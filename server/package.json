@@ -1,0 +1,14 @@
+{
+  "name": "@workgremlin/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WorkGremlin 本地服务：HTTP 上报接口 + WebSocket 推送 + SQLite 落库（可内嵌 Electron 主进程，也可独立启动）",
+  "main": "src/index.js",
+  "dependencies": {
+    "@workgremlin/shared": "*",
+    "better-sqlite3": "^13.0.3",
+    "chokidar": "^4.0.3",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}

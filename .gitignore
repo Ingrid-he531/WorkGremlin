@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+*.log
+.DS_Store
+
+# 本地运行态（端口/token/数据库）
+.workgremlin/
+*.db
+*.db-wal
+*.db-shm

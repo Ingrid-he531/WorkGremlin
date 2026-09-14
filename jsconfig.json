@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "checkJs": true,
+    "allowJs": true,
+    "strict": false,
+    "baseUrl": ".",
+    "paths": {
+      "@workgremlin/shared": ["shared/index.js"]
+    }
+  },
+  "include": ["shared/**/*.js", "server/**/*.js", "desktop/**/*.js", "scripts/**/*.js"],
+  "exclude": ["**/node_modules/**", "**/dist/**"]
+}

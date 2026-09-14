@@ -1,0 +1,8 @@
+{
+  "name": "@workgremlin/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WorkGremlin 共享类型、常量与协议（同构：Node 与浏览器均可用，零运行时依赖）",
+  "main": "index.js",
+  "types": "index.d.ts"
+}

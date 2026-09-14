@@ -1,0 +1,36 @@
+{
+  "name": "workgremlin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WorkGremlin - 可视化桌面程序：管理与监控多 agent 协作团队",
+  "license": "MIT",
+  "workspaces": [
+    "shared",
+    "server",
+    "desktop",
+    "renderer",
+    "packages/reporter"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "rebuild:native": "node scripts/postinstall.js --force",
+    "dev": "node scripts/dev.js",
+    "server": "node server/src/cli.js",
+    "build": "npm run build --workspace @workgremlin/renderer",
+    "start": "electron desktop/src/main.js",
+    "db:check": "node server/src/cli.js --self-test"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.6.0",
+    "electron": "38.8.6"
+  },
+  "allowScripts": {
+    "electron@38.8.6": true,
+    "esbuild@0.25.12": true,
+    "vue-demi@0.14.10": true,
+    "better-sqlite3@13.0.3": true
+  }
+}

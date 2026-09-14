@@ -1,0 +1,11 @@
+{
+  "name": "@workgremlin/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WorkGremlin Electron 主进程外壳",
+  "main": "src/main.js",
+  "dependencies": {
+    "@workgremlin/server": "*",
+    "@workgremlin/shared": "*"
+  }
+}
