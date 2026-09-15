@@ -52,6 +52,7 @@ const DEFAULTS = Object.freeze({
 const WS_EVENTS = Object.freeze({
   SNAPSHOT: 'snapshot',
   MEMBER_STATUS: 'member.status',
+  MEMBER_REMOVE: 'member.remove',
   TASK_UPDATE: 'task.update',
   MESSAGE_NEW: 'message.new',
   MESSAGES_PAGE: 'messages.page',
@@ -192,6 +193,18 @@ function avatarOf(name) {
     .toLowerCase();
   return AVATARS[key] || AVATAR_FALLBACK;
 }
+
+/* ------------------------------------------------------------------ *
+ * 临时成员（幽灵）
+ *
+ * 专家团队是常驻成员，一人一个工位；为某个项目临时组队拉进来的成员
+ * 没有工位，在场景里以"幽灵"形态飘在空中。
+ *
+ * 判定规则属于展示层（见 renderer/src/lib/ephemeral.js）：
+ *   ephemeral === true > memberId 前缀 ghost- / tmp- > role === 'ghost'。
+ * 这里只声明数据契约字段，供将来 server 直接下发。
+ * ------------------------------------------------------------------ */
+
 
 module.exports = {
   PROTOCOL_VERSION,

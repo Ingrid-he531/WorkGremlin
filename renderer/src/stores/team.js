@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { getServerInfo, getFlags, wsUrl } from '../api/bridge';
+import { getServerInfo, getFlags, getWorkspace, openWorkspace, wsUrl } from '../api/bridge';
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
 
@@ -9,6 +9,13 @@ export const useTeamStore = defineStore('team', {
     teams: [],
     team: null,
     members: [],
+    /** 当前工程名（server 解析：package.json name > 目录名） */
+    project: '',
+    workspacePath: '',
+    /** 当前工程的 subagent 清单文件路径（幽灵的数据源） */
+    feedPath: '',
+    /** 最近打开过的工程 */
+    recent: [],
     connection: { state: 'connecting', source: 'ws' },
     serverInfo: null,
     flags: { demo: false, seed: 1 },
@@ -30,9 +37,13 @@ export const useTeamStore = defineStore('team', {
     async init(onMessage) {
       const info = await getServerInfo();
       this.serverInfo = info;
+      this.project = info.project || '';
       const flags = await getFlags();
       this.flags = flags;
       this.demo = Boolean(flags.demo);
+
+      const ws = await getWorkspace(info);
+      if (ws) this.applyWorkspace(ws);
 
       this._conn = createConnection({
         url: wsUrl(info),
@@ -45,6 +56,9 @@ export const useTeamStore = defineStore('team', {
               break;
             case WS_EVENTS.MEMBER_STATUS:
               this.upsertMember(msg.payload);
+              break;
+            case WS_EVENTS.MEMBER_REMOVE:
+              this.removeMember(msg.payload && msg.payload.memberId);
               break;
             default:
               if (onMessage) onMessage(msg);
@@ -60,6 +74,7 @@ export const useTeamStore = defineStore('team', {
       this.team = snapshot.team;
       this.teams = snapshot.teams || [];
       this.members = snapshot.members || [];
+      if (snapshot.project) this.project = snapshot.project;
     },
 
     /** @param {any} card */
@@ -68,6 +83,33 @@ export const useTeamStore = defineStore('team', {
       const idx = this.members.findIndex((m) => m.memberId === card.memberId);
       if (idx >= 0) this.members.splice(idx, 1, { ...this.members[idx], ...card });
       else this.members.push(card);
+    },
+
+    /** 临时成员（幽灵）退场：subagent 结束，屋里就不该再飘着它 */
+    removeMember(memberId) {
+      if (!memberId) return;
+      const idx = this.members.findIndex((m) => m.memberId === memberId);
+      if (idx >= 0) this.members.splice(idx, 1);
+    },
+
+    applyWorkspace(ws) {
+      if (!ws) return;
+      this.project = ws.project || '';
+      this.workspacePath = ws.workspacePath || '';
+      this.feedPath = ws.feedPath || '';
+      this.recent = Array.isArray(ws.recent) ? ws.recent : [];
+      this.demo = Boolean(ws.demo);
+    },
+
+    /**
+     * 打开工程：屋里的成员/幽灵整体切到这个工程。path 为空 / 'demo' 切回演示数据。
+     * 服务端会广播新快照，这里不用自己拉。
+     * @param {string} path
+     */
+    async openWorkspace(path) {
+      const cur = await openWorkspace(this.serverInfo || {}, path);
+      this.applyWorkspace(cur);
+      return cur;
     },
 
     /** 切换团队（单 workspace 下可有多个 team） */

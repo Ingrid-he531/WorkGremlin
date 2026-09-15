@@ -57,6 +57,8 @@ async function selfTest() {
     reported: 1,
     createdAt: 1,
     lastSeenAt: 1,
+    ephemeral: 0,
+    project: null,
   });
   repo.insertMessage.run({
     dedupeKey: 'k1',

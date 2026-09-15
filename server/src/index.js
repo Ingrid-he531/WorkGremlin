@@ -16,10 +16,14 @@ const path = require('node:path');
 
 const { openDatabase } = require('./db');
 const { createIngestBus } = require('./ingest/bus');
+const { createSubagentFeed } = require('./ingest/subagentFeed');
+const { resolveWorkspacePath, resolveProjectName } = require('./project');
+const { createWorkspaceManager } = require('./workspace');
 const { createHub } = require('./ws/hub');
 const { createHealthRouter } = require('./http/routes/health');
 const { createQueryRouter } = require('./http/routes/query');
 const { createIngestRouter } = require('./http/routes/ingest');
+const { createWorkspaceRouter } = require('./http/routes/workspace');
 const { requireToken } = require('./http/auth');
 const config = require('./config');
 const { seedDemoData, createDemoTicker } = require('./mock/generator');
@@ -64,12 +68,17 @@ function createServer(opts = {}) {
 
   const { db, repo, checkpoint, startCheckpointLoop, close: closeDb } = openDatabase(dbPath);
 
+  /** 当前工程：目录来自 WORKGREMLIN_WORKSPACE / 入参，否则 cwd；名字取 package.json name，回落目录名 */
+  const workspacePath = resolveWorkspacePath(opts.workspacePath);
+  const project = resolveProjectName(workspacePath);
+
   const app = express();
   const httpServer = http.createServer(app);
 
   let hub = null;
   const bus = createIngestBus({
     repo,
+    project,
     hub: {
       /** @type {(...args: any[]) => void} */
       broadcast: (...args) => (hub ? hub.broadcast(...args) : undefined),
@@ -101,11 +110,22 @@ function createServer(opts = {}) {
     return next();
   });
 
-  app.use('/api/v1', createHealthRouter({ version: VERSION }));
+  app.use('/api/v1', createHealthRouter({ version: VERSION, project }));
 
   // 上报与查询需要 token；health 不需要（供 Electron 做存活探测）
   app.use('/api/v1', requireToken(token), createQueryRouter({ bus, repo }));
   app.use('/api/v1', requireToken(token), createIngestRouter({ bus }));
+
+  /** 工程（"打开工程"）：一个 workspace 一个 team，切换即换屋里显示的那批成员 */
+  const workspace = createWorkspaceManager({
+    repo,
+    bus,
+    initial: { workspacePath, project },
+    demoTeam: process.env.WORKGREMLIN_TEAM || 'workgremlin',
+    preferDemo: isDemoMode(),
+    broadcast: (team, type, payload) => (hub ? hub.broadcast(team, type, payload) : undefined),
+  });
+  app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
 
   if (opts.serveStatic) {
     app.use(express.static(path.resolve(opts.serveStatic)));
@@ -114,6 +134,28 @@ function createServer(opts = {}) {
   const timers = [];
   let info = null;
   let demoTicker = null;
+  let subagentFeed = null;
+  /** 临时成员（幽灵）挂在哪个 team 上：与演示数据同一个 team */
+  const feedTeam = () => process.env.WORKGREMLIN_TEAM || 'workgremlin';
+
+  /**
+   * （重）启动 subagent 清单监听 —— 盯的是**当前打开工程**下的
+   * <workspace>/.workgremlin/subagents.json。演示数据模式没有工程目录，不监听。
+   */
+  function startFeed() {
+    if (subagentFeed) subagentFeed.stop();
+    const cur = workspace.current();
+    if (!cur.workspacePath) return null;
+    subagentFeed = createSubagentFeed({
+      bus,
+      repo,
+      team: cur.team || feedTeam(),
+      workspacePath: cur.workspacePath,
+      project: cur.project,
+    });
+    subagentFeed.start();
+    return subagentFeed;
+  }
 
   /**
    * 启动监听。
@@ -137,6 +179,8 @@ function createServer(opts = {}) {
       startedAt: clock.now(),
       version: VERSION,
       previousPid: existing ? existing.pid : null,
+      project,
+      workspacePath,
     };
     config.writeServerInfo(info);
 
@@ -158,14 +202,30 @@ function createServer(opts = {}) {
       demoTicker = createDemoTicker({
         bus,
         repo,
-        team: process.env.WORKGREMLIN_TEAM || 'workgremlin',
+        team: feedTeam(),
         seed: Number(opts.seed ?? process.env.WORKGREMLIN_DEMO_SEED ?? 1),
       });
       demoTicker.start();
     }
 
+    // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）
+    const restored = workspace.restore();
+    if (info) {
+      info.project = restored.project;
+      info.workspacePath = restored.workspacePath || workspacePath;
+      config.writeServerInfo(info);
+    }
+
+    // subagent 清单 → 幽灵：文件里有谁，屋里就飘着谁（换工程就重开一个监听）
+    workspace.setOnSwitch(() => startFeed());
+    startFeed();
+
     if (!opts.silent) {
       console.log(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
+      const cur = workspace.current();
+      if (cur.demo) console.log('[workgremlin] 当前：演示数据');
+      else console.log(`[workgremlin] project=${cur.project || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
+      console.log(`[workgremlin] subagent 清单：${cur.feedPath}`);
     }
     return info;
   }
@@ -195,13 +255,16 @@ function createServer(opts = {}) {
       bus,
       seed: Number.isFinite(seed) ? seed : 1,
       team,
-      workspacePath: opts.workspacePath || process.env.WORKGREMLIN_WORKSPACE || '',
+      // 演示数据不属于任何工程：绑到某个目录的话，打开这个工程就会看到这 8 个模拟成员，
+      // 还以为"打开工程没生效"。演示 team 只通过"切回演示数据"进入。
+      workspacePath: '',
     });
   }
 
   async function close() {
     for (const t of timers) clearInterval(t);
     if (demoTicker) demoTicker.stop();
+    if (subagentFeed) subagentFeed.stop();
     try {
       hub.close();
     } catch {

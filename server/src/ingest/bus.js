@@ -31,9 +31,11 @@ function jsonOrNull(v) {
 }
 
 /**
- * @param {{ repo: any, hub: any }} ctx
+ * @param {{ repo: any, hub: any, project?: string, team?: string|null }} ctx
  */
-function createIngestBus({ repo, hub }) {
+function createIngestBus({ repo, hub, project = '', team = null }) {
+  /** 会随"打开工程"变化的东西：当前工程名 + 当前团队（屋里显示谁的工位） */
+  const context = { project, team: team || null };
   const now = () => clock.now();
 
   function ensureTeam(name, workspacePath = '', mainConversationId = null, source = 'report') {
@@ -50,7 +52,8 @@ function createIngestBus({ repo, hub }) {
   }
 
   /**
-   * @param {{team: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string}} p
+   * @param {{team: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string,
+   *          ephemeral?: boolean, project?: string|null}} p
    */
   function registerMember(p) {
     const team = teamIdOf(p.team);
@@ -67,6 +70,9 @@ function createIngestBus({ repo, hub }) {
       reported: p.reported === 0 ? 0 : 1,
       createdAt: existing ? existing.created_at : now(),
       lastSeenAt: now(),
+      // 临时成员（无工位 / 场景里是幽灵）。老成员的 ephemeral 只升不降（见 upsertMember 的 MAX）
+      ephemeral: p.ephemeral ? 1 : 0,
+      project: p.project ?? null,
     });
     hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, buildMemberCard(id));
     return id;
@@ -346,7 +352,23 @@ function createIngestBus({ repo, hub }) {
       degraded: s ? Boolean(s.degraded) : true,
       reported: Boolean(m.reported),
       messageCount: cnt ? cnt.c : 0,
+      // 临时成员（无工位 → 场景里飘着的幽灵）+ 所属项目名
+      ephemeral: Boolean(m.ephemeral),
+      project: m.project ?? null,
     };
+  }
+
+  /**
+   * 删除成员（临时成员退场：subagent 结束、幽灵散掉）。
+   * @param {{team: string, memberId: string}} p
+   */
+  function removeMember(p) {
+    const team = teamIdOf(p.team);
+    const member = requireMember(team, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    repo.purgeMember(member.id);
+    hub.broadcast(team, WS_EVENTS.MEMBER_REMOVE, { memberId: member.id });
+    return { ok: true };
   }
 
   function safeJson(str, fallback) {
@@ -358,12 +380,31 @@ function createIngestBus({ repo, hub }) {
     }
   }
 
-  /** 首屏快照 */
+  /**
+   * 切换当前工程 / 团队（见 server/src/workspace.js）。
+   * @param {{project?: string, team?: string|null}} next
+   */
+  function setContext(next = {}) {
+    if (typeof next.project === 'string') context.project = next.project;
+    if (next.team !== undefined) context.team = next.team || null;
+    return { ...context };
+  }
+
+  /** 首屏快照。没指定 team 时用"当前打开的工程"对应的团队 */
   function buildSnapshot(teamName) {
     const teams = repo.listTeams.all();
-    const teamRow = teamName ? repo.getTeam.get(teamIdOf(teamName)) : teams[0];
+    const want = teamName || context.team;
+    const teamRow = want ? repo.getTeam.get(teamIdOf(want)) : teams[0];
     if (!teamRow) {
-      return { team: null, teams, members: [], recentMessages: [], serverTime: now(), serverVersion: '0.1.0' };
+      return {
+        team: null,
+        teams,
+        members: [],
+        recentMessages: [],
+        project: context.project,
+        serverTime: now(),
+        serverVersion: '0.1.0',
+      };
     }
     const members = repo.listMembers.all(teamRow.id).map((m) => buildMemberCard(m.id)).filter(Boolean);
     const recentMessages = repo.listMessages(teamRow.id, { limit: DEFAULTS.MESSAGE_WINDOW, direction: 'desc' })
@@ -381,6 +422,7 @@ function createIngestBus({ repo, hub }) {
       },
       teams,
       members,
+      project: context.project,
       recentMessages,
       serverTime: now(),
       serverVersion: '0.1.0',
@@ -411,7 +453,10 @@ function createIngestBus({ repo, hub }) {
     teamIdOf,
     memberIdOf,
     ensureTeam,
+    setContext,
+    getContext: () => ({ ...context }),
     registerMember,
+    removeMember,
     heartbeat,
     setStatus,
     startTask,

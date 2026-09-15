@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS members (
   session_id     TEXT,
   reported       INTEGER NOT NULL DEFAULT 0, -- 1 = 接入了主动上报（B 路线）
   created_at     INTEGER NOT NULL,
-  last_seen_at   INTEGER
+  last_seen_at   INTEGER,
+  -- 临时成员（无工位，场景里是幽灵）：subagent 这类"随项目临时组队"的成员
+  ephemeral      INTEGER NOT NULL DEFAULT 0,
+  -- 临时成员所属项目名（缺省时 UI 回落到 role）
+  project        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_members_team ON members(team_id, name);
 

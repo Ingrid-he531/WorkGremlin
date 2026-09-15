@@ -32,6 +32,24 @@ function chmod600(file) {
   }
 }
 
+/**
+ * 增量补列：schema.sql 只管"建新库"，老库要补的列在这里加。
+ * SQLite 没有 ADD COLUMN IF NOT EXISTS，所以先查 table_info 再决定。
+ * @param {import('better-sqlite3').Database} db
+ */
+function ensureColumn(db, table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (cols.some((c) => c.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  return true;
+}
+
+/** @param {import('better-sqlite3').Database} db */
+function migrate(db) {
+  ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'members', 'project', 'project TEXT');
+}
+
 function applyPragmas(db) {
   db.pragma('journal_mode = WAL');
   db.pragma('secure_delete = ON');
@@ -51,6 +69,7 @@ function openDatabase(dbPath) {
   const db = new Database(dbPath);
   applyPragmas(db);
   db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+  migrate(db);
 
   chmod600(dbPath);
   chmod600(`${dbPath}-wal`);
@@ -109,18 +128,22 @@ function createRepo(db) {
     `),
     listTeams: db.prepare(`SELECT * FROM teams ORDER BY created_at DESC`),
     getTeam: db.prepare(`SELECT * FROM teams WHERE id = ?`),
+    getTeamByWorkspace: db.prepare(`SELECT * FROM teams WHERE workspace_path = ?`),
 
     upsertMember: db.prepare(`
-      INSERT INTO members (id, team_id, name, role, session_id, reported, created_at, last_seen_at)
-      VALUES (@id, @teamId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt)
+      INSERT INTO members (id, team_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project)
+      VALUES (@id, @teamId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @project)
       ON CONFLICT(id) DO UPDATE SET
         role = COALESCE(excluded.role, members.role),
         session_id = COALESCE(excluded.session_id, members.session_id),
         reported = MAX(members.reported, excluded.reported),
-        last_seen_at = MAX(COALESCE(members.last_seen_at, 0), COALESCE(excluded.last_seen_at, 0))
+        last_seen_at = MAX(COALESCE(members.last_seen_at, 0), COALESCE(excluded.last_seen_at, 0)),
+        ephemeral = MAX(members.ephemeral, excluded.ephemeral),
+        project = COALESCE(excluded.project, members.project)
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
     listMembers: db.prepare(`SELECT * FROM members WHERE team_id = ? ORDER BY name`),
+    listEphemeral: db.prepare(`SELECT * FROM members WHERE team_id = ? AND ephemeral = 1`),
     touchMember: db.prepare(`UPDATE members SET last_seen_at = ? WHERE id = ?`),
 
     upsertStatus: db.prepare(`
@@ -274,7 +297,24 @@ function createRepo(db) {
     db.pragma('wal_checkpoint(TRUNCATE)');
   }
 
-  return { ...stmt, listMessages, purgeTeam, raw: db };
+  /**
+   * 删掉一个成员及其所有附属行 —— 临时成员（幽灵）消失时用。
+   * messages 不删：它是"发生过什么"的历史，不是成员的属性。
+   * @param {string} memberId
+   */
+  function purgeMember(memberId) {
+    const tx = db.transaction((id) => {
+      db.prepare('DELETE FROM file_activity WHERE member_id = ?').run(id);
+      db.prepare('DELETE FROM artifacts WHERE member_id = ?').run(id);
+      db.prepare('DELETE FROM agent_status_history WHERE member_id = ?').run(id);
+      db.prepare('DELETE FROM agent_status WHERE member_id = ?').run(id);
+      db.prepare('DELETE FROM tasks WHERE member_id = ?').run(id);
+      db.prepare('DELETE FROM members WHERE id = ?').run(id);
+    });
+    tx(memberId);
+  }
+
+  return { ...stmt, listMessages, purgeTeam, purgeMember, raw: db };
 }
 
-module.exports = { openDatabase, createRepo, applyPragmas, SCHEMA_PATH };
+module.exports = { openDatabase, createRepo, applyPragmas, migrate, SCHEMA_PATH };

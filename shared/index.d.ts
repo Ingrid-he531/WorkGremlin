@@ -65,6 +65,10 @@ export interface MemberCard {
   degraded: boolean;
   reported: boolean;
   messageCount: number;
+  /** 临时组队成员（无工位，场景里以幽灵形态飘在空中） */
+  ephemeral?: boolean;
+  /** 临时成员所属项目名，缺省用 role */
+  project?: string | null;
 }
 
 export interface Message {
@@ -94,6 +98,8 @@ export interface Snapshot {
   team: Team | null;
   teams: Team[];
   members: MemberCard[];
+  /** 当前工程名（package.json name > 目录名），拿不到为空串 */
+  project?: string;
   recentMessages: Message[];
   serverTime: number;
   serverVersion: string;
@@ -130,6 +136,7 @@ export declare const HTTP_ROUTES: Record<string, string>;
 export declare const ERROR_CODES: Record<string, string>;
 export declare const STATE_LABELS: Record<AgentState, string>;
 export declare const STATE_COLORS: Record<AgentState, string>;
+
 
 export declare function envelope<T>(type: string, team: string, actor: string, payload: T, ts?: number): Envelope<T>;
 export declare function dedupeKey(m: {

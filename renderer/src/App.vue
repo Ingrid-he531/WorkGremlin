@@ -3,7 +3,9 @@ import { onMounted, onUnmounted, ref } from 'vue';
 import ConnectionBar from './components/ConnectionBar.vue';
 import TeamSwitcher from './components/TeamSwitcher.vue';
 import ChatPanel from './components/ChatPanel.vue';
-import OfficeView from './views/OfficeView.vue';
+import IsoOfficeView from './views/IsoOfficeView.vue';
+import OfficeSceneView from './views/OfficeSceneView.vue';
+import DeskLabView from './views/DeskLabView.vue';
 import WorkstationView from './views/WorkstationView.vue';
 import ConversationView from './views/ConversationView.vue';
 import { useTeamStore } from './stores/team';
@@ -14,7 +16,15 @@ import { httpBase } from './api/bridge';
 const team = useTeamStore();
 const msgs = useMessageStore();
 
-const tab = ref('office');
+/** 支持 ?tab=lab 直接进入工位设计台（调造型时用） */
+const initialTab = (() => {
+  try {
+    return new URLSearchParams(location.search).get('tab') || 'office';
+  } catch {
+    return 'office';
+  }
+})();
+const tab = ref(initialTab);
 const selectedId = ref('');
 const chatCollapsed = ref(false);
 
@@ -41,6 +51,17 @@ function clearSelect() {
   msgs.setFilters({ members: [] });
 }
 
+/** 打开工程：服务端会广播新快照（成员/消息/幽灵整体换一批） */
+async function onOpenWorkspace(path) {
+  selectedId.value = '';
+  msgs.setFilters({ members: [] });
+  try {
+    await team.openWorkspace(path);
+  } catch (err) {
+    console.warn('[workgremlin] 打开工程失败：', err && err.message);
+  }
+}
+
 onMounted(async () => {
   await team.init((msg) => {
     if (msg.type === WS_EVENTS.MESSAGE_NEW) msgs.push(msg.payload);
@@ -54,12 +75,22 @@ onUnmounted(() => team.dispose());
 
 <template>
   <div class="app">
-    <ConnectionBar :connection="team.connection" :demo="team.demo" :team="team.team" />
+    <ConnectionBar
+      :connection="team.connection"
+      :demo="team.demo"
+      :team="team.team"
+      :project="team.project"
+      :recent="team.recent"
+      :feed-path="team.feedPath"
+      :member-count="team.members.length"
+      @open-workspace="onOpenWorkspace"
+    />
 
     <nav class="tabs">
       <button :class="{ on: tab === 'office' }" @click="tab = 'office'">办公室</button>
       <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">工位卡片</button>
       <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">对话记录</button>
+      <button :class="{ on: tab === 'lab' }" @click="tab = 'lab'">工位设计</button>
       <span class="spacer" />
       <TeamSwitcher
         :teams="team.teams"
@@ -70,12 +101,21 @@ onUnmounted(() => team.dispose());
 
     <main class="body">
       <section class="stage">
-        <OfficeView
+        <IsoOfficeView
           v-if="tab === 'office'"
           :selected-id="selectedId"
           @select="selectDesk"
+          @toggle-chat="chatCollapsed = !chatCollapsed"
+        />
+        <!-- 旧的 2D 正视场景，?tab=flat 还能进，用来和新场景对比 -->
+        <OfficeSceneView
+          v-else-if="tab === 'flat'"
+          :selected-id="selectedId"
+          @select="selectDesk"
+          @toggle-chat="chatCollapsed = !chatCollapsed"
         />
         <WorkstationView v-else-if="tab === 'workstation'" />
+        <DeskLabView v-else-if="tab === 'lab'" />
         <ConversationView v-else />
       </section>
 

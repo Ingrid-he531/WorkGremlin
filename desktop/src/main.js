@@ -9,7 +9,7 @@
  * 启动顺序：app.ready -> createServer().start() -> 写 ~/.workgremlin/server.json -> 建窗
  */
 
-const { app, ipcMain, BrowserWindow, globalShortcut } = require('electron');
+const { app, ipcMain, BrowserWindow, dialog, globalShortcut } = require('electron');
 const { createServer } = require('@workgremlin/server');
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
@@ -40,6 +40,17 @@ async function bootstrap() {
   ipcMain.handle('workgremlin:get-server-info', () => server && server.info);
   ipcMain.handle('workgremlin:get-app-version', () => app.getVersion());
   ipcMain.handle('workgremlin:get-flags', () => ({ ...flags, userDataDir: app.getPath('userData') }));
+
+  // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）
+  ipcMain.handle('workgremlin:choose-workspace', async () => {
+    const win = BrowserWindow.getFocusedWindow() || mainWindow;
+    const res = await dialog.showOpenDialog(win, {
+      title: '打开工程',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (res.canceled || !res.filePaths || !res.filePaths.length) return null;
+    return res.filePaths[0];
+  });
 
   buildMenu();
   mainWindow = createWindow({ serverInfo: info });

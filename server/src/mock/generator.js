@@ -38,6 +38,20 @@ const ROSTER = [
   { name: 'ops', role: '构建与部署', state: 'offline', progress: null, reported: 0 }, // 未接上报 -> degraded
 ];
 
+/**
+ * 临时组队成员（GUESTS）：为某个项目临时拉进来的 agent。
+ *
+ * 判定靠 `ghost-` 前缀（见 shared.isEphemeralMember），UI 里是"幽灵"——
+ * 不占工位、飘在空中；role 即所属项目名，显示在它头顶。
+ */
+const GUESTS = [
+  { name: 'ghost-search', role: '临时项目 · 搜索重构', state: 'busy', progress: 0.44, reported: 1 },
+  { name: 'ghost-i18n', role: '临时项目 · 多语言文案', state: 'idle', progress: null, reported: 1 },
+];
+
+/** 专家 + 临时成员：注册/心跳/任务都按这份名单来 */
+const ALL_MEMBERS = ROSTER.concat(GUESTS);
+
 const TASK_TITLES = {
   leader: '拆解 M1 任务并派发',
   researcher: '调研 .codebuddy/teams 数据格式',
@@ -45,6 +59,8 @@ const TASK_TITLES = {
   tester: '编写 M0 验收用例',
   reviewer: '评审数据模型与协议定义',
   ops: '搭建本地打包流水线',
+  'ghost-search': '搜索重构：补齐倒排索引',
+  'ghost-i18n': '多语言文案校对（zh/en）',
 };
 
 const FILES = {
@@ -58,6 +74,8 @@ const FILES = {
   tester: ['docs/test-strategy.md', 'tests/e2e/m0.spec.js'],
   reviewer: ['server/src/db/schema.sql'],
   ops: ['scripts/build.js', 'electron-builder.yml'],
+  'ghost-search': ['server/src/db/schema.sql', 'server/src/http/routes/snapshot.js'],
+  'ghost-i18n': ['renderer/src/styles/theme.css'],
 };
 
 const SUBJECTS = [
@@ -95,7 +113,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
 
   bus.ensureTeam(team, workspacePath, 'demo-conversation', 'report');
 
-  for (const r of ROSTER) {
+  for (const r of ALL_MEMBERS) {
     const memberId = bus.registerMember({ team, name: r.name, role: r.role });
     const files = FILES[r.name] || [];
     if (r.reported) {
@@ -115,7 +133,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
   }
 
   // 为每个 busy 成员建一条任务
-  for (const r of ROSTER) {
+  for (const r of ALL_MEMBERS) {
     if (r.state !== 'busy') continue;
     const started = bus.startTask({
       team,
@@ -180,7 +198,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
 
   // ops 是"未接上报"的成员：把它的状态标成 degraded（模拟心跳超时）
   bus.sweepDegraded && bus.sweepDegraded();
-  return { team, seed, members: ROSTER.length, messages: count + 1, baseTs: t0 };
+  return { team, seed, members: ALL_MEMBERS.length, messages: count + 1, baseTs: t0 };
 }
 
 /**
@@ -195,9 +213,9 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
  */
 function createDemoTicker({ bus, repo, team = 'workgremlin', intervalMs = 5_000, seed = 1 }) {
   const rng = makeRng((Number(seed) || 1) ^ 0x9e3779b9);
-  const reported = ROSTER.filter((r) => r.reported);
+  const reported = ALL_MEMBERS.filter((r) => r.reported);
   const progress = new Map(
-    ROSTER.filter((r) => Number.isFinite(r.progress)).map((r) => [r.name, r.progress])
+    ALL_MEMBERS.filter((r) => Number.isFinite(r.progress)).map((r) => [r.name, r.progress])
   );
   let timer = null;
 
