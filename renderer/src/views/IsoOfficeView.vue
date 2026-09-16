@@ -15,7 +15,7 @@ import { createIsoOffice, STATE_COLOR, STATE_LABEL } from '../iso/engine';
 const props = defineProps({
   selectedId: { type: String, default: '' },
 });
-const emit = defineEmits(['select', 'toggle-chat']);
+const emit = defineEmits(['select']);
 
 const team = useTeamStore();
 const wrapRef = ref(null);
@@ -144,7 +144,6 @@ onBeforeUnmount(() => {
       <button @click="dismiss">全员回工位</button>
       <button :class="{ on: showPaths }" @click="showPaths = !showPaths">路网</button>
       <button @click="resetView">复位视角</button>
-      <button @click="emit('toggle-chat')">折叠对话</button>
     </div>
 
     <div class="tip">

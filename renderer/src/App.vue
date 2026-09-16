@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref } from 'vue';
 import ConnectionBar from './components/ConnectionBar.vue';
 import TeamSwitcher from './components/TeamSwitcher.vue';
-import ChatPanel from './components/ChatPanel.vue';
+import FloorSelector from './components/FloorSelector.vue';
 import IsoOfficeView from './views/IsoOfficeView.vue';
 import OfficeSceneView from './views/OfficeSceneView.vue';
 import DeskLabView from './views/DeskLabView.vue';
@@ -26,7 +26,8 @@ const initialTab = (() => {
 })();
 const tab = ref(initialTab);
 const selectedId = ref('');
-const chatCollapsed = ref(false);
+const floorProducts = ref([]);
+const selectedFloor = ref('1F');
 
 async function refreshMessages() {
   const base = httpBase(team.serverInfo || {});
@@ -46,11 +47,6 @@ function selectDesk(id) {
   msgs.setFilters({ members: selectedId.value ? [selectedId.value] : [] });
 }
 
-function clearSelect() {
-  selectedId.value = '';
-  msgs.setFilters({ members: [] });
-}
-
 /** 打开工程：服务端会广播新快照（成员/消息/幽灵整体换一批） */
 async function onOpenWorkspace(path) {
   selectedId.value = '';
@@ -62,12 +58,27 @@ async function onOpenWorkspace(path) {
   }
 }
 
+/** 左侧楼层：受监控产品及其安装状态（1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy 插件） */
+async function fetchProducts() {
+  const info = team.serverInfo || {};
+  try {
+    const res = await fetch(`${httpBase(info)}/api/v1/products`, {
+      headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+    });
+    const data = await res.json();
+    if (data && data.ok) floorProducts.value = data.products || [];
+  } catch {
+    /* 忽略：不影响主界面 */
+  }
+}
+
 onMounted(async () => {
   await team.init((msg) => {
     if (msg.type === WS_EVENTS.MESSAGE_NEW) msgs.push(msg.payload);
     if (msg.type === WS_EVENTS.SNAPSHOT) msgs.setSnapshot(msg.payload.recentMessages || []);
   });
   await refreshMessages();
+  await fetchProducts();
 });
 
 onUnmounted(() => team.dispose());
@@ -100,33 +111,24 @@ onUnmounted(() => team.dispose());
     </nav>
 
     <main class="body">
+      <FloorSelector v-model="selectedFloor" :products="floorProducts" />
+
       <section class="stage">
         <IsoOfficeView
           v-if="tab === 'office'"
           :selected-id="selectedId"
           @select="selectDesk"
-          @toggle-chat="chatCollapsed = !chatCollapsed"
         />
         <!-- 旧的 2D 正视场景，?tab=flat 还能进，用来和新场景对比 -->
         <OfficeSceneView
           v-else-if="tab === 'flat'"
           :selected-id="selectedId"
           @select="selectDesk"
-          @toggle-chat="chatCollapsed = !chatCollapsed"
         />
         <WorkstationView v-else-if="tab === 'workstation'" />
         <DeskLabView v-else-if="tab === 'lab'" />
         <ConversationView v-else />
       </section>
-
-      <ChatPanel
-        v-show="tab !== 'conversation'"
-        :selected-id="selectedId"
-        :collapsed="chatCollapsed"
-        @update:collapsed="chatCollapsed = $event"
-        @select="selectDesk"
-        @clear-select="clearSelect"
-      />
     </main>
   </div>
 </template>

@@ -24,6 +24,7 @@ const { createHealthRouter } = require('./http/routes/health');
 const { createQueryRouter } = require('./http/routes/query');
 const { createIngestRouter } = require('./http/routes/ingest');
 const { createWorkspaceRouter } = require('./http/routes/workspace');
+const { createProductsRouter } = require('./http/routes/products');
 const { requireToken } = require('./http/auth');
 const config = require('./config');
 const { seedDemoData, createDemoTicker } = require('./mock/generator');
@@ -126,6 +127,7 @@ function createServer(opts = {}) {
     broadcast: (team, type, payload) => (hub ? hub.broadcast(team, type, payload) : undefined),
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
+  app.use('/api/v1', requireToken(token), createProductsRouter());
 
   if (opts.serveStatic) {
     app.use(express.static(path.resolve(opts.serveStatic)));

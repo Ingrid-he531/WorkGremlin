@@ -36,7 +36,7 @@ import {
 const props = defineProps({
   selectedId: { type: String, default: '' },
 });
-const emit = defineEmits(['select', 'toggle-chat']);
+const emit = defineEmits(['select']);
 
 const team = useTeamStore();
 
@@ -668,7 +668,6 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
       <button @click="callAll">集合开会</button>
       <button @click="dismiss">全员回工位</button>
       <button @click="showGraph = !showGraph">路网</button>
-      <button @click="emit('toggle-chat')">折叠对话</button>
       <span v-if="meetingCount" class="meeting-tip">会议室 {{ meetingCount }} 人</span>
     </div>
   </div>
