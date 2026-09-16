@@ -12,7 +12,7 @@ function createQueryRouter({ bus, repo }) {
   const router = express.Router();
 
   router.get('/teams', (req, res) => {
-    res.json({ ok: true, teams: repo.listTeams.all() });
+    res.json({ ok: true, teams: bus.listTeamSummaries() });
   });
 
   router.get('/snapshot', (req, res) => {

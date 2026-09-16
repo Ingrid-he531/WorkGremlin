@@ -12,6 +12,7 @@
 
 const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey } = require('@workgremlin/shared');
 const clock = require('../clock');
+const { resolveProjectName } = require('../project');
 
 function teamIdOf(name) {
   return name;
@@ -390,11 +391,28 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     return { ...context };
   }
 
+  /**
+   * 团队列表。team 的 name 是内部 slug，界面上要显示的是它所属工程的名字，
+   * 所以这里按 workspace_path 反解出 project（package.json name > 目录名）一起带出去。
+   * @returns {Array<any>}
+   */
+  function listTeamSummaries() {
+    return repo.listTeams.all().map((t) => ({
+      id: t.id,
+      name: t.name,
+      workspacePath: t.workspace_path || '',
+      mainConversationId: t.main_conversation_id || null,
+      source: t.source,
+      createdAt: t.created_at,
+      project: t.workspace_path ? resolveProjectName(t.workspace_path) : '',
+    }));
+  }
+
   /** 首屏快照。没指定 team 时用"当前打开的工程"对应的团队 */
   function buildSnapshot(teamName) {
-    const teams = repo.listTeams.all();
+    const teams = listTeamSummaries();
     const want = teamName || context.team;
-    const teamRow = want ? repo.getTeam.get(teamIdOf(want)) : teams[0];
+    const teamRow = want ? teams.find((t) => t.id === teamIdOf(want)) : teams[0];
     if (!teamRow) {
       return {
         team: null,
@@ -412,14 +430,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       .reverse()
       .map(toMessage);
     return {
-      team: {
-        id: teamRow.id,
-        name: teamRow.name,
-        workspacePath: teamRow.workspace_path,
-        mainConversationId: teamRow.main_conversation_id,
-        source: teamRow.source,
-        createdAt: teamRow.created_at,
-      },
+      team: teamRow,
       teams,
       members,
       project: context.project,
@@ -466,6 +477,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     fileTouch,
     buildMemberCard,
     buildSnapshot,
+    listTeamSummaries,
     sweepDegraded,
     toMessage,
   };

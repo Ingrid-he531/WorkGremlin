@@ -9,6 +9,8 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useTeamStore } from '../stores/team';
+import { useSessionStore } from '../stores/sessions';
+import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { createIsoOffice, STATE_COLOR, STATE_LABEL } from '../iso/engine';
 
@@ -18,24 +20,74 @@ const props = defineProps({
 const emit = defineEmits(['select']);
 
 const team = useTeamStore();
+const sessions = useSessionStore();
+const mainAgent = useMainAgentStore();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
 const showPaths = ref(false);
+
+/* ------------------------------ 主 Agent 控制台 tooltip ------------------------------
+ * 鼠标停在悬浮屏上（hover 命中）超过 TIP_DELAY 才弹，避免拖拽 / 扫过也闪。
+ * 内容取自主 Agent store：具体在做什么 + 技能名 + MCP 工具信息（都是 setMainAgent 喂进来的）。
+ */
+const TIP_DELAY = 400;
+const tip = ref({ show: false, x: 0, y: 0 });
+let tipTimer = null;
+
+function clearTip() {
+  if (tipTimer) {
+    clearTimeout(tipTimer);
+    tipTimer = null;
+  }
+  tip.value.show = false;
+}
+
+function onConsoleMove(e) {
+  if (!office || !canvasRef.value) return;
+  // 按住拖拽时不弹（那是平移视角，不是看信息）
+  if (e.buttons) {
+    clearTip();
+    return;
+  }
+  const r = canvasRef.value.getBoundingClientRect();
+  const px = e.clientX - r.left;
+  const py = e.clientY - r.top;
+  if (office.hitMainConsole(px, py)) {
+    tip.value.x = e.clientX;
+    tip.value.y = e.clientY;
+    if (!tipTimer) tipTimer = setTimeout(() => { tip.value.show = true; }, TIP_DELAY);
+  } else {
+    clearTip();
+  }
+}
+
+function onConsoleLeave() {
+  clearTip();
+}
+
+/** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
+const mainAgentState = computed(() => mainAgent.snapshot);
 
 /** @type {ReturnType<typeof createIsoOffice> | null} */
 let office = null;
 let cardRaf = 0;
 
-/** 场景演员：专家（有工位）+ 临时成员（幽灵，飘着） */
+/**
+ * 场景演员：专家（有工位）+ 临时成员（幽灵，飘着）。
+ *
+ * 选中的会话不是"当前工程里正在跑的那个"时（别的工程的会话 / 只剩化石数据），
+ * 这份成员清单跟那个会话对不上 —— 一律按离线 + 推断显示，绝不拿 A 工程的人
+ * 冒充 B 工程的状态。办公室布局不受影响，还是这份清单摆出来的样子。
+ */
 const sceneMembers = computed(() =>
   team.members.map((m) => ({
     memberId: m.memberId,
     name: m.name || String(m.memberId || '').split('@')[0],
-    state: m.state || 'offline',
-    degraded: Boolean(m.degraded),
+    state: sessions.live ? m.state || 'offline' : 'offline',
+    degraded: sessions.live ? Boolean(m.degraded) : true,
     ghost: isEphemeralMember(m),
     project: projectLabelOf(m),
-    taskProgress: m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
+    taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
   }))
 );
 
@@ -48,6 +100,7 @@ watch(
   (v) => office && office.setSelected(v)
 );
 watch(showPaths, (v) => office && office.setShowPaths(v));
+watch(mainAgentState, (v) => office && office.setMainAgent(v));
 
 /* ------------------------------ 任务卡 ------------------------------ */
 
@@ -97,12 +150,15 @@ function resetView() {
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setShowPaths(showPaths.value);
+  office.setMainAgent(mainAgentState.value);
 }
 
 onMounted(() => {
   office = createIsoOffice(canvasRef.value, { onSelect: openCard });
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
+  office.setMainAgent(mainAgentState.value);
+  mainAgent.start();
 
   const loop = () => {
     updateCardPos();
@@ -113,6 +169,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(cardRaf);
+  mainAgent.stop();
   if (office) office.destroy();
   office = null;
 });
@@ -120,7 +177,28 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="wrapRef" class="scene-wrap">
-    <canvas ref="canvasRef" class="scene" @click="onCanvasClick" />
+    <canvas
+      ref="canvasRef"
+      class="scene"
+      @click="onCanvasClick"
+      @mousemove="onConsoleMove"
+      @mouseleave="onConsoleLeave"
+    />
+
+    <!-- 主 Agent 控制台 tooltip：鼠标停在悬浮屏上 400ms 后弹出 -->
+    <div
+      v-if="tip.show"
+      class="console-tip"
+      :style="{ left: `${tip.x}px`, top: `${tip.y}px` }"
+    >
+      <div class="ct-head">
+        <i class="dot" :style="{ background: mainAgent.phaseColor }" />
+        <span class="ct-phase">{{ mainAgent.phaseLabel }}</span>
+      </div>
+      <div v-if="mainAgent.action" class="ct-row">{{ mainAgent.action }}</div>
+      <div v-if="mainAgent.skill" class="ct-row"><b>技能</b>{{ mainAgent.skill }}</div>
+      <div v-if="mainAgent.tool" class="ct-row"><b>工具</b>{{ mainAgent.tool }}</div>
+    </div>
 
     <!-- 任务卡（跟着角色走） -->
     <div
@@ -140,6 +218,19 @@ onBeforeUnmount(() => {
       </span>
       <span class="legend"><i class="dot ghost-dot" />临时成员</span>
       <span class="sep" />
+      <span class="legend">
+        <i class="dot" :style="{ background: mainAgent.phaseColor }" />主 Agent · {{ mainAgent.phaseLabel }}
+      </span>
+      <span v-if="sessions.selected" class="legend session-tag">
+        会话 {{ String(sessions.selected.id).slice(0, 8) }}
+        <template v-if="sessions.selected.project">· {{ sessions.selected.project }}</template>
+        <template v-if="!sessions.live">· 无实时数据</template>
+      </span>
+      <button :class="{ on: mainAgent.auto }" @click="mainAgent.setAuto(!mainAgent.auto)">
+        {{ mainAgent.auto ? '演示中' : mainAgent.live ? '会话接管' : '已暂停' }}
+      </button>
+      <button :disabled="mainAgent.live" @click="mainAgent.next()">下一阶段</button>
+      <span class="sep" />
       <button @click="callAll">集合开会</button>
       <button @click="dismiss">全员回工位</button>
       <button :class="{ on: showPaths }" @click="showPaths = !showPaths">路网</button>
@@ -148,6 +239,7 @@ onBeforeUnmount(() => {
 
     <div class="tip">
       拖拽平移 · 滚轮缩放 · 双击复位 · 点小怪物看任务
+      <span class="dim">（前玻璃墙下是主 Agent 控制台，放大可看清屏幕）</span>
       <span class="dim">（工位 {{ seatedCount }} · 临时 {{ ghostCount }}）</span>
     </div>
   </div>
@@ -243,6 +335,45 @@ onBeforeUnmount(() => {
   color: var(--text-dim);
   font-size: 11px;
   z-index: 4;
+}
+
+.console-tip {
+  position: fixed;
+  transform: translate(16px, 16px);
+  max-width: 290px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(14, 18, 26, 0.96);
+  border: 1px solid var(--accent, #4c8dff);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  color: var(--text, #e6ebf2);
+  font-size: 12px;
+  line-height: 1.5;
+  z-index: 60;
+  pointer-events: none;
+}
+
+.ct-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+}
+
+.ct-phase {
+  font-weight: 700;
+}
+
+.ct-row {
+  display: flex;
+  gap: 8px;
+  color: var(--text-dim, #a8bdd6);
+}
+
+.ct-row b {
+  flex: 0 0 auto;
+  color: #7fb0ff;
+  font-weight: 600;
 }
 
 .dim {

@@ -1,7 +1,7 @@
 <script setup>
-import { onMounted, onUnmounted, ref } from 'vue';
+import { onMounted, onUnmounted, ref, watch } from 'vue';
 import ConnectionBar from './components/ConnectionBar.vue';
-import TeamSwitcher from './components/TeamSwitcher.vue';
+import SessionSwitcher from './components/SessionSwitcher.vue';
 import FloorSelector from './components/FloorSelector.vue';
 import IsoOfficeView from './views/IsoOfficeView.vue';
 import OfficeSceneView from './views/OfficeSceneView.vue';
@@ -10,11 +10,15 @@ import WorkstationView from './views/WorkstationView.vue';
 import ConversationView from './views/ConversationView.vue';
 import { useTeamStore } from './stores/team';
 import { useMessageStore } from './stores/messages';
+import { useSessionStore } from './stores/sessions';
+import { useMainAgentStore } from './stores/mainAgent';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { httpBase } from './api/bridge';
 
 const team = useTeamStore();
 const msgs = useMessageStore();
+const sessions = useSessionStore();
+const mainAgent = useMainAgentStore();
 
 /** 支持 ?tab=lab 直接进入工位设计台（调造型时用） */
 const initialTab = (() => {
@@ -26,8 +30,6 @@ const initialTab = (() => {
 })();
 const tab = ref(initialTab);
 const selectedId = ref('');
-const floorProducts = ref([]);
-const selectedFloor = ref('1F');
 
 async function refreshMessages() {
   const base = httpBase(team.serverInfo || {});
@@ -53,24 +55,17 @@ async function onOpenWorkspace(path) {
   msgs.setFilters({ members: [] });
   try {
     await team.openWorkspace(path);
+    await sessions.refresh(team.serverInfo || {});
   } catch (err) {
     console.warn('[workgremlin] 打开工程失败：', err && err.message);
   }
 }
 
-/** 左侧楼层：受监控产品及其安装状态（1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy 插件） */
-async function fetchProducts() {
-  const info = team.serverInfo || {};
-  try {
-    const res = await fetch(`${httpBase(info)}/api/v1/products`, {
-      headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
-    });
-    const data = await res.json();
-    if (data && data.ok) floorProducts.value = data.products || [];
-  } catch {
-    /* 忽略：不影响主界面 */
-  }
-}
+/** 选中的会话变了 → 主 Agent 控制台改显示这个会话的状态（办公室布局不动） */
+watch(
+  () => sessions.selected,
+  (s) => mainAgent.applySession(s)
+);
 
 onMounted(async () => {
   await team.init((msg) => {
@@ -78,10 +73,14 @@ onMounted(async () => {
     if (msg.type === WS_EVENTS.SNAPSHOT) msgs.setSnapshot(msg.payload.recentMessages || []);
   });
   await refreshMessages();
-  await fetchProducts();
+  await sessions.refresh(team.serverInfo || {});
+  sessions.startPolling(team.serverInfo || {});
 });
 
-onUnmounted(() => team.dispose());
+onUnmounted(() => {
+  sessions.stopPolling();
+  team.dispose();
+});
 </script>
 
 <template>
@@ -103,15 +102,21 @@ onUnmounted(() => team.dispose());
       <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">对话记录</button>
       <button :class="{ on: tab === 'lab' }" @click="tab = 'lab'">工位设计</button>
       <span class="spacer" />
-      <TeamSwitcher
-        :teams="team.teams"
-        :model-value="team.team ? team.team.name : ''"
-        @update:model-value="team.switchTeam($event)"
+      <SessionSwitcher
+        :items="sessions.options"
+        :model-value="sessions.selectedId"
+        :empty-label="sessions.emptyLabel"
+        @update:model-value="sessions.select($event)"
       />
     </nav>
 
     <main class="body">
-      <FloorSelector v-model="selectedFloor" :products="floorProducts" />
+      <!-- 楼层：一层一个受监控的智能体；状态点绿 = 这一层有活跃会话 -->
+      <FloorSelector
+        :products="sessions.floors"
+        :model-value="sessions.selectedFloor"
+        @update:model-value="sessions.selectFloor($event)"
+      />
 
       <section class="stage">
         <IsoOfficeView

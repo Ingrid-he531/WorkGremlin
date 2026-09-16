@@ -37,9 +37,11 @@ import {
   PLANTS,
   PLACES,
   NAV_NODES,
+  CONSOLE,
   route,
 } from './officeMap';
 import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from './sprites';
+import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator, drawDispatchBeam } from './mainConsole';
 
 const STATE_COLOR = {
   online: '#2ecc71',
@@ -78,7 +80,7 @@ const GHOST_SPOTS = [
   { x: 10.4, y: 5.4, z: 1.9 },
   { x: 2.2, y: 9.4, z: 2.2 },
 ];
-const GHOST_MEET = { x: 17.0, y: 3.0, z: 2.25 };
+const GHOST_MEET = { x: 17.0, y: 3.6, z: 2.25 };
 
 /**
  * @param {HTMLCanvasElement} canvas
@@ -168,6 +170,22 @@ export function createIsoOffice(canvas, opts = {}) {
   function toScreen(gx, gy, gz = 0) {
     const p = project(gx, gy, gz);
     return { x: p.x * cam.zoom + cam.ox, y: p.y * cam.zoom + cam.oy };
+  }
+
+  /* ------------------------------ 主 Agent 控制台 ------------------------------ */
+
+  /**
+   * 主会话（Craft Agent）的状态：{ phase, action, context[], target }。
+   * 现在由 stores/mainAgent.js 的 mock 喂，以后换成 hook 事件即可，画法不变。
+   */
+  let mainAgent = { phase: 'idle', action: '', context: [], target: null };
+
+  /** 调度目标：可以写工位号（A0…B2），也可以写成员 id —— 都换算成脚下的坐标 */
+  function targetSeat(id) {
+    const u = DESK_UNITS.find((d) => d.id === id);
+    if (u) return u.seat;
+    const a = agents.find((ag) => ag.memberId === id);
+    return a ? { x: a.x, y: a.y } : null;
   }
 
   /* ------------------------------ 成员 ------------------------------ */
@@ -594,8 +612,9 @@ export function createIsoOffice(canvas, opts = {}) {
       isoBox(c, { x: mt.x + 1.9, y: mt.y + 0.6, z: mt.h, w: 0.42, d: 0.3, h: 0.12, color: '#2b3140' });
     });
 
+    // 前一半椅子在桌子北侧（椅背朝北），后一半在南侧
     MEETING.chairs.forEach((ch, i) => {
-      push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 3));
+      push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 4));
     });
 
     // 玻璃隔墙（半透明，压在会议室里的人之上）
@@ -624,7 +643,7 @@ export function createIsoOffice(canvas, opts = {}) {
     });
 
     PANTRY.chairs.forEach((ch, i) => {
-      push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 2));
+      push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 3));
     });
 
     const pc = PANTRY.cooler;
@@ -633,16 +652,14 @@ export function createIsoOffice(canvas, opts = {}) {
       isoCylinder(c, { x: pc.x, y: pc.y, z: pc.h - 0.5, r: 0.28, h: 0.5, color: '#5aa9e6', alpha: 0.85 });
     });
 
-    // 茶水间玻璃隔断：西面（门在中间）+ 南面；北面借会议室南墙，不另砌
+    // 茶水间玻璃隔断：只砌西面（门在中间）；
+    // 北面借会议室的南墙，南面直接贴房间最前面那道玻璃幕墙，不再多砌一道
     const ph = PANTRY.glass.h;
     const pg = PANTRY.glass;
     [pg.westA, pg.westB].forEach((g) => {
       push(depthOf(g.x, g.y + g.d / 2) + 0.6, (c) => {
         isoBox(c, { ...g, h: ph, color: COLORS.glass, alpha: 0.16 });
       });
-    });
-    push(depthOf(pg.south.x + pg.south.w / 2, pg.south.y) + 0.6, (c) => {
-      isoBox(c, { ...pg.south, h: ph, color: COLORS.glass, alpha: 0.16 });
     });
 
     /* 复印机（会议室东南角） */
@@ -655,6 +672,15 @@ export function createIsoOffice(canvas, opts = {}) {
     });
 
     PLANTS.forEach((p) => push(depthOf(p.x, p.y), (c) => drawPlant(c, p)));
+
+    /* 主 Agent 控制台：柜体 → 悬浮屏 → 剪影（depth 由小到大，正好是从里到外的顺序） */
+    const cd = CONSOLE.desk;
+    push(depthOf(cd.x + cd.w / 2, cd.y + cd.d / 2), (c, now) => drawConsoleDesk(c, now));
+    const cs = CONSOLE.screen;
+    push(depthOf(cs.x + cs.w / 2, cs.y) + 0.05, (c, now) =>
+      drawConsoleScreen(c, { state: mainAgent, now, zoom: cam.zoom })
+    );
+    push(depthOf(CONSOLE.seat.x, CONSOLE.seat.y), (c, now) => drawOperator(c, { state: mainAgent, now }));
 
     return items;
   }
@@ -732,62 +758,123 @@ export function createIsoOffice(canvas, opts = {}) {
     wallQuad(c, 'y', 0, 0, ROOM.w, 0, 0.12, shade(COLORS.wall, 0.75));
     wallQuad(c, 'x', 0, 0, ROOM.d, 0, 0.12, shade(COLORS.wall, 0.66));
 
-    // 窗（夜景）
-    WALL.windows.forEach((w) => {
+    // 窗（夜景）：外框 + 玻璃 + 窗台，外加漏进屋里的月光
+    WALL.windows.forEach((w, wi) => {
       const gy = 0;
-      wallQuad(c, 'y', gy, w.x0 - 0.08, w.x1 + 0.08, w.z0 - 0.08, w.z1 + 0.08, '#232a36');
-      const top = project(0, 0, w.z1).y;
-      const bot = project(0, 0, w.z0).y;
-      const g = c.createLinearGradient(0, top, 0, bot);
-      g.addColorStop(0, '#16233d');
-      g.addColorStop(1, '#0b1020');
+      const cxm = (w.x0 + w.x1) / 2;
+      const czm = (w.z0 + w.z1) / 2;
+      const FW = 0.11;  // 窗框宽
+      const SD = 0.18;  // 窗台伸出墙面的深度
+      const frame = '#3d4859';
+      const frameLit = shade(frame, 1.4);   // 上沿受天光
+      const frameDim = shade(frame, 0.6);   // 下沿背光
+
+      /* 透光：先在墙面上晕一圈冷光，再往地上铺一片月光。都用 lighter 叠加，
+         才像"光"加在墙/地上，而不是一块灰补丁。 */
       c.save();
+      c.globalCompositeOperation = 'lighter';
+      // 墙上的光晕：拿墙自己的两根轴（gx、gz）当局部基底，圆才不会画成屏幕上正圆
+      const gc0 = project(cxm, gy, czm);
+      c.save();
+      c.transform(AX.x, AX.y, AZ.x, AZ.y, gc0.x, gc0.y);
+      const rg = c.createRadialGradient(0, 0, 0, 0, 0, 2);
+      rg.addColorStop(0, 'rgba(120,165,255,0.17)');
+      rg.addColorStop(0.5, 'rgba(110,150,255,0.07)');
+      rg.addColorStop(1, 'rgba(100,140,255,0)');
       c.beginPath();
-      const p = [
+      c.arc(0, 0, 2, 0, Math.PI * 2);
+      c.fillStyle = rg;
+      c.fill();
+      c.restore();
+      // 地上的光斑：从墙根往屋里渐隐（略微外扩，像光是斜着进来的）
+      const fL = 2;
+      const gA = project(cxm, gy + 0.1, 0);
+      const gB = project(cxm, gy + fL, 0);
+      const fg = c.createLinearGradient(gA.x, gA.y, gB.x, gB.y);
+      fg.addColorStop(0, 'rgba(126,168,255,0.20)');
+      fg.addColorStop(1, 'rgba(126,168,255,0)');
+      poly(c, [
+        project(w.x0 - 0.1, gy + 0.1, 0),
+        project(w.x1 + 0.1, gy + 0.1, 0),
+        project(w.x1 + 0.35, gy + fL, 0),
+        project(w.x0 - 0.35, gy + fL, 0),
+      ], fg);
+      c.restore();
+
+      // 墙上的洞口：比玻璃大一圈的暗边，就是墙体厚度
+      wallQuad(c, 'y', gy, w.x0 - FW, w.x1 + FW, w.z0 - FW, w.z1 + FW, '#1a1f28');
+      // 外框：上沿亮、下沿暗，一眼能看出是"框"而不是一块黑
+      wallQuad(c, 'y', gy, w.x0 - FW, w.x1 + FW, w.z1, w.z1 + FW, frameLit);
+      wallQuad(c, 'y', gy, w.x0 - FW, w.x1 + FW, w.z0 - FW, w.z0, frameDim);
+      wallQuad(c, 'y', gy, w.x0 - FW, w.x0, w.z0, w.z1, frame);
+      wallQuad(c, 'y', gy, w.x1, w.x1 + FW, w.z0, w.z1, frameDim);
+
+      // 玻璃：夜空渐变，上亮下暗
+      const pTop = project(cxm, gy, w.z1);
+      const pBot = project(cxm, gy, w.z0);
+      const g = c.createLinearGradient(0, pTop.y, 0, pBot.y);
+      g.addColorStop(0, '#1d2e52');
+      g.addColorStop(0.55, '#141d33');
+      g.addColorStop(1, '#0a0f1c');
+      poly(c, [
         project(w.x0, gy, w.z1),
         project(w.x1, gy, w.z1),
         project(w.x1, gy, w.z0),
         project(w.x0, gy, w.z0),
-      ];
-      c.moveTo(p[0].x, p[0].y);
-      for (let i = 1; i < 4; i += 1) c.lineTo(p[i].x, p[i].y);
-      c.closePath();
-      c.fillStyle = g;
+      ], g);
+
+      // 月亮：右上角一团冷光
+      const moon = project(w.x1 - 0.6, gy, w.z1 - 0.45);
+      const mg = c.createRadialGradient(moon.x, moon.y, 0, moon.x, moon.y, 14);
+      mg.addColorStop(0, 'rgba(226,238,255,0.95)');
+      mg.addColorStop(0.3, 'rgba(170,205,255,0.4)');
+      mg.addColorStop(1, 'rgba(120,160,255,0)');
+      c.beginPath();
+      c.arc(moon.x, moon.y, 14, 0, Math.PI * 2);
+      c.fillStyle = mg;
       c.fill();
-      c.restore();
-      // 星星 + 窗框
-      for (let k = 0; k < 5; k += 1) {
-        const sp = project(w.x0 + 0.4 + k * ((w.x1 - w.x0) / 5.5), gy, w.z0 + 0.25 + ((k * 0.37) % 0.7));
+
+      // 星星：每扇窗排布不同（用窗口序号当种子的确定性伪随机）
+      const rnd = (i) => {
+        const s = Math.sin((wi + 1) * 12.9898 + i * 78.233) * 43758.5453;
+        return s - Math.floor(s);
+      };
+      for (let k = 0; k < 7; k += 1) {
+        const sp = project(
+          w.x0 + 0.35 + rnd(k) * (w.x1 - w.x0 - 0.7),
+          gy,
+          w.z0 + 0.2 + rnd(k + 7) * (w.z1 - w.z0 - 0.55),
+        );
         c.beginPath();
-        c.arc(sp.x, sp.y, 1.1, 0, Math.PI * 2);
-        c.fillStyle = 'rgba(143,182,255,0.55)';
+        c.arc(sp.x, sp.y, 0.9 + rnd(k + 13) * 0.6, 0, Math.PI * 2);
+        c.fillStyle = 'rgba(160,200,255,0.5)';
         c.fill();
       }
-      wallQuad(c, 'y', gy, (w.x0 + w.x1) / 2 - 0.03, (w.x0 + w.x1) / 2 + 0.03, w.z0, w.z1, '#232a36');
-      wallQuad(c, 'y', gy, w.x0, w.x1, (w.z0 + w.z1) / 2 - 0.02, (w.z0 + w.z1) / 2 + 0.02, '#232a36');
+
+      // 窗棂：十字一根竖一根横，用比玻璃亮一档的框色才看得见
+      const mull = shade(frame, 1.25);
+      wallQuad(c, 'y', gy, cxm - 0.035, cxm + 0.035, w.z0, w.z1, mull);
+      wallQuad(c, 'y', gy, w.x0, w.x1, czm - 0.03, czm + 0.03, mull);
+      wallQuad(c, 'y', gy, w.x0, w.x1, czm + 0.03, czm + 0.05, frameLit);
+
+      // 窗台：从墙里伸出来一道窄台面，前沿压一条高光
+      const sill = '#394252';
+      isoDiamond(c, { x: w.x0 - FW, y: gy, w: w.x1 - w.x0 + FW * 2, d: SD, z: w.z0 - FW, fill: sill });
+      isoDiamond(c, {
+        x: w.x0 - FW, y: gy + SD - 0.05, w: w.x1 - w.x0 + FW * 2, d: 0.05, z: w.z0 - FW, fill: shade(sill, 1.3),
+      });
     });
 
-    // 大门（后墙）
+    // 大门（左墙 gx = 0，挂在挂钟左侧。墙换了一面 → 用 'x' 面，a 轴变成 gy）
     const d = WALL.door;
-    wallQuad(c, 'y', 0, d.x0, d.x1, d.z0, d.z1, '#2f3745');
-    wallQuad(c, 'y', 0, d.x0 + 0.06, d.x1 - 0.06, d.z0 + 0.06, d.z1 - 0.06, '#1a1f28');
-    const knob = project(d.x1 - 0.18, 0, 1.0);
+    wallQuad(c, 'x', 0, d.y0, d.y1, d.z0, d.z1, '#2f3745');
+    wallQuad(c, 'x', 0, d.y0 + 0.06, d.y1 - 0.06, d.z0 + 0.06, d.z1 - 0.06, '#1a1f28');
+    // 门把手：装在靠钟那一侧的门边
+    const knob = project(0, d.y0 + 0.18, 1.0);
     c.beginPath();
     c.arc(knob.x, knob.y, 2, 0, Math.PI * 2);
     c.fillStyle = '#9aa7b8';
     c.fill();
-    // 门牌
-    const sign = project((d.x0 + d.x1) / 2, 0, d.z1 + 0.22);
-    c.save();
-    c.fillStyle = 'rgba(143,182,255,0.14)';
-    c.fillRect(sign.x - 26, sign.y - 9, 52, 18);
-    c.fillStyle = '#8fa3bf';
-    c.font = '11px ui-sans-serif, system-ui, sans-serif';
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    c.fillText('WORKGREMLIN', sign.x, sign.y);
-    c.restore();
-
     // 会议室白板（贴在后墙内侧）
     const wb = MEETING.whiteboard;
     wallQuad(c, 'y', 0, wb.x0 - 0.06, wb.x1 + 0.06, wb.z0 - 0.06, wb.z1 + 0.06, '#39414f');
@@ -809,7 +896,8 @@ export function createIsoOffice(canvas, opts = {}) {
     c.restore();
 
     // 茶水间标识
-    const plabel = project(PANTRY.x + PANTRY.w / 2, PANTRY.y + PANTRY.d + 0.4, 2.45);
+    // 南面就是玻璃幕墙，标识退回屋里一点，免得被幕墙压住
+    const plabel = project(PANTRY.x + PANTRY.w / 2, PANTRY.y + PANTRY.d - 0.35, 2.45);
     c.save();
     c.fillStyle = '#8fa3bf';
     c.font = '12px ui-sans-serif, system-ui, sans-serif';
@@ -820,7 +908,7 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 左墙挂钟（gx = 0 那面墙，整面墙空着，就它一个挂件）。
+   * 左墙挂钟（gx = 0 那面墙；大门也开在这面墙上，在钟的左侧 gy 更大的那头）。
    * 秒针会动，所以每帧现画 —— 画进缓存的背景里就永远停在开局那一秒了。
    * 墙面在等距下是斜的，跟名牌一样用墙面自己的两根轴当局部基底斜切。
    * 挂得够高（cz > 1.4）屋里家具就盖不到它：等距下家具能挡住的墙高 = 物高 − 物到墙的距离。
@@ -1023,6 +1111,12 @@ export function createIsoOffice(canvas, opts = {}) {
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
 
+    // 委托专家：一道光从控制台射向那个工位。光是"照过去"的，所以压在家具之上。
+    if (mainAgent.phase === 'dispatch' && mainAgent.target) {
+      const seat = targetSeat(mainAgent.target);
+      if (seat) drawDispatchBeam(ctx, CONSOLE.beam, seat, now, PHASES.dispatch.color);
+    }
+
     // 路网调试
     if (showPaths) {
       for (const n of NAV_NODES) {
@@ -1122,6 +1216,42 @@ export function createIsoOffice(canvas, opts = {}) {
     return null;
   }
 
+  /** 射线法判断屏幕坐标是否落在多边形内（CSS px） */
+  function pointInPoly(px, py, pts) {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i].x;
+      const yi = pts[i].y;
+      const xj = pts[j].x;
+      const yj = pts[j].y;
+      const hit = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+      if (hit) inside = !inside;
+    }
+    return inside;
+  }
+
+  /**
+   * 主 Agent 悬浮屏的命中检测（与 onMove 的 px/py 同一套 CSS 像素坐标）。
+   * 屏是贴在 gy 恒定竖直面上的一块 wallQuad，四个角投影成屏幕四边形后做 point-in-polygon。
+   * 比画出来的屏框再外扩一圈 padding，hover 好命中一点。
+   */
+  function hitMainConsole(px, py) {
+    const s = CONSOLE.screen;
+    const pad = 0.06;
+    const fx = s.y - 0.012;
+    const x0 = s.x - 0.07 - pad;
+    const x1 = s.x + s.w + 0.07 + pad;
+    const z0 = s.z0 - 0.07 - pad;
+    const z1 = s.z1 + 0.07 + pad;
+    const poly = [
+      toScreen(x0, fx, z1),
+      toScreen(x1, fx, z1),
+      toScreen(x1, fx, z0),
+      toScreen(x0, fx, z0),
+    ];
+    return pointInPoly(px, py, poly);
+  }
+
   function onMove(e) {
     const r = canvas.getBoundingClientRect();
     const px = e.clientX - r.left;
@@ -1210,6 +1340,14 @@ export function createIsoOffice(canvas, opts = {}) {
     /** 角色脚底的 CSS 像素坐标（给任务卡定位用） */
     screenOf(id) {
       return screenPos.get(id) || null;
+    },
+    /** 主 Agent 悬浮屏命中检测（CSS px）：hover 该屏时给 Vue 侧弹 tooltip 用 */
+    hitMainConsole(px, py) {
+      return hitMainConsole(px, py);
+    },
+    /** 主 Agent 控制台：{ phase, action, context[], target }（现在由 mock 驱动，以后接 hook 事件） */
+    setMainAgent(s) {
+      mainAgent = { phase: 'idle', action: '', context: [], target: null, ...(s || {}) };
     },
     meetingCount: () => agents.filter((a) => a.inMeeting).length + ghosts.filter((g) => g.inMeeting).length,
     stateColor: (s) => STATE_COLOR[bucketOf(s)],

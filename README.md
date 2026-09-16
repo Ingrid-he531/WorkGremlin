@@ -71,6 +71,41 @@ node scripts/subagents.js list
 
 清单文件路径：`$WORKGREMLIN_SUBAGENTS_FILE` > `$WORKGREMLIN_WORKSPACE/.workgremlin/subagents.json` > `<cwd>/.workgremlin/subagents.json`。
 
+## CodeBuddy / WorkBuddy 接入（hook）
+
+让正在干活的 agent 自己往屋里报状态：装一次，CodeBuddy 插件、CodeBuddy CLI、WorkBuddy CLI
+三个入口的会话都会上报：
+
+```bash
+npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy
+npm run hooks:install -- --member coder    # 指定工位名（默认 codebuddy）
+npm run hooks:install -- --project         # 另外写一份项目级 <仓库>/.codebuddy/settings.json
+npm run hooks:uninstall                    # 撤掉（只删我们加的那几条，别人的配置不动）
+```
+
+事件 → 上报的映射（对齐 `docs/requirements.md` §5 的状态机）：
+
+| hook 事件 | 上报 |
+| --- | --- |
+| `SessionStart` | 注册成员 + `idle`（等派单）+ 拉起心跳守护 |
+| `UserPromptSubmit` | `task/start`（标题 = 用户那句话的前 80 字）+ `busy` |
+| `PreToolUse` | `busy` |
+| `PostToolUse` | 写 / 改类工具 → `file/touch`；`busy` |
+| `Notification` | 等权限 → `blocked`（`awaiting_permission`）；空闲提醒 → `idle` |
+| `Stop` | `task/end(done)` + `idle` |
+| `SessionEnd` | `offline` + 撤掉心跳守护 |
+
+几个要点：
+
+- **报给哪个 team**：默认报进屋里「当前打开的工程」（问服务端 `/api/v1/workspace`），
+  `WORKGREMLIN_TEAM` 可覆盖；工位名默认 `codebuddy`（`WORKGREMLIN_MEMBER` 可覆盖）。
+- **心跳**：60s 无心跳就 `degraded`（灰显 + 「推断」），所以 `SessionStart` 会另起一个 15s
+  一次的心跳守护（`node packages/reporter/src/hook.js --heartbeat`），`SessionEnd` 收掉；
+  会话异常退出时，最多 30 分钟没有事件就自己退，不留孤儿进程。
+- **绝不阻塞 agent**：服务没起 / 上报失败 / stdin 不是 JSON，一律静默退出 0，
+  且**一个字都不写 stdout**（hook 的 stdout 会被塞回上下文）。调试用 `WORKGREMLIN_HOOK_DEBUG=1`（走 stderr）。
+- **CLI 侧改完不会立刻生效**：启动时快照 hooks，外部改动要在 `/hooks` 面板过一遍；插件侧重开会话即可。
+
 顶部连接条显示当前**工程名**：`<workspace>/package.json` 的 `name`（去 scope）→ 目录名；拿不到就是空串，不编造。
 
 ## 安全基线（不得关闭）

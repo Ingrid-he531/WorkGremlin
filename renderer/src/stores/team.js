@@ -117,6 +117,20 @@ export const useTeamStore = defineStore('team', {
       if (this._conn) this._conn.subscribe({ team: name });
     },
 
+    /**
+     * 下拉里选了一个"工程"：它属于别的目录就真正打开那个工程（换监听根 + 幽灵数据源），
+     * 只切订阅会出现"屋里是 A 的成员、幽灵是 B 的"这种错位。
+     * @param {string} name team 名
+     */
+    async selectTeam(name) {
+      const t = this.teams.find((x) => x.name === name);
+      if (t && t.workspacePath && this.workspacePath && t.workspacePath !== this.workspacePath) {
+        await this.openWorkspace(t.workspacePath);
+        return;
+      }
+      this.switchTeam(name);
+    },
+
     dispose() {
       if (this._conn) this._conn.close();
       this._conn = null;

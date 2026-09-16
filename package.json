@@ -21,7 +21,9 @@
     "server": "node server/src/cli.js",
     "build": "npm run build --workspace @workgremlin/renderer",
     "start": "electron desktop/src/main.js",
-    "db:check": "node server/src/cli.js --self-test"
+    "db:check": "node server/src/cli.js --self-test",
+    "hooks:install": "node scripts/install-hooks.js",
+    "hooks:uninstall": "node scripts/install-hooks.js --uninstall"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

@@ -92,6 +92,8 @@ export interface Team {
   mainConversationId: string | null;
   source: Source | string;
   createdAt: number;
+  /** 所属工程名（package.json name > 目录名）；拿不到为空串 */
+  project?: string;
 }
 
 export interface Snapshot {

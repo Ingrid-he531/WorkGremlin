@@ -25,6 +25,7 @@ const { createQueryRouter } = require('./http/routes/query');
 const { createIngestRouter } = require('./http/routes/ingest');
 const { createWorkspaceRouter } = require('./http/routes/workspace');
 const { createProductsRouter } = require('./http/routes/products');
+const { createSessionsRouter } = require('./http/routes/sessions');
 const { requireToken } = require('./http/auth');
 const config = require('./config');
 const { seedDemoData, createDemoTicker } = require('./mock/generator');
@@ -128,6 +129,8 @@ function createServer(opts = {}) {
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
   app.use('/api/v1', requireToken(token), createProductsRouter());
+  /** 会话下拉：所有工程里的活跃会话 */
+  app.use('/api/v1', requireToken(token), createSessionsRouter({ workspace }));
 
   if (opts.serveStatic) {
     app.use(express.static(path.resolve(opts.serveStatic)));
@@ -198,9 +201,19 @@ function createServer(opts = {}) {
     );
     for (const t of timers) if (t.unref) t.unref();
 
-    maybeSeedDemo();
+    // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）
+    const restored = workspace.restore();
+    if (info) {
+      info.project = restored.project;
+      info.workspacePath = restored.workspacePath || workspacePath;
+      config.writeServerInfo(info);
+    }
 
-    if (isDemoMode()) {
+    // 演示数据要在**恢复之后**再决定：上次停在演示数据、这回又没带 --demo 启动时，
+    // restore() 会把人带回 demo team，而按启动参数判定又不会灌数据、不跑心跳 —— 屋里就空了。
+    maybeSeedDemo(Boolean(restored.demo));
+
+    if (isDemoMode() || restored.demo) {
       demoTicker = createDemoTicker({
         bus,
         repo,
@@ -208,14 +221,6 @@ function createServer(opts = {}) {
         seed: Number(opts.seed ?? process.env.WORKGREMLIN_DEMO_SEED ?? 1),
       });
       demoTicker.start();
-    }
-
-    // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）
-    const restored = workspace.restore();
-    if (info) {
-      info.project = restored.project;
-      info.workspacePath = restored.workspacePath || workspacePath;
-      config.writeServerInfo(info);
     }
 
     // subagent 清单 → 幽灵：文件里有谁，屋里就飘着谁（换工程就重开一个监听）
@@ -238,14 +243,19 @@ function createServer(opts = {}) {
     return opts.demo === true || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1';
   }
 
-  function shouldSeedDemo() {
+  /**
+   * @param {boolean} [onDemoWorkspace] 恢复后当前就停在演示数据上：这种也算 demo，
+   *   否则非 --demo 启动 + 上次停在演示数据 = 恢复进 demo team 却没数据，屋里空无一人。
+   */
+  function shouldSeedDemo(onDemoWorkspace) {
     if (opts.demo === true || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1') return true;
     if (process.env.WORKGREMLIN_NO_DEMO === '1') return false;
+    if (onDemoWorkspace) return true;
     return repo.listTeams.all().length === 0; // 首次运行：给两个界面一份可渲染的数据
   }
 
-  function maybeSeedDemo() {
-    if (!shouldSeedDemo()) return null;
+  function maybeSeedDemo(onDemoWorkspace) {
+    if (!shouldSeedDemo(onDemoWorkspace)) return null;
     const team = process.env.WORKGREMLIN_TEAM || 'workgremlin';
     // 演示数据的时间基准锚定当前时间，每次重跑都会生成新时间戳。
     // 已有数据时默认跳过（否则反复 --demo 启动会让消息无限堆积），

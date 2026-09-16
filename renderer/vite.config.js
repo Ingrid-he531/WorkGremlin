@@ -24,6 +24,9 @@ function readServerToken() {
 }
 
 export default defineConfig({
+  // 相对路径：prod 走 Electron loadFile(file://) 加载 dist，绝对 /assets/* 会被解析到
+  // 文件系统根导致 404 -> 首屏全黑。dev（Vite dev server）同理兼容。
+  base: './',
   plugins: [vue()],
   resolve: {
     alias: {
