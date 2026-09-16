@@ -164,6 +164,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
       files: s.files,
       phase: s.phase,
       action: s.action,
+      target: s.target || '',
       context: s.context || [],
       inferred: true,
       lastEventAt: s.lastUpdated || 0,

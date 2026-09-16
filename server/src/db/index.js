@@ -48,6 +48,45 @@ function ensureColumn(db, table, column, ddl) {
 function migrate(db) {
   ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'members', 'project', 'project TEXT');
+  ensureAgentStatusThinking(db);
+}
+
+/**
+ * 老库的 agent_status.state 带旧 CHECK 约束（不含 thinking），
+ * 而 CREATE TABLE IF NOT EXISTS 不会改已有表的约束。
+ * 运行时状态表，内容可丢（下个上报/心跳会补齐），所以重建该表放宽为包含 thinking。
+ * @param {import('better-sqlite3').Database} db
+ */
+function ensureAgentStatusThinking(db) {
+  let sql = '';
+  try {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_status'").get();
+    sql = (row && row.sql) || '';
+  } catch {
+    return;
+  }
+  if (!sql || /thinking/.test(sql)) return; // 已是新约束或表不存在
+  db.exec(`
+    ALTER TABLE agent_status RENAME TO _agent_status_old;
+    CREATE TABLE agent_status (
+      member_id          TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+      state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline', 'thinking')),
+      state_since        INTEGER NOT NULL,
+      task_id            TEXT,
+      progress           REAL,
+      current_files      TEXT,
+      last_heartbeat_at  INTEGER,
+      degraded           INTEGER NOT NULL DEFAULT 0,
+      source             TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch', 'timeout')),
+      updated_at         INTEGER NOT NULL
+    );
+    INSERT INTO agent_status
+      (member_id, state, state_since, task_id, progress, current_files, last_heartbeat_at, degraded, source, updated_at)
+    SELECT member_id, state, state_since, task_id, progress, current_files, last_heartbeat_at, degraded, source, updated_at
+    FROM _agent_status_old;
+    DROP TABLE _agent_status_old;
+    CREATE INDEX IF NOT EXISTS idx_status_state ON agent_status(state);
+  `);
 }
 
 function applyPragmas(db) {

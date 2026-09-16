@@ -17,11 +17,13 @@ import { PHASES } from '../iso/mainConsole';
 const SCRIPT = [
   { phase: 'idle', action: '', context: ['等待派单'], skill: '', tool: '', ms: 6000 },
   { phase: 'plan', action: '正在拆解任务', context: ['任务：重构用户登录模块', '目标：拆成 3 个子任务'], skill: 'planning（规划）', tool: '', ms: 5200 },
+  { phase: 'thinking', action: '正在分析你的请求', context: ['任务：重构用户登录模块', '思考：先理清登录链路'], skill: 'reasoning（推理）', tool: '', ms: 4200 },
   { phase: 'tool', action: '正在读取 src/main.js', context: ['任务：重构用户登录模块', '进度：已读取 1 个文件'], skill: '', tool: 'mcp: filesystem.read_file', ms: 3800 },
   { phase: 'tool', action: '正在搜索 login 相关引用', context: ['任务：重构用户登录模块', '进度：已读取 3 个文件', '命中：7 处引用'], skill: '', tool: 'mcp: ripgrep.search', ms: 3800 },
   { phase: 'dispatch', action: '正在召唤 Coder 专家', target: 'A1', context: ['任务：重构用户登录模块', '委托：Coder 改写登录逻辑'], skill: 'delegate（委托专家）', tool: '', ms: 5200 },
   { phase: 'tool', action: '正在读取 src/auth/session.js', context: ['任务：重构用户登录模块', '进度：已读取 5 个文件'], skill: '', tool: 'mcp: filesystem.read_file', ms: 3600 },
   { phase: 'dispatch', action: '正在召唤 Tester 专家', target: 'B1', context: ['任务：重构用户登录模块', '委托：Tester 补登录用例'], skill: 'delegate（委托专家）', tool: '', ms: 4800 },
+  { phase: 'await', action: '申请写入 renderer/vite.config.js', target: 'renderer/vite.config.js', context: ['等待用户授权后继续', '原因：修改构建基路径 base'], skill: '', tool: 'mcp: filesystem.write_file', ms: 5000 },
   { phase: 'summarize', action: '正在汇总各专家结果', context: ['任务：重构用户登录模块', '已回收：2/2', '准备写入变更摘要'], skill: 'summarize（汇总）', tool: '', ms: 5000 },
 ];
 
@@ -34,6 +36,10 @@ export const useMainAgentStore = defineStore('mainAgent', {
     auto: true,
     /** true = 状态来自真实会话（插件落盘，阶段是推断的），mock 不推进 */
     live: false,
+    /** true = 当前由 hook 实时上报驱动（reporter 把 busy/idle/offline/blocked 发给服务端） */
+    hookLive: false,
+    /** 最近一次 hook 喂进来的成员卡（仅用于 HUD/调试，不直接驱动画法） */
+    liveMember: null,
     phase: 'idle',
     action: '',
     skill: '',
@@ -97,6 +103,36 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
+     * 用 reporter hook 实时上报的成员卡驱动主控制台。hook 不发事件时 s 传 null，
+     * 这时若之前是 hook 在驱动就退回演示脚本（auto 开的话），否则不动（让会话接管保留）。
+     *
+     * 阶段映射（hook 的 AGENT_STATES -> 主控制台 PHASES）：
+     *   busy    -> tool  （调用工具 / 干活中，对应"工作却显示空闲"的修复）
+     *   blocked -> await（等用户授权；工具与目标走会话落盘的 await 叠加）
+     *   idle / online / offline -> idle（offline 对应"关掉 VS Code 还显示规划中"的修复）
+     * @param {null|{phase:string, action?:string, context?:string[], target?:any}} s
+     */
+    setLiveState(s) {
+      if (!s) {
+        if (this.hookLive) {
+          this.hookLive = false;
+          if (this.auto) this.start();
+        }
+        this.liveMember = null;
+        return;
+      }
+      this.stop();
+      this.hookLive = true;
+      this.liveMember = s;
+      this.phase = s.phase || 'idle';
+      this.action = s.action || '';
+      this.skill = s.skill || '';
+      this.tool = s.tool || '';
+      this.target = s.target || null;
+      this.context = Array.isArray(s.context) ? s.context : [];
+    },
+
+    /**
      * 会话接管：下拉里选了某个会话，控制台就显示**这个会话**的状态。
      * 真源是插件落盘，阶段是按 runtime + 待办 + 文件改动推出来的（inferred），
      * 所以 mock 的自动推进要停下来，别跟真数据打架。
@@ -116,8 +152,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.action = s.action || '';
       this.skill = s.skill || '';
       this.tool = s.tool || '';
+      this.target = s.target || null;
       this.context = Array.isArray(s.context) ? s.context : [];
-      this.target = null;
     },
   },
 });

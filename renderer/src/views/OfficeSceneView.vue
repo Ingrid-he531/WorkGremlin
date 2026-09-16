@@ -48,9 +48,10 @@ const STATE_COLOR = {
   busy: '#f5a623',
   idle: '#7f8c9b',
   blocked: '#ff5c5c',
+  thinking: '#ffcf5c',
   offline: '#4a5160',
 };
-const STATE_LABEL = { online: '在线', busy: '忙碌', idle: '空闲', blocked: '阻塞', offline: '离线' };
+const STATE_LABEL = { online: '在线', busy: '忙碌', idle: '空闲', blocked: '阻塞', thinking: '思考中', offline: '离线' };
 
 /* ------------------------------ 成员 → 工位 ------------------------------ */
 

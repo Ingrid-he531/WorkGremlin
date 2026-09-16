@@ -10,7 +10,7 @@
  *
  * 事件 → 上报（对齐 docs/requirements.md §5 的状态机）：
  *   SessionStart      register + idle（等派单）+ 拉起心跳守护
- *   UserPromptSubmit  task/start（标题 = 用户那句话的前 80 字）+ busy
+ *   UserPromptSubmit  task/start（标题 = 用户那句话的前 80 字）+ thinking（思考中，直到下一个事件）
  *   PreToolUse        busy（顺带心跳）
  *   PostToolUse       写/改类工具 → file/touch，并 busy
  *   Notification      等权限 → blocked(reason=awaiting_permission)；空闲提醒 → idle
@@ -181,6 +181,22 @@ function relFile(file, cwd) {
   return abs;
 }
 
+/** 把"等权限"标记写进本地状态文件：要执行的工具 + 目标文件 + 工程 + 时间。
+ *  优先取 notification 自带的工具信息，取不到就回退到最近一次 PreToolUse 记的。 */
+function setAwait(file, ctx, cwd, ev) {
+  const st = readState(file);
+  const tool = (ev && ev.tool_name) || st.lastTool || '';
+  const input = (ev && ev.tool_input) || st.lastInput || '';
+  const f = relFile(fileOf(input), cwd);
+  writeState(file, { await: { tool, file: f, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' } });
+}
+
+/** 撤掉"等权限"标记（工具放行 / 新回合 / 会话结束）。
+ *  顺便把 pending 一起清掉：它只是 PreToolUse 留下的"兜底推断"标记。 */
+function clearAwait(file) {
+  writeState(file, { await: null, pending: null });
+}
+
 function startHeartbeat(member) {
   const file = statePath(member);
   const st = readState(file);
@@ -270,7 +286,6 @@ async function main() {
   const base = { team: ctx.team, workspacePath: ctx.workspacePath };
   const file = statePath(member);
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
-  const isBusyEvent = event === 'PreToolUse' || event === 'PostToolUse';
 
   // 心跳守护的"最后活跃时间"（它靠这个判断会话还在不在）
   if (event !== 'SessionEnd') writeState(file, { hb: { ...(readState(file).hb || {}), lastEventAt: Date.now() } });
@@ -297,12 +312,15 @@ async function main() {
   }
 
   if (event === 'UserPromptSubmit') {
+    clearAwait(file); // 新的一轮用户输入：之前挂起的"等授权"作废
     const prompt = String(ev.prompt || '');
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
     await register();
     const started = await request(info, HTTP_ROUTES.TASK_START, { ...base, memberId: member, title });
-    if (started && started.taskId) writeState(file, { taskId: started.taskId });
-    await status('busy');
+    if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: ctx.workspacePath || '', taskStartedAt: Date.now() });
+    // 用户刚提交：进入"思考中"，直到下一个事件（PreToolUse / Stop / Notification）才切换。
+    // 思考期间没有任何工具/授权事件，牌子上就一直显示「思考中」。
+    await status('thinking');
     if (process.env.WORKGREMLIN_HOOK_MESSAGES === '1') {
       await request(info, HTTP_ROUTES.MESSAGE, {
         ...base,
@@ -317,26 +335,49 @@ async function main() {
     return;
   }
 
-  if (isBusyEvent) {
+  if (event === 'PreToolUse' || event === 'PostToolUse') {
     await beat();
-    if (event === 'PostToolUse') {
+    if (event === 'PreToolUse') {
+      // 记下"即将执行"的工具，等权限时好知道要申请的是哪个；
+      // 同时打一个 pending 标记：权限弹窗迟迟没放行（PostToolUse 不来）时，
+      // 服务端据此推断"正在等用户授权"——兜底某些 CodeBuddy 不发 permission_prompt 通知的情况
+      writeState(file, {
+        lastTool: ev.tool_name || '',
+        lastInput: ev.tool_input || '',
+        pending: {
+          tool: ev.tool_name || '',
+          file: relFile(fileOf(ev.tool_input), cwd),
+          at: Date.now(),
+          workspacePath: (ctx && ctx.workspacePath) || '',
+        },
+      });
+    } else {
       const f = relFile(fileOf(ev.tool_input), cwd);
       if (f) await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: member, files: [f], op: opOf(ev.tool_name) });
+      // 工具真正跑起来了 → 权限已通过，撤掉"等授权"标记
+      clearAwait(file);
     }
     await status('busy');
     return;
   }
 
   if (event === 'Notification') {
-    if (ev.notification_type === 'idle_prompt') await status('idle');
-    else await status('blocked', 'awaiting_permission');
+    if (ev.notification_type === 'idle_prompt') {
+      clearAwait(file);
+      await status('idle');
+    } else {
+      // 等权限：把要执行的工具 + 目标文件写进本地状态文件，主控制台会读它显示"等待授权"
+      setAwait(file, ctx, cwd, ev);
+      await status('blocked', 'awaiting_permission');
+    }
     return;
   }
 
   if (event === 'Stop') {
+    clearAwait(file);
     const taskId = readState(file).taskId;
     if (taskId) await request(info, HTTP_ROUTES.TASK_END, { ...base, memberId: member, taskId, state: 'done' });
-    writeState(file, { taskId: null });
+    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 });
     await beat();
     await status('idle');
     return;
@@ -344,7 +385,9 @@ async function main() {
 
   // SubagentStop 不接：子代理收工不等于主会话收工，结束主任务会误报。
   if (event === 'SessionEnd') {
+    clearAwait(file);
     stopHeartbeat(member);
+    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 });
     await status('offline');
   }
 }

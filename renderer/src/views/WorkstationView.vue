@@ -6,7 +6,7 @@ import { useTeamStore } from '../stores/team';
 const team = useTeamStore();
 
 const sorted = computed(() => {
-  const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
+  const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
   return team.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
 });
 </script>

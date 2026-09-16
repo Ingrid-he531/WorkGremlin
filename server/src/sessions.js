@@ -40,6 +40,8 @@ let cache = { at: 0, key: '', value: null };
 const IDLE_MS = 10 * 60_000;
 /** 文件改动在这么久之内 → 认为正在动手 */
 const BUSY_MS = 90_000;
+/** 落盘在这么久之内 → 认为这一轮对话还在推进（含纯推理、只读工具等拿不到文件/待办证据的情况） */
+const FRESH_MS = 2 * 60_000;
 
 /* ------------------------------ 基础工具 ------------------------------ */
 
@@ -198,44 +200,144 @@ function readRuntime(storage, id) {
 }
 
 /**
+ * reporter hook 在"等权限"时会把要执行的工具 + 目标文件写进 ~/.workgremlin/hooks/<工位>.json
+ * 的 `await` 字段（见 packages/reporter/src/hook.js）。这里读回来给主控制台用。
+ * 多工位时取 workspacePath 匹配且最新的一条；没有匹配工程就取最新一条。
+ * 超过新鲜期的（默认 5 分钟）视为过期作废，避免权限已处理却还显示"等待授权"。
+ * @returns {{tool: string, file: string}|null}
+ */
+const AWAIT_TTL_MS = 5 * 60_000;
+/** 兜底推断的延迟阈值：PreToolUse 之后这么久还没 PostToolUse，多半是卡在权限确认 */
+const AWAIT_DELAY_MS = 2_000;
+
+function reporterHookHome() {
+  return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
+}
+
+function readReporterAwait(workspacePath) {
+  const dir = path.join(reporterHookHome(), 'hooks');
+  const now = Date.now();
+  let win = null;
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const j = readJson(path.join(dir, name));
+    // 优先用 permission_prompt 通知直接落的真值
+    let cand = null;
+    const a = j && j.await;
+    const p = j && j.pending;
+    if (a && a.ts && now - a.ts <= AWAIT_TTL_MS) {
+      cand = a;
+    } else if (p && p.at && now - p.at > AWAIT_DELAY_MS && now - p.at <= AWAIT_TTL_MS) {
+      // 兜底：PreToolUse 之后迟迟没有 PostToolUse —— 多半是卡在权限确认
+      cand = { tool: p.tool, file: p.file, ts: p.at, workspacePath: p.workspacePath };
+    }
+    if (!cand) continue;
+    if (workspacePath && cand.workspacePath && path.resolve(cand.workspacePath) !== path.resolve(workspacePath)) continue;
+    if (!win || cand.ts > win.ts) win = cand;
+  }
+  return win ? { tool: String(win.tool || ''), file: String(win.file || '') } : null;
+}
+
+/**
+ * reporter hook 的"活跃窗口"：UserPromptSubmit 落 taskId、Stop 清空。
+ * 只有在这个窗口内（用户提交了任务、agent 还没收工）才算"活着"；
+ * 会话存在但没有事件时一律待命 —— 主控制台据此决定要不要显示活跃状态。
+ * @param {string} workspacePath 当前打开的工程；空则不限工程
+ * @returns {boolean}
+ */
+function readReporterActiveTask(workspacePath) {
+  const dir = path.join(reporterHookHome(), 'hooks');
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const j = readJson(path.join(dir, name));
+    if (!j || !j.taskId) continue;
+    const ws = j.taskWorkspacePath || '';
+    if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
  * 主 Agent 阶段：会话落盘里没有"阶段"这个字段，只能推。
  * 所以返回值一律带 inferred: true，UI 按推断展示。
  */
-function inferPhase({ todos, files, runtime, pending, lastUpdated, now }) {
+function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow }) {
+  // 活跃窗口 = reporter hook 的 UserPromptSubmit..Stop（本地状态文件 taskId 非空）。
+  // 不在窗口内 → 一律待命：会话存在但没有事件，绝不凭空显示活跃状态。
+  if (!inWindow) {
+    return { phase: 'idle', action: '', inferred: true };
+  }
+  // 没有任何线索（没待办、没改文件、没运行态）→ 空闲
   if (!todos.total && !files.count && !runtime.activated) {
     return { phase: 'idle', action: '', inferred: true };
   }
-  if (runtime.paused) return { phase: 'idle', action: '会话已暂停', inferred: true };
-  if (runtime.awaitingSessionIdle) return { phase: 'summarize', action: '等会话空闲后收尾', inferred: true };
-  if (todos.doing) return { phase: 'tool', action: todos.doing, inferred: true };
+  // 显式状态也只在"近期真有动静"时采信，避免 IDE 关掉后残留的运行态一直挂着
+  if (runtime.paused && lastUpdated && now - lastUpdated < IDLE_MS) {
+    return { phase: 'idle', action: '会话已暂停', inferred: true };
+  }
+  if (runtime.awaitingSessionIdle && lastUpdated && now - lastUpdated < IDLE_MS) {
+    return { phase: 'summarize', action: '等会话空闲后收尾', inferred: true };
+  }
+
+  // 正在干活：必须"新鲜"证据，否则 IDE 关掉后残留的 in_progress 待办 / 文件改动会一直显示「工具中」
+  if (todos.doing && todos.at && now - todos.at < IDLE_MS) {
+    return { phase: 'tool', action: todos.doing, inferred: true };
+  }
   if (files.lastAt && now - files.lastAt < BUSY_MS) {
     const f = files.recent[0];
     return { phase: 'tool', action: `改 ${f.name}（+${f.added}/-${f.removed}）`, inferred: true };
   }
-  if (pending > 0) return { phase: 'plan', action: `${pending} 条待发消息排队中`, inferred: true };
-  if (lastUpdated && now - lastUpdated < IDLE_MS && runtime.activated) {
-    return { phase: 'plan', action: '会话活跃中', inferred: true };
+  // 运行态极新鲜（插件最近在落盘）→ 这一轮对话真的在推进（含纯推理、只读工具等拿不到文件/待办证据的情况）。
+  // 注意：这里没有"正在调工具"的硬证据，只是知道在动，归到专用的「会话中」相位而非「调用工具」，避免轻量对话被显示成在调工具。
+  if (lastUpdated && now - lastUpdated < FRESH_MS) {
+    return { phase: 'chat', action: '会话进行中', inferred: true };
   }
+
+  // 有排队待发消息（且不是陈年残留）→ 规划 / 待处理
+  if (pending > 0 && lastUpdated && now - lastUpdated < IDLE_MS) {
+    return { phase: 'plan', action: `${pending} 条待发消息排队中`, inferred: true };
+  }
+
+  // 没有新动静：IDE 多半关了 / 在等用户。回空闲，不再凭"激活过"瞎显示「规划中」
   return { phase: 'idle', action: '会话空闲', inferred: true };
 }
 
 /** 单个会话的完整信息 */
-function sessionInfo(storage, id, { current = false, now = Date.now() } = {}) {
+function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false } = {}) {
   const todos = readTodos(storage, id);
   const files = readFileChanges(storage, id);
   const mq = readRuntime(storage, id);
   const lastUpdated = Math.max(todos.at, files.lastAt, mq.updatedAt) || null;
-  // 当前会话（IDE 里正开着）一律算活跃；其余看 runtime 心跳 / 最近有没有动文件
+  // 活跃 = 当前会话且近期有动静 / 运行态新鲜 / 刚改过文件。
+  // 关键：关掉 IDE 后插件不再落盘，但 current.json 仍指向它、runtime.activated 也残留为真，
+  // 所以不能只靠 current / activated 判定活跃，必须用"近期有写入"确认它真的还活着，
+  // 否则关掉窗口的会话会一直卡在列表里、相位还停在「规划中」。
   const active = Boolean(
-    current ||
+    (current && lastUpdated && now - lastUpdated < IDLE_MS) ||
       (mq.runtime.activated && lastUpdated && now - lastUpdated < IDLE_MS) ||
       (files.lastAt && now - files.lastAt < BUSY_MS)
   );
-  const inferred = inferPhase({ todos, files, runtime: mq.runtime, pending: mq.pending, lastUpdated, now });
+  const inferred = inferPhase({ todos, files, runtime: mq.runtime, pending: mq.pending, lastUpdated, now, inWindow });
 
   /** 悬浮屏第三层：任务清单（状态用符号标出来，不做翻译） */
   const mark = { completed: '✓', in_progress: '▶', pending: '·' };
-  const context = todos.items.map((t) => `${mark[t.status] || '·'} ${t.content}`);
+  let phase = inferred.phase;
+  let action = inferred.action;
+  let target = '';
+  let context = todos.items.map((t) => `${mark[t.status] || '·'} ${t.content}`);
+
+  // 真实"等权限"信号：reporter hook 在 permission_prompt 时落了工具+文件到本地状态文件。
+  // 它是上报真值，优先级高于推断；只在"当前会话"（权限弹窗必然出在它身上）上生效。
+  if (current) {
+    const aw = readReporterAwait(workspacePath);
+    if (aw) {
+      phase = 'await';
+      action = aw.tool ? `申请执行 ${aw.tool}` : '等待用户授权';
+      target = aw.file || '';
+      context = ['等待用户授权后继续', aw.tool && `工具：${aw.tool}`, aw.file && `目标：${aw.file}`].filter(Boolean);
+    }
+  }
 
   return {
     id,
@@ -248,8 +350,9 @@ function sessionInfo(storage, id, { current = false, now = Date.now() } = {}) {
     pending: mq.pending,
     todos: { total: todos.total, done: todos.done, doing: todos.doing, items: todos.items },
     files: { count: files.count, recent: files.recent, lastAt: files.lastAt || null },
-    phase: inferred.phase,
-    action: inferred.action,
+    phase,
+    action,
+    target,
     context,
     inferred: true, // 全部来自被动观测，不是上报值
   };
@@ -315,9 +418,11 @@ function listSessions({ workspacePath = '', force = false } = {}) {
     if (id && !meta.has(id)) meta.set(id, { project: '', projectPath: '', current: false });
   }
 
+  // 活跃窗口扫一次即可（按当前打开的工程匹配 reporter hook 的 taskId）
+  const inWindow = readReporterActiveTask(ws);
   const sessions = [];
   for (const [id, m] of meta) {
-    const info = sessionInfo(storage, id, { current: m.current, now });
+    const info = sessionInfo(storage, id, { current: m.current, now, workspacePath: ws, inWindow });
     if (!info.active) continue; // 下拉只要活跃会话
     sessions.push({
       ...info,

@@ -68,6 +68,50 @@ function onConsoleLeave() {
 /** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
 const mainAgentState = computed(() => mainAgent.snapshot);
 
+/**
+ * reporter hook 把主 Agent 的实时状态上报成了 team 里的一个成员
+ * （role=agent、主动上报 reported=1、非临时）。主控制台应该吃这个真值——
+ * 它带心跳死亡检测（degraded 即 60s 没心跳），比磁盘推断准，也修掉了
+ * "干活显示空闲"和"关掉 VS Code 还卡在规划中"两处失真。
+ */
+const mainMember = computed(() =>
+  team.members.find((m) => m.role === 'agent' && m.reported && !m.ephemeral && !m.degraded) || null
+);
+
+/** 主控制台真正要显示的状态：优先 hook 实时上报，否则退回现有逻辑（演示 / 会话接管） */
+const consoleLive = computed(() => {
+  const m = mainMember.value;
+  if (!m) return null;
+  // 只有"没选会话"或"选中的就是当前会话（主 Agent 自己）"时才用 hook 覆盖；
+  // 选了别的工程的会话则尊重会话接管（磁盘推断），不动它。
+  const sel = sessions.selected;
+  if (sel && sel.id && !sel.current) return null;
+
+  if (m.state === 'blocked') {
+    // 等授权：工具与目标走会话落盘的 await 叠加（sessions.js 已读 reporter 的本地文件）
+    return {
+      phase: 'await',
+      action: (sel && sel.action) || '等待用户授权',
+      context: sel && sel.context && sel.context.length ? sel.context : ['等待用户授权后继续'],
+      target: sel && sel.target ? sel.target : null,
+    };
+  }
+  if (m.state === 'thinking') {
+    // 思考中：用户刚提交，尚未发起工具 / 授权。第二层写任务标题（即用户那句话）。
+    const title = m.task && m.task.title ? m.task.title : '正在分析你的请求';
+    return { phase: 'thinking', action: title, context: title !== '正在分析你的请求' ? [title] : [], target: null };
+  }
+  const phase = m.state === 'busy' ? 'tool' : 'idle';
+  const action = m.task && m.task.title ? m.task.title : '';
+  const files = Array.isArray(m.currentFiles)
+    ? m.currentFiles.map((f) => (f && (f.path || f)) || '').filter(Boolean)
+    : [];
+  const context = files.length ? files.slice(0, 6) : action ? [action] : [];
+  return { phase, action, context, target: null };
+});
+
+watch(consoleLive, (v) => mainAgent.setLiveState(v), { immediate: true });
+
 /** @type {ReturnType<typeof createIsoOffice> | null} */
 let office = null;
 let cardRaf = 0;
@@ -195,7 +239,8 @@ onBeforeUnmount(() => {
         <i class="dot" :style="{ background: mainAgent.phaseColor }" />
         <span class="ct-phase">{{ mainAgent.phaseLabel }}</span>
       </div>
-      <div v-if="mainAgent.action" class="ct-row">{{ mainAgent.action }}</div>
+      <div v-if="mainAgent.action" class="ct-row"><b>操作</b>{{ mainAgent.action }}</div>
+      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b>{{ mainAgent.target }}</div>
       <div v-if="mainAgent.skill" class="ct-row"><b>技能</b>{{ mainAgent.skill }}</div>
       <div v-if="mainAgent.tool" class="ct-row"><b>工具</b>{{ mainAgent.tool }}</div>
     </div>

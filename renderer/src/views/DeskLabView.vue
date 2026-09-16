@@ -18,7 +18,7 @@ const timer = setInterval(() => {
 onUnmounted(() => clearInterval(timer));
 
 const ROLES = ['leader', 'coder', 'researcher', 'tester', 'reviewer', 'ops'];
-const STATES = ['online', 'busy', 'idle', 'blocked', 'offline'];
+const STATES = ['online', 'busy', 'idle', 'blocked', 'thinking', 'offline'];
 
 /** @param {number} i @param {string} state */
 function makeMember(i, state) {
@@ -34,10 +34,10 @@ function makeMember(i, state) {
     lastSeenAt: Date.now() - (state === 'offline' ? 300 : 5) * 1000,
     messageCount: 0,
     task:
-      state === 'busy' || state === 'blocked'
+      state === 'busy' || state === 'blocked' || state === 'thinking'
         ? { id: role, title: '实现工位视图与对话记录窗口', progress: state === 'blocked' ? 0.34 : 0.62 }
         : null,
-    currentFiles: state === 'busy' ? ['renderer/src/components/DeskScene.vue', 'server/src/ingest/bus.js'] : [],
+    currentFiles: state === 'busy' || state === 'thinking' ? ['renderer/src/components/DeskScene.vue', 'server/src/ingest/bus.js'] : [],
     artifacts: [],
   };
 }

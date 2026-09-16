@@ -33,9 +33,14 @@ import { CONSOLE } from './officeMap';
 export const PHASES = {
   idle: { label: '待命中', color: '#6b7c94', glow: 0.22, busy: false },
   plan: { label: '规划中', color: '#7fb0ff', glow: 0.55, busy: true },
+  thinking: { label: '思考中', color: '#ffcf5c', glow: 0.6, busy: true },
+  /** 会话进行中：运行态新鲜但拿不到工具/文件证据时由服务端推断出来（见 server/src/sessions.js 的 inferPhase） */
+  chat: { label: '会话中', color: '#4fd1c5', glow: 0.6, busy: true },
   tool: { label: '调用工具', color: '#4c8dff', glow: 0.85, busy: true },
   dispatch: { label: '委托专家', color: '#c084fc', glow: 1.0, busy: true },
   summarize: { label: '汇总中', color: '#2fbf71', glow: 0.7, busy: true },
+  /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
+  await: { label: '等待授权', color: '#f5a623', glow: 0.6, busy: false },
 };
 
 export const PHASE_LIST = Object.keys(PHASES);
@@ -332,6 +337,70 @@ export function drawOperator(c, o) {
   c.fill();
   c.restore();
 
+  // 手臂：等待授权时举牌（一只手高高举起一块牌子），其余状态沿用 滑/点/静观
+  const isAwait = state.phase === 'await';
+  if (isAwait) {
+    const bob = Math.sin(t * 2.2) * 3;
+    const sh = { x: 8, y: -47 + breathe };
+    const hand = { x: 30, y: -82 + bob + breathe };
+    const el = { x: (sh.x + hand.x) / 2 + 6, y: (sh.y + hand.y) / 2 };
+    // 举牌的胳膊
+    c.strokeStyle = body;
+    c.lineWidth = 7;
+    c.lineCap = 'round';
+    c.lineJoin = 'round';
+    c.beginPath();
+    c.moveTo(sh.x, sh.y);
+    c.lineTo(el.x, el.y);
+    c.lineTo(hand.x, hand.y);
+    c.stroke();
+    // 另一只手搭在台沿上
+    c.beginPath();
+    c.moveTo(-10, -46 + breathe);
+    c.lineTo(-16, -38 + breathe);
+    c.lineTo(-6, -32 + breathe);
+    c.stroke();
+    // 牌子立柱
+    const boardCx = hand.x + 2;
+    const boardCy = hand.y - 24;
+    c.strokeStyle = '#3a4252';
+    c.lineWidth = 3;
+    c.beginPath();
+    c.moveTo(hand.x, hand.y);
+    c.lineTo(boardCx, boardCy + bh / 2);
+    c.stroke();
+    // 牌子光晕（淡）
+    c.save();
+    c.globalCompositeOperation = 'lighter';
+    const sg2 = c.createRadialGradient(boardCx, boardCy, 0, boardCx, boardCy, 22);
+    sg2.addColorStop(0, rgba(ph.color, 0.32));
+    sg2.addColorStop(1, rgba(ph.color, 0));
+    c.fillStyle = sg2;
+    c.beginPath();
+    c.arc(boardCx, boardCy, 22, 0, Math.PI * 2);
+    c.fill();
+    c.restore();
+    // 牌面：小、深灰底
+    const bw = 30;
+    const bh = 18;
+    c.fillStyle = '#414a5a';
+    c.fillRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
+    c.strokeStyle = '#6b7686';
+    c.lineWidth = 1.2;
+    c.strokeRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
+    // 牌上字：白色示意，看不清具体内容
+    c.fillStyle = 'rgba(232,237,242,0.9)';
+    const lineW = bw * 0.6;
+    c.fillRect(boardCx - lineW / 2, boardCy - 3.5, lineW, 2.2);
+    c.fillRect(boardCx - lineW / 2, boardCy + 1, lineW * 0.7, 2.2);
+    // 举牌胳膊的轮廓光
+    c.strokeStyle = rim;
+    c.lineWidth = 1.4;
+    c.beginPath();
+    c.moveTo(el.x, el.y);
+    c.lineTo(hand.x, hand.y);
+    c.stroke();
+  } else {
   // 手臂：肩 → 肘 → 手，手往控制台那边伸（屏幕上在右下方）
   const sh = { x: 8, y: -47 + breathe };
   const hand = { x: 26 + handU, y: -34 + handV + breathe };
@@ -379,6 +448,7 @@ export function drawOperator(c, o) {
     c.arc(hand.x, hand.y, 9, 0, Math.PI * 2);
     c.fill();
     c.restore();
+  }
   }
 
   c.restore();

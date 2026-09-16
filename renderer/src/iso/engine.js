@@ -48,12 +48,13 @@ const STATE_COLOR = {
   busy: '#f5a623',
   idle: '#7f8c9b',
   blocked: '#ff5c5c',
+  thinking: '#ffcf5c',
   offline: '#4a5160',
 };
 /** 对外只保留两档状态：忙碌 / 空闲 */
 const STATE_LABEL = { busy: '忙碌', idle: '空闲' };
-/** 后端的五种状态归并到这两档（blocked 也算忙） */
-const bucketOf = (s) => (s === 'busy' || s === 'blocked' ? 'busy' : 'idle');
+/** 后端的五种（+thinking）状态归并到这两档（busy / blocked / thinking 都算忙） */
+const bucketOf = (s) => (s === 'busy' || s === 'blocked' || s === 'thinking' ? 'busy' : 'idle');
 /** 忙碌时具体在干的事：只有"思考"允许起身走动 */
 const WORK_LABEL = { think: '思考', code: '写代码', doc: '写文档' };
 const WORK_KEYS = ['think', 'code', 'doc'];

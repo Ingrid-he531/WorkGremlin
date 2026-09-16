@@ -15,6 +15,12 @@ const props = defineProps({
 const emit = defineEmits(['update:modelValue']);
 
 const count = computed(() => props.items.length);
+
+/** 悬停提示：有会话时显示数量，没会话时才显示占位原因。
+ *  之前写死成 emptyLabel，导致即使有会话 hover 也提示"没有活跃会话"，属误导。 */
+const title = computed(() =>
+  count.value ? `当前楼层活跃会话（${count.value} 个）` : props.emptyLabel
+);
 </script>
 
 <template>
@@ -24,7 +30,7 @@ const count = computed(() => props.items.length);
     :class="{ empty: !count }"
     :disabled="!count"
     :value="modelValue"
-    :title="emptyLabel"
+    :title="title"
     @change="emit('update:modelValue', $event.target.value)"
   >
     <option v-if="!count" value="">{{ props.emptyLabel }}</option>

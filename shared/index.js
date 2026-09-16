@@ -8,8 +8,8 @@
 
 const PROTOCOL_VERSION = 1;
 
-/** @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'>} */
-const AGENT_STATES = Object.freeze(['online', 'busy', 'idle', 'blocked', 'offline']);
+/** @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'|'thinking'>} */
+const AGENT_STATES = Object.freeze(['online', 'busy', 'idle', 'blocked', 'offline', 'thinking']);
 
 /** @type {ReadonlyArray<'pending'|'running'|'done'|'failed'|'cancelled'>} */
 const TASK_STATES = Object.freeze(['pending', 'running', 'done', 'failed', 'cancelled']);

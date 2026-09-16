@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_members_team ON members(team_id, name);
 -- 每个成员一行最新状态（UPSERT）。B 路线为唯一真值；A 路线/超时只写 degraded=1
 CREATE TABLE IF NOT EXISTS agent_status (
   member_id          TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
-  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline')),
+  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline', 'thinking')),
   state_since        INTEGER NOT NULL,
   task_id            TEXT,
   progress           REAL,                   -- 0~1，NULL = 未知（绝不编造）

@@ -20,7 +20,7 @@ let server = null;
 let mainWindow = null;
 
 const flags = {
-  demo: process.argv.includes('--demo') || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1',
+  demo: process.argv.includes('--demo'),
   seed: (() => {
     const i = process.argv.indexOf('--demo-seed');
     return i >= 0 ? Number(process.argv[i + 1]) : Number(process.env.WORKGREMLIN_DEMO_SEED || 1);

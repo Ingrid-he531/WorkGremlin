@@ -1,4 +1,4 @@
-export type AgentState = 'online' | 'busy' | 'idle' | 'blocked' | 'offline';
+export type AgentState = 'online' | 'busy' | 'idle' | 'blocked' | 'offline' | 'thinking';
 export type TaskState = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type MessageType =
   | 'task_assign'
