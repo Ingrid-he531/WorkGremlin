@@ -19,6 +19,8 @@ const { createIngestBus } = require('./ingest/bus');
 const { createSubagentFeed } = require('./ingest/subagentFeed');
 const { resolveWorkspacePath, resolveProjectName } = require('./project');
 const { createWorkspaceManager } = require('./workspace');
+const os = require('node:os');
+const { createAgentScanner } = require('./ingest/agentScan');
 const { createHub } = require('./ws/hub');
 const { createHealthRouter } = require('./http/routes/health');
 const { createQueryRouter } = require('./http/routes/query');
@@ -140,6 +142,7 @@ function createServer(opts = {}) {
   let info = null;
   let demoTicker = null;
   let subagentFeed = null;
+  let agentScan = null;
   /** 临时成员（幽灵）挂在哪个 team 上：与演示数据同一个 team */
   const feedTeam = () => process.env.WORKGREMLIN_TEAM || 'workgremlin';
 
@@ -224,8 +227,18 @@ function createServer(opts = {}) {
     }
 
     // subagent 清单 → 幽灵：文件里有谁，屋里就飘着谁（换工程就重开一个监听）
-    workspace.setOnSwitch(() => startFeed());
+    agentScan = createAgentScanner({
+      bus,
+      team: feedTeam(),
+      homeDir: os.homedir(),
+      getWorkspacePath: () => workspace.current().workspacePath,
+    });
+    workspace.setOnSwitch(() => {
+      startFeed();
+      agentScan.sync();
+    });
     startFeed();
+    agentScan.start();
 
     if (!opts.silent) {
       console.log(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
@@ -277,6 +290,7 @@ function createServer(opts = {}) {
     for (const t of timers) clearInterval(t);
     if (demoTicker) demoTicker.stop();
     if (subagentFeed) subagentFeed.stop();
+    if (agentScan) agentScan.stop();
     try {
       hub.close();
     } catch {

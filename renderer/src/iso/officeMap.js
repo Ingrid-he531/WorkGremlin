@@ -103,6 +103,8 @@ function deskUnit(id, x, dy, row) {
 export const DESK_UNITS = [
   ...[1.0, 5.4, 9.8].map((x, i) => deskUnit(`A${i}`, x, 2.4, 'A')),
   ...[1.0, 5.4, 9.8].map((x, i) => deskUnit(`B${i}`, x, 6.4, 'B')),
+  // C 排：给"用户级 / 工程级 subagent"这类常驻小怪物预留的工位
+  ...[1.0, 5.4, 9.8].map((x, i) => deskUnit(`C${i}`, x, 9.0, 'C')),
 ];
 
 /* ------------------------------------------------------------------ *
@@ -134,7 +136,7 @@ export const CONSOLE = {
 
 /** 地毯（工位区 + 会议室 + 茶水间 + 控制台地台） */
 export const RUGS = [
-  { x: 0.6, y: 1.7, w: 13.0, d: 7.3, color: COLORS.rug },
+  { x: 0.6, y: 1.7, w: 13.0, d: 9.6, color: COLORS.rug },
   { x: 14.2, y: 0.35, w: 5.4, d: 6.8, color: '#2a3341' },
   { x: 14.2, y: 7.25, w: 5.4, d: 5.75, color: '#2a3341' },
   { ...CONSOLE.rug },

@@ -55,8 +55,9 @@ const STATE_LABEL = { online: '在线', busy: '忙碌', idle: '空闲', blocked:
 
 /* ------------------------------ 成员 → 工位 ------------------------------ */
 
-/** 专家团队：常驻成员，一人一个工位（临时成员不占工位） */
-const roster = computed(() => team.members.filter((m) => !isEphemeralMember(m)).slice(0, DESKS.length));
+/** 专家团队：常驻成员，一人一个工位（临时成员不占工位）。
+ *  主 Agent（role=agent）只在主控制台剪影出现，不占工位，所以从名单剔掉。 */
+const roster = computed(() => team.members.filter((m) => !isEphemeralMember(m) && m.role !== 'agent').slice(0, DESKS.length));
 /** 临时组队成员 + 工位坐不下的成员：没有工位，飘在空中 */
 const ghostRoster = computed(() => {
   const seated = new Set(roster.value.map((m) => m.memberId));

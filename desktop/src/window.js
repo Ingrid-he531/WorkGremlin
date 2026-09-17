@@ -62,8 +62,19 @@ function createWindow(opts = {}) {
       const L = ['verbose', 'info', 'warning', 'error'][level] || String(level);
       console.log(`[renderer:${L}] ${message} (${sourceId}:${line})`);
     });
+    let devTries = 0;
+    const MAX_DEV_TRIES = 60;
     win.webContents.once('did-finish-load', () => {
       console.log('[workgremlin] renderer did-finish-load');
+    });
+    // dev 下 Vite 常比窗口晚就绪：加载失败就重试，否则窗口会停在
+    // ERR_CONNECTION_REFUSED 的空白错误页（表现成"黑屏、没有控件"）
+    win.webContents.on('did-fail-load', (_e, code, desc, url) => {
+      console.error('[workgremlin] 渲染进程加载失败', code, desc, url);
+      if (devTries < MAX_DEV_TRIES) {
+        devTries += 1;
+        setTimeout(() => win.loadURL(DEV_URL), 500);
+      }
     });
 
     win.loadURL(DEV_URL);

@@ -41,6 +41,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // 显式绑 IPv4 回环：Electron 的 DEV_URL 是 http://127.0.0.1:5173，
+    // 若不指定 host，Vite 默认绑 localhost（本机解析到 ::1 / IPv6），
+    // 导致渲染进程 ERR_CONNECTION_REFUSED、窗口停在空白错误页（黑屏、无控件）
+    host: '127.0.0.1',
     strictPort: false,
     proxy: {
       '/api': {

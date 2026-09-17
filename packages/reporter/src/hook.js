@@ -11,8 +11,8 @@
  * 事件 → 上报（对齐 docs/requirements.md §5 的状态机）：
  *   SessionStart      register + idle（等派单）+ 拉起心跳守护
  *   UserPromptSubmit  task/start（标题 = 用户那句话的前 80 字）+ thinking（思考中，直到下一个事件）
- *   PreToolUse        busy（顺带心跳）
- *   PostToolUse       写/改类工具 → file/touch，并 busy
+ *   PreToolUse        busy（顺带心跳）；工具是 Agent → 飘出一只小幽灵
+ *   PostToolUse       写/改类工具 → file/touch，并 busy；工具是 Agent → 小幽灵散掉
  *   Notification      等权限 → blocked(reason=awaiting_permission)；空闲提醒 → idle
  *   Stop              task/end(done) + idle
  *   SessionEnd        offline + 撤掉心跳守护
@@ -57,6 +57,17 @@ const debug = (...args) => {
 
 function home() {
   return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
+}
+
+/** 追加式事件时间线（诊断用）：每次 hook 事件写一行到 ~/.workgremlin/hooks/events.log。
+ *  含事件名 / 工具 / notification_type / 工位，方便排查"等授权没收到""相位跳变"等问题。 */
+function trace(event, extra) {
+  try {
+    const line = `${new Date().toISOString()} ${event}${extra ? ' ' + JSON.stringify(extra) : ''}\n`;
+    fs.appendFileSync(path.join(home(), 'hooks', 'events.log'), line);
+  } catch {
+    /* 落盘失败不影响 hook */
+  }
 }
 
 /** 每个工位一份：当前任务 id + 心跳守护的 pid */
@@ -173,12 +184,90 @@ function opOf(tool) {
   return /^(Edit|MultiEdit|NotebookEdit|replace_in_file)$/.test(String(tool || '')) ? 'edit' : 'write';
 }
 
+/**
+ * 只有这些"写类"工具才打 pending 标记（用于"等授权"兜底推断）。
+ * 依据：本环境 events.log 实测 Read/Grep/Glob/ReadLints/Bash 等只读 / 命令类工具
+ * **根本不发 PostToolUse**，一旦给它们打 pending，PostToolUse 永远不来、清不掉，
+ * 兜底就会把"读文件 / 点了 run 正在跑"误判成"等待授权"。
+ * 写类工具（Edit/Write/Delete 家族）既可能弹权限框、又会发 PostToolUse，
+ * 所以只有它们适合用"PreToolUse 打 pending、PostToolUse 清掉、超时未清即等授权"这套逻辑。
+ */
+const PROBE_TOOLS = new Set([
+  'Edit', 'MultiEdit', 'NotebookEdit', 'Write', 'Delete', // CodeBuddy 写类
+  'replace_in_file', 'write_to_file', 'delete_file', // 本助手写类
+]);
+
 /** 工程内的文件记相对路径，工程外的记绝对路径（不猜、不编造） */
 function relFile(file, cwd) {
   if (!file) return '';
   const abs = path.resolve(file);
   if (cwd && (abs === cwd || abs.startsWith(cwd + path.sep))) return path.relative(cwd, abs);
   return abs;
+}
+
+/* ------------------------------------------------------------------ *
+ * 主 Agent 召唤 subagent（Agent 工具）时，往 subagent 清单写一条，
+ * 服务端 subagentFeed 盯着它 → 办公室飘出一只小幽灵（临时成员）。
+ * 工具跑完（PostToolUse）就从清单里划掉，幽灵散掉。
+ * 复用 server/src/ingest/subagentFeed.js 的 feedFilePath 规则：
+ *   $WORKGREMLIN_SUBAGENTS_FILE > <workspacePath>/.workgremlin/subagents.json > <cwd>/.workgremlin/subagents.json
+ * ------------------------------------------------------------------ */
+function feedFileFor(workspacePath) {
+  const env = String(process.env.WORKGREMLIN_SUBAGENTS_FILE || '').trim();
+  if (env) return path.resolve(env);
+  const ws = String(workspacePath || '').trim();
+  return path.join(ws ? path.resolve(ws) : process.cwd(), '.workgremlin', 'subagents.json');
+}
+
+function readFeedFile(file) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const agents = Array.isArray(data) ? data : Array.isArray(data.agents) ? data.agents : [];
+    const project = (!Array.isArray(data) && typeof data.project === 'string' && data.project) || '';
+    return { project, agents };
+  } catch {
+    return { project: '', agents: [] };
+  }
+}
+
+function writeFeedFile(file, feed) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(feed, null, 2)}\n`, 'utf8');
+  } catch (err) {
+    debug('写 subagent 清单失败：', err && err.message);
+  }
+}
+
+/** Agent 工具输入的"名字"：优先 description（UI 上那行短描述），回退 subagent_type / name */
+function agentName(input) {
+  if (!input || typeof input !== 'object') return 'subagent';
+  const d = input.description || input.subagent_type || input.name || '';
+  return String(d).trim() || 'subagent';
+}
+
+/** Agent 工具输入的"在干嘛"：取 prompt 前 80 字 */
+function agentTask(input) {
+  if (!input || typeof input !== 'object') return '';
+  const p = input.prompt || '';
+  return String(p).replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
+/** 主 Agent 召唤 subagent → 加一只小幽灵（同名已在飘就跳过，避免并发同名合并后误删） */
+function addGhost(workspacePath, name, task) {
+  const file = feedFileFor(workspacePath);
+  const feed = readFeedFile(file);
+  if (feed.agents.some((a) => a.name === name)) return;
+  feed.agents.push({ name, state: 'busy', ...(task ? { task } : {}) });
+  writeFeedFile(file, feed);
+}
+
+/** subagent 收工 → 划掉，幽灵散掉 */
+function removeGhost(workspacePath, name) {
+  const file = feedFileFor(workspacePath);
+  const feed = readFeedFile(file);
+  const next = feed.agents.filter((a) => a.name !== name);
+  if (next.length !== feed.agents.length) writeFeedFile(file, { ...feed, agents: next });
 }
 
 /** 把"等权限"标记写进本地状态文件：要执行的工具 + 目标文件 + 工程 + 时间。
@@ -188,13 +277,16 @@ function setAwait(file, ctx, cwd, ev) {
   const tool = (ev && ev.tool_name) || st.lastTool || '';
   const input = (ev && ev.tool_input) || st.lastInput || '';
   const f = relFile(fileOf(input), cwd);
-  writeState(file, { await: { tool, file: f, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' } });
+  writeState(file, {
+    await: { tool, file: f, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+    sessionPhase: { phase: 'await', tool, file: f, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+  });
 }
 
 /** 撤掉"等权限"标记（工具放行 / 新回合 / 会话结束）。
  *  顺便把 pending 一起清掉：它只是 PreToolUse 留下的"兜底推断"标记。 */
 function clearAwait(file) {
-  writeState(file, { await: null, pending: null });
+  writeState(file, { await: null, pending: null, sessionPhase: null });
 }
 
 function startHeartbeat(member) {
@@ -281,6 +373,7 @@ async function main() {
   }
   const event = ev && ev.hook_event_name;
   if (!event) return;
+  trace(event, { member, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const ctx = await resolveCtx(info);
   const base = { team: ctx.team, workspacePath: ctx.workspacePath };
@@ -318,6 +411,8 @@ async function main() {
     await register();
     const started = await request(info, HTTP_ROUTES.TASK_START, { ...base, memberId: member, title });
     if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: ctx.workspacePath || '', taskStartedAt: Date.now() });
+    // 进入"思考中"：直到下一个事件（PreToolUse / Notification / Stop）才切换
+    writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: ctx.workspacePath || '' } });
     // 用户刚提交：进入"思考中"，直到下一个事件（PreToolUse / Stop / Notification）才切换。
     // 思考期间没有任何工具/授权事件，牌子上就一直显示「思考中」。
     await status('thinking');
@@ -338,26 +433,36 @@ async function main() {
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     await beat();
     if (event === 'PreToolUse') {
-      // 记下"即将执行"的工具，等权限时好知道要申请的是哪个；
-      // 同时打一个 pending 标记：权限弹窗迟迟没放行（PostToolUse 不来）时，
-      // 服务端据此推断"正在等用户授权"——兜底某些 CodeBuddy 不发 permission_prompt 通知的情况
+      const tool = ev.tool_name || '';
+      const file = relFile(fileOf(ev.tool_input), cwd);
+      // pending 只给"会发 PostToolUse、且可能要权限"的写类工具打。
+      // 本环境实测 Read/Grep/Glob/ReadLints/Bash 等只读 / 命令类工具根本不发 PostToolUse，
+      // 一旦给它们打 pending，PostToolUse 永远不来、清不掉 → 兜底误判成"等待授权"
+      // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
+      const probe = PROBE_TOOLS.has(tool);
       writeState(file, {
-        lastTool: ev.tool_name || '',
+        lastTool: tool,
         lastInput: ev.tool_input || '',
-        pending: {
-          tool: ev.tool_name || '',
-          file: relFile(fileOf(ev.tool_input), cwd),
-          at: Date.now(),
-          workspacePath: (ctx && ctx.workspacePath) || '',
-        },
+        pending: probe
+          ? { tool, file, at: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' }
+          : null, // 非写类：显式清掉上一支可能残留的 pending
+        // 工具开始跑 → 主控制台相位「调用工具」（PreToolUse..PostToolUse 这段就是"在调工具"）
+        sessionPhase: { phase: 'tool', tool, file, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
       });
+      // 主 Agent 召唤 subagent（Agent 工具）→ 往清单写一条，办公室飘出一只小幽灵
+      if (tool === 'Agent') addGhost(ctx.workspacePath, agentName(ev.tool_input), agentTask(ev.tool_input));
+      await status('busy');
     } else {
       const f = relFile(fileOf(ev.tool_input), cwd);
       if (f) await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: member, files: [f], op: opOf(ev.tool_name) });
-      // 工具真正跑起来了 → 权限已通过，撤掉"等授权"标记
+      // 工具真正跑完了 → 权限已通过，撤掉"等授权"，回到"思考中"
       clearAwait(file);
+      writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' } });
+      // subagent 收工 → 从清单划掉，小幽灵散掉
+      if (ev.tool_name === 'Agent') removeGhost(ctx.workspacePath, agentName(ev.tool_input));
+      // PostToolUse = 工具已跑完，进入"思考中"（处理返回结果），直到下一个事件
+      await status('thinking');
     }
-    await status('busy');
     return;
   }
 
@@ -368,6 +473,13 @@ async function main() {
     } else {
       // 等权限：把要执行的工具 + 目标文件写进本地状态文件，主控制台会读它显示"等待授权"
       setAwait(file, ctx, cwd, ev);
+      // 同时把相位标成「await」写进 sessionPhase —— server/src/sessions.js 的 readReporterPhase
+      // 只读 sessionPhase、不读 await 字段，所以不标这一笔主控制台就收不到"等待授权"的真实操作。
+      const tool = (ev && ev.tool_name) || readState(file).lastTool || '';
+      const input = (ev && ev.tool_input) || readState(file).lastInput || '';
+      writeState(file, {
+        sessionPhase: { phase: 'await', tool, file: relFile(fileOf(input), cwd), ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+      });
       await status('blocked', 'awaiting_permission');
     }
     return;

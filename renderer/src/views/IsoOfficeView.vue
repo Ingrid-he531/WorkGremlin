@@ -12,6 +12,7 @@ import { useTeamStore } from '../stores/team';
 import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
+import { httpBase, getServerInfo } from '../api/bridge';
 import { createIsoOffice, STATE_COLOR, STATE_LABEL } from '../iso/engine';
 
 const props = defineProps({
@@ -25,6 +26,45 @@ const mainAgent = useMainAgentStore();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
 const showPaths = ref(false);
+
+/* ------------------------------ 主 Agent 相位快轮询（1.5s） ------------------------------
+ * 服务端 /api/v1/reporter-phase 直接回 reporter hook 的上报相位（已映射成 UI 字段），
+ * 比 /sessions 的 10s 轮询新鲜，专供主控制台"操作"实时显示（调用工具 / 等待授权）。
+ * 渲染层是沙箱的（contextIsolation + nodeIntegration:false），读不到本地状态文件，
+ * 所以一律走服务端，复用 readReporterPhase 的容错读，不碰 fs。
+ */
+const fastPhase = ref(null);
+let phaseTimer = null;
+
+async function startPhasePoll() {
+  const info = await getServerInfo().catch(() => ({ port: 0, token: '' }));
+  if (!info || !info.port) return;
+  const tick = async () => {
+    try {
+      const res = await fetch(`${httpBase(info)}/api/v1/reporter-phase`, {
+        headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d && d.ok && d.phase && d.phase !== 'idle') {
+          fastPhase.value = { phase: d.phase, action: d.action, target: d.target, context: d.context || [] };
+        } else {
+          fastPhase.value = null;
+        }
+      }
+    } catch {
+      /* 拉不到就留着上一次的相位，别闪回空闲 */
+    }
+  };
+  await tick();
+  phaseTimer = setInterval(tick, 1500);
+}
+
+function stopPhasePoll() {
+  if (phaseTimer) clearInterval(phaseTimer);
+  phaseTimer = null;
+  fastPhase.value = null;
+}
 
 /* ------------------------------ 主 Agent 控制台 tooltip ------------------------------
  * 鼠标停在悬浮屏上（hover 命中）超过 TIP_DELAY 才弹，避免拖拽 / 扫过也闪。
@@ -87,13 +127,38 @@ const consoleLive = computed(() => {
   const sel = sessions.selected;
   if (sel && sel.id && !sel.current) return null;
 
+  // 快轮询（1.5s）优先：reporter hook 的"调用工具 / 等待授权"相位比 10s 的 sessions 轮询新鲜；
+  // thinking 由 WS 的 mainMember.state 已实时给到，这里不覆盖。
+  if (fastPhase.value) {
+    const fp = fastPhase.value;
+    if (fp.phase === 'await') {
+      return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null };
+    }
+    if (fp.phase === 'tool') {
+      return { phase: 'tool', action: fp.action || '调用工具', context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null };
+    }
+  }
+
+  // 上报真值优先：reporter hook 把每次事件的相位（思考中 / 调用工具 / 等待授权）落到本地状态文件，
+  // server/src/sessions.js 的 readReporterPhase 已转成 sel.action / target / context。
+  // 调用工具 → 显示真实操作（工具名 + 目标文件），别再把聊天输入（任务标题）当操作；
+  // 等待授权 → 显示"申请执行 X + 目标文件"。
+  if (sel && sel.action) {
+    if (sel.phase === 'await' || m.state === 'blocked') {
+      return { phase: 'await', action: sel.action, context: sel.context && sel.context.length ? sel.context : ['等待用户授权后继续'], target: sel.target || null };
+    }
+    if (sel.phase === 'tool' || m.state === 'busy') {
+      return { phase: 'tool', action: sel.action, context: sel.context && sel.context.length ? sel.context : [], target: sel.target || null };
+    }
+  }
+
   if (m.state === 'blocked') {
     // 等授权：工具与目标走会话落盘的 await 叠加（sessions.js 已读 reporter 的本地文件）
     return {
       phase: 'await',
-      action: (sel && sel.action) || '等待用户授权',
-      context: sel && sel.context && sel.context.length ? sel.context : ['等待用户授权后继续'],
-      target: sel && sel.target ? sel.target : null,
+      action: '等待用户授权',
+      context: ['等待用户授权后继续'],
+      target: null,
     };
   }
   if (m.state === 'thinking') {
@@ -101,12 +166,13 @@ const consoleLive = computed(() => {
     const title = m.task && m.task.title ? m.task.title : '正在分析你的请求';
     return { phase: 'thinking', action: title, context: title !== '正在分析你的请求' ? [title] : [], target: null };
   }
+  // idle / offline：没有正在进行的操作，别把上一条任务的标题（你的聊天输入）当"操作"泄露出来
   const phase = m.state === 'busy' ? 'tool' : 'idle';
-  const action = m.task && m.task.title ? m.task.title : '';
-  const files = Array.isArray(m.currentFiles)
+  const action = m.state === 'busy' && m.task && m.task.title ? m.task.title : '';
+  const files = m.state === 'busy' && Array.isArray(m.currentFiles)
     ? m.currentFiles.map((f) => (f && (f.path || f)) || '').filter(Boolean)
     : [];
-  const context = files.length ? files.slice(0, 6) : action ? [action] : [];
+  const context = files.length ? files.slice(0, 6) : [];
   return { phase, action, context, target: null };
 });
 
@@ -123,16 +189,21 @@ let cardRaf = 0;
  * 这份成员清单跟那个会话对不上 —— 一律按离线 + 推断显示，绝不拿 A 工程的人
  * 冒充 B 工程的状态。办公室布局不受影响，还是这份清单摆出来的样子。
  */
+// 主 Agent（role=agent）不占工位：它自己的实时状态由主控制台剪影单独吃
+// （setMainAgent），在工位区再摆一个就是重复。所以从工位名单里剔掉，
+// 只让真正的 subagent 小怪物（含扫描器注册的常驻成员）坐工位。
 const sceneMembers = computed(() =>
-  team.members.map((m) => ({
-    memberId: m.memberId,
-    name: m.name || String(m.memberId || '').split('@')[0],
-    state: sessions.live ? m.state || 'offline' : 'offline',
-    degraded: sessions.live ? Boolean(m.degraded) : true,
-    ghost: isEphemeralMember(m),
-    project: projectLabelOf(m),
-    taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
-  }))
+  team.members
+    .filter((m) => m.role !== 'agent')
+    .map((m) => ({
+      memberId: m.memberId,
+      name: m.name || String(m.memberId || '').split('@')[0],
+      state: sessions.live ? m.state || 'offline' : 'offline',
+      degraded: sessions.live ? Boolean(m.degraded) : true,
+      ghost: isEphemeralMember(m),
+      project: projectLabelOf(m),
+      taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
+    }))
 );
 
 const seatedCount = computed(() => sceneMembers.value.filter((m) => !m.ghost).length);
@@ -203,6 +274,7 @@ onMounted(() => {
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);
   mainAgent.start();
+  startPhasePoll();
 
   const loop = () => {
     updateCardPos();
@@ -214,6 +286,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   cancelAnimationFrame(cardRaf);
   mainAgent.stop();
+  stopPhasePoll();
   if (office) office.destroy();
   office = null;
 });

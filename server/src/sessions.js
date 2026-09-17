@@ -23,7 +23,7 @@
 
 const fs = require('node:fs');
 const os = require('node:os');
-const path = require('node:path');
+const path = require('path');
 const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -207,35 +207,116 @@ function readRuntime(storage, id) {
  * @returns {{tool: string, file: string}|null}
  */
 const AWAIT_TTL_MS = 5 * 60_000;
-/** 兜底推断的延迟阈值：PreToolUse 之后这么久还没 PostToolUse，多半是卡在权限确认 */
-const AWAIT_DELAY_MS = 2_000;
+/**
+ * 等授权兜底阈值：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
+ * 所以靠 hook 留下的 pending 推断——PreToolUse 写 pending + sessionPhase=tool，PostToolUse 才清掉它。
+ * 一旦 pending 超过这个时间仍没被清（没有 PostToolUse 来），就认为工具被权限框卡住了 → 标「等待授权」。
+ * 设 3.5s：绝大多数工具在 PreToolUse..PostToolUse 之间远小于此值，不会误报；权限框通常一弹就卡住不动。
+ */
+const AWAIT_PROBE_MS = 3_500;
+
+/**
+ * 这些工具永远不该被标成"等待授权"：
+ *  - 只读 / 诊断类（Read/Grep/Glob/...）：本就不弹权限框；且本环境实测它们不发 PostToolUse，
+ *    一旦 pending 残留就会误报成 await。
+ *  - 命令类（Bash/execute_command）：可能弹 run 权限框，但本环境实测同样不发 PostToolUse，
+ *    点了 run 开始执行后 pending 永远清不掉 → 会卡成"等待授权"。所以也不参与兜底推断，
+ *    避免出现"点了 run 还在等授权"的误报（需要真信号时再放开，见 hook.js 的 PROBE_TOOLS）。
+ */
+const NEVER_AWAIT_TOOLS = new Set([
+  'Read', 'Grep', 'Glob', 'ReadLints', 'read_file', 'search_content', 'search_file', 'read_lints', 'list_dir',
+  'RAG_search', 'web_fetch', 'web_search', 'use_skill', 'ask_followup_question', 'read_rules', 'task', 'update_memory', 'todo_write', 'send_message',
+  'Bash', 'execute_command',
+]);
 
 function reporterHookHome() {
   return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
 }
 
-function readReporterAwait(workspacePath) {
+/**
+ * reporter hook 的"主控制台相位"：每次事件都会把当前相位（thinking/tool/await）写进
+ * ~/.workgremlin/hooks/<工位>.json 的 `sessionPhase` 字段（见 packages/reporter/src/hook.js）。
+ * 这是上报真值，优先级高于从 genie-history 推断出来的相位，UI 按真值展示（不标"推断"）。
+ * 超过新鲜期（5 分钟）视为作废，避免 IDE 关掉后残留相位一直挂着。
+ * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
+ * @returns {{phase: string, tool: string, file: string, pending: {tool: string, file: string, at: number}|null}|null}
+ */
+function readReporterPhase(workspacePath) {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   let win = null;
+  let winPending = null;
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
-    // 优先用 permission_prompt 通知直接落的真值
-    let cand = null;
-    const a = j && j.await;
-    const p = j && j.pending;
-    if (a && a.ts && now - a.ts <= AWAIT_TTL_MS) {
-      cand = a;
-    } else if (p && p.at && now - p.at > AWAIT_DELAY_MS && now - p.at <= AWAIT_TTL_MS) {
-      // 兜底：PreToolUse 之后迟迟没有 PostToolUse —— 多半是卡在权限确认
-      cand = { tool: p.tool, file: p.file, ts: p.at, workspacePath: p.workspacePath };
+    const sp = j && j.sessionPhase;
+    if (!sp || !sp.ts || now - sp.ts > AWAIT_TTL_MS) continue;
+    if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
+    if (!win || sp.ts > win.ts) {
+      win = sp;
+      // 同一份状态文件里的 pending：PreToolUse 写、PostToolUse 清掉；迟迟不清 = 工具被权限框卡住
+      winPending = j.pending || null;
     }
-    if (!cand) continue;
-    if (workspacePath && cand.workspacePath && path.resolve(cand.workspacePath) !== path.resolve(workspacePath)) continue;
-    if (!win || cand.ts > win.ts) win = cand;
   }
-  return win ? { tool: String(win.tool || ''), file: String(win.file || '') } : null;
+  if (!win) return null;
+  return {
+    phase: String(win.phase || 'thinking'),
+    tool: String(win.tool || ''),
+    file: String(win.file || ''),
+    pending: winPending
+      ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), at: Number(winPending.at) || 0 }
+      : null,
+  };
+}
+
+/**
+ * 主 Agent 上报相位（已映射成 UI 字段）。轻量接口 /api/v1/reporter-phase 也用它，
+ * 避免把"调用工具 / 等待授权"的文案映射写两遍。
+ * @param {string} workspacePath 当前工程；空则不限工程
+ * @returns {{phase:string, action:string, target:string, context:string[]}|null}
+ */
+function reporterMainPhase(workspacePath) {
+  const rp = readReporterPhase(workspacePath);
+  if (!rp) return null;
+  if (rp.phase === 'await') {
+    return {
+      phase: 'await',
+      action: rp.tool ? `申请执行 ${rp.tool}` : '等待用户授权',
+      target: rp.file || '',
+      context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, rp.file && `目标：${rp.file}`].filter(Boolean),
+    };
+  }
+  // 等授权兜底：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
+  // 所以靠 hook 留下的 pending 推断——PreToolUse 写了 pending + sessionPhase=tool，
+  // 若超过 AWAIT_PROBE_MS 仍无 PostToolUse 来清掉，说明工具被权限框卡住了。
+  // 只读 / 命令类工具（NEVER_AWAIT_TOOLS）本就不发 PostToolUse、也不该弹权限框，排除掉避免误报
+  // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
+  if (
+    rp.phase === 'tool' &&
+    rp.pending &&
+    rp.pending.at &&
+    Date.now() - rp.pending.at > AWAIT_PROBE_MS &&
+    !NEVER_AWAIT_TOOLS.has(rp.pending.tool || rp.tool)
+  ) {
+    const tool = rp.pending.tool || rp.tool;
+    const file = rp.pending.file || rp.file;
+    return {
+      phase: 'await',
+      action: tool ? `申请执行 ${tool}` : '等待用户授权',
+      target: file || '',
+      context: ['等待用户授权后继续', tool && `工具：${tool}`, file && `目标：${file}`].filter(Boolean),
+    };
+  }
+  if (rp.phase === 'tool') {
+    return {
+      phase: 'tool',
+      action: rp.tool ? `调用 ${rp.tool}` : '调用工具',
+      target: rp.file || '',
+      context: rp.file ? [`目标：${rp.file}`] : [],
+    };
+  }
+  // thinking：干净，不堆示意字
+  return { phase: 'thinking', action: '', target: '', context: [] };
 }
 
 /**
@@ -289,9 +370,9 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
     return { phase: 'tool', action: `改 ${f.name}（+${f.added}/-${f.removed}）`, inferred: true };
   }
   // 运行态极新鲜（插件最近在落盘）→ 这一轮对话真的在推进（含纯推理、只读工具等拿不到文件/待办证据的情况）。
-  // 注意：这里没有"正在调工具"的硬证据，只是知道在动，归到专用的「会话中」相位而非「调用工具」，避免轻量对话被显示成在调工具。
+  // 没有"正在调工具"的硬证据，只是知道在动，归到「思考中」——绝不凭空显示「调用工具」。
   if (lastUpdated && now - lastUpdated < FRESH_MS) {
-    return { phase: 'chat', action: '会话进行中', inferred: true };
+    return { phase: 'thinking', action: '', inferred: true };
   }
 
   // 有排队待发消息（且不是陈年残留）→ 规划 / 待处理
@@ -327,15 +408,17 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   let target = '';
   let context = todos.items.map((t) => `${mark[t.status] || '·'} ${t.content}`);
 
-  // 真实"等权限"信号：reporter hook 在 permission_prompt 时落了工具+文件到本地状态文件。
-  // 它是上报真值，优先级高于推断；只在"当前会话"（权限弹窗必然出在它身上）上生效。
+  // 上报真值：reporter hook 把每个事件的相位（思考中 / 调用工具 / 等待授权）落到本地状态文件。
+  // 优先级高于从 genie-history 推断的相位；只在"当前会话"上生效（相位必然出在这只 agent 身上）。
+  let reported = false;
   if (current) {
-    const aw = readReporterAwait(workspacePath);
-    if (aw) {
-      phase = 'await';
-      action = aw.tool ? `申请执行 ${aw.tool}` : '等待用户授权';
-      target = aw.file || '';
-      context = ['等待用户授权后继续', aw.tool && `工具：${aw.tool}`, aw.file && `目标：${aw.file}`].filter(Boolean);
+    const rp = reporterMainPhase(workspacePath);
+    if (rp) {
+      reported = true;
+      phase = rp.phase;
+      action = rp.action;
+      target = rp.target;
+      context = rp.context;
     }
   }
 
@@ -354,7 +437,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     action,
     target,
     context,
-    inferred: true, // 全部来自被动观测，不是上报值
+    inferred: !reported, // 上报真值（reporter hook）不算推断
   };
 }
 
@@ -452,4 +535,4 @@ function listSessions({ workspacePath = '', force = false } = {}) {
   return cache.value;
 }
 
-module.exports = { listSessions, findPluginStorage, decodeDirName };
+module.exports = { listSessions, findPluginStorage, decodeDirName, reporterMainPhase };

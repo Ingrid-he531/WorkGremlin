@@ -34,10 +34,8 @@ export const PHASES = {
   idle: { label: '待命中', color: '#6b7c94', glow: 0.22, busy: false },
   plan: { label: '规划中', color: '#7fb0ff', glow: 0.55, busy: true },
   thinking: { label: '思考中', color: '#ffcf5c', glow: 0.6, busy: true },
-  /** 会话进行中：运行态新鲜但拿不到工具/文件证据时由服务端推断出来（见 server/src/sessions.js 的 inferPhase） */
-  chat: { label: '会话中', color: '#4fd1c5', glow: 0.6, busy: true },
   tool: { label: '调用工具', color: '#4c8dff', glow: 0.85, busy: true },
-  dispatch: { label: '委托专家', color: '#c084fc', glow: 1.0, busy: true },
+  dispatch: { label: '委托专家', color: '#7fb0ff', glow: 1.0, busy: true },
   summarize: { label: '汇总中', color: '#2fbf71', glow: 0.7, busy: true },
   /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
   await: { label: '等待授权', color: '#f5a623', glow: 0.6, busy: false },
@@ -340,11 +338,11 @@ export function drawOperator(c, o) {
   // 手臂：等待授权时举牌（一只手高高举起一块牌子），其余状态沿用 滑/点/静观
   const isAwait = state.phase === 'await';
   if (isAwait) {
-    const bob = Math.sin(t * 2.2) * 3;
+    // 举牌的胳膊：手抬到头部高度即可，别举过头顶去挡悬浮屏
+    const bob = Math.sin(t * 2.2) * 2.4;
     const sh = { x: 8, y: -47 + breathe };
-    const hand = { x: 30, y: -82 + bob + breathe };
-    const el = { x: (sh.x + hand.x) / 2 + 6, y: (sh.y + hand.y) / 2 };
-    // 举牌的胳膊
+    const hand = { x: 28, y: -60 + bob + breathe };
+    const el = { x: (sh.x + hand.x) / 2 + 5, y: (sh.y + hand.y) / 2 };
     c.strokeStyle = body;
     c.lineWidth = 7;
     c.lineCap = 'round';
@@ -360,39 +358,50 @@ export function drawOperator(c, o) {
     c.lineTo(-16, -38 + breathe);
     c.lineTo(-6, -32 + breathe);
     c.stroke();
-    // 牌子立柱
-    const boardCx = hand.x + 2;
-    const boardCy = hand.y - 24;
+    // 牌子：小一点，举在头部高度（牌底贴手，整体在头顶以下），不挡屏
+    const bw = 22;
+    const bh = 12;
+    const boardCx = hand.x + 1;
+    const boardCy = hand.y - bh / 2 - 3;
+    // 牌立柱（手 → 牌底）
     c.strokeStyle = '#3a4252';
-    c.lineWidth = 3;
+    c.lineWidth = 2.6;
     c.beginPath();
     c.moveTo(hand.x, hand.y);
     c.lineTo(boardCx, boardCy + bh / 2);
     c.stroke();
-    // 牌子光晕（淡）
+    // 牌子淡光晕
     c.save();
     c.globalCompositeOperation = 'lighter';
-    const sg2 = c.createRadialGradient(boardCx, boardCy, 0, boardCx, boardCy, 22);
-    sg2.addColorStop(0, rgba(ph.color, 0.32));
+    const sg2 = c.createRadialGradient(boardCx, boardCy, 0, boardCx, boardCy, 16);
+    sg2.addColorStop(0, rgba(ph.color, 0.28));
     sg2.addColorStop(1, rgba(ph.color, 0));
     c.fillStyle = sg2;
     c.beginPath();
-    c.arc(boardCx, boardCy, 22, 0, Math.PI * 2);
+    c.arc(boardCx, boardCy, 16, 0, Math.PI * 2);
     c.fill();
     c.restore();
     // 牌面：小、深灰底
-    const bw = 30;
-    const bh = 18;
     c.fillStyle = '#414a5a';
     c.fillRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
     c.strokeStyle = '#6b7686';
-    c.lineWidth = 1.2;
+    c.lineWidth = 1.1;
     c.strokeRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
-    // 牌上字：白色示意，看不清具体内容
-    c.fillStyle = 'rgba(232,237,242,0.9)';
-    const lineW = bw * 0.6;
-    c.fillRect(boardCx - lineW / 2, boardCy - 3.5, lineW, 2.2);
-    c.fillRect(boardCx - lineW / 2, boardCy + 1, lineW * 0.7, 2.2);
+    // 牌上用白色点点示意有字（远看就是几行点，看不清具体字）
+    c.fillStyle = 'rgba(232,237,242,0.92)';
+    const dotR = 1.25;
+    const gap = 3.3;
+    for (let r = 0; r < 3; r += 1) {
+      const ry = boardCy - 3.2 + r * 3.3;
+      const count = r === 2 ? 3 : 4;
+      const rowW = (count - 1) * gap;
+      const sx = boardCx - rowW / 2;
+      for (let d = 0; d < count; d += 1) {
+        c.beginPath();
+        c.arc(sx + d * gap, ry, dotR, 0, Math.PI * 2);
+        c.fill();
+      }
+    }
     // 举牌胳膊的轮廓光
     c.strokeStyle = rim;
     c.lineWidth = 1.4;
@@ -454,66 +463,3 @@ export function drawOperator(c, o) {
   c.restore();
 }
 
-/* ------------------------------------------------------------------ *
- * 调度光束
- * ------------------------------------------------------------------ */
-
-/**
- * 委托专家时，从控制台射向对应工位的一道地面光 + 一个跑过去的光点 + 落点光环。
- * 用 lighter 叠加，画在所有家具之上 —— 光是"照过去"的，被桌子挡住反而不像光。
- * @param {{x:number,y:number}} from
- * @param {{x:number,y:number}} to
- */
-export function drawDispatchBeam(c, from, to, now, color) {
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const nx = -dy / len;
-  const ny = dx / len;
-  const wA = 0.5;
-  const wB = 0.16;
-
-  c.save();
-  c.globalCompositeOperation = 'lighter';
-
-  const a = project(from.x, from.y, 0.03);
-  const b = project(to.x, to.y, 0.03);
-  const g = c.createLinearGradient(a.x, a.y, b.x, b.y);
-  g.addColorStop(0, rgba(color, 0.3));
-  g.addColorStop(0.55, rgba(color, 0.16));
-  g.addColorStop(1, rgba(color, 0.05));
-  poly(
-    c,
-    [
-      project(from.x + nx * wA, from.y + ny * wA, 0.03),
-      project(to.x + nx * wB, to.y + ny * wB, 0.03),
-      project(to.x - nx * wB, to.y - ny * wB, 0.03),
-      project(from.x - nx * wA, from.y - ny * wA, 0.03),
-    ],
-    g
-  );
-
-  // 沿线跑的光点
-  const k = (now / 1500) % 1;
-  const q = { x: from.x + dx * k, y: from.y + dy * k };
-  const e = groundEllipse(q.x, q.y, 0.34, 0.04);
-  const pg = c.createRadialGradient(e.x, e.y, 0, e.x, e.y, e.rx);
-  pg.addColorStop(0, rgba(color, 0.55));
-  pg.addColorStop(1, rgba(color, 0));
-  c.save();
-  c.beginPath();
-  c.ellipse(e.x, e.y, e.rx, e.ry, e.rot, 0, Math.PI * 2);
-  c.fillStyle = pg;
-  c.fill();
-  c.restore();
-
-  // 落点：工位脚下一圈呼吸的光环
-  const r = groundEllipse(to.x, to.y, 0.62 + Math.sin(now / 240) * 0.06, 0.04);
-  c.beginPath();
-  c.ellipse(r.x, r.y, r.rx, r.ry, r.rot, 0, Math.PI * 2);
-  c.strokeStyle = rgba(color, 0.5);
-  c.lineWidth = 1.6;
-  c.stroke();
-
-  c.restore();
-}

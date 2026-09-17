@@ -24,6 +24,7 @@ import {
   wallQuad,
   shade,
   rgba,
+  roundRectPath,
 } from './iso';
 import {
   ROOM,
@@ -41,7 +42,7 @@ import {
   route,
 } from './officeMap';
 import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from './sprites';
-import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator, drawDispatchBeam } from './mainConsole';
+import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator } from './mainConsole';
 
 const STATE_COLOR = {
   online: '#2ecc71',
@@ -55,8 +56,7 @@ const STATE_COLOR = {
 const STATE_LABEL = { busy: '忙碌', idle: '空闲' };
 /** 后端的五种（+thinking）状态归并到这两档（busy / blocked / thinking 都算忙） */
 const bucketOf = (s) => (s === 'busy' || s === 'blocked' || s === 'thinking' ? 'busy' : 'idle');
-/** 忙碌时具体在干的事：只有"思考"允许起身走动 */
-const WORK_LABEL = { think: '思考', code: '写代码', doc: '写文档' };
+/** 忙碌时具体在干的事（只决定走路/钉座位，头顶标签不再显示细节） */
 const WORK_KEYS = ['think', 'code', 'doc'];
 const hashOf = (s) => {
   let h = 0;
@@ -83,6 +83,12 @@ const GHOST_SPOTS = [
 ];
 const GHOST_MEET = { x: 17.0, y: 3.6, z: 2.25 };
 
+/** 召唤时小怪物站的位置：控制台正前方（靠近镜头那侧） */
+const CONSOLE_FRONT = { x: CONSOLE.desk.x + CONSOLE.desk.w / 2, y: CONSOLE.desk.y + CONSOLE.desk.d + 1.0 };
+/** 小怪物跑到前面后停留 / 对话的时长（秒），之后回工位忙碌 */
+const DISPATCH_TALK = 2.2;
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
 /**
  * @param {HTMLCanvasElement} canvas
  * @param {{onSelect?: (id: string) => void}} [opts]
@@ -106,6 +112,10 @@ export function createIsoOffice(canvas, opts = {}) {
   let hoverId = '';
   let showPaths = false;
   let manualMeeting = false;
+  /** 召唤编排状态：{ agentId, start, back } */
+  let dispatch = null;
+  /** 召唤时出现的临时小幽灵：显示具体工作任务 */
+  let dispatchGhost = null;
 
   let raf = 0;
   let last = 0;
@@ -187,6 +197,48 @@ export function createIsoOffice(canvas, opts = {}) {
     if (u) return u.seat;
     const a = agents.find((ag) => ag.memberId === id);
     return a ? { x: a.x, y: a.y } : null;
+  }
+
+  /** 把工位号 / 成员 id 解析成对应的小怪物（坐工位那只） */
+  function agentByTarget(id) {
+    const direct = agents.find((x) => x.memberId === id);
+    if (direct) return direct;
+    const u = DESK_UNITS.find((d) => d.id === id);
+    if (u) return agents.find((x) => x.home === DESK_UNITS.indexOf(u)) || null;
+    return null;
+  }
+
+  /** 主 Agent 对小怪物说的任务：从上下文里挑"委托 / 分配"那一行，没有就退回动作 */
+  function delegationLine() {
+    const lines = Array.isArray(mainAgent.context) ? mainAgent.context : [];
+    const hit = lines.find((t) => /委托|分配|交给|让他|让她|去/.test(t));
+    return String(hit || lines[0] || mainAgent.action || '新任务');
+  }
+
+  /** 进入 / 退出 dispatch 相位时，启动或收尾召唤编排 */
+  function syncDispatch() {
+    const target = mainAgent.phase === 'dispatch' ? mainAgent.target : null;
+    if (target) {
+      const a = agentByTarget(target);
+      if (a && (!dispatch || dispatch.agentId !== a.memberId)) {
+        dispatch = { agentId: a.memberId, start: performance.now(), back: false };
+        goTo(a, CONSOLE_FRONT, 'stand');
+        dispatchGhost = {
+          x: a.seat.x + 0.25,
+          y: a.seat.y - 0.15,
+          z: 1.7,
+          color: a.color,
+          phase: Math.random() * 6.28,
+          name: a.name,
+          task: delegationLine(),
+        };
+      }
+    } else if (dispatch) {
+      const a = agents.find((x) => x.memberId === dispatch.agentId);
+      if (a && !dispatch.back) goHome(a);
+      dispatch = null;
+      dispatchGhost = null;
+    }
   }
 
   /* ------------------------------ 成员 ------------------------------ */
@@ -1079,6 +1131,77 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
+  /** 召唤编排推进：小怪物走到前面后停留对话，到点回工位 */
+  function stepDispatch(now) {
+    if (!dispatch) return;
+    const a = agents.find((x) => x.memberId === dispatch.agentId);
+    if (!a) { dispatch = null; dispatchGhost = null; return; }
+    const el = (now - dispatch.start) / 1000;
+    if (!dispatch.back) {
+      a.facing = -1; // 面向控制台（更小 gy）
+      if (el >= DISPATCH_TALK) {
+        dispatch.back = true;
+        goHome(a);
+      }
+    }
+    if (dispatchGhost) dispatchGhost.phase = (now - t0) / 780;
+  }
+
+  /** 临时小幽灵精灵（自带漂浮 + 状态点） */
+  function drawDispatchGhostSprite(c) {
+    if (!dispatchGhost) return;
+    const p = project(dispatchGhost.x, dispatchGhost.y, dispatchGhost.z);
+    const ge = groundEllipse(dispatchGhost.x, dispatchGhost.y, 0.4, 0);
+    c.save();
+    c.globalAlpha *= 0.16;
+    c.beginPath();
+    c.ellipse(ge.x, ge.y, ge.rx, ge.ry, ge.rot, 0, Math.PI * 2);
+    c.fillStyle = '#9fe8ff';
+    c.fill();
+    c.restore();
+    drawGhost(c, {
+      x: p.x,
+      y: p.y,
+      s: SPRITE_S * 0.92,
+      color: dispatchGhost.color,
+      state: 'busy',
+      phase: dispatchGhost.phase,
+    });
+  }
+
+  /** 对话气泡（屏幕空间，锚点在脚下，(x,y) 是其上方的落点） */
+  function drawBubble(c, x, y, text, alpha, color) {
+    c.save();
+    c.globalAlpha = alpha;
+    c.font = '600 13px ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
+    const padX = 12;
+    const tw = Math.min(c.measureText(text).width, 232);
+    const w = tw + padX * 2;
+    const h = 30;
+    const bx = x - w / 2;
+    const by = y - h;
+    roundRectPath(c, bx, by, w, h, 10);
+    c.fillStyle = 'rgba(16,21,30,0.95)';
+    c.fill();
+    c.strokeStyle = color;
+    c.lineWidth = 1.6;
+    c.stroke();
+    // 尾巴指向下方中心
+    c.beginPath();
+    c.moveTo(x - 7, by + h - 0.5);
+    c.lineTo(x + 7, by + h - 0.5);
+    c.lineTo(x, by + h + 9);
+    c.closePath();
+    c.fillStyle = 'rgba(16,21,30,0.95)';
+    c.fill();
+    c.stroke();
+    c.fillStyle = '#eaf1fb';
+    c.textAlign = 'left';
+    c.textBaseline = 'middle';
+    c.fillText(text, bx + padX, by + h / 2 + 1);
+    c.restore();
+  }
+
   /* ------------------------------ 主循环 ------------------------------ */
 
   function tick(now) {
@@ -1087,6 +1210,7 @@ export function createIsoOffice(canvas, opts = {}) {
 
     stepAgents(dt, now);
     stepGhosts(dt, now);
+    stepDispatch(now);
     draw(now);
     raf = requestAnimationFrame(tick);
   }
@@ -1109,14 +1233,9 @@ export function createIsoOffice(canvas, opts = {}) {
     const items = statics.slice();
     for (const a of agents) items.push({ depth: depthOf(a.x, a.y), draw: (c) => drawAgent(c, a) });
     for (const g of ghosts) items.push({ depth: depthOf(g.x, g.y) + 3, draw: (c) => drawGhostSprite(c, g) });
+    if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawDispatchGhostSprite(c) });
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
-
-    // 委托专家：一道光从控制台射向那个工位。光是"照过去"的，所以压在家具之上。
-    if (mainAgent.phase === 'dispatch' && mainAgent.target) {
-      const seat = targetSeat(mainAgent.target);
-      if (seat) drawDispatchBeam(ctx, CONSOLE.beam, seat, now, PHASES.dispatch.color);
-    }
 
     // 路网调试
     if (showPaths) {
@@ -1172,15 +1291,41 @@ export function createIsoOffice(canvas, opts = {}) {
       });
       pushHit(g.memberId, s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
     }
+
+    // 召唤时的临时小幽灵：名字 + 具体任务
+    if (dispatchGhost) {
+      const s = toScreen(dispatchGhost.x, dispatchGhost.y, dispatchGhost.z);
+      const y = s.y - SPRITE_H * UNIT_Z * cam.zoom * 0.92 - 12;
+      const box = drawTag(ctx, {
+        x: s.x,
+        y,
+        text: `${dispatchGhost.name} · ${dispatchGhost.task}`,
+        color: STATE_COLOR.busy,
+        dashed: true,
+      });
+      pushHit('__dispatch_ghost', s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
+    }
+
+    // 召唤对话气泡（屏幕空间，压在最上面）
+    if (dispatch) {
+      const a = agents.find((x) => x.memberId === dispatch.agentId);
+      const el = (now - dispatch.start) / 1000;
+      const fadeOut = 1 - clamp01((el - (DISPATCH_TALK + 0.5)) / 0.7);
+      const mainA = clamp01((el - 0.2) / 0.4) * fadeOut;
+      const gremA = clamp01((el - 1.0) / 0.4) * fadeOut;
+      if (a && mainA > 0.02) {
+        const cs = toScreen(CONSOLE.screen.x + CONSOLE.screen.w / 2, CONSOLE.screen.y, CONSOLE.screen.z1);
+        drawBubble(ctx, cs.x, cs.y - 12, delegationLine(), mainA, '#7fb0ff');
+      }
+      if (a && gremA > 0.02) {
+        const sp = toScreen(a.x, a.y, 0);
+        drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, '收到', gremA, a.color);
+      }
+    }
   }
 
   function pushHit(id, x0, y0, x1, y1) {
     hits.push({ id, x0: Math.min(x0, x1), y0: Math.min(y0, y1), x1: Math.max(x0, x1), y1: Math.max(y0, y1) });
-  }
-
-  /** 忙碌的就显示具体在做什么，其余一律是空闲 */
-  function workText(a) {
-    return bucketOf(stateOf(a.memberId)) === 'busy' ? WORK_LABEL[a.work] : '空闲';
   }
 
   /** 只有空闲的、或正在思考的人才会起身走动；写代码 / 写文档时钉在座位上 */
@@ -1188,10 +1333,10 @@ export function createIsoOffice(canvas, opts = {}) {
     return bucketOf(stateOf(a.memberId)) !== 'busy' || a.work === 'think';
   }
 
-  /** 头顶只写状态：去茶水间、去文印这类去向都不再标注 */
+  /** 头顶只写状态：小怪物（被召唤的专家）只显示"忙碌"，具体在做什么交给小幽灵讲 */
   function tagText(a) {
     if (a.mode === 'meet') return '会议中';
-    return workText(a) + (degradedOf(a.memberId) ? '?' : '');
+    return bucketOf(stateOf(a.memberId)) === 'busy' ? '忙碌' : '空闲';
   }
 
   /**
@@ -1349,6 +1494,7 @@ export function createIsoOffice(canvas, opts = {}) {
     /** 主 Agent 控制台：{ phase, action, context[], target }（现在由 mock 驱动，以后接 hook 事件） */
     setMainAgent(s) {
       mainAgent = { phase: 'idle', action: '', context: [], target: null, ...(s || {}) };
+      syncDispatch();
     },
     meetingCount: () => agents.filter((a) => a.inMeeting).length + ghosts.filter((g) => g.inMeeting).length,
     stateColor: (s) => STATE_COLOR[bucketOf(s)],
