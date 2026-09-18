@@ -328,6 +328,12 @@ onBeforeUnmount(() => {
       <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
       <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
       <div v-if="mainAgent.tool" class="ct-row"><b>工具</b><span class="ct-val">{{ mainAgent.tool }}</span></div>
+      <div v-if="(mainAgent.phase === 'done' || mainAgent.phase === 'summarize') && mainAgent.context.length" class="ct-row ct-files">
+        <b>改动</b>
+        <span class="ct-val">
+          <span v-for="(c, i) in mainAgent.context" :key="i" class="ct-file">{{ c }}</span>
+        </span>
+      </div>
     </div>
 
     <!-- 任务卡（跟着角色走） -->
@@ -495,6 +501,11 @@ onBeforeUnmount(() => {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+/* 完成/暂停时的「改动」明细：每个文件单独一行 */
+.ct-files .ct-file {
+  display: block;
 }
 
 .dim {
