@@ -177,7 +177,21 @@ const consoleLive = computed(() => {
   return { phase, action, context, target: null };
 });
 
-watch(consoleLive, (v) => mainAgent.setLiveState(v), { immediate: true });
+/** 这些相位算"正在干活"，从它们回落到 idle 即视为一次任务完成 */
+const ACTIVE_PHASES = new Set(['plan', 'thinking', 'tool', 'dispatch', 'await', 'summarize']);
+watch(
+  consoleLive,
+  (v, old) => {
+    // 真实任务刚跑完（从活跃相位回落到待命）：亮"任务完成"概要 10s，再退回待命；
+    // 沿用上一份状态里的上下文（本次改动的文件等）作为完成概要。
+    if (old && old.phase && ACTIVE_PHASES.has(old.phase) && v && v.phase === 'idle') {
+      mainAgent.enterDone('任务完成', old.context && old.context.length ? old.context.slice() : ['本次任务已完成']);
+      return;
+    }
+    mainAgent.setLiveState(v);
+  },
+  { immediate: true }
+);
 
 /** @type {ReturnType<typeof createIsoOffice> | null} */
 let office = null;
@@ -313,10 +327,10 @@ onBeforeUnmount(() => {
         <i class="dot" :style="{ background: mainAgent.phaseColor }" />
         <span class="ct-phase">{{ mainAgent.phaseLabel }}</span>
       </div>
-      <div v-if="mainAgent.action" class="ct-row"><b>操作</b>{{ mainAgent.action }}</div>
-      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b>{{ mainAgent.target }}</div>
-      <div v-if="mainAgent.skill" class="ct-row"><b>技能</b>{{ mainAgent.skill }}</div>
-      <div v-if="mainAgent.tool" class="ct-row"><b>工具</b>{{ mainAgent.tool }}</div>
+      <div v-if="mainAgent.action" class="ct-row"><b>操作</b><span class="ct-val">{{ mainAgent.action }}</span></div>
+      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
+      <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
+      <div v-if="mainAgent.tool" class="ct-row"><b>工具</b><span class="ct-val">{{ mainAgent.tool }}</span></div>
     </div>
 
     <!-- 任务卡（跟着角色走） -->
@@ -459,7 +473,7 @@ onBeforeUnmount(() => {
 .console-tip {
   position: fixed;
   transform: translate(16px, 16px);
-  max-width: 290px;
+  max-width: 320px;
   padding: 9px 11px;
   border-radius: 8px;
   background: rgba(14, 18, 26, 0.96);
@@ -487,12 +501,22 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 8px;
   color: var(--text-dim, #a8bdd6);
+  /* 长内容（超长文件路径等）与标签顶部对齐，而不是撑破盒子 */
+  align-items: flex-start;
 }
 
 .ct-row b {
   flex: 0 0 auto;
   color: #7fb0ff;
   font-weight: 600;
+}
+
+/* 值文本：可收缩，长串（文件路径 / 工具名）断词换行 */
+.ct-val {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .dim {

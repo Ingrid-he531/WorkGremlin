@@ -37,6 +37,8 @@ export const PHASES = {
   tool: { label: '调用工具', color: '#4c8dff', glow: 0.85, busy: true },
   dispatch: { label: '委托专家', color: '#7fb0ff', glow: 1.0, busy: true },
   summarize: { label: '汇总中', color: '#2fbf71', glow: 0.7, busy: true },
+  /** 任务完成：屏上写"任务完成"，剪影回到静观；内容第三层显示本次改动概要 */
+  done: { label: '任务完成', color: '#2fbf71', glow: 0.5, busy: false },
   /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
   await: { label: '等待授权', color: '#f5a623', glow: 0.6, busy: false },
 };

@@ -16,7 +16,7 @@
  *      "任务完成/已暂停" 摘要（summarize）持续 10s，期间无新事件则退回待命(idle)。
  */
 
-import { defineStore } from 'pinia';
+import { defineStore, acceptHMRUpdate } from 'pinia';
 import { PHASES } from '../iso/mainConsole';
 
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
@@ -31,7 +31,7 @@ const SCRIPT = [
   { phase: 'tool', action: '正在读取 src/auth/session.js', context: ['任务：重构用户登录模块', '进度：已读取 5 个文件'], skill: '', tool: 'mcp: filesystem.read_file', prompt: '', ms: 3600 },
   { phase: 'dispatch', action: '正在召唤 Tester 专家', target: 'B1', context: ['任务：重构用户登录模块', '委托：Tester 补登录用例'], skill: 'delegate（委托专家）', tool: '', prompt: '', ms: 4800 },
   { phase: 'await', action: '申请写入 renderer/vite.config.js', target: 'renderer/vite.config.js', context: ['等待用户授权后继续', '原因：修改构建基路径 base'], skill: '', tool: 'mcp: filesystem.write_file', prompt: '', ms: 5000 },
-  { phase: 'summarize', action: '正在汇总各专家结果', context: ['任务：重构用户登录模块', '已回收：2/2', '准备写入变更摘要'], skill: 'summarize（汇总）', tool: '', prompt: '', ms: 5000 },
+  { phase: 'done', action: '任务完成', context: ['任务：重构用户登录模块', '已交付：登录链路重构', '改动 3 个文件'], skill: '', tool: '', prompt: '', ms: 5000 },
 ];
 
 /** 定时器放在 store 外面：它不属于"状态"，也没必要进 devtools */
@@ -105,7 +105,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.auto = false;
       clearTimeout(timer);
       timer = null;
-      this.enterStopSummary('已暂停 · 等待下一步');
+      this.enterPause('已暂停 · 等待下一步');
     },
 
     /** 手动跳一步（暂停状态下也能点，用来一个个阶段对着看） */
@@ -131,10 +131,14 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * @param {null|{phase:string, action?:string, context?:string[], target?:any, prompt?:string}} s
      */
     setLiveState(s) {
+      // 任务完成概要（done）展示期间，忽略回落的 idle/offline/null，等 10s 定时器退回待命；
+      // 新的活跃事件（tool/thinking…）仍会覆盖它。
+      if (this.phase === 'done' && (!s || s.phase === 'idle' || s.phase === 'offline')) return;
       if (!s) {
         if (this.hookLive) {
           this.hookLive = false;
-          this.enterStopSummary('任务完成 · 等待下一步');
+          // 任务完成：亮出"任务完成"概要（沿用最后上下文：本次改动的文件等），10s 后退回待命
+          this.enterDone('任务完成 · 等待下一步', this.context && this.context.length ? this.context.slice() : ['本次任务已完成']);
         }
         this.liveMember = null;
         return;
@@ -144,14 +148,23 @@ export const useMainAgentStore = defineStore('mainAgent', {
       timer = null;
       this.hookLive = true;
       this.liveMember = s;
+      // s.phase 已是 UI 相位（thinking / tool / await / idle …）或 hook 原始状态（busy / blocked）。
+      // 之前这里把 thinking / tool 等非 busy/blocked 一律归成 idle，导致：
+      //  - UserPromptSubmit 进入的「思考中」被吞成「待命」；
+      //  - 正在调工具时相位被压成「待命」，action 却还留着上一条工具命令
+      //    （图上"待命中却显示 Bash diff"就是这么来的）。
       const hookPhase = s.phase || 'idle';
-      let phase = 'idle';
+      const tool = String(s.tool || '').toLowerCase();
+      const isBash = /\b(bash|shell|terminal|sh|cmd|powershell|exec|zsh)\b/i.test(tool);
+      let phase;
       if (hookPhase === 'busy') {
-        const tool = String(s.tool || '').toLowerCase();
-        const isBash = /\b(bash|shell|terminal|sh|cmd|powershell|exec|zsh)\b/i.test(tool);
+        // 原始 hook 状态：busy 可能调工具，也可能跑 Bash（按「等待授权」处理）
         phase = isBash ? 'await' : 'tool';
       } else if (hookPhase === 'blocked') {
         phase = 'await';
+      } else if (PHASES[hookPhase]) {
+        // 已是 UI 相位，直接采用；Bash 类工具按「等待授权」而非「调用工具」
+        phase = hookPhase === 'tool' && isBash ? 'await' : hookPhase;
       } else {
         phase = 'idle';
       }
@@ -175,7 +188,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
       if (!s) {
         if (!this.live) return; // 本来就在跑脚本，别打搅
         this.live = false;
-        this.enterStopSummary('任务完成 · 等待下一步');
+        // 会话取消：亮出"任务完成"概要（沿用最后上下文），10s 后退回待命
+        this.enterDone('任务完成 · 等待下一步', this.context && this.context.length ? this.context.slice() : ['本次任务已完成']);
         return;
       }
       this.auto = false;
@@ -192,14 +206,31 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 显示一段"完成 / 暂停"摘要（summarize 阶段），持续 10s；期间若有新事件
-     * （setLiveState/applySession 收到非 null）会被覆盖，否则 10s 后退回待命(idle)。
-     * @param {string} summary
+     * 任务完成：亮出"任务完成"状态（done 阶段）并带上完成概要（context），
+     * 持续 10s；期间若有新事件（setLiveState/applySession 收到非 null）会被覆盖，
+     * 否则 10s 后退回待命(idle)。
+     * @param {string} summary 第二层动作文案（默认"任务完成 · 等待下一步"）
+     * @param {string[]} [context] 第三层完成概要（如本次改动的文件、已交付的子任务）
      */
-    enterStopSummary(summary) {
+    enterDone(summary = '任务完成 · 等待下一步', context = []) {
+      clearTimeout(stopTimer);
+      this.phase = 'done';
+      this.action = summary || '任务完成 · 等待下一步';
+      this.context = Array.isArray(context) ? context : [];
+      this.prompt = '';
+      stopTimer = setTimeout(() => {
+        this.phase = 'idle';
+        this.action = '';
+        this.context = [];
+        this.prompt = '';
+      }, 10000);
+    },
+
+    /** 手动暂停演示：亮出"已暂停"摘要（summarize 阶段），持续 10s 后退回待命 */
+    enterPause(summary = '已暂停 · 等待下一步') {
       clearTimeout(stopTimer);
       this.phase = 'summarize';
-      this.action = summary || '任务完成 · 等待下一步';
+      this.action = summary;
       this.context = [];
       this.prompt = '';
       stopTimer = setTimeout(() => {
@@ -213,3 +244,9 @@ export const useMainAgentStore = defineStore('mainAgent', {
 });
 
 export { SCRIPT as MAIN_AGENT_SCRIPT };
+
+// 让 store 支持 HMR：改本文件时 Pinia 会热替换 store 实例的 actions/state，
+// 否则运行中的实例仍是旧版本（例如没有新加的 enterDone），调用即报错。
+if (import.meta.hot) {
+  acceptHMRUpdate(useMainAgentStore, import.meta.hot);
+}

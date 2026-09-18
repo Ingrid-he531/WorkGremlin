@@ -312,12 +312,13 @@ function reporterMainPhase(workspacePath) {
   }
   if (rp.phase === 'tool') {
     // 优先显示 hook 报上来的完整命令（Read src/main.js / grep ... / Bash npm run build），
-    // 没有再回退到「调用 Xxx」泛化文案；tool 字段同样带完整命令，专供 tips 的"工具"行。
+    // 没有再回退到「调用 Xxx」泛化文案。
+    // action 是具体在做什么；tool 只显示工具名，不要塞完整命令。
     const cmd = rp.cmd || (rp.tool ? `调用 ${rp.tool}` : '调用工具');
     return {
       phase: 'tool',
       action: cmd,
-      tool: rp.cmd || rp.tool || '',
+      tool: rp.tool || '',
       target: rp.file || '',
       context: rp.file ? [`目标：${rp.file}`] : [],
     };
