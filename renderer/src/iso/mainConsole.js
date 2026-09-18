@@ -216,8 +216,13 @@ export function drawConsoleScreen(c, o) {
     }
   }
 
-  /* 第三层：任务上下文，多出来就慢慢往上滚 */
-  const lines = Array.isArray(state.context) ? state.context : [];
+  /* 第三层：任务上下文，多出来就慢慢往上滚。
+     思考中（thinking）时把收到的 prompt 原文顶到最前面（点1：tips 显示 prompt 内容） */
+  const ctxBase = Array.isArray(state.context) ? state.context : [];
+  const lines =
+    state.phase === 'thinking' && state.prompt
+      ? [state.prompt, ...ctxBase]
+      : ctxBase;
   if (showL3 && lines.length) {
     const lineH = fs3 * 1.65;
     const topV = H * 0.68;
@@ -387,20 +392,16 @@ export function drawOperator(c, o) {
     c.strokeStyle = '#6b7686';
     c.lineWidth = 1.1;
     c.strokeRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
-    // 牌上用白色点点示意有字（远看就是几行点，看不清具体字）
+    // 牌上用一排两个白色点点示意有字（点4：原三排白点改成一排两个）
     c.fillStyle = 'rgba(232,237,242,0.92)';
     const dotR = 1.25;
     const gap = 3.3;
-    for (let r = 0; r < 3; r += 1) {
-      const ry = boardCy - 3.2 + r * 3.3;
-      const count = r === 2 ? 3 : 4;
-      const rowW = (count - 1) * gap;
-      const sx = boardCx - rowW / 2;
-      for (let d = 0; d < count; d += 1) {
-        c.beginPath();
-        c.arc(sx + d * gap, ry, dotR, 0, Math.PI * 2);
-        c.fill();
-      }
+    const rowW = gap;
+    const sx = boardCx - rowW / 2;
+    for (let d = 0; d < 2; d += 1) {
+      c.beginPath();
+      c.arc(sx + d * gap, boardCy, dotR, 0, Math.PI * 2);
+      c.fill();
     }
     // 举牌胳膊的轮廓光
     c.strokeStyle = rim;

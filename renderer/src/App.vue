@@ -32,10 +32,13 @@ const tab = ref(initialTab);
 const selectedId = ref('');
 
 async function refreshMessages() {
-  const base = httpBase(team.serverInfo || {});
+  const info = team.serverInfo || {};
+  const base = httpBase(info);
   const t = team.team ? team.team.name : '';
   try {
-    const res = await fetch(`${base}/api/v1/snapshot${t ? `?team=${encodeURIComponent(t)}` : ''}`);
+    const res = await fetch(`${base}/api/v1/snapshot${t ? `?team=${encodeURIComponent(t)}` : ''}`, {
+      headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+    });
     const data = await res.json();
     if (data && data.ok && data.snapshot) msgs.setSnapshot(data.snapshot.recentMessages || []);
   } catch {

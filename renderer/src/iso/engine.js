@@ -579,12 +579,29 @@ export function createIsoOffice(canvas, opts = {}) {
        */
       const SEG = 4;
       const segW = p.w / SEG;
-      const segDepth = (s) => depthOf(p.x + (s + 0.5) * segW, p.y + p.d / 2);
+      const natSegDepth = (s) => depthOf(p.x + (s + 0.5) * segW, p.y + p.d / 2);
+      /**
+       * 隔板要挡住"正后方那一排工位"的桌子：但每段 depth=gx+gy，
+       * 后方桌子 gx 更大时深度反而更高，会被画到隔板前面（透出来）。
+       * 把每段深度夹在 [后方桌面上物, 自己桌面上物) 之间：
+       * 下限保证压住后方桌子，上限保证不挡自己这排的桌子/人。
+       */
+      const deskDepth = depthOf(u.desk.x + u.desk.w / 2, u.desk.y + u.desk.d / 2);
+      const ownCeil = deskDepth + 0.4 - 0.01; // 不挡自己这排的桌子/桌上物
+      const behind = i - 3 >= 0 ? DESK_UNITS[i - 3] : null; // 同列前一排
+      const behindFloor = behind
+        ? depthOf(behind.desk.x + behind.desk.w / 2, behind.desk.y + behind.desk.d / 2) + 0.4 + 0.01
+        : -Infinity;
+      const segDepth = (s) => {
+        const nat = natSegDepth(s);
+        const clamped = Math.min(ownCeil, Math.max(behindFloor, nat));
+        return clamped + s * 0.0005; // 段间仍保持左→右的前后序
+      };
       /** 名牌落在哪一段上 */
       const segOf = (gx) => Math.max(0, Math.min(SEG - 1, Math.floor((gx - p.x) / segW)));
 
-      // 落地阴影：隔板脚下的暗带，明确"它立在地上"
-      push(segDepth(0) - 0.5, (c) => {
+      // 落地阴影：用自然深度，避免被 clamp 抬高后盖到后方桌子上
+      push(natSegDepth(0) - 0.5, (c) => {
         isoDiamond(c, {
           x: p.x - 0.06,
           y: p.y + p.d - 0.06,
@@ -620,7 +637,6 @@ export function createIsoOffice(canvas, opts = {}) {
       push(depthOf(u.chair.x, u.chair.y) - 0.02, (c) => drawChair(c, u.chair.x, u.chair.y, true));
 
       // 桌子
-      const deskDepth = depthOf(u.desk.x + u.desk.w / 2, u.desk.y + u.desk.d / 2);
       push(deskDepth, (c) => {
         const { x, y, w, d, h } = u.desk;
         // 四条腿
@@ -647,9 +663,13 @@ export function createIsoOffice(canvas, opts = {}) {
           prog,
           i * 977 + 13
         );
-        // 键盘 / 鼠标 / 杯子
+        // 键盘 / 鼠标
         isoBox(c, { x: u.keyboard.x, y: u.keyboard.y, z, w: u.keyboard.w, d: u.keyboard.d, h: 0.03, color: '#2a3240' });
-        isoCylinder(c, { x: u.mug.x, y: u.mug.y, z, r: u.mug.r, h: u.mug.h, color: '#e6ebf2' });
+      });
+      // 水杯随桌面一起排序（跟显示器/键盘同层 deskDepth+0.4），不要人为抬到悬浮屏之上：
+      // 屏后的水杯应被悬浮屏正确遮挡，而不是盖在屏上
+      push(deskDepth + 0.4, (c) => {
+        isoCylinder(c, { x: u.mug.x, y: u.mug.y, z: u.desk.h, r: u.mug.r, h: u.mug.h, color: '#e6ebf2' });
       });
 
     });
@@ -730,7 +750,10 @@ export function createIsoOffice(canvas, opts = {}) {
     const cd = CONSOLE.desk;
     push(depthOf(cd.x + cd.w / 2, cd.y + cd.d / 2), (c, now) => drawConsoleDesk(c, now));
     const cs = CONSOLE.screen;
-    push(depthOf(cs.x + cs.w / 2, cs.y) + 0.05, (c, now) =>
+    // 悬浮屏必须盖住它后面（gy 更小）的所有工位内容：工位物品按桌心推深度最高约 22.28，
+    // 而 operator（小黑人）在屏前（depth 22.62）。取 operator 深度 -0.1 ≈ 22.52，
+    // 既高于工位、又不挡小黑人。
+    push(depthOf(CONSOLE.seat.x, CONSOLE.seat.y) - 0.1, (c, now) =>
       drawConsoleScreen(c, { state: mainAgent, now, zoom: cam.zoom })
     );
     push(depthOf(CONSOLE.seat.x, CONSOLE.seat.y), (c, now) => drawOperator(c, { state: mainAgent, now }));

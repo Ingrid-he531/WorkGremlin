@@ -434,7 +434,18 @@ async function main() {
     await beat();
     if (event === 'PreToolUse') {
       const tool = ev.tool_name || '';
-      const file = relFile(fileOf(ev.tool_input), cwd);
+      // 注意：工具目标文件用局部变量 f 接，绝不能覆盖外层的 file（= 状态文件路径）！
+      // 否则 writeState(file, ...) 会把 sessionPhase 写到相对路径（如 src/main.js）而非状态文件，
+      // server 永远读不到 tool 相位 → 思考中卡住、转不到调用工具（今天这个 bug 的根因）。
+      const f = relFile(fileOf(ev.tool_input), cwd);
+      const input = ev.tool_input || {};
+      // 给 tips 用的"实际调用"：Bash/命令类用 command，Grep 类用 pattern+路径，读改写类用"工具 文件"
+      const desc =
+        input.command || input.cmd
+          ? `${tool} ${input.command || input.cmd}`
+          : input.pattern || input.regex || input.query
+            ? `${tool} ${input.pattern || input.regex || input.query}${f ? ' ' + f : ''}`
+            : f ? `${tool} ${f}` : tool;
       // pending 只给"会发 PostToolUse、且可能要权限"的写类工具打。
       // 本环境实测 Read/Grep/Glob/ReadLints/Bash 等只读 / 命令类工具根本不发 PostToolUse，
       // 一旦给它们打 pending，PostToolUse 永远不来、清不掉 → 兜底误判成"等待授权"
@@ -444,10 +455,10 @@ async function main() {
         lastTool: tool,
         lastInput: ev.tool_input || '',
         pending: probe
-          ? { tool, file, at: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' }
+          ? { tool, file: f, cmd: desc, at: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' }
           : null, // 非写类：显式清掉上一支可能残留的 pending
         // 工具开始跑 → 主控制台相位「调用工具」（PreToolUse..PostToolUse 这段就是"在调工具"）
-        sessionPhase: { phase: 'tool', tool, file, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+        sessionPhase: { phase: 'tool', tool, file: f, cmd: desc, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
       });
       // 主 Agent 召唤 subagent（Agent 工具）→ 往清单写一条，办公室飘出一只小幽灵
       if (tool === 'Agent') addGhost(ctx.workspacePath, agentName(ev.tool_input), agentTask(ev.tool_input));

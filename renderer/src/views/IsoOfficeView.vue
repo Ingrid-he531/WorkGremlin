@@ -47,7 +47,7 @@ async function startPhasePoll() {
       if (res.ok) {
         const d = await res.json();
         if (d && d.ok && d.phase && d.phase !== 'idle') {
-          fastPhase.value = { phase: d.phase, action: d.action, target: d.target, context: d.context || [] };
+          fastPhase.value = { phase: d.phase, action: d.action, target: d.target, context: d.context || [], tool: d.tool || '' };
         } else {
           fastPhase.value = null;
         }
@@ -135,7 +135,7 @@ const consoleLive = computed(() => {
       return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null };
     }
     if (fp.phase === 'tool') {
-      return { phase: 'tool', action: fp.action || '调用工具', context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null };
+      return { phase: 'tool', action: fp.action || '调用工具', context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, tool: fp.tool || '' };
     }
   }
 
@@ -148,7 +148,7 @@ const consoleLive = computed(() => {
       return { phase: 'await', action: sel.action, context: sel.context && sel.context.length ? sel.context : ['等待用户授权后继续'], target: sel.target || null };
     }
     if (sel.phase === 'tool' || m.state === 'busy') {
-      return { phase: 'tool', action: sel.action, context: sel.context && sel.context.length ? sel.context : [], target: sel.target || null };
+      return { phase: 'tool', action: sel.action, context: sel.context && sel.context.length ? sel.context : [], target: sel.target || null, tool: sel.tool || '' };
     }
   }
 
@@ -164,7 +164,8 @@ const consoleLive = computed(() => {
   if (m.state === 'thinking') {
     // 思考中：用户刚提交，尚未发起工具 / 授权。第二层写任务标题（即用户那句话）。
     const title = m.task && m.task.title ? m.task.title : '正在分析你的请求';
-    return { phase: 'thinking', action: title, context: title !== '正在分析你的请求' ? [title] : [], target: null };
+    // 点1：把用户那句话（prompt 原文）一并带出，屏幕第三层会顶到最前显示
+    return { phase: 'thinking', action: title, context: title !== '正在分析你的请求' ? [title] : [], target: null, prompt: title };
   }
   // idle / offline：没有正在进行的操作，别把上一条任务的标题（你的聊天输入）当"操作"泄露出来
   const phase = m.state === 'busy' ? 'tool' : 'idle';

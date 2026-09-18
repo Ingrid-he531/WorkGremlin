@@ -263,8 +263,11 @@ function readReporterPhase(workspacePath) {
     phase: String(win.phase || 'thinking'),
     tool: String(win.tool || ''),
     file: String(win.file || ''),
+    // hook 在 PreToolUse 写的"实际调用"可读命令（Read src/main.js / grep ... / Bash ...），
+    // 给主控制台 tips 当"工具"显示，比纯工具名更直观
+    cmd: String(win.cmd || ''),
     pending: winPending
-      ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), at: Number(winPending.at) || 0 }
+      ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), cmd: String(winPending.cmd || ''), at: Number(winPending.at) || 0 }
       : null,
   };
 }
@@ -308,9 +311,13 @@ function reporterMainPhase(workspacePath) {
     };
   }
   if (rp.phase === 'tool') {
+    // 优先显示 hook 报上来的完整命令（Read src/main.js / grep ... / Bash npm run build），
+    // 没有再回退到「调用 Xxx」泛化文案；tool 字段同样带完整命令，专供 tips 的"工具"行。
+    const cmd = rp.cmd || (rp.tool ? `调用 ${rp.tool}` : '调用工具');
     return {
       phase: 'tool',
-      action: rp.tool ? `调用 ${rp.tool}` : '调用工具',
+      action: cmd,
+      tool: rp.cmd || rp.tool || '',
       target: rp.file || '',
       context: rp.file ? [`目标：${rp.file}`] : [],
     };
