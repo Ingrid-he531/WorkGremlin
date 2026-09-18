@@ -212,6 +212,7 @@ const sceneMembers = computed(() =>
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],
+      level: m.level || null,
       state: sessions.live ? m.state || 'offline' : 'offline',
       degraded: sessions.live ? Boolean(m.degraded) : true,
       ghost: isEphemeralMember(m),
@@ -219,9 +220,6 @@ const sceneMembers = computed(() =>
       taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
     }))
 );
-
-const seatedCount = computed(() => sceneMembers.value.filter((m) => !m.ghost).length);
-const ghostCount = computed(() => sceneMembers.value.filter((m) => m.ghost).length);
 
 watch(sceneMembers, (v) => office && office.setMembers(v));
 watch(
@@ -324,16 +322,20 @@ onBeforeUnmount(() => {
         <i class="dot" :style="{ background: mainAgent.phaseColor }" />
         <span class="ct-phase">{{ mainAgent.phaseLabel }}</span>
       </div>
-      <div v-if="mainAgent.action" class="ct-row"><b>操作</b><span class="ct-val">{{ mainAgent.action }}</span></div>
-      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
-      <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
-      <div v-if="mainAgent.tool" class="ct-row"><b>工具</b><span class="ct-val">{{ mainAgent.tool }}</span></div>
-      <div v-if="(mainAgent.phase === 'done' || mainAgent.phase === 'summarize') && mainAgent.context.length" class="ct-row ct-files">
-        <b>改动</b>
+      <div
+        class="ct-row"
+        v-if="mainAgent.action || ((mainAgent.phase === 'done' || mainAgent.phase === 'summarize') && mainAgent.context.length)"
+      >
+        <b>操作</b>
         <span class="ct-val">
-          <span v-for="(c, i) in mainAgent.context" :key="i" class="ct-file">{{ c }}</span>
+          <template v-if="(mainAgent.phase === 'done' || mainAgent.phase === 'summarize') && mainAgent.context.length">
+            <span v-for="(c, i) in mainAgent.context" :key="i" class="ct-file">{{ c }}</span>
+          </template>
+          <template v-else-if="mainAgent.action">{{ mainAgent.action }}</template>
         </span>
       </div>
+      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
+      <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
     </div>
 
     <!-- 任务卡（跟着角色走） -->
@@ -357,7 +359,6 @@ onBeforeUnmount(() => {
     <div class="tip">
       拖拽平移 · 滚轮缩放 · 双击复位 · 点小怪物看任务
       <span class="dim">（前玻璃墙下是主 Agent 控制台，放大可看清屏幕）</span>
-      <span class="dim">（工位 {{ seatedCount }} · 临时 {{ ghostCount }}）</span>
     </div>
   </div>
 </template>

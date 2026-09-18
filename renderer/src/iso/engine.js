@@ -52,6 +52,9 @@ const STATE_COLOR = {
   thinking: '#ffcf5c',
   offline: '#4a5160',
 };
+/** 工牌级别色（与小怪物脖子上的工牌一致）：user=蓝, project=绿, 其它（演示/普通）=灰 */
+const LEVEL_COLOR = { user: '#3b82f6', project: '#22c55e' };
+const levelColor = (level) => LEVEL_COLOR[level] || '#7c8aa5';
 /** 对外只保留两档状态：忙碌 / 空闲 */
 const STATE_LABEL = { busy: '忙碌', idle: '空闲' };
 /** 后端的五种（+thinking）状态归并到这两档（busy / blocked / thinking 都算忙） */
@@ -302,11 +305,16 @@ export function createIsoOffice(canvas, opts = {}) {
       color: colorOf(member.memberId),
       prop: propOf(member.memberId),
       work: workOf(member.memberId),
+      level: member.level || null,
     };
   }
 
-  function makeGhost(member, i) {
-    const a = GHOST_SPOTS[i % GHOST_SPOTS.length];
+  function makeGhost(member, i, nearSeat) {
+    // 如果这个幽灵对应一个坐工位的小怪物（定义级 subagent 被召唤），
+    // 就飘在小怪物头顶附近，而不是通用悬浮区，并且不漂走。
+    const a = nearSeat
+      ? { x: nearSeat.x, y: nearSeat.y - 0.1, z: 2.15 }
+      : GHOST_SPOTS[i % GHOST_SPOTS.length];
     return {
       memberId: member.memberId,
       name: member.name || member.memberId,
@@ -316,10 +324,12 @@ export function createIsoOffice(canvas, opts = {}) {
       anchor: a,
       target: null,
       phase: Math.random() * 6.28,
-      speed: 0.5 + Math.random() * 0.35,
+      speed: nearSeat ? 0 : 0.5 + Math.random() * 0.35,
       hold: performance.now() + 1500 + Math.random() * 4000,
       inMeeting: false,
+      nearSeat: Boolean(nearSeat),
       color: colorOf(member.memberId),
+      level: member.level || null,
     };
   }
 
@@ -330,6 +340,8 @@ export function createIsoOffice(canvas, opts = {}) {
     const floating = members.filter((m) => !seated.includes(m));
 
     const seatIds = new Set(seated.map((m) => m.memberId));
+    /** 小怪物 memberId -> 工位坐标（脚底），供"对应幽灵"定位到小怪物附近 */
+    const seatPos = {};
     agents = agents.filter((a) => seatIds.has(a.memberId));
     seated.forEach((m, i) => {
       let a = agents.find((x) => x.memberId === m.memberId);
@@ -339,13 +351,22 @@ export function createIsoOffice(canvas, opts = {}) {
       }
       a.home = i;
       a.seat = DESK_UNITS[i].seat;
+      // 已存在的小怪物也要刷新名字 / 级别：级别是随成员卡异步下发的，
+      // 首次建出来时可能还没有（会画成灰牌），后续收到必须更新，否则永远是灰的。
+      a.name = m.name || a.name;
+      a.level = m.level || null;
       a.taskProgress = Number.isFinite(m.taskProgress) ? m.taskProgress : 0;
+      seatPos[m.memberId] = DESK_UNITS[i].seat;
     });
 
     const gIds = new Set(floating.map((m) => m.memberId));
     ghosts = ghosts.filter((g) => gIds.has(g.memberId));
     floating.forEach((m, i) => {
-      if (!ghosts.some((g) => g.memberId === m.memberId)) ghosts.push(makeGhost(m, i));
+      if (!ghosts.some((g) => g.memberId === m.memberId)) {
+        // 幽灵名字若等于某个坐工位小怪物的 memberId（定义级 subagent 被召唤），就飘在它附近
+        const near = seatPos[m.name];
+        ghosts.push(makeGhost(m, i, near));
+      }
     });
 
     maybeMeeting();
@@ -439,6 +460,7 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function stepGhosts(dt, now) {
     for (const g of ghosts) {
+      if (g.nearSeat) continue; // 锚定在小怪物附近，原地漂浮，不漂去通用悬浮区
       if (g.target) {
         const dx = g.target.x - g.x;
         const dy = g.target.y - g.y;
@@ -476,6 +498,7 @@ export function createIsoOffice(canvas, opts = {}) {
       k += 1;
     });
     ghosts.forEach((g) => {
+      if (g.nearSeat) return; // 留在小怪物身边，不进会议室
       g.inMeeting = true;
       g.target = GHOST_MEET;
     });
@@ -665,7 +688,7 @@ export function createIsoOffice(canvas, opts = {}) {
           y: p.y + p.d + 0.001,
           z: 0.58,
           text: owner.name,
-          accent: STATE_COLOR[stateOf(owner.memberId)] || STATE_COLOR.offline,
+          accent: levelColor(owner.level),
         });
       });
 
@@ -690,12 +713,11 @@ export function createIsoOffice(canvas, opts = {}) {
         // 显示器
         isoBox(c, { x: u.monitor.x, y: u.monitor.y, z, w: u.monitor.w, d: u.monitor.d, h: 0.06, color: '#202735' });
         const a = agents.find((ag) => ag.home === i);
-        const st = a ? stateOf(a.memberId) : 'offline';
         const prog = a && a.taskProgress != null ? a.taskProgress : 0;
         drawScreen(
           c,
           { x: u.monitor.x + 0.12, y: u.monitor.y, z: z + 0.06, w: u.monitor.w - 0.24, d: u.monitor.d, h: u.monitor.h },
-          STATE_COLOR[st] || STATE_COLOR.offline,
+          levelColor(a && a.level),
           prog,
           i * 977 + 13
         );
@@ -771,7 +793,7 @@ export function createIsoOffice(canvas, opts = {}) {
       });
     });
 
-    /* 复印机（会议室东南角） */
+    /* 复印机（会议室西北角） */
     const pr = MEETING.printer;
     push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2), (c) => {
       isoBox(c, { ...pr, color: COLORS.metal });
@@ -1170,6 +1192,7 @@ export function createIsoOffice(canvas, opts = {}) {
       phase: a.phase,
       sitting: a.mode === 'sit' || a.mode === 'meet',
       degraded: degradedOf(a.memberId),
+      level: a.level,
     });
   }
 

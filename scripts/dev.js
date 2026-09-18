@@ -2,8 +2,8 @@
 /**
  * 开发启动器：并行拉起 Vite（renderer, 5173）与 Electron（desktop）。
  * 用法：
- *   npm run dev                 默认带演示数据（保证首屏有东西可看）
- *   npm run dev -- --no-demo    接真实数据源
+ *   npm run dev                 默认接真实数据源（非演示）
+ *   npm run dev -- --demo       灌演示数据（保证首屏有东西可看）
  *   npm run dev -- --demo-seed 42
  *
  * 额外的命令行参数会透传给 Electron 主进程（进而传给内嵌 server）。
@@ -61,7 +61,7 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 const extra = process.argv.slice(2);
-const noDemo = extra.includes('--no-demo');
+const demo = extra.includes('--demo');
 // 直接调用 node_modules/.bin 里的 electron：走 `npm run start` 时子进程 PATH 不一定带 .bin
 const electronBin = path.join(
   root,
@@ -70,11 +70,11 @@ const electronBin = path.join(
   isWin ? 'electron.cmd' : 'electron'
 );
 
+// 开发态默认接真实数据源（非演示）；仅 --demo 才灌演示数据（保证首屏有东西可看）。
 run('vite', npm, ['run', 'dev', '--workspace', '@workgremlin/renderer']);
-run('electron', electronBin, [path.join('desktop', 'src', 'main.js'), ...extra.filter((a) => a !== '--no-demo')], {
+run('electron', electronBin, [path.join('desktop', 'src', 'main.js'), ...extra], {
   env: {
     WORKGREMLIN_DEV: '1',
-    // 开发态默认灌演示数据；--no-demo 关闭
-    ...(noDemo ? { WORKGREMLIN_NO_DEMO: '1' } : { WORKGREMLIN_DEMO: '1' }),
+    ...(demo ? { WORKGREMLIN_DEMO: '1' } : { WORKGREMLIN_NO_DEMO: '1' }),
   },
 });

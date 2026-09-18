@@ -19,8 +19,10 @@ npm install
 # 2) 【V1 判据】验证原生模块可用（建表 + 写入 + 读回 + checkpoint）
 npm run db:check
 
-# 3) 开发启动（Vite + Electron）
+# 3) 开发启动（Vite + Electron）；默认接真实数据源（非演示）
 npm run dev
+#    想看演示数据（首屏有内容）时显式加 --demo：
+npm run dev -- --demo
 
 # 4) 构建 renderer 静态资源（M0 的 build；M3 再接 electron-builder）
 npm run build
@@ -155,9 +157,9 @@ curl -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/jso
 | --- | --- |
 | `WORKGREMLIN_HOME` | 数据目录（覆盖 `~/.workgremlin`） |
 | `WORKGREMLIN_DB` | 数据库文件路径 |
-| `WORKGREMLIN_DEMO=1` / `MOCK=1` | 启用演示数据 |
+| `WORKGREMLIN_DEMO=1` / `MOCK=1` / `--demo` | 显式启用演示数据。默认**不**启用：首屏是空屋子，等 agent 通过 hook 上报后才有人 |
 | `WORKGREMLIN_DEMO_SEED=N` | 演示数据随机种子（同 seed 输出完全一致） |
-| `WORKGREMLIN_NO_DEMO=1` | 禁止首次运行自动灌演示数据 |
+| `WORKGREMLIN_NO_DEMO=1` | （已废弃）默认即不自动灌演示数据，此变量保留为兼容别名 |
 | `WORKGREMLIN_WORKSPACE` | 当前工程根目录（工程名与 subagent 清单都基于它；缺省 `process.cwd()`） |
 | `WORKGREMLIN_SUBAGENTS_FILE` | subagent 清单文件路径（覆盖 `<workspace>/.workgremlin/subagents.json`） |
 | `WORKGREMLIN_DEV=1` | Electron 加载 Vite dev server 并开 DevTools |

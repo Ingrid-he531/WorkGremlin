@@ -82,7 +82,10 @@ function normState(s) {
 }
 
 /**
- * @param {{bus: any, repo: any, team: string, workspacePath?: string, project?: string, intervalMs?: number}} opts
+ * @param {{bus: any, repo: any, team: string, workspacePath?: string, project?: string,
+ *          intervalMs?: number, roster?: any}} opts
+ *   roster: 常驻小怪物名册（agentRoster 实例）。传入后，清单里的"已定义 subagent"
+ *           被召唤时，会把对应小怪物的工位状态同步为忙碌，结束（从清单移除）时复位在线。
  */
 function createSubagentFeed(opts) {
   const bus = opts.bus;
@@ -91,6 +94,13 @@ function createSubagentFeed(opts) {
   const project = opts.project || '';
   const intervalMs = Number(opts.intervalMs) || 2000;
   const file = feedFilePath(opts.workspacePath);
+  const roster = opts.roster || null;
+
+  /** 小怪物工位在被召唤时应显示的状态：召唤即视为在忙，除非显式指定 thinking/blocked */
+  function gremlinState(state) {
+    const s = normState(state);
+    return s === 'busy' || s === 'thinking' || s === 'blocked' ? s : 'busy';
+  }
 
   /** name -> {id, title} 当前挂在幽灵身上的任务 */
   const tasks = new Map();
@@ -153,12 +163,27 @@ function createSubagentFeed(opts) {
         progress: a.progress,
         files: a.files,
       });
+
+      // 清单里的"已定义 subagent"被召唤：把对应小怪物的工位状态同步为忙碌，
+      // 并登记活跃（roster 心跳不再覆盖它）。召唤结束（从清单移除）时由下方 stale 清理复位。
+      if (roster && roster.isDefined(a.name)) {
+        bus.heartbeat({
+          team,
+          memberId: a.name,
+          state: gremlinState(a.state),
+          progress: a.progress,
+          files: a.files,
+        });
+        roster.markActive(a.name);
+      }
     }
 
     // 清单里没了 -> 幽灵散掉（含上一轮残留的临时成员）
     const stale = repo.listEphemeral.all(team);
     for (const m of stale) {
       if (alive.has(m.id)) continue;
+      // 若这是某个已定义 subagent 的幽灵，先把对应小怪物工位复位为在线
+      if (roster && m.name && roster.isDefined(m.name)) roster.markIdle(m.name);
       tasks.delete(m.id);
       bus.removeMember({ team, memberId: m.id });
     }

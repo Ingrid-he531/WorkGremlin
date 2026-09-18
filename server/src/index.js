@@ -17,10 +17,9 @@ const path = require('node:path');
 const { openDatabase } = require('./db');
 const { createIngestBus } = require('./ingest/bus');
 const { createSubagentFeed } = require('./ingest/subagentFeed');
+const { createAgentRoster } = require('./ingest/agentRoster');
 const { resolveWorkspacePath, resolveProjectName } = require('./project');
 const { createWorkspaceManager } = require('./workspace');
-const os = require('node:os');
-const { createAgentScanner } = require('./ingest/agentScan');
 const { createHub } = require('./ws/hub');
 const { createHealthRouter } = require('./http/routes/health');
 const { createQueryRouter } = require('./http/routes/query');
@@ -142,7 +141,7 @@ function createServer(opts = {}) {
   let info = null;
   let demoTicker = null;
   let subagentFeed = null;
-  let agentScan = null;
+  let agentRoster = null;
   /** 临时成员（幽灵）挂在哪个 team 上：与演示数据同一个 team */
   const feedTeam = () => process.env.WORKGREMLIN_TEAM || 'workgremlin';
 
@@ -160,6 +159,7 @@ function createServer(opts = {}) {
       team: cur.team || feedTeam(),
       workspacePath: cur.workspacePath,
       project: cur.project,
+      roster: agentRoster,
     });
     subagentFeed.start();
     return subagentFeed;
@@ -226,19 +226,33 @@ function createServer(opts = {}) {
       demoTicker.start();
     }
 
-    // subagent 清单 → 幽灵：文件里有谁，屋里就飘着谁（换工程就重开一个监听）
-    agentScan = createAgentScanner({
+    // 清理历史遗留：旧版 agentScan 注册的 "agent-<级别>-<id>" 成员已被 agentRoster 取代，
+    // 但库里的旧行不会自动消失，会和 roster 的小怪物同名（出现"Peter/Leo 各两只"）。这里一次性删掉。
+    try {
+      const legacy = repo
+        .listMembers.all(feedTeam())
+        .filter((m) => /^agent-(user|project)-/.test(m.id));
+      for (const m of legacy) bus.removeMember({ team: feedTeam(), memberId: m.id });
+    } catch {
+      /* 清理失败不影响启动 */
+    }
+
+    // 常驻小怪物名册：把已定义的 subagent（项目级 + 用户级）注册成坐工位、带工牌的小怪物。
+    // 当前工程路径优先，回退到服务启动时解析的工程（演示模式下也能扫到项目级 agent）。
+    // 必须在 startFeed() 之前创建：被召唤时由 subagentFeed 同步小怪物工位状态。
+    agentRoster = createAgentRoster({
       bus,
       team: feedTeam(),
-      homeDir: os.homedir(),
-      getWorkspacePath: () => workspace.current().workspacePath,
+      getWorkspacePath: () => workspace.current().workspacePath || workspacePath,
     });
+    // 换工程：重启 subagent 清单监听（幽灵）+ 同步小怪物名册。
+    // 已定义 subagent 的"小怪物"只由 agentRoster 注册一次，避免同名两只。
     workspace.setOnSwitch(() => {
       startFeed();
-      agentScan.sync();
+      agentRoster.sync();
     });
     startFeed();
-    agentScan.start();
+    agentRoster.start();
 
     if (!opts.silent) {
       console.log(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
@@ -264,7 +278,10 @@ function createServer(opts = {}) {
     if (opts.demo === true || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1') return true;
     if (process.env.WORKGREMLIN_NO_DEMO === '1') return false;
     if (onDemoWorkspace) return true;
-    return repo.listTeams.all().length === 0; // 首次运行：给两个界面一份可渲染的数据
+    // 默认**不再**在空库首跑时自动灌演示数据：首屏走真实数据源（空屋子），
+    // 直到 agent 通过 hook 上报才有人。演示数据只在使用 --demo / WORKGREMLIN_DEMO=1 /
+    // MOCK=1 时显式注入（README 已说明）。避免"默认演示"和文档里的"默认非演示"互相打架。
+    return false;
   }
 
   function maybeSeedDemo(onDemoWorkspace) {
@@ -290,7 +307,7 @@ function createServer(opts = {}) {
     for (const t of timers) clearInterval(t);
     if (demoTicker) demoTicker.stop();
     if (subagentFeed) subagentFeed.stop();
-    if (agentScan) agentScan.stop();
+    if (agentRoster) agentRoster.stop();
     try {
       hub.close();
     } catch {

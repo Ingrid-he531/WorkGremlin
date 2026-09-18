@@ -83,6 +83,8 @@ function createAgentScanner({ bus, team, homeDir, getWorkspacePath, intervalMs =
         sessionId: null,
         ephemeral: false,
         reported: 0,
+        // 必须带上 workspacePath：bus 里按它判定"工程级 subagent"，缺了工程级会被判成普通成员（灰牌）
+        workspacePath: a.level === 'project' ? wp : '',
         project: a.level === 'project' && wp ? path.basename(wp) : null,
       });
     }

@@ -13,6 +13,7 @@
 const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey } = require('@workgremlin/shared');
 const clock = require('../clock');
 const { resolveProjectName } = require('../project');
+const { detectLevel } = require('./agentLevel');
 
 function teamIdOf(name) {
   return name;
@@ -37,6 +38,8 @@ function jsonOrNull(v) {
 function createIngestBus({ repo, hub, project = '', team = null }) {
   /** 会随"打开工程"变化的东西：当前工程名 + 当前团队（屋里显示谁的工位） */
   const context = { project, team: team || null };
+  /** memberId -> 'user' | 'project'：注册时按 subagent 目录判定一次 */
+  const levels = new Map();
   const now = () => clock.now();
 
   function ensureTeam(name, workspacePath = '', mainConversationId = null, source = 'report') {
@@ -75,6 +78,10 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       ephemeral: p.ephemeral ? 1 : 0,
       project: p.project ?? null,
     });
+    // subagent 级别（用户级 / 项目级）：按名字扫 agent 目录判定，记进内存 map
+    const lvl = detectLevel(p.name || p.memberId || '', p.workspacePath || '');
+    if (lvl) levels.set(id, lvl);
+    else levels.delete(id);
     hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, buildMemberCard(id));
     return id;
   }
@@ -356,6 +363,8 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       // 临时成员（无工位 → 场景里飘着的幽灵）+ 所属项目名
       ephemeral: Boolean(m.ephemeral),
       project: m.project ?? null,
+      // subagent 级别（用户级 / 项目级）：驱动小怪物脖子上的工牌配色
+      level: levels.get(memberId) || null,
     };
   }
 
@@ -368,6 +377,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     const member = requireMember(team, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     repo.purgeMember(member.id);
+    levels.delete(member.id);
     hub.broadcast(team, WS_EVENTS.MEMBER_REMOVE, { memberId: member.id });
     return { ok: true };
   }

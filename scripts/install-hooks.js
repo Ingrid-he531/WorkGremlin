@@ -118,25 +118,100 @@ function merge(existing, ours, uninstall) {
 /**
  * 这个目标看着装了吗？**没装就别写**。
  *
- * 写一份 settings.json 会顺手 mkdir 出一个配置目录，而"配置目录存在"一度被当成
- * 安装证据（server/src/products.js），结果没装 WorkBuddy 的机器上也显示成了已装。
- * 证据只认两样：可执行文件在 PATH 里，或者配置目录里除了我们的 settings.json
- * 还有别的数据（说明这个产品真在用这个目录）。
+ * 判定口径和 server/src/products.js 对齐：只认"安装位置"——
+ *   · CLI：在 PATH 或常见 bin 目录里找得到可执行文件；
+ *   · 插件：在编辑器扩展目录里找得到（覆盖"只装了插件、没装 CLI、~/.codebuddy 还没数据"的情况）。
+ * 另外保留一条兜底：配置目录里除了我们的 settings.json 还有别的数据（产品真在用这个目录）。
+ * （早期版本曾把"配置目录存在"当证据，被我们自己的安装脚本造出的目录骗了；
+ *  现在 products.js 只用安装位置判 installed，所以即便这里新建了配置目录也不会误判成已装。）
+ *
+ * 注意：这里只决定"要不要写"；"有没有装过我们的 hook、有了就不重复写"由
+ * 下面的 merge + before===after 跳过逻辑保证（即"有就跳过、没有就装"）。
  */
-function looksInstalled(t) {
-  if (t.cmd) {
-    try {
-      execSync(`command -v ${t.cmd}`, { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
-      return true;
-    } catch {
-      /* PATH 里没有，继续看目录 */
+
+const HOME = os.homedir();
+
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function isFile(p) {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** PATH 里的命令解析成绝对路径 */
+function resolveCommand(cmd) {
+  try {
+    const out = execSync(`command -v ${cmd}`, { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, encoding: 'utf8' });
+    return String(out || '').split(/\r?\n/).map((s) => s.trim()).find(Boolean) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** CLI 常见安装目录兜底（PATH 查不到时） */
+const CLI_BIN_DIRS = [
+  path.join(HOME, '.local', 'bin'),
+  path.join(HOME, 'bin'),
+  path.join(HOME, '.codebuddy', 'bin'),
+  path.join(HOME, '.workbuddy', 'bin'),
+  path.join(HOME, '.npm-global', 'bin'),
+  '/usr/local/bin',
+  '/opt/homebrew/bin',
+  '/usr/bin',
+];
+function findCliBin(cmd) {
+  const names = process.platform === 'win32' ? [`${cmd}.cmd`, `${cmd}.exe`, cmd] : [cmd];
+  for (const dir of CLI_BIN_DIRS) {
+    for (const n of names) {
+      const p = path.join(dir, n);
+      if (isFile(p)) return p;
     }
   }
+  return '';
+}
+
+/** 编辑器扩展目录（插件安装位置） */
+function extensionRoots() {
+  return ['.vscode', '.vscode-insiders', '.cursor', '.trae', '.windsurf', '.vscode-server']
+    .map((d) => path.join(HOME, d, 'extensions'))
+    .filter(isDir);
+}
+const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
+function pluginMatchIn(root) {
+  try {
+    for (const name of fs.readdirSync(root)) {
+      if (RE_PLUGIN.some((re) => re.test(name))) return path.join(root, name);
+    }
+  } catch {
+    /* 读不到就跳过 */
+  }
+  return '';
+}
+function findPluginDir() {
+  for (const r of extensionRoots()) {
+    const hit = pluginMatchIn(r);
+    if (hit) return hit;
+  }
+  return '';
+}
+
+function looksInstalled(t) {
+  // CLI：PATH 或常见安装目录里找得到可执行文件
+  if (t.cmd && (resolveCommand(t.cmd) || findCliBin(t.cmd))) return true;
+  // 插件：编辑器扩展目录里找得到（CodeBuddy 插件与 CLI 共用 ~/.codebuddy）
+  if (t.plugin && findPluginDir()) return true;
+  // 兜底：配置目录里除了我们自己的 settings.json 还有别的数据
   const ours = new Set(['settings.json', 'settings.json.bak-workgremlin']);
   try {
-    return fs
-      .readdirSync(t.dir)
-      .some((n) => !ours.has(n));
+    return fs.readdirSync(t.dir).some((n) => !ours.has(n));
   } catch {
     return false;
   }
@@ -166,6 +241,7 @@ function main() {
       file: path.join(os.homedir(), '.codebuddy', 'settings.json'),
       cmd: 'codebuddy',
       dir: path.join(os.homedir(), '.codebuddy'),
+      plugin: true,
     },
     {
       id: 'workbuddy',

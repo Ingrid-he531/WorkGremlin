@@ -51,7 +51,7 @@ export function drawGremlin(ctx, o) {
   const {
     x, y, s, color, state = 'online',
     facing = 1, walking = false, phase = 0,
-    sitting = false, degraded = false, alpha = 1,
+    sitting = false, degraded = false, alpha = 1, level,
   } = o;
 
   ctx.save();
@@ -146,6 +146,9 @@ export function drawGremlin(ctx, o) {
   drawProp(ctx, o.prop || 'note', color);
   ctx.restore();
 
+  // 脖子上的工牌：颜色区分用户级 / 项目级（演示专家用中性灰），两个白点示意有字
+  drawLevelBadge(ctx, level, { nx: 0, ny: bodyTop + 2 }, { bx: 0, by: bodyTop + 10 });
+
   ctx.restore();
 }
 
@@ -213,6 +216,52 @@ export function drawGhost(ctx, o) {
   ctx.fillStyle = light;
   ctx.fill();
 
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ *
+ * 工牌（脖子上的级别牌）—— 仅小怪物（drawGremlin）使用
+ * ------------------------------------------------------------------ */
+
+/**
+ * 画一张挂在脖子上的小工牌。用明显的实色底色区分 subagent 级别：
+ *   · user    -> 蓝（#3b82f6）
+ *   · project -> 绿（#22c55e）
+ *   · 其它（演示专家 / 普通成员）-> 中性灰（#7c8aa5）
+ * 卡片上两个白点示意"有字"（不渲染文字，保持小尺寸清晰）。
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string} level 'user' | 'project' | 其它
+ * @param {{nx:number, ny:number}} neck 挂绳在脖子上的锚点
+ * @param {{bx:number, by:number}} anchor 卡片的水平中心 x 与上沿 y
+ */
+function drawLevelBadge(ctx, level, neck, anchor) {
+  const color =
+    level === 'user' ? '#3b82f6' : level === 'project' ? '#22c55e' : '#7c8aa5';
+  ctx.save();
+  // 挂绳：从脖子两侧拉到卡片上沿（锚点在头部下方、身体上方的脖子处）
+  ctx.strokeStyle = 'rgba(20,24,32,0.6)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(neck.nx - 3, neck.ny);
+  ctx.lineTo(anchor.bx - 3, anchor.by);
+  ctx.moveTo(neck.nx + 3, neck.ny);
+  ctx.lineTo(anchor.bx + 3, anchor.by);
+  ctx.stroke();
+  // 竖长方形卡片：明显的实色底色 + 黑色边框
+  const cardW = 11;
+  const cardH = 15;
+  const left = anchor.bx - cardW / 2;
+  roundRectPath(ctx, left, anchor.by, cardW, cardH, 2.5);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = '#0f141b';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  // 一个白点：示意卡片上有字
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.arc(anchor.bx, anchor.by + cardH / 2, 2, 0, Math.PI * 2);
+  ctx.fill();
   ctx.restore();
 }
 
