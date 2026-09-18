@@ -13,7 +13,7 @@ import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { httpBase, getServerInfo } from '../api/bridge';
-import { createIsoOffice, STATE_COLOR, STATE_LABEL } from '../iso/engine';
+import { createIsoOffice } from '../iso/engine';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
@@ -25,7 +25,6 @@ const sessions = useSessionStore();
 const mainAgent = useMainAgentStore();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
-const showPaths = ref(false);
 
 /* ------------------------------ 主 Agent 相位快轮询（1.5s） ------------------------------
  * 服务端 /api/v1/reporter-phase 直接回 reporter hook 的上报相位（已映射成 UI 字段），
@@ -229,7 +228,6 @@ watch(
   () => props.selectedId,
   (v) => office && office.setSelected(v)
 );
-watch(showPaths, (v) => office && office.setShowPaths(v));
 watch(mainAgentState, (v) => office && office.setMainAgent(v));
 
 /* ------------------------------ 任务卡 ------------------------------ */
@@ -279,7 +277,6 @@ function resetView() {
   office = createIsoOffice(canvasRef.value, { onSelect: openCard });
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
-  office.setShowPaths(showPaths.value);
   office.setMainAgent(mainAgentState.value);
 }
 
@@ -346,27 +343,8 @@ onBeforeUnmount(() => {
 
     <!-- HUD -->
     <div class="hud" @click.stop>
-      <span v-for="(label, s) in STATE_LABEL" :key="s" class="legend">
-        <i class="dot" :style="{ background: STATE_COLOR[s] }" />{{ label }}
-      </span>
-      <span class="legend"><i class="dot ghost-dot" />临时成员</span>
-      <span class="sep" />
-      <span class="legend">
-        <i class="dot" :style="{ background: mainAgent.phaseColor }" />主 Agent · {{ mainAgent.phaseLabel }}
-      </span>
-      <span v-if="sessions.selected" class="legend session-tag">
-        会话 {{ String(sessions.selected.id).slice(0, 8) }}
-        <template v-if="sessions.selected.project">· {{ sessions.selected.project }}</template>
-        <template v-if="!sessions.live">· 无实时数据</template>
-      </span>
-      <button :class="{ on: mainAgent.auto }" @click="mainAgent.setAuto(!mainAgent.auto)">
-        {{ mainAgent.auto ? '演示中' : mainAgent.live ? '会话接管' : '已暂停' }}
-      </button>
-      <button :disabled="mainAgent.live" @click="mainAgent.next()">下一阶段</button>
-      <span class="sep" />
       <button @click="callAll">集合开会</button>
       <button @click="dismiss">全员回工位</button>
-      <button :class="{ on: showPaths }" @click="showPaths = !showPaths">路网</button>
       <button @click="resetView">复位视角</button>
     </div>
 
