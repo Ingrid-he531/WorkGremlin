@@ -90,6 +90,42 @@ const DISPATCH_TALK = 2.2;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /**
+ * 把"圆角牌底 + 文字"渲染到离屏画布（水平、高清），供斜贴到墙面。
+ * 牌底+文字一起进同一张位图，斜贴后整块都随墙面平行四边形变形，像真挂在墙上。
+ */
+function makeWallText(text) {
+  const fontPx = 30;
+  const padX = 16;
+  const padY = 10;
+  const font = `600 ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  const off = document.createElement('canvas');
+  let g = off.getContext('2d');
+  g.font = font;
+  const w = Math.ceil(g.measureText(text).width) + padX * 2;
+  const h = fontPx + padY * 2;
+  off.width = w;
+  off.height = h;
+  // 改 width/height 会清空上下文，重取一次
+  g = off.getContext('2d');
+  g.font = font;
+  // 牌底（圆角深色 + 蓝边）
+  roundRectPath(g, 0.75, 0.75, w - 1.5, h - 1.5, 10);
+  g.fillStyle = 'rgba(18,24,34,0.82)';
+  g.fill();
+  g.lineWidth = 1.5;
+  g.strokeStyle = 'rgba(127,176,255,0.55)';
+  g.stroke();
+  // 文字：近白、加阴影保证在花背景上清晰
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.shadowColor = 'rgba(0,0,0,0.6)';
+  g.shadowBlur = 4;
+  g.fillStyle = '#eaf1fb';
+  g.fillText(text, w / 2, h / 2 + 1);
+  return off;
+}
+
+/**
  * @param {HTMLCanvasElement} canvas
  * @param {{onSelect?: (id: string) => void}} [opts]
  */
@@ -961,26 +997,32 @@ export function createIsoOffice(canvas, opts = {}) {
     }
     wallQuad(c, 'y', 0, wb.x0 + 1.9, wb.x0 + 2.5, wb.z0 + 0.16, wb.z1 - 0.16, 'rgba(76,141,255,0.18)');
 
-    // 会议室标识
-    const label = project(MEETING.x + MEETING.w / 2, MEETING.y + MEETING.d + 0.35, 2.45);
-    c.save();
-    c.fillStyle = '#8fa3bf';
-    c.font = '12px ui-sans-serif, system-ui, sans-serif';
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    c.fillText('会议室', label.x, label.y);
-    c.restore();
-
-    // 茶水间标识
-    // 南面就是玻璃幕墙，标识退回屋里一点，免得被幕墙压住
-    const plabel = project(PANTRY.x + PANTRY.w / 2, PANTRY.y + PANTRY.d - 0.35, 2.45);
-    c.save();
-    c.fillStyle = '#8fa3bf';
-    c.font = '12px ui-sans-serif, system-ui, sans-serif';
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    c.fillText('茶水间', plabel.x, plabel.y);
-    c.restore();
+    // 会议室 / 茶水间 标识：整块（牌底+文字）按墙面平行四边形斜贴，做到"平行墙面"
+    // （不是水平悬浮）。AX 斜 30°、AZ 竖直，故文字底边随墙斜、竖笔仍直。
+    const drawWallLabel = (text, gx, gy, gz) => {
+      const tc = makeWallText(text);
+      const W = tc.width;
+      const H = tc.height;
+      const halfH = 0.34; // 标牌半高（世界单位），需压在墙高内
+      const halfW = halfH * (W / H); // 与位图等比，文字不被拉伸
+      // 墙面四边形的三個角（gy 恒定）：sD=左上 sC=右上 sA=左下
+      const sD = project(gx - halfW, gy, gz + halfH);
+      const sC = project(gx + halfW, gy, gz + halfH);
+      const sA = project(gx - halfW, gy, gz - halfH);
+      // 仿射：把位图(0..W,0..H) 映射到墙面平行四边形（绕墙斜切）
+      const a = (sC.x - sD.x) / W;
+      const b = (sC.y - sD.y) / W;
+      const cc = (sA.x - sD.x) / H;
+      const d = (sA.y - sD.y) / H;
+      c.save();
+      c.transform(a, b, cc, d, sD.x, sD.y);
+      c.drawImage(tc, 0, 0);
+      c.restore();
+    };
+    // 会议室：贴在实心后墙（gy=0，与白板同面）上方，z 不超墙高 2.8
+    drawWallLabel('会议室', MEETING.x + MEETING.w / 2, 0, 2.4);
+    // 茶水间：贴其北侧内墙（gy=PANTRY.y），z 不超玻璃高 2.3
+    drawWallLabel('茶水间', PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
   }
 
   /**
