@@ -103,7 +103,6 @@ onUnmounted(() => {
       <button :class="{ on: tab === 'office' }" @click="tab = 'office'">办公室</button>
       <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">工位卡片</button>
       <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">对话记录</button>
-      <button :class="{ on: tab === 'lab' }" @click="tab = 'lab'">工位设计</button>
       <span class="spacer" />
       <SessionSwitcher
         :items="sessions.options"

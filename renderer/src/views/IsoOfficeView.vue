@@ -218,6 +218,8 @@ const sceneMembers = computed(() =>
       ghost: isEphemeralMember(m),
       project: projectLabelOf(m),
       taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
+      // 被召唤的 subagent 当前任务名：主 agent 会用气泡把它交代给小怪物
+      task: m.task && m.task.title ? m.task.title : '',
     }))
 );
 

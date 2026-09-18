@@ -39,6 +39,7 @@ import {
   PLACES,
   NAV_NODES,
   CONSOLE,
+  CONSOLE_FRONT,
   route,
 } from './officeMap';
 import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from './sprites';
@@ -86,10 +87,8 @@ const GHOST_SPOTS = [
 ];
 const GHOST_MEET = { x: 17.0, y: 3.6, z: 2.25 };
 
-/** 召唤时小怪物站的位置：控制台正前方（靠近镜头那侧） */
-const CONSOLE_FRONT = { x: CONSOLE.desk.x + CONSOLE.desk.w / 2, y: CONSOLE.desk.y + CONSOLE.desk.d + 1.0 };
 /** 小怪物跑到前面后停留 / 对话的时长（秒），之后回工位忙碌 */
-const DISPATCH_TALK = 2.2;
+const DISPATCH_TALK = 3.6;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /**
@@ -151,10 +150,20 @@ export function createIsoOffice(canvas, opts = {}) {
   let hoverId = '';
   let showPaths = false;
   let manualMeeting = false;
-  /** 召唤编排状态：{ agentId, start, back } */
+  /** 召唤编排状态：{ agentId, start, back, task, ghostId, reply } */
   let dispatch = null;
   /** 召唤时出现的临时小幽灵：显示具体工作任务 */
   let dispatchGhost = null;
+  /** 召唤队列：收到召唤 -> 排队走"跑到主 agent 面前领任务"的编排 */
+  const summonQueue = [];
+  /** 已入过队的召唤幽灵 memberId：避免重复触发 */
+  const summonedGhostIds = new Set();
+  /** 编排期间先隐藏的召唤幽灵 memberId：等小怪物回到工位再出现在头顶 */
+  const pendingGhostIds = new Set();
+  /** 待显幽灵"至少看过一次"（用于等待任务名的兜底，避免任务名一直不来时幽灵不出现） */
+  const pendingSeenOnce = new Set();
+  /** 坐工位小怪物名字 -> { seat, agentId }：把"被召唤的幽灵"对到它的小怪物 */
+  let seatByName = {};
 
   let raf = 0;
   let last = 0;
@@ -254,30 +263,67 @@ export function createIsoOffice(canvas, opts = {}) {
     return String(hit || lines[0] || mainAgent.action || '新任务');
   }
 
-  /** 进入 / 退出 dispatch 相位时，启动或收尾召唤编排 */
+  /** 入队一次召唤编排（小怪物跑去主 agent 面前领任务）。同一只不重复入队。 */
+  function enqueueDispatch(agentId, task, ghostId = null) {
+    if (!agentId) return;
+    if (dispatch && dispatch.agentId === agentId) return;
+    if (summonQueue.some((s) => s.agentId === agentId)) return;
+    summonQueue.push({ agentId, task: task || '新任务', ghostId });
+  }
+
+  /** 启动队列里的下一段编排（当前空闲时） */
+  function pumpDispatch() {
+    if (dispatch || !summonQueue.length) return;
+    const s = summonQueue.shift();
+    const a = agents.find((x) => x.memberId === s.agentId);
+    if (!a) return;
+    dispatch = {
+      agentId: a.memberId,
+      start: performance.now(),
+      back: false,
+      task: s.task,
+      ghostId: s.ghostId || null,
+      reply: Math.random() < 0.5 ? '收到' : '好的',
+    };
+    goTo(a, CONSOLE_FRONT, 'stand');
+    dispatchGhost = {
+      x: a.seat.x + 0.25,
+      y: a.seat.y - 0.15,
+      z: 1.7,
+      color: a.color,
+      phase: Math.random() * 6.28,
+      name: a.name,
+      task: s.task,
+    };
+  }
+
+  /** 收尾当前编排：回工位后让"召唤幽灵"出现在头顶，并推进队列 */
+  function finishDispatch() {
+    if (!dispatch) return;
+    const ghostId = dispatch.ghostId;
+    dispatch = null;
+    dispatchGhost = null;
+    if (ghostId) revealGhost(ghostId);
+    pumpDispatch();
+  }
+
+  /** 小怪物回到工位：显示之前被隐藏的召唤幽灵（飘在它头顶） */
+  function revealGhost(ghostId) {
+    pendingGhostIds.delete(ghostId);
+    if (ghosts.some((g) => g.memberId === ghostId)) return;
+    const m = members.find((x) => x.memberId === ghostId);
+    if (!m) return;
+    const info = m.ghost ? seatByName[m.name] : null;
+    ghosts.push(makeGhost(m, ghosts.length, info && info.seat));
+  }
+
+  /** 主 agent 进入 dispatch 相位（mock / 真实）时，也让对应小怪物走同一套编排 */
   function syncDispatch() {
-    const target = mainAgent.phase === 'dispatch' ? mainAgent.target : null;
-    if (target) {
-      const a = agentByTarget(target);
-      if (a && (!dispatch || dispatch.agentId !== a.memberId)) {
-        dispatch = { agentId: a.memberId, start: performance.now(), back: false };
-        goTo(a, CONSOLE_FRONT, 'stand');
-        dispatchGhost = {
-          x: a.seat.x + 0.25,
-          y: a.seat.y - 0.15,
-          z: 1.7,
-          color: a.color,
-          phase: Math.random() * 6.28,
-          name: a.name,
-          task: delegationLine(),
-        };
-      }
-    } else if (dispatch) {
-      const a = agents.find((x) => x.memberId === dispatch.agentId);
-      if (a && !dispatch.back) goHome(a);
-      dispatch = null;
-      dispatchGhost = null;
+    if (mainAgent.phase === 'dispatch' && mainAgent.target) {
+      const a = agentByTarget(mainAgent.target);
+      if (a) enqueueDispatch(a.memberId, delegationLine());
     }
+    pumpDispatch();
   }
 
   /* ------------------------------ 成员 ------------------------------ */
@@ -310,11 +356,10 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   function makeGhost(member, i, nearSeat) {
-    // 如果这个幽灵对应一个坐工位的小怪物（定义级 subagent 被召唤），
-    // 就飘在小怪物头顶附近，而不是通用悬浮区，并且不漂走。
-    const a = nearSeat
-      ? { x: nearSeat.x, y: nearSeat.y - 0.1, z: 2.15 }
-      : GHOST_SPOTS[i % GHOST_SPOTS.length];
+    // 对应坐工位小怪物的"头顶幽灵"：围绕工位上方一小片区域慢慢飘；
+    // 其它临时成员飘在通用悬浮区。
+    const center = nearSeat ? { x: nearSeat.x, y: nearSeat.y - 0.1, z: 2.15 } : null;
+    const a = center || GHOST_SPOTS[i % GHOST_SPOTS.length];
     return {
       memberId: member.memberId,
       name: member.name || member.memberId,
@@ -322,10 +367,11 @@ export function createIsoOffice(canvas, opts = {}) {
       y: a.y,
       z: a.z,
       anchor: a,
+      center, // 非空 = 头顶幽灵，围绕它小范围飘荡
       target: null,
       phase: Math.random() * 6.28,
-      speed: nearSeat ? 0 : 0.5 + Math.random() * 0.35,
-      hold: performance.now() + 1500 + Math.random() * 4000,
+      speed: center ? 0.35 : 0.5 + Math.random() * 0.35,
+      hold: performance.now() + 800 + Math.random() * 2000,
       inMeeting: false,
       nearSeat: Boolean(nearSeat),
       color: colorOf(member.memberId),
@@ -340,8 +386,10 @@ export function createIsoOffice(canvas, opts = {}) {
     const floating = members.filter((m) => !seated.includes(m));
 
     const seatIds = new Set(seated.map((m) => m.memberId));
-    /** 小怪物 memberId -> 工位坐标（脚底），供"对应幽灵"定位到小怪物附近 */
+    /** 小怪物 memberId -> 工位坐标（脚底） */
     const seatPos = {};
+    /** 小怪物名字 -> { seat, agentId }：被召唤的幽灵按名字对到它的小怪物 */
+    const byName = {};
     agents = agents.filter((a) => seatIds.has(a.memberId));
     seated.forEach((m, i) => {
       let a = agents.find((x) => x.memberId === m.memberId);
@@ -357,18 +405,47 @@ export function createIsoOffice(canvas, opts = {}) {
       a.level = m.level || null;
       a.taskProgress = Number.isFinite(m.taskProgress) ? m.taskProgress : 0;
       seatPos[m.memberId] = DESK_UNITS[i].seat;
+      const nm = m.name || String(m.memberId).split('@')[0];
+      if (nm) byName[nm] = { seat: DESK_UNITS[i].seat, agentId: m.memberId };
     });
+    seatByName = byName;
 
     const gIds = new Set(floating.map((m) => m.memberId));
     ghosts = ghosts.filter((g) => gIds.has(g.memberId));
+    // 幽灵已消失 -> 从待显 / 已触发集合里清掉，这样下次召唤能重新触发
+    for (const id of [...pendingGhostIds]) if (!gIds.has(id)) pendingGhostIds.delete(id);
+    for (const id of [...summonedGhostIds]) if (!gIds.has(id)) summonedGhostIds.delete(id);
+    for (const id of [...pendingSeenOnce]) if (!gIds.has(id)) pendingSeenOnce.delete(id);
+
     floating.forEach((m, i) => {
+      // 幽灵名字若等于某个坐工位小怪物的名字，说明这是"某只小怪物被召唤"的实例幽灵。
+      const info = m.ghost ? byName[m.name] : null;
+      if (info && !summonedGhostIds.has(m.memberId)) {
+        // 收到召唤（含页面刷新时已在跑的）：先隐藏这只幽灵，稍后入队走
+        // "跑到主 agent 面前领任务 -> 回工位"的编排。
+        summonedGhostIds.add(m.memberId);
+        pendingGhostIds.add(m.memberId);
+      }
+      if (info && pendingGhostIds.has(m.memberId)) {
+        // 幽灵先注册、任务名随后才写进成员卡：等任务到位再入队，免得显示成"新任务"。
+        const queued = summonQueue.find((s) => s.ghostId === m.memberId);
+        const running = !!(dispatch && dispatch.ghostId === m.memberId);
+        if (!queued && !running) {
+          if (m.task) summonQueue.push({ agentId: info.agentId, task: m.task, ghostId: m.memberId });
+          else if (pendingSeenOnce.has(m.memberId)) summonQueue.push({ agentId: info.agentId, task: '执行任务', ghostId: m.memberId });
+        } else if (m.task) {
+          if (queued) queued.task = m.task;
+          else if (running) dispatch.task = m.task;
+        }
+        pendingSeenOnce.add(m.memberId);
+      }
+      if (pendingGhostIds.has(m.memberId)) return; // 还没到出现时机
       if (!ghosts.some((g) => g.memberId === m.memberId)) {
-        // 幽灵名字若等于某个坐工位小怪物的 memberId（定义级 subagent 被召唤），就飘在它附近
-        const near = seatPos[m.name];
-        ghosts.push(makeGhost(m, i, near));
+        ghosts.push(makeGhost(m, i, info && info.seat));
       }
     });
 
+    pumpDispatch();
     maybeMeeting();
   }
 
@@ -460,7 +537,6 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function stepGhosts(dt, now) {
     for (const g of ghosts) {
-      if (g.nearSeat) continue; // 锚定在小怪物附近，原地漂浮，不漂去通用悬浮区
       if (g.target) {
         const dx = g.target.x - g.x;
         const dy = g.target.y - g.y;
@@ -472,16 +548,29 @@ export function createIsoOffice(canvas, opts = {}) {
           g.y = g.target.y;
           g.z = g.target.z;
           g.target = null;
-          g.hold = now + 6000 + Math.random() * 9000;
+          g.hold = now + (g.nearSeat ? 1000 + Math.random() * 2000 : 6000 + Math.random() * 9000);
         } else {
           g.x += (dx / d) * step;
           g.y += (dy / d) * step;
           g.z += (dz / d) * step;
         }
-      } else if (!g.inMeeting && now >= g.hold) {
-        const pool = GHOST_SPOTS.filter((p) => p !== g.anchor);
-        g.anchor = pool[Math.floor(Math.random() * pool.length)];
-        g.target = g.anchor;
+      } else if (now >= g.hold) {
+        if (g.nearSeat && g.center) {
+          // 头顶幽灵：在整个工位附近随机飘（横向范围更大），别钉死、也别飘去别处
+          const rx = 1.4;
+          const ry = 0.9;
+          const ang = Math.random() * Math.PI * 2;
+          const rad = Math.sqrt(Math.random()); // 均匀落在椭圆内
+          g.target = {
+            x: g.center.x + Math.cos(ang) * rad * rx,
+            y: g.center.y + Math.sin(ang) * rad * ry,
+            z: g.center.z + (Math.random() - 0.5) * 0.25,
+          };
+        } else if (!g.inMeeting) {
+          const pool = GHOST_SPOTS.filter((p) => p !== g.anchor);
+          g.anchor = pool[Math.floor(Math.random() * pool.length)];
+          g.target = g.anchor;
+        }
       }
     }
   }
@@ -1219,11 +1308,11 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
-  /** 召唤编排推进：小怪物走到前面后停留对话，到点回工位 */
+  /** 召唤编排推进：小怪物跑到前面停留对话，到点回工位，回到工位后收尾 */
   function stepDispatch(now) {
     if (!dispatch) return;
     const a = agents.find((x) => x.memberId === dispatch.agentId);
-    if (!a) { dispatch = null; dispatchGhost = null; return; }
+    if (!a) { finishDispatch(); return; }
     const el = (now - dispatch.start) / 1000;
     if (!dispatch.back) {
       a.facing = -1; // 面向控制台（更小 gy）
@@ -1231,6 +1320,10 @@ export function createIsoOffice(canvas, opts = {}) {
         dispatch.back = true;
         goHome(a);
       }
+    } else if (Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
+      // 已回到工位：让召唤幽灵出现在头顶，收尾本次编排
+      finishDispatch();
+      return;
     }
     if (dispatchGhost) dispatchGhost.phase = (now - t0) / 780;
   }
@@ -1403,11 +1496,11 @@ export function createIsoOffice(canvas, opts = {}) {
       const gremA = clamp01((el - 1.0) / 0.4) * fadeOut;
       if (a && mainA > 0.02) {
         const cs = toScreen(CONSOLE.screen.x + CONSOLE.screen.w / 2, CONSOLE.screen.y, CONSOLE.screen.z1);
-        drawBubble(ctx, cs.x, cs.y - 12, delegationLine(), mainA, '#7fb0ff');
+        drawBubble(ctx, cs.x, cs.y - 12, dispatch.task || delegationLine(), mainA, '#7fb0ff');
       }
       if (a && gremA > 0.02) {
         const sp = toScreen(a.x, a.y, 0);
-        drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, '收到', gremA, a.color);
+        drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, dispatch.reply || '收到', gremA, a.color);
       }
     }
   }
