@@ -350,17 +350,31 @@ function reporterMainPhase(workspacePath) {
  * reporter hook 的"活跃窗口"：UserPromptSubmit 落 taskId、Stop 清空。
  * 只有在这个窗口内（用户提交了任务、agent 还没收工）才算"活着"；
  * 会话存在但没有事件时一律待命 —— 主控制台据此决定要不要显示活跃状态。
+ *
+ * 还要校验"这份状态文件本身是否还活着"：历史遗留 / 已退出的会话会在 hooks 目录里
+ * 留下 taskId 不再更新的死文件（例如改「按工位+工程分文件」之前的老命名文件）。
+ * 不校验的话，只要有一个死文件的 taskId 跟当前工程匹配，inWindow 就会被永久顶成 true，
+ * 于是 Stop 之后仍旧按"还在干活"推出「思考中」。
  * @param {string} workspacePath 当前打开的工程；空则不限工程
  * @returns {boolean}
  */
 function readReporterActiveTask(workspacePath) {
   const dir = path.join(reporterHookHome(), 'hooks');
+  const now = Date.now();
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j || !j.taskId) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
+    // 心跳时间 / 任务开始 / 相位时间三者取最新：最近还有 hook 事件才算这个会话活着。
+    // 超过相位新鲜期（AWAIT_TTL_MS）没动静 → 视为死会话，它的 taskId 不作数。
+    const lastAt = Math.max(
+      Number(j.hb && j.hb.lastEventAt) || 0,
+      Number(j.taskStartedAt) || 0,
+      Number(j.sessionPhase && j.sessionPhase.ts) || 0
+    );
+    if (!lastAt || now - lastAt > AWAIT_TTL_MS) continue;
     return true;
   }
   return false;
