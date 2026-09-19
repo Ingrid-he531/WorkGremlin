@@ -918,26 +918,47 @@ export function createIsoOffice(canvas, opts = {}) {
       push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 4));
     });
 
-    // 玻璃隔墙（半透明，压在会议室里的人之上）；每片玻璃迎镜头那一面再挂一层半透光百叶帘
+    // 玻璃隔墙（半透明，压在会议室里的人之上）；每片玻璃迎镜头那一面再挂一层半透光百叶帘。
+    //
+    // 为什么帘子要"分段"入队：等距排序键是 gx+gy（一个标量），而这几片玻璃横跨好几个 tile，
+    // 整片只取一个中点键的话，靠它低坐标一侧、又实际在玻璃**前面**的小东西（会议室西北角的复印机、
+    // 茶水间北墙的饮水机、走到跟前的小怪物）会被算成在玻璃后面，被帘子整片压住。
+    // 按面坐标把帘子切成小段、各段用自己的中点定 depth，排序就和真实前后一致了：
+    //   - 玻璃"后面"（屋里侧）的东西：键总小于对应段 → 先画，被帘子盖住 ✓
+    //   - 玻璃"前面"的东西（饮水机 / 复印机 / 走到跟前的小怪物）：键总大于对应段 → 后画，盖在帘子上 ✓
+    // 玻璃本体仍整块画（切开会让 isoBox 露出端面接缝）；它只是 0.16 的半透明，不影响可读性。
     const gh = MEETING.glass.h;
+    /** 把一条帘子按「面坐标」切成若干段分别入队：axis='x' 沿 gy 切，axis='y' 沿 gx 切 */
+    const pushBlindsSegmented = ({ axis, fixed, a0, a1, maxSegW }) => {
+      const n = Math.max(1, Math.ceil((a1 - a0) / maxSegW));
+      const w = (a1 - a0) / n;
+      for (let i = 0; i < n; i += 1) {
+        const s0 = a0 + i * w;
+        const s1 = s0 + w;
+        const mid = (s0 + s1) / 2;
+        push(depthOf(axis === 'x' ? fixed : mid, axis === 'x' ? mid : fixed), (c) => {
+          drawBlinds(c, { axis, fixed, a0: s0, a1: s1, z0: 0, z1: gh });
+        });
+      }
+    };
     // 西面：分两段，中间是门洞（帘子按片挂，门洞处自然留空）
     [MEETING.glass.westA, MEETING.glass.westB].forEach((g) => {
       push(depthOf(g.x, g.y + g.d / 2) + 0.6, (c) => {
         isoBox(c, { ...g, h: gh, color: COLORS.glass, alpha: 0.16 });
-        // 大面是 +gx 面（x = 右沿）
-        drawBlinds(c, { axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, z0: 0, z1: gh });
       });
+      // 大面是 +gx 面（x = 右沿）
+      pushBlindsSegmented({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, maxSegW: 0.8 });
     });
     // 南面：一整条
-    push(depthOf(MEETING.glass.south.x + MEETING.glass.south.w / 2, MEETING.glass.south.y) + 0.6, (c) => {
-      const s = MEETING.glass.south;
-      isoBox(c, { ...s, h: gh, color: COLORS.glass, alpha: 0.16 });
-      // 大面是 +gy 面（y = 前沿）
-      drawBlinds(c, { axis: 'y', fixed: s.y + s.d, a0: s.x, a1: s.x + s.w, z0: 0, z1: gh });
+    const gs = MEETING.glass.south;
+    push(depthOf(gs.x + gs.w / 2, gs.y) + 0.6, (c) => {
+      isoBox(c, { ...gs, h: gh, color: COLORS.glass, alpha: 0.16 });
     });
-    // 茶水间标识：贴在这片南面玻璃朝镜头那一面（也就是茶水间的北墙）。
-    // 玻璃挂了百叶帘，所以给它一个略高于玻璃的 depth，排在帘子之后，才不会被压住看不清。
-    push(depthOf(PANTRY.x + PANTRY.w / 2, PANTRY.y) + 0.7, (c) => {
+    // 大面是 +gy 面（y = 前沿）
+    pushBlindsSegmented({ axis: 'y', fixed: gs.y + gs.d, a0: gs.x, a1: gs.x + gs.w, maxSegW: 0.7 });
+    // 茶水间标识：贴在这片南面玻璃朝镜头那一面（= 茶水间的北墙）。
+    // 帘子分了段、各段 depth 不同，标识必须排在**所有帘段**之后：取这条玻璃最右端的 depth 再抬一点。
+    push(depthOf(gs.x + gs.w, gs.y + gs.d) + 0.3, (c) => {
       drawWallLabel(c, '茶水间', PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
     });
 
@@ -958,10 +979,9 @@ export function createIsoOffice(canvas, opts = {}) {
     });
 
     const pc = PANTRY.cooler;
-    // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前。等距排序键是 gx+gy：饮水机在左端（gx 小），
-    // 算出来比"按中点取键"的那条长玻璃小，会被玻璃上的百叶帘整片压住（它其实在帘子前面）。
-    // 这面玻璃+帘子的键约 24.65，故把饮水机抬到它之后，保证显示在帘子前面。
-    push(depthOf(pc.x, pc.y) + 2.5, (c) => {
+    // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前：帘子已按坐标分段（见上），
+    // 它自然排在对应帘段之后、也不会被走到跟前的小怪物反超，所以用正常 depth 即可。
+    push(depthOf(pc.x, pc.y), (c) => {
       isoBox(c, { x: pc.x - 0.3, y: pc.y - 0.3, z: 0, w: 0.6, d: 0.6, h: pc.h - 0.5, color: COLORS.metal });
       isoCylinder(c, { x: pc.x, y: pc.y, z: pc.h - 0.5, r: 0.28, h: 0.5, color: '#5aa9e6', alpha: 0.85 });
     });
@@ -978,10 +998,8 @@ export function createIsoOffice(canvas, opts = {}) {
 
     /* 复印机（会议室西北角） */
     const pr = MEETING.printer;
-    // 同"饮水机"那类问题：复印机在西北角（gx / gy 都小），按 gx+gy 算出的键比"按中点取键"的
-    // 西面玻璃 + 百叶帘（约 16.78）小，会被帘子压住 —— 它其实在西墙东侧（屋里）、在帘子前面。
-    // 抬到帘子之后（+2.5）就正常了。
-    push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2) + 2.5, (c) => {
+    // 西面帘子已按坐标分段（见上），复印机用正常 depth 就能排在对应帘段之后。
+    push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2), (c) => {
       isoBox(c, { ...pr, color: COLORS.metal });
       // 出纸口 + 控制面板
       wallQuad(c, 'y', pr.y + pr.d, pr.x + 0.2, pr.x + pr.w - 0.2, pr.h - 0.4, pr.h - 0.1, '#e6ebf2');
