@@ -520,10 +520,13 @@ async function main() {
     const st = readState(file);
     const taskId = st.taskId;
     const title = st.taskTitle || '';
+    // 本轮任务的开始时刻：服务端据此只挑"这一轮改过的文件"做完成概要，
+    // 否则会把上一轮的改动也算进来（典型：这一轮只是 push，却显示上一轮改了多少文件）。
+    const startedAt = Number(st.taskStartedAt) || 0;
     if (taskId) await request(info, HTTP_ROUTES.TASK_END, { ...base, memberId: member, taskId, state: 'done' });
-    // 落"完成"标记：带工程路径 + 任务标题，服务端据此（且仅据此）亮"任务完成"概要，
+    // 落"完成"标记：带工程路径 + 任务标题 + 起始时刻，服务端据此（且仅据此）亮"任务完成"概要，
     // 不再靠"相位回落到空闲"来猜，避免中途被其它工程串味误弹。
-    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0, done: { at: Date.now(), title, workspacePath: REAL_WS } });
+    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0, done: { at: Date.now(), title, workspacePath: REAL_WS, startedAt } });
     await beat();
     await status('idle');
     return;

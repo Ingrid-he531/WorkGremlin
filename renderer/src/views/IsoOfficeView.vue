@@ -199,7 +199,8 @@ watch(
       // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
       // tooltip 里 {{ c }} 渲染对象就成了 JSON 串；这里先给一句总述，再一行一个文件。
       const files = (sel && sel.doneFiles) || [];
-      const count = (sel && sel.files && Number(sel.files.count)) || files.length;
+      // 本轮任务改动的文件数（服务端已按"本轮开始之后"过滤）；拿不到就用列表长度兜底
+      const count = (sel && Number(sel.doneCount)) || files.length;
       const ctx = files.length
         ? [`改动 ${count} 个文件`, ...files.map((f) => `${f.name}  +${f.added}/-${f.removed}`)]
         : ['本次任务已完成'];

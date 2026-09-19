@@ -175,6 +175,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
       doneAt: s.doneAt || 0,
       doneTitle: s.doneTitle || '',
+      doneCount: s.doneCount || 0,
       doneFiles: s.doneFiles || [],
       // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
       // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。

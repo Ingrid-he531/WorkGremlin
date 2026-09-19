@@ -522,7 +522,13 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   const done = readReporterDone(workspacePath) || null;
   const doneAt = done ? done.at : 0;
   const doneTitle = done ? done.title || '' : '';
-  const doneFiles = done ? (Array.isArray(files.recent) ? files.recent.slice(0, 6) : []) : [];
+  // 只挑"本轮任务开始之后"改过的文件：file-changes 是整个会话累积的，
+  // 不筛会把上一轮（甚至更早）的改动当成"本次完成"——典型：这一轮只是 push，却显示上一轮改了多少文件。
+  // done.startedAt 缺省（老数据）时不过滤，退回原来的"取最近几个"。
+  const doneStartedAt = done ? Number(done.startedAt) || 0 : 0;
+  const doneAll = done
+    ? (Array.isArray(files.recent) ? files.recent.filter((f) => !doneStartedAt || Number(f.at) >= doneStartedAt) : [])
+    : [];
 
   return {
     id,
@@ -543,7 +549,8 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     prompt,
     doneAt,
     doneTitle,
-    doneFiles,
+    doneCount: doneAll.length, // 本轮任务改动的文件数（在切片之前算）
+    doneFiles: doneAll.slice(0, 6),
     inferred: !reported, // 上报真值（reporter hook）不算推断
   };
 }
