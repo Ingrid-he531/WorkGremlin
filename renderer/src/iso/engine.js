@@ -91,11 +91,18 @@ const GHOST_MEET = { x: 17.0, y: 3.6, z: 2.25 };
 const DISPATCH_TALK = 3.6;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
+/** 标识位图缓存：同一文本只渲染一次（标签现在会被放进排序层重画，不能每帧新建 canvas） */
+const WALL_TEXT_CACHE = new Map();
+
 /**
  * 把"圆角牌底 + 文字"渲染到离屏画布（水平、高清），供斜贴到墙面。
  * 牌底+文字一起进同一张位图，斜贴后整块都随墙面平行四边形变形，像真挂在墙上。
  */
+
 function makeWallText(text) {
+  const key = String(text);
+  const cached = WALL_TEXT_CACHE.get(key);
+  if (cached) return cached;
   const fontPx = 30;
   const padX = 16;
   const padY = 10;
@@ -124,6 +131,7 @@ function makeWallText(text) {
   g.shadowBlur = 4;
   g.fillStyle = '#eaf1fb';
   g.fillText(text, w / 2, h / 2 + 1);
+  WALL_TEXT_CACHE.set(key, off);
   return off;
 }
 
@@ -710,6 +718,79 @@ export function createIsoOffice(canvas, opts = {}) {
     c.restore();
   }
 
+  /**
+   * 百叶帘（半透光）：贴在玻璃迎镜头那一面上的横向叶片。
+   * 面取向与 wallQuad 一致：axis='x' 面 gx 固定（a0/a1 是 gy 范围）；axis='y' 面 gy 固定（a0/a1 是 gx 范围）。
+   *
+   * 观感要点（否则会像"贴上去的白色横条纹"）：
+   *   1) 每片叶片用**屏幕竖向渐变**：顶刃受光（细亮边）→ 叶面中灰 → 叶底背光（暗），有立体感，
+   *      而不是一整块平色；
+   *   2) 整帘再叠一层**上亮下暗**的衰减（越靠上越贴窗光），拉开上下层次；
+   *   3) 叶间留缝、缝隙透出玻璃，整层半透明 → 半透光，隔着帘子看得见屋里人影；
+   *   4) 顶部轨道 + 两侧拉绳 + 底部底杆，收住边，不再是均匀平铺的条带。
+   */
+  function drawBlinds(c, o) {
+    const { axis, fixed, a0, a1, z0 = 0, z1, base = '#6f849c', alpha = 0.92, pitch = 0.155, slatH = 0.1 } = o;
+    const railH = 0.14;
+    const baseGap = 0.07;
+    const span = a1 - a0;
+    const pAt = (a, z) => (axis === 'x' ? project(a, fixed, z) : project(fixed, a, z));
+
+    c.save();
+    c.globalAlpha *= alpha;
+
+    // 叶片：自下而上；越靠上越亮（窗光自上方来），上下拉开更大的明暗对比
+    for (let z = z0 + baseGap; z + slatH <= z1 - railH + 1e-6; z += pitch) {
+      const k = 0.5 + 0.62 * ((z + slatH / 2) / z1);
+      const pT = pAt(a0, z + slatH);
+      const pB = pAt(a0, z);
+      const g = c.createLinearGradient(pT.x, pT.y, pB.x, pB.y);
+      g.addColorStop(0, shade(base, k * 1.42)); // 受光的顶刃
+      g.addColorStop(0.14, shade(base, k * 1.02));
+      g.addColorStop(0.6, shade(base, k * 0.74));
+      g.addColorStop(1, shade(base, k * 0.4)); // 背光的叶底
+      wallQuad(c, axis, fixed, a0, a1, z, z + slatH, g);
+    }
+
+    // 顶部轨道（深色实心）+ 一条高光，压住最上一片
+    wallQuad(c, axis, fixed, a0, a1, z1 - railH, z1, '#242d38');
+    wallQuad(c, axis, fixed, a0, a1, z1 - railH * 0.36, z1, '#4b586a');
+    // 底部底杆
+    wallQuad(c, axis, fixed, a0, a1, z0, z0 + baseGap - 0.01, shade(base, 0.7));
+    // 两侧拉绳
+    [a0 + span * 0.055, a1 - span * 0.075].forEach((a) => {
+      wallQuad(c, axis, fixed, a, a + Math.min(0.028, span * 0.02), z0, z1 - railH, 'rgba(14,19,27,0.72)');
+    });
+
+    c.restore();
+  }
+
+  /**
+   * 会议室 / 茶水间 标识：整块（牌底+文字）按墙面平行四边形斜贴，做到"平行墙面"
+   * （不是水平悬浮）。AX 斜 30°、AZ 竖直，故文字底边随墙斜、竖笔仍直。
+   * 用函数声明（提升）：buildStatics 在构造期就会调用它（茶水间标识要画在百叶帘之后）。
+   */
+  function drawWallLabel(c, text, gx, gy, gz) {
+    const tc = makeWallText(text);
+    const W = tc.width;
+    const H = tc.height;
+    const halfH = 0.34; // 标牌半高（世界单位），需压在墙高内
+    const halfW = halfH * (W / H); // 与位图等比，文字不被拉伸
+    // 墙面四边形的三個角（gy 恒定）：sD=左上 sC=右上 sA=左下
+    const sD = project(gx - halfW, gy, gz + halfH);
+    const sC = project(gx + halfW, gy, gz + halfH);
+    const sA = project(gx - halfW, gy, gz - halfH);
+    // 仿射：把位图(0..W,0..H) 映射到墙面平行四边形（绕墙斜切）
+    const a = (sC.x - sD.x) / W;
+    const b = (sC.y - sD.y) / W;
+    const cc = (sA.x - sD.x) / H;
+    const d = (sA.y - sD.y) / H;
+    c.save();
+    c.transform(a, b, cc, d, sD.x, sD.y);
+    c.drawImage(tc, 0, 0);
+    c.restore();
+  }
+
   /** 预生成静态物件列表（每帧参与排序） */
   function buildStatics() {
     /** @type {{depth:number,draw:(c:CanvasRenderingContext2D, now:number)=>void}[]} */
@@ -837,17 +918,27 @@ export function createIsoOffice(canvas, opts = {}) {
       push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 4));
     });
 
-    // 玻璃隔墙（半透明，压在会议室里的人之上）
+    // 玻璃隔墙（半透明，压在会议室里的人之上）；每片玻璃迎镜头那一面再挂一层半透光百叶帘
     const gh = MEETING.glass.h;
-    // 西面：分两段，中间是门洞
+    // 西面：分两段，中间是门洞（帘子按片挂，门洞处自然留空）
     [MEETING.glass.westA, MEETING.glass.westB].forEach((g) => {
       push(depthOf(g.x, g.y + g.d / 2) + 0.6, (c) => {
         isoBox(c, { ...g, h: gh, color: COLORS.glass, alpha: 0.16 });
+        // 大面是 +gx 面（x = 右沿）
+        drawBlinds(c, { axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, z0: 0, z1: gh });
       });
     });
     // 南面：一整条
     push(depthOf(MEETING.glass.south.x + MEETING.glass.south.w / 2, MEETING.glass.south.y) + 0.6, (c) => {
-      isoBox(c, { ...MEETING.glass.south, h: gh, color: COLORS.glass, alpha: 0.16 });
+      const s = MEETING.glass.south;
+      isoBox(c, { ...s, h: gh, color: COLORS.glass, alpha: 0.16 });
+      // 大面是 +gy 面（y = 前沿）
+      drawBlinds(c, { axis: 'y', fixed: s.y + s.d, a0: s.x, a1: s.x + s.w, z0: 0, z1: gh });
+    });
+    // 茶水间标识：贴在这片南面玻璃朝镜头那一面（也就是茶水间的北墙）。
+    // 玻璃挂了百叶帘，所以给它一个略高于玻璃的 depth，排在帘子之后，才不会被压住看不清。
+    push(depthOf(PANTRY.x + PANTRY.w / 2, PANTRY.y) + 0.7, (c) => {
+      drawWallLabel(c, '茶水间', PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
     });
 
     /* 茶水间 */
@@ -1108,32 +1199,10 @@ export function createIsoOffice(canvas, opts = {}) {
     }
     wallQuad(c, 'y', 0, wb.x0 + 1.9, wb.x0 + 2.5, wb.z0 + 0.16, wb.z1 - 0.16, 'rgba(76,141,255,0.18)');
 
-    // 会议室 / 茶水间 标识：整块（牌底+文字）按墙面平行四边形斜贴，做到"平行墙面"
-    // （不是水平悬浮）。AX 斜 30°、AZ 竖直，故文字底边随墙斜、竖笔仍直。
-    const drawWallLabel = (text, gx, gy, gz) => {
-      const tc = makeWallText(text);
-      const W = tc.width;
-      const H = tc.height;
-      const halfH = 0.34; // 标牌半高（世界单位），需压在墙高内
-      const halfW = halfH * (W / H); // 与位图等比，文字不被拉伸
-      // 墙面四边形的三個角（gy 恒定）：sD=左上 sC=右上 sA=左下
-      const sD = project(gx - halfW, gy, gz + halfH);
-      const sC = project(gx + halfW, gy, gz + halfH);
-      const sA = project(gx - halfW, gy, gz - halfH);
-      // 仿射：把位图(0..W,0..H) 映射到墙面平行四边形（绕墙斜切）
-      const a = (sC.x - sD.x) / W;
-      const b = (sC.y - sD.y) / W;
-      const cc = (sA.x - sD.x) / H;
-      const d = (sA.y - sD.y) / H;
-      c.save();
-      c.transform(a, b, cc, d, sD.x, sD.y);
-      c.drawImage(tc, 0, 0);
-      c.restore();
-    };
-    // 会议室：贴在实心后墙（gy=0，与白板同面）上方，z 不超墙高 2.8
-    drawWallLabel('会议室', MEETING.x + MEETING.w / 2, 0, 2.4);
-    // 茶水间：贴其北侧内墙（gy=PANTRY.y），z 不超玻璃高 2.3
-    drawWallLabel('茶水间', PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
+    // 会议室标识：贴在实心后墙（gy=0，与白板同面）上方，z 不超墙高 2.8。
+    // 茶水间标识不在这里画：它那面墙（= 会议室南面玻璃）挂了百叶帘，
+    // 而背景是先画的、帘子在排序层后画，会被压住 → 改到 buildStatics 里排到帘子之后。
+    drawWallLabel(c, '会议室', MEETING.x + MEETING.w / 2, 0, 2.4);
   }
 
   /**
