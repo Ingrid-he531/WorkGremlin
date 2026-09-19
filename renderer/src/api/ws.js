@@ -23,8 +23,12 @@ export function createConnection({ url, token, team, onEvent, onState }) {
 
     socket.addEventListener('open', () => {
       attempt = 0;
-      setState('open', { source: 'ws' });
+      // 顺序很重要：必须**先把 HELLO 发出去**，再通知上层 open。
+      // 服务端要求"鉴权前的首帧必须是 HELLO"（见 server/src/ws/hub.js，否则 close(4001)）；
+      // 若先 setState 通知上层，上层在 open 回调里抢先发的帧（订阅 / 回填）会排在 HELLO 之前
+      // → 被服务端当成 bad token 踢掉 → 表现就是一直"连接断开，重连中"。
       send({ type: CLIENT_EVENTS.HELLO, token, team, ts: Date.now() });
+      setState('open', { source: 'ws' });
     });
 
     socket.addEventListener('message', (evt) => {

@@ -66,6 +66,10 @@ export const useTeamStore = defineStore('team', {
         },
         onState: (st) => {
           this.connection = st;
+          // WS 一连上就主动订阅一次：注册 filters 并让服务端立刻回一份当前状态，
+          // 不必等下一次推送（roster 心跳最长 15s）才见得到成员/小怪物（HELLO 也会回快照，这里是显式再拉一次）。
+          // 必须在 HELLO 之后发 —— 顺序由 api/ws.js 的 open 回调保证，抢在 HELLO 前会被服务端当 bad token 踢掉。
+          if (st && st.state === 'open' && this._conn) this._conn.subscribe({});
         },
       });
     },

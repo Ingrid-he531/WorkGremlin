@@ -76,7 +76,10 @@ function createHub({ server, token, bus, repo }) {
         case CLIENT_EVENTS.HELLO:
           conn.team = msg.team || conn.team;
           conn.filters = msg.filters || conn.filters;
-          if (conn.team) send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.team));
+          // 没指定 team 也要回一份快照（buildSnapshot(null) 会用"当前打开的工程"对应的团队）：
+          // 否则客户端连上后一帧都收不到，只能等后续推送（roster 心跳最长 15s）——
+          // 表现就是成员/小怪物"很久才出现"。
+          send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.team));
           break;
         case CLIENT_EVENTS.SUBSCRIBE:
           conn.filters = msg.filters || {};
