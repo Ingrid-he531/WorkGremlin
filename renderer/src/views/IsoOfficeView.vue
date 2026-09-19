@@ -26,6 +26,13 @@ const mainAgent = useMainAgentStore();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
 
+/** 左上角"楼层"标签：办公室当前展示的是哪一层（来自 session store 的楼层表） */
+const floorLabel = computed(() => {
+  const f = sessions.floors.find((x) => x.id === sessions.selectedFloor);
+  if (f) return `${f.id} · ${f.name}`;
+  return sessions.selectedFloor || '—';
+});
+
 /* ------------------------------ 主 Agent 相位快轮询（1.5s） ------------------------------
  * 服务端 /api/v1/reporter-phase 直接回 reporter hook 的上报相位（已映射成 UI 字段），
  * 比 /sessions 的 10s 轮询新鲜，专供主控制台"操作"实时显示（调用工具 / 等待授权）。
@@ -121,10 +128,12 @@ const mainMember = computed(() =>
 const consoleLive = computed(() => {
   const m = mainMember.value;
   if (!m) return null;
-  // 只有"没选会话"或"选中的就是当前会话（主 Agent 自己）"时才用 hook 覆盖；
-  // 选了别的工程的会话则尊重会话接管（磁盘推断），不动它。
   const sel = sessions.selected;
-  if (sel && sel.id && !sel.current) return null;
+  // 选中的不是"当前在敲"的会话（例如已关闭的旧工程）：控制台严格跟随下拉，
+  // 显示该会话自身的状态（多为空闲），绝不拿别的会话的输入 / 工具相位来冒充。
+  if (sel && sel.id && !sel.current) {
+    return { phase: 'idle', action: '', context: [], target: null };
+  }
 
   // 快轮询（1.5s）优先：reporter hook 的"调用工具 / 等待授权"相位比 10s 的 sessions 轮询新鲜；
   // thinking 由 WS 的 mainMember.state 已实时给到，这里不覆盖。
@@ -314,6 +323,12 @@ onBeforeUnmount(() => {
       @mouseleave="onConsoleLeave"
     />
 
+    <!-- 楼层标签（左上角）：办公室当前展示的是哪一层 -->
+    <div class="floor-tag">
+      <span class="ft-k">楼层</span>
+      <span class="ft-v">{{ floorLabel }}</span>
+    </div>
+
     <!-- 主 Agent 控制台 tooltip：鼠标停在悬浮屏上 400ms 后弹出 -->
     <div
       v-if="tip.show"
@@ -382,6 +397,33 @@ onBeforeUnmount(() => {
   height: 100%;
   cursor: grab;
   touch-action: none;
+}
+
+.floor-tag {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: rgba(12, 15, 20, 0.8);
+  border: 1px solid var(--border);
+  color: var(--text, #e6ebf2);
+  font-size: 12px;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.floor-tag .ft-k {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text-dim, #6e7681);
+}
+
+.floor-tag .ft-v {
+  font-weight: 600;
 }
 
 .card-layer {

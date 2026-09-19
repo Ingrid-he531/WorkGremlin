@@ -60,6 +60,8 @@ const WS_EVENTS = Object.freeze({
   ARTIFACT_NEW: 'artifact.new',
   CONNECTION: 'connection',
   ERROR: 'error',
+  /** 全局活跃会话表变化（开/关工程·会话）：服务端按变化实时推送，客户端即时刷新 */
+  SESSIONS: 'sessions',
 });
 
 /** 客户端 -> 服务端 */

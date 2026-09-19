@@ -52,18 +52,6 @@ function selectDesk(id) {
   msgs.setFilters({ members: selectedId.value ? [selectedId.value] : [] });
 }
 
-/** 打开工程：服务端会广播新快照（成员/消息/幽灵整体换一批） */
-async function onOpenWorkspace(path) {
-  selectedId.value = '';
-  msgs.setFilters({ members: [] });
-  try {
-    await team.openWorkspace(path);
-    await sessions.refresh(team.serverInfo || {});
-  } catch (err) {
-    console.warn('[workgremlin] 打开工程失败：', err && err.message);
-  }
-}
-
 /** 选中的会话变了 → 主 Agent 控制台改显示这个会话的状态（办公室布局不动） */
 watch(
   () => sessions.selected,
@@ -74,6 +62,8 @@ onMounted(async () => {
   await team.init((msg) => {
     if (msg.type === WS_EVENTS.MESSAGE_NEW) msgs.push(msg.payload);
     if (msg.type === WS_EVENTS.SNAPSHOT) msgs.setSnapshot(msg.payload.recentMessages || []);
+    // 会话（开/关工程·会话）实时推送：立即刷新楼层与下拉，不等 10s 轮询
+    if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
   });
   await refreshMessages();
   await sessions.refresh(team.serverInfo || {});
@@ -90,13 +80,8 @@ onUnmounted(() => {
   <div class="app">
     <ConnectionBar
       :connection="team.connection"
-      :demo="team.demo"
       :team="team.team"
       :project="team.project"
-      :recent="team.recent"
-      :feed-path="team.feedPath"
-      :member-count="team.members.length"
-      @open-workspace="onOpenWorkspace"
     />
 
     <nav class="tabs">

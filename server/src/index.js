@@ -28,6 +28,8 @@ const { createWorkspaceRouter } = require('./http/routes/workspace');
 const { createProductsRouter } = require('./http/routes/products');
 const { createSessionsRouter } = require('./http/routes/sessions');
 const { requireToken } = require('./http/auth');
+const { WS_EVENTS } = require('@workgremlin/shared');
+const { snapshot: registrySnapshot } = require('./sessionRegistry');
 const config = require('./config');
 const { seedDemoData, createDemoTicker } = require('./mock/generator');
 const clock = require('./clock');
@@ -201,6 +203,28 @@ function createServer(opts = {}) {
           /* ignore */
         }
       }, 10_000)
+    );
+    // 会话（全局活跃会话表）变化实时推送：开/关工程（会话）立刻反映到办公室，不再等 10s 轮询。
+    // 每 2s 强制扫盘一次，按"活跃会话集合"算签名，只在变化时广播，避免无谓推送。
+    let lastSessionSig = '';
+    timers.push(
+      setInterval(() => {
+        try {
+          const cur = workspace.current();
+          const snap = registrySnapshot({ workspacePath: cur.workspacePath || '', force: true });
+          const sig = JSON.stringify({
+            d: snap.defaultFloor,
+            f: snap.floors.map((f) => [f.id, f.activeCount, f.installed ? 1 : 0]),
+            s: snap.sessions.map((x) => [x.floor, x.id, x.active ? 1 : 0, x.lastEventAt]),
+          });
+          if (sig !== lastSessionSig) {
+            lastSessionSig = sig;
+            hub.broadcast(null, WS_EVENTS.SESSIONS, snap);
+          }
+        } catch {
+          /* 扫盘失败不阻断主流程 */
+        }
+      }, 2000)
     );
     for (const t of timers) if (t.unref) t.unref();
 

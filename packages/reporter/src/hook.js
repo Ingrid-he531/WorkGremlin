@@ -38,6 +38,11 @@ const { spawn } = require('node:child_process');
 
 const { readServerInfo, HTTP_ROUTES } = require('./index');
 
+/** 本 reporter 进程真实运行所在的工程（cwd 解析成绝对路径）。
+ * 相位 / task 都打这个路径，服务端据此把"当前工程"归到你真正在敲的工程，
+ * 而不是 office 里手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。 */
+const REAL_WS = path.resolve(process.cwd());
+
 /** shared 里没有登记这条（服务端在 server/src/http/routes/workspace.js） */
 const WORKSPACE_ROUTE = '/api/v1/workspace';
 
@@ -278,8 +283,8 @@ function setAwait(file, ctx, cwd, ev) {
   const input = (ev && ev.tool_input) || st.lastInput || '';
   const f = relFile(fileOf(input), cwd);
   writeState(file, {
-    await: { tool, file: f, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
-    sessionPhase: { phase: 'await', tool, file: f, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+    await: { tool, file: f, ts: Date.now(), workspacePath: REAL_WS },
+    sessionPhase: { phase: 'await', tool, file: f, ts: Date.now(), workspacePath: REAL_WS },
   });
 }
 
@@ -410,7 +415,7 @@ async function main() {
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
     await register();
     const started = await request(info, HTTP_ROUTES.TASK_START, { ...base, memberId: member, title });
-    if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: ctx.workspacePath || '', taskStartedAt: Date.now() });
+    if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: REAL_WS, taskStartedAt: Date.now() });
     // 进入"思考中"：直到下一个事件（PreToolUse / Notification / Stop）才切换
     writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: ctx.workspacePath || '' } });
     // 用户刚提交：进入"思考中"，直到下一个事件（PreToolUse / Stop / Notification）才切换。
@@ -455,10 +460,10 @@ async function main() {
         lastTool: tool,
         lastInput: ev.tool_input || '',
         pending: probe
-          ? { tool, file: f, cmd: desc, at: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' }
+          ? { tool, file: f, cmd: desc, at: Date.now(), workspacePath: REAL_WS }
           : null, // 非写类：显式清掉上一支可能残留的 pending
         // 工具开始跑 → 主控制台相位「调用工具」（PreToolUse..PostToolUse 这段就是"在调工具"）
-        sessionPhase: { phase: 'tool', tool, file: f, cmd: desc, ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+        sessionPhase: { phase: 'tool', tool, file: f, cmd: desc, ts: Date.now(), workspacePath: REAL_WS },
       });
       // 主 Agent 召唤 subagent（Agent 工具）→ 往清单写一条，办公室飘出一只小幽灵
       if (tool === 'Agent') addGhost(ctx.workspacePath, agentName(ev.tool_input), agentTask(ev.tool_input));
@@ -468,7 +473,7 @@ async function main() {
       if (f) await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: member, files: [f], op: opOf(ev.tool_name) });
       // 工具真正跑完了 → 权限已通过，撤掉"等授权"，回到"思考中"
       clearAwait(file);
-      writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' } });
+      writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
       // subagent 收工 → 从清单划掉，小幽灵散掉
       if (ev.tool_name === 'Agent') removeGhost(ctx.workspacePath, agentName(ev.tool_input));
       // PostToolUse = 工具已跑完，进入"思考中"（处理返回结果），直到下一个事件
@@ -489,7 +494,7 @@ async function main() {
       const tool = (ev && ev.tool_name) || readState(file).lastTool || '';
       const input = (ev && ev.tool_input) || readState(file).lastInput || '';
       writeState(file, {
-        sessionPhase: { phase: 'await', tool, file: relFile(fileOf(input), cwd), ts: Date.now(), workspacePath: (ctx && ctx.workspacePath) || '' },
+        sessionPhase: { phase: 'await', tool, file: relFile(fileOf(input), cwd), ts: Date.now(), workspacePath: REAL_WS },
       });
       await status('blocked', 'awaiting_permission');
     }

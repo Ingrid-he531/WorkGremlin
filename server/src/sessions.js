@@ -348,6 +348,35 @@ function readReporterActiveTask(workspacePath) {
 }
 
 /**
+ * 当前"真正在敲"的工程：取 reporter hook 最近一次写相位 / task 的工程路径。
+ * reporter 把相位打在 REAL_WS（它实际运行的工程），而不是 office 手工"打开工程"记的那个，
+ * 所以这里用最新活动判定，避免 IDE 里直接开新工程时相位错归到旧工程（主控制台对不上下拉）。
+ * 超过新鲜期（AWAIT_TTL_MS）视为失效，回落到传入的 fallback（通常是 office 当前打开的工程）。
+ * @param {string} fallback 回落值
+ * @returns {string}
+ */
+function freshestReporterWs(fallback) {
+  const dir = path.join(reporterHookHome(), 'hooks');
+  const now = Date.now();
+  let best = '';
+  let bestTs = 0;
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const j = readJson(path.join(dir, name));
+    if (!j) continue;
+    const sp = j.sessionPhase;
+    const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
+    const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
+    if (!ws || !ts || now - ts > AWAIT_TTL_MS) continue;
+    if (ts > bestTs) {
+      bestTs = ts;
+      best = ws;
+    }
+  }
+  return best ? path.resolve(best) : fallback ? path.resolve(fallback) : '';
+}
+
+/**
  * 主 Agent 阶段：会话落盘里没有"阶段"这个字段，只能推。
  * 所以返回值一律带 inferred: true，UI 按推断展示。
  */
@@ -476,9 +505,11 @@ function collectProjects(storage) {
  *   reason: 'no-storage' 没找到插件落盘 / 'no-open-project' 一个活跃会话都没有
  */
 function listSessions({ workspacePath = '', force = false } = {}) {
-  const ws = workspacePath ? path.resolve(workspacePath) : '';
+  // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
+  // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
+  const ws = freshestReporterWs(workspacePath);
   const now = Date.now();
-  if (!force && cache.value && now - cache.at < TTL) return cache.value;
+  if (!force && cache.value && cache.key === ws && now - cache.at < TTL) return cache.value;
 
   const storage = findPluginStorage();
   if (!storage) {
@@ -513,7 +544,10 @@ function listSessions({ workspacePath = '', force = false } = {}) {
   const inWindow = readReporterActiveTask(ws);
   const sessions = [];
   for (const [id, m] of meta) {
-    const info = sessionInfo(storage, id, { current: m.current, now, workspacePath: ws, inWindow });
+    // current 必须是"全局唯一"的当前会话：只认当前真实活动工程（ws）里那条 current 会话，
+    // 不能每个工程都算一条 current —— 否则多工程时旧工程那条也会是 current，
+    // 主控制台守卫 !sel.current 失效，把新工程的相位错归到旧会话。
+    const info = sessionInfo(storage, id, { current: id === currentId, now, workspacePath: ws, inWindow });
     if (!info.active) continue; // 下拉只要活跃会话
     sessions.push({
       ...info,
@@ -543,4 +577,4 @@ function listSessions({ workspacePath = '', force = false } = {}) {
   return cache.value;
 }
 
-module.exports = { listSessions, findPluginStorage, decodeDirName, reporterMainPhase };
+module.exports = { listSessions, findPluginStorage, decodeDirName, reporterMainPhase, freshestReporterWs };

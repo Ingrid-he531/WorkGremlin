@@ -89,29 +89,35 @@ export const useSessionStore = defineStore('sessions', {
         });
         const data = await res.json();
         if (!data || !data.ok) return;
-
-        this.floors = data.floors || [];
-        this.sessions = data.sessions || [];
-        this.defaultFloor = data.defaultFloor || '';
-        this.reason = data.reason || '';
-        if (Number(data.timeoutMs)) this.timeoutMs = Number(data.timeoutMs);
-        this.loaded = true;
-
-        // 默认选中有活跃会话的楼层：用户选的那层没装 / 活跃会话掉光了，就跟到还行的那层
-        const cur = this.floors.find((f) => f.id === this.selectedFloor);
-        if (!cur || !cur.installed) {
-          this.selectedFloor = this.defaultFloor || this.floors.find((f) => f.installed)?.id || '';
-        }
-
-        // 选中的会话掉了（超时剔除 / 换楼层）就在当前层重新落一个
-        const list = this.floorSessions;
-        if (this.selectedId && !list.some((x) => x.id === this.selectedId)) this.selectedId = '';
-        if (!this.selectedId && list.length) {
-          const pick = list.find((x) => x.current && x.mine) || list[0];
-          this.selectedId = pick.id;
-        }
+        this.applySnapshot(data);
       } catch {
         /* 拉不到就留着上一次的列表，别把下拉闪成空 */
+      }
+    },
+
+    /** 应用一份会话快照（HTTP 轮询与 WS 实时推送共用），并修正当前楼层 / 会话选择 */
+    applySnapshot(data) {
+      if (!data || !data.ok) return;
+      this.floors = data.floors || [];
+      this.sessions = data.sessions || [];
+      this.defaultFloor = data.defaultFloor || '';
+      this.reason = data.reason || '';
+      if (Number(data.timeoutMs)) this.timeoutMs = Number(data.timeoutMs);
+      this.loaded = true;
+
+      // 默认选中有活跃会话的楼层：用户选的那层没装 / 活跃会话掉光了，就跟到还行的那层
+      const cur = this.floors.find((f) => f.id === this.selectedFloor);
+      if (!cur || !cur.installed) {
+        this.selectedFloor = this.defaultFloor || this.floors.find((f) => f.installed)?.id || '';
+      }
+
+      // 选中的会话掉了（超时剔除 / 换楼层）就在当前层重新落一个
+      const list = this.floorSessions;
+      if (this.selectedId && !list.some((x) => x.id === this.selectedId)) this.selectedId = '';
+      if (!this.selectedId && list.length) {
+        // current 已是"全局唯一"的当前会话（仅当前真实活动工程里那条），优先选它
+        const pick = list.find((x) => x.current) || list[0];
+        this.selectedId = pick.id;
       }
     },
 
@@ -126,7 +132,7 @@ export const useSessionStore = defineStore('sessions', {
     selectFloor(id) {
       this.selectedFloor = id || '';
       const list = this.floorSessions;
-      const pick = list.find((x) => x.current && x.mine) || list[0];
+      const pick = list.find((x) => x.current) || list[0];
       this.selectedId = pick ? pick.id : '';
     },
 

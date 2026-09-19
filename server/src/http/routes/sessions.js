@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { reporterMainPhase } = require('../../sessions');
+const { reporterMainPhase, freshestReporterWs } = require('../../sessions');
 
 /**
  * 会话：全局活跃会话表（按楼层分组）。
@@ -25,7 +25,8 @@ function createSessionsRouter({ workspace }) {
   // 渲染层 1.5s 拉一次，比 /sessions 的 10s 轮询新鲜，专供主 Agent 控制台的"操作"实时显示。
   router.get('/reporter-phase', (req, res) => {
     const cur = workspace && workspace.current ? workspace.current() : {};
-    const rp = reporterMainPhase(cur.workspacePath || '');
+    // 跟随 reporter 真实活动的最新工程，而不是 office 手工"打开工程"记的那个
+    const rp = reporterMainPhase(freshestReporterWs(cur.workspacePath || ''));
     res.json(rp ? { ok: true, ...rp } : { ok: true, phase: null, action: '', target: '', context: [] });
   });
 
