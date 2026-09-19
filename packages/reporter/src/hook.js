@@ -421,7 +421,15 @@ async function main() {
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
     await register();
     const started = await request(info, HTTP_ROUTES.TASK_START, { ...base, memberId: member, title });
-    if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: REAL_WS, taskStartedAt: Date.now(), taskTitle: title, done: null });
+    // taskTitle（用户原话）无论 TASK_START 成功与否都要落盘：它是"思考中"屏上 / tooltip 里显示的那句话，
+    // 不能因为上报失败就留着上一轮的旧标题 —— 否则"思考中"会先显示上一轮内容，等快照刷新才更正。
+    const patch = { taskTitle: title, done: null };
+    if (started && started.taskId) {
+      patch.taskId = started.taskId;
+      patch.taskWorkspacePath = REAL_WS;
+      patch.taskStartedAt = Date.now();
+    }
+    writeState(file, patch);
     // 进入"思考中"：直到下一个事件（PreToolUse / Notification / Stop）才切换
     writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
     // 用户刚提交：进入"思考中"，直到下一个事件（PreToolUse / Stop / Notification）才切换。

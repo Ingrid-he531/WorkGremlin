@@ -146,9 +146,11 @@ const consoleLive = computed(() => {
     // 思考中：把用户那句话（prompt）同时放到第二层（action）和第三层。
     // 屏上第三层有"字号够大才画"的门槛（mainConsole 的 showL3），放大不够时不出字；
     // 第二层门槛低，所以放一份在第二层，保证"思考中"下面任何时候都看得到你问的那句话。
+    // 注意：这里只用快轮询（1.5s，新鲜）的字段，**不再回落到 sel**——会话快照可能还是上一轮的，
+    // 一旦用 sel.action / sel.context 兜底，就会出现"思考中却显示上一轮的操作"，几秒后才更正。
     if (fp.phase === 'thinking') {
-      const p = fp.prompt || sel.prompt || '';
-      return { phase: 'thinking', action: fp.action || sel.action || p, context: fp.context && fp.context.length ? fp.context : (sel.context || []), target: fp.target || null, prompt: p };
+      const p = fp.prompt || '';
+      return { phase: 'thinking', action: fp.action || p, context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, prompt: p };
     }
   }
   // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
@@ -194,8 +196,13 @@ watch(
     // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
     if (doneAt && doneAt !== lastDoneAt) {
       lastDoneAt = doneAt;
+      // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
+      // tooltip 里 {{ c }} 渲染对象就成了 JSON 串；这里先给一句总述，再一行一个文件。
       const files = (sel && sel.doneFiles) || [];
-      const ctx = files.length ? files : ['本次任务已完成'];
+      const count = (sel && sel.files && Number(sel.files.count)) || files.length;
+      const ctx = files.length
+        ? [`改动 ${count} 个文件`, ...files.map((f) => `${f.name}  +${f.added}/-${f.removed}`)]
+        : ['本次任务已完成'];
       mainAgent.enterDone('任务完成', ctx);
       return;
     }
@@ -356,13 +363,6 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
       <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
-      <!-- 相位来源：这条会话的相位是 agent 上报的真值，还是服务端从落盘推断的 -->
-      <div v-if="sessions.selected" class="ct-row">
-        <b>来源</b>
-        <span class="ct-val" :class="{ 'ct-infer': sessions.selected.inferred }">
-          {{ sessions.selected.inferred ? '推断值（服务端由落盘推导）' : '上报真值（agent 主动上报）' }}
-        </span>
-      </div>
     </div>
 
     <!-- 任务卡（跟着角色走） -->
@@ -556,12 +556,6 @@ onBeforeUnmount(() => {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
-}
-
-/* 来源为「推断值」：灰 + 虚线，提示这不是上报真值 */
-.ct-infer {
-  color: var(--text-dim, #a8bdd6);
-  border-bottom: 1px dashed var(--text-faint);
 }
 
 /* 完成/暂停时的「改动」明细：每个文件单独一行 */
