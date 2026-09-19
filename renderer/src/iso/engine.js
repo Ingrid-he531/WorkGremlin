@@ -958,7 +958,10 @@ export function createIsoOffice(canvas, opts = {}) {
     });
 
     const pc = PANTRY.cooler;
-    push(depthOf(pc.x, pc.y), (c) => {
+    // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前。等距排序键是 gx+gy：饮水机在左端（gx 小），
+    // 算出来比"按中点取键"的那条长玻璃小，会被玻璃上的百叶帘整片压住（它其实在帘子前面）。
+    // 这面玻璃+帘子的键约 24.65，故把饮水机抬到它之后，保证显示在帘子前面。
+    push(depthOf(pc.x, pc.y) + 2.5, (c) => {
       isoBox(c, { x: pc.x - 0.3, y: pc.y - 0.3, z: 0, w: 0.6, d: 0.6, h: pc.h - 0.5, color: COLORS.metal });
       isoCylinder(c, { x: pc.x, y: pc.y, z: pc.h - 0.5, r: 0.28, h: 0.5, color: '#5aa9e6', alpha: 0.85 });
     });
@@ -975,7 +978,10 @@ export function createIsoOffice(canvas, opts = {}) {
 
     /* 复印机（会议室西北角） */
     const pr = MEETING.printer;
-    push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2), (c) => {
+    // 同"饮水机"那类问题：复印机在西北角（gx / gy 都小），按 gx+gy 算出的键比"按中点取键"的
+    // 西面玻璃 + 百叶帘（约 16.78）小，会被帘子压住 —— 它其实在西墙东侧（屋里）、在帘子前面。
+    // 抬到帘子之后（+2.5）就正常了。
+    push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2) + 2.5, (c) => {
       isoBox(c, { ...pr, color: COLORS.metal });
       // 出纸口 + 控制面板
       wallQuad(c, 'y', pr.y + pr.d, pr.x + 0.2, pr.x + pr.w - 0.2, pr.h - 0.4, pr.h - 0.1, '#e6ebf2');
