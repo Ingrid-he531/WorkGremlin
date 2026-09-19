@@ -3,9 +3,10 @@ import { computed } from 'vue';
 
 const props = defineProps({
   connection: { type: Object, required: true },
-  team: { type: Object, default: null },
   /** 当前工程名；仅作展示，工程切换改由右侧"活跃会话"下拉负责，不再提供选择入口 */
   project: { type: String, default: '' },
+  /** 选中会话的相位来源：'reported'（agent 上报真值） / 'inferred'（服务端推断） / ''（无会话） */
+  source: { type: String, default: '' },
 });
 
 const text = computed(() => {
@@ -27,11 +28,17 @@ const dotClass = computed(() => props.connection.state);
 <template>
   <div class="bar">
     <span class="conn" :class="dotClass"><i />{{ text }}</span>
-    <span v-if="team" class="dim">团队：{{ team.name }}</span>
     <span v-if="project" class="dim proj">项目：{{ project }}</span>
 
     <span class="spacer" />
-    <span class="legend faint">
+    <!-- 选中会话时给常驻的「相位来源」标识；没选会话时退回解释性图例 -->
+    <span v-if="source" class="src">
+      相位来源：
+      <b :class="source === 'inferred' ? 'src-infer' : 'src-real'">
+        {{ source === 'inferred' ? '推断值' : '上报真值' }}
+      </b>
+    </span>
+    <span v-else class="legend faint">
       <i class="sw real" />上报真值
       <i class="sw infer" />推断值
     </span>
@@ -71,6 +78,12 @@ const dotClass = computed(() => props.connection.state);
 .spacer { flex: 1; }
 
 .legend { display: inline-flex; align-items: center; gap: 6px; }
+
+/* 相位来源常驻标识：真值绿、推断灰虚 */
+.src { display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim); }
+.src b { font-weight: 600; }
+.src-real { color: var(--state-online); }
+.src-infer { color: var(--text-dim); border-bottom: 1px dashed var(--text-faint); }
 
 .sw {
   width: 10px;

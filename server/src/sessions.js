@@ -36,6 +36,15 @@ const PLUGIN_RE = [/coding-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i];
 const TTL = 5_000;
 let cache = { at: 0, key: '', value: null };
 
+/**
+ * 本进程（server）的启动时刻 —— "纪元"起点。
+ * reporter 把相位写进本地状态文件、且不会被主动删除；上次运行（尤其被 kill/崩溃、
+ * 没走 SessionEnd）留下的相位会在重启后被重新读到，表现为"已关闭的工程又亮了思考中"。
+ * 所以只采信"本进程启动之后"写入的相位：重启后一律先回到待命，等下一个新事件再点亮。
+ * 用时间戳比较而不是"退出时删文件"，是因为删除依赖干净退出，kill -9 / 崩溃时根本删不到。
+ */
+const SERVER_STARTED_AT = Date.now();
+
 /** 多久没动静算"不活跃"（插件 runtime 没有心跳，只能用文件时间） */
 const IDLE_MS = 10 * 60_000;
 /** 文件改动在这么久之内 → 认为正在动手 */
@@ -246,16 +255,21 @@ function readReporterPhase(workspacePath) {
   const now = Date.now();
   let win = null;
   let winPending = null;
+  let winPrompt = '';
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     const sp = j && j.sessionPhase;
     if (!sp || !sp.ts || now - sp.ts > AWAIT_TTL_MS) continue;
+    // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
+    if (sp.ts < SERVER_STARTED_AT) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
     if (!win || sp.ts > win.ts) {
       win = sp;
       // 同一份状态文件里的 pending：PreToolUse 写、PostToolUse 清掉；迟迟不清 = 工具被权限框卡住
       winPending = j.pending || null;
+      // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
+      winPrompt = j.taskTitle || '';
     }
   }
   if (!win) return null;
@@ -266,6 +280,8 @@ function readReporterPhase(workspacePath) {
     // hook 在 PreToolUse 写的"实际调用"可读命令（Read src/main.js / grep ... / Bash ...），
     // 给主控制台 tips 当"工具"显示，比纯工具名更直观
     cmd: String(win.cmd || ''),
+    // 用户那句话（思考中时主控制台屏幕第三层顶到最前显示；UI 只在 thinking 相位用）
+    prompt: String(winPrompt || ''),
     pending: winPending
       ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), cmd: String(winPending.cmd || ''), at: Number(winPending.at) || 0 }
       : null,
@@ -287,6 +303,7 @@ function reporterMainPhase(workspacePath) {
       action: rp.tool ? `申请执行 ${rp.tool}` : '等待用户授权',
       target: rp.file || '',
       context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, rp.file && `目标：${rp.file}`].filter(Boolean),
+      prompt: rp.prompt || '',
     };
   }
   // 等授权兜底：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
@@ -308,6 +325,7 @@ function reporterMainPhase(workspacePath) {
       action: tool ? `申请执行 ${tool}` : '等待用户授权',
       target: file || '',
       context: ['等待用户授权后继续', tool && `工具：${tool}`, file && `目标：${file}`].filter(Boolean),
+      prompt: rp.prompt || '',
     };
   }
   if (rp.phase === 'tool') {
@@ -321,10 +339,11 @@ function reporterMainPhase(workspacePath) {
       tool: rp.tool || '',
       target: rp.file || '',
       context: rp.file ? [`目标：${rp.file}`] : [],
+      prompt: rp.prompt || '',
     };
   }
-  // thinking：干净，不堆示意字
-  return { phase: 'thinking', action: '', target: '', context: [] };
+  // thinking：干净，不堆示意字；但把用户那句话（prompt）一并带出，屏幕第三层顶到最前显示
+  return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '' };
 }
 
 /**
@@ -345,6 +364,21 @@ function readReporterActiveTask(workspacePath) {
     return true;
   }
   return false;
+}
+
+/** reporter hook 在 Stop 时落的"完成"标记（带工程路径）。按工程归属取，
+ *  作为"任务完成"的唯一真源——不靠相位回落到空闲来猜，避免中途误弹。 */
+function readReporterDone(workspacePath) {
+  const dir = path.join(reporterHookHome(), 'hooks');
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const j = readJson(path.join(dir, name));
+    if (!j || !j.done || !j.done.at) continue;
+    const ws = j.done.workspacePath || '';
+    if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
+    return j.done;
+  }
+  return null;
 }
 
 /**
@@ -368,6 +402,8 @@ function freshestReporterWs(fallback) {
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
     if (!ws || !ts || now - ts > AWAIT_TTL_MS) continue;
+    // 同上：只认本进程启动之后写入的相位，避免用上次运行的残留判定"当前工程"
+    if (ts < SERVER_STARTED_AT) continue;
     if (ts > bestTs) {
       bestTs = ts;
       best = ws;
@@ -390,30 +426,34 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
   if (!todos.total && !files.count && !runtime.activated) {
     return { phase: 'idle', action: '', inferred: true };
   }
+  // 重启纪元：推断用的时间证据（文件改动 / 待办 / 运行态落盘）也必须是**本进程启动之后**的。
+  // 否则"上次运行留下的最后一次文件改动"（仍在 BUSY_MS 窗口内）会在重启瞬间被判成「调用工具」，
+  // 与"重启后先待命、等下一个新事件"相悖。与 readReporterPhase 用同一把尺子。
+  const afterRestart = (ts) => Number(ts) >= SERVER_STARTED_AT;
   // 显式状态也只在"近期真有动静"时采信，避免 IDE 关掉后残留的运行态一直挂着
-  if (runtime.paused && lastUpdated && now - lastUpdated < IDLE_MS) {
+  if (runtime.paused && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'idle', action: '会话已暂停', inferred: true };
   }
-  if (runtime.awaitingSessionIdle && lastUpdated && now - lastUpdated < IDLE_MS) {
+  if (runtime.awaitingSessionIdle && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'summarize', action: '等会话空闲后收尾', inferred: true };
   }
 
   // 正在干活：必须"新鲜"证据，否则 IDE 关掉后残留的 in_progress 待办 / 文件改动会一直显示「工具中」
-  if (todos.doing && todos.at && now - todos.at < IDLE_MS) {
+  if (todos.doing && afterRestart(todos.at) && now - todos.at < IDLE_MS) {
     return { phase: 'tool', action: todos.doing, inferred: true };
   }
-  if (files.lastAt && now - files.lastAt < BUSY_MS) {
+  if (afterRestart(files.lastAt) && now - files.lastAt < BUSY_MS) {
     const f = files.recent[0];
     return { phase: 'tool', action: `改 ${f.name}（+${f.added}/-${f.removed}）`, inferred: true };
   }
   // 运行态极新鲜（插件最近在落盘）→ 这一轮对话真的在推进（含纯推理、只读工具等拿不到文件/待办证据的情况）。
   // 没有"正在调工具"的硬证据，只是知道在动，归到「思考中」——绝不凭空显示「调用工具」。
-  if (lastUpdated && now - lastUpdated < FRESH_MS) {
+  if (afterRestart(lastUpdated) && now - lastUpdated < FRESH_MS) {
     return { phase: 'thinking', action: '', inferred: true };
   }
 
   // 有排队待发消息（且不是陈年残留）→ 规划 / 待处理
-  if (pending > 0 && lastUpdated && now - lastUpdated < IDLE_MS) {
+  if (pending > 0 && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'plan', action: `${pending} 条待发消息排队中`, inferred: true };
   }
 
@@ -443,12 +483,14 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   let phase = inferred.phase;
   let action = inferred.action;
   let target = '';
+  let tool = '';
   let context = todos.items.map((t) => `${mark[t.status] || '·'} ${t.content}`);
 
   // 上报真值：reporter hook 把每个事件的相位（思考中 / 调用工具 / 等待授权）落到本地状态文件。
   // 优先级高于从 genie-history 推断的相位；只在"当前会话"上生效（相位必然出在这只 agent 身上）。
   let reported = false;
-  if (current) {
+  let prompt = '';
+  if (current && inWindow) {
     const rp = reporterMainPhase(workspacePath);
     if (rp) {
       reported = true;
@@ -456,8 +498,17 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
       action = rp.action;
       target = rp.target;
       context = rp.context;
+      tool = rp.tool || '';
+      prompt = rp.prompt || '';
     }
   }
+
+  // 完成标记：reporter 仅在 Stop 时落盘（且按工程区分），是"任务完成"的唯一真源；
+  // 比"相位回落到空闲"可靠——任务中途因轮询间隙 / 跨工程串味出现空闲，绝不冒充完成。
+  const done = readReporterDone(workspacePath) || null;
+  const doneAt = done ? done.at : 0;
+  const doneTitle = done ? done.title || '' : '';
+  const doneFiles = done ? (Array.isArray(files.recent) ? files.recent.slice(0, 6) : []) : [];
 
   return {
     id,
@@ -473,7 +524,12 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     phase,
     action,
     target,
+    tool,
     context,
+    prompt,
+    doneAt,
+    doneTitle,
+    doneFiles,
     inferred: !reported, // 上报真值（reporter hook）不算推断
   };
 }
@@ -521,39 +577,47 @@ function listSessions({ workspacePath = '', force = false } = {}) {
     return cache.value;
   }
 
-  /** 会话 id -> 归属（工程名 / 工程路径 / 是不是该工程正开着的那个） */
+  /** 会话 id -> 归属（工程名 / 工程路径）。每个工程自己的"当前会话"单独记，
+   *  不做成全局唯一 —— 这样多工程时每条工程里的活跃会话都能拿到自己 reporter 的实时相位，
+   *  主控制台跟随下拉选中的那条，不再被全局"最后一个 reporter"覆盖。 */
   const meta = new Map();
+  const perProjectCurrent = new Map(); // 工程路径 -> 该工程 current.json 指向的会话 id
   let currentId = '';
   for (const p of collectProjects(storage)) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
-    if (cid && p.path === ws) currentId = currentId || cid;
-    for (const id of readDir(path.join(p.dir, 'conversations'))) {
-      if (id) meta.set(id, { project: p.project, projectPath: p.path, current: id === cid });
+    if (cid) {
+      perProjectCurrent.set(p.path, cid);
+      // 全局唯一的"当前会话"仍认真实活动工程（ws）里那条，用于默认选中 / 高亮
+      if (p.path === ws) currentId = currentId || cid;
     }
-    if (cid && !meta.has(cid)) meta.set(cid, { project: p.project, projectPath: p.path, current: true });
+    for (const id of readDir(path.join(p.dir, 'conversations'))) {
+      if (id) meta.set(id, { project: p.project, projectPath: p.path });
+    }
+    if (cid && !meta.has(cid)) meta.set(cid, { project: p.project, projectPath: p.path });
   }
   // 兜底：插件新版可能不写 genie-history，会话只在 todos / 消息队列里露过头。
   // 这类会话没有工程归属（project 留空），但它是"正在跑的那个"，不列出来更糟。
   for (const name of readDir(path.join(storage, 'todos'))) {
     const id = name.replace(/\.json$/i, '');
-    if (id && !meta.has(id)) meta.set(id, { project: '', projectPath: '', current: false });
+    if (id && !meta.has(id)) meta.set(id, { project: '', projectPath: '' });
   }
 
-  // 活跃窗口扫一次即可（按当前打开的工程匹配 reporter hook 的 taskId）
-  const inWindow = readReporterActiveTask(ws);
   const sessions = [];
   for (const [id, m] of meta) {
-    // current 必须是"全局唯一"的当前会话：只认当前真实活动工程（ws）里那条 current 会话，
-    // 不能每个工程都算一条 current —— 否则多工程时旧工程那条也会是 current，
-    // 主控制台守卫 !sel.current 失效，把新工程的相位错归到旧会话。
-    const info = sessionInfo(storage, id, { current: id === currentId, now, workspacePath: ws, inWindow });
+    // 这条会话是不是它"自己工程"里当前开着的那个（每个工程各算各的，可多条同时为 true）。
+    // 只有它才吃得到本工程 reporter 上报的实时相位；别的工程 / 历史会话一律走推断。
+    const isProjectCurrent = id === (perProjectCurrent.get(m.projectPath) || '');
+    // 活跃窗口按"这条会话自己的工程"匹配 reporter 的 taskId：工程没在跑就不采信它的相位，
+    // 避免旧工程残留的"思考中"相位在 IDE 关掉 / 切走后还挂着。
+    const inWindow = readReporterActiveTask(m.projectPath);
+    const info = sessionInfo(storage, id, { current: isProjectCurrent, now, workspacePath: m.projectPath, inWindow });
     if (!info.active) continue; // 下拉只要活跃会话
     sessions.push({
       ...info,
       project: m.project,
       projectPath: m.projectPath,
-      /** 属于当前打开的工程 —— 只有它才有幽灵清单可看 */
+      /** 属于当前真实活动工程（ws）—— 只有它才有幽灵清单可看 */
       mine: Boolean(ws) && m.projectPath === ws,
     });
   }

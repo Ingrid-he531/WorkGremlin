@@ -26,8 +26,11 @@ function createSessionsRouter({ workspace }) {
   router.get('/reporter-phase', (req, res) => {
     const cur = workspace && workspace.current ? workspace.current() : {};
     // 跟随 reporter 真实活动的最新工程，而不是 office 手工"打开工程"记的那个
-    const rp = reporterMainPhase(freshestReporterWs(cur.workspacePath || ''));
-    res.json(rp ? { ok: true, ...rp } : { ok: true, phase: null, action: '', target: '', context: [] });
+    const ws = freshestReporterWs(cur.workspacePath || '');
+    const rp = reporterMainPhase(ws);
+    // 带上这条相位所属的工程路径（workspacePath）：渲染层据此只在"选中会话正好属于这个工程"时
+    // 才叠加实时相位，避免旧会话（它自己工程已不活跃）被新工程的相位串味、短暂闪一下"思考中"。
+    res.json(rp ? { ok: true, workspacePath: ws, ...rp } : { ok: true, workspacePath: ws, phase: null, action: '', target: '', context: [] });
   });
 
   return router;

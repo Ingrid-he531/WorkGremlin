@@ -53,7 +53,7 @@ async function startPhasePoll() {
       if (res.ok) {
         const d = await res.json();
         if (d && d.ok && d.phase && d.phase !== 'idle') {
-          fastPhase.value = { phase: d.phase, action: d.action, target: d.target, context: d.context || [], tool: d.tool || '' };
+          fastPhase.value = { phase: d.phase, action: d.action, target: d.target, context: d.context || [], tool: d.tool || '', prompt: d.prompt || '', workspacePath: d.workspacePath || '' };
         } else {
           fastPhase.value = null;
         }
@@ -114,86 +114,89 @@ function onConsoleLeave() {
 /** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
 const mainAgentState = computed(() => mainAgent.snapshot);
 
+/** 两个工程路径是否同一个（去尾斜杠比较；任一为空视为"不限定"，返回 true） */
+function sameWorkspace(a, b) {
+  const na = String(a || '').replace(/\/+$/, '');
+  const nb = String(b || '').replace(/\/+$/, '');
+  return !na || !nb || na === nb;
+}
+
 /**
- * reporter hook 把主 Agent 的实时状态上报成了 team 里的一个成员
- * （role=agent、主动上报 reported=1、非临时）。主控制台应该吃这个真值——
- * 它带心跳死亡检测（degraded 即 60s 没心跳），比磁盘推断准，也修掉了
- * "干活显示空闲"和"关掉 VS Code 还卡在规划中"两处失真。
+ * 主控制台严格跟随下拉选中的会话：显示"这条会话自己"的相位
+ * （它自己工程 reporter 上报的真值，或落盘推断值），绝不拿别的工程的实时相位冒充。
+ * 这样多个工程同时开着时，下拉切到哪条就显示哪条，与所选会话一一对应。
  */
-const mainMember = computed(() =>
-  team.members.find((m) => m.role === 'agent' && m.reported && !m.ephemeral && !m.degraded) || null
-);
-
-/** 主控制台真正要显示的状态：优先 hook 实时上报，否则退回现有逻辑（演示 / 会话接管） */
 const consoleLive = computed(() => {
-  const m = mainMember.value;
-  if (!m) return null;
   const sel = sessions.selected;
-  // 选中的不是"当前在敲"的会话（例如已关闭的旧工程）：控制台严格跟随下拉，
-  // 显示该会话自身的状态（多为空闲），绝不拿别的会话的输入 / 工具相位来冒充。
-  if (sel && sel.id && !sel.current) {
-    return { phase: 'idle', action: '', context: [], target: null };
-  }
-
-  // 快轮询（1.5s）优先：reporter hook 的"调用工具 / 等待授权"相位比 10s 的 sessions 轮询新鲜；
-  // thinking 由 WS 的 mainMember.state 已实时给到，这里不覆盖。
-  if (fastPhase.value) {
+  if (!sel) return null;
+  // 选中的恰好是"全局当前在敲"的那条（fresh）：叠加 1.5s 快轮询的实时相位，
+  // 让"调用工具 / 等待授权"更跟手（比 10s 会话轮询新鲜）。其余会话（哪怕是各自工程的
+  // current=true）只用自己会话轮询的数据，绝不借全局实时相位冒充——否则切回旧会话会误显新工程的"调用工具"。
+  // 再加一道"工程归属"校验：快轮询相位带回了它所属工程（workspacePath），只有选中会话正好
+  // 属于那个工程才叠加。否则切工程后旧会话的 fresh 还来不及翻新（会话快照滞后），新工程的
+  // "思考中"会短暂盖到旧会话上——现象就是旧会话闪一下"思考中"、随后回落"待命中"。
+  if (sel.fresh && fastPhase.value && sameWorkspace(fastPhase.value.workspacePath, sel.projectPath)) {
     const fp = fastPhase.value;
     if (fp.phase === 'await') {
-      return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null };
+      return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null, prompt: fp.prompt || '' };
     }
     if (fp.phase === 'tool') {
-      return { phase: 'tool', action: fp.action || '调用工具', context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, tool: fp.tool || '' };
+      return { phase: 'tool', action: fp.action || '调用工具', context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, tool: fp.tool || '', prompt: fp.prompt || '' };
+    }
+    // 思考中：把用户那句话（prompt）同时放到第二层（action）和第三层。
+    // 屏上第三层有"字号够大才画"的门槛（mainConsole 的 showL3），放大不够时不出字；
+    // 第二层门槛低，所以放一份在第二层，保证"思考中"下面任何时候都看得到你问的那句话。
+    if (fp.phase === 'thinking') {
+      const p = fp.prompt || sel.prompt || '';
+      return { phase: 'thinking', action: fp.action || sel.action || p, context: fp.context && fp.context.length ? fp.context : (sel.context || []), target: fp.target || null, prompt: p };
     }
   }
-
-  // 上报真值优先：reporter hook 把每次事件的相位（思考中 / 调用工具 / 等待授权）落到本地状态文件，
-  // server/src/sessions.js 的 readReporterPhase 已转成 sel.action / target / context。
-  // 调用工具 → 显示真实操作（工具名 + 目标文件），别再把聊天输入（任务标题）当操作；
-  // 等待授权 → 显示"申请执行 X + 目标文件"。
-  if (sel && sel.action) {
-    if (sel.phase === 'await' || m.state === 'blocked') {
-      return { phase: 'await', action: sel.action, context: sel.context && sel.context.length ? sel.context : ['等待用户授权后继续'], target: sel.target || null };
-    }
-    if (sel.phase === 'tool' || m.state === 'busy') {
-      return { phase: 'tool', action: sel.action, context: sel.context && sel.context.length ? sel.context : [], target: sel.target || null, tool: sel.tool || '' };
-    }
-  }
-
-  if (m.state === 'blocked') {
-    // 等授权：工具与目标走会话落盘的 await 叠加（sessions.js 已读 reporter 的本地文件）
-    return {
-      phase: 'await',
-      action: '等待用户授权',
-      context: ['等待用户授权后继续'],
-      target: null,
-    };
-  }
-  if (m.state === 'thinking') {
-    // 思考中：用户刚提交，尚未发起工具 / 授权。第二层写任务标题（即用户那句话）。
-    const title = m.task && m.task.title ? m.task.title : '正在分析你的请求';
-    // 点1：把用户那句话（prompt 原文）一并带出，屏幕第三层会顶到最前显示
-    return { phase: 'thinking', action: title, context: title !== '正在分析你的请求' ? [title] : [], target: null, prompt: title };
-  }
-  // idle / offline：没有正在进行的操作，别把上一条任务的标题（你的聊天输入）当"操作"泄露出来
-  const phase = m.state === 'busy' ? 'tool' : 'idle';
-  const action = m.state === 'busy' && m.task && m.task.title ? m.task.title : '';
-  const files = m.state === 'busy' && Array.isArray(m.currentFiles)
-    ? m.currentFiles.map((f) => (f && (f.path || f)) || '').filter(Boolean)
-    : [];
-  const context = files.length ? files.slice(0, 6) : [];
-  return { phase, action, context, target: null };
+  // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
+  // 下拉切到旧工程会话就显示旧会话自己的状态，不再被新工程的实时相位覆盖。
+  const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
+  return {
+    phase: sel.phase || 'idle',
+    action: sel.action || selPrompt,
+    context: sel.context && sel.context.length ? sel.context : [],
+    target: sel.target || null,
+    tool: sel.tool || '',
+    prompt: sel.prompt || '',
+  };
 });
 
-/** 这些相位算"正在干活"，从它们回落到 idle 即视为一次任务完成 */
-const ACTIVE_PHASES = new Set(['plan', 'thinking', 'tool', 'dispatch', 'await', 'summarize']);
+/**
+ * "任务完成"唯一真源 = reporter 在 Stop 时落盘的 doneAt（服务端按工程透传）。
+ * 绝不靠"相位回落到空闲"来猜——那样会被轮询间隙 / 跨工程串味误触发，
+ * 导致任务中途也弹出"任务完成"。而且只有 doneAt 真正变化（收到新 Stop）时才弹，
+ * 切到一条早已收工的旧会话不会误报。
+ */
+let lastConsoleSessionId = undefined;
+let lastDoneAt = undefined;
 watch(
   consoleLive,
-  (v, old) => {
-    // 真实任务刚跑完（从活跃相位回落到待命）：亮"任务完成"概要 10s，再退回待命；
-    // 沿用上一份状态里的上下文（本次改动的文件等）作为完成概要。
-    if (old && old.phase && ACTIVE_PHASES.has(old.phase) && v && v.phase === 'idle') {
-      mainAgent.enterDone('任务完成', old.context && old.context.length ? old.context.slice() : ['本次任务已完成']);
+  (v) => {
+    const sel = sessions.selected;
+    const selId = sel ? sel.id : null;
+    const doneAt = sel ? sel.doneAt || 0 : 0;
+    // 切换了会话（或首次）：直接把控制台切到这条会话当前的状态，重置完成标记，不弹"任务完成"。
+    // 办公室的工位小怪物也跟着选中的会话走：切到别的工程会话，就切到那个工程的成员清单，
+    // 这样"主 Agent + 小怪物"整组都跟随下拉选中的那条，不再停在之前打开的工程。
+    if (selId !== lastConsoleSessionId) {
+      lastConsoleSessionId = selId;
+      lastDoneAt = doneAt;
+      mainAgent.applySession(v);
+      if (sel && sel.projectPath && sel.projectPath !== team.workspacePath) {
+        team.openWorkspace(sel.projectPath);
+      }
+      return;
+    }
+    // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
+    // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
+    if (doneAt && doneAt !== lastDoneAt) {
+      lastDoneAt = doneAt;
+      const files = (sel && sel.doneFiles) || [];
+      const ctx = files.length ? files : ['本次任务已完成'];
+      mainAgent.enterDone('任务完成', ctx);
       return;
     }
     mainAgent.setLiveState(v);
@@ -353,6 +356,13 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
       <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
+      <!-- 相位来源：这条会话的相位是 agent 上报的真值，还是服务端从落盘推断的 -->
+      <div v-if="sessions.selected" class="ct-row">
+        <b>来源</b>
+        <span class="ct-val" :class="{ 'ct-infer': sessions.selected.inferred }">
+          {{ sessions.selected.inferred ? '推断值（服务端由落盘推导）' : '上报真值（agent 主动上报）' }}
+        </span>
+      </div>
     </div>
 
     <!-- 任务卡（跟着角色走） -->
@@ -546,6 +556,12 @@ onBeforeUnmount(() => {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+/* 来源为「推断值」：灰 + 虚线，提示这不是上报真值 */
+.ct-infer {
+  color: var(--text-dim, #a8bdd6);
+  border-bottom: 1px dashed var(--text-faint);
 }
 
 /* 完成/暂停时的「改动」明细：每个文件单独一行 */

@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue';
+import { onMounted, onUnmounted, ref } from 'vue';
 import ConnectionBar from './components/ConnectionBar.vue';
 import SessionSwitcher from './components/SessionSwitcher.vue';
 import FloorSelector from './components/FloorSelector.vue';
@@ -11,14 +11,12 @@ import ConversationView from './views/ConversationView.vue';
 import { useTeamStore } from './stores/team';
 import { useMessageStore } from './stores/messages';
 import { useSessionStore } from './stores/sessions';
-import { useMainAgentStore } from './stores/mainAgent';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { httpBase } from './api/bridge';
 
 const team = useTeamStore();
 const msgs = useMessageStore();
 const sessions = useSessionStore();
-const mainAgent = useMainAgentStore();
 
 /** 支持 ?tab=lab 直接进入工位设计台（调造型时用） */
 const initialTab = (() => {
@@ -52,11 +50,7 @@ function selectDesk(id) {
   msgs.setFilters({ members: selectedId.value ? [selectedId.value] : [] });
 }
 
-/** 选中的会话变了 → 主 Agent 控制台改显示这个会话的状态（办公室布局不动） */
-watch(
-  () => sessions.selected,
-  (s) => mainAgent.applySession(s)
-);
+/** 选中的会话变了 → 由 IsoOfficeView 的主控制台负责（严格跟随所选会话，办公室布局不动） */
 
 onMounted(async () => {
   await team.init((msg) => {
@@ -80,8 +74,8 @@ onUnmounted(() => {
   <div class="app">
     <ConnectionBar
       :connection="team.connection"
-      :team="team.team"
-      :project="team.project"
+      :project="sessions.selected ? sessions.selected.project : team.project"
+      :source="sessions.selected ? (sessions.selected.inferred ? 'inferred' : 'reported') : ''"
     />
 
     <nav class="tabs">

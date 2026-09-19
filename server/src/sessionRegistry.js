@@ -157,6 +157,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
       projectPath: s.projectPath || '',
       mine: Boolean(s.mine),
       current: Boolean(s.current),
+      // 全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
+      // 只有它才配叠加 1.5s 快轮询的全局实时相位，其余 current=true 的工程当前会话
+      // 只用自己工程的上报，绝不借别人的相位冒充（否则切回旧会话会误显新工程的"调用工具"）。
+      fresh: s.id === plugin.current,
       live: Boolean(s.live),
       runtime: s.runtime,
       pending: s.pending || 0,
@@ -165,8 +169,16 @@ function refresh({ workspacePath = '', force = false } = {}) {
       phase: s.phase,
       action: s.action,
       target: s.target || '',
+      tool: s.tool || '',
       context: s.context || [],
-      inferred: true,
+      prompt: s.prompt || '',
+      // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
+      doneAt: s.doneAt || 0,
+      doneTitle: s.doneTitle || '',
+      doneFiles: s.doneFiles || [],
+      // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
+      // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
+      inferred: Boolean(s.inferred),
       lastEventAt: s.lastUpdated || 0,
     });
   }

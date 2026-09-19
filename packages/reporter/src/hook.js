@@ -75,9 +75,15 @@ function trace(event, extra) {
   }
 }
 
-/** 每个工位一份：当前任务 id + 心跳守护的 pid */
+/**
+ * 每个工位 + 工程一份：当前任务 id + 心跳守护的 pid。
+ * 文件名带上工程（cwd 解析后的 REAL_WS），这样多个工程同时开着（同一 member 名 codebuddy）
+ * 时各自写自己的文件，互不覆盖相位 / 任务 / 心跳 —— 否则会出现旧会话乱跳"思考中"、
+ * "任务完成"被别的工程串味误弹等跨工程失真。
+ */
 function statePath(member) {
-  return path.join(home(), 'hooks', `${String(member).replace(/[^a-zA-Z0-9._-]/g, '_')}.json`);
+  const key = `${String(member)}@${REAL_WS}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(home(), 'hooks', `${key}.json`);
 }
 
 function readState(file) {
@@ -291,7 +297,7 @@ function setAwait(file, ctx, cwd, ev) {
 /** 撤掉"等权限"标记（工具放行 / 新回合 / 会话结束）。
  *  顺便把 pending 一起清掉：它只是 PreToolUse 留下的"兜底推断"标记。 */
 function clearAwait(file) {
-  writeState(file, { await: null, pending: null, sessionPhase: null });
+  writeState(file, { await: null, pending: null, sessionPhase: null, done: null });
 }
 
 function startHeartbeat(member) {
@@ -415,9 +421,9 @@ async function main() {
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
     await register();
     const started = await request(info, HTTP_ROUTES.TASK_START, { ...base, memberId: member, title });
-    if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: REAL_WS, taskStartedAt: Date.now() });
+    if (started && started.taskId) writeState(file, { taskId: started.taskId, taskWorkspacePath: REAL_WS, taskStartedAt: Date.now(), taskTitle: title, done: null });
     // 进入"思考中"：直到下一个事件（PreToolUse / Notification / Stop）才切换
-    writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: ctx.workspacePath || '' } });
+    writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
     // 用户刚提交：进入"思考中"，直到下一个事件（PreToolUse / Stop / Notification）才切换。
     // 思考期间没有任何工具/授权事件，牌子上就一直显示「思考中」。
     await status('thinking');
@@ -503,9 +509,13 @@ async function main() {
 
   if (event === 'Stop') {
     clearAwait(file);
-    const taskId = readState(file).taskId;
+    const st = readState(file);
+    const taskId = st.taskId;
+    const title = st.taskTitle || '';
     if (taskId) await request(info, HTTP_ROUTES.TASK_END, { ...base, memberId: member, taskId, state: 'done' });
-    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 });
+    // 落"完成"标记：带工程路径 + 任务标题，服务端据此（且仅据此）亮"任务完成"概要，
+    // 不再靠"相位回落到空闲"来猜，避免中途被其它工程串味误弹。
+    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0, done: { at: Date.now(), title, workspacePath: REAL_WS } });
     await beat();
     await status('idle');
     return;
