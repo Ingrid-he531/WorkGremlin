@@ -16,6 +16,7 @@
  */
 
 const { MESSAGE_TYPES } = require('@workgremlin/shared');
+const config = require('../config');
 
 /** mulberry32：小而确定的 PRNG */
 function makeRng(seed) {
@@ -52,9 +53,18 @@ const GUESTS = [
 /** 专家 + 临时成员：注册/心跳/任务都按这份名单来 */
 const ALL_MEMBERS = ROSTER.concat(GUESTS);
 
+/**
+ * 演示种子成员的名字集合。
+ *
+ * 供启动清理用：老版本里演示 project 叫 workgremlin，和真实工程撞名，
+ * 这些名字被写进了真实工程的 project；演示 project 改名后需要把它们从真实 project 里摘掉。
+ * （注意：若某名字同时是工程里**已定义 subagent**（如 coder），说明那已是真实成员，不清。）
+ */
+const DEMO_MEMBER_NAMES = new Set(ALL_MEMBERS.map((m) => m.name));
+
 const TASK_TITLES = {
   leader: '拆解 M1 任务并派发',
-  researcher: '调研 .codebuddy/teams 数据格式',
+  researcher: '调研 .codebuddy/projects 数据格式',
   coder: '实现工位视图与对话记录窗口',
   tester: '编写 M0 验收用例',
   reviewer: '评审数据模型与协议定义',
@@ -65,7 +75,7 @@ const TASK_TITLES = {
 
 const FILES = {
   leader: ['docs/tech-design.md', 'docs/roadmap.md'],
-  researcher: ['docs/research/codebuddy-format.md', 'fixtures/teams-sample/config.json'],
+  researcher: ['docs/research/codebuddy-format.md', 'fixtures/projects-sample/config.json'],
   coder: [
     'renderer/src/components/WorkstationCard.vue',
     'renderer/src/views/ConversationView.vue',
@@ -100,9 +110,9 @@ const CONTENTS = [
 
 /**
  * 生成演示数据。
- * @param {{bus: any, seed?: number, team?: string, workspacePath?: string, baseTs?: number}} opts
+ * @param {{bus: any, seed?: number, project?: string, workspacePath?: string, baseTs?: number}} opts
  */
-function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/demo/workspace', baseTs }) {
+function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspacePath = '/demo/workspace', baseTs }) {
   const rng = makeRng(seed);
   const t0 = Number.isFinite(baseTs)
     ? Number(baseTs)
@@ -111,14 +121,14 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
       : Date.now();
   const pick = (arr) => arr[Math.floor(rng() * arr.length) % arr.length];
 
-  bus.ensureTeam(team, workspacePath, 'demo-conversation', 'report');
+  bus.ensureProject(project, workspacePath, 'demo-conversation', 'report');
 
   for (const r of ALL_MEMBERS) {
-    const memberId = bus.registerMember({ team, name: r.name, role: r.role });
+    const memberId = bus.registerMember({ project, name: r.name, role: r.role });
     const files = FILES[r.name] || [];
     if (r.reported) {
       bus.heartbeat({
-        team,
+        project,
         memberId,
         state: r.state,
         progress: r.progress,
@@ -127,7 +137,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
       });
     } else {
       // 未接上报：状态行打 degraded，UI 必须灰显并标注"推断"
-      bus.heartbeat({ team, memberId, state: r.state, ts: t0 - 3 * 60_000 });
+      bus.heartbeat({ project, memberId, state: r.state, ts: t0 - 3 * 60_000 });
       bus.raw && bus.raw;
     }
   }
@@ -136,7 +146,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
   for (const r of ALL_MEMBERS) {
     if (r.state !== 'busy') continue;
     const started = bus.startTask({
-      team,
+      project,
       memberId: r.name,
       title: TASK_TITLES[r.name],
       progress: r.progress,
@@ -145,7 +155,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
     });
     if (started.ok) {
       bus.taskProgress({
-        team,
+        project,
         memberId: r.name,
         taskId: started.taskId,
         progress: r.progress,
@@ -156,7 +166,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
 
   // blocked 成员额外写一条原因
   bus.setStatus({
-    team,
+    project,
     memberId: 'reviewer',
     state: 'blocked',
     reason: '等待 FTS 分词器决策（trigram vs unicode61）',
@@ -173,7 +183,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
     const ts = t0 - (count - i) * 20_000;
     const isError = i === count - 3;
     bus.recordMessage({
-      team,
+      project,
       from,
       to,
       type: isError ? 'block' : pick(MESSAGE_TYPES),
@@ -186,7 +196,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
 
   // 一条 error 级系统消息
   bus.recordMessage({
-    team,
+    project,
     from: 'system',
     to: null,
     type: 'system',
@@ -198,7 +208,7 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
 
   // ops 是"未接上报"的成员：把它的状态标成 degraded（模拟心跳超时）
   bus.sweepDegraded && bus.sweepDegraded();
-  return { team, seed, members: ALL_MEMBERS.length, messages: count + 1, baseTs: t0 };
+  return { project, seed, members: ALL_MEMBERS.length, messages: count + 1, baseTs: t0 };
 }
 
 /**
@@ -209,9 +219,9 @@ function seedDemoData({ bus, seed = 1, team = 'workgremlin', workspacePath = '/d
  *   - 已接上报的成员：刷新心跳（保持不 degraded）并缓慢推进进度；
  *   - 未接上报的成员（ops）：**故意不刷新**，用于持续演示 degraded 灰显。
  *
- * @param {{bus: any, repo?: any, team?: string, intervalMs?: number, seed?: number}} opts
+ * @param {{bus: any, repo?: any, project?: string, intervalMs?: number, seed?: number}} opts
  */
-function createDemoTicker({ bus, repo, team = 'workgremlin', intervalMs = 5_000, seed = 1 }) {
+function createDemoTicker({ bus, repo, project = config.DEMO_PROJECT, intervalMs = 5_000, seed = 1 }) {
   const rng = makeRng((Number(seed) || 1) ^ 0x9e3779b9);
   const reported = ALL_MEMBERS.filter((r) => r.reported);
   const progress = new Map(
@@ -222,7 +232,7 @@ function createDemoTicker({ bus, repo, team = 'workgremlin', intervalMs = 5_000,
   /** 找到成员当前进行中的任务（用于推进 tasks.progress，UI 进度条读的是这张表） */
   function runningTaskId(memberId) {
     if (!repo) return null;
-    const rows = repo.listTasks.all(team) || [];
+    const rows = repo.listTasks.all(project) || [];
     const hit = rows.find((t) => t.member_id === memberId && t.state === 'running');
     return hit ? hit.id : null;
   }
@@ -230,7 +240,7 @@ function createDemoTicker({ bus, repo, team = 'workgremlin', intervalMs = 5_000,
   function tick() {
     for (const r of reported) {
       const ts = Date.now();
-      const memberId = `${r.name}@${team}`;
+      const memberId = `${r.name}@${project}`;
       const cur = progress.get(r.name);
 
       if (r.state === 'busy' && cur != null) {
@@ -238,11 +248,11 @@ function createDemoTicker({ bus, repo, team = 'workgremlin', intervalMs = 5_000,
         progress.set(r.name, next);
         const taskId = runningTaskId(memberId);
         if (taskId) {
-          bus.taskProgress({ team, memberId: r.name, taskId, progress: next, files: FILES[r.name] || [], ts });
+          bus.taskProgress({ project, memberId: r.name, taskId, progress: next, files: FILES[r.name] || [], ts });
           continue;
         }
       }
-      bus.heartbeat({ team, memberId: r.name, state: r.state, files: FILES[r.name] || [], ts });
+      bus.heartbeat({ project, memberId: r.name, state: r.state, files: FILES[r.name] || [], ts });
     }
   }
 
@@ -260,4 +270,4 @@ function createDemoTicker({ bus, repo, team = 'workgremlin', intervalMs = 5_000,
   };
 }
 
-module.exports = { seedDemoData, createDemoTicker, makeRng };
+module.exports = { seedDemoData, createDemoTicker, makeRng, DEMO_MEMBER_NAMES };

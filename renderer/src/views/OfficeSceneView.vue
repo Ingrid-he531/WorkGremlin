@@ -17,7 +17,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GremlinSprite from '../components/GremlinSprite.vue';
 import GhostSprite from '../components/GhostSprite.vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
-import { useTeamStore } from '../stores/team';
+import { useProjectStore } from '../stores/project';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import {
   DESKS,
@@ -38,7 +38,7 @@ const props = defineProps({
 });
 const emit = defineEmits(['select']);
 
-const team = useTeamStore();
+const project = useProjectStore();
 
 const wrapRef = ref(null);
 const svgRef = ref(null);
@@ -57,15 +57,15 @@ const STATE_LABEL = { online: '在线', busy: '忙碌', idle: '空闲', blocked:
 
 /** 专家团队：常驻成员，一人一个工位（临时成员不占工位）。
  *  主 Agent（role=agent）只在主控制台剪影出现，不占工位，所以从名单剔掉。 */
-const roster = computed(() => team.members.filter((m) => !isEphemeralMember(m) && m.role !== 'agent').slice(0, DESKS.length));
+const roster = computed(() => project.members.filter((m) => !isEphemeralMember(m) && m.role !== 'agent').slice(0, DESKS.length));
 /** 临时组队成员 + 工位坐不下的成员：没有工位，飘在空中 */
 const ghostRoster = computed(() => {
   const seated = new Set(roster.value.map((m) => m.memberId));
-  return team.members.filter((m) => !seated.has(m.memberId));
+  return project.members.filter((m) => !seated.has(m.memberId));
 });
 const memberOf = computed(() => {
   const m = new Map();
-  team.members.forEach((x) => m.set(x.memberId, x));
+  project.members.forEach((x) => m.set(x.memberId, x));
   return m;
 });
 
@@ -267,7 +267,7 @@ function frame(t) {
 /* ------------------------------ 开会 ------------------------------ */
 
 const manualMeeting = ref(false);
-const blockedIds = computed(() => team.members.filter((m) => m.state === 'blocked').map((m) => m.memberId));
+const blockedIds = computed(() => project.members.filter((m) => m.state === 'blocked').map((m) => m.memberId));
 
 function startMeeting(ids) {
   let k = 0;

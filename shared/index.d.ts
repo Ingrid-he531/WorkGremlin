@@ -15,14 +15,15 @@ export interface Envelope<T = unknown> {
   v: number;
   type: string;
   ts: number;
-  team: string;
+  /** 工程标识 */
+  project: string;
   actor: string;
   payload: T;
 }
 
 export interface Member {
   id: string;
-  teamId: string;
+  projectId: string;
   name: string;
   role: string | null;
   sessionId: string | null;
@@ -68,12 +69,12 @@ export interface MemberCard {
   /** 临时组队成员（无工位，场景里以幽灵形态飘在空中） */
   ephemeral?: boolean;
   /** 临时成员所属项目名，缺省用 role */
-  project?: string | null;
+  projectLabel?: string | null;
 }
 
 export interface Message {
   id: number;
-  teamId: string;
+  projectId: string;
   tsMs: number;
   fromMember: string;
   toMember: string | null;
@@ -85,23 +86,25 @@ export interface Message {
   rawJson: string | null;
 }
 
-export interface Team {
+export interface Project {
   id: string;
   name: string;
   workspacePath: string;
   mainConversationId: string | null;
   source: Source | string;
   createdAt: number;
-  /** 所属工程名（package.json name > 目录名）；拿不到为空串 */
-  project?: string;
+  /** 工程显示名（package.json name > 目录名）；演示工程为固定名 */
+  projectName: string;
 }
 
 export interface Snapshot {
-  team: Team | null;
-  teams: Team[];
+  /** 当前工程 */
+  project: Project | null;
+  /** 全部工程（含演示工程） */
+  projects: Project[];
   members: MemberCard[];
-  /** 当前工程名（package.json name > 目录名），拿不到为空串 */
-  project?: string;
+  /** 当前工程显示名（package.json name > 目录名） */
+  projectName?: string;
   recentMessages: Message[];
   serverTime: number;
   serverVersion: string;
@@ -140,9 +143,9 @@ export declare const STATE_LABELS: Record<AgentState, string>;
 export declare const STATE_COLORS: Record<AgentState, string>;
 
 
-export declare function envelope<T>(type: string, team: string, actor: string, payload: T, ts?: number): Envelope<T>;
+export declare function envelope<T>(type: string, project: string, actor: string, payload: T, ts?: number): Envelope<T>;
 export declare function dedupeKey(m: {
-  team: string;
+  project: string;
   from: string;
   to?: string | null;
   ts: number;

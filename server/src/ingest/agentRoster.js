@@ -21,6 +21,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { detectLevel } = require('./agentLevel');
+const config = require('../config');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const USER_AGENTS_DIR = path.join(HOME, '.codebuddy', 'agents');
@@ -56,11 +57,17 @@ function listDefinedAgents(workspacePath) {
 }
 
 /**
- * @param {{bus:any, team?:string, getWorkspacePath?:()=>string, intervalMs?:number}} opts
+ * @param {{bus:any, project?:string, getProject?:()=>string, getWorkspacePath?:()=>string, intervalMs?:number}} opts
  */
 function createAgentRoster(opts) {
   const bus = opts.bus;
-  const team = opts.team || 'workgremlin';
+  /**
+   * 小怪物注册到哪个工程：**跟随"当前打开的工程"**。
+   * 传 getProject() 让它每次现取当前工程 —— 否则名册会固定写死进一个工程
+   * （老代码写死演示工程 id，只因演示工程恰好和真实工程同名才"蒙对"），
+   * 一旦演示数据隔离 / 换工程，小怪物就跟不过去。
+   */
+  const getProject = typeof opts.getProject === 'function' ? opts.getProject : () => opts.project || config.DEMO_PROJECT;
   const getWorkspacePath = opts.getWorkspacePath || (() => '');
   const intervalMs = Number(opts.intervalMs) || 15_000;
 
@@ -68,21 +75,30 @@ function createAgentRoster(opts) {
   let timer = null;
   let lastSig = '';
   const defined = new Set();
-  const registered = new Set();
+  /** project -> 本名册在该 project 上注册过的名字（换工程时各自记账，互不干扰） */
+  const registered = new Map();
   /** 正在被召唤（活跃）的小怪物：这些由 subagentFeed 负责把工位状态设为忙碌，
    *  roster 心跳不要把它覆盖回 online。召唤结束（markIdle）即复位。 */
   const activeNames = new Set();
 
   function sync() {
     if (!running) return;
+    const project = getProject();
     const ws = getWorkspacePath();
     const list = listDefinedAgents(ws);
-    const sig = list
+    const sig = `${project}|${list
       .map((a) => a.name)
       .sort()
-      .join(',');
+      .join(',')}`;
 
-    // 名册集合变化时才动注册（补新增的、摘掉不再定义的）
+    // 这条 project 上"本名册注册过"的名字；换工程（project 变）时 sig 会变，会重新在这条 project 上注册。
+    let mine = registered.get(project);
+    if (!mine) {
+      mine = new Set();
+      registered.set(project, mine);
+    }
+
+    // 名册集合（或当前 project）变化时才动注册（补新增的、摘掉不再定义的）
     if (sig !== lastSig) {
       lastSig = sig;
       defined.clear();
@@ -90,28 +106,29 @@ function createAgentRoster(opts) {
       for (const { name } of list) {
         defined.add(name);
         keep.add(name);
-        if (!registered.has(name)) {
+        if (!mine.has(name)) {
           bus.registerMember({
-            team,
+            project,
             memberId: name,
             name,
             role: 'subagent',
             sessionId: null,
             ephemeral: false,
-            project: '',
+            projectLabel: '',
             workspacePath: ws,
           });
-          registered.add(name);
+          mine.add(name);
         }
       }
-      for (const name of [...registered]) {
+      // 不再定义的：只从**当前这条 project** 上摘掉，别的工程的 project 不动
+      for (const name of [...mine]) {
         if (!keep.has(name)) {
           try {
-            bus.removeMember({ team, memberId: name });
+            bus.removeMember({ project, memberId: name });
           } catch {
             /* ignore */
           }
-          registered.delete(name);
+          mine.delete(name);
         }
       }
     }
@@ -119,10 +136,10 @@ function createAgentRoster(opts) {
     // 心跳：保持在线、避免被 sweepDegraded 判灰。
     // 正在被召唤（activeNames）的小怪物由 subagentFeed 把工位状态设为忙碌，
     // 这里跳过，不把它覆盖回 online。
-    for (const name of registered) {
+    for (const name of mine) {
       if (activeNames.has(name)) continue;
       try {
-        bus.heartbeat({ team, memberId: name, state: 'online', progress: null, files: [] });
+        bus.heartbeat({ project, memberId: name, state: 'online', progress: null, files: [] });
       } catch {
         /* ignore */
       }
@@ -139,7 +156,7 @@ function createAgentRoster(opts) {
     name = String(name || '').trim();
     if (!activeNames.delete(name)) return;
     try {
-      bus.heartbeat({ team, memberId: name, state: 'online', progress: null, files: [] });
+      bus.heartbeat({ project: getProject(), memberId: name, state: 'online', progress: null, files: [] });
     } catch {
       /* ignore */
     }

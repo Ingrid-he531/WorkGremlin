@@ -10,17 +10,19 @@
  *   - 进度/文件/耗时拿不到就是 NULL，绝不用 0 或随机值填充。
  */
 
+const path = require('node:path');
 const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey } = require('@workgremlin/shared');
 const clock = require('../clock');
+const config = require('../config');
 const { resolveProjectName } = require('../project');
 const { detectLevel } = require('./agentLevel');
 
-function teamIdOf(name) {
+function projectIdOf(name) {
   return name;
 }
 
-function memberIdOf(team, name) {
-  return String(name).includes('@') ? name : `${name}@${team}`;
+function memberIdOf(project, name) {
+  return String(name).includes('@') ? name : `${name}@${project}`;
 }
 
 function jsonOrNull(v) {
@@ -33,18 +35,18 @@ function jsonOrNull(v) {
 }
 
 /**
- * @param {{ repo: any, hub: any, project?: string, team?: string|null }} ctx
+ * @param {{ repo: any, hub: any, projectName?: string, project?: string|null }} ctx
  */
-function createIngestBus({ repo, hub, project = '', team = null }) {
-  /** 会随"打开工程"变化的东西：当前工程名 + 当前团队（屋里显示谁的工位） */
-  const context = { project, team: team || null };
+function createIngestBus({ repo, hub, projectName = '', project = null }) {
+  /** 会随"打开工程"变化的东西：当前工程名 + 工程路径 + 当前工程（屋里显示谁的工位） */
+  const context = { projectName, project: project || null, workspacePath: '' };
   /** memberId -> 'user' | 'project'：注册时按 subagent 目录判定一次 */
   const levels = new Map();
   const now = () => clock.now();
 
-  function ensureTeam(name, workspacePath = '', mainConversationId = null, source = 'report') {
-    const id = teamIdOf(name);
-    repo.upsertTeam.run({
+  function ensureProject(name, workspacePath = '', mainConversationId = null, source = 'report') {
+    const id = projectIdOf(name);
+    repo.upsertProject.run({
       id,
       name,
       workspacePath,
@@ -56,17 +58,17 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
   }
 
   /**
-   * @param {{team: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string,
-   *          ephemeral?: boolean, project?: string|null}} p
+   * @param {{project: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string,
+   *          ephemeral?: boolean, projectLabel?: string|null}} p
    */
   function registerMember(p) {
-    const team = teamIdOf(p.team);
-    ensureTeam(p.team, p.workspacePath || '', null, 'report');
-    const id = memberIdOf(team, p.memberId || p.name);
+    const project = projectIdOf(p.project);
+    ensureProject(p.project, p.workspacePath || '', null, 'report');
+    const id = memberIdOf(project, p.memberId || p.name);
     const existing = repo.getMember.get(id);
     repo.upsertMember.run({
       id,
-      teamId: team,
+      projectId: project,
       name: p.name || id.split('@')[0],
       role: p.role ?? null,
       sessionId: p.sessionId ?? null,
@@ -76,18 +78,18 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       lastSeenAt: now(),
       // 临时成员（无工位 / 场景里是幽灵）。老成员的 ephemeral 只升不降（见 upsertMember 的 MAX）
       ephemeral: p.ephemeral ? 1 : 0,
-      project: p.project ?? null,
+      projectLabel: p.projectLabel ?? null,
     });
     // subagent 级别（用户级 / 项目级）：按名字扫 agent 目录判定，记进内存 map
     const lvl = detectLevel(p.name || p.memberId || '', p.workspacePath || '');
     if (lvl) levels.set(id, lvl);
     else levels.delete(id);
-    hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, buildMemberCard(id));
+    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(id));
     return id;
   }
 
-  function requireMember(team, memberId) {
-    const id = memberIdOf(team, memberId);
+  function requireMember(project, memberId) {
+    const id = memberIdOf(project, memberId);
     const m = repo.getMember.get(id);
     if (!m) return null;
     return m;
@@ -95,11 +97,11 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
 
   /**
    * 心跳 / 轻量状态更新。
-   * @param {{team: string, memberId: string, state?: string, progress?: number, taskId?: string, files?: string[], ts?: number}} p
+   * @param {{project: string, memberId: string, state?: string, progress?: number, taskId?: string, files?: string[], ts?: number}} p
    */
   function heartbeat(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const id = member.id;
     const ts = Number(p.ts) || now();
@@ -130,7 +132,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     }
 
     const card = buildMemberCard(id);
-    hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, card);
+    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
     return { ok: true, card };
   }
 
@@ -138,8 +140,8 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
    * 显式状态切换（含 blocked + 原因）。
    */
   function setStatus(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const id = member.id;
     const ts = Number(p.ts) || now();
@@ -160,20 +162,20 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     });
     repo.insertStatusHistory.run(id, state, ts, p.reason ?? null, 'report');
     const card = buildMemberCard(id);
-    hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, card);
+    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
     return { ok: true, card };
   }
 
   function startTask(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const ts = Number(p.ts) || now();
     const id = p.taskId || `t_${ts.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
     repo.insertTask.run({
       id,
-      teamId: team,
+      projectId: project,
       memberId: member.id,
       parentTaskId: p.parentTaskId ?? null,
       title: p.title || '(未命名任务)',
@@ -194,14 +196,14 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       source: 'report',
       updatedAt: ts,
     });
-    hub.broadcast(team, WS_EVENTS.TASK_UPDATE, repo.getTask.get(id));
-    hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
+    hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(id));
+    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
     return { ok: true, taskId: id };
   }
 
   function taskProgress(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const ts = Number(p.ts) || now();
     repo.updateTask.run({ id: p.taskId, state: 'running', progress: p.progress ?? null, endedAt: null });
@@ -221,14 +223,14 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       for (const f of p.files) repo.insertFileActivity.run(member.id, f, 'write', ts);
       repo.trimFileActivity.run(member.id, member.id, 200);
     }
-    hub.broadcast(team, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
-    hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
+    hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
+    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
     return { ok: true };
   }
 
   function endTask(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const ts = Number(p.ts) || now();
     const state = ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done';
@@ -248,7 +250,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     });
     for (const a of p.artifacts || []) {
       repo.insertArtifact.run(member.id, p.taskId ?? null, a.kind || 'file', a.title || a.path || '(产出)', a.path ?? null, ts);
-      hub.broadcast(team, WS_EVENTS.ARTIFACT_NEW, {
+      hub.broadcast(project, WS_EVENTS.ARTIFACT_NEW, {
         memberId: member.id,
         taskId: p.taskId ?? null,
         kind: a.kind || 'file',
@@ -257,8 +259,8 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
         tsMs: ts,
       });
     }
-    hub.broadcast(team, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
-    hub.broadcast(team, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
+    hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
+    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
     return { ok: true };
   }
 
@@ -266,16 +268,16 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
    * 记录一条消息。source='report' 为上报真值；source='watch' 为目录监听兜底。
    */
   function recordMessage(p) {
-    const team = teamIdOf(p.team);
+    const project = projectIdOf(p.project);
     const ts = Number(p.ts) || now();
-    const from = memberIdOf(team, p.from);
-    const to = p.to ? memberIdOf(team, p.to) : null;
+    const from = memberIdOf(project, p.from);
+    const to = p.to ? memberIdOf(project, p.to) : null;
     const type = MESSAGE_TYPES.includes(p.type) ? p.type : p.type || 'system';
-    const key = p.dedupeKey || dedupeKey({ team, from, to, ts, content: p.content || '' });
+    const key = p.dedupeKey || dedupeKey({ project, from, to, ts, content: p.content || '' });
 
     const info = repo.insertMessage.run({
       dedupeKey: key,
-      teamId: team,
+      projectId: project,
       tsMs: ts,
       fromMember: from,
       toMember: to,
@@ -292,13 +294,13 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     const row = repo.raw
       .prepare('SELECT * FROM messages WHERE dedupe_key = ?')
       .get(key);
-    hub.broadcast(team, WS_EVENTS.MESSAGE_NEW, toMessage(row));
+    hub.broadcast(project, WS_EVENTS.MESSAGE_NEW, toMessage(row));
     return { ok: true, id: row.id };
   }
 
   function fileTouch(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const ts = Number(p.ts) || now();
     const op = p.op === 'read' ? 'read' : 'write';
@@ -306,7 +308,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     for (const f of files) repo.insertFileActivity.run(member.id, f, op, ts);
     repo.trimFileActivity.run(member.id, member.id, 200);
     for (const f of files) {
-      hub.broadcast(team, WS_EVENTS.FILE_ACTIVITY, { memberId: member.id, path: f, op, tsMs: ts });
+      hub.broadcast(project, WS_EVENTS.FILE_ACTIVITY, { memberId: member.id, path: f, op, tsMs: ts });
     }
     return { ok: true };
   }
@@ -315,7 +317,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
   function toMessage(row) {
     return {
       id: row.id,
-      teamId: row.team_id,
+      projectId: row.project_id,
       tsMs: row.ts_ms,
       fromMember: row.from_member,
       toMember: row.to_member,
@@ -344,7 +346,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       path: a.path,
       tsMs: a.ts_ms,
     }));
-    const cnt = repo.countMessagesFor.get(m.team_id, memberId, memberId);
+    const cnt = repo.countMessagesFor.get(m.project_id, memberId, memberId);
 
     return {
       memberId: m.id,
@@ -362,7 +364,7 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
       messageCount: cnt ? cnt.c : 0,
       // 临时成员（无工位 → 场景里飘着的幽灵）+ 所属项目名
       ephemeral: Boolean(m.ephemeral),
-      project: m.project ?? null,
+      projectLabel: m.project_label ?? null,
       // subagent 级别（用户级 / 项目级）：驱动小怪物脖子上的工牌配色
       level: levels.get(memberId) || null,
     };
@@ -370,15 +372,15 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
 
   /**
    * 删除成员（临时成员退场：subagent 结束、幽灵散掉）。
-   * @param {{team: string, memberId: string}} p
+   * @param {{project: string, memberId: string}} p
    */
   function removeMember(p) {
-    const team = teamIdOf(p.team);
-    const member = requireMember(team, p.memberId);
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     repo.purgeMember(member.id);
     levels.delete(member.id);
-    hub.broadcast(team, WS_EVENTS.MEMBER_REMOVE, { memberId: member.id });
+    hub.broadcast(project, WS_EVENTS.MEMBER_REMOVE, { memberId: member.id });
     return { ok: true };
   }
 
@@ -393,57 +395,70 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
 
   /**
    * 切换当前工程 / 团队（见 server/src/workspace.js）。
-   * @param {{project?: string, team?: string|null}} next
+   * @param {{project?: string, project?: string|null}} next
    */
   function setContext(next = {}) {
-    if (typeof next.project === 'string') context.project = next.project;
-    if (next.team !== undefined) context.team = next.team || null;
+    if (typeof next.projectName === 'string') context.projectName = next.projectName;
+    if (next.project !== undefined) context.project = next.project || null;
+    if (typeof next.workspacePath === 'string') context.workspacePath = next.workspacePath;
     return { ...context };
   }
 
   /**
-   * 团队列表。team 的 name 是内部 slug，界面上要显示的是它所属工程的名字，
+   * 团队列表。project 的 name 是内部 slug，界面上要显示的是它所属工程的名字，
    * 所以这里按 workspace_path 反解出 project（package.json name > 目录名）一起带出去。
    * @returns {Array<any>}
    */
-  function listTeamSummaries() {
-    return repo.listTeams.all().map((t) => ({
+  function listProjectSummaries() {
+    return repo.listProjects.all().map((t) => ({
       id: t.id,
       name: t.name,
       workspacePath: t.workspace_path || '',
       mainConversationId: t.main_conversation_id || null,
       source: t.source,
       createdAt: t.created_at,
-      project: t.workspace_path ? resolveProjectName(t.workspace_path) : '',
+      // 演示工程没有目录，显示名固定为「演示工程」（和真实工程并列展示）
+      projectName: t.workspace_path ? resolveProjectName(t.workspace_path) : config.DEMO_PROJECT_NAME,
     }));
   }
 
-  /** 首屏快照。没指定 team 时用"当前打开的工程"对应的团队 */
-  function buildSnapshot(teamName) {
-    const teams = listTeamSummaries();
-    const want = teamName || context.team;
-    const teamRow = want ? teams.find((t) => t.id === teamIdOf(want)) : teams[0];
-    if (!teamRow) {
+  /**
+   * 首屏快照。没指定 project 时用"当前打开的工程"对应的团队。
+   *
+   * 注意：**绝不回落到 projects[0]**。projects 是按创建时间倒序的，第一条可能是演示 data
+   * 或被污染的 project，拿它当"当前"会让办公室显示错的成员（甚至挂着几十小时前的演示残留）。
+   * 找不到对应 project 时按当前工程路径再匹配一次；还是找不到就返回空成员，由客户端显式
+   * 切成正确工程（POST /api/v1/workspace）。
+   */
+  function buildSnapshot(projectId) {
+    const projects = listProjectSummaries();
+    const want = projectId || context.project;
+    let projectRow = want ? projects.find((t) => t.id === projectIdOf(want)) : null;
+    if (!projectRow && context.workspacePath) {
+      const ws = path.resolve(context.workspacePath);
+      projectRow = projects.find((t) => t.workspacePath && path.resolve(t.workspacePath) === ws) || null;
+    }
+    if (!projectRow) {
       return {
-        team: null,
-        teams,
+        project: null,
+        projects,
         members: [],
         recentMessages: [],
-        project: context.project,
+        projectName: context.projectName,
         serverTime: now(),
         serverVersion: '0.1.0',
       };
     }
-    const members = repo.listMembers.all(teamRow.id).map((m) => buildMemberCard(m.id)).filter(Boolean);
-    const recentMessages = repo.listMessages(teamRow.id, { limit: DEFAULTS.MESSAGE_WINDOW, direction: 'desc' })
+    const members = repo.listMembers.all(projectRow.id).map((m) => buildMemberCard(m.id)).filter(Boolean);
+    const recentMessages = repo.listMessages(projectRow.id, { limit: DEFAULTS.MESSAGE_WINDOW, direction: 'desc' })
       .slice()
       .reverse()
       .map(toMessage);
     return {
-      team: teamRow,
-      teams,
+      project: projectRow,
+      projects,
       members,
-      project: context.project,
+      projectName: context.projectName,
       recentMessages,
       serverTime: now(),
       serverVersion: '0.1.0',
@@ -465,15 +480,15 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
         s.member_id
       );
       const m = repo.getMember.get(s.member_id);
-      if (m) hub.broadcast(m.team_id, WS_EVENTS.MEMBER_STATUS, buildMemberCard(s.member_id));
+      if (m) hub.broadcast(m.project_id, WS_EVENTS.MEMBER_STATUS, buildMemberCard(s.member_id));
     }
     return rows.length;
   }
 
   return {
-    teamIdOf,
+    projectIdOf,
     memberIdOf,
-    ensureTeam,
+    ensureProject,
     setContext,
     getContext: () => ({ ...context }),
     registerMember,
@@ -487,10 +502,10 @@ function createIngestBus({ repo, hub, project = '', team = null }) {
     fileTouch,
     buildMemberCard,
     buildSnapshot,
-    listTeamSummaries,
+    listProjectSummaries,
     sweepDegraded,
     toMessage,
   };
 }
 
-module.exports = { createIngestBus, teamIdOf, memberIdOf };
+module.exports = { createIngestBus, projectIdOf, memberIdOf };

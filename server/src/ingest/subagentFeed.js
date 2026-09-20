@@ -25,6 +25,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { AGENT_STATES } = require('@workgremlin/shared');
+const config = require('../config');
 
 /** 屋里只有 6 个悬浮点，多了会叠在一起；先出现的优先 */
 const MAX_GHOSTS = 6;
@@ -82,16 +83,18 @@ function normState(s) {
 }
 
 /**
- * @param {{bus: any, repo: any, team: string, workspacePath?: string, project?: string,
+ * @param {{bus: any, repo: any, project: string, workspacePath?: string, projectName?: string,
  *          intervalMs?: number, roster?: any}} opts
+ *   project  工程标识（幽灵挂在它下面）
+ *   projectName 工程显示名（幽灵头顶显示的"所属项目"）
  *   roster: 常驻小怪物名册（agentRoster 实例）。传入后，清单里的"已定义 subagent"
  *           被召唤时，会把对应小怪物的工位状态同步为忙碌，结束（从清单移除）时复位在线。
  */
 function createSubagentFeed(opts) {
   const bus = opts.bus;
   const repo = opts.repo;
-  const team = opts.team || 'workgremlin';
-  const project = opts.project || '';
+  const project = opts.project || config.DEMO_PROJECT;
+  const projectName = opts.projectName || '';
   const intervalMs = Number(opts.intervalMs) || 2000;
   const file = feedFilePath(opts.workspacePath);
   const roster = opts.roster || null;
@@ -114,7 +117,7 @@ function createSubagentFeed(opts) {
   function sync() {
     if (!running) return 0;
     const feed = readFeed(file);
-    const feedProject = feed.project || project;
+    const feedProject = feed.project || projectName;
     // 内容没变就只续心跳（否则每 2s 都会重写一遍状态行）
     const sig = JSON.stringify({ p: feedProject, a: feed.agents });
     const changed = sig !== lastSig;
@@ -125,17 +128,17 @@ function createSubagentFeed(opts) {
     for (const a of feed.agents) {
       // 加 subagent- 前缀：免得跟常驻专家重名（清单里也有个 coder 的话，会把坐在工位上的那位顶掉）
       const memberId = `subagent-${a.name}`;
-      const fullId = bus.memberIdOf(team, memberId);
+      const fullId = bus.memberIdOf(project, memberId);
       alive.add(fullId);
       if (changed) {
         bus.registerMember({
-          team,
+          project,
           memberId,
           name: a.name,
           role: 'subagent',
           sessionId: null,
           ephemeral: true,
-          project: a.project || feedProject,
+          projectLabel: a.project || feedProject,
           workspacePath: opts.workspacePath || '',
         });
       }
@@ -144,20 +147,20 @@ function createSubagentFeed(opts) {
       const known = tasks.get(fullId);
       if (a.task) {
         if (!known || known.title !== a.task) {
-          if (known) bus.endTask({ team, memberId, taskId: known.id, state: 'done' });
-          const r = bus.startTask({ team, memberId, title: a.task, progress: a.progress ?? 0, files: a.files });
+          if (known) bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
+          const r = bus.startTask({ project, memberId, title: a.task, progress: a.progress ?? 0, files: a.files });
           if (r && r.taskId) tasks.set(fullId, { id: r.taskId, title: a.task });
         } else if (a.progress !== null) {
-          bus.taskProgress({ team, memberId, taskId: known.id, progress: a.progress, files: a.files });
+          bus.taskProgress({ project, memberId, taskId: known.id, progress: a.progress, files: a.files });
         }
       } else if (known) {
-        bus.endTask({ team, memberId, taskId: known.id, state: 'done' });
+        bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
         tasks.delete(fullId);
       }
 
       // 心跳：state 变了才写历史，同时刷新 last_heartbeat_at（不然 60s 后被判 degraded）
       bus.heartbeat({
-        team,
+        project,
         memberId,
         state: normState(a.state),
         progress: a.progress,
@@ -168,7 +171,7 @@ function createSubagentFeed(opts) {
       // 并登记活跃（roster 心跳不再覆盖它）。召唤结束（从清单移除）时由下方 stale 清理复位。
       if (roster && roster.isDefined(a.name)) {
         bus.heartbeat({
-          team,
+          project,
           memberId: a.name,
           state: gremlinState(a.state),
           progress: a.progress,
@@ -179,13 +182,13 @@ function createSubagentFeed(opts) {
     }
 
     // 清单里没了 -> 幽灵散掉（含上一轮残留的临时成员）
-    const stale = repo.listEphemeral.all(team);
+    const stale = repo.listEphemeral.all(project);
     for (const m of stale) {
       if (alive.has(m.id)) continue;
       // 若这是某个已定义 subagent 的幽灵，先把对应小怪物工位复位为在线
       if (roster && m.name && roster.isDefined(m.name)) roster.markIdle(m.name);
       tasks.delete(m.id);
-      bus.removeMember({ team, memberId: m.id });
+      bus.removeMember({ project, memberId: m.id });
     }
 
     return feed.agents.length;

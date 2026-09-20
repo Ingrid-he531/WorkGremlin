@@ -99,8 +99,8 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 
 几个要点：
 
-- **报给哪个 team**：默认报进屋里「当前打开的工程」（问服务端 `/api/v1/workspace`），
-  `WORKGREMLIN_TEAM` 可覆盖；工位名默认 `codebuddy`（`WORKGREMLIN_MEMBER` 可覆盖）。
+- **报给哪个工程**：默认报进屋里「当前打开的工程」（问服务端 `/api/v1/workspace`），
+  `WORKGREMLIN_PROJECT` 可覆盖；工位名默认 `codebuddy`（`WORKGREMLIN_MEMBER` 可覆盖）。
 - **心跳**：60s 无心跳就 `degraded`（灰显 + 「推断」），所以 `SessionStart` 会另起一个 15s
   一次的心跳守护（`node packages/reporter/src/hook.js --heartbeat`），`SessionEnd` 收掉；
   会话异常退出时，最多 30 分钟没有事件就自己退，不留孤儿进程。
@@ -122,7 +122,7 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 
 | 文件 | 内容 |
 | --- | --- |
-| `workgremlin.db`（+ `-wal` / `-shm`） | **全部业务数据**：teams / members / agent_status / tasks / messages / file_activity / artifacts，权限 0600 |
+| `workgremlin.db`（+ `-wal` / `-shm`） | **全部业务数据**：projects / members / agent_status / tasks / messages / file_activity / artifacts，权限 0600 |
 | `server.json` | 端口、token、pid、version，以及当前工程名与工程目录 |
 | `workspaces.json` | 当前打开的工程 + 最近打开过的 8 个工程（重开自动恢复） |
 | `<工程>/.workgremlin/subagents.json` | 该工程的 subagent 清单（幽灵的数据源，见下节） |
@@ -131,21 +131,22 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 
 ```bash
 node -e "const D=require('better-sqlite3');const db=new D(process.env.HOME+'/.workgremlin/workgremlin.db',{readonly:true});
-console.log(db.prepare('select id,team_id,name,role,ephemeral,project from members').all());
-console.log(db.prepare('select id,workspace_path from teams').all())"
+console.log(db.prepare('select id,project_id,name,role,ephemeral,project_label from members').all());
+console.log(db.prepare('select id,workspace_path from projects').all())"
 ```
 
 ## 打开工程
 
-一个 workspace 一个 team：**打开哪个工程，屋里就显示哪个工程的成员和幽灵**。
-点顶部连接条的工程徽标 → 「打开工程…」选目录（也可以切回演示数据、或点最近打开过的工程）。
+一个 workspace 一个工程：**打开哪个工程，屋里就显示哪个工程的成员和幽灵**。
+演示数据是一条独立的**演示工程**记录，和真实工程并列（`__demo__`，显示名「演示工程」）。
+点顶部连接条的工程徽标 → 「打开工程…」选目录（也可以切到演示工程、或点最近打开过的工程）。
 选择会写进 `~/.workgremlin/workspaces.json`，重开自动恢复。
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/v1/workspace            # 当前工程
 curl -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/json' \
      -d '{"path":"/abs/path/to/project"}' http://127.0.0.1:<port>/api/v1/workspace         # 打开工程
-# path 为 "demo" 或空 -> 切回演示数据（不删真数据，只是把显示切回演示 team）
+# path 为 "demo" 或空 -> 切到演示工程（不删真数据，只是把显示切到演示工程）
 ```
 
 为什么要手工打开：磁盘上没有「当前在跑哪些 subagent」的运行态，服务端只能盯住**某个工程**下的
@@ -157,6 +158,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/jso
 | --- | --- |
 | `WORKGREMLIN_HOME` | 数据目录（覆盖 `~/.workgremlin`） |
 | `WORKGREMLIN_DB` | 数据库文件路径 |
+| `WORKGREMLIN_PROJECT` | 覆盖上报归属的工程 id（缺省跟随服务端「当前打开的工程」，也是演示工程的 id 覆盖项） |
 | `WORKGREMLIN_DEMO=1` / `MOCK=1` / `--demo` | 显式启用演示数据。默认**不**启用：首屏是空屋子，等 agent 通过 hook 上报后才有人 |
 | `WORKGREMLIN_DEMO_SEED=N` | 演示数据随机种子（同 seed 输出完全一致） |
 | `WORKGREMLIN_NO_DEMO=1` | （已废弃）默认即不自动灌演示数据，此变量保留为兼容别名 |

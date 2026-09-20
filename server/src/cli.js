@@ -40,7 +40,7 @@ async function selfTest() {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wg-selftest-')), 'test.db');
   const { repo, checkpoint, close } = openDatabase(file);
 
-  repo.upsertTeam.run({
+  repo.upsertProject.run({
     id: 'selftest',
     name: 'selftest',
     workspacePath: '/tmp',
@@ -50,7 +50,7 @@ async function selfTest() {
   });
   repo.upsertMember.run({
     id: 'coder@selftest',
-    teamId: 'selftest',
+    projectId: 'selftest',
     name: 'coder',
     role: 'test',
     sessionId: null,
@@ -62,7 +62,7 @@ async function selfTest() {
   });
   repo.insertMessage.run({
     dedupeKey: 'k1',
-    teamId: 'selftest',
+    projectId: 'selftest',
     tsMs: 1,
     fromMember: 'coder@selftest',
     toMember: null,
@@ -74,7 +74,7 @@ async function selfTest() {
     rawJson: null,
   });
   const row = repo.getMessage.get(1);
-  const teams = repo.listTeams.all();
+  const projects = repo.listProjects.all();
 
   const pragmaSecure = repo.raw.pragma('secure_delete', { simple: true });
   const pragmaWal = repo.raw.pragma('journal_mode', { simple: true });
@@ -85,7 +85,7 @@ async function selfTest() {
     ok: true,
     dbFile: file,
     read: row,
-    teams: teams.length,
+    projects: projects.length,
     secure_delete: pragmaSecure,
     journal_mode: pragmaWal,
     checkpoint: cp,

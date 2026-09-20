@@ -4,7 +4,7 @@
  * agent 侧上报 SDK（零依赖，Node >= 18 自带 fetch）。
  *
  * 用法（agent runner 内）：
- *   const rep = await createReporter({ team: 'workgremlin', member: 'coder' });
+ *   const rep = await createReporter({ project: 'my-project', member: 'coder' });
  *   const task = rep.task('实现工位视图');
  *   await task.progress(0.4, { files: ['renderer/src/components/WorkstationCard.vue'] });
  *   await task.end('done', { artifacts: [{ kind: 'file', title: 'WorkstationCard.vue', path: '...' }] });
@@ -37,7 +37,7 @@ function readServerInfo() {
 }
 
 /**
- * @param {{team: string, member: string, endpoint?: string, token?: string, heartbeatMs?: number, silent?: boolean}} opts
+ * @param {{project: string, member: string, endpoint?: string, token?: string, heartbeatMs?: number, silent?: boolean}} opts
  */
 async function createReporter(opts) {
   const info = readServerInfo();
@@ -46,14 +46,27 @@ async function createReporter(opts) {
   }
   const base = (opts.endpoint || `http://127.0.0.1:${info.port}`).replace(/\/$/, '');
   const token = opts.token || (info ? info.token : '');
-  const team = opts.team;
   const member = opts.member;
   const silent = opts.silent !== false;
+
+  /** 上报归属的工程：没显式指定就跟随服务端"当前打开的工程" */
+  let project = opts.project;
+  if (!project) {
+    try {
+      const res = await fetch(`${base}/api/v1/workspace`, {
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      });
+      const cur = res.ok ? await res.json() : null;
+      project = (cur && cur.project) || '';
+    } catch {
+      /* 服务端不可达：留空，后续上报会被拒（总比写进错的工程好） */
+    }
+  }
 
   let closed = false;
 
   async function post(route, body) {
-    const payload = { team, ...body };
+    const payload = { project, ...body };
     try {
       const res = await fetch(`${base}${route}`, {
         method: 'POST',
@@ -100,7 +113,7 @@ async function createReporter(opts) {
   }
 
   return {
-    team,
+    project,
     member,
     register: (extra = {}) => post(HTTP_ROUTES.REGISTER, { memberId: member, name: member, ...extra }),
     heartbeat: (extra = {}) => post(HTTP_ROUTES.HEARTBEAT, { memberId: member, ...extra }),

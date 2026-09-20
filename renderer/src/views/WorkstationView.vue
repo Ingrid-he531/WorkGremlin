@@ -1,30 +1,30 @@
 <script setup>
 import { computed } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
-import { useTeamStore } from '../stores/team';
+import { useProjectStore } from '../stores/project';
 
-const team = useTeamStore();
+const project = useProjectStore();
 
 const sorted = computed(() => {
   const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
-  return team.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
+  return project.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
 });
 </script>
 
 <template>
   <div class="view">
     <div class="summary">
-      <span v-for="(n, s) in team.stateCounts" :key="s" class="pill" :class="`state-${s}`">
+      <span v-for="(n, s) in project.stateCounts" :key="s" class="pill" :class="`state-${s}`">
         {{ s }} · {{ n }}
       </span>
-      <span v-if="team.degradedCount" class="pill warn">推断值 {{ team.degradedCount }}</span>
+      <span v-if="project.degradedCount" class="pill warn">推断值 {{ project.degradedCount }}</span>
     </div>
 
     <div class="grid">
       <WorkstationCard v-for="m in sorted" :key="m.memberId" :member="m" />
     </div>
 
-    <p v-if="!team.members.length" class="empty dim">暂无成员数据</p>
+    <p v-if="!project.members.length" class="empty dim">暂无成员数据</p>
   </div>
 </template>
 

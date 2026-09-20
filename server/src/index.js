@@ -31,7 +31,7 @@ const { requireToken } = require('./http/auth');
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { snapshot: registrySnapshot } = require('./sessionRegistry');
 const config = require('./config');
-const { seedDemoData, createDemoTicker } = require('./mock/generator');
+const { seedDemoData, createDemoTicker, DEMO_MEMBER_NAMES } = require('./mock/generator');
 const clock = require('./clock');
 
 const VERSION = '0.1.0';
@@ -68,14 +68,16 @@ function isLoopbackOrigin(origin) {
  */
 function createServer(opts = {}) {
   const dbPath = opts.dbPath || process.env.WORKGREMLIN_DB || config.defaultDbPath();
-  const token = opts.token || config.newToken();
+  // 传字符串（含空串）即采用：空串 = 显式关闭校验（--no-token，仅调试）；未传才生成随机 token。
+  // 注意不能用 `opts.token || newToken()` —— 空串是 falsy，会让 --no-token 静默失效。
+  const token = typeof opts.token === 'string' ? opts.token : config.newToken();
   const host = opts.host || '127.0.0.1';
 
   const { db, repo, checkpoint, startCheckpointLoop, close: closeDb } = openDatabase(dbPath);
 
   /** 当前工程：目录来自 WORKGREMLIN_WORKSPACE / 入参，否则 cwd；名字取 package.json name，回落目录名 */
   const workspacePath = resolveWorkspacePath(opts.workspacePath);
-  const project = resolveProjectName(workspacePath);
+  const projectName = resolveProjectName(workspacePath);
 
   const app = express();
   const httpServer = http.createServer(app);
@@ -83,7 +85,7 @@ function createServer(opts = {}) {
   let hub = null;
   const bus = createIngestBus({
     repo,
-    project,
+    projectName,
     hub: {
       /** @type {(...args: any[]) => void} */
       broadcast: (...args) => (hub ? hub.broadcast(...args) : undefined),
@@ -115,20 +117,20 @@ function createServer(opts = {}) {
     return next();
   });
 
-  app.use('/api/v1', createHealthRouter({ version: VERSION, project }));
+  app.use('/api/v1', createHealthRouter({ version: VERSION, projectName }));
 
   // 上报与查询需要 token；health 不需要（供 Electron 做存活探测）
   app.use('/api/v1', requireToken(token), createQueryRouter({ bus, repo }));
   app.use('/api/v1', requireToken(token), createIngestRouter({ bus }));
 
-  /** 工程（"打开工程"）：一个 workspace 一个 team，切换即换屋里显示的那批成员 */
+  /** 工程（"打开工程"）：一个 workspace 一个工程，切换即换屋里显示的那批成员 */
   const workspace = createWorkspaceManager({
     repo,
     bus,
-    initial: { workspacePath, project },
-    demoTeam: process.env.WORKGREMLIN_TEAM || 'workgremlin',
+    initial: { workspacePath, projectName },
+    demoProject: config.DEMO_PROJECT,
     preferDemo: isDemoMode(),
-    broadcast: (team, type, payload) => (hub ? hub.broadcast(team, type, payload) : undefined),
+    broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
   app.use('/api/v1', requireToken(token), createProductsRouter());
@@ -144,8 +146,12 @@ function createServer(opts = {}) {
   let demoTicker = null;
   let subagentFeed = null;
   let agentRoster = null;
-  /** 临时成员（幽灵）挂在哪个 team 上：与演示数据同一个 team */
-  const feedTeam = () => process.env.WORKGREMLIN_TEAM || 'workgremlin';
+  /**
+   * 演示数据（以及没打开工程时的幽灵/ticker）挂在哪个 project 上。
+   * 用**保留名**（config.DEMO_PROJECT，带下划线，绝不可能和真实工程 slug 撞名），
+   * 否则演示种子成员会混进同名的真实工程 project，办公室里一直挂着演示残留。
+   */
+  const demoProjectId = () => config.DEMO_PROJECT;
 
   /**
    * （重）启动 subagent 清单监听 —— 盯的是**当前打开工程**下的
@@ -158,13 +164,42 @@ function createServer(opts = {}) {
     subagentFeed = createSubagentFeed({
       bus,
       repo,
-      team: cur.team || feedTeam(),
+      project: cur.project || demoProjectId(),
       workspacePath: cur.workspacePath,
-      project: cur.project,
+      projectName: cur.projectName,
       roster: agentRoster,
     });
     subagentFeed.start();
     return subagentFeed;
+  }
+
+  /**
+   * 清理"演示残留"：老版本演示 project 的 id 就叫 workgremlin，和真实工程 slug 撞名，
+   * 于是演示种子成员（leader / researcher / tester / reviewer / ops / ghost-*）被写进了
+   * 真实工程的 project；演示 project 现已改用保留名（config.DEMO_PROJECT），这里把混进当前真实
+   * 工程 project 的这些成员摘掉。
+   *
+   * 只清**演示种子名单里**的名字，且**跳过已被 agentRoster 管理的"已定义 subagent"**
+   *（如 coder —— 那个名字现在代表真实成员，且由名册持续心跳，不能误删）。
+   * 只动成员行/状态/任务，不删历史消息（见 repo.purgeMember）。
+   */
+  function purgeDemoLeftovers() {
+    const cur = workspace.current();
+    if (!cur.workspacePath || cur.demo || !cur.project || cur.project === config.DEMO_PROJECT) return 0;
+    let n = 0;
+    for (const m of repo.listMembers.all(cur.project) || []) {
+      const name = m.name || String(m.id || '').split('@')[0];
+      if (!DEMO_MEMBER_NAMES.has(name)) continue;
+      if (agentRoster && agentRoster.isDefined(name)) continue;
+      try {
+        bus.removeMember({ project: cur.project, memberId: m.id });
+        n += 1;
+      } catch {
+        /* 单个清不掉不影响别的 */
+      }
+    }
+    if (n) console.log(`[workgremlin] 已清理 ${n} 个混进工程「${cur.projectName || cur.project}」的演示残留成员`);
+    return n;
   }
 
   /**
@@ -189,7 +224,7 @@ function createServer(opts = {}) {
       startedAt: clock.now(),
       version: VERSION,
       previousPid: existing ? existing.pid : null,
-      project,
+      projectName,
       workspacePath,
     };
     config.writeServerInfo(info);
@@ -231,20 +266,20 @@ function createServer(opts = {}) {
     // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）
     const restored = workspace.restore();
     if (info) {
-      info.project = restored.project;
+      info.projectName = restored.projectName;
       info.workspacePath = restored.workspacePath || workspacePath;
       config.writeServerInfo(info);
     }
 
     // 演示数据要在**恢复之后**再决定：上次停在演示数据、这回又没带 --demo 启动时，
-    // restore() 会把人带回 demo team，而按启动参数判定又不会灌数据、不跑心跳 —— 屋里就空了。
+    // restore() 会把人带回 demo project，而按启动参数判定又不会灌数据、不跑心跳 —— 屋里就空了。
     maybeSeedDemo(Boolean(restored.demo));
 
     if (isDemoMode() || restored.demo) {
       demoTicker = createDemoTicker({
         bus,
         repo,
-        team: feedTeam(),
+        project: demoProjectId(),
         seed: Number(opts.seed ?? process.env.WORKGREMLIN_DEMO_SEED ?? 1),
       });
       demoTicker.start();
@@ -254,9 +289,9 @@ function createServer(opts = {}) {
     // 但库里的旧行不会自动消失，会和 roster 的小怪物同名（出现"Peter/Leo 各两只"）。这里一次性删掉。
     try {
       const legacy = repo
-        .listMembers.all(feedTeam())
+        .listMembers.all(demoProjectId())
         .filter((m) => /^agent-(user|project)-/.test(m.id));
-      for (const m of legacy) bus.removeMember({ team: feedTeam(), memberId: m.id });
+      for (const m of legacy) bus.removeMember({ project: demoProjectId(), memberId: m.id });
     } catch {
       /* 清理失败不影响启动 */
     }
@@ -266,23 +301,28 @@ function createServer(opts = {}) {
     // 必须在 startFeed() 之前创建：被召唤时由 subagentFeed 同步小怪物工位状态。
     agentRoster = createAgentRoster({
       bus,
-      team: feedTeam(),
+      // 小怪物跟随"当前打开的工程"的 project（不再固定写死演示 project），换工程才跟得过去
+      getProject: () => workspace.current().project || config.DEMO_PROJECT,
       getWorkspacePath: () => workspace.current().workspacePath || workspacePath,
     });
-    // 换工程：重启 subagent 清单监听（幽灵）+ 同步小怪物名册。
+    // 换工程：重启 subagent 清单监听（幽灵）+ 同步小怪物名册 + 清掉混进来的演示残留。
     // 已定义 subagent 的"小怪物"只由 agentRoster 注册一次，避免同名两只。
     workspace.setOnSwitch(() => {
       startFeed();
       agentRoster.sync();
+      purgeDemoLeftovers();
     });
     startFeed();
     agentRoster.start();
+    // 启动时也清一遍：老版本撞名留下的演示残留
+    purgeDemoLeftovers();
 
     if (!opts.silent) {
       console.log(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
+      if (!token) console.warn('[workgremlin] 已关闭 token 校验（--no-token，仅调试用）');
       const cur = workspace.current();
-      if (cur.demo) console.log('[workgremlin] 当前：演示数据');
-      else console.log(`[workgremlin] project=${cur.project || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
+      if (cur.demo) console.log('[workgremlin] 当前：演示工程');
+      else console.log(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
       console.log(`[workgremlin] subagent 清单：${cur.feedPath}`);
     }
     return info;
@@ -296,7 +336,7 @@ function createServer(opts = {}) {
 
   /**
    * @param {boolean} [onDemoWorkspace] 恢复后当前就停在演示数据上：这种也算 demo，
-   *   否则非 --demo 启动 + 上次停在演示数据 = 恢复进 demo team 却没数据，屋里空无一人。
+   *   否则非 --demo 启动 + 上次停在演示数据 = 恢复进 demo project 却没数据，屋里空无一人。
    */
   function shouldSeedDemo(onDemoWorkspace) {
     if (opts.demo === true || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1') return true;
@@ -310,19 +350,19 @@ function createServer(opts = {}) {
 
   function maybeSeedDemo(onDemoWorkspace) {
     if (!shouldSeedDemo(onDemoWorkspace)) return null;
-    const team = process.env.WORKGREMLIN_TEAM || 'workgremlin';
+    const project = config.DEMO_PROJECT;
     // 演示数据的时间基准锚定当前时间，每次重跑都会生成新时间戳。
     // 已有数据时默认跳过（否则反复 --demo 启动会让消息无限堆积），
     // 需要重置时加 WORKGREMLIN_DEMO_REFRESH=1。
-    const existing = /** @type {{ c?: number } | undefined} */ (repo.countMessages.get(team));
+    const existing = /** @type {{ c?: number } | undefined} */ (repo.countMessages.get(project));
     if (existing && existing.c > 0 && process.env.WORKGREMLIN_DEMO_REFRESH !== '1') return null;
     const seed = Number(opts.seed ?? process.env.WORKGREMLIN_DEMO_SEED ?? 1);
     return seedDemoData({
       bus,
       seed: Number.isFinite(seed) ? seed : 1,
-      team,
-      // 演示数据不属于任何工程：绑到某个目录的话，打开这个工程就会看到这 8 个模拟成员，
-      // 还以为"打开工程没生效"。演示 team 只通过"切回演示数据"进入。
+      project,
+      // 演示数据是一条独立的「演示工程」：绑到某个目录的话，打开这个目录就会看到这 8 个模拟成员，
+      // 还以为"打开工程没生效"。演示工程只通过"切到演示工程"进入。
       workspacePath: '',
     });
   }

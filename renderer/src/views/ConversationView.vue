@@ -3,10 +3,10 @@ import { computed } from 'vue';
 import MessageList from '../components/MessageList.vue';
 import MessageFilters from '../components/MessageFilters.vue';
 import SearchBox from '../components/SearchBox.vue';
-import { useTeamStore } from '../stores/team';
+import { useProjectStore } from '../stores/project';
 import { useMessageStore } from '../stores/messages';
 
-const team = useTeamStore();
+const project = useProjectStore();
 const msgs = useMessageStore();
 
 const shown = computed(() => msgs.filtered);
@@ -16,7 +16,7 @@ const shown = computed(() => msgs.filtered);
   <div class="view">
     <div class="toolbar">
       <MessageFilters
-        :members="team.members"
+        :members="project.members"
         :model-value="msgs.filters"
         @update:model-value="msgs.setFilters($event)"
         @clear="msgs.clearFilters()"

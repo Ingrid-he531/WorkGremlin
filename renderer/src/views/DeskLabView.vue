@@ -7,9 +7,9 @@
  */
 import { computed, onUnmounted, ref } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
-import { useTeamStore } from '../stores/team';
+import { useProjectStore } from '../stores/project';
 
-const team = useTeamStore();
+const project = useProjectStore();
 
 const tick = ref(Date.now());
 const timer = setInterval(() => {
@@ -44,7 +44,7 @@ function makeMember(i, state) {
 
 const big = computed(() => STATES.map((s, i) => makeMember(i, s)));
 const grid = computed(() => ROLES.map((r, i) => makeMember(i, STATES[i % STATES.length])));
-const live = computed(() => team.members);
+const live = computed(() => project.members);
 </script>
 
 <template>

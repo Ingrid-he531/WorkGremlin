@@ -8,13 +8,13 @@ import OfficeSceneView from './views/OfficeSceneView.vue';
 import DeskLabView from './views/DeskLabView.vue';
 import WorkstationView from './views/WorkstationView.vue';
 import ConversationView from './views/ConversationView.vue';
-import { useTeamStore } from './stores/team';
+import { useProjectStore } from './stores/project';
 import { useMessageStore } from './stores/messages';
 import { useSessionStore } from './stores/sessions';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { httpBase } from './api/bridge';
 
-const team = useTeamStore();
+const project = useProjectStore();
 const msgs = useMessageStore();
 const sessions = useSessionStore();
 
@@ -30,11 +30,11 @@ const tab = ref(initialTab);
 const selectedId = ref('');
 
 async function refreshMessages() {
-  const info = team.serverInfo || {};
+  const info = project.serverInfo || {};
   const base = httpBase(info);
-  const t = team.team ? team.team.name : '';
+  const t = project.project ? project.project.name : '';
   try {
-    const res = await fetch(`${base}/api/v1/snapshot${t ? `?team=${encodeURIComponent(t)}` : ''}`, {
+    const res = await fetch(`${base}/api/v1/snapshot${t ? `?project=${encodeURIComponent(t)}` : ''}`, {
       headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
     });
     const data = await res.json();
@@ -53,28 +53,28 @@ function selectDesk(id) {
 /** 选中的会话变了 → 由 IsoOfficeView 的主控制台负责（严格跟随所选会话，办公室布局不动） */
 
 onMounted(async () => {
-  await team.init((msg) => {
+  await project.init((msg) => {
     if (msg.type === WS_EVENTS.MESSAGE_NEW) msgs.push(msg.payload);
     if (msg.type === WS_EVENTS.SNAPSHOT) msgs.setSnapshot(msg.payload.recentMessages || []);
     // 会话（开/关工程·会话）实时推送：立即刷新楼层与下拉，不等 10s 轮询
     if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
   });
   await refreshMessages();
-  await sessions.refresh(team.serverInfo || {});
-  sessions.startPolling(team.serverInfo || {});
+  await sessions.refresh(project.serverInfo || {});
+  sessions.startPolling(project.serverInfo || {});
 });
 
 onUnmounted(() => {
   sessions.stopPolling();
-  team.dispose();
+  project.dispose();
 });
 </script>
 
 <template>
   <div class="app">
     <ConnectionBar
-      :connection="team.connection"
-      :project="sessions.selected ? sessions.selected.project : team.project"
+      :connection="project.connection"
+      :project="sessions.selected ? sessions.selected.project : project.projectName"
       :source="sessions.selected ? (sessions.selected.inferred ? 'inferred' : 'reported') : ''"
     />
 

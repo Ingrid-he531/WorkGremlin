@@ -24,7 +24,7 @@
  *      所以 SessionStart 会另起一个守护进程按 15s 心跳，免得 agent 一思考就灰。
  *
  * 环境变量：
- *   WORKGREMLIN_TEAM        team 名（缺省用服务端"当前打开的工程"那个 team）
+ *   WORKGREMLIN_PROJECT        project 名（缺省用服务端"当前打开的工程"那个 project）
  *   WORKGREMLIN_MEMBER      工位名（缺省 codebuddy）
  *   WORKGREMLIN_ROLE        角色（缺省 agent）
  *   WORKGREMLIN_HOOK_DEBUG=1      把失败原因打到 stderr
@@ -171,16 +171,17 @@ async function request(info, route, body) {
 }
 
 /**
- * 上报到哪个 team：环境变量 > 服务端"当前打开的工程" > 回落 workgremlin。
- * 顺带把 workspacePath 也带回来 —— register 会 upsert team，
+ * 上报到哪个工程：环境变量 > 服务端"当前打开的工程"（唯一的正常来源）。
+ * 服务端不可达时才留空 —— 留空什么都不会归属错，宁可不上报也不写进别的工程。
+ * 顺带把 workspacePath 也带回来 —— register 会 upsert 工程，
  * 用服务端现有的值回写，才不会把"打开工程"记的工程目录改掉。
  * @param {{port: number, token?: string}} info
  */
 async function resolveCtx(info) {
-  const fallback = { team: 'workgremlin', workspacePath: '' };
+  const fallback = { project: '', workspacePath: '' };
   const cur = await request(info, WORKSPACE_ROUTE, null);
-  const team = String(process.env.WORKGREMLIN_TEAM || '').trim() || (cur && cur.team) || fallback.team;
-  return { team, workspacePath: (cur && cur.workspacePath) || fallback.workspacePath };
+  const project = String(process.env.WORKGREMLIN_PROJECT || '').trim() || (cur && cur.project) || fallback.project;
+  return { project, workspacePath: (cur && cur.workspacePath) || fallback.workspacePath };
 }
 
 /** 工具输入里的文件路径（CLI 风格 file_path / IDE 风格 filePath 都认） */
@@ -340,7 +341,7 @@ async function runHeartbeat(info, member) {
   const file = statePath(member);
   const startedAt = Date.now();
   const ctx = await resolveCtx(info);
-  const body = { team: ctx.team, workspacePath: ctx.workspacePath, memberId: member };
+  const body = { project: ctx.project, workspacePath: ctx.workspacePath, memberId: member };
   writeState(file, { hb: { pid: process.pid, startedAt, lastEventAt: Date.now() } });
 
   const stop = () => {
@@ -387,7 +388,7 @@ async function main() {
   trace(event, { member, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const ctx = await resolveCtx(info);
-  const base = { team: ctx.team, workspacePath: ctx.workspacePath };
+  const base = { project: ctx.project, workspacePath: ctx.workspacePath };
   const file = statePath(member);
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
 

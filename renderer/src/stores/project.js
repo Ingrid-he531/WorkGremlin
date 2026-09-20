@@ -3,14 +3,17 @@ import { getServerInfo, getFlags, getWorkspace, openWorkspace, wsUrl } from '../
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
 
-/** 工位视图 + 连接状态 */
-export const useTeamStore = defineStore('team', {
+/** 工位视图 + 连接状态（当前工程的成员 / 幽灵 / 连接） */
+export const useProjectStore = defineStore('project', {
   state: () => ({
-    teams: [],
-    team: null,
+    /** 全部工程（演示工程和真实工程并列） */
+    projects: [],
+    /** 当前工程 */
+    project: null,
     members: [],
-    /** 当前工程名（server 解析：package.json name > 目录名） */
-    project: '',
+    /** 当前工程显示名（server 解析：package.json name > 目录名；演示工程为固定名） */
+    projectName: '',
+    /** 当前工程根目录（演示工程为空） */
     workspacePath: '',
     /** 当前工程的 subagent 清单文件路径（幽灵的数据源） */
     feedPath: '',
@@ -37,7 +40,7 @@ export const useTeamStore = defineStore('team', {
     async init(onMessage) {
       const info = await getServerInfo();
       this.serverInfo = info;
-      this.project = info.project || '';
+      this.projectName = info.projectName || '';
       const flags = await getFlags();
       this.flags = flags;
       this.demo = Boolean(flags.demo);
@@ -48,7 +51,7 @@ export const useTeamStore = defineStore('team', {
       this._conn = createConnection({
         url: wsUrl(info),
         token: info.token,
-        team: null,
+        project: null,
         onEvent: (msg) => {
           switch (msg.type) {
             case WS_EVENTS.SNAPSHOT:
@@ -75,10 +78,10 @@ export const useTeamStore = defineStore('team', {
     },
 
     applySnapshot(snapshot) {
-      this.team = snapshot.team;
-      this.teams = snapshot.teams || [];
+      this.project = snapshot.project;
+      this.projects = snapshot.projects || [];
       this.members = snapshot.members || [];
-      if (snapshot.project) this.project = snapshot.project;
+      if (snapshot.projectName) this.projectName = snapshot.projectName;
     },
 
     /** @param {any} card */
@@ -98,7 +101,7 @@ export const useTeamStore = defineStore('team', {
 
     applyWorkspace(ws) {
       if (!ws) return;
-      this.project = ws.project || '';
+      this.projectName = ws.projectName || '';
       this.workspacePath = ws.workspacePath || '';
       this.feedPath = ws.feedPath || '';
       this.recent = Array.isArray(ws.recent) ? ws.recent : [];
@@ -106,7 +109,7 @@ export const useTeamStore = defineStore('team', {
     },
 
     /**
-     * 打开工程：屋里的成员/幽灵整体切到这个工程。path 为空 / 'demo' 切回演示数据。
+     * 打开工程：屋里的成员/幽灵整体切到这个工程。path 为空 / 'demo' 切到演示工程。
      * 服务端会广播新快照，这里不用自己拉。
      * @param {string} path
      */
@@ -114,25 +117,6 @@ export const useTeamStore = defineStore('team', {
       const cur = await openWorkspace(this.serverInfo || {}, path);
       this.applyWorkspace(cur);
       return cur;
-    },
-
-    /** 切换团队（单 workspace 下可有多个 team） */
-    async switchTeam(name) {
-      if (this._conn) this._conn.subscribe({ team: name });
-    },
-
-    /**
-     * 下拉里选了一个"工程"：它属于别的目录就真正打开那个工程（换监听根 + 幽灵数据源），
-     * 只切订阅会出现"屋里是 A 的成员、幽灵是 B 的"这种错位。
-     * @param {string} name team 名
-     */
-    async selectTeam(name) {
-      const t = this.teams.find((x) => x.name === name);
-      if (t && t.workspacePath && this.workspacePath && t.workspacePath !== this.workspacePath) {
-        await this.openWorkspace(t.workspacePath);
-        return;
-      }
-      this.switchTeam(name);
     },
 
     dispose() {

@@ -28,42 +28,42 @@ function createIngestRouter({ bus }) {
     }
   };
 
-  const teamFirst = (fn) =>
+  const projectFirst = (fn) =>
     wrap((body) => {
-      const team = body.team || body.teamId;
-      if (!team) return { ok: false, error: 'missing team' };
-      bus.ensureTeam(team, body.workspacePath || '', body.mainConversationId || null, 'report');
-      return fn({ ...body, team });
+      const project = body.project || body.projectId;
+      if (!project) return { ok: false, error: 'missing project' };
+      bus.ensureProject(project, body.workspacePath || '', body.mainConversationId || null, 'report');
+      return fn({ ...body, project });
     });
 
-  router.post('/register', teamFirst((b) => ({ ok: true, memberId: bus.registerMember(b) })));
+  router.post('/register', projectFirst((b) => ({ ok: true, memberId: bus.registerMember(b) })));
 
   router.post(
     '/heartbeat',
-    teamFirst((b) =>
+    projectFirst((b) =>
       b.memberId
         ? bus.heartbeat(b)
         : { ok: false, error: 'missing memberId' }
     )
   );
 
-  router.post('/status', teamFirst((b) => (b.memberId ? bus.setStatus(b) : { ok: false, error: 'missing memberId' })));
+  router.post('/status', projectFirst((b) => (b.memberId ? bus.setStatus(b) : { ok: false, error: 'missing memberId' })));
 
-  router.post('/task/start', teamFirst((b) => (b.memberId ? bus.startTask(b) : { ok: false, error: 'missing memberId' })));
+  router.post('/task/start', projectFirst((b) => (b.memberId ? bus.startTask(b) : { ok: false, error: 'missing memberId' })));
 
   router.post(
     '/task/progress',
-    teamFirst((b) => (b.memberId && b.taskId ? bus.taskProgress(b) : { ok: false, error: 'missing memberId/taskId' }))
+    projectFirst((b) => (b.memberId && b.taskId ? bus.taskProgress(b) : { ok: false, error: 'missing memberId/taskId' }))
   );
 
   router.post(
     '/task/end',
-    teamFirst((b) => (b.memberId && b.taskId ? bus.endTask(b) : { ok: false, error: 'missing memberId/taskId' }))
+    projectFirst((b) => (b.memberId && b.taskId ? bus.endTask(b) : { ok: false, error: 'missing memberId/taskId' }))
   );
 
-  router.post('/message', teamFirst((b) => (b.from ? bus.recordMessage({ ...b, source: 'report' }) : { ok: false, error: 'missing from' })));
+  router.post('/message', projectFirst((b) => (b.from ? bus.recordMessage({ ...b, source: 'report' }) : { ok: false, error: 'missing from' })));
 
-  router.post('/file/touch', teamFirst((b) => (b.memberId ? bus.fileTouch(b) : { ok: false, error: 'missing memberId' })));
+  router.post('/file/touch', projectFirst((b) => (b.memberId ? bus.fileTouch(b) : { ok: false, error: 'missing memberId' })));
 
   return router;
 }

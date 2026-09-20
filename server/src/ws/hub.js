@@ -3,7 +3,7 @@
 /**
  * WebSocket 集线器：连接管理、订阅过滤、事件广播。
  *
- * 客户端首帧必须是 {type:'hello', token, team, filters}；也可以在 URL 上带 ?token=。
+ * 客户端首帧必须是 {type:'hello', token, project, filters}；也可以在 URL 上带 ?token=。
  * 服务端推送统一走 envelope（见 shared/index.js）。
  */
 
@@ -15,13 +15,13 @@ const { PROTOCOL_VERSION, WS_EVENTS, CLIENT_EVENTS, DEFAULTS, envelope } = requi
  */
 function createHub({ server, token, bus, repo }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 4 * 1024 * 1024 });
-  /** @type {Set<{ws: any, team: string|null, filters: any, authed: boolean}>} */
+  /** @type {Set<{ws: any, project: string|null, filters: any, authed: boolean}>} */
   const clients = new Set();
 
   function send(conn, type, payload) {
     if (conn.ws.readyState !== 1) return;
     try {
-      conn.ws.send(JSON.stringify(envelope(type, conn.team || '', 'server', payload)));
+      conn.ws.send(JSON.stringify(envelope(type, conn.project || '', 'server', payload)));
     } catch {
       /* ignore */
     }
@@ -48,7 +48,7 @@ function createHub({ server, token, bus, repo }) {
     const queryToken = url.searchParams.get('token');
     const conn = {
       ws,
-      team: url.searchParams.get('team') || null,
+      project: url.searchParams.get('project') || null,
       filters: {},
       authed: !token || queryToken === token,
     };
@@ -74,22 +74,22 @@ function createHub({ server, token, bus, repo }) {
 
       switch (msg.type) {
         case CLIENT_EVENTS.HELLO:
-          conn.team = msg.team || conn.team;
+          conn.project = msg.project || conn.project;
           conn.filters = msg.filters || conn.filters;
-          // 没指定 team 也要回一份快照（buildSnapshot(null) 会用"当前打开的工程"对应的团队）：
+          // 没指定 project 也要回一份快照（buildSnapshot(null) 会用"当前打开的工程"对应的团队）：
           // 否则客户端连上后一帧都收不到，只能等后续推送（roster 心跳最长 15s）——
           // 表现就是成员/小怪物"很久才出现"。
-          send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.team));
+          send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.project));
           break;
         case CLIENT_EVENTS.SUBSCRIBE:
           conn.filters = msg.filters || {};
-          if (msg.team) conn.team = msg.team;
-          send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.team));
+          if (msg.project) conn.project = msg.project;
+          send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.project));
           break;
         case CLIENT_EVENTS.BACKFILL: {
-          if (!conn.team) break;
+          if (!conn.project) break;
           const items = repo
-            .listMessages(conn.team, {
+            .listMessages(conn.project, {
               ...(conn.filters || {}),
               beforeId: msg.beforeId,
               limit: msg.limit || 100,
@@ -121,15 +121,15 @@ function createHub({ server, token, bus, repo }) {
   });
 
   /**
-   * 广播。team 为 null 表示广播给所有连接。
-   * @param {string|null} team
+   * 广播。project 为 null 表示广播给所有连接。
+   * @param {string|null} project
    * @param {string} type
    * @param {unknown} payload
    */
-  function broadcast(team, type, payload) {
+  function broadcast(project, type, payload) {
     for (const conn of clients) {
       if (!conn.authed) continue;
-      if (team && conn.team && conn.team !== team) continue;
+      if (project && conn.project && conn.project !== project) continue;
       if (type === WS_EVENTS.MESSAGE_NEW && !matchesFilters(conn, payload)) continue;
       send(conn, type, payload);
     }

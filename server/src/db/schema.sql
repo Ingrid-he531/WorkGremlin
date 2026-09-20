@@ -5,22 +5,26 @@
 --   * JSON 字段用 TEXT 存储
 --   * 安全基线：PRAGMA secure_delete=ON 在 **每个连接** 打开时由 db/index.js 设置（该 PRAGMA 不持久化）
 --
+-- 领域模型：**工程（project）** 是唯一的归属单位 —— 一个工程目录一条 projects 记录，
+-- 成员 / 任务 / 消息 / 事件都挂在 project_id 上。演示数据是一条独立的"演示工程"记录，
+-- 和真实工程并列（不再有 team 概念）。
+--
 -- 安全说明：真正的防线是 **脱敏在入库与建 FTS 索引之前** 完成；
 -- 本 schema 里的 content / raw_json 只允许存放已脱敏内容。
 
-CREATE TABLE IF NOT EXISTS teams (
-  id                    TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS projects (
+  id                    TEXT PRIMARY KEY,   -- 工程标识（由目录名 slug 而来）
   name                  TEXT NOT NULL,
   workspace_path        TEXT NOT NULL,
   main_conversation_id  TEXT,
   source                TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch', 'timeout')),
   created_at            INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_teams_ws ON teams(workspace_path);
+CREATE INDEX IF NOT EXISTS idx_projects_ws ON projects(workspace_path);
 
 CREATE TABLE IF NOT EXISTS members (
-  id             TEXT PRIMARY KEY,          -- "leader@workgremlin"
-  team_id        TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  id             TEXT PRIMARY KEY,          -- "leader@my-project"
+  project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   name           TEXT NOT NULL,
   role           TEXT,
   session_id     TEXT,
@@ -30,9 +34,9 @@ CREATE TABLE IF NOT EXISTS members (
   -- 临时成员（无工位，场景里是幽灵）：subagent 这类"随项目临时组队"的成员
   ephemeral      INTEGER NOT NULL DEFAULT 0,
   -- 临时成员所属项目名（缺省时 UI 回落到 role）
-  project        TEXT
+  project_label  TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_members_team ON members(team_id, name);
+CREATE INDEX IF NOT EXISTS idx_members_project ON members(project_id, name);
 
 -- 每个成员一行最新状态（UPSERT）。B 路线为唯一真值；A 路线/超时只写 degraded=1
 CREATE TABLE IF NOT EXISTS agent_status (
@@ -61,7 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_status_hist_member_ts ON agent_status_history(mem
 
 CREATE TABLE IF NOT EXISTS tasks (
   id              TEXT PRIMARY KEY,
-  team_id         TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   member_id       TEXT NOT NULL,
   parent_task_id  TEXT,
   title           TEXT NOT NULL,
@@ -71,12 +75,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   ended_at        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_member_state ON tasks(member_id, state);
-CREATE INDEX IF NOT EXISTS idx_tasks_team_started ON tasks(team_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_started ON tasks(project_id, started_at);
 
 CREATE TABLE IF NOT EXISTS messages (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,  -- 游标 / 虚拟滚动
   dedupe_key   TEXT UNIQUE,                        -- A/B 去重
-  team_id      TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   ts_ms        INTEGER NOT NULL,
   from_member  TEXT NOT NULL,
   to_member    TEXT,                               -- NULL = 广播
@@ -91,11 +95,11 @@ CREATE TABLE IF NOT EXISTS messages (
   -- 1 = 正文被截断存储（原始长度超过阈值时只留摘要），UI 需显示"内容已截断"
   content_truncated INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_messages_team_ts   ON messages(team_id, ts_ms DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_from      ON messages(team_id, from_member, ts_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_to        ON messages(team_id, to_member, ts_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_type      ON messages(team_id, type, ts_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_archived  ON messages(team_id, archived_at);
+CREATE INDEX IF NOT EXISTS idx_messages_project_ts   ON messages(project_id, ts_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_from         ON messages(project_id, from_member, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_to           ON messages(project_id, to_member, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_type         ON messages(project_id, type, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_archived     ON messages(project_id, archived_at);
 
 -- 中文搜索：必须用 trigram（unicode61 会把整段中文当成一个 token，中文搜索不可用）
 -- 注意：trigram 对 <3 字的查询召回差，M2 需在搜索层把 1~2 字查询降级为 LIKE 扫描并限定时间范围。
@@ -137,9 +141,9 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_member_ts ON artifacts(member_id, ts_ms
 
 CREATE TABLE IF NOT EXISTS events (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
-  team_id  TEXT,
+  project_id TEXT,
   ts_ms    INTEGER NOT NULL,
   kind     TEXT NOT NULL,
   payload_json TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_events_team_ts ON events(team_id, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_events_project_ts ON events(project_id, ts_ms DESC);

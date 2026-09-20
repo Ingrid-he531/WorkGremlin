@@ -47,7 +47,7 @@ function ensureColumn(db, table, column, ddl) {
 /** @param {import('better-sqlite3').Database} db */
 function migrate(db) {
   ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(db, 'members', 'project', 'project TEXT');
+  ensureColumn(db, 'members', 'project_label', 'project_label TEXT');
   ensureAgentStatusThinking(db);
 }
 
@@ -157,32 +157,32 @@ function openDatabase(dbPath) {
  */
 function createRepo(db) {
   const stmt = {
-    upsertTeam: db.prepare(`
-      INSERT INTO teams (id, name, workspace_path, main_conversation_id, source, created_at)
+    upsertProject: db.prepare(`
+      INSERT INTO projects (id, name, workspace_path, main_conversation_id, source, created_at)
       VALUES (@id, @name, @workspacePath, @mainConversationId, @source, @createdAt)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         workspace_path = excluded.workspace_path,
         main_conversation_id = excluded.main_conversation_id
     `),
-    listTeams: db.prepare(`SELECT * FROM teams ORDER BY created_at DESC`),
-    getTeam: db.prepare(`SELECT * FROM teams WHERE id = ?`),
-    getTeamByWorkspace: db.prepare(`SELECT * FROM teams WHERE workspace_path = ?`),
+    listProjects: db.prepare(`SELECT * FROM projects ORDER BY created_at DESC`),
+    getProject: db.prepare(`SELECT * FROM projects WHERE id = ?`),
+    getProjectByWorkspace: db.prepare(`SELECT * FROM projects WHERE workspace_path = ?`),
 
     upsertMember: db.prepare(`
-      INSERT INTO members (id, team_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project)
-      VALUES (@id, @teamId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @project)
+      INSERT INTO members (id, project_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project_label)
+      VALUES (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @projectLabel)
       ON CONFLICT(id) DO UPDATE SET
         role = COALESCE(excluded.role, members.role),
         session_id = COALESCE(excluded.session_id, members.session_id),
         reported = MAX(members.reported, excluded.reported),
         last_seen_at = MAX(COALESCE(members.last_seen_at, 0), COALESCE(excluded.last_seen_at, 0)),
         ephemeral = MAX(members.ephemeral, excluded.ephemeral),
-        project = COALESCE(excluded.project, members.project)
+        project_label = COALESCE(excluded.project_label, members.project_label)
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
-    listMembers: db.prepare(`SELECT * FROM members WHERE team_id = ? ORDER BY name`),
-    listEphemeral: db.prepare(`SELECT * FROM members WHERE team_id = ? AND ephemeral = 1`),
+    listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),
+    listEphemeral: db.prepare(`SELECT * FROM members WHERE project_id = ? AND ephemeral = 1`),
     touchMember: db.prepare(`UPDATE members SET last_seen_at = ? WHERE id = ?`),
 
     upsertStatus: db.prepare(`
@@ -205,15 +205,15 @@ function createRepo(db) {
     listStatuses: db.prepare(`
       SELECT s.* FROM agent_status s
       JOIN members m ON m.id = s.member_id
-      WHERE m.team_id = ?
+      WHERE m.project_id = ?
     `),
     insertStatusHistory: db.prepare(`
       INSERT INTO agent_status_history (member_id, state, ts_ms, reason, source) VALUES (?, ?, ?, ?, ?)
     `),
 
     insertTask: db.prepare(`
-      INSERT INTO tasks (id, team_id, member_id, parent_task_id, title, state, progress, started_at, ended_at)
-      VALUES (@id, @teamId, @memberId, @parentTaskId, @title, @state, @progress, @startedAt, @endedAt)
+      INSERT INTO tasks (id, project_id, member_id, parent_task_id, title, state, progress, started_at, ended_at)
+      VALUES (@id, @projectId, @memberId, @parentTaskId, @title, @state, @progress, @startedAt, @endedAt)
       ON CONFLICT(id) DO UPDATE SET
         title = excluded.title, state = excluded.state,
         progress = COALESCE(excluded.progress, tasks.progress),
@@ -227,17 +227,17 @@ function createRepo(db) {
       WHERE id = @id
     `),
     getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
-    listTasks: db.prepare(`SELECT * FROM tasks WHERE team_id = ? ORDER BY started_at DESC`),
+    listTasks: db.prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY started_at DESC`),
 
     insertMessage: db.prepare(`
-      INSERT INTO messages (dedupe_key, team_id, ts_ms, from_member, to_member, type, subject, content, task_id, source, raw_json)
-      VALUES (@dedupeKey, @teamId, @tsMs, @fromMember, @toMember, @type, @subject, @content, @taskId, @source, @rawJson)
+      INSERT INTO messages (dedupe_key, project_id, ts_ms, from_member, to_member, type, subject, content, task_id, source, raw_json)
+      VALUES (@dedupeKey, @projectId, @tsMs, @fromMember, @toMember, @type, @subject, @content, @taskId, @source, @rawJson)
       ON CONFLICT(dedupe_key) DO NOTHING
     `),
     getMessage: db.prepare(`SELECT * FROM messages WHERE id = ?`),
-    countMessages: db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE team_id = ?`),
+    countMessages: db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE project_id = ?`),
     countMessagesFor: db.prepare(
-      `SELECT COUNT(*) AS c FROM messages WHERE team_id = ? AND (from_member = ? OR to_member = ?)`
+      `SELECT COUNT(*) AS c FROM messages WHERE project_id = ? AND (from_member = ? OR to_member = ?)`
     ),
 
     insertFileActivity: db.prepare(`
@@ -257,19 +257,19 @@ function createRepo(db) {
     `),
     listArtifacts: db.prepare(`SELECT * FROM artifacts WHERE member_id = ? ORDER BY ts_ms DESC LIMIT ?`),
 
-    insertEvent: db.prepare(`INSERT INTO events (team_id, ts_ms, kind, payload_json) VALUES (?, ?, ?, ?)`),
+    insertEvent: db.prepare(`INSERT INTO events (project_id, ts_ms, kind, payload_json) VALUES (?, ?, ?, ?)`),
   };
 
   /**
    * 消息查询：按成员 / 类型 / 时间过滤 + 关键字搜索 + 游标分页。
    * M0 用 LIKE；M2 切换到 FTS5 trigram（<3 字查询自动降级为 LIKE，见 README 说明）。
-   * @param {string} teamId
+   * @param {string} projectId
    * @param {{members?: string[], types?: string[], since?: number, until?: number, keyword?: string, direction?: string, beforeId?: number, afterId?: number, limit?: number}} f
    */
-  function listMessages(teamId, f = {}) {
+  function listMessages(projectId, f = {}) {
     const limit = Math.min(Math.max(Number(f.limit) || 100, 1), 1000);
-    const where = ['team_id = @teamId'];
-    const params = { teamId, limit };
+    const where = ['project_id = @projectId'];
+    const params = { projectId, limit };
 
     if (f.members && f.members.length) {
       const ph = f.members.map((_, i) => `@m${i}`);
@@ -313,25 +313,25 @@ function createRepo(db) {
   }
 
   /**
-   * 删除（归档）某个团队的全部数据 —— 演示 secure_delete + TRUNCATE 的完整链路。
+   * 删除（归档）某个工程的全部数据 —— 演示 secure_delete + TRUNCATE 的完整链路。
    * 真实归档/保留策略在 M2 落地；此处保证"删了就真的抹掉"。
-   * @param {string} teamId
+   * @param {string} projectId
    */
-  function purgeTeam(teamId) {
+  function purgeProject(projectId) {
     const tx = db.transaction((id) => {
-      db.prepare('DELETE FROM messages WHERE team_id = ?').run(id);
-      db.prepare('DELETE FROM tasks WHERE team_id = ?').run(id);
-      db.prepare('DELETE FROM file_activity WHERE member_id IN (SELECT id FROM members WHERE team_id = ?)').run(id);
-      db.prepare('DELETE FROM artifacts WHERE member_id IN (SELECT id FROM members WHERE team_id = ?)').run(id);
-      db.prepare('DELETE FROM agent_status WHERE member_id IN (SELECT id FROM members WHERE team_id = ?)').run(id);
-      db.prepare('DELETE FROM agent_status_history WHERE member_id IN (SELECT id FROM members WHERE team_id = ?)').run(
+      db.prepare('DELETE FROM messages WHERE project_id = ?').run(id);
+      db.prepare('DELETE FROM tasks WHERE project_id = ?').run(id);
+      db.prepare('DELETE FROM file_activity WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
+      db.prepare('DELETE FROM artifacts WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
+      db.prepare('DELETE FROM agent_status WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
+      db.prepare('DELETE FROM agent_status_history WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(
         id
       );
-      db.prepare('DELETE FROM members WHERE team_id = ?').run(id);
-      db.prepare('DELETE FROM events WHERE team_id = ?').run(id);
-      db.prepare('DELETE FROM teams WHERE id = ?').run(id);
+      db.prepare('DELETE FROM members WHERE project_id = ?').run(id);
+      db.prepare('DELETE FROM events WHERE project_id = ?').run(id);
+      db.prepare('DELETE FROM projects WHERE id = ?').run(id);
     });
-    tx(teamId);
+    tx(projectId);
     // secure_delete 只保证 freelist 页被覆写；WAL 里的旧页要靠 TRUNCATE 清掉
     db.pragma('wal_checkpoint(TRUNCATE)');
   }
@@ -353,7 +353,7 @@ function createRepo(db) {
     tx(memberId);
   }
 
-  return { ...stmt, listMessages, purgeTeam, purgeMember, raw: db };
+  return { ...stmt, listMessages, purgeProject, purgeMember, raw: db };
 }
 
 module.exports = { openDatabase, createRepo, applyPragmas, migrate, SCHEMA_PATH };

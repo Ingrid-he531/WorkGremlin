@@ -33,6 +33,6 @@ export function isEphemeralMember(member) {
 /** 临时成员所属项目名（缺省回落到 role / name） */
 export function projectLabelOf(member) {
   if (!member) return '';
-  const raw = String(member.project || member.role || member.name || '');
+  const raw = String(member.projectLabel || member.role || member.name || '');
   return raw.replace(/^临时项目\s*[·:：\-]?\s*/, '').trim();
 }

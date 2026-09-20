@@ -4,7 +4,7 @@
 /**
  * 命令行上报（供 shell hook / 不想改 agent 代码时调用）：
  *
- *   node packages/reporter/src/cli.js --team workgremlin --member coder --state busy
+ *   node packages/reporter/src/cli.js --project my-project --member coder --state busy
  *   node packages/reporter/src/cli.js --member coder --task "实现工位视图" --progress 0.4 --file a.vue b.vue
  *   node packages/reporter/src/cli.js --member coder --task-end done --artifact "文件:docs/tech-design.md"
  *   node packages/reporter/src/cli.js --member coder --message --to leader --type result --subject "产出" --content "已提交"
@@ -34,7 +34,8 @@ function parseArgs(argv) {
 
 async function main() {
   const { flags, files } = parseArgs(process.argv.slice(2));
-  const team = flags.team || process.env.WORKGREMLIN_TEAM || 'workgremlin';
+  // 不传 --project 就由 createReporter 跟随服务端"当前打开的工程"
+  const project = flags.project || process.env.WORKGREMLIN_PROJECT || '';
   const member = flags.member || process.env.WORKGREMLIN_MEMBER;
 
   if (!member) {
@@ -42,7 +43,7 @@ async function main() {
     process.exit(2);
   }
 
-  const rep = await createReporter({ team, member, silent: false });
+  const rep = await createReporter({ project, member, silent: false });
 
   try {
     if (flags.state) await rep.status(flags.state, typeof flags.reason === 'string' ? flags.reason : undefined);

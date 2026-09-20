@@ -3,7 +3,7 @@
 /**
  * 工程管理（"打开工程"）。
  *
- * 一个 workspace 一个 team：打开哪个工程，屋里就显示哪个工程的成员（含这个工程下的 subagent 幽灵）。
+ * 一个 workspace 一个 project：打开哪个工程，屋里就显示哪个工程的成员（含这个工程下的 subagent 幽灵）。
  * 选择会落盘到 ~/.workgremlin/workspaces.json，重开还在；演示数据作为一项可随时切回。
  *
  * 为什么要手工打开：磁盘上没有"当前在跑哪些 subagent"的运行态，
@@ -44,7 +44,7 @@ function writeStore(data) {
   return file;
 }
 
-/** 工程目录名 -> team id */
+/** 工程目录名 -> project id */
 function slug(name) {
   return (
     String(name || '')
@@ -63,21 +63,21 @@ function expand(p) {
 }
 
 /**
- * @param {{repo: any, bus: any, initial?: {workspacePath?: string, project?: string},
- *          demoTeam?: string, broadcast?: (team: string|null, type: string, payload: unknown) => void}} opts
+ * @param {{repo: any, bus: any, initial?: {workspacePath?: string, projectName?: string},
+ *          demoProject?: string, broadcast?: (project: string|null, type: string, payload: unknown) => void}} opts
  */
 function createWorkspaceManager(opts) {
   const repo = opts.repo;
   const bus = opts.bus;
-  const demoTeam = opts.demoTeam || 'workgremlin';
+  const demoProject = opts.demoProject || config.DEMO_PROJECT;
   const initial = opts.initial || {};
   const broadcast = opts.broadcast || (() => {});
 
-  /** @type {{workspacePath: string, project: string, team: string|null, demo: boolean}} */
+  /** @type {{workspacePath: string, projectName: string, project: string|null, demo: boolean}} */
   let current = {
     workspacePath: initial.workspacePath || '',
-    project: initial.project || '',
-    team: null,
+    projectName: initial.projectName || '',
+    project: null,
     demo: false,
   };
   let recent = [];
@@ -94,7 +94,7 @@ function createWorkspaceManager(opts) {
 
   /** 切换生效：更新 bus 上下文 -> 落盘 -> 通知 -> 广播新快照 */
   function apply() {
-    bus.setContext({ project: current.project, team: current.team });
+    bus.setContext({ projectName: current.projectName, project: current.project, workspacePath: current.workspacePath });
     persist();
     if (onSwitch) onSwitch(current);
     broadcast(null, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(null));
@@ -113,32 +113,51 @@ function createWorkspaceManager(opts) {
     }
     if (!st || !st.isDirectory()) throw new Error(`不是目录：${abs}`);
 
-    const project = resolveProjectName(abs);
-    // 同一个目录复用同一个 team；不同目录同名就加后缀，别互相顶掉
-    let row = repo.getTeamByWorkspace.get(abs);
+    const projectName = resolveProjectName(abs);
+    // 同一个目录复用同一个工程；不同目录同名就加后缀，别互相顶掉
+    let row = repo.getProjectByWorkspace.get(abs);
     if (!row) {
-      let id = slug(project);
+      let id = slug(projectName);
       let n = 2;
-      while (repo.getTeam.get(id)) {
-        id = `${slug(project)}-${n}`;
+      while (repo.getProject.get(id)) {
+        id = `${slug(projectName)}-${n}`;
         n += 1;
       }
-      bus.ensureTeam(id, abs, null, 'report');
-      row = repo.getTeam.get(id);
+      bus.ensureProject(id, abs, null, 'report');
+      row = repo.getProject.get(id);
     }
-    current = { workspacePath: abs, project, team: row.id, demo: false };
-    pushRecent({ path: abs, project, team: row.id, openedAt: Date.now() });
+    current = { workspacePath: abs, projectName, project: row.id, demo: false };
+    pushRecent({ path: abs, projectName, project: row.id, openedAt: Date.now() });
     return apply();
   }
 
-  /** 切回演示数据（不删库里的真数据，只是把显示切到演示 team） */
+  /** 切到演示工程（不删库里的真数据，只是把显示切到演示工程） */
   function openDemo() {
-    bus.ensureTeam(demoTeam, '', null, 'report');
-    current = { workspacePath: '', project: '', team: demoTeam, demo: true };
+    bus.ensureProject(demoProject, '', null, 'report');
+    current = { workspacePath: '', projectName: config.DEMO_PROJECT_NAME, project: demoProject, demo: true };
     return apply();
   }
 
-  /** 启动时恢复上次打开的工程；目录已经没了就保持默认（cwd / --workspace） */
+  /**
+   * 兜底：把"启动时解析出来的工程"（cwd / --workspace）真正 open 一次。
+   *
+   * 关键：必须走 open() —— 它会把 current.project 落成这个工程对应的 project，并 setContext 交给 bus。
+   * 老代码在兜底分支直接 `return {...current}`，project 仍是 null；而 buildSnapshot 在拿不到
+   * project 时会回落到 projects[0]（可能正是演示/被污染的 project），办公室就挂着错的成员，
+   * 跟不上当前会话。目录不存在 / 没路径就原样返回（此时确实没有"当前工程"可言）。
+   */
+  function openInitial() {
+    if (initial.workspacePath) {
+      try {
+        return open(initial.workspacePath);
+      } catch {
+        /* 目录没了 / 不是目录：保持现状 */
+      }
+    }
+    return { ...current };
+  }
+
+  /** 启动时恢复上次打开的工程；目录已经没了就落到启动时解析出来的工程（cwd / --workspace） */
   function restore() {
     const store = readStore();
     if (store) recent = Array.isArray(store.recent) ? store.recent : [];
@@ -146,21 +165,26 @@ function createWorkspaceManager(opts) {
     if (!saved) {
       // 从没手工打开过工程：demo 模式要明确落在"演示数据"上。
       // 否则屋里站着 8 个模拟成员，顶上却写着真工程名 —— 分不清真假。
-      return opts.preferDemo ? openDemo() : { ...current };
+      return opts.preferDemo ? openDemo() : openInitial();
     }
     // --no-demo：强制真实数据源，不回退到持久化的演示工作区
-    //（否则上次停在演示数据，这回没带 --demo 启动也会把人带回 demo team）。
-    // 没有保存在 current 的真实路径时，依次尝试"最近打开"里的真实工程，让真实数据直接回来。
+    //（否则上次停在演示数据，这回没带 --demo 启动也会把人带回 demo project）。
+    // 没有保存在 current 的真实路径时，依次尝试"最近打开"、最后退回启动时解析出来的工程，
+    // 让真实数据直接回来（也保证 project 一定落到某个真实工程上，不会留 null）。
     if (process.env.WORKGREMLIN_NO_DEMO === '1') {
-      const candidates = [saved.workspacePath || saved.path, ...recent.map((r) => (r && r.path) || '').filter(Boolean)];
+      const candidates = [
+        saved.workspacePath || saved.path,
+        ...recent.map((r) => (r && r.path) || '').filter(Boolean),
+        initial.workspacePath || '',
+      ];
       for (const p of candidates) {
         try {
           return open(p);
         } catch {
-          /* 目录没了 / 换了机器：试下一个 */
+          /* 目录没了 / 换了机器 / 空路径：试下一个 */
         }
       }
-      return { ...current };
+      return openInitial();
     }
     try {
       if (saved.demo) return openDemo();
@@ -169,7 +193,7 @@ function createWorkspaceManager(opts) {
     } catch {
       /* 目录没了 / 换了机器：回落默认 */
     }
-    return { ...current };
+    return openInitial();
   }
 
   return {

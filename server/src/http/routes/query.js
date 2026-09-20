@@ -11,20 +11,20 @@ const { DEFAULTS } = require('@workgremlin/shared');
 function createQueryRouter({ bus, repo }) {
   const router = express.Router();
 
-  router.get('/teams', (req, res) => {
-    res.json({ ok: true, teams: bus.listTeamSummaries() });
+  router.get('/projects', (req, res) => {
+    res.json({ ok: true, projects: bus.listProjectSummaries() });
   });
 
   router.get('/snapshot', (req, res) => {
-    res.json({ ok: true, snapshot: bus.buildSnapshot(req.query.team || null) });
+    res.json({ ok: true, snapshot: bus.buildSnapshot(req.query.project || null) });
   });
 
   router.get('/messages', (req, res) => {
-    const team = req.query.team;
-    if (!team) return res.status(400).json({ ok: false, error: { code: 'bad_payload', message: 'missing team' } });
+    const project = req.query.project;
+    if (!project) return res.status(400).json({ ok: false, error: { code: 'bad_payload', message: 'missing project' } });
     const q = req.query;
     const items = repo
-      .listMessages(team, {
+      .listMessages(project, {
         members: q.members ? String(q.members).split(',').filter(Boolean) : undefined,
         types: q.types ? String(q.types).split(',').filter(Boolean) : undefined,
         since: q.since ? Number(q.since) : undefined,

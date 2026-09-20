@@ -6,7 +6,8 @@
  * 类型声明见同目录 index.d.ts。
  */
 
-const PROTOCOL_VERSION = 1;
+/** v2：把 team 概念统一为 project（信封字段 team -> project）。 */
+const PROTOCOL_VERSION = 2;
 
 /** @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'|'thinking'>} */
 const AGENT_STATES = Object.freeze(['online', 'busy', 'idle', 'blocked', 'offline', 'thinking']);
@@ -76,7 +77,7 @@ const HTTP_ROUTES = Object.freeze({
   HEALTH: '/api/v1/health',
   SNAPSHOT: '/api/v1/snapshot',
   MESSAGES: '/api/v1/messages',
-  TEAMS: '/api/v1/teams',
+  PROJECTS: '/api/v1/projects',
   REGISTER: '/api/v1/register',
   HEARTBEAT: '/api/v1/heartbeat',
   TASK_START: '/api/v1/task/start',
@@ -91,7 +92,7 @@ const ERROR_CODES = Object.freeze({
   BAD_PAYLOAD: 'bad_payload',
   BAD_TOKEN: 'bad_token',
   UNKNOWN_MEMBER: 'unknown_member',
-  UNKNOWN_TEAM: 'unknown_team',
+  UNKNOWN_PROJECT: 'unknown_project',
   DUPLICATE: 'duplicate',
   INTERNAL: 'internal',
 });
@@ -99,13 +100,13 @@ const ERROR_CODES = Object.freeze({
 /**
  * 构造协议信封。
  * @param {string} type
- * @param {string} team
+ * @param {string} project 工程标识
  * @param {string} actor
  * @param {unknown} payload
  * @param {number} [ts]
  */
-function envelope(type, team, actor, payload, ts = Date.now()) {
-  return { v: PROTOCOL_VERSION, type, ts, team, actor, payload };
+function envelope(type, project, actor, payload, ts = Date.now()) {
+  return { v: PROTOCOL_VERSION, type, ts, project, actor, payload };
 }
 
 /**
@@ -124,11 +125,11 @@ function fnv1a32(str) {
 
 /**
  * 消息去重键。A/B 两条来源写入同一张表时用它做幂等。
- * @param {{team: string, from: string, to?: string|null, ts: number, content?: string}} m
+ * @param {{project: string, from: string, to?: string|null, ts: number, content?: string}} m
  * @returns {string}
  */
 function dedupeKey(m) {
-  const base = [m.team, m.from, m.to ?? '', String(m.ts ?? ''), m.content ?? ''].join('\u0001');
+  const base = [m.project, m.from, m.to ?? '', String(m.ts ?? ''), m.content ?? ''].join('\u0001');
   return `${fnv1a32(base)}${fnv1a32(`${base}\u0002`)}`;
 }
 

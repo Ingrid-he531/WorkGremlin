@@ -8,7 +8,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
-import { useTeamStore } from '../stores/team';
+import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
@@ -20,7 +20,7 @@ const props = defineProps({
 });
 const emit = defineEmits(['select']);
 
-const team = useTeamStore();
+const project = useProjectStore();
 const sessions = useSessionStore();
 const mainAgent = useMainAgentStore();
 const wrapRef = ref(null);
@@ -187,8 +187,8 @@ watch(
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
       mainAgent.applySession(v);
-      if (sel && sel.projectPath && sel.projectPath !== team.workspacePath) {
-        team.openWorkspace(sel.projectPath);
+      if (sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
+        project.openWorkspace(sel.projectPath);
       }
       return;
     }
@@ -227,7 +227,7 @@ let cardRaf = 0;
 // （setMainAgent），在工位区再摆一个就是重复。所以从工位名单里剔掉，
 // 只让真正的 subagent 小怪物（含扫描器注册的常驻成员）坐工位。
 const sceneMembers = computed(() =>
-  team.members
+  project.members
     .filter((m) => m.role !== 'agent')
     .map((m) => ({
       memberId: m.memberId,
@@ -255,7 +255,7 @@ watch(mainAgentState, (v) => office && office.setMainAgent(v));
 const card = ref(null);
 let lastOpen = 0;
 
-const cardMember = computed(() => (card.value ? team.members.find((m) => m.memberId === card.value.memberId) : null));
+const cardMember = computed(() => (card.value ? project.members.find((m) => m.memberId === card.value.memberId) : null));
 
 function updateCardPos() {
   if (!card.value || !office || !wrapRef.value) return;

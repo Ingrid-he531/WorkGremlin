@@ -7,14 +7,14 @@
  */
 import { computed, onUnmounted, ref } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
-import { useTeamStore } from '../stores/team';
+import { useProjectStore } from '../stores/project';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
 });
 const emit = defineEmits(['select']);
 
-const team = useTeamStore();
+const project = useProjectStore();
 
 const tick = ref(Date.now());
 const timer = setInterval(() => {
@@ -25,7 +25,7 @@ onUnmounted(() => clearInterval(timer));
 /** 异常优先：保证阻塞/忙碌的成员一定在首屏 */
 const desks = computed(() => {
   const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
-  return team.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
+  return project.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
 });
 </script>
 
