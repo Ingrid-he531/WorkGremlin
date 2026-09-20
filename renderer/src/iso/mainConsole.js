@@ -32,6 +32,11 @@ import { CONSOLE } from './officeMap';
 /** 屏幕第一层：五个阶段。busy 决定有没有光标 / 加载动画 */
 export const PHASES = {
   idle: { label: '待命中', color: '#6b7c94', glow: 0.22, busy: false },
+  /**
+   * 未上报：这一层的 CLI 还没接 hook，只有会话文件时间可看 —— 不推断动作，
+   * 也不假装它在调工具（以前会显示「调用工具 · 改 xxx.jsonl」，那是拿文件名编造）。
+   */
+  unreported: { label: '未上报', color: '#6b7c94', glow: 0.18, busy: false },
   plan: { label: '规划中', color: '#7fb0ff', glow: 0.55, busy: true },
   thinking: { label: '思考中', color: '#ffcf5c', glow: 0.6, busy: true },
   tool: { label: '调用工具', color: '#4c8dff', glow: 0.85, busy: true },
@@ -41,11 +46,39 @@ export const PHASES = {
   done: { label: '任务完成', color: '#2fbf71', glow: 0.5, busy: false },
   /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
   await: { label: '等待授权', color: '#f5a623', glow: 0.6, busy: false },
+  /**
+   * 等待 subagent 汇报：主会话还没收到 Stop，但活已经派出去了 ——
+   * 既不是"待命中"（人还在这轮任务里），也不是自己正在干活，所以单开一个相位：
+   * 屏上写"等待中"，并写出在等谁（见 IsoOfficeView 的 consoleLive）。
+   */
+  waiting: { label: '等待中', color: '#5aa9ff', glow: 0.42, busy: false },
 };
 
 export const PHASE_LIST = Object.keys(PHASES);
 
 const FONT = 'ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
+
+/**
+ * 命令类工具（Bash / Shell / 终端 …）判断：真实链路里 tool 是工具名（"Bash"），
+ * mock 里可能带着命令（"bash: npm run build"），所以用"包含"匹配而不是全等。
+ */
+const isBashTool = (tool) => /\b(bash|shell|terminal|sh|cmd|powershell|exec|zsh)\b/i.test(String(tool || ''));
+/** 命令类工具在"调用工具"相位上的文案；除这一行之外，其它展示（操作 / 上下文）全部照旧 */
+const BASH_LABEL = '调用工具，需要授权';
+
+/**
+ * 屏上第一层 与 tooltip 第一行**共用的**相位文案（两处口径永远一致）。
+ *
+ * 命令类工具（Bash / Shell …）在"调用工具"相位上换成「调用工具，需要授权」；
+ * 其它相位（done / await / 待命 / 思考中 …）一律用 PHASES 的原标签 ——
+ * 否则 tool 字段残留上一支 Bash 时，"需要授权"会串到「任务完成」这些相位上。
+ * @param {{phase?:string, tool?:string}} state
+ */
+export function consolePhaseLabel(state) {
+  const ph = PHASES[String((state && state.phase) || 'idle')] || PHASES.idle;
+  if (state && state.phase === 'tool' && isBashTool(state.tool)) return BASH_LABEL;
+  return ph.label;
+}
 
 /** 剪影：跟精灵同一套局部单位（70 ≈ 1.55 tile 高），坐着所以整体矮一截 */
 const BODY_UNITS = 70;
@@ -128,7 +161,7 @@ export function drawConsoleDesk(c, now) {
 
 /**
  * @param {CanvasRenderingContext2D} c
- * @param {{state:{phase:string,action:string,context:string[]}, now:number, zoom:number}} o
+ * @param {{state:{phase:string,action:string,context:string[],tool?:string}, now:number, zoom:number}} o
  */
 export function drawConsoleScreen(c, o) {
   const { state, now, zoom } = o;
@@ -197,12 +230,23 @@ export function drawConsoleScreen(c, o) {
   c.textAlign = 'left';
   c.textBaseline = 'top';
 
-  /* 第一层：阶段。待命中时缓慢呼吸，执行中常亮 */
+  /* 第一层：阶段。待命中时缓慢呼吸，执行中常亮。
+     命令类工具（Bash / Shell）：服务端一律按"调用工具"（phase=tool）上报，不做特殊化；
+     "要不要提示需要授权"由渲染层按 tool 判断 —— 屏上这一行和 tooltip 第一行走同一个
+     consolePhaseLabel()，第二层的操作仍是实际要执行的命令。
+     文案比默认标签长，放不下就自动缩字号，别被 fit 截成"调用工具，需…"。 */
   const blink = ph.busy ? 1 : 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(now / 700));
+  const label = consolePhaseLabel(state);
+  let lfs = fs1;
+  c.font = `700 ${lfs}px ${FONT}`;
+  const labelW = c.measureText(label).width;
+  if (labelW > inner) {
+    lfs = Math.max(fs1 * 0.5, (fs1 * inner) / labelW);
+    c.font = `700 ${lfs}px ${FONT}`;
+  }
   c.globalAlpha = blink;
-  c.font = `700 ${fs1}px ${FONT}`;
   c.fillStyle = ph.color;
-  c.fillText(fit(c, ph.label, inner), padX, H * 0.13);
+  c.fillText(fit(c, label, inner), padX, H * 0.13 + (fs1 - lfs) * 0.5);
   c.globalAlpha = 1;
 
   /* 第二层：具体在做什么。后面跟一个闪烁的光标 */

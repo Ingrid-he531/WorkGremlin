@@ -238,6 +238,20 @@ const NEVER_AWAIT_TOOLS = new Set([
   'Bash', 'execute_command',
 ]);
 
+/**
+ * 命令类工具（Bash / execute_command …）：**服务端一律按"调用工具"上报，不做任何特殊化**。
+ *
+ * 为什么不在这里把 Bash 标成 await（等待授权）或改文案：
+ * 本环境实测 CodeBuddy 插件既不发"等授权"通知、也不发"授权结束"通知，而命令类工具
+ * 又不发 PostToolUse —— 于是"到底有没有在等授权"根本没有真信号。以前靠"工具是 Bash"
+ * 直接标 await，结果点了 run 之后没有任何事件能把它清掉，主控制台就一路卡在「等待授权」。
+ *
+ * 现在服务端只如实上报：相位 tool（调用工具）+ 工具名 + 实际命令。
+ * "要不要提示需要授权"交给渲染层按 tool 判断（见 renderer/src/iso/mainConsole.js 的
+ * drawConsoleScreen），这样展示口径改起来不用动服务端。真正的授权信号（Notification）来时，
+ * 仍走下面 rp.phase === 'await' 那条真值分支——那段逻辑保留不动。
+ */
+
 function reporterHookHome() {
   return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
 }
@@ -250,7 +264,7 @@ function reporterHookHome() {
  * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
  * @returns {{phase: string, tool: string, file: string, pending: {tool: string, file: string, at: number}|null}|null}
  */
-function readReporterPhase(workspacePath) {
+function readReporterPhase(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   let win = null;
@@ -259,7 +273,12 @@ function readReporterPhase(workspacePath) {
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
-    const sp = j && j.sessionPhase;
+    if (!j) continue;
+    // 按客户端过滤。老状态文件（本次改动之前写的）没有 client 字段 —— 那会儿只有 CodeBuddy，
+    // 所以按 codebuddy 归属，而不是"对谁都匹配"（否则刚重启、Codex 还没写过状态文件时，
+    // 4F 会短暂借到 3F 的相位）。
+    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    const sp = j.sessionPhase;
     if (!sp || !sp.ts || now - sp.ts > AWAIT_TTL_MS) continue;
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
     if (sp.ts < SERVER_STARTED_AT) continue;
@@ -294,8 +313,32 @@ function readReporterPhase(workspacePath) {
  * @param {string} workspacePath 当前工程；空则不限工程
  * @returns {{phase:string, action:string, target:string, context:string[]}|null}
  */
-function reporterMainPhase(workspacePath) {
-  const rp = readReporterPhase(workspacePath);
+/**
+ * 这个工程有没有接过 hook（= 有没有对应的 hook 状态文件）。
+ *
+ * 和"有没有新鲜相位"是两回事：会话结束后 hook 会把 sessionPhase 清空（正确行为），
+ * 但此时 CLI 楼层不该退回"按 jsonl mtime 猜"的兜底（那会让 4F 一直显示「调用工具 / 改 xxx.jsonl」），
+ * 而应该显示「待命」。渲染层靠这个字段区分"没接 hook"与"接了但当前没事干"。
+ *
+ * 状态文件名由 hook 的 statePath() 生成：`<member>@<工程绝对路径>` 里所有非 [A-Za-z0-9._-] 的字符换成 `_`。
+ * @param {string} workspacePath
+ */
+function hasReporterState(workspacePath, client = '') {
+  const ws = String(workspacePath || '').trim();
+  if (!ws) return false;
+  const suffix = `@${path.resolve(ws)}`.replace(/[^a-zA-Z0-9._-]/g, '_') + '.json';
+  for (const name of readDir(path.join(reporterHookHome(), 'hooks'))) {
+    if (!/[.]json$/i.test(name) || !name.endsWith(suffix)) continue;
+    if (!client) return true;
+    const j = readJson(path.join(reporterHookHome(), 'hooks', name));
+    // 老文件没记 client → 按 codebuddy 归属（同上）
+    if (String((j && j.client) || 'codebuddy').toLowerCase() === String(client).toLowerCase()) return true;
+  }
+  return false;
+}
+
+function reporterMainPhase(workspacePath, client = '') {
+  const rp = readReporterPhase(workspacePath, client);
   if (!rp) return null;
   if (rp.phase === 'await') {
     return {
@@ -403,7 +446,7 @@ function readReporterDone(workspacePath) {
  * @param {string} fallback 回落值
  * @returns {string}
  */
-function freshestReporterWs(fallback) {
+function freshestReporterWs(fallback, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   let best = '';
@@ -412,6 +455,7 @@ function freshestReporterWs(fallback) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
+    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
     const sp = j.sessionPhase;
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
@@ -662,4 +706,5 @@ function listSessions({ workspacePath = '', force = false } = {}) {
   return cache.value;
 }
 
-module.exports = { listSessions, findPluginStorage, decodeDirName, reporterMainPhase, freshestReporterWs };
+module.exports = {
+  hasReporterState, listSessions, findPluginStorage, decodeDirName, reporterMainPhase, freshestReporterWs };

@@ -5,12 +5,19 @@
 | 产品名 | WorkGremlin —— 多 Agent 协作可视化桌面端（工位视图 + 对话记录） |
 | 版本 | **v0.3**（并入 Q1/Q2/Q3/Q5/Q8~Q11 全部拍板结论；替代 v0.2 相关章节） |
 | 编写人 | researcher（WorkGremlin 团队） |
-| 关联文档 | `docs/requirements-outline.md`（大纲，编号权威来源）、`docs/roadmap.md`（排期）、`docs/tech-design.md`（coder 技术方案）、`docs/test-strategy.md`（tester 策略） |
+| 关联文档 | `docs/requirements-outline.md`（大纲，编号权威来源）、`docs/roadmap.md`（排期）、`docs/tech-design.md`（coder 技术方案）、`docs/test-strategy.md`（tester 策略）、`docs/implementation-status.md`（**实现现状**，与本文的差异总表） |
 | 工作目录 | `/home/yinghui/work/WorkGremlin` |
 | 状态 | 待评审；**《§5 状态语义定义》为 M1 阻塞依赖，优先评审** |
 
 > **编号权威**：功能编号一律沿用 `requirements-outline.md` 的 `P0-1 ~ P0-6 / P1-1 ~ P1-6 / P2-1 ~ P2-6`；开放问题一律沿用其 §6 的 `Q1 ~ Q7`（派生问题用 `Q3-1` 这类子编号）。本文档不再另立编号体系。
 > 与 `tech-design.md` 的字段级差异统一登记在 **§13**，供 coder 对齐。
+
+> **[2026-09-20 实现对齐]** 本文的**编号与验收标准仍然有效**，但下列事实性描述已被实现超越 —— 读代码时以 `docs/implementation-status.md` 为准：
+> - **`team_id` → `project_id`**：代码已无 team 概念，改为「工程（project）」（commit `def3fee`）；§3、§4、§7.1 里所有 `team_id` 按 `project_id` 理解。
+> - **A 路线（`chokidar` 监听 `.codebuddy/teams`）未实现**：`chokidar` 只在 `server/package.json` 声明，源码零引用。
+> - **§5 的 `error` 主状态未落地**：`shared/index.js` 的 `AGENT_STATES` 是 `online/busy/idle/blocked/offline/thinking`，没有 `error`；办公室只渲染「忙碌 / 空闲」两档。
+> - **§8 消息脱敏、§7.5 FTS5 查询、§13 的各项字段新增**均未实现（`listMessages` 目前一律 `LIKE`，没有 `redact()`）。
+> - 本文假设的 `PROTOCOL_VERSION = 1` / 信封字段 `team` 也已变为 **v2 / `project`**。
 
 ---
 
@@ -60,8 +67,8 @@
 | 维度 | 决策 |
 | --- | --- |
 | workspace | **单 workspace**（当前工作区）；多 workspace 仅架构预留，M0~M3 不实现 |
-| team | **一等字段**：`team_id` 出现在 `members / agent_status / tasks / messages / file_activity / artifacts` 全部核心表；UI 顶部支持 team 切换（P0-4） |
-| 成员规模 | 上限 **16 人**；≥5 自动切紧凑模式；>16 按 team 分页折叠（详见 §6.4） |
+| ~~team~~ → **工程（project）** | ⚠️ **已被实现取代（2026-09-20）**：代码无 team 概念，改为**工程（project）**一等字段 —— `project_id` 出现在 `members / agent_status / tasks / messages / file_activity / artifacts` 全部核心表；`members` 另增 `ephemeral`（临时成员/幽灵）与 `project_label`。切换入口是**左侧楼层 + 顶部会话下拉 + 「打开工程」**，不是 team 切换；P0-4 的原始意图由「打开工程 + 楼层」承接 |
+| 成员规模 | 上限 **16 人**；≥5 自动切紧凑模式；>16 按**工程**分页折叠（原文写「按 team」，代码已无 team 概念，详见 §6.4） |
 | 平台 | 仅 **x64**（Linux AppImage/deb、Windows nsis、macOS-x64 dmg）；不出 ARM，脚本参数化不硬编码架构 |
 | 网络盘 / WSL | M0~M2 **不支持**：网络盘 / EMFILE 时降级 5s 轮询并置 `degraded`；WSL 与时钟跳变登记 M3 评估 |
 | 离线演示 | `--demo` / `MOCK=1` **提前到 M0**，与 mock 静态渲染、E2E 确定性数据源三合一 |
@@ -76,7 +83,10 @@
 | 路线 | 内容 | 地位 |
 | --- | --- | --- |
 | **B（主动上报，真值）** | agent 经 `packages/reporter` SDK / CLI 上报 → HTTP ingest → SQLite → WS 推送 | **唯一真值源**。状态、进度、文件、耗时、产出均由 B 提供 |
-| **A（目录监听，兜底）** | `chokidar` 监听 `{workspace}/.codebuddy/teams/{team}/`，解析 `config.json`（roster）与各成员 mailbox | **兜底**。仅能拿到名单与**收件**，拿不到发件、任务、进度、文件、耗时 |
+| **A（目录监听，兜底）** ⚠️ **至今未实现** | 原计划：`chokidar` 监听 `{workspace}/.codebuddy/teams/{team}/`，解析 `config.json`（roster）与各成员 mailbox | 设计上的**兜底**：仅能拿到名单与**收件**。**实现状态：零代码**（`chokidar` 仅在 `server/package.json` 声明，源码无引用） |
+
+> ⚠️ **A 路线未实现（2026-09-20）**：`.codebuddy/teams` 没有任何解析器，本节的「融合」目前只有 B 一路。
+> 实际在跑的四个成员来源是：CodeBuddy 系 hook 上报 / `.codebuddy/agents` 名册（常驻小怪物）/ `.workgremlin/subagents.json` 清单（临时幽灵）/ 各产品落盘扫描 —— 见 `docs/implementation-status.md` §2。
 
 ### 4.2 融合规则（写入同一张表，`source` 区分，`dedupe_key` 去重）
 
@@ -1043,6 +1053,7 @@ main 点名让 tester 出默认值建议，这里补一条**产品侧**判断，
 
 | 版本 | 日期 | 变更 |
 | --- | --- | --- |
+| **v0.4** | 2026-09-20 | **实现对齐（只加事实标注，不改验收标准）**：顶部新增对齐提示；§3 与 §4.1 的 `team` / A 路线标注为已被实现取代或未实现；§4.2 前补充实际成员来源。差异总表见新增的 `docs/implementation-status.md` |
 | v0.1 | 2026-09-14 | 初版（画像、P0/P1/P2、状态语义、消息字段、非功能、竞品、14 条开放问题） |
 | **v0.2** | 2026-09-14 | 对齐 `requirements-outline.md` v0.1 与四项拍板决策：**重写**状态语义（5 主状态 + `degraded`、判定算法、优先序 `error>busy>blocked>idle`、迁移矩阵与非法迁移处理、`progress_source` 三值）、补齐 `file_activity.op`、成员规模/紧凑模式取舍、脱敏与原文查看流程、明确 A-only「禁止推断 blocked/error」、开放问题并入 Q1~Q7、新增与 `tech-design.md` 的差异清单；移除 v0.1 中与之冲突的自有编号与 `unknown` 状态 |
 | **v0.3** | 2026-09-14 | 并入全部拍板结论：① **§5 状态语义定稿**（§5.3 加 `HEARTBEAT_INTERVAL=15s` 并声明 `tech-design` 5s 作废；§5.4 `error` 增 `error_type/retryable/summary` 与「不强制先回 idle」；**§5.8 迁移矩阵改为 18 合法 / 2 非法：`offline→error`、`error→blocked` 为非法并采用「拒绝 + 保留原状态 + events + metrics + warn + 恢复后延迟兑现」**，新增不变式 INV-1「→offline 只能由心跳超时或显式断开触发」，`offline→blocked` 需合成中间态；新增 **§5.11 裁决 FAQ** 回答 tester 四问：busy 充要条件与「无空闲回落、只认 task.end」、blocked 不做状态栈、`error` 语义与恢复）；② **§5.9.1** 三层进度 AC-PR1~PR7（含 main 背书的 AC-PR5 第③层 DOM 判据）；③ **§6.2** `file_activity.op` 三值判定口径（编辑≠先读后写、新建算 write、缺 op 保守归 write）+ **A-only 不可判定**的标注规则 + AC-F1~F4；④ **§7.5.1** Q10 短词搜索语义（trigram + 1/2 字自动降级 LIKE、**FTS 与 LIKE 不混排**的排序规则、正式 UI 文案、LIMIT/时间窗/800ms 超时护栏、AC-Q1~Q7）；⑤ **§8** 脱敏升为 **P0-7 硬要求**（`***` 替换、`redaction_hits` 独立记录、**原文不入库、不得半掩码**）、新增 §8.2 误伤边界、§8.3 搜索命中语义（AC-RS1~4）、§8.4 展示时机与计数、**§8.5 Q9 原文通道**（三步开启确认 + type-to-confirm、`显示原文` 弹窗正式文案（含截图/剪贴板/录屏/日志风险）、默认遮罩与 6 种重新遮罩时机、「会话首次 + 第 11 条起 + 批量导出」三段式二次确认、取消降级、两级 ESC、审计字段禁止含原文）；⑥ **§9.4** 通知规格 Q4/Q8（含 researcher 对免打扰默认值的产品意见 §12.1）；⑦ §12 补齐 Q4-1~Q11 状态与落点章节；⑧ §13 新增 5b / 11 / 12 三条对齐项 |

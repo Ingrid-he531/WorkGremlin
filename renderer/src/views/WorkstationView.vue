@@ -2,12 +2,19 @@
 import { computed } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
+import { useSessionStore } from '../stores/sessions';
 
 const project = useProjectStore();
+const sessions = useSessionStore();
 
 const sorted = computed(() => {
   const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
-  return project.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
+  // 与办公室同一口径：按当前楼层的客户端过滤（client 为空的视作通用）
+  const want = sessions.selectedClient;
+  return project.members
+    .filter((m) => !want || !m.client || m.client === want)
+    .slice()
+    .sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
 });
 </script>
 
@@ -24,7 +31,7 @@ const sorted = computed(() => {
       <WorkstationCard v-for="m in sorted" :key="m.memberId" :member="m" />
     </div>
 
-    <p v-if="!project.members.length" class="empty dim">暂无成员数据</p>
+    <p v-if="!sorted.length" class="empty dim">本层暂无成员</p>
   </div>
 </template>
 

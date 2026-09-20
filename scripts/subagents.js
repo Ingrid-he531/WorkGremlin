@@ -13,6 +13,10 @@
  *
  * state 取 online | busy | idle | blocked | offline（写错或不写 -> online，不编造 busy）。
  *
+ * 收工（推荐）：写一句结果摘要，办公室里小怪物会走到主 agent 面前把这句话说出来，
+ * 播完汇报服务端自动把这条回收（幽灵散掉、工位回空闲）：
+ *   node scripts/subagents.js set simmon idle --result "设计文档已落地，390 行，含时序表与状态机"
+ *
  * 清单文件位置（与服务端同一套规则）：
  *   $WORKGREMLIN_SUBAGENTS_FILE  >  $WORKGREMLIN_WORKSPACE/.workgremlin/subagents.json  >  <cwd>/.workgremlin/subagents.json
  */
@@ -110,6 +114,9 @@ function main() {
     const entry = {
       name,
       state: state || 'online',
+      // 收工摘要：写了它 = 这次召唤干完了（服务端播完汇报会自动回收这条），
+      // 没写就置空 —— 免得上一轮的 result 粘到新一轮召唤上
+      result: args.result ? String(args.result) : '',
       ...(args.task ? { task: String(args.task) } : {}),
       ...(args.progress !== undefined && Number.isFinite(Number(args.progress))
         ? { progress: Number(args.progress) }

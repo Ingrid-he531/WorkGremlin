@@ -5,9 +5,18 @@
 >
 > 本文只做方案与取舍说明，**未经批准不写业务代码**。
 
+> **[2026-09-20 实现对齐]** 本文是 v0.1 技术方案，**取舍理由仍然成立**（Electron / A+B 混合 / SQLite / WS / 零依赖 reporter），但下列结论已被实现取代 —— 现状见 `docs/implementation-status.md`：
+> - **领域模型 team → 工程（project）**（commit `def3fee`）：§4 的 `teams` 表即今天的 `projects`，`team_id` 一律为 `project_id`；
+> - **A 路线（`chokidar`）未实现**：`server/src/watcher/` 从未创建，§7 文件清单里的 watcher 条目不存在；
+> - **协议版本为 2**：§5.1 的 `PROTOCOL_VERSION = 1` 与信封字段 `team` 已改为 `2` / `project`；
+> - **实现是 CommonJS JavaScript**（`jsconfig.json`），§2 的 TypeScript 选型尚未执行；
+> - 新增了本文未设计的东西：楼层（受监控产品探测）、全局活跃会话表、`.codebuddy/agents` 名册、`subagents.json` 幽灵清单、等距 Canvas 办公室与主 Agent 控制台。
+
 ---
 
 ## 0. 现状调研（已确认的事实）
+
+> ⚠️ **本节是 2026-09-14 的实测快照，目录结构描述已过时**：无法从 `.codebuddy/teams` 拿到状态这一结论仍然成立（它正是必须走 B 路线的原因），但代码后来没有实现该目录的监听，成员改由 hook / 名册 / 清单 / 落盘扫描四路提供。
 
 当前 agent 团队运行数据落盘位置（实测）：
 
@@ -299,7 +308,7 @@
 
 ```ts
 // shared/src/protocol.ts
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 1;   // ⚠️ 实现已升为 2：信封字段 team → project（见 docs/implementation-status.md §5-1）
 
 export interface Envelope<T = unknown> {
   v: 1;              // 协议版本

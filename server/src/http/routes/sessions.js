@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { reporterMainPhase, freshestReporterWs } = require('../../sessions');
+const { reporterMainPhase, freshestReporterWs, hasReporterState } = require('../../sessions');
 
 /**
  * 会话：全局活跃会话表（按楼层分组）。
@@ -25,12 +25,20 @@ function createSessionsRouter({ workspace }) {
   // 渲染层 1.5s 拉一次，比 /sessions 的 10s 轮询新鲜，专供主 Agent 控制台的"操作"实时显示。
   router.get('/reporter-phase', (req, res) => {
     const cur = workspace && workspace.current ? workspace.current() : {};
+    // 按楼层（客户端）取相位：同一工程里 Codex 与 CodeBuddy 同时跑时不能互相串味
+    const client = String(req.query.client || '').trim().toLowerCase();
     // 跟随 reporter 真实活动的最新工程，而不是 office 手工"打开工程"记的那个
-    const ws = freshestReporterWs(cur.workspacePath || '');
-    const rp = reporterMainPhase(ws);
+    const ws = freshestReporterWs(cur.workspacePath || '', client);
+    const rp = reporterMainPhase(ws, client);
+    // 这个工程有没有接 hook（接了但当前没动作 → 渲染层显示"待命"，而不是按文件时间瞎猜）
+    const instrumented = hasReporterState(ws, client);
     // 带上这条相位所属的工程路径（workspacePath）：渲染层据此只在"选中会话正好属于这个工程"时
     // 才叠加实时相位，避免旧会话（它自己工程已不活跃）被新工程的相位串味、短暂闪一下"思考中"。
-    res.json(rp ? { ok: true, workspacePath: ws, ...rp } : { ok: true, workspacePath: ws, phase: null, action: '', target: '', context: [] });
+    res.json(
+      rp
+        ? { ok: true, workspacePath: ws, instrumented, ...rp }
+        : { ok: true, workspacePath: ws, instrumented, phase: null, action: '', target: '', context: [] }
+    );
   });
 
   return router;

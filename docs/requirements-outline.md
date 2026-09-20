@@ -3,7 +3,13 @@
 - 版本：v0.1（leader 起草，2026-09-14）
 - 状态：待 researcher 深化、待 main / 用户拍板
 - 唯一工作目录：`/home/yinghui/work/WorkGremlin`（禁止在 `stb-insight*` 下写任何东西）
-- 关联文档：`docs/tech-design.md`（coder，技术方案 v0.1）、`docs/test-strategy.md`（tester，测试策略 v0.1）、`docs/roadmap.md`（排期）
+- 关联文档：`docs/tech-design.md`（coder，技术方案 v0.1）、`docs/test-strategy.md`（tester，测试策略 v0.1）、`docs/roadmap.md`（排期）、`docs/implementation-status.md`（实现现状）
+
+> **[2026-09-20 实现对齐]** 本大纲写于「team」模型时期，下列内容已被实现超越 —— 编号体系仍然有效，**事实描述以 `docs/implementation-status.md` 为准**：
+> - 领域模型 **team → 工程（project）**：`team_id` 全部改为 `project_id`（commit `def3fee`）；
+> - 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~5F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
+> - **A 路线（`chokidar` 监听 `.codebuddy/teams`）未实现**；成员来源改为 hook 上报 / `.codebuddy/agents` 名册 / `.workgremlin/subagents.json` 清单 / 落盘扫描；
+> - **消息脱敏（P0-7）未实现**；FTS5 只建表未接查询；双连接存储、自动归档、TypeScript 迁移、自动化测试均未落地。
 
 ---
 

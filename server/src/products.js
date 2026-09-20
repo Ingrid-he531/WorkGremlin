@@ -5,6 +5,8 @@
  *   1F  CodeBuddy CLI
  *   2F  WorkBuddy CLI
  *   3F  CodeBuddy 插件
+ *   4F  Codex CLI
+ *   5F  Claude Code CLI
  *
  * 每一层自动搜索两样东西：
  *   - 安装位置：CLI 的可执行文件（PATH + 常见安装目录），插件的扩展目录
@@ -182,6 +184,8 @@ const CLI_BIN_DIRS = [
   path.join(HOME, '.codebuddy', 'bin'),
   path.join(HOME, '.workbuddy', 'bin'),
   path.join(HOME, '.npm-global', 'bin'),
+  // npm 全局 bin：和当前 node 可执行文件同目录（/usr/local/nodejs/bin 这类装法）
+  path.dirname(process.execPath),
   '/usr/local/bin',
   '/opt/homebrew/bin',
   '/usr/bin',
@@ -202,6 +206,8 @@ function findCliBin(cmd) {
 
 const RE_CODEBUDDY = [/^codebuddy/i, /^code-?buddy/i, /^tencent/i, /^ingram/i];
 const RE_WORKBUDDY = [/^workbuddy/i, /^work-?buddy/i];
+const RE_CODEX = [/^codex/i];
+const RE_CLAUDE = [/^claude/i];
 const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
 
 /** 在某个根目录下找名字命中的子项（只看一层，快） */
@@ -234,11 +240,22 @@ function firstExisting(dirs) {
  * CLI 优先家目录隐藏目录（~/.codebuddy），插件优先编辑器的 globalStorage。
  */
 function findDataPath(kind, plugin) {
-  const res = kind === 'workbuddy' ? RE_WORKBUDDY : RE_CODEBUDDY;
+  const res =
+    kind === 'workbuddy'
+      ? RE_WORKBUDDY
+      : kind === 'codex'
+        ? RE_CODEX
+        : kind === 'claude'
+          ? RE_CLAUDE
+          : RE_CODEBUDDY;
   const homeDirs =
     kind === 'workbuddy'
       ? [path.join(HOME, '.workbuddy')]
-      : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
+      : kind === 'codex'
+        ? [path.join(HOME, '.codex')]
+        : kind === 'claude'
+          ? [path.join(HOME, '.claude')]
+          : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
 
   const steps = plugin
     ? [
@@ -291,6 +308,22 @@ const PRODUCTS = [
     dataKind: 'codebuddy',
     plugin: true,
   },
+  {
+    id: '4F',
+    name: 'Codex CLI',
+    kind: 'cli',
+    cmd: 'codex',
+    dataKind: 'codex',
+    plugin: false,
+  },
+  {
+    id: '5F',
+    name: 'Claude Code CLI',
+    kind: 'cli',
+    cmd: 'claude',
+    dataKind: 'claude',
+    plugin: false,
+  },
 ];
 
 function detectOne(p) {
@@ -305,6 +338,8 @@ function detectOne(p) {
     id: p.id,
     name: p.name,
     kind: p.kind,
+    /** 落盘形态（codebuddy / workbuddy / codex）—— 会话扫描按它挑解析方式 */
+    dataKind: p.dataKind,
     // 装没装只看**安装位置**：CLI 得找到可执行文件，插件得找到扩展目录。
     // 落盘目录不算证据 —— 我们自己的 hooks 安装脚本会给没装的产品写一份
     // settings.json 顺手造出一个目录（~/.workbuddy），拿它当证据等于自己骗自己。

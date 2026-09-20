@@ -25,6 +25,13 @@ function memberIdOf(project, name) {
   return String(name).includes('@') ? name : `${name}@${project}`;
 }
 
+/** 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL） */
+const CLIENTS = new Set(['codebuddy', 'workbuddy', 'codex', 'claude']);
+function normClient(v) {
+  const c = String(v || '').trim().toLowerCase();
+  return CLIENTS.has(c) ? c : null;
+}
+
 function jsonOrNull(v) {
   if (v === undefined || v === null) return null;
   try {
@@ -79,6 +86,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // 临时成员（无工位 / 场景里是幽灵）。老成员的 ephemeral 只升不降（见 upsertMember 的 MAX）
       ephemeral: p.ephemeral ? 1 : 0,
       projectLabel: p.projectLabel ?? null,
+      // 来源客户端（演示/手工数据没有，就是 NULL）
+      client: normClient(p.client),
     });
     // subagent 级别（用户级 / 项目级）：按名字扫 agent 目录判定，记进内存 map
     const lvl = detectLevel(p.name || p.memberId || '', p.workspacePath || '');
@@ -365,9 +374,21 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // 临时成员（无工位 → 场景里飘着的幽灵）+ 所属项目名
       ephemeral: Boolean(m.ephemeral),
       projectLabel: m.project_label ?? null,
+      // 来源客户端：办公室据此按楼层过滤（NULL = 不知道，哪层都显示）
+      client: m.client || null,
       // subagent 级别（用户级 / 项目级）：驱动小怪物脖子上的工牌配色
       level: levels.get(memberId) || null,
     };
+  }
+
+  /**
+   * 补写来源客户端（老库的行是 NULL）。名册与清单每轮同步调一次，只在缺失/不一致时写。
+   * @param {{project: string, memberId: string, client: string}} p
+   */
+  function tagMemberClient(project, memberId, client) {
+    const c = normClient(client);
+    if (!c) return 0;
+    return repo.tagMemberClient.run({ id: memberIdOf(project, memberId), client: c }).changes;
   }
 
   /**
@@ -492,6 +513,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     setContext,
     getContext: () => ({ ...context }),
     registerMember,
+    tagMemberClient,
     removeMember,
     heartbeat,
     setStatus,

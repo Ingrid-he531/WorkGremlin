@@ -25,14 +25,16 @@ const config = require('../config');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const USER_AGENTS_DIR = path.join(HOME, '.codebuddy', 'agents');
+/** Codex CLI 的 agent 定义目录（实测 codex home 下有 agents/） */
+const USER_CODEX_AGENTS_DIR = path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'agents');
 
 /** 列出目录下的 agent 文件名（去 .md），目录不可读返回空 */
 function listAgentFiles(dir) {
   try {
     return fs
       .readdirSync(dir)
-      .filter((f) => /\.md$/i.test(f))
-      .map((f) => f.replace(/\.md$/i, ''));
+      .filter((f) => /\.(md|toml)$/i.test(f)) // CodeBuddy 用 .md；Codex 的 agent 定义可能是 .toml
+      .map((f) => f.replace(/\.(md|toml)$/i, ''));
   } catch {
     return [];
   }
@@ -46,12 +48,18 @@ function listDefinedAgents(workspacePath) {
   const ws = String(workspacePath || '').trim();
   const projDir = ws ? path.join(path.resolve(ws), '.codebuddy', 'agents') : '';
   const seen = new Map();
-  if (projDir) for (const n of listAgentFiles(projDir)) if (!seen.has(n)) seen.set(n, 'project');
-  for (const n of listAgentFiles(USER_AGENTS_DIR)) if (!seen.has(n)) seen.set(n, 'user');
+  const add = (dir, level, client) => {
+    for (const n of listAgentFiles(dir)) if (!seen.has(n)) seen.set(n, { level, client });
+  };
+  if (projDir) add(projDir, 'project', 'codebuddy');
+  // Codex CLI 的 agent 定义（项目级 <ws>/.codex/agents、用户级 $CODEX_HOME/agents）
+  if (ws) add(path.join(path.resolve(ws), '.codex', 'agents'), 'project', 'codex');
+  add(USER_CODEX_AGENTS_DIR, 'user', 'codex');
+  add(USER_AGENTS_DIR, 'user', 'codebuddy');
   const out = [];
-  for (const [name, fallback] of seen) {
-    const level = detectLevel(name, ws) || fallback;
-    if (level) out.push({ name, level });
+  for (const [name, meta] of seen) {
+    const level = detectLevel(name, ws) || meta.level;
+    if (level) out.push({ name, level, client: meta.client });
   }
   return out;
 }
@@ -77,9 +85,16 @@ function createAgentRoster(opts) {
   const defined = new Set();
   /** project -> 本名册在该 project 上注册过的名字（换工程时各自记账，互不干扰） */
   const registered = new Map();
-  /** 正在被召唤（活跃）的小怪物：这些由 subagentFeed 负责把工位状态设为忙碌，
-   *  roster 心跳不要把它覆盖回 online。召唤结束（markIdle）即复位。 */
-  const activeNames = new Set();
+  /**
+   * 正在被召唤（活跃）的小怪物 name -> 最近一次被标活跃的时刻。这些由 subagentFeed
+   * 负责把工位状态设为忙碌，roster 心跳不要把它覆盖回 online。召唤结束（markIdle）即复位。
+   *
+   * 带时刻是为了**超时兜底**：markIdle 是唯一复位入口，而它只在 subagentFeed 里被调用，
+   * 一旦幽灵因别的原因消失（换工程导致 feed 被 stop、名册摘掉成员、hook 没送到结束信号），
+   * 这个名字就永远不再被心跳 —— 它会一直挂着"忙碌"，60s 后变 busy + degraded。
+   */
+  const ACTIVE_TTL_MS = 10 * 60_000;
+  const activeNames = new Map();
 
   function sync() {
     if (!running) return;
@@ -101,9 +116,12 @@ function createAgentRoster(opts) {
     // 名册集合（或当前 project）变化时才动注册（补新增的、摘掉不再定义的）
     if (sig !== lastSig) {
       lastSig = sig;
+      // 换工程 / 名册变了：上一轮的"召唤中"记账作废（feed 也会跟着重启），
+      // 否则旧工程留下的 activeNames 会让新工程里同名的小怪物一直不心跳。
+      activeNames.clear();
       defined.clear();
       const keep = new Set();
-      for (const { name } of list) {
+      for (const { name, client } of list) {
         defined.add(name);
         keep.add(name);
         if (!mine.has(name)) {
@@ -116,6 +134,7 @@ function createAgentRoster(opts) {
             ephemeral: false,
             projectLabel: '',
             workspacePath: ws,
+            client,
           });
           mine.add(name);
         }
@@ -129,14 +148,24 @@ function createAgentRoster(opts) {
             /* ignore */
           }
           mine.delete(name);
+          activeNames.delete(name); // 成员都摘了，别再拿"召唤中"压着它的心跳
         }
       }
+    }
+
+    // 召唤中的记账超时兜底：见 ACTIVE_TTL_MS 的说明 ——
+    // 幽灵没了却没走 markIdle 时，别让这个名字永久"忙碌 + 不心跳"。
+    for (const [name, at] of [...activeNames]) {
+      if (Date.now() - Number(at || 0) > ACTIVE_TTL_MS) activeNames.delete(name);
     }
 
     // 心跳：保持在线、避免被 sweepDegraded 判灰。
     // 正在被召唤（activeNames）的小怪物由 subagentFeed 把工位状态设为忙碌，
     // 这里跳过，不把它覆盖回 online。
     for (const name of mine) {
+      // 老库的成员行没有 client，顺手补上（只在缺失/不一致时写）
+      const meta = list.find((x) => x.name === name);
+      if (meta) bus.tagMemberClient(project, name, meta.client);
       if (activeNames.has(name)) continue;
       try {
         bus.heartbeat({ project, memberId: name, state: 'online', progress: null, files: [] });
@@ -148,7 +177,7 @@ function createAgentRoster(opts) {
 
   /** 小怪物被召唤：登记活跃，roster 心跳不再覆盖其工位状态（忙碌由 subagentFeed 下发） */
   function markActive(name) {
-    activeNames.add(String(name || '').trim());
+    activeNames.set(String(name || '').trim(), Date.now());
   }
 
   /** 召唤结束：立即把小怪物工位复位为在线，并从活跃名单移除 */

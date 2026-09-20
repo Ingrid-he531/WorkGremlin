@@ -20,6 +20,13 @@
  * 对齐语义：**文件里有谁，屋里就飘着谁**。
  * 清单里删掉一个 agent，它的幽灵当场散掉（连状态行一起删，不清历史消息）。
  * 启动时先把库里残留的临时成员清一遍 —— 上一轮跑的幽灵不该这一轮还飘着。
+ *
+ * 收工（唯一的例外）：给某条写上 `result`（一句结果摘要）即表示它干完了 ——
+ *   任务按 done 收尾、摘要作为产出（artifact kind=summary）下发（办公室里小怪物
+ *   就是拿这句话走到主 agent 面前汇报）、小怪物工位改空闲；
+ *   **幽灵不马上散**，等汇报演完（RETIRE_MS）再自动从清单里摘掉。
+ * 所以一次召唤的完整收尾只要一条命令：
+ *   node scripts/subagents.js set simmon idle --result "设计文档已落地，390 行，含时序表与状态机"
  */
 
 const fs = require('node:fs');
@@ -29,6 +36,25 @@ const config = require('../config');
 
 /** 屋里只有 6 个悬浮点，多了会叠在一起；先出现的优先 */
 const MAX_GHOSTS = 6;
+/**
+ * 写了 result 之后，幽灵还要飘多久才回收（毫秒）。
+ * 得盖住办公室里那段"走到主 agent 面前 → 说出摘要 → 走回工位"的汇报动画
+ * （约 3s + 3.4s + 3s），否则人还没汇报完、幽灵先散了。
+ */
+const RETIRE_MS = 10_000;
+/**
+ * hook 写的召唤条目（带 ts）活过这么久还没收场信号，就当它已经没了（毫秒）。
+ * subagent 的结束信号依赖 PostToolUse / SubagentStop，哪条都可能因为 matcher
+ * 没放开 / 事件不支持而不来；没有 TTL 的话这些幽灵会永久挂在屋里。
+ * 只在内存里过滤，不动清单文件（手工 scripts/subagents.js 写的条目没有 ts，不受影响）。
+ */
+const GHOST_TTL_MS = 2 * 60 * 60_000; // 只是兜底：真正的收场由 hook 在 Stop / UserPromptSubmit / SessionEnd 主动扫（hook.js 的 sweepGhosts）。原来 30 分钟，会把跑超 30 分钟的长任务幽灵误撤。
+/**
+ * 收工摘要的落点：artifacts 表的 kind 只有 file / doc / pr / text 四种（CHECK 约束），
+ * 所以摘要记成 kind='text'，再用 path 打这个标记让渲染层认出来
+ * （检索处：renderer/src/views/IsoOfficeView.vue 的 sceneMembers）。
+ */
+const SUMMARY_PATH = 'workgremlin:summary';
 
 /**
  * 清单文件路径。
@@ -62,18 +88,30 @@ function readFeed(file) {
   }
   const list = Array.isArray(data) ? data : Array.isArray(data && data.agents) ? data.agents : [];
   const project = (!Array.isArray(data) && typeof data.project === 'string' && data.project.trim()) || '';
+  const now = Date.now();
   const agents = list
     .filter((a) => a && typeof a === 'object')
     .map((a) => ({
       name: String(a.name || a.id || '').trim().slice(0, 64),
       state: String(a.state || '').trim(),
+      // id / ts 由 hook 写（每次召唤一个 id），用来做"同名并发各算一条"和 TTL
+      id: typeof a.id === 'string' ? a.id.trim().slice(0, 64) : '',
+      ts: Number.isFinite(Number(a.ts)) ? Number(a.ts) : 0,
       task: typeof a.task === 'string' ? a.task.trim().slice(0, 200) : '',
+      // result：一句结果摘要。写了它 = 这次召唤收工（见文件头）
+      result: typeof a.result === 'string' ? a.result.trim().slice(0, 200) : '',
       progress: Number.isFinite(Number(a.progress)) ? Number(a.progress) : null,
       files: Array.isArray(a.files) ? a.files.slice(0, 10).map(String) : [],
       project: typeof a.project === 'string' && a.project.trim() ? a.project.trim() : '',
+      // 写这条清单的是哪个客户端（hook 写的会带；手工 scripts/subagents.js 写的不带）
+      client: typeof a.client === 'string' && a.client.trim() ? a.client.trim().toLowerCase() : '',
     }))
     .filter((a) => a.name)
-    .slice(0, MAX_GHOSTS);
+    // 过期兜底：带 ts 的（hook 写的）超时未收场就当它没了，不再飘着
+    .filter((a) => !a.ts || now - a.ts <= GHOST_TTL_MS)
+    // 屋里只有 6 个悬浮点，多了叠在一起。**取最后 6 条**（hook 是往后追加的，即最新的）：
+    // 取前 6 条的话，第 7 只会在前面的腾出位置后"迟到地"冒出来，很莫名。
+    .slice(-MAX_GHOSTS);
   return { project, agents };
 }
 
@@ -100,13 +138,21 @@ function createSubagentFeed(opts) {
   const roster = opts.roster || null;
 
   /** 小怪物工位在被召唤时应显示的状态：召唤即视为在忙，除非显式指定 thinking/blocked */
-  function gremlinState(state) {
+  function gremlinState(state, result) {
+    // 写了 result = 收工：工位回空闲（顺序是"汇报 → 空闲 → 幽灵消失"）
+    if (result) return 'idle';
     const s = normState(state);
-    return s === 'busy' || s === 'thinking' || s === 'blocked' ? s : 'busy';
+    if (s === 'busy' || s === 'thinking' || s === 'blocked') return s;
+    // 清单里明写了 idle / offline 就照它显示：不替调用方把"空闲"编造成"忙碌"。
+    // "召唤即视为在忙"只用于**没写状态**的条目（hook 侧召唤一律写 busy）。
+    if (s === 'idle' || s === 'offline') return s;
+    return 'busy';
   }
 
   /** name -> {id, title} 当前挂在幽灵身上的任务 */
   const tasks = new Map();
+  /** name -> { result, at } 已收工、等着播完汇报再回收的（见文件头） */
+  const retiring = new Map();
   /** @type {NodeJS.Timeout[]} */
   const timers = [];
   /** @type {fs.FSWatcher[]} */
@@ -130,6 +176,8 @@ function createSubagentFeed(opts) {
       const memberId = `subagent-${a.name}`;
       const fullId = bus.memberIdOf(project, memberId);
       alive.add(fullId);
+      // 老库的幽灵行没有 client，顺手补（只在缺失/不一致时写）
+      if (a.client) bus.tagMemberClient(project, memberId, a.client);
       if (changed) {
         bus.registerMember({
           project,
@@ -140,12 +188,32 @@ function createSubagentFeed(opts) {
           ephemeral: true,
           projectLabel: a.project || feedProject,
           workspacePath: opts.workspacePath || '',
+          client: a.client || '',
         });
       }
 
       // 任务：标题变了就换一个（旧的收尾），没变只推进度
       const known = tasks.get(fullId);
-      if (a.task) {
+      if (a.result) {
+        // 收工：结果摘要作为产出下发（渲染层拿它当汇报文案），任务按 done 收尾；
+        // 幽灵留着，等汇报演完再摘（下方 retiring 到点处理）。
+        if (known) {
+          // 摘要写失败也不能拖住收工（否则幽灵既不汇报也不散）
+          try {
+            bus.endTask({
+              project,
+              memberId,
+              taskId: known.id,
+              state: 'done',
+              artifacts: [{ kind: 'text', title: a.result, path: SUMMARY_PATH }],
+            });
+          } catch (err) {
+            console.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
+          }
+          tasks.delete(fullId);
+        }
+        if (!retiring.has(a.name)) retiring.set(a.name, { result: a.result, at: Date.now() + RETIRE_MS });
+      } else if (a.task) {
         if (!known || known.title !== a.task) {
           if (known) bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
           const r = bus.startTask({ project, memberId, title: a.task, progress: a.progress ?? 0, files: a.files });
@@ -173,12 +241,20 @@ function createSubagentFeed(opts) {
         bus.heartbeat({
           project,
           memberId: a.name,
-          state: gremlinState(a.state),
+          state: gremlinState(a.state, a.result),
           progress: a.progress,
           files: a.files,
         });
         roster.markActive(a.name);
       }
+    }
+
+    // 到点回收：汇报演完了，把这条从清单里摘掉 —— 幽灵这才散掉
+    const nowMs = Date.now();
+    for (const [name, plan] of [...retiring]) {
+      if (nowMs < plan.at) continue;
+      retiring.delete(name);
+      retireFromFeed(name, plan.result);
     }
 
     // 清单里没了 -> 幽灵散掉（含上一轮残留的临时成员）
@@ -192,6 +268,36 @@ function createSubagentFeed(opts) {
     }
 
     return feed.agents.length;
+  }
+
+  /**
+   * 从清单里摘掉一只已收工的（汇报已播完 → 幽灵散掉）。
+   * 只摘 result 仍然相同的那条：期间若被重新召唤（result 被清掉 / 换了），就别误删新一轮。
+   * @param {string} name
+   * @param {string} result
+   */
+  function retireFromFeed(name, result) {
+    // 直接改原始 JSON、**不**走 readFeed 的归一化：否则回写会把别条目的 id / ts
+    // 等字段冲掉（那两个是 hook 用来做并发去重和 TTL 的）。
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return;
+    }
+    const wrap = !Array.isArray(data) && Array.isArray(data.agents);
+    const list = Array.isArray(data) ? data : wrap ? data.agents : null;
+    if (!list) return;
+    const i = list.findIndex((a) => a && a.name === name && String(a.result || '') === String(result || ''));
+    if (i < 0) return;
+    list.splice(i, 1);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const out = Array.isArray(data) ? list : { ...data, agents: list };
+      fs.writeFileSync(file, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
+    } catch (err) {
+      console.warn('[workgremlin] subagent 收工回收失败：', err && err.message);
+    }
   }
 
   function start() {

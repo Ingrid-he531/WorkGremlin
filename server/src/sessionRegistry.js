@@ -9,8 +9,11 @@
  *   3F CodeBuddy 插件 —— 结构化落盘（genie-history / todos / message-queue / file-changes），
  *                        拿得到运行态、待办清单、改动文件（见 sessions.js）
  *   1F CodeBuddy CLI、
- *   2F WorkBuddy CLI   —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
+ *   2F WorkBuddy CLI、
+ *   4F Codex CLI、
+ *   5F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
  *                        工程名要看首行里有没有 cwd，读不到就留空（不猜）
+ *                        （Codex 的 cwd 藏在首行 payload.cwd 里，见 scanCliSessions）
  *
  * 超时：一个会话 60 分钟没有事件（最后更新时间没往前走）就从表里移除。
  * 它被移除只是"不再活跃"，下次它又有动静会被当成新会话重新登记。
@@ -46,25 +49,98 @@ function mtime(p) {
   }
 }
 
-/** 只读文件开头一小段 —— 会话 jsonl 可能很大，别整读 */
-function headText(p, bytes = 8192) {
+/**
+ * 只读第一行（会话 jsonl 可能很大，别整读；按块读直到换行或上限）。
+ * 上限给得比较宽（256KB）：Codex 的 session_meta 那一行里塞了整份 base_instructions，
+ * 8KB 会把它截断成一个残缺的 JSON，cwd 就读不出来了。
+ */
+function headLine(p, cap = 262_144) {
+  let fd;
   try {
-    const fd = fs.openSync(p, 'r');
-    const buf = Buffer.alloc(bytes);
-    const n = fs.readSync(fd, buf, 0, bytes, 0);
-    fs.closeSync(fd);
-    return buf.subarray(0, Math.max(0, n)).toString('utf8');
+    fd = fs.openSync(p, 'r');
   } catch {
     return '';
+  }
+  try {
+    const CHUNK = 8192;
+    let buf = Buffer.alloc(0);
+    while (buf.length < cap) {
+      const next = Buffer.alloc(CHUNK);
+      const n = fs.readSync(fd, next, 0, CHUNK, buf.length);
+      if (n <= 0) break;
+      buf = Buffer.concat([buf, next.subarray(0, n)]);
+      const nl = buf.indexOf(0x0a);
+      if (nl >= 0) return buf.subarray(0, nl).toString('utf8');
+      if (n < CHUNK) break;
+    }
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* 关闭失败无所谓 */
+    }
+  }
+}
+
+/** 从首行里取工程路径；读不到就留空，不猜 */
+function cwdOfFirstLine(line) {
+  if (!line) return '';
+  try {
+    const j = JSON.parse(line);
+    // CodeBuddy 家族：cwd 在顶层
+    if (j && typeof j.cwd === 'string') return j.cwd;
+    // Codex：{"type":"session_meta","payload":{"cwd":...}} —— cwd 藏在 payload 里
+    if (j && j.payload && typeof j.payload.cwd === 'string') return j.payload.cwd;
+  } catch {
+    /* 首行超长被截断，退到正则 */
+  }
+  // 兜底：首行被上限截断时，里面这第一个 cwd 就是会话自己的（不是后面事件里的）
+  const m = line.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (!m) return '';
+  try {
+    const s = JSON.parse(`"${m[1]}"`);
+    return typeof s === 'string' ? s : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 人类可读的相对时间（只用于"会话文件多久前动过"这类说明文案） */
+function formatAge(ms) {
+  const n = Number(ms) || 0;
+  if (n < 60_000) return '刚刚有更新';
+  if (n < 60 * 60_000) return `${Math.round(n / 60_000)} 分钟前有更新`;
+  return `${Math.round(n / (60 * 60_000))} 小时前有更新`;
+}
+
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
   }
 }
 
 /**
  * CLI 落盘里的会话文件（*.jsonl）：一个文件算一个会话。
  * 只有文件时间可靠，别的字段读不到就留空。
+ *
+ * 按 kind 只扫真正放会话的那棵子树：Codex 写在 sessions/YYYY/MM/DD/ 下、
+ * Claude Code 写在 projects/<工程目录>/ 下；两家根目录都还有 history.jsonl、
+ * settings.json 这类不是会话的文件，扫进来全是噪声（顺带也少走一遍 cache / plugins
+ * 那些大目录）。
  */
-function scanCliSessions(dataPath, limit = 200) {
+function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   if (!dataPath) return [];
+  // 只扫真正放会话文件的那棵子树：Codex 在 sessions/ 下，Claude Code 在 projects/ 下。
+  // 根目录里还有 history.jsonl / settings.json 这类不是会话的文件，扫进来全是噪声
+  // （顺带也少走一遍 cache / plugins 那些大目录）。
+  const SUBTREE = { codex: 'sessions', claude: 'projects' };
+  const sub = SUBTREE[kind] ? path.join(dataPath, SUBTREE[kind]) : '';
+  const root = sub && isDir(sub) ? sub : dataPath;
   const out = [];
   const walk = (d, depth) => {
     if (depth > 4 || out.length >= limit) return;
@@ -84,28 +160,17 @@ function scanCliSessions(dataPath, limit = 200) {
       }
       if (!/\.jsonl$/i.test(e.name)) continue;
       const at = mtime(p);
-      // 首行里可能有 cwd（工程路径）；读不到就留空，不猜
-      let cwd = '';
-      const first = headText(p)
-        .split(/\r?\n/)
-        .find(Boolean);
-      if (first) {
-        try {
-          const j = JSON.parse(first);
-          if (j && typeof j.cwd === 'string') cwd = j.cwd;
-        } catch {
-          /* 首行不是 JSON，跳过 */
-        }
-      }
+      // 首行里可能有 cwd（工程路径）；读不到就留空，不猜（解析规则见 cwdOfFirstLine）
+      const cwd = cwdOfFirstLine(headLine(p));
       out.push({
-        id: path.relative(dataPath, p),
+        id: path.relative(root, p),
         project: cwd ? resolveProjectName(cwd) || path.basename(cwd) : '',
         projectPath: cwd,
         lastEventAt: at || Date.now(),
       });
     }
   };
-  walk(dataPath, 0);
+  walk(root, 0);
   return out;
 }
 
@@ -184,10 +249,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
     });
   }
 
-  // 1F / 2F CLI：落盘目录里的 jsonl
+  // 1F / 2F / 4F / 5F CLI：落盘目录里的 jsonl
   for (const p of detectProducts({})) {
     if (p.kind !== 'cli') continue;
-    for (const s of scanCliSessions(p.dataPath)) {
+    for (const s of scanCliSessions(p.dataPath, { kind: p.dataKind })) {
       const lastEventAt = s.lastEventAt;
       upsert({
         floor: p.id,
@@ -197,11 +262,14 @@ function refresh({ workspacePath = '', force = false } = {}) {
         projectPath: s.projectPath,
         mine: Boolean(workspacePath && s.projectPath === path.resolve(workspacePath)),
         current: false,
-        // CLI 落盘里没有运行态，只有文件时间：近期动过就当在干活
+        // CLI 落盘里没有运行态，只有文件时间。**不许编造**（项目铁律）：
+        // 以前这里写 phase:'tool' + action:'改 xxx.jsonl'，主控制台就会一直显示
+        // 「调用工具 · 改 rollout-….jsonl」——那不是观测到的动作，是拿会话文件名冒充的。
+        // 现在老实报 phase:'unreported'（未上报），只把"文件多久前动过"写进 context。
         live: true,
-        phase: now - lastEventAt < 5 * 60_000 ? 'tool' : 'idle',
-        action: now - lastEventAt < 5 * 60_000 ? `改 ${path.basename(s.id)}` : '会话空闲',
-        context: [],
+        phase: 'unreported',
+        action: '',
+        context: [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`],
         inferred: true,
         lastEventAt,
       });
@@ -235,6 +303,9 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       id: p.id,
       name: p.name,
       kind: p.kind,
+      // 这一层监控的是哪个客户端（codebuddy / workbuddy / codex / claude）——
+      // 办公室按它过滤成员，切到 4F 就不该再看见 CodeBuddy 的小怪物
+      client: p.dataKind || '',
       installed: Boolean(p.installed),
       installPathLabel: p.installPathLabel || '',
       dataPathLabel: p.dataPathLabel || '',

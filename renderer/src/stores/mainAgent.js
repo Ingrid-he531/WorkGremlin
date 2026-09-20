@@ -11,13 +11,20 @@
  *
  * 今天微调：
  *   1) 思考中（thinking）时，屏幕第三层把收到的 prompt 原文顶到最前面显示；
- *   2) 调用工具若是 Bash/Shell 类，状态按 await（等待授权）而不是 tool；
+ *   2) 调用工具若是 Bash/Shell 类：**不再**按 await（等待授权）处理 —— 插件既不发
+ *      "等授权"通知也不发"授权结束"通知，命令类工具又不发 PostToolUse，一旦标成 await
+ *      就再也没有事件能把它清掉（点了 run 还一直显示「等待授权」）。
+ *      现在服务端一律报 tool（调用工具 + 实际命令），"要不要提示需要授权"交给渲染层按 tool
+ *      判断：屏上第一行与 tooltip 第一行一起换成「调用工具，需要授权」
+ *      （见 iso/mainConsole.js 的 consolePhaseLabel），操作仍是实际命令，互不串味；
  *   3) 会话停止（setLiveState/applySession 收到 null，或手动 stop）时，先亮出
  *      "任务完成/已暂停" 摘要（summarize）持续 10s，期间无新事件则退回待命(idle)。
  */
 
 import { defineStore, acceptHMRUpdate } from 'pinia';
-import { PHASES } from '../iso/mainConsole';
+// 相位文案（含命令类工具的「调用工具，需要授权」）只有一份实现：屏上第一行与 tooltip 第一行
+// 都走 consolePhaseLabel()，改口径只需动那一处。
+import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
 const SCRIPT = [
@@ -33,6 +40,9 @@ const SCRIPT = [
   { phase: 'await', action: '申请写入 renderer/vite.config.js', target: 'renderer/vite.config.js', context: ['等待用户授权后继续', '原因：修改构建基路径 base'], skill: '', tool: 'mcp: filesystem.write_file', prompt: '', ms: 5000 },
   { phase: 'done', action: '任务完成', context: ['任务：重构用户登录模块', '已交付：登录链路重构', '改动 3 个文件'], skill: '', tool: '', prompt: '', ms: 5000 },
 ];
+
+// 命令类工具（Bash / Shell / 终端 …）的"需要授权"提示不再写进 context —— 它只在相位那一行
+// 出现（见 consolePhaseLabel）。写进 context 会顺着 enterDone 的"沿用最后上下文"漏到「任务完成」上。
 
 /** 定时器放在 store 外面：它不属于"状态"，也没必要进 devtools */
 let timer = null;
@@ -61,7 +71,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
   getters: {
     /** 交给引擎的那一份：新对象，watch 才收得到变化 */
     snapshot: (s) => ({ phase: s.phase, action: s.action, skill: s.skill, tool: s.tool, context: s.context, target: s.target, prompt: s.prompt }),
-    phaseLabel: (s) => (PHASES[s.phase] || PHASES.idle).label,
+    /** tooltip 第一行：与屏上第一行同源（consolePhaseLabel），命令类工具同样显示「调用工具，需要授权」 */
+    phaseLabel: (s) => consolePhaseLabel(s),
     phaseColor: (s) => (PHASES[s.phase] || PHASES.idle).color,
   },
 
@@ -71,13 +82,11 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.idx = ((i % SCRIPT.length) + SCRIPT.length) % SCRIPT.length;
       const step = SCRIPT[this.idx];
       this.phase = step.phase;
-      // 点2：mock 里工具若是 Bash/Shell 类，同样按 await（等待授权）而不是 tool
-      if (step.phase === 'tool' && /\b(bash|shell|terminal|sh|cmd|powershell|exec|zsh)\b/i.test(step.tool || '')) {
-        this.phase = 'await';
-      }
       this.action = step.action || '';
       this.skill = step.skill || '';
       this.tool = step.tool || '';
+      // 点2：mock 里工具若是 Bash/Shell 类（`bash: npm run build`），相位照旧是 tool，
+      // "需要授权"由 consolePhaseLabel 按 tool 判断后写在相位行上，context 保持原样。
       this.context = step.context || [];
       this.target = step.target || null;
       this.prompt = step.prompt || '';
@@ -125,8 +134,12 @@ export const useMainAgentStore = defineStore('mainAgent', {
      *
      * 阶段映射（hook 的 AGENT_STATES -> 主控制台 PHASES）：
      *   busy    -> tool  （调用工具 / 干活中）
-     *             但若工具是 Bash/Shell 类，按 await（等待授权）而不是 tool
+     *             命令类工具（Bash/Shell）也一样是 tool：插件不发"等授权 / 授权结束"通知，
+     *             标成 await 就再没有事件能把它清掉。要不要提示"需要授权"由渲染层按 tool 判断，
+     *             且只改屏上那行（见 iso/mainConsole.js 的 drawConsoleScreen），action（操作）仍是实际命令。
      *   blocked -> await（等用户授权；工具与目标走会话落盘的 await 叠加）
+     *             注：await 相位仍然只认服务端给的真值（Notification 等授权 -> await，
+     *             授权结束 -> 回落其它相位），渲染层不自己推断。
      *   idle / online / offline -> idle（offline 对应"关掉 VS Code 还显示规划中"的修复）
      * @param {null|{phase:string, action?:string, context?:string[], target?:any, prompt?:string}} s
      */
@@ -153,18 +166,17 @@ export const useMainAgentStore = defineStore('mainAgent', {
       //  - UserPromptSubmit 进入的「思考中」被吞成「待命」；
       //  - 正在调工具时相位被压成「待命」，action 却还留着上一条工具命令
       //    （图上"待命中却显示 Bash diff"就是这么来的）。
+      // 相位一律采用服务端映射好的真值：busy -> tool、blocked -> await。
+      // 命令类工具（Bash）不再在这里被改写成 await —— 插件没有"授权结束"通知，
+      // 改写后没有任何事件能把它清掉，主控制台会一直卡在「等待授权」。
       const hookPhase = s.phase || 'idle';
-      const tool = String(s.tool || '').toLowerCase();
-      const isBash = /\b(bash|shell|terminal|sh|cmd|powershell|exec|zsh)\b/i.test(tool);
       let phase;
       if (hookPhase === 'busy') {
-        // 原始 hook 状态：busy 可能调工具，也可能跑 Bash（按「等待授权」处理）
-        phase = isBash ? 'await' : 'tool';
+        phase = 'tool';
       } else if (hookPhase === 'blocked') {
         phase = 'await';
       } else if (PHASES[hookPhase]) {
-        // 已是 UI 相位，直接采用；Bash 类工具按「等待授权」而非「调用工具」
-        phase = hookPhase === 'tool' && isBash ? 'await' : hookPhase;
+        phase = hookPhase;
       } else {
         phase = 'idle';
       }
@@ -217,6 +229,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.phase = 'done';
       this.action = summary || '任务完成 · 等待下一步';
       this.context = Array.isArray(context) ? context : [];
+      // 收尾相位要把工具名清掉：残留的 Bash 会让「需要授权」串到「任务完成」上
+      this.tool = '';
       this.prompt = '';
       stopTimer = setTimeout(() => {
         this.phase = 'idle';
@@ -226,12 +240,37 @@ export const useMainAgentStore = defineStore('mainAgent', {
       }, 10000);
     },
 
+    /**
+     * 没有会话（切到了一个没有活跃会话的楼层）：控制台回到待命。
+     * 与 applySession(null)（会话取消 → 亮"任务完成"摘要）分开：空楼层跟"上一层收工"
+     * 没关系，弹"任务完成"是拿别人的收尾信号冒充这层的状态。
+     * @param {string[]} [context] 待命时屏上第三层显示的话
+     */
+    enterIdle(context = []) {
+      this.auto = false;
+      clearTimeout(timer);
+      timer = null;
+      clearTimeout(stopTimer);
+      stopTimer = null;
+      this.live = false;
+      this.hookLive = false;
+      this.liveMember = null;
+      this.phase = 'idle';
+      this.action = '';
+      this.skill = '';
+      this.tool = '';
+      this.target = null;
+      this.context = Array.isArray(context) ? context.slice() : [];
+      this.prompt = '';
+    },
+
     /** 手动暂停演示：亮出"已暂停"摘要（summarize 阶段），持续 10s 后退回待命 */
     enterPause(summary = '已暂停 · 等待下一步') {
       clearTimeout(stopTimer);
       this.phase = 'summarize';
       this.action = summary;
       this.context = [];
+      this.tool = '';
       this.prompt = '';
       stopTimer = setTimeout(() => {
         this.phase = 'idle';

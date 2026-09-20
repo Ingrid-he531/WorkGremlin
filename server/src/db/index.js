@@ -48,6 +48,7 @@ function ensureColumn(db, table, column, ddl) {
 function migrate(db) {
   ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'members', 'project_label', 'project_label TEXT');
+  ensureColumn(db, 'members', 'client', 'client TEXT');
   ensureAgentStatusThinking(db);
 }
 
@@ -170,15 +171,21 @@ function createRepo(db) {
     getProjectByWorkspace: db.prepare(`SELECT * FROM projects WHERE workspace_path = ?`),
 
     upsertMember: db.prepare(`
-      INSERT INTO members (id, project_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project_label)
-      VALUES (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @projectLabel)
+      INSERT INTO members (id, project_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project_label, client)
+      VALUES (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @projectLabel, @client)
       ON CONFLICT(id) DO UPDATE SET
         role = COALESCE(excluded.role, members.role),
         session_id = COALESCE(excluded.session_id, members.session_id),
         reported = MAX(members.reported, excluded.reported),
         last_seen_at = MAX(COALESCE(members.last_seen_at, 0), COALESCE(excluded.last_seen_at, 0)),
         ephemeral = MAX(members.ephemeral, excluded.ephemeral),
-        project_label = COALESCE(excluded.project_label, members.project_label)
+        project_label = COALESCE(excluded.project_label, members.project_label),
+        -- 来源客户端已知就覆盖（老库是 NULL，第一次上报/名册心跳会补上）
+        client = COALESCE(excluded.client, members.client)
+    `),
+    tagMemberClient: db.prepare(`
+      UPDATE members SET client = @client
+      WHERE id = @id AND (client IS NULL OR client <> @client)
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
     listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),

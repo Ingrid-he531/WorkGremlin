@@ -18,12 +18,14 @@ const path = require('node:path');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const USER_AGENTS_DIR = path.join(HOME, '.codebuddy', 'agents');
+/** Codex CLI 的 agent 定义目录（实测：codex home 下有 agents/；扩展名以 .md / .toml 都试） */
+const USER_CODEX_AGENTS_DIR = path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'agents');
 
 /** 文件名大小写兼容：CodeBuddy 文档要求小写连字符，但保险起见两种都试 */
 function fileExists(dir, name) {
   const base = String(name || '').trim();
   if (!base) return false;
-  const cands = [`${base}.md`, `${base.toLowerCase()}.md`];
+  const cands = [`${base}.md`, `${base.toLowerCase()}.md`, `${base}.toml`, `${base.toLowerCase()}.toml`];
   return cands.some((f) => {
     try {
       return fs.statSync(path.join(dir, f)).isFile();
@@ -42,10 +44,12 @@ function detectLevel(name, workspacePath) {
 
   let level = null;
   if (ws) {
-    const projDir = path.join(path.resolve(ws), '.codebuddy', 'agents');
-    if (fileExists(projDir, name)) level = 'project';
+    const root = path.resolve(ws);
+    if (fileExists(path.join(root, '.codebuddy', 'agents'), name)) level = 'project';
+    else if (fileExists(path.join(root, '.codex', 'agents'), name)) level = 'project'; // Codex CLI
   }
   if (!level && fileExists(USER_AGENTS_DIR, name)) level = 'user';
+  else if (!level && fileExists(USER_CODEX_AGENTS_DIR, name)) level = 'user'; // Codex CLI
 
   cache.set(key, level);
   return level;

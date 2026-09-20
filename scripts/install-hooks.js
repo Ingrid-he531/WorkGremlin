@@ -33,14 +33,35 @@ const HOOK_SCRIPT = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'hook.js
 /**
  * matcher 为 null 表示这个事件不吃 matcher（UserPromptSubmit / Stop）。
  * 写 / 改类工具才记 file_activity，读类不记（读了什么文件不重要，也免得刷屏）。
+ *
+ * PostToolUse 的白名单里**必须有 Task**：subagent 的"收工"信号原本押在它身上，
+ * 结果 Task 不在名单里 → CodeBuddy 压根不为它调我们的 hook → 幽灵只加不散
+ * （日志实测：5 次 Task 的 PreToolUse，0 次 PostToolUse；写类工具才是成对的）。
+ * 同理注册 SubagentStop 作为第二条收场信号（hook 侧只收幽灵、不碰主会话任务）。
  */
+const CODEX_EVENTS = [
+  ['SessionStart', ''],
+  ['UserPromptSubmit', null],
+  ['PreToolUse', ''],
+  ['PostToolUse', ''],
+  ['PermissionRequest', null],
+  ['SubagentStart', null],
+  ['SubagentStop', null],
+  ['Stop', null],
+  ['Interrupt', null],
+  ['SessionEnd', ''],
+];
+
 const EVENTS = [
   ['SessionStart', ''],
   ['UserPromptSubmit', null],
   ['PreToolUse', ''],
-  ['PostToolUse', '^(Write|Edit|MultiEdit|NotebookEdit|write_to_file|replace_in_file)$'],
-  ['Notification', 'permission_prompt|idle_prompt'],
+  ['PostToolUse', '^(Write|Edit|MultiEdit|NotebookEdit|write_to_file|replace_in_file|Task|Agent)$'],
+  // Notification 和 UserPromptSubmit / Stop / SubagentStop 一样**不吃 matcher**
+  // （扩展源码：EVENTS_WITHOUT_MATCHER 恰好是这四个）—— 给它写 matcher 可能整条不生效
+  ['Notification', null],
   ['Stop', null],
+  ['SubagentStop', null],
   ['SessionEnd', ''],
 ];
 
@@ -66,6 +87,20 @@ function parseArgs(argv) {
 function command(member) {
   const base = `node "${HOOK_SCRIPT}"`;
   return member && member !== 'codebuddy' ? `${base} --member ${member}` : base;
+}
+
+/**
+ * Codex 的 hook 命令：注入 WORKGREMLIN_CLIENT=codex（hook 靠它选事件名与工具名口径，
+ * 见 packages/reporter/src/hook.js 的 IS_CODEX），默认工位名也换成 codex —— 不跟 CodeBuddy
+ * 抢同一张工位卡。
+ */
+function codexCommand(member) {
+  return `WORKGREMLIN_CLIENT=codex node "${HOOK_SCRIPT}" --member ${member}`;
+}
+
+/** WorkBuddy 同理：带自己的 client 与工位名，别写成 codebuddy */
+function workbuddyCommand(member) {
+  return `WORKGREMLIN_CLIENT=workbuddy node "${HOOK_SCRIPT}" --member ${member}`;
 }
 
 /** 我们加的那几条：按 command 里有没有 hook 脚本路径识别 */
@@ -228,11 +263,19 @@ function main() {
     .filter(Boolean);
 
   const cmd = command(member);
-  const ours = {};
-  for (const [event, matcher] of EVENTS) {
-    const entry = { type: 'command', command: cmd, timeout: 10 };
-    ours[event] = [matcher === null ? { hooks: [entry] } : { matcher, hooks: [entry] }];
-  }
+  const buildOurs = (events, hookCmd) => {
+    const out = {};
+    for (const [event, matcher] of events) {
+      const entry = { type: 'command', command: hookCmd, timeout: 10 };
+      out[event] = [matcher === null ? { hooks: [entry] } : { matcher, hooks: [entry] }];
+    }
+    return out;
+  };
+  const ours = buildOurs(EVENTS, cmd);
+  const codexMember = String(args.member || 'codex').trim() || 'codex';
+  const codexOurs = buildOurs(CODEX_EVENTS, codexCommand(codexMember));
+  const wbMember = String(args.member || 'workbuddy').trim() || 'workbuddy';
+  const workbuddyOurs = buildOurs(EVENTS, workbuddyCommand(wbMember));
 
   const all = [
     {
@@ -249,6 +292,16 @@ function main() {
       file: path.join(os.homedir(), '.workbuddy', 'settings.json'),
       cmd: 'workbuddy',
       dir: path.join(os.homedir(), '.workbuddy'),
+      ours: workbuddyOurs,
+    },
+    {
+      id: 'codex',
+      label: 'Codex CLI',
+      // 实测（Codex 0.151.0）：用户级 hooks 文件就在 codex home 下，结构与 CodeBuddy settings.json 同源
+      file: path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'hooks.json'),
+      cmd: 'codex',
+      dir: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
+      ours: codexOurs,
     },
     { id: 'project', label: `CodeBuddy 项目级（${path.basename(REPO_ROOT)}）`, file: path.join(REPO_ROOT, '.codebuddy', 'settings.json'), optional: true },
   ];
@@ -260,6 +313,7 @@ function main() {
   }
 
   console.log(`[workgremlin] hook 命令：${cmd}`);
+  if (!wanted.length || wanted.includes('codex')) console.log(`[workgremlin] Codex 命令：${codexCommand(codexMember)}`);
   console.log(`[workgremlin] 工位名：${member}（WORKGREMLIN_MEMBER 可在环境里覆盖）`);
   if (dryRun) console.log('[workgremlin] --dry-run：不落盘');
 
@@ -279,7 +333,7 @@ function main() {
       continue;
     }
 
-    const next = merge(existing || {}, ours, uninstall);
+    const next = merge(existing || {}, t.ours || ours, uninstall);
     const before = JSON.stringify(existing || {});
     const after = JSON.stringify(next);
 
@@ -303,6 +357,8 @@ function main() {
 
   if (!uninstall) {
     console.log('');
+    console.log('[workgremlin] · Codex CLI：hook 需要「信任」才会执行 —— 首次在新会话里用 /hooks 批准一次；');
+    console.log('                       自动化场合可临时加 --dangerously-bypass-hook-trust');
     console.log('[workgremlin] 生效方式：');
     console.log('  · CodeBuddy 插件：重开会话');
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');

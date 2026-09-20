@@ -26,13 +26,6 @@ const mainAgent = useMainAgentStore();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
 
-/** 左上角"楼层"标签：办公室当前展示的是哪一层（来自 session store 的楼层表） */
-const floorLabel = computed(() => {
-  const f = sessions.floors.find((x) => x.id === sessions.selectedFloor);
-  if (f) return `${f.id} · ${f.name}`;
-  return sessions.selectedFloor || '—';
-});
-
 /* ------------------------------ 主 Agent 相位快轮询（1.5s） ------------------------------
  * 服务端 /api/v1/reporter-phase 直接回 reporter hook 的上报相位（已映射成 UI 字段），
  * 比 /sessions 的 10s 轮询新鲜，专供主控制台"操作"实时显示（调用工具 / 等待授权）。
@@ -47,15 +40,27 @@ async function startPhasePoll() {
   if (!info || !info.port) return;
   const tick = async () => {
     try {
-      const res = await fetch(`${httpBase(info)}/api/v1/reporter-phase`, {
+      // 带上当前楼层的客户端：同一工程里 Codex 与 CodeBuddy 同时在跑时，各取各的相位
+      const want = sessions.selectedClient;
+      const qs = want ? `?client=${encodeURIComponent(want)}` : '';
+      const res = await fetch(`${httpBase(info)}/api/v1/reporter-phase${qs}`, {
         headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
       });
       if (res.ok) {
         const d = await res.json();
-        if (d && d.ok && d.phase && d.phase !== 'idle') {
-          fastPhase.value = { phase: d.phase, action: d.action, target: d.target, context: d.context || [], tool: d.tool || '', prompt: d.prompt || '', workspacePath: d.workspacePath || '' };
-        } else {
-          fastPhase.value = null;
+        if (d && d.ok) {
+          // 相位可能为空（这一轮结束 / 当前没动作），但 instrumented 要留住：
+          // 渲染层靠它区分"这个工程根本没接 hook"和"接了、只是现在没事干"。
+          fastPhase.value = {
+            phase: d.phase && d.phase !== 'idle' ? d.phase : null,
+            action: d.action || '',
+            target: d.target || null,
+            context: d.context || [],
+            tool: d.tool || '',
+            prompt: d.prompt || '',
+            workspacePath: d.workspacePath || '',
+            instrumented: Boolean(d.instrumented),
+          };
         }
       }
     } catch {
@@ -126,7 +131,7 @@ function sameWorkspace(a, b) {
  * （它自己工程 reporter 上报的真值，或落盘推断值），绝不拿别的工程的实时相位冒充。
  * 这样多个工程同时开着时，下拉切到哪条就显示哪条，与所选会话一一对应。
  */
-const consoleLive = computed(() => {
+const consoleBase = computed(() => {
   const sel = sessions.selected;
   if (!sel) return null;
   // 选中的恰好是"全局当前在敲"的那条（fresh）：叠加 1.5s 快轮询的实时相位，
@@ -135,8 +140,13 @@ const consoleLive = computed(() => {
   // 再加一道"工程归属"校验：快轮询相位带回了它所属工程（workspacePath），只有选中会话正好
   // 属于那个工程才叠加。否则切工程后旧会话的 fresh 还来不及翻新（会话快照滞后），新工程的
   // "思考中"会短暂盖到旧会话上——现象就是旧会话闪一下"思考中"、随后回落"待命中"。
-  if (sel.fresh && fastPhase.value && sameWorkspace(fastPhase.value.workspacePath, sel.projectPath)) {
-    const fp = fastPhase.value;
+  const fp = fastPhase.value;
+  const sameWs = Boolean(fp) && sameWorkspace(fp.workspacePath, sel.projectPath);
+  // `fresh` 只有 3F 插件会话会设（= 全局唯一"正在敲"的那条）。CLI 楼层（1F/2F/4F/5F）没这个标记，
+  // 但同样有 hook 上报的相位 —— 只要"相位所属工程 == 这条会话的工程"就该用它；
+  // 否则 4F 永远只能显示会话表里"按 jsonl 文件时间猜"的兜底：一直「调用工具」+ 文案是那个 rollout 文件名。
+  const canUseFast = Boolean(sel.fresh) || (sel.source === 'cli' && Boolean(sel.projectPath));
+  if (canUseFast && sameWs && fp.phase) {
     if (fp.phase === 'await') {
       return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null, prompt: fp.prompt || '' };
     }
@@ -153,6 +163,11 @@ const consoleLive = computed(() => {
       return { phase: 'thinking', action: fp.action || p, context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, prompt: p };
     }
   }
+  // 接了我们 hook 的 CLI 工程：当前没有相位 = 这一路现在真的没事干 → 待命。
+  // 不能退回会话表里那个"按文件 mtime 猜"的结果（它会在 5 分钟窗口内一直说「调用工具」）。
+  if (sel.source === 'cli' && sameWs && fp.instrumented) {
+    return { phase: 'idle', action: '', context: [], target: null, tool: '', prompt: '' };
+  }
   // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
   // 下拉切到旧工程会话就显示旧会话自己的状态，不再被新工程的实时相位覆盖。
   const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
@@ -164,6 +179,44 @@ const consoleLive = computed(() => {
     tool: sel.tool || '',
     prompt: sel.prompt || '',
   };
+});
+
+/**
+ * 正在替主 agent 干活的 subagent（屋里飘着的幽灵）。
+ *
+ * 这里直接读 project.members、**不复用下面的 sceneMembers** ——
+ * consoleLive 的 watch 在 setup 阶段就会求值一次，那时 sceneMembers 还没初始化（TDZ）。
+ * 筛选口径与 sceneMembers 保持一致：只算临时成员（幽灵）。
+ */
+const busySubagents = computed(() => {
+  if (sessions.floorEmpty || !sessions.live) return [];
+  return project.members.filter(
+    (m) => isEphemeralMember(m) && (m.state === 'busy' || m.state === 'blocked' || m.state === 'thinking')
+  );
+});
+
+/**
+ * 主控制台最终喂给 store 的相位 = 会话自己的相位 + "在等 subagent"这一层。
+ *
+ * 主会话还没收到 Stop（相位仍是 idle）而屋里已经有 subagent 在跑 —— 这时写"待命中"
+ * 是错的：人明明还在这一轮任务里，只是在等小怪物交活。单独给"等待中"，并写出在等谁。
+ * 收到 Stop 后相位变 done / summarize，不再被这里覆盖，"任务完成 → 待命中"照旧。
+ */
+const consoleLive = computed(() => {
+  const v = consoleBase.value;
+  const subs = busySubagents.value;
+  if (subs.length && (!v || v.phase === 'idle')) {
+    const names = [...new Set(subs.map((m) => m.name))].join('、');
+    return {
+      phase: 'waiting',
+      action: `等待 ${names} 汇报`,
+      context: subs.slice(0, 3).map((m) => (m.task ? `${m.name}：${m.task}` : `${m.name} 执行中`)),
+      target: null,
+      tool: '',
+      prompt: '',
+    };
+  }
+  return v;
 });
 
 /**
@@ -186,6 +239,12 @@ watch(
     if (selId !== lastConsoleSessionId) {
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
+      // 空楼层（一条会话都没有）：控制台待命 + 屋里清人（见 sceneMembers），
+      // 不走 applySession(null) —— 那是"会话收工"，会弹「任务完成」，跟这层没关系。
+      if (!sel && sessions.floorEmpty) {
+        mainAgent.enterIdle(['本层暂无活跃会话']);
+        return;
+      }
       mainAgent.applySession(v);
       if (sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
         project.openWorkspace(sel.projectPath);
@@ -226,9 +285,17 @@ let cardRaf = 0;
 // 主 Agent（role=agent）不占工位：它自己的实时状态由主控制台剪影单独吃
 // （setMainAgent），在工位区再摆一个就是重复。所以从工位名单里剔掉，
 // 只让真正的 subagent 小怪物（含扫描器注册的常驻成员）坐工位。
-const sceneMembers = computed(() =>
-  project.members
+const sceneMembers = computed(() => {
+  // 切到没有活跃会话的楼层：屋里一个人都不留。
+  // 否则 project.members 还是上一个工程的人（小怪物站在工位上、卡片也是那批），
+  // 看着就像楼层没切 —— 那层压根没人在干活。
+  if (sessions.floorEmpty) return [];
+  const want = sessions.selectedClient;
+  return project.members
     .filter((m) => m.role !== 'agent')
+    // 按楼层过滤来源：4F 只看 Codex 的成员与幽灵，1F/3F 只看 CodeBuddy 的。
+    // client 为空的（演示数据、手工 scripts/subagents.js 写的、老库还没补上的）视作通用，哪层都显示。
+    .filter((m) => !want || !m.client || m.client === want)
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],
@@ -240,10 +307,18 @@ const sceneMembers = computed(() =>
       taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
       // 被召唤的 subagent 当前任务名：主 agent 会用气泡把它交代给小怪物
       task: m.task && m.task.title ? m.task.title : '',
-    }))
-);
+      // 收工摘要：清单里写的 result 由服务端作为 artifact 随成员卡下发
+      // （kind 只有 file/doc/pr/text，所以记成 kind='text' + path 标记，见 subagentFeed 的 SUMMARY_PATH），
+      // 小怪物收工时会把它说给主 agent 听（见 iso/engine 的 stepReport）。
+      result: ((m.artifacts || []).find((a) => a && a.kind === 'text' && a.path === 'workgremlin:summary') || {}).title || '',
+    }));
+});
 
-watch(sceneMembers, (v) => office && office.setMembers(v));
+watch(sceneMembers, (v) => {
+  // 人没了（切到空楼层）：开着的工位卡片也一起收掉，别挂着上一层某个成员的任务卡
+  if (!v.length) card.value = null;
+  if (office) office.setMembers(v);
+});
 watch(
   () => props.selectedId,
   (v) => office && office.setSelected(v)
@@ -334,12 +409,6 @@ onBeforeUnmount(() => {
       @mouseleave="onConsoleLeave"
     />
 
-    <!-- 楼层标签（左上角）：办公室当前展示的是哪一层 -->
-    <div class="floor-tag">
-      <span class="ft-k">楼层</span>
-      <span class="ft-v">{{ floorLabel }}</span>
-    </div>
-
     <!-- 主 Agent 控制台 tooltip：鼠标停在悬浮屏上 400ms 后弹出 -->
     <div
       v-if="tip.show"
@@ -408,33 +477,6 @@ onBeforeUnmount(() => {
   height: 100%;
   cursor: grab;
   touch-action: none;
-}
-
-.floor-tag {
-  position: absolute;
-  left: 10px;
-  top: 10px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border-radius: 6px;
-  background: rgba(12, 15, 20, 0.8);
-  border: 1px solid var(--border);
-  color: var(--text, #e6ebf2);
-  font-size: 12px;
-  z-index: 4;
-  pointer-events: none;
-}
-
-.floor-tag .ft-k {
-  font-size: 11px;
-  letter-spacing: 1px;
-  color: var(--text-dim, #6e7681);
-}
-
-.floor-tag .ft-v {
-  font-weight: 600;
 }
 
 .card-layer {

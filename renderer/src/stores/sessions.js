@@ -19,6 +19,20 @@ const POLL_MS = 10_000;
 /** 定时器放在 store 外面：它不是状态 */
 let timer = null;
 
+/**
+ * 上一份快照里见过的会话（`楼层:id`）。放在 store 外面：只是记账，不参与渲染。
+ * null = 还没接过第一份快照（那时一切都是"第一次见"，不算新来的）。
+ */
+let seenKeys = null;
+const keyOf = (s) => `${s && s.floor ? s.floor : ''}:${s && s.id ? s.id : ''}`;
+
+/**
+ * 当前这条会话算不算"没在跑"：待命 / 任务完成都算，可以放心跟到新会话上；
+ * 等待授权（await）不算 —— 用户正等着给它放行，别把焦点抢走。
+ */
+// unreported（没接 hook 的 CLI 楼层）也算"没在跑"：新会话出现时可以让它跟过去
+const isIdleish = (s) => !s || s.phase === 'idle' || s.phase === 'done' || s.phase === 'unreported';
+
 const phaseLabel = (p) => (PHASES[p] || PHASES.idle).label;
 const shortId = (id) => String(id || '').slice(0, 8);
 
@@ -30,6 +44,13 @@ export const useSessionStore = defineStore('sessions', {
     sessions: [],
     selectedFloor: '',
     selectedId: '',
+    /**
+     * 用户切到了一个**没有活跃会话**的楼层。
+     * 这层没人在干活 → 办公室要跟着清空（屋里的人、主控制台、对话都不该再挂着上一层工程的）；
+     * 一旦这层出现会话（或用户选了某条会话）就自动置回 false。
+     * 只在用户主动切楼层时置位：初始加载 / 演示模式下没有会话也不该把办公室清掉。
+     */
+    floorEmpty: false,
     /** 服务端建议的楼层（第一个有活跃会话的层） */
     defaultFloor: '',
     /** 空表原因：no-storage / no-open-project */
@@ -47,6 +68,15 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     selected: (s) => s.sessions.find((x) => x.id === s.selectedId) || null,
+
+    /**
+     * 当前楼层对应的客户端：1F/3F=codebuddy、2F=workbuddy、4F=codex、5F=claude。
+     * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）。
+     */
+    selectedClient: (s) => {
+      const f = s.floors.find((x) => x.id === s.selectedFloor);
+      return (f && f.client) || '';
+    },
 
     /** 下拉里没东西可挑时的占位文案（按当前楼层判定） */
     emptyLabel: (s) => (s.sessions.length === 0 ? '没有打开的工程' : '没有活跃会话'),
@@ -119,21 +149,55 @@ export const useSessionStore = defineStore('sessions', {
         const pick = list.find((x) => x.current) || list[0];
         this.selectedId = pick.id;
       }
+      // 这层终于有会话了（刚才还是空的）→ 办公室恢复正常显示
+      if (this.selectedId) this.floorEmpty = false;
+
+      // 新会话插队：当前这条"没在跑"时，自动跟到刚出现的会话上（见 followNewSessions）
+      this.followNewSessions();
+    },
+
+    /**
+     * 新会话插队：这一份快照里出现了上次没见过的会话，且当前选中那条"没在跑"
+     * （待命 / 任务完成），就自动切过去 —— 用户在 IDE 里开了新会话，办公室别还停在旧那条上发呆。
+     * 正在跑 / 等待授权的会话不抢：那是有主的状态。
+     * @returns {string} 切过去的会话 id；没切返回 ''
+     */
+    followNewSessions() {
+      const keys = this.sessions.map(keyOf);
+      if (!seenKeys) {
+        // 第一份快照只记账：否则一进页面就会被"第一次见"的第一条抢走
+        seenKeys = new Set(keys);
+        return '';
+      }
+      const fresh = this.sessions.filter((s) => !seenKeys.has(keyOf(s)));
+      seenKeys = new Set(keys);
+      if (!fresh.length) return '';
+      if (!isIdleish(this.selected)) return '';
+      // 同时冒出多条：先挑标了 current / fresh 的（真实在活动的那条），否则取最后一条（最新的）
+      const pick = fresh.find((x) => x.current || x.fresh) || fresh[fresh.length - 1];
+      this.select(pick.id);
+      return pick.id;
     },
 
     /** 选中某个会话：楼层跟着它走（会话本来就按楼层分组） */
     select(id) {
       this.selectedId = id || '';
+      this.floorEmpty = false;
       const s = this.sessions.find((x) => x.id === this.selectedId);
       if (s && s.floor) this.selectedFloor = s.floor;
     },
 
-    /** 切楼层：办公室照常显示（没有活跃会话的层也一样），只是下拉跟着换一批 */
+    /**
+     * 切楼层：下拉跟着换一批；**这一层没有活跃会话时办公室一并清空** ——
+     * 那层没人在干活，屋里要是还站着上一层工程的小怪物、顶上还挂着上一个工程的名字，
+     * 看着就像没切换（会话 / 工程 / 对话都还是上一层的）。
+     */
     selectFloor(id) {
       this.selectedFloor = id || '';
       const list = this.floorSessions;
       const pick = list.find((x) => x.current) || list[0];
       this.selectedId = pick ? pick.id : '';
+      this.floorEmpty = !this.selectedId;
     },
 
     /** @param {{port?:number, token?:string, fallback?:boolean}} info */

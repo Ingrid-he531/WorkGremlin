@@ -43,17 +43,21 @@ shared/              类型与协议真源（零依赖，Node 与浏览器同构
 server/              本地服务：HTTP 上报 + WebSocket 推送 + SQLite（可内嵌 Electron，也可独立启动）
 desktop/             Electron 主进程 / preload
 renderer/            Vue 3 + Vite 渲染层
-packages/reporter/   agent 侧上报 SDK + CLI（零依赖）
-docs/                设计、协议、runbook
+packages/reporter/   agent 侧上报 SDK + CLI + hook（零依赖）
+docs/                设计、协议、runbook、**实现现状（文档对齐记录）**
 scripts/             dev / build / postinstall（electron-rebuild）
 ```
+
+> 文档分工：`docs/requirements.md` 是规格，`docs/implementation-status.md` 记录**代码实际怎么做的、和规格哪里对不上**（含「已承诺但未实现」清单）。读代码前建议先看后者。
 
 ## 数据源：A + B 混合
 
 - **B（主，唯一真值）**：agent / runner 通过 `@workgremlin/reporter` 主动上报心跳与任务状态。
-- **A（兜底）**：`chokidar` 监听 `{workspace}/.codebuddy/teams/**`，只补 roster 与消息（M1 实现）。
+- **A（兜底，至今未实现）**：原计划用 `chokidar` 监听 `{workspace}/.codebuddy/teams/**` 只补 roster 与消息；`chokidar` 目前只在 `server/package.json` 里声明，源码零引用。
 - 无心跳 60s → 状态标记 `degraded=1`，UI 灰显 + 标注「推断」，**绝不编造进度/文件/耗时**。
 - 未接上报的成员，进度与文件区域显示「未上报 / —」。
+
+实际在跑的成员来源有四条（见 `docs/implementation-status.md` §2）：CodeBuddy 系 hook 上报、`.codebuddy/agents` 名册、`.workgremlin/subagents.json` 清单、各产品落盘扫描。
 
 ## subagent → 幽灵
 
@@ -75,8 +79,8 @@ node scripts/subagents.js list
 
 ## CodeBuddy / WorkBuddy 接入（hook）
 
-让正在干活的 agent 自己往屋里报状态：装一次，CodeBuddy 插件、CodeBuddy CLI、WorkBuddy CLI
-三个入口的会话都会上报：
+让正在干活的 agent 自己往屋里报状态：装一次，**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI**
+四个入口的会话都会上报：
 
 ```bash
 npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy
@@ -109,6 +113,57 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 - **CLI 侧改完不会立刻生效**：启动时快照 hooks，外部改动要在 `/hooks` 面板过一遍；插件侧重开会话即可。
 
 顶部连接条显示当前**工程名**：`<workspace>/package.json` 的 `name`（去 scope）→ 目录名；拿不到就是空串，不编造。
+
+### Codex CLI 接入（hook）
+
+Codex CLI（0.151+）自带 hook 子系统（`hooks` 是默认开启的 stable feature），协议与 Claude Code / CodeBuddy
+同源，所以共用同一个 `packages/reporter/src/hook.js`，只是事件名与工具名不同，靠 `WORKGREMLIN_CLIENT=codex` 分流：
+
+```bash
+npm run hooks:install                      # 一并写 ~/.codex/hooks.json
+npm run hooks:install -- --targets=codex   # 只装 Codex
+```
+
+装出来的条目（`<codex home>/hooks.json`，默认 `~/.codex/hooks.json`）：
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "", "hooks": [
+  { "type": "command", "command": "WORKGREMLIN_CLIENT=codex node \"/abs/hook.js\" --member codex", "timeout": 10 } ] } ] } }
+```
+
+与 CodeBuddy 的两点差别：
+
+- **需要「信任」**：Codex 的 hook 默认要人工批准一次（TUI 里 `/hooks`）；自动化场合可以临时加
+  `--dangerously-bypass-hook-trust`。**未信任的 hook 不会执行**（会静默跳过，不报错）。
+- **事件与工具名不同**，映射如下：
+
+| Codex 事件 | 上报 | 备注 |
+| --- | --- | --- |
+| `SessionStart` / `SessionEnd` | 注册 + `idle` / `offline` + 撤心跳守护 | 同 CodeBuddy |
+| `UserPromptSubmit` | `task/start` + `thinking` | 同 |
+| `PreToolUse` / `PostToolUse` | `busy` / 回到 `thinking`；写类工具 → `file/touch` | 工具名是 `Bash` / `apply_patch` / `collaboration*` |
+| `PermissionRequest` | `blocked(awaiting_permission)` | CodeBuddy 没有这个事件（那边靠 `Notification`） |
+| `SubagentStart` | 飘出一只幽灵（名字取 `spawn_agent` 的 `task_name`） | CodeBuddy 没有，那边靠 `PreToolUse(Task)` 推断 |
+| `SubagentStop` | 幽灵转「待汇报」，汇报文案取 `last_assistant_message` | 比 CodeBuddy 的「已完成：任务名」更实 |
+| `Interrupt` | 收掉孤儿幽灵（打断时结束事件会丢） | CodeBuddy 没有 |
+| `Stop` | `task/end(done)` + `idle`，顺手扫掉本轮残留的幽灵 | 同 |
+
+CLI 楼层的主控制台**也用 hook 上报的真实相位**（思考中 / 调用工具 + 真实命令 / 等待授权 / 待命）——
+以前只有 3F 插件会话能拿到实时相位，1F/2F/4F/5F 只能"按会话 jsonl 的文件时间猜"，
+表现就是 4F 一直卡在「调用工具 · 改 rollout-xxxx.jsonl」且内容不变。现在只要该工程接过 hook
+（`/api/v1/reporter-phase` 的 `instrumented`）就以 hook 为准，没有动作时显示「待命」。
+
+Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本），hook 会从
+`*** Update File:` / `*** Add File:` / `*** Delete File:` 里解析路径，所以「正在读写」照常显示。
+坐工位的小怪物名册除 `.codebuddy/agents/` 外，也会扫 `<工程>/.codex/agents/` 与 `$CODEX_HOME/agents/`。
+
+**成员是按楼层过滤的**：每个成员都带一个「来源客户端」（`members.client`），办公室与工位卡片只显示
+当前楼层那一路的成员 —— 1F/3F 看 CodeBuddy、2F 看 WorkBuddy、4F 看 Codex、5F 看 Claude。
+所以切到 4F 不会再看见你在 CodeBuddy 里建的小怪物。`client` 为空的是「通用」成员（演示数据、
+手工 `scripts/subagents.js` 写的幽灵），哪层都显示。
+
+Codex 与 CodeBuddy 在同一个工程下**共用** `<工程>/.workgremlin/subagents.json`，所以每条清单记录
+都会带 `client`，收工与扫场只动自己那一路 —— 否则两边的 Stop/Interrupt 会把对方的幽灵一起收掉。
 
 ## 安全基线（不得关闭）
 

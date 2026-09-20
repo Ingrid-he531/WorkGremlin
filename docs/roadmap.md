@@ -20,6 +20,22 @@ coder 与 tester 的里程碑编号不一致，本文档以 **coder 的 M0~M3 �
 
 ---
 
+## 0.1 实际进度（2026-09-20 对齐）
+
+> 代码实际走到哪一步，逐条差异登记在 `docs/implementation-status.md` §5；这里是排期视角的摘要。
+
+| 里程碑 | 已交付 | 未交付 |
+| --- | --- | --- |
+| **M0** ✅ 基本达成 | monorepo 骨架、Electron 窗口、`better-sqlite3` + `electron-rebuild`、`--demo` 确定性数据、reporter SDK/CLI、WS 推送与断线重连 | 6 条可测性契约只有「时间源可注入」（`server/src/clock.js`）等少数落地；`data-testid` 只覆盖部分组件；**仓库里没有任何测试文件** |
+| **M1** 🟡 部分达成 | hook 上报链路（CodeBuddy 插件/CLI、WorkBuddy）、工程切换、常驻名册 + 临时清单、楼层/会话表、`degraded` 60s 灰显 | **A 路线（`chokidar`）零代码**；**消息脱敏零代码**；双连接存储未做；`file_activity.op` 缺 `edit`；告警/通知未做 |
+| **M2** 🟡 部分达成 | 消息落库 + `dedupe_key` 幂等、按成员/类型/时间过滤 + 关键字（`LIKE`）、对话记录界面 | **FTS5 查询与 1~2 字降级未接**（虚表已建）；虚拟滚动未做；归档保留策略未做；`events` 表无写入方 |
+| **M3** ❌ 未开工 | — | electron-builder 打包、时间线图、会话导出、暗色主题、系统通知与免打扰、原文加密通道 |
+| **M4** ❌ 未开工 | — | 派活 / 中断、目录监听生产化 |
+
+**排期之外已额外交付**（本文原先未规划）：等距 Canvas 办公室引擎与主 Agent 控制台（`renderer/src/iso/`）、左侧楼层与产品安装探测（1F~5F）、全局活跃会话表（60 分钟超时剔除）、工程级/用户级 subagent 工牌名册、`docs/design-elevator-transition.md` 的楼层切换设计。
+
+**语言栈**：本文 §7「风险 7」裁决的 TypeScript 迁移**未执行** —— 当前仍是 CommonJS JavaScript（`jsconfig.json`），硬前提「V1 先过」已满足，迁移本身未启动。
+
 ## 1. M0 — 骨架、可测性地基、离线演示
 
 **目标**：工程能一键跑起来，两个核心界面用 mock 数据静态渲染，所有高险技术项（原生模块构建）验证掉。

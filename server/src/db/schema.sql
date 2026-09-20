@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS members (
   -- 临时成员（无工位，场景里是幽灵）：subagent 这类"随项目临时组队"的成员
   ephemeral      INTEGER NOT NULL DEFAULT 0,
   -- 临时成员所属项目名（缺省时 UI 回落到 role）
-  project_label  TEXT
+  project_label  TEXT,
+  -- 来源客户端：codebuddy / workbuddy / codex / claude；NULL = 不知道（演示数据、手工脚本）。
+  -- 办公室按"当前楼层的客户端"过滤就是靠它（NULL 视作通用，哪层都显示）。
+  client         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_members_project ON members(project_id, name);
 

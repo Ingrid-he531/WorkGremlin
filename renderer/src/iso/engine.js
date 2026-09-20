@@ -88,6 +88,15 @@ const GHOST_MEET = { x: 17.0, y: 3.6, z: 2.25 };
 
 /** 小怪物跑到前面后停留 / 对话的时长（秒），之后回工位忙碌 */
 const DISPATCH_TALK = 3.6;
+/** 收工汇报：小怪物跑到主 agent 面前说出结果摘要的停留时长（秒） */
+const REPORT_TALK = 3.4;
+/**
+ * 入场：小怪物不是凭空出现在工位上，而是一个个从大门进来、走到自己工位坐下。
+ * @property {number} ENTER_DELAY 第一批露面前的等待（等画面先亮起来）
+ * @property {number} ENTER_STAGGER 相邻两只之间隔多久（毫秒）
+ */
+const ENTER_DELAY = 400;
+const ENTER_STAGGER = 480;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /** 标识位图缓存：同一文本只渲染一次（标签现在会被放进排序层重画，不能每帧新建 canvas） */
@@ -171,6 +180,18 @@ export function createIsoOffice(canvas, opts = {}) {
   const pendingSeenOnce = new Set();
   /** 坐工位小怪物名字 -> { seat, agentId }：把"被召唤的幽灵"对到它的小怪物 */
   let seatByName = {};
+  /** 汇报编排：subagent 收工 -> 走到主 agent 面前说出结果摘要 -> 回工位，幽灵随后散掉 */
+  let report = null;
+  /** 汇报队列：召唤幽灵写了 result（收工）或直接从名单里消失时入队，一只一只汇报 */
+  const reportQueue = [];
+  /** 汇报期间补画的幽灵：幽灵已从名单里消失、但汇报还没演完时用 */
+  let reportGhost = null;
+  /** ghostId -> { agentId, name, color, task, result }：幽灵没了也知道是谁、干了什么 */
+  const ghostMeta = new Map();
+  /** 同一轮召唤只汇报一次（写了 result 汇报过，随后幽灵被回收时不再报第二次） */
+  const reportedGhostIds = new Set();
+  /** 正被召唤（幽灵还飘着）的小怪物 agentId：这段时间钉在工位上，不许起身溜达 */
+  const summonedAgentIds = new Set();
 
   let raf = 0;
   let last = 0;
@@ -287,12 +308,17 @@ export function createIsoOffice(canvas, opts = {}) {
     dispatch = {
       agentId: a.memberId,
       start: performance.now(),
+      // sent：是否已出发（等它进门 / 等手上动作收尾再发，别在门口就开走）
+      sent: false,
+      // talkAt：**走到控制台跟前**的时刻，对话从这时才开始计时。
+      // 之前按"出发"计时，走得慢的小怪物还没到就被叫回去了 ——
+      // 于是"走到主 agent 控制台前"这段根本看不见，气泡也在半路上就消失。
+      talkAt: 0,
       back: false,
       task: s.task,
       ghostId: s.ghostId || null,
-      reply: Math.random() < 0.5 ? '收到' : '好的',
+      reply: '收到',
     };
-    goTo(a, CONSOLE_FRONT, 'stand');
     dispatchGhost = {
       x: a.seat.x + 0.25,
       y: a.seat.y - 0.15,
@@ -324,18 +350,77 @@ export function createIsoOffice(canvas, opts = {}) {
     ghosts.push(makeGhost(m, ghosts.length, info && info.seat));
   }
 
+  /* ------------------------------ 收工汇报 ------------------------------
+   * subagent 干完活：走到主 agent 控制台前说出**结果摘要**（清单里写的 result，
+   * 没写就退回"已完成：<任务名>"），说完回工位坐下，这时幽灵才散掉 ——
+   * 顺序必须是 汇报 → 空闲 → 幽灵消失，不能"主 agent 一收到 stop 就复位"。
+   */
+
+  /** 汇报文案：优先结果摘要，没有就退回"已完成：<任务名>" */
+  function reportText(r) {
+    const res = String((r && r.result) || '').trim();
+    if (res) return res;
+    const task = String((r && r.task) || '').trim();
+    return task ? `已完成：${task}` : '已完成';
+  }
+
+  /** 入队一次收工汇报（同一轮召唤只报一次） */
+  function pushReport(ghostId, meta) {
+    if (!meta || !meta.agentId) return;
+    if (reportQueue.some((r) => r.ghostId === ghostId)) return;
+    if (report && report.ghostId === ghostId) return;
+    reportQueue.push({ agentId: meta.agentId, ghostId, task: meta.task, result: meta.result });
+    // 幽灵已经不在名单里（没写 result 就被 rm 了）：补一只在工位上方，
+    // 等这轮汇报演完再散，否则"干活的人先没了、再自己汇报"看着像穿帮。
+    if (!reportGhost && !ghosts.some((g) => g.memberId === ghostId)) {
+      const a = agents.find((x) => x.memberId === meta.agentId);
+      if (a) {
+        reportGhost = {
+          id: ghostId,
+          x: a.seat.x + 0.25,
+          y: a.seat.y - 0.15,
+          z: 1.7,
+          color: meta.color || a.color,
+          phase: Math.random() * 6.28,
+          name: meta.name || a.name,
+        };
+      }
+    }
+    pumpReport();
+  }
+
+  function pumpReport() {
+    if (report || !reportQueue.length) return;
+    const r = reportQueue.shift();
+    const a = agents.find((x) => x.memberId === r.agentId);
+    if (!a) return;
+    report = { ...r, start: performance.now(), sent: false, talkAt: 0, back: false };
+  }
+
+  function finishReport() {
+    if (!report) return;
+    if (reportGhost && reportGhost.id === report.ghostId) reportGhost = null;
+    report = null;
+    pumpReport();
+  }
+
+  /** 这只小怪物此刻是否正被召唤（清单里有它的实例幽灵） */
+  const isSummoned = (agentId) => summonedAgentIds.has(agentId);
+
   /** 主 agent 进入 dispatch 相位（mock / 真实）时，也让对应小怪物走同一套编排 */
   function syncDispatch() {
+    // 真召唤不在这里触发：幽灵出现的那一刻（setMembers）就已经把任务交代过一次了，
+    // 之后权限放行 / 相位回放再演一遍，就成了"同一个任务被交代两次"。
     if (mainAgent.phase === 'dispatch' && mainAgent.target) {
       const a = agentByTarget(mainAgent.target);
-      if (a) enqueueDispatch(a.memberId, delegationLine());
+      if (a && !isSummoned(a.memberId)) enqueueDispatch(a.memberId, delegationLine());
     }
     pumpDispatch();
   }
 
   /* ------------------------------ 成员 ------------------------------ */
 
-  function makeAgent(member, index) {
+  function makeAgent(member, index, spawnAt = 0) {
     const seat = DESK_UNITS[index].seat;
     return {
       memberId: member.memberId,
@@ -344,6 +429,9 @@ export function createIsoOffice(canvas, opts = {}) {
       seat,
       x: seat.x,
       y: seat.y,
+      /** 入场时刻（performance.now 毫秒）：到点之前还没进门 —— 不画、不动，到点才出现在门口 */
+      spawnAt,
+      entering: spawnAt > 0,
       facing: 1,
       mode: 'sit',
       moving: false,
@@ -398,10 +486,14 @@ export function createIsoOffice(canvas, opts = {}) {
     /** 小怪物名字 -> { seat, agentId }：被召唤的幽灵按名字对到它的小怪物 */
     const byName = {};
     agents = agents.filter((a) => seatIds.has(a.memberId));
+    // 新来的小怪物排队入场：按收到顺序错开，一只只从大门走进来
+    let enterSlot = 0;
+    const nowMs = performance.now();
     seated.forEach((m, i) => {
       let a = agents.find((x) => x.memberId === m.memberId);
       if (!a) {
-        a = makeAgent(m, i);
+        a = makeAgent(m, i, nowMs + ENTER_DELAY + enterSlot * ENTER_STAGGER);
+        enterSlot += 1;
         agents.push(a);
       }
       a.home = i;
@@ -424,6 +516,25 @@ export function createIsoOffice(canvas, opts = {}) {
     for (const id of [...summonedGhostIds]) if (!gIds.has(id)) summonedGhostIds.delete(id);
     for (const id of [...pendingSeenOnce]) if (!gIds.has(id)) pendingSeenOnce.delete(id);
 
+    // 召唤幽灵从名单里消失 = 这次召唤结束。之前没汇报过（清单里没写 result 就被 rm）
+    // 的，补一次"回主 agent 面前汇报"，免得它无声无息地没了。
+    for (const [id, meta] of [...ghostMeta]) {
+      if (gIds.has(id)) continue;
+      ghostMeta.delete(id);
+      if (!reportedGhostIds.has(id)) pushReport(id, meta);
+      reportedGhostIds.delete(id); // 下次再召唤得能再报一次
+    }
+    if (reportGhost && !gIds.has(reportGhost.id) && !reportQueue.some((r) => r.ghostId === reportGhost.id) && !(report && report.ghostId === reportGhost.id)) {
+      reportGhost = null;
+    }
+
+    // 当前正在被召唤的小怪物：这段时间钉在工位上（见 canWander）
+    summonedAgentIds.clear();
+    for (const m of floating) {
+      const info = m.ghost ? byName[m.name] : null;
+      if (info) summonedAgentIds.add(info.agentId);
+    }
+
     floating.forEach((m, i) => {
       // 幽灵名字若等于某个坐工位小怪物的名字，说明这是"某只小怪物被召唤"的实例幽灵。
       const info = m.ghost ? byName[m.name] : null;
@@ -445,6 +556,23 @@ export function createIsoOffice(canvas, opts = {}) {
           else if (running) dispatch.task = m.task;
         }
         pendingSeenOnce.add(m.memberId);
+      }
+      if (info) {
+        // 记住这只召唤幽灵对应谁、在做什么、结果是什么：
+        // 幽灵被回收后（名单里没了）还要靠它把汇报演完。
+        const prev = ghostMeta.get(m.memberId) || {};
+        ghostMeta.set(m.memberId, {
+          agentId: info.agentId,
+          name: m.name || prev.name || '',
+          color: colorOf(m.memberId),
+          task: m.task || prev.task || '',
+          result: m.result || prev.result || '',
+        });
+        // 写了 result = 收工：立刻去汇报（幽灵还在，等汇报演完服务端才回收它）
+        if (m.result && !reportedGhostIds.has(m.memberId)) {
+          reportedGhostIds.add(m.memberId);
+          pushReport(m.memberId, ghostMeta.get(m.memberId));
+        }
       }
       if (pendingGhostIds.has(m.memberId)) return; // 还没到出现时机
       if (!ghosts.some((g) => g.memberId === m.memberId)) {
@@ -498,6 +626,24 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function stepAgents(dt, now) {
     for (const a of agents) {
+      // 还没进门：先在门口候着（不画不动），到点才冒出来、沿过道走向自己工位
+      if (a.entering) {
+        if (now < a.spawnAt) continue;
+        a.entering = false;
+        if (dispatch && dispatch.agentId === a.memberId) {
+          // 刚建出来就被召唤了：别再走一遍入场，直接落座，交给召唤编排
+          a.x = a.seat.x;
+          a.y = a.seat.y;
+        } else {
+          a.x = PLACES.door.x;
+          // 门洞沿 gy 有 1 格宽，随机错开一点，前后两只不会精确地叠在一条线上
+          a.y = PLACES.door.y + (Math.random() - 0.5) * 0.5;
+          a.facing = 1;
+          a.mode = 'walk'; // 走的过程里得是"站着走"的姿态，到工位才坐下（pendingMode='sit'）
+          goTo(a, a.seat, 'sit');
+        }
+        a.nextThink = now + 4000 + Math.random() * 14000;
+      }
       if (a.path.length && a.pi < a.path.length) {
         let budget = SPEED * dt;
         while (budget > 0 && a.pi < a.path.length) {
@@ -587,7 +733,7 @@ export function createIsoOffice(canvas, opts = {}) {
   function startMeeting(ids) {
     let k = 0;
     agents.forEach((a) => {
-      if (!ids.includes(a.memberId)) return;
+      if (!ids.includes(a.memberId) || a.entering) return; // 还没进门的不去开会
       a.inMeeting = true;
       a.dwell = 0;
       goTo(a, MEETING_SEATS[k % MEETING_SEATS.length], 'meet');
@@ -655,6 +801,310 @@ export function createIsoOffice(canvas, opts = {}) {
     isoBox(c, { x: x - 0.24, y: y - 0.24, z: 0.4, w: 0.48, d: 0.48, h: 0.08, color: COLORS.chair });
     const by = backAtNorth ? y - 0.3 : y + 0.22;
     isoBox(c, { x: x - 0.22, y: by, z: 0.48, w: 0.44, d: 0.1, h: 0.5, color: COLORS.chair });
+  }
+
+  /**
+   * 复印机（会议室西北角）：一台落地式一体机。
+   *
+   * 为什么不能只画一个金属方盒 —— 等距下那跟"文件柜"一模一样。复印机的辨识点全在**分层**上：
+   *   1) 正面中段**凹进去一块**（出纸腔的后壁 / 内壁 / 腔底都压暗），腔里伸出一截浅色托盘，
+   *      托盘上还搭着两张刚吐出来的白纸 —— "出纸"是打印机最直白的语言；
+   *   2) 顶上是一块深色**稿台玻璃**（比机身窄一圈），上面压一块盖板 + 盖板上的进稿槽；
+   *      玻璃必须在盖板**之前**画，盖板只压住中间，露出的那道前边就是"扫描台"；
+   *   3) 控制面板装在稿台前沿（小蓝屏 + 一颗绿灯 + 两颗灰键）—— 柜门不会有这个；
+   *   4) 底柜是两格**纸盒抽屉**（带把手凹槽），通体一整块板就成了柜子；
+   *   5) 比例要敦实（矮胖），瘦高就又变回文件柜。
+   */
+  function drawPrinter(c, pr) {
+    const { x, y, w, d } = pr;
+    const H = pr.h;
+    const xR = x + w;          // 朝 +gx 那面（屏幕右下）
+    const yF = y + d;          // 朝 +gy 那面（朝镜头）
+    const zBase = H * 0.44;    // 纸盒柜顶
+    const zBody = H * 0.76;    // 中段顶 / 稿台底
+    const zGlass = H * 0.83;   // 稿台玻璃面
+    const zLid = H * 0.9;      // 掀盖顶
+    const zAdf = H * 0.94;     // 进稿槽顶
+
+    // ---- 机身：纸盒柜 → 中段（出纸腔所在）→ 稿台 ----
+    isoBox(c, { x, y, z: 0, w, d, h: zBase, color: '#333c4b' });
+    isoBox(c, { x, y, z: zBase, w, d, h: zBody - zBase, color: COLORS.metal });
+    isoBox(c, { x, y, z: zBody, w, d, h: zGlass - zBody, color: '#2f3a4d' });
+
+    // 稿台玻璃（画在盖板之前：盖板待会儿只压住它中间，露出前面那道边）
+    poly(
+      c,
+      [
+        project(x + 0.05, y + 0.04, zGlass),
+        project(xR - 0.05, y + 0.04, zGlass),
+        project(xR - 0.05, yF - 0.03, zGlass),
+        project(x + 0.05, yF - 0.03, zGlass),
+      ],
+      '#212b3a',
+      'rgba(176,208,240,0.45)',
+      0.8
+    );
+
+    // ---- 掀盖 + 盖板上的进稿槽 ----
+    isoBox(c, { x: x + 0.02, y: y + 0.02, z: zGlass, w: w - 0.04, d: d - 0.04, h: zLid - zGlass, color: '#464f61' });
+    isoBox(c, { x: x + 0.14, y: y + 0.06, z: zLid, w: w - 0.28, d: d - 0.12, h: zAdf - zLid, color: '#5b6577' });
+
+    // ---- 出纸腔：正面凹进去一块（凹腔是"一体机"最硬的辨识点）----
+    const cz0 = H * 0.46;
+    const cz1 = H * 0.65;
+    const cx0 = x + 0.08;
+    const cx1 = xR - 0.08;
+    const cyB = yF - 0.07;   // 腔的后壁（比机身正面往里）
+    wallQuad(c, 'y', cyB, cx0, cx1, cz0, cz1, '#141a24');                       // 后壁
+    wallQuad(c, 'x', cx0, cyB, yF, cz0, cz1, '#0f141c');                        // 西内壁
+    poly(c, [project(cx0, cyB, cz0), project(cx1, cyB, cz0), project(cx1, yF, cz0), project(cx0, yF, cz0)], '#1c2331'); // 腔底
+
+    // 出纸托盘 + 上面两张刚吐出来的纸（探出机身外面）
+    isoBox(c, { x: cx0 + 0.02, y: cyB + 0.01, z: cz0, w: cx1 - cx0 - 0.04, d: 0.22, h: 0.025, color: '#a7b2c2' });
+    isoBox(c, { x: cx0 + 0.06, y: cyB + 0.02, z: cz0 + 0.026, w: cx1 - cx0 - 0.12, d: 0.18, h: 0.012, color: '#eef2f8' });
+    isoBox(c, { x: cx0 + 0.09, y: cyB + 0.05, z: cz0 + 0.039, w: cx1 - cx0 - 0.18, d: 0.15, h: 0.012, color: '#f6f9fc' });
+
+    // ---- 控制面板：装在稿台前沿（小蓝屏 + 一颗绿灯 + 两颗灰键）----
+    wallQuad(c, 'y', yF + 0.002, x + 0.1, xR - 0.1, H * 0.67, H * 0.745, '#1b2230', 'rgba(120,150,180,0.3)', 0.8);
+    wallQuad(c, 'y', yF + 0.003, x + 0.13, x + 0.13 + w * 0.32, H * 0.685, H * 0.73, '#2f8fd8');
+    for (let i = 0; i < 3; i += 1) {
+      const bx = x + 0.19 + w * 0.32 + i * 0.09;
+      wallQuad(c, 'y', yF + 0.003, bx, bx + 0.06, H * 0.695, H * 0.72, i === 0 ? '#7fe0a0' : '#5a6474');
+    }
+
+    // ---- 底柜：两格纸盒抽屉（分格 + 把手凹槽，才不是"一整块板"）----
+    [
+      [H * 0.05, H * 0.22, H * 0.115],
+      [H * 0.25, H * 0.4, H * 0.305],
+    ].forEach(([z0, z1, hz]) => {
+      wallQuad(c, 'y', yF + 0.002, x + 0.06, xR - 0.06, z0, z1, '#3b4455', 'rgba(18,24,32,0.55)', 0.8);
+      wallQuad(c, 'y', yF + 0.003, x + 0.3, xR - 0.3, hz, hz + H * 0.03, '#222a38');
+    });
+
+    // ---- 东侧面：散热格栅（三条横线）----
+    for (let i = 0; i < 3; i += 1) {
+      const gz = H * 0.12 + i * H * 0.045;
+      wallQuad(c, 'x', xR + 0.001, y + 0.12, yF - 0.12, gz, gz + H * 0.014, '#2b3341');
+    }
+  }
+
+  /**
+   * 饮水机：机身（正面冷/热两个出水嘴 + 接水盘）+ 倒扣在顶上的 5 加仑水桶。
+   *
+   * 怎么才"看得出是个水桶"（而不是一根蓝色圆柱）：
+   *   1) 侧影按高度做剖面：颈在下（插进机器那截细）→ 外扩 → 直筒 → 收肩 → 顶颈，
+   *      再把每一层的"地面圆"投成椭圆，取长轴两端当左右侧影点，连成整个轮廓；
+   *   2) 桶身是**半透明**的塑料：能透出后面的墙 / 帘，才像桶而不是一颗蓝球（地球）；
+   *      桶里看得见水位：水面画一道椭圆（带亮边），水下面更蓝更沉，上面是空气，两截不同色；
+   *   3) 侧面一道竖高光 + 一道暗面 —— 直筒才有圆柱的体积感；
+   *   4) 几道环筋 + 底部蓝色颈圈 + 水里几个气泡，塑料桶的细节就齐了。
+   */
+  function drawCooler(c, pc) {
+    const HW = 0.3;           // 机身半宽
+    const BH = 0.55;          // 水桶高
+    const bodyH = pc.h - BH;  // 机身高度（顶到桶底）
+    const faceY = pc.y + HW;  // 朝镜头那面（+gy）
+
+    // ---- 机身 ----
+    isoBox(c, { x: pc.x - HW, y: pc.y - HW, z: 0, w: HW * 2, d: HW * 2, h: bodyH, color: COLORS.metal });
+    // 正面：内凹的接水区（深色面板，出水嘴和接水盘都在这一块里）
+    wallQuad(c, 'y', faceY, pc.x - 0.17, pc.x + 0.17, bodyH * 0.5, bodyH * 0.86, '#2a3340');
+    // 冷 / 热两个出水嘴：往 +gy 伸出来一点，蓝 / 红各一个
+    isoBox(c, { x: pc.x - 0.13, y: faceY - 0.03, z: bodyH * 0.55, w: 0.08, d: 0.1, h: 0.05, color: '#4aa3f0' });
+    isoBox(c, { x: pc.x + 0.05, y: faceY - 0.03, z: bodyH * 0.55, w: 0.08, d: 0.1, h: 0.05, color: '#e0603f' });
+    // 接水盘（格栅）：再往下、再往外一点
+    isoBox(c, { x: pc.x - 0.15, y: faceY - 0.03, z: bodyH * 0.34, w: 0.3, d: 0.12, h: 0.035, color: '#39445a' });
+
+    // ---- 水桶 ----
+    const BZ = bodyH;   // 桶底（= 机器顶面）
+    const R = 0.28;     // 桶身最大半径（比机身窄一圈）
+    const LEVEL = 0.74; // 水位（占桶高的比例）
+
+    /** 侧影半径：颈 0.13 → 外扩 → 直筒 R → 收肩 → 顶颈 0.10（s = smoothstep，接缝不生硬） */
+    const rAt = (t) => {
+      const s = (u) => u * u * (3 - 2 * u);
+      if (t < 0.3) return 0.13 + (R - 0.13) * s(t / 0.3);
+      if (t < 0.62) return R;
+      if (t < 0.94) return R + (0.14 - R) * s((t - 0.62) / 0.32);
+      return 0.14 + (0.1 - 0.14) * ((t - 0.94) / 0.06);
+    };
+    /** 某高度那一圈水/塑料投到屏幕上的椭圆 */
+    const ell = (t, k = 1) => groundEllipse(pc.x, pc.y, rAt(t) * k, BZ + t * BH);
+    /** 椭圆上一点：th = 0 是屏幕最右，π/2 是最下（也就是离镜头最近的一圈） */
+    const at = (e, th) => ({
+      x: e.x + e.rx * Math.cos(th) * Math.cos(e.rot) - e.ry * Math.sin(th) * Math.sin(e.rot),
+      y: e.y + e.rx * Math.cos(th) * Math.sin(e.rot) + e.ry * Math.sin(th) * Math.cos(e.rot),
+    });
+    /** 轮廓：右侧影自下而上 + 左侧影自上而下 */
+    const outline = (t0, t1) => {
+      const pts = [];
+      const n = 18;
+      for (let i = 0; i <= n; i += 1) pts.push(at(ell(t0 + (t1 - t0) * (i / n)), 0));
+      for (let i = n; i >= 0; i -= 1) pts.push(at(ell(t0 + (t1 - t0) * (i / n)), Math.PI));
+      return pts;
+    };
+    const yTop = project(pc.x, pc.y, BZ + BH).y;
+    const yBot = project(pc.x, pc.y, BZ).y;
+
+    // 桶身（塑料）：半透明，能透出后面的墙 / 帘 —— 实心蓝白看着就是一颗球（"地球"）。
+    // 白雾只留一丝（0.05）当塑料内壁的磨砂：铺厚了会把透明度抵消掉，看着跟没改一样。
+    poly(c, outline(0, 1), 'rgba(255,255,255,0.05)');
+    const gb = c.createLinearGradient(0, yTop, 0, yBot);
+    gb.addColorStop(0, 'rgba(230,244,252,0.20)');
+    gb.addColorStop(1, 'rgba(183,216,238,0.30)');
+    poly(c, outline(0, 1), gb, 'rgba(58,92,120,0.30)', 1);
+
+    // 水：下半截，跟着桶身一起透（更浅、更淡蓝，水底还是更沉一点，但不再糊成实心蓝）
+    const gw = c.createLinearGradient(0, project(pc.x, pc.y, BZ + LEVEL * BH).y, 0, yBot);
+    gw.addColorStop(0, 'rgba(150,208,240,0.40)');
+    gw.addColorStop(1, 'rgba(70,148,196,0.52)');
+    poly(c, outline(0, LEVEL), gw);
+
+    // 水面：一道椭圆 + 亮边（桶身透明了，水位线反而更要留住 —— 它是"装了水"的关键线索）
+    const se = ell(LEVEL, 0.99);
+    c.beginPath();
+    c.ellipse(se.x, se.y, se.rx, se.ry, se.rot, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(186,226,248,0.42)';
+    c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.45)';
+    c.lineWidth = 1;
+    c.stroke();
+
+    // 环筋：桶身上那几道塑料箍（桶身透明了就别画太实）
+    c.strokeStyle = 'rgba(70,110,145,0.18)';
+    [0.34, 0.42, 0.5, 0.58].forEach((t) => {
+      const e = ell(t, 0.995);
+      c.beginPath();
+      c.ellipse(e.x, e.y, e.rx, e.ry, e.rot, 0, Math.PI * 2);
+      c.stroke();
+    });
+
+    // 竖条带（沿桶身一条高光 / 一条暗面）：直筒才有圆柱感
+    const band = (thA, thB, fill) => {
+      const pts = [];
+      const n = 10;
+      for (let i = 0; i <= n; i += 1) pts.push(at(ell(0.1 + 0.8 * (i / n)), thA));
+      for (let i = n; i >= 0; i -= 1) pts.push(at(ell(0.1 + 0.8 * (i / n)), thB));
+      poly(c, pts, fill);
+    };
+    const gh = c.createLinearGradient(0, yTop, 0, yBot);
+    gh.addColorStop(0, 'rgba(255,255,255,0.34)');
+    gh.addColorStop(0.7, 'rgba(255,255,255,0.12)');
+    gh.addColorStop(1, 'rgba(255,255,255,0.04)');
+    band(0.42, 0.95, gh);                                          // 高光在右前方（窗在那一侧）
+    band(Math.PI - 0.95, Math.PI - 0.42, 'rgba(40,78,110,0.10)');  // 暗面在左前方
+    // 透过前壁看到的**后壁**（远侧那半）：一道很淡的竖带，"透"的感觉大半来自它
+    band(Math.PI * 1.5 - 0.3, Math.PI * 1.5 + 0.3, 'rgba(140,186,216,0.12)');
+
+    // 颈圈：桶口插进机器那截的蓝色塑料环（最后画，正好压住桶底的颈部）
+    isoCylinder(c, { x: pc.x, y: pc.y, z: BZ - 0.03, r: 0.17, h: 0.07, color: '#2f6ea8' });
+
+    // 桶顶小圆盖：也跟着透一点（实心白会把它压成一块"贴片"）
+    const te = ell(1);
+    c.beginPath();
+    c.ellipse(te.x, te.y, te.rx, te.ry, te.rot, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(238,246,252,0.55)';
+    c.fill();
+    c.strokeStyle = 'rgba(120,166,196,0.45)';
+    c.lineWidth = 0.8;
+    c.stroke();
+
+    // 水里的几个气泡（桶身透亮，气泡就别抢戏）
+    [[0.1, -0.06, 0.2], [-0.09, 0.08, 0.36], [0.06, 0.11, 0.5], [-0.05, -0.09, 0.62]].forEach(([dx, dy, t]) => {
+      const b = project(pc.x + dx, pc.y + dy, BZ + t * BH);
+      c.beginPath();
+      c.arc(b.x, b.y, 1.4, 0, Math.PI * 2);
+      c.fillStyle = 'rgba(255,255,255,0.4)';
+      c.fill();
+    });
+  }
+
+  /**
+   * 杂志架（茶水间北墙东段，见 PANTRY.rack）：三层斜面展示架。
+   *
+   * 等距下怎么才"看得出是杂志架"，而不是个摆了几本书的小柜子 —— 每条都是为"封面能被看见"：
+   *   1) **架体沿 x 展开、封面朝 +gy**：镜头正对着 +gy 这一侧，一排封面彼此不遮挡。
+   *      第一版靠着西墙摆（架体沿 y），杂志沿 y 排成一队、后一本盖住前一本，
+   *      整排只剩几条 8px 宽的缝 —— 截图里看着像彩色木条，不像杂志封面；
+   *   2) **层板朝 +gy 倾斜**（后沿高、前沿低）：封面略微仰起，比平放更像"一张封面立着"；
+   *   3) 两端立板夹住层板 + 底下踢脚 + 背后背板：架子才落地，不然层板看着是悬空的。
+   *
+   * 一条硬规矩：**不能用 Math.random**。静态层每帧重画（见 buildStatics），随机色会闪成迪厅；
+   * 高矮 / 宽窄 / 配色一律用 index 取模算（和工位上的键盘、杯子同一种做法）。
+   */
+  function drawMagRack(c, rk) {
+    const X0 = rk.x;
+    const X1 = rk.x + rk.w;
+    const Y0 = rk.y;
+    const Y1 = rk.y + rk.d;
+    const zBase = 0.16; // 踢脚顶面：最下层板从这里起
+    const zTop = rk.h - 0.1; // 顶层板的上限
+    const tiers = Math.max(1, rk.tiers || 3);
+    const step = (zTop - zBase) / tiers;
+    const lean = rk.lean == null ? 0.12 : rk.lean;
+    const T = 0.05; // 层板 / 立板厚度
+    const PT = 0.07; // 两端立板厚度
+    /** 层板面在某个 gy 处的高度：后沿（Y0，贴墙那侧）高、前沿（Y1）低 */
+    const zAt = (zb, gy) => zb + lean * ((Y1 - gy) / rk.d);
+    /** 封面配色：偏亮但不荧光（夜里太跳会跟主控制台抢视线） */
+    const COVERS = ['#e6ebf2', '#7fb0ff', '#d9744f', '#3fb950', '#f5a623', '#a98cf2', '#51c7c0'];
+
+    isoShadow(c, (X0 + X1) / 2, (Y0 + Y1) / 2 + 0.1, rk.w * 0.46, 0.26);
+
+    // 架体：背板（贴墙）+ 踢脚 + 左端立板 —— 先把架子立起来，再往里塞层板和杂志
+    isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: 0.05, h: rk.h, color: COLORS.metalDark });
+    isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: rk.d, h: zBase, color: COLORS.metal });
+    isoBox(c, { x: X0, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: COLORS.metal });
+
+    for (let i = 0; i < tiers; i += 1) {
+      const zb = zBase + i * step + 0.06;
+      // ---- 层板：斜面顶 + 前沿立面（等距下层板朝镜头的只有这两面）----
+      poly(
+        c,
+        [
+          project(X0, Y0, zAt(zb, Y0) + T),
+          project(X1, Y0, zAt(zb, Y0) + T),
+          project(X1, Y1, zAt(zb, Y1) + T),
+          project(X0, Y1, zAt(zb, Y1) + T),
+        ],
+        shade(COLORS.wood, 1.06)
+      );
+      poly(
+        c,
+        [
+          project(X0, Y1, zAt(zb, Y1) + T),
+          project(X1, Y1, zAt(zb, Y1) + T),
+          project(X1, Y1, zAt(zb, Y1)),
+          project(X0, Y1, zAt(zb, Y1)),
+        ],
+        shade(COLORS.wood, 0.66)
+      );
+
+      // ---- 一排杂志：沿 x 并排站、往后靠（顶边更靠 Y0，同时抬高 hj）----
+      const n = 5 + (i % 2); // 5~6 本
+      const slot = (rk.w - 0.2) / n;
+      for (let j = 0; j < n; j += 1) {
+        const xA = X0 + 0.1 + j * slot + slot * 0.14;
+        const xB = xA + slot * 0.72;
+        const hj = 0.2 + 0.035 * ((i * 7 + j * 5) % 3); // 高矮错开
+        const yBot = Y1 - 0.09; // 底边靠前沿
+        const yTp = Y0 + 0.11; // 顶边往后倒
+        const zB = zAt(zb, yBot) + T;
+        const zT = zAt(zb, yTp) + T + hj;
+        const cover = COVERS[(i * 3 + j * 2) % COVERS.length];
+        // 封面：朝 +gy 的那面 —— 镜头正对它，所以整排都看得见（和门楣屏、白板是同一类面）
+        poly(
+          c,
+          [project(xA, yBot, zB), project(xB, yBot, zB), project(xB, yTp, zT), project(xA, yTp, zT)],
+          shade(cover, 0.88),
+          'rgba(10,13,19,0.5)',
+          0.8
+        );
+      }
+    }
+
+    // 右端立板最后画：相机在 +x 方向，它是最靠近镜头的那块，把层板与杂志的端头夹进架子
+    isoBox(c, { x: X1 - PT, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: COLORS.metal });
   }
 
   /**
@@ -971,6 +1421,16 @@ export function createIsoOffice(canvas, opts = {}) {
       push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 3));
     });
 
+    /* 杂志架（茶水间北墙东段），见 drawMagRack */
+    const rk = PANTRY.rack;
+    // 键取"前右侧角"，再抬到"这面墙最东端"之上：北墙（会议室南面玻璃）是分段画的，
+    // 玻璃段的键会一路到 depthOf(19.6, 7.25) ≈ 26.85，架子只要比它浅，后画的玻璃就会切掉架子右角。
+    // 现在架子摆最东端时天然就够（角键 ≈ 26.97），这句保证的是"以后把 d 收窄也不会破"。
+    // 代价：站在它正东侧（x 更大）且更靠镜头的人可能被它压住 —— 那片是茶水间东北角，
+    // 走道（PDOOR_IN → COFFEE）在最西侧，实际不会撞上。
+    const wallEastDepth = depthOf(MEETING.x + MEETING.w, MEETING.y);
+    push(Math.max(depthOf(rk.x + rk.w, rk.y + rk.d), wallEastDepth + 0.1), (c) => drawMagRack(c, rk));
+
     const pc = PANTRY.cooler;
     // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前，属于"玻璃前面"的东西：
     // 它必须排在这条北墙的**所有**玻璃段 / 帘段之后 —— 帘片 alpha 0.92 几乎不透明，
@@ -978,11 +1438,7 @@ export function createIsoOffice(canvas, opts = {}) {
     // 单纯用 depthOf(pc.x, pc.y)（22.85）不够：分段后靠右那些段的键会高到 23.1~26.5。
     // 上限卡死在"接水站位"（PLACES.coffee, 23.55）之下 —— 站在饮水机前接水的小怪物仍要能盖住它。
     const coolDepth = Math.max(depthOf(pc.x, pc.y), depthOf(PLACES.coffee.x, PLACES.coffee.y) - 0.05);
-    push(coolDepth, (c) => {
-      isoBox(c, { x: pc.x - 0.3, y: pc.y - 0.3, z: 0, w: 0.6, d: 0.6, h: pc.h - 0.5, color: COLORS.metal });
-      // 水桶不透明：原先 alpha 0.85 会让背后帘子的横纹透出来，看着也像"被帘子遮了一块"
-      isoCylinder(c, { x: pc.x, y: pc.y, z: pc.h - 0.5, r: 0.28, h: 0.5, color: '#5aa9e6' });
-    });
+    push(coolDepth, (c) => drawCooler(c, pc));
 
     // 茶水间玻璃隔断：只砌西面（门在中间，两片分开挂帘 → 门洞处自然留空）；
     // 北面借会议室的南墙，南面直接贴房间最前面那道玻璃幕墙，不再多砌一道。
@@ -997,15 +1453,10 @@ export function createIsoOffice(canvas, opts = {}) {
       pushGlassFace({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, segW: 0.8, h: ph });
     });
 
-    /* 复印机（会议室西北角） */
+    /* 复印机（会议室西北角）：一台落地式一体机，见 drawPrinter */
     const pr = MEETING.printer;
     // 西面帘子已按坐标分段（见上），复印机用正常 depth 就能排在对应帘段之后。
-    push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2), (c) => {
-      isoBox(c, { ...pr, color: COLORS.metal });
-      // 出纸口 + 控制面板
-      wallQuad(c, 'y', pr.y + pr.d, pr.x + 0.2, pr.x + pr.w - 0.2, pr.h - 0.4, pr.h - 0.1, '#e6ebf2');
-      wallQuad(c, 'y', pr.y + pr.d, pr.x + 0.3, pr.x + pr.w - 0.3, pr.h - 0.36, pr.h - 0.14, '#9aa7b8');
-    });
+    push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2), (c) => drawPrinter(c, pr));
 
     PLANTS.forEach((p) => push(depthOf(p.x, p.y), (c) => drawPlant(c, p)));
 
@@ -1065,14 +1516,18 @@ export function createIsoOffice(canvas, opts = {}) {
   ];
   const NEAR_HALF_H = 0.55;
   const NEAR_FRAME = 'rgba(143,182,255,0.3)';
+  /* 竖挺落在矮墙上的那截：矮墙是实心的，同样的 alpha 会比在玻璃上更闷一点，
+     稍微提一档，上下两截看着才是同一根（不然矮墙顶上会有一道"换色"的横断口）。 */
+  const NEAR_MULLION_BASE = 'rgba(152,192,255,0.38)';
   // 玻璃上沿单独一档：它是墙顶那条边的延续，太淡会看着像"边断在角上"
   const NEAR_RAIL = 'rgba(150,186,255,0.5)';
   const NEAR_RAIL_H = 0.11;
 
   function drawNearLowWalls(c) {
     NEAR.forEach((n) => {
+      // 矮墙只画实心墙身：矮墙与玻璃的交界**不画横框** —— 一道横线等于把墙切成上下两截，
+      // 竖挺通到底已经把两者扎成一整面墙了，再描一道边反而露出拼接感。
       wallQuad(c, n.axis, n.fixed, n.a0, n.a1, 0, NEAR_HALF_H, shade(COLORS.wall, n.k));
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, NEAR_HALF_H, NEAR_HALF_H + 0.07, NEAR_FRAME);
     });
   }
 
@@ -1085,12 +1540,19 @@ export function createIsoOffice(canvas, opts = {}) {
    * 近处两面**不画墙顶**：那是一整圈厚 0.28 的实体顶面，压在玻璃上沿上又重又挡视线
    * （屋里靠前的一切都被它切掉一条）。改由这道上沿收边 —— 后墙/左墙的墙顶在远端收口时
    * 与玻璃面齐平（见 drawWalls），墙顶那条边正好落在这道上沿的延长线上，看上去是一条连续的边。
+   *
+   * 竖挺（竖条）**从地面 0 一直画到墙顶 h**，中间在矮墙顶（NEAR_HALF_H）不断：
+   * 只画在玻璃段的话，矮墙和幕墙就是"两截拼起来的"；一根竖挺通到底，整面墙才是一体的 ——
+   * 矮墙是这根竖挺的基座，玻璃是它嵌的芯（交界处也不画横框，见 drawNearLowWalls）。
    */
   function drawNearGlassFrame(c) {
     const h = WALL.h;
     NEAR.forEach((n) => {
       wallQuad(c, n.axis, n.fixed, n.a0, n.a1, h - NEAR_RAIL_H, h, NEAR_RAIL);
       for (let k = Math.ceil(n.a0 + 1); k < n.a1 - 0.5; k += 2) {
+        // 矮墙段（一直到地面）：压在实心矮墙上，与玻璃段在 NEAR_HALF_H 处无缝接上
+        wallQuad(c, n.axis, n.fixed, k - 0.04, k + 0.04, 0, NEAR_HALF_H, NEAR_MULLION_BASE);
+        // 玻璃段
         wallQuad(c, n.axis, n.fixed, k - 0.04, k + 0.04, NEAR_HALF_H, h, NEAR_FRAME);
       }
     });
@@ -1444,19 +1906,29 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
-  /** 召唤编排推进：小怪物跑到前面停留对话，到点回工位，回到工位后收尾 */
+  /** 召唤编排推进：出发 -> 走到控制台跟前 -> 对话 -> 回工位，回到工位后收尾 */
   function stepDispatch(now) {
     if (!dispatch) return;
     const a = agents.find((x) => x.memberId === dispatch.agentId);
     if (!a) { finishDispatch(); return; }
-    const el = (now - dispatch.start) / 1000;
+    // 还没进门 / 还没落座：等它出现再往控制台走（在门口就开走会瞬移）
+    if (!dispatch.sent) {
+      if (a.entering) return;
+      goTo(a, CONSOLE_FRONT, 'stand');
+      dispatch.sent = true;
+      return;
+    }
     if (!dispatch.back) {
-      a.facing = -1; // 面向控制台（更小 gy）
-      if (el >= DISPATCH_TALK) {
-        dispatch.back = true;
-        goHome(a);
+      if (!a.moving && !a.path.length) {
+        // 到了控制台跟前才开始对话：走得远的小怪物也能把"走过去"演完整
+        if (!dispatch.talkAt) dispatch.talkAt = now;
+        else if (now - dispatch.talkAt >= DISPATCH_TALK * 1000) {
+          dispatch.back = true;
+          goHome(a);
+        }
       }
-    } else if (Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
+      a.facing = -1; // 面向控制台（更小 gy）
+    } else if (!a.moving && !a.path.length && Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
       // 已回到工位：让召唤幽灵出现在头顶，收尾本次编排
       finishDispatch();
       return;
@@ -1464,11 +1936,38 @@ export function createIsoOffice(canvas, opts = {}) {
     if (dispatchGhost) dispatchGhost.phase = (now - t0) / 780;
   }
 
-  /** 临时小幽灵精灵（自带漂浮 + 状态点） */
-  function drawDispatchGhostSprite(c) {
-    if (!dispatchGhost) return;
-    const p = project(dispatchGhost.x, dispatchGhost.y, dispatchGhost.z);
-    const ge = groundEllipse(dispatchGhost.x, dispatchGhost.y, 0.4, 0);
+  /** 收工汇报推进：走到控制台跟前 -> 说出结果摘要 -> 回工位 -> 幽灵散掉 */
+  function stepReport(now) {
+    if (!report) return;
+    const a = agents.find((x) => x.memberId === report.agentId);
+    if (!a) { finishReport(); return; }
+    if (!report.sent) {
+      if (a.entering) return;
+      goTo(a, CONSOLE_FRONT, 'stand');
+      report.sent = true;
+      return;
+    }
+    if (!report.back) {
+      if (!a.moving && !a.path.length) {
+        if (!report.talkAt) report.talkAt = now;
+        else if (now - report.talkAt >= REPORT_TALK * 1000) {
+          report.back = true;
+          goHome(a);
+        }
+      }
+      a.facing = -1;
+    } else if (!a.moving && !a.path.length && Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
+      finishReport();
+      return;
+    }
+    if (reportGhost) reportGhost.phase = (now - t0) / 780;
+  }
+
+  /** 临时小幽灵精灵（自带漂浮 + 状态点）：召唤时 / 汇报期间共用 */
+  function drawFloatingGhostSprite(c, g) {
+    if (!g) return;
+    const p = project(g.x, g.y, g.z);
+    const ge = groundEllipse(g.x, g.y, 0.4, 0);
     c.save();
     c.globalAlpha *= 0.16;
     c.beginPath();
@@ -1480,9 +1979,9 @@ export function createIsoOffice(canvas, opts = {}) {
       x: p.x,
       y: p.y,
       s: SPRITE_S * 0.92,
-      color: dispatchGhost.color,
+      color: g.color,
       state: 'busy',
-      phase: dispatchGhost.phase,
+      phase: g.phase,
     });
   }
 
@@ -1492,7 +1991,14 @@ export function createIsoOffice(canvas, opts = {}) {
     c.globalAlpha = alpha;
     c.font = '600 13px ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
     const padX = 12;
-    const tw = Math.min(c.measureText(text).width, 232);
+    // 结果摘要可能很长：按气泡宽度截断并加省略号，别让文字溢出到框外
+    const maxW = 232;
+    let t = String(text || '');
+    if (c.measureText(t).width > maxW) {
+      while (t.length > 1 && c.measureText(`${t}…`).width > maxW) t = t.slice(0, -1);
+      t = `${t}…`;
+    }
+    const tw = c.measureText(t).width;
     const w = tw + padX * 2;
     const h = 30;
     const bx = x - w / 2;
@@ -1515,7 +2021,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.fillStyle = '#eaf1fb';
     c.textAlign = 'left';
     c.textBaseline = 'middle';
-    c.fillText(text, bx + padX, by + h / 2 + 1);
+    c.fillText(t, bx + padX, by + h / 2 + 1);
     c.restore();
   }
 
@@ -1528,6 +2034,7 @@ export function createIsoOffice(canvas, opts = {}) {
     stepAgents(dt, now);
     stepGhosts(dt, now);
     stepDispatch(now);
+    stepReport(now);
     draw(now);
     raf = requestAnimationFrame(tick);
   }
@@ -1548,9 +2055,13 @@ export function createIsoOffice(canvas, opts = {}) {
 
     // 排序：家具 + 角色混在一起，depth 大的后画（挡住前面的）
     const items = statics.slice();
-    for (const a of agents) items.push({ depth: depthOf(a.x, a.y), draw: (c) => drawAgent(c, a) });
+    for (const a of agents) {
+      if (a.entering) continue; // 还没进门
+      items.push({ depth: depthOf(a.x, a.y), draw: (c) => drawAgent(c, a) });
+    }
     for (const g of ghosts) items.push({ depth: depthOf(g.x, g.y) + 3, draw: (c) => drawGhostSprite(c, g) });
-    if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawDispatchGhostSprite(c) });
+    if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, dispatchGhost) });
+    if (reportGhost) items.push({ depth: depthOf(reportGhost.x, reportGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, reportGhost) });
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
 
@@ -1575,6 +2086,7 @@ export function createIsoOffice(canvas, opts = {}) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     for (const a of agents) {
+      if (a.entering) continue; // 还没进门：不进屏幕坐标表，头顶标签和点选也就一并跟着不出现
       const s = toScreen(a.x, a.y, 0);
       screenPos.set(a.memberId, s);
       const h = SPRITE_H * UNIT_Z * cam.zoom;
@@ -1627,12 +2139,27 @@ export function createIsoOffice(canvas, opts = {}) {
       pushHit('__dispatch_ghost', s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
     }
 
-    // 召唤对话气泡（屏幕空间，压在最上面）
+    // 汇报期间补画的幽灵：名字 + "正在汇报"（结果摘要在气泡里说）
+    if (reportGhost) {
+      const s = toScreen(reportGhost.x, reportGhost.y, reportGhost.z);
+      const y = s.y - SPRITE_H * UNIT_Z * cam.zoom * 0.92 - 12;
+      const box = drawTag(ctx, {
+        x: s.x,
+        y,
+        text: `${reportGhost.name} · 汇报中`,
+        color: STATE_COLOR.online,
+        dashed: true,
+      });
+      pushHit('__report_ghost', s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
+    }
+
+    // 召唤对话气泡（屏幕空间，压在最上面）：主 agent 交代任务 -> 小怪物答"收到"
+    // 计时从**走到控制台跟前**（talkAt）开始，没到之前一个字都别说。
     if (dispatch) {
       const a = agents.find((x) => x.memberId === dispatch.agentId);
-      const el = (now - dispatch.start) / 1000;
-      const fadeOut = 1 - clamp01((el - (DISPATCH_TALK + 0.5)) / 0.7);
-      const mainA = clamp01((el - 0.2) / 0.4) * fadeOut;
+      const el = dispatch.talkAt ? (now - dispatch.talkAt) / 1000 : -1;
+      const fadeOut = 1 - clamp01((el - (DISPATCH_TALK + 0.2)) / 0.7);
+      const mainA = clamp01(el / 0.4) * fadeOut;
       const gremA = clamp01((el - 1.0) / 0.4) * fadeOut;
       if (a && mainA > 0.02) {
         const cs = toScreen(CONSOLE.screen.x + CONSOLE.screen.w / 2, CONSOLE.screen.y, CONSOLE.screen.z1);
@@ -1643,14 +2170,31 @@ export function createIsoOffice(canvas, opts = {}) {
         drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, dispatch.reply || '收到', gremA, a.color);
       }
     }
+
+    // 收工汇报气泡：小怪物站在主 agent 面前说结果摘要
+    if (report) {
+      const a = agents.find((x) => x.memberId === report.agentId);
+      const el = report.talkAt ? (now - report.talkAt) / 1000 : -1;
+      const alpha = clamp01(el / 0.4) * (1 - clamp01((el - (REPORT_TALK + 0.2)) / 0.7));
+      if (a && alpha > 0.02) {
+        const sp = toScreen(a.x, a.y, 0);
+        drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, reportText(report), alpha, a.color);
+      }
+    }
   }
 
   function pushHit(id, x0, y0, x1, y1) {
     hits.push({ id, x0: Math.min(x0, x1), y0: Math.min(y0, y1), x1: Math.max(x0, x1), y1: Math.max(y0, y1) });
   }
 
-  /** 只有空闲的、或正在思考的人才会起身走动；写代码 / 写文档时钉在座位上 */
+  /**
+   * 只有空闲的、或正在思考的人才会起身走动；写代码 / 写文档时钉在座位上。
+   * 被召唤期间（幽灵还飘着 / 正在汇报）一律钉住：它正替主 agent 干活，
+   * 头顶写着"忙碌"却在屋里溜达，看着像在摸鱼。
+   */
   function canWander(a) {
+    if (isSummoned(a.memberId)) return false;
+    if (report && report.agentId === a.memberId) return false;
     return bucketOf(stateOf(a.memberId)) !== 'busy' || a.work === 'think';
   }
 
