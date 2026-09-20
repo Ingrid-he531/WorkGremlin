@@ -31,7 +31,6 @@ import {
   COLORS,
   WALL,
   DESK_UNITS,
-  RUGS,
   MEETING,
   MEETING_SEATS,
   PANTRY,
@@ -918,44 +917,38 @@ export function createIsoOffice(canvas, opts = {}) {
       push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 4));
     });
 
-    // 玻璃隔墙（半透明，压在会议室里的人之上）；每片玻璃迎镜头那一面再挂一层半透光百叶帘。
+    // 玻璃隔墙（半透明）+ 它迎镜头那一面的半透光百叶帘。
     //
-    // 为什么帘子要"分段"入队：等距排序键是 gx+gy（一个标量），而这几片玻璃横跨好几个 tile，
-    // 整片只取一个中点键的话，靠它低坐标一侧、又实际在玻璃**前面**的小东西（会议室西北角的复印机、
-    // 茶水间北墙的饮水机、走到跟前的小怪物）会被算成在玻璃后面，被帘子整片压住。
-    // 按面坐标把帘子切成小段、各段用自己的中点定 depth，排序就和真实前后一致了：
-    //   - 玻璃"后面"（屋里侧）的东西：键总小于对应段 → 先画，被帘子盖住 ✓
-    //   - 玻璃"前面"的东西（饮水机 / 复印机 / 走到跟前的小怪物）：键总大于对应段 → 后画，盖在帘子上 ✓
-    // 玻璃本体仍整块画（切开会让 isoBox 露出端面接缝）；它只是 0.16 的半透明，不影响可读性。
+    // 为什么"玻璃面"和"帘子"都必须按面坐标**分段**入队：等距排序键是 gx+gy（一个标量），
+    // 而这几片玻璃横跨好几个 tile。整片只取一个中点键（再 +0.6 抬过屋里的人）时，靠它低坐标一侧、
+    // 又实际贴在玻璃**前面**的东西（茶水间北墙的饮水机、走到跟前接水的小怪物）会被算成在玻璃后面 ——
+    // 于是那层 16% 的半透明玻璃面就压在它们身上，看上去就是"饮水机被玻璃/帘子遮了一块"。
+    // 按面坐标切成小段、各段用自己的中点定 depth，前后关系就回到真实的局部顺序：
+    //   - 玻璃"后面"（屋里侧）的东西：键总小于对应段 → 先画，被玻璃 / 帘子盖住 ✓
+    //   - 玻璃"前面"的东西（饮水机 / 复印机 / 站在饮水机前的小怪物）：键总大于对应段 → 后画 ✓
+    // 玻璃面逐段用 wallQuad 画（而不是整块 isoBox、也不是拼多块 isoBox）：相邻段共边不重叠，
+    // 既不会露出 isoBox 的端面接缝，也不会把 0.16 的透明度在接缝处叠成一条深线。
     const gh = MEETING.glass.h;
-    /** 把一条帘子按「面坐标」切成若干段分别入队：axis='x' 沿 gy 切，axis='y' 沿 gx 切 */
-    const pushBlindsSegmented = ({ axis, fixed, a0, a1, maxSegW }) => {
-      const n = Math.max(1, Math.ceil((a1 - a0) / maxSegW));
+    /** 一面玻璃 +（可选）它迎镜头那面的百叶帘，按面坐标切成若干段分别入队：axis='x' 沿 gy 切，axis='y' 沿 gx 切 */
+    const pushGlassFace = ({ axis, fixed, a0, a1, segW, h = gh, blinds = true }) => {
+      const n = Math.max(1, Math.ceil((a1 - a0) / segW));
       const w = (a1 - a0) / n;
       for (let i = 0; i < n; i += 1) {
         const s0 = a0 + i * w;
         const s1 = s0 + w;
         const mid = (s0 + s1) / 2;
-        push(depthOf(axis === 'x' ? fixed : mid, axis === 'x' ? mid : fixed), (c) => {
-          drawBlinds(c, { axis, fixed, a0: s0, a1: s1, z0: 0, z1: gh });
-        });
+        const d = depthOf(axis === 'x' ? fixed : mid, axis === 'x' ? mid : fixed);
+        push(d, (c) => wallQuad(c, axis, fixed, s0, s1, 0, h, rgba(COLORS.glass, 0.16)));
+        if (blinds) push(d + 0.0005, (c) => drawBlinds(c, { axis, fixed, a0: s0, a1: s1, z0: 0, z1: h }));
       }
     };
-    // 西面：分两段，中间是门洞（帘子按片挂，门洞处自然留空）
+    // 西面：分两段，中间是门洞（帘子按片挂，门洞处自然留空）；大面是 +gx 面（x = 右沿）
     [MEETING.glass.westA, MEETING.glass.westB].forEach((g) => {
-      push(depthOf(g.x, g.y + g.d / 2) + 0.6, (c) => {
-        isoBox(c, { ...g, h: gh, color: COLORS.glass, alpha: 0.16 });
-      });
-      // 大面是 +gx 面（x = 右沿）
-      pushBlindsSegmented({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, maxSegW: 0.8 });
+      pushGlassFace({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, segW: 0.8 });
     });
-    // 南面：一整条
+    // 南面：一整条；大面是 +gy 面（y = 前沿）
     const gs = MEETING.glass.south;
-    push(depthOf(gs.x + gs.w / 2, gs.y) + 0.6, (c) => {
-      isoBox(c, { ...gs, h: gh, color: COLORS.glass, alpha: 0.16 });
-    });
-    // 大面是 +gy 面（y = 前沿）
-    pushBlindsSegmented({ axis: 'y', fixed: gs.y + gs.d, a0: gs.x, a1: gs.x + gs.w, maxSegW: 0.7 });
+    pushGlassFace({ axis: 'y', fixed: gs.y + gs.d, a0: gs.x, a1: gs.x + gs.w, segW: 0.7 });
     // 茶水间标识：贴在这片南面玻璃朝镜头那一面（= 茶水间的北墙）。
     // 帘子分了段、各段 depth 不同，标识必须排在**所有帘段**之后：取这条玻璃最右端的 depth 再抬一点。
     push(depthOf(gs.x + gs.w, gs.y + gs.d) + 0.3, (c) => {
@@ -979,21 +972,29 @@ export function createIsoOffice(canvas, opts = {}) {
     });
 
     const pc = PANTRY.cooler;
-    // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前：帘子已按坐标分段（见上），
-    // 它自然排在对应帘段之后、也不会被走到跟前的小怪物反超，所以用正常 depth 即可。
-    push(depthOf(pc.x, pc.y), (c) => {
+    // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前，属于"玻璃前面"的东西：
+    // 它必须排在这条北墙的**所有**玻璃段 / 帘段之后 —— 帘片 alpha 0.92 几乎不透明，
+    // 只要有一段排在它后面，就会从屏幕重叠处硬切掉它一块（实测被切的就是这个）。
+    // 单纯用 depthOf(pc.x, pc.y)（22.85）不够：分段后靠右那些段的键会高到 23.1~26.5。
+    // 上限卡死在"接水站位"（PLACES.coffee, 23.55）之下 —— 站在饮水机前接水的小怪物仍要能盖住它。
+    const coolDepth = Math.max(depthOf(pc.x, pc.y), depthOf(PLACES.coffee.x, PLACES.coffee.y) - 0.05);
+    push(coolDepth, (c) => {
       isoBox(c, { x: pc.x - 0.3, y: pc.y - 0.3, z: 0, w: 0.6, d: 0.6, h: pc.h - 0.5, color: COLORS.metal });
-      isoCylinder(c, { x: pc.x, y: pc.y, z: pc.h - 0.5, r: 0.28, h: 0.5, color: '#5aa9e6', alpha: 0.85 });
+      // 水桶不透明：原先 alpha 0.85 会让背后帘子的横纹透出来，看着也像"被帘子遮了一块"
+      isoCylinder(c, { x: pc.x, y: pc.y, z: pc.h - 0.5, r: 0.28, h: 0.5, color: '#5aa9e6' });
     });
 
-    // 茶水间玻璃隔断：只砌西面（门在中间）；
-    // 北面借会议室的南墙，南面直接贴房间最前面那道玻璃幕墙，不再多砌一道
+    // 茶水间玻璃隔断：只砌西面（门在中间，两片分开挂帘 → 门洞处自然留空）；
+    // 北面借会议室的南墙，南面直接贴房间最前面那道玻璃幕墙，不再多砌一道。
+    // 帘子与玻璃面一样按面坐标分段（见上面 pushGlassFace 的说明）：整块中点键会把这层 16% 的玻璃
+    // 压到贴在茶水间一侧的饮水机上，看上去就是饮水机左边被遮了一块。
+    // 这两片帘子不会盖住饮水机：与饮水机在屏幕上重叠的只有靠北的两段（depth 21.87 / 22.50，
+    // 都小于饮水机的 coolDepth 23.5，先画 → 被饮水机盖住）；靠南那几段在屏幕左下，根本不重叠。
+    // （帘片 alpha 0.92 几乎不透明，所以必须靠 depth 卡住，不能靠透明度兜底。）
     const ph = PANTRY.glass.h;
     const pg = PANTRY.glass;
     [pg.westA, pg.westB].forEach((g) => {
-      push(depthOf(g.x, g.y + g.d / 2) + 0.6, (c) => {
-        isoBox(c, { ...g, h: ph, color: COLORS.glass, alpha: 0.16 });
-      });
+      pushGlassFace({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, segW: 0.8, h: ph });
     });
 
     /* 复印机（会议室西北角） */
@@ -1030,6 +1031,8 @@ export function createIsoOffice(canvas, opts = {}) {
   function drawFloor(c) {
     // 地面是一块纯平的平行四边形：不要给它加板厚，
     // 一旦露出侧面，整个外轮廓就变成六边形，看着就不像平行四边形了。
+    // 满铺菱形地毯砖：每格一块菱形，深浅两档交替 + 一道砖缝，整间屋子同一种材质
+    // （以前是几块颜色不一的大地毯盖在格子上，深浅打架，看着很花）。
     for (let gy = 0; gy < ROOM.d; gy += 1) {
       for (let gx = 0; gx < ROOM.w; gx += 1) {
         isoDiamond(c, {
@@ -1037,19 +1040,59 @@ export function createIsoOffice(canvas, opts = {}) {
           y: gy,
           w: 1,
           d: 1,
-          fill: (gx + gy) % 2 ? COLORS.floorA : COLORS.floorB,
-          stroke: COLORS.floorLine,
-          lw: 1.1,
+          fill: (gx + gy) % 2 ? COLORS.floor : COLORS.floorAlt,
+          stroke: COLORS.floorSeam,
+          lw: 1,
         });
       }
     }
-    RUGS.forEach((r) => {
-      isoDiamond(c, { x: r.x, y: r.y, w: r.w, d: r.d, fill: r.color, stroke: COLORS.rugEdge, lw: 1.6 });
-    });
     // 房间地面边界：四条边就是四道墙脚，围成一个清晰的平行四边形
     isoDiamond(c, {
       x: 0, y: 0, w: ROOM.w, d: ROOM.d,
       fill: null, stroke: COLORS.wallTop, lw: 2.8, alpha: 0.9,
+    });
+  }
+
+  // 靠近镜头的两面墙（右 gx = ROOM.w、前 gy = ROOM.d）：这个角度看到的是它们的外侧墙面。
+  // 做成矮墙 + 玻璃幕墙：既把长方体围合完整（地面四边才是个完整的平行四边形），又不挡住屋里。
+  // 矮墙是实心的、玻璃上的框线（上沿 + 竖挺）也是挡在镜头与屋子之间的实体 → 都不画在背景层，
+  // 改由 drawNearLowWalls / drawNearGlassFrame 排在所有屋里物件之后（见下面说明）。
+  // 只有那层几乎全透的玻璃面留在背景：alpha 只有 0.085~0.1，留在后面不会露出破绽，
+  // 反过来若放到最后画，等于给屋里所有东西糊一层蓝膜，反而把画面压灰。
+  const NEAR = [
+    { axis: 'x', fixed: ROOM.w, a0: 0, a1: ROOM.d, k: 0.72, ga: 0.1 },
+    { axis: 'y', fixed: ROOM.d, a0: 0, a1: ROOM.w, k: 0.6, ga: 0.085 },
+  ];
+  const NEAR_HALF_H = 0.55;
+  const NEAR_FRAME = 'rgba(143,182,255,0.3)';
+  // 玻璃上沿单独一档：它是墙顶那条边的延续，太淡会看着像"边断在角上"
+  const NEAR_RAIL = 'rgba(150,186,255,0.5)';
+  const NEAR_RAIL_H = 0.11;
+
+  function drawNearLowWalls(c) {
+    NEAR.forEach((n) => {
+      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, 0, NEAR_HALF_H, shade(COLORS.wall, n.k));
+      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, NEAR_HALF_H, NEAR_HALF_H + 0.07, NEAR_FRAME);
+    });
+  }
+
+  /**
+   * 近处幕墙的框线：玻璃上沿 + 竖挺。
+   * 它们和矮墙一样挡在镜头与屋子之间 —— 屋里任何东西（走到跟前的小怪物、贴着这面墙的家具）
+   * 只要在屏幕上跟它重叠，就该被它切掉一块。留在背景层的话会被后画的屋里物件盖住，
+   * 看起来就是"竖挺断了 / 上沿被吃掉一截"，所以跟矮墙一起排到最后画。
+   *
+   * 近处两面**不画墙顶**：那是一整圈厚 0.28 的实体顶面，压在玻璃上沿上又重又挡视线
+   * （屋里靠前的一切都被它切掉一条）。改由这道上沿收边 —— 后墙/左墙的墙顶在远端收口时
+   * 与玻璃面齐平（见 drawWalls），墙顶那条边正好落在这道上沿的延长线上，看上去是一条连续的边。
+   */
+  function drawNearGlassFrame(c) {
+    const h = WALL.h;
+    NEAR.forEach((n) => {
+      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, h - NEAR_RAIL_H, h, NEAR_RAIL);
+      for (let k = Math.ceil(n.a0 + 1); k < n.a1 - 0.5; k += 2) {
+        wallQuad(c, n.axis, n.fixed, k - 0.04, k + 0.04, NEAR_HALF_H, h, NEAR_FRAME);
+      }
     });
   }
 
@@ -1065,32 +1108,17 @@ export function createIsoOffice(canvas, opts = {}) {
     // 左墙内表面（gx = 0）：沿 +gy 方向斜下去的另一半
     wallQuad(c, 'x', 0, 0, ROOM.d, 0, h, shade(COLORS.wall, 0.82));
 
-    // 靠近镜头的两面墙（右 gx = ROOM.w、前 gy = ROOM.d）是这个角度看得见的外侧墙面。
-    // 做成矮墙 + 玻璃幕墙：既把长方体围合完整（地面四边才是个完整的平行四边形），又不挡住屋里。
-    const halfH = 0.55;
-    const frame = 'rgba(143,182,255,0.3)';
-    const near = [
-      { axis: 'x', fixed: ROOM.w, a0: 0, a1: ROOM.d, k: 0.72, ga: 0.1 },
-      { axis: 'y', fixed: ROOM.d, a0: 0, a1: ROOM.w, k: 0.6, ga: 0.085 },
-    ];
-    near.forEach((n) => {
-      // 矮墙
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, 0, halfH, shade(COLORS.wall, n.k));
-      // 玻璃
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, halfH, h, `rgba(127,176,255,${n.ga})`);
-      // 玻璃上下沿 + 竖挺
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, h - 0.07, h, frame);
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, halfH, halfH + 0.07, frame);
-      for (let k = Math.ceil(n.a0 + 1); k < n.a1 - 0.5; k += 2) {
-        wallQuad(c, n.axis, n.fixed, k - 0.04, k + 0.04, halfH, h, frame);
-      }
+    NEAR.forEach((n) => {
+      // 玻璃面（几乎全透，留在背景；框线不在这里画，见 drawNearGlassFrame）
+      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, NEAR_HALF_H, h, `rgba(127,176,255,${n.ga})`);
     });
 
-    // 墙顶：绕一整圈，盒子才是完整的
-    isoDiamond(c, { x: -t, y: -t, w: ROOM.w + t * 2, d: t, z: h, fill: COLORS.wallTop });
+    // 墙顶：只有后（gy=0）、左（gx=0）两面是实心墙才有这道顶面；屋里的一切都在它们前面，
+    // 所以留在背景层（放到最后画会糊住站在墙前的角色）。
+    // 两端收在与幕墙玻璃面齐平的位置（x 到 ROOM.w、y 到 ROOM.d）：这样墙顶这条边
+    // 正好落在玻璃上沿那道线的延长线上，前后是一条连续的边，不会再"接不上"。
+    isoDiamond(c, { x: -t, y: -t, w: ROOM.w + t, d: t, z: h, fill: COLORS.wallTop });
     isoDiamond(c, { x: -t, y: -t, w: t, d: ROOM.d + t, z: h, fill: shade(COLORS.wallTop, 0.92) });
-    isoDiamond(c, { x: ROOM.w, y: -t, w: t, d: ROOM.d + t, z: h, fill: shade(COLORS.wallTop, 0.8) });
-    isoDiamond(c, { x: -t, y: ROOM.d, w: ROOM.w + t * 2, d: t, z: h, fill: shade(COLORS.wallTop, 0.7) });
 
     // 踢脚线
     wallQuad(c, 'y', 0, 0, ROOM.w, 0, 0.12, shade(COLORS.wall, 0.75));
@@ -1124,19 +1152,34 @@ export function createIsoOffice(canvas, opts = {}) {
       c.fillStyle = rg;
       c.fill();
       c.restore();
-      // 地上的光斑：从墙根往屋里渐隐（略微外扩，像光是斜着进来的）
-      const fL = 2;
-      const gA = project(cxm, gy + 0.1, 0);
-      const gB = project(cxm, gy + fL, 0);
-      const fg = c.createLinearGradient(gA.x, gA.y, gB.x, gB.y);
-      fg.addColorStop(0, 'rgba(126,168,255,0.20)');
-      fg.addColorStop(1, 'rgba(126,168,255,0)');
-      poly(c, [
-        project(w.x0 - 0.1, gy + 0.1, 0),
-        project(w.x1 + 0.1, gy + 0.1, 0),
-        project(w.x1 + 0.35, gy + fL, 0),
-        project(w.x0 - 0.35, gy + fL, 0),
-      ], fg);
+      /* 地上的月光：不再用有棱有角的四边形（那看起来就是块地毯），
+         改成"地板坐标系里的软椭圆"，边缘全透明地化开，才像光洒进来。
+         做法：把画笔换成地板自己的两根轴（AX / AY）——在这个局部坐标里画圆，
+         等距投影出来就是贴地的斜椭圆；再叠两片（贴墙根的亮核 + 往屋里铺开的淡晕），
+         越往屋里越淡越散。 */
+      const o = project(cxm, gy, 0);
+      const spill = (rx, ry, cy, a) => {
+        c.save();
+        c.transform(AX.x, AX.y, AY.x, AY.y, o.x, o.y);
+        // 只在墙内侧铺（gy >= 0）：不然光会爬到墙面上、把踢脚线照亮一圈
+        c.beginPath();
+        c.rect(-rx - 1, 0, (rx + 1) * 2, cy + ry + 1);
+        c.clip();
+        c.translate(0, cy);
+        c.scale(rx, ry); // 圆 → 地面上的椭圆
+        const sg = c.createRadialGradient(0, 0, 0, 0, 0, 1);
+        sg.addColorStop(0, `rgba(126,168,255,${a})`);
+        sg.addColorStop(0.42, `rgba(126,168,255,${a * 0.5})`);
+        sg.addColorStop(1, 'rgba(126,168,255,0)');
+        c.beginPath();
+        c.arc(0, 0, 1, 0, Math.PI * 2);
+        c.fillStyle = sg;
+        c.fill();
+        c.restore();
+      };
+      const halfW = (w.x1 - w.x0) / 2 + 0.25;
+      spill(halfW * 1.18, 2.6, 0.95, 0.12);  // 往屋里铺开、边缘化掉的大片淡晕
+      spill(halfW * 0.92, 1.15, 0.42, 0.14); // 贴着窗根的亮核
       c.restore();
 
       // 墙上的洞口：比玻璃大一圈的暗边，就是墙体厚度
@@ -1510,6 +1553,10 @@ export function createIsoOffice(canvas, opts = {}) {
     if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawDispatchGhostSprite(c) });
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
+
+    // 近处幕墙：实心矮墙 + 玻璃上的框线，屋里的一切都在它们后面 → 最后画，挡住该挡的
+    drawNearLowWalls(ctx);
+    drawNearGlassFrame(ctx);
 
     // 路网调试
     if (showPaths) {

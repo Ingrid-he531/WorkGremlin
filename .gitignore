@@ -9,3 +9,6 @@ release/
 *.db
 *.db-wal
 *.db-shm
+
+# 本地工程数据（工程级 agent 定义等，由各人本地维护，不进版本管理）
+.codebuddy/
