@@ -1,7 +1,10 @@
 import { defineStore } from 'pinia';
-import { getServerInfo, getFlags, getWorkspace, openWorkspace, wsUrl } from '../api/bridge';
+import { getServerInfo, getFlags, getWorkspace, openWorkspace, wsUrl, httpBase } from '../api/bridge';
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
+
+/** 兜底对账间隔：WS 增量事件（尤其 member.remove）是一次性的，漏收就永久陈旧，靠它自愈 */
+const RECONCILE_MS = 15_000;
 
 /** 工位视图 + 连接状态（当前工程的成员 / 幽灵 / 连接） */
 export const useProjectStore = defineStore('project', {
@@ -24,6 +27,7 @@ export const useProjectStore = defineStore('project', {
     flags: { demo: false, seed: 1 },
     demo: false,
     _conn: null,
+    _reconcileTimer: null,
   }),
 
   getters: {
@@ -75,6 +79,31 @@ export const useProjectStore = defineStore('project', {
           if (st && st.state === 'open' && this._conn) this._conn.subscribe({});
         },
       });
+
+      // 兜底对账：member.remove 是一次性事件，漏收（WS 抖动 / 窗口失焦）后那条成员会永久挂在
+      // 办公室里（member.status 心跳只更新不删除）。周期性拉一次快照整体对齐，保证最终一致。
+      this.stopReconcile();
+      this._reconcileTimer = setInterval(() => this.reconcile(), RECONCILE_MS);
+    },
+
+    /** 拉一份当前快照，整体覆盖本地成员表（自愈：多出来的陈旧成员会被这次覆盖掉） */
+    async reconcile() {
+      try {
+        const info = this.serverInfo || {};
+        const res = await fetch(`${httpBase(info)}/api/v1/snapshot`, {
+          headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && data.ok && data.snapshot) this.applySnapshot(data.snapshot);
+      } catch {
+        /* 拉不到就留到下一轮，不影响增量推送 */
+      }
+    },
+
+    stopReconcile() {
+      if (this._reconcileTimer) clearInterval(this._reconcileTimer);
+      this._reconcileTimer = null;
     },
 
     applySnapshot(snapshot) {
@@ -120,6 +149,7 @@ export const useProjectStore = defineStore('project', {
     },
 
     dispose() {
+      this.stopReconcile();
       if (this._conn) this._conn.close();
       this._conn = null;
     },
