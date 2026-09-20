@@ -1,7 +1,7 @@
 <script setup>
 /**
  * FloorSelector —— 左侧竖向堆叠的"楼层"胶囊。
- * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy 插件。
+ * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy 插件 / 4F Codex CLI / 5F Claude Code CLI。
  *
  * 状态点看的是**这一层有没有活跃会话**（全局活跃会话表，60 分钟没事件会剔除）：
  *   - 有活跃会话：绿色状态点 + 数量角标
@@ -9,7 +9,16 @@
  * 没有活跃会话的楼层照样能点进去，办公室照常显示，只是下拉为空。
  * 未安装（后端没搜到安装位置或落盘数据）：整体置灰，显示"未安装"。
  * 选中：高亮边框（accent + 外发光）。
+ *
+ * 电梯（design-elevator-transition.md §1 / §5.2）：`.rail` 就是井道，本组件额外挂一个
+ * `.car` 轿厢覆盖层。高亮与轿厢位置都从 useElevator 拿（effort §2.3 方案 A），
+ * 保证「高亮在 4F、轿厢在 3F」这种错位不会出现。
+ * 楼层显示屏（FloorLcd）**不在这里**：它挂在电梯门上方（ElevatorDoors 的门楣），
+ * 由 App.vue 把楼层表传过去（effort §2.4）。井道这边只负责井道 + 轿厢。
  */
+
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { useElevator } from '../composables/useElevator';
 
 const props = defineProps({
   products: { type: Array, default: () => [] },
@@ -17,9 +26,99 @@ const props = defineProps({
 });
 const emit = defineEmits(['update:modelValue']);
 
+const { displayFloor, carFloor, phase, moveMs } = useElevator();
+
 function select(p) {
   emit('update:modelValue', p.id);
 }
+
+/* ---------- 轿厢定位 ---------- */
+
+const railEl = ref(null);
+/** 胶囊 DOM（floorId → element）：量 offsetTop 用，不进响应式 —— 只有量出来的结果才进 */
+const floorEls = new Map();
+/** { [floorId]: { top, height } } —— 实测缓存，ResizeObserver 只写这里 */
+const metrics = ref({});
+let ro = null;
+
+function setFloorEl(id, el) {
+  if (!el) {
+    floorEls.delete(id);
+    return;
+  }
+  floorEls.set(id, el);
+  if (ro) ro.observe(el);
+}
+
+function sameMetrics(a, b) {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  return ka.every((k) => b[k] && b[k].top === a[k].top && b[k].height === a[k].height);
+}
+
+/**
+ * 量一次所有胶囊的位置。
+ * 不能按索引硬算：胶囊高度会随路径文案换行变化（设计 §5.2 / §8.1）。
+ * offsetTop 相对 offsetParent —— `.rail` 已 position: relative，所以它就是井道坐标。
+ */
+function measure() {
+  const next = {};
+  floorEls.forEach((el, id) => {
+    next[id] = { top: el.offsetTop, height: el.offsetHeight };
+  });
+  if (sameMetrics(next, metrics.value)) return; // 每 10s 一次轮询也会进来，值没变就不惊动渲染
+  metrics.value = next;
+}
+
+const carMetric = computed(() => metrics.value[carFloor.value] || null);
+
+/** 轿厢：只动 transform（+ 静态 height/opacity），不碰 width / left / top */
+const carStyle = computed(() => ({
+  height: `${carMetric.value.height}px`,
+  transform: `translateY(${carMetric.value.top}px)`,
+  // 只有 moving 段真的在井道里跑；其余时刻 0ms（保持停靠，不跟着高亮提前滑走）
+  transitionDuration: phase.value === 'moving' ? `${moveMs.value}ms` : '0ms',
+}));
+
+/* ---------- 轿厢自己的层号带 ---------- */
+
+/**
+ * 设计 §1「楼层数字」原文那版：**轿厢内的 odometer 数字条** —— 一串纵向层号，
+ * 窗口只露一格，轿厢滚到哪层，带子就滚到哪格。
+ *
+ * 与门楣那块屏的分工（两块屏不是重复，是真电梯也各有一块）：
+ *   · 门楣屏 = 层站指示器：固定不动，答"现在在哪层 / 要去哪层"（含方向）
+ *   · 这里   = 轿厢自己的显示屏：跟着车走，只有层号，路过中间层时能看到数字滚过去
+ *
+ * 对齐靠"同一条曲线 + 同一个 moveMs"（设计 §2 段2 的并行说明）：带子与轿厢共用
+ * `--ease-shaft-move` 和内联的 transitionDuration，天然同步 ——
+ * 所以设计 §7.1 那套"按层数预计算 ease⁻¹(k/N) 的 setTimeout"不需要了。
+ */
+const odoSlots = computed(() => props.products.map((f) => ({ id: f.id, lit: f.installed !== false })));
+const odoIndex = computed(() => {
+  const i = odoSlots.value.findIndex((s) => s.id === carFloor.value);
+  return i < 0 ? 0 : i;
+});
+const odoStyle = computed(() => ({
+  transform: `translateY(calc(-1 * ${odoIndex.value} * var(--car-slot)))`,
+  transitionDuration: phase.value === 'moving' ? `${moveMs.value}ms` : '0ms',
+}));
+
+onMounted(() => {
+  measure();
+  // 回调里只写缓存，不碰 phase、不重启动画（设计 §5.2）
+  ro = new ResizeObserver(() => measure());
+  if (railEl.value) ro.observe(railEl.value);
+  floorEls.forEach((el) => ro.observe(el));
+});
+
+onBeforeUnmount(() => {
+  if (ro) ro.disconnect();
+  ro = null;
+});
+
+/** 楼层列表换了（首次加载 / 10s 轮询）→ DOM 更新后再量一次 */
+watch(() => props.products, () => measure(), { flush: 'post' });
 
 /** 悬浮提示：活跃会话 + 安装位置 + 落盘统计 */
 function tip(p) {
@@ -56,14 +155,17 @@ function pathLine(p) {
 </script>
 
 <template>
-  <aside class="rail" aria-label="楼层选择">
+  <!-- data-phase 挂在这里：轿厢门缝线（.car::after）的"关门变亮 + 到点锁一下"要靠它驱动 -->
+  <aside ref="railEl" class="rail" :data-phase="phase" aria-label="楼层选择">
     <header class="rail-title">楼层</header>
+
     <button
       v-for="p in products"
       :key="p.id"
+      :ref="(el) => setFloorEl(p.id, el)"
       type="button"
       class="floor"
-      :class="{ selected: p.id === modelValue, dim: !p.installed }"
+      :class="{ selected: p.id === displayFloor, dim: !p.installed }"
       :disabled="!p.installed"
       :title="tip(p)"
       @click="select(p)"
@@ -76,11 +178,23 @@ function pathLine(p) {
         <span v-if="p.activeCount" class="fbadge">{{ p.activeCount }}</span>
       </span>
     </button>
+
+    <!-- 轿厢：井道里那一格。纯装饰（不拦点击、不进无障碍树），位移只走 transform -->
+    <div v-if="carMetric" class="car" :style="carStyle" aria-hidden="true">
+      <!-- 轿厢内的层号带：窗口只露一格，跟着车滚过每一层（设计 §1「楼层数字」原文） -->
+      <div class="car-odo">
+        <div v-if="odoSlots.length" class="car-odo-strip" :style="odoStyle">
+          <span v-for="s in odoSlots" :key="s.id" :class="{ dim: !s.lit }">{{ s.id }}</span>
+        </div>
+      </div>
+    </div>
   </aside>
 </template>
 
 <style scoped>
 .rail {
+  /* 井道：轿厢是绝对定位的覆盖层，必须有个定位祖先（设计 §1） */
+  position: relative;
   flex: 0 0 140px;
   width: 140px;
   display: flex;
@@ -90,6 +204,114 @@ function pathLine(p) {
   border-right: 1px solid var(--border);
   background: var(--panel, #0e1116);
   overflow-y: auto;
+}
+
+/* 轿厢：跟着 carFloor 在井道里滑。只动画 transform，duration 由内联 style 按层数给 */
+.car {
+  position: absolute;
+  top: 0;
+  /* 左右对齐胶囊的内容边（= .rail 的左右 padding 10px）；上下位置与高度靠实测 */
+  left: 10px;
+  right: 10px;
+  z-index: 2;
+  border-radius: 16px;
+  border: 2px solid var(--accent, #58a6ff);
+  background: color-mix(in srgb, var(--accent, #58a6ff) 12%, transparent);
+  pointer-events: none; /* 纯装饰：不许拦住胶囊点击 */
+  transition: transform var(--dur-shaft-move) var(--ease-shaft-move);
+}
+
+/* 轿厢内的层号带（设计 §1「楼层数字」原文那版）：窗口横贯轿厢，数字在里面逐格滚过。
+   窗口高度 = 一格（`--car-slot`，正好是胶囊 `.fid` 的行高），纵向压在胶囊第一行上
+   （`.floor` 的 padding-top 14px），所以**静止时把胶囊自己那个层号整行盖住**。
+   为什么必须横贯（而不是贴个小方块）：运行途中车在两格之间，"谁被压过" 的层号会从旁边
+   露出来 —— 我第一版做成 44px 宽的小方块，截出来就是「小屏 4F」和「胶囊 4F」并排重影。
+   带宽铺满后，凡是被车压过的层号都在带子里，读起来才是"数字滚过窗口"。
+   改 `.floor` 的 padding-top 或 `.fid` 字号时，这里的 top 要一起改。 */
+.car-odo {
+  position: absolute;
+  top: 14px;
+  left: 0;
+  right: 0;
+  height: var(--car-slot);
+  display: flex;
+  justify-content: center;
+  border-radius: 2px;
+  background: var(--lcd-bg, #05070a);
+  box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.8);
+  overflow: hidden; /* 只露一格：上下邻居被裁掉 */
+  font-family: var(--mono, monospace);
+}
+
+/* 时长由内联给（moving 才有值），曲线与轿厢同一条 —— 数字和车天然同步 */
+.car-odo-strip {
+  display: flex;
+  flex-direction: column;
+  transition: transform var(--dur-shaft-move) var(--ease-shaft-move);
+}
+
+.car-odo-strip span {
+  height: var(--car-slot);
+  line-height: var(--car-slot);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-align: center;
+  color: var(--lcd-lit, #7fe6ff);
+  text-shadow: 0 0 5px currentColor;
+}
+
+/* 未安装（置灰、点不动）的层：段码压暗 —— 轿厢物理上会经过它，但不表示"能到" */
+.car-odo-strip span.dim {
+  color: var(--lcd-dim, #33414d);
+  text-shadow: none;
+}
+
+/* will-change 只在真的滚层号时挂、进 idle 立刻摘（与门 / 门楣屏同一条规矩） */
+.rail[data-phase='moving'] .car-odo-strip {
+  will-change: transform;
+}
+
+/* 运行中把井道里的层号压暗：车在两格之间时，被它压过的那格白字会从显示带下面露出
+   （瞬时"重影"）。压暗之后，整条井道里亮的只有轿厢那块滚动的显示带 + 目的地那一格 ——
+   既消掉了重影，也让人一眼看出"数字在滚"、要去哪层。到站（opening）立刻回到常态。
+   （`.selected` 那一格不压：它是用户刚点的目的层，压暗等于把"我要去 5F"这条信息抹掉一半。） */
+.rail[data-phase='moving'] .floor:not(.selected) .fid {
+  opacity: 0.32;
+  transition: opacity var(--dur-settle) linear;
+}
+
+/* 轿厢门缝：胶囊只有 140px 宽，做真门片看不清 —— 用一条竖线暗示（设计 §1） */
+.car::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 12%;
+  bottom: 12%;
+  width: 1px;
+  background: var(--accent, #58a6ff);
+  opacity: 0.35;
+  transition: opacity var(--dur-door-close) linear;
+}
+
+/* 关门（设计 §2 段 1b）：门缝线随门合拢亮起来，合到底再"锁一下" ——
+   40ms 的亮度脉冲，延迟到关门结束那一刻才开始（delay = --dur-door-close）。
+   animation 一旦进入延迟期就会接管 opacity，所以和上面那条 transition 不打架。 */
+[data-phase='closing'] .car::after {
+  opacity: 0.5;
+  animation: car-lock 40ms linear var(--dur-door-close) 1;
+}
+
+@keyframes car-lock {
+  0% {
+    opacity: 0.5;
+  }
+  45% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.55;
+  }
 }
 
 .rail-title {
@@ -113,6 +335,7 @@ function pathLine(p) {
   color: var(--text, #e6edf3);
   cursor: pointer;
   font: inherit;
+  /* 只收窄到 .floor 自己：轿厢（.car）有自己的 transform 过渡，两者不许互相盖 */
   transition: border-color 0.15s, transform 0.1s, opacity 0.15s, box-shadow 0.15s;
 }
 
@@ -125,10 +348,13 @@ function pathLine(p) {
 }
 
 .floor .fid {
-  font-size: 22px;
-  font-weight: 800;
+  /* 字号/字重与轿厢显示带、门楣屏里的段码一致（16px / 700）——
+     原来 22px/800 太大，一层楼号压着整个胶囊，跟"楼层显示屏"那块的语言也不统一。
+     行高仍取 --car-slot（22px）：胶囊布局不动，轿厢显示带也才能继续盖住这一行。 */
+  font-size: 16px;
+  font-weight: 700;
   letter-spacing: 0.5px;
-  line-height: 1;
+  line-height: var(--car-slot);
 }
 
 .floor .fname {

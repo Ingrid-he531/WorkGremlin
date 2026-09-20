@@ -23,6 +23,76 @@
   --radius: 10px;
   --gap: 12px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* 楼层液晶屏（FloorLcd.vue）：暗底 + 发光段码。零图片、零依赖，全靠这几个色。
+     --lcd-slot 是「一位数字」的格子高，滚动位移由 JS 写成 calc(idx × --lcd-slot)，
+     所以改字号时改这一处就够，别在 JS 里再写一份 px。 */
+  --lcd-bg: #05070a;
+  --lcd-lit: #7fe6ff;
+  --lcd-dim: #33414d;
+  --lcd-slot: 26px;
+  --car-slot: 22px; /* 轿厢内层号带的一格高（= 胶囊 .fid 的行高，窗口压在它上面） */
+
+  /* motion —— 楼层切换「电梯」过渡（design-elevator-transition.md §2 / §5.1）。
+     新动画一律引用这些 token，别再散写时长与 ease。
+     时长与 useElevator 的 DURATIONS 一一对应，改一边要同步另一边。 */
+  --dur-door-close: 180ms;
+  --dur-door-open: 260ms;
+  --dur-settle: 120ms;
+  --dur-shaft-move: 300ms; /* 运行时由 JS 按层数内联覆盖：clamp(240+130×N, 300, 700) */
+  --ease-door-close: cubic-bezier(0.45, 0, 0.55, 1); /* 先加速后贴合，尾段不过冲 */
+  --ease-shaft-move: cubic-bezier(0.52, 0, 0.28, 1); /* 起步缓→中段快→尾段滑行停靠 */
+  --ease-door-open: cubic-bezier(0.22, 0.8, 0.3, 1); /* 快起慢收，别让门拖着眼睛 */
+  --ease-settle: cubic-bezier(0.2, 0, 0.2, 1);
+  --dur-lcd-fade: 140ms; /* 液晶屏：目的层数字与方向箭头 点亮/熄灭（数字滚动走 --ease-shaft-move） */
+  --ease-lcd-fade: cubic-bezier(0.2, 0, 0.2, 1);
+  --dur-flash: 40ms; /* 降级档（系统「减弱动态效果」）的淡出/淡入各一段，与 useElevator 的 FLASH_MS 对应 */
+}
+
+/* 系统「减弱动态效果」：时长归零。
+   useElevator 读的是同一个偏好，会走 reduced 档 —— 不演电梯，只做一次 80ms 淡入淡出
+   （见 useElevator 的 FLASH_MS / request() 的 reduced 分支），所以这里的 token 是给
+   那些"万一还有别的动画在跑"的场景兜底的。 */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-door-close: 0ms;
+    --dur-door-open: 0ms;
+    --dur-settle: 0ms;
+    --dur-shaft-move: 0ms;
+    --dur-lcd-fade: 0ms;
+  }
+
+  /* 与已有组件（DeskScene / GremlinSprite / GhostSprite）一致的兜底写法：
+     光把 token 归零不够 —— 轿厢、轿厢层号带与门楣屏数字条的 transition-duration
+     都是内联写的，会盖过 token */
+  .door,
+  .car,
+  .car-odo-strip,
+  .lcd-odo {
+    transition: none !important;
+  }
+}
+
+/* 手动关：根上 data-motion='off' 一处切换即可清零。
+   全局选择器能命中 scoped 组件内部元素（scoped 只加属性，不阻断全局选择器） */
+[data-motion='off'] .door,
+[data-motion='off'] .car,
+[data-motion='off'] .car-odo-strip,
+[data-motion='off'] .lcd-odo {
+  transition-duration: 0ms !important;
+}
+
+/* 门锁扣脉冲是 keyframes，不吃 token（归零时长只会让它"一瞬间闪完"，还是闪），必须点名停。
+   判 data-motion 而**不是** media query：off / 降级档都不该有这一下，
+   但用户显式设成 on 时要能盖过系统偏好（设计 §5.1 的 on 档语义）。 */
+[data-motion='off'] .car::after,
+[data-motion='reduced'] .car::after {
+  animation: none !important;
+}
+
+/* 液晶屏的点亮/熄灭只吃 token（没有内联时长），所以归零变量就够，不用再点名元素 */
+[data-motion='off'] {
+  --dur-lcd-fade: 0ms;
 }
 
 * {
