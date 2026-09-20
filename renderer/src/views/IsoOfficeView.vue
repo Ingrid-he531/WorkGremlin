@@ -8,6 +8,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
+import ConnectionBar from '../components/ConnectionBar.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
@@ -17,6 +18,10 @@ import { createIsoOffice } from '../iso/engine';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
+  /** 左上角状态徽标用的三项：连接 / 项目名 / 相位来源（由 App.vue 统一算好传下来） */
+  connection: { type: Object, default: () => ({ state: '' }) },
+  projectLabel: { type: String, default: '' },
+  source: { type: String, default: '' },
 });
 const emit = defineEmits(['select']);
 
@@ -386,6 +391,30 @@ function closeCard() {
   card.value = null;
 }
 
+/* ------------------------------ 演示脚本的启动时机 ------------------------------
+ * 主控制台那份 SCRIPT（见 stores/mainAgent.js）是**演示数据**，只能演示模式下跑。
+ * 真数据源（默认）首屏就该是待命：一条会话都没有、hook 也没接上时，没有任何非 null 的
+ * applySession / setLiveState 来接管，脚本会自己循环播放「重构用户登录模块」，
+ * 假状态永远没人顶掉 —— 新设备首次启动就撞上这个（屋里是空的，屏上却在演）。
+ *
+ * 两个细节：
+ *   1) project.demo 是**异步**拿的（App.vue 在父组件 onMounted 里 project.init()，
+ *      子组件先挂载），所以 onMounted 里读到的常常还是 false —— 真正的启动交给下面的 watch；
+ *   2) 真数据已经在驱动时不抢方向盘（live / hookLive）。
+ */
+function startDemoScript() {
+  if (mainAgent.live || mainAgent.hookLive) return;
+  mainAgent.start();
+}
+
+/** 服务端确认当前停在演示工程后（含"上次停在演示数据"被 restore 回来的情况）才开演 */
+watch(
+  () => project.demo,
+  (v) => {
+    if (v) startDemoScript();
+  }
+);
+
 /* ------------------------------ HUD ------------------------------ */
 
 function callAll() {
@@ -408,7 +437,8 @@ onMounted(() => {
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);
-  mainAgent.start();
+  // 非演示模式不 start()：保持待命，等真会话 / hook 相位接管（见 startDemoScript 的注释）
+  if (project.demo) startDemoScript();
   startPhasePoll();
 
   const loop = () => {
@@ -420,7 +450,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(cardRaf);
-  mainAgent.stop();
+  // 只有演示脚本在跑时才 stop()：stop() 会亮「已暂停」摘要，非演示模式下没在演就别弹
+  if (mainAgent.auto) mainAgent.stop();
   stopPhasePoll();
   if (office) office.destroy();
   office = null;
@@ -435,6 +466,14 @@ onBeforeUnmount(() => {
       @click="onCanvasClick"
       @mousemove="onConsoleMove"
       @mouseleave="onConsoleLeave"
+    />
+
+    <!-- 左上角状态徽标：连接 / 项目 / 相位来源（原来在顶栏，现在跟着办公室走） -->
+    <ConnectionBar
+      class="status-hud"
+      :connection="connection"
+      :project="projectLabel"
+      :source="source"
     />
 
     <!-- 主 Agent 控制台 tooltip：鼠标停在悬浮屏上 400ms 后弹出 -->
@@ -518,6 +557,15 @@ onBeforeUnmount(() => {
 .card-close {
   margin-top: 6px;
   width: 100%;
+}
+
+/* 左上角状态徽标：不吃鼠标事件，免得挡住场景拖拽 */
+.status-hud {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  z-index: 4;
+  pointer-events: none;
 }
 
 .hud {

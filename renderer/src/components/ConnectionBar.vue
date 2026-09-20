@@ -26,11 +26,11 @@ const dotClass = computed(() => props.connection.state);
 </script>
 
 <template>
+  <!-- 连接 / 项目 / 相位来源：三样并排一组，常驻办公室场景左上角（见 IsoOfficeView 的 .status-hud） -->
   <div class="bar">
     <span class="conn" :class="dotClass"><i />{{ text }}</span>
     <span v-if="project" class="dim proj">项目：{{ project }}</span>
 
-    <span class="spacer" />
     <!-- 选中会话时给常驻的「相位来源」标识；没选会话时退回解释性图例 -->
     <span v-if="source" class="src">
       相位来源：
@@ -46,14 +46,19 @@ const dotClass = computed(() => props.connection.state);
 </template>
 
 <style scoped>
+/* 浮在办公室场景左上角的小徽标：跟 .hud 一套观感（半透明 + 圆角 + 细边） */
 .bar {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 14px;
-  padding: 6px 12px;
-  background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border);
+  gap: 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(12, 15, 20, 0.82);
+  border: 1px solid var(--border);
   font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  backdrop-filter: blur(2px);
 }
 
 .conn {
@@ -74,8 +79,6 @@ const dotClass = computed(() => props.connection.state);
 .conn.closed i { background: var(--state-blocked); }
 
 .proj { font: inherit; }
-
-.spacer { flex: 1; }
 
 .legend { display: inline-flex; align-items: center; gap: 6px; }
 

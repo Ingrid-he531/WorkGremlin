@@ -20,6 +20,9 @@ function createWindow(opts = {}) {
     title: 'WorkGremlin',
     backgroundColor: '#0f1115',
     show: false,
+    // 不显示菜单栏：非 macOS 在 menu.js 里整体置空，这里兜住 macOS（Alt/摁键才会临时浮出）
+    autoHideMenuBar: true,
+    fullscreenable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -54,6 +57,15 @@ function createWindow(opts = {}) {
 
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error('[workgremlin] 渲染进程加载失败', code, desc, url);
+  });
+
+  // 原生全屏状态变了（F11 / 系统手势 / macOS 菜单里的 Enter Full Screen）推给渲染层：
+  // 应用内的专注模式要跟着同步，否则窗口已经退出全屏、界面还挂着"没有出口按钮"的专注态。
+  win.on('enter-full-screen', () => {
+    if (!win.isDestroyed()) win.webContents.send('workgremlin:full-screen', true);
+  });
+  win.on('leave-full-screen', () => {
+    if (!win.isDestroyed()) win.webContents.send('workgremlin:full-screen', false);
   });
 
   if (isDev) {

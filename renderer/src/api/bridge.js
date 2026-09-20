@@ -33,6 +33,47 @@ export async function getFlags() {
 }
 
 /**
+ * 原生（OS 级）全屏：true 时窗口占满整屏，标题栏 / 边框 / 菜单栏一起去掉。
+ * 有 Electron bridge 走 IPC；纯浏览器 dev 退回 HTML5 Fullscreen API（同样没有窗口外壳）。
+ * @param {boolean} on
+ * @returns {Promise<boolean>} 切换后的实际状态
+ */
+export async function setFullScreen(on) {
+  if (hasBridge() && typeof window.workgremlin.setFullScreen === 'function') {
+    try {
+      return Boolean(await window.workgremlin.setFullScreen(Boolean(on)));
+    } catch {
+      /* 降级到 HTML5 全屏 */
+    }
+  }
+  try {
+    if (on) {
+      if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    } else if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    }
+    return Boolean(document.fullscreenElement);
+  } catch {
+    /* 没有 bridge 也没有 Fullscreen API（老 WebView）：应用内专注模式照旧生效 */
+    return false;
+  }
+}
+
+/**
+ * 订阅原生全屏状态变化（F11 / 系统手势 / 菜单切换都会触发）。
+ * @param {(on: boolean) => void} cb
+ * @returns {() => void} 取消订阅
+ */
+export function onFullScreen(cb) {
+  if (hasBridge() && typeof window.workgremlin.onFullScreen === 'function') {
+    return window.workgremlin.onFullScreen(cb);
+  }
+  const handler = () => cb(Boolean(document.fullscreenElement));
+  document.addEventListener('fullscreenchange', handler);
+  return () => document.removeEventListener('fullscreenchange', handler);
+}
+
+/**
  * 当前工程 + 最近打开过的工程 + subagent 清单路径。
  * @param {{port?:number, token?:string, fallback?:boolean}} info
  */

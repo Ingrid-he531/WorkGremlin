@@ -7,7 +7,12 @@ const { app, Menu } = require('electron');
  * 其它平台保持无菜单，避免 M0 引入额外维护面。
  */
 function buildMenu() {
-  if (process.platform !== 'darwin') return null;
+  // 非 macOS：明确不要菜单栏。Electron 默认会塞一套 File/Edit/View/Window 菜单，
+  // 全屏时尤其碍眼；menu.js 的设计口径本来就是"其它平台保持无菜单"，这里把它落实到底。
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+    return null;
+  }
   const template = [
     {
       label: app.name,

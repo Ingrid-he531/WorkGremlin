@@ -51,7 +51,9 @@ let stopTimer = null;
 export const useMainAgentStore = defineStore('mainAgent', {
   state: () => ({
     idx: 0,
-    auto: true,
+    /** true = 演示脚本正在自动推进。**默认不开**：演示脚本只在演示模式下由视图显式 start()
+     *  （见 IsoOfficeView 的 startDemoScript）；真数据源首屏应当停在待命，等会话 / hook 接管。 */
+    auto: false,
     /** true = 状态来自真实会话（插件落盘，阶段是推断的），mock 不推进 */
     live: false,
     /** true = 当前由 hook 实时上报驱动（reporter 把 busy/idle/offline/blocked 发给服务端） */

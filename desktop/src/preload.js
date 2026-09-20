@@ -8,6 +8,17 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const listeners = new Set();
+const fullScreenListeners = new Set();
+
+ipcRenderer.on('workgremlin:full-screen', (_evt, on) => {
+  for (const cb of fullScreenListeners) {
+    try {
+      cb(Boolean(on));
+    } catch {
+      /* 单个监听器异常不影响其他监听器 */
+    }
+  }
+});
 
 ipcRenderer.on('workgremlin:event', (_evt, payload) => {
   for (const cb of listeners) {
@@ -30,5 +41,17 @@ contextBridge.exposeInMainWorld('workgremlin', {
   onEvent: (cb) => {
     listeners.add(cb);
     return () => listeners.delete(cb);
+  },
+  /**
+   * 原生（OS 级）全屏：会连窗口菜单和边框一起去掉。
+   * @param {boolean} on @returns {Promise<boolean>} 切换后的实际状态
+   */
+  setFullScreen: (on) => ipcRenderer.invoke('workgremlin:set-full-screen', Boolean(on)),
+  /** @returns {Promise<boolean>} 窗口当前是否处于原生全屏 */
+  isFullScreen: () => ipcRenderer.invoke('workgremlin:is-full-screen'),
+  /** @param {(on: boolean) => void} cb @returns {() => void} 取消订阅 */
+  onFullScreen: (cb) => {
+    fullScreenListeners.add(cb);
+    return () => fullScreenListeners.delete(cb);
   },
 });
