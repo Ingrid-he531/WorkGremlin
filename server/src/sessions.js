@@ -51,6 +51,23 @@ const IDLE_MS = 10 * 60_000;
 const BUSY_MS = 90_000;
 /** 落盘在这么久之内 → 认为这一轮对话还在推进（含纯推理、只读工具等拿不到文件/待办证据的情况） */
 const FRESH_MS = 2 * 60_000;
+/**
+ * 会话"还在下拉里"的窗口 —— 与 CLI 楼层对齐（sessionRegistry 的 TIMEOUT_MS = 60 分钟）。
+ *
+ * 为什么不再用 IDLE_MS(10 分钟) 当在列标准：IDE 里开着但十几分钟没敲字的会话会被整条剔除，
+ * 而同样空闲的 CLI 会话（4F）却还在列表里，两边口径不一致（实测：3F 空、4F 有 4 条）。
+ * 现在 IDLE_MS 只用来判断"相位还热不热"（inferPhase），不再决定会话是否出现。
+ */
+const LISTED_MS = 60 * 60_000;
+/**
+ * 完成标记的"新鲜期"：只有这么久之内结束的才算"刚发生"，才会回给界面。
+ *
+ * 为什么必须有：done 是**持久状态**（为了让一次一进程的 `codex exec` 也能看到完成摘要，
+ * 会话结束后不清它），于是页面/楼层一打开就可能读到上一轮（甚至几小时前）的完成标记，
+ * 把历史当成新闻重播一遍（现象：一开 4F 就弹「任务完成 · 链路测试完成」）。
+ * 渲染层也做了"首次只当基线"的防护，这里是第二道，而且对旧前端也生效。
+ */
+const DONE_TTL_MS = 10 * 60_000;
 
 /* ------------------------------ 基础工具 ------------------------------ */
 
@@ -270,6 +287,7 @@ function readReporterPhase(workspacePath, client = '') {
   let win = null;
   let winPending = null;
   let winPrompt = '';
+  let winClient = '';
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
@@ -285,6 +303,7 @@ function readReporterPhase(workspacePath, client = '') {
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
     if (!win || sp.ts > win.ts) {
       win = sp;
+      winClient = String(j.client || 'codebuddy');
       // 同一份状态文件里的 pending：PreToolUse 写、PostToolUse 清掉；迟迟不清 = 工具被权限框卡住
       winPending = j.pending || null;
       // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
@@ -293,6 +312,8 @@ function readReporterPhase(workspacePath, client = '') {
   }
   if (!win) return null;
   return {
+    // 这份相位是哪个客户端写的（Codex 有显式 PermissionRequest，不需要 pending 推断）
+    client: String(winClient || 'codebuddy').toLowerCase(),
     phase: String(win.phase || 'thinking'),
     tool: String(win.tool || ''),
     file: String(win.file || ''),
@@ -337,6 +358,38 @@ function hasReporterState(workspacePath, client = '') {
   return false;
 }
 
+/**
+ * 这个工程有没有接过 hook，以及那份状态文件属于**哪条会话**。
+ *
+ * 为什么要会话 id：hook 是会话级加载的（会话启动时装，之后改配置不影响它），
+ * 所以"工程里有状态文件"不等于"你正在看的这条会话在上报"——
+ * 实测：13:40 开的旧会话没有 hook，但同工程里跑过 `codex exec`，状态文件存在，
+ * 界面就会把这条会话显示成「待命」，看起来像"整轮对话没有状态变化"。
+ * @returns {{instrumented: boolean, sessionId: string}}
+ */
+function reporterStateMeta(workspacePath, client = '') {
+  const ws = String(workspacePath || '').trim();
+  if (!ws) return { instrumented: false, sessionId: '' };
+  const suffix = `@${path.resolve(ws)}`.replace(/[^a-zA-Z0-9._-]/g, '_') + '.json';
+  const dir = path.join(reporterHookHome(), 'hooks');
+  let best = null;
+  let bestTs = -1;
+  for (const name of readDir(dir)) {
+    if (!/[.]json$/i.test(name) || !name.endsWith(suffix)) continue;
+    const j = readJson(path.join(dir, name));
+    if (!j) continue;
+    // 老状态文件没记 client → 按 codebuddy 归属（与相位读取同一口径）
+    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    const ts = (j.sessionPhase && j.sessionPhase.ts) || j.taskStartedAt || (j.hb && j.hb.lastEventAt) || 0;
+    if (ts >= bestTs) {
+      bestTs = ts;
+      best = j;
+    }
+  }
+  if (!best) return { instrumented: false, sessionId: '' };
+  return { instrumented: true, sessionId: String(best.sessionId || '') };
+}
+
 function reporterMainPhase(workspacePath, client = '') {
   const rp = readReporterPhase(workspacePath, client);
   if (!rp) return null;
@@ -355,6 +408,7 @@ function reporterMainPhase(workspacePath, client = '') {
   // 只读 / 命令类工具（NEVER_AWAIT_TOOLS）本就不发 PostToolUse、也不该弹权限框，排除掉避免误报
   // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
   if (
+    rp.client !== 'codex' && // Codex 用显式 PermissionRequest，跳过这套推断
     rp.phase === 'tool' &&
     rp.pending &&
     rp.pending.at &&
@@ -425,17 +479,22 @@ function readReporterActiveTask(workspacePath) {
 
 /** reporter hook 在 Stop 时落的"完成"标记（带工程路径）。按工程归属取，
  *  作为"任务完成"的唯一真源——不靠相位回落到空闲来猜，避免中途误弹。 */
-function readReporterDone(workspacePath) {
+function readReporterDone(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
+  const now = Date.now();
+  let best = null;
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j || !j.done || !j.done.at) continue;
+    if (now - Number(j.done.at) > DONE_TTL_MS) continue; // 过期的不算"刚发生"（见 DONE_TTL_MS）
     const ws = j.done.workspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
-    return j.done;
+    // 同一工程里 Codex 与 CodeBuddy 各有一份状态文件：按客户端取，别把对方的"完成"搬过来
+    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    if (!best || Number(j.done.at) > Number(best.at)) best = j.done;
   }
-  return null;
+  return best;
 }
 
 /**
@@ -534,6 +593,8 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
       (mq.runtime.activated && lastUpdated && now - lastUpdated < IDLE_MS) ||
       (files.lastAt && now - files.lastAt < BUSY_MS)
   );
+  // 还在列表里（宽窗口，60 分钟）；active 仍是"热窗口"，只影响相位推断
+  const listed = Boolean(lastUpdated && now - lastUpdated < LISTED_MS);
   const inferred = inferPhase({ todos, files, runtime: mq.runtime, pending: mq.pending, lastUpdated, now, inWindow });
 
   /** 悬浮屏第三层：任务清单（状态用符号标出来，不做翻译） */
@@ -578,6 +639,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     id,
     current,
     active,
+    listed,
     // 有 runtime 说明插件还认这个会话；没有就是历史会话（只剩待办/改动的化石）
     live: Boolean(mq.hasRuntime),
     lastUpdated,
@@ -677,7 +739,9 @@ function listSessions({ workspacePath = '', force = false } = {}) {
     // 避免旧工程残留的"思考中"相位在 IDE 关掉 / 切走后还挂着。
     const inWindow = readReporterActiveTask(m.projectPath);
     const info = sessionInfo(storage, id, { current: isProjectCurrent, now, workspacePath: m.projectPath, inWindow });
-    if (!info.active) continue; // 下拉只要活跃会话
+    // 只按"还在窗口内"过滤（60 分钟），不再因为 10 分钟没动静就整条剔除 ——
+    // 否则 IDE 里明明开着、只是十几分钟没敲字的会话会从 3F 消失（与 4F 口径不一致）。
+    if (!info.listed) continue;
     sessions.push({
       ...info,
       project: m.project,
@@ -707,4 +771,12 @@ function listSessions({ workspacePath = '', force = false } = {}) {
 }
 
 module.exports = {
-  hasReporterState, listSessions, findPluginStorage, decodeDirName, reporterMainPhase, freshestReporterWs };
+  hasReporterState,
+  reporterStateMeta,
+  readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
+  listSessions,
+  findPluginStorage,
+  decodeDirName,
+  reporterMainPhase,
+  freshestReporterWs,
+};

@@ -3,7 +3,7 @@
 | 项 | 内容 |
 | --- | --- |
 | 生成日期 | 2026-09-20 |
-| 对照基准 | 工作区 `HEAD = 27022c9` + 当日未提交改动（见 §8） |
+| 对照基准 | 工作区 `HEAD = 27022c9` + 当日未提交改动（见 §9） |
 | 用途 | 记录**代码实际怎么做的**，以及它与 `requirements*.md` / `tech-design.md` / `roadmap.md` / `test-strategy.md` / `runbook.md` 的差异 |
 | 维护约定 | 改代码导致领域模型 / 数据源 / 接口变化时，同步更新本文；需求变更更新 `requirements.md`。**本文只描述已实现的事实，不表达需求倾向，也不代替规格。** |
 
@@ -166,7 +166,31 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 
 ---
 
-## 8. 工作区内的已知杂物（非工程结构）
+## 8. Codex CLI 支持矩阵（2026-09-20，实测 Codex 0.151.0）
+
+协议：Codex 有原生 hook 子系统（`hooks` 是默认开启的 stable feature），文件是
+`$CODEX_HOME/hooks.json`，结构与 CodeBuddy / Claude Code **同源**（`{matcher, hooks:[{type:'command',…}]}`）。
+**hook 需要信任**：交互式会话要在 TUI 里用 `/hooks` 批准一次；自动化用 `--dangerously-bypass-hook-trust`。
+`~/.codex/agents` 目前还不存在，Codex 侧的具名 agent 定义仍待实证。
+
+| 能力 | 状态 | 说明 |
+| --- | --- | --- |
+| 成员注册 / 心跳 / 状态（busy·idle·offline） | ✅ 实测 | SessionStart / Pre·PostToolUse / Stop / SessionEnd |
+| 任务开始 / 结束 / 完成标记 | ✅ 实测 | UserPromptSubmit → `task/start`；Stop → `task/end(done)` |
+| 相位（思考中 / 调用工具 / 等待授权 / 待命） | ✅ 实测 | Pre/PostToolUse → tool/thinking；空闲时「待命」；不再退回"按 jsonl 时间猜" |
+| 文件活动（正在读写） | ✅ 实测 | `apply_patch` 没有 `file_path`，路径从 patch 文本的 `*** Update/Add/Delete File:` 解析 |
+| 子代理幽灵（出现 / 收工汇报） | ✅ 实测 | SubagentStart/Stop；名字取 `spawn_agent` 的 `task_name`，汇报文案取 `last_assistant_message` |
+| 打断收场（收掉孤儿幽灵） | 🟡 仅离线验证 | `Interrupt` 事件已接，真实会话里还没出现过 |
+| 等授权（blocked·awaiting_permission） | 🟡 仅离线验证 | 本机 `permission_mode=bypassPermissions`，从不弹权限框；Codex 走显式 `PermissionRequest`（不再用 CodeBuddy 的 pending 推断） |
+| 坐工位小怪物名册（Codex 侧 agent 定义） | 🟡 未实证 | 按 `$CODEX_HOME/agents`、`<工程>/.codex/agents` 的 `.md`/`.toml` 扫；本机还没有这类文件 |
+| 楼层 / 会话列表（4F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessions.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl` 取首行 `cwd` |
+| 按客户端隔离（4F 不显示 CodeBuddy 的成员与相位） | ✅ 实测 | `members.client` + `/api/v1/reporter-phase?client=` |
+| PreCompact / PostCompact | ❌ 未处理 | 与 CodeBuddy 一致（没有对应的 UI 语义） |
+| `Stop.last_assistant_message` | ❌ 未使用 | 完成摘要仍取"本轮改动过的文件" |
+| `turn_id` / `agent_id` 归因 | ❌ 未使用 | 子代理自己的工具调用带 `agent_id`，本可把文件活动归到那只幽灵身上（现在仍算主成员） |
+| 工具名归一 | ✅ 实测 | Codex 报的是 `Bash`（不是 shell）、`apply_patch`、`collaborationspawn_agent`（展示去掉前缀） |
+
+## 9. 工作区内的已知杂物（非工程结构）
 
 | 路径 | 现象 | 说明 |
 | --- | --- | --- |

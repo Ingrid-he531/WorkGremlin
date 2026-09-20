@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { reporterMainPhase, freshestReporterWs, hasReporterState } = require('../../sessions');
+const { reporterMainPhase, freshestReporterWs, reporterStateMeta, readReporterDone } = require('../../sessions');
 
 /**
  * 会话：全局活跃会话表（按楼层分组）。
@@ -31,13 +31,17 @@ function createSessionsRouter({ workspace }) {
     const ws = freshestReporterWs(cur.workspacePath || '', client);
     const rp = reporterMainPhase(ws, client);
     // 这个工程有没有接 hook（接了但当前没动作 → 渲染层显示"待命"，而不是按文件时间瞎猜）
-    const instrumented = hasReporterState(ws, client);
+    // 有没有接 hook + 那份状态文件属于哪条会话（渲染层据此判断"你正在看的这条会话在上报吗"）
+    const meta = reporterStateMeta(ws, client);
+    const instrumented = meta.instrumented;
+    // 上一轮的完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
+    const done = readReporterDone(ws, client);
     // 带上这条相位所属的工程路径（workspacePath）：渲染层据此只在"选中会话正好属于这个工程"时
     // 才叠加实时相位，避免旧会话（它自己工程已不活跃）被新工程的相位串味、短暂闪一下"思考中"。
     res.json(
       rp
-        ? { ok: true, workspacePath: ws, instrumented, ...rp }
-        : { ok: true, workspacePath: ws, instrumented, phase: null, action: '', target: '', context: [] }
+        ? { ok: true, workspacePath: ws, instrumented, sessionId: meta.sessionId, done, ...rp }
+        : { ok: true, workspacePath: ws, instrumented, sessionId: meta.sessionId, done, phase: null, action: '', target: '', context: [] }
     );
   });
 

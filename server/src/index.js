@@ -37,6 +37,38 @@ const clock = require('./clock');
 const VERSION = '0.1.0';
 
 /**
+ * 探测到"装了某个受监控 CLI"就把 hook 自动接上 —— 探测和接入本该是一件事，
+ * 不该让用户装完 WorkGremlin 再手跑一遍 `npm run hooks:install`。
+ *
+ * 安全与分寸：
+ *   · 只对**安装位置命中**的产品写（products.js 的判定口径：PATH 里有可执行文件 / 有插件目录）；
+ *   · 合并式写入，只加/更新我们自己的条目，别人的配置一条不动，首次改动前备份 .bak-workgremlin；
+ *   · 幂等：内容没变就什么都不写（所以每次启动调用是廉价的）；
+ *   · 失败绝不影响服务启动；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`。
+ */
+function autoInstallHooks() {
+  if (process.env.WORKGREMLIN_NO_AUTO_HOOKS === '1') {
+    console.log('[workgremlin] WORKGREMLIN_NO_AUTO_HOOKS=1：跳过自动接入 hook');
+    return null;
+  }
+  try {
+    // 延迟 require：只有真要装的时候才加载这个脚本
+    const { installHooks } = require('../../scripts/install-hooks');
+    const result = installHooks({});
+    if (result.installed.length) {
+      console.log(`[workgremlin] 自动接入 hook：${result.installed.join('、')}`);
+    }
+    if (result.failed.length) {
+      console.warn(`[workgremlin] 自动接入 hook 跳过（配置不是合法 JSON）：${result.failed.join('、')}`);
+    }
+    return result;
+  } catch (err) {
+    console.warn(`[workgremlin] 自动接入 hook 失败（不影响使用）：${err && err.message}`);
+    return null;
+  }
+}
+
+/**
  * 判断 Origin 是否为回环地址（端口不限）。
  * @param {string} origin
  */
@@ -207,6 +239,9 @@ function createServer(opts = {}) {
    * @param {number} [port]
    */
   async function start(port) {
+    // 启动即接入：探测到装了哪个 CLI 就把它那份 hook 写好（幂等）
+    autoInstallHooks();
+
     const existing = config.readServerInfo();
     const chosen = Number(port) || Number(opts.port) || (await config.pickPort());
     if (!chosen) throw new Error('no free port available in the configured range');

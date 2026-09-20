@@ -252,8 +252,14 @@ function looksInstalled(t) {
   }
 }
 
-function main() {
-  const args = parseArgs(process.argv.slice(2));
+/**
+ * 安装/卸载 hook。既能当函数调（服务启动时自动接入），也能走 CLI（见文件末尾）。
+ * @param {Record<string, any>} [args] 同 CLI 参数（targets / member / dry-run / uninstall / project）
+ * @returns {{installed: string[], unchanged: string[], skipped: string[], failed: string[], files: string[]}}
+ */
+function installHooks(args = parseArgs(process.argv.slice(2))) {
+  /** @type {{installed: string[], unchanged: string[], skipped: string[], failed: string[], files: string[]}} */
+  const result = { installed: [], unchanged: [], skipped: [], failed: [], files: [] };
   const member = String(args.member || 'codebuddy').trim() || 'codebuddy';
   const dryRun = args['dry-run'] === true;
   const uninstall = args.uninstall === true;
@@ -308,8 +314,8 @@ function main() {
   const targets = all.filter((t) => (t.optional ? args.project === true || wanted.includes(t.id) : !wanted.length || wanted.includes(t.id)));
 
   if (!fs.existsSync(HOOK_SCRIPT)) {
-    console.error(`[workgremlin] 找不到 hook 脚本：${HOOK_SCRIPT}`);
-    process.exit(1);
+    // 抛错而不是 process.exit：服务端启动时自动接入会调本函数，退出会把服务带下去
+    throw new Error(`找不到 hook 脚本：${HOOK_SCRIPT}`);
   }
 
   console.log(`[workgremlin] hook 命令：${cmd}`);
@@ -323,6 +329,7 @@ function main() {
       console.log(
         `[workgremlin] · ${t.label}：看着没装（PATH 里没有 ${t.cmd}，${t.dir} 里也没有别的数据），跳过（确定装了就 --targets=${t.id} 强制写）`
       );
+      result.skipped.push(t.label);
       continue;
     }
 
@@ -330,6 +337,7 @@ function main() {
     const existing = exists ? readSettings(t.file) : null;
     if (exists && existing === null) {
       console.error(`[workgremlin] ✗ ${t.label}：${t.file} 不是合法 JSON，先修好再装（没动它）`);
+      result.failed.push(t.label);
       continue;
     }
 
@@ -339,10 +347,12 @@ function main() {
 
     if (!uninstall && before === after) {
       console.log(`[workgremlin] · ${t.label}：已是最新 ${t.file}`);
+      result.unchanged.push(t.label);
       continue;
     }
     if (uninstall && before === after) {
       console.log(`[workgremlin] · ${t.label}：本来就没装 ${t.file}`);
+      result.unchanged.push(t.label);
       continue;
     }
 
@@ -353,6 +363,8 @@ function main() {
 
     writeSettings(t.file, next, dryRun);
     console.log(`[workgremlin] ✓ ${t.label}：${uninstall ? '已移除' : '已写入'} ${t.file}`);
+    if (!dryRun) result.installed.push(t.label);
+    result.files.push(t.file);
   }
 
   if (!uninstall) {
@@ -363,7 +375,18 @@ function main() {
     console.log('  · CodeBuddy 插件：重开会话');
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');
     console.log('  · 想换工位名：node scripts/install-hooks.js --uninstall && node scripts/install-hooks.js --member coder');
+    console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
+  return result;
 }
 
-main();
+module.exports = { installHooks, HOOK_SCRIPT, EVENTS, CODEX_EVENTS };
+
+if (require.main === module) {
+  try {
+    installHooks();
+  } catch (err) {
+    console.error(`[workgremlin] ${err && err.message}`);
+    process.exit(1);
+  }
+}

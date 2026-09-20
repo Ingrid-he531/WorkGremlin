@@ -60,6 +60,10 @@ async function startPhasePoll() {
             prompt: d.prompt || '',
             workspacePath: d.workspacePath || '',
             instrumented: Boolean(d.instrumented),
+            // 这份状态属于哪条会话（hook 是会话级加载的，见 consoleBase 的 sameSession）
+            sessionId: d.sessionId || '',
+            // 上一轮的完成标记（CLI 楼层靠它亮「任务完成」；Codex 还带收尾自述）
+            done: d.done || null,
           };
         }
       }
@@ -142,11 +146,16 @@ const consoleBase = computed(() => {
   // "思考中"会短暂盖到旧会话上——现象就是旧会话闪一下"思考中"、随后回落"待命中"。
   const fp = fastPhase.value;
   const sameWs = Boolean(fp) && sameWorkspace(fp.workspacePath, sel.projectPath);
+  // hook 状态文件属于**某一条会话**（hook 在会话启动时加载）。工程相同还不够 ——
+  // 实测：13:40 开的旧会话没有 hook，但同工程里跑过 codex exec，状态文件存在，
+  // 于是这条会话被显示成「待命」，看起来像"整轮对话完全没有状态变化"。
+  // 所以还要确认"上报的那条会话 == 你正在看的这条"（rollout 文件名里含 session_id）。
+  const sameSession = Boolean(fp) && (!fp.sessionId || !sel.id || String(sel.id).includes(fp.sessionId));
   // `fresh` 只有 3F 插件会话会设（= 全局唯一"正在敲"的那条）。CLI 楼层（1F/2F/4F/5F）没这个标记，
   // 但同样有 hook 上报的相位 —— 只要"相位所属工程 == 这条会话的工程"就该用它；
   // 否则 4F 永远只能显示会话表里"按 jsonl 文件时间猜"的兜底：一直「调用工具」+ 文案是那个 rollout 文件名。
   const canUseFast = Boolean(sel.fresh) || (sel.source === 'cli' && Boolean(sel.projectPath));
-  if (canUseFast && sameWs && fp.phase) {
+  if (canUseFast && sameWs && sameSession && fp.phase) {
     if (fp.phase === 'await') {
       return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null, prompt: fp.prompt || '' };
     }
@@ -165,7 +174,7 @@ const consoleBase = computed(() => {
   }
   // 接了我们 hook 的 CLI 工程：当前没有相位 = 这一路现在真的没事干 → 待命。
   // 不能退回会话表里那个"按文件 mtime 猜"的结果（它会在 5 分钟窗口内一直说「调用工具」）。
-  if (sel.source === 'cli' && sameWs && fp.instrumented) {
+  if (sel.source === 'cli' && sameWs && sameSession && fp.instrumented) {
     return { phase: 'idle', action: '', context: [], target: null, tool: '', prompt: '' };
   }
   // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
@@ -227,18 +236,35 @@ const consoleLive = computed(() => {
  */
 let lastConsoleSessionId = undefined;
 let lastDoneAt = undefined;
+/** 是否已经见过"快轮询带回的完成标记"：首次只当基线，不弹摘要（见下面的注释） */
+let seenFastDone = false;
 watch(
   consoleLive,
   (v) => {
     const sel = sessions.selected;
     const selId = sel ? sel.id : null;
-    const doneAt = sel ? sel.doneAt || 0 : 0;
+    // 完成标记：优先会话自身的（3F 插件从落盘算出来），CLI 楼层没有就取 hook 快轮询带回来的。
+    //
+    // 两条纪律（都是踩过的坑）：
+    //   ① 它是"某条会话上一轮结束"的**持久状态**，不是一次性事件 —— 页面刚打开 / 刚切楼层时
+    //      首次拿到它只能当基线，否则会把上一次的完成摘要当成刚发生的事重播一遍
+    //      （现象：一开 4F 就弹「任务完成」，10 秒后才回待命）；
+    //   ② 它按"工程 + 客户端"存（同工程里 Codex/CodeBuddy 各一份），但显示时是针对**选中的会话**，
+    //      所以还要确认这份完成属于当前这条会话（rollout 文件名里含 session_id）。
+    const fpDone = fastPhase.value && fastPhase.value.done;
+    const sameSession =
+      !fpDone || !fpDone.sessionId || !sel || !sel.id || String(sel.id).includes(fpDone.sessionId);
+    const fastDoneAt = fpDone && fpDone.at && sameSession ? fpDone.at : 0;
+    const firstFastDone = fastDoneAt > 0 && !seenFastDone;
+    if (fastDoneAt > 0) seenFastDone = true;
+    const doneAt = (sel && sel.doneAt) || fastDoneAt || 0;
     // 切换了会话（或首次）：直接把控制台切到这条会话当前的状态，重置完成标记，不弹"任务完成"。
     // 办公室的工位小怪物也跟着选中的会话走：切到别的工程会话，就切到那个工程的成员清单，
     // 这样"主 Agent + 小怪物"整组都跟随下拉选中的那条，不再停在之前打开的工程。
     if (selId !== lastConsoleSessionId) {
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
+      seenFastDone = fastDoneAt > 0; // 切会话时重新以这条会话的标记为基线
       // 空楼层（一条会话都没有）：控制台待命 + 屋里清人（见 sceneMembers），
       // 不走 applySession(null) —— 那是"会话收工"，会弹「任务完成」，跟这层没关系。
       if (!sel && sessions.floorEmpty) {
@@ -253,6 +279,7 @@ watch(
     }
     // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
     // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
+    if (firstFastDone) lastDoneAt = doneAt; // 首次拿到：只记基线，不弹
     if (doneAt && doneAt !== lastDoneAt) {
       lastDoneAt = doneAt;
       // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
@@ -260,9 +287,10 @@ watch(
       const files = (sel && sel.doneFiles) || [];
       // 本轮任务改动的文件数（服务端已按"本轮开始之后"过滤）；拿不到就用列表长度兜底
       const count = (sel && Number(sel.doneCount)) || files.length;
+      const said = (fpDone && fpDone.said) || '';
       const ctx = files.length
         ? [`改动 ${count} 个文件`, ...files.map((f) => `${f.name}  +${f.added}/-${f.removed}`)]
-        : ['本次任务已完成'];
+        : [said || '本次任务已完成'];
       mainAgent.enterDone('任务完成', ctx);
       return;
     }

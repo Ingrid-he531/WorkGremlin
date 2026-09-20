@@ -79,8 +79,11 @@ node scripts/subagents.js list
 
 ## CodeBuddy / WorkBuddy 接入（hook）
 
-让正在干活的 agent 自己往屋里报状态：装一次，**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI**
-四个入口的会话都会上报：
+让正在干活的 agent 自己往屋里报状态：**启动时会自动接入** —— 探测到装了哪个 CLI（只看安装位置），
+就把对应那份 hook 写好（合并式、幂等、首次改动前备份；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`）。
+**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI** 四个入口的会话都会上报。
+
+需要手动跑（强制某个 target / 指定工位名 / 卸载）时：
 
 ```bash
 npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy
@@ -221,6 +224,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/jso
 | `WORKGREMLIN_SUBAGENTS_FILE` | subagent 清单文件路径（覆盖 `<workspace>/.workgremlin/subagents.json`） |
 | `WORKGREMLIN_DEV=1` | Electron 加载 Vite dev server 并开 DevTools |
 | `WORKGREMLIN_SKIP_REBUILD=1` | 跳过 electron-rebuild（**仅供无法构建时使用，需上报**） |
+| `WORKGREMLIN_NO_AUTO_HOOKS=1` | 启动时不自动写各 CLI 的 hook 配置（要用 `npm run hooks:install` 手动装） |
 
 ## 打包（M3）
 

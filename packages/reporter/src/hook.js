@@ -619,7 +619,7 @@ async function main() {
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // 状态文件里记下来源客户端：同一个工程可能同时有 Codex 与 CodeBuddy 在跑，
   // 主控制台要按楼层（客户端）取相位，不能谁新鲜就显示谁。
-  writeState(file, { client: CLIENT });
+  writeState(file, { client: CLIENT, sessionId: String((ev && ev.session_id) || '') });
 
   // 心跳守护的"最后活跃时间"（它靠这个判断会话还在不在）
   if (event !== 'SessionEnd') writeState(file, { hb: { ...(readState(file).hb || {}), lastEventAt: Date.now() } });
@@ -708,7 +708,9 @@ async function main() {
       // 本环境实测 Read/Grep/Glob/ReadLints/Bash 等只读 / 命令类工具根本不发 PostToolUse，
       // 一旦给它们打 pending，PostToolUse 永远不来、清不掉 → 兜底误判成"等待授权"
       // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
-      const probe = PROBE_TOOLS.has(tool);
+      // Codex 有显式的 PermissionRequest 事件，不需要"pending 超时 = 等授权"这套兜底推断；
+      // 而且 Codex 的写类工具（apply_patch）经常跑很久，打了 pending 会被误判成"等待授权"。
+      const probe = !IS_CODEX && PROBE_TOOLS.has(tool);
       writeState(file, {
         lastTool: tool,
         lastInput: ev.tool_input || '',
@@ -787,7 +789,15 @@ async function main() {
     if (taskId) await request(info, HTTP_ROUTES.TASK_END, { ...base, memberId: member, taskId, state: 'done' });
     // 落"完成"标记：带工程路径 + 任务标题 + 起始时刻，服务端据此（且仅据此）亮"任务完成"概要，
     // 不再靠"相位回落到空闲"来猜，避免中途被其它工程串味误弹。
-    writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0, done: { at: Date.now(), title, workspacePath: REAL_WS, startedAt } });
+    // Codex 的 Stop 带 last_assistant_message（收尾自述）——落进完成标记，主控制台拿它当摘要；
+    // CodeBuddy 没有这个字段，said 为空，仍然走"本轮改动文件"那套。
+    const said = String((ev && ev.last_assistant_message) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    writeState(file, {
+      taskId: null,
+      taskWorkspacePath: '',
+      taskStartedAt: 0,
+      done: { at: Date.now(), title, workspacePath: REAL_WS, startedAt, said, sessionId: String((ev && ev.session_id) || '') },
+    });
     await beat();
     await status('idle');
     return;
@@ -836,7 +846,10 @@ async function main() {
   }
 
   if (event === 'SessionEnd') {
-    clearAwait(file);
+    // 注意：这里不能调 clearAwait() —— 它会把 done 一起清掉，而 done 是"上一轮任务完成"的标记，
+    // 会话结束后办公室可能还停在这条会话上（尤其 codex exec 这种一次一进程的短会话），
+    // 清掉就永远看不到「任务完成」摘要了。所以只清"当前进行中"的那几项。
+    writeState(file, { await: null, pending: null, sessionPhase: null });
     stopHeartbeat(member);
     // 兜底：会话都结束了，它召唤出去的幽灵不该还飘着（手工 scripts/subagents.js
     // 写的那些没有 ts，不动它们）。
