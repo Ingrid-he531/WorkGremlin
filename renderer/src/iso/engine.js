@@ -771,10 +771,12 @@ export function createIsoOffice(canvas, opts = {}) {
 
   /**
    * 显示器屏幕（南桌，朝镜头那一面）。
-   * on=false（没人的工位）：屏幕熄灭 —— 接近黑，只留一道很淡的反光，不是死黑一块。
-   * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，上面密密麻麻的
-   * 黑色小文字短段与点点（"中病毒"的满屏黑字）；全部用 seed 做确定性伪随机，
-   * 不能 Math.random，否则每帧闪成迪厅。
+   * on=false（没人的工位）：**待机** —— 铺暗蓝，屏面上透出一小团冷调微光，
+   * 读得出"通着电、只是没内容"，跟隔壁亮着的屏幕一眼分得开（不是死黑一块掉了电）。
+   * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，上面是密密麻麻的
+   * **白色短横**（= 一屏正在滚的字）：亮白 / 柔白绿两级，行距密、每行错落顶格；
+   * 不再画黑点点（远看像脏污），字本身就是比绿底更亮的白。
+   * 全部用 seed 做确定性伪随机，不能 Math.random，否则每帧闪成迪厅。
    */
   function drawScreen(c, m, color, progress, seed, on) {
     const face = m.y + m.d;
@@ -783,32 +785,57 @@ export function createIsoOffice(canvas, opts = {}) {
     const x0 = m.x + 0.07;
     const x1 = m.x + m.w - 0.07;
     if (!on) {
-      wallQuad(c, 'y', face, x0, x1, z0, z1, '#04060b');
-      wallQuad(c, 'y', face + 0.001, x0 + 0.12, x0 + 0.26, z0 + 0.04, z1 - 0.12, 'rgba(160,190,230,0.05)');
+      // 暗蓝底：上缘略亮、下缘沉下去，屏面才有"一块玻璃"的厚度感
+      const pTop = project((x0 + x1) / 2, face, z1);
+      const pBot = project((x0 + x1) / 2, face, z0);
+      const gb = c.createLinearGradient(0, pTop.y, 0, pBot.y);
+      gb.addColorStop(0, '#14283f');
+      gb.addColorStop(1, '#08142a');
+      wallQuad(c, 'y', face, x0, x1, z0, z1, gb);
+
+      // 屏面中央的冷光：夹在多边形里画（clip），不许溢到边框上
+      c.save();
+      poly(c, [project(x0, face, z1), project(x1, face, z1), project(x1, face, z0), project(x0, face, z0)]);
+      c.clip();
+      const gz = z0 + (z1 - z0) * 0.44;
+      const gp = project((x0 + x1) / 2, face, gz);
+      const r = Math.max(4, Math.abs(project(x1, face, gz).x - project(x0, face, gz).x) * 0.55);
+      const gg = c.createRadialGradient(gp.x, gp.y, 0, gp.x, gp.y, r);
+      gg.addColorStop(0, 'rgba(122,180,255,0.20)');
+      gg.addColorStop(0.5, 'rgba(92,152,236,0.08)');
+      gg.addColorStop(1, 'rgba(70,130,215,0)');
+      c.fillStyle = gg;
+      c.fillRect(gp.x - r * 2, gp.y - r * 2, r * 4, r * 4);
+      c.restore();
+
+      // 一道斜向反光（玻璃还在，只是没发光）
+      wallQuad(c, 'y', face + 0.001, x0 + 0.12, x0 + 0.26, z0 + 0.04, z1 - 0.12, 'rgba(150,190,240,0.07)');
       return;
     }
     // 墨绿铺满（老显示器的沉绿，不是荧光绿）
     wallQuad(c, 'y', face, x0, x1, z0, z1, '#1f5c40');
     // 右上角状态点（沿用成员级别色）
     wallQuad(c, 'y', face + 0.001, x1 - 0.12, x1 - 0.07, z1 - 0.05, z1 - 0.01, color);
-    // 满屏黑色小字：行距密、段短、每行几乎顶格排满 —— 远看就是一整屏字
-    const pitch = 0.034;
+    // 屏上的白字：行距拉开（不铺满），每行几段短横 —— 远看是"屏上有字"，不是一整屏雪花
+    const pitch = 0.055;
     const rows = Math.max(3, Math.floor((z1 - z0 - 0.13) / pitch));
     for (let k = 0; k < rows; k += 1) {
       const zz = z1 - 0.065 - k * pitch;
       let cx = x0 + 0.05 + ((seed >> (k * 4)) % 4) * 0.02; // 行首缩进错落
-      for (let s = 0; s < 14; s += 1) {
-        const sw = 0.022 + ((seed >> (k * 5 + s * 7)) % 5) * 0.013; // 0.022~0.087，很多是小点
+      for (let s = 0; s < 10; s += 1) {
+        // 最短 0.036：不留"点"，最短也得像一小截单词
+        const sw = 0.036 + ((seed >> (k * 5 + s * 7)) % 5) * 0.011; // 0.036~0.080
+        // 亮白 / 柔白绿两级，都比绿底亮 —— 看着就是"屏上有字"
         const tone = (seed >> (k * 3 + s)) % 3;
-        const col = tone === 0 ? '#071b0f' : tone === 1 ? '#0c2c17' : '#04120a';
+        const col = tone === 0 ? '#f4fff8' : tone === 1 ? '#d3f6e2' : '#a9e7c4';
         if (cx + sw > x1 - 0.05) break;
         wallQuad(c, 'y', face, cx, cx + sw, zz, zz + 0.024, col);
-        cx += sw + 0.02 + ((seed >> (k + s * 3)) % 3) * 0.008; // 词间距错落
+        cx += sw + 0.03 + ((seed >> (k + s * 3)) % 3) * 0.008; // 词间距拉开
       }
     }
-    // 底部进度条：半透明暗轨 + 浅绿走条（墨绿底上深走条对比不够，反过来）
+    // 底部进度条：深绿轨（不用纯黑，免得糊成一团黑）+ 亮绿的走条
     const pz = z0 + 0.04;
-    wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(0,0,0,0.35)');
+    wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(6,32,20,0.5)');
     if (progress > 0) {
       const full = x1 - 0.06 - (x0 + 0.06);
       wallQuad(c, 'y', face, x0 + 0.06, x0 + 0.06 + full * progress, pz, pz + 0.04, '#9fe8b8');
@@ -1478,30 +1505,30 @@ export function createIsoOffice(canvas, opts = {}) {
             wallQuad(c, 'y', backY, m.x + 0.12, m.x + m.w - 0.12, z0 + m.h * 0.42, z0 + m.h * 0.48, 'rgba(120,140,170,0.16)');
             wallQuad(c, 'y', backY + 0.001, m.x + m.w / 2 - 0.055, m.x + m.w / 2 + 0.055, z0 + m.h * 0.58, z0 + m.h * 0.58 + 0.09, '#31405a', 'rgba(140,170,210,0.35)', 0.8);
             /**
-             * 电源指示灯（只在小怪物在座的工位点亮 = 通电运行中）：
-             * 背面下沿、比右下角往中间收一点（不正中 —— 正中像摄像头），
-             * 一条 3×1 的青蓝小横线，透明度呼吸 0.3 → 1.0 → 0.3
-             * （周期 1.8s，各工位错开相位）；外圈极淡辉光（≤15%，跟着一起呼吸）。
+             * 电源指示灯：背面下沿、比右下角往中间收一点（不正中 —— 正中像摄像头），
+             * 一条 3×1 的小横线（与显示器横边平行：gx 轴屏幕方向斜 30°，不是窗口水平）。
+             *   · 在座（通电运行中）：青蓝，透明度呼吸 0.3 → 1.0 → 0.3，周期 1.8s、各工位错相位；
+             *   · 空工位（待机）：换成**暗蓝微光**、恒亮不呼吸 —— 北排只看得见显示器背壳，
+             *     靠这颗灯传达"机器通着电、屏是暗蓝待机"，而不是这台坏了。
              */
-            if (a) {
-              const breath = 0.3 + 0.7 * (0.5 + 0.5 * Math.sin((now / 1000) * ((Math.PI * 2) / 1.8) + i * 0.9));
-              const lp = project(m.x + m.w * 0.72, backY + 0.002, z0 + 0.05);
-              const gl = c.createRadialGradient(lp.x, lp.y, 0, lp.x, lp.y, 4);
-              gl.addColorStop(0, `rgba(79,195,247,${0.15 * breath})`);
-              gl.addColorStop(1, 'rgba(79,195,247,0)');
-              c.beginPath();
-              c.arc(lp.x, lp.y, 4, 0, Math.PI * 2);
-              c.fillStyle = gl;
-              c.fill();
-              c.save();
-              c.globalAlpha *= breath;
-              c.fillStyle = '#4FC3F7';
-              // 与显示器的横边平行（gx 轴屏幕方向，斜 30°），不是窗口水平
-              c.translate(lp.x, lp.y);
-              c.rotate(Math.atan2(AX.y, AX.x));
-              c.fillRect(-1.5, -0.5, 3, 1);
-              c.restore();
-            }
+            const breath = a
+              ? 0.3 + 0.7 * (0.5 + 0.5 * Math.sin((now / 1000) * ((Math.PI * 2) / 1.8) + i * 0.9))
+              : 0.2;
+            const lp = project(m.x + m.w * 0.72, backY + 0.002, z0 + 0.05);
+            const gl = c.createRadialGradient(lp.x, lp.y, 0, lp.x, lp.y, 4);
+            gl.addColorStop(0, `rgba(79,195,247,${(a ? 0.15 : 0.05) * breath})`);
+            gl.addColorStop(1, 'rgba(79,195,247,0)');
+            c.beginPath();
+            c.arc(lp.x, lp.y, 4, 0, Math.PI * 2);
+            c.fillStyle = gl;
+            c.fill();
+            c.save();
+            c.globalAlpha *= breath;
+            c.fillStyle = a ? '#4FC3F7' : '#3d6d99';
+            c.translate(lp.x, lp.y);
+            c.rotate(Math.atan2(AX.y, AX.x));
+            c.fillRect(-1.5, -0.5, 3, 1);
+            c.restore();
           }
         };
 
