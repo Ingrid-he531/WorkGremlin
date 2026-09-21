@@ -152,8 +152,11 @@ export function drawGremlin(ctx, o) {
   drawProp(ctx, o.prop || 'note', color);
   ctx.restore();
 
-  // 脖子上的工牌：颜色区分用户级 / 项目级（演示专家用中性灰），两个白点示意有字
-  drawLevelBadge(ctx, level, { nx: 0, ny: bodyTop + 2 }, { bx: 0, by: bodyTop + 10 });
+  // 脖子上的工牌：颜色区分用户级 / 项目级（演示专家用中性灰），黑色首字母当"名字"
+  ctx.save();
+  if (facing < 0) ctx.scale(-1, 1); // 身体镜像时工牌上的字母不能跟着镜像
+  drawLevelBadge(ctx, level, String(o.name || '').trim().charAt(0).toUpperCase(), { nx: 0, ny: bodyTop + 2 }, { bx: 0, by: bodyTop + 10 });
+  ctx.restore();
 
   ctx.restore();
 }
@@ -234,13 +237,14 @@ export function drawGhost(ctx, o) {
  *   · user    -> 蓝（#3b82f6）
  *   · project -> 绿（#22c55e）
  *   · 其它（演示专家 / 普通成员）-> 中性灰（#7c8aa5）
- * 卡片上两个白点示意"有字"（不渲染文字，保持小尺寸清晰）。
+ * 卡片中央用黑色写名字的首字母（中文名取第一个字）。
  * @param {CanvasRenderingContext2D} ctx
  * @param {string} level 'user' | 'project' | 其它
+ * @param {string} initial 名字首字母（空串则不画字）
  * @param {{nx:number, ny:number}} neck 挂绳在脖子上的锚点
  * @param {{bx:number, by:number}} anchor 卡片的水平中心 x 与上沿 y
  */
-function drawLevelBadge(ctx, level, neck, anchor) {
+function drawLevelBadge(ctx, level, initial, neck, anchor) {
   const color =
     level === 'user' ? '#3b82f6' : level === 'project' ? '#22c55e' : '#7c8aa5';
   ctx.save();
@@ -263,11 +267,14 @@ function drawLevelBadge(ctx, level, neck, anchor) {
   ctx.strokeStyle = '#0f141b';
   ctx.lineWidth = 1.4;
   ctx.stroke();
-  // 一个白点：示意卡片上有字
-  ctx.fillStyle = '#ffffff';
-  ctx.beginPath();
-  ctx.arc(anchor.bx, anchor.by + cardH / 2, 2, 0, Math.PI * 2);
-  ctx.fill();
+  // 名字首字母（黑色，居中）
+  if (initial) {
+    ctx.fillStyle = '#0f141b';
+    ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(initial, anchor.bx, anchor.by + cardH / 2 + 0.5);
+  }
   ctx.restore();
 }
 

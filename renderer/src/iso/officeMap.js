@@ -101,8 +101,8 @@ const DIVIDER_FRAME = 0.05;
 const COLS = [1.0, 5.4, 9.8];
 /** 两组"面对面双人桌"里，北侧那个人座位的 y */
 const BENCH_Y = [2.6, 6.75];
-/** 人坐自己桌子的哪一侧（gx 偏移）：坐左边，右边留给显示器，屏幕才不被身体挡住 */
-const SEAT_DX = 1.0;
+/** 人坐的位置（gx 偏移）：桌子中间、正对键盘/显示器竖带（键盘中心 x+1.6） */
+const SEAT_DX = 1.6;
 
 /**
  * 一组"面对面双人桌"（= 1 列 × 1 组 = 2 个工位）。
@@ -112,10 +112,9 @@ const SEAT_DX = 1.0;
  * 工位号沿用 A/B 命名：`A<row*3+col>`（北侧）、`B<row*3+col>`（南侧）——
  * 所以演示脚本里 `target: 'A1' / 'B1'` 那两处调度目标仍然有效。
  *
- * 桌上东西的排布（沿用原工位的思路，也为了让隔断上的名牌不被挡）：
- *   人 → 显示器 → 键盘 → 杯子，一路朝自己那侧的桌沿排；
- *   显示器与杯子分列桌子左右两端（显示器在 x+1.95 那条竖带、杯子在 x+0.3），
- *   和隔断上两块名牌的横向范围错开 —— 否则同深度桶里后画的会把名牌压住。
+ * 桌上东西的排布：人 → 键盘 → 显示器，从自己那侧的桌沿一路排到隔板（一前一后）；
+ *   名字贴平放在桌面"坐下后的左下角"（北桌东北角 / 南桌西南角），
+ *   与键盘、鼠标、显示器的位置都错开。
  *
  * @param {number} col 列号 0..2
  * @param {number} row 组号 0..1
@@ -133,7 +132,7 @@ function bench(col, row, x, yN) {
 
   return {
     id: `${col}:${row}`,
-    /** 隔断：两张桌子中间那道板（同长、带铝框）；`seats` 是它两块名牌各属于哪个工位 */
+    /** 隔断：两张桌子中间那道板（同长、带铝框）；`seats` 是它两侧各属于哪个工位 */
     divider: {
       x,
       y: northDesk.y + DESK_D,
@@ -154,10 +153,9 @@ function bench(col, row, x, yN) {
       seat: { x: x + SEAT_DX, y: yN },
       chair: { x: x + SEAT_DX, y: yN },
       desk: northDesk,
-      monitor: { x: x + 1.95, y: northDesk.y + 0.2, w: 1.0, d: 0.12, h: 0.62 },
-      keyboard: { x: x + 0.55, y: northDesk.y + 0.5, w: 0.9, d: 0.34 },
-      // 杯子放桌子的北半边（+0.42）：隔断板顶会切掉桌子南沿那一条，放北边才完整露在板顶之上
-      mug: { x: x + 0.3, y: northDesk.y + 0.42, r: 0.11, h: 0.2 },
+      // 显示器与键盘一前一后：键盘在人前（北沿），显示器靠隔板（背对镜头，看见的是背面）
+      monitor: { x: x + 1.15, y: northDesk.y + 0.5, w: 0.91, d: 0.12, h: 0.56 },
+      keyboard: { x: x + 1.25, y: northDesk.y + 0.18, w: 0.7, d: 0.26 },
     },
     south: {
       ...common,
@@ -166,10 +164,9 @@ function bench(col, row, x, yN) {
       seat: { x: x + SEAT_DX, y: yS },
       chair: { x: x + SEAT_DX, y: yS },
       desk: southDesk,
-      // 镜像：显示器朝自己那侧桌沿（南桌的南沿）退 0.2，键盘在它北边、杯子挪到桌子东端
-      monitor: { x: x + 1.95, y: southDesk.y + DESK_D - 0.32, w: 1.0, d: 0.12, h: 0.62 },
-      keyboard: { x: x + 0.55, y: southDesk.y + 0.4, w: 0.9, d: 0.34 },
-      mug: { x: x + 2.7, y: southDesk.y + 0.9, r: 0.11, h: 0.2 },
+      // 镜像：显示器在键盘北侧、基本挨着键盘（离隔板 0.36，屏幕朝镜头）
+      monitor: { x: x + 1.15, y: southDesk.y + 0.36, w: 0.91, d: 0.12, h: 0.56 },
+      keyboard: { x: x + 1.25, y: southDesk.y + 0.56, w: 0.7, d: 0.26 },
     },
   };
 }

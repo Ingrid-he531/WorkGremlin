@@ -769,29 +769,49 @@ export function createIsoOffice(canvas, opts = {}) {
 
   /* ------------------------------ 静态家具 ------------------------------ */
 
-  /** 显示器屏幕：画在朝镜头那一面（gy = m.y + m.d） */
-  function drawScreen(c, m, color, progress, seed) {
+  /**
+   * 显示器屏幕（南桌，朝镜头那一面）。
+   * on=false（没人的工位）：屏幕熄灭 —— 接近黑，只留一道很淡的反光，不是死黑一块。
+   * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，上面密密麻麻的
+   * 黑色小文字短段与点点（"中病毒"的满屏黑字）；全部用 seed 做确定性伪随机，
+   * 不能 Math.random，否则每帧闪成迪厅。
+   */
+  function drawScreen(c, m, color, progress, seed, on) {
     const face = m.y + m.d;
     const z0 = m.z + 0.08;
     const z1 = m.z + m.h - 0.1;
     const x0 = m.x + 0.07;
     const x1 = m.x + m.w - 0.07;
-    // 屏幕底
-    wallQuad(c, 'y', face, x0, x1, z0, z1, COLORS.screen);
-    // 顶部状态条
-    wallQuad(c, 'y', face, x0, x1, z1 - 0.1, z1, color);
-    // 几行"代码"
-    for (let k = 0; k < 3; k += 1) {
-      const zz = z1 - 0.24 - k * 0.12;
-      const w = 0.22 + ((seed >> (k * 3)) % 5) * 0.11;
-      wallQuad(c, 'y', face, x0 + 0.08, Math.min(x1 - 0.08, x0 + 0.08 + w), zz, zz + 0.055, k === 1 ? '#6fa8ff' : '#5b6779');
+    if (!on) {
+      wallQuad(c, 'y', face, x0, x1, z0, z1, '#04060b');
+      wallQuad(c, 'y', face + 0.001, x0 + 0.12, x0 + 0.26, z0 + 0.04, z1 - 0.12, 'rgba(160,190,230,0.05)');
+      return;
     }
-    // 进度条
-    const pz = z0 + 0.1;
-    wallQuad(c, 'y', face, x0 + 0.08, x1 - 0.08, pz, pz + 0.05, '#232c3a');
+    // 亮绿铺满
+    wallQuad(c, 'y', face, x0, x1, z0, z1, '#3ef06a');
+    // 右上角状态点（沿用成员级别色）
+    wallQuad(c, 'y', face + 0.001, x1 - 0.12, x1 - 0.07, z1 - 0.05, z1 - 0.01, color);
+    // 满屏黑色小字：行距密、段短、每行几乎顶格排满 —— 远看就是一整屏字
+    const pitch = 0.034;
+    const rows = Math.max(3, Math.floor((z1 - z0 - 0.13) / pitch));
+    for (let k = 0; k < rows; k += 1) {
+      const zz = z1 - 0.065 - k * pitch;
+      let cx = x0 + 0.05 + ((seed >> (k * 4)) % 4) * 0.02; // 行首缩进错落
+      for (let s = 0; s < 14; s += 1) {
+        const sw = 0.022 + ((seed >> (k * 5 + s * 7)) % 5) * 0.013; // 0.022~0.087，很多是小点
+        const tone = (seed >> (k * 3 + s)) % 3;
+        const col = tone === 0 ? '#071b0f' : tone === 1 ? '#0c2c17' : '#04120a';
+        if (cx + sw > x1 - 0.05) break;
+        wallQuad(c, 'y', face, cx, cx + sw, zz, zz + 0.024, col);
+        cx += sw + 0.02 + ((seed >> (k + s * 3)) % 3) * 0.008; // 词间距错落
+      }
+    }
+    // 底部进度条：半透明暗轨 + 深绿走条
+    const pz = z0 + 0.04;
+    wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(7,27,15,0.45)');
     if (progress > 0) {
-      const full = x1 - 0.08 - (x0 + 0.08);
-      wallQuad(c, 'y', face, x0 + 0.08, x0 + 0.08 + full * progress, pz, pz + 0.05, '#4c8dff');
+      const full = x1 - 0.06 - (x0 + 0.06);
+      wallQuad(c, 'y', face, x0 + 0.06, x0 + 0.06 + full * progress, pz, pz + 0.04, '#071b0f');
     }
   }
 
@@ -1113,42 +1133,38 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 名牌：钉在隔板正面的一块小牌子，只写成员名字（name 字段，不是 role 职务）。
-   * 板面贴在 gy 恒定的竖直平面上 —— 等距下是个"左右竖直、上下沿斜 30°"的平行四边形，
-   * 所以文字要用 AX / AZ 当局部基底斜切，不然会浮在板子外面。
+   * 桌面名贴：平放在桌面上的小名牌（替代原来挂在隔板上的名牌），只写成员名字。
+   * 文字按桌面自己的两根轴（AX / AY）斜切，贴在桌面上；保留级别色条（user 蓝 / project 绿）。
+   * 字在屏幕上恒为 ~10px：先按相机反算世界字号，名字比贴宽长时再按比例收。
    */
-  function drawWallPlate(c, { x, y, z, text, accent, maxW = 1.5, maxH = 0.5 }) {
-    // 想让字在屏幕上恒为 ~11px → 反算世界字号；但牌子挂在隔板上，
-    // 高度必须封顶（maxH，隔断的矮板传 0.38），所以字号再按牌高收一次，远看也不会撑爆隔板。
-    const H_MAX = maxH;
-    const fsPx = 11 / cam.zoom;
-    const wantTile = fsPx / UNIT_Z; // 期望的世界字号（tile）
+  function drawDeskTag(c, { x, y, z, text, accent, maxW = 0.85, flip = false, alignRight = false }) {
+    const fsPx = 10 / cam.zoom;
     c.font = `600 ${fsPx}px ui-sans-serif, system-ui, sans-serif`;
-    // 牌宽跟着名字长度走，长名字也不会挤成一团（上限留给隔板上的便利贴）
-    const w = Math.max(0.9, Math.min(maxW, c.measureText(text).width / UNIT_Z + 0.3));
-    const h = Math.min(H_MAX, Math.max(0.34, wantTile * 2.1));
-    const fsTile = Math.min(wantTile, h * 0.5); // 字号跟着牌高收
-    const face = y; // 紧贴隔板正面
-    const z1 = z + h;
-
-    // 落在隔板上的投影（牌子下方偏右一点，暗示它离板面有一点点距离）
-    wallQuad(c, 'y', face - 0.002, x + 0.07, x + w + 0.09, z - 0.07, z1 - 0.06, 'rgba(0,0,0,0.38)');
-    // 深色边框（当作牌子的厚度/包边）
-    wallQuad(c, 'y', face + 0.006, x - 0.035, x + w + 0.035, z - 0.035, z1 + 0.035, '#1a2130');
-    // 牌面
-    wallQuad(c, 'y', face + 0.012, x, x + w, z, z1, '#eef2f8', 'rgba(18,24,34,0.35)', 0.8);
-    // 左侧状态色条
-    wallQuad(c, 'y', face + 0.018, x, x + 0.09, z, z1, accent);
-
-    // 名字：贴着牌面斜切（局部坐标 u 沿牌宽、v 向下）
-    const o = project(x, face + 0.018, z1);
+    const w = Math.max(0.5, Math.min(maxW, c.measureText(text).width / UNIT_Z + 0.22));
+    const d = 0.3;
+    // alignRight：x 给的是贴子右沿（紧贴桌子侧边时，贴宽随名字变化也能对齐桌边）
+    const tx = alignRight ? x - w : x;
+    // 级别色条：正常在西侧；flip（北桌）时随文字一起换到对面（东侧）——
+    // 从坐着的小怪物看，色条始终在文字的左手边
+    const stripX = flip ? tx + w - 0.07 : tx;
+    // 贴底（浅色）+ 一条级别色条
+    isoDiamond(c, { x: tx, y, w, d, z, fill: '#eef2f8', stroke: 'rgba(18,24,34,0.4)', lw: 0.8 });
+    isoDiamond(c, { x: stripX, y, w: 0.07, d, z: z + 0.001, fill: accent });
+    // 名字：按桌面轴斜切（局部 u 沿 +gx、v 沿 +gy，单位 tile）。
+    // flip=true（北桌）：绕贴中心转 180°，字对镜头是倒的、对坐在北侧的小怪物是正的
+    let fsTile = fsPx / UNIT_Z;
+    const tw = c.measureText(text).width / UNIT_Z;
+    if (tw > w - 0.16) fsTile *= (w - 0.16) / tw;
+    const cx = flip ? (w - 0.09) / 2 : 0.09 + (w - 0.09) / 2; // 文字中心（让开色条那侧）
+    const o = flip ? project(tx + w, y + d, z + 0.002) : project(tx, y, z + 0.002);
     c.save();
-    c.transform(AX.x, AX.y, -AZ.x, -AZ.y, o.x, o.y);
+    if (flip) c.transform(-AX.x, -AX.y, -AY.x, -AY.y, o.x, o.y);
+    else c.transform(AX.x, AX.y, AY.x, AY.y, o.x, o.y);
     c.font = `600 ${fsTile}px ui-sans-serif, system-ui, sans-serif`;
     c.fillStyle = '#2c3442';
     c.textAlign = 'center';
     c.textBaseline = 'middle';
-    c.fillText(text, 0.09 + (w - 0.09) / 2, h / 2);
+    c.fillText(text, flip ? w - cx : cx, d / 2);
     c.restore();
   }
 
@@ -1246,13 +1262,17 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 金属竖直面（隔板铝框的南面 / 东面）：屏幕竖向渐变。
+   * 金属竖直面（隔板铝框的南面 / 东面）：屏幕竖向渐变，从 (gx,gy,z1) 到 (gx,gy,z0)。
+   * 渐变必须贴着**实际那个面**取坐标 —— 只按 z 在原点处取一条竖线的话，
+   * 面的位置远在渐变范围之外，超出渐变的部分只能拿到末端色
+   * （南面变成一整块 0.5 暗色、和板体一个色，框就"没了"）。
    * 拉丝铝的读法 —— 顶刃一条受光亮带（镜面高光）→ 快速回落到基调 → 底刃压暗；
-   * 等距下 z 轴投成屏幕竖直线，所以渐变色标对所有 gx/gy 都成立。
    * k 给背光面整体降档（东面 ≈ 南面的 0.72，与原先 shade 0.8 / 0.58 的比例一致）。
    */
-  function metalFace(c, base, z0, z1, k = 1) {
-    const g = c.createLinearGradient(0, project(0, 0, z1).y, 0, project(0, 0, z0).y);
+  function metalFace(c, base, gx, gy, z0, z1, k = 1) {
+    const pT = project(gx, gy, z1);
+    const pB = project(gx, gy, z0);
+    const g = c.createLinearGradient(pT.x, pT.y, pB.x, pB.y);
     g.addColorStop(0, shade(base, 1.62 * k)); // 顶刃高光
     g.addColorStop(0.16, shade(base, 1.06 * k));
     g.addColorStop(0.55, shade(base, 0.82 * k)); // 基调（≈ 原南面 0.8）
@@ -1290,7 +1310,7 @@ export function createIsoOffice(canvas, opts = {}) {
       if (!backAtNorth) push(depthOf(x, y + 0.24), (c) => drawChairBack(c, x, y, false));
     };
 
-    /* 工位（一）：隔断（铝合金边框）+ 它上面的两块名牌 —— 6 组面对面双人桌各一道 */
+    /* 工位（一）：隔断（铝合金边框）—— 6 组面对面双人桌各一道 */
     DIVIDERS.forEach((p) => {
       // 兜底：HMR 期间可能拿到"新 officeMap 的隔断对象 + 旧引擎"或半截数据 ——
       // 那种情况下宁可少画一道隔断，也不要让整个办公室构建失败（白屏）。
@@ -1317,8 +1337,6 @@ export function createIsoOffice(canvas, opts = {}) {
       const floor = dn + 0.4 + 0.01;
       const ceil = ds - 0.01;
       const segDepth = (s) => Math.min(ceil, Math.max(floor, natSegDepth(s))) + s * 0.0005; // 段间仍保持左→右的前后序
-      /** 名牌落在哪一段上 */
-      const segOf = (gx) => Math.max(0, Math.min(SEG - 1, Math.floor((gx - p.x) / segW)));
 
       // 落地阴影：用自然深度，避免被 clamp 抬高后盖到后方桌子上
       push(natSegDepth(0) - 0.5, (c) => {
@@ -1365,9 +1383,9 @@ export function createIsoOffice(canvas, opts = {}) {
            */
           isoBox(c, {
             x: p.x + FR + s * bodySegW, y: p.y, z: p.h - FR, w: bodySegW + 0.01, d: p.d, h: FR, color: ALU,
-            south: metalFace(c, ALU, p.h - FR, p.h, 1),
-            east: metalFace(c, ALU, p.h - FR, p.h, 0.72),
-            top: metalTop(c, ALU, p.y, p.d, p.h),
+            south: metalFace(c, ALU, p.x + FR + s * bodySegW, p.y + p.d, p.h - FR, p.h, 1),
+            east: metalFace(c, ALU, p.x + FR + (s + 1) * bodySegW, p.y, p.h - FR, p.h, 0.72),
+            top: metalTop(c, ALU, p.x + FR + s * bodySegW, p.y, p.d, p.h),
           });
           /**
            * 下横框只画正面那一条（wallQuad），不画盒子：
@@ -1375,7 +1393,7 @@ export function createIsoOffice(canvas, opts = {}) {
            * 画盒子的话顶面那条亮色会浮在板根前面，只能不漏的方式就是根本没有那个面。
            * 正面这条比板面往外探 0.001，避免与板体南面共面打架。
            */
-          wallQuad(c, 'y', p.y + p.d + 0.001, p.x + FR + s * bodySegW, p.x + FR + (s + 1) * bodySegW + 0.01, 0, FR, metalFace(c, ALU, 0, FR, 1));
+          wallQuad(c, 'y', p.y + p.d + 0.001, p.x + FR + s * bodySegW, p.x + FR + (s + 1) * bodySegW + 0.01, 0, FR, metalFace(c, ALU, p.x + FR + s * bodySegW, p.y + p.d, 0, FR, 1));
         });
       }
       /**
@@ -1387,9 +1405,9 @@ export function createIsoOffice(canvas, opts = {}) {
       push(segDepth(0) - 0.0005, (c) => {
         isoBox(c, {
           x: p.x, y: p.y - FD / 2, w: FR, d: p.d + FD, h: p.h, color: ALU,
-          south: metalFace(c, ALU, 0, p.h, 1),
-          east: metalFace(c, ALU, 0, p.h, 0.72),
-          top: metalTop(c, ALU, p.y - FD / 2, p.d + FD, p.h),
+          south: metalFace(c, ALU, p.x, p.y + p.d, 0, p.h, 1),
+          east: metalFace(c, ALU, p.x + FR, p.y, 0, p.h, 0.72),
+          top: metalTop(c, ALU, p.x, p.y - FD / 2, p.d + FD, p.h),
         });
       });
       // 右竖框：朝东那面是隔断的外表面（该看见），排在最后一段板体之后，
@@ -1397,36 +1415,13 @@ export function createIsoOffice(canvas, opts = {}) {
       push(segDepth(SEG - 1) + 0.0002, (c) => {
         isoBox(c, {
           x: p.x + p.w - FR, y: p.y - FD / 2, w: FR, d: p.d + FD, h: p.h, color: ALU,
-          south: metalFace(c, ALU, 0, p.h, 1),
-          east: metalFace(c, ALU, 0, p.h, 0.72),
-          top: metalTop(c, ALU, p.y - FD / 2, p.d + FD, p.h),
+          south: metalFace(c, ALU, p.x + p.w - FR, p.y + p.d, 0, p.h, 1),
+          east: metalFace(c, ALU, p.x + p.w, p.y, 0, p.h, 0.72),
+          top: metalTop(c, ALU, p.x + p.w - FR, p.y - FD / 2, p.d + FD, p.h),
         });
       });
 
-      /**
-       * 两块名牌：一张隔断属于哪两个工位（p.seats = [北侧号, 南侧号]），各写各自主人。
-       * 两块都挂在隔断**朝镜头那一面** —— 本工程一贯的取舍：看得见优先于物理正确
-       * （显示器屏幕也是这么处理的）。横向一西一东、各自留出边框的宽度；
-       * 高度：底边 0.77 正好在南侧那张桌子压过来的可见线之上，顶边让开顶部铝框
-       * （板 1.21 高、框 0.05 → 牌高压到 0.38，顶到 1.15）。
-       */
-      p.seats.forEach((seatId, k) => {
-        const idx = DESK_UNITS.findIndex((u) => u.id === seatId);
-        const owner = idx >= 0 ? agents.find((ag) => ag.home === idx) : null;
-        if (!owner) return;
-        const px = p.x + (k === 0 ? 0.08 : 1.52);
-        push(segDepth(segOf(Math.min(px + 1.35, p.x + p.w))) + 0.002, (c) => {
-          drawWallPlate(c, {
-            x: px,
-            y: p.y + p.d + 0.012,
-            z: 0.77,
-            text: owner.name,
-            accent: levelColor(owner.level),
-            maxW: 1.35,
-            maxH: 0.38,
-          });
-        });
-      });
+      // 名牌不再挂隔板：已挪到各桌桌面（见 DESK_UNITS 段的 drawDeskTag）
     });
 
     /* 工位（二）：椅子 / 桌子 / 桌上的东西（显示器、键盘、水杯） */
@@ -1450,26 +1445,150 @@ export function createIsoOffice(canvas, opts = {}) {
       });
 
       // 桌上的东西（depth 比桌子大一点 → 压在桌面上）
-      push(deskDepth + 0.4, (c) => {
+      push(deskDepth + 0.4, (c, now) => {
         const z = u.desk.h;
-        // 显示器
-        isoBox(c, { x: u.monitor.x, y: u.monitor.y, z, w: u.monitor.w, d: u.monitor.d, h: 0.06, color: '#202735' });
+        const m = u.monitor;
+        const kb = u.keyboard;
         const a = agents.find((ag) => ag.home === i);
         const prog = a && a.taskProgress != null ? a.taskProgress : 0;
-        drawScreen(
-          c,
-          { x: u.monitor.x + 0.12, y: u.monitor.y, z: z + 0.06, w: u.monitor.w - 0.24, d: u.monitor.d, h: u.monitor.h },
-          levelColor(a && a.level),
-          prog,
-          i * 977 + 13
-        );
-        // 键盘 / 鼠标
-        isoBox(c, { x: u.keyboard.x, y: u.keyboard.y, z, w: u.keyboard.w, d: u.keyboard.d, h: 0.03, color: '#2a3240' });
-      });
-      // 水杯随桌面一起排序（跟显示器/键盘同层 deskDepth+0.4），不要人为抬到悬浮屏之上：
-      // 屏后的水杯应被悬浮屏正确遮挡，而不是盖在屏上
-      push(deskDepth + 0.4, (c) => {
-        isoCylinder(c, { x: u.mug.x, y: u.mug.y, z: u.desk.h, r: u.mug.r, h: u.mug.h, color: '#e6ebf2' });
+
+        /**
+         * 显示器：底座 + 支架 + 面板（薄盒子当边框）。
+         * 南桌（face='north'）：屏幕朝镜头（也朝使用者），drawScreen 画在面板正面；
+         * 北桌（face='south'）：使用者朝南坐，屏幕朝北 —— 镜头看见的是**背面**，
+         * 画两条散热横纹 + 中央 logo 牌，才读得出"显示器的背壳"而不是一块黑板。
+         */
+        const drawMonitor = () => {
+          isoBox(c, { x: m.x + m.w / 2 - 0.2, y: m.y + 0.01, z, w: 0.4, d: 0.15, h: 0.03, color: '#202735' });
+          isoBox(c, { x: m.x + m.w / 2 - 0.03, y: m.y + 0.02, z: z + 0.03, w: 0.06, d: 0.1, h: 0.09, color: '#242c3a' });
+          isoBox(c, { x: m.x, y: m.y, z: z + 0.12, w: m.w, d: m.d, h: m.h, color: '#1b2230' });
+          if (u.face === 'north') {
+            drawScreen(
+              c,
+              { x: m.x, y: m.y, z: z + 0.12, w: m.w, d: m.d, h: m.h },
+              levelColor(a && a.level),
+              prog,
+              i * 977 + 13,
+              Boolean(a) // 没人的工位：屏幕熄灭
+            );
+          } else {
+            const backY = m.y + m.d + 0.001;
+            const z0 = z + 0.12;
+            wallQuad(c, 'y', backY, m.x + 0.12, m.x + m.w - 0.12, z0 + m.h * 0.3, z0 + m.h * 0.36, 'rgba(120,140,170,0.22)');
+            wallQuad(c, 'y', backY, m.x + 0.12, m.x + m.w - 0.12, z0 + m.h * 0.42, z0 + m.h * 0.48, 'rgba(120,140,170,0.16)');
+            wallQuad(c, 'y', backY + 0.001, m.x + m.w / 2 - 0.055, m.x + m.w / 2 + 0.055, z0 + m.h * 0.58, z0 + m.h * 0.58 + 0.09, '#31405a', 'rgba(140,170,210,0.35)', 0.8);
+            /**
+             * 电源指示灯（只在小怪物在座的工位点亮 = 通电运行中）：
+             * 背面下沿、比右下角往中间收一点（不正中 —— 正中像摄像头），
+             * 一条 3×1 的青蓝小横线，透明度呼吸 0.3 → 1.0 → 0.3
+             * （周期 1.8s，各工位错开相位）；外圈极淡辉光（≤15%，跟着一起呼吸）。
+             */
+            if (a) {
+              const breath = 0.3 + 0.7 * (0.5 + 0.5 * Math.sin((now / 1000) * ((Math.PI * 2) / 1.8) + i * 0.9));
+              const lp = project(m.x + m.w * 0.72, backY + 0.002, z0 + 0.05);
+              const gl = c.createRadialGradient(lp.x, lp.y, 0, lp.x, lp.y, 4);
+              gl.addColorStop(0, `rgba(79,195,247,${0.15 * breath})`);
+              gl.addColorStop(1, 'rgba(79,195,247,0)');
+              c.beginPath();
+              c.arc(lp.x, lp.y, 4, 0, Math.PI * 2);
+              c.fillStyle = gl;
+              c.fill();
+              c.save();
+              c.globalAlpha *= breath;
+              c.fillStyle = '#4FC3F7';
+              // 与显示器的横边平行（gx 轴屏幕方向，斜 30°），不是窗口水平
+              c.translate(lp.x, lp.y);
+              c.rotate(Math.atan2(AX.y, AX.x));
+              c.fillRect(-1.5, -0.5, 3, 1);
+              c.restore();
+            }
+          }
+        };
+
+        /**
+         * 键盘：薄底板 + 顶面三行键帽（浅色小菱形）。
+         * 键帽不画厚度（不到 3px 的盒子看不出体积，平的小格反而一眼是键盘）。
+         * 键盘右边一只鼠标：底影 + 亮面小拱 + 一道中线当滚轮。
+         */
+        const drawKeyboard = () => {
+          isoBox(c, { x: kb.x, y: kb.y, z, w: kb.w, d: kb.d, h: 0.025, color: '#242c3a' });
+          const ROWS = 3;
+          const COLS = 7;
+          for (let r = 0; r < ROWS; r += 1) {
+            for (let q = 0; q < COLS; q += 1) {
+              isoDiamond(c, {
+                x: kb.x + 0.05 + q * ((kb.w - 0.1) / COLS),
+                y: kb.y + 0.04 + r * ((kb.d - 0.08) / ROWS),
+                w: (kb.w - 0.1) / COLS - 0.02,
+                d: (kb.d - 0.08) / ROWS - 0.015,
+                z: z + 0.026,
+                fill: '#454f61',
+              });
+            }
+          }
+          /**
+           * 鼠标：沿桌子前后（gy 轴屏幕方向）拉长的椭圆，颜色与键盘同系深灰蓝。
+           * 位置在使用者的**右手边**：南桌（背对镜头）右手在东（键盘 +x 侧），
+           * 北桌（面对镜头）右手在西（键盘 −x 侧）—— 两排不是同一个屏幕方向，不能镜像。
+           */
+          const mx = u.face === 'north' ? kb.x + kb.w + 0.22 : kb.x - 0.22;
+          const my = kb.y + kb.d / 2;
+          const pM = project(mx, my, z + 0.045);
+          const mAng = Math.atan2(AY.y, AY.x); // gy 轴在屏幕上的方向
+          c.save();
+          c.translate(pM.x, pM.y);
+          c.rotate(mAng);
+          c.beginPath();
+          c.ellipse(0, 0.9, 4.7, 2.9, 0, 0, Math.PI * 2); // 底影
+          c.fillStyle = '#161c26';
+          c.fill();
+          c.beginPath();
+          c.ellipse(0, 0, 4.5, 2.75, 0, 0, Math.PI * 2); // 鼠身（键盘同色系）
+          c.fillStyle = '#39424f';
+          c.fill();
+          c.strokeStyle = '#4b5666';
+          c.lineWidth = 0.7;
+          c.stroke();
+          c.beginPath(); // 前沿滚轮亮线
+          c.moveTo(-1.7, 0);
+          c.lineTo(-3.6, 0);
+          c.strokeStyle = '#5b6779';
+          c.stroke();
+          c.restore();
+        };
+
+        /**
+         * 一前一后，谁靠镜头谁后画：
+         * 北桌显示器在键盘南边（靠镜头）→ 显示器后画，键盘被它压住
+         * （对面工位看见的就是显示器背壳挡着键盘）；南桌键盘在南边 → 键盘后画。
+         */
+        if (u.face === 'south') {
+          drawKeyboard();
+          drawMonitor();
+        } else {
+          drawMonitor();
+          drawKeyboard();
+        }
+
+        /**
+         * 名字贴：平放在自己桌子"坐下后的左下角"（保留级别色条），紧贴桌子的左侧边。
+         * 北桌（面朝 +gy 坐）：左手边是东侧 → 紧贴桌子东沿、靠近自己的北沿，
+         *   字翻转 180°、色条换到对面 —— 对镜头是倒的，对坐在那儿的小怪物才是正的；
+         * 南桌（背对镜头坐）：左手边是西侧 → 紧贴桌子西沿、靠近自己的南沿，
+         *   字朝镜头方向，坐着的小怪物看已经是正的。
+         */
+        if (a) {
+          const common = { z: z + 0.002, text: a.name, accent: levelColor(a.level) };
+          if (u.face === 'south') {
+            // 北桌：往隔板方向挪（y 0.22..0.52）。极限是贴子南沿离隔板 >0.47
+            // （隔板 1.21 高，藏住身后 1.21−Δ 以下的东西；贴面 z=0.74 → Δ>0.47 才完整露出），
+            // 0.52 离隔板 0.53，刚好仍在遮挡线之上、完整可见。
+            drawDeskTag(c, { ...common, x: u.desk.x + u.desk.w - 0.02, y: u.desk.y + 0.22, flip: true, alignRight: true });
+          } else {
+            // 南桌：同样往隔板方向挪一小段（y 0.55..0.85）；隔板在它身后，不存在遮挡
+            drawDeskTag(c, { ...common, x: u.desk.x + 0.02, y: u.desk.y + 0.55 });
+          }
+        }
       });
     });
 
@@ -1991,6 +2110,7 @@ export function createIsoOffice(canvas, opts = {}) {
       s: SPRITE_S,
       color: a.color,
       prop: a.prop,
+      name: a.name,
       state: st,
       facing: a.facing,
       walking: a.moving,
