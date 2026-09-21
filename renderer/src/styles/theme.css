@@ -4,6 +4,12 @@
   --bg: #0f1115;
   --bg-elevated: #161a21;
   --bg-panel: #1b2029;
+  /**
+   * 办公室画布底色（IsoOfficeView 的 .scene-wrap）。
+   * 门楣（楼层屏所在那一片）也用它：上面那片和办公室是**同一块板**，
+   * 不是另一条色带 —— 这件事必须由同一个 token 保证，两处各写一份迟早会飘。
+   */
+  --iso-bg: #151a22;
   --border: #262c38;
   --border-strong: #333b4a;
 

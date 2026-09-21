@@ -69,15 +69,22 @@ watch(
   overflow: hidden;
 }
 
-/* 门楣：静态墙带。高度由内容（屏）撑，不写死 —— 改屏的字号不用回来改这里 */
+/* 门楣：屏固定在这里。高度由内容（屏）撑，不写死 —— 改屏的字号不用回来改这里。
+ *
+ * 外观：和下面的办公室画布**同色、同框、同圆角**（--iso-bg / --border / --radius），
+ * 外围再留出一圈（margin 12px，与 .stage 的 padding 对齐，所以门楣和画布的左右边是一条竖线）。
+ * 也就是说它**不是**"贴着窗口顶边的一条色带"，而是和画布并排的同一块板 ——
+ * 底色跟画布一样，屏才像装在那块板上，而不是浮在一条异色横条里。 */
 .lintel {
   flex: none;
   display: flex;
   justify-content: center;
   align-items: center;
+  margin: 12px 12px 0;
   padding: 8px 12px;
-  background: var(--bg-panel, #1b2029);
-  border-bottom: 1px solid var(--border-strong, #333b4a);
+  background: var(--iso-bg, #151a22);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
 /* 门洞：舞台内容与门扇的容器，门扇滑到 ±100% 时不撑出横向滚动条 */
