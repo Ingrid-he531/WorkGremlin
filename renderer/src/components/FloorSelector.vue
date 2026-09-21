@@ -104,17 +104,45 @@ const odoStyle = computed(() => ({
   transitionDuration: phase.value === 'moving' ? `${moveMs.value}ms` : '0ms',
 }));
 
+/**
+ * 1F 胶囊顶与右侧办公室画面顶对齐：实测 .scene-wrap 相对井道顶的偏移，写进 --office-top。
+ * 那个偏移 = 门楣（内容撑高，没定数）+ 舞台留白，所以只能量，不能按 CSS 硬算。
+ */
+function syncOfficeTop() {
+  const rail = railEl.value;
+  const scene = document.querySelector('.scene-wrap');
+  if (!rail || !scene) return; // 非办公室页签：没有 .scene-wrap，沿用上一次的结果
+  const t = Math.round(scene.getBoundingClientRect().top - rail.getBoundingClientRect().top);
+  rail.style.setProperty('--office-top', `${Math.max(0, t)}px`);
+}
+
+let lintelRo = null;
+let officeTopRaf = 0;
+
 onMounted(() => {
   measure();
   // 回调里只写缓存，不碰 phase、不重启动画（设计 §5.2）
   ro = new ResizeObserver(() => measure());
   if (railEl.value) ro.observe(railEl.value);
   floorEls.forEach((el) => ro.observe(el));
+
+  // 门楣高度随楼层屏内容变、窗口缩放也变 → 三处都重测（首帧兄弟组件可能还没挂上，等一帧）
+  officeTopRaf = requestAnimationFrame(syncOfficeTop);
+  const lintel = document.querySelector('.lintel');
+  if (lintel) {
+    lintelRo = new ResizeObserver(syncOfficeTop);
+    lintelRo.observe(lintel);
+  }
+  window.addEventListener('resize', syncOfficeTop);
 });
 
 onBeforeUnmount(() => {
   if (ro) ro.disconnect();
   ro = null;
+  if (lintelRo) lintelRo.disconnect();
+  lintelRo = null;
+  cancelAnimationFrame(officeTopRaf);
+  window.removeEventListener('resize', syncOfficeTop);
 });
 
 /** 楼层列表换了（首次加载 / 10s 轮询）→ DOM 更新后再量一次 */
@@ -147,44 +175,45 @@ function tip(p) {
   return lines.join('\n');
 }
 
-/** 胶囊上那行小字：优先显示落盘路径，没有就显示安装路径 */
-function pathLine(p) {
-  if (!p.installed) return '未安装';
-  return p.dataPathLabel || p.installPathLabel || '已安装';
-}
+/** 胶囊上不再显示智能体目录（路径）—— 路径信息仍在悬浮提示（tip）里；未安装的楼层只留"未安装"状态字 */
 </script>
 
 <template>
   <!-- data-phase 挂在这里：轿厢门缝线（.car::after）的"关门变亮 + 到点锁一下"要靠它驱动 -->
   <aside ref="railEl" class="rail" :data-phase="phase" aria-label="楼层选择">
-    <header class="rail-title">楼层</header>
+    <!-- 顶格：与右侧"门楣+舞台留白"等高（--office-top 实测），让 1F 胶囊顶与办公室画面顶对齐 -->
+    <div class="rail-head">
+      <header class="rail-title">楼层</header>
+    </div>
 
-    <button
-      v-for="p in products"
-      :key="p.id"
-      :ref="(el) => setFloorEl(p.id, el)"
-      type="button"
-      class="floor"
-      :class="{ selected: p.id === displayFloor, dim: !p.installed }"
-      :disabled="!p.installed"
-      :title="tip(p)"
-      @click="select(p)"
-    >
-      <span class="fid">{{ p.id }}</span>
-      <span class="fname">{{ p.name }}</span>
-      <span class="fpath">{{ pathLine(p) }}</span>
-      <span class="fstat">
-        <span class="fdot" :class="p.activeCount ? 'on' : 'off'" />
-        <span v-if="p.activeCount" class="fbadge">{{ p.activeCount }}</span>
-      </span>
-    </button>
+    <!-- 胶囊区：内容整体缩小 30%（scale 只影响这一区，标题不参与） -->
+    <div class="rail-floors">
+      <button
+        v-for="p in products"
+        :key="p.id"
+        :ref="(el) => setFloorEl(p.id, el)"
+        type="button"
+        class="floor"
+        :class="{ selected: p.id === displayFloor, dim: !p.installed }"
+        :disabled="!p.installed"
+        :title="tip(p)"
+        @click="select(p)"
+      >
+        <span class="fid">{{ p.id }}</span>
+        <span class="fname">{{ p.name }}</span>
+        <span class="fstat">
+          <span class="fdot" :class="p.activeCount ? 'on' : 'off'" />
+          <span v-if="p.activeCount" class="fbadge">{{ p.activeCount }}</span>
+        </span>
+      </button>
 
-    <!-- 轿厢：井道里那一格。纯装饰（不拦点击、不进无障碍树），位移只走 transform -->
-    <div v-if="carMetric" class="car" :style="carStyle" aria-hidden="true">
-      <!-- 轿厢内的层号带：窗口只露一格，跟着车滚过每一层（设计 §1「楼层数字」原文） -->
-      <div class="car-odo">
-        <div v-if="odoSlots.length" class="car-odo-strip" :style="odoStyle">
-          <span v-for="s in odoSlots" :key="s.id" :class="{ dim: !s.lit }">{{ s.id }}</span>
+      <!-- 轿厢：井道里那一格。纯装饰（不拦点击、不进无障碍树），位移只走 transform -->
+      <div v-if="carMetric" class="car" :style="carStyle" aria-hidden="true">
+        <!-- 轿厢内的层号带：窗口只露一格，跟着车滚过每一层（设计 §1「楼层数字」原文） -->
+        <div class="car-odo">
+          <div v-if="odoSlots.length" class="car-odo-strip" :style="odoStyle">
+            <span v-for="s in odoSlots" :key="s.id" :class="{ dim: !s.lit }">{{ s.id }}</span>
+          </div>
         </div>
       </div>
     </div>
@@ -193,16 +222,50 @@ function pathLine(p) {
 
 <style scoped>
 .rail {
-  /* 井道：轿厢是绝对定位的覆盖层，必须有个定位祖先（设计 §1） */
+  /* 井道外框：宽 = 胶囊区排版宽 140 × 0.7（胶囊整体缩小 30%，见 .rail-floors） */
+  flex: 0 0 98px;
+  width: 98px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--panel, #0e1116);
+  overflow: hidden;
+}
+
+/* 顶格：高度 = 右侧"门楣 + 舞台留白"（运行时实测写进 --office-top，见 syncOfficeTop），
+   于是下面第一颗胶囊（1F）的顶边正好与办公室画面顶边水平对齐 */
+.rail-head {
+  flex: none;
+  height: var(--office-top, 70px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rail-title {
+  /* "楼层"标题：不参与胶囊区的 0.7 缩放，字号单独调大（原 11px） */
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: var(--muted, #6e7681);
+  text-align: center;
+}
+
+/* 胶囊区（= 原来的井道）：胶囊整体缩小 30% —— 按原尺寸排版、整体 scale(0.7)。
+   用 transform 不用 zoom：胶囊的 offsetTop/offsetHeight（轿厢定位的实测来源）不受
+   transform 影响，而缩放对整棵子树统一生效 —— 轿厢、层号带跟着一起缩，天然不错位。
+   它因此接替成为轿厢（.car）的定位祖先（原来这个角色在 .rail 上，设计 §1）。 */
+.rail-floors {
   position: relative;
-  flex: 0 0 140px;
-  width: 140px;
+  flex: 1;
+  min-height: 0;
+  width: 140px; /* 缩放前的排版宽度，缩完正好 98 = 井道宽 */
+  transform: scale(0.7);
+  transform-origin: top left;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 14px 10px;
-  border-right: 1px solid var(--border);
-  background: var(--panel, #0e1116);
+  padding: 0 10px 14px;
   overflow-y: auto;
 }
 
@@ -253,7 +316,7 @@ function pathLine(p) {
 .car-odo-strip span {
   height: var(--car-slot);
   line-height: var(--car-slot);
-  font-size: 16px;
+  font-size: 19px; /* 与胶囊 .fid 同字号 —— 显示带整行盖在胶囊层号上，字号变了要一起改 */
   font-weight: 700;
   letter-spacing: 0.5px;
   text-align: center;
@@ -314,14 +377,6 @@ function pathLine(p) {
   }
 }
 
-.rail-title {
-  font-size: 11px;
-  letter-spacing: 2px;
-  color: var(--muted, #6e7681);
-  text-align: center;
-  margin-bottom: 2px;
-}
-
 .floor {
   position: relative;
   display: flex;
@@ -348,31 +403,19 @@ function pathLine(p) {
 }
 
 .floor .fid {
-  /* 字号/字重与轿厢显示带、门楣屏里的段码一致（16px / 700）——
-     原来 22px/800 太大，一层楼号压着整个胶囊，跟"楼层显示屏"那块的语言也不统一。
-     行高仍取 --car-slot（22px）：胶囊布局不动，轿厢显示带也才能继续盖住这一行。 */
-  font-size: 16px;
+  /* 字号/字重与轿厢显示带一致（19px / 700，行高仍取 --car-slot 22px）——
+     胶囊区整体缩了 0.7，层号这里补大一点；改字号时显示带（.car-odo-strip）要一起改。 */
+  font-size: 19px;
   font-weight: 700;
   letter-spacing: 0.5px;
   line-height: var(--car-slot);
 }
 
 .floor .fname {
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.25;
   text-align: center;
   opacity: 0.9;
-}
-
-/* 落盘路径：单行截断，完整内容在 title 里 */
-.floor .fpath {
-  max-width: 100%;
-  font-size: 10px;
-  line-height: 1.2;
-  color: var(--muted, #6e7681);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .floor .fdot {
@@ -403,7 +446,7 @@ function pathLine(p) {
   border-radius: 8px;
   background: color-mix(in srgb, var(--ok, #3fb950) 22%, transparent);
   color: var(--ok, #3fb950);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 16px;
   text-align: center;
 }
@@ -414,11 +457,12 @@ function pathLine(p) {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #58a6ff) 28%, transparent);
 }
 
-/* 未安装：整体置灰 + 点不动 */
+/* 未安装：置灰 + 点不动。不透明度别压太低（0.72）—— 置灰是"不能点"的提示，
+   层号与名字还得读得清 */
 .floor.dim {
   color: var(--muted, #6e7681);
   border-color: var(--border);
-  opacity: 0.45;
+  opacity: 0.72;
 }
 
 .floor.dim:hover {

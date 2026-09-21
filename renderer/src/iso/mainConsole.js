@@ -7,8 +7,8 @@
  * 三样东西：
  *   1. 控制台本体（矮柜 + 台面 + 指示灯）—— 暗色低多边形，跟屋里家具同一套画法
  *   2. 悬浮屏——贴在 gy 恒定的竖直面上，所以等距下是平行四边形，内容正对镜头
- *      三层信息：阶段（最大）/ 动作或对象（中）/ 任务上下文（小、可滚动）
- *      远看是一块发光板（只留阶段名 + 抽象光条），放大到能看清时才把后两层写出来
+ *      只显示相位状态（思考中 / 调用工具 …）：具体 prompt、读写文件、工具细节都不上屏。
+ *      远看是一块发光板（只留抽象光条），放大到能看清时才把相位名写出来
  *   3. 剪影——深色的一个坐着的影子，没有五官；手在滑 / 点 / 悬停，不敲键盘
  *
  * 局部坐标：屏幕内容用 (u, v) 两个 tile 当单位，u 沿 +gx、v 向下（跟名牌同一套斜切）。
@@ -203,13 +203,8 @@ export function drawConsoleScreen(c, o) {
   const padX = 0.2;
   const inner = W - padX * 2;
   const fs1 = H * 0.32;
-  const fs2 = H * 0.155;
-  const fs3 = H * 0.115;
   /** 字号小于这个就不写了 —— 远看留一块发光板，凑近才出字 */
-  const MIN_PX = 7;
   const showL1 = fs1 * pxPerTile >= 9;
-  const showL2 = fs2 * pxPerTile >= MIN_PX;
-  const showL3 = fs3 * pxPerTile >= MIN_PX;
 
   // 顶部状态条
   c.fillStyle = rgba(ph.color, 0.35 + 0.45 * ph.glow);
@@ -230,11 +225,11 @@ export function drawConsoleScreen(c, o) {
   c.textAlign = 'left';
   c.textBaseline = 'top';
 
-  /* 第一层：阶段。待命中时缓慢呼吸，执行中常亮。
-     命令类工具（Bash / Shell）：服务端一律按"调用工具"（phase=tool）上报，不做特殊化；
-     "要不要提示需要授权"由渲染层按 tool 判断 —— 屏上这一行和 tooltip 第一行走同一个
-     consolePhaseLabel()，第二层的操作仍是实际要执行的命令。
-     文案比默认标签长，放不下就自动缩字号，别被 fit 截成"调用工具，需…"。 */
+  /* 唯一一层内容：相位状态（思考中 / 调用工具 …）。
+     只显示状态，不显示具体 prompt、读写文件、调用工具的细节 —— 那些留在 tooltip / 对话记录里。
+     命令类工具（Bash / Shell）：相位文案与 tooltip 第一行走同一个 consolePhaseLabel()
+     （"调用工具，需要授权"）；文案长就自动缩字号，别被 fit 截成"调用工具，需…"。
+     待命中缓慢呼吸，执行中常亮、后面跟一个闪烁光标。 */
   const blink = ph.busy ? 1 : 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(now / 700));
   const label = consolePhaseLabel(state);
   let lfs = fs1;
@@ -244,51 +239,16 @@ export function drawConsoleScreen(c, o) {
     lfs = Math.max(fs1 * 0.5, (fs1 * inner) / labelW);
     c.font = `700 ${lfs}px ${FONT}`;
   }
+  const labelV = H * 0.38; // 只剩一层：垂直居中偏上（顶部状态条与底部进度条之间）
+  const labelText = fit(c, label, inner - lfs);
   c.globalAlpha = blink;
   c.fillStyle = ph.color;
-  c.fillText(fit(c, label, inner), padX, H * 0.13 + (fs1 - lfs) * 0.5);
+  c.fillText(labelText, padX, labelV + (fs1 - lfs) * 0.5);
   c.globalAlpha = 1;
-
-  /* 第二层：具体在做什么。后面跟一个闪烁的光标 */
-  if (showL2 && state.action) {
-    c.font = `500 ${fs2}px ${FONT}`;
-    const t2 = fit(c, state.action, inner - fs2);
-    c.fillStyle = '#a8bdd6';
-    c.fillText(t2, padX, H * 0.5);
-    if (ph.busy && Math.floor(now / 420) % 2 === 0) {
-      const w2 = c.measureText(t2).width;
-      c.fillStyle = ph.color;
-      c.fillRect(padX + w2 + fs2 * 0.28, H * 0.5 + fs2 * 0.16, fs2 * 0.62, fs2 * 0.8);
-    }
-  }
-
-  /* 第三层：任务上下文，多出来就慢慢往上滚。
-     思考中（thinking）时把收到的 prompt 原文顶到最前面（点1：tips 显示 prompt 内容） */
-  const ctxBase = Array.isArray(state.context) ? state.context : [];
-  const lines =
-    state.phase === 'thinking' && state.prompt
-      ? [state.prompt, ...ctxBase]
-      : ctxBase;
-  if (showL3 && lines.length) {
-    const lineH = fs3 * 1.65;
-    const topV = H * 0.68;
-    const viewH = H * 0.22;
-    const total = lines.length * lineH;
-    c.save();
-    c.beginPath();
-    c.rect(padX, topV, inner, viewH);
-    c.clip();
-    c.font = `400 ${fs3}px ${FONT}`;
-    c.fillStyle = '#6d7d92';
-    const gap = viewH * 0.6;
-    const off = total > viewH ? ((now / 1000) * 0.12) % (total + gap) : 0;
-    for (let rep = 0; rep < 2; rep += 1) {
-      for (let i = 0; i < lines.length; i += 1) {
-        const v = topV + i * lineH + (total + gap) * rep - off;
-        if (v > topV - lineH && v < topV + viewH) c.fillText(fit(c, lines[i], inner), padX, v);
-      }
-    }
-    c.restore();
+  if (ph.busy && Math.floor(now / 420) % 2 === 0) {
+    const w1 = c.measureText(labelText).width;
+    c.fillStyle = ph.color;
+    c.fillRect(padX + w1 + lfs * 0.28, labelV + (fs1 - lfs) * 0.5 + lfs * 0.16, lfs * 0.62, lfs * 0.8);
   }
 
   /* 底部：执行中走一条不确定的进度条 */
