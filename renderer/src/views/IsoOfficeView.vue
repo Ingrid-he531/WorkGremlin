@@ -243,6 +243,11 @@ let lastConsoleSessionId = undefined;
 let lastDoneAt = undefined;
 /** 是否已经见过"快轮询带回的完成标记"：首次只当基线，不弹摘要（见下面的注释） */
 let seenFastDone = false;
+/** 页面（本视图）打开时刻：完成标记早于它 = 上一轮的残留（只当基线）；
+ *  晚于它 = 页面打开后真实收到的 Stop —— 必须弹「任务完成」。
+ *  之前不区分这两者：打开页面后的**第一次** Stop 一律被当成残留基线吞掉，
+ *  于是"收到 Stop 必现任务完成"只对第二次起的 Stop 成立。 */
+const PAGE_OPEN_AT = Date.now();
 watch(
   consoleLive,
   (v) => {
@@ -293,7 +298,9 @@ watch(
     }
     // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
     // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
-    if (firstFastDone) lastDoneAt = doneAt; // 首次拿到：只记基线，不弹
+    // 首次拿到标记：早于页面打开的只记基线（上一轮的收工，不重播）；
+    // 页面打开之后发生的不能当基线 —— 那是刚刚真实收到的 Stop，走下面正常判断弹摘要
+    if (firstFastDone && doneAt < PAGE_OPEN_AT) lastDoneAt = doneAt;
     if (doneAt && doneAt !== lastDoneAt) {
       lastDoneAt = doneAt;
       // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
@@ -308,6 +315,12 @@ watch(
       mainAgent.enterDone('任务完成', ctx);
       return;
     }
+    // 刚亮起的「任务完成」不许被同一轮的残留相位盖掉：
+    // Stop 后 hook 会把实时相位清掉（fastPhase.phase 为 null），但 10s 会话快照还停留在
+    // Stop 前的「调用工具」——它晚到几秒，一盖就把「任务完成」冲掉
+    // （看到的就是 任务完成 → 调用工具 → 待命中，顺序倒了；调用工具应在任务完成之前）。
+    // 只在"没有实时相位"时拦：新一轮（UserPromptSubmit 后实时相位恢复）仍正常覆盖 —— 那是用户又发任务了。
+    if (mainAgent.phase === 'done' && !(fastPhase.value && fastPhase.value.phase)) return;
     mainAgent.setLiveState(v);
   },
   { immediate: true }
@@ -570,8 +583,9 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="tip">
-      拖拽平移 · 滚轮缩放 · 双击复位 · 点小怪物看任务
-      <span class="dim">（前玻璃墙下是主 Agent 控制台，放大可看清屏幕）</span>
+      拖拽平移 · 滚轮缩放 · 双击复位
+      <span class="legend"><i class="dot green" />项目专家</span>
+      <span class="legend"><i class="dot blue" />用户专家</span>
     </div>
   </div>
 </template>
@@ -734,5 +748,27 @@ onBeforeUnmount(() => {
 
 .dim {
   color: var(--text-faint);
+}
+
+/* 专家级别图例：与工牌/名牌的级别色一致（project 绿 / user 蓝） */
+.legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+}
+
+.legend .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.legend .dot.green {
+  background: #22c55e;
+}
+
+.legend .dot.blue {
+  background: #3b82f6;
 }
 </style>

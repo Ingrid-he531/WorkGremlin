@@ -1955,10 +1955,26 @@ export function createIsoOffice(canvas, opts = {}) {
     c.arc(knob.x, knob.y, 2, 0, Math.PI * 2);
     c.fillStyle = '#9aa7b8';
     c.fill();
-    // 会议室白板（贴在后墙内侧）
+    // 会议室白板（贴在后墙内侧）：0.09 铝框 + 框下内阴影 + 笔托（白板笔/板擦）。
+    // 只画一块白板的的话太像一张纸 —— 边框的厚度、上亮下暗的框缘、凸出墙面的笔托才是"白板"。
     const wb = MEETING.whiteboard;
-    wallQuad(c, 'y', 0, wb.x0 - 0.06, wb.x1 + 0.06, wb.z0 - 0.06, wb.z1 + 0.06, '#39414f');
+    const WFW = 0.09;
+    const wframe = '#5a6478';
+    // 铝框四条边：上沿受光亮、下沿背光暗（与窗框同一套语言）
+    wallQuad(c, 'y', 0, wb.x0 - WFW, wb.x1 + WFW, wb.z1, wb.z1 + WFW, shade(wframe, 1.35));
+    wallQuad(c, 'y', 0, wb.x0 - WFW, wb.x1 + WFW, wb.z0 - WFW, wb.z0, shade(wframe, 0.65));
+    wallQuad(c, 'y', 0, wb.x0 - WFW, wb.x0, wb.z0, wb.z1, wframe);
+    wallQuad(c, 'y', 0, wb.x1, wb.x1 + WFW, wb.z0, wb.z1, shade(wframe, 0.85));
+    // 板面 + 框压下来的内阴影（板面才像嵌在框里，不是贴在墙上）
     wallQuad(c, 'y', 0, wb.x0, wb.x1, wb.z0, wb.z1, '#dfe6ef');
+    wallQuad(c, 'y', 0, wb.x0, wb.x1, wb.z1 - 0.05, wb.z1, 'rgba(20,28,40,0.14)');
+    // 笔托：板下沿凸出墙面一小条（顶面 + 正面），上面两支白板笔 + 一个板擦
+    const trayZ = wb.z0 - WFW - 0.02;
+    isoDiamond(c, { x: wb.x0 + 0.3, y: 0, w: wb.x1 - wb.x0 - 0.6, d: 0.1, z: trayZ, fill: '#4a5468' });
+    wallQuad(c, 'y', 0.1, wb.x0 + 0.3, wb.x1 - 0.3, trayZ - 0.04, trayZ, '#3a4354');
+    isoBox(c, { x: wb.x0 + 0.6, y: 0.02, z: trayZ, w: 0.22, d: 0.05, h: 0.03, color: '#2f6ea8' });
+    isoBox(c, { x: wb.x0 + 0.95, y: 0.02, z: trayZ, w: 0.22, d: 0.05, h: 0.03, color: '#c0453d' });
+    isoBox(c, { x: wb.x1 - 0.8, y: 0.01, z: trayZ, w: 0.26, d: 0.08, h: 0.05, color: '#39414f' });
     for (let k = 0; k < 3; k += 1) {
       const z = wb.z1 - 0.22 - k * 0.24;
       wallQuad(c, 'y', 0, wb.x0 + 0.2, wb.x1 - 0.5 - k * 0.35, z, z + 0.05, '#7d8ea6');
