@@ -32,6 +32,14 @@ const IS_WIN = process.platform === 'win32';
 /** 插件目录名（腾讯 Coding Copilot，别名兜底） */
 const PLUGIN_RE = [/coding-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i];
 
+/**
+ * 插件落盘（3F）这一路的来源客户端。
+ * reporter 的状态文件按客户端分开写（同一个工程里 CodeBuddy / Codex / Claude 各一份），
+ * 3F 只能认自己这一路 —— 否则 4F 在跑 Codex 时，3F 会把它的相位 / 命令 / 完成标记搬过来，
+ * 表现就是「切到 3F 却看见 4F 在敲的命令」，收工时 3F 还会弹别层的「任务完成」。
+ */
+const PLUGIN_CLIENT = 'codebuddy';
+
 /** 缓存：列表扫盘 + 读十几个小 json，5 秒足够 */
 const TTL = 5_000;
 let cache = { at: 0, key: '', value: null };
@@ -453,15 +461,19 @@ function reporterMainPhase(workspacePath, client = '') {
  * 不校验的话，只要有一个死文件的 taskId 跟当前工程匹配，inWindow 就会被永久顶成 true，
  * 于是 Stop 之后仍旧按"还在干活"推出「思考中」。
  * @param {string} workspacePath 当前打开的工程；空则不限工程
+ * @param {string} [client] 来源客户端；空则不限客户端
  * @returns {boolean}
  */
-function readReporterActiveTask(workspacePath) {
+function readReporterActiveTask(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j || !j.taskId) continue;
+    // 按客户端过滤（口径同 readReporterPhase：老状态文件没记 client → 归 codebuddy）：
+    // 同一工程里 Codex 在跑时，别把它的任务算成 3F 这一层"还在干活"的活跃窗口
+    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     // 心跳时间 / 任务开始 / 相位时间三者取最新：最近还有 hook 事件才算这个会话活着。
@@ -579,7 +591,7 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
 }
 
 /** 单个会话的完整信息 */
-function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false } = {}) {
+function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false, client = PLUGIN_CLIENT } = {}) {
   const todos = readTodos(storage, id);
   const files = readFileChanges(storage, id);
   const mq = readRuntime(storage, id);
@@ -610,7 +622,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   let reported = false;
   let prompt = '';
   if (current && inWindow) {
-    const rp = reporterMainPhase(workspacePath);
+    const rp = reporterMainPhase(workspacePath, client);
     if (rp) {
       reported = true;
       phase = rp.phase;
@@ -622,9 +634,9 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     }
   }
 
-  // 完成标记：reporter 仅在 Stop 时落盘（且按工程区分），是"任务完成"的唯一真源；
+  // 完成标记：reporter 仅在 Stop 时落盘（按工程 + 客户端区分），是"任务完成"的唯一真源；
   // 比"相位回落到空闲"可靠——任务中途因轮询间隙 / 跨工程串味出现空闲，绝不冒充完成。
-  const done = readReporterDone(workspacePath) || null;
+  const done = readReporterDone(workspacePath, client) || null;
   const doneAt = done ? done.at : 0;
   const doneTitle = done ? done.title || '' : '';
   // 只挑"本轮任务开始之后"改过的文件：file-changes 是整个会话累积的，
@@ -690,7 +702,9 @@ function collectProjects(storage) {
 function listSessions({ workspacePath = '', force = false } = {}) {
   // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
   // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
-  const ws = freshestReporterWs(workspacePath);
+  // 只认 CodeBuddy 这一路：这份清单是 3F 的，别层（Codex / Claude）在别的工程里活动
+  // 不该决定 3F 的"当前工程" —— 否则 3F 的 mine / current / fresh 全被带偏。
+  const ws = freshestReporterWs(workspacePath, PLUGIN_CLIENT);
   const now = Date.now();
   if (!force && cache.value && cache.key === ws && now - cache.at < TTL) return cache.value;
 
@@ -737,8 +751,14 @@ function listSessions({ workspacePath = '', force = false } = {}) {
     const isProjectCurrent = id === (perProjectCurrent.get(m.projectPath) || '');
     // 活跃窗口按"这条会话自己的工程"匹配 reporter 的 taskId：工程没在跑就不采信它的相位，
     // 避免旧工程残留的"思考中"相位在 IDE 关掉 / 切走后还挂着。
-    const inWindow = readReporterActiveTask(m.projectPath);
-    const info = sessionInfo(storage, id, { current: isProjectCurrent, now, workspacePath: m.projectPath, inWindow });
+    const inWindow = readReporterActiveTask(m.projectPath, PLUGIN_CLIENT);
+    const info = sessionInfo(storage, id, {
+      current: isProjectCurrent,
+      now,
+      workspacePath: m.projectPath,
+      inWindow,
+      client: PLUGIN_CLIENT,
+    });
     // 只按"还在窗口内"过滤（60 分钟），不再因为 10 分钟没动静就整条剔除 ——
     // 否则 IDE 里明明开着、只是十几分钟没敲字的会话会从 3F 消失（与 4F 口径不一致）。
     if (!info.listed) continue;
