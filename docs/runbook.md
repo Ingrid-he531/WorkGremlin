@@ -21,7 +21,8 @@ npm run db:check
 # 期望输出：{"ok":true, ..., "read":{"content":"world"}, "secure_delete":1, "journal_mode":"wal"}
 
 # 5) Electron 主进程内 require（关键：不是 Node 里可用就算过）
-WORKGREMLIN_DEV=1 npx electron desktop/src/main.js --demo
+#    （没有 --demo 这类启动开关了：演示模式改在界面里切，见 README 的「演示模式」）
+WORKGREMLIN_DEV=1 npx electron desktop/src/main.js
 ```
 
 排障要点：

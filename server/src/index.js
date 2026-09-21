@@ -91,8 +91,6 @@ function isLoopbackOrigin(origin) {
  *   token?: string,
  *   port?: number,
  *   host?: string,
- *   demo?: boolean,
- *   seed?: number,
  *   workspacePath?: string,
  *   serveStatic?: string,
  *   silent?: boolean,
@@ -161,7 +159,6 @@ function createServer(opts = {}) {
     bus,
     initial: { workspacePath, projectName },
     demoProject: config.DEMO_PROJECT,
-    preferDemo: isDemoMode(),
     broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
@@ -231,6 +228,40 @@ function createServer(opts = {}) {
       }
     }
     if (n) console.log(`[workgremlin] 已清理 ${n} 个混进工程「${cur.projectName || cur.project}」的演示残留成员`);
+    return n;
+  }
+
+  /**
+   * 清演示工程里的"名册残留"：`role='subagent'` 里那些当前名册**不再定义**的成员行。
+   *
+   * 为什么需要：名册是这些成员行的主人，但它摘人靠**进程内记账**（registered / mine）——
+   * 服务一重启那笔账就空了。于是上一轮注册进演示工程的成员（典型：旧版还会把"启动工程"的
+   * 项目级 agent 扫进来，如本工程的 leo / susan）再没人认领、也没人心跳，
+   * 60s 后被 sweep 标成 degraded —— 在办公室里就是"还在，但灰了"。
+   *
+   * 按名册自己的口径对账最可靠：`role='subagent'` 且 `agentRoster.isDefined(name)` 为假就摘。
+   * 三类不碰：演示种子成员（leader / coder …，归 ensureDemoData）、主 agent 成员
+   * （`role='agent'`，hook 上报、跟楼层走）、临时成员（ephemeral，归 subagentFeed）。
+   */
+  function purgeDemoStragglers() {
+    // 名册没起来时 isDefined 不可信（会把用户级小怪物一起误摘），宁可不做
+    if (!agentRoster) return 0;
+    const project = demoProjectId();
+    let n = 0;
+    for (const m of repo.listMembers.all(project) || []) {
+      if (m.ephemeral) continue;
+      if (String(m.role || '') !== 'subagent') continue;
+      const name = m.name || String(m.id || '').split('@')[0];
+      if (DEMO_MEMBER_NAMES.has(name)) continue;
+      if (agentRoster.isDefined(name)) continue;
+      try {
+        bus.removeMember({ project, memberId: m.id });
+        n += 1;
+      } catch {
+        /* 单个清不掉不影响别的 */
+      }
+    }
+    if (n) console.log(`[workgremlin] 已清理 ${n} 个不属于演示工程的小怪物（名册残留）`);
     return n;
   }
 
@@ -306,19 +337,8 @@ function createServer(opts = {}) {
       config.writeServerInfo(info);
     }
 
-    // 演示数据要在**恢复之后**再决定：上次停在演示数据、这回又没带 --demo 启动时，
-    // restore() 会把人带回 demo project，而按启动参数判定又不会灌数据、不跑心跳 —— 屋里就空了。
-    maybeSeedDemo(Boolean(restored.demo));
-
-    if (isDemoMode() || restored.demo) {
-      demoTicker = createDemoTicker({
-        bus,
-        repo,
-        project: demoProjectId(),
-        seed: Number(opts.seed ?? process.env.WORKGREMLIN_DEMO_SEED ?? 1),
-      });
-      demoTicker.start();
-    }
+    // 注意：演示数据的准备（syncDemo）不在这里 —— 它要对"哪些小怪物算已定义"，（见下）
+    // 而那要等 agentRoster 起来之后才有准数，所以挪到名册 start() 之后。
 
     // 清理历史遗留：旧版 agentScan 注册的 "agent-<级别>-<id>" 成员已被 agentRoster 取代，
     // 但库里的旧行不会自动消失，会和 roster 的小怪物同名（出现"Peter/Leo 各两只"）。这里一次性删掉。
@@ -338,7 +358,11 @@ function createServer(opts = {}) {
       bus,
       // 小怪物跟随"当前打开的工程"的 project（不再固定写死演示 project），换工程才跟得过去
       getProject: () => workspace.current().project || config.DEMO_PROJECT,
-      getWorkspacePath: () => workspace.current().workspacePath || workspacePath,
+      // 只认**当前工程**的路径，不回退到"服务启动时解析出来的工程"：
+      // 演示工程没有目录（workspacePath === ''），名册于是只列**用户级** agent ——
+      // 项目级小怪物属于某个真实目录，而切到演示工程后屋里演的是演示团队，
+      // 那几个"本工程的 agent"不该跟着飘进来（它们并不属于演示工程）。
+      getWorkspacePath: () => workspace.current().workspacePath,
     });
     // 换工程：重启 subagent 清单监听（幽灵）+ 同步小怪物名册 + 清掉混进来的演示残留。
     // 已定义 subagent 的"小怪物"只由 agentRoster 注册一次，避免同名两只。
@@ -346,9 +370,14 @@ function createServer(opts = {}) {
       startFeed();
       agentRoster.sync();
       purgeDemoLeftovers();
+      // 切工程即决定"演示要不要活着"：进演示就按需播种 + 起推进器，离开就停
+      syncDemo(workspace.current().demo);
     });
     startFeed();
     agentRoster.start();
+    // 名册起来之后才有"已定义"的准数（syncDemo 的对账要用它），所以演示的准备放这里：
+    // 上次停在演示工程 → 这回启动照旧是演示，播种 / 心跳 / 残留清理都交给它。
+    syncDemo(Boolean(restored.demo));
     // 启动时也清一遍：老版本撞名留下的演示残留
     purgeDemoLeftovers();
 
@@ -363,43 +392,50 @@ function createServer(opts = {}) {
     return info;
   }
 
-  /** 是否处于 demo 模式（决定心跳推进器是否运行） */
-  function isDemoMode() {
-    if (process.env.WORKGREMLIN_NO_DEMO === '1') return false;
-    return opts.demo === true || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1';
-  }
-
   /**
-   * @param {boolean} [onDemoWorkspace] 恢复后当前就停在演示数据上：这种也算 demo，
-   *   否则非 --demo 启动 + 上次停在演示数据 = 恢复进 demo project 却没数据，屋里空无一人。
+   * 演示推进器随「当前工程是不是演示工程」起停。
+   *
+   * 演示模式**没有启动开关**了（原来靠 `--demo` / `WORKGREMLIN_DEMO=1` / `MOCK=1`）：
+   * 它现在由界面上的「演示模式」按钮切换工程触发（POST /api/v1/workspace 走空路径 → openDemo）。
+   *   - 进演示：库里还没有演示数据就先播一次种，再起推进器 —— 没有推进器的话，60s 后
+   *     所有成员都因心跳超时变 degraded，界面一片灰，而演示恰恰要看"活着"的样子；
+   *   - 离开演示：停掉推进器，别对着演示工程空转（真实工程的成员由 hook / roster 驱动）。
    */
-  function shouldSeedDemo(onDemoWorkspace) {
-    if (opts.demo === true || process.env.WORKGREMLIN_DEMO === '1' || process.env.MOCK === '1') return true;
-    if (process.env.WORKGREMLIN_NO_DEMO === '1') return false;
-    if (onDemoWorkspace) return true;
-    // 默认**不再**在空库首跑时自动灌演示数据：首屏走真实数据源（空屋子），
-    // 直到 agent 通过 hook 上报才有人。演示数据只在使用 --demo / WORKGREMLIN_DEMO=1 /
-    // MOCK=1 时显式注入（README 已说明）。避免"默认演示"和文档里的"默认非演示"互相打架。
-    return false;
+  function syncDemo(on) {
+    if (!on) {
+      if (demoTicker) {
+        demoTicker.stop();
+        demoTicker = null;
+      }
+      return;
+    }
+    // 每次进演示都对一次账：名册摘人靠**进程内记账**，服务一重启那笔账就空了，
+    // 只有按"名册自己的口径"对账才清得掉上一轮留下的成员（见 purgeDemoStragglers）。
+    purgeDemoStragglers();
+    if (demoTicker) return;
+    ensureDemoData();
+    demoTicker = createDemoTicker({ bus, repo, project: demoProjectId(), seed: 1 });
+    demoTicker.start();
   }
 
-  function maybeSeedDemo(onDemoWorkspace) {
-    if (!shouldSeedDemo(onDemoWorkspace)) return null;
-    const project = config.DEMO_PROJECT;
-    // 演示数据的时间基准锚定当前时间，每次重跑都会生成新时间戳。
-    // 已有数据时默认跳过（否则反复 --demo 启动会让消息无限堆积），
-    // 需要重置时加 WORKGREMLIN_DEMO_REFRESH=1。
+  /** 演示工程里一条消息都没有时才播种；已有数据就沿用，反复进出演示不会把消息越堆越多 */
+  function ensureDemoData() {
+    const project = demoProjectId();
     const existing = /** @type {{ c?: number } | undefined} */ (repo.countMessages.get(project));
-    if (existing && existing.c > 0 && process.env.WORKGREMLIN_DEMO_REFRESH !== '1') return null;
-    const seed = Number(opts.seed ?? process.env.WORKGREMLIN_DEMO_SEED ?? 1);
-    return seedDemoData({
-      bus,
-      seed: Number.isFinite(seed) ? seed : 1,
-      project,
-      // 演示数据是一条独立的「演示工程」：绑到某个目录的话，打开这个目录就会看到这 8 个模拟成员，
-      // 还以为"打开工程没生效"。演示工程只通过"切到演示工程"进入。
-      workspacePath: '',
-    });
+    if (existing && existing.c > 0) return;
+    try {
+      seedDemoData({
+        bus,
+        seed: 1,
+        project,
+        // 演示数据是一条独立的「演示工程」：绑到某个目录的话，打开这个目录就会看到这 8 个模拟成员，
+        // 还以为"打开工程没生效"。演示工程只通过"切到演示工程"进入。
+        workspacePath: '',
+      });
+    } catch (err) {
+      // 播种失败不能拖垮切换本身（切工程照旧发生，只是屋里空着）
+      console.warn('[workgremlin] 演示数据播种失败（不影响真实数据）：', err && err.message);
+    }
   }
 
   async function close() {

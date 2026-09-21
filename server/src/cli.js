@@ -3,11 +3,14 @@
 
 /**
  * 独立启动入口（headless 模式）：
- *   node server/src/cli.js                      默认端口探测 + 演示数据
+ *   node server/src/cli.js                      默认端口探测 + 接真实数据源
  *   node server/src/cli.js --port 21800
- *   node server/src/cli.js --db /tmp/wg.db --demo --demo-seed 42
+ *   node server/src/cli.js --db /tmp/wg.db
  *   node server/src/cli.js --self-test          只验证 better-sqlite3 建表/读写（V1 判据 3）
  *   node server/src/cli.js --no-token           关闭本地 token（仅调试）
+ *
+ * 演示模式没有启动参数了：起完之后 POST /api/v1/workspace（空路径）即切到演示工程，
+ * 服务端会按需播种并起推进器（见 index.js 的 syncDemo）；界面上就是 HUD 的「演示模式」按钮。
  */
 
 const { createServer } = require('./index');
@@ -109,8 +112,6 @@ async function main() {
   const server = createServer({
     dbPath: typeof args.db === 'string' ? args.db : undefined,
     port: args.port ? Number(args.port) : undefined,
-    demo: args.demo === true || process.env.MOCK === '1',
-    seed: args['demo-seed'] ? Number(args['demo-seed']) : undefined,
     token: args['no-token'] ? '' : undefined,
     workspacePath: typeof args.workspace === 'string' ? args.workspace : undefined,
   });

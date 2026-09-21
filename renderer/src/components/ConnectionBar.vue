@@ -5,9 +5,14 @@ const props = defineProps({
   connection: { type: Object, required: true },
   /** 当前工程名；仅作展示，工程切换改由右侧"活跃会话"下拉负责，不再提供选择入口 */
   project: { type: String, default: '' },
-  /** 选中会话的相位来源：'reported'（agent 上报真值） / 'inferred'（服务端推断） / ''（无会话） */
+  /** 相位来源：'reported'（agent 上报真值）/ 'inferred'（服务端推断）/ 'demo'（演示脚本）/ ''（无会话） */
   source: { type: String, default: '' },
 });
+
+/** 相位来源文案（演示脚本不是"真值"也不是"推断"，单列一项） */
+const sourceText = computed(() =>
+  props.source === 'demo' ? '演示脚本' : props.source === 'inferred' ? '推断值' : '上报真值'
+);
 
 const text = computed(() => {
   switch (props.connection.state) {
@@ -34,8 +39,14 @@ const dotClass = computed(() => props.connection.state);
     <!-- 选中会话时给常驻的「相位来源」标识；没选会话时退回解释性图例 -->
     <span v-if="source" class="src">
       相位来源：
-      <b :class="source === 'inferred' ? 'src-infer' : 'src-real'">
-        {{ source === 'inferred' ? '推断值' : '上报真值' }}
+      <b
+        :class="{
+          'src-infer': source === 'inferred',
+          'src-real': source === 'reported',
+          'src-demo': source === 'demo',
+        }"
+      >
+        {{ sourceText }}
       </b>
     </span>
     <span v-else class="legend faint">
@@ -87,6 +98,8 @@ const dotClass = computed(() => props.connection.state);
 .src b { font-weight: 600; }
 .src-real { color: var(--state-online); }
 .src-infer { color: var(--text-dim); border-bottom: 1px dashed var(--text-faint); }
+/* 演示模式：这一路的相位既不是上报真值也不是推断，用 accent 单列，别跟前两者混 */
+.src-demo { color: var(--accent, #4c8dff); }
 
 .sw {
   width: 10px;

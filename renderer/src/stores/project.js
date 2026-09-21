@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { getServerInfo, getFlags, getWorkspace, openWorkspace, wsUrl, httpBase } from '../api/bridge';
+import { getServerInfo, getWorkspace, openWorkspace, wsUrl, httpBase } from '../api/bridge';
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
 
@@ -24,8 +24,10 @@ export const useProjectStore = defineStore('project', {
     recent: [],
     connection: { state: 'connecting', source: 'ws' },
     serverInfo: null,
-    flags: { demo: false, seed: 1 },
+    /** 当前停在演示工程（服务端 workspace 响应里的 demo，由「演示模式」按钮切换） */
     demo: false,
+    /** 进演示前打开的是哪个工程：退出演示时回这里（演示工程自己没有目录） */
+    demoReturnPath: '',
     _conn: null,
     _reconcileTimer: null,
   }),
@@ -45,9 +47,6 @@ export const useProjectStore = defineStore('project', {
       const info = await getServerInfo();
       this.serverInfo = info;
       this.projectName = info.projectName || '';
-      const flags = await getFlags();
-      this.flags = flags;
-      this.demo = Boolean(flags.demo);
 
       const ws = await getWorkspace(info);
       if (ws) this.applyWorkspace(ws);
@@ -146,6 +145,37 @@ export const useProjectStore = defineStore('project', {
       const cur = await openWorkspace(this.serverInfo || {}, path);
       this.applyWorkspace(cur);
       return cur;
+    },
+
+    /**
+     * 退出演示时该回的目录：进演示前记下的那个 → 最近打开过的 → 服务启动时解析出来的。
+     * 演示工程自己没有目录（workspacePath 为空），所以它自己不能当"回去的地址"。
+     */
+    realPath() {
+      if (this.workspacePath) return this.workspacePath;
+      const hit = (this.recent || []).find((r) => r && r.path);
+      if (hit) return hit.path;
+      return (this.serverInfo && this.serverInfo.workspacePath) || '';
+    },
+
+    /**
+     * 进演示模式：切到「演示工程」（POST /api/v1/workspace 空路径 → 服务端 openDemo）。
+     * 服务端会顺手把演示数据备好并起心跳推进器（见 server/src/index.js 的 syncDemo）。
+     *
+     * 先把"退出时回哪个工程"记下来 —— 必须**在切走之前**抓（切进演示后 workspacePath 就是空的了）。
+     */
+    async enterDemo() {
+      if (this.demo) return null;
+      this.demoReturnPath = this.realPath();
+      return this.openWorkspace('demo');
+    },
+
+    /** 退出演示：回到进演示前打开的那个真实工程；一个真实工程都没有就留在演示 */
+    async exitDemo() {
+      if (!this.demo) return null;
+      const back = this.demoReturnPath || this.realPath();
+      if (!back) return null;
+      return this.openWorkspace(back);
     },
 
     dispose() {

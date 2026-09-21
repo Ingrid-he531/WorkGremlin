@@ -1,7 +1,11 @@
 'use strict';
 
 /**
- * 演示 / Mock 数据生成器（M0 用于两个界面的静态渲染）。
+ * 演示数据生成器：给「演示工程」灌一套可看的假数据（成员 / 任务 / 消息）。
+ *
+ * 触发时机：**不再有启动开关**（原 `--demo` / `WORKGREMLIN_DEMO=1` / `MOCK=1` 已移除）。
+ * 它只由「切到演示工程」这一个动作触发 —— 界面 HUD 上的「演示模式」按钮 →
+ * POST /api/v1/workspace（空路径）→ openDemo → index.js 的 syncDemo 按需播种 + 起推进器。
  *
  * 硬性要求（tester DEMO-01~07）：
  *   - **确定性**：相同 seed 必须产出完全一致的数据（含时间戳），否则 DOM 快照会 flaky；
@@ -11,8 +15,6 @@
  * 时间基准：默认**锚定当前时间**（各事件相对偏移固定），否则「已耗时」会显示成 —、
  * 心跳超时也不会触发 degraded。需要绝对时间可复现（DOM 快照测试）时设
  * `WORKGREMLIN_DEMO_FIXED_TS=1`，退回到固定的 UTC 基准。
- *
- * M1 接入真实数据源后本文件即被 watcher + reporter 取代，不再用于生产逻辑。
  */
 
 const { MESSAGE_TYPES } = require('@workgremlin/shared');

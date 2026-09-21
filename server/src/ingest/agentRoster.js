@@ -42,6 +42,9 @@ function listAgentFiles(dir) {
 
 /**
  * 列出已定义的 subagent（项目级优先于用户级，重名去重），返回 [{ name, level }]。
+ *
+ * **workspacePath 为空 = 没有当前工程目录**（演示工程就是这种）：此时只列用户级 ——
+ * 项目级 agent 挂在某个真实目录下，没有目录就无从谈起，也不该被算进演示工程。
  * @param {string} workspacePath 当前工程路径（用于扫项目级 agents 目录）
  */
 function listDefinedAgents(workspacePath) {

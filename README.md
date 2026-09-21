@@ -19,10 +19,10 @@ npm install
 # 2) 【V1 判据】验证原生模块可用（建表 + 写入 + 读回 + checkpoint）
 npm run db:check
 
-# 3) 开发启动（Vite + Electron）；默认接真实数据源（非演示）
+# 3) 开发启动（Vite + Electron）—— 一律接真实数据源
 npm run dev
-#    想看演示数据（首屏有内容）时显式加 --demo：
-npm run dev -- --demo
+#    想看演示数据：起完之后在办公室右下角操作条上点「演示模式」（在「集合开会」左边），
+#    再点一次「退出演示」即回到进演示前的工程
 
 # 4) 构建 renderer 静态资源（M0 的 build；M3 再接 electron-builder）
 npm run build
@@ -32,7 +32,6 @@ npm run build
 
 ```bash
 npm run server                                  # 同 npm run server -> node server/src/cli.js
-node server/src/cli.js --demo --demo-seed 42    # 确定性演示数据
 node server/src/cli.js --self-test              # 只验证原生模块
 ```
 
@@ -197,8 +196,15 @@ console.log(db.prepare('select id,workspace_path from projects').all())"
 
 一个 workspace 一个工程：**打开哪个工程，屋里就显示哪个工程的成员和幽灵**。
 演示数据是一条独立的**演示工程**记录，和真实工程并列（`__demo__`，显示名「演示工程」）。
-点顶部连接条的工程徽标 → 「打开工程…」选目录（也可以切到演示工程、或点最近打开过的工程）。
-选择会写进 `~/.workgremlin/workspaces.json`，重开自动恢复。
+
+**进 / 出演示只有一个入口：办公室右下角操作条上的「演示模式」按钮**（在「集合开会」左边）——
+它等价于把工程切到演示工程，服务端会顺手备好演示数据（`__demo__` 里没有消息才播种）并起心跳推进器；
+再点一次「退出演示」就回到进演示前打开的那个工程。演示期间主控制台会自动演一轮
+（`stores/mainAgent.js` 的 SCRIPT），小怪物换成演示成员（6 位专家 + 2 个临时成员）。
+**没有启动参数与环境变量了**（原 `--demo` / `--demo-seed` / `WORKGREMLIN_DEMO*` / `MOCK=1` 均已移除）。
+
+点顶部连接条的工程徽标 → 「打开工程…」选目录（也可以点最近打开过的工程）。
+选择会写进 `~/.workgremlin/workspaces.json`，重开自动恢复（包括"上次停在演示工程"）。
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/v1/workspace            # 当前工程
@@ -217,9 +223,6 @@ curl -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/jso
 | `WORKGREMLIN_HOME` | 数据目录（覆盖 `~/.workgremlin`） |
 | `WORKGREMLIN_DB` | 数据库文件路径 |
 | `WORKGREMLIN_PROJECT` | 覆盖上报归属的工程 id（缺省跟随服务端「当前打开的工程」，也是演示工程的 id 覆盖项） |
-| `WORKGREMLIN_DEMO=1` / `MOCK=1` / `--demo` | 显式启用演示数据。默认**不**启用：首屏是空屋子，等 agent 通过 hook 上报后才有人 |
-| `WORKGREMLIN_DEMO_SEED=N` | 演示数据随机种子（同 seed 输出完全一致） |
-| `WORKGREMLIN_NO_DEMO=1` | （已废弃）默认即不自动灌演示数据，此变量保留为兼容别名 |
 | `WORKGREMLIN_WORKSPACE` | 当前工程根目录（工程名与 subagent 清单都基于它；缺省 `process.cwd()`） |
 | `WORKGREMLIN_SUBAGENTS_FILE` | subagent 清单文件路径（覆盖 `<workspace>/.workgremlin/subagents.json`） |
 | `WORKGREMLIN_DEV=1` | Electron 加载 Vite dev server 并开 DevTools |

@@ -133,14 +133,53 @@ function selectDesk(id) {
  * 顶栏"项目"：优先跟着选中的会话走；
  * 切到没有活跃会话的楼层时显示楼层本身 —— 项目还挂着上一个工程的名字，
  * 会让人以为楼层没切（屋里的人已经是上一层那个工程的了）。
+ *
+ * 演示模式**压过**上面两条：屋里站的是演示成员、控制台演的是演示脚本，这时还跟着
+ * 下拉里那条真会话显示真工程名就自相矛盾了（放最前面判）。
  */
 const projectLabel = computed(() => {
+  if (project.demo) return `${project.projectName || '演示工程'} · 演示模式`;
   if (sessions.selected) return sessions.selected.project;
   if (sessions.floorEmpty) {
     const f = sessions.floors.find((x) => x.id === sessions.selectedFloor);
     return f ? `${f.name} · 本层暂无活跃会话` : '';
   }
   return project.projectName;
+});
+
+/**
+ * 会话下拉的内容：演示模式下换成**唯一一项**「演示工程 · 演示会话」。
+ *
+ * 为什么不把真会话继续列着：演示不是任何一条真会话 —— 列着既点不动（演示期间不切工程，
+ * 见 IsoOfficeView 的演示保护），又和"项目：演示工程"打架。要退出演示走 HUD 的「退出演示」。
+ */
+const DEMO_SESSION_ID = '__demo__';
+const sessionItems = computed(() =>
+  project.demo
+    ? [
+        {
+          value: DEMO_SESSION_ID,
+          label: '演示工程 · 演示会话',
+          title: '演示模式（退出：办公室操作条上的「退出演示」）',
+        },
+      ]
+    : sessions.options
+);
+const sessionValue = computed(() => (project.demo ? DEMO_SESSION_ID : sessions.selectedId));
+const sessionEmptyLabel = computed(() => (project.demo ? '演示工程 · 演示会话' : sessions.emptyLabel));
+
+/** 选中会话：演示期间不切（要退出演示请走 HUD 的按钮） */
+function selectSession(id) {
+  if (project.demo) return;
+  sessions.select(id);
+}
+
+/** 相位来源徽标：演示时说"演示脚本"，别拿真会话的"上报真值 / 推断值"冒充 */
+const phaseSource = computed(() => {
+  if (project.demo) return 'demo';
+  const sel = sessions.selected;
+  if (!sel) return '';
+  return sel.inferred ? 'inferred' : 'reported';
 });
 
 /**
@@ -200,10 +239,10 @@ onUnmounted(() => {
       <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">对话记录</button>
       <span class="spacer" />
       <SessionSwitcher
-        :items="sessions.options"
-        :model-value="sessions.selectedId"
-        :empty-label="sessions.emptyLabel"
-        @update:model-value="sessions.select($event)"
+        :items="sessionItems"
+        :model-value="sessionValue"
+        :empty-label="sessionEmptyLabel"
+        @update:model-value="selectSession($event)"
       />
       <button class="fs-btn" title="全屏只显示主屏幕（F）" @click="toggleFullscreen">全屏</button>
     </nav>
@@ -224,7 +263,7 @@ onUnmounted(() => {
             :selected-id="selectedId"
             :connection="project.connection"
             :project-label="projectLabel"
-            :source="sessions.selected ? (sessions.selected.inferred ? 'inferred' : 'reported') : ''"
+            :source="phaseSource"
             @select="selectDesk"
           />
           <!-- 旧的 2D 正视场景，?tab=flat 还能进，用来和新场景对比 -->
@@ -299,6 +338,14 @@ onUnmounted(() => {
 }
 
 .app.fullscreen :deep(.scene-wrap) {
+  border: 0;
+  border-radius: 0;
+}
+
+/* 门楣（楼层屏那片）与画布是同一块板的上下两段：全屏时画布顶满，
+   它也得跟着去掉外圈留白与边框，否则画布贴边了、上面还悬着一块圆角板。 */
+.app.fullscreen :deep(.lintel) {
+  margin: 0;
   border: 0;
   border-radius: 0;
 }

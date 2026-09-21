@@ -21,17 +21,6 @@ export async function getServerInfo() {
   return { port: fallbackPort, token: '', version: 'dev', fallback: true };
 }
 
-export async function getFlags() {
-  if (hasBridge()) {
-    try {
-      return await window.workgremlin.getFlags();
-    } catch {
-      /* ignore */
-    }
-  }
-  return { demo: false, seed: 1 };
-}
-
 /**
  * 原生（OS 级）全屏：true 时窗口占满整屏，标题栏 / 边框 / 菜单栏一起去掉。
  * 有 Electron bridge 走 IPC；纯浏览器 dev 退回 HTML5 Fullscreen API（同样没有窗口外壳）。

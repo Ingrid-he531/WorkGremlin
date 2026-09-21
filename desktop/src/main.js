@@ -23,27 +23,17 @@ let menuVisibleBeforeFs = true;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const flags = {
-  demo: process.argv.includes('--demo'),
-  seed: (() => {
-    const i = process.argv.indexOf('--demo-seed');
-    return i >= 0 ? Number(process.argv[i + 1]) : Number(process.env.WORKGREMLIN_DEMO_SEED || 1);
-  })(),
-};
-
 async function bootstrap() {
   await app.whenReady();
 
-  server = createServer({
-    demo: flags.demo,
-    seed: Number.isFinite(flags.seed) ? flags.seed : 1,
-  });
+  // 演示模式**没有启动开关**（原来的 --demo / --demo-seed / WORKGREMLIN_DEMO* 都散了）：
+  // 它由界面上的「演示模式」按钮切换工程触发（见 server 的 syncDemo），启动一律接真实数据。
+  server = createServer();
 
   const info = await server.start();
 
   ipcMain.handle('workgremlin:get-server-info', () => server && server.info);
   ipcMain.handle('workgremlin:get-app-version', () => app.getVersion());
-  ipcMain.handle('workgremlin:get-flags', () => ({ ...flags, userDataDir: app.getPath('userData') }));
 
   // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）
   ipcMain.handle('workgremlin:choose-workspace', async () => {

@@ -194,6 +194,56 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 
 | 路径 | 现象 | 说明 |
 | --- | --- | --- |
-| `work/WorkGremlin/` | 一份未被 git 跟踪的嵌套副本（server / renderer / desktop / packages 的部分文件 + 一个 `.workgremlin/subagents.json`） | 疑似某次演示或运行留下的残骸，**不是工程结构的一部分**，可安全删除（删除前请自行确认） |
+| `work/WorkGremlin/` | ~~一份未被 git 跟踪的嵌套副本~~ | **已于 2026-09-21 删除**（内容核实为 hook 状态文件的测试残留，非工程代码） |
 | `.workgremlin/workspaces.json` | 内容却是 hook 的相位状态（`lastTool` / `sessionPhase`），不是工程管理该写的 `{current, recent}` | 该目录本应只放 `subagents.json`；疑似历史误写产物 |
-| 未提交改动 | 11 个文件（iso 引擎、主控制台相位、`sessionRegistry`、`products` 探测、`App.vue` 等），约 +600 行 | 最近一轮「办公室渲染 + 相位保真」修复，尚未提交 |
+
+## 10. 演示模式：入口从「启动参数」改为「界面按钮」（2026-09-21）
+
+**需求没变**（仍是"一套确定性的假数据、与真实数据隔离"），变的只是**怎么进**：
+
+| 项 | 之前 | 现在 |
+| --- | --- | --- |
+| 进入方式 | `npm run dev -- --demo` / `--demo-seed N` / `WORKGREMLIN_DEMO=1` / `MOCK=1` | 办公室 HUD 上的「演示模式」按钮（在「集合开会」左边）→ `POST /api/v1/workspace`（空路径）→ `openDemo()` |
+| 数据播种 | 启动时按 `shouldSeedDemo()` 判定（`WORKGREMLIN_DEMO_REFRESH=1` 可重灌） | 切进演示工程时**按需播种**（`__demo__` 里没有消息才灌），见 `server/src/index.js` 的 `syncDemo` / `ensureDemoData` |
+| 心跳推进器 | 启动时按 `isDemoMode()` 起，进程活着就一直跑 | 随工程切换起停：进演示起、切走停（`workspace.setOnSwitch`） |
+| 退出 | 重启且不带 `--demo` | 再点一次按钮（「退出演示」）→ 回进演示前打开的工程（`project.demoReturnPath`） |
+| 启动恢复 | `WORKGREMLIN_NO_DEMO=1` 专用来"别把我带回演示工程" | 落盘 `current.demo` 是用户自己点的结果 → 恢复进演示；该变量已删除 |
+
+连同删掉的开关：`desktop/src/main.js` 的 `flags` 与 `workgremlin:get-flags` IPC（`preload.js` / `api/bridge.js` / `stores/project.js` 的 `flags` 一并移除）、`server/src/cli.js` 的 `--demo` / `--demo-seed`、`scripts/dev.js` 的 `WORKGREMLIN_DEMO*` 注入、`createServer({demo, seed})` 两个入参、`workspace.js` 的 `preferDemo`。
+保留：`config.DEMO_PROJECT`（`__demo__`）与 `workspace.openDemo()`（切工程本来就有）、`generator.js` 的 `seedDemoData/createDemoTicker`（改为按需调用）、`WORKGREMLIN_DEMO_FIXED_TS`（生成器的时间基准开关，与"怎么进演示"无关）。
+
+演示期间的五处前端特判，都是为了让"点了按钮就真在演示"：
+① `sceneMembers` 里演示压过楼层/会话过滤（`floorEmpty` 不清场、`sessions.live` 不把成员压成灰）；
+② 会话下拉的"新会话自动跟随"在演示期间不切工程（否则一条真会话冒出来就把演示拽走）；
+③ 退出演示时收掉脚本：`mainAgent.enterIdle()`（**不是** `stop()` ——那会亮「已暂停」把演示味留在真数据上），真会话相位随即接管；
+④ **控制台归演示脚本独占**：`consoleLive` 的 watch 在演示时提前 return，并保证脚本在跑；
+   起脚本走 `mainAgent.startDemo()`（先清 `live` / `hookLive` 再 `start()`）
+   —— 不清的话，下拉里那条真会话每 1.5s 就会把它的「待命中」喂进来，脚本起不来 / 刚演一步就被顶掉，
+   现象就是"点了演示模式，主 Agent 不动"；
+⑤ 顶栏与状态徽标同步：项目徽标显示「演示工程 · 演示模式」（原来优先跟"选中的会话"走，会显示真工程名）、
+   会话下拉换成唯一一项「演示工程 · 演示会话」（演示期间不响应切换）、相位来源标成「演示脚本」
+   （`ConnectionBar` 的 `source='demo'`，与"上报真值 / 推断值"并列但分开着色）。
+
+> 注：`startDemoScript()` 的守卫从"`live`/`hookLive` 为真就不起"改成"`auto` 为真就不重复起" ——
+> 旧守卫在演示里恒为真（真会话总在喂相位），等于永远不起脚本。
+
+**演示工程里的小怪物只留用户级**（2026-09-21）：`createAgentRoster` 的 `getWorkspacePath` 不再回退到
+"服务启动时解析出来的工程"，只认当前工程路径 —— 演示工程没有目录（`workspacePath === ''`），
+`listDefinedAgents('')` 只列用户级 agent（`~/.codebuddy/agents`、`$CODEX_HOME/agents`），
+于是切进演示后**项目级**小怪物（`<工程>/.codebuddy/agents`，如本工程的 leo / susan）会被 `sync()`
+从演示工程上摘掉，切回真实工程再自动补回；用户级的（如 simmon）照常留在屋里。
+实测：真实工程 3 只（leo:project / simmon:user / susan:project）→ 演示工程 9 只
+（8 个演示成员 + simmon:user，无 leo/susan）→ 切回真实工程又回到 3 只。
+
+**名册残留的对账清理**（2026-09-21，紧接上一条）：只改 `getWorkspacePath` 还不够 ——
+名册摘人靠**进程内记账**（`registered` / `mine`），服务一重启那笔账就空了，于是**上一轮**注册进
+演示工程的项目级成员（leo / susan）再没人认领、也没人心跳，60s 后被 sweep 标成 degraded，
+在屋里就是"还在，但灰了"。所以新增 `purgeDemoStragglers()`（`server/src/index.js`）：
+进演示（含"启动时落盘就是演示"）时按名册自己的口径对账 —— 演示工程里 `role='subagent'` 且
+`agentRoster.isDefined(name)` 为假的成员行摘掉；三类不碰：演示种子成员（leader / coder …）、
+主 agent 成员（`role='agent'`，hook 上报）、临时成员（ephemeral）。
+配套：`syncDemo()` 的调用点从"restore 之后"挪到 `agentRoster.start()` 之后（对账要用名册的
+"已定义"，名册没起来时 `isDefined` 恒假，会把用户级小怪物一起误摘；函数里也加了 `if (!agentRoster) return 0` 兜底）。
+实测：手工往 `__demo__` 塞 `role='subagent'` 的 leo（复现"灰着的残留"）→ 切出再切回演示即清掉、
+用户级 simmon 保留；再塞 susan 后**重启服务**（落盘仍停在演示工程）也在启动期清掉。
+（`ops[灰]` 是演示数据里**故意**留的 degraded 样本，不是残留。）

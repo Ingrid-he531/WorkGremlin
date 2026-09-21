@@ -246,6 +246,13 @@ let seenFastDone = false;
 watch(
   consoleLive,
   (v) => {
+    // 演示模式：控制台**归演示脚本独占**，真会话一律不参与。
+    // 不拦的话，下拉里选着的那条真会话每 1.5s 都会把它的相位喂进来（演示时通常就是「待命中」），
+    // 于是脚本刚演一步就被顶回去 —— 现象正是"点了演示模式，主 Agent 状态不变"。
+    if (project.demo) {
+      if (!mainAgent.auto) startDemoScript();
+      return;
+    }
     const sel = sessions.selected;
     const selId = sel ? sel.id : null;
     // 完成标记：优先会话自身的（3F 插件从落盘算出来），CLI 楼层没有就取 hook 快轮询带回来的。
@@ -277,7 +284,9 @@ watch(
         return;
       }
       mainAgent.applySession(v);
-      if (sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
+      // 演示期间不让会话把工程拽走：演示是用户显式进出的（HUD 的按钮），而"新会话自动跟随"
+      // 很可能在看演示时正好插进来一条真会话 —— 一拽就走了，演示当场断掉。
+      if (!project.demo && sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
         project.openWorkspace(sel.projectPath);
       }
       return;
@@ -319,11 +328,17 @@ let cardRaf = 0;
 // （setMainAgent），在工位区再摆一个就是重复。所以从工位名单里剔掉，
 // 只让真正的 subagent 小怪物（含扫描器注册的常驻成员）坐工位。
 const sceneMembers = computed(() => {
+  // 演示模式压过楼层 / 会话这两层过滤：演示成员的活跃状态由服务端推进器维持
+  // （每 5s 刷心跳、推进度），跟"下拉里选中哪条真会话"没关系。不特判的话，
+  // 演示里 8 只小怪物会整片转灰 + 标"推断"，楼层恰好没有活跃会话时（floorEmpty）
+  // 屋里还会一个人都不剩 —— 那就不叫演示了。
+  const demo = project.demo;
   // 切到没有活跃会话的楼层：屋里一个人都不留。
   // 否则 project.members 还是上一个工程的人（小怪物站在工位上、卡片也是那批），
   // 看着就像楼层没切 —— 那层压根没人在干活。
-  if (sessions.floorEmpty) return [];
-  const want = sessions.selectedClient;
+  if (sessions.floorEmpty && !demo) return [];
+  const want = demo ? '' : sessions.selectedClient;
+  const live = demo || sessions.live;
   return project.members
     .filter((m) => m.role !== 'agent')
     // 按楼层过滤来源：4F 只看 Codex 的成员与幽灵，1F/3F 只看 CodeBuddy 的。
@@ -333,11 +348,11 @@ const sceneMembers = computed(() => {
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],
       level: m.level || null,
-      state: sessions.live ? m.state || 'offline' : 'offline',
-      degraded: sessions.live ? Boolean(m.degraded) : true,
+      state: live ? m.state || 'offline' : 'offline',
+      degraded: live ? Boolean(m.degraded) : true,
       ghost: isEphemeralMember(m),
       project: projectLabelOf(m),
-      taskProgress: sessions.live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
+      taskProgress: live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
       // 被召唤的 subagent 当前任务名：主 agent 会用气泡把它交代给小怪物
       task: m.task && m.task.title ? m.task.title : '',
       // 收工摘要：清单里写的 result 由服务端作为 artifact 随成员卡下发
@@ -403,19 +418,42 @@ function closeCard() {
  *   2) 真数据已经在驱动时不抢方向盘（live / hookLive）。
  */
 function startDemoScript() {
-  if (mainAgent.live || mainAgent.hookLive) return;
+  if (mainAgent.auto) return; // 已经在演了，别把进度拨回第一步
+  // 演示期间控制台归脚本：必须先把 live / hookLive 清掉，否则脚本起不来 / 起步就被真会话顶掉。
+  // 优先走 store 的 startDemo()；热更时页面里可能还是改之前的 store 实例（没有这个 action），
+  // 那就地清标志再 start() —— 不能让"HMR 没换掉 action"变成控制台每 1.5s 抛一次错。
+  if (typeof mainAgent.startDemo === 'function') {
+    mainAgent.startDemo();
+    return;
+  }
+  mainAgent.live = false;
+  mainAgent.hookLive = false;
+  mainAgent.liveMember = null;
   mainAgent.start();
 }
 
-/** 服务端确认当前停在演示工程后（含"上次停在演示数据"被 restore 回来的情况）才开演 */
+/** 服务端确认当前停在演示工程后（含"上次停在演示工程"被 restore 回来的情况）才开演；
+ *  退出演示时收掉脚本，控制台交回真会话（真实相位由上面那个 watch 立刻接管）。 */
 watch(
   () => project.demo,
   (v) => {
     if (v) startDemoScript();
+    else if (mainAgent.auto) mainAgent.enterIdle();
   }
 );
 
 /* ------------------------------ HUD ------------------------------ */
+
+/** 演示模式开关（HUD 里、集合开会前面那个按钮）：切进 / 切出演示工程 */
+async function toggleDemo() {
+  try {
+    if (project.demo) await project.exitDemo();
+    else await project.enterDemo();
+  } catch (err) {
+    // 切不过去（目录没了 / 服务端拒绝）不能把视图带崩：保持原样，只报一行
+    console.warn('[workgremlin] 切换演示模式失败：', err && err.message);
+  }
+}
 
 function callAll() {
   if (office) office.callAll();
@@ -515,6 +553,17 @@ onBeforeUnmount(() => {
 
     <!-- HUD -->
     <div class="hud" @click.stop>
+      <!-- 演示模式：切到演示工程（主控制台自动演一轮、小怪物换成演示成员）。
+           放在办公室自己的操作条上、集合开会之前 —— 它切的是"屋里这台机器"，
+           和 集合开会 / 全员回工位 是一类动作，不占顶栏页签。 -->
+      <button
+        class="demo-btn"
+        :class="{ on: project.demo }"
+        :title="project.demo ? '退出演示，回到进演示前的工程' : '切到演示工程：主控制台自动演一轮，小怪物用演示成员'"
+        @click="toggleDemo"
+      >
+        {{ project.demo ? '退出演示' : '演示模式' }}
+      </button>
       <button @click="callAll">集合开会</button>
       <button @click="dismiss">全员回工位</button>
       <button @click="resetView">复位视角</button>
@@ -535,7 +584,8 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
-  background: #151a22;
+  /* 底色走 token：门楣（楼层屏那片）用的是同一个色，见 theme.css 的 --iso-bg */
+  background: var(--iso-bg, #151a22);
 }
 
 .scene {

@@ -111,6 +111,25 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.advance();
     },
 
+    /**
+     * 演示模式：把控制台**抢回来**交给脚本。
+     *
+     * 与 start() 的区别就在这里：必须先把 live / hookLive 清掉。那两个标志的意思是
+     * "真会话正在接管" —— 演示期间下拉里往往还选着一条真会话，快轮询每 1.5s 就会把它的
+     * 相位喂进来（演示时通常就是「待命中」），于是：
+     *   ① startDemoScript() 被 live 挡住，脚本根本起不来；
+     *   ② 就算起来了，下一步立刻被那条真会话的相位顶掉。
+     * 现象就是"点了演示模式，主 Agent 停在待命不动"。清干净之后由脚本一路演。
+     */
+    startDemo() {
+      this.live = false;
+      this.hookLive = false;
+      this.liveMember = null;
+      clearTimeout(stopTimer);
+      stopTimer = null;
+      this.start();
+    },
+
     /** 手动停止 mock：先亮出"已暂停"摘要，10s 后退回待命 */
     stop() {
       this.auto = false;

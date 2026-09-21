@@ -157,35 +157,19 @@ function createWorkspaceManager(opts) {
     return { ...current };
   }
 
-  /** 启动时恢复上次打开的工程；目录已经没了就落到启动时解析出来的工程（cwd / --workspace） */
+  /**
+   * 启动时恢复上次打开的工程；目录已经没了就落到启动时解析出来的工程（cwd / --workspace）。
+   *
+   * 关于演示工程：**这里只认落盘的历史**，没有"启动就进演示"这回事了 ——
+   * 演示模式改由界面上的按钮切换（见 server/src/index.js 的 syncDemo）。
+   * 上次是用户自己点的「演示模式」→ 这次启动照旧回到演示工程（和回到任何别的工程一样）；
+   * 从没打开过工程 → 落到启动时解析出来的工程，而不是硬塞演示数据。
+   */
   function restore() {
     const store = readStore();
     if (store) recent = Array.isArray(store.recent) ? store.recent : [];
     const saved = store && store.current;
-    if (!saved) {
-      // 从没手工打开过工程：demo 模式要明确落在"演示数据"上。
-      // 否则屋里站着 8 个模拟成员，顶上却写着真工程名 —— 分不清真假。
-      return opts.preferDemo ? openDemo() : openInitial();
-    }
-    // --no-demo：强制真实数据源，不回退到持久化的演示工作区
-    //（否则上次停在演示数据，这回没带 --demo 启动也会把人带回 demo project）。
-    // 没有保存在 current 的真实路径时，依次尝试"最近打开"、最后退回启动时解析出来的工程，
-    // 让真实数据直接回来（也保证 project 一定落到某个真实工程上，不会留 null）。
-    if (process.env.WORKGREMLIN_NO_DEMO === '1') {
-      const candidates = [
-        saved.workspacePath || saved.path,
-        ...recent.map((r) => (r && r.path) || '').filter(Boolean),
-        initial.workspacePath || '',
-      ];
-      for (const p of candidates) {
-        try {
-          return open(p);
-        } catch {
-          /* 目录没了 / 换了机器 / 空路径：试下一个 */
-        }
-      }
-      return openInitial();
-    }
+    if (!saved) return openInitial();
     try {
       if (saved.demo) return openDemo();
       const savedPath = saved.workspacePath || saved.path;
