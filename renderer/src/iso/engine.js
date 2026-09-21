@@ -787,8 +787,8 @@ export function createIsoOffice(canvas, opts = {}) {
       wallQuad(c, 'y', face + 0.001, x0 + 0.12, x0 + 0.26, z0 + 0.04, z1 - 0.12, 'rgba(160,190,230,0.05)');
       return;
     }
-    // 亮绿铺满
-    wallQuad(c, 'y', face, x0, x1, z0, z1, '#3ef06a');
+    // 墨绿铺满（老显示器的沉绿，不是荧光绿）
+    wallQuad(c, 'y', face, x0, x1, z0, z1, '#1f5c40');
     // 右上角状态点（沿用成员级别色）
     wallQuad(c, 'y', face + 0.001, x1 - 0.12, x1 - 0.07, z1 - 0.05, z1 - 0.01, color);
     // 满屏黑色小字：行距密、段短、每行几乎顶格排满 —— 远看就是一整屏字
@@ -806,12 +806,12 @@ export function createIsoOffice(canvas, opts = {}) {
         cx += sw + 0.02 + ((seed >> (k + s * 3)) % 3) * 0.008; // 词间距错落
       }
     }
-    // 底部进度条：半透明暗轨 + 深绿走条
+    // 底部进度条：半透明暗轨 + 浅绿走条（墨绿底上深走条对比不够，反过来）
     const pz = z0 + 0.04;
-    wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(7,27,15,0.45)');
+    wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(0,0,0,0.35)');
     if (progress > 0) {
       const full = x1 - 0.06 - (x0 + 0.06);
-      wallQuad(c, 'y', face, x0 + 0.06, x0 + 0.06 + full * progress, pz, pz + 0.04, '#071b0f');
+      wallQuad(c, 'y', face, x0 + 0.06, x0 + 0.06 + full * progress, pz, pz + 0.04, '#9fe8b8');
     }
   }
 

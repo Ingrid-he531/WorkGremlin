@@ -229,7 +229,8 @@ export function drawConsoleScreen(c, o) {
      只显示状态，不显示具体 prompt、读写文件、调用工具的细节 —— 那些留在 tooltip / 对话记录里。
      命令类工具（Bash / Shell）：相位文案与 tooltip 第一行走同一个 consolePhaseLabel()
      （"调用工具，需要授权"）；文案长就自动缩字号，别被 fit 截成"调用工具，需…"。
-     待命中缓慢呼吸，执行中常亮、后面跟一个闪烁光标。 */
+     待命中缓慢呼吸，执行中常亮。文字按整宽排 —— 不跟闪烁光标
+     （给它预留位置会把"调用工具，需要授权"挤成省略号）。 */
   const blink = ph.busy ? 1 : 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(now / 700));
   const label = consolePhaseLabel(state);
   let lfs = fs1;
@@ -240,16 +241,11 @@ export function drawConsoleScreen(c, o) {
     c.font = `700 ${lfs}px ${FONT}`;
   }
   const labelV = H * 0.38; // 只剩一层：垂直居中偏上（顶部状态条与底部进度条之间）
-  const labelText = fit(c, label, inner - lfs);
+  const labelText = fit(c, label, inner);
   c.globalAlpha = blink;
   c.fillStyle = ph.color;
   c.fillText(labelText, padX, labelV + (fs1 - lfs) * 0.5);
   c.globalAlpha = 1;
-  if (ph.busy && Math.floor(now / 420) % 2 === 0) {
-    const w1 = c.measureText(labelText).width;
-    c.fillStyle = ph.color;
-    c.fillRect(padX + w1 + lfs * 0.28, labelV + (fs1 - lfs) * 0.5 + lfs * 0.16, lfs * 0.62, lfs * 0.8);
-  }
 
   /* 底部：执行中走一条不确定的进度条 */
   c.fillStyle = 'rgba(255,255,255,0.07)';
