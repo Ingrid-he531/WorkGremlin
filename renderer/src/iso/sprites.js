@@ -75,7 +75,13 @@ export function drawGremlin(ctx, o) {
 
   const bounce = walking ? Math.abs(Math.sin(phase * 2)) * 2.2 : 0;
   const sink = sitting ? 5 : 0; // 坐着：整体下沉一点
-  ctx.translate(0, -bounce + sink);
+  /**
+   * 坐着再抬升 8 单位：屁股落到椅面（z≈0.42）高度、小腿垂在座前。
+   * 不抬的话身体沉在地面高度，椅背（朝镜头那侧）一挡就只剩眼睛和角 —— 像陷进椅子里。
+   * 幅度压在头顶标签的 12px 间隙以内，角不会顶到标签。
+   */
+  const lift = sitting ? 8 : 0;
+  ctx.translate(0, -bounce + sink - lift);
 
   const dark = mix(color, '#101720', 0.28);
   const belly = mix(color, '#ffffff', 0.42);

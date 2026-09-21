@@ -31,6 +31,7 @@ import {
   COLORS,
   WALL,
   DESK_UNITS,
+  DIVIDERS,
   MEETING,
   MEETING_SEATS,
   PANTRY,
@@ -794,11 +795,15 @@ export function createIsoOffice(canvas, opts = {}) {
     }
   }
 
-  function drawChair(c, x, y, backAtNorth = true) {
-    // 五星脚（简化成一个扁圆柱）+ 中柱 + 座板 + 靠背
+  /** 椅子底座：五星脚 + 中柱 + 座板（永远画在坐着的人之前） */
+  function drawChairBase(c, x, y) {
     isoCylinder(c, { x, y, z: 0.02, r: 0.26, h: 0.04, color: '#2b3140' });
     isoCylinder(c, { x, y, z: 0.06, r: 0.05, h: 0.34, color: '#39414f' });
     isoBox(c, { x: x - 0.24, y: y - 0.24, z: 0.4, w: 0.48, d: 0.48, h: 0.08, color: COLORS.chair });
+  }
+
+  /** 椅背：backAtNorth=true 朝北（背对镜头），false 朝南（挡在人与镜头之间） */
+  function drawChairBack(c, x, y, backAtNorth) {
     const by = backAtNorth ? y - 0.3 : y + 0.22;
     isoBox(c, { x: x - 0.22, y: by, z: 0.48, w: 0.44, d: 0.1, h: 0.5, color: COLORS.chair });
   }
@@ -1112,10 +1117,10 @@ export function createIsoOffice(canvas, opts = {}) {
    * 板面贴在 gy 恒定的竖直平面上 —— 等距下是个"左右竖直、上下沿斜 30°"的平行四边形，
    * 所以文字要用 AX / AZ 当局部基底斜切，不然会浮在板子外面。
    */
-  function drawWallPlate(c, { x, y, z, text, accent, maxW = 1.5 }) {
-    // 想让字在屏幕上恒为 ~11px → 反算世界字号；但牌子挂在 1.2 高的隔板上，
-    // 高度必须封顶（H_MAX），所以字号再按牌高收一次，远看也不会撑爆隔板。
-    const H_MAX = 0.5;
+  function drawWallPlate(c, { x, y, z, text, accent, maxW = 1.5, maxH = 0.5 }) {
+    // 想让字在屏幕上恒为 ~11px → 反算世界字号；但牌子挂在隔板上，
+    // 高度必须封顶（maxH，隔断的矮板传 0.38），所以字号再按牌高收一次，远看也不会撑爆隔板。
+    const H_MAX = maxH;
     const fsPx = 11 / cam.zoom;
     const wantTile = fsPx / UNIT_Z; // 期望的世界字号（tile）
     c.font = `600 ${fsPx}px ui-sans-serif, system-ui, sans-serif`;
@@ -1240,17 +1245,58 @@ export function createIsoOffice(canvas, opts = {}) {
     c.restore();
   }
 
+  /**
+   * 金属竖直面（隔板铝框的南面 / 东面）：屏幕竖向渐变。
+   * 拉丝铝的读法 —— 顶刃一条受光亮带（镜面高光）→ 快速回落到基调 → 底刃压暗；
+   * 等距下 z 轴投成屏幕竖直线，所以渐变色标对所有 gx/gy 都成立。
+   * k 给背光面整体降档（东面 ≈ 南面的 0.72，与原先 shade 0.8 / 0.58 的比例一致）。
+   */
+  function metalFace(c, base, z0, z1, k = 1) {
+    const g = c.createLinearGradient(0, project(0, 0, z1).y, 0, project(0, 0, z0).y);
+    g.addColorStop(0, shade(base, 1.62 * k)); // 顶刃高光
+    g.addColorStop(0.16, shade(base, 1.06 * k));
+    g.addColorStop(0.55, shade(base, 0.82 * k)); // 基调（≈ 原南面 0.8）
+    g.addColorStop(1, shade(base, 0.5 * k)); // 底刃暗边
+    return g;
+  }
+
+  /** 金属顶面：沿进深方向的提亮渐变 —— 北沿（远）更亮，像天光擦过框顶 */
+  function metalTop(c, base, y, d, z) {
+    const pN = project(0, y, z);
+    const pS = project(0, y + d, z);
+    const g = c.createLinearGradient(pN.x, pN.y, pS.x, pS.y);
+    g.addColorStop(0, shade(base, 1.5));
+    g.addColorStop(1, shade(base, 1.1));
+    return g;
+  }
+
   /** 预生成静态物件列表（每帧参与排序） */
   function buildStatics() {
     /** @type {{depth:number,draw:(c:CanvasRenderingContext2D, now:number)=>void}[]} */
     const items = [];
     const push = (depth, draw) => items.push({ depth, draw });
 
-    /* 工位 */
-    DESK_UNITS.forEach((u, i) => {
-      const p = u.partition;
+    /**
+     * 一把椅子入队：底座与椅背分开排。
+     * 椅背朝北（背对镜头）时整把画在人之前 —— 椅背本就在人身后；
+     * 椅背朝南（挡在人与镜头之间，即"椅子朝向窗口"那排）时，椅背必须排在人**之后**：
+     * 坐着的人下半身被椅背压住才读作"坐在椅子里"，否则人像站在椅子前面。
+     */
+    const pushChair = (x, y, backAtNorth) => {
+      push(depthOf(x, y) - 0.02, (c) => {
+        drawChairBase(c, x, y);
+        if (backAtNorth) drawChairBack(c, x, y, true);
+      });
+      if (!backAtNorth) push(depthOf(x, y + 0.24), (c) => drawChairBack(c, x, y, false));
+    };
+
+    /* 工位（一）：隔断（铝合金边框）+ 它上面的两块名牌 —— 6 组面对面双人桌各一道 */
+    DIVIDERS.forEach((p) => {
+      // 兜底：HMR 期间可能拿到"新 officeMap 的隔断对象 + 旧引擎"或半截数据 ——
+      // 那种情况下宁可少画一道隔断，也不要让整个办公室构建失败（白屏）。
+      if (!p || !p.northDesk || !p.southDesk) return;
       /**
-       * 隔板是 3.2 宽的一整块，但整块只能拿一个 depth（= 中心 x+y）参与排序：
+       * 隔断是 3.2 宽的一整块，但整块只能拿一个 depth（= 中心 x+y）参与排序：
        * 走道上的精灵 depth = x+y，走到板子后半段就会超过板子中心的 depth，
        * 于是被画到板子**前面** —— 看着就是"从板子里穿出来"。
        * 切成 4 段各排各的，遮挡判断就局部化了：板前的排后面、板后的排前面。
@@ -1259,22 +1305,18 @@ export function createIsoOffice(canvas, opts = {}) {
       const segW = p.w / SEG;
       const natSegDepth = (s) => depthOf(p.x + (s + 0.5) * segW, p.y + p.d / 2);
       /**
-       * 隔板要挡住"正后方那一排工位"的桌子：但每段 depth=gx+gy，
-       * 后方桌子 gx 更大时深度反而更高，会被画到隔板前面（透出来）。
-       * 把每段深度夹在 [后方桌面上物, 自己桌面上物) 之间：
-       * 下限保证压住后方桌子，上限保证不挡自己这排的桌子/人。
+       * 每段深度夹在**本组两张桌子**之间：
+       *   下限 = 北桌（含桌上物）之后 → 隔断在它前面，要压住它；
+       *   上限 = 南桌**本身**之前（ds − 0.01）→ 南桌更靠近镜头，要能压住隔断（连桌腿一起）。
+       * 上限写大的后果：靠 x 大那几段的自然深度会超过南桌，哪怕 clamp 到 ds + 0.39 也仍在南桌
+       * **之后**绘制 —— 隔断东端盖住南桌的东沿与东腿，看着就是"右边看不到前桌腿、
+       * 板子突出了桌面、桌面爬到板子上"。所以上限必须严格小于南桌本身的深度。
        */
-      const deskDepth = depthOf(u.desk.x + u.desk.w / 2, u.desk.y + u.desk.d / 2);
-      const ownCeil = deskDepth + 0.4 - 0.01; // 不挡自己这排的桌子/桌上物
-      const behind = i - 3 >= 0 ? DESK_UNITS[i - 3] : null; // 同列前一排
-      const behindFloor = behind
-        ? depthOf(behind.desk.x + behind.desk.w / 2, behind.desk.y + behind.desk.d / 2) + 0.4 + 0.01
-        : -Infinity;
-      const segDepth = (s) => {
-        const nat = natSegDepth(s);
-        const clamped = Math.min(ownCeil, Math.max(behindFloor, nat));
-        return clamped + s * 0.0005; // 段间仍保持左→右的前后序
-      };
+      const dn = depthOf(p.northDesk.x + p.northDesk.w / 2, p.northDesk.y + p.northDesk.d / 2);
+      const ds = depthOf(p.southDesk.x + p.southDesk.w / 2, p.southDesk.y + p.southDesk.d / 2);
+      const floor = dn + 0.4 + 0.01;
+      const ceil = ds - 0.01;
+      const segDepth = (s) => Math.min(ceil, Math.max(floor, natSegDepth(s))) + s * 0.0005; // 段间仍保持左→右的前后序
       /** 名牌落在哪一段上 */
       const segOf = (gx) => Math.max(0, Math.min(SEG - 1, Math.floor((gx - p.x) / segW)));
 
@@ -1284,35 +1326,116 @@ export function createIsoOffice(canvas, opts = {}) {
           x: p.x - 0.06,
           y: p.y + p.d - 0.06,
           w: p.w + 0.12,
-          d: 0.36,
+          d: 0.28,
           z: 0.002,
           fill: '#0b0e14',
           alpha: 0.5,
         });
       });
 
+      /**
+       * 深色金属边框：与板体**同厚**（FD = 0，不往外探），四条边一样宽。
+       * 亮铝色 + 比板厚会把边框读成一副独立于板子的浅色骨架；压暗、同厚之后，
+       * 整块隔断读起来是"一块带收边的板"。
+       */
+      const FR = p.frame || 0.05;
+      const FD = 0;
+      const ALU = '#5f6a7e';
+      /**
+       * 板体左右各让出 FR，把这两条让给竖框：
+       * 于是竖框**落在板边的那一条上、不压在板面上**（框外沿 = 板的总外沿 = 桌子左右沿）。
+       * 之前板体铺满全宽、竖框又后画，等于框整根骑在板面前面 —— 看着就是"板前立了根柱子"，
+       * 遮挡关系不对。
+       */
+      const bodySegW = (p.w - 2 * FR) / SEG;
       for (let s = 0; s < SEG; s += 1) {
         // 段间多画 0.01，压住接缝；多出来的部分被后一段盖住
         push(segDepth(s), (c) => {
-          isoBox(c, { x: p.x + s * segW, y: p.y, w: segW + 0.01, d: p.d, h: p.h, color: '#2a3241' });
+          /**
+           * 板体：不透明深灰，落地、无底座。
+           * 高度是被"突出桌面减半 + 北桌仍可读 + 名牌压得进板面"三个条件夹出来的
+           * （推导在 officeMap 的 DIVIDER_H 注释里）：再高北桌会被切剩一条边停在板顶
+           * （"桌面爬到隔板上"）；再矮名牌压不进板面。
+           */
+          isoBox(c, { x: p.x + FR + s * bodySegW, y: p.y, w: bodySegW + 0.01, d: p.d, h: p.h, color: '#2a3241' });
+          /**
+           * 上横框：跟着段走（整条横框只拿一个深度会排错，被画到桌子前后不对的一侧）。
+           * 画在板体之后：顶面与板顶共面、后画的框条压出"收边"；南面在板正面压出顶部那条框；
+           * 朝东的端面被下一段板体盖住，接缝不露。
+           */
+          isoBox(c, {
+            x: p.x + FR + s * bodySegW, y: p.y, z: p.h - FR, w: bodySegW + 0.01, d: p.d, h: FR, color: ALU,
+            south: metalFace(c, ALU, p.h - FR, p.h, 1),
+            east: metalFace(c, ALU, p.h - FR, p.h, 0.72),
+            top: metalTop(c, ALU, p.y, p.d, p.h),
+          });
+          /**
+           * 下横框只画正面那一条（wallQuad），不画盒子：
+           * 盒子 z 0..FR 整段埋在板体脚下的体积里，顶面物理上就该被板体挡住 ——
+           * 画盒子的话顶面那条亮色会浮在板根前面，只能不漏的方式就是根本没有那个面。
+           * 正面这条比板面往外探 0.001，避免与板体南面共面打架。
+           */
+          wallQuad(c, 'y', p.y + p.d + 0.001, p.x + FR + s * bodySegW, p.x + FR + (s + 1) * bodySegW + 0.01, 0, FR, metalFace(c, ALU, 0, FR, 1));
         });
       }
-
-      // 名牌：钉在隔板正面，写成员名字（不是职务）。牌子最宽 1.5，按最右端选段
-      push(segDepth(segOf(Math.min(p.x + 0.26 + 1.5, p.x + p.w))) + 0.002, (c) => {
-        const owner = agents.find((ag) => ag.home === i);
-        if (!owner) return;
-        drawWallPlate(c, {
-          x: p.x + 0.26,
-          y: p.y + p.d + 0.001,
-          z: 0.58,
-          text: owner.name,
-          accent: levelColor(owner.level),
+      /**
+       * 左竖框：必须排在第 0 段板体**之前**画（同深度入队又靠后 = 画在板体之后，
+       * 朝东那条侧面就浮在板面上 —— 之前就是这么坏的）。它贴在板体西端，
+       * 朝东的侧面整面埋在板体体积里，后画的板体（顶面 + 南面）会把它正好盖没；
+       * 正面那条不与板体重叠（板体从 p.x+FR 起），仍然看得见。
+       */
+      push(segDepth(0) - 0.0005, (c) => {
+        isoBox(c, {
+          x: p.x, y: p.y - FD / 2, w: FR, d: p.d + FD, h: p.h, color: ALU,
+          south: metalFace(c, ALU, 0, p.h, 1),
+          east: metalFace(c, ALU, 0, p.h, 0.72),
+          top: metalTop(c, ALU, p.y - FD / 2, p.d + FD, p.h),
+        });
+      });
+      // 右竖框：朝东那面是隔断的外表面（该看见），排在最后一段板体之后，
+      // 顺便盖住板体段间接缝多画出来的 0.01。
+      push(segDepth(SEG - 1) + 0.0002, (c) => {
+        isoBox(c, {
+          x: p.x + p.w - FR, y: p.y - FD / 2, w: FR, d: p.d + FD, h: p.h, color: ALU,
+          south: metalFace(c, ALU, 0, p.h, 1),
+          east: metalFace(c, ALU, 0, p.h, 0.72),
+          top: metalTop(c, ALU, p.y - FD / 2, p.d + FD, p.h),
         });
       });
 
-      // 椅子（在人之前画，人被画在上面）
-      push(depthOf(u.chair.x, u.chair.y) - 0.02, (c) => drawChair(c, u.chair.x, u.chair.y, true));
+      /**
+       * 两块名牌：一张隔断属于哪两个工位（p.seats = [北侧号, 南侧号]），各写各自主人。
+       * 两块都挂在隔断**朝镜头那一面** —— 本工程一贯的取舍：看得见优先于物理正确
+       * （显示器屏幕也是这么处理的）。横向一西一东、各自留出边框的宽度；
+       * 高度：底边 0.77 正好在南侧那张桌子压过来的可见线之上，顶边让开顶部铝框
+       * （板 1.21 高、框 0.05 → 牌高压到 0.38，顶到 1.15）。
+       */
+      p.seats.forEach((seatId, k) => {
+        const idx = DESK_UNITS.findIndex((u) => u.id === seatId);
+        const owner = idx >= 0 ? agents.find((ag) => ag.home === idx) : null;
+        if (!owner) return;
+        const px = p.x + (k === 0 ? 0.08 : 1.52);
+        push(segDepth(segOf(Math.min(px + 1.35, p.x + p.w))) + 0.002, (c) => {
+          drawWallPlate(c, {
+            x: px,
+            y: p.y + p.d + 0.012,
+            z: 0.77,
+            text: owner.name,
+            accent: levelColor(owner.level),
+            maxW: 1.35,
+            maxH: 0.38,
+          });
+        });
+      });
+    });
+
+    /* 工位（二）：椅子 / 桌子 / 桌上的东西（显示器、键盘、水杯） */
+    DESK_UNITS.forEach((u, i) => {
+      const deskDepth = depthOf(u.desk.x + u.desk.w / 2, u.desk.y + u.desk.d / 2);
+
+      // 椅子（底座在人之前画；椅背朝镜头那排由 pushChair 排到人之后）。
+      // 椅背朝向跟着"面对面"来：face='south'（北侧那排，面朝 +gy）椅背朝北 → true；南侧那排相反 → false
+      pushChair(u.chair.x, u.chair.y, u.face === 'south');
 
       // 桌子
       push(deskDepth, (c) => {
@@ -1348,7 +1471,6 @@ export function createIsoOffice(canvas, opts = {}) {
       push(deskDepth + 0.4, (c) => {
         isoCylinder(c, { x: u.mug.x, y: u.mug.y, z: u.desk.h, r: u.mug.r, h: u.mug.h, color: '#e6ebf2' });
       });
-
     });
 
     /* 会议室 */
@@ -1362,10 +1484,8 @@ export function createIsoOffice(canvas, opts = {}) {
       isoBox(c, { x: mt.x + 1.9, y: mt.y + 0.6, z: mt.h, w: 0.42, d: 0.3, h: 0.12, color: '#2b3140' });
     });
 
-    // 前一半椅子在桌子北侧（椅背朝北），后一半在南侧
-    MEETING.chairs.forEach((ch, i) => {
-      push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 4));
-    });
+    // 前一半椅子在桌子北侧（椅背朝北），后一半在南侧（椅背朝镜头 → 排到人就座之后）
+    MEETING.chairs.forEach((ch, i) => pushChair(ch.x, ch.y, i < 4));
 
     // 玻璃隔墙（半透明）+ 它迎镜头那一面的半透光百叶帘。
     //
@@ -1417,9 +1537,7 @@ export function createIsoOffice(canvas, opts = {}) {
       isoCylinder(c, { x: pt.x + 1.45, y: pt.y + 0.6, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
     });
 
-    PANTRY.chairs.forEach((ch, i) => {
-      push(depthOf(ch.x, ch.y) - 0.02, (c) => drawChair(c, ch.x, ch.y, i < 3));
-    });
+    PANTRY.chairs.forEach((ch, i) => pushChair(ch.x, ch.y, i < 3));
 
     /* 杂志架（茶水间北墙东段），见 drawMagRack */
     const rk = PANTRY.rack;
