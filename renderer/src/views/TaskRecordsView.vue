@@ -168,14 +168,7 @@ async function saveRetention() {
 
 <template>
   <div class="view" data-testid="task-records">
-    <div class="toolbar">
-      <span class="title">任务记录</span>
-      <span class="spacer" />
-      <span class="dim">共 {{ list.length }} 次任务</span>
-      <span v-if="tasks.loading" class="dim loading">刷新中…</span>
-    </div>
-
-    <!-- 筛选：一级（工程 + 楼层）+ 二级（状态分段）+ 标题搜索，仅本页生效 -->
+    <!-- 筛选：一级（工程 + 楼层）+ 二级（状态分段）+ 标题搜索 + 计数，仅本页生效 -->
     <div class="filters">
       <select v-model="tasks.filterProject" class="sel" aria-label="按工程筛选">
         <option value="all">全部工程</option>
@@ -202,6 +195,8 @@ async function saveRetention() {
         placeholder="搜索任务标题…"
         aria-label="搜索任务标题"
       />
+      <span class="dim">共 {{ list.length }} 次任务</span>
+      <span v-if="tasks.loading" class="dim loading">刷新中…</span>
     </div>
 
     <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理） -->
