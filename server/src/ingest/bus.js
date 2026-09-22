@@ -32,6 +32,18 @@ function normClient(v) {
   return CLIENTS.has(c) ? c : null;
 }
 
+/** 模型名：拿不到就是 NULL（绝不猜），超长截断 */
+function normModel(v) {
+  const s = String(v == null ? '' : v).trim();
+  return s ? s.slice(0, 64) : null;
+}
+
+/** 台账里的文本字段：压空白 + 截断；空串一律当"没有"（NULL） */
+function normText(v, max) {
+  const s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  return s ? s.slice(0, max) : null;
+}
+
 function jsonOrNull(v) {
   if (v === undefined || v === null) return null;
   try {
@@ -205,6 +217,19 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       source: 'report',
       updatedAt: ts,
     });
+    // 台账：**主 agent** 的一轮任务 = 一次用户任务（输入就是用户原话）。
+    // subagent 实例不走这条（它们记 subagent_runs），所以判据是"上报者是不是主 agent"。
+    if (String(member.role || '') === 'agent') {
+      repo.upsertTaskRun.run({
+        id,
+        projectId: project,
+        memberId: member.id,
+        client: member.client || normClient(p.client) || null,
+        model: normModel(p.model),
+        title: p.title || '(未命名任务)',
+        startedAt: ts,
+      });
+    }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(id));
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
     return { ok: true, taskId: id };
@@ -268,9 +293,86 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         tsMs: ts,
       });
     }
+    // 台账收尾：结束时间 / 花费时间 / 产出（收尾自述）/ 本轮改动文件
+    if (String(member.role || '') === 'agent') {
+      const run = repo.getTaskRun.get(p.taskId);
+      if (!run) {
+        // 老 hook 或中途接上的：起点未知就别编，started_at 留 NULL、duration 也算不出来
+        repo.upsertTaskRun.run({
+          id: p.taskId,
+          projectId: project,
+          memberId: member.id,
+          client: member.client || normClient(p.client) || null,
+          model: normModel(p.model),
+          title: null,
+          startedAt: null,
+        });
+      }
+      const startedAt = run ? Number(run.started_at) || null : null;
+      const files = Array.isArray(p.files) ? p.files.slice(0, 8).map(String) : null;
+      repo.endTaskRun.run({
+        id: p.taskId,
+        model: normModel(p.model),
+        result: normText(p.result, 500),
+        fileCount: Number.isFinite(Number(p.fileCount)) ? Number(p.fileCount) : null,
+        filesJson: files ? jsonOrNull(files) : null,
+        endedAt: ts,
+        durationMs: startedAt && ts > startedAt ? ts - startedAt : null,
+      });
+    }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
+    // 幽灵收工时顺手刷同名常驻小怪物的卡：它这一轮的产出会被那张卡借去显示（见 ghostArtifacts）
+    const heir = heirOf(member);
+    if (heir) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(heir));
     return { ok: true };
+  }
+
+  /**
+   * 台账：记一次召唤（subagent 实例）的开场。
+   * 有小工位的（susan）和没工位的（code-explorer / 内置专家直接 spawn 的）都记 ——
+   * 「这一轮用了几个 subagent」这条账就是靠它。
+   * @returns {number|null} 台账行 id（收工时交给 endSubagentRun）
+   */
+  function startSubagentRun(p) {
+    const project = projectIdOf(p.project);
+    const r = repo.insertSubagentRun.run({
+      projectId: project,
+      parentTaskId: p.parentTaskId ?? null,
+      taskId: p.taskId ?? null,
+      memberId: p.memberId,
+      name: normText(p.name, 64) || 'subagent',
+      client: normClient(p.client),
+      model: normModel(p.model),
+      title: normText(p.title, 200),
+      // 召唤时没给任务行的话，开始时刻就是"不知道" —— 留 NULL（耗时也算不出来），不拿现在冒充填
+      startedAt: p.startedAt === null ? null : Number(p.startedAt) || now(),
+    });
+    return r && r.lastInsertRowid ? Number(r.lastInsertRowid) : null;
+  }
+
+  /**
+   * 台账：subagent 实例收工 —— 补产出（收工摘要）、结束时间与花费时间。
+   * @param {{id: number|null, result?: string, model?: string, endedAt?: number}} p
+   */
+  function endSubagentRun(p) {
+    if (!p || !p.id) return 0;
+    return repo.endSubagentRun.run({
+      id: p.id,
+      model: normModel(p.model),
+      result: normText(p.result, 500),
+      endedAt: Number(p.endedAt) || now(),
+    }).changes;
+  }
+
+  /**
+   * 当前工程里**主 agent**（role='agent'）正在跑的任务 id。
+   * 召唤关系拿不到时（老 hook 写的清单没有 parent 字段）用它兜底认父。
+   * @param {string} project
+   */
+  function currentMainTaskId(project) {
+    const r = repo.mainRunningTask.get(projectIdOf(project));
+    return r && r.taskId ? r.taskId : null;
   }
 
   /**
@@ -339,14 +441,66 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     };
   }
 
-  /** @param {string} memberId */
-  function buildMemberCard(memberId) {
-    const m = repo.getMember.get(memberId);
-    if (!m) return null;
-    const s = repo.getStatus.get(memberId);
-    const files = s && s.current_files ? safeJson(s.current_files, []) : [];
-    const task = s && s.task_id ? repo.getTask.get(s.task_id) : null;
-    const artifacts = repo.listArtifacts.all(memberId, 3).map((a) => ({
+  /**
+   * 卡片上的「最近产出」。
+   *
+   * 真值在 artifacts 表，但它**只有 /task/end 带了 artifacts 时才写**（endTask）；
+   * 而唯一的生产调用方 —— reporter hook 的 Stop —— 只发 `{taskId, state:'done'}`，从不带 artifacts
+   * （实测：全库 artifacts 0 行）。所以「最近产出」不是"写了没查出来"，而是**根本没有数据源**。
+   *
+   * 真值为空时用**本轮任务真实改动过的文件**兜底（file_activity 的上报行），并标 derived=true，
+   * 由渲染层标出「改动」—— 这是落库的真事实，但它是推导出来的产出，绝不当成上报真值。
+   * @param {string} memberId
+   * @param {any|null} runningTask 当前进行中的任务行（snake_case），没有就是 null
+   */
+  function recentArtifacts(memberId, runningTask) {
+    const rows = repo.listArtifacts.all(memberId, 3);
+    if (rows.length) {
+      return rows.map((a) => ({
+        id: a.id,
+        memberId: a.member_id,
+        taskId: a.task_id,
+        kind: a.kind,
+        title: a.title,
+        path: a.path,
+        tsMs: a.ts_ms,
+      }));
+    }
+    // 时间窗候选：先本轮进行中的任务（截至当下），再最近一条已结束的任务（产出已定型）
+    const windows = [];
+    if (runningTask && runningTask.state === 'running') {
+      windows.push({ taskId: runningTask.id, from: runningTask.started_at, to: now() });
+    }
+    const last = repo.latestEndedTask.get(memberId);
+    if (last) windows.push({ taskId: last.id, from: last.started_at, to: last.ended_at });
+    for (const w of windows) {
+      const files = repo.listActivityInWindow.all(memberId, w.from, w.to, 3);
+      if (!files.length) continue;
+      return files.map((f) => ({
+        id: null,
+        memberId,
+        taskId: w.taskId,
+        kind: 'file',
+        title: f.path,
+        path: f.path,
+        tsMs: f.ts_ms,
+        derived: true,
+      }));
+    }
+    return [];
+  }
+
+  /**
+   * 幽灵（召唤实例）的产出。**常驻小怪物自己没有产出时**才借它的：
+   * 真正被召唤出去干活的是 subagent-<名字> 那个实例，它的收工摘要
+   * （subagentFeed 收工时按 kind='text' 落的产出）就是这位小怪物这一轮的产出。
+   * @param {any} member 常驻成员行（ephemeral=0）
+   */
+  function ghostArtifacts(member) {
+    if (!member || member.ephemeral || !member.name) return [];
+    const ghostId = memberIdOf(member.project_id, `subagent-${member.name}`);
+    if (ghostId === member.id) return [];
+    return repo.listArtifacts.all(ghostId, 3).map((a) => ({
       id: a.id,
       memberId: a.member_id,
       taskId: a.task_id,
@@ -355,6 +509,30 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       path: a.path,
       tsMs: a.ts_ms,
     }));
+  }
+
+  /**
+   * 幽灵散掉时产出的继承人：同名常驻小怪物（没有就 NULL，产出随幽灵一起抹掉）。
+   * @param {any} member 幽灵成员行
+   */
+  function heirOf(member) {
+    if (!member || !member.ephemeral || !member.name) return null;
+    const id = memberIdOf(member.project_id, member.name);
+    if (id === member.id) return null;
+    const host = repo.getMember.get(id);
+    return host && !host.ephemeral ? id : null;
+  }
+
+  /** @param {string} memberId */
+  function buildMemberCard(memberId) {
+    const m = repo.getMember.get(memberId);
+    if (!m) return null;
+    const s = repo.getStatus.get(memberId);
+    const files = s && s.current_files ? safeJson(s.current_files, []) : [];
+    const task = s && s.task_id ? repo.getTask.get(s.task_id) : null;
+    let artifacts = recentArtifacts(memberId, task);
+    // 常驻小怪物自己没产出 -> 借同名幽灵实例的（幽灵还活着时借用；散掉时由 removeMember 过继）
+    if (!artifacts.length) artifacts = ghostArtifacts(m);
     const cnt = repo.countMessagesFor.get(m.project_id, memberId, memberId);
 
     return {
@@ -399,7 +577,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const project = projectIdOf(p.project);
     const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
-    repo.purgeMember(member.id);
+    // 幽灵散掉：**成员行删掉，这一轮召唤的账留着**（tasks / artifacts，见 repo.purgeMember）。
+    // 产出发给谁都不改写 —— 有小工位的由那张卡借去显示（见 ghostArtifacts），
+    // 没工位的（code-explorer 这类）产出在库里照样查得到，台账 subagent_runs 也还指着它。
+    repo.purgeMember(member.id, { keepHistory: Boolean(member.ephemeral) });
     levels.delete(member.id);
     hub.broadcast(project, WS_EVENTS.MEMBER_REMOVE, { memberId: member.id });
     return { ok: true };
@@ -515,6 +696,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     registerMember,
     tagMemberClient,
     removeMember,
+    currentMainTaskId,
+    startSubagentRun,
+    endSubagentRun,
     heartbeat,
     setStatus,
     startTask,

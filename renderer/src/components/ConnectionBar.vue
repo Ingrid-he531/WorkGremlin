@@ -3,10 +3,10 @@ import { computed } from 'vue';
 
 const props = defineProps({
   connection: { type: Object, required: true },
-  /** 当前工程名；仅作展示，工程切换改由右侧"活跃会话"下拉负责，不再提供选择入口 */
-  project: { type: String, default: '' },
   /** 相位来源：'reported'（agent 上报真值）/ 'inferred'（服务端推断）/ 'demo'（演示脚本）/ ''（无会话） */
   source: { type: String, default: '' },
+  /** 嵌进宿主条里（办公室左下角说明条）：不再自带底板与边框，跟着宿主走 */
+  bare: { type: Boolean, default: false },
 });
 
 /** 相位来源文案（演示脚本不是"真值"也不是"推断"，单列一项） */
@@ -31,10 +31,10 @@ const dotClass = computed(() => props.connection.state);
 </script>
 
 <template>
-  <!-- 连接 / 项目 / 相位来源：三样并排一组，常驻办公室场景左上角（见 IsoOfficeView 的 .status-hud） -->
-  <div class="bar">
+  <!-- 连接 / 相位来源：常驻办公室场景**左下角**说明条（见 IsoOfficeView 的 .tip）。
+       项目名不在这里 —— 它跟着楼层屏走，见 ElevatorDoors 门楣最左边。 -->
+  <div class="bar" :class="{ bare }">
     <span class="conn" :class="dotClass"><i />{{ text }}</span>
-    <span v-if="project" class="dim proj">项目：{{ project }}</span>
 
     <!-- 选中会话时给常驻的「相位来源」标识；没选会话时退回解释性图例 -->
     <span v-if="source" class="src">
@@ -57,7 +57,8 @@ const dotClass = computed(() => props.connection.state);
 </template>
 
 <style scoped>
-/* 浮在办公室场景左上角的小徽标：跟 .hud 一套观感（半透明 + 圆角 + 细边） */
+/* 连接 / 相位来源一组。默认自带底板（跟 .hud 一套观感：半透明 + 圆角 + 细边）；
+   嵌进左下角说明条时宿主已经有底板了，用 .bare 摘掉自己这份（见 IsoOfficeView 的 .tip） */
 .bar {
   display: inline-flex;
   align-items: center;
@@ -70,6 +71,13 @@ const dotClass = computed(() => props.connection.state);
   line-height: 1.4;
   white-space: nowrap;
   backdrop-filter: blur(2px);
+}
+
+.bar.bare {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  backdrop-filter: none;
 }
 
 .conn {
@@ -88,8 +96,6 @@ const dotClass = computed(() => props.connection.state);
 .conn.open i { background: var(--state-online); }
 .conn.connecting i { background: var(--state-busy); }
 .conn.closed i { background: var(--state-blocked); }
-
-.proj { font: inherit; }
 
 .legend { display: inline-flex; align-items: center; gap: 6px; }
 

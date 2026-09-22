@@ -264,6 +264,73 @@ function createRepo(db) {
     `),
     listArtifacts: db.prepare(`SELECT * FROM artifacts WHERE member_id = ? ORDER BY ts_ms DESC LIMIT ?`),
 
+    /** 最近一条已结束的任务：给「本轮改动文件」当时间窗边界（started_at..ended_at） */
+    latestEndedTask: db.prepare(`
+      SELECT * FROM tasks WHERE member_id = ? AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1
+    `),
+    /* ---- 台账（报表用）：一轮用户任务 + 它召唤出去的 subagent 实例 ---- */
+    upsertTaskRun: db.prepare(`
+      INSERT INTO task_runs (id, project_id, member_id, client, model, title, started_at)
+      VALUES (@id, @projectId, @memberId, @client, @model, @title, @startedAt)
+      ON CONFLICT(id) DO UPDATE SET
+        client     = COALESCE(excluded.client, task_runs.client),
+        model      = COALESCE(excluded.model, task_runs.model),
+        title      = COALESCE(excluded.title, task_runs.title),
+        started_at = COALESCE(task_runs.started_at, excluded.started_at)
+    `),
+    endTaskRun: db.prepare(`
+      UPDATE task_runs SET
+        model       = COALESCE(@model, model),
+        result      = COALESCE(@result, result),
+        file_count  = COALESCE(@fileCount, file_count),
+        files_json  = COALESCE(@filesJson, files_json),
+        ended_at    = COALESCE(@endedAt, ended_at),
+        duration_ms = COALESCE(@durationMs, duration_ms)
+      WHERE id = @id
+    `),
+    listTaskRuns: db.prepare(`
+      SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?
+    `),
+    getTaskRun: db.prepare(`SELECT * FROM task_runs WHERE id = ?`),
+    insertSubagentRun: db.prepare(`
+      INSERT INTO subagent_runs
+        (project_id, parent_task_id, task_id, member_id, name, client, model, title, started_at)
+      VALUES
+        (@projectId, @parentTaskId, @taskId, @memberId, @name, @client, @model, @title, @startedAt)
+    `),
+    endSubagentRun: db.prepare(`
+      UPDATE subagent_runs SET
+        model    = COALESCE(@model, model),
+        result   = COALESCE(@result, result),
+        ended_at = COALESCE(@endedAt, ended_at),
+        duration_ms = CASE
+          WHEN @endedAt IS NOT NULL AND started_at IS NOT NULL THEN @endedAt - started_at
+          ELSE duration_ms
+        END
+      WHERE id = @id
+    `),
+    listSubagentRuns: db.prepare(`
+      SELECT * FROM subagent_runs WHERE parent_task_id = ? ORDER BY started_at, id
+    `),
+    /**
+     * 当前工程里**主 agent**（role='agent'，hook 上报的那位）正在跑的任务。
+     * 召唤关系拿不到时（老 hook 写的清单没有 parent 字段）用它兜底认父：
+     * 幽灵是主 agent 派出去的，它活着的时候主 agent 必然在跑某个用户任务。
+     */
+    mainRunningTask: db.prepare(`
+      SELECT s.task_id AS taskId
+      FROM agent_status s JOIN members m ON m.id = s.member_id
+      WHERE m.project_id = ? AND m.role = 'agent' AND s.task_id IS NOT NULL
+      ORDER BY COALESCE(s.last_heartbeat_at, s.updated_at) DESC
+      LIMIT 1
+    `),
+    /** 时间窗内该成员改动过的文件：按路径去重（同一文件反复改只算一个产出），取最近一次的时间 */
+    listActivityInWindow: db.prepare(`
+      SELECT path, MAX(ts_ms) AS ts_ms FROM file_activity
+      WHERE member_id = ? AND ts_ms >= ? AND ts_ms <= ?
+      GROUP BY path ORDER BY ts_ms DESC LIMIT ?
+    `),
+
     insertEvent: db.prepare(`INSERT INTO events (project_id, ts_ms, kind, payload_json) VALUES (?, ?, ?, ?)`),
   };
 
@@ -344,20 +411,35 @@ function createRepo(db) {
   }
 
   /**
-   * 删掉一个成员及其所有附属行 —— 临时成员（幽灵）消失时用。
-   * messages 不删：它是"发生过什么"的历史，不是成员的属性。
+   * 删掉一个成员及其附属行 —— 临时成员（幽灵）消失时用。
+   *
+   * 两类"发生过什么"的历史不删：
+   *   · messages —— 一直如此；
+   *   · **幽灵的 tasks / artifacts**（keepHistory）—— 一次召唤的"干了什么 / 产出是什么 /
+   *     花了多久"全在这两行里，而 tasks.member_id 与 artifacts.member_id 都没有外键约束，
+   *     成员行删了它们照样站得住。
+   *     以前连它们一起删，于是：有小怪物的（susan）产出随幽灵蒸发；没小怪物的
+   *     （code-explorer / 内置专家直接 spawn 的实例）更是**查都没处查** ——
+   *     「这次用户任务用了几个 subagent」这条线就断在这儿。
+   *     产出留在产出者名下（不再过户），"谁干的"不被改写；小怪物卡片靠
+   *     bus.ghostArtifacts 借同名幽灵的产出来显示。
+   *
    * @param {string} memberId
+   * @param {{ keepHistory?: boolean }} [opts]
    */
-  function purgeMember(memberId) {
-    const tx = db.transaction((id) => {
+  function purgeMember(memberId, opts = {}) {
+    const keepHistory = Boolean(opts.keepHistory);
+    const tx = db.transaction((id, keep) => {
       db.prepare('DELETE FROM file_activity WHERE member_id = ?').run(id);
-      db.prepare('DELETE FROM artifacts WHERE member_id = ?').run(id);
+      if (!keep) {
+        db.prepare('DELETE FROM artifacts WHERE member_id = ?').run(id);
+        db.prepare('DELETE FROM tasks WHERE member_id = ?').run(id);
+      }
       db.prepare('DELETE FROM agent_status_history WHERE member_id = ?').run(id);
       db.prepare('DELETE FROM agent_status WHERE member_id = ?').run(id);
-      db.prepare('DELETE FROM tasks WHERE member_id = ?').run(id);
       db.prepare('DELETE FROM members WHERE id = ?').run(id);
     });
-    tx(memberId);
+    tx(memberId, keepHistory);
   }
 
   return { ...stmt, listMessages, purgeProject, purgeMember, raw: db };

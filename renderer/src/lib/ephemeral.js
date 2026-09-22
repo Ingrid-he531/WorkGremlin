@@ -14,7 +14,14 @@
  *   3. role === 'ghost'
  */
 
-const EPHEMERAL_PREFIXES = Object.freeze(['ghost-', 'ghost_', 'tmp-', 'temp-']);
+const EPHEMERAL_PREFIXES = Object.freeze([
+  'subagent-',
+  'subagent_',
+  'ghost-',
+  'ghost_',
+  'tmp-',
+  'temp-',
+]);
 
 /**
  * 是否为临时成员（无工位、飘在空中）。

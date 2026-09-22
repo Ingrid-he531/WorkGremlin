@@ -100,6 +100,12 @@ function readFeed(file) {
       task: typeof a.task === 'string' ? a.task.trim().slice(0, 200) : '',
       // result：一句结果摘要。写了它 = 这次召唤收工（见文件头）
       result: typeof a.result === 'string' ? a.result.trim().slice(0, 200) : '',
+      // parent：**召唤它的那轮用户任务 id**（task_runs.id / 主 agent 的 tasks.id）。
+      // 台账靠它回答"这一轮用了几个 subagent"；老 hook 写的清单没有这个字段，
+      // 由下方 bus.currentMainTaskId(project) 兜底认父。
+      parent: typeof a.parent === 'string' ? a.parent.trim().slice(0, 64) : '',
+      // 模型：hook 召唤时带上的（拿不到就 NULL，绝不编造）
+      model: typeof a.model === 'string' ? a.model.trim().slice(0, 64) : '',
       progress: Number.isFinite(Number(a.progress)) ? Number(a.progress) : null,
       files: Array.isArray(a.files) ? a.files.slice(0, 10).map(String) : [],
       project: typeof a.project === 'string' && a.project.trim() ? a.project.trim() : '',
@@ -194,6 +200,8 @@ function createSubagentFeed(opts) {
 
       // 任务：标题变了就换一个（旧的收尾），没变只推进度
       const known = tasks.get(fullId);
+      // 召唤它的那轮用户任务：清单里写了就用写的，没写（老 hook）就认主 agent 当前在跑的那个
+      const parentTaskId = a.parent || bus.currentMainTaskId(project);
       if (a.result) {
         // 收工：结果摘要作为产出下发（渲染层拿它当汇报文案），任务按 done 收尾；
         // 幽灵留着，等汇报演完再摘（下方 retiring 到点处理）。
@@ -210,19 +218,61 @@ function createSubagentFeed(opts) {
           } catch (err) {
             console.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
           }
+          bus.endSubagentRun({ id: known.runId, result: a.result, model: a.model });
           tasks.delete(fullId);
+        } else {
+          // 从没开过任务行（召唤时没写任务文案）也照样记一笔：
+          // 名字 + 产出有了，开始时刻只能承认不知道（startedAt=null → 耗时 NULL）。
+          const runId = bus.startSubagentRun({
+            project,
+            memberId: fullId,
+            name: a.name,
+            client: a.client,
+            model: a.model,
+            title: '',
+            parentTaskId,
+            taskId: null,
+            startedAt: null,
+          });
+          bus.endSubagentRun({ id: runId, result: a.result, model: a.model });
         }
         if (!retiring.has(a.name)) retiring.set(a.name, { result: a.result, at: Date.now() + RETIRE_MS });
       } else if (a.task) {
         if (!known || known.title !== a.task) {
-          if (known) bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
-          const r = bus.startTask({ project, memberId, title: a.task, progress: a.progress ?? 0, files: a.files });
-          if (r && r.taskId) tasks.set(fullId, { id: r.taskId, title: a.task });
+          if (known) {
+            bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
+            bus.endSubagentRun({ id: known.runId, model: a.model });
+          }
+          const r = bus.startTask({
+            project,
+            memberId,
+            title: a.task,
+            progress: a.progress ?? 0,
+            files: a.files,
+            parentTaskId,
+          });
+          if (r && r.taskId) {
+            // 台账：一次召唤一行 —— 类型（name）/ 任务 / 父任务，收工时补产出与耗时
+            const runId = bus.startSubagentRun({
+              project,
+              memberId: fullId,
+              name: a.name,
+              client: a.client,
+              model: a.model,
+              title: a.task,
+              parentTaskId,
+              taskId: r.taskId,
+              startedAt: Date.now(),
+            });
+            tasks.set(fullId, { id: r.taskId, title: a.task, runId });
+          }
         } else if (a.progress !== null) {
           bus.taskProgress({ project, memberId, taskId: known.id, progress: a.progress, files: a.files });
         }
       } else if (known) {
         bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
+        // 没写 result 的收尾：产出留 NULL（不编造），但结束时间与耗时照记
+        bus.endSubagentRun({ id: known.runId, model: a.model });
         tasks.delete(fullId);
       }
 
@@ -263,7 +313,13 @@ function createSubagentFeed(opts) {
       if (alive.has(m.id)) continue;
       // 若这是某个已定义 subagent 的幽灵，先把对应小怪物工位复位为在线
       if (roster && m.name && roster.isDefined(m.name)) roster.markIdle(m.name);
-      tasks.delete(m.id);
+      // 台账：这一只就这么没了（清单里直接被摘掉、没写过 result）——
+      // 产出留 NULL，但结束时间与耗时得记上，否则报表里永远挂着一笔"还在跑"的账。
+      const open = tasks.get(m.id);
+      if (open) {
+        bus.endSubagentRun({ id: open.runId });
+        tasks.delete(m.id);
+      }
       bus.removeMember({ project, memberId: m.id });
     }
 

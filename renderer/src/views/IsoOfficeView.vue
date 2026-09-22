@@ -18,9 +18,9 @@ import { createIsoOffice } from '../iso/engine';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
-  /** 左上角状态徽标用的三项：连接 / 项目名 / 相位来源（由 App.vue 统一算好传下来） */
+  /** 连接状态与相位来源（由 App.vue 统一算好传下来），显示在左下角说明条里。
+      项目名不归这里管 —— 它挂在门楣最左边，见 ElevatorDoors 的 projectLabel */
   connection: { type: Object, default: () => ({ state: '' }) },
-  projectLabel: { type: String, default: '' },
   source: { type: String, default: '' },
 });
 const emit = defineEmits(['select']);
@@ -94,6 +94,45 @@ const TIP_DELAY = 400;
 const tip = ref({ show: false, x: 0, y: 0 });
 let tipTimer = null;
 
+/* ------------------------------ 小怪物 tooltip ------------------------------
+ * 鼠标停在小怪物（或它头顶的幽灵）上 400ms 才弹：写**它在做的任务**，
+ * 以及最近一次完成的结果 —— 幽灵头顶只留名字，任务与结果都在这里讲。
+ */
+const mtip = ref({ show: false, x: 0, y: 0, id: '' });
+let mtipTimer = null;
+
+function clearMTip() {
+  if (mtipTimer) {
+    clearTimeout(mtipTimer);
+    mtipTimer = null;
+  }
+  mtip.value.show = false;
+  mtip.value.id = '';
+}
+
+const mtipMember = computed(() =>
+  mtip.value.id ? project.members.find((m) => m.memberId === mtip.value.id) : null
+);
+/**
+ * 任务文案：临时成员（幽灵）是字符串，工位小怪物是 { title }。
+ *
+ * 被召唤期间任务只写在**幽灵**身上（服务端把任务派给 subagent-xxx，工位那只 resident
+ * 自己没有 task）。所以这里回落到同名幽灵：鼠标停在**小怪物**身上就能看到它正替主 agent
+ * 干什么。幽灵本身仍然不给 tooltip（见引擎 memberAt），它头顶只留名字。
+ */
+const mtipTask = computed(() => {
+  const m = mtipMember.value;
+  if (!m) return '';
+  const own = m.task;
+  if (own) return typeof own === 'string' ? own : String(own.title || '');
+  // 回落到本次召唤派下来的那只同名幽灵
+  const g = project.members.find((x) => isEphemeralMember(x) && x.name === m.name && x.task);
+  if (!g) return '';
+  return typeof g.task === 'string' ? g.task : String(g.task.title || '');
+});
+/** 最近一次完成的结果（汇报演完时引擎记下的那笔） */
+const mtipResult = computed(() => (mtip.value.id && office ? office.lastResult(mtip.value.id) : null));
+
 function clearTip() {
   if (tipTimer) {
     clearTimeout(tipTimer);
@@ -107,11 +146,23 @@ function onConsoleMove(e) {
   // 按住拖拽时不弹（那是平移视角，不是看信息）
   if (e.buttons) {
     clearTip();
+    clearMTip();
     return;
   }
   const r = canvasRef.value.getBoundingClientRect();
   const px = e.clientX - r.left;
   const py = e.clientY - r.top;
+  // 先看有没有停在某个成员身上：有就弹"它"的 tooltip，主控制台那份让位
+  const hit = office.memberAt(px, py);
+  if (hit) {
+    clearTip();
+    mtip.value.id = hit;
+    mtip.value.x = e.clientX;
+    mtip.value.y = e.clientY;
+    if (!mtipTimer) mtipTimer = setTimeout(() => { mtip.value.show = true; }, TIP_DELAY);
+    return;
+  }
+  clearMTip();
   if (office.hitMainConsole(px, py)) {
     tip.value.x = e.clientX;
     tip.value.y = e.clientY;
@@ -123,6 +174,7 @@ function onConsoleMove(e) {
 
 function onConsoleLeave() {
   clearTip();
+  clearMTip();
 }
 
 /** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
@@ -282,8 +334,9 @@ watch(
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
       seenFastDone = fastDoneAt > 0; // 切会话时重新以这条会话的标记为基线
-      // 空楼层（一条会话都没有）：控制台待命 + 屋里清人（见 sceneMembers），
-      // 不走 applySession(null) —— 那是"会话收工"，会弹「任务完成」，跟这层没关系。
+      // 空楼层（一条会话都没有）：控制台待命；屋里只留常驻小怪物、清掉幽灵
+      // （见 sceneMembers），但**不走 applySession(null)** —— 那是"会话收工"，
+      // 会弹「任务完成」，跟这层没关系。
       if (!sel && sessions.floorEmpty) {
         mainAgent.enterIdle(['本层暂无活跃会话']);
         return;
@@ -305,12 +358,25 @@ watch(
       lastDoneAt = doneAt;
       // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
       // tooltip 里 {{ c }} 渲染对象就成了 JSON 串；这里先给一句总述，再一行一个文件。
-      const files = (sel && sel.doneFiles) || [];
+      //
+      // 改动清单两条来源（谁先到用谁）：
+      //   ① 会话快照的 doneFiles（插件落盘，带 +/- 行数）—— 但它 10s 才刷一次，
+      //      而 doneAt 是 1.5s 快轮询先看到的，所以**多数时候这一份还是空的**，
+      //      这就是"任务完成只剩一句话"的根因；
+      //   ② hook 自己记的"本轮用工具动过的文件"（done.files，跟着完成标记一起落盘，
+      //      快轮询当下就有；不依赖插件落盘，Codex / Claude 那几层也有）。
+      const snapFiles = (sel && sel.doneFiles) || [];
+      const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({ name: String(p) }));
+      const files = snapFiles.length ? snapFiles : hookFiles;
       // 本轮任务改动的文件数（服务端已按"本轮开始之后"过滤）；拿不到就用列表长度兜底
-      const count = (sel && Number(sel.doneCount)) || files.length;
+      const count = (sel && Number(sel.doneCount)) || (fpDone && Number(fpDone.fileCount)) || files.length;
       const said = (fpDone && fpDone.said) || '';
+      // hook 那份只有路径、没有行数（不做 diff），+/- 只在快照那份里才有
       const ctx = files.length
-        ? [`改动 ${count} 个文件`, ...files.map((f) => `${f.name}  +${f.added}/-${f.removed}`)]
+        ? [
+            `改动 ${count} 个文件`,
+            ...files.map((f) => (f.added == null ? String(f.name) : `${f.name}  +${f.added}/-${f.removed}`)),
+          ]
         : [said || '本次任务已完成'];
       mainAgent.enterDone('任务完成', ctx);
       return;
@@ -346,14 +412,20 @@ const sceneMembers = computed(() => {
   // 演示里 8 只小怪物会整片转灰 + 标"推断"，楼层恰好没有活跃会话时（floorEmpty）
   // 屋里还会一个人都不剩 —— 那就不叫演示了。
   const demo = project.demo;
-  // 切到没有活跃会话的楼层：屋里一个人都不留。
-  // 否则 project.members 还是上一个工程的人（小怪物站在工位上、卡片也是那批），
-  // 看着就像楼层没切 —— 那层压根没人在干活。
-  if (sessions.floorEmpty && !demo) return [];
+  /**
+   * 空楼层（这层一条活跃会话都没有）的取舍 —— 分两类：
+   *   · 幽灵（`subagent-<name>`）不留：它是会话级的临时成员，"这轮召唤"的产物，
+   *     没有会话就不该存在（留着就是上一层的残影）。
+   *   · **常驻小怪物要留**：用户级 / 工程级小怪物是写在 agents 目录里已定义的 subagent，
+   *     由服务端 agentRoster 注册并持续心跳，"即使当下没被召唤也在" —— 跟这层有没有会话无关。
+   *     切过去看不见他们会让人以为这层压根没人（3F 没会话时用户级/工程级专家应照常在工位）。
+   */
+  const emptyFloor = sessions.floorEmpty && !demo;
   const want = demo ? '' : sessions.selectedClient;
   const live = demo || sessions.live;
   return project.members
     .filter((m) => m.role !== 'agent')
+    .filter((m) => !(emptyFloor && isEphemeralMember(m))) // 空楼层：只留常驻的
     // 按楼层过滤来源：4F 只看 Codex 的成员与幽灵，1F/3F 只看 CodeBuddy 的。
     // client 为空的（演示数据、手工 scripts/subagents.js 写的、老库还没补上的）视作通用，哪层都显示。
     .filter((m) => !want || !m.client || m.client === want)
@@ -519,14 +591,6 @@ onBeforeUnmount(() => {
       @mouseleave="onConsoleLeave"
     />
 
-    <!-- 左上角状态徽标：连接 / 项目 / 相位来源（原来在顶栏，现在跟着办公室走） -->
-    <ConnectionBar
-      class="status-hud"
-      :connection="connection"
-      :project="projectLabel"
-      :source="source"
-    />
-
     <!-- 主 Agent 控制台 tooltip：鼠标停在悬浮屏上 400ms 后弹出 -->
     <div
       v-if="tip.show"
@@ -551,6 +615,25 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
       <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
+    </div>
+
+    <!-- 小怪物 tooltip：当前任务 + 最近一次完成的结果 -->
+    <div
+      v-if="mtip.show && mtipMember"
+      class="console-tip member-tip"
+      :style="{ left: `${mtip.x}px`, top: `${mtip.y}px` }"
+    >
+      <div class="ct-head">
+        <span class="ct-phase">{{ mtipMember.name }}</span>
+      </div>
+      <div class="ct-row">
+        <b>任务</b>
+        <span class="ct-val">{{ mtipTask || '空闲 / 无进行中任务' }}</span>
+      </div>
+      <div v-if="mtipResult && (mtipResult.result || mtipResult.task)" class="ct-row">
+        <b>上次结果</b>
+        <span class="ct-val">{{ mtipResult.result || `已完成：${mtipResult.task}` }}</span>
+      </div>
     </div>
 
     <!-- 任务卡（跟着角色走） -->
@@ -582,7 +665,11 @@ onBeforeUnmount(() => {
       <button @click="resetView">复位视角</button>
     </div>
 
+    <!-- 左下角说明条：连接状态 + 相位来源（原来在左上角那枚小徽标里）与操作说明**并列**一条。
+         项目名不在这里 —— 它挪到了门楣（楼层液晶屏那块板）的最左边，见 ElevatorDoors。 -->
     <div class="tip">
+      <ConnectionBar bare class="status-hud" :connection="connection" :source="source" />
+      <span class="sep" />
       拖拽平移 · 滚轮缩放 · 双击复位
       <span class="legend"><i class="dot green" />项目专家</span>
       <span class="legend"><i class="dot blue" />用户专家</span>
@@ -623,12 +710,9 @@ onBeforeUnmount(() => {
   width: 100%;
 }
 
-/* 左上角状态徽标：不吃鼠标事件，免得挡住场景拖拽 */
+/* 连接 / 相位来源：已并入左下角说明条（.tip 里），不吃鼠标事件，免得挡住场景拖拽 */
 .status-hud {
-  position: absolute;
-  left: 10px;
-  top: 10px;
-  z-index: 4;
+  flex: none;
   pointer-events: none;
 }
 
@@ -679,10 +763,15 @@ onBeforeUnmount(() => {
   background: var(--border-strong);
 }
 
+/* 左下角说明条：连接 / 相位来源 / 操作说明 / 专家级别图例 —— 一行并列 */
 .tip {
   position: absolute;
   left: 10px;
   bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
   padding: 5px 10px;
   border-radius: 6px;
   background: rgba(12, 15, 20, 0.7);

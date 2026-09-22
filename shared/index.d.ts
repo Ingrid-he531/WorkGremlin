@@ -48,6 +48,8 @@ export interface Artifact {
   title: string;
   path: string | null;
   tsMs: number;
+  /** true = 由「本轮改动文件」推导出来的产出（artifacts 表无真值时的兜底），非上报真值 */
+  derived?: boolean;
 }
 
 /** 工位视图直接绑定的数据结构 */

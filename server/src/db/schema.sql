@@ -142,6 +142,52 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_member_ts ON artifacts(member_id, ts_ms DESC);
 
+-- 一轮**用户任务**的台账（报表主表）。
+-- 主键就是 tasks.id（主 agent 那一轮的任务），不另起一套 id —— 用户任务的起止、
+-- 输入（用户原话）、产出都在 tasks / artifacts 里，这里只补"报表要算"的那几列。
+-- 没有真值就留 NULL（token 尤其如此）：本环境 hook 不报 usage、插件也没落盘，绝不编造。
+CREATE TABLE IF NOT EXISTS task_runs (
+  id                  TEXT PRIMARY KEY,   -- = tasks.id
+  project_id          TEXT NOT NULL,
+  member_id           TEXT NOT NULL,      -- 主 agent：codebuddy@<工程> / codex@<工程>
+  client              TEXT,               -- codebuddy / workbuddy / codex / claude
+  model               TEXT,               -- 使用的模型（hook 上报；NULL = 没报）
+  title               TEXT,               -- 输入：用户原话
+  result              TEXT,               -- 产出：收尾自述 / 完成摘要
+  file_count          INTEGER,            -- 本轮改动文件数（NULL = 不知道）
+  files_json          TEXT,               -- 本轮改动文件清单（JSON array，最多 8 条）
+  input_tokens        INTEGER,
+  output_tokens       INTEGER,
+  cache_read_tokens   INTEGER,
+  cache_write_tokens  INTEGER,
+  started_at          INTEGER,
+  ended_at            INTEGER,
+  duration_ms         INTEGER             -- 花费时间 = ended_at - started_at
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_project_started ON task_runs(project_id, started_at DESC);
+
+-- 这一轮**召唤出去的 subagent 实例**（幽灵）各一行。
+-- 幽灵散掉（purgeMember）也不删：它是"这轮用了几个 subagent"的唯一账本 ——
+-- 有小工位的（susan）也好、内置专家直接 spawn 的没工位的实例（code-explorer）也好，都记。
+CREATE TABLE IF NOT EXISTS subagent_runs (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id     TEXT NOT NULL,
+  parent_task_id TEXT,                    -- 召唤它的那轮用户任务 = task_runs.id
+  task_id        TEXT,                    -- 幽灵自己的 tasks.id（拿它的产出 artifacts 用）
+  member_id      TEXT NOT NULL,           -- subagent-<名字>@<工程>
+  name           TEXT NOT NULL,           -- 类型：susan / simmon / code-explorer / general-purpose…
+  client         TEXT,
+  model          TEXT,
+  title          TEXT,                    -- 它这一单的任务
+  result         TEXT,                    -- 收工摘要（产出）
+  started_at     INTEGER,
+  ended_at       INTEGER,
+  duration_ms    INTEGER,                 -- 花费时间
+  input_tokens   INTEGER,
+  output_tokens  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent ON subagent_runs(parent_task_id, started_at);
+
 CREATE TABLE IF NOT EXISTS events (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id TEXT,

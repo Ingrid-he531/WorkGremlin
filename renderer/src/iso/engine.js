@@ -103,6 +103,30 @@ const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 /** 标识位图缓存：同一文本只渲染一次（标签现在会被放进排序层重画，不能每帧新建 canvas） */
 const WALL_TEXT_CACHE = new Map();
 
+/* ------------------------------ 跨实例持久化的召唤/汇报状态 ------------------------------
+ * 办公室视图（IsoOfficeView）是路由级组件：切到"工位卡片"/"对话记录"再切回时会被
+ * unmount/remount，createIsoOffice 会新建实例。如果下面这几组状态留在实例内部，
+ * 切回后会认为"这只幽灵从来没召唤过"，于是已经派出去干活的小怪物会再次跑到主 agent
+ * 面前重播一遍"领任务"的对话。
+ *
+ * 这些状态按幽灵 memberId 记录、并在幽灵从名单里消失时主动清空，所以不会无限增长，
+ * 也不会让下一次全新的召唤被误判为"已经演过"。
+ */
+/** 已注册为"被召唤"的幽灵 memberId */
+const summonedGhostIds = new Set();
+/** 已经演过"跑到主 agent 面前领任务"的幽灵 memberId：一次召唤只演一次 */
+const dispatchedGhostIds = new Set();
+/** 编排期间先隐藏的幽灵 memberId */
+const pendingGhostIds = new Set();
+/** 待显幽灵"至少看过一次"（用于等待任务名的兜底） */
+const pendingSeenOnce = new Set();
+/** 幽灵 memberId -> { agentId, name, color, task, result }：幽灵散了也能把汇报演完 */
+const ghostMeta = new Map();
+/** 同一轮召唤只汇报一次 */
+const reportedGhostIds = new Set();
+/** 小怪物最近一次完成的结果：agent memberId -> { task, result, at }（tooltip / 工位卡片回看） */
+const lastResults = new Map();
+
 /**
  * 把"圆角牌底 + 文字"渲染到离屏画布（水平、高清），供斜贴到墙面。
  * 牌底+文字一起进同一张位图，斜贴后整块都随墙面平行四边形变形，像真挂在墙上。
@@ -173,12 +197,6 @@ export function createIsoOffice(canvas, opts = {}) {
   let dispatchGhost = null;
   /** 召唤队列：收到召唤 -> 排队走"跑到主 agent 面前领任务"的编排 */
   const summonQueue = [];
-  /** 已入过队的召唤幽灵 memberId：避免重复触发 */
-  const summonedGhostIds = new Set();
-  /** 编排期间先隐藏的召唤幽灵 memberId：等小怪物回到工位再出现在头顶 */
-  const pendingGhostIds = new Set();
-  /** 待显幽灵"至少看过一次"（用于等待任务名的兜底，避免任务名一直不来时幽灵不出现） */
-  const pendingSeenOnce = new Set();
   /** 坐工位小怪物名字 -> { seat, agentId }：把"被召唤的幽灵"对到它的小怪物 */
   let seatByName = {};
   /** 汇报编排：subagent 收工 -> 走到主 agent 面前说出结果摘要 -> 回工位，幽灵随后散掉 */
@@ -187,10 +205,6 @@ export function createIsoOffice(canvas, opts = {}) {
   const reportQueue = [];
   /** 汇报期间补画的幽灵：幽灵已从名单里消失、但汇报还没演完时用 */
   let reportGhost = null;
-  /** ghostId -> { agentId, name, color, task, result }：幽灵没了也知道是谁、干了什么 */
-  const ghostMeta = new Map();
-  /** 同一轮召唤只汇报一次（写了 result 汇报过，随后幽灵被回收时不再报第二次） */
-  const reportedGhostIds = new Set();
   /** 正被召唤（幽灵还飘着）的小怪物 agentId：这段时间钉在工位上，不许起身溜达 */
   const summonedAgentIds = new Set();
 
@@ -400,6 +414,15 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function finishReport() {
     if (!report) return;
+    // 记一笔"这只小怪物最近一次干完什么"：汇报演完就算交付，之后 tooltip / 工位卡片
+    // 还能回看（幽灵这时已经散了，结果只存在这里）。
+    if (report.agentId) {
+      lastResults.set(report.agentId, {
+        task: String(report.task || ''),
+        result: String(report.result || ''),
+        at: Date.now(),
+      });
+    }
     if (reportGhost && reportGhost.id === report.ghostId) reportGhost = null;
     report = null;
     pumpReport();
@@ -408,13 +431,21 @@ export function createIsoOffice(canvas, opts = {}) {
   /** 这只小怪物此刻是否正被召唤（清单里有它的实例幽灵） */
   const isSummoned = (agentId) => summonedAgentIds.has(agentId);
 
-  /** 主 agent 进入 dispatch 相位（mock / 真实）时，也让对应小怪物走同一套编排 */
-  function syncDispatch() {
+  /**
+   * 主 agent 进入 dispatch 相位（mock / 真实）时，也让对应小怪物走同一套编排。
+   *
+   * **只在"刚进入" dispatch 时演一次**：相位是 1.5s 轮询喂进来的，同一个 dispatch
+   * 相位会被反复送来（target 还不变），不判"刚进来"就会每来一次重排一次队 ——
+   * 表现就是点一下工位卡片（触发一次状态回流）又把同一段对话演一遍。
+   * @param {{phase?:string, target?:any}|null} prev 上一次的相位（null = 首次）
+   */
+  function syncDispatch(prev) {
     // 真召唤不在这里触发：幽灵出现的那一刻（setMembers）就已经把任务交代过一次了，
     // 之后权限放行 / 相位回放再演一遍，就成了"同一个任务被交代两次"。
     if (mainAgent.phase === 'dispatch' && mainAgent.target) {
       const a = agentByTarget(mainAgent.target);
-      if (a && !isSummoned(a.memberId)) enqueueDispatch(a.memberId, delegationLine());
+      const sameAsPrev = prev && prev.phase === 'dispatch' && String(prev.target) === String(mainAgent.target);
+      if (a && !sameAsPrev && !isSummoned(a.memberId)) enqueueDispatch(a.memberId, delegationLine());
     }
     pumpDispatch();
   }
@@ -515,6 +546,8 @@ export function createIsoOffice(canvas, opts = {}) {
     // 幽灵已消失 -> 从待显 / 已触发集合里清掉，这样下次召唤能重新触发
     for (const id of [...pendingGhostIds]) if (!gIds.has(id)) pendingGhostIds.delete(id);
     for (const id of [...summonedGhostIds]) if (!gIds.has(id)) summonedGhostIds.delete(id);
+    // 幽灵散了 -> 这只实例演过的账也销掉：下次召唤是新实例，编排可以再演一次
+    for (const id of [...dispatchedGhostIds]) if (!gIds.has(id)) dispatchedGhostIds.delete(id);
     for (const id of [...pendingSeenOnce]) if (!gIds.has(id)) pendingSeenOnce.delete(id);
 
     // 召唤幽灵从名单里消失 = 这次召唤结束。之前没汇报过（清单里没写 result 就被 rm）
@@ -549,9 +582,14 @@ export function createIsoOffice(canvas, opts = {}) {
         // 幽灵先注册、任务名随后才写进成员卡：等任务到位再入队，免得显示成"新任务"。
         const queued = summonQueue.find((s) => s.ghostId === m.memberId);
         const running = !!(dispatch && dispatch.ghostId === m.memberId);
-        if (!queued && !running) {
-          if (m.task) summonQueue.push({ agentId: info.agentId, task: m.task, ghostId: m.memberId });
-          else if (pendingSeenOnce.has(m.memberId)) summonQueue.push({ agentId: info.agentId, task: '执行任务', ghostId: m.memberId });
+        if (!queued && !running && !dispatchedGhostIds.has(m.memberId)) {
+          if (m.task) {
+            summonQueue.push({ agentId: info.agentId, task: m.task, ghostId: m.memberId });
+            dispatchedGhostIds.add(m.memberId);
+          } else if (pendingSeenOnce.has(m.memberId)) {
+            summonQueue.push({ agentId: info.agentId, task: '执行任务', ghostId: m.memberId });
+            dispatchedGhostIds.add(m.memberId);
+          }
         } else if (m.task) {
           if (queued) queued.task = m.task;
           else if (running) dispatch.task = m.task;
@@ -570,6 +608,14 @@ export function createIsoOffice(canvas, opts = {}) {
           result: m.result || prev.result || '',
         });
         // 写了 result = 收工：立刻去汇报（幽灵还在，等汇报演完服务端才回收它）
+        // 同时先记下结果：即使页面切走没演完汇报，tooltip / 工位卡片还能回看。
+        if (m.result && info) {
+          lastResults.set(info.agentId, {
+            task: String(m.task || ghostMeta.get(m.memberId)?.task || ''),
+            result: String(m.result),
+            at: Date.now(),
+          });
+        }
         if (m.result && !reportedGhostIds.has(m.memberId)) {
           reportedGhostIds.add(m.memberId);
           pushReport(m.memberId, ghostMeta.get(m.memberId));
@@ -770,15 +816,100 @@ export function createIsoOffice(canvas, opts = {}) {
   /* ------------------------------ 静态家具 ------------------------------ */
 
   /**
+   * 屏上"打字"用的等宽字体：一个字符占一格，才能一格一格往外蹦。
+   * 字号用**屏幕局部单位**（tile）写 —— 跟 mainConsole 的屏面文字同一套，
+   * 靠 c.transform 把它斜切贴到屏面上，缩放时自动跟着变大变小。
+   */
+  const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+  /** 敲出来的字符池：小写字母 + 数字 + 少量符号，凑近看像在敲代码 */
+  const TYPE_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789_./:-=><()[]{}#$*';
+
+  /** 确定性伪随机 0~1：每台机器内容不同，但每帧同值 —— 不许用 Math.random（会闪成迪厅） */
+  function screenRnd(a, b) {
+    const s = Math.sin(a * 12.9898 + b * 78.233) * 43758.5453;
+    return s - Math.floor(s);
+  }
+  /** 第 i 个要打出来的字符：约 1/6 是空格，凑出"词 + 空格"的一行行代码感 */
+  function screenChar(seed, i) {
+    if (screenRnd(seed, i * 1.37 + 0.11) < 0.17) return ' ';
+    const n = TYPE_CHARS.length;
+    return TYPE_CHARS[Math.floor(screenRnd(seed + 7.3, i * 2.11 + 3.7) * n) % n];
+  }
+
+  /**
+   * 屏幕上正在打的字：**一个字符一个字符往外蹦**，光标跟着走并闪烁，
+   * 写满整屏 → 停一下 → 清屏重来（无限循环）。
+   *
+   * 节奏/内容全部由 (seed, now) 决定：每台显示器各自的字和快慢不同（不同步），
+   * 但每一帧结果稳定，不会抖。字符是**真的字**（不是白点/白横），
+   * 远看是"这块屏一直在输出"，滚轮放大后能认出是字。
+   * @param {{x0:number,x1:number,z0:number,z1:number,face:number,seed:number,now:number}} o
+   */
+  function drawTyping(c, o) {
+    const { x0, x1, z0, z1, face, seed, now } = o;
+    // 内容区：上让状态点、下让进度条，右边缘再收一点避开右上角那颗灯
+    const left = x0 + 0.04;
+    const right = x1 - 0.13;
+    const top = z1 - 0.05;
+    const bot = z0 + 0.1;
+    const w = right - left;
+    const h = top - bot;
+    if (w <= 0 || h <= 0) return;
+
+    const COLS = 11;
+    const ROWS = 3;
+    const cw = w / COLS;
+    const lh = h / ROWS;
+    const fs = Math.min(lh * 0.95, cw * 1.7); // 字高让行距管着，字宽不许挤进邻格
+    const cap = COLS * ROWS;
+
+    // 节奏：打字速度 + 相位各台不同；写满后停顿 hold 秒再清屏重来
+    const cps = 9 + (seed % 5);
+    const off = ((seed >> 3) % 40) / 10;
+    const hold = 1.0;
+    const cycle = cap / cps + hold;
+    const typed = Math.min(cap, Math.floor(((now / 1000 + off) % cycle) * cps));
+
+    c.save();
+    // 切到屏面自己的局部坐标：u 沿 +gx（贴着屏面的斜向），v 向下
+    const o0 = project(left, face, top);
+    c.transform(AX.x, AX.y, -AZ.x, -AZ.y, o0.x, o0.y);
+    c.beginPath();
+    c.rect(0, 0, w, h);
+    c.clip();
+
+    c.textAlign = 'left';
+    c.textBaseline = 'top';
+    c.font = `${fs}px ${MONO}`;
+    for (let i = 0; i < typed; i += 1) {
+      const ch = screenChar(seed, i);
+      if (ch === ' ') continue;
+      const col = i % COLS;
+      const row = Math.floor(i / COLS);
+      // 刚打出来的那一行最亮，往上越沉 —— 像终端里往上滚的旧输出
+      const age = (typed - 1 - i) / COLS;
+      c.fillStyle = age < 1 ? '#f4fff8' : age < 2 ? '#d0f4de' : '#a4e6bf';
+      c.fillText(ch, col * cw, row * lh + (lh - fs) * 0.5);
+    }
+
+    // 光标：落在下一个字符将要出现的位置；写满后压在末格闪，等清屏
+    if (Math.floor(now / 500) % 2 === 0) {
+      const ci = typed < cap ? typed : cap - 1;
+      c.fillStyle = 'rgba(244,255,248,0.9)';
+      c.fillRect((ci % COLS) * cw, Math.floor(ci / COLS) * lh + lh * 0.1, cw * 0.8, lh * 0.8);
+    }
+    c.restore();
+  }
+
+  /**
    * 显示器屏幕（南桌，朝镜头那一面）。
    * on=false（没人的工位）：**待机** —— 铺暗蓝，屏面上透出一小团冷调微光，
    * 读得出"通着电、只是没内容"，跟隔壁亮着的屏幕一眼分得开（不是死黑一块掉了电）。
-   * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，上面是密密麻麻的
-   * **白色短横**（= 一屏正在滚的字）：亮白 / 柔白绿两级，行距密、每行错落顶格；
-   * 不再画黑点点（远看像脏污），字本身就是比绿底更亮的白。
+   * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，屏上是**打字动画**
+   * （字符一个个蹦出来 + 光标闪 + 写满清屏重来，见 drawTyping），不再画那些白色短横/白点。
    * 全部用 seed 做确定性伪随机，不能 Math.random，否则每帧闪成迪厅。
    */
-  function drawScreen(c, m, color, progress, seed, on) {
+  function drawScreen(c, m, color, progress, seed, on, now = 0) {
     const face = m.y + m.d;
     const z0 = m.z + 0.08;
     const z1 = m.z + m.h - 0.1;
@@ -816,23 +947,8 @@ export function createIsoOffice(canvas, opts = {}) {
     wallQuad(c, 'y', face, x0, x1, z0, z1, '#1f5c40');
     // 右上角状态点（沿用成员级别色）
     wallQuad(c, 'y', face + 0.001, x1 - 0.12, x1 - 0.07, z1 - 0.05, z1 - 0.01, color);
-    // 屏上的白字：行距拉开（不铺满），每行几段短横 —— 远看是"屏上有字"，不是一整屏雪花
-    const pitch = 0.055;
-    const rows = Math.max(3, Math.floor((z1 - z0 - 0.13) / pitch));
-    for (let k = 0; k < rows; k += 1) {
-      const zz = z1 - 0.065 - k * pitch;
-      let cx = x0 + 0.05 + ((seed >> (k * 4)) % 4) * 0.02; // 行首缩进错落
-      for (let s = 0; s < 10; s += 1) {
-        // 最短 0.036：不留"点"，最短也得像一小截单词
-        const sw = 0.036 + ((seed >> (k * 5 + s * 7)) % 5) * 0.011; // 0.036~0.080
-        // 亮白 / 柔白绿两级，都比绿底亮 —— 看着就是"屏上有字"
-        const tone = (seed >> (k * 3 + s)) % 3;
-        const col = tone === 0 ? '#f4fff8' : tone === 1 ? '#d3f6e2' : '#a9e7c4';
-        if (cx + sw > x1 - 0.05) break;
-        wallQuad(c, 'y', face, cx, cx + sw, zz, zz + 0.024, col);
-        cx += sw + 0.03 + ((seed >> (k + s * 3)) % 3) * 0.008; // 词间距拉开
-      }
-    }
+    // 屏上正在打的字：字符一个个蹦，光标闪，写满清屏重来
+    drawTyping(c, { x0, x1, z0, z1, face, seed, now });
     // 底部进度条：深绿轨（不用纯黑，免得糊成一团黑）+ 亮绿的走条
     const pz = z0 + 0.04;
     wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(6,32,20,0.5)');
@@ -1496,7 +1612,8 @@ export function createIsoOffice(canvas, opts = {}) {
               levelColor(a && a.level),
               prog,
               i * 977 + 13,
-              Boolean(a) // 没人的工位：屏幕熄灭
+              Boolean(a), // 没人的工位：屏幕熄灭
+              now // 打字动画的时间轴
             );
           } else {
             const backY = m.y + m.d + 0.001;
@@ -1557,8 +1674,11 @@ export function createIsoOffice(canvas, opts = {}) {
            * 鼠标：沿桌子前后（gy 轴屏幕方向）拉长的椭圆，颜色与键盘同系深灰蓝。
            * 位置在使用者的**右手边**：南桌（背对镜头）右手在东（键盘 +x 侧），
            * 北桌（面对镜头）右手在西（键盘 −x 侧）—— 两排不是同一个屏幕方向，不能镜像。
+           *
+           * 底影的偏移方向是 local +y 的反方向：local +y 在屏上指向上左，
+           * 所以影子要往 local −y 走，才会落到**右下角**（符合光从左上方来）。
            */
-          const mx = u.face === 'north' ? kb.x + kb.w + 0.22 : kb.x - 0.22;
+          const mx = u.face === 'north' ? kb.x + kb.w + 0.1 : kb.x - 0.1;
           const my = kb.y + kb.d / 2;
           const pM = project(mx, my, z + 0.045);
           const mAng = Math.atan2(AY.y, AY.x); // gy 轴在屏幕上的方向
@@ -1566,7 +1686,7 @@ export function createIsoOffice(canvas, opts = {}) {
           c.translate(pM.x, pM.y);
           c.rotate(mAng);
           c.beginPath();
-          c.ellipse(0, 0.9, 4.7, 2.9, 0, 0, Math.PI * 2); // 底影
+          c.ellipse(0, -0.9, 4.7, 2.9, 0, 0, Math.PI * 2); // 底影 → 右下角
           c.fillStyle = '#161c26';
           c.fill();
           c.beginPath();
@@ -2366,32 +2486,30 @@ export function createIsoOffice(canvas, opts = {}) {
     screenPos.clear();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+    // 命中盒要有宽度：原来只给了一条零宽竖线（x0 === x1 === s.x），鼠标得正好压在
+    // 身体中线上才算命中 —— 实际等于"身体点不到"。被召唤期间幽灵还飘在小怪物头顶，
+    // 于是看起来"幽灵和它对应的小怪物都没有 tooltip"。给身体一个真实宽度，
+    // 鼠标扫过身体就算命中（精灵局部宽约 44 单位，这里取半宽 24）。
+    // 顺序：幽灵先 push、小怪物后 push —— hitAt 从后往前找，重叠时小怪物赢。
+    // 幽灵本身仍然不给 tooltip（memberAt 里排除），但不能因为它挡在上面，
+    // 就让底下正在干活的那只小怪物也失去 tooltip。
+    for (const g of ghosts) {
+      const s = toScreen(g.x, g.y, g.z);
+      screenPos.set(g.memberId, s);
+      const h = SPRITE_H * UNIT_Z * cam.zoom * 0.92;
+      const hw = SPRITE_S * 0.92 * 24 * cam.zoom;
+      pushHit(g.memberId, s.x - hw, s.y - h - 16, s.x + hw, s.y + 6);
+    }
     for (const a of agents) {
       if (a.entering) continue; // 还没进门：不进屏幕坐标表，头顶标签和点选也就一并跟着不出现
       const s = toScreen(a.x, a.y, 0);
       screenPos.set(a.memberId, s);
       const h = SPRITE_H * UNIT_Z * cam.zoom;
-      pushHit(a.memberId, s.x, s.y - h - 16, s.x, s.y + 6);
-    }
-    for (const g of ghosts) {
-      const s = toScreen(g.x, g.y, g.z);
-      screenPos.set(g.memberId, s);
-      const h = SPRITE_H * UNIT_Z * cam.zoom * 0.92;
-      pushHit(g.memberId, s.x, s.y - h - 16, s.x, s.y + 6);
+      const hw = SPRITE_S * 24 * cam.zoom;
+      pushHit(a.memberId, s.x - hw, s.y - h - 16, s.x + hw, s.y + 6);
     }
 
-    // 标签（角色在上、家具在下，所以后画）
-    for (const a of agents) {
-      const s = screenPos.get(a.memberId);
-      if (!s) continue;
-      const box = drawTag(ctx, {
-        x: s.x,
-        y: s.y - SPRITE_H * UNIT_Z * cam.zoom - 12,
-        text: tagText(a),
-        color: STATE_COLOR[bucketOf(stateOf(a.memberId))],
-      });
-      pushHit(a.memberId, s.x - box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12 - box.h, s.x + box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12);
-    }
+    // 标签（角色在上、家具在下，所以后画）；同样幽灵先、小怪物后
     for (const g of ghosts) {
       const s = screenPos.get(g.memberId);
       if (!s) continue;
@@ -2405,6 +2523,17 @@ export function createIsoOffice(canvas, opts = {}) {
       });
       pushHit(g.memberId, s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
     }
+    for (const a of agents) {
+      const s = screenPos.get(a.memberId);
+      if (!s) continue;
+      const box = drawTag(ctx, {
+        x: s.x,
+        y: s.y - SPRITE_H * UNIT_Z * cam.zoom - 12,
+        text: tagText(a),
+        color: STATE_COLOR[bucketOf(stateOf(a.memberId))],
+      });
+      pushHit(a.memberId, s.x - box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12 - box.h, s.x + box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12);
+    }
 
     // 召唤时的临时小幽灵：名字 + 具体任务
     if (dispatchGhost) {
@@ -2413,7 +2542,7 @@ export function createIsoOffice(canvas, opts = {}) {
       const box = drawTag(ctx, {
         x: s.x,
         y,
-        text: `${dispatchGhost.name} · ${dispatchGhost.task}`,
+        text: dispatchGhost.name,
         color: STATE_COLOR.busy,
         dashed: true,
       });
@@ -2427,7 +2556,7 @@ export function createIsoOffice(canvas, opts = {}) {
       const box = drawTag(ctx, {
         x: s.x,
         y,
-        text: `${reportGhost.name} · 汇报中`,
+        text: reportGhost.name,
         color: STATE_COLOR.online,
         dashed: true,
       });
@@ -2486,16 +2615,17 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 幽灵头顶：临时成员（subagent）的名字 + 它所属的项目。
-   * 名字优先于"临时"这个泛称 —— 这样才能对上"是哪个 subagent 在跑"。
+   * 幽灵头顶：**只写名字**（就是 subagent 自己的名字，如 susan / simmon）。
+   *
+   * 曾经写「名字 · 工程名」，而工程名多半只是当前工程，等于每个人头顶都挂同一串后缀，
+   * 反而把"是谁"挤掉了；任务内容本来就该由**小怪物**（工位那只）的 tooltip 讲，
+   * 幽灵只在收工汇报那几秒用气泡说结果（见 reportText）。
    */
   function ghostTagText(g) {
     if (g.inMeeting) return '旁听会议';
     const m = memberOf(g.memberId);
     const name = (m && m.name) || g.name || '';
-    const proj = m && m.project;
-    const tail = proj || STATE_LABEL[bucketOf(stateOf(g.memberId))];
-    return name ? `${name} · ${tail}` : `临时 · ${tail}`;
+    return name || '临时成员';
   }
 
   /* ------------------------------ 交互 ------------------------------ */
@@ -2637,10 +2767,27 @@ export function createIsoOffice(canvas, opts = {}) {
     hitMainConsole(px, py) {
       return hitMainConsole(px, py);
     },
+    /**
+     * 鼠标下是不是某个成员（CSS px），返回 memberId；空 = 没命中。
+     * `__xxx` 是内部精灵（召唤 / 汇报用的临时小幽灵），不算成员、不给 tooltip。
+     */
+    memberAt(px, py) {
+      const id = hitAt(px, py);
+      if (!id || String(id).startsWith('__')) return '';
+      // 幽灵（临时成员）不给 tooltip：它头顶只写名字，任务由它对应的小怪物来讲
+      const m = members.find((x) => x.memberId === id);
+      if (m && m.ghost) return '';
+      return String(id);
+    },
+    /** 某只小怪物最近一次完成任务的结果：{ task, result, at }；没干过活则 null */
+    lastResult(id) {
+      return lastResults.get(id) || null;
+    },
     /** 主 Agent 控制台：{ phase, action, context[], target }（现在由 mock 驱动，以后接 hook 事件） */
     setMainAgent(s) {
+      const prev = mainAgent;
       mainAgent = { phase: 'idle', action: '', context: [], target: null, ...(s || {}) };
-      syncDispatch();
+      syncDispatch(prev);
     },
     meetingCount: () => agents.filter((a) => a.inMeeting).length + ghosts.filter((g) => g.inMeeting).length,
     stateColor: (s) => STATE_COLOR[bucketOf(s)],

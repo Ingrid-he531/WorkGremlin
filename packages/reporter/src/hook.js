@@ -296,14 +296,16 @@ function writeFeedFile(file, feed) {
 }
 
 /**
- * 召唤 subagent 的工具名：CodeBuddy 插件 / CLI 用的是 **Task**
- * （日志实测 5 次 PreToolUse 全是 Task、一次 Agent 都没出现过）；
- * 旧版 / Claude Code 风格里它叫 Agent，两个都认，免得换一端就全瞎。
+ * 召唤 subagent 的工具名：CodeBuddy 插件 / CLI 用的是 **task**（小写，实测 PostToolUse
+ * 里就是 `task`；老日志里的 `Task` 是同一支工具的另一种写法）；Claude Code 风格叫 agent。
+ * 两个都认，且**忽略大小写** —— 大小写敏感时小写 `task` 匹配不上，收工那一步
+ * （PostToolUse → finishGhost）永远不执行，幽灵只能等 Stop / SessionEnd 兜底扫掉，
+ * 表现就是"子代理干完了、幽灵还飘着，直到下一次会话才开始"。
  */
-const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
+const SUBAGENT_TOOLS = new Set(['task', 'agent']);
 const isSubagentTool = (tool) => {
-  const t = String(tool || '');
-  // CodeBuddy / Claude 风格是 Task / Agent；Codex 是 collaborationspawn_agent（带命名空间前缀）
+  const t = String(tool || '').trim().toLowerCase();
+  // CodeBuddy / Claude 风格是 task / agent；Codex 是 collaborationspawn_agent（带命名空间前缀）
   return SUBAGENT_TOOLS.has(t) || t.endsWith('spawn_agent');
 };
 
@@ -394,7 +396,15 @@ function ownsEntry(a) {
  * key 用**本次调用的 id**而不是名字：同一个 subagent_type 并发起两个 Task 是很常见的，
  * 按名字去重的话第二只根本登记不上，而第一只收工又会按名字把还在跑的那只一起划掉。
  */
-function addGhost(workspacePath, name, task, id) {
+/**
+ * @param {string} workspacePath
+ * @param {string} name subagent 类型（susan / code-explorer …）
+ * @param {string} task 它这一单的任务
+ * @param {string} id 本次召唤的 key
+ * @param {string} parent 召唤它的那轮用户任务 id（主 agent 当前任务）—— 台账认父用
+ * @param {string} model 召唤时的模型（拿不到就空，服务端留 NULL）
+ */
+function addGhost(workspacePath, name, task, id, parent, model) {
   const file = feedFileFor(workspacePath);
   const feed = readFeedFile(file);
   const dup = id ? (a) => a.id === id : (a) => a.name === name;
@@ -406,6 +416,8 @@ function addGhost(workspacePath, name, task, id) {
     client: CLIENT, // 归属：同一个工程下 Codex 与 CodeBuddy 共用一个清单文件
     ...(task ? { task } : {}),
     ...(id ? { id } : {}),
+    ...(parent ? { parent } : {}),
+    ...(model ? { model } : {}),
   });
   writeFeedFile(file, feed);
 }
@@ -451,6 +463,49 @@ function rememberSubagent(file, id, name) {
   if (id && !list.some((r) => r.id === id)) list.push({ id, name, at: Date.now() });
   else if (!id && name && !list.some((r) => r.name === name)) list.push({ id: '', name, at: Date.now() });
   writeState(file, { subagents: list.slice(-8) });
+}
+
+/**
+ * 记下"这一轮用工具动过哪些文件"（去重，最多留最近 30 条）。
+ *
+ * 为什么非要自己记一份：「任务完成」的改动概要原来只有**会话快照**那一条路
+ * （server/src/sessions.js 的 doneFiles，扫插件 file-changes 落盘，10s 才刷一次），
+ * 而 doneAt 是 1.5s 快轮询先看到的 —— 弹「任务完成」时那份快照基本还是 Stop 之前算的
+ * （done 为 null → doneFiles 为 []），于是绝大多数时候只剩一句"本次任务已完成"。
+ * 本地这一份跟着 done 标记一起落盘，快轮询当下就能拿到，而且不依赖插件落盘、
+ * 不挑楼层（Codex / Claude 那几层也有）。
+ * @param {string} file 状态文件路径
+ * @param {string[]} paths 相对工程的文件路径
+ */
+function rememberRoundFiles(file, paths) {
+  if (!paths || !paths.length) return;
+  const list = (readState(file).roundFiles || []).filter((x) => typeof x === 'string' && x);
+  for (const p of paths) if (p && !list.includes(p)) list.push(p);
+  writeState(file, { roundFiles: list.slice(-30) });
+}
+
+/**
+ * 子代理收工时的**结果摘要**：PostToolUse 的 tool_response 里带着它最后说的话。
+ * 各端形状不一（纯字符串 / {content} / {result}），能取到就用，取不到返回空 ——
+ * retireGhost 会退回「已完成：<任务名>」，绝不编造。
+ */
+function resultOfResponse(ev) {
+  const r = ev && ev.tool_response;
+  if (r == null) return '';
+  let s = '';
+  if (typeof r === 'string') s = r;
+  else if (typeof r === 'object') {
+    const c = r.content != null ? r.content : r.result;
+    if (typeof c === 'string') s = c;
+    else if (Array.isArray(c)) {
+      // Claude 风格：content 是 [{type:'text', text:'…'}]，只取文本片段
+      s = c
+        .map((x) => (x && typeof x === 'object' ? String(x.text || '') : String(x || '')))
+        .join(' ')
+        .trim();
+    } else if (c != null) s = String(c);
+  }
+  return String(s || '').replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
 /** 收工：按 id 精确找，找不到再按 name，都找不到就认最早那只（FIFO）。转成待汇报并销账。 */
@@ -655,10 +710,17 @@ async function main() {
     const prompt = String(ev.prompt || '');
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
     await register();
-    const started = await request(info, HTTP_ROUTES.TASK_START, { ...base, memberId: member, title });
+    // model 一并上报：报表要记这一轮用的是哪个模型（hook payload 没带就是空 → 服务端留 NULL）
+    const started = await request(info, HTTP_ROUTES.TASK_START, {
+      ...base,
+      memberId: member,
+      title,
+      model: String(ev.model || ''),
+    });
     // taskTitle（用户原话）无论 TASK_START 成功与否都要落盘：它是"思考中"屏上 / tooltip 里显示的那句话，
     // 不能因为上报失败就留着上一轮的旧标题 —— 否则"思考中"会先显示上一轮内容，等快照刷新才更正。
-    const patch = { taskTitle: title, done: null };
+    // 新一轮：上一轮动过的文件清单作废（完成概要只算这一轮的）
+    const patch = { taskTitle: title, done: null, roundFiles: [] };
     if (started && started.taskId) {
       patch.taskId = started.taskId;
       patch.taskWorkspacePath = REAL_WS;
@@ -735,7 +797,8 @@ async function main() {
         } else {
           const id = subagentKeys(ev, nm, task)[0] || '';
           rememberSubagent(file, id, nm);
-          addGhost(REAL_WS, nm, task, id);
+          // parent = 主 agent 当前这一轮的用户任务 id：台账靠它把这次召唤挂到那一轮头上
+          addGhost(REAL_WS, nm, task, id, String(readState(file).taskId || ''), String(ev.model || ''));
           trace('ghost+', { member, tool, name: nm, id, gen: ev.generation_id || '', agentId: ev.agent_id || '' });
         }
       }
@@ -744,13 +807,17 @@ async function main() {
       const touched = filesOf(ev.tool_input, ev.tool_name).map((x) => relFile(x, cwd)).filter(Boolean);
       if (touched.length) {
         await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: member, files: touched, op: opOf(ev.tool_name) });
+        // 本地也记一份：上报失败（服务没起 / 接口报错）时完成概要仍拿得到文件清单
+        rememberRoundFiles(file, touched);
       }
       // 工具真正跑完了 → 权限已通过，撤掉"等授权"，回到"思考中"
       clearAwait(file);
       writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
       // subagent 收工 → 从清单划掉，小幽灵散掉
       // Codex 的 spawn_agent 返回 ≠ 子代理干完（它的收工只认 SubagentStop）
-      if (isSubagentTool(ev.tool_name) && !IS_CODEX) finishGhost(file, REAL_WS, ev);
+      // 带上结果摘要：tool_response 里有子代理最后说的话就当汇报文案，
+      // 没有就由 retireGhost 退回"已完成：<任务名>"。
+      if (isSubagentTool(ev.tool_name) && !IS_CODEX) finishGhost(file, REAL_WS, ev, { result: resultOfResponse(ev) });
       // PostToolUse = 工具已跑完，进入"思考中"（处理返回结果），直到下一个事件
       await status('thinking');
     }
@@ -786,17 +853,45 @@ async function main() {
     // 本轮任务的开始时刻：服务端据此只挑"这一轮改过的文件"做完成概要，
     // 否则会把上一轮的改动也算进来（典型：这一轮只是 push，却显示上一轮改了多少文件）。
     const startedAt = Number(st.taskStartedAt) || 0;
-    if (taskId) await request(info, HTTP_ROUTES.TASK_END, { ...base, memberId: member, taskId, state: 'done' });
     // 落"完成"标记：带工程路径 + 任务标题 + 起始时刻，服务端据此（且仅据此）亮"任务完成"概要，
     // 不再靠"相位回落到空闲"来猜，避免中途被其它工程串味误弹。
     // Codex 的 Stop 带 last_assistant_message（收尾自述）——落进完成标记，主控制台拿它当摘要；
     // CodeBuddy 没有这个字段，said 为空，仍然走"本轮改动文件"那套。
     const said = String((ev && ev.last_assistant_message) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    // 本轮用工具动过的文件（PostToolUse 一路记下来的）：跟着完成标记一起落盘，
+    // 这样 1.5s 快轮询拿到 doneAt 的**同一时刻**就有文件清单，不用等 10s 的会话快照，
+    // 「任务完成」才不会退化成一句"本次任务已完成"。
+    const roundFiles = (st.roundFiles || []).filter((x) => typeof x === 'string' && x);
+    // 收工上报：把**这一轮的产出**一起交给服务端进台账（task_runs）——
+    // 收尾自述 + 改动文件清单 + 模型，报表要的"输入 / 产出 / 改了多少文件 / 用了什么模型"就齐了。
+    if (taskId) {
+      await request(info, HTTP_ROUTES.TASK_END, {
+        ...base,
+        memberId: member,
+        taskId,
+        state: 'done',
+        model: String(ev.model || ''),
+        result: said,
+        files: roundFiles,
+        fileCount: roundFiles.length,
+      });
+    }
     writeState(file, {
       taskId: null,
       taskWorkspacePath: '',
       taskStartedAt: 0,
-      done: { at: Date.now(), title, workspacePath: REAL_WS, startedAt, said, sessionId: String((ev && ev.session_id) || '') },
+      roundFiles: [],
+      done: {
+        at: Date.now(),
+        title,
+        workspacePath: REAL_WS,
+        startedAt,
+        said,
+        sessionId: String((ev && ev.session_id) || ''),
+        // 只带前 8 条（屏上放不下就省略），总数另给一个字段，界面好写"改动 N 个文件"
+        files: roundFiles.slice(0, 8),
+        fileCount: roundFiles.length,
+      },
     });
     await beat();
     await status('idle');
@@ -822,7 +917,7 @@ async function main() {
     const name = (type && type !== 'default' ? type : '') || (pend && pend.name) || 'subagent';
     const id = agentIdOf(ev) || subagentKeys(ev, name, (pend && pend.task) || '')[0] || '';
     rememberSubagent(file, id, name);
-    addGhost(REAL_WS, name, (pend && pend.task) || '', id);
+    addGhost(REAL_WS, name, (pend && pend.task) || '', id, String(readState(file).taskId || ''), String(ev.model || ''));
     writeState(file, { pendingSpawn: null });
     trace('ghost+', { member, tool: 'SubagentStart', name, id, agentType: type });
     await beat();

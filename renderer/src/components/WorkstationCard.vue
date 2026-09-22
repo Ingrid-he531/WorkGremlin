@@ -46,17 +46,11 @@ const lastSeen = computed(() => formatDuration(tick.value - props.member.lastSee
     </div>
 
     <div class="row">
-      <div class="label dim">正在读写</div>
-      <ul v-if="member.currentFiles.length" class="files mono">
-        <li v-for="f in member.currentFiles.slice(0, 3)" :key="f">{{ f }}</li>
-      </ul>
-      <span v-else class="na">未上报</span>
-    </div>
-
-    <div class="row">
       <div class="label dim">最近产出</div>
       <ul v-if="member.artifacts.length" class="artifacts">
-        <li v-for="a in member.artifacts" :key="a.id ?? a.title">{{ a.title }}</li>
+        <li v-for="a in member.artifacts" :key="a.id ?? a.title">
+          {{ a.title }}<span v-if="a.derived" class="derived">改动</span>
+        </li>
       </ul>
       <span v-else class="na">—</span>
     </div>
@@ -135,6 +129,15 @@ ul {
 .artifacts {
   list-style: none;
   padding-left: 0;
+}
+
+/* 「改动」标记：这条产出是从本轮改动文件推出的（derived），不是 agent 上报的产出 —— 必须标出来，不能冒充真值 */
+.derived {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-faint);
 }
 
 footer {

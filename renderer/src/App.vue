@@ -232,7 +232,9 @@ onUnmounted(() => {
   <!-- data-motion 挂在根部：它要同时罩住左栏（轿厢）和主舞台（门）—— 挂 .stage 就罩不到左栏 -->
   <div class="app" :class="{ fullscreen }" :data-motion="motionMode">
     <!-- 全屏：顶栏整条收掉（页签 + 会话下拉），出口见 .fs-exit。
-         连接 / 项目 / 相位来源那三项已挪进办公室场景左上角（IsoOfficeView 的 .status-hud） -->
+         连接 / 相位来源 在办公室左下角说明条里（IsoOfficeView 的 .tip）；
+         项目名在门楣（楼层液晶屏那块板）最左边（ElevatorDoors 的 .lintel-proj）——
+         三样都不占顶栏，所以收掉顶栏不会丢信息。 -->
     <nav v-if="!fullscreen" class="tabs">
       <button :class="{ on: tab === 'office' }" @click="tab = 'office'">办公室</button>
       <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">工位卡片</button>
@@ -256,13 +258,17 @@ onUnmounted(() => {
         @update:model-value="requestFloor($event)"
       />
 
-      <ElevatorDoors :phase="phase" :floors="sessions.floors" :flash="flash">
+      <ElevatorDoors
+        :phase="phase"
+        :floors="sessions.floors"
+        :flash="flash"
+        :project-label="projectLabel"
+      >
         <section class="stage">
           <IsoOfficeView
             v-if="tab === 'office'"
             :selected-id="selectedId"
             :connection="project.connection"
-            :project-label="projectLabel"
             :source="phaseSource"
             @select="selectDesk"
           />

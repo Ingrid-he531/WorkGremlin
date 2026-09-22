@@ -29,6 +29,8 @@ const props = defineProps({
   floors: { type: Array, default: () => [] },
   /** 降级档（系统「减弱动态效果」）的淡出/淡入开关，来自 useElevator 的 flash */
   flash: { type: Boolean, default: false },
+  /** 当前工程名：放在门楣**最左边**（原来在办公室左上角那枚小徽标里） */
+  projectLabel: { type: String, default: '' },
 });
 
 watch(
@@ -42,9 +44,14 @@ watch(
 
 <template>
   <div class="elevator-doors" :data-phase="phase" :data-flash="flash ? 'on' : 'off'">
-    <!-- 门楣：墙带 + 固定的楼层显示屏。门扇在下面的 .portal 里滑，够不到这里 -->
+    <!-- 门楣：墙带 + 固定的楼层显示屏。门扇在下面的 .portal 里滑，够不到这里。
+         三列：左=项目名 / 中=楼层屏（居中）/ 右=等宽占位，所以屏不会被项目名挤偏 -->
     <div class="lintel">
+      <div class="lintel-side">
+        <span v-if="projectLabel" class="lintel-proj">项目：{{ projectLabel }}</span>
+      </div>
       <FloorLcd :floors="floors" />
+      <div class="lintel-side" aria-hidden="true" />
     </div>
     <div class="portal">
       <!-- 内容外面再包一层：这是"内容就位"动效的作用对象（直接给 slot 内容的根元素写样式会落到子组件上） -->
@@ -85,6 +92,32 @@ watch(
   background: var(--iso-bg, #151a22);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+}
+
+/* 左右两列等宽（flex:1 1 0），中间的楼层屏才仍然居中 ——
+   只给左边放一列、靠 justify-content:center 会把屏推偏。 */
+.lintel-side {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* 项目名：直接写在门楣这块板上，**不另加黑色小底板**（就是在板上排一行字）。
+   字号跟左侧「楼层」标题（FloorSelector 的 .rail-title）对齐：14px / 600 ——
+   两边同一级，扫一眼能连读成"楼层 · 项目"。
+   工程名可能很长：占满左列后省略号截断，不许把中间的楼层屏挤走。 */
+.lintel-proj {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  /* 亮度跟左侧「楼层」标题（.rail-title）取同一个变量，两边看起来是一套 */
+  color: var(--muted, #6e7681);
+  line-height: 1.2;
 }
 
 /* 门洞：舞台内容与门扇的容器，门扇滑到 ±100% 时不撑出横向滚动条 */

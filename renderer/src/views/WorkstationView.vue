@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
+import { isEphemeralMember } from '../lib/ephemeral';
 
 const project = useProjectStore();
 const sessions = useSessionStore();
@@ -12,6 +13,9 @@ const sorted = computed(() => {
   // 与办公室同一口径：按当前楼层的客户端过滤（client 为空的视作通用）
   const want = sessions.selectedClient;
   return project.members
+    // 工位卡片只显示常住小怪物；临时召唤出来的幽灵（subagent-xxx）不在这张表里占位，
+    // 避免"召唤后卡片列表里多出同名小怪物"的误会。
+    .filter((m) => !isEphemeralMember(m))
     .filter((m) => !want || !m.client || m.client === want)
     .slice()
     .sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
