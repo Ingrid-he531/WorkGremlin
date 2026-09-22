@@ -31,6 +31,12 @@ const props = defineProps({
   flash: { type: Boolean, default: false },
   /** 当前工程名：放在门楣**最左边**（原来在办公室左上角那枚小徽标里） */
   projectLabel: { type: String, default: '' },
+  /** 门楣中间的楼层液晶屏是否显示。任务记录页等非电梯场景不需要那块屏，
+   *  关掉它只留左边「项目」，门楣不会空出一块黑屏。默认开（办公室等页面仍然显示）。 */
+  showFloorLcd: { type: Boolean, default: true },
+  /** 整条门楣（项目名 + 楼层屏）是否显示。任务记录页整页都不需要电梯门楣，关掉它，
+   *  内容直接顶到顶部。默认开（办公室等电梯场景保留门楣）。 */
+  showLintel: { type: Boolean, default: true },
 });
 
 watch(
@@ -46,11 +52,11 @@ watch(
   <div class="elevator-doors" :data-phase="phase" :data-flash="flash ? 'on' : 'off'">
     <!-- 门楣：墙带 + 固定的楼层显示屏。门扇在下面的 .portal 里滑，够不到这里。
          三列：左=项目名 / 中=楼层屏（居中）/ 右=等宽占位，所以屏不会被项目名挤偏 -->
-    <div class="lintel">
+    <div v-if="showLintel" class="lintel">
       <div class="lintel-side">
         <span v-if="projectLabel" class="lintel-proj">项目：{{ projectLabel }}</span>
       </div>
-      <FloorLcd :floors="floors" />
+      <FloorLcd v-if="showFloorLcd" :floors="floors" />
       <div class="lintel-side" aria-hidden="true" />
     </div>
     <div class="portal">

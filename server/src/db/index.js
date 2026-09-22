@@ -49,6 +49,8 @@ function migrate(db) {
   ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'members', 'project_label', 'project_label TEXT');
   ensureColumn(db, 'members', 'client', 'client TEXT');
+  ensureColumn(db, 'subagent_runs', 'files_json', 'files_json TEXT');
+  ensureColumn(db, 'task_runs', 'baseline_commit', 'baseline_commit TEXT');
   ensureAgentStatusThinking(db);
 }
 
@@ -270,13 +272,14 @@ function createRepo(db) {
     `),
     /* ---- 台账（报表用）：一轮用户任务 + 它召唤出去的 subagent 实例 ---- */
     upsertTaskRun: db.prepare(`
-      INSERT INTO task_runs (id, project_id, member_id, client, model, title, started_at)
-      VALUES (@id, @projectId, @memberId, @client, @model, @title, @startedAt)
+      INSERT INTO task_runs (id, project_id, member_id, client, model, title, started_at, baseline_commit)
+      VALUES (@id, @projectId, @memberId, @client, @model, @title, @startedAt, @baselineCommit)
       ON CONFLICT(id) DO UPDATE SET
         client     = COALESCE(excluded.client, task_runs.client),
         model      = COALESCE(excluded.model, task_runs.model),
         title      = COALESCE(excluded.title, task_runs.title),
-        started_at = COALESCE(task_runs.started_at, excluded.started_at)
+        started_at = COALESCE(task_runs.started_at, excluded.started_at),
+        baseline_commit = COALESCE(task_runs.baseline_commit, excluded.baseline_commit)
     `),
     endTaskRun: db.prepare(`
       UPDATE task_runs SET
@@ -302,6 +305,7 @@ function createRepo(db) {
       UPDATE subagent_runs SET
         model    = COALESCE(@model, model),
         result   = COALESCE(@result, result),
+        files_json = COALESCE(@filesJson, files_json),
         ended_at = COALESCE(@endedAt, ended_at),
         duration_ms = CASE
           WHEN @endedAt IS NOT NULL AND started_at IS NOT NULL THEN @endedAt - started_at
@@ -311,6 +315,23 @@ function createRepo(db) {
     `),
     listSubagentRuns: db.prepare(`
       SELECT * FROM subagent_runs WHERE parent_task_id = ? ORDER BY started_at, id
+    `),
+    countSubagentRuns: db.prepare(`SELECT COUNT(*) AS c FROM subagent_runs WHERE parent_task_id = ?`),
+    /** 删除：按顶层任务（及其 subagent 子任务）整条清掉，含台账/消息/产出 */
+    selectChildTaskIds: db.prepare(`SELECT id FROM tasks WHERE parent_task_id IN (SELECT value FROM json_each(?))`),
+    deleteTasksById: db.prepare(`DELETE FROM tasks WHERE id IN (SELECT value FROM json_each(?))`),
+    deleteTaskRunsById: db.prepare(`DELETE FROM task_runs WHERE id IN (SELECT value FROM json_each(?))`),
+    deleteSubagentRunsByParent: db.prepare(`DELETE FROM subagent_runs WHERE parent_task_id IN (SELECT value FROM json_each(?))`),
+    deleteMessagesByTask: db.prepare(`DELETE FROM messages WHERE task_id IN (SELECT value FROM json_each(?))`),
+    deleteArtifactsByTask: db.prepare(`DELETE FROM artifacts WHERE task_id IN (SELECT value FROM json_each(?))`),
+    /** 顶层任务 id 选择器：复用任务记录页的一级检索（工程 + 楼层），可选"早于某时刻"（保留最近 N 天） */
+    selectTopTaskIds: db.prepare(`
+      SELECT t.id FROM tasks t
+      LEFT JOIN members m ON m.id = t.member_id
+      WHERE t.parent_task_id IS NULL
+        AND (@project IS NULL OR t.project_id = @project)
+        AND (@client IS NULL OR m.client = @client)
+        AND (@before IS NULL OR t.started_at < @before)
     `),
     /**
      * 当前工程里**主 agent**（role='agent'，hook 上报的那位）正在跑的任务。
@@ -442,7 +463,78 @@ function createRepo(db) {
     tx(memberId, keepHistory);
   }
 
-  return { ...stmt, listMessages, purgeProject, purgeMember, raw: db };
+  /**
+   * 整条删掉一组顶层任务（含其 subagent 子任务），以及对应的台账/消息/产出。
+   * @param {string[]} topIds 顶层任务 id 列表
+   * @returns {number} 删除的顶层任务条数
+   */
+  function deleteByTopIds(topIds) {
+    if (!topIds.length) return 0;
+    const topJson = JSON.stringify(topIds);
+    const childRows = stmt.selectChildTaskIds.all(topJson);
+    const allJson = JSON.stringify([...topIds, ...childRows.map((r) => r.id)]);
+    const tx = db.transaction(() => {
+      stmt.deleteMessagesByTask.run(allJson);
+      stmt.deleteArtifactsByTask.run(allJson);
+      stmt.deleteSubagentRunsByParent.run(topJson);
+      stmt.deleteTaskRunsById.run(topJson);
+      stmt.deleteTasksById.run(allJson);
+    });
+    tx();
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    return topIds.length;
+  }
+
+  /**
+   * 删单条任务记录（二次确认在客户端做；这里只负责真删）。
+   * @param {string} id 顶层任务 id
+   */
+  function deleteTaskRun(id) {
+    return deleteByTopIds([id]);
+  }
+
+  /**
+   * 按一级检索（工程 + 楼层）删除；beforeTs 给定时只删早于该时刻的（保留最近 N 天）。
+   * @param {{ project?: string, client?: string, beforeTs?: number }} opt
+   * @returns {number} 删除的顶层任务条数
+   */
+  function deleteTaskRunsByFilter(opt = {}) {
+    const projectArg = opt.project && opt.project !== 'all' ? opt.project : null;
+    const clientArg = opt.client && opt.client !== 'all' ? opt.client : null;
+    const beforeArg = opt.beforeTs != null ? opt.beforeTs : null;
+    const topIds = stmt.selectTopTaskIds
+      .all({ project: projectArg, client: clientArg, before: beforeArg })
+      .map((r) => r.id);
+    return deleteByTopIds(topIds);
+  }
+
+  const getSettingStmt = db.prepare('SELECT value FROM settings WHERE key = ?');
+  const setSettingStmt = db.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+
+  /** 读设置项（字符串），不存在返回 null */
+  function getSetting(key) {
+    const row = getSettingStmt.get(key);
+    return row ? row.value : null;
+  }
+  /** 写设置项（值一律转字符串存） */
+  function setSetting(key, value) {
+    setSettingStmt.run(key, String(value));
+  }
+  /**
+   * 记录保留天数（天）：缺省 30；前端改过则优先用落库值，并夹在 1~3650。
+   * 服务端自动清理任务记录以它为准（见 server/src/index.js 的 runRetentionCleanup）。
+   */
+  function getRetentionDays() {
+    const raw = getSetting('retentionDays');
+    const n = raw != null ? Number(raw) : NaN;
+    if (!Number.isFinite(n) || n < 1) return 30;
+    return Math.min(n, 3650);
+  }
+
+  return { ...stmt, listMessages, purgeProject, purgeMember, deleteTaskRun, deleteTaskRunsByFilter, getSetting, setSetting, getRetentionDays, raw: db };
 }
 
 module.exports = { openDatabase, createRepo, applyPragmas, migrate, SCHEMA_PATH };

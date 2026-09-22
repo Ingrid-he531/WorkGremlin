@@ -366,7 +366,7 @@ watch(
       //   ② hook 自己记的"本轮用工具动过的文件"（done.files，跟着完成标记一起落盘，
       //      快轮询当下就有；不依赖插件落盘，Codex / Claude 那几层也有）。
       const snapFiles = (sel && sel.doneFiles) || [];
-      const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({ name: String(p) }));
+      const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({ name: typeof p === 'string' ? p : (p && p.path) || '' }));
       const files = snapFiles.length ? snapFiles : hookFiles;
       // 本轮任务改动的文件数（服务端已按"本轮开始之后"过滤）；拿不到就用列表长度兜底
       const count = (sel && Number(sel.doneCount)) || (fpDone && Number(fpDone.fileCount)) || files.length;

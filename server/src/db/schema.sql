@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
   model          TEXT,
   title          TEXT,                    -- 它这一单的任务
   result         TEXT,                    -- 收工摘要（产出）
+  files_json     TEXT,                    -- 本轮改动文件清单（JSON array of {path,added,removed}，最多 10 条）
   started_at     INTEGER,
   ended_at       INTEGER,
   duration_ms    INTEGER,                 -- 花费时间
@@ -196,3 +197,10 @@ CREATE TABLE IF NOT EXISTS events (
   payload_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_project_ts ON events(project_id, ts_ms DESC);
+
+-- 服务端可持久化的设置键值表（目前仅记录保留天数 retentionDays）。
+-- 仅服务端写，前端通过 /api/v1/settings/retention 读取 / 修改。
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

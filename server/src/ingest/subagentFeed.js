@@ -218,7 +218,7 @@ function createSubagentFeed(opts) {
           } catch (err) {
             console.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
           }
-          bus.endSubagentRun({ id: known.runId, result: a.result, model: a.model });
+          bus.endSubagentRun({ id: known.runId, project, result: a.result, model: a.model, files: a.files });
           tasks.delete(fullId);
         } else {
           // 从没开过任务行（召唤时没写任务文案）也照样记一笔：
@@ -234,14 +234,14 @@ function createSubagentFeed(opts) {
             taskId: null,
             startedAt: null,
           });
-          bus.endSubagentRun({ id: runId, result: a.result, model: a.model });
+          bus.endSubagentRun({ id: runId, project, result: a.result, model: a.model, files: a.files });
         }
         if (!retiring.has(a.name)) retiring.set(a.name, { result: a.result, at: Date.now() + RETIRE_MS });
       } else if (a.task) {
         if (!known || known.title !== a.task) {
           if (known) {
             bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
-            bus.endSubagentRun({ id: known.runId, model: a.model });
+            bus.endSubagentRun({ id: known.runId, project, model: a.model, files: a.files });
           }
           const r = bus.startTask({
             project,
@@ -272,7 +272,7 @@ function createSubagentFeed(opts) {
       } else if (known) {
         bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
         // 没写 result 的收尾：产出留 NULL（不编造），但结束时间与耗时照记
-        bus.endSubagentRun({ id: known.runId, model: a.model });
+        bus.endSubagentRun({ id: known.runId, project, model: a.model, files: a.files });
         tasks.delete(fullId);
       }
 
@@ -317,7 +317,7 @@ function createSubagentFeed(opts) {
       // 产出留 NULL，但结束时间与耗时得记上，否则报表里永远挂着一笔"还在跑"的账。
       const open = tasks.get(m.id);
       if (open) {
-        bus.endSubagentRun({ id: open.runId });
+        bus.endSubagentRun({ id: open.runId, project });
         tasks.delete(m.id);
       }
       bus.removeMember({ project, memberId: m.id });

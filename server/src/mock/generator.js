@@ -145,6 +145,7 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
   }
 
   // 为每个 busy 成员建一条任务
+  let leaderTaskId = null;
   for (const r of ALL_MEMBERS) {
     if (r.state !== 'busy') continue;
     const started = bus.startTask({
@@ -163,7 +164,39 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
         progress: r.progress,
         ts: t0 - Math.floor(rng() * 300_000),
       });
+      if (r.name === 'leader') leaderTaskId = started.taskId;
     }
+  }
+
+  // 给 leader 那轮任务挂几个 subagent，演示"多次 subagent 调用 → 点开看单个"的能力
+  if (leaderTaskId) {
+    const subs = [
+      { name: 'researcher', title: '调研 .codebuddy/projects 数据格式', result: '产出调研报告一份，字段与 schema 对齐', model: 'claude-opus-4' },
+      { name: 'coder', title: '实现工位视图与对话记录窗口', result: '落地 WorkstationCard.vue 与列表渲染', model: 'claude-sonnet-4' },
+      { name: 'reviewer', title: '代码评审与回归校验', result: '无阻断性问题，仅 2 条建议', model: 'claude-opus-4' },
+    ];
+    subs.forEach((s, i) => {
+      const id = bus.startSubagentRun({
+        project,
+        memberId: `subagent-${s.name}@${project}`,
+        name: s.name,
+        parentTaskId: leaderTaskId,
+        taskId: leaderTaskId,
+        title: s.title,
+        model: s.model,
+        client: 'codebuddy',
+        startedAt: t0 - (subs.length - i) * 120_000,
+      });
+      if (id) {
+        bus.endSubagentRun({
+          id,
+          result: s.result,
+          model: s.model,
+          client: 'codebuddy',
+          endedAt: t0 - (subs.length - i) * 120_000 + 90_000,
+        });
+      }
+    });
   }
 
   // blocked 成员额外写一条原因

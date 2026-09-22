@@ -8,6 +8,7 @@ import OfficeSceneView from './views/OfficeSceneView.vue';
 import DeskLabView from './views/DeskLabView.vue';
 import WorkstationView from './views/WorkstationView.vue';
 import ConversationView from './views/ConversationView.vue';
+import TaskRecordsView from './views/TaskRecordsView.vue';
 import { useProjectStore } from './stores/project';
 import { useMessageStore } from './stores/messages';
 import { useSessionStore } from './stores/sessions';
@@ -238,21 +239,29 @@ onUnmounted(() => {
     <nav v-if="!fullscreen" class="tabs">
       <button :class="{ on: tab === 'office' }" @click="tab = 'office'">办公室</button>
       <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">工位卡片</button>
-      <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">对话记录</button>
+      <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">任务记录</button>
       <span class="spacer" />
+      <!-- 工位卡片 / 任务记录页不需要会话下拉与全屏，收掉右上角这两样 -->
       <SessionSwitcher
+        v-if="tab !== 'workstation' && tab !== 'conversation'"
         :items="sessionItems"
         :model-value="sessionValue"
         :empty-label="sessionEmptyLabel"
         @update:model-value="selectSession($event)"
       />
-      <button class="fs-btn" title="全屏只显示主屏幕（F）" @click="toggleFullscreen">全屏</button>
+      <button
+        v-if="tab !== 'workstation' && tab !== 'conversation'"
+        class="fs-btn"
+        title="全屏只显示主屏幕（F）"
+        @click="toggleFullscreen"
+      >全屏</button>
     </nav>
 
     <main class="body">
-      <!-- 楼层：一层一个受监控的智能体；状态点绿 = 这一层有活跃会话 -->
+      <!-- 楼层：一层一个受监控的智能体；状态点绿 = 这一层有活跃会话。
+           任务记录页不需要井道（不是电梯场景），去掉左边胶囊楼层 -->
       <FloorSelector
-        v-if="!fullscreen"
+        v-if="!fullscreen && tab !== 'conversation'"
         :products="sessions.floors"
         :model-value="sessions.selectedFloor"
         @update:model-value="requestFloor($event)"
@@ -263,6 +272,8 @@ onUnmounted(() => {
         :floors="sessions.floors"
         :flash="flash"
         :project-label="projectLabel"
+        :show-floor-lcd="tab !== 'conversation'"
+        :show-lintel="tab !== 'conversation'"
       >
         <section class="stage">
           <IsoOfficeView
@@ -280,6 +291,7 @@ onUnmounted(() => {
           />
           <WorkstationView v-else-if="tab === 'workstation'" />
           <DeskLabView v-else-if="tab === 'lab'" />
+          <TaskRecordsView v-else-if="tab === 'conversation'" />
           <ConversationView v-else />
         </section>
       </ElevatorDoors>

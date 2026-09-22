@@ -69,6 +69,12 @@ const HB_IDLE_EXIT_MS = 30 * 60_000;
 /** 兜底：再怎么样 6 小时也退 */
 const HB_MAX_LIFE_MS = 6 * 60 * 60_000;
 const TITLE_MAX = 80;
+/** 台账"产出"全文上限（服务端另有上限，见 server/src/ingest/bus.js 的 RUN_RESULT_MAX） */
+const RESULT_MAX = 4_000;
+/** 单条 AI 回复进对话记录的长度上限 */
+const MSG_MAX = 8_000;
+/** 一轮最多上报几条 AI 回复（并发上报，所以这里只是防刷的闸门，不是延迟闸门） */
+const MAX_REPLIES = 50;
 
 const DEBUG = process.env.WORKGREMLIN_HOOK_DEBUG === '1';
 const debug = (...args) => {
@@ -232,10 +238,11 @@ function fileOf(input, tool) {
   return filesOf(input, tool)[0] || '';
 }
 
-/** 编辑类算 edit，其余写类算 write（server 侧只分 read / write 之外的 op） */
+/** 编辑类算 edit，删除类算 delete，其余写类算 write（server 侧按 op 分 新增/改动/删除） */
 function opOf(tool) {
   const t = String(tool || '');
   if (t === 'apply_patch') return 'edit'; // Codex
+  if (/delete/i.test(t)) return 'delete'; // 删除类工具
   return /^(Edit|MultiEdit|NotebookEdit|replace_in_file)$/.test(t) ? 'edit' : 'write';
 }
 
@@ -259,6 +266,207 @@ function relFile(file, cwd) {
   const abs = path.resolve(file);
   if (cwd && (abs === cwd || abs.startsWith(cwd + path.sep))) return path.relative(cwd, abs);
   return abs;
+}
+
+/** 内容块里算"回复正文"的类型：reasoning / tool-call 之类不算
+ * （CodeBuddy 会把思维链也塞进 content，整段并进来会把一条回复撑成上万字）。 */
+const TEXT_BLOCK_TYPES = new Set(['text', 'output_text', 'input_text', 'summary_text']);
+
+/** 从内容块里抽人类可读文本（兼容 string / [{type:'text'|'output_text',text}] / {text}） */
+function extractText(content) {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((x) => {
+        if (!x || typeof x !== 'object' || typeof x.text !== 'string') return '';
+        const t = x.type == null ? '' : String(x.type);
+        return !t || TEXT_BLOCK_TYPES.has(t) ? x.text : '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  if (content && typeof content === 'object' && typeof content.text === 'string') return content.text.trim();
+  return '';
+}
+
+/**
+ * 一条 transcript 记录里的"消息体"。各家封装不同，这里统一成 {role, content, id}：
+ *   · Codex rollout：{type:'response_item', payload:{type:'message', role, content:[{type:'output_text',text}]}}
+ *     —— role 在 **payload** 里，不在 message 里（实测 2026-09-22，Codex 0.151.0）；
+ *   · 通用 / Claude Code / CodeBuddy CLI：{message:{role, content:[{type:'text',text}]}}
+ *   · 顶层本身就是消息：{role, content}
+ * @param {any} obj
+ * @returns {{role: string, content: any, id: string}|null}
+ */
+function msgOf(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const p = obj.payload;
+  if (p && typeof p === 'object' && typeof p.role === 'string' && p.content !== undefined) {
+    return { role: p.role, content: p.content, id: String(p.id || '') };
+  }
+  const m = obj.message;
+  if (m && typeof m === 'object' && typeof m.role === 'string' && m.content !== undefined) {
+    return { role: m.role, content: m.content, id: String(m.id || '') };
+  }
+  if (typeof obj.role === 'string') return { role: obj.role, content: obj.content, id: String(obj.id || '') };
+  return null;
+}
+
+/** 本轮 = 最后一条 user 消息之后的 assistant 消息。一条 user 都没有时全算（宁可多报，服务端按 id 去重）。 */
+function sinceLastUser(items) {
+  let start = 0;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i].role === 'user') {
+      start = i + 1;
+      break;
+    }
+  }
+  return items.slice(start).filter((x) => x.role === 'assistant' && x.text);
+}
+
+/** 通用 / Claude Code / Codex rollout 的 JSONL：逐行一个 JSON */
+function jsonlReplies(file) {
+  let lines;
+  try {
+    lines = fs.readFileSync(file, 'utf8').split('\n');
+  } catch {
+    return [];
+  }
+  const items = [];
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (!s) continue;
+    let obj;
+    try {
+      obj = JSON.parse(s);
+    } catch {
+      continue; // 半截行 / 非 JSON 行：跳过，不猜
+    }
+    const m = msgOf(obj);
+    if (!m) continue;
+    const ts = Date.parse(String((obj && obj.timestamp) || '')) || 0;
+    items.push({ role: String(m.role), id: m.id, text: extractText(m.content), ts });
+  }
+  return sinceLastUser(items);
+}
+
+/**
+ * CodeBuddy 的会话正文**不在**索引文件里：索引是 history/<sessionId>/index.json
+ * （缩进过的多行 JSON，不是 JSONL，按行解析必然全失败），正文在同目录 messages/<消息 id>.json
+ * （{role, message:"<JSON 字符串>"}）。一轮回复在索引里被切成若干 assistant 分片（实测），
+ * 所以按"最后一个请求 requests[-1]"把分片拼成一条，去重键用请求 id。
+ */
+function codebuddyReplies(indexPath) {
+  const dir = path.dirname(indexPath);
+  let idx;
+  try {
+    idx = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  } catch {
+    return [];
+  }
+  const msgs = Array.isArray(idx && idx.messages) ? idx.messages : [];
+  const byId = new Map(msgs.map((m) => [m && m.id, m]));
+  const read = (id) => {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, 'messages', `${id}.json`), 'utf8'));
+      const inner = typeof raw.message === 'string' ? JSON.parse(raw.message) : raw.message;
+      return extractText(inner && inner.content !== undefined ? inner.content : inner);
+    } catch {
+      return '';
+    }
+  };
+
+  const reqs = Array.isArray(idx && idx.requests) ? idx.requests : [];
+  const req = reqs.length ? reqs[reqs.length - 1] : null;
+  if (req && Array.isArray(req.messages) && req.messages.length) {
+    const parts = [];
+    for (const id of req.messages) {
+      const m = byId.get(id);
+      if (!m || String(m.role) !== 'assistant') continue;
+      const t = read(id);
+      if (t) parts.push(t);
+    }
+    const text = parts.join('\n\n').trim();
+    if (text) return [{ id: String(req.id || req.startedAt || 'last'), text }];
+  }
+
+  // 没有 requests 索引（老版本）：退回"最后一条 user 之后的 assistant 分片各算一条"
+  return sinceLastUser(
+    msgs.map((m) => ({
+      role: String((m && m.role) || ''),
+      id: String((m && m.id) || ''),
+      text: m && m.id ? read(m.id) : '',
+    }))
+  );
+}
+
+/**
+ * 本轮 AI 回复列表（可能多条）——"每次回复入库"与"产出摘要"共用这一个来源。
+ * transcriptPath 指向 CodeBuddy 的 index.json 时走 CodeBuddy 那套，其余（Codex rollout /
+ * Claude Code / CodeBuddy CLI 的 JSONL）逐行解析。
+ * @param {string} transcriptPath
+ * @returns {Array<{id: string, text: string}>}
+ */
+function turnReplies(transcriptPath) {
+  if (!transcriptPath || typeof transcriptPath !== 'string') return [];
+  return /index\.json$/i.test(transcriptPath) ? codebuddyReplies(transcriptPath) : jsonlReplies(transcriptPath);
+}
+
+/**
+ * 一条回复的"身份"：优先用 transcript 里的消息 id（Codex 的 payload.id / CodeBuddy 的请求 id）；
+ * 没有 id 就用**正文哈希**兜底。
+ * 这里绝不能拿 taskId 兜底：Stop 上报时 state 里还是真实 taskId，而 SessionEnd / Interrupt 补报时
+ * taskId 已经被清空（或已切到下一轮）—— 同一轮回复会算出两个不同的键，ON CONFLICT DO NOTHING
+ * 拦不住，库里就出现两行一模一样的内容（实测复现过）。正文哈希跨 Stop/SessionEnd 都稳定。
+ */
+function replyKeyOf(reply) {
+  const id = String((reply && reply.id) || '').trim();
+  if (id) return id;
+  return 'h' + fnv1a32(String((reply && reply.text) || ''));
+}
+
+/** 对话记录里每条 AI 回复的去重键：同一轮重复上报（Stop 之后又来 SessionEnd、重放）不会写重 */
+function aiDedupeKey(sessionId, msgId) {
+  return `ai:${CLIENT}:${String(sessionId || 'nosession')}:${String(msgId || 'noid')}`;
+}
+
+/**
+ * 把本轮 AI 回复投进对话记录（messages 表）—— 这条线回答"每次回复都入库"，
+ * 与 task_runs.result（一轮一条摘要）互不替代。
+ * 一条都拿不到就什么都不做（绝不编造）；超长单条按 MSG_MAX 截断，别把一条消息撑爆。
+ */
+async function reportAiReplies(info, base, member, taskId, replies, sessionId) {
+  if (!Array.isArray(replies) || !replies.length) return;
+  const list = replies.slice(-MAX_REPLIES);
+  const now = Date.now();
+  // 并发上报：一条一条 await 的话，服务端卡顿时耗时 = 条数 × REQ_TIMEOUT_MS（2s），
+  // 20 条最坏 40s —— 而 hook 命令在 settings.json 里配了 10s 超时，会被 runner 掐掉，
+  // 连 status('idle') 都发不出去（实测 5 条挂 2s 的服务就是 10069ms）。
+  // 顺序**不靠发送次序**：每条都带显式 ts（transcript 里有真时间就用真的，没有就按回复次序
+  // 单调铺开），消息表与前端都按 ts_ms 排序，所以并发不会把一轮的回复打乱。
+  await Promise.all(
+    list
+      .map((r, i) => {
+        const content = String(r.text || '').trim();
+        if (!content) return null;
+        const ts = Number(r.ts) > 0 ? Number(r.ts) : now - (list.length - 1 - i);
+        return request(info, HTTP_ROUTES.MESSAGE, {
+          ...base,
+          memberId: member,
+          from: member,
+          to: null,
+          // 收尾那条算产出，中间那几条算过程（都在 MESSAGE_TYPES 里，前端不用改）
+          type: i === list.length - 1 ? 'result' : 'task_update',
+          subject: null,
+          content: content.slice(0, MSG_MAX),
+          taskId: taskId || null,
+          ts,
+          dedupeKey: aiDedupeKey(sessionId, replyKeyOf(list[i])),
+        });
+      })
+      .filter(Boolean)
+  );
 }
 
 /* ------------------------------------------------------------------ *
@@ -466,21 +674,21 @@ function rememberSubagent(file, id, name) {
 }
 
 /**
- * 记下"这一轮用工具动过哪些文件"（去重，最多留最近 30 条）。
- *
- * 为什么非要自己记一份：「任务完成」的改动概要原来只有**会话快照**那一条路
- * （server/src/sessions.js 的 doneFiles，扫插件 file-changes 落盘，10s 才刷一次），
- * 而 doneAt 是 1.5s 快轮询先看到的 —— 弹「任务完成」时那份快照基本还是 Stop 之前算的
- * （done 为 null → doneFiles 为 []），于是绝大多数时候只剩一句"本次任务已完成"。
- * 本地这一份跟着 done 标记一起落盘，快轮询当下就能拿到，而且不依赖插件落盘、
- * 不挑楼层（Codex / Claude 那几层也有）。
+ * 记录本轮用工具动过的文件（带 op：write=新增 / edit=改动 / delete=删除）。
+ * 同文件多次出现后者覆盖，最后一步操作决定归类；最多保留 30 条。
  * @param {string} file 状态文件路径
- * @param {string[]} paths 相对工程的文件路径
+ * @param {{path:string,op:string}[]} items 相对工程的文件 + 操作
  */
-function rememberRoundFiles(file, paths) {
-  if (!paths || !paths.length) return;
-  const list = (readState(file).roundFiles || []).filter((x) => typeof x === 'string' && x);
-  for (const p of paths) if (p && !list.includes(p)) list.push(p);
+function rememberRoundFiles(file, items) {
+  if (!items || !items.length) return;
+  const map = new Map();
+  for (const x of readState(file).roundFiles || []) {
+    if (x && x.path) map.set(x.path, x.op);
+  }
+  for (const it of items) {
+    if (it && it.path) map.set(it.path, it.op);
+  }
+  const list = [...map.entries()].map(([path, op]) => ({ path, op }));
   writeState(file, { roundFiles: list.slice(-30) });
 }
 
@@ -676,6 +884,10 @@ async function main() {
   // 主控制台要按楼层（客户端）取相位，不能谁新鲜就显示谁。
   writeState(file, { client: CLIENT, sessionId: String((ev && ev.session_id) || '') });
 
+  // transcript 路径：Codex / CodeBuddy 的 hook payload 都带，存下来供 Stop 取"产出摘要"。
+  // 纯问答没有工具事件、Stop 也不带 last_assistant_message 时，只能从 transcript 读最后一条 assistant。
+  if (ev.transcript_path) writeState(file, { transcriptPath: String(ev.transcript_path) });
+
   // 心跳守护的"最后活跃时间"（它靠这个判断会话还在不在）
   if (event !== 'SessionEnd') writeState(file, { hb: { ...(readState(file).hb || {}), lastEventAt: Date.now() } });
 
@@ -808,7 +1020,7 @@ async function main() {
       if (touched.length) {
         await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: member, files: touched, op: opOf(ev.tool_name) });
         // 本地也记一份：上报失败（服务没起 / 接口报错）时完成概要仍拿得到文件清单
-        rememberRoundFiles(file, touched);
+        rememberRoundFiles(file, touched.map((p) => ({ path: p, op: opOf(ev.tool_name) })));
       }
       // 工具真正跑完了 → 权限已通过，撤掉"等授权"，回到"思考中"
       clearAwait(file);
@@ -855,15 +1067,41 @@ async function main() {
     const startedAt = Number(st.taskStartedAt) || 0;
     // 落"完成"标记：带工程路径 + 任务标题 + 起始时刻，服务端据此（且仅据此）亮"任务完成"概要，
     // 不再靠"相位回落到空闲"来猜，避免中途被其它工程串味误弹。
-    // Codex 的 Stop 带 last_assistant_message（收尾自述）——落进完成标记，主控制台拿它当摘要；
-    // CodeBuddy 没有这个字段，said 为空，仍然走"本轮改动文件"那套。
-    const said = String((ev && ev.last_assistant_message) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    // 本轮的 AI 回复：Stop 自带的 last_assistant_message 优先（Codex 实测有），
+    // 取不到（CodeBuddy 实测为空）就回退读 transcript —— 按各家落盘格式解析，见 turnReplies()。
+    const replies = turnReplies(ev.transcript_path || st.transcriptPath || '');
+    const eventSaid = String((ev && ev.last_assistant_message) || '').replace(/\s+/g, ' ').trim();
+    const lastText = eventSaid || (replies.length ? replies[replies.length - 1].text : '');
+    // 主控制台那口气泡只放一句话：摘要留短（160）；台账 result 与对话记录存全文（各有上限）。
+    const said = lastText.replace(/\s+/g, ' ').trim().slice(0, 160);
+    const result = lastText.trim().slice(0, RESULT_MAX);
+    // transcript 读不到（路径没了 / 格式不认识）时，至少把 Stop 自带的这句当成一条回复存下来；
+    // 去重键用正文哈希（同一轮重复上报仍不会写重，不同轮内容不同就是两条）。
+    if (!replies.length && lastText) replies.push({ id: 'h' + fnv1a32(lastText), text: lastText });
     // 本轮用工具动过的文件（PostToolUse 一路记下来的）：跟着完成标记一起落盘，
     // 这样 1.5s 快轮询拿到 doneAt 的**同一时刻**就有文件清单，不用等 10s 的会话快照，
     // 「任务完成」才不会退化成一句"本次任务已完成"。
-    const roundFiles = (st.roundFiles || []).filter((x) => typeof x === 'string' && x);
+    // 注意：rememberRoundFiles 存的是 {path, op} 对象（op 区分 新增/改动/删除），
+    // 这里只过滤无效项，不要把对象当成字符串丢掉（否则文件清单永远为空）。
+    const roundFiles = (st.roundFiles || []).filter((x) => x && (typeof x === 'string' ? x : x.path));
+    // 本轮用工具动过的文件：补上"当前体积（字节）"，主控制台好显示文件大小。
+    // 大小在收工那一刻现 stat（相对路径按 cwd / REAL_WS 拼成绝对路径），拼不出来 / 已删除就留 null。
+    // 之所以在 hook 侧算、不让服务端算：服务端按工程存的 workspace_path 反查文件，
+    // 而开发工程那条 workspace_path 往往为空 / 对不上，服务端 stat 必失败 → 大小永远 null。
+    const roundFileDetails = roundFiles.map((x) => {
+      const p = typeof x === 'string' ? x : x.path;
+      const op = typeof x === 'string' ? null : x.op;
+      let size = null;
+      try {
+        const st0 = fs.statSync(path.resolve(cwd || REAL_WS, p));
+        if (st0.isFile()) size = st0.size;
+      } catch {
+        /* 文件不存在 / 非文件：大小留 null（删除类本就无大小） */
+      }
+      return { path: p, op, size };
+    });
     // 收工上报：把**这一轮的产出**一起交给服务端进台账（task_runs）——
-    // 收尾自述 + 改动文件清单 + 模型，报表要的"输入 / 产出 / 改了多少文件 / 用了什么模型"就齐了。
+    // 收尾自述 + 改动文件清单（含大小）+ 模型，报表要的"输入 / 产出 / 改了多少文件 / 用了什么模型"就齐了。
     if (taskId) {
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
@@ -871,11 +1109,14 @@ async function main() {
         taskId,
         state: 'done',
         model: String(ev.model || ''),
-        result: said,
-        files: roundFiles,
-        fileCount: roundFiles.length,
+        result,
+        files: roundFileDetails,
+        fileCount: roundFileDetails.length,
       });
     }
+    // 每次 AI 回复都进对话记录（messages 表）——这是"每次回复入库"那条线，
+    // 与上面的 task_runs.result（一轮一条摘要）互不替代。
+    // 放在清 taskId 之前：消息要挂在本轮任务上；重复上报由 dedupeKey 吃掉。
     writeState(file, {
       taskId: null,
       taskWorkspacePath: '',
@@ -889,12 +1130,15 @@ async function main() {
         said,
         sessionId: String((ev && ev.session_id) || ''),
         // 只带前 8 条（屏上放不下就省略），总数另给一个字段，界面好写"改动 N 个文件"
-        files: roundFiles.slice(0, 8),
-        fileCount: roundFiles.length,
+        files: roundFileDetails.slice(0, 8),
+        fileCount: roundFileDetails.length,
       },
     });
+    // 先把"任务完成 / 空闲"告诉办公室，再做回复入库 —— 入库慢不该拖住界面。
+    // taskId / replies / sessionId 都在局部变量里，所以放在清状态之后归属也不会错。
     await beat();
     await status('idle');
+    await reportAiReplies(info, base, member, taskId, replies, String((ev && ev.session_id) || st.sessionId || ''));
     return;
   }
 
@@ -926,6 +1170,16 @@ async function main() {
 
   // 打断（ESC / 停止）：这一轮飞出去的召唤不可能还活着 —— 只收孤儿，不碰主会话的任务与相位。
   if (event === 'Interrupt') {
+    // 被打断的这一轮：之后再来一句 user，本轮回复就永远落在"上一条 user 之前"了 —— 先补一刀留档。
+    const stInt = readState(file);
+    await reportAiReplies(
+      info,
+      base,
+      member,
+      stInt.taskId,
+      turnReplies(ev.transcript_path || stInt.transcriptPath || ''),
+      String((ev && ev.session_id) || stInt.sessionId || '')
+    );
     sweepGhosts(file, REAL_WS);
     await beat();
     return;
@@ -944,6 +1198,17 @@ async function main() {
     // 注意：这里不能调 clearAwait() —— 它会把 done 一起清掉，而 done 是"上一轮任务完成"的标记，
     // 会话结束后办公室可能还停在这条会话上（尤其 codex exec 这种一次一进程的短会话），
     // 清掉就永远看不到「任务完成」摘要了。所以只清"当前进行中"的那几项。
+    // 兜底：Stop 没来（进程被杀 / 打断 / 一次一进程的 codex exec 收尾）时，本轮 AI 回复也别丢 ——
+    // 同样按"消息 id / 请求 id"去重，SessionEnd 之后再报一遍不会写重。
+    const stEnd = readState(file);
+    await reportAiReplies(
+      info,
+      base,
+      member,
+      stEnd.taskId,
+      turnReplies(ev.transcript_path || stEnd.transcriptPath || ''),
+      String((ev && ev.session_id) || stEnd.sessionId || '')
+    );
     writeState(file, { await: null, pending: null, sessionPhase: null });
     stopHeartbeat(member);
     // 兜底：会话都结束了，它召唤出去的幽灵不该还飘着（手工 scripts/subagents.js

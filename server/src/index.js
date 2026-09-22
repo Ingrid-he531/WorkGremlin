@@ -139,7 +139,7 @@ function createServer(opts = {}) {
     if (origin && (isLoopbackOrigin(origin) || origin === 'null')) {
       res.setHeader('Access-Control-Allow-Origin', origin === 'null' ? '*' : origin);
       res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type');
       res.setHeader('Access-Control-Max-Age', '86400');
       if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -327,6 +327,22 @@ function createServer(opts = {}) {
         }
       }, 2000)
     );
+
+    // 记录自动保留：启动即清一次，之后每 24h 按 retentionDays 清掉更早的任务记录。
+    // 定时器 unref 不阻止进程退出；清理失败不影响主流程。
+    const runRetentionCleanup = () => {
+      try {
+        const days = repo.getRetentionDays();
+        const beforeTs = clock.now() - days * 24 * 60 * 60 * 1000;
+        const n = repo.deleteTaskRunsByFilter({ beforeTs });
+        if (n > 0 && !opts.silent) console.log(`[workgremlin] 自动清理：删除 ${n} 条超过 ${days} 天的任务记录`);
+      } catch (err) {
+        if (!opts.silent) console.warn('[workgremlin] 自动清理失败：', err && err.message);
+      }
+    };
+    runRetentionCleanup();
+    timers.push(setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000));
+
     for (const t of timers) if (t.unref) t.unref();
 
     // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）

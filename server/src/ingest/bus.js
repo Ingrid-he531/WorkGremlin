@@ -11,6 +11,8 @@
  */
 
 const path = require('node:path');
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
 const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey } = require('@workgremlin/shared');
 const clock = require('../clock');
 const config = require('../config');
@@ -38,6 +40,9 @@ function normModel(v) {
   return s ? s.slice(0, 64) : null;
 }
 
+/** 台账"产出"全文上限：AI 回复按 hook 侧 RESULT_MAX(4000) 送上来，这里必须 >= 它，否则会被砍掉 */
+const RUN_RESULT_MAX = 4_000;
+
 /** 台账里的文本字段：压空白 + 截断；空串一律当"没有"（NULL） */
 function normText(v, max) {
   const s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
@@ -51,6 +56,75 @@ function jsonOrNull(v) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 当前 HEAD 的 commit sha（工作区不是 git 仓库 / 没装 git 时返回 null）。
+ * 用于"任务开始时"打基线，任务结束时再 diff 基线..HEAD 拿全量改动（含已提交部分）。
+ * @param {string} ws 工程工作区绝对路径
+ * @returns {string|null}
+ */
+function gitHead(ws) {
+  if (!ws) return null;
+  try {
+    return execFileSync('git', ['-C', ws, 'rev-parse', 'HEAD'], {
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString().trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 单个文件当前体积（字节）：按工作区路径 stat；文件不存在 / 非文件 -> null（绝不编造）。
+ * 删除类文件在 enrichFiles 里直接置 null，不调本函数。
+ * @param {string} ws 工程工作区绝对路径
+ * @param {string} rel 工作区相对路径
+ * @returns {number|null}
+ */
+function fileSize(ws, rel) {
+  if (!ws) return null;
+  try {
+    const st = fs.statSync(path.resolve(ws, rel));
+    return st.isFile() ? st.size : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把上报的文件清单补全为 [{path, op, size}]：
+ *   - op 来自 hook（write=新增 / edit=改动 / delete=删除；老数据无 op 一律按改动计）；
+ *   - size 由服务端按工作区路径 stat 当前文件体积（字节）；删除文件 / 不存在 -> null。
+ * 同一文件多次出现时，"最后一次出现"的 op 为准（后者覆盖，决定最终归类）。
+ * 最多保留前 50 条。空清单返回 null（落库时 files_json 置 NULL）。
+ * @param {string} ws 工程工作区绝对路径
+ * @param {Array<string|{path:string,op?:string}>} reportedFiles 上报侧给的文件
+ */
+function enrichFiles(ws, reportedFiles) {
+  const reported = Array.isArray(reportedFiles) ? reportedFiles : [];
+  const seen = new Map();
+  const sizeOf = new Map(); // hook 已算好的大小（按路径），优先于服务端 stat
+  for (const it of reported) {
+    const p = typeof it === 'string' ? it : (it && it.path);
+    if (!p) continue;
+    const op = typeof it === 'string' ? null : (it && it.op) || null;
+    seen.set(p, op); // 同一文件多次出现：后者覆盖（最后一次操作决定归类）
+    // 上报侧带了真实大小（hook 在收工那一刻按其真实工作区 stat 出来的）就记下，
+    // 服务端工程 workspace_path 对不上时也能正确显示文件大小。
+    if (typeof it !== 'string' && it && typeof it.size === 'number') sizeOf.set(p, it.size);
+  }
+  if (!seen.size) return null;
+  const list = [...seen.entries()].map(([p, op]) => {
+    let size;
+    // 优先用 hook 给的大小；没有（老数据 / subagent 上报）再按服务端 workspace_path 兜底 stat。
+    if (sizeOf.has(p)) size = sizeOf.get(p);
+    else size = op === 'delete' ? null : fileSize(ws, p);
+    return { path: p, op: op || 'edit', size };
+  });
+  const capped = list.slice(0, 50);
+  return capped.length ? capped : null;
 }
 
 /**
@@ -220,6 +294,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     // 台账：**主 agent** 的一轮任务 = 一次用户任务（输入就是用户原话）。
     // subagent 实例不走这条（它们记 subagent_runs），所以判据是"上报者是不是主 agent"。
     if (String(member.role || '') === 'agent') {
+      const wsRow0 = repo.getProject.get(project);
+      const baseline = wsRow0 && wsRow0.workspace_path ? gitHead(wsRow0.workspace_path) : null;
       repo.upsertTaskRun.run({
         id,
         projectId: project,
@@ -228,6 +304,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         model: normModel(p.model),
         title: p.title || '(未命名任务)',
         startedAt: ts,
+        baselineCommit: baseline,
       });
     }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(id));
@@ -309,13 +386,15 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         });
       }
       const startedAt = run ? Number(run.started_at) || null : null;
-      const files = Array.isArray(p.files) ? p.files.slice(0, 8).map(String) : null;
+      const wsRow = repo.getProject.get(project);
+      const reportedFiles = Array.isArray(p.files) ? p.files : [];
+      const filesJson = enrichFiles(wsRow ? wsRow.workspace_path : '', reportedFiles);
       repo.endTaskRun.run({
         id: p.taskId,
         model: normModel(p.model),
-        result: normText(p.result, 500),
+        result: normText(p.result, RUN_RESULT_MAX),
         fileCount: Number.isFinite(Number(p.fileCount)) ? Number(p.fileCount) : null,
-        filesJson: files ? jsonOrNull(files) : null,
+        filesJson: filesJson ? JSON.stringify(filesJson) : null,
         endedAt: ts,
         durationMs: startedAt && ts > startedAt ? ts - startedAt : null,
       });
@@ -357,10 +436,15 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    */
   function endSubagentRun(p) {
     if (!p || !p.id) return 0;
+    const project = p.project ? projectIdOf(p.project) : null;
+    const wsRow = project ? repo.getProject.get(project) : null;
+    const reportedFiles = Array.isArray(p.files) ? p.files : [];
+    const filesJson = enrichFiles(wsRow ? wsRow.workspace_path : '', reportedFiles);
     return repo.endSubagentRun.run({
       id: p.id,
       model: normModel(p.model),
-      result: normText(p.result, 500),
+      result: normText(p.result, RUN_RESULT_MAX),
+      filesJson: filesJson ? JSON.stringify(filesJson) : null,
       endedAt: Number(p.endedAt) || now(),
     }).changes;
   }

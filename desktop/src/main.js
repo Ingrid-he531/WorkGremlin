@@ -13,26 +13,66 @@ const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen } = require(
 const { createServer } = require('@workgremlin/server');
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const net = require('node:net');
 
 /** @type {ReturnType<typeof createServer> | null} */
 let server = null;
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
+/** 渲染层 / 建窗统一用的 server 信息（无论自起还是连接已有） */
+let serverInfo = null;
 /** 进原生全屏前的菜单栏可见性（退出时还原） */
 let menuVisibleBeforeFs = true;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 读 ~/.workgremlin/server.json（与 server 包 config.home() 同规则） */
+function readServerInfoFile() {
+  const home = process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
+  try {
+    const info = JSON.parse(fs.readFileSync(path.join(home, 'server.json'), 'utf8'));
+    if (info && Number.isInteger(info.port) && typeof info.token === 'string') return info;
+  } catch {}
+  return null;
+}
+
+/** 轻量探活：127.0.0.1:port 是否有人监听 */
+function pingPort(port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port });
+    const done = (ok) => { try { s.destroy(); } catch {} resolve(ok); };
+    const t = setTimeout(() => done(false), timeoutMs);
+    s.once('connect', () => { clearTimeout(t); done(true); });
+    s.once('error', () => { clearTimeout(t); done(false); });
+  });
+}
 
 async function bootstrap() {
   await app.whenReady();
 
   // 演示模式**没有启动开关**（原来的 --demo / --demo-seed / WORKGREMLIN_DEMO* 都散了）：
   // 它由界面上的「演示模式」按钮切换工程触发（见 server 的 syncDemo），启动一律接真实数据。
-  server = createServer();
 
-  const info = await server.start();
+  // 连接已有 server 模式（统一启动器 WORKGREMLIN_CONNECT=1 时）：server 已由脚本起好，
+  // 直接复用其端口 + token，不再内嵌自起（否则会再占一个端口、变成孤儿进程）。
+  if (process.env.WORKGREMLIN_CONNECT === '1') {
+    const existing = readServerInfoFile();
+    if (existing && (await pingPort(existing.port))) {
+      serverInfo = existing;
+      console.log(`[workgremlin] 连接已有 server：port=${existing.port}`);
+    } else {
+      console.warn('[workgremlin] WORKGREMLIN_CONNECT=1 但 server.json 无可用 server，回退为自起 server');
+    }
+  }
+  if (!serverInfo) {
+    server = createServer();
+    serverInfo = await server.start();
+  }
 
-  ipcMain.handle('workgremlin:get-server-info', () => server && server.info);
+  ipcMain.handle('workgremlin:get-server-info', () => serverInfo);
   ipcMain.handle('workgremlin:get-app-version', () => app.getVersion());
 
   // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）
@@ -91,7 +131,7 @@ async function bootstrap() {
   });
 
   buildMenu();
-  mainWindow = createWindow({ serverInfo: info });
+  mainWindow = createWindow({ serverInfo });
 
   /** 退出原生全屏时把菜单栏恢复成进去之前的样子 */
   mainWindow.on('leave-full-screen', () => {
@@ -120,8 +160,8 @@ app.on('window-all-closed', async () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0 && server) {
-    mainWindow = createWindow({ serverInfo: server.info });
+  if (BrowserWindow.getAllWindows().length === 0 && serverInfo) {
+    mainWindow = createWindow({ serverInfo });
   }
 });
 
