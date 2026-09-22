@@ -121,6 +121,14 @@ const FILTER_STATES = ['all', 'running', 'done', 'failed', 'cancelled', 'pending
 const filterState = ref('all');
 const keyword = ref('');
 
+/** 三个并列视图，共享上方筛选条件：列表视图（默认）/ 汇总报表 / 图形看板 */
+const VIEWS = [
+  { key: 'list', label: '列表视图' },
+  { key: 'summary', label: '汇总报表' },
+  { key: 'board', label: '图形看板' },
+];
+const view = ref('list');
+
 const list = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
   return (tasks.tasks || []).filter((t) => {
@@ -199,8 +207,20 @@ async function saveRetention() {
       <span v-if="tasks.loading" class="dim loading">刷新中…</span>
     </div>
 
-    <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理） -->
-    <div class="bulk-bar">
+    <!-- 三视图切换：共享上方筛选条件 -->
+    <div class="view-tabs">
+      <button
+        v-for="v in VIEWS"
+        :key="v.key"
+        type="button"
+        class="view-tab"
+        :class="{ on: view === v.key }"
+        @click="view = v.key"
+      >{{ v.label }}</button>
+    </div>
+
+    <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理）；仅列表视图，位于标签页下方 -->
+    <div class="bulk-bar" v-if="view === 'list'">
       <span class="dim">批量操作：</span>
       <button type="button" class="del-btn danger" @click="bulkDeleteAll">删除筛选结果</button>
       <span class="dim">自动保留最近</span>
@@ -209,7 +229,7 @@ async function saveRetention() {
       <button type="button" class="btn" @click="saveRetention">保存保留天数</button>
     </div>
 
-    <div class="body">
+    <div class="body" v-if="view === 'list'">
       <!-- 左：每行一次任务 -->
       <ul class="task-list" :class="{ empty: !list.length }">
         <li
@@ -391,6 +411,16 @@ async function saveRetention() {
         <span class="dim">从左侧选一条任务查看详情</span>
       </section>
     </div>
+
+    <!-- 汇总报表：占位，后续落地 -->
+    <div v-else-if="view === 'summary'" class="empty-pane">
+      <span class="dim">汇总报表（待实现）</span>
+    </div>
+
+    <!-- 图形看板：占位，后续落地 -->
+    <div v-else class="empty-pane">
+      <span class="dim">图形看板（待实现）</span>
+    </div>
   </div>
 </template>
 
@@ -402,15 +432,40 @@ async function saveRetention() {
   height: 100%;
   min-height: 0;
 }
-.toolbar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.title { font-weight: 600; letter-spacing: 1px; }
-.spacer { flex: 1; }
 .dim { color: var(--text-dim); font-size: 12px; }
 .loading { color: var(--accent); }
+
+/* 三视图切换 */
+.view-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.view-tab {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-dim);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 14px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.view-tab:hover { color: var(--text); border-color: var(--accent); }
+.view-tab.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+/* 未落地视图的占位面板 */
+.empty-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
 
 .filters {
   display: flex;
