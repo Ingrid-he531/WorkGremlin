@@ -6,7 +6,7 @@
  * 一张表管所有智能体（楼层）在所有工程里开着的会话，跟当前打开哪个工程无关。
  * 表里每条记录 = 一个会话，按**楼层**（受监控产品）分组，超时就剔除：
  *
- *   3F CodeBuddy 插件 —— 结构化落盘（genie-history / todos / message-queue / file-changes），
+ *   3F CodeBuddy Plugin —— 结构化落盘（genie-history / todos / message-queue / file-changes），
  *                        拿得到运行态、待办清单、改动文件（见 sessions.js）
  *   1F CodeBuddy CLI、
  *   2F WorkBuddy CLI、

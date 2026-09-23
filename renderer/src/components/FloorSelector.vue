@@ -1,7 +1,7 @@
 <script setup>
 /**
  * FloorSelector —— 左侧竖向堆叠的"楼层"胶囊。
- * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy 插件 / 4F Codex CLI / 5F Claude Code CLI。
+ * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy Plugin / 4F Codex CLI / 5F Claude Code CLI。
  *
  * 状态点看的是**这一层有没有活跃会话**（全局活跃会话表，60 分钟没事件会剔除）：
  *   - 有活跃会话：绿色状态点 + 数量角标

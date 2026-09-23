@@ -4,7 +4,7 @@
  * 楼层 = 受监控的产品源。
  *   1F  CodeBuddy CLI
  *   2F  WorkBuddy CLI
- *   3F  CodeBuddy 插件
+ *   3F  CodeBuddy Plugin
  *   4F  Codex CLI
  *   5F  Claude Code CLI
  *
@@ -289,7 +289,7 @@ const PRODUCTS = [
     name: 'CodeBuddy CLI',
     kind: 'cli',
     cmd: 'codebuddy',
-    dataKind: 'codebuddy',
+    dataKind: 'codebuddy-cli',
     plugin: false,
   },
   {
@@ -302,7 +302,7 @@ const PRODUCTS = [
   },
   {
     id: '3F',
-    name: 'CodeBuddy 插件',
+    name: 'CodeBuddy Plugin',
     kind: 'plugin',
     cmd: '',
     dataKind: 'codebuddy',

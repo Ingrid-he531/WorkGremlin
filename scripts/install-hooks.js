@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * 把 WorkGremlin 的上报 hook 装进 CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI 的 settings.json。
+ * 把 WorkGremlin 的上报 hook 装进 CodeBuddy Plugin / CodeBuddy CLI / WorkBuddy CLI 的 settings.json。
  *
  * 用法：
  *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy）
@@ -13,7 +13,7 @@
  *   node scripts/install-hooks.js --dry-run              只打印将要写什么，不落盘
  *
  * 说明：
- *   - CodeBuddy 插件与 CodeBuddy CLI 共用同一份用户级配置（~/.codebuddy/settings.json），
+ *   - CodeBuddy Plugin与 CodeBuddy CLI 共用同一份用户级配置（~/.codebuddy/settings.json），
  *     所以 codebuddy 这一份同时覆盖两者；matcher 里 CLI 风格（Write/Edit）与 IDE 风格
  *     （write_to_file/replace_in_file）都写了，两端都能命中。
  *   - 合并写、可重复执行：先摘掉上一次我们自己加的条目（按 command 里含 hook 脚本路径识别），
@@ -241,7 +241,7 @@ function findPluginDir() {
 function looksInstalled(t) {
   // CLI：PATH 或常见安装目录里找得到可执行文件
   if (t.cmd && (resolveCommand(t.cmd) || findCliBin(t.cmd))) return true;
-  // 插件：编辑器扩展目录里找得到（CodeBuddy 插件与 CLI 共用 ~/.codebuddy）
+  // 插件：编辑器扩展目录里找得到（CodeBuddy Plugin与 CLI 共用 ~/.codebuddy）
   if (t.plugin && findPluginDir()) return true;
   // 兜底：配置目录里除了我们自己的 settings.json 还有别的数据
   const ours = new Set(['settings.json', 'settings.json.bak-workgremlin']);
@@ -286,7 +286,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   const all = [
     {
       id: 'codebuddy',
-      label: 'CodeBuddy 插件 / CodeBuddy CLI',
+      label: 'CodeBuddy Plugin / CodeBuddy CLI',
       file: path.join(os.homedir(), '.codebuddy', 'settings.json'),
       cmd: 'codebuddy',
       dir: path.join(os.homedir(), '.codebuddy'),
@@ -372,7 +372,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('[workgremlin] · Codex CLI：hook 需要「信任」才会执行 —— 首次在新会话里用 /hooks 批准一次；');
     console.log('                       自动化场合可临时加 --dangerously-bypass-hook-trust');
     console.log('[workgremlin] 生效方式：');
-    console.log('  · CodeBuddy 插件：重开会话');
+    console.log('  · CodeBuddy Plugin：重开会话');
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');
     console.log('  · 想换工位名：node scripts/install-hooks.js --uninstall && node scripts/install-hooks.js --member coder');
     console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');

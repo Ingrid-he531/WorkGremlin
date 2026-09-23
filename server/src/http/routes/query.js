@@ -82,6 +82,7 @@ function createQueryRouter({ bus, repo }) {
            t.id, t.project_id, t.member_id, t.parent_task_id, t.title,
            t.progress, t.started_at, t.ended_at,
            COALESCE(tr.client, m.client) AS client,
+           m.name AS member_name,
            tr.model AS model,
            tr.file_count AS file_count,
            tr.files_json AS files_json,

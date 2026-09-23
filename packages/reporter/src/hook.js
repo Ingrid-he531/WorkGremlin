@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI 的 hook 入口。
+ * CodeBuddy Plugin / CodeBuddy CLI / WorkBuddy CLI 的 hook 入口。
  *
  * 由 scripts/install-hooks.js 写进各家的 settings.json，形如：
  *   { "hooks": { "SessionStart": [ { "matcher": "", "hooks": [
@@ -52,6 +52,23 @@ const CLIENT = String(process.env.WORKGREMLIN_CLIENT || 'codebuddy').toLowerCase
 const IS_CODEX = CLIENT === 'codex';
 /** spawn_agent → SubagentStart 之间的"待认领"窗口 */
 const PENDING_SPAWN_MS = 2 * 60_000;
+
+/**
+ * 本事件究竟来自哪个客户端（codebuddy / codebuddy-cli / codex / …）。
+ *
+ * CodeBuddy **Plugin** 的 hook payload 带 `client` 字段（实测为 'codebuddy'），直接用它；
+ * **CLI** 与 Plugin 共用同一份 ~/.codebuddy/settings.json、跑同一条 hook 命令，但 CLI 的
+ * payload 不带 `client` 字段 —— 这种事件一律当作 CLI，归到专属的 'codebuddy-cli'，
+ * 免得和 Plugin 的 'codebuddy' 撞车（数据库楼层列 / 成员 / 会话归属据此分开）。
+ * 显式带 WORKGREMLIN_CLIENT（如未来为 CLI 单独注入 codebuddy-cli）时，无 payload client 也用它。
+ * @param {any} ev hook 事件
+ * @returns {string}
+ */
+function eventClient(ev) {
+  const ec = ev && ev.client ? String(ev.client).trim().toLowerCase() : '';
+  if (ec) return ec;
+  return CLIENT === 'codebuddy' ? 'codebuddy-cli' : CLIENT;
+}
 
 /** 本 reporter 进程真实运行所在的工程（cwd 解析成绝对路径）。
  * 相位 / task 都打这个路径，服务端据此把"当前工程"归到你真正在敲的工程，
@@ -427,8 +444,8 @@ function replyKeyOf(reply) {
 }
 
 /** 对话记录里每条 AI 回复的去重键：同一轮重复上报（Stop 之后又来 SessionEnd、重放）不会写重 */
-function aiDedupeKey(sessionId, msgId) {
-  return `ai:${CLIENT}:${String(sessionId || 'nosession')}:${String(msgId || 'noid')}`;
+function aiDedupeKey(client, sessionId, msgId) {
+  return `ai:${client}:${String(sessionId || 'nosession')}:${String(msgId || 'noid')}`;
 }
 
 /**
@@ -436,7 +453,7 @@ function aiDedupeKey(sessionId, msgId) {
  * 与 task_runs.result（一轮一条摘要）互不替代。
  * 一条都拿不到就什么都不做（绝不编造）；超长单条按 MSG_MAX 截断，别把一条消息撑爆。
  */
-async function reportAiReplies(info, base, member, taskId, replies, sessionId) {
+async function reportAiReplies(info, base, member, taskId, replies, sessionId, client) {
   if (!Array.isArray(replies) || !replies.length) return;
   const list = replies.slice(-MAX_REPLIES);
   const now = Date.now();
@@ -462,7 +479,7 @@ async function reportAiReplies(info, base, member, taskId, replies, sessionId) {
           content: content.slice(0, MSG_MAX),
           taskId: taskId || null,
           ts,
-          dedupeKey: aiDedupeKey(sessionId, replyKeyOf(list[i])),
+          dedupeKey: aiDedupeKey(client, sessionId, replyKeyOf(list[i])),
         });
       })
       .filter(Boolean)
@@ -504,7 +521,7 @@ function writeFeedFile(file, feed) {
 }
 
 /**
- * 召唤 subagent 的工具名：CodeBuddy 插件 / CLI 用的是 **task**（小写，实测 PostToolUse
+ * 召唤 subagent 的工具名：CodeBuddy Plugin / CLI 用的是 **task**（小写，实测 PostToolUse
  * 里就是 `task`；老日志里的 `Task` 是同一支工具的另一种写法）；Claude Code 风格叫 agent。
  * 两个都认，且**忽略大小写** —— 大小写敏感时小写 `task` 匹配不上，收工那一步
  * （PostToolUse → finishGhost）永远不执行，幽灵只能等 Stop / SessionEnd 兜底扫掉，
@@ -543,7 +560,7 @@ function agentTask(input) {
  * 本次召唤的 **key 候选列表**（由强到弱），用来把"召唤"与"收工"配成一对。
  *
  *   1) 真 per-call id（tool_use_id / call_id …）—— Claude Code 风格有；
- *      **CodeBuddy 插件没有**：读扩展源码（out/extension/index.js）实测，PreToolUse / PostToolUse
+ *      **CodeBuddy Plugin没有**：读扩展源码（out/extension/index.js）实测，PreToolUse / PostToolUse
  *      的 payload 只有 session_id / transcript_path / cwd / tool_name / tool_input / tool_response /
  *      generation_id / model / agent_type / agent_id / client / version —— 一个 per-call id 都没有。
  *   2) 那就用**两端应当一致**的字段合成：PostToolUse 会原样带回 tool_input，所以
@@ -592,11 +609,11 @@ function subagentKeys(ev, name, task) {
  * 所以收工 / 扫场必须认来源，否则会把对方的幽灵一起收掉。
  * 写了 client 的按 client 认；没写的（老版本 hook / 手工脚本）算 CodeBuddy 的历史条目。
  */
-function ownsEntry(a) {
+function ownsEntry(a, client) {
   if (!a) return false;
   const c = String(a.client || '').trim().toLowerCase();
-  if (c) return c === CLIENT;
-  return CLIENT === 'codebuddy';
+  if (c) return c === client;
+  return client === 'codebuddy';
 }
 
 /**
@@ -612,7 +629,7 @@ function ownsEntry(a) {
  * @param {string} parent 召唤它的那轮用户任务 id（主 agent 当前任务）—— 台账认父用
  * @param {string} model 召唤时的模型（拿不到就空，服务端留 NULL）
  */
-function addGhost(workspacePath, name, task, id, parent, model) {
+function addGhost(workspacePath, name, task, id, parent, model, client) {
   const file = feedFileFor(workspacePath);
   const feed = readFeedFile(file);
   const dup = id ? (a) => a.id === id : (a) => a.name === name;
@@ -621,7 +638,7 @@ function addGhost(workspacePath, name, task, id, parent, model) {
     name,
     state: 'busy',
     ts: Date.now(),
-    client: CLIENT, // 归属：同一个工程下 Codex 与 CodeBuddy 共用一个清单文件
+    client, // 归属：同一个工程下 Codex / CLI / Plugin 共用一个清单文件，按 client 区分
     ...(task ? { task } : {}),
     ...(id ? { id } : {}),
     ...(parent ? { parent } : {}),
@@ -749,7 +766,7 @@ function finishGhost(file, workspacePath, ev, opts = {}) {
  * SessionEnd 全扫（会话都没了，没什么好汇报的了）。
  * @returns {number} 清掉的条数
  */
-function sweepGhosts(stateFile, workspacePath, opts = {}) {
+function sweepGhosts(stateFile, workspacePath, client, opts = {}) {
   // 注意两个路径别搞混：stateFile 是 hook 状态文件（账本在里面），
   // 清单文件要按 workspacePath 现算 —— 混了的话本函数会静默变成空操作。
   const feedFile = feedFileFor(workspacePath);
@@ -757,7 +774,7 @@ function sweepGhosts(stateFile, workspacePath, opts = {}) {
   // 默认只扫「从没收过工的孤儿」（没有 result）：带 result 的已经进了「待汇报」流程，
   // 由 subagentFeed 播完汇报再回收 —— 连它一起扫会把刚做好的汇报动画掐掉。
   // 会话真的结束了（SessionEnd）才 all:true 全清。
-  const doomed = feed.agents.filter((a) => a && a.ts && ownsEntry(a) && (opts.all || !a.result));
+  const doomed = feed.agents.filter((a) => a && a.ts && ownsEntry(a, client) && (opts.all || !a.result));
   if (!doomed.length) return 0;
   writeFeedFile(feedFile, { ...feed, agents: feed.agents.filter((a) => !doomed.includes(a)) });
 
@@ -874,15 +891,17 @@ async function main() {
   }
   const event = ev && ev.hook_event_name;
   if (!event) return;
-  trace(event, { member, tool: ev.tool_name, notification_type: ev.notification_type });
+  // 本次事件归属的客户端：Plugin 用 payload 的 client（'codebuddy'），CLI 用专属 'codebuddy-cli'
+  const cl = eventClient(ev);
+  trace(event, { member, client: cl, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const ctx = await resolveCtx(info);
   const base = { project: ctx.project, workspacePath: ctx.workspacePath };
   const file = statePath(member);
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
-  // 状态文件里记下来源客户端：同一个工程可能同时有 Codex 与 CodeBuddy 在跑，
+  // 状态文件里记下来源客户端：同一个工程可能同时有 Codex / CLI / Plugin 在跑，
   // 主控制台要按楼层（客户端）取相位，不能谁新鲜就显示谁。
-  writeState(file, { client: CLIENT, sessionId: String((ev && ev.session_id) || '') });
+  writeState(file, { client: cl, sessionId: String((ev && ev.session_id) || '') });
 
   // transcript 路径：Codex / CodeBuddy 的 hook payload 都带，存下来供 Stop 取"产出摘要"。
   // 纯问答没有工具事件、Stop 也不带 last_assistant_message 时，只能从 transcript 读最后一条 assistant。
@@ -898,7 +917,7 @@ async function main() {
       name: member,
       role: process.env.WORKGREMLIN_ROLE || 'agent',
       // 来源客户端：办公室按当前楼层的客户端过滤成员（server 的 members.client）
-      client: CLIENT,
+      client: cl,
     });
   const beat = () => request(info, HTTP_ROUTES.HEARTBEAT, { ...base, memberId: member });
   const status = (state, reason) =>
@@ -917,7 +936,7 @@ async function main() {
   if (event === 'UserPromptSubmit') {
     // 新一轮用户输入 = 上一轮已经结束：Task 是阻塞工具，轮次一结束它就不可能在飞了。
     // 结束事件可能丢（实测：打断时 PostToolUse / SubagentStop 都不来），这里兜底扫掉。
-    sweepGhosts(file, REAL_WS);
+    sweepGhosts(file, REAL_WS, cl);
     clearAwait(file); // 新的一轮用户输入：之前挂起的"等授权"作废
     const prompt = String(ev.prompt || '');
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
@@ -1010,7 +1029,7 @@ async function main() {
           const id = subagentKeys(ev, nm, task)[0] || '';
           rememberSubagent(file, id, nm);
           // parent = 主 agent 当前这一轮的用户任务 id：台账靠它把这次召唤挂到那一轮头上
-          addGhost(REAL_WS, nm, task, id, String(readState(file).taskId || ''), String(ev.model || ''));
+          addGhost(REAL_WS, nm, task, id, String(readState(file).taskId || ''), String(ev.model || ''), cl);
           trace('ghost+', { member, tool, name: nm, id, gen: ev.generation_id || '', agentId: ev.agent_id || '' });
         }
       }
@@ -1058,7 +1077,7 @@ async function main() {
   if (event === 'Stop') {
     clearAwait(file);
     // 本轮结束：同理，屋里不该再留着上一轮召唤的幽灵
-    sweepGhosts(file, REAL_WS);
+    sweepGhosts(file, REAL_WS, cl);
     const st = readState(file);
     const taskId = st.taskId;
     const title = st.taskTitle || '';
@@ -1138,7 +1157,7 @@ async function main() {
     // taskId / replies / sessionId 都在局部变量里，所以放在清状态之后归属也不会错。
     await beat();
     await status('idle');
-    await reportAiReplies(info, base, member, taskId, replies, String((ev && ev.session_id) || st.sessionId || ''));
+    await reportAiReplies(info, base, member, taskId, replies, String((ev && ev.session_id) || st.sessionId || ''), cl);
     return;
   }
 
@@ -1161,7 +1180,7 @@ async function main() {
     const name = (type && type !== 'default' ? type : '') || (pend && pend.name) || 'subagent';
     const id = agentIdOf(ev) || subagentKeys(ev, name, (pend && pend.task) || '')[0] || '';
     rememberSubagent(file, id, name);
-    addGhost(REAL_WS, name, (pend && pend.task) || '', id, String(readState(file).taskId || ''), String(ev.model || ''));
+    addGhost(REAL_WS, name, (pend && pend.task) || '', id, String(readState(file).taskId || ''), String(ev.model || ''), cl);
     writeState(file, { pendingSpawn: null });
     trace('ghost+', { member, tool: 'SubagentStart', name, id, agentType: type });
     await beat();
@@ -1178,9 +1197,10 @@ async function main() {
       member,
       stInt.taskId,
       turnReplies(ev.transcript_path || stInt.transcriptPath || ''),
-      String((ev && ev.session_id) || stInt.sessionId || '')
+      String((ev && ev.session_id) || stInt.sessionId || ''),
+      cl
     );
-    sweepGhosts(file, REAL_WS);
+    sweepGhosts(file, REAL_WS, cl);
     await beat();
     return;
   }
@@ -1207,13 +1227,14 @@ async function main() {
       member,
       stEnd.taskId,
       turnReplies(ev.transcript_path || stEnd.transcriptPath || ''),
-      String((ev && ev.session_id) || stEnd.sessionId || '')
+      String((ev && ev.session_id) || stEnd.sessionId || ''),
+      cl
     );
     writeState(file, { await: null, pending: null, sessionPhase: null });
     stopHeartbeat(member);
     // 兜底：会话都结束了，它召唤出去的幽灵不该还飘着（手工 scripts/subagents.js
     // 写的那些没有 ts，不动它们）。
-    sweepGhosts(file, REAL_WS, { all: true });
+    sweepGhosts(file, REAL_WS, cl, { all: true });
     writeState(file, { taskId: null, taskWorkspacePath: '', taskStartedAt: 0, subagents: [] });
     await status('offline');
   }

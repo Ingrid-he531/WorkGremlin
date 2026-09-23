@@ -27,8 +27,9 @@ function memberIdOf(project, name) {
   return String(name).includes('@') ? name : `${name}@${project}`;
 }
 
-/** 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL） */
-const CLIENTS = new Set(['codebuddy', 'workbuddy', 'codex', 'claude']);
+/** 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL）
+ *  codebuddy-cli = CodeBuddy CLI（与 CodeBuddy Plugin 共用 ~/.codebuddy，靠 hook payload 的 client 字段区分） */
+const CLIENTS = new Set(['codebuddy', 'codebuddy-cli', 'workbuddy', 'codex', 'claude']);
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
   return CLIENTS.has(c) ? c : null;

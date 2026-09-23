@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 会话（conversation）—— 当前智能体（CodeBuddy 插件）在各个工程下开着的会话。
+ * 会话（conversation）—— 当前智能体（CodeBuddy Plugin）在各个工程下开着的会话。
  *
  * 真源是插件自己的落盘（不经我们同意也一直在写），四个目录互相索引：
  *   genie-history/{base64(工程目录)}/conversations/{会话id}/   工程 ↔ 会话名单（目录本身是空的）
@@ -267,7 +267,7 @@ const NEVER_AWAIT_TOOLS = new Set([
  * 命令类工具（Bash / execute_command …）：**服务端一律按"调用工具"上报，不做任何特殊化**。
  *
  * 为什么不在这里把 Bash 标成 await（等待授权）或改文案：
- * 本环境实测 CodeBuddy 插件既不发"等授权"通知、也不发"授权结束"通知，而命令类工具
+ * 本环境实测 CodeBuddy Plugin既不发"等授权"通知、也不发"授权结束"通知，而命令类工具
  * 又不发 PostToolUse —— 于是"到底有没有在等授权"根本没有真信号。以前靠"工具是 Bash"
  * 直接标 await，结果点了 run 之后没有任何事件能把它清掉，主控制台就一路卡在「等待授权」。
  *

@@ -42,6 +42,7 @@ watch(
     tasks.filterClient = 'all';
     filterState.value = 'all';
     keyword.value = '';
+    filterModel.value = '';
     if (id) tasks.fetchTasks();
   }
 );
@@ -129,14 +130,141 @@ const VIEWS = [
 ];
 const view = ref('list');
 
+// 模型无专属下拉，留给“汇总报表”点行下钻时用的客户端筛选（默认空=不过滤，不影响列表视图现有逻辑）
+const filterModel = ref('');
+
 const list = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
+  const fm = filterModel.value;
   return (tasks.tasks || []).filter((t) => {
     if (filterState.value !== 'all' && t.state !== filterState.value) return false;
     if (kw && !(t.title || '').toLowerCase().includes(kw)) return false;
+    if (fm && (t.model || '') !== fm) return false;
     return true;
   });
 });
+
+// ---- 汇总报表：按维度聚合（基于已筛选的 list，三视图共享筛选条件）----
+const DIMS = [
+  { key: 'project', label: '按工程' },
+  { key: 'model', label: '按模型' },
+  { key: 'floor', label: '按楼层' },
+];
+const DIM_COL = { project: '工程', model: '模型', floor: '楼层' };
+const reportDim = ref('project');
+const reportSort = ref({ key: 'taskCount', dir: 'desc' });
+
+function dimValue(t, dim) {
+  if (dim === 'project') return t.project_id || '';
+  if (dim === 'model') return t.model || '';
+  if (dim === 'floor') return t.client || '';
+  return '';
+}
+function dimLabel(t, dim) {
+  if (dim === 'project') return (projectOptions.value.find((p) => p.id === t.project_id) || {}).name || t.project_id || '(未命名工程)';
+  if (dim === 'model') return t.model || '(未记录)';
+  if (dim === 'floor') return (floorOptions.value.find((f) => f.client === t.client) || {}).name || t.client || '(未记录)';
+  return '';
+}
+const reportGroups = computed(() => {
+  const dim = reportDim.value;
+  const map = new Map();
+  for (const t of list.value) {
+    const k = dimValue(t, dim);
+    let g = map.get(k);
+    if (!g) {
+      g = { key: k, label: dimLabel(t, dim), taskCount: 0, successCount: 0, failCount: 0, fileCount: 0, durationSum: 0, durN: 0 };
+      map.set(k, g);
+    }
+    g.taskCount += 1;
+    if (t.state === 'done') g.successCount += 1;
+    else if (t.state === 'failed') g.failCount += 1;
+    g.fileCount += Number(t.file_count) || 0;
+    const d = Number(t.duration_ms) || 0;
+    if (d > 0) { g.durationSum += d; g.durN += 1; }
+  }
+  return [...map.values()].map((g) => {
+    const avgDuration = g.durN ? g.durationSum / g.durN : 0;
+    const minutes = g.durationSum / 60000;
+    const efficiency = minutes > 0 ? g.fileCount / minutes : 0;
+    return { ...g, avgDuration, efficiency };
+  });
+});
+const reportTotal = computed(() => {
+  const a = reportGroups.value.reduce(
+    (s, g) => ({
+      taskCount: s.taskCount + g.taskCount,
+      successCount: s.successCount + g.successCount,
+      failCount: s.failCount + g.failCount,
+      fileCount: s.fileCount + g.fileCount,
+      durationSum: s.durationSum + g.durationSum,
+      durN: s.durN + g.durN,
+    }),
+    { taskCount: 0, successCount: 0, failCount: 0, fileCount: 0, durationSum: 0, durN: 0 }
+  );
+  const avgDuration = a.durN ? a.durationSum / a.durN : 0;
+  const minutes = a.durationSum / 60000;
+  const efficiency = minutes > 0 ? a.fileCount / minutes : 0;
+  return { label: '合计', taskCount: a.taskCount, successCount: a.successCount, failCount: a.failCount, fileCount: a.fileCount, avgDuration, efficiency };
+});
+const reportSorted = computed(() => {
+  const rows = reportGroups.value.slice();
+  const { key, dir } = reportSort.value;
+  if (key) rows.sort((x, y) => (dir === 'asc' ? x[key] - y[key] : y[key] - x[key]));
+  return rows;
+});
+const dimColName = computed(() => DIM_COL[reportDim.value] || '维度');
+function sortBy(key) {
+  if (reportSort.value.key === key) reportSort.value.dir = reportSort.value.dir === 'asc' ? 'desc' : 'asc';
+  else reportSort.value = { key, dir: 'desc' };
+}
+function sortCls(key) {
+  const s = reportSort.value;
+  return { active: s.key === key, asc: s.key === key && s.dir === 'asc', desc: s.key === key && s.dir === 'desc' };
+}
+function effClass(e) {
+  if (e >= 8) return 'eff-high';
+  if (e <= 1) return 'eff-low';
+  return '';
+}
+/** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
+function drillDown(row) {
+  const dim = reportDim.value;
+  filterModel.value = '';
+  if (dim === 'project') { tasks.filterProject = row.key || 'all'; tasks.filterClient = 'all'; }
+  else if (dim === 'floor') { tasks.filterClient = row.key || 'all'; tasks.filterProject = 'all'; }
+  else if (dim === 'model') { filterModel.value = row.key; }
+  view.value = 'list';
+}
+/** 导出报表为 CSV（客户端 Blob 下载，含当前排序与合计行） */
+function exportCsv() {
+  const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
+  const head = ['维度', '任务数', '成功数', '失败数', '改动文件数', '总耗时(ms)', '平均耗时(ms)', '效率(文件/分钟)'];
+  const rows = reportSorted.value.map((r) => [
+    r.label, r.taskCount, r.successCount, r.failCount, r.fileCount,
+    Math.round(r.durationSum), Math.round(r.avgDuration), r.efficiency.toFixed(2),
+  ]);
+  rows.push([
+    reportTotal.value.label, reportTotal.value.taskCount, reportTotal.value.successCount,
+    reportTotal.value.failCount, reportTotal.value.fileCount,
+    Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration), reportTotal.value.efficiency.toFixed(2),
+  ]);
+  const csv = [head, ...rows]
+    .map((line) => line.map((c) => {
+      const s = String(c);
+      return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    }).join(','))
+    .join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `汇总报表_${dimLabelNow}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
 // ---- 删除 ----
 /** 单个删除：二次确认（点一次变"确认删除?"，再点才真删，期间可"取消"） */
@@ -178,6 +306,7 @@ async function saveRetention() {
   <div class="view" data-testid="task-records">
     <!-- 筛选：一级（工程 + 楼层）+ 二级（状态分段）+ 标题搜索 + 计数，仅本页生效 -->
     <div class="filters">
+      <span class="spacer" />
       <select v-model="tasks.filterProject" class="sel" aria-label="按工程筛选">
         <option value="all">全部工程</option>
         <option v-for="p in projectOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
@@ -186,16 +315,10 @@ async function saveRetention() {
         <option value="all">全部楼层</option>
         <option v-for="f in floorOptions" :key="f.id" :value="f.client">{{ f.name }}</option>
       </select>
-      <div class="chips">
-        <button
-          v-for="s in FILTER_STATES"
-          :key="s"
-          type="button"
-          class="chip"
-          :class="{ on: filterState === s }"
-          @click="filterState = s"
-        >{{ stateLabel(s) }}</button>
-      </div>
+      <select v-model="filterState" class="sel" aria-label="按状态筛选">
+        <option value="all">全部状态</option>
+        <option v-for="s in FILTER_STATES.filter((s) => s !== 'all')" :key="s" :value="s">{{ stateLabel(s) }}</option>
+      </select>
       <input
         v-model="keyword"
         class="search"
@@ -203,8 +326,7 @@ async function saveRetention() {
         placeholder="搜索任务标题…"
         aria-label="搜索任务标题"
       />
-      <span class="dim">共 {{ list.length }} 次任务</span>
-      <span v-if="tasks.loading" class="dim loading">刷新中…</span>
+      <span class="dim count">共 {{ list.length }} 次任务</span>
     </div>
 
     <!-- 三视图切换：共享上方筛选条件 -->
@@ -217,16 +339,6 @@ async function saveRetention() {
         :class="{ on: view === v.key }"
         @click="view = v.key"
       >{{ v.label }}</button>
-    </div>
-
-    <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理）；仅列表视图，位于标签页下方 -->
-    <div class="bulk-bar" v-if="view === 'list'">
-      <span class="dim">批量操作：</span>
-      <button type="button" class="del-btn danger" @click="bulkDeleteAll">删除筛选结果</button>
-      <span class="dim">自动保留最近</span>
-      <input v-model.number="retentionDays" class="days" type="number" min="1" max="3650" aria-label="保留天数" />
-      <span class="dim">天（更早记录由服务端自动清理）</span>
-      <button type="button" class="btn" @click="saveRetention">保存保留天数</button>
     </div>
 
     <div class="body" v-if="view === 'list'">
@@ -412,9 +524,80 @@ async function saveRetention() {
       </section>
     </div>
 
-    <!-- 汇总报表：占位，后续落地 -->
-    <div v-else-if="view === 'summary'" class="empty-pane">
-      <span class="dim">汇总报表（待实现）</span>
+    <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理）；仅列表视图，位于列表页底部 -->
+    <div class="bulk-bar" v-if="view === 'list'">
+      <span class="dim">批量操作：</span>
+      <button type="button" class="del-btn danger" @click="bulkDeleteAll">删除筛选结果</button>
+      <span class="dim">自动保留最近</span>
+      <input v-model.number="retentionDays" class="days" type="number" min="1" max="3650" aria-label="保留天数" />
+      <span class="dim">天（更早记录由服务端自动清理）</span>
+      <button type="button" class="btn" @click="saveRetention">保存保留天数</button>
+    </div>
+
+    <!-- 汇总报表：按维度聚合的表格；共享上方筛选栏条件 -->
+    <div v-else-if="view === 'summary'" class="report">
+      <div class="report-bar">
+        <div class="dim-tabs">
+          <button
+            v-for="d in DIMS"
+            :key="d.key"
+            type="button"
+            class="view-tab"
+            :class="{ on: reportDim === d.key }"
+            @click="reportDim = d.key"
+          >{{ d.label }}</button>
+        </div>
+        <button type="button" class="btn export" @click="exportCsv">导出 CSV</button>
+      </div>
+
+      <div v-if="reportGroups.length" class="report-scroll">
+        <table class="report-table">
+          <thead>
+            <tr>
+              <th class="th-dim">{{ dimColName }}</th>
+              <th class="sortable num" :class="sortCls('taskCount')" @click="sortBy('taskCount')">任务数</th>
+              <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">成功数</th>
+              <th class="sortable num" :class="sortCls('failCount')" @click="sortBy('failCount')">失败数</th>
+              <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">改动文件数</th>
+              <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">总耗时</th>
+              <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">平均耗时</th>
+              <th class="sortable num" :class="sortCls('efficiency')" @click="sortBy('efficiency')">效率</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="r in reportSorted"
+              :key="r.key"
+              class="report-row"
+              @click="drillDown(r)"
+            >
+              <td class="td-dim">{{ r.label }}</td>
+              <td class="num">{{ r.taskCount }}</td>
+              <td class="num">{{ r.successCount }}</td>
+              <td class="num">{{ r.failCount }}</td>
+              <td class="num">{{ r.fileCount }}</td>
+              <td class="num">{{ fmtDuration(r.durationSum) }}</td>
+              <td class="num">{{ fmtDuration(r.avgDuration) }}</td>
+              <td class="num" :class="effClass(r.efficiency)">{{ r.efficiency.toFixed(1) }}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr class="total-row">
+              <td class="td-dim">{{ reportTotal.label }}</td>
+<td class="num">{{ reportTotal.taskCount }}</td>
+              <td class="num">{{ reportTotal.successCount }}</td>
+              <td class="num">{{ reportTotal.failCount }}</td>
+              <td class="num">{{ reportTotal.fileCount }}</td>
+              <td class="num">{{ fmtDuration(reportTotal.durationSum) }}</td>
+              <td class="num">{{ fmtDuration(reportTotal.avgDuration) }}</td>
+              <td class="num" :class="effClass(reportTotal.efficiency)">{{ reportTotal.efficiency.toFixed(1) }}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      <div v-else class="empty-pane">
+        <span class="dim">当前筛选条件下暂无数据</span>
+      </div>
     </div>
 
     <!-- 图形看板：占位，后续落地 -->
@@ -434,6 +617,10 @@ async function saveRetention() {
 }
 .dim { color: var(--text-dim); font-size: 12px; }
 .loading { color: var(--accent); }
+/* 弹性占位：把筛选控件组整体顶到右侧 */
+.spacer { flex: 1; }
+/* 计数：固定宽度 + 右对齐 + 等宽数字，避免数字位数变化引发水平抖动 */
+.count { flex: 0 0 100px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 /* 三视图切换 */
 .view-tabs {
@@ -467,26 +654,80 @@ async function saveRetention() {
   background: var(--bg-panel);
 }
 
+/* 汇总报表 */
+.report {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+}
+.report-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.dim-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn.export { border-color: var(--accent); color: var(--accent); }
+.btn.export:hover { background: var(--accent-soft); }
+.report-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.report-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-weight: 600;
+  text-align: right;
+  padding: 8px 12px;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.report-table thead th.th-dim { text-align: left; }
+.report-table th.sortable { cursor: pointer; user-select: none; }
+.report-table th.sortable:hover { color: var(--text); }
+.report-table th.sortable.active { color: var(--accent); }
+.report-table th.sortable.active.desc::after { content: ' ▼'; }
+.report-table th.sortable.active.asc::after { content: ' ▲'; }
+.report-table td {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  text-align: right;
+}
+.report-table td.td-dim { text-align: left; }
+.report-table .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.report-row { cursor: pointer; transition: background 0.12s; }
+.report-row:hover { background: var(--bg-elevated); }
+.total-row td {
+  font-weight: 600;
+  background: var(--bg-elevated);
+  border-top: 2px solid var(--border);
+}
+/* 效率：高绿低红，柔和区分 */
+.eff-high { color: #7ee787; }
+.eff-low { color: #ff7b72; }
+
 .filters {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
-.chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.chip {
-  font: inherit;
-  font-size: 12px;
-  color: var(--text-dim);
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 3px 11px;
-  cursor: pointer;
-  transition: color 0.12s, border-color 0.12s, background 0.12s;
-}
-.chip:hover { color: var(--text); border-color: var(--accent); }
-.chip.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .sel {
   font: inherit;
   font-size: 13px;
@@ -506,9 +747,8 @@ async function saveRetention() {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 4px 10px;
-  min-width: 180px;
-  flex: 1 1 180px;
-  max-width: 320px;
+  min-width: 140px;
+  flex: 0 1 200px;
 }
 .search:focus { outline: none; border-color: var(--accent); }
 .search::placeholder { color: var(--text-faint); }
