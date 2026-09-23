@@ -5,15 +5,16 @@
  * WorkGremlin 统一启动器：管理 server 生命周期 + 启动 client。
  *
  * 行为：
- *   - 默认：检查是否已有 server 在跑。
- *       · 有  -> 直接启动 client，复用现有 server 的端口（WORKGREMLIN_CONNECT=1）。
- *       · 无  -> 先起 server（后台常驻），等它就绪后再启动 client 连它。
+ *   - 默认：检查是否已有 server 在跑（读 server.json + 探活端口）。
+ *       · 有  -> 复用现有 server。
+ *       · 无  -> 先起 server（后台常驻 detached），等它就绪后再启动 client。
  *   - 带 --restart / -r：杀掉现有 server（含孤儿进程，清 21800~21820），重启 server，再启动 client。
  *
  * 关键设计：
  *   - server 以 detached 方式启动，进程独立于本脚本；client 退出后 server 仍在，
- *     下次默认启动会直接复用（server 跨 client 重启常驻，解决"另起孤儿端口"问题）。
- *   - client 用 WORKGREMLIN_CONNECT=1 连已有 server，不会自己再起一个。
+ *     下次默认启动会直接复用（server 跨 client 重启常驻）。
+ *   - client 只读取 server.json 连接本脚本起好的 server，**不自行启动 server、不读环境变量**
+ *     （见 desktop/src/main.js），server 的生命周期完全由本脚本管理。
  *
  * 用法：
  *   node scripts/launch.js            # 默认：检查/启动 server，再启动 client
@@ -123,11 +124,11 @@ function startServer() {
   return child;
 }
 
-/** 前台启动 client，连已有 server */
+/** 前台启动 client：连接本脚本已起好的 server，不读环境变量、不自行启动 server */
 function startClient() {
   return spawn(electronBin(), [...ELECTRON_ARGS, 'desktop/src/main.js'], {
     cwd: ROOT,
-    env: { ...process.env, WORKGREMLIN_CONNECT: '1' },
+    env: { ...process.env },
     stdio: 'inherit',
     detached: false,
   });

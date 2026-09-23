@@ -1,16 +1,16 @@
 'use strict';
 
 /**
- * Electron 主进程入口。
+ * Electron 主进程入口（client）。
  *
- * 关键设计：本地服务 **内嵌在主进程里**（同进程），不额外 fork 子进程 —— 免端口/生命周期管理，
- * 也没有跨进程序列化开销。server 包同时保留独立启动能力（node server/src/cli.js）。
+ * 关键设计：server 由启动器 scripts/launch.js 先行以独立进程启动（node server/src/cli.js），
+ * 并写入 ~/.workgremlin/server.json；本进程只读取 server.json 连接该 server，**不自行启动 server**，
+ * 也不依赖任何环境变量。server 的生命周期完全由 launch.js 管理。
  *
- * 启动顺序：app.ready -> createServer().start() -> 写 ~/.workgremlin/server.json -> 建窗
+ * 启动顺序：app.ready -> 读 server.json 连接已起好的 server -> 建窗
  */
 
 const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen } = require('electron');
-const { createServer } = require('@workgremlin/server');
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
 const fs = require('node:fs');
@@ -18,8 +18,6 @@ const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 
-/** @type {ReturnType<typeof createServer> | null} */
-let server = null;
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
 /** 渲染层 / 建窗统一用的 server 信息（无论自起还是连接已有） */
@@ -56,20 +54,15 @@ async function bootstrap() {
   // 演示模式**没有启动开关**（原来的 --demo / --demo-seed / WORKGREMLIN_DEMO* 都散了）：
   // 它由界面上的「演示模式」按钮切换工程触发（见 server 的 syncDemo），启动一律接真实数据。
 
-  // 连接已有 server 模式（统一启动器 WORKGREMLIN_CONNECT=1 时）：server 已由脚本起好，
-  // 直接复用其端口 + token，不再内嵌自起（否则会再占一个端口、变成孤儿进程）。
-  if (process.env.WORKGREMLIN_CONNECT === '1') {
-    const existing = readServerInfoFile();
-    if (existing && (await pingPort(existing.port))) {
-      serverInfo = existing;
-      console.log(`[workgremlin] 连接已有 server：port=${existing.port}`);
-    } else {
-      console.warn('[workgremlin] WORKGREMLIN_CONNECT=1 但 server.json 无可用 server，回退为自起 server');
-    }
-  }
-  if (!serverInfo) {
-    server = createServer();
-    serverInfo = await server.start();
+  // server 由启动器(launch.js)先行启动并写入 server.json；client 只读取并连接，不自行启动 server。
+  const existing = readServerInfoFile();
+  if (existing && (await pingPort(existing.port))) {
+    serverInfo = existing;
+    console.log(`[workgremlin] 连接 server：port=${existing.port}`);
+  } else {
+    console.error('[workgremlin] 未找到可用 server（请先通过 launch.js 启动），退出');
+    app.quit();
+    return;
   }
 
   ipcMain.handle('workgremlin:get-server-info', () => serverInfo);
@@ -154,8 +147,7 @@ async function bootstrap() {
   });
 }
 
-app.on('window-all-closed', async () => {
-  if (server) await server.close();
+app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -163,10 +155,6 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0 && serverInfo) {
     mainWindow = createWindow({ serverInfo });
   }
-});
-
-app.on('before-quit', async () => {
-  if (server) await server.close();
 });
 
 // 单实例锁：避免重复启动争抢端口
