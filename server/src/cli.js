@@ -13,6 +13,36 @@
  * 服务端会按需播种并起推进器（见 index.js 的 syncDemo）；界面上就是 HUD 的「演示模式」按钮。
  */
 
+// Node 版本先拦一道：低于 engines.node 时 better-sqlite3 的原生模块 ABI 对不上，
+// 表现是进程直接段错误（core dumped），不打任何日志，排查成本极高。早失败早提示。
+const ROOT_PKG = (() => {
+  try {
+    // 注意：不是 '../package.json' —— 那是 server/package.json（workspace 子包，没有 engines 声明），
+    // 门限必须看仓库根 package.json。
+    return JSON.parse(
+      require('node:fs').readFileSync(require('node:path').join(__dirname, '..', '..', 'package.json'), 'utf8')
+    );
+  } catch {
+    return null;
+  }
+})();
+{
+  const ENGINES = ROOT_PKG && ROOT_PKG.engines;
+  const req = String((ENGINES && ENGINES.node) || '').match(/(\d+)\.(\d+)\.(\d+)/);
+  const cur = process.version.match(/^v(\d+)\.(\d+)\.(\d+)/);
+  if (req && cur) {
+    const less = (a, b) => (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) < 0;
+    if (less(cur.slice(1).map(Number), req.slice(1).map(Number))) {
+      console.error(
+        `[workgremlin] Node 版本过低：当前 ${process.version}，需要 ${ENGINES.node}。\n` +
+          '        原生模块（better-sqlite3）是按新 ABI 编的，低版本会在加载时直接崩溃。\n' +
+          '        例如：nvm use 24'
+      );
+      process.exit(1);
+    }
+  }
+}
+
 const { createServer } = require('./index');
 const { openDatabase } = require('./db');
 const config = require('./config');
