@@ -8,6 +8,12 @@
  *   4F  Codex CLI
  *   5F  Claude Code CLI
  *   6F  TraeCode Plugin
+ *   7F  Codex Plugin
+ *   8F  TraeCode CLI
+ *
+ * Claude Code **只有一层**（5F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置与同一套 hook，
+ * 事件 payload 里没有任何字段能区分二者（实测 2.1：不含 client，只有 session_id / cwd /
+ * transcript_path 这类共用字段），所以分不出、也不该分两层。
  *
  * 每一层自动搜索两样东西：
  *   - 安装位置：CLI 的可执行文件（PATH + 常见安装目录），插件的扩展目录
@@ -310,8 +316,8 @@ function findPluginDir(res = RE_PLUGIN) {
  *   - codebuddy：1F CLI / 3F Plugin
  *   - workbuddy：2F CLI（暂无 Plugin）
  *   - codex     ：4F CLI / 7F Plugin
- *   - claude    ：5F CLI / 8F Plugin
- *   - trae      ：6F Plugin / 9F CLI
+ *   - claude    ：5F CLI（**只有这一层**，见文件头说明：plugin 与 CLI 同配置同 hook，分不出来）
+ *   - trae      ：6F Plugin / 8F CLI
  * 要再加变体（例如给 workbuddy 加 Plugin，或新增某个 agent 的 CLI/Plugin），只需在这里加一条
  * { id, name, agent, plugin:true|false, pluginRe? } —— client、归层、过滤、会话来源全部自动跟着走。
  *
@@ -391,16 +397,6 @@ const PRODUCTS = [
   },
   {
     id: '8F',
-    name: 'Claude Code Plugin',
-    kind: 'plugin',
-    cmd: '',
-    agent: 'claude',
-    plugin: true,
-    pluginRe: RE_CLAUDE,
-    dataKind: clientOf('claude', true),
-  },
-  {
-    id: '9F',
     name: 'TraeCode CLI',
     kind: 'cli',
     cmd: 'trae',

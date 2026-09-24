@@ -2,11 +2,15 @@
 'use strict';
 
 /**
- * 把 WorkGremlin 的上报 hook 装进 CodeBuddy Plugin / CodeBuddy CLI / WorkBuddy CLI 的 settings.json。
+ * 把 WorkGremlin 的上报 hook 装进各受监控产品的用户级配置
+ * （CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode）。
+ *
+ * 默认**全装**：不带 --targets 时遍历下面 `all` 里的每一个非 optional 目标，
+ * 各自「装了才写、没装跳过」（判定口径见 looksInstalled）。加新产品只需往 `all` 里加一条。
  *
  * 用法：
- *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy）
- *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / project）
+ *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae）
+ *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / codex / claude / trae / project）
  *   node scripts/install-hooks.js --project              另外写一份项目级 <仓库>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            撤掉（只删我们加的那几条，别人的配置不动）
  *   node scripts/install-hooks.js --dry-run              只打印将要写什么，不落盘
@@ -48,6 +52,32 @@ const CODEX_EVENTS = [
   ['SubagentStop', null],
   ['Stop', null],
   ['Interrupt', null],
+  ['SessionEnd', ''],
+];
+
+/**
+ * Claude Code（2.1 实测）的事件表。
+ *
+ * 与 CodeBuddy 的差别，决定了这里**不能直接复用 EVENTS**：
+ *   - 有显式的 PermissionRequest（payload 带 tool_name / tool_input），
+ *     等授权不用再靠"PreToolUse 打 pending、超时未清即猜"，与 Codex 同档；
+ *   - PostToolUse **对所有工具都发**（含 Read/Grep/Bash），所以 matcher 留空，
+ *     不用像 EVENTS 那样开白名单；
+ *   - 子代理工具叫 **Agent**（不是 Task），由 hook 的 isSubagentTool 大小写不敏感地认。
+ *
+ * 故意**不注册 SubagentStart**：PreToolUse(Agent) 已经能拿到真 tool_use_id 并登记幽灵，
+ * 再注册一次 SubagentStart 会让同一只子代理登记出两只幽灵。
+ * SubagentStop 仍然注册，作为"PostToolUse 没来"时的第二条收场信号。
+ */
+const CLAUDE_EVENTS = [
+  ['SessionStart', ''],
+  ['UserPromptSubmit', null],
+  ['PreToolUse', ''],
+  ['PostToolUse', ''],
+  ['PermissionRequest', null],
+  ['Notification', null],
+  ['SubagentStop', null],
+  ['Stop', null],
   ['SessionEnd', ''],
 ];
 
@@ -107,6 +137,11 @@ function workbuddyCommand() {
  *  运行时分不出，只能靠安装期身份），别写成 codebuddy。工位名默认 trae。 */
 function traeCommand() {
   return `node "${HOOK_SCRIPT}" --agent trae`;
+}
+
+/** Claude Code CLI：用 --agent claude 注入产品家族身份，工位名默认 claude */
+function claudeCommand() {
+  return `node "${HOOK_SCRIPT}" --agent claude`;
 }
 
 /** 我们加的那几条：按 command 里有没有 hook 脚本路径识别 */
@@ -288,6 +323,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   const codexOurs = buildOurs(CODEX_EVENTS, codexCommand());
   const workbuddyOurs = buildOurs(EVENTS, workbuddyCommand());
   const traeOurs = buildOurs(EVENTS, traeCommand());
+  const claudeOurs = buildOurs(CLAUDE_EVENTS, claudeCommand());
 
   const all = [
     {
@@ -317,6 +353,16 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       ours: codexOurs,
     },
     {
+      id: 'claude',
+      label: 'Claude Code CLI',
+      // Claude Code 的 hooks 与 CodeBuddy 同构（settings.json + hooks 事件 + matcher），
+      // 用户级就是 ~/.claude/settings.json。注意它多一道「工作区信任」闸门（见文件末尾提示）。
+      file: path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json'),
+      cmd: 'claude',
+      dir: process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'),
+      ours: claudeOurs,
+    },
+    {
       id: 'trae',
       label: 'TraeCode Plugin',
       // Trae 基于 VS Code 协议，hook 结构与 CodeBuddy Plugin 同源（settings.json + hooks 事件）。
@@ -340,6 +386,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   console.log(`[workgremlin] hook 命令：${codebuddyCmd}`);
   if (!wanted.length || wanted.includes('codex')) console.log(`[workgremlin] Codex 命令：${codexCommand()}`);
   if (!wanted.length || wanted.includes('trae')) console.log(`[workgremlin] TraeCode 命令：${traeCommand()}`);
+  if (!wanted.length || wanted.includes('claude')) console.log(`[workgremlin] Claude Code 命令：${claudeCommand()}`);
   if (dryRun) console.log('[workgremlin] --dry-run：不落盘');
 
   for (const t of targets) {
@@ -375,13 +422,16 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       continue;
     }
 
-    if (exists && !hasOurs(existing)) {
+    // dry-run 也要一步都不落盘：早先这里没判 dryRun，预览时会真写出 .bak-workgremlin
+    if (!dryRun && exists && !hasOurs(existing)) {
       fs.copyFileSync(t.file, `${t.file}.bak-workgremlin`);
       console.log(`[workgremlin]   备份 -> ${t.file}.bak-workgremlin`);
     }
 
     writeSettings(t.file, next, dryRun);
-    console.log(`[workgremlin] ✓ ${t.label}：${uninstall ? '已移除' : '已写入'} ${t.file}`);
+    // dry-run 时如实说"将写入"——不然预览输出会谎报已经写过了
+    const verb = uninstall ? '已移除' : '已写入';
+    console.log(`[workgremlin] ✓ ${t.label}：${dryRun ? (uninstall ? '将移除' : '将写入') : verb} ${t.file}`);
     if (!dryRun) result.installed.push(t.label);
     result.files.push(t.file);
   }
@@ -393,13 +443,15 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('[workgremlin] 生效方式：');
     console.log('  · CodeBuddy Plugin：重开会话');
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');
-    console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae），已写进 hook 命令的 --agent，无需也无法二次指定');
+    console.log('  · Claude Code：写完新起的会话直接就生效（claude --print 实测，没经过批准）；');
+    console.log('                 若表现为"装了没反应"，在 /hooks 面板过一遍即可');
+    console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae / claude），已写进 hook 命令的 --agent，无需也无法二次指定');
     console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;
 }
 
-module.exports = { installHooks, HOOK_SCRIPT, EVENTS, CODEX_EVENTS };
+module.exports = { installHooks, HOOK_SCRIPT, EVENTS, CODEX_EVENTS, CLAUDE_EVENTS };
 
 if (require.main === module) {
   try {

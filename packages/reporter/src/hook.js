@@ -2,7 +2,19 @@
 'use strict';
 
 /**
- * CodeBuddy Plugin / CodeBuddy CLI / WorkBuddy CLI 的 hook 入口。
+ * 各受监控产品的 hook 入口（CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode）。
+ *
+ * 各家差异（同一份 hook 靠 `--agent` 注入的产品身份选口径）：
+ *   · CodeBuddy / WorkBuddy / Trae：工具名 Write/Edit/MultiEdit/Task，事件 Notification / SubagentStop；
+ *     没有显式的等授权事件，靠 pending 超时推断；子代理没有 per-call id，靠字段合成 key。
+ *   · Codex：工具名 Bash/apply_patch，有 PermissionRequest / SubagentStart / Interrupt（无 Notification）；
+ *     子代理事件带 agent_id（天然唯一键）；subagent 用 collaborationspawn_agent。
+ *   · Claude Code（2.1 实测）：工具名与 CodeBuddy 同名，但子代理工具叫 **Agent**（不是 Task）；
+ *     有 PermissionRequest / SubagentStart（同样不注册，避免与 PreToolUse(Agent) 登记出两只幽灵）
+ *     与 SubagentStop；PostToolUse **对所有工具都发**；notification_type 还多出
+ *     auth_success / elicitation_dialog，不能一律当"等授权"。
+ *     transcript 与 Codex 一样是 JSONL（~/.claude/projects/<cwd 斜杠换横线>/<session_id>.jsonl），
+ *     所以 turnReplies 的 jsonlReplies 那一路直接复用。
  *
  * 由 scripts/install-hooks.js 写进各家的 settings.json，形如：
  *   { "hooks": { "SessionStart": [ { "matcher": "", "hooks": [
@@ -14,6 +26,8 @@
  *   PreToolUse        busy（顺带心跳）；工具是 Task/Agent（召唤 subagent）→ 飘出一只小幽灵
  *   PostToolUse       写/改类工具 → file/touch，并 busy；工具是 Task/Agent → 幽灵转「待汇报」
  *   Notification      等权限 → blocked(reason=awaiting_permission)；空闲提醒 → idle
+ *                     （Claude Code 还有 auth_success / elicitation_dialog 等非权限类型，不认、不动状态）
+ *   PermissionRequest 等授权（Codex / Claude Code 的显式事件）→ blocked(reason=awaiting_permission)
  *   SubagentStop      只收幽灵（不碰主会话的任务 / 相位）
  *   Stop              task/end(done) + idle；顺手扫掉本轮残留的幽灵
  *   SessionEnd        offline + 撤掉心跳守护 + 扫掉本 hook 召唤的幽灵
@@ -26,7 +40,7 @@
  *
  * 环境变量：
  *   WORKGREMLIN_PROJECT        project 名（缺省用服务端"当前打开的工程"那个 project）
- *   --agent <name>          主 agent 名字（必填；codebuddy / codex / workbuddy / trae …）
+ *   --agent <name>          主 agent 名字（必填；codebuddy / codex / workbuddy / trae / claude …）
  *   WORKGREMLIN_ROLE        角色（缺省 agent）
  *   WORKGREMLIN_HOOK_DEBUG=1      把失败原因打到 stderr
  *   WORKGREMLIN_HOOK_MESSAGES=1   另外把每条用户指令当消息投进对话记录
@@ -54,6 +68,19 @@ const { fnv1a32 } = require('@workgremlin/shared');
  *  只有 codebuddy 这个家族还要靠 payload 的 client 再分 cli（1F）/ plugin（3F）两层，见 eventClient。 */
 let AGENT = '';
 let IS_CODEX = false;
+/** Claude Code（--agent claude）。与 CodeBuddy 的差别见 header 的"各家差异"一段 */
+let IS_CLAUDE = false;
+
+/**
+ * 本产品有没有**显式的等授权事件**。
+ *
+ * Codex 与 Claude Code 都会发 PermissionRequest（payload 带 tool_name / tool_input），
+ * 所以"等授权"靠真事件点亮，不需要 CodeBuddy 那套「PreToolUse 打 pending、超时未清即猜」——
+ * 那套只在"没有显式事件、又必须在弹权限框时给出一个相位"时才用得上。
+ * 对这两家继续打 pending 反而会把"跑得久的写类工具"误判成"等待授权"。
+ */
+const hasPermissionEvent = () => IS_CODEX || IS_CLAUDE;
+
 /** spawn_agent → SubagentStart 之间的"待认领"窗口 */
 const PENDING_SPAWN_MS = 2 * 60_000;
 
@@ -671,14 +698,19 @@ function addGhost(workspacePath, name, task, id, parent, model, client) {
  * 摘要用 description/prompt 那句任务名兜底（feed 那边也会再兜一次），
  * 主 agent 若随后写了更具体的 result，会覆盖掉这句。
  */
-function retireGhost(workspacePath, name, id, result) {
+function retireGhost(workspacePath, name, id, result, client) {
   const file = feedFileFor(workspacePath);
   const feed = readFeedFile(file);
   let hit = id ? feed.agents.findIndex((a) => a.id === id) : -1;
   if (hit < 0) hit = feed.agents.findIndex((a) => a.name === name);
   if (hit < 0) return;
   const cur = feed.agents[hit] || {};
-  if (!ownsEntry(cur)) return; // 别动别的客户端的幽灵
+  // client 必须传进来：ownsEntry 拿它跟条目上的 client 比。
+  // 早先这里漏传（ownsEntry(cur)），而 ownsEntry 在 client 为 undefined 时**恒返回 false**，
+  // 于是本函数永远提前 return —— 幽灵从没进过"待汇报"，只会被 Stop / SessionEnd 当孤儿扫掉，
+  // 「走到主 agent 面前汇报」那段动画对所有客户端都没播过（实测 ghost-report 打了，
+  // 紧接着 ghost-sweep 仍把它当孤儿 remove 掉，就是这条）。
+  if (!ownsEntry(cur, client)) return; // 别动别的客户端的幽灵
   const task = String(cur.task || '').trim();
   // Codex 的 SubagentStop 会带子代理最后那段话，直接当汇报文案（比"已完成：任务名"实在）
   const said = String(result || '').replace(/\s+/g, ' ').trim().slice(0, 200);
@@ -745,7 +777,7 @@ function resultOfResponse(ev) {
 }
 
 /** 收工：按 id 精确找，找不到再按 name，都找不到就认最早那只（FIFO）。转成待汇报并销账。 */
-function finishGhost(file, workspacePath, ev, opts = {}) {
+function finishGhost(file, workspacePath, ev, client, opts = {}) {
   const list = readState(file).subagents || [];
   const ti = ev && ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : null;
   const nm = ti ? agentName(ti) : '';
@@ -757,7 +789,7 @@ function finishGhost(file, workspacePath, ev, opts = {}) {
   if (!rec && nm && nm !== 'subagent') rec = list.find((r) => r.name === nm) || null;
   if (!rec) rec = list[0] || null;
   if (!rec) return;
-  retireGhost(workspacePath, rec.name, rec.id, opts.result);
+  retireGhost(workspacePath, rec.name, rec.id, opts.result, client);
   writeState(file, { subagents: list.filter((r) => r !== rec) });
   trace('ghost-report', { name: rec.name, id: rec.id, via: ev && ev.hook_event_name });
 }
@@ -889,6 +921,7 @@ async function main() {
     process.exit(1);
   }
   IS_CODEX = AGENT === 'codex';
+  IS_CLAUDE = AGENT === 'claude';
 
   const info = readServerInfo();
   if (!info || !info.port) {
@@ -1028,9 +1061,9 @@ async function main() {
       // 本环境实测 Read/Grep/Glob/ReadLints/Bash 等只读 / 命令类工具根本不发 PostToolUse，
       // 一旦给它们打 pending，PostToolUse 永远不来、清不掉 → 兜底误判成"等待授权"
       // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
-      // Codex 有显式的 PermissionRequest 事件，不需要"pending 超时 = 等授权"这套兜底推断；
-      // 而且 Codex 的写类工具（apply_patch）经常跑很久，打了 pending 会被误判成"等待授权"。
-      const probe = !IS_CODEX && PROBE_TOOLS.has(tool);
+      // Codex / Claude Code 有显式的 PermissionRequest 事件，不需要"pending 超时 = 等授权"
+      // 这套兜底推断；而且它们的写类工具经常跑很久，打了 pending 会被误判成"等待授权"。
+      const probe = !hasPermissionEvent() && PROBE_TOOLS.has(tool);
       writeState(file, {
         lastTool: tool,
         lastInput: ev.tool_input || '',
@@ -1075,7 +1108,7 @@ async function main() {
       // Codex 的 spawn_agent 返回 ≠ 子代理干完（它的收工只认 SubagentStop）
       // 带上结果摘要：tool_response 里有子代理最后说的话就当汇报文案，
       // 没有就由 retireGhost 退回"已完成：<任务名>"。
-      if (isSubagentTool(ev.tool_name) && !IS_CODEX) finishGhost(file, REAL_WS, ev, { result: resultOfResponse(ev) });
+      if (isSubagentTool(ev.tool_name) && !IS_CODEX) finishGhost(file, REAL_WS, ev, cl, { result: resultOfResponse(ev) });
       // PostToolUse = 工具已跑完，进入"思考中"（处理返回结果），直到下一个事件
       await status('thinking');
     }
@@ -1086,6 +1119,12 @@ async function main() {
     if (ev.notification_type === 'idle_prompt') {
       clearAwait(file);
       await status('idle');
+    } else if (IS_CLAUDE && ev.notification_type !== 'permission_prompt') {
+      // Claude Code 的 notification_type 枚举还有 auth_success / elicitation_dialog 等，
+      // 它们**都不是**在等权限（实测 2.1.281 二进制里的枚举）。
+      // CodeBuddy 的非 idle 类型只有"要权限"这一种，所以它的 else 可以直接当"等授权"；
+      // Claude 若照抄 else，登录成功那一下就会被标成"等待授权"。不认的类型直接不动状态。
+      return;
     } else {
       // 等权限：把要执行的工具 + 目标文件写进本地状态文件，主控制台会读它显示"等待授权"
       setAwait(file, ctx, cwd, ev);
@@ -1236,7 +1275,7 @@ async function main() {
   // （子代理收工 ≠ 主会话收工，所以不能像 Stop 那样结束任务，否则会误报"任务完成"）。
   // Codex 的这条事件还带 last_assistant_message，直接拿来当汇报文案。
   if (event === 'SubagentStop') {
-    finishGhost(file, REAL_WS, ev, { result: ev.last_assistant_message });
+    finishGhost(file, REAL_WS, ev, cl, { result: ev.last_assistant_message });
     await beat();
     return;
   }

@@ -76,17 +76,18 @@ node scripts/subagents.js list
 
 清单文件路径：`$WORKGREMLIN_SUBAGENTS_FILE` > `$WORKGREMLIN_WORKSPACE/.workgremlin/subagents.json` > `<cwd>/.workgremlin/subagents.json`。
 
-## CodeBuddy / WorkBuddy 接入（hook）
+## CodeBuddy / WorkBuddy / Claude Code 接入（hook）
 
 让正在干活的 agent 自己往屋里报状态：**启动时会自动接入** —— 探测到装了哪个 CLI（只看安装位置），
 就把对应那份 hook 写好（合并式、幂等、首次改动前备份；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`）。
-**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI / TraeCode 插件** 五个入口的会话都会上报。
+**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI / Claude Code CLI / TraeCode 插件** 六个入口的会话都会上报。
 
-需要手动跑（强制某个 target / 卸载）时：
+默认**全装**（遍历所有 target，装了才写、没装跳过）：
 
 ```bash
-npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.trae
-npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / trae）
+npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae
+npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / claude / trae）
+npm run hooks:install -- --dry-run         # 只打印将要写什么，一步都不落盘
 npm run hooks:install -- --project         # 另外写一份项目级 <仓库>/.codebuddy/settings.json
 npm run hooks:uninstall                    # 撤掉（只删我们加的那几条，别人的配置不动）
 ```
@@ -166,6 +167,43 @@ Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本�
 
 Codex 与 CodeBuddy 在同一个工程下**共用** `<工程>/.workgremlin/subagents.json`，所以每条清单记录
 都会带 `client`，收工与扫场只动自己那一路 —— 否则两边的 Stop/Interrupt 会把对方的幽灵一起收掉。
+
+### Claude Code CLI 接入（hook）
+
+Claude Code 的 hook 与 CodeBuddy **同源**（`settings.json` + `hooks` 事件 + `matcher`），
+所以共用同一个 `packages/reporter/src/hook.js`，靠 `--agent claude` 分流。
+装出来的条目写在 `~/.claude/settings.json`（可用 `CLAUDE_CONFIG_DIR` 改家目录）：
+
+```bash
+npm run hooks:install                      # 一并写 ~/.claude/settings.json
+npm run hooks:install -- --targets=claude  # 只装 Claude Code
+```
+
+与 CodeBuddy 的差别（按 2.1 实测）：
+
+- **生效时机**（实测）：写完配置后新起的会话**直接就执行了**，没经过任何批准（`claude --print` 实测）。
+  二进制里存在 `hook execution - workspace trust not accepted` 与「启动时对 hooks 做快照」的文案，
+  但在本机这套配置下都没拦住；若你的环境里表现为「装了没反应」，先在 `/hooks` 面板过一遍。
+- **`PostToolUse` 对所有工具都发**（含 `Read`/`Grep`/`Bash`），所以不需要 CodeBuddy 那种 matcher 白名单。
+- **子代理工具叫 `Agent`**（不是 CodeBuddy 的 `Task`），且带真 `tool_use_id`。hook 故意**不注册
+  `SubagentStart`**：`PreToolUse(Agent)` 已经能登记幽灵，再注册一次会让同一只子代理飘出两只。
+- **`notification_type` 不止"要权限"一种**：除 `permission_prompt` / `idle_prompt` 外还有
+  `auth_success` / `elicitation_dialog`。只有 `permission_prompt` 才算等授权，其余不认、不动状态
+  （CodeBuddy 那边非 idle 只有"要权限"一种，所以它的 `else` 可以直接当"等授权"）。
+- **等授权走显式事件**：和 Codex 一样注册 `PermissionRequest`，不再用"`PreToolUse` 打 pending、
+  超时未清即猜"那套兜底推断。
+- transcript 与 Codex 一样是 JSONL（`~/.claude/projects/<cwd 斜杠换横线>/<session_id>.jsonl`），
+  所以「产出摘要 / 每次回复入库」直接复用同一条解析路径。
+
+| Claude Code 事件 | 上报 | 备注 |
+| --- | --- | --- |
+| `SessionStart` / `SessionEnd` | 注册 + `idle` / `offline` + 撤心跳守护 | 同 CodeBuddy |
+| `UserPromptSubmit` | `task/start` + `thinking` | 同 |
+| `PreToolUse` / `PostToolUse` | `busy` / 回到 `thinking`；写类工具 → `file/touch` | 工具名同 CodeBuddy，但子代理是 `Agent` |
+| `PermissionRequest` | `blocked(awaiting_permission)` | 显式事件，比 CodeBuddy 的 `Notification` 推断准 |
+| `Notification` | 等权限 → `blocked`；空闲提醒 → `idle`；其余类型忽略 | 见上「`notification_type` 不止一种」 |
+| `SubagentStop` | 幽灵转「待汇报」 | 与 `PostToolUse(Agent)` 互为兜底 |
+| `Stop` | `task/end(done)` + `idle`，顺手扫掉本轮残留的幽灵 | 汇报文案取 `last_assistant_message` |
 
 ## 安全基线（不得关闭）
 

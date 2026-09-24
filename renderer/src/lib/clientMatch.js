@@ -16,8 +16,9 @@ import { clientBase } from '@workgremlin/shared';
  * 某楼层（floorClient）是否接纳某成员（memberClient）。
  *
  * 小怪物是常住 / 项目级成员（躺在 ~/.codebuddy/agents 这类目录里），与"走 CLI 还是 Plugin"
- * 无关：CodeBuddy 的常住小怪物在 1F(CLI) 与 3F(Plugin) 都该出现，codex / claude / trae 同理
- * 两个变体楼层都要。所以按 **agent 基名**（剥掉 -plugin 后缀）匹配，不再精确区分 CLI / Plugin。
+ * 无关：CodeBuddy 的常住小怪物在 1F(CLI) 与 3F(Plugin) 都该出现，codex / trae 这些有两个变体的
+ * 楼层同理。所以按 **agent 基名**（剥掉 -plugin 后缀）匹配，不再精确区分 CLI / Plugin。
+ * （claude 只有 5F 一层 —— 它的 CLI 与 IDE 插件共用同一份配置与 hook，payload 分不出二者。）
  * client 为空的（演示数据 / 老库没补上 client 的）视作通用，哪层都显示。
  *
  * @param {string} floorClient 楼层身份（floor.client，如 codebuddy / codebuddy-plugin）
@@ -39,8 +40,8 @@ const CLIENT_LABELS = {
   'workbuddy-plugin': 'WorkBuddy Plugin',
   codex: 'Codex',
   'codex-plugin': 'Codex Plugin',
+  // Claude Code 只有一层（CLI 与 IDE 插件共用同一份 ~/.claude 配置与 hook，payload 分不出二者）
   claude: 'Claude Code',
-  'claude-plugin': 'Claude Code Plugin',
   trae: 'TraeCode',
   'trae-plugin': 'TraeCode Plugin',
 };

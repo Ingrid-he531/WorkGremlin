@@ -226,8 +226,10 @@ const IPC_EVENTS = Object.freeze({
  *   - agent（基名）：codebuddy / workbuddy / codex / claude / trae …（见 server/src/products.js 的楼层定义）
  *   - client（上报身份）：非 plugin 直接是 agent；plugin 是 agent + '-plugin'。
  * 例：CodeBuddy 同时有 CLI（client=codebuddy，1F）与 Plugin（client=codebuddy-plugin，3F）；
- * Codex/Claude 目前只有 CLI（client=codex / claude），Trae 目前是 Plugin（client=trae-plugin）。
- * 以后加 TraeCode-plugin、Codex-plugin，只需在 products.js 多写一条楼层（agent + plugin:true）。
+ * Codex 有 4F CLI / 7F Plugin、Trae 有 6F Plugin / 8F CLI，两个变体都有。
+ * **Claude Code 只有 CLI 一个身份**（client=claude，5F）：它的 CLI 与 IDE 插件共用同一份
+ * ~/.claude 配置与同一套 hook，事件 payload 里没有能区分二者的字段（实测 2.1）。
+ * 以后再加别的变体，只需在 products.js 多写一条楼层（agent + plugin:true）。
  */
 
 /** 去 '-plugin' 后缀，拿到产品基名（小写）；非法/空输入返回 '' */

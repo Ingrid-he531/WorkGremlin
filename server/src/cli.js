@@ -61,7 +61,10 @@ async function selfTest() {
     createdAt: 1,
     lastSeenAt: 1,
     ephemeral: 0,
-    project: null,
+    // 列已改名：旧 schema 的 project 现在是 project_label；并新增 client 列。
+    // 自检按 bus.js 的上报口径补齐，否则 better-sqlite3 报 Missing named parameter。
+    projectLabel: null,
+    client: null,
   });
   repo.insertMessage.run({
     dedupeKey: 'k1',
