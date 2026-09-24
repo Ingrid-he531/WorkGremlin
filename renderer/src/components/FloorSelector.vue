@@ -153,8 +153,8 @@ function tip(p) {
   const lines = [p.name];
   lines.push(
     p.activeCount
-      ? `活跃会话：${p.activeCount} 个（状态点绿）`
-      : '活跃会话：0 个（状态点灰；60 分钟没有事件就移出表）'
+      ? `活跃会话：${p.activeCount} 个`
+      : '活跃会话：0 个'
   );
   if (!p.installed) {
     lines.push('未安装（没搜到可执行文件或扩展目录）→ 置灰，不能点');
@@ -251,19 +251,20 @@ function tip(p) {
   text-align: center;
 }
 
-/* 胶囊区（= 原来的井道）：按原尺寸排版（宽 140）、整体 scale(0.7)，胶囊保持紧凑。
+/* 胶囊区（= 原来的井道）：按原尺寸排版（宽 140）、zoom(0.7)，胶囊保持紧凑。
  * 布局改为「顶部紧凑堆叠」：不再撑满整列、不再用 space-between 把胶囊拉开大间隔。
  *   · flex: 1 1 auto + min-height: 0  → 占满标题下方的剩余高度，但内容超出时自己出滚动条
  *     （楼层少时空着底部面板；楼层多到放不下才出现滚动条）。
  *   · justify-content: flex-start + 小 gap → 从顶开始紧挨着排，不散布。
- * 轿厢、层号带随子树一起缩放，定位仍靠实测 offsetTop/offsetHeight（transform 不影响它），不会错位。 */
+ * 用 zoom 而不是 transform: scale()：scale 不参与布局，溢出/滚动条仍按未缩放高度判定 ——
+ * 视觉只占 70% 也可能弹滚动条（下面还空一大截）。zoom 是真缩放布局盒，滚动判定与视觉一致。
+ * 轿厢、层号带随子树一起缩放，定位仍靠实测 offsetTop/offsetHeight（同一 zoom 坐标系），不会错位。 */
 .rail-floors {
   position: relative;
   flex: 1 1 auto;
   min-height: 0;
-  width: 140px; /* 缩放前的排版宽度，缩完正好 98 = 井道宽 */
-  transform: scale(0.7);
-  transform-origin: top left;
+  width: 140px; /* 排版宽度，zoom 0.7 后视觉正好 98 = 井道宽 */
+  zoom: 0.7;
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
