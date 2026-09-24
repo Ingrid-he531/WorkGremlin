@@ -159,8 +159,18 @@ function dataRoots() {
 
 /** 编辑器扩展目录（插件安装位置） */
 function extensionRoots() {
-  return ['.vscode', '.vscode-insiders', '.cursor', '.trae', '.windsurf', '.vscode-server']
+  return [
+    '.vscode',
+    '.vscode-insiders',
+    '.cursor',
+    '.trae',
+    '.windsurf',
+    '.vscode-server',
+    // MarsCode（火山引擎 IDE）的扩展装在自家的 builtin 目录里，不在标准 extensions 下。
+    // TraeCode 就是它的内置插件：~/.marscode/builtin/trae，所以这里也要认。
+  ]
     .map((d) => path.join(HOME, d, 'extensions'))
+    .concat(isDir(path.join(HOME, '.marscode', 'builtin')) ? [path.join(HOME, '.marscode', 'builtin')] : [])
     .filter(isDir);
 }
 
