@@ -6,11 +6,12 @@
  */
 
 const { contextBridge, ipcRenderer } = require('electron');
+const { IPC_EVENTS } = require('@workgremlin/shared');
 
 const listeners = new Set();
 const fullScreenListeners = new Set();
 
-ipcRenderer.on('workgremlin:full-screen', (_evt, on) => {
+ipcRenderer.on(IPC_EVENTS.FULL_SCREEN_EVENT, (_evt, on) => {
   for (const cb of fullScreenListeners) {
     try {
       cb(Boolean(on));
@@ -20,7 +21,7 @@ ipcRenderer.on('workgremlin:full-screen', (_evt, on) => {
   }
 });
 
-ipcRenderer.on('workgremlin:event', (_evt, payload) => {
+ipcRenderer.on(IPC_EVENTS.EVENT, (_evt, payload) => {
   for (const cb of listeners) {
     try {
       cb(payload);
@@ -32,10 +33,10 @@ ipcRenderer.on('workgremlin:event', (_evt, payload) => {
 
 contextBridge.exposeInMainWorld('workgremlin', {
   /** @returns {Promise<{port:number, token:string, dbPath:string, version:string}|null>} */
-  getServerInfo: () => ipcRenderer.invoke('workgremlin:get-server-info'),
-  getAppVersion: () => ipcRenderer.invoke('workgremlin:get-app-version'),
+  getServerInfo: () => ipcRenderer.invoke(IPC_EVENTS.GET_SERVER_INFO),
+  getAppVersion: () => ipcRenderer.invoke(IPC_EVENTS.GET_APP_VERSION),
   /** 弹出系统目录选择框；取消返回 null @returns {Promise<string|null>} */
-  chooseWorkspace: () => ipcRenderer.invoke('workgremlin:choose-workspace'),
+  chooseWorkspace: () => ipcRenderer.invoke(IPC_EVENTS.CHOOSE_WORKSPACE),
   /** @param {(payload: any) => void} cb @returns {() => void} 取消订阅 */
   onEvent: (cb) => {
     listeners.add(cb);
@@ -45,9 +46,9 @@ contextBridge.exposeInMainWorld('workgremlin', {
    * 原生（OS 级）全屏：会连窗口菜单和边框一起去掉。
    * @param {boolean} on @returns {Promise<boolean>} 切换后的实际状态
    */
-  setFullScreen: (on) => ipcRenderer.invoke('workgremlin:set-full-screen', Boolean(on)),
+  setFullScreen: (on) => ipcRenderer.invoke(IPC_EVENTS.SET_FULL_SCREEN, Boolean(on)),
   /** @returns {Promise<boolean>} 窗口当前是否处于原生全屏 */
-  isFullScreen: () => ipcRenderer.invoke('workgremlin:is-full-screen'),
+  isFullScreen: () => ipcRenderer.invoke(IPC_EVENTS.IS_FULL_SCREEN),
   /** @param {(on: boolean) => void} cb @returns {() => void} 取消订阅 */
   onFullScreen: (cb) => {
     fullScreenListeners.add(cb);

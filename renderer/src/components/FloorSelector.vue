@@ -1,7 +1,7 @@
 <script setup>
 /**
  * FloorSelector —— 左侧竖向堆叠的"楼层"胶囊。
- * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy Plugin / 4F Codex CLI / 5F Claude Code CLI。
+ * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy Plugin / 4F Codex CLI / 5F Claude Code CLI / 6F TraeCode Plugin。
  *
  * 状态点看的是**这一层有没有活跃会话**（全局活跃会话表，60 分钟没事件会剔除）：
  *   - 有活跃会话：绿色状态点 + 数量角标
@@ -251,19 +251,22 @@ function tip(p) {
   text-align: center;
 }
 
-/* 胶囊区（= 原来的井道）：胶囊整体缩小 30% —— 按原尺寸排版、整体 scale(0.7)。
-   用 transform 不用 zoom：胶囊的 offsetTop/offsetHeight（轿厢定位的实测来源）不受
-   transform 影响，而缩放对整棵子树统一生效 —— 轿厢、层号带跟着一起缩，天然不错位。
-   它因此接替成为轿厢（.car）的定位祖先（原来这个角色在 .rail 上，设计 §1）。 */
+/* 胶囊区（= 原来的井道）：按原尺寸排版（宽 140）、整体 scale(0.7)，胶囊保持紧凑。
+ * 关键：要让「缩放后」的高度正好填满整列（= 右侧办公室背景高度），未缩放高度就得是
+ *   整列高 / 0.7。整列高 = rail 高 − 顶部"楼层"标题高（--office-top），
+ *   所以这里 height = (100% − var(--office-top)) / 0.7，再 scale(0.7) 缩回整列高。
+ * 这样胶囊不被拉长，只是容器被撑高、再用 space-between 把紧凑胶囊铺满全列。
+ * 轿厢、层号带随子树一起缩放，定位仍靠实测 offsetTop/offsetHeight（transform 不影响它），不会错位。 */
 .rail-floors {
   position: relative;
-  flex: 1;
-  min-height: 0;
+  flex: none;
   width: 140px; /* 缩放前的排版宽度，缩完正好 98 = 井道宽 */
+  height: calc((100% - var(--office-top, 70px)) / 0.7);
   transform: scale(0.7);
   transform-origin: top left;
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
   gap: 12px;
   padding: 0 10px 14px;
   overflow-y: auto;

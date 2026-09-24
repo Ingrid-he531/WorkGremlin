@@ -28,10 +28,11 @@ const { createWorkspaceRouter } = require('./http/routes/workspace');
 const { createProductsRouter } = require('./http/routes/products');
 const { createSessionsRouter } = require('./http/routes/sessions');
 const { requireToken } = require('./http/auth');
+const { createDemo } = require('./demo');
+const { createLifecycle } = require('./lifecycle');
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { snapshot: registrySnapshot } = require('./sessionRegistry');
 const config = require('./config');
-const { seedDemoData, createDemoTicker, DEMO_MEMBER_NAMES } = require('./mock/generator');
 const clock = require('./clock');
 
 const VERSION = '0.1.0';
@@ -172,15 +173,12 @@ function createServer(opts = {}) {
 
   const timers = [];
   let info = null;
-  let demoTicker = null;
   let subagentFeed = null;
   let agentRoster = null;
-  /**
-   * 演示数据（以及没打开工程时的幽灵/ticker）挂在哪个 project 上。
-   * 用**保留名**（config.DEMO_PROJECT，带下划线，绝不可能和真实工程 slug 撞名），
-   * 否则演示种子成员会混进同名的真实工程 project，办公室里一直挂着演示残留。
-   */
-  const demoProjectId = () => config.DEMO_PROJECT;
+
+  // 生命周期钩子 + 演示逻辑（从 index.js 拆出，见 server/src/lifecycle.js 与 server/src/demo/）。
+  const lifecycle = createLifecycle();
+  const demo = createDemo({ bus, repo, getRoster: () => agentRoster });
 
   /**
    * （重）启动 subagent 清单监听 —— 盯的是**当前打开工程**下的
@@ -193,76 +191,13 @@ function createServer(opts = {}) {
     subagentFeed = createSubagentFeed({
       bus,
       repo,
-      project: cur.project || demoProjectId(),
+      project: cur.project || config.DEMO_PROJECT,
       workspacePath: cur.workspacePath,
       projectName: cur.projectName,
       roster: agentRoster,
     });
     subagentFeed.start();
     return subagentFeed;
-  }
-
-  /**
-   * 清理"演示残留"：老版本演示 project 的 id 就叫 workgremlin，和真实工程 slug 撞名，
-   * 于是演示种子成员（leader / researcher / tester / reviewer / ops / ghost-*）被写进了
-   * 真实工程的 project；演示 project 现已改用保留名（config.DEMO_PROJECT），这里把混进当前真实
-   * 工程 project 的这些成员摘掉。
-   *
-   * 只清**演示种子名单里**的名字，且**跳过已被 agentRoster 管理的"已定义 subagent"**
-   *（如 coder —— 那个名字现在代表真实成员，且由名册持续心跳，不能误删）。
-   * 只动成员行/状态/任务，不删历史消息（见 repo.purgeMember）。
-   */
-  function purgeDemoLeftovers() {
-    const cur = workspace.current();
-    if (!cur.workspacePath || cur.demo || !cur.project || cur.project === config.DEMO_PROJECT) return 0;
-    let n = 0;
-    for (const m of repo.listMembers.all(cur.project) || []) {
-      const name = m.name || String(m.id || '').split('@')[0];
-      if (!DEMO_MEMBER_NAMES.has(name)) continue;
-      if (agentRoster && agentRoster.isDefined(name)) continue;
-      try {
-        bus.removeMember({ project: cur.project, memberId: m.id });
-        n += 1;
-      } catch {
-        /* 单个清不掉不影响别的 */
-      }
-    }
-    if (n) console.log(`[workgremlin] 已清理 ${n} 个混进工程「${cur.projectName || cur.project}」的演示残留成员`);
-    return n;
-  }
-
-  /**
-   * 清演示工程里的"名册残留"：`role='subagent'` 里那些当前名册**不再定义**的成员行。
-   *
-   * 为什么需要：名册是这些成员行的主人，但它摘人靠**进程内记账**（registered / mine）——
-   * 服务一重启那笔账就空了。于是上一轮注册进演示工程的成员（典型：旧版还会把"启动工程"的
-   * 项目级 agent 扫进来，如本工程的 leo / susan）再没人认领、也没人心跳，
-   * 60s 后被 sweep 标成 degraded —— 在办公室里就是"还在，但灰了"。
-   *
-   * 按名册自己的口径对账最可靠：`role='subagent'` 且 `agentRoster.isDefined(name)` 为假就摘。
-   * 三类不碰：演示种子成员（leader / coder …，归 ensureDemoData）、主 agent 成员
-   * （`role='agent'`，hook 上报、跟楼层走）、临时成员（ephemeral，归 subagentFeed）。
-   */
-  function purgeDemoStragglers() {
-    // 名册没起来时 isDefined 不可信（会把用户级小怪物一起误摘），宁可不做
-    if (!agentRoster) return 0;
-    const project = demoProjectId();
-    let n = 0;
-    for (const m of repo.listMembers.all(project) || []) {
-      if (m.ephemeral) continue;
-      if (String(m.role || '') !== 'subagent') continue;
-      const name = m.name || String(m.id || '').split('@')[0];
-      if (DEMO_MEMBER_NAMES.has(name)) continue;
-      if (agentRoster.isDefined(name)) continue;
-      try {
-        bus.removeMember({ project, memberId: m.id });
-        n += 1;
-      } catch {
-        /* 单个清不掉不影响别的 */
-      }
-    }
-    if (n) console.log(`[workgremlin] 已清理 ${n} 个不属于演示工程的小怪物（名册残留）`);
-    return n;
   }
 
   /**
@@ -353,49 +288,47 @@ function createServer(opts = {}) {
       config.writeServerInfo(info);
     }
 
-    // 注意：演示数据的准备（syncDemo）不在这里 —— 它要对"哪些小怪物算已定义"，（见下）
-    // 而那要等 agentRoster 起来之后才有准数，所以挪到名册 start() 之后。
-
     // 清理历史遗留：旧版 agentScan 注册的 "agent-<级别>-<id>" 成员已被 agentRoster 取代，
     // 但库里的旧行不会自动消失，会和 roster 的小怪物同名（出现"Peter/Leo 各两只"）。这里一次性删掉。
     try {
       const legacy = repo
-        .listMembers.all(demoProjectId())
+        .listMembers.all(config.DEMO_PROJECT)
         .filter((m) => /^agent-(user|project)-/.test(m.id));
-      for (const m of legacy) bus.removeMember({ project: demoProjectId(), memberId: m.id });
+      for (const m of legacy) bus.removeMember({ project: config.DEMO_PROJECT, memberId: m.id });
     } catch {
       /* 清理失败不影响启动 */
     }
 
     // 常驻小怪物名册：把已定义的 subagent（项目级 + 用户级）注册成坐工位、带工牌的小怪物。
-    // 当前工程路径优先，回退到服务启动时解析的工程（演示模式下也能扫到项目级 agent）。
-    // 必须在 startFeed() 之前创建：被召唤时由 subagentFeed 同步小怪物工位状态。
+    // 演示工程没有目录（workspacePath === ''），名册于是只列**用户级** agent。
     agentRoster = createAgentRoster({
       bus,
       // 小怪物跟随"当前打开的工程"的 project（不再固定写死演示 project），换工程才跟得过去
       getProject: () => workspace.current().project || config.DEMO_PROJECT,
       // 只认**当前工程**的路径，不回退到"服务启动时解析出来的工程"：
-      // 演示工程没有目录（workspacePath === ''），名册于是只列**用户级** agent ——
-      // 项目级小怪物属于某个真实目录，而切到演示工程后屋里演的是演示团队，
-      // 那几个"本工程的 agent"不该跟着飘进来（它们并不属于演示工程）。
+      // 切到演示工程后屋里演的是演示团队，那几个"本工程的 agent"不该跟着飘进来。
       getWorkspacePath: () => workspace.current().workspacePath,
     });
-    // 换工程：重启 subagent 清单监听（幽灵）+ 同步小怪物名册 + 清掉混进来的演示残留。
-    // 已定义 subagent 的"小怪物"只由 agentRoster 注册一次，避免同名两只。
-    workspace.setOnSwitch(() => {
+
+    // 生命周期钩子：切换工程后（恢复 / 手动切 / 演示切换都走这）按注册顺序触发。
+    lifecycle.onWorkspaceSwitch(() => {
       startFeed();
       agentRoster.sync();
-      purgeDemoLeftovers();
-      // 切工程即决定"演示要不要活着"：进演示就按需播种 + 起推进器，离开就停
-      syncDemo(workspace.current().demo);
     });
+    lifecycle.onWorkspaceSwitch(() => demo.onSwitch(workspace.current(), agentRoster));
+    workspace.setOnSwitch(() => lifecycle.afterWorkspaceSwitch());
+
+    // 关闭钩子：按注册顺序停掉定时器之外的资源（demo 推进器 / 清单监听 / 名册 / hub）。
+    lifecycle.onClose(() => demo.stop());
+    lifecycle.onClose(() => { if (subagentFeed) subagentFeed.stop(); });
+    lifecycle.onClose(() => { if (agentRoster) agentRoster.stop(); });
+    lifecycle.onClose(() => { try { hub.close(); } catch {} });
+
     startFeed();
     agentRoster.start();
-    // 名册起来之后才有"已定义"的准数（syncDemo 的对账要用它），所以演示的准备放这里：
+    // 名册起来之后才有"已定义"的准数（演示对账要用它），所以演示的准备放这里：
     // 上次停在演示工程 → 这回启动照旧是演示，播种 / 心跳 / 残留清理都交给它。
-    syncDemo(Boolean(restored.demo));
-    // 启动时也清一遍：老版本撞名留下的演示残留
-    purgeDemoLeftovers();
+    demo.onSwitch(workspace.current(), agentRoster);
 
     if (!opts.silent) {
       console.log(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
@@ -408,62 +341,9 @@ function createServer(opts = {}) {
     return info;
   }
 
-  /**
-   * 演示推进器随「当前工程是不是演示工程」起停。
-   *
-   * 演示模式**没有启动开关**了（原来靠 `--demo` / `WORKGREMLIN_DEMO=1` / `MOCK=1`）：
-   * 它现在由界面上的「演示模式」按钮切换工程触发（POST /api/v1/workspace 走空路径 → openDemo）。
-   *   - 进演示：库里还没有演示数据就先播一次种，再起推进器 —— 没有推进器的话，60s 后
-   *     所有成员都因心跳超时变 degraded，界面一片灰，而演示恰恰要看"活着"的样子；
-   *   - 离开演示：停掉推进器，别对着演示工程空转（真实工程的成员由 hook / roster 驱动）。
-   */
-  function syncDemo(on) {
-    if (!on) {
-      if (demoTicker) {
-        demoTicker.stop();
-        demoTicker = null;
-      }
-      return;
-    }
-    // 每次进演示都对一次账：名册摘人靠**进程内记账**，服务一重启那笔账就空了，
-    // 只有按"名册自己的口径"对账才清得掉上一轮留下的成员（见 purgeDemoStragglers）。
-    purgeDemoStragglers();
-    if (demoTicker) return;
-    ensureDemoData();
-    demoTicker = createDemoTicker({ bus, repo, project: demoProjectId(), seed: 1 });
-    demoTicker.start();
-  }
-
-  /** 演示工程里一条消息都没有时才播种；已有数据就沿用，反复进出演示不会把消息越堆越多 */
-  function ensureDemoData() {
-    const project = demoProjectId();
-    const existing = /** @type {{ c?: number } | undefined} */ (repo.countMessages.get(project));
-    if (existing && existing.c > 0) return;
-    try {
-      seedDemoData({
-        bus,
-        seed: 1,
-        project,
-        // 演示数据是一条独立的「演示工程」：绑到某个目录的话，打开这个目录就会看到这 8 个模拟成员，
-        // 还以为"打开工程没生效"。演示工程只通过"切到演示工程"进入。
-        workspacePath: '',
-      });
-    } catch (err) {
-      // 播种失败不能拖垮切换本身（切工程照旧发生，只是屋里空着）
-      console.warn('[workgremlin] 演示数据播种失败（不影响真实数据）：', err && err.message);
-    }
-  }
-
   async function close() {
     for (const t of timers) clearInterval(t);
-    if (demoTicker) demoTicker.stop();
-    if (subagentFeed) subagentFeed.stop();
-    if (agentRoster) agentRoster.stop();
-    try {
-      hub.close();
-    } catch {
-      /* ignore */
-    }
+    lifecycle.beforeClose();
     await new Promise((resolve) => httpServer.close(() => resolve(null)));
     closeDb();
     config.clearServerInfo();

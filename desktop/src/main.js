@@ -17,6 +17,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const { IPC_EVENTS } = require('@workgremlin/shared');
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
@@ -65,11 +66,11 @@ async function bootstrap() {
     return;
   }
 
-  ipcMain.handle('workgremlin:get-server-info', () => serverInfo);
-  ipcMain.handle('workgremlin:get-app-version', () => app.getVersion());
+  ipcMain.handle(IPC_EVENTS.GET_SERVER_INFO, () => serverInfo);
+  ipcMain.handle(IPC_EVENTS.GET_APP_VERSION, () => app.getVersion());
 
   // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）
-  ipcMain.handle('workgremlin:choose-workspace', async () => {
+  ipcMain.handle(IPC_EVENTS.CHOOSE_WORKSPACE, async () => {
     const win = BrowserWindow.getFocusedWindow() || mainWindow;
     const res = await dialog.showOpenDialog(win, {
       title: '打开工程',
@@ -83,7 +84,7 @@ async function bootstrap() {
    * 原生（OS 级）全屏：窗口占满整屏，标题栏/边框/菜单栏一起没掉 —— 只有主舞台留着。
    * 渲染层那套"专注模式"（收自家顶栏与左栏）跟着它一起走，见 App.vue。
    */
-  ipcMain.handle('workgremlin:set-full-screen', async (_e, on) => {
+  ipcMain.handle(IPC_EVENTS.SET_FULL_SCREEN, async (_e, on) => {
     const win = BrowserWindow.getFocusedWindow() || mainWindow;
     if (!win || win.isDestroyed()) return false;
     const want = Boolean(on);
@@ -118,7 +119,7 @@ async function bootstrap() {
     return win.isFullScreen();
   });
 
-  ipcMain.handle('workgremlin:is-full-screen', () => {
+  ipcMain.handle(IPC_EVENTS.IS_FULL_SCREEN, () => {
     const win = BrowserWindow.getFocusedWindow() || mainWindow;
     return win && !win.isDestroyed() ? win.isFullScreen() : false;
   });

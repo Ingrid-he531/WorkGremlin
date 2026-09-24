@@ -70,7 +70,8 @@ export const useSessionStore = defineStore('sessions', {
     selected: (s) => s.sessions.find((x) => x.id === s.selectedId) || null,
 
     /**
-     * 当前楼层对应的客户端：1F/3F=codebuddy、2F=workbuddy、4F=codex、5F=claude。
+     * 当前楼层对应的客户端：1F=codebuddy(CLI)、3F=codebuddy-plugin、2F=workbuddy、
+     * 4F=codex、5F=claude、6F=trae-plugin。plugin（VS Code 系扩展）统一带 -plugin 后缀。
      * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）。
      */
     selectedClient: (s) => {

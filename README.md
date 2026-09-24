@@ -80,13 +80,13 @@ node scripts/subagents.js list
 
 让正在干活的 agent 自己往屋里报状态：**启动时会自动接入** —— 探测到装了哪个 CLI（只看安装位置），
 就把对应那份 hook 写好（合并式、幂等、首次改动前备份；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`）。
-**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI** 四个入口的会话都会上报。
+**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI / TraeCode 插件** 五个入口的会话都会上报。
 
-需要手动跑（强制某个 target / 指定工位名 / 卸载）时：
+需要手动跑（强制某个 target / 卸载）时：
 
 ```bash
-npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy
-npm run hooks:install -- --member coder    # 指定工位名（默认 codebuddy）
+npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.trae
+npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / trae）
 npm run hooks:install -- --project         # 另外写一份项目级 <仓库>/.codebuddy/settings.json
 npm run hooks:uninstall                    # 撤掉（只删我们加的那几条，别人的配置不动）
 ```
@@ -106,7 +106,7 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 几个要点：
 
 - **报给哪个工程**：默认报进屋里「当前打开的工程」（问服务端 `/api/v1/workspace`），
-  `WORKGREMLIN_PROJECT` 可覆盖；工位名默认 `codebuddy`（`WORKGREMLIN_MEMBER` 可覆盖）。
+  `WORKGREMLIN_PROJECT` 可覆盖；主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae），已写进命令的 `--agent`。
 - **心跳**：60s 无心跳就 `degraded`（灰显 + 「推断」），所以 `SessionStart` 会另起一个 15s
   一次的心跳守护（`node packages/reporter/src/hook.js --heartbeat`），`SessionEnd` 收掉；
   会话异常退出时，最多 30 分钟没有事件就自己退，不留孤儿进程。
@@ -119,7 +119,7 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 ### Codex CLI 接入（hook）
 
 Codex CLI（0.151+）自带 hook 子系统（`hooks` 是默认开启的 stable feature），协议与 Claude Code / CodeBuddy
-同源，所以共用同一个 `packages/reporter/src/hook.js`，只是事件名与工具名不同，靠 `WORKGREMLIN_CLIENT=codex` 分流：
+同源，所以共用同一个 `packages/reporter/src/hook.js`，只是事件名与工具名不同，靠 `--agent codex` 分流：
 
 ```bash
 npm run hooks:install                      # 一并写 ~/.codex/hooks.json
@@ -130,7 +130,7 @@ npm run hooks:install -- --targets=codex   # 只装 Codex
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "", "hooks": [
-  { "type": "command", "command": "WORKGREMLIN_CLIENT=codex node \"/abs/hook.js\" --member codex", "timeout": 10 } ] } ] } }
+  { "type": "command", "command": "node \"/abs/hook.js\" --agent codex", "timeout": 10 } ] } ] } }
 ```
 
 与 CodeBuddy 的两点差别：

@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const { BrowserWindow } = require('electron');
+const { IPC_EVENTS } = require('@workgremlin/shared');
 
 const isDev = process.env.WORKGREMLIN_DEV === '1' || process.env.NODE_ENV === 'development';
 const DEV_URL = process.env.WORKGREMLIN_RENDERER_URL || 'http://127.0.0.1:5173';
@@ -62,10 +63,10 @@ function createWindow(opts = {}) {
   // 原生全屏状态变了（F11 / 系统手势 / macOS 菜单里的 Enter Full Screen）推给渲染层：
   // 应用内的专注模式要跟着同步，否则窗口已经退出全屏、界面还挂着"没有出口按钮"的专注态。
   win.on('enter-full-screen', () => {
-    if (!win.isDestroyed()) win.webContents.send('workgremlin:full-screen', true);
+    if (!win.isDestroyed()) win.webContents.send(IPC_EVENTS.FULL_SCREEN_EVENT, true);
   });
   win.on('leave-full-screen', () => {
-    if (!win.isDestroyed()) win.webContents.send('workgremlin:full-screen', false);
+    if (!win.isDestroyed()) win.webContents.send(IPC_EVENTS.FULL_SCREEN_EVENT, false);
   });
 
   if (isDev) {

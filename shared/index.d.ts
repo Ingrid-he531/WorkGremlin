@@ -138,6 +138,7 @@ export declare const DEFAULTS: {
   readonly WAL_CHECKPOINT_INTERVAL_MS: number;
 };
 export declare const WS_EVENTS: Record<string, string>;
+export declare const IPC_EVENTS: Record<string, string>;
 export declare const CLIENT_EVENTS: Record<string, string>;
 export declare const HTTP_ROUTES: Record<string, string>;
 export declare const ERROR_CODES: Record<string, string>;
@@ -155,3 +156,12 @@ export declare function dedupeKey(m: {
 }): string;
 export declare function fnv1a32(str: string): string;
 export declare function formatDuration(ms: number): string;
+
+/**
+ * 智能体（agent）与客户端（client）的关系：client = agent，或 agent + '-plugin'。
+ * 这是全局唯一合同（hook 的 eventClient 据此产出 client 字段，server/前端据此归层）。
+ */
+export declare function clientBase(client: string): string;
+export declare function isPluginClient(client: string): boolean;
+export declare function clientOf(agent: string, plugin: boolean): string;
+export declare function agentOf(client: string): string;

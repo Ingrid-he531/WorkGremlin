@@ -209,8 +209,51 @@ function avatarOf(name) {
  * ------------------------------------------------------------------ */
 
 
+/** 主进程 <-> 渲染层 IPC 通道（与 WS_EVENTS 同款约定，集中管理避免拼写漂移导致静默断链） */
+const IPC_EVENTS = Object.freeze({
+  GET_SERVER_INFO: 'workgremlin:get-server-info',
+  GET_APP_VERSION: 'workgremlin:get-app-version',
+  CHOOSE_WORKSPACE: 'workgremlin:choose-workspace',
+  SET_FULL_SCREEN: 'workgremlin:set-full-screen',
+  IS_FULL_SCREEN: 'workgremlin:is-full-screen',
+  FULL_SCREEN_EVENT: 'workgremlin:full-screen',
+  EVENT: 'workgremlin:event',
+});
+
+/**
+ * 智能体（agent）与客户端（client）的关系：client = agent，或 agent + '-plugin'。
+ * 这是全局唯一合同（hook 的 eventClient 据此产出 client 字段，server/前端据此归层）。
+ *   - agent（基名）：codebuddy / workbuddy / codex / claude / trae …（见 server/src/products.js 的楼层定义）
+ *   - client（上报身份）：非 plugin 直接是 agent；plugin 是 agent + '-plugin'。
+ * 例：CodeBuddy 同时有 CLI（client=codebuddy，1F）与 Plugin（client=codebuddy-plugin，3F）；
+ * Codex/Claude 目前只有 CLI（client=codex / claude），Trae 目前是 Plugin（client=trae-plugin）。
+ * 以后加 TraeCode-plugin、Codex-plugin，只需在 products.js 多写一条楼层（agent + plugin:true）。
+ */
+
+/** 去 '-plugin' 后缀，拿到产品基名（小写）；非法/空输入返回 '' */
+function clientBase(client) {
+  return String(client || '').replace(/-plugin$/i, '').toLowerCase();
+}
+
+/** 是否 plugin 形态（带 -plugin 后缀） */
+function isPluginClient(client) {
+  return /-plugin$/i.test(String(client || ''));
+}
+
+/** 由 agent 基名 + 是否 plugin 拼出 client 字符串 */
+function clientOf(agent, plugin) {
+  const a = String(agent || '').toLowerCase();
+  return plugin ? `${a}-plugin` : a;
+}
+
+/** client 反推 agent 基名（= clientBase） */
+function agentOf(client) {
+  return clientBase(client);
+}
+
 module.exports = {
   PROTOCOL_VERSION,
+  IPC_EVENTS,
   AGENT_STATES,
   TASK_STATES,
   MESSAGE_TYPES,
@@ -229,4 +272,8 @@ module.exports = {
   dedupeKey,
   fnv1a32,
   formatDuration,
+  clientBase,
+  isPluginClient,
+  clientOf,
+  agentOf,
 };

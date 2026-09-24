@@ -27,9 +27,14 @@ function memberIdOf(project, name) {
   return String(name).includes('@') ? name : `${name}@${project}`;
 }
 
-/** 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL）
- *  codebuddy-cli = CodeBuddy CLI（与 CodeBuddy Plugin 共用 ~/.codebuddy，靠 hook payload 的 client 字段区分） */
-const CLIENTS = new Set(['codebuddy', 'codebuddy-cli', 'workbuddy', 'codex', 'claude']);
+/**
+ * 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL）。
+ * 合同见 hook 的 eventClient：非 plugin 直接返回 agent（codebuddy / codex / trae / …），
+ * plugin 返回 agent + '-plugin'（codebuddy-plugin / codex-plugin / trae-plugin）。
+ * 因此白名单同时认 base 与 base-plugin 两种形态；新加的产品补进 CLIENT_BASES 即可。
+ */
+const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae'];
+const CLIENTS = new Set([...CLIENT_BASES, ...CLIENT_BASES.map((b) => `${b}-plugin`)]);
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
   return CLIENTS.has(c) ? c : null;

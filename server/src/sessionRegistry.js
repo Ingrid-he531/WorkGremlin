@@ -211,48 +211,55 @@ function refresh({ workspacePath = '', force = false } = {}) {
   const now = Date.now();
   if (!force && lastScanAt && now - lastScanAt < TTL) return;
 
-  // 3F 插件：结构化落盘
-  const plugin = listSessions({ workspacePath, force });
-  for (const s of plugin.sessions || []) {
-    upsert({
-      floor: '3F',
-      id: s.id,
-      source: 'plugin',
-      project: s.project || '',
-      projectPath: s.projectPath || '',
-      mine: Boolean(s.mine),
-      current: Boolean(s.current),
-      // 全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
-      // 只有它才配叠加 1.5s 快轮询的全局实时相位，其余 current=true 的工程当前会话
-      // 只用自己工程的上报，绝不借别人的相位冒充（否则切回旧会话会误显新工程的"调用工具"）。
-      fresh: s.id === plugin.current,
-      live: Boolean(s.live),
-      runtime: s.runtime,
-      pending: s.pending || 0,
-      todos: s.todos,
-      files: s.files,
-      phase: s.phase,
-      action: s.action,
-      target: s.target || '',
-      tool: s.tool || '',
-      context: s.context || [],
-      prompt: s.prompt || '',
-      // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
-      doneAt: s.doneAt || 0,
-      doneTitle: s.doneTitle || '',
-      doneCount: s.doneCount || 0,
-      doneFiles: s.doneFiles || [],
-      // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
-      // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
-      inferred: Boolean(s.inferred),
-      lastEventAt: s.lastUpdated || 0,
-    });
+  // 插件楼层：每个 plugin 楼层各自读自己的落盘（client 不同，不能混）。
+  // 以前这里写死 3F + 全局 PLUGIN_CLIENT（已删除）；现在遍历所有 plugin 楼层，
+  // 6F TraeCode-Plugin 因此也有会话来源，未来加 Codex-Plugin 同理（只改 products.js）。
+  const products = detectProducts({});
+  for (const p of products) {
+    if (p.kind !== 'plugin') continue;
+    const st = listSessions({ workspacePath, force, client: p.dataKind, pluginRe: p.pluginRe });
+    if (!st.sessions || !st.sessions.length) continue;
+    for (const s of st.sessions) {
+      upsert({
+        floor: p.id,
+        id: s.id,
+        source: 'plugin',
+        project: s.project || '',
+        projectPath: s.projectPath || '',
+        mine: Boolean(s.mine),
+        current: Boolean(s.current),
+        // 该层全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
+        // 只有它才配叠加实时相位，其余 current=true 的工程当前会话只用自己工程的上报，
+        // 绝不借别人的相位冒充（否则切回旧会话会误显别的工程的"调用工具"）。
+        fresh: s.id === st.current,
+        live: Boolean(s.live),
+        runtime: s.runtime,
+        pending: s.pending || 0,
+        todos: s.todos,
+        files: s.files,
+        phase: s.phase,
+        action: s.action,
+        target: s.target || '',
+        tool: s.tool || '',
+        context: s.context || [],
+        prompt: s.prompt || '',
+        // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
+        doneAt: s.doneAt || 0,
+        doneTitle: s.doneTitle || '',
+        doneCount: s.doneCount || 0,
+        doneFiles: s.doneFiles || [],
+        // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
+        // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
+        inferred: Boolean(s.inferred),
+        lastEventAt: s.lastUpdated || 0,
+      });
+    }
   }
 
   // 1F / 2F / 4F / 5F CLI：落盘目录里的 jsonl
-  for (const p of detectProducts({})) {
+  for (const p of products) {
     if (p.kind !== 'cli') continue;
-    for (const s of scanCliSessions(p.dataPath, { kind: p.dataKind })) {
+    for (const s of scanCliSessions(p.dataPath, { kind: p.agent })) {
       const lastEventAt = s.lastEventAt;
       upsert({
         floor: p.id,

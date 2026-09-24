@@ -26,7 +26,7 @@
  *
  * 环境变量：
  *   WORKGREMLIN_PROJECT        project 名（缺省用服务端"当前打开的工程"那个 project）
- *   WORKGREMLIN_MEMBER      工位名（缺省 codebuddy）
+ *   --agent <name>          主 agent 名字（必填；codebuddy / codex / workbuddy / trae …）
  *   WORKGREMLIN_ROLE        角色（缺省 agent）
  *   WORKGREMLIN_HOOK_DEBUG=1      把失败原因打到 stderr
  *   WORKGREMLIN_HOOK_MESSAGES=1   另外把每条用户指令当消息投进对话记录
@@ -41,43 +41,54 @@ const { readServerInfo, HTTP_ROUTES } = require('./index');
 const { fnv1a32 } = require('@workgremlin/shared');
 
 /**
- * 本 hook 服务哪个 CLI（安装器写进 hook 命令：Codex 那份是 WORKGREMLIN_CLIENT=codex）。
+ * 本 hook 服务哪个 CLI（安装器写进 hook 命令：Codex 那份是 --agent codex）。
  * 实测差异（Codex CLI 0.151.0）：
  *   · 工具名：Bash / apply_patch（tool_input 是 patch 文本）/ collaborationspawn_agent …
  *   · 事件：有 PermissionRequest、SubagentStart、Interrupt；没有 Notification
  *   · 每个工具事件都带真 tool_use_id；子代理事件带 agent_id / agent_type
  * 对照 CodeBuddy：工具名 Write/Edit/MultiEdit/Task，事件 Notification / SubagentStop。
  */
-const CLIENT = String(process.env.WORKGREMLIN_CLIENT || 'codebuddy').toLowerCase();
-const IS_CODEX = CLIENT === 'codex';
+/** 本 hook 服务哪个产品（安装器通过 --agent 注入；必填，缺省直接报错退出）。
+ *  这是**轴 1（产品家族）**：trae / codebuddy-plugin 都跑在 VS Code 协议上、运行时 payload 长得一样
+ *  （都自报 client:'vscode'），光靠 payload 分不出，只能靠安装期身份。
+ *  只有 codebuddy 这个家族还要靠 payload 的 client 再分 cli（1F）/ plugin（3F）两层，见 eventClient。 */
+let AGENT = '';
+let IS_CODEX = false;
 /** spawn_agent → SubagentStart 之间的"待认领"窗口 */
 const PENDING_SPAWN_MS = 2 * 60_000;
 
 /**
- * 本事件究竟来自哪个客户端（codebuddy / codebuddy-cli / codex / …）。
+ * 本事件究竟来自哪个客户端（codebuddy / codebuddy-plugin / codex / codex-plugin / …）。
  *
- * CodeBuddy **Plugin** 的 hook payload 带 `client` 字段（实测为 'codebuddy'），直接用它；
- * **CLI** 与 Plugin 共用同一份 ~/.codebuddy/settings.json、跑同一条 hook 命令，但 CLI 的
- * payload 不带 `client` 字段 —— 这种事件一律当作 CLI，归到专属的 'codebuddy-cli'，
- * 免得和 Plugin 的 'codebuddy' 撞车（数据库楼层列 / 成员 / 会话归属据此分开）。
- * 显式带 WORKGREMLIN_CLIENT（如未来为 CLI 单独注入 codebuddy-cli）时，无 payload client 也用它。
+ * 这是**来源身份的合同映射**，不是运行时猜测：Plugin 与 CLI 共用同一份
+ * ~/.codebuddy/settings.json、跑同一条 hook 命令，所以只能靠 payload 里
+ * 稳定携带的 `client` 字段来区分二者，再归一化到服务端约定的来源身份。
+ *
+ * 约定（全产品通用，codex / trae 同样适用）：
+ *   - 非 plugin（CLI / 独立可执行）：直接返回 **agent 本身**（codebuddy / codex / trae / workbuddy）。
+ *   - plugin（VS Code 系扩展，payload 自报 `client: 'vscode'`）：返回 **agent + '-plugin'**
+ *     （codebuddy-plugin / codex-plugin / trae-plugin）。
+ *
+ * 这样每个产品既能分清 CLI 与 plugin（CodeBuddy 的 1F / 3F 二分），
+ * 又能让只有一个楼层的产品（codex / trae）把两种变体都归到那一层。
+ *
  * @param {any} ev hook 事件
  * @returns {string}
  */
 function eventClient(ev) {
   const ec = ev && ev.client ? String(ev.client).trim().toLowerCase() : '';
-  if (ec) return ec;
-  return CLIENT === 'codebuddy' ? 'codebuddy-cli' : CLIENT;
+  // Plugin 自报的 'vscode'（及历史 'codebuddy'）一律加 '-plugin' 后缀归到 plugin 身份；
+  // 其余（含空，即 CLI）按 agent 本身返回。
+  if (ec && ec !== AGENT.toLowerCase()) return AGENT + "-plugin";
+  return AGENT;
 }
 
 /** 本 reporter 进程真实运行所在的工程（cwd 解析成绝对路径）。
  * 相位 / task 都打这个路径，服务端据此把"当前工程"归到你真正在敲的工程，
  * 而不是 office 里手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。 */
 const REAL_WS = path.resolve(process.cwd());
-
 /** shared 里没有登记这条（服务端在 server/src/http/routes/workspace.js） */
 const WORKSPACE_ROUTE = '/api/v1/workspace';
-
 const REQ_TIMEOUT_MS = 2_000;
 const STDIN_TIMEOUT_MS = 1_500;
 const HB_INTERVAL_MS = 15_000;
@@ -115,12 +126,12 @@ function trace(event, extra) {
 
 /**
  * 每个工位 + 工程一份：当前任务 id + 心跳守护的 pid。
- * 文件名带上工程（cwd 解析后的 REAL_WS），这样多个工程同时开着（同一 member 名 codebuddy）
+ * 文件名带上工程（cwd 解析后的 REAL_WS），这样多个工程同时开着（同一 agent 名）
  * 时各自写自己的文件，互不覆盖相位 / 任务 / 心跳 —— 否则会出现旧会话乱跳"思考中"、
  * "任务完成"被别的工程串味误弹等跨工程失真。
  */
-function statePath(member) {
-  const key = `${String(member)}@${REAL_WS}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+function statePath(agent) {
+  const key = `${String(agent)}@${REAL_WS}`.replace(/[^a-zA-Z0-9._-]/g, '_');
   return path.join(home(), 'hooks', `${key}.json`);
 }
 
@@ -453,7 +464,7 @@ function aiDedupeKey(client, sessionId, msgId) {
  * 与 task_runs.result（一轮一条摘要）互不替代。
  * 一条都拿不到就什么都不做（绝不编造）；超长单条按 MSG_MAX 截断，别把一条消息撑爆。
  */
-async function reportAiReplies(info, base, member, taskId, replies, sessionId, client) {
+async function reportAiReplies(info, base, agent, taskId, replies, sessionId, client) {
   if (!Array.isArray(replies) || !replies.length) return;
   const list = replies.slice(-MAX_REPLIES);
   const now = Date.now();
@@ -470,8 +481,8 @@ async function reportAiReplies(info, base, member, taskId, replies, sessionId, c
         const ts = Number(r.ts) > 0 ? Number(r.ts) : now - (list.length - 1 - i);
         return request(info, HTTP_ROUTES.MESSAGE, {
           ...base,
-          memberId: member,
-          from: member,
+          memberId: agent,
+          from: agent,
           to: null,
           // 收尾那条算产出，中间那几条算过程（都在 MESSAGE_TYPES 里，前端不用改）
           type: i === list.length - 1 ? 'result' : 'task_update',
@@ -807,12 +818,12 @@ function clearAwait(file) {
   writeState(file, { await: null, pending: null, sessionPhase: null, done: null });
 }
 
-function startHeartbeat(member) {
-  const file = statePath(member);
+function startHeartbeat(agent) {
+  const file = statePath(agent);
   const st = readState(file);
   if (st.hb && st.hb.pid && alive(st.hb.pid)) return; // 已经有一个在跑
   try {
-    const child = spawn(process.execPath, [__filename, '--heartbeat', '--member', member], {
+    const child = spawn(process.execPath, [__filename, '--heartbeat', '--agent', agent], {
       detached: true,
       stdio: 'ignore',
       env: process.env,
@@ -824,8 +835,8 @@ function startHeartbeat(member) {
   }
 }
 
-function stopHeartbeat(member) {
-  const file = statePath(member);
+function stopHeartbeat(agent) {
+  const file = statePath(agent);
   const st = readState(file);
   const pid = st.hb && st.hb.pid;
   // 先立停止旗，再发信号：守护即便错过信号，下一轮也会自己退
@@ -843,11 +854,11 @@ function stopHeartbeat(member) {
  * 心跳守护：SessionStart 拉起、SessionEnd 收掉。
  * 没有它，agent 只要思考超过 60s，屋里就把它标成 degraded（灰 + 「推断」）。
  */
-async function runHeartbeat(info, member) {
-  const file = statePath(member);
+async function runHeartbeat(info, agent) {
+  const file = statePath(agent);
   const startedAt = Date.now();
   const ctx = await resolveCtx(info);
-  const body = { project: ctx.project, workspacePath: ctx.workspacePath, memberId: member };
+  const body = { project: ctx.project, workspacePath: ctx.workspacePath, memberId: agent };
   writeState(file, { hb: { pid: process.pid, startedAt, lastEventAt: Date.now() } });
 
   const stop = () => {
@@ -871,7 +882,13 @@ async function runHeartbeat(info, member) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  const member = flag(argv, '--member') || process.env.WORKGREMLIN_MEMBER || (IS_CODEX ? 'codex' : 'codebuddy');
+  // 主 agent 身份：安装器在命令里用 --agent 注入，必填；缺了直接报错退出。
+  AGENT = flag(argv, '--agent');
+  if (!AGENT) {
+    console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / workbuddy / trae）');
+    process.exit(1);
+  }
+  IS_CODEX = AGENT === 'codex';
 
   const info = readServerInfo();
   if (!info || !info.port) {
@@ -879,7 +896,7 @@ async function main() {
     return;
   }
 
-  if (argv.includes('--heartbeat')) return runHeartbeat(info, member);
+  if (argv.includes('--heartbeat')) return runHeartbeat(info, AGENT);
 
   const raw = await readStdin();
   let ev = null;
@@ -891,13 +908,23 @@ async function main() {
   }
   const event = ev && ev.hook_event_name;
   if (!event) return;
-  // 本次事件归属的客户端：Plugin 用 payload 的 client（'codebuddy'），CLI 用专属 'codebuddy-cli'
+  // 本次事件归属的客户端：默认 CodeBuddy 钩子落 'codebuddy'（CLI/1F 来源），
+  // plugin（payload 自带 client）则落 'codebuddy-plugin'（3F 来源）；其余产品同此
+  // （codex / codex-plugin、trae / trae-plugin …），由 eventClient 统一归层。
   const cl = eventClient(ev);
-  trace(event, { member, client: cl, tool: ev.tool_name, notification_type: ev.notification_type });
+  // 观测用：把"安装器注入的 client（env）"与"payload 自带的 client（ev）"都按原值打出来，
+  // 方便对照 codebuddy plugin / traeCode plugin / codex cli 各自长什么样。
+  trace(event, {
+    client: cl,
+    agent: AGENT,
+    raw_ev_client: ev && ev.client !== undefined ? ev.client : null,
+    tool: ev.tool_name,
+    notification_type: ev.notification_type,
+  });
 
   const ctx = await resolveCtx(info);
   const base = { project: ctx.project, workspacePath: ctx.workspacePath };
-  const file = statePath(member);
+  const file = statePath(AGENT);
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // 状态文件里记下来源客户端：同一个工程可能同时有 Codex / CLI / Plugin 在跑，
   // 主控制台要按楼层（客户端）取相位，不能谁新鲜就显示谁。
@@ -913,20 +940,20 @@ async function main() {
   const register = () =>
     request(info, HTTP_ROUTES.REGISTER, {
       ...base,
-      memberId: member,
-      name: member,
+      memberId: AGENT,
+      name: AGENT,
       role: process.env.WORKGREMLIN_ROLE || 'agent',
       // 来源客户端：办公室按当前楼层的客户端过滤成员（server 的 members.client）
       client: cl,
     });
-  const beat = () => request(info, HTTP_ROUTES.HEARTBEAT, { ...base, memberId: member });
+  const beat = () => request(info, HTTP_ROUTES.HEARTBEAT, { ...base, memberId: AGENT });
   const status = (state, reason) =>
-    request(info, HTTP_ROUTES.STATUS, { ...base, memberId: member, state, ...(reason ? { reason } : {}) });
+    request(info, HTTP_ROUTES.STATUS, { ...base, memberId: AGENT, state, ...(reason ? { reason } : {}) });
 
   // 会话边界的事件才 register（工具前后各 register 一次太吵）；
   // 但中途才装上 hook 的话第一个事件也可能是 SessionStart 之外的，所以 UserPromptSubmit / Stop 也补一次。
   if (event === 'SessionStart') {
-    startHeartbeat(member);
+    startHeartbeat(AGENT);
     await register();
     await beat();
     await status('idle');
@@ -944,7 +971,7 @@ async function main() {
     // model 一并上报：报表要记这一轮用的是哪个模型（hook payload 没带就是空 → 服务端留 NULL）
     const started = await request(info, HTTP_ROUTES.TASK_START, {
       ...base,
-      memberId: member,
+      memberId: AGENT,
       title,
       model: String(ev.model || ''),
     });
@@ -966,8 +993,8 @@ async function main() {
     if (process.env.WORKGREMLIN_HOOK_MESSAGES === '1') {
       await request(info, HTTP_ROUTES.MESSAGE, {
         ...base,
-        memberId: member,
-        from: member,
+        memberId: AGENT,
+        from: AGENT,
         to: null,
         type: 'task_assign',
         subject: title,
@@ -1024,20 +1051,20 @@ async function main() {
           // tool_response 里没有 agent_id（实测只有 {"task_name":"/root/xxx"}），所以这里只把
           // 名字 / 任务记成"待认领"，由 SubagentStart 认领后生成幽灵；收工只认 SubagentStop。
           writeState(file, { pendingSpawn: { name: nm, task, at: Date.now() } });
-          trace('ghost-pending', { member, tool, name: nm });
+          trace('ghost-pending', { agent: AGENT, tool, name: nm });
         } else {
           const id = subagentKeys(ev, nm, task)[0] || '';
           rememberSubagent(file, id, nm);
           // parent = 主 agent 当前这一轮的用户任务 id：台账靠它把这次召唤挂到那一轮头上
           addGhost(REAL_WS, nm, task, id, String(readState(file).taskId || ''), String(ev.model || ''), cl);
-          trace('ghost+', { member, tool, name: nm, id, gen: ev.generation_id || '', agentId: ev.agent_id || '' });
+          trace('ghost+', { agent: AGENT, tool, name: nm, id, gen: ev.generation_id || '', agentId: ev.agent_id || '' });
         }
       }
       await status('busy');
     } else {
       const touched = filesOf(ev.tool_input, ev.tool_name).map((x) => relFile(x, cwd)).filter(Boolean);
       if (touched.length) {
-        await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: member, files: touched, op: opOf(ev.tool_name) });
+        await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: AGENT, files: touched, op: opOf(ev.tool_name) });
         // 本地也记一份：上报失败（服务没起 / 接口报错）时完成概要仍拿得到文件清单
         rememberRoundFiles(file, touched.map((p) => ({ path: p, op: opOf(ev.tool_name) })));
       }
@@ -1124,7 +1151,7 @@ async function main() {
     if (taskId) {
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
-        memberId: member,
+        memberId: AGENT,
         taskId,
         state: 'done',
         model: String(ev.model || ''),
@@ -1157,7 +1184,7 @@ async function main() {
     // taskId / replies / sessionId 都在局部变量里，所以放在清状态之后归属也不会错。
     await beat();
     await status('idle');
-    await reportAiReplies(info, base, member, taskId, replies, String((ev && ev.session_id) || st.sessionId || ''), cl);
+    await reportAiReplies(info, base, AGENT, taskId, replies, String((ev && ev.session_id) || st.sessionId || ''), cl);
     return;
   }
 
@@ -1182,7 +1209,7 @@ async function main() {
     rememberSubagent(file, id, name);
     addGhost(REAL_WS, name, (pend && pend.task) || '', id, String(readState(file).taskId || ''), String(ev.model || ''), cl);
     writeState(file, { pendingSpawn: null });
-    trace('ghost+', { member, tool: 'SubagentStart', name, id, agentType: type });
+    trace('ghost+', { agent: AGENT, tool: 'SubagentStart', name, id, agentType: type });
     await beat();
     return;
   }
@@ -1194,7 +1221,7 @@ async function main() {
     await reportAiReplies(
       info,
       base,
-      member,
+      AGENT,
       stInt.taskId,
       turnReplies(ev.transcript_path || stInt.transcriptPath || ''),
       String((ev && ev.session_id) || stInt.sessionId || ''),
@@ -1224,14 +1251,14 @@ async function main() {
     await reportAiReplies(
       info,
       base,
-      member,
+      AGENT,
       stEnd.taskId,
       turnReplies(ev.transcript_path || stEnd.transcriptPath || ''),
       String((ev && ev.session_id) || stEnd.sessionId || ''),
       cl
     );
     writeState(file, { await: null, pending: null, sessionPhase: null });
-    stopHeartbeat(member);
+    stopHeartbeat(AGENT);
     // 兜底：会话都结束了，它召唤出去的幽灵不该还飘着（手工 scripts/subagents.js
     // 写的那些没有 ts，不动它们）。
     sweepGhosts(file, REAL_WS, cl, { all: true });

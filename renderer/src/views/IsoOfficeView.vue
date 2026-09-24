@@ -13,6 +13,7 @@ import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
+import { floorAcceptsClient } from '../lib/clientMatch';
 import { httpBase, getServerInfo } from '../api/bridge';
 import { createIsoOffice } from '../iso/engine';
 
@@ -422,13 +423,15 @@ const sceneMembers = computed(() => {
    */
   const emptyFloor = sessions.floorEmpty && !demo;
   const want = demo ? '' : sessions.selectedClient;
+  // 小怪物按 agent 基名归层：1F/3F 都是 codebuddy，所以两边都摆 CodeBuddy 的常住小怪物；
+  // codex / claude / trae 各自 CLI 与 plugin 两层也都要。floorAcceptsClient 内部剥 -plugin 后比基名。
   const live = demo || sessions.live;
   return project.members
     .filter((m) => m.role !== 'agent')
     .filter((m) => !(emptyFloor && isEphemeralMember(m))) // 空楼层：只留常驻的
-    // 按楼层过滤来源：4F 只看 Codex 的成员与幽灵，1F/3F 只看 CodeBuddy 的。
+    // 按 agent 基名过滤来源：4F/7F 只看 Codex 的成员与幽灵，1F/3F 只看 CodeBuddy 的。
     // client 为空的（演示数据、手工 scripts/subagents.js 写的、老库还没补上的）视作通用，哪层都显示。
-    .filter((m) => !want || !m.client || m.client === want)
+    .filter((m) => floorAcceptsClient(want, m.client))
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],

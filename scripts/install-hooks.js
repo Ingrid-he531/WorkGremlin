@@ -8,7 +8,6 @@
  *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy）
  *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / project）
  *   node scripts/install-hooks.js --project              另外写一份项目级 <仓库>/.codebuddy/settings.json
- *   node scripts/install-hooks.js --member coder         指定工位名（默认 codebuddy）
  *   node scripts/install-hooks.js --uninstall            撤掉（只删我们加的那几条，别人的配置不动）
  *   node scripts/install-hooks.js --dry-run              只打印将要写什么，不落盘
  *
@@ -84,23 +83,30 @@ function parseArgs(argv) {
   return args;
 }
 
-function command(member) {
-  const base = `node "${HOOK_SCRIPT}"`;
-  return member && member !== 'codebuddy' ? `${base} --member ${member}` : base;
+function codebuddyCommand() {
+  // codebuddy 家族（cli/plugin 共用 ~/.codebuddy/settings.json）：--agent codebuddy，
+  // 由 hook 再按 payload 的 client 分 cli（1F）/ plugin（3F）。
+  return `node "${HOOK_SCRIPT}" --agent codebuddy`;
 }
 
 /**
- * Codex 的 hook 命令：注入 WORKGREMLIN_CLIENT=codex（hook 靠它选事件名与工具名口径，
+ * Codex 的 hook 命令：用 --agent codex 注入产品家族身份（hook 靠它选事件名与工具名口径，
  * 见 packages/reporter/src/hook.js 的 IS_CODEX），默认工位名也换成 codex —— 不跟 CodeBuddy
  * 抢同一张工位卡。
  */
-function codexCommand(member) {
-  return `WORKGREMLIN_CLIENT=codex node "${HOOK_SCRIPT}" --member ${member}`;
+function codexCommand() {
+  return `node "${HOOK_SCRIPT}" --agent codex`;
 }
 
-/** WorkBuddy 同理：带自己的 client 与工位名，别写成 codebuddy */
-function workbuddyCommand(member) {
-  return `WORKGREMLIN_CLIENT=workbuddy node "${HOOK_SCRIPT}" --member ${member}`;
+/** WorkBuddy 同理：用 --agent workbuddy 注入产品家族身份，别写成 codebuddy */
+function workbuddyCommand() {
+  return `node "${HOOK_SCRIPT}" --agent workbuddy`;
+}
+
+/** TraeCode 插件：用 --agent trae 注入产品家族身份（trae 与 codebuddy 都自报 client:'vscode'，
+ *  运行时分不出，只能靠安装期身份），别写成 codebuddy。工位名默认 trae。 */
+function traeCommand() {
+  return `node "${HOOK_SCRIPT}" --agent trae`;
 }
 
 /** 我们加的那几条：按 command 里有没有 hook 脚本路径识别 */
@@ -220,19 +226,21 @@ function extensionRoots() {
     .filter(isDir);
 }
 const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
-function pluginMatchIn(root) {
+function pluginMatchIn(root, res) {
+  // res 可能是单个正则（某产品的 pluginRe，如 /trae/i）或正则数组：统一成数组再 .some
+  const list = res instanceof RegExp ? [res] : res || [];
   try {
     for (const name of fs.readdirSync(root)) {
-      if (RE_PLUGIN.some((re) => re.test(name))) return path.join(root, name);
+      if (list.some((re) => re.test(name))) return path.join(root, name);
     }
   } catch {
     /* 读不到就跳过 */
   }
   return '';
 }
-function findPluginDir() {
+function findPluginDir(res = RE_PLUGIN) {
   for (const r of extensionRoots()) {
-    const hit = pluginMatchIn(r);
+    const hit = pluginMatchIn(r, res);
     if (hit) return hit;
   }
   return '';
@@ -242,7 +250,7 @@ function looksInstalled(t) {
   // CLI：PATH 或常见安装目录里找得到可执行文件
   if (t.cmd && (resolveCommand(t.cmd) || findCliBin(t.cmd))) return true;
   // 插件：编辑器扩展目录里找得到（CodeBuddy Plugin与 CLI 共用 ~/.codebuddy）
-  if (t.plugin && findPluginDir()) return true;
+  if (t.plugin && findPluginDir(t.pluginRe || RE_PLUGIN)) return true;
   // 兜底：配置目录里除了我们自己的 settings.json 还有别的数据
   const ours = new Set(['settings.json', 'settings.json.bak-workgremlin']);
   try {
@@ -254,13 +262,12 @@ function looksInstalled(t) {
 
 /**
  * 安装/卸载 hook。既能当函数调（服务启动时自动接入），也能走 CLI（见文件末尾）。
- * @param {Record<string, any>} [args] 同 CLI 参数（targets / member / dry-run / uninstall / project）
+ * @param {Record<string, any>} [args] 同 CLI 参数（targets / dry-run / uninstall / project）
  * @returns {{installed: string[], unchanged: string[], skipped: string[], failed: string[], files: string[]}}
  */
 function installHooks(args = parseArgs(process.argv.slice(2))) {
   /** @type {{installed: string[], unchanged: string[], skipped: string[], failed: string[], files: string[]}} */
   const result = { installed: [], unchanged: [], skipped: [], failed: [], files: [] };
-  const member = String(args.member || 'codebuddy').trim() || 'codebuddy';
   const dryRun = args['dry-run'] === true;
   const uninstall = args.uninstall === true;
   const wanted = String(args.targets || '')
@@ -268,7 +275,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const cmd = command(member);
+  const codebuddyCmd = codebuddyCommand();
   const buildOurs = (events, hookCmd) => {
     const out = {};
     for (const [event, matcher] of events) {
@@ -277,11 +284,10 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
     return out;
   };
-  const ours = buildOurs(EVENTS, cmd);
-  const codexMember = String(args.member || 'codex').trim() || 'codex';
-  const codexOurs = buildOurs(CODEX_EVENTS, codexCommand(codexMember));
-  const wbMember = String(args.member || 'workbuddy').trim() || 'workbuddy';
-  const workbuddyOurs = buildOurs(EVENTS, workbuddyCommand(wbMember));
+  const codebuddyOurs = buildOurs(EVENTS, codebuddyCmd);
+  const codexOurs = buildOurs(CODEX_EVENTS, codexCommand());
+  const workbuddyOurs = buildOurs(EVENTS, workbuddyCommand());
+  const traeOurs = buildOurs(EVENTS, traeCommand());
 
   const all = [
     {
@@ -291,6 +297,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       cmd: 'codebuddy',
       dir: path.join(os.homedir(), '.codebuddy'),
       plugin: true,
+      ours: codebuddyOurs,
     },
     {
       id: 'workbuddy',
@@ -309,7 +316,19 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       dir: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
       ours: codexOurs,
     },
-    { id: 'project', label: `CodeBuddy 项目级（${path.basename(REPO_ROOT)}）`, file: path.join(REPO_ROOT, '.codebuddy', 'settings.json'), optional: true },
+    {
+      id: 'trae',
+      label: 'TraeCode Plugin',
+      // Trae 基于 VS Code 协议，hook 结构与 CodeBuddy Plugin 同源（settings.json + hooks 事件）。
+      // 注意：路径是按 CodeBuddy 同款 ~/.trae/settings.json 推断的；若 Trae 实际用别的落盘位置需调整。
+      file: path.join(os.homedir(), '.trae', 'settings.json'),
+      cmd: 'trae',
+      dir: path.join(os.homedir(), '.trae'),
+      plugin: true,
+      pluginRe: /trae/i,
+      ours: traeOurs,
+    },
+    { id: 'project', label: `CodeBuddy 项目级（${path.basename(REPO_ROOT)}）`, file: path.join(REPO_ROOT, '.codebuddy', 'settings.json'), ours: codebuddyOurs, optional: true },
   ];
   const targets = all.filter((t) => (t.optional ? args.project === true || wanted.includes(t.id) : !wanted.length || wanted.includes(t.id)));
 
@@ -318,9 +337,9 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     throw new Error(`找不到 hook 脚本：${HOOK_SCRIPT}`);
   }
 
-  console.log(`[workgremlin] hook 命令：${cmd}`);
-  if (!wanted.length || wanted.includes('codex')) console.log(`[workgremlin] Codex 命令：${codexCommand(codexMember)}`);
-  console.log(`[workgremlin] 工位名：${member}（WORKGREMLIN_MEMBER 可在环境里覆盖）`);
+  console.log(`[workgremlin] hook 命令：${codebuddyCmd}`);
+  if (!wanted.length || wanted.includes('codex')) console.log(`[workgremlin] Codex 命令：${codexCommand()}`);
+  if (!wanted.length || wanted.includes('trae')) console.log(`[workgremlin] TraeCode 命令：${traeCommand()}`);
   if (dryRun) console.log('[workgremlin] --dry-run：不落盘');
 
   for (const t of targets) {
@@ -341,7 +360,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       continue;
     }
 
-    const next = merge(existing || {}, t.ours || ours, uninstall);
+    const next = merge(existing || {}, t.ours, uninstall);
     const before = JSON.stringify(existing || {});
     const after = JSON.stringify(next);
 
@@ -374,7 +393,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('[workgremlin] 生效方式：');
     console.log('  · CodeBuddy Plugin：重开会话');
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');
-    console.log('  · 想换工位名：node scripts/install-hooks.js --uninstall && node scripts/install-hooks.js --member coder');
+    console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae），已写进 hook 命令的 --agent，无需也无法二次指定');
     console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;

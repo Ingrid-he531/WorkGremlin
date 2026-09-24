@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
+import { clientLabel } from '../lib/clientMatch';
 
 const project = useProjectStore();
 const session = useSessionStore();
@@ -143,6 +144,15 @@ const list = computed(() => {
     return true;
   });
 });
+
+// 列表视图打开 / 数据刷新后，若尚未选中任何任务则默认选中第一条；无任务时右侧留空。
+watch(
+  list,
+  (arr) => {
+    if (!tasks.selectedTaskId && arr && arr.length) tasks.selectTask(arr[0].id);
+  },
+  { immediate: true }
+);
 
 // ---- 汇总报表：按维度聚合（基于已筛选的 list，三视图共享筛选条件）----
 const DIMS = [
@@ -381,7 +391,7 @@ async function saveRetention() {
           <div class="row-title">{{ t.title || '(未命名任务)' }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
-            <span v-if="t.client">{{ t.client }}</span>
+            <span v-if="t.client">{{ clientLabel(t.client) }}</span>
             <span v-if="t.model">{{ t.model }}</span>
             <span>{{ fmtDuration(t.duration_ms) }}</span>
             <span v-if="t.file_count != null">{{ t.file_count }} 文件</span>
@@ -391,7 +401,7 @@ async function saveRetention() {
       </ul>
 
       <!-- 右：选中任务的详情 + 它的 subagent -->
-      <section class="detail" v-if="tasks.selectedTask">
+      <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
             <div class="detail-title">{{ tasks.selectedTask.title || '(未命名任务)' }}</div>
@@ -405,7 +415,7 @@ async function saveRetention() {
           <div class="kv">
             <div class="k">状态</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
             <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
-            <div class="k">客户端</div><div class="v">{{ tasks.selectedTask.client || '—' }}</div>
+            <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <div class="k">改动文件</div><div class="v">{{ tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : '—' }}</div>
           </div>
@@ -467,7 +477,7 @@ async function saveRetention() {
                   <div class="kv">
                     <div class="k">名字</div><div class="v">{{ s.name }}</div>
                     <div class="k">任务</div><div class="v">{{ s.title || '（未命名）' }}</div>
-                    <div class="k">客户端</div><div class="v">{{ s.client || '—' }}</div>
+                    <div class="k">客户端</div><div class="v">{{ clientLabel(s.client) }}</div>
                     <div class="k">模型</div><div class="v">{{ s.model || '—' }}</div>
                     <div class="k">开始</div><div class="v">{{ fmtTime(s.started_at) }}</div>
                     <div class="k">结束</div><div class="v">{{ fmtTime(s.ended_at) }}</div>
@@ -517,10 +527,6 @@ async function saveRetention() {
           </div>
           <div v-else-if="tasks.selectedTask.subagentCount" class="dim loading">加载 subagent…</div>
         </template>
-      </section>
-
-      <section v-else class="detail empty-detail">
-        <span class="dim">从左侧选一条任务查看详情</span>
       </section>
     </div>
 

@@ -25,6 +25,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('path');
 const { resolveProjectName } = require('./project');
+const { clientBase } = require('@workgremlin/shared');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -33,12 +34,19 @@ const IS_WIN = process.platform === 'win32';
 const PLUGIN_RE = [/coding-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i];
 
 /**
- * 插件落盘（3F）这一路的来源客户端。
- * reporter 的状态文件按客户端分开写（同一个工程里 CodeBuddy / Codex / Claude 各一份），
- * 3F 只能认自己这一路 —— 否则 4F 在跑 Codex 时，3F 会把它的相位 / 命令 / 完成标记搬过来，
- * 表现就是「切到 3F 却看见 4F 在敲的命令」，收工时 3F 还会弹别层的「任务完成」。
+ * 插件落盘这一路的来源客户端：**按楼层传入**，不再写死。
+ * reporter 的状态文件按客户端分开写（同一个工程里 CodeBuddy / Codex / Claude … 各一份），
+ * 每个插件楼层（3F CodeBuddy-Plugin、6F TraeCode-Plugin、未来的 Codex-Plugin …）只认自己
+ * 这一路 —— 否则切到某层会看见别层在敲的命令、收工时还弹别层的「任务完成」。
+ * 调用方（sessionRegistry）会把该楼层的 client（例如 'codebuddy-plugin' / 'trae-plugin'）传进来。
  */
-const PLUGIN_CLIENT = 'codebuddy';
+
+/**
+ * 老状态文件（引入 client 字段之前写的）没有 client —— 那时只有 CodeBuddy 家族在写，
+ * 所以这类文件按 codebuddy（CLI）归属。新文件一律带 client，不会走到这个兜底。
+ * 注意：这只是历史兼容，绝不能当"默认客户端"用——client 必须显式传入。
+ */
+const LEGACY_STATE_CLIENT = 'codebuddy';
 
 /** 缓存：列表扫盘 + 读十几个小 json，5 秒足够 */
 const TTL = 5_000;
@@ -142,11 +150,13 @@ function globalStorageRoots() {
 }
 
 /** 插件目录名会带版本号，所以按名字前缀找；要求里面有会话相关子目录才算数 */
-function findPluginStorage() {
+function findPluginStorage(re = PLUGIN_RE) {
+  // 与 products.js 的 matchIn 保持一致：pluginRe 既可是正则数组，也可是单个正则（如 /trae/i）
+  const list = re instanceof RegExp ? [re] : re || [];
   const marks = ['genie-history', 'todos', 'file-changes', 'message-queue'];
   for (const root of globalStorageRoots()) {
     for (const name of readDir(root)) {
-      if (!PLUGIN_RE.some((re) => re.test(name))) continue;
+      if (!list.some((rx) => rx.test(name))) continue;
       const p = path.join(root, name);
       if (marks.some((m) => isDir(path.join(p, m)))) return p;
     }
@@ -287,7 +297,7 @@ function reporterHookHome() {
  * 这是上报真值，优先级高于从 genie-history 推断出来的相位，UI 按真值展示（不标"推断"）。
  * 超过新鲜期（5 分钟）视为作废，避免 IDE 关掉后残留相位一直挂着。
  * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
- * @returns {{phase: string, tool: string, file: string, pending: {tool: string, file: string, at: number}|null}|null}
+ * @returns {{phase: string, tool: string, file: string, cmd: string, prompt: string, client: string, pending: {tool: string, file: string, cmd: string, at: number}|null}|null}
  */
 function readReporterPhase(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
@@ -303,7 +313,7 @@ function readReporterPhase(workspacePath, client = '') {
     // 按客户端过滤。老状态文件（本次改动之前写的）没有 client 字段 —— 那会儿只有 CodeBuddy，
     // 所以按 codebuddy 归属，而不是"对谁都匹配"（否则刚重启、Codex 还没写过状态文件时，
     // 4F 会短暂借到 3F 的相位）。
-    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
     const sp = j.sessionPhase;
     if (!sp || !sp.ts || now - sp.ts > AWAIT_TTL_MS) continue;
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
@@ -311,7 +321,7 @@ function readReporterPhase(workspacePath, client = '') {
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
     if (!win || sp.ts > win.ts) {
       win = sp;
-      winClient = String(j.client || 'codebuddy');
+      winClient = String(j.client || LEGACY_STATE_CLIENT);
       // 同一份状态文件里的 pending：PreToolUse 写、PostToolUse 清掉；迟迟不清 = 工具被权限框卡住
       winPending = j.pending || null;
       // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
@@ -321,7 +331,7 @@ function readReporterPhase(workspacePath, client = '') {
   if (!win) return null;
   return {
     // 这份相位是哪个客户端写的（Codex 有显式 PermissionRequest，不需要 pending 推断）
-    client: String(winClient || 'codebuddy').toLowerCase(),
+    client: String(winClient || LEGACY_STATE_CLIENT).toLowerCase(),
     phase: String(win.phase || 'thinking'),
     tool: String(win.tool || ''),
     file: String(win.file || ''),
@@ -361,7 +371,7 @@ function hasReporterState(workspacePath, client = '') {
     if (!client) return true;
     const j = readJson(path.join(reporterHookHome(), 'hooks', name));
     // 老文件没记 client → 按 codebuddy 归属（同上）
-    if (String((j && j.client) || 'codebuddy').toLowerCase() === String(client).toLowerCase()) return true;
+    if (String((j && j.client) || LEGACY_STATE_CLIENT).toLowerCase() === String(client).toLowerCase()) return true;
   }
   return false;
 }
@@ -387,7 +397,7 @@ function reporterStateMeta(workspacePath, client = '') {
     const j = readJson(path.join(dir, name));
     if (!j) continue;
     // 老状态文件没记 client → 按 codebuddy 归属（与相位读取同一口径）
-    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
     const ts = (j.sessionPhase && j.sessionPhase.ts) || j.taskStartedAt || (j.hb && j.hb.lastEventAt) || 0;
     if (ts >= bestTs) {
       bestTs = ts;
@@ -416,7 +426,7 @@ function reporterMainPhase(workspacePath, client = '') {
   // 只读 / 命令类工具（NEVER_AWAIT_TOOLS）本就不发 PostToolUse、也不该弹权限框，排除掉避免误报
   // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
   if (
-    rp.client !== 'codex' && // Codex 用显式 PermissionRequest，跳过这套推断
+    clientBase(rp.client) !== 'codex' && // Codex 用显式 PermissionRequest，跳过这套推断（codex / codex-plugin 都算）
     rp.phase === 'tool' &&
     rp.pending &&
     rp.pending.at &&
@@ -473,7 +483,7 @@ function readReporterActiveTask(workspacePath, client = '') {
     if (!j || !j.taskId) continue;
     // 按客户端过滤（口径同 readReporterPhase：老状态文件没记 client → 归 codebuddy）：
     // 同一工程里 Codex 在跑时，别把它的任务算成 3F 这一层"还在干活"的活跃窗口
-    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     // 心跳时间 / 任务开始 / 相位时间三者取最新：最近还有 hook 事件才算这个会话活着。
@@ -503,7 +513,7 @@ function readReporterDone(workspacePath, client = '') {
     const ws = j.done.workspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     // 同一工程里 Codex 与 CodeBuddy 各有一份状态文件：按客户端取，别把对方的"完成"搬过来
-    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
     if (!best || Number(j.done.at) > Number(best.at)) best = j.done;
   }
   return best;
@@ -526,7 +536,7 @@ function freshestReporterWs(fallback, client = '') {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
-    if (client && String(j.client || 'codebuddy').toLowerCase() !== String(client).toLowerCase()) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
     const sp = j.sessionPhase;
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
@@ -591,7 +601,7 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
 }
 
 /** 单个会话的完整信息 */
-function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false, client = PLUGIN_CLIENT } = {}) {
+function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false, client = '' } = {}) {
   const todos = readTodos(storage, id);
   const files = readFileChanges(storage, id);
   const mq = readRuntime(storage, id);
@@ -694,25 +704,27 @@ function collectProjects(storage) {
 
 /**
  * 列出**所有工程**里的活跃会话（不局限于当前打开的那个工程）。
- * @param {{workspacePath?: string, force?: boolean}} o
+ * @param {{workspacePath?: string, force?: boolean, client?: string, pluginRe?: RegExp[]}} o
  * @returns {{ok: true, sessions: Array, current: string, workspacePath: string,
  *            storage: string, reason?: string}}
  *   reason: 'no-storage' 没找到插件落盘 / 'no-open-project' 一个活跃会话都没有
  */
-function listSessions({ workspacePath = '', force = false } = {}) {
+function listSessions({ workspacePath = '', force = false, client = '', pluginRe = PLUGIN_RE } = {}) {
   // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
   // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
-  // 只认 CodeBuddy 这一路：这份清单是 3F 的，别层（Codex / Claude）在别的工程里活动
-  // 不该决定 3F 的"当前工程" —— 否则 3F 的 mine / current / fresh 全被带偏。
-  const ws = freshestReporterWs(workspacePath, PLUGIN_CLIENT);
+  // 只认传入的 client 这一路：这份清单属于某个插件楼层，别层（其它产品 / 同一产品的 CLI）
+  // 在别的工程里活动不该决定这一层的"当前工程" —— 否则 mine / current / fresh 全被带偏。
+  const ws = freshestReporterWs(workspacePath, client);
   const now = Date.now();
-  if (!force && cache.value && cache.key === ws && now - cache.at < TTL) return cache.value;
+  // 缓存键含 client：不同插件楼层（codebuddy-plugin / trae-plugin …）即使同一工程也各算各的
+  const key = `${client}@@${ws}`;
+  if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
-  const storage = findPluginStorage();
+  const storage = findPluginStorage(pluginRe);
   if (!storage) {
     cache = {
       at: now,
-      key: ws,
+      key,
       value: { ok: true, sessions: [], current: '', workspacePath: ws, storage: '', reason: 'no-storage' },
     };
     return cache.value;
@@ -751,13 +763,13 @@ function listSessions({ workspacePath = '', force = false } = {}) {
     const isProjectCurrent = id === (perProjectCurrent.get(m.projectPath) || '');
     // 活跃窗口按"这条会话自己的工程"匹配 reporter 的 taskId：工程没在跑就不采信它的相位，
     // 避免旧工程残留的"思考中"相位在 IDE 关掉 / 切走后还挂着。
-    const inWindow = readReporterActiveTask(m.projectPath, PLUGIN_CLIENT);
+    const inWindow = readReporterActiveTask(m.projectPath, client);
     const info = sessionInfo(storage, id, {
       current: isProjectCurrent,
       now,
       workspacePath: m.projectPath,
       inWindow,
-      client: PLUGIN_CLIENT,
+      client,
     });
     // 只按"还在窗口内"过滤（60 分钟），不再因为 10 分钟没动静就整条剔除 ——
     // 否则 IDE 里明明开着、只是十几分钟没敲字的会话会从 3F 消失（与 4F 口径不一致）。

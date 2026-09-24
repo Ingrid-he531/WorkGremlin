@@ -4,6 +4,7 @@ import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { isEphemeralMember } from '../lib/ephemeral';
+import { floorAcceptsClient } from '../lib/clientMatch';
 
 const project = useProjectStore();
 const sessions = useSessionStore();
@@ -12,11 +13,14 @@ const sorted = computed(() => {
   const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
   // 与办公室同一口径：按当前楼层的客户端过滤（client 为空的视作通用）
   const want = sessions.selectedClient;
+  // 所有楼层的 client 都认一遍，才能正确区分 codebuddy 的 1F/3F 二分，
+  // 又让 codex/trae 单楼层时把 CLI 与 plugin 两种变体都收进来。
+  const allClients = (sessions.floors || []).map((f) => f.client);
   return project.members
     // 工位卡片只显示常住小怪物；临时召唤出来的幽灵（subagent-xxx）不在这张表里占位，
     // 避免"召唤后卡片列表里多出同名小怪物"的误会。
     .filter((m) => !isEphemeralMember(m))
-    .filter((m) => !want || !m.client || m.client === want)
+    .filter((m) => floorAcceptsClient(want, m.client, allClients))
     .slice()
     .sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
 });
