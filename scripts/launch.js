@@ -38,6 +38,41 @@ const RESTART = ARGS.some((a) => a === '--restart' || a === '-r' || a === 'resta
 // 除 launch 自身开关外的参数（如 --no-sandbox）全部透传给 electron
 const ELECTRON_ARGS = ARGS.filter((a) => a !== '--restart' && a !== '-r' && a !== 'restart');
 
+/** 解析 package.json 里 engines.node 声明的最低版本（兼容 >=x.y.z / x.y.z / ^x / ~x 形式） */
+function requiredNodeVersion() {
+  let raw = '';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    raw = (pkg && pkg.engines && pkg.engines.node) || '';
+  } catch {}
+  const m = String(raw).match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+  if (!m) return null;
+  return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
+}
+
+/** 当前 Node 版本：[major, minor, patch] */
+function nodeVer() {
+  const m = process.version.match(/v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+  return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
+}
+
+/** 低于声明版本时直接报错退出：低版本根本起不了 server，早失败早提示 */
+function checkNodeVersion() {
+  const req = requiredNodeVersion();
+  if (!req) return; // 没声明就不拦
+  const cur = nodeVer();
+  const lower =
+    cur[0] < req[0] ||
+    (cur[0] === req[0] && cur[1] < req[1]) ||
+    (cur[0] === req[0] && cur[1] === req[1] && cur[2] < req[2]);
+  if (!lower) return;
+  console.error(
+    `[launch] Node 版本过低：当前 v${cur.join('.')}，WorkGremlin 需要 >= v${req.join('.')}。\n` +
+      '        请先升级 Node（例如 nvm install 24 && nvm use 24），否则 server 无法启动。'
+  );
+  process.exit(1);
+}
+
 function readServerInfo() {
   try {
     const j = JSON.parse(fs.readFileSync(SERVER_JSON, 'utf8'));
@@ -135,6 +170,8 @@ function startClient() {
 }
 
 async function main() {
+  // 先校验 Node 版本：低版本直接退出并提示，避免在 server 启动失败后才暴露问题
+  checkNodeVersion();
   if (RESTART) {
     console.log('[launch] --restart：杀掉现有 server（含孤儿）...');
     await killAllServers();
