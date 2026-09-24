@@ -26,7 +26,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { listSessions } = require('./sessions');
+const { listSessions, listReporterSessions } = require('./sessions');
 const { detectProducts } = require('./products');
 const { resolveProjectName } = require('./project');
 
@@ -297,7 +297,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
 
   // 1F / 2F / 4F / 5F CLI：落盘目录里的 jsonl
   for (const p of products) {
-    if (p.kind !== 'cli') continue;
+    if (p.kind !== 'cli' || p.hookSource) continue;
     for (const s of scanCliSessions(p.dataPath, { kind: p.agent })) {
       const lastEventAt = s.lastEventAt;
       upsert({
@@ -322,6 +322,34 @@ function refresh({ workspacePath = '', force = false } = {}) {
         context: [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`],
         inferred: true,
         lastEventAt,
+      });
+    }
+  }
+
+  // 只认 hook 的楼层（7F TraeCode IDE）：没有可扫的会话落盘，会话来源就是 reporter
+  // 状态文件本身 —— sessionId 与工程路径都是 hook payload 的实测值（见 listReporterSessions）。
+  for (const p of products) {
+    if (!p.hookSource) continue;
+    for (const s of listReporterSessions(p.dataKind)) {
+      upsert({
+        floor: p.id,
+        id: s.sessionId,
+        sessionId: s.sessionId,
+        // 按 CLI 楼层对待：渲染层正是靠 `source === 'cli'` + 非空 projectPath 才肯叠加
+        // hook 上报的实时相位（见 IsoOfficeView 的 canUseFast）。
+        source: 'cli',
+        project: s.workspacePath ? resolveProjectName(s.workspacePath) || path.basename(s.workspacePath) : '',
+        projectPath: s.workspacePath,
+        mine: Boolean(workspacePath && s.workspacePath && path.resolve(s.workspacePath) === path.resolve(workspacePath)),
+        current: false,
+        live: true,
+        // 相位不在这里造：实时相位由 /reporter-phase 快轮询单独拉（1.5s），
+        // 这里只报"未上报"，让渲染层在没有相位时老实显示「待命」。
+        phase: 'unreported',
+        action: '',
+        context: [],
+        inferred: true,
+        lastEventAt: s.lastEventAt,
       });
     }
   }

@@ -226,7 +226,7 @@ const IPC_EVENTS = Object.freeze({
  *   - agent（基名）：codebuddy / workbuddy / codex / claude / trae …（见 server/src/products.js 的楼层定义）
  *   - client（上报身份）：非 plugin 直接是 agent；plugin 是 agent + '-plugin'。
  * 例：CodeBuddy 同时有 CLI（client=codebuddy，1F）与 Plugin（client=codebuddy-plugin，3F）；
- * Codex 有 4F CLI / 7F Plugin、Trae 有 6F Plugin / 8F CLI，两个变体都有。
+ * Codex 有 4F CLI / 7F Plugin、Trae 有 6F Plugin / 7F CLI，两个变体都有。
  * **Claude Code 只有 CLI 一个身份**（client=claude，5F）：它的 CLI 与 IDE 插件共用同一份
  * ~/.claude 配置、同一套 hook、同一个落盘目录，事件 payload 里也没有能区分二者的字段（实测 2.1），
  * 所以不拆成两层。

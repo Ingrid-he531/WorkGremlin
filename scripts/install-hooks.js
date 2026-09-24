@@ -9,7 +9,7 @@
  * 各自「装了才写、没装跳过」（判定口径见 looksInstalled）。加新产品只需往 `all` 里加一条。
  *
  * 用法：
- *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae）
+ *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json）
  *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / codex / claude / trae / project）
  *   node scripts/install-hooks.js --project              另外写一份项目级 <仓库>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            撤掉（只删我们加的那几条，别人的配置不动）
@@ -256,7 +256,8 @@ function findCliBin(cmd) {
 
 /** 编辑器扩展目录（插件安装位置） */
 function extensionRoots() {
-  return ['.vscode', '.vscode-insiders', '.cursor', '.trae', '.windsurf', '.vscode-server']
+  // .trae-cn 是 TraeCode（国内版）的扩展根；coding-copilot 扩展就装在它下面
+  return ['.vscode', '.vscode-insiders', '.cursor', '.trae', '.trae-cn', '.windsurf', '.vscode-server']
     .map((d) => path.join(HOME, d, 'extensions'))
     .filter(isDir);
 }
@@ -364,14 +365,17 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     },
     {
       id: 'trae',
-      label: 'TraeCode Plugin',
-      // Trae 基于 VS Code 协议，hook 结构与 CodeBuddy Plugin 同源（settings.json + hooks 事件）。
-      // 注意：路径是按 CodeBuddy 同款 ~/.trae/settings.json 推断的；若 Trae 实际用别的落盘位置需调整。
-      file: path.join(os.homedir(), '.trae', 'settings.json'),
+      label: 'TraeCode 全局 Hook',
+      // 官方文档（docs.trae.cn「Hook 配置详解」）：Linux/macOS 全局 hook 落
+      // ~/.trae-cn/hooks.json，格式为 { version: 1, hooks: { <事件>: [ { matcher, hooks:[{type,command,timeout}] } ] } }
+      // —— 不是 CodeBuddy 同款的 settings.json，也不是 ~/.trae/。项目级才是 <工程>/.trae/hooks.json。
+      file: path.join(os.homedir(), '.trae-cn', 'hooks.json'),
       cmd: 'trae',
-      dir: path.join(os.homedir(), '.trae'),
+      dir: path.join(os.homedir(), '.trae-cn'),
       plugin: true,
-      pluginRe: /trae/i,
+      // 扩展在编辑器扩展目录里叫 tencent-cloud.coding-copilot（TraeCode 内核），不是 trae 字样
+      pluginRe: /trae|coding-copilot/i,
+      version: 1,
       ours: traeOurs,
     },
     { id: 'project', label: `CodeBuddy 项目级（${path.basename(REPO_ROOT)}）`, file: path.join(REPO_ROOT, '.codebuddy', 'settings.json'), ours: codebuddyOurs, optional: true },
@@ -408,6 +412,8 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
 
     const next = merge(existing || {}, t.ours, uninstall);
+    // hooks.json 协议（TraeCode）默认带 schema version：新建/已存在都保证有，已有的不覆盖
+    if (!uninstall && t.version) next.version = next.version || t.version;
     const before = JSON.stringify(existing || {});
     const after = JSON.stringify(next);
 
@@ -441,6 +447,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('[workgremlin] · Codex CLI：hook 需要「信任」才会执行 —— 首次在新会话里用 /hooks 批准一次；');
     console.log('                       自动化场合可临时加 --dangerously-bypass-hook-trust');
     console.log('[workgremlin] 生效方式：');
+    console.log('  · TraeCode：首次在 设置 > Hooks 面板确认全局 hooks.json 已启用（外部写入有安全闸门），再重开会话');
     console.log('  · CodeBuddy Plugin：重开会话');
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');
     console.log('  · Claude Code：写完新起的会话直接就生效（claude --print 实测，没经过批准）；');

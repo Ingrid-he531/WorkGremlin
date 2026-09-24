@@ -20,7 +20,7 @@ const { resolveProjectName } = require('../project');
 const { detectLevel } = require('./agentLevel');
 // 成员状态降级前的守卫：别的会话还在跑就别压成空闲/离线（见 keepStateForOtherSession）。
 // 只单向依赖（sessions.js 不 require ingest/），没有循环。
-const { hasOtherLiveSession } = require('../sessions');
+const { hasOtherLiveSession, sessionModel } = require('../sessions');
 
 function projectIdOf(name) {
   return name;
@@ -409,13 +409,17 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (String(member.role || '') === 'agent') {
       const wsRow0 = repo.getProject.get(project);
       const baseline = wsRow0 && wsRow0.workspace_path ? gitHead(wsRow0.workspace_path) : null;
+      const client0 = member.client || normClient(p.client) || null;
       repo.upsertTaskRun.run({
         id,
         projectId: project,
         memberId: member.id,
-        client: member.client || normClient(p.client) || null,
+        client: client0,
         sessionId: normSession(p.sessionId),
-        model: normModel(p.model),
+        // hook payload 里没有模型字段（TraeCode 六个事件都不带），为空时按会话去
+        // TraeCode 自己的 globalStorage 里取"当前选中模型"（见 sessions.sessionModel）。
+        // 取不到就是空 —— 报表的"模型"列留空，不拿默认模型冒充。
+        model: normModel(p.model) || sessionModel(client0, p.sessionId) || null,
         title: p.title || '(未命名任务)',
         startedAt: ts,
         baselineCommit: baseline,

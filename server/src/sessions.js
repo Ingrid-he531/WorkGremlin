@@ -26,6 +26,7 @@ const os = require('node:os');
 const path = require('path');
 const { resolveProjectName } = require('./project');
 const { clientBase } = require('@workgremlin/shared');
+const { selectedModelOf } = require('./traeModels');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -292,12 +293,29 @@ function reporterHookHome() {
 }
 
 /**
+ * 这条会话在用什么模型。
+ * 各产品模型字段的取法不通用：TraeCode 能从落盘捞（见 traeModels.selectedModelOf），
+ * 其余产品 hook payload 不带也不落盘，取不到就留空（绝不编造）。
+ * 这里只做"按 client 分派适配器"这一件事，避免把某个产品的私有存储格式写死进通用读函数，
+ * 也保持和 products.js 的表驱动扩展约定一致（加新产品就往 MODEL_SOURCES 挂一条，不必改 this 函数）。
+ * @param {string} client 楼层客户端（如 'trae' / 'codebuddy' / 'codex' …）
+ * @param {string} sessionId hook payload 的 session_id
+ * @param {string} agentType hook payload 的 agent_type（已落盘）
+ */
+/** client → 取"这条会话当前模型"的适配器表；没挂的照旧取不到 */
+const MODEL_SOURCES = { trae: selectedModelOf };
+function sessionModel(client, sessionId, agentType = '') {
+  const fn = MODEL_SOURCES[String(client || '').toLowerCase()];
+  return fn ? fn(sessionId, agentType) || '' : '';
+}
+
+/**
  * reporter hook 的"主控制台相位"：每次事件都会把当前相位（thinking/tool/await）写进
  * ~/.workgremlin/hooks/<工位>.json 的 `sessionPhase` 字段（见 packages/reporter/src/hook.js）。
  * 这是上报真值，优先级高于从 genie-history 推断出来的相位，UI 按真值展示（不标"推断"）。
  * 超过新鲜期（5 分钟）视为作废，避免 IDE 关掉后残留相位一直挂着。
  * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
- * @returns {{phase: string, tool: string, file: string, cmd: string, prompt: string, client: string, pending: {tool: string, file: string, cmd: string, at: number}|null}|null}
+ * @returns {{phase: string, tool: string, file: string, cmd: string, prompt: string, model: string, client: string, pending: {tool: string, file: string, cmd: string, at: number}|null}|null}
  */
 function readReporterPhase(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
@@ -306,6 +324,7 @@ function readReporterPhase(workspacePath, client = '', session = '') {
   let winPending = null;
   let winPrompt = '';
   let winClient = '';
+  let winModel = '';
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
@@ -327,6 +346,8 @@ function readReporterPhase(workspacePath, client = '', session = '') {
       winPending = j.pending || null;
       // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
       winPrompt = j.taskTitle || '';
+      // 模型不在这份状态文件里（hook payload 不带），按会话去 TraeCode 自己的落盘取
+      winModel = sessionModel(winClient, j.sessionId, j.agentType);
     }
   }
   if (!win) return null;
@@ -341,6 +362,8 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     cmd: String(win.cmd || ''),
     // 用户那句话（思考中时主控制台屏幕第三层顶到最前显示；UI 只在 thinking 相位用）
     prompt: String(winPrompt || ''),
+    // 这条会话在用什么模型（只有 TraeCode 取得到；别的楼层留空）。取不到就是空串，不猜。
+    model: String(winModel || ''),
     pending: winPending
       ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), cmd: String(winPending.cmd || ''), at: Number(winPending.at) || 0 }
       : null,
@@ -525,6 +548,8 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
 function reporterMainPhase(workspacePath, client = '', session = '') {
   const rp = readReporterPhase(workspacePath, client, session);
   if (!rp) return null;
+  // 下面每个分支都是**各建各的对象**，不是展开 rp —— 要往外带什么字段，每个分支都得加一遍，
+  // 漏了就会静默丢掉（model 就这么丢过一次）。
   if (rp.phase === 'await') {
     return {
       phase: 'await',
@@ -532,6 +557,7 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       target: rp.file || '',
       context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, rp.file && `目标：${rp.file}`].filter(Boolean),
       prompt: rp.prompt || '',
+      model: rp.model || '',
     };
   }
   // 等授权兜底：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
@@ -555,6 +581,7 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       target: file || '',
       context: ['等待用户授权后继续', tool && `工具：${tool}`, file && `目标：${file}`].filter(Boolean),
       prompt: rp.prompt || '',
+      model: rp.model || '',
     };
   }
   if (rp.phase === 'tool') {
@@ -569,10 +596,11 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       target: rp.file || '',
       context: rp.file ? [`目标：${rp.file}`] : [],
       prompt: rp.prompt || '',
+      model: rp.model || '',
     };
   }
   // thinking：干净，不堆示意字；但把用户那句话（prompt）一并带出，屏幕第三层顶到最前显示
-  return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '' };
+  return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '' };
 }
 
 /**
@@ -633,6 +661,46 @@ function readReporterDone(workspacePath, client = '', session = '') {
     if (!best || Number(j.done.at) > Number(best.at)) best = j.done;
   }
   return best;
+}
+
+/**
+ * hook 上报的会话清单 —— 给"只认 hook"的楼层当会话来源（见 products.js 的 hookSource）。
+ *
+ * TraeCode IDE 没有可扫的会话落盘（`~/.trae-cn/memory/*.jsonl` 是它自己的记忆文件，
+ * 不是对话会话，拿来当会话就是编造），所以它的会话表直接由 reporter 状态文件构成：
+ * sessionId 就是 hook payload 的 `session_id`，工程路径取相位 / 任务里记的 workspacePath ——
+ * 两个都是实测值，不猜。老命名文件（没有 sessionId）没有会话维度，不算。
+ * @param {string} client 客户端身份（楼层 dataKind，如 trae）；空则不限
+ * @returns {Array<{sessionId: string, workspacePath: string, lastEventAt: number}>}
+ */
+function listReporterSessions(client = '') {
+  const dir = path.join(reporterHookHome(), 'hooks');
+  const byId = new Map();
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const j = readJson(path.join(dir, name));
+    if (!j) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    const sessionId = String(j.sessionId || '').trim();
+    if (!sessionId) continue;
+    const sp = j.sessionPhase || {};
+    const lastEventAt = Math.max(
+      Number(j.hb && j.hb.lastEventAt) || 0,
+      Number(sp.ts) || 0,
+      Number(j.taskStartedAt) || 0
+    );
+    if (!lastEventAt) continue;
+    const prev = byId.get(sessionId);
+    // 同一会话可能有多份状态文件（换过工程 / 老命名残留）：取最新那份的工程
+    if (!prev || lastEventAt > prev.lastEventAt) {
+      byId.set(sessionId, {
+        sessionId,
+        workspacePath: String(sp.workspacePath || j.taskWorkspacePath || ''),
+        lastEventAt,
+      });
+    }
+  }
+  return [...byId.values()];
 }
 
 /**
@@ -925,6 +993,8 @@ module.exports = {
   // 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）
   hasOtherLiveSession,
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
+  listReporterSessions, // 只认 hook 的楼层（7F TraeCode IDE）的会话来源
+  sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
   listSessions,
   findPluginStorage,
   decodeDirName,

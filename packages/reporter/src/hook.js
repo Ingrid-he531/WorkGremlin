@@ -1063,7 +1063,14 @@ async function main() {
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // 状态文件里记下来源客户端：同一个工程可能同时有 Codex / CLI / Plugin 在跑，
   // 主控制台要按楼层（客户端）取相位，不能谁新鲜就显示谁。
-  writeState(file, { client: cl, sessionId: String((ev && ev.session_id) || '') });
+  // agent_type 一并落盘：TraeCode 把"每个会话选了哪个模型"按 agentType 分组记在
+  // globalStorage 里（agent / solo_agent 各一项），服务端靠它挑对应那一项。
+  const agentType = String((ev && ev.agent_type) || '').trim();
+  writeState(file, {
+    client: cl,
+    sessionId: String((ev && ev.session_id) || ''),
+    ...(agentType ? { agentType } : {}),
+  });
 
   // transcript 路径：Codex / CodeBuddy 的 hook payload 都带，存下来供 Stop 取"产出摘要"。
   // 纯问答没有工具事件、Stop 也不带 last_assistant_message 时，只能从 transcript 读最后一条 assistant。
