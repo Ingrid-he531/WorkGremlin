@@ -5,15 +5,23 @@
  *   1F  CodeBuddy CLI
  *   2F  WorkBuddy CLI
  *   3F  CodeBuddy Plugin
- *   4F  Codex CLI
- *   5F  Claude Code CLI
+ *   4F  Codex（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并单楼层）
+ *   5F  Claude Code（CLI 与 IDE 同 ~/.claude、同 hook，分不出，合并单楼层）
  *   6F  TraeCode Plugin
- *   7F  Codex Plugin
  *   8F  TraeCode CLI
  *
- * Claude Code **只有一层**（5F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置与同一套 hook，
- * 事件 payload 里没有任何字段能区分二者（实测 2.1：不含 client，只有 session_id / cwd /
- * transcript_path 这类共用字段），所以分不出、也不该分两层。
+ * Claude Code **只有一层**（5F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、
+ * 同一个落盘目录（~/.claude/projects），连二进制都是同一份 —— 事件 payload 里没有任何字段能
+ * 区分二者（实测 2.1：不含 client，只有 session_id / cwd / transcript_path 这类共用字段）。
+ * 既然"分不出"，就不该硬拆两层。
+ *
+ * 那"同一层里同时开着多会话"怎么分？靠 **session_id**（轴 2，见 docs/implementation-status.md）：
+ * 它是 hook payload 的字段、也是 transcript 的文件名（`<session_id>.jsonl`）、还写在 transcript
+ * 首行的 sessionId 里，三处实测 100% 一致。所以：
+ *   - hook 侧：状态文件按 `<agent>@<工程>@<会话>.json` 分（见 packages/reporter/src/hook.js 的 statePath）
+ *   - 服务端：/api/v1/reporter-phase 收 `?session=`，只取那一条会话的相位
+ *   - 落库：task_runs / messages 都带 session_id
+ * 楼层仍然只有一层，会话在层内区分 —— 这就是"一个楼层 + 会话"的设计。
  *
  * 每一层自动搜索两样东西：
  *   - 安装位置：CLI 的可执行文件（PATH + 常见安装目录），插件的扩展目录
@@ -315,7 +323,7 @@ function findPluginDir(res = RE_PLUGIN) {
  * 约定：每个 agent 可有 CLI 与 Plugin 两个独立楼层（变体）。目前——
  *   - codebuddy：1F CLI / 3F Plugin
  *   - workbuddy：2F CLI（暂无 Plugin）
- *   - codex     ：4F CLI / 7F Plugin
+ *   - codex     ：4F（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并为单楼层）
  *   - claude    ：5F CLI（**只有这一层**，见文件头说明：plugin 与 CLI 同配置同 hook，分不出来）
  *   - trae      ：6F Plugin / 8F CLI
  * 要再加变体（例如给 workbuddy 加 Plugin，或新增某个 agent 的 CLI/Plugin），只需在这里加一条
@@ -357,7 +365,7 @@ const PRODUCTS = [
   },
   {
     id: '4F',
-    name: 'Codex CLI',
+    name: 'Codex',
     kind: 'cli',
     cmd: 'codex',
     agent: 'codex',
@@ -366,7 +374,7 @@ const PRODUCTS = [
   },
   {
     id: '5F',
-    name: 'Claude Code CLI',
+    name: 'Claude Code',
     kind: 'cli',
     cmd: 'claude',
     agent: 'claude',
@@ -382,18 +390,6 @@ const PRODUCTS = [
     plugin: true,
     pluginRe: /trae/i,
     dataKind: clientOf('trae', true),
-  },
-  {
-    id: '7F',
-    name: 'Codex Plugin',
-    kind: 'plugin',
-    cmd: '',
-    agent: 'codex',
-    plugin: true,
-    // 插件目录名按 agent 基名匹配（与 Codex CLI 的落盘前缀共用 RE_CODEX）；
-    // 真实扩展目录名若不同，这里换成对应正则即可，楼层归层/过滤不受影响。
-    pluginRe: RE_CODEX,
-    dataKind: clientOf('codex', true),
   },
   {
     id: '8F',

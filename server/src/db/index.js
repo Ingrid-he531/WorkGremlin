@@ -51,6 +51,11 @@ function migrate(db) {
   ensureColumn(db, 'members', 'client', 'client TEXT');
   ensureColumn(db, 'subagent_runs', 'files_json', 'files_json TEXT');
   ensureColumn(db, 'task_runs', 'baseline_commit', 'baseline_commit TEXT');
+  // 轴 2（会话）：老库里没有这两列，补上；老行留 NULL（不是"没有会话"，是"当时还没记"）
+  ensureColumn(db, 'task_runs', 'session_id', 'session_id TEXT');
+  ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
   ensureAgentStatusThinking(db);
 }
 
@@ -239,8 +244,8 @@ function createRepo(db) {
     listTasks: db.prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY started_at DESC`),
 
     insertMessage: db.prepare(`
-      INSERT INTO messages (dedupe_key, project_id, ts_ms, from_member, to_member, type, subject, content, task_id, source, raw_json)
-      VALUES (@dedupeKey, @projectId, @tsMs, @fromMember, @toMember, @type, @subject, @content, @taskId, @source, @rawJson)
+      INSERT INTO messages (dedupe_key, project_id, ts_ms, from_member, to_member, type, subject, content, task_id, session_id, source, raw_json)
+      VALUES (@dedupeKey, @projectId, @tsMs, @fromMember, @toMember, @type, @subject, @content, @taskId, @sessionId, @source, @rawJson)
       ON CONFLICT(dedupe_key) DO NOTHING
     `),
     getMessage: db.prepare(`SELECT * FROM messages WHERE id = ?`),
@@ -272,10 +277,11 @@ function createRepo(db) {
     `),
     /* ---- 台账（报表用）：一轮用户任务 + 它召唤出去的 subagent 实例 ---- */
     upsertTaskRun: db.prepare(`
-      INSERT INTO task_runs (id, project_id, member_id, client, model, title, started_at, baseline_commit)
-      VALUES (@id, @projectId, @memberId, @client, @model, @title, @startedAt, @baselineCommit)
+      INSERT INTO task_runs (id, project_id, member_id, client, session_id, model, title, started_at, baseline_commit)
+      VALUES (@id, @projectId, @memberId, @client, @sessionId, @model, @title, @startedAt, @baselineCommit)
       ON CONFLICT(id) DO UPDATE SET
         client     = COALESCE(excluded.client, task_runs.client),
+        session_id = COALESCE(excluded.session_id, task_runs.session_id),
         model      = COALESCE(excluded.model, task_runs.model),
         title      = COALESCE(excluded.title, task_runs.title),
         started_at = COALESCE(task_runs.started_at, excluded.started_at),
@@ -359,13 +365,20 @@ function createRepo(db) {
    * 消息查询：按成员 / 类型 / 时间过滤 + 关键字搜索 + 游标分页。
    * M0 用 LIKE；M2 切换到 FTS5 trigram（<3 字查询自动降级为 LIKE，见 README 说明）。
    * @param {string} projectId
-   * @param {{members?: string[], types?: string[], since?: number, until?: number, keyword?: string, direction?: string, beforeId?: number, afterId?: number, limit?: number}} f
+   * @param {{members?: string[], types?: string[], session?: string, since?: number, until?: number, keyword?: string, direction?: string, beforeId?: number, afterId?: number, limit?: number}} f
+   *   session：只取某一条会话的消息（轴 2）。不传 = 所有会话（老行为）。
    */
   function listMessages(projectId, f = {}) {
     const limit = Math.min(Math.max(Number(f.limit) || 100, 1), 1000);
     const where = ['project_id = @projectId'];
     const params = { projectId, limit };
 
+    // 会话过滤：只认**精确等于**这条会话的。老消息（session_id IS NULL）不并入 ——
+    // 「没带会话标识」跟「属于这条会话」是两回事，混进来就分不清了。
+    if (f.session) {
+      where.push('session_id = @session');
+      params.session = String(f.session);
+    }
     if (f.members && f.members.length) {
       const ph = f.members.map((_, i) => `@m${i}`);
       f.members.forEach((m, i) => {

@@ -70,6 +70,21 @@ export const useSessionStore = defineStore('sessions', {
     selected: (s) => s.sessions.find((x) => x.id === s.selectedId) || null,
 
     /**
+     * 选中会话的**会话 id**（轴 2）—— hook payload 里的 `session_id`，服务端拿它过滤
+     * `/api/v1/reporter-phase`，这样同一个楼层里多条会话（两个终端 / CLI 与插件混跑）
+     * 各显示各的实时相位，不会"谁最新显示谁"。
+     *
+     * 它跟 `id` 不是一回事：`id` 是**落盘定位符**（CLI 是 `<工程目录>/<会话>.jsonl` 的相对路径，
+     * 插件是 genie-history 的会话 id），只有落盘文件名本身就等于会话 id 的产品（Claude Code）
+     * 才拿得到。拿不到（Codex 的 rollout-*.jsonl、插件）就返回空串 → 服务端退回老行为。
+     * @returns {string}
+     */
+    selectedSessionId: (s) => {
+      const x = s.sessions.find((y) => y.id === s.selectedId);
+      return (x && x.sessionId) || '';
+    },
+
+    /**
      * 当前楼层对应的客户端：1F=codebuddy(CLI)、3F=codebuddy-plugin、2F=workbuddy、
      * 4F=codex、5F=claude、6F=trae-plugin。plugin（VS Code 系扩展）统一带 -plugin 后缀。
      * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）。

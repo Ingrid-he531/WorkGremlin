@@ -252,24 +252,25 @@ function tip(p) {
 }
 
 /* 胶囊区（= 原来的井道）：按原尺寸排版（宽 140）、整体 scale(0.7)，胶囊保持紧凑。
- * 关键：要让「缩放后」的高度正好填满整列（= 右侧办公室背景高度），未缩放高度就得是
- *   整列高 / 0.7。整列高 = rail 高 − 顶部"楼层"标题高（--office-top），
- *   所以这里 height = (100% − var(--office-top)) / 0.7，再 scale(0.7) 缩回整列高。
- * 这样胶囊不被拉长，只是容器被撑高、再用 space-between 把紧凑胶囊铺满全列。
+ * 布局改为「顶部紧凑堆叠」：不再撑满整列、不再用 space-between 把胶囊拉开大间隔。
+ *   · flex: 1 1 auto + min-height: 0  → 占满标题下方的剩余高度，但内容超出时自己出滚动条
+ *     （楼层少时空着底部面板；楼层多到放不下才出现滚动条）。
+ *   · justify-content: flex-start + 小 gap → 从顶开始紧挨着排，不散布。
  * 轿厢、层号带随子树一起缩放，定位仍靠实测 offsetTop/offsetHeight（transform 不影响它），不会错位。 */
 .rail-floors {
   position: relative;
-  flex: none;
+  flex: 1 1 auto;
+  min-height: 0;
   width: 140px; /* 缩放前的排版宽度，缩完正好 98 = 井道宽 */
-  height: calc((100% - var(--office-top, 70px)) / 0.7);
   transform: scale(0.7);
   transform-origin: top left;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
-  gap: 12px;
+  justify-content: flex-start;
+  gap: 4px;
   padding: 0 10px 14px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* 轿厢：跟着 carFloor 在井道里滑。只动画 transform，duration 由内联 style 按层数给 */

@@ -27,21 +27,35 @@ function createSessionsRouter({ workspace }) {
     const cur = workspace && workspace.current ? workspace.current() : {};
     // 按楼层（客户端）取相位：同一工程里 Codex 与 CodeBuddy 同时跑时不能互相串味
     const client = String(req.query.client || '').trim().toLowerCase();
+    // 轴 2（会话）：`?session=<session_id>` 只取那一条会话的相位/完成标记。
+    // 一个楼层可以同时开多条会话（同一个 claude 开两个终端 / CLI + 插件混着跑），
+    // 不给 session 就是老行为——同 client 里"谁最新显示谁"，多会话下会串味。
+    const session = String(req.query.session || '').trim();
     // 跟随 reporter 真实活动的最新工程，而不是 office 手工"打开工程"记的那个
-    const ws = freshestReporterWs(cur.workspacePath || '', client);
-    const rp = reporterMainPhase(ws, client);
+    const ws = freshestReporterWs(cur.workspacePath || '', client, session);
+    const rp = reporterMainPhase(ws, client, session);
     // 这个工程有没有接 hook（接了但当前没动作 → 渲染层显示"待命"，而不是按文件时间瞎猜）
     // 有没有接 hook + 那份状态文件属于哪条会话（渲染层据此判断"你正在看的这条会话在上报吗"）
-    const meta = reporterStateMeta(ws, client);
+    const meta = reporterStateMeta(ws, client, session);
     const instrumented = meta.instrumented;
     // 上一轮的完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
-    const done = readReporterDone(ws, client);
+    const done = readReporterDone(ws, client, session);
     // 带上这条相位所属的工程路径（workspacePath）：渲染层据此只在"选中会话正好属于这个工程"时
     // 才叠加实时相位，避免旧会话（它自己工程已不活跃）被新工程的相位串味、短暂闪一下"思考中"。
+    // session 一并回显：调用方可能没传（老行为），拿这个字段确认到底是谁的相位。
+    const body = {
+      ok: true,
+      workspacePath: ws,
+      instrumented,
+      // 请求指定了会话就回显它；没指定就回"实际取到的那条"（meta.sessionId）
+      session: session || meta.sessionId || '',
+      sessionId: meta.sessionId,
+      done,
+    };
     res.json(
       rp
-        ? { ok: true, workspacePath: ws, instrumented, sessionId: meta.sessionId, done, ...rp }
-        : { ok: true, workspacePath: ws, instrumented, sessionId: meta.sessionId, done, phase: null, action: '', target: '', context: [] }
+        ? { ...body, ...rp }
+        : { ...body, phase: null, action: '', target: '', context: [] }
     );
   });
 

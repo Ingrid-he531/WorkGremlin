@@ -107,7 +107,7 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 | 2F | WorkBuddy CLI | `~/.workbuddy` 下 `*.jsonl` |
 | 3F | CodeBuddy 插件 | 编辑器 globalStorage 的结构化目录（唯一能拿到运行态的一层） |
 | 4F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
-| 5F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl` |
+| 5F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分 |
 
 选中的会话决定主 Agent 控制台的相位（幽灵状态跟着走），办公室布局不受影响；切到没有活跃会话的楼层时整屋清空。
 
@@ -183,7 +183,7 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 | 打断收场（收掉孤儿幽灵） | 🟡 仅离线验证 | `Interrupt` 事件已接，真实会话里还没出现过 |
 | 等授权（blocked·awaiting_permission） | 🟡 仅离线验证 | 本机 `permission_mode=bypassPermissions`，从不弹权限框；Codex 走显式 `PermissionRequest`（不再用 CodeBuddy 的 pending 推断） |
 | 坐工位小怪物名册（Codex 侧 agent 定义） | 🟡 未实证 | 按 `$CODEX_HOME/agents`、`<工程>/.codex/agents` 的 `.md`/`.toml` 扫；本机还没有这类文件 |
-| 楼层 / 会话列表（4F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessions.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl` 取首行 `cwd` |
+| 楼层 / 会话列表（4F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessionRegistry.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl`，用 `cwdOfHead` 从头部若干行取 `payload.cwd` |
 | 按客户端隔离（4F 不显示 CodeBuddy 的成员与相位） | ✅ 实测 | `members.client` + `/api/v1/reporter-phase?client=` |
 | PreCompact / PostCompact | ❌ 未处理 | 与 CodeBuddy 一致（没有对应的 UI 语义） |
 | `Stop.last_assistant_message` | ❌ 未使用 | 完成摘要仍取"本轮改动过的文件" |

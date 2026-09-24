@@ -72,6 +72,20 @@ let IS_CODEX = false;
 let IS_CLAUDE = false;
 
 /**
+ * **轴 2（会话）**：本次事件所属的会话 id，取自 payload 的 `session_id`。
+ *
+ * 同一个 CLI 可以同时开着好几条会话（两个终端 / 一个终端 + 一个 IDE 窗口），
+ * 它们的产品身份（AGENT / client）**完全一样**，只有 session_id 不同 —— 所以会话
+ * 只能靠它区分。实测 Claude Code 2.1.281：14/14 个事件都带 session_id，且与
+ * `CLAUDE_CODE_SESSION_ID`、transcript 文件名（`~/.claude/projects/<工程>/<session_id>.jsonl`）
+ * 三处 100% 一致；子代理转录共用父会话的 sessionId，另靠 agent_id 区分实例。
+ *
+ * 拿不到（老版本 payload / 手工脚本 / 其它产品没这个字段）时留空 → 状态文件名
+ * 退回"只按 工位+工程"的旧形式，行为与改动前完全一致（向后兼容）。
+ */
+let SESSION = '';
+
+/**
  * 本产品有没有**显式的等授权事件**。
  *
  * Codex 与 Claude Code 都会发 PermissionRequest（payload 带 tool_name / tool_input），
@@ -152,14 +166,61 @@ function trace(event, extra) {
 }
 
 /**
- * 每个工位 + 工程一份：当前任务 id + 心跳守护的 pid。
- * 文件名带上工程（cwd 解析后的 REAL_WS），这样多个工程同时开着（同一 agent 名）
- * 时各自写自己的文件，互不覆盖相位 / 任务 / 心跳 —— 否则会出现旧会话乱跳"思考中"、
- * "任务完成"被别的工程串味误弹等跨工程失真。
+ * 每个「工位 + 工程 + 会话」一份：当前任务 id + 相位 + 完成标记 + 心跳守护的 pid。
+ *
+ * 文件名带**两级**归属：
+ *   1) 工程（REAL_WS）—— 多个工程同时开着（同一 agent 名）时各自写自己的文件，
+ *      互不覆盖相位 / 任务 / 心跳，避免旧会话乱跳"思考中"、"任务完成"被别的工程串味；
+ *   2) 会话（session）—— 同一个工程里同一个 agent 开着两条会话（两个终端、或终端 + IDE）
+ *      时，**产品身份完全一样**，只有会话不同。少了这一级，两条会话会往同一个文件里
+ *      写相位 / taskId / roundFiles / done，症状是：切到 A 却显示 B 的相位、
+ *      A 开始新一轮把 B 攒的改动文件清单清空、A 按 Stop 却关掉 B 的任务。
+ *
+ * 会话为空（拿不到 session_id）时不拼这一段，文件名与"只按 工位+工程"的旧形式一致。
  */
-function statePath(agent) {
-  const key = `${String(agent)}@${REAL_WS}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+function statePath(agent, session = SESSION) {
+  const parts = [String(agent), REAL_WS];
+  if (session) parts.push(String(session));
+  const key = parts.join('@').replace(/[^a-zA-Z0-9._-]/g, '_');
   return path.join(home(), 'hooks', `${key}.json`);
+}
+
+/** 状态文件保留时长：超过就从 hooks/ 里清掉。 */
+const STATE_KEEP_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * 清掉过期状态文件。
+ *
+ * 为什么现在必须要这一步：状态文件名从「工位+工程」变成「工位+工程+会话」之后，
+ * 文件数从"每人一份"变成"每条会话一份"，只增不减。而服务端读相位是**每 1.5s
+ * 扫一遍整个 hooks/ 目录**（见 server/src/sessions.js 的 readReporterState）——
+ * 攒到几千份就是每 1.5s 几千次读文件，主控制台会被拖垮。
+ *
+ * 按 **mtime** 判过期，不按文件名：正在跑的会话刚写过文件，mtime 是新的，绝不会被误删。
+ * 只在 SessionStart 跑（每条会话一次，频率极低），失败不影响 hook。
+ */
+function pruneStateFiles(maxAgeMs = STATE_KEEP_MS) {
+  const dir = path.join(home(), 'hooks');
+  const now = Date.now();
+  let removed = 0;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue; // 别碰 events.log
+      const p = path.join(dir, name);
+      try {
+        if (now - fs.statSync(p).mtimeMs > maxAgeMs) {
+          fs.unlinkSync(p);
+          removed += 1;
+        }
+      } catch {
+        /* 读不到 / 删不掉就跳过 */
+      }
+    }
+  } catch {
+    /* 目录不存在等 —— 都不是错误 */
+  }
+  if (removed) trace('state-prune', { removed });
+  return removed;
 }
 
 function readState(file) {
@@ -647,11 +708,22 @@ function subagentKeys(ev, name, task) {
  * 所以收工 / 扫场必须认来源，否则会把对方的幽灵一起收掉。
  * 写了 client 的按 client 认；没写的（老版本 hook / 手工脚本）算 CodeBuddy 的历史条目。
  */
-function ownsEntry(a, client) {
+function ownsEntry(a, client, session = '') {
   if (!a) return false;
   const c = String(a.client || '').trim().toLowerCase();
-  if (c) return c === client;
-  return client === 'codebuddy';
+  if (c) {
+    if (c !== client) return false;
+  } else if (client !== 'codebuddy') {
+    return false;
+  }
+  // 会话这一级只在**两边都有**时才比：老条目 / 手工 `scripts/subagents.js` 写的条目
+  // 根本没有 sessionId，不能因为缺字段就当"不是我的"（那会把手工幽灵变成本层谁都收不掉）。
+  // 两条 claude 会话的 client 都是 'claude'，只有这一步能把它们分开。
+  if (session) {
+    const s = String(a.sessionId || '').trim();
+    if (s && s !== session) return false;
+  }
+  return true;
 }
 
 /**
@@ -667,16 +739,23 @@ function ownsEntry(a, client) {
  * @param {string} parent 召唤它的那轮用户任务 id（主 agent 当前任务）—— 台账认父用
  * @param {string} model 召唤时的模型（拿不到就空，服务端留 NULL）
  */
-function addGhost(workspacePath, name, task, id, parent, model, client) {
+function addGhost(workspacePath, name, task, id, parent, model, client, session = SESSION) {
   const file = feedFileFor(workspacePath);
   const feed = readFeedFile(file);
-  const dup = id ? (a) => a.id === id : (a) => a.name === name;
+  // 去重也要按会话：同一个 subagent 名 + 同一个 id 只会出现在一条会话里，
+  // 但两条会话各自召唤同名 subagent 时，只按 name 去重会把第二只吞掉。
+  const dup = id
+    ? (a) => a.id === id
+    : (a) => a.name === name && String(a.sessionId || '') === String(session || '');
   if (feed.agents.some(dup)) return;
   feed.agents.push({
     name,
     state: 'busy',
     ts: Date.now(),
-    client, // 归属：同一个工程下 Codex / CLI / Plugin 共用一个清单文件，按 client 区分
+    client, // 归属轴 1（产品）：同一个工程下 Codex / CLI / Plugin 共用一个清单文件，按 client 区分
+    // 归属轴 2（会话）：同产品两条会话的 client 完全一样，只能靠 sessionId 分开。
+    // 收工 / 扫场都用 ownsEntry 比它，否则 A 的 Stop 会把 B 还在跑的幽灵一起收掉。
+    ...(session ? { sessionId: String(session) } : {}),
     ...(task ? { task } : {}),
     ...(id ? { id } : {}),
     ...(parent ? { parent } : {}),
@@ -698,11 +777,17 @@ function addGhost(workspacePath, name, task, id, parent, model, client) {
  * 摘要用 description/prompt 那句任务名兜底（feed 那边也会再兜一次），
  * 主 agent 若随后写了更具体的 result，会覆盖掉这句。
  */
-function retireGhost(workspacePath, name, id, result, client) {
+function retireGhost(workspacePath, name, id, result, client, session = SESSION) {
   const file = feedFileFor(workspacePath);
   const feed = readFeedFile(file);
   let hit = id ? feed.agents.findIndex((a) => a.id === id) : -1;
-  if (hit < 0) hit = feed.agents.findIndex((a) => a.name === name);
+  // 没有 id 才退回按名字。按名字这一步也要带会话：两条会话各自召唤同名 subagent 时，
+  // 只按名字找会收掉对方那只。
+  if (hit < 0) {
+    hit = feed.agents.findIndex(
+      (a) => a.name === name && (!session || !a.sessionId || String(a.sessionId) === String(session))
+    );
+  }
   if (hit < 0) return;
   const cur = feed.agents[hit] || {};
   // client 必须传进来：ownsEntry 拿它跟条目上的 client 比。
@@ -710,7 +795,7 @@ function retireGhost(workspacePath, name, id, result, client) {
   // 于是本函数永远提前 return —— 幽灵从没进过"待汇报"，只会被 Stop / SessionEnd 当孤儿扫掉，
   // 「走到主 agent 面前汇报」那段动画对所有客户端都没播过（实测 ghost-report 打了，
   // 紧接着 ghost-sweep 仍把它当孤儿 remove 掉，就是这条）。
-  if (!ownsEntry(cur, client)) return; // 别动别的客户端的幽灵
+  if (!ownsEntry(cur, client, session)) return; // 别动别的客户端 / 别的会话的幽灵
   const task = String(cur.task || '').trim();
   // Codex 的 SubagentStop 会带子代理最后那段话，直接当汇报文案（比"已完成：任务名"实在）
   const said = String(result || '').replace(/\s+/g, ' ').trim().slice(0, 200);
@@ -777,7 +862,7 @@ function resultOfResponse(ev) {
 }
 
 /** 收工：按 id 精确找，找不到再按 name，都找不到就认最早那只（FIFO）。转成待汇报并销账。 */
-function finishGhost(file, workspacePath, ev, client, opts = {}) {
+function finishGhost(file, workspacePath, ev, client, opts = {}, session = SESSION) {
   const list = readState(file).subagents || [];
   const ti = ev && ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : null;
   const nm = ti ? agentName(ti) : '';
@@ -789,7 +874,7 @@ function finishGhost(file, workspacePath, ev, client, opts = {}) {
   if (!rec && nm && nm !== 'subagent') rec = list.find((r) => r.name === nm) || null;
   if (!rec) rec = list[0] || null;
   if (!rec) return;
-  retireGhost(workspacePath, rec.name, rec.id, opts.result, client);
+  retireGhost(workspacePath, rec.name, rec.id, opts.result, client, session);
   writeState(file, { subagents: list.filter((r) => r !== rec) });
   trace('ghost-report', { name: rec.name, id: rec.id, via: ev && ev.hook_event_name });
 }
@@ -809,7 +894,7 @@ function finishGhost(file, workspacePath, ev, client, opts = {}) {
  * SessionEnd 全扫（会话都没了，没什么好汇报的了）。
  * @returns {number} 清掉的条数
  */
-function sweepGhosts(stateFile, workspacePath, client, opts = {}) {
+function sweepGhosts(stateFile, workspacePath, client, opts = {}, session = SESSION) {
   // 注意两个路径别搞混：stateFile 是 hook 状态文件（账本在里面），
   // 清单文件要按 workspacePath 现算 —— 混了的话本函数会静默变成空操作。
   const feedFile = feedFileFor(workspacePath);
@@ -817,7 +902,11 @@ function sweepGhosts(stateFile, workspacePath, client, opts = {}) {
   // 默认只扫「从没收过工的孤儿」（没有 result）：带 result 的已经进了「待汇报」流程，
   // 由 subagentFeed 播完汇报再回收 —— 连它一起扫会把刚做好的汇报动画掐掉。
   // 会话真的结束了（SessionEnd）才 all:true 全清。
-  const doomed = feed.agents.filter((a) => a && a.ts && ownsEntry(a, client) && (opts.all || !a.result));
+  // **会话维度**：all:true 也只是"这条会话全清"，不是"清光整个工程" ——
+  // 否则你关掉一个终端，另一个终端里还在飞的幽灵会被一起扫掉。
+  const doomed = feed.agents.filter(
+    (a) => a && a.ts && ownsEntry(a, client, session) && (opts.all || !a.result)
+  );
   if (!doomed.length) return 0;
   writeFeedFile(feedFile, { ...feed, agents: feed.agents.filter((a) => !doomed.includes(a)) });
 
@@ -850,16 +939,22 @@ function clearAwait(file) {
   writeState(file, { await: null, pending: null, sessionPhase: null, done: null });
 }
 
-function startHeartbeat(agent) {
-  const file = statePath(agent);
+function startHeartbeat(agent, session = SESSION) {
+  const file = statePath(agent, session);
   const st = readState(file);
   if (st.hb && st.hb.pid && alive(st.hb.pid)) return; // 已经有一个在跑
   try {
-    const child = spawn(process.execPath, [__filename, '--heartbeat', '--agent', agent], {
-      detached: true,
-      stdio: 'ignore',
-      env: process.env,
-    });
+    // --session 必须传给子进程：守护要按会话找**自己那份**状态文件。
+    // 少了它，两条会话的守护会共用一份文件，一条 SessionEnd 就把另一条还在跑的心跳杀掉。
+    const child = spawn(
+      process.execPath,
+      [__filename, '--heartbeat', '--agent', agent, ...(session ? ['--session', session] : [])],
+      {
+        detached: true,
+        stdio: 'ignore',
+        env: process.env,
+      }
+    );
     child.unref();
     writeState(file, { hb: { pid: child.pid, startedAt: Date.now(), lastEventAt: Date.now() } });
   } catch (err) {
@@ -867,8 +962,8 @@ function startHeartbeat(agent) {
   }
 }
 
-function stopHeartbeat(agent) {
-  const file = statePath(agent);
+function stopHeartbeat(agent, session = SESSION) {
+  const file = statePath(agent, session);
   const st = readState(file);
   const pid = st.hb && st.hb.pid;
   // 先立停止旗，再发信号：守护即便错过信号，下一轮也会自己退
@@ -886,11 +981,11 @@ function stopHeartbeat(agent) {
  * 心跳守护：SessionStart 拉起、SessionEnd 收掉。
  * 没有它，agent 只要思考超过 60s，屋里就把它标成 degraded（灰 + 「推断」）。
  */
-async function runHeartbeat(info, agent) {
-  const file = statePath(agent);
+async function runHeartbeat(info, agent, session = '') {
+  const file = statePath(agent, session);
   const startedAt = Date.now();
   const ctx = await resolveCtx(info);
-  const body = { project: ctx.project, workspacePath: ctx.workspacePath, memberId: agent };
+  const body = { project: ctx.project, workspacePath: ctx.workspacePath, memberId: agent, sessionId: session };
   writeState(file, { hb: { pid: process.pid, startedAt, lastEventAt: Date.now() } });
 
   const stop = () => {
@@ -929,7 +1024,8 @@ async function main() {
     return;
   }
 
-  if (argv.includes('--heartbeat')) return runHeartbeat(info, AGENT);
+  // 心跳守护：--session 由 startHeartbeat 拉起时注入，决定它盯哪一份状态文件
+  if (argv.includes('--heartbeat')) return runHeartbeat(info, AGENT, flag(argv, '--session'));
 
   const raw = await readStdin();
   let ev = null;
@@ -941,6 +1037,10 @@ async function main() {
   }
   const event = ev && ev.hook_event_name;
   if (!event) return;
+  // 轴 2：本次事件属于哪条会话。必须在算 statePath / 拉心跳之前定下来 ——
+  // 它决定这一整轮所有读写落在**哪一份**状态文件上。
+  // 拿不到就留空（退回旧的文件名，向后兼容），绝不是"随便挑一条会话"。
+  SESSION = String((ev && ev.session_id) || '').trim();
   // 本次事件归属的客户端：默认 CodeBuddy 钩子落 'codebuddy'（CLI/1F 来源），
   // plugin（payload 自带 client）则落 'codebuddy-plugin'（3F 来源）；其余产品同此
   // （codex / codex-plugin、trae / trae-plugin …），由 eventClient 统一归层。
@@ -956,7 +1056,9 @@ async function main() {
   });
 
   const ctx = await resolveCtx(info);
-  const base = { project: ctx.project, workspacePath: ctx.workspacePath };
+  // sessionId 放进公共信封：register / task/start / task/end / file/touch / message / status
+  // 全都从 base 展开，一处加上即全线带上 —— 服务端据此把每条记录挂到**具体会话**上。
+  const base = { project: ctx.project, workspacePath: ctx.workspacePath, sessionId: SESSION };
   const file = statePath(AGENT);
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // 状态文件里记下来源客户端：同一个工程可能同时有 Codex / CLI / Plugin 在跑，
@@ -980,13 +1082,31 @@ async function main() {
       client: cl,
     });
   const beat = () => request(info, HTTP_ROUTES.HEARTBEAT, { ...base, memberId: AGENT });
+  /**
+   * 状态上报。顺带把**这条会话此刻挂在哪个任务上**一起报（轴 2）。
+   *
+   * 为什么非报不可：服务端 `agent_status` 是**一行一成员**、只有一个 task_id 槽位，
+   * 同产品的多条会话共用它。不报的话服务端只能沿用上一行，槽位就被"最后调 startTask 的
+   * 那条会话"占死 —— 实测后果是状态**正好反了**：已退出的那条在报表里显示「进行中」，
+   * 正在干活的这条显示「已取消」（见 server/src/ingest/bus.js 的 nextTaskSlot）。
+   *
+   * 值取状态文件里的 taskId（UserPromptSubmit 落、Stop 清），所以收工时发出去的
+   * 是显式 `null` —— "这条会话现在没有在跑的任务"，服务端据此只释放**自己**占的槽位。
+   */
   const status = (state, reason) =>
-    request(info, HTTP_ROUTES.STATUS, { ...base, memberId: AGENT, state, ...(reason ? { reason } : {}) });
+    request(info, HTTP_ROUTES.STATUS, {
+      ...base,
+      memberId: AGENT,
+      state,
+      taskId: readState(file).taskId || null,
+      ...(reason ? { reason } : {}),
+    });
 
   // 会话边界的事件才 register（工具前后各 register 一次太吵）；
   // 但中途才装上 hook 的话第一个事件也可能是 SessionStart 之外的，所以 UserPromptSubmit / Stop 也补一次。
   if (event === 'SessionStart') {
-    startHeartbeat(AGENT);
+    pruneStateFiles(); // 顺手清过期状态文件（见该函数说明：不清理会把 1.5s 快轮询拖垮）
+    startHeartbeat(AGENT, SESSION);
     await register();
     await beat();
     await status('idle');

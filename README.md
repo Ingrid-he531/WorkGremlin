@@ -165,6 +165,10 @@ Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本�
 所以切到 4F 不会再看见你在 CodeBuddy 里建的小怪物。`client` 为空的是「通用」成员（演示数据、
 手工 `scripts/subagents.js` 写的幽灵），哪层都显示。
 
+注意**小怪物（subagent 名册）不受会话影响**：它是静态的（`client` 比对的又是去掉 `-plugin` 的
+基础名），同一层的两条会话看到的是同一批常驻小怪物。会话只决定**主 agent 状态、幽灵实例、
+任务台账与对话**这三样 —— 它们是"某一条会话干的活"，天然该分。
+
 Codex 与 CodeBuddy 在同一个工程下**共用** `<工程>/.workgremlin/subagents.json`，所以每条清单记录
 都会带 `client`，收工与扫场只动自己那一路 —— 否则两边的 Stop/Interrupt 会把对方的幽灵一起收掉。
 
@@ -204,6 +208,21 @@ npm run hooks:install -- --targets=claude  # 只装 Claude Code
 | `Notification` | 等权限 → `blocked`；空闲提醒 → `idle`；其余类型忽略 | 见上「`notification_type` 不止一种」 |
 | `SubagentStop` | 幽灵转「待汇报」 | 与 `PostToolUse(Agent)` 互为兜底 |
 | `Stop` | `task/end(done)` + `idle`，顺手扫掉本轮残留的幽灵 | 汇报文案取 `last_assistant_message` |
+
+**同一个楼层可以同时开多条会话**（比如开两个终端，或者终端 + VS Code 插件各开一条）——
+CLI 与插件是同一份 `~/.claude`、同一套 hook、连二进制都相同，所以它们本来就该是**一个楼层**；
+层内靠 `session_id` 区分（轴 2，与"楼层/客户端"这条轴正交）：
+
+- **`session_id` 从哪来、可不可信**：hook payload 的 `session_id` 字段、transcript 的文件名
+  （`~/.claude/projects/<工程>/<session_id>.jsonl`）、transcript 首行的 `sessionId`、
+  以及子代理目录 `<session_id>/subagents/agent-<agentId>.jsonl` 的父目录名，
+  实测 2.1.281 下五处 100% 一致。子代理共享父会话的 `session_id`，另带自己的 `agentId`。
+- **hook 侧**：状态文件按 `<agent>@<工程>@<会话>.json` 分（`~/.workgremlin/hooks/`），
+  所以两条会话各写各的，不会互相清空"本轮改动文件"。老命名（不带会话）仍然认，向后兼容。
+- **服务端**：`/api/v1/reporter-phase?client=<client>&session=<session_id>` 只取那一条会话的
+  实时相位与完成标记；不传 `session` 就是老行为（同 client 里取最新的那条）。
+- **落库**：`task_runs` / `messages` 都带 `session_id`，报表能分清"这轮改动是哪条会话干的"。
+- 状态文件每个会话一份，所以 hook 在 `SessionStart` 时会顺手清掉 7 天前的旧状态文件，避免目录无限膨胀。
 
 ## 安全基线（不得关闭）
 

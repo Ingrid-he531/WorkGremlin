@@ -299,7 +299,7 @@ function reporterHookHome() {
  * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
  * @returns {{phase: string, tool: string, file: string, cmd: string, prompt: string, client: string, pending: {tool: string, file: string, cmd: string, at: number}|null}|null}
  */
-function readReporterPhase(workspacePath, client = '') {
+function readReporterPhase(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   let win = null;
@@ -310,6 +310,7 @@ function readReporterPhase(workspacePath, client = '') {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
+    if (!sameSession(j, session)) continue;
     // 按客户端过滤。老状态文件（本次改动之前写的）没有 client 字段 —— 那会儿只有 CodeBuddy，
     // 所以按 codebuddy 归属，而不是"对谁都匹配"（否则刚重启、Codex 还没写过状态文件时，
     // 4F 会短暂借到 3F 的相位）。
@@ -346,12 +347,118 @@ function readReporterPhase(workspacePath, client = '') {
   };
 }
 
+/** 状态文件名里"这个工程"那一段：`@<工程绝对路径>` 整体 sanitize。 */
+function stateFileWs(ws) {
+  return `@${path.resolve(ws)}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
 /**
- * 主 Agent 上报相位（已映射成 UI 字段）。轻量接口 /api/v1/reporter-phase 也用它，
- * 避免把"调用工具 / 等待授权"的文案映射写两遍。
- * @param {string} workspacePath 当前工程；空则不限工程
- * @returns {{phase:string, action:string, target:string, context:string[]}|null}
+ * 会话过滤（轴 2）：这条状态文件是不是 `session` 那条会话写的。
+ *
+ * `session` 为空 → **不限**（保持老行为：同 client 里取最新那份）。
+ * 指定了会话时，老状态文件（没有 sessionId 字段）一律不算 —— 它们属于"还没有会话概念"的时代，
+ * 硬算给某条会话会让"看 A 会话"读到 B 会话的数据。
  */
+function sameSession(j, session) {
+  return !session || String((j && j.sessionId) || '') === String(session);
+}
+
+/** 进程还在不在（信号 0 = 只探测不投递）。权限不足也算"在"。 */
+function pidAlive(pid) {
+  const n = Number(pid);
+  if (!n || n < 1) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    // EPERM = 进程存在但不归我们管；ESRCH = 真没了
+    return Boolean(e && e.code === 'EPERM');
+  }
+}
+
+/**
+ * 这个成员**还有没有别的会话在跑**（轴 2）。
+ *
+ * 为什么需要它：`agent_status` 是**按成员一行**存的（`member_id` 是主键），没有会话维度。
+ * 同一个 Claude Code 同时开着 A / B 两条会话时，A 收工（Stop → idle）或退出（SessionEnd → offline）
+ * 都会去写那**唯一一行**，于是 B 还在干活、工位卡片已经显示「空闲 / 离线」。
+ * 所以降级之前先问一句"这条成员的别的会话还活着吗"，活着就别降。
+ *
+ * 「活着」的判据（任一）：
+ *   - 那份状态文件的**心跳守护进程还在**（`hb.pid` 存活）—— 主判据：会话没退，守护就没退；
+ *   - 或者它还有**在飞的相位 / 任务**（`sessionPhase` 或 `taskId` 是新鲜的）——
+ *     覆盖"守护没起来 / 刚被杀"的情况。注意 SessionEnd 会把这两样清空，所以干净退出的
+ *     会话不会被这条误判成活着。
+ *
+ * **不能用 `hb.lastEventAt` 当判据**：会话干净退出后它照样是新的（它记的是"最后一次事件"，
+ * 不是"最后一次心跳"），拿它判会把已结束的会话当成还在跑 —— 实测的症状是：A 退会话后
+ * B 也退了，工位卡片还挂在「思考中」，永远降不下来。
+ *
+ * 只认**同一个 client + 同一个工程**下、**会话 id 不同**的状态文件；老命名文件（没有会话）
+ * 不算"别的会话"（它压根没有会话维度，认了会把单会话场景也拦下来）。
+ * @param {{workspacePath?: string, client?: string, session?: string, now?: number}} o
+ * @returns {boolean}
+ */
+function hasOtherLiveSession({ workspacePath = '', client = '', session = '', now = Date.now() } = {}) {
+  const ws = String(workspacePath || '').trim();
+  // 没有会话标识就无从谈起"别的会话"（老 hook / 别的产品）→ 一律不拦
+  if (!ws || !session) return false;
+  const m = stateFileWs(ws);
+  const dir = path.join(reporterHookHome(), 'hooks');
+  for (const name of readDir(dir)) {
+    const fileSession = stateFileSession(name, m, dir);
+    if (fileSession === null || !fileSession || fileSession === session) continue;
+    const j = readJson(path.join(dir, name));
+    if (!j) continue;
+    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    // 判据 1：心跳守护还活着（最可靠）
+    if (j.hb && pidAlive(j.hb.pid)) return true;
+    // 判据 2：还有在飞的相位 / 任务（见函数说明，**不能**用 hb.lastEventAt）
+    const phaseTs = Number(j.sessionPhase && j.sessionPhase.ts) || 0;
+    if (j.sessionPhase && phaseTs && now - phaseTs <= AWAIT_TTL_MS) return true;
+    const startedAt = Number(j.taskStartedAt) || 0;
+    if (j.taskId && startedAt && now - startedAt <= AWAIT_TTL_MS) return true;
+  }
+  return false;
+}
+
+/** 会话 id 的规范形状：UUID（Claude Code 实测就是这个）。 */
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 状态文件的文件名 → 它属于哪个会话（`''` = 老命名，没带会话）。
+ * 不认识这个名字（不是这个工程的状态文件 / 根本不是状态文件）→ 返回 `null`。
+ *
+ * 命名由 hook 的 statePath() 决定：`<agent>@<工程绝对路径>[@<会话>]` 整体 sanitize 成 `[A-Za-z0-9._-]`。
+ * **加了会话之后文件名尾巴多一段 `_<会话>`**，所以老的 `endsWith('@<工程>.json')` 会全部匹配不上 ——
+ * 两处调用（hasReporterState / reporterStateMeta）都走这里，别退回去用 endsWith。
+ *
+ * **这个编码是有损的**（`_` 既是分隔符又是合法字符），所以单看文件名分不清
+ * "工程 `/a/b` + 会话 `sub`" 和 "工程 `/a/b/sub` + 没有会话"——后者是老命名的文件，
+ * 会被前者误认成自己的会话。所以尾巴分两步认：
+ *   1. 是 UUID → 直接认（Claude Code 的规范形状，绝大多数情况走这条，不读文件）；
+ *   2. 不是 UUID → 回读文件内容，**内容里的 `sessionId` 才是权威**（它是 hook 原样写进去的，
+ *      没过 sanitize）。内容对不上就不认 —— 于是上面那个 `/a/b/sub` 的老文件会被正确排除。
+ * @param {string} name 文件名
+ * @param {string} wsPart stateFileWs() 的结果
+ * @param {string} dir hooks 目录（第 2 步回读内容用）
+ * @returns {string|null} 会话 id（可为 ''）
+ */
+function stateFileSession(name, wsPart, dir) {
+  if (!/\.json$/i.test(name)) return null;
+  const base = name.slice(0, -5);
+  if (base.endsWith(wsPart)) return '';
+  const i = base.lastIndexOf(wsPart);
+  if (i < 0) return null;
+  const tail = base.slice(i + wsPart.length);
+  // 会话尾巴只能是一段 `_<id>`（id 里不含 `_`：UUID 没有，sanitize 也把它会变成 `_`）
+  if (!/^_[A-Za-z0-9.-]+$/.test(tail)) return null;
+  const cand = tail.slice(1);
+  if (SESSION_UUID_RE.test(cand)) return cand;
+  const j = readJson(path.join(dir, name));
+  return j && String(j.sessionId || '') === cand ? cand : null;
+}
+
 /**
  * 这个工程有没有接过 hook（= 有没有对应的 hook 状态文件）。
  *
@@ -359,17 +466,20 @@ function readReporterPhase(workspacePath, client = '') {
  * 但此时 CLI 楼层不该退回"按 jsonl mtime 猜"的兜底（那会让 4F 一直显示「调用工具 / 改 xxx.jsonl」），
  * 而应该显示「待命」。渲染层靠这个字段区分"没接 hook"与"接了但当前没事干"。
  *
- * 状态文件名由 hook 的 statePath() 生成：`<member>@<工程绝对路径>` 里所有非 [A-Za-z0-9._-] 的字符换成 `_`。
+ * 状态文件名由 hook 的 statePath() 生成：`<member>@<工程绝对路径>[@<会话>]`，非 [A-Za-z0-9._-] 换成 `_`。
  * @param {string} workspacePath
+ * @param {string} [client] 来源客户端；空则不限
  */
 function hasReporterState(workspacePath, client = '') {
   const ws = String(workspacePath || '').trim();
   if (!ws) return false;
-  const suffix = `@${path.resolve(ws)}`.replace(/[^a-zA-Z0-9._-]/g, '_') + '.json';
-  for (const name of readDir(path.join(reporterHookHome(), 'hooks'))) {
-    if (!/[.]json$/i.test(name) || !name.endsWith(suffix)) continue;
+  const m = stateFileWs(ws);
+  const dir = path.join(reporterHookHome(), 'hooks');
+  for (const name of readDir(dir)) {
+    // 注意判 null 而不是判 falsy：老命名文件（不带会话）返回的是空串，那也是**本工程的**状态文件
+    if (stateFileSession(name, m, dir) === null) continue;
     if (!client) return true;
-    const j = readJson(path.join(reporterHookHome(), 'hooks', name));
+    const j = readJson(path.join(dir, name));
     // 老文件没记 client → 按 codebuddy 归属（同上）
     if (String((j && j.client) || LEGACY_STATE_CLIENT).toLowerCase() === String(client).toLowerCase()) return true;
   }
@@ -385,15 +495,19 @@ function hasReporterState(workspacePath, client = '') {
  * 界面就会把这条会话显示成「待命」，看起来像"整轮对话没有状态变化"。
  * @returns {{instrumented: boolean, sessionId: string}}
  */
-function reporterStateMeta(workspacePath, client = '') {
+function reporterStateMeta(workspacePath, client = '', session = '') {
   const ws = String(workspacePath || '').trim();
   if (!ws) return { instrumented: false, sessionId: '' };
-  const suffix = `@${path.resolve(ws)}`.replace(/[^a-zA-Z0-9._-]/g, '_') + '.json';
+  const m = stateFileWs(ws);
   const dir = path.join(reporterHookHome(), 'hooks');
   let best = null;
   let bestTs = -1;
   for (const name of readDir(dir)) {
-    if (!/[.]json$/i.test(name) || !name.endsWith(suffix)) continue;
+    const fileSession = stateFileSession(name, m, dir);
+    if (fileSession === null) continue;
+    // 指定了会话就只认那一条：文件名里的会话是 hook 写的，最可信；
+    // 老命名文件（没带会话）在指定会话时一律不算 —— 否则"看会话 B"会借到会话 A 的老文件。
+    if (session && fileSession !== session) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
     // 老状态文件没记 client → 按 codebuddy 归属（与相位读取同一口径）
@@ -408,8 +522,8 @@ function reporterStateMeta(workspacePath, client = '') {
   return { instrumented: true, sessionId: String(best.sessionId || '') };
 }
 
-function reporterMainPhase(workspacePath, client = '') {
-  const rp = readReporterPhase(workspacePath, client);
+function reporterMainPhase(workspacePath, client = '', session = '') {
+  const rp = readReporterPhase(workspacePath, client, session);
   if (!rp) return null;
   if (rp.phase === 'await') {
     return {
@@ -474,13 +588,14 @@ function reporterMainPhase(workspacePath, client = '') {
  * @param {string} [client] 来源客户端；空则不限客户端
  * @returns {boolean}
  */
-function readReporterActiveTask(workspacePath, client = '') {
+function readReporterActiveTask(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j || !j.taskId) continue;
+    if (!sameSession(j, session)) continue;
     // 按客户端过滤（口径同 readReporterPhase：老状态文件没记 client → 归 codebuddy）：
     // 同一工程里 Codex 在跑时，别把它的任务算成 3F 这一层"还在干活"的活跃窗口
     if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
@@ -501,7 +616,7 @@ function readReporterActiveTask(workspacePath, client = '') {
 
 /** reporter hook 在 Stop 时落的"完成"标记（带工程路径）。按工程归属取，
  *  作为"任务完成"的唯一真源——不靠相位回落到空闲来猜，避免中途误弹。 */
-function readReporterDone(workspacePath, client = '') {
+function readReporterDone(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   let best = null;
@@ -509,6 +624,7 @@ function readReporterDone(workspacePath, client = '') {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j || !j.done || !j.done.at) continue;
+    if (!sameSession(j, session)) continue;
     if (now - Number(j.done.at) > DONE_TTL_MS) continue; // 过期的不算"刚发生"（见 DONE_TTL_MS）
     const ws = j.done.workspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
@@ -527,7 +643,7 @@ function readReporterDone(workspacePath, client = '') {
  * @param {string} fallback 回落值
  * @returns {string}
  */
-function freshestReporterWs(fallback, client = '') {
+function freshestReporterWs(fallback, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   let best = '';
@@ -536,6 +652,7 @@ function freshestReporterWs(fallback, client = '') {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
+    if (!sameSession(j, session)) continue;
     if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
     const sp = j.sessionPhase;
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
@@ -805,6 +922,8 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
 module.exports = {
   hasReporterState,
   reporterStateMeta,
+  // 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）
+  hasOtherLiveSession,
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
   listSessions,
   findPluginStorage,

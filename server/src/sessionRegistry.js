@@ -12,8 +12,10 @@
  *   2F WorkBuddy CLI、
  *   4F Codex CLI、
  *   5F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
- *                        工程名要看首行里有没有 cwd，读不到就留空（不猜）
- *                        （Codex 的 cwd 藏在首行 payload.cwd 里，见 scanCliSessions）
+ *                        工程名从文件**头部若干行**里找 cwd，读不到就留空（不猜）。
+ *                        注意不是"首行"：Claude 的首行是 mode / queue-operation 这类
+ *                        元记录，压根没有 cwd，cwd 从第 3 行的 user 记录才有（见 cwdOfHead）
+ *                        （Codex 的 cwd 藏在 payload.cwd 里，同样由 cwdOfHead 覆盖）
  *
  * 超时：一个会话 60 分钟没有事件（最后更新时间没往前走）就从表里移除。
  * 它被移除只是"不再活跃"，下次它又有动静会被当成新会话重新登记。
@@ -50,11 +52,41 @@ function mtime(p) {
 }
 
 /**
- * 只读第一行（会话 jsonl 可能很大，别整读；按块读直到换行或上限）。
- * 上限给得比较宽（256KB）：Codex 的 session_meta 那一行里塞了整份 base_instructions，
- * 8KB 会把它截断成一个残缺的 JSON，cwd 就读不出来了。
+ * 一行里取工程路径。CodeBuddy 家族 cwd 在顶层；Codex 藏在 payload 里。
+ * 这一行 parse 不了（被截断 / 根本不是 JSON）→ 回空，由调用方决定要不要退正则。
  */
-function headLine(p, cap = 262_144) {
+function cwdOfLine(line) {
+  if (!line) return '';
+  let j;
+  try {
+    j = JSON.parse(line);
+  } catch {
+    return '';
+  }
+  // CodeBuddy 家族：cwd 在顶层
+  if (j && typeof j.cwd === 'string') return j.cwd;
+  // Codex：{"type":"session_meta","payload":{"cwd":...}} —— cwd 藏在 payload 里
+  if (j && j.payload && typeof j.payload.cwd === 'string') return j.payload.cwd;
+  return '';
+}
+
+/**
+ * 从会话文件**头部若干行**里取工程路径；读不到就留空，不猜。
+ *
+ * 为什么不能只看第一行：**Claude Code 的首行不是对话内容**。实测它的 transcript 开头是
+ * `{"type":"queue-operation",...}`（新版）或 `{"type":"mode",...}`（旧版），两样都不带 `cwd`；
+ * `cwd` 从第 3 行的 `user` / `attachment` 记录才开始有（顶层字段）。
+ * 老实现只读第一行，于是 5F **每一条**会话的工程都是空 —— 一个空值同时引出三个症状：
+ * 下拉显示「未知工程」、`mine` 永远 false、连实时相位都叠不上去（渲染层要 `projectPath`
+ * 非空才肯用快轮询，见 IsoOfficeView 的 canUseFast）→ 主控制台一直挂在「未上报」。
+ *
+ * 边读边试、命中就收工：这个函数会被每个会话文件、每几秒调一次，不许为了一行 cwd 读完整棵树。
+ * 上限给得宽（512KB / 60 行）：Codex 的 session_meta 那一行里塞了整份 base_instructions，
+ * 8KB 会把它截断成残缺 JSON，cwd 就读不出来了。
+ * @param {string} p 会话 jsonl 路径
+ * @returns {string} 工程绝对路径；读不到回空串
+ */
+function cwdOfHead(p, { cap = 524_288, maxLines = 60 } = {}) {
   let fd;
   try {
     fd = fs.openSync(p, 'r');
@@ -63,17 +95,39 @@ function headLine(p, cap = 262_144) {
   }
   try {
     const CHUNK = 8192;
+    // buf 里只留"还没凑成完整一行"的残段（完整的行当场切走并试掉），所以 cap 实际限的是单行长度
     let buf = Buffer.alloc(0);
-    while (buf.length < cap) {
+    let lines = 0;
+    while (buf.length < cap && lines < maxLines) {
       const next = Buffer.alloc(CHUNK);
       const n = fs.readSync(fd, next, 0, CHUNK, buf.length);
       if (n <= 0) break;
       buf = Buffer.concat([buf, next.subarray(0, n)]);
-      const nl = buf.indexOf(0x0a);
-      if (nl >= 0) return buf.subarray(0, nl).toString('utf8');
+      let nl = buf.indexOf(0x0a);
+      while (lines < maxLines && nl >= 0) {
+        const c = cwdOfLine(buf.subarray(0, nl).toString('utf8'));
+        buf = buf.subarray(nl + 1);
+        lines += 1;
+        if (c) return c;
+        nl = buf.indexOf(0x0a);
+      }
       if (n < CHUNK) break;
     }
-    return buf.toString('utf8');
+    // 走到这儿 buf 没有换行收尾：要么文件就到这里（末尾无换行），要么这条超长行撞上了 cap。
+    // 两种情况都先整行 parse，不成再退到正则捞**第一个** cwd —— 它仍是这条会话自己的
+    // （后面的事件压根还没读到），同老实现的口径。
+    if (lines >= maxLines || !buf.length) return '';
+    const tail = buf.toString('utf8');
+    const direct = cwdOfLine(tail);
+    if (direct) return direct;
+    const m = tail.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (!m) return '';
+    try {
+      const s = JSON.parse(`"${m[1]}"`);
+      return typeof s === 'string' ? s : '';
+    } catch {
+      return '';
+    }
   } catch {
     return '';
   } finally {
@@ -82,29 +136,6 @@ function headLine(p, cap = 262_144) {
     } catch {
       /* 关闭失败无所谓 */
     }
-  }
-}
-
-/** 从首行里取工程路径；读不到就留空，不猜 */
-function cwdOfFirstLine(line) {
-  if (!line) return '';
-  try {
-    const j = JSON.parse(line);
-    // CodeBuddy 家族：cwd 在顶层
-    if (j && typeof j.cwd === 'string') return j.cwd;
-    // Codex：{"type":"session_meta","payload":{"cwd":...}} —— cwd 藏在 payload 里
-    if (j && j.payload && typeof j.payload.cwd === 'string') return j.payload.cwd;
-  } catch {
-    /* 首行超长被截断，退到正则 */
-  }
-  // 兜底：首行被上限截断时，里面这第一个 cwd 就是会话自己的（不是后面事件里的）
-  const m = line.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  if (!m) return '';
-  try {
-    const s = JSON.parse(`"${m[1]}"`);
-    return typeof s === 'string' ? s : '';
-  } catch {
-    return '';
   }
 }
 
@@ -155,15 +186,23 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
       if (SKIP.has(e.name)) continue;
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
+        // 子代理的 transcript 不是独立会话：它们住在 `<会话 id>/subagents/agent-<agentId>.jsonl`，
+        // 和父会话共享同一个 sessionId（首行也带 cwd，所以"读首行判工程"会把它当成一条会话）。
+        // 收进来的后果：一条会话配上多少个 subagent 就多出多少条"会话"，全是噪声。
+        if (e.name === 'subagents') continue;
         walk(p, depth + 1);
         continue;
       }
       if (!/\.jsonl$/i.test(e.name)) continue;
       const at = mtime(p);
-      // 首行里可能有 cwd（工程路径）；读不到就留空，不猜（解析规则见 cwdOfFirstLine）
-      const cwd = cwdOfFirstLine(headLine(p));
+      // 文件头部里可能有 cwd（工程路径）；读不到就留空，不猜（解析规则见 cwdOfHead）
+      const cwd = cwdOfHead(p);
       out.push({
         id: path.relative(root, p),
+        // 轴 2：这条落盘属于哪条会话。Claude Code 的 transcript 就叫 `<session_id>.jsonl`，
+        // 文件名去扩展名就是 hook payload 里的 session_id（实测三处 100% 一致）。
+        // Codex 是 `rollout-<时间>-<uuid>.jsonl`，形状不同 —— 不猜，留空。
+        sessionId: kind === 'claude' ? e.name.replace(/\.jsonl$/i, '') : '',
         project: cwd ? resolveProjectName(cwd) || path.basename(cwd) : '',
         projectPath: cwd,
         lastEventAt: at || Date.now(),
@@ -264,6 +303,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
       upsert({
         floor: p.id,
         id: s.id,
+        // 轴 2：会话 id（`~/.claude/projects/<slug>/<session_id>.jsonl` 的文件名）。
+        // 渲染层拿它去问 `/api/v1/reporter-phase?session=`，就能只取这条会话的实时相位，
+        // 不再"同一个 client 里谁最新就显示谁"。Codex 拿不到（形状不同）→ 空串，退回旧行为。
+        sessionId: s.sessionId || '',
         source: 'cli',
         project: s.project,
         projectPath: s.projectPath,

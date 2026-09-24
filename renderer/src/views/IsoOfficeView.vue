@@ -48,7 +48,14 @@ async function startPhasePoll() {
     try {
       // 带上当前楼层的客户端：同一工程里 Codex 与 CodeBuddy 同时在跑时，各取各的相位
       const want = sessions.selectedClient;
-      const qs = want ? `?client=${encodeURIComponent(want)}` : '';
+      const params = [];
+      if (want) params.push(`client=${encodeURIComponent(want)}`);
+      // 再带上选中会话的会话 id（轴 2）：同一个 client 下可以同时开多条会话
+      // （比如同一层的 Claude Code 开两个终端），只按 client 取会"谁最新显示谁"、来回串味。
+      // 拿不到会话 id 的产品（Codex / 插件）这里就没有这个参数 → 服务端退回老行为。
+      const wantSession = sessions.selectedSessionId;
+      if (wantSession) params.push(`session=${encodeURIComponent(wantSession)}`);
+      const qs = params.length ? `?${params.join('&')}` : '';
       const res = await fetch(`${httpBase(info)}/api/v1/reporter-phase${qs}`, {
         headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
       });
@@ -204,11 +211,18 @@ const consoleBase = computed(() => {
   // "思考中"会短暂盖到旧会话上——现象就是旧会话闪一下"思考中"、随后回落"待命中"。
   const fp = fastPhase.value;
   const sameWs = Boolean(fp) && sameWorkspace(fp.workspacePath, sel.projectPath);
+  // 选中这条会话的**会话 id**（轴 2）：下面两处"这份上报属不属于你看的这条会话"都用它精确比对。
+  // 拿不到（Codex / 插件）就是空串 → 相关判定放行，退回老行为。
+  const selSessionId = sel.sessionId || '';
   // hook 状态文件属于**某一条会话**（hook 在会话启动时加载）。工程相同还不够 ——
   // 实测：13:40 开的旧会话没有 hook，但同工程里跑过 codex exec，状态文件存在，
   // 于是这条会话被显示成「待命」，看起来像"整轮对话完全没有状态变化"。
-  // 所以还要确认"上报的那条会话 == 你正在看的这条"（rollout 文件名里含 session_id）。
-  const sameSession = Boolean(fp) && (!fp.sessionId || !sel.id || String(sel.id).includes(fp.sessionId));
+  // 所以还要确认"上报的那条会话 == 你正在看的这条"。
+  // 用会话 id **精确比对**（服务端回的是状态文件里的 sessionId，也就是 hook payload 的 session_id）。
+  // 以前是拿 sel.id 去 includes(fp.sessionId)：sel.id 是**落盘定位符**（CLI 是 `<工程目录>/<会话>.jsonl`
+  // 的相对路径），子串匹配既可能漏判也可能误判。现在两边都有真会话 id 就直接相等判定。
+  // 任何一边拿不到会话 id（Codex 的 rollout 文件名不含 session_id、老状态文件）→ 宽松放行，维持老行为。
+  const sameSession = Boolean(fp) && (!fp.sessionId || !selSessionId || fp.sessionId === selSessionId);
   // `fresh` 只有 3F 插件会话会设（= 全局唯一"正在敲"的那条）。CLI 楼层（1F/2F/4F/5F）没这个标记，
   // 但同样有 hook 上报的相位 —— 只要"相位所属工程 == 这条会话的工程"就该用它；
   // 否则 4F 永远只能显示会话表里"按 jsonl 文件时间猜"的兜底：一直「调用工具」+ 文案是那个 rollout 文件名。
@@ -319,11 +333,11 @@ watch(
     //   ① 它是"某条会话上一轮结束"的**持久状态**，不是一次性事件 —— 页面刚打开 / 刚切楼层时
     //      首次拿到它只能当基线，否则会把上一次的完成摘要当成刚发生的事重播一遍
     //      （现象：一开 4F 就弹「任务完成」，10 秒后才回待命）；
-    //   ② 它按"工程 + 客户端"存（同工程里 Codex/CodeBuddy 各一份），但显示时是针对**选中的会话**，
-    //      所以还要确认这份完成属于当前这条会话（rollout 文件名里含 session_id）。
+    //   ② 同一楼层可以同时开多条会话，所以它是按"工程 + 客户端 + 会话"存的，显示时是针对
+    //      **选中的会话**，还要确认这份完成属于当前这条会话（会话 id 精确比对，同上）。
     const fpDone = fastPhase.value && fastPhase.value.done;
-    const sameSession =
-      !fpDone || !fpDone.sessionId || !sel || !sel.id || String(sel.id).includes(fpDone.sessionId);
+    const doneSessionId = (sel && sel.sessionId) || '';
+    const sameSession = !fpDone || !fpDone.sessionId || !doneSessionId || fpDone.sessionId === doneSessionId;
     const fastDoneAt = fpDone && fpDone.at && sameSession ? fpDone.at : 0;
     const firstFastDone = fastDoneAt > 0 && !seenFastDone;
     if (fastDoneAt > 0) seenFastDone = true;

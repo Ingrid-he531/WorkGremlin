@@ -27,6 +27,8 @@ function createQueryRouter({ bus, repo }) {
       .listMessages(project, {
         members: q.members ? String(q.members).split(',').filter(Boolean) : undefined,
         types: q.types ? String(q.types).split(',').filter(Boolean) : undefined,
+        // 轴 2：只取这条会话的消息。不传 = 所有会话（老行为）
+        session: q.session ? String(q.session) : undefined,
         since: q.since ? Number(q.since) : undefined,
         until: q.until ? Number(q.until) : undefined,
         keyword: q.keyword ? String(q.keyword) : undefined,
@@ -82,6 +84,9 @@ function createQueryRouter({ bus, repo }) {
            t.id, t.project_id, t.member_id, t.parent_task_id, t.title,
            t.progress, t.started_at, t.ended_at,
            COALESCE(tr.client, m.client) AS client,
+           -- 轴 2（会话）：这一轮属于哪条会话。同一楼层可以同时开多条会话，
+           -- 报表据此把同 client 的会话分开；NULL = 老任务 / 上报没带会话标识
+           tr.session_id AS session_id,
            m.name AS member_name,
            tr.model AS model,
            tr.file_count AS file_count,

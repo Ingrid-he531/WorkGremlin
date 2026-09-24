@@ -228,8 +228,13 @@ const IPC_EVENTS = Object.freeze({
  * 例：CodeBuddy 同时有 CLI（client=codebuddy，1F）与 Plugin（client=codebuddy-plugin，3F）；
  * Codex 有 4F CLI / 7F Plugin、Trae 有 6F Plugin / 8F CLI，两个变体都有。
  * **Claude Code 只有 CLI 一个身份**（client=claude，5F）：它的 CLI 与 IDE 插件共用同一份
- * ~/.claude 配置与同一套 hook，事件 payload 里没有能区分二者的字段（实测 2.1）。
- * 以后再加别的变体，只需在 products.js 多写一条楼层（agent + plugin:true）。
+ * ~/.claude 配置、同一套 hook、同一个落盘目录，事件 payload 里也没有能区分二者的字段（实测 2.1），
+ * 所以不拆成两层。
+ *
+ * 但"一个楼层"不等于"一条会话"：同一层里可以同时开着多条会话（两个终端 / 终端 + IDE 混着跑）。
+ * 那一条轴是 **session_id**（hook payload 字段，也是 transcript 的文件名），
+ * 跟 client 正交：client 决定**楼层**，session_id 决定**楼层里的哪条会话**。
+ * 以后再加别的变体（比如某产品真有独立的 plugin 形态），只需在 products.js 多写一条楼层。
  */
 
 /** 去 '-plugin' 后缀，拿到产品基名（小写）；非法/空输入返回 '' */

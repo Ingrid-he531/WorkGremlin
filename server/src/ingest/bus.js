@@ -18,6 +18,9 @@ const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
 const { detectLevel } = require('./agentLevel');
+// 成员状态降级前的守卫：别的会话还在跑就别压成空闲/离线（见 keepStateForOtherSession）。
+// 只单向依赖（sessions.js 不 require ingest/），没有循环。
+const { hasOtherLiveSession } = require('../sessions');
 
 function projectIdOf(name) {
   return name;
@@ -44,6 +47,22 @@ function normClient(v) {
 function normModel(v) {
   const s = String(v == null ? '' : v).trim();
   return s ? s.slice(0, 64) : null;
+}
+
+/**
+ * 会话 id（轴 2）：hook 的 payload `session_id` / 插件会话 id。
+ * 拿不到就是 NULL —— 「没带会话标识」和「会话叫空串」是两回事，前者是合法的老数据形态。
+ * 超长截断（128）纯属防御：真值是 UUID，插件侧可能是别的形式。
+ */
+function normSession(v) {
+  const s = String(v == null ? '' : v).trim();
+  return s ? s.slice(0, 128) : null;
+}
+
+/** 任务 id：拿不到就是 NULL（同 normSession 的口径，绝不猜） */
+function normTaskId(v) {
+  const s = String(v == null ? '' : v).trim();
+  return s ? s.slice(0, 128) : null;
 }
 
 /** 台账"产出"全文上限：AI 回复按 hook 侧 RESULT_MAX(4000) 送上来，这里必须 >= 它，否则会被砍掉 */
@@ -238,6 +257,90 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * 这条会话要把成员状态往下压（空闲 / 离线）时，同产品的**别的会话**是不是还在跑。
+   *
+   * `agent_status` 是按成员一行存的，没有会话维度：同一个 Claude Code 开着 A / B 两条会话，
+   * A 收工（Stop → idle）或退出（SessionEnd → offline）会去写那唯一一行，B 还在干活却显示「离线」。
+   * 所以降级前先问 sessions.js 的 hasOtherLiveSession：还有别的会话活着就**整块跳过这次状态写入**
+   * （连 taskId / currentFiles 一起留着 —— 那是还在跑的那条会话的，清掉等于把它的卡也擦干净）。
+   *
+   * 不拦**升级**（busy / thinking / blocked / online）：那不会造成"还在干活却显示离线"。
+   * 也不拦没有会话标识的上报（老 hook / 别的产品）→ 行为与改动前完全一致。
+   * @param {string} state 本次想写的状态
+   * @param {any} member 服务端的成员行（client 从它取）
+   * @param {any} p 上报体
+   */
+  function keepStateForOtherSession(state, member, p) {
+    if (state !== 'idle' && state !== 'offline') return false;
+    if (!p.sessionId) return false;
+    try {
+      return hasOtherLiveSession({
+        workspacePath: p.workspacePath || '',
+        client: member.client || normClient(p.client) || '',
+        session: String(p.sessionId),
+      });
+    } catch {
+      return false; // 读盘失败就当没有 —— 宁可降级，也不要因为守卫报错把状态卡死
+    }
+  }
+
+  /**
+   * 成员行上挂的那个 task，是不是**本次上报这条会话**的（轴 2）。
+   *
+   * 为什么需要判：`agent_status` 是**一行一成员**、只有一个 task_id 槽位，同产品的多条会话
+   * 共用它。不判的话，槽位归"最后调 startTask 的那条会话"占着 —— 实测的后果是状态**正好反了**：
+   * 已退出的那条会话的任务在报表里显示「进行中」（成员行的 task_id 指着它、心跳又由活着的
+   * 那条会话刷着，`/task-runs` 的存活判定就认为它还在跑），而**正在干活**的那条显示「已取消」
+   * （成员行的 task_id 不指向它，存活判定找不到匹配行）。
+   *
+   * 归属靠 `task_runs.session_id`（轴 2 新加的列）。
+   * @returns {boolean|null} true=是它的 / false=不是它的 / null=判不了（查不到这一行，或两边有一边没会话标识）
+   */
+  function taskOwnedBy(taskId, sessionId) {
+    const sid = normSession(sessionId);
+    if (!taskId || !sid) return null;
+    try {
+      const run = repo.getTaskRun.get(taskId);
+      const owner = run && normSession(run.session_id);
+      if (!owner) return null; // 老数据（加 session_id 之前的任务）→ 判不了，维持老行为
+      return owner === sid;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 决定这次 `/status` 之后，成员行的 task_id 槽位该写谁。
+   *
+   * 优先级：
+   *   1. 上报体**带了个真 taskId**（新 hook 干活时每次都带）→ 以它为准。
+   *      这条会话就此认领槽位，报表的存活判定才能把**它自己**的任务认成在跑。
+   *   2. **显式 null**（新 hook 收工时带）= "我这边没任务了" → 只清**自己**占的槽位：
+   *      槽位是空的、或本来就是我的、或归属判不出来 → 清掉；
+   *      槽位被**别的会话**占着 → 留着，别把人家还在跑的任务擦掉（A 收工不能把 B 的任务抹了）。
+   *   3. 没带这个字段（老 hook / mock / 别的产品）→ 沿用 prev；但**若 prev 的 task 属于别的
+   *      会话**就清空 —— 那条会话已经不往这儿写状态了，还把它挂在成员行上，会让一个早已结束的
+   *      任务因为"心跳不断"而被判成「进行中」。
+   *   4. 归属判不了（加 session_id 之前的老数据）→ 沿用 prev，与改动前完全一致。
+   *
+   * 注意判的是 `hasOwnProperty` 而不是真值：省略与显式 `null` 是两件事。
+   * @param {any} prev agent_status 里现有那一行（可能不存在）
+   * @param {any} p 上报体
+   * @returns {string|null}
+   */
+  function nextTaskSlot(prev, p) {
+    const prevTask = prev ? prev.task_id : null;
+    const own = prevTask ? taskOwnedBy(prevTask, p.sessionId) : null;
+    if (!Object.prototype.hasOwnProperty.call(p, 'taskId')) {
+      return own === false ? null : prevTask;
+    }
+    const want = normTaskId(p.taskId);
+    if (want) return want;
+    if (!prevTask) return null;
+    return own === false ? prevTask : null;
+  }
+
+  /**
    * 显式状态切换（含 blocked + 原因）。
    */
   function setStatus(p) {
@@ -248,12 +351,16 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
     const state = AGENT_STATES.includes(p.state) ? p.state : 'idle';
     const prev = repo.getStatus.get(id);
+    // 别的会话还在跑 → 别把成员整体压成空闲/离线
+    if (keepStateForOtherSession(state, member, p)) {
+      return { ok: true, skipped: 'other_session_live', card: buildMemberCard(id) };
+    }
 
     repo.upsertStatus.run({
       memberId: id,
       state,
       stateSince: ts,
-      taskId: prev ? prev.task_id : null,
+      taskId: nextTaskSlot(prev, p),
       progress: prev ? prev.progress : null,
       currentFiles: prev ? prev.current_files : null,
       lastHeartbeatAt: ts,
@@ -307,6 +414,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         projectId: project,
         memberId: member.id,
         client: member.client || normClient(p.client) || null,
+        sessionId: normSession(p.sessionId),
         model: normModel(p.model),
         title: p.title || '(未命名任务)',
         startedAt: ts,
@@ -353,18 +461,22 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const state = ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done';
 
     repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
-    repo.upsertStatus.run({
-      memberId: member.id,
-      state: 'idle',
-      stateSince: ts,
-      taskId: null,
-      progress: null,
-      currentFiles: null,
-      lastHeartbeatAt: ts,
-      degraded: 0,
-      source: 'report',
-      updatedAt: ts,
-    });
+    // 收工要把成员压回 idle；但同产品的别的会话还在跑时不能压（否则 B 干着活、卡片显示空闲，
+    // 而且 taskId / currentFiles 会被清空、把 B 的任务卡一起擦掉）。见 keepStateForOtherSession。
+    if (!keepStateForOtherSession('idle', member, p)) {
+      repo.upsertStatus.run({
+        memberId: member.id,
+        state: 'idle',
+        stateSince: ts,
+        taskId: null,
+        progress: null,
+        currentFiles: null,
+        lastHeartbeatAt: ts,
+        degraded: 0,
+        source: 'report',
+        updatedAt: ts,
+      });
+    }
     for (const a of p.artifacts || []) {
       repo.insertArtifact.run(member.id, p.taskId ?? null, a.kind || 'file', a.title || a.path || '(产出)', a.path ?? null, ts);
       hub.broadcast(project, WS_EVENTS.ARTIFACT_NEW, {
@@ -386,6 +498,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
           projectId: project,
           memberId: member.id,
           client: member.client || normClient(p.client) || null,
+          sessionId: normSession(p.sessionId),
           model: normModel(p.model),
           title: null,
           startedAt: null,
@@ -486,6 +599,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       subject: p.subject ?? null,
       content: p.content ?? '',
       taskId: p.taskId ?? null,
+      sessionId: normSession(p.sessionId),
       source: p.source || 'report',
       rawJson: jsonOrNull(p.raw ?? null),
     });
@@ -526,6 +640,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       subject: row.subject,
       content: row.content,
       taskId: row.task_id,
+      sessionId: row.session_id,
       source: row.source,
       rawJson: row.raw_json,
     };

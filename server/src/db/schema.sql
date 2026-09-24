@@ -91,6 +91,10 @@ CREATE TABLE IF NOT EXISTS messages (
   subject      TEXT,
   content      TEXT,
   task_id      TEXT,
+  -- 轴 2（会话）：这条消息出自哪个会话（hook payload 的 session_id / 插件会话 id）。
+  -- 同一个成员（同一层楼的同一个 agent）可以同时开多条会话，靠它分。
+  -- NULL = 老数据或没带会话标识的上报（演示数据、手工 scripts/subagents.js）。
+  session_id   TEXT,
   source       TEXT NOT NULL DEFAULT 'report',
   raw_json     TEXT,
   -- 归档（M1 实现逻辑，M0 只落字段与索引）
@@ -103,6 +107,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_from         ON messages(project_id, fro
 CREATE INDEX IF NOT EXISTS idx_messages_to           ON messages(project_id, to_member, ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_type         ON messages(project_id, type, ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_archived     ON messages(project_id, archived_at);
+-- 注意：session_id 上的索引建在 migrate() 里，不在这里 —— schema.sql 先于 migrate() 执行，
+-- 老库这时还没有 session_id 列，在这里建索引会 "no such column"。见 db/index.js 的 migrate()。
 
 -- 中文搜索：必须用 trigram（unicode61 会把整段中文当成一个 token，中文搜索不可用）
 -- 注意：trigram 对 <3 字的查询召回差，M2 需在搜索层把 1~2 字查询降级为 LIKE 扫描并限定时间范围。
@@ -151,6 +157,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
   project_id          TEXT NOT NULL,
   member_id           TEXT NOT NULL,      -- 主 agent：codebuddy@<工程> / codex@<工程>
   client              TEXT,               -- codebuddy / workbuddy / codex / claude
+  -- 轴 2（会话）：这轮用户任务属于哪条会话。同一个 agent 同时开两条会话时，
+  -- 报表要能分清"这轮改动是哪条会话干的"。NULL = 老数据 / 无会话标识的上报。
+  session_id          TEXT,
   model               TEXT,               -- 使用的模型（hook 上报；NULL = 没报）
   title               TEXT,               -- 输入：用户原话
   result              TEXT,               -- 产出：收尾自述 / 完成摘要
@@ -165,6 +174,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   duration_ms         INTEGER             -- 花费时间 = ended_at - started_at
 );
 CREATE INDEX IF NOT EXISTS idx_task_runs_project_started ON task_runs(project_id, started_at DESC);
+-- 同上：idx_task_runs_session 建在 migrate() 里。
 
 -- 这一轮**召唤出去的 subagent 实例**（幽灵）各一行。
 -- 幽灵散掉（purgeMember）也不删：它是"这轮用了几个 subagent"的唯一账本 ——

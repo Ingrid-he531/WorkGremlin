@@ -76,6 +76,7 @@ async function selfTest() {
     subject: 'hello',
     content: 'world',
     taskId: null,
+    sessionId: null,
     source: 'report',
     rawJson: null,
   });
