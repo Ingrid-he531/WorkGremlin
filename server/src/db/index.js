@@ -32,14 +32,26 @@ function chmod600(file) {
   }
 }
 
+/** @param {import('better-sqlite3').Database} db */
+function tableExists(db, name) {
+  return Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)
+  );
+}
+
+/** @param {import('better-sqlite3').Database} db */
+function hasColumn(db, table, column) {
+  if (!tableExists(db, table)) return false;
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+}
+
 /**
  * 增量补列：schema.sql 只管"建新库"，老库要补的列在这里加。
  * SQLite 没有 ADD COLUMN IF NOT EXISTS，所以先查 table_info 再决定。
  * @param {import('better-sqlite3').Database} db
  */
 function ensureColumn(db, table, column, ddl) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (cols.some((c) => c.name === column)) return false;
+  if (hasColumn(db, table, column)) return false;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
   return true;
 }
@@ -97,6 +109,182 @@ function ensureAgentStatusThinking(db) {
   `);
 }
 
+/** 带 team_id 的老表（projec改成 project 之前的那一版 schema） */
+const LEGACY_TEAM_TABLES = ['members', 'tasks', 'messages', 'events'];
+
+/** 迁移前留一份全量备份，万一迁移出来的结果不对还能回滚 */
+function backupLegacyDatabase(db, dbPath) {
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    const dest = `${dbPath}.legacy-team-${Date.now()}`;
+    fs.copyFileSync(dbPath, dest);
+    chmod600(dest);
+    return dest;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * team 时代 → project 时代的一次性迁移。
+ *
+ * 必须抢在 exec(schema.sql) 之前跑：schema.sql 里有一批 `CREATE INDEX ...(project_id, ...)`，
+ * 老表（members / tasks / messages / events）只有 team_id，db.exec 会当场挂在
+ * "no such column: project_id"，服务端起不来且不知道为什么。
+ *
+ * 做法：老行读进内存 → 丢掉老表（schema.sql 随后按最新定义重建）→ 建完回填，
+ * 顺手把 team_id 写成 project_id、members.project 写成 project_label。
+ * 全程 foreign_keys=OFF（连默认值就是这样），免得 DROP 时级联把 agent_status / 历史一起带走。
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @returns {Record<string, any[]> | null} 需要回填的老行；null = 这个库不用迁
+ */
+function migrateLegacyTeamSchema(db) {
+  // 判据只看「还有表挂着 team_id」：teams 表本身允许留着（里面是历史工程），
+  // 只看它会导致每次启动都误判成待迁移、白备份一遍库。
+  const legacyTables = LEGACY_TEAM_TABLES.filter((t) => hasColumn(db, t, 'team_id'));
+  if (!legacyTables.length) return null;
+
+  // teams 就是当年的 projects：抄过去，IGNORE 保证重复启动不会重写
+  if (tableExists(db, 'teams') && tableExists(db, 'projects')) {
+    db.exec(`
+      INSERT OR IGNORE INTO projects (id, name, workspace_path, main_conversation_id, source, created_at)
+      SELECT id, name, workspace_path, main_conversation_id, source, created_at FROM teams
+    `);
+  }
+
+  const snap = {};
+  for (const t of legacyTables) {
+    snap[t] = db.prepare(`SELECT * FROM ${t}`).all();
+    if (t === 'messages') {
+      // messages_fts 是 external content 虚表（content='messages'），必须跟着一起拆，
+      // 留给 schema.sql 重建；回填完再 rebuild 索引。
+      db.exec(`
+        DROP TRIGGER IF EXISTS messages_ai;
+        DROP TRIGGER IF EXISTS messages_ad;
+        DROP TRIGGER IF EXISTS messages_au;
+        DROP TABLE IF EXISTS messages_fts;
+      `);
+    }
+    db.exec(`DROP TABLE ${t}`);
+  }
+  return snap;
+}
+
+/**
+ * schema.sql 把表按最新定义建好之后，回填迁移前捞出来的老行。
+ * 落不进去的（引用了不存在的工程）跳过并计数 —— 宁可少几条历史，也不让 server 起不来。
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @param {Record<string, any[]> | null} snap
+ */
+function restoreLegacyRows(db, snap) {
+  if (!snap) return 0;
+  const known = new Set(db.prepare('SELECT id FROM projects').all().map((r) => r.id));
+  if (!known.size) return 0;
+  const now = Date.now();
+  let restored = 0;
+
+  const members = db.prepare(`
+    INSERT OR IGNORE INTO members
+      (id, project_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project_label, client)
+    VALUES
+      (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @projectLabel, @client)
+  `);
+  const tasks = db.prepare(`
+    INSERT OR IGNORE INTO tasks
+      (id, project_id, member_id, parent_task_id, title, state, progress, started_at, ended_at)
+    VALUES
+      (@id, @projectId, @memberId, @parentTaskId, @title, @state, @progress, @startedAt, @endedAt)
+  `);
+  const messages = db.prepare(`
+    INSERT OR IGNORE INTO messages
+      (dedupe_key, project_id, ts_ms, from_member, to_member, type, subject, content, task_id, session_id, source, raw_json, archived_at, content_truncated)
+    VALUES
+      (@dedupeKey, @projectId, @tsMs, @fromMember, @toMember, @type, @subject, @content, @taskId, NULL, @source, @rawJson, @archivedAt, @contentTruncated)
+  `);
+  const events = db.prepare(
+    `INSERT OR IGNORE INTO events (project_id, ts_ms, kind, payload_json) VALUES (@projectId, @tsMs, @kind, @payloadJson)`
+  );
+
+  const put = (fn, row) => {
+    try {
+      fn(row);
+      restored += 1;
+    } catch {
+      /* 单行失败不影响其余：历史数据少一条，好过服务起不来 */
+    }
+  };
+
+  for (const r of snap.members || []) {
+    if (!known.has(r.team_id)) continue;
+    put(members.run.bind(members), {
+      id: r.id,
+      projectId: r.team_id,
+      name: r.name,
+      role: r.role ?? null,
+      sessionId: r.session_id ?? null,
+      reported: r.reported ?? 0,
+      createdAt: r.created_at ?? now,
+      lastSeenAt: r.last_seen_at ?? null,
+      ephemeral: r.ephemeral ?? 0,
+      // 老库的 members.project（临时成员所属项目名）改名叫 project_label 了
+      projectLabel: r.project ?? null,
+      client: null,
+    });
+  }
+  for (const r of snap.tasks || []) {
+    if (!known.has(r.team_id)) continue;
+    put(tasks.run.bind(tasks), {
+      id: r.id,
+      projectId: r.team_id,
+      memberId: r.member_id,
+      parentTaskId: r.parent_task_id ?? null,
+      title: r.title,
+      state: r.state,
+      progress: r.progress ?? null,
+      startedAt: r.started_at ?? null,
+      endedAt: r.ended_at ?? null,
+    });
+  }
+  for (const r of snap.messages || []) {
+    if (!known.has(r.team_id)) continue;
+    put(messages.run.bind(messages), {
+      dedupeKey: r.dedupe_key ?? null,
+      projectId: r.team_id,
+      tsMs: r.ts_ms,
+      fromMember: r.from_member,
+      toMember: r.to_member ?? null,
+      type: r.type,
+      subject: r.subject ?? null,
+      content: r.content ?? null,
+      taskId: r.task_id ?? null,
+      source: r.source ?? 'report',
+      rawJson: r.raw_json ?? null,
+      archivedAt: r.archived_at ?? null,
+      contentTruncated: r.content_truncated ?? 0,
+    });
+  }
+  for (const r of snap.events || []) {
+    if (!known.has(r.team_id)) continue;
+    put(events.run.bind(events), {
+      projectId: r.team_id,
+      tsMs: r.ts_ms,
+      kind: r.kind,
+      payloadJson: r.payload_json ?? null,
+    });
+  }
+
+  if (snap.messages && snap.messages.length) {
+    try {
+      db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
+    } catch {
+      /* FTS 重建失败不影响主流程：搜索退化为不可用，历史消息照常可读 */
+    }
+  }
+  return restored;
+}
+
 function applyPragmas(db) {
   db.pragma('journal_mode = WAL');
   db.pragma('secure_delete = ON');
@@ -114,9 +302,23 @@ function openDatabase(dbPath) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
 
   const db = new Database(dbPath);
+
+  // team 时代的老库先迁到 project 时代 —— 必须早于 applyPragmas（foreign_keys=ON）与 schema，
+  // 否则 exec(schema.sql) 里那几条 (project_id, ...) 索引会直接 "no such column" 把启动掐死。
+  db.pragma('foreign_keys = OFF');
+  const legacy = migrateLegacyTeamSchema(db);
+  if (legacy) {
+    const backup = backupLegacyDatabase(db, dbPath);
+    console.warn(
+      `[workgremlin] 检测到 team 时代的老库，已迁移到 project 时代${backup ? `（备份：${backup}）` : ''}`
+    );
+  }
+
   applyPragmas(db);
   db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
   migrate(db);
+  const restored = restoreLegacyRows(db, legacy);
+  if (restored) console.warn(`[workgremlin] 老库迁移完成，回填 ${restored} 行历史数据`);
 
   chmod600(dbPath);
   chmod600(`${dbPath}-wal`);
