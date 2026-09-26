@@ -31,6 +31,7 @@
     "test:floors": "node server/test/mergedFloors.test.js",
     "test:kilo": "node server/test/kiloFloor.test.js",
     "test:opencode": "node server/test/opencodeFloor.test.js",
+    "test:done-shape": "node server/test/doneShape.test.js",
     "test:task-filter": "node server/test/taskFilter.test.js",
     "test:claude-model": "node server/test/claudeModel.test.js"
   },

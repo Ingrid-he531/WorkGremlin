@@ -10,6 +10,34 @@ const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('.
 const { clientBase } = require('@workgremlin/shared');
 
 /**
+ * 完成标记统一成 **reporter 形状**（`{ at, title, fileCount, files, sessionId }`）。
+ *
+ * 为什么必须转译：各产品的读取器（`kilo.js` / `opencode.js` 的 `read*Done`）返回的是
+ * **会话表**形状 `{ doneAt, doneTitle, doneCount, doneFiles }`（那是 `sessionRegistry`
+ * 铺会话行时展开用的），而渲染层读**快轮询**那份完成标记用的是 `fpDone.at` 与
+ * `fpDone.sessionId`（见 `IsoOfficeView.vue` 的 `fastDoneAt` / `sameSession`）。
+ * 两套字段名对不上：把会话表形状原样塞进响应，`fpDone.at` 恒为 undefined ——
+ * 快轮询那份「任务完成」就永远不触发（会话表那份还在，所以现象是"切楼层/等 10 秒才亮"，
+ * 很容易被误当成偶发）。本函数是这两套形状之间唯一的转换点。
+ *
+ * @param {{doneAt?:number,doneTitle?:string,doneCount?:number,doneFiles?:Array}|null} done
+ * @param {string} sessionId 这份标记属于哪条会话（渲染层按它精确比对，不串味）
+ * @param {string} [workspacePath]
+ * @returns {{at:number,title:string,fileCount:number,files:Array,sessionId:string,workspacePath:string}|null}
+ */
+function toReporterDone(done, sessionId, workspacePath = '') {
+  if (!done || !done.doneAt) return null;
+  return {
+    at: Number(done.doneAt) || 0,
+    title: done.doneTitle || '',
+    fileCount: Number(done.doneCount) || 0,
+    files: Array.isArray(done.doneFiles) ? done.doneFiles : [],
+    sessionId: String(sessionId || ''),
+    workspacePath,
+  };
+}
+
+/**
  * 会话：全局活跃会话表（按楼层分组）。
  * 数据源是各智能体自己的落盘，跟当前打开的工程无关 —— 换工程的入口在
  * /api/v1/workspace，这里只负责"列出 / 选中哪个会话"。
@@ -48,14 +76,16 @@ function createSessionsRouter({ workspace }) {
     // 它自己的库取。形态与下面完全一致，渲染层分不出也不需要分。
     if (clientBase(client) === 'kilo') {
       const rp = kiloMainPhase(ws || cur.workspacePath || '', session);
-      const done = readKiloDone(session || (rp && rp.sessionId) || '');
+      const sid = String(session || (rp && rp.sessionId) || '');
       return res.json({
         ok: true,
         workspacePath: ws || cur.workspacePath || '',
         instrumented: Boolean(session ? kiloInstrumented(session) : kiloInstrumented(rp && rp.sessionId)),
-        session: session || (rp && rp.sessionId) || '',
-        sessionId: session || (rp && rp.sessionId) || '',
-        done: done && done.doneAt ? done : null,
+        session: sid,
+        sessionId: sid,
+        // 走 toReporterDone：readKiloDone 给的是**会话表**形状，渲染层快轮询读的是
+        // fpDone.at / fpDone.sessionId —— 不转译的话这份「任务完成」永远不触发
+        done: toReporterDone(readKiloDone(sid), sid, ws || cur.workspacePath || ''),
         ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
       });
     }
@@ -81,28 +111,12 @@ function createSessionsRouter({ workspace }) {
       const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
 
       // 完成标记同理：插件那份带**改动文件清单**（实测 session.step.ended 事件的 data.files），
-      // 轮询那份只有一个计数 —— 有就优先用插件的。
-      //
-      // **两边的形状必须统一成 reporter 那种**（{ at, title, fileCount, files, sessionId }）：
-      // 渲染层读快轮询的完成标记用的是 `fpDone.at` 与 `fpDone.sessionId`
-      // （见 IsoOfficeView 的 fastDoneAt / sameSession），不是会话表那套 doneAt/doneTitle。
-      // 把 opencode.js 的 { doneAt, doneTitle, doneCount, doneFiles } 原样塞进来会让
-      // `fpDone.at` 恒为 undefined —— 快轮询那份完成标记永远不触发。
+      // 轮询那份只有一个计数 —— 有就优先用插件的。两边都经 toReporterDone 归到同一形状
+      // （插件那份本来就已经是 reporter 形状，转译是幂等的）。
       const doneTruth = readReporterDone(ws, client, phaseSessionId);
-      let done = doneTruth && doneTruth.at ? doneTruth : null;
-      if (!done && phaseSessionId) {
-        const poll = readOpencodeDone(phaseSessionId, { title: '', fileCount: 0 });
-        if (poll && poll.doneAt) {
-          done = {
-            at: poll.doneAt,
-            title: poll.doneTitle || '',
-            fileCount: poll.doneCount || 0,
-            files: poll.doneFiles || [],
-            sessionId: phaseSessionId,
-            workspacePath: fallbackWs,
-          };
-        }
-      }
+      const done = doneTruth && doneTruth.at
+        ? doneTruth
+        : toReporterDone(phaseSessionId ? readOpencodeDone(phaseSessionId, { title: '', fileCount: 0 }) : null, phaseSessionId, fallbackWs);
       // "接上了没有"：装了插件（状态文件在）**或**这条会话在库里 —— 两者任一即为真。
       // 渲染层靠它区分"这个产品根本没在跑"与"在跑但此刻没动作"。
       const instrumented = Boolean(metaTruth.instrumented || opencodeInstrumented(phaseSessionId));
