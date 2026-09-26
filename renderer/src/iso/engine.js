@@ -174,7 +174,7 @@ function makeWallText(text) {
 /**
  * @param {HTMLCanvasElement} canvas
  * @param {{onSelect?: (id: string) => void, floor?: string}} [opts]
- *   floor：当前楼层 id（如 '3F' / '4F' / '7F'）。用于挑这一层的材质配色（见 officeMap 的 colorsFor），
+ *   floor：当前楼层 id（如 '1F' / '3F' / '6F'）。用于挑这一层的材质配色（见 officeMap 的 colorsFor），
  *   之后可在运行时用 setFloor() 切换。
  */
 export function createIsoOffice(canvas, opts = {}) {
@@ -1454,7 +1454,7 @@ export function createIsoOffice(canvas, opts = {}) {
    * 44r·√1.5（长轴，沿屏幕 60°）与 44r·√0.5（短轴，沿 −30°），
    * 直接喂给 ctx.ellipse 的 rotation 即可。
    *
-   * 纸色与墨色取自本层配色（colors.note / colors.noteInk）：3F 是便签黄，4F 是冷紫罗兰，
+   * 纸色与墨色取自本层配色（colors.note / colors.noteInk）：基准层（1F/2F）是便签黄，3F 是冷紫罗兰，
    * 换层时随 applyFloor() 一起变 —— 便签是静态家具，会被重建进 statics。
    */
   function drawDividerNote(c, p, note) {

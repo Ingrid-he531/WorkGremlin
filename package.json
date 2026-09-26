@@ -28,6 +28,8 @@
     "hooks:uninstall": "node scripts/install-hooks.js --uninstall",
     "test:elevator": "node renderer/test/elevator.t3.test.mjs",
     "test:done": "node server/test/doneAttribution.test.js",
+    "test:codebuddy": "node server/test/codebuddyFloor.test.js",
+    "test:task-filter": "node server/test/taskFilter.test.js",
     "test:claude-model": "node server/test/claudeModel.test.js"
   },
   "devDependencies": {

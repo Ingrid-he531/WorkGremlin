@@ -6,12 +6,14 @@
  * 一张表管所有智能体（楼层）在所有工程里开着的会话，跟当前打开哪个工程无关。
  * 表里每条记录 = 一个会话，按**楼层**（受监控产品）分组，超时就剔除：
  *
- *   3F CodeBuddy Plugin —— 结构化落盘（genie-history / todos / message-queue / file-changes），
- *                        拿得到运行态、待办清单、改动文件（见 sessions.js）
- *   1F CodeBuddy CLI、
+ *   1F CodeBuddy —— **合并楼层**：CLI 与 Plugin 是同一产品的两种形态，合成一层。
+ *                        插件那路是结构化落盘（genie-history / todos / message-queue /
+ *                        file-changes），拿得到运行态、待办清单、改动文件（见 sessions.js）；
+ *                        CLI 那路是 ~/.codebuddy 的会话 jsonl + reporter 状态文件。
+ *                        两路同时有会话 = 这一层里的两条会话（按 session_id 区分），不是两层。
  *   2F WorkBuddy CLI、
- *   4F Codex CLI、
- *   5F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
+ *   3F Codex CLI、
+ *   4F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
  *                        工程名从文件**头部若干行**里找 cwd，读不到就留空（不猜）。
  *                        注意不是"首行"：Claude 的首行是 mode / queue-operation 这类
  *                        元记录，压根没有 cwd，cwd 从第 3 行的 user 记录才有（见 cwdOfHead）
@@ -79,7 +81,7 @@ function cwdOfLine(line) {
  * 为什么不能只看第一行：**Claude Code 的首行不是对话内容**。实测它的 transcript 开头是
  * `{"type":"queue-operation",...}`（新版）或 `{"type":"mode",...}`（旧版），两样都不带 `cwd`；
  * `cwd` 从第 3 行的 `user` / `attachment` 记录才开始有（顶层字段）。
- * 老实现只读第一行，于是 5F **每一条**会话的工程都是空 —— 一个空值同时引出三个症状：
+ * 老实现只读第一行，于是 4F **每一条**会话的工程都是空 —— 一个空值同时引出三个症状：
  * 下拉显示「未知工程」、`mine` 永远 false、连实时相位都叠不上去（渲染层要 `projectPath`
  * 非空才肯用快轮询，见 IsoOfficeView 的 canUseFast）→ 主控制台一直挂在「未上报」。
  *
@@ -167,7 +169,7 @@ function isDir(p) {
  *     早先这里写的是"形状不同，不猜，留空"，其实是**取法不同**：直接去扩展名拿到的是
  *     `rollout-…-<id>` 整串。本机实测 3/3，尾段 uuid 与 hooks 状态文件里的 session_id
  *     一字不差（rollout-2026-09-26T11-15-56-01a0dbb6-…  ==  codex__…_01a0dbb6-….json）。
- *     取到 id 的收益是让 4F 的"完成"从"该工程最新"变成按会话精确（见 doneFieldsOf），
+ *     取到 id 的收益是让 3F 的"完成"从"该工程最新"变成按会话精确（见 doneFieldsOf），
  *     渲染层的快轮询也会开始带 ?session=（相位同样受益）。
  *     失败是安全的：形状对不上就回空串 → 退回老行为，不会张冠李戴。
  *   - 其余产品（CodeBuddy / WorkBuddy CLI）：文件名不含会话 id，留空。
@@ -286,13 +288,14 @@ const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [] };
  * 只能退回 (工程+client) 的 latest** —— 同层跑多条会话时，后者仍可能把"别人刚收工"
  * 算到当前这条头上。这是已知残留，不是本次回归。
  * 现在拿得到 id 的是：Claude CLI（文件名）、Codex（rollout 文件名，见 sessionIdOfFile）、
- * 7F hookSource（listReporterSessions 本来就只列得出有 sessionId 的）。剩下 1F / 2F 两个
- * CLI 楼层的文件名不含 id；plugin 楼层（3F/6F）的会话行不带 sessionId（且它们的 doneAt
- * 另走 sessions.js 的 sessionInfo，不经过本函数）。
+ * 6F hookSource（listReporterSessions 本来就只列得出有 sessionId 的）、以及 1F CodeBuddy 的
+ * hook 那一路。剩下 1F（CLI 的 jsonl）/ 2F 两个 CLI 楼层的文件名不含 id，退回该工程内的 latest；
+ * plugin 那一路的会话行现在也带 sessionId 了，但它们的 doneAt 另走 sessions.js 的 sessionInfo，
+ * 不经过本函数。
  *
  * 文件清单只有路径：hook 不做 diff，没有 +/- 行数（那是 plugin 落盘的 file-changes 才有的）。
  * @param {string} projectPath 会话所属工程（读状态文件时按它过滤）；**可能为空**，见下面的守卫
- * @param {string} client 客户端身份（楼层 dataKind，如 codex / trae）
+ * @param {string} client 客户端身份（**这一路来源**的 client，如 codex / trae / codebuddy）
  * @param {string} sessionId 会话 id；拿不到才退回"该（工程 + client）最新的一份"
  */
 function doneFieldsOf(projectPath, client, sessionId = '') {
@@ -303,9 +306,9 @@ function doneFieldsOf(projectPath, client, sessionId = '') {
    *
    * 但只砍**兜底**这一支，**不砍有会话 id 的精确命中**（两者安全性不同：id 唯一，精确命中
    * 与工程无关）。一刀砍掉会误伤两条真实路径：
-   *   · 7F TraeCode IDE（hookSource）—— 会话一 Stop，hook 就把 sessionPhase 与
+   *   · 6F TraeCode IDE（hookSource）—— 会话一 Stop，hook 就把 sessionPhase 与
    *     taskWorkspacePath 一起清空（实测 sessionPhase:null、taskWorkspacePath:""），于是
-   *     "有完成标记"与"工程归属非空"按构造互斥：守卫一开，7F 的「任务完成」永远不亮，
+   *     "有完成标记"与"工程归属非空"按构造互斥：守卫一开，6F 的「任务完成」永远不亮，
    *     反而要等下一轮开工、工程回来了才突然亮起上一轮的完成（假弹）。
    *   · Claude 会话的 cwd 没解析出来时工程也是空，但它有会话 id，精确命中照样是对的。
    * 反过来，没有会话 id 的（1F/2F）行为不变：仍返回空标记（合"绝不编造"纪律）。
@@ -342,109 +345,145 @@ function refresh({ workspacePath = '', force = false } = {}) {
   if (!force && lastScanAt && now - lastScanAt < TTL) return;
   doneScans = new Map();
 
-  // 插件楼层：每个 plugin 楼层各自读自己的落盘（client 不同，不能混）。
-  // 以前这里写死 3F + 全局 PLUGIN_CLIENT（已删除）；现在遍历所有 plugin 楼层，
-  // 6F TraeCode-Plugin 因此也有会话来源，未来加 Codex-Plugin 同理（只改 products.js）。
+  /**
+   * 会话来源：每个楼层按自己的 sources 逐路取 —— 普通楼层一路，合并楼层多路
+   * （1F CodeBuddy = CLI 落盘 + 插件结构化落盘 + reporter 状态文件，见 products.js 的 sources）。
+   *
+   * 每一路都带上**这一路自己的 client**：插件那路是 codebuddy-plugin，CLI / hook 那路是 codebuddy。
+   * 于是每条会话的相位、完成标记、活跃窗口都只认自己那一路的落盘 ——
+   * 同一个产品同时开着 CLI 与 Plugin 时，两条会话各显示各的，不会互相串味。
+   *
+   * 两种来源之间有个例外（见下面的 cli 分支）：CLI 的会话 jsonl 与 reporter 状态文件
+   * 说的是同一批会话，但 jsonl 那条路拿不到会话 id —— 两路一起列，同一条会话会显示成两条。
+   * 所以**jsonl 优先**：只要这一层的 CLI 落盘扫到了会话，hook 那一路整层跳过；
+   * 一条都没扫到（CodeBuddy CLI 的常见形态：只留 hook 状态文件）才用状态文件兜底。
+   */
   const products = detectProducts({});
-  for (const p of products) {
-    if (p.kind !== 'plugin') continue;
-    const st = listSessions({ workspacePath, force, client: p.dataKind, pluginRe: p.pluginRe });
-    if (!st.sessions || !st.sessions.length) continue;
-    for (const s of st.sessions) {
-      upsert({
-        floor: p.id,
-        id: s.id,
-        source: 'plugin',
-        project: s.project || '',
-        projectPath: s.projectPath || '',
-        mine: Boolean(s.mine),
-        current: Boolean(s.current),
-        // 该层全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
-        // 只有它才配叠加实时相位，其余 current=true 的工程当前会话只用自己工程的上报，
-        // 绝不借别人的相位冒充（否则切回旧会话会误显别的工程的"调用工具"）。
-        fresh: s.id === st.current,
-        live: Boolean(s.live),
-        runtime: s.runtime,
-        pending: s.pending || 0,
-        todos: s.todos,
-        files: s.files,
-        phase: s.phase,
-        action: s.action,
-        target: s.target || '',
-        tool: s.tool || '',
-        context: s.context || [],
-        prompt: s.prompt || '',
-        // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
-        doneAt: s.doneAt || 0,
-        doneTitle: s.doneTitle || '',
-        doneCount: s.doneCount || 0,
-        doneFiles: s.doneFiles || [],
-        // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
-        // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
-        inferred: Boolean(s.inferred),
-        lastEventAt: s.lastUpdated || 0,
-      });
-    }
-  }
+  const seen = new Set();
+  /** 这一层的 CLI 落盘到底扫出会话没有（决定 hook 那一路要不要兜底，见上面的说明） */
+  const cliLandingSeen = new Set();
+  const claim = (floor, sessionId) => {
+    if (!sessionId) return true;
+    const k = `${floor}:${sessionId}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  };
 
-  // 1F / 2F / 4F / 5F CLI：落盘目录里的 jsonl
   for (const p of products) {
-    if (p.kind !== 'cli' || p.hookSource) continue;
-    for (const s of scanCliSessions(p.dataPath, { kind: p.agent })) {
-      const lastEventAt = s.lastEventAt;
-      upsert({
-        floor: p.id,
-        id: s.id,
-        // 轴 2：会话 id（`~/.claude/projects/<slug>/<session_id>.jsonl` 的文件名）。
-        // 渲染层拿它去问 `/api/v1/reporter-phase?session=`，就能只取这条会话的实时相位，
-        // 不再"同一个 client 里谁最新就显示谁"。Codex 拿不到（形状不同）→ 空串，退回旧行为。
-        sessionId: s.sessionId || '',
-        source: 'cli',
-        project: s.project,
-        projectPath: s.projectPath,
-        mine: Boolean(workspacePath && s.projectPath === path.resolve(workspacePath)),
-        current: false,
-        // CLI 落盘里没有运行态，只有文件时间。**不许编造**（项目铁律）：
-        // 以前这里写 phase:'tool' + action:'改 xxx.jsonl'，主控制台就会一直显示
-        // 「调用工具 · 改 rollout-….jsonl」——那不是观测到的动作，是拿会话文件名冒充的。
-        // 现在老实报 phase:'unreported'（未上报），只把"文件多久前动过"写进 context。
-        live: true,
-        phase: 'unreported',
-        action: '',
-        context: [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`],
-        inferred: true,
-        ...doneFieldsOf(s.projectPath, p.dataKind, s.sessionId || ''),
-        lastEventAt,
-      });
-    }
-  }
+    for (const src of p.sources) {
+      // ---- 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）----
+      if (src.kind === 'plugin') {
+        const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
+        if (!st.sessions || !st.sessions.length) continue;
+        for (const s of st.sessions) {
+          // 轴 2：插件的会话 id 就是 hook payload 的 session_id（实测 genie-history 的
+          // conversationId 与状态文件里的 sessionId 一字不差）。带上它，同一层里多条会话
+          // （CLI + Plugin 同时跑）才能各取各的实时相位 / 完成标记，不"谁最新显示谁"。
+          if (!claim(p.id, s.id)) continue;
+          upsert({
+            floor: p.id,
+            id: s.id,
+            sessionId: s.id,
+            source: 'plugin',
+            project: s.project || '',
+            projectPath: s.projectPath || '',
+            mine: Boolean(s.mine),
+            current: Boolean(s.current),
+            // 该层全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
+            // 只有它才配叠加实时相位，其余 current=true 的工程当前会话只用自己工程的上报，
+            // 绝不借别人的相位冒充（否则切回旧会话会误显别的工程的"调用工具"）。
+            fresh: s.id === st.current,
+            live: Boolean(s.live),
+            runtime: s.runtime,
+            pending: s.pending || 0,
+            todos: s.todos,
+            files: s.files,
+            phase: s.phase,
+            action: s.action,
+            target: s.target || '',
+            tool: s.tool || '',
+            context: s.context || [],
+            prompt: s.prompt || '',
+            // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
+            doneAt: s.doneAt || 0,
+            doneTitle: s.doneTitle || '',
+            doneCount: s.doneCount || 0,
+            doneFiles: s.doneFiles || [],
+            // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
+            // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
+            inferred: Boolean(s.inferred),
+            lastEventAt: s.lastUpdated || 0,
+          });
+        }
+        continue;
+      }
 
-  // 只认 hook 的楼层（7F TraeCode IDE）：没有可扫的会话落盘，会话来源就是 reporter
-  // 状态文件本身 —— sessionId 与工程路径都是 hook payload 的实测值（见 listReporterSessions）。
-  for (const p of products) {
-    if (!p.hookSource) continue;
-    for (const s of listReporterSessions(p.dataKind)) {
-      upsert({
-        floor: p.id,
-        id: s.sessionId,
-        sessionId: s.sessionId,
-        // 按 CLI 楼层对待：渲染层正是靠 `source === 'cli'` + 非空 projectPath 才肯叠加
-        // hook 上报的实时相位（见 IsoOfficeView 的 canUseFast）。
-        source: 'cli',
-        project: s.workspacePath ? resolveProjectName(s.workspacePath) || path.basename(s.workspacePath) : '',
-        projectPath: s.workspacePath,
-        mine: Boolean(workspacePath && s.workspacePath && path.resolve(s.workspacePath) === path.resolve(workspacePath)),
-        current: false,
-        live: true,
-        // 相位不在这里造：实时相位由 /reporter-phase 快轮询单独拉（1.5s），
-        // 这里只报"未上报"，让渲染层在没有相位时老实显示「待命」。
-        phase: 'unreported',
-        action: '',
-        context: [],
-        inferred: true,
-        ...doneFieldsOf(s.workspacePath, p.dataKind, s.sessionId),
-        lastEventAt: s.lastEventAt,
-      });
+      // ---- hook 那一路：由 reporter 状态文件构成会话表 ----
+      // 两个用途：① 6F TraeCode IDE 压根没有可扫的会话落盘，它是唯一来源；
+      // ② 1F CodeBuddy CLI 的兜底 —— CLI 常常只留 hook 状态文件。
+      // 但只要有 jsonl 可扫就不走这条（同一条会话两路都看得到时，只有 jsonl 那路拿不到
+      // 会话 id，混着列会把一条会话显示成两条，见上面 refresh 的说明）。
+      if (src.kind === 'hook') {
+        if (cliLandingSeen.has(p.id)) continue;
+      }
+
+      // 两路产出的会话行同构（都只有文件时间 / 心跳时间，没有运行态）：
+      // jsonl 路给出 projectPath（从文件头部的 cwd 解析，读不到就空）；
+      // hook 路给出 workspacePath（hook payload 实测值）。
+      const rows =
+        src.kind === 'cli'
+          ? scanCliSessions(src.dataPath, { kind: p.agent })
+          : listReporterSessions(src.client).map((s) => ({
+              id: s.sessionId,
+              sessionId: s.sessionId,
+              project: s.workspacePath ? resolveProjectName(s.workspacePath) || path.basename(s.workspacePath) : '',
+              projectPath: s.workspacePath,
+              lastEventAt: s.lastEventAt,
+            }));
+      if (rows.length) {
+        cliLandingSeen.add(p.id);
+        // 这一层以前可能正靠 hook 兜底列会话（见上面那段说明）：CLI 落盘现在有会话了，
+        // 就把那些 hook 行撤掉 —— 表按 `楼层:id` 存，一条会话的两路 id 不同，不会自动重合，
+        // 不撤就会同一会话挂两行（一行 hook、一行 jsonl）。
+        for (const [k, v] of table) if (v.floor === p.id && v.sourceKind === 'hook') table.delete(k);
+      }
+
+      for (const s of rows) {
+        const sessionId = s.sessionId || '';
+        if (!claim(p.id, sessionId)) continue;
+        const lastEventAt = s.lastEventAt;
+        upsert({
+          floor: p.id,
+          id: s.id,
+          // 轴 2：会话 id —— Claude 取 transcript 文件名、Codex 取 rollout 文件名的尾段、
+          // TraeCode IDE / CodeBuddy CLI 的 hook 那一路取状态文件里的 sessionId。
+          // 渲染层拿它去问 `/api/v1/reporter-phase?session=`，就能只取这条会话的实时相位，
+          // 不再"同一个 client 里谁最新就显示谁"。取不到（CodeBuddy CLI 的 jsonl 文件名不含 id）
+          // → 空串，退回旧行为。
+          sessionId,
+          source: 'cli',
+          /** 这一行具体来自哪一路（cli / hook）：让"jsonl 优先"规则能撤掉旧的 hook 行 */
+          sourceKind: src.kind,
+          project: s.project,
+          projectPath: s.projectPath,
+          mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
+          current: false,
+          live: true,
+          // 相位不在这里造（项目铁律：绝不编造）：实时相位由 /reporter-phase 快轮询单独拉，
+          // 这里老实报 phase:'unreported'（未上报），让渲染层在没有相位时显示「待命」。
+          // CLI 落盘只有文件时间，于是把"文件多久前动过"写进 context —— 那是观测到的事实。
+          phase: 'unreported',
+          action: '',
+          context:
+            src.kind === 'cli' ? [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`] : [],
+          inferred: true,
+          // 完成标记只认**这一路自己的 client**（CLI 那路 codebuddy、插件那路 codebuddy-plugin）：
+          // 拿整层的 client 列表去查会把另一路刚收的工搬到这条头上（同工程、无会话 id 时尤其）。
+          ...doneFieldsOf(s.projectPath, src.client, sessionId),
+          lastEventAt,
+        });
+      }
     }
   }
 
@@ -476,12 +515,24 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       name: p.name,
       kind: p.kind,
       // 这一层监控的是哪个客户端（codebuddy / workbuddy / codex / claude）——
-      // 办公室按它过滤成员，切到 4F 就不该再看见 CodeBuddy 的小怪物
+      // 办公室按它过滤成员，切到 3F 就不该再看见 CodeBuddy 的小怪物
+      // （成员过滤按 **基名** 认：1F 的 codebuddy 也收 codebuddy-plugin 的小怪物，
+      //  见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）
       client: p.dataKind || '',
+      // 这一层接纳的全部客户端（合并楼层多个，如 1F = codebuddy + codebuddy-plugin）：
+      // 前端按它过滤实时相位（/reporter-phase?client=a,b）与任务记录里的楼层归属
+      clients: p.clients && p.clients.length ? p.clients : p.dataKind ? [p.dataKind] : [],
       installed: Boolean(p.installed),
       installPathLabel: p.installPathLabel || '',
       dataPathLabel: p.dataPathLabel || '',
       stats: p.stats || null,
+      // 落盘来源（合并楼层多路，含每路的落盘目录与统计）—— 楼层悬浮提示按它逐路显示
+      sources: (p.sources || []).map((s) => ({
+        kind: s.kind,
+        client: s.client,
+        dataPathLabel: s.dataPathLabel || '',
+        stats: s.stats || null,
+      })),
       /** 这一层有几个活跃会话 —— 左侧状态点绿/灰就看它 */
       activeCount: sessions.length,
       sessions,

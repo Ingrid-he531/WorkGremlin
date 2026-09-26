@@ -85,9 +85,22 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * 当前楼层对应的客户端：1F=codebuddy(CLI)、3F=codebuddy-plugin、2F=workbuddy、
-     * 4F=codex、5F=claude、6F=trae-plugin。plugin（VS Code 系扩展）统一带 -plugin 后缀。
-     * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）。
+     * 当前楼层接纳的**全部**客户端：1F=codebuddy + codebuddy-plugin（CLI 与 Plugin 合并成一层）、
+     * 2F=workbuddy、3F=codex、4F=claude、5F=trae-plugin、6F=trae。
+     * 单层就一个，合并楼层两个 —— /reporter-phase 收逗号分隔的一串（见 server 的 clientHit）。
+     */
+    selectedClients: (s) => {
+      const f = s.floors.find((x) => x.id === s.selectedFloor);
+      if (!f) return [];
+      if (Array.isArray(f.clients) && f.clients.length) return f.clients;
+      return f.client ? [f.client] : [];
+    },
+
+    /**
+     * 当前楼层的**主**客户端（= clients[0]）：1F=codebuddy、2F=workbuddy、3F=codex、
+     * 4F=claude、5F=trae-plugin、6F=trae。plugin（VS Code 系扩展）统一带 -plugin 后缀。
+     * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）——
+     * 过滤按**基名**认，所以 1F 的主 client=codebuddy 也收 codebuddy-plugin 的成员。
      */
     selectedClient: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);

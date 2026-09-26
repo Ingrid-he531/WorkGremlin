@@ -47,7 +47,8 @@ async function startPhasePoll() {
   const tick = async () => {
     try {
       // 带上当前楼层的客户端：同一工程里 Codex 与 CodeBuddy 同时在跑时，各取各的相位
-      const want = sessions.selectedClient;
+      // 合并楼层（1F CodeBuddy = CLI + Plugin）会带一串（逗号分隔），服务端任一路命中即算本层
+      const want = sessions.selectedClients.join(',');
       const params = [];
       if (want) params.push(`client=${encodeURIComponent(want)}`);
       // 再带上选中会话的会话 id（轴 2）：同一个 client 下可以同时开多条会话
@@ -223,9 +224,9 @@ const consoleBase = computed(() => {
   // 的相对路径），子串匹配既可能漏判也可能误判。现在两边都有真会话 id 就直接相等判定。
   // 任何一边拿不到会话 id（Codex 的 rollout 文件名不含 session_id、老状态文件）→ 宽松放行，维持老行为。
   const sameSession = Boolean(fp) && (!fp.sessionId || !selSessionId || fp.sessionId === selSessionId);
-  // `fresh` 只有 3F 插件会话会设（= 全局唯一"正在敲"的那条）。CLI 楼层（1F/2F/4F/5F）没这个标记，
+  // `fresh` 只有插件那一路的会话会设（= 全局唯一"正在敲"的那条）。CLI 楼层（1F/2F/3F/4F）没这个标记，
   // 但同样有 hook 上报的相位 —— 只要"相位所属工程 == 这条会话的工程"就该用它；
-  // 否则 4F 永远只能显示会话表里"按 jsonl 文件时间猜"的兜底：一直「调用工具」+ 文案是那个 rollout 文件名。
+  // 否则 3F 永远只能显示会话表里"按 jsonl 文件时间猜"的兜底：一直「调用工具」+ 文案是那个 rollout 文件名。
   const canUseFast = Boolean(sel.fresh) || (sel.source === 'cli' && Boolean(sel.projectPath));
   if (canUseFast && sameWs && sameSession && fp.phase) {
     if (fp.phase === 'await') {
@@ -320,7 +321,7 @@ const PAGE_OPEN_AT = Date.now();
  * 为什么不能用页面打开那一刻的常量当尺子：切楼层时快轮询里装的还是**上一层**的数据
  * （1.5s 才刷一次），所以"首次见到新楼层的完成标记"必然发生在切换之后，而那个标记
  * 通常晚于页面打开 —— 拿打开时刻去量，必然判成"刚发生的新 Stop"。
- * 现象：3F 切 4F 一进去就弹「任务完成」，几秒后回「待命中」，每次切都复现。
+ * 现象：1F 切 3F 一进去就弹「任务完成」，几秒后回「待命中」，每次切都复现。
  */
 let trackSince = PAGE_OPEN_AT;
 watch(
@@ -343,7 +344,7 @@ watch(
     // 两条纪律（都是踩过的坑）：
     //   ① 它是"某条会话上一轮结束"的**持久状态**，不是一次性事件 —— 页面刚打开 / 刚切楼层时
     //      首次拿到它只能当基线，否则会把上一次的完成摘要当成刚发生的事重播一遍
-    //      （现象：一开 4F 就弹「任务完成」，10 秒后才回待命）；
+    //      （现象：一开 3F 就弹「任务完成」，10 秒后才回待命）；
     //   ② 同一楼层可以同时开多条会话，所以它是按"工程 + 客户端 + 会话"存的，显示时是针对
     //      **选中的会话**，还要确认这份完成属于当前这条会话（会话 id 精确比对，同上）。
     const fpDone = fastPhase.value && fastPhase.value.done;
@@ -446,17 +447,17 @@ const sceneMembers = computed(() => {
    *     没有会话就不该存在（留着就是上一层的残影）。
    *   · **常驻小怪物要留**：用户级 / 工程级小怪物是写在 agents 目录里已定义的 subagent，
    *     由服务端 agentRoster 注册并持续心跳，"即使当下没被召唤也在" —— 跟这层有没有会话无关。
-   *     切过去看不见他们会让人以为这层压根没人（3F 没会话时用户级/工程级专家应照常在工位）。
+   *     切过去看不见他们会让人以为这层压根没人（1F 没会话时用户级/工程级专家应照常在工位）。
    */
   const emptyFloor = sessions.floorEmpty && !demo;
   const want = demo ? '' : sessions.selectedClient;
-  // 小怪物按 agent 基名归层：1F/3F 都是 codebuddy，所以两边都摆 CodeBuddy 的常住小怪物；
-  // codex / claude / trae 各自 CLI 与 plugin 两层也都要。floorAcceptsClient 内部剥 -plugin 后比基名。
+  // 小怪物按 agent 基名归层：CLI 与 plugin 两种形态同属一层（1F CodeBuddy 就是这么合并的），
+  // 所以常驻小怪物只要基名对得上就摆。floorAcceptsClient 内部剥 -plugin 后比基名。
   const live = demo || sessions.live;
   return project.members
     .filter((m) => m.role !== 'agent')
     .filter((m) => !(emptyFloor && isEphemeralMember(m))) // 空楼层：只留常驻的
-    // 按 agent 基名过滤来源：4F/7F 只看 Codex 的成员与幽灵，1F/3F 只看 CodeBuddy 的。
+    // 按 agent 基名过滤来源：3F 只看 Codex 的成员与幽灵，1F 只看 CodeBuddy 的。
     // client 为空的（演示数据、手工 scripts/subagents.js 写的、老库还没补上的）视作通用，哪层都显示。
     .filter((m) => floorAcceptsClient(want, m.client))
     .map((m) => ({

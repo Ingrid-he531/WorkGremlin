@@ -2,15 +2,22 @@
 
 /**
  * 楼层 = 受监控的产品源。
- *   1F  CodeBuddy CLI
+ *   1F  CodeBuddy（CLI 与 Plugin 合并：同一产品的两种形态，合成一层）
  *   2F  WorkBuddy CLI
- *   3F  CodeBuddy Plugin
- *   4F  Codex（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并单楼层）
- *   5F  Claude Code（CLI 与 IDE 同 ~/.claude、同 hook，分不出，合并单楼层）
- *   6F  TraeCode Plugin
- *   7F  TraeCode IDE
+ *   3F  Codex（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并单楼层）
+ *   4F  Claude Code（CLI 与 IDE 同 ~/.claude、同 hook，分不出，合并单楼层）
+ *   5F  TraeCode Plugin
+ *   6F  TraeCode IDE
  *
- * Claude Code **只有一层**（5F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、
+ * **CodeBuddy 只有一层**（1F）：CLI 与 Plugin 是同一个产品的两种形态 —— CLI 落 `~/.codebuddy`
+ * （会话 jsonl / hook 状态文件），Plugin 落编辑器的 globalStorage（genie-history / todos /
+ * message-queue / file-changes 这套结构化目录，见 server/src/sessions.js 的 listSessions）。
+ * 以前按"来源身份"把它硬拆成 1F CLI + 3F Plugin 两层，于是同一个产品在同一间办公室占两层，
+ * 而"到底有几个在跑"其实是**会话**的事。现在合成一层：这一层的 `sources` 把两处落盘都扫一遍、
+ * `clients` 照收 codebuddy 与 codebuddy-plugin 两种上报身份。同时开着 CLI 与 Plugin 时，
+ * 表现是**这一层里的两条会话**（靠 session_id 区分），不是两个楼层。
+ *
+ * Claude Code 同理只有一层（4F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、
  * 同一个落盘目录（~/.claude/projects），连二进制都是同一份 —— 事件 payload 里没有任何字段能
  * 区分二者（实测 2.1：不含 client，只有 session_id / cwd / transcript_path 这类共用字段）。
  * 既然"分不出"，就不该硬拆两层。
@@ -207,7 +214,7 @@ function globalStorageRoots() {
 /**
  * TraeCode 家族的 globalStorage（模型选择就记在它的 state.vscdb 里）。
  * 单列一份、不并进 globalStorageRoots：那份是**插件楼层的落盘位置**，
- * 一改就会把 6F 的落盘从 ~/.marscode 带偏到编辑器的 globalStorage 去。
+ * 一改就会把 5F 的落盘从 ~/.marscode 带偏到编辑器的 globalStorage 去。
  */
 function traeGlobalStorageRoots() {
   const out = [];
@@ -225,7 +232,7 @@ function traeGlobalStorageRoots() {
  *
  * 认 CLAUDE_CONFIG_DIR：**装 hook 的那一头（scripts/install-hooks.js）早就认了**，
  * 找落盘这一头以前写死 ~/.claude —— 设了这个变量的人，hooks 装到了新根下，
- * 服务端却还在老根下找会话，5F 于是永远扫不到东西。这个根只留这一处定义。
+ * 服务端却还在老根下找会话，4F 于是永远扫不到东西。这个根只留这一处定义。
  */
 function claudeHome() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
@@ -345,9 +352,9 @@ function findDataPath(kind, plugin) {
           ? [claudeHome()]
           : kind === 'trae'
             ? plugin
-              // 插件形态（6F TraeCode Plugin）：MarsCode 数据根，内置 trae 插件就装在
+              // 插件形态（5F TraeCode Plugin）：MarsCode 数据根，内置 trae 插件就装在
               // ~/.marscode/builtin/trae，落盘也在它下面。
-              // 命令形态（7F TraeCode IDE）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
+              // 命令形态（6F TraeCode IDE）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
               ? [path.join(HOME, '.marscode'), path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')]
               : [path.join(HOME, '.trae'), path.join(HOME, '.trae-cn')]
             : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
@@ -382,28 +389,39 @@ function findPluginDir(res = RE_PLUGIN) {
  * 楼层 = 受监控的产品源。
  * 每个楼层绑定一个 **agent 基名** + 是否 plugin；由此派生出它的 client（= 上报身份）：
  *   client = clientOf(agent, plugin)  →  agent 本身（CLI）或 agent + '-plugin'（Plugin）。
- * 约定：每个 agent 可有 CLI 与 Plugin 两个独立楼层（变体）。目前——
- *   - codebuddy：1F CLI / 3F Plugin
+ * 约定：每个 agent 正常情况下一个楼层；合并楼层（下面 sources 里挂了多路落盘）另说。目前——
+ *   - codebuddy：1F 一层（CLI + Plugin 合并，见文件头）
  *   - workbuddy：2F CLI（暂无 Plugin）
- *   - codex     ：4F（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并为单楼层）
- *   - claude    ：5F CLI（**只有这一层**，见文件头说明：plugin 与 CLI 同配置同 hook，分不出来）
- *   - trae      ：6F Plugin / 7F CLI
- * 要再加变体（例如给 workbuddy 加 Plugin，或新增某个 agent 的 CLI/Plugin），只需在这里加一条
- * { id, name, agent, plugin:true|false, pluginRe? } —— client、归层、过滤、会话来源全部自动跟着走。
+ *   - codex     ：3F（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并为单楼层）
+ *   - claude    ：4F CLI（**只有这一层**，见文件头说明：plugin 与 CLI 同配置同 hook，分不出来）
+ *   - trae      ：5F Plugin / 6F CLI
+ * 要再加楼层（或把某产品的两种形态合并），只需在这里加/改一条 —— client、归层、过滤、
+ * 会话来源、落盘扫描全部自动跟着走。
  *
  * 字段说明：
  *   - agent  产品基名（codebuddy / workbuddy / codex / claude / trae），落盘目录匹配用
- *   - dataKind  == client，下发给前端当"楼层客户端"（办公室按它过滤成员）；也当会话扫描形态
+ *   - dataKind  主 client，下发给前端当"楼层客户端"（办公室按它过滤成员）
  *   - pluginRe  插件目录名匹配（仅 plugin 楼层需要；CLI 楼层忽略）
+ *   - sources   这一层的**会话/落盘来源**，可多路（合并楼层）：'cli' | 'plugin' | 'hook'。
+ *               不写则按 kind / plugin / hookSource 推出一路（老行为）。
+ *               clients（这一层接纳的上报身份）由 sources 反推、去重，第一路是主身份。
  */
 const PRODUCTS = [
   {
     id: '1F',
-    name: 'CodeBuddy CLI',
+    name: 'CodeBuddy',
     kind: 'cli',
     cmd: 'codebuddy',
     agent: 'codebuddy',
     plugin: false,
+    pluginRe: RE_PLUGIN,
+    // 合并楼层（见文件头）：
+    //   cli    —— ~/.codebuddy 下的会话 jsonl（CLI 的历史落盘）
+    //   plugin —— 编辑器 globalStorage 里的结构化落盘（genie-history / todos / …）
+    //   hook   —— reporter 状态文件（CLI 常常没有可扫的会话落盘，状态文件里的 sessionId /
+    //             workspacePath 是 hook payload 实测值，是"它正在跑"的唯一真值）
+    // 三路都归这一层；同一会话被两路同时看到时按 session_id 去重（见 sessionRegistry）。
+    sources: ['cli', 'plugin', 'hook'],
     dataKind: clientOf('codebuddy', false),
   },
   {
@@ -417,22 +435,12 @@ const PRODUCTS = [
   },
   {
     id: '3F',
-    name: 'CodeBuddy Plugin',
-    kind: 'plugin',
-    cmd: '',
-    agent: 'codebuddy',
-    plugin: true,
-    pluginRe: RE_PLUGIN,
-    dataKind: clientOf('codebuddy', true),
-  },
-  {
-    id: '4F',
     name: 'Codex',
     kind: 'cli',
     cmd: 'codex',
     agent: 'codex',
     plugin: false,
-    // 4F 是「CLI 与 IDE 合并」楼层（文件头：二者同 ~/.codex、同 hook，分不出来）。
+    // 3F 是「CLI 与 IDE 合并」楼层（文件头：二者同 ~/.codex、同 hook，分不出来）。
     // 于是这层的"装了"不能只认 codex 可执行文件 —— 只装 VS Code 的 Codex/ChatGPT 扩展、
     // 或只用 ChatGPT 桌面版的人，命令行里根本没有 codex，但人家确实在跑（会话就是证据）。
     // altPluginRe：仅作安装证据补抓，不影响 kind / client / 会话来源。
@@ -440,7 +448,7 @@ const PRODUCTS = [
     dataKind: clientOf('codex', false),
   },
   {
-    id: '5F',
+    id: '4F',
     name: 'Claude Code',
     kind: 'cli',
     cmd: 'claude',
@@ -449,7 +457,7 @@ const PRODUCTS = [
     dataKind: clientOf('claude', false),
   },
   {
-    id: '6F',
+    id: '5F',
     name: 'TraeCode Plugin',
     kind: 'plugin',
     cmd: '',
@@ -459,7 +467,7 @@ const PRODUCTS = [
     dataKind: clientOf('trae', true),
   },
   {
-    id: '7F',
+    id: '6F',
     name: 'TraeCode IDE',
     kind: 'cli',
     cmd: 'trae',
@@ -475,19 +483,55 @@ const PRODUCTS = [
   },
 ];
 
+/**
+ * 这一层吃哪几路会话/落盘来源。合并楼层（1F CodeBuddy）显式挂多路；
+ * 其余楼层按老口径推出一路，行为与改动前完全一致。
+ * @returns {Array<'cli'|'plugin'|'hook'>}
+ */
+function sourcesOf(p) {
+  const list = p.sources && p.sources.length ? p.sources : p.hookSource ? ['hook'] : p.plugin ? ['plugin'] : ['cli'];
+  return [...new Set(list)];
+}
+
+/** 每一路来源的 client（上报身份）：CLI / hook 走 agent 本身，plugin 走 agent + '-plugin' */
+function sourceClient(agent, kind) {
+  return clientOf(agent, kind === 'plugin');
+}
+
+/** 空统计（没有落盘目录时的占位，字段与 scanDataDir 一致） */
+const NO_STATS = { files: 0, sessions: 0, bytes: 0, sizeLabel: '0 B', lastModifiedAt: null };
+
+/** 一路来源的描述：kind + client + 落盘目录 + 落盘统计（hook 来源没有自己的落盘目录） */
+function detectSource(p, kind) {
+  const dataPath = kind === 'hook' ? '' : findDataPath(p.agent, kind === 'plugin');
+  return {
+    kind,
+    client: sourceClient(p.agent, kind),
+    dataPath,
+    dataPathLabel: shorten(dataPath),
+    stats: dataPath ? scanDataDir(dataPath) : { ...NO_STATS },
+  };
+}
+
 function detectOne(p) {
+  const sources = sourcesOf(p).map((kind) => detectSource(p, kind));
+  const hasPluginSource = sources.some((s) => s.kind === 'plugin');
   const installPath =
     (p.cmd ? resolveCommand(p.cmd) || findCliBin(p.cmd) : '') ||
-    // 备用命令（7F TraeCode：国内版 IDE 的 trae-cn）——主命令搜不到时再认它。
+    // 备用命令（6F TraeCode：国内版 IDE 的 trae-cn）——主命令搜不到时再认它。
     (p.altCmd ? resolveCommand(p.altCmd) || findCliBin(p.altCmd) : '') ||
-    (p.plugin ? findPluginDir(p.pluginRe || RE_PLUGIN) : '') ||
-    // 合并楼层（当前只有 4F Codex）：命令行搜不到时，再认一次宿主扩展目录。
+    // 插件形态的安装证据：plugin 楼层看自己的 pluginRe；合并楼层（1F CodeBuddy）也认插件扩展
+    // ——只装了 IDE 插件、没装 CLI 的人，这一层照样是"装了"（会话也确实在跑）。
+    (p.plugin || hasPluginSource ? findPluginDir(p.pluginRe || RE_PLUGIN) : '') ||
+    // 合并楼层（3F Codex）：命令行搜不到时，再认一次宿主扩展目录。
     // 不改 kind / client：这层本来就同时代表 CLI 与 IDE，只是我们抓不到可执行文件而已。
     (p.altPluginRe ? findPluginDir(p.altPluginRe) : '');
-  const dataPath = findDataPath(p.agent, p.plugin);
-  const stats = dataPath
-    ? scanDataDir(dataPath)
-    : { files: 0, sessions: 0, bytes: 0, sizeLabel: '0 B', lastModifiedAt: null };
+  // 主来源 = 老口径那一路（合并楼层取 cli，即 ~/.codebuddy）；dataPath / stats 沿用它的，
+  // 保证前端悬浮提示、外层调用方的字段形状不变（多路的完整清单在 sources 里）。
+  const primary = sources.find((s) => s.kind === (p.plugin ? 'plugin' : 'cli')) || sources[0] || { dataPath: '', dataPathLabel: '', stats: { ...NO_STATS } };
+  // 这一层接纳的上报身份（去重保序）：由各来源的 client 反推，第一路是主身份
+  const clients = [...new Set(sources.map((s) => s.client))];
+  const dataKind = clients[0] || p.dataKind;
 
   return {
     id: p.id,
@@ -495,25 +539,32 @@ function detectOne(p) {
     kind: p.kind,
     /** 产品基名（codebuddy / workbuddy / codex / claude / trae）；落盘目录匹配用 */
     agent: p.agent,
-    /** 落盘形态（codebuddy / workbuddy / codex）—— 会话扫描按它挑解析方式；也等于 client（楼层客户端） */
-    dataKind: p.dataKind,
-    /** 插件目录名匹配（仅 plugin 楼层有意义；sessionRegistry 据此给 listSessions 传参） */
+    /** 主 client（上报身份）：前端当"楼层客户端"用；等于 clients[0] */
+    dataKind,
+    /** 这一层接纳的全部上报身份（合并楼层多个）：过滤相位 / 任务 / 成员时按它认 */
+    clients,
+    /** 插件目录名匹配（plugin 来源有意义；sessionRegistry 据此给 listSessions 传参） */
     pluginRe: p.pluginRe || null,
     /** 会话来源只有 reporter hook 状态文件（没有可扫的会话落盘），见 refresh 的对应分支 */
     hookSource: Boolean(p.hookSource),
+    /**
+     * 会话 / 落盘来源清单（合并楼层多路）：[{ kind, client, dataPath, dataPathLabel, stats }]。
+     * sessionRegistry 按它逐路取会话；前端悬浮提示按它逐路显示落盘信息。
+     */
+    sources,
     // 装没装只看**安装位置**：CLI 得找到可执行文件，插件得找到扩展目录。
     // 落盘目录不算证据 —— 我们自己的 hooks 安装脚本会给没装的产品写一份
     // settings.json 顺手造出一个目录（~/.workbuddy），拿它当证据等于自己骗自己。
     installed: Boolean(installPath),
     installPath,
     installPathLabel: shorten(installPath),
-    dataPath,
-    dataPathLabel: shorten(dataPath),
-    stats,
+    dataPath: primary.dataPath,
+    dataPathLabel: primary.dataPathLabel,
+    stats: primary.stats,
   };
 }
 
-/** 探测三个楼层；force 可跳过缓存重新扫盘 */
+/** 探测所有楼层；force 可跳过缓存重新扫盘 */
 function detectProducts({ force = false } = {}) {
   const now = Date.now();
   if (!force && cache.products.length && now - cache.at < TTL) return cache.products;

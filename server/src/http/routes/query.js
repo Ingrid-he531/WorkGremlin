@@ -6,6 +6,20 @@ const express = require('express');
 const { DEFAULTS } = require('@workgremlin/shared');
 
 /**
+ * 楼层筛选参数 → client 列表。
+ * 可以是单个 client（'codebuddy'），也可以是逗号分隔的一串（'codebuddy,codebuddy-plugin'，
+ * 合并楼层用）；'all' / 空 = 不过滤。
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function clientFilter(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s && s !== 'all');
+}
+
+/**
  * @param {{bus: any, repo: any}} ctx
  */
 function createQueryRouter({ bus, repo }) {
@@ -47,6 +61,7 @@ function createQueryRouter({ bus, repo }) {
    * 一级检索（服务端过滤）：
    *   - project：工程 id；缺省 / 'all' = 所有工程。
    *   - client ：楼层 = 执行该任务的成员 client（codebuddy/codex/workbuddy/claude…）；
+   *              可为逗号分隔的一串（合并楼层 1F CodeBuddy = codebuddy + codebuddy-plugin）；
    *              缺省 / 'all' = 所有楼层。
    * 二级检索（状态）由前端在已拉取结果上按 state 再筛（见 TaskRecordsView 的状态分段）。
    *
@@ -61,7 +76,9 @@ function createQueryRouter({ bus, repo }) {
    */
   router.get('/task-runs', (req, res) => {
     const project = req.query.project;
-    const client = req.query.client;
+    // 楼层筛选：client 可以是**逗号分隔的一串** —— 合并楼层（1F CodeBuddy = CLI + Plugin）
+    // 一个楼层对应两种成员 client，选它要一次把两路都取回来（口径见 products.js 的 clients）。
+    const clients = clientFilter(req.query.client);
     const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
     // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑
     const cutoff = Date.now() - 10 * 60 * 1000;
@@ -72,9 +89,11 @@ function createQueryRouter({ bus, repo }) {
       conds.push('t.project_id = @project');
       args.project = project;
     }
-    if (client && client !== 'all') {
-      conds.push('m.client = @client');
-      args.client = client;
+    if (clients.length) {
+      // 命中口径与报表分组一致（COALESCE(tr.client, m.client)），用 instr 做集合成员判定：
+      // @client 是 ",a,b," 形式，单个 client 也走同一条（1F 之外行为不变）。
+      conds.push("instr(@client, ',' || COALESCE(tr.client, m.client) || ',') > 0");
+      args.client = `,${clients.join(',')},`;
     }
 
     // 始终 LEFT JOIN 报表层与成员，补全 client/model/文件/产出，并按 client 过滤
@@ -151,7 +170,8 @@ function createQueryRouter({ bus, repo }) {
    */
   router.delete('/task-runs', (req, res) => {
     const project = req.query.project;
-    const client = req.query.client;
+    // 同 GET：client 可以是逗号分隔的一串（合并楼层一次删两路）
+    const client = clientFilter(req.query.client).join(',') || null;
     const mode = req.query.mode || 'all';
     let beforeTs = null;
     if (mode === 'recent') {

@@ -4,6 +4,7 @@ import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
 import { clientLabel } from '../lib/clientMatch';
+import { clientBase } from '@workgremlin/shared';
 
 const project = useProjectStore();
 const session = useSessionStore();
@@ -13,6 +14,28 @@ const tasks = useTaskStore();
 const projectOptions = computed(() => project.projects || []);
 // 楼层里只有带 client 的才能当任务过滤维度（部分楼层 unreported 没有 client）
 const floorOptions = computed(() => (session.floors || []).filter((f) => f.client));
+
+/**
+ * 楼层 ↔ 客户端（轴 1）：
+ *   - 合并楼层（1F CodeBuddy = CLI + Plugin）的 key 是**逗号分隔的 client 串**，服务端按集合取；
+ *   - 单楼层就是一个 client，走同一条路（串里只有它自己），行为不变。
+ */
+function floorClients(f) {
+  return Array.isArray(f.clients) && f.clients.length ? f.clients : f.client ? [f.client] : [];
+}
+function floorValue(f) {
+  return floorClients(f).join(',');
+}
+/** 这条任务的 client 归哪个楼层（先精确命中，再按基名兜底认合并楼层） */
+function floorOfClient(c) {
+  const k = String(c || '').toLowerCase();
+  if (!k) return null;
+  return (
+    floorOptions.value.find((f) => floorClients(f).some((x) => String(x).toLowerCase() === k)) ||
+    floorOptions.value.find((f) => f.client && clientBase(f.client) === clientBase(k)) ||
+    null
+  );
+}
 
 /** 每 4s 轮询一次（任务/ subagent 是低频事件，轮询足够，不必挂 WS） */
 const POLL_MS = 4000;
@@ -167,13 +190,21 @@ const reportSort = ref({ key: 'taskCount', dir: 'desc' });
 function dimValue(t, dim) {
   if (dim === 'project') return t.project_id || '';
   if (dim === 'model') return t.model || '';
-  if (dim === 'floor') return t.client || '';
+  // 按楼层聚合：CLI 与 Plugin 两个 client 归同一个楼层（1F CodeBuddy）→ 同一个分组 key
+  if (dim === 'floor') {
+    const f = floorOfClient(t.client);
+    return f ? floorValue(f) : t.client || '';
+  }
   return '';
 }
 function dimLabel(t, dim) {
   if (dim === 'project') return (projectOptions.value.find((p) => p.id === t.project_id) || {}).name || t.project_id || '(未命名工程)';
   if (dim === 'model') return t.model || '(未记录)';
-  if (dim === 'floor') return (floorOptions.value.find((f) => f.client === t.client) || {}).name || t.client || '(未记录)';
+  if (dim === 'floor') {
+    const f = floorOfClient(t.client);
+    if (f) return f.name;
+    return t.client ? clientLabel(t.client) : '(未记录)';
+  }
   return '';
 }
 const reportGroups = computed(() => {
@@ -323,7 +354,8 @@ async function saveRetention() {
       </select>
       <select v-model="tasks.filterClient" class="sel" aria-label="按楼层筛选">
         <option value="all">全部楼层</option>
-        <option v-for="f in floorOptions" :key="f.id" :value="f.client">{{ f.name }}</option>
+        <!-- 合并楼层（1F CodeBuddy）的值是逗号分隔的 client 串，服务端按集合取（见 query.js） -->
+        <option v-for="f in floorOptions" :key="f.id" :value="floorValue(f)">{{ f.name }}</option>
       </select>
       <select v-model="filterState" class="sel" aria-label="按状态筛选">
         <option value="all">全部状态</option>

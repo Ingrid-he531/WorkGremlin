@@ -16,7 +16,7 @@
 产品定位没变（本地只读的多 agent 协作可视化终端），但**实现形态已经离开 v0.1 设计**：
 
 - 领域模型由 **team** 改为 **工程（project）**（commit `def3fee`）；
-- 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~5F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
+- 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~6F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
 - 成员来源从「roster（`config.json`）+ A 路线目录监听」改为 **hook 上报 / `.codebuddy/agents` 名册 / `.workgremlin/subagents.json` 清单**三路；
 - 承诺的 **A 路线（`chokidar`）、消息脱敏、FTS5 查询、双连接存储、TS 迁移、自动化测试** 均未落地。
 
@@ -103,11 +103,16 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 
 | 楼层 | 产品 | 落盘形态 |
 | --- | --- | --- |
-| 1F | CodeBuddy CLI | `~/.codebuddy` 下 `*.jsonl` |
+| 1F | CodeBuddy（**CLI 与 Plugin 合并成一层**） | CLI：`~/.codebuddy` 下的 `*.jsonl` + reporter 状态文件；Plugin：编辑器 globalStorage 的结构化目录（genie-history / todos / message-queue / file-changes，唯一能拿到运行态的那一路）。两路都在这一层，同时开着两种形态 = 这一层里的**两条会话**（按 `session_id` 区分），不是两个楼层 |
 | 2F | WorkBuddy CLI | `~/.workbuddy` 下 `*.jsonl` |
-| 3F | CodeBuddy 插件 | 编辑器 globalStorage 的结构化目录（唯一能拿到运行态的一层） |
-| 4F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
-| 5F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分 |
+| 3F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
+| 4F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分 |
+| 5F | TraeCode Plugin | MarsCode 数据根 `~/.marscode` + 编辑器 globalStorage 的结构化目录 |
+| 6F | TraeCode IDE | 没有可扫的会话落盘：会话来源就是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值） |
+
+合并楼层在 `products.js` 里由 `sources` 声明（1F 是 `['cli', 'plugin', 'hook']`）：一个楼层可以吃
+多路落盘，每一路带自己的 client（`codebuddy` / `codebuddy-plugin`），相位与完成标记按会话各认各的。
+自检见 `server/test/codebuddyFloor.test.js`（`npm run test:codebuddy`）。
 
 选中的会话决定主 Agent 控制台的相位（幽灵状态跟着走），办公室布局不受影响；切到没有活跃会话的楼层时整屋清空。
 
@@ -183,8 +188,8 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 | 打断收场（收掉孤儿幽灵） | 🟡 仅离线验证 | `Interrupt` 事件已接，真实会话里还没出现过 |
 | 等授权（blocked·awaiting_permission） | 🟡 仅离线验证 | 本机 `permission_mode=bypassPermissions`，从不弹权限框；Codex 走显式 `PermissionRequest`（不再用 CodeBuddy 的 pending 推断） |
 | 坐工位小怪物名册（Codex 侧 agent 定义） | 🟡 未实证 | 按 `$CODEX_HOME/agents`、`<工程>/.codex/agents` 的 `.md`/`.toml` 扫；本机还没有这类文件 |
-| 楼层 / 会话列表（4F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessionRegistry.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl`，用 `cwdOfHead` 从头部若干行取 `payload.cwd` |
-| 按客户端隔离（4F 不显示 CodeBuddy 的成员与相位） | ✅ 实测 | `members.client` + `/api/v1/reporter-phase?client=` |
+| 楼层 / 会话列表（3F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessionRegistry.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl`，用 `cwdOfHead` 从头部若干行取 `payload.cwd` |
+| 按客户端隔离（3F 不显示 CodeBuddy 的成员与相位） | ✅ 实测 | `members.client` + `/api/v1/reporter-phase?client=`（合并楼层可传逗号分隔的一串） |
 | PreCompact / PostCompact | ❌ 未处理 | 与 CodeBuddy 一致（没有对应的 UI 语义） |
 | `Stop.last_assistant_message` | ❌ 未使用 | 完成摘要仍取"本轮改动过的文件" |
 | `turn_id` / `agent_id` 归因 | ❌ 未使用 | 子代理自己的工具调用带 `agent_id`，本可把文件活动归到那只幽灵身上（现在仍算主成员） |

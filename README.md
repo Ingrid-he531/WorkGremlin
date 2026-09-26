@@ -152,8 +152,8 @@ npm run hooks:install -- --targets=codex   # 只装 Codex
 | `Stop` | `task/end(done)` + `idle`，顺手扫掉本轮残留的幽灵 | 同 |
 
 CLI 楼层的主控制台**也用 hook 上报的真实相位**（思考中 / 调用工具 + 真实命令 / 等待授权 / 待命）——
-以前只有 3F 插件会话能拿到实时相位，1F/2F/4F/5F 只能"按会话 jsonl 的文件时间猜"，
-表现就是 4F 一直卡在「调用工具 · 改 rollout-xxxx.jsonl」且内容不变。现在只要该工程接过 hook
+以前只有插件那一路的会话能拿到实时相位，1F/2F/3F/4F 只能"按会话 jsonl 的文件时间猜"，
+表现就是 3F 一直卡在「调用工具 · 改 rollout-xxxx.jsonl」且内容不变。现在只要该工程接过 hook
 （`/api/v1/reporter-phase` 的 `instrumented`）就以 hook 为准，没有动作时显示「待命」。
 
 Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本），hook 会从
@@ -161,8 +161,8 @@ Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本�
 坐工位的小怪物名册除 `.codebuddy/agents/` 外，也会扫 `<工程>/.codex/agents/` 与 `$CODEX_HOME/agents/`。
 
 **成员是按楼层过滤的**：每个成员都带一个「来源客户端」（`members.client`），办公室与工位卡片只显示
-当前楼层那一路的成员 —— 1F/3F 看 CodeBuddy、2F 看 WorkBuddy、4F 看 Codex、5F 看 Claude。
-所以切到 4F 不会再看见你在 CodeBuddy 里建的小怪物。`client` 为空的是「通用」成员（演示数据、
+当前楼层那一路的成员 —— 1F 看 CodeBuddy、2F 看 WorkBuddy、3F 看 Codex、4F 看 Claude。
+所以切到 3F 不会再看见你在 CodeBuddy 里建的小怪物。`client` 为空的是「通用」成员（演示数据、
 手工 `scripts/subagents.js` 写的幽灵），哪层都显示。
 
 注意**小怪物（subagent 名册）不受会话影响**：它是静态的（`client` 比对的又是去掉 `-plugin` 的
@@ -223,6 +223,13 @@ CLI 与插件是同一份 `~/.claude`、同一套 hook、连二进制都相同�
   实时相位与完成标记；不传 `session` 就是老行为（同 client 里取最新的那条）。
 - **落库**：`task_runs` / `messages` 都带 `session_id`，报表能分清"这轮改动是哪条会话干的"。
 - 状态文件每个会话一份，所以 hook 在 `SessionStart` 时会顺手清掉 7 天前的旧状态文件，避免目录无限膨胀。
+
+**CodeBuddy 的 CLI 与 Plugin 也合成一个楼层（1F CodeBuddy）**：CLI 那一路落 `~/.codebuddy`
+（会话 `*.jsonl`；没有 jsonl 时用 reporter 状态文件兜底列出），Plugin 那一路落编辑器的 globalStorage
+（`genie-history` / `todos` / `message-queue` / `file-changes`，唯一能拿到运行态的一路）。
+两路都归 1F：同时开着 CLI 与 Plugin 时，表现是**这一层里的两条会话**，不是两个楼层；
+实时相位与完成标记按会话各认各的（`/api/v1/reporter-phase?client=codebuddy,codebuddy-plugin&session=<id>`）。
+想知道"某一层吃哪几路落盘"，看 `server/src/products.js` 的 `sources`；自检 `npm run test:codebuddy`。
 
 ## 安全基线（不得关闭）
 

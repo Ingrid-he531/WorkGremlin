@@ -26,6 +26,8 @@ function createSessionsRouter({ workspace }) {
   router.get('/reporter-phase', (req, res) => {
     const cur = workspace && workspace.current ? workspace.current() : {};
     // 按楼层（客户端）取相位：同一工程里 Codex 与 CodeBuddy 同时跑时不能互相串味
+    // client 可以是**逗号分隔的一串** —— 合并楼层（1F CodeBuddy = CLI + Plugin）一次要认两路
+    // 上报身份，串里任意一个命中就算本层（匹配见 sessions.js 的 clientHit）。
     const client = String(req.query.client || '').trim().toLowerCase();
     // 轴 2（会话）：`?session=<session_id>` 只取那一条会话的相位/完成标记。
     // 一个楼层可以同时开多条会话（同一个 claude 开两个终端 / CLI + 插件混着跑），

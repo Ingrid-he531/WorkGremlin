@@ -1,7 +1,10 @@
 <script setup>
 /**
  * FloorSelector —— 左侧竖向堆叠的"楼层"胶囊。
- * 每个楼层对应一个受监控的产品：1F CodeBuddy CLI / 2F WorkBuddy CLI / 3F CodeBuddy Plugin / 4F Codex CLI / 5F Claude Code CLI / 6F TraeCode Plugin。
+ * 每个楼层对应一个受监控的产品：1F CodeBuddy（CLI + Plugin 合并）/ 2F WorkBuddy CLI /
+ * 3F Codex（CLI + IDE 合并）/ 4F Claude Code / 5F TraeCode Plugin / 6F TraeCode IDE。
+ * 合并楼层（1F）会扫**多路落盘**（CLI 的 ~/.codebuddy + 插件的 globalStorage），
+ * 同时开着两种形态时表现成这一层里的多条会话，而不是多个楼层（见 server/src/products.js）。
  *
  * 状态点看的是**这一层有没有活跃会话**（全局活跃会话表，60 分钟没事件会剔除）：
  *   - 有活跃会话：绿色状态点 + 数量角标
@@ -148,7 +151,22 @@ onBeforeUnmount(() => {
 /** 楼层列表换了（首次加载 / 10s 轮询）→ DOM 更新后再量一次 */
 watch(() => props.products, () => measure(), { flush: 'post' });
 
-/** 悬浮提示：活跃会话 + 安装位置 + 落盘统计 */
+/** 某一路落盘来源的显示名（合并楼层的悬浮提示要逐路标出来） */
+const SOURCE_LABEL = { cli: 'CLI', plugin: '插件', hook: 'hook 状态文件' };
+
+/** 一路落盘的说明文案：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）` */
+function sourceLine(label, dataPathLabel, stats) {
+  if (!dataPathLabel) return `${label}：未找到数据目录`;
+  const s = stats || {};
+  const bits = [];
+  if (s.sessions) bits.push(`${s.sessions} 个会话文件`);
+  if (s.files) bits.push(`${s.files} 个文件`);
+  if (s.sizeLabel) bits.push(s.sizeLabel);
+  if (s.lastModifiedAt) bits.push(`最后写入 ${new Date(s.lastModifiedAt).toLocaleString()}`);
+  return `${label}：${dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`;
+}
+
+/** 悬浮提示：活跃会话 + 安装位置 + 落盘统计（合并楼层逐路列） */
 function tip(p) {
   const lines = [p.name];
   lines.push(
@@ -161,14 +179,14 @@ function tip(p) {
     return lines.join('\n');
   }
   lines.push(`安装：${p.installPathLabel || '（未定位到可执行文件）'}`);
-  if (p.dataPathLabel) {
-    const s = p.stats || {};
-    const bits = [];
-    if (s.sessions) bits.push(`${s.sessions} 个会话文件`);
-    if (s.files) bits.push(`${s.files} 个文件`);
-    if (s.sizeLabel) bits.push(s.sizeLabel);
-    if (s.lastModifiedAt) bits.push(`最后写入 ${new Date(s.lastModifiedAt).toLocaleString()}`);
-    lines.push(`落盘：${p.dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`);
+  // 有落盘目录的来源才逐路列（hook 那一路没有自己的落盘目录，只在"活跃会话"里体现）
+  const sources = (p.sources || []).filter((s) => s.dataPathLabel);
+  if (sources.length > 1) {
+    for (const s of sources) lines.push(sourceLine(SOURCE_LABEL[s.kind] || s.kind || '落盘', s.dataPathLabel, s.stats));
+  } else if (sources.length === 1) {
+    lines.push(sourceLine('落盘', sources[0].dataPathLabel, sources[0].stats));
+  } else if (p.dataPathLabel) {
+    lines.push(sourceLine('落盘', p.dataPathLabel, p.stats));
   } else {
     lines.push('落盘：未找到数据目录');
   }

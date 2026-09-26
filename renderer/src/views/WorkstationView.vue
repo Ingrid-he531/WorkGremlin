@@ -13,8 +13,8 @@ const sorted = computed(() => {
   const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
   // 与办公室同一口径：按当前楼层的客户端过滤（client 为空的视作通用）
   const want = sessions.selectedClient;
-  // 所有楼层的 client 都认一遍，才能正确区分 codebuddy 的 1F/3F 二分，
-  // 又让 codex/trae 单楼层时把 CLI 与 plugin 两种变体都收进来。
+  // 所有楼层的 client 都认一遍：合并楼层（1F CodeBuddy = CLI + Plugin）要把两种变体都收进来，
+  // 单楼层（3F Codex 这种 CLI 与 IDE 合并的）同理。
   const allClients = (sessions.floors || []).map((f) => f.client);
   return project.members
     // 工位卡片只显示常住小怪物；临时召唤出来的幽灵（subagent-xxx）不在这张表里占位，

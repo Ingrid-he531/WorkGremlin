@@ -1,7 +1,15 @@
 'use strict';
 
 /**
- * 会话（conversation）—— 当前智能体（CodeBuddy Plugin）在各个工程下开着的会话。
+ * 会话（conversation）—— 受监控产品在各个工程下开着的会话。
+ *
+ * 同一层的 CLI 与 Plugin 两路落盘**不是同一份**，各自有各自的取法，但产出同一种会话行：
+ *   · 插件那路（1F CodeBuddy 的插件形态、5F TraeCode Plugin）：就是本文件下面这套结构化落盘
+ *     （genie-history / todos / message-queue / file-changes），能拿到运行态；
+ *   · CLI 那路（1F CodeBuddy、2F、3F、4F）：会话在各自的会话 jsonl 里，只有文件时间可靠；
+ *   · hook 那路（6F TraeCode IDE、1F CodeBuddy CLI 的兜底）：连 jsonl 都没有时，
+ *     会话来源就是 reporter 状态文件（listReporterSessions）。
+ * 楼层吃哪几路由 server/src/products.js 的 sources 声明（合并楼层可多路）。
  *
  * 真源是插件自己的落盘（不经我们同意也一直在写），四个目录互相索引：
  *   genie-history/{base64(工程目录)}/conversations/{会话id}/   工程 ↔ 会话名单（目录本身是空的）
@@ -40,9 +48,10 @@ const PLUGIN_RE = [/coding-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i];
 /**
  * 插件落盘这一路的来源客户端：**按楼层传入**，不再写死。
  * reporter 的状态文件按客户端分开写（同一个工程里 CodeBuddy / Codex / Claude … 各一份），
- * 每个插件楼层（3F CodeBuddy-Plugin、6F TraeCode-Plugin、未来的 Codex-Plugin …）只认自己
+ * 每个插件楼层（1F CodeBuddy 的插件那一路、5F TraeCode-Plugin、未来的 Codex-Plugin …）只认自己
  * 这一路 —— 否则切到某层会看见别层在敲的命令、收工时还弹别层的「任务完成」。
  * 调用方（sessionRegistry）会把该楼层的 client（例如 'codebuddy-plugin' / 'trae-plugin'）传进来。
+ * 合并楼层（1F CodeBuddy）另有一路 CLI 身份：见下面的 clientHit —— 它可以一次收一串 client。
  */
 
 /**
@@ -51,6 +60,29 @@ const PLUGIN_RE = [/coding-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i];
  * 注意：这只是历史兼容，绝不能当"默认客户端"用——client 必须显式传入。
  */
 const LEGACY_STATE_CLIENT = 'codebuddy';
+
+/**
+ * 楼层身份匹配（轴 1 的过滤口径，全文件只此一处）。
+ *
+ * want 既可以是**单个 client**（如 'codebuddy-plugin'），也可以是**逗号分隔的一串** ——
+ * 合并楼层（1F CodeBuddy 把 CLI 与 Plugin 合成一层）就是"一个楼层吃两路上报身份"，
+ * 它把 clients 列表一起传进来（见 server/src/products.js 的 sources / clients）。
+ * 别的楼层一律传单值，行为与改动前逐字一致（精确比对，不做基名放宽）——
+ * 5F TraeCode Plugin 与 6F TraeCode IDE 必须靠这条继续分开。
+ *
+ * got 是状态文件里记的 client；老状态文件没有 client 字段 → 按 codebuddy（CLI）归属。
+ * @param {string} want 楼层要求的 client（单个，或逗号分隔多个）；空 = 不限
+ * @param {string} got 状态文件里的 client
+ */
+function clientHit(want, got) {
+  if (!want) return true;
+  const set = String(want)
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!set.length) return true;
+  return set.includes(String(got || LEGACY_STATE_CLIENT).toLowerCase());
+}
 
 /** 缓存：列表扫盘 + 读十几个小 json，5 秒足够 */
 const TTL = 5_000;
@@ -75,7 +107,7 @@ const FRESH_MS = 2 * 60_000;
  * 会话"还在下拉里"的窗口 —— 与 CLI 楼层对齐（sessionRegistry 的 TIMEOUT_MS = 60 分钟）。
  *
  * 为什么不再用 IDLE_MS(10 分钟) 当在列标准：IDE 里开着但十几分钟没敲字的会话会被整条剔除，
- * 而同样空闲的 CLI 会话（4F）却还在列表里，两边口径不一致（实测：3F 空、4F 有 4 条）。
+ * 而同样空闲的 CLI 会话（3F Codex）却还在列表里，两边口径不一致（实测：插件那路空、CLI 有 4 条）。
  * 现在 IDLE_MS 只用来判断"相位还热不热"（inferPhase），不再决定会话是否出现。
  */
 const LISTED_MS = 60 * 60_000;
@@ -84,7 +116,7 @@ const LISTED_MS = 60 * 60_000;
  *
  * 为什么必须有：done 是**持久状态**（为了让一次一进程的 `codex exec` 也能看到完成摘要，
  * 会话结束后不清它），于是页面/楼层一打开就可能读到上一轮（甚至几小时前）的完成标记，
- * 把历史当成新闻重播一遍（现象：一开 4F 就弹「任务完成 · 链路测试完成」）。
+ * 把历史当成新闻重播一遍（现象：一开 3F 就弹「任务完成 · 链路测试完成」）。
  * 渲染层也做了"首次只当基线"的防护，这里是第二道，而且对旧前端也生效。
  */
 const DONE_TTL_MS = 10 * 60_000;
@@ -340,8 +372,8 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     if (!sameSession(j, session)) continue;
     // 按客户端过滤。老状态文件（本次改动之前写的）没有 client 字段 —— 那会儿只有 CodeBuddy，
     // 所以按 codebuddy 归属，而不是"对谁都匹配"（否则刚重启、Codex 还没写过状态文件时，
-    // 4F 会短暂借到 3F 的相位）。
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    // 3F 会短暂借到 1F 的相位）。
+    if (!clientHit(client, j.client)) continue;
     const sp = j.sessionPhase;
     if (!sp || !sp.ts || now - sp.ts > AWAIT_TTL_MS) continue;
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
@@ -441,7 +473,7 @@ function hasOtherLiveSession({ workspacePath = '', client = '', session = '', no
     if (fileSession === null || !fileSession || fileSession === session) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    if (!clientHit(client, j.client)) continue;
     // 判据 1：心跳守护还活着（最可靠）
     if (j.hb && pidAlive(j.hb.pid)) return true;
     // 判据 2：还有在飞的相位 / 任务（见函数说明，**不能**用 hb.lastEventAt）
@@ -494,7 +526,7 @@ function stateFileSession(name, wsPart, dir) {
  * 这个工程有没有接过 hook（= 有没有对应的 hook 状态文件）。
  *
  * 和"有没有新鲜相位"是两回事：会话结束后 hook 会把 sessionPhase 清空（正确行为），
- * 但此时 CLI 楼层不该退回"按 jsonl mtime 猜"的兜底（那会让 4F 一直显示「调用工具 / 改 xxx.jsonl」），
+ * 但此时 CLI 楼层不该退回"按 jsonl mtime 猜"的兜底（那会让 3F 一直显示「调用工具 / 改 xxx.jsonl」），
  * 而应该显示「待命」。渲染层靠这个字段区分"没接 hook"与"接了但当前没事干"。
  *
  * 状态文件名由 hook 的 statePath() 生成：`<member>@<工程绝对路径>[@<会话>]`，非 [A-Za-z0-9._-] 换成 `_`。
@@ -512,7 +544,7 @@ function hasReporterState(workspacePath, client = '') {
     if (!client) return true;
     const j = readJson(path.join(dir, name));
     // 老文件没记 client → 按 codebuddy 归属（同上）
-    if (String((j && j.client) || LEGACY_STATE_CLIENT).toLowerCase() === String(client).toLowerCase()) return true;
+    if (clientHit(client, j && j.client)) return true;
   }
   return false;
 }
@@ -542,7 +574,7 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
     const j = readJson(path.join(dir, name));
     if (!j) continue;
     // 老状态文件没记 client → 按 codebuddy 归属（与相位读取同一口径）
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    if (!clientHit(client, j.client)) continue;
     const ts = (j.sessionPhase && j.sessionPhase.ts) || j.taskStartedAt || (j.hb && j.hb.lastEventAt) || 0;
     if (ts >= bestTs) {
       bestTs = ts;
@@ -633,8 +665,8 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     if (!j || !j.taskId) continue;
     if (!sameSession(j, session)) continue;
     // 按客户端过滤（口径同 readReporterPhase：老状态文件没记 client → 归 codebuddy）：
-    // 同一工程里 Codex 在跑时，别把它的任务算成 3F 这一层"还在干活"的活跃窗口
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    // 同一工程里别的产品在跑时，别把它的任务算成本层"还在干活"的活跃窗口
+    if (!clientHit(client, j.client)) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     // 心跳时间 / 任务开始 / 相位时间三者取最新：最近还有 hook 事件才算这个会话活着。
@@ -673,7 +705,7 @@ function readReporterDones(workspacePath, client = '') {
     const ws = j.done.workspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     // 同一工程里 Codex 与 CodeBuddy 各有一份状态文件：按客户端取，别把对方的"完成"搬过来
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    if (!clientHit(client, j.client)) continue;
     const done = j.done;
     const id = String(j.sessionId || '');
     const prev = id ? bySession.get(id) : null;
@@ -699,7 +731,7 @@ function readReporterDone(workspacePath, client = '', session = '') {
  * 不是对话会话，拿来当会话就是编造），所以它的会话表直接由 reporter 状态文件构成：
  * sessionId 就是 hook payload 的 `session_id`，工程路径取相位 / 任务里记的 workspacePath ——
  * 两个都是实测值，不猜。老命名文件（没有 sessionId）没有会话维度，不算。
- * @param {string} client 客户端身份（楼层 dataKind，如 trae）；空则不限
+ * @param {string} client 客户端身份（**这一路来源**的 client，如 trae / codebuddy）；空则不限
  * @returns {Array<{sessionId: string, workspacePath: string, lastEventAt: number}>}
  */
 function listReporterSessions(client = '') {
@@ -709,7 +741,7 @@ function listReporterSessions(client = '') {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    if (!clientHit(client, j.client)) continue;
     const sessionId = String(j.sessionId || '').trim();
     if (!sessionId) continue;
     const sp = j.sessionPhase || {};
@@ -750,7 +782,7 @@ function freshestReporterWs(fallback, client = '', session = '') {
     const j = readJson(path.join(dir, name));
     if (!j) continue;
     if (!sameSession(j, session)) continue;
-    if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
+    if (!clientHit(client, j.client)) continue;
     const sp = j.sessionPhase;
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
@@ -986,7 +1018,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
       client,
     });
     // 只按"还在窗口内"过滤（60 分钟），不再因为 10 分钟没动静就整条剔除 ——
-    // 否则 IDE 里明明开着、只是十几分钟没敲字的会话会从 3F 消失（与 4F 口径不一致）。
+    // 否则 IDE 里明明开着、只是十几分钟没敲字的会话会从这一层消失（与 CLI 那路口径不一致）。
     if (!info.listed) continue;
     sessions.push({
       ...info,
@@ -1023,7 +1055,7 @@ module.exports = {
   hasOtherLiveSession,
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
   readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
-  listReporterSessions, // 只认 hook 的楼层（7F TraeCode IDE）的会话来源
+  listReporterSessions, // 只认 hook 的楼层（6F TraeCode IDE）与合并楼层的 hook 那一路（1F CodeBuddy CLI）
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
   listSessions,
   findPluginStorage,

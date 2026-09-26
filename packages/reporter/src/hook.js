@@ -65,7 +65,9 @@ const { fnv1a32 } = require('@workgremlin/shared');
 /** 本 hook 服务哪个产品（安装器通过 --agent 注入；必填，缺省直接报错退出）。
  *  这是**轴 1（产品家族）**：trae / codebuddy-plugin 都跑在 VS Code 协议上、运行时 payload 长得一样
  *  （都自报 client:'vscode'），光靠 payload 分不出，只能靠安装期身份。
- *  只有 codebuddy 这个家族还要靠 payload 的 client 再分 cli（1F）/ plugin（3F）两层，见 eventClient。 */
+ *  只有 codebuddy 这个家族还要靠 payload 的 client 再分 cli / plugin 两种身份，见 eventClient
+ *  ——分出来的两种身份**同属 1F CodeBuddy 一层**（CLI 与 Plugin 合并，见 server/src/products.js），
+ *  服务端按会话把这些上报区分开，不再拆成两个楼层。 */
 let AGENT = '';
 let IS_CODEX = false;
 /** Claude Code（--agent claude）。与 CodeBuddy 的差别见 header 的"各家差异"一段 */
@@ -110,8 +112,9 @@ const PENDING_SPAWN_MS = 2 * 60_000;
  *   - plugin（VS Code 系扩展，payload 自报 `client: 'vscode'`）：返回 **agent + '-plugin'**
  *     （codebuddy-plugin / codex-plugin / trae-plugin）。
  *
- * 这样每个产品既能分清 CLI 与 plugin（CodeBuddy 的 1F / 3F 二分），
- * 又能让只有一个楼层的产品（codex / trae）把两种变体都归到那一层。
+ * 这样每个产品既能分清 CLI 与 plugin 两种上报身份（CodeBuddy 的 CLI / Plugin 都在 1F，
+ * 靠这一位区分它们各自的相位与完成标记），又能让只有一个楼层的产品（codex）把两种变体
+ * 都归到那一层。
  *
  * @param {any} ev hook 事件
  * @returns {string}
@@ -1041,8 +1044,9 @@ async function main() {
   // 它决定这一整轮所有读写落在**哪一份**状态文件上。
   // 拿不到就留空（退回旧的文件名，向后兼容），绝不是"随便挑一条会话"。
   SESSION = String((ev && ev.session_id) || '').trim();
-  // 本次事件归属的客户端：默认 CodeBuddy 钩子落 'codebuddy'（CLI/1F 来源），
-  // plugin（payload 自带 client）则落 'codebuddy-plugin'（3F 来源）；其余产品同此
+  // 本次事件归属的客户端：默认 CodeBuddy 钩子落 'codebuddy'（CLI 来源），
+  // plugin（payload 自带 client）则落 'codebuddy-plugin'（Plugin 来源）——两种身份都在
+  // 1F CodeBuddy 这一层，服务端按会话区分；其余产品同此
   // （codex / codex-plugin、trae / trae-plugin …），由 eventClient 统一归层。
   const cl = eventClient(ev);
   // 观测用：把"安装器注入的 client（env）"与"payload 自带的 client（ev）"都按原值打出来，

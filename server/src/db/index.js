@@ -532,13 +532,18 @@ function createRepo(db) {
     deleteSubagentRunsByParent: db.prepare(`DELETE FROM subagent_runs WHERE parent_task_id IN (SELECT value FROM json_each(?))`),
     deleteMessagesByTask: db.prepare(`DELETE FROM messages WHERE task_id IN (SELECT value FROM json_each(?))`),
     deleteArtifactsByTask: db.prepare(`DELETE FROM artifacts WHERE task_id IN (SELECT value FROM json_each(?))`),
-    /** 顶层任务 id 选择器：复用任务记录页的一级检索（工程 + 楼层），可选"早于某时刻"（保留最近 N 天） */
+    /**
+     * 顶层任务 id 选择器：复用任务记录页的一级检索（工程 + 楼层），可选"早于某时刻"（保留最近 N 天）。
+     * @client 是 ",a,b," 形式的 client 集合（合并楼层 1F CodeBuddy = CLI + Plugin 两个 client），
+     * 用 instr 做成员判定 —— 单值走同一条路（",codebuddy," 也能命中 codebuddy）。
+     */
     selectTopTaskIds: db.prepare(`
       SELECT t.id FROM tasks t
+      LEFT JOIN task_runs tr ON tr.id = t.id
       LEFT JOIN members m ON m.id = t.member_id
       WHERE t.parent_task_id IS NULL
         AND (@project IS NULL OR t.project_id = @project)
-        AND (@client IS NULL OR m.client = @client)
+        AND (@client IS NULL OR instr(@client, ',' || COALESCE(tr.client, m.client) || ',') > 0)
         AND (@before IS NULL OR t.started_at < @before)
     `),
     /**
@@ -711,11 +716,18 @@ function createRepo(db) {
   /**
    * 按一级检索（工程 + 楼层）删除；beforeTs 给定时只删早于该时刻的（保留最近 N 天）。
    * @param {{ project?: string, client?: string, beforeTs?: number }} opt
+   *        client 可以是逗号分隔的一串（合并楼层 1F CodeBuddy = CLI + Plugin）
    * @returns {number} 删除的顶层任务条数
    */
   function deleteTaskRunsByFilter(opt = {}) {
     const projectArg = opt.project && opt.project !== 'all' ? opt.project : null;
-    const clientArg = opt.client && opt.client !== 'all' ? opt.client : null;
+    // client 可以是逗号分隔的一串（合并楼层一次删两路），也可以是一个值。
+    // 统一包成 ",a,b," 交给 selectTopTaskIds 的 instr 判定（单值 = ",a,"，命中口径不变）。
+    const clients = String(opt.client || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s && s !== 'all');
+    const clientArg = clients.length ? `,${clients.join(',')},` : null;
     const beforeArg = opt.beforeTs != null ? opt.beforeTs : null;
     const topIds = stmt.selectTopTaskIds
       .all({ project: projectArg, client: clientArg, before: beforeArg })
