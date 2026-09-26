@@ -1948,9 +1948,9 @@ export function createIsoOffice(canvas, opts = {}) {
     const cd = CONSOLE.desk;
     push(depthOf(cd.x + cd.w / 2, cd.y + cd.d / 2), (c, now) => drawConsoleDesk(c, now));
     const cs = CONSOLE.screen;
-    // 悬浮屏必须盖住它后面（gy 更小）的所有工位内容：工位物品按桌心推深度最高约 22.28，
-    // 而 operator（小黑人）在屏前（depth 22.62）。取 operator 深度 -0.1 ≈ 22.52，
-    // 既高于工位、又不挡小黑人。
+    // 悬浮屏必须盖住它正后方（gy 更小）的工位内容：屏幕 depth 取 operator 深度 -0.1，
+    // operator 在屏前（depth = seat.x + seat.y）。屏正后方是中间列工位（x+y 远低于屏），
+    // 必然先画、被屏盖住；最右列工位虽 x+y 略高，但位于屏右侧、屏幕投影不重叠，不受影响。
     push(depthOf(CONSOLE.seat.x, CONSOLE.seat.y) - 0.1, (c, now) =>
       drawConsoleScreen(c, { state: mainAgent, now, zoom: cam.zoom })
     );
