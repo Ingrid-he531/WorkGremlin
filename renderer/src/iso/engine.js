@@ -174,7 +174,7 @@ function makeWallText(text) {
 /**
  * @param {HTMLCanvasElement} canvas
  * @param {{onSelect?: (id: string) => void, floor?: string}} [opts]
- *   floor：当前楼层 id（如 '1F' / '3F' / '6F'）。用于挑这一层的材质配色（见 officeMap 的 colorsFor），
+ *   floor：当前楼层 id（如 '1F' / '3F' / '5F'）。用于挑这一层的材质配色（见 officeMap 的 colorsFor），
  *   之后可在运行时用 setFloor() 切换。
  */
 export function createIsoOffice(canvas, opts = {}) {

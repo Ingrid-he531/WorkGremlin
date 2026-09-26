@@ -16,7 +16,7 @@
 产品定位没变（本地只读的多 agent 协作可视化终端），但**实现形态已经离开 v0.1 设计**：
 
 - 领域模型由 **team** 改为 **工程（project）**（commit `def3fee`）；
-- 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~6F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
+- 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~5F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
 - 成员来源从「roster（`config.json`）+ A 路线目录监听」改为 **hook 上报 / `.codebuddy/agents` 名册 / `.workgremlin/subagents.json` 清单**三路；
 - 承诺的 **A 路线（`chokidar`）、消息脱敏、FTS5 查询、双连接存储、TS 迁移、自动化测试** 均未落地。
 
@@ -107,12 +107,15 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 | 2F | WorkBuddy CLI | `~/.workbuddy` 下 `*.jsonl` |
 | 3F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
 | 4F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分 |
-| 5F | TraeCode Plugin | MarsCode 数据根 `~/.marscode` + 编辑器 globalStorage 的结构化目录 |
-| 6F | TraeCode IDE | 没有可扫的会话落盘：会话来源就是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值） |
+| 5F | TraeCode（**IDE 与 Plugin 合并成一层**） | 会话来源是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值）：两个形态都没有可扫的**会话**落盘 —— IDE `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与 `project_memory.md` 是记忆文件（文件名带 session_id，但不是对话记录、也没有工程路径）；插件 `~/.marscode` 实测只有 ai-chat 二进制、日志与 `ai-agent/database.db` / `snapshot/<链 id>/v2/.git` 文件快照（前者不是可读的 sqlite、后者是逐轮改动的 git 快照）。**两处落盘都在楼层胶囊的 tooltip 里逐路列出**（IDE / plugin 两行，各带一句"只作展示、取不到会话"的说明） |
 
-合并楼层在 `products.js` 里由 `sources` 声明（1F 是 `['cli', 'plugin', 'hook']`）：一个楼层可以吃
-多路落盘，每一路带自己的 client（`codebuddy` / `codebuddy-plugin`），相位与完成标记按会话各认各的。
-自检见 `server/test/codebuddyFloor.test.js`（`npm run test:codebuddy`）。
+合并楼层在 `products.js` 里由 `sources` 声明（1F 是 `['cli', 'plugin', 'hook']`，5F 是
+两个 `dir` 落盘 + `hook`）：一个楼层可以吃多路落盘，每一路带自己的 client（`codebuddy` /
+`codebuddy-plugin`、`trae` / `trae-plugin`），相位与完成标记按会话各认各的。
+条目可以是 `{ kind, label?, client?, dirs?, note? }`：`kind: 'dir'` = 只作落盘展示、不产会话
+（`sessions: false`），两份 `dir` 靠 `label` 在 tooltip 里区分（IDE / plugin）；
+某一路读不出会话时，服务端在 `sources[].note` 里给一句说明，楼层胶囊的 tooltip 照它显示。
+自检见 `server/test/mergedFloors.test.js`（`npm run test:floors`）。
 
 选中的会话决定主 Agent 控制台的相位（幽灵状态跟着走），办公室布局不受影响；切到没有活跃会话的楼层时整屋清空。
 

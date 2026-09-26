@@ -63,7 +63,7 @@ store.selectFloor = (id) => {
 };
 
 const reset = () => {
-  store.floors = ['1F', '2F', '3F', '4F', '5F', '6F'].map((id) => ({ id, name: id, installed: true, sessions: [], activeCount: 0 }));
+  store.floors = ['1F', '2F', '3F', '4F', '5F'].map((id) => ({ id, name: id, installed: true, sessions: [], activeCount: 0 }));
   store.selectedFloor = '1F';
   commits = 0;
 };

@@ -3,13 +3,13 @@
  *
  * 跑法：`npm run test:done`（= node 直接跑，零依赖）。
  * 为什么要有它：这块的每个 bug 都是"读代码看不出来、只有在真实状态文件摆放到位时才现形"的
- * 那一类 —— 切楼层误弹、6F 永不亮、跨工程把别人的收工搬过来。所以这里不 mock 内部函数，
+ * 那一类 —— 切楼层误弹、5F 永不亮、跨工程把别人的收工搬过来。所以这里不 mock 内部函数，
  * 而是把 HOME / WORKGREMLIN_HOME / PATH 全指到临时目录，让**真实的** products 探测、
  * scanCliSessions、doneFieldsOf、snapshot 跑一遍，只断言会话表里出来的字段。
  *
  * 覆盖（每条都对应一个踩过的坑）：
- *   [1] 6F hookSource：有会话 id、工程为空（Stop 后 hook 清空了 sessionPhase）→ 标记照样亮
- *       （守卫只砍 latest 兜底，不许砍精确命中；一刀砍就会让 6F 永不亮 + 下一轮假弹）
+ *   [1] 5F TraeCode（会话只能靠 hook）：有会话 id、工程为空（Stop 后 hook 清空了 sessionPhase）
+ *       → 标记照样亮（守卫只砍 latest 兜底，不许砍精确命中；一刀砍就会让 5F 永不亮 + 下一轮假弹）
  *   [2] 1F CLI：没有会话 id、工程也解析不出来 → 返回空标记，**不能**拿别工程的 latest 冒充
  *   [3] 3F Codex：会话 id 从 rollout 文件名取到 → 完成标记按会话精确，不吃同工程别人刚收工
  *   [4] 相同工程但 id 对不上 → 空标记（"命中不了"= 没完成过，不退回 latest）
@@ -29,7 +29,8 @@ const WG = path.join(TMP, 'wg');
 const BIN = path.join(TMP, 'bin');
 const HOOKS = path.join(WG, 'hooks');
 for (const d of [HOME, HOOKS, BIN]) fs.mkdirSync(d, { recursive: true });
-// 6F 是唯一 hookSource 楼层，"装没装"只看这条命令在不在 PATH 上；给个假的，让它进 products
+// 5F 是唯一"会话只能靠 hook 状态文件"的楼层，"装没装"只看这条命令在不在 PATH 上；
+// 给个假的，让它进 products
 fs.writeFileSync(path.join(BIN, 'trae-cn'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 // 必须在 require 业务模块**之前**改环境：products 的 HOME、sessions 的 reporterHookHome 都在模块期取值
 process.env.HOME = HOME;
@@ -80,8 +81,8 @@ const UB = '01a0dc1c-1ea8-7993-860d-eea6ba644a4e';
 const UX = 'bbbb1111-2222-3333-4444-555566667777';
 const UY = 'cccc1111-2222-3333-4444-555566667777';
 
-// [1] 6F：Stop 之后的状态文件（有 id、无工程），完成标记必须在
-writeState('trae', '/tmp/Proj7', U7, doneOf(60, '6F 收工摘要', 'note.js', '/tmp/Proj7'));
+// [1] 5F：Stop 之后的状态文件（有 id、无工程），完成标记必须在
+writeState('trae', '/tmp/Proj7', U7, doneOf(60, '5F 收工摘要', 'note.js', '/tmp/Proj7'));
 
 // [2] 1F：没有 cwd 的 transcript（工程解析不出来）+ 另一工程刚落的完成标记
 writeTranscript(path.join(HOME, '.codebuddy'), 'nocwd.jsonl', [{ type: 'message', text: 'hi' }]);
@@ -129,14 +130,14 @@ const desc = (r) => `projectPath=${JSON.stringify(r.projectPath)} sessionId=${JS
 console.log(`沙箱：${TMP}`);
 console.log(`楼层：${snap.floors.map((f) => `${f.id}${f.installed ? '' : '(未装)'}`).join(' ')}`);
 
-head('[1] 6F hookSource：有会话 id、工程为空（Stop 后 sessionPhase 被清空）→ 标记照样亮');
+head('[1] 5F TraeCode（会话只能靠 hook 状态文件）：有会话 id、工程为空 → 标记照样亮');
 {
-  const r = rows('6F').find((x) => x.sessionId === U7);
-  ok('6F 这一行存在', Boolean(r), JSON.stringify(snap.floors.find((f) => f.id === '6F') || {}));
+  const r = rows('5F').find((x) => x.sessionId === U7);
+  ok('5F 这一行存在', Boolean(r), JSON.stringify(snap.floors.find((f) => f.id === '5F') || {}));
   if (r) {
     ok('工程归属确为空（复现 Stop 后的状态）', r.projectPath === '', desc(r));
     ok('完成标记仍在（守卫没把精确命中一起砍掉）', r.doneAt === NOW - 60, desc(r));
-    ok('摘要用真实完成内容，不是空标记', r.doneTitle === '6F 收工摘要' && r.doneFiles[0] && r.doneFiles[0].name === 'note.js', desc(r));
+    ok('摘要用真实完成内容，不是空标记', r.doneTitle === '5F 收工摘要' && r.doneFiles[0] && r.doneFiles[0].name === 'note.js', desc(r));
   }
 }
 

@@ -1,10 +1,10 @@
 <script setup>
 /**
  * FloorSelector —— 左侧竖向堆叠的"楼层"胶囊。
- * 每个楼层对应一个受监控的产品：1F CodeBuddy（CLI + Plugin 合并）/ 2F WorkBuddy CLI /
- * 3F Codex（CLI + IDE 合并）/ 4F Claude Code / 5F TraeCode Plugin / 6F TraeCode IDE。
- * 合并楼层（1F）会扫**多路落盘**（CLI 的 ~/.codebuddy + 插件的 globalStorage），
- * 同时开着两种形态时表现成这一层里的多条会话，而不是多个楼层（见 server/src/products.js）。
+ * 楼层 = 受监控的产品（列表由服务端给，这里不写死；定义见 server/src/products.js）。
+ * 合并楼层（一个产品的两种形态合成一层）会扫**多路落盘**，同时开着两种形态时表现成这一层里的
+ * 多条会话，而不是多个楼层；某一路落盘**读不出会话**时，服务端会在 sources[].note 里给一句说明，
+ * 悬浮提示照它显示 —— 让"这一路读不到"和"这一层没在跑"分得清。
  *
  * 状态点看的是**这一层有没有活跃会话**（全局活跃会话表，60 分钟没事件会剔除）：
  *   - 有活跃会话：绿色状态点 + 数量角标
@@ -151,19 +151,36 @@ onBeforeUnmount(() => {
 /** 楼层列表换了（首次加载 / 10s 轮询）→ DOM 更新后再量一次 */
 watch(() => props.products, () => measure(), { flush: 'post' });
 
-/** 某一路落盘来源的显示名（合并楼层的悬浮提示要逐路标出来） */
-const SOURCE_LABEL = { cli: 'CLI', plugin: '插件', hook: 'hook 状态文件' };
+/**
+ * 某一路落盘来源的**默认**显示名（合并楼层的悬浮提示要逐路标出来；服务端给了 label 就用它，
+ * 同 kind 的两路也能分清 —— 5F 的 IDE 与插件都是 'dir'，标签是 IDE / plugin）。
+ * plugin 保留英文：跟 hook / CLI 一起对齐上报身份（codebuddy-plugin / trae-plugin）的叫法，
+ * 避免"插件"这个中译在不同楼层指代不同东西（IDE 插件？CodeBuddy 插件？）时看不出来。
+ */
+const SOURCE_LABEL = { cli: 'CLI', plugin: 'plugin', hook: 'hook 状态文件', dir: '落盘' };
 
-/** 一路落盘的说明文案：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）` */
-function sourceLine(label, dataPathLabel, stats) {
-  if (!dataPathLabel) return `${label}：未找到数据目录`;
-  const s = stats || {};
+/**
+ * 一路落盘的说明文案：
+ *   - cli / plugin：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）`
+ *   - hook：这一路没有自己的落盘目录，会话就是 reporter 上报的状态文件
+ * 都带上这一路自己的 note（取不到会话时服务端给的说明），让"没数据"和"读不到"分得清。
+ */
+function sourceLine(src) {
+  const label = src.label || SOURCE_LABEL[src.kind] || src.kind || '落盘';
+  if (src.kind === 'hook') {
+    return { text: `${label}：会话来源就是 reporter 状态文件（没有独立的会话落盘目录）`, note: src.note || '' };
+  }
+  if (!src.dataPathLabel) return { text: `${label}：没有找到落盘目录`, note: src.note || '' };
+  const s = src.stats || {};
   const bits = [];
   if (s.sessions) bits.push(`${s.sessions} 个会话文件`);
   if (s.files) bits.push(`${s.files} 个文件`);
   if (s.sizeLabel) bits.push(s.sizeLabel);
   if (s.lastModifiedAt) bits.push(`最后写入 ${new Date(s.lastModifiedAt).toLocaleString()}`);
-  return `${label}：${dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`;
+  return {
+    text: `${label}：${src.dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`,
+    note: src.note || '',
+  };
 }
 
 /** 悬浮提示：活跃会话 + 安装位置 + 落盘统计（合并楼层逐路列） */
@@ -179,14 +196,19 @@ function tip(p) {
     return lines.join('\n');
   }
   lines.push(`安装：${p.installPathLabel || '（未定位到可执行文件）'}`);
-  // 有落盘目录的来源才逐路列（hook 那一路没有自己的落盘目录，只在"活跃会话"里体现）
-  const sources = (p.sources || []).filter((s) => s.dataPathLabel);
-  if (sources.length > 1) {
-    for (const s of sources) lines.push(sourceLine(SOURCE_LABEL[s.kind] || s.kind || '落盘', s.dataPathLabel, s.stats));
-  } else if (sources.length === 1) {
-    lines.push(sourceLine('落盘', sources[0].dataPathLabel, sources[0].stats));
+  // 逐路列这一层的落盘来源（合并楼层多路）；取不到会话的那一路会带一行说明
+  const sources = Array.isArray(p.sources) ? p.sources : [];
+  if (sources.length) {
+    for (const src of sources) {
+      const line = sourceLine(src);
+      lines.push(line.text);
+      if (line.note) lines.push(`    · ${line.note}`);
+    }
   } else if (p.dataPathLabel) {
-    lines.push(sourceLine('落盘', p.dataPathLabel, p.stats));
+    // 老服务端（没有 sources 字段）的兜底：单行"落盘：…"
+    const line = sourceLine({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats });
+    lines.push(line.text);
+    if (line.note) lines.push(`    · ${line.note}`);
   } else {
     lines.push('落盘：未找到数据目录');
   }

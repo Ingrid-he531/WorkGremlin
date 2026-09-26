@@ -80,7 +80,7 @@ node scripts/subagents.js list
 
 让正在干活的 agent 自己往屋里报状态：**启动时会自动接入** —— 探测到装了哪个 CLI（只看安装位置），
 就把对应那份 hook 写好（合并式、幂等、首次改动前备份；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`）。
-**CodeBuddy 插件 / CodeBuddy CLI / WorkBuddy CLI / Codex CLI / Claude Code CLI / TraeCode 插件** 六个入口的会话都会上报。
+**CodeBuddy CLI+插件 / WorkBuddy CLI / Codex CLI / Claude Code CLI / TraeCode IDE+插件** 六个入口的会话都会上报。
 
 默认**全装**（遍历所有 target，装了才写、没装跳过）：
 
@@ -161,7 +161,7 @@ Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本�
 坐工位的小怪物名册除 `.codebuddy/agents/` 外，也会扫 `<工程>/.codex/agents/` 与 `$CODEX_HOME/agents/`。
 
 **成员是按楼层过滤的**：每个成员都带一个「来源客户端」（`members.client`），办公室与工位卡片只显示
-当前楼层那一路的成员 —— 1F 看 CodeBuddy、2F 看 WorkBuddy、3F 看 Codex、4F 看 Claude。
+当前楼层那一路的成员 —— 1F 看 CodeBuddy、2F 看 WorkBuddy、3F 看 Codex、4F 看 Claude、5F 看 TraeCode。
 所以切到 3F 不会再看见你在 CodeBuddy 里建的小怪物。`client` 为空的是「通用」成员（演示数据、
 手工 `scripts/subagents.js` 写的幽灵），哪层都显示。
 
@@ -229,7 +229,17 @@ CLI 与插件是同一份 `~/.claude`、同一套 hook、连二进制都相同�
 （`genie-history` / `todos` / `message-queue` / `file-changes`，唯一能拿到运行态的一路）。
 两路都归 1F：同时开着 CLI 与 Plugin 时，表现是**这一层里的两条会话**，不是两个楼层；
 实时相位与完成标记按会话各认各的（`/api/v1/reporter-phase?client=codebuddy,codebuddy-plugin&session=<id>`）。
-想知道"某一层吃哪几路落盘"，看 `server/src/products.js` 的 `sources`；自检 `npm run test:codebuddy`。
+
+**TraeCode 的 IDE 与插件同样合成一层（5F TraeCode）**，但这一层的会话**只能靠 hook 状态文件**：
+两个形态都没有可扫的**会话**落盘 —— `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl`
+与 `project_memory.md` 是笔记/记忆（文件名带 session_id，但不是对话记录、也没有工程路径）；
+`~/.marscode`（插件运行时）实测只有 ai-chat 二进制、日志，以及 `ai-agent/database.db`（不是可读的 sqlite）
+与 `snapshot/<链 id>/v2/.git`（逐轮改动的 git 文件快照）。所以两处落盘都**只作展示**：
+楼层胶囊的 tooltip 会把 IDE（`~/.trae-cn`）与插件（`~/.marscode`）两路都列出来、各带一句"取不到会话"的说明，
+免得把"这一路读不到"误看成"这一层没在跑"。
+
+想知道"某一层吃哪几路落盘"，看 `server/src/products.js` 的 `sources`（某一路读不出会话时，
+服务端会在 `sources[].note` 里给一句说明）；自检 `npm run test:floors`。
 
 ## 安全基线（不得关闭）
 

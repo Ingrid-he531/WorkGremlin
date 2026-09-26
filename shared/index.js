@@ -225,16 +225,17 @@ const IPC_EVENTS = Object.freeze({
  * 这是全局唯一合同（hook 的 eventClient 据此产出 client 字段，server/前端据此归层）。
  *   - agent（基名）：codebuddy / workbuddy / codex / claude / trae …（见 server/src/products.js 的楼层定义）
  *   - client（上报身份）：非 plugin 直接是 agent；plugin 是 agent + '-plugin'。
- * 例：CodeBuddy 同时有 CLI（client=codebuddy，1F）与 Plugin（client=codebuddy-plugin，3F）；
- * Codex 有 4F CLI / 7F Plugin、Trae 有 6F Plugin / 7F CLI，两个变体都有。
- * **Claude Code 只有 CLI 一个身份**（client=claude，5F）：它的 CLI 与 IDE 插件共用同一份
- * ~/.claude 配置、同一套 hook、同一个落盘目录，事件 payload 里也没有能区分二者的字段（实测 2.1），
- * 所以不拆成两层。
+ * 合同只有这两条形状，**这里不写"哪个 client 在哪层"**：楼层编号、哪两个形态合成一层，都是
+ * server/src/products.js 的事（前端读 /api/v1/sessions 的 floors[].clients，不自己推）。
+ * 一个楼层可以接纳多个 client —— 例如 CodeBuddy 的 CLI（codebuddy）与 Plugin
+ * （codebuddy-plugin）同属一个楼层，TraeCode 的 IDE（trae）与插件（trae-plugin）也是；
+ * 也可以只有一个：**claude 没有 plugin 形态**（client=claude），它的 CLI 与 IDE 插件共用
+ * 同一份 ~/.claude 配置、同一套 hook、同一个落盘目录，事件 payload 里也没有能区分二者的字段（实测 2.1）。
  *
  * 但"一个楼层"不等于"一条会话"：同一层里可以同时开着多条会话（两个终端 / 终端 + IDE 混着跑）。
  * 那一条轴是 **session_id**（hook payload 字段，也是 transcript 的文件名），
  * 跟 client 正交：client 决定**楼层**，session_id 决定**楼层里的哪条会话**。
- * 以后再加别的变体（比如某产品真有独立的 plugin 形态），只需在 products.js 多写一条楼层。
+ * 以后再加别产品/变体，只需在 products.js 改一条楼层（sources 里挂几路、clients 就收几种身份）。
  */
 
 /** 去 '-plugin' 后缀，拿到产品基名（小写）；非法/空输入返回 '' */

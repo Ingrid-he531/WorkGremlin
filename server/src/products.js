@@ -6,8 +6,7 @@
  *   2F  WorkBuddy CLI
  *   3F  Codex（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并单楼层）
  *   4F  Claude Code（CLI 与 IDE 同 ~/.claude、同 hook，分不出，合并单楼层）
- *   5F  TraeCode Plugin
- *   6F  TraeCode IDE
+ *   5F  TraeCode（IDE 与 Plugin 合并：会话来自 hook 状态文件；插件落盘取不到会话，见下）
  *
  * **CodeBuddy 只有一层**（1F）：CLI 与 Plugin 是同一个产品的两种形态 —— CLI 落 `~/.codebuddy`
  * （会话 jsonl / hook 状态文件），Plugin 落编辑器的 globalStorage（genie-history / todos /
@@ -16,6 +15,17 @@
  * 而"到底有几个在跑"其实是**会话**的事。现在合成一层：这一层的 `sources` 把两处落盘都扫一遍、
  * `clients` 照收 codebuddy 与 codebuddy-plugin 两种上报身份。同时开着 CLI 与 Plugin 时，
  * 表现是**这一层里的两条会话**（靠 session_id 区分），不是两个楼层。
+ *
+ * **TraeCode 也只有一层**（5F）：IDE（`~/.trae-cn`）与插件（`~/.marscode`）是同一个产品，
+ * 以前拆成 5F Plugin / 6F IDE 两层。合并后**两处落盘都列出来**（kind 'dir'，只作展示），
+ * 会话来源则是 reporter hook 的状态文件 —— TraeCode 两个形态都没有可扫的**会话**落盘：
+ *   · `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与
+ *     `project_memory.md`：**记忆**文件（文件名带 session_id，但它不是对话记录、没有工程路径，
+ *     不足以当会话行用），另外还有 extensions / plugins / mcps 这些安装目录；
+ *   · `~/.marscode`：插件自己的运行时（ai-chat 二进制、日志、`ai-agent/database.db` 与
+ *     `snapshot/<链 id>/v2/.git` 文件快照 —— 前者不是可读的 sqlite，后者是逐轮改动的 git 快照）。
+ * 所以这两路都**取不到会话**，只作落盘展示，并在楼层胶囊的 tooltip 里各带一句说明
+ * （见 detectSource 的 label / note）。
  *
  * Claude Code 同理只有一层（4F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、
  * 同一个落盘目录（~/.claude/projects），连二进制都是同一份 —— 事件 payload 里没有任何字段能
@@ -352,9 +362,9 @@ function findDataPath(kind, plugin) {
           ? [claudeHome()]
           : kind === 'trae'
             ? plugin
-              // 插件形态（5F TraeCode Plugin）：MarsCode 数据根，内置 trae 插件就装在
+              // 插件形态（5F TraeCode 的插件那一路）：MarsCode 数据根，内置 trae 插件就装在
               // ~/.marscode/builtin/trae，落盘也在它下面。
-              // 命令形态（6F TraeCode IDE）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
+              // 命令形态（同一个 5F 的 IDE 那一路）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
               ? [path.join(HOME, '.marscode'), path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')]
               : [path.join(HOME, '.trae'), path.join(HOME, '.trae-cn')]
             : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
@@ -394,7 +404,7 @@ function findPluginDir(res = RE_PLUGIN) {
  *   - workbuddy：2F CLI（暂无 Plugin）
  *   - codex     ：3F（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并为单楼层）
  *   - claude    ：4F CLI（**只有这一层**，见文件头说明：plugin 与 CLI 同配置同 hook，分不出来）
- *   - trae      ：5F Plugin / 6F CLI
+ *   - trae      ：5F（IDE 与 Plugin 合并，见文件头：会话只能靠 hook 状态文件）
  * 要再加楼层（或把某产品的两种形态合并），只需在这里加/改一条 —— client、归层、过滤、
  * 会话来源、落盘扫描全部自动跟着走。
  *
@@ -458,67 +468,131 @@ const PRODUCTS = [
   },
   {
     id: '5F',
-    name: 'TraeCode Plugin',
-    kind: 'plugin',
-    cmd: '',
-    agent: 'trae',
-    plugin: true,
-    pluginRe: /trae/i,
-    dataKind: clientOf('trae', true),
-  },
-  {
-    id: '6F',
-    name: 'TraeCode IDE',
+    name: 'TraeCode',
     kind: 'cli',
     cmd: 'trae',
     // 国内版 TraeCode 桌面 IDE 的命令是 trae-cn（/usr/bin/trae-cn，没有独立的 trae CLI）；
-    // 这层对应的就是那台 IDE，主命令搜不到时认它。
+    // 主命令搜不到时认它（插件形态由 runner 自带，没有独立可执行文件）。
     altCmd: 'trae-cn',
     agent: 'trae',
     plugin: false,
-    // 这层没有人能扫的会话落盘（TraeCode 的 memory/*.jsonl 不是会话），会话来源改用
-    // reporter hook 的状态文件本身（sessionId / workspacePath 都是 hook payload 实测值）。
+    pluginRe: /trae/i,
+    // 合并楼层（见文件头）：IDE 与 Plugin 是同一个产品，两个形态的落盘都要列出来。
+    //   dir(IDE)    —— ~/.trae-cn（国内版）/ ~/.trae（国际版）：memory/ 里是
+    //                  session_memory_<会话>.jsonl 这类**记忆**文件 + project_memory.md，
+    //                  不是对话记录，所以只作落盘展示、不当会话来源（见下面的 note）
+    //   dir(plugin) —— ~/.marscode：插件自己的运行时（没有会话索引）
+    //   hook        —— 会话来源就是 reporter 状态文件（sessionId / workspacePath 都是实测值）
+    sources: [
+      {
+        kind: 'dir',
+        label: 'IDE',
+        client: clientOf('trae', false),
+        dirs: [path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')],
+        note: '这一路只作落盘展示：memory/ 里是 session_memory_<会话>.jsonl 这类记忆文件与 project_memory.md，不是对话记录；会话列表由 hook 状态文件提供',
+      },
+      {
+        kind: 'dir',
+        label: 'plugin',
+        client: clientOf('trae', true),
+        dirs: [path.join(HOME, '.marscode')],
+        note: '这一路只作落盘展示：目录里是插件自己的运行时（日志、ai-agent/ 的文件快照，以及读不出的 database.db），没有会话索引；会话列表由 hook 状态文件提供',
+      },
+      { kind: 'hook' },
+    ],
+    // 老口径的标记（sources 之前用它推来源）：会话只能靠 hook 状态文件 —— 这一层确实如此
     hookSource: true,
     dataKind: clientOf('trae', false),
   },
 ];
 
 /**
- * 这一层吃哪几路会话/落盘来源。合并楼层（1F CodeBuddy）显式挂多路；
- * 其余楼层按老口径推出一路，行为与改动前完全一致。
- * @returns {Array<'cli'|'plugin'|'hook'>}
+ * 这一层吃哪几路会话/落盘来源。合并楼层显式挂多路；其余楼层按老口径推出一路，
+ * 行为与改动前完全一致。
+ *
+ * 条目是**字符串**（只给 kind，老写法）或**对象**（合并楼层用得上）：
+ *   { kind, label?, client?, dirs?, note? }
+ *   · kind   'cli'（扫会话 jsonl）| 'plugin'（结构化落盘）| 'hook'（reporter 状态文件）
+ *            | 'dir'（**只作落盘展示**，不产会话 —— 目录里有东西但读不出会话时用它）
+ *   · label  前端悬浮提示里的显示名（'IDE' / 'plugin' …）；不给就按 kind 显示
+ *   · client 这一路对应的上报身份；不给就按 kind 推（plugin → agent-plugin，其余 → agent）
+ *   · dirs   显式落盘目录候选（同一形态可能有多处：国际版 ~/.trae / 国内版 ~/.trae-cn）
+ *   · note   这一路读不出会话时的说明（悬浮提示里显示）
+ * @returns {Array<{kind: string, label?: string, client?: string, dirs?: string[], note?: string}>}
  */
-function sourcesOf(p) {
-  const list = p.sources && p.sources.length ? p.sources : p.hookSource ? ['hook'] : p.plugin ? ['plugin'] : ['cli'];
-  return [...new Set(list)];
+function sourceSpecs(p) {
+  const raw = p.sources && p.sources.length ? p.sources : p.hookSource ? ['hook'] : p.plugin ? ['plugin'] : ['cli'];
+  // 老写法是一串 kind：按 kind 去重保序（对象写法可以挂两路同 kind 的 dir，不去重）
+  if (raw.some((s) => typeof s !== 'string')) return raw.map((s) => ({ ...(typeof s === 'string' ? { kind: s } : s) }));
+  return [...new Set(raw)].map((kind) => ({ kind }));
 }
 
-/** 每一路来源的 client（上报身份）：CLI / hook 走 agent 本身，plugin 走 agent + '-plugin' */
-function sourceClient(agent, kind) {
-  return clientOf(agent, kind === 'plugin');
+/** 这一路的上报身份：显式给了就用它，否则按 kind 推（plugin → agent-plugin，其余 → agent） */
+function sourceClient(p, spec) {
+  return spec.client || clientOf(p.agent, spec.kind === 'plugin');
+}
+
+/** 这一路的落盘目录候选（顺序即优先级）：hook 没有落盘目录；'dir' 用显式 dirs */
+function sourceDirs(p, spec) {
+  if (spec.dirs && spec.dirs.length) return spec.dirs;
+  if (spec.kind === 'hook') return [];
+  return [findDataPath(p.agent, spec.kind === 'plugin')];
 }
 
 /** 空统计（没有落盘目录时的占位，字段与 scanDataDir 一致） */
 const NO_STATS = { files: 0, sessions: 0, bytes: 0, sizeLabel: '0 B', lastModifiedAt: null };
 
-/** 一路来源的描述：kind + client + 落盘目录 + 落盘统计（hook 来源没有自己的落盘目录） */
-function detectSource(p, kind) {
-  const dataPath = kind === 'hook' ? '' : findDataPath(p.agent, kind === 'plugin');
+/**
+ * 这一路落盘**能不能读出会话** —— 不能就明说，别让人以为"没数据是没跑过"。
+ *
+ * 判据很窄：插件的结构化会话索引是 `genie-history`（见 sessions.js 的 listSessions，
+ * 会话 id、当前会话、待办、改动文件都挂在它下面）。没有这个目录，这一路就取不到会话。
+ * 实测 TraeCode 插件（`~/.marscode`）正是这样：只有插件自己的运行时（ai-chat 二进制、
+ * 日志、`ai-agent/database.db` 与 `snapshot/<链 id>/v2/.git` 文件快照）——前者不是可读的
+ * sqlite，后者是逐轮改动的 git 快照、不是会话索引，所以会话只能靠 hook 那一路。
+ * @returns {string} 说明文案；不需要说明时回空串
+ */
+function sourceNote(kind, dataPath) {
+  // 只对"有落盘目录、但目录里没有会话索引"的插件来源补一句说明；
+  // hook 那一路没有落盘目录（会话就是状态文件本身），由前端固定文案交代，不在这里重复。
+  if (kind !== 'plugin' || !dataPath) return '';
+  if (isDir(path.join(dataPath, 'genie-history'))) return '';
+  return `${shorten(dataPath)} 里没有 genie-history 这类会话索引，只有产品自己的运行时文件 —— 这一路取不到会话（会话 id、运行态都读不到）`;
+}
+
+/**
+ * 一路来源的描述：kind + client + 落盘目录 + 落盘统计（hook 来源没有自己的落盘目录）。
+ * @param {string[]} clients 这一层接纳的全部上报身份 —— hook 那一路要按**整层**过滤：
+ *   会话就是状态文件本身，合并楼层的两种身份（trae / trae-plugin、codebuddy / codebuddy-plugin）
+ *   都属于这一层。单独传一个 client 会让"插件形态跑在 IDE 里"的那种会话漏掉。
+ */
+function detectSource(p, spec, clients) {
+  // 目录候选里取第一个真实存在的（~/.trae-cn 与 ~/.trae 只会有一个）
+  const dataPath = sourceDirs(p, spec).find((d) => d && isDir(d)) || '';
   return {
-    kind,
-    client: sourceClient(p.agent, kind),
+    kind: spec.kind,
+    /** 前端显示名（'IDE' / 'plugin' …）；空则由前端按 kind 显示 */
+    label: spec.label || '',
+    client: spec.kind === 'hook' ? clients.join(',') : sourceClient(p, spec),
+    /** 这一路产不产会话：'dir' = 只作落盘展示（目录里有东西，但读不出会话） */
+    sessions: spec.kind !== 'dir',
     dataPath,
     dataPathLabel: shorten(dataPath),
     stats: dataPath ? scanDataDir(dataPath) : { ...NO_STATS },
+    /** 这一路取不到会话时的说明（楼层胶囊 tooltip 里显示）；能取到 / 没目录就是空串 */
+    note: dataPath ? spec.note || sourceNote(spec.kind, dataPath) : '',
   };
 }
 
 function detectOne(p) {
-  const sources = sourcesOf(p).map((kind) => detectSource(p, kind));
-  const hasPluginSource = sources.some((s) => s.kind === 'plugin');
+  const specs = sourceSpecs(p);
+  // 这一层接纳的上报身份（去重保序）：由各来源的形态反推，第一路是主身份
+  const clients = [...new Set(specs.map((spec) => sourceClient(p, spec)))];
+  const sources = specs.map((spec) => detectSource(p, spec, clients));
+  const hasPluginSource = specs.some((spec) => spec.kind === 'plugin');
   const installPath =
     (p.cmd ? resolveCommand(p.cmd) || findCliBin(p.cmd) : '') ||
-    // 备用命令（6F TraeCode：国内版 IDE 的 trae-cn）——主命令搜不到时再认它。
+    // 备用命令（5F TraeCode：国内版 IDE 的 trae-cn）——主命令搜不到时再认它。
     (p.altCmd ? resolveCommand(p.altCmd) || findCliBin(p.altCmd) : '') ||
     // 插件形态的安装证据：plugin 楼层看自己的 pluginRe；合并楼层（1F CodeBuddy）也认插件扩展
     // ——只装了 IDE 插件、没装 CLI 的人，这一层照样是"装了"（会话也确实在跑）。
@@ -526,11 +600,15 @@ function detectOne(p) {
     // 合并楼层（3F Codex）：命令行搜不到时，再认一次宿主扩展目录。
     // 不改 kind / client：这层本来就同时代表 CLI 与 IDE，只是我们抓不到可执行文件而已。
     (p.altPluginRe ? findPluginDir(p.altPluginRe) : '');
-  // 主来源 = 老口径那一路（合并楼层取 cli，即 ~/.codebuddy）；dataPath / stats 沿用它的，
-  // 保证前端悬浮提示、外层调用方的字段形状不变（多路的完整清单在 sources 里）。
-  const primary = sources.find((s) => s.kind === (p.plugin ? 'plugin' : 'cli')) || sources[0] || { dataPath: '', dataPathLabel: '', stats: { ...NO_STATS } };
-  // 这一层接纳的上报身份（去重保序）：由各来源的 client 反推，第一路是主身份
-  const clients = [...new Set(sources.map((s) => s.client))];
+  // 主来源 = 老口径那一路（CLI 楼层取 cli、插件楼层取 plugin）；合并楼层没有那一路时，
+  // 取第一个真的有落盘目录的（1F → cli 的 ~/.codebuddy，5F → IDE 的 ~/.trae-cn）。
+  // dataPath / stats 沿用它的，保证前端悬浮提示、外层调用方的字段形状不变（多路清单在 sources 里）。
+  const emptySource = { dataPath: '', dataPathLabel: '', stats: { ...NO_STATS } };
+  const primary =
+    sources.find((s) => s.kind === (p.plugin ? 'plugin' : 'cli')) ||
+    sources.find((s) => s.dataPath) ||
+    sources[0] ||
+    emptySource;
   const dataKind = clients[0] || p.dataKind;
 
   return {
@@ -548,8 +626,10 @@ function detectOne(p) {
     /** 会话来源只有 reporter hook 状态文件（没有可扫的会话落盘），见 refresh 的对应分支 */
     hookSource: Boolean(p.hookSource),
     /**
-     * 会话 / 落盘来源清单（合并楼层多路）：[{ kind, client, dataPath, dataPathLabel, stats }]。
-     * sessionRegistry 按它逐路取会话；前端悬浮提示按它逐路显示落盘信息。
+     * 会话 / 落盘来源清单（合并楼层多路）：
+     * [{ kind, client, dataPath, dataPathLabel, stats, note }]。
+     * sessionRegistry 按它逐路取会话；前端悬浮提示按它逐路显示落盘信息，
+     * note 非空 = 这一路读不出会话（照实说明，别让人误以为"没跑过"）。
      */
     sources,
     // 装没装只看**安装位置**：CLI 得找到可执行文件，插件得找到扩展目录。

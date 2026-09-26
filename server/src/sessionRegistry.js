@@ -288,7 +288,7 @@ const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [] };
  * 只能退回 (工程+client) 的 latest** —— 同层跑多条会话时，后者仍可能把"别人刚收工"
  * 算到当前这条头上。这是已知残留，不是本次回归。
  * 现在拿得到 id 的是：Claude CLI（文件名）、Codex（rollout 文件名，见 sessionIdOfFile）、
- * 6F hookSource（listReporterSessions 本来就只列得出有 sessionId 的）、以及 1F CodeBuddy 的
+ * 5F TraeCode（listReporterSessions 本来就只列得出有 sessionId 的）、以及 1F CodeBuddy 的
  * hook 那一路。剩下 1F（CLI 的 jsonl）/ 2F 两个 CLI 楼层的文件名不含 id，退回该工程内的 latest；
  * plugin 那一路的会话行现在也带 sessionId 了，但它们的 doneAt 另走 sessions.js 的 sessionInfo，
  * 不经过本函数。
@@ -306,9 +306,9 @@ function doneFieldsOf(projectPath, client, sessionId = '') {
    *
    * 但只砍**兜底**这一支，**不砍有会话 id 的精确命中**（两者安全性不同：id 唯一，精确命中
    * 与工程无关）。一刀砍掉会误伤两条真实路径：
-   *   · 6F TraeCode IDE（hookSource）—— 会话一 Stop，hook 就把 sessionPhase 与
+   *   · 5F TraeCode（会话只能靠 hook 状态文件）—— 会话一 Stop，hook 就把 sessionPhase 与
    *     taskWorkspacePath 一起清空（实测 sessionPhase:null、taskWorkspacePath:""），于是
-   *     "有完成标记"与"工程归属非空"按构造互斥：守卫一开，6F 的「任务完成」永远不亮，
+   *     "有完成标记"与"工程归属非空"按构造互斥：守卫一开，5F 的「任务完成」永远不亮，
    *     反而要等下一轮开工、工程回来了才突然亮起上一轮的完成（假弹）。
    *   · Claude 会话的 cwd 没解析出来时工程也是空，但它有会话 id，精确命中照样是对的。
    * 反过来，没有会话 id 的（1F/2F）行为不变：仍返回空标记（合"绝不编造"纪律）。
@@ -355,12 +355,13 @@ function refresh({ workspacePath = '', force = false } = {}) {
    *
    * 两种来源之间有个例外（见下面的 cli 分支）：CLI 的会话 jsonl 与 reporter 状态文件
    * 说的是同一批会话，但 jsonl 那条路拿不到会话 id —— 两路一起列，同一条会话会显示成两条。
-   * 所以**jsonl 优先**：只要这一层的 CLI 落盘扫到了会话，hook 那一路整层跳过；
-   * 一条都没扫到（CodeBuddy CLI 的常见形态：只留 hook 状态文件）才用状态文件兜底。
+   * 所以**jsonl 优先，但只算"还活着的"**：这一层的 CLI 落盘扫到了 60 分钟窗口内还动过的
+   * 会话，hook 那一路才整层跳过；一条活会话都没扫到（CodeBuddy CLI 的常见形态：只留 hook
+   * 状态文件；或只剩陈旧 jsonl）就用状态文件兜底。
    */
   const products = detectProducts({});
   const seen = new Set();
-  /** 这一层的 CLI 落盘到底扫出会话没有（决定 hook 那一路要不要兜底，见上面的说明） */
+  /** 这一层的 CLI 落盘到底扫出【活】会话没有（决定 hook 那一路要不要兜底，见上面的说明） */
   const cliLandingSeen = new Set();
   const claim = (floor, sessionId) => {
     if (!sessionId) return true;
@@ -372,6 +373,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
 
   for (const p of products) {
     for (const src of p.sources) {
+      // 只作落盘展示的那几路（kind 'dir'，如 5F 的 ~/.trae-cn 与 ~/.marscode）不产会话：
+      // 目录里有东西，但读不出会话索引 —— 它们只进楼层悬浮提示，不进会话表。
+      if (src.sessions === false) continue;
+
       // ---- 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）----
       if (src.kind === 'plugin') {
         const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
@@ -420,7 +425,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
       }
 
       // ---- hook 那一路：由 reporter 状态文件构成会话表 ----
-      // 两个用途：① 6F TraeCode IDE 压根没有可扫的会话落盘，它是唯一来源；
+      // 两个用途：① 5F TraeCode 两个形态都没有可扫的会话落盘，它是唯一来源；
       // ② 1F CodeBuddy CLI 的兜底 —— CLI 常常只留 hook 状态文件。
       // 但只要有 jsonl 可扫就不走这条（同一条会话两路都看得到时，只有 jsonl 那路拿不到
       // 会话 id，混着列会把一条会话显示成两条，见上面 refresh 的说明）。
@@ -441,15 +446,28 @@ function refresh({ workspacePath = '', force = false } = {}) {
               projectPath: s.workspacePath,
               lastEventAt: s.lastEventAt,
             }));
-      if (rows.length) {
+      // 判据得是"这一路扫到了【还活着】的会话"，而不是"扫到了任何行"。
+      // 陈旧 jsonl（早已超过 60min 超时、马上要被 prune() 剔除）也算数会把 hook 兜底那一路
+      // 整层让位，导致只有 hook 状态文件的正在跑会话连表都进不去、整层显示 0 会话
+      // （见 mergedFloors.test.js [A4] 复现）。
+      // "活着"与 prune / snapshot 用同一把尺子（TIMEOUT_MS = 60 分钟）；陈旧行本来也会被
+      // prune 掉（snapshot 只列 active 的），所以连登记都不登记它们 —— 顺带避免它用
+      // 会话 id 去 claim（那会让同名 id 的活会话在 claim 那一步被顶掉）。
+      const live = rows.filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS);
+      // `cliLandingSeen` / 撤 hook 行**只由 CLI 落盘那一路决定**，判据挂在具体的 kind 上：
+      //   · hook 那一路自己不是判据来源 —— 挂在通用的 rows/live 上，它每轮都会先把自己那几行
+      //     删掉再重新 upsert（firstSeenAt 也跟着重置），语义上更是"让位给自己"；
+      //   · 按 kind 判定与声明顺序无关：哪天把 sources 写成 ['hook', 'cli']，结论不变
+      //     （hook 先登记、cli 那一趟再把它们撤掉；cli 没有活会话时 hook 正常留着）。
+      if (src.kind === 'cli' && live.length) {
         cliLandingSeen.add(p.id);
-        // 这一层以前可能正靠 hook 兜底列会话（见上面那段说明）：CLI 落盘现在有会话了，
+        // 这一层以前可能正靠 hook 兜底列会话（见上面那段说明）：CLI 落盘现在有【活】会话了，
         // 就把那些 hook 行撤掉 —— 表按 `楼层:id` 存，一条会话的两路 id 不同，不会自动重合，
         // 不撤就会同一会话挂两行（一行 hook、一行 jsonl）。
         for (const [k, v] of table) if (v.floor === p.id && v.sourceKind === 'hook') table.delete(k);
       }
 
-      for (const s of rows) {
+      for (const s of live) {
         const sessionId = s.sessionId || '';
         if (!claim(p.id, sessionId)) continue;
         const lastEventAt = s.lastEventAt;
@@ -457,7 +475,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
           floor: p.id,
           id: s.id,
           // 轴 2：会话 id —— Claude 取 transcript 文件名、Codex 取 rollout 文件名的尾段、
-          // TraeCode IDE / CodeBuddy CLI 的 hook 那一路取状态文件里的 sessionId。
+          // TraeCode / CodeBuddy CLI 的 hook 那一路取状态文件里的 sessionId。
           // 渲染层拿它去问 `/api/v1/reporter-phase?session=`，就能只取这条会话的实时相位，
           // 不再"同一个 client 里谁最新就显示谁"。取不到（CodeBuddy CLI 的 jsonl 文件名不含 id）
           // → 空串，退回旧行为。
@@ -529,9 +547,16 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       // 落盘来源（合并楼层多路，含每路的落盘目录与统计）—— 楼层悬浮提示按它逐路显示
       sources: (p.sources || []).map((s) => ({
         kind: s.kind,
+        // 显示名（'IDE' / 'plugin' …）：同 kind 可能有两路（5F 的 IDE 与插件都是 'dir'）
+        label: s.label || '',
+        // 这一路产不产会话：false = 只作落盘展示（悬浮提示里说明"读不出会话"）
+        sessions: s.sessions !== false,
         client: s.client,
         dataPathLabel: s.dataPathLabel || '',
         stats: s.stats || null,
+        // 这一路取不到会话时的说明（如 TraeCode 的插件落盘没有会话索引）——
+        // 前端悬浮提示照它显示，让"没数据"和"读不到"分得清
+        note: s.note || '',
       })),
       /** 这一层有几个活跃会话 —— 左侧状态点绿/灰就看它 */
       activeCount: sessions.length,

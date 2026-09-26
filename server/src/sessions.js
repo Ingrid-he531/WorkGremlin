@@ -4,10 +4,12 @@
  * 会话（conversation）—— 受监控产品在各个工程下开着的会话。
  *
  * 同一层的 CLI 与 Plugin 两路落盘**不是同一份**，各自有各自的取法，但产出同一种会话行：
- *   · 插件那路（1F CodeBuddy 的插件形态、5F TraeCode Plugin）：就是本文件下面这套结构化落盘
+ *   · 插件那路（1F CodeBuddy 的插件形态）：就是本文件下面这套结构化落盘
  *     （genie-history / todos / message-queue / file-changes），能拿到运行态；
+ *     TraeCode 的插件形态没有这套落盘（实测只有运行时文件），所以它那两路落盘
+ *     （~/.trae-cn、~/.marscode）只作展示、不进会话来源（见 products.js 的 sources）。
  *   · CLI 那路（1F CodeBuddy、2F、3F、4F）：会话在各自的会话 jsonl 里，只有文件时间可靠；
- *   · hook 那路（6F TraeCode IDE、1F CodeBuddy CLI 的兜底）：连 jsonl 都没有时，
+ *   · hook 那路（5F TraeCode、1F CodeBuddy CLI 的兜底）：连 jsonl 都没有时，
  *     会话来源就是 reporter 状态文件（listReporterSessions）。
  * 楼层吃哪几路由 server/src/products.js 的 sources 声明（合并楼层可多路）。
  *
@@ -68,7 +70,7 @@ const LEGACY_STATE_CLIENT = 'codebuddy';
  * 合并楼层（1F CodeBuddy 把 CLI 与 Plugin 合成一层）就是"一个楼层吃两路上报身份"，
  * 它把 clients 列表一起传进来（见 server/src/products.js 的 sources / clients）。
  * 别的楼层一律传单值，行为与改动前逐字一致（精确比对，不做基名放宽）——
- * 5F TraeCode Plugin 与 6F TraeCode IDE 必须靠这条继续分开。
+ * 合并楼层的两路（如 5F TraeCode = trae + trae-plugin）则一次收一串。
  *
  * got 是状态文件里记的 client；老状态文件没有 client 字段 → 按 codebuddy（CLI）归属。
  * @param {string} want 楼层要求的 client（单个，或逗号分隔多个）；空 = 不限
@@ -1055,7 +1057,7 @@ module.exports = {
   hasOtherLiveSession,
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
   readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
-  listReporterSessions, // 只认 hook 的楼层（6F TraeCode IDE）与合并楼层的 hook 那一路（1F CodeBuddy CLI）
+  listReporterSessions, // 会话只能靠 hook 的楼层（5F TraeCode）与合并楼层的 hook 那一路（1F CodeBuddy CLI）
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
   listSessions,
   findPluginStorage,
