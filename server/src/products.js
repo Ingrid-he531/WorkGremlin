@@ -221,6 +221,17 @@ function traeGlobalStorageRoots() {
 }
 
 /**
+ * Claude Code 的配置根 —— 配置、hook（settings.json）与会话落盘（projects/）都在它下面。
+ *
+ * 认 CLAUDE_CONFIG_DIR：**装 hook 的那一头（scripts/install-hooks.js）早就认了**，
+ * 找落盘这一头以前写死 ~/.claude —— 设了这个变量的人，hooks 装到了新根下，
+ * 服务端却还在老根下找会话，5F 于是永远扫不到东西。这个根只留这一处定义。
+ */
+function claudeHome() {
+  return process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+}
+
+/**
  * nvm 的 bin：<HOME>/.nvm/versions/node/<版本>/bin。
  * 版本目录名不固定（v18.20.4 / v22.11.0 …），没法写死，只能在运行时展开一层。
  * 服务端常由桌面端拉起，PATH 里往往没有 nvm，所以这条兜底不能省。
@@ -331,7 +342,7 @@ function findDataPath(kind, plugin) {
       : kind === 'codex'
         ? [path.join(HOME, '.codex')]
         : kind === 'claude'
-          ? [path.join(HOME, '.claude')]
+          ? [claudeHome()]
           : kind === 'trae'
             ? plugin
               // 插件形态（6F TraeCode Plugin）：MarsCode 数据根，内置 trae 插件就装在
@@ -511,4 +522,4 @@ function detectProducts({ force = false } = {}) {
   return products;
 }
 
-module.exports = { detectProducts, PRODUCTS, shorten, humanSize, traeGlobalStorageRoots };
+module.exports = { detectProducts, PRODUCTS, shorten, humanSize, traeGlobalStorageRoots, claudeHome };

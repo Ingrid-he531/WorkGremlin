@@ -416,8 +416,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         memberId: member.id,
         client: client0,
         sessionId: normSession(p.sessionId),
-        // hook payload 里没有模型字段（TraeCode 六个事件都不带），为空时按会话去
-        // TraeCode 自己的 globalStorage 里取"当前选中模型"（见 sessions.sessionModel）。
+        // hook payload 里没有模型字段的产品（TraeCode 六个事件都不带、Claude Code 除
+        // SessionStart 外也都不带），为空时按会话去**各自的落盘**里取当前模型
+        // （见 sessions.sessionModel：traeModels / claudeModels 两个适配器）。
         // 取不到就是空 —— 报表的"模型"列留空，不拿默认模型冒充。
         model: normModel(p.model) || sessionModel(client0, p.sessionId) || null,
         title: p.title || '(未命名任务)',
@@ -495,15 +496,25 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     // 台账收尾：结束时间 / 花费时间 / 产出（收尾自述）/ 本轮改动文件
     if (String(member.role || '') === 'agent') {
       const run = repo.getTaskRun.get(p.taskId);
+      // 模型靠**落盘**取的产品（Claude Code / TraeCode）在这儿补一刀：开轮时 transcript 里还
+      // 没有本轮的 assistant 行，读到的是上一轮的模型（会话第一轮则一条都没有、直接为空），
+      // 收尾时再按会话取一次就能拿到本轮真实的那个。见 sessions.sessionModel。
+      const endClient = (run && run.client) || member.client || normClient(p.client) || null;
+      const endSession = (run && run.session_id) || normSession(p.sessionId);
+      // 但**只在行上还没有模型时才回填**：endTaskRun 是 `model = COALESCE(@model, model)`，
+      // COALESCE 挡的是 null、不挡非空值 —— 无脑回填会把别的楼层开轮时取到的模型改写成
+      // 收尾时重取的另一个值（轮中途换过模型的话就是两个值），那是偷偷改别人楼层的历史。
+      const refill = !run || !run.model ? normModel(sessionModel(endClient, endSession)) : null;
+      const endModel = normModel(p.model) || refill;
       if (!run) {
         // 老 hook 或中途接上的：起点未知就别编，started_at 留 NULL、duration 也算不出来
         repo.upsertTaskRun.run({
           id: p.taskId,
           projectId: project,
           memberId: member.id,
-          client: member.client || normClient(p.client) || null,
-          sessionId: normSession(p.sessionId),
-          model: normModel(p.model),
+          client: endClient,
+          sessionId: endSession,
+          model: endModel,
           title: null,
           startedAt: null,
         });
@@ -514,7 +525,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       const filesJson = enrichFiles(wsRow ? wsRow.workspace_path : '', reportedFiles);
       repo.endTaskRun.run({
         id: p.taskId,
-        model: normModel(p.model),
+        model: endModel,
         result: normText(p.result, RUN_RESULT_MAX),
         fileCount: Number.isFinite(Number(p.fileCount)) ? Number(p.fileCount) : null,
         filesJson: filesJson ? JSON.stringify(filesJson) : null,

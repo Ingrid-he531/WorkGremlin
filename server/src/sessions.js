@@ -26,7 +26,10 @@ const os = require('node:os');
 const path = require('path');
 const { resolveProjectName } = require('./project');
 const { clientBase } = require('@workgremlin/shared');
-const { selectedModelOf } = require('./traeModels');
+// 两个适配器同名导出（selectedModelOf），这里必须改名 —— 否则后一个静默盖掉前一个，
+// 就会正好造出"某一层取不到模型"这个本次要修的 bug。
+const { selectedModelOf: traeModelOf } = require('./traeModels');
+const { selectedModelOf: claudeModelOf } = require('./claudeModels');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -294,18 +297,23 @@ function reporterHookHome() {
 
 /**
  * 这条会话在用什么模型。
- * 各产品模型字段的取法不通用：TraeCode 能从落盘捞（见 traeModels.selectedModelOf），
- * 其余产品 hook payload 不带也不落盘，取不到就留空（绝不编造）。
+ * 各产品模型字段的取法不通用，所以一个产品一个适配器、都从**各自的落盘**里捞：
+ * TraeCode 见 traeModels.selectedModelOf，Claude Code 见 claudeModels.selectedModelOf。
+ * 两者都是因为 hook payload 里压根没有模型字段才只能读盘。
+ * 其余产品（CodeBuddy / Codex）payload 里有，用不着适配器；真取不到就留空（绝不编造）。
  * 这里只做"按 client 分派适配器"这一件事，避免把某个产品的私有存储格式写死进通用读函数，
  * 也保持和 products.js 的表驱动扩展约定一致（加新产品就往 MODEL_SOURCES 挂一条，不必改 this 函数）。
- * @param {string} client 楼层客户端（如 'trae' / 'codebuddy' / 'codex' …）
+ * @param {string} client 楼层客户端（如 'trae' / 'trae-plugin' / 'claude' / 'codex' …）
  * @param {string} sessionId hook payload 的 session_id
  * @param {string} agentType hook payload 的 agent_type（已落盘）
  */
 /** client → 取"这条会话当前模型"的适配器表；没挂的照旧取不到 */
-const MODEL_SOURCES = { trae: selectedModelOf };
+const MODEL_SOURCES = { trae: traeModelOf, claude: claudeModelOf };
 function sessionModel(client, sessionId, agentType = '') {
-  const fn = MODEL_SOURCES[String(client || '').toLowerCase()];
+  // 按**基名**查表：同一产品的插件/CLI 两种形态（trae-plugin / claude-plugin …）落盘是同一份，
+  // 适配器也只认产品，不该因为客户端带了个后缀就取不到（适配器对不认识的会话 id 一律回空串，
+  // 所以这里放宽只会"多给一次机会"，不会给错模型）。
+  const fn = MODEL_SOURCES[clientBase(client)];
   return fn ? fn(sessionId, agentType) || '' : '';
 }
 
