@@ -29,6 +29,8 @@
     "test:elevator": "node renderer/test/elevator.t3.test.mjs",
     "test:done": "node server/test/doneAttribution.test.js",
     "test:floors": "node server/test/mergedFloors.test.js",
+    "test:kilo": "node server/test/kiloFloor.test.js",
+    "test:opencode": "node server/test/opencodeFloor.test.js",
     "test:task-filter": "node server/test/taskFilter.test.js",
     "test:claude-model": "node server/test/claudeModel.test.js"
   },

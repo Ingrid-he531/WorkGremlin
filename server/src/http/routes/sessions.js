@@ -2,6 +2,12 @@
 
 const express = require('express');
 const { reporterMainPhase, freshestReporterWs, reporterStateMeta, readReporterDone } = require('../../sessions');
+// 7F Kilo Code：Kilo 没有 hook 状态文件，相位/完成标记从它自己的 SQLite 推导
+const { kiloMainPhase, readKiloDone, kiloInstrumented } = require('../../kilo');
+// 8F OpenCode：**两路**——装了 WorkGremlin 插件时真相位走 reporter 状态文件，
+// 没装（或还没写过）才退回轮询 opencode.db 的推导。形态与 7F 不同，理由见下面那段注释。
+const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('../../opencode');
+const { clientBase } = require('@workgremlin/shared');
 
 /**
  * 会话：全局活跃会话表（按楼层分组）。
@@ -35,6 +41,82 @@ function createSessionsRouter({ workspace }) {
     const session = String(req.query.session || '').trim();
     // 跟随 reporter 真实活动的最新工程，而不是 office 手工"打开工程"记的那个
     const ws = freshestReporterWs(cur.workspacePath || '', client, session);
+
+    // ---- 7F Kilo Code：另一条数据源，从 SQLite 推导，不走 hook 状态文件 ----
+    // Kilo 没有 hook 子系统，所以 reporterMainPhase / readReporterDone 那一套对它恒为空。
+    // 命中 Kilo 楼层（client 基名是 kilo）时改走 kilo.js：相位、instrumented、done 都从
+    // 它自己的库取。形态与下面完全一致，渲染层分不出也不需要分。
+    if (clientBase(client) === 'kilo') {
+      const rp = kiloMainPhase(ws || cur.workspacePath || '', session);
+      const done = readKiloDone(session || (rp && rp.sessionId) || '');
+      return res.json({
+        ok: true,
+        workspacePath: ws || cur.workspacePath || '',
+        instrumented: Boolean(session ? kiloInstrumented(session) : kiloInstrumented(rp && rp.sessionId)),
+        session: session || (rp && rp.sessionId) || '',
+        sessionId: session || (rp && rp.sessionId) || '',
+        done: done && done.doneAt ? done : null,
+        ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
+      });
+    }
+
+    // ---- 8F OpenCode：**真相位优先、轮询兜底**（与 7F 不同，理由见下） ----
+    // 7F 之所以直接短路到 kilo.js，是因为 Kilo 压根没有 hook 状态文件，reporterMainPhase
+    // 对它恒为空。8F 不一样：OpenCode **有**插件机制，WorkGremlin 插件会把相位/完成标记写成
+    // reporter 状态文件 —— 那是**上报真值**（不标 inferred、UI 不灰显），而且只有它能给
+    // 「等待授权」（OpenCode 的 tool 状态实测只有 completed/error/running，授权信号只在
+    // 内存事件流里，轮询推不出来）。
+    // 所以顺序是：先按通用口径读 reporter（插件在就命中）→ 读不到才退回轮询推导。
+    // 两条路的响应形状完全一致，渲染层分不出也不需要分。
+    if (clientBase(client) === 'opencode') {
+      const fallbackWs = ws || cur.workspacePath || '';
+      // ---- 真相位：插件写的状态文件（与下面通用口径读的是同一份东西） ----
+      const rpTruth = reporterMainPhase(ws, client, session);
+      const metaTruth = reporterStateMeta(ws, client, session);
+      // ---- 兜底：轮询 opencode.db 的推导 ----
+      const rpPoll = opencodeMainPhase(fallbackWs, session);
+      const useTruth = Boolean(rpTruth && rpTruth.phase);
+      const rp = useTruth ? rpTruth : rpPoll;
+      // 这份相位属于哪条会话（渲染层拿它确认"我正在看的那条会话"是不是这份）
+      const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
+
+      // 完成标记同理：插件那份带**改动文件清单**（实测 session.step.ended 事件的 data.files），
+      // 轮询那份只有一个计数 —— 有就优先用插件的。
+      //
+      // **两边的形状必须统一成 reporter 那种**（{ at, title, fileCount, files, sessionId }）：
+      // 渲染层读快轮询的完成标记用的是 `fpDone.at` 与 `fpDone.sessionId`
+      // （见 IsoOfficeView 的 fastDoneAt / sameSession），不是会话表那套 doneAt/doneTitle。
+      // 把 opencode.js 的 { doneAt, doneTitle, doneCount, doneFiles } 原样塞进来会让
+      // `fpDone.at` 恒为 undefined —— 快轮询那份完成标记永远不触发。
+      const doneTruth = readReporterDone(ws, client, phaseSessionId);
+      let done = doneTruth && doneTruth.at ? doneTruth : null;
+      if (!done && phaseSessionId) {
+        const poll = readOpencodeDone(phaseSessionId, { title: '', fileCount: 0 });
+        if (poll && poll.doneAt) {
+          done = {
+            at: poll.doneAt,
+            title: poll.doneTitle || '',
+            fileCount: poll.doneCount || 0,
+            files: poll.doneFiles || [],
+            sessionId: phaseSessionId,
+            workspacePath: fallbackWs,
+          };
+        }
+      }
+      // "接上了没有"：装了插件（状态文件在）**或**这条会话在库里 —— 两者任一即为真。
+      // 渲染层靠它区分"这个产品根本没在跑"与"在跑但此刻没动作"。
+      const instrumented = Boolean(metaTruth.instrumented || opencodeInstrumented(phaseSessionId));
+      return res.json({
+        ok: true,
+        workspacePath: useTruth ? ws || fallbackWs : fallbackWs,
+        instrumented,
+        session: session || phaseSessionId,
+        sessionId: phaseSessionId,
+        done: done || null,
+        ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
+      });
+    }
+
     const rp = reporterMainPhase(ws, client, session);
     // 这个工程有没有接 hook（接了但当前没动作 → 渲染层显示"待命"，而不是按文件时间瞎猜）
     // 有没有接 hook + 那份状态文件属于哪条会话（渲染层据此判断"你正在看的这条会话在上报吗"）

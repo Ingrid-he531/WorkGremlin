@@ -3,14 +3,14 @@
 
 /**
  * 把 WorkGremlin 的上报 hook 装进各受监控产品的用户级配置
- * （CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode）。
+ * （CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode / Qoder）。
  *
- * 默认**全装**：不带 --targets 时遍历下面 `all` 里的每一个非 optional 目标，
+ * 默认**全装**：不带 --targets 时遍历下面 `all` 里每一个非 optional 目标，
  * 各自「装了才写、没装跳过」（判定口径见 looksInstalled）。加新产品只需往 `all` 里加一条。
  *
  * 用法：
  *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json）
- *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / codex / claude / trae / project）
+ *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / codex / claude / trae / qoder / project）
  *   node scripts/install-hooks.js --project              另外写一份项目级 <仓库>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            撤掉（只删我们加的那几条，别人的配置不动）
  *   node scripts/install-hooks.js --dry-run              只打印将要写什么，不落盘
@@ -23,6 +23,9 @@
  *     再追加，别人的 hooks 一条不动。首次改动前备份成 <file>.bak-workgremlin。
  *   - CLI 侧改完不会立刻生效：启动时会快照 hooks，外部改动要在 /hooks 面板里过一遍（安全设计）。
  *     插件侧重开会话即可。
+ *   - **7F Kilo Code 不在此列表**：Kilo 没有 hook 子系统（无 hooks.json、无可挂事件点），
+ *     没有 hook 可装。它的数据由服务端轮询 Kilo 自己的 SQLite 库获取
+ *     （见 server/src/kilo.js），不需要也不应该在这里写任何配置。
  */
 
 const fs = require('node:fs');
@@ -142,6 +145,21 @@ function traeCommand() {
 /** Claude Code CLI：用 --agent claude 注入产品家族身份，工位名默认 claude */
 function claudeCommand() {
   return `node "${HOOK_SCRIPT}" --agent claude`;
+}
+
+/**
+ * Qoder CLI（6F）：hook 配置落在 ~/.qoder/settings.json（Claude / CodeBuddy 同款，hooks 嵌在 settings.json）。
+ * Qoder 的真实 hook 事件名暂未确认，这里**默认采用最宽覆盖的 Claude 风格事件表**
+ * （PreToolUse / PostToolUse 对所有工具都发，且带 PermissionRequest / Notification / SubagentStop）：
+ * 这样无论 Qoder 的工具名长什么样，我们的 hook 都至少能抓到 会话起止 / 工具前后 / 授权 这类事件。
+ * 若 Qoder 实际事件名不同，只需把 QODER_EVENTS 换成 EVENTS / CODEX_EVENTS 或自定义即可，
+ * 不涉及 hook.js 逻辑 —— hook.js 靠 --agent qoder 走通用路径（非 codex / 非 claude）。
+ */
+const QODER_EVENTS = CLAUDE_EVENTS;
+
+/** Qoder CLI：用 --agent qoder 注入产品家族身份，工位名默认 qoder */
+function qoderCommand() {
+  return `node "${HOOK_SCRIPT}" --agent qoder`;
 }
 
 /** 我们加的那几条：按 command 里有没有 hook 脚本路径识别 */
@@ -325,6 +343,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   const workbuddyOurs = buildOurs(EVENTS, workbuddyCommand());
   const traeOurs = buildOurs(EVENTS, traeCommand());
   const claudeOurs = buildOurs(CLAUDE_EVENTS, claudeCommand());
+  const qoderOurs = buildOurs(QODER_EVENTS, qoderCommand());
 
   const all = [
     {
@@ -379,6 +398,15 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       ours: traeOurs,
     },
     { id: 'project', label: `CodeBuddy 项目级（${path.basename(REPO_ROOT)}）`, file: path.join(REPO_ROOT, '.codebuddy', 'settings.json'), ours: codebuddyOurs, optional: true },
+    {
+      id: 'qoder',
+      label: 'Qoder CLI',
+      // Qoder 的 hooks 与 Claude / CodeBuddy 同构：hooks 嵌在 ~/.qoder/settings.json 里。
+      file: path.join(os.homedir(), '.qoder', 'settings.json'),
+      cmd: 'qoder',
+      dir: path.join(os.homedir(), '.qoder'),
+      ours: qoderOurs,
+    },
   ];
   const targets = all.filter((t) => (t.optional ? args.project === true || wanted.includes(t.id) : !wanted.length || wanted.includes(t.id)));
 
@@ -452,7 +480,8 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('  · CodeBuddy / WorkBuddy CLI：改完不会立刻生效，跑 /hooks 过一遍（外部改动需审核）');
     console.log('  · Claude Code：写完新起的会话直接就生效（claude --print 实测，没经过批准）；');
     console.log('                 若表现为"装了没反应"，在 /hooks 面板过一遍即可');
-    console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae / claude），已写进 hook 命令的 --agent，无需也无法二次指定');
+    console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae / claude / qoder），已写进 hook 命令的 --agent，无需也无法二次指定');
+    console.log('  · 7F Kilo Code：无需安装 hook —— Kilo 没有 hook 子系统，WorkGremlin 直接轮询它自己的 SQLite 库');
     console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;

@@ -80,13 +80,15 @@ node scripts/subagents.js list
 
 让正在干活的 agent 自己往屋里报状态：**启动时会自动接入** —— 探测到装了哪个 CLI（只看安装位置），
 就把对应那份 hook 写好（合并式、幂等、首次改动前备份；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`）。
-**CodeBuddy CLI+插件 / WorkBuddy CLI / Codex CLI / Claude Code CLI / TraeCode IDE+插件** 六个入口的会话都会上报。
+**CodeBuddy CLI+插件 / WorkBuddy CLI / Codex CLI / Claude Code CLI / TraeCode IDE+插件 / Qoder CLI** 七个入口的会话都会上报。
+**Kilo Code（7F）例外：它没有 hook 可装** —— 见下面「Kilo Code 接入」。
+**OpenCode（8F）也不进这份列表**：它没有 `hooks.json` 那套命令钩子，改用「轮询 SQLite + 可选插件」—— 见下面「OpenCode 接入」。
 
 默认**全装**（遍历所有 target，装了才写、没装跳过）：
 
 ```bash
 npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae
-npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / claude / trae）
+npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / claude / trae / qoder）
 npm run hooks:install -- --dry-run         # 只打印将要写什么，一步都不落盘
 npm run hooks:install -- --project         # 另外写一份项目级 <仓库>/.codebuddy/settings.json
 npm run hooks:uninstall                    # 撤掉（只删我们加的那几条，别人的配置不动）
@@ -107,7 +109,7 @@ npm run hooks:uninstall                    # 撤掉（只删我们加的那几�
 几个要点：
 
 - **报给哪个工程**：默认报进屋里「当前打开的工程」（问服务端 `/api/v1/workspace`），
-  `WORKGREMLIN_PROJECT` 可覆盖；主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae），已写进命令的 `--agent`。
+  `WORKGREMLIN_PROJECT` 可覆盖；主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae / claude / qoder），已写进命令的 `--agent`。
 - **心跳**：60s 无心跳就 `degraded`（灰显 + 「推断」），所以 `SessionStart` 会另起一个 15s
   一次的心跳守护（`node packages/reporter/src/hook.js --heartbeat`），`SessionEnd` 收掉；
   会话异常退出时，最多 30 分钟没有事件就自己退，不留孤儿进程。
@@ -161,7 +163,7 @@ Codex 的 `apply_patch` **没有 `file_path`**（`tool_input` 是 patch 文本�
 坐工位的小怪物名册除 `.codebuddy/agents/` 外，也会扫 `<工程>/.codex/agents/` 与 `$CODEX_HOME/agents/`。
 
 **成员是按楼层过滤的**：每个成员都带一个「来源客户端」（`members.client`），办公室与工位卡片只显示
-当前楼层那一路的成员 —— 1F 看 CodeBuddy、2F 看 WorkBuddy、3F 看 Codex、4F 看 Claude、5F 看 TraeCode。
+当前楼层那一路的成员 —— 1F 看 CodeBuddy、2F 看 WorkBuddy、3F 看 Codex、4F 看 Claude、5F 看 TraeCode、6F 看 Qoder、7F 看 Kilo Code、8F 看 OpenCode。
 所以切到 3F 不会再看见你在 CodeBuddy 里建的小怪物。`client` 为空的是「通用」成员（演示数据、
 手工 `scripts/subagents.js` 写的幽灵），哪层都显示。
 
@@ -209,6 +211,109 @@ npm run hooks:install -- --targets=claude  # 只装 Claude Code
 | `SubagentStop` | 幽灵转「待汇报」 | 与 `PostToolUse(Agent)` 互为兜底 |
 | `Stop` | `task/end(done)` + `idle`，顺手扫掉本轮残留的幽灵 | 汇报文案取 `last_assistant_message` |
 
+### Qoder 接入（CLI 与插件：hook + transcript）
+
+Qoder 的 hook 与 Claude / CodeBuddy **同源**（`settings.json` + `hooks` 事件 + `matcher`），
+所以共用同一个 `packages/reporter/src/hook.js`，靠 `--agent qoder` 分流。
+装出来的条目写在 `~/.qoder/settings.json`：
+
+```bash
+npm run hooks:install                      # 一并写 ~/.qoder/settings.json
+npm run hooks:install -- --targets=qoder  # 只装 Qoder
+```
+
+- **CLI 与插件合并（不拆层）**：Qoder 的 CLI 与插件（如 `qoder-context`）共用同一份 `~/.qoder` 配置、
+  同一套 hook（`enabledPlugins` 里启用，hook 写在 `~/.qoder/settings.json`，CLI 与插件同吃）、
+  同一个落盘目录（`~/.qoder/projects/<工程>/<会话>.jsonl`），分不出，所以 6F 只有一层。
+- **会话两路来源**：① 落盘 transcript（`~/.qoder/projects/...`）走 `cli` 来源扫描，文件名即 `session_id`、
+  工程路径从每行 `cwd` 解析（Claude Code 同款格式）；② reporter 状态文件兜底（JSONL 还没写/读不出时，
+  hook 那一路照常列会话并提供实时相位）。两路按 `session_id` 去重（cli 有活会话就撤掉 hook 行）。
+- **事件表暂用最宽覆盖**：Qoder 的真实 hook 事件名尚未确认，`scripts/install-hooks.js` 的
+  `QODER_EVENTS` 默认采用 Claude 风格（`PreToolUse` / `PostToolUse` 对所有工具都发，且带
+  `PermissionRequest` / `Notification` / `SubagentStop`）。若 Qoder 实际事件名不同，只需把
+  `QODER_EVENTS` 换成 `EVENTS` / `CODEX_EVENTS` 或自定义——不涉及 `hook.js` 逻辑。
+- **相位只有粗粒度**：Qoder 实测**只发 `SessionStart` / `SessionEnd`**，没有 `UserPromptSubmit` /
+  `PreToolUse` / `PostToolUse` 等细粒度事件（见 `~/.workgremlin/hooks/events.log` 与
+  `scripts/install-hooks.js` 的 `QODER_EVENTS` 注释）。所以 `hook.js` 对 `--agent qoder` 在这两个事件上
+  补「思考中 / 已完成」粗粒度相位（`packages/reporter/src/hook.js`），6F 不会再一直显示「未上报」；
+  相位精度比 Claude 粗——等 Qoder 开放细粒度事件后自动变细，无需改 hook 逻辑。
+
+### Kilo Code 接入（7F：没有 hook，靠轮询它自己的 SQLite）
+
+**Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何
+`hooks.json` 或可挂命令的事件点）。所以 7F 不进 `install-hooks.js` 的安装列表 ——
+没有 hook 可装，也**不应该**在 Kilo 的配置里写任何东西。
+
+它靠**轮询**自己的落盘接进来，全部逻辑在 `server/src/kilo.js`：
+
+- **落盘是 event-sourced SQLite**（`~/.local/share/kilo/kilo.db`，WAL 模式）。我们**只读**打开，
+  不阻塞 Kilo 自己的 daemon。数据根按 XDG 位置认（`kiloHome()`）——
+  **不是** `~/.kilo`（那个目录实测只有安装期留下的 `bin/`）。
+- **会话**来自 `session` 表（`id` / `directory`=工程路径 / `title` / `agent` / `model` /
+  `time_updated` / `summary_*`）。已归档的（`time_archived`）不算"在跑"。
+- **相位**由 `event` 表（append-only，`aggregate_id`=会话、`seq` 单调）的**最新事件推导**：
+  `tool`+`running`→调用工具、`tool`+`pending`→等待授权、`reasoning`→思考中。
+  比 5F TraeCode 那种"拿文件 mtime 猜"精确得多，但**仍是轮询**（不是 Kilo 主动报的），
+  所以相位一律 `inferred:true`，UI 按推断灰显。
+- **完成标记**取 `message` 表里 `role=assistant` 且 `finish=stop` 的那条
+  （`tool-calls`/`length`/`content-filter` 都不算"完成"）。
+- **只读一次、坏表不冒泡**：表结构对不上（Kilo 改版）时回空，楼层照常列出，只是没会话 ——
+  绝不把每 1.5s 一次的 `/reporter-phase` 轮询打挂。
+
+不需要任何安装动作，WorkGremlin 起来就看得见 7F。自检：`npm run test:kilo`。
+
+### OpenCode 接入（8F：轮询打底 + 插件给真相位）
+
+7F 的兄弟楼层，也是同源（**Kilo Code CLI 就是 OpenCode 的 fork**：落盘结构一模一样，
+连 Kilo 的日志目录里都直接躺着一个 `opencode.log`）。但**两者的 V2 schema 已经分叉，
+所以 8F 不能照抄 7F 的取法** —— 实测 2026-09-26（Kilo 7.8.1 / OpenCode 2.0.18）：
+
+| | Kilo 7.8.1 | OpenCode 2.0.18 |
+|---|---|---|
+| `event`（落盘事件流） | 2288 行 | **0 行**（只在内存里推流） |
+| 消息表 | `message` + `part` | `session_message`（无 `part` 表） |
+| 会话表 | `session` | `session_v2` |
+
+8F 因此改读 `session_v2` + `session_message` 的 `data.content[]`（part 形状与 Kilo 的
+`event.data.part` 同构），全部逻辑在 `server/src/opencode.js`：
+
+- **会话**来自 `session_v2`（`id` / `directory`=工程路径 / `title` / `agent` / `model`）。
+  已归档的（`time_archived`）不算"在跑"；**子代理会话（`parent_id` 非空）不算独立会话**。
+  表名与列名都探测着来（`session_v2` → `session`），OpenCode 改版换表不会把接口打挂。
+- **相位**由最新消息的 `content[]` 推导：`tool`+`running`→调用工具（带工具名与实际命令）、
+  `tool`+`error`→调用工具但报错、`reasoning`→思考中、`type='idle'` 行→待命。
+  轮询这一路一律 `inferred:true`，UI 按推断灰显。
+- **一个补不上的洞**：全库 114 条 assistant 消息实测 `tool.state.status` 只出现过
+  `completed / error / running`，**没有 `pending`** —— 也就是说**轮询永远推不出「等待授权」**
+  （Kilo 有 pending，OpenCode 没有）。OpenCode 把授权做成了独立事件
+  （`permission.asked`），那个信号只在内存事件流里。
+- **所以另挂一路插件**（`packages/reporter/src/plugin/`）：订阅 OpenCode/Kilo 的
+  `ctx.event.subscribe()` 事件流，把相位/完成标记写成 reporter 状态文件
+  （格式与 `hook.js` **完全一致**，服务端一行都不用改）。装上之后：
+  相位是**上报真值**（不标 inferred、UI 不灰显）、多出「等待授权」、
+  完成标记还带**改动文件清单**（`session.step.ended` 事件的 `data.files`）。
+  没装插件就自动退回轮询推导，功能不受影响。
+- **可执行文件位置**：`opencode` 实测在 `~/.opencode/bin/opencode` 且**不在 PATH**，
+  `products.js` 的 `CLI_BIN_DIRS` 已显式认这一条 —— 否则这层永远判成"没装"。
+
+**装插件（可选，零配置）**：本仓库已经带了一个自动加载的入口 ——
+`.opencode/plugins/workgremlin.js`，它转发到 `packages/reporter/src/plugin/index.js`。
+在**本工程**里跑 OpenCode 就自动生效（上面那些实测就是它跑出来的）。
+想全机生效，在 `~/.config/opencode/opencode.json` 里加：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [{ "package": "/绝对路径/WorkGremlin/packages/reporter/src/plugin/index.js" }]
+}
+```
+
+Kilo 同理（`.kilo/plugins/` 或 `~/.config/kilo/kilo.jsonc`），并用
+`options: { client: 'kilo' }` 指定上报身份。
+
+不需要任何安装动作，WorkGremlin 起来就看得见 8F（有没有插件都一样）。
+自检：`npm run test:opencode`。
+
 **同一个楼层可以同时开多条会话**（比如开两个终端，或者终端 + VS Code 插件各开一条）——
 CLI 与插件是同一份 `~/.claude`、同一套 hook、连二进制都相同，所以它们本来就该是**一个楼层**；
 层内靠 `session_id` 区分（轴 2，与"楼层/客户端"这条轴正交）：
@@ -239,7 +344,8 @@ CLI 与插件是同一份 `~/.claude`、同一套 hook、连二进制都相同�
 免得把"这一路读不到"误看成"这一层没在跑"。
 
 想知道"某一层吃哪几路落盘"，看 `server/src/products.js` 的 `sources`（某一路读不出会话时，
-服务端会在 `sources[].note` 里给一句说明）；自检 `npm run test:floors`。
+服务端会在 `sources[].note` 里给一句说明）；自检 `npm run test:floors`（1F/5F/6F）、
+`npm run test:kilo`（7F 轮询路线）与 `npm run test:opencode`（8F 轮询 + 插件双路）。
 
 ## 安全基线（不得关闭）
 

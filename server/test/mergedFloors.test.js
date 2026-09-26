@@ -1,5 +1,5 @@
 /**
- * 合并楼层自检 —— 1F CodeBuddy（CLI + Plugin）与 5F TraeCode（IDE + 插件）。
+ * 合并楼层自检 —— 1F CodeBuddy（CLI + Plugin）、5F TraeCode（IDE + 插件）、6F Qoder（CLI 与插件合并，transcript + hook 两路会话）。
  *
  * 跑法：`npm run test:floors`（= node 直接跑，零依赖）。
  * 为什么要有它：这几层的每个结论都对应一条"只有真实文件摆到位才现形"的行为 —— 楼层是不是
@@ -22,6 +22,10 @@
  *     [B2] **两个形态的落盘目录都要列出来**（~/.trae-cn 与 ~/.marscode）；这两路只作展示、
  *          取不到会话 → 各带一句说明（楼层胶囊 tooltip 显示它们）
  *     [B3] 两种身份的 hook 状态文件（trae / trae-plugin）都归这一层
+ *   C. 6F Qoder（CLI 与插件合并：同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F）
+ *     [C] 一层：只接纳 qoder 一种身份（CLI 与插件共用同一 client）；两路来源（cli 扫 transcript 产会话 + hook 实时相位兜底）；只装了 qoder 就算"装了"
+ *     [C2] 会话来自 hook 状态文件兜底：qoder 状态文件归这一层、相位按整层 client 取得到
+ *     [C3] 会话也来自落盘 transcript：~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式）被 cli 那一路扫出，工程从 cwd 解析
  */
 'use strict';
 
@@ -44,6 +48,9 @@ fs.mkdirSync(path.join(HOME, '.vscode', 'extensions', 'tencent-cloud.coding-copi
 fs.mkdirSync(path.join(HOME, '.codebuddy'), { recursive: true });
 // 5F TraeCode：装的是国内版 IDE（trae-cn 在 PATH 上），插件形态由 runner 自带、没有独立可执行文件
 fs.writeFileSync(path.join(BIN, 'trae-cn'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+// 6F Qoder：沙箱里放一个 qoder 可执行文件（让"装了"判定命中），并立一个 ~/.qoder 落盘根
+fs.writeFileSync(path.join(BIN, 'qoder'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+fs.mkdirSync(path.join(HOME, '.qoder'), { recursive: true });
 // 插件那一路的落盘根：故意**不放** genie-history —— 复现"这一路读不出会话"
 fs.mkdirSync(path.join(HOME, '.marscode', 'ai-chat', 'AppData', 'vscode', 'ai-agent'), { recursive: true });
 fs.writeFileSync(path.join(HOME, '.marscode', 'ai-chat', 'AppData', 'vscode', 'ai-agent', 'database.db'), 'not a sqlite\n');
@@ -233,13 +240,19 @@ head('[A5] CLI 落盘扫得到活会话时，hook 兜底整层让位（同一条
 }
 
 /* [B1] 5F TraeCode：IDE 与插件也是一层 */
-head('[B1] 楼层表：5F 只有一层 TraeCode（原 5F 插件 + 6F IDE 合并）');
+head('[B1] 楼层表：5F 只有一层 TraeCode（IDE 与插件合并）');
 {
   const products = detectProducts({ force: true });
   const floor = products.find((p) => p.id === '5F');
   ok('只有一个 TraeCode 楼层（没有第二个 trae 楼层）', products.filter((p) => p.agent === 'trae').length === 1);
   ok('5F 名叫 TraeCode', floor && floor.name === 'TraeCode', floor && floor.name);
-  ok('整个楼层表只剩 5 层', products.length === 5, products.map((p) => p.id).join(' '));
+  // 楼层数会随新楼层增长（7F Kilo / 8F OpenCode 都是轮询路线），所以这里不断言"共 N 层"——
+  // 那种断言每加一层就得改一次，漏改就红。改为断言**编号从 1F 起连续**且**没有重号**：
+  // 加楼层时这条恒真，真出现"两层撞成同一个 id"或"编号跳号"才会红。
+  const ids = products.map((p) => p.id);
+  const nums = ids.map((id) => parseInt(String(id).replace(/^[A-Z]+/, ''), 10)).filter((n) => Number.isFinite(n));
+  ok('楼层编号从 1F 起连续、没有重号', nums.length === ids.length && nums.every((n, i) => n === i + 1), ids.join(' '));
+  ok('7F 是 Kilo Code（轮询 SQLite 那一路）', products.some((p) => p.id === '7F' && p.name === 'Kilo Code'), products.map((p) => `${p.id}:${p.name}`).join(' '));
   ok(
     '这一层接纳 trae + trae-plugin 两种上报身份',
     floor && JSON.stringify(floor.clients) === JSON.stringify(['trae', 'trae-plugin']),
@@ -297,10 +310,63 @@ head('[B3] 5F 的会话来自 hook：trae 与 trae-plugin 两种状态文件都�
   ok('这一层两条会话', floor.sessions.length === 2, floor.sessions.map((s) => `${s.sessionId}`).join(' '));
   ok('两种身份的会话都在（trae + trae-plugin）', JSON.stringify(ids) === JSON.stringify([TRAE_PLUGIN_SID, TRAE_SID].sort()), JSON.stringify(ids));
   ok('两条都归属同一个工程', floor.sessions.every((s) => s.projectPath === TR_WS), JSON.stringify(floor.sessions.map((s) => s.projectPath)));
-  ok('没有独立的 6F 楼层了', !snap.floors.some((f) => f.id === '6F'));
   const both = 'trae,trae-plugin';
   ok('相位按这一层的 client 串取得到（整层的两路都认）', Boolean(reporterMainPhase(TR_WS, both, TRAE_SID)));
   ok('相位按会话精确：两条会话拿到各自的相位', reporterMainPhase(TR_WS, both, TRAE_SID).phase === 'tool' && reporterMainPhase(TR_WS, both, TRAE_PLUGIN_SID).phase === 'thinking');
+}
+
+/* [C] 6F Qoder：CLI 与插件合并（同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F） */
+head('[C] 楼层表：6F 只有一层 Qoder（CLI 与插件合并，cli 扫 transcript + hook 兜底）');
+{
+  const products = detectProducts({ force: true });
+  const floor = products.find((p) => p.id === '6F');
+  ok('有 6F 这一层', Boolean(floor), products.map((p) => p.id).join(' '));
+  ok('6F 名叫 Qoder', floor && floor.name === 'Qoder', floor && floor.name);
+  ok('这一层只接纳 qoder 一种上报身份（CLI 与插件分不出，共用同一 client，无 qoder-plugin）', floor && JSON.stringify(floor.clients) === JSON.stringify(['qoder']), floor && JSON.stringify(floor.clients));
+  ok(
+    '两路来源：cli（扫 ~/.qoder/projects transcript 产会话）+ hook（实时相位兜底）',
+    floor && JSON.stringify(floor.sources.map((s) => s.kind)) === JSON.stringify(['cli', 'hook']),
+    floor && JSON.stringify(floor.sources.map((s) => `${s.label || s.kind}:${s.kind}`))
+  );
+  ok('cli 与 hook 两路都产会话（cli 扫 transcript、hook 兜底）', floor && floor.sources.filter((s) => s.sessions !== false).map((s) => s.kind).join(',') === 'cli,hook', floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
+  ok('装了 qoder（沙箱里放了可执行文件）就算装了', floor && floor.installed === true, floor && String(floor.installPath));
+  ok('cli 那一路扫的是 ~/.qoder（子树 projects）', Boolean(floor.sources.find((s) => s.kind === 'cli')) && String(floor.sources.find((s) => s.kind === 'cli').dataPathLabel).endsWith('.qoder'));
+}
+
+/* [C2] 会话来自 hook 状态文件兜底；qoder 状态文件归这一层 */
+head('[C2] 6F 的会话来自 hook：qoder 状态文件归这一层');
+{
+  const Q_WS = '/tmp/ProjQ';
+  const Q_SID = 'qoder-session-0001';
+  writeState('qoder', Q_SID, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: Q_WS }, pending: null }, Q_WS);
+  const snap = snapshot({ force: true, workspacePath: Q_WS });
+  const floor = snap.floors.find((f) => f.id === '6F');
+  ok('这一层一条会话（hook 兜底）', floor.sessions.length === 1, floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
+  ok('会话就是 qoder 状态文件那条', floor.sessions[0] && floor.sessions[0].sessionId === Q_SID, floor.sessions.map((s) => s.sessionId).join(' '));
+  ok('会话归属正确工程', floor.sessions[0] && floor.sessions[0].projectPath === Q_WS, floor.sessions.map((s) => String(s.projectPath)).join(' '));
+  ok('相位按这一层的 client 取得到', Boolean(reporterMainPhase(Q_WS, 'qoder', Q_SID)));
+}
+
+/* [C3] 会话也来自落盘 transcript：~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式） */
+head('[C3] 6F 也吃落盘 transcript：~/.qoder/projects/<工程>/<会话>.jsonl 被 cli 那一路扫出');
+{
+  const Q_PROJ = '/tmp/ProjQTranscript';
+  const Q_TSID = 'c0ffee00-1234-5678-9abc-def012345678';
+  const tdir = path.join(HOME, '.qoder', 'projects', '-tmp-ProjQTranscript');
+  fs.mkdirSync(tdir, { recursive: true });
+  // Claude Code 同款：首行 workspace-directories（无 cwd），user 行带 cwd 与 sessionId
+  const lines = [
+    JSON.stringify({ type: 'workspace-directories', sessionId: Q_TSID, directories: [Q_PROJ] }),
+    JSON.stringify({ type: 'user', sessionId: Q_TSID, cwd: Q_PROJ, message: { role: 'user', content: 'hi' } }),
+  ];
+  fs.writeFileSync(path.join(tdir, `${Q_TSID}.jsonl`), lines.join('\n') + '\n');
+
+  const snap = snapshot({ force: true, workspacePath: Q_PROJ });
+  const floor = snap.floors.find((f) => f.id === '6F');
+  const row = floor.sessions.find((s) => s.sessionId === Q_TSID);
+  ok('落盘 transcript 那条会话被 cli 那一路扫出', Boolean(row) && row.sourceKind === 'cli', floor.sessions.map((s) => `${s.sourceKind}:${s.sessionId}`).join(' '));
+  ok('会话 id 从文件名取到（与 Claude 同款）', Boolean(row) && row.sessionId === Q_TSID, row && row.sessionId);
+  ok('工程路径从 cwd 解析到', Boolean(row) && row.projectPath === Q_PROJ, row && row.projectPath);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

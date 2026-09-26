@@ -223,7 +223,8 @@ const IPC_EVENTS = Object.freeze({
 /**
  * 智能体（agent）与客户端（client）的关系：client = agent，或 agent + '-plugin'。
  * 这是全局唯一合同（hook 的 eventClient 据此产出 client 字段，server/前端据此归层）。
- *   - agent（基名）：codebuddy / workbuddy / codex / claude / trae …（见 server/src/products.js 的楼层定义）
+ *   - agent（基名）：codebuddy / workbuddy / codex / claude / trae / qoder / kilo …
+ *                  （见 server/src/products.js 的楼层定义）
  *   - client（上报身份）：非 plugin 直接是 agent；plugin 是 agent + '-plugin'。
  * 合同只有这两条形状，**这里不写"哪个 client 在哪层"**：楼层编号、哪两个形态合成一层，都是
  * server/src/products.js 的事（前端读 /api/v1/sessions 的 floors[].clients，不自己推）。

@@ -3,10 +3,15 @@
 /**
  * 楼层 = 受监控的产品源。
  *   1F  CodeBuddy（CLI 与 Plugin 合并：同一产品的两种形态，合成一层）
- *   2F  WorkBuddy CLI
+ *   2F  WorkBuddy
  *   3F  Codex（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并单楼层）
  *   4F  Claude Code（CLI 与 IDE 同 ~/.claude、同 hook，分不出，合并单楼层）
  *   5F  TraeCode（IDE 与 Plugin 合并：会话来自 hook 状态文件；插件落盘取不到会话，见下）
+ *   6F  Qoder（CLI 与插件合并：同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F）
+ *   7F  Kilo Code（CLI 与 IDE 扩展合并：同一个 kilo 二进制、同一个数据根，分不出，合并单楼层。
+ *                  **纯轮询楼层**（与 8F OpenCode 同类）：Kilo 没有 hook 子系统，会话/相位/完成标记
+ *                  全部由服务端轮询它自己的 event-sourced SQLite 推导，见 server/src/kilo.js）
+ *   8F  OpenCode（CLI 与桌面端/网页端合并：同一个 opencode 二进制、同一个数据根）
  *
  * **CodeBuddy 只有一层**（1F）：CLI 与 Plugin 是同一个产品的两种形态 —— CLI 落 `~/.codebuddy`
  * （会话 jsonl / hook 状态文件），Plugin 落编辑器的 globalStorage（genie-history / todos /
@@ -32,6 +37,26 @@
  * 区分二者（实测 2.1：不含 client，只有 session_id / cwd / transcript_path 这类共用字段）。
  * 既然"分不出"，就不该硬拆两层。
  *
+ * **OpenCode 家族（7F Kilo Code / 8F OpenCode）也各只有一层**，而且是同一个理由的第三次复现，
+ * 证据链（实测 2026-09-26，本机 Kilo Code 7.8.1 / OpenCode 2.0.18）：
+ *   · **Kilo Code CLI 就是 OpenCode 的 fork**。落盘结构一模一样：
+ *     `~/.local/share/{kilo,opencode}/` 下都是 `<名>.db` + `storage/session_diff/` + `repos/`
+ *     + `shell/` + `snapshot/` + `log/` —— 连 Kilo 的日志目录里都直接躺着一个 `opencode.log`。
+ *     会话表 Kilo 叫 `session`、OpenCode V2 叫 `session_v2`（字段几乎同构）。
+ *   · **Kilo 的 VS Code 扩展（kilocode.kilo-code）不另起一份数据**：扩展目录里自带
+ *     `bin/kilo`，用 `spawn(cliPath, ["serve","--port","0"])` 起的就是同一个 CLI server，
+ *     只多带 `KILO_CLIENT=vscode` / `KILOCODE_FEATURE=vscode-extension` / `KILO_PLATFORM=vscode`，
+ *     **不覆盖 `XDG_DATA_HOME` / `KILO_CONFIG_DIR`** → 共用 `~/.local/share/kilo/kilo.db`、
+ *     共用 `~/.config/kilo/kilo.jsonc`。扩展也不写编辑器 globalStorage
+ *     （实测 `~/.config/Code/User/globalStorage` 下没有它的目录）。
+ *   · **会话行里也没有平台字段**（`metadata` 只有 `kilocode.sandbox`），所以连"按行认形态"都做不到。
+ *   → 同 4F Claude / 6F Qoder：一个 agent 基名 = 一个 client = 一个楼层；CLI 与 IDE 的区分留给上游。
+ *
+ * 这两层**没有 jsonl transcript**（与 1F~4F、6F 的最大不同），会话来源是新增的 `db` 一路：
+ * 只读 SQLite 会话表（见 server/src/ingest/sessionDb.js）。实时相位那一路是 `hook`，
+ * 由 WorkGremlin 的 OpenCode 插件写状态文件（见 packages/reporter/src/plugin/）。
+ * 没装插件时 `hook` 那一路空着，7F/8F 照样按落盘列出会话，只是相位显示「未上报」。
+ *
  * 那"同一层里同时开着多会话"怎么分？靠 **session_id**（轴 2，见 docs/implementation-status.md）：
  * 它是 hook payload 的字段、也是 transcript 的文件名（`<session_id>.jsonl`）、还写在 transcript
  * 首行的 sessionId 里，三处实测 100% 一致。所以：
@@ -54,6 +79,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
 const { clientOf } = require('@workgremlin/shared');
+// Kilo Code 的数据根（XDG 位置）—— 与 server/src/kilo.js 同源，别在这里另写一份
+const { kiloHome } = require('./kilo');
+// 8F OpenCode 的数据根 —— 同理，与 server/src/opencode.js 同源
+const { opencodeHome } = require('./opencode');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -206,6 +235,30 @@ function extensionRoots() {
     .filter(isDir);
 }
 
+/**
+ * XDG 数据根（OpenCode 家族的数据落在这套约定下，不在 ~/.codebuddy 那种家目录隐藏目录里）。
+ *
+ * 认 `XDG_DATA_HOME` 是因为 Kilo 与 OpenCode **都**认它（实测二进制里有这个变量，
+ * 扩展起 server 时原样透传），设过的人数据根就跟着搬走了。顺序：
+ *   1. $XDG_DATA_HOME/<名>
+ *   2. 平台约定的应用数据根（macOS 的 ~/Library/Application Support、Win 的 %APPDATA%）—— dataRoots()
+ *   3. Linux 的 ~/.local/share/<名>（兜底；dataRoots() 里已有，这里补的是"目录还不存在"的情形，
+ *      因为上面几步都只认**已经存在**的目录，而"没建过数据根"正是最该被认出来的状态）
+ *
+ * 只给候选、不判断存在 —— 存在性由调用方 firstExisting / firstMatch 负责。
+ * @param {string} name 数据根目录名（kilo / opencode）
+ * @returns {string[]}
+ */
+function xdgDataDirs(name) {
+  const out = [];
+  const xdg = process.env.XDG_DATA_HOME;
+  if (xdg) out.push(path.join(xdg, name));
+  for (const r of dataRoots()) out.push(path.join(r, name));
+  // Linux 桌面版的默认位置，显式补一份（dataRoots() 在 Linux 上给的是 ~/.local/share）
+  if (process.platform === 'linux') out.push(path.join(HOME, '.local', 'share', name));
+  return out;
+}
+
 /** 编辑器 globalStorage（插件的落盘位置） */
 function globalStorageRoots() {
   const out = [];
@@ -273,6 +326,11 @@ const CLI_BIN_DIRS = [
   path.join(HOME, '.codebuddy', 'bin'),
   path.join(HOME, '.workbuddy', 'bin'),
   path.join(HOME, '.npm-global', 'bin'),
+  // OpenCode 官方安装脚本把二进制放在 ~/.opencode/bin（实测 2.0.18 就在这儿，200MB 单文件），
+  // 它**不在 PATH 里**，不认这一条 8F 的"装了没装"就永远判不出来。
+  // Kilo 的 CLI 是 npm 全局包（在 nvm bin 里，下面那条已经覆盖），但 ~/.kilo/bin 也一并认上。
+  path.join(HOME, '.opencode', 'bin'),
+  path.join(HOME, '.kilo', 'bin'),
   // npm 全局 bin：和当前 node 可执行文件同目录（/usr/local/nodejs/bin 这类装法）
   path.dirname(process.execPath),
   '/usr/local/bin',
@@ -309,6 +367,12 @@ const RE_CODEX = [/^codex/i];
 const RE_CODEX_HOST = [/^openai\.(chatgpt|codex)/i];
 const RE_CLAUDE = [/^claude/i];
 const RE_TRAE = [/^trae/i];
+/** 7F Kilo Code：CLI 叫 kilo（也提供 kilocode 这个别名，二者同一个二进制） */
+const RE_KILO = [/^kilo(code)?$/i];
+/** Kilo 的 VS Code 扩展目录名：kilocode.kilo-code-<版本>-<平台> */
+const RE_KILO_HOST = [/^kilocode\./i];
+/** 8F OpenCode */
+const RE_OPENCODE = [/^opencode$/i];
 const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
 
 /** 在某个根目录下找名字命中的子项（只看一层，快） */
@@ -352,7 +416,11 @@ function findDataPath(kind, plugin) {
           ? RE_CLAUDE
           : kind === 'trae'
             ? RE_TRAE
-            : RE_CODEBUDDY;
+            : kind === 'kilo'
+              ? RE_KILO
+              : kind === 'opencode'
+                ? RE_OPENCODE
+                : RE_CODEBUDDY;
   const homeDirs =
     kind === 'workbuddy'
       ? [path.join(HOME, '.workbuddy')]
@@ -360,14 +428,18 @@ function findDataPath(kind, plugin) {
         ? [path.join(HOME, '.codex')]
         : kind === 'claude'
           ? [claudeHome()]
-          : kind === 'trae'
-            ? plugin
-              // 插件形态（5F TraeCode 的插件那一路）：MarsCode 数据根，内置 trae 插件就装在
-              // ~/.marscode/builtin/trae，落盘也在它下面。
-              // 命令形态（同一个 5F 的 IDE 那一路）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
-              ? [path.join(HOME, '.marscode'), path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')]
-              : [path.join(HOME, '.trae'), path.join(HOME, '.trae-cn')]
-            : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
+          : kind === 'kilo'
+            ? xdgDataDirs('kilo')
+            : kind === 'opencode'
+              ? xdgDataDirs('opencode')
+              : kind === 'trae'
+                ? plugin
+                  // 插件形态（5F TraeCode 的插件那一路）：MarsCode 数据根，内置 trae 插件就装在
+                  // ~/.marscode/builtin/trae，落盘也在它下面。
+                  // 命令形态（同一个 5F 的 IDE 那一路）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
+                  ? [path.join(HOME, '.marscode'), path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')]
+                  : [path.join(HOME, '.trae'), path.join(HOME, '.trae-cn')]
+                : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
 
   const steps = plugin
     ? [
@@ -436,7 +508,9 @@ const PRODUCTS = [
   },
   {
     id: '2F',
-    name: 'WorkBuddy CLI',
+    // 胶囊上只写产品名（跟 1F CodeBuddy / 5F TraeCode 一致）：它只有 CLI 一个形态，
+    // 没必要把"CLI"挂在楼层名上；上报身份仍是 client=workbuddy（见 shared 的合同）
+    name: 'WorkBuddy',
     kind: 'cli',
     cmd: 'workbuddy',
     agent: 'workbuddy',
@@ -504,6 +578,103 @@ const PRODUCTS = [
     hookSource: true,
     dataKind: clientOf('trae', false),
   },
+  {
+    id: '6F',
+    name: 'Qoder',
+    kind: 'cli',
+    cmd: 'qoder',
+    agent: 'qoder',
+    plugin: false,
+    // Qoder 的 CLI 与插件（qoder-context 等）共用同一份 ~/.qoder 配置、同一套 hook、
+    // 同一个落盘目录（~/.qoder/projects/<工程>/<会话>.jsonl），分不出，合并单楼层（类 4F Claude）。
+    // 所以 6F 走「cli 扫 transcript + hook 实时相位」两路：
+    //   cli   —— ~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式：各带 sessionId 与 cwd，
+    //            文件名即 session_id；会话来自落盘，工程路径从 cwd 解析；见 sessionRegistry 的 SUBTREE/sessionIdOfFile）
+    //   hook  —— reporter 状态文件兜底（jsonl 还没写/读不出时，hook 那一路照常列会话并提供实时相位）
+    // 两路按 session_id 去重（见 sessionRegistry 的 claim / cliLandingSeen：cli 有活会话就撤掉 hook 行）。
+    sources: [
+      {
+        kind: 'cli',
+        label: 'CLI / 插件',
+        client: clientOf('qoder', false),
+        dirs: [path.join(HOME, '.qoder')],
+        note: 'Qoder 的 CLI 与插件共用 ~/.qoder，会话 transcript 在 ~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式）',
+      },
+      { kind: 'hook' },
+    ],
+    hookSource: true,
+    dataKind: clientOf('qoder', false),
+  },
+  {
+    id: '7F',
+    name: 'Kilo Code',
+    kind: 'cli',
+    cmd: 'kilo',
+    // 产品基名：上报身份 client=kilo（shared 的 clientOf 合同，见 shared/index.js）
+    agent: 'kilo',
+    plugin: false,
+    // Kilo Code（7F）是**纯轮询楼层**（与 8F OpenCode 同类，取法各自不同）：
+    // Kilo 没有 hook 子系统（实测 7.8.1 —— 没有 hooks.json、没有任何可挂命令的事件点），
+    // 所以既没有 hook 上报，也没有可扫的会话 jsonl：会话、相位、完成标记全部由服务端
+    // 轮询它自己的 event-sourced SQLite 推导（见 server/src/kilo.js）。
+    // 两路来源：
+    //   dir   —— 数据根（XDG 位置，见 kilo.js 的 kiloHome）只作落盘展示：
+    //            目录里有日志/快照/会话库，但会话不是"扫文件"能得到的
+    //   kilo  —— 会话来源：轮询 kilo.db（session + event + message 三张表）
+    // kind 用 'kilo' 而不是复用 'cli'：CLI 那一路是"扫 *.jsonl"，Kilo 是"读 SQLite"，
+    // 两种完全不同的取法，别让 sessionRegistry 里两条分支互相误认。
+    sources: [
+      {
+        kind: 'dir',
+        label: '数据根',
+        client: clientOf('kilo', false),
+        dirs: [kiloHome()],
+        note: '这一路只作落盘展示：Kilo 的会话是 SQLite 库（kilo.db），不是可扫的会话文件',
+      },
+      { kind: 'kilo', client: clientOf('kilo', false) },
+    ],
+    // 老口径的标记：会话来源既不是 hook 状态文件、也不是 jsonl，就是"轮询 Kilo 自己的库"
+    hookSource: true,
+    dataKind: clientOf('kilo', false),
+  },
+  {
+    id: '8F',
+    name: 'OpenCode',
+    kind: 'cli',
+    // 实测：官方安装脚本把二进制放在 ~/.opencode/bin/opencode，它**不在 PATH 里** ——
+    // 所以 CLI_BIN_DIRS 必须显式认这一条，否则这层永远判成"没装"（已加，见 CLI_BIN_DIRS）。
+    cmd: 'opencode',
+    // 产品基名：上报身份 client=opencode（shared 的 clientOf 合同，见 shared/index.js）
+    agent: 'opencode',
+    plugin: false,
+    // 与 7F Kilo 同源（Kilo Code CLI 就是 OpenCode 的 fork），但**不能照抄 7F 的取法**：
+    // OpenCode 2.0.18 的 `event` 表是空的（事件只在内存流里推、不落盘），所以轮询那一路
+    // 改读 `session_message` 的 content[]（见 server/src/opencode.js 文件头的分叉实测）。
+    //
+    // 两路来源：
+    //   dir       —— 数据根（XDG 位置，见 opencode.js 的 opencodeHome）只作落盘展示
+    //   opencode  —— 会话来源：轮询 opencode.db（session_v2 + session_message 两张表）
+    //   hook      —— **装了 WorkGremlin 插件时**的真相位一路：插件订阅 OpenCode 的内存事件流，
+    //               把相位/完成标记写成 reporter 状态文件（见 packages/reporter/src/plugin/）。
+    //               没装插件这一路空着，8F 照常按轮询列会话，只是相位按推断灰显。
+    //               这一路是「等待授权」相位的**唯一来源** —— OpenCode 的 tool 状态实测只有
+    //               completed/error/running，授权信号只在事件流里（见 opencode.js 文件头）。
+    // kind 用 'opencode' 而不是复用 'cli'/'kilo'：那两种是"扫 jsonl"和"读 event 表"，
+    // 8F 是"读 session_message"，三种取法别互相误认。
+    sources: [
+      {
+        kind: 'dir',
+        label: '数据根',
+        client: clientOf('opencode', false),
+        dirs: [opencodeHome()],
+        note: '这一路只作落盘展示：OpenCode 的会话是 SQLite 库（opencode.db），不是可扫的会话文件',
+      },
+      { kind: 'opencode', client: clientOf('opencode', false) },
+      { kind: 'hook' },
+    ],
+    hookSource: true,
+    dataKind: clientOf('opencode', false),
+  },
 ];
 
 /**
@@ -536,6 +707,12 @@ function sourceClient(p, spec) {
 function sourceDirs(p, spec) {
   if (spec.dirs && spec.dirs.length) return spec.dirs;
   if (spec.kind === 'hook') return [];
+  // 'kilo'（7F）也没有独立的落盘目录可扫：会话在 SQLite 库里，由 kilo.js 轮询。
+  // 这里必须显式回空 —— 落到下面的 findDataPath 会拿 RE_CODEBUDDY 去 matchIn 家目录，
+  // 给 Kilo 楼层报出一个 ~/.codebuddy 的路径（装别的产品的机器上尤其难看）。
+  if (spec.kind === 'kilo') return [];
+  // 'opencode'（8F）同理：会话在 opencode.db 里，由 opencode.js 轮询，没有可扫的落盘目录。
+  if (spec.kind === 'opencode') return [];
   return [findDataPath(p.agent, spec.kind === 'plugin')];
 }
 

@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * 各受监控产品的 hook 入口（CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode）。
+ * 各受监控产品的 hook 入口（CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode / Qoder）。
  *
  * 各家差异（同一份 hook 靠 `--agent` 注入的产品身份选口径）：
  *   · CodeBuddy / WorkBuddy / Trae：工具名 Write/Edit/MultiEdit/Task，事件 Notification / SubagentStop；
@@ -1015,7 +1015,7 @@ async function main() {
   // 主 agent 身份：安装器在命令里用 --agent 注入，必填；缺了直接报错退出。
   AGENT = flag(argv, '--agent');
   if (!AGENT) {
-    console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / workbuddy / trae）');
+    console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / workbuddy / trae / claude / qoder）');
     process.exit(1);
   }
   IS_CODEX = AGENT === 'codex';
@@ -1121,6 +1121,13 @@ async function main() {
     await register();
     await beat();
     await status('idle');
+    // Qoder 实测只发 SessionStart / SessionEnd，没有 UserPromptSubmit / PreToolUse / PostToolUse
+    // 这些细粒度事件（见 scripts/install-hooks.js 的 QODER_EVENTS 注释与 ~/.workgremlin/hooks/events.log）。
+    // 不补一笔"会话进行中"的粗粒度真值，主控制台只会一直显示「未上报」。Claude / CodeBuddy 有
+    // 细粒度事件随后把相位推进到 thinking / tool，不受这句影响。
+    if (AGENT === 'qoder') {
+      writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
+    }
     return;
   }
 
@@ -1427,7 +1434,13 @@ async function main() {
       String((ev && ev.session_id) || stEnd.sessionId || ''),
       cl
     );
-    writeState(file, { await: null, pending: null, sessionPhase: null });
+    // Qoder 没有 Stop（只有 SessionStart / SessionEnd），收尾给一个"已完成"的粗粒度相位，
+    // 否则 sessionPhase 回落成 null，主控制台又会显示「未上报」。其它产品维持原状（null）。
+    writeState(file, {
+      await: null,
+      pending: null,
+      sessionPhase: AGENT === 'qoder' ? { phase: 'done', ts: Date.now(), workspacePath: REAL_WS } : null,
+    });
     stopHeartbeat(AGENT);
     // 兜底：会话都结束了，它召唤出去的幽灵不该还飘着（手工 scripts/subagents.js
     // 写的那些没有 ts，不动它们）。

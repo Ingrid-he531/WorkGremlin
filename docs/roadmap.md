@@ -32,7 +32,7 @@ coder 与 tester 的里程碑编号不一致，本文档以 **coder 的 M0~M3 �
 | **M3** ❌ 未开工 | — | electron-builder 打包、时间线图、会话导出、暗色主题、系统通知与免打扰、原文加密通道 |
 | **M4** ❌ 未开工 | — | 派活 / 中断、目录监听生产化 |
 
-**排期之外已额外交付**（本文原先未规划）：等距 Canvas 办公室引擎与主 Agent 控制台（`renderer/src/iso/`）、左侧楼层与产品安装探测（1F~5F）、全局活跃会话表（60 分钟超时剔除）、工程级/用户级 subagent 工牌名册、`docs/design-elevator-transition.md` 的楼层切换设计。
+**排期之外已额外交付**（本文原先未规划）：等距 Canvas 办公室引擎与主 Agent 控制台（`renderer/src/iso/`）、左侧楼层与产品安装探测（1F~6F）、全局活跃会话表（60 分钟超时剔除）、工程级/用户级 subagent 工牌名册、`docs/design-elevator-transition.md` 的楼层切换设计。
 
 **语言栈**：本文 §7「风险 7」裁决的 TypeScript 迁移**未执行** —— 当前仍是 CommonJS JavaScript（`jsconfig.json`），硬前提「V1 先过」已满足，迁移本身未启动。
 

@@ -11,13 +11,16 @@
  *                        file-changes），拿得到运行态、待办清单、改动文件（见 sessions.js）；
  *                        CLI 那路是 ~/.codebuddy 的会话 jsonl + reporter 状态文件。
  *                        两路同时有会话 = 这一层里的两条会话（按 session_id 区分），不是两层。
- *   2F WorkBuddy CLI、
+ *   2F WorkBuddy、
  *   3F Codex CLI、
  *   4F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
  *                        工程名从文件**头部若干行**里找 cwd，读不到就留空（不猜）。
  *                        注意不是"首行"：Claude 的首行是 mode / queue-operation 这类
  *                        元记录，压根没有 cwd，cwd 从第 3 行的 user 记录才有（见 cwdOfHead）
  *                        （Codex 的 cwd 藏在 payload.cwd 里，同样由 cwdOfHead 覆盖）
+ *   7F Kilo Code —— **轮询路线**：Kilo 没有 hook、也没有会话 jsonl，会话/相位/完成标记
+ *                  全部由 server/src/kilo.js 读它自己的 event-sourced SQLite（kilo.db）推导。
+ *                  相位带 inferred:true 却又有真相位来源（推导自 event 流）。
  *
  * 超时：一个会话 60 分钟没有事件（最后更新时间没往前走）就从表里移除。
  * 它被移除只是"不再活跃"，下次它又有动静会被当成新会话重新登记。
@@ -29,6 +32,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { listSessions, listReporterSessions, readReporterDones } = require('./sessions');
+// 7F Kilo Code：Kilo 没有 hook、没有会话 jsonl，会话/相位/完成标记由这里轮询它的 SQLite 推导
+const { listKiloSessions, readKiloPhase, readKiloDone } = require('./kilo');
+// 8F OpenCode：与 7F 同类（轮询 SQLite），但读的是 session_message 而不是 event 表
+const { listOpencodeSessions, readOpencodePhase, readOpencodeDone } = require('./opencode');
 const { detectProducts } = require('./products');
 const { resolveProjectName } = require('./project');
 
@@ -178,7 +185,9 @@ function isDir(p) {
  * @returns {string} 会话 id；取不到回空串
  */
 function sessionIdOfFile(name, kind) {
-  if (kind === 'claude') return name.replace(/\.jsonl$/i, '');
+  // Claude Code 与 Qoder 的 transcript 都叫 `<session_id>.jsonl`：去扩展名即是
+  // （Qoder 是 Claude Code 同款格式，文件名即 hook payload 的 session_id，三处实测一致）。
+  if (kind === 'claude' || kind === 'qoder') return name.replace(/\.jsonl$/i, '');
   if (kind === 'codex') {
     const m = String(name).match(
       /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
@@ -202,7 +211,7 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   // 只扫真正放会话文件的那棵子树：Codex 在 sessions/ 下，Claude Code 在 projects/ 下。
   // 根目录里还有 history.jsonl / settings.json 这类不是会话的文件，扫进来全是噪声
   // （顺带也少走一遍 cache / plugins 那些大目录）。
-  const SUBTREE = { codex: 'sessions', claude: 'projects' };
+  const SUBTREE = { codex: 'sessions', claude: 'projects', qoder: 'projects' };
   const sub = SUBTREE[kind] ? path.join(dataPath, SUBTREE[kind]) : '';
   const root = sub && isDir(sub) ? sub : dataPath;
   const out = [];
@@ -431,6 +440,96 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // 会话 id，混着列会把一条会话显示成两条，见上面 refresh 的说明）。
       if (src.kind === 'hook') {
         if (cliLandingSeen.has(p.id)) continue;
+      }
+
+      // ---- Kilo 那一路（7F）：轮询 Kilo 自己的 SQLite 库 ----
+      // Kilo 没有 hook 子系统，也没有可扫的会话 jsonl，会话 / 相位 / 完成标记都由
+      // server/src/kilo.js 读 kilo.db 推导（与 8F OpenCode 同属轮询路线，取法不同：
+      // 8F 的 event 表是空的，改读 session_message —— 各自认各自的 kind）。
+      // 它与 cli / hook 两路形状不同（带真的相位与模型），所以单独一支，不塞进下面的
+      // `rows` 三元里 —— 那两路只有"文件时间"这一个证据。
+      if (src.kind === 'kilo') {
+        for (const s of listKiloSessions()) {
+          if (!claim(p.id, s.id)) continue;
+          // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook 两路完全一致
+          if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
+          const ph = readKiloPhase(s.id) || null;
+          upsert({
+            floor: p.id,
+            id: s.id,
+            // 轴 2：Kilo 的 ses_xxx 就是它自己的 session_id（与 message.session_id、
+            // event.aggregate_id、文件名 ses_f2261460….json 三处一致）
+            sessionId: s.id,
+            source: 'kilo',
+            /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
+            sourceKind: 'kilo',
+            project: s.project,
+            projectPath: s.projectPath,
+            mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
+            current: false,
+            // Kilo 没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
+            live: true,
+            // 相位来自 kilo.js 对 event 流的推导（见那里的新鲜度口径）——
+            // 它是**推断**（我们是轮询，不是它主动报的），所以 inferred 一律 true。
+            phase: ph ? ph.phase : 'unreported',
+            action: ph ? ph.action : '',
+            target: ph ? ph.target : '',
+            tool: ph ? ph.tool : '',
+            context: ph ? ph.context : [],
+            prompt: '',
+            inferred: true,
+            // 完成标记：Kilo 那边等价于"assistant 消息 finish=stop"（见 kilo.js）
+            ...readKiloDone(s.id, s),
+            lastEventAt: s.lastEventAt,
+          });
+        }
+        continue;
+      }
+
+      // ---- OpenCode 那一路（8F）：轮询 OpenCode 自己的 SQLite 库 ----
+      // 与 7F 同一类（不靠上报、单独一支、不塞进下面的 rows 三元），但**取法不同**：
+      // OpenCode 2.0.18 的 event 表是空的（事件不落盘），所以 opencode.js 读的是
+      // session_message 的 content[]，见那个文件头的分叉实测。
+      //
+      // 与 7F 的一个**能力差**（不是 bug，是 OpenCode 的落盘里根本没有这个信号）：
+      // 轮询推不出「等待授权」—— 它的 tool 状态只有 completed/error/running。
+      // 装了 WorkGremlin 插件时真相位由 hook 那一路补上（见 products.js 的 8F sources）。
+      if (src.kind === 'opencode') {
+        for (const s of listOpencodeSessions()) {
+          if (!claim(p.id, s.id)) continue;
+          // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook / kilo 四路完全一致
+          if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
+          const ph = readOpencodePhase(s.id) || null;
+          upsert({
+            floor: p.id,
+            id: s.id,
+            // 轴 2：OpenCode 的 ses_xxx 就是它自己的 session_id（与 session_message.session_id、
+            // 事件流 data.sessionID 三处一致）
+            sessionId: s.id,
+            source: 'opencode',
+            /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
+            sourceKind: 'opencode',
+            project: s.project,
+            projectPath: s.projectPath,
+            mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
+            current: false,
+            // OpenCode 没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
+            live: true,
+            // 相位来自 opencode.js 对 session_message 的推导（见那里的新鲜度口径）——
+            // 它是**推断**（我们是轮询，不是它主动报的），所以 inferred 一律 true。
+            phase: ph ? ph.phase : 'unreported',
+            action: ph ? ph.action : '',
+            target: ph ? ph.target : '',
+            tool: ph ? ph.tool : '',
+            context: ph ? ph.context : [],
+            prompt: '',
+            inferred: true,
+            // 完成标记：OpenCode 那边等价于"assistant 消息 finish=stop"（见 opencode.js）
+            ...readOpencodeDone(s.id, s),
+            lastEventAt: s.lastEventAt,
+          });
+        }
+        continue;
       }
 
       // 两路产出的会话行同构（都只有文件时间 / 心跳时间，没有运行态）：
