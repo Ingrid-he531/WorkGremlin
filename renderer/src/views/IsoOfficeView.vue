@@ -310,11 +310,19 @@ let lastConsoleSessionId = undefined;
 let lastDoneAt = undefined;
 /** 是否已经见过"快轮询带回的完成标记"：首次只当基线，不弹摘要（见下面的注释） */
 let seenFastDone = false;
-/** 页面（本视图）打开时刻：完成标记早于它 = 上一轮的残留（只当基线）；
- *  晚于它 = 页面打开后真实收到的 Stop —— 必须弹「任务完成」。
- *  之前不区分这两者：打开页面后的**第一次** Stop 一律被当成残留基线吞掉，
- *  于是"收到 Stop 必现任务完成"只对第二次起的 Stop 成立。 */
+/** 页面（本视图）打开时刻 = 下面 trackSince 的初始值 */
 const PAGE_OPEN_AT = Date.now();
+/**
+ * 我们**开始盯住当前这条会话**的时刻：页面打开时 = PAGE_OPEN_AT，切会话 / 切楼层时刷新。
+ *   · 完成标记早于它 = 开始盯之前就收的工 → 只当基线，不弹摘要；
+ *   · 晚于它 = 盯着的时候真实收到的 Stop → 必须弹「任务完成」。
+ *
+ * 为什么不能用页面打开那一刻的常量当尺子：切楼层时快轮询里装的还是**上一层**的数据
+ * （1.5s 才刷一次），所以"首次见到新楼层的完成标记"必然发生在切换之后，而那个标记
+ * 通常晚于页面打开 —— 拿打开时刻去量，必然判成"刚发生的新 Stop"。
+ * 现象：3F 切 4F 一进去就弹「任务完成」，几秒后回「待命中」，每次切都复现。
+ */
+let trackSince = PAGE_OPEN_AT;
 watch(
   consoleLive,
   (v) => {
@@ -327,7 +335,10 @@ watch(
     }
     const sel = sessions.selected;
     const selId = sel ? sel.id : null;
-    // 完成标记：优先会话自身的（3F 插件从落盘算出来），CLI 楼层没有就取 hook 快轮询带回来的。
+    // 完成标记有两条来源，取**较新**的那份：① 会话快照的 doneAt（10s 一条，各楼层都有；
+    // plugin 楼层是插件落盘算出来的，CLI / hookSource 楼层由服务端从同一份 hook 状态取）；
+    // ② hook 快轮询的 done（1.5s 一条）。用 max 而不用 `||`：快照那份最多能旧 10 秒，
+    // 拿它盖住刚收到的 Stop 会让「任务完成」晚到；反过来快轮询缺这条会话时也不至于丢标记。
     //
     // 两条纪律（都是踩过的坑）：
     //   ① 它是"某条会话上一轮结束"的**持久状态**，不是一次性事件 —— 页面刚打开 / 刚切楼层时
@@ -341,7 +352,7 @@ watch(
     const fastDoneAt = fpDone && fpDone.at && sameSession ? fpDone.at : 0;
     const firstFastDone = fastDoneAt > 0 && !seenFastDone;
     if (fastDoneAt > 0) seenFastDone = true;
-    const doneAt = (sel && sel.doneAt) || fastDoneAt || 0;
+    const doneAt = Math.max(Number(sel && sel.doneAt) || 0, fastDoneAt);
     // 切换了会话（或首次）：直接把控制台切到这条会话当前的状态，重置完成标记，不弹"任务完成"。
     // 办公室的工位小怪物也跟着选中的会话走：切到别的工程会话，就切到那个工程的成员清单，
     // 这样"主 Agent + 小怪物"整组都跟随下拉选中的那条，不再停在之前打开的工程。
@@ -349,6 +360,7 @@ watch(
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
       seenFastDone = fastDoneAt > 0; // 切会话时重新以这条会话的标记为基线
+      trackSince = Date.now(); // "完成标记是新的还是旧的"这把尺子也跟着换到这条会话
       // 空楼层（一条会话都没有）：控制台待命；屋里只留常驻小怪物、清掉幽灵
       // （见 sceneMembers），但**不走 applySession(null)** —— 那是"会话收工"，
       // 会弹「任务完成」，跟这层没关系。
@@ -366,20 +378,21 @@ watch(
     }
     // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
     // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
-    // 首次拿到标记：早于页面打开的只记基线（上一轮的收工，不重播）；
-    // 页面打开之后发生的不能当基线 —— 那是刚刚真实收到的 Stop，走下面正常判断弹摘要
-    if (firstFastDone && doneAt < PAGE_OPEN_AT) lastDoneAt = doneAt;
+    // 首次拿到标记：早于 trackSince（= 开始盯这条会话）的只记基线（上一轮的收工，不重播）；
+    // 之后发生的不能当基线 —— 那是盯着的时候真实收到的 Stop，走下面正常判断弹摘要
+    if (firstFastDone && doneAt < trackSince) lastDoneAt = doneAt;
     if (doneAt && doneAt !== lastDoneAt) {
       lastDoneAt = doneAt;
       // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
       // tooltip 里 {{ c }} 渲染对象就成了 JSON 串；这里先给一句总述，再一行一个文件。
       //
       // 改动清单两条来源（谁先到用谁）：
-      //   ① 会话快照的 doneFiles（插件落盘，带 +/- 行数）—— 但它 10s 才刷一次，
+      //   ① 会话快照的 doneFiles —— plugin 楼层是插件落盘的 file-changes（带 +/- 行数），
+      //      CLI / hookSource 楼层是服务端从 hook 那份取的（只有路径）；但它 10s 才刷一次，
       //      而 doneAt 是 1.5s 快轮询先看到的，所以**多数时候这一份还是空的**，
       //      这就是"任务完成只剩一句话"的根因；
       //   ② hook 自己记的"本轮用工具动过的文件"（done.files，跟着完成标记一起落盘，
-      //      快轮询当下就有；不依赖插件落盘，Codex / Claude 那几层也有）。
+      //      快轮询当下就有）。两边的文件名对得上，只是 ② 没有 +/- 行数。
       const snapFiles = (sel && sel.doneFiles) || [];
       const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({ name: typeof p === 'string' ? p : (p && p.path) || '' }));
       const files = snapFiles.length ? snapFiles : hookFiles;
@@ -472,6 +485,12 @@ watch(sceneMembers, (v) => {
 watch(
   () => props.selectedId,
   (v) => office && office.setSelected(v)
+);
+// 切楼层时换这一层的材质配色（隔断 / 金属件 / 木件逐层不同，见 iso/officeMap 的 FLOOR_COLORS）。
+// 换脸发生在电梯关门后，这里跟着 store 走即可。
+watch(
+  () => sessions.selectedFloor,
+  (v) => office && office.setFloor(v)
 );
 watch(mainAgentState, (v) => office && office.setMainAgent(v));
 
@@ -566,14 +585,14 @@ function dismiss() {
 function resetView() {
   if (!office) return;
   office.destroy();
-  office = createIsoOffice(canvasRef.value, { onSelect: openCard });
+  office = createIsoOffice(canvasRef.value, { onSelect: openCard, floor: sessions.selectedFloor });
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);
 }
 
 onMounted(() => {
-  office = createIsoOffice(canvasRef.value, { onSelect: openCard });
+  office = createIsoOffice(canvasRef.value, { onSelect: openCard, floor: sessions.selectedFloor });
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);

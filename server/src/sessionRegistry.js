@@ -26,7 +26,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { listSessions, listReporterSessions } = require('./sessions');
+const { listSessions, listReporterSessions, readReporterDones } = require('./sessions');
 const { detectProducts } = require('./products');
 const { resolveProjectName } = require('./project');
 
@@ -40,6 +40,9 @@ const table = new Map();
 
 let lastScanAt = 0;
 let lastSnapshot = null;
+/** 本次扫盘里 (工程|客户端) -> readReporterDones 的结果；每次 refresh 重建。
+ *  一个 CLI 楼层一次能扫出上百个历史会话文件，逐个去扫 hooks 目录太浪费，所以按 client 读一次盘。 */
+let doneScans = new Map();
 
 const SKIP = new Set(['node_modules', '.git', '.svn', 'cache', 'Cache', 'logs']);
 
@@ -156,6 +159,34 @@ function isDir(p) {
 }
 
 /**
+ * 从会话文件名里取会话 id（拿不到回空串 —— 不猜）。
+ *
+ *   - Claude Code：transcript 就叫 `<session_id>.jsonl`，去扩展名即是
+ *     （hook payload 的 session_id，实测三处 100% 一致）。
+ *   - Codex：`rollout-<YYYY-MM-DDTHH-MM-SS>-<session_id>.jsonl` —— id 在**时间戳后面那一段**。
+ *     早先这里写的是"形状不同，不猜，留空"，其实是**取法不同**：直接去扩展名拿到的是
+ *     `rollout-…-<id>` 整串。本机实测 3/3，尾段 uuid 与 hooks 状态文件里的 session_id
+ *     一字不差（rollout-2026-09-26T11-15-56-01a0dbb6-…  ==  codex__…_01a0dbb6-….json）。
+ *     取到 id 的收益是让 4F 的"完成"从"该工程最新"变成按会话精确（见 doneFieldsOf），
+ *     渲染层的快轮询也会开始带 ?session=（相位同样受益）。
+ *     失败是安全的：形状对不上就回空串 → 退回老行为，不会张冠李戴。
+ *   - 其余产品（CodeBuddy / WorkBuddy CLI）：文件名不含会话 id，留空。
+ * @param {string} name 文件名（含扩展名）
+ * @param {string} kind 产品基名（products 的 agent：claude / codex / codebuddy …）
+ * @returns {string} 会话 id；取不到回空串
+ */
+function sessionIdOfFile(name, kind) {
+  if (kind === 'claude') return name.replace(/\.jsonl$/i, '');
+  if (kind === 'codex') {
+    const m = String(name).match(
+      /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
+    );
+    return m ? m[1] : '';
+  }
+  return '';
+}
+
+/**
  * CLI 落盘里的会话文件（*.jsonl）：一个文件算一个会话。
  * 只有文件时间可靠，别的字段读不到就留空。
  *
@@ -199,10 +230,8 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
       const cwd = cwdOfHead(p);
       out.push({
         id: path.relative(root, p),
-        // 轴 2：这条落盘属于哪条会话。Claude Code 的 transcript 就叫 `<session_id>.jsonl`，
-        // 文件名去扩展名就是 hook payload 里的 session_id（实测三处 100% 一致）。
-        // Codex 是 `rollout-<时间>-<uuid>.jsonl`，形状不同 —— 不猜，留空。
-        sessionId: kind === 'claude' ? e.name.replace(/\.jsonl$/i, '') : '',
+        // 轴 2：这条落盘属于哪条会话（解析规则与实测依据见 sessionIdOfFile）
+        sessionId: sessionIdOfFile(e.name, kind),
         project: cwd ? resolveProjectName(cwd) || path.basename(cwd) : '',
         projectPath: cwd,
         lastEventAt: at || Date.now(),
@@ -242,6 +271,68 @@ function prune(now = Date.now()) {
   return removed;
 }
 
+/** 完成标记缺失时的统一返回值（没有就是"没有"，不臆造） */
+const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [] };
+
+/**
+ * CLI / hookSource 楼层的"完成标记"，字段名与 plugin 分支完全一致。
+ *
+ * 以前只有 plugin 楼层在会话表里带 doneAt（插件落盘那条路算的），CLI 楼层只能等渲染层的
+ * 1.5s 快轮询把完成标记带回来 —— 于是"完成"这件事在 UI 上有两套来源，切楼层时还因此
+ * 误弹过「任务完成」（渲染层拿不到会话快照里的 doneAt，只能把快轮询第一次见到的当成新事件）。
+ * 时间戳来源统一了：CLI / hookSource 楼层走本函数（读 reporter 在 Stop 时落盘的 done），
+ * 不再依赖渲染层 1.5s 快轮询第一次见到才算"新事件"，所以渲染层不再需要按楼层分叉判断。
+ * 但"同源"只对了时间戳来源、没对归属：**有会话 id 的按 bySession 精确命中，没有 id 的
+ * 只能退回 (工程+client) 的 latest** —— 同层跑多条会话时，后者仍可能把"别人刚收工"
+ * 算到当前这条头上。这是已知残留，不是本次回归。
+ * 现在拿得到 id 的是：Claude CLI（文件名）、Codex（rollout 文件名，见 sessionIdOfFile）、
+ * 7F hookSource（listReporterSessions 本来就只列得出有 sessionId 的）。剩下 1F / 2F 两个
+ * CLI 楼层的文件名不含 id；plugin 楼层（3F/6F）的会话行不带 sessionId（且它们的 doneAt
+ * 另走 sessions.js 的 sessionInfo，不经过本函数）。
+ *
+ * 文件清单只有路径：hook 不做 diff，没有 +/- 行数（那是 plugin 落盘的 file-changes 才有的）。
+ * @param {string} projectPath 会话所属工程（读状态文件时按它过滤）；**可能为空**，见下面的守卫
+ * @param {string} client 客户端身份（楼层 dataKind，如 codex / trae）
+ * @param {string} sessionId 会话 id；拿不到才退回"该（工程 + client）最新的一份"
+ */
+function doneFieldsOf(projectPath, client, sessionId = '') {
+  /**
+   * 守卫：工程归属不明的会话**不许走兜底**。
+   * readReporterDones 在没有 projectPath 时不做工程过滤，那份 latest 可能来自别的工程 ——
+   * 会把别工程的收工（连同文件名）当成这条会话的"任务完成"显示出来。
+   *
+   * 但只砍**兜底**这一支，**不砍有会话 id 的精确命中**（两者安全性不同：id 唯一，精确命中
+   * 与工程无关）。一刀砍掉会误伤两条真实路径：
+   *   · 7F TraeCode IDE（hookSource）—— 会话一 Stop，hook 就把 sessionPhase 与
+   *     taskWorkspacePath 一起清空（实测 sessionPhase:null、taskWorkspacePath:""），于是
+   *     "有完成标记"与"工程归属非空"按构造互斥：守卫一开，7F 的「任务完成」永远不亮，
+   *     反而要等下一轮开工、工程回来了才突然亮起上一轮的完成（假弹）。
+   *   · Claude 会话的 cwd 没解析出来时工程也是空，但它有会话 id，精确命中照样是对的。
+   * 反过来，没有会话 id 的（1F/2F）行为不变：仍返回空标记（合"绝不编造"纪律）。
+   *
+   * 守卫只加在这里，别加进 readReporterDone：/reporter-phase 在 freshestReporterWs
+   * 返回空时也会调它，那样会连快轮询的精确标记一起废掉。
+   */
+  if (!projectPath && !sessionId) return NO_DONE;
+  // projectPath 为空时 key 塌成 `|client`，与 readReporterDones 的"空串 = 不过滤"是同一语义：
+  // 这类会话只可能靠下面的精确命中取到东西，走不到 latest（守卫已拦）。
+  const key = `${projectPath || ''}|${client || ''}`;
+  if (!doneScans.has(key)) doneScans.set(key, readReporterDones(projectPath, client));
+  const { latest, bySession } = doneScans.get(key);
+  // 有会话 id 就必须精确命中：命中不了就是"这条会话没完成过"，
+  // 不能退回 latest —— 那会把同层别的会话的收工搬到它头上（错误归因）。
+  const done = sessionId ? bySession.get(String(sessionId)) || null : latest;
+  if (!done) return NO_DONE;
+  const files = Array.isArray(done.files) ? done.files : [];
+  const count = Number(done.fileCount);
+  return {
+    doneAt: Number(done.at) || 0,
+    doneTitle: done.title || '',
+    doneCount: Number.isFinite(count) ? count : files.length,
+    doneFiles: files.slice(0, 6).map((f) => ({ name: typeof f === 'string' ? f : (f && f.path) || '' })),
+  };
+}
+
 /**
  * 扫一遍所有数据源，更新表。
  * @param {{workspacePath?: string, force?: boolean}} o
@@ -249,6 +340,7 @@ function prune(now = Date.now()) {
 function refresh({ workspacePath = '', force = false } = {}) {
   const now = Date.now();
   if (!force && lastScanAt && now - lastScanAt < TTL) return;
+  doneScans = new Map();
 
   // 插件楼层：每个 plugin 楼层各自读自己的落盘（client 不同，不能混）。
   // 以前这里写死 3F + 全局 PLUGIN_CLIENT（已删除）；现在遍历所有 plugin 楼层，
@@ -321,6 +413,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
         action: '',
         context: [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`],
         inferred: true,
+        ...doneFieldsOf(s.projectPath, p.dataKind, s.sessionId || ''),
         lastEventAt,
       });
     }
@@ -349,6 +442,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
         action: '',
         context: [],
         inferred: true,
+        ...doneFieldsOf(s.workspacePath, p.dataKind, s.sessionId),
         lastEventAt: s.lastEventAt,
       });
     }

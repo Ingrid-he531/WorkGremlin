@@ -28,7 +28,7 @@ import {
 } from './iso';
 import {
   ROOM,
-  COLORS,
+  colorsFor,
   WALL,
   DESK_UNITS,
   DIVIDERS,
@@ -53,6 +53,9 @@ const STATE_COLOR = {
   thinking: '#ffcf5c',
   offline: '#4a5160',
 };
+/** 隔板便签上那颗磁吸固定器的金属色（金属件，不随楼层变）。
+ *  便签纸色与墨色不在这里写死 —— 走本层配色 colors.note / colors.noteInk（见 officeMap 的 FLOOR_COLORS）。 */
+const MAGNET = '#c3ccda';
 /** 工牌级别色（与小怪物脖子上的工牌一致）：user=蓝, project=绿, 其它（演示/普通）=灰 */
 const LEVEL_COLOR = { user: '#3b82f6', project: '#22c55e' };
 const levelColor = (level) => LEVEL_COLOR[level] || '#7c8aa5';
@@ -170,11 +173,16 @@ function makeWallText(text) {
 
 /**
  * @param {HTMLCanvasElement} canvas
- * @param {{onSelect?: (id: string) => void}} [opts]
+ * @param {{onSelect?: (id: string) => void, floor?: string}} [opts]
+ *   floor：当前楼层 id（如 '3F' / '4F' / '7F'）。用于挑这一层的材质配色（见 officeMap 的 colorsFor），
+ *   之后可在运行时用 setFloor() 切换。
  */
 export function createIsoOffice(canvas, opts = {}) {
   const ctx = canvas.getContext('2d');
   const onSelect = opts.onSelect || (() => {});
+  /** 本层配色：随楼层变化的材质 token（隔断 / 金属 / 木件），其余沿用基准 */
+  let colors = colorsFor(opts.floor);
+  let floorId = opts.floor || '';
 
   let W = 0;
   let H = 0;
@@ -960,15 +968,15 @@ export function createIsoOffice(canvas, opts = {}) {
 
   /** 椅子底座：五星脚 + 中柱 + 座板（永远画在坐着的人之前） */
   function drawChairBase(c, x, y) {
-    isoCylinder(c, { x, y, z: 0.02, r: 0.26, h: 0.04, color: '#2b3140' });
-    isoCylinder(c, { x, y, z: 0.06, r: 0.05, h: 0.34, color: '#39414f' });
-    isoBox(c, { x: x - 0.24, y: y - 0.24, z: 0.4, w: 0.48, d: 0.48, h: 0.08, color: COLORS.chair });
+    isoCylinder(c, { x, y, z: 0.02, r: 0.26, h: 0.04, color: colors.metalDark });
+    isoCylinder(c, { x, y, z: 0.06, r: 0.05, h: 0.34, color: colors.metal });
+    isoBox(c, { x: x - 0.24, y: y - 0.24, z: 0.4, w: 0.48, d: 0.48, h: 0.08, color: colors.chair });
   }
 
   /** 椅背：backAtNorth=true 朝北（背对镜头），false 朝南（挡在人与镜头之间） */
   function drawChairBack(c, x, y, backAtNorth) {
     const by = backAtNorth ? y - 0.3 : y + 0.22;
-    isoBox(c, { x: x - 0.22, y: by, z: 0.48, w: 0.44, d: 0.1, h: 0.5, color: COLORS.chair });
+    isoBox(c, { x: x - 0.22, y: by, z: 0.48, w: 0.44, d: 0.1, h: 0.5, color: colors.chair });
   }
 
   /**
@@ -996,7 +1004,7 @@ export function createIsoOffice(canvas, opts = {}) {
 
     // ---- 机身：纸盒柜 → 中段（出纸腔所在）→ 稿台 ----
     isoBox(c, { x, y, z: 0, w, d, h: zBase, color: '#333c4b' });
-    isoBox(c, { x, y, z: zBase, w, d, h: zBody - zBase, color: COLORS.metal });
+    isoBox(c, { x, y, z: zBase, w, d, h: zBody - zBase, color: colors.metal });
     isoBox(c, { x, y, z: zBody, w, d, h: zGlass - zBody, color: '#2f3a4d' });
 
     // 稿台玻璃（画在盖板之前：盖板待会儿只压住它中间，露出前面那道边）
@@ -1074,7 +1082,7 @@ export function createIsoOffice(canvas, opts = {}) {
     const faceY = pc.y + HW;  // 朝镜头那面（+gy）
 
     // ---- 机身 ----
-    isoBox(c, { x: pc.x - HW, y: pc.y - HW, z: 0, w: HW * 2, d: HW * 2, h: bodyH, color: COLORS.metal });
+    isoBox(c, { x: pc.x - HW, y: pc.y - HW, z: 0, w: HW * 2, d: HW * 2, h: bodyH, color: colors.metal });
     // 正面：内凹的接水区（深色面板，出水嘴和接水盘都在这一块里）
     wallQuad(c, 'y', faceY, pc.x - 0.17, pc.x + 0.17, bodyH * 0.5, bodyH * 0.86, '#2a3340');
     // 冷 / 热两个出水嘴：往 +gy 伸出来一点，蓝 / 红各一个
@@ -1220,9 +1228,9 @@ export function createIsoOffice(canvas, opts = {}) {
     isoShadow(c, (X0 + X1) / 2, (Y0 + Y1) / 2 + 0.1, rk.w * 0.46, 0.26);
 
     // 架体：背板（贴墙）+ 踢脚 + 左端立板 —— 先把架子立起来，再往里塞层板和杂志
-    isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: 0.05, h: rk.h, color: COLORS.metalDark });
-    isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: rk.d, h: zBase, color: COLORS.metal });
-    isoBox(c, { x: X0, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: COLORS.metal });
+    isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: 0.05, h: rk.h, color: colors.metalDark });
+    isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: rk.d, h: zBase, color: colors.metal });
+    isoBox(c, { x: X0, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: colors.metal });
 
     for (let i = 0; i < tiers; i += 1) {
       const zb = zBase + i * step + 0.06;
@@ -1235,7 +1243,7 @@ export function createIsoOffice(canvas, opts = {}) {
           project(X1, Y1, zAt(zb, Y1) + T),
           project(X0, Y1, zAt(zb, Y1) + T),
         ],
-        shade(COLORS.wood, 1.06)
+        shade(colors.wood, 1.06)
       );
       poly(
         c,
@@ -1245,7 +1253,7 @@ export function createIsoOffice(canvas, opts = {}) {
           project(X1, Y1, zAt(zb, Y1)),
           project(X0, Y1, zAt(zb, Y1)),
         ],
-        shade(COLORS.wood, 0.66)
+        shade(colors.wood, 0.66)
       );
 
       // ---- 一排杂志：沿 x 并排站、往后靠（顶边更靠 Y0，同时抬高 hj）----
@@ -1272,7 +1280,7 @@ export function createIsoOffice(canvas, opts = {}) {
     }
 
     // 右端立板最后画：相机在 +x 方向，它是最靠近镜头的那块，把层板与杂志的端头夹进架子
-    isoBox(c, { x: X1 - PT, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: COLORS.metal });
+    isoBox(c, { x: X1 - PT, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: colors.metal });
   }
 
   /**
@@ -1317,7 +1325,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.save();
     c.translate(t.x, t.y);
     c.scale(p.s, p.s);
-    c.fillStyle = COLORS.plant;
+    c.fillStyle = colors.plant;
     c.beginPath();
     c.ellipse(0, -16, 13, 16, 0, 0, Math.PI * 2);
     c.fill();
@@ -1433,6 +1441,92 @@ export function createIsoOffice(canvas, opts = {}) {
     return g;
   }
 
+  /**
+   * 隔板上的便签纸：一张歪着的小方纸 + 压在纸上沿的一颗磁吸固定器。
+   *
+   * 纸与磁吸都贴在隔板**朝镜头那一面**（gy = 板南沿 + 0.002，抬一丝免得跟板面共面打架），
+   * 也就是都躺在 (gx, gz) 这张竖直面里。做法：先在面内绕纸心把四个角"转歪"，
+   * 再逐角 project —— 斜投影下正方形自然变成平行四边形，和板面严丝合缝，
+   * 而不是一张正对镜头、浮在板前的贴片。
+   *
+   * 磁吸是个圆盘（圆面与板面平行），投影后是**斜椭圆**：面内两根轴 AX / AZ
+   * 投影后等长（44px）但夹角 120°；等长共轭半径成 120° 时，椭圆半轴为
+   * 44r·√1.5（长轴，沿屏幕 60°）与 44r·√0.5（短轴，沿 −30°），
+   * 直接喂给 ctx.ellipse 的 rotation 即可。
+   *
+   * 纸色与墨色取自本层配色（colors.note / colors.noteInk）：3F 是便签黄，4F 是冷紫罗兰，
+   * 换层时随 applyFloor() 一起变 —— 便签是静态家具，会被重建进 statics。
+   */
+  function drawDividerNote(c, p, note) {
+    const y = p.y + p.d + 0.002;
+    const th = (note.tilt * Math.PI) / 180;
+    const co = Math.cos(th);
+    const si = Math.sin(th);
+    /** 面内局部坐标（u 沿 gx、v 沿 gz，已绕纸心转过 tilt）→ 屏幕点 */
+    const at = (u, v) => project(note.x + u * co - v * si, y, note.z + u * si + v * co);
+    const hw = note.w / 2;
+    const hh = note.h / 2;
+    /** 四个角（du/dv = 整张纸在面内的平移，用来画影子） */
+    const quad = (du = 0, dv = 0) => [
+      at(-hw + du, hh + dv),
+      at(hw + du, hh + dv),
+      at(hw + du, -hh + dv),
+      at(-hw + du, -hh + dv),
+    ];
+
+    // 影子：光从左上来，影子往板的右下方偏一点，纸才"浮"在板面上而不是印上去的
+    poly(c, quad(0.03, -0.03), 'rgba(8,11,16,0.35)');
+
+    // 纸面：上亮下暗（顶边受光）
+    const pT = at(0, hh);
+    const pB = at(0, -hh);
+    const gp = c.createLinearGradient(pT.x, pT.y, pB.x, pB.y);
+    gp.addColorStop(0, shade(colors.note, 1.14));
+    gp.addColorStop(1, shade(colors.note, 0.8));
+    poly(c, quad(), gp, 'rgba(24,20,8,0.35)', 0.7);
+
+    // 下沿一道暗带：便签的下边微微翘起，这一道就是翘边落在纸上的影
+    poly(c, [at(-hw, -hh), at(hw, -hh), at(hw, -hh + 0.055), at(-hw, -hh + 0.055)], 'rgba(20,16,4,0.16)');
+
+    // 两道手写笔迹（不到 1px，只为让它读起来是"写了字的便签"而不是一块色块）
+    c.save();
+    c.strokeStyle = rgba(colors.noteInk, 0.5);
+    c.lineWidth = 0.7;
+    c.lineCap = 'round';
+    [[-0.085, -0.03, 0.105], [-0.095, -0.09, 0.07]].forEach(([u0, v, len]) => {
+      const a = at(u0, v);
+      const b = at(u0 + len, v);
+      c.beginPath();
+      c.moveTo(a.x, a.y);
+      c.lineTo(b.x, b.y);
+      c.stroke();
+    });
+    c.restore();
+
+    // 磁吸固定器：压在纸上沿正中 —— 外圈暗边（厚度）+ 金属面 + 一点高光
+    const r = note.magnet;
+    const mj = UNIT_Z * r * Math.sqrt(1.5);
+    const mn = UNIT_Z * r * Math.sqrt(0.5);
+    const ROT = Math.PI / 3;
+    const mc = at(0, hh - r - 0.03);
+    c.beginPath();
+    c.ellipse(mc.x, mc.y, mj * 1.3, mn * 1.3, ROT, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(10,14,20,0.5)';
+    c.fill();
+    const gm = c.createLinearGradient(mc.x, mc.y - mj, mc.x + mj * 0.5, mc.y + mj);
+    gm.addColorStop(0, shade(MAGNET, 1.32));
+    gm.addColorStop(0.55, shade(MAGNET, 0.95));
+    gm.addColorStop(1, shade(MAGNET, 0.5));
+    c.beginPath();
+    c.ellipse(mc.x, mc.y, mj, mn, ROT, 0, Math.PI * 2);
+    c.fillStyle = gm;
+    c.fill();
+    c.beginPath();
+    c.ellipse(mc.x - mj * 0.16, mc.y - mn * 0.26, mj * 0.4, mn * 0.42, ROT, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(255,255,255,0.55)';
+    c.fill();
+  }
+
   /** 预生成静态物件列表（每帧参与排序） */
   function buildStatics() {
     /** @type {{depth:number,draw:(c:CanvasRenderingContext2D, now:number)=>void}[]} */
@@ -1501,7 +1595,7 @@ export function createIsoOffice(canvas, opts = {}) {
        */
       const FR = p.frame || 0.05;
       const FD = 0;
-      const ALU = '#5f6a7e';
+      const ALU = colors.dividerFrame;
       /**
        * 板体左右各让出 FR，把这两条让给竖框：
        * 于是竖框**落在板边的那一条上、不压在板面上**（框外沿 = 板的总外沿 = 桌子左右沿）。
@@ -1518,7 +1612,7 @@ export function createIsoOffice(canvas, opts = {}) {
            * （推导在 officeMap 的 DIVIDER_H 注释里）：再高北桌会被切剩一条边停在板顶
            * （"桌面爬到隔板上"）；再矮名牌压不进板面。
            */
-          isoBox(c, { x: p.x + FR + s * bodySegW, y: p.y, w: bodySegW + 0.01, d: p.d, h: p.h, color: '#2a3241' });
+          isoBox(c, { x: p.x + FR + s * bodySegW, y: p.y, w: bodySegW + 0.01, d: p.d, h: p.h, color: colors.divider });
           /**
            * 上横框：跟着段走（整条横框只拿一个深度会排错，被画到桌子前后不对的一侧）。
            * 画在板体之后：顶面与板顶共面、后画的框条压出"收边"；南面在板正面压出顶部那条框；
@@ -1563,6 +1657,12 @@ export function createIsoOffice(canvas, opts = {}) {
           top: metalTop(c, ALU, p.x + p.w - FR, p.y - FD / 2, p.d + FD, p.h),
         });
       });
+      /**
+       * 便签纸（+ 磁吸固定器）：排在**最后一段板体与右竖框之后** —— 它贴在板面上，
+       * 必须压在板子之上；又严格小于南桌的 depth（上限 ceil = ds − 0.01），
+       * 所以纸的下沿万一压到桌面高度，仍会被后画的南桌正确切掉，不会浮在桌子前面。
+       */
+      if (p.note) push(segDepth(SEG - 1) + 0.0004, (c) => drawDividerNote(c, p, p.note));
 
       // 名牌不再挂隔板：已挪到各桌桌面（见 DESK_UNITS 段的 drawDeskTag）
     });
@@ -1579,12 +1679,12 @@ export function createIsoOffice(canvas, opts = {}) {
       push(deskDepth, (c) => {
         const { x, y, w, d, h } = u.desk;
         // 四条腿
-        isoBox(c, { x: x + 0.1, y: y + 0.1, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: '#3a2d21' });
-        isoBox(c, { x: x + w - 0.2, y: y + 0.1, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: '#3a2d21' });
-        isoBox(c, { x: x + 0.1, y: y + d - 0.2, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: '#3a2d21' });
-        isoBox(c, { x: x + w - 0.2, y: y + d - 0.2, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: '#3a2d21' });
+        isoBox(c, { x: x + 0.1, y: y + 0.1, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
+        isoBox(c, { x: x + w - 0.2, y: y + 0.1, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
+        isoBox(c, { x: x + 0.1, y: y + d - 0.2, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
+        isoBox(c, { x: x + w - 0.2, y: y + d - 0.2, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
         // 桌面
-        isoBox(c, { x, y, z: h - 0.08, w, d, h: 0.08, color: COLORS.wood });
+        isoBox(c, { x, y, z: h - 0.08, w, d, h: 0.08, color: colors.wood });
       });
 
       // 桌上的东西（depth 比桌子大一点 → 压在桌面上）
@@ -1742,9 +1842,9 @@ export function createIsoOffice(canvas, opts = {}) {
     /* 会议室 */
     const mt = MEETING.table;
     push(depthOf(mt.x + mt.w / 2, mt.y + mt.d / 2), (c) => {
-      isoBox(c, { x: mt.x + 0.15, y: mt.y + 0.2, z: 0, w: 0.18, d: 0.18, h: mt.h - 0.08, color: '#3a2d21' });
-      isoBox(c, { x: mt.x + mt.w - 0.33, y: mt.y + mt.d - 0.38, z: 0, w: 0.18, d: 0.18, h: mt.h - 0.08, color: '#3a2d21' });
-      isoBox(c, { x: mt.x, y: mt.y, z: mt.h - 0.1, w: mt.w, d: mt.d, h: 0.1, color: COLORS.wood });
+      isoBox(c, { x: mt.x + 0.15, y: mt.y + 0.2, z: 0, w: 0.18, d: 0.18, h: mt.h - 0.08, color: colors.deskLeg });
+      isoBox(c, { x: mt.x + mt.w - 0.33, y: mt.y + mt.d - 0.38, z: 0, w: 0.18, d: 0.18, h: mt.h - 0.08, color: colors.deskLeg });
+      isoBox(c, { x: mt.x, y: mt.y, z: mt.h - 0.1, w: mt.w, d: mt.d, h: 0.1, color: colors.wood });
       // 桌上：一摞纸 + 投影仪
       isoBox(c, { x: mt.x + 1.1, y: mt.y + 0.55, z: mt.h, w: 0.5, d: 0.4, h: 0.04, color: '#e6ebf2' });
       isoBox(c, { x: mt.x + 1.9, y: mt.y + 0.6, z: mt.h, w: 0.42, d: 0.3, h: 0.12, color: '#2b3140' });
@@ -1774,7 +1874,7 @@ export function createIsoOffice(canvas, opts = {}) {
         const s1 = s0 + w;
         const mid = (s0 + s1) / 2;
         const d = depthOf(axis === 'x' ? fixed : mid, axis === 'x' ? mid : fixed);
-        push(d, (c) => wallQuad(c, axis, fixed, s0, s1, 0, h, rgba(COLORS.glass, 0.16)));
+        push(d, (c) => wallQuad(c, axis, fixed, s0, s1, 0, h, rgba(colors.glass, 0.16)));
         if (blinds) push(d + 0.0005, (c) => drawBlinds(c, { axis, fixed, a0: s0, a1: s1, z0: 0, z1: h }));
       }
     };
@@ -1795,9 +1895,9 @@ export function createIsoOffice(canvas, opts = {}) {
     const pt = PANTRY.table;
     push(depthOf(pt.x + pt.w / 2, pt.y + pt.d / 2), (c) => {
       [[0.12, 0.1], [pt.w - 0.24, 0.1], [0.12, pt.d - 0.22], [pt.w - 0.24, pt.d - 0.22]].forEach(([dx, dy]) => {
-        isoBox(c, { x: pt.x + dx, y: pt.y + dy, z: 0, w: 0.12, d: 0.12, h: pt.h - 0.08, color: '#3a2d21' });
+        isoBox(c, { x: pt.x + dx, y: pt.y + dy, z: 0, w: 0.12, d: 0.12, h: pt.h - 0.08, color: colors.deskLeg });
       });
-      isoBox(c, { x: pt.x, y: pt.y, z: pt.h - 0.08, w: pt.w, d: pt.d, h: 0.08, color: COLORS.wood });
+      isoBox(c, { x: pt.x, y: pt.y, z: pt.h - 0.08, w: pt.w, d: pt.d, h: 0.08, color: colors.wood });
       // 桌上的杯子
       isoCylinder(c, { x: pt.x + 0.5, y: pt.y + 0.42, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
       isoCylinder(c, { x: pt.x + 1.45, y: pt.y + 0.6, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
@@ -1859,7 +1959,18 @@ export function createIsoOffice(canvas, opts = {}) {
     return items;
   }
 
-  const statics = buildStatics();
+  /** 静态家具的绘制清单（含每件的 depth）。配色随楼层变，切层时用 applyFloor() 重建 */
+  let statics = buildStatics();
+
+  /** 换楼层：重挑配色并重建受影响的缓存（家具清单 + 背景） */
+  function applyFloor(id) {
+    const next = id || '';
+    if (next === floorId) return;
+    floorId = next;
+    colors = colorsFor(floorId);
+    statics = buildStatics();
+    bgKey = '';
+  }
 
   /* ------------------------------ 背景（缓存） ------------------------------ */
 
@@ -1875,8 +1986,8 @@ export function createIsoOffice(canvas, opts = {}) {
           y: gy,
           w: 1,
           d: 1,
-          fill: (gx + gy) % 2 ? COLORS.floor : COLORS.floorAlt,
-          stroke: COLORS.floorSeam,
+          fill: (gx + gy) % 2 ? colors.floor : colors.floorAlt,
+          stroke: colors.floorSeam,
           lw: 1,
         });
       }
@@ -1884,7 +1995,7 @@ export function createIsoOffice(canvas, opts = {}) {
     // 房间地面边界：四条边就是四道墙脚，围成一个清晰的平行四边形
     isoDiamond(c, {
       x: 0, y: 0, w: ROOM.w, d: ROOM.d,
-      fill: null, stroke: COLORS.wallTop, lw: 2.8, alpha: 0.9,
+      fill: null, stroke: colors.wallTop, lw: 2.8, alpha: 0.9,
     });
   }
 
@@ -1911,7 +2022,7 @@ export function createIsoOffice(canvas, opts = {}) {
     NEAR.forEach((n) => {
       // 矮墙只画实心墙身：矮墙与玻璃的交界**不画横框** —— 一道横线等于把墙切成上下两截，
       // 竖挺通到底已经把两者扎成一整面墙了，再描一道边反而露出拼接感。
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, 0, NEAR_HALF_H, shade(COLORS.wall, n.k));
+      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, 0, NEAR_HALF_H, shade(colors.wall, n.k));
     });
   }
 
@@ -1950,9 +2061,9 @@ export function createIsoOffice(canvas, opts = {}) {
     drawFloor(c);
 
     // 后墙内表面（gy = 0）：等距下是沿 +gx 方向斜下去的平行四边形
-    wallQuad(c, 'y', 0, 0, ROOM.w, 0, h, COLORS.wall);
+    wallQuad(c, 'y', 0, 0, ROOM.w, 0, h, colors.wall);
     // 左墙内表面（gx = 0）：沿 +gy 方向斜下去的另一半
-    wallQuad(c, 'x', 0, 0, ROOM.d, 0, h, shade(COLORS.wall, 0.82));
+    wallQuad(c, 'x', 0, 0, ROOM.d, 0, h, shade(colors.wall, 0.82));
 
     NEAR.forEach((n) => {
       // 玻璃面（几乎全透，留在背景；框线不在这里画，见 drawNearGlassFrame）
@@ -1963,12 +2074,12 @@ export function createIsoOffice(canvas, opts = {}) {
     // 所以留在背景层（放到最后画会糊住站在墙前的角色）。
     // 两端收在与幕墙玻璃面齐平的位置（x 到 ROOM.w、y 到 ROOM.d）：这样墙顶这条边
     // 正好落在玻璃上沿那道线的延长线上，前后是一条连续的边，不会再"接不上"。
-    isoDiamond(c, { x: -t, y: -t, w: ROOM.w + t, d: t, z: h, fill: COLORS.wallTop });
-    isoDiamond(c, { x: -t, y: -t, w: t, d: ROOM.d + t, z: h, fill: shade(COLORS.wallTop, 0.92) });
+    isoDiamond(c, { x: -t, y: -t, w: ROOM.w + t, d: t, z: h, fill: colors.wallTop });
+    isoDiamond(c, { x: -t, y: -t, w: t, d: ROOM.d + t, z: h, fill: shade(colors.wallTop, 0.92) });
 
     // 踢脚线
-    wallQuad(c, 'y', 0, 0, ROOM.w, 0, 0.12, shade(COLORS.wall, 0.75));
-    wallQuad(c, 'x', 0, 0, ROOM.d, 0, 0.12, shade(COLORS.wall, 0.66));
+    wallQuad(c, 'y', 0, 0, ROOM.w, 0, 0.12, shade(colors.wall, 0.75));
+    wallQuad(c, 'x', 0, 0, ROOM.d, 0, 0.12, shade(colors.wall, 0.66));
 
     // 窗（夜景）：外框 + 玻璃 + 窗台，外加漏进屋里的月光
     WALL.windows.forEach((w, wi) => {
@@ -2745,6 +2856,10 @@ export function createIsoOffice(canvas, opts = {}) {
 
   return {
     setMembers,
+    /** 切换楼层：换这一层的材质配色（隔断 / 金属 / 木件），见 officeMap 的 FLOOR_COLORS */
+    setFloor(id) {
+      applyFloor(id);
+    },
     setSelected(id) {
       selectedId = id || '';
     },

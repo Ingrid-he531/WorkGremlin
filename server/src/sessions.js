@@ -642,25 +642,46 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
   return false;
 }
 
-/** reporter hook 在 Stop 时落的"完成"标记（带工程路径）。按工程归属取，
- *  作为"任务完成"的唯一真源——不靠相位回落到空闲来猜，避免中途误弹。 */
-function readReporterDone(workspacePath, client = '', session = '') {
+/**
+ * reporter hook 在 Stop 时落的"完成"标记（带工程路径），按**工程 + 客户端**一次扫盘取回。
+ * 返回 { latest, bySession }：latest = 该 (工程, 客户端) 里最新的一份；bySession = 会话 id -> 该会话最新的一份。
+ *
+ * 为什么拆成"一次读盘"和"按会话取"两步：会话表扫盘一次能扫出上百个历史会话文件，
+ * 若每扫到一条就去调一次 readReporterDone，hooks 目录就要被扫上百遍
+ * （消费方见 sessionRegistry 里按 (工程, 客户端) 缓存的 doneScans）。
+ */
+function readReporterDones(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
-  let best = null;
+  /** sessionId -> 该会话最新的一份 */
+  const bySession = new Map();
+  /** 该工程 + 客户端里最新的一份（会话 id 拿不到的楼层用它兜底） */
+  let latest = null;
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j || !j.done || !j.done.at) continue;
-    if (!sameSession(j, session)) continue;
     if (now - Number(j.done.at) > DONE_TTL_MS) continue; // 过期的不算"刚发生"（见 DONE_TTL_MS）
     const ws = j.done.workspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     // 同一工程里 Codex 与 CodeBuddy 各有一份状态文件：按客户端取，别把对方的"完成"搬过来
     if (client && String(j.client || LEGACY_STATE_CLIENT).toLowerCase() !== String(client).toLowerCase()) continue;
-    if (!best || Number(j.done.at) > Number(best.at)) best = j.done;
+    const done = j.done;
+    const id = String(j.sessionId || '');
+    const prev = id ? bySession.get(id) : null;
+    if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
+    if (!latest || Number(done.at) > Number(latest.at)) latest = done;
   }
-  return best;
+  return { latest, bySession };
+}
+
+/** "任务完成"的唯一真源：取**某条会话**的完成标记（不靠相位回落到空闲来猜，避免中途误弹）。
+ *  同一个 (工程, 客户端) 下可能有多条会话，各取各的；会话 id 拿不到的楼层（Codex 的
+ *  rollout 文件名不含 session_id）退回"该 client 最新的一份"——不猜，只是放宽到这一步。 */
+function readReporterDone(workspacePath, client = '', session = '') {
+  const { latest, bySession } = readReporterDones(workspacePath, client);
+  if (!session) return latest;
+  return bySession.get(String(session)) || null;
 }
 
 /**
@@ -993,6 +1014,7 @@ module.exports = {
   // 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）
   hasOtherLiveSession,
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
+  readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
   listReporterSessions, // 只认 hook 的楼层（7F TraeCode IDE）的会话来源
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
   listSessions,
