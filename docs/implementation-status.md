@@ -80,6 +80,17 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 
 **纪律（代码里反复强调，且已被实现遵守）**：拿不到就是空 —— 无心跳 60s 标 `degraded` 而不改状态；进度拿不到显示「进度未知（未上报）」而不是 0%。
 
+**IDE 形态（Codex 的 VS Code 扩展 / app-server）的两个坑（2026-09-27 修）**：
+① 提交的 prompt 是**拼好的** —— IDE 在前面注入 `# Context from my IDE setup:` / `## Active file:` /
+`## Open tabs:`，用户那句话在 `## My request:` 之后。hook 按 `userRequestText()` 只取请求正文：
+整段（含被截断的）注入块当标题，任务列表里就只剩一堆 IDE 上下文、用户的话一个字看不见；
+老数据在渲染层按同一套规则（`TaskRecordsView.vue` 的 `promptOf()`）再剥一次。
+② 改动文件两路取：PostToolUse 从 `tool_input` 解析 apply_patch 的 patch 文本（`command` / `input`
+键都认），收工时再按 transcript 里 apply_patch 的权威清单（`Success. Updated the following files:`
++ `M/A/D <路径>`）按**本轮开始时刻**补一遍 —— IDE 形态的 PostToolUse 常常不带 patch 文本，
+只靠前者就会"任务结束没有改动文件列表"。自检见 `npm run test:ide-hook`
+（`server/test/ideHook.test.js`）。
+
 ---
 
 ## 3. 领域模型（以 `server/src/db/schema.sql` 为准）
@@ -109,16 +120,17 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 | 4F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分 |
 | 5F | TraeCode（**IDE 与 Plugin 合并成一层**） | 会话来源是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值）：两个形态都没有可扫的**会话**落盘 —— IDE `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与 `project_memory.md` 是记忆文件（文件名带 session_id，但不是对话记录、也没有工程路径）；插件 `~/.marscode` 实测只有 ai-chat 二进制、日志与 `ai-agent/database.db` / `snapshot/<链 id>/v2/.git` 文件快照（前者不是可读的 sqlite、后者是逐轮改动的 git 快照）。**两处落盘都在楼层胶囊的 tooltip 里逐路列出**（IDE / plugin 两行，各带一句"只作展示、取不到会话"的说明） |
 | 6F | Qoder（**CLI 与插件合并成一层**，与 4F Claude 同理） | 会话两路来源：① 落盘 transcript `~/.qoder/projects/<工程目录>/<会话>.jsonl`（Claude Code 同款格式：文件名即 `session_id`、每行带 `cwd`，工程路径从 `cwd` 解析，见 `sessionRegistry.js` 的 `SUBTREE`/`sessionIdOfFile`/`cwdOfHead`）；② reporter 状态文件兜底（JSONL 还没写/读不出时，hook 那一路照常列会话并提供实时相位）。两路按 `session_id` 去重（cli 有活会话就撤掉 hook 行）。`~/.qoder` 这一路只列落盘（文件数 / 体积 / 最后写入）。hook 写入 `~/.qoder/settings.json`（与 Claude / CodeBuddy 同构），由 `--agent qoder` 分流；事件表暂默认采用最宽的 Claude 风格（`scripts/install-hooks.js` 的 `QODER_EVENTS`），待确认 Qoder 真实事件名后再收紧。**Qoder 实测只发 `SessionStart` / `SessionEnd`、没有细粒度事件**，故 `hook.js` 对 qoder 补「思考中 / 已完成」粗粒度相位——6F 不会一直「未上报」，但相位精度比 Claude 粗（待 Qoder 开放细粒度事件后自动变细） |
-| 7F | Kilo Code（**纯轮询楼层**） | **Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何 `hooks.json` / 可挂命令的事件点），所以既没有 hook 上报、也没有可扫的会话 jsonl —— 7F 由服务端**轮询**它自己的落盘。会话 / 相位 / 完成标记全部来自 `server/src/kilo.js` 读它那份 **event-sourced SQLite**（`~/.local/share/kilo/kilo.db`，WAL 模式，只读打开不阻塞 Kilo 的 daemon）：`session`（id / directory=工程路径 / title / agent / model / time_updated / summary_*）＋ `event`（append-only，aggregate_id=会话、seq 单调、data 里 `part.type ∈ tool|text|reasoning|step-start|step-finish|patch`、`part.state.status ∈ running|pending|completed|error`）＋ `message`（role、path.cwd、`finish ∈ stop|tool-calls|length|content-filter`）。相位由**最新事件推导**（tool+running→调用工具、tool+pending→等待授权、reasoning→思考中），**不是**像 5F 那样拿文件时间猜；完成标记取 `finish=stop` 那条 assistant 消息（`tool-calls` / `length` / `content-filter` 都不算"完成"）。数据根按 XDG 位置认（`kiloHome()`），**不是** `~/.kilo`（那个目录实测只有安装期留下的 `bin/`）。落盘那一路（`kind:'dir'`）只作展示并带一句"会话是 SQLite、不是可扫的文件"；会话来源是 `kind:'kilo'`（读 SQLite，与 cli 扫 jsonl 完全不同，故单开一个 kind）。因是轮询而非上报，**相位一律 `inferred:true`**（UI 按推断灰显）；自检见 `npm run test:kilo` |
+| 7F | Kilo Code（**纯轮询楼层**） | **Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何 `hooks.json` / 可挂命令的事件点），所以既没有 hook 上报、也没有可扫的会话 jsonl —— 7F 由服务端**轮询**它自己的落盘。会话 / 相位 / 完成标记全部来自 `server/src/kilo.js` 读它那份 **event-sourced SQLite**（`~/.local/share/kilo/kilo.db`，WAL 模式，只读打开不阻塞 Kilo 的 daemon）：`session`（id / directory=工程路径 / title / agent / model / time_updated / summary_*）＋ `event`（append-only，aggregate_id=会话、seq 单调、data 里 `part.type ∈ tool|text|reasoning|step-start|step-finish|patch`、`part.state.status ∈ running|pending|completed|error`）＋ `message`（role、path.cwd、`finish ∈ stop|tool-calls|length|content-filter`）。相位由**最新事件推导**（tool+running→调用工具、tool+pending→等待授权、reasoning→思考中），**不是**像 5F 那样拿文件时间猜；完成标记取 `finish=stop` 那条 assistant 消息（`tool-calls` / `length` / `content-filter` 都不算"完成"）。数据根按 XDG 位置认（`kiloHome()`），**不是** `~/.kilo`（那个目录实测只有安装期留下的 `bin/`）。来源只有 `kind:'kilo'` 一路（读 SQLite，与 cli 扫 jsonl 完全不同，故单开一个 kind）：落盘统计与"会话是 SQLite、不是可扫的文件"那句说明都挂在同一路（不再单列 `kind:'dir'` 展示路，胶囊 tooltip 也就不会再多打一行"没有找到落盘目录"）。因是轮询而非上报，**相位一律 `inferred:true`**（UI 按推断灰显）；自检见 `npm run test:kilo` |
 | 8F | OpenCode（**轮询 + 插件双路**） | 与 7F 同源（Kilo Code CLI 就是 OpenCode 的 fork，落盘结构同源：`<数据根>/{kilo,opencode}.db` + `storage/session_diff/` + `repos/` + `shell/` + `snapshot/`），但**V2 schema 已分叉，照抄 7F 的取法会读到空数据**：实测 Kilo 7.8.1 的 `event` 表有 2288 行（落盘），OpenCode 2.0.18 的 `event` 表**是 0 行**（事件只在内存流里推、不落盘）。所以 8F 改读 `session_v2`（id / directory=工程路径 / title / agent / model / time_updated / summary_*）＋ `session_message`（`type ∈ assistant|user|idle|synthetic`，`data.content[]` 里 `part.type ∈ tool|reasoning|text`、工具块是 `{type:'tool',name,state:{status,input}}`）。相位由**最新消息的 content[]** 推导（tool+running→调用工具、tool+error→调用工具但报错、reasoning→思考中、`type:'idle'` 行→待命），一律 `inferred:true`；完成标记取 `finish=stop` 且 `time.completed` 落过的那条（`tool-calls` / `error` 都不算"完成"）。表名与列名都**探测**着来（`session_v2` → `session`、`pragma table_info` 取交集），OpenCode 改版换表不会把接口打挂。**关键能力差：轮询给不出「等待授权」** —— 全库 114 条 assistant 消息实测 `tool.state.status` 只出现过 `completed / error / running`，**没有 `pending`**（Kilo 有），授权在 OpenCode 是独立事件（`permission.asked`）且只在内存流里。所以 8F 额外挂 `kind:'hook'` 一路：装了 WorkGremlin 插件（`packages/reporter/src/plugin/`，实现 OpenCode/Kilo 的 `ctx.event.subscribe` 事件流，状态文件格式与 `hook.js` 完全一致、服务端零改动）时，相位是**上报真值**（不标 inferred、UI 不灰显）、多出「等待授权」、完成标记还带**改动文件清单**（`session.step.ended` 事件的 `data.files`）；没装插件就自动退回轮询推导。数据根按 XDG 位置认（`opencodeHome()`）；`opencode` 可执行文件实测在 `~/.opencode/bin` 且**不在 PATH**，`CLI_BIN_DIRS` 已显式认这一条否则永远判成"没装"。自检见 `npm run test:opencode` |
 
 合并楼层在 `products.js` 里由 `sources` 声明（1F 是 `['cli', 'plugin', 'hook']`，5F 是
-两个 `dir` 落盘 + `hook`，7F 是一个 `dir` 展示 + 一个 `kilo`，8F 是 `dir` 展示 + `opencode`
+两个 `dir` 落盘 + `hook`，7F 是一个 `kilo`（自带数据根落盘统计），8F 是 `opencode`（自带数据根）
 轮询 + `hook` 收插件真相位）：一个楼层可以吃多路落盘，
 每一路带自己的 client（`codebuddy` / `codebuddy-plugin`、`trae` / `trae-plugin`），
 相位与完成标记按会话各认各的。
 条目可以是 `{ kind, label?, client?, dirs?, note? }`：`kind: 'dir'` = 只作落盘展示、不产会话
 （`sessions: false`），两份 `dir` 靠 `label` 在 tooltip 里区分（IDE / plugin）；
+`label` 还用来给"一路抵两形态"的合并楼层起显示名 —— 3F/4F/6F/7F 标 `CLI/Plugin`（CLI 与 IDE 插件共用同一份落盘，分不出），8F 标 `CLI/Desktop`（CLI 与桌面端/网页端同一个二进制、同一个数据根）；
 `kind: 'kilo'` = 7F 专用，读 Kilo 的 SQLite（与 `kind: 'cli'` 扫 jsonl 是两套取法，
 所以单开一个 kind，别让 `sessionRegistry` 里两条分支互相误认）；
 `kind: 'opencode'` = 8F 专用，读 OpenCode 的 SQLite —— **与 `kind: 'kilo'` 也是两套取法**
