@@ -4,6 +4,7 @@
 
 const express = require('express');
 const { DEFAULTS } = require('@workgremlin/shared');
+const { cachedDirSize } = require('../../dirSize');
 
 /**
  * 楼层筛选参数 → client 列表。
@@ -31,6 +32,26 @@ function createQueryRouter({ bus, repo }) {
 
   router.get('/snapshot', (req, res) => {
     res.json({ ok: true, snapshot: bus.buildSnapshot(req.query.project || null) });
+  });
+
+  /**
+   * 各工程目录的总大小（字节），排除隐藏文件 / 隐藏目录。
+   * 汇总报表「按工程」聚合时展示。目录大小服务端现算（不落库、不编造），
+   * 按 workspace_path 缓存 30s。给出工程 id 串，返回 { id: bytes|null }。
+   * 演示工程没有目录 → null（界面显示"—"）。
+   */
+  router.get('/project-sizes', (req, res) => {
+    const ids = String(req.query.projects || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const out = {};
+    if (ids.length) {
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = repo.raw.prepare(`SELECT id, workspace_path FROM projects WHERE id IN (${placeholders})`).all(...ids);
+      for (const r of rows) out[r.id] = r.workspace_path ? cachedDirSize(r.workspace_path) : null;
+    }
+    return res.json({ ok: true, sizes: out });
   });
 
   router.get('/messages', (req, res) => {

@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
 import { clientLabel } from '../lib/clientMatch';
 import { clientBase } from '@workgremlin/shared';
+import { httpBase } from '../api/bridge';
 
 const project = useProjectStore();
 const session = useSessionStore();
@@ -268,6 +269,29 @@ function effClass(e) {
   if (e <= 1) return 'eff-low';
   return '';
 }
+/** 各工程目录总大小（字节），按工程 id → 服务端现算（排除隐藏）。仅「按工程」维度有意义。 */
+const projectSizes = reactive({});
+async function loadProjectSizes() {
+  if (reportDim.value !== 'project' || view.value !== 'summary') return;
+  const ids = reportGroups.value.map((g) => g.key).filter(Boolean);
+  const need = ids.filter((id) => !(id in projectSizes));
+  if (!need.length) return;
+  const info = project.serverInfo || {};
+  try {
+    const res = await fetch(`${httpBase(info)}/api/v1/project-sizes?projects=${encodeURIComponent(need.join(','))}`, {
+      headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+    });
+    const data = await res.json();
+    if (data && data.ok && data.sizes) Object.assign(projectSizes, data.sizes);
+  } catch {
+    /* 拉不到就留空，界面显示"—" */
+  }
+}
+// 进入汇总报表 / 切到「按工程」维度 / 筛选项变化导致工程集合变化时，补拉各工程目录大小
+watch(
+  () => [view.value, reportDim.value, reportGroups.value.map((g) => g.key).join(',')],
+  () => loadProjectSizes()
+);
 /** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
 function drillDown(row) {
   const dim = reportDim.value;
@@ -281,15 +305,23 @@ function drillDown(row) {
 function exportCsv() {
   const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
   const head = ['维度', '任务数', '成功数', '失败数', '改动文件数', '总耗时(ms)', '平均耗时(ms)', '效率(文件/分钟)'];
-  const rows = reportSorted.value.map((r) => [
-    r.label, r.taskCount, r.successCount, r.failCount, r.fileCount,
-    Math.round(r.durationSum), Math.round(r.avgDuration), r.efficiency.toFixed(2),
-  ]);
-  rows.push([
+  const showSize = reportDim.value === 'project';
+  if (showSize) head.push('工程大小(字节)');
+  const rows = reportSorted.value.map((r) => {
+    const line = [
+      r.label, r.taskCount, r.successCount, r.failCount, r.fileCount,
+      Math.round(r.durationSum), Math.round(r.avgDuration), r.efficiency.toFixed(2),
+    ];
+    if (showSize) line.push(projectSizes[r.key] != null ? projectSizes[r.key] : '');
+    return line;
+  });
+  const totalLine = [
     reportTotal.value.label, reportTotal.value.taskCount, reportTotal.value.successCount,
     reportTotal.value.failCount, reportTotal.value.fileCount,
     Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration), reportTotal.value.efficiency.toFixed(2),
-  ]);
+  ];
+  if (showSize) totalLine.push('');
+  rows.push(totalLine);
   const csv = [head, ...rows]
     .map((line) => line.map((c) => {
       const s = String(c);
@@ -601,6 +633,7 @@ async function saveRetention() {
               <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">总耗时</th>
               <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">平均耗时</th>
               <th class="sortable num" :class="sortCls('efficiency')" @click="sortBy('efficiency')">效率</th>
+              <th v-if="reportDim === 'project'" class="num">工程大小</th>
             </tr>
           </thead>
           <tbody>
@@ -618,6 +651,7 @@ async function saveRetention() {
               <td class="num">{{ fmtDuration(r.durationSum) }}</td>
               <td class="num">{{ fmtDuration(r.avgDuration) }}</td>
               <td class="num" :class="effClass(r.efficiency)">{{ r.efficiency.toFixed(1) }}</td>
+              <td v-if="reportDim === 'project'" class="num">{{ projectSizes[r.key] != null ? fmtSize(projectSizes[r.key]) : '—' }}</td>
             </tr>
           </tbody>
           <tfoot>
@@ -630,6 +664,7 @@ async function saveRetention() {
               <td class="num">{{ fmtDuration(reportTotal.durationSum) }}</td>
               <td class="num">{{ fmtDuration(reportTotal.avgDuration) }}</td>
               <td class="num" :class="effClass(reportTotal.efficiency)">{{ reportTotal.efficiency.toFixed(1) }}</td>
+              <td v-if="reportDim === 'project'" class="num">—</td>
             </tr>
           </tfoot>
         </table>
