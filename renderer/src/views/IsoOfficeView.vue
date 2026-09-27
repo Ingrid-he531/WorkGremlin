@@ -189,6 +189,14 @@ function onConsoleLeave() {
 /** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
 const mainAgentState = computed(() => mainAgent.snapshot);
 
+/** 字节数 -> 人类可读（B / KB / MB），与任务记录页同一套显示 */
+function fmtSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / 1024 / 1024).toFixed(1)}MB`;
+}
+
 /** 两个工程路径是否同一个（去尾斜杠比较；任一为空视为"不限定"，返回 true） */
 function sameWorkspace(a, b) {
   const na = String(a || '').replace(/\/+$/, '');
@@ -384,27 +392,26 @@ watch(
     if (firstFastDone && doneAt < trackSince) lastDoneAt = doneAt;
     if (doneAt && doneAt !== lastDoneAt) {
       lastDoneAt = doneAt;
-      // 组装成**可读的完成摘要**：原来直接把 doneFiles 的对象塞进 context，
-      // tooltip 里 {{ c }} 渲染对象就成了 JSON 串；这里先给一句总述，再一行一个文件。
-      //
-      // 改动清单两条来源（谁先到用谁）：
-      //   ① 会话快照的 doneFiles —— plugin 楼层是插件落盘的 file-changes（带 +/- 行数），
-      //      CLI / hookSource 楼层是服务端从 hook 那份取的（只有路径）；但它 10s 才刷一次，
-      //      而 doneAt 是 1.5s 快轮询先看到的，所以**多数时候这一份还是空的**，
-      //      这就是"任务完成只剩一句话"的根因；
-      //   ② hook 自己记的"本轮用工具动过的文件"（done.files，跟着完成标记一起落盘，
-      //      快轮询当下就有）。两边的文件名对得上，只是 ② 没有 +/- 行数。
+      // 改动清单：优先用会话快照的 doneFiles（plugin/IDE 楼层那份），没有则退回
+      // reporter 落盘的 done.files（CLI 这一路，带文件大小 size）。系统拿不到 +/- 行数
+      // （没有 git diff 计算），所以只显示文件名 + 大小。
       const snapFiles = (sel && sel.doneFiles) || [];
-      const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({ name: typeof p === 'string' ? p : (p && p.path) || '' }));
+      const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({
+        name: typeof p === 'string' ? p : (p && p.path) || '',
+        size: typeof p === 'string' ? null : (p && typeof p.size === 'number' ? p.size : null),
+      }));
       const files = snapFiles.length ? snapFiles : hookFiles;
-      // 本轮任务改动的文件数（服务端已按"本轮开始之后"过滤）；拿不到就用列表长度兜底
       const count = (sel && Number(sel.doneCount)) || (fpDone && Number(fpDone.fileCount)) || files.length;
       const said = (fpDone && fpDone.said) || '';
-      // hook 那份只有路径、没有行数（不做 diff），+/- 只在快照那份里才有
+      // 有 size 就显示大小（B/KB/MB），没有只显示文件名
       const ctx = files.length
         ? [
             `改动 ${count} 个文件`,
-            ...files.map((f) => (f.added == null ? String(f.name) : `${f.name}  +${f.added}/-${f.removed}`)),
+            ...files.map((f) => {
+              const nm = f && (f.name || f.path) || (typeof f === 'string' ? f : '');
+              const sz = f && typeof f.size === 'number' ? f.size : null;
+              return sz != null ? `${nm}  (${fmtSize(sz)})` : String(nm);
+            }),
           ]
         : [said || '本次任务已完成'];
       mainAgent.enterDone('任务完成', ctx);

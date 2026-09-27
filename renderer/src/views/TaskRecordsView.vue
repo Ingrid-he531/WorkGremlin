@@ -449,11 +449,13 @@ async function saveRetention() {
             <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
             <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
-            <div class="k">改动文件</div><div class="v">{{ tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : '—' }}</div>
           </div>
 
           <div v-if="filesOf(tasks.selectedTask).length" class="files">
-            <div class="files-head">本轮文件改动</div>
+            <!-- 文件数并到这一行当标题（原来另起一行叫「改动文件」，跟下面「改动文件 (N)」重名） -->
+            <div class="files-head">
+              本轮文件变化 ({{ tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : '—' }})
+            </div>
 
             <template v-if="addedFiles(tasks.selectedTask).length">
               <div class="cat">新增文件 ({{ addedFiles(tasks.selectedTask).length }})</div>

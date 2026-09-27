@@ -543,8 +543,21 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         : Number.isFinite(Number(p.fileCount))
           ? Number(p.fileCount)
           : null;
+      // 标题兜底：开轮时 prompt 没取到（CLI 这个客户端有时不带上 prompt 文本），
+      // startTask 会落成「(未命名任务)」。收工时若还是这个默认值 / 空，就用本轮改动的文件
+      // 派生一个有意义、不编造的标题（取首个改动文件的路径），至少能跟别轮区分开。
+      const UNNAMED = new Set(['', '(未命名任务)', '（未命名任务）']);
+      const haveTitle = run && run.title && !UNNAMED.has(String(run.title));
+      let finalTitle = haveTitle ? run.title : null;
+      if (!finalTitle) {
+        const firstPath =
+          (filesJson && filesJson[0] && filesJson[0].path) ||
+          (reportedFiles[0] && (reportedFiles[0].path || reportedFiles[0]));
+        finalTitle = firstPath ? `改动 ${firstPath}` : 'CodeBuddy 会话任务';
+      }
       repo.endTaskRun.run({
         id: p.taskId,
+        title: finalTitle,
         model: endModel,
         result: normText(p.result, RUN_RESULT_MAX),
         fileCount,

@@ -272,7 +272,19 @@ export default {
         /* ---- 一轮结束：任务完成 + 完成标记（带改动文件清单，轮询给不出这一项） ---- */
         case "session.execution.succeeded": {
           const sid = String(data.sessionID || "")
-          const files = sid ? lastFiles.get(sid) || [] : []
+          const ws = wsOf(event)
+          const files = (sid ? lastFiles.get(sid) || [] : []).map((f) => {
+            // 顺手 stat 出当前体积（字节）：主控制台好显示文件大小。
+            // 路径按 workspace 解析（绝对路径直接用之），解析不出 / 已删除就留 null。
+            let size = null
+            try {
+              const st0 = fs.statSync(path.resolve(ws, f))
+              if (st0.isFile()) size = st0.size
+            } catch {
+              /* 文件不存在 / 非文件：大小留 null */
+            }
+            return { path: f, size }
+          })
           report(event, "done", {
             action: "",
             done: {
@@ -280,7 +292,7 @@ export default {
               title: (sid && titles.get(sid)) || "",
               fileCount: files.length,
               files: files.slice(0, 20),
-              workspacePath: wsOf(event),
+              workspacePath: ws,
               sessionId: sid,
             },
           })

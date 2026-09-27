@@ -1396,18 +1396,28 @@ async function main() {
     // 这里只过滤无效项，不要把对象当成字符串丢掉（否则文件清单永远为空）。
     const roundFiles = (st.roundFiles || []).filter((x) => x && (typeof x === 'string' ? x : x.path));
     // 本轮用工具动过的文件：补上"当前体积（字节）"，主控制台好显示文件大小。
-    // 大小在收工那一刻现 stat（相对路径按 cwd / REAL_WS 拼成绝对路径），拼不出来 / 已删除就留 null。
+    // 大小在收工那一刻现 stat。解析按优先级试多个基路径：文件本身（工具给的往往是绝对路径）
+    // → 按事件 cwd → 按 REAL_WS（= process.cwd()）。插件 / IDE 下 cwd 常常对不上工程，
+    // 只信 cwd 会把大小算成 null，所以要多试几个、谁先 stat 到用谁。
     // 之所以在 hook 侧算、不让服务端算：服务端按工程存的 workspace_path 反查文件，
     // 而开发工程那条 workspace_path 往往为空 / 对不上，服务端 stat 必失败 → 大小永远 null。
     const roundFileDetails = roundFiles.map((x) => {
       const p = typeof x === 'string' ? x : x.path;
       const op = typeof x === 'string' ? null : x.op;
       let size = null;
-      try {
-        const st0 = fs.statSync(path.resolve(cwd || REAL_WS, p));
-        if (st0.isFile()) size = st0.size;
-      } catch {
-        /* 文件不存在 / 非文件：大小留 null（删除类本就无大小） */
+      if (op !== 'delete') {
+        const candidates = [p, cwd ? path.resolve(cwd, p) : null, path.resolve(REAL_WS, p)].filter(Boolean);
+        for (const cp of candidates) {
+          try {
+            const st0 = fs.statSync(cp);
+            if (st0.isFile()) {
+              size = st0.size;
+              break;
+            }
+          } catch {
+            /* 试下一个候选 */
+          }
+        }
       }
       return { path: p, op, size };
     });

@@ -598,7 +598,6 @@ const PRODUCTS = [
         label: 'CLI / 插件',
         client: clientOf('qoder', false),
         dirs: [path.join(HOME, '.qoder')],
-        note: 'Qoder 的 CLI 与插件共用 ~/.qoder，会话 transcript 在 ~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式）',
       },
       { kind: 'hook' },
     ],

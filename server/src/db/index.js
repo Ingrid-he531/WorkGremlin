@@ -491,6 +491,7 @@ function createRepo(db) {
     `),
     endTaskRun: db.prepare(`
       UPDATE task_runs SET
+        title       = COALESCE(@title, title),
         model       = COALESCE(@model, model),
         result      = COALESCE(@result, result),
         file_count  = COALESCE(@fileCount, file_count),
