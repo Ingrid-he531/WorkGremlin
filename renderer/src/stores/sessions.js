@@ -34,7 +34,13 @@ const keyOf = (s) => `${s && s.floor ? s.floor : ''}:${s && s.id ? s.id : ''}`;
 const isIdleish = (s) => !s || s.phase === 'idle' || s.phase === 'done' || s.phase === 'unreported';
 
 const phaseLabel = (p) => (PHASES[p] || PHASES.idle).label;
-const shortId = (id) => String(id || '').slice(0, 8);
+/**
+ * 下拉里的短 id：取**文件名那一段**再截 8 位。
+ * CLI 楼层的 id 是 transcript 的**相对路径**（`projects/<工程>/<会话>.jsonl` 或扫了子树后的
+ * `<工程>/<会话>.jsonl`），直接从头截 8 位拿到的是目录名（三条会话全是 `projects`，分不出谁是谁）；
+ * 插件 / Claude 那些 id 本身就是一个 uuid，不含路径分隔符，取文件名段等于原样 —— 行为不变。
+ */
+const shortId = (id) => String(id || '').split(/[\\/]/).pop().replace(/\.jsonl$/i, '').slice(0, 8);
 
 export const useSessionStore = defineStore('sessions', {
   state: () => ({

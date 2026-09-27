@@ -5,6 +5,8 @@
  * 合并楼层（一个产品的两种形态合成一层）会扫**多路落盘**，同时开着两种形态时表现成这一层里的
  * 多条会话，而不是多个楼层；某一路落盘**读不出会话**时，服务端会在 sources[].note 里给一句说明，
  * 悬浮提示照它显示 —— 让"这一路读不到"和"这一层没在跑"分得清。
+ * 例外是 hook 那一路：它照样参与会话采集（服务端靠它兜底列会话，见 sessionRegistry 的 refresh），
+ * 但没有自己的落盘目录，列出来只是干巴巴一句"没有独立落盘目录"，所以 tooltip 里不显示它。
  *
  * 状态点看的是**这一层有没有活跃会话**（全局活跃会话表，60 分钟没事件会剔除）：
  *   - 有活跃会话：绿色状态点 + 数量角标
@@ -154,22 +156,18 @@ watch(() => props.products, () => measure(), { flush: 'post' });
 /**
  * 某一路落盘来源的**默认**显示名（合并楼层的悬浮提示要逐路标出来；服务端给了 label 就用它，
  * 同 kind 的两路也能分清 —— 5F 的 IDE 与插件都是 'dir'，标签是 IDE / plugin）。
- * plugin 保留英文：跟 hook / CLI 一起对齐上报身份（codebuddy-plugin / trae-plugin）的叫法，
+ * plugin 保留英文：跟 CLI 一起对齐上报身份（codebuddy-plugin / trae-plugin）的叫法，
  * 避免"插件"这个中译在不同楼层指代不同东西（IDE 插件？CodeBuddy 插件？）时看不出来。
+ * 没有 'hook'：那一路的 tooltip 行在下面 tip() 里就被过滤掉了（没有落盘目录，列了没信息量）。
  */
-const SOURCE_LABEL = { cli: 'CLI', plugin: 'plugin', hook: 'hook 状态文件', dir: '落盘' };
+const SOURCE_LABEL = { cli: 'CLI', plugin: 'plugin', dir: '落盘' };
 
 /**
- * 一路落盘的说明文案：
- *   - cli / plugin：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）`
- *   - hook：这一路没有自己的落盘目录，会话就是 reporter 上报的状态文件
- * 都带上这一路自己的 note（取不到会话时服务端给的说明），让"没数据"和"读不到"分得清。
+ * 一路落盘的说明文案：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）`
+ * 带上这一路自己的 note（取不到会话时服务端给的说明），让"没数据"和"读不到"分得清。
  */
 function sourceLine(src) {
   const label = src.label || SOURCE_LABEL[src.kind] || src.kind || '落盘';
-  if (src.kind === 'hook') {
-    return { text: `${label}：会话来源就是 reporter 状态文件（没有独立的会话落盘目录）`, note: src.note || '' };
-  }
   if (!src.dataPathLabel) return { text: `${label}：没有找到落盘目录`, note: src.note || '' };
   const s = src.stats || {};
   const bits = [];
@@ -197,7 +195,13 @@ function tip(p) {
   }
   lines.push(`安装：${p.installPathLabel || '（未定位到可执行文件）'}`);
   // 逐路列这一层的落盘来源（合并楼层多路）；取不到会话的那一路会带一行说明
-  const sources = Array.isArray(p.sources) ? p.sources : [];
+  // 但 hook 那一路不列：它没有独立的落盘目录（sourceDirs 对它返回空数组），列出来永远是
+  // 一句"会话来源就是 reporter 状态文件"，对读 tooltip 的人没有信息量 —— 真正有信息的是
+  // 带目录 / 会话文件数 / 体积 / 最后写入的 cli / plugin 那几行。
+  // 纯展示层过滤：服务端那条 hook 来源照旧下发，sessionRegistry 的 refresh 靠它决定要不要
+  // 用 reporter 状态文件兜底列会话（cliLandingSeen），动它会把 5F / 6F 的会话列没。
+  const allSources = Array.isArray(p.sources) ? p.sources : [];
+  const sources = allSources.filter((src) => src && src.kind !== 'hook');
   if (sources.length) {
     for (const src of sources) {
       const line = sourceLine(src);
