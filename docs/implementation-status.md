@@ -90,6 +90,12 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 + `M/A/D <路径>`）按**本轮开始时刻**补一遍 —— IDE 形态的 PostToolUse 常常不带 patch 文本，
 只靠前者就会"任务结束没有改动文件列表"。自检见 `npm run test:ide-hook`
 （`server/test/ideHook.test.js`）。
+③ 客户端标签分 CLI / 插件：Codex 的 CLI 与 VS Code 扩展共用一份 `~/.codex`、client 都是 `codex`，
+光看 client 只能显示「Codex」。hook 从 rollout 的 `session_meta`（`source` / `originator`）认出形态
+（`form = 'cli' | 'plugin'`，见 `codexForm()`）随任务一起上报，落 `task_runs.form`，任务列表按
+「产品名 + 形态」显示（Codex CLI / Codex Plugin）；已带形态的标签（CodeBuddy CLI / Plugin）不重复追加，
+读不到形态的老数据退回只写产品名。自检见 `npm run test:task-client`
+（`renderer/test/taskClientLabel.test.mjs`）与 `npm run test:ide-hook` 的 [7]。
 
 ---
 

@@ -49,6 +49,15 @@ function normClient(v) {
   return CLIENTS.has(c) ? c : null;
 }
 
+/**
+ * 这一轮走的**形态**：'cli' / 'plugin'（IDE 扩展）。
+ * 分不出的产品（Claude / Qoder…）与老数据留 NULL —— 任务列表退回只写产品名（如 "Codex"）。
+ */
+function normForm(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return s === 'cli' || s === 'plugin' ? s : null;
+}
+
 /** 模型名：拿不到就是 NULL（绝不猜），超长截断 */
 function normModel(v) {
   const s = String(v == null ? '' : v).trim();
@@ -422,6 +431,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         memberId: member.id,
         client: client0,
         sessionId: normSession(p.sessionId),
+        form: normForm(p.form),
         // hook payload 里没有模型字段的产品（TraeCode 六个事件都不带、Claude Code 除
         // SessionStart 外也都不带），为空时按会话去**各自的落盘**里取当前模型
         // （见 sessions.sessionModel：traeModels / claudeModels 两个适配器）。
@@ -520,6 +530,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
           memberId: member.id,
           client: endClient,
           sessionId: endSession,
+          form: normForm(p.form),
           model: endModel,
           title: null,
           startedAt: null,
@@ -559,6 +570,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         id: p.taskId,
         title: finalTitle,
         model: endModel,
+        form: normForm(p.form),
         result: normText(p.result, RUN_RESULT_MAX),
         fileCount,
         filesJson: filesJson ? JSON.stringify(filesJson) : null,

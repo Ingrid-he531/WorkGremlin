@@ -38,7 +38,8 @@
     "test:ghost-ledger": "node server/test/ghostLedger.test.js",
     "test:recover": "node server/test/taskRecover.test.js",
     "test:qoder": "node server/test/qoderHook.test.js",
-    "test:ide-hook": "node server/test/ideHook.test.js"
+    "test:ide-hook": "node server/test/ideHook.test.js",
+    "test:task-client": "node renderer/test/taskClientLabel.test.mjs"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

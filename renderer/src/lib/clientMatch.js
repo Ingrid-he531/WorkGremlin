@@ -61,8 +61,21 @@ const CLIENT_LABELS = {
   opencode: 'OpenCode',
 };
 
-/** 把 client 字符串显示成友好的产品名；认不出的原样返回 */
-export function clientLabel(c) {
+/**
+ * 把 client 字符串显示成友好的产品名；认不出的原样返回。
+ *
+ * `form` = 这一轮走的**形态**（'cli' / 'plugin'）：只有"CLI 与 IDE 插件共用一份落盘"的产品
+ * 才需要它 —— 它们的 client 分不出两种形态（3F Codex 就是如此：hook 从 rollout 的
+ * session_meta 认出来单独上报，见 packages/reporter/src/hook.js 的 codexForm），
+ * 任务列表才能标成「Codex CLI / Codex Plugin」。
+ * 标签里已经带形态的（CodeBuddy CLI / CodeBuddy Plugin）不重复追加。
+ */
+export function clientLabel(c, form) {
   const k = String(c || '').toLowerCase();
-  return CLIENT_LABELS[k] || c || '—';
+  const label = CLIENT_LABELS[k] || c || '—';
+  const f = String(form || '').toLowerCase();
+  if ((f === 'cli' || f === 'plugin') && !/(?:^|\s)(?:CLI|Plugin)$/i.test(label)) {
+    return `${label} ${f === 'plugin' ? 'Plugin' : 'CLI'}`;
+  }
+  return label;
 }

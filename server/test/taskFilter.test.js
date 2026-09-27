@@ -76,6 +76,7 @@ function task(id, memberId, runClient) {
     memberId,
     client: runClient,
     sessionId: null,
+    form: null,
     model: null,
     title: `t-${id}`,
     startedAt: 1000,
@@ -143,6 +144,30 @@ head('[5] all / 空 = 不过滤（现有语义：无筛选就是"全部"）');
   ok('顶层任务清空', repo.raw.prepare('SELECT COUNT(*) AS c FROM tasks WHERE parent_task_id IS NULL').get().c === 0);
 }
 
+
+head('[6] form（这一轮走的形态 cli / plugin）落库、读得回来、收工回填不覆盖');
+{
+  task('t-form', 'main@p1', 'codex');
+  repo.upsertTaskRun.run({
+    id: 't-form',
+    projectId: 'p1',
+    memberId: 'main@p1',
+    client: 'codex',
+    sessionId: null,
+    form: 'plugin',
+    model: null,
+    title: 't-t-form',
+    startedAt: 3000,
+    baselineCommit: null,
+  });
+  ok('开轮写进的 form 能读回来', (repo.getTaskRun.get('t-form') || {}).form === 'plugin', JSON.stringify(repo.getTaskRun.get('t-form')));
+  ok('listTaskRuns 也带 form（报表查询 SELECT *）', (repo.listTaskRuns.all('p1', 50).find((r) => r.id === 't-form') || {}).form === 'plugin');
+  repo.endTaskRun.run({ id: 't-form', title: null, model: null, form: null, result: null, fileCount: null, filesJson: null, endedAt: 4000, durationMs: 1000 });
+  ok('收工读不到形态时不冲掉开轮那个（COALESCE）', (repo.getTaskRun.get('t-form') || {}).form === 'plugin', JSON.stringify(repo.getTaskRun.get('t-form')));
+  task('t-form2', 'main@p1', 'codex');
+  repo.endTaskRun.run({ id: 't-form2', title: null, model: null, form: 'cli', result: null, fileCount: null, filesJson: null, endedAt: 4000, durationMs: 1000 });
+  ok('开轮没认出来时，收工这一刀能补上', (repo.getTaskRun.get('t-form2') || {}).form === 'cli', JSON.stringify(repo.getTaskRun.get('t-form2')));
+}
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 close();
 fs.rmSync(TMP, { recursive: true, force: true });

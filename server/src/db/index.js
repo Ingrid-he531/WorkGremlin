@@ -65,6 +65,7 @@ function migrate(db) {
   ensureColumn(db, 'task_runs', 'baseline_commit', 'baseline_commit TEXT');
   // 轴 2（会话）：老库里没有这两列，补上；老行留 NULL（不是"没有会话"，是"当时还没记"）
   ensureColumn(db, 'task_runs', 'session_id', 'session_id TEXT');
+  ensureColumn(db, 'task_runs', 'form', 'form TEXT');
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
@@ -487,11 +488,12 @@ function createRepo(db) {
     `),
     /* ---- 台账（报表用）：一轮用户任务 + 它召唤出去的 subagent 实例 ---- */
     upsertTaskRun: db.prepare(`
-      INSERT INTO task_runs (id, project_id, member_id, client, session_id, model, title, started_at, baseline_commit)
-      VALUES (@id, @projectId, @memberId, @client, @sessionId, @model, @title, @startedAt, @baselineCommit)
+      INSERT INTO task_runs (id, project_id, member_id, client, session_id, form, model, title, started_at, baseline_commit)
+      VALUES (@id, @projectId, @memberId, @client, @sessionId, @form, @model, @title, @startedAt, @baselineCommit)
       ON CONFLICT(id) DO UPDATE SET
         client     = COALESCE(excluded.client, task_runs.client),
         session_id = COALESCE(excluded.session_id, task_runs.session_id),
+        form       = COALESCE(excluded.form, task_runs.form),
         model      = COALESCE(excluded.model, task_runs.model),
         title      = COALESCE(excluded.title, task_runs.title),
         started_at = COALESCE(task_runs.started_at, excluded.started_at),
@@ -501,6 +503,7 @@ function createRepo(db) {
       UPDATE task_runs SET
         title       = COALESCE(@title, title),
         model       = COALESCE(@model, model),
+        form        = COALESCE(@form, form),
         result      = COALESCE(@result, result),
         file_count  = COALESCE(@fileCount, file_count),
         files_json  = COALESCE(@filesJson, files_json),

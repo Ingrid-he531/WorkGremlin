@@ -476,7 +476,7 @@ async function saveRetention() {
           <div class="row-title">{{ promptOf(t) || '(未命名任务)' }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
-            <span v-if="t.client">{{ clientLabel(t.client) }}</span>
+            <span v-if="t.client">{{ clientLabel(t.client, t.form) }}</span>
             <span v-if="t.model">{{ t.model }}</span>
             <span>{{ fmtDuration(t.duration_ms) }}</span>
             <span v-if="t.file_count != null">{{ t.file_count }} 文件</span>
@@ -500,7 +500,7 @@ async function saveRetention() {
           <div class="kv">
             <div class="k">状态</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
             <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
-            <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client) }}</div>
+            <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
             <div class="k">文件变化</div>

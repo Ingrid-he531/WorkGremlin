@@ -137,6 +137,9 @@ function createQueryRouter({ bus, repo }) {
                   AND NOT EXISTS (
                     SELECT 1 FROM agent_status s
                     WHERE s.task_id = t.id
+           -- 这一轮走的形态（'cli' / 'plugin'）：Codex 的 CLI 与 IDE 扩展共用一个 client，
+           -- 靠它把任务列表的客户端标成「Codex CLI / Codex Plugin」（见 hook 的 codexForm）
+           tr.form AS form,
                       AND s.last_heartbeat_at > @cutoff
                       -- blocked = 等权限，仍然是"这一轮在飞"，不能算已取消
                       AND s.state IN ('busy', 'thinking', 'blocked')

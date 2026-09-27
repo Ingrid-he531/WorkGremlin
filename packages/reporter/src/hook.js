@@ -478,6 +478,48 @@ function fileOf(input, tool) {
   return filesOf(input, tool)[0] || '';
 }
 
+/**
+ * 这条会话**是谁起的**：终端 CLI 还是 IDE 扩展（VS Code 插件）。
+ *
+ * Codex 的 rollout 第一行是 session_meta，里面写着（实测 0.155）：
+ *   {"type":"session_meta","payload":{"source":"cli","originator":"codex-tui",…}}       ← 终端 CLI
+ *   {"type":"session_meta","payload":{"source":"vscode","originator":"codex_vscode"}}    ← VS Code 扩展
+ * CLI 与 IDE 扩展共用同一份 ~/.codex、同一套 hook、同一个 client（3F 就是这么合并的），
+ * 别处分不出这两种形态；任务列表要标「Codex CLI / Codex Plugin」只能靠这一行。
+ * 只读文件头（64KB）就够 —— session_meta 在第一行，别把整份 rollout 读进内存。
+ * @returns {'cli'|'plugin'|''} 认不出就回空（宁可什么都不标，也不猜）
+ */
+function codexForm(transcriptPath) {
+  if (!transcriptPath || typeof transcriptPath !== 'string') return '';
+  let head = '';
+  try {
+    const fd = fs.openSync(transcriptPath, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    head = buf.slice(0, n).toString('utf8');
+  } catch {
+    return '';
+  }
+  for (const ln of head.split('\n').slice(0, 20)) {
+    const s = ln.trim();
+    if (!s) continue;
+    let obj;
+    try {
+      obj = JSON.parse(s);
+    } catch {
+      break; // 读窗口把这一行切断了：不猜
+    }
+    const p = obj && obj.payload;
+    if (!p || typeof p !== 'object') continue;
+    if (obj.type !== 'session_meta' && !p.source && !p.originator) continue;
+    const who = `${String(p.source || '')} ${String(p.originator || '')}`.toLowerCase();
+    if (/vscode|jetbrains|extension|plugin|visual studio/.test(who)) return 'plugin';
+    if (who.trim()) return 'cli';
+  }
+  return '';
+}
+
 /** 编辑类算 edit，删除类算 delete，其余写类算 write（server 侧按 op 分 新增/改动/删除） */
 function opOf(tool) {
   const t = String(tool || '');
@@ -1331,6 +1373,10 @@ async function main() {
     // 用户原话 = 剥掉 IDE 注入块之后的正文（见 userRequestText）
     const prompt = userRequestText(ev.prompt);
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
+    // 这一轮走的形态（CLI / IDE 插件）：Codex 的两种形态共用一份落盘、client 都是 codex，
+    // 只有 rollout 的 session_meta 分得出（见 codexForm）。认一次存进状态文件，后续轮次直接用。
+    const st0 = readState(file);
+    const form = IS_CODEX ? st0.form || codexForm(ev.transcript_path || st0.transcriptPath || '') : '';
     await register();
     // model 一并上报：报表要记这一轮用的是哪个模型（hook payload 没带就是空 → 服务端留 NULL）
     const started = await request(info, HTTP_ROUTES.TASK_START, {
@@ -1338,11 +1384,13 @@ async function main() {
       memberId: AGENT,
       title,
       model: String(ev.model || ''),
+      form,
     });
     // taskTitle（用户原话）无论 TASK_START 成功与否都要落盘：它是"思考中"屏上 / tooltip 里显示的那句话，
     // 不能因为上报失败就留着上一轮的旧标题 —— 否则"思考中"会先显示上一轮内容，等快照刷新才更正。
     // 新一轮：上一轮动过的文件清单作废（完成概要只算这一轮的）
     const patch = { taskTitle: title, done: null, roundFiles: [] };
+    if (form) patch.form = form;
     if (started && started.taskId) {
       patch.taskId = started.taskId;
       patch.taskWorkspacePath = REAL_WS;
@@ -1579,6 +1627,8 @@ async function main() {
     // 收工上报：把**这一轮的产出**一起交给服务端进台账（task_runs）——
     // 收尾自述 + 改动文件清单（含大小）+ 模型，报表要的"输入 / 产出 / 改了多少文件 / 用了什么模型"就齐了。
     if (taskId) {
+      // 收工时再认一次形态（开轮时 rollout 还没落盘 / 读不出时兜底）：TASK_END 与开轮同口径
+      const form = IS_CODEX ? st.form || codexForm(ev.transcript_path || st.transcriptPath || '') : '';
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
         memberId: AGENT,
@@ -1588,6 +1638,7 @@ async function main() {
         result,
         files: roundFileDetails,
         fileCount: roundFileDetails.length,
+        form,
       });
     }
     // 每次 AI 回复都进对话记录（messages 表）——这是"每次回复入库"那条线，

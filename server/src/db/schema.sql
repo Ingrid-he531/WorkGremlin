@@ -160,6 +160,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
   -- 轴 2（会话）：这轮用户任务属于哪条会话。同一个 agent 同时开两条会话时，
   -- 报表要能分清"这轮改动是哪条会话干的"。NULL = 老数据 / 无会话标识的上报。
   session_id          TEXT,
+  -- 这一轮走的**形态**：'cli' / 'plugin'（IDE 扩展）。
+  -- 同一产品的两种形态共用一份落盘、client 也相同时（3F Codex：CLI 与 VS Code 扩展
+  -- 共用 ~/.codex，client 都是 codex），任务列表靠它标出「Codex CLI / Codex Plugin」。
+  -- 分不出的产品（Claude / Qoder…）与老数据留 NULL —— 显示时退回只写产品名。
+  form                TEXT,
   model               TEXT,               -- 使用的模型（hook 上报；NULL = 没报）
   title               TEXT,               -- 输入：用户原话
   result              TEXT,               -- 产出：收尾自述 / 完成摘要

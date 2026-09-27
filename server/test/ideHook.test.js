@@ -46,10 +46,13 @@ function head(t) {
 
 /* ------------------------------ 假服务端（只回 hook 要的那几个字段） ------------------------------ */
 let taskSeq = 0;
+/** 收到的 task/start 请求体（要断言 form = 这一轮走的形态） */
+const starts = [];
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
+    if (req.url === '/api/v1/task/start') starts.push(JSON.parse(body || '{}'));
     const out = req.url === '/api/v1/task/start'
       ? { ok: true, taskId: `t_ide_${++taskSeq}` }
       : { ok: true, project: 'WorkGremlin', workspacePath: WS, taskId: null, title: '' };
@@ -177,6 +180,28 @@ async function main() {
   const s6 = stateOf('idetx2');
   const files6 = (s6 && s6.done && s6.done.files) || [];
   ok('一小时前那条改动没被算进本轮', !files6.some((f) => f.path === FILE6), JSON.stringify(files6));
+
+  /* [7] 形态（CLI / IDE 插件）：Codex 的两种形态共用一份落盘、client 都是 codex，
+   *     只有 rollout 的 session_meta 分得出 —— 任务列表的「Codex CLI / Codex Plugin」靠它 */
+  head('[7] 形态上报：rollout 的 session_meta 说是谁起的 → task/start 带 form');
+  const mkRollout = (file, meta) => {
+    fs.writeFileSync(
+      path.join(TMP, file),
+      JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: meta }) + '\n'
+    );
+    return path.join(TMP, file);
+  };
+  const TS_IDE = mkRollout('rollout-ide.jsonl', { session_id: 'ideform1', source: 'vscode', originator: 'codex_vscode' });
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform1', cwd: WS, prompt: 'IDE 里的一轮', transcript_path: TS_IDE });
+  ok('VS Code 扩展起的会话 → form=plugin', starts[starts.length - 1].form === 'plugin', JSON.stringify(starts[starts.length - 1]));
+  ok('形态写进了状态文件（下一轮直接用）', stateOf('ideform1').form === 'plugin', stateOf('ideform1').form);
+
+  const TS_TUI = mkRollout('rollout-tui.jsonl', { session_id: 'ideform2', source: 'cli', originator: 'codex-tui' });
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform2', cwd: WS, prompt: '终端里的一轮', transcript_path: TS_TUI });
+  ok('终端 CLI 起的会话 → form=cli', starts[starts.length - 1].form === 'cli', JSON.stringify(starts[starts.length - 1]));
+
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform3', cwd: WS, prompt: '读不到 rollout 的一轮' });
+  ok('读不到 rollout 就不猜（form 为空）', !starts[starts.length - 1].form, JSON.stringify(starts[starts.length - 1]));
 
   server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
