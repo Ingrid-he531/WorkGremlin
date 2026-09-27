@@ -602,7 +602,7 @@ async function saveRetention() {
       <span class="dim">自动保留最近</span>
       <input v-model.number="retentionDays" class="days" type="number" min="1" max="3650" aria-label="保留天数" />
       <span class="dim">天（更早记录由服务端自动清理）</span>
-      <button type="button" class="btn" @click="saveRetention">保存保留天数</button>
+      <button type="button" class="btn" @click="saveRetention">保存天数</button>
     </div>
 
     <!-- 汇总报表：按维度聚合的表格；共享上方筛选栏条件 -->
