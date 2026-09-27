@@ -23,6 +23,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+// 与 hook / 服务端共用同一份清单文件：读改写加锁 + 原子写（见 shared/fslock.js）。
+const { updateJson } = require('@workgremlin/shared/fslock');
 
 /** 与 server/src/ingest/subagentFeed.js 的 feedFilePath 保持一致 */
 function feedFilePath() {
@@ -43,9 +45,17 @@ function readFile(file) {
   }
 }
 
-function writeFile(file, feed) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(feed, null, 2)}\n`, 'utf8');
+/** 加锁的清单读-改-写：mutate 收到归一化后的 { project, agents }，返回新清单写回。 */
+function updateFeed(file, mutate) {
+  return updateJson(
+    file,
+    (raw) => {
+      const agents = Array.isArray(raw) ? raw : Array.isArray(raw && raw.agents) ? raw.agents : [];
+      const project = (!Array.isArray(raw) && raw && typeof raw.project === 'string' && raw.project) || '';
+      return mutate({ project, agents });
+    },
+    { fallback: { project: '', agents: [] }, pretty: true }
+  );
 }
 
 function parseArgs(argv) {
@@ -87,7 +97,7 @@ function main() {
   }
 
   if (cmd === 'clear') {
-    writeFile(file, { project: feed.project, agents: [] });
+    updateFeed(file, (f) => ({ project: f.project, agents: [] }));
     console.log(`已清空：${file}`);
     return;
   }
@@ -98,8 +108,7 @@ function main() {
       console.error('用法：node scripts/subagents.js rm <name>');
       process.exit(1);
     }
-    feed.agents = feed.agents.filter((a) => a.name !== name);
-    writeFile(file, feed);
+    updateFeed(file, (f) => ({ project: f.project, agents: f.agents.filter((a) => a.name !== name) }));
     console.log(`已移除 ${name}：${file}`);
     return;
   }
@@ -124,10 +133,12 @@ function main() {
       ...(args.project ? { project: String(args.project) } : {}),
       ...(args.file ? { files: [String(args.file)] } : {}),
     };
-    const i = feed.agents.findIndex((a) => a.name === name);
-    if (i >= 0) feed.agents[i] = { ...feed.agents[i], ...entry };
-    else feed.agents.push(entry);
-    writeFile(file, feed);
+    updateFeed(file, (f) => {
+      const i = f.agents.findIndex((a) => a.name === name);
+      if (i >= 0) f.agents[i] = { ...f.agents[i], ...entry };
+      else f.agents.push(entry);
+      return f;
+    });
     console.log(`${entry.name} -> ${entry.state}（写入 ${file}）`);
     return;
   }

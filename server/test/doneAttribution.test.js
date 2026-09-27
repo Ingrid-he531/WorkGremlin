@@ -14,6 +14,10 @@
  *   [3] 3F Codex：会话 id 从 rollout 文件名取到 → 完成标记按会话精确，不吃同工程别人刚收工
  *   [4] 相同工程但 id 对不上 → 空标记（"命中不了"= 没完成过，不退回 latest）
  *   [5] 有工程、没有 id（1F）→ 走该工程内的 latest 兜底，且跨工程那份（更新的）不会赢
+ *   [6] 1F CLI：transcript 文件名**就是**会话 id（CodeBuddy 与 Claude 同款命名）→ 按会话精确，
+ *       同工程那条更新的收工不会串到它头上（这也盖住"cli 那一路以前拿不到 id"的旧行为）
+ *   [7] 噪声文件不进会话表：根目录的输入历史 history.jsonl（扫 projects 子树后自然落不到它）、
+ *       以及 0 字节的 transcript 占位（起进程没写入就断了会留下）
  */
 'use strict';
 
@@ -80,12 +84,16 @@ const UA = '01a0dbb6-5d72-7af1-8afd-bd964964fd3a';
 const UB = '01a0dc1c-1ea8-7993-860d-eea6ba644a4e';
 const UX = 'bbbb1111-2222-3333-4444-555566667777';
 const UY = 'cccc1111-2222-3333-4444-555566667777';
+/** [7] 用：形状合法（是 UUID）但文件是空的 —— 形状对不代表它是会话 */
+const UZ = 'dddd1111-2222-3333-4444-555566667777';
 
 // [1] 5F：Stop 之后的状态文件（有 id、无工程），完成标记必须在
 writeState('trae', '/tmp/Proj7', U7, doneOf(60, '5F 收工摘要', 'note.js', '/tmp/Proj7'));
 
 // [2] 1F：没有 cwd 的 transcript（工程解析不出来）+ 另一工程刚落的完成标记
-writeTranscript(path.join(HOME, '.codebuddy'), 'nocwd.jsonl', [{ type: 'message', text: 'hi' }]);
+writeTranscript(path.join(HOME, '.codebuddy', 'projects', '-tmp-ProjN'), 'nocwd.jsonl', [
+  { type: 'message', text: 'hi' },
+]);
 writeState('codebuddy', '/tmp/ProjOther', '', doneOf(30, '别的工程收工', 'other.js', '/tmp/ProjOther'));
 
 // [3] 3F：同工程两条 Codex 会话，各自有完成标记（B 更新）
@@ -104,9 +112,25 @@ writeTranscript(path.join(HOME, '.claude', 'projects', '-tmp-ProjD'), `${UX}.jso
 writeState('claude', '/tmp/ProjD', UY, doneOf(20, '同工程别人的收工', 'y.js', '/tmp/ProjD'));
 
 // [5] 1F：有 cwd 的 transcript（工程解析得出来），本工程有一份、别的工程有一份更新的
-writeTranscript(path.join(HOME, '.codebuddy'), 'withcwd.jsonl', [{ cwd: '/tmp/ProjB', text: 'hi' }]);
+writeTranscript(path.join(HOME, '.codebuddy', 'projects', '-tmp-ProjB'), 'withcwd.jsonl', [
+  { cwd: '/tmp/ProjB', text: 'hi' },
+]);
 writeState('codebuddy', '/tmp/ProjB', '', doneOf(120, '同工程收工', 'b.js', '/tmp/ProjB'));
 writeState('codebuddy', '/tmp/ProjC', '', doneOf(10, '别工程更新', 'c.js', '/tmp/ProjC'));
+
+// [6] 1F CLI：文件名即会话 id（UUID 形状，实测与 hook 状态文件里的 sessionId 一致）
+const UE = '01a0e136-9b12-75d9-a218-f6bd35e168aa';
+const UF = '01a0e137-4c21-71b6-9a53-2f1c1a5d8e90';
+for (const u of [UE, UF]) {
+  writeTranscript(path.join(HOME, '.codebuddy', 'projects', '-tmp-ProjE'), `${u}.jsonl`, [{ cwd: '/tmp/ProjE' }]);
+}
+writeState('codebuddy', '/tmp/ProjE', UE, doneOf(300, 'E1 收工', 'e1.js', '/tmp/ProjE'));
+writeState('codebuddy', '/tmp/ProjE', UF, doneOf(200, 'E2 收工', 'e2.js', '/tmp/ProjE'));
+
+// [7] 噪声：根目录的输入历史（不在 projects 子树里）+ 0 字节的 transcript 占位
+writeTranscript(path.join(HOME, '.codebuddy'), 'history.jsonl', [{ display: 'hi', timestamp: NOW }]);
+fs.mkdirSync(path.join(HOME, '.codebuddy', 'projects', '-tmp-ProjF'), { recursive: true });
+fs.writeFileSync(path.join(HOME, '.codebuddy', 'projects', '-tmp-ProjF', `${UZ}.jsonl`), '');
 
 /* ------------------------------ 断言 ------------------------------ */
 
@@ -182,6 +206,25 @@ head('[5] 有工程、没有 id（1F）→ 该工程内的 latest 兜底，跨�
   if (r) {
     ok('拿到本工程的收工（不是更新的"别工程更新"）', r.doneAt === NOW - 120 && r.doneTitle === '同工程收工', desc(r));
   }
+}
+
+head('[6] 1F CLI：文件名即会话 id → 同工程两条各自精确，不吃对方那份更新的');
+{
+  const a = rows('1F').find((x) => x.sessionId === UE);
+  const b = rows('1F').find((x) => x.sessionId === UF);
+  ok('两条 1F CLI 会话都从文件名取到了会话 id', Boolean(a && b), `E1=${Boolean(a)} E2=${Boolean(b)}`);
+  if (a) {
+    ok('工程解析正确', a.projectPath === '/tmp/ProjE', desc(a));
+    ok('拿的是自己的收工（不是更新的 E2 那份）', a.doneAt === NOW - 300 && a.doneTitle === 'E1 收工', desc(a));
+  }
+  if (b) ok('E2 拿的是自己的收工', b.doneAt === NOW - 200 && b.doneTitle === 'E2 收工', desc(b));
+}
+
+head('[7] 噪声不进会话表：根目录 history.jsonl + 0 字节的 transcript 占位');
+{
+  const oneF = rows('1F');
+  ok('输入历史 history.jsonl 没有被当成会话', !oneF.some((x) => String(x.id).toLowerCase().includes('history')), oneF.map((x) => x.id).join(' | '));
+  ok('0 字节的 transcript 没有被当成会话', !oneF.some((x) => x.sessionId === UZ), oneF.map((x) => x.id).join(' | '));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -32,6 +32,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { AGENT_STATES } = require('@workgremlin/shared');
+// 与 hook 共用同一份清单文件 <workspace>/.workgremlin/subagents.json：
+// 读改写要加锁 + 原子写，否则会和并发的 hook 进程互相覆盖（见 shared/fslock.js）。
+const { updateJson } = require('@workgremlin/shared/fslock');
 const config = require('../config');
 
 /** 屋里只有 6 个悬浮点，多了会叠在一起；先出现的优先 */
@@ -48,7 +51,12 @@ const RETIRE_MS = 10_000;
  * 没放开 / 事件不支持而不来；没有 TTL 的话这些幽灵会永久挂在屋里。
  * 只在内存里过滤，不动清单文件（手工 scripts/subagents.js 写的条目没有 ts，不受影响）。
  */
-const GHOST_TTL_MS = 2 * 60 * 60_000; // 只是兜底：真正的收场由 hook 在 Stop / UserPromptSubmit / SessionEnd 主动扫（hook.js 的 sweepGhosts）。原来 30 分钟，会把跑超 30 分钟的长任务幽灵误撤。
+// 兜底：真正的收场由 hook 在 Stop / UserPromptSubmit / SessionEnd 主动扫（hook.js 的 sweepGhosts）。
+// 2026-09-27 从 2 小时调短到 60 分钟 —— 2 小时太长，扫场一旦失效幽灵就在屋里白飘很久，
+// 还会让 subagentFeed 每 2s 给它续一条任务行；但也不能太短（原来 30 分钟会误撤跑超 30 分钟的
+// 长任务）。60 分钟是折中，需要时可调 WORKGREMLIN_GHOST_TTL_MS 覆盖。
+const GHOST_TTL_MS =
+  Number(process.env.WORKGREMLIN_GHOST_TTL_MS) > 0 ? Number(process.env.WORKGREMLIN_GHOST_TTL_MS) : 60 * 60_000;
 /**
  * 收工摘要的落点：artifacts 表的 kind 只有 file / doc / pr / text 四种（CHECK 约束），
  * 所以摘要记成 kind='text'，再用 path 打这个标记让渲染层认出来
@@ -157,7 +165,11 @@ function createSubagentFeed(opts) {
 
   /** name -> {id, title} 当前挂在幽灵身上的任务 */
   const tasks = new Map();
-  /** name -> { result, at } 已收工、等着播完汇报再回收的（见文件头） */
+  /**
+   * 幽灵键 -> { name, result, at }：已收工、等着播完汇报再回收的（见文件头）。
+   * 键是**这一只**的身份（优先 per-call id，没有才退名字）—— 用 name 的话同名并发
+   * （三条都叫 Explore）会互相顶掉：第二只的收工既记不上、也永远不会被摘出清单。
+   */
   const retiring = new Map();
   /** @type {NodeJS.Timeout[]} */
   const timers = [];
@@ -198,45 +210,57 @@ function createSubagentFeed(opts) {
         });
       }
 
-      // 任务：标题变了就换一个（旧的收尾），没变只推进度
-      const known = tasks.get(fullId);
+      // 这一只的身份键：hook 写的条目带 per-call id，手工 scripts/subagents.js 写的不带。
+      const gkey = a.id || a.name;
+      // 任务：标题变了就换一个（旧的收尾），没变只推进度。
+      // 账必须按**这一只**记（gkey），不能按成员（memberId = `subagent-<名字>`）：同名并发
+      // （同时召唤三只都叫 Explore）共用一个成员，按成员记的话三只会在同一趟 sync() 里
+      // 轮流把对方的账收掉再开一条 —— 每 2s 一趟，台账就是这么被刷出几百上千行的
+      // （2026-09-27 实测：同一只被记 944 次；DB 里 13:45 那批三条任务每 2 秒翻一遍也是它）。
+      const known = tasks.get(gkey);
       // 召唤它的那轮用户任务：清单里写了就用写的，没写（老 hook）就认主 agent 当前在跑的那个
       const parentTaskId = a.parent || bus.currentMainTaskId(project);
       if (a.result) {
-        // 收工：结果摘要作为产出下发（渲染层拿它当汇报文案），任务按 done 收尾；
-        // 幽灵留着，等汇报演完再摘（下方 retiring 到点处理）。
-        if (known) {
-          // 摘要写失败也不能拖住收工（否则幽灵既不汇报也不散）
-          try {
-            bus.endTask({
+        // 收工**只记一次**：这一条在清单里还要再活 RETIRE_MS（播"走到主 agent 面前汇报"
+        // 那段动画），期间 sync() 每 2s 都会再进来一趟 —— 而 known 上头刚被 delete 掉，
+        // 少了这道闸就会每 2s 补一行**空标题 / 无耗时**的台账（2026-09-27 实测：peter 那只
+        // 多出 6 行；幽灵滞留在清单里更久时，见过同一只被记 944 次）。
+        if (!retiring.has(gkey)) {
+          // 收工：结果摘要作为产出下发（渲染层拿它当汇报文案），任务按 done 收尾；
+          // 幽灵留着，等汇报演完再摘（下方 retiring 到点处理）。
+          if (known) {
+            // 摘要写失败也不能拖住收工（否则幽灵既不汇报也不散）
+            try {
+              bus.endTask({
+                project,
+                memberId,
+                taskId: known.id,
+                state: 'done',
+                artifacts: [{ kind: 'text', title: a.result, path: SUMMARY_PATH }],
+              });
+            } catch (err) {
+              console.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
+            }
+            bus.endSubagentRun({ id: known.runId, project, result: a.result, model: a.model, files: a.files });
+            tasks.delete(gkey);
+          } else {
+            // 从没开过任务行（召唤时没写任务文案）也照样记一笔：
+            // 名字 + 产出有了，开始时刻只能承认不知道（startedAt=null → 耗时 NULL）。
+            const runId = bus.startSubagentRun({
               project,
-              memberId,
-              taskId: known.id,
-              state: 'done',
-              artifacts: [{ kind: 'text', title: a.result, path: SUMMARY_PATH }],
+              memberId: fullId,
+              name: a.name,
+              client: a.client,
+              model: a.model,
+              title: '',
+              parentTaskId,
+              taskId: null,
+              startedAt: null,
             });
-          } catch (err) {
-            console.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
+            bus.endSubagentRun({ id: runId, project, result: a.result, model: a.model, files: a.files });
           }
-          bus.endSubagentRun({ id: known.runId, project, result: a.result, model: a.model, files: a.files });
-          tasks.delete(fullId);
-        } else {
-          // 从没开过任务行（召唤时没写任务文案）也照样记一笔：
-          // 名字 + 产出有了，开始时刻只能承认不知道（startedAt=null → 耗时 NULL）。
-          const runId = bus.startSubagentRun({
-            project,
-            memberId: fullId,
-            name: a.name,
-            client: a.client,
-            model: a.model,
-            title: '',
-            parentTaskId,
-            taskId: null,
-            startedAt: null,
-          });
-          bus.endSubagentRun({ id: runId, project, result: a.result, model: a.model, files: a.files });
+          retiring.set(gkey, { name: a.name, result: a.result, at: Date.now() + RETIRE_MS });
         }
-        if (!retiring.has(a.name)) retiring.set(a.name, { result: a.result, at: Date.now() + RETIRE_MS });
       } else if (a.task) {
         if (!known || known.title !== a.task) {
           if (known) {
@@ -264,7 +288,7 @@ function createSubagentFeed(opts) {
               taskId: r.taskId,
               startedAt: Date.now(),
             });
-            tasks.set(fullId, { id: r.taskId, title: a.task, runId });
+            tasks.set(gkey, { id: r.taskId, title: a.task, runId, fullId });
           }
         } else if (a.progress !== null) {
           bus.taskProgress({ project, memberId, taskId: known.id, progress: a.progress, files: a.files });
@@ -273,7 +297,7 @@ function createSubagentFeed(opts) {
         bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
         // 没写 result 的收尾：产出留 NULL（不编造），但结束时间与耗时照记
         bus.endSubagentRun({ id: known.runId, project, model: a.model, files: a.files });
-        tasks.delete(fullId);
+        tasks.delete(gkey);
       }
 
       // 心跳：state 变了才写历史，同时刷新 last_heartbeat_at（不然 60s 后被判 degraded）
@@ -301,10 +325,10 @@ function createSubagentFeed(opts) {
 
     // 到点回收：汇报演完了，把这条从清单里摘掉 —— 幽灵这才散掉
     const nowMs = Date.now();
-    for (const [name, plan] of [...retiring]) {
+    for (const [gkey, plan] of [...retiring]) {
       if (nowMs < plan.at) continue;
-      retiring.delete(name);
-      retireFromFeed(name, plan.result);
+      retiring.delete(gkey);
+      retireFromFeed(plan.name, plan.result);
     }
 
     // 清单里没了 -> 幽灵散掉（含上一轮残留的临时成员）
@@ -315,10 +339,12 @@ function createSubagentFeed(opts) {
       if (roster && m.name && roster.isDefined(m.name)) roster.markIdle(m.name);
       // 台账：这一只就这么没了（清单里直接被摘掉、没写过 result）——
       // 产出留 NULL，但结束时间与耗时得记上，否则报表里永远挂着一笔"还在跑"的账。
-      const open = tasks.get(m.id);
-      if (open) {
-        bus.endSubagentRun({ id: open.runId, project });
-        tasks.delete(m.id);
+      // 按成员找、不按 gkey 找：成员消失时我们只剩成员 id，而同名并发下一个成员挂着好几只的账，
+      // 要全部收掉（tasks 的键是 gkey，值里存着 fullId，见上）。
+      for (const [k, t] of [...tasks]) {
+        if (t.fullId !== m.id) continue;
+        bus.endSubagentRun({ id: t.runId, project });
+        tasks.delete(k);
       }
       bus.removeMember({ project, memberId: m.id });
     }
@@ -335,22 +361,22 @@ function createSubagentFeed(opts) {
   function retireFromFeed(name, result) {
     // 直接改原始 JSON、**不**走 readFeed 的归一化：否则回写会把别条目的 id / ts
     // 等字段冲掉（那两个是 hook 用来做并发去重和 TTL 的）。
-    let data;
+    // 读改写整段在锁里 + 原子写：hook 进程可能正同时往同一份清单里追加 / 划账，
+    // 以前这里裸 writeFileSync 会跟 hook 互相覆盖。
     try {
-      data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {
-      return;
-    }
-    const wrap = !Array.isArray(data) && Array.isArray(data.agents);
-    const list = Array.isArray(data) ? data : wrap ? data.agents : null;
-    if (!list) return;
-    const i = list.findIndex((a) => a && a.name === name && String(a.result || '') === String(result || ''));
-    if (i < 0) return;
-    list.splice(i, 1);
-    try {
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      const out = Array.isArray(data) ? list : { ...data, agents: list };
-      fs.writeFileSync(file, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
+      updateJson(
+        file,
+        (data) => {
+          const wrap = !Array.isArray(data) && Array.isArray(data && data.agents);
+          const list = Array.isArray(data) ? data : wrap ? data.agents : null;
+          if (!list) return undefined;
+          const i = list.findIndex((a) => a && a.name === name && String(a.result || '') === String(result || ''));
+          if (i < 0) return undefined;
+          list.splice(i, 1);
+          return Array.isArray(data) ? list : { ...data, agents: list };
+        },
+        { fallback: { project: '', agents: [] }, pretty: true }
+      );
     } catch (err) {
       console.warn('[workgremlin] subagent 收工回收失败：', err && err.message);
     }

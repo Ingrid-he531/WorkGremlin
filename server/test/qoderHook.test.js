@@ -23,7 +23,7 @@ process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
 process.env.PATH = BIN;
 
-const HOOK = path.resolve(__dirname, '..', 'packages', 'reporter', 'src', 'hook.js');
+const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
 const CWD = TMP;
 
 let pass = 0;
@@ -94,7 +94,9 @@ function killHeartbeat(sessionId) {
   // 回归：非 qoder（claude）SessionStart 不补粗粒度相位（仍 null，等后续细粒度事件覆盖）
   await runHook('claude', 'SessionStart', 'qtest-claude-1');
   st = stateFile('qtest-claude-1');
-  ok('claude SessionStart 不补粗粒度相位（sessionPhase 仍为 null，留给 UserPromptSubmit）', Boolean(st && st.sessionPhase === null), st && JSON.stringify(st.sessionPhase));
+  // 不编造相位即可：没写（undefined）或显式 null 都算"留给 UserPromptSubmit"，
+  // 只要不是 thinking / done 这种凭空捏的值。服务端 readReporterPhase 用 !sp 判空，两者等价。
+  ok('claude SessionStart 不补粗粒度相位（留给 UserPromptSubmit）', Boolean(st && !st.sessionPhase), st && JSON.stringify(st.sessionPhase));
   killHeartbeat('qtest-claude-1');
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

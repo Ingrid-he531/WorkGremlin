@@ -33,7 +33,11 @@
     "test:opencode": "node server/test/opencodeFloor.test.js",
     "test:done-shape": "node server/test/doneShape.test.js",
     "test:task-filter": "node server/test/taskFilter.test.js",
-    "test:claude-model": "node server/test/claudeModel.test.js"
+    "test:claude-model": "node server/test/claudeModel.test.js",
+    "test:ghost": "node server/test/ghostRace.test.js",
+    "test:ghost-ledger": "node server/test/ghostLedger.test.js",
+    "test:recover": "node server/test/taskRecover.test.js",
+    "test:qoder": "node server/test/qoderHook.test.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

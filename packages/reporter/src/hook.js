@@ -53,6 +53,9 @@ const { spawn } = require('node:child_process');
 
 const { readServerInfo, HTTP_ROUTES } = require('./index');
 const { fnv1a32 } = require('@workgremlin/shared');
+// 进程间互斥 + 原子写：CLI 会在同一毫秒并行触发多个 hook 进程，各写各的会互相覆盖
+// （见 fslock.js 头部的实测记录）。writeState / updateState / updateFeedFile 都走这里。
+const { updateJson } = require('@workgremlin/shared/fslock');
 
 /**
  * 本 hook 服务哪个 CLI（安装器写进 hook 命令：Codex 那份是 --agent codex）。
@@ -123,7 +126,7 @@ function eventClient(ev) {
   const ec = ev && ev.client ? String(ev.client).trim().toLowerCase() : '';
   // Plugin 自报的 'vscode'（及历史 'codebuddy'）一律加 '-plugin' 后缀归到 plugin 身份；
   // 其余（含空，即 CLI）按 agent 本身返回。
-  if (ec && ec !== AGENT.toLowerCase()) return AGENT + "-plugin";
+  if (ec && ec !== AGENT.toLowerCase() && ec !== 'cli') return AGENT + "-plugin";
   return AGENT;
 }
 
@@ -237,10 +240,33 @@ function readState(file) {
 
 function writeState(file, patch) {
   try {
-    const next = { ...readState(file), ...patch };
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify(next)}\n`, 'utf8');
-    return next;
+    // 加锁 + 原子写：同一毫秒并行的多个 hook 进程各读一份旧状态，后写的会把先写的冲掉
+    // （2026-09-27 实测：taskId / roundFiles / done 就是这么被削掉的）。锁里读改写，
+    // 原子 rename 保证读者永远看不到半截 JSON（半截会让 readState 退回 {} → 整份状态写没）。
+    return updateJson(
+      file,
+      (cur) => ({ ...(cur && typeof cur === 'object' && !Array.isArray(cur) ? cur : {}), ...patch }),
+      { fallback: {}, pretty: false } // 状态文件保持原来的紧凑单行格式
+    );
+  } catch (err) {
+    debug('写状态失败：', err && err.message);
+    return readState(file);
+  }
+}
+
+/**
+ * 加锁的状态读-改-写：mutate 收到当前状态，返回新状态写回。
+ * writeState 只保证"单次 patch 不丢"（加锁 + 原子写）；像 rememberSubagent /
+ * rememberRoundFiles 这种"读账本 → 追加 → 写回"的**复合**更新必须整段在锁里 ——
+ * 只把最后那一次 writeState 加锁是没用的：两个进程仍会读到同一份旧账本、各推各的。
+ */
+function updateState(file, mutate) {
+  try {
+    return updateJson(
+      file,
+      (cur) => mutate(cur && typeof cur === 'object' && !Array.isArray(cur) ? cur : {}),
+      { fallback: {}, pretty: false }
+    );
   } catch (err) {
     debug('写状态失败：', err && err.message);
     return readState(file);
@@ -602,23 +628,28 @@ function feedFileFor(workspacePath) {
   return path.join(ws ? path.resolve(ws) : process.cwd(), '.workgremlin', 'subagents.json');
 }
 
-function readFeedFile(file) {
+/**
+ * 加锁的清单读-改-写：mutate 收到归一化后的 { project, agents }，返回新清单写回。
+ * addGhost / retireGhost / sweepGhosts 都是"读 → 改 → 写"，必须整段在锁里 ——
+ * 否则并发召唤时后写的会冲掉先写的（实测三条 ghost+ 只落两条）。
+ * mutate 返回 undefined = 放弃这次更新（不写盘）。
+ * @param {string} file
+ * @param {(feed: {project: string, agents: any[]}) => any} mutate
+ */
+function updateFeedFile(file, mutate) {
   try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const agents = Array.isArray(data) ? data : Array.isArray(data.agents) ? data.agents : [];
-    const project = (!Array.isArray(data) && typeof data.project === 'string' && data.project) || '';
-    return { project, agents };
-  } catch {
-    return { project: '', agents: [] };
-  }
-}
-
-function writeFeedFile(file, feed) {
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify(feed, null, 2)}\n`, 'utf8');
+    return updateJson(
+      file,
+      (raw) => {
+        const agents = Array.isArray(raw) ? raw : Array.isArray(raw && raw.agents) ? raw.agents : [];
+        const project = (!Array.isArray(raw) && raw && typeof raw.project === 'string' && raw.project) || '';
+        return mutate({ project, agents });
+      },
+      { fallback: { project: '', agents: [] }, pretty: true }
+    );
   } catch (err) {
     debug('写 subagent 清单失败：', err && err.message);
+    return null;
   }
 }
 
@@ -706,17 +737,29 @@ function subagentKeys(ev, name, task) {
 }
 
 /**
+ * client 的"家族"：codebuddy 与 codebuddy-plugin 是**同一个产品**（1F 已把 CLI / 插件
+ * 合并成单层），共用同一份 <workspace>/.workgremlin/subagents.json。
+ * 实测（2026-09-27）：一只 05:01 召唤的幽灵条目 client 写的是 'codebuddy-plugin'，
+ * 而当天下午 CLI 上报的身份变成 'codebuddy' —— 精确比对 client 时这只幽灵谁都收不掉，
+ * 只能干等 GHOST_TTL_MS 过期。比较归属时按家族归一。
+ */
+function clientFamily(c) {
+  return String(c || '').trim().toLowerCase().replace(/-plugin$/, '');
+}
+
+/**
  * 这条清单条目归不归本 hook 管。
  * Codex 与 CodeBuddy 写的是**同一个** <workspace>/.workgremlin/subagents.json，
  * 所以收工 / 扫场必须认来源，否则会把对方的幽灵一起收掉。
- * 写了 client 的按 client 认；没写的（老版本 hook / 手工脚本）算 CodeBuddy 的历史条目。
+ * 写了 client 的按**家族**认（见 clientFamily）；没写的（老版本 hook / 手工脚本）
+ * 算 CodeBuddy 的历史条目。
  */
 function ownsEntry(a, client, session = '') {
   if (!a) return false;
-  const c = String(a.client || '').trim().toLowerCase();
-  if (c) {
-    if (c !== client) return false;
-  } else if (client !== 'codebuddy') {
+  const fam = clientFamily(a.client);
+  if (fam) {
+    if (fam !== clientFamily(client)) return false;
+  } else if (clientFamily(client) !== 'codebuddy') {
     return false;
   }
   // 会话这一级只在**两边都有**时才比：老条目 / 手工 `scripts/subagents.js` 写的条目
@@ -744,27 +787,30 @@ function ownsEntry(a, client, session = '') {
  */
 function addGhost(workspacePath, name, task, id, parent, model, client, session = SESSION) {
   const file = feedFileFor(workspacePath);
-  const feed = readFeedFile(file);
-  // 去重也要按会话：同一个 subagent 名 + 同一个 id 只会出现在一条会话里，
-  // 但两条会话各自召唤同名 subagent 时，只按 name 去重会把第二只吞掉。
-  const dup = id
-    ? (a) => a.id === id
-    : (a) => a.name === name && String(a.sessionId || '') === String(session || '');
-  if (feed.agents.some(dup)) return;
-  feed.agents.push({
-    name,
-    state: 'busy',
-    ts: Date.now(),
-    client, // 归属轴 1（产品）：同一个工程下 Codex / CLI / Plugin 共用一个清单文件，按 client 区分
-    // 归属轴 2（会话）：同产品两条会话的 client 完全一样，只能靠 sessionId 分开。
-    // 收工 / 扫场都用 ownsEntry 比它，否则 A 的 Stop 会把 B 还在跑的幽灵一起收掉。
-    ...(session ? { sessionId: String(session) } : {}),
-    ...(task ? { task } : {}),
-    ...(id ? { id } : {}),
-    ...(parent ? { parent } : {}),
-    ...(model ? { model } : {}),
+  // 读改写整段在锁里：召唤是并发到达的（实测三条 PreToolUse(Agent) 只差 5~11ms），
+  // 老写法"各自读 → push → 各自整体写回"会互相覆盖，三条只落两条。
+  updateFeedFile(file, (feed) => {
+    // 去重也要按会话：同一个 subagent 名 + 同一个 id 只会出现在一条会话里，
+    // 但两条会话各自召唤同名 subagent 时，只按 name 去重会把第二只吞掉。
+    const dup = id
+      ? (a) => a.id === id
+      : (a) => a.name === name && String(a.sessionId || '') === String(session || '');
+    if (feed.agents.some(dup)) return undefined; // 已有 → 不写
+    feed.agents.push({
+      name,
+      state: 'busy',
+      ts: Date.now(),
+      client, // 归属轴 1（产品）：同一个工程下 Codex / CLI / Plugin 共用一个清单文件，按 client 区分
+      // 归属轴 2（会话）：同产品两条会话的 client 完全一样，只能靠 sessionId 分开。
+      // 收工 / 扫场都用 ownsEntry 比它，否则 A 的 Stop 会把 B 还在跑的幽灵一起收掉。
+      ...(session ? { sessionId: String(session) } : {}),
+      ...(task ? { task } : {}),
+      ...(id ? { id } : {}),
+      ...(parent ? { parent } : {}),
+      ...(model ? { model } : {}),
+    });
+    return feed;
   });
-  writeFeedFile(file, feed);
 }
 
 /**
@@ -782,29 +828,29 @@ function addGhost(workspacePath, name, task, id, parent, model, client, session 
  */
 function retireGhost(workspacePath, name, id, result, client, session = SESSION) {
   const file = feedFileFor(workspacePath);
-  const feed = readFeedFile(file);
-  let hit = id ? feed.agents.findIndex((a) => a.id === id) : -1;
-  // 没有 id 才退回按名字。按名字这一步也要带会话：两条会话各自召唤同名 subagent 时，
-  // 只按名字找会收掉对方那只。
-  if (hit < 0) {
-    hit = feed.agents.findIndex(
-      (a) => a.name === name && (!session || !a.sessionId || String(a.sessionId) === String(session))
-    );
-  }
-  if (hit < 0) return;
-  const cur = feed.agents[hit] || {};
-  // client 必须传进来：ownsEntry 拿它跟条目上的 client 比。
-  // 早先这里漏传（ownsEntry(cur)），而 ownsEntry 在 client 为 undefined 时**恒返回 false**，
-  // 于是本函数永远提前 return —— 幽灵从没进过"待汇报"，只会被 Stop / SessionEnd 当孤儿扫掉，
-  // 「走到主 agent 面前汇报」那段动画对所有客户端都没播过（实测 ghost-report 打了，
-  // 紧接着 ghost-sweep 仍把它当孤儿 remove 掉，就是这条）。
-  if (!ownsEntry(cur, client, session)) return; // 别动别的客户端 / 别的会话的幽灵
-  const task = String(cur.task || '').trim();
-  // Codex 的 SubagentStop 会带子代理最后那段话，直接当汇报文案（比"已完成：任务名"实在）
-  const said = String(result || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-  const next = feed.agents.slice();
-  next[hit] = { ...cur, state: 'idle', result: said || (task ? `已完成：${task}` : '已完成') };
-  writeFeedFile(file, { ...feed, agents: next });
+  updateFeedFile(file, (feed) => {
+    let hit = id ? feed.agents.findIndex((a) => a.id === id) : -1;
+    // 没有 id 才退回按名字。按名字这一步也要带会话：两条会话各自召唤同名 subagent 时，
+    // 只按名字找会收掉对方那只。
+    if (hit < 0) {
+      hit = feed.agents.findIndex(
+        (a) => a.name === name && (!session || !a.sessionId || String(a.sessionId) === String(session))
+      );
+    }
+    if (hit < 0) return undefined;
+    const cur = feed.agents[hit] || {};
+    // client 必须传进来：ownsEntry 拿它跟条目上的 client 比。
+    // 早先这里漏传（ownsEntry(cur)），而 ownsEntry 在 client 为 undefined 时**恒返回 false**，
+    // 于是本函数永远提前 return —— 幽灵从没进过"待汇报"，只会被 Stop / SessionEnd 当孤儿扫掉，
+    // 「走到主 agent 面前汇报」那段动画对所有客户端都没播过（实测 ghost-report 打了，
+    // 紧接着 ghost-sweep 仍把它当孤儿 remove 掉，就是这条）。
+    if (!ownsEntry(cur, client, session)) return undefined; // 别动别的客户端 / 别的会话的幽灵
+    const task = String(cur.task || '').trim();
+    // Codex 的 SubagentStop 会带子代理最后那段话，直接当汇报文案（比"已完成：任务名"实在）
+    const said = String(result || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    feed.agents[hit] = { ...cur, state: 'idle', result: said || (task ? `已完成：${task}` : '已完成') };
+    return feed;
+  });
 }
 
 /**
@@ -815,10 +861,13 @@ function retireGhost(workspacePath, name, id, result, client, session = SESSION)
  * 收工时回来查。**多槽**（不是"最近一条"）：同名并发时前一只收工不能把后一只的账一起销掉。
  */
 function rememberSubagent(file, id, name) {
-  const list = (readState(file).subagents || []).filter((r) => r && (r.id || r.name));
-  if (id && !list.some((r) => r.id === id)) list.push({ id, name, at: Date.now() });
-  else if (!id && name && !list.some((r) => r.name === name)) list.push({ id: '', name, at: Date.now() });
-  writeState(file, { subagents: list.slice(-8) });
+  // 读账本 → 追加 → 写回，整段在锁里（并发召唤时 12 条只落 6 条就是这么丢的）
+  updateState(file, (st) => {
+    const list = (st.subagents || []).filter((r) => r && (r.id || r.name));
+    if (id && !list.some((r) => r.id === id)) list.push({ id, name, at: Date.now() });
+    else if (!id && name && !list.some((r) => r.name === name)) list.push({ id: '', name, at: Date.now() });
+    return { ...st, subagents: list.slice(-8) };
+  });
 }
 
 /**
@@ -829,15 +878,18 @@ function rememberSubagent(file, id, name) {
  */
 function rememberRoundFiles(file, items) {
   if (!items || !items.length) return;
-  const map = new Map();
-  for (const x of readState(file).roundFiles || []) {
-    if (x && x.path) map.set(x.path, x.op);
-  }
-  for (const it of items) {
-    if (it && it.path) map.set(it.path, it.op);
-  }
-  const list = [...map.entries()].map(([path, op]) => ({ path, op }));
-  writeState(file, { roundFiles: list.slice(-30) });
+  // 同 rememberSubagent：读-改-写整段在锁里，否则并发时"这一轮改了哪些文件"会互相覆盖
+  updateState(file, (st) => {
+    const map = new Map();
+    for (const x of st.roundFiles || []) {
+      if (x && x.path) map.set(x.path, x.op);
+    }
+    for (const it of items) {
+      if (it && it.path) map.set(it.path, it.op);
+    }
+    const list = [...map.entries()].map(([path, op]) => ({ path, op }));
+    return { ...st, roundFiles: list.slice(-30) };
+  });
 }
 
 /**
@@ -866,19 +918,32 @@ function resultOfResponse(ev) {
 
 /** 收工：按 id 精确找，找不到再按 name，都找不到就认最早那只（FIFO）。转成待汇报并销账。 */
 function finishGhost(file, workspacePath, ev, client, opts = {}, session = SESSION) {
-  const list = readState(file).subagents || [];
   const ti = ev && ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : null;
   const nm = ti ? agentName(ti) : '';
   const keys = subagentKeys(ev, nm, ti ? agentTask(ti) : '');
   const aid = agentIdOf(ev);
-  // 匹配顺序：agent_id（Codex）> 合成 key（CodeBuddy）> 名字 > 最早那只
-  let rec = aid ? list.find((r) => r.id === aid) : null;
-  if (!rec && keys.length) rec = list.find((r) => r.id && keys.includes(r.id)) || null;
-  if (!rec && nm && nm !== 'subagent') rec = list.find((r) => r.name === nm) || null;
-  if (!rec) rec = list[0] || null;
+  /** 匹配顺序：agent_id（Codex）> 合成 key（CodeBuddy）> 名字 > 最早那只（判据只依赖事件 + 台账） */
+  const pick = (list) => {
+    let r = aid ? list.find((x) => x.id === aid) : null;
+    if (!r && keys.length) r = list.find((x) => x.id && keys.includes(x.id)) || null;
+    if (!r && nm && nm !== 'subagent') r = list.find((x) => x.name === nm) || null;
+    return r || list[0] || null;
+  };
+  // 挑出要收工的那只 + 销台账，**一起**在锁里：挑和销必须是一次原子操作，否则并发的
+  // SubagentStop（实测同一秒来三个）会读到同一份台账、挑中同一只 —— 三只幽灵只收掉一只，
+  // 剩下两只干等 GHOST_TTL_MS。
+  let rec = null;
+  updateState(file, (st) => {
+    const list = st.subagents || [];
+    const hit = pick(list);
+    if (!hit) return undefined;
+    rec = hit;
+    return { ...st, subagents: list.filter((x) => x !== hit) };
+  });
   if (!rec) return;
+  // 划掉清单里的那只（先销账、后划账）：万一划账失败，台账少一条是无害的 ——
+  // Stop / UserPromptSubmit 的 sweepGhosts 会按"没收过工的孤儿"把它兜底扫掉。
   retireGhost(workspacePath, rec.name, rec.id, opts.result, client, session);
-  writeState(file, { subagents: list.filter((r) => r !== rec) });
   trace('ghost-report', { name: rec.name, id: rec.id, via: ev && ev.hook_event_name });
 }
 
@@ -901,24 +966,31 @@ function sweepGhosts(stateFile, workspacePath, client, opts = {}, session = SESS
   // 注意两个路径别搞混：stateFile 是 hook 状态文件（账本在里面），
   // 清单文件要按 workspacePath 现算 —— 混了的话本函数会静默变成空操作。
   const feedFile = feedFileFor(workspacePath);
-  const feed = readFeedFile(feedFile);
   // 默认只扫「从没收过工的孤儿」（没有 result）：带 result 的已经进了「待汇报」流程，
   // 由 subagentFeed 播完汇报再回收 —— 连它一起扫会把刚做好的汇报动画掐掉。
   // 会话真的结束了（SessionEnd）才 all:true 全清。
   // **会话维度**：all:true 也只是"这条会话全清"，不是"清光整个工程" ——
   // 否则你关掉一个终端，另一个终端里还在飞的幽灵会被一起扫掉。
-  const doomed = feed.agents.filter(
-    (a) => a && a.ts && ownsEntry(a, client, session) && (opts.all || !a.result)
-  );
+  // 读改写整段在锁里：清单文件是多个 hook 进程 / 服务端 subagentFeed / CLI 脚本共用的。
+  let doomed = [];
+  updateFeedFile(feedFile, (feed) => {
+    doomed = feed.agents.filter((a) => a && a.ts && ownsEntry(a, client, session) && (opts.all || !a.result));
+    if (!doomed.length) return undefined; // 没得扫 → 不开销一次写盘
+    feed.agents = feed.agents.filter((a) => !doomed.includes(a));
+    return feed;
+  });
   if (!doomed.length) return 0;
-  writeFeedFile(feedFile, { ...feed, agents: feed.agents.filter((a) => !doomed.includes(a)) });
 
-  const pool = (readState(stateFile).subagents || []).slice();
-  for (const a of doomed) {
-    const i = pool.findIndex((r) => r && (a.id ? r.id === a.id : !r.id && r.name === a.name));
-    if (i >= 0) pool.splice(i, 1);
-  }
-  writeState(stateFile, { subagents: pool });
+  // 销台账：同样是"读-改-写"，整段在锁里 —— 并发的 Stop / UserPromptSubmit 会互相覆盖，
+  // 销不掉的那条会一直挂在台账里（下一次 finishGhost 可能拿它去收错幽灵）。
+  updateState(stateFile, (st) => {
+    const pool = (st.subagents || []).slice();
+    for (const a of doomed) {
+      const i = pool.findIndex((r) => r && (a.id ? r.id === a.id : !r.id && r.name === a.name));
+      if (i >= 0) pool.splice(i, 1);
+    }
+    return { ...st, subagents: pool };
+  });
   trace('ghost-sweep', { removed: doomed.length, agents: doomed.map((a) => a.name) });
   return doomed.length;
 }
@@ -1081,7 +1153,10 @@ async function main() {
   if (ev.transcript_path) writeState(file, { transcriptPath: String(ev.transcript_path) });
 
   // 心跳守护的"最后活跃时间"（它靠这个判断会话还在不在）
-  if (event !== 'SessionEnd') writeState(file, { hb: { ...(readState(file).hb || {}), lastEventAt: Date.now() } });
+  if (event !== 'SessionEnd') {
+    // 读-改-写（要保留原来的 hb.pid / startedAt）：整段在锁里，别把心跳守护的登记冲掉
+    updateState(file, (st) => ({ ...st, hb: { ...(st.hb || {}), lastEventAt: Date.now() } }));
+  }
 
   const register = () =>
     request(info, HTTP_ROUTES.REGISTER, {
@@ -1283,11 +1358,24 @@ async function main() {
     // 本轮结束：同理，屋里不该再留着上一轮召唤的幽灵
     sweepGhosts(file, REAL_WS, cl);
     const st = readState(file);
-    const taskId = st.taskId;
-    const title = st.taskTitle || '';
+    let taskId = st.taskId;
+    let title = st.taskTitle || '';
     // 本轮任务的开始时刻：服务端据此只挑"这一轮改过的文件"做完成概要，
     // 否则会把上一轮的改动也算进来（典型：这一轮只是 push，却显示上一轮改了多少文件）。
-    const startedAt = Number(st.taskStartedAt) || 0;
+    let startedAt = Number(st.taskStartedAt) || 0;
+    // 兜底（bug 3）：并发覆盖会让状态文件丢掉 taskId —— 那样本轮就不发 task/end，
+    // 产出摘要 / 改动文件 / 结束时间整块丢，任务永远挂 running（实测 13:14 / 13:18 /
+    // 13:29 三条 codebuddy 任务全部如此）。taskId 丢了就向服务端回捞"本成员 + 本会话
+    // 当前在跑的任务"（服务端 agent_status / task_runs 里是真值），拿回来照常收工。
+    if (!taskId) {
+      const cur = await request(info, HTTP_ROUTES.TASK_CURRENT, { ...base, memberId: AGENT });
+      if (cur && cur.taskId) {
+        taskId = cur.taskId;
+        if (!title && cur.title) title = cur.title;
+        if (!startedAt && cur.startedAt) startedAt = Number(cur.startedAt) || 0;
+        trace('task-recover', { agent: AGENT, taskId, sessionId: SESSION });
+      }
+    }
     // 落"完成"标记：带工程路径 + 任务标题 + 起始时刻，服务端据此（且仅据此）亮"任务完成"概要，
     // 不再靠"相位回落到空闲"来猜，避免中途被其它工程串味误弹。
     // 本轮的 AI 回复：Stop 自带的 last_assistant_message 优先（Codex 实测有），

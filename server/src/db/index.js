@@ -558,9 +558,27 @@ function createRepo(db) {
       ORDER BY COALESCE(s.last_heartbeat_at, s.updated_at) DESC
       LIMIT 1
     `),
-    /** 时间窗内该成员改动过的文件：按路径去重（同一文件反复改只算一个产出），取最近一次的时间 */
+    /**
+     * 某成员当前进行中的任务（可能多条：同产品的不同会话各占一条）。
+     * hook 的本地 taskId 被并发覆盖冲掉时，Stop 靠它回捞本轮任务（bug 3 兜底）。
+     * 按会话挑哪一条由上层 currentTaskFor 决定，这里只负责把候选捞出来。
+     */
+    // 会话标识在报表层 task_runs（tasks 表本身没有 session_id 列），所以这里 JOIN 取。
+    runningTaskForMember: db.prepare(`
+      SELECT t.id AS taskId, t.title AS title, tr.session_id AS sessionId, t.started_at AS startedAt
+      FROM tasks t
+      LEFT JOIN task_runs tr ON tr.id = t.id
+      WHERE t.member_id = ? AND t.state = 'running'
+      ORDER BY t.started_at DESC
+      LIMIT 5
+    `),
+    /**
+     * 时间窗内该成员改动过的文件：按路径去重（同一文件反复改只算一个产出），取最近一次的时间。
+     * op 一并带出来（收工兜底要它，见 bus.endTask）：SQLite 的 min/max 聚合规则里，
+     * 裸列取的是**聚合命中那一行**（也就是时间最近的那次）的值，所以这里的 op 是"最后一次操作"。
+     */
     listActivityInWindow: db.prepare(`
-      SELECT path, MAX(ts_ms) AS ts_ms FROM file_activity
+      SELECT path, op, MAX(ts_ms) AS ts_ms FROM file_activity
       WHERE member_id = ? AND ts_ms >= ? AND ts_ms <= ?
       GROUP BY path ORDER BY ts_ms DESC LIMIT ?
     `),

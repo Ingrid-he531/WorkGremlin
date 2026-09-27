@@ -83,6 +83,8 @@ const HTTP_ROUTES = Object.freeze({
   TASK_START: '/api/v1/task/start',
   TASK_PROGRESS: '/api/v1/task/progress',
   TASK_END: '/api/v1/task/end',
+  // 收工兜底（bug 3）：状态文件被并发覆盖丢了 taskId 时，hook 按会话回捞"当前在跑的任务"
+  TASK_CURRENT: '/api/v1/task/current',
   STATUS: '/api/v1/status',
   MESSAGE: '/api/v1/message',
   FILE_TOUCH: '/api/v1/file/touch',

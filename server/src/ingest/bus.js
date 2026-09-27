@@ -35,8 +35,14 @@ function memberIdOf(project, name) {
  * 合同见 hook 的 eventClient：非 plugin 直接返回 agent（codebuddy / codex / trae / …），
  * plugin 返回 agent + '-plugin'（codebuddy-plugin / codex-plugin / trae-plugin）。
  * 因此白名单同时认 base 与 base-plugin 两种形态；新加的产品补进 CLIENT_BASES 即可。
+ *
+ * **漏一个产品 = 它的成员 client 变 NULL，而"空 client 视作通用、哪层都显示"**
+ * （见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）—— 于是这个产品的成员会
+ * 出现在**每一个**楼层里。实测 2026-09-27：6F Qoder / 7F Kilo / 8F OpenCode 都不在名单里，
+ * qoder 那一行于是飘进了 1F 的工位卡片（members 表实测 client IS NULL）。
+ * 加楼层（products.js）时**必须**同步这里，别只改一半。
  */
-const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae'];
+const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
 const CLIENTS = new Set([...CLIENT_BASES, ...CLIENT_BASES.map((b) => `${b}-plugin`)]);
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
@@ -521,13 +527,27 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       }
       const startedAt = run ? Number(run.started_at) || null : null;
       const wsRow = repo.getProject.get(project);
-      const reportedFiles = Array.isArray(p.files) ? p.files : [];
+      let reportedFiles = Array.isArray(p.files) ? p.files : [];
+      // 兜底（bug 3）：hook 的状态文件被并发覆盖时 roundFiles 会变空 ——"修改的文件"整列空着。
+      // file_activity 里本来就有本轮每一条 file/touch 的真值，用任务窗口回捞一次补上。
+      if (!reportedFiles.length && startedAt) {
+        const act = repo.listActivityInWindow.all(member.id, startedAt, ts, 50);
+        // op 照 file_activity 里记的填（本库实测只有 'write'）。不认得的值留 null，
+        // 绝不统一编造成 'edit' —— 那是把"新增"说成"改动"，正踩「绝不编造」那条纪律。
+        // 删除类文件根本不进这张表，所以回捞这条路本来就拿不到删除项，认了就是。
+        if (act.length) reportedFiles = act.map((f) => ({ path: f.path, op: f.op === 'write' ? 'write' : null }));
+      }
       const filesJson = enrichFiles(wsRow ? wsRow.workspace_path : '', reportedFiles);
+      const fileCount = reportedFiles.length
+        ? reportedFiles.length
+        : Number.isFinite(Number(p.fileCount))
+          ? Number(p.fileCount)
+          : null;
       repo.endTaskRun.run({
         id: p.taskId,
         model: endModel,
         result: normText(p.result, RUN_RESULT_MAX),
-        fileCount: Number.isFinite(Number(p.fileCount)) ? Number(p.fileCount) : null,
+        fileCount,
         filesJson: filesJson ? JSON.stringify(filesJson) : null,
         endedAt: ts,
         durationMs: startedAt && ts > startedAt ? ts - startedAt : null,
@@ -591,6 +611,35 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   function currentMainTaskId(project) {
     const r = repo.mainRunningTask.get(projectIdOf(project));
     return r && r.taskId ? r.taskId : null;
+  }
+
+  /**
+   * 回捞：某成员当前进行中的任务（bug 3 兜底）。
+   *
+   * 场景：hook 的状态文件是"读-改-写"的，CLI 同一毫秒并行触发多个 hook 进程时会互相覆盖，
+   * taskId 被冲掉 → Stop 不发 task/end → 产出摘要 / 改动文件 / 结束时间整块丢，任务永远挂
+   * running（实测 2026-09-27 的 13:14 / 13:18 / 13:29 三条 codebuddy 任务全部如此）。
+   * 这里让 hook 按"本成员 + 本会话"回来问一次 —— 服务端 agent_status / tasks 里有真值。
+   *
+   * 保守口径：优先认**本会话**的那条；本会话对不上时，只有"全表只有一条且它没有会话标识"
+   * （老数据 / 无会话上报）才认 —— 绝不把另一条会话正在跑的任务误收掉。
+   */
+  function currentTaskFor(project, memberId, sessionId = '') {
+    const member = requireMember(projectIdOf(project), memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    const rows = repo.runningTaskForMember.all(member.id);
+    if (!rows.length) return { ok: true, taskId: null };
+    const want = normSession(sessionId);
+    let hit = want ? rows.find((r) => normSession(r.sessionId) === want) : null;
+    if (!hit && rows.length === 1 && (!want || !normSession(rows[0].sessionId))) hit = rows[0];
+    if (!hit) return { ok: true, taskId: null };
+    return {
+      ok: true,
+      taskId: hit.taskId,
+      title: hit.title || '',
+      sessionId: hit.sessionId || '',
+      startedAt: Number(hit.startedAt) || 0,
+    };
   }
 
   /**
@@ -917,6 +966,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     tagMemberClient,
     removeMember,
     currentMainTaskId,
+    currentTaskFor,
     startSubagentRun,
     endSubagentRun,
     heartbeat,
