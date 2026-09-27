@@ -124,7 +124,7 @@ function createAgentRoster(opts) {
       activeNames.clear();
       defined.clear();
       const keep = new Set();
-      for (const { name, client } of list) {
+      for (const { name, client, level } of list) {
         defined.add(name);
         keep.add(name);
         if (!mine.has(name)) {
@@ -132,7 +132,8 @@ function createAgentRoster(opts) {
             project,
             memberId: name,
             name,
-            role: 'subagent',
+            // 项目级 / 用户级 subagent 用不同的 role 码，前端映射成「项目子代理」/「用户子代理」
+            role: level === 'project' ? 'subagent:project' : 'subagent:user',
             sessionId: null,
             ephemeral: false,
             projectLabel: '',

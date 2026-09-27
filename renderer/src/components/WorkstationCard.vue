@@ -18,6 +18,18 @@ onUnmounted(() => clearInterval(timer));
 const agentId = computed(() => props.member.memberId.split('@')[0]);
 const elapsed = computed(() => formatDuration(tick.value - props.member.stateSince));
 const lastSeen = computed(() => formatDuration(tick.value - props.member.lastSeenAt));
+
+/** 角色文案：主 agent 与子代理在工位卡片上显示为中文；项目级 / 用户级子代理分开标注。 */
+const ROLE_LABELS = {
+  agent: '主代理',
+  'subagent:project': '项目子代理',
+  'subagent:user': '用户子代理',
+};
+const roleLabel = computed(() => {
+  const r = props.member.role;
+  if (!r) return '—';
+  return ROLE_LABELS[r] || (r === 'subagent' ? '用户子代理' : r);
+});
 </script>
 
 <template>
@@ -25,7 +37,7 @@ const lastSeen = computed(() => formatDuration(tick.value - props.member.lastSee
     <header>
       <div class="who">
         <h3>{{ member.name }}</h3>
-        <span class="role dim">{{ member.role || '—' }}</span>
+        <span class="role dim">{{ roleLabel }}</span>
       </div>
       <StatusBadge
         :state="member.state"
