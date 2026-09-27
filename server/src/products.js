@@ -35,7 +35,9 @@
  * Claude Code 同理只有一层（4F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、
  * 同一个落盘目录（~/.claude/projects），连二进制都是同一份 —— 事件 payload 里没有任何字段能
  * 区分二者（实测 2.1：不含 client，只有 session_id / cwd / transcript_path 这类共用字段）。
- * 既然"分不出"，就不该硬拆两层。
+ * 既然"分不出"，就不该硬拆两层。**形态**另说：这两个形态是同一层里的两条会话，
+ * 任务行上的 form（hook 从 transcript 的 entrypoint 认出来，见 hook.js 的 claudeForm）
+ * 标得出这一轮是 CLI 还是 VS Code 扩展 —— 那是任务列表的事，与楼层无关。
  *
  * **OpenCode 家族（7F Kilo Code / 8F OpenCode）也各只有一层**，而且是同一个理由的第三次复现，
  * 证据链（实测 2026-09-26，本机 Kilo Code 7.8.1 / OpenCode 2.0.18）：
@@ -543,7 +545,8 @@ const PRODUCTS = [
     agent: 'claude',
     plugin: false,
     // 只有一路 cli（~/.claude）：CLI 与 IDE 插件共用同一份配置、同一套 hook、同一份
-    // transcript，分不出，所以这一路同时代表两种形态 —— tooltip 里标 'CLI/Plugin'（类 3F）。
+    // transcript，**楼层**上分不出，所以这一路同时代表两种形态 —— tooltip 里标 'CLI/Plugin'（类 3F）。
+    // 任务列表那一层分得出（transcript 的 entrypoint → form，见 hook.js 的 claudeForm）。
     sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
     dataKind: clientOf('claude', false),
   },

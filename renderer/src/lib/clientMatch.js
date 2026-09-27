@@ -19,7 +19,8 @@ import { clientBase } from '@workgremlin/shared';
  * 无关：同一个产品的 CLI 与 Plugin 现在同属一层（1F CodeBuddy 就是这么合并的），
  * 常驻小怪物当然要跟着出现；codex 这种「CLI 与 IDE 合并成一层」的同理。
  * 所以按 **agent 基名**（剥掉 -plugin 后缀）匹配，不再精确区分 CLI / Plugin。
- * （claude 只有 4F 一层 —— 它的 CLI 与 IDE 插件共用同一份配置与 hook，payload 分不出二者。）
+ * （claude 只有 4F 一层 —— 它的 CLI 与 IDE 插件共用同一份配置与 hook、上报同一个 client；
+ * 两者是这一层里的两条会话，形态标在任务行的 form 上，与归层无关。）
  * client 为空的（演示数据 / 老库没补上 client 的）视作通用，哪层都显示。
  *
  * @param {string} floorClient 楼层身份（floor.client，如 codebuddy / codebuddy-plugin）
@@ -47,7 +48,8 @@ const CLIENT_LABELS = {
   'workbuddy-plugin': 'WorkBuddy Plugin',
   codex: 'Codex',
   'codex-plugin': 'Codex Plugin',
-  // Claude Code 只有一层（CLI 与 IDE 插件共用同一份 ~/.claude 配置与 hook，payload 分不出二者）
+  // Claude Code 只有一层（CLI 与 IDE 插件共用同一份 ~/.claude 配置、hook 与 client 身份）。
+  // 形态由 form 补出来：hook 从 transcript 的 entrypoint 认出（见 hook.js 的 claudeForm）
   claude: 'Claude Code',
   trae: 'TraeCode',
   'trae-plugin': 'TraeCode Plugin',
@@ -65,9 +67,9 @@ const CLIENT_LABELS = {
  * 把 client 字符串显示成友好的产品名；认不出的原样返回。
  *
  * `form` = 这一轮走的**形态**（'cli' / 'plugin'）：只有"CLI 与 IDE 插件共用一份落盘"的产品
- * 才需要它 —— 它们的 client 分不出两种形态（3F Codex 就是如此：hook 从 rollout 的
- * session_meta 认出来单独上报，见 packages/reporter/src/hook.js 的 codexForm），
- * 任务列表才能标成「Codex CLI / Codex Plugin」。
+ * 才需要它 —— 它们的 client 分不出两种形态（3F Codex、4F Claude Code 都是如此：hook 从会话
+ * 自己落的记录里认出来单独上报，见 packages/reporter/src/hook.js 的 codexForm / claudeForm），
+ * 任务列表才能标成「Codex CLI / Codex Plugin」「Claude Code CLI / Claude Code Plugin」。
  * 标签里已经带形态的（CodeBuddy CLI / CodeBuddy Plugin）不重复追加。
  */
 export function clientLabel(c, form) {

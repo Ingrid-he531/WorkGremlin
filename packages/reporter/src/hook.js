@@ -479,6 +479,41 @@ function fileOf(input, tool) {
 }
 
 /**
+ * 读会话落盘的**文件头**（64KB）并把前若干行解析成对象。
+ *
+ * 两家要的"形态"标记都在会话落盘的开头几行（Codex 的 session_meta 在第一行，Claude 的
+ * entrypoint 在第 3~5 行），所以只读一个窗口就够，别把整份 transcript 读进内存。
+ * 读窗口把某一行切断了就**停在那儿**：再往后是半截 JSON，继续解析只会读出假数据。
+ * @param {string} file
+ * @param {number} maxLines 最多看几行
+ * @returns {any[]} 解析成功的对象（顺序即文件顺序）
+ */
+function headJsonLines(file, maxLines = 20) {
+  if (!file || typeof file !== 'string') return [];
+  let head = '';
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    head = buf.slice(0, n).toString('utf8');
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const ln of head.split('\n').slice(0, maxLines)) {
+    const s = ln.trim();
+    if (!s) continue;
+    try {
+      out.push(JSON.parse(s));
+    } catch {
+      break; // 读窗口把这一行切断了：不猜
+    }
+  }
+  return out;
+}
+
+/**
  * 这条会话**是谁起的**：终端 CLI 还是 IDE 扩展（VS Code 插件）。
  *
  * Codex 的 rollout 第一行是 session_meta，里面写着（实测 0.155）：
@@ -486,30 +521,10 @@ function fileOf(input, tool) {
  *   {"type":"session_meta","payload":{"source":"vscode","originator":"codex_vscode"}}    ← VS Code 扩展
  * CLI 与 IDE 扩展共用同一份 ~/.codex、同一套 hook、同一个 client（3F 就是这么合并的），
  * 别处分不出这两种形态；任务列表要标「Codex CLI / Codex Plugin」只能靠这一行。
- * 只读文件头（64KB）就够 —— session_meta 在第一行，别把整份 rollout 读进内存。
  * @returns {'cli'|'plugin'|''} 认不出就回空（宁可什么都不标，也不猜）
  */
 function codexForm(transcriptPath) {
-  if (!transcriptPath || typeof transcriptPath !== 'string') return '';
-  let head = '';
-  try {
-    const fd = fs.openSync(transcriptPath, 'r');
-    const buf = Buffer.alloc(64 * 1024);
-    const n = fs.readSync(fd, buf, 0, buf.length, 0);
-    fs.closeSync(fd);
-    head = buf.slice(0, n).toString('utf8');
-  } catch {
-    return '';
-  }
-  for (const ln of head.split('\n').slice(0, 20)) {
-    const s = ln.trim();
-    if (!s) continue;
-    let obj;
-    try {
-      obj = JSON.parse(s);
-    } catch {
-      break; // 读窗口把这一行切断了：不猜
-    }
+  for (const obj of headJsonLines(transcriptPath)) {
     const p = obj && obj.payload;
     if (!p || typeof p !== 'object') continue;
     if (obj.type !== 'session_meta' && !p.source && !p.originator) continue;
@@ -517,6 +532,63 @@ function codexForm(transcriptPath) {
     if (/vscode|jetbrains|extension|plugin|visual studio/.test(who)) return 'plugin';
     if (who.trim()) return 'cli';
   }
+  return '';
+}
+
+/**
+ * Claude Code 这条会话**是谁起的**：终端 CLI 还是 VS Code 扩展（类 3F Codex）。
+ *
+ * transcript 的第 3~5 行就有 `entrypoint`（实测 2.1.283）：
+ *   {"type":"user","entrypoint":"cli",…}            ← 终端（在 IDE 的集成终端里敲 claude 也是它）
+ *   {"type":"user","entrypoint":"claude-vscode",…}  ← VS Code 扩展起的会话
+ * CLI 与 VS Code 扩展共用同一份 ~/.claude、同一套 hook、同一个 client（4F 就是这么合并的），
+ * 任务列表要标「Claude Code CLI / Claude Code Plugin」只能靠这一位。
+ *
+ * 为什么不去读 hook payload / 环境变量：
+ *   · payload 里根本没有这个字段 —— 实测每个事件只有 session_id / transcript_path / cwd /
+ *     permission_mode 这几个共用键，没有任何一位说得出"是谁起的"
+ *     （`~/.workgremlin/hooks/events.log` 里 Claude 的每一条都是 raw_ev_client: null）；
+ *   · CLAUDE_CODE_ENTRYPOINT 环境变量说的是同一件事（transcript 那一列就是它），但 hook 是
+ *     子进程，环境不保证原样继承 —— CLI 给部分子进程发环境时会把它**删掉**
+ *     （claude.exe 里 claude-vscode / claude-desktop 这几种 entrypoint 会被显式 delete
+ *     再起子进程），拿它当依据会时灵时不灵。
+ * 所以只能读会话自己落的这份记录 —— 它是会话级的真值（启动时写一次，全程一致），
+ * 也就是 Claude Code 自己在遥测里叫 `app.entrypoint` 的那一位。
+ *
+ * 只认"终端"与"VS Code 扩展"两种，其余（sdk-cli / mcp / remote / claude-desktop /
+ * local-agent / 老版本的 'other' …）**一律留空**：它们不是这个问题里的两种形态，
+ * 标错了比不标更糟（任务列表退回只写「Claude Code」）。
+ * 注意 JetBrains 插件报的就是 'cli' —— 官方文档明说它是"在 IDE 的**集成终端**里跑 claude
+ * 命令"（不自带 CLI、也没有自己的 entrypoint 值），所以它本来就是终端形态，不是漏认。
+ * @returns {'cli'|'plugin'|''} 认不出就回空（与 codexForm 同口径）
+ */
+function claudeForm(transcriptPath) {
+  for (const obj of headJsonLines(transcriptPath)) {
+    const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
+    if (!ep) continue;
+    // entrypoint 是会话级的常量，认到第一位就是答案（认不出也别接着往下猜）
+    if (ep === 'claude-vscode') return 'plugin';
+    return ep === 'cli' ? 'cli' : '';
+  }
+  return '';
+}
+
+/**
+ * 这一轮走的**形态**（'cli' / 'plugin'）：先看状态文件里缓存的，没有再回会话落盘里认。
+ *
+ * 认得出就由调用方写进状态文件（认一次，后续轮次直接用）；认不出（老版本 / 读不到落盘）
+ * 一律留空 —— 服务端存 NULL，任务列表退回只写产品名。两个调用点（开轮 / 收工）用同一个
+ * 口径，收工那一刀是"开轮时落盘还没写好"的兜底。
+ * @param {any} st 状态文件内容
+ * @param {any} ev hook 事件
+ * @returns {'cli'|'plugin'|''}
+ */
+function sessionForm(st, ev) {
+  const cached = String((st && st.form) || '');
+  if (cached === 'cli' || cached === 'plugin') return cached;
+  const tp = (ev && ev.transcript_path) || (st && st.transcriptPath) || '';
+  if (IS_CODEX) return codexForm(tp);
+  if (IS_CLAUDE) return claudeForm(tp);
   return '';
 }
 
@@ -1417,10 +1489,11 @@ async function main() {
     // 用户原话 = 剥掉 IDE 注入块之后的正文（见 userRequestText）
     const prompt = userRequestText(ev.prompt);
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
-    // 这一轮走的形态（CLI / IDE 插件）：Codex 的两种形态共用一份落盘、client 都是 codex，
-    // 只有 rollout 的 session_meta 分得出（见 codexForm）。认一次存进状态文件，后续轮次直接用。
+    // 这一轮走的形态（CLI / IDE 插件）：Codex（3F）与 Claude（4F）的两种形态都共用一份落盘、
+    // client 也相同，只有会话自己落的记录分得出 —— Codex 看 rollout 的 session_meta，
+    // Claude 看 transcript 的 entrypoint（见 codexForm / claudeForm）。认一次存进状态文件。
     const st0 = readState(file);
-    const form = IS_CODEX ? st0.form || codexForm(ev.transcript_path || st0.transcriptPath || '') : '';
+    const form = sessionForm(st0, ev);
     await register();
     // model 一并上报：报表要记这一轮用的是哪个模型（hook payload 没带就是空 → 服务端留 NULL）
     const started = await request(info, HTTP_ROUTES.TASK_START, {
@@ -1678,8 +1751,8 @@ async function main() {
     // 收工上报：把**这一轮的产出**一起交给服务端进台账（task_runs）——
     // 收尾自述 + 改动文件清单（含大小）+ 模型，报表要的"输入 / 产出 / 改了多少文件 / 用了什么模型"就齐了。
     if (taskId) {
-      // 收工时再认一次形态（开轮时 rollout 还没落盘 / 读不出时兜底）：TASK_END 与开轮同口径
-      const form = IS_CODEX ? st.form || codexForm(ev.transcript_path || st.transcriptPath || '') : '';
+      // 收工时再认一次形态（开轮时 rollout / transcript 还没落盘、读不出时兜底）：TASK_END 与开轮同口径
+      const form = sessionForm(st, ev);
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
         memberId: AGENT,
