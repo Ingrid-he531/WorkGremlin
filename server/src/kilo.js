@@ -27,8 +27,15 @@
  *   最新事件 part.type=tool 且 state.status=pending  → 等待授权（工具还没放行）
  *   最新事件 part.type=tool 且 state.status=error    → 出错了
  *   最新事件 part.type=reasoning                    → 思考中
- *   最新事件 part.type=step-finish                  → 汇总中
- *   最新事件 part.type=text / 长时间没事件           → 待命
+ *   最新事件 part.type=patch                        → 调用工具（正在落盘改动）
+ *   最新事件 part.type=text                          → 待命（刚吐完一段文字）
+ *   step-start / step-finish / 工具 completed         → **不是相位**，跳过继续往更旧处找
+ *
+ * 为什么 step-* 不映射成「规划中 / 汇总中」：实测一个会话里 step-start 363 次、
+ * step-finish 361 次（对照 tool 2677 次、text 463 次），基本是每轮 assistant 输出前后各一条
+ * —— 那是「一步」的边界**记账**，不是 agent 在规划或在收尾。硬套的后果是：每次工具刚跑完、
+ * 最新事件恰好落在 step-finish 上时，控制台就一直卡在「汇总中」—— 而那恰恰是
+ * "这一步跑完了、正要进入下一步"的时刻。推不出来就别推（见下方 step 分支的注释）。
  *
  * **纪律（对齐 requirements.md §P0-6「绝不编造」）**：一切相位都带 `inferred: true`。
  * 我们是**轮询**读它的库，不是它主动上报的，所以"上一条事件长什么样"只能推断"现在大致在干嘛"，
@@ -351,11 +358,20 @@ function readKiloPhase(sessionId) {
     if (type === 'reasoning') {
       return { phase: 'thinking', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
     }
-    if (type === 'step-start') {
-      return { phase: 'plan', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
-    }
-    if (type === 'step-finish') {
-      return { phase: 'summarize', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
+    // step-start / step-finish **不是相位**，跳过继续往更旧的事件找。
+    //
+    // 它们是「一步」的边界标记：实测一个会话里 step-start 363 次 / step-finish 361 次
+    // （对照 tool 2677 次、text 463 次）—— 基本是每轮 assistant 输出前后各一条。
+    // 早先这里把 step-start 映射成「规划中」、step-finish 映射成「汇总中」，后果是：
+    // 每次工具刚跑完、最新事件恰好落在 step-finish 上时，控制台就一直卡在「汇总中」
+    // （恰恰是"这一步跑完了、正要进入下一步"的时刻）。「规划中 / 汇总中」在相位词汇表里
+    // 指的是 agent 真的在规划 / 真的在收尾汇总，从这两个记账标记里**推不出来** ——
+    // 硬套就是编造相位（见 requirements.md §P0-6）。
+    //
+    // 跳过之后落到的那条才是真相位：下一条多半是 reasoning（思考中）或
+    // text（待命）；工具 completed 本身也走上面的 continue，同样往更旧处找。
+    if (type === 'step-start' || type === 'step-finish') {
+      continue;
     }
     if (type === 'text') {
       // 刚吐完一段文字 = 这一轮的输出阶段，往下（更旧）就是上一轮的事了

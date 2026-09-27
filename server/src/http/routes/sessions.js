@@ -70,22 +70,44 @@ function createSessionsRouter({ workspace }) {
     // 跟随 reporter 真实活动的最新工程，而不是 office 手工"打开工程"记的那个
     const ws = freshestReporterWs(cur.workspacePath || '', client, session);
 
-    // ---- 7F Kilo Code：另一条数据源，从 SQLite 推导，不走 hook 状态文件 ----
-    // Kilo 没有 hook 子系统，所以 reporterMainPhase / readReporterDone 那一套对它恒为空。
-    // 命中 Kilo 楼层（client 基名是 kilo）时改走 kilo.js：相位、instrumented、done 都从
-    // 它自己的库取。形态与下面完全一致，渲染层分不出也不需要分。
+    // ---- 7F Kilo Code：两条路，按 client 分 ——
+    //   · kilo-plugin（VS Code 扩展装了 WorkGremlin 插件）：**真相位优先、轮询兜底**
+    //     （与 8F OpenCode 同一套模式：插件把相位/完成标记写成 reporter 状态文件，
+    //     那是上报真值、不标 inferred，而且只有它能给「等待授权」—— Kilo 的 tool 状态
+    //     实测也只有 completed / error / running，没有 pending，轮询同样推不出等授权）。
+    //   · kilo（CLI / TUI，没装插件）：纯轮询，从它自己的 SQLite 推导（恒带 inferred）。
+    // 两条路的响应形状完全一致，渲染层分不出也不需要分。
     if (clientBase(client) === 'kilo') {
-      const rp = kiloMainPhase(ws || cur.workspacePath || '', session);
-      const sid = String(session || (rp && rp.sessionId) || '');
+      const fallbackWs = ws || cur.workspacePath || '';
+      // ---- 先问真相位：插件写的状态文件（与通用口径读的是同一份东西） ----
+      //
+      // **kilo 与 kilo-plugin 都要问**，不能只问后者：插件装在 CLI / TUI 上时，
+      // resolveClient() 按环境变量判出来是 `kilo`（只有扩展那三个变量才是 kilo-plugin），
+      // 而 CLI 一样会写状态文件、一样有「等待授权」。只认 kilo-plugin 的话，
+      // "CLI 装了插件"这个组合的真相位会被整条忽略、反而显示轮询推出来的相位 ——
+      // 装了插件反而更差。
+      const rpTruth = reporterMainPhase(ws, client, session);
+      const metaTruth = reporterStateMeta(ws, client, session);
+      const useTruth = Boolean(rpTruth && rpTruth.phase);
+      // ---- 兜底：轮询 kilo.db 的推导 ----
+      const rpPoll = useTruth ? null : kiloMainPhase(fallbackWs, session);
+      const rp = rpTruth && rpTruth.phase ? rpTruth : rpPoll;
+      const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
+
+      // 完成标记同理：插件那份带改动文件清单，轮询那份只有计数 —— 有就优先用插件的。
+      const doneTruth = readReporterDone(ws, client, phaseSessionId);
+      const done = doneTruth && doneTruth.at
+        ? doneTruth
+        : toReporterDone(phaseSessionId ? readKiloDone(phaseSessionId, { title: '', fileCount: 0 }) : null, phaseSessionId, fallbackWs);
+      // "接上了没有"：装了插件（状态文件在）**或**这条会话在库里 —— 两者任一即为真。
+      const instrumented = Boolean(metaTruth.instrumented || kiloInstrumented(phaseSessionId));
       return res.json({
         ok: true,
-        workspacePath: ws || cur.workspacePath || '',
-        instrumented: Boolean(session ? kiloInstrumented(session) : kiloInstrumented(rp && rp.sessionId)),
-        session: sid,
-        sessionId: sid,
-        // 走 toReporterDone：readKiloDone 给的是**会话表**形状，渲染层快轮询读的是
-        // fpDone.at / fpDone.sessionId —— 不转译的话这份「任务完成」永远不触发
-        done: toReporterDone(readKiloDone(sid), sid, ws || cur.workspacePath || ''),
+        workspacePath: useTruth ? ws || fallbackWs : fallbackWs,
+        instrumented,
+        session: session || phaseSessionId,
+        sessionId: phaseSessionId,
+        done: done || null,
         ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
       });
     }

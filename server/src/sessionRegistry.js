@@ -31,13 +31,15 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { listSessions, listReporterSessions, readReporterDones } = require('./sessions');
+const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
 // 7F Kilo Code：Kilo 没有 hook、没有会话 jsonl，会话/相位/完成标记由这里轮询它的 SQLite 推导
 const { listKiloSessions, readKiloPhase, readKiloDone } = require('./kilo');
 // 8F OpenCode：与 7F 同类（轮询 SQLite），但读的是 session_message 而不是 event 表
 const { listOpencodeSessions, readOpencodePhase, readOpencodeDone } = require('./opencode');
 const { detectProducts } = require('./products');
 const { resolveProjectName } = require('./project');
+// clientOf：7F 那支要按上报身份去问真相位（kilo-plugin / kilo 两个都试，见 kilo 分支的注释）
+const { clientOf } = require('@workgremlin/shared');
 
 /** 超过这么久没有事件 → 从表里移除 */
 const TIMEOUT_MS = 60 * 60_000;
@@ -482,13 +484,30 @@ function refresh({ workspacePath = '', force = false } = {}) {
           // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook 两路完全一致
           if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
           const ph = readKiloPhase(s.id) || null;
+          // ---- 装了 WorkGremlin 插件吗？装了就用它上报的**真值** ----
+          //
+          // 7F 有两路：轮询（这一支，永远在场）与插件写的状态文件。真相位要压过轮询推导，
+          // 但**不靠 sources 的顺序**（claim 先到先得，hook 那一支沿用老约定只报
+          // 'unreported'，让它先 claim 反而信息更少），而是这一支自己去问一句。
+          //
+          // 两个 client 都要试：插件装在 VS Code 扩展上判出来是 kilo-plugin，
+          // 装在 CLI / TUI 上判出来是 **kilo**（见 plugin/index.js 的 resolveClient）——
+          // 只试前者的话「CLI 装了插件」这个组合的真相位就白写了。
+          const wsOfSession = s.projectPath || workspacePath;
+          const truth =
+            reporterMainPhase(wsOfSession, clientOf('kilo', true), s.id) ||
+            reporterMainPhase(wsOfSession, clientOf('kilo', false), s.id) ||
+            null;
+          // 完成标记同理：插件那份带改动文件清单，轮询那份只有计数
+          const doneTruth = readReporterDone(wsOfSession, clientOf('kilo', true), s.id);
+          const donePoll = readKiloDone(s.id, s);
           upsert({
             floor: p.id,
             id: s.id,
             // 轴 2：Kilo 的 ses_xxx 就是它自己的 session_id（与 message.session_id、
             // event.aggregate_id、文件名 ses_f2261460….json 三处一致）
             sessionId: s.id,
-            source: 'kilo',
+            source: truth ? 'kilo-plugin' : 'kilo',
             /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
             sourceKind: 'kilo',
             project: s.project,
@@ -497,17 +516,18 @@ function refresh({ workspacePath = '', force = false } = {}) {
             current: false,
             // Kilo 没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
             live: true,
-            // 相位来自 kilo.js 对 event 流的推导（见那里的新鲜度口径）——
-            // 它是**推断**（我们是轮询，不是它主动报的），所以 inferred 一律 true。
-            phase: ph ? ph.phase : 'unreported',
-            action: ph ? ph.action : '',
-            target: ph ? ph.target : '',
-            tool: ph ? ph.tool : '',
-            context: ph ? ph.context : [],
-            prompt: '',
-            inferred: true,
-            // 完成标记：Kilo 那边等价于"assistant 消息 finish=stop"（见 kilo.js）
-            ...readKiloDone(s.id, s),
+            // 相位：插件在 → 用它的真值（不标 inferred，UI 不灰显）；不在 → 用轮询推导的
+            phase: truth ? truth.phase : ph ? ph.phase : 'unreported',
+            action: truth ? truth.action || '' : ph ? ph.action : '',
+            target: truth ? truth.target || '' : ph ? ph.target : '',
+            tool: truth ? truth.tool || '' : ph ? ph.tool : '',
+            context: truth ? truth.context || [] : ph ? ph.context : [],
+            prompt: truth ? truth.prompt || '' : '',
+            // **只有轮询推导才标 inferred**（我们是轮询，不是它主动报的）；
+            // 插件上报的是真值，标 true 会让 UI 把上报也灰显掉。
+            inferred: !truth,
+            // 完成标记：插件那份带 files 清单（doneTruth），没有才用轮询那份
+            ...(doneTruth && doneTruth.at ? doneTruth : donePoll),
             lastEventAt: s.lastEventAt,
           });
         }

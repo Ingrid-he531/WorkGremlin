@@ -238,13 +238,22 @@ npm run hooks:install -- --targets=qoder  # 只装 Qoder
   补「思考中 / 已完成」粗粒度相位（`packages/reporter/src/hook.js`），6F 不会再一直显示「未上报」；
   相位精度比 Claude 粗——等 Qoder 开放细粒度事件后自动变细，无需改 hook 逻辑。
 
-### Kilo Code 接入（7F：没有 hook，靠轮询它自己的 SQLite）
+### Kilo Code 接入（7F：轮询打底 + 插件给真相位与台账）
 
 **Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何
 `hooks.json` 或可挂命令的事件点）。所以 7F 不进 `install-hooks.js` 的安装列表 ——
 没有 hook 可装，也**不应该**在 Kilo 的配置里写任何东西。
 
-它靠**轮询**自己的落盘接进来，全部逻辑在 `server/src/kilo.js`：
+7F 有**两路**，装的形态决定你拿到哪一路：
+
+| | 轮询打底（永远在场） | 插件真相位 + 台账（装了才有） |
+| --- | --- | --- |
+| 装法 | 零配置 | 把 `packages/reporter/src/plugin/index.js` 放进 `.kilo/plugins/`，或 `~/.config/kilo/kilo.jsonc` 的 `plugins` |
+| 上报身份 | — | `kilo-plugin`（VS Code 扩展）/ `kilo`（CLI / TUI） |
+| 相位 | 从 event 流**推导**，`inferred:true` 灰显 | 事件流**真值**，不灰显，且能给「等待授权」 |
+| 任务台账 | ❌ 不记 | ✅ 记（成员 / 任务 / 对话记录 / 文件活动 / 幽灵） |
+
+**轮询那一路**（全部逻辑在 `server/src/kilo.js`）：
 
 - **落盘是 event-sourced SQLite**（`~/.local/share/kilo/kilo.db`，WAL 模式）。我们**只读**打开，
   不阻塞 Kilo 自己的 daemon。数据根按 XDG 位置认（`kiloHome()`）——
@@ -260,7 +269,39 @@ npm run hooks:install -- --targets=qoder  # 只装 Qoder
 - **只读一次、坏表不冒泡**：表结构对不上（Kilo 改版）时回空，楼层照常列出，只是没会话 ——
   绝不把每 1.5s 一次的 `/reporter-phase` 轮询打挂。
 
-不需要任何安装动作，WorkGremlin 起来就看得见 7F。自检：`npm run test:kilo`。
+**CLI 为什么不记任务台账**：轮询是**只读**的，监控端伪造上报就违背"绝不编造"。所以
+7F 的任务列表 / 对话记录**只有装了插件才有内容** —— 这是刻意的，不是没做完。
+
+**装法**（Kilo 用的是 `"plugin": ["<绝对路径>"]` —— **字符串数组、单数键**；文件头注释里那套
+`plugins: [{ package, options }]` 是 OpenCode 的形状，Kilo 会报 `Unrecognized key: plugins`，
+`kilo plugin <module>` 也只收 npm 模块名、不收本地路径）：
+
+```bash
+npm run hooks:install -- --targets=kilo-plugin              # 写 ~/.config/kilo/kilo.jsonc
+npm run hooks:install -- --targets=kilo-plugin --dry-run    # 先看一眼
+npm run hooks:install -- --targets=kilo-plugin --uninstall  # 撤掉（备份在 kilo.jsonc.bak-workgremlin）
+```
+
+改完要**重开 Kilo 会话**才加载。
+
+**事件契约以实测为准**（Kilo 7.8.1，探针跑出来的）：信封是 `{ id, type, properties }`，
+事件只有 `session.created` / `session.updated` / `message.updated` / `message.part.updated` /
+`session.status` / `session.idle` / `session.drained` / `session.diff` / `*.delta` 这几类。
+**不是** `session.tool.called` / `session.execution.succeeded` 那一套 —— 按那套写会「装得上、
+加载不报错、但一条记录都不来」。派生态：任务起于 `role=user` 的 text part、收于 assistant 的
+`finish=stop`（`finish=tool-calls` 只是消息到工具处断了、整轮未完）、「等待授权」看 tool 的
+`state.status==='pending'`、改动文件看 `session.diff`。
+
+**插件那一路**（`packages/reporter/src/plugin/index.js`，8F OpenCode 共用同一份）除了相位，
+还往台账上报：`register`（带 `role:agent`，否则 `task_runs` 不会写）、`task/start`、
+`task/end`（带 result 与本轮改动文件）、`message`（收尾自述）、`file/touch`（只报**写类**工具），
+以及 subagent 幽灵（`task` 工具召唤时写 `.workgremlin/subagents.json`，与 `hook.js` 共用
+`ghostFeed.js` 那一份格式实现）。没有标题就不传 `result` —— 事件流里没有"最后一段
+assistant 文本"这个信号，拿文件清单拼一句"完成了 N 个文件"属于**编造自述**，不做。
+
+自检：`npm run test:kilo`（楼层/相位推导）、`npm run test:plugin-ingest`（台账上报，
+打假服务端）、`npm run test:plugin-e2e`（**真起一个服务端**跑通整条链，沙箱 HOME，不碰你的库）、
+`npm run test:ghost`（幽灵清单格式）。
 
 ### OpenCode 接入（8F：轮询打底 + 插件给真相位）
 

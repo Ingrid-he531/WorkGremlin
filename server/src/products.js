@@ -626,18 +626,35 @@ const PRODUCTS = [
     // 产品基名：上报身份 client=kilo（shared 的 clientOf 合同，见 shared/index.js）
     agent: 'kilo',
     plugin: false,
-    // Kilo Code（7F）是**纯轮询楼层**（与 8F OpenCode 同类，取法各自不同）：
-    // Kilo 没有 hook 子系统（实测 7.8.1 —— 没有 hooks.json、没有任何可挂命令的事件点），
-    // 所以既没有 hook 上报，也没有可扫的会话 jsonl：会话、相位、完成标记全部由服务端
-    // 轮询它自己的 event-sourced SQLite 推导（见 server/src/kilo.js）。
+    // Kilo Code（7F）是**两路**楼层（与 8F OpenCode 同类，取法各自不同）：
+    //   · CLI / TUI（没装 WorkGremlin 插件）：纯轮询，从它自己的 event-sourced SQLite 推导
+    //     （见 server/src/kilo.js）。Kilo 没有 hook 子系统（实测 7.8.1 —— 没有 hooks.json、
+    //     没有任何可挂命令的事件点），所以这一路既没有 hook 上报，也没有可扫的会话 jsonl：
+    //     会话、相位、完成标记全部由服务端轮询它自己的库推导，恒带 inferred。
+    //   · VS Code 扩展（装了 WorkGremlin 插件）：插件订阅 Kilo 的内存事件流，把相位/完成标记
+    //     写成 reporter 状态文件（见 packages/reporter/src/plugin/）。那是**上报真值**
+    //     （不标 inferred、UI 不灰显），而且只有它能给「等待授权」—— Kilo 的 tool 状态
+    //     实测也只有 completed / error / running，没有 pending，轮询同样推不出等授权。
+    //     插件实例的上报身份是 kilo-plugin（扩展起 server 时带 KILO_CLIENT=vscode 等，
+    //     见 plugin/index.js 的 resolveClient），与 CLI 的 kilo 分开。
+    // 两路的会话都来自同一个 kilo.db（扩展不另起数据，见文件头），按 session_id 去重。
     // 唯一一路来源：
     //   kilo —— 轮询数据根里的 kilo.db（session + event + message 三张表）产会话，同时带上
     //           数据根（XDG 位置，见 kilo.js 的 kiloHome）作落盘统计：目录里有日志/快照/会话库，
     //           但会话不是"扫文件"能得到的，所以那一行的文件数/体积只作展示（见下面的 note）。
+    //   hook —— 装了插件时的真相位一路（client=kilo-plugin）。
     // label 标 'CLI/Plugin'：这一层同时代表 Kilo Code 的 CLI 与 VS Code 扩展 ——
     // 扩展自带同一个二进制、共用同一个数据根（见文件头），落盘里没有平台字段可分。
     // kind 用 'kilo' 而不是复用 'cli'：CLI 那一路是"扫 *.jsonl"，Kilo 是"读 SQLite"，
     // 两种完全不同的取法，别让 sessionRegistry 里两条分支互相误认。
+    // 顺序：kilo（轮询，永远在场）→ hook（插件在场时的真相位）。
+    // **hook 放后面是有意的**：sessionRegistry 里 claim() 先到先得，而 hook 那一支
+    // 沿用 1F~6F 的老约定 —— 它的会话行只报 phase:'unreported'（见 sessionRegistry 的
+    // 「相位不在这里造」注释），实时相位由 /reporter-phase 快轮询单独给。
+    // 若让 hook 先 claim，同一条会话的 /sessions 行就变成"未上报"，比轮询推导出的
+    // 灰显相位信息量还少（实测：调换后 kiloPluginE2E 的 [4] 变成 unreported）。
+    // 真相位要压过轮询推导，不靠 claim 顺序，而是靠 sessionRegistry 的 kilo 那一支
+    // **自己去问 reporterMainPhase**（见那里「装了插件就用真值」那段）。
     sources: [
       {
         kind: 'kilo',
@@ -646,6 +663,11 @@ const PRODUCTS = [
         dirs: [kiloHome()],
         note: '这一路读的是数据根里的 kilo.db（SQLite），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
       },
+      // hook 那一路：装了 WorkGremlin 插件时的真相位一路。插件实例的上报身份是 kilo-plugin
+      // （扩展起 server 时带 KILO_CLIENT=vscode 等，见 plugin/index.js 的 resolveClient），
+      // 所以这一路显式挂 kilo-plugin —— 让 listReporterSessions / readReporterDone 能认到
+      // 插件写的状态文件（否则按 kind 推出的 kilo 把插件的相位当成别层的）。
+      { kind: 'hook', client: clientOf('kilo', true) },
     ],
     // 老口径的标记：会话来源既不是 hook 状态文件、也不是 jsonl，就是"轮询 Kilo 自己的库"
     hookSource: true,
@@ -678,6 +700,11 @@ const PRODUCTS = [
     // 8F 是"读 session_message"，三种取法别互相误认。
     // label 标 'CLI/Desktop'：这一层同时代表 OpenCode 的 CLI/TUI、桌面端与网页端 ——
     // 同一个二进制、同一个数据根（见文件头与 renderer/src/lib/clientMatch.js 的说明）。
+    //
+    // CLI/Plugin 区分：OpenCode 的 CLI 与 VS Code 扩展共用同一个二进制、同一个数据根，
+    // 但插件实例的上报身份是 opencode-plugin（扩展起 server 时带 OPENCODE_CLIENT=vscode 等，
+    // 见 plugin/index.js 的 resolveClient），与 CLI 的 opencode 分开。
+    // 任务记录通过 form 字段（'cli'/'plugin'）区分两种形态。
     sources: [
       {
         kind: 'opencode',
@@ -686,7 +713,11 @@ const PRODUCTS = [
         dirs: [opencodeHome()],
         note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
       },
-      { kind: 'hook' },
+      // hook 那一路：装了 WorkGremlin 插件时的真相位一路。插件实例的上报身份是 opencode-plugin
+      // （扩展起 server 时带 OPENCODE_CLIENT=vscode 等，见 plugin/index.js 的 resolveClient），
+      // 所以这一路显式挂 opencode-plugin —— 让 listReporterSessions / readReporterDone 能认到
+      // 插件写的状态文件（否则按 kind 推出的 opencode 把插件的相位当成别层的）。
+      { kind: 'hook', client: clientOf('opencode', true) },
     ],
     hookSource: true,
     dataKind: clientOf('opencode', false),
@@ -765,7 +796,10 @@ function detectSource(p, spec, clients) {
     kind: spec.kind,
     /** 前端显示名（'IDE' / 'plugin' …）；空则由前端按 kind 显示 */
     label: spec.label || '',
-    client: spec.kind === 'hook' ? clients.join(',') : sourceClient(p, spec),
+    // hook 那一路（以及 kilo 那一路）按**整层**过滤：会话就是状态文件本身 / 同一个库，
+    // 合并楼层的两种身份（kilo / kilo-plugin）都属于这一层。单独传一个 client 会让
+    // "插件形态跑在 IDE 里"的那种会话漏掉（doneFieldsOf 查不到 kilo-plugin 的完成标记）。
+    client: (spec.kind === 'hook' || spec.kind === 'kilo') ? clients.join(',') : sourceClient(p, spec),
     /** 这一路产不产会话：'dir' = 只作落盘展示（目录里有东西，但读不出会话） */
     sessions: spec.kind !== 'dir',
     dataPath,

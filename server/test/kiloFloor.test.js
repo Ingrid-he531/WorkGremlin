@@ -150,18 +150,26 @@ const SID = 'ses_kilo_0001';
 
 /* ------------------------------ A. 楼层表 ------------------------------ */
 
-head('[A1] 7F 只有一层 Kilo Code：clients = kilo，一路来源（kilo 轮询 SQLite 产会话）');
+head('[A1] 7F 只有一层 Kilo Code：clients = kilo + kilo-plugin，两路来源（kilo 轮询 + hook 插件）');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '7F');
   ok('7F 这一层存在', Boolean(floor), '楼层表里没有 7F');
-  ok('7F 名叫 Kilo Code', floor && floor.name === 'Kilo Code', floor && floor.name);
-  ok('这一层只接纳 kilo 一种上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['kilo']), floor && JSON.stringify(floor.clients));
+  ok('7F 名名叫 Kilo Code', floor && floor.name === 'Kilo Code', floor && floor.name);
   ok(
-    '一路来源：kilo（轮询数据根里的 SQLite 产会话），tooltip 里标 CLI/Plugin',
-    floor && JSON.stringify(floor.sources.map((s) => s.kind)) === JSON.stringify(['kilo']) && floor.sources[0].label === 'CLI/Plugin',
+    '这一层接纳两种上报身份：kilo（CLI/TUI）与 kilo-plugin（VS Code 扩展装了 WorkGremlin 插件）',
+    floor && JSON.stringify(floor.clients) === JSON.stringify(['kilo', 'kilo-plugin']),
+    floor && JSON.stringify(floor.clients)
+  );
+  ok(
+    '两路来源：kilo（轮询数据根里的 SQLite 产会话，tooltip 里标 CLI/Plugin）+ hook（插件的真相位）',
+    floor &&
+      JSON.stringify(floor.sources.map((s) => `${s.label || s.kind}:${s.kind}`)) ===
+        JSON.stringify(['CLI/Plugin:kilo', 'hook:hook']),
     floor && JSON.stringify(floor.sources.map((s) => `${s.label || s.kind}:${s.kind}`))
   );
   ok('kilo 那一路产会话，不标 sessions:false', floor && floor.sources.every((s) => s.sessions !== false), floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
+  ok('hook 那一路也产会话（插件写的状态文件）', floor && floor.sources.find((s) => s.kind === 'hook') && floor.sources.find((s) => s.kind === 'hook').sessions !== false, floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
+  ok('hook 那一路按整层过滤：client = kilo,kilo-plugin（合并楼层两路都认）', floor && floor.sources.find((s) => s.kind === 'hook').client === 'kilo,kilo-plugin', floor && JSON.stringify(floor.sources.find((s) => s.kind === 'hook')));
 }
 
 head('[A2] 装了 kilo 可执行文件就算"装了"；数据根是 XDG 位置');
@@ -280,6 +288,36 @@ head('[B6] 陈旧事件不算"正在说话"：几小时前那条 text 事件让�
   ok('陈旧事件的相位是 idle（待命）', ph && ph.phase === 'idle', ph && ph.phase);
 }
 
+// [B7] step-start / step-finish 不是相位。
+// 这两条在真实会话里极 frequent（实测一个会话 step-start 363 次 / step-finish 361 次，
+// 对照 tool 2677 次）—— 它们是「一步」的边界记账。早先映射成「规划中 / 汇总中」，
+// 后果是每次工具刚跑完、最新事件恰好落在 step-finish 上时控制台就一直卡在「汇总中」。
+head('[B7] step-finish / step-start 不许变成「汇总中 / 规划中」');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  seq = 0;
+  // 刚跑完一个工具 → 紧接着就是 step-finish（这正是"卡在汇总中"的那个时刻）
+  addEvent(db, SID, { type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'npm test' } }, time: { start: Date.now() - 6000, end: Date.now() - 5000 } });
+  addEvent(db, SID, { type: 'step-finish' });
+  db.close();
+  const ph = kilo.readKiloPhase(SID);
+  ok('step-finish 不产生 summarize', !(ph && ph.phase === 'summarize'), ph && ph.phase);
+  ok('step-finish 不产生 plan', !(ph && ph.phase === 'plan'), ph && ph.phase);
+  // 跳过 step-* 之后应落到更旧的真实事件上：刚跑完工具、还没开始下一轮 → 待命
+  ok('跳过 step-* 后落到待命（不是硬套一个相位）', ph && ph.phase === 'idle', ph && ph.phase);
+
+  const db2 = new Database(DB);
+  db2.prepare('DELETE FROM event').run();
+  seq = 0;
+  addEvent(db2, SID, { type: 'step-start' });
+  addEvent(db2, SID, { type: 'reasoning', text: '想一下', time: { start: Date.now() - 3000, end: Date.now() - 2000 } });
+  db2.close();
+  const ph2 = kilo.readKiloPhase(SID);
+  ok('step-start 之前的 reasoning 仍然是思考中', ph2 && ph2.phase === 'thinking', ph2 && ph2.phase);
+  ok('step-start 不产生 plan', !(ph2 && ph2.phase === 'plan'), ph2 && ph2.phase);
+}
+
 head('[C4] 过期的完成标记（DONE_TTL_MS 之外）→ 当没有');
 {
   const db = new Database(DB);
@@ -311,6 +349,61 @@ head('[D1] 库缺 event/message 表（Kilo 改版换表）→ 楼层仍列出，
   // 相位 / 完成标记同样不许抛：缺表时回"没有"，不是把 1.5s 一次的轮询打挂
   ok('相位读不出时回 null，不抛', kilo.readKiloPhase(SID) === null, String(kilo.readKiloPhase(SID)));
   ok('完成标记读不出时回空，不抛', kilo.readKiloDone(SID, {}).doneAt === 0, JSON.stringify(kilo.readKiloDone(SID, {})));
+}
+
+/* ------------------------------ E. 两路合起来 ------------------------------ */
+
+head('[E] 装了 WorkGremlin 插件时：kilo-plugin 的状态文件被认出（真相位优先于轮询）');
+{
+  // sessions / sessionRegistry **必须在取任何时间戳之前**加载：它们在模块加载那一刻记下
+  // SERVER_STARTED_AT（"重启纪元"），而 readReporterPhase 只采信本进程启动之后写入的相位
+  // （sessions.js 里那句 `if (sp.ts < SERVER_STARTED_AT) continue`）。
+  // 反过来先算时间戳再 require 的话，写进去的相位永远早于 SERVER_STARTED_AT，
+  // 会被当成上次运行的残留拒掉 —— 那样 [E] 永远测不到真相位那一路。
+  const { reporterMainPhase, reporterStateMeta, readReporterDone } = require('../src/sessions');
+
+  // 恢复好数据根：这一段测的是"插件写的状态文件"，跟上面那份库无关
+  process.env.WORKGREMLIN_KILO_HOME = KILO_HOME;
+  // 先把库重建成"正在调用工具"（[B6] 那一段把事件清成 3 小时前的陈旧 text 了，
+  // 否则轮询那份会是 idle，测不出"插件没装时就是它兜底"那条）。
+  {
+    const db = new Database(DB);
+    db.prepare('DELETE FROM event').run();
+    seq = 0;
+    addEvent(db, SID, { type: 'text', text: '先看一眼', time: { start: Date.now() - 40_000, end: Date.now() - 39_000 } });
+    addEvent(db, SID, { type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'npm run test:kilo' } }, time: { start: Date.now() - 5_000 } });
+    db.close();
+  }
+
+  const at = Date.now();
+  const sid = SID;
+  const key = ['kilo-plugin', WS, sid].join('@').replace(/[^a-zA-Z0-9._-]/g, '_');
+  fs.mkdirSync(WG, { recursive: true });
+  fs.mkdirSync(path.join(WG, 'hooks'), { recursive: true });
+  fs.writeFileSync(
+    path.join(WG, 'hooks', `${key}.json`),
+    JSON.stringify({
+      client: 'kilo-plugin',
+      sessionId: sid,
+      hb: { lastEventAt: at },
+      sessionPhase: { phase: 'await', ts: at, workspacePath: WS, tool: 'write', target: `${WS}/z.txt` },
+      done: { at, title: '插件这一轮', fileCount: 2, files: ['a.ts', 'b.ts'], workspacePath: WS, sessionId: sid },
+    })
+  );
+
+  const rpTruth = reporterMainPhase(WS, 'kilo-plugin', sid);
+  const metaTruth = reporterStateMeta(WS, 'kilo-plugin', sid);
+  const rpPoll = kilo.kiloMainPhase(WS, sid);
+  ok('插件那份相位是 await（轮询给不出的那一相位）', rpTruth && rpTruth.phase === 'await', rpTruth && rpTruth.phase);
+  ok('轮询那份仍在（tool）—— 插件没装时就是它兜底', rpPoll && rpPoll.phase === 'tool', rpPoll && rpPoll.phase);
+  ok('真相位优先：useTruth 成立', Boolean(rpTruth && rpTruth.phase));
+  ok('instrumented 为真（状态文件在）', Boolean(metaTruth.instrumented));
+  const done = readReporterDone(WS, 'kilo-plugin', sid);
+  ok('插件那份完成标记带**改动文件清单**', done && done.at && Array.isArray(done.files) && done.files.length === 2, JSON.stringify(done));
+  ok('完成标记用 reporter 形状（渲染层读 fpDone.at / fpDone.sessionId）', done && typeof done.at === 'number' && done.sessionId === sid, JSON.stringify(done && Object.keys(done)));
+
+  // 清掉插件状态文件，避免污染 [D] 那一段（它会去扫 hooks 目录）
+  fs.rmSync(path.join(WG, 'hooks', `${key}.json`), { force: true });
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

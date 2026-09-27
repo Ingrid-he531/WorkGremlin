@@ -75,6 +75,8 @@ let AGENT = '';
 let IS_CODEX = false;
 /** Claude Code（--agent claude）。与 CodeBuddy 的差别见 header 的"各家差异"一段 */
 let IS_CLAUDE = false;
+/** Qoder（--agent qoder）。CLI 与插件共用同一份 ~/.qoder，但 transcript 里带 entrypoint（同 Claude Code 格式） */
+let IS_QODER = false;
 
 /**
  * **轴 2（会话）**：本次事件所属的会话 id，取自 payload 的 `session_id`。
@@ -574,6 +576,30 @@ function claudeForm(transcriptPath) {
 }
 
 /**
+ * Qoder 这条会话**是谁起的**：终端 CLI 还是 VS Code 扩展（类 4F Claude Code）。
+ *
+ * Qoder 的 transcript 格式与 Claude Code 同款（~/.qoder/projects/<工程>/<会话>.jsonl），
+ * 首行 user 记录里带 entrypoint 字段：
+ *   {"type":"user","entrypoint":"cli",…}            ← 终端
+ *   {"type":"user","entrypoint":"qoder-vscode",…}  ← VS Code 扩展（qoder-context 等插件）
+ * CLI 与插件共用同一份 ~/.qoder、同一套 hook、同一个 client（6F 就是这么合并的），
+ * 任务列表要标「Qoder CLI / Qoder Plugin」只能靠这一位。
+ *
+ * @returns {'cli'|'plugin'|''} 认不出就回空（与 codexForm / claudeForm 同口径）
+ */
+function qoderForm(transcriptPath) {
+  for (const obj of headJsonLines(transcriptPath)) {
+    const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
+    if (!ep) continue;
+    // entrypoint 是会话级的常量，认到第一位就是答案（认不出也别接着往下猜）
+    // Qoder 插件可能报 'qoder-vscode' 或 'vscode'，统一识别为 plugin
+    if (ep.includes('vscode') || ep.includes('plugin')) return 'plugin';
+    return ep === 'cli' ? 'cli' : '';
+  }
+  return '';
+}
+
+/**
  * 这一轮走的**形态**（'cli' / 'plugin'）：先看状态文件里缓存的，没有再回会话落盘里认。
  *
  * 认得出就由调用方写进状态文件（认一次，后续轮次直接用）；认不出（老版本 / 读不到落盘）
@@ -589,6 +615,7 @@ function sessionForm(st, ev) {
   const tp = (ev && ev.transcript_path) || (st && st.transcriptPath) || '';
   if (IS_CODEX) return codexForm(tp);
   if (IS_CLAUDE) return claudeForm(tp);
+  if (IS_QODER) return qoderForm(tp);
   return '';
 }
 
@@ -1367,6 +1394,7 @@ async function main() {
   }
   IS_CODEX = AGENT === 'codex';
   IS_CLAUDE = AGENT === 'claude';
+  IS_QODER = AGENT === 'qoder';
 
   const info = readServerInfo();
   if (!info || !info.port) {
@@ -1476,7 +1504,29 @@ async function main() {
     // 不补一笔"会话进行中"的粗粒度真值，主控制台只会一直显示「未上报」。Claude / CodeBuddy 有
     // 细粒度事件随后把相位推进到 thinking / tool，不受这句影响。
     if (AGENT === 'qoder') {
+      // Qoder 不发 UserPromptSubmit / Stop，form 检测与 TASK_START 永远不会在那两条路径里触发 ——
+      // 只能在 SessionStart 里补做（类 3F Codex 的 UserPromptSubmit 那一刀）。
+      // transcript 在 SessionStart 时可能还没落盘（entrypoint 写不进），先试一次、认不出留空，
+      // SessionEnd 时再兜底认一次（见下方 SessionEnd 的 Qoder 段）。
+      const qForm = sessionForm(null, ev);
+      if (qForm) writeState(file, { form: qForm });
+      const started = await request(info, HTTP_ROUTES.TASK_START, {
+        ...base,
+        memberId: AGENT,
+        title: 'Qoder Session',
+        model: '',
+        form: qForm,
+      });
+      const qPatch = { taskTitle: 'Qoder Session', done: null, roundFiles: [] };
+      if (qForm) qPatch.form = qForm;
+      if (started && started.taskId) {
+        qPatch.taskId = started.taskId;
+        qPatch.taskWorkspacePath = REAL_WS;
+        qPatch.taskStartedAt = Date.now();
+      }
+      writeState(file, qPatch);
       writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
+      await status('thinking');
     }
     return;
   }
@@ -1864,6 +1914,27 @@ async function main() {
     );
     // Qoder 没有 Stop（只有 SessionStart / SessionEnd），收尾给一个"已完成"的粗粒度相位，
     // 否则 sessionPhase 回落成 null，主控制台又会显示「未上报」。其它产品维持原状（null）。
+    // Qoder 的 TASK_END 也只能在这里补（Stop 那一刀永远不会触发）：
+    // 再认一次 form（SessionStart 时 transcript 可能还没落盘，此时兜底），
+    // 然后调 TASK_END 把"会话结束"告诉服务端。
+    if (AGENT === 'qoder') {
+      const qFormEnd = sessionForm(stEnd, ev);
+      if (qFormEnd && qFormEnd !== stEnd.form) writeState(file, { form: qFormEnd });
+      const qTaskId = stEnd.taskId;
+      if (qTaskId) {
+        await request(info, HTTP_ROUTES.TASK_END, {
+          ...base,
+          memberId: AGENT,
+          taskId: qTaskId,
+          state: 'done',
+          model: '',
+          result: '',
+          files: [],
+          fileCount: 0,
+          form: qFormEnd || stEnd.form || '',
+        });
+      }
+    }
     writeState(file, {
       await: null,
       pending: null,

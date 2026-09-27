@@ -35,6 +35,11 @@ const { execSync } = require('node:child_process');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const HOOK_SCRIPT = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'hook.js');
+/**
+ * WorkGremlin 自己的 OpenCode / Kilo 插件（上报真相位 + 台账的那一份）。
+ * 7F Kilo / 8F OpenCode 没有 hook 子系统可挂，只能以「插件」形态注册进它们的配置。
+ */
+const PLUGIN_ENTRY_FILE = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'plugin', 'index.js');
 
 /**
  * matcher 为 null 表示这个事件不吃 matcher（UserPromptSubmit / Stop）。
@@ -180,6 +185,46 @@ function readSettings(file) {
   } catch {
     return null;
   }
+}
+
+/* ------------------------------ 插件形态（7F Kilo / 8F OpenCode） ------------------------------ */
+
+/**
+ * 我们要写进 Kilo / OpenCode 配置的那条 plugins 条目。
+ *
+ * 这两个产品**没有 hook 子系统**（Kilo 7.8.1 实测：`--help` 里没有 hook 子命令，也没有
+ * `hooks.json`），所以上报只能走它们自己的**插件**机制：插件订阅 agent 的内存事件流，
+ * 把相位/完成标记写成 reporter 状态文件，并往台账上报成员/任务/对话记录/文件活动
+ * （见 packages/reporter/src/plugin/index.js）。没有这条，7F/8F 就只有轮询推导 ——
+ * 相位恒带 inferred 灰显，而且**完全没有任务台账**（轮询是只读的，监控端不能伪造上报）。
+ *
+ * `options.client` 显式钉住上报身份，别让插件靠环境变量猜（见 plugin/index.js 的
+ * resolveClient：Kilo 的 VS Code 扩展会判成 kilo-plugin，CLI/TUI 判成 kilo）。
+ */
+function pluginEntry(client) {
+  return { package: PLUGIN_ENTRY_FILE, options: { client } };
+}
+
+/** 这份配置里有没有我们自己那条插件条目（按 package 路径认，认 path 不认名字） */
+function hasPluginEntry(settings, client) {
+  const list = Array.isArray(settings && settings.plugins) ? settings.plugins : [];
+  const want = pluginEntry(client).package;
+  return list.some((p) => p && typeof p === 'object' && p.package === want);
+}
+
+/**
+ * 幂等合并 plugins 数组：摘掉上一次我们自己写的那条（同 package 路径），再追加。
+ * 别人的插件一条不动；`uninstall` 只摘我们自己的。
+ */
+function mergePlugins(existing, client, uninstall) {
+  const list = Array.isArray(existing.plugins) ? existing.plugins : [];
+  const want = pluginEntry(client).package;
+  const kept = list.filter((p) => !(p && typeof p === 'object' && p.package === want));
+  const out = { ...existing };
+  const next = uninstall ? kept : [...kept, pluginEntry(client)];
+  if (next.length) out.plugins = next;
+  else delete out.plugins;
+  return out;
 }
 
 function writeSettings(file, settings, dryRun) {
@@ -407,6 +452,27 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       dir: path.join(os.homedir(), '.qoder'),
       ours: qoderOurs,
     },
+    {
+      // 7F Kilo Code：**没有 hook 可装**，装的是我们自己的插件。
+      // Kilo 7.8.1 实测没有 hook 子命令、也没有 hooks.json，所以上报走它的 `plugins` 机制。
+      // 不装的话 7F 只剩服务端轮询：相位恒带 inferred（UI 灰显），而且**完全没有任务台账**
+      // （轮询是只读的，监控端不能伪造上报 —— 任务列表里就不会有 Kilo 的记录）。
+      id: 'kilo-plugin',
+      label: 'Kilo Code 插件（真相位 + 任务台账）',
+      kind: 'plugin',
+      file: path.join(os.homedir(), '.config', 'kilo', 'kilo.jsonc'),
+      // 装了没装的判定：跟别的楼层同一把尺子（PATH 里有 kilo / 数据根存在）
+      cmd: 'kilo',
+      dir: (() => {
+        const explicit = String(process.env.WORKGREMLIN_KILO_HOME || '').trim();
+        if (explicit) return path.resolve(explicit);
+        const xdg = String(process.env.XDG_DATA_HOME || '').trim();
+        if (xdg) return path.join(path.resolve(xdg), 'kilo');
+        return path.join(os.homedir(), '.local', 'share', 'kilo');
+      })(),
+      // CLI / TUI 形态的上报身份（VS Code 扩展那份是 kilo-plugin，由扩展自己判）
+      client: 'kilo',
+    },
   ];
   const targets = all.filter((t) => (t.optional ? args.project === true || wanted.includes(t.id) : !wanted.length || wanted.includes(t.id)));
 
@@ -439,7 +505,8 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       continue;
     }
 
-    const next = merge(existing || {}, t.ours, uninstall);
+    const isPlugin = t.kind === 'plugin';
+    const next = isPlugin ? mergePlugins(existing || {}, t.client, uninstall) : merge(existing || {}, t.ours, uninstall);
     // hooks.json 协议（TraeCode）默认带 schema version：新建/已存在都保证有，已有的不覆盖
     if (!uninstall && t.version) next.version = next.version || t.version;
     const before = JSON.stringify(existing || {});
@@ -457,7 +524,8 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
 
     // dry-run 也要一步都不落盘：早先这里没判 dryRun，预览时会真写出 .bak-workgremlin
-    if (!dryRun && exists && !hasOurs(existing)) {
+    // 插件形态认自己的那条（按 package 路径），别拿 hasOurs 去问 hooks —— 它只看 hooks
+    if (!dryRun && exists && !(isPlugin ? hasPluginEntry(existing, t.client) : hasOurs(existing))) {
       fs.copyFileSync(t.file, `${t.file}.bak-workgremlin`);
       console.log(`[workgremlin]   备份 -> ${t.file}.bak-workgremlin`);
     }
@@ -481,7 +549,10 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('  · Claude Code：写完新起的会话直接就生效（claude --print 实测，没经过批准）；');
     console.log('                 若表现为"装了没反应"，在 /hooks 面板过一遍即可');
     console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae / claude / qoder），已写进 hook 命令的 --agent，无需也无法二次指定');
-    console.log('  · 7F Kilo Code：无需安装 hook —— Kilo 没有 hook 子系统，WorkGremlin 直接轮询它自己的 SQLite 库');
+    console.log('  · 7F Kilo Code：**没有 hook**（实测 7.8.1 无 hook 子命令 / hooks.json），所以装的是插件；');
+    console.log('                 改完 kilo.jsonc 要**重开 Kilo 会话**才加载。装上后 7F 才有任务台账 ——');
+    console.log('                 没装插件时只剩服务端轮询：相位灰显，且任务列表里不会有 Kilo 的记录');
+    console.log('                 （轮询是只读的，监控端不能伪造上报，这是刻意的）');
     console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;

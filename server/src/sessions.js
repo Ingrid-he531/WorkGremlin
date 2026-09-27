@@ -402,8 +402,11 @@ function readReporterPhase(workspacePath, client = '', session = '') {
       winPending = j.pending || null;
       // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
       winPrompt = j.taskTitle || '';
-      // 模型不在这份状态文件里（hook payload 不带），按会话去 TraeCode 自己的落盘取
-      winModel = sessionModel(winClient, j.sessionId, j.agentType);
+      // 模型不在这份状态文件里（多数产品的 hook payload 不带），按会话去 TraeCode 自己的落盘取。
+      // 但 Kilo / OpenCode 插件（packages/reporter/src/plugin/）**直接把模型写进状态文件**
+      // （它们的 session.created 事件带 data.model，轮询那一路本来也能从库里取到）——
+      // 所以先认状态文件里这个值，取不到才退回落盘适配器。
+      winModel = String(j.model || "") || sessionModel(winClient, j.sessionId, j.agentType);
     }
   }
   if (!win) return null;
@@ -530,8 +533,15 @@ function stateFileSession(name, wsPart, dir) {
   const i = base.lastIndexOf(wsPart);
   if (i < 0) return null;
   const tail = base.slice(i + wsPart.length);
-  // 会话尾巴只能是一段 `_<id>`（id 里不含 `_`：UUID 没有，sanitize 也把它会变成 `_`）
-  if (!/^_[A-Za-z0-9.-]+$/.test(tail)) return null;
+  // 会话尾巴是一段 `_<id>`。**`_` 本身必须允许出现在 id 里** —— Kilo / OpenCode 的会话 id
+  // 形如 `ses_f22614607ffeQV…`（OpenCode 同款），id 内不含 `_`，但**测试夹具与将来任何
+  // 带下划线的 id** 都会被这里挡掉：那一份状态文件就被当成"不认识的文件"跳过，
+  // `hasReporterState` / `reporterStateMeta` 恒返回 false → UI 一直显示「未上报」，
+  // 而不是「接了 hook、当前没事干」。之前这里写的是 `[A-Za-z0-9.-]`（只有 UUID 成立）。
+  //
+  // 放宽不会引入歧义：这个编码本来就是有损的（`_` 既是分隔符又是合法字符），
+  // 下面紧接着就是靠**回读文件内容里的 sessionId** 来定音的 —— 内容对不上照样不认。
+  if (!/^_[A-Za-z0-9._-]+$/.test(tail)) return null;
   const cand = tail.slice(1);
   if (SESSION_UUID_RE.test(cand)) return cand;
   const j = readJson(path.join(dir, name));
@@ -654,6 +664,17 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       prompt: rp.prompt || '',
       model: rp.model || '',
     };
+  }
+  // 其余相位**原样透传**，不要压成 thinking。
+  //
+  // 早先这里只认 await / tool 两个分支，剩下的全落进最后的 thinking 兜底，于是
+  // 「写 idle 的一轮结束了」与「写 done 的任务完成了」在控制台上都显示成「思考中」——
+  // 收工了还在显示在思考，是把已完成说成还在忙。相位词汇表里本来就有
+  // idle / unreported / plan / dispatch / summarize / done / waiting 这几项
+  // （见 renderer/src/iso/mainConsole.js 的 PHASES），透传即可，不必各自再包一层。
+  // 真正**不认识**的相位才落 thinking（兜底，且只对未知值生效）。
+  if (rp.phase && rp.phase !== 'await' && rp.phase !== 'tool') {
+    return { phase: rp.phase, action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '' };
   }
   // thinking：干净，不堆示意字；但把用户那句话（prompt）一并带出，屏幕第三层顶到最前显示
   return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '' };

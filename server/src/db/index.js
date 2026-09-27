@@ -75,7 +75,7 @@ function migrate(db) {
   // （实测 qoder 主 agent 行就是这么飘进 1F 工位卡片的）。按"名字正好等于已知产品基名"
   // 回填：演示成员的通用 NULL（名字不是基名）不受影响。新成员已由 normClient 正确归一，
   // 这里是清历史残留。
-  const BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
+  const BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode', 'opencode-plugin'];
   const tagBase = db.prepare(`UPDATE members SET client = ? WHERE client IS NULL AND name = ?`);
   for (const b of BASES) tagBase.run(b, b);
 }

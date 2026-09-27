@@ -42,7 +42,7 @@ function memberIdOf(project, name) {
  * qoder 那一行于是飘进了 1F 的工位卡片（members 表实测 client IS NULL）。
  * 加楼层（products.js）时**必须**同步这里，别只改一半。
  */
-const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
+const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode', 'opencode-plugin'];
 const CLIENTS = new Set([...CLIENT_BASES, ...CLIENT_BASES.map((b) => `${b}-plugin`)]);
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();

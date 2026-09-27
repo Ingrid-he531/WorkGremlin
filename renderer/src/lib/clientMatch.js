@@ -56,14 +56,22 @@ const CLIENT_LABELS = {
   // 两种形态靠上报身份（client）就能分开，不需要像 Codex / Claude 那样靠 form 补。
   trae: 'TraeCode IDE',
   'trae-plugin': 'TraeCode Plugin',
-  // 7F Kilo Code：只有 CLI/TUI 一个形态（IDE 插件那一层归 7F 之外的产品，不在此列）。
-  // 它没有 hook，相位与完成标记由服务端轮询它自己的 SQLite 推导（见 server/src/kilo.js）。
+  // 7F Kilo Code：CLI（TUI）与 VS Code 扩展是同一个二进制、同一个数据根（见 products.js），
+  // 但装了 WorkGremlin 插件时**相位是上报真值**（不标 inferred、UI 不灰显），
+  // 而且只有它能给「等待授权」—— Kilo 的 tool 状态实测也只有 completed / error / running，
+  // 没有 pending，轮询推不出等授权。插件实例的上报身份是 kilo-plugin（扩展起 server 时带
+  // KILO_CLIENT=vscode 等，见 plugin/index.js 的 resolveClient），与 CLI 的 kilo 分开。
+  // 两种形态靠上报身份（client）就能分开，不需要像 Codex / Claude 那样靠 form 补。
   kilo: 'Kilo Code',
-  // 6F Qoder：CLI 与插件共用同一份 ~/.qoder，合并成一层（见 products.js）
+  'kilo-plugin': 'Kilo Code Plugin',
+  // 6F Qoder：CLI 与插件共用同一份 ~/.qoder，合并成一层（见 products.js）。
+  // 形态由 form 补出来：hook 从 transcript 的 entrypoint 认出（见 hook.js 的 qoderForm，同 Claude Code 格式）
   qoder: 'Qoder',
   // 8F OpenCode：CLI / TUI / 桌面端 / 网页端同一个二进制、同一个数据根，合并成一层。
   // 装了 WorkGremlin 插件时相位是上报真值，否则退回轮询 opencode.db 的推导（见 server/src/opencode.js）。
+  // 形态由 form 补出来：插件从环境变量认出（见 plugin/index.js 的 resolveClient）
   opencode: 'OpenCode',
+  'opencode-plugin': 'OpenCode Plugin',
 };
 
 /**
