@@ -351,11 +351,18 @@ async function resolveCtx(info) {
 }
 
 /**
- * Codex 的 apply_patch：tool_input 只有 { command: "*** Begin Patch
-*** Update File: <路径>
-…" }，
- * **没有 file_path**（实测）—— 路径只能从 patch 文本里解析。
+ * Codex 的 apply_patch：tool_input 里放的是**整段 patch 文本**、**没有 file_path** ——
+ * 路径只能从 patch 文本里解析。键名各家形态不一样：TUI 实测是 `command`；IDE 扩展 /
+ * app-server 形态把自定义工具的原样入参放在 `input`（rollout 里就是
+ * `"name":"apply_patch","input":"*** Begin Patch…"`），所以几个键都认一遍。
  */
+function patchText(input) {
+  if (typeof input === 'string') return input;
+  if (!input || typeof input !== 'object') return '';
+  const t = input.command || input.input || input.patch || input.diff || '';
+  return typeof t === 'string' ? t : '';
+}
+
 function patchPaths(text) {
   const out = [];
   const src = String(text || '');
@@ -371,11 +378,99 @@ function patchPaths(text) {
 
 /** 工具输入里的目标文件（CodeBuddy: file_path/filePath；Codex: apply_patch 的 patch 文本） @returns {string[]} */
 function filesOf(input, tool) {
+  // 自定义工具（Codex 的 apply_patch）的 tool_input 可能就是一个**字符串**
+  if (typeof input === 'string') input = { command: input };
   if (!input || typeof input !== 'object') return [];
   const p = input.file_path || input.filePath || input.path || input.notebook_path || input.target_file || '';
   if (typeof p === 'string' && p) return [p];
-  if (String(tool || '') === 'apply_patch' && typeof input.command === 'string') return patchPaths(input.command);
+  if (String(tool || '') === 'apply_patch') return patchPaths(patchText(input));
   return [];
+}
+
+/**
+ * 用户原话：剥掉 IDE 插件注入的那段上下文。
+ *
+ * 实测（Codex 的 VS Code 扩展）提交上来的 prompt 是拼好的：
+ *   # Context from my IDE setup:
+ *   ## Active file: renderer/src/stores/sessions.js
+ *   ## Open tabs: - …
+ *   ## My request:
+ *   <用户真正写的那句话>
+ * 整段拿去当标题，任务列表里就只剩 "Context from my IDE setup: ## Active file: … ##"
+ * （标题只截前 TITLE_MAX 字，全被注入块占满，用户的话一个字都看不见）。所以：认得出这是注入块
+ * （有那个标题行，或 Active file / Open tabs 小节）+ 有请求分隔行，就只取分隔行后面的正文；
+ * 注入块里没有正文就返回空串（调用方退化成"（未命名任务）"，好过把 IDE 上下文当任务名）。
+ * 不像注入块的原样返回 —— 用户真在 prompt 里写 "My request:" 这类字样的不会被误伤。
+ */
+function userRequestText(raw) {
+  const text = String(raw || '').replace(/\r\n?/g, '\n');
+  if (!text.trim()) return '';
+  const injected =
+    /^[ \t]*#{0,6}[ \t]*Context from my IDE setup\b/im.test(text) ||
+    /^[ \t]*#{1,6}[ \t]*(?:Active file|Open tabs)\b/im.test(text);
+  if (!injected) return text.trim();
+  const parts = text.split(
+    /^[ \t]*#{0,6}[ \t]*(?:My request|User request|Request|我的请求|用户请求)[ \t]*[:：][ \t]*$/im
+  );
+  return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
+}
+
+/**
+ * apply_patch 结果里那份**权威清单**：`Success. Updated the following files:` 之后
+ * 每行 `M/A/D <路径>`（M=改动 / A=新增 / D=删除），与 server 侧的 op 词汇（edit/write/delete）对齐。
+ */
+function patchOutputFiles(text) {
+  const src = String(text || '');
+  const i = src.indexOf('Success. Updated the following files');
+  if (i < 0) return [];
+  const out = [];
+  for (const line of src.slice(i).split('\n').slice(1)) {
+    const m = line.match(/^[ \t]*([MAD])[ \t]+(\S.*?)[ \t]*$/);
+    if (!m) {
+      if (out.length) break; // 清单结束（后面是空行 / 别的输出）
+      continue;
+    }
+    out.push({ path: m[2].trim(), op: m[1] === 'M' ? 'edit' : m[1] === 'A' ? 'write' : 'delete' });
+  }
+  return out;
+}
+
+/**
+ * 从 Codex 的 rollout transcript 里读**本轮真正改过的文件**（apply_patch 的权威清单）。
+ *
+ * 为什么还要这一路：hook 的 PostToolUse 是从 tool_input 里解析 patch 文本，实测它会漏 ——
+ * IDE 扩展 / app-server 形态的 PostToolUse 不带 patch 文本时那一路什么都记不到，任务收工时
+ * "改动文件"整块是空的。transcript 是 agent 自己的落盘，最可靠，所以收工时按本轮开始时刻再补一遍。
+ * @param {string} transcriptPath
+ * @param {number} sinceTs 只认这个时刻之后的记录（= 本轮任务开始时刻；拿不到就不补）
+ * @returns {{path:string, op:string}[]}
+ */
+function transcriptRoundFiles(transcriptPath, sinceTs) {
+  if (!transcriptPath || typeof transcriptPath !== 'string' || !(Number(sinceTs) > 0)) return [];
+  let lines;
+  try {
+    lines = fs.readFileSync(transcriptPath, 'utf8').split('\n');
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (!s) continue;
+    let obj;
+    try {
+      obj = JSON.parse(s);
+    } catch {
+      continue;
+    }
+    const p = obj && obj.payload;
+    if (!p || typeof p !== 'object') continue;
+    if (p.type !== 'custom_tool_call_output' && p.type !== 'function_call_output') continue;
+    const ts = Date.parse(String((obj && obj.timestamp) || '')) || 0;
+    if (ts && ts < Number(sinceTs)) continue; // 上一轮的记录不算这一轮
+    out.push(...patchOutputFiles(p.output));
+  }
+  return out;
 }
 
 /** 单个路径（相位与日志展示用，取第一个） */
@@ -1233,7 +1328,8 @@ async function main() {
     // 结束事件可能丢（实测：打断时 PostToolUse / SubagentStop 都不来），这里兜底扫掉。
     sweepGhosts(file, REAL_WS, cl);
     clearAwait(file); // 新的一轮用户输入：之前挂起的"等授权"作废
-    const prompt = String(ev.prompt || '');
+    // 用户原话 = 剥掉 IDE 注入块之后的正文（见 userRequestText）
+    const prompt = userRequestText(ev.prompt);
     const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
     await register();
     // model 一并上报：报表要记这一轮用的是哪个模型（hook payload 没带就是空 → 服务端留 NULL）
@@ -1427,22 +1523,39 @@ async function main() {
     // transcript 读不到（路径没了 / 格式不认识）时，至少把 Stop 自带的这句当成一条回复存下来；
     // 去重键用正文哈希（同一轮重复上报仍不会写重，不同轮内容不同就是两条）。
     if (!replies.length && lastText) replies.push({ id: 'h' + fnv1a32(lastText), text: lastText });
-    // 本轮用工具动过的文件（PostToolUse 一路记下来的）：跟着完成标记一起落盘，
-    // 这样 1.5s 快轮询拿到 doneAt 的**同一时刻**就有文件清单，不用等 10s 的会话快照，
-    // 「任务完成」才不会退化成一句"本次任务已完成"。
+    // 本轮改过的文件：两路合起来 ——
+    //   ① rememberRoundFiles 记的（PostToolUse 那一路：工具入参里解析得出目标文件时）；
+    //   ② transcript 里 apply_patch 的权威清单（见 transcriptRoundFiles）—— IDE / app-server
+    //      形态的 PostToolUse 常常不带 patch 文本，只靠 ① 会"没有改动文件"。
+    // 两路按**绝对路径**去重（同一条改动两边都记到时只留一条，op 取先记到的那个）。
+    // 记在完成标记里一起落盘：1.5s 快轮询拿到 doneAt 的**同一时刻**就有文件清单，
+    // 不用等 10s 的会话快照，「任务完成」才不会退化成一句"本次任务已完成"。
     // 注意：rememberRoundFiles 存的是 {path, op} 对象（op 区分 新增/改动/删除），
     // 这里只过滤无效项，不要把对象当成字符串丢掉（否则文件清单永远为空）。
     const roundFiles = (st.roundFiles || []).filter((x) => x && (typeof x === 'string' ? x : x.path));
+    const baseDir = cwd || REAL_WS;
+    const byAbs = new Map();
+    for (const x of roundFiles) {
+      const p = typeof x === 'string' ? x : x.path;
+      if (!p) continue;
+      const abs = (typeof x === 'object' && x.abs) || path.resolve(baseDir, p);
+      byAbs.set(abs, { path: p, op: typeof x === 'string' ? null : x.op, abs });
+    }
+    for (const t of transcriptRoundFiles(ev.transcript_path || st.transcriptPath || '', startedAt)) {
+      const abs = path.resolve(baseDir, t.path);
+      const prev = byAbs.get(abs);
+      byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });
+    }
     // 本轮用工具动过的文件：补上"当前体积（字节）"，主控制台好显示文件大小。
     // 大小在收工那一刻现 stat。解析按优先级试多个基路径：文件本身（工具给的往往是绝对路径）
     // → 按事件 cwd → 按 REAL_WS（= process.cwd()）。插件 / IDE 下 cwd 常常对不上工程，
     // 只信 cwd 会把大小算成 null，所以要多试几个、谁先 stat 到用谁。
     // 之所以在 hook 侧算、不让服务端算：服务端按工程存的 workspace_path 反查文件，
     // 而开发工程那条 workspace_path 往往为空 / 对不上，服务端 stat 必失败 → 大小永远 null。
-    const roundFileDetails = roundFiles.map((x) => {
-      const p = typeof x === 'string' ? x : x.path;
-      const op = typeof x === 'string' ? null : x.op;
-      const abs = typeof x === 'string' ? null : x.abs;
+    const roundFileDetails = [...byAbs.values()].map((x) => {
+      const p = x.path;
+      const op = x.op || null;
+      const abs = x.abs;
       let size = null;
       if (op !== 'delete') {
         // abs 是工具给的绝对路径（PostToolUse 那一刻最准），优先用；下面再退回按相对路径

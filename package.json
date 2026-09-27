@@ -37,7 +37,8 @@
     "test:ghost": "node server/test/ghostRace.test.js",
     "test:ghost-ledger": "node server/test/ghostLedger.test.js",
     "test:recover": "node server/test/taskRecover.test.js",
-    "test:qoder": "node server/test/qoderHook.test.js"
+    "test:qoder": "node server/test/qoderHook.test.js",
+    "test:ide-hook": "node server/test/ideHook.test.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

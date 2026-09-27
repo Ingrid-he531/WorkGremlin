@@ -125,6 +125,27 @@ function filesOf(task) {
     return { path: x.path, op: x.op ?? null, size: x.size ?? null };
   });
 }
+
+/**
+ * 任务标题里的"用户原话"。
+ *
+ * 老数据（hook 修掉之前）把 IDE 注入的那段上下文整段当标题存了下来 ——
+ * `# Context from my IDE setup: ## Active file: …`。钩子那边已经不再这么存（规则见
+ * packages/reporter/src/hook.js 的 userRequestText），但**历史行**还在库里，显示时按
+ * 同一套规则再剥一次，任务列表才不是一屏 IDE 上下文。规则与 hook 侧保持一致。
+ */
+function promptOf(t) {
+  const raw = String((t && t.title) || '').replace(/\r\n?/g, '\n');
+  if (!raw.trim()) return '';
+  const injected =
+    /^[ \t]*#{0,6}[ \t]*Context from my IDE setup\b/im.test(raw) ||
+    /^[ \t]*#{1,6}[ \t]*(?:Active file|Open tabs)\b/im.test(raw);
+  if (!injected) return raw.trim();
+  const parts = raw.split(
+    /^[ \t]*#{0,6}[ \t]*(?:My request|User request|Request|我的请求|用户请求)[ \t]*[:：][ \t]*$/im
+  );
+  return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
+}
 /** 把 hook 的 op 归到三类：add=新增 / del=删除 / mod=改动（含老数据无 op） */
 function classify(f) {
   if (f.op === 'delete') return 'del';
@@ -163,7 +184,7 @@ const list = computed(() => {
   const fm = filterModel.value;
   return (tasks.tasks || []).filter((t) => {
     if (filterState.value !== 'all' && t.state !== filterState.value) return false;
-    if (kw && !(t.title || '').toLowerCase().includes(kw)) return false;
+    if (kw && !promptOf(t).toLowerCase().includes(kw)) return false;
     if (fm && (t.model || '') !== fm) return false;
     return true;
   });
@@ -452,7 +473,7 @@ async function saveRetention() {
               >删除</button>
             </span>
           </div>
-          <div class="row-title">{{ t.title || '(未命名任务)' }}</div>
+          <div class="row-title">{{ promptOf(t) || '(未命名任务)' }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
             <span v-if="t.client">{{ clientLabel(t.client) }}</span>
@@ -468,7 +489,7 @@ async function saveRetention() {
       <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
-            <div class="detail-title">{{ tasks.selectedTask.title || '(未命名任务)' }}</div>
+            <div class="detail-title">{{ promptOf(tasks.selectedTask) || '(未命名任务)' }}</div>
             <div class="detail-meta">
               <span>{{ fmtTime(tasks.selectedTask.started_at) }}</span>
               <span v-if="tasks.selectedTask.ended_at">→ {{ fmtTime(tasks.selectedTask.ended_at) }}</span>
