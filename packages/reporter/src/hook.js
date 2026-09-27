@@ -904,12 +904,12 @@ function rememberRoundFiles(file, items) {
   updateState(file, (st) => {
     const map = new Map();
     for (const x of st.roundFiles || []) {
-      if (x && x.path) map.set(x.path, x.op);
+      if (x && x.path) map.set(x.path, { op: x.op || null, abs: x.abs || null });
     }
     for (const it of items) {
-      if (it && it.path) map.set(it.path, it.op);
+      if (it && it.path) map.set(it.path, { op: it.op || null, abs: it.abs || null });
     }
-    const list = [...map.entries()].map(([path, op]) => ({ path, op }));
+    const list = [...map.entries()].map(([path, v]) => ({ path, op: v.op, abs: v.abs }));
     return { ...st, roundFiles: list.slice(-30) };
   });
 }
@@ -1330,11 +1330,16 @@ async function main() {
       }
       await status('busy');
     } else {
-      const touched = filesOf(ev.tool_input, ev.tool_name).map((x) => relFile(x, cwd)).filter(Boolean);
+      const touched = filesOf(ev.tool_input, ev.tool_name)
+        .map((x) => ({ abs: path.resolve(x), path: relFile(x, cwd), op: opOf(ev.tool_name) }))
+        .filter((t) => t.path);
       if (touched.length) {
-        await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: AGENT, files: touched, op: opOf(ev.tool_name) });
-        // 本地也记一份：上报失败（服务没起 / 接口报错）时完成概要仍拿得到文件清单
-        rememberRoundFiles(file, touched.map((p) => ({ path: p, op: opOf(ev.tool_name) })));
+        // FILE_TOUCH 只认路径字符串（file_activity 表），仍送相对路径，不动它的口径
+        await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: AGENT, files: touched.map((t) => t.path), op: opOf(ev.tool_name) });
+        // 本地也记一份：上报失败（服务没起 / 接口报错）时完成概要仍拿得到文件清单。
+        // 额外留 abs（工具给的绝对路径，PostToolUse 此刻最准），收工算 size 时优先用，
+        // 不再依赖 Stop 事件的 cwd / 进程 cwd 去拼相对路径（插件下两者常常对不上工程）。
+        rememberRoundFiles(file, touched.map((t) => ({ path: t.path, op: t.op, abs: t.abs })));
       }
       // TodoWrite / 待办清单更新：据此上报"任务进度"（已完成占比）。
       // 这是任务进行中能拿到的真实完成比例信号——agent 用待办清单组织任务时，
@@ -1437,9 +1442,13 @@ async function main() {
     const roundFileDetails = roundFiles.map((x) => {
       const p = typeof x === 'string' ? x : x.path;
       const op = typeof x === 'string' ? null : x.op;
+      const abs = typeof x === 'string' ? null : x.abs;
       let size = null;
       if (op !== 'delete') {
-        const candidates = [p, cwd ? path.resolve(cwd, p) : null, path.resolve(REAL_WS, p)].filter(Boolean);
+        // abs 是工具给的绝对路径（PostToolUse 那一刻最准），优先用；下面再退回按相对路径
+        // 拼 cwd / REAL_WS —— 插件下 Stop 事件的 cwd 常常为空、进程 cwd 又对不上工程，
+        // 单靠它们会把相对路径拼成 work/WorkGremlin/work/... 而 stat 失败，size 永远 null。
+        const candidates = [abs, p, cwd ? path.resolve(cwd, p) : null, path.resolve(REAL_WS, p)].filter(Boolean);
         for (const cp of candidates) {
           try {
             const st0 = fs.statSync(cp);
