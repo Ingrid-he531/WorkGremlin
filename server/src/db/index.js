@@ -69,6 +69,14 @@ function migrate(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
   ensureAgentStatusThinking(db);
+  // 回填：CLIENT_BASES 漏配过的产品，其主 agent 成员的 client 会被写成 NULL，
+  // 而空 client 在前端被当「通用、哪层都显示」，于是这个产品的成员飘进所有楼层
+  // （实测 qoder 主 agent 行就是这么飘进 1F 工位卡片的）。按"名字正好等于已知产品基名"
+  // 回填：演示成员的通用 NULL（名字不是基名）不受影响。新成员已由 normClient 正确归一，
+  // 这里是清历史残留。
+  const BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
+  const tagBase = db.prepare(`UPDATE members SET client = ? WHERE client IS NULL AND name = ?`);
+  for (const b of BASES) tagBase.run(b, b);
 }
 
 /**
