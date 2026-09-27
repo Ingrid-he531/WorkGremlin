@@ -5,9 +5,16 @@ import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { isEphemeralMember } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
+import { clientBase } from '@workgremlin/shared';
 
 const project = useProjectStore();
 const sessions = useSessionStore();
+
+// 主 agent：成员名（剥 -plugin）等于其 client 基名（codebuddy / qoder / codex …），
+// 对应 hook 注册的那只"本层主 agent"；子代理（leo / peter / software-architect…）名与基名不同。
+function isMainAgent(m) {
+  return clientBase(m.name) === clientBase(m.client);
+}
 
 const sorted = computed(() => {
   const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
@@ -22,7 +29,13 @@ const sorted = computed(() => {
     .filter((m) => !isEphemeralMember(m))
     .filter((m) => floorAcceptsClient(want, m.client, allClients))
     .slice()
-    .sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
+    // 主 agent 卡片固定排最前（其余仍按相位顺序），不再随机
+    .sort((a, b) => {
+      const am = isMainAgent(a) ? 0 : 1;
+      const bm = isMainAgent(b) ? 0 : 1;
+      if (am !== bm) return am - bm;
+      return order.indexOf(a.state) - order.indexOf(b.state);
+    });
 });
 </script>
 
