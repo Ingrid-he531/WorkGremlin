@@ -21,16 +21,18 @@
  * `clients` 照收 codebuddy 与 codebuddy-plugin 两种上报身份。同时开着 CLI 与 Plugin 时，
  * 表现是**这一层里的两条会话**（靠 session_id 区分），不是两个楼层。
  *
- * **TraeCode 也只有一层**（5F）：IDE（`~/.trae-cn`）与插件（`~/.marscode`）是同一个产品，
- * 以前拆成 5F Plugin / 6F IDE 两层。合并后**两处落盘都列出来**（kind 'dir'，只作展示），
+ * **TraeCode 也只有一层**（5F）：IDE（`~/.trae-cn`）与插件（`~/.marscode`）是同一个产品的两种形态，
+ * 以前拆成 5F Plugin / 6F IDE 两层。合并后**两路落盘都列出来**（kind 'dir'，只作展示），
  * 会话来源则是 reporter hook 的状态文件 —— TraeCode 两个形态都没有可扫的**会话**落盘：
  *   · `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与
  *     `project_memory.md`：**记忆**文件（文件名带 session_id，但它不是对话记录、没有工程路径，
  *     不足以当会话行用），另外还有 extensions / plugins / mcps 这些安装目录；
- *   · `~/.marscode`：插件自己的运行时（ai-chat 二进制、日志、`ai-agent/database.db` 与
- *     `snapshot/<链 id>/v2/.git` 文件快照 —— 前者不是可读的 sqlite，后者是逐轮改动的 git 快照）。
- * 所以这两路都**取不到会话**，只作落盘展示，并在楼层胶囊的 tooltip 里各带一句说明
- * （见 detectSource 的 label / note）。
+ *   · `~/.marscode`：插件自己的运行时。会话数据在 `ai-agent/database.db` 里，实测是**加密**数据
+ *     （非 SQLite，打不开）；`snapshot/<链 id>/v2/.git` 只是逐轮改动的 git 快照、不是会话索引；
+ *     插件侧 hook（`~/.marscode/hooks.json`）实测也不生效 —— 所以**插件这一形态目前不支持会话**，
+ *     保留这一路只为交代清"这层是两形态产品"，等以后有可读落盘再接。
+ * 两路都**不带 note**（tooltip 只列目录与落盘统计）：形态靠上报身份（client）就分得开，
+ * 任务列表里分别叫 TraeCode IDE / TraeCode Plugin（见 renderer/src/lib/clientMatch.js 的 CLIENT_LABELS）。
  *
  * Claude Code 同理只有一层（4F）：CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、
  * 同一个落盘目录（~/.claude/projects），连二进制都是同一份 —— 事件 payload 里没有任何字段能
@@ -561,11 +563,15 @@ const PRODUCTS = [
     agent: 'trae',
     plugin: false,
     pluginRe: /trae/i,
-    // 合并楼层（见文件头）：IDE 与 Plugin 是同一个产品，两个形态的落盘都要列出来。
+    // 合并楼层（见文件头）：IDE 与 Plugin 是同一个产品的两种形态，两个形态的落盘都要列出来。
     //   dir(IDE)    —— ~/.trae-cn（国内版）/ ~/.trae（国际版）：memory/ 里是
     //                  session_memory_<会话>.jsonl 这类**记忆**文件 + project_memory.md，
-    //                  不是对话记录，所以只作落盘展示、不当会话来源（见下面的 note）
-    //   dir(plugin) —— ~/.marscode：插件自己的运行时（没有会话索引）
+    //                  不是对话记录，所以只作落盘展示、不当会话来源（任务列表里这一形态叫 TraeCode IDE）
+    //   dir(plugin) —— ~/.marscode：插件自己的运行时。**目前不支持会话**：会话数据在
+    //                  ai-agent/database.db 里，实测是加密数据（非 SQLite，打不开），
+    //                  snapshot/<链 id>/v2/.git 只是逐轮 git 快照、不是会话索引，插件侧 hook
+    //                  （~/.marscode/hooks.json）实测也不生效 —— 保留这一路只为交代清"这层是两形态
+    //                  产品"，等插件有了可读落盘再接会话（任务列表里这一形态叫 TraeCode Plugin）
     //   hook        —— 会话来源就是 reporter 状态文件（sessionId / workspacePath 都是实测值）
     sources: [
       {
@@ -573,14 +579,12 @@ const PRODUCTS = [
         label: 'IDE',
         client: clientOf('trae', false),
         dirs: [path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')],
-        note: '这一路只作落盘展示：memory/ 里是 session_memory_<会话>.jsonl 这类记忆文件与 project_memory.md，不是对话记录；会话列表由 hook 状态文件提供',
       },
       {
         kind: 'dir',
         label: 'plugin',
         client: clientOf('trae', true),
         dirs: [path.join(HOME, '.marscode')],
-        note: '这一路只作落盘展示：目录里是插件自己的运行时（日志、ai-agent/ 的文件快照，以及读不出的 database.db），没有会话索引；会话列表由 hook 状态文件提供',
       },
       { kind: 'hook' },
     ],
@@ -736,9 +740,8 @@ const NO_STATS = { files: 0, sessions: 0, bytes: 0, sizeLabel: '0 B', lastModifi
  *
  * 判据很窄：插件的结构化会话索引是 `genie-history`（见 sessions.js 的 listSessions，
  * 会话 id、当前会话、待办、改动文件都挂在它下面）。没有这个目录，这一路就取不到会话。
- * 实测 TraeCode 插件（`~/.marscode`）正是这样：只有插件自己的运行时（ai-chat 二进制、
- * 日志、`ai-agent/database.db` 与 `snapshot/<链 id>/v2/.git` 文件快照）——前者不是可读的
- * sqlite，后者是逐轮改动的 git 快照、不是会话索引，所以会话只能靠 hook 那一路。
+ * 只对 kind 'plugin' 的来源生效；5F TraeCode 的两路来源都是 'dir'（见其 sources 注释），
+ * 不在这里补说明，tooltip 里只列目录与落盘统计。
  * @returns {string} 说明文案；不需要说明时回空串
  */
 function sourceNote(kind, dataPath) {

@@ -51,7 +51,10 @@ const CLIENT_LABELS = {
   // Claude Code 只有一层（CLI 与 IDE 插件共用同一份 ~/.claude 配置、hook 与 client 身份）。
   // 形态由 form 补出来：hook 从 transcript 的 entrypoint 认出（见 hook.js 的 claudeForm）
   claude: 'Claude Code',
-  trae: 'TraeCode',
+  // 5F TraeCode：非 plugin 的那一种形态是**桌面 IDE 本体**（trae / trae-cn），不是 CLI
+  // （Trae 没有独立的 trae CLI），所以标签叫 IDE 而不是 CLI；插件形态仍是 trae-plugin。
+  // 两种形态靠上报身份（client）就能分开，不需要像 Codex / Claude 那样靠 form 补。
+  trae: 'TraeCode IDE',
   'trae-plugin': 'TraeCode Plugin',
   // 7F Kilo Code：只有 CLI/TUI 一个形态（IDE 插件那一层归 7F 之外的产品，不在此列）。
   // 它没有 hook，相位与完成标记由服务端轮询它自己的 SQLite 推导（见 server/src/kilo.js）。
@@ -70,13 +73,13 @@ const CLIENT_LABELS = {
  * 才需要它 —— 它们的 client 分不出两种形态（3F Codex、4F Claude Code 都是如此：hook 从会话
  * 自己落的记录里认出来单独上报，见 packages/reporter/src/hook.js 的 codexForm / claudeForm），
  * 任务列表才能标成「Codex CLI / Codex Plugin」「Claude Code CLI / Claude Code Plugin」。
- * 标签里已经带形态的（CodeBuddy CLI / CodeBuddy Plugin）不重复追加。
+ * 标签里已经带形态的（CodeBuddy CLI / CodeBuddy Plugin / TraeCode IDE / TraeCode Plugin）不重复追加。
  */
 export function clientLabel(c, form) {
   const k = String(c || '').toLowerCase();
   const label = CLIENT_LABELS[k] || c || '—';
   const f = String(form || '').toLowerCase();
-  if ((f === 'cli' || f === 'plugin') && !/(?:^|\s)(?:CLI|Plugin)$/i.test(label)) {
+  if ((f === 'cli' || f === 'plugin') && !/(?:^|\s)(?:CLI|Plugin|IDE)$/i.test(label)) {
     return `${label} ${f === 'plugin' ? 'Plugin' : 'CLI'}`;
   }
   return label;

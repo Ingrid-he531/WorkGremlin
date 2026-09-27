@@ -276,8 +276,8 @@ head('[B1] 楼层表：5F 只有一层 TraeCode（IDE 与插件合并）');
   ok('装了国内版 IDE（trae-cn）就算装了', floor && floor.installed === true, floor && String(floor.installPath));
 }
 
-/* [B2] 两个形态的落盘目录都要列出来，且各自说明"取不到会话"（胶囊 tooltip 显示的就是它们） */
-head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都要在 tooltip 里，各带一句说明');
+/* [B2] 两个形态的落盘目录都要列出来（胶囊 tooltip 显示的就是它们）；两路都不带 sources[].note */
+head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都要在 tooltip 里');
 {
   const products = detectProducts({ force: true });
   const dirs = products.find((p) => p.id === '5F').sources.filter((s) => s.kind === 'dir');
@@ -285,8 +285,8 @@ head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都�
   const pluginSrc = dirs.find((s) => s.label === 'plugin');
   ok('IDE 那一路扫的是 ~/.trae-cn（国内版）', Boolean(ideSrc) && String(ideSrc.dataPathLabel).endsWith('.trae-cn'), ideSrc && ideSrc.dataPathLabel);
   ok('插件那一路扫的是 ~/.marscode', Boolean(pluginSrc) && String(pluginSrc.dataPathLabel).endsWith('.marscode'), pluginSrc && pluginSrc.dataPathLabel);
-  ok('两路都各带一句说明（只作展示、取不到会话）', /只作落盘展示/.test(ideSrc.note || '') && /只作落盘展示/.test(pluginSrc.note || ''));
-  ok('说明里点出 IDE 那一路是记忆文件、不是会话', /memory\//.test(ideSrc.note || ''), ideSrc.note);
+  // tooltip 只列目录与落盘统计，不带 sources[].note（形态靠上报身份区分，见 clientMatch 的 CLIENT_LABELS）
+  ok('两路都不带说明（tooltip 只列目录与落盘统计）', !ideSrc.note && !pluginSrc.note, `${ideSrc.note} | ${pluginSrc.note}`);
   // 明确没有 genie-history 这类会话索引（否则本该由 listSessions 读出来，而不是只作展示）
   ok('两路都没有 genie-history 这类会话索引', !fs.existsSync(path.join(ideSrc.dataPath, 'genie-history')) && !fs.existsSync(path.join(pluginSrc.dataPath, 'genie-history')));
 
@@ -294,11 +294,11 @@ head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都�
   const st = listSessions({ force: true, client: 'trae-plugin', pluginRe: /trae/i });
   ok('listSessions 对插件那一路回空（没有结构化落盘）', (st.sessions || []).length === 0, JSON.stringify(st.sessions).slice(0, 200));
 
-  // 楼层快照（前端拿到的就是这份）也要带上这句说明
+  // 楼层快照（前端拿到的就是这份）也要带上这两路（前端 tooltip 直接列它们）
   const snap = snapshot({ force: true, workspacePath: TR_WS });
   const floor = snap.floors.find((f) => f.id === '5F');
   const labels = (floor.sources || []).filter((s) => s.kind === 'dir').map((s) => s.label);
-  ok('楼层快照里两路落盘的 label 与 note 都在（前端 tooltip 直接显示它们）', JSON.stringify(labels) === JSON.stringify(['IDE', 'plugin']) && (floor.sources || []).filter((s) => s.kind === 'dir').every((s) => s.note), JSON.stringify(floor.sources));
+  ok('楼层快照里两路落盘的 label 都在（前端 tooltip 直接列它们）', JSON.stringify(labels) === JSON.stringify(['IDE', 'plugin']), JSON.stringify(floor.sources));
 }
 
 /* [B3] 会话来自 hook 状态文件；两种身份都归这一层 */

@@ -336,16 +336,18 @@ CLI 与插件是同一份 `~/.claude`、同一套 hook、连二进制都相同�
 实时相位与完成标记按会话各认各的（`/api/v1/reporter-phase?client=codebuddy,codebuddy-plugin&session=<id>`）。
 
 **TraeCode 的 IDE 与插件同样合成一层（5F TraeCode）**，但这一层的会话**只能靠 hook 状态文件**：
-两个形态都没有可扫的**会话**落盘 —— `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl`
-与 `project_memory.md` 是笔记/记忆（文件名带 session_id，但不是对话记录、也没有工程路径）；
-`~/.marscode`（插件运行时）实测只有 ai-chat 二进制、日志，以及 `ai-agent/database.db`（不是可读的 sqlite）
-与 `snapshot/<链 id>/v2/.git`（逐轮改动的 git 文件快照）。所以两处落盘都**只作展示**：
-楼层胶囊的 tooltip 会把 IDE（`~/.trae-cn`）与插件（`~/.marscode`）两路都列出来、各带一句"取不到会话"的说明，
-免得把"这一路读不到"误看成"这一层没在跑"。
+IDE（`~/.trae-cn`）与插件（`~/.marscode`）两路落盘都**只作展示**（`kind:'dir'`，不产会话），
+楼层胶囊的 tooltip 把两路目录与落盘统计都列出来、**不带说明**（免得把"这一路读不到"误看成"这一层没在跑"）：
+`~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与 `project_memory.md` 是笔记/记忆
+（文件名带 session_id，但不是对话记录、也没有工程路径）；`~/.marscode`（插件运行时）实测只有 ai-chat 二进制、
+日志，以及 `ai-agent/database.db`（**加密数据、不是可读的 sqlite**）与 `snapshot/<链 id>/v2/.git`
+（逐轮改动的 git 文件快照）—— 所以**插件这一形态目前不支持会话记录**，这一路只为交代"这层是两形态产品"。
+形态靠上报身份（client）就分得开：任务列表里分别显示 **TraeCode IDE** / **TraeCode Plugin**
+（见 `renderer/src/lib/clientMatch.js` 的 `CLIENT_LABELS`，无需按楼层特判）。
 
-想知道"某一层吃哪几路落盘"，看 `server/src/products.js` 的 `sources`（某一路读不出会话时，
-服务端会在 `sources[].note` 里给一句说明）；自检 `npm run test:floors`（1F/5F/6F）、
-`npm run test:kilo`（7F 轮询路线）与 `npm run test:opencode`（8F 轮询 + 插件双路）。
+想知道"某一层吃哪几路落盘"，看 `server/src/products.js` 的 `sources`（`kind:'plugin'` 那一路
+读不出会话时，服务端在 `sources[].note` 里给一句说明；`kind:'dir'` 的展示路不带）；自检
+`npm run test:floors`（1F/5F/6F）、`npm run test:kilo`（7F 轮询路线）与 `npm run test:opencode`（8F 轮询 + 插件双路）。
 
 ## 安全基线（不得关闭）
 
