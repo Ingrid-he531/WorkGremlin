@@ -450,7 +450,7 @@ async function saveRetention() {
             <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
-            <div class="k">本轮文件变化</div>
+            <div class="k">文件变化</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
           </div>
 
