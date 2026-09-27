@@ -234,6 +234,17 @@ function readTodos(storage, id) {
   };
 }
 
+/** 文件当前字节大小（按绝对路径现 stat）。删除类改动的源文件已不存在 → null，绝不编造。 */
+function fileSizeOf(fp) {
+  if (!fp || typeof fp !== 'string') return null;
+  try {
+    const s = fs.statSync(fp);
+    return s.isFile() ? s.size : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 改动文件：按最后写入倒序取最近几个 */
 function readFileChanges(storage, id) {
   const dir = path.join(storage, 'file-changes', id);
@@ -248,6 +259,9 @@ function readFileChanges(storage, id) {
       op: String(j.changeType || ''),
       added: Number(j.addedLines) || 0,
       removed: Number(j.removedLines) || 0,
+      // 字节大小：文件本体（filePath 是绝对路径）现 stat。插件 / IDE 这份落盘只给行数、
+      // 不给体积，只能服务端现算；删除类改动的源文件已不在，算不到就留 null。
+      size: fileSizeOf(j.filePath),
       at: mtime(p),
     });
   }

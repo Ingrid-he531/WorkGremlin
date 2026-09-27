@@ -392,6 +392,28 @@ function opOf(tool) {
 }
 
 /**
+ * 从 TodoWrite 类工具的入参里抽"任务进度"（已完成 / 总量）。
+ * 这是任务进行中能拿到的**真实**完成比例信号：agent 用待办清单组织任务时，
+ * 每改写一次清单就反映"做了几个"，hook 据此调 /task/progress，任务记录的进度
+ * 才不是只有 0% 和 100%。抽不到（非待办工具 / 没有可解析的清单）返回 null。
+ * 兼容各家 schema：todos / todo_list / todoList / items；status 认 completed/done
+ * 算 1、in_progress 算 0.5（正在做那一个算半步），其余算 0。
+ */
+function todoProgress(tool, input) {
+  if (!input || typeof input !== 'object') return null;
+  if (!/todo/i.test(String(tool || ''))) return null;
+  const arr = input.todos || input.todo_list || input.todoList || input.items || [];
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let done = 0;
+  for (const t of arr) {
+    const s = String((t && t.status) || '').toLowerCase();
+    if (s === 'completed' || s === 'done' || s === 'finished') done += 1;
+    else if (s === 'in_progress' || s === 'progress' || s === 'active' || s === 'inprogress') done += 0.5;
+  }
+  return Math.min(1, done / arr.length);
+}
+
+/**
  * 只有这些"写类"工具才打 pending 标记（用于"等授权"兜底推断）。
  * 依据：本环境 events.log 实测 Read/Grep/Glob/ReadLints/Bash 等只读 / 命令类工具
  * **根本不发 PostToolUse**，一旦给它们打 pending，PostToolUse 永远不来、清不掉，
@@ -1313,6 +1335,17 @@ async function main() {
         await request(info, HTTP_ROUTES.FILE_TOUCH, { ...base, memberId: AGENT, files: touched, op: opOf(ev.tool_name) });
         // 本地也记一份：上报失败（服务没起 / 接口报错）时完成概要仍拿得到文件清单
         rememberRoundFiles(file, touched.map((p) => ({ path: p, op: opOf(ev.tool_name) })));
+      }
+      // TodoWrite / 待办清单更新：据此上报"任务进度"（已完成占比）。
+      // 这是任务进行中能拿到的真实完成比例信号——agent 用待办清单组织任务时，
+      // 每改写一次清单就反映"做了几个"，hook 调 /task/progress，任务记录的进度
+      // 才不是只有 0% 和 100%。抽不到（非待办工具 / 清单不可解析）就不上报。
+      const prog = todoProgress(ev.tool_name, ev.tool_input);
+      if (prog != null) {
+        const tid = readState(file).taskId;
+        if (tid) {
+          await request(info, HTTP_ROUTES.TASK_PROGRESS, { ...base, memberId: AGENT, taskId: tid, progress: prog });
+        }
       }
       // 工具真正跑完了 → 权限已通过，撤掉"等授权"，回到"思考中"
       clearAwait(file);

@@ -392,9 +392,10 @@ watch(
     if (firstFastDone && doneAt < trackSince) lastDoneAt = doneAt;
     if (doneAt && doneAt !== lastDoneAt) {
       lastDoneAt = doneAt;
-      // 改动清单：优先用会话快照的 doneFiles（plugin/IDE 楼层那份），没有则退回
-      // reporter 落盘的 done.files（CLI 这一路，带文件大小 size）。系统拿不到 +/- 行数
-      // （没有 git diff 计算），所以只显示文件名 + 大小。
+      // 改动清单：优先用会话快照的 doneFiles（plugin/IDE 楼层这份，带 +/- 行数 + size），
+      // 没有则退回 reporter 落盘的 done.files（CLI 这一路，只有 size）。插件 / IDE 的
+      // file-changes 落盘自带 addedLines / removedLines，所以这里把 +/- 也显示出来；
+      // 体积（size）由服务端现 stat（落盘不给），能拿到就显示。
       const snapFiles = (sel && sel.doneFiles) || [];
       const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({
         name: typeof p === 'string' ? p : (p && p.path) || '',
@@ -403,14 +404,19 @@ watch(
       const files = snapFiles.length ? snapFiles : hookFiles;
       const count = (sel && Number(sel.doneCount)) || (fpDone && Number(fpDone.fileCount)) || files.length;
       const said = (fpDone && fpDone.said) || '';
-      // 有 size 就显示大小（B/KB/MB），没有只显示文件名
+      // 能拿到 +/- 行数（插件 / IDE 路）就显示 +X/-Y；能拿到 size 就显示体积（B/KB/MB）
       const ctx = files.length
         ? [
             `改动 ${count} 个文件`,
             ...files.map((f) => {
               const nm = f && (f.name || f.path) || (typeof f === 'string' ? f : '');
-              const sz = f && typeof f.size === 'number' ? f.size : null;
-              return sz != null ? `${nm}  (${fmtSize(sz)})` : String(nm);
+              const bits = [];
+              const add = f && Number.isFinite(f.added) ? f.added : null;
+              const rm = f && Number.isFinite(f.removed) ? f.removed : null;
+              if (add != null || rm != null) bits.push(`+${add || 0}/-${rm || 0}`);
+              const sz = f && Number.isFinite(f.size) ? f.size : null;
+              if (sz != null) bits.push(fmtSize(sz));
+              return bits.length ? `${nm}  (${bits.join(' · ')})` : String(nm);
             }),
           ]
         : [said || '本次任务已完成'];
