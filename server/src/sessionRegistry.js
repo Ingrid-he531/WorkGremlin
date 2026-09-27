@@ -63,6 +63,15 @@ function mtime(p) {
   }
 }
 
+/** 文件字节数；读不到当 0（0 = 空文件，不算会话，见 scanCliSessions） */
+function sizeOf(p) {
+  try {
+    return fs.statSync(p).size || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * 一行里取工程路径。CodeBuddy 家族 cwd 在顶层；Codex 藏在 payload 里。
  * 这一行 parse 不了（被截断 / 根本不是 JSON）→ 回空，由调用方决定要不要退正则。
@@ -179,7 +188,7 @@ function isDir(p) {
  *     取到 id 的收益是让 3F 的"完成"从"该工程最新"变成按会话精确（见 doneFieldsOf），
  *     渲染层的快轮询也会开始带 ?session=（相位同样受益）。
  *     失败是安全的：形状对不上就回空串 → 退回老行为，不会张冠李戴。
- *   - 其余产品（CodeBuddy / WorkBuddy CLI）：文件名不含会话 id，留空。
+ *   - 其余产品（WorkBuddy CLI）：文件名不含会话 id，留空。
  * @param {string} name 文件名（含扩展名）
  * @param {string} kind 产品基名（products 的 agent：claude / codex / codebuddy …）
  * @returns {string} 会话 id；取不到回空串
@@ -194,6 +203,17 @@ function sessionIdOfFile(name, kind) {
     );
     return m ? m[1] : '';
   }
+  // CodeBuddy CLI：transcript 同样叫 `<session_id>.jsonl`（2026-09-27 实测：
+  // ~/.codebuddy/projects/<工程>/01a0e136-9b12-75d9-a218-f6bd35e168aa.jsonl 与 hook 状态文件
+  // codebuddy__…_01a0e136-9b12-75d9-a218-f6bd35e168aa.json 里的 sessionId 一字不差）。
+  // 老版本给的是 32 位十六进制（无连字符，见 hooks 目录里那几份旧状态文件），一并认。
+  // 形状对不上（history.jsonl 之类）→ 回空，退回老行为。
+  if (kind === 'codebuddy') {
+    const stem = name.replace(/\.jsonl$/i, '');
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (isUuid.test(stem) || /^[0-9a-f]{32}$/i.test(stem)) return stem;
+    return '';
+  }
   return '';
 }
 
@@ -202,16 +222,20 @@ function sessionIdOfFile(name, kind) {
  * 只有文件时间可靠，别的字段读不到就留空。
  *
  * 按 kind 只扫真正放会话的那棵子树：Codex 写在 sessions/YYYY/MM/DD/ 下、
- * Claude Code 写在 projects/<工程目录>/ 下；两家根目录都还有 history.jsonl、
+ * Claude Code 与 CodeBuddy 写在 projects/<工程目录>/ 下；三家根目录都还有 history.jsonl、
  * settings.json 这类不是会话的文件，扫进来全是噪声（顺带也少走一遍 cache / plugins
  * 那些大目录）。
  */
 function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   if (!dataPath) return [];
-  // 只扫真正放会话文件的那棵子树：Codex 在 sessions/ 下，Claude Code 在 projects/ 下。
+  // 只扫真正放会话文件的那棵子树：Codex 在 sessions/ 下，Claude Code 与 CodeBuddy 在 projects/ 下。
   // 根目录里还有 history.jsonl / settings.json 这类不是会话的文件，扫进来全是噪声
   // （顺带也少走一遍 cache / plugins 那些大目录）。
-  const SUBTREE = { codex: 'sessions', claude: 'projects', qoder: 'projects' };
+  // CodeBuddy 这一条是实测补的（2026-09-27）：它漏了，于是 root 退回整个 ~/.codebuddy，
+  // 把 CLI 的**输入历史** history.jsonl（每行 {"display":"…","project":"…"}，你每敲一次回车
+  // 它就更新、还总是最新）当成一条会话列进下拉。
+  // 目录不存在时退回整棵（下面的 isDir 判定），老安装的行为不变。
+  const SUBTREE = { codex: 'sessions', claude: 'projects', qoder: 'projects', codebuddy: 'projects' };
   const sub = SUBTREE[kind] ? path.join(dataPath, SUBTREE[kind]) : '';
   const root = sub && isDir(sub) ? sub : dataPath;
   const out = [];
@@ -236,6 +260,10 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
         continue;
       }
       if (!/\.jsonl$/i.test(e.name)) continue;
+      // 空文件不算会话：会话刚起来、还没写入就被打断，会留下一个 0 字节的 jsonl 占位
+      // （实测 ~/.codebuddy/projects/home-yinghui/<会话>.jsonl 就是这样）。
+      // 它照样有 mtime、照样落进 60 分钟活跃窗口，于是下拉里凭空多一条「未知工程」。
+      if (!sizeOf(p)) continue;
       const at = mtime(p);
       // 文件头部里可能有 cwd（工程路径）；读不到就留空，不猜（解析规则见 cwdOfHead）
       const cwd = cwdOfHead(p);
