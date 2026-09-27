@@ -150,18 +150,18 @@ const SID = 'ses_kilo_0001';
 
 /* ------------------------------ A. 楼层表 ------------------------------ */
 
-head('[A1] 7F 只有一层 Kilo Code：clients = kilo，两路来源（dir 展示 + kilo 产会话）');
+head('[A1] 7F 只有一层 Kilo Code：clients = kilo，一路来源（kilo 轮询 SQLite 产会话）');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '7F');
   ok('7F 这一层存在', Boolean(floor), '楼层表里没有 7F');
   ok('7F 名叫 Kilo Code', floor && floor.name === 'Kilo Code', floor && floor.name);
   ok('这一层只接纳 kilo 一种上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['kilo']), floor && JSON.stringify(floor.clients));
   ok(
-    '两路来源：dir（只作展示）+ kilo（轮询 SQLite 产会话）',
-    floor && JSON.stringify(floor.sources.map((s) => s.kind)) === JSON.stringify(['dir', 'kilo']),
+    '一路来源：kilo（轮询数据根里的 SQLite 产会话），tooltip 里标 CLI/Plugin',
+    floor && JSON.stringify(floor.sources.map((s) => s.kind)) === JSON.stringify(['kilo']) && floor.sources[0].label === 'CLI/Plugin',
     floor && JSON.stringify(floor.sources.map((s) => `${s.label || s.kind}:${s.kind}`))
   );
-  ok('只有 kilo 那一路产会话（dir 不产）', floor && floor.sources.filter((s) => s.sessions !== false).map((s) => s.kind).join(',') === 'kilo', floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
+  ok('kilo 那一路产会话，不标 sessions:false', floor && floor.sources.every((s) => s.sessions !== false), floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
 }
 
 head('[A2] 装了 kilo 可执行文件就算"装了"；数据根是 XDG 位置');
@@ -172,13 +172,13 @@ head('[A2] 装了 kilo 可执行文件就算"装了"；数据根是 XDG 位置')
   ok('kiloHome 与楼层认的是同一个根', kilo.kiloHome() === KILO_HOME, kilo.kiloHome());
 }
 
-head('[A3] 那一路 dir 读不出会话 → 如实带一句说明');
+head('[A3] kilo 那一路：产会话，同时把数据根与"会话是 SQLite"的说明挂在同一行');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '7F');
-  const dir = floor.sources.find((s) => s.kind === 'dir');
-  ok('dir 那一路标了 sessions:false', dir && dir.sessions === false, dir && String(dir.sessions));
-  ok('dir 那一路带一句"取不到会话"的说明', Boolean(dir && dir.note), dir && dir.note);
-  ok('kilo 那一路不带多余说明（它产会话）', !floor.sources.find((s) => s.kind === 'kilo').note, floor.sources.find((s) => s.kind === 'kilo').note);
+  const src = floor.sources.find((s) => s.kind === 'kilo');
+  ok('kilo 那一路产会话', src && src.sessions !== false, src && String(src.sessions));
+  ok('kilo 那一路带着数据根（tooltip 据此显示落盘统计）', Boolean(src && src.dataPathLabel), src && src.dataPathLabel);
+  ok('kilo 那一路说明"会话是 SQLite、不是可扫的文件"', /SQLite/.test((src && src.note) || ''), src && src.note);
 }
 
 /* ------------------------------ B. 会话与相位 ------------------------------ */

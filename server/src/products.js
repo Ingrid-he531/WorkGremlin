@@ -529,6 +529,10 @@ const PRODUCTS = [
     // 或只用 ChatGPT 桌面版的人，命令行里根本没有 codex，但人家确实在跑（会话就是证据）。
     // altPluginRe：仅作安装证据补抓，不影响 kind / client / 会话来源。
     altPluginRe: RE_CODEX_HOST,
+    // 只有一路 cli（~/.codex）：CLI 与 IDE 插件共用同一份落盘、同 hook，分不出，所以这一路
+    // 同时代表两种形态 —— tooltip 里直接标 'CLI/Plugin'，别让人以为这层只认命令行
+    // （1F 是显式挂了 cli + plugin 两路，由前端合成这个叫法；这层只有一路，所以在来源上标）。
+    sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
     dataKind: clientOf('codex', false),
   },
   {
@@ -538,6 +542,9 @@ const PRODUCTS = [
     cmd: 'claude',
     agent: 'claude',
     plugin: false,
+    // 只有一路 cli（~/.claude）：CLI 与 IDE 插件共用同一份配置、同一套 hook、同一份
+    // transcript，分不出，所以这一路同时代表两种形态 —— tooltip 里标 'CLI/Plugin'（类 3F）。
+    sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
     dataKind: clientOf('claude', false),
   },
   {
@@ -595,7 +602,7 @@ const PRODUCTS = [
     sources: [
       {
         kind: 'cli',
-        label: 'CLI / 插件',
+        label: 'CLI/Plugin',
         client: clientOf('qoder', false),
         dirs: [path.join(HOME, '.qoder')],
       },
@@ -616,21 +623,22 @@ const PRODUCTS = [
     // Kilo 没有 hook 子系统（实测 7.8.1 —— 没有 hooks.json、没有任何可挂命令的事件点），
     // 所以既没有 hook 上报，也没有可扫的会话 jsonl：会话、相位、完成标记全部由服务端
     // 轮询它自己的 event-sourced SQLite 推导（见 server/src/kilo.js）。
-    // 两路来源：
-    //   dir   —— 数据根（XDG 位置，见 kilo.js 的 kiloHome）只作落盘展示：
-    //            目录里有日志/快照/会话库，但会话不是"扫文件"能得到的
-    //   kilo  —— 会话来源：轮询 kilo.db（session + event + message 三张表）
+    // 唯一一路来源：
+    //   kilo —— 轮询数据根里的 kilo.db（session + event + message 三张表）产会话，同时带上
+    //           数据根（XDG 位置，见 kilo.js 的 kiloHome）作落盘统计：目录里有日志/快照/会话库，
+    //           但会话不是"扫文件"能得到的，所以那一行的文件数/体积只作展示（见下面的 note）。
+    // label 标 'CLI/Plugin'：这一层同时代表 Kilo Code 的 CLI 与 VS Code 扩展 ——
+    // 扩展自带同一个二进制、共用同一个数据根（见文件头），落盘里没有平台字段可分。
     // kind 用 'kilo' 而不是复用 'cli'：CLI 那一路是"扫 *.jsonl"，Kilo 是"读 SQLite"，
     // 两种完全不同的取法，别让 sessionRegistry 里两条分支互相误认。
     sources: [
       {
-        kind: 'dir',
-        label: '数据根',
+        kind: 'kilo',
+        label: 'CLI/Plugin',
         client: clientOf('kilo', false),
         dirs: [kiloHome()],
-        note: '这一路只作落盘展示：Kilo 的会话是 SQLite 库（kilo.db），不是可扫的会话文件',
+        note: '这一路读的是数据根里的 kilo.db（SQLite），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
       },
-      { kind: 'kilo', client: clientOf('kilo', false) },
     ],
     // 老口径的标记：会话来源既不是 hook 状态文件、也不是 jsonl，就是"轮询 Kilo 自己的库"
     hookSource: true,
@@ -651,8 +659,9 @@ const PRODUCTS = [
     // 改读 `session_message` 的 content[]（见 server/src/opencode.js 文件头的分叉实测）。
     //
     // 两路来源：
-    //   dir       —— 数据根（XDG 位置，见 opencode.js 的 opencodeHome）只作落盘展示
-    //   opencode  —— 会话来源：轮询 opencode.db（session_v2 + session_message 两张表）
+    //   opencode  —— 会话来源：轮询数据根里的 opencode.db（session_v2 + session_message
+    //                两张表）产会话，同时带上数据根（XDG 位置，见 opencode.js 的
+    //                opencodeHome）作落盘统计
     //   hook      —— **装了 WorkGremlin 插件时**的真相位一路：插件订阅 OpenCode 的内存事件流，
     //               把相位/完成标记写成 reporter 状态文件（见 packages/reporter/src/plugin/）。
     //               没装插件这一路空着，8F 照常按轮询列会话，只是相位按推断灰显。
@@ -660,15 +669,16 @@ const PRODUCTS = [
     //               completed/error/running，授权信号只在事件流里（见 opencode.js 文件头）。
     // kind 用 'opencode' 而不是复用 'cli'/'kilo'：那两种是"扫 jsonl"和"读 event 表"，
     // 8F 是"读 session_message"，三种取法别互相误认。
+    // label 标 'CLI/Desktop'：这一层同时代表 OpenCode 的 CLI/TUI、桌面端与网页端 ——
+    // 同一个二进制、同一个数据根（见文件头与 renderer/src/lib/clientMatch.js 的说明）。
     sources: [
       {
-        kind: 'dir',
-        label: '数据根',
+        kind: 'opencode',
+        label: 'CLI/Desktop',
         client: clientOf('opencode', false),
         dirs: [opencodeHome()],
-        note: '这一路只作落盘展示：OpenCode 的会话是 SQLite 库（opencode.db），不是可扫的会话文件',
+        note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
       },
-      { kind: 'opencode', client: clientOf('opencode', false) },
       { kind: 'hook' },
     ],
     hookSource: true,

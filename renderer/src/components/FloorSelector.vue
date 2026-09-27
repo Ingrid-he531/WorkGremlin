@@ -166,8 +166,12 @@ const SOURCE_LABEL = { cli: 'CLI', plugin: 'plugin', dir: '落盘' };
  * 一路落盘的说明文案：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）`
  * 带上这一路自己的 note（取不到会话时服务端给的说明），让"没数据"和"读不到"分得清。
  */
-function sourceLine(src) {
-  const label = src.label || SOURCE_LABEL[src.kind] || src.kind || '落盘';
+function sourceLine(src, allSources = []) {
+  let label = src.label || SOURCE_LABEL[src.kind] || src.kind || '落盘';
+  // If this product has both CLI and plugin sources, show combined label for clarity
+  if (src.kind === 'cli' && Array.isArray(allSources) && allSources.some((s) => s && s.kind === 'plugin')) {
+    label = 'CLI/Plugin';
+  }
   if (!src.dataPathLabel) return { text: `${label}：没有找到落盘目录`, note: src.note || '' };
   const s = src.stats || {};
   const bits = [];
@@ -204,13 +208,13 @@ function tip(p) {
   const sources = allSources.filter((src) => src && src.kind !== 'hook');
   if (sources.length) {
     for (const src of sources) {
-      const line = sourceLine(src);
+      const line = sourceLine(src, sources);
       lines.push(line.text);
       if (line.note) lines.push(`    · ${line.note}`);
     }
   } else if (p.dataPathLabel) {
     // 老服务端（没有 sources 字段）的兜底：单行"落盘：…"
-    const line = sourceLine({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats });
+    const line = sourceLine({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats }, []);
     lines.push(line.text);
     if (line.note) lines.push(`    · ${line.note}`);
   } else {

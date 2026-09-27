@@ -208,8 +208,8 @@ head('[A] 楼层表：8F 只有一层 OpenCode');
   ok('8F 存在且名叫 OpenCode', floor && floor.name === 'OpenCode', floor && floor.name);
   ok('这一层只接纳 opencode 一种上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode']), floor && JSON.stringify(floor.clients));
   ok(
-    '三路来源：dir（只作展示）+ opencode（轮询产会话）+ hook（收插件真相位）',
-    floor && floor.sources.length === 3 && floor.sources.map((s) => s.kind).join(',') === 'dir,opencode,hook',
+    '两路来源：opencode（轮询产会话 + 数据根落盘统计，标 CLI/Desktop）+ hook（收插件真相位）',
+    floor && floor.sources.length === 2 && floor.sources.map((s) => s.kind).join(',') === 'opencode,hook' && floor.sources[0].label === 'CLI/Desktop',
     floor && floor.sources.map((s) => s.kind).join(',')
   );
   ok(
@@ -220,8 +220,8 @@ head('[A] 楼层表：8F 只有一层 OpenCode');
   ok('数据根是 XDG 位置（~/.local/share/opencode）', floor && String(floor.sources[0].dataPathLabel).endsWith('.local/share/opencode'), floor && floor.sources[0].dataPathLabel);
   ok('安装位置认出 ~/.opencode/bin/opencode', floor && String(floor.installPathLabel).endsWith('.opencode/bin/opencode'), floor && floor.installPathLabel);
   ok(
-    'dir 那一路读不出会话 → 如实带一句说明',
-    floor && floor.sources[0].sessions === false && /SQLite/.test(floor.sources[0].note || ''),
+    'opencode 那一路带着数据根，并说明"会话是 SQLite、不是可扫的文件"',
+    Boolean(floor && floor.sources[0].dataPathLabel) && floor.sources[0].sessions !== false && /SQLite/.test(floor.sources[0].note || ''),
     floor && `${floor.sources[0].sessions} ${floor.sources[0].note}`
   );
   ok('核心表齐了（session_v2 + session_message）', opencode.hasCoreTables() === true);
