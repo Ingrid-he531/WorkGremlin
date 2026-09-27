@@ -449,13 +449,12 @@ async function saveRetention() {
             <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
             <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
+            <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
+            <div class="k">本轮文件变化</div>
+            <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
           </div>
 
           <div v-if="filesOf(tasks.selectedTask).length" class="files">
-            <!-- 文件数并到这一行当标题（原来另起一行叫「改动文件」，跟下面「改动文件 (N)」重名） -->
-            <div class="files-head">
-              本轮文件变化 ({{ tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : '—' }})
-            </div>
 
             <template v-if="addedFiles(tasks.selectedTask).length">
               <div class="cat">新增文件 ({{ addedFiles(tasks.selectedTask).length }})</div>
@@ -877,6 +876,8 @@ async function saveRetention() {
 }
 .kv .k { color: var(--text-faint); }
 .kv .v { color: var(--text); font-family: var(--mono); word-break: break-all; }
+/* 文件数量：亮白色 + 加粗，与上方各值区分 */
+.kv .v.v-bright { color: #fff; font-weight: 600; }
 
 .files { margin-top: 12px; }
 .files-head { font-size: 12px; color: var(--text-dim); margin-bottom: 5px; letter-spacing: 0.5px; }
