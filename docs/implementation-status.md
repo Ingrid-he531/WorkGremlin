@@ -85,11 +85,15 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 `## Open tabs:`，用户那句话在 `## My request:` 之后。hook 按 `userRequestText()` 只取请求正文：
 整段（含被截断的）注入块当标题，任务列表里就只剩一堆 IDE 上下文、用户的话一个字看不见；
 老数据在渲染层按同一套规则（`TaskRecordsView.vue` 的 `promptOf()`）再剥一次。
-② 改动文件两路取：PostToolUse 从 `tool_input` 解析 apply_patch 的 patch 文本（`command` / `input`
+② 改动文件三路取：PostToolUse 从 `tool_input` 解析 apply_patch 的 patch 文本（`command` / `input`
 键都认），收工时再按 transcript 里 apply_patch 的权威清单（`Success. Updated the following files:`
 + `M/A/D <路径>`）按**本轮开始时刻**补一遍 —— IDE 形态的 PostToolUse 常常不带 patch 文本，
 只靠前者就会"任务结束没有改动文件列表"。自检见 `npm run test:ide-hook`
 （`server/test/ideHook.test.js`）。
+第三路是**兜底**：按 mtime 扫 `git ls-files`（受版本控制的 + 未跟踪但非忽略的）里**本轮开始后**
+动过的文件 —— agent 用 shell 改文件（`sed -i` / `patch` / python 写文件 / 重定向）时前两路都看不到，
+实测 2026-09-27 有一轮真改了 3 个文件、任务里却显示"文件变化 0"；被 .gitignore 忽略的构建产物
+（`dist/` 等）不算，非 git 工程这一路自动退空。
 ③ 客户端标签分 CLI / 插件：Codex 的 CLI 与 VS Code 扩展共用一份 `~/.codex`、client 都是 `codex`，
 光看 client 只能显示「Codex」。hook 从 rollout 的 `session_meta`（`source` / `originator`）认出形态
 （`form = 'cli' | 'plugin'`，见 `codexForm()`）随任务一起上报，落 `task_runs.form`，任务列表按

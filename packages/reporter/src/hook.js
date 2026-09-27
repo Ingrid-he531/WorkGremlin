@@ -49,7 +49,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, execSync } = require('node:child_process');
 
 const { readServerInfo, HTTP_ROUTES } = require('./index');
 const { fnv1a32 } = require('@workgremlin/shared');
@@ -518,6 +518,50 @@ function codexForm(transcriptPath) {
     if (who.trim()) return 'cli';
   }
   return '';
+}
+
+/**
+ * 兜底那一路：按**文件 mtime** 扫出这一轮碰过的文件。
+ *
+ * 另外两路都盯着 agent 的工具入参（PostToolUse 的目标文件、transcript 里 apply_patch 的
+ * 权威清单）。agent 用 shell 改文件时它们全瞎：`sed -i` / `patch` / python 写文件 / 重定向
+ * —— 实测 2026-09-27 那一轮真改了 3 个文件，任务里"文件变化"却是 0。
+ * 口径：`git ls-files` 里（受版本控制的 + 未跟踪但非忽略的）mtime ≥ 本轮开始时刻的文件，
+ * 与"用什么工具改的"无关；被 .gitignore 忽略的构建产物（dist/ 等）不算，非 git 工程回空。
+ * @param {string} ws 工程目录（git 仓库）
+ * @param {number} sinceTs 本轮开始时刻（拿不到就不扫）
+ * @returns {{path:string, op:string}[]} 未跟踪 = write（新增）、已跟踪 = edit
+ */
+function touchedSince(ws, sinceTs) {
+  if (!ws || !(Number(sinceTs) > 0)) return [];
+  const git = (args) =>
+    execSync(`git ${args}`, {
+      cwd: ws,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: 4000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  let list;
+  try {
+    const tracked = git('ls-files -z --cached').split('\0').filter(Boolean);
+    const others = git('ls-files -z --others --exclude-standard').split('\0').filter(Boolean);
+    list = [...tracked.map((p) => [p, 'edit']), ...others.map((p) => [p, 'write'])];
+  } catch {
+    return []; // 不是 git 仓库 / git 不可用：这一路没有就拉倒，绝不猜
+  }
+  if (list.length > 30000) return []; // 巨型仓库：别在 Stop 里 stat 十几秒
+  const out = [];
+  for (const [rel, op] of list) {
+    if (!rel || rel.startsWith('.git/')) continue;
+    try {
+      if (fs.statSync(path.resolve(ws, rel)).mtimeMs >= Number(sinceTs) - 2000) out.push({ path: rel, op });
+    } catch {
+      /* 已删除 / 读不到：这一路不管（apply_patch 那一路会带出来） */
+    }
+    if (out.length >= 200) break;
+  }
+  return out;
 }
 
 /** 编辑类算 edit，删除类算 delete，其余写类算 write（server 侧按 op 分 新增/改动/删除） */
@@ -1590,6 +1634,13 @@ async function main() {
       byAbs.set(abs, { path: p, op: typeof x === 'string' ? null : x.op, abs });
     }
     for (const t of transcriptRoundFiles(ev.transcript_path || st.transcriptPath || '', startedAt)) {
+      const abs = path.resolve(baseDir, t.path);
+      const prev = byAbs.get(abs);
+      byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });
+    }
+    // 第三路（兜底）：按 mtime 扫这一轮碰过的文件（见 touchedSince）—— agent 用 shell 改
+    // 文件时上面两路都看不到（实测"真改了 3 个文件却显示 0"）。前两路已知的 op 更准，不覆盖。
+    for (const t of touchedSince(baseDir, startedAt)) {
       const abs = path.resolve(baseDir, t.path);
       const prev = byAbs.get(abs);
       byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });

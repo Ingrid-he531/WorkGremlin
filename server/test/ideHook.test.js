@@ -203,6 +203,25 @@ async function main() {
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform3', cwd: WS, prompt: '读不到 rollout 的一轮' });
   ok('读不到 rollout 就不猜（form 为空）', !starts[starts.length - 1].form, JSON.stringify(starts[starts.length - 1]));
 
+
+  /* [8] 兜底那一路：agent 用 shell 改文件（sed -i / patch / python）时，前两路都看不到，
+   *     靠 mtime 扫（git ls-files 里 mtime ≥ 本轮开始）把"文件变化 0"救回来 */
+  head('[8] mtime 兜底：shell 改过的文件也要算进本轮改动');
+  const { execSync } = require('node:child_process');
+  const TMPGIT = path.join(TMP, 'gitws');
+  fs.mkdirSync(path.join(TMPGIT, 'src'), { recursive: true });
+  execSync('git init -q', { cwd: TMPGIT });
+  fs.writeFileSync(path.join(TMPGIT, 'src/tracked.js'), 'export const t = 1;\n');
+  execSync('git add src/tracked.js', { cwd: TMPGIT });
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'idegit1', cwd: TMPGIT, prompt: '用 shell 改两个文件' });
+  await new Promise((r) => setTimeout(r, 20)); // mtime 必须晚于本轮开始
+  fs.writeFileSync(path.join(TMPGIT, 'src/tracked.js'), 'export const t = 2;\n');
+  fs.writeFileSync(path.join(TMPGIT, 'src/new.js'), 'export const n = 1;\n');
+  await runHook({ hook_event_name: 'Stop', session_id: 'idegit1', cwd: TMPGIT, transcript_path: '' });
+  const files8 = (stateOf('idegit1').done.files || []).map((f) => `${f.path}:${f.op}`);
+  ok('改过的已跟踪文件进来了', files8.includes('src/tracked.js:edit'), JSON.stringify(files8));
+  ok('新建的未跟踪文件按 write 记', files8.includes('src/new.js:write'), JSON.stringify(files8));
+  ok('本轮之前就有的文件不算（src/foo.js 是上一轮写的）', !files8.some((x) => x.startsWith('src/foo.js')), JSON.stringify(files8));
   server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
