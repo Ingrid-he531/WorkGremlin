@@ -32,6 +32,9 @@ const { createDemo } = require('./demo');
 const { createLifecycle } = require('./lifecycle');
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { snapshot: registrySnapshot } = require('./sessionRegistry');
+const { startCopilotTaskSyncer } = require('./copilotTasks');
+const { startKiloTaskSyncer } = require('./kiloTasks');
+const { startOpencodeTaskSyncer } = require('./opencodeTasks');
 const config = require('./config');
 const clock = require('./clock');
 
@@ -265,6 +268,21 @@ function createServer(opts = {}) {
 
     // 记录自动保留：启动即清一次，之后每 24h 按 retentionDays 清掉更早的任务记录。
     // 定时器 unref 不阻止进程退出；清理失败不影响主流程。
+    // 9F Copilot 任务同步：Copilot 没有 reporter hook，不会自己往 tasks 表写东西。
+    // 这个同步器每 5s 轮询 Copilot 的 session-store.db，把会话写成 task + task_run，
+    // 让任务列表和主控制台都能看到 9F。异常吞掉不阻断主循环。
+    timers.push(startCopilotTaskSyncer({ bus, repo, now: () => clock.now() }));
+
+    // 7F Kilo Code 任务同步：同 9F Copilot 的道理 —— Kilo 没有 reporter hook，
+    // 不会自己往 tasks 表写东西。同步器每 5s 轮询 Kilo 的 kilo.db，
+    // 把会话写成 task + task_run（含 model 信息），让任务列表能看到 7F。
+    timers.push(startKiloTaskSyncer({ bus, repo, now: () => clock.now() }));
+
+    // 8F OpenCode 任务同步：同 7F/9F —— OpenCode 没有 hook 时不会自己往 tasks 表写东西。
+    // 同步器每 5s 轮询 opencode.db（session_message 的 user/assistant/idle 消息流），
+    // 把**每一轮用户任务**写成 task + task_run，让任务列表能看到 8F。
+    timers.push(startOpencodeTaskSyncer({ bus, repo, now: () => clock.now() }));
+
     const runRetentionCleanup = () => {
       try {
         const days = repo.getRetentionDays();

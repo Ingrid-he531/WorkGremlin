@@ -66,7 +66,19 @@ async function bootstrap() {
     return;
   }
 
-  ipcMain.handle(IPC_EVENTS.GET_SERVER_INFO, () => serverInfo);
+  /**
+   * 渲染层每次（重）连前都会来问一次当前 server 信息 —— **每次都重读 server.json**。
+   *
+   * server 每次启动都会换 token（见 server/src/config.js 的 newToken），如果这里只回
+   * 启动那一刻缓存的那份，server 一重启渲染层就拿着旧 token 一直重连（服务端 close 4001
+   * bad_token）+ 所有 HTTP 轮询 401，界面停在旧数据上不再更新（实测：任务列表里"运行中"
+   * 的任务消失，只剩旧记录）。所以这里现读现给，读不到才退回缓存。
+   */
+  ipcMain.handle(IPC_EVENTS.GET_SERVER_INFO, () => {
+    const fresh = readServerInfoFile();
+    if (fresh) serverInfo = fresh;
+    return serverInfo;
+  });
   ipcMain.handle(IPC_EVENTS.GET_APP_VERSION, () => app.getVersion());
 
   // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）

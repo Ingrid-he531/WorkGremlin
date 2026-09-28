@@ -522,7 +522,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
             target: truth ? truth.target || '' : ph ? ph.target : '',
             tool: truth ? truth.tool || '' : ph ? ph.tool : '',
             context: truth ? truth.context || [] : ph ? ph.context : [],
-            prompt: truth ? truth.prompt || '' : '',
+            // 「思考中」屏上显示的那句用户原话。轮询这一路**也要给**（kilo.js 自己从库里取，
+            // 见 readRoundPrompt）—— 早先这里只透传插件那份、轮询一律空串，于是没装插件时
+            // 7F 的「思考中」一个字都没有（别的楼层都有，因为它们的 hook 写了 taskTitle）。
+            prompt: truth ? truth.prompt || '' : ph ? ph.prompt || '' : '',
             // **只有轮询推导才标 inferred**（我们是轮询，不是它主动报的）；
             // 插件上报的是真值，标 true 会让 UI 把上报也灰显掉。
             inferred: !truth,
@@ -570,7 +573,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
             target: ph ? ph.target : '',
             tool: ph ? ph.tool : '',
             context: ph ? ph.context : [],
-            prompt: '',
+            // 「思考中」屏上那句用户原话（opencode.js 从 user 消息的 data.text 取；没有就空）
+            prompt: (ph && ph.prompt) || '',
+            // 模型从会话表取（真实值，取不到留空不猜）
+            model: s.model || '',
             inferred: true,
             // 完成标记：OpenCode 那边等价于"assistant 消息 finish=stop"（见 opencode.js）
             ...readOpencodeDone(s.id, s),
@@ -689,6 +695,11 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       clients: p.clients && p.clients.length ? p.clients : p.dataKind ? [p.dataKind] : [],
       installed: Boolean(p.installed),
       installPathLabel: p.installPathLabel || '',
+      // 安装位置逐形态清单（CLI / 插件各一条，见 products.js 的 detectOne）：
+      // 楼层胶囊 tooltip 照它逐行显示"安装 CLI / 安装 插件"。**必须显式透传** ——
+      // 这里只挑字段下发，漏了它前端就拿不到、退回单行兜底，合并楼层（1F CodeBuddy）
+      // 的插件扩展目录会被吞掉。
+      installPaths: Array.isArray(p.installPaths) ? p.installPaths : [],
       dataPathLabel: p.dataPathLabel || '',
       stats: p.stats || null,
       // 落盘来源（合并楼层多路，含每路的落盘目录与统计）—— 楼层悬浮提示按它逐路显示

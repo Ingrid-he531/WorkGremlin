@@ -968,8 +968,11 @@ export function createIsoOffice(canvas, opts = {}) {
 
   /** 椅子底座：五星脚 + 中柱 + 座板（永远画在坐着的人之前） */
   function drawChairBase(c, x, y) {
-    isoCylinder(c, { x, y, z: 0.02, r: 0.26, h: 0.04, color: colors.metalDark });
-    isoCylinder(c, { x, y, z: 0.06, r: 0.05, h: 0.34, color: colors.metal });
+    // 底座（五星脚 + 中柱）统一亮银色（只改椅子底座，不动全局 metal token：
+    // 复印机 / 饮水机 / 杂志架都在用 colors.metal）
+    const SILVER = '#2b2f36';
+    isoCylinder(c, { x, y, z: 0.02, r: 0.26, h: 0.04, color: '#1d2025' });
+    isoCylinder(c, { x, y, z: 0.06, r: 0.05, h: 0.34, color: SILVER });
     isoBox(c, { x: x - 0.24, y: y - 0.24, z: 0.4, w: 0.48, d: 0.48, h: 0.08, color: colors.chair });
   }
 

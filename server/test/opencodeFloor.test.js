@@ -206,7 +206,7 @@ head('[A] 楼层表：8F 只有一层 OpenCode');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '8F');
   ok('8F 存在且名叫 OpenCode', floor && floor.name === 'OpenCode', floor && floor.name);
-  ok('这一层只接纳 opencode 一种上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode']), floor && JSON.stringify(floor.clients));
+  ok('这一层接纳 opencode 与 opencode-plugin 两种上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode', 'opencode-plugin']), floor && JSON.stringify(floor.clients));
   ok(
     '两路来源：opencode（轮询产会话 + 数据根落盘统计，标 CLI/Desktop）+ hook（收插件真相位）',
     floor && floor.sources.length === 2 && floor.sources.map((s) => s.kind).join(',') === 'opencode,hook' && floor.sources[0].label === 'CLI/Desktop',
@@ -297,6 +297,86 @@ head('[B4] 相位：reasoning → 思考中');
 
 head('[B5] 相位：type=idle 行（OpenCode 的**显式**空闲标记）→ 待命');
 {
+  // [B4b] 回归（2026-09-28 实测）：这一轮的 assistant 消息 parts 是 [reasoning, text]，
+  // **还没写完**（没有 time.completed）。从后往前扫先撞到 text —— 早先把 text 一律当待命，
+  // 于是整轮都显示"待命/任务完成"，看不到"思考中"。正在流式的 text 应该算思考中。
+  const dbIn = new Database(DB);
+  const streaming = { time: { created: now - 3_000 }, content: [{ type: 'reasoning', text: '在想' }, { type: 'text', text: '正在往外吐字' }] };
+  dbIn.prepare('UPDATE session_message SET data=? WHERE session_id=? AND seq=2').run(JSON.stringify(streaming), 'ses_live0000000000000000000001');
+  dbIn.close();
+  const phStream = opencode.readOpencodePhase('ses_live0000000000000000000001');
+  ok('流式中的 text → 思考中（不是待命）', phStream && phStream.phase === 'thinking', phStream && phStream.phase);
+
+  const dbDone = new Database(DB);
+  dbDone.prepare('UPDATE session_message SET data=? WHERE session_id=? AND seq=2').run(
+    JSON.stringify({ ...streaming, time: { created: now - 3_000, completed: now - 1_000 }, finish: 'stop' }),
+    'ses_live0000000000000000000001'
+  );
+  dbDone.close();
+  const phDone = opencode.readOpencodePhase('ses_live0000000000000000000001');
+  ok('写完（有 completed + finish=stop）的 text → 待命', phDone && phDone.phase === 'idle', phDone && phDone.phase);
+
+  // 工具步：这一步以"要调工具"收尾（finish=tool-calls），而工具块落盘时**常常已经跑完**
+  // （`read` 这种毫秒级），status 是 completed —— 早先只认 running，于是整轮看不到"调用工具"
+  // （实测 2026-09-28：一轮 10 次工具调用，1.5s 采样只撞到 1 帧）。现在"以调工具收尾、
+  // 下一步还没出现"就算在用工具。
+  const dbTool = new Database(DB);
+  dbTool.prepare('UPDATE session_message SET data=? WHERE session_id=? AND seq=2').run(
+    JSON.stringify({
+      time: { created: now - 3_000, streamed: now - 2_500, completed: now - 2_000 },
+      finish: 'tool-calls',
+      content: [
+        { type: 'reasoning', text: '先看一下' },
+        { type: 'tool', name: 'read', state: { status: 'completed', input: { path: '/tmp/ProjO/a.js' } } },
+      ],
+    }),
+    'ses_live0000000000000000000001'
+  );
+  dbTool.close();
+  const phTool = opencode.readOpencodePhase('ses_live0000000000000000000001');
+  ok(
+    '以调工具收尾的步（finish=tool-calls、工具已 completed）→ 调用工具',
+    phTool && phTool.phase === 'tool' && phTool.tool === 'read',
+    phTool && JSON.stringify({ phase: phTool.phase, tool: phTool.tool, action: phTool.action })
+  );
+
+  // 轮次刚开跑：最新一条是 **user** 消息（assistant 行还没写出来）→ 思考中，不是待命。
+  // 实测 2026-09-28：缺这条时，用户发完消息后那十几秒主控制台显示"待命"，
+  // 整轮采样里只有 tool → idle 在来回切，看不到"思考中"。
+  const dbUser = new Database(DB);
+  dbUser
+    .prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)')
+    .run(
+      'ses_live0000000000000000000001#96',
+      'ses_live0000000000000000000001',
+      'user',
+      96,
+      now,
+      now,
+      JSON.stringify({ time: { created: now }, text: '刚发的一句话' })
+    );
+  dbUser.close();
+  const phUser = opencode.readOpencodePhase('ses_live0000000000000000000001');
+  ok('最新是 user 消息（assistant 还没出来）→ 思考中', phUser && phUser.phase === 'thinking', phUser && phUser.phase);
+  ok('「思考中」带上这句话', phUser && phUser.prompt === '刚发的一句话', phUser && phUser.prompt);
+  const dbUserClean = new Database(DB);
+  dbUserClean.prepare('DELETE FROM session_message WHERE session_id=? AND seq=96').run('ses_live0000000000000000000001');
+  dbUserClean.close();
+
+  // 还原成 fixture 原本的"正在跑（shell running）"，后面的用例继续按原状态跑
+  const dbRestore = new Database(DB);
+  dbRestore.prepare('UPDATE session_message SET data=? WHERE session_id=? AND seq=2').run(
+    JSON.stringify({
+      time: { created: now - 5_000, streamed: now - 4_000 },
+      content: [
+        { type: 'reasoning', text: '先看文件' },
+        { type: 'tool', name: 'shell', state: { status: 'running', input: { command: 'ls -la /tmp/ProjO' } } },
+      ],
+    }),
+    'ses_live0000000000000000000001'
+  );
+  dbRestore.close();
+
   const db = new Database(DB);
   // 在"正在跑"那条上面压一条更新的 idle 行：显式空闲就该是待命，哪怕更下面还有 running 的工具
   db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)').run(
@@ -436,7 +516,7 @@ head('[E] 插件写的状态文件能被认出来（真相位优先于轮询）'
   // 4 小时前那条早过了 60 分钟超时（与 prune 同一把尺子），所以只剩"正在跑"+"刚收工"两条
   ok('8F 会话表列得出**还在超时窗口内**的会话', ids8.includes('ses_live0000000000000000000001') && ids8.includes('ses_done0000000000000000000001'), ids8.join(' '));
   ok('超时（60 分钟无动静）的会话已被剔除', !ids8.includes('ses_old00000000000000000000001'), ids8.join(' '));
-  ok('clients = opencode（前端按它过滤相位与成员）', snap.floors.every((f) => f.id !== '8F' || JSON.stringify(f.clients) === JSON.stringify(['opencode'])));
+  ok('clients = opencode + opencode-plugin（前端按它过滤相位与成员）', snap.floors.every((f) => f.id !== '8F' || JSON.stringify(f.clients) === JSON.stringify(['opencode', 'opencode-plugin'])));
 
   // 真相位那一路：/reporter-phase 的组装逻辑（直接调函数，免得起服务）
   const { opencodeMainPhase, opencodeInstrumented } = require('../src/opencode');

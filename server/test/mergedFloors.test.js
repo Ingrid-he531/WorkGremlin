@@ -48,13 +48,16 @@ fs.mkdirSync(path.join(HOME, '.vscode', 'extensions', 'tencent-cloud.coding-copi
 fs.mkdirSync(path.join(HOME, '.codebuddy'), { recursive: true });
 // 5F TraeCode：装的是国内版 IDE（trae-cn 在 PATH 上），插件形态由 runner 自带、没有独立可执行文件
 fs.writeFileSync(path.join(BIN, 'trae-cn'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-// 6F Qoder：沙箱里放一个 qoder 可执行文件（让"装了"判定命中），并立一个 ~/.qoder 落盘根
+// 6F Qoder：沙箱里放一个 qoder 可执行文件（让"装了"判定命中），并立一个 ~/.qoder 落盘根；
+// 再放一个 Qoder CN 的编辑器插件（通义灵码，displayName 就是 "Qoder CN (Formerly Lingma)"）
 fs.writeFileSync(path.join(BIN, 'qoder'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 fs.mkdirSync(path.join(HOME, '.qoder'), { recursive: true });
+fs.mkdirSync(path.join(HOME, '.vscode', 'extensions', 'alibaba-cloud.tongyi-lingma-2.6.10'), { recursive: true });
 // 插件那一路的落盘根：故意**不放** genie-history —— 复现"这一路读不出会话"
 fs.mkdirSync(path.join(HOME, '.marscode', 'ai-chat', 'AppData', 'vscode', 'ai-agent'), { recursive: true });
 fs.writeFileSync(path.join(HOME, '.marscode', 'ai-chat', 'AppData', 'vscode', 'ai-agent', 'database.db'), 'not a sqlite\n');
 fs.mkdirSync(path.join(HOME, '.trae-cn', 'memory', 'projects'), { recursive: true });
+fs.mkdirSync(path.join(HOME, '.vscode', 'extensions', 'GitHub.copilot-1.0.0'), { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
 process.env.PATH = BIN;
@@ -88,6 +91,32 @@ fs.mkdirSync(path.join(PROJ_DIR, 'conversations', PLUGIN_SID), { recursive: true
 fs.mkdirSync(path.join(STORAGE, 'todos'), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'file-changes', PLUGIN_SID), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'message-queue'), { recursive: true });
+
+const GITHUB_STORAGE = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat');
+const GITHUB_SID = 'github-sqlite-session-123';
+fs.mkdirSync(GITHUB_STORAGE, { recursive: true });
+const Database = require('better-sqlite3');
+const db = new Database(path.join(GITHUB_STORAGE, 'session-store.db'));
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      cwd TEXT,
+      repository TEXT,
+      host_type TEXT,
+      branch TEXT,
+      summary TEXT,
+      agent_name TEXT,
+      agent_description TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+  `);
+  db.prepare('INSERT INTO sessions (id, cwd, repository, host_type, branch, summary, agent_name, agent_description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(GITHUB_SID, WS, 'demo/repo', 'vscode', 'main', 'github highlight', 'GitHub Copilot Chat', '', new Date().toISOString(), new Date().toISOString());
+} finally {
+  db.close();
+}
 // current.json 指到这条会话：它才是"这个工程当前开着的会话"（吃得到 reporter 的实时相位）
 fs.writeFileSync(path.join(PROJ_DIR, 'current.json'), JSON.stringify({ conversationId: PLUGIN_SID, lastUpdated: new Date().toISOString() }));
 fs.writeFileSync(
@@ -330,6 +359,7 @@ head('[C] 楼层表：6F 只有一层 Qoder（CLI 与插件合并，cli 扫 tran
   );
   ok('cli 与 hook 两路都产会话（cli 扫 transcript、hook 兜底）', floor && floor.sources.filter((s) => s.sessions !== false).map((s) => s.kind).join(',') === 'cli,hook', floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
   ok('装了 qoder（沙箱里放了可执行文件）就算装了', floor && floor.installed === true, floor && String(floor.installPath));
+  ok('Qoder CN 编辑器插件（tongyi-lingma）算插件安装证据', floor && String(floor.pluginInstallPath || '').includes('tongyi-lingma'), floor && String(floor.pluginInstallPath));
   ok('cli 那一路扫的是 ~/.qoder（子树 projects）', Boolean(floor.sources.find((s) => s.kind === 'cli')) && String(floor.sources.find((s) => s.kind === 'cli').dataPathLabel).endsWith('.qoder'));
 }
 
@@ -367,6 +397,238 @@ head('[C3] 6F 也吃落盘 transcript：~/.qoder/projects/<工程>/<会话>.json
   ok('落盘 transcript 那条会话被 cli 那一路扫出', Boolean(row) && row.sourceKind === 'cli', floor.sessions.map((s) => `${s.sourceKind}:${s.sessionId}`).join(' '));
   ok('会话 id 从文件名取到（与 Claude 同款）', Boolean(row) && row.sessionId === Q_TSID, row && row.sessionId);
   ok('工程路径从 cwd 解析到', Boolean(row) && row.projectPath === Q_PROJ, row && row.projectPath);
+}
+
+/* [D] 9F GitHub Copilot：插件扩展一层，视觉上可展示且可点 */
+head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
+{
+  const products = detectProducts({ force: true });
+  const floor = products.find((p) => p.id === '9F');
+  ok('有 9F 这一层', Boolean(floor), products.map((p) => p.id).join(' '));
+  ok('9F 名叫 GitHub Copilot', floor && floor.name === 'GitHub Copilot', floor && floor.name);
+  ok('9F 只接纳 copilot-plugin 这一路上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['copilot-plugin']), floor && JSON.stringify(floor.clients));
+  ok('插件扩展目录命中后会被判定为已安装', floor && floor.installed === true, floor && String(floor.installPath));
+  ok('9F 视图层会拿到插件落盘源', floor && floor.sources.some((s) => s.kind === 'plugin'), floor && JSON.stringify(floor.sources.map((s) => s.kind)));
+
+  const ghStorage = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat');
+  const tencentStorage = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'tencent-cloud.coding-copilot');
+  const globalStorageRoot = path.join(HOME, '.config', 'Code', 'User', 'globalStorage');
+  fs.mkdirSync(globalStorageRoot, { recursive: true });
+  fs.mkdirSync(ghStorage, { recursive: true });
+  fs.mkdirSync(tencentStorage, { recursive: true });
+
+  const ghSid = 'gh-copilot-session-9f';
+  const Database = require('better-sqlite3');
+  const db = new Database(path.join(ghStorage, 'session-store.db'));
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      cwd TEXT,
+      repository TEXT,
+      host_type TEXT,
+      branch TEXT,
+      summary TEXT,
+      agent_name TEXT,
+      agent_description TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS turns (
+      id INTEGER PRIMARY KEY,
+      session_id TEXT,
+      turn_index INTEGER,
+      user_message TEXT,
+      assistant_response TEXT,
+      timestamp TEXT
+    );
+    CREATE TABLE IF NOT EXISTS session_files (
+      id INTEGER PRIMARY KEY,
+      session_id TEXT,
+      file_path TEXT,
+      tool_name TEXT,
+      turn_index INTEGER,
+      first_seen_at TEXT
+    );
+  `);
+  const nowIso = new Date().toISOString();
+  db.prepare(`INSERT INTO sessions (id, cwd, repository, host_type, branch, summary, agent_name, agent_description, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(ghSid, '/tmp/ProjGitHubCopilot', 'https://example.com/repo.git', 'vscode', 'main', 'github highlight', 'GitHub Copilot Chat', '', nowIso, nowIso);
+  db.prepare(`INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp) VALUES (?, ?, ?, ?, ?)`)
+    .run(ghSid, 0, 'fix the highlight bug', 'done', nowIso);
+  db.prepare(`INSERT INTO session_files (session_id, file_path, tool_name, turn_index, first_seen_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(ghSid, '/tmp/ProjGitHubCopilot/src/highlight.ts', 'read_file', 0, nowIso);
+  // 读过的文件不算"改动文件"（Copilot 0.65.0 的 session_files 整表都是 read_file，实测）；
+  // 写工具碰过的才算 —— 下面两条一起验证这个筛子。
+  db.prepare(`INSERT INTO session_files (session_id, file_path, tool_name, turn_index, first_seen_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(ghSid, '/tmp/ProjGitHubCopilot/src/changed.ts', 'edit_file', 0, nowIso);
+  db.close();
+
+  // GitHub Copilot 的真实落盘是 SQLite `session-store.db`，不是 `genie-history`。
+  // 这条回归确保不再把真实会话库当成“空目录”，否则 9F 会被旧的 Tencent 目录覆盖、胶囊永远不亮。
+
+  const tencentDir = path.join(tencentStorage, 'genie-history', Buffer.from('/tmp/ProjGitHubCopilot').toString('base64'));
+  fs.mkdirSync(path.join(tencentDir, 'conversations', 'old-session'), { recursive: true });
+  fs.writeFileSync(path.join(tencentDir, 'current.json'), JSON.stringify({ conversationId: 'old-session', lastUpdated: new Date().toISOString() }));
+  fs.mkdirSync(path.join(tencentStorage, 'todos'), { recursive: true });
+  fs.writeFileSync(path.join(tencentStorage, 'todos', 'old-session.json'), JSON.stringify({ todos: [{ status: 'in_progress', content: 'stale tencent' }] }));
+
+  // 这条是根因回归：同一台机上会同时有老的 Tencent Copilot 目录和新的 GitHub Copilot 目录；
+  // 代码必须优先选真正的 GitHub Copilot，不然 9F 会被旧目录吞掉，胶囊永远不亮。
+  const sessionSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const storage = sessionSnap.storage;
+  ok('9F 优先选 GitHub Copilot 的真实插件存储', storage === ghStorage, `实际 ${storage}，期望 ${ghStorage}`);
+  ok('9F 能从 GitHub Copilot 的真实 SQLite 会话库读出活跃会话', Array.isArray(sessionSnap.sessions) && sessionSnap.sessions.some((s) => s.id === ghSid), JSON.stringify(sessionSnap.sessions.map((s) => s.id)));
+  ok('旧的 Tencent Copilot 目录不会覆盖 GitHub Copilot 的 9F 亮起', !storage || storage !== tencentStorage, `实际 ${storage}`);
+
+  // 任务记录：Copilot 的 turns / session_files 表读出来后要体现在会话行里
+  const ghSession = sessionSnap.sessions.find((s) => s.id === ghSid);
+  ok('9F 会话带 Copilot 的 summary 作标题', ghSession && ghSession.doneTitle === 'github highlight', ghSession && ghSession.doneTitle);
+  ok('9F 会话带 Copilot 的 turn 数（doneCount）', ghSession && ghSession.doneCount === 1, ghSession && String(ghSession.doneCount));
+  ok('9F 会话带最后一条 user_message 作 prompt', ghSession && ghSession.prompt === 'fix the highlight bug', ghSession && ghSession.prompt);
+  ok(
+    '9F 会话的文件清单只留写工具碰过的（读过的 read_file 剔掉）、并转成相对路径',
+    ghSession && ghSession.files && ghSession.files.count === 1 && ghSession.files.recent[0] && ghSession.files.recent[0].path === 'src/changed.ts',
+    ghSession && JSON.stringify(ghSession.files)
+  );
+
+  const ghPhase = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot-plugin', ghSid);
+  ok('9F 主 Agent 相位可从 GitHub Copilot SQLite 会话回退得到', ghPhase && ghPhase.phase === 'thinking' && ghPhase.prompt === 'fix the highlight bug', ghPhase && JSON.stringify(ghPhase));
+
+  // 9F 相位：Copilot 自己的库是**整轮写完**才落的（turns 行带 assistant_response 一起出现，
+  // sessions.updated_at 也是那一刻才动），所以"正在生成"在它库里看不见 ——
+  // 只看时间窗就会出现"跑着显示待命、跑完显示思考中"。
+  // VS Code 自己有一份更细的索引：workspaceStorage/<hash>/state.vscdb 的
+  // `chat.ChatSessionStore.index`（timing.lastRequestStarted / lastRequestEnded）。
+  // 下面现造一份，验证 9F 相位听这份旁证。
+  const wsHash = 'ws-9f-fixture';
+  const wsDir = path.join(HOME, '.config', 'Code', 'User', 'workspaceStorage', wsHash);
+  fs.mkdirSync(wsDir, { recursive: true });
+  /** @param {number} started @param {number} ended 0 表示这一轮还没有 ended（在飞） */
+  const writeChatIndex = (started, ended, pad = '') => {
+    const idb = new Database(path.join(wsDir, 'state.vscdb'));
+    idb.exec('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)');
+    idb
+      .prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)')
+      .run(
+        'chat.ChatSessionStore.index',
+        JSON.stringify({
+          version: 1,
+          entries: {
+            [ghSid]: {
+              sessionId: ghSid,
+              title: 'github highlight',
+              timing: { created: started, lastRequestStarted: started, ...(ended ? { lastRequestEnded: ended } : {}) },
+              lastResponseState: 1,
+              pad,
+            },
+          },
+        })
+      );
+    idb.close();
+  };
+
+  writeChatIndex(1790580000000, 0); // 只有开始、没有结束 = 这一轮在飞
+  const liveSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const liveRow = liveSnap.sessions.find((s) => s.id === ghSid);
+  ok(
+    '9F 相位：chat 索引说这一轮在飞 → thinking（不是待命）',
+    liveRow && liveRow.phase === 'thinking' && liveRow.inFlight === true,
+    liveRow && JSON.stringify({ phase: liveRow.phase, inFlight: liveRow.inFlight })
+  );
+  const livePhase = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot-plugin', ghSid);
+  ok('9F 主 Agent 相位同口径（在飞 → thinking）', livePhase && livePhase.phase === 'thinking', livePhase && livePhase.phase);
+
+  const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  sleepSync(20);
+  writeChatIndex(1790580000000, 1790580050000, 'ended'); // 结束晚于开始 = 这一轮收工了
+  const idleSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const idleRow = idleSnap.sessions.find((s) => s.id === ghSid);
+  ok(
+    '9F 相位：索引说这一轮已收工 → idle（不再拿 2 分钟窗口糊着）',
+    idleRow && idleRow.phase === 'idle' && idleRow.inFlight === false,
+    idleRow && JSON.stringify({ phase: idleRow.phase, inFlight: idleRow.inFlight })
+  );
+
+  // 会话日志（chatSessions/<会话>.jsonl）：最新一轮**在请求开始时就落下**（带用户原话），
+  // 完成时间稍后以 requests.<n>.modelState.completedAt 补 —— 9F「正在跑」最靠谱的旁证，
+  // 也是「思考中」那句用户原话的来源（Copilot 自己的库要整轮写完才有）。
+  const chatDir = path.join(wsDir, 'chatSessions');
+  fs.mkdirSync(chatDir, { recursive: true });
+  const logFile = path.join(chatDir, `${ghSid}.jsonl`);
+  const liveStart = Date.now();
+  const writeLog = (obj) => fs.appendFileSync(logFile, `${JSON.stringify(obj)}\n`);
+  writeLog({
+    kind: 1,
+    k: ['requests'],
+    v: [{ requestId: 'r1', timestamp: liveStart, message: { text: '这一轮在做 9F 相位' }, modelState: { value: 0 } }],
+  });
+  const liveSnap2 = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const liveRow2 = liveSnap2.sessions.find((s) => s.id === ghSid);
+  ok(
+    '9F 相位：会话日志说这一轮刚开始 → thinking',
+    liveRow2 && liveRow2.phase === 'thinking' && liveRow2.inFlight === true,
+    liveRow2 && JSON.stringify({ phase: liveRow2.phase, inFlight: liveRow2.inFlight })
+  );
+  ok('9F「思考中」带的是这一轮用户原话（不是上一轮）', liveRow2 && liveRow2.prompt === '这一轮在做 9F 相位', liveRow2 && liveRow2.prompt);
+  const livePhase2 = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot-plugin', ghSid);
+  ok(
+    '9F 主 Agent 相位同口径（在飞 → thinking + 原话）',
+    livePhase2 && livePhase2.phase === 'thinking' && livePhase2.prompt === '这一轮在做 9F 相位',
+    livePhase2 && JSON.stringify({ phase: livePhase2.phase, prompt: livePhase2.prompt })
+  );
+
+  writeLog({ kind: 1, k: ['requests', 0, 'elapsedMs'], v: 42000 });
+  writeLog({ kind: 1, k: ['requests', 0, 'modelState'], v: { value: 1, completedAt: liveStart + 42000 } });
+  const doneSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const doneRow = doneSnap.sessions.find((s) => s.id === ghSid);
+  ok(
+    '9F 相位：日志补上完成标记后 → idle',
+    doneRow && doneRow.phase === 'idle' && doneRow.inFlight === false,
+    doneRow && JSON.stringify({ phase: doneRow.phase, inFlight: doneRow.inFlight })
+  );
+  ok(
+    '9F 这一轮的起止从日志算得出来（台账按轮记账用）',
+    Boolean(doneRow) && Array.isArray(doneRow.liveReqs) && doneRow.liveReqs[0] && doneRow.liveReqs[0].startedAt === liveStart && doneRow.liveReqs[0].endedAt === liveStart + 42000,
+    JSON.stringify(doneRow && doneRow.liveReqs)
+  );
+
+  // 回归（2026-09-28 实测的坑）：新一轮刚开始时，日志里只有整份 requests（带这一轮的
+  // 起始时间与用户原话），**还没有它的 requests.<n>.* 补丁** —— 完成标记还是上一轮的。
+  // 早先拿"补丁里的最大轮号"当这一轮的轮号，就会把上一轮的 completedAt 当成它的完成标记，
+  // 于是"正在跑"被判成"已收工"：用户跑任务时 9F 连「思考中」都没有。
+  // 时间上必须排在上一轮收工之后（真实数据就是顺序的）：上一轮 completedAt = liveStart+42000
+  const liveStart2 = liveStart + 42000 + 1000;
+  // 真实 VS Code 0.65.0 实测：索引会把 lastRequestEnded 写成和 lastRequestStarted 一样
+  // （永远判不出在飞），所以"日志说刚开跑"不能被索引压掉。
+  writeChatIndex(liveStart2, liveStart2, 'same-instant');
+  writeLog({
+    kind: 1,
+    k: ['requests'],
+    v: [{ requestId: 'r2', timestamp: liveStart2, message: { text: '新一轮刚开始' }, modelState: { value: 0 } }],
+  });
+  // 这一轮改动的文件：日志里**写工具**碰过的（read_file 不算）
+  writeLog({
+    kind: 1,
+    k: ['requests', 1, 'response'],
+    v: [
+      { kind: 'toolInvocationSerialized', toolId: 'copilot_readFile', invocationMessage: { value: 'Reading [](file:///tmp/ProjGitHubCopilot/src/read-only.ts)' } },
+      { kind: 'toolInvocationSerialized', toolId: 'copilot_multiReplaceString', invocationMessage: { value: 'Replacing 1 lines with 2 lines in [](file:///tmp/ProjGitHubCopilot/src/highlight.ts)' } },
+    ],
+  });
+  const newSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const newRow = newSnap.sessions.find((s) => s.id === ghSid);
+  ok(
+    '9F 相位：新一轮刚开始（完成补丁还没落、索引又写成 started==ended）→ 仍然 thinking',
+    newRow && newRow.phase === 'thinking' && newRow.inFlight === true,
+    newRow && JSON.stringify({ phase: newRow.phase, inFlight: newRow.inFlight, index: newRow.liveIndex })
+  );
+  ok('9F 这一轮的轮序号 = 上一轮 + 1（不是沿用上一轮的）', newRow && newRow.liveIndex === 1, newRow && String(newRow.liveIndex));
+  ok(
+    '9F 改动文件只认写工具碰过的（read_file 不算）',
+    Boolean(newRow) && Array.isArray(newRow.liveChanged) && newRow.liveChanged[0] && JSON.stringify(newRow.liveChanged[0].files) === JSON.stringify(['/tmp/ProjGitHubCopilot/src/highlight.ts']),
+    JSON.stringify(newRow && newRow.liveChanged)
+  );
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -42,10 +42,14 @@ const fastPhase = ref(null);
 let phaseTimer = null;
 
 async function startPhasePoll() {
-  const info = await getServerInfo().catch(() => ({ port: 0, token: '' }));
-  if (!info || !info.port) return;
+  const info0 = await getServerInfo().catch(() => ({ port: 0, token: '' }));
+  if (!info0 || !info0.port) return;
   const tick = async () => {
     try {
+      // server 重启会换 token：每轮都取**当前**的 serverInfo（project store 在 WS 重连时
+      // 已经用 server.json 的新值刷新过它），不能把启动那一刻的 token 吃死在闭包里 ——
+      // 吃死就是 1.5s 一路 401、相位与"操作"永远停在旧值上（同 api/ws.js 那条回归）。
+      const info = project.serverInfo || info0;
       // 带上当前楼层的客户端：同一工程里 Codex 与 CodeBuddy 同时在跑时，各取各的相位
       // 合并楼层（1F CodeBuddy = CLI + Plugin）会带一串（逗号分隔），服务端任一路命中即算本层
       const want = sessions.selectedClients.join(',');

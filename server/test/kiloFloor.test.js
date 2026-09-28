@@ -19,6 +19,8 @@
  *     [B4] 相位：最新事件是 reasoning → 思考中
  *     [B5] 相位一律 inferred（轮询来的，不是上报的）
  *     [B6] **陈旧事件不算"正在说话"**：几小时前那条 text 事件让相位回到待命
+ *     [B8] **轮中的 assistant 文字 → 思考中**（不是待命）：只有 finish=stop 那段才是待命
+ *     [B9] 「思考中」带上这一轮用户说的话（别的楼层都有，7F 原来一个字都没有）
  *   C. 完成标记：message.finish 的映射
  *     [C1] finish=stop（新鲜）→ 有完成标记，标题取会话标题
  *     [C2] finish=tool-calls → 不算完成（还要接着调工具）
@@ -126,13 +128,17 @@ function addEvent(db, sessionId, part, extra = {}) {
   );
 }
 function addMessage(db, sessionId, data) {
+  // 返回这条消息的 id：相位推导要靠 part.messageID join 回 message 才能判 finish
+  // （轮中的文字 vs 整轮收尾，见 [B8]），造数据时得能引用它。
+  const id = `msg_${db.prepare('SELECT COUNT(*) c FROM message').get().c + 1}`;
   db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)').run(
-    `msg_${db.prepare('SELECT COUNT(*) c FROM message').get().c + 1}`,
+    id,
     sessionId,
     data.time.created || Date.now(),
     Date.now(),
     JSON.stringify(data)
   );
+  return id;
 }
 
 const WS = '/tmp/ProjKilo';
@@ -327,6 +333,115 @@ head('[C4] 过期的完成标记（DONE_TTL_MS 之外）→ 当没有');
   db.close();
   const done = kilo.readKiloDone(SID, { title: '早收工了' });
   ok('过期标记当没有', done.doneAt === 0, JSON.stringify(done));
+}
+
+// [B8] **轮中的一段 assistant 文字 = 思考中，不是待命**（实测 2026-09-28 修的坑）。
+//
+// Kilo 在**一轮之内**会多次吐 assistant 文字（每次工具调用前后都可能来一段），
+// 而轮询只看"最新那条 part"：模型在两次工具调用之间说话时，最新 part 正是 text。
+// 早先一律 `text → 待命`，于是任务还在跑、控制台却闪回「待命中」，几秒后又被下一条
+// tool 事件顶回「调用工具」—— 相位在两个值之间来回跳。其它楼层在这段间隙是回到
+// 「思考中」的（hook.js 的 PostToolUse：工具跑完 → sessionPhase thinking）。
+// 判据是那条 text 归属消息的 finish：只有 finish=stop（且 completed）才是整轮说完了。
+head('[B8] 轮中的 assistant 文字 → 思考中；只有整轮收尾（finish=stop）才待命');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  db.prepare('DELETE FROM message').run();
+  seq = 0;
+  const midTurn = addMessage(db, SID, { role: 'assistant', time: { created: Date.now() - 4000, completed: Date.now() - 3000 }, finish: 'tool-calls' });
+  // 最新一条 part 就是这段"轮中"文字（后面还会接着调工具）
+  addEvent(db, SID, { type: 'text', messageID: midTurn, text: '先确认一下插件到底加载没有', time: { start: Date.now() - 2000, end: Date.now() - 1000 } });
+  db.close();
+  const ph = kilo.readKiloPhase(SID);
+  ok('轮中的 assistant 文字是 thinking（不是待命）', ph && ph.phase === 'thinking', ph && ph.phase);
+  ok('不是 idle', !(ph && ph.phase === 'idle'), ph && ph.phase);
+
+  const db2 = new Database(DB);
+  db2.prepare('DELETE FROM event').run();
+  db2.prepare('DELETE FROM message').run();
+  seq = 0;
+  const doneMsg = addMessage(db2, SID, { role: 'assistant', time: { created: Date.now() - 3000, completed: Date.now() - 2000 }, finish: 'stop' });
+  addEvent(db2, SID, { type: 'text', messageID: doneMsg, text: '搞定', time: { start: Date.now() - 2000, end: Date.now() - 1000 } });
+  db2.close();
+  const ph2 = kilo.readKiloPhase(SID);
+  ok('整轮收尾（finish=stop）的那段文字才是待命', ph2 && ph2.phase === 'idle', ph2 && ph2.phase);
+}
+
+// [B10] **陈旧判定必须看信封上的 time，不能只看 part.time**（实测 2026-09-28 修的坑）。
+//
+// 这是 [B8] 连带挖出来的**旧洞**：`readKiloPhase` 原先只从 `part.time.end|start` 取时间，
+// 取不到就算 at=0，而 `if (at && now - at > PHASE_FRESH_MS)` 对 at=0 直接跳过判定 ——
+// 于是**没有 part.time 的 part（tool / patch / step-start / 正在流式吐字的 text）永远不会被
+// 判成陈旧**。真机实测一个真实会话最近 400 条 part 事件：tool 270 条、step-start 30 条、
+// patch 5 条、流式 text 1 条 都没有 part.time，只有 text 26 / reasoning 38 / step-finish 30 有。
+// 每一条事件的信封上都带 `time`（number），那才是可靠的时间源。
+//
+// 这个洞原先被 `text → 待命` 盖住了（这类会话恰好显示成待命，看着"对"）；
+// 改成"轮中文字 → 思考中"之后它就露出来了：一个 50 分钟前收工、最后一条是
+// 无 part.time 的 text 的会话，会**永远显示「思考中」**（真机上确实复现了两条）。
+head('[B10] 没有 part.time 的陈旧事件（信封 time 兜底）→ 回到待命，不许永远「思考中」');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  db.prepare('DELETE FROM message').run();
+  seq = 0;
+  // 50 分钟前收工的一条会话：最后一条是**没有 part.time** 的 text（实测就长这样）
+  const old = Date.now() - 50 * MIN;
+  addMessage(db, SID, { role: 'assistant', time: { created: old, completed: old } });
+  seq += 1;
+  db.prepare('INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?,?,?,?,?)').run(
+    `evt_${seq}`,
+    SID,
+    seq,
+    'message.part.updated.1',
+    JSON.stringify({ sessionID: SID, part: { id: `prt_${seq}`, type: 'text', text: 'say hi' }, time: old })
+  );
+  db.close();
+  const ph = kilo.readKiloPhase(SID);
+  ok('陈旧且没有 part.time 的 text → 待命（不是思考中）', ph && ph.phase === 'idle', ph && ph.phase);
+  ok('不是 thinking', !(ph && ph.phase === 'thinking'), ph && ph.phase);
+
+  // 同一条"新鲜的"（信封 time 是现在）→ 仍然是思考中，证明兜底不是无脑判待命
+  const db2 = new Database(DB);
+  db2.prepare('DELETE FROM event').run();
+  seq = 0;
+  seq += 1;
+  db2.prepare('INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?,?,?,?,?)').run(
+    `evt_${seq}`,
+    SID,
+    seq,
+    'message.part.updated.1',
+    JSON.stringify({ sessionID: SID, part: { id: `prt_${seq}`, type: 'text', text: '还在说' }, time: Date.now() })
+  );
+  db2.close();
+  const ph2 = kilo.readKiloPhase(SID);
+  ok('新鲜的同类事件仍是思考中（信封 time 兜底没有把活跃会话也判成待命）', ph2 && ph2.phase === 'thinking', ph2 && ph2.phase);
+}
+
+head('[B9] 「思考中」要带上这一轮用户说的话（别的一层都有，7F 原来一个字都没有）');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  db.prepare('DELETE FROM message').run();
+  seq = 0;
+  const userMsg = addMessage(db, SID, { role: 'user', time: { created: Date.now() - 5000 } });
+  // 实测 Kilo 的用户原话带一层 JSON 引号
+  addEvent(db, SID, { type: 'text', messageID: userMsg, text: JSON.stringify('7F 的任务记录为什么是空的'), time: { start: Date.now() - 4000 } });
+  const asst = addMessage(db, SID, { role: 'assistant', time: { created: Date.now() - 3000, completed: Date.now() - 2000 }, finish: 'tool-calls' });
+  addEvent(db, SID, { type: 'reasoning', messageID: asst, text: '先看插件配置', time: { start: Date.now() - 2000, end: Date.now() - 1000 } });
+  db.close();
+  const ph = kilo.readKiloPhase(SID);
+  ok('相位是 thinking', ph && ph.phase === 'thinking', ph && ph.phase);
+  ok('prompt 是用户那句话（引号已剥）', ph && ph.prompt === '7F 的任务记录为什么是空的', JSON.stringify(ph && ph.prompt));
+  // tool 相位同样带上：屏上"调用工具"那行下面也能看到用户问的是什么
+  // （用户那句话那条 event 保留，只把**最新**换成正在跑的 tool）
+  const db2 = new Database(DB);
+  seq += 1;
+  addEvent(db2, SID, { type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'npm test' } }, time: { start: Date.now() - 500 } });
+  db2.close();
+  const ph2 = kilo.readKiloPhase(SID);
+  ok('tool 相位也带 prompt', ph2 && ph2.prompt === '7F 的任务记录为什么是空的', JSON.stringify(ph2 && ph2.prompt));
 }
 
 /* ------------------------------ D. 读不出来不许冒泡 ------------------------------ */

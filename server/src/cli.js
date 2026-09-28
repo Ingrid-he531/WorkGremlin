@@ -30,7 +30,7 @@ const ROOT_PKG = (() => {
   const ENGINES = ROOT_PKG && ROOT_PKG.engines;
   const req = String((ENGINES && ENGINES.node) || '').match(/(\d+)\.(\d+)\.(\d+)/);
   const cur = process.version.match(/^v(\d+)\.(\d+)\.(\d+)/);
-  if (req && cur) {
+  if (req && cur && !process.env.WORKGREMLIN_SKIP_VERSION_CHECK) {
     const less = (a, b) => (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) < 0;
     if (less(cur.slice(1).map(Number), req.slice(1).map(Number))) {
       console.error(

@@ -10,7 +10,7 @@
  *
  * 用法：
  *   node scripts/install-hooks.js                       装（用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json）
- *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / codex / claude / trae / qoder / project）
+ *   node scripts/install-hooks.js --targets=workbuddy    只装某几个（codebuddy / workbuddy / codex / claude / trae / qoder / qoder-cn / project）
  *   node scripts/install-hooks.js --project              另外写一份项目级 <仓库>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            撤掉（只删我们加的那几条，别人的配置不动）
  *   node scripts/install-hooks.js --dry-run              只打印将要写什么，不落盘
@@ -190,7 +190,7 @@ function readSettings(file) {
 /* ------------------------------ 插件形态（7F Kilo / 8F OpenCode） ------------------------------ */
 
 /**
- * 我们要写进 Kilo / OpenCode 配置的那条 plugins 条目。
+ * 我们要写进 Kilo / OpenCode 配置的那条 plugin 条目。
  *
  * 这两个产品**没有 hook 子系统**（Kilo 7.8.1 实测：`--help` 里没有 hook 子命令，也没有
  * `hooks.json`），所以上报只能走它们自己的**插件**机制：插件订阅 agent 的内存事件流，
@@ -201,29 +201,61 @@ function readSettings(file) {
  * `options.client` 显式钉住上报身份，别让插件靠环境变量猜（见 plugin/index.js 的
  * resolveClient：Kilo 的 VS Code 扩展会判成 kilo-plugin，CLI/TUI 判成 kilo）。
  */
+
+/**
+ * **键名是 `plugin`（单数），不是 `plugins`** —— 这一点实测踩过坑，必须写在这里。
+ *
+ * 早先这里写的是 `plugins: [{ package, options }]`。Kilo 7.8.1 认不出来：
+ * 它把配置**降级到 V1** 时对 `plugins` 报一条 WARN 然后**整段丢掉** ——
+ *   WARN configuration compatibility diagnostic source=~/.config/kilo/kilo.jsonc
+ *        path="[\"plugins\"]" kind=unsupported
+ *        action="Omitted native setting that cannot be represented in V1"
+ * 症状是「插件看着装上了、配置里也确实有那条，但一条状态文件都不写，7F 任务台账永远空」，
+ * 而且**没有任何报错**，只有那条 WARN（要翻 ~/.local/share/kilo/log/opencode.log 才看得到）。
+ *
+ * 真正的形状（二进制里 `plugin: J.optional(J.Array(Spec))`，`Spec = String | [String, Record]`）：
+ *   "plugin": [ ["/abs/path/index.js", { "client": "kilo" }] ]
+ * 实测（Kilo 7.8.1 `kilo debug config`）：这样写才会进解析结果（并被规范成 file:// URL），
+ * 探针插件实测能收到 session.created / message.part.updated 等真实事件。
+ * 路径必须是**绝对路径**（相对路径是相对配置文件目录解析的，跨机器必坏）。
+ * @param {string} client 上报身份
+ * @returns {[string, {client:string}]} 一条 plugin 条目
+ */
 function pluginEntry(client) {
-  return { package: PLUGIN_ENTRY_FILE, options: { client } };
+  return [PLUGIN_ENTRY_FILE, { client }];
+}
+
+/** 一条 plugin 条目里那个包路径（字符串形式 / [路径, 选项] 元组都认） */
+function pluginPathOf(entry) {
+  if (typeof entry === 'string') return entry;
+  if (Array.isArray(entry)) return String(entry[0] || '');
+  if (entry && typeof entry === 'object') return String(entry.package || entry.path || '');
+  return '';
 }
 
 /** 这份配置里有没有我们自己那条插件条目（按 package 路径认，认 path 不认名字） */
 function hasPluginEntry(settings, client) {
-  const list = Array.isArray(settings && settings.plugins) ? settings.plugins : [];
-  const want = pluginEntry(client).package;
-  return list.some((p) => p && typeof p === 'object' && p.package === want);
+  const list = Array.isArray(settings && settings.plugin) ? settings.plugin : [];
+  const want = pluginEntry(client)[0];
+  return list.some((p) => pluginPathOf(p) === want);
 }
 
 /**
- * 幂等合并 plugins 数组：摘掉上一次我们自己写的那条（同 package 路径），再追加。
+ * 幂等合并 plugin 数组：摘掉上一次我们自己写的那条（同 package 路径），再追加。
  * 别人的插件一条不动；`uninstall` 只摘我们自己的。
+ *
+ * 顺手清掉早先写错键名留下的 `plugins` 段：Kilo 本来就不认它，留着只会在每次启动时
+ * 多一条 "Omitted native setting" WARN（还会让人误以为插件已装）。
  */
 function mergePlugins(existing, client, uninstall) {
-  const list = Array.isArray(existing.plugins) ? existing.plugins : [];
-  const want = pluginEntry(client).package;
-  const kept = list.filter((p) => !(p && typeof p === 'object' && p.package === want));
+  const list = Array.isArray(existing.plugin) ? existing.plugin : [];
+  const want = pluginEntry(client)[0];
+  const kept = list.filter((p) => pluginPathOf(p) !== want);
   const out = { ...existing };
+  delete out.plugins;
   const next = uninstall ? kept : [...kept, pluginEntry(client)];
-  if (next.length) out.plugins = next;
-  else delete out.plugins;
+  if (next.length) out.plugin = next;
+  else delete out.plugin;
   return out;
 }
 
@@ -445,11 +477,21 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     { id: 'project', label: `CodeBuddy 项目级（${path.basename(REPO_ROOT)}）`, file: path.join(REPO_ROOT, '.codebuddy', 'settings.json'), ours: codebuddyOurs, optional: true },
     {
       id: 'qoder',
-      label: 'Qoder CLI',
+      label: 'Qoder CLI（国际版）',
       // Qoder 的 hooks 与 Claude / CodeBuddy 同构：hooks 嵌在 ~/.qoder/settings.json 里。
       file: path.join(os.homedir(), '.qoder', 'settings.json'),
       cmd: 'qoder',
       dir: path.join(os.homedir(), '.qoder'),
+      ours: qoderOurs,
+    },
+    {
+      // 国内版 Qoder：命令是 qoder-cn，配置家在 ~/.qoder-cn（settings.json 同构）。
+      // 上报身份仍是 --agent qoder（产品家族基名，见 6F 的 agent），只是落盘的家不同。
+      id: 'qoder-cn',
+      label: 'Qoder CLI（国内版）',
+      file: path.join(os.homedir(), '.qoder-cn', 'settings.json'),
+      cmd: 'qoder-cn',
+      dir: path.join(os.homedir(), '.qoder-cn'),
       ours: qoderOurs,
     },
     {

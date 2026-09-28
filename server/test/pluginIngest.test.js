@@ -197,6 +197,12 @@ await fire(part({ id: 'prt_2', type: 'reasoning', time: { start: Date.now(), end
 {
   const st = stateFile();
   ok('reasoning → 思考中', st && st.sessionPhase.phase === 'thinking', st && st.sessionPhase.phase);
+  // 「思考中」屏上要显示用户那句话：服务端 readReporterPhase 读的就是这个 taskTitle
+  // （见 sessions.js 的 winPrompt）。早先插件只抹 done、不写 taskTitle，
+  // 于是 7F/8F 的「思考中」一个字都没有（别的楼层都有，因为它们的 hook 写了）。
+  ok('taskTitle = 用户那句话（屏上「思考中」显示的就是它）', st && st.taskTitle === '把 7F 接进楼层表', st && JSON.stringify(st.taskTitle));
+  const rp = reporterMainPhase(WS, 'kilo', SID);
+  ok('reporterMainPhase 把它带成 prompt', rp && rp.prompt === '把 7F 接进楼层表', rp && JSON.stringify(rp && rp.prompt));
 }
 await fire(part({ id: 'prt_3', type: 'tool', tool: 'write', callID: 'c1', state: { status: 'pending', input: {} } }));
 {
@@ -247,6 +253,16 @@ head('[C] finish=tool-calls 只是"这条消息到工具处断了"，**整轮还
 await fire(msg({ id: 'msg_3', role: 'user', time: { created: Date.now() } }));
 await fire(part({ id: 'prt_8', type: 'text', text: '"新的一轮"' }, 'msg_3'));
 await fire(msg({ id: 'msg_4', role: 'assistant', time: { created: Date.now() } }));
+{
+  // 轮中的一段 assistant 文字 → **思考中**，不是待命（实测 2026-09-28 修的坑）。
+  // Kilo 一轮之内会多次吐 assistant 文字（每次工具调用前后都可能来一段），
+  // 早先这里一律报 idle，于是任务还在跑、主 agent 却闪回「待命中」，
+  // 几秒后又被下一条 tool 事件顶回「调用工具」—— 相位在两个值之间来回跳。
+  // 其它楼层在这段间隙是回到思考中的（hook.js 的 PostToolUse 写 sessionPhase thinking）。
+  const st = stateFile();
+  ok('轮中的 assistant 文字 → 思考中（不是待命）', st && st.sessionPhase.phase === 'thinking', st && st.sessionPhase.phase);
+  ok('不是 idle', !(st && st.sessionPhase.phase === 'idle'), st && st.sessionPhase.phase);
+}
 await fire(part({ id: 'prt_7', type: 'text', text: '"先看一眼"' }, 'msg_4'));
 await fire(msg({ id: 'msg_4', role: 'assistant', finish: 'tool-calls', time: { created: Date.now(), completed: Date.now() } }));
 {

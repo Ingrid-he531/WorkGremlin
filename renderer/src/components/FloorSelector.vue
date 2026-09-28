@@ -154,25 +154,43 @@ onBeforeUnmount(() => {
 watch(() => props.products, () => measure(), { flush: 'post' });
 
 /**
- * 某一路落盘来源的**默认**显示名（合并楼层的悬浮提示要逐路标出来；服务端给了 label 就用它，
- * 同 kind 的两路也能分清 —— 5F 的 IDE 与插件都是 'dir'，标签是 IDE / plugin）。
- * plugin 保留英文：跟 CLI 一起对齐上报身份（codebuddy-plugin / trae-plugin）的叫法，
- * 避免"插件"这个中译在不同楼层指代不同东西（IDE 插件？CodeBuddy 插件？）时看不出来。
- * 没有 'hook'：那一路的 tooltip 行在下面 tip() 里就被过滤掉了（没有落盘目录，列了没信息量）。
+ * 形态显示名（悬浮提示里的子项标签）。plugin 统一用中文「插件」。
+ * dir 是"只有落盘、读不出会话"的来源（5F TraeCode 的两路），默认叫「数据」，
+ * 避免和外层「落盘：」区头叠成"落盘：落盘 - …"。
+ * 没有 'hook'：那一路在 tip() 里就被过滤掉了（没有落盘目录，列了没信息量）。
  */
-const SOURCE_LABEL = { cli: 'CLI', plugin: 'plugin', dir: '落盘' };
+const SOURCE_LABEL = { cli: 'CLI', plugin: '插件', dir: '数据' };
 
 /**
- * 一路落盘的说明文案：`<label>：<目录>（N 个会话文件 · N 个文件 · 体积 · 最后写入）`
- * 带上这一路自己的 note（取不到会话时服务端给的说明），让"没数据"和"读不到"分得清。
+ * 非插件形态的安装行名。多数产品的命令形态就叫 CLI；TraeCode 例外 —— 它的非插件
+ * 形态是**桌面 IDE 本体**（trae / trae-cn，没有独立 CLI），所以显示 'IDE'。
+ * 与 renderer/src/lib/clientMatch.js 的 CLIENT_LABELS（trae → TraeCode IDE）同一口径。
  */
-function sourceLine(src, allSources = []) {
-  let label = src.label || SOURCE_LABEL[src.kind] || src.kind || '落盘';
-  // If this product has both CLI and plugin sources, show combined label for clarity
-  if (src.kind === 'cli' && Array.isArray(allSources) && allSources.some((s) => s && s.kind === 'plugin')) {
-    label = 'CLI/Plugin';
-  }
-  if (!src.dataPathLabel) return { text: `${label}：没有找到落盘目录`, note: src.note || '' };
+const FORM_LABEL = { trae: 'IDE' };
+function cliFormLabel(p) {
+  const base = String((p && (p.client || p.dataKind)) || '').toLowerCase().replace(/-plugin$/, '');
+  return FORM_LABEL[base] || 'CLI';
+}
+
+/**
+ * 子项缩进。**区头独占一行、所有子项用同一段前缀** —— 保证 CLI / 插件两行起始位置一致：
+ * title 提示用比例字体，若把首项内联在区头后（`安装：CLI - …`）再对齐后续行，
+ * 缩进宽度永远对不上区头宽度；统一缩进则在任何字体 / 行首空白处理下都不会错位。
+ */
+const TIP_INDENT = '  ';
+
+/**
+ * 把一路来源归一成 { label, detail, note }：
+ *   label  形态名（CLI / 插件 / 服务端给的 label，如 IDE）
+ *   detail 落盘目录 + 统计（`~/.codebuddy（1 个会话文件 · …）`）
+ *   note   这一路取不到会话时的说明
+ */
+function sourceInfo(src) {
+  const raw = src.label || SOURCE_LABEL[src.kind] || src.kind || '数据';
+  // 服务端下发的 label 里若含英文 Plugin，统一成中文「插件」——
+  // 覆盖 5F TraeCode 的 'plugin'，以及 3F Codex / 7F Kilo 的 'CLI/Plugin'（→ 'CLI/插件'）。
+  const label = raw.replace(/plugin/gi, '插件');
+  if (!src.dataPathLabel) return { label, detail: '没有找到数据目录', note: src.note || '' };
   const s = src.stats || {};
   const bits = [];
   if (s.sessions) bits.push(`${s.sessions} 个会话文件`);
@@ -180,43 +198,93 @@ function sourceLine(src, allSources = []) {
   if (s.sizeLabel) bits.push(s.sizeLabel);
   if (s.lastModifiedAt) bits.push(`最后写入 ${new Date(s.lastModifiedAt).toLocaleString()}`);
   return {
-    text: `${label}：${src.dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`,
+    label,
+    detail: `${src.dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`,
     note: src.note || '',
   };
 }
 
-/** 悬浮提示：活跃会话 + 安装位置 + 落盘统计（合并楼层逐路列） */
+/**
+ * 追加一个分区：区头独占一行，子项每行统一缩进（`row = { text, note? }`，note 再深一级）。
+ * 所有子行共用同一段缩进前缀 —— 这是"CLI / 插件 起始位置对齐"的关键。
+ */
+function pushSection(lines, title, rows) {
+  lines.push(`${title}：`);
+  for (const row of rows) {
+    lines.push(`${TIP_INDENT}${row.text}`);
+    if (row.note) lines.push(`${TIP_INDENT}${TIP_INDENT}· ${row.note}`);
+  }
+}
+
+/**
+ * 悬浮提示：活跃会话 +「安装」+「落盘」两个分区，各分区内逐形态列（CLI / 插件）。
+ *
+ * 形如：
+ *   CodeBuddy
+ *   活跃会话：1 个
+ *   安装：
+ *     CLI - /usr/local/nodejs/bin/codebuddy
+ *     插件 - ~/.vscode/extensions/tencent-cloud.coding-copilot-…
+ *   落盘：
+ *     CLI - ~/.codebuddy（1 个会话文件 · …）
+ *     插件 - ~/.config/Code/User/globalStorage/tencent-cloud.coding-copilot（…）
+ */
 function tip(p) {
-  const lines = [p.name];
-  lines.push(
-    p.activeCount
-      ? `活跃会话：${p.activeCount} 个`
-      : '活跃会话：0 个'
-  );
+  const lines = [p.name, p.activeCount ? `活跃会话：${p.activeCount} 个` : '活跃会话：0 个'];
   if (!p.installed) {
-    lines.push('未安装（没搜到可执行文件或扩展目录）→ 置灰，不能点');
+    lines.push('未安装');
     return lines.join('\n');
   }
-  lines.push(`安装：${p.installPathLabel || '（未定位到可执行文件）'}`);
-  // 逐路列这一层的落盘来源（合并楼层多路）；取不到会话的那一路会带一行说明
-  // 但 hook 那一路不列：它没有独立的落盘目录（sourceDirs 对它返回空数组），列出来永远是
-  // 一句"会话来源就是 reporter 状态文件"，对读 tooltip 的人没有信息量 —— 真正有信息的是
-  // 带目录 / 会话文件数 / 体积 / 最后写入的 cli / plugin 那几行。
+
+  // 落盘来源（hook 那一路不列，见下面注释）
+  const sources = (Array.isArray(p.sources) ? p.sources : []).filter((src) => src && src.kind !== 'hook');
+  const installPaths = Array.isArray(p.installPaths) ? p.installPaths : [];
+  // 这一层有没有"插件"这个形态：来源里挂了 plugin 路（kind 是 plugin，或 label 含 Plugin ——
+  // 如 3F/4F/6F/7F 的 'CLI/Plugin'、5F 的 'plugin'），或安装清单里已有插件项。
+  // 纯 CLI 楼层（2F WorkBuddy，label 只有 cli）不凑一行"未找到"。
+  // （不认 p.pluginRe：它是正则，过 JSON 会变成 {}，前端拿不到。）
+  const hasPluginForm =
+    sources.some((src) => src.kind === 'plugin' || /plugin/i.test(src.label || '')) ||
+    installPaths.some((ip) => ip && ip.kind === 'plugin');
+
+  // ---- 安装：每个形态一行「CLI - 路径」/「插件 - 路径」，没找到明说「未找到」----
+  // 后端给 installPaths（新服务端）；老服务端没有该字段，兜底用 installPathLabel 单行。
+  if (installPaths.length) {
+    const cli = installPaths.find((ip) => ip && ip.kind === 'cli');
+    const plug = installPaths.find((ip) => ip && ip.kind === 'plugin');
+    const rows = [{ text: `${cliFormLabel(p)} - ${(cli && (cli.label || cli.path)) || '未找到'}` }];
+    if (hasPluginForm) rows.push({ text: `插件 - ${(plug && (plug.label || plug.path)) || '未找到'}` });
+    pushSection(lines, '安装', rows);
+  } else if (p.installPathLabel) {
+    pushSection(lines, '安装', [{ text: `${cliFormLabel(p)} - ${p.installPathLabel}` }]);
+  } else {
+    lines.push('安装：未找到');
+  }
+
+  // ---- 落盘：逐路列数据目录与统计 ----
+  // 取不到会话的那一路会带一行说明（note）。hook 那一路不列：它没有独立的落盘目录
+  // （sourceDirs 对它返回空数组），列出来没信息量。
   // 纯展示层过滤：服务端那条 hook 来源照旧下发，sessionRegistry 的 refresh 靠它决定要不要
   // 用 reporter 状态文件兜底列会话（cliLandingSeen），动它会把 5F / 6F 的会话列没。
-  const allSources = Array.isArray(p.sources) ? p.sources : [];
-  const sources = allSources.filter((src) => src && src.kind !== 'hook');
+  //
+  // 7F Kilo / 8F OpenCode 的 note（"这一路读的是数据根里的 xxx.db（SQLite），不是可扫的
+  // 会话文件"）不在悬浮提示里显示：那两层的会话本来就是从 SQLite 库里轮询出来的，是设计事实
+  // 而不是"这一路读不到"的故障说明，挂在 tooltip 里只是重复"落盘："区头已经说过的路径信息。
+  // （note 字段仍照常下发/透传：sessionRegistry、服务端自检都用它，这里只在渲染层不显示。）
+  const isPollingDb = (src) => src.kind === 'kilo' || src.kind === 'opencode';
   if (sources.length) {
-    for (const src of sources) {
-      const line = sourceLine(src, sources);
-      lines.push(line.text);
-      if (line.note) lines.push(`    · ${line.note}`);
-    }
+    pushSection(
+      lines,
+      '落盘',
+      sources.map((src) => {
+        const info = sourceInfo(src);
+        return { text: `${info.label} - ${info.detail}`, note: isPollingDb(src) ? '' : info.note };
+      })
+    );
   } else if (p.dataPathLabel) {
-    // 老服务端（没有 sources 字段）的兜底：单行"落盘：…"
-    const line = sourceLine({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats }, []);
-    lines.push(line.text);
-    if (line.note) lines.push(`    · ${line.note}`);
+    // 老服务端（没有 sources 字段）的兜底
+    const info = sourceInfo({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats });
+    pushSection(lines, '落盘', [{ text: `数据 - ${info.detail}`, note: info.note }]);
   } else {
     lines.push('落盘：未找到数据目录');
   }

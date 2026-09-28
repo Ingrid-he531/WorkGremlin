@@ -7,7 +7,7 @@
  *   3F  Codex（CLI 与 IDE 同 ~/.codex、同 hook，分不出，合并单楼层）
  *   4F  Claude Code（CLI 与 IDE 同 ~/.claude、同 hook，分不出，合并单楼层）
  *   5F  TraeCode（IDE 与 Plugin 合并：会话来自 hook 状态文件；插件落盘取不到会话，见下）
- *   6F  Qoder（CLI 与插件合并：同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F）
+ *   6F  Qoder（CLI 与插件合并：同 ~/.qoder | ~/.qoder-cn、同 hook、同 transcript，分不出，合并单楼层，类 4F）
  *   7F  Kilo Code（CLI 与 IDE 扩展合并：同一个 kilo 二进制、同一个数据根，分不出，合并单楼层。
  *                  **纯轮询楼层**（与 8F OpenCode 同类）：Kilo 没有 hook 子系统，会话/相位/完成标记
  *                  全部由服务端轮询它自己的 event-sourced SQLite 推导，见 server/src/kilo.js）
@@ -207,6 +207,55 @@ function scanDataDir(dir) {
 
 /* ------------------------------ 候选根目录 ------------------------------ */
 
+/**
+ * 额外搜索范围（配置文件 + 环境变量，二者并存、拼接去重）。不同 IDE 的插件装在各自目录，
+ * 默认只认一批常见编辑器，认不到（JetBrains / Zed / Neovim / 其他非标编辑器）时靠它扩范围。
+ *   · 配置文件：~/.workgremlin/products.overrides.json（见 workgremlinHome），字段：
+ *       extensionDirs      —— 额外编辑器根目录（自动拼 extensions/；直接给 extensions 目录也认）
+ *       globalStorageDirs —— 额外编辑器 globalStorage 目录（直接给目录）
+ *       dataRoots         —— 额外平台数据根（Application Support / APPDATA 同类）
+ *       cliBinDirs        —— 额外 CLI 可执行文件目录（自定义 npm 前缀、/opt 里的 .deb 等）
+ *   · 环境变量（更即时、适合临时注入，与配置文件字段一一对应）：
+ *       WORKGREMLIN_EXTENSION_DIRS / WORKGREMLIN_GLOBALSTORAGE_DIRS / WORKGREMLIN_DATA_ROOTS
+ *       / WORKGREMLIN_CLI_BIN_DIRS（均为冒号分隔）
+ * 见下方 extensionRoots / globalStorageRoots / dataRoots / CLI_BIN_DIRS 的引用点。
+ */
+function workgremlinHome() {
+  return process.env.WORKGREMLIN_HOME || path.join(HOME, '.workgremlin');
+}
+
+let _overridesCache = null;
+/** 读一次配置文件（解析失败/不存在回空对象）；缓存避免每次扫盘都读盘 */
+function readOverrides() {
+  if (_overridesCache) return _overridesCache;
+  const file = path.join(workgremlinHome(), 'products.overrides.json');
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(file, 'utf8')) || {};
+  } catch {
+    cfg = {};
+  }
+  _overridesCache = cfg;
+  return cfg;
+}
+
+/** 把开头的 ~ 展开成家目录（配置里写 ~/xxx 是常见习惯，不展开会被当字面量） */
+function expandHome(p) {
+  return /^~([/\\]|$)/.test(p) ? path.join(HOME, p.replace(/^~[/\\]?/, '')) : p;
+}
+
+/** 合并「配置文件字段」+「环境变量」（env 优先同名，但二者都给则拼接去重）；~ 自动展开 */
+function extraDirs(field, env) {
+  const out = new Set();
+  const cfg = readOverrides();
+  if (Array.isArray(cfg[field])) {
+    for (const d of cfg[field]) if (d && typeof d === 'string' && d.trim()) out.add(expandHome(d.trim()));
+  }
+  const v = process.env[env];
+  if (v) for (const s of String(v).split(path.delimiter)) if (s.trim()) out.add(expandHome(s.trim()));
+  return [...out];
+}
+
 /** 平台级应用数据根目录 */
 function dataRoots() {
   const roots = [];
@@ -218,24 +267,36 @@ function dataRoots() {
   } else {
     roots.push(path.join(HOME, '.config'), path.join(HOME, '.local', 'share'));
   }
+  // 配置注入的额外数据根（不同 IDE 的非标数据位置）
+  for (const d of extraDirs('dataRoots', 'WORKGREMLIN_DATA_ROOTS')) if (isDir(d)) roots.push(d);
   return roots.filter(isDir);
 }
 
 /** 编辑器扩展目录（插件安装位置） */
 function extensionRoots() {
-  return [
+  const base = [
     '.vscode',
     '.vscode-insiders',
     '.cursor',
     '.trae',
     '.trae-cn',
+    // Qoder 编辑器（若装了本体）的扩展也落自家 extensions 目录（对称 Trae 的 .trae[-cn]）
+    '.qoder',
+    '.qoder-cn',
     '.windsurf',
     '.vscode-server',
     // MarsCode（火山引擎 IDE）的扩展装在自家的 builtin 目录里，不在标准 extensions 下。
     // TraeCode 就是它的内置插件：~/.marscode/builtin/trae，所以这里也要认。
-  ]
-    .map((d) => path.join(HOME, d, 'extensions'))
+  ].map((d) => path.join(HOME, d, 'extensions'));
+  // 配置注入的额外编辑器根目录：自动拼 extensions/；若给的就是 extensions 目录本身也认
+  const extras = extraDirs('extensionDirs', 'WORKGREMLIN_EXTENSION_DIRS').flatMap((d) => {
+    const out = [path.join(d, 'extensions')];
+    if (path.basename(d) === 'extensions') out.push(d);
+    return out;
+  });
+  return base
     .concat(isDir(path.join(HOME, '.marscode', 'builtin')) ? [path.join(HOME, '.marscode', 'builtin')] : [])
+    .concat(extras)
     .filter(isDir);
 }
 
@@ -275,6 +336,8 @@ function globalStorageRoots() {
   // vscode-server（远程/容器场景）也顺手看一眼
   const srv = path.join(HOME, '.vscode-server', 'data', 'User', 'globalStorage');
   if (isDir(srv)) out.push(srv);
+  // 配置注入的额外 globalStorage 目录（直接给目录，覆盖非标 IDE 的插件落盘点）
+  for (const d of extraDirs('globalStorageDirs', 'WORKGREMLIN_GLOBALSTORAGE_DIRS')) if (isDir(d)) out.push(d);
   return out;
 }
 
@@ -288,6 +351,23 @@ function traeGlobalStorageRoots() {
   for (const r of dataRoots()) {
     for (const ed of ['Trae', 'Trae CN']) {
       const p = path.join(r, ed, 'User', 'globalStorage');
+      if (isDir(p)) out.push(p);
+    }
+  }
+  return out;
+}
+
+/**
+ * TraeCode 家族的 logs 根。新版 Trae 把「会话 → 当前选中模型」搬进了内存态 store +
+ * 加密库（ModularData/ai-agent/database.db），state.vscdb 里那条
+ * `<uid>:AI.agent.model.session_selected_model` 不再写 —— renderer.log 的
+ * model-store 事件成了唯一明文来源，成对放在这里，别劈进 traeModels.js。
+ */
+function traeLogRoots() {
+  const out = [];
+  for (const r of dataRoots()) {
+    for (const ed of ['Trae', 'Trae CN']) {
+      const p = path.join(r, ed, 'logs');
       if (isDir(p)) out.push(p);
     }
   }
@@ -335,6 +415,11 @@ const CLI_BIN_DIRS = [
   // Kilo 的 CLI 是 npm 全局包（在 nvm bin 里，下面那条已经覆盖），但 ~/.kilo/bin 也一并认上。
   path.join(HOME, '.opencode', 'bin'),
   path.join(HOME, '.kilo', 'bin'),
+  // Qoder（6F）自带启动器：二进制在 ~/.qoder[-cn]/entry/qoder[-cn]（国内版实测 ~/.qoder-cn/entry/qoder-cn，
+  // 国际版对称 ~/.qoder/entry/qoder）。桌面/GUI 拉起的 server 进程 PATH 里通常没有这个 entry 目录，
+  // 不认这两条的话，"装了没装"在图形会话里永远判不出来（终端里能、UI 里不行，就是这个坑）。
+  path.join(HOME, '.qoder', 'entry'),
+  path.join(HOME, '.qoder-cn', 'entry'),
   // npm 全局 bin：和当前 node 可执行文件同目录（/usr/local/nodejs/bin 这类装法）
   path.dirname(process.execPath),
   '/usr/local/bin',
@@ -349,6 +434,9 @@ const CLI_BIN_DIRS = [
   '/usr/lib/chatgpt/resources',
   '/opt/chatgpt/resources',
   ...(process.platform === 'darwin' ? ['/Applications/ChatGPT.app/Contents/Resources'] : []),
+  // 配置注入的额外 CLI bin 目录（自定义 npm 前缀、/opt 里的 .deb、其他非标安装位置）：
+  //   products.overrides.json 的 cliBinDirs 字段 / WORKGREMLIN_CLI_BIN_DIRS 环境变量
+  ...extraDirs('cliBinDirs', 'WORKGREMLIN_CLI_BIN_DIRS'),
 ];
 
 function findCliBin(cmd) {
@@ -367,8 +455,11 @@ function findCliBin(cmd) {
 const RE_CODEBUDDY = [/^codebuddy/i, /^code-?buddy/i, /^tencent/i, /^ingram/i];
 const RE_WORKBUDDY = [/^workbuddy/i, /^work-?buddy/i];
 const RE_CODEX = [/^codex/i];
+const RE_GITHUB_COPILOT = [/^github\.copilot/i, /^github-copilot/i, /^github\.copilot-chat/i, /^copilot/i];
 /** Codex 的宿主扩展目录名：VS Code 里的 openai.chatgpt-* / openai.codex-*（它们自带 codex） */
 const RE_CODEX_HOST = [/^openai\.(chatgpt|codex)/i];
+/** Claude Code 的 VS Code 扩展目录名：anthropic.claude-code-<版本>（4F 合并楼层的插件安装证据） */
+const RE_CLAUDE_HOST = [/^anthropic\.claude/i];
 const RE_CLAUDE = [/^claude/i];
 const RE_TRAE = [/^trae/i];
 /** 7F Kilo Code：CLI 叫 kilo（也提供 kilocode 这个别名，二者同一个二进制） */
@@ -381,12 +472,20 @@ const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
 
 /** 在某个根目录下找名字命中的子项（只看一层，快） */
 function matchIn(root, res) {
-  // res 可能是单个正则（某产品的 pluginRe，如 /trae/i）或正则数组：统一成数组再 .some
+  // res 可能是单个正则（某产品的 pluginRe，如 /trae/i）或正则数组：统一成数组再比较优先级。
+  // 关键修正：原来只要它命中就返回，`/copilot/i` 会把 `tencent-cloud.coding-copilot` 和
+  // `github.copilot-chat` 一起命中，盘符遍历顺序不同就会偶发选到旧目录，9F 胶囊就不亮。
+  // 这里按“最具体的匹配规则优先”选：GitHub 相关目录排在通配 `/copilot/i` 前面。
   const list = res instanceof RegExp ? [res] : res || [];
   try {
+    const candidates = [];
     for (const name of fs.readdirSync(root)) {
-      if (list.some((re) => re.test(name))) return path.join(root, name);
+      const idx = list.findIndex((re) => re.test(name));
+      if (idx >= 0) candidates.push({ name, idx });
     }
+    if (!candidates.length) return '';
+    candidates.sort((a, b) => a.idx - b.idx || a.name.localeCompare(b.name));
+    return path.join(root, candidates[0].name);
   } catch {
     /* 读不到就跳过 */
   }
@@ -424,7 +523,9 @@ function findDataPath(kind, plugin) {
               ? RE_KILO
               : kind === 'opencode'
                 ? RE_OPENCODE
-                : RE_CODEBUDDY;
+                : kind === 'copilot'
+                  ? RE_GITHUB_COPILOT
+                  : RE_CODEBUDDY;
   const homeDirs =
     kind === 'workbuddy'
       ? [path.join(HOME, '.workbuddy')]
@@ -443,7 +544,9 @@ function findDataPath(kind, plugin) {
                   // 命令形态（同一个 5F 的 IDE 那一路）：~/.trae（国际版）/ ~/.trae-cn（国内版）。
                   ? [path.join(HOME, '.marscode'), path.join(HOME, '.trae-cn'), path.join(HOME, '.trae')]
                   : [path.join(HOME, '.trae'), path.join(HOME, '.trae-cn')]
-                : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
+                : kind === 'copilot'
+                  ? [path.join(HOME, '.config', 'Code', 'User', 'globalStorage')]
+                  : [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')];
 
   const steps = plugin
     ? [
@@ -467,6 +570,11 @@ function findDataPath(kind, plugin) {
 /** 找插件安装目录（编辑器扩展）。res 可传单个正则（某产品的 pluginRe）或正则数组 */
 function findPluginDir(res = RE_PLUGIN) {
   return firstMatch(extensionRoots(), res);
+}
+
+/** 找插件 globalStorage 目录（扩展目录搜不到时的兜底安装证据）。res 同上。 */
+function findPluginStorageDir(res = RE_PLUGIN) {
+  return firstMatch(globalStorageRoots(), res);
 }
 
 /* ------------------------------ 产品定义 ------------------------------ */
@@ -546,6 +654,10 @@ const PRODUCTS = [
     cmd: 'claude',
     agent: 'claude',
     plugin: false,
+    // 同 3F Codex：命令行里搜不到 claude 时，再认一次 VS Code 的 Claude Code 扩展
+    // （anthropic.claude-code-*）作安装证据 —— 只装 IDE 扩展的人这一层照样"装了"。
+    // altPluginRe 仅作安装证据补抓，不影响 kind / client / 会话来源。
+    altPluginRe: RE_CLAUDE_HOST,
     // 只有一路 cli（~/.claude）：CLI 与 IDE 插件共用同一份配置、同一套 hook、同一份
     // transcript，**楼层**上分不出，所以这一路同时代表两种形态 —— tooltip 里标 'CLI/Plugin'（类 3F）。
     // 任务列表那一层分得出（transcript 的 entrypoint → form，见 hook.js 的 claudeForm）。
@@ -562,7 +674,7 @@ const PRODUCTS = [
     altCmd: 'trae-cn',
     agent: 'trae',
     plugin: false,
-    pluginRe: /trae/i,
+    pluginRe: /trae|coding-copilot/i,
     // 合并楼层（见文件头）：IDE 与 Plugin 是同一个产品的两种形态，两个形态的落盘都要列出来。
     //   dir(IDE)    —— ~/.trae-cn（国内版）/ ~/.trae（国际版）：memory/ 里是
     //                  session_memory_<会话>.jsonl 这类**记忆**文件 + project_memory.md，
@@ -597,12 +709,20 @@ const PRODUCTS = [
     name: 'Qoder',
     kind: 'cli',
     cmd: 'qoder',
+    // 国内版 Qoder 的命令是 qoder-cn（实测 ~/.qoder-cn/entry/qoder-cn，PATH 里没有 qoder）；
+    // 主命令搜不到时认它（类 5F TraeCode 的 trae-cn）。
+    altCmd: 'qoder-cn',
     agent: 'qoder',
     plugin: false,
-    // Qoder 的 CLI 与插件（qoder-context 等）共用同一份 ~/.qoder 配置、同一套 hook、
-    // 同一个落盘目录（~/.qoder/projects/<工程>/<会话>.jsonl），分不出，合并单楼层（类 4F Claude）。
+    // 插件形态的安装证据：Qoder 国内版的编辑器插件以 tongyi-lingma（通义灵码）发布 ——
+    // 扩展 displayName 实测就是 "Qoder CN (Formerly Lingma)"（~/.vscode/extensions/alibaba-cloud.tongyi-lingma-*）。
+    // 仅补安装证据（类 3F/4F 的 altPluginRe），不影响 kind / client / 会话来源。
+    altPluginRe: /tongyi-lingma/i,
+    // Qoder 的 CLI 与插件（qoder-context 等）共用同一份配置、同一套 hook、同一个落盘目录
+    // （~/.qoder 与 ~/.qoder-cn/projects/<工程>/…），分不出，合并单楼层（类 4F Claude）。
+    // 国际版装 ~/.qoder、国内版装 ~/.qoder-cn（两者可能只装其一，dirs 按序取第一个存在的）。
     // 所以 6F 走「cli 扫 transcript + hook 实时相位」两路：
-    //   cli   —— ~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式：各带 sessionId 与 cwd，
+    //   cli   —— <家>/projects/<工程>/<会话>.jsonl（Claude Code 同款格式：各带 sessionId 与 cwd，
     //            文件名即 session_id；会话来自落盘，工程路径从 cwd 解析；见 sessionRegistry 的 SUBTREE/sessionIdOfFile）
     //   hook  —— reporter 状态文件兜底（jsonl 还没写/读不出时，hook 那一路照常列会话并提供实时相位）
     // 两路按 session_id 去重（见 sessionRegistry 的 claim / cliLandingSeen：cli 有活会话就撤掉 hook 行）。
@@ -611,7 +731,7 @@ const PRODUCTS = [
         kind: 'cli',
         label: 'CLI/Plugin',
         client: clientOf('qoder', false),
-        dirs: [path.join(HOME, '.qoder')],
+        dirs: [path.join(HOME, '.qoder'), path.join(HOME, '.qoder-cn')],
       },
       { kind: 'hook' },
     ],
@@ -626,6 +746,9 @@ const PRODUCTS = [
     // 产品基名：上报身份 client=kilo（shared 的 clientOf 合同，见 shared/index.js）
     agent: 'kilo',
     plugin: false,
+    // 同 3F/4F：VS Code 扩展 kilocode.kilo-code-* 也是这一层的安装证据（RE_KILO_HOST，
+    // 之前定义了却没用上）。altPluginRe 仅补安装证据，不影响 kind / client / 会话来源。
+    altPluginRe: RE_KILO_HOST,
     // Kilo Code（7F）是**两路**楼层（与 8F OpenCode 同类，取法各自不同）：
     //   · CLI / TUI（没装 WorkGremlin 插件）：纯轮询，从它自己的 event-sourced SQLite 推导
     //     （见 server/src/kilo.js）。Kilo 没有 hook 子系统（实测 7.8.1 —— 没有 hooks.json、
@@ -722,6 +845,19 @@ const PRODUCTS = [
     hookSource: true,
     dataKind: clientOf('opencode', false),
   },
+  {
+    id: '9F',
+    name: 'GitHub Copilot',
+    kind: 'plugin',
+    cmd: 'copilot',
+    agent: 'copilot',
+    plugin: true,
+    pluginRe: RE_GITHUB_COPILOT,
+    // 9F 仅展示 GitHub Copilot VS Code 插件这一层：它没有独立 CLI 形态（至少主流程里走的是插件），
+    // 由 VS Code 扩展目录的 globalStorage / extension 目录做安装与落盘证据。
+    sources: ['plugin'],
+    dataKind: clientOf('copilot', true),
+  },
 ];
 
 /**
@@ -816,16 +952,25 @@ function detectOne(p) {
   const clients = [...new Set(specs.map((spec) => sourceClient(p, spec)))];
   const sources = specs.map((spec) => detectSource(p, spec, clients));
   const hasPluginSource = specs.some((spec) => spec.kind === 'plugin');
-  const installPath =
+  // 安装位置分两路记：CLI 可执行文件、插件扩展目录。合并楼层（1F CodeBuddy）两种形态
+  // 可能同时装着、也可能只装其一 —— 两路都要落到 tooltip 里（见 detectOne 返回 installPaths），
+  // 别像以前只取第一个命中就丢了另一路（只装了插件的人，tooltip 里永远只见 CLI 路径）。
+  const cliInstallPath =
     (p.cmd ? resolveCommand(p.cmd) || findCliBin(p.cmd) : '') ||
     // 备用命令（5F TraeCode：国内版 IDE 的 trae-cn）——主命令搜不到时再认它。
-    (p.altCmd ? resolveCommand(p.altCmd) || findCliBin(p.altCmd) : '') ||
-    // 插件形态的安装证据：plugin 楼层看自己的 pluginRe；合并楼层（1F CodeBuddy）也认插件扩展
-    // ——只装了 IDE 插件、没装 CLI 的人，这一层照样是"装了"（会话也确实在跑）。
-    (p.plugin || hasPluginSource ? findPluginDir(p.pluginRe || RE_PLUGIN) : '') ||
-    // 合并楼层（3F Codex）：命令行搜不到时，再认一次宿主扩展目录。
-    // 不改 kind / client：这层本来就同时代表 CLI 与 IDE，只是我们抓不到可执行文件而已。
-    (p.altPluginRe ? findPluginDir(p.altPluginRe) : '');
+    (p.altCmd ? resolveCommand(p.altCmd) || findCliBin(p.altCmd) : '');
+  // 插件形态的安装证据：plugin 楼层看自己的 pluginRe；合并楼层（1F CodeBuddy）也认插件扩展
+  // ——只装了 IDE 插件、没装 CLI 的人，这一层照样是"装了"（会话也确实在跑）。
+  // 3F Codex 这种「CLI 与 IDE 合并成一层」再认一次宿主扩展目录（altPluginRe）。
+  const pluginInstallPath =
+    (p.plugin || hasPluginSource || p.pluginRe ? findPluginDir(p.pluginRe || RE_PLUGIN) : '') ||
+    (p.altPluginRe ? findPluginDir(p.altPluginRe) : '') ||
+    // 扩展目录没扫到时（装进非标编辑器 / 扩展被卸但 globalStorage 还在），globalStorage
+    // 也算安装证据 —— 9F GitHub Copilot 只认扩展目录，而它家 globalStorage 在
+    // ~/.config/Code/User/globalStorage/github.copilot-chat 下还在，就会误判"未安装"。
+    (p.plugin || hasPluginSource || p.pluginRe ? findPluginStorageDir(p.pluginRe || RE_PLUGIN) : '');
+  // 兜底兼容：installed / 单值 installPath 仍取第一个命中的（老前端 / 调用方继续可用）
+  const installPath = cliInstallPath || pluginInstallPath;
   // 主来源 = 老口径那一路（CLI 楼层取 cli、插件楼层取 plugin）；合并楼层没有那一路时，
   // 取第一个真的有落盘目录的（1F → cli 的 ~/.codebuddy，5F → IDE 的 ~/.trae-cn）。
   // dataPath / stats 沿用它的，保证前端悬浮提示、外层调用方的字段形状不变（多路清单在 sources 里）。
@@ -864,6 +1009,21 @@ function detectOne(p) {
     installed: Boolean(installPath),
     installPath,
     installPathLabel: shorten(installPath),
+    /** CLI 可执行文件安装位置（合并楼层里它和插件可能都装了） */
+    cliInstallPath,
+    cliInstallPathLabel: shorten(cliInstallPath),
+    /** 插件扩展目录安装位置（只装了插件、没 CLI 的人，这一路才有值） */
+    pluginInstallPath,
+    pluginInstallPathLabel: shorten(pluginInstallPath),
+    /**
+     * 安装位置逐路清单：合并楼层（CLI + 插件）两种形态都列出，tooltip 照它逐行显示。
+     * 老服务端 / 老前端没有这个字段时，前端用 installPathLabel 兜底单行。
+     * @type {Array<{kind: string, path: string, label: string}>}
+     */
+    installPaths: [
+      ...(cliInstallPath ? [{ kind: 'cli', path: cliInstallPath, label: shorten(cliInstallPath) }] : []),
+      ...(pluginInstallPath ? [{ kind: 'plugin', path: pluginInstallPath, label: shorten(pluginInstallPath) }] : []),
+    ],
     dataPath: primary.dataPath,
     dataPathLabel: primary.dataPathLabel,
     stats: primary.stats,
@@ -879,4 +1039,4 @@ function detectProducts({ force = false } = {}) {
   return products;
 }
 
-module.exports = { detectProducts, PRODUCTS, shorten, humanSize, traeGlobalStorageRoots, claudeHome };
+module.exports = { detectProducts, PRODUCTS, shorten, humanSize, traeGlobalStorageRoots, traeLogRoots, claudeHome };

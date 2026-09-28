@@ -225,9 +225,18 @@ function createIngest(client) {
       try {
         const res = await fetch(`${base}/api/v1/workspace`, { headers, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
         const j = res.ok ? await res.json() : null
-        projectCache = String((j && j.project) || "")
-        return projectCache
+        const p = String((j && j.project) || "")
+        if (p) {
+          projectCache = p
+          return p
+        }
+        // 没拿到工程就别缓存 —— 下次调用重试，否则服务端晚起就永远拿不到工程、
+        // register / task/start / task/end 全被 `if (!project) return` 静默跳过
+        projectPromise = null
+        return ""
       } catch {
+        // 网络失败同样不缓存，下次重试
+        projectPromise = null
         return ""
       }
     })()
@@ -423,8 +432,18 @@ function createIngestPlugin(options, { location } = {}) {
     // 状态文件是合并写（readState → 打补丁 → 写回），不显式清的话旧 done 会一直挂着 ——
     // 新任务已经在跑了，控制台却还亮着上一轮的「任务完成」。done 置 null 而不是删键：
     // 合并写只认键值，null 就够服务端 readReporterDone 判成"没有"（见 sessions.js）。
+    //
+    // 同一个补丁里带上 **taskTitle = 用户那句话**：服务端 readReporterPhase 把它读成
+    // `prompt`，「思考中」时主控制台第二/第三层显示的就是它（见 sessions.js 的
+    // winPrompt 与 renderer/src/views/IsoOfficeView.vue 的 thinking 分支）。
+    // 早先这里只抹 done、不写 taskTitle，于是 7F/8F 的「思考中」屏上**一个字都没有** ——
+    // 别的楼层（hook 那一路，hook.js 的 TASK_START 分支）都写 taskTitle，所以只有 7F/8F 空着。
+    //
+    // 只写 `said`（用户原话，截到与 hook 同一口径的 80 字），**不写会话标题**：
+    // 会话标题默认是 "New session - <时间戳>" 这种没信息量的值，拿它当"用户问了什么"是编造。
+    // 拿不到原话就写空串（而不是留着上一轮的旧 prompt）—— 空屏好过显示上一轮的内容。
     try {
-      writeState(statePath(client, wsOf(event), sid), { done: null })
+      writeState(statePath(client, wsOf(event), sid), { done: null, taskTitle: said.slice(0, 80) })
     } catch {
       /* 抹不掉就算了：readReporterDone 有 TTL，最多多显示一会儿 */
     }
@@ -665,7 +684,19 @@ function createIngestPlugin(options, { location } = {}) {
           } else {
             // assistant 的文本是这一轮的收尾自述；实测每次 part 更新带的是**当前全文**，不是增量
             if (sid) assistantText.set(sid, text)
-            report(event, "idle")
+            // **这里原来报的是 idle（待命），是错的** —— 改过，实测踩的坑：
+            // Kilo 在**一轮之内**会多次吐 assistant 文字（每次工具调用前后都可能来一段）。
+            // 一律报 idle 的话，模型在两次工具调用之间说话时主 agent 就闪回「待命中」，
+            // 几秒后又被下一条 tool 事件顶回「调用工具」—— 用户看到的是相位在两个值之间来回跳，
+            // 而任务明明还在跑。其它楼层（hook 那一路）在这段间隙是**回落到思考中**的
+            // （见 hook.js 的 PostToolUse：工具跑完 → 写 sessionPhase thinking），
+            // 7F/8F 跟同一口径。
+            //
+            // 真正"这一轮结束了"有独立的判据，不靠这条：message.updated 带
+            // finish + time.completed（且不是 tool-calls）→ 报 done（上面那个分支）；
+            // session.idle / session.status=idle → 报 idle。所以这里报 thinking 不会让
+            // 相位卡在"思考中"收不了尾。
+            report(event, "thinking")
           }
           break
         }

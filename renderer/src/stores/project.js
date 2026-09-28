@@ -55,6 +55,9 @@ export const useProjectStore = defineStore('project', {
         url: wsUrl(info),
         token: info.token,
         project: null,
+        // 每轮（重）连前重新问一次 server 信息：server 重启会换 token / 端口，
+        // 拿旧的那份重连只会被 bad_token 一直踢（见 api/ws.js 的说明）。
+        resolve: () => this.resolveServerAuth(),
         onEvent: (msg) => {
           switch (msg.type) {
             case WS_EVENTS.SNAPSHOT:
@@ -83,6 +86,35 @@ export const useProjectStore = defineStore('project', {
       // 办公室里（member.status 心跳只更新不删除）。周期性拉一次快照整体对齐，保证最终一致。
       this.stopReconcile();
       this._reconcileTimer = setInterval(() => this.reconcile(), RECONCILE_MS);
+    },
+
+    /**
+     * 每次（重）连前的鉴权解析。
+     *
+     * Electron 主进程每次都会重读 ~/.workgremlin/server.json（见 desktop/src/main.js 的
+     * GET_SERVER_INFO），所以这里拿到的是"当前这个 server 实例"的端口与 token。
+     * 一旦和本地记的不一样（= server 重启过），就把 serverInfo 换成新的并把工程信息对齐一次；
+     * 各页面的 HTTP 轮询都读 project.serverInfo，因此也会跟着用上新 token（不再一路 401）。
+     * @returns {Promise<{url: string, token: string, project: null}>}
+     */
+    async resolveServerAuth() {
+      let info = this.serverInfo || {};
+      try {
+        const fresh = await getServerInfo();
+        if (fresh && fresh.port) {
+          const changed =
+            Number(fresh.port) !== Number(info.port) || String(fresh.token || '') !== String(info.token || '');
+          if (changed) {
+            info = fresh;
+            this.serverInfo = fresh;
+            const ws = await getWorkspace(fresh);
+            if (ws) this.applyWorkspace(ws);
+          }
+        }
+      } catch {
+        /* 读不到 server.json（或 IPC 不通）就用旧的那份继续试，别把连接卡死 */
+      }
+      return { url: wsUrl(info), token: info.token, project: null };
     },
 
     /** 拉一份当前快照，整体覆盖本地成员表（自愈：多出来的陈旧成员会被这次覆盖掉） */

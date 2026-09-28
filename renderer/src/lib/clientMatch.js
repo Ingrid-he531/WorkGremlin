@@ -72,6 +72,8 @@ const CLIENT_LABELS = {
   // 形态由 form 补出来：插件从环境变量认出（见 plugin/index.js 的 resolveClient）
   opencode: 'OpenCode',
   'opencode-plugin': 'OpenCode Plugin',
+  copilot: 'GitHub Copilot',
+  'copilot-plugin': 'GitHub Copilot Plugin',
 };
 
 /**

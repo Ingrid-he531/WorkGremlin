@@ -44,8 +44,223 @@ const { selectedModelOf: claudeModelOf } = require('./claudeModels');
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
 
-/** 插件目录名（腾讯 Coding Copilot，别名兜底） */
-const PLUGIN_RE = [/coding-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i];
+/** 插件目录名（腾讯 Coding Copilot、GitHub Copilot、别名兜底） */
+const PLUGIN_RE = [/coding-copilot/i, /github\.copilot/i, /github-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i, /^copilot/i];
+
+/** GitHub Copilot 的真实会话落盘是 SQLite `session-store.db`，不是 genie-history 目录。 */
+function readSqliteSessionRows(storage) {
+  const dbFile = path.join(storage, 'session-store.db');
+  if (!isFile(dbFile)) return [];
+  try {
+    const Database = require('better-sqlite3');
+    const db = new Database(dbFile, { readonly: true, fileMustExist: true });
+    try {
+      const cols = db.prepare('PRAGMA table_info(sessions)').all().map((c) => String(c.name || '').trim());
+      if (!cols.length) return [];
+      const idCol = cols.includes('id') ? 'id' : cols[0];
+      const cwdCol = cols.includes('cwd') ? 'cwd' : cols.includes('current_directory') ? 'current_directory' : '';
+      const repoCol = cols.includes('repository') ? 'repository' : cols.includes('repo') ? 'repo' : '';
+      const updatedCol = ['updated_at', 'last_updated', 'created_at', 'modified_at'].find((name) => cols.includes(name)) || '';
+      const summaryCol = cols.includes('summary') ? 'summary' : '';
+      const selectCols = [idCol, cwdCol, repoCol, updatedCol, summaryCol].filter(Boolean);
+      if (!selectCols.length) return [];
+      const query = `SELECT ${selectCols.join(', ')} FROM sessions WHERE ${idCol} IS NOT NULL AND TRIM(${idCol}) <> '' ${updatedCol ? `ORDER BY datetime(${updatedCol}) DESC` : ''}`;
+      const rows = db.prepare(query).all();
+
+      // turns 表：取每个会话的 turn 数 + 最后一条 user_message（作任务标题/提示语兜底）。
+      // session_files 表：取每个会话碰过的文件路径 + 工具名（作文件改动清单）。
+      // 两张表不一定在（Copilot 版本可能变），查不到就回空，不冒泡。
+      const turnsBySid = readCopilotTurns(db);
+      const filesBySid = readCopilotFiles(db);
+      // 「这一轮在不在飞」的旁证（VS Code 的 chat 索引，见 readCopilotChatIndex）
+      const chatBySid = readCopilotChatIndex();
+
+      return rows
+        .map((row) => {
+          const id = String(row[idCol] || '').trim();
+          if (!id) return null;
+          const cwd = cwdCol ? String(row[cwdCol] || '').trim() : '';
+          const projectPath = cwd || '';
+          const project = resolveProjectName(projectPath) || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
+          const ts = updatedCol ? row[updatedCol] : null;
+          // 拿不到真实时间戳 → lastUpdated=0，让下游 freshness 检查正确判过期（idle），
+          // 不要用 Date.now() 冒充 —— 一冒充就永远"新鲜"，相位卡死在 thinking。
+          const lastUpdated = ts ? (Number(new Date(ts).getTime()) || 0) : 0;
+          const summary = summaryCol ? String(row[summaryCol] || '').trim() : '';
+          const t = turnsBySid.get(id) || {};
+          const rawFiles = filesBySid.get(id) || [];
+          // session_files 存的是绝对路径，其他 agent 都用相对路径 —— 统一成相对路径
+          const files = rawFiles.map((f) => ({
+            ...f,
+            path: projectPath && f.path ? path.relative(projectPath, f.path) || f.path : f.path,
+          }));
+          return {
+            id,
+            project,
+            projectPath,
+            lastUpdated,
+            summary,
+            turnCount: t.turnCount || 0,
+            lastUserMessage: t.lastUserMessage || '',
+            hasPendingTurn: t.hasPendingTurn || false,
+            files,
+            turns: Array.isArray(t.turns) ? t.turns : [],
+            chat: chatBySid.get(id) || null,
+            // 最新那一轮请求（VS Code 会话日志）：在不在飞 + 用户原话 + 起止时间
+            live: readCopilotLiveRequest(id),
+          };
+        })
+        .filter(Boolean);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 读 Copilot `turns` 表：每个会话的 turn 数 + 最后一条 user_message。
+ * 表不存在 / 列名变了对上层透明（回空 Map，调用方照常工作）。
+ */
+function readCopilotTurns(db) {
+  const out = new Map();
+  try {
+    const cols = db.prepare('PRAGMA table_info(turns)').all().map((c) => String(c.name || '').trim());
+    if (!cols.length) return out;
+    const sidCol = cols.includes('session_id') ? 'session_id' : cols.includes('sid') ? 'sid' : '';
+    const msgCol = cols.includes('user_message') ? 'user_message' : '';
+    const respCol = cols.includes('assistant_response') ? 'assistant_response' : cols.includes('response') ? 'response' : '';
+    const tsCol = cols.includes('timestamp') ? 'timestamp' : '';
+    if (!sidCol) return out;
+    // 每个 session_id 取 turn 数 + 按 timestamp 倒序的第一条 user_message
+    const countRows = db.prepare(`SELECT ${sidCol} as sid, COUNT(*) as cnt FROM turns GROUP BY ${sidCol}`).all();
+    for (const r of countRows) {
+      const sid = String(r.sid || '').trim();
+      if (sid) out.set(sid, { turnCount: r.cnt, lastUserMessage: '', hasPendingTurn: false });
+    }
+    // 有空 assistant_response 的 turn = AI 还没写完回复 → 这条会话正在跑
+    // （Copilot 是批次写入：只在用户发消息时写 turn 行，AI 回复完了才更新 assistant_response。
+    //  所以"空回复的 turn"是"正在生成"的硬证据，比看 updated_at 新鲜度准得多。）
+    if (respCol) {
+      const pendingRows = db.prepare(`SELECT ${sidCol} as sid FROM turns WHERE ${respCol} IS NULL OR TRIM(${respCol}) = ''`).all();
+      for (const r of pendingRows) {
+        const sid = String(r.sid || '').trim();
+        if (sid) {
+          const existing = out.get(sid) || { turnCount: 0, lastUserMessage: '', hasPendingTurn: false };
+          existing.hasPendingTurn = true;
+          out.set(sid, existing);
+        }
+      }
+    }
+    // 逐轮清单：任务台账按「每一轮一条」记账要用（轮序号 + 用户原话 + 时间 + 有没有回复）。
+    // 列缺失（老版本）就跳过 —— 上层照常工作，只是没有逐轮台账。
+    const idxCol = cols.includes('turn_index') ? 'turn_index' : '';
+    if (idxCol && msgCol) {
+      const tsSel = tsCol ? `, ${tsCol} as ts` : '';
+      const pendSel = respCol ? `, (${respCol} IS NULL OR TRIM(${respCol}) = '') as pend` : ', 0 as pend';
+      for (const r of db.prepare(`SELECT ${sidCol} as sid, ${idxCol} as idx, ${msgCol} as msg${pendSel}${tsSel} FROM turns`).all()) {
+        const sid = String(r.sid || '').trim();
+        if (!sid) continue;
+        const existing = out.get(sid) || { turnCount: 0, lastUserMessage: '', hasPendingTurn: false };
+        if (!Array.isArray(existing.turns)) existing.turns = [];
+        existing.turns.push({
+          index: Number(r.idx) || 0,
+          userMessage: String(r.msg || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+          at: r.ts ? Number(new Date(String(r.ts)).getTime()) || 0 : 0,
+          pending: Boolean(r.pend),
+        });
+        out.set(sid, existing);
+      }
+      for (const v of out.values()) if (Array.isArray(v.turns)) v.turns.sort((a, b) => a.index - b.index);
+    }
+    if (msgCol && tsCol) {
+      const lastRows = db.prepare(`SELECT ${sidCol} as sid, ${msgCol} as msg FROM turns ORDER BY datetime(${tsCol}) DESC`).all();
+      for (const r of lastRows) {
+        const sid = String(r.sid || '').trim();
+        const msg = String(r.msg || '').trim();
+        if (sid && msg) {
+          const existing = out.get(sid) || { turnCount: 0, lastUserMessage: '', hasPendingTurn: false };
+          if (!existing.lastUserMessage) {
+            existing.lastUserMessage = msg.slice(0, 200);
+            out.set(sid, existing);
+          }
+        }
+      }
+    } else if (msgCol) {
+      // 没 timestamp 列就取最后一条（靠默认 rowid 顺序）
+      const lastRows = db.prepare(`SELECT ${sidCol} as sid, ${msgCol} as msg FROM turns`).all();
+      const seen = new Set();
+      for (let i = lastRows.length - 1; i >= 0; i--) {
+        const sid = String(lastRows[i].sid || '').trim();
+        const msg = String(lastRows[i].msg || '').trim();
+        if (sid && msg && !seen.has(sid)) {
+          seen.add(sid);
+          const existing = out.get(sid) || { turnCount: 0, lastUserMessage: '', hasPendingTurn: false };
+          existing.lastUserMessage = msg.slice(0, 200);
+          out.set(sid, existing);
+        }
+      }
+    }
+  } catch {
+    /* Copilot 版本变了 turns 表名/列名 → 回空 */
+  }
+  return out;
+}
+
+/**
+ * 读 Copilot `session_files` 表：每个会话碰过的文件路径 + 工具名。
+ * 表不存在 / 列名变了同样回空 Map。
+ */
+function readCopilotFiles(db) {
+  const out = new Map();
+  try {
+    const cols = db.prepare('PRAGMA table_info(session_files)').all().map((c) => String(c.name || '').trim());
+    if (!cols.length) return out;
+    const sidCol = cols.includes('session_id') ? 'session_id' : cols.includes('sid') ? 'sid' : '';
+    const pathCol = cols.includes('file_path') ? 'file_path' : cols.includes('path') ? 'path' : '';
+    const toolCol = cols.includes('tool_name') ? 'tool_name' : cols.includes('tool') ? 'tool' : '';
+    if (!sidCol || !pathCol) return out;
+    const turnCol = cols.includes('turn_index') ? 'turn_index' : '';
+    const orderCol = cols.includes('first_seen_at') ? 'first_seen_at' : cols.includes('created_at') ? 'created_at' : '';
+    const rows = db
+      .prepare(
+        `SELECT ${sidCol} as sid, ${pathCol} as fp${toolCol ? `, ${toolCol} as tn` : ''}${turnCol ? `, ${turnCol} as ti` : ''} FROM session_files${orderCol ? ` ORDER BY datetime(${orderCol}) DESC` : ''}`
+      )
+      .all();
+    for (const r of rows) {
+      const sid = String(r.sid || '').trim();
+      const fp = String(r.fp || '').trim();
+      if (!sid || !fp) continue;
+      // 只要**读**过的文件不算"改动文件"：Copilot 0.65.0 的 session_files 整表都是
+      // read_file（实测），拿它当"这一轮改了什么"会把一堆没动过的文件报上去。
+      const tool = toolCol ? String(r.tn || '').trim() : '';
+      if (tool && !COPILOT_WRITE_TOOL_RE.test(tool)) continue;
+      // Copilot 把**它自己的**临时文件也记进 session_files（工具调用的附件、
+      // chat-session-resources/.../content.txt 之类，全在 VS Code 的 workspaceStorage /
+      // globalStorage 下）。那些不是"这一轮改动的文件"，混进任务记录的文件清单只会误导
+      // （实测 9F 的记录里近一半是这种内部文件）。这里按"在编辑器存储目录下"精确剔除，
+      // 工程外的真实文件（比如另一个仓库）照旧保留。
+      if (/[\\/]User[\\/](?:workspace|global)Storage[\\/]/i.test(fp)) continue;
+      const arr = out.get(sid) || [];
+      // 去重（同一个文件可能被多轮碰）
+      if (!arr.some((f) => f.path === fp)) {
+        // turn：这个文件是哪一轮碰的（台账按轮切分时用它）。
+        // 拿不准就留 null —— Copilot 0.65.0 实测 turn_index 整列是 NULL（那整张表其实是
+        // "这个会话见过的文件"），把它当成 0 会张冠李戴挂到第一轮上，宁可说不知道。
+        arr.push({
+          path: fp,
+          tool: toolCol ? String(r.tn || '').trim() : '',
+          turn: turnCol && r.ti != null && r.ti !== '' ? Number(r.ti) : null,
+        });
+        out.set(sid, arr);
+      }
+    }
+  } catch {
+    /* Copilot 版本变了 session_files 表名/列名 → 回空 */
+  }
+  return out;
+}
 
 /**
  * 插件落盘这一路的来源客户端：**按楼层传入**，不再写死。
@@ -101,6 +316,10 @@ const SERVER_STARTED_AT = Date.now();
 
 /** 多久没动静算"不活跃"（插件 runtime 没有心跳，只能用文件时间） */
 const IDLE_MS = 10 * 60_000;
+/** Copilot 的相位新鲜窗口：2 分钟内有活动 = thinking，超了 = idle。
+ *  比 IDLE_MS 短得多 —— IDLE_MS 管"活不活"（10 分钟内都算活跃会话），
+ *  这个管"正在不在想"（2 分钟没动静就是待命了）。和 Kilo 的 PHASE_FRESH_MS 同量级。 */
+const COPILOT_PHASE_MS = 2 * 60_000;
 /** 文件改动在这么久之内 → 认为正在动手 */
 const BUSY_MS = 90_000;
 /** 落盘在这么久之内 → 认为这一轮对话还在推进（含纯推理、只读工具等拿不到文件/待办证据的情况） */
@@ -128,6 +347,14 @@ const DONE_TTL_MS = 10 * 60_000;
 function isDir(p) {
   try {
     return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isFile(p) {
+  try {
+    return fs.statSync(p).isFile();
   } catch {
     return false;
   }
@@ -187,16 +414,313 @@ function globalStorageRoots() {
   return out;
 }
 
+/** 编辑器 workspaceStorage 目录（VS Code 按工作区存 state.vscdb 的地方） */
+function workspaceStorageRoots() {
+  const out = [];
+  for (const r of dataRoots()) {
+    for (const ed of ['Code', 'Code - Insiders', 'Cursor', 'Trae', 'Windsurf', 'VSCodium']) {
+      const p = path.join(r, ed, 'User', 'workspaceStorage');
+      if (isDir(p)) out.push(p);
+    }
+  }
+  const srv = path.join(HOME, '.vscode-server', 'data', 'User', 'workspaceStorage');
+  if (isDir(srv)) out.push(srv);
+  return out;
+}
+
+/**
+ * Copilot「这一轮在不在飞」的旁证。
+ *
+ * Copilot 自己的 session-store.db 是**整轮写完**才落的：turns 行带着 assistant_response
+ * 一起出现，sessions.updated_at 也是那一刻才动 —— 「正在生成」在那张库里根本看不见。
+ * 只看 updated_at 的 2 分钟窗口，就会出现最难看的那种错：**跑着的时候显示待命，
+ * 跑完了反倒显示思考中**（实测 2026-09-28）。
+ *
+ * VS Code 自己有一份更细的索引：`workspaceStorage/<hash>/state.vscdb` 的
+ * `chat.ChatSessionStore.index`，每个会话带 `timing.lastRequestStarted / lastRequestEnded`
+ * （外加 lastResponseState / hasPendingEdits）。started 晚于 ended（或压根没有 ended）
+ * = 这一轮还在飞。这里只读它、不写；读不到就回空 Map，上层退回原来的时间窗推断。
+ */
+const COPILOT_INDEX_TTL = 2_000;
+/** dbFile -> { mtimeMs, size, at, entries }：文件没变就不重复开库（相位 1.5s 一poll） */
+let copilotIndexCache = new Map();
+
+function readCopilotChatIndex() {
+  const now = Date.now();
+  const next = new Map();
+  const out = new Map();
+  let Database = null;
+  try {
+    Database = require('better-sqlite3');
+  } catch {
+    /* 没装原生依赖就退回时间窗推断 */
+  }
+  for (const root of workspaceStorageRoots()) {
+    for (const name of readDir(root)) {
+      const dbFile = path.join(root, name, 'state.vscdb');
+      if (!isFile(dbFile)) continue;
+      let st = null;
+      try {
+        st = fs.statSync(dbFile);
+      } catch {
+        continue;
+      }
+      // 文件没动过、且上次读还在 TTL 内 → 直接用上次的结果（避免每 1.5s 开一次 SQLite）
+      const prev = copilotIndexCache.get(dbFile);
+      const unchanged = prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && now - prev.at < COPILOT_INDEX_TTL;
+      let entries = prev ? prev.entries : null;
+      if (Database && !unchanged) {
+        let db = null;
+        try {
+          db = new Database(dbFile, { readonly: true, fileMustExist: true });
+          const row = db.prepare("SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'").get();
+          const parsed = row && row.value ? JSON.parse(String(row.value)).entries : null;
+          entries = parsed ? Object.entries(parsed) : null;
+        } catch {
+          /* 这个工作区的库读不到（被占用 / 版本变了）→ 换下一个 */
+          entries = prev ? prev.entries : null;
+        } finally {
+          if (db) {
+            try {
+              db.close();
+            } catch {
+              /* 关不掉不影响读取 */
+            }
+          }
+        }
+      }
+      next.set(dbFile, { mtimeMs: st.mtimeMs, size: st.size, at: now, entries: entries || null });
+      for (const [sid, e] of entries || []) {
+        const t = (e && e.timing) || {};
+        out.set(String(sid), {
+          lastRequestStarted: Number(t.lastRequestStarted) || 0,
+          lastRequestEnded: Number(t.lastRequestEnded) || 0,
+          hasPendingEdits: Boolean(e && e.hasPendingEdits),
+          title: String((e && e.title) || ''),
+          stats: (e && e.stats) || null,
+        });
+      }
+    }
+  }
+  copilotIndexCache = next;
+  return out;
+}
+
+/**
+ * 会话行上的"在飞"标记：true 在飞 / false 已收工 / null 没有旁证（退回时间窗推断）。
+ *
+ * 两份旁证（VS Code 的 chat 索引 / 会话日志）**谁知道的那一轮更新，就听谁**：
+ * 索引常滞后（请求开始了它还没写），日志在请求开始就落；反过来日志的完成补丁又会晚一点到，
+ * 所以不能简单地"谁说不忙就信谁"。另外 DB 里已经有这一轮的 turn 行 = 铁定收工
+ * （Copilot 的 turn 行是整轮写完才落的）。
+ */
+function copilotInFlight(row) {
+  if (!row) return null;
+  const c = row.chat || null;
+  const live = row.live || null;
+  const turns = Array.isArray(row.turns) ? row.turns : [];
+  const lastTurnIdx = turns.length ? Number(turns[turns.length - 1].index) : -1;
+  // 日志**不早于**索引知道的那一轮就以日志为准。不能要求"严格更新"：实测这个 VS Code
+  // 版本把索引的 lastRequestEnded 写成和 lastRequestStarted 一样（永远判不出在飞），
+  // 平票时让索引压过日志，就会出现"日志明明说刚开跑、索引说已收工"→ 相位一直待命。
+  const logKnowsNewer = Boolean(live && live.startedAt && (!c || live.startedAt >= (c.lastRequestStarted || 0)));
+  if (logKnowsNewer) {
+    if (live.index != null && lastTurnIdx >= Number(live.index)) return false; // 这一轮的 turn 行已经落了
+    if (Date.now() - live.startedAt > 60 * 60_000) return false; // 太旧的"未完成"多半是残留，不算在飞
+    return !live.completed;
+  }
+  if (c) return Boolean(c.lastRequestStarted && c.lastRequestStarted > c.lastRequestEnded);
+  return null;
+}
+
+/**
+ * Copilot 会话"算不算正在跑"：有在途旁证就听它，没有才退回 updated_at 的 2 分钟窗口。
+ * @param {{chat?: any, lastUpdated?: number}} row
+ * @param {number} now
+ */
+function copilotInWindow(row, now) {
+  const inFlight = copilotInFlight(row);
+  if (inFlight !== null) return inFlight;
+  return Boolean(row.lastUpdated && now - row.lastUpdated < COPILOT_PHASE_MS);
+}
+
+/** 某条 Copilot 会话的 VS Code 会话日志（chatSessions/<会话>.jsonl） */
+function copilotChatLogPath(sessionId) {
+  const name = `${sessionId}.jsonl`;
+  for (const root of workspaceStorageRoots()) {
+    for (const dir of readDir(root)) {
+      const p = path.join(root, dir, 'chatSessions', name);
+      if (isFile(p)) return p;
+    }
+  }
+  return '';
+}
+
+/** sessionId -> { key, value }：日志是 append-only 的，mtime+size 没变就没必要重读 */
+const copilotLiveCache = new Map();
+
+/**
+ * 会**写文件**的 Copilot 工具（toolId）。只有这些工具碰过的文件才算"这一轮改动的文件"。
+ * 实测（0.65.0）toolId 长这样：copilot_readFile / copilot_findTextInFiles / run_in_terminal /
+ * copilot_replaceString / copilot_multiReplaceString / manage_todo_list…
+ * —— session_files 那张表里**只有 read_file**，拿它当"改动文件"是错的（用户实测抓出来的）。
+ */
+const COPILOT_WRITE_TOOL_RE =
+  /replace|patch|create[_.]?file|write[_.]?file|edit[_.]?file|insert[_.]?edit|apply[_.]?edit|multi[_.]?replace|delete[_.]?file|move[_.]?file/i;
+
+/**
+ * 读 Copilot 会话日志的**尾部**，取最新那一轮请求。
+ *
+ * 这份日志（`workspaceStorage/<hash>/chatSessions/<会话>.jsonl`）是 VS Code 自己的会话状态
+ * 补丁流：`{"kind":1,"k":["requests",<n>,"…"],"v":…}` 一条条追加。关键在**时机** ——
+ * 最新一轮的 `requests` 数组（含用户原话 message.text 与起始 timestamp）在这一轮**开始**时
+ * 就追加进去了（实测那一行里的 modelState 还是 {value:0}，完成时间稍后才以
+ * `requests.<n>.modelState.completedAt` 补上）。所以它一次给出三样 Copilot 自己的 sqlite
+ * 库给不了的东西：这一轮在不在飞、用户原话、起止时间。
+ *
+ * @param {string} sessionId
+ * @returns {{index: number|null, prompt: string, startedAt: number, completed: boolean,
+ *            completedAt: number, reqs: Array<{index: number, startedAt: number, endedAt: number}>,
+ *            changed: Array<{index: number, files: string[]}>}|null}
+ */
+function readCopilotLiveRequest(sessionId) {
+  const file = copilotChatLogPath(sessionId);
+  if (!file) return null;
+  let st = null;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return null;
+  }
+  const key = `${st.mtimeMs}@@${st.size}`;
+  const hit = copilotLiveCache.get(sessionId);
+  if (hit && hit.key === key) return hit.value;
+
+  const TAIL = 4 * 1024 * 1024; // 最新那一轮那行可能很大（带整段 response），往上多读一点
+  let txt = '';
+  try {
+    const start = Math.max(0, st.size - TAIL);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(st.size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      txt = buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (start > 0) txt = txt.slice(txt.indexOf('\n') + 1); // 丢掉可能被截断的首行
+  } catch {
+    return null;
+  }
+
+  let req = null;
+  const modelStateByIndex = new Map(); // 轮序号 -> {value, completedAt}
+  const elapsedByIndex = new Map(); // 轮序号 -> elapsedMs（起止时间 = completedAt - elapsedMs）
+  const changedByIndex = new Map(); // 轮序号 -> Set(写工具碰过的文件：绝对路径)
+  let maxIndex = -1;
+  for (const line of txt.split('\n')) {
+    if (!line || line[0] !== '{') continue;
+    let j = null;
+    try {
+      j = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const k = j && j.k;
+    if (!Array.isArray(k) || k[0] !== 'requests') continue;
+    if (k.length === 1) {
+      // 整份 requests（滚动窗口）：最后一条就是最新那一轮
+      const arr = Array.isArray(j.v) ? j.v : [];
+      const last = arr[arr.length - 1];
+      if (last && typeof last === 'object') {
+        const startedAt = Number(last.timestamp) || 0;
+        const prompt = String((last.message || {}).text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        if (startedAt) req = { index: null, prompt, startedAt, completed: false, completedAt: 0 };
+      }
+    } else {
+      const idx = Number(k[1]);
+      if (Number.isFinite(idx)) {
+        maxIndex = Math.max(maxIndex, idx);
+        if (k[2] === 'modelState' && j.v && typeof j.v === 'object') {
+          modelStateByIndex.set(idx, { value: Number(j.v.value) || 0, completedAt: Number(j.v.completedAt) || 0 });
+        } else if (k[2] === 'elapsedMs') {
+          elapsedByIndex.set(idx, Number(j.v) || 0);
+        } else if (k[2] === 'response') {
+          // 这一轮的回复流里，**写文件**的工具调用 = 这一轮改动的文件。
+          // 路径整个对象里找（invocationMessage / pastTenseMessage / toolSpecificData 都可能带），
+          // 只认 file:// URI，去掉 #Lx-y 行号后缀。
+          for (const it of Array.isArray(j.v) ? j.v : []) {
+            if (!it || typeof it !== 'object' || it.kind !== 'toolInvocationSerialized') continue;
+            if (!COPILOT_WRITE_TOOL_RE.test(String(it.toolId || ''))) continue;
+            const blob = JSON.stringify(it);
+            const files = [...blob.matchAll(/file:\/\/([^\s)\]\\"']+)/g)]
+              .map((m) => decodeURIComponent(m[1]).replace(/#.*$/, ''))
+              .filter(Boolean);
+            if (!files.length) continue;
+            if (!changedByIndex.has(idx)) changedByIndex.set(idx, new Set());
+            for (const f of files) changedByIndex.get(idx).add(f);
+          }
+        }
+      }
+    }
+  }
+  if (!req) return null;
+  /*
+   * 完成判定**不能**拿"补丁里的最大轮号"当这一轮的轮号：最新一轮在开始时落的是一整份
+   * requests（此时还没有它的 requests.<n>.* 补丁），那一轮号还是上一轮的 —— 拿上一轮的
+   * modelState.completedAt 去判定，就会把"刚开始跑"判成"已经收工"（2026-09-28 实测的坑：
+   * 用户跑任务时 9F 连"思考中"都没有）。
+   * 轮次是顺序的，所以正确判据是：**有没有出现"不早于这一轮起始时间"的完成标记**。
+   * 没有（最大的 completedAt 还是上一轮的，必然早于本轮 startedAt）→ 这一轮还在飞。
+   */
+  let maxCompletedAt = 0;
+  let maxCompletedIndex = -1;
+  for (const [idx, st] of modelStateByIndex) {
+    if (st.completedAt > maxCompletedAt) {
+      maxCompletedAt = st.completedAt;
+      maxCompletedIndex = idx;
+    }
+  }
+  req.completed = maxCompletedAt >= req.startedAt;
+  req.completedAt = req.completed ? maxCompletedAt : 0;
+  req.index = req.completed ? maxCompletedIndex : maxCompletedIndex >= 0 ? maxCompletedIndex + 1 : null;
+  // 顺带回一份"最近几轮各自的起止时间"（顶部窗口里带 elapsedMs 的都能算出来），
+  // 台账按轮记账时用它把每一轮的 started_at 填准（Copilot 自己的库只有完成时刻）。
+  req.reqs = [];
+  for (const [idx, st] of modelStateByIndex) {
+    if (!st.completedAt) continue;
+    const el = elapsedByIndex.get(idx) || 0;
+    req.reqs.push({ index: idx, startedAt: Math.max(0, st.completedAt - el), endedAt: st.completedAt });
+  }
+  req.reqs.sort((a, b) => a.index - b.index);
+  // 最近几轮各自改动的文件（写工具碰过的），按轮序号给出去
+  req.changed = [...changedByIndex]
+    .map(([index, set]) => ({ index, files: [...set] }))
+    .sort((a, b) => a.index - b.index);
+  copilotLiveCache.set(sessionId, { key, value: req });
+  return req;
+}
+
 /** 插件目录名会带版本号，所以按名字前缀找；要求里面有会话相关子目录才算数 */
 function findPluginStorage(re = PLUGIN_RE) {
   // 与 products.js 的 matchIn 保持一致：pluginRe 既可是正则数组，也可是单个正则（如 /trae/i）
   const list = re instanceof RegExp ? [re] : re || [];
-  const marks = ['genie-history', 'todos', 'file-changes', 'message-queue'];
+  const marks = ['genie-history', 'todos', 'file-changes', 'message-queue', 'session-store.db'];
+  const priority = (name) => {
+    const n = String(name || '').toLowerCase();
+    if (/github\.copilot|github-copilot|^copilot/i.test(n)) return 0;
+    if (/coding-copilot|tencent|ingram|codebuddy/i.test(n)) return 1;
+    return 2;
+  };
   for (const root of globalStorageRoots()) {
-    for (const name of readDir(root)) {
+    const names = [...readDir(root)].sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
+    for (const name of names) {
       if (!list.some((rx) => rx.test(name))) continue;
       const p = path.join(root, name);
-      if (marks.some((m) => isDir(path.join(p, m)))) return p;
+      const hasSessionStore = isFile(path.join(p, 'session-store.db'));
+      if (hasSessionStore || marks.some((m) => isDir(path.join(p, m)) || (m === 'session-store.db' ? isFile(path.join(p, m)) : false))) {
+        return p;
+      }
     }
   }
   return '';
@@ -373,6 +897,40 @@ function sessionModel(client, sessionId, agentType = '') {
  * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
  * @returns {{phase: string, tool: string, file: string, cmd: string, prompt: string, model: string, client: string, pending: {tool: string, file: string, cmd: string, at: number}|null}|null}
  */
+function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
+  if (clientBase(client) !== 'copilot') return null;
+  const storage = findPluginStorage(PLUGIN_RE);
+  if (!storage) return null;
+  const rowList = readSqliteSessionRows(storage)
+    .filter((r) => (!session || String(r.id || '') === String(session)))
+    .filter((r) => (!workspacePath || !r.projectPath || path.resolve(r.projectPath) === path.resolve(workspacePath)));
+  if (!rowList.length) return null;
+  rowList.sort((a, b) => Number(b.lastUpdated || 0) - Number(a.lastUpdated || 0));
+  const row = rowList[0];
+  // 相位：优先听 VS Code chat 索引的"这一轮在不在飞"，没有旁证才退回 2 分钟新鲜度窗口。
+  // 和 listSessions 同一口径（copilotInWindow）—— 不要让旧会话永远显示 thinking，
+  // 更不要在轮正跑着的时候报待命。
+  const now = Date.now();
+  const fresh = copilotInWindow(row, now);
+  // 屏上那句"用户说的话"：正在飞的那一轮用会话日志里的原话（Copilot 自己的库要等整轮写完才有）
+  const prompt = String(
+    (fresh && row.live && row.live.prompt) || row.lastUserMessage || row.summary || ''
+  ).trim();
+  return {
+    client: String(client || 'copilot-plugin').toLowerCase(),
+    phase: fresh ? 'thinking' : 'idle',
+    tool: '',
+    file: '',
+    cmd: '',
+    prompt,
+    model: '',
+    pending: null,
+    action: '',
+    target: '',
+    context: [],
+  };
+}
+
 function readReporterPhase(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
@@ -409,7 +967,11 @@ function readReporterPhase(workspacePath, client = '', session = '') {
       winModel = String(j.model || "") || sessionModel(winClient, j.sessionId, j.agentType);
     }
   }
-  if (!win) return null;
+  if (!win) {
+    const sqlFallback = readCopilotPhaseFromSqlite(workspacePath, client, session);
+    if (sqlFallback) return sqlFallback;
+    return null;
+  }
   return {
     // 这份相位是哪个客户端写的（Codex 有显式 PermissionRequest，不需要 pending 推断）
     client: String(winClient || LEGACY_STATE_CLIENT).toLowerCase(),
@@ -999,8 +1561,9 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   // 在别的工程里活动不该决定这一层的"当前工程" —— 否则 mine / current / fresh 全被带偏。
   const ws = freshestReporterWs(workspacePath, client);
   const now = Date.now();
-  // 缓存键含 client：不同插件楼层（codebuddy-plugin / trae-plugin …）即使同一工程也各算各的
-  const key = `${client}@@${ws}`;
+  // 缓存键必须覆盖 client / pluginRe / 工程，否则同一工程里的不同插件楼层、或 CLI/Plugin 视图
+  // 会复用上一次的旧结果（例如 A5 里 plugin 那路读到先前写入的窗口值、误以为还在全局表里）。
+  const key = `${client}@@${ws}@@${String(pluginRe instanceof RegExp ? pluginRe.source : Array.isArray(pluginRe) ? pluginRe.map((r) => (r && r.source) || String(r)).join('|') : String(pluginRe || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
   const storage = findPluginStorage(pluginRe);
@@ -1032,6 +1595,18 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     }
     if (cid && !meta.has(cid)) meta.set(cid, { project: p.project, projectPath: p.path });
   }
+
+  // GitHub Copilot 这类真实插件落盘用 SQLite `session-store.db`，不是 `genie-history`：
+  // 这里单独把它们并进同一张会话表，否则 9F 永远会被旧的 Tencent 目录吞掉、UI 不点亮。
+  const sqliteSessions = readSqliteSessionRows(storage);
+  const sqliteById = new Map();
+  for (const row of sqliteSessions) {
+    if (!row || !row.id) continue;
+    sqliteById.set(row.id, row);
+    meta.set(row.id, { project: row.project, projectPath: row.projectPath });
+    if (row.projectPath && row.projectPath === ws) currentId = currentId || row.id;
+  }
+
   // 兜底：插件新版可能不写 genie-history，会话只在 todos / 消息队列里露过头。
   // 这类会话没有工程归属（project 留空），但它是"正在跑的那个"，不列出来更糟。
   for (const name of readDir(path.join(storage, 'todos'))) {
@@ -1041,27 +1616,74 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
 
   const sessions = [];
   for (const [id, m] of meta) {
-    // 这条会话是不是它"自己工程"里当前开着的那个（每个工程各算各的，可多条同时为 true）。
-    // 只有它才吃得到本工程 reporter 上报的实时相位；别的工程 / 历史会话一律走推断。
+    const sqliteRow = sqliteById.get(id);
     const isProjectCurrent = id === (perProjectCurrent.get(m.projectPath) || '');
-    // 活跃窗口按"这条会话自己的工程"匹配 reporter 的 taskId：工程没在跑就不采信它的相位，
-    // 避免旧工程残留的"思考中"相位在 IDE 关掉 / 切走后还挂着。
-    const inWindow = readReporterActiveTask(m.projectPath, client);
-    const info = sessionInfo(storage, id, {
-      current: isProjectCurrent,
-      now,
-      workspacePath: m.projectPath,
-      inWindow,
-      client,
-    });
-    // 只按"还在窗口内"过滤（60 分钟），不再因为 10 分钟没动静就整条剔除 ——
-    // 否则 IDE 里明明开着、只是十几分钟没敲字的会话会从这一层消失（与 CLI 那路口径不一致）。
+    // Copilot 没有 reporter hook，readReporterActiveTask 恒为空，相位只能推断（inferred）：
+    //   ① 有 VS Code chat 索引的「这一轮在不在飞」→ 直接听它（跑着就是 thinking，收工就是 idle），
+    //      这是唯一能看见"轮进行中"的旁证，见 readCopilotChatIndex；
+    //   ② 没有旁证（老版本 / 库被占用）才退回 updated_at 的 COPILOT_PHASE_MS(2 分钟)窗口。
+    // hasPendingTurn（空 assistant_response 的 turn）不单独使用 —— Copilot 是批次写入，
+    // 放弃/取消的 turn 也留空 response，2 分钟外的空 turn 是已废弃不是正在跑。
+    const reporterInWindow = readReporterActiveTask(m.projectPath, client);
+    const inWindow = sqliteRow
+      ? (reporterInWindow || copilotInWindow(sqliteRow, now))
+      : reporterInWindow;
+    const inFlight = sqliteRow ? copilotInFlight(sqliteRow) : null;
+    const info = sqliteRow
+      ? {
+          id,
+          current: Boolean(isProjectCurrent || (sqliteRow.projectPath && sqliteRow.projectPath === ws)),
+          active: Boolean(sqliteRow.lastUpdated && now - sqliteRow.lastUpdated < IDLE_MS),
+          listed: Boolean(sqliteRow.lastUpdated && now - sqliteRow.lastUpdated < LISTED_MS),
+          live: true,
+          lastUpdated: sqliteRow.lastUpdated || 0,
+          runtime: { activated: true, paused: false, awaitingSessionIdle: false },
+          pending: 0,
+          todos: { total: 0, done: 0, doing: '', items: [] },
+          // Copilot 的 session_files 表给出本轮碰过的文件路径 + 工具名；有就带上，
+          // 没有回空列表（老版本 Copilot 可能没这张表 —— readCopilotFiles 已兜底回空）。
+          files: { count: (sqliteRow.files || []).length, recent: sqliteRow.files || [], lastAt: sqliteRow.lastUpdated || null },
+          phase: inWindow ? 'thinking' : 'idle',
+          action: '',
+          target: '',
+          tool: '',
+          context: [],
+          // 「思考中」屏上那句话：正在飞的那一轮用 VS Code 会话日志里的用户原话（最新），
+          // 否则退回 Copilot 的 turns 表里最后一条 user_message；summary（sessions 表）
+          // 是 Copilot 自己取的会话标题 —— 都带上，渲染层按它的规则择优展示。
+          prompt: (inFlight && sqliteRow.live && sqliteRow.live.prompt) || sqliteRow.lastUserMessage || '',
+          doneAt: 0,
+          doneTitle: sqliteRow.summary || '',
+          doneCount: sqliteRow.turnCount || 0,
+          doneFiles: [],
+          inferred: true,
+          hasPendingTurn: sqliteRow.hasPendingTurn || false,
+          // 「这一轮在不在飞」：true / false / null（没旁证）。台账同步器（copilotTasks.js）
+          // 靠它决定这条会话的任务是"运行中"还是"已完成"，比时间窗准。
+          inFlight,
+          /** 正在飞的那一轮：用户原话 + 起始时间 + 轮序号（台账按轮记账用） */
+          livePrompt: (sqliteRow.live && sqliteRow.live.prompt) || '',
+          liveStartedAt: (sqliteRow.live && sqliteRow.live.startedAt) || 0,
+          liveIndex: sqliteRow.live ? sqliteRow.live.index : null,
+          /** 最近几轮各自的起止时间（会话日志里的 completedAt - elapsedMs） */
+          liveReqs: (sqliteRow.live && sqliteRow.live.reqs) || [],
+          /** 最近几轮各自**改动过的文件**（会话日志里写工具碰过的；read_file 不算） */
+          liveChanged: (sqliteRow.live && sqliteRow.live.changed) || [],
+          /** 逐轮清单（turns 表）：任务台账「每一轮一条」用 */
+          copilotTurns: sqliteRow.turns || [],
+        }
+      : sessionInfo(storage, id, {
+          current: isProjectCurrent,
+          now,
+          workspacePath: m.projectPath,
+          inWindow,
+          client,
+        });
     if (!info.listed) continue;
     sessions.push({
       ...info,
       project: m.project,
       projectPath: m.projectPath,
-      /** 属于当前真实活动工程（ws）—— 只有它才有幽灵清单可看 */
       mine: Boolean(ws) && m.projectPath === ws,
     });
   }
@@ -1072,7 +1694,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
 
   cache = {
     at: now,
-    key: ws,
+    key,
     value: {
       ok: true,
       sessions,
@@ -1085,6 +1707,71 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   return cache.value;
 }
 
+/**
+ * Copilot 当前选中的模型。从 VS Code 的 state.vscdb 里读 `chat.currentLanguageModel.editor`，
+ * 值形如 `copilot/gpt-5-mini`；再用 `chat.cachedLanguageModels` 查展示名（如 "GPT-5 mini"）。
+ * 取不到返回空串 —— 不猜。
+ *
+ * 和 TraeCode 的 traeModels.selectedModelOf 同理：模型存在 globalStorage 的 state.vscdb 里，
+ * Copilot 自己的 session-store.db 不记模型。
+ */
+const COPILOT_MODEL_CACHE_TTL = 15_000;
+let copilotModelCache = { at: 0, value: '' };
+
+function copilotCurrentModel() {
+  const now = Date.now();
+  if (copilotModelCache.value && now - copilotModelCache.at < COPILOT_MODEL_CACHE_TTL) {
+    return copilotModelCache.value;
+  }
+  const storage = findPluginStorage([/github\.copilot/i, /github-copilot/i, /^copilot/i]);
+  if (!storage) {
+    copilotModelCache = { at: now, value: '' };
+    return '';
+  }
+  // state.vscdb 在 globalStorage 根下（Copilot 的 plugin storage 是它的子目录）
+  const dbFile = path.join(path.dirname(storage), 'state.vscdb');
+  let db = null;
+  try {
+    if (!fs.existsSync(dbFile)) {
+      copilotModelCache = { at: now, value: '' };
+      return '';
+    }
+    const Database = require('better-sqlite3');
+    db = new Database(dbFile, { readonly: true, fileMustExist: true });
+    // 当前选中的模型标识（如 "copilot/gpt-5-mini"）
+    const row = db.prepare("select value from ItemTable where key = 'chat.currentLanguageModel.editor'").get();
+    const identifier = row ? String(row.value || '').trim() : '';
+    if (!identifier) {
+      copilotModelCache = { at: now, value: '' };
+      return '';
+    }
+    // 从 cachedLanguageModels 查展示名（如 "GPT-5 mini"）
+    const cached = db.prepare("select value from ItemTable where key = 'chat.cachedLanguageModels'").get();
+    if (cached && cached.value) {
+      const models = JSON.parse(String(cached.value));
+      if (Array.isArray(models)) {
+        const match = models.find((m) => m && m.identifier === identifier);
+        if (match && match.metadata && match.metadata.name) {
+          const name = String(match.metadata.name);
+          copilotModelCache = { at: now, value: name };
+          return name;
+        }
+      }
+    }
+    // 查不到展示名就用标识符去掉 vendor 前缀（"copilot/gpt-5-mini" → "gpt-5-mini"）
+    const fallback = identifier.replace(/^[^/]+\//, '');
+    copilotModelCache = { at: now, value: fallback };
+    return fallback;
+  } catch {
+    copilotModelCache = { at: now, value: '' };
+    return '';
+  } finally {
+    if (db) {
+      try { db.close(); } catch { /* 关不掉不影响读取 */ }
+    }
+  }
+}
+
 module.exports = {
   hasReporterState,
   reporterStateMeta,
@@ -1094,6 +1781,7 @@ module.exports = {
   readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
   listReporterSessions, // 会话只能靠 hook 的楼层（5F TraeCode）与合并楼层的 hook 那一路（1F CodeBuddy CLI）
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
+  copilotCurrentModel, // Copilot 当前选中的模型（从 VS Code state.vscdb 取）
   listSessions,
   findPluginStorage,
   decodeDirName,

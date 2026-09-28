@@ -38,6 +38,23 @@ function toReporterDone(done, sessionId, workspacePath = '') {
 }
 
 /**
+ * 楼层客户端串里有没有**这一路**。
+ *
+ * 渲染层传的是**整个楼层的 clients 串**（`sessions.selectedClients.join(',')`），合并楼层就是
+ * 逗号串（7F `kilo,kilo-plugin`、8F `opencode,opencode-plugin`）。以前这里写的是
+ * `clientBase(client) === 'kilo' | 'opencode'` —— clientBase 只剥单个 -plugin 后缀，
+ * 逗号串永远不相等，于是这两条分支**整条不生效**：相位 / 模型 / 完成标记全空。
+ * （实测 2026-09-28：8F 楼层加了 opencode-plugin 这一路之后，主控制台只剩"思考中"、没有内容。）
+ */
+function clientListHas(client, base) {
+  return String(client || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .some((c) => clientBase(c) === base);
+}
+
+/**
  * 会话：全局活跃会话表（按楼层分组）。
  * 数据源是各智能体自己的落盘，跟当前打开的工程无关 —— 换工程的入口在
  * /api/v1/workspace，这里只负责"列出 / 选中哪个会话"。
@@ -77,7 +94,7 @@ function createSessionsRouter({ workspace }) {
     //     实测也只有 completed / error / running，没有 pending，轮询同样推不出等授权）。
     //   · kilo（CLI / TUI，没装插件）：纯轮询，从它自己的 SQLite 推导（恒带 inferred）。
     // 两条路的响应形状完全一致，渲染层分不出也不需要分。
-    if (clientBase(client) === 'kilo') {
+    if (clientListHas(client, 'kilo')) {
       const fallbackWs = ws || cur.workspacePath || '';
       // ---- 先问真相位：插件写的状态文件（与通用口径读的是同一份东西） ----
       //
@@ -120,7 +137,7 @@ function createSessionsRouter({ workspace }) {
     // 内存事件流里，轮询推不出来）。
     // 所以顺序是：先按通用口径读 reporter（插件在就命中）→ 读不到才退回轮询推导。
     // 两条路的响应形状完全一致，渲染层分不出也不需要分。
-    if (clientBase(client) === 'opencode') {
+    if (clientListHas(client, 'opencode')) {
       const fallbackWs = ws || cur.workspacePath || '';
       // ---- 真相位：插件写的状态文件（与下面通用口径读的是同一份东西） ----
       const rpTruth = reporterMainPhase(ws, client, session);

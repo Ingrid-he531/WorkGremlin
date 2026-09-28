@@ -14,6 +14,7 @@
 import { defineStore } from 'pinia';
 import { httpBase } from '../api/bridge';
 import { PHASES } from '../iso/mainConsole';
+import { useProjectStore } from './project';
 
 const POLL_MS = 10_000;
 /** 定时器放在 store 外面：它不是状态 */
@@ -234,10 +235,17 @@ export const useSessionStore = defineStore('sessions', {
       this.floorEmpty = !this.selectedId;
     },
 
-    /** @param {{port?:number, token?:string, fallback?:boolean}} info */
+    /**
+     * @param {{port?:number, token?:string, fallback?:boolean}} info 只当首轮兜底
+     *
+     * 不能把启动那一刻的 info **吃死在闭包里**：server 重启会换 token（见 api/ws.js），
+     * 吃死旧 token 的轮询从此一路 401，界面就停在旧数据上不再更新
+     * （实测：跑着的任务在任务/会话表里再也不出现）。所以每轮都取当前的 serverInfo。
+     */
     startPolling(info = {}) {
       this.stopPolling();
-      timer = setInterval(() => this.refresh(info), POLL_MS);
+      const fallback = info;
+      timer = setInterval(() => this.refresh(useProjectStore().serverInfo || fallback), POLL_MS);
     },
 
     stopPolling() {

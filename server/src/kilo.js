@@ -160,7 +160,8 @@ function query(fn) {
   }
 }
 
-/** 库里到底有没有这些表 —— 用来给前端一句"这一路读不出会话"的说明 */
+/**
+ * 库里到底有没有这些表 —— 用来给前端一句"这一路读不出会话"的说明 */
 function hasCoreTables() {
   return query((db) => {
     const names = db
@@ -169,6 +170,57 @@ function hasCoreTables() {
       .map((r) => r.name);
     return names.length === 3;
   }) === true;
+}
+
+/**
+ * 这一轮**用户说的话**（「思考中」时主控制台屏上显示的那句）。
+ *
+ * 取法：event 里 role=user 的 text part，按 seq 倒序取最新一条 —— 用户原话就在
+ * `part.text` 里（实测值带一层 JSON 引号，要剥掉），这与插件那一路
+ * （plugin/index.js 的 role==='user' 分支）是同一个信号，只是这里从库里读而不是从事件流收。
+ *
+ * 为什么轮询这一路也要有它：早先 `readKiloPhase` 每个分支都写死 `prompt: ''`，
+ * 于是 7F 的「思考中」屏上**一个字都没有**。别的楼层不空，是因为它们的 hook 把
+ * 用户原话以 `taskTitle` 写进状态文件，服务端 `readReporterPhase` 读出来当 prompt
+ * （见 sessions.js 的 winPrompt）。7F 没装插件时没有那份状态文件，就只能自己从库里取 ——
+ * 取的是用户自己的原话，不是编的。
+ *
+ * 取不到（表缺 / 没有用户消息 / JSON 坏了）一律回空串：宁可空屏，不拿会话标题顶替。
+ * @param {string} sessionId
+ * @returns {string}
+ */
+function readRoundPrompt(sessionId) {
+  const rows = query((db) =>
+    db
+      .prepare(
+        `SELECT e.data AS data
+           FROM event e
+           JOIN message m ON m.id = JSON_extract(e.data,'$.part.messageID')
+                              AND m.session_id = e.aggregate_id
+          WHERE e.aggregate_id = ?
+            AND JSON_extract(e.data,'$.part.type') = 'text'
+            AND JSON_extract(m.data,'$.role') = 'user'
+          ORDER BY e.seq DESC LIMIT 1`
+      )
+      .all(String(sessionId))
+  );
+  if (!Array.isArray(rows) || !rows.length) return '';
+  try {
+    const d = JSON.parse(String(rows[0].data || ''));
+    const raw = String((d && d.part && d.part.text) || '').trim();
+    if (!raw) return '';
+    // 实测 part.text 带一层 JSON 引号（'"…"'"），先按 JSON 剥一层，剥不掉就用原文
+    let said = raw;
+    try {
+      const un = JSON.parse(raw);
+      if (typeof un === 'string') said = un;
+    } catch {
+      /* 不是 JSON 包裹的，原样用 */
+    }
+    return said.replace(/\s+/g, ' ').trim().slice(0, 80);
+  } catch {
+    return '';
+  }
 }
 
 /* ------------------------------ 会话清单 ------------------------------ */
@@ -247,10 +299,8 @@ function listKiloSessions() {
  *   tool + pending   → 等待授权（工具排着队还没放行 —— Kilo 的 approval 就落在这个状态）
  *   tool + error     → 调用工具但报错了（显示工具名，UI 侧按失败灰显）
  *   reasoning        → 思考中
- *   step-start       → 规划中（新一步刚起头）
- *   step-finish      → 汇总中
  *   patch            → 调用工具（正在落盘改动）
- *   text             → 待命（刚吐完一段文字）
+ *   text             → **看这条 text 属于哪条消息**（见下面那段，改过两次）
  *   step-finish/step-start/text 都对不上 → 待命
  *
  * **只认"新鲜"证据**：`session.turn` 结束之后那条 text 事件会一直躺在库里，不看新鲜度
@@ -269,12 +319,19 @@ const PHASE_LOOKBACK = 64;
 function readKiloPhase(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
+  // 这一轮用户说的话（「思考中」屏上第二/第三层显示的就是它）。
+  // 取一次就够：整个 readKiloPhase 里所有返回分支共用同一个值。
+  const prompt = readRoundPrompt(id);
+  // 顺带把这条 part 归属的 message 一起带出来（LEFT JOIN）：判 text 是不是"这一轮的收尾"
+  // 要看那条消息的 finish，单独再查一次 message 表是多余的往返（见下面 text 分支的注释）。
   const events = query((db) =>
     db
       .prepare(
-        `SELECT data FROM event
-          WHERE aggregate_id = ? AND JSON_extract(data,'$.part.type') IS NOT NULL
-          ORDER BY seq DESC LIMIT ?`
+        `SELECT e.data AS data, m.data AS mdata
+           FROM event e
+           LEFT JOIN message m ON m.id = JSON_extract(e.data,'$.part.messageID')
+          WHERE e.aggregate_id = ? AND JSON_extract(e.data,'$.part.type') IS NOT NULL
+          ORDER BY e.seq DESC LIMIT ?`
       )
       .all(id, PHASE_LOOKBACK)
   );
@@ -283,19 +340,32 @@ function readKiloPhase(sessionId) {
   const now = Date.now();
   for (const ev of events) {
     let part = null;
+    let envTime = 0;
     try {
       const d = JSON.parse(String(ev.data || ''));
       part = d && typeof d === 'object' ? d.part || null : null;
+      // 信封上的 `time`（**每一条都有**，实测是一条 number，见下）
+      envTime = Number(d && d.time) || 0;
     } catch {
       part = null; // 半截 / 非 JSON：跳过这一条，不猜
     }
     if (!part || typeof part !== 'object') continue;
 
-    // 事件自身的时间：Kilo 把它放在 part.time.end|start（没有顶层 time 列，见实测）
+    // 事件自身的时间。**三处都认，缺一不可**（实测统计见下面注释）：
+    //   part.time.end | part.time.start —— reasoning / 已完成的 text 有
+    //   信封 time（number）              —— **每一条都有**
+    // 早先只读 part.time，于是 tool / patch / step-start / 正在流式吐字的 text
+    // （part.time 为 undefined）算出 at=0，`if (at && ...)` 直接跳过新鲜度判定 ——
+    // 收工几小时的会话照样按"最新那条"给相位。这是个**早就存在的洞**，只是原先
+    // `text → 待命` 恰好把它盖住了：轮询把这类会话显示成待命，看上去"对"。
+    // 改成"轮中文字 → 思考中"之后，洞就露出来了：一个 50 分钟前收工、
+    // 最后一条是无 part.time 的 text 的会话，会永远显示「思考中」。
+    // 实测真机统计（一个真实会话最近 400 条 part 事件）：
+    //   text 26 条 / reasoning 38 条 / step-finish 30 条 有 part.time；
+    //   tool 270 条 / step-start 30 条 / patch 5 条 / 流式 text 1 条 **没有** part.time。
+    // 所以信封 time 才是可靠的兜底。
     const tm = part.time && typeof part.time === 'object' ? part.time : {};
-    const at = Number(tm.end) || Number(tm.start) || 0;
-    // 上面那些 part 状态（如 running）没有 time；这类"状态事件"要靠库里最新事件的
-    // 时间来判断新鲜度，而不是因为 part.time 为空就当成陈旧。
+    const at = Number(tm.end) || Number(tm.start) || envTime;
     if (at && now - at > PHASE_FRESH_MS) break; // 从新到旧，第一条过期的就说明这一轮早收工了
 
     const type = String(part.type || '');
@@ -311,7 +381,7 @@ function readKiloPhase(sessionId) {
           target: fileOf(input),
           tool,
           context: tool ? [`工具：${tool}`] : [],
-          prompt: '',
+          prompt,
           model: '',
           inferred: true,
         };
@@ -323,7 +393,7 @@ function readKiloPhase(sessionId) {
           target: fileOf(input),
           tool,
           context: ['等待用户授权后继续', tool && `工具：${tool}`].filter(Boolean),
-          prompt: '',
+          prompt,
           model: '',
           inferred: true,
         };
@@ -335,7 +405,7 @@ function readKiloPhase(sessionId) {
           target: fileOf(input),
           tool,
           context: ['上一支工具执行失败'],
-          prompt: '',
+          prompt,
           model: '',
           inferred: true,
         };
@@ -350,13 +420,13 @@ function readKiloPhase(sessionId) {
         target: f,
         tool: 'patch',
         context: f ? [`目标：${f}`] : [],
-        prompt: '',
+        prompt,
         model: '',
         inferred: true,
       };
     }
     if (type === 'reasoning') {
-      return { phase: 'thinking', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
+      return { phase: 'thinking', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
     }
     // step-start / step-finish **不是相位**，跳过继续往更旧的事件找。
     //
@@ -374,11 +444,30 @@ function readKiloPhase(sessionId) {
       continue;
     }
     if (type === 'text') {
-      // 刚吐完一段文字 = 这一轮的输出阶段，往下（更旧）就是上一轮的事了
-      return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
+      // **text 不等于"待命"** —— 这里改过一次，实测踩的坑记在下面。
+      //
+      // 早先一律 `text → 待命`，理由是"刚吐完一段文字 = 这一轮的输出阶段"。
+      // 但 Kilo 在**一轮之内**会多次吐文字（每次工具调用前后都可能来一段），
+      // 而轮询只看得到"最新那条 part"：模型在两次工具调用之间说话时，最新 part 正是 text，
+      // 于是控制台在**任务明明还在跑**的时候闪回「待命中」，过几秒又被下一条 tool 事件
+      // 顶回「调用工具」。用户看到的现象就是"主 agent 状态在待命 / 调用工具之间来回跳"。
+      //
+      // 判据用**这条 text 归属的那条 message 的 finish**（message 表，part.messageID 对得上）：
+      //   finish='stop'（且 time.completed）→ 这一轮真的说完了 → 待命
+      //   finish='tool-calls'              → 到工具调用处断了，**整轮还没完** → 思考中
+      //   还没有 finish（正在流式吐字）      → 整轮还没完 → 思考中
+      // 实测分布（本机 Kilo 7.8.1 一个真实会话）：assistant 的 text part 里
+      // finish=stop 只有 2 条，finish=tool-calls 14 条，还在流式 2 条 —— 绝大多数是"轮中"。
+      //
+      // 口径与 readKiloDone 判"完成"一致（那里也是 finish!=='tool-calls' 才算收工），
+      // 也与插件那一路同源（plugin/index.js 的 message.updated 分支同样按 finish 分流）。
+      if (turnIsOver(ev.mdata)) {
+        return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
+      }
+      return { phase: 'thinking', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
     }
   }
-  return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
+  return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
 }
 
 /** 工具入参里的可读命令（bash 的 command / 其他工具的 description） */
@@ -393,6 +482,32 @@ function commandOf(input) {
 function fileOf(input) {
   const p = input.file || input.filePath || input.file_path || input.path || input.target_file || '';
   return typeof p === 'string' ? p : '';
+}
+
+/**
+ * 这条消息是不是"整轮说完了"（读 event 时 LEFT JOIN message 带出来的那一列 `mdata`）。
+ *
+ * 口径与 readKiloDone 判完成、插件 message.updated 分支判收工**完全一致**：
+ * `finish` 存在、`time.completed` 存在、且 `finish !== 'tool-calls'`。
+ * `tool-calls` 只是"这条消息到工具调用处断了"，整轮还在继续。
+ *
+ * 取不到 message 行（LEFT JOIN 落空 / JSON 坏了）时返回 false —— 也就是**偏向"还在想"**：
+ * 宁可显示「思考中」也不要把一个还在跑的任务说成「待命中」（那是在把进行中报成空闲）。
+ * @param {any} mdata message.data 那一列（原始 JSON 字符串）
+ * @returns {boolean}
+ */
+function turnIsOver(mdata) {
+  if (!mdata) return false;
+  let m = null;
+  try {
+    m = JSON.parse(String(mdata));
+  } catch {
+    return false;
+  }
+  if (!m || typeof m !== 'object') return false;
+  const finish = String(m.finish || '');
+  if (!finish || finish === 'tool-calls') return false;
+  return Boolean(m.time && m.time.completed);
 }
 
 /* ------------------------------ 完成标记 ------------------------------ */
@@ -458,6 +573,44 @@ function readKiloDone(sessionId, meta = {}) {
 /* ------------------------------ 对外 ------------------------------ */
 
 /**
+ * 这条会话碰过的文件路径（去重）。
+ * 从 event 表的 patch / tool 事件里取 part.file / part.state.input.* 的文件路径。
+ * 路径是相对于会话 directory 的相对路径（Kilo 存的就是相对路径，不用转）。
+ * 取不到回空数组（表缺 / 事件没有文件信息 → 不冒泡）。
+ * @param {string} sessionId
+ * @returns {string[]}
+ */
+function readKiloFiles(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return [];
+  const rows = query((db) =>
+    db
+      .prepare(
+        `SELECT DISTINCT
+           JSON_extract(e.data,'$.part.file') AS f1,
+           JSON_extract(e.data,'$.part.state.input.file') AS f2,
+           JSON_extract(e.data,'$.part.state.input.filePath') AS f3,
+           JSON_extract(e.data,'$.part.state.input.file_path') AS f4,
+           JSON_extract(e.data,'$.part.state.input.path') AS f5,
+           JSON_extract(e.data,'$.part.state.input.target_file') AS f6
+           FROM event e
+          WHERE e.aggregate_id = ?
+            AND JSON_extract(e.data,'$.part.type') IN ('patch','tool')`
+      )
+      .all(id)
+  );
+  if (!Array.isArray(rows)) return [];
+  const out = [];
+  for (const r of rows) {
+    for (const key of ['f1', 'f2', 'f3', 'f4', 'f5', 'f6']) {
+      const p = String(r[key] || '').trim();
+      if (p && !out.includes(p)) out.push(p);
+    }
+  }
+  return out;
+}
+
+/**
  * 这条会话有没有"接上"（Kilo 库里真有它）。
  * 渲染层靠它区分"这个产品根本没在跑"与"在跑但此刻没动作"（同 reporter-phase 的 instrumented）。
  */
@@ -516,6 +669,8 @@ module.exports = {
   listKiloSessions,
   readKiloPhase,
   readKiloDone,
+  readKiloFiles,
+  readRoundPrompt, // 这一轮用户说的话（台账标题用，见 kiloTasks.js）
   kiloInstrumented,
   kiloMainPhase,
   NO_DONE,

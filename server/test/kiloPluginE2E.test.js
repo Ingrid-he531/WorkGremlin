@@ -144,6 +144,16 @@ async function main() {
   await part({ id: 'prt_1', type: 'text', text: '"端到端：让 7F 记上任务"' }, 'msg_u')
   await part({ id: 'prt_2', type: 'tool', tool: 'write', callID: 'c1', state: { status: 'running', input: { filePath: `${WS}/a.ts` } } }, 'msg_a')
   await part({ id: 'prt_3', type: 'tool', tool: 'task', callID: 'c2', state: { status: 'running', input: { subagent_type: 'leo', description: '顺手看一眼' } } }, 'msg_a')
+  // 这一步之前 assistant 已经说过话（msg_a 的 role 由下面那条 message.updated 补上，
+  // 这里 part 自带 role=assistant，插件认 part.role）——**整轮还没完**（finish=stop 还没来）
+  await part({ id: 'prt_3b', type: 'text', role: 'assistant', text: '"先看一眼再动手"' }, 'msg_a')
+  {
+    // 轮中的 assistant 文字 → 思考中，不是待命（实测 2026-09-28 修的坑）。
+    // 早先这里报 idle，主 agent 会在任务还在跑的时候闪回「待命中」。
+    const rpMid = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID)}`, info.token)
+    ok('轮中的 assistant 文字 → 思考中（不是待命）', rpMid.phase === 'thinking', JSON.stringify(rpMid))
+    ok('「思考中」带上了用户那句话', rpMid.prompt === '端到端：让 7F 记上任务', JSON.stringify(rpMid.prompt))
+  }
   await part({ id: 'prt_4', type: 'text', text: '"端到端这一轮做完了"' }, 'msg_a')
   await fire('session.diff', { diff: ['a.ts'] })
   await msg({ id: 'msg_a', role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } })

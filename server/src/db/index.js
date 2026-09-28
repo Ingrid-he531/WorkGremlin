@@ -442,7 +442,8 @@ function createRepo(db) {
       ON CONFLICT(id) DO UPDATE SET
         title = excluded.title, state = excluded.state,
         progress = COALESCE(excluded.progress, tasks.progress),
-        started_at = COALESCE(tasks.started_at, excluded.started_at)
+        started_at = COALESCE(tasks.started_at, excluded.started_at),
+        ended_at = excluded.ended_at
     `),
     updateTask: db.prepare(`
       UPDATE tasks SET
@@ -491,7 +492,7 @@ function createRepo(db) {
       INSERT INTO task_runs (id, project_id, member_id, client, session_id, form, model, title, started_at, baseline_commit)
       VALUES (@id, @projectId, @memberId, @client, @sessionId, @form, @model, @title, @startedAt, @baselineCommit)
       ON CONFLICT(id) DO UPDATE SET
-        client     = COALESCE(excluded.client, task_runs.client),
+        client     = excluded.client,
         session_id = COALESCE(excluded.session_id, task_runs.session_id),
         form       = COALESCE(excluded.form, task_runs.form),
         model      = COALESCE(excluded.model, task_runs.model),
@@ -507,7 +508,7 @@ function createRepo(db) {
         result      = COALESCE(@result, result),
         file_count  = COALESCE(@fileCount, file_count),
         files_json  = COALESCE(@filesJson, files_json),
-        ended_at    = COALESCE(@endedAt, ended_at),
+        ended_at    = @endedAt,
         duration_ms = COALESCE(@durationMs, duration_ms)
       WHERE id = @id
     `),
@@ -515,6 +516,8 @@ function createRepo(db) {
       SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?
     `),
     getTaskRun: db.prepare(`SELECT * FROM task_runs WHERE id = ?`),
+    /** 某条会话名下的全部台账行（7F 轮询兜底据此判断"插件是不是已经上报了真值"，见 kiloTasks.js） */
+    taskRunsOfSession: db.prepare(`SELECT id, client FROM task_runs WHERE session_id = ?`),
     insertSubagentRun: db.prepare(`
       INSERT INTO subagent_runs
         (project_id, parent_task_id, task_id, member_id, name, client, model, title, started_at)

@@ -168,6 +168,17 @@ export const FLOOR_COLORS = {
     note: '#f2a8c8',
     noteInk: '#4a0f2e',
   },
+  '9F': {
+    // 桌椅木件：GitHub Copilot 深蓝巡航（冷调蓝紫）
+    wood: '#3b6ea8',
+    woodDark: '#254a79',
+    deskLeg: '#173458',
+    metal: '#2f476d',
+    metalDark: '#1d2c42',
+    chair: '#2d3f5a',
+    note: '#b7cfff',
+    noteInk: '#11284f',
+  },
 };
 
 /** 取某层用的配色（基准 COLORS + 该层覆盖；没覆盖的层直接返回基准，不做多余拷贝） */

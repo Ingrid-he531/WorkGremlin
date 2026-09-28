@@ -331,10 +331,20 @@ function pickSessionColumns(db, table) {
 const PHASE_FRESH_MS = 2 * 60_000;
 /** 往回看多少条消息够用（一轮对话末尾最多 tool→reasoning→text 几条，64 条极宽裕） */
 const PHASE_LOOKBACK = 64;
+/**
+ * 会**写文件**的 OpenCode 工具名。实测（2.0.18）它家工具是 read / grep / glob / shell /
+ * edit / subagent —— 写文件的就叫 `edit`（入参 `state.input.path`）。只认这些，读类不算改动。
+ */
+const OPENCODE_WRITE_TOOL_RE = /edit|write|patch|create|apply|insert|replace/i;
 
 function readOpencodePhase(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
+  // 「思考中」屏上那句用户说的话：OpenCode 把原话放在 user 消息的 data.text（**不在** content[] 里，
+  // content[] 只有 assistant 的 reasoning/text/tool）。以前一律回空串，所以主控制台只有
+  // "思考中"、一个字都没有（实测 2026-09-28）。
+  const prompt = lastUserText(id);
+  const out = (r) => (r && !r.prompt ? { ...r, prompt } : r);
   const rows = query((db) =>
     db
       .prepare(
@@ -353,8 +363,13 @@ function readOpencodePhase(sessionId) {
     if (String(row.type || '') === 'idle') {
       const at = idleAt(row);
       if (at && now - at > PHASE_FRESH_MS) break;
-      return idle();
+      return out(idle());
     }
+    // 轮次刚开跑：最新一条是 **user** 消息（assistant 行还没写出来），或者 assistant 行还没
+    // 写出内容 —— 那都是"模型正在想"，不是待命。实测 2026-09-28：缺了这条，用户发完消息后
+    // 那十几秒主控制台是"待命"，整轮看不到"思考中"（采样区间只有 tool → idle 在来回切）。
+    // 注意它是"新到旧"扫的：真收工的轮次会先撞到更新的 idle 行，不会走到这里。
+    if (String(row.type || '') === 'user') return out(thinking());
 
     let data = {};
     try {
@@ -372,22 +387,45 @@ function readOpencodePhase(sessionId) {
     if (at && now - at > PHASE_FRESH_MS) break;
 
     const parts = Array.isArray(data.content) ? data.content : [];
+    // 这条 assistant 消息**写完了没有**（time.completed 落了才算写完）。
+    // 它决定 text part 的含义，见下面 text 分支。
+    const completed = Boolean(tm.completed);
+    const finish = String(data.finish || '');
     // 从后往前找第一条有信号的 part（同一条消息里既有 reasoning 也有 tool 时，
     // 越靠后的越是"现在正在做的"）
     for (let i = parts.length - 1; i >= 0; i -= 1) {
       const part = parts[i];
       if (!part || typeof part !== 'object') continue;
       const type = String(part.type || '');
-      if (type === 'text') return idle();
-      if (type === 'reasoning') return thinking();
+      if (type === 'text') {
+        // 还没写完（没有 completed）= 正在往外吐字 → **思考中**，不是待命。
+        // 实测 2026-09-28：把流中的 text 当待命，主控制台会一直停在"任务完成"上，
+        // 整轮都看不到"思考中"（这一轮 parts 是 [reasoning, text]，从后往前先撞到 text）。
+        // 与 7F 那次同一个坑（见 kilo.js 的 readKiloPhase）。
+        if (!completed) return out(thinking());
+        // 写完了但还要接着调工具（finish=tool-calls）→ 这一条不算收口，继续看更早的 part / 行
+        if (finish === 'tool-calls') continue;
+        return out(idle());
+      }
+      if (type === 'reasoning') return out(thinking());
       if (type !== 'tool') continue;
 
       // OpenCode 的工具块：工具名在 part.name（不是 Kilo 的 part.tool），入参在 state.input
       const tool = String(part.name || '');
       const status = String((part.state && part.state.status) || '');
       const input = part.state && part.state.input && typeof part.state.input === 'object' ? part.state.input : {};
-      if (status === 'running') {
-        return {
+      /**
+       * 这一段算不算"正在用工具"：
+       *   · status=running          → 无疑（工具还在跑）
+       *   · status=completed 且这一步 finish=tool-calls → **也算**
+       *     OpenCode 是一步一条 assistant 消息：模型这一步以"要调工具"收尾（finish=tool-calls），
+       *     然后它去跑工具、再开下一步。而工具块落盘时常常已经跑完（`read` 这种毫秒级），
+       *     所以只认 running 会几乎永远看不到"调用工具"（实测 2026-09-28：一整轮 10 次工具调用，
+       *     1.5s 采样只撞到 1 帧）。"这一步以调工具收尾、下一步还没出现" = 就是在用工具。
+       */
+      const stepCallsTool = finish === 'tool-calls' && status !== 'error';
+      if (status === 'running' || (status === 'completed' && stepCallsTool)) {
+        return out({
           phase: 'tool',
           action: commandOf(input) || `调用 ${tool || '工具'}`,
           target: fileOf(input),
@@ -396,10 +434,10 @@ function readOpencodePhase(sessionId) {
           prompt: '',
           model: '',
           inferred: true,
-        };
+        });
       }
       if (status === 'error') {
-        return {
+        return out({
           phase: 'tool',
           action: tool ? `调用 ${tool} 报错` : '调用工具报错',
           target: fileOf(input),
@@ -408,16 +446,15 @@ function readOpencodePhase(sessionId) {
           prompt: '',
           model: '',
           inferred: true,
-        };
+        });
       }
       // completed：这一支跑完了，看同一条消息里更早的 part（可能还有下一个工具）
     }
 
     // 这条消息的 part 都对不上 → 看它有没有"说完了"（finish=stop 是正常收尾）
-    const finish = String(data.finish || '');
-    if (finish && finish !== 'tool-calls') return idle();
+    if (finish && finish !== 'tool-calls') return out(idle());
   }
-  return idle();
+  return out(idle());
 }
 
 /** 轮询推导的"待命"（统一出口，方便以后加文案只改一处） */
@@ -438,6 +475,141 @@ function idleAt(row) {
   } catch {
     return Number(row.time_created) || 0;
   }
+}
+
+/**
+ * 这条会话**最后一条用户消息的原话**（`type='user'` 的 `data.text`）。
+ * 取不到回空串 —— 宁可空屏，不拿会话标题顶替。
+ * @param {string} sessionId
+ */
+function lastUserText(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return '';
+  const row = query((db) =>
+    db
+      .prepare(`SELECT data FROM session_message WHERE session_id = ? AND type = 'user' ORDER BY seq DESC LIMIT 1`)
+      .get(id)
+  );
+  if (!row) return '';
+  try {
+    const d = JSON.parse(String(row.data || ''));
+    return String((d && d.text) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 这条会话**逐轮**的任务清单（8F 台账按"每一轮一条"记账用）。
+ *
+ * OpenCode 的 `session_message` 是顺序消息流：一轮 = 一条 `type='user'`（`data.text` 是用户原话，
+ * `time.created` 是这一轮开始）→ 若干 `type='assistant'`（`time.completed` 是它说完的时刻，
+ * `content[].state.input.path` 里是它编辑过的文件）→ 一条 `type='idle'`（这一轮显式收工）。
+ * 所以：
+ *   · 有 idle 行 = 收工（endedAt = 那一轮最后一次活动时刻）
+ *   · 没有 idle、但最后活动在 PHASE_FRESH_MS 之外 = 也算收工（避免"永远在跑"）
+ *   · 否则 = 还在飞（endedAt = null）—— 和其它楼层同口径，running 由台账同步器写
+ *
+ * `read_file`/`grep`/`glob`/`shell` 这些**不算改动文件**，只认写工具（OpenCode 实测叫 `edit`）。
+ *
+ * @param {string} sessionId
+ * `outcome`：这一轮怎么结束的 —— OpenCode 的 idle 行写了 `succeeded` / `interrupted`；
+ * 没有 idle 行而已经陈旧的，按最后一条 assistant 的 `finish` 判断（`stop` = 正常收尾，
+ * 其余 = 被打断/放弃）。台账据此区分「完成」与「已取消」——实测 2026-09-28：用户终止了
+ * 一轮（idle.outcome = interrupted），台账却报「完成」。
+ *
+ * `result`：这一轮的**收尾自述**（这一轮最后一条 assistant 消息里的 text，压空白后截断）——
+ * 任务记录里的"产出摘要"就用它（与 hook 那一路同口径，上限 4000）。
+ *
+ * @returns {Array<{index:number, prompt:string, startedAt:number, endedAt:number|null,
+ *                  outcome:string, files:string[], result:string}>}
+ */
+function readOpencodeTurns(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return [];
+  const rows = query((db) =>
+    db
+      .prepare(`SELECT type, time_created, data FROM session_message WHERE session_id = ? ORDER BY seq ASC`)
+      .all(id)
+  );
+  if (!Array.isArray(rows) || !rows.length) return [];
+
+  const turns = [];
+  let cur = null;
+  for (const row of rows) {
+    let d = {};
+    try {
+      d = JSON.parse(String(row.data || ''));
+    } catch {
+      d = {};
+    }
+    if (!d || typeof d !== 'object') d = {};
+    const type = String(row.type || '');
+    const tm = d.time && typeof d.time === 'object' ? d.time : {};
+    const at = Number(tm.completed) || Number(tm.streamed) || Number(tm.created) || Number(row.time_created) || 0;
+
+    if (type === 'user') {
+      if (cur) turns.push(cur);
+      cur = {
+        index: turns.length,
+        prompt: String(d.text || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        startedAt: Number(tm.created) || at,
+        lastAt: at,
+        files: new Set(),
+        closed: false,
+      };
+      continue;
+    }
+    if (!cur) continue; // 会话开头不是 user 行的，不编一轮
+    // 这一轮已经收工（idle 行已到）：它之后的 assistant / synthetic 行都**不算它的**，
+    // 否则收工时间会被后面那条 synthetic（系统提醒）顶到下一轮的头上（实测把 14:19 收工的
+    // 那轮算成了 17:14，凭空多出 3 小时）。
+    if (cur.closed) continue;
+    if (at) cur.lastAt = Math.max(cur.lastAt, at);
+    if (type === 'idle') {
+      cur.closed = true;
+      cur.outcome = String(d.outcome || 'succeeded');
+      continue;
+    }
+    if (type === 'assistant') {
+      const fin = String(d.finish || '');
+      if (fin) cur.finish = fin;
+      // 这一轮的收尾自述：取 assistant 消息里的 text（后面的消息会覆盖前面的，
+      // 所以最终留下的是"最后那条消息说的话"）。压空白 + 上限 4000，与 hook 那一路同口径。
+      const said = (Array.isArray(d.content) ? d.content : [])
+        .filter((p) => p && p.type === 'text' && p.text)
+        .map((p) => String(p.text))
+        .join('\n')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (said) cur.result = said.slice(0, 4_000);
+      for (const part of Array.isArray(d.content) ? d.content : []) {
+        if (!part || typeof part !== 'object' || String(part.type || '') !== 'tool') continue;
+        if (!OPENCODE_WRITE_TOOL_RE.test(String(part.name || ''))) continue;
+        const input = (part.state && part.state.input) || {};
+        const fp = String(input.path || input.filePath || input.file_path || '').trim();
+        if (fp) cur.files.add(fp);
+      }
+    }
+  }
+  if (cur) turns.push(cur);
+
+  const now = Date.now();
+  return turns.map((t) => {
+    const stale = now - t.lastAt > PHASE_FRESH_MS;
+    const ended = t.closed || stale;
+    // 收工的方式：idle 行说了算；没有 idle 行（陈旧收口）就看最后一条 assistant 的 finish
+    const outcome = !ended ? 'running' : t.closed ? t.outcome || 'succeeded' : t.finish === 'stop' ? 'succeeded' : 'interrupted';
+    return {
+      index: t.index,
+      prompt: t.prompt,
+      startedAt: t.startedAt || t.lastAt,
+      endedAt: ended ? t.lastAt || null : null,
+      outcome,
+      files: [...t.files],
+      result: t.result || '',
+    };
+  });
 }
 
 /** 工具入参里的可读命令（OpenCode 的 shell 工具叫 `shell`，入参是 command） */
@@ -581,6 +753,7 @@ module.exports = {
   listOpencodeSessions,
   readOpencodePhase,
   readOpencodeDone,
+  readOpencodeTurns, // 逐轮任务清单（8F 台账按"每一轮一条"记账用，见 opencodeTasks.js）
   opencodeInstrumented,
   opencodeMainPhase,
   NO_DONE,
