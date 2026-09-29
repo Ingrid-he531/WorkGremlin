@@ -837,6 +837,69 @@ function readRuntime(storage, id) {
 }
 
 /**
+ * CodeBuddy **插件（IDE 扩展）**的"用户按了停止"信号。
+ *
+ * 插件取消时**一个 hook 事件都不发**（实测 2026-09-29：扩展日志里是
+ * `AgentState.cancelled → ChatStateEvent.stop`、`AgentSessionManager state: running → cancelled`、
+ * `MessageQueueStateListener Session settled … state=cancelled`，但**没有任何 HookExecutor 去跑
+ * Stop / FinalStop**）—— 所以 CLI 那条 `FinalStop` 在 IDE 形态根本等不到。好在插件自己把会话
+ * 运行态写在 `<globalStorage>/<codebuddy 插件目录>/message-queue/*.json` 里：
+ *
+ *   conversations[<会话 id>].runtime = { activated: true, paused: true,
+ *                                        pauseReason: "cancel", updatedAt: <按停止那一刻> }
+ *
+ * 实测 18:03:44 那次停止，`4a670fe4…` 那条会话的 runtime 就是
+ * `{"paused":true,"pauseReason":"cancel","updatedAt":1790676224193}` —— 会话 id 与
+ * hook 状态文件的 sessionId 一字不差，时间戳就是取消时刻。
+ *
+ * 这份落盘**我们本来就在读**（`sessionInfo` / `readRuntime` 一直读 message-queue），
+ * 所以不新增任何"新路径"，只是把 `pauseReason='cancel'` 当取消信号用。
+ *
+ * 只认 `pauseReason === 'cancel'` 且 `updatedAt ≥ 本轮开始`：`paused` 还有别的来源
+ * （手工暂停 / 队列等待），拿 `paused` 当取消会误报；老时间戳也不能算到新一轮头上。
+ * @param {string} sessionId
+ * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）
+ * @returns {number} 取消时刻（0 = 没有 / 判不出）
+ */
+const _pauseCancelCache = new Map(); // path -> {m, size, data}
+function codebuddyPauseCancelAt(sessionId, sinceTs = 0) {
+  const sid = String(sessionId || '');
+  if (!sid) return 0;
+  let best = 0;
+  for (const root of globalStorageRoots()) {
+    for (const name of readDir(root)) {
+      if (!/coding-copilot|tencent|ingram|codebuddy/i.test(name)) continue;
+      const dir = path.join(root, name, 'message-queue');
+      for (const f of readDir(dir)) {
+        if (!/\.json$/i.test(f)) continue;
+        const p = path.join(dir, f);
+        let stat = null;
+        try {
+          stat = fs.statSync(p);
+        } catch {
+          continue;
+        }
+        const cached = _pauseCancelCache.get(p);
+        let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
+        if (!data) {
+          data = readJson(p);
+          _pauseCancelCache.set(p, { m: stat.mtimeMs, size: stat.size, data });
+        }
+        const conv = data && data.conversations ? data.conversations[sid] : null;
+        const rt = (conv && conv.runtime) || null;
+        if (!rt || !rt.paused) continue;
+        if (String(rt.pauseReason || '').toLowerCase() !== 'cancel') continue;
+        const at = Number(rt.updatedAt) || Number(conv.updatedAt) || 0;
+        if (!at) continue;
+        if (sinceTs && at < sinceTs) continue; // 老取消不能算到新一轮头上
+        if (at > best) best = at;
+      }
+    }
+  }
+  return best;
+}
+
+/**
  * reporter hook 在"等权限"时会把要执行的工具 + 目标文件写进 ~/.workgremlin/hooks/<工位>.json
  * 的 `await` 字段（见 packages/reporter/src/hook.js）。这里读回来给主控制台用。
  * 多工位时取 workspacePath 匹配且最新的一条；没有匹配工程就取最新一条。
@@ -1012,6 +1075,12 @@ function readReporterPhase(workspacePath, client = '', session = '') {
       // 不比这口相位旧 → 这口相位作废，不再喂给控制台（否则红灯亮完 10s 又被喂回来）。
       const iv = claudeInterruptOf(j, Number(j.taskStartedAt) || 0);
       if (iv.hit && (!iv.at || iv.at + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts))) continue;
+      // CodeBuddy 插件同理：message-queue 里 pauseReason='cancel' 的那一刻比这口相位新 → 作废
+      // （插件取消时一个 hook 事件都不发，相位会冻在「思考中 / 调用工具」）。
+      if (!iv.hit && clientBase(j.client) === 'codebuddy') {
+        const atP = codebuddyPauseCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+        if (atP && atP + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
+      }
     }
     if (!win || sp.ts > win.ts) {
       win = sp;
@@ -1594,10 +1663,41 @@ function readReporterDones(workspacePath, client = '') {
   /** 该工程 + 客户端里最新的一份（会话 id 拿不到的楼层用它兜底） */
   let latest = null;
   /** 兜底合成的"取消"标记里、需要服务端补发 task/end(cancelled) 的那些（见 sessionRegistry 的 flush）。
-   *  CodeBuddy IDE 这类不收 Stop / Interrupt 的产品，取消只靠这一条兜底漏出来，而它原本只写
-   *  内存标记、从不 notify 服务端台账 —— 任务就一直卡在「进行中」。这里把"该补一刀"的会话列出来，
-   *  由 sessionRegistry 在 refresh 时去重后发一次 task/end。 */
+   *  这些产品（Claude / Qoder 按停止、CodeBuddy 插件按停止）取消时**一个 hook 事件都不发**，
+   *  只能由服务端从落盘里认出来（见 claudeInterruptOf / codebuddyPauseCancelAt），
+   *  然后由 sessionRegistry 在 refresh 时去重后补发一次 task/end —— 否则台账那行一直挂在「进行中」。 */
   const cancels = [];
+  /**
+   * 合成一枚取消标记：既有按会话给控制台的那份（bySession，红灯靠它），
+   * 也有列进 cancels 让台账补一刀的那份。两个信号共用，别再各写一遍。
+   */
+  const synthCancel = ({ id, j, ws, at, files = [], said = '', result = '' }) => {
+    if (!at) return;
+    const mark = {
+      at,
+      title: j.taskTitle || '',
+      workspacePath: ws,
+      sessionId: id,
+      cancelled: true,
+      files: files.slice(0, 8),
+      fileCount: files.length,
+      said,
+    };
+    if (id && (!bySession.get(id) || Number(mark.at) > Number(bySession.get(id).at))) bySession.set(id, mark);
+    if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
+    cancels.push({
+      sessionId: id,
+      taskId: j.taskId,
+      client: j.client,
+      workspacePath: ws,
+      at,
+      title: j.taskTitle || '',
+      form: j.form || '',
+      files,
+      fileCount: files.length,
+      result,
+    });
+  };
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
@@ -1640,29 +1740,24 @@ function readReporterDones(workspacePath, client = '') {
         if (iv.hit) {
           // 收尾自述只有 transcript 那条路有（idle 兜底认出来的早打断，本来就没吐过字）
           const ci = claudeInterruptTail(j.transcriptPath, startedAtJ);
-          const filesC = roundFilesOf(j);
-          const saidC = String(ci.said || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-          const atC = iv.at || Number(j.sessionPhase && j.sessionPhase.ts) || startedAtJ || now;
-          const cancelC = {
-            at: atC, title: j.taskTitle || '', workspacePath: ws,
-            sessionId: id, cancelled: true, files: filesC.slice(0, 8), fileCount: filesC.length, said: saidC,
-          };
-          const prevC = id ? bySession.get(id) : null;
-          if (id && (!prevC || Number(cancelC.at) > Number(prevC.at))) bySession.set(id, cancelC);
-          if (!latest || Number(cancelC.at) > Number(latest.at)) latest = cancelC;
-          cancels.push({
-            sessionId: id,
-            taskId: j.taskId,
-            client: j.client,
-            workspacePath: ws,
-            at: atC,
-            title: j.taskTitle || '',
-            form: j.form || '',
-            files: filesC,
-            fileCount: filesC.length,
+          synthCancel({
+            id,
+            j,
+            ws,
+            at: iv.at || Number(j.sessionPhase && j.sessionPhase.ts) || startedAtJ || now,
+            files: roundFilesOf(j),
+            said: String(ci.said || '').replace(/\s+/g, ' ').trim().slice(0, 160),
             result: String(ci.said || '').trim().slice(0, 4_000),
           });
         }
+      }
+      /* CodeBuddy **插件**（IDE 扩展）：取消时同样一个 hook 事件都不发（CLI 那条 FinalStop
+         在 IDE 形态等不到 —— 扩展日志里只有 AgentState.cancelled，没有任何 HookExecutor），
+         但插件自己把 `{paused:true, pauseReason:'cancel', updatedAt}` 写在 message-queue 里
+         （会话 id 与状态文件的 sessionId 一字不差）。见 codebuddyPauseCancelAt。 */
+      if (base === 'codebuddy') {
+        const atP = codebuddyPauseCancelAt(id, startedAtJ);
+        if (atP) synthCancel({ id, j, ws, at: atP, files: roundFilesOf(j) });
       }
     }
   }
