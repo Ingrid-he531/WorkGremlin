@@ -110,6 +110,7 @@ app.use('/api/v1', createIngestRouter({ bus }));
   const row = (all.body.items || []).find((t) => t.id === 't-plugin') || {};
   ok('client 在', row.client === 'codex', row.client);
   ok('form 在（Codex CLI / Codex Plugin 靠它）', row.form === 'plugin', JSON.stringify(row.form));
+  ok('项目名在（任务详情「工程」那一栏）', 'project_name' in row && row.project_name === 'p1', JSON.stringify(row.project_name));
   ok('老数据 form 为 null（显示退回只写产品名）', (all.body.items.find((t) => t.id === 't-old') || {}).form === null);
   ok('file_count / files_json / model / result 列都在 SELECT 里', ['file_count', 'files_json', 'model', 'result', 'session_id', 'duration_ms', 'subagentCount'].every((k) => k in row), Object.keys(row).join(','));
 

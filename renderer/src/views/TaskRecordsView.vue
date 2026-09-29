@@ -515,6 +515,10 @@ async function saveRetention() {
             <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
             <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
+            <!-- 工程：这一轮归属的工程名（服务端按 project_id join projects 取名，见 /task-runs）；
+                 取不到就退回 project_id，再没有才写占位，绝不编造 -->
+            <div class="k">工程</div>
+            <div class="v">{{ tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
             <div class="k">文件变化</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
@@ -980,7 +984,8 @@ async function saveRetention() {
   font-family: var(--mono);
   padding: 2px 0;
 }
-.tool-item .tool-name { word-break: break-all; }
+/* 工具名用亮白色，次数留暗色 —— 一眼看到"用了哪些工具"，次数是次要信息 */
+.tool-item .tool-name { word-break: break-all; color: #fff; }
 .tool-item .tool-count { color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .result-block { margin-top: 12px; }

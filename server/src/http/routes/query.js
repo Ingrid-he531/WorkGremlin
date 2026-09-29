@@ -129,6 +129,10 @@ function createQueryRouter({ bus, repo }) {
            tr.session_id AS session_id,
            tr.form AS form,
            m.name AS member_name,
+           -- 这一轮归属的工程名（任务详情里「工程」那一栏显示它）。
+           -- projects.name 是"打开工程"时按 package.json name > 目录名 落的名字；
+           -- 取不到（老数据 / 工程行被清过）时前端退回 project_id。
+           p.name AS project_name,
            tr.model AS model,
            tr.file_count AS file_count,
            tr.files_json AS files_json,
@@ -148,6 +152,7 @@ function createQueryRouter({ bus, repo }) {
          FROM tasks t
          LEFT JOIN task_runs tr ON tr.id = t.id
          LEFT JOIN members m ON m.id = t.member_id
+         LEFT JOIN projects p ON p.id = t.project_id
          WHERE ${conds.join(' AND ')}
          ORDER BY t.started_at DESC
          LIMIT @limit`
