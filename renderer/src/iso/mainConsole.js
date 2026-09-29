@@ -204,10 +204,6 @@ export function drawConsoleScreen(c, o) {
   /** 字号小于这个就不写了 —— 远看留一块发光板，凑近才出字 */
   const showL1 = fs1 * pxPerTile >= 9;
 
-  // 顶部状态条
-  c.fillStyle = rgba(ph.color, 0.35 + 0.45 * ph.glow);
-  c.fillRect(0, 0, W, H * 0.06);
-
   if (!showL1) {
     // 太小了：只留三条抽象光条（远看就是"屏上有东西在动"）
     for (let k = 0; k < 3; k += 1) {
