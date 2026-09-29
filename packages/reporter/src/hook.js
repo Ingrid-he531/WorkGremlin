@@ -1732,8 +1732,8 @@ async function main() {
     // 这些细粒度事件（见 scripts/install-hooks.js 的 QODER_EVENTS 注释与 ~/.workgremlin/hooks/events.log）。
     // 不补一笔"会话进行中"的粗粒度真值，主控制台只会一直显示「未上报」。Claude / CodeBuddy 有
     // 细粒度事件随后把相位推进到 thinking / tool，不受这句影响。
-    if (AGENT === 'qoder') {
-      // Qoder 不发 UserPromptSubmit / Stop，form 检测与 TASK_START 永远不会在那两条路径里触发 ——
+    if (isCoarseAgent()) {
+      // Qoder / TraeCode 不发 UserPromptSubmit / Stop，form 检测与 TASK_START 永远不会在那两条路径里触发 ——
       // 只能在 SessionStart 里补做（类 3F Codex 的 UserPromptSubmit 那一刀）。
       // transcript 在 SessionStart 时可能还没落盘（entrypoint 写不进），先试一次、认不出留空，
       // SessionEnd 时再兜底认一次（见下方 SessionEnd 的 Qoder 段）。
@@ -1742,11 +1742,11 @@ async function main() {
       const started = await request(info, HTTP_ROUTES.TASK_START, {
         ...base,
         memberId: AGENT,
-        title: 'Qoder Session',
+        title: COARSE_SESSION_TITLE[AGENT],
         model: '',
         form: qForm,
       });
-      const qPatch = { taskTitle: 'Qoder Session', done: null, roundFiles: [] };
+      const qPatch = { taskTitle: COARSE_SESSION_TITLE[AGENT], done: null, roundFiles: [] };
       if (qForm) qPatch.form = qForm;
       if (started && started.taskId) {
         qPatch.taskId = started.taskId;
@@ -2154,12 +2154,12 @@ async function main() {
       String((ev && ev.session_id) || stEnd.sessionId || ''),
       cl
     );
-    // Qoder 没有 Stop（只有 SessionStart / SessionEnd），收尾给一个"已完成"的粗粒度相位，
+    // Qoder / TraeCode 没有 Stop（只有 SessionStart / SessionEnd），收尾给一个"已完成"的粗粒度相位，
     // 否则 sessionPhase 回落成 null，主控制台又会显示「未上报」。其它产品维持原状（null）。
-    // Qoder 的 TASK_END 也只能在这里补（Stop 那一刀永远不会触发）：
+    // 这一族的 TASK_END 也只能在这里补（Stop 那一刀永远不会触发）：
     // 再认一次 form（SessionStart 时 transcript 可能还没落盘，此时兜底），
     // 然后调 TASK_END 把"会话结束"告诉服务端。
-    if (AGENT === 'qoder') {
+    if (isCoarseAgent()) {
       const qFormEnd = sessionForm(stEnd, ev);
       if (qFormEnd && qFormEnd !== stEnd.form) writeState(file, { form: qFormEnd });
       const qTaskId = stEnd.taskId;
@@ -2180,7 +2180,7 @@ async function main() {
     writeState(file, {
       await: null,
       pending: null,
-      sessionPhase: AGENT === 'qoder' ? { phase: 'done', ts: Date.now(), workspacePath: REAL_WS } : null,
+      sessionPhase: isCoarseAgent() ? { phase: 'done', ts: Date.now(), workspacePath: REAL_WS } : null,
     });
     stopHeartbeat(AGENT);
     // 兜底：会话都结束了，它召唤出去的幽灵不该还飘着（手工 scripts/subagents.js

@@ -251,21 +251,19 @@ const reportGroups = computed(() => {
     const k = dimValue(t, dim);
     let g = map.get(k);
     if (!g) {
-      g = { key: k, label: dimLabel(t, dim), taskCount: 0, successCount: 0, failCount: 0, fileCount: 0, durationSum: 0, durN: 0 };
+      g = { key: k, label: dimLabel(t, dim), taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0 };
       map.set(k, g);
     }
     g.taskCount += 1;
     if (t.state === 'done') g.successCount += 1;
-    else if (t.state === 'failed') g.failCount += 1;
+    else if (t.state === 'cancelled') g.cancelCount += 1;
     g.fileCount += Number(t.file_count) || 0;
     const d = Number(t.duration_ms) || 0;
     if (d > 0) { g.durationSum += d; g.durN += 1; }
   }
   return [...map.values()].map((g) => {
     const avgDuration = g.durN ? g.durationSum / g.durN : 0;
-    const minutes = g.durationSum / 60000;
-    const efficiency = minutes > 0 ? g.fileCount / minutes : 0;
-    return { ...g, avgDuration, efficiency };
+    return { ...g, avgDuration };
   });
 });
 const reportTotal = computed(() => {
@@ -273,17 +271,15 @@ const reportTotal = computed(() => {
     (s, g) => ({
       taskCount: s.taskCount + g.taskCount,
       successCount: s.successCount + g.successCount,
-      failCount: s.failCount + g.failCount,
+      cancelCount: s.cancelCount + g.cancelCount,
       fileCount: s.fileCount + g.fileCount,
       durationSum: s.durationSum + g.durationSum,
       durN: s.durN + g.durN,
     }),
-    { taskCount: 0, successCount: 0, failCount: 0, fileCount: 0, durationSum: 0, durN: 0 }
+    { taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0 }
   );
   const avgDuration = a.durN ? a.durationSum / a.durN : 0;
-  const minutes = a.durationSum / 60000;
-  const efficiency = minutes > 0 ? a.fileCount / minutes : 0;
-  return { label: '合计', taskCount: a.taskCount, successCount: a.successCount, failCount: a.failCount, fileCount: a.fileCount, avgDuration, efficiency };
+  return { label: '合计', taskCount: a.taskCount, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration };
 });
 const reportSorted = computed(() => {
   const rows = reportGroups.value.slice();
@@ -300,34 +296,6 @@ function sortCls(key) {
   const s = reportSort.value;
   return { active: s.key === key, asc: s.key === key && s.dir === 'asc', desc: s.key === key && s.dir === 'desc' };
 }
-function effClass(e) {
-  if (e >= 8) return 'eff-high';
-  if (e <= 1) return 'eff-low';
-  return '';
-}
-/** 各工程目录总大小（字节），按工程 id → 服务端现算（排除隐藏）。仅「按工程」维度有意义。 */
-const projectSizes = reactive({});
-async function loadProjectSizes() {
-  if (reportDim.value !== 'project' || view.value !== 'summary') return;
-  const ids = reportGroups.value.map((g) => g.key).filter(Boolean);
-  const need = ids.filter((id) => !(id in projectSizes));
-  if (!need.length) return;
-  const info = project.serverInfo || {};
-  try {
-    const res = await fetch(`${httpBase(info)}/api/v1/project-sizes?projects=${encodeURIComponent(need.join(','))}`, {
-      headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
-    });
-    const data = await res.json();
-    if (data && data.ok && data.sizes) Object.assign(projectSizes, data.sizes);
-  } catch {
-    /* 拉不到就留空，界面显示"—" */
-  }
-}
-// 进入汇总报表 / 切到「按工程」维度 / 筛选项变化导致工程集合变化时，补拉各工程目录大小
-watch(
-  () => [view.value, reportDim.value, reportGroups.value.map((g) => g.key).join(',')],
-  () => loadProjectSizes()
-);
 /** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
 function drillDown(row) {
   const dim = reportDim.value;
@@ -340,23 +308,16 @@ function drillDown(row) {
 /** 导出报表为 CSV（客户端 Blob 下载，含当前排序与合计行） */
 function exportCsv() {
   const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
-  const head = ['维度', '任务数', '成功数', '失败数', '改动文件数', '总耗时(ms)', '平均耗时(ms)', '效率(文件/分钟)'];
-  const showSize = reportDim.value === 'project';
-  if (showSize) head.push('工程大小(字节)');
-  const rows = reportSorted.value.map((r) => {
-    const line = [
-      r.label, r.taskCount, r.successCount, r.failCount, r.fileCount,
-      Math.round(r.durationSum), Math.round(r.avgDuration), r.efficiency.toFixed(2),
-    ];
-    if (showSize) line.push(projectSizes[r.key] != null ? projectSizes[r.key] : '');
-    return line;
-  });
+  const head = ['维度', '任务数', '成功数', '取消数', '改动文件数', '总耗时(ms)', '平均耗时(ms)'];
+  const rows = reportSorted.value.map((r) => [
+    r.label, r.taskCount, r.successCount, r.cancelCount, r.fileCount,
+    Math.round(r.durationSum), Math.round(r.avgDuration),
+  ]);
   const totalLine = [
     reportTotal.value.label, reportTotal.value.taskCount, reportTotal.value.successCount,
-    reportTotal.value.failCount, reportTotal.value.fileCount,
-    Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration), reportTotal.value.efficiency.toFixed(2),
+    reportTotal.value.cancelCount, reportTotal.value.fileCount,
+    Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration),
   ];
-  if (showSize) totalLine.push('');
   rows.push(totalLine);
   const csv = [head, ...rows]
     .map((line) => line.map((c) => {
@@ -686,12 +647,10 @@ async function saveRetention() {
               <th class="th-dim">{{ dimColName }}</th>
               <th class="sortable num" :class="sortCls('taskCount')" @click="sortBy('taskCount')">任务数</th>
               <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">成功数</th>
-              <th class="sortable num" :class="sortCls('failCount')" @click="sortBy('failCount')">失败数</th>
+              <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">取消数</th>
               <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">改动文件数</th>
               <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">总耗时</th>
               <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">平均耗时</th>
-              <th class="sortable num" :class="sortCls('efficiency')" @click="sortBy('efficiency')">效率</th>
-              <th v-if="reportDim === 'project'" class="num">工程大小</th>
             </tr>
           </thead>
           <tbody>
@@ -704,12 +663,10 @@ async function saveRetention() {
               <td class="td-dim">{{ r.label }}</td>
               <td class="num">{{ r.taskCount }}</td>
               <td class="num">{{ r.successCount }}</td>
-              <td class="num">{{ r.failCount }}</td>
+              <td class="num">{{ r.cancelCount }}</td>
               <td class="num">{{ r.fileCount }}</td>
               <td class="num">{{ fmtDuration(r.durationSum) }}</td>
               <td class="num">{{ fmtDuration(r.avgDuration) }}</td>
-              <td class="num" :class="effClass(r.efficiency)">{{ r.efficiency.toFixed(1) }}</td>
-              <td v-if="reportDim === 'project'" class="num">{{ projectSizes[r.key] != null ? fmtSize(projectSizes[r.key]) : '—' }}</td>
             </tr>
           </tbody>
           <tfoot>
@@ -717,12 +674,10 @@ async function saveRetention() {
               <td class="td-dim">{{ reportTotal.label }}</td>
 <td class="num">{{ reportTotal.taskCount }}</td>
               <td class="num">{{ reportTotal.successCount }}</td>
-              <td class="num">{{ reportTotal.failCount }}</td>
+              <td class="num">{{ reportTotal.cancelCount }}</td>
               <td class="num">{{ reportTotal.fileCount }}</td>
               <td class="num">{{ fmtDuration(reportTotal.durationSum) }}</td>
               <td class="num">{{ fmtDuration(reportTotal.avgDuration) }}</td>
-              <td class="num" :class="effClass(reportTotal.efficiency)">{{ reportTotal.efficiency.toFixed(1) }}</td>
-              <td v-if="reportDim === 'project'" class="num">—</td>
             </tr>
           </tfoot>
         </table>
@@ -850,9 +805,6 @@ async function saveRetention() {
   background: var(--bg-elevated);
   border-top: 2px solid var(--border);
 }
-/* 效率：高绿低红，柔和区分 */
-.eff-high { color: #7ee787; }
-.eff-low { color: #ff7b72; }
 
 .filters {
   display: flex;
