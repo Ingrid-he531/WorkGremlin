@@ -80,6 +80,17 @@ reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartb
 
 **纪律（代码里反复强调，且已被实现遵守）**：拿不到就是空 —— 无心跳 60s 标 `degraded` 而不改状态；进度拿不到显示「进度未知（未上报）」而不是 0%。
 
+**上报归属以 `workspacePath` 为准，不是"办公室当前打开的那个工程"**（2026-09-29 修）：
+hook 以前把 `workspacePath` 取成 `/api/v1/workspace`（办公室当前工程）的路径，服务端又拿
+`body.project` 当归宿 —— "办公室开着 A、我在 B 里跑 CLI"时，这一轮的任务 / 成员 / 文件活动
+全被记到 A 名下（实测：在 `/home/yinghui/work/stb-insight` 里跑的 codex 任务，任务列表里挂在
+`workgremlin` 下；办公室视图那条会话的工程名却是对的，因为会话走的是 rollout 的 `cwd`）。
+现在 hook 的 `resolveCtx` 一律上报 `REAL_WS`（agent 启动 hook 时的 cwd），插件各条上报也都带
+自己事件里的目录；服务端在 `http/routes/ingest.js` 的 `projectFirst` 用
+`bus.projectForReport()` **按 workspacePath 反查工程**（按 `projects.workspace_path` 命中已有
+工程 → 找不到再按 `package.json name > 目录名` 建一条），没带 `workspacePath` 的老上报退回
+`body.project`（行为不变）。回归见 `npm run test:project-attribution`。
+
 **IDE 形态（Codex 的 VS Code 扩展 / app-server）的两个坑（2026-09-27 修）**：
 ① 提交的 prompt 是**拼好的** —— IDE 在前面注入 `# Context from my IDE setup:` / `## Active file:` /
 `## Open tabs:`，用户那句话在 `## My request:` 之后。hook 按 `userRequestText()` 只取请求正文：

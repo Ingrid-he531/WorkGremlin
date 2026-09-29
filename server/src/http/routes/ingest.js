@@ -30,7 +30,11 @@ function createIngestRouter({ bus }) {
 
   const projectFirst = (fn) =>
     wrap((body) => {
-      const project = body.project || body.projectId;
+      /* 归属以**上报方真实所在目录**为准（见 bus.projectForReport 的说明）：
+         "办公室开着 A、我在 B 里跑 CLI"时，body.project 是 A（办公室当前工程），
+         body.workspacePath 才是 B —— 以前就拿 A 当归宿，任务被记到别的工程名下。
+         没带 workspacePath 的老上报退回 body.project，行为不变。 */
+      const project = bus.projectForReport(body.project || body.projectId || '', body.workspacePath || '');
       if (!project) return { ok: false, error: 'missing project' };
       bus.ensureProject(project, body.workspacePath || '', body.mainConversationId || null, 'report');
       return fn({ ...body, project });

@@ -402,7 +402,9 @@ function createIngestPlugin(options, { location } = {}) {
       if (done) patch.done = done
       writeState(statePath(client, ws, sid), patch)
       // 心跳跟着相位一起发：>60s 没有心跳服务端就把这只成员标 degraded 灰显
-      ingest.post("/heartbeat", { memberId: client, sessionId: sid, ts: now })
+      // 带上真实工程路径：服务端以它为准反查工程（见 bus.projectForReport）——
+      // 不带的话会落到"办公室当前打开的工程"，开着 A、在 B 里干活时成员/心跳就挂错了工程。
+      ingest.post("/heartbeat", { memberId: client, sessionId: sid, ts: now, workspacePath: ws })
     } catch {
       /* 上报失败不影响 agent */
     }
@@ -487,13 +489,13 @@ function createIngestPlugin(options, { location } = {}) {
    * 写类工具动过的文件 → 台账 file/touch（"正在改什么"）。
    * **只在写类时调用**：读类工具不报（读了不留改动痕迹，报上去只是噪声）。
    */
-  function touchFile(sid, file) {
+  function touchFile(sid, file, ws = "") {
     if (!file) return
     const set = roundFiles.get(sid)
     if (set) set.add(file)
     ingest.resolveProject().then((project) => {
       if (!project) return
-      ingest.post("/file/touch", { memberId: client, files: [file], op: "write", sessionId: sid, client })
+      ingest.post("/file/touch", { memberId: client, files: [file], op: "write", sessionId: sid, client, workspacePath: ws })
     })
   }
 
@@ -552,6 +554,7 @@ function createIngestPlugin(options, { location } = {}) {
           taskId,
           sessionId: sid,
           client,
+          workspacePath: ws,
           ts: Date.now(),
         })
       }
@@ -745,12 +748,13 @@ function createIngestPlugin(options, { location } = {}) {
                 tool: toolName,
                 sessionId: sid,
                 client,
+                workspacePath: wsOf(event),
                 form: client.endsWith("-plugin") ? "plugin" : "cli",
               })
             }
           }
           // 台账：只报**写类**工具（读类不报 —— 读了不留改动痕迹，报上去只是噪声）
-          if (sid && opOfTool(part.tool) === "write" && status !== "pending") touchFile(sid, target)
+          if (sid && opOfTool(part.tool) === "write" && status !== "pending") touchFile(sid, target, wsOf(event))
           // 召唤 subagent（task 工具）时飘一只小幽灵
           if (sid && isSubagentTool(part.tool) && status !== "pending") {
             const sa = subagentOf(input)

@@ -349,7 +349,13 @@ async function resolveCtx(info) {
   const fallback = { project: '', workspacePath: '' };
   const cur = await request(info, WORKSPACE_ROUTE, null);
   const project = String(process.env.WORKGREMLIN_PROJECT || '').trim() || (cur && cur.project) || fallback.project;
-  return { project, workspacePath: (cur && cur.workspacePath) || fallback.workspacePath };
+  /* workspacePath 一律用**本进程真实所在目录**（REAL_WS = agent 启动本 hook 时的 cwd），
+     绝不用服务端"办公室当前打开的那个工程"：两者可以不是同一个（办公室开着 stb-insight、
+     我却在 workgremlin 里跑 CLI），拿后者当归属会把这一轮的任务记到别的工程名下
+     （实测 2026-09-29：在 stb-insight 里跑的 codex 任务，任务列表里挂到了 workgremlin）。
+     服务端现在以这个路径反查工程（见 http/routes/ingest.js 的 projectFirst +
+     bus.projectForReport），project 只剩"没带 workspacePath 时"的兜底。 */
+  return { project, workspacePath: REAL_WS || fallback.workspacePath };
 }
 
 /**

@@ -191,6 +191,41 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * 这一条上报该归到哪个**工程**（id）。
+   *
+   * 上报里的 `project` 历史上取的是"办公室**当前打开**的那个工程"（hook 的 resolveCtx 从
+   * `/api/v1/workspace` 拿），而 `workspacePath` 是上报方**自己真实所在的目录**。
+   * "办公室开着 A、我在 B 里跑 CLI"的时候两者对不上：任务被归到 A。
+   * 实测 2026-09-29：在 /home/yinghui/work/stb-insight 里跑的 codex 任务，任务列表里挂在
+   * workgremlin 名下（办公室视图里那条会话的工程名却是对的 —— 会话走的是 rollout 的 cwd）。
+   *
+   * 所以**以 workspacePath 为准**：
+   *   1) 按这个路径能找到已有工程 → 用它的 id（与办公室"打开工程"落的行是同一行）；
+   *   2) 找不到 → 按这个目录算名字（package.json name > 目录名，与 server/src/project.js 同口径）
+   *      并建一条；
+   *   3) 没带 workspacePath（老上报 / 手工脚本）→ 退回 `project` 字段，行为不变。
+   * @param {string} reportedProject 上报里的 project（办公室当前工程名，仅作兜底）
+   * @param {string} workspacePath 上报方真实所在目录
+   * @returns {string} 工程 id（空串 = 两边都没给，调用方按 missing project 处理）
+   */
+  function projectForReport(reportedProject, workspacePath = '') {
+    const ws = String(workspacePath || '').trim();
+    if (!ws) return reportedProject ? projectIdOf(reportedProject) : '';
+    let abs = '';
+    try {
+      abs = path.resolve(ws);
+    } catch {
+      return reportedProject ? projectIdOf(reportedProject) : '';
+    }
+    const row = repo.getProjectByWorkspace.get(abs);
+    if (row && row.id) return row.id;
+    const name = resolveProjectName(abs) || path.basename(abs);
+    if (!name) return reportedProject ? projectIdOf(reportedProject) : '';
+    ensureProject(name, abs, null, 'report');
+    return projectIdOf(name);
+  }
+
+  /**
    * @param {{project: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string,
    *          ephemeral?: boolean, projectLabel?: string|null}} p
    */
@@ -1023,6 +1058,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     registerMember,
     tagMemberClient,
     removeMember,
+    projectForReport,
     currentMainTaskId,
     currentTaskFor,
     startSubagentRun,
