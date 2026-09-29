@@ -514,8 +514,12 @@ function turnIsOver(mdata) {
 
 /** 完成标记的新鲜期：只有这么久之内结束的才算"刚发生"，否则页面一开就重播上一轮 */
 const DONE_TTL_MS = 10 * 60_000;
-/** 完成标记缺省时统一返回（没有就是"没有"，不臆造） */
-const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [] };
+/** 完成标记缺省时统一返回（没有就是"没有"，不臆造）。
+ *  doneCancelled：这一轮是被用户打断（ESC / 停止）收掉的 → 主控制台亮红色「任务取消」。
+ *  Kilo 的**轮询**这一路读不出"被打断"（`message.finish` 只有 stop / tool-calls / length /
+ *  content-filter，没有 interrupted），所以这里恒为 false —— 不臆造取消。装了 WorkGremlin
+ *  插件时，由插件的 `session.idle` 那一路上报取消标记（见 packages/reporter/src/plugin）。 */
+const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false };
 
 /**
  * 这条会话的"完成"标记 —— 对应 hook 那边 Stop 事件落下的 done。
@@ -567,6 +571,7 @@ function readKiloDone(sessionId, meta = {}) {
     doneTitle: String(meta.title || ''),
     doneCount: Number(meta.fileCount) || 0,
     doneFiles: [],
+    doneCancelled: false,
   };
 }
 

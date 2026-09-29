@@ -20,10 +20,10 @@ const { clientBase } = require('@workgremlin/shared');
  * 快轮询那份「任务完成」就永远不触发（会话表那份还在，所以现象是"切楼层/等 10 秒才亮"，
  * 很容易被误当成偶发）。本函数是这两套形状之间唯一的转换点。
  *
- * @param {{doneAt?:number,doneTitle?:string,doneCount?:number,doneFiles?:Array}|null} done
+ * @param {{doneAt?:number,doneTitle?:string,doneCount?:number,doneFiles?:Array,doneCancelled?:boolean,doneSaid?:string}|null} done
  * @param {string} sessionId 这份标记属于哪条会话（渲染层按它精确比对，不串味）
  * @param {string} [workspacePath]
- * @returns {{at:number,title:string,fileCount:number,files:Array,sessionId:string,workspacePath:string}|null}
+ * @returns {{at:number,title:string,fileCount:number,files:Array,sessionId:string,workspacePath:string,cancelled:boolean,said:string}|null}
  */
 function toReporterDone(done, sessionId, workspacePath = '') {
   if (!done || !done.doneAt) return null;
@@ -34,6 +34,12 @@ function toReporterDone(done, sessionId, workspacePath = '') {
     files: Array.isArray(done.doneFiles) ? done.doneFiles : [],
     sessionId: String(sessionId || ''),
     workspacePath,
+    // 这一轮是被用户打断（ESC / 停止）收掉的 → 主控制台亮红色「任务取消」，不亮「任务完成」。
+    // 7F/8F 的轮询那一支（readKiloDone / readOpencodeDone）就靠它把"取消"从库里带上来。
+    cancelled: Boolean(done.doneCancelled),
+    // 这一轮吐出来的文字（收尾概要）—— 取消时也照带（"没干完"不是"没产出"）；
+    // 渲染层的 `fpDone.said` 就是它，没有才退回落款文案 / 「没有输出」。
+    said: String(done.doneSaid || ''),
   };
 }
 

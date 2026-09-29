@@ -544,6 +544,21 @@ function copilotInWindow(row, now) {
   return Boolean(row.lastUpdated && now - row.lastUpdated < COPILOT_PHASE_MS);
 }
 
+/**
+ * 9F 的「任务完成」时刻：会话日志里最新那一轮 request 的 completedAt（超 DONE_TTL_MS 不算）。
+ * Copilot 没有 hook 状态文件，完成标记只能从这份日志取 —— 与 kilo.js/opencode.js 的
+ * read*Done 同一个口径（不靠"相位回落到空闲"来猜，避免中途误弹）。
+ * @param {{live?: any}} row
+ * @param {number} now
+ * @returns {number} 0 = 没有（或已过期）
+ */
+function copilotDoneAt(row, now) {
+  const live = row && row.live;
+  const at = Number((live && live.completed && live.completedAt) || 0);
+  if (!at || now - at > DONE_TTL_MS) return 0;
+  return at;
+}
+
 /** 某条 Copilot 会话的 VS Code 会话日志（chatSessions/<会话>.jsonl） */
 function copilotChatLogPath(sessionId) {
   const name = `${sessionId}.jsonl`;
@@ -828,6 +843,23 @@ function readRuntime(storage, id) {
  */
 const AWAIT_TTL_MS = 5 * 60_000;
 /**
+ * 任务"还在跑"的判定窗口：只有最近**有过 hook 事件**（UserPromptSubmit / PreToolUse /
+ * PostToolUse / Notification …）才算这一轮在生成。心跳守护的 `hb.lastEventAt` 不能算——
+ * 它只证明 IDE 会话还开着，不证明 agent 在干活。
+ *
+ * 为什么需要它：CodeBuddy IDE 在「思考中 / 调用工具」时按 ESC 取消，既不发 Stop 也不发
+ * Interrupt（实测 events.log 无此事件），但 IDE 会话没关、心跳守护照跳，于是 taskId 一直
+ * 占着、sessionPhase 冻在最后一笔（tool / thinking）。旧逻辑拿 hb.lastEventAt 当新鲜度，
+ * inWindow / sessionPhase 永远回落不下来 → 主控制台一直显示「调用工具 / 思考中」，实则那
+ * 一轮早被掐断了。改成只看 hook 事件时间：取消后没有新事件，超过这个窗口就当这轮结束、回落待命。
+ * 窗口与 inferPhase 的 FRESH_MS 对齐（2 分钟）——项目统一口径："近 2 分钟没活动就不当它在忙"。
+ *
+ * 已知取舍：一次 hook 事件都没有的中途长工具（比如跑了 >2 分钟的 Bash 构建，期间只有
+ * PreToolUse 起手、PostToolUse 收尾，中间毫无事件）会被这个窗口误判成"已结束"、短暂回落待命，
+ * 等 PostToolUse 一来相位又恢复。属于可接受的小抖动，不比"取消后永远卡在思考中"更糟。
+ */
+const TASK_RUN_MS = 2 * 60_000;
+/**
  * 等授权兜底阈值：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
  * 所以靠 hook 留下的 pending 推断——PreToolUse 写 pending + sessionPhase=tool，PostToolUse 才清掉它。
  * 一旦 pending 超过这个时间仍没被清（没有 PostToolUse 来），就认为工具被权限框卡住了 → 标「等待授权」。
@@ -949,7 +981,12 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // 3F 会短暂借到 1F 的相位）。
     if (!clientHit(client, j.client)) continue;
     const sp = j.sessionPhase;
-    if (!sp || !sp.ts || now - sp.ts > AWAIT_TTL_MS) continue;
+    // 相位新鲜期：默认 AWAIT_TTL_MS（IDE 关掉后残留相位不挂）。
+    // 但 taskId 还占着（这轮"在跑"）却很久没新 hook 事件（sessionPhase.ts 冻结）= 这一轮其实
+    // 已经结束（CodeBuddy ESC 取消不发事件、心跳照跳），不能还显示"调用工具/思考中"，
+    // 按更短的 TASK_RUN_MS 回落待命。
+    const staleMs = j.taskId ? TASK_RUN_MS : AWAIT_TTL_MS;
+    if (!sp || !sp.ts || now - sp.ts > staleMs) continue;
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
     if (sp.ts < SERVER_STARTED_AT) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
@@ -1057,9 +1094,13 @@ function hasOtherLiveSession({ workspacePath = '', client = '', session = '', no
     if (!clientHit(client, j.client)) continue;
     // 判据 1：心跳守护还活着（最可靠）
     if (j.hb && pidAlive(j.hb.pid)) return true;
-    // 判据 2：还有在飞的相位 / 任务（见函数说明，**不能**用 hb.lastEventAt）
+    // 判据 2：还有在飞的相位 / 任务（见函数说明，**不能**用 hb.lastEventAt）。
+    // **idle 相位不算"在飞"**：收尾（Stop / Interrupt / idle_prompt）现在都会写一笔显式 idle，
+    // 它只说明"这一轮结束了、在等下一句"，把它当"别的会话还在跑"会让成员卡永远回不到空闲
+    // （同层 CLI + 插件混跑时尤其明显）。
+    const spPhase = String((j.sessionPhase && j.sessionPhase.phase) || '');
     const phaseTs = Number(j.sessionPhase && j.sessionPhase.ts) || 0;
-    if (j.sessionPhase && phaseTs && now - phaseTs <= AWAIT_TTL_MS) return true;
+    if (spPhase && spPhase !== 'idle' && phaseTs && now - phaseTs <= AWAIT_TTL_MS) return true;
     const startedAt = Number(j.taskStartedAt) || 0;
     if (j.taskId && startedAt && now - startedAt <= AWAIT_TTL_MS) return true;
   }
@@ -1268,14 +1309,15 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     if (!clientHit(client, j.client)) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
-    // 心跳时间 / 任务开始 / 相位时间三者取最新：最近还有 hook 事件才算这个会话活着。
-    // 超过相位新鲜期（AWAIT_TTL_MS）没动静 → 视为死会话，它的 taskId 不作数。
+    // 心跳时间**不能**算"任务在跑"：它只证明 IDE 会话还开着（见 hasOtherLiveSession 的同名纪律），
+    // 取消时心跳照跳会让 taskId 永远新鲜、相位卡死在思考中/调用工具。只认 hook 事件时间
+    // （taskStartedAt 起轮、sessionPhase.ts 每次事件刷新）：取消后没有新事件，超 TASK_RUN_MS
+    // 就当这一轮结束了，inWindow 回落待命。
     const lastAt = Math.max(
-      Number(j.hb && j.hb.lastEventAt) || 0,
       Number(j.taskStartedAt) || 0,
       Number(j.sessionPhase && j.sessionPhase.ts) || 0
     );
-    if (!lastAt || now - lastAt > AWAIT_TTL_MS) continue;
+    if (!lastAt || now - lastAt > TASK_RUN_MS) continue;
     return true;
   }
   return false;
@@ -1289,6 +1331,122 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
  * 若每扫到一条就去调一次 readReporterDone，hooks 目录就要被扫上百遍
  * （消费方见 sessionRegistry 里按 (工程, 客户端) 缓存的 doneScans）。
  */
+/**
+ * 读 CodeBuddy transcript（history/<工程>/<会话>/index.json）最后一轮请求（requests 数组末元素）
+ * 的 state：IDE 正常收尾写 "complete"、被打断写 "running"。拿不到结构就回 null（绝不猜）。
+ *
+ * 顺带取这一轮**已经吐出来的收尾文本**（best-effort）：与 hook.js 的 codebuddyReplies 同源 ——
+ * index.json 的 `requests[-1].messages` 是消息 id 列表，正文在 `messages/<id>.json` 里
+ * （`{role, message:"<JSON 字符串>"}`）。取不到就回空串。**取消时也要照记这份产出**
+ * （"没干完"不是"没产出"，与「任务完成」同一条线）。
+ * 用文件 mtime 做缓存，避免每次扫盘都解析大 transcript。
+ * @returns {{state: string|null, said: string}} state ∈ "complete" | "running" | null
+ */
+const _craftRunCache = new Map();
+
+/** 内容块里算"回复正文"的类型（与 hook.js 的 extractText 同口径，思维链 / 工具调用不算） */
+const CRAFT_TEXT_BLOCK_TYPES = new Set(['text', 'output_text', 'input_text', 'summary_text']);
+
+/** 一条消息的 content → 正文文本（字符串 / 块数组 / {text} 三种形状，与 hook.js 同口径） */
+function craftTextOf(content) {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((x) => {
+        if (!x || typeof x !== 'object' || typeof x.text !== 'string') return '';
+        const t = x.type == null ? '' : String(x.type);
+        return !t || CRAFT_TEXT_BLOCK_TYPES.has(t) ? x.text : '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  if (content && typeof content === 'object' && typeof content.text === 'string') return content.text.trim();
+  return '';
+}
+
+/**
+ * 读 CodeBuddy `messages/<id>.json`（`{role, message:"<JSON 字符串>"}`），拼出正文。
+ * 拿不到就跳过那一条 —— 不猜、不编。
+ * @param {string} dir transcript 所在目录
+ * @param {string[]} ids 消息 id 列表
+ */
+function craftMessagesText(dir, ids) {
+  const parts = [];
+  for (const id of Array.isArray(ids) ? ids : []) {
+    if (!id) continue;
+    try {
+      const raw = readJson(path.join(dir, 'messages', `${id}.json`));
+      if (!raw) continue;
+      const inner = typeof raw.message === 'string' ? JSON.parse(raw.message) : raw.message;
+      const txt = craftTextOf(inner && inner.content !== undefined ? inner.content : inner);
+      if (txt) parts.push(txt);
+    } catch {
+      /* 读不到就算了 */
+    }
+  }
+  return parts.join('\n\n').trim();
+}
+
+/**
+ * 状态文件里的 `roundFiles`（`{path,op,abs}`）→ 完成标记的 `files` 形状（带 size）。
+ * 取消时用它补"取消前已经动了哪些文件"（与 hook.js 的 collectRoundFiles 同口径）：
+ * 去重、删除类不给 size、stat 不到就不给（绝不编造）。
+ * @param {{roundFiles?: Array<any>}} j 状态文件内容
+ */
+function roundFilesOf(j) {
+  const out = [];
+  const seen = new Set();
+  for (const x of Array.isArray(j && j.roundFiles) ? j.roundFiles : []) {
+    const p = typeof x === 'string' ? x : x && x.path;
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    let size = null;
+    const abs = x && typeof x === 'object' ? x.abs : '';
+    if (abs && !(x && x.op === 'delete')) {
+      try {
+        const s = fs.statSync(abs);
+        if (s.isFile()) size = s.size;
+      } catch {
+        /* 文件删了 / 挪了：不给 size，路径照记 */
+      }
+    }
+    out.push(size == null ? { path: p } : { path: p, size });
+  }
+  return out;
+}
+
+function lastCraftRun(transcriptPath) {
+  if (!transcriptPath || !isFile(transcriptPath)) return { state: null, said: '' };
+  try {
+    const m = mtime(transcriptPath);
+    const cached = _craftRunCache.get(transcriptPath);
+    if (cached && cached.m === m) return { state: cached.state, said: cached.said || '' };
+    const data = readJson(transcriptPath);
+    let state = null;
+    let said = '';
+    const runs = Array.isArray(data && data.requests) ? data.requests : null;
+    if (runs && runs.length) {
+      const last = runs[runs.length - 1];
+      state = last && last.state != null ? String(last.state) : null;
+      said = last && last.result != null ? String(last.result).trim() : '';
+      // 收尾文本在 messages/<id>.json 里：按末轮请求的 messages 逐条读、拼成一段
+      if (!said && last && Array.isArray(last.messages)) {
+        said = craftMessagesText(path.dirname(transcriptPath), last.messages);
+      }
+    } else if (Array.isArray(data && data.messages) && data.messages.length) {
+      // 兜底：对话末条 assistant 消息 isComplete:false = 这轮被掐断（CodeBuddy 取消时末条即未完成）
+      const last = data.messages[data.messages.length - 1];
+      state = last && last.isComplete === false ? 'running' : (last && last.isComplete === true ? 'complete' : null);
+      if (last && last.id) said = craftMessagesText(path.dirname(transcriptPath), [last.id]);
+    }
+    _craftRunCache.set(transcriptPath, { m, state, said });
+    return { state, said };
+  } catch {
+    return { state: null, said: '' };
+  }
+}
+
 function readReporterDones(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
@@ -1296,22 +1454,68 @@ function readReporterDones(workspacePath, client = '') {
   const bySession = new Map();
   /** 该工程 + 客户端里最新的一份（会话 id 拿不到的楼层用它兜底） */
   let latest = null;
+  /** 兜底合成的"取消"标记里、需要服务端补发 task/end(cancelled) 的那些（见 sessionRegistry 的 flush）。
+   *  CodeBuddy IDE 这类不收 Stop / Interrupt 的产品，取消只靠这一条兜底漏出来，而它原本只写
+   *  内存标记、从不 notify 服务端台账 —— 任务就一直卡在「进行中」。这里把"该补一刀"的会话列出来，
+   *  由 sessionRegistry 在 refresh 时去重后发一次 task/end。 */
+  const cancels = [];
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
-    if (!j || !j.done || !j.done.at) continue;
-    if (now - Number(j.done.at) > DONE_TTL_MS) continue; // 过期的不算"刚发生"（见 DONE_TTL_MS）
-    const ws = j.done.workspacePath || '';
-    if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
-    // 同一工程里 Codex 与 CodeBuddy 各有一份状态文件：按客户端取，别把对方的"完成"搬过来
+    if (!j) continue;
     if (!clientHit(client, j.client)) continue;
-    const done = j.done;
+    const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || '';
+    if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     const id = String(j.sessionId || '');
-    const prev = id ? bySession.get(id) : null;
-    if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
-    if (!latest || Number(done.at) > Number(latest.at)) latest = done;
+    // 真·完成标记（Stop 落盘）：取每会话最新的一份
+    if (j.done && j.done.at && now - Number(j.done.at) <= DONE_TTL_MS) {
+      const done = j.done;
+      const prev = id ? bySession.get(id) : null;
+      if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
+      if (!latest || Number(done.at) > Number(latest.at)) latest = done;
+    }
+    // CodeBuddy IDE 取消：既不发 Stop 也不发 Interrupt，taskId 一直占着、心跳照跳 → 旧逻辑
+    // 一直显示「思考中 / 调用工具」。但它 transcript 的 requests 数组里，每一轮带
+    // state: "complete"（正常收尾）/ "running"（被打断）。任务槽卡死（很久没 hook 事件）
+    // 且末轮 state 是 "running" → 这一轮是被打断的，合成取消标记亮红色「任务取消」。
+    if (j.taskId) {
+      const lastAt = Math.max(Number(j.taskStartedAt) || 0, Number(j.sessionPhase && j.sessionPhase.ts) || 0);
+      if (lastAt && now - lastAt > TASK_RUN_MS) {
+        const run = lastCraftRun(j.transcriptPath);
+        if (run.state === 'running') {
+          // 取消只是"没干完"，不是"没产出"：这一轮改过的文件（状态文件里的 roundFiles）
+          // 与已经吐出来的文字（transcript 末轮）照「任务完成」一样带上 —— 台账/对话记录/控制台都要。
+          const files = roundFilesOf(j);
+          const said = String(run.said || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+          const cancel = {
+            at: lastAt, title: j.taskTitle || '', workspacePath: ws,
+            sessionId: id, cancelled: true, files: files.slice(0, 8), fileCount: files.length, said,
+          };
+          const prev = id ? bySession.get(id) : null;
+          // 当前这轮（取消的）比已记录的完成更晚 → 用取消覆盖（"上一轮完成、这一轮被打断"）
+          if (id && (!prev || Number(cancel.at) > Number(prev.at))) bySession.set(id, cancel);
+          if (!latest || Number(cancel.at) > Number(latest.at)) latest = cancel;
+          // 这一轮是被打断的（没发 Stop / Interrupt）：列出来，让 sessionRegistry 去重后补发
+          // 一次 task/end(cancelled) —— 否则台账里的任务永远停在「进行中」。
+          cancels.push({
+            sessionId: id,
+            taskId: j.taskId,
+            client: j.client,
+            workspacePath: ws,
+            at: lastAt,
+            title: j.taskTitle || '',
+            form: j.form || '',
+            // 补发的 task/end 也要带产出（与「任务完成」同一条线）：files 是改动清单，
+            // result 是这一轮已经吐出来的收尾自述（拿不到就空，服务端显示"无产出摘要"）。
+            files,
+            fileCount: files.length,
+            result: String(run.said || '').trim().slice(0, 4_000),
+          });
+        }
+      }
+    }
   }
-  return { latest, bySession };
+  return { latest, bySession, cancels };
 }
 
 /** "任务完成"的唯一真源：取**某条会话**的完成标记（不靠相位回落到空闲来猜，避免中途误弹）。
@@ -1319,8 +1523,29 @@ function readReporterDones(workspacePath, client = '') {
  *  rollout 文件名不含 session_id）退回"该 client 最新的一份"——不猜，只是放宽到这一步。 */
 function readReporterDone(workspacePath, client = '', session = '') {
   const { latest, bySession } = readReporterDones(workspacePath, client);
-  if (!session) return latest;
-  return bySession.get(String(session)) || null;
+  const hit = session ? bySession.get(String(session)) || null : latest;
+  if (hit) return hit;
+  // 9F GitHub Copilot 没有 hook：状态文件这条路永远是空的，完成标记得从它自己的会话日志取
+  // （最新那一轮 request 的 completedAt，见 readCopilotLiveRequest）——不然 9F 永远没有
+  // 「任务完成」那一下（实测 2026-09-28：7F/8F 都有、9F 一直空）。
+  if (clientBase(client) === 'copilot') {
+    const d = readCopilotDone(session);
+    if (d) return d;
+  }
+  return hit;
+}
+
+/**
+ * 9F 的完成标记（会话表形状 `{doneAt,doneTitle,doneCount,doneFiles}`，与各产品的 read*Done 同形）。
+ * 取会话日志里最新那一轮的 completedAt；超 DONE_TTL_MS 或那一轮还没收工都没有。
+ * @param {string} sessionId
+ */
+function readCopilotDone(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return null;
+  const at = copilotDoneAt({ live: readCopilotLiveRequest(id) }, Date.now());
+  if (!at) return null;
+  return { doneAt: at, doneTitle: '', doneCount: 0, doneFiles: [] };
 }
 
 /**
@@ -1498,9 +1723,11 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   // 不筛会把上一轮（甚至更早）的改动当成"本次完成"——典型：这一轮只是 push，却显示上一轮改了多少文件。
   // done.startedAt 缺省（老数据）时不过滤，退回原来的"取最近几个"。
   const doneStartedAt = done ? Number(done.startedAt) || 0 : 0;
-  const doneAll = done
-    ? (Array.isArray(files.recent) ? files.recent.filter((f) => !doneStartedAt || Number(f.at) >= doneStartedAt) : [])
-    : [];
+  const doneAll = done && done.cancelled
+    ? [] // 被打断的那一轮常常什么都没改：不把整轮会话的文件改动算成"本次完成"
+    : (done
+      ? (Array.isArray(files.recent) ? files.recent.filter((f) => !doneStartedAt || Number(f.at) >= doneStartedAt) : [])
+      : []);
 
   return {
     id,
@@ -1524,6 +1751,9 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     doneTitle,
     doneCount: doneAll.length, // 本轮任务改动的文件数（在切片之前算）
     doneFiles: doneAll.slice(0, 6),
+    // 这一轮是被打断收掉的（reporter 在 Interrupt 时落的 done.cancelled）：
+    // 渲染层据此亮红色「任务取消」，不亮「任务完成」。
+    doneCancelled: Boolean(done && done.cancelled),
     inferred: !reported, // 上报真值（reporter hook）不算推断
   };
 }
@@ -1652,10 +1882,14 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
           // 否则退回 Copilot 的 turns 表里最后一条 user_message；summary（sessions 表）
           // 是 Copilot 自己取的会话标题 —— 都带上，渲染层按它的规则择优展示。
           prompt: (inFlight && sqliteRow.live && sqliteRow.live.prompt) || sqliteRow.lastUserMessage || '',
-          doneAt: 0,
+          // 「任务完成」标记：9F 没有 hook，完成时刻只能从会话日志取（最新那一轮 request 的
+          // completedAt）—— 与 7F/8F 的 read*Done 同口径，超 DONE_TTL_MS 就算过期（不弹）。
+          doneAt: copilotDoneAt(sqliteRow, now),
           doneTitle: sqliteRow.summary || '',
           doneCount: sqliteRow.turnCount || 0,
           doneFiles: [],
+          // 9F 没有 hook，拿不到"打断"信号 → 一律按正常完成显示，不猜取消
+          doneCancelled: false,
           inferred: true,
           hasPendingTurn: sqliteRow.hasPendingTurn || false,
           // 「这一轮在不在飞」：true / false / null（没旁证）。台账同步器（copilotTasks.js）
@@ -1780,6 +2014,7 @@ module.exports = {
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
   readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
   listReporterSessions, // 会话只能靠 hook 的楼层（5F TraeCode）与合并楼层的 hook 那一路（1F CodeBuddy CLI）
+  readCopilotDone,    // 9F 的完成标记（没有 hook，从 VS Code 会话日志取）
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
   copilotCurrentModel, // Copilot 当前选中的模型（从 VS Code state.vscdb 取）
   listSessions,

@@ -462,6 +462,33 @@ head('[C] 完成标记：session_message.finish 的映射');
   ok('finish=error → 不算完成', opencode.readOpencodeDone('ses_err00000000000000000000001', {}).doneAt === 0);
 }
 
+/* ------------------------------ C2. 被打断的那一轮 → 取消标记 ------------------------------ */
+
+head('[C2] 被打断的一轮（idle.outcome=interrupted）→ 完成标记带 doneCancelled（主控制台亮红色「任务取消」）');
+{
+  const db = new Database(DB);
+  const sid = 'ses_cancel00000000000000000001';
+  db.prepare(
+    `INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, agent, model,
+                             cost, summary_files, time_created, time_updated, time_idle, idle_outcome, time_archived, time_suspended)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(sid, 'proj', null, 'slug', '/tmp/ProjO', '被打断的那条', '2.0.18', 'build', '{"id":"x"}', 0, 1, now - 60_000, now - 1_000, null, 'interrupted', null, null);
+  const msg = db.prepare(
+    `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)`
+  );
+  const put = (seq, type, data, at) => msg.run(`${sid}#${seq}`, sid, type, seq, at, at, JSON.stringify(data));
+  put(1, 'user', { time: { created: now - 50_000 }, text: '改点东西' }, now - 50_000);
+  put(2, 'assistant', { time: { created: now - 40_000, completed: now - 30_000 }, finish: 'tool-calls', content: [{ type: 'text', text: '改到一半' }] }, now - 30_000);
+  // 显式空闲标记：用户终止了这一轮（没有 finish=stop 的 assistant 消息）
+  put(3, 'idle', { time: { created: now - 1_000 }, outcome: 'interrupted' }, now - 1_000);
+  db.close();
+
+  const d = opencode.readOpencodeDone(sid, { title: '被打断的那条' });
+  ok('被打断的一轮也回一枚完成标记（不然主控制台拿不到"这一轮结束了"）', d && d.doneAt > 0, JSON.stringify(d));
+  ok('且带 doneCancelled=true（→ 红色「任务取消」，不是「任务完成」）', d && d.doneCancelled === true, JSON.stringify(d));
+  ok('正常完成的那条 doneCancelled=false（不臆造取消）', opencode.readOpencodeDone('ses_done0000000000000000000001', {}).doneCancelled === false);
+}
+
 /* ------------------------------ D. 读不出来不许冒泡 ------------------------------ */
 
 head('[D] 库缺 session_message 表（OpenCode 改版换表）→ 降级而不是瘫，接口不挂');

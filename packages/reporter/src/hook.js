@@ -715,6 +715,75 @@ function relFile(file, cwd) {
   return abs;
 }
 
+/**
+ * 本轮（startedAt 之后）改过的文件：三路合起来，按绝对路径去重，再补上体积。
+ *
+ * Stop（正常收工）与 Interrupt（用户 ESC / 停止）都要这份清单：
+ * 收工时它是"改动了哪些文件"，取消时它是"取消前已经动了哪些文件" ——
+ * 主控制台靠它决定「任务完成 / 任务取消」那句概要写文件清单还是写"没有输出"。
+ *
+ * 三路：
+ *   ① rememberRoundFiles 记的（PostToolUse 那一路：工具入参里解析得出目标文件时）；
+ *   ② transcript 里 apply_patch 的权威清单（见 transcriptRoundFiles）—— IDE / app-server
+ *      形态的 PostToolUse 常常不带 patch 文本，只靠 ① 会"没有改动文件"；
+ *   ③ 按 mtime 扫这一轮碰过的文件（见 touchedSince）—— agent 用 shell 改文件时上面
+ *      两路都看不到（实测"真改了 3 个文件却显示 0"）。前两路已知的 op 更准，不覆盖。
+ *
+ * 体积（size）在收工那一刻现 stat：解析按优先级试多个基路径（文件本身 → 事件 cwd → REAL_WS）——
+ * 插件 / IDE 下 cwd 常常对不上工程，只信 cwd 会把相对路径拼错、size 永远 null。
+ * 之所以在 hook 侧算、不让服务端算：服务端按工程存的 workspace_path 反查文件，
+ * 而开发工程那条 workspace_path 往往为空 / 对不上，服务端 stat 必失败。
+ *
+ * @param {object} st 状态文件内容
+ * @param {object} ev hook 事件体
+ * @param {string} cwd 事件里的 cwd（可能为空）
+ * @param {number} startedAt 本轮任务开始时刻（0 = 不过滤）
+ * @returns {Array<{path:string, op:string|null, size:number|null}>}
+ */
+function collectRoundFiles(st, ev, cwd, startedAt) {
+  const roundFiles = ((st && st.roundFiles) || []).filter((x) => x && (typeof x === 'string' ? x : x.path));
+  const baseDir = cwd || REAL_WS;
+  /** @type {Map<string, {path:string, op:string|null, abs:string}>} */
+  const byAbs = new Map();
+  for (const x of roundFiles) {
+    const p = typeof x === 'string' ? x : x.path;
+    if (!p) continue;
+    const abs = (typeof x === 'object' && x.abs) || path.resolve(baseDir, p);
+    byAbs.set(abs, { path: p, op: typeof x === 'string' ? null : x.op, abs });
+  }
+  const tp = (ev && ev.transcript_path) || (st && st.transcriptPath) || '';
+  for (const t of transcriptRoundFiles(tp, startedAt)) {
+    const abs = path.resolve(baseDir, t.path);
+    const prev = byAbs.get(abs);
+    byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });
+  }
+  for (const t of touchedSince(baseDir, startedAt)) {
+    const abs = path.resolve(baseDir, t.path);
+    const prev = byAbs.get(abs);
+    byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });
+  }
+  return [...byAbs.values()].map((x) => {
+    const p = x.path;
+    const op = x.op || null;
+    let size = null;
+    if (op !== 'delete') {
+      const candidates = [x.abs, p, cwd ? path.resolve(cwd, p) : null, path.resolve(REAL_WS, p)].filter(Boolean);
+      for (const cp of candidates) {
+        try {
+          const st0 = fs.statSync(cp);
+          if (st0.isFile()) {
+            size = st0.size;
+            break;
+          }
+        } catch {
+          /* 试下一个候选 */
+        }
+      }
+    }
+    return { path: p, op, size };
+  });
+}
+
 /** 内容块里算"回复正文"的类型：reasoning / tool-call 之类不算
  * （CodeBuddy 会把思维链也塞进 content，整段并进来会把一条回复撑成上万字）。 */
 const TEXT_BLOCK_TYPES = new Set(['text', 'output_text', 'input_text', 'summary_text']);
@@ -790,6 +859,11 @@ function jsonlReplies(file) {
     } catch {
       continue; // 半截行 / 非 JSON 行：跳过，不猜
     }
+    /* 打断标记的 user 行不算"新一轮用户提问" —— Claude / Qoder 在 ESC 后会写一条
+       `[Request interrupted by user]` 的 user 消息。它要是被当成 user 边界，sinceLastUser
+       就会把**这一轮已经吐出来的半截回复**整段切掉（那一轮被取消时的"输出"就丢了，
+       收尾也记不上）。跳过它，这一轮的真实 prompt 才是边界。 */
+    if (isInterruptLine(obj)) continue;
     const m = msgOf(obj);
     if (!m) continue;
     const ts = Date.parse(String((obj && obj.timestamp) || '')) || 0;
@@ -858,6 +932,90 @@ function codebuddyReplies(indexPath) {
 function turnReplies(transcriptPath) {
   if (!transcriptPath || typeof transcriptPath !== 'string') return [];
   return /index\.json$/i.test(transcriptPath) ? codebuddyReplies(transcriptPath) : jsonlReplies(transcriptPath);
+}
+
+/**
+ * 这一轮（startedAt 之后）有没有被用户打断的痕迹 —— 给"没有显式 Interrupt 事件"的产品用。
+ *
+ * 各产品"用户按 ESC / 停止"的信号不一样，落到 transcript 上是**结构化的一行**：
+ *   · Codex（3F）：一条 `event_msg` / `payload.type === 'turn_aborted'`（`reason: 'interrupted'`）
+ *     —— 与显式 `Interrupt` 事件同一时刻落盘，互为印证。
+ *   · Claude Code（4F）/ Qoder（6F）：**不发 Interrupt**，但会写一条 user 消息，正文是
+ *     `[Request interrupted by user]`（工具中途打断是 `[Request interrupted by user for tool use]`）
+ *     —— 这是"这一轮被掐掉了"唯一的、也是权威的落盘痕迹。
+ *
+ * **必须按结构判，不能全文搜字符串**：agent 自己的工具输出 / 思考里经常出现这两个词
+ * （实测：跑一句 `rg 'turn_aborted'` 或讨论打断逻辑，输出被原样写进 rollout；全文匹配会把
+ * 那一轮误判成"用户打断了" —— 用户没打断、控制台却报红色「任务取消」、产出摘要还被清空）。
+ * 所以逐行 `JSON.parse` 后只认上面两种**事件结构**：`function_call_output` / `reasoning` /
+ * `tool_result` 里带同名字符串一律不算。
+ *
+ * 只认**时间戳晚于本轮开始时刻**的那条 —— 老一轮的打断标记不能算到这一轮头上。
+ * 解析不出结构 / 时间戳的行宁可不算（不臆造），路径读不到就回 false（hook 照常按"完成"走）。
+ * @param {string} transcriptPath
+ * @param {number} startedAt 本轮任务开始时刻（0 = 不过滤）
+ * @returns {boolean}
+ */
+const INTERRUPT_HINT_RE = /turn_aborted|Request interrupted by user/i;
+
+/** 一行 JSONL 是不是"用户打断了这一轮"的结构化事件（见 turnInterrupted 的说明） */
+function isInterruptLine(o) {
+  if (!o || typeof o !== 'object') return false;
+  // Codex：event_msg / payload.type = turn_aborted（reason 为空或 interrupted/aborted）
+  const p = o.payload;
+  if (o.type === 'event_msg' && p && typeof p === 'object' && p.type === 'turn_aborted') {
+    const reason = String(p.reason || '').toLowerCase();
+    return !reason || reason === 'interrupted' || reason === 'aborted' || reason === 'cancelled' || reason === 'canceled';
+  }
+  // Claude / Qoder：一条 user 消息，正文（text part，不是 tool_result）就是 [Request interrupted by user]
+  if (o.type === 'user' && o.message && typeof o.message === 'object') {
+    const c = o.message.content;
+    const texts = typeof c === 'string' ? [c] : Array.isArray(c) ? c.filter((x) => x && x.type === 'text').map((x) => x.text) : [];
+    return texts.some((t) => /^\s*\[?request interrupted by user/i.test(String(t || '')));
+  }
+  return false;
+}
+
+function turnInterrupted(transcriptPath, startedAt) {
+  if (!transcriptPath || typeof transcriptPath !== 'string') return false;
+  let raw = '';
+  try {
+    raw = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return false;
+  }
+  // 便宜的先决条件：整份文件连关键词都没有就不必逐行解析
+  if (!INTERRUPT_HINT_RE.test(raw)) return false;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || !INTERRUPT_HINT_RE.test(line)) continue;
+    let o;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue; // 解析不出的行（截断的 JSON / 非 JSONL 的 index.json）不算
+    }
+    if (!isInterruptLine(o)) continue;
+    if (!startedAt) return true;
+    // 只认这一轮的：消息时间戳要晚于本轮开始。解析不出时间戳的行不算（保守，不臆造）。
+    const ts = Date.parse(String(o.timestamp || ''));
+    if (Number.isFinite(ts) && ts >= startedAt) return true;
+  }
+  return false;
+}
+
+/**
+ * 少数产品的 Stop / FinalStop payload 自带一个"这一轮怎么结束"的原因字段
+ * （各家字段名不一：`final_stop_reason` / `stop_reason` / `reason`）。取值里出现
+ * cancelled / interrupted / aborted 就是被用户掐掉的 —— 比 transcript 痕迹更直接。
+ * 取不到（绝大多数产品的 Stop payload 没这个字段）就回 false，不影响老行为。
+ * @param {any} ev hook 事件体
+ * @returns {boolean}
+ */
+function stopReasonCancelled(ev) {
+  const r = String((ev && (ev.final_stop_reason || ev.stop_reason || ev.reason)) || '')
+    .trim()
+    .toLowerCase();
+  return r === 'cancelled' || r === 'canceled' || r === 'interrupted' || r === 'aborted';
 }
 
 /**
@@ -1679,7 +1837,15 @@ async function main() {
 
   if (event === 'Notification') {
     if (ev.notification_type === 'idle_prompt') {
-      clearAwait(file);
+      /* 空闲提醒 = 这一轮早就结束了、CLI 在等下一句输入。
+         **不能走 clearAwait**：它会把 `done` 一起清掉 —— 而 `done` 是「任务完成 / 任务取消」
+         唯一的凭据，清了就再也亮不出来（实测：CodeBuddy CLI 每轮结束后约 60s 发一条
+         idle_prompt，1F 的完成/取消标记 60s 后就被抹平，主控制台也再没有实时状态）。
+         这里只撤「等权限 / 待认领」，done 原样保留。
+         —— 相位**不能**写成 null：状态文件里 sessionPhase=null 会让快轮询 readReporterPhase
+         读不到任何相位，主控制台直接掉回「未上报」，实时状态整段消失。idle_prompt 来时这一轮
+         早已结束，相位本就是 idle，显式落一笔 idle 既清掉上一轮残留的 tool/thinking，又保住实时状态。 */
+      writeState(file, { await: null, pending: null, sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: REAL_WS } });
       await status('idle');
     } else if (IS_CLAUDE && ev.notification_type !== 'permission_prompt') {
       // Claude Code 的 notification_type 枚举还有 auth_success / elicitation_dialog 等，
@@ -1703,6 +1869,15 @@ async function main() {
   }
 
   if (event === 'Stop') {
+    /* clearAwait 撤的是"等权限 / 待认领"那一整块，会顺手把 done 也清掉 ——
+       先留一份：判断这一轮是不是**刚被打断**（见下面 justCancelled）要看 Interrupt 落的那枚取消标记，
+       被清掉之后就无从判断了。 */
+    const doneBeforeStop = (readState(file) || {}).done || null;
+    /* 本轮之前刚落过的那枚**取消**标记还在 60s 内 = 这一轮是被 Interrupt 掐掉的
+       （Interrupt 已经落过 done.cancelled 并清了 taskId），下面别再拿"完成"盖回去。 */
+    const prevCancelledDone = Boolean(
+      doneBeforeStop && doneBeforeStop.cancelled && Date.now() - Number(doneBeforeStop.at || 0) < 60_000
+    );
     clearAwait(file);
     // 本轮结束：同理，屋里不该再留着上一轮召唤的幽灵
     sweepGhosts(file, REAL_WS, cl);
@@ -1738,66 +1913,22 @@ async function main() {
     // transcript 读不到（路径没了 / 格式不认识）时，至少把 Stop 自带的这句当成一条回复存下来；
     // 去重键用正文哈希（同一轮重复上报仍不会写重，不同轮内容不同就是两条）。
     if (!replies.length && lastText) replies.push({ id: 'h' + fnv1a32(lastText), text: lastText });
-    // 本轮改过的文件：两路合起来 ——
-    //   ① rememberRoundFiles 记的（PostToolUse 那一路：工具入参里解析得出目标文件时）；
-    //   ② transcript 里 apply_patch 的权威清单（见 transcriptRoundFiles）—— IDE / app-server
-    //      形态的 PostToolUse 常常不带 patch 文本，只靠 ① 会"没有改动文件"。
-    // 两路按**绝对路径**去重（同一条改动两边都记到时只留一条，op 取先记到的那个）。
+    // 本轮改过的文件（三路合并 + 体积，见 collectRoundFiles）。
     // 记在完成标记里一起落盘：1.5s 快轮询拿到 doneAt 的**同一时刻**就有文件清单，
     // 不用等 10s 的会话快照，「任务完成」才不会退化成一句"本次任务已完成"。
-    // 注意：rememberRoundFiles 存的是 {path, op} 对象（op 区分 新增/改动/删除），
-    // 这里只过滤无效项，不要把对象当成字符串丢掉（否则文件清单永远为空）。
-    const roundFiles = (st.roundFiles || []).filter((x) => x && (typeof x === 'string' ? x : x.path));
-    const baseDir = cwd || REAL_WS;
-    const byAbs = new Map();
-    for (const x of roundFiles) {
-      const p = typeof x === 'string' ? x : x.path;
-      if (!p) continue;
-      const abs = (typeof x === 'object' && x.abs) || path.resolve(baseDir, p);
-      byAbs.set(abs, { path: p, op: typeof x === 'string' ? null : x.op, abs });
-    }
-    for (const t of transcriptRoundFiles(ev.transcript_path || st.transcriptPath || '', startedAt)) {
-      const abs = path.resolve(baseDir, t.path);
-      const prev = byAbs.get(abs);
-      byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });
-    }
-    // 第三路（兜底）：按 mtime 扫这一轮碰过的文件（见 touchedSince）—— agent 用 shell 改
-    // 文件时上面两路都看不到（实测"真改了 3 个文件却显示 0"）。前两路已知的 op 更准，不覆盖。
-    for (const t of touchedSince(baseDir, startedAt)) {
-      const abs = path.resolve(baseDir, t.path);
-      const prev = byAbs.get(abs);
-      byAbs.set(abs, prev || { path: relFile(abs, baseDir), op: t.op, abs });
-    }
-    // 本轮用工具动过的文件：补上"当前体积（字节）"，主控制台好显示文件大小。
-    // 大小在收工那一刻现 stat。解析按优先级试多个基路径：文件本身（工具给的往往是绝对路径）
-    // → 按事件 cwd → 按 REAL_WS（= process.cwd()）。插件 / IDE 下 cwd 常常对不上工程，
-    // 只信 cwd 会把大小算成 null，所以要多试几个、谁先 stat 到用谁。
-    // 之所以在 hook 侧算、不让服务端算：服务端按工程存的 workspace_path 反查文件，
-    // 而开发工程那条 workspace_path 往往为空 / 对不上，服务端 stat 必失败 → 大小永远 null。
-    const roundFileDetails = [...byAbs.values()].map((x) => {
-      const p = x.path;
-      const op = x.op || null;
-      const abs = x.abs;
-      let size = null;
-      if (op !== 'delete') {
-        // abs 是工具给的绝对路径（PostToolUse 那一刻最准），优先用；下面再退回按相对路径
-        // 拼 cwd / REAL_WS —— 插件下 Stop 事件的 cwd 常常为空、进程 cwd 又对不上工程，
-        // 单靠它们会把相对路径拼成 work/WorkGremlin/work/... 而 stat 失败，size 永远 null。
-        const candidates = [abs, p, cwd ? path.resolve(cwd, p) : null, path.resolve(REAL_WS, p)].filter(Boolean);
-        for (const cp of candidates) {
-          try {
-            const st0 = fs.statSync(cp);
-            if (st0.isFile()) {
-              size = st0.size;
-              break;
-            }
-          } catch {
-            /* 试下一个候选 */
-          }
-        }
-      }
-      return { path: p, op, size };
-    });
+    const roundFileDetails = collectRoundFiles(st, ev, cwd, startedAt);
+    /* 这一轮有没有被用户掐掉？三条证据，取或：
+       ① Codex 的显式 Interrupt 刚落过取消标记、且这一轮没有新任务在跑（prevCancelledDone && !taskId）；
+       ② Stop payload 自带结束原因、且是 cancelled / interrupted（stopReasonCancelled，少数产品才有）；
+       ③ Claude Code / Qoder / Codex 的 transcript 落盘痕迹（turnInterrupted）：Claude 家族是
+          "[Request interrupted by user]"、Codex 是 rollout 里的 turn_aborted。
+       打断后又发了新任务时 taskId 是新那一轮的，①不成立、transcript / reason 那条也晚于本轮开始才认，
+       所以照常落「完成」，不会一直红着。 */
+    const justCancelled = prevCancelledDone && !taskId;
+    const cancelledRound =
+      justCancelled ||
+      stopReasonCancelled(ev) ||
+      turnInterrupted(ev.transcript_path || st.transcriptPath || '', startedAt);
     // 收工上报：把**这一轮的产出**一起交给服务端进台账（task_runs）——
     // 收尾自述 + 改动文件清单（含大小）+ 模型，报表要的"输入 / 产出 / 改了多少文件 / 用了什么模型"就齐了。
     if (taskId) {
@@ -1807,7 +1938,9 @@ async function main() {
         ...base,
         memberId: AGENT,
         taskId,
-        state: 'done',
+        // 被掐掉的那一轮按 cancelled 收尾（不亮「任务完成」）—— 用户没让它干完。
+        // 但"没干完"不是"没产出"：这一轮吐出来的文字 / 改过的文件照常带上（与 done 同一条线）。
+        state: cancelledRound ? 'cancelled' : 'done',
         model: String(ev.model || ''),
         result,
         files: roundFileDetails,
@@ -1818,21 +1951,40 @@ async function main() {
     // 每次 AI 回复都进对话记录（messages 表）——这是"每次回复入库"那条线，
     // 与上面的 task_runs.result（一轮一条摘要）互不替代。
     // 放在清 taskId 之前：消息要挂在本轮任务上；重复上报由 dedupeKey 吃掉。
+    /* 刚被打断的那一轮：ESC 之后 Stop 常常照样来一次（这一轮"结束了"）。
+       别再用一枚"完成"盖掉它 —— 用户没让它干完，就不该报「任务完成」。
+       两种写法：① Codex 的 Interrupt 已经落过取消标记（justCancelled → 沿用那一枚，at 不变）；
+       ② 这一轮的 Stop 自带打断证据（payload 的结束原因是 cancelled/interrupted，或 transcript 里的
+       turn_aborted / [Request interrupted by user]）→ 现在现落一枚取消标记（at 取现在）。
+       两者都没有才是正常「任务完成」。 */
+    const prevDone = doneBeforeStop;
     writeState(file, {
       taskId: null,
       taskWorkspacePath: '',
       taskStartedAt: 0,
       roundFiles: [],
-      done: {
+      /* 这一轮结束了，**必须把实时相位落到"没动作"**：以前只清 task、相位留着（thinking / tool
+         且 ts 停在最后一个事件那一刻），服务端的"新鲜期"（taskId 没了还有 AWAIT_TTL_MS=5 分钟）
+         一直认它新鲜 —— 现象就是"任务完成/取消之后，控制台一直停在『思考中』"，而且渲染层
+         那条"刚亮的收尾相位不许被实时相位盖掉"的守卫也因为 fastPhase.phase 不为空而失效，
+         红色「任务取消」刚亮就被这口旧相位盖回『思考中』。
+         写**显式 idle**（不是 null）：null 会让 readReporterPhase 什么都读不到、上层退回
+         "未上报 / 靠落盘推断"，实时状态整段消失；显式 idle 既清掉残留的 tool/thinking，
+         又保住"这一路是接过 hook 的、此刻待命"这个真值。 */
+      sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: REAL_WS },
+      done: justCancelled ? prevDone : {
         at: Date.now(),
         title,
         workspacePath: REAL_WS,
         startedAt,
+        // 这一轮已经吐出来的话照常记（有就记、没有就空）—— 取消与完成在这一栏同口径
         said,
         sessionId: String((ev && ev.session_id) || ''),
         // 只带前 8 条（屏上放不下就省略），总数另给一个字段，界面好写"改动 N 个文件"
         files: roundFileDetails.slice(0, 8),
         fileCount: roundFileDetails.length,
+        // 取消标记：服务端与渲染层照同一条路透传 → 主控制台亮红色「任务取消」而不是「任务完成」
+        ...(cancelledRound ? { cancelled: true } : {}),
       },
     });
     // 先把"任务完成 / 空闲"告诉办公室，再做回复入库 —— 入库慢不该拖住界面。
@@ -1869,21 +2021,62 @@ async function main() {
     return;
   }
 
-  // 打断（ESC / 停止）：这一轮飞出去的召唤不可能还活着 —— 只收孤儿，不碰主会话的任务与相位。
+  // 打断（ESC / 停止）：这一轮被用户掐掉了 —— 只收孤儿幽灵，并把这一轮按"取消"收尾。
   if (event === 'Interrupt') {
     // 被打断的这一轮：之后再来一句 user，本轮回复就永远落在"上一条 user 之前"了 —— 先补一刀留档。
     const stInt = readState(file);
-    await reportAiReplies(
-      info,
-      base,
-      AGENT,
-      stInt.taskId,
-      turnReplies(ev.transcript_path || stInt.transcriptPath || ''),
-      String((ev && ev.session_id) || stInt.sessionId || ''),
-      cl
-    );
+    const taskIdInt = stInt.taskId || '';
+    const startedAtInt = Number(stInt.taskStartedAt) || 0;
+    const repliesInt = turnReplies(ev.transcript_path || stInt.transcriptPath || '');
+    await reportAiReplies(info, base, AGENT, taskIdInt, repliesInt, String((ev && ev.session_id) || stInt.sessionId || ''), cl);
     sweepGhosts(file, REAL_WS, cl);
+    /* 取消标记：与 Stop 落的那枚 done **同形**（同一个 done 字段，多一个 cancelled:true），
+       服务端与渲染层照同一条路透传 —— 主控制台据此亮红色「任务取消」，
+       而不是把被打断的这一轮当成「任务完成」（用户没让它干完，就不该报完成）。
+       清单照样带"取消前已经动了哪些文件"；**这一轮已经吐出来的文字 / 改过的文件照常记录**
+       （和「任务完成」同一套：task_runs.result + 对话记录 + done 概要）——
+       取消只是"没干完"，不是"没产出"；真的一点产出都没有才落空、界面写「没有输出」。 */
+    const filesInt = collectRoundFiles(stInt, ev, cwd, startedAtInt);
+    const lastInt = repliesInt.length ? repliesInt[repliesInt.length - 1].text : '';
+    const saidInt = String(lastInt || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    const resultInt = String(lastInt || '').trim().slice(0, RESULT_MAX);
+    if (taskIdInt) {
+      await request(info, HTTP_ROUTES.TASK_END, {
+        ...base,
+        memberId: AGENT,
+        taskId: taskIdInt,
+        state: 'cancelled',
+        model: String(ev.model || ''),
+        // 有输出就带上（与「任务完成」同一条线）；没有就是空串，服务端显示"无产出摘要"
+        result: resultInt,
+        files: filesInt,
+        fileCount: filesInt.length,
+        form: sessionForm(stInt, ev),
+      });
+    }
+    writeState(file, {
+      taskId: null,
+      taskWorkspacePath: '',
+      taskStartedAt: 0,
+      roundFiles: [],
+      // 同理：打断之后不留旧相位（否则红色「任务取消」会被 stale 的『思考中 / 调用工具』盖回去，
+      // 而且会因为新鲜期一直挂着，控制台迟迟回不到待命）。显式 idle，理由同上面 Stop 那一处。
+      sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: REAL_WS },
+      done: {
+        at: Date.now(),
+        title: stInt.taskTitle || '',
+        workspacePath: REAL_WS,
+        startedAt: startedAtInt,
+        // 这一轮已经吐出来的话照常记（有就记、没有就空 —— 与「任务完成」一致）
+        said: saidInt,
+        sessionId: String((ev && ev.session_id) || stInt.sessionId || ''),
+        files: filesInt.slice(0, 8),
+        fileCount: filesInt.length,
+        cancelled: true,
+      },
+    });
     await beat();
+    await status('idle');
     return;
   }
 

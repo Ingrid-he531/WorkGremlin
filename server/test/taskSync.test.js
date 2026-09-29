@@ -355,7 +355,10 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     prompt: '逗号串也要给原话',
     model: 'longcat',
   });
-  opencodeMod.readOpencodeDone = () => null;
+  // 用可变变量 + 闭包：route 在 require 时就把 readOpencodeDone 解构进去了，
+  // 之后再改模块导出对它无效（第一版就是踩了这个，done 一直是 null）。
+  let ocDone = null;
+  opencodeMod.readOpencodeDone = () => ocDone;
   opencodeMod.opencodeInstrumented = () => true;
   const { createSessionsRouter } = require('../src/http/routes/sessions');
   const appPhase = express();
@@ -370,6 +373,27 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     rpComma.phase === 'thinking' && rpComma.prompt === '逗号串也要给原话' && rpComma.model === 'longcat',
     JSON.stringify({ phase: rpComma.phase, prompt: rpComma.prompt, model: rpComma.model })
   );
+  // 被打断的那一轮：轮询那一路（readOpencodeDone）带的 doneCancelled 要经 toReporterDone 透传成
+  // 快轮询的 `done.cancelled` —— 渲染层读的就是它（IsoOfficeView 的 `fpDone.cancelled`），
+  // 少了这一步 8F 被终止也只会干等回待命，不会亮红色「任务取消」。
+  ocDone = {
+    doneAt: Date.now(),
+    doneTitle: '',
+    doneCount: 1,
+    doneFiles: [],
+    doneCancelled: true,
+  };
+  const srv2 = appPhase.listen(0, '127.0.0.1');
+  await new Promise((r) => srv2.once('listening', r));
+  const rpCancel = await (
+    await fetch(`http://127.0.0.1:${srv2.address().port}/api/v1/reporter-phase?client=opencode,opencode-plugin`)
+  ).json();
+  ok(
+    '8F 被打断：快轮询的 done.cancelled=true（主控制台据此亮红色「任务取消」）',
+    Boolean(rpCancel.done && rpCancel.done.cancelled === true),
+    JSON.stringify(rpCancel.done)
+  );
+  srv2.close();
   srvPhase.close();
 
   server.close();

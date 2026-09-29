@@ -281,13 +281,27 @@ await fire(msg({ id: 'msg_4', role: 'assistant', finish: 'tool-calls', time: { c
 head('[中断] session.idle 时任务还开着 → 收成 cancelled，不亮「任务完成」');
 await fire(msg({ id: 'msg_6', role: 'user', time: { created: Date.now() } }));
 await fire(part({ id: 'prt_9', type: 'text', text: '"被打断的一轮"' }, 'msg_6'));
+// 这一轮已经吐出来的半句（assistant）—— 取消时要照常当"产出"记下来（与「任务完成」同一条线）
+await fire(msg({ id: 'msg_6a', role: 'assistant', time: { created: Date.now() } }));
+await fire(part({ id: 'prt_10', type: 'text', text: '"改到一半就被掐了"' }, 'msg_6a'));
 await fire(ev('session.idle', {}));
 {
   const e = lastFor('/api/v1/task/end');
   ok('state = cancelled', e && e.body.state === 'cancelled', e && e.body.state);
+  ok('取消但这一轮有输出 → result 照常带上（不因"取消"丢掉产出摘要）', e && e.body.result === '改到一半就被掐了', e && e.body.result);
   const st = stateFile();
-  ok('没有落下 done 完成标记', !(st && st.done && Date.now() - st.done.at < 3000), st && JSON.stringify(st.done));
+  // 被打断的一轮要落一枚**取消**标记（与 hook.js 的 Interrupt 同形，多一个 cancelled:true）：
+  // 主控制台据此亮红色「任务取消」，而不是干等回待命，也绝不亮「任务完成」。
+  ok('落下的是**取消**标记（done.cancelled 为真）', Boolean(st && st.done && st.done.cancelled === true), st && JSON.stringify(st.done));
+  ok('取消标记是刚落的（at 在 3s 内）', Boolean(st && st.done && Date.now() - st.done.at < 3000), st && JSON.stringify(st.done));
+  ok('取消标记也带上这一轮的输出（said）', Boolean(st && st.done && st.done.said === '改到一半就被掐了'), st && JSON.stringify(st.done && st.done.said));
+  ok('取消标记带本轮改动文件清单（没有就是空数组，UI 显示「没有输出」）', Boolean(st && st.done && Array.isArray(st.done.files)), st && JSON.stringify(st.done && st.done.files));
   ok('扫场：这一轮召唤的幽灵收掉了', !readFeed().agents.find((a) => a.id === 'c2'), JSON.stringify(readFeed().agents));
+
+  // 打断后紧跟着一条迟到的 finish=stop：不许把红色「任务取消」盖成绿色「任务完成」
+  await fire(msg({ id: 'msg_6b', role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } }));
+  const st2 = stateFile();
+  ok('迟到的 finish=stop 不许盖掉取消标记', Boolean(st2 && st2.done && st2.done.cancelled === true), st2 && JSON.stringify(st2.done));
 }
 
 /* ------------------------------ D. 状态文件 ------------------------------ */

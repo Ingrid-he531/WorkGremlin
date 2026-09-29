@@ -341,6 +341,13 @@ function createIngestPlugin(options, { location } = {}) {
   const taskIds = new Map()
   /** 会话 id → 本轮动过的文件（台账 file/touch 累积，收尾时并进 task/end 的 files） */
   const roundFiles = new Map()
+  /**
+   * 会话 id → 最近一次"被打断收尾"的时刻。
+   * 用户按 ESC / 停止时 Kilo / OpenCode 只发一条 `session.idle`（没有 `finish=stop`）——
+   * 这一轮按**取消**收尾并落一枚 `done.cancelled`。但偶尔会有一条迟到的 assistant
+   * `finish=stop` 消息跟在后面，别让它把红色「任务取消」盖成绿色「任务完成」（同 hook.js 的 justCancelled）。
+   */
+  const cancelledAt = new Map()
   /** 成员注册只需一次（同一 client 在一个 WorkGremlin 生命周期里是同一只小怪物） */
   let registered = false
   const ingest = createIngest(client)
@@ -428,6 +435,8 @@ function createIngestPlugin(options, { location } = {}) {
     const taskId = `k_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
     taskIds.set(sid, taskId)
     roundFiles.set(sid, new Set())
+    // 新一轮开始：上一次的"被打断"标记作废（迟到的旧 done 不该再压住这一轮的完成）
+    cancelledAt.delete(sid)
     // **新一轮开始时把上一轮的「任务完成」标记抹掉。**
     // 状态文件是合并写（readState → 打补丁 → 写回），不显式清的话旧 done 会一直挂着 ——
     // 新任务已经在跑了，控制台却还亮着上一轮的「任务完成」。done 置 null 而不是删键：
@@ -642,6 +651,13 @@ function createIngestPlugin(options, { location } = {}) {
         if (role === "assistant" && info.finish && info.time && info.time.completed) {
           // finish=tool-calls 只是"到工具调用处断了"，整轮还没完 —— 不能收工
           if (info.finish === "tool-calls") break
+          /* 刚被 session.idle 判成"打断"的那一轮不许再用一枚"完成"盖回来：
+             ① 取消标记是刚才落的（60s 内）；② 这一轮已经没有任务在跑（taskId 已被 endTask 清掉）。
+             打断后又发了新任务时 taskId 是新那一轮的，startTask 也会清掉 cancelledAt，照常落完成。 */
+          if (sid && cancelledAt.has(sid) && !taskIds.has(sid) && Date.now() - Number(cancelledAt.get(sid) || 0) < 60_000) {
+            assistantText.delete(sid)
+            break
+          }
           const result = String(assistantText.get(sid) || "")
           assistantText.delete(sid)
           const ws = wsOf(event)
@@ -660,6 +676,7 @@ function createIngestPlugin(options, { location } = {}) {
               files: files.slice(0, 20).map((f) => ({ path: f, size: null })),
               workspacePath: ws,
               sessionId: sid,
+              cancelled: false,
             },
           })
         }
@@ -759,12 +776,44 @@ function createIngestPlugin(options, { location } = {}) {
         break
       }
       case "session.idle": {
-        // 兜底：真收到"这一轮结束了"却没有 finish=stop 的 assistant 消息
-        // （比如用户中途打断）—— 收成 cancelled，不亮「任务完成」
+        /* 兜底：真收到"这一轮结束了"却没有 finish=stop 的 assistant 消息
+           （比如用户按 ESC / 停止打断）—— 这一轮按**取消**收尾，不亮「任务完成」。
+           Kilo / OpenCode 打断时不发 finish=stop，只发这一条 session.idle ——
+           以前这里只把台账收成 cancelled，**没有往状态文件落取消标记**，于是主控制台
+           拿不到任何"这是被打断"的证据，红色「任务取消」永远不亮（只能干等回待命）。
+           现在补一枚 done（与 hook.js 的 Interrupt 同形，多一个 cancelled:true）：
+             ① 台账 task/end(state=cancelled)（endTask 里）；
+             ② 状态文件 done.cancelled=true → /reporter-phase 与 /sessions 透传 →
+                主控制台照「任务取消」亮红色，「改动文件」或「没有输出」照常。 */
         if (sid && taskIds.has(sid)) {
-          endTask(event, sid, "cancelled", "")
+          // 统计本轮动过的文件：lastFiles（session.step.ended / session.diff 给的）∪ roundFiles（写类工具给）
+          const files = [...new Set([...(lastFiles.get(sid) || []), ...((roundFiles.get(sid)) || [])].map(String).filter(Boolean))]
+          // 这一轮已经吐出来的文字也照常收（与 message.updated 那条 done 同口径）：
+          // 取消只是"没干完"，不是"没产出"——台账的产出摘要 / 对话记录照记。
+          const result = String(assistantText.get(sid) || "")
+          const ws = wsOf(event)
+          cancelledAt.set(sid, Date.now())
+          endTask(event, sid, "cancelled", result)
           assistantText.delete(sid)
-          ghostFeed.sweepGhosts(wsOf(event), client, { all: true }, sid)
+          ghostFeed.sweepGhosts(ws, client, { all: true }, sid)
+          report(event, "idle", {
+            done: {
+              at: Date.now(),
+              title: result || titles.get(sid) || "",
+              fileCount: files.length,
+              files: files.slice(0, 20).map((f) => ({ path: f, size: null })),
+              workspacePath: ws,
+              sessionId: sid,
+              // 这一轮已经吐出来的话照常记（有就记、没有就空 —— 与「任务完成」一致）
+              said: result.replace(/\s+/g, " ").trim().slice(0, 160),
+              cancelled: true,
+            },
+          })
+          // 清掉状态文件里的 taskId：否则服务端兜底合成取消标记会在 ≥TASK_RUN_MS 后
+          // 再补一发 task/end(cancelled)（重复），也避免任务槽一直占着、相位卡在「调用工具」。
+          // 与 hook.js 的 Interrupt 同口径（它也把 taskId 清成 null）。
+          try { writeState(statePath(client, ws, sid), { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 }) } catch {}
+          break
         }
         report(event, "idle")
         break

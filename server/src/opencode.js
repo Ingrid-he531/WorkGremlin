@@ -630,8 +630,9 @@ function fileOf(input) {
 
 /** 完成标记的新鲜期：只有这么久之内结束的才算"刚发生"，否则页面一开就重播上一轮 */
 const DONE_TTL_MS = 10 * 60_000;
-/** 完成标记缺省时统一返回（没有就是"没有"，不臆造） */
-const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [] };
+/** 完成标记缺省时统一返回（没有就是"没有"，不臆造）。
+ *  doneCancelled：这一轮是被用户打断（ESC / 停止）收掉的 → 主控制台亮红色「任务取消」。 */
+const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false };
 
 /**
  * 这条会话的"完成"标记 —— 对应 hook 那边 Stop 事件落下的 done。
@@ -669,23 +670,48 @@ function readOpencodeDone(sessionId, meta = {}) {
       )
       .get(id)
   );
-  if (!row) return NO_DONE;
-  let data = {};
-  try {
-    data = JSON.parse(String(row.data || ''));
-  } catch {
-    data = {};
+  if (row) {
+    let data = {};
+    try {
+      data = JSON.parse(String(row.data || ''));
+    } catch {
+      data = {};
+    }
+    const finish = String((data && data.finish) || '');
+    if (finish === 'stop') {
+      const at = Number(data && data.time && data.time.completed) || 0;
+      if (at && Date.now() - at <= DONE_TTL_MS) {
+        return {
+          doneAt: at,
+          doneTitle: String(meta.title || ''),
+          doneCount: Number(meta.fileCount) || 0,
+          doneFiles: [],
+          doneCancelled: false,
+        };
+      }
+    }
   }
-  const finish = String((data && data.finish) || '');
-  if (finish !== 'stop') return NO_DONE;
-  const at = Number(data && data.time && data.time.completed) || 0;
-  if (!at || Date.now() - at > DONE_TTL_MS) return NO_DONE;
-  return {
-    doneAt: at,
-    doneTitle: String(meta.title || ''),
-    doneCount: Number(meta.fileCount) || 0,
-    doneFiles: [],
-  };
+  /**
+   * 被打断的那一轮没有 `finish=stop` 的 assistant 消息（OpenCode 每轮结束会写一行
+   * `type='idle'`，`data.outcome` 落 `succeeded` / `interrupted`）—— 上面那条路取不到，
+   * 但主控制台仍要知道"这一轮是被掐掉的"才能亮红色「任务取消」。
+   * 取逐轮清单里最新那一轮：`interrupted` 且刚结束（TTL 内）→ 落一枚取消标记。
+   * 与台账同步器（opencodeTasks.js）同一口径：绝不把被打断当成完成，也不臆造未发生的取消。
+   */
+  const turns = readOpencodeTurns(id);
+  const last = turns[turns.length - 1];
+  if (last && last.endedAt && last.outcome === 'interrupted' && Date.now() - Number(last.endedAt) <= DONE_TTL_MS) {
+    return {
+      doneAt: Number(last.endedAt) || 0,
+      doneTitle: String(meta.title || ''),
+      doneCount: Array.isArray(last.files) ? last.files.length : 0,
+      doneFiles: [],
+      doneCancelled: true,
+      // 这一轮已经吐出来的文字照常带上（与「任务完成」同一条线）：取消只是没干完，不是没产出
+      doneSaid: String(last.result || ''),
+    };
+  }
+  return NO_DONE;
 }
 
 /* ------------------------------ 对外 ------------------------------ */

@@ -193,6 +193,11 @@ function onConsoleLeave() {
 /** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
 const mainAgentState = computed(() => mainAgent.snapshot);
 
+/** 收尾相位（任务完成 / 任务取消 / 汇总中）：tooltip 里改列"产出概要"而不是 action */
+const isFinishPhase = computed(
+  () => mainAgent.phase === 'done' || mainAgent.phase === 'cancelled' || mainAgent.phase === 'summarize'
+);
+
 /** 字节数 -> 人类可读（B / KB / MB），与任务记录页同一套显示 */
 function fmtSize(n) {
   if (n == null) return '';
@@ -408,7 +413,16 @@ watch(
       const files = snapFiles.length ? snapFiles : hookFiles;
       const count = (sel && Number(sel.doneCount)) || (fpDone && Number(fpDone.fileCount)) || files.length;
       const said = (fpDone && fpDone.said) || '';
+      /* 这一轮是"干完了"还是"被掐掉了"：唯一凭证是 reporter 在 Interrupt 时落的那枚
+         取消标记（done.cancelled），会话快照那份由服务端透传成 doneCancelled。
+         两份取或：快轮询 1.5s 到、会话快照 10s 到，谁先到都算数 ——
+         少了快照这份，取消标记还没被快轮询带回来时就会先弹成「任务完成」。 */
+      const cancelled = Boolean((fpDone && fpDone.cancelled) || (sel && sel.doneCancelled));
       // 能拿到 +/- 行数（插件 / IDE 路）就显示 +X/-Y；能拿到 size 就显示体积（B/KB/MB）
+      // 有输出（这一轮动过文件）→ 列出改动了哪些文件；没动文件但有话（这一轮吐出来的文字）
+      // → 照「任务完成」那样把那句话显示出来；**两样都没有**才写「没有输出」。
+      // 取消与完成在这里同口径：取消只是"没干完"，不是"没产出"——被掐掉的那一轮常常还是
+      // 吐了半句、改了几个文件，照记；真一点产出都没有时，写"本次任务已完成"才是假的。
       const ctx = files.length
         ? [
             `改动 ${count} 个文件`,
@@ -423,16 +437,21 @@ watch(
               return bits.length ? `${nm}  (${bits.join(' · ')})` : String(nm);
             }),
           ]
-        : [said || '本次任务已完成'];
-      mainAgent.enterDone('任务完成', ctx);
+        : [said || (cancelled ? '没有输出' : '本次任务已完成')];
+      if (cancelled) mainAgent.enterCancelled('任务取消', ctx);
+      else mainAgent.enterDone('任务完成', ctx);
       return;
     }
-    // 刚亮起的「任务完成」不许被同一轮的残留相位盖掉：
-    // Stop 后 hook 会把实时相位清掉（fastPhase.phase 为 null），但 10s 会话快照还停留在
-    // Stop 前的「调用工具」——它晚到几秒，一盖就把「任务完成」冲掉
-    // （看到的就是 任务完成 → 调用工具 → 待命中，顺序倒了；调用工具应在任务完成之前）。
-    // 只在"没有实时相位"时拦：新一轮（UserPromptSubmit 后实时相位恢复）仍正常覆盖 —— 那是用户又发任务了。
-    if (mainAgent.phase === 'done' && !(fastPhase.value && fastPhase.value.phase)) return;
+    // 「任务取消 / 任务完成」刚亮起，不许被同一轮的残留相位盖掉：
+    // Stop / Interrupt 之后 hook 会把实时相位清掉（fastPhase.phase 为 null），但 10s 会话快照
+    // 还停在收尾前的「调用工具」——晚到几秒就把红色/绿色那一下冲掉（顺序倒成 任务完成→调用工具→待命）。
+    // 只在"没有实时相位"或"取消标记还在"时拦：新一轮（UserPromptSubmit 后实时相位恢复、done 被清掉）
+    // 仍正常覆盖 —— 那是用户又发任务了。
+    // CodeBuddy IDE 这类不打断事件的产品，取消后相位仍停在「调用工具」、取消标记靠 ≥TASK_RUN_MS
+    // 的兜底才合成 —— 这期间 fastPhase.phase 一直是 tool，必须用"done.cancelled 还在"这道闸护住红色，
+    // 否则「任务取消」一闪就被「调用工具」盖回去了（现象正是：取消后状态卡在「调用工具」、任务仍「进行中」）。
+    const fpCancel = Boolean(fastPhase.value && fastPhase.value.done && fastPhase.value.done.cancelled);
+    if ((mainAgent.phase === 'done' || mainAgent.phase === 'cancelled') && (!(fastPhase.value && fastPhase.value.phase) || fpCancel)) return;
     mainAgent.setLiveState(v);
   },
   { immediate: true }
@@ -653,15 +672,18 @@ onBeforeUnmount(() => {
     >
       <div class="ct-head">
         <i class="dot" :style="{ background: mainAgent.phaseColor }" />
-        <span class="ct-phase">{{ mainAgent.phaseLabel }}</span>
+        <!-- 「任务取消」那三个字也跟着相位色走（红）—— 只在这一相染色，别的相位维持原样 -->
+        <span class="ct-phase" :style="mainAgent.phase === 'cancelled' ? { color: mainAgent.phaseColor } : null">{{ mainAgent.phaseLabel }}</span>
       </div>
+      <!-- 收尾相位（任务完成 / 任务取消 / 汇总中）：第三层那几句"产出概要"才是要看的东西，
+           所以它们压过 action —— 取消时这里是"改动了哪些文件"，一个都没动就是「没有输出」。 -->
       <div
         class="ct-row"
-        v-if="mainAgent.action || ((mainAgent.phase === 'done' || mainAgent.phase === 'summarize') && mainAgent.context.length)"
+        v-if="mainAgent.action || (isFinishPhase && mainAgent.context.length)"
       >
         <b>操作</b>
         <span class="ct-val">
-          <template v-if="(mainAgent.phase === 'done' || mainAgent.phase === 'summarize') && mainAgent.context.length">
+          <template v-if="isFinishPhase && mainAgent.context.length">
             <span v-for="(c, i) in mainAgent.context" :key="i" class="ct-file">{{ c }}</span>
           </template>
           <template v-else-if="mainAgent.action">{{ mainAgent.action }}</template>

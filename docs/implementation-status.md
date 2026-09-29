@@ -159,6 +159,59 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 
 选中的会话决定主 Agent 控制台的相位（幽灵状态跟着走），办公室布局不受影响；切到没有活跃会话的楼层时整屋清空。
 
+### 4.1 「任务取消」逐楼层来源（红色「任务取消」，不是绿色「任务完成」）
+
+主控制台在收尾时只问一件事：**这一轮是干完了，还是被用户掐掉了**。唯一真源是 reporter /
+各产品落盘里的那枚 **完成标记**（`done`），`done.cancelled` 为真即亮红色「任务取消」，第三层照
+「改动文件清单 / 没有输出」显示。渲染层读两路：① `/reporter-phase` 快轮询的 `done.cancelled`；
+② `/sessions` 会话快照的 `doneCancelled`，取或（见 `IsoOfficeView.vue`）。
+
+「被掐掉」的信号各家不一样，逐楼层如下（**知道"被打断"就亮红，不知道就老实当没有取消、绝不臆造**）：
+
+| 楼层 | 产品 | 取消信号（落盘真值） | 落地位置 |
+| --- | --- | --- | --- |
+| 1F | CodeBuddy（CLI + Plugin） | ① CLI 走 `Interrupt`（有则用）/ Stop payload 的 `final_stop_reason ∈ cancelled/interrupted`；② **IDE（Plugin）不发 Stop / Interrupt**，由服务端兜底合成：状态文件 `taskId` 一直占着 + 空闲超 `TASK_RUN_MS` + transcript 末轮 `state='running'` → 合成取消标记，并补发一次 `task/end(cancelled)` | `hook.js`（`--agent codebuddy`）+ `sessions.js` 的 `readReporterDones.cancels` / `sessionRegistry` 的 `flushSynthesizedCancels`，回归 `test:codebuddy-cancel` |
+| 2F | WorkBuddy | 同 1F 家族（同一条 hook，`--agent workbuddy`） | `hook.js` |
+| 3F | Codex | ① 显式 `Interrupt` 事件；② 交互式会话常**不发** `Interrupt`，Stop 时读 rollout 里的 `event_msg/turn_aborted`（reason=interrupted）兜底 | `hook.js` 的 `runInterrupted`/`turnInterrupted`，回归 `test:stop-interrupt` |
+| 4F | Claude Code | Claude 不发 `Interrupt`；Stop 时读 transcript 里的 `[Request interrupted by user]`（工具中途打断带 ` for tool use` 后缀） | `hook.js` 的 `turnInterrupted`，回归 `test:stop-interrupt` |
+| 5F | TraeCode | **没有可读的取消信号**（无 transcript 可写、hook 只到 Stop/SessionEnd）→ 不亮「任务取消」，收尾仍按「任务完成」 | —— |
+| 6F | Qoder | 与 4F 同款（Claude 转写格式）：Stop 时读 transcript 的打断标记 —— Qoder 目前只发粗粒度事件，实际多半拿不到 | `hook.js` 的 `turnInterrupted` |
+| 7F | Kilo Code | ① 装了插件：`session.idle` 时若这一轮还开着 → 落一枚 `done.cancelled`（与 hook.js 的 `Interrupt` 同形）+ 台账 `task/end(state=cancelled)`；② 纯轮询这一路读不出打断（`message.finish` 没有 interrupted）→ 不臆造 | `packages/reporter/src/plugin/index.js` 的 `session.idle` 分支 |
+| 8F | OpenCode | ① 插件那一路同 7F（`session.idle`）；② 轮询那一路按 `session_message` 的 `type='idle'` / `data.outcome='interrupted'` 判取消 | `plugin/index.js`、`server/src/opencode.js` 的 `readOpencodeDone` |
+| 9F | GitHub Copilot | **没有可读的取消信号**（没有 hook，会话日志里没有"被打断"字段）→ 不亮「任务取消」 | —— |
+
+服务端透传一侧：CLI / hook 楼层的快轮询直接透传 reporter 的 `done.cancelled`；7F/8F 走
+`toReporterDone`（把会话行形状的 `doneCancelled` 翻回快轮询的 `done.cancelled`）；会话快照按
+`sessionInfo.doneCancelled` / 会话行的 `doneCancelled` 下发（7F/8F 那两支以前把原始 `done`
+直接摊进会话行，字段名对不上，现统一经 `doneFieldsFromReporter` 归一）。
+
+**取消信号的判定一律按结构，不全文搜字符串**（`hook.js` 的 `isInterruptLine`）：agent 自己的
+工具输出 / 思考里经常出现 `turn_aborted` / `Request interrupted by user` 这些词（实测：跑一句
+`rg 'turn_aborted'`、或讨论打断逻辑，输出被原样写进 rollout），全文匹配会把**没被打断**的一轮
+误判成取消 —— 控制台报红色「任务取消」、产出摘要还被一并清空。所以逐行 `JSON.parse` 后只认
+Codex 的 `event_msg/turn_aborted` 事件行与 Claude 家族 `user` 消息里的正文文本，工具结果 /
+思考 / 普通消息里带同名字符串一律不算。回归见 `npm run test:stop-interrupt` 的 [4]。
+
+**收尾那一下必须把实时相位一起清掉**（`hook.js` 的 Stop / Interrupt）：以前只清 `taskId`，
+`sessionPhase` 原样留着（还是 `thinking` / `tool`，ts 停在最后一个事件那一刻），服务端的新鲜期
+（taskId 没了还有 `AWAIT_TTL_MS`=5 分钟）一直认它新鲜 —— 现象就是「任务完成 / 任务取消亮过之后，
+控制台一直停在『思考中』」，且渲染层那条"刚亮的收尾相位不许被实时相位盖掉"的守卫也因
+`fastPhase.phase` 非空而失效，红色「任务取消」刚亮就被旧相位顶回去。现在两个收尾分支都把
+`sessionPhase` 落成 `null`（= 这一轮真的没在动），控制台按"接了 hook、此刻没动作"落「待命中」。
+
+**`Notification idle_prompt` 不许清掉 `done`**：CodeBuddy CLI 每轮结束后约 60s 会发一条
+`idle_prompt`（实测 events.log）。这一支以前走 `clearAwait()`，而它会把 `done` 一并写 null ——
+`done` 是「任务完成 / 任务取消」唯一的凭据，抹掉之后标记与控制台实时状态一起消失。现在
+idle_prompt 只撤 `await` / `pending` 并把相位清掉，`done` 原样保留（新的 `UserPromptSubmit`
+仍照常把它清掉）。回归见 `npm run test:stop-interrupt` 的 [1]/[5]。
+
+**取消照「任务完成」一样记录：取消只是"没干完"，不是"没产出"。** 被打断的那一轮
+已经吐出来的文字（`task_runs.result` + 对话记录 `type=result`）与改过的文件
+（`task/end.files`）照常入账；主控制台第三层按「改动文件 → 那一轮说的话 → 没有输出」
+择优显示（`IsoOfficeView.vue` 一处决定），真的一点产出都没有才写「没有输出」。
+（早先取消一律把 `said` / `result` 清空，理由"别拿上一轮冒充"——现在 `turnReplies`
+按本轮 user 起算、且跳过 `[Request interrupted by user]` 那条标记行，本轮输出不会串到上一轮。）
+
 ---
 
 ## 5. 文档 ↔ 实现 差异清单
@@ -229,6 +282,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | 文件活动（正在读写） | ✅ 实测 | `apply_patch` 没有 `file_path`，路径从 patch 文本的 `*** Update/Add/Delete File:` 解析 |
 | 子代理幽灵（出现 / 收工汇报） | ✅ 实测 | SubagentStart/Stop；名字取 `spawn_agent` 的 `task_name`，汇报文案取 `last_assistant_message` |
 | 打断收场（收掉孤儿幽灵） | 🟡 仅离线验证 | `Interrupt` 事件已接，真实会话里还没出现过 |
+| 打断 → 主控制台「任务取消」（红色，不是「任务完成」） | 🟡 仅离线验证 | `Interrupt` 落 `done.cancelled`（与 Stop 的 done 同形）；另外 Stop 时读 rollout 里的 `turn_aborted` 兜底（交互式会话里 `Interrupt` 不一定发）；回归见 `npm run test:cancel`、`npm run test:stop-interrupt` |
 | 等授权（blocked·awaiting_permission） | 🟡 仅离线验证 | 本机 `permission_mode=bypassPermissions`，从不弹权限框；Codex 走显式 `PermissionRequest`（不再用 CodeBuddy 的 pending 推断） |
 | 坐工位小怪物名册（Codex 侧 agent 定义） | 🟡 未实证 | 按 `$CODEX_HOME/agents`、`<工程>/.codex/agents` 的 `.md`/`.toml` 扫；本机还没有这类文件 |
 | 楼层 / 会话列表（3F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessionRegistry.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl`，用 `cwdOfHead` 从头部若干行取 `payload.cwd` |

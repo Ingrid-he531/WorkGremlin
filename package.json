@@ -46,6 +46,9 @@
     "test:task-client": "node renderer/test/taskClientLabel.test.mjs",
     "test:ws-reconnect": "node renderer/test/wsReconnect.test.mjs",
     "test:claude-hook": "node server/test/claudeHook.test.js",
+    "test:cancel": "node server/test/interruptCancel.test.js",
+    "test:codebuddy-cancel": "node server/test/codebuddyCancel.test.js",
+    "test:stop-interrupt": "node server/test/stopInterrupt.test.js",
     "test:task-runs-route": "node server/test/taskRunsRoute.test.js",
     "test:task-sync": "node server/test/taskSync.test.js"
   },

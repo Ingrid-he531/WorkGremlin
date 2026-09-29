@@ -44,6 +44,13 @@ export const PHASES = {
   summarize: { label: '汇总中', color: '#2fbf71', glow: 0.7, busy: true },
   /** 任务完成：屏上写"任务完成"，剪影回到静观；内容第三层显示本次改动概要 */
   done: { label: '任务完成', color: '#2fbf71', glow: 0.5, busy: false },
+  /**
+   * 任务取消：用户按了 ESC / 停止，这一轮没干完就被掐掉 ——
+   * 与 done 的区别只有两个：**红色**（不是"完成"那种绿）+ 屏上 / tooltip 写「任务取消」。
+   * 第三层同样是"这一轮的产出"：动过文件就列文件，一个都没动就写「没有输出」
+   * （见 IsoOfficeView 里 enterCancelled 那一段）。
+   */
+  cancelled: { label: '任务取消', color: '#ff5c5c', glow: 0.5, busy: false },
   /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
   await: { label: '等待授权', color: '#f5a623', glow: 0.6, busy: false },
   /**

@@ -165,9 +165,9 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * @param {null|{phase:string, action?:string, context?:string[], target?:any, prompt?:string}} s
      */
     setLiveState(s) {
-      // 任务完成概要（done）展示期间，忽略回落的 idle/offline/null，等 10s 定时器退回待命；
-      // 新的活跃事件（tool/thinking…）仍会覆盖它。
-      if (this.phase === 'done' && (!s || s.phase === 'idle' || s.phase === 'offline')) return;
+      // 收尾概要（done「任务完成」/ cancelled「任务取消」）展示期间，忽略回落的
+      // idle/offline/null，等 10s 定时器退回待命；新的活跃事件（tool/thinking…）仍会覆盖它。
+      if ((this.phase === 'done' || this.phase === 'cancelled') && (!s || s.phase === 'idle' || s.phase === 'offline')) return;
       if (!s) {
         if (this.hookLive) {
           this.hookLive = false;
@@ -246,11 +246,34 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * @param {string[]} [context] 第三层完成概要（如本次改动的文件、已交付的子任务）
      */
     enterDone(summary = '任务完成 · 等待下一步', context = []) {
+      this.enterFinish('done', summary || '任务完成 · 等待下一步', context);
+    },
+
+    /**
+     * 任务取消：用户按了 ESC / 停止，这一轮没干完就被掐掉。
+     *
+     * 与 enterDone 唯一的区别是相位（cancelled，红色「任务取消」）——
+     * 同样亮 10s 再退回待命，期间的覆盖规则也完全一致（见 setLiveState 那一处守卫）。
+     * @param {string} summary 第二层动作文案
+     * @param {string[]} [context] 第三层概要：取消前改过的文件；一个都没动就写「没有输出」
+     */
+    enterCancelled(summary = '任务取消 · 等待下一步', context = []) {
+      this.enterFinish('cancelled', summary || '任务取消 · 等待下一步', context);
+    },
+
+    /**
+     * 收尾相位的共同部分（done / cancelled 都走这里）：停掉 mock、清掉工具名与 prompt、
+     * 亮 10s 再退回待命。
+     * 收尾相位要把工具名清掉：残留的 Bash 会让「需要授权」串到「任务完成 / 任务取消」上。
+     * @param {'done'|'cancelled'} phase 收尾相位
+     * @param {string} summary 第二层动作文案
+     * @param {string[]} context 第三层概要
+     */
+    enterFinish(phase, summary, context = []) {
       clearTimeout(stopTimer);
-      this.phase = 'done';
-      this.action = summary || '任务完成 · 等待下一步';
+      this.phase = phase;
+      this.action = summary;
       this.context = Array.isArray(context) ? context : [];
-      // 收尾相位要把工具名清掉：残留的 Bash 会让「需要授权」串到「任务完成」上
       this.tool = '';
       this.prompt = '';
       stopTimer = setTimeout(() => {

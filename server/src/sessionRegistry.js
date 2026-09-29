@@ -312,8 +312,36 @@ function prune(now = Date.now()) {
   return removed;
 }
 
-/** 完成标记缺失时的统一返回值（没有就是"没有"，不臆造） */
-const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [] };
+/** 完成标记缺失时的统一返回值（没有就是"没有"，不臆造）
+ *  doneCancelled：那一轮是被用户打断（ESC / 停止）的，渲染层据此亮红色「任务取消」而不是「任务完成」。 */
+const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false };
+
+/**
+ * reporter 状态文件里的**原始** done（`{at,title,files,fileCount,cancelled,workspacePath}`）→
+ * 会话行形状（`{doneAt,doneTitle,doneCount,doneFiles,doneCancelled}`）。
+ *
+ * 为什么要有这一步：7F/8F 的会话行以前直接把原始 done 摊进来（`...doneTruth`），字段名
+ * （`at` / `files`）与会话行约定的（`doneAt` / `doneFiles`）对不上 —— 渲染层读 `sel.doneAt`
+ * 拿不到值，装了插件反而比轮询那一份还少信息。统一在这里转一次，顺带把 `cancelled` 透传成
+ * `doneCancelled`（主控制台据此亮红色「任务取消」）。
+ * @param {{at?:number,title?:string,files?:Array,fileCount?:number,cancelled?:boolean}} done
+ */
+function doneFieldsFromReporter(done) {
+  const files = Array.isArray(done.files) ? done.files : [];
+  const count = Number(done.fileCount);
+  return {
+    doneAt: Number(done.at) || 0,
+    doneTitle: done.title || '',
+    doneCount: Number.isFinite(count) ? count : files.length,
+    // 带 size 的保留 size（插件那一路有），只有路径的退回 name（与 doneFieldsOf 同形）
+    doneFiles: files.slice(0, 6).map((f) =>
+      typeof f === 'string'
+        ? { name: f }
+        : { name: (f && (f.path || f.name)) || '', ...(f && Number.isFinite(f.size) ? { size: f.size } : {}) }
+    ),
+    doneCancelled: Boolean(done.cancelled),
+  };
+}
 
 /**
  * CLI / hookSource 楼层的"完成标记"，字段名与 plugin 分支完全一致。
@@ -372,6 +400,8 @@ function doneFieldsOf(projectPath, client, sessionId = '') {
     doneTitle: done.title || '',
     doneCount: Number.isFinite(count) ? count : files.length,
     doneFiles: files.slice(0, 6).map((f) => ({ name: typeof f === 'string' ? f : (f && f.path) || '' })),
+    // reporter 的 done.cancelled（Interrupt 落的那一枚）：原样透传，不猜、不补
+    doneCancelled: Boolean(done.cancelled),
   };
 }
 
@@ -454,6 +484,8 @@ function refresh({ workspacePath = '', force = false } = {}) {
             doneTitle: s.doneTitle || '',
             doneCount: s.doneCount || 0,
             doneFiles: s.doneFiles || [],
+            // 这一轮是被打断（Interrupt）收掉的 → UI 亮「任务取消」，不亮「任务完成」
+            doneCancelled: Boolean(s.doneCancelled),
             // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
             // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
             inferred: Boolean(s.inferred),
@@ -498,8 +530,12 @@ function refresh({ workspacePath = '', force = false } = {}) {
             reporterMainPhase(wsOfSession, clientOf('kilo', true), s.id) ||
             reporterMainPhase(wsOfSession, clientOf('kilo', false), s.id) ||
             null;
-          // 完成标记同理：插件那份带改动文件清单，轮询那份只有计数
-          const doneTruth = readReporterDone(wsOfSession, clientOf('kilo', true), s.id);
+          // 完成标记同理：插件那份带改动文件清单（还带"被打断"标记），轮询那份只有计数。
+          // 与相位同样两个 client 都试 —— 插件装在 CLI / TUI 上时上报身份是 kilo（不是 kilo-plugin），
+          // 只问后者会把"CLI 装了插件"这条路的完成标记整条漏掉。
+          const doneTruth =
+            readReporterDone(wsOfSession, clientOf('kilo', true), s.id) ||
+            readReporterDone(wsOfSession, clientOf('kilo', false), s.id);
           const donePoll = readKiloDone(s.id, s);
           upsert({
             floor: p.id,
@@ -529,8 +565,9 @@ function refresh({ workspacePath = '', force = false } = {}) {
             // **只有轮询推导才标 inferred**（我们是轮询，不是它主动报的）；
             // 插件上报的是真值，标 true 会让 UI 把上报也灰显掉。
             inferred: !truth,
-            // 完成标记：插件那份带 files 清单（doneTruth），没有才用轮询那份
-            ...(doneTruth && doneTruth.at ? doneTruth : donePoll),
+            // 完成标记：插件那份带 files 清单（还有 cancelled），没有才用轮询那份。
+            // 原始 done 要转成会话行形状，否则 doneAt / doneCancelled 取不到（见 doneFieldsFromReporter）。
+            ...(doneTruth && doneTruth.at ? doneFieldsFromReporter(doneTruth) : donePoll),
             lastEventAt: s.lastEventAt,
           });
         }
@@ -551,6 +588,11 @@ function refresh({ workspacePath = '', force = false } = {}) {
           // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook / kilo 四路完全一致
           if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
           const ph = readOpencodePhase(s.id) || null;
+          // 完成标记：插件那一路写状态文件（带改动文件清单 + "被打断"标记），轮询那一路只有计数。
+          // 两个 client 都试 —— 插件装在 CLI / TUI 上时身份是 opencode（不是 opencode-plugin）。
+          const doneTruth =
+            readReporterDone(s.projectPath || workspacePath, clientOf('opencode', true), s.id) ||
+            readReporterDone(s.projectPath || workspacePath, clientOf('opencode', false), s.id);
           upsert({
             floor: p.id,
             id: s.id,
@@ -578,8 +620,9 @@ function refresh({ workspacePath = '', force = false } = {}) {
             // 模型从会话表取（真实值，取不到留空不猜）
             model: s.model || '',
             inferred: true,
-            // 完成标记：OpenCode 那边等价于"assistant 消息 finish=stop"（见 opencode.js）
-            ...readOpencodeDone(s.id, s),
+            // 完成标记：插件那份（带 cancelled）优先，没有才用轮询那份
+            // （轮询等价于"assistant 消息 finish=stop"，被打断的那轮见 opencode.js 的 idle.outcome）
+            ...(doneTruth && doneTruth.at ? doneFieldsFromReporter(doneTruth) : readOpencodeDone(s.id, s)),
             lastEventAt: s.lastEventAt,
           });
         }
@@ -658,9 +701,58 @@ function refresh({ workspacePath = '', force = false } = {}) {
     }
   }
 
+  // 兜底合成的"取消"标记：去重后补发一次 task/end(cancelled)，把台账里卡在「进行中」的任务收掉。
+  // CodeBuddy IDE 这类不收 Stop / Interrupt 的产品，取消只靠 readReporterDones 的 ≥TASK_RUN_MS
+  // 兜底漏出来，而它原本只写内存标记、从不 notify 服务端 —— 这里补上那一刀。doneScans 在 refresh
+  // 开头已清空、本轮回填完，正好遍历它收集到的 cancels。
+  flushSynthesizedCancels(doneScans, now);
+
   prune(now);
   lastScanAt = now;
   lastSnapshot = null;
+}
+
+/**
+ * 把 readReporterDones 兜底合成的"打断"标记，去重后各发一次 task/end(cancelled)。
+ * 去重键含 taskStartedAt（at），同一轮只要补发一次；新一轮（at 变了）照常再发。
+ * @param {Map<string, {cancels?: Array}>} doneScans
+ * @param {number} now
+ */
+const postedCancels = new Map(); // key -> 过期时间戳（避免进程存活期间反复补发）
+function flushSynthesizedCancels(doneScans, now) {
+  let bus;
+  try {
+    bus = require('./ingest/bus');
+  } catch {
+    return;
+  }
+  for (const scan of doneScans.values()) {
+    for (const c of scan.cancels || []) {
+      const key = `${c.sessionId}|${c.taskId}|${c.workspacePath}|${c.at}`;
+      if (postedCancels.get(key) > now) continue;
+      postedCancels.set(key, now + 10 * 60_000);
+      try {
+        bus.endTask({
+          project: c.workspacePath,
+          memberId: c.client,
+          taskId: c.taskId,
+          state: 'cancelled',
+          model: '',
+          // 取消只是"没干完"，不是"没产出"：这一轮改过的文件与已经吐出来的收尾自述照常带上
+          // （与 reporter 直接上报的取消标记同口径，见 sessions.js readReporterDones 的合成那段）。
+          result: String(c.result || ''),
+          files: Array.isArray(c.files) ? c.files : [],
+          fileCount: Number.isFinite(Number(c.fileCount)) ? Number(c.fileCount) : (Array.isArray(c.files) ? c.files.length : 0),
+          form: c.form || '',
+          sessionId: c.sessionId,
+          ts: c.at,
+        });
+      } catch {
+        /* 补发失败不影响会话表 */
+      }
+    }
+  }
+  for (const [k, v] of postedCancels) if (v <= now) postedCancels.delete(k);
 }
 
 /**
