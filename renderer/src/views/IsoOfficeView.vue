@@ -80,6 +80,8 @@ async function startPhasePoll() {
             instrumented: Boolean(d.instrumented),
             // 这份状态属于哪条会话（hook 是会话级加载的，见 consoleBase 的 sameSession）
             sessionId: d.sessionId || '',
+            // 这份相位的写入时刻：与收尾标记比先后（见下面 consoleLive 那处守卫）
+            phaseTs: Number(d.ts) || 0,
             // 上一轮的完成标记（CLI 楼层靠它亮「任务完成」；Codex 还带收尾自述）
             done: d.done || null,
           };
@@ -450,8 +452,18 @@ watch(
     // CodeBuddy IDE 这类不打断事件的产品，取消后相位仍停在「调用工具」、取消标记靠 ≥TASK_RUN_MS
     // 的兜底才合成 —— 这期间 fastPhase.phase 一直是 tool，必须用"done.cancelled 还在"这道闸护住红色，
     // 否则「任务取消」一闪就被「调用工具」盖回去了（现象正是：取消后状态卡在「调用工具」、任务仍「进行中」）。
-    const fpCancel = Boolean(fastPhase.value && fastPhase.value.done && fastPhase.value.done.cancelled);
-    if ((mainAgent.phase === 'done' || mainAgent.phase === 'cancelled') && (!(fastPhase.value && fastPhase.value.phase) || fpCancel)) return;
+    if (mainAgent.phase === 'done' || mainAgent.phase === 'cancelled') {
+      const fp = fastPhase.value;
+      // 没有实时相位（收尾后 hook 把相位落成 idle）→ 拦住，收尾那一下稳亮
+      if (!fp || !fp.phase) return;
+      // 有实时相位：只有**比收尾标记更新的**才算"用户又发了一轮"（UserPromptSubmit 写的 ts 更晚）。
+      // 收尾/取消之前那一口 stale 的「思考中 / 调用工具」ts 更早 → 一律拦住 —— 这正是
+      // "Claude Code 按停止一个事件都不发、红色「任务取消」刚亮就被 stale 相位顶回去、一直思考中"
+      // 的根因（取消标记来自服务端兜底合成，状态文件里的相位没人清）。
+      // 拿不到相位时间戳的路径（7F/8F 轮询那份不带 ts）退回老行为：允许覆盖。
+      const phaseTs = Number(fp.phaseTs) || 0;
+      if (phaseTs && phaseTs <= doneAt) return;
+    }
     mainAgent.setLiveState(v);
   },
   { immediate: true }

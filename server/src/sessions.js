@@ -1022,6 +1022,9 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     prompt: String(winPrompt || ''),
     // 这条会话在用什么模型（只有 TraeCode 取得到；别的楼层留空）。取不到就是空串，不猜。
     model: String(winModel || ''),
+    // 这份相位的写入时刻：渲染层拿它跟"收尾标记"比先后 —— 只有**比收尾还新**的实时相位
+    // 才算"用户又发了一轮"，取消前那一口 stale 的 thinking / tool 不许把红色「任务取消」盖回去。
+    ts: Number(win.ts) || 0,
     pending: winPending
       ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), cmd: String(winPending.cmd || ''), at: Number(winPending.at) || 0 }
       : null,
@@ -1227,6 +1230,8 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, rp.file && `目标：${rp.file}`].filter(Boolean),
       prompt: rp.prompt || '',
       model: rp.model || '',
+      // 相位写入时刻：渲染层拿它跟收尾标记比先后（见 IsoOfficeView 的 consoleLive 守卫）
+      ts: Number(rp.ts) || 0,
     };
   }
   // 等授权兜底：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
@@ -1251,6 +1256,7 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       context: ['等待用户授权后继续', tool && `工具：${tool}`, file && `目标：${file}`].filter(Boolean),
       prompt: rp.prompt || '',
       model: rp.model || '',
+      ts: Number(rp.ts) || 0,
     };
   }
   if (rp.phase === 'tool') {
@@ -1266,6 +1272,7 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       context: rp.file ? [`目标：${rp.file}`] : [],
       prompt: rp.prompt || '',
       model: rp.model || '',
+      ts: Number(rp.ts) || 0,
     };
   }
   // 其余相位**原样透传**，不要压成 thinking。
@@ -1277,10 +1284,10 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
   // （见 renderer/src/iso/mainConsole.js 的 PHASES），透传即可，不必各自再包一层。
   // 真正**不认识**的相位才落 thinking（兜底，且只对未知值生效）。
   if (rp.phase && rp.phase !== 'await' && rp.phase !== 'tool') {
-    return { phase: rp.phase, action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '' };
+    return { phase: rp.phase, action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '', ts: Number(rp.ts) || 0 };
   }
   // thinking：干净，不堆示意字；但把用户那句话（prompt）一并带出，屏幕第三层顶到最前显示
-  return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '' };
+  return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '', ts: Number(rp.ts) || 0 };
 }
 
 /**
@@ -1416,6 +1423,101 @@ function roundFilesOf(j) {
   return out;
 }
 
+/**
+ * Claude / Qoder 风格 transcript 的**尾部窗口**：这一轮有没有被用户打断、以及打断前最后说了什么。
+ *
+ * 为什么必须由服务端来判：这两家（实测 2026-09-29，4F Claude Code 的 VS Code 扩展形态）
+ * 用户按"停止"后**一个 hook 事件都不发** —— events.log 里 Stop / SessionEnd / Notification
+ * 全无，事件流停在最后一次 PostToolUse，所以 hook 侧的 `turnInterrupted`（跑在 Stop 分支里）
+ * 根本没机会执行。唯一权威的痕迹是 transcript 末尾那条 user 消息
+ * `[Request interrupted by user]`（工具中途打断带 ` for tool use` 后缀）。
+ *
+ * 读法：只读文件**最后 128KB**（标记永远写在末尾，长会话不必整份读），按 mtime+size+sinceTs 缓存，
+ * 同一个文件在标记落盘后只会被解析一次。逐行 `JSON.parse` 按结构判（`type:'user'` 且正文文本
+ * 命中标记），工具结果 / 思考里带同名字符串一律不算。
+ *
+ * @param {string} transcriptPath
+ * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的标记，老一轮的不算
+ * @returns {{interrupted:boolean, said:string, at:number}}
+ */
+const TRANSCRIPT_TAIL_BYTES = 128 * 1024;
+const _claudeTailCache = new Map();
+function claudeInterruptTail(transcriptPath, sinceTs = 0) {
+  const miss = { interrupted: false, said: '', at: 0 };
+  if (!transcriptPath || !isFile(transcriptPath)) return miss;
+  let stat = null;
+  try {
+    stat = fs.statSync(transcriptPath);
+  } catch {
+    return miss;
+  }
+  const cached = _claudeTailCache.get(transcriptPath);
+  if (cached && cached.m === stat.mtimeMs && cached.size === stat.size && cached.sinceTs === sinceTs) {
+    return cached.res;
+  }
+  let raw = '';
+  try {
+    const start = Math.max(0, stat.size - TRANSCRIPT_TAIL_BYTES);
+    const len = stat.size - start;
+    if (len <= 0) return miss;
+    const fd = fs.openSync(transcriptPath, 'r');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      raw = buf.toString('utf8');
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* 关不上也不影响这次读取 */
+      }
+    }
+  } catch {
+    return miss;
+  }
+  let interrupted = false;
+  let said = '';
+  let at = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    // 便宜先行：这一行连关键词、也不是 assistant 正文候选就跳过（尾部第一行多半是被截断的，解析会失败）
+    if (!line || !/interrupted|"role"\s*:\s*"assistant"/.test(line)) continue;
+    let o = null;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!o || typeof o !== 'object') continue;
+    const ts = Date.parse(String(o.timestamp || '')) || 0;
+    if (sinceTs && ts && ts < sinceTs) continue;
+    const msg = o.message && typeof o.message === 'object' ? o.message : null;
+    const content = msg ? msg.content : o.content;
+    const texts =
+      typeof content === 'string'
+        ? [content]
+        : Array.isArray(content)
+          ? content
+              .filter((x) => x && (x.type === 'text' || x.type === 'output_text') && typeof x.text === 'string')
+              .map((x) => x.text)
+          : [];
+    if (!texts.length) continue;
+    // 打断标记：一条 user 消息，正文（text part，不是 tool_result）就是 [Request interrupted by user]
+    if (o.type === 'user' && texts.some((t) => /^\s*\[?request interrupted by user/i.test(String(t)))) {
+      interrupted = true;
+      if (ts) at = Math.max(at, ts);
+      continue;
+    }
+    const role = String((msg && msg.role) || o.role || '');
+    if (role === 'assistant') {
+      const txt = texts.join('\n').trim();
+      if (txt) said = txt; // 取最后一段（覆盖前面的）
+    }
+  }
+  const res = { interrupted, said, at };
+  _claudeTailCache.set(transcriptPath, { m: stat.mtimeMs, size: stat.size, sinceTs, res });
+  return res;
+}
+
 function lastCraftRun(transcriptPath) {
   if (!transcriptPath || !isFile(transcriptPath)) return { state: null, said: '' };
   try {
@@ -1479,6 +1581,44 @@ function readReporterDones(workspacePath, client = '') {
     // state: "complete"（正常收尾）/ "running"（被打断）。任务槽卡死（很久没 hook 事件）
     // 且末轮 state 是 "running" → 这一轮是被打断的，合成取消标记亮红色「任务取消」。
     if (j.taskId) {
+      const startedAtJ = Number(j.taskStartedAt) || 0;
+      /* Claude Code / Qoder（4F / 6F，CLI 与 IDE 扩展都一样）：用户按"停止"后**一个 hook
+         事件都不发** —— 实测 2026-09-29 的 4F：events.log 里 Stop / SessionEnd / Notification
+         全无，事件流停在最后一次 PostToolUse。hook 侧那条 `turnInterrupted` 跑在 Stop 分支里，
+         没事件就永远执行不到，于是控制台一直停在「思考中」、也永远不亮红色「任务取消」。
+         只能由服务端在轮询时读 transcript 尾部找 `[Request interrupted by user]` 那一条，
+         自己合成取消标记（与下面 CodeBuddy IDE 的兜底同一条路，只是信号不同：
+         那边看 transcript 末轮的 state，这边看末尾那条 user 消息）。
+         **不设 TASK_RUN_MS 门槛**：标记一落盘就该亮（服务端 5~10s 扫一轮 + 前端 1.5s 快轮询，
+         足够"准实时"）；同一轮靠 (会话, 任务, at) 去重，只补发一次。 */
+      const base = clientBase(j.client);
+      if (base === 'claude' || base === 'qoder') {
+        const ci = claudeInterruptTail(j.transcriptPath, startedAtJ);
+        if (ci.interrupted) {
+          const filesC = roundFilesOf(j);
+          const saidC = String(ci.said || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+          const atC = ci.at || Number(j.sessionPhase && j.sessionPhase.ts) || startedAtJ || now;
+          const cancelC = {
+            at: atC, title: j.taskTitle || '', workspacePath: ws,
+            sessionId: id, cancelled: true, files: filesC.slice(0, 8), fileCount: filesC.length, said: saidC,
+          };
+          const prevC = id ? bySession.get(id) : null;
+          if (id && (!prevC || Number(cancelC.at) > Number(prevC.at))) bySession.set(id, cancelC);
+          if (!latest || Number(cancelC.at) > Number(latest.at)) latest = cancelC;
+          cancels.push({
+            sessionId: id,
+            taskId: j.taskId,
+            client: j.client,
+            workspacePath: ws,
+            at: atC,
+            title: j.taskTitle || '',
+            form: j.form || '',
+            files: filesC,
+            fileCount: filesC.length,
+            result: String(ci.said || '').trim().slice(0, 4_000),
+          });
+        }
+      }
       const lastAt = Math.max(Number(j.taskStartedAt) || 0, Number(j.sessionPhase && j.sessionPhase.ts) || 0);
       if (lastAt && now - lastAt > TASK_RUN_MS) {
         const run = lastCraftRun(j.transcriptPath);

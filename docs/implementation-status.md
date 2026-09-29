@@ -174,9 +174,9 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | 1F | CodeBuddy（CLI + Plugin） | ① CLI 走 `Interrupt`（有则用）/ Stop payload 的 `final_stop_reason ∈ cancelled/interrupted`；② **IDE（Plugin）不发 Stop / Interrupt**，由服务端兜底合成：状态文件 `taskId` 一直占着 + 空闲超 `TASK_RUN_MS` + transcript 末轮 `state='running'` → 合成取消标记，并补发一次 `task/end(cancelled)` | `hook.js`（`--agent codebuddy`）+ `sessions.js` 的 `readReporterDones.cancels` / `sessionRegistry` 的 `flushSynthesizedCancels`，回归 `test:codebuddy-cancel` |
 | 2F | WorkBuddy | 同 1F 家族（同一条 hook，`--agent workbuddy`） | `hook.js` |
 | 3F | Codex | ① 显式 `Interrupt` 事件；② 交互式会话常**不发** `Interrupt`，Stop 时读 rollout 里的 `event_msg/turn_aborted`（reason=interrupted）兜底 | `hook.js` 的 `runInterrupted`/`turnInterrupted`，回归 `test:stop-interrupt` |
-| 4F | Claude Code | Claude 不发 `Interrupt`；Stop 时读 transcript 里的 `[Request interrupted by user]`（工具中途打断带 ` for tool use` 后缀） | `hook.js` 的 `turnInterrupted`，回归 `test:stop-interrupt` |
+| 4F | Claude Code | Claude 不发 `Interrupt`，且实测（2026-09-29，VS Code 扩展形态）按"停止"后**一个 hook 事件都不发**（Stop / SessionEnd / Notification 全无）→ hook 侧够不着，改由**服务端轮询**读 transcript 尾部那条 `[Request interrupted by user]`（工具中途打断带 ` for tool use`）合成取消；CLI 形态若发了 Stop，hook 侧 `turnInterrupted` 也会认 | `sessions.js` 的 `claudeInterruptTail`（+ `hook.js` 的 `turnInterrupted`），回归 `test:claude-cancel` / `test:stop-interrupt` |
 | 5F | TraeCode | **没有可读的取消信号**（无 transcript 可写、hook 只到 Stop/SessionEnd）→ 不亮「任务取消」，收尾仍按「任务完成」 | —— |
-| 6F | Qoder | 与 4F 同款（Claude 转写格式）：Stop 时读 transcript 的打断标记 —— Qoder 目前只发粗粒度事件，实际多半拿不到 | `hook.js` 的 `turnInterrupted` |
+| 6F | Qoder | 与 4F 同款（Claude 转写格式）：服务端轮询读 transcript 尾部的打断标记（按 `claude` / `qoder` 两个 client 基名一起认）—— Qoder 目前只发粗粒度事件，实际多半拿不到 | `sessions.js` 的 `claudeInterruptTail` |
 | 7F | Kilo Code | ① 装了插件：`session.idle` 时若这一轮还开着 → 落一枚 `done.cancelled`（与 hook.js 的 `Interrupt` 同形）+ 台账 `task/end(state=cancelled)`；② 纯轮询这一路读不出打断（`message.finish` 没有 interrupted）→ 不臆造 | `packages/reporter/src/plugin/index.js` 的 `session.idle` 分支 |
 | 8F | OpenCode | ① 插件那一路同 7F（`session.idle`）；② 轮询那一路按 `session_message` 的 `type='idle'` / `data.outcome='interrupted'` 判取消 | `plugin/index.js`、`server/src/opencode.js` 的 `readOpencodeDone` |
 | 9F | GitHub Copilot | **没有可读的取消信号**（没有 hook，会话日志里没有"被打断"字段）→ 不亮「任务取消」 | —— |
@@ -205,6 +205,13 @@ Codex 的 `event_msg/turn_aborted` 事件行与 Claude 家族 `user` 消息里�
 `done` 是「任务完成 / 任务取消」唯一的凭据，抹掉之后标记与控制台实时状态一起消失。现在
 idle_prompt 只撤 `await` / `pending` 并把相位清掉，`done` 原样保留（新的 `UserPromptSubmit`
 仍照常把它清掉）。回归见 `npm run test:stop-interrupt` 的 [1]/[5]。
+
+**收尾守卫按"相位比收尾标记新不新"判，而不是"有没有实时相位"**（`IsoOfficeView.vue` 的
+consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"服务端兜底合成的取消 +
+状态文件里没人清的 stale 相位"的组合下，`fastPhase.phase` 一直是「思考中」，旧判据
+（`!fastPhase.phase` 才拦）形同虚设 —— 红色「任务取消」刚亮就被顶回「思考中」，看起来就是
+"取消看不见、一直思考中"。现在只有**相位 ts 晚于收尾标记**（= 用户又发了一轮，UserPromptSubmit
+写的新相位）才允许覆盖收尾；拿不到 ts 的路径（7F/8F 轮询）退回老行为。
 
 **取消照「任务完成」一样记录：取消只是"没干完"，不是"没产出"。** 被打断的那一轮
 已经吐出来的文字（`task_runs.result` + 对话记录 `type=result`）与改过的文件
