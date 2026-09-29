@@ -127,6 +127,19 @@ function filesOf(task) {
 }
 
 /**
+ * 这一轮用过的工具（名字 + 次数）。服务端按 tool_usage 表聚合好随任务行下发
+ * （见 server/src/http/routes/query.js 的 /task-runs）；没有记录就是空数组，
+ * 详情里那一段整块不显示 —— 前端不折算、不编造。
+ */
+function toolsOf(task) {
+  const a = task && task.tools;
+  if (!Array.isArray(a)) return [];
+  return a
+    .filter((x) => x && x.tool)
+    .map((x) => ({ tool: String(x.tool), count: Number(x.count) || 0 }));
+}
+
+/**
  * 任务标题里的"用户原话"。
  *
  * 老数据（hook 修掉之前）把 IDE 注入的那段上下文整段当标题存了下来 ——
@@ -539,6 +552,17 @@ async function saveRetention() {
             </template>
           </div>
 
+          <!-- 工具使用：这一轮每个工具用了几次（上报方逐次 +1，见 server/src/ingest/bus.js 的 toolUse） -->
+          <div v-if="toolsOf(tasks.selectedTask).length" class="tools">
+            <div class="files-head">工具使用</div>
+            <ul class="tool-list">
+              <li v-for="(t, i) in toolsOf(tasks.selectedTask)" :key="'tool' + i" class="tool-item">
+                <span class="tool-name">{{ t.tool }}</span>
+                <span class="tool-count">{{ t.count }} 次</span>
+              </li>
+            </ul>
+          </div>
+
           <div class="result-block">
             <div class="files-head">产出摘要</div>
             <p class="result">{{ tasks.selectedTask.result || '（无）' }}</p>
@@ -942,6 +966,22 @@ async function saveRetention() {
 .files li { font-size: 12px; color: var(--text-dim); font-family: var(--mono); display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .files li .fp { word-break: break-all; }
 .files li .sz { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+/* 工具使用：名字在左、次数在右（次数等宽数字，一列对齐好扫） */
+.tools { margin-top: 12px; }
+.tool-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.tool-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  padding: 2px 0;
+}
+.tool-item .tool-name { word-break: break-all; }
+.tool-item .tool-count { color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .result-block { margin-top: 12px; }
 .result { margin: 0; font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }

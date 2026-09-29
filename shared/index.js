@@ -88,6 +88,8 @@ const HTTP_ROUTES = Object.freeze({
   STATUS: '/api/v1/status',
   MESSAGE: '/api/v1/message',
   FILE_TOUCH: '/api/v1/file/touch',
+  // 工具使用计数：一轮任务里某个工具又用了一次（任务详情的「工具使用」）
+  TOOL_USE: '/api/v1/tool/use',
 });
 
 const ERROR_CODES = Object.freeze({

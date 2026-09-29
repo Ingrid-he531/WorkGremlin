@@ -158,6 +158,12 @@ function createQueryRouter({ bus, repo }) {
       ...r,
       duration_ms: r.ended_at && r.started_at ? r.ended_at - r.started_at : null,
       subagentCount: repo.countSubagentRuns.get(r.id).c,
+      /**
+       * 这一轮用过的工具 + 次数（任务详情里的「工具使用」）。
+       * 真源是 tool_usage 表（上报方每调用一次工具 +1，见 bus.toolUse）；没有记录就是空数组，
+       * 任务详情那一段整块不显示 —— 绝不拿"文件活动"之类的旁证折算成工具次数。
+       */
+      tools: repo.listTaskTools.all(r.id).map((x) => ({ tool: x.tool, count: Number(x.count) || 0 })),
     }));
     return res.json({ ok: true, items });
   });

@@ -71,6 +71,9 @@ function createIngestRouter({ bus }) {
 
   router.post('/file/touch', projectFirst((b) => (b.memberId ? bus.fileTouch(b) : { ok: false, error: 'missing memberId' })));
 
+  // 工具使用：一轮任务里某个工具又用了一次（任务详情的「工具使用」按 (taskId, tool) 累加）
+  router.post('/tool/use', projectFirst((b) => (b.memberId ? bus.toolUse(b) : { ok: false, error: 'missing memberId' })));
+
   return router;
 }
 

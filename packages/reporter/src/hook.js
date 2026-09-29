@@ -1797,6 +1797,21 @@ async function main() {
           trace('ghost+', { agent: AGENT, tool, name: nm, id, gen: ev.generation_id || '', agentId: ev.agent_id || '' });
         }
       }
+      /* 工具使用计数（任务记录 → 任务详情的「工具使用」）：PreToolUse 就是"这支工具被调用了"
+         最可靠的信号（Read/Grep/Bash 这些压根不发 PostToolUse，放那边会漏一大半）。
+         只按 (任务, 工具) 累加次数，不记参数 / 不记结果；拿不到 taskId（老状态文件、上报丢过）
+         就**不报** —— 没任务的计数无处可挂，绝不瞎归因到别的任务上。 */
+      const toolTaskId = String(readState(file).taskId || '');
+      if (tool && toolTaskId) {
+        await request(info, HTTP_ROUTES.TOOL_USE, {
+          ...base,
+          memberId: AGENT,
+          taskId: toolTaskId,
+          tool,
+          sessionId: String((ev && ev.session_id) || SESSION || ''),
+          client: cl,
+        });
+      }
       await status('busy');
     } else {
       const touched = filesOf(ev.tool_input, ev.tool_name)

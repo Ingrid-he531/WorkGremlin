@@ -51,11 +51,14 @@ function head(t) {
 
 let taskSeq = 0;
 const ends = [];
+/** /tool/use 收到的上报（工具使用计数） */
+const toolUses = [];
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     if (req.url === '/api/v1/task/end') ends.push(JSON.parse(body || '{}'));
+    if (req.url === '/api/v1/tool/use') toolUses.push(JSON.parse(body || '{}'));
     const out = req.url === '/api/v1/task/start'
       ? { ok: true, taskId: `t_${++taskSeq}`, project: 'WorkGremlin', workspacePath: WS }
       : { ok: true, project: 'WorkGremlin', workspacePath: WS, taskId: null, title: '' };
@@ -231,6 +234,21 @@ async function main() {
     Boolean(after && after.sessionPhase && String(after.sessionPhase.phase) === 'idle'),
     after && JSON.stringify(after.sessionPhase)
   );
+
+  /* [6] 工具使用：PreToolUse 逐次上报（任务详情「工具使用」靠它累加） */
+  head('[6] 工具使用：PreToolUse 按 (任务, 工具) 上报，任务详情那边才能算出"用了哪些工具、各几次"');
+  const toolSid = 'claude-tools-1';
+  await runHook('claude', { hook_event_name: 'UserPromptSubmit', session_id: toolSid, cwd: WS, prompt: '跑点东西' });
+  const toolTaskId = String((stateOf(toolSid) || {}).taskId || '');
+  await runHook('claude', { hook_event_name: 'PreToolUse', session_id: toolSid, cwd: WS, tool_name: 'Bash', tool_input: { command: 'ls' } });
+  await runHook('claude', { hook_event_name: 'PreToolUse', session_id: toolSid, cwd: WS, tool_name: 'Bash', tool_input: { command: 'pwd' } });
+  await runHook('claude', { hook_event_name: 'PreToolUse', session_id: toolSid, cwd: WS, tool_name: 'Read', tool_input: { file_path: 'a.js' } });
+  ok(
+    '两次 Bash + 一次 Read 都上报了',
+    JSON.stringify(toolUses.map((u) => u.tool)) === JSON.stringify(['Bash', 'Bash', 'Read']),
+    JSON.stringify(toolUses)
+  );
+  ok('都挂在当前这一轮任务上（带 taskId）', toolUses.length === 3 && toolUses.every((u) => u.taskId === toolTaskId), JSON.stringify(toolUses));
 
   server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

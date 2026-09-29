@@ -348,6 +348,12 @@ function createIngestPlugin(options, { location } = {}) {
    * `finish=stop` 消息跟在后面，别让它把红色「任务取消」盖成绿色「任务完成」（同 hook.js 的 justCancelled）。
    */
   const cancelledAt = new Map()
+  /**
+   * 已经计过一次「工具使用」的工具调用 id（Kilo / OpenCode 的 `part.callID`）。
+   * 工具的 part 会反复更新（pending → running → completed），每一条都算一次的话次数会成倍虚高；
+   * 同一个 callID 只记一次。攒到一定量整批清掉 —— 它只是"本进程见过的调用"，不需要长留。
+   */
+  let toolCallSeen = new Set()
   /** 成员注册只需一次（同一 client 在一个 WorkGremlin 生命周期里是同一只小怪物） */
   let registered = false
   const ingest = createIngest(client)
@@ -722,6 +728,27 @@ function createIngestPlugin(options, { location } = {}) {
           const status = String((part.state && part.state.status) || "")
           const input = (part.state && part.state.input) || {}
           const target = fileOf(input)
+          /* 工具使用计数（任务详情「工具使用」）：同一个 callID 只记一次
+             （part 会反复更新 pending/running/completed，逐条记就成倍虚高）。
+             pending 不算"用过"（还没放行），其余状态都算"调过它了"。 */
+          const callId = String(part.callID || part.id || "")
+          if (sid && callId && status && status !== "pending" && !toolCallSeen.has(callId)) {
+            toolCallSeen.add(callId)
+            // 只当"本进程见过的调用"用，攒太多就丢掉重来（同一支工具的下一次调用照样会记）
+            if (toolCallSeen.size > 500) toolCallSeen = new Set([callId])
+            const toolName = String(part.tool || "")
+            const taskId = taskIds.get(sid) || ""
+            if (toolName && taskId) {
+              ingest.post("/tool/use", {
+                memberId: client,
+                taskId,
+                tool: toolName,
+                sessionId: sid,
+                client,
+                form: client.endsWith("-plugin") ? "plugin" : "cli",
+              })
+            }
+          }
           // 台账：只报**写类**工具（读类不报 —— 读了不留改动痕迹，报上去只是噪声）
           if (sid && opOfTool(part.tool) === "write" && status !== "pending") touchFile(sid, target)
           // 召唤 subagent（task 工具）时飘一只小幽灵

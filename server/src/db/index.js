@@ -478,6 +478,23 @@ function createRepo(db) {
       )
     `),
 
+    /* ---- 工具使用（任务详情里的「工具使用：工具名 + 次数」）---- */
+    /** 某工具在这一轮任务里 +1 次（按 (task_id, tool) UPSERT 累加，见 schema.sql 的说明） */
+    bumpToolUsage: db.prepare(`
+      INSERT INTO tool_usage (task_id, tool, project_id, member_id, client, session_id, count, first_at, last_at)
+      VALUES (@taskId, @tool, @projectId, @memberId, @client, @sessionId, 1, @ts, @ts)
+      ON CONFLICT(task_id, tool) DO UPDATE SET
+        count      = tool_usage.count + 1,
+        last_at    = excluded.last_at,
+        member_id  = COALESCE(excluded.member_id, tool_usage.member_id),
+        client     = COALESCE(excluded.client, tool_usage.client),
+        session_id = COALESCE(excluded.session_id, tool_usage.session_id)
+    `),
+    /** 一轮任务的工具使用清单：次数多的在前 */
+    listTaskTools: db.prepare(`
+      SELECT tool, count, last_at FROM tool_usage WHERE task_id = ? ORDER BY count DESC, tool ASC
+    `),
+
     insertArtifact: db.prepare(`
       INSERT INTO artifacts (member_id, task_id, kind, title, path, ts_ms) VALUES (?, ?, ?, ?, ?, ?)
     `),
@@ -547,6 +564,7 @@ function createRepo(db) {
     deleteSubagentRunsByParent: db.prepare(`DELETE FROM subagent_runs WHERE parent_task_id IN (SELECT value FROM json_each(?))`),
     deleteMessagesByTask: db.prepare(`DELETE FROM messages WHERE task_id IN (SELECT value FROM json_each(?))`),
     deleteArtifactsByTask: db.prepare(`DELETE FROM artifacts WHERE task_id IN (SELECT value FROM json_each(?))`),
+    deleteToolUsageByTask: db.prepare(`DELETE FROM tool_usage WHERE task_id IN (SELECT value FROM json_each(?))`),
     /**
      * 顶层任务 id 选择器：复用任务记录页的一级检索（工程 + 楼层），可选"早于某时刻"（保留最近 N 天）。
      * @client 是 ",a,b," 形式的 client 集合（合并楼层 1F CodeBuddy = CLI + Plugin 两个 client），
@@ -670,6 +688,7 @@ function createRepo(db) {
       db.prepare('DELETE FROM messages WHERE project_id = ?').run(id);
       db.prepare('DELETE FROM tasks WHERE project_id = ?').run(id);
       db.prepare('DELETE FROM file_activity WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
+      db.prepare('DELETE FROM tool_usage WHERE project_id = ?').run(id);
       db.prepare('DELETE FROM artifacts WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
       db.prepare('DELETE FROM agent_status WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
       db.prepare('DELETE FROM agent_status_history WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(
@@ -729,6 +748,7 @@ function createRepo(db) {
     const tx = db.transaction(() => {
       stmt.deleteMessagesByTask.run(allJson);
       stmt.deleteArtifactsByTask.run(allJson);
+      stmt.deleteToolUsageByTask.run(allJson);
       stmt.deleteSubagentRunsByParent.run(topJson);
       stmt.deleteTaskRunsById.run(topJson);
       stmt.deleteTasksById.run(allJson);

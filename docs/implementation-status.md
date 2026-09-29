@@ -118,6 +118,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | `messages` | `dedupe_key` 唯一、`archived_at`、`content_truncated` | **无** `redacted` / `redaction_hits` / `ingested_at_ms` / `reply_to` |
 | `messages_fts` | FTS5 `tokenize='trigram'` + 三个同步触发器 | 表已建，但**查询未使用**（见 §5） |
 | `file_activity` | `op` CHECK 仅 `('read','write')` | 缺 `edit` |
+| `tool_usage` | `task_id` + `tool` 主键、`count`、`first_at` / `last_at` | **新表**（任务详情「工具使用」）：按 `(任务, 工具)` 累加次数，不给每次调用落一行。上报见 `POST /api/v1/tool/use`（hook 的 PreToolUse / 插件的 tool part 各报一条，插件按 `callID` 去重、`pending` 不算）；`/task-runs` 每行带 `tools: [{tool,count}]`，删除任务时随 `deleteByTopIds` 一起清 |
 | `artifacts` / `events` | 产出与审计 | `events` 表已建但**无写入方** |
 
 ---

@@ -223,6 +223,14 @@ await fire(part({ id: 'prt_4', type: 'tool', tool: 'read', callID: 'c0', state: 
   const before = seen.filter((s) => s.route === '/api/v1/file/touch').length;
   ok('读类工具不报 file/touch（读了不留改动痕迹）', before === 1, `file/touch 共 ${before} 次`);
 }
+// 工具使用（任务详情「工具使用」）：同一个 callID 只记一次 —— 上面 c1 被 pending / running
+// 更新过两次、c0 一次，都不该重复计数，pending 那次也不算"用过"。
+{
+  const uses = seen.filter((s) => s.route === '/api/v1/tool/use').map((s) => s.body);
+  ok('工具使用上报：write(running) ×1 + read(completed) ×1', uses.length === 2, JSON.stringify(uses));
+  ok('带工具名与当前任务 id', uses.every((u) => u.tool && u.taskId), JSON.stringify(uses));
+  ok('pending 那一笔不算（还没放行）', !uses.some((u) => u.tool === 'write' && !u.taskId), JSON.stringify(uses));
+}
 await fire(part({ id: 'prt_5', type: 'tool', tool: 'task', callID: 'c2', state: { status: 'running', input: { subagent_type: 'leo', description: '顺手看一眼' } } }));
 {
   const g = readFeed().agents.find((a) => a.id === 'c2');

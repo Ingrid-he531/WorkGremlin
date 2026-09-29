@@ -17,6 +17,7 @@ const express = require('express');
 const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
+const { createIngestRouter } = require('../src/http/routes/ingest');
 
 let pass = 0;
 let fail = 0;
@@ -82,6 +83,8 @@ seedTask('t-old', null, 500); // 老数据：没有形态
 /* ------------------------------ 真路由 ------------------------------ */
 const app = express();
 app.use('/api/v1', createQueryRouter({ bus, repo }));
+// 上报接口也挂上：工具使用（/tool/use）走的就是它，这里连 HTTP 那一段一起验
+app.use('/api/v1', createIngestRouter({ bus }));
 
 (async () => {
   const server = app.listen(0, '127.0.0.1');
@@ -113,6 +116,32 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   console.log('[3] 楼层筛选照常（合并楼层的逗号集合）');
   const filtered = await get('limit=50&client=codex');
   ok('client=codex 取到 3 条', (filtered.body.items || []).length === 3, JSON.stringify((filtered.body.items || []).map((t) => t.id)));
+
+  console.log('[4] 工具使用：POST /tool/use 逐次累加 → /task-runs 每行带 tools（名字 + 次数）');
+  const post = async (p, body) => {
+    const res = await fetch(`${base}${p}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ project: 'p1', memberId: 'codex@p1', ...body }),
+    });
+    return res.status;
+  };
+  // 一轮里：Bash 调了 3 次、Edit 调了 2 次（上报方每调用一次报一条，服务端按 (任务,工具) 累加）
+  for (let i = 0; i < 3; i += 1) await post('/tool/use', { taskId: 't-cli', tool: 'Bash', sessionId: 's-t-cli', client: 'codex' });
+  for (let i = 0; i < 2; i += 1) await post('/tool/use', { taskId: 't-cli', tool: 'Edit', sessionId: 's-t-cli', client: 'codex' });
+  // 拿不到 taskId / 拿不到工具名 → 不记（没任务的计数无处可挂，绝不瞎归因）
+  await post('/tool/use', { tool: 'Bash' });
+  await post('/tool/use', { taskId: 't-cli', tool: '' });
+
+  const withTools = await get('limit=50');
+  const cli = (withTools.body.items || []).find((t) => t.id === 't-cli') || {};
+  ok(
+    't-cli.tools 累加正确（Bash 3 / Edit 2，次数多的在前）',
+    JSON.stringify(cli.tools) === JSON.stringify([{ tool: 'Bash', count: 3 }, { tool: 'Edit', count: 2 }]),
+    JSON.stringify(cli.tools)
+  );
+  const plugin = (withTools.body.items || []).find((t) => t.id === 't-plugin') || {};
+  ok('没用过工具的任务 → tools 是空数组（详情那段整块不显示）', Array.isArray(plugin.tools) && plugin.tools.length === 0, JSON.stringify(plugin.tools));
 
   server.close();
   close();

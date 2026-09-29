@@ -717,6 +717,39 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     return { ok: true };
   }
 
+  /**
+   * 这一轮任务里某个工具用了一次（任务详情里的「工具使用」）。
+   *
+   * 上报方（hook / 插件）每调用一次工具报一条，这里按 `(task_id, tool)` 累加计数 ——
+   * 不给每次调用落一行（一轮里 Bash 能跑上百次，逐行落盘只会把库撑大）。
+   *
+   * 三条纪律：
+   *   1) **没有 taskId 就不记**：任务详情是按任务看的，把"没任务的调用"挂到别人的
+   *      任务头上属于编造归因；宁可少记。
+   *   2) 没有工具名也不记（老版本 payload / 手工脚本）—— 一个空名计数没有意义。
+   *   3) 幂等由上报方负责（同一支工具调一次报一次）；服务端只管累加，不猜、不折算。
+   * @param {{project:string, memberId:string, taskId?:string, tool?:string, sessionId?:string, client?:string, ts?:number}} p
+   */
+  function toolUse(p) {
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    const taskId = String(p.taskId || '').trim();
+    const tool = String(p.tool || '').trim();
+    if (!taskId || !tool) return { ok: true, skipped: true };
+    const ts = Number(p.ts) || now();
+    repo.bumpToolUsage.run({
+      taskId,
+      tool,
+      projectId: project,
+      memberId: member.id,
+      client: member.client || normClient(p.client) || null,
+      sessionId: p.sessionId ? String(p.sessionId) : null,
+      ts,
+    });
+    return { ok: true };
+  }
+
   /** @param {any} row */
   function toMessage(row) {
     return {
@@ -1001,6 +1034,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     endTask,
     recordMessage,
     fileTouch,
+    toolUse,
     buildMemberCard,
     buildSnapshot,
     listProjectSummaries,

@@ -137,6 +137,26 @@ CREATE TABLE IF NOT EXISTS file_activity (
 );
 CREATE INDEX IF NOT EXISTS idx_files_member_ts ON file_activity(member_id, ts_ms DESC);
 
+-- 一轮用户任务里**每个工具用了几次**（任务记录 → 任务详情的「工具使用」）。
+-- 形状是"按 (task_id, tool) 累加一行"，不是每次调用落一行：一轮里 Bash 能跑上百次，
+-- 逐次落盘只会把库撑大、查的时候还得 GROUP BY。计数由上报方逐次 +1（见 bus.toolUse）。
+-- task_id 就是 tasks.id / task_runs.id（那一轮用户任务）；拿不到任务 id 的调用不记
+-- （任务详情是按任务看的，没任务的记录无处可挂 —— 不瞎归因到别的任务上）。
+CREATE TABLE IF NOT EXISTS tool_usage (
+  task_id    TEXT NOT NULL,
+  tool       TEXT NOT NULL,
+  project_id TEXT,
+  member_id  TEXT,
+  client     TEXT,
+  session_id TEXT,
+  count      INTEGER NOT NULL DEFAULT 0,
+  first_at   INTEGER,
+  last_at    INTEGER,
+  PRIMARY KEY (task_id, tool)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_task ON tool_usage(task_id);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_project ON tool_usage(project_id, last_at DESC);
+
 CREATE TABLE IF NOT EXISTS artifacts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   member_id  TEXT NOT NULL,
