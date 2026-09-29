@@ -3,7 +3,7 @@
  * DeskScene —— 单个"真实工位"（2.5D 斜俯视）。
  *
  * 图层自后向前：地毯 → 隔断挡板 → 座椅 → 精灵 → 桌面 → 桌上物件（键盘/鼠标/马克杯/台灯/绿植）
- *              → 显示器（屏幕为 HTML 叠层，显示真实任务/进度/文件）→ 桌牌。
+ *              → 显示器（屏幕为 HTML 叠层，显示真实任务/文件）→ 桌牌。
  *
  * 之所以拆成 bg / fg 两层 SVG：精灵是 HTML 组件（AgentAvatar），
  * 必须夹在"椅子"和"桌子"之间，才能做出"坐在桌后、手搭在桌上"的层次。
@@ -28,10 +28,11 @@ const skin = computed(() => avatarOf(props.member.memberId));
 const state = computed(() => props.member.state);
 
 const title = computed(() => (props.member.task ? props.member.task.title : '空闲 / 无进行中任务'));
-const pct = computed(() => {
-  const p = props.member.task && props.member.task.progress;
-  return Number.isFinite(p) ? Math.max(0, Math.min(1, p)) * 100 : 0;
-});
+// 屏幕上那条走条是**不确定**的（只在干活时爬，不表示完成度）——2026-09-29 之前它按
+// member.task.progress 画长度，但那个字段没有真值（全库只有 0 和 1，开工写 0、收工写 1，
+// 中间没人推进；详见 TaskRecordsView 里「进度」那一行的说明），画出来永远是空条或满条。
+// 所以这里只判断"在不在干活"，取值与主控制台一致（见 iso/mainConsole.js 的 PHASES.busy）。
+const running = computed(() => state.value === 'busy' || state.value === 'thinking');
 const fileText = computed(() =>
   props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : '未上报文件'
 );
@@ -149,7 +150,9 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
           <span class="scr-dot" />
           <span class="scr-title">{{ title }}</span>
         </div>
-        <div class="scr-bar"><i :style="{ width: `${pct}%` }" /></div>
+        <!-- 走条：不确定动画（轨道常显，光带只在干活时爬）。周期 1800ms 与主控制台一致，
+             见 iso/mainConsole.js 里 ph.busy 那一段。 -->
+        <div class="scr-bar"><i v-if="running" /></div>
         <div class="scr-file mono">{{ fileText }}</div>
         <div v-if="state === 'blocked'" class="scr-alert">需要协助</div>
       </div>
@@ -157,7 +160,9 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
       <!-- 悬停/选中时的详情卡（小屏看不全，用这个补全信息） -->
       <div class="peek">
         <div class="peek-title">{{ title }}</div>
-        <div class="peek-row dim">进度 {{ Math.round(pct) }}% · 已耗时 {{ elapsed }}</div>
+        <!-- 「进度 x%」已去掉（2026-09-29）：那个百分比是假的，只有 0% 和 100% 两种取值。
+             已耗时是真数据（stateSince），留着。 -->
+        <div class="peek-row dim">已耗时 {{ elapsed }}</div>
         <div v-if="member.currentFiles.length" class="peek-row mono">{{ member.currentFiles.join(' , ') }}</div>
       </div>
     </div>
@@ -416,11 +421,14 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   background: rgba(255, 255, 255, 0.12);
   overflow: hidden;
 }
+/* 不确定走条：光带固定占轨道 30%，从左滑到右循环（不表示完成度，表示"正在跑"）。
+   翻译量按光带自身宽度算：-100% = 完全滑出左边，333% ≒ 完全滑出右边（30% × 3.33 ≈ 100%）。 */
 .scr-bar i {
   display: block;
   height: 100%;
+  width: 30%;
   background: var(--accent);
-  transition: width 0.4s ease;
+  animation: scr-crawl 1.8s linear infinite;
 }
 .scr-file {
   font-size: 6px;
@@ -633,6 +641,15 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
     opacity: 0.18;
   }
 }
+/* 屏幕上那条走条：从左爬到右，1.8s 一圈（与主控制台 mainConsole 同周期） */
+@keyframes scr-crawl {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(333%);
+  }
+}
 @keyframes led-blink {
   0%,
   49% {
@@ -699,6 +716,12 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   .desk-scene {
     animation: none !important;
     transition: none !important;
+  }
+
+  /* 不确定走条是靠"动"表达"在跑"的：关掉动画它就只剩一段固定长度的光带，会被读成
+     “进度 30%”，等于又造了个假进度。所以这里直接不画光带，只留空轨道。 */
+  .scr-bar i {
+    display: none;
   }
 }
 </style>

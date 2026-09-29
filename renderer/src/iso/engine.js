@@ -559,7 +559,6 @@ export function createIsoOffice(canvas, opts = {}) {
       // 首次建出来时可能还没有（会画成灰牌），后续收到必须更新，否则永远是灰的。
       a.name = m.name || a.name;
       a.level = m.level || null;
-      a.taskProgress = Number.isFinite(m.taskProgress) ? m.taskProgress : 0;
       seatPos[m.memberId] = DESK_UNITS[i].seat;
       const nm = m.name || String(m.memberId).split('@')[0];
       if (nm) byName[nm] = { seat: DESK_UNITS[i].seat, agentId: m.memberId };
@@ -939,8 +938,14 @@ export function createIsoOffice(canvas, opts = {}) {
    * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，屏上是**打字动画**
    * （字符一个个蹦出来 + 光标闪 + 写满清屏重来，见 drawTyping），不再画那些白色短横/白点。
    * 全部用 seed 做确定性伪随机，不能 Math.random，否则每帧闪成迪厅。
+   *
+   * 底部那条走条**不接 task.progress**（2026-09-29 去掉）：那个字段没有真值 —— 开工写 0、
+   * 收工写 1，中间没人推进（本机库 489 条任务全落在 {0,1}，见 TaskRecordsView 里那一行
+   * 「进度」的注释）。按它画就是"空条"或"满条"，等于报告一个不存在的进度。改成**不确定走条**
+   * （与主控制台 mainConsole 的底部条同一口径、同一个 1800ms 周期）：只表达"这台机器在干活"，
+   * 不声称干到哪儿了。
    */
-  function drawScreen(c, m, color, progress, seed, on, now = 0) {
+  function drawScreen(c, m, color, seed, on, now = 0) {
     const face = m.y + m.d;
     const z0 = m.z + 0.08;
     const z1 = m.z + m.h - 0.1;
@@ -980,12 +985,15 @@ export function createIsoOffice(canvas, opts = {}) {
     wallQuad(c, 'y', face + 0.001, x1 - 0.12, x1 - 0.07, z1 - 0.05, z1 - 0.01, color);
     // 屏上正在打的字：字符一个个蹦，光标闪，写满清屏重来
     drawTyping(c, { x0, x1, z0, z1, face, seed, now });
-    // 底部进度条：深绿轨（不用纯黑，免得糊成一团黑）+ 亮绿的走条
+    // 底部走条：深绿轨（不用纯黑，免得糊成一团黑）+ 亮绿的**不确定**走条
+    // （周期与主控制台一致，见上面那段说明：没有真进度就不画长度）。
     const pz = z0 + 0.04;
     wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(6,32,20,0.5)');
-    if (progress > 0) {
+    {
       const full = x1 - 0.06 - (x0 + 0.06);
-      wallQuad(c, 'y', face, x0 + 0.06, x0 + 0.06 + full * progress, pz, pz + 0.04, '#9fe8b8');
+      const seg = full * 0.3;
+      const at = (x0 + 0.06) + ((now / 1800) % 1) * (full - seg);
+      wallQuad(c, 'y', face, at, at + seg, pz, pz + 0.04, '#9fe8b8');
     }
   }
 
@@ -1719,7 +1727,6 @@ export function createIsoOffice(canvas, opts = {}) {
         const m = u.monitor;
         const kb = u.keyboard;
         const a = agents.find((ag) => ag.home === i);
-        const prog = a && a.taskProgress != null ? a.taskProgress : 0;
 
         /**
          * 显示器：底座 + 支架 + 面板（薄盒子当边框）。
@@ -1736,10 +1743,9 @@ export function createIsoOffice(canvas, opts = {}) {
               c,
               { x: m.x, y: m.y, z: z + 0.12, w: m.w, d: m.d, h: m.h },
               levelColor(a && a.level),
-              prog,
               i * 977 + 13,
               Boolean(a), // 没人的工位：屏幕熄灭
-              now // 打字动画的时间轴
+              now // 打字动画 + 底部走条的时间轴
             );
           } else {
             const backY = m.y + m.d + 0.001;

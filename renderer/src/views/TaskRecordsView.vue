@@ -107,6 +107,8 @@ const STATE_LABEL = { all: '全部', pending: '待命', running: '运行中', do
 function stateLabel(s) {
   return STATE_LABEL[s] || s || '—';
 }
+/** 当前**没有调用方**：详情里那一行「进度」按 2026-09-29 的要求注释掉了（见模板里的说明），
+ *  留着是为了将来有真进度时一行就能放回来。progress 现在只有 0 / 1 两个取值。 */
 function fmtProgress(p) {
   if (p == null) return '—';
   return `${Math.round(p * 100)}%`;
@@ -512,7 +514,12 @@ async function saveRetention() {
 
           <div class="kv">
             <div class="k">状态</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
-            <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
+            <!-- 「进度」暂时不显示（2026-09-29 用户要求注释掉）：progress 现在拿不到真值 ——
+                 开工写 0、收工写 1，中间没人推进（唯一会推的是 hook 里"按 TodoWrite 清单
+                 折算几项做完"那一条，见 reporter/hook.js 的 todoProgress，实测落不到库里）。
+                 本机库实测：489 条任务的 progress 只有 0（80 条）和 1（409 条）两种取值，
+                 一个中间值都没有 —— 显示出来就是「0% / 100%」两个数跳，纯误导。
+                 将来有了能按轮次推进的真实进度来源，再把这一行放回来（fmtProgress 一并复活）。 -->
             <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- 工程：这一轮归属的工程名。服务端按工程**目录**现算（package.json name > 目录名，

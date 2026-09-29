@@ -401,7 +401,10 @@ const deskScreens = computed(() =>
     return {
       color: STATE_COLOR[m ? m.state : 'offline'],
       lines: [0, 1, 2].map((k) => 30 + ((seed >> (k * 3)) % 55)),
-      progress: m && m.task && Number.isFinite(m.task.progress) ? Math.max(0, Math.min(1, m.task.progress)) : 0,
+      // 屏幕上那条走条**不画完成度**（2026-09-29 去掉 progress）：task.progress 只有 0/1
+      // 两个取值（开工写 0、收工写 1，中间没人推进，见 TaskRecordsView「进度」那行），
+      // 画长度等于永远空条或满条。这里只判断"在不在干活"，让光带自己爬（见模板里的 .scr-crawl）。
+      running: Boolean(m && (m.state === 'busy' || m.state === 'thinking')),
     };
   })
 );
@@ -552,7 +555,18 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
             opacity="0.9"
           />
           <rect :x="d.monitor.screen.x + 8" :y="d.monitor.screen.y + 32" :width="d.monitor.screen.w - 16" height="3" rx="1.5" fill="#232c3a" />
-          <rect :x="d.monitor.screen.x + 8" :y="d.monitor.screen.y + 32" :width="(d.monitor.screen.w - 16) * deskScreens[i].progress" height="3" rx="1.5" fill="#4c8dff" />
+          <!-- 底部走条：光带固定占轨道 30%，从左爬到右循环（不确定，不表示完成度）。
+               周期 1.8s 与主控制台一致，见 iso/mainConsole.js 里 ph.busy 那一段。 -->
+          <rect
+            v-if="deskScreens[i].running"
+            class="scr-crawl"
+            :x="d.monitor.screen.x + 8"
+            :y="d.monitor.screen.y + 32"
+            :width="(d.monitor.screen.w - 16) * 0.3"
+            height="3"
+            rx="1.5"
+            fill="#4c8dff"
+          />
           <circle :cx="d.monitor.led.cx" :cy="d.monitor.led.cy" :r="d.monitor.led.r" :fill="deskScreens[i].color" />
 
           <polygon :points="d.keyboard" fill="#2a3240" stroke="#3a4557" stroke-width="1" />
@@ -789,5 +803,30 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
 
 .meeting-tip {
   color: var(--accent);
+}
+
+/* 显示器上那条走条：光带从左爬到右，1.8s 一圈（与主控制台 mainConsole 同周期）。
+   翻译量按光带自身宽度算：-100% = 完全滑出左边，333% ≈ 完全滑出右边（30% × 3.33 ≈ 100%）。 */
+.scr-crawl {
+  /* transform-box: fill-box —— 必须显式写：SVG 元素的初始值是 view-box，
+     那样 translateX(-100%) 会按整个画布宽度算，光带直接飞到屏幕外。*/
+  transform-box: fill-box;
+  animation: scr-crawl-x 1.8s linear infinite;
+}
+@keyframes scr-crawl-x {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(333%);
+  }
+}
+
+/* 靠"动"表达"在跑"的光带，关掉动画就只剩一段固定长度，会被读成"进度 30%" ——
+   宁可什么都不画，也不给个假的完成度。 */
+@media (prefers-reduced-motion: reduce) {
+  .scr-crawl {
+    display: none;
+  }
 }
 </style>

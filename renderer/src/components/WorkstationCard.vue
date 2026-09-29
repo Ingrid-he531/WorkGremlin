@@ -1,7 +1,9 @@
 <script setup>
 import { computed, onUnmounted, ref } from 'vue';
 import StatusBadge from './StatusBadge.vue';
-import ProgressBar from './ProgressBar.vue';
+// ProgressBar 暂时不引了：卡片上那条进度条按 2026-09-29 的要求去掉（task.progress 没有真值，
+// 只有 0/1 两个取值 —— 画出来永远是空条或满条）。要恢复的话把这一行和模板里那行一起放开。
+// import ProgressBar from './ProgressBar.vue';
 import { formatDuration } from '@workgremlin/shared';
 
 const props = defineProps({
@@ -54,7 +56,11 @@ const roleLabel = computed(() => {
       <div class="label dim">当前任务</div>
       <div v-if="member.task" class="task-title">{{ member.task.title }}</div>
       <div v-else class="na">空闲 / 无进行中任务</div>
-      <ProgressBar :value="member.task ? member.task.progress : null" :testid="`seat-progress-${agentId}`" />
+      <!-- 进度条暂时去掉（2026-09-29）：task.progress 没有真值 —— 开工 0、收工 1，
+           中间没人推进它（本机库 489 条任务全落在 {0,1}，见 TaskRecordsView「进度」那行），
+           画出来只有"空条"和"满条"两种状态，等于报了个不存在的进度。
+           将来有了真进度再把 ProgressBar 接回来（它自己会把 null 显示成「进度未知（未上报）」）。 -->
+      <!-- <ProgressBar :value="member.task ? member.task.progress : null" :testid="`seat-progress-${agentId}`" /> -->
     </div>
 
     <div class="row">

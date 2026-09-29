@@ -516,7 +516,9 @@ const sceneMembers = computed(() => {
       degraded: live ? Boolean(m.degraded) : true,
       ghost: isEphemeralMember(m),
       project: projectLabelOf(m),
-      taskProgress: live && m.task && Number.isFinite(m.task.progress) ? m.task.progress : 0,
+      // taskProgress 已删（2026-09-29）：3D 办公室显示器上那条进度条改成"不确定走条"了，
+      // 不再消费这个字段；而 task.progress 本身没有真值（只有 0/1 两个取值，见
+      // TaskRecordsView 里「进度」那一行的说明），留着只会误导下一个人再去接它。
       // 被召唤的 subagent 当前任务名：主 agent 会用气泡把它交代给小怪物
       task: m.task && m.task.title ? m.task.title : '',
       // 收工摘要：清单里写的 result 由服务端作为 artifact 随成员卡下发
