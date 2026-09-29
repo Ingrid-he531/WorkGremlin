@@ -1362,63 +1362,6 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
  * （消费方见 sessionRegistry 里按 (工程, 客户端) 缓存的 doneScans）。
  */
 /**
- * 读 CodeBuddy transcript（history/<工程>/<会话>/index.json）最后一轮请求（requests 数组末元素）
- * 的 state：IDE 正常收尾写 "complete"、被打断写 "running"。拿不到结构就回 null（绝不猜）。
- *
- * 顺带取这一轮**已经吐出来的收尾文本**（best-effort）：与 hook.js 的 codebuddyReplies 同源 ——
- * index.json 的 `requests[-1].messages` 是消息 id 列表，正文在 `messages/<id>.json` 里
- * （`{role, message:"<JSON 字符串>"}`）。取不到就回空串。**取消时也要照记这份产出**
- * （"没干完"不是"没产出"，与「任务完成」同一条线）。
- * 用文件 mtime 做缓存，避免每次扫盘都解析大 transcript。
- * @returns {{state: string|null, said: string}} state ∈ "complete" | "running" | null
- */
-const _craftRunCache = new Map();
-
-/** 内容块里算"回复正文"的类型（与 hook.js 的 extractText 同口径，思维链 / 工具调用不算） */
-const CRAFT_TEXT_BLOCK_TYPES = new Set(['text', 'output_text', 'input_text', 'summary_text']);
-
-/** 一条消息的 content → 正文文本（字符串 / 块数组 / {text} 三种形状，与 hook.js 同口径） */
-function craftTextOf(content) {
-  if (typeof content === 'string') return content.trim();
-  if (Array.isArray(content)) {
-    return content
-      .map((x) => {
-        if (!x || typeof x !== 'object' || typeof x.text !== 'string') return '';
-        const t = x.type == null ? '' : String(x.type);
-        return !t || CRAFT_TEXT_BLOCK_TYPES.has(t) ? x.text : '';
-      })
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-  }
-  if (content && typeof content === 'object' && typeof content.text === 'string') return content.text.trim();
-  return '';
-}
-
-/**
- * 读 CodeBuddy `messages/<id>.json`（`{role, message:"<JSON 字符串>"}`），拼出正文。
- * 拿不到就跳过那一条 —— 不猜、不编。
- * @param {string} dir transcript 所在目录
- * @param {string[]} ids 消息 id 列表
- */
-function craftMessagesText(dir, ids) {
-  const parts = [];
-  for (const id of Array.isArray(ids) ? ids : []) {
-    if (!id) continue;
-    try {
-      const raw = readJson(path.join(dir, 'messages', `${id}.json`));
-      if (!raw) continue;
-      const inner = typeof raw.message === 'string' ? JSON.parse(raw.message) : raw.message;
-      const txt = craftTextOf(inner && inner.content !== undefined ? inner.content : inner);
-      if (txt) parts.push(txt);
-    } catch {
-      /* 读不到就算了 */
-    }
-  }
-  return parts.join('\n\n').trim();
-}
-
-/**
  * 状态文件里的 `roundFiles`（`{path,op,abs}`）→ 完成标记的 `files` 形状（带 size）。
  * 取消时用它补"取消前已经动了哪些文件"（与 hook.js 的 collectRoundFiles 同口径）：
  * 去重、删除类不给 size、stat 不到就不给（绝不编造）。
@@ -1643,37 +1586,6 @@ function claudeInterruptOf(j, startedAt) {
   return { hit: true, at, via: 'idle' };
 }
 
-function lastCraftRun(transcriptPath) {
-  if (!transcriptPath || !isFile(transcriptPath)) return { state: null, said: '' };
-  try {
-    const m = mtime(transcriptPath);
-    const cached = _craftRunCache.get(transcriptPath);
-    if (cached && cached.m === m) return { state: cached.state, said: cached.said || '' };
-    const data = readJson(transcriptPath);
-    let state = null;
-    let said = '';
-    const runs = Array.isArray(data && data.requests) ? data.requests : null;
-    if (runs && runs.length) {
-      const last = runs[runs.length - 1];
-      state = last && last.state != null ? String(last.state) : null;
-      said = last && last.result != null ? String(last.result).trim() : '';
-      // 收尾文本在 messages/<id>.json 里：按末轮请求的 messages 逐条读、拼成一段
-      if (!said && last && Array.isArray(last.messages)) {
-        said = craftMessagesText(path.dirname(transcriptPath), last.messages);
-      }
-    } else if (Array.isArray(data && data.messages) && data.messages.length) {
-      // 兜底：对话末条 assistant 消息 isComplete:false = 这轮被掐断（CodeBuddy 取消时末条即未完成）
-      const last = data.messages[data.messages.length - 1];
-      state = last && last.isComplete === false ? 'running' : (last && last.isComplete === true ? 'complete' : null);
-      if (last && last.id) said = craftMessagesText(path.dirname(transcriptPath), [last.id]);
-    }
-    _craftRunCache.set(transcriptPath, { m, state, said });
-    return { state, said };
-  } catch {
-    return { state: null, said: '' };
-  }
-}
-
 function readReporterDones(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
@@ -1701,10 +1613,14 @@ function readReporterDones(workspacePath, client = '') {
       if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
       if (!latest || Number(done.at) > Number(latest.at)) latest = done;
     }
-    // CodeBuddy IDE 取消：既不发 Stop 也不发 Interrupt，taskId 一直占着、心跳照跳 → 旧逻辑
-    // 一直显示「思考中 / 调用工具」。但它 transcript 的 requests 数组里，每一轮带
-    // state: "complete"（正常收尾）/ "running"（被打断）。任务槽卡死（很久没 hook 事件）
-    // 且末轮 state 是 "running" → 这一轮是被打断的，合成取消标记亮红色「任务取消」。
+    /* 兜底合成取消标记。
+       **只认"用户真按了停止"的信号**（Claude/Qoder，见 claudeInterruptOf 的两个信号）。
+       这里曾经还有一条"任务槽卡死 + transcript 末轮 state='running' ⇒ 判被打断"的兜底
+       （CodeBuddy IDE 收不到 Stop / Interrupt 时用），**2026-09-29 去掉了**：它判不出
+       "还在慢慢想"和"被打断"—— 长时间不调工具的轮（模型纯推理 > TASK_RUN_MS）会被误判成
+       取消，控制台先弹红色「任务取消」+「待命中」，下一条事件回来又跳回「思考中」，
+       用户看到的就是"任务没完成却报取消"。宁可这种轮暂时停在旧相位（相位新鲜期到了会回落
+       待命），也不误报取消。 */
     if (j.taskId) {
       const startedAtJ = Number(j.taskStartedAt) || 0;
       /* Claude Code / Qoder（4F / 6F，CLI 与 IDE 扩展都一样）：用户按"停止"后**一个 hook
@@ -1715,7 +1631,7 @@ function readReporterDones(workspacePath, client = '') {
            ① transcript 尾部那条 `[Request interrupted by user]`（模型已输出 / 正在跑工具时打断）；
            ② Claude 自己的会话状态文件 `<claudeHome>/sessions/<pid>.json` 说 idle
               （"刚提交、一个字都没吐就 ESC"——transcript 一行都不写，只有这里看得出）。
-         认出来就合成取消标记（与下面 CodeBuddy IDE 的兜底同一条路）。
+         认出来就合成取消标记。
          **不设 TASK_RUN_MS 门槛**：信号一到位就该亮（服务端 5~10s 扫一轮 + 前端 1.5s 快轮询，
          足够"准实时"）；同一轮靠 (会话, 任务, at) 去重，只补发一次。 */
       const base = clientBase(j.client);
@@ -1745,40 +1661,6 @@ function readReporterDones(workspacePath, client = '') {
             files: filesC,
             fileCount: filesC.length,
             result: String(ci.said || '').trim().slice(0, 4_000),
-          });
-        }
-      }
-      const lastAt = Math.max(Number(j.taskStartedAt) || 0, Number(j.sessionPhase && j.sessionPhase.ts) || 0);
-      if (lastAt && now - lastAt > TASK_RUN_MS) {
-        const run = lastCraftRun(j.transcriptPath);
-        if (run.state === 'running') {
-          // 取消只是"没干完"，不是"没产出"：这一轮改过的文件（状态文件里的 roundFiles）
-          // 与已经吐出来的文字（transcript 末轮）照「任务完成」一样带上 —— 台账/对话记录/控制台都要。
-          const files = roundFilesOf(j);
-          const said = String(run.said || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-          const cancel = {
-            at: lastAt, title: j.taskTitle || '', workspacePath: ws,
-            sessionId: id, cancelled: true, files: files.slice(0, 8), fileCount: files.length, said,
-          };
-          const prev = id ? bySession.get(id) : null;
-          // 当前这轮（取消的）比已记录的完成更晚 → 用取消覆盖（"上一轮完成、这一轮被打断"）
-          if (id && (!prev || Number(cancel.at) > Number(prev.at))) bySession.set(id, cancel);
-          if (!latest || Number(cancel.at) > Number(latest.at)) latest = cancel;
-          // 这一轮是被打断的（没发 Stop / Interrupt）：列出来，让 sessionRegistry 去重后补发
-          // 一次 task/end(cancelled) —— 否则台账里的任务永远停在「进行中」。
-          cancels.push({
-            sessionId: id,
-            taskId: j.taskId,
-            client: j.client,
-            workspacePath: ws,
-            at: lastAt,
-            title: j.taskTitle || '',
-            form: j.form || '',
-            // 补发的 task/end 也要带产出（与「任务完成」同一条线）：files 是改动清单，
-            // result 是这一轮已经吐出来的收尾自述（拿不到就空，服务端显示"无产出摘要"）。
-            files,
-            fileCount: files.length,
-            result: String(run.said || '').trim().slice(0, 4_000),
           });
         }
       }

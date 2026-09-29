@@ -715,9 +715,10 @@ function refresh({ workspacePath = '', force = false } = {}) {
   }
 
   // 兜底合成的"取消"标记：去重后补发一次 task/end(cancelled)，把台账里卡在「进行中」的任务收掉。
-  // CodeBuddy IDE 这类不收 Stop / Interrupt 的产品，取消只靠 readReporterDones 的 ≥TASK_RUN_MS
-  // 兜底漏出来，而它原本只写内存标记、从不 notify 服务端 —— 这里补上那一刀。doneScans 在 refresh
-  // 开头已清空、本轮回填完，正好遍历它收集到的 cancels。
+  // cancels 由 readReporterDones 合成，来源是**用户真按了停止**的信号（Claude / Qoder：
+  // transcript 尾部的打断标记，或 Claude 自己那份会话状态文件说 idle）—— 这些产品按停止时
+  // 一个 hook 事件都不发，台账那行会一直挂在「进行中」。doneScans 在 refresh 开头已清空、
+  // 本轮回填完，正好遍历它收集到的 cancels。
   flushSynthesizedCancels(doneScans, now);
 
   prune(now);
