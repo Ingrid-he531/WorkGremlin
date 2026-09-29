@@ -30,7 +30,7 @@ fs.mkdirSync(path.join(HOME, 'hooks'), { recursive: true });
 process.env.WORKGREMLIN_HOME = HOME;
 
 // 必须在设置 WORKGREMLIN_HOME 之后再 require（reporterHookHome 每次调用读 env）
-const { readReporterDones } = require('../src/sessions');
+const { readReporterDones, readReporterPhase } = require('../src/sessions');
 
 let pass = 0;
 let fail = 0;
@@ -50,9 +50,10 @@ function head(t) {
 /**
  * 造 Claude 风格的 transcript（JSONL）+ reporter 状态文件。
  * @param {{name:string, taskId?:string, startedAt?:number, interrupted?:boolean,
- *          said?:string, markerTs?:string, roundFiles?:Array<any>}} o
+ *          said?:string, markerTs?:string, roundFiles?:Array<any>,
+ *          phase?:string, phaseTs?:number}} o
  */
-function scenario({ name, taskId, startedAt, interrupted = false, said = '', markerTs = '', roundFiles }) {
+function scenario({ name, taskId, startedAt, interrupted = false, said = '', markerTs = '', roundFiles, phase = '', phaseTs = 0 }) {
   const nowIso = new Date().toISOString();
   const tp = path.join(HOME, `transcript-${name}.jsonl`);
   const lines = [
@@ -86,6 +87,8 @@ function scenario({ name, taskId, startedAt, interrupted = false, said = '', mar
       taskTitle: '改个东西',
       taskWorkspacePath: WS,
       transcriptPath: tp,
+      // 相位：不传就整条不写（老夹具的行为）；传了才写进状态文件，专供 [5] 那两例
+      ...(phase ? { sessionPhase: { phase, ts: phaseTs, workspacePath: WS } } : {}),
       ...(roundFiles ? { roundFiles } : {}),
     })
   );
@@ -150,6 +153,50 @@ head('[4] 取消照「任务完成」一样带产出：改动清单 + 打断前�
   ok('补发带改动清单（去重后 1 个）', Boolean(hit) && hit.fileCount === 1 && hit.files.some((f) => f.path === rel), JSON.stringify(hit && hit.files));
   const mark = bySession.get('d') || null;
   ok('控制台那枚取消标记也带 files / said', Boolean(mark) && mark.said === '改到一半就被掐了' && mark.files.length === 1, JSON.stringify(mark));
+}
+
+head('[5] 打断后那口 stale 相位不许再当"实时相位"喂给控制台');
+{
+  /* 这是"用户终止了任务、控制台却一直停在取消前那个状态"的根因：Claude / Qoder 打断时
+     一个 hook 事件都不发，状态文件里的 sessionPhase（tool）没人清，服务端照新鲜期还能再认它
+     2 分钟。取消标记亮完 10s 退回待命后，1.5s 快轮询又把这口相位喂回来。
+     真值：transcript 里的打断标记比相位更新 → 这口相位作废（readReporterPhase 返 null）。 */
+  scenario({
+    name: 'e',
+    taskId: 't_e',
+    startedAt: NOW - 30_000,
+    interrupted: true,
+    said: '干到一半',
+    phase: 'tool',
+    phaseTs: NOW, // 最后一个 PostToolUse 那一刻（打断前）
+    markerTs: new Date(NOW + 1_000).toISOString(), // 1s 后按的停止
+  });
+  const rp = readReporterPhase(WS, 'claude', 'e');
+  ok('标记更新 → 相位作废，不再上报「调用工具」', rp === null, JSON.stringify(rp));
+  // 同一份状态文件里的取消标记照样给（红色「任务取消」靠它，两件事互不影响）
+  const mark = readReporterDones(WS, 'claude').bySession.get('e') || null;
+  ok('取消标记照旧（作废相位不影响亮红色）', Boolean(mark) && mark.cancelled === true, JSON.stringify(mark));
+}
+{
+  // 反过来：相位**比标记更新**（标记是这一轮里更早落下的，之后还有事件在跑）→ 照常上报
+  scenario({
+    name: 'f',
+    taskId: 't_f',
+    startedAt: NOW - 30_000,
+    interrupted: true,
+    said: '又跑起来了',
+    phase: 'tool',
+    phaseTs: NOW + 5_000,
+    markerTs: new Date(NOW).toISOString(),
+  });
+  const rp = readReporterPhase(WS, 'claude', 'f');
+  ok('相位比标记新 → 照常上报（不误杀新一轮）', Boolean(rp) && rp.phase === 'tool', JSON.stringify(rp));
+}
+{
+  // 没有打断（正常在跑）→ 相位照常上报
+  scenario({ name: 'g', taskId: 't_g', startedAt: NOW - 30_000, interrupted: false, said: '在跑', phase: 'tool', phaseTs: NOW });
+  const rp = readReporterPhase(WS, 'claude', 'g');
+  ok('没打断 → 相位照常上报', Boolean(rp) && rp.phase === 'tool', JSON.stringify(rp));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

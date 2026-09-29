@@ -866,6 +866,13 @@ const TASK_RUN_MS = 2 * 60_000;
  * 设 3.5s：绝大多数工具在 PreToolUse..PostToolUse 之间远小于此值，不会误报；权限框通常一弹就卡住不动。
  */
 const AWAIT_PROBE_MS = 3_500;
+/**
+ * "打断标记"与"最后一个 hook 事件"的先后容差（见 readReporterPhase 里那处作废判定）：
+ * 标记的 ts 由 CLI 自己落盘、相位的 ts 由 hook 进程落盘，两者可能差几毫秒 —— 用户正是在
+ * 最后一个工具的 hook 还没写完时按的停止。所以标记不比相位"旧过 1s"就算标记更新。
+ * 代价：紧接着（<1s）重发一轮时，新相位会被压一小会儿；换来的是"按了停止就永不回弹"。
+ */
+const INTERRUPT_PHASE_SLACK_MS = 1_000;
 
 /**
  * 这些工具永远不该被标成"等待授权"：
@@ -990,6 +997,18 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
     if (sp.ts < SERVER_STARTED_AT) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
+    /* 用户按了"停止"、但**一个 hook 事件都不发**的产品（Claude Code / Qoder，见 claudeInterruptTail）：
+       这口相位没人清 —— taskId 还占着、sp.ts 冻在被打断前最后一个事件那一刻，而服务端照
+       新鲜期还能再认它 TASK_RUN_MS（2 分钟）。也就是说"取消标记"与"这口 stale 相位"有一整段
+       重叠期：红色「任务取消」亮 10s 退回待命后，1.5s 快轮询又把这口相位喂回来，
+       主控制台于是挂回「调用工具 / 思考中」——正是"用户终止了任务，控制台却一直停在取消前那个状态"。
+       真值在 transcript 末尾那条 `[Request interrupted by user]`：**标记比相位更新 = 这口相位作废**
+       （hook 那条路会写显式 idle，这里补的是"没有 hook 事件"那条路）。
+       标记之后用户又发了一轮的话，UserPromptSubmit 写的相位 ts 更新 → 这里不再命中，按新相位走。 */
+    if (j.taskId && (clientBase(j.client) === 'claude' || clientBase(j.client) === 'qoder')) {
+      const ci = claudeInterruptTail(j.transcriptPath, Number(j.taskStartedAt) || 0);
+      if (ci.interrupted && (!ci.at || ci.at + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts))) continue;
+    }
     if (!win || sp.ts > win.ts) {
       win = sp;
       winClient = String(j.client || LEGACY_STATE_CLIENT);
@@ -1435,6 +1454,24 @@ function roundFilesOf(j) {
  * 读法：只读文件**最后 128KB**（标记永远写在末尾，长会话不必整份读），按 mtime+size+sinceTs 缓存，
  * 同一个文件在标记落盘后只会被解析一次。逐行 `JSON.parse` 按结构判（`type:'user'` 且正文文本
  * 命中标记），工具结果 / 思考里带同名字符串一律不算。
+ *
+ * **CLI 与 VS Code 扩展不一样，差别在"什么时候按的停止"**（实测 2026-09-29，同一台机器两边复现）：
+ *   · 模型已经吐出东西（工具在跑）再打断 → 两边都落 ` for tool use` 那条标记，本函数认得到。
+ *   · 刚提交、模型还没输出就按停止 → **扩展照样落 `[Request interrupted by user]`（认得到）；
+ *     终端 CLI 一行都不写**：提示词被还原回输入框，events.log 停在同秒的 UserPromptSubmit，
+ *     transcript 停在用户那条 prompt 上 —— 这一种在盘上**没有任何痕迹**，不是读取口径的问题。
+ *     真实案例：任务 t_mumetsne_quls1x（"测试 claude code CLI任务取消"，16:24，CLI 形态）。
+ *   于是这一种只能等相位新鲜期（TASK_RUN_MS 2 分钟）过期后控制台回待命，红灯不亮、
+ *   台账那行的结束时间一直是空 —— 这是**已知缺口**，不是回归。
+ *
+ * 已知的兜底线索（**2026-09-29 决定先不接**，将来真要做时从这里起步）：Claude Code 自己在
+ * `~/.claude/sessions/<pid>.json` 里记 `{sessionId, entrypoint, status, statusUpdatedAt}` ——
+ * `status` 只有 busy / idle，一轮结束就翻 idle、时间戳很准（实测那轮 08:24:00.769 提交、
+ * 08:24:03.137 翻 idle，我复现的早打断同样对上）。判据可以是"状态文件里 taskId 还占着 +
+ * 没有收工标记 + status=idle 且 statusUpdatedAt ≥ taskStartedAt ⇒ 这一轮被掐了"，取消时间
+ * 就用它给的 statusUpdatedAt（不拿"现在"冒充）。没接的两个理由：那是 Claude Code **未公开的
+ * 内部文件**，格式随时可能变；而且早打断的那一轮本来就没开始干活（没有产出可收），
+ * 代价仅仅是控制台 2 分钟后回待命 + 台账那行结束时间为空。
  *
  * @param {string} transcriptPath
  * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的标记，老一轮的不算
@@ -2162,4 +2199,5 @@ module.exports = {
   decodeDirName,
   reporterMainPhase,
   freshestReporterWs,
+  readReporterPhase, // 主控制台那口实时相位（打断后作废的逻辑在这里，回归测试直接盯它）
 };

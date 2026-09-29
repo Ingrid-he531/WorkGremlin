@@ -949,6 +949,9 @@ function turnReplies(transcriptPath) {
  *   · Claude Code（4F）/ Qoder（6F）：**不发 Interrupt**，但会写一条 user 消息，正文是
  *     `[Request interrupted by user]`（工具中途打断是 `[Request interrupted by user for tool use]`）
  *     —— 这是"这一轮被掐掉了"唯一的、也是权威的落盘痕迹。
+ *     注意**这条痕迹不是总会有**：CLI 形态下"刚提交、模型还没吐出任何东西就按 ESC"什么都不写
+ *     （transcript 一行不加、hook 一个事件不发）。实测记录与已知的兜底线索见
+ *     server/src/sessions.js 的 claudeInterruptTail —— 别在这儿再查一遍。
  *
  * **必须按结构判，不能全文搜字符串**：agent 自己的工具输出 / 思考里经常出现这两个词
  * （实测：跑一句 `rg 'turn_aborted'` 或讨论打断逻辑，输出被原样写进 rollout；全文匹配会把

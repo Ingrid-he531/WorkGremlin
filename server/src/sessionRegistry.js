@@ -55,6 +55,19 @@ let lastSnapshot = null;
  *  一个 CLI 楼层一次能扫出上百个历史会话文件，逐个去扫 hooks 目录太浪费，所以按 client 读一次盘。 */
 let doneScans = new Map();
 
+/**
+ * 台账写入端（bus + repo），由 index.js 装配时注入 —— 见 flushSynthesizedCancels。
+ * 为什么必须注入：本模块是被路由层 require 的，而 bus 实例是 index.js 里
+ * createIngestBus() 造出来的，模块里 require('./ingest/bus') 只能拿到
+ * `{ createIngestBus, projectIdOf, memberIdOf }` 这个**工厂**，`bus.endTask` 压根不存在。
+ * 测试（只调 snapshot 的那几个）不注入 → 这一步照旧什么都不做。
+ * @type {{bus: any, repo: any}|null}
+ */
+let backend = null;
+function setBackend(next) {
+  backend = next && next.bus ? { bus: next.bus, repo: next.repo || null } : null;
+}
+
 const SKIP = new Set(['node_modules', '.git', '.svn', 'cache', 'Cache', 'logs']);
 
 function mtime(p) {
@@ -720,21 +733,26 @@ function refresh({ workspacePath = '', force = false } = {}) {
  */
 const postedCancels = new Map(); // key -> 过期时间戳（避免进程存活期间反复补发）
 function flushSynthesizedCancels(doneScans, now) {
-  let bus;
-  try {
-    bus = require('./ingest/bus');
-  } catch {
-    return;
-  }
+  const { bus, repo } = backend || {};
+  if (!bus || typeof bus.endTask !== 'function') return;
   for (const scan of doneScans.values()) {
     for (const c of scan.cancels || []) {
       const key = `${c.sessionId}|${c.taskId}|${c.workspacePath}|${c.at}`;
       if (postedCancels.get(key) > now) continue;
+      /* 归属**从台账那行任务上取**，别拿状态文件里的字面量顶：bus.endTask 收的是
+         工程 id + 成员 id（`<名字>@<工程id>`，见 bus.memberIdOf），而状态文件里只有
+         工程**路径**（c.workspacePath）和客户端名（c.client）—— 直接传过去会算成
+         `claude@/home/yinghui/work/WorkGremlin` 这种不存在的成员，endTask 当场返回
+         unknown_member（不抛错），取消照旧收不了尾：任务永远挂在「进行中」、
+         产出与改动文件整块丢。实测 2026-09-29：所有 cancelled 行 ended_at 全是 NULL。
+         拿不到这一行（老数据 / 任务已被清）就不发 —— 绝不编造一个工程去写。 */
+      const task = repo && repo.getTask ? repo.getTask.get(c.taskId) : null;
+      if (!task) continue;
       postedCancels.set(key, now + 10 * 60_000);
       try {
         bus.endTask({
-          project: c.workspacePath,
-          memberId: c.client,
+          project: task.project_id,
+          memberId: task.member_id,
           taskId: c.taskId,
           state: 'cancelled',
           model: '',
@@ -834,4 +852,4 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   };
 }
 
-module.exports = { snapshot, refresh, prune, TIMEOUT_MS, table };
+module.exports = { snapshot, refresh, prune, TIMEOUT_MS, table, setBackend };

@@ -47,6 +47,7 @@
     "test:ws-reconnect": "node renderer/test/wsReconnect.test.mjs",
     "test:claude-hook": "node server/test/claudeHook.test.js",
     "test:claude-cancel": "node server/test/claudeCancel.test.js",
+    "test:cancel-flush": "node server/test/cancelFlush.test.js",
     "test:project-attribution": "node server/test/projectAttribution.test.js",
     "test:cancel": "node server/test/interruptCancel.test.js",
     "test:codebuddy-cancel": "node server/test/codebuddyCancel.test.js",

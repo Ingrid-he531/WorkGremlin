@@ -31,7 +31,7 @@ const { requireToken } = require('./http/auth');
 const { createDemo } = require('./demo');
 const { createLifecycle } = require('./lifecycle');
 const { WS_EVENTS } = require('@workgremlin/shared');
-const { snapshot: registrySnapshot } = require('./sessionRegistry');
+const { snapshot: registrySnapshot, setBackend: setRegistryBackend } = require('./sessionRegistry');
 const { startCopilotTaskSyncer } = require('./copilotTasks');
 const { startKiloTaskSyncer } = require('./kiloTasks');
 const { startOpencodeTaskSyncer } = require('./opencodeTasks');
@@ -127,6 +127,11 @@ function createServer(opts = {}) {
   });
 
   hub = createHub({ server: httpServer, token, bus, repo });
+
+  /* 会话表要能往台账补一刀（服务端自己发现的"这一轮被用户掐了" → task/end(cancelled)，
+     见 sessionRegistry 的 flushSynthesizedCancels）。bus 实例是本函数造的，模块里拿不到，
+     所以在这儿注入；不注入那一步就什么都不做（老行为）。 */
+  setRegistryBackend({ bus, repo });
 
   app.use((req, res, next) => {
     res.setHeader('X-WorkGremlin-Version', VERSION);
