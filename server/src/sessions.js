@@ -40,6 +40,8 @@ const { clientBase } = require('@workgremlin/shared');
 // 就会正好造出"某一层取不到模型"这个本次要修的 bug。
 const { selectedModelOf: traeModelOf } = require('./traeModels');
 const { selectedModelOf: claudeModelOf } = require('./claudeModels');
+// Claude 的配置根（认 CLAUDE_CONFIG_DIR）只留在 products.js 那一处定义，这里复用，别另写一份
+const { claudeHome } = require('./products');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -1005,9 +1007,11 @@ function readReporterPhase(workspacePath, client = '', session = '') {
        真值在 transcript 末尾那条 `[Request interrupted by user]`：**标记比相位更新 = 这口相位作废**
        （hook 那条路会写显式 idle，这里补的是"没有 hook 事件"那条路）。
        标记之后用户又发了一轮的话，UserPromptSubmit 写的相位 ts 更新 → 这里不再命中，按新相位走。 */
-    if (j.taskId && (clientBase(j.client) === 'claude' || clientBase(j.client) === 'qoder')) {
-      const ci = claudeInterruptTail(j.transcriptPath, Number(j.taskStartedAt) || 0);
-      if (ci.interrupted && (!ci.at || ci.at + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts))) continue;
+    if (j.taskId) {
+      // 打断成立（transcript 标记 / Claude 自己的会话状态说 idle，见 claudeInterruptOf）且打断时刻
+      // 不比这口相位旧 → 这口相位作废，不再喂给控制台（否则红灯亮完 10s 又被喂回来）。
+      const iv = claudeInterruptOf(j, Number(j.taskStartedAt) || 0);
+      if (iv.hit && (!iv.at || iv.at + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts))) continue;
     }
     if (!win || sp.ts > win.ts) {
       win = sp;
@@ -1464,14 +1468,13 @@ function roundFilesOf(j) {
  *   于是这一种只能等相位新鲜期（TASK_RUN_MS 2 分钟）过期后控制台回待命，红灯不亮、
  *   台账那行的结束时间一直是空 —— 这是**已知缺口**，不是回归。
  *
- * 已知的兜底线索（**2026-09-29 决定先不接**，将来真要做时从这里起步）：Claude Code 自己在
- * `~/.claude/sessions/<pid>.json` 里记 `{sessionId, entrypoint, status, statusUpdatedAt}` ——
+ * 上面那个缺口**2026-09-29 已接上**（用户明确同意用未公开内部文件）：Claude Code 自己在
+ * `<claudeHome>/sessions/<pid>.json` 里记 `{sessionId, entrypoint, status, statusUpdatedAt}` ——
  * `status` 只有 busy / idle，一轮结束就翻 idle、时间戳很准（实测那轮 08:24:00.769 提交、
- * 08:24:03.137 翻 idle，我复现的早打断同样对上）。判据可以是"状态文件里 taskId 还占着 +
- * 没有收工标记 + status=idle 且 statusUpdatedAt ≥ taskStartedAt ⇒ 这一轮被掐了"，取消时间
- * 就用它给的 statusUpdatedAt（不拿"现在"冒充）。没接的两个理由：那是 Claude Code **未公开的
- * 内部文件**，格式随时可能变；而且早打断的那一轮本来就没开始干活（没有产出可收），
- * 代价仅仅是控制台 2 分钟后回待命 + 台账那行结束时间为空。
+ * 08:24:03.137 翻 idle，早打断同样对上；且 idle 期间文件不再刷新，所以那个时间戳就是"这轮
+ * 什么时候结束的"）。判据与实现见下面 claudeInterruptOf 的 ② 号信号：状态文件里 taskId 还占着 +
+ * 没有收工标记 + status=idle 且 statusUpdatedAt ≥ taskStartedAt ⇒ 这一轮被掐了。
+ * 已知风险：那是**未公开的内部文件**（格式随时可能变）→ 读不到/字段缺失一律当"没有"，绝不猜。
  *
  * @param {string} transcriptPath
  * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的标记，老一轮的不算
@@ -1555,6 +1558,91 @@ function claudeInterruptTail(transcriptPath, sinceTs = 0) {
   return res;
 }
 
+/**
+ * Claude Code 自己的**会话状态文件**：`<claudeHome>/sessions/<pid>.json`，
+ * 一个运行中的 CLI 进程一个文件。字段实测（2026-09-29，2.1.281/2.1.283）：
+ *   { pid, sessionId, cwd, startedAt, kind:'interactive', entrypoint:'cli'|'claude-vscode',
+ *     status:'busy'|'idle', updatedAt, statusUpdatedAt }
+ *
+ * **这是 Claude Code 未公开的内部文件**（用户 2026-09-29 明确同意用它做兜底），格式随时可能变 ——
+ * 所以读不到 / 缺字段 / 解析失败一律当"没有"，绝不猜；只按 sessionId **精确**匹配。
+ * 关键实测：**idle 期间这个文件不再刷新**（statusUpdatedAt 一直冻在"翻 idle 的那一刻"），
+ * 于是它就是"这一轮什么时候结束的"时间戳；反过来 status='busy' = 正在生成。
+ *
+ * 目录列举缓存 2s、文件按 (mtime,size) 缓存 —— 每个扫盘周期会被问好几次，别每次都重读。
+ * @param {string} sessionId
+ * @returns {{status:string, statusUpdatedAt:number, updatedAt:number, pid:number, entrypoint:string, kind:string}|null}
+ */
+const _claudeSessFiles = { at: 0, names: [] };
+const _claudeSessData = new Map(); // path -> {m, size, data}
+function claudeSessionStatus(sessionId) {
+  const sid = String(sessionId || '');
+  if (!sid) return null;
+  const dir = path.join(claudeHome(), 'sessions');
+  const now = Date.now();
+  if (now - _claudeSessFiles.at > 2_000) {
+    _claudeSessFiles.names = readDir(dir).filter((n) => /\.json$/i.test(n));
+    _claudeSessFiles.at = now;
+  }
+  let best = null;
+  for (const name of _claudeSessFiles.names) {
+    const p = path.join(dir, name);
+    let stat = null;
+    try {
+      stat = fs.statSync(p);
+    } catch {
+      continue; // 进程退出时文件可能被删掉：跳过，不猜
+    }
+    const cached = _claudeSessData.get(p);
+    let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
+    if (!data) {
+      data = readJson(p);
+      _claudeSessData.set(p, { m: stat.mtimeMs, size: stat.size, data });
+    }
+    if (!data || String(data.sessionId || '') !== sid) continue;
+    // 同一个 sessionId 可能同时有多份（老进程残留）→ 取 updatedAt 最新的那份
+    if (!best || Number(data.updatedAt || 0) > Number(best.updatedAt || 0)) best = data;
+  }
+  return best;
+}
+
+/**
+ * 这一轮（状态文件 `j`）是不是被用户打断了；是的话给出**打断时刻**。
+ *
+ * 两个信号（都是"按了停止却一个 hook 事件都不发"那条路的兜底），取先命中的：
+ *   ① `claudeInterruptTail`：transcript 尾部那条 `[Request interrupted by user]`
+ *      —— 模型已经吐过字 / 正在跑工具时打断，CLI 与 IDE 扩展都会写；
+ *   ② `~/.claude/sessions/<pid>.json` 写着 `status='idle'` 且 statusUpdatedAt 晚于本轮开始
+ *      —— "刚提交、模型一个字都没吐就按 ESC"：transcript **一行都不写**、hook **一个事件都不发**，
+ *         只有这里看得出（2026-09-29 接上；用户明确同意用这个未公开文件）。
+ *         ⚠ 只在"本轮已经开始 ≥ CLAUDE_IDLE_GRACE_MS"之后才采信：开轮那一瞬 CLI 可能还写着
+ *         idle（还没翻 busy），不设宽限会把刚提交的正常一轮误判成取消。
+ *      取消时间用 statusUpdatedAt（**不拿"现在"冒充**）。
+ *
+ * 另有一条硬前提：这一轮**没有收工标记**（`j.done` 早于本轮开始 = 上一轮残留，不算数）。
+ * @param {any} j reporter 状态文件内容
+ * @param {number} startedAt 本轮开始时刻
+ * @returns {{hit:boolean, at:number, via:'transcript'|'idle'|''}} at=0 表示打断成立但拿不到时刻
+ */
+const CLAUDE_IDLE_GRACE_MS = 3_000;
+function claudeInterruptOf(j, startedAt) {
+  const none = { hit: false, at: 0, via: '' };
+  if (!j) return none;
+  const base = clientBase(j.client);
+  if (base !== 'claude' && base !== 'qoder') return none;
+  const started = Number(startedAt) || 0;
+  const doneAt = Number(j.done && j.done.at) || 0;
+  if (doneAt && (!started || doneAt >= started)) return none; // 这一轮已经正常收尾
+  const ci = claudeInterruptTail(j.transcriptPath, started);
+  if (ci.interrupted) return { hit: true, at: Number(ci.at) || 0, via: 'transcript' };
+  const st = claudeSessionStatus(j.sessionId);
+  if (!st || String(st.status) !== 'idle') return none;
+  const at = Number(st.statusUpdatedAt || st.updatedAt) || 0;
+  if (!at || !started || at < started) return none; // idle 是开轮之前翻的 → 那一轮还没结束
+  if (Date.now() - started < CLAUDE_IDLE_GRACE_MS) return none; // 刚开轮，别误伤
+  return { hit: true, at, via: 'idle' };
+}
+
 function lastCraftRun(transcriptPath) {
   if (!transcriptPath || !isFile(transcriptPath)) return { state: null, said: '' };
   try {
@@ -1623,18 +1711,22 @@ function readReporterDones(workspacePath, client = '') {
          事件都不发** —— 实测 2026-09-29 的 4F：events.log 里 Stop / SessionEnd / Notification
          全无，事件流停在最后一次 PostToolUse。hook 侧那条 `turnInterrupted` 跑在 Stop 分支里，
          没事件就永远执行不到，于是控制台一直停在「思考中」、也永远不亮红色「任务取消」。
-         只能由服务端在轮询时读 transcript 尾部找 `[Request interrupted by user]` 那一条，
-         自己合成取消标记（与下面 CodeBuddy IDE 的兜底同一条路，只是信号不同：
-         那边看 transcript 末轮的 state，这边看末尾那条 user 消息）。
-         **不设 TASK_RUN_MS 门槛**：标记一落盘就该亮（服务端 5~10s 扫一轮 + 前端 1.5s 快轮询，
+         只能由服务端在轮询时自己认，两个信号见 claudeInterruptOf：
+           ① transcript 尾部那条 `[Request interrupted by user]`（模型已输出 / 正在跑工具时打断）；
+           ② Claude 自己的会话状态文件 `<claudeHome>/sessions/<pid>.json` 说 idle
+              （"刚提交、一个字都没吐就 ESC"——transcript 一行都不写，只有这里看得出）。
+         认出来就合成取消标记（与下面 CodeBuddy IDE 的兜底同一条路）。
+         **不设 TASK_RUN_MS 门槛**：信号一到位就该亮（服务端 5~10s 扫一轮 + 前端 1.5s 快轮询，
          足够"准实时"）；同一轮靠 (会话, 任务, at) 去重，只补发一次。 */
       const base = clientBase(j.client);
       if (base === 'claude' || base === 'qoder') {
-        const ci = claudeInterruptTail(j.transcriptPath, startedAtJ);
-        if (ci.interrupted) {
+        const iv = claudeInterruptOf(j, startedAtJ);
+        if (iv.hit) {
+          // 收尾自述只有 transcript 那条路有（idle 兜底认出来的早打断，本来就没吐过字）
+          const ci = claudeInterruptTail(j.transcriptPath, startedAtJ);
           const filesC = roundFilesOf(j);
           const saidC = String(ci.said || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-          const atC = ci.at || Number(j.sessionPhase && j.sessionPhase.ts) || startedAtJ || now;
+          const atC = iv.at || Number(j.sessionPhase && j.sessionPhase.ts) || startedAtJ || now;
           const cancelC = {
             at: atC, title: j.taskTitle || '', workspacePath: ws,
             sessionId: id, cancelled: true, files: filesC.slice(0, 8), fileCount: filesC.length, said: saidC,

@@ -28,6 +28,13 @@ fs.mkdirSync(HOME, { recursive: true });
 fs.mkdirSync(WS, { recursive: true });
 fs.mkdirSync(path.join(HOME, 'hooks'), { recursive: true });
 process.env.WORKGREMLIN_HOME = HOME;
+/**
+ * Claude Code 的**会话状态文件**根：`<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`。
+ * 「刚提交、一个字都没吐就 ESC」这一种 transcript 一行都不写，只有它能判（见 claudeInterruptOf）。
+ */
+const CLAUDE_DIR = path.join(TMP, 'claude');
+fs.mkdirSync(path.join(CLAUDE_DIR, 'sessions'), { recursive: true });
+process.env.CLAUDE_CONFIG_DIR = CLAUDE_DIR;
 
 // 必须在设置 WORKGREMLIN_HOME 之后再 require（reporterHookHome 每次调用读 env）
 const { readReporterDones, readReporterPhase } = require('../src/sessions');
@@ -96,6 +103,33 @@ function scenario({ name, taskId, startedAt, interrupted = false, said = '', mar
 }
 
 const NOW = Date.now();
+
+/** 写一份 Claude 的会话状态文件（`<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`，未公开内部文件） */
+function writeSessionStatus(name, { status, statusUpdatedAt, entrypoint = 'cli' }) {
+  fs.writeFileSync(
+    path.join(CLAUDE_DIR, 'sessions', `${name}.json`),
+    JSON.stringify({
+      pid: Number(name.replace(/\D/g, '')) || 1,
+      sessionId: name,
+      cwd: WS,
+      kind: 'interactive',
+      entrypoint,
+      status,
+      statusUpdatedAt,
+      updatedAt: statusUpdatedAt,
+    })
+  );
+}
+
+/**
+ * [6]~[9] 用的会话状态文件**先全部写好**（名字用 i/j/k/l，避开 [5] 那几条已经占了 e/f/g）：
+ * claudeSessionStatus 的目录列举有 2s 缓存，中途新建的文件在这 2s 内看不见
+ * （生产上无所谓，测试里会把用例跑红）。
+ */
+writeSessionStatus('i', { status: 'idle', statusUpdatedAt: NOW - 25_000 }); // 早打断：idle 晚于开轮
+writeSessionStatus('j', { status: 'busy', statusUpdatedAt: NOW - 5_000 }); // 还在生成
+writeSessionStatus('k', { status: 'idle', statusUpdatedAt: NOW - 30_000 }); // idle 是开轮之前翻的
+writeSessionStatus('l', { status: 'idle', statusUpdatedAt: NOW - 500 }); // 刚开轮，落在宽限期内
 
 head('[1] taskId 占着 + transcript 末尾有 [Request interrupted by user] → 合成取消标记');
 scenario({ name: 'a', taskId: 't_a', startedAt: NOW - 30_000, interrupted: true });
@@ -197,6 +231,41 @@ head('[5] 打断后那口 stale 相位不许再当"实时相位"喂给控制台'
   scenario({ name: 'g', taskId: 't_g', startedAt: NOW - 30_000, interrupted: false, said: '在跑', phase: 'tool', phaseTs: NOW });
   const rp = readReporterPhase(WS, 'claude', 'g');
   ok('没打断 → 相位照常上报', Boolean(rp) && rp.phase === 'tool', JSON.stringify(rp));
+}
+
+head('[6] 早打断（transcript 一行都不写）：Claude 自己的会话状态说 idle → 也算取消');
+scenario({ name: 'i', taskId: 't_i', startedAt: NOW - 30_000, interrupted: false });
+{
+  const { cancels, bySession } = readReporterDones(WS, 'claude');
+  const hit = cancels.find((c) => c.sessionId === 'i') || null;
+  ok('cancels 含它（补发 task/end 用）', Boolean(hit), JSON.stringify(cancels));
+  ok('取消时刻用 statusUpdatedAt（不拿"现在"冒充）', Boolean(hit) && hit.at === NOW - 25_000, hit && String(hit.at));
+  const mark = bySession.get('i') || null;
+  ok('控制台那枚取消标记也在（红灯能亮）', Boolean(mark) && mark.cancelled === true, JSON.stringify(mark));
+}
+
+head('[7] 会话状态说 busy（还在生成）→ 不判取消');
+scenario({ name: 'j', taskId: 't_j', startedAt: NOW - 30_000, interrupted: false });
+{
+  const { cancels, bySession } = readReporterDones(WS, 'claude');
+  ok('cancels 不含还在跑的轮', !cancels.some((c) => c.sessionId === 'j'), JSON.stringify(cancels));
+  ok('也没有取消标记', !bySession.get('j'), JSON.stringify(bySession.get('j')));
+}
+
+head('[8] idle 是**开轮之前**翻的（statusUpdatedAt 早于本轮开始）→ 不判取消');
+scenario({ name: 'k', taskId: 't_k', startedAt: NOW - 10_000, interrupted: false });
+{
+  const { cancels, bySession } = readReporterDones(WS, 'claude');
+  ok('cancels 不含它', !cancels.some((c) => c.sessionId === 'k'), JSON.stringify(cancels));
+  ok('也没有取消标记', !bySession.get('k'), JSON.stringify(bySession.get('k')));
+}
+
+head('[9] 刚开轮 3s 内（可能还没翻 busy 的窗口）→ 不判取消，别误伤正常一轮');
+scenario({ name: 'l', taskId: 't_l', startedAt: NOW - 1_000, interrupted: false });
+{
+  const { cancels, bySession } = readReporterDones(WS, 'claude');
+  ok('cancels 不含刚提交的轮', !cancels.some((c) => c.sessionId === 'l'), JSON.stringify(cancels));
+  ok('也没有取消标记', !bySession.get('l'), JSON.stringify(bySession.get('l')));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
