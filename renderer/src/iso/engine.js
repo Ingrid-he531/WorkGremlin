@@ -101,6 +101,21 @@ const REPORT_TALK = 3.4;
  */
 const ENTER_DELAY = 400;
 const ENTER_STAGGER = 480;
+/**
+ * 大门开合：小怪物露面之前先把门推开，最后一只进屋之后门再自己合上。
+ * @property {number} DOOR_LEAD 提前多久开始开门（毫秒）—— 门先动、人后到
+ * @property {number} DOOR_SWING 开 / 关一趟的时长（秒）
+ * @property {number} DOOR_LINGER 最后一只进门后，门再撑多久才关（毫秒）
+ */
+const DOOR_LEAD = 420;
+const DOOR_SWING = 0.42;
+const DOOR_LINGER = 900;
+/** 门扇开到底的角度（度）：略过 90°，门才像"敞开抵在那儿"，而不是正好笔直戳出来 */
+const DOOR_OPEN_DEG = 96;
+/** 开合缓动：两头慢、中间快（门有重量，不会匀速甩） */
+const smooth = (t) => t * t * (3 - 2 * t);
+/** 走到这个 gx 就算"进屋了"：门洞在 gx=0，+0.55 时整个身子都在门里侧了 */
+const DOOR_INSIDE_X = 0.55;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /** 标识位图缓存：同一文本只渲染一次（标签现在会被放进排序层重画，不能每帧新建 canvas） */
@@ -469,9 +484,11 @@ export function createIsoOffice(canvas, opts = {}) {
       seat,
       x: seat.x,
       y: seat.y,
-      /** 入场时刻（performance.now 毫秒）：到点之前还没进门 —— 不画、不动，到点才出现在门口 */
+      /** 入场时刻（performance.now 毫秒）：到点之前还没进门 —— 不画、不动，到点才从门外走进来 */
       spawnAt,
       entering: spawnAt > 0,
+      /** 正在门洞里（门外 → 门内侧这一段）：这段时间大门得敞着（见 stepDoor） */
+      atDoor: false,
       facing: 1,
       mode: 'sit',
       moving: false,
@@ -681,7 +698,7 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function stepAgents(dt, now) {
     for (const a of agents) {
-      // 还没进门：先在门口候着（不画不动），到点才冒出来、沿过道走向自己工位
+      // 还没进门：先在门外候着（不画不动），到点才从门外走进来（门同时推开，见 stepDoor）
       if (a.entering) {
         if (now < a.spawnAt) continue;
         a.entering = false;
@@ -690,9 +707,13 @@ export function createIsoOffice(canvas, opts = {}) {
           a.x = a.seat.x;
           a.y = a.seat.y;
         } else {
-          a.x = PLACES.door.x;
-          // 门洞沿 gy 有 1 格宽，随机错开一点，前后两只不会精确地叠在一条线上
-          a.y = PLACES.door.y + (Math.random() - 0.5) * 0.5;
+          // 从**门外**起步（gx < 0 = 墙外的小走廊），穿过门洞再拐向工位 ——
+          // 门正是在这时候推开的（见 stepDoor），于是看着就是"门开了、人进来"。
+          // 随机错开一点：门洞沿 gy 有 1 格宽，前后两只不会精确地叠在一条线上。
+          // 只错 ±0.12（原来 ±0.25）：错太多会贴到门洞边上，被墙裁掉半边身子。
+          a.x = PLACES.doorOut.x;
+          a.y = PLACES.doorOut.y + (Math.random() - 0.5) * 0.24;
+          a.atDoor = true;
           a.facing = 1;
           a.mode = 'walk'; // 走的过程里得是"站着走"的姿态，到工位才坐下（pendingMode='sit'）
           goTo(a, a.seat, 'sit');
@@ -735,6 +756,8 @@ export function createIsoOffice(canvas, opts = {}) {
           goHome(a);
         }
       }
+      // 走进屋里了（整个身子过了门洞）→ 门不用再为它敞着
+      if (a.atDoor && a.x >= DOOR_INSIDE_X) a.atDoor = false;
 
       if (a.mode === 'sit' && !a.path.length && !a.inMeeting && now >= a.nextThink) {
         a.nextThink = now + 8000 + Math.random() * 16000;
@@ -2002,6 +2025,74 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
+  /* ------------------------------ 大门（会开合） ------------------------------ */
+
+  /**
+   * 大门开度 0..1（0 = 关严，1 = 开到底）；holdUntil = 在这个时刻之前门都敞着。
+   * 门板**不进背景缓存**：缓存只在相机变化时重画，画进去就永远推不开了。
+   */
+  const door = { a: 0, holdUntil: 0 };
+
+  /**
+   * 门跟着"谁要进门"走：有人快露面了（提前 DOOR_LEAD）、或还在门洞里，门就一直敞着；
+   * 人走完再撑 DOOR_LINGER 一档才合上 —— 不然最后一只刚跨进来，门就拍在它身上。
+   */
+  function stepDoor(dt, now) {
+    let busy = false;
+    for (const a of agents) {
+      if ((a.entering && now >= a.spawnAt - DOOR_LEAD) || a.atDoor) { busy = true; break; }
+    }
+    if (busy) door.holdUntil = Math.max(door.holdUntil, now + DOOR_LINGER);
+    const want = now < door.holdUntil ? 1 : 0;
+    const step = dt / DOOR_SWING;
+    door.a = want > door.a ? Math.min(1, door.a + step) : Math.max(0, door.a - step);
+  }
+
+  /** 门扇自由边的落点：绕门轴（门洞靠钟那一侧 gy = y0）往屋里转 DOOR_OPEN_DEG */
+  function doorLeafEdge() {
+    const d = WALL.door;
+    const w = d.y1 - d.y0;
+    const ang = ((DOOR_OPEN_DEG * Math.PI) / 180) * smooth(door.a);
+    return { d, fx: w * Math.sin(ang), fy: d.y0 + w * Math.cos(ang) };
+  }
+
+  /** 门洞那块四边形：小怪物还在墙外时，只有洞里这一块该看得见（其余让墙挡住） */
+  function doorwayPath(c) {
+    const d = WALL.door;
+    const p = [project(0, d.y0, d.z1), project(0, d.y1, d.z1), project(0, d.y1, d.z0), project(0, d.y0, d.z0)];
+    c.beginPath();
+    c.moveTo(p[0].x, p[0].y);
+    for (let i = 1; i < p.length; i += 1) c.lineTo(p[i].x, p[i].y);
+    c.closePath();
+  }
+
+  /** 门板：一块会绕门轴转开的板（凹板 + 上沿高光 + 把手），开合由 door.a 决定 */
+  function drawDoor(c) {
+    const { d, fx, fy } = doorLeafEdge();
+    /** 门扇上参数 t（0 = 门轴那侧，1 = 自由边）处、高度 z 的点 */
+    const at = (t, z) => project(t * fx, d.y0 + t * (fy - d.y0), z);
+    const z0 = d.z0 + 0.02;
+    const z1 = d.z1 - 0.02;
+    poly(c, [at(0, z1), at(1, z1), at(1, z0), at(0, z0)], '#2f3745');
+    // 上沿受光的一条窄边：门板才有厚度，不然看着是一张纸
+    poly(c, [at(0, z1), at(1, z1), at(1, z1 - 0.06), at(0, z1 - 0.06)], shade('#2f3745', 1.45));
+    // 凹进去的板面 + 它上沿压下来的一道暗边（门才不是一整块平板）
+    poly(c, [at(0.16, z1 - 0.14), at(0.84, z1 - 0.14), at(0.84, z0 + 0.18), at(0.16, z0 + 0.18)], '#242c38');
+    poly(c, [at(0.16, z1 - 0.14), at(0.84, z1 - 0.14), at(0.84, z1 - 0.2), at(0.16, z1 - 0.2)], '#1a1f28');
+    // 把手：装在自由边那侧（门轴在 gy = y0 那头，把手永远在它的对侧）
+    const k = at(0.86, 1.0);
+    c.beginPath();
+    c.arc(k.x, k.y, 2.2, 0, Math.PI * 2);
+    c.fillStyle = '#9aa7b8';
+    c.fill();
+  }
+
+  /** 门板在排序层里的位置：取门扇中线（关着时就等于门洞在墙面上那一格） */
+  function doorDepth() {
+    const { d, fx, fy } = doorLeafEdge();
+    return depthOf(fx / 2, (d.y0 + fy) / 2);
+  }
+
   function drawWalls(c) {
     const t = WALL.thickness;
     const h = WALL.h;
@@ -2151,16 +2242,18 @@ export function createIsoOffice(canvas, opts = {}) {
       });
     });
 
-    // 大门（左墙 gx = 0，挂在挂钟左侧。墙换了一面 → 用 'x' 面，a 轴变成 gy）
+    /* 大门（左墙 gx = 0，挂在挂钟左侧。墙换了一面 → 用 'x' 面，a 轴变成 gy）：
+       这里只画**门套 + 门洞**，会动的那扇门板在排序层逐帧画（见 drawDoor）——
+       画进背景缓存就永远推不开了（缓存只在相机变化时重画）。
+       洞里是墙外的小走廊：往里退一层再压深一档，才有"透出去"的深度。 */
     const d = WALL.door;
-    wallQuad(c, 'x', 0, d.y0, d.y1, d.z0, d.z1, '#2f3745');
-    wallQuad(c, 'x', 0, d.y0 + 0.06, d.y1 - 0.06, d.z0 + 0.06, d.z1 - 0.06, '#1a1f28');
-    // 门把手：装在靠钟那一侧的门边
-    const knob = project(0, d.y0 + 0.18, 1.0);
-    c.beginPath();
-    c.arc(knob.x, knob.y, 2, 0, Math.PI * 2);
-    c.fillStyle = '#9aa7b8';
-    c.fill();
+    wallQuad(c, 'x', 0, d.y0 - 0.09, d.y1 + 0.09, d.z0, d.z1 + 0.09, '#39424f'); // 门套
+    wallQuad(c, 'x', 0, d.y0, d.y1, d.z0, d.z1, '#10151e');                       // 洞口
+    c.save();
+    doorwayPath(c); // 退进去的那层比洞口大（往左上偏），得裁在洞里，不然会糊到墙上
+    c.clip();
+    wallQuad(c, 'x', -0.32, d.y0, d.y1, d.z0, d.z1, '#070a10');
+    c.restore();
     // 会议室白板（贴在后墙内侧）：0.09 铝框 + 框下内阴影 + 笔托（白板笔/板擦）。
     // 只画一块白板的的话太像一张纸 —— 边框的厚度、上亮下暗的框缘、凸出墙面的笔托才是"白板"。
     const wb = MEETING.whiteboard;
@@ -2492,6 +2585,7 @@ export function createIsoOffice(canvas, opts = {}) {
     last = now;
 
     stepAgents(dt, now);
+    stepDoor(dt, now);
     stepGhosts(dt, now);
     stepDispatch(now);
     stepReport(now);
@@ -2515,9 +2609,23 @@ export function createIsoOffice(canvas, opts = {}) {
 
     // 排序：家具 + 角色混在一起，depth 大的后画（挡住前面的）
     const items = statics.slice();
+    // 大门：门板会开合，所以也进排序层 —— 关着时正好盖住门洞，开着时挡在洞与过道之间
+    items.push({ depth: doorDepth(), draw: (c) => drawDoor(c) });
     for (const a of agents) {
       if (a.entering) continue; // 还没进门
-      items.push({ depth: depthOf(a.x, a.y), draw: (c) => drawAgent(c, a) });
+      // 还在墙外（gx < 0）：墙挡着的部分不该看得见，只裁出门洞里那一块
+      const outside = a.x < 0;
+      items.push({
+        depth: depthOf(a.x, a.y),
+        draw: (c) => {
+          if (!outside) { drawAgent(c, a); return; }
+          c.save();
+          doorwayPath(c);
+          c.clip();
+          drawAgent(c, a);
+          c.restore();
+        },
+      });
     }
     for (const g of ghosts) items.push({ depth: depthOf(g.x, g.y) + 3, draw: (c) => drawGhostSprite(c, g) });
     if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, dispatchGhost) });
@@ -2556,7 +2664,8 @@ export function createIsoOffice(canvas, opts = {}) {
       pushHit(g.memberId, s.x - hw, s.y - h - 16, s.x + hw, s.y + 6);
     }
     for (const a of agents) {
-      if (a.entering) continue; // 还没进门：不进屏幕坐标表，头顶标签和点选也就一并跟着不出现
+      // 还没进门 / 还在墙外（身子还被墙挡着）：不进屏幕坐标表，头顶标签和点选也就一并跟着不出现
+      if (a.entering || a.x < 0) continue;
       const s = toScreen(a.x, a.y, 0);
       screenPos.set(a.memberId, s);
       const h = SPRITE_H * UNIT_Z * cam.zoom;
