@@ -2002,60 +2002,6 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
-  // 靠近镜头的两面墙（右 gx = ROOM.w、前 gy = ROOM.d）：这个角度看到的是它们的外侧墙面。
-  // 做成矮墙 + 玻璃幕墙：既把长方体围合完整（地面四边才是个完整的平行四边形），又不挡住屋里。
-  // 矮墙是实心的、玻璃上的框线（上沿 + 竖挺）也是挡在镜头与屋子之间的实体 → 都不画在背景层，
-  // 改由 drawNearLowWalls / drawNearGlassFrame 排在所有屋里物件之后（见下面说明）。
-  // 只有那层几乎全透的玻璃面留在背景：alpha 只有 0.085~0.1，留在后面不会露出破绽，
-  // 反过来若放到最后画，等于给屋里所有东西糊一层蓝膜，反而把画面压灰。
-  const NEAR = [
-    { axis: 'x', fixed: ROOM.w, a0: 0, a1: ROOM.d, k: 0.72, ga: 0.1 },
-    { axis: 'y', fixed: ROOM.d, a0: 0, a1: ROOM.w, k: 0.6, ga: 0.085 },
-  ];
-  const NEAR_HALF_H = 0.55;
-  const NEAR_FRAME = 'rgba(143,182,255,0.3)';
-  /* 竖挺落在矮墙上的那截：矮墙是实心的，同样的 alpha 会比在玻璃上更闷一点，
-     稍微提一档，上下两截看着才是同一根（不然矮墙顶上会有一道"换色"的横断口）。 */
-  const NEAR_MULLION_BASE = 'rgba(152,192,255,0.38)';
-  // 玻璃上沿单独一档：它是墙顶那条边的延续，太淡会看着像"边断在角上"
-  const NEAR_RAIL = 'rgba(150,186,255,0.5)';
-  const NEAR_RAIL_H = 0.11;
-
-  function drawNearLowWalls(c) {
-    NEAR.forEach((n) => {
-      // 矮墙只画实心墙身：矮墙与玻璃的交界**不画横框** —— 一道横线等于把墙切成上下两截，
-      // 竖挺通到底已经把两者扎成一整面墙了，再描一道边反而露出拼接感。
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, 0, NEAR_HALF_H, shade(colors.wall, n.k));
-    });
-  }
-
-  /**
-   * 近处幕墙的框线：玻璃上沿 + 竖挺。
-   * 它们和矮墙一样挡在镜头与屋子之间 —— 屋里任何东西（走到跟前的小怪物、贴着这面墙的家具）
-   * 只要在屏幕上跟它重叠，就该被它切掉一块。留在背景层的话会被后画的屋里物件盖住，
-   * 看起来就是"竖挺断了 / 上沿被吃掉一截"，所以跟矮墙一起排到最后画。
-   *
-   * 近处两面**不画墙顶**：那是一整圈厚 0.28 的实体顶面，压在玻璃上沿上又重又挡视线
-   * （屋里靠前的一切都被它切掉一条）。改由这道上沿收边 —— 后墙/左墙的墙顶在远端收口时
-   * 与玻璃面齐平（见 drawWalls），墙顶那条边正好落在这道上沿的延长线上，看上去是一条连续的边。
-   *
-   * 竖挺（竖条）**从地面 0 一直画到墙顶 h**，中间在矮墙顶（NEAR_HALF_H）不断：
-   * 只画在玻璃段的话，矮墙和幕墙就是"两截拼起来的"；一根竖挺通到底，整面墙才是一体的 ——
-   * 矮墙是这根竖挺的基座，玻璃是它嵌的芯（交界处也不画横框，见 drawNearLowWalls）。
-   */
-  function drawNearGlassFrame(c) {
-    const h = WALL.h;
-    NEAR.forEach((n) => {
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, h - NEAR_RAIL_H, h, NEAR_RAIL);
-      for (let k = Math.ceil(n.a0 + 1); k < n.a1 - 0.5; k += 2) {
-        // 矮墙段（一直到地面）：压在实心矮墙上，与玻璃段在 NEAR_HALF_H 处无缝接上
-        wallQuad(c, n.axis, n.fixed, k - 0.04, k + 0.04, 0, NEAR_HALF_H, NEAR_MULLION_BASE);
-        // 玻璃段
-        wallQuad(c, n.axis, n.fixed, k - 0.04, k + 0.04, NEAR_HALF_H, h, NEAR_FRAME);
-      }
-    });
-  }
-
   function drawWalls(c) {
     const t = WALL.thickness;
     const h = WALL.h;
@@ -2068,15 +2014,14 @@ export function createIsoOffice(canvas, opts = {}) {
     // 左墙内表面（gx = 0）：沿 +gy 方向斜下去的另一半
     wallQuad(c, 'x', 0, 0, ROOM.d, 0, h, shade(colors.wall, 0.82));
 
-    NEAR.forEach((n) => {
-      // 玻璃面（几乎全透，留在背景；框线不在这里画，见 drawNearGlassFrame）
-      wallQuad(c, n.axis, n.fixed, n.a0, n.a1, NEAR_HALF_H, h, `rgba(127,176,255,${n.ga})`);
-    });
+    /* 靠近镜头的两面（右 gx = ROOM.w、前 gy = ROOM.d）**不砌墙**：这一侧朝镜头敞开，
+       屋里的一切（贴边走的精灵、靠前的家具）都不会被矮墙 / 玻璃框线切掉一块。
+       地面的那条边界线（见 drawFloor）仍然把房间收成一个完整的平行四边形。 */
 
     // 墙顶：只有后（gy=0）、左（gx=0）两面是实心墙才有这道顶面；屋里的一切都在它们前面，
     // 所以留在背景层（放到最后画会糊住站在墙前的角色）。
-    // 两端收在与幕墙玻璃面齐平的位置（x 到 ROOM.w、y 到 ROOM.d）：这样墙顶这条边
-    // 正好落在玻璃上沿那道线的延长线上，前后是一条连续的边，不会再"接不上"。
+    // 两端在房间的两个角上收口（x 到 ROOM.w、y 到 ROOM.d）：近侧那两面不砌墙，
+    // 墙顶就到角为止，不再需要跟玻璃上沿对齐。
     isoDiamond(c, { x: -t, y: -t, w: ROOM.w + t, d: t, z: h, fill: colors.wallTop });
     isoDiamond(c, { x: -t, y: -t, w: t, d: ROOM.d + t, z: h, fill: shade(colors.wallTop, 0.92) });
 
@@ -2579,10 +2524,6 @@ export function createIsoOffice(canvas, opts = {}) {
     if (reportGhost) items.push({ depth: depthOf(reportGhost.x, reportGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, reportGhost) });
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
-
-    // 近处幕墙：实心矮墙 + 玻璃上的框线，屋里的一切都在它们后面 → 最后画，挡住该挡的
-    drawNearLowWalls(ctx);
-    drawNearGlassFrame(ctx);
 
     // 路网调试
     if (showPaths) {
