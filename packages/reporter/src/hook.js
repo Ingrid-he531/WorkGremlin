@@ -1658,6 +1658,68 @@ async function main() {
       ...(reason ? { reason } : {}),
     });
 
+  /**
+   * 这一轮**取消**收尾（`Interrupt` 与 `FinalStop(cancelled|interrupted)` 共用）。
+   *
+   * 与 Stop 那条"正常收工"同一条记录线，只有三点不同：
+   *   ① `task/end` 报 `state: 'cancelled'`（台账那行不能算「完成」）；
+   *   ② 落的那枚完成标记多一个 `cancelled: true`（主控制台据此亮红色「任务取消」）；
+   *   ③ 收尾相位落成显式 idle（不留旧相位，红色才不会被 stale 的「思考中/调用工具」顶回去）。
+   * 产出照「任务完成」记录：这一轮已经吐出来的文字（result / 对话记录 / done.said）与改过的文件
+   * （task/end.files）都带上 —— 取消只是"没干完"，不是"没产出"；真没有才落空、界面写「没有输出」。
+   * @param {any} ev0 触发取消的事件（Interrupt / FinalStop）
+   */
+  const finishCancelled = async (ev0) => {
+    // 被打断的这一轮：之后再来一句 user，本轮回复就永远落在"上一条 user 之前"了 —— 先补一刀留档。
+    const st0 = readState(file);
+    const taskId0 = st0.taskId || '';
+    const startedAt0 = Number(st0.taskStartedAt) || 0;
+    const replies0 = turnReplies(ev0.transcript_path || st0.transcriptPath || '');
+    await reportAiReplies(info, base, AGENT, taskId0, replies0, String((ev0 && ev0.session_id) || st0.sessionId || ''), cl);
+    sweepGhosts(file, REAL_WS, cl);
+    const files0 = collectRoundFiles(st0, ev0, cwd, startedAt0);
+    const last0 = replies0.length ? replies0[replies0.length - 1].text : '';
+    const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    const result0 = String(last0 || '').trim().slice(0, RESULT_MAX);
+    if (taskId0) {
+      await request(info, HTTP_ROUTES.TASK_END, {
+        ...base,
+        memberId: AGENT,
+        taskId: taskId0,
+        state: 'cancelled',
+        model: String(ev0.model || ''),
+        // 有输出就带上（与「任务完成」同一条线）；没有就是空串，服务端显示"无产出摘要"
+        result: result0,
+        files: files0,
+        fileCount: files0.length,
+        form: sessionForm(st0, ev0),
+      });
+    }
+    writeState(file, {
+      taskId: null,
+      taskWorkspacePath: '',
+      taskStartedAt: 0,
+      roundFiles: [],
+      // 打断之后不留旧相位（否则红色「任务取消」会被 stale 的『思考中 / 调用工具』盖回去，
+      // 而且会因为新鲜期一直挂着，控制台迟迟回不到待命）。显式 idle，理由同 Stop 那一处。
+      sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: REAL_WS },
+      done: {
+        at: Date.now(),
+        title: st0.taskTitle || '',
+        workspacePath: REAL_WS,
+        startedAt: startedAt0,
+        // 这一轮已经吐出来的话照常记（有就记、没有就空 —— 与「任务完成」一致）
+        said: said0,
+        sessionId: String((ev0 && ev0.session_id) || st0.sessionId || ''),
+        files: files0.slice(0, 8),
+        fileCount: files0.length,
+        cancelled: true,
+      },
+    });
+    await beat();
+    await status('idle');
+  };
+
   // 会话边界的事件才 register（工具前后各 register 一次太吵）；
   // 但中途才装上 hook 的话第一个事件也可能是 SessionStart 之外的，所以 UserPromptSubmit / Stop 也补一次。
   if (event === 'SessionStart') {
@@ -2045,62 +2107,25 @@ async function main() {
     return;
   }
 
-  // 打断（ESC / 停止）：这一轮被用户掐掉了 —— 只收孤儿幽灵，并把这一轮按"取消"收尾。
+  // 打断（ESC / 停止）：这一轮被用户掐掉了 —— 收孤儿幽灵，并把这一轮按"取消"收尾。
   if (event === 'Interrupt') {
-    // 被打断的这一轮：之后再来一句 user，本轮回复就永远落在"上一条 user 之前"了 —— 先补一刀留档。
-    const stInt = readState(file);
-    const taskIdInt = stInt.taskId || '';
-    const startedAtInt = Number(stInt.taskStartedAt) || 0;
-    const repliesInt = turnReplies(ev.transcript_path || stInt.transcriptPath || '');
-    await reportAiReplies(info, base, AGENT, taskIdInt, repliesInt, String((ev && ev.session_id) || stInt.sessionId || ''), cl);
-    sweepGhosts(file, REAL_WS, cl);
-    /* 取消标记：与 Stop 落的那枚 done **同形**（同一个 done 字段，多一个 cancelled:true），
-       服务端与渲染层照同一条路透传 —— 主控制台据此亮红色「任务取消」，
-       而不是把被打断的这一轮当成「任务完成」（用户没让它干完，就不该报完成）。
-       清单照样带"取消前已经动了哪些文件"；**这一轮已经吐出来的文字 / 改过的文件照常记录**
-       （和「任务完成」同一套：task_runs.result + 对话记录 + done 概要）——
-       取消只是"没干完"，不是"没产出"；真的一点产出都没有才落空、界面写「没有输出」。 */
-    const filesInt = collectRoundFiles(stInt, ev, cwd, startedAtInt);
-    const lastInt = repliesInt.length ? repliesInt[repliesInt.length - 1].text : '';
-    const saidInt = String(lastInt || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-    const resultInt = String(lastInt || '').trim().slice(0, RESULT_MAX);
-    if (taskIdInt) {
-      await request(info, HTTP_ROUTES.TASK_END, {
-        ...base,
-        memberId: AGENT,
-        taskId: taskIdInt,
-        state: 'cancelled',
-        model: String(ev.model || ''),
-        // 有输出就带上（与「任务完成」同一条线）；没有就是空串，服务端显示"无产出摘要"
-        result: resultInt,
-        files: filesInt,
-        fileCount: filesInt.length,
-        form: sessionForm(stInt, ev),
-      });
+    await finishCancelled(ev);
+    return;
+  }
+
+  /* CodeBuddy 家族（CLI 与 IDE 扩展）的**一轮终态**事件：payload 带
+     `final_stop_reason ∈ completed | cancelled | failed | interrupted`（实测 2026-09-29，
+     codebuddy 的 dist 里 executeFinalStopHooks 就是这么发的）。
+     这是"用户按了停止"的**主动信号** —— 1F 以前靠服务端猜（taskId 卡死 + transcript 末轮 running），
+     会把"还在慢慢想"的长轮误判成取消，那条兜底已删（见 server/src/sessions.js）。
+     这里只处理**取消**那两种：completed / failed 交给 Stop 那条正常收工的路（它本来就在收），
+     在这儿再插一手会重复收工。 */
+  if (event === 'FinalStop') {
+    const reason = String((ev && ev.final_stop_reason) || '').trim().toLowerCase();
+    if (reason === 'cancelled' || reason === 'canceled' || reason === 'interrupted' || reason === 'aborted') {
+      trace('final-stop-cancelled', { agent: AGENT, reason, sessionId: SESSION });
+      await finishCancelled(ev);
     }
-    writeState(file, {
-      taskId: null,
-      taskWorkspacePath: '',
-      taskStartedAt: 0,
-      roundFiles: [],
-      // 同理：打断之后不留旧相位（否则红色「任务取消」会被 stale 的『思考中 / 调用工具』盖回去，
-      // 而且会因为新鲜期一直挂着，控制台迟迟回不到待命）。显式 idle，理由同上面 Stop 那一处。
-      sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: REAL_WS },
-      done: {
-        at: Date.now(),
-        title: stInt.taskTitle || '',
-        workspacePath: REAL_WS,
-        startedAt: startedAtInt,
-        // 这一轮已经吐出来的话照常记（有就记、没有就空 —— 与「任务完成」一致）
-        said: saidInt,
-        sessionId: String((ev && ev.session_id) || stInt.sessionId || ''),
-        files: filesInt.slice(0, 8),
-        fileCount: filesInt.length,
-        cancelled: true,
-      },
-    });
-    await beat();
-    await status('idle');
     return;
   }
 

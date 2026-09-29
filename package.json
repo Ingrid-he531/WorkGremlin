@@ -51,6 +51,7 @@
     "test:project-attribution": "node server/test/projectAttribution.test.js",
     "test:cancel": "node server/test/interruptCancel.test.js",
     "test:codebuddy-cancel": "node server/test/codebuddyCancel.test.js",
+    "test:final-stop": "node server/test/finalStop.test.js",
     "test:stop-interrupt": "node server/test/stopInterrupt.test.js",
     "test:task-runs-route": "node server/test/taskRunsRoute.test.js",
     "test:task-sync": "node server/test/taskSync.test.js"

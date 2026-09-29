@@ -102,6 +102,20 @@ const EVENTS = [
   ['SessionEnd', ''],
 ];
 
+/**
+ * CodeBuddy / WorkBuddy 的事件表 = EVENTS + `FinalStop`。
+ *
+ * `FinalStop` 是 CodeBuddy 家族的**一轮终态**事件，payload 带
+ * `final_stop_reason ∈ completed | cancelled | failed | interrupted`
+ * （实测 2026-09-29：dist 的 `executeFinalStopHooks(sessionId, reason)` 里发这个事件）。
+ * 1F 靠它认"用户按了停止"—— 以前靠服务端猜（taskId 卡死 + transcript 末轮 state='running'），
+ * 会把"模型纯推理超过 2 分钟、中间没有工具事件"的长轮误判成取消，那条兜底已删
+ * （见 server/src/sessions.js / packages/reporter/src/hook.js 的 finishCancelled）。
+ *
+ * **Trae 不并进来**：它是另一家的 VS Code 分支，不认识这个事件名就别硬塞（沿用 EVENTS）。
+ */
+const CODEBUDDY_EVENTS = [...EVENTS, ['FinalStop', null]];
+
 function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
@@ -415,9 +429,9 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
     return out;
   };
-  const codebuddyOurs = buildOurs(EVENTS, codebuddyCmd);
+  const codebuddyOurs = buildOurs(CODEBUDDY_EVENTS, codebuddyCmd);
   const codexOurs = buildOurs(CODEX_EVENTS, codexCommand());
-  const workbuddyOurs = buildOurs(EVENTS, workbuddyCommand());
+  const workbuddyOurs = buildOurs(CODEBUDDY_EVENTS, workbuddyCommand());
   const traeOurs = buildOurs(EVENTS, traeCommand());
   const claudeOurs = buildOurs(CLAUDE_EVENTS, claudeCommand());
   const qoderOurs = buildOurs(QODER_EVENTS, qoderCommand());
@@ -600,7 +614,7 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   return result;
 }
 
-module.exports = { installHooks, HOOK_SCRIPT, EVENTS, CODEX_EVENTS, CLAUDE_EVENTS };
+module.exports = { installHooks, HOOK_SCRIPT, EVENTS, CODEBUDDY_EVENTS, CODEX_EVENTS, CLAUDE_EVENTS };
 
 if (require.main === module) {
   try {
