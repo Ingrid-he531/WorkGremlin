@@ -890,8 +890,8 @@ const NEVER_AWAIT_TOOLS = new Set([
  * 直接标 await，结果点了 run 之后没有任何事件能把它清掉，主控制台就一路卡在「等待授权」。
  *
  * 现在服务端只如实上报：相位 tool（调用工具）+ 工具名 + 实际命令。
- * "要不要提示需要授权"交给渲染层按 tool 判断（见 renderer/src/iso/mainConsole.js 的
- * drawConsoleScreen），这样展示口径改起来不用动服务端。真正的授权信号（Notification）来时，
+ * 展示层一律写「调用工具」（不再按工具名换文案），这样展示口径改起来不用动服务端。
+ * 真正的授权信号（Notification）来时，
  * 仍走下面 rp.phase === 'await' 那条真值分支——那段逻辑保留不动。
  */
 

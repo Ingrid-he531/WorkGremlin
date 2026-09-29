@@ -66,25 +66,16 @@ export const PHASE_LIST = Object.keys(PHASES);
 const FONT = 'ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
 
 /**
- * 命令类工具（Bash / Shell / 终端 …）判断：真实链路里 tool 是工具名（"Bash"），
- * mock 里可能带着命令（"bash: npm run build"），所以用"包含"匹配而不是全等。
- */
-const isBashTool = (tool) => /\b(bash|shell|terminal|sh|cmd|powershell|exec|zsh)\b/i.test(String(tool || ''));
-/** 命令类工具在"调用工具"相位上的文案；除这一行之外，其它展示（操作 / 上下文）全部照旧 */
-const BASH_LABEL = '调用工具，需要授权';
-
-/**
  * 屏上第一层 与 tooltip 第一行**共用的**相位文案（两处口径永远一致）。
  *
- * 命令类工具（Bash / Shell …）在"调用工具"相位上换成「调用工具，需要授权」；
- * 其它相位（done / await / 待命 / 思考中 …）一律用 PHASES 的原标签 ——
- * 否则 tool 字段残留上一支 Bash 时，"需要授权"会串到「任务完成」这些相位上。
- * @param {{phase?:string, tool?:string}} state
+ * 一律取 PHASES 的原标签，不按工具名换文案：调用工具就写「调用工具」。
+ * 工具名只说明"上一支调的是什么"，不足以说明"正在等授权" —— 命令类工具（Bash / Shell）
+ * 以前会被换成「调用工具，需要授权」，既串到「任务完成」这些相位上（tool 字段残留），
+ * 也让人以为卡住了。真正的授权信号由 await 相位单独表示，不靠工具名猜。
+ * @param {{phase?:string}} state
  */
 export function consolePhaseLabel(state) {
-  const ph = PHASES[String((state && state.phase) || 'idle')] || PHASES.idle;
-  if (state && state.phase === 'tool' && isBashTool(state.tool)) return BASH_LABEL;
-  return ph.label;
+  return (PHASES[String((state && state.phase) || 'idle')] || PHASES.idle).label;
 }
 
 /** 剪影：跟精灵同一套局部单位（70 ≈ 1.55 tile 高），坐着所以整体矮一截 */
@@ -234,10 +225,9 @@ export function drawConsoleScreen(c, o) {
 
   /* 唯一一层内容：相位状态（思考中 / 调用工具 …）。
      只显示状态，不显示具体 prompt、读写文件、调用工具的细节 —— 那些留在 tooltip / 对话记录里。
-     命令类工具（Bash / Shell）：相位文案与 tooltip 第一行走同一个 consolePhaseLabel()
-     （"调用工具，需要授权"）；文案长就自动缩字号，别被 fit 截成"调用工具，需…"。
-     待命中缓慢呼吸，执行中常亮。文字按整宽排 —— 不跟闪烁光标
-     （给它预留位置会把"调用工具，需要授权"挤成省略号）。 */
+     文案与 tooltip 第一行走同一个 consolePhaseLabel()（调用工具就写「调用工具」）；
+     文案长就自动缩字号，别被 fit 截成省略号。
+     待命中缓慢呼吸，执行中常亮。文字按整宽排 —— 不跟闪烁光标（给它预留位置会把文案挤成省略号）。 */
   const blink = ph.busy ? 1 : 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(now / 700));
   const label = consolePhaseLabel(state);
   let lfs = fs1;

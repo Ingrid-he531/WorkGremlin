@@ -14,16 +14,15 @@
  *   2) 调用工具若是 Bash/Shell 类：**不再**按 await（等待授权）处理 —— 插件既不发
  *      "等授权"通知也不发"授权结束"通知，命令类工具又不发 PostToolUse，一旦标成 await
  *      就再也没有事件能把它清掉（点了 run 还一直显示「等待授权」）。
- *      现在服务端一律报 tool（调用工具 + 实际命令），"要不要提示需要授权"交给渲染层按 tool
- *      判断：屏上第一行与 tooltip 第一行一起换成「调用工具，需要授权」
- *      （见 iso/mainConsole.js 的 consolePhaseLabel），操作仍是实际命令，互不串味；
+ *      现在服务端一律报 tool（调用工具 + 实际命令），渲染层也不再按工具名换文案：
+ *      屏上第一行与 tooltip 第一行统一写「调用工具」（见 iso/mainConsole.js 的
+ *      consolePhaseLabel），操作仍是实际命令，互不串味；
  *   3) 会话停止（setLiveState/applySession 收到 null，或手动 stop）时，先亮出
  *      "任务完成/已暂停" 摘要（summarize）持续 10s，期间无新事件则退回待命(idle)。
  */
 
 import { defineStore, acceptHMRUpdate } from 'pinia';
-// 相位文案（含命令类工具的「调用工具，需要授权」）只有一份实现：屏上第一行与 tooltip 第一行
-// 都走 consolePhaseLabel()，改口径只需动那一处。
+// 相位文案只有一份实现：屏上第一行与 tooltip 第一行都走 consolePhaseLabel()，改口径只需动那一处。
 import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
@@ -41,8 +40,8 @@ const SCRIPT = [
   { phase: 'done', action: '任务完成', context: ['任务：重构用户登录模块', '已交付：登录链路重构', '改动 3 个文件'], skill: '', tool: '', prompt: '', ms: 5000 },
 ];
 
-// 命令类工具（Bash / Shell / 终端 …）的"需要授权"提示不再写进 context —— 它只在相位那一行
-// 出现（见 consolePhaseLabel）。写进 context 会顺着 enterDone 的"沿用最后上下文"漏到「任务完成」上。
+// 命令类工具（Bash / Shell / 终端 …）不再额外提示"需要授权"：既不写进 context，也不改相位文案
+// （见 consolePhaseLabel）—— 写进 context 会顺着 enterDone 的"沿用最后上下文"漏到「任务完成」上。
 
 /** 定时器放在 store 外面：它不属于"状态"，也没必要进 devtools */
 let timer = null;
@@ -73,7 +72,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
   getters: {
     /** 交给引擎的那一份：新对象，watch 才收得到变化 */
     snapshot: (s) => ({ phase: s.phase, action: s.action, skill: s.skill, tool: s.tool, context: s.context, target: s.target, prompt: s.prompt }),
-    /** tooltip 第一行：与屏上第一行同源（consolePhaseLabel），命令类工具同样显示「调用工具，需要授权」 */
+    /** tooltip 第一行：与屏上第一行同源（consolePhaseLabel），调用工具一律显示「调用工具」 */
     phaseLabel: (s) => consolePhaseLabel(s),
     phaseColor: (s) => (PHASES[s.phase] || PHASES.idle).color,
   },
@@ -88,7 +87,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.skill = step.skill || '';
       this.tool = step.tool || '';
       // 点2：mock 里工具若是 Bash/Shell 类（`bash: npm run build`），相位照旧是 tool，
-      // "需要授权"由 consolePhaseLabel 按 tool 判断后写在相位行上，context 保持原样。
+      // 文案也照旧是「调用工具」（不再按工具名换「需要授权」），context 保持原样。
       this.context = step.context || [];
       this.target = step.target || null;
       this.prompt = step.prompt || '';
@@ -156,8 +155,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * 阶段映射（hook 的 AGENT_STATES -> 主控制台 PHASES）：
      *   busy    -> tool  （调用工具 / 干活中）
      *             命令类工具（Bash/Shell）也一样是 tool：插件不发"等授权 / 授权结束"通知，
-     *             标成 await 就再没有事件能把它清掉。要不要提示"需要授权"由渲染层按 tool 判断，
-     *             且只改屏上那行（见 iso/mainConsole.js 的 drawConsoleScreen），action（操作）仍是实际命令。
+     *             标成 await 就再没有事件能把它清掉。相位文案一律「调用工具」，不按工具名换
+     *             （见 iso/mainConsole.js 的 consolePhaseLabel），action（操作）仍是实际命令。
      *   blocked -> await（等用户授权；工具与目标走会话落盘的 await 叠加）
      *             注：await 相位仍然只认服务端给的真值（Notification 等授权 -> await，
      *             授权结束 -> 回落其它相位），渲染层不自己推断。
@@ -264,7 +263,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
     /**
      * 收尾相位的共同部分（done / cancelled 都走这里）：停掉 mock、清掉工具名与 prompt、
      * 亮 10s 再退回待命。
-     * 收尾相位要把工具名清掉：残留的 Bash 会让「需要授权」串到「任务完成 / 任务取消」上。
+     * 收尾相位把工具名与 prompt 一起清掉：这轮已经结束，别把上一轮的工具名留在状态里。
      * @param {'done'|'cancelled'} phase 收尾相位
      * @param {string} summary 第二层动作文案
      * @param {string[]} context 第三层概要
