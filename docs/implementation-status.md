@@ -91,6 +91,13 @@ hook 以前把 `workspacePath` 取成 `/api/v1/workspace`（办公室当前工�
 工程 → 找不到再按 `package.json name > 目录名` 建一条），没带 `workspacePath` 的老上报退回
 `body.project`（行为不变）。回归见 `npm run test:project-attribution`。
 
+任务详情里的「工程」显示的是**按目录现算**的名字（`/task-runs` 的 `project_label` =
+`resolveProjectName(project.workspace_path)`，与"打开工程"同一口径），不是库里那行
+`projects.name` —— 同名不同目录时办公室会给新工程的 id / name 加冲突后缀（实测：
+`/home/yinghui/work/stb-insight` 的 `package.json name` 是 `stb-dashboard`，但那个 id 早被
+一行历史脏数据占了，于是库里叫 `stb-dashboard-2`），显示时要用目录算出来的那个名字。
+读不到目录才退回 `projects.name`。
+
 **IDE 形态（Codex 的 VS Code 扩展 / app-server）的两个坑（2026-09-27 修）**：
 ① 提交的 prompt 是**拼好的** —— IDE 在前面注入 `# Context from my IDE setup:` / `## Active file:` /
 `## Open tabs:`，用户那句话在 `## My request:` 之后。hook 按 `userRequestText()` 只取请求正文：

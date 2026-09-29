@@ -5,6 +5,7 @@
 const express = require('express');
 const { DEFAULTS } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
+const { resolveProjectName } = require('../../project');
 
 /**
  * 楼层筛选参数 → client 列表。
@@ -18,6 +19,32 @@ function clientFilter(raw) {
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter((s) => s && s !== 'all');
+}
+
+/**
+ * 工程目录 → 显示名（`package.json name > 目录名`，与"打开工程"用的
+ * `server/src/project.js` 的 resolveProjectName 同一口径）。
+ *
+ * 为什么按目录现算、而不是直接用 projects.name：同名不同目录时，办公室会给新工程的
+ * id / name 加冲突后缀（实测：`/home/yinghui/work/stb-insight` 的 package.json name 是
+ * `stb-dashboard`，但那个 id 早在 09-20 就被一行历史脏数据占了，于是新工程叫 `stb-dashboard-2`）。
+ * 目录名 / 包名才是用户认得出的名字。
+ *
+ * 缓存 60 秒：`/task-runs` 一次最多 2000 行，工程却只有几个 —— 不缓存就是每行读一次 package.json。
+ * 读不到目录（工程被删 / 挪走）或没有 package.json 时退回库里的 name。
+ * @param {{project_workspace_path?:string, project_name?:string, project_id?:string}} row
+ */
+const _projectLabelCache = new Map();
+function projectLabelOf(row) {
+  const ws = String((row && row.project_workspace_path) || '').trim();
+  const fallback = String((row && row.project_name) || (row && row.project_id) || '');
+  if (!ws) return fallback;
+  const now = Date.now();
+  const hit = _projectLabelCache.get(ws);
+  if (hit && now - hit.at < 60_000) return hit.label || fallback;
+  const label = resolveProjectName(ws) || fallback;
+  _projectLabelCache.set(ws, { at: now, label });
+  return label;
 }
 
 /**
@@ -133,6 +160,10 @@ function createQueryRouter({ bus, repo }) {
            -- projects.name 是"打开工程"时按 package.json name > 目录名 落的名字；
            -- 取不到（老数据 / 工程行被清过）时前端退回 project_id。
            p.name AS project_name,
+           -- 工程目录：任务详情「工程」显示的名字按它现算（见 projectLabelOf）——
+           -- 工程 id / name 可能带冲突后缀（同名不同目录：stb-dashboard-2），
+           -- 而"这个目录现在叫什么名字"才是用户认得出的那个名字。
+           p.workspace_path AS project_workspace_path,
            tr.model AS model,
            tr.file_count AS file_count,
            tr.files_json AS files_json,
@@ -163,6 +194,15 @@ function createQueryRouter({ bus, repo }) {
       ...r,
       duration_ms: r.ended_at && r.started_at ? r.ended_at - r.started_at : null,
       subagentCount: repo.countSubagentRuns.get(r.id).c,
+      /**
+       * 任务详情「工程」显示的名字：按工程**目录**现算（`package.json name > 目录名`，
+       * 与"打开工程"同一口径），拿不到目录/读不到 name 才退回库里那行 projects.name。
+       * 为什么不用 projects.name：同名不同目录时办公室会给 id / name 加冲突后缀
+       * （实测：stb-insight 的 package.json name 是 stb-dashboard，但 id 已被一行历史脏数据占了，
+       * 于是新工程叫 stb-dashboard-2）—— 目录名才是用户认得出的那个名字。
+       * 目录 → 名字的解析结果按目录缓存（同一工程几十上百条任务，别每条都去读 package.json）。
+       */
+      project_label: projectLabelOf(r),
       /**
        * 这一轮用过的工具 + 次数（任务详情里的「工具使用」）。
        * 真源是 tool_usage 表（上报方每调用一次工具 +1，见 bus.toolUse）；没有记录就是空数组，

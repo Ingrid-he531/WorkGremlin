@@ -515,10 +515,12 @@ async function saveRetention() {
             <div class="k">进度</div><div class="v">{{ fmtProgress(tasks.selectedTask.progress) }}</div>
             <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
             <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
-            <!-- 工程：这一轮归属的工程名（服务端按 project_id join projects 取名，见 /task-runs）；
-                 取不到就退回 project_id，再没有才写占位，绝不编造 -->
+            <!-- 工程：这一轮归属的工程名。服务端按工程**目录**现算（package.json name > 目录名，
+                 与"打开工程"同一口径，见 /task-runs 的 project_label）；拿不到目录才退回库里的
+                 projects.name（可能带同名冲突后缀，如 stb-dashboard-2），再没有退 project_id，
+                 最后才写占位 —— 绝不编造 -->
             <div class="k">工程</div>
-            <div class="v">{{ tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
+            <div class="v">{{ tasks.selectedTask.project_label || tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
             <div class="k">文件变化</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>

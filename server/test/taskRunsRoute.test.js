@@ -79,6 +79,42 @@ function seedTask(id, form, startedAt) {
 seedTask('t-plugin', 'plugin', 2000);
 seedTask('t-cli', 'cli', 1000);
 seedTask('t-old', null, 500); // 老数据：没有形态
+// 同名不同目录：这一层的 id / name 被加了冲突后缀（stb-dashboard-2），但目录里的
+// package.json name 才是用户认得出的名字 —— 任务detail「工程」要显示后者（见 query.js 的 projectLabelOf）
+const WS2 = path.join(TMP, 'stb-insight');
+fs.mkdirSync(WS2, { recursive: true });
+fs.writeFileSync(path.join(WS2, 'package.json'), JSON.stringify({ name: 'stb-dashboard' }));
+repo.upsertProject.run({
+  id: 'stb-dashboard-2',
+  name: 'stb-dashboard-2',
+  workspacePath: WS2,
+  mainConversationId: null,
+  source: 'report',
+  createdAt: 3,
+});
+repo.insertTask.run({
+  id: 't-stb',
+  projectId: 'stb-dashboard-2',
+  memberId: 'claude@stb-dashboard-2',
+  parentTaskId: null,
+  title: 't-stb',
+  state: 'done',
+  progress: 1,
+  startedAt: 300,
+  endedAt: 1300,
+});
+repo.upsertTaskRun.run({
+  id: 't-stb',
+  projectId: 'stb-dashboard-2',
+  memberId: 'claude@stb-dashboard-2',
+  client: 'claude',
+  sessionId: 's-t-stb',
+  form: null,
+  model: 'x',
+  title: 't-stb',
+  startedAt: 300,
+  baselineCommit: null,
+});
 
 /* ------------------------------ 真路由 ------------------------------ */
 const app = express();
@@ -104,7 +140,7 @@ app.use('/api/v1', createIngestRouter({ bus }));
   console.log('[1] 接口本身不报错（SQL 能 prepare + 执行）');
   const all = await get('limit=50');
   ok('HTTP 200', all.status === 200, `status=${all.status}`);
-  ok('ok=true 且带回全部 3 条', Boolean(all.body && all.body.ok) && (all.body.items || []).length === 3, JSON.stringify(all.body && all.body.items && all.body.items.length));
+  ok('ok=true 且带回全部 4 条', Boolean(all.body && all.body.ok) && (all.body.items || []).length === 4, JSON.stringify(all.body && all.body.items && all.body.items.length));
 
   console.log('[2] 返回字段齐（任务列表按这些字段渲染）');
   const row = (all.body.items || []).find((t) => t.id === 't-plugin') || {};
@@ -143,6 +179,11 @@ app.use('/api/v1', createIngestRouter({ bus }));
   );
   const plugin = (withTools.body.items || []).find((t) => t.id === 't-plugin') || {};
   ok('没用过工具的任务 → tools 是空数组（详情那段整块不显示）', Array.isArray(plugin.tools) && plugin.tools.length === 0, JSON.stringify(plugin.tools));
+
+  console.log('[5] 工程显示名：按目录现算（同名不同目录时不该露出冲突后缀）');
+  const stb = (withTools.body.items || []).find((t) => t.id === 't-stb') || {};
+  ok('project_label = 目录里 package.json 的 name（stb-dashboard）', stb.project_label === 'stb-dashboard', JSON.stringify(stb.project_label));
+  ok('库里那行 name 仍是带后缀的 id（只改显示，不动数据）', stb.project_name === 'stb-dashboard-2', JSON.stringify(stb.project_name));
 
   server.close();
   close();
