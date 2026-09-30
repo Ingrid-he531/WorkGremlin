@@ -495,6 +495,81 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     JSON.stringify(eight3.map((t) => [t.id, t.client]))
   );
 
+  // ---- 8F 与 7F 统一口径（2026-09-30）：让位只在插件**还在报**的时候成立 ----
+  console.log('[7b] 8F：让位的会话不参与 owner 选择（同工程那条真在跑的不能被判成「已取消」）');
+  // 同 kiloTasks.js [5d]：owner 若在**全部**会话里选，让位那条（它这一路不写心跳）只要更新
+  // 就会把同工程真在跑的那条挤掉 —— 那条任务在 agent_status 里找不到心跳，被判成「已取消」。
+  const yhTurn = { index: 0, prompt: '插件那条', startedAt: Date.now() - 3_000, endedAt: null, files: [] };
+  const yrTurn = { index: 0, prompt: '终端这条在跑', startedAt: Date.now() - 5_000, endedAt: null, files: [] };
+  opencodeRows = [
+    { id: 'oc-sid-y-held', project: 'p1', projectPath: '/tmp/p1', title: '插件那条', model: '', lastEventAt: Date.now(), turns: [yhTurn] },
+    { id: 'oc-sid-y-run', project: 'p1', projectPath: '/tmp/p1', title: '终端这条在跑', model: '', lastEventAt: Date.now() - 60_000, turns: [yrTurn] },
+  ];
+  repo.insertTask.run({ id: 't_oc_held', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: yhTurn.startedAt, endedAt: null });
+  repo.upsertTaskRun.run({ id: 't_oc_held', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode-plugin', sessionId: 'oc-sid-y-held', form: 'plugin', model: null, title: '插件那条', startedAt: yhTurn.startedAt, baselineCommit: null });
+  ok('让位那条不写轮询行，同工程另一条照写', syncOpencodeTasks({ bus, repo }) === 1);
+  ok('同工程在跑的那条照样拿得到心跳', taskIdOf('opencode@p1') === 'opencode:oc-sid-y-run:0', taskIdOf('opencode@p1'));
+  const eightB = await get(`project=p1&client=${F8.join(',')}&limit=50`);
+  const runY = eightB.find((t) => t.id === 'opencode:oc-sid-y-run:0') || null;
+  ok('它在任务列表里是 running（没被判成「已取消」）', Boolean(runY) && runY.state === 'running', runY && runY.state);
+
+  console.log('[7c] 8F：插件通道断了 → 把会话收回来（同 7F 的 ②b）');
+  // 回归（2026-09-30）：插件写的行只证明它**曾经**在报。它跟 agent 进程活，通道断了
+  // （服务端重启换随机 token）时两路都不写 → 用户跑的轮次凭空消失。
+  // 让位现在要求"插件**这一轮**也写了"：它最新一行比源里最新一轮还旧 + 过了宽限期 → 收回来。
+  const deadRow = Date.now() - 20 * 60_000; // 插件最后报到的那一轮（20 分钟前）
+  const dT0 = { index: 0, prompt: '插件报过的那轮', startedAt: deadRow, endedAt: deadRow + 30_000, files: [], result: '做完了' };
+  const dT1 = { index: 1, prompt: '断线后第一轮', startedAt: Date.now() - 8 * 60_000, endedAt: Date.now() - 7 * 60_000, outcome: 'interrupted', files: [] };
+  const dT2 = { index: 2, prompt: '断线后第二轮', startedAt: Date.now() - 5 * 60_000, endedAt: null, files: [] };
+  opencodeRows = [{ id: 'oc-sid-dead', project: 'p1', projectPath: '/tmp/p1', title: '断线后第二轮', model: '', lastEventAt: Date.now() - 4 * 60_000, turns: [dT0, dT1, dT2] }];
+  repo.insertTask.run({ id: 't_oc_dead', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件报过的那轮', state: 'done', progress: 1, startedAt: deadRow, endedAt: deadRow + 30_000 });
+  repo.upsertTaskRun.run({ id: 't_oc_dead', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-dead', form: 'cli', model: null, title: '插件报过的那轮', startedAt: deadRow, baselineCommit: null });
+  ok(
+    '通道断了就收回来：断线之后那两轮都补上了',
+    syncOpencodeTasks({ bus, repo }) === 2 && Boolean(repo.getTaskRun.get('opencode:oc-sid-dead:1')) && Boolean(repo.getTaskRun.get('opencode:oc-sid-dead:2'))
+  );
+  ok('插件自己报过的那一轮不重复写（它已经有行了）', !repo.getTaskRun.get('opencode:oc-sid-dead:0'));
+  ok('插件那行纹丝不动', Boolean(repo.getTaskRun.get('t_oc_dead')));
+  const eightC = await get(`project=p1&client=${F8.join(',')}&limit=50`);
+  ok(
+    '任务列表里真的看得到（用户报的就是"看不到任务"）',
+    Boolean(eightC.find((t) => t.id === 'opencode:oc-sid-dead:1')) && Boolean(eightC.find((t) => t.id === 'opencode:oc-sid-dead:2')),
+    JSON.stringify(eightC.filter((t) => String(t.id).includes('oc-sid-dead')).map((t) => [t.id, t.state]))
+  );
+
+  console.log('[7d] 8F：源里已经没有的那几轮被收掉（同 7F 的 ③b）');
+  // 轮次表缩短时（OpenCode 清了消息 / 压过上下文），比最后一轮靠后的行永远等不到自己的轮，
+  // 会一直挂在 'running' —— 任务列表按 query.js 的 CASE 显示成「已取消」，成了一条假任务。
+  const cutT = (i, endAgo, startAgo) => ({ index: i, prompt: `第${i}轮`, startedAt: Date.now() - startAgo, endedAt: endAgo === null ? null : Date.now() - endAgo, files: [] });
+  opencodeRows = [{ id: 'oc-sid-cut', project: 'p1', projectPath: '/tmp/p1', title: '第三轮', model: '', lastEventAt: Date.now(), turns: [cutT(0, 50_000, 60_000), cutT(1, 30_000, 40_000), cutT(2, null, 20_000)] }];
+  syncOpencodeTasks({ bus, repo });
+  ok('最后一轮写下了', Boolean(repo.getTaskRun.get('opencode:oc-sid-cut:2')));
+  const cutTurn = opencodeRows[0].turns.slice(0, 2); // 源里只剩两轮（第三轮被清掉）
+  opencodeRows = [{ ...opencodeRows[0], turns: cutTurn }];
+  syncOpencodeTasks({ bus, repo });
+  ok('比最后一轮靠后的那一行被收掉', !repo.getTaskRun.get('opencode:oc-sid-cut:2'), JSON.stringify(repo.getTaskRun.get('opencode:oc-sid-cut:2')));
+  ok('新的最后一轮顶上来了', Boolean(repo.getTaskRun.get('opencode:oc-sid-cut:1')));
+
+  console.log('[7e] 8F：插件只是慢了（刚开跑、还没到宽限期）→ 照旧让位，不抢');
+  const graPlug = Date.now() - 3 * 60_000;
+  opencodeRows = [
+    {
+      id: 'oc-sid-grace',
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      title: '刚起的一轮',
+      model: '',
+      lastEventAt: Date.now(),
+      turns: [
+        { index: 0, prompt: '插件那条', startedAt: graPlug, endedAt: null, files: [] },
+        { index: 1, prompt: '刚起的一轮', startedAt: Date.now() - 10_000, endedAt: null, files: [] },
+      ],
+    },
+  ];
+  repo.insertTask.run({ id: 't_oc_grace', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: graPlug, endedAt: null });
+  repo.upsertTaskRun.run({ id: 't_oc_grace', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-grace', form: 'cli', model: null, title: '插件那条', startedAt: graPlug, baselineCommit: null });
+  ok('还在宽限期里 → 一条都不写（插件那 1 秒内就会补上自己的行）', syncOpencodeTasks({ bus, repo }) === 0);
+
   console.log('[8] /reporter-phase：楼层客户端是逗号串也要走对那条路（8F 回归）');
   // 回归（2026-09-28 实测）：route 里两条分支曾写成 `clientBase(client) === 'opencode' | 'kilo'`，
   // 而渲染层传的是**整个楼层的 clients 串**（合并楼层就是 'opencode,opencode-plugin'），

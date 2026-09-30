@@ -14,6 +14,9 @@
  *   起止 = 那一轮的起止；还在飞的那轮 state=running、ended_at=null）。
  * - 装了 WorkGremlin 插件时让位：插件那一路上报的是真值（每一轮一条，带 form/result），
  *   这类会话轮询这一路整条跳过，并把自己上一轮抢写的兜底行收掉。
+ *   **让位只在插件还在报的时候成立** —— 它的上报通道断了（服务端重启换了随机 token，
+ *   老进程里那份插件就哑了、而且完全无声）就得把会话收回来，不然用户跑的轮次会一条不剩地
+ *   消失。这一条与 kiloTasks.js 的 yieldsOf / owner 选择 / ③b 收尾同一口径，说明见那边。
  * - 安静：不广播 WS 事件（2s 会话扫盘 loop 会自然拾取变化并推给前端）。
  */
 
@@ -21,6 +24,14 @@ const path = require('path');
 const { listOpencodeSessions, readOpencodeTurns } = require('./opencode');
 
 const SYNC_INTERVAL_MS = 5_000;
+
+/**
+ * 插件那一路"还活着"的宽限期（见下面的 yieldsOf，与 kiloTasks.js 同名同值）。
+ * 插件每开一轮就立刻写一条台账（收到用户消息 1 秒内 task/start），所以"源里最新那一轮
+ * 比插件最新一行还新" + 过了这个宽限期，就说明它的上报通道断了 —— 该由轮询收回来。
+ */
+const PLUGIN_SILENT_MS = 60_000;
+
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'opencode:';
 /** 这一层的上报身份：8F 由 sources 反推得到 ["opencode","opencode-plugin"]，轮询这一路是前者 */
@@ -79,6 +90,14 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
+/** 台账 id 里的轮序号（`opencode:<会话id>:<序号>`）；不是这个形状就回 null（同 kiloTasks.js） */
+function turnIndexOf(taskId, prefix) {
+  const id = String(taskId || '');
+  if (!id.startsWith(`${prefix}:`)) return null;
+  const n = Number(id.slice(prefix.length + 1));
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 /**
  * @param {{bus: any, repo: any, now?: () => number}} ctx
  * @returns {number} 本次同步写/改了几条任务
@@ -90,32 +109,94 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   const now = nowFn();
   let count = 0;
 
+  // 每条会话的逐轮清单**和**它现有的台账行各只读一次：让位判定、owner 选择、写台账三处复用
+  const turnsOf = new Map();
+  const runsOf = new Map();
+  for (const s of sessions) {
+    turnsOf.set(s.id, readOpencodeTurns(s.id));
+    runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
+  }
+  /** 这条会话现在算不算在跑（还有一轮没收工） */
+  const isActiveOf = (s) => (turnsOf.get(s.id) || []).some((t) => !t.endedAt);
+
+  /** 插件给这条会话写的最新一行的时刻（没写过 → 0） */
+  const pluginNewestOf = (s) =>
+    runsOf.get(s.id).reduce((m, r) => (String(r.id).startsWith(TASK_ID_PREFIX) ? m : Math.max(m, Number(r.started_at || 0))), 0);
+
+  /**
+   * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `opencode:*`）——
+   * 有就整条让位。判据按 id 前缀而不是 client（理由见 kiloTasks.js 同名函数）。
+   *
+   * **让位只在插件还在报的时候成立**（2026-09-30 起，与 kiloTasks.js 同口径）：插件写的行只
+   * 证明它**曾经**在报 —— 它跟着 agent 进程活，通道断了（服务端重启换了随机 token，老进程里
+   * 那份插件从此每条上报都 401 且完全无声）时，两路都不写，用户跑的轮次就凭空消失。
+   * 判据因此是"插件**这一轮**也写了没有"：它最新一行比源里最新那一轮还旧 + 过了宽限期
+   * （PLUGIN_SILENT_MS）→ 收回这条会话。插件活着时每轮开跑 1 秒内就写一条，正常永不命中；
+   * 它只是慢了（注册重试中）就先照旧让位，等它写上来让位重新成立、轮询自己的行被收掉（自愈）。
+   */
+  const yieldsOf = (s) => {
+    const newestTheirs = pluginNewestOf(s);
+    if (!newestTheirs) return false;
+    const turns = turnsOf.get(s.id) || [];
+    const last = turns[turns.length - 1];
+    const turnStart = last ? Number(last.startedAt || 0) : 0;
+    if (turnStart > newestTheirs && now - turnStart > PLUGIN_SILENT_MS) return false;
+    return true;
+  };
+
+  /**
+   * 让位给插件的那条会话，插件是不是**冒我们这个身份、而且现在正跑着**？
+   * CLI 形态的插件（没有 VS Code 环境变量）报的就是裸 `opencode` —— 同一个成员
+   * `opencode@<工程>`，见 plugin/index.js 的 resolveClient。是的话这条工程的成员状态先归
+   * 插件写：轮询这一路连心跳都不碰，否则 5s 一次轮询会把插件刚写的相位覆盖成轮询视角下的
+   * 旧状态（agent_status 谁最后写谁赢）。收工后交回轮询（与 kiloTasks.js 同款）。
+   */
+  const pluginOwnsMember = new Set();
+  for (const s of sessions) {
+    if (!yieldsOf(s) || !isActiveOf(s)) continue;
+    if (runsOf.get(s.id).some((r) => String(r.client) === CLIENT)) pluginOwnsMember.add(projectIdOf(s));
+  }
+
   /**
    * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
    * 同工程多条会话时，谁最后写谁赢 —— 会让"正在跑的那条任务"在 agent_status 里找不到心跳，
-   * 任务列表按 query.js 的 CASE 把它算成「已取消」。所以只由"最新那条会话"写（见 kiloTasks.js 同款说明）。
+   * 任务列表按 query.js 的 CASE 把它算成「已取消」。所以先选出这个工程该报的那条：
+   * 活跃里最新的；都不活跃就报最新那条（卡片挂住最后一条任务）—— 与 kiloTasks.js 同款。
    */
+  const activeByProject = new Map();
   const newestByProject = new Map();
   for (const s of sessions) {
+    // 让位的会话**不参与** owner 选择：它这一路根本不写心跳，把它算进来就会让同工程另一条
+    // 真在跑的会话永远选不上 owner —— 那条任务在 agent_status 里找不到心跳，被判成「已取消」。
+    if (yieldsOf(s)) continue;
     const pid = projectIdOf(s);
-    const prev = newestByProject.get(pid);
-    if (!prev || Number(s.lastEventAt || 0) > Number(prev.lastEventAt || 0)) newestByProject.set(pid, s);
+    const prevNew = newestByProject.get(pid);
+    if (!prevNew || Number(s.lastEventAt || 0) > Number(prevNew.lastEventAt || 0)) newestByProject.set(pid, s);
+    if (!isActiveOf(s)) continue;
+    const prevAct = activeByProject.get(pid);
+    if (!prevAct || Number(s.lastEventAt || 0) > Number(prevAct.lastEventAt || 0)) activeByProject.set(pid, s);
   }
 
   for (const s of sessions) {
     const projectPath = s.projectPath || '';
     const projectId = projectIdOf(s);
-    const turns = readOpencodeTurns(s.id);
+    const prefix = `${TASK_ID_PREFIX}${s.id}`;
 
-    // 装了插件就让位（和 kiloTasks.js 同一口径）：插件那一路上报的是每一轮真值。
-    // 判据是"有没有不是 `opencode:` 前缀的行"（插件写的 id 是 `k_*`）—— 按 id 认而不是按
-    // client 认，因为 7F 那个同款判据按 client 判时从来没命中过（见 kiloTasks.js 的说明）。
-    const sessionRuns = repo.taskRunsOfSession.all(s.id);
-    if (sessionRuns.some((r) => !String(r.id).startsWith(TASK_ID_PREFIX))) {
+    // 装了插件就让位（和 kiloTasks.js 同一口径）：插件那一路上报的是每一轮真值，判据是
+    // "这个会话有没有插件写的行"（插件写的 id 是 `k_*`，按 id 认而不是按 client 认 ——
+    // 7F 那个同款判据按 client 判时从来没命中过，见 kiloTasks.js 的说明）。
+    // 但让位只在插件**还在报**时成立（yieldsOf）：通道断了就把会话收回来，
+    // 自己上一轮抢写的兜底行同样收掉（只删自己前缀的 id，插件的行一根汗毛都不动）。
+    const sessionRuns = runsOf.get(s.id);
+    if (yieldsOf(s)) {
       for (const r of sessionRuns) if (String(r.id).startsWith(TASK_ID_PREFIX)) repo.deleteTaskRun(r.id);
       continue;
     }
+    const turns = turnsOf.get(s.id) || [];
     if (!turns.length) continue;
+    // 从断线插件手里收回来的会话：**插件报过的轮次它自己管**（那些行是 `k_*`），
+    // 只补它断线之后的（判据"比插件最新一行还新"，与 kiloTasks.js 的 ②b 同一口径）。
+    const newestTheirs = pluginNewestOf(s);
 
     // 确保工程 & 成员存在（安静写入，不广播）
     bus.ensureProject(projectId, projectPath, null, 'report');
@@ -139,7 +220,8 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     let hbFilesJson = null;
     let running = false;
     for (const t of turns) {
-      const id = `${TASK_ID_PREFIX}${s.id}:${t.index}`;
+      if (newestTheirs && Number(t.startedAt || 0) <= newestTheirs) continue; // 插件报过的轮次不重复写
+      const id = `${prefix}:${t.index}`;
       // 改动文件：只认写工具（edit）碰过的；OpenCode 的输入是绝对路径，统一转工程相对
       const files = (t.files || [])
         .map((abs) => {
@@ -171,8 +253,25 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
-    // 心跳：只在跑 = thinking，收工 = idle；指向正在跑的那条（没有就最新那条）
-    if (newestByProject.get(projectId) === s && hbId) {
+    // 收掉"源里已经没有"的那几轮（与 kiloTasks.js 的 ③b 同一口径）：轮次表缩短时
+    // （OpenCode 清了消息 / 压过上下文），那几行永远等不到自己的轮 —— 一直挂在 'running'，
+    // 被 query.js 的 CASE 判成「已取消」，在列表里当一条假任务躺着。
+    // 判据是"这一轮还在不在源里"（byIndex），不认数组下标。turns 整个读空时上面已经
+    // continue 了（不在这里删）：读不出来 ≠ 源里没有。
+    const byIndex = new Set(turns.map((t) => t.index));
+    for (const r of sessionRuns) {
+      const idx = turnIndexOf(r.id, prefix);
+      if (idx === null || byIndex.has(idx)) continue;
+      repo.deleteTaskRun(r.id);
+    }
+
+    // 心跳：只在跑 = thinking，收工 = idle；指向正在跑的那条（没有就最新那条）。
+    // **只由这个工程选中的那条会话写**（见上面 activeByProject 的说明）；
+    // 插件正冒我们这个身份在报、且那轮还没收工 → 这一栏整个让给它（见 pluginOwnsMember）。
+    const owner = pluginOwnsMember.has(projectId)
+      ? null
+      : activeByProject.get(projectId) || newestByProject.get(projectId);
+    if (owner === s && hbId) {
       const last = turns[turns.length - 1] || {};
       repo.upsertStatus.run({
         memberId,
