@@ -342,6 +342,71 @@ async function main() {
   ok('成员是这个工程上报时现注册出来的（不是蹭前面几组注册的）',
     mem4.some((m) => m.client === 'kilo-plugin' && m.role === 'agent'), JSON.stringify(mem4))
 
+  console.log('\n[11] 会话级 diff 不许把**别人改的**文件算进这一轮（按 mtime 划窗口）')
+  // 真实现场（2026-09-30 12:35，用户报的「这个任务显示有两个文件改动，kilotask.js /
+  // taskSync.test.js，这两个文件是你改的吗」）：一条 5 秒就被打断的 Kilo 任务，台账上写了
+  // 那两个文件 —— 它们是**同工程另一个 agent 12:25 改的**，本轮一条 patch part、
+  // 一个写类工具都没有，7F 轮询那一路（kilo.js 只认 patch part）算出来是 0 个文件。
+  // 根因：`session.diff` 是**会话级**差集（对照会话自己的快照基线），会话开着的时候
+  // 谁改的都列在里面 —— 插件把它当"本轮改动"直接记账，于是把别人的活算到自己头上。
+  // 修法：按 mtime 落在本轮窗口内（>= startTask 时刻）筛，见 plugin/index.js 的 steppedOf。
+  const WS3 = '/tmp/ProjE2E3'
+  fs.mkdirSync(WS3, { recursive: true })
+  fs.writeFileSync(path.join(WS3, 'package.json'), JSON.stringify({ name: 'proj-e2e3', version: '1.0.0' }))
+  // 别人一小时前改好的文件：本轮的 session.diff 里**仍然会列它**（会话级差集）
+  const OLD = path.join(WS3, 'old-by-someone-else.ts')
+  fs.writeFileSync(OLD, '// 别人一小时前改的\n')
+  const hourAgo = new Date(Date.now() - 3_600_000)
+  fs.utimesSync(OLD, hourAgo, hourAgo)
+  await post(`${base}/api/v1/workspace`, info.token, { project: 'proj-e2e3', workspacePath: WS3 })
+  const SID5 = 'ses_e2e_0005'
+  const hooksDiff = await plugin.server({ directory: WS3 }, { client: 'kilo' })
+  let d5 = 0
+  const rs5 = async (type, properties) => {
+    await hooksDiff.event({ event: { id: `diffev_${(d5 += 1)}`, type, properties: { sessionID: SID5, ...properties } } })
+    await sleep(160)
+  }
+  await rs5('session.created', { info: { id: SID5, directory: WS3, title: '会话级 diff 的那一轮', model: { id: 'kilo-auto/free' } } })
+  await rs5('message.updated', { info: { id: 'u5', role: 'user', time: { created: Date.now() } } })
+  await rs5('message.part.updated', { part: { sessionID: SID5, messageID: 'u5', id: 'p5', type: 'text', text: '"这一轮只该记新文件"' } })
+  // 本轮真落盘的那个文件：**故意不给写类工具事件**（不给 roundFiles 供料），只能走
+  // session.diff 这一路 —— 这样下面断言的就是纯粹的"筛子有没有按 mtime 放行"。
+  const NEWF = path.join(WS3, 'made-this-round.ts')
+  fs.writeFileSync(NEWF, '// 本轮写的\n')
+  await rs5('session.diff', { diff: ['old-by-someone-else.ts', 'made-this-round.ts'] })
+  await rs5('message.part.updated', { part: { sessionID: SID5, messageID: 'a5', id: 'p5b', type: 'text', role: 'assistant', text: '"这一轮只动了新文件"' } })
+  await rs5('message.updated', { info: { id: 'a5', role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } } })
+  await rs5('session.idle', {})
+  await sleep(600)
+  const dbD = new Database(info.dbPath, { readonly: true, fileMustExist: true })
+  const rows5 = dbD.prepare('SELECT * FROM task_runs WHERE session_id = ? ORDER BY started_at').all(SID5)
+  dbD.close()
+  ok('第 1 轮（干完了）只记本轮那个文件 —— 别人改的那个被 mtime 筛掉',
+    rows5.length === 1 && rows5[0].file_count === 1 && String(rows5[0].files_json || '').includes('made-this-round.ts')
+      && !String(rows5[0].files_json || '').includes('old-by-someone-else'),
+    JSON.stringify(rows5.map((r) => ({ c: r.file_count, f: r.files_json }))))
+  // 主控制台「改动文件」那一栏走的是另一条路（report 的 done.files），也得是筛过的
+  const rp5 = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID5)}`, info.token)
+  const done5 = (rp5.done && rp5.done.files) || []
+  ok('控制台的「改动文件」也只有本轮那个', done5.length === 1 && String(done5[0].path || '').endsWith('made-this-round.ts'),
+    JSON.stringify(done5))
+
+  // 第 2 轮：**就是这个现场** —— 被用户 ESC 打断（只有 session.idle，没有 finish=stop），
+  // 且 session.diff 里只有那个别人改的旧文件 → 本轮改动必须是 0，不是 1。
+  await rs5('message.updated', { info: { id: 'u5b', role: 'user', time: { created: Date.now() } } })
+  await rs5('message.part.updated', { part: { sessionID: SID5, messageID: 'u5b', id: 'p5c', type: 'text', text: '"这一轮马上被打断"' } })
+  await rs5('session.diff', { diff: ['old-by-someone-else.ts'] })
+  await rs5('session.idle', {})
+  await sleep(600)
+  const dbD2 = new Database(info.dbPath, { readonly: true, fileMustExist: true })
+  const rows5b = dbD2.prepare('SELECT * FROM task_runs WHERE session_id = ? ORDER BY started_at').all(SID5)
+  const tk5b = dbD2.prepare('SELECT state FROM tasks WHERE id = ?').get(rows5b.length > 1 ? rows5b[1].id : '')
+  dbD2.close()
+  // 空清单到服务端就落成 null（bus 不拿空数组去覆盖）—— 断言"没有文件"，别咬死 0
+  ok('第 2 轮（被打断）没把别人的文件算成自己的改动：没有文件',
+    rows5b.length === 2 && !rows5b[1].file_count && !rows5b[1].files_json, JSON.stringify(rows5b.map((r) => ({ c: r.file_count, f: r.files_json }))))
+  ok('第 2 轮按取消收尾（不是 done）', tk5b && tk5b.state === 'cancelled', JSON.stringify(tk5b))
+
   srv.kill('SIGTERM')
   await sleep(300)
   fs.rmSync(TMP, { recursive: true, force: true })

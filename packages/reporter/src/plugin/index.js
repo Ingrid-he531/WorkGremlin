@@ -38,7 +38,7 @@
  *   session.status         status.type = busy | idle
  *   session.idle           这一轮彻底结束
  *   session.drained        队列排空
- *   session.diff           diff[] = 本轮改动的文件
+ *   session.diff           diff[] = 相对**会话**快照的差集（不是"本轮"，见 steppedOf 的注释）
  *   session.next.tool.input.delta  工具入参增量 —— 忽略
  *
  * 派生规则见 `handle()` 的长注释（任务起于 role=user 的 text part、收于 assistant 的
@@ -398,7 +398,11 @@ function createIngestPlugin(options, { location, base } = {}) {
   const dirs = new Map()
   /** 工具调用 id → 工具名（`session.tool.called` 不带工具名，只有配对的 input.started 里有） */
   const toolNames = new Map()
-  /** 会话 id → 上一轮 session.step.ended 的 files（完成标记要用） */
+  /**
+   * 会话 id → 最近一条 `session.diff` 给的文件清单。
+   * **是会话级的**（对照会话自己的快照基线），不是"本轮改动"—— 取用一律走 steppedOf 按本轮
+   * 窗口筛，别直接读（见那里的注释：直接读会把同工程另一个 agent 改的文件算进这一轮）。
+   */
   const lastFiles = new Map()
   /** 会话 id → 会话标题 */
   const titles = new Map()
@@ -414,6 +418,8 @@ function createIngestPlugin(options, { location, base } = {}) {
   const taskIds = new Map()
   /** 会话 id → 本轮动过的文件（台账 file/touch 累积，收尾时并进 task/end 的 files） */
   const roundFiles = new Map()
+  /** 会话 id → 本轮开跑的时刻（startTask 落的）。用来给会话级 diff 划一条"这一轮"的界线（见 steppedOf） */
+  const roundStartAt = new Map()
   /**
    * 会话 id → 最近一次"被打断收尾"的时刻。
    * 用户按 ESC / 停止时 Kilo / OpenCode 只发一条 `session.idle`（没有 `finish=stop`）——
@@ -559,6 +565,36 @@ function createIngestPlugin(options, { location, base } = {}) {
   /* ---- 台账上报的三个小动作（都不 await，绝不拖住事件流） ---- */
 
   /**
+   * 这一轮**真的动过**的文件：Kilo 的 `session.diff` 按 mtime 过一道筛子，只留本轮窗口内的。
+   *
+   * 为什么不能直接信 `session.diff`：它不是"本轮改动"，是**会话级**的差集（对照会话自己的
+   * 快照基线），会话开着的时候别人在同一个工程里改的文件照样列进来。实测 2026-09-30 12:35：
+   * 一条 5 秒就被用户打断的 Kilo 任务（一条 patch part、一个写类工具都没有）在台账上写了两个
+   * 文件（server/src/kiloTasks.js、server/test/taskSync.test.js）—— 那两个文件是**同工程另一个
+   * agent 12:25 改完的**（本轮 12:35:42 才起，从头到尾没碰）。拿 7F 轮询那一路对（kilo.js：
+   * 「改动文件只认 patch part」）算出来是 0 个 —— 同一条会话两条路给出两个数，用户看到的就是
+   * "这轮凭什么说我改了这两个文件"。
+   *
+   * 所以按 **mtime 落在本轮窗口内**（>= startTask 落的 roundStartAt）过筛：本轮落盘的留下
+   * （**bash 里改的也算** —— 那是这一轮真干的活，写类工具那一栏看不见它，只有 diff 看得见），
+   * 会话里别人改的、以及更早几轮改过的（mtime 更早）剔掉。
+   * stat 拿不到（文件被删 / 没权限）→ 留着：删除也是一种改动，宁可多记一条。
+   * 这一轮的起点没记到（插件启动前就开跑的会话）→ 不过滤，维持原样，不凭空少记。
+   */
+  function steppedOf(sid, ws) {
+    const since = Number(roundStartAt.get(sid) || 0)
+    const list = sid ? lastFiles.get(sid) || [] : []
+    return list.map(String).filter((f) => {
+      if (!since) return true
+      try {
+        return fs.statSync(path.resolve(ws || ownDir, f)).mtimeMs >= since
+      } catch {
+        return true
+      }
+    })
+  }
+
+  /**
    * 开一个任务。标题 = **用户那句话**，由调用方从 role=user 的 text part 里取到传进来
    * （实测 Kilo 的用户原话就在 `message.part.updated` 的 `part.type==='text'` 里，
    * 信封没有 prompt 字段，所以拿不到就退回会话标题 / 占位，不编）。
@@ -572,6 +608,8 @@ function createIngestPlugin(options, { location, base } = {}) {
     const taskId = `k_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
     taskIds.set(sid, taskId)
     roundFiles.set(sid, new Set())
+    // 本轮的时间界线：session.diff 是会话级的，靠它才知道哪些文件是**这一轮**动的（见 steppedOf）
+    roundStartAt.set(sid, Date.now())
     // 新一轮开始：上一次的"被打断"标记作废（迟到的旧 done 不该再压住这一轮的完成）
     cancelledAt.delete(sid)
     // **新一轮开始时把上一轮的「任务完成」标记抹掉。**
@@ -632,7 +670,9 @@ function createIngestPlugin(options, { location, base } = {}) {
     taskIds.delete(sid)
     const touched = [...(roundFiles.get(sid) || new Set())]
     roundFiles.delete(sid)
-    const stepped = (sid ? lastFiles.get(sid) || [] : []).map(String)
+    // 先把这一轮的改动文件算出来，再抹掉起点时刻 —— steppedOf 要靠它划窗口
+    const stepped = steppedOf(sid, wsOf(event))
+    roundStartAt.delete(sid)
     // **同一个文件会被记两遍**：`session.step.ended` 给的是工作区相对路径（a.ts），
     // file/touch 记的是工具入参原样（可能是绝对路径 /tmp/…/a.ts）。直接并起来，
     // file_count 与 files 列表里同一个文件会出现两次（实测 file_count=2，其实只改了一个）。
@@ -703,7 +743,7 @@ function createIngestPlugin(options, { location, base } = {}) {
    *   session.status         status.type = busy | idle
    *   session.idle           这一轮彻底结束
    *   session.drained        队列排空（收尾信号）
-   *   session.diff           diff[] = 本轮改动的文件
+   *   session.diff           diff[] = 相对**会话**快照的差集（不是"本轮"，见 steppedOf 的注释）
    *   session.next.tool.input.delta  工具入参增量 —— 忽略（part 更新里已有完整 input）
    *
    * ## 由此推出的几条判定
@@ -794,7 +834,9 @@ function createIngestPlugin(options, { location, base } = {}) {
           const result = String(assistantText.get(sid) || "")
           assistantText.delete(sid)
           const ws = wsOf(event)
-          const files = (sid ? lastFiles.get(sid) || [] : []).map(String)
+          // 同样要按本轮窗口筛（见 steppedOf）：这里喂的是主控制台「改动文件」那一栏，
+          // 直接拿会话级 diff 的话，同工程别人改的文件会被算进这一轮的产出
+          const files = steppedOf(sid, ws)
           endTask(event, sid, "done", result || titles.get(sid) || "")
           // 收工扫场：带 result 的"待汇报"保留给服务端的汇报动画
           ghostFeed.sweepGhosts(ws, client, { all: false }, sid)
@@ -941,8 +983,8 @@ function createIngestPlugin(options, { location, base } = {}) {
              ② 状态文件 done.cancelled=true → /reporter-phase 与 /sessions 透传 →
                 主控制台照「任务取消」亮红色，「改动文件」或「没有输出」照常。 */
         if (sid && taskIds.has(sid)) {
-          // 统计本轮动过的文件：lastFiles（session.step.ended / session.diff 给的）∪ roundFiles（写类工具给）
-          const files = [...new Set([...(lastFiles.get(sid) || []), ...((roundFiles.get(sid)) || [])].map(String).filter(Boolean))]
+          // 统计本轮动过的文件：steppedOf（session.diff 给的，按本轮窗口筛过）∪ roundFiles（写类工具给）
+          const files = [...new Set([...steppedOf(sid, wsOf(event)), ...((roundFiles.get(sid)) || [])].map(String).filter(Boolean))]
           // 这一轮已经吐出来的文字也照常收（与 message.updated 那条 done 同口径）：
           // 取消只是"没干完"，不是"没产出"——台账的产出摘要 / 对话记录照记。
           const result = String(assistantText.get(sid) || "")
