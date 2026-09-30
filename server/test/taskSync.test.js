@@ -691,6 +691,44 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('清单里没带 Copilot 标记的会话不写（第二道闸：只认 Copilot 自己 session-store.db 读出来的）', syncCopilotTasks({ bus, repo }) === 0 && !repo.getTaskRun.get('copilot:not-copilot-sid:0'));
   copilotRows = [];
 
+  console.log('\n[8b] 9F：没有会话时要把「思考中」落回空闲（否则卡片一直显示忙碌，却没有任务）');
+  // 用户实测（2026-09-30）：GitHub Copilot 楼层一直「忙碌」，可库里那条占位任务早被收掉了 ——
+  // agent_status 还停在最后一次上报的 thinking（task_id 指向一条已经不在的任务）。
+  // 9F 没有 hook / 插件上报，这条状态行只有同步器会写；不在的会话就必须落回 idle。
+  const staleAt = Date.now() - 5 * 60_000;
+  repo.insertTask.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: '(Copilot 会话)', state: 'running', progress: null, startedAt: staleAt, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot-plugin', sessionId: 'gone', form: null, model: null, title: '(Copilot 会话)', startedAt: staleAt, baselineCommit: null });
+  repo.upsertStatus.run({ memberId: 'copilot@p1', state: 'thinking', stateSince: staleAt, taskId: 'copilot:gone:0', progress: null, currentFiles: null, lastHeartbeatAt: staleAt, degraded: 1, source: 'timeout', updatedAt: staleAt });
+  copilotRows = [];
+  syncCopilotTasks({ bus, repo });
+  const settled = repo.getStatus.get('copilot@p1');
+  ok('状态落回 idle（卡片显示「空闲」而不是「忙碌」）', settled && settled.state === 'idle', settled && settled.state);
+  ok('悬空的 task_id 一起清掉（卡片不会再挂一个不存在的任务）', settled && settled.task_id === null, settled && String(settled.task_id));
+  ok('成员卡上也没有任务了', stateOf('copilot@p1') === 'idle' && taskIdOf('copilot@p1') === '', `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1')}`);
+
+  console.log('\n[8c] 9F：有会话在跑时，收工那一手不许碰它（真值优先）');
+  copilotRows = [
+    {
+      id: 'cop-sid-keep',
+      copilot: true,
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      lastUpdated: Date.now(),
+      inFlight: true,
+      copilotTurns: [],
+      livePrompt: '正在跑的这一轮',
+      liveStartedAt: Date.now() - 3_000,
+      liveIndex: 0,
+      liveReqs: [],
+    },
+  ];
+  syncCopilotTasks({ bus, repo });
+  ok('按会话写了 thinking 的成员不被收工覆盖', stateOf('copilot@p1') === 'thinking', stateOf('copilot@p1'));
+  ok('心跳指着在跑的那条任务', taskIdOf('copilot@p1') === 'copilot:cop-sid-keep:0', taskIdOf('copilot@p1'));
+  copilotRows = [];
+  syncCopilotTasks({ bus, repo });
+  ok('会话停掉后再跑一轮 → 落回 idle', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
+
   console.log('[9] /reporter-phase：楼层客户端是逗号串也要走对那条路（8F 回归）');
   // 回归（2026-09-28 实测）：route 里两条分支曾写成 `clientBase(client) === 'opencode' | 'kilo'`，
   // 而渲染层传的是**整个楼层的 clients 串**（合并楼层就是 'opencode,opencode-plugin'），

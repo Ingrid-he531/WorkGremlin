@@ -146,6 +146,52 @@ function pruneForeignRunningRuns(repo, copilotIds) {
   return removed;
 }
 
+/**
+ * 收工：把这一轮**没有会话**的 9F 成员状态落回「空闲」。
+ *
+ * agent_status 是一行一成员、由这个同步器独占写（GitHub Copilot 没有 hook，也没有插件上报）。
+ * 一旦会话消失（会话库清了 / 那条会话其实属于别的楼层被收掉 / Copilot 根本没在用），
+ * 最后那次「思考中」就永远挂在库里 —— 卡片上就是**一直显示忙碌、却没有任务**
+ * （用户 2026-09-30 实测：9F GitHub Copilot 一直忙碌，而它那条占位任务早被收掉了）。
+ * 与 7F/8F 的同步器同一口径：非活跃时补一条 idle，让状态跟着会话走，不让旧值烂在那里。
+ *
+ * 分寸：
+ *   · 只碰 client=CLIENT 的成员 —— 9F 这一层没有别的写入方，不会跟谁抢；
+ *   · 这一轮已经按会话写过状态（`touched`）的一律不动，用户级真值优先；
+ *   · 已经是 idle / offline 的不重复写；
+ *   · 没有状态行的成员不管（不凭空造一条"空闲"出来）。
+ *
+ * @param {any} repo
+ * @param {number} now
+ * @param {Set<string>} touched 这一轮已经写过状态的成员 id
+ * @returns {number} 落回了几条
+ */
+function settleIdleMembers(repo, now, touched) {
+  let settled = 0;
+  for (const m of repo.listMembersByClient.all(CLIENT)) {
+    if (touched.has(m.id)) continue;
+    const s = repo.getStatus.get(m.id);
+    if (!s || s.state === 'idle' || s.state === 'offline') continue;
+    repo.upsertStatus.run({
+      memberId: m.id,
+      state: 'idle',
+      stateSince: now,
+      // 顺手清掉悬空的 task_id：指向的那条任务可能已经不在了（误差来源于上面说的错行清理）
+      taskId: null,
+      progress: null,
+      currentFiles: null,
+      lastHeartbeatAt: now,
+      degraded: 0,
+      source: 'report',
+      updatedAt: now,
+    });
+    // upsertStatus 的 task_id 是 COALESCE（传 null 清不掉），悬空槽位要单独清
+    repo.clearStatusTask.run(m.id);
+    settled += 1;
+  }
+  return settled;
+}
+
 function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   const now = nowFn();
   /*
@@ -159,12 +205,18 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   const sessions = ((snap && snap.sessions) || []).filter((s) => s.copilot === true);
   // 一条 Copilot 会话都没有时也要跑：上面那条错行正是在这种机器上冒出来的（只有别的产品的落盘）。
   pruneForeignRunningRuns(repo, new Set(sessions.map((s) => String(s.id || '')).filter(Boolean)));
-  if (!sessions.length) return 0;
+  if (!sessions.length) {
+    // 一条会话都没有 —— 也要把上一轮留下的「思考中」落回空闲，否则卡片一直显示忙碌
+    settleIdleMembers(repo, now, new Set());
+    return 0;
+  }
 
   // Copilot 的模型存在 VS Code 的 state.vscdb（chat.currentLanguageModel.editor），
   // 不是 per-session 的 —— 全局一份，所有会话共用。取不到留空，不拿默认模型冒充。
   const model = copilotCurrentModel();
   let count = 0;
+  /** 这一轮按会话写过状态的成员（心跳只由 owner 写）—— 收工那一步要跳过他们 */
+  const statusWritten = new Set();
 
   /**
    * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
@@ -319,8 +371,12 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         source: 'report',
         updatedAt: now,
       });
+      statusWritten.add(memberId);
     }
   }
+
+  // 收工：这一轮没轮到写状态的成员（工程里连会话都没有）同样落回空闲 —— 别让「思考中」烂在库里
+  settleIdleMembers(repo, now, statusWritten);
 
   return count;
 }

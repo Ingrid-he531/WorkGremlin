@@ -407,6 +407,8 @@ function createRepo(db) {
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
     listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),
+    /** 按上报身份取成员（9F 的同步器据它收工：没有会话时也要把状态落回空闲，见 copilotTasks.js） */
+    listMembersByClient: db.prepare(`SELECT * FROM members WHERE client = ? ORDER BY name`),
     listEphemeral: db.prepare(`SELECT * FROM members WHERE project_id = ? AND ephemeral = 1`),
     touchMember: db.prepare(`UPDATE members SET last_seen_at = ? WHERE id = ?`),
 
@@ -427,6 +429,11 @@ function createRepo(db) {
         updated_at = excluded.updated_at
     `),
     getStatus: db.prepare(`SELECT * FROM agent_status WHERE member_id = ?`),
+    /**
+     * 清掉成员状态里的任务槽位（upsertStatus 的 task_id 是 COALESCE，传 null 清不掉）。
+     * 9F 收工时用：会话没了，槽位里那条任务（可能已经不存在）也不该再挂着。
+     */
+    clearStatusTask: db.prepare(`UPDATE agent_status SET task_id = NULL, progress = NULL, current_files = NULL WHERE member_id = ?`),
     listStatuses: db.prepare(`
       SELECT s.* FROM agent_status s
       JOIN members m ON m.id = s.member_id
