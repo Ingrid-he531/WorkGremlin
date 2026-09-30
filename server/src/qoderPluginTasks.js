@@ -35,20 +35,12 @@
  */
 
 const path = require('path');
-const { listLingmaSessions, readLingmaRounds } = require('./lingma');
+// LIVE_MS（"这一轮还在跑"的判据）与会话表那一支共用同一把尺子，定义在 lingma.js ——
+// 两边对"这一轮还在不在跑"必须给同一个答案，否则主控制台与任务记录会互相打架。
+const { listLingmaSessions, readLingmaRounds, LIVE_MS } = require('./lingma');
 const { resolveProjectName } = require('./project');
 
 const SYNC_INTERVAL_MS = 5_000;
-
-/**
- * "这一轮还在跑"的判据：本会话最后一轮，且距今 LIVE_MS 内还有落盘。
- *
- * 为什么可以用新鲜度：插件一轮里每吐一条消息 / 每跑一次工具都会写 chat_message
- * （实测一轮 2 分钟里写了 8 条），所以"一分半没动静"基本就等于收工了。反过来定太短
- * （比如 30 秒）会把"模型正在长时间思考、还没有任何消息落盘"的那一轮判成已收工。
- * 定 90 秒：实测最长的静默间隔（一次回答的生成）在 30 秒以内，留三倍余量。
- */
-const LIVE_MS = 90_000;
 
 /** task id 前缀：认人用（我们自己写的行都是这个前缀，hook 那一路是 `t_*`），也避免撞 id */
 const TASK_ID_PREFIX = 'qoder-plugin:';

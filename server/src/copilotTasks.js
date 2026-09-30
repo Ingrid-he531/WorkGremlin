@@ -20,7 +20,8 @@
  */
 
 const path = require('path');
-const { listSessions, copilotCurrentModel } = require('./sessions');
+const { listSessions, copilotCurrentModel, nonCopilotSessionIds } = require('./sessions');
+const { RE_GITHUB_COPILOT } = require('./products');
 
 const IDLE_MS = 10 * 60_000;
 /** Copilot 相位新鲜窗口：2 分钟内有活动 = running，超了 = done。
@@ -112,12 +113,54 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
+/**
+ * 收掉"张冠李戴"的在飞行。
+ *
+ * 9F 的台账只有这个同步器写（`copilot:` 前缀 + client=copilot-plugin），所以这个前缀的行归它自己管。
+ * 历史版本给 listSessions 用的是共享的 PLUGIN_RE，它会命中别的产品的插件目录
+ * （Tencent CodeBuddy 的 tencent-cloud.coding-copilot、Trae 的 coding-copilot）—— 那些楼层正在跑的
+ * 会话就被写成了 Copilot 任务，标题只能退回占位符「(Copilot 会话)」。而且这种行**永远不会收工**：
+ * 收工靠 Copilot 自己的 turns 表，别的产品的会话在它那张表里根本没有 → 任务记录页永远挂着一条「进行中」。
+ * （用户实测 2026-09-30：打开 VS Code、没在 Copilot Chat 里输入，9F 就冒一条。）
+ *
+ * 分寸：**只删"能证明是别人的"行** —— 这个 session id 出现在别的产品的结构化落盘里
+ * （sessions.js 的 nonCopilotSessionIds）。Copilot 自己的历史（哪怕早过了清单窗口、现在不在
+ * sessions 里）一律不碰；没有归属证据的行也留着 —— 宁可留错，也不误删真记录。
+ *
+ * @param {any} repo
+ * @param {Set<string>} copilotIds 本次清单里认得的所有 Copilot 会话 id
+ * @returns {number} 收掉几条
+ */
+function pruneForeignRunningRuns(repo, copilotIds) {
+  const orphans = repo.liveTaskRunsOfClient
+    .all(CLIENT)
+    .filter((r) => r.session_id && !copilotIds.has(String(r.session_id)));
+  if (!orphans.length) return 0;
+  const foreign = nonCopilotSessionIds();
+  let removed = 0;
+  for (const r of orphans) {
+    if (!foreign.has(String(r.session_id))) continue;
+    repo.deleteTaskRun(r.id);
+    removed += 1;
+  }
+  return removed;
+}
+
 function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
-  const snap = listSessions({ force: true, client: 'copilot-plugin' });
-  const sessions = (snap && snap.sessions) || [];
+  const now = nowFn();
+  /*
+   * 会话清单必须锁在 **GitHub Copilot 自己的落盘** 上，不能吃 listSessions 的默认 PLUGIN_RE：
+   * 那串里含 `/^tencent/` 与 `/coding-copilot/i`，本机上会命中 Tencent CodeBuddy 的
+   * `tencent-cloud.coding-copilot` —— 别的楼层正在跑的会话就被当成 Copilot 会话写进 9F
+   * （用户实测：打开 VS Code 什么都没问，任务记录里就多一条「(Copilot 会话)」在飞行）。
+   * `copilot === true` 是第二道闸：只有 Copilot 自己 session-store.db 里读出来的才算。
+   */
+  const snap = listSessions({ force: true, client: 'copilot-plugin', pluginRe: RE_GITHUB_COPILOT });
+  const sessions = ((snap && snap.sessions) || []).filter((s) => s.copilot === true);
+  // 一条 Copilot 会话都没有时也要跑：上面那条错行正是在这种机器上冒出来的（只有别的产品的落盘）。
+  pruneForeignRunningRuns(repo, new Set(sessions.map((s) => String(s.id || '')).filter(Boolean)));
   if (!sessions.length) return 0;
 
-  const now = nowFn();
   // Copilot 的模型存在 VS Code 的 state.vscdb（chat.currentLanguageModel.editor），
   // 不是 per-session 的 —— 全局一份，所有会话共用。取不到留空，不拿默认模型冒充。
   const model = copilotCurrentModel();

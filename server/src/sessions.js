@@ -561,6 +561,53 @@ function copilotDoneAt(row, now) {
   return at;
 }
 
+/**
+ * GitHub Copilot 自己的插件落盘目录名。`/copilot/i` 会把 Tencent 的
+ * `tencent-cloud.coding-copilot` 一起命中，所以必须锚在开头。
+ */
+const COPILOT_STORAGE_RE = /^(?:github[.\-]?copilot|copilot)/i;
+
+/**
+ * **别的产品**的结构化落盘里认领的会话 id（genie-history / todos / message-queue / file-changes）。
+ *
+ * 用途只有一个：9F 的台账同步器清理"张冠李戴"的历史行（见 copilotTasks.js 的
+ * pruneForeignRunningRuns）。2026-09-30 实测的坑 —— 那个同步器原来用共享的 PLUGIN_RE 去要
+ * 会话清单，`/^tencent/` 与 `/coding-copilot/` 会命中别的产品的插件目录（Tencent CodeBuddy 的
+ * `tencent-cloud.coding-copilot`、Trae 的 coding-copilot），于是别的楼层正在跑的会话在 9F 被
+ * 写成一条「(Copilot 会话)」在飞行 —— 用户根本没在 Copilot Chat 里输入，打开 VS Code 就冒一条。
+ *
+ * **只做归属判定，不改任何落盘**：把这个 id 交给调用方，由它决定"能证明是别人的"才收行。
+ * @returns {Set<string>}
+ */
+function nonCopilotSessionIds() {
+  const ids = new Set();
+  for (const root of globalStorageRoots()) {
+    for (const name of readDir(root)) {
+      if (COPILOT_STORAGE_RE.test(name)) continue; // Copilot 自己的目录不算"别的产品"
+      const dir = path.join(root, name);
+      const gh = path.join(dir, 'genie-history');
+      for (const proj of readDir(gh)) {
+        const pdir = path.join(gh, proj);
+        for (const sid of readDir(path.join(pdir, 'conversations'))) ids.add(sid);
+        // 工程级 current.json 也记着一条会话 id（会话目录可能已经不在，但这只会话还在跑）
+        const cur = readJson(path.join(pdir, 'current.json'));
+        const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
+        if (cid) ids.add(cid);
+      }
+      for (const f of readDir(path.join(dir, 'todos'))) {
+        if (/\.json$/i.test(f)) ids.add(f.replace(/\.json$/i, ''));
+      }
+      for (const sid of readDir(path.join(dir, 'file-changes'))) ids.add(sid);
+      for (const f of readDir(path.join(dir, 'message-queue'))) {
+        if (!/\.json$/i.test(f)) continue;
+        const j = readJson(path.join(dir, f));
+        for (const sid of Object.keys((j && j.conversations) || {})) ids.add(sid);
+      }
+    }
+  }
+  return ids;
+}
+
 /** 某条 Copilot 会话的 VS Code 会话日志（chatSessions/<会话>.jsonl） */
 function copilotChatLogPath(sessionId) {
   const name = `${sessionId}.jsonl`;
@@ -2108,6 +2155,10 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     const info = sqliteRow
       ? {
           id,
+          // 这条会话来自 Copilot 自己的 SQLite 会话库 —— 它才是 9F 的真会话。
+          // 有它是为了让"按楼层扫盘"的那条路（copilotTasks.js）能把 Copilot 会话和
+          // 同目录里别的产品的会话分开：共享的 PLUGIN_RE 会把 Tencent / Trae 的目录也算进来。
+          copilot: true,
           current: Boolean(isProjectCurrent || (sqliteRow.projectPath && sqliteRow.projectPath === ws)),
           active: Boolean(sqliteRow.lastUpdated && now - sqliteRow.lastUpdated < IDLE_MS),
           listed: Boolean(sqliteRow.lastUpdated && now - sqliteRow.lastUpdated < LISTED_MS),
@@ -2264,6 +2315,7 @@ module.exports = {
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
   copilotCurrentModel, // Copilot 当前选中的模型（从 VS Code state.vscdb 取）
   listSessions,
+  nonCopilotSessionIds, // 别的产品的落盘认领了哪些会话 id（9F 清理张冠李戴的历史行用）
   findPluginStorage,
   decodeDirName,
   reporterMainPhase,

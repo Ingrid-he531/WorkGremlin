@@ -537,6 +537,16 @@ function createRepo(db) {
     // started_at 也要：kiloTasks 用它判断"插件这一轮写了没有"（见那里的 yieldsOf）
     taskRunsOfSession: db.prepare(`SELECT id, client, started_at FROM task_runs WHERE session_id = ?`),
     /**
+     * 某客户端名下**还没收工**的台账行（9F Copilot 据此收掉"张冠李戴"的在飞行：
+     * 别的产品的会话被误当成 Copilot 写进来的历史行，见 copilotTasks.js 的 pruneForeignRunningRuns）。
+     * 只取 running 的：这类错行全靠同步器写、又永远等不到收工，done 的历史行不在这条路上。
+     */
+    liveTaskRunsOfClient: db.prepare(`
+      SELECT tr.id AS id, tr.session_id AS session_id FROM task_runs tr
+        JOIN tasks t ON t.id = tr.id
+       WHERE tr.client = ? AND t.state = 'running' AND t.ended_at IS NULL
+    `),
+    /**
      * 台账里**还没收工**的那条任务（`tasks.state = 'running'` 且没有 ended_at）。
      *
      * 用途只有一个：`agent_status.task_id`（一行一成员、只有一个槽位）该指着谁 —— 见 bus.js 的

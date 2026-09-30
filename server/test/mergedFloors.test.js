@@ -23,7 +23,7 @@
  *          取不到会话 → 各带一句说明（楼层胶囊 tooltip 显示它们）
  *     [B3] 两种身份的 hook 状态文件（trae / trae-plugin）都归这一层
  *   C. 6F Qoder（CLI 与插件合并：同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F）
- *     [C] 一层：只接纳 qoder 一种身份（CLI 与插件共用同一 client）；两路来源（cli 扫 transcript 产会话 + hook 实时相位兜底）；只装了 qoder 就算"装了"
+ *     [C] 一层：只接纳 qoder 一种身份（CLI 与插件共用同一 client）；三路来源（cli 扫 transcript 产会话 + lingma 轮询插件的 local.db + hook 实时相位兜底）；只装了 qoder 就算"装了"
  *     [C2] 会话来自 hook 状态文件兜底：qoder 状态文件归这一层、相位按整层 client 取得到
  *     [C3] 会话也来自落盘 transcript：~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式）被 cli 那一路扫出，工程从 cwd 解析
  */
@@ -345,7 +345,7 @@ head('[B3] 5F 的会话来自 hook：trae 与 trae-plugin 两种状态文件都�
 }
 
 /* [C] 6F Qoder：CLI 与插件合并（同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F） */
-head('[C] 楼层表：6F 只有一层 Qoder（CLI 与插件合并，cli 扫 transcript + hook 兜底）');
+head('[C] 楼层表：6F 只有一层 Qoder（CLI 与插件合并，cli 扫 transcript + 插件轮询 local.db + hook 兜底）');
 {
   const products = detectProducts({ force: true });
   const floor = products.find((p) => p.id === '6F');
@@ -353,11 +353,11 @@ head('[C] 楼层表：6F 只有一层 Qoder（CLI 与插件合并，cli 扫 tran
   ok('6F 名叫 Qoder', floor && floor.name === 'Qoder', floor && floor.name);
   ok('这一层只接纳 qoder 一种上报身份（CLI 与插件分不出，共用同一 client，无 qoder-plugin）', floor && JSON.stringify(floor.clients) === JSON.stringify(['qoder']), floor && JSON.stringify(floor.clients));
   ok(
-    '两路来源：cli（扫 ~/.qoder/projects transcript 产会话）+ hook（实时相位兜底）',
-    floor && JSON.stringify(floor.sources.map((s) => s.kind)) === JSON.stringify(['cli', 'hook']),
+    '三路来源：cli（扫 ~/.qoder/projects transcript 产会话）+ lingma（插件自己的 local.db）+ hook（实时相位兜底）',
+    floor && JSON.stringify(floor.sources.map((s) => s.kind)) === JSON.stringify(['cli', 'lingma', 'hook']),
     floor && JSON.stringify(floor.sources.map((s) => `${s.label || s.kind}:${s.kind}`))
   );
-  ok('cli 与 hook 两路都产会话（cli 扫 transcript、hook 兜底）', floor && floor.sources.filter((s) => s.sessions !== false).map((s) => s.kind).join(',') === 'cli,hook', floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
+  ok('三路都产会话（cli 扫 transcript、lingma 轮询插件的库、hook 兜底）', floor && floor.sources.filter((s) => s.sessions !== false).map((s) => s.kind).join(',') === 'cli,lingma,hook', floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
   ok('装了 qoder（沙箱里放了可执行文件）就算装了', floor && floor.installed === true, floor && String(floor.installPath));
   ok('Qoder CN 编辑器插件（tongyi-lingma）算插件安装证据', floor && String(floor.pluginInstallPath || '').includes('tongyi-lingma'), floor && String(floor.pluginInstallPath));
   ok('cli 那一路扫的是 ~/.qoder（子树 projects）', Boolean(floor.sources.find((s) => s.kind === 'cli')) && String(floor.sources.find((s) => s.kind === 'cli').dataPathLabel).endsWith('.qoder'));

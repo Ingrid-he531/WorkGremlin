@@ -44,6 +44,7 @@ const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
 const { detectProducts } = require('../src/products');
+const { snapshot } = require('../src/sessionRegistry');
 const lingma = require('../src/lingma');
 const { syncQoderPluginTasks, LIVE_MS, TASK_ID_PREFIX } = require('../src/qoderPluginTasks');
 
@@ -367,6 +368,61 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   }
   ok('不抛', threw2 === '', threw2);
   ok('返回 0（没东西可写）', wrote === 0, String(wrote));
+
+  /* ------------------------------ C. 主控制台看得到这条会话 ------------------------------ */
+  /* 台账那条路（A/B 两段）走通了还不够：**主控制台严格跟随所选会话**
+     （见 IsoOfficeView 的 consoleBase），会话表里没有这一行，插件那条任务在主控制台
+     就是"没有会话" —— 这一段锁的就是那一行的形状。 */
+
+  head('[C1] 会话表：插件那条会话进 6F（主控制台跟着所选会话走）');
+  writeDb({
+    sessions: [{ id: 's-ui', title: '插件会话', lastEventAt: NOW }],
+    records: [
+      { requestId: 'u0', sessionId: 's-ui', prompt: '把左下角那个圆点去掉', summary: '**对话总结：** 去掉了', startedAt: NOW - 30 * MIN, updatedAt: NOW - 25 * MIN },
+      { requestId: 'u1', sessionId: 's-ui', prompt: '再看看', model: 'qwen3-coder', startedAt: NOW - 20_000, updatedAt: NOW - 2_000 },
+    ],
+  });
+  {
+    const snap = snapshot({ force: true, workspacePath: PROJ });
+    const floor = snap.floors.find((f) => f.id === '6F');
+    const row = ((floor && floor.sessions) || []).find((s) => s.sessionId === 's-ui') || null;
+    ok('插件那条会话进 6F 的会话表', Boolean(row), ((floor && floor.sessions) || []).map((s) => `${s.sourceKind}:${s.sessionId}`).join(' '));
+    ok('标明来自 lingma 那一路（轮询插件的 local.db）', Boolean(row) && row.sourceKind === 'lingma', row && row.sourceKind);
+    ok('工程归属 = project_uri 解析出来的那个工程', Boolean(row) && row.projectPath === PROJ, row && String(row.projectPath));
+    ok('当前工程里的会话算 mine（屋里的人按在线显示）', Boolean(row) && row.mine === true, row && String(row.mine));
+    ok('最后一轮还在跑（90s 内有落盘）→ thinking', Boolean(row) && row.phase === 'thinking', row && row.phase);
+    ok('屏上那句用户原话 = 最后一轮的原话', Boolean(row) && row.prompt === '再看看', row && String(row.prompt));
+    ok('相位是推断（不是它上报的）→ inferred', Boolean(row) && row.inferred === true, row && String(row.inferred));
+    ok('还在跑 → 没有完成标记（不臆造）', Boolean(row) && !row.doneAt, row && String(row.doneAt));
+  }
+
+  head('[C2] 收工（超过 LIVE_MS 没再落盘）→ idle + 一枚完成标记（凭据是扩展自己写的 summary）');
+  const doneAt = NOW - 3 * MIN;
+  writeDb({
+    sessions: [{ id: 's-ui', title: '插件会话', lastEventAt: doneAt }],
+    records: [
+      { requestId: 'u0', sessionId: 's-ui', prompt: '把左下角那个圆点去掉', summary: '**对话总结：** 去掉了', startedAt: NOW - 30 * MIN, updatedAt: NOW - 25 * MIN },
+      { requestId: 'u1', sessionId: 's-ui', prompt: '再看看', summary: '**对话总结：** 弄好了', startedAt: NOW - 10 * MIN, updatedAt: doneAt },
+    ],
+  });
+  {
+    const snap = snapshot({ force: true, workspacePath: PROJ });
+    const floor = snap.floors.find((f) => f.id === '6F');
+    const row = ((floor && floor.sessions) || []).find((s) => s.sessionId === 's-ui') || null;
+    ok('相位回落待命中', Boolean(row) && row.phase === 'idle', row && row.phase);
+    ok('完成标记 = 那一轮最后一次落盘（源里没有更准的）', Boolean(row) && row.doneAt === doneAt, row && String(row.doneAt));
+    ok('完成标题 = 那一轮用户原话', Boolean(row) && row.doneTitle === '再看看', row && String(row.doneTitle));
+    ok('收尾自述 = 扩展自己写的 summary（明文）', Boolean(row) && /弄好了/.test(row.doneSaid || ''), row && String(row.doneSaid));
+    ok('扩展的落盘里没有"被用户打断"这个信号 → 不臆造取消', Boolean(row) && row.doneCancelled === false, row && String(row.doneCancelled));
+  }
+
+  head('[C3] 只在插件里开了会话、一句话没说 → 不建会话行（与台账同口径）');
+  writeDb({ sessions: [{ id: 's-empty', title: '空会话', lastEventAt: NOW }], records: [] });
+  {
+    const snap = snapshot({ force: true, workspacePath: PROJ });
+    const floor = snap.floors.find((f) => f.id === '6F');
+    ok('空会话不进表（主控制台不会凭空多一条）', !((floor && floor.sessions) || []).some((s) => s.sessionId === 's-empty'), ((floor && floor.sessions) || []).map((s) => s.sessionId).join(' '));
+  }
 
   server.close();
   close();

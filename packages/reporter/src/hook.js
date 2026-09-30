@@ -166,7 +166,7 @@ function eventClient(ev) {
   const ec = ev && ev.client ? String(ev.client).trim().toLowerCase() : '';
   // Plugin 自报的 'vscode'（及历史 'codebuddy'）一律加 '-plugin' 后缀归到 plugin 身份；
   // 其余（含空，即 CLI）按 agent 本身返回。
-  if (ec && ec !== AGENT.toLowerCase() && ec !== 'cli') return AGENT + "-plugin";
+  if (ec && ec.includes('vscode')) return AGENT + "-plugin";
   return AGENT;
 }
 

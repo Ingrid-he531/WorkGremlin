@@ -35,16 +35,24 @@ process.env.WORKGREMLIN_HOME = WG;
 const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
-const { detectProducts } = require('../src/products');
+const { detectProducts, RE_GITHUB_COPILOT } = require('../src/products');
 const sessionsMod = require('../src/sessions');
 const kiloMod = require('../src/kilo');
 const opencodeMod = require('../src/opencode');
 
-/* 固定数据打桩：只把"厂商落盘"那一层换掉，repo / 路由 / 同步器全是真的 */
+/* 固定数据打桩：只把"厂商落盘"那一层换掉，repo / 路由 / 同步器全是真的。
+ * [9] 那一节要跑**真实的扫盘**证明别的产品的会话不会被写进 9F —— 用一个开关切过去：
+ * copilotTasks 在 require 时就把 listSessions 解构走了，之后改模块导出对它无效。 */
+const realListSessions = sessionsMod.listSessions;
+let scanReal = false;
+let lastScanOpts = null;
 let copilotRows = [];
 let kiloRows = [];
 let opencodeRows = [];
-sessionsMod.listSessions = () => ({ sessions: copilotRows });
+sessionsMod.listSessions = (opts = {}) => {
+  lastScanOpts = opts;
+  return scanReal ? realListSessions(opts) : { sessions: copilotRows };
+};
 sessionsMod.copilotCurrentModel = () => 'GPT-5 mini';
 kiloMod.listKiloSessions = () => kiloRows;
 // 7F 是「每一轮一条」：会话行上挂 `rounds`（形状同 kilo.js 的 readKiloRounds）
@@ -121,6 +129,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   copilotRows = [
     {
       id: 'cop-sid-1',
+      copilot: true, // 只有 Copilot 自己 session-store.db 里读出来的会话才带这个标记（见 sessions.js）
       project: 'p1',
       projectPath: '/tmp/p1',
       lastUpdated: t1,
@@ -423,6 +432,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   copilotRows = [
     {
       id: 'cop-sid-live',
+      copilot: true,
       project: 'p1',
       projectPath: '/tmp/p1',
       lastUpdated: Date.now() - 30 * 60_000,
@@ -642,7 +652,46 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   repo.upsertTaskRun.run({ id: 't_oc_twin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-twin', form: 'cli', model: null, title: '插件先落的那一轮', startedAt: ocTwinStart - 87, baselineCommit: null });
   ok('轮询一条都不写（这一轮插件报过，早 87 毫秒也算）', syncOpencodeTasks({ bus, repo }) === 0, JSON.stringify(repo.getTaskRun.get('opencode:oc-sid-twin:0')));
 
-  console.log('[8] /reporter-phase：楼层客户端是逗号串也要走对那条路（8F 回归）');
+  console.log('[8] 9F：别的楼层的会话不许被写成 Copilot 台账（打开 VS Code 就冒「(Copilot 会话)」的根因）');
+  // 回归（2026-09-30 用户实测）：9F 同步器原来用 listSessions 的**默认** PLUGIN_RE 去要会话清单，
+  // 那一串里含 `/^tencent/` 与 `/coding-copilot/i` —— 本机上命中 Tencent CodeBuddy 的
+  // `tencent-cloud.coding-copilot` 目录。于是 1F 正在跑的会话被写成了 9F 的任务：
+  // 用户根本没在 Copilot Chat 里输入，打开 VS Code 任务记录里就多一条「(Copilot 会话)」在飞行；
+  // 而且那条行永远收不了工（收工靠 Copilot 自己的 turns 表，别的产品的会话在它表里没有）。
+  const GSR = path.join(HOME, '.config', 'Code', 'User', 'globalStorage');
+  const TEN = path.join(GSR, 'tencent-cloud.coding-copilot');
+  const cbSid = 'cb-session-phantom';
+  const cbProj = path.join(TEN, 'genie-history', Buffer.from('/tmp/ProjCB').toString('base64'));
+  fs.mkdirSync(path.join(cbProj, 'conversations', cbSid), { recursive: true });
+  fs.writeFileSync(path.join(cbProj, 'current.json'), JSON.stringify({ conversationId: cbSid, lastUpdated: new Date().toISOString() }));
+  fs.mkdirSync(path.join(TEN, 'todos'), { recursive: true });
+  fs.writeFileSync(path.join(TEN, 'todos', `${cbSid}.json`), JSON.stringify({ todos: [{ status: 'in_progress', content: '别的楼层正在跑' }] }));
+  fs.mkdirSync(path.join(TEN, 'file-changes', cbSid), { recursive: true });
+
+  // 先证明事故现场：共享 PLUGIN_RE 确实把这条会话扫得出来（不锁 pluginRe 就是这个后果）
+  const unionSnap = realListSessions({ force: true, client: 'copilot-plugin' });
+  ok('前置：共享 PLUGIN_RE 会把 Tencent 目录里正在跑的会话当 Copilot 扫出来（事故现场）', unionSnap.sessions.some((s) => s.id === cbSid), unionSnap.storage);
+  const scopedSnap = realListSessions({ force: true, client: 'copilot-plugin', pluginRe: RE_GITHUB_COPILOT });
+  ok('9F 自己的 pluginRe 不会把别的产品的落盘当自己的', !scopedSnap.sessions.some((s) => s.id === cbSid), scopedSnap.storage);
+
+  // 上一版留下的错行：同步器写的在飞记录（那条会话永远等不到收工）
+  repo.insertTask.run({ id: `copilot:${cbSid}:0`, projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: '(Copilot 会话)', state: 'running', progress: null, startedAt: Date.now() - 60_000, endedAt: null });
+  repo.upsertTaskRun.run({ id: `copilot:${cbSid}:0`, projectId: 'p1', memberId: 'copilot@p1', client: 'copilot-plugin', sessionId: cbSid, form: null, model: null, title: '(Copilot 会话)', startedAt: Date.now() - 60_000, baselineCommit: null });
+
+  scanReal = true;
+  const phantomWrote = syncCopilotTasks({ bus, repo });
+  scanReal = false;
+  ok('同步器要按 9F 自己的 pluginRe 要清单（不再吃默认的共享 PLUGIN_RE）', lastScanOpts && lastScanOpts.pluginRe === RE_GITHUB_COPILOT, JSON.stringify(lastScanOpts && lastScanOpts.pluginRe));
+  ok('别的楼层正在跑的会话不会再被写成 9F 台账', phantomWrote === 0 && !repo.getTaskRun.get(`copilot:${cbSid}:0`), `${phantomWrote} / ${JSON.stringify(repo.getTaskRun.get(`copilot:${cbSid}:0`))}`);
+  const phantomGone = (await get(`project=p1&client=${F9.join(',')}&limit=50`)).find((t) => t.id === `copilot:${cbSid}:0`);
+  ok('上一版留下的「(Copilot 会话)」在飞行被收掉（任务记录页不再挂一条永远进行中）', !phantomGone);
+
+  // 第二道闸：即使清单里混进一条**没有 Copilot 标记**的会话（不是 Copilot 库读出来的），也不写
+  copilotRows = [{ id: 'not-copilot-sid', project: 'p1', projectPath: '/tmp/p1', lastUpdated: Date.now(), inFlight: true, copilotTurns: [] }];
+  ok('清单里没带 Copilot 标记的会话不写（第二道闸：只认 Copilot 自己 session-store.db 读出来的）', syncCopilotTasks({ bus, repo }) === 0 && !repo.getTaskRun.get('copilot:not-copilot-sid:0'));
+  copilotRows = [];
+
+  console.log('[9] /reporter-phase：楼层客户端是逗号串也要走对那条路（8F 回归）');
   // 回归（2026-09-28 实测）：route 里两条分支曾写成 `clientBase(client) === 'opencode' | 'kilo'`，
   // 而渲染层传的是**整个楼层的 clients 串**（合并楼层就是 'opencode,opencode-plugin'），
   // clientBase 只剥单个 -plugin 后缀、逗号串永远不相等 → 整条分支不生效：

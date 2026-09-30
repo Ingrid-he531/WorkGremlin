@@ -36,6 +36,10 @@ const { listSessions, listReporterSessions, readReporterDones, readReporterDone,
 const { listKiloSessions, readKiloPhase, readKiloDone } = require('./kilo');
 // 8F OpenCode：与 7F 同类（轮询 SQLite），但读的是 session_message 而不是 event 表
 const { listOpencodeSessions, readOpencodePhase, readOpencodeDone } = require('./opencode');
+// 6F Qoder 的**插件形态**（VS Code / Trae CN 里的「Qoder CN (Formerly Lingma)」扩展）：
+// 与 7F/8F 同类（轮询它自己的 SQLite），但只有 chat_session / chat_record 两张表可读，
+// 逐字正文是密文 —— 会话 / 相位 / 完成标记都只能从"最后一次落盘"推断（见 lingma.js）。
+const { listLingmaSessions, readLingmaRounds, readLingmaPhase, readLingmaDone } = require('./lingma');
 const { detectProducts } = require('./products');
 const { resolveProjectName } = require('./project');
 // clientOf：7F 那支要按上报身份去问真相位（kilo-plugin / kilo 两个都试，见 kilo 分支的注释）
@@ -636,6 +640,57 @@ function refresh({ workspacePath = '', force = false } = {}) {
             // 完成标记：插件那份（带 cancelled）优先，没有才用轮询那份
             // （轮询等价于"assistant 消息 finish=stop"，被打断的那轮见 opencode.js 的 idle.outcome）
             ...(doneTruth && doneTruth.at ? doneFieldsFromReporter(doneTruth) : readOpencodeDone(s.id, s)),
+            lastEventAt: s.lastEventAt,
+          });
+        }
+        continue;
+      }
+
+      // ---- 6F Qoder 的**插件形态**那一路：轮询扩展自己的 local.db ----
+      // 与 7F/8F 同一类（不靠上报、单独一支），取法是"chat_session + chat_record"两张表
+      // （见 lingma.js 文件头：扩展以通义灵码发布、没有 hook 子系统，逐字正文是密文）。
+      //
+      // 这一路**必须存在**，否则插件里跑的任务在任务记录里看得到、主控制台却一条会话都没有 ——
+      // 主控制台严格跟随所选会话（见 IsoOfficeView 的 consoleBase），没有会话行就没有它的屏。
+      // 能力也比 7F/8F 更窄：源里连"工具状态"都没有，只有"最后一次落盘的时刻"，
+      // 所以相位只在「思考中 / 待命中」之间二选一，恒带 inferred（见 readLingmaPhase）。
+      if (src.kind === 'lingma') {
+        for (const s of listLingmaSessions()) {
+          if (!claim(p.id, s.id)) continue;
+          // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook / kilo / opencode 五路完全一致。
+          // 先过这一关再读轮次：超时的会话不必再去查 chat_record（一个库几十条会话、每 5s 一轮）。
+          if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
+          const rounds = readLingmaRounds(s.id);
+          // 只在插件里开了会话、一句话都没说：不建行 —— 与台账那一路口径一致
+          // （qoderPluginTasks 也是这样，免得 6F 凭空多一个空工位 / 空会话）。
+          if (!rounds.length) continue;
+          const ph = readLingmaPhase(s.id, rounds, s, now);
+          upsert({
+            floor: p.id,
+            id: s.id,
+            // 轴 2：插件的 chat_session.session_id 就是它自己的会话 id（台账那一行写的也是它）
+            sessionId: s.id,
+            source: 'lingma',
+            /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
+            sourceKind: 'lingma',
+            project: s.project,
+            projectPath: s.projectPath,
+            mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
+            current: false,
+            // 插件没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
+            live: true,
+            phase: ph ? ph.phase : 'unreported',
+            action: ph ? ph.action : '',
+            target: ph ? ph.target : '',
+            tool: ph ? ph.tool : '',
+            context: ph ? ph.context : [],
+            // 「思考中」屏上那句用户原话（extra.originalContent 是明文）
+            prompt: (ph && ph.prompt) || '',
+            model: (ph && ph.model) || '',
+            // 相位是轮询推断出来的（不是它主动报的）→ UI 灰显
+            inferred: true,
+            // 完成标记：扩展自己写的 summary 就是"这一轮收工了"的凭据（见 readLingmaDone）
+            ...readLingmaDone(s.id, rounds, s, now),
             lastEventAt: s.lastEventAt,
           });
         }

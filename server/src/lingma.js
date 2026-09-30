@@ -181,6 +181,19 @@ function modelOf(extra) {
 }
 
 /**
+ * "这一轮还在跑"的判据：这是本会话最后一轮、且距今 LIVE_MS 内还有落盘。
+ *
+ * 为什么可以用新鲜度：插件一轮里每吐一条消息 / 每跑一次工具都会写 chat_message
+ * （实测一轮 2 分钟里写了 8 条），所以"一分半没动静"基本就等于收工了。反过来定太短
+ * （比如 30 秒）会把"模型正在长时间思考、还没有任何消息落盘"的那一轮判成已收工。
+ * 定 90 秒：实测最长的静默间隔（一次回答的生成）在 30 秒以内，留三倍余量。
+ *
+ * 台账（qoderPluginTasks.js）与会话表（sessionRegistry.js 的 lingma 那一支）共用这一把尺子 ——
+ * 两边对"这一轮还在不在跑"必须给同一个答案，否则主控制台与任务记录会互相打架。
+ */
+const LIVE_MS = 90_000;
+
+/**
  * 这一条会话里**每一轮**插件的落盘（按 gmt_create 升序 = 真实先后）。
  *
  * ⚠️ 源里**没有**"这一轮跑完了没有"的真值：`finish_status` 实测常驻 0（跑完的也是 0），
@@ -251,6 +264,100 @@ function filesByRecord(sessionId) {
   return out;
 }
 
+/* ------------------------------ 相位 / 完成标记（会话表用） ------------------------------ */
+
+/**
+ * 最后一轮是不是"还在跑"（判据与理由见 LIVE_MS）。
+ *
+ * 与 qoderPluginTasks.js 的 isLive 同一个式子：**本会话最后一轮** + 90 秒内还有落盘。
+ * 会话自己的 gmt_modified（meta.lastEventAt）也一起取最大值 —— 扩展不一定把每一次
+ * 消息落盘都反映到 chat_record.gmt_modified 上，会话行那个时间同样是它写的。
+ */
+function lastRoundLive(rounds, meta = {}, now = Date.now()) {
+  const last = rounds[rounds.length - 1];
+  if (!last) return false;
+  return now - Math.max(Number(last.updatedAt) || 0, Number((meta && meta.lastEventAt) || 0)) <= LIVE_MS;
+}
+
+/**
+ * 这条插件会话**此刻的相位**（**推断**，不是它上报的）。
+ *
+ * 源里没有"这一轮跑完了没有"的真值（finish_status 常驻 0、answer 是密文），只有
+ * "最后一次落盘的时刻"，所以只能二选一：最后一轮还新鲜 → thinking，否则 idle。
+ * 拿不到更细的东西（在调哪个工具、等不等授权），**一个字都不补** —— 宁可只给
+ * 「思考中 / 待命中」，也不拿时间窗去编造"调用工具 xxx"。
+ *
+ * @param {string} sessionId
+ * @param {Array|null} rounds 调用方已经读过就传进来（免得同一轮里重复查库）
+ * @param {{lastEventAt?: number}} meta 会话行自己的最后更新时刻
+ * @returns {{phase:string,action:string,target:string,tool:string,context:string[],prompt:string,model:string,inferred:boolean}|null}
+ */
+function readLingmaPhase(sessionId, rounds = null, meta = {}, now = Date.now()) {
+  const rs = Array.isArray(rounds) ? rounds : readLingmaRounds(sessionId);
+  if (!rs.length) return null;
+  const last = rs[rs.length - 1];
+  return {
+    phase: lastRoundLive(rs, meta, now) ? 'thinking' : 'idle',
+    // 工具 / 目标：源里没有，不猜（见上面"一个字都不补"）
+    action: '',
+    target: '',
+    tool: '',
+    context: [],
+    // 「思考中」屏上那句用户原话（extra.originalContent 是明文）
+    prompt: String(last.prompt || ''),
+    model: String(last.model || ''),
+    inferred: true,
+  };
+}
+
+/** 完成标记的新鲜期：只有这么久之内收工的才算"刚发生"，否则一开页面就重播上一轮（与 kilo.js 同口径） */
+const DONE_TTL_MS = 10 * 60_000;
+/**
+ * 完成标记缺省值（没有就是"没有"，不臆造）。
+ * doneCancelled 恒 false：扩展的落盘里**没有**"用户按了停止"这个信号（连逐字正文都是密文，
+ * 更没有 interrupt 痕迹），所以不亮红色「任务取消」—— 与 9F Copilot 同口径。
+ */
+const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false, doneSaid: '' };
+
+/**
+ * 这条插件会话的"完成"标记 —— 对应 hook 那边 Stop 落下的 done。
+ *
+ * 判据只有一条：**最后一轮已经收工**，凭据是扩展自己写的 `summary`（明文对话总结，
+ * 一轮跑完它才写）。还在飞（90 秒内还有落盘）不算；没写总结的不算（那是"没跑完
+ * 或扩展还没总结"，不是"完成了"）。收工时刻取那一轮最后一次落盘 —— 源里没有更准的。
+ *
+ * @param {string} sessionId
+ * @param {Array|null} rounds
+ * @param {{lastEventAt?: number, projectPath?: string}} meta
+ * @returns {{doneAt:number,doneTitle:string,doneCount:number,doneFiles:Array,doneCancelled:boolean,doneSaid:string}}
+ */
+function readLingmaDone(sessionId, rounds = null, meta = {}, now = Date.now()) {
+  const rs = Array.isArray(rounds) ? rounds : readLingmaRounds(sessionId);
+  if (!rs.length) return NO_DONE;
+  const last = rs[rs.length - 1];
+  if (lastRoundLive(rs, meta, now)) return NO_DONE;
+  const summary = String(last.summary || '').trim();
+  if (!summary) return NO_DONE;
+  const at = Number(last.updatedAt) || 0;
+  if (!at || now - at > DONE_TTL_MS) return NO_DONE;
+  const projectPath = String((meta && meta.projectPath) || '');
+  // 改动文件：扩展记的是绝对路径，转工程相对（与台账那一路口径一致）；工程外的留绝对路径
+  const files = (Array.isArray(last.files) ? last.files : []).slice(0, 6).map((abs) => {
+    if (!projectPath) return String(abs || '');
+    const rel = path.relative(projectPath, String(abs || ''));
+    return rel && !rel.startsWith('..') ? rel : String(abs || '');
+  });
+  return {
+    doneAt: at,
+    doneTitle: String(last.prompt || ''),
+    doneCount: Array.isArray(last.files) ? last.files.length : 0,
+    doneFiles: files.map((name) => ({ name })),
+    doneCancelled: false,
+    // 收尾自述：扩展自己写的对话总结（明文）—— 主控制台那句"说了什么"就是它
+    doneSaid: summary.replace(/\s+/g, ' ').trim().slice(0, 200),
+  };
+}
+
 /** 库里到底有没有这些表 —— 给前端一句"这一路读不出会话"的说明（与 kilo.js 的 hasCoreTables 同款） */
 function hasCoreTables() {
   return (
@@ -277,8 +384,11 @@ module.exports = {
   lingmaDbPath,
   listLingmaSessions,
   readLingmaRounds,
+  readLingmaPhase,
+  readLingmaDone,
   hasCoreTables,
   resetLingmaCache,
+  LIVE_MS,
   TTL,
   SESSION_LIMIT,
 };

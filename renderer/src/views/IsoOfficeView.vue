@@ -936,7 +936,6 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  margin-left: 10px;
 }
 
 .legend .dot {

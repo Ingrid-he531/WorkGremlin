@@ -721,17 +721,29 @@ const PRODUCTS = [
     // Qoder 的 CLI 与插件（qoder-context 等）共用同一份配置、同一套 hook、同一个落盘目录
     // （~/.qoder 与 ~/.qoder-cn/projects/<工程>/…），分不出，合并单楼层（类 4F Claude）。
     // 国际版装 ~/.qoder、国内版装 ~/.qoder-cn（两者可能只装其一，dirs 按序取第一个存在的）。
-    // 所以 6F 走「cli 扫 transcript + hook 实时相位」两路：
-    //   cli   —— <家>/projects/<工程>/<会话>.jsonl（Claude Code 同款格式：各带 sessionId 与 cwd，
-    //            文件名即 session_id；会话来自落盘，工程路径从 cwd 解析；见 sessionRegistry 的 SUBTREE/sessionIdOfFile）
-    //   hook  —— reporter 状态文件兜底（jsonl 还没写/读不出时，hook 那一路照常列会话并提供实时相位）
-    // 两路按 session_id 去重（见 sessionRegistry 的 claim / cliLandingSeen：cli 有活会话就撤掉 hook 行）。
+    // 所以 6F 走「cli 扫 transcript + 插件轮询 local.db + hook 实时相位」三路：
+    //   cli     —— <家>/projects/<工程>/<会话>.jsonl（Claude Code 同款格式：各带 sessionId 与 cwd，
+    //              文件名即 session_id；会话来自落盘，工程路径从 cwd 解析；见 sessionRegistry 的 SUBTREE/sessionIdOfFile）
+    //   lingma  —— **Qoder CN 编辑器插件那一路**（以通义灵码发布）：它没有 hook 子系统
+    //              （见 lingma.js 文件头），不读 ~/.qoder[-cn]/settings.json 里那份 hook 配置，
+    //              所以上面两路都够不着它 —— 会话只能由服务端轮询它自己的 local.db 得到
+    //              （chat_session / chat_record）。相位同样来自那份落盘，恒为推断。
+    //   hook    —— reporter 状态文件兜底（jsonl 还没写/读不出时，hook 那一路照常列会话并提供实时相位）
+    // 三路按 session_id 去重（见 sessionRegistry 的 claim / cliLandingSeen：cli 有活会话就撤掉 hook 行）。
+    // lingma 那一路的会话 id 是插件自己的 chat_session.session_id，与 CLI 的 transcript 名不可能撞，
+    // 所以它不会被 cliLandingSeen 撤掉 —— 同层里"CLI 一条 + 插件一条"就是两条会话，正合合并楼层的口径。
     sources: [
       {
         kind: 'cli',
-        label: 'CLI/Plugin',
+        label: 'CLI',
         client: clientOf('qoder', false),
         dirs: [path.join(HOME, '.qoder'), path.join(HOME, '.qoder-cn')],
+      },
+      {
+        kind: 'lingma',
+        label: 'Plugin',
+        client: clientOf('qoder', false),
+        note: '这一路读的是 Qoder CN 编辑器插件自己的 local.db（SQLite，chat_session / chat_record）：扩展没有 hook 子系统、也不写 ~/.qoder 的 transcript，所以会话与相位只能由服务端轮询它这份落盘（相位是推断值）',
       },
       { kind: 'hook' },
     ],
@@ -896,6 +908,10 @@ function sourceDirs(p, spec) {
   if (spec.kind === 'kilo') return [];
   // 'opencode'（8F）同理：会话在 opencode.db 里，由 opencode.js 轮询，没有可扫的落盘目录。
   if (spec.kind === 'opencode') return [];
+  // 'lingma'（6F 的插件形态）同理：会话在插件自己的 local.db 里，由 lingma.js 轮询。
+  // 而且它连"数据根"都没有一个像样的目录可指（库在 ~/.lingma/vscode/sharedClientCache/cache/db/
+  // 下面，父目录里全是扩展的运行时文件，扫它没有意义）。
+  if (spec.kind === 'lingma') return [];
   return [findDataPath(p.agent, spec.kind === 'plugin')];
 }
 
@@ -941,8 +957,11 @@ function detectSource(p, spec, clients) {
     dataPath,
     dataPathLabel: shorten(dataPath),
     stats: dataPath ? scanDataDir(dataPath) : { ...NO_STATS },
-    /** 这一路取不到会话时的说明（楼层胶囊 tooltip 里显示）；能取到 / 没目录就是空串 */
-    note: dataPath ? spec.note || sourceNote(spec.kind, dataPath) : '',
+    /**
+     * 这一路读不出会话时的说明（楼层胶囊 tooltip 里显示）；能取到就是空串。
+     * 显式给了 note 就照给（'lingma' 那一路没有落盘目录可列，但"会话从哪来"仍要交代一句）。
+     */
+    note: spec.note || (dataPath ? sourceNote(spec.kind, dataPath) : ''),
   };
 }
 
@@ -1039,4 +1058,4 @@ function detectProducts({ force = false } = {}) {
   return products;
 }
 
-module.exports = { detectProducts, PRODUCTS, shorten, humanSize, traeGlobalStorageRoots, traeLogRoots, claudeHome };
+module.exports = { detectProducts, PRODUCTS, shorten, humanSize, traeGlobalStorageRoots, traeLogRoots, claudeHome, RE_GITHUB_COPILOT };
