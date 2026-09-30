@@ -1,18 +1,12 @@
 <script setup>
-import { computed, onUnmounted, ref } from 'vue';
+import { computed } from 'vue';
 import StatusBadge from './StatusBadge.vue';
-import { formatDuration } from '@workgremlin/shared';
+import { formatClock } from '@workgremlin/shared';
 import { currentTaskOf, currentTaskStartedAt, currentTaskTitle } from '../lib/memberTask';
 
 const props = defineProps({
   member: { type: Object, required: true },
 });
-
-const tick = ref(Date.now());
-const timer = setInterval(() => {
-  tick.value = Date.now();
-}, 1000);
-onUnmounted(() => clearInterval(timer));
 
 /** 主 agent 与子代理在工位卡片上分别展示自己的任务描述，用这个开关区分 */
 const isSubagent = computed(() => props.member.role && props.member.role.startsWith('subagent'));
@@ -26,13 +20,15 @@ const taskTitle = computed(() => currentTaskTitle(props.member) || '空闲');
 
 /** 短 id：coder@workgremlin -> coder（用于 data-testid，保证选择器稳定） */
 const agentId = computed(() => props.member.memberId.split('@')[0]);
-/** 已耗时 = **当前任务**的已耗时（从这一轮任务开工算起），不是状态停留时长 */
-const elapsed = computed(() => formatDuration(tick.value - (currentTaskStartedAt(props.member) || props.member.stateSince)));
-/** 最近活跃 = 上一个任务在多久以前（最近一条已收工任务的收工时刻），不是最后一次心跳 */
-const lastActiveAgo = computed(() => {
-  const at = Number(props.member.lastTaskAt || 0);
-  return at ? formatDuration(tick.value - at) : '';
-});
+/**
+ * 两个时间点都用**绝对时刻**（MM-DD HH:mm），不走"多久以前"的相对时长：
+ *   · 开始     = 当前任务开工时刻（原「已耗时」的绝对值）
+ *   · 最近活跃 = 上一个任务收工时刻（最近一条已收工任务）
+ * 相对时长要求界面每秒重算，重算一旦断掉就会出现"1F 的最近活跃不动、3F 的已耗时还在涨"
+ * 这种同一屏两种行为（用户 2026-09-30 实测）。写死的时间点不需要定时器，也不会漏刷。
+ */
+const startAt = computed(() => formatClock(currentTaskStartedAt(props.member) || props.member.stateSince));
+const lastActiveAt = computed(() => formatClock(props.member.lastTaskAt) || '—');
 
 /** 角色文案：主 agent 与子代理在工位卡片上显示为中文；项目级 / 用户级子代理分开标注。 */
 const ROLE_LABELS = {
@@ -77,8 +73,8 @@ const roleLabel = computed(() => {
     </div>
 
     <footer>
-      <span v-if="hasTask" class="mono dim">已耗时 {{ elapsed }}</span>
-      <span v-else class="mono dim">最近活跃 {{ lastActiveAgo ? `${lastActiveAgo}前` : '—' }}</span>
+      <span v-if="hasTask" class="mono dim">开始 {{ startAt }}</span>
+      <span v-else class="mono dim">最近活跃 {{ lastActiveAt }}</span>
       <span v-if="!member.reported" class="tag">被动观测</span>
     </footer>
   </section>

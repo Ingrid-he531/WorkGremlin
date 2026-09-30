@@ -5,17 +5,11 @@
  * 不依赖真实数据：把 5 种状态各渲染一个大工位 + 一排实际尺寸的工位，
  * 方便对照着改配色、比例、动画，而不用等服务里正好出现某个状态。
  */
-import { computed, onUnmounted, ref } from 'vue';
+import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
 import { useProjectStore } from '../stores/project';
 
 const project = useProjectStore();
-
-const tick = ref(Date.now());
-const timer = setInterval(() => {
-  tick.value = Date.now();
-}, 1000);
-onUnmounted(() => clearInterval(timer));
 
 const ROLES = ['leader', 'coder', 'researcher', 'tester', 'reviewer', 'ops'];
 const STATES = ['online', 'busy', 'idle', 'blocked', 'thinking', 'offline'];
@@ -56,20 +50,20 @@ const live = computed(() => project.members);
 
     <div class="big-row">
       <div v-for="m in big" :key="m.memberId" class="big-cell">
-        <DeskScene :member="m" :now="tick" />
+        <DeskScene :member="m" />
         <div class="cap mono">{{ m.state }}</div>
       </div>
     </div>
 
     <h3 class="sec">实际尺寸（办公室网格）</h3>
     <div class="grid">
-      <DeskScene v-for="m in grid" :key="m.memberId" :member="m" :now="tick" />
+      <DeskScene v-for="m in grid" :key="m.memberId" :member="m" />
     </div>
 
     <template v-if="live.length">
       <h3 class="sec">线上成员（真实数据）</h3>
       <div class="grid">
-        <DeskScene v-for="m in live" :key="m.memberId" :member="m" :now="tick" />
+        <DeskScene v-for="m in live" :key="m.memberId" :member="m" />
       </div>
     </template>
   </div>

@@ -5,7 +5,7 @@
  * 排序把异常成员顶到前面：blocked > busy > online > idle > offline。
  * 点击工位 = 选中该成员（与右侧对话抽屉联动）。
  */
-import { computed, onUnmounted, ref } from 'vue';
+import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
 import { useProjectStore } from '../stores/project';
 
@@ -15,12 +15,6 @@ const props = defineProps({
 const emit = defineEmits(['select']);
 
 const project = useProjectStore();
-
-const tick = ref(Date.now());
-const timer = setInterval(() => {
-  tick.value = Date.now();
-}, 1000);
-onUnmounted(() => clearInterval(timer));
 
 /** 异常优先：保证阻塞/忙碌的成员一定在首屏 */
 const desks = computed(() => {
@@ -39,7 +33,6 @@ const desks = computed(() => {
           v-for="m in desks"
           :key="m.memberId"
           :member="m"
-          :now="tick"
           :selected="selectedId === m.memberId"
           @select="emit('select', $event)"
         />

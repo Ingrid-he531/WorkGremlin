@@ -151,6 +151,22 @@ function formatDuration(ms) {
   return `${s}s`;
 }
 
+/**
+ * 绝对时刻 `MM-DD HH:mm`（用于「开始 / 最近活跃」这类时间点）。
+ *
+ * 为什么不用相对时长（"53m前"）：那要求界面每秒重算，而重算一旦断了，就会出现
+ * "1F 的最近活跃不动、3F 的已耗时还在涨"这种同一屏两种行为（用户 2026-09-30 实测）。
+ * 时间点写死不动，既不需要定时器，也不会有"谁没刷新"的问题。秒级不要 —— 那是给相对时长看的。
+ * @param {number} ms
+ */
+function formatClock(ms) {
+  const t = Number(ms);
+  if (!Number.isFinite(t) || t <= 0) return '';
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 /** 状态 -> 中文标签 */
 const STATE_LABELS = Object.freeze({
   online: '在线',
@@ -285,6 +301,7 @@ module.exports = {
   dedupeKey,
   fnv1a32,
   formatDuration,
+  formatClock,
   clientBase,
   isPluginClient,
   clientOf,

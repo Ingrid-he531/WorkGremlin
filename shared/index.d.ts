@@ -163,6 +163,8 @@ export declare function dedupeKey(m: {
 }): string;
 export declare function fnv1a32(str: string): string;
 export declare function formatDuration(ms: number): string;
+/** 绝对时刻 `MM-DD HH:mm`（「开始 / 最近活跃」这类时间点；写死不动，不需要定时器重算） */
+export declare function formatClock(ms: number): string;
 
 /**
  * 智能体（agent）与客户端（client）的关系：client = agent，或 agent + '-plugin'。

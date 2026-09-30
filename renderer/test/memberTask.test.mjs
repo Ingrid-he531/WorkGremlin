@@ -53,5 +53,15 @@ ok('online / idle / offline → 空闲', ['online', 'idle', 'offline'].every((s)
 ok('未知状态按空闲处理（不把原始 state 直接怼给用户）', statusLabel('weird') === '空闲', statusLabel('weird'));
 ok('色调与文案同源（忙碌=busy 点，其余=idle 点）', statusTone('thinking') === 'busy' && statusTone('online') === 'idle' && statusTone('offline') === 'idle');
 
+console.log('\n[5] 时间点用绝对时刻（formatClock），不用需要每秒重算的相对时长');
+// 用户 2026-09-30 实测：1F 的「最近活跃」（相对时长）看着不动、3F 的「已耗时」一直在涨 ——
+// 同一屏两种行为。改成绝对时间后两者都是写死的字符串，不依赖任何定时器。
+const { formatClock } = await import('@workgremlin/shared');
+const at = new Date(2026, 8, 30, 21, 5, 42).getTime();
+ok('格式是 MM-DD HH:mm', formatClock(at) === '09-30 21:05', formatClock(at));
+ok('没有值 / 非法值回空串（卡片自己写「—」）', formatClock(0) === '' && formatClock(NaN) === '' && formatClock(null) === '');
+ok('同一时刻永远是同一个字符串（不随"现在几点"变化 = 不需要 tick）', formatClock(at) === formatClock(at));
+ok('不带秒、不带"前"（那些是相对时长的写法）', !/前|:\d\d:\d\d/.test(formatClock(at)), formatClock(at));
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
