@@ -42,6 +42,7 @@
     "test:ghost-ledger": "node server/test/ghostLedger.test.js",
     "test:recover": "node server/test/taskRecover.test.js",
     "test:qoder": "node server/test/qoderHook.test.js",
+    "test:qoder-plugin": "node server/test/qoderPlugin.test.js",
     "test:ide-hook": "node server/test/ideHook.test.js",
     "test:task-client": "node renderer/test/taskClientLabel.test.mjs",
     "test:ws-reconnect": "node renderer/test/wsReconnect.test.mjs",

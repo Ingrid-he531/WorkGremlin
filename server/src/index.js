@@ -35,6 +35,7 @@ const { snapshot: registrySnapshot, setBackend: setRegistryBackend } = require('
 const { startCopilotTaskSyncer } = require('./copilotTasks');
 const { startKiloTaskSyncer } = require('./kiloTasks');
 const { startOpencodeTaskSyncer } = require('./opencodeTasks');
+const { startQoderPluginTaskSyncer } = require('./qoderPluginTasks');
 const config = require('./config');
 const clock = require('./clock');
 
@@ -287,6 +288,12 @@ function createServer(opts = {}) {
     // 同步器每 5s 轮询 opencode.db（session_message 的 user/assistant/idle 消息流），
     // 把**每一轮用户任务**写成 task + task_run，让任务列表能看到 8F。
     timers.push(startOpencodeTaskSyncer({ bus, repo, now: () => clock.now() }));
+
+    // 6F Qoder **插件形态**同步：Qoder CN 的编辑器扩展没有 hook 子系统（实测 2026-09-30），
+    // hook 那条路对它无效，重启/重编译都不会变。同步器每 5s 轮询扩展自己的 local.db，
+    // 把**每一轮**写成 task + task_run（标题=用户原话、产出=扩展写的 summary）。
+    // 同一个成员若正被 CLI 那一路占着状态栏，这一路只写台账、不动相位（见该文件头）。
+    timers.push(startQoderPluginTaskSyncer({ bus, repo, now: () => clock.now() }));
 
     const runRetentionCleanup = () => {
       try {
