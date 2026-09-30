@@ -79,6 +79,44 @@ let IS_CLAUDE = false;
 let IS_QODER = false;
 
 /**
+ * **粗粒度会话**那一族：只发 SessionStart / SessionEnd，**没有** UserPromptSubmit / Stop 这些
+ * 细粒度事件。这一族没有"每一轮"的概念，任务与相位只能在会话边界上补一笔：
+ * SessionStart → 一条会话级任务 + thinking，SessionEnd → 收工 + done（见两处调用点）。
+ *
+ * ## 2026-09-30：Qoder 从这一族**移出**（集合留空，机制保留给以后的产品）
+ *
+ * Qoder 之前在这一族里（`AGENT === 'qoder'`，7dec250 引入，口径是"只发 SessionStart / SessionEnd"）。
+ * 实测本机 Qoder CLI 1.1.64 早已是**细粒度**产品 —— 2026-09-30 14:37 一次会话，events.log 里
+ * 依次是 SessionStart → Notification(auth_success) → UserPromptSubmit → PreToolUse(Bash) →
+ * PostToolUse → Stop → Notification(idle_prompt)，一应俱全；那一轮也照常写进了任务台账
+ * （form=cli、标题就是用户原话）。
+ *
+ * 留着粗粒度补笔的后果是**两条任务抢同一个槽位**：agent_status 一行一成员、只有一个 task_id，
+ * 会话级那条（`Qoder Session`）永远抢不到心跳 → 在任务记录里一直显示「已取消」，而会话其实
+ * 好好开着。所以现在按细粒度走（与 4F Claude 同口径：相位由 UserPromptSubmit / Stop 推进）。
+ *
+ * **TraeCode 也不在这一族**：events.log 里 trae 有 16 条 UserPromptSubmit / 13 条 Stop，
+ * tasks 表里 trae 的行标题就是用户原话。
+ *
+ * 以后遇到真的只发会话事件的产品，把基名加进 COARSE_AGENTS、并在 COARSE_SESSION_TITLE
+ * 里给它起个会话级标题即可。
+ *
+ * ## 别再把这两个名字弄丢
+ *
+ * `isCoarseAgent` / `COARSE_SESSION_TITLE` 是 b5b38a4 把 `AGENT === 'qoder'` 重构成统一判断时
+ * **引入却漏了定义**的 —— 于是每个 SessionStart / SessionEnd 都抛
+ * `ReferenceError: isCoarseAgent is not defined`，被 main 末尾的"异常（忽略）"吞掉：
+ * 会话级任务与 thinking / done 相位写不出去，SessionEnd 之后的清理（停心跳守护、扫幽灵、
+ * `status('offline')`）也一并跳过（连 4F Claude 都被殃及）。唯一的警报是 test:qoder 那两条红。
+ * 以后动这里，先跑 `npm run test:qoder`。
+ */
+const COARSE_AGENTS = new Set();
+/** 粗粒度会话那一族的会话级任务标题（没有"用户那句话"，只能给个产品名）。每个成员都要有一条 */
+const COARSE_SESSION_TITLE = { qoder: 'Qoder Session' };
+/** 这条会话是不是粗粒度产品（见 COARSE_AGENTS） */
+const isCoarseAgent = () => COARSE_AGENTS.has(AGENT);
+
+/**
  * **轴 2（会话）**：本次事件所属的会话 id，取自 payload 的 `session_id`。
  *
  * 同一个 CLI 可以同时开着好几条会话（两个终端 / 一个终端 + 一个 IDE 窗口），
@@ -1754,12 +1792,12 @@ async function main() {
     await register();
     await beat();
     await status('idle');
-    // Qoder 实测只发 SessionStart / SessionEnd，没有 UserPromptSubmit / PreToolUse / PostToolUse
-    // 这些细粒度事件（见 scripts/install-hooks.js 的 QODER_EVENTS 注释与 ~/.workgremlin/hooks/events.log）。
-    // 不补一笔"会话进行中"的粗粒度真值，主控制台只会一直显示「未上报」。Claude / CodeBuddy 有
-    // 细粒度事件随后把相位推进到 thinking / tool，不受这句影响。
+    // 粗粒度那一族（见 COARSE_AGENTS）只发 SessionStart / SessionEnd，没有 UserPromptSubmit /
+    // PreToolUse / PostToolUse 这些细粒度事件 —— 不补一笔"会话进行中"的粗粒度真值，主控制台
+    // 只会一直显示「未上报」。细粒度产品（Claude / CodeBuddy / **Qoder** / TraeCode …）有后续
+    // 事件把相位推进到 thinking / tool，不该在这里补（补了就是两条任务抢一个槽位，见 COARSE_AGENTS）。
     if (isCoarseAgent()) {
-      // Qoder / TraeCode 不发 UserPromptSubmit / Stop，form 检测与 TASK_START 永远不会在那两条路径里触发 ——
+      // 这一族不发 UserPromptSubmit / Stop，form 检测与 TASK_START 永远不会在那两条路径里触发 ——
       // 只能在 SessionStart 里补做（类 3F Codex 的 UserPromptSubmit 那一刀）。
       // transcript 在 SessionStart 时可能还没落盘（entrypoint 写不进），先试一次、认不出留空，
       // SessionEnd 时再兜底认一次（见下方 SessionEnd 的 Qoder 段）。
@@ -2189,7 +2227,7 @@ async function main() {
       String((ev && ev.session_id) || stEnd.sessionId || ''),
       cl
     );
-    // Qoder / TraeCode 没有 Stop（只有 SessionStart / SessionEnd），收尾给一个"已完成"的粗粒度相位，
+    // 粗粒度那一族没有 Stop（只有 SessionStart / SessionEnd），收尾给一个"已完成"的粗粒度相位，
     // 否则 sessionPhase 回落成 null，主控制台又会显示「未上报」。其它产品维持原状（null）。
     // 这一族的 TASK_END 也只能在这里补（Stop 那一刀永远不会触发）：
     // 再认一次 form（SessionStart 时 transcript 可能还没落盘，此时兜底），
