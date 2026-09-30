@@ -192,6 +192,66 @@ async function main() {
   ok('task/end 带上了 form=plugin', lastEnd().form === 'plugin', JSON.stringify(lastEnd()));
   ok('这一笔确实是收工上报（带 taskId）', Boolean(lastEnd().taskId), JSON.stringify(lastEnd()));
 
+  /* [6] 注入信封不当新一轮：Claude Code 把「后台子 agent 完成」从用户输入队列投递，
+   *     于是 UserPromptSubmit 照常触发、ev.prompt 就是那段 XML（实测 2026-09-30）。 */
+  head('[6] <task-notification> 不当用户任务：不开新任务、不动正在跑的那一轮');
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'cfm-inj', cwd: WS, prompt: '真的用户任务' });
+  const st6 = stateOf('cfm-inj');
+  const starts6 = starts.length;
+  const ends6 = ends.length;
+  const NOTIFY = [
+    '<task-notification>',
+    '<task-id>a8be33807de04142a</task-id>',
+    '<tool-use-id>call_00_rARf9Selg5A31PAQWXXa4188</tool-use-id>',
+    '<status>completed</status>',
+    '<summary>Agent "Design per-round Kilo ledger fix" finished</summary>',
+    '</task-notification>',
+  ].join('\n');
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'cfm-inj', cwd: WS, prompt: NOTIFY });
+  const st6b = stateOf('cfm-inj') || {};
+  ok('没开新任务（task/start 一次都没发）', starts.length === starts6, `starts ${starts6} → ${starts.length}`);
+  ok('也没发收工上报', ends.length === ends6, `ends ${ends6} → ${ends.length}`);
+  ok('正在跑那轮的 taskId 原样保留（没被覆盖）', Boolean(st6.taskId) && st6b.taskId === st6.taskId, `${st6.taskId} → ${st6b.taskId}`);
+  ok('标题没被那段 XML 顶掉', st6b.taskTitle === '真的用户任务', JSON.stringify(st6b.taskTitle));
+  ok('相位没被这次注入刷新', st6b.sessionPhase && st6.sessionPhase && st6b.sessionPhase.ts === st6.sessionPhase.ts);
+
+  /* [7] 同一类信封：别的会话 / subagent 递过来的消息 */
+  head('[7] <agent-message> 同样不当用户任务');
+  const starts7 = starts.length;
+  await runHook({
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 'cfm-inj',
+    cwd: WS,
+    prompt: '<agent-message from="a73b954e42a3f777e">\n帮我看一眼 7F\n</agent-message>',
+  });
+  ok('没开新任务', starts.length === starts7, `starts ${starts7} → ${starts.length}`);
+
+  /* [8] 边界：真人那句话**中间**提到这个字样（用户报这个 bug 时就是这么写的）—— 必须照常开任务 */
+  head('[8] 边界：<task-notification> 出现在真人 prompt 中间 → 照常开任务');
+  const starts8 = starts.length;
+  await runHook({
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 'cfm-real',
+    cwd: WS,
+    prompt: '后面就又出现一个新任务，prompt 是：<task-notification> <task-id>a8be33807de04142a</task-id>，你看看',
+  });
+  ok('照常开任务', starts.length === starts8 + 1, `starts ${starts8} → ${starts.length}`);
+  ok('标题是用户原话', String(lastStart().title || '').startsWith('后面就又出现一个新任务'), JSON.stringify(lastStart().title));
+
+  /* [9] IDE 注入的"打开了某文件"是**前缀**，不是整条信封：剥掉块、留下用户原话当标题
+   *     （实测 2026-09-24：标题被这个块占满，落了两条看不见用户话的任务） */
+  head('[9] <ide_opened_file> 是前缀 → 剥掉块，标题留用户原话');
+  const starts9 = starts.length;
+  await runHook({
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 'cfm-ide-open',
+    cwd: WS,
+    prompt:
+      '<ide_opened_file>The user opened the file /home/yinghui/work/WorkGremlin/packages/reporter/src/hook.js in the IDE. This may or may not be related to the current task.</ide_opened_file>装上吧',
+  });
+  ok('照常开任务（它是真 prompt，不能整条丢掉）', starts.length === starts9 + 1, `starts ${starts9} → ${starts.length}`);
+  ok('标题是用户原话（不是那串 XML）', lastStart().title === '装上吧', JSON.stringify(lastStart().title));
+
   server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });

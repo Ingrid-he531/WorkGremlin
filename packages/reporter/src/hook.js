@@ -396,6 +396,23 @@ function filesOf(input, tool) {
 }
 
 /**
+ * 「这条 prompt 不是用户敲的」——Claude Code 会把下面两类东西**从用户输入队列**投递，
+ * 因此照样触发 UserPromptSubmit，`ev.prompt` 就是那段信封原文（实测 2026-09-30：
+ * events.log 里 02:18:45 有一条 UserPromptSubmit，transcript 里对应的却是
+ * `{"type":"queue-operation","operation":"remove",…,"content":"<task-notification>…"}`）：
+ *   - `<task-notification>`：后台子 agent / 后台命令完成时的通知
+ *   - `<agent-message>`：别的会话 / subagent 递过来的消息
+ * 认不出来有两个后果（实测同一个会话里同时发生）：凭空多一条标题是 XML 的假任务；而且
+ * UserPromptSubmit 的前提是"新一轮 = 上一轮已结束"，于是**正在跑的那一轮**永远等不到它的
+ * Stop、停在 running，被服务端判成「已取消」。
+ *
+ * 按**开头**锚定是安全的：本机全量 transcript 实测，经这条队列投递的信封只有这两种
+ * （12 / 3 次），而以信封开头的 user 条目是 0 —— 真人不会把自己那句话的开头写成
+ * `<task-notification>`（在中间提到它不算，`^` 挡住的就是这种）。
+ */
+const INJECTED_PROMPT_RE = /^\s*<(?:task-notification|agent-message)[\s>]/i;
+
+/**
  * 用户原话：剥掉 IDE 插件注入的那段上下文。
  *
  * 实测（Codex 的 VS Code 扩展）提交上来的 prompt 是拼好的：
@@ -411,7 +428,16 @@ function filesOf(input, tool) {
  * 不像注入块的原样返回 —— 用户真在 prompt 里写 "My request:" 这类字样的不会被误伤。
  */
 function userRequestText(raw) {
-  const text = String(raw || '').replace(/\r\n?/g, '\n');
+  const text = String(raw || '')
+    .replace(/\r\n?/g, '\n')
+    // IDE 注入的"打开了某文件"块是**拼在用户原话前面**的（实测 2026-09-24 的
+    // bd0c4119 会话：整条 = `<ide_opened_file>…</ide_opened_file>先不谈 cli 和 plugin,
+    // 单说 cli 和主 agent…`）。标题只取前 TITLE_MAX(80) 字，正好被这个块占满，
+    // 用户的话一个字都看不见 —— 实测已经因此落了两条标题全是信封的任务（t_muf561ug / t_muf6mx6w）。
+    // 所以整块剥掉再往下走。
+    // 注意它和 <task-notification> / <agent-message> **不是一回事**：那两个是"整条就是信封"
+    // （该整条丢掉，见 INJECTED_PROMPT_RE）；这个是"前缀"（剥掉后正文还在）。
+    .replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>/gi, '');
   if (!text.trim()) return '';
   const injected =
     /^[ \t]*#{0,6}[ \t]*Context from my IDE setup\b/im.test(text) ||
@@ -1761,6 +1787,15 @@ async function main() {
   }
 
   if (event === 'UserPromptSubmit') {
+    // 不是用户敲的（见 INJECTED_PROMPT_RE）：整段不上报，当前这一轮继续跑。
+    // 连下面的 sweepGhosts 也一并跳过 —— 它那一步的理由同样是"新一轮 = 上一轮已结束"，
+    // 而注入消息恰恰是在一轮**中途**来的，上一轮还在飞；子 agent 的幽灵另有 SubagentStop
+    // 那条路收。更不能往下走：那会 TASK_START 出一条假任务，还顺手把正在跑的那轮的
+    // taskId 覆盖掉，那一轮就再也收不了工。
+    if (INJECTED_PROMPT_RE.test(String((ev && ev.prompt) || ''))) {
+      debug('注入消息，不当新一轮任务：', String(ev.prompt).slice(0, 60));
+      return;
+    }
     // 新一轮用户输入 = 上一轮已经结束：Task 是阻塞工具，轮次一结束它就不可能在飞了。
     // 结束事件可能丢（实测：打断时 PostToolUse / SubagentStop 都不来），这里兜底扫掉。
     sweepGhosts(file, REAL_WS, cl);
