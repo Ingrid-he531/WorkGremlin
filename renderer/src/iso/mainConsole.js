@@ -216,8 +216,10 @@ export function drawConsoleScreen(c, o) {
     return;
   }
 
-  c.textAlign = 'left';
-  c.textBaseline = 'top';
+  // 状态字居中显示（2026-09-30 用户要求）：水平居中于屏宽，垂直居中于"底部进度条以上"那块。
+  // 用 textBaseline='middle' 直接以中线定位 —— 字号自适应缩小（下面 lfs）时也不用再补偏移。
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
 
   /* 唯一一层内容：相位状态（思考中 / 调用工具 …）。
      只显示状态，不显示具体 prompt、读写文件、调用工具的细节 —— 那些留在 tooltip / 对话记录里。
@@ -233,22 +235,24 @@ export function drawConsoleScreen(c, o) {
     lfs = Math.max(fs1 * 0.5, (fs1 * inner) / labelW);
     c.font = `700 ${lfs}px ${FONT}`;
   }
-  const labelV = H * 0.38; // 只剩一层：垂直居中偏上（顶部状态条与底部进度条之间）
+  /** 底部那条不确定进度条的上沿；状态字在它以上的区域里居中 */
+  const barTop = H * 0.93;
+  const labelV = barTop / 2;
   const labelText = fit(c, label, inner);
   c.globalAlpha = blink;
   c.fillStyle = ph.color;
-  c.fillText(labelText, padX, labelV + (fs1 - lfs) * 0.5);
+  c.fillText(labelText, W / 2, labelV);
   c.globalAlpha = 1;
 
   /* 底部：执行中走一条不确定的进度条 */
   c.fillStyle = 'rgba(255,255,255,0.07)';
-  c.fillRect(padX, H * 0.93, inner, H * 0.035);
+  c.fillRect(padX, barTop, inner, H * 0.035);
   if (ph.busy) {
     const segW = inner * 0.3;
     const u = padX + ((now / 1800) % 1) * (inner - segW);
     c.fillStyle = ph.color;
     c.globalAlpha = 0.85;
-    c.fillRect(u, H * 0.93, segW, H * 0.035);
+    c.fillRect(u, barTop, segW, H * 0.035);
     c.globalAlpha = 1;
   }
 
@@ -458,4 +462,3 @@ export function drawOperator(c, o) {
 
   c.restore();
 }
-
