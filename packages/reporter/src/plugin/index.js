@@ -62,37 +62,49 @@ const ghostFeed = require_("../ghostFeed.js")
 /* ------------------------------ 上报身份 ------------------------------ */
 
 /**
- * 这个插件实例替哪个产品上报（= products.js 里的 client / agent 基名）。
- *
- * Kilo Code 的 CLI（TUI）与 VS Code 扩展**都跑同一份插件**（扩展自带 bin/kilo、
- * 起的就是同一个 CLI server），所以这里要靠环境变量把两种形态分开：
- *   · CLI / TUI 起的 → client = 'kilo'（与 7F 的轮询那一路同身份）
- *   · VS Code 扩展起的 → client = 'kilo-plugin'（插件形态，走 hook 状态文件那一路）
- *
- * 扩展起 server 时实测带 KILO_CLIENT=vscode / KILOCODE_FEATURE=vscode-extension /
- * KILO_PLATFORM=vscode —— 这三个任何一个出现都说明"是编辑器里起的"，不是终端里起的。
- * 其余（KILO_APP_NAME 之类）只说明"这是 Kilo"，分不出形态，归到 CLI。
- *
- * OpenCode 同理：VS Code 扩展起 server 时带 OPENCODE_CLIENT=vscode 或 OPENCODE_FEATURE=vscode-extension，
- * 区分 CLI（opencode）与 Plugin（opencode-plugin）两种形态。
+ * 「这个进程是编辑器里起的吗」的专属信号 —— **按产品分开列**。
+ * 混在一起认会让两边的变量互相污染：Kilo 的 CLI 进程里一个 KILO_* 都没有（实测 2026-09-30，
+ * `/proc/<pid>/environ` 只有安装垫片留下的 KILO_TREE_SITTER_WASM_DIR），而 VS Code 扩展起的
+ * `kilo serve` 三个都齐（KILO_CLIENT=vscode / KILOCODE_FEATURE=vscode-extension / KILO_PLATFORM=vscode）。
  */
-function resolveClient(options) {
+const VSCODE_ENV = {
+  kilo: [
+    ["KILO_CLIENT", "vscode"],
+    ["KILOCODE_FEATURE", "vscode-extension"],
+    ["KILO_PLATFORM", "vscode"],
+  ],
+  opencode: [
+    ["OPENCODE_CLIENT", "vscode"],
+    ["OPENCODE_FEATURE", "vscode-extension"],
+  ],
+}
+
+/**
+ * 上报身份（= products.js 里的 client）= **产品基名** + **形态**，两件事分开定：
+ *
+ *   · 产品基名（kilo / opencode）**由入口给**：`setup(ctx)` 是 OpenCode 的插件 API、
+ *     `server(input, options)` 是 Kilo 的 —— 走哪个入口就说明是哪个产品，不用猜。
+ *     配置里显式写了 `client` 也归一到基名（`kilo-plugin` → `kilo`）。
+ *   · 形态（CLI / VS Code 插件）**由环境判**：同一份二进制在终端里和编辑器里各起一次，
+ *     事件流完全一样（见文件头），只有环境变量分得出 —— 见上面的 VSCODE_ENV。
+ *
+ * **这里踩过的坑（2026-09-30 修）**：早先第一行是 `if (explicit) return explicit` ——
+ * 而安装器写进 kilo.jsonc 的正是 `{client:"kilo"}`、`server()` 里还有个 `|| {client:"kilo"}`
+ * 的兜底，于是**显式分支把下面整段环境判定全遮死**：VS Code 里跑出来的插件也报 `kilo`、
+ * `form` 随之恒为 `cli`，任务列表里永远显示「Kilo Code CLI」（7F 的 plugin 形态从来没出现过）。
+ * 安装器那条注释本来就是「`options.client` 钉住产品、形态由扩展自己判」的意图，
+ * 是这里的判定顺序把那个意图杀死了。
+ */
+function resolveClient(options, base = "opencode") {
+  const env = (typeof process !== "undefined" && process.env) || {}
   const explicit = String((options && options.client) || "").trim().toLowerCase()
-  if (explicit) return explicit
-  const env = typeof process !== "undefined" && process.env ? process.env : {}
-  // Kilo Code 的 VS Code 扩展：这三个变量是"编辑器里起的"专属信号
-  if (env.KILO_CLIENT === "vscode" || env.KILOCODE_FEATURE === "vscode-extension" || env.KILO_PLATFORM === "vscode") {
-    return "kilo-plugin"
-  }
-  // 其余 Kilo 相关变量（KILO_APP_NAME 等）只说明"这是 Kilo"，分不出形态 → CLI
-  if (env.KILO_CLIENT || env.KILOCODE_FEATURE || env.KILO_APP_NAME) return "kilo"
-  // OpenCode 的 VS Code 扩展：这两个变量是"编辑器里起的"专属信号
-  if (env.OPENCODE_CLIENT === "vscode" || env.OPENCODE_FEATURE === "vscode-extension") {
-    return "opencode-plugin"
-  }
-  // 其余 OpenCode 相关变量只说明"这是 OpenCode"，分不出形态 → CLI
-  if (env.OPENCODE_CLIENT || env.OPENCODE) return "opencode"
-  return "opencode"
+  // 显式选项**只说产品**：`kilo` / `kilo-plugin` / `opencode` 都归一到基名，形态仍然由环境判。
+  // 选项表达不了形态 —— 它写在配置里，而那**同一份配置 CLI 和编辑器扩展都会读**（Kilo 就是这样：
+  // 扩展自带同一个二进制、读同一个 ~/.config/kilo/kilo.jsonc），所以选项里写死 `-plugin`
+  // 在终端里就是错的，反之亦然。环境是唯一分得出"这一次是谁起的"的信号。
+  const name = explicit ? explicit.replace(/-plugin$/i, "") : base
+  const vscode = (VSCODE_ENV[name] || []).some(([k, v]) => env[k] === v)
+  return vscode ? `${name}-plugin` : name
 }
 
 /* ------------------------------ 状态文件 ------------------------------ */
@@ -175,39 +187,89 @@ function readServerInfo() {
 /** 单次 HTTP 的超时；超了就当这次没报出去，不重试到把 agent 拖住 */
 const HTTP_TIMEOUT_MS = 2_000
 
+/** server.json 的重读间隔：读一次几百字节，5 秒足够跟上"应用刚起来 / 刚换了端口" */
+const SERVER_INFO_TTL_MS = 5_000
+
+/** 进程还活着吗？与 server/src/config.js 的 isPidAlive 同一口径（崩掉那次留下的 server.json 不能用） */
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * 建一个台账上报器。
  * @param {string} client 上报身份（kilo / kilo-plugin / opencode）—— 同时也是 memberId
  */
 function createIngest(client) {
-  const info = readServerInfo()
-  const base = info && info.port ? `http://127.0.0.1:${info.port}` : ""
-  const token = (info && info.token) || ""
-  const headers = { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) }
+  /**
+   * 连接信息**惰性重读**，不在建实例那一刻定死。
+   *
+   * **这里踩过的坑（2026-09-30 修）**：早先这里读一次就把 `base` 定成常量、`enabled()`
+   * 恒为 `Boolean(base)` —— 而插件是**跟着 agent 的 server 进程活的**：Kilo 的 VS Code 扩展
+   * 09:04 起 server，WorkGremlin 10:42 才起，那个实例的 `post()` / `resolveProject()`
+   * 就一辈子直接 return（状态文件照写本地磁盘、台账一条不来，且**完全无声**）。
+   * 实测症状：那条 VS Code 会话在任务列表里只有轮询推导的行、没有任何插件行。
+   * 现在改成带 TTL 的重读：应用晚起 / 重启换了端口，下一个事件就能接上。
+   *
+   * 也补上了插件原先缺的存活判定（`isPidAlive`）：否则崩掉那次留下的 server.json
+   * 会被一直当成有效连接，每次都往一个死端口撞。
+   */
+  let conn = null
+  let connAt = 0
+  function connect() {
+    const now = Date.now()
+    // 命中缓存：端口/令牌没变、且没过期 —— 高频事件（*.delta 虽然不写盘，但 part 更新很密）
+    // 下不能每个事件都去读一次盘
+    if (conn && now - connAt < SERVER_INFO_TTL_MS) return conn
+    connAt = now
+    const info = readServerInfo()
+    if (!info || !info.port || !isPidAlive(info.pid)) {
+      conn = null
+      return null
+    }
+    conn = {
+      base: `http://127.0.0.1:${info.port}`,
+      token: info.token || "",
+      headers: { "content-type": "application/json", ...(info.token ? { authorization: `Bearer ${info.token}` } : {}) },
+    }
+    return conn
+  }
 
-  /** WorkGremlin 没在跑 / 没装 → 整个上报层停用，绝不每个事件都去撞一次连接 */
-  const enabled = () => Boolean(base)
+  /** WorkGremlin 没在跑 / 没装 → 这次上报不发，绝不撞一个已知不通的端口 */
+  const enabled = () => Boolean(connect())
 
   /**
-   * 记一条台账。**同步返回、不 await** —— 事件处理绝不因 HTTP 被拖住。
+   * 记一条台账。**调用方一律不 await** —— 事件处理绝不因 HTTP 被拖住；
+   * 但**把响应返回出去**，让"这一条到底发出去没有"变成可判的：`ensureRegistered`
+   * 就是靠它决定"注册成功没有、要不要重试"（早先这里返回 undefined、错误全吞，
+   * 于是注册悄悄失败也无人知晓，见那里踩的坑）。
    *
    * `project` 在这里**统一注入**，不交给各调用点：ingest 的 `projectFirst` 中间件
    * 要求 body 里有 project，缺了就直接 400（`missing project`）—— 而 400 是
    * **静默**的（上报 fire-and-forget，没人看响应），漏一处就表现为"这个产品的台账
    * 永远是空的"，极难定位。SDK 那边（packages/reporter/src/index.js 的 post）是
    * `{ project, ...body }` 统一加的，这里必须同一个口径。
+   *
+   * @returns {Promise<Response|null>} 没连上 / 发不出去 → null
    */
   function post(route, body) {
-    if (!enabled()) return
+    const c = connect()
+    if (!c) return Promise.resolve(null)
     try {
-      fetch(`${base}/api/v1${route}`, {
+      return fetch(`${c.base}/api/v1${route}`, {
         method: "POST",
-        headers,
+        headers: c.headers,
         body: JSON.stringify({ project: projectCache, ...body }),
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-      }).catch(() => {})
+      }).catch(() => null)
     } catch {
       /* 发不出去就算了 */
+      return Promise.resolve(null)
     }
   }
 
@@ -219,11 +281,12 @@ function createIngest(client) {
   let projectCache = ""
   let projectPromise = null
   function resolveProject() {
-    if (!enabled()) return Promise.resolve("")
+    const c = connect()
+    if (!c) return Promise.resolve("")
     if (projectPromise) return projectPromise
     projectPromise = (async () => {
       try {
-        const res = await fetch(`${base}/api/v1/workspace`, { headers, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+        const res = await fetch(`${c.base}/api/v1/workspace`, { headers: c.headers, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
         const j = res.ok ? await res.json() : null
         const p = String((j && j.project) || "")
         if (p) {
@@ -318,9 +381,19 @@ function subagentOf(input) {
  *   · 8F OpenCode：`setup(ctx)` + `ctx.event.subscribe()` 拿事件流
  *   · 7F Kilo   ：`server(input)` 返回 `{ event }` 钩子，Kilo 每条事件调一次
  * 所以事件处理（相位 / 台账 / 幽灵）只写一份，两个入口各自接线。
+ *
+ * @param {any} options 配置里那条 plugin 条目的选项（目录注册的没有，是 undefined）
+ * @param {{location?: any, base?: string}} ctx `base` = 产品基名，**由入口给**（见 resolveClient）
  */
-function createIngestPlugin(options, { location } = {}) {
-  const client = resolveClient(options)
+function createIngestPlugin(options, { location, base } = {}) {
+  const client = resolveClient(options, base)
+  /**
+   * 形态（落 task_runs.form，任务列表按它显示「… CLI」/「… Plugin」）。
+   * 与 `client` 的 `-plugin` 后缀是同一件事，所以只在这里算一次 —— 原先开轮（task/start）
+   * 与工具计数（tool/use）两处各写一遍 `client.endsWith("-plugin") ? …`，将来改一处必漏另一处。
+   * 口径与 shared 的 isPluginClient 一致。
+   */
+  const form = /-plugin$/i.test(client) ? "plugin" : "cli"
   /** 会话 id → 工程路径（session.created 给的是权威值，事件信封的 location.directory 兜底） */
   const dirs = new Map()
   /** 工具调用 id → 工具名（`session.tool.called` 不带工具名，只有配对的 input.started 里有） */
@@ -354,11 +427,84 @@ function createIngestPlugin(options, { location } = {}) {
    * 同一个 callID 只记一次。攒到一定量整批清掉 —— 它只是"本进程见过的调用"，不需要长留。
    */
   let toolCallSeen = new Set()
-  /** 成员注册只需一次（同一 client 在一个 WorkGremlin 生命周期里是同一只小怪物） */
-  let registered = false
   const ingest = createIngest(client)
   /** 本插件实例自己的工程（事件流是**全服务**的，不只这个工程 —— 见下面 wsOf 的注释） */
   const ownDir = String((location && location.directory) || "")
+
+  /* ------------------------------ 成员注册 ------------------------------ */
+
+  /** 这个 client 的成员建出来了没有（建出来就不再重复补） */
+  let registered = false
+  /** 在途的那次注册（事件很密，几十毫秒里能来一串 —— 别每来一条就发一次 register） */
+  let registering = null
+
+  /**
+   * 确保"本身份的成员"已经在服务端建出来了，返回一个 Promise：
+   * 建好了 → true；WorkGremlin 不可达 / 没拿到工程 / 服务端拒了 → false（**下次再试**）。
+   *
+   * ## 为什么必须有这个函数，以及为什么它要重试
+   *
+   * 服务端 bus 的**每一个**上报入口开头都是 `requireMember(...)`，查不到就把整条请求
+   * 404 掉（`unknown_member`）—— 而插件这侧是 fire-and-forget，**404 完全无声**。
+   * 也就是说：成员没建出来 ⇒ 这个进程上报的**每一条台账**都石沉大海，只剩本地状态文件。
+   *
+   * **这里踩过的坑（2026-09-30 修，实测）**：早先只在 `session.created` 那一支注册一次，
+   * 而且 `registered = true` 是在**发出去之前**就置上的。两个后果都真实发生过：
+   *
+   *   1) **会话先于进程存在** —— Kilo 的 VS Code 扩展重开窗口会重启 `kilo serve`，而会话
+   *      （`ses_f196…`）是更早那个进程建的：新进程从头到尾**等不到 session.created**，
+   *      于是它一次注册都不发。实测症状：状态文件照写（相位 / 完成标记都对）、台账一条不来。
+   *   2) **注册那一次正好撞上应用没起**（本就该跳过）时 `registered` 已置真 → 应用起来后
+   *      也永远不再注册。
+   *
+   * 两种情形的表现是同一个：任务列表里那一轮显示的是**轮询兜底**写的那一行
+   * （`kiloTasks.js` 写的 client=kilo / form=null），用户看到的就是「Kilo Code」而不是
+   * 「Kilo Code Plugin」—— 2026-09-30 用户报的正是这个。
+   *
+   * 所以：注册**重试到成功为止**（失败就把在途标记清掉，下一条事件再试），
+   * 且下面所有台账上报都先等它 —— 顺序也由此有了保证（否则 register 与 task/start
+   * 并发发出去，谁先到服务端不一定，task/start 先到就是一条 404）。
+   */
+  function ensureRegistered() {
+    if (registered) return Promise.resolve(true)
+    if (!ingest.enabled()) return Promise.resolve(false)
+    if (!registering) {
+      registering = ingest
+        .resolveProject()
+        .then(async (project) => {
+          // 没拿到工程（应用晚起 / 刚换了端口）→ 这次不发，下一条事件重试
+          if (!project) {
+            registering = null
+            return false
+          }
+          const res = await ingest.post("/register", {
+            memberId: client,
+            name: client,
+            client,
+            role: "agent",
+            workspacePath: ownDir,
+            sessionId: "",
+          })
+          if (res && res.ok) {
+            registered = true
+            return true
+          }
+          registering = null
+          return false
+        })
+        .catch(() => {
+          registering = null
+          return false
+        })
+    }
+    return registering
+  }
+
+  /**
+   * 台账上报的统一入口：**先确保成员已注册，再发**（理由见 ensureRegistered 的长注释）。
+   * `/register` 自己走 `ingest.post` —— 从这里走就递归了。
+   */
+  const post = (route, body) => ensureRegistered().then((ok) => (ok ? ingest.post(route, body) : null))
 
   /** 取这条会话的工程路径；查不到就退回本实例的工程 */
   const wsOf = (event) => {
@@ -404,30 +550,13 @@ function createIngestPlugin(options, { location } = {}) {
       // 心跳跟着相位一起发：>60s 没有心跳服务端就把这只成员标 degraded 灰显
       // 带上真实工程路径：服务端以它为准反查工程（见 bus.projectForReport）——
       // 不带的话会落到"办公室当前打开的工程"，开着 A、在 B 里干活时成员/心跳就挂错了工程。
-      ingest.post("/heartbeat", { memberId: client, sessionId: sid, ts: now, workspacePath: ws })
+      post("/heartbeat", { memberId: client, sessionId: sid, ts: now, workspacePath: ws })
     } catch {
       /* 上报失败不影响 agent */
     }
   }
 
   /* ---- 台账上报的三个小动作（都不 await，绝不拖住事件流） ---- */
-
-  /** 成员注册：整条生命周期只做一次。role 必须是 agent —— bus.endTask 只给 role=agent 写 task_runs */
-  function ensureRegistered() {
-    if (registered || !ingest.enabled()) return
-    registered = true
-    ingest.resolveProject().then((project) => {
-      if (!project) return
-      ingest.post("/register", {
-        memberId: client,
-        name: client,
-        client,
-        role: "agent",
-        workspacePath: ownDir,
-        sessionId: "",
-      })
-    })
-  }
 
   /**
    * 开一个任务。标题 = **用户那句话**，由调用方从 role=user 的 text part 里取到传进来
@@ -464,23 +593,20 @@ function createIngestPlugin(options, { location } = {}) {
     } catch {
       /* 抹不掉就算了：readReporterDone 有 TTL，最多多显示一会儿 */
     }
-    // 形态标记：CLI 还是 Plugin（IDE 扩展）
-    const form = client.endsWith("-plugin") ? "plugin" : "cli"
-    ingest.resolveProject().then((project) => {
-      if (!project) return
-      ingest.post("/task/start", {
-        memberId: client,
-        taskId,
-        title,
-        sessionId: sid,
-        client,
-        form,
-        // 模型从 session.created 记下来了（models map）。**必须自己带**：bus.endTask 的
-        // 兜底 refill 走 sessionModel() 的 MODEL_SOURCES 表，那里只挂了 trae / claude，
-        // 没有 kilo → 轮询/适配器都取不到，task_runs.model 会留 null（任务列表少一列）。
-        ...(models.get(sid) ? { model: models.get(sid) } : {}),
-        workspacePath: wsOf(event),
-      })
+    // 形态标记（form）在 createIngestPlugin 里算一次，这里直接用。
+    // 工程由 post() 里的 ensureRegistered 保证已解析（拿不到就整条不发 —— 见那里的注释）。
+    post("/task/start", {
+      memberId: client,
+      taskId,
+      title,
+      sessionId: sid,
+      client,
+      form,
+      // 模型从 session.created 记下来了（models map）。**必须自己带**：bus.endTask 的
+      // 兜底 refill 走 sessionModel() 的 MODEL_SOURCES 表，那里只挂了 trae / claude，
+      // 没有 kilo → 轮询/适配器都取不到，task_runs.model 会留 null（任务列表少一列）。
+      ...(models.get(sid) ? { model: models.get(sid) } : {}),
+      workspacePath: wsOf(event),
     })
     return taskId
   }
@@ -493,10 +619,7 @@ function createIngestPlugin(options, { location } = {}) {
     if (!file) return
     const set = roundFiles.get(sid)
     if (set) set.add(file)
-    ingest.resolveProject().then((project) => {
-      if (!project) return
-      ingest.post("/file/touch", { memberId: client, files: [file], op: "write", sessionId: sid, client, workspacePath: ws })
-    })
+    post("/file/touch", { memberId: client, files: [file], op: "write", sessionId: sid, client, workspacePath: ws })
   }
 
   /**
@@ -525,40 +648,36 @@ function createIngestPlugin(options, { location } = {}) {
       }
     }
     const all = [...new Set([...stepped, ...touched].map(rel).filter(Boolean))]
-    // 形态标记：CLI 还是 Plugin（IDE 扩展）
-    const form = client.endsWith("-plugin") ? "plugin" : "cli"
-    ingest.resolveProject().then((project) => {
-      if (!project) return
-      ingest.post("/task/end", {
+    // 形态标记（form）在 createIngestPlugin 里算一次，这里直接用
+    post("/task/end", {
+      memberId: client,
+      taskId,
+      state,
+      result: String(result || "").slice(0, 4_000) || undefined,
+      files: all,
+      sessionId: sid,
+      client,
+      form,
+      ...(models.get(sid) ? { model: models.get(sid) } : {}),
+      workspacePath: ws,
+    })
+    // 本轮的收尾自述也进对话记录（type=result）；没有自述就不写 —— 不拿文件清单凑数
+    const said = String(result || "").trim()
+    if (said) {
+      post("/message", {
         memberId: client,
+        from: client,
+        to: null,
+        type: "result",
+        subject: null,
+        content: said.slice(0, 8_000),
         taskId,
-        state,
-        result: String(result || "").slice(0, 4_000) || undefined,
-        files: all,
         sessionId: sid,
         client,
-        form,
-        ...(models.get(sid) ? { model: models.get(sid) } : {}),
         workspacePath: ws,
+        ts: Date.now(),
       })
-      // 本轮的收尾自述也进对话记录（type=result）；没有自述就不写 —— 不拿文件清单凑数
-      const said = String(result || "").trim()
-      if (said) {
-        ingest.post("/message", {
-          memberId: client,
-          from: client,
-          to: null,
-          type: "result",
-          subject: null,
-          content: said.slice(0, 8_000),
-          taskId,
-          sessionId: sid,
-          client,
-          workspacePath: ws,
-          ts: Date.now(),
-        })
-      }
-    })
+    }
   }
 
   // 这里**不订阅**：事件从哪来由入口决定（OpenCode 走 subscribe 流、Kilo 走 server 的
@@ -610,8 +729,14 @@ function createIngestPlugin(options, { location } = {}) {
     // 工程路径：事件信封没有 location（Kilo 侧），回落 ownDir
     const dirOf = () => String((p.info && p.info.directory) || (p.info && p.info.path && p.info.path.cwd) || "")
 
+    // 成员注册：**每一条事件都顺手确保一次**，而不是等 `session.created` 那一支。
+    // 一定要这么做：Kilo 的 VS Code 扩展重开窗口会重启 kilo serve，而会话是**早就存在**的
+    // —— 新进程等不到 session.created，只在那一支注册的话它一次都不发（见 ensureRegistered）。
+    // 已注册时这只是一次布尔判断，高频的 `*.delta` 也扛得住。
+    void ensureRegistered()
+
     switch (type) {
-      /* ---- 会话创建：工程路径与模型的权威来源，顺带注册成员 ---- */
+      /* ---- 会话创建：工程路径与模型的权威来源 ---- */
       case "session.created": {
         const info = p.info || {}
         const ws = dirOf() || ownDir
@@ -622,7 +747,6 @@ function createIngestPlugin(options, { location } = {}) {
           // 主控制台要显示模型；轮询那一路本来也能从库里取到，装了插件就用真值
           writeState(statePath(client, ws, sid), { model })
         }
-        ensureRegistered()
         break
       }
 
@@ -742,14 +866,14 @@ function createIngestPlugin(options, { location } = {}) {
             const toolName = String(part.tool || "")
             const taskId = taskIds.get(sid) || ""
             if (toolName && taskId) {
-              ingest.post("/tool/use", {
+              post("/tool/use", {
                 memberId: client,
                 taskId,
                 tool: toolName,
                 sessionId: sid,
                 client,
                 workspacePath: wsOf(event),
-                form: client.endsWith("-plugin") ? "plugin" : "cli",
+                form,
               })
             }
           }
@@ -880,9 +1004,9 @@ function createIngestPlugin(options, { location } = {}) {
 export default {
   id: "workgremlin",
 
-  /** 8F OpenCode */
+  /** 8F OpenCode —— 走这个入口就说明是 OpenCode，产品基名不用猜 */
   async setup(ctx) {
-    const inst = createIngestPlugin(ctx && ctx.options, { location: ctx && ctx.location })
+    const inst = createIngestPlugin(ctx && ctx.options, { location: ctx && ctx.location, base: "opencode" })
     const controller = new AbortController()
     void (async () => {
       try {
@@ -901,8 +1025,12 @@ export default {
 
   /** 7F Kilo —— 契约见 packages/plugin/src/index.ts 的 `PluginModule` */
   async server(input, options) {
-    const inst = createIngestPlugin(options || { client: "kilo" }, {
+    // `base: "kilo"`：走 server() 这个入口就是 Kilo（setup() 才是 OpenCode），产品基名不用猜。
+    // 早先这里是 `options || { client: "kilo" }` —— 目录注册那份没有 options，于是被喂了一个
+    // 假默认 `{client:"kilo"}`，把 resolveClient 里的环境判定（形态 CLI / Plugin）整段遮死。
+    const inst = createIngestPlugin(options || {}, {
       location: { directory: String((input && input.directory) || (input && input.worktree) || "") },
+      base: "kilo",
     })
     return {
       /** Kilo 的每一条事件都从这里过一遍（含 `*.delta`，靠 handle 里的 switch 只认需要的那些） */

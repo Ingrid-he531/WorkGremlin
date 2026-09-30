@@ -212,8 +212,11 @@ function readSettings(file) {
  * （见 packages/reporter/src/plugin/index.js）。没有这条，7F/8F 就只有轮询推导 ——
  * 相位恒带 inferred 灰显，而且**完全没有任务台账**（轮询是只读的，监控端不能伪造上报）。
  *
- * `options.client` 显式钉住上报身份，别让插件靠环境变量猜（见 plugin/index.js 的
- * resolveClient：Kilo 的 VS Code 扩展会判成 kilo-plugin，CLI/TUI 判成 kilo）。
+ * `options.client` 钉的是**产品**（这里是 `kilo`），**不是形态**：形态由插件自己按环境判
+ * （见 plugin/index.js 的 resolveClient —— 编辑器扩展起的带 KILO_CLIENT=vscode，判成
+ * kilo-plugin；终端 CLI 一个 KILO_* 都没有，判成 kilo）。
+ * 选项里写死 `-plugin` 是错的：这条条目写在 `kilo.jsonc` 里，而**同一份配置 CLI 和 VS Code
+ * 扩展都会读**，写死哪一个形态都会把另一半弄反。
  */
 
 /**
@@ -237,6 +240,46 @@ function readSettings(file) {
  */
 function pluginEntry(client) {
   return [PLUGIN_ENTRY_FILE, { client }];
+}
+
+/**
+ * 工程目录里还有没有**我们自己**的零配置入口（`.kilo/{plugin,plugins}/*.{ts,js}`）。
+ *
+ * 7F **只能有一处注册**。Kilo 的来源有两路 —— 每个配置目录下 `{plugin,plugins}/*.{ts,js}`，
+ * 以及配置文件里的 `plugin` 数组 —— 两路都在时就是同一个进程里的**两个插件实例**：
+ * 同一轮任务被上报两遍（实测 2026-09-30：同一 session、同一标题的两行台账，`started_at`
+ * 只差 5 毫秒），而且它的去重是按 **spec 字符串**做的（绝对路径与 shim 里的相对路径算两条），
+ * 所以两份都留得下来。
+ *
+ * 安装器只**报**不删：那是用户工程里的文件，删不删由他定。
+ * @returns {string[]} 冲突的文件路径
+ */
+function projectPluginEntryFiles(dir) {
+  const hits = [];
+  for (const cfg of ['.kilo', '.kilocode']) {
+    for (const sub of ['plugin', 'plugins']) {
+      const d = path.join(dir, cfg, sub);
+      let names = [];
+      try {
+        names = fs.readdirSync(d);
+      } catch {
+        continue; // 这个目录不存在就是没这回事
+      }
+      for (const n of names) {
+        if (!/\.(ts|js)$/.test(n)) continue;
+        const f = path.join(d, n);
+        let body = '';
+        try {
+          body = fs.readFileSync(f, 'utf8');
+        } catch {
+          continue;
+        }
+        // 名字或内容提到我们就算 —— shim 只是转发，认内容比认文件名稳
+        if (/workgremlin/i.test(n) || body.includes(PLUGIN_ENTRY_FILE) || /workgremlin/i.test(body)) hits.push(f);
+      }
+    }
+  }
+  return hits;
 }
 
 /** 一条 plugin 条目里那个包路径（字符串形式 / [路径, 选项] 元组都认） */
@@ -510,9 +553,11 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     },
     {
       // 7F Kilo Code：**没有 hook 可装**，装的是我们自己的插件。
-      // Kilo 7.8.1 实测没有 hook 子命令、也没有 hooks.json，所以上报走它的 `plugins` 机制。
-      // 不装的话 7F 只剩服务端轮询：相位恒带 inferred（UI 灰显），而且**完全没有任务台账**
-      // （轮询是只读的，监控端不能伪造上报 —— 任务列表里就不会有 Kilo 的记录）。
+      // Kilo 7.8.1 实测没有 hook 子命令、也没有 hooks.json，所以上报走它的 `plugin` 机制
+      // （**单数键**，条目是 [绝对路径, options]，见 pluginEntry）。
+      // 不装插件 7F 也**有**任务台账 —— 服务端轮询每一轮写一条（只读推导，`kiloTasks.js`）；
+      // 插件那一路补的是轮询拿不到的东西：真相位（不灰显）、「等待授权」、
+      // 收尾自述与对话记录/文件活动，以及**形态**（CLI / VS Code 插件）。
       id: 'kilo-plugin',
       label: 'Kilo Code 插件（真相位 + 任务台账）',
       kind: 'plugin',
@@ -542,6 +587,20 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   if (!wanted.length || wanted.includes('trae')) console.log(`[workgremlin] TraeCode 命令：${traeCommand()}`);
   if (!wanted.length || wanted.includes('claude')) console.log(`[workgremlin] Claude Code 命令：${claudeCommand()}`);
   if (dryRun) console.log('[workgremlin] --dry-run：不落盘');
+
+  // 7F **只能有一处注册**。全局那条（kilo.jsonc 的 plugin 数组）已经够用；工程目录里再留
+  // 一份零配置入口的话，Kilo 会把两份都加载 → 同一进程里两个实例 → 同一轮台账落两行。
+  // 只报不删：那是用户工程里的文件（本仓库自己踩过这个坑，2026-09-30 实测）。
+  if (!uninstall && targets.some((t) => t.id === 'kilo-plugin')) {
+    const dirs = [...new Set([process.cwd(), REPO_ROOT])];
+    const conflicts = dirs.flatMap((d) => projectPluginEntryFiles(d));
+    if (conflicts.length) {
+      console.warn('[workgremlin] ⚠ Kilo Code：这个工程里还有别的零配置插件入口：');
+      for (const f of conflicts) console.warn(`[workgremlin]     ${f}`);
+      console.warn('[workgremlin]   两处注册会在同一个 Kilo 进程里起两个插件实例，同一轮任务上报两遍（任务记录里一行变两行）。');
+      console.warn('[workgremlin]   全局那条（kilo.jsonc）已经够用，建议删掉上面这份（我们不自动动你的文件）。');
+    }
+  }
 
   for (const t of targets) {
     // 没装的产品不写：写了就等于给它凭空造出一份"已安装"的证据
@@ -606,9 +665,9 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('                 若表现为"装了没反应"，在 /hooks 面板过一遍即可');
     console.log('  · 主 agent 身份由安装目标决定（codebuddy / codex / workbuddy / trae / claude / qoder），已写进 hook 命令的 --agent，无需也无法二次指定');
     console.log('  · 7F Kilo Code：**没有 hook**（实测 7.8.1 无 hook 子命令 / hooks.json），所以装的是插件；');
-    console.log('                 改完 kilo.jsonc 要**重开 Kilo 会话**才加载。装上后 7F 才有任务台账 ——');
-    console.log('                 没装插件时只剩服务端轮询：相位灰显，且任务列表里不会有 Kilo 的记录');
-    console.log('                 （轮询是只读的，监控端不能伪造上报，这是刻意的）');
+    console.log('                 改完 kilo.jsonc 要**重开 Kilo 会话**才加载。不装插件也有任务台账 ——');
+    console.log('                 服务端轮询每一轮写一条（只读推导：相位灰显、没有收尾自述）；');
+    console.log('                 装了插件那份才是真值（相位不灰显、有「等待授权」、对话记录与文件活动）');
     console.log('[workgremlin] · 不想自动接入：WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;

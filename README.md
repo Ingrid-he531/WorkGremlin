@@ -81,14 +81,14 @@ node scripts/subagents.js list
 让正在干活的 agent 自己往屋里报状态：**启动时会自动接入** —— 探测到装了哪个 CLI（只看安装位置），
 就把对应那份 hook 写好（合并式、幂等、首次改动前备份；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`）。
 **CodeBuddy CLI+插件 / WorkBuddy CLI / Codex CLI / Claude Code CLI / TraeCode IDE+插件 / Qoder CLI** 七个入口的会话都会上报。
-**Kilo Code（7F）例外：它没有 hook 可装** —— 见下面「Kilo Code 接入」。
+**Kilo Code（7F）装的不是 hook 而是插件**（同一个安装器的 `kilo-plugin` 目标，写 `~/.config/kilo/kilo.jsonc`）—— 见下面「Kilo Code 接入」。
 **OpenCode（8F）也不进这份列表**：它没有 `hooks.json` 那套命令钩子，改用「轮询 SQLite + 可选插件」—— 见下面「OpenCode 接入」。
 
 默认**全装**（遍历所有 target，装了才写、没装跳过）：
 
 ```bash
-npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae
-npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / claude / trae / qoder）
+npm run hooks:install                      # 用户级：~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae + ~/.config/kilo/kilo.jsonc（插件）
+npm run hooks:install -- --targets=codex   # 只装某个 target（codebuddy / workbuddy / codex / claude / trae / qoder / kilo-plugin）
 npm run hooks:install -- --dry-run         # 只打印将要写什么，一步都不落盘
 npm run hooks:install -- --project         # 另外写一份项目级 <仓库>/.codebuddy/settings.json
 npm run hooks:uninstall                    # 撤掉（只删我们加的那几条，别人的配置不动）
@@ -241,17 +241,19 @@ npm run hooks:install -- --targets=qoder  # 只装 Qoder
 ### Kilo Code 接入（7F：轮询打底 + 插件给真相位与台账）
 
 **Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何
-`hooks.json` 或可挂命令的事件点）。所以 7F 不进 `install-hooks.js` 的安装列表 ——
-没有 hook 可装，也**不应该**在 Kilo 的配置里写任何东西。
+`hooks.json` 或可挂命令的事件点）。所以 7F 装的不是 hook，而是**我们自己的插件**：
+`scripts/install-hooks.js` 的 `kilo-plugin` 目标把它写进 `~/.config/kilo/kilo.jsonc`
+（`"plugin": [[<绝对路径>, {"client":"kilo"}]]` —— **键名单数**），不用手改配置文件。
 
 7F 有**两路**，装的形态决定你拿到哪一路：
 
-| | 轮询打底（永远在场） | 插件真相位 + 台账（装了才有） |
+| | 轮询打底（永远在场） | 插件（装了才有） |
 | --- | --- | --- |
-| 装法 | 零配置 | 把 `packages/reporter/src/plugin/index.js` 放进 `.kilo/plugins/`，或 `~/.config/kilo/kilo.jsonc` 的 `plugins` |
-| 上报身份 | — | `kilo-plugin`（VS Code 扩展）/ `kilo`（CLI / TUI） |
+| 装法 | 零配置 | `npm run hooks:install -- --targets=kilo-plugin`（写 `~/.config/kilo/kilo.jsonc` 的 `plugin` 数组）。**别再往工程里放 `.kilo/plugins/` 那种零配置入口**：Kilo 两处插件来源都会加载，同一轮会被上报两遍（实测孪生台账行只差 5 毫秒），安装器现在会探测到并警告 |
+| 上报身份 | — | `kilo-plugin`（VS Code 扩展）/ `kilo`（CLI / TUI）——**由插件按环境自己判**，配置里那条 `{client:"kilo"}` 只钉产品 |
 | 相位 | 从 event 流**推导**，`inferred:true` 灰显 | 事件流**真值**，不灰显，且能给「等待授权」 |
-| 任务台账 | ❌ 不记 | ✅ 记（成员 / 任务 / 对话记录 / 文件活动 / 幽灵） |
+| 任务台账 | ✅ 记（**每一轮一条**，全部是只读推导：标题 = 那一轮用户原话、相位与完成标记都是推断） | ✅ 记（同前者，且是**真值**：收尾自述、形态、真实的收工时刻） |
+| 对话记录 / 文件活动 / 幽灵 | ❌ 没有（轮询不写这两张表；改动文件只进台账那一行的 `files_json`） | ✅ 有 |
 
 **轮询那一路**（全部逻辑在 `server/src/kilo.js`）：
 
@@ -269,12 +271,19 @@ npm run hooks:install -- --targets=qoder  # 只装 Qoder
 - **只读一次、坏表不冒泡**：表结构对不上（Kilo 改版）时回空，楼层照常列出，只是没会话 ——
   绝不把每 1.5s 一次的 `/reporter-phase` 轮询打挂。
 
-**CLI 为什么不记任务台账**：轮询是**只读**的，监控端伪造上报就违背"绝不编造"。所以
-7F 的任务列表 / 对话记录**只有装了插件才有内容** —— 这是刻意的，不是没做完。
+**轮询这一路的台账为什么"少一半"**：轮询是**只读**的，监控端伪造上报就违背"绝不编造"。
+所以它只写它能从库里读出来的东西 —— 成员、每一轮的标题/起止/相位/改动文件清单；
+**收尾自述、对话记录、文件活动、幽灵**这些需要 agent 进程内事件流的东西，它没有，
+只有装了插件才有 —— 这是刻意的，不是没做完。
 
-**装法**（Kilo 用的是 `"plugin": ["<绝对路径>"]` —— **字符串数组、单数键**；文件头注释里那套
-`plugins: [{ package, options }]` 是 OpenCode 的形状，Kilo 会报 `Unrecognized key: plugins`，
-`kilo plugin <module>` 也只收 npm 模块名、不收本地路径）：
+**装了插件时轮询整条让位**（同一个会话不再各写一行）：判据是"这个会话已经有插件写的行了"
+（插件写的 id 是服务端发的 `k_*`，轮询写的是 `kilo:*`），此时轮询还会把自己此前抢先写下的
+`kilo:*` 行收掉。**判 id 前缀，不判 `client`** —— 早先按 `client === 'kilo-plugin'` 判，
+而插件在修好形态判定之前报的是裸 `kilo`，于是从不让位、同一轮落两行（2026-09-30 修）。
+
+**装法**（Kilo 用的是 `"plugin": [[<绝对路径>, {options}]]` —— **单数键**、条目是"路径 + 选项"
+的数组；早先写成 `plugins: [{ package, options }]`，Kilo 7.8.1 降级到 V1 配置时把整段丢掉
+（只留一条 WARN），插件看着装上了却一条记录都不来）：
 
 ```bash
 npm run hooks:install -- --targets=kilo-plugin              # 写 ~/.config/kilo/kilo.jsonc
@@ -282,6 +291,9 @@ npm run hooks:install -- --targets=kilo-plugin --dry-run    # 先看一眼
 npm run hooks:install -- --targets=kilo-plugin --uninstall  # 撤掉（备份在 kilo.jsonc.bak-workgremlin）
 ```
 
+那条选项里**只写产品**（`{"client":"kilo"}`），**别写形态**（`kilo-plugin`）：这一份配置
+CLI 和 VS Code 扩展都会读，写死哪一个都会把另一半弄反 —— 形态由插件按进程环境判
+（扩展带的 `KILO_CLIENT=vscode` 等实测见 `plugin/index.js` 的 `resolveClient`）。
 改完要**重开 Kilo 会话**才加载。
 
 **事件契约以实测为准**（Kilo 7.8.1，探针跑出来的）：信封是 `{ id, type, properties }`，
@@ -349,8 +361,10 @@ assistant 文本"这个信号，拿文件清单拼一句"完成了 N 个文件"�
 }
 ```
 
-Kilo 同理（`.kilo/plugins/` 或 `~/.config/kilo/kilo.jsonc`），并用
-`options: { client: 'kilo' }` 指定上报身份。
+Kilo 那边走安装器（`npm run hooks:install -- --targets=kilo-plugin`，写
+`~/.config/kilo/kilo.jsonc` 的 **`plugin`** 数组，选项是 `{ client: 'kilo' }` —— 只钉产品，
+形态由插件按环境判）。**别在工程里另外放 `.kilo/plugins/` 的零配置入口**：Kilo 会两处都加载，
+一个进程里起两个实例、同一轮上报两遍（本仓库自己踩过，那份 shim 已删）。
 
 不需要任何安装动作，WorkGremlin 起来就看得见 8F（有没有插件都一样）。
 自检：`npm run test:opencode`。
