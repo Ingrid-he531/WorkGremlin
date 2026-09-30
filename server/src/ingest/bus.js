@@ -17,7 +17,7 @@ const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey } = require(
 const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
-const { detectLevel } = require('./agentLevel');
+const { detectLevel, agentDescription } = require('./agentLevel');
 // 成员状态降级前的守卫：别的会话还在跑就别压成空闲/离线（见 keepStateForOtherSession）。
 // 只单向依赖（sessions.js 不 require ingest/），没有循环。
 const { hasOtherLiveSession, sessionModel } = require('../sessions');
@@ -958,6 +958,12 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     return host && !host.ephemeral ? id : null;
   }
 
+  /** 成员所属工程的落盘路径（项目级 agent 定义文件在这里找）；读不到回空串，只按用户级目录找 */
+  function projectWorkspacePath(projectId) {
+    const p = repo.getProject.get(projectId);
+    return (p && p.workspace_path) || '';
+  }
+
   /** @param {string} memberId */
   function buildMemberCard(memberId) {
     const m = repo.getMember.get(memberId);
@@ -969,6 +975,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     // 常驻小怪物自己没产出 -> 借同名幽灵实例的（幽灵还活着时借用；散掉时由 removeMember 过继）
     if (!artifacts.length) artifacts = ghostArtifacts(m);
     const cnt = repo.countMessagesFor.get(m.project_id, memberId, memberId);
+    // 上一个任务在多久以前：最近一条**已收工**任务的收工时刻（渲染层的「最近活跃」用它）。
+    // 不能拿 lastSeenAt 顶替 —— 那是心跳时刻，成员只要在线就一直刷新，永远显示"刚刚活跃"。
+    const lastEnd = repo.lastTaskEndOfMember.get(memberId);
 
     return {
       memberId: m.id,
@@ -977,10 +986,22 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // 没接上报且没状态行 -> offline；有状态行但 degraded -> 保持状态并标注推断
       state: s ? s.state : 'offline',
       stateSince: s ? s.state_since : m.created_at,
-      task: task ? { id: task.id, title: task.title, progress: task.progress, startedAt: task.started_at } : null,
+      // ended_at / state 一起带上：渲染层据此区分"当前任务"（还没收工）与"上一个任务"（已收工，
+      // 槽位 agent_status.task_id 不会随收工清空，不区分就会在空闲时挂着旧任务 + 旧任务的已耗时）
+      task: task
+        ? {
+            id: task.id,
+            title: task.title,
+            progress: task.progress,
+            startedAt: task.started_at,
+            endedAt: task.ended_at ?? null,
+            state: task.state,
+          }
+        : null,
       currentFiles: files,
       artifacts,
       lastSeenAt: m.last_seen_at ?? m.created_at,
+      lastTaskAt: lastEnd ? lastEnd.at : null,
       degraded: s ? Boolean(s.degraded) : true,
       reported: Boolean(m.reported),
       messageCount: cnt ? cnt.c : 0,
@@ -991,6 +1012,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       client: m.client || null,
       // subagent 级别（用户级 / 项目级）：驱动小怪物脖子上的工牌配色
       level: levels.get(memberId) || null,
+      // 常驻 subagent 的**功能描述**（agent 定义文件里的静态数据）：卡片上显示"它是干什么的"，
+      // 不是状态。取不到回空串，由渲染层隐藏那一栏 —— 不拿"项目子代理 · 空闲"顶替。
+      description: String(m.role || '').startsWith('subagent') ? agentDescription(m.name, projectWorkspacePath(m.project_id)) : '',
     };
   }
 

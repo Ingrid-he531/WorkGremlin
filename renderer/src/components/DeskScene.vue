@@ -14,6 +14,7 @@ import { computed } from 'vue';
 import AgentAvatar from './AgentAvatar.vue';
 import StatusBadge from './StatusBadge.vue';
 import { avatarOf, formatDuration } from '@workgremlin/shared';
+import { currentTaskOf, currentTaskTitle, currentTaskStartedAt } from '../lib/memberTask';
 
 const props = defineProps({
   member: { type: Object, required: true },
@@ -27,7 +28,10 @@ const agentId = computed(() => props.member.memberId.split('@')[0]);
 const skin = computed(() => avatarOf(props.member.memberId));
 const state = computed(() => props.member.state);
 
-const title = computed(() => (props.member.task ? props.member.task.title : '空闲 / 无进行中任务'));
+// 「当前任务」口径与其他卡片一致（见 lib/memberTask.js）：空闲时槽位里那条是**上一个任务**，
+// 不能留在屏幕上冒充当前任务。
+const task = computed(() => currentTaskOf(props.member));
+const title = computed(() => currentTaskTitle(props.member) || '空闲');
 // 屏幕上那条走条是**不确定**的（只在干活时爬，不表示完成度）——2026-09-29 之前它按
 // member.task.progress 画长度，但那个字段没有真值（全库只有 0 和 1，开工写 0、收工写 1，
 // 中间没人推进；详见 TaskRecordsView 里「进度」那一行的说明），画出来永远是空条或满条。
@@ -36,7 +40,13 @@ const running = computed(() => state.value === 'busy' || state.value === 'thinki
 const fileText = computed(() =>
   props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : '未上报文件'
 );
-const elapsed = computed(() => formatDuration(props.now - props.member.stateSince));
+/** 已耗时 = 当前任务已耗时（从这一轮任务开工算起）；没有当前任务就回落到进入当前状态的时刻 */
+const elapsed = computed(() => formatDuration(props.now - (currentTaskStartedAt(props.member) || props.member.stateSince)));
+/** 最近活跃 = 上一个任务在多久以前（最近一条已收工任务的收工时刻），不是最后一次心跳 */
+const lastActiveAgo = computed(() => {
+  const at = Number(props.member.lastTaskAt || 0);
+  return at ? formatDuration(props.now - at) : '';
+});
 
 /** 动画相位 0~1.6s，按成员名哈希：全员动作不会整齐划一 */
 const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 16) / 10);
@@ -161,8 +171,9 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
       <div class="peek">
         <div class="peek-title">{{ title }}</div>
         <!-- 「进度 x%」已去掉（2026-09-29）：那个百分比是假的，只有 0% 和 100% 两种取值。
-             已耗时是真数据（stateSince），留着。 -->
-        <div class="peek-row dim">已耗时 {{ elapsed }}</div>
+             已耗时只对**当前任务**成立；空闲时改为「上一个任务在多久以前」。 -->
+        <div v-if="task" class="peek-row dim">已耗时 {{ elapsed }}</div>
+        <div v-else class="peek-row dim">最近活跃 {{ lastActiveAgo ? `${lastActiveAgo}前` : '—' }}</div>
         <div v-if="member.currentFiles.length" class="peek-row mono">{{ member.currentFiles.join(' , ') }}</div>
       </div>
     </div>
@@ -172,7 +183,8 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
       <span class="p-name">{{ member.name }}</span>
       <span class="p-role dim">{{ member.role || '—' }}</span>
       <StatusBadge :state="state" :degraded="member.degraded" :testid="`seat-status-${agentId}`" />
-      <span class="p-elapsed mono faint">{{ elapsed }}</span>
+      <!-- 桌牌上那个小数字也只在干活时才有意义（当前任务已耗时） -->
+      <span v-if="task" class="p-elapsed mono faint">{{ elapsed }}</span>
     </div>
   </div>
 </template>

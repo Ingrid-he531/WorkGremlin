@@ -1,10 +1,8 @@
 <script setup>
 import { computed, onUnmounted, ref } from 'vue';
 import StatusBadge from './StatusBadge.vue';
-// ProgressBar 暂时不引了：卡片上那条进度条按 2026-09-29 的要求去掉（task.progress 没有真值，
-// 只有 0/1 两个取值 —— 画出来永远是空条或满条）。要恢复的话把这一行和模板里那行一起放开。
-// import ProgressBar from './ProgressBar.vue';
 import { formatDuration } from '@workgremlin/shared';
+import { currentTaskOf, currentTaskStartedAt, currentTaskTitle } from '../lib/memberTask';
 
 const props = defineProps({
   member: { type: Object, required: true },
@@ -16,10 +14,25 @@ const timer = setInterval(() => {
 }, 1000);
 onUnmounted(() => clearInterval(timer));
 
+/** 主 agent 与子代理在工位卡片上分别展示自己的任务描述，用这个开关区分 */
+const isSubagent = computed(() => props.member.role && props.member.role.startsWith('subagent'));
+
+/** 当前任务：口径见 lib/memberTask.js（空闲时槽位里那条是**上一个任务**，不算当前任务） */
+const currentTask = computed(() => currentTaskOf(props.member));
+/** 当前任务是否进行中（驱动"已耗时 / 最近活跃"的互斥显示） */
+const hasTask = computed(() => Boolean(currentTask.value));
+/** 这一栏常驻：没有当前任务时如实写「空闲」，不把上一次的任务留在卡片上 */
+const taskTitle = computed(() => currentTaskTitle(props.member) || '空闲');
+
 /** 短 id：coder@workgremlin -> coder（用于 data-testid，保证选择器稳定） */
 const agentId = computed(() => props.member.memberId.split('@')[0]);
-const elapsed = computed(() => formatDuration(tick.value - props.member.stateSince));
-const lastSeen = computed(() => formatDuration(tick.value - props.member.lastSeenAt));
+/** 已耗时 = **当前任务**的已耗时（从这一轮任务开工算起），不是状态停留时长 */
+const elapsed = computed(() => formatDuration(tick.value - (currentTaskStartedAt(props.member) || props.member.stateSince)));
+/** 最近活跃 = 上一个任务在多久以前（最近一条已收工任务的收工时刻），不是最后一次心跳 */
+const lastActiveAgo = computed(() => {
+  const at = Number(props.member.lastTaskAt || 0);
+  return at ? formatDuration(tick.value - at) : '';
+});
 
 /** 角色文案：主 agent 与子代理在工位卡片上显示为中文；项目级 / 用户级子代理分开标注。 */
 const ROLE_LABELS = {
@@ -48,14 +61,9 @@ const roleLabel = computed(() => {
       />
     </header>
 
-    <div v-if="member.degraded" class="watcher-banner" :data-testid="`seat-degraded-${agentId}`">
-      状态为推断值：该成员未上报心跳（&gt;60s）
-    </div>
-
     <div class="task">
       <div class="label dim">当前任务</div>
-      <div v-if="member.task" class="task-title">{{ member.task.title }}</div>
-      <div v-else class="na">空闲 / 无进行中任务</div>
+      <div class="task-title" :class="{ na: !hasTask }">{{ taskTitle }}</div>
       <!-- 进度条暂时去掉（2026-09-29）：task.progress 没有真值 —— 开工 0、收工 1，
            中间没人推进它（本机库 489 条任务全落在 {0,1}，见 TaskRecordsView「进度」那行），
            画出来只有"空条"和"满条"两种状态，等于报了个不存在的进度。
@@ -63,20 +71,14 @@ const roleLabel = computed(() => {
       <!-- <ProgressBar :value="member.task ? member.task.progress : null" :testid="`seat-progress-${agentId}`" /> -->
     </div>
 
-    <div class="row">
-      <div class="label dim">最近产出</div>
-      <ul v-if="member.artifacts.length" class="artifacts">
-        <li v-for="a in member.artifacts" :key="a.id ?? a.title">
-          {{ a.title }}<span v-if="a.derived" class="derived">改动</span>
-        </li>
-      </ul>
-      <span v-else class="na">—</span>
+    <div v-if="isSubagent && member.description" class="subagent-desc" :data-testid="`seat-desc-${agentId}`">
+      <span class="dim">描述</span>
+      <div class="desc-text">{{ member.description }}</div>
     </div>
 
     <footer>
-      <span class="mono dim">已耗时 {{ elapsed }}</span>
-      <span class="mono faint">最近活跃 {{ lastSeen }}前</span>
-      <span class="mono faint">消息 {{ member.messageCount }}</span>
+      <span v-if="hasTask" class="mono dim">已耗时 {{ elapsed }}</span>
+      <span v-else class="mono dim">最近活跃 {{ lastActiveAgo ? `${lastActiveAgo}前` : '—' }}</span>
       <span v-if="!member.reported" class="tag">被动观测</span>
     </footer>
   </section>
@@ -113,15 +115,6 @@ h3 {
   font-size: 12px;
 }
 
-.watcher-banner {
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-size: 12px;
-  color: #ffd08a;
-  background: rgba(245, 166, 35, 0.1);
-  border: 1px solid rgba(245, 166, 35, 0.35);
-}
-
 .label {
   font-size: 11px;
   text-transform: uppercase;
@@ -132,30 +125,27 @@ h3 {
   margin: 2px 0 6px;
 }
 
+/* 没有当前任务时那一栏写「空闲」——不抢眼，但不留空 */
+.task-title.na {
+  color: var(--text-faint);
+}
+
 .row {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-ul {
-  margin: 0;
-  padding-left: 16px;
-  font-size: 12px;
+.subagent-desc {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  font-size: 13px;
 }
 
-.artifacts {
-  list-style: none;
-  padding-left: 0;
-}
-
-/* 「改动」标记：这条产出是从本轮改动文件推出的（derived），不是 agent 上报的产出 —— 必须标出来，不能冒充真值 */
-.derived {
-  margin-left: 6px;
-  padding: 0 4px;
-  border-radius: 4px;
-  border: 1px solid var(--border-strong);
-  color: var(--text-faint);
+.desc-text {
+  margin-top: 2px;
 }
 
 footer {

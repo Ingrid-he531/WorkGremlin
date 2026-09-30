@@ -38,6 +38,9 @@ export interface MemberTaskRef {
   title: string;
   progress: number | null;
   startedAt: number;
+  /** 收工时刻；null = 还在跑。卡片据此区分「当前任务」与「上一个任务」（槽位不会随收工清空） */
+  endedAt?: number | null;
+  state?: TaskState;
 }
 
 export interface Artifact {
@@ -64,10 +67,14 @@ export interface MemberCard {
   currentFiles: string[];
   artifacts: Artifact[];
   lastSeenAt: number;
+  /** 最近一条**已收工**任务的收工时刻：「最近活跃」= 距今多久（不是最后一次心跳） */
+  lastTaskAt?: number | null;
   /** true = 状态为推断值（A 路线兜底 / 心跳超时），非上报真值 */
   degraded: boolean;
   reported: boolean;
   messageCount: number;
+  /** 常驻子代理的功能描述（agent 定义文件里的静态数据，非运行状态）；没有则空串 */
+  description?: string | null;
   /** 临时组队成员（无工位，场景里以幽灵形态飘在空中） */
   ephemeral?: boolean;
   /** 临时成员所属项目名，缺省用 role */

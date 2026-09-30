@@ -45,6 +45,8 @@
     "test:qoder-plugin": "node server/test/qoderPlugin.test.js",
     "test:ide-hook": "node server/test/ideHook.test.js",
     "test:task-client": "node renderer/test/taskClientLabel.test.mjs",
+    "test:member-task": "node renderer/test/memberTask.test.mjs",
+    "test:agent-desc": "node server/test/agentDescription.test.js",
     "test:ws-reconnect": "node renderer/test/wsReconnect.test.mjs",
     "test:claude-hook": "node server/test/claudeHook.test.js",
     "test:claude-cancel": "node server/test/claudeCancel.test.js",

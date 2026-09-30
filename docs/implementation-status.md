@@ -35,7 +35,7 @@ server/                 Express + ws + better-sqlite3，可内嵌 Electron 也�
   src/db/{schema.sql,index.js}   建表 + 预编译语句 + PRAGMA
   src/ingest/bus.js     唯一写入口：落库 → 广播 → 组装成员卡 / 首屏快照
   src/ingest/agentRoster.js      .codebuddy/agents 名册 → 常驻小怪物（坐工位、带工牌）
-  src/ingest/agentLevel.js       用户级 / 项目级判定（工牌颜色）
+  src/ingest/agentLevel.js       用户级 / 项目级判定（工牌颜色）+ 功能描述（agent 定义的 description，静态数据）
   src/ingest/subagentFeed.js     subagents.json 清单 → 临时成员（头顶幽灵）
   src/project.js        工程名解析（package.json name > 目录名）
   src/workspace.js      「打开工程」：切换 + 落盘 workspaces.json + 最近 8 个

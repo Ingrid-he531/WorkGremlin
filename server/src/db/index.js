@@ -454,6 +454,11 @@ function createRepo(db) {
     `),
     getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
     listTasks: db.prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY started_at DESC`),
+    /**
+     * 某成员最近一条**已收工**任务的收工时刻（工位卡的「最近活跃」用它：上一个任务在多久以前）。
+     * 用成员自己的 id 查（tasks.member_id 是 "名字@工程" 这个全量 id），命中 idx_tasks_member_state。
+     */
+    lastTaskEndOfMember: db.prepare(`SELECT MAX(ended_at) AS at FROM tasks WHERE member_id = ? AND ended_at IS NOT NULL`),
 
     insertMessage: db.prepare(`
       INSERT INTO messages (dedupe_key, project_id, ts_ms, from_member, to_member, type, subject, content, task_id, session_id, source, raw_json)

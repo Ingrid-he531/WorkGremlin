@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue';
-import { STATE_LABELS } from '@workgremlin/shared';
+import { statusLabel, statusTone } from '../lib/memberTask';
 
 const props = defineProps({
   state: { type: String, required: true },
@@ -8,13 +8,18 @@ const props = defineProps({
   testid: { type: String, default: '' },
 });
 
-const label = computed(() => STATE_LABELS[props.state] || props.state);
+/**
+ * 工位卡 / 桌牌上的状态只分两档：忙碌 / 空闲（用户 2026-09-30 的要求）。
+ * 判据与卡片其它地方同一份（见 lib/memberTask.js）—— busy/thinking/blocked = 在干活 → 忙碌。
+ */
+const label = computed(() => statusLabel(props.state));
+const tone = computed(() => statusTone(props.state));
 </script>
 
 <template>
   <span
     class="badge"
-    :class="[`state-${state}`, { degraded }]"
+    :class="[`state-${tone}`, { degraded }]"
     :data-testid="testid"
     :title="degraded ? '状态为推断值（非 agent 上报真值）' : 'agent 上报真值'"
   >
@@ -40,14 +45,11 @@ const label = computed(() => STATE_LABELS[props.state] || props.state);
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--state-offline);
+  background: var(--state-idle);
 }
 
-.state-online .dot { background: var(--state-online); }
 .state-busy .dot { background: var(--state-busy); }
 .state-idle .dot { background: var(--state-idle); }
-.state-blocked .dot { background: var(--state-blocked); }
-.state-offline .dot { background: var(--state-offline); }
 
 .badge.degraded {
   opacity: 0.62;
