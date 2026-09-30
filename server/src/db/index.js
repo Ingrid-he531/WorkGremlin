@@ -534,7 +534,8 @@ function createRepo(db) {
     `),
     getTaskRun: db.prepare(`SELECT * FROM task_runs WHERE id = ?`),
     /** 某条会话名下的全部台账行（7F 轮询兜底据此判断"插件是不是已经上报了真值"，见 kiloTasks.js） */
-    taskRunsOfSession: db.prepare(`SELECT id, client FROM task_runs WHERE session_id = ?`),
+    // started_at 也要：kiloTasks 用它判断"插件这一轮写了没有"（见那里的 yieldsOf）
+    taskRunsOfSession: db.prepare(`SELECT id, client, started_at FROM task_runs WHERE session_id = ?`),
     insertSubagentRun: db.prepare(`
       INSERT INTO subagent_runs
         (project_id, parent_task_id, task_id, member_id, name, client, model, title, started_at)

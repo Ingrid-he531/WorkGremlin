@@ -352,6 +352,37 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('比最后一轮靠后的那一行被收掉', !repo.getTaskRun.get('kilo:kilo-sid-cut2:2'), JSON.stringify(repo.getTaskRun.get('kilo:kilo-sid-cut2:2')));
   ok('新的最后一轮顶上来了', Boolean(repo.getTaskRun.get('kilo:kilo-sid-cut2:1')));
 
+  console.log('[5f] 7F：插件通道断了 → 把会话收回来，别让用户跑的轮次凭空消失');
+  // 回归（2026-09-30 用户实测）：Kilo CLI 进程 11:00 起（那一版插件还没有"重读 server.json"），
+  // WorkGremlin 11:29 重启换了随机 token（config.js 每次启动随机生成）→ 那个进程里插件的每条
+  // 上报都 401 且完全无声：状态文件照写（相位正常）、台账一条不来；而轮询这一路只要看到
+  // "这个会话有插件行"就整条让位 → 用户 12:46 / 12:48 跑的两轮**两条都查不到**。
+  // 让位现在要求"插件**这一轮**也写了"：它最新一行比源里最新一轮还旧 + 过了宽限期 → 收回来。
+  const deadPlugRow = Date.now() - 20 * 60_000; // 插件最后报到的那一轮（20 分钟前）
+  const deadA = { index: 0, prompt: '插件报过的那轮', startedAt: deadPlugRow, endedAt: deadPlugRow + 30_000, outcome: 'done', files: [], result: '做完了' };
+  const deadB = { index: 1, prompt: '断线后第一轮', startedAt: Date.now() - 8 * 60_000, endedAt: Date.now() - 7 * 60_000, outcome: 'cancelled', files: [], result: '' };
+  const deadC = { index: 2, prompt: '断线后第二轮', startedAt: Date.now() - 5 * 60_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [{ id: 'kilo-sid-dead', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now() - 4 * 60_000, title: '断线后第二轮', model: '', fileCount: 0, rounds: [deadA, deadB, deadC] }];
+  repo.insertTask.run({ id: 'k_plugin_dead', projectId: 'p1', memberId: 'kilo-plugin@p1', parentTaskId: null, title: '插件报过的那轮', state: 'done', progress: 1, startedAt: deadPlugRow, endedAt: deadPlugRow + 30_000 });
+  repo.upsertTaskRun.run({ id: 'k_plugin_dead', projectId: 'p1', memberId: 'kilo-plugin@p1', client: 'kilo-plugin', sessionId: 'kilo-sid-dead', form: 'plugin', model: null, title: '插件报过的那轮', startedAt: deadPlugRow, baselineCommit: null });
+  ok('通道断了就收回来：这一轮写下了', syncKiloTasks({ bus, repo }) >= 1 && Boolean(repo.getTaskRun.get('kilo:kilo-sid-dead:2')));
+  ok('插件断线期间漏掉的那一轮也补上（②b）', Boolean(repo.getTaskRun.get('kilo:kilo-sid-dead:1')), JSON.stringify(repo.getTaskRun.get('kilo:kilo-sid-dead:1')));
+  ok('插件自己报过的那一轮不重复写（它已经有行了）', !repo.getTaskRun.get('kilo:kilo-sid-dead:0'));
+  ok('插件那行纹丝不动', Boolean(repo.getTaskRun.get('k_plugin_dead')));
+  const deadList = await get(`project=p1&client=${F7.join(',')}&limit=50`);
+  ok('任务列表里真的看得到（用户报的就是"看不到任务"）',
+    Boolean(deadList.find((t) => t.id === 'kilo:kilo-sid-dead:1')) && Boolean(deadList.find((t) => t.id === 'kilo:kilo-sid-dead:2')),
+    JSON.stringify(deadList.filter((t) => String(t.id).includes('kilo-sid-dead')).map((t) => [t.id, t.state])));
+
+  console.log('[5f-2] 7F：插件只是慢了（刚开跑、还没到宽限期）→ 照旧让位，不抢');
+  const slowPlug = Date.now() - 3 * 60_000;
+  const slowA = { index: 0, prompt: '插件那条', startedAt: slowPlug, endedAt: null, outcome: 'running', files: [], result: '' };
+  const slowB = { index: 1, prompt: '刚起的一轮', startedAt: Date.now() - 10_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [{ id: 'kilo-sid-slow', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now(), title: '刚起的一轮', model: '', fileCount: 0, rounds: [slowA, slowB] }];
+  repo.insertTask.run({ id: 'k_plugin_slow', projectId: 'p1', memberId: 'kilo@p1', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: slowPlug, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_plugin_slow', projectId: 'p1', memberId: 'kilo@p1', client: 'kilo', sessionId: 'kilo-sid-slow', form: 'cli', model: null, title: '插件那条', startedAt: slowPlug, baselineCommit: null });
+  ok('还在宽限期里 → 一条都不写（插件那 1 秒内就会补上自己的行）', syncKiloTasks({ bus, repo }) === 0);
+
   console.log('[6] 9F：会话行说「在飞」→ 只有那一轮是 running（不受 2 分钟窗口影响）');
   // Copilot 自己的库整轮写完才落盘，只看 updated_at 会出现"跑着显示待命、跑完显示思考中"。
   // sessions.js 从 VS Code 的 chat 索引 / 会话日志读出「这一轮在不在飞」并挂在会话行上

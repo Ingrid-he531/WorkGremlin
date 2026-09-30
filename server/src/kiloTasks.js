@@ -9,7 +9,9 @@
  * 逐轮清单由 readKiloRounds 读），把**每一轮用户任务**写成一条 task + task_run。
  *
  * 这是**兜底**，不是唯一来源：装了 WorkGremlin 插件时，plugin 那一路上报的才是真值
- * （每一轮用户任务一条），这类会话轮询这一路会让位（见下面循环里的说明）。
+ * （每一轮用户任务一条），这类会话轮询这一路会让位（见下面循环里的说明）——
+ * 但让位只在插件**还在报**时成立：它的通道断了（服务端重启换 token、老进程里那份插件哑了）
+ * 就得把这条会话收回来，不然用户跑的轮次会一条不剩地消失（见 yieldsOf）。
  *
  * Kilo 比 Copilot 多的东西：session 表里有 model 字段（真实值，不是推断）、
  * message 表能读出每一轮的边界与收工 finish。
@@ -37,12 +39,22 @@
  * 代价是同一会话此前的轮次永远补不回来 —— 这一轮收工、下一轮开始时，由下面第 ③ 步
  * 把它定稿（不然它会永远停在 'running'，被 query.js 的 CASE 判成「已取消」，
  * 而它其实是干完了的）。
+ *
+ * 唯一例外是第 ②b 步：从**断线插件**手里收回来的会话，会把插件断线期间漏掉的那几轮补上
+ * （判据是"比插件最新一行还新"）。那几轮不是"历史"，是"本该有行却一直没等到"。
  */
 
 const path = require('path');
 const { listKiloSessions, readKiloRounds } = require('./kilo');
 
 const SYNC_INTERVAL_MS = 5_000;
+
+/**
+ * 插件那一路"还活着"的宽限期（见下面的 yieldsOf）。
+ * 插件每开一轮就立刻写一条台账（收到用户消息 1 秒内 task/start），所以"源里最新的那一轮
+ * 比插件最新一行还新" + 过了这个宽限期，就说明它的上报通道断了 —— 这一栏该由轮询收回来。
+ */
+const PLUGIN_SILENT_MS = 60_000;
 
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'kilo:';
@@ -135,11 +147,36 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   }
   const isActiveOf = (s) => (roundsOf.get(s.id) || []).some((r) => r.outcome === 'running');
 
+  /** 插件给这条会话写的最新一行的时刻（没写过 → 0） */
+  const pluginNewestOf = (s) =>
+    runsOf.get(s.id).reduce((m, r) => (String(r.id).startsWith(TASK_ID_PREFIX) ? m : Math.max(m, Number(r.started_at || 0))), 0);
+
   /**
    * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `kilo:*`）——
    * 有就整条让位。判据用 id 前缀而不是 client，因为这里要问的是"这行是不是我写的"（见下面循环）。
+   *
+   * **让位只在插件还在报的时候成立**（2026-09-30 修：用户实测一轮任务在列表里凭空消失）。
+   * "这条会话有插件行"只证明它**曾经**在报 —— 插件跟着 agent 进程活，通道断了它自己不知道，
+   * 也什么都发不出去。实测那一回：Kilo CLI 进程 11:00 起（那个进程里的插件还没有"重读
+   * server.json"那版），WorkGremlin 11:29 重启换了随机 token（server/src/config.js 每次启动
+   * 随机生成）→ 从那以后这个进程的每条上报都 401，而且**完全无声**：状态文件照写
+   * （所以相位/状态正常显示）、台账一条不来。于是 12:46 与 12:48 用户跑的两轮，
+   * 插件写不了、轮询又整条让位 → **两条任务都查不到**（用户报的"状态有，但看不到任务"）。
+   *
+   * 所以让位的判据改成"插件**这一轮**也写了"：插件给这条会话写的最新一行如果比源里最新那一轮
+   * 还旧、且已经过了宽限期（PLUGIN_SILENT_MS），就认为通道断了，把这条会话收回来（补记见 ②b）。
+   * 插件活着时每轮开跑就写一条，所以正常情况下这条永远不命中；万一它只是慢了（注册重试中），
+   * 等它写上来那一刻让位又成立 —— 轮询自己写的行会被收掉（见下面循环里的让位分支），自愈。
    */
-  const yieldsOf = (s) => runsOf.get(s.id).some((r) => !String(r.id).startsWith(TASK_ID_PREFIX));
+  const yieldsOf = (s) => {
+    const newestTheirs = pluginNewestOf(s);
+    if (!newestTheirs) return false;
+    const rounds = roundsOf.get(s.id) || [];
+    const last = rounds[rounds.length - 1];
+    const roundStart = last ? Number(last.startedAt || 0) : 0;
+    if (roundStart > newestTheirs && now - roundStart > PLUGIN_SILENT_MS) return false;
+    return true;
+  };
 
   /**
    * 让位给插件的那条会话，插件是不是**冒我们这个身份、而且现在正跑着**？
@@ -266,6 +303,33 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       result: last.endedAt ? last.result || '' : '',
     });
     count += 1;
+
+    // ②b 从插件手里收回来时（它的通道断了，见 yieldsOf），把它断线期间漏掉的轮次补上：
+    // 判据是"比插件最新一行还新的那些轮"—— 它之前的老轮次插件自己报过，轮询不回溯历史
+    // （见文件头"只记当前这一轮"）；只有这里补，因为这是"本该有行、却一直没等到"的那几轮。
+    // 已经写过行的（含上面刚写的最后一轮、以及插件亲手写的那几行）不动一根汗毛。
+    const newestTheirs = pluginNewestOf(s);
+    if (newestTheirs) {
+      for (const r of rounds.slice(0, -1)) {
+        if (Number(r.startedAt || 0) <= newestTheirs) continue;
+        const rid = `${prefix}:${r.index}`;
+        if (sessionRuns.some((x) => String(x.id) === rid)) continue;
+        writeTurnRun(repo, {
+          id: rid,
+          projectId,
+          memberId,
+          sessionId: s.id || null,
+          model: s.model || '',
+          title: r.prompt || s.title || '(Kilo 会话)',
+          startedAt: r.startedAt || now,
+          endedAt: r.endedAt || null,
+          state: r.outcome,
+          files: relFiles(r.files),
+          result: r.endedAt ? r.result || '' : '',
+        });
+        count += 1;
+      }
+    }
 
     // ③ 定稿上一轮：上一轮在我们这儿是 running，现在后面已经开了新的一轮 ——
     // 用它的真实收工时刻/结果把那一行补成 done / cancelled。
