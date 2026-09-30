@@ -173,6 +173,26 @@ function hasCoreTables() {
 }
 
 /**
+ * part.text 的剥壳：实测 Kilo 存进去的值带一层 JSON 引号（`'"…"'`），
+ * 先按 JSON 剥一层，剥不掉就用原文。
+ *
+ * 压空白与截断留给调用方 —— 各处上限不同（屏上那句 80 字，台账的收尾自述 4000 字）。
+ * @param {string} raw
+ * @returns {string}
+ */
+function unquoteText(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  try {
+    const un = JSON.parse(s);
+    if (typeof un === 'string') return un.trim();
+  } catch {
+    /* 不是 JSON 包裹的，原样用 */
+  }
+  return s;
+}
+
+/**
  * 这一轮**用户说的话**（「思考中」时主控制台屏上显示的那句）。
  *
  * 取法：event 里 role=user 的 text part，按 seq 倒序取最新一条 —— 用户原话就在
@@ -207,20 +227,208 @@ function readRoundPrompt(sessionId) {
   if (!Array.isArray(rows) || !rows.length) return '';
   try {
     const d = JSON.parse(String(rows[0].data || ''));
-    const raw = String((d && d.part && d.part.text) || '').trim();
-    if (!raw) return '';
-    // 实测 part.text 带一层 JSON 引号（'"…"'"），先按 JSON 剥一层，剥不掉就用原文
-    let said = raw;
-    try {
-      const un = JSON.parse(raw);
-      if (typeof un === 'string') said = un;
-    } catch {
-      /* 不是 JSON 包裹的，原样用 */
-    }
+    const said = unquoteText((d && d.part && d.part.text) || '');
+    if (!said) return '';
     return said.replace(/\s+/g, ' ').trim().slice(0, 80);
   } catch {
     return '';
   }
+}
+
+/* ------------------------------ 逐轮清单（7F 台账用） ------------------------------ */
+
+/**
+ * 一轮"算不算收工"的窗口。
+ *
+ * **不要和 `PHASE_FRESH_MS`（2 分钟）混用**：那个管"屏上现在显什么相位"，
+ * 这个管"这一轮完了没有"。实测这条会话的同一轮里有过 **780 秒**的生成间隔
+ * （慢速 free 模型：一条 assistant 消息 06:17:37 → 06:30:37 才写完），
+ * 拿 2 分钟当收工窗口会把正在跑的轮判成"没干完就断了"。
+ * 窗口短了会翻转（运行中↔已取消），长了会让中断的轮多挂一会儿 —— 取 10 分钟。
+ */
+const ROUND_IDLE_MS = 10 * 60_000;
+
+/** part.data.files 是 JSON 数组（Kilo 自己记的改动文件，实测绝对路径）；形状不对就当没有 */
+function filesOf(raw) {
+  if (!raw) return [];
+  let arr = null;
+  try {
+    arr = JSON.parse(String(raw));
+  } catch {
+    return []; // 半截 / 非 JSON：不猜
+  }
+  if (typeof arr === 'string') arr = [arr];
+  if (!Array.isArray(arr)) return [];
+  return arr.map((f) => String(f || '').trim()).filter(Boolean);
+}
+
+/**
+ * 这条会话**逐轮**的用户任务清单（7F 台账按「每一轮一条」记账用，口径与 8F 的
+ * `readOpencodeTurns` 对齐）。
+ *
+ * 轮的边界：`message` 表里 `role='user'` 的消息起一轮，`startedAt` 取它的 `time_created`
+ * —— 这个值**不可变**，所以 9F Copilot 那条"起点被insertTask的 COALESCE 钉住、
+ * 只好删行重建"的补丁 7F 不需要。
+ *
+ * 轮的收口：复用 `turnIsOver`（与 `readKiloDone` 判完成、插件判收工同一口径）。
+ * 有终态 finish 的按 finish 映射（stop → done，length / content-filter → cancelled），
+ * **没有终态又不是最后一轮**的按 cancelled 记 —— 那一轮要么是用户按了 ESC（插件那一路
+ * 才写得出取消标记，见 NO_DONE 的说明），要么是进程没了，两种都是"没干完"。
+ *
+ * 注意 **`session_message` 表在 Kilo 是空的**（实测 0 行）—— 8F OpenCode 的轮次从那张表读，
+ * 7F 只能从 `message` + `part` 拼，别照抄。
+ *
+ * 读不出来（库没装 / 表被改 / JSON 坏了）一律回空数组 —— 绝不冒泡（文件头纪律 3）。
+ * `message` 表缺了就真没有轮；`part` 表缺了只是 prompt / files / result 为空，轮还在。
+ * @param {string} sessionId
+ * @returns {Array<{index:number, prompt:string, startedAt:number, endedAt:number|null,
+ *   outcome:'running'|'done'|'cancelled', files:string[], result:string}>}
+ */
+function readKiloRounds(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return [];
+  // 两条语句走**同一次** query()（只读连接开一次就够；part 表在 session_id 上没有索引，
+  // 整表扫一次约 5ms，别开第二条连接再扫一遍）。
+  const data = query((db) => {
+    const out = { msgs: [], parts: [] };
+    // 各自 try/catch：part 表缺了轮还在，message 表缺了才是真没有
+    try {
+      out.msgs = db
+        .prepare(
+          `SELECT id, time_created AS createdAt, time_updated AS updatedAt, data AS data
+             FROM message WHERE session_id = ? ORDER BY time_created, id`
+        )
+        .all(id);
+    } catch {
+      out.msgs = [];
+    }
+    try {
+      // 只 json_extract、不整行 parse：tool part 的 data 里塞着几 KB 的工具输出
+      out.parts = db
+        .prepare(
+          `SELECT p.message_id AS messageId,
+                  JSON_extract(p.data,'$.type')  AS type,
+                  JSON_extract(p.data,'$.text')  AS text,
+                  JSON_extract(p.data,'$.files') AS files,
+                  MAX(p.time_updated,
+                      COALESCE(JSON_extract(p.data,'$.time.end'), 0),
+                      COALESCE(JSON_extract(p.data,'$.time.start'), 0)) AS at
+             FROM part p WHERE p.session_id = ?`
+        )
+        .all(id);
+    } catch {
+      out.parts = [];
+    }
+    return out;
+  });
+  const msgs = Array.isArray(data && data.msgs) ? data.msgs : [];
+  if (!msgs.length) return [];
+
+  const partsByMsg = new Map();
+  for (const p of Array.isArray(data && data.parts) ? data.parts : []) {
+    const k = String(p.messageId || '');
+    if (!k) continue;
+    if (!partsByMsg.has(k)) partsByMsg.set(k, []);
+    partsByMsg.get(k).push(p);
+  }
+
+  /** 这一轮里各条 part 的时间也要算进 lastAt（工具跑完的时刻比消息的 time_updated 更贴） */
+  const foldAt = (round, own) => {
+    for (const p of own) round.lastAt = Math.max(round.lastAt, Number(p.at) || 0);
+  };
+
+  const rounds = [];
+  let cur = null;
+  for (const m of msgs) {
+    let md = null;
+    try {
+      md = JSON.parse(String(m.data || ''));
+    } catch {
+      md = null; // 坏 JSON：这条消息的 role/finish 读不出，但它的 part 仍然算时间
+    }
+    if (!md || typeof md !== 'object') md = {};
+    const own = partsByMsg.get(String(m.id)) || [];
+    const at = Number(m.updatedAt) || Number(m.createdAt) || 0;
+
+    if (String(md.role || '') === 'user') {
+      // 这一轮用户说的话：它的 text part（Kilo 可能拆成多条，取第一条非空的）
+      let prompt = '';
+      for (const p of own) {
+        if (String(p.type || '') !== 'text') continue;
+        const said = unquoteText(p.text);
+        if (said) {
+          prompt = said.replace(/\s+/g, ' ').trim().slice(0, 80);
+          break;
+        }
+      }
+      // **没有 text part 的 user 消息不是新任务**，是 Kilo 自己的 compaction 注入
+      // （全库实测只有一条，紧跟在被打断的那一轮之后）—— 折进当前轮，不新起 index。
+      // 真的连一轮都还没开始（会话头就是它）才拿它当一轮，免得这几条消息无处安放。
+      if (!prompt && cur) {
+        cur.lastAt = Math.max(cur.lastAt, at);
+        foldAt(cur, own);
+        continue;
+      }
+      if (cur) rounds.push(cur);
+      cur = {
+        index: rounds.length,
+        prompt,
+        startedAt: Number(m.createdAt) || at,
+        lastAt: at,
+        finish: '',
+        over: false,
+        files: new Set(),
+        result: '',
+      };
+      foldAt(cur, own);
+      continue;
+    }
+
+    if (!cur) continue; // 会话开头不是 user 消息的，不编一轮
+    cur.lastAt = Math.max(cur.lastAt, at);
+    foldAt(cur, own);
+    if (turnIsOver(m.data)) cur.over = true;
+    const fin = String(md.finish || '');
+    if (fin) cur.finish = fin;
+    for (const p of own) {
+      const t = String(p.type || '');
+      if (t === 'text') {
+        // 这一轮的收尾自述：后面的消息会覆盖前面的，最终留下"最后那条消息说的话"
+        // （与 8F:opencode.js 和插件那一路同口径）
+        const said = unquoteText(p.text);
+        if (said) cur.result = said.replace(/\s+/g, ' ').trim().slice(0, 4_000);
+      } else if (t === 'patch') {
+        // 改动文件只认 patch part —— **不认工具入参**：read / grep 这些只读工具也带
+        // filePath，拿它当"改动"会把只读过的文件算进「本轮改动」
+        for (const f of filesOf(p.files)) cur.files.add(f);
+      }
+    }
+  }
+  if (cur) rounds.push(cur);
+
+  const now = Date.now();
+  return rounds.map((r, i) => {
+    const next = rounds[i + 1];
+    const isLast = i === rounds.length - 1;
+    // "还在飞" = 最后一轮 + 没有终态 finish + 窗口内还有动静。
+    // 非最后一轮的必然已收工（后面已经开了新的一轮），不看窗口。
+    const running = isLast && !r.over && now - r.lastAt < ROUND_IDLE_MS;
+    const outcome = running ? 'running' : r.over ? (r.finish === 'stop' ? 'done' : 'cancelled') : 'cancelled';
+    // 收工时刻夹一下：流式 assistant 消息的 time_updated 可能晚于下一条用户消息的时间
+    const endedAt =
+      outcome === 'running'
+        ? null
+        : Math.max(r.startedAt, Math.min(r.lastAt || r.startedAt, next ? next.startedAt : Infinity));
+    return {
+      index: r.index,
+      prompt: r.prompt,
+      startedAt: r.startedAt,
+      endedAt,
+      outcome,
+      files: [...r.files],
+      result: r.result,
+    };
+  });
 }
 
 /* ------------------------------ 会话清单 ------------------------------ */
@@ -578,44 +786,6 @@ function readKiloDone(sessionId, meta = {}) {
 /* ------------------------------ 对外 ------------------------------ */
 
 /**
- * 这条会话碰过的文件路径（去重）。
- * 从 event 表的 patch / tool 事件里取 part.file / part.state.input.* 的文件路径。
- * 路径是相对于会话 directory 的相对路径（Kilo 存的就是相对路径，不用转）。
- * 取不到回空数组（表缺 / 事件没有文件信息 → 不冒泡）。
- * @param {string} sessionId
- * @returns {string[]}
- */
-function readKiloFiles(sessionId) {
-  const id = String(sessionId || '').trim();
-  if (!id) return [];
-  const rows = query((db) =>
-    db
-      .prepare(
-        `SELECT DISTINCT
-           JSON_extract(e.data,'$.part.file') AS f1,
-           JSON_extract(e.data,'$.part.state.input.file') AS f2,
-           JSON_extract(e.data,'$.part.state.input.filePath') AS f3,
-           JSON_extract(e.data,'$.part.state.input.file_path') AS f4,
-           JSON_extract(e.data,'$.part.state.input.path') AS f5,
-           JSON_extract(e.data,'$.part.state.input.target_file') AS f6
-           FROM event e
-          WHERE e.aggregate_id = ?
-            AND JSON_extract(e.data,'$.part.type') IN ('patch','tool')`
-      )
-      .all(id)
-  );
-  if (!Array.isArray(rows)) return [];
-  const out = [];
-  for (const r of rows) {
-    for (const key of ['f1', 'f2', 'f3', 'f4', 'f5', 'f6']) {
-      const p = String(r[key] || '').trim();
-      if (p && !out.includes(p)) out.push(p);
-    }
-  }
-  return out;
-}
-
-/**
  * 这条会话有没有"接上"（Kilo 库里真有它）。
  * 渲染层靠它区分"这个产品根本没在跑"与"在跑但此刻没动作"（同 reporter-phase 的 instrumented）。
  */
@@ -674,8 +844,8 @@ module.exports = {
   listKiloSessions,
   readKiloPhase,
   readKiloDone,
-  readKiloFiles,
-  readRoundPrompt, // 这一轮用户说的话（台账标题用，见 kiloTasks.js）
+  readKiloRounds, // 逐轮清单（7F 台账按「每一轮一条」记账用，见 kiloTasks.js）
+  readRoundPrompt, // 这一轮用户说的话（「思考中」屏上那句；比 readKiloRounds 便宜得多）
   kiloInstrumented,
   kiloMainPhase,
   NO_DONE,

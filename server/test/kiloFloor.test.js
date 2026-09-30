@@ -27,6 +27,8 @@
  *     [C3] 撞长度 / 被内容过滤 → 不算完成（亮"任务完成"会误导）
  *     [C4] 过期的完成标记（DONE_TTL_MS 之外）→ 当没有
  *   D. 读不出来不许冒泡
+ *     [B10] 逐轮清单：轮边界 / 收工判据 / 用户原话 / 改动文件（台账「每一轮一条」的真源）
+ *     [B11] 逐轮清单的边界：没干完又过了窗口 → cancelled；compaction 注入不算新任务
  *     [D1] 库缺 event/message 表（Kilo 改版换表）→ 楼层仍列出，会话为空，接口不挂
  */
 'use strict';
@@ -105,6 +107,12 @@ function makeKiloDb(file, { full = true } = {}) {
         id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
         time_updated INTEGER, data TEXT
       );
+      -- 逐轮清单（readKiloRounds）读 part 拿用户原话 / 改动文件 / 收尾自述。
+      -- 注意 Kilo 的 **session_message 表是空的**（实测 0 行），所以这里也不建它。
+      CREATE TABLE part (
+        id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+        time_created INTEGER, time_updated INTEGER, data TEXT
+      );
     `);
   } else {
     // [D1] 只建 session 表：Kilo 改版换掉 event / message 时，7F 得"读不出会话"而不是崩
@@ -127,15 +135,35 @@ function addEvent(db, sessionId, part, extra = {}) {
     JSON.stringify({ sessionID: sessionId, part: { id: `prt_${seq}`, ...part }, ...extra })
   );
 }
-function addMessage(db, sessionId, data) {
+function addMessage(db, sessionId, data, updatedAt = Date.now()) {
   // 返回这条消息的 id：相位推导要靠 part.messageID join 回 message 才能判 finish
   // （轮中的文字 vs 整轮收尾，见 [B8]），造数据时得能引用它。
+  // updatedAt 同样可显式给：逐轮清单拿消息时间算"这一轮最后动到什么时候"，
+  // 默认 Date.now() 会把几十轮前的数据算成"刚刚"。
   const id = `msg_${db.prepare('SELECT COUNT(*) c FROM message').get().c + 1}`;
   db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)').run(
     id,
     sessionId,
     data.time.created || Date.now(),
-    Date.now(),
+    updatedAt,
+    JSON.stringify(data)
+  );
+  return id;
+}
+
+/**
+ * 追加一条 part（真实库的 part 形状）。
+ * `at` 要显式给 —— 逐轮清单拿 part 的时间算"这一轮最后动到什么时候"，
+ * 默认 Date.now() 会把几十轮前的数据算成"刚刚"，测起来全是假阳性。
+ */
+function addPart(db, sessionId, messageId, data, at = Date.now()) {
+  const id = `prt_p${db.prepare('SELECT COUNT(*) c FROM part').get().c + 1}`;
+  db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)').run(
+    id,
+    messageId,
+    sessionId,
+    at,
+    at,
     JSON.stringify(data)
   );
   return id;
@@ -444,6 +472,104 @@ head('[B9] 「思考中」要带上这一轮用户说的话（别的一层都有
   ok('tool 相位也带 prompt', ph2 && ph2.prompt === '7F 的任务记录为什么是空的', JSON.stringify(ph2 && ph2.prompt));
 }
 
+/* ------------------------------ C2. 逐轮清单（台账「每一轮一条」的真源） ------------------------------ */
+
+head('[B10] 逐轮清单：轮边界、收工判据、用户原话、改动文件（readKiloRounds）');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  db.prepare('DELETE FROM message').run();
+  db.prepare('DELETE FROM part').run();
+  seq = 0;
+  const now = Date.now();
+  const fileAbs = path.join(WS, 'server/src/kiloTasks.js');
+
+  // 第 0 轮：干完了（finish=stop），改了一个文件
+  const u0 = addMessage(db, SID, { role: 'user', time: { created: now - 30 * MIN } }, now - 29 * MIN);
+  addPart(db, SID, u0, { type: 'text', text: JSON.stringify('把 7F 接上台账') }, now - 29 * MIN);
+  // 真实库里同一段文字在 event 与 part **两张表**里各有一份：屏上那句（readRoundPrompt）
+  // 走 event，台账（readKiloRounds）走 part。两份都要造，才能锁住"两处口径不许分叉"。
+  addEvent(db, SID, { type: 'text', messageID: u0, text: JSON.stringify('把 7F 接上台账'), time: { start: now - 29 * MIN } });
+  const a0 = addMessage(
+    db,
+    SID,
+    { role: 'assistant', time: { created: now - 29 * MIN, completed: now - 28 * MIN }, finish: 'stop' },
+    now - 28 * MIN
+  );
+  addPart(db, SID, a0, { type: 'text', text: '接上了' }, now - 28 * MIN);
+  // Kilo 自己记的改动文件（实测 patch part 的 files 是**绝对路径**数组）
+  addPart(db, SID, a0, { type: 'patch', files: [fileAbs] }, now - 28 * MIN);
+
+  // 第 1 轮：还没干完（只有 tool-calls）→ 最后一轮且新鲜 → running
+  const u1 = addMessage(db, SID, { role: 'user', time: { created: now - 5_000 } }, now - 5_000);
+  addPart(db, SID, u1, { type: 'text', text: JSON.stringify('再看看任务记录') }, now - 5_000);
+  addEvent(db, SID, { type: 'text', messageID: u1, text: JSON.stringify('再看看任务记录'), time: { start: now - 5_000 } });
+  const a1 = addMessage(db, SID, { role: 'assistant', time: { created: now - 4_000 }, finish: 'tool-calls' }, now - 4_000);
+  addPart(db, SID, a1, { type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'ls' } } }, now - 3_000);
+  db.close();
+
+  const rounds = kilo.readKiloRounds(SID);
+  ok('切成 2 轮', rounds.length === 2, String(rounds.length));
+  ok('轮序号从 0 起（台账 id 的后缀就是它）', rounds[0].index === 0 && rounds[1].index === 1, JSON.stringify(rounds.map((r) => r.index)));
+  ok('标题 = 那一轮用户原话（引号已剥）', rounds[0].prompt === '把 7F 接上台账', JSON.stringify(rounds[0].prompt));
+  // 这条是 2026-09-30 那个故障的根：起点必须来自**那一轮**的 user 消息（不可变），
+  // 不是"第一次见到这条会话"的时刻（那条会被 insertTask 的 COALESCE 永远钉住）。
+  ok('起点 = 那一轮 user 消息的 time.created', rounds[0].startedAt === now - 30 * MIN, String(rounds[0].startedAt));
+  ok(
+    '干完的那轮 → done，收工时刻 = assistant 的 time.completed',
+    rounds[0].outcome === 'done' && rounds[0].endedAt === now - 28 * MIN,
+    `${rounds[0].outcome}/${rounds[0].endedAt}`
+  );
+  ok('收尾自述取这一轮最后一条 assistant 文字', rounds[0].result === '接上了', JSON.stringify(rounds[0].result));
+  // 改动文件只认 patch part —— 工具入参里有 filePath 的只读工具（read/grep）不算改动
+  ok(
+    '改动文件取 patch part 的 files（不是工具入参）',
+    JSON.stringify(rounds[0].files) === JSON.stringify([fileAbs]),
+    JSON.stringify(rounds[0].files)
+  );
+  ok(
+    '最后一轮还没干完 → running、ended_at 为空',
+    rounds[1].outcome === 'running' && rounds[1].endedAt === null,
+    `${rounds[1].outcome}/${rounds[1].endedAt}`
+  );
+  // 两处取用户原话的口径不许分叉：屏上那句（readRoundPrompt）就是台账的标题来源
+  ok(
+    'readRoundPrompt 与最后一轮的 prompt 是同一句',
+    kilo.readRoundPrompt(SID) === rounds[1].prompt,
+    `${JSON.stringify(kilo.readRoundPrompt(SID))} vs ${JSON.stringify(rounds[1].prompt)}`
+  );
+}
+
+head('[B11] 逐轮清单的两个边界：没干完又过了窗口 → cancelled；compaction 注入不算新任务');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  db.prepare('DELETE FROM message').run();
+  db.prepare('DELETE FROM part').run();
+  seq = 0;
+  const now = Date.now();
+
+  const u0 = addMessage(db, SID, { role: 'user', time: { created: now - 40 * MIN } }, now - 39 * MIN);
+  addPart(db, SID, u0, { type: 'text', text: JSON.stringify('干一半被打断') }, now - 39 * MIN);
+  // 只有 tool-calls、没有终态 finish，而且早就停了 → 这一轮是"没干完"
+  const a0 = addMessage(db, SID, { role: 'assistant', time: { created: now - 39 * MIN }, finish: 'tool-calls' }, now - 39 * MIN);
+  addPart(db, SID, a0, { type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'sleep 1' } } }, now - 39 * MIN);
+  // Kilo 自己的 compaction 注入：role=user 但**没有 text part** —— 不许算成新的一轮
+  const c0 = addMessage(db, SID, { role: 'user', time: { created: now - 38 * MIN } }, now - 38 * MIN);
+  addPart(db, SID, c0, { type: 'compaction', text: '' }, now - 38 * MIN);
+  db.close();
+
+  const rounds = kilo.readKiloRounds(SID);
+  ok('compaction 注入没有新起一轮', rounds.length === 1, String(rounds.length));
+  ok('没干完又过了窗口的轮 → cancelled（不是 done）', rounds[0].outcome === 'cancelled', rounds[0].outcome);
+  ok(
+    'cancelled 的收工时刻有值、且不早于起点',
+    Number.isFinite(rounds[0].endedAt) && rounds[0].endedAt >= rounds[0].startedAt,
+    String(rounds[0].endedAt)
+  );
+  ok('没干完的那轮不写收尾自述（半截话不算产出）', rounds[0].result === '', JSON.stringify(rounds[0].result));
+}
+
 /* ------------------------------ D. 读不出来不许冒泡 ------------------------------ */
 
 head('[D1] 库缺 event/message 表（Kilo 改版换表）→ 楼层仍列出，会话为空，接口不挂');
@@ -464,6 +590,8 @@ head('[D1] 库缺 event/message 表（Kilo 改版换表）→ 楼层仍列出，
   // 相位 / 完成标记同样不许抛：缺表时回"没有"，不是把 1.5s 一次的轮询打挂
   ok('相位读不出时回 null，不抛', kilo.readKiloPhase(SID) === null, String(kilo.readKiloPhase(SID)));
   ok('完成标记读不出时回空，不抛', kilo.readKiloDone(SID, {}).doneAt === 0, JSON.stringify(kilo.readKiloDone(SID, {})));
+  // 缺的是 message / part 表 → 逐轮清单读不出任何一轮（但也不许抛）
+  ok('逐轮清单读不出时回空数组，不抛', JSON.stringify(kilo.readKiloRounds(SID)) === '[]', JSON.stringify(kilo.readKiloRounds(SID)));
 }
 
 /* ------------------------------ E. 两路合起来 ------------------------------ */

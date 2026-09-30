@@ -43,13 +43,12 @@ const opencodeMod = require('../src/opencode');
 /* 固定数据打桩：只把"厂商落盘"那一层换掉，repo / 路由 / 同步器全是真的 */
 let copilotRows = [];
 let kiloRows = [];
-let kiloFiles = [];
 let opencodeRows = [];
 sessionsMod.listSessions = () => ({ sessions: copilotRows });
 sessionsMod.copilotCurrentModel = () => 'GPT-5 mini';
 kiloMod.listKiloSessions = () => kiloRows;
-kiloMod.readKiloFiles = () => kiloFiles;
-kiloMod.readRoundPrompt = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).roundPrompt || '');
+// 7F 是「每一轮一条」：会话行上挂 `rounds`（形状同 kilo.js 的 readKiloRounds）
+kiloMod.readKiloRounds = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).rounds || []);
 opencodeMod.listOpencodeSessions = () => opencodeRows;
 opencodeMod.readOpencodeTurns = (sid) => ((opencodeRows.find((r) => r.id === sid) || {}).turns || []);
 
@@ -176,6 +175,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('成员卡回落 idle（不再永远"思考中"）', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
 
   console.log('[3] 7F Kilo Code：活跃会话 → 台账 + 成员卡思考中');
+  const round7Start = Date.now() - 60_000;
   kiloRows = [
     {
       id: 'kilo-sid-1',
@@ -183,17 +183,29 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       projectPath: '/tmp/p1',
       lastEventAt: Date.now(),
       title: '把 7F 接上台账',
-      roundPrompt: '把 7F 接上台账（这一轮）',
       model: 'kilo-auto/free',
       fileCount: 0,
+      rounds: [
+        {
+          index: 3,
+          prompt: '把 7F 接上台账（这一轮）',
+          startedAt: round7Start,
+          endedAt: null,
+          outcome: 'running',
+          files: ['/tmp/p1/src/a.js', '/tmp/p1/src/b.js'],
+          result: '',
+        },
+      ],
     },
   ];
-  kiloFiles = ['/tmp/p1/src/a.js', '/tmp/p1/src/b.js'];
   ok('同步器写了 1 条', syncKiloTasks({ bus, repo }) === 1);
-  const run7 = repo.getTaskRun.get('kilo:kilo-sid-1');
+  // 台账 id 必须带**轮序号**：一条会话一行那版已经废掉（见 kiloTasks.js 头部的说明），
+  // 那条老 id 是本次同步顺手收掉的过渡期残留。
+  ok('过渡期那条"一条会话一行"的旧台账被收掉', !repo.getTaskRun.get('kilo:kilo-sid-1'));
+  const run7 = repo.getTaskRun.get('kilo:kilo-sid-1:3');
   ok('台账行的 client 是楼层接纳的身份', Boolean(run7) && F7.includes(run7.client), run7 && run7.client);
   const items7 = await get(`project=p1&client=${F7.join(',')}&limit=50`);
-  const row7 = items7.find((t) => t.id === 'kilo:kilo-sid-1') || null;
+  const row7 = items7.find((t) => t.id === 'kilo:kilo-sid-1:3') || null;
   ok('按 7F 楼层筛选能取到这条任务记录', Boolean(row7), JSON.stringify(items7.map((t) => t.id)));
   ok('标题用这一轮用户说的话（不是永远不变的会话标题）', Boolean(row7) && row7.title === '把 7F 接上台账（这一轮）', row7 && row7.title);
   ok('模型信息带上了（Kilo 的 session.model）', Boolean(row7) && row7.model === 'kilo-auto/free', row7 && row7.model);
@@ -202,27 +214,74 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     Boolean(row7) && String(row7.files_json) === JSON.stringify(['src/a.js', 'src/b.js']),
     row7 && row7.files_json
   );
+  // 起点必须是**那一轮**的起点，不是"第一次见到这条会话"的时刻 —— 这就是 2026-09-30 报的
+  // 那个故障（老会话里跑新任务，行还是几天前那条、时间戳被 insertTask 的 COALESCE 钉死）。
+  ok('台账起点 = 这一轮的起点（不是会话第一次被看见的时刻）', Boolean(row7) && Number(row7.started_at) === round7Start, row7 && String(row7.started_at));
   ok('活跃会话 → 成员卡 thinking', stateOf('kilo@p1') === 'thinking', stateOf('kilo@p1'));
 
-  console.log('[4] 7F Kilo Code：会话停下 → 成员卡回落 idle');
-  kiloRows = [{ ...kiloRows[0], lastEventAt: Date.now() - 30 * 60_000 }];
+  console.log('[4] 7F Kilo Code：一轮收工 → 成员卡回落 idle，时长是真的');
+  const round7End = Date.now() - 30 * 60_000;
+  kiloRows = [
+    {
+      ...kiloRows[0],
+      rounds: [{ ...kiloRows[0].rounds[0], endedAt: round7End, outcome: 'done', result: '已经把 7F 接上了' }],
+    },
+  ];
   syncKiloTasks({ bus, repo });
   ok('成员卡回落 idle', stateOf('kilo@p1') === 'idle', stateOf('kilo@p1'));
+  const done7 = repo.getTask.get('kilo:kilo-sid-1:3');
+  ok('那一轮落成 done', Boolean(done7) && done7.state === 'done', done7 && done7.state);
+  ok(
+    'duration_ms 是这一轮真实的耗时（不再是 0）',
+    Boolean(run7) && repo.getTaskRun.get('kilo:kilo-sid-1:3').duration_ms === round7End - round7Start,
+    String(repo.getTaskRun.get('kilo:kilo-sid-1:3').duration_ms)
+  );
+  ok('收工后补上这一轮的收尾自述', repo.getTaskRun.get('kilo:kilo-sid-1:3').result === '已经把 7F 接上了');
+
+  console.log('[4b] 7F Kilo Code：没干完就断了的那一轮 → 已取消（不是完成）');
+  // 没有终态 finish 的轮（用户 ESC / 进程没了）在 readKiloRounds 里就判成 cancelled，
+  // 同步器照写 —— 不能写 done（明明没干完），也不能留着 running 等 query.js 的 CASE 兜。
+  kiloRows = [
+    {
+      ...kiloRows[0],
+      id: 'kilo-sid-cut',
+      rounds: [
+        { index: 0, prompt: '干一半被打断', startedAt: round7End, endedAt: round7End + 5_000, outcome: 'cancelled', files: [], result: '' },
+      ],
+    },
+  ];
+  syncKiloTasks({ bus, repo });
+  const cut7 = repo.getTask.get('kilo:kilo-sid-cut:0');
+  ok('被打断的那轮记 cancelled', Boolean(cut7) && cut7.state === 'cancelled', cut7 && cut7.state);
 
   console.log('[5] 同一工程多条会话：在跑的那条不许被判成「已取消」');
   // 回归（2026-09-28 实测）：agent_status 主键是 member_id，一个工程只有一条状态行。
   // 早先每条会话都去写它，谁最后写谁赢 —— 正在跑的那条任务因此在 agent_status 里
   // 找不到对应心跳，任务列表按 query.js 的 CASE 把它算成「已取消」，运行中的任务就没了。
   // 这里故意把"早就停了的那条"排在后面（谁最后写谁赢的写法就会踩中）。
+  const r5a = { index: 0, prompt: '在跑的这条', startedAt: round7End + 60_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  const r5b = { index: 0, prompt: '早就停了的', startedAt: round7End, endedAt: round7End + 1_000, outcome: 'done', files: [], result: '' };
   kiloRows = [
-    { id: 'kilo-sid-active', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now(), title: '在跑的这条', model: 'kilo-auto/free', fileCount: 0 },
-    { id: 'kilo-sid-old', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now() - 30 * 60_000, title: '早就停了的', model: '', fileCount: 0 },
+    { id: 'kilo-sid-active', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now(), title: '在跑的这条', model: 'kilo-auto/free', fileCount: 0, rounds: [r5a] },
+    { id: 'kilo-sid-old', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now() - 30 * 60_000, title: '早就停了的', model: '', fileCount: 0, rounds: [r5b] },
   ];
   syncKiloTasks({ bus, repo });
   const seven2 = await get(`project=p1&client=${F7.join(',')}&limit=50`);
-  const active7 = seven2.find((t) => t.id === 'kilo:kilo-sid-active') || null;
+  const active7 = seven2.find((t) => t.id === 'kilo:kilo-sid-active:0') || null;
   ok('7F 运行中的任务是 running（不是 cancelled）', Boolean(active7) && active7.state === 'running', active7 && active7.state);
-  ok('心跳指着在跑的那条任务', taskIdOf('kilo@p1') === 'kilo:kilo-sid-active', taskIdOf('kilo@p1'));
+  ok('心跳指着在跑的那条任务', taskIdOf('kilo@p1') === 'kilo:kilo-sid-active:0', taskIdOf('kilo@p1'));
+
+  console.log('[5b] 7F：下一轮开始时，上一轮被定稿（不许永远挂在 running）');
+  // 只记"当前这一轮"，所以上一轮的状态是**下一条用户任务来了以后**才补上的。
+  // 不补的话它会永远停在 running，被 query.js 的 CASE 判成「已取消」—— 而它其实干完了。
+  const r5c = { index: 1, prompt: '又开了一轮', startedAt: r5a.startedAt + 10_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [{ ...kiloRows[0], rounds: [{ ...r5a, endedAt: r5a.startedAt + 5_000, outcome: 'done', result: '上一轮干完了' }, r5c] }];
+  ok('同步器写了 2 条（定稿上一轮 + 写当前轮）', syncKiloTasks({ bus, repo }) === 2);
+  const prev7 = repo.getTask.get('kilo:kilo-sid-active:0');
+  ok('上一轮被定稿成 done', Boolean(prev7) && prev7.state === 'done', prev7 && prev7.state);
+  const now7 = repo.getTask.get('kilo:kilo-sid-active:1');
+  ok('当前这一轮是 running', Boolean(now7) && now7.state === 'running', now7 && now7.state);
+  ok('心跳改指新的一轮', taskIdOf('kilo@p1') === 'kilo:kilo-sid-active:1', taskIdOf('kilo@p1'));
 
   console.log('[6] 9F：会话行说「在飞」→ 只有那一轮是 running（不受 2 分钟窗口影响）');
   // Copilot 自己的库整轮写完才落盘，只看 updated_at 会出现"跑着显示待命、跑完显示思考中"。
