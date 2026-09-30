@@ -50,11 +50,22 @@ const { listKiloSessions, readKiloRounds } = require('./kilo');
 const SYNC_INTERVAL_MS = 5_000;
 
 /**
- * 插件那一路"还活着"的宽限期（见下面的 yieldsOf）。
- * 插件每开一轮就立刻写一条台账（收到用户消息 1 秒内 task/start），所以"源里最新的那一轮
- * 比插件最新一行还新" + 过了这个宽限期，就说明它的上报通道断了 —— 这一栏该由轮询收回来。
+ * 插件那一路"还活着"的两个时间参数（见下面的 yieldsOf / coveredBy）。
+ *
+ * PLUGIN_GRACE_MS —— 一轮刚起的头几秒先不抢：插件收到用户消息就写台账（本地回环，实测
+ *   30~90 毫秒就落库），所以"这一轮已经跑了几秒、插件还没为它写行"基本就等于它哑了。
+ *   这个值**必须短**，因为它量的是"插件还没写上来"这段窗口，而这段窗口里轮询是**不写**的
+ *   —— 窗口多长，用户的这一轮就在列表里消失多久。实测（2026-09-30 13:42）：一条 8 秒的
+ *   任务（13:42:44 → 13:42:52），按 60 秒算的时候整轮都落在宽限期里，用户看着它跑完、
+ *   又等了 52 秒才在列表里看到那行（报的是"输入 Prompt 后没看到任务，任务结束后一会才
+ *   看到"）。3 秒是本地回环的宽裕余量，同时把消失窗口压到一次轮询（5s）以内。
+ * PLUGIN_COVER_MS —— 判"这一轮插件报过没有"时，插件那行的 started_at 与轮次起点允许差
+ *   多少。两边记的是同一个事件的两端：插件记它**看到消息**的时刻，轮次表记消息**落库**
+ *   的时刻，实测差在 ±90ms 内且方向不定（+34 / -87 / -14ms 三例）。判漏了会与插件的行
+ *   并排多写一条（孪生行，而且它自己好不了）；判重了会把"两秒内连开两轮"当成同一轮。
  */
-const PLUGIN_SILENT_MS = 60_000;
+const PLUGIN_GRACE_MS = 3_000;
+const PLUGIN_COVER_MS = 2_000;
 
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'kilo:';
@@ -147,9 +158,12 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   }
   const isActiveOf = (s) => (roundsOf.get(s.id) || []).some((r) => r.outcome === 'running');
 
-  /** 插件给这条会话写的最新一行的时刻（没写过 → 0） */
-  const pluginNewestOf = (s) =>
-    runsOf.get(s.id).reduce((m, r) => (String(r.id).startsWith(TASK_ID_PREFIX) ? m : Math.max(m, Number(r.started_at || 0))), 0);
+  /** 插件给这条会话写的那些行（服务端发的 `k_*`）各自报的轮次起点；没写过 → [] */
+  const pluginStartsOf = (s) =>
+    runsOf.get(s.id).filter((r) => !String(r.id).startsWith(TASK_ID_PREFIX)).map((r) => Number(r.started_at || 0));
+
+  /** 插件**为这一轮**写过行没有：按轮次起点对齐（容许 PLUGIN_COVER_MS 的误差，理由见常量） */
+  const coveredBy = (starts, at) => starts.some((p) => Math.abs(p - Number(at || 0)) <= PLUGIN_COVER_MS);
 
   /**
    * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `kilo:*`）——
@@ -163,19 +177,24 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
    * （所以相位/状态正常显示）、台账一条不来。于是 12:46 与 12:48 用户跑的两轮，
    * 插件写不了、轮询又整条让位 → **两条任务都查不到**（用户报的"状态有，但看不到任务"）。
    *
-   * 所以让位的判据改成"插件**这一轮**也写了"：插件给这条会话写的最新一行如果比源里最新那一轮
-   * 还旧、且已经过了宽限期（PLUGIN_SILENT_MS），就认为通道断了，把这条会话收回来（补记见 ②b）。
+   * 所以让位的判据改成"插件**这一轮**也写了没有"：它最新那一行落在源里最新这一轮起点之后
+   * （容许 PLUGIN_COVER_MS 的误差）→ 让位；否则这一轮刚起就再等 PLUGIN_GRACE_MS（本地回环，
+   * 正常 1 秒内落库），过了还不见它的行 → 认定通道断了，把这条会话收回来（补记见 ②b）。
    * 插件活着时每轮开跑就写一条，所以正常情况下这条永远不命中；万一它只是慢了（注册重试中），
    * 等它写上来那一刻让位又成立 —— 轮询自己写的行会被收掉（见下面循环里的让位分支），自愈。
+   * 宽限期**从这一轮的起点算**（不是"插件沉默多久"）：插件两轮之间本来就不写东西，沉默是常态。
    */
   const yieldsOf = (s) => {
-    const newestTheirs = pluginNewestOf(s);
-    if (!newestTheirs) return false;
+    const starts = pluginStartsOf(s);
+    if (!starts.length) return false;
     const rounds = roundsOf.get(s.id) || [];
     const last = rounds[rounds.length - 1];
     const roundStart = last ? Number(last.startedAt || 0) : 0;
-    if (roundStart > newestTheirs && now - roundStart > PLUGIN_SILENT_MS) return false;
-    return true;
+    // 比的是"最新那行是否落在这一轮起点之后"：插件那行可能比轮次起点早几十毫秒（实测 -87ms），
+    // 也可能晚（它自己取 Date.now()，agent 忙的时候迟一会儿）—— 两边都要容，所以减一个 COVER。
+    const newestTheirs = starts.reduce((m, p) => Math.max(m, p), 0);
+    if (newestTheirs >= roundStart - PLUGIN_COVER_MS) return true;
+    return now - roundStart <= PLUGIN_GRACE_MS;
   };
 
   /**
@@ -305,13 +324,13 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     count += 1;
 
     // ②b 从插件手里收回来时（它的通道断了，见 yieldsOf），把它断线期间漏掉的轮次补上：
-    // 判据是"比插件最新一行还新的那些轮"—— 它之前的老轮次插件自己报过，轮询不回溯历史
+    // 判据是"这一轮插件没报过"（按轮次起点对齐，见 coveredBy）—— 它报过的轮次轮询不回溯
     // （见文件头"只记当前这一轮"）；只有这里补，因为这是"本该有行、却一直没等到"的那几轮。
     // 已经写过行的（含上面刚写的最后一轮、以及插件亲手写的那几行）不动一根汗毛。
-    const newestTheirs = pluginNewestOf(s);
-    if (newestTheirs) {
+    const starts = pluginStartsOf(s);
+    if (starts.length) {
       for (const r of rounds.slice(0, -1)) {
-        if (Number(r.startedAt || 0) <= newestTheirs) continue;
+        if (coveredBy(starts, r.startedAt)) continue;
         const rid = `${prefix}:${r.index}`;
         if (sessionRuns.some((x) => String(x.id) === rid)) continue;
         writeTurnRun(repo, {

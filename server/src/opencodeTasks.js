@@ -26,11 +26,16 @@ const { listOpencodeSessions, readOpencodeTurns } = require('./opencode');
 const SYNC_INTERVAL_MS = 5_000;
 
 /**
- * 插件那一路"还活着"的宽限期（见下面的 yieldsOf，与 kiloTasks.js 同名同值）。
- * 插件每开一轮就立刻写一条台账（收到用户消息 1 秒内 task/start），所以"源里最新那一轮
- * 比插件最新一行还新" + 过了这个宽限期，就说明它的上报通道断了 —— 该由轮询收回来。
+ * 插件那一路"还活着"的两个时间参数（与 kiloTasks.js 同名同值，理由见那边的常量注释）。
+ *
+ * PLUGIN_GRACE_MS —— 一轮刚起的头几秒先不抢（插件本地回环，正常 1 秒内就落库）。
+ *   短是必须的：它量的是"插件还没写上来"这段窗口，窗口多长用户那一轮就在列表里消失多久
+ *   （实测 60 秒时，一条 8 秒的任务整轮都看不见）。
+ * PLUGIN_COVER_MS —— 判"这一轮插件报过没有"时，插件那行的 started_at 与轮次起点允许的差
+ *   （实测 ±90ms 内、方向不定；判漏了会多写一条孪生行，判重了会把两秒内连开两轮当同一轮）。
  */
-const PLUGIN_SILENT_MS = 60_000;
+const PLUGIN_GRACE_MS = 3_000;
+const PLUGIN_COVER_MS = 2_000;
 
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'opencode:';
@@ -119,9 +124,12 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   /** 这条会话现在算不算在跑（还有一轮没收工） */
   const isActiveOf = (s) => (turnsOf.get(s.id) || []).some((t) => !t.endedAt);
 
-  /** 插件给这条会话写的最新一行的时刻（没写过 → 0） */
-  const pluginNewestOf = (s) =>
-    runsOf.get(s.id).reduce((m, r) => (String(r.id).startsWith(TASK_ID_PREFIX) ? m : Math.max(m, Number(r.started_at || 0))), 0);
+  /** 插件给这条会话写的那些行（服务端发的 `k_*`）各自报的轮次起点；没写过 → [] */
+  const pluginStartsOf = (s) =>
+    runsOf.get(s.id).filter((r) => !String(r.id).startsWith(TASK_ID_PREFIX)).map((r) => Number(r.started_at || 0));
+
+  /** 插件**为这一轮**写过行没有：按轮次起点对齐（容许 PLUGIN_COVER_MS 的误差，理由见常量） */
+  const coveredBy = (starts, at) => starts.some((p) => Math.abs(p - Number(at || 0)) <= PLUGIN_COVER_MS);
 
   /**
    * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `opencode:*`）——
@@ -130,18 +138,21 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
    * **让位只在插件还在报的时候成立**（2026-09-30 起，与 kiloTasks.js 同口径）：插件写的行只
    * 证明它**曾经**在报 —— 它跟着 agent 进程活，通道断了（服务端重启换了随机 token，老进程里
    * 那份插件从此每条上报都 401 且完全无声）时，两路都不写，用户跑的轮次就凭空消失。
-   * 判据因此是"插件**这一轮**也写了没有"：它最新一行比源里最新那一轮还旧 + 过了宽限期
-   * （PLUGIN_SILENT_MS）→ 收回这条会话。插件活着时每轮开跑 1 秒内就写一条，正常永不命中；
-   * 它只是慢了（注册重试中）就先照旧让位，等它写上来让位重新成立、轮询自己的行被收掉（自愈）。
+   * 判据因此是"插件**这一轮**也写了没有"：它最新那一行落在源里最新这一轮起点之后
+   * （容许 PLUGIN_COVER_MS 的误差）→ 让位；这一轮刚起就再等 PLUGIN_GRACE_MS，过了还不见
+   * 它的行 → 收回这条会话。插件活着时每轮开跑 1 秒内就写一条，正常永不命中；它只是慢了
+   * （注册重试中）就先照旧让位，等它写上来让位重新成立、轮询自己的行被收掉（自愈）。
+   * 宽限期**从这一轮的起点算**（不是"插件沉默多久"）：插件两轮之间本来就不写东西，沉默是常态。
    */
   const yieldsOf = (s) => {
-    const newestTheirs = pluginNewestOf(s);
-    if (!newestTheirs) return false;
+    const starts = pluginStartsOf(s);
+    if (!starts.length) return false;
     const turns = turnsOf.get(s.id) || [];
     const last = turns[turns.length - 1];
     const turnStart = last ? Number(last.startedAt || 0) : 0;
-    if (turnStart > newestTheirs && now - turnStart > PLUGIN_SILENT_MS) return false;
-    return true;
+    const newestTheirs = starts.reduce((m, p) => Math.max(m, p), 0);
+    if (newestTheirs >= turnStart - PLUGIN_COVER_MS) return true;
+    return now - turnStart <= PLUGIN_GRACE_MS;
   };
 
   /**
@@ -195,8 +206,8 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     const turns = turnsOf.get(s.id) || [];
     if (!turns.length) continue;
     // 从断线插件手里收回来的会话：**插件报过的轮次它自己管**（那些行是 `k_*`），
-    // 只补它断线之后的（判据"比插件最新一行还新"，与 kiloTasks.js 的 ②b 同一口径）。
-    const newestTheirs = pluginNewestOf(s);
+    // 只补它断线之后的（判据"这一轮插件没报过"，与 kiloTasks.js 的 ②b 同一口径）。
+    const starts = pluginStartsOf(s);
 
     // 确保工程 & 成员存在（安静写入，不广播）
     bus.ensureProject(projectId, projectPath, null, 'report');
@@ -220,7 +231,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     let hbFilesJson = null;
     let running = false;
     for (const t of turns) {
-      if (newestTheirs && Number(t.startedAt || 0) <= newestTheirs) continue; // 插件报过的轮次不重复写
+      if (coveredBy(starts, t.startedAt)) continue; // 插件报过的轮次不重复写
       const id = `${prefix}:${t.index}`;
       // 改动文件：只认写工具（edit）碰过的；OpenCode 的输入是绝对路径，统一转工程相对
       const files = (t.files || [])

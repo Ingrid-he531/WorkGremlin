@@ -374,14 +374,46 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     Boolean(deadList.find((t) => t.id === 'kilo:kilo-sid-dead:1')) && Boolean(deadList.find((t) => t.id === 'kilo:kilo-sid-dead:2')),
     JSON.stringify(deadList.filter((t) => String(t.id).includes('kilo-sid-dead')).map((t) => [t.id, t.state])));
 
-  console.log('[5f-2] 7F：插件只是慢了（刚开跑、还没到宽限期）→ 照旧让位，不抢');
+  console.log('[5f-2] 7F：插件只是慢了（这一轮刚起、还没过宽限期）→ 照旧让位，不抢');
+  // 宽限期量的是"这一轮开跑到现在"（插件本地回环，正常 1 秒内就落库），不是"插件沉默多久"：
+  // 插件两轮之间本来就不写东西，沉默是常态，拿沉默当死会把正常会话全抢过来。
   const slowPlug = Date.now() - 3 * 60_000;
   const slowA = { index: 0, prompt: '插件那条', startedAt: slowPlug, endedAt: null, outcome: 'running', files: [], result: '' };
-  const slowB = { index: 1, prompt: '刚起的一轮', startedAt: Date.now() - 10_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  const slowB = { index: 1, prompt: '刚起的一轮', startedAt: Date.now() - 1_000, endedAt: null, outcome: 'running', files: [], result: '' };
   kiloRows = [{ id: 'kilo-sid-slow', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now(), title: '刚起的一轮', model: '', fileCount: 0, rounds: [slowA, slowB] }];
   repo.insertTask.run({ id: 'k_plugin_slow', projectId: 'p1', memberId: 'kilo@p1', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: slowPlug, endedAt: null });
   repo.upsertTaskRun.run({ id: 'k_plugin_slow', projectId: 'p1', memberId: 'kilo@p1', client: 'kilo', sessionId: 'kilo-sid-slow', form: 'cli', model: null, title: '插件那条', startedAt: slowPlug, baselineCommit: null });
   ok('还在宽限期里 → 一条都不写（插件那 1 秒内就会补上自己的行）', syncKiloTasks({ bus, repo }) === 0);
+
+  console.log('[5f-3] 7F：插件沉默了两个多小时 + 这一轮刚起 → 宽限期一过就收回来，别让整轮都看不见');
+  // 回归（2026-09-30 用户实测）：「输入 Prompt 后没看到任务，任务结束后一会才看到任务记录」。
+  // 那条会话的插件早就哑了（最后一次上报是 11:02，进程 11:00 起、之后 token 换过），
+  // 13:42:44 起的那一轮 **8 秒就结束了**（13:42:52），而宽限期按 60 秒算是**从这一轮起点**
+  // 起算的 —— 整轮都在宽限期里，轮询一行都不写（用户看着任务跑完、又等了 52 秒才看到那行）。
+  // 现在宽限期 3 秒：这一轮还在跑（8 秒）的时候行就写下去了。
+  const stalePlug = Date.now() - 160 * 60_000; // 插件最后报到的那一轮（两个多小时前）
+  const sT0 = { index: 0, prompt: '插件报过的老轮', startedAt: stalePlug, endedAt: stalePlug + 30_000, outcome: 'done', files: [], result: '做完了' };
+  const sT1 = { index: 1, prompt: '刚起的这一轮', startedAt: Date.now() - 8_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [{ id: 'kilo-sid-stale', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now() - 7_000, title: '刚起的这一轮', model: '', fileCount: 0, rounds: [sT0, sT1] }];
+  repo.insertTask.run({ id: 'k_plugin_stale', projectId: 'p1', memberId: 'kilo@p1', parentTaskId: null, title: '插件报过的老轮', state: 'done', progress: 1, startedAt: stalePlug, endedAt: stalePlug + 30_000 });
+  repo.upsertTaskRun.run({ id: 'k_plugin_stale', projectId: 'p1', memberId: 'kilo@p1', client: 'kilo', sessionId: 'kilo-sid-stale', form: 'cli', model: null, title: '插件报过的老轮', startedAt: stalePlug, baselineCommit: null });
+  const staleWrote = syncKiloTasks({ bus, repo });
+  ok('这一轮还在跑的时候就把行写下了（宽限期只有 3 秒）', staleWrote === 1 && Boolean(repo.getTaskRun.get('kilo:kilo-sid-stale:1')), `${staleWrote} / ${JSON.stringify(repo.getTaskRun.get('kilo:kilo-sid-stale:1'))}`);
+  const staleList = await get(`project=p1&client=${F7.join(',')}&limit=50`);
+  const stale = staleList.find((t) => t.id === 'kilo:kilo-sid-stale:1') || null;
+  ok('任务列表里看得到，而且是 running（不是等收工后才冒出来）', Boolean(stale) && stale.state === 'running', stale && stale.state);
+  ok('插件报过的老轮不重复写（按轮次起点对齐认"这一轮它报过没有"）', !repo.getTaskRun.get('kilo:kilo-sid-stale:0'));
+
+  console.log('[5f-4] 7F：插件那行比轮次起点早了几十毫秒 → 照样算"这一轮它报过"，不许并排多写一条');
+  // 回归：插件记的是它**看到消息**的时刻，轮次表记的是消息**落库**的时刻，实测差 ±90ms 且
+  // 方向不定（+34 / -87 / -14ms）。判据若写成"插件最新一行比这一轮起点新"，插件先落 87 毫秒
+  // 那条会话就会在宽限期后被我抢过来 → 同一轮两行（孪生行，而且它自己好不了：越判越不像）。
+  const twinStart = Date.now() - 120_000; // 这一轮早已过了宽限期（老口径下必被抢）
+  const twinRound = { index: 0, prompt: '插件先落的那一轮', startedAt: twinStart, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [{ id: 'kilo-sid-twin', project: 'p1', projectPath: '/tmp/p1', lastEventAt: Date.now(), title: '插件先落的那一轮', model: '', fileCount: 0, rounds: [twinRound] }];
+  repo.insertTask.run({ id: 'k_plugin_twin', projectId: 'p1', memberId: 'kilo@p1', parentTaskId: null, title: '插件先落的那一轮', state: 'running', progress: null, startedAt: twinStart - 87, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_plugin_twin', projectId: 'p1', memberId: 'kilo@p1', client: 'kilo', sessionId: 'kilo-sid-twin', form: 'cli', model: null, title: '插件先落的那一轮', startedAt: twinStart - 87, baselineCommit: null });
+  ok('轮询一条都不写（这一轮插件报过，早 87 毫秒也算）', syncKiloTasks({ bus, repo }) === 0, JSON.stringify(repo.getTaskRun.get('kilo:kilo-sid-twin:0')));
 
   console.log('[6] 9F：会话行说「在飞」→ 只有那一轮是 running（不受 2 分钟窗口影响）');
   // Copilot 自己的库整轮写完才落盘，只看 updated_at 会出现"跑着显示待命、跑完显示思考中"。
@@ -550,7 +582,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('比最后一轮靠后的那一行被收掉', !repo.getTaskRun.get('opencode:oc-sid-cut:2'), JSON.stringify(repo.getTaskRun.get('opencode:oc-sid-cut:2')));
   ok('新的最后一轮顶上来了', Boolean(repo.getTaskRun.get('opencode:oc-sid-cut:1')));
 
-  console.log('[7e] 8F：插件只是慢了（刚开跑、还没到宽限期）→ 照旧让位，不抢');
+  console.log('[7e] 8F：插件只是慢了（这一轮刚起、还没过宽限期）→ 照旧让位，不抢');
+  // 与 7F 的 [5f-2] 同口径：宽限期量的是"这一轮开跑到现在"，不是"插件沉默多久"。
   const graPlug = Date.now() - 3 * 60_000;
   opencodeRows = [
     {
@@ -562,13 +595,52 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       lastEventAt: Date.now(),
       turns: [
         { index: 0, prompt: '插件那条', startedAt: graPlug, endedAt: null, files: [] },
-        { index: 1, prompt: '刚起的一轮', startedAt: Date.now() - 10_000, endedAt: null, files: [] },
+        { index: 1, prompt: '刚起的一轮', startedAt: Date.now() - 1_000, endedAt: null, files: [] },
       ],
     },
   ];
   repo.insertTask.run({ id: 't_oc_grace', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: graPlug, endedAt: null });
   repo.upsertTaskRun.run({ id: 't_oc_grace', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-grace', form: 'cli', model: null, title: '插件那条', startedAt: graPlug, baselineCommit: null });
   ok('还在宽限期里 → 一条都不写（插件那 1 秒内就会补上自己的行）', syncOpencodeTasks({ bus, repo }) === 0);
+
+  console.log('[7f] 8F：插件沉默了两个多小时 + 这一轮刚起 → 宽限期一过就收回来（同 7F 的 [5f-3]）');
+  const ocStale = Date.now() - 160 * 60_000;
+  opencodeRows = [
+    {
+      id: 'oc-sid-stale',
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      title: '刚起的这一轮',
+      model: '',
+      lastEventAt: Date.now() - 7_000,
+      turns: [
+        { index: 0, prompt: '插件报过的老轮', startedAt: ocStale, endedAt: ocStale + 30_000, files: [], result: '做完了' },
+        { index: 1, prompt: '刚起的这一轮', startedAt: Date.now() - 8_000, endedAt: null, files: [] },
+      ],
+    },
+  ];
+  repo.insertTask.run({ id: 't_oc_stale', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件报过的老轮', state: 'done', progress: 1, startedAt: ocStale, endedAt: ocStale + 30_000 });
+  repo.upsertTaskRun.run({ id: 't_oc_stale', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-stale', form: 'cli', model: null, title: '插件报过的老轮', startedAt: ocStale, baselineCommit: null });
+  const ocStaleWrote = syncOpencodeTasks({ bus, repo });
+  ok('这一轮还在跑的时候就把行写下了（宽限期只有 3 秒）', ocStaleWrote === 1 && Boolean(repo.getTaskRun.get('opencode:oc-sid-stale:1')), `${ocStaleWrote} / ${JSON.stringify(repo.getTaskRun.get('opencode:oc-sid-stale:1'))}`);
+  ok('插件报过的老轮不重复写（按轮次起点对齐认"这一轮它报过没有"）', !repo.getTaskRun.get('opencode:oc-sid-stale:0'));
+
+  console.log('[7g] 8F：插件那行比轮次起点早了几十毫秒 → 照样算"这一轮它报过"（同 7F 的 [5f-4]）');
+  const ocTwinStart = Date.now() - 120_000; // 这一轮早已过了宽限期（老口径下必被抢）
+  opencodeRows = [
+    {
+      id: 'oc-sid-twin',
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      title: '插件先落的那一轮',
+      model: '',
+      lastEventAt: Date.now(),
+      turns: [{ index: 0, prompt: '插件先落的那一轮', startedAt: ocTwinStart, endedAt: null, files: [] }],
+    },
+  ];
+  repo.insertTask.run({ id: 't_oc_twin', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件先落的那一轮', state: 'running', progress: null, startedAt: ocTwinStart - 87, endedAt: null });
+  repo.upsertTaskRun.run({ id: 't_oc_twin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-twin', form: 'cli', model: null, title: '插件先落的那一轮', startedAt: ocTwinStart - 87, baselineCommit: null });
+  ok('轮询一条都不写（这一轮插件报过，早 87 毫秒也算）', syncOpencodeTasks({ bus, repo }) === 0, JSON.stringify(repo.getTaskRun.get('opencode:oc-sid-twin:0')));
 
   console.log('[8] /reporter-phase：楼层客户端是逗号串也要走对那条路（8F 回归）');
   // 回归（2026-09-28 实测）：route 里两条分支曾写成 `clientBase(client) === 'opencode' | 'kilo'`，
