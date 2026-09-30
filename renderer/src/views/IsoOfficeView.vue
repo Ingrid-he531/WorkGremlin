@@ -761,6 +761,8 @@ onBeforeUnmount(() => {
       <ConnectionBar bare class="status-hud" :connection="connection" :source="source" />
       <span class="sep" />
       拖拽平移 · 滚轮缩放 · 双击复位
+      <!-- 与前面操作说明之间也来一条竖线（和"相位来源"后面那条同一规格的 .sep） -->
+      <span class="sep" />
       <span class="legend"><i class="dot green" />项目专家</span>
       <span class="legend"><i class="dot blue" />用户专家</span>
     </div>

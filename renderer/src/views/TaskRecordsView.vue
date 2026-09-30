@@ -27,6 +27,10 @@ function floorClients(f) {
 function floorValue(f) {
   return floorClients(f).join(',');
 }
+/** 下拉条目文案：楼层号 + 产品名（"1F CodeBuddy"）；楼层号缺省时只给名字，不编造 */
+function floorText(f) {
+  return [f.id, f.name].filter(Boolean).join(' ');
+}
 /** 这条任务的 client 归哪个楼层（先精确命中，再按基名兜底认合并楼层） */
 function floorOfClient(c) {
   const k = String(c || '').toLowerCase();
@@ -383,8 +387,9 @@ async function saveRetention() {
       </select>
       <select v-model="tasks.filterClient" class="sel" aria-label="按楼层筛选">
         <option value="all">全部楼层</option>
-        <!-- 合并楼层（1F CodeBuddy）的值是逗号分隔的 client 串，服务端按集合取（见 query.js） -->
-        <option v-for="f in floorOptions" :key="f.id" :value="floorValue(f)">{{ f.name }}</option>
+        <!-- 合并楼层（1F CodeBuddy）的值是逗号分隔的 client 串，服务端按集合取（见 query.js）；
+             条目文案带上楼层号（"1F CodeBuddy"）—— 只有产品名时认不出是哪层 -->
+        <option v-for="f in floorOptions" :key="f.id" :value="floorValue(f)">{{ floorText(f) }}</option>
       </select>
       <select v-model="filterState" class="sel" aria-label="按状态筛选">
         <option value="all">全部状态</option>
