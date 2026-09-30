@@ -23,8 +23,6 @@ const { listOpencodeSessions, readOpencodeTurns } = require('./opencode');
 const SYNC_INTERVAL_MS = 5_000;
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'opencode:';
-/** 插件那一路上报身份（products.js 里 8F 的第二路来源就是这个） */
-const PLUGIN_CLIENT = 'opencode-plugin';
 /** 这一层的上报身份：8F 由 sources 反推得到 ["opencode","opencode-plugin"]，轮询这一路是前者 */
 const CLIENT = 'opencode';
 
@@ -109,9 +107,11 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     const projectId = projectIdOf(s);
     const turns = readOpencodeTurns(s.id);
 
-    // 装了插件就让位（和 kiloTasks.js 同一口径）：插件那一路上报的是每一轮真值
+    // 装了插件就让位（和 kiloTasks.js 同一口径）：插件那一路上报的是每一轮真值。
+    // 判据是"有没有不是 `opencode:` 前缀的行"（插件写的 id 是 `k_*`）—— 按 id 认而不是按
+    // client 认，因为 7F 那个同款判据按 client 判时从来没命中过（见 kiloTasks.js 的说明）。
     const sessionRuns = repo.taskRunsOfSession.all(s.id);
-    if (sessionRuns.some((r) => r.client === PLUGIN_CLIENT)) {
+    if (sessionRuns.some((r) => !String(r.id).startsWith(TASK_ID_PREFIX))) {
       for (const r of sessionRuns) if (String(r.id).startsWith(TASK_ID_PREFIX)) repo.deleteTaskRun(r.id);
       continue;
     }

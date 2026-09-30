@@ -47,9 +47,6 @@ const SYNC_INTERVAL_MS = 5_000;
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'kilo:';
 
-/** 插件那一路上报身份（products.js 里 7F 的第二路来源就是这个） */
-const PLUGIN_CLIENT = 'kilo-plugin';
-
 /** 这一层的上报身份：轮询这一路（7F 由 sources 反推得到 ["kilo","kilo-plugin"]，前者是它） */
 const CLIENT = 'kilo';
 
@@ -126,12 +123,38 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   const now = nowFn();
   let count = 0;
 
-  // 每条会话的逐轮清单只读一次，下面选 owner 和写台账都复用（读一次要扫 part 表，别读两遍）。
+  // 每条会话的逐轮清单**和**它现有的台账行各只读一次：让位判定、owner 选择、写台账三处都复用
+  // （逐轮清单要扫 message/part 表，别读两遍）。
   // "这一层现在算不算在跑"也直接由它推出（有没有 outcome==='running' 的轮）——
   // 收工窗口只留在 kilo.js 一处（ROUND_IDLE_MS），这里不再自己算时间窗。
   const roundsOf = new Map();
-  for (const s of sessions) roundsOf.set(s.id, readKiloRounds(s.id));
+  const runsOf = new Map();
+  for (const s of sessions) {
+    roundsOf.set(s.id, readKiloRounds(s.id));
+    runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
+  }
   const isActiveOf = (s) => (roundsOf.get(s.id) || []).some((r) => r.outcome === 'running');
+
+  /**
+   * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `kilo:*`）——
+   * 有就整条让位。判据用 id 前缀而不是 client，因为这里要问的是"这行是不是我写的"（见下面循环）。
+   */
+  const yieldsOf = (s) => runsOf.get(s.id).some((r) => !String(r.id).startsWith(TASK_ID_PREFIX));
+
+  /**
+   * 让位给插件的那条会话，插件是不是**冒我们这个身份、而且现在正跑着**？
+   * CLI 形态的插件（`kilo run`，没有 VS Code 环境变量）报的就是裸 `kilo` —— 同一个成员
+   * `kilo@<工程>`，见 plugin/index.js 的 resolveClient；只有 VS Code 扩展起的才是 `kilo-plugin`。
+   * 是的话这条工程的成员状态就先归插件写：轮询这一路连心跳都不碰 —— 否则 5s 一次轮询会把
+   * 插件刚写的相位覆盖成轮询视角下的旧状态（agent_status 谁最后写谁赢），现场就是相位来回跳。
+   * 只在那轮**还没收工**时让位（isActiveOf）：插件那条停下来了就把这一栏交回轮询，
+   * 否则同工程另一条（没装插件的老会话）真在跑时永远拿不到心跳，被判成「已取消」。
+   */
+  const pluginOwnsMember = new Set();
+  for (const s of sessions) {
+    if (!yieldsOf(s) || !isActiveOf(s)) continue;
+    if (runsOf.get(s.id).some((r) => String(r.client) === CLIENT)) pluginOwnsMember.add(projectIdOf(s));
+  }
 
   /**
    * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
@@ -143,6 +166,12 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   const activeByProject = new Map();
   const newestByProject = new Map();
   for (const s of sessions) {
+    // 让位的会话**不参与** owner 选择：它这一路根本不写心跳（见下面那个 continue），
+    // 把它算进来就会让同工程另一条真在跑的会话永远选不上 owner ——
+    // 那条任务在 agent_status 里找不到心跳，又被 query.js 的 CASE 判成「已取消」。
+    // 实测 2026-09-30：插件那条会话一出现（它比老会话新），老会话的状态就冻在上一次
+    // 写下的那一行上再也不刷新（成员卡心跳过期灰显、老会话里再开一轮就显示「已取消」）。
+    if (yieldsOf(s)) continue;
     const pid = projectIdOf(s);
     const prevNew = newestByProject.get(pid);
     if (!prevNew || Number(s.lastEventAt || 0) > Number(prevNew.lastEventAt || 0)) newestByProject.set(pid, s);
@@ -163,19 +192,29 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     // 还会把插件写的相位/成员状态覆盖回 thinking（收工了还显示"思考中"）。
     // 所以：这条会话已经有 plugin 行 → 整条跳过；自己上一轮抢在 plugin 前面写下的
     // 兜底行 → 收掉（只删自己前缀的 id，插件的行一根汗毛都不动）。
-    const sessionRuns = repo.taskRunsOfSession.all(s.id || '');
-    if (sessionRuns.some((r) => r.client === PLUGIN_CLIENT)) {
+    // 判据是"这个会话已经有插件写的行了"，不是"有没有 client === kilo-plugin 的行"。
+    // 插件写的 id 是 `k_*`，轮询写的是 `kilo:*` —— 用 id 前缀认，比认身份稳：
+    // 身份是插件**上报**的，而这里要问的是"这行是不是我写的"。早先按 client 判，
+    // 而插件那份的身份在修好之前根本不是 kilo-plugin（判出的是 kilo）→ 从不让位 →
+    // 同一个会话轮询与插件各写各的，同一轮在任务列表里出现两行（2026-09-30 实测）。
+    // runsOf 是上面读的那一份（那时还没写这一轮，所以下面 ③ 定稿不会误伤 lastId）
+    const sessionRuns = runsOf.get(s.id);
+    if (yieldsOf(s)) {
       for (const r of sessionRuns) if (String(r.id).startsWith(TASK_ID_PREFIX)) repo.deleteTaskRun(r.id);
       continue;
     }
 
     // ① 过渡期清扫：早先是"一条会话一行"，id 就是 `kilo:<会话id>`（没有轮序号）。
-    // 放在所有 continue **之前** —— 否则那些没有用户轮的会话（Kilo 一启动就落一条空会话）
+    // 让位那条路在上面自己就把这类行删了（它也带 `kilo:` 前缀）；走到这里的是没让位的会话，
+    // 所以这一步必须在这里做 —— 否则那些没有用户轮的会话（Kilo 一启动就落一条空会话）
     // 会把自己那条旧台账永远留在列表里。
     if (repo.getTaskRun.get(prefix)) repo.deleteTaskRun(prefix);
 
     const rounds = roundsOf.get(s.id) || [];
     if (!rounds.length) continue; // 没有用户轮（一句话都没说过）的会话不算任务，不落台账
+    // 轮序号 → 那一轮。**认 index 而不是数组下标**：id 里的序号是 kilo.js 落下的 `r.index`，
+    // 两者平时相等，但拿 index 问"源里还有没有这一轮"才是准的（见下面 ③b）。
+    const byIndex = new Map(rounds.map((r) => [r.index, r]));
 
     // 确保工程 & 成员存在（安静写入，不广播）
     bus.ensureProject(projectId, projectPath, null, 'report');
@@ -235,7 +274,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     for (const r of sessionRuns) {
       const idx = roundIndexOf(r.id, prefix);
       if (idx === null || idx >= last.index) continue;
-      const old = rounds[idx];
+      const old = byIndex.get(idx);
       if (!old) continue;
       writeTurnRun(repo, {
         id: r.id,
@@ -253,13 +292,29 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
+    // ③b 收掉"源里已经没有"的那几轮：轮次表缩短时（Kilo 清了消息 / 压过上下文），
+    // 那几行永远等不到自己的轮 —— 一直挂着 'running'，被 query.js 的 CASE 判成「已取消」，
+    // 在列表里当一条假任务躺着（老口径"一条会话一行"自己会盖掉，改成一轮一条之后不会了）。
+    // 判据是**这一轮还在不在源里**（byIndex），不是"序号比最后一轮小"—— 中间那几轮被删掉时
+    // 序号照样对得上，只有按 index 问才问得准。
+    // `rounds` 整个读空的情况上面已经 continue 了（不在这里删）：库改版读不出来时
+    // （见 kiloFloor 的 D1 用例）宁可留旧行，也不拿"读不出来"当"源里没有"把历史删掉。
+    for (const r of sessionRuns) {
+      const idx = roundIndexOf(r.id, prefix);
+      if (idx === null || byIndex.has(idx)) continue;
+      repo.deleteTaskRun(r.id);
+    }
+
     // ④ 心跳：活跃 → thinking，停下 → idle；task_id 必须指向**最后一轮**那条，
     // 否则 query.js 的 CASE 找不到心跳，会把正在跑的那条判成「已取消」。
     // 和 copilotTasks 同理：只在活跃时写 thinking，会话停掉后旧值会一直挂在库里，
     // 成员卡永远「思考中」。非活跃时补一条 idle，让状态跟着会话走。
     // 另外：**只由这个工程选中的那条会话写**（见上面 activeByProject 的说明），
     // 否则同工程别的会话会把心跳指到自己的任务上，运行中的那条被判成「已取消」。
-    const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
+    // 插件正冒我们这个身份在报、且那轮还没收工 → 这一栏整个让给它（见 pluginOwnsMember）。
+    const owner = pluginOwnsMember.has(projectId)
+      ? null
+      : activeByProject.get(projectId) || newestByProject.get(projectId);
     if (owner === s) {
       repo.upsertStatus.run({
         memberId,

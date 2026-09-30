@@ -283,6 +283,75 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('当前这一轮是 running', Boolean(now7) && now7.state === 'running', now7 && now7.state);
   ok('心跳改指新的一轮', taskIdOf('kilo@p1') === 'kilo:kilo-sid-active:1', taskIdOf('kilo@p1'));
 
+  console.log('[5c] 7F：插件在场就整条让位（会话里已有插件写的行 → 轮询不写自己的行）');
+  // 回归（2026-09-30 实测）：判据原先是「这个会话有没有 client === 'kilo-plugin' 的行」，
+  // 而插件那份**在修好形态判定之前报的是裸 kilo**（见 plugin/index.js 的 resolveClient）——
+  // 于是这个条件从来没命中过，轮询从不让位：同一轮插件与轮询各写一行
+  // （实测孪生行同 session、同标题，started_at 只差 5 毫秒）。
+  // 现在按 **id 前缀**认：插件写的是服务端发的 `k_*`，轮询写的是 `kilo:*` —— 问的是
+  // "这行是不是我写的"，而不是"对方自称是谁"，不再依赖对方身份判得对不对。
+  repo.insertTask.run({ id: 'k_plugin_1', projectId: 'p1', memberId: 'kilo-plugin@p1', parentTaskId: null, title: '插件写的那一行', state: 'running', progress: null, startedAt: r5c.startedAt, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_plugin_1', projectId: 'p1', memberId: 'kilo-plugin@p1', client: 'kilo-plugin', sessionId: 'kilo-sid-active', form: 'plugin', model: null, title: '插件写的那一行', startedAt: r5c.startedAt, baselineCommit: null });
+  ok('轮询一条都不写（这个会话已经有插件行）', syncKiloTasks({ bus, repo }) === 0);
+  ok(
+    '轮询自己此前写的那两行被收掉（不许与插件并存）',
+    !repo.getTaskRun.get('kilo:kilo-sid-active:0') && !repo.getTaskRun.get('kilo:kilo-sid-active:1'),
+    JSON.stringify([repo.getTaskRun.get('kilo:kilo-sid-active:0'), repo.getTaskRun.get('kilo:kilo-sid-active:1')])
+  );
+  ok('插件写的那一行纹丝不动（只删自己前缀的 id）', Boolean(repo.getTaskRun.get('k_plugin_1')));
+
+  console.log('[5d] 7F：让位的会话不参与 owner 选择（同工程那条真在跑的不能被判成「已取消」）');
+  // 回归（2026-09-30 实测）：owner 是在**全部**会话里选的，而让位那条这一路根本不写心跳 ——
+  // 于是让位会话只要更新（插件那条恰恰总是最新的），同工程另一条真在跑的会话就永远选不上
+  // owner：它的心跳停在上一刻，任务列表按 query.js 的 CASE 判成「已取消」，运行中的任务
+  // 在列表里凭空消失（实测：插件会话一出现，老会话的状态行就冻住不再刷新了）。
+  const dRun = { index: 0, prompt: '终端这条在跑', startedAt: Date.now() - 5_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  const dPlug = { index: 0, prompt: '插件那条', startedAt: Date.now() - 3_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [
+    { id: 'kilo-sid-d-run', project: 'p2', projectPath: '/tmp/p2', lastEventAt: Date.now() - 60_000, title: '终端这条在跑', model: 'kilo-auto/free', fileCount: 0, rounds: [dRun] },
+    { id: 'kilo-sid-d-plugin', project: 'p2', projectPath: '/tmp/p2', lastEventAt: Date.now(), title: '插件那条', model: '', fileCount: 0, rounds: [dPlug] },
+  ];
+  bus.ensureProject('p2', '/tmp/p2', null, 'report'); // 台账行有工程外键，先让工程存在
+  repo.insertTask.run({ id: 'k_plugin_d', projectId: 'p2', memberId: 'kilo-plugin@p2', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: dPlug.startedAt, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_plugin_d', projectId: 'p2', memberId: 'kilo-plugin@p2', client: 'kilo-plugin', sessionId: 'kilo-sid-d-plugin', form: 'plugin', model: null, title: '插件那条', startedAt: dPlug.startedAt, baselineCommit: null });
+  // stateOf / taskIdOf 那两个小工具是给 p1 写死的，这里问的是 p2 的成员卡
+  const cardP2 = () => (bus.buildSnapshot('p2').members.find((x) => x.memberId === 'kilo@p2') || {});
+  const hbP2 = () => (cardP2().task && cardP2().task.id) || '';
+  ok('让位那条不写轮询行，同工程另一条照写', syncKiloTasks({ bus, repo }) === 1);
+  ok('同工程在跑的那条照样拿得到心跳', hbP2() === 'kilo:kilo-sid-d-run:0', hbP2());
+  const two2 = await get(`project=p2&client=${F7.join(',')}&limit=50`);
+  const runD = two2.find((t) => t.id === 'kilo:kilo-sid-d-run:0') || null;
+  ok('它在任务列表里是 running（没被判成「已取消」）', Boolean(runD) && runD.state === 'running', runD && runD.state);
+
+  console.log('[5d-2] 7F：插件冒我们这个身份在报（CLI 形态）且那轮没完 → 成员状态整栏让给它');
+  // `kilo run` 里的插件报的是裸 `kilo`（同一个成员 kilo@工程，见 plugin/index.js 的
+  // resolveClient）—— 插件与轮询写的是同一条 agent_status，谁最后写谁赢。轮询 5s 一次，
+  // 不让开就会把插件刚写的相位覆盖成自己那份旧状态（现场：相位在两个值之间来回跳）。
+  repo.upsertTaskRun.run({ id: 'k_plugin_d', projectId: 'p2', memberId: 'kilo@p2', client: 'kilo', sessionId: 'kilo-sid-d-plugin', form: 'cli', model: null, title: '插件那条', startedAt: dPlug.startedAt, baselineCommit: null });
+  repo.upsertStatus.run({ memberId: 'kilo@p2', state: 'blocked', stateSince: 1, taskId: 'k_plugin_d', progress: null, currentFiles: null, lastHeartbeatAt: Date.now(), degraded: 0, source: 'report', updatedAt: Date.now() });
+  syncKiloTasks({ bus, repo });
+  ok('插件那份状态没被轮询覆盖', cardP2().state === 'blocked', cardP2().state);
+  // 插件那条收工后（不再有在飞的轮）这一栏交回轮询 —— 否则同工程别的会话永远没有心跳
+  dPlug.endedAt = dPlug.startedAt + 1_000;
+  dPlug.outcome = 'done';
+  syncKiloTasks({ bus, repo });
+  ok('插件那轮收工后，心跳交回轮询', hbP2() === 'kilo:kilo-sid-d-run:0', hbP2());
+
+  console.log('[5e] 7F：源里已经没有的那几轮被收掉（别再挂在 running 上冒充「已取消」）');
+  // 轮次表缩短时（Kilo 清了消息 / 压过上下文），比最后一轮靠后的行永远等不到自己的轮，
+  // 会一直挂在 'running' —— 任务列表按 query.js 的 CASE 显示成「已取消」，成了一条假任务。
+  const cutA = { index: 0, prompt: '第一轮', startedAt: Date.now() - 60_000, endedAt: Date.now() - 50_000, outcome: 'done', files: [], result: '' };
+  const cutB = { index: 1, prompt: '第二轮', startedAt: Date.now() - 40_000, endedAt: Date.now() - 30_000, outcome: 'done', files: [], result: '' };
+  const cutC = { index: 2, prompt: '第三轮', startedAt: Date.now() - 20_000, endedAt: null, outcome: 'running', files: [], result: '' };
+  kiloRows = [{ id: 'kilo-sid-cut2', project: 'p2', projectPath: '/tmp/p2', lastEventAt: Date.now(), title: '第三轮', model: '', fileCount: 0, rounds: [cutA, cutB, cutC] }];
+  syncKiloTasks({ bus, repo });
+  ok('最后一轮写下了', Boolean(repo.getTaskRun.get('kilo:kilo-sid-cut2:2')));
+  // 源里只剩两轮了（第三轮被清掉）
+  kiloRows = [{ ...kiloRows[0], rounds: [cutA, cutB] }];
+  syncKiloTasks({ bus, repo });
+  ok('比最后一轮靠后的那一行被收掉', !repo.getTaskRun.get('kilo:kilo-sid-cut2:2'), JSON.stringify(repo.getTaskRun.get('kilo:kilo-sid-cut2:2')));
+  ok('新的最后一轮顶上来了', Boolean(repo.getTaskRun.get('kilo:kilo-sid-cut2:1')));
+
   console.log('[6] 9F：会话行说「在飞」→ 只有那一轮是 running（不受 2 分钟窗口影响）');
   // Copilot 自己的库整轮写完才落盘，只看 updated_at 会出现"跑着显示待命、跑完显示思考中"。
   // sessions.js 从 VS Code 的 chat 索引 / 会话日志读出「这一轮在不在飞」并挂在会话行上
