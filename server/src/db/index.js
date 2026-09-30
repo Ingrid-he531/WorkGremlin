@@ -536,6 +536,27 @@ function createRepo(db) {
     /** 某条会话名下的全部台账行（7F 轮询兜底据此判断"插件是不是已经上报了真值"，见 kiloTasks.js） */
     // started_at 也要：kiloTasks 用它判断"插件这一轮写了没有"（见那里的 yieldsOf）
     taskRunsOfSession: db.prepare(`SELECT id, client, started_at FROM task_runs WHERE session_id = ?`),
+    /**
+     * 台账里**还没收工**的那条任务（`tasks.state = 'running'` 且没有 ended_at）。
+     *
+     * 用途只有一个：`agent_status.task_id`（一行一成员、只有一个槽位）该指着谁 —— 见 bus.js 的
+     * heartbeat（按会话认领）与 endTask（收工往外交接）。`ended_at IS NULL` 是冗余判据，写在这里
+     * 是为了防"state 被别处改回过 running"的老数据；两条按 project + 成员走
+     * idx_task_runs_session 前缀，会话那条再多一个 session_id。
+     */
+    liveTaskOfSession: db.prepare(`
+      SELECT t.id AS id FROM task_runs tr JOIN tasks t ON t.id = tr.id
+       WHERE tr.project_id = @projectId AND tr.member_id = @memberId AND tr.session_id = @sessionId
+         AND t.state = 'running' AND t.ended_at IS NULL
+       ORDER BY tr.started_at DESC LIMIT 1
+    `),
+    /** 同上，不限定会话：本成员**最新的**那条在飞任务（收工时交接槽位用） */
+    liveTaskOfMember: db.prepare(`
+      SELECT t.id AS id FROM task_runs tr JOIN tasks t ON t.id = tr.id
+       WHERE tr.project_id = @projectId AND tr.member_id = @memberId
+         AND t.state = 'running' AND t.ended_at IS NULL
+       ORDER BY tr.started_at DESC LIMIT 1
+    `),
     insertSubagentRun: db.prepare(`
       INSERT INTO subagent_runs
         (project_id, parent_task_id, task_id, member_id, name, client, model, title, started_at)

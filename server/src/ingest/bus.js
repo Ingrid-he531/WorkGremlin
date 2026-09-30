@@ -277,13 +277,36 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
 
     const prev = repo.getStatus.get(id);
-    const state = AGENT_STATES.includes(p.state) ? p.state : prev ? prev.state : 'online';
+    /**
+     * 这条会话**自己**还没收工的那条任务（没有 → null）。
+     *
+     * 心跳是"这条会话还活着"最直接的证据，而槽位（`agent_status.task_id`）是**一行一成员、
+     * 只有一个**：同产品的两条会话同时在跑时，槽位归"最后一个 `/task/start` 的会话"。先收工的
+     * 那条会话 `/task/end` 时，因为"别的会话还活着"整块跳过这次状态写入（见
+     * keepStateForOtherSession）—— 槽位就停在**它自己已经结束的**任务上，**还在跑**的那条在
+     * `/task-runs` 的存活判定里找不到匹配行，于是显示「已取消」。实测 2026-09-30 14:03 的
+     * Kilo CLI（两条会话：13:58 那条一直显示已取消，槽位指着 14:03 那条已经结束的）。
+     *
+     * 所以心跳顺带**认领**槽位：带 taskId 的上报仍以 taskId 为准（优先级 1，见 nextTaskSlot），
+     * 没带就写自己这条在飞的任务。它也是这套判定的自愈口 —— 槽位因为任何原因指歪了，
+     * 下一次心跳就掰回来，不必等新任务开始。
+     */
+    const mine = liveTaskOf(project, id, p.sessionId);
+    const state = AGENT_STATES.includes(p.state)
+      ? p.state
+      : // 认领到在飞任务、槽位却挂在 idle/offline 上 = "任务在跑、成员空闲"，存活判定照样
+        // 看不见它（判据要求 busy/thinking/blocked）→ 一起抬成 busy。只抬这两种，别的照旧。
+        mine && prev && (prev.state === 'idle' || prev.state === 'offline')
+        ? 'busy'
+        : prev
+          ? prev.state
+          : 'online';
 
     repo.upsertStatus.run({
       memberId: id,
       state,
       stateSince: ts,
-      taskId: p.taskId ?? (prev ? prev.task_id : null),
+      taskId: p.taskId ?? mine ?? (prev ? prev.task_id : null),
       progress: Number.isFinite(p.progress) ? p.progress : prev ? prev.progress : null,
       currentFiles: p.files ? jsonOrNull(p.files) : prev ? prev.current_files : null,
       lastHeartbeatAt: ts,
@@ -378,6 +401,24 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    * @param {any} p 上报体
    * @returns {string|null}
    */
+  /**
+   * 台账里**还没收工**的那条任务是哪条 —— 心跳与收工据此决定成员行的 task_id 槽位。
+   *
+   * 给了 `sessionId` 就只看这条会话名下的（心跳用：会话自己的在飞任务最准，见 heartbeat）；
+   * 没给就看本成员最新的那条（收工往外交接用，见 endTask）。查不到 / 读库报错都回 null：
+   * 宁可不动槽位，也不能让上报因为这里报错被打挂。
+   */
+  function liveTaskOf(project, memberId, sessionId) {
+    try {
+      const args = { projectId: project, memberId };
+      const sid = normSession(sessionId);
+      const row = sid ? repo.liveTaskOfSession.get({ ...args, sessionId: sid }) : repo.liveTaskOfMember.get(args);
+      return row ? row.id : null;
+    } catch {
+      return null;
+    }
+  }
+
   function nextTaskSlot(prev, p) {
     const prevTask = prev ? prev.task_id : null;
     const own = prevTask ? taskOwnedBy(prevTask, p.sessionId) : null;
@@ -517,6 +558,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const state = ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done';
 
     repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
+    const prev = repo.getStatus.get(member.id);
     // 收工要把成员压回 idle；但同产品的别的会话还在跑时不能压（否则 B 干着活、卡片显示空闲，
     // 而且 taskId / currentFiles 会被清空、把 B 的任务卡一起擦掉）。见 keepStateForOtherSession。
     if (!keepStateForOtherSession('idle', member, p)) {
@@ -527,6 +569,37 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         taskId: null,
         progress: null,
         currentFiles: null,
+        lastHeartbeatAt: ts,
+        degraded: 0,
+        source: 'report',
+        updatedAt: ts,
+      });
+    } else {
+      /**
+       * 还有别的会话在跑 → 不压 idle，但槽位**不能就这么留着**。
+       *
+       * 槽位只有一个、归"最后一个 `/task/start` 的会话"：这次收工的会话如果正是那个（同产品两条
+       * 会话同时在跑时就是如此），槽位会停在**它自己已经结束的**任务上 —— 还在跑的那条在
+       * `/task-runs` 的存活判定里找不到匹配行，显示「已取消」（实测 2026-09-30 14:03 Kilo CLI：
+       * 13:58 起的那条整轮显示已取消，槽位指着 14:03 那条刚结束的）。原来的写法整块跳过这次写入
+       * （本意是保住"还在跑的那条会话"的 taskId/currentFiles），但那个前提不成立：槽位里的
+       * taskId 是**收工这条**的，不是还在跑那条的。
+       *
+       * 所以按台账把槽位**交接**给本成员还没收工的最新那条任务；台账里一条都没有（别的会话只在
+       * hook 状态文件里活着、还没写台账）→ 清空槽位，宁可空着也不要指错。
+       *
+       * state 一般保持原样（那条会话的相位由它自己的心跳写，这里不越权改）；只有交接成功、
+       * 而槽位挂在 idle/offline 上时才抬成 busy —— 与 heartbeat 的认领同一条理由：
+       * "任务在跑、成员空闲"在 `/task-runs` 的存活判定里照样看不见。
+       */
+      const next = liveTaskOf(project, member.id, '');
+      repo.upsertStatus.run({
+        memberId: member.id,
+        state: next && prev && (prev.state === 'idle' || prev.state === 'offline') ? 'busy' : prev ? prev.state : 'busy',
+        stateSince: prev ? prev.state_since : ts,
+        taskId: next,
+        progress: prev ? prev.progress : null,
+        currentFiles: prev ? prev.current_files : null,
         lastHeartbeatAt: ts,
         degraded: 0,
         source: 'report',
