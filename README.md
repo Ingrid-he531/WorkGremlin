@@ -1,16 +1,15 @@
 # WorkGremlin
 
-可视化桌面程序：管理 / 监控多 agent 协作团队（leader / researcher / coder / tester）。
+可视化桌面程序：管理 / 监控多 agent, subagents, 记录任务，使用模型和Agent。
 
 两个核心界面：
 
-1. **工位视图** —— 每个成员一张工位卡片：状态（在线/忙碌/空闲/阻塞/离线）、当前任务、进度、正在读写的文件、最近产出、已耗时，自动刷新。
-2. **对话记录窗口** —— 全量消息流（谁→谁、时间、类型、内容），支持按成员/时间/类型过滤、关键字搜索、自动跟随滚动。
+1. **工位视图** —— 每个成员一张工位卡片：状态（忙碌/空闲/）、当前任务、调用工具、正在读写的文件、最近产出、耗时，自动刷新。
 
 ## 快速开始
 
 ```bash
-# 0) 前置：Node >= 20.11，Linux 需 python3 + make + g++（编译 better-sqlite3）
+# 0) 前置：Node >= 24.x，Linux 需 python3 + make + g++（编译 better-sqlite3）
 node -v && npm -v && python3 --version && which make g++
 
 # 1) 安装依赖（postinstall 会自动跑 electron-rebuild 重建 better-sqlite3）
@@ -20,7 +19,7 @@ npm install
 npm run db:check
 
 # 3) 开发启动（Vite + Electron）—— 一律接真实数据源
-npm run dev
+npm run launch
 #    想看演示数据：起完之后在办公室右下角操作条上点「演示模式」（在「集合开会」左边），
 #    再点一次「退出演示」即回到进演示前的工程
 
@@ -73,8 +72,6 @@ node scripts/subagents.js list
 
 对齐语义是「**清单里有谁，屋里就飘着谁**」：`rm` 之后幽灵当场散掉（连状态行一起删，历史消息保留），
 服务启动时也会先清一遍上一轮残留的临时成员，避免幽灵赖着不走。
-
-清单文件路径：`$WORKGREMLIN_SUBAGENTS_FILE` > `$WORKGREMLIN_WORKSPACE/.workgremlin/subagents.json` > `<cwd>/.workgremlin/subagents.json`。
 
 ## CodeBuddy / WorkBuddy / Claude Code 接入（hook）
 
@@ -221,23 +218,7 @@ Qoder 的 hook 与 Claude / CodeBuddy **同源**（`settings.json` + `hooks` 事
 npm run hooks:install                      # 一并写 ~/.qoder/settings.json
 npm run hooks:install -- --targets=qoder  # 只装 Qoder
 ```
-
-- **CLI 与插件合并（不拆层）**：Qoder 的 CLI 与插件（如 `qoder-context`）共用同一份 `~/.qoder` 配置、
-  同一套 hook（`enabledPlugins` 里启用，hook 写在 `~/.qoder/settings.json`，CLI 与插件同吃）、
-  同一个落盘目录（`~/.qoder/projects/<工程>/<会话>.jsonl`），分不出，所以 6F 只有一层。
-- **会话两路来源**：① 落盘 transcript（`~/.qoder/projects/...`）走 `cli` 来源扫描，文件名即 `session_id`、
-  工程路径从每行 `cwd` 解析（Claude Code 同款格式）；② reporter 状态文件兜底（JSONL 还没写/读不出时，
-  hook 那一路照常列会话并提供实时相位）。两路按 `session_id` 去重（cli 有活会话就撤掉 hook 行）。
-- **事件表暂用最宽覆盖**：Qoder 的真实 hook 事件名尚未确认，`scripts/install-hooks.js` 的
-  `QODER_EVENTS` 默认采用 Claude 风格（`PreToolUse` / `PostToolUse` 对所有工具都发，且带
-  `PermissionRequest` / `Notification` / `SubagentStop`）。若 Qoder 实际事件名不同，只需把
-  `QODER_EVENTS` 换成 `EVENTS` / `CODEX_EVENTS` 或自定义——不涉及 `hook.js` 逻辑。
-- **相位只有粗粒度**：Qoder 实测**只发 `SessionStart` / `SessionEnd`**，没有 `UserPromptSubmit` /
-  `PreToolUse` / `PostToolUse` 等细粒度事件（见 `~/.workgremlin/hooks/events.log` 与
-  `scripts/install-hooks.js` 的 `QODER_EVENTS` 注释）。所以 `hook.js` 对 `--agent qoder` 在这两个事件上
-  补「思考中 / 已完成」粗粒度相位（`packages/reporter/src/hook.js`），6F 不会再一直显示「未上报」；
-  相位精度比 Claude 粗——等 Qoder 开放细粒度事件后自动变细，无需改 hook 逻辑。
-
+-
 ### Kilo Code 接入（7F：轮询打底 + 插件给真相位与台账）
 
 **Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何
