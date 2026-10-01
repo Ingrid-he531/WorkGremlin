@@ -2,6 +2,7 @@
  * preload 桥接。Electron 内运行时用 window.workgremlin（真实端口+token）；
  * 浏览器 dev 模式下降级为同源 /api、/ws（由 vite proxy 转发）。
  */
+import { t } from '../i18n/index.js';
 
 export function hasBridge() {
   return typeof window !== 'undefined' && Boolean(window.workgremlin);
@@ -109,7 +110,7 @@ export async function chooseWorkspace() {
       /* 降级到 prompt */
     }
   }
-  const p = window.prompt('工程目录（绝对路径）');
+  const p = window.prompt(t('workspace.prompt'));
   return p ? p.trim() : null;
 }
 

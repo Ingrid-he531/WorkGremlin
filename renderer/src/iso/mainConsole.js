@@ -28,6 +28,9 @@ import {
   rgba,
 } from './iso';
 import { CONSOLE } from './officeMap';
+// 相位文案走 i18n（屏上第一行与 tooltip 第一行同源，见 consolePhaseLabel）。显式写 /index.js：
+// 画布模块也可能被 node 脚本直接 import（HMR / 自检），Node 不补扩展名。
+import { t } from '../i18n/index.js';
 
 /**
  * 屏幕第一层：相位表。busy 决定有没有光标 / 加载动画。
@@ -40,32 +43,32 @@ import { CONSOLE } from './officeMap';
  * 那两类信息改用「待命中 + 操作行说明」表达（见 mainAgent.enterPause / sessions.inferPhase）。
  */
 export const PHASES = {
-  idle: { label: '待命中', color: '#6b7c94', glow: 0.22, busy: false },
+  idle: { color: '#6b7c94', glow: 0.22, busy: false },
   /**
    * 未上报：这一层的 CLI 还没接 hook，只有会话文件时间可看 —— 不推断动作，
    * 也不假装它在调工具（以前会显示「调用工具 · 改 xxx.jsonl」，那是拿文件名编造）。
    */
-  unreported: { label: '未上报', color: '#6b7c94', glow: 0.18, busy: false },
-  thinking: { label: '思考中', color: '#ffcf5c', glow: 0.6, busy: true },
-  tool: { label: '调用工具', color: '#4c8dff', glow: 0.85, busy: true },
-  dispatch: { label: '委托专家', color: '#7fb0ff', glow: 1.0, busy: true },
+  unreported: { color: '#6b7c94', glow: 0.18, busy: false },
+  thinking: { color: '#ffcf5c', glow: 0.6, busy: true },
+  tool: { color: '#4c8dff', glow: 0.85, busy: true },
+  dispatch: { color: '#7fb0ff', glow: 1.0, busy: true },
   /** 任务完成：屏上写"任务完成"，剪影回到静观；内容第三层显示本次改动概要 */
-  done: { label: '任务完成', color: '#2fbf71', glow: 0.5, busy: false },
+  done: { color: '#2fbf71', glow: 0.5, busy: false },
   /**
    * 任务取消：用户按了 ESC / 停止，这一轮没干完就被掐掉 ——
    * 与 done 的区别只有两个：**红色**（不是"完成"那种绿）+ 屏上 / tooltip 写「任务取消」。
    * 第三层同样是"这一轮的产出"：动过文件就列文件，一个都没动就写「没有输出」
    * （见 IsoOfficeView 里 enterCancelled 那一段）。
    */
-  cancelled: { label: '任务取消', color: '#ff5c5c', glow: 0.5, busy: false },
+  cancelled: { color: '#ff5c5c', glow: 0.5, busy: false },
   /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
-  await: { label: '等待授权', color: '#f5a623', glow: 0.6, busy: false },
+  await: { color: '#f5a623', glow: 0.6, busy: false },
   /**
    * 等待 subagent 汇报：主会话还没收到 Stop，但活已经派出去了 ——
    * 既不是"待命中"（人还在这轮任务里），也不是自己正在干活，所以单开一个相位：
    * 屏上写"等待中"，并写出在等谁（见 IsoOfficeView 的 consoleLive）。
    */
-  waiting: { label: '等待中', color: '#5aa9ff', glow: 0.42, busy: false },
+  waiting: { color: '#5aa9ff', glow: 0.42, busy: false },
 };
 
 export const PHASE_LIST = Object.keys(PHASES);
@@ -75,14 +78,16 @@ const FONT = 'ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans
 /**
  * 屏上第一层 与 tooltip 第一行**共用的**相位文案（两处口径永远一致）。
  *
- * 一律取 PHASES 的原标签，不按工具名换文案：调用工具就写「调用工具」。
- * 工具名只说明"上一支调的是什么"，不足以说明"正在等授权" —— 命令类工具（Bash / Shell）
+ * 文案按相位 key 取（`phase.idle` / `phase.tool` …），中英两套在 i18n 的词条表里；
+ * 认不出的相位回落到「待命中」。一律按相位取词、**不按工具名换文案**：
+ * 工具名只说明"上一支调的是什么"，不足以说明"正在等授权"——命令类工具（Bash / Shell）
  * 以前会被换成「调用工具，需要授权」，既串到「任务完成」这些相位上（tool 字段残留），
  * 也让人以为卡住了。真正的授权信号由 await 相位单独表示，不靠工具名猜。
  * @param {{phase?:string}} state
  */
 export function consolePhaseLabel(state) {
-  return (PHASES[String((state && state.phase) || 'idle')] || PHASES.idle).label;
+  const key = String((state && state.phase) || 'idle');
+  return t(`phase.${PHASES[key] ? key : 'idle'}`);
 }
 
 /** 剪影：跟精灵同一套局部单位（70 ≈ 1.55 tile 高），坐着所以整体矮一截 */

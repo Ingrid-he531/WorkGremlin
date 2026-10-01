@@ -15,6 +15,7 @@ import AgentAvatar from './AgentAvatar.vue';
 import StatusBadge from './StatusBadge.vue';
 import { avatarOf, formatClock } from '@workgremlin/shared';
 import { currentTaskOf, currentTaskTitle, currentTaskStartedAt } from '../lib/memberTask';
+import { useI18n } from '../i18n';
 
 const props = defineProps({
   member: { type: Object, required: true },
@@ -25,18 +26,19 @@ const emit = defineEmits(['select']);
 const agentId = computed(() => props.member.memberId.split('@')[0]);
 const skin = computed(() => avatarOf(props.member.memberId));
 const state = computed(() => props.member.state);
+const { t } = useI18n();
 
 // 「当前任务」口径与其他卡片一致（见 lib/memberTask.js）：空闲时槽位里那条是**上一个任务**，
 // 不能留在屏幕上冒充当前任务。
 const task = computed(() => currentTaskOf(props.member));
-const title = computed(() => currentTaskTitle(props.member) || '空闲');
+const title = computed(() => currentTaskTitle(props.member) || t('card.idle'));
 // 屏幕上那条走条是**不确定**的（只在干活时爬，不表示完成度）——2026-09-29 之前它按
 // member.task.progress 画长度，但那个字段没有真值（全库只有 0 和 1，开工写 0、收工写 1，
 // 中间没人推进；详见 TaskRecordsView 里「进度」那一行的说明），画出来永远是空条或满条。
 // 所以这里只判断"在不在干活"，取值与主控制台一致（见 iso/mainConsole.js 的 PHASES.busy）。
 const running = computed(() => state.value === 'busy' || state.value === 'thinking');
 const fileText = computed(() =>
-  props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : '未上报文件'
+  props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : t('card.no_file')
 );
 /**
  * 两个时间点都用**绝对时刻**（MM-DD HH:mm）：开始 = 当前任务开工时刻，最近活跃 = 上一个任务收工时刻。
@@ -162,7 +164,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
              见 iso/mainConsole.js 里 ph.busy 那一段。 -->
         <div class="scr-bar"><i v-if="running" /></div>
         <div class="scr-file mono">{{ fileText }}</div>
-        <div v-if="state === 'blocked'" class="scr-alert">需要协助</div>
+        <div v-if="state === 'blocked'" class="scr-alert">{{ t('card.needs_help') }}</div>
       </div>
 
       <!-- 悬停/选中时的详情卡（小屏看不全，用这个补全信息） -->
@@ -170,8 +172,8 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
         <div class="peek-title">{{ title }}</div>
         <!-- 「进度 x%」已去掉（2026-09-29）：那个百分比是假的，只有 0% 和 100% 两种取值。
              时间点都写绝对时刻（不用相对时长，省掉每秒重算）：开始 / 最近活跃。 -->
-        <div v-if="task" class="peek-row dim">开始 {{ startAt }}</div>
-        <div v-else class="peek-row dim">最近活跃 {{ lastActiveAt }}</div>
+        <div v-if="task" class="peek-row dim">{{ t('card.started', { time: startAt }) }}</div>
+        <div v-else class="peek-row dim">{{ t('card.last_active', { time: lastActiveAt }) }}</div>
         <div v-if="member.currentFiles.length" class="peek-row mono">{{ member.currentFiles.join(' , ') }}</div>
       </div>
     </div>

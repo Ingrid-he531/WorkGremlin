@@ -10,7 +10,9 @@ import GremlinSprite from './GremlinSprite.vue';
 import GhostSprite from './GhostSprite.vue';
 import { avatarOf } from '@workgremlin/shared';
 import { isEphemeralMember } from '../lib/ephemeral';
+import { useI18n } from '../i18n';
 
+const { t } = useI18n();
 const props = defineProps({
   /** 成员名或 memberId（coder@workgremlin） */
   name: { type: String, required: true },
@@ -33,9 +35,9 @@ const ephemeral = computed(() => isEphemeralMember({ memberId: props.name }));
     :class="[`state-${state}`, { degraded, offline: isOffline }]"
     :style="{ '--body': skin.body, '--horn': skin.horn, width: `${size}px`, height: `${size}px` }"
     :data-testid="`avatar-${agentId}`"
-    :title="`${agentId} · ${state}${degraded ? ' (推断)' : ''}`"
+    :title="`${agentId} · ${state}${degraded ? ` (${t('status.tag_inferred')})` : ''}`"
   >
-    <svg viewBox="0 0 64 64" role="img" :aria-label="`${agentId} 的形象`">
+    <svg viewBox="0 0 64 64" role="img" :aria-label="agentId">
       <GhostSprite v-if="ephemeral" :name="name" :state="state" :degraded="degraded" />
       <GremlinSprite v-else :name="name" :state="state" :degraded="degraded" />
     </svg>

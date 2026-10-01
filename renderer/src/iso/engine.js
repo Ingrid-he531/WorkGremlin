@@ -44,6 +44,8 @@ import {
 } from './officeMap';
 import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from './sprites';
 import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator } from './mainConsole';
+// 画布上的文字（名牌、气泡、墙上标签）也走 i18n：每帧重绘，读到的是当前语言
+import { t } from '../i18n/index.js';
 
 const STATE_COLOR = {
   online: '#2ecc71',
@@ -60,7 +62,6 @@ const MAGNET = '#c3ccda';
 const LEVEL_COLOR = { user: '#3b82f6', project: '#22c55e' };
 const levelColor = (level) => LEVEL_COLOR[level] || '#7c8aa5';
 /** 对外只保留两档状态：忙碌 / 空闲 */
-const STATE_LABEL = { busy: '忙碌', idle: '空闲' };
 /** 后端的五种（+thinking）状态归并到这两档（busy / blocked / thinking 都算忙） */
 const bucketOf = (s) => (s === 'busy' || s === 'blocked' || s === 'thinking' ? 'busy' : 'idle');
 /** 忙碌时具体在干的事（只决定走路/钉座位，头顶标签不再显示细节） */
@@ -345,7 +346,7 @@ export function createIsoOffice(canvas, opts = {}) {
   function delegationLine() {
     const lines = Array.isArray(mainAgent.context) ? mainAgent.context : [];
     const hit = lines.find((t) => /委托|分配|交给|让他|让她|去/.test(t));
-    return String(hit || lines[0] || mainAgent.action || '新任务');
+    return String(hit || lines[0] || mainAgent.action || t('office.task_new'));
   }
 
   /** 入队一次召唤编排（小怪物跑去主 agent 面前领任务）。同一只不重复入队。 */
@@ -353,7 +354,7 @@ export function createIsoOffice(canvas, opts = {}) {
     if (!agentId) return;
     if (dispatch && dispatch.agentId === agentId) return;
     if (summonQueue.some((s) => s.agentId === agentId)) return;
-    summonQueue.push({ agentId, task: task || '新任务', ghostId });
+    summonQueue.push({ agentId, task: task || t('office.task_new'), ghostId });
   }
 
   /** 启动队列里的下一段编排（当前空闲时） */
@@ -374,7 +375,6 @@ export function createIsoOffice(canvas, opts = {}) {
       back: false,
       task: s.task,
       ghostId: s.ghostId || null,
-      reply: '收到',
     };
     dispatchGhost = {
       x: a.seat.x + 0.25,
@@ -418,7 +418,7 @@ export function createIsoOffice(canvas, opts = {}) {
     const res = String((r && r.result) || '').trim();
     if (res) return res;
     const task = String((r && r.task) || '').trim();
-    return task ? `已完成：${task}` : '已完成';
+    return task ? t('bubble.done_prefix', { task }) : t('bubble.done');
   }
 
   /** 入队一次收工汇报（同一轮召唤只报一次） */
@@ -657,7 +657,7 @@ export function createIsoOffice(canvas, opts = {}) {
             summonQueue.push({ agentId: info.agentId, task: m.task, ghostId: m.memberId });
             dispatchedGhostIds.add(m.memberId);
           } else if (pendingSeenOnce.has(m.memberId)) {
-            summonQueue.push({ agentId: info.agentId, task: '执行任务', ghostId: m.memberId });
+            summonQueue.push({ agentId: info.agentId, task: t('bubble.working'), ghostId: m.memberId });
             dispatchedGhostIds.add(m.memberId);
           }
         } else if (m.task) {
@@ -1992,7 +1992,7 @@ export function createIsoOffice(canvas, opts = {}) {
     // 茶水间标识：贴在这片南面玻璃朝镜头那一面（= 茶水间的北墙）。
     // 帘子分了段、各段 depth 不同，标识必须排在**所有帘段**之后：取这条玻璃最右端的 depth 再抬一点。
     push(depthOf(gs.x + gs.w, gs.y + gs.d) + 0.3, (c) => {
-      drawWallLabel(c, '茶水间', PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
+      drawWallLabel(c, t('wall.pantry'), PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
     });
 
     /* 茶水间 */
@@ -2178,7 +2178,7 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   function drawWalls(c) {
-    const t = WALL.thickness;
+    const th = WALL.thickness;
     const h = WALL.h;
 
     // 地板先画，墙压在上面
@@ -2197,8 +2197,8 @@ export function createIsoOffice(canvas, opts = {}) {
     // 所以留在背景层（放到最后画会糊住站在墙前的角色）。
     // 两端在房间的两个角上收口（x 到 ROOM.w、y 到 ROOM.d）：近侧那两面不砌墙，
     // 墙顶就到角为止，不再需要跟玻璃上沿对齐。
-    isoDiamond(c, { x: -t, y: -t, w: ROOM.w + t, d: t, z: h, fill: colors.wallTop });
-    isoDiamond(c, { x: -t, y: -t, w: t, d: ROOM.d + t, z: h, fill: shade(colors.wallTop, 0.92) });
+    isoDiamond(c, { x: -th, y: -th, w: ROOM.w + th, d: th, z: h, fill: colors.wallTop });
+    isoDiamond(c, { x: -th, y: -th, w: th, d: ROOM.d + th, z: h, fill: shade(colors.wallTop, 0.92) });
 
     // 踢脚线
     wallQuad(c, 'y', 0, 0, ROOM.w, 0, 0.12, shade(colors.wall, 0.75));
@@ -2367,7 +2367,7 @@ export function createIsoOffice(canvas, opts = {}) {
     // 会议室标识：贴在实心后墙（gy=0，与白板同面）上方，z 不超墙高 2.8。
     // 茶水间标识不在这里画：它那面墙（= 会议室南面玻璃）挂了百叶帘，
     // 而背景是先画的、帘子在排序层后画，会被压住 → 改到 buildStatics 里排到帘子之后。
-    drawWallLabel(c, '会议室', MEETING.x + MEETING.w / 2, 0, 2.4);
+    drawWallLabel(c, t('wall.meeting_room'), MEETING.x + MEETING.w / 2, 0, 2.4);
   }
 
   /**
@@ -2844,7 +2844,7 @@ export function createIsoOffice(canvas, opts = {}) {
       }
       if (a && gremA > 0.02) {
         const sp = toScreen(a.x, a.y, 0);
-        drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, dispatch.reply || '收到', gremA, a.color);
+        drawBubble(ctx, sp.x, sp.y - SPRITE_H * UNIT_Z * cam.zoom - 6, t('bubble.received'), gremA, a.color);
       }
     }
 
@@ -2877,8 +2877,8 @@ export function createIsoOffice(canvas, opts = {}) {
 
   /** 头顶只写状态：小怪物（被召唤的专家）只显示"忙碌"，具体在做什么交给小幽灵讲 */
   function tagText(a) {
-    if (a.mode === 'meet') return '会议中';
-    return bucketOf(stateOf(a.memberId)) === 'busy' ? '忙碌' : '空闲';
+    if (a.mode === 'meet') return t('tag.meeting');
+    return bucketOf(stateOf(a.memberId)) === 'busy' ? t('tag.busy') : t('tag.idle');
   }
 
   /**
@@ -2889,10 +2889,10 @@ export function createIsoOffice(canvas, opts = {}) {
    * 幽灵只在收工汇报那几秒用气泡说结果（见 reportText）。
    */
   function ghostTagText(g) {
-    if (g.inMeeting) return '旁听会议';
+    if (g.inMeeting) return t('tag.attending');
     const m = memberOf(g.memberId);
     const name = (m && m.name) || g.name || '';
-    return name || '临时成员';
+    return name || t('tag.temp_member');
   }
 
   /* ------------------------------ 交互 ------------------------------ */
@@ -3075,4 +3075,4 @@ export function createIsoOffice(canvas, opts = {}) {
   };
 }
 
-export { STATE_COLOR, STATE_LABEL };
+export { STATE_COLOR };

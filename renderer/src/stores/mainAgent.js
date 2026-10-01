@@ -27,6 +27,7 @@
 import { defineStore, acceptHMRUpdate } from 'pinia';
 // 相位文案只有一份实现：屏上第一行与 tooltip 第一行都走 consolePhaseLabel()，改口径只需动那一处。
 import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
+import { t } from '../i18n/index.js';
 
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
 const SCRIPT = [
@@ -136,7 +137,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.auto = false;
       clearTimeout(timer);
       timer = null;
-      this.enterPause('已暂停 · 等待下一步');
+      this.enterPause(t('console.paused'));
     },
 
     /** 手动跳一步（暂停状态下也能点，用来一个个阶段对着看） */
@@ -173,7 +174,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
         if (this.hookLive) {
           this.hookLive = false;
           // 任务完成：亮出"任务完成"概要（沿用最后上下文：本次改动的文件等），10s 后退回待命
-          this.enterDone('任务完成 · 等待下一步', this.context && this.context.length ? this.context.slice() : ['本次任务已完成']);
+          this.enterDone(t('console.done_wait'), this.context && this.context.length ? this.context.slice() : [t('console.this_task_done')]);
         }
         this.liveMember = null;
         return;
@@ -223,7 +224,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
         if (!this.live) return; // 本来就在跑脚本，别打搅
         this.live = false;
         // 会话取消：亮出"任务完成"概要（沿用最后上下文），10s 后退回待命
-        this.enterDone('任务完成 · 等待下一步', this.context && this.context.length ? this.context.slice() : ['本次任务已完成']);
+        this.enterDone(t('console.done_wait'), this.context && this.context.length ? this.context.slice() : [t('console.this_task_done')]);
         return;
       }
       this.auto = false;
@@ -246,8 +247,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * @param {string} summary 第二层动作文案（默认"任务完成 · 等待下一步"）
      * @param {string[]} [context] 第三层完成概要（如本次改动的文件、已交付的子任务）
      */
-    enterDone(summary = '任务完成 · 等待下一步', context = []) {
-      this.enterFinish('done', summary || '任务完成 · 等待下一步', context);
+    enterDone(summary = t('console.done_wait'), context = []) {
+      this.enterFinish('done', summary || t('console.done_wait'), context);
     },
 
     /**
@@ -258,8 +259,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * @param {string} summary 第二层动作文案
      * @param {string[]} [context] 第三层概要：取消前改过的文件；一个都没动就写「没有输出」
      */
-    enterCancelled(summary = '任务取消 · 等待下一步', context = []) {
-      this.enterFinish('cancelled', summary || '任务取消 · 等待下一步', context);
+    enterCancelled(summary = t('console.cancelled_wait'), context = []) {
+      this.enterFinish('cancelled', summary || t('console.cancelled_wait'), context);
     },
 
     /**
@@ -316,7 +317,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * 是对的；"已暂停"这三个字写在 tooltip 的操作行上。以前借 summarize（「汇总中」）
      * 当暂停的相位，看着像真有个"汇总"阶段（2026-10-01 去掉，见 iso/mainConsole.js 的 PHASES）。
      */
-    enterPause(summary = '已暂停 · 等待下一步') {
+    enterPause(summary = t('console.paused')) {
       clearTimeout(stopTimer);
       this.phase = 'idle';
       this.action = summary;

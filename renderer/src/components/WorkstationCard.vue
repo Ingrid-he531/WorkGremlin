@@ -3,6 +3,9 @@ import { computed } from 'vue';
 import StatusBadge from './StatusBadge.vue';
 import { formatClock } from '@workgremlin/shared';
 import { currentTaskOf, currentTaskStartedAt, currentTaskTitle } from '../lib/memberTask';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   member: { type: Object, required: true },
@@ -16,7 +19,7 @@ const currentTask = computed(() => currentTaskOf(props.member));
 /** 当前任务是否进行中（驱动"已耗时 / 最近活跃"的互斥显示） */
 const hasTask = computed(() => Boolean(currentTask.value));
 /** 这一栏常驻：没有当前任务时如实写「空闲」，不把上一次的任务留在卡片上 */
-const taskTitle = computed(() => currentTaskTitle(props.member) || '空闲');
+const taskTitle = computed(() => currentTaskTitle(props.member) || t('card.idle'));
 
 /** 短 id：coder@workgremlin -> coder（用于 data-testid，保证选择器稳定） */
 const agentId = computed(() => props.member.memberId.split('@')[0]);
@@ -31,15 +34,13 @@ const startAt = computed(() => formatClock(currentTaskStartedAt(props.member) ||
 const lastActiveAt = computed(() => formatClock(props.member.lastTaskAt) || '—');
 
 /** 角色文案：主 agent 与子代理在工位卡片上显示为中文；项目级 / 用户级子代理分开标注。 */
-const ROLE_LABELS = {
-  agent: '主代理',
-  'subagent:project': '项目子代理',
-  'subagent:user': '用户子代理',
-};
 const roleLabel = computed(() => {
   const r = props.member.role;
   if (!r) return '—';
-  return ROLE_LABELS[r] || (r === 'subagent' ? '用户子代理' : r);
+  if (r === 'agent') return t('card.role.agent');
+  if (r === 'subagent:project') return t('card.role.subagent_project');
+  if (r === 'subagent:user' || r === 'subagent') return t('card.role.subagent_user');
+  return r;
 });
 </script>
 
@@ -58,7 +59,7 @@ const roleLabel = computed(() => {
     </header>
 
     <div class="task">
-      <div class="label dim">当前任务</div>
+      <div class="label dim">{{ t('card.current_task') }}</div>
       <div class="task-title" :class="{ na: !hasTask }">{{ taskTitle }}</div>
       <!-- 进度条暂时去掉（2026-09-29）：task.progress 没有真值 —— 开工 0、收工 1，
            中间没人推进它（本机库 489 条任务全落在 {0,1}，见 TaskRecordsView「进度」那行），
@@ -68,14 +69,14 @@ const roleLabel = computed(() => {
     </div>
 
     <div v-if="isSubagent && member.description" class="subagent-desc" :data-testid="`seat-desc-${agentId}`">
-      <span class="dim">描述</span>
+      <span class="dim">{{ t('card.description') }}</span>
       <div class="desc-text">{{ member.description }}</div>
     </div>
 
     <footer>
-      <span v-if="hasTask" class="mono dim">开始 {{ startAt }}</span>
-      <span v-else class="mono dim">最近活跃 {{ lastActiveAt }}</span>
-      <span v-if="!member.reported" class="tag">被动观测</span>
+      <span v-if="hasTask" class="mono dim">{{ t('card.started', { time: startAt }) }}</span>
+      <span v-else class="mono dim">{{ t('card.last_active', { time: lastActiveAt }) }}</span>
+      <span v-if="!member.reported" class="tag">{{ t('card.passive') }}</span>
     </footer>
   </section>
 </template>

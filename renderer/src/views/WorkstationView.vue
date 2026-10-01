@@ -6,9 +6,11 @@ import { useSessionStore } from '../stores/sessions';
 import { isEphemeralMember } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
 import { clientBase } from '@workgremlin/shared';
+import { useI18n } from '../i18n';
 
 const project = useProjectStore();
 const sessions = useSessionStore();
+const { t } = useI18n();
 
 // 主 agent：成员名（剥 -plugin）等于其 client 基名（codebuddy / qoder / codex …），
 // 对应 hook 注册的那只"本层主 agent"；子代理（leo / peter / software-architect…）名与基名不同。
@@ -90,7 +92,7 @@ const mainAgentCard = computed(() => {
       <WorkstationCard v-for="m in sorted" :key="m.memberId" :member="m" />
     </div>
 
-    <p v-if="!mainAgentCard && !sorted.length" class="empty dim">本层暂无成员</p>
+    <p v-if="!mainAgentCard && !sorted.length" class="empty dim">{{ t('workstation.empty') }}</p>
   </div>
 </template>
 

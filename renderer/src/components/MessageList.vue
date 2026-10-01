@@ -1,6 +1,9 @@
 <script setup>
 import { nextTick, onMounted, ref, watch } from 'vue';
 import MessageRow from './MessageRow.vue';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   messages: { type: Array, required: true },
@@ -44,11 +47,11 @@ defineExpose({ scrollToBottom });
   <div class="wrap">
     <div ref="scroller" class="scroller" data-testid="conv-list" @scroll="onScroll">
       <MessageRow v-for="m in messages" :key="m.id" :message="m" />
-      <div v-if="!messages.length" class="empty dim">没有匹配的消息</div>
+      <div v-if="!messages.length" class="empty dim">{{ t('chat.empty') }}</div>
     </div>
 
     <button v-if="!autoFollow" class="jump" @click="emit('update:autoFollow', true) && scrollToBottom()">
-      ↓ 跟随最新
+      {{ t('list.follow') }}
     </button>
   </div>
 </template>

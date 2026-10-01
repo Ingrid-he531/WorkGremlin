@@ -1,9 +1,12 @@
 <script setup>
 import { ref, watch } from 'vue';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   modelValue: { type: String, default: '' },
-  placeholder: { type: String, default: '搜索消息内容…' },
+  placeholder: { type: String, default: '' },
 });
 
 const emit = defineEmits(['update:modelValue']);
@@ -29,7 +32,7 @@ watch(
     class="search"
     type="search"
     data-testid="search-input"
-    :placeholder="placeholder"
+    :placeholder="placeholder || t('chat.search_placeholder')"
   />
 </template>
 

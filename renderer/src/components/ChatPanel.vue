@@ -9,6 +9,9 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import AgentAvatar from './AgentAvatar.vue';
 import SearchBox from './SearchBox.vue';
 import { useMessageStore } from '../stores/messages';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
@@ -61,11 +64,11 @@ function pick(id) {
 <template>
   <aside class="panel" :class="{ collapsed }" data-testid="chat-panel">
     <header>
-      <button class="fold" :title="collapsed ? '展开对话' : '收起对话'" @click="emit('update:collapsed', !collapsed)">
+      <button class="fold" :title="collapsed ? t('chat.unfold') : t('chat.fold')" @click="emit('update:collapsed', !collapsed)">
         {{ collapsed ? '‹' : '›' }}
       </button>
       <template v-if="!collapsed">
-        <h2>沟通记录</h2>
+        <h2>{{ t('chat.title') }}</h2>
         <span class="dim count">{{ shown.length }} / {{ msgs.count }}</span>
       </template>
     </header>
@@ -74,7 +77,7 @@ function pick(id) {
       <div class="tools">
         <SearchBox :model-value="msgs.keyword" @update:model-value="msgs.setKeyword($event)" />
         <button v-if="selectedName" class="chip" @click="emit('clear-select')">
-          仅看 {{ selectedName }} ✕
+          {{ t('chat.only') }} {{ selectedName }} ✕
         </button>
       </div>
 
@@ -93,7 +96,7 @@ function pick(id) {
             <div class="meta">
               <span class="from">{{ short(m.fromMember) }}</span>
               <span class="arrow faint">→</span>
-              <span class="to">{{ m.toMember ? short(m.toMember) : '全员' }}</span>
+              <span class="to">{{ m.toMember ? short(m.toMember) : t('chat.to_all') }}</span>
               <span class="type">{{ m.type }}</span>
               <span class="ts mono faint">{{ time(m.tsMs) }}</span>
             </div>
@@ -101,11 +104,11 @@ function pick(id) {
             <div class="text">{{ m.content }}</div>
           </div>
         </div>
-        <p v-if="!shown.length" class="empty dim">没有匹配的消息</p>
+        <p v-if="!shown.length" class="empty dim">{{ t('chat.empty') }}</p>
       </div>
 
       <div v-if="msgs.pendingCount" class="pending" @click="msgs.setAutoFollow(true)">
-        {{ msgs.pendingCount }} 条新消息 · 点击回到底部
+        {{ t('chat.new_messages', { n: msgs.pendingCount }) }}
       </div>
     </template>
   </aside>

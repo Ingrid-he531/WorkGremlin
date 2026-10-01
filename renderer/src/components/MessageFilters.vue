@@ -1,6 +1,9 @@
 <script setup>
 import { computed } from 'vue';
 import { MESSAGE_TYPES } from '@workgremlin/shared';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   members: { type: Array, required: true },
@@ -27,7 +30,7 @@ function setRange(field, value) {
 <template>
   <div class="filters">
     <div class="group">
-      <span class="label dim">成员</span>
+      <span class="label dim">{{ t('filters.members') }}</span>
       <button
         v-for="m in members"
         :key="m.memberId"
@@ -41,14 +44,14 @@ function setRange(field, value) {
     </div>
 
     <div class="group">
-      <span class="label dim">起始</span>
+      <span class="label dim">{{ t('filters.since') }}</span>
       <input type="datetime-local" @change="setRange('since', $event.target.value)" />
-      <span class="label dim">截止</span>
+      <span class="label dim">{{ t('filters.until') }}</span>
       <input type="datetime-local" @change="setRange('until', $event.target.value)" />
     </div>
 
     <div class="group">
-      <span class="label dim">类型</span>
+      <span class="label dim">{{ t('filters.types') }}</span>
       <select
         multiple
         size="1"
@@ -63,7 +66,7 @@ function setRange(field, value) {
       </select>
     </div>
 
-    <button data-testid="filter-clear" @click="emit('clear')">清空过滤</button>
+    <button data-testid="filter-clear" @click="emit('clear')">{{ t('filters.clear') }}</button>
   </div>
 </template>
 

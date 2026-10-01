@@ -1,5 +1,8 @@
 <script setup>
 import { computed } from 'vue';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   connection: { type: Object, required: true },
@@ -11,17 +14,21 @@ const props = defineProps({
 
 /** 相位来源文案（演示脚本不是"真值"也不是"推断"，单列一项） */
 const sourceText = computed(() =>
-  props.source === 'demo' ? '演示脚本' : props.source === 'inferred' ? '推断值' : '上报真值'
+  props.source === 'demo'
+    ? t('conn.source.demo')
+    : props.source === 'inferred'
+      ? t('conn.source.inferred')
+      : t('conn.source.reported')
 );
 
 const text = computed(() => {
   switch (props.connection.state) {
     case 'open':
-      return '实时连接已建立';
+      return t('conn.connected');
     case 'connecting':
-      return '连接中…';
+      return t('conn.connecting');
     case 'closed':
-      return '连接断开，重连中…';
+      return t('conn.disconnected');
     default:
       return props.connection.state;
   }
@@ -38,7 +45,7 @@ const dotClass = computed(() => props.connection.state);
 
     <!-- 选中会话时给常驻的「相位来源」标识；没选会话时退回解释性图例 -->
     <span v-if="source" class="src">
-      相位来源：
+      {{ t('conn.source_label') }}：
       <b
         :class="{
           'src-infer': source === 'inferred',
@@ -50,8 +57,8 @@ const dotClass = computed(() => props.connection.state);
       </b>
     </span>
     <span v-else class="legend faint">
-      <i class="sw real" />上报真值
-      <i class="sw infer" />推断值
+      <i class="sw real" />{{ t('conn.source.reported') }}
+      <i class="sw infer" />{{ t('conn.source.inferred') }}
     </span>
   </div>
 </template>

@@ -8,8 +8,10 @@
 import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
 import { useProjectStore } from '../stores/project';
+import { useI18n } from '../i18n';
 
 const project = useProjectStore();
+const { t } = useI18n();
 
 const ROLES = ['leader', 'coder', 'researcher', 'tester', 'reviewer', 'ops'];
 const STATES = ['online', 'busy', 'idle', 'blocked', 'thinking', 'offline'];
@@ -29,7 +31,7 @@ function makeMember(i, state) {
     messageCount: 0,
     task:
       state === 'busy' || state === 'blocked' || state === 'thinking'
-        ? { id: role, title: '实现工位视图与对话记录窗口', progress: state === 'blocked' ? 0.34 : 0.62 }
+        ? { id: role, title: t('deskLab.demo_task'), progress: state === 'blocked' ? 0.34 : 0.62 }
         : null,
     currentFiles: state === 'busy' || state === 'thinking' ? ['renderer/src/components/DeskScene.vue', 'server/src/ingest/bus.js'] : [],
     artifacts: [],
@@ -43,10 +45,7 @@ const live = computed(() => project.members);
 
 <template>
   <div class="lab">
-    <p class="hint dim">
-      同一张工位的 5 种状态（大图用于看细节，下面一排是办公室里的真实尺寸）。
-      有真实数据时最下方会显示线上成员。
-    </p>
+    <p class="hint dim">{{ t('deskLab.hint') }}</p>
 
     <div class="big-row">
       <div v-for="m in big" :key="m.memberId" class="big-cell">
@@ -55,13 +54,13 @@ const live = computed(() => project.members);
       </div>
     </div>
 
-    <h3 class="sec">实际尺寸（办公室网格）</h3>
+    <h3 class="sec">{{ t('deskLab.real_size') }}</h3>
     <div class="grid">
       <DeskScene v-for="m in grid" :key="m.memberId" :member="m" />
     </div>
 
     <template v-if="live.length">
-      <h3 class="sec">线上成员（真实数据）</h3>
+      <h3 class="sec">{{ t('deskLab.online_members') }}</h3>
       <div class="grid">
         <DeskScene v-for="m in live" :key="m.memberId" :member="m" />
       </div>

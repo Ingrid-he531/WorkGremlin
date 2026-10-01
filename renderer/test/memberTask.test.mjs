@@ -12,6 +12,14 @@ const { currentTaskOf, currentTaskTitle, currentTaskStartedAt, isWorking, status
   '../src/lib/memberTask.js'
 );
 
+/**
+ * 状态牌文案走 i18n（2026-10-01 加了中/英切换）：这里锁**中文那一套**。
+ * 必须显式设一次 —— i18n 默认按浏览器语言猜，Node 的 navigator.language 是 en-US，
+ * 不设的话断言"忙碌/空闲"就会随环境挂掉（英文那套由 i18n 的词条表保证完整）。
+ */
+const { setLocale } = await import('../src/i18n/index.js');
+setLocale('zh');
+
 let pass = 0;
 let fail = 0;
 function ok(label, cond, extra = '') {

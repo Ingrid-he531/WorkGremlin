@@ -24,6 +24,9 @@
  */
 import { computed } from 'vue';
 import { useElevator } from '../composables/useElevator';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   /** 井道里的楼层，顺序就是井道顺序（= FloorSelector 的 products，与轿厢、高亮同一份来源） */
@@ -63,11 +66,11 @@ const arrow = computed(() => (direction.value === 'up' ? '▲' : direction.value
 const statusText = computed(() => {
   if (pendingFloor.value) {
     return phase.value === 'moving'
-      ? `正在前往 ${pendingFloor.value}`
-      : `当前 ${carFloor.value}，将前往 ${pendingFloor.value}`;
+      ? t('lcd.to_floor', { floor: pendingFloor.value })
+      : t('lcd.from_to', { from: carFloor.value, to: pendingFloor.value });
   }
-  if (!carFloor.value) return '电梯尚未就位';
-  return `当前 ${carFloor.value}`;
+  if (!carFloor.value) return t('lcd.not_ready');
+  return t('lcd.current', { floor: carFloor.value });
 });
 </script>
 

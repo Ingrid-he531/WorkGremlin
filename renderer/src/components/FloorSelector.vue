@@ -24,6 +24,9 @@
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useElevator } from '../composables/useElevator';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   products: { type: Array, default: () => [] },
@@ -159,7 +162,17 @@ watch(() => props.products, () => measure(), { flush: 'post' });
  * 避免和外层「落盘：」区头叠成"落盘：落盘 - …"。
  * 没有 'hook'：那一路在 tip() 里就被过滤掉了（没有落盘目录，列了没信息量）。
  */
-const SOURCE_LABEL = { cli: 'CLI', plugin: '插件', dir: '数据' };
+/**
+ * 一路来源的形态名。'CLI' / 'IDE' 不分语言；'plugin' / 'dir' 走 i18n
+ * （服务端下发的 label 可能是英文 'plugin'，见下面 sourceInfo 里的替换）。
+ */
+function sourceLabelOf(src) {
+  const kind = String((src && src.kind) || '');
+  if (kind === 'cli') return 'CLI';
+  if (kind === 'plugin') return t('floor.form_plugin');
+  if (kind === 'dir') return t('floor.kind_dir');
+  return kind || t('floor.kind_dir');
+}
 
 /**
  * 非插件形态的安装行名。多数产品的命令形态就叫 CLI；TraeCode 例外 —— 它的非插件
@@ -186,17 +199,17 @@ const TIP_INDENT = '  ';
  *   note   这一路取不到会话时的说明
  */
 function sourceInfo(src) {
-  const raw = src.label || SOURCE_LABEL[src.kind] || src.kind || '数据';
-  // 服务端下发的 label 里若含英文 Plugin，统一成中文「插件」——
-  // 覆盖 5F TraeCode 的 'plugin'，以及 3F Codex / 7F Kilo 的 'CLI/Plugin'（→ 'CLI/插件'）。
-  const label = raw.replace(/plugin/gi, '插件');
-  if (!src.dataPathLabel) return { label, detail: '没有找到数据目录', note: src.note || '' };
+  const raw = src.label || sourceLabelOf(src);
+  // 服务端下发的 label 里若含英文 Plugin，按当前语言换成「插件 / Plugin」——
+  // 覆盖 5F TraeCode 的 'plugin'，以及 3F Codex / 7F Kilo 的 'CLI/Plugin'。
+  const label = raw.replace(/plugin/gi, t('floor.form_plugin'));
+  if (!src.dataPathLabel) return { label, detail: t('floor.no_data_dir'), note: src.note || '' };
   const s = src.stats || {};
   const bits = [];
-  if (s.sessions) bits.push(`${s.sessions} 个会话文件`);
-  if (s.files) bits.push(`${s.files} 个文件`);
+  if (s.sessions) bits.push(t('floor.sessions_files', { n: s.sessions }));
+  if (s.files) bits.push(t('floor.n_files', { n: s.files }));
   if (s.sizeLabel) bits.push(s.sizeLabel);
-  if (s.lastModifiedAt) bits.push(`最后写入 ${new Date(s.lastModifiedAt).toLocaleString()}`);
+  if (s.lastModifiedAt) bits.push(t('floor.last_write', { time: new Date(s.lastModifiedAt).toLocaleString() }));
   return {
     label,
     detail: `${src.dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`,
@@ -230,9 +243,9 @@ function pushSection(lines, title, rows) {
  *     插件 - ~/.config/Code/User/globalStorage/tencent-cloud.coding-copilot（…）
  */
 function tip(p) {
-  const lines = [p.name, p.activeCount ? `活跃会话：${p.activeCount} 个` : '活跃会话：0 个'];
+  const lines = [p.name, t('floor.active_sessions', { n: p.activeCount || 0 })];
   if (!p.installed) {
-    lines.push('未安装');
+    lines.push(t('floor.not_installed'));
     return lines.join('\n');
   }
 
@@ -252,13 +265,14 @@ function tip(p) {
   if (installPaths.length) {
     const cli = installPaths.find((ip) => ip && ip.kind === 'cli');
     const plug = installPaths.find((ip) => ip && ip.kind === 'plugin');
-    const rows = [{ text: `${cliFormLabel(p)} - ${(cli && (cli.label || cli.path)) || '未找到'}` }];
-    if (hasPluginForm) rows.push({ text: `插件 - ${(plug && (plug.label || plug.path)) || '未找到'}` });
-    pushSection(lines, '安装', rows);
+    const missing = t('floor.not_found');
+    const rows = [{ text: `${cliFormLabel(p)} - ${(cli && (cli.label || cli.path)) || missing}` }];
+    if (hasPluginForm) rows.push({ text: `${t('floor.form_plugin')} - ${(plug && (plug.label || plug.path)) || missing}` });
+    pushSection(lines, t('floor.install'), rows);
   } else if (p.installPathLabel) {
-    pushSection(lines, '安装', [{ text: `${cliFormLabel(p)} - ${p.installPathLabel}` }]);
+    pushSection(lines, t('floor.install'), [{ text: `${cliFormLabel(p)} - ${p.installPathLabel}` }]);
   } else {
-    lines.push('安装：未找到');
+    lines.push(t('floor.install_not_found'));
   }
 
   // ---- 落盘：逐路列数据目录与统计 ----
@@ -275,7 +289,7 @@ function tip(p) {
   if (sources.length) {
     pushSection(
       lines,
-      '落盘',
+      t('floor.storage'),
       sources.map((src) => {
         const info = sourceInfo(src);
         return { text: `${info.label} - ${info.detail}`, note: isPollingDb(src) ? '' : info.note };
@@ -284,9 +298,9 @@ function tip(p) {
   } else if (p.dataPathLabel) {
     // 老服务端（没有 sources 字段）的兜底
     const info = sourceInfo({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats });
-    pushSection(lines, '落盘', [{ text: `数据 - ${info.detail}`, note: info.note }]);
+    pushSection(lines, t('floor.storage'), [{ text: `${t('floor.kind_dir')} - ${info.detail}`, note: info.note }]);
   } else {
-    lines.push('落盘：未找到数据目录');
+    lines.push(t('floor.storage_not_found'));
   }
   return lines.join('\n');
 }
@@ -296,10 +310,10 @@ function tip(p) {
 
 <template>
   <!-- data-phase 挂在这里：轿厢门缝线（.car::after）的"关门变亮 + 到点锁一下"要靠它驱动 -->
-  <aside ref="railEl" class="rail" :data-phase="phase" aria-label="楼层选择">
+  <aside ref="railEl" class="rail" :data-phase="phase" :aria-label="t('floor.title')">
     <!-- 顶格：与右侧"门楣+舞台留白"等高（--office-top 实测），让 1F 胶囊顶与办公室画面顶对齐 -->
     <div class="rail-head">
-      <header class="rail-title">楼层</header>
+      <header class="rail-title">{{ t('floor.title') }}</header>
     </div>
 
     <!-- 胶囊区：内容整体缩小 30%（scale 只影响这一区，标题不参与） -->

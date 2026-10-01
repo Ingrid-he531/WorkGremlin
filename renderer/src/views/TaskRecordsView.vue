@@ -15,10 +15,25 @@ import {
 } from '../lib/timeRange';
 import { DEFAULTS, clientBase } from '@workgremlin/shared';
 import { httpBase } from '../api/bridge';
+import { useI18n } from '../i18n';
+
+/**
+ * 打开时停在哪个视图（list / summary / board）。
+ * 只有默认值在真跑时用得上；SSR 冒烟测试（renderSmoke）靠它把汇总 / 看板那两个分支也渲染一遍 ——
+ * 否则那两块只有手点才走到，白屏类的问题（2026-10-01 汇总页整页空白）测不出来。
+ */
+const props = defineProps({
+  initialView: { type: String, default: 'list' },
+});
 
 const project = useProjectStore();
 const session = useSessionStore();
 const tasks = useTaskStore();
+/**
+ * 取个别名 `tr`：这个文件里 `t` 到处都是"一条任务"（`dimLabel(t, dim)`、`v-for="t in list"`、
+ * 模板里的行变量），用 `tr` 当翻译函数就永远不会被行变量遮住。
+ */
+const { t: tr } = useI18n();
 
 /** 一级检索的可选项：所有工程 + 所有楼层（楼层 = 成员 client） */
 const projectOptions = computed(() => project.projects || []);
@@ -163,9 +178,9 @@ function tokenQuadOf(t) {
 }
 /** 「词元」那一行的悬停说明：四个数各是什么（顺序与主行一致）+ 前三项的合计 */
 function tokenTitleOf(t) {
-  const head = '依次为：非缓存输入 / 缓存读输入 / 缓存写输入 / 输出';
+  const head = tr('records.tokens_order');
   const total = inputTotalOf(t);
-  return total == null ? head : `${head}（前三项合计 = 输入总量 ${fmtTokens(total)}）`;
+  return total == null ? head : tr('records.tokens_total', { head, n: fmtTokens(total) });
 }
 /**
  * 一条任务的**总词元** = 非缓存输入 + 缓存读输入 + 缓存写输入 + 输出（四项全加）。
@@ -179,9 +194,17 @@ function totalTokensOf(t) {
   if (parts.every((v) => v == null)) return null;
   return parts.reduce((s, v) => s + (Number(v) || 0), 0);
 }
-const STATE_LABEL = { all: '全部', pending: '待命', running: '运行中', done: '完成', failed: '失败', cancelled: '已取消' };
+/** 状态 key → i18n 词条（筛选项与表格里的状态列共用） */
+const STATE_KEY = {
+  all: 'records.state.all',
+  pending: 'records.state.pending',
+  running: 'records.state.running',
+  done: 'records.state.done',
+  failed: 'records.state.failed',
+  cancelled: 'records.state.cancelled',
+};
 function stateLabel(s) {
-  return STATE_LABEL[s] || s || '—';
+  return STATE_KEY[s] ? tr(STATE_KEY[s]) : s || '—';
 }
 /** 当前**没有调用方**：详情里那一行「进度」按 2026-09-29 的要求注释掉了（见模板里的说明），
  *  留着是为了将来有真进度时一行就能放回来。progress 现在只有 0 / 1 两个取值。 */
@@ -267,6 +290,20 @@ const keyword = ref('');
  * 不必另起定时器。
  */
 const filterTime = ref('all');
+/** 时间档位的文案（档位表在 lib/timeRange.js，文案在中英文案表里；认不出的 key 原样显示） */
+const TIME_KEY = {
+  all: 'records.time.all',
+  today: 'records.time.today',
+  yesterday: 'records.time.yesterday',
+  d7: 'records.time.d7',
+  d30: 'records.time.d30',
+  thisMonth: 'records.time.this_month',
+  lastMonth: 'records.time.last_month',
+  custom: 'records.time.custom',
+};
+function timeRangeLabel(key) {
+  return TIME_KEY[key] ? tr(TIME_KEY[key]) : String(key || '');
+}
 /** 自定义区间：两个 <input type="date"> 的值，本地 YYYY-MM-DD（空 = 那一端不设限） */
 const customFrom = ref('');
 const customTo = ref('');
@@ -278,11 +315,11 @@ function inTimeWindow(t) {
 
 /** 三个并列视图，共享上方筛选条件：列表视图（默认）/ 汇总报表 / 图形看板 */
 const VIEWS = [
-  { key: 'list', label: '列表视图' },
-  { key: 'summary', label: '汇总报表' },
-  { key: 'board', label: '图形看板' },
+  { key: 'list', label: 'records.view.list' },
+  { key: 'summary', label: 'records.view.summary' },
+  { key: 'board', label: 'records.view.board' },
 ];
-const view = ref('list');
+const view = ref(props.initialView);
 
 // 模型无专属下拉，留给“汇总报表”点行下钻时用的客户端筛选（默认空=不过滤，不影响列表视图现有逻辑）
 const filterModel = ref('');
@@ -317,12 +354,17 @@ watch(
  * 只是页签文案改成了「数据总览」—— key 是内部标识，跟着 CSV 分支与测试走，不改。
  */
 const DIMS = [
-  { key: 'time', label: '数据总览' },
-  { key: 'project', label: '按工程' },
-  { key: 'model', label: '按模型' },
-  { key: 'floor', label: '按楼层' },
+  { key: 'time', label: 'records.dim.time' },
+  { key: 'project', label: 'records.dim.project' },
+  { key: 'model', label: 'records.dim.model' },
+  { key: 'floor', label: 'records.dim.floor' },
 ];
-const DIM_COL = { project: '工程', model: '模型', floor: '楼层', time: '时间' };
+const DIM_COL = {
+  project: 'records.col.project',
+  model: 'records.col.model',
+  floor: 'records.dim.floor',
+  time: 'records.col.time',
+};
 /** 默认停在第一个维度（现在就是「数据总览」）—— 页签排在最前、打开也是它 */
 const reportDim = ref(DIMS[0].key);
 const reportSort = ref({ key: 'taskCount', dir: 'desc' });
@@ -338,12 +380,12 @@ function dimValue(t, dim) {
   return '';
 }
 function dimLabel(t, dim) {
-  if (dim === 'project') return (projectOptions.value.find((p) => p.id === t.project_id) || {}).name || t.project_id || '(未命名工程)';
-  if (dim === 'model') return t.model || '(未记录)';
+  if (dim === 'project') return (projectOptions.value.find((p) => p.id === t.project_id) || {}).name || t.project_id || tr('records.unnamed_project');
+  if (dim === 'model') return t.model || tr('records.unrecorded');
   if (dim === 'floor') {
     const f = floorOfClient(t.client);
     if (f) return f.name;
-    return t.client ? clientLabel(t.client) : '(未记录)';
+    return t.client ? clientLabel(t.client) : tr('records.unrecorded');
   }
   return '';
 }
@@ -388,7 +430,7 @@ const reportTotal = computed(() => {
     { taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 }
   );
   const avgDuration = a.durN ? a.durationSum / a.durN : 0;
-  return { label: '合计', taskCount: a.taskCount, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration, tokenSum: a.tokenSum, tokenN: a.tokenN };
+  return { label: tr('records.total'), taskCount: a.taskCount, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration, tokenSum: a.tokenSum, tokenN: a.tokenN };
 });
 const reportSorted = computed(() => {
   const rows = reportGroups.value.slice();
@@ -396,7 +438,7 @@ const reportSorted = computed(() => {
   if (key) rows.sort((x, y) => (dir === 'asc' ? x[key] - y[key] : y[key] - x[key]));
   return rows;
 });
-const dimColName = computed(() => DIM_COL[reportDim.value] || '维度');
+const dimColName = computed(() => tr(DIM_COL[reportDim.value] || 'records.dim.default'));
 function sortBy(key) {
   if (reportSort.value.key === key) reportSort.value.dir = reportSort.value.dir === 'asc' ? 'desc' : 'asc';
   else reportSort.value = { key, dir: 'desc' };
@@ -411,8 +453,9 @@ function sortCls(key) {
  * 标题原样铺开会把右边的客户端 / 模型 / 工程挤出去。完整标题挂在 title 上。
  * 用 [...s] 按**码点**切 —— 直接 slice 会把 emoji / 生僻字劈成半个，显出乱码。
  */
-function shortTitle(t, n = 10) {
-  const s = promptOf(t) || '(未命名任务)';
+function shortTitle(task, n = 10) {
+  // 注意参数名别叫 t：这个文件里 t 到处都是"一条任务"，翻译函数取的是 tr
+  const s = promptOf(task) || tr('records.untitled_task');
   const chars = [...s];
   return chars.length > n ? `${chars.slice(0, n).join('')}…` : s;
 }
@@ -494,10 +537,14 @@ function downloadCsv(fileName, lines) {
 /** 导出报表为 CSV（客户端下载，含当前排序与合计行；数据总览那一版导的就是逐条任务） */
 function exportCsv() {
   if (reportDim.value === 'time') {
-    const head = ['时间', '任务', '客户端', '模型', '工程', '词元', '时长(ms)', '状态'];
+    const head = [
+      tr('records.col.time'), tr('records.col.task'), tr('records.col.client'),
+      tr('records.col.model'), tr('records.col.project'), tr('records.col.tokens'),
+      `${tr('records.col.duration')}(ms)`, tr('records.col.state'),
+    ];
     const rows = timeRows.value.map((t) => [
       fmtTime(t.started_at),
-      promptOf(t) || '(未命名任务)', // 导出用完整标题，别把省略号也导出去
+      promptOf(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
       clientLabel(t.client, t.form),
       t.model || '',
       projectOf(t),
@@ -507,11 +554,15 @@ function exportCsv() {
       stateLabel(t.state),
     ]);
     // 文件名跟页签走（下面聚合那几版也是拿 label 拼的），改页签文案时这里要一起改
-    downloadCsv('汇总报表_数据总览.csv', [head, ...rows]);
+    downloadCsv(`${tr('records.view.summary')}_${tr('records.dim.time')}.csv`, [head, ...rows]);
     return;
   }
-  const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
-  const head = ['维度', '任务数', '成功数', '取消数', '改动文件数', '词元合计', '总耗时(ms)', '平均耗时(ms)'];
+  const dimLabelNow = tr((DIMS.find((d) => d.key === reportDim.value) || {}).label || 'records.dim.default');
+  const head = [
+    tr('records.dim.default'), tr('records.col.task_count'), tr('records.col.success_count'),
+    tr('records.col.cancel_count'), tr('records.col.file_count'), tr('records.col.token_sum'),
+    `${tr('records.col.duration_sum')}(ms)`, `${tr('records.col.avg_duration')}(ms)`,
+  ];
   // 词元导出**裸数字**（不带千位逗号，Excel 里才能直接算）；这一组没有真值就留空，不写 0
   const tokenCell = (x) => (x.tokenN ? x.tokenSum : '');
   const rows = reportSorted.value.map((r) => [
@@ -526,7 +577,7 @@ function exportCsv() {
     Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration),
   ];
   rows.push(totalLine);
-  downloadCsv(`汇总报表_${dimLabelNow}.csv`, [head, ...rows]);
+  downloadCsv(`${tr('records.view.summary')}_${dimLabelNow}.csv`, [head, ...rows]);
 }
 
 /* ------------------------------ 图形看板：每日 ------------------------------
@@ -545,7 +596,8 @@ function exportCsv() {
 function fmtDay(ms) {
   const d = new Date(ms);
   const p = (n) => String(n).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} 周${'日一二三四五六'[d.getDay()]}`;
+  const wd = tr('records.weekdays')[d.getDay()] || '';
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())}${wd ? ` ${wd}` : ''}`;
 }
 
 /** 一行的行高（px）：一层恒定一行，这个值同时决定行高与块高 */
@@ -562,7 +614,7 @@ const boardIsToday = computed(() => boardDay.value === dayStartOf(Date.now()));
 const boardDayRange = computed(() => dayRangeOf(timeWindow.value));
 /** 当前档位的文案（给灰掉的按钮写 title 用，让人知道是被哪个筛选卡住的） */
 const filterTimeLabel = computed(
-  () => (TIME_RANGES.find((r) => r.key === filterTime.value) || {}).label || ''
+  () => timeRangeLabel(filterTime.value)
 );
 /** 换档位 / 跨过午夜后，把停在窗外的这天拉回来 —— 否则画出来是一片空白，看着像坏了 */
 watch(
@@ -620,7 +672,7 @@ function onBoardDayInput(e) {
 function rowOfTask(t) {
   const f = floorOfClient(t.client);
   if (f) return { key: f.id, label: floorText(f), order: Number.parseInt(f.id, 10) || 900 };
-  if (!t.client) return { key: '__none__', label: '未记录楼层', order: 999 };
+  if (!t.client) return { key: '__none__', label: tr('records.no_floor'), order: 999 };
   // 有 client 但不在楼层表里（老数据 / 该产品没装）：如实标出是哪个 client，不硬塞进某层
   return { key: String(t.client), label: clientLabel(t.client, t.form), order: 900 };
 }
@@ -660,9 +712,9 @@ const boardNowPct = computed(() => {
 
 /** 块上的悬停提示：是哪条任务、几点到几点、多久、什么状态 */
 function blockTitle(it) {
-  const t = it.task;
-  const dur = t.duration_ms != null ? fmtDuration(t.duration_ms) : '未收工';
-  return `${promptOf(t) || '(未命名任务)'}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(t.state)}`;
+  const task = it.task;
+  const dur = task.duration_ms != null ? fmtDuration(task.duration_ms) : tr('records.unfinished');
+  return `${promptOf(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
 }
 /**
  * 重叠段的加深：同时跑 2 条加一档、3 条再加一档（最深压住，免得糊成一块黑）。
@@ -702,9 +754,9 @@ function cancelDelete() {
 function bulkDeleteAll() {
   const n = tasks.tasks.length;
   const shown = list.value.length;
-  const scope = `当前筛选（工程/楼层）下的全部 ${n} 条`;
-  const gap = shown < n ? `\n\n（列表上因状态/关键词/时间筛选只显示了 ${shown} 条，但删除按工程/楼层执行。）` : '';
-  if (!window.confirm(`将删除${scope}任务记录，含其 subagent 与产出，此操作不可撤销。${gap}\n确认？`)) return;
+  const scope = tr('records.delete_scope', { n });
+  const gap = shown < n ? `\n\n${tr('records.delete_scope_hint', { n: shown })}` : '';
+  if (!window.confirm(tr('records.delete_confirm_text', { scope, gap }))) return;
   tasks.deleteByFilter('all');
 }
 /**
@@ -723,7 +775,7 @@ async function loadRetention() {
 }
 async function saveRetention() {
   const ok = await tasks.saveRetention(retentionDays.value);
-  if (!ok) window.alert('保存保留天数失败');
+  if (!ok) window.alert(tr('records.retention_failed'));
 }
 </script>
 
@@ -732,37 +784,37 @@ async function saveRetention() {
     <!-- 筛选：一级（工程 + 楼层）+ 二级（状态分段）+ 标题搜索 + 计数，仅本页生效 -->
     <div class="filters">
       <span class="spacer" />
-      <select v-model="tasks.filterProject" class="sel" aria-label="按工程筛选">
-        <option value="all">全部工程</option>
+      <select v-model="tasks.filterProject" class="sel" :aria-label="tr('records.col.project')">
+        <option value="all">{{ tr('records.filter.project') }}</option>
         <option v-for="p in projectOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
       </select>
-      <select v-model="tasks.filterClient" class="sel" aria-label="按楼层筛选">
-        <option value="all">全部楼层</option>
+      <select v-model="tasks.filterClient" class="sel" :aria-label="tr('records.dim.floor')">
+        <option value="all">{{ tr('records.filter.floor') }}</option>
         <!-- 合并楼层（1F CodeBuddy）的值是逗号分隔的 client 串，服务端按集合取（见 query.js）；
              条目文案带上楼层号（"1F CodeBuddy"）—— 只有产品名时认不出是哪层 -->
         <option v-for="f in floorOptions" :key="f.id" :value="floorValue(f)">{{ floorText(f) }}</option>
       </select>
-      <select v-model="filterState" class="sel" aria-label="按状态筛选">
-        <option value="all">全部状态</option>
+      <select v-model="filterState" class="sel" :aria-label="tr('records.col.state')">
+        <option value="all">{{ tr('records.filter.state') }}</option>
         <option v-for="s in FILTER_STATES.filter((s) => s !== 'all')" :key="s" :value="s">{{ stateLabel(s) }}</option>
       </select>
       <!-- 时间筛选：口径 = 任务的开始时刻（见 timeWindow）。选「自定义」才露出两个日期框 -->
-      <select v-model="filterTime" class="sel" aria-label="按时间筛选">
-        <option v-for="r in TIME_RANGES" :key="r.key" :value="r.key">{{ r.label }}</option>
+      <select v-model="filterTime" class="sel" :aria-label="tr('records.col.time')">
+        <option v-for="r in TIME_RANGES" :key="r.key" :value="r.key">{{ timeRangeLabel(r.key, r.label) }}</option>
       </select>
       <template v-if="filterTime === 'custom'">
-        <input v-model="customFrom" class="day-input" type="date" aria-label="起始日期" />
+        <input v-model="customFrom" class="day-input" type="date" :aria-label="tr('records.filter.custom_from')" />
         <span class="dim">→</span>
-        <input v-model="customTo" class="day-input" type="date" aria-label="结束日期" />
+        <input v-model="customTo" class="day-input" type="date" :aria-label="tr('records.filter.custom_to')" />
       </template>
       <input
         v-model="keyword"
         class="search"
         type="search"
-        placeholder="搜索任务标题…"
-        aria-label="搜索任务标题"
+        :placeholder="tr('records.filter.keyword')"
+        :aria-label="tr('records.filter.keyword')"
       />
-      <span class="dim count">共 {{ list.length }} 次任务</span>
+      <span class="dim count">{{ tr('records.count', { n: list.length }) }}</span>
     </div>
 
     <!-- 三视图切换：共享上方筛选条件 -->
@@ -774,7 +826,7 @@ async function saveRetention() {
         class="view-tab"
         :class="{ on: view === v.key }"
         @click="view = v.key"
-      >{{ v.label }}</button>
+      >{{ tr(v.label) }}</button>
     </div>
 
     <div class="body" v-if="view === 'list'">
@@ -795,42 +847,42 @@ async function saveRetention() {
                 <button
                   type="button"
                   class="del-btn confirm"
-                  title="确认删除该任务记录"
+                  :title="tr('records.delete_confirm_title')"
                   @click.stop="askDelete(t)"
-                >确认删除</button>
+                >{{ tr('records.delete_confirm') }}</button>
                 <button
                   type="button"
                   class="del-btn"
-                  title="取消删除"
+                  :title="tr('records.delete_cancel_title')"
                   @click.stop="cancelDelete"
-                >取消</button>
+                >{{ tr('records.delete_cancel') }}</button>
               </template>
               <button
                 v-else
                 type="button"
                 class="del-btn"
-                title="删除该任务记录"
+                :title="tr('records.delete_title')"
                 @click.stop="askDelete(t)"
-              >删除</button>
+              >{{ tr('records.delete') }}</button>
             </span>
           </div>
-          <div class="row-title">{{ promptOf(t) || '(未命名任务)' }}</div>
+          <div class="row-title">{{ promptOf(t) || tr('records.untitled_task') }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
             <span v-if="t.client">{{ clientLabel(t.client, t.form) }}</span>
             <span v-if="t.model">{{ t.model }}</span>
             <span>{{ fmtDuration(t.duration_ms) }}</span>
-            <span v-if="t.file_count != null">{{ t.file_count }} 文件</span>
+            <span v-if="t.file_count != null">{{ tr('records.n_files', { n: t.file_count }) }}</span>
           </div>
         </li>
-        <li v-if="!list.length" class="empty-hint">暂无任务记录</li>
+        <li v-if="!list.length" class="empty-hint">{{ tr('records.list.empty') }}</li>
       </ul>
 
       <!-- 右：选中任务的详情 + 它的 subagent -->
       <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
-            <div class="detail-title">{{ promptOf(tasks.selectedTask) || '(未命名任务)' }}</div>
+            <div class="detail-title">{{ promptOf(tasks.selectedTask) || tr('records.untitled_task') }}</div>
             <div class="detail-meta">
               <span>{{ fmtTime(tasks.selectedTask.started_at) }}</span>
               <span v-if="tasks.selectedTask.ended_at">→ {{ fmtTime(tasks.selectedTask.ended_at) }}</span>
@@ -839,23 +891,23 @@ async function saveRetention() {
           </header>
 
           <div class="kv">
-            <div class="k">状态</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
+            <div class="k">{{ tr('records.detail.state') }}</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
             <!-- 「进度」暂时不显示（2026-09-29 用户要求注释掉）：progress 现在拿不到真值 ——
                  开工写 0、收工写 1，中间没人推进（唯一会推的是 hook 里"按 TodoWrite 清单
                  折算几项做完"那一条，见 reporter/hook.js 的 todoProgress，实测落不到库里）。
                  本机库实测：489 条任务的 progress 只有 0（80 条）和 1（409 条）两种取值，
                  一个中间值都没有 —— 显示出来就是「0% / 100%」两个数跳，纯误导。
                  将来有了能按轮次推进的真实进度来源，再把这一行放回来（fmtProgress 一并复活）。 -->
-            <div class="k">客户端</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
-            <div class="k">模型</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
+            <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
+            <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- 工程：这一轮归属的工程名。服务端按工程**目录**现算（package.json name > 目录名，
                  与"打开工程"同一口径，见 /task-runs 的 project_label）；拿不到目录才退回库里的
                  projects.name（可能带同名冲突后缀，如 stb-dashboard-2），再没有退 project_id，
                  最后才写占位 —— 绝不编造 -->
-            <div class="k">工程</div>
+            <div class="k">{{ tr('records.detail.project') }}</div>
             <div class="v">{{ tasks.selectedTask.project_label || tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
-            <div class="k">文件变化</div>
+            <div class="k">{{ tr('records.detail.files') }}</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
             <!-- 本轮消耗的词元：四项摊开、用 " / " 隔开（2026-10-01 用户要求）——
                  `非缓存输入 / 缓存读输入 / 缓存写输入 / 输出`，顺序与库里的列序一致，
@@ -863,14 +915,14 @@ async function saveRetention() {
                  （见 reporter/src/usage.js），拿不到的楼层（5F TraeCode 没有 usage、
                  6F Qoder 的 transcript 里没有、2F/9F 没接）显示 "—"，不显示 0 ——
                  「报不出来」和「消耗为零」是两回事。 -->
-            <div class="k">词元</div>
+            <div class="k">{{ tr('records.detail.tokens') }}</div>
             <div class="v" :title="tokenTitleOf(tasks.selectedTask)">{{ tokenQuadOf(tasks.selectedTask) }}</div>
           </div>
 
           <div v-if="filesOf(tasks.selectedTask).length" class="files">
 
             <template v-if="addedFiles(tasks.selectedTask).length">
-              <div class="cat">新增文件 ({{ addedFiles(tasks.selectedTask).length }})</div>
+              <div class="cat">{{ tr('records.files.added', { n: addedFiles(tasks.selectedTask).length }) }}</div>
               <ul>
                 <li v-for="(f, i) in addedFiles(tasks.selectedTask)" :key="'a' + i">
                   <span class="fp">{{ f.path }}</span>
@@ -880,7 +932,7 @@ async function saveRetention() {
             </template>
 
             <template v-if="modifiedFiles(tasks.selectedTask).length">
-              <div class="cat">改动文件 ({{ modifiedFiles(tasks.selectedTask).length }})</div>
+              <div class="cat">{{ tr('records.files.modified', { n: modifiedFiles(tasks.selectedTask).length }) }}</div>
               <ul>
                 <li v-for="(f, i) in modifiedFiles(tasks.selectedTask)" :key="'m' + i">
                   <span class="fp">{{ f.path }}</span>
@@ -890,7 +942,7 @@ async function saveRetention() {
             </template>
 
             <template v-if="deletedFiles(tasks.selectedTask).length">
-              <div class="cat">删除文件 ({{ deletedFiles(tasks.selectedTask).length }})</div>
+              <div class="cat">{{ tr('records.files.deleted', { n: deletedFiles(tasks.selectedTask).length }) }}</div>
               <ul>
                 <li v-for="(f, i) in deletedFiles(tasks.selectedTask)" :key="'d' + i">
                   <span class="fp">{{ f.path }}</span>
@@ -901,23 +953,23 @@ async function saveRetention() {
 
           <!-- 工具使用：这一轮每个工具用了几次（上报方逐次 +1，见 server/src/ingest/bus.js 的 toolUse） -->
           <div v-if="toolsOf(tasks.selectedTask).length" class="tools">
-            <div class="files-head">工具使用</div>
+            <div class="files-head">{{ tr('records.detail.tools') }}</div>
             <ul class="tool-list">
               <li v-for="(t, i) in toolsOf(tasks.selectedTask)" :key="'tool' + i" class="tool-item">
                 <span class="tool-name">{{ t.tool }}</span>
-                <span class="tool-count">{{ t.count }} 次</span>
+                <span class="tool-count">{{ tr('records.detail.tools_times', { n: t.count }) }}</span>
               </li>
             </ul>
           </div>
 
           <div class="result-block">
-            <div class="files-head">产出摘要</div>
-            <p class="result">{{ tasks.selectedTask.result || '（无）' }}</p>
+            <div class="files-head">{{ tr('records.detail.result') }}</div>
+            <p class="result">{{ tasks.selectedTask.result || tr('records.none_paren') }}</p>
           </div>
 
           <!-- subagent 列表：点击单个看详情 -->
           <div v-if="tasks.subagents.length" class="subs">
-            <div class="files-head">本轮 subagent（{{ tasks.subagents.length }}）</div>
+            <div class="files-head">{{ tr('records.detail.subagents', { n: tasks.subagents.length }) }}</div>
             <ul class="sub-list">
               <li
                 v-for="s in tasks.subagents"
@@ -927,26 +979,26 @@ async function saveRetention() {
               >
                 <button class="sub-btn" @click="toggleSub(s.id)">
                   <span class="sub-name">{{ s.name }}</span>
-                  <span class="sub-sub">{{ s.title || '（未命名）' }}</span>
+                  <span class="sub-sub">{{ s.title || tr('records.sub_untitled') }}</span>
                   <span class="sub-dur">{{ fmtDuration(s.duration_ms) }}</span>
                 </button>
                 <div v-if="expandedSub === s.id" class="sub-detail">
                   <div class="kv">
-                    <div class="k">名字</div><div class="v">{{ s.name }}</div>
-                    <div class="k">任务</div><div class="v">{{ s.title || '（未命名）' }}</div>
-                    <div class="k">客户端</div><div class="v">{{ clientLabel(s.client) }}</div>
-                    <div class="k">模型</div><div class="v">{{ s.model || '—' }}</div>
-                    <div class="k">开始</div><div class="v">{{ fmtTime(s.started_at) }}</div>
-                    <div class="k">结束</div><div class="v">{{ fmtTime(s.ended_at) }}</div>
-                    <div class="k">耗时</div><div class="v">{{ fmtDuration(s.duration_ms) }}</div>
-                    <div class="k">输入 token</div><div class="v">{{ fmtTokens(s.input_tokens) }}</div>
-                    <div class="k">输出 token</div><div class="v">{{ fmtTokens(s.output_tokens) }}</div>
+                    <div class="k">{{ tr('records.detail.sub_name') }}</div><div class="v">{{ s.name }}</div>
+                    <div class="k">{{ tr('records.detail.sub_task') }}</div><div class="v">{{ s.title || tr('records.sub_untitled') }}</div>
+                    <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(s.client) }}</div>
+                    <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ s.model || '—' }}</div>
+                    <div class="k">{{ tr('records.detail.sub_start') }}</div><div class="v">{{ fmtTime(s.started_at) }}</div>
+                    <div class="k">{{ tr('records.detail.sub_end') }}</div><div class="v">{{ fmtTime(s.ended_at) }}</div>
+                    <div class="k">{{ tr('records.detail.sub_duration') }}</div><div class="v">{{ fmtDuration(s.duration_ms) }}</div>
+                    <div class="k">{{ tr('records.detail.sub_in_tokens') }}</div><div class="v">{{ fmtTokens(s.input_tokens) }}</div>
+                    <div class="k">{{ tr('records.detail.sub_out_tokens') }}</div><div class="v">{{ fmtTokens(s.output_tokens) }}</div>
                   </div>
                   <div v-if="filesOf(s).length" class="files">
-                    <div class="files-head">改动文件</div>
+                    <div class="files-head">{{ tr('records.detail.sub_files') }}</div>
 
                     <template v-if="addedFiles(s).length">
-                      <div class="cat">新增文件 ({{ addedFiles(s).length }})</div>
+                      <div class="cat">{{ tr('records.files.added', { n: addedFiles(s).length }) }}</div>
                       <ul>
                         <li v-for="(f, i) in addedFiles(s)" :key="'a' + i">
                           <span class="fp">{{ f.path }}</span>
@@ -956,7 +1008,7 @@ async function saveRetention() {
                     </template>
 
                     <template v-if="modifiedFiles(s).length">
-                      <div class="cat">改动文件 ({{ modifiedFiles(s).length }})</div>
+                      <div class="cat">{{ tr('records.files.modified', { n: modifiedFiles(s).length }) }}</div>
                       <ul>
                         <li v-for="(f, i) in modifiedFiles(s)" :key="'m' + i">
                           <span class="fp">{{ f.path }}</span>
@@ -966,7 +1018,7 @@ async function saveRetention() {
                     </template>
 
                     <template v-if="deletedFiles(s).length">
-                      <div class="cat">删除文件 ({{ deletedFiles(s).length }})</div>
+                      <div class="cat">{{ tr('records.files.deleted', { n: deletedFiles(s).length }) }}</div>
                       <ul>
                         <li v-for="(f, i) in deletedFiles(s)" :key="'d' + i">
                           <span class="fp">{{ f.path }}</span>
@@ -975,26 +1027,26 @@ async function saveRetention() {
                     </template>
                   </div>
                   <div class="result-block">
-                    <div class="files-head">完成任务（产出）</div>
-                    <p class="result">{{ s.result || '（无）' }}</p>
+                    <div class="files-head">{{ tr('records.detail.sub_result') }}</div>
+                    <p class="result">{{ s.result || tr('records.none_paren') }}</p>
                   </div>
                 </div>
               </li>
             </ul>
           </div>
-          <div v-else-if="tasks.selectedTask.subagentCount" class="dim loading">加载 subagent…</div>
+          <div v-else-if="tasks.selectedTask.subagentCount" class="dim loading">{{ tr('records.loading_subagents') }}</div>
         </template>
       </section>
     </div>
 
     <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理）；仅列表视图，位于列表页底部 -->
     <div class="bulk-bar" v-if="view === 'list'">
-      <span class="dim">批量操作：</span>
-      <button type="button" class="del-btn danger" @click="bulkDeleteAll">删除筛选结果</button>
-      <span class="dim">自动保留最近</span>
-      <input v-model.number="retentionDays" class="days" type="number" min="1" max="3650" aria-label="保留天数" />
-      <span class="dim">天（更早记录由服务端自动清理）</span>
-      <button type="button" class="btn" @click="saveRetention">保存天数</button>
+      <span class="dim">{{ tr('records.bulk_ops') }}</span>
+      <button type="button" class="del-btn danger" @click="bulkDeleteAll">{{ tr('records.bulk_delete') }}</button>
+      <span class="dim">{{ tr('records.retention_before') }}</span>
+      <input v-model.number="retentionDays" class="days" type="number" min="1" max="3650" :aria-label="tr('records.retention_aria')" />
+      <span class="dim">{{ tr('records.retention_after') }}</span>
+      <button type="button" class="btn" @click="saveRetention">{{ tr('records.retention_save') }}</button>
     </div>
 
     <!-- 汇总报表：按维度聚合的表格；共享上方筛选栏条件 -->
@@ -1008,9 +1060,9 @@ async function saveRetention() {
             class="view-tab"
             :class="{ on: reportDim === d.key }"
             @click="reportDim = d.key"
-          >{{ d.label }}</button>
+          >{{ tr(d.label) }}</button>
         </div>
-        <button type="button" class="btn export" @click="exportCsv">导出 CSV</button>
+        <button type="button" class="btn export" @click="exportCsv">{{ tr('records.export') }}</button>
       </div>
 
       <!-- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 词元 / 时长 / 状态 -->
@@ -1018,23 +1070,23 @@ async function saveRetention() {
         <table class="report-table">
           <thead>
             <tr>
-              <th class="th-dim sortable" :class="timeSortCls('started_at')" @click="sortTimeBy('started_at')">时间</th>
-              <th class="th-dim">任务</th>
-              <th class="th-dim">客户端</th>
-              <th class="th-dim">模型</th>
-              <th class="th-dim">工程</th>
+              <th class="th-dim sortable" :class="timeSortCls('started_at')" @click="sortTimeBy('started_at')">{{ tr('records.col.time') }}</th>
+              <th class="th-dim">{{ tr('records.col.task') }}</th>
+              <th class="th-dim">{{ tr('records.col.client') }}</th>
+              <th class="th-dim">{{ tr('records.col.model') }}</th>
+              <th class="th-dim">{{ tr('records.col.project') }}</th>
               <!-- 一行一个任务，这一列 = **这条任务的总词元**（四项全加，见 totalTokensOf）。
                    悬停看四项拆分；报不出 token 的楼层显示 "—"（不是 0）。 -->
-              <th class="sortable num" :class="timeSortCls('tokens')" @click="sortTimeBy('tokens')" title="这一轮消耗的总词元（非缓存输入 + 缓存读 + 缓存写 + 输出）">词元</th>
-              <th class="sortable num" :class="timeSortCls('duration_ms')" @click="sortTimeBy('duration_ms')">时长</th>
-              <th class="th-dim">状态</th>
+              <th class="sortable num" :class="timeSortCls('tokens')" @click="sortTimeBy('tokens')" :title="tr('records.col.tokens_title')">{{ tr('records.col.tokens') }}</th>
+              <th class="sortable num" :class="timeSortCls('duration_ms')" @click="sortTimeBy('duration_ms')">{{ tr('records.col.duration') }}</th>
+              <th class="th-dim">{{ tr('records.col.state') }}</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="t in timeRows" :key="t.id" class="report-row" @click="drillDown(t)">
               <td class="td-dim mono">{{ fmtTime(t.started_at) }}</td>
               <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
-              <td class="td-dim td-task" :title="promptOf(t) || '(未命名任务)'">{{ shortTitle(t) }}</td>
+              <td class="td-dim td-task" :title="promptOf(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
               <td class="td-dim">{{ clientLabel(t.client, t.form) }}</td>
               <td class="td-dim">{{ t.model || '—' }}</td>
               <td class="td-dim">{{ projectOf(t) }}</td>
@@ -1045,8 +1097,8 @@ async function saveRetention() {
           </tbody>
           <tfoot>
             <tr class="total-row">
-              <td class="td-dim">合计</td>
-              <td class="td-dim">{{ timeRows.length }} 次</td>
+              <td class="td-dim">{{ tr('records.total') }}</td>
+              <td class="td-dim">{{ tr('records.times', { n: timeRows.length }) }}</td>
               <td class="td-dim" />
               <td class="td-dim" />
               <td class="td-dim" />
@@ -1064,14 +1116,14 @@ async function saveRetention() {
           <thead>
             <tr>
               <th class="th-dim">{{ dimColName }}</th>
-              <th class="sortable num" :class="sortCls('taskCount')" @click="sortBy('taskCount')">任务数</th>
-              <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">成功数</th>
-              <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">取消数</th>
-              <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">改动文件数</th>
+              <th class="sortable num" :class="sortCls('taskCount')" @click="sortBy('taskCount')">{{ tr('records.col.task_count') }}</th>
+              <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">{{ tr('records.col.success_count') }}</th>
+              <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">{{ tr('records.col.cancel_count') }}</th>
+              <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">{{ tr('records.col.file_count') }}</th>
               <!-- 词元合计 = 这一组里**报得出 token 的那些任务**的四项全加（与「数据总览」表尾同一口径） -->
-              <th class="sortable num" :class="sortCls('tokenSum')" @click="sortBy('tokenSum')" title="这一组任务的词元合计（只累加报得出 token 的；非缓存输入 + 缓存读 + 缓存写 + 输出）">词元合计</th>
-              <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">总耗时</th>
-              <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">平均耗时</th>
+              <th class="sortable num" :class="sortCls('tokenSum')" @click="sortBy('tokenSum')" :title="tr('records.col.token_sum_title')">{{ tr('records.col.token_sum') }}</th>
+              <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">{{ tr('records.col.duration_sum') }}</th>
+              <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">{{ tr('records.col.avg_duration') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -1107,7 +1159,7 @@ async function saveRetention() {
         </table>
       </div>
       <div v-else class="empty-pane">
-        <span class="dim">当前筛选条件下暂无数据</span>
+        <span class="dim">{{ tr('records.empty') }}</span>
       </div>
     </div>
 
@@ -1119,43 +1171,43 @@ async function saveRetention() {
           type="button"
           class="btn"
           :disabled="!canShiftDay(-1)"
-          :title="canShiftDay(-1) ? '前一天' : `前一天不在当前时间筛选（${filterTimeLabel}）内`"
+          :title="canShiftDay(-1) ? tr('records.board.prev') : tr('records.board.prev_out', { range: filterTimeLabel })"
           @click="shiftDay(-1)"
-        >← 前一天</button>
+        >← {{ tr('records.board.prev') }}</button>
         <input
           class="day-input"
           type="date"
           :value="boardDayValue"
           :min="boardDayMin"
           :max="boardDayMax"
-          :title="`可选范围：${filterTimeLabel}`"
-          aria-label="看板日期"
+          :title="tr('records.board.range_aria', { range: filterTimeLabel })"
+          :aria-label="tr('records.board.date_aria')"
           @change="onBoardDayInput"
         />
         <span class="day-label">
-          {{ fmtDay(boardDay) }}<span v-if="boardIsToday" class="dim">（今天）</span>
+          {{ fmtDay(boardDay) }}<span v-if="boardIsToday" class="dim">{{ tr('records.board.today_suffix') }}</span>
         </span>
         <button
           type="button"
           class="btn"
           :disabled="!canShiftDay(1)"
-          :title="canShiftDay(1) ? '后一天' : `后一天不在当前时间筛选（${filterTimeLabel}）内`"
+          :title="canShiftDay(1) ? tr('records.board.next') : tr('records.board.next_out', { range: filterTimeLabel })"
           @click="shiftDay(1)"
-        >后一天 →</button>
+        >{{ tr('records.board.next') }} →</button>
         <button
           type="button"
           class="btn"
           :disabled="boardIsToday || !canBackToToday"
-          :title="canBackToToday ? '回到今天' : `今天不在当前时间筛选（${filterTimeLabel}）内`"
+          :title="canBackToToday ? tr('records.board.today_back') : tr('records.board.today_out', { range: filterTimeLabel })"
           @click="backToToday"
-        >今天</button>
+        >{{ tr('records.board.today') }}</button>
         <span class="spacer" />
         <span class="legend">
-          <i class="dot st-running" />运行中
-          <i class="dot st-done" />完成
-          <i class="dot st-failed" />失败
-          <i class="dot st-cancelled" />已取消
-          <i class="dot st-pending" />待命
+          <i class="dot st-running" />{{ tr('records.board.legend_running') }}
+          <i class="dot st-done" />{{ tr('records.board.legend_done') }}
+          <i class="dot st-failed" />{{ tr('records.board.legend_failed') }}
+          <i class="dot st-cancelled" />{{ tr('records.board.legend_cancelled') }}
+          <i class="dot st-pending" />{{ tr('records.board.legend_pending') }}
         </span>
       </div>
 
@@ -1176,7 +1228,7 @@ async function saveRetention() {
                 v-if="boardNowPct >= 0"
                 class="now-line"
                 :style="{ left: `${boardNowPct}%` }"
-                title="此刻"
+                :title="tr('office.tip.now')"
               />
               <button
                 v-for="it in row.items"
@@ -1217,7 +1269,7 @@ async function saveRetention() {
                 v-if="boardNowPct >= 0"
                 class="now-line"
                 :style="{ left: `${boardNowPct}%` }"
-                title="此刻"
+                :title="tr('office.tip.now')"
               />
             </div>
           </div>
@@ -1227,20 +1279,20 @@ async function saveRetention() {
       <div class="board-foot dim">
         <!-- 没有任务的日子不写"任务 0 次"这类话：空表格本身就说清楚了（所以这里看的是 task 数，不是行数） -->
         <template v-if="boardGantt.total">
-          <span>任务 {{ boardGantt.total }} 次</span>
+          <span>{{ tr('records.board.sum_tasks', { n: boardGantt.total }) }}</span>
           <span class="sep">·</span>
-          <span>楼层 {{ boardRows.length }} 个</span>
+          <span>{{ tr('records.board.sum_floors', { n: boardRows.length }) }}</span>
           <template v-if="boardGantt.firstMin >= 0">
             <span class="sep">·</span>
-            <span>活跃时段 {{ fmtHM(boardGantt.firstMin) }}–{{ fmtHM(boardGantt.lastMin) }}</span>
+            <span>{{ tr('records.board.active_window', { from: fmtHM(boardGantt.firstMin), to: fmtHM(boardGantt.lastMin) }) }}</span>
           </template>
         </template>
         <template v-if="boardGantt.untimed">
           <span v-if="boardGantt.total" class="sep">·</span>
-          <span>另有 {{ boardGantt.untimed }} 条没有开始时间，画不进图</span>
+          <span>{{ tr('records.board.untimed', { n: boardGantt.untimed }) }}</span>
         </template>
         <span class="spacer" />
-        <span>只列这一天有任务的楼层 · 同一时间并行的那段会加深（一层就一行）· 点块跳到列表里那条任务</span>
+        <span>{{ tr('records.board.hint') }}</span>
       </div>
     </div>
   </div>

@@ -5,9 +5,11 @@ import MessageFilters from '../components/MessageFilters.vue';
 import SearchBox from '../components/SearchBox.vue';
 import { useProjectStore } from '../stores/project';
 import { useMessageStore } from '../stores/messages';
+import { useI18n } from '../i18n';
 
 const project = useProjectStore();
 const msgs = useMessageStore();
+const { t } = useI18n();
 
 const shown = computed(() => msgs.filtered);
 </script>
@@ -22,7 +24,7 @@ const shown = computed(() => msgs.filtered);
         @clear="msgs.clearFilters()"
       />
       <span class="spacer" />
-      <span class="dim">共 {{ shown.length }} / {{ msgs.count }} 条</span>
+      <span class="dim">{{ t('chat.count', { shown: shown.length, total: msgs.count }) }}</span>
       <SearchBox :model-value="msgs.keyword" @update:model-value="msgs.setKeyword($event)" />
     </div>
 
@@ -33,7 +35,7 @@ const shown = computed(() => msgs.filtered);
     />
 
     <div v-if="msgs.pendingCount" class="pending" data-testid="archive-notice">
-      {{ msgs.pendingCount }} 条新消息（已暂停跟随）
+      {{ t('chat.new_messages', { n: msgs.pendingCount }) }}
     </div>
   </div>
 </template>

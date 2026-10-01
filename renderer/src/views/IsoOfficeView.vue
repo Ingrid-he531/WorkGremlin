@@ -17,6 +17,7 @@ import { floorAcceptsClient } from '../lib/clientMatch';
 import { currentTaskOf, currentTaskTitle } from '../lib/memberTask';
 import { httpBase, getServerInfo } from '../api/bridge';
 import { createIsoOffice } from '../iso/engine';
+import { useI18n } from '../i18n';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
@@ -30,6 +31,7 @@ const emit = defineEmits(['select']);
 const project = useProjectStore();
 const sessions = useSessionStore();
 const mainAgent = useMainAgentStore();
+const { t } = useI18n();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
 
@@ -249,10 +251,10 @@ const consoleBase = computed(() => {
   const canUseFast = Boolean(sel.fresh) || (sel.source === 'cli' && Boolean(sel.projectPath));
   if (canUseFast && sameWs && sameSession && fp.phase) {
     if (fp.phase === 'await') {
-      return { phase: 'await', action: fp.action || '等待用户授权', context: fp.context && fp.context.length ? fp.context : ['等待用户授权后继续'], target: fp.target || null, prompt: fp.prompt || '' };
+      return { phase: 'await', action: fp.action || t('console.await_action'), context: fp.context && fp.context.length ? fp.context : [t('console.await_hint')], target: fp.target || null, prompt: fp.prompt || '' };
     }
     if (fp.phase === 'tool') {
-      return { phase: 'tool', action: fp.action || '调用工具', context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, tool: fp.tool || '', prompt: fp.prompt || '' };
+      return { phase: 'tool', action: fp.action || t('console.tool_action'), context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, tool: fp.tool || '', prompt: fp.prompt || '' };
     }
     // 思考中：把用户那句话（prompt）同时放到第二层（action）和第三层。
     // 屏上第三层有"字号够大才画"的门槛（mainConsole 的 showL3），放大不够时不出字；
@@ -310,8 +312,8 @@ const consoleLive = computed(() => {
     const names = [...new Set(subs.map((m) => m.name))].join('、');
     return {
       phase: 'waiting',
-      action: `等待 ${names} 汇报`,
-      context: subs.slice(0, 3).map((m) => (m.task ? `${m.name}：${m.task}` : `${m.name} 执行中`)),
+      action: t('console.waiting_subs', { names }),
+      context: subs.slice(0, 3).map((m) => (m.task ? `${m.name}：${m.task}` : t('console.sub_running', { name: m.name }))),
       target: null,
       tool: '',
       prompt: '',
@@ -385,7 +387,7 @@ watch(
       // （见 sceneMembers），但**不走 applySession(null)** —— 那是"会话收工"，
       // 会弹「任务完成」，跟这层没关系。
       if (!sel && sessions.floorEmpty) {
-        mainAgent.enterIdle(['本层暂无活跃会话']);
+        mainAgent.enterIdle([t('console.floor_empty')]);
         return;
       }
       mainAgent.applySession(v);
@@ -427,7 +429,7 @@ watch(
       // 吐了半句、改了几个文件，照记；真一点产出都没有时，写"本次任务已完成"才是假的。
       const ctx = files.length
         ? [
-            `改动 ${count} 个文件`,
+            t('console.files_changed', { n: count }),
             ...files.map((f) => {
               const nm = f && (f.name || f.path) || (typeof f === 'string' ? f : '');
               const bits = [];
@@ -439,9 +441,9 @@ watch(
               return bits.length ? `${nm}  (${bits.join(' · ')})` : String(nm);
             }),
           ]
-        : [said || (cancelled ? '没有输出' : '本次任务已完成')];
-      if (cancelled) mainAgent.enterCancelled('任务取消', ctx);
-      else mainAgent.enterDone('任务完成', ctx);
+        : [said || (cancelled ? t('console.no_output') : t('console.this_task_done'))];
+      if (cancelled) mainAgent.enterCancelled(t('console.cancelled'), ctx);
+      else mainAgent.enterDone(t('console.done'), ctx);
       return;
     }
     // 「任务取消 / 任务完成」刚亮起，不许被同一轮的残留相位盖掉：
@@ -695,7 +697,7 @@ onBeforeUnmount(() => {
         class="ct-row"
         v-if="mainAgent.action || (isFinishPhase && mainAgent.context.length)"
       >
-        <b>操作</b>
+        <b>{{ t('office.tip.action') }}</b>
         <span class="ct-val">
           <template v-if="isFinishPhase && mainAgent.context.length">
             <span v-for="(c, i) in mainAgent.context" :key="i" class="ct-file">{{ c }}</span>
@@ -703,8 +705,8 @@ onBeforeUnmount(() => {
           <template v-else-if="mainAgent.action">{{ mainAgent.action }}</template>
         </span>
       </div>
-      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>目标</b><span class="ct-val">{{ mainAgent.target }}</span></div>
-      <div v-if="mainAgent.skill" class="ct-row"><b>技能</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
+      <div v-if="mainAgent.target && mainAgent.phase === 'await'" class="ct-row"><b>{{ t('office.tip.target') }}</b><span class="ct-val">{{ mainAgent.target }}</span></div>
+      <div v-if="mainAgent.skill" class="ct-row"><b>{{ t('office.tip.skill') }}</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
     </div>
 
     <!-- 小怪物 tooltip：当前任务 + 最近一次完成的结果 -->
@@ -717,12 +719,12 @@ onBeforeUnmount(() => {
         <span class="ct-phase">{{ mtipMember.name }}</span>
       </div>
       <div class="ct-row">
-        <b>任务</b>
-        <span class="ct-val">{{ mtipTask || '空闲' }}</span>
+        <b>{{ t('office.tip.task') }}</b>
+        <span class="ct-val">{{ mtipTask || t('office.tip.idle') }}</span>
       </div>
       <div v-if="mtipResult && (mtipResult.result || mtipResult.task)" class="ct-row">
-        <b>上次结果</b>
-        <span class="ct-val">{{ mtipResult.result || `已完成：${mtipResult.task}` }}</span>
+        <b>{{ t('office.tip.last_result') }}</b>
+        <span class="ct-val">{{ mtipResult.result || t('bubble.done_prefix', { task: mtipResult.task }) }}</span>
       </div>
     </div>
 
@@ -734,7 +736,7 @@ onBeforeUnmount(() => {
       @click.stop
     >
       <WorkstationCard :member="cardMember" />
-      <button class="card-close" @click="closeCard">关闭</button>
+      <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 
     <!-- HUD -->
@@ -745,14 +747,14 @@ onBeforeUnmount(() => {
       <button
         class="demo-btn"
         :class="{ on: project.demo }"
-        :title="project.demo ? '退出演示，回到进演示前的工程' : '切到演示工程：主控制台自动演一轮，小怪物用演示成员'"
+        :title="project.demo ? t('office.exit_demo_title') : t('office.demo_title')"
         @click="toggleDemo"
       >
-        {{ project.demo ? '退出演示' : '演示模式' }}
+        {{ project.demo ? t('office.exit_demo') : t('office.demo') }}
       </button>
-      <button @click="callAll">集合开会</button>
-      <button @click="dismiss">全员回工位</button>
-      <button @click="resetView">复位视角</button>
+      <button @click="callAll">{{ t('office.meeting') }}</button>
+      <button @click="dismiss">{{ t('office.back_to_desk') }}</button>
+      <button @click="resetView">{{ t('office.reset_view') }}</button>
     </div>
 
     <!-- 左下角说明条：连接状态 + 相位来源（原来在左上角那枚小徽标里）与操作说明**并列**一条。
@@ -760,11 +762,11 @@ onBeforeUnmount(() => {
     <div class="tip">
       <ConnectionBar bare class="status-hud" :connection="connection" :source="source" />
       <span class="sep" />
-      拖拽平移 · 滚轮缩放 · 双击复位
+      {{ t('office.tip.pan') }}
       <!-- 与前面操作说明之间也来一条竖线（和"相位来源"后面那条同一规格的 .sep） -->
       <span class="sep" />
-      <span class="legend"><i class="dot green" />项目专家</span>
-      <span class="legend"><i class="dot blue" />用户专家</span>
+      <span class="legend"><i class="dot green" />{{ t('office.legend.project_expert') }}</span>
+      <span class="legend"><i class="dot blue" />{{ t('office.legend.user_expert') }}</span>
     </div>
   </div>
 </template>

@@ -1,5 +1,8 @@
 <script setup>
 import { computed } from 'vue';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   message: { type: Object, required: true },
@@ -19,11 +22,11 @@ const short = (id) => (id ? id.split('@')[0] : '');
     <span class="ts mono faint">{{ time }}</span>
     <span class="from">{{ short(message.fromMember) }}</span>
     <span class="arrow faint">→</span>
-    <span class="to">{{ message.toMember ? short(message.toMember) : '全员' }}</span>
+    <span class="to">{{ message.toMember ? short(message.toMember) : t('chat.to_all') }}</span>
     <span class="type" :title="message.type">{{ message.type }}</span>
     <span v-if="message.subject" class="subject">{{ message.subject }}</span>
     <span class="content">{{ message.content }}</span>
-    <span v-if="message.source === 'watch'" class="src faint" title="来自目录监听兜底">watch</span>
+    <span v-if="message.source === 'watch'" class="src faint" :title="t('msg.watch_title')">watch</span>
   </div>
 </template>
 

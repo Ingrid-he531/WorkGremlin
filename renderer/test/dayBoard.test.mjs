@@ -14,6 +14,13 @@ const { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM, spanOf } = a
   '../src/lib/dayBoard.js'
 );
 
+/**
+ * 兜底行名走 i18n（未记录楼层 / floor not recorded）：这里锁中文那一套。
+ * 必须显式设一次 —— i18n 默认按浏览器语言猜，Node 的 navigator.language 是 en-US。
+ */
+const { setLocale } = await import('../src/i18n/index.js');
+setLocale('zh');
+
 let pass = 0;
 let fail = 0;
 function ok(label, cond, extra = '') {

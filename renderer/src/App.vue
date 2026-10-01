@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import SessionSwitcher from './components/SessionSwitcher.vue';
+import LangSwitch from './components/LangSwitch.vue';
 import FloorSelector from './components/FloorSelector.vue';
 import ElevatorDoors from './components/ElevatorDoors.vue';
 import IsoOfficeView from './views/IsoOfficeView.vue';
@@ -15,10 +16,12 @@ import { useSessionStore } from './stores/sessions';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { httpBase, setFullScreen, onFullScreen } from './api/bridge';
 import { useElevator } from './composables/useElevator';
+import { useI18n } from './i18n';
 
 const project = useProjectStore();
 const msgs = useMessageStore();
 const sessions = useSessionStore();
+const { t } = useI18n();
 
 /**
  * 电梯过渡：状态机是模块级单例，主舞台（门）与左栏（轿厢 / 高亮）共用同一个实例。
@@ -139,11 +142,11 @@ function selectDesk(id) {
  * 下拉里那条真会话显示真工程名就自相矛盾了（放最前面判）。
  */
 const projectLabel = computed(() => {
-  if (project.demo) return `${project.projectName || '演示工程'} · 演示模式`;
+  if (project.demo) return `${project.projectName || t('session.demo_project')} · ${t('session.demo_mode')}`;
   if (sessions.selected) return sessions.selected.project;
   if (sessions.floorEmpty) {
     const f = sessions.floors.find((x) => x.id === sessions.selectedFloor);
-    return f ? `${f.name} · 本层暂无活跃会话` : '';
+    return f ? t('session.floor_empty', { name: f.name }) : '';
   }
   return project.projectName;
 });
@@ -160,14 +163,14 @@ const sessionItems = computed(() =>
     ? [
         {
           value: DEMO_SESSION_ID,
-          label: '演示工程 · 演示会话',
-          title: '演示模式（退出：办公室操作条上的「退出演示」）',
+          label: t('session.demo_session'),
+          title: t('session.demo_session_title'),
         },
       ]
     : sessions.options
 );
 const sessionValue = computed(() => (project.demo ? DEMO_SESSION_ID : sessions.selectedId));
-const sessionEmptyLabel = computed(() => (project.demo ? '演示工程 · 演示会话' : sessions.emptyLabel));
+const sessionEmptyLabel = computed(() => (project.demo ? t('session.demo_session') : sessions.emptyLabel));
 
 /** 选中会话：演示期间不切（要退出演示请走 HUD 的按钮） */
 function selectSession(id) {
@@ -237,10 +240,12 @@ onUnmounted(() => {
          项目名在门楣（楼层液晶屏那块板）最左边（ElevatorDoors 的 .lintel-proj）——
          三样都不占顶栏，所以收掉顶栏不会丢信息。 -->
     <nav v-if="!fullscreen" class="tabs">
-      <button :class="{ on: tab === 'office' }" @click="tab = 'office'">办公室</button>
-      <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">工位卡片</button>
-      <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">任务记录</button>
+      <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
+      <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">{{ t('nav.workstation') }}</button>
+      <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">{{ t('nav.records') }}</button>
       <span class="spacer" />
+      <!-- 语言切换常驻（会话下拉与全屏在工位卡片 / 任务记录页会收掉，语言开关留着） -->
+      <LangSwitch />
       <!-- 工位卡片 / 任务记录页不需要会话下拉与全屏，收掉右上角这两样 -->
       <SessionSwitcher
         v-if="tab !== 'workstation' && tab !== 'conversation'"
@@ -252,9 +257,9 @@ onUnmounted(() => {
       <button
         v-if="tab !== 'workstation' && tab !== 'conversation'"
         class="fs-btn"
-        title="全屏只显示主屏幕（F）"
+        :title="t('nav.fullscreen_title')"
         @click="toggleFullscreen"
-      >全屏</button>
+      >{{ t('nav.fullscreen') }}</button>
     </nav>
 
     <main class="body">
@@ -301,10 +306,10 @@ onUnmounted(() => {
     <button
       v-if="fullscreen"
       class="fs-exit"
-      title="退出全屏（Esc / F）"
+      :title="t('nav.exit_fullscreen_title')"
       @click="exitFullscreen"
     >
-      退出全屏
+      {{ t('nav.exit_fullscreen') }}
     </button>
   </div>
 </template>

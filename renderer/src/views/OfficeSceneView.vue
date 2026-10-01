@@ -19,6 +19,9 @@ import GhostSprite from '../components/GhostSprite.vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 import {
   DESKS,
   GHOST,
@@ -51,7 +54,16 @@ const STATE_COLOR = {
   thinking: '#ffcf5c',
   offline: '#4a5160',
 };
-const STATE_LABEL = { online: '在线', busy: '忙碌', idle: '空闲', blocked: '阻塞', thinking: '思考中', offline: '离线' };
+/** 五个主状态 → i18n 词条（图例与头顶贴片共用） */
+const STATE_KEY = {
+  online: 'state.online',
+  busy: 'state.busy',
+  idle: 'state.idle',
+  blocked: 'state.blocked',
+  thinking: 'state.thinking',
+  offline: 'state.offline',
+};
+const stateText = (s) => t(STATE_KEY[s] || 'state.idle');
 
 /* ------------------------------ 成员 → 工位 ------------------------------ */
 
@@ -318,20 +330,27 @@ const meetingCount = computed(() => agents.value.filter((a) => a.inMeeting).leng
 
 /* ------------------------------ 头顶状态贴片 ------------------------------ */
 
-const ACTIVITY_LABEL = { coffee: '茶水间', print: '文印', chat: '串门', walk: '溜达', meet: '会议' };
+const ACTIVITY_KEY = {
+  coffee: 'scene.activity.coffee',
+  print: 'scene.activity.print',
+  chat: 'scene.activity.chat',
+  walk: 'scene.activity.walk',
+  meet: 'scene.activity.meet',
+};
+const activityText = (m) => (ACTIVITY_KEY[m] ? t(ACTIVITY_KEY[m]) : '');
 
 function tagText(a) {
-  if (a.mode === 'meet') return '会议中';
-  if (a.moving) return a.pendingMode && ACTIVITY_LABEL[a.pendingMode] ? `去${ACTIVITY_LABEL[a.pendingMode]}` : '走动中';
-  if (a.dwell && ACTIVITY_LABEL[a.mode]) return ACTIVITY_LABEL[a.mode];
-  return STATE_LABEL[stateOf(a)] + (degradedOf(a) ? '?' : '');
+  if (a.mode === 'meet') return t('tag.meeting');
+  if (a.moving) return a.pendingMode && activityText(a.pendingMode) ? t('scene.going', { place: activityText(a.pendingMode) }) : t('scene.walking');
+  if (a.dwell && activityText(a.mode)) return activityText(a.mode);
+  return stateText(stateOf(a)) + (degradedOf(a) ? '?' : '');
 }
 
 /** 幽灵头顶：项目名优先（临时成员是为某个项目临时拉进来的） */
 function ghostTagText(g) {
-  if (g.inMeeting) return '旁听会议';
+  if (g.inMeeting) return t('tag.attending');
   const proj = projectLabelOf(memberOf.value.get(g.memberId));
-  return proj ? `临时 · ${proj}` : `临时 · ${STATE_LABEL[stateOf(g)]}`;
+  return t('scene.temp', { x: proj || stateText(stateOf(g)) });
 }
 
 function tagWidth(text) {
@@ -595,7 +614,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           />
           <rect :x="MEETING.glassLeft.x" :y="MEETING.glassLeft.y" :width="MEETING.wallRight.x + MEETING.wallRight.w - MEETING.glassLeft.x" :height="MEETING.glassLeft.h" fill="none" stroke="#4a5568" stroke-width="2" />
         </g>
-        <text :x="MEETING.x + MEETING.w / 2" :y="MEETING.glassFront.y - 14" class="room-label" text-anchor="middle">会议室</text>
+        <text :x="MEETING.x + MEETING.w / 2" :y="MEETING.glassFront.y - 14" class="room-label" text-anchor="middle">{{ t('wall.meeting_room') }}</text>
       </g>
 
       <!-- ============ 4. 走动中的精灵 ============ -->
@@ -671,20 +690,20 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
       @click.stop
     >
       <WorkstationCard :member="cardMember" />
-      <button class="card-close" @click="closeCard">关闭</button>
+      <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 
     <!-- HUD -->
     <div class="hud" @click.stop>
-      <span v-for="(label, s) in STATE_LABEL" :key="s" class="legend">
-        <i class="dot" :style="{ background: STATE_COLOR[s] }" />{{ label }}
+      <span v-for="(key, s) in STATE_KEY" :key="s" class="legend">
+        <i class="dot" :style="{ background: STATE_COLOR[s] }" />{{ t(key) }}
       </span>
-      <span class="legend"><i class="dot ghost-dot" />临时成员</span>
+      <span class="legend"><i class="dot ghost-dot" />{{ t('tag.temp_member') }}</span>
       <span class="sep" />
-      <button @click="callAll">集合开会</button>
-      <button @click="dismiss">全员回工位</button>
-      <button @click="showGraph = !showGraph">路网</button>
-      <span v-if="meetingCount" class="meeting-tip">会议室 {{ meetingCount }} 人</span>
+      <button @click="callAll">{{ t('office.meeting') }}</button>
+      <button @click="dismiss">{{ t('office.back_to_desk') }}</button>
+      <button @click="showGraph = !showGraph">{{ t('office.graph') }}</button>
+      <span v-if="meetingCount" class="meeting-tip">{{ t('scene.meeting_count', { n: meetingCount }) }}</span>
     </div>
   </div>
 </template>

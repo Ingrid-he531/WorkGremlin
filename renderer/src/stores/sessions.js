@@ -13,7 +13,8 @@
 
 import { defineStore } from 'pinia';
 import { httpBase } from '../api/bridge';
-import { PHASES } from '../iso/mainConsole';
+import { consolePhaseLabel } from '../iso/mainConsole';
+import { t } from '../i18n/index.js';
 import { useProjectStore } from './project';
 
 const POLL_MS = 10_000;
@@ -34,7 +35,8 @@ const keyOf = (s) => `${s && s.floor ? s.floor : ''}:${s && s.id ? s.id : ''}`;
 // unreported（没接 hook 的 CLI 楼层）也算"没在跑"：新会话出现时可以让它跟过去
 const isIdleish = (s) => !s || s.phase === 'idle' || s.phase === 'done' || s.phase === 'unreported';
 
-const phaseLabel = (p) => (PHASES[p] || PHASES.idle).label;
+// 相位文案与主控制台同源（中英两套都在 i18n 词条表里），别在这里再维护一份
+const phaseLabel = (p) => consolePhaseLabel({ phase: p });
 /**
  * 下拉里的短 id：取**文件名那一段**再截 8 位。
  * CLI 楼层的 id 是 transcript 的**相对路径**（`projects/<工程>/<会话>.jsonl` 或扫了子树后的
@@ -114,7 +116,7 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /** 下拉里没东西可挑时的占位文案（按当前楼层判定） */
-    emptyLabel: (s) => (s.sessions.length === 0 ? '没有打开的工程' : '没有活跃会话'),
+    emptyLabel: (s) => (s.sessions.length === 0 ? t('session.empty_no_project') : t('session.empty_no_active')),
 
     /**
      * 下拉选项：直接列出**当前选中楼层**的所有活跃会话（扁平，不显示楼层标题、
@@ -126,7 +128,7 @@ export const useSessionStore = defineStore('sessions', {
       if (!f) return [];
       return f.sessions.map((x) => ({
         value: x.id,
-        label: [x.project || '未知工程', shortId(x.id)].filter(Boolean).join(' '),
+        label: [x.project || t('sessions.unknown_project'), shortId(x.id)].filter(Boolean).join(' '),
         title: x.projectPath || x.project || x.id,
       }));
     },

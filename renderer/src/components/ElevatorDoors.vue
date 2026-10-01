@@ -21,6 +21,9 @@
 import { watch } from 'vue';
 import FloorLcd from './FloorLcd.vue';
 import { playArrivalChime } from '../lib/elevatorChime';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   /** idle | closing | moving | opening | settling —— 来自 useElevator 的 phase */
@@ -54,7 +57,7 @@ watch(
          三列：左=项目名 / 中=楼层屏（居中）/ 右=等宽占位，所以屏不会被项目名挤偏 -->
     <div v-if="showLintel" class="lintel">
       <div class="lintel-side">
-        <span v-if="projectLabel" class="lintel-proj">项目：{{ projectLabel }}</span>
+        <span v-if="projectLabel" class="lintel-proj">{{ t('lintel.project') }}：{{ projectLabel }}</span>
       </div>
       <FloorLcd v-if="showFloorLcd" :floors="floors" />
       <div class="lintel-side" aria-hidden="true" />

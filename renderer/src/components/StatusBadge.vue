@@ -1,6 +1,9 @@
 <script setup>
 import { computed } from 'vue';
 import { statusLabel, statusTone } from '../lib/memberTask';
+import { useI18n } from '../i18n';
+
+const { t } = useI18n();
 
 const props = defineProps({
   state: { type: String, required: true },
@@ -21,11 +24,11 @@ const tone = computed(() => statusTone(props.state));
     class="badge"
     :class="[`state-${tone}`, { degraded }]"
     :data-testid="testid"
-    :title="degraded ? '状态为推断值（非 agent 上报真值）' : 'agent 上报真值'"
+    :title="degraded ? t('status.title_inferred') : t('status.title_reported')"
   >
     <i class="dot" />
     {{ label }}
-    <em v-if="degraded" class="degraded-tag">推断</em>
+    <em v-if="degraded" class="degraded-tag">{{ t('status.tag_inferred') }}</em>
   </span>
 </template>
 

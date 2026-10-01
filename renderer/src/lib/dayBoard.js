@@ -16,6 +16,9 @@
  *     不替它编一个结束时刻。
  * 时间一律按传入的本地毫秒算，没有时区 / UTC 换算（调用方给本地 00:00）。
  */
+// 显式写 /index.js：这个文件被 renderer/test 的 node 脚本直接 import，Node 不补扩展名。
+// 取别名 tr：下面 buildFloorGantt 的循环变量就叫 t（一条任务），不能撞名。
+import { t as tr } from '../i18n/index.js';
 
 export const MIN_PER_DAY = 24 * 60;
 /** 横轴的小时数（每小时一条竖线） */
@@ -129,7 +132,7 @@ export function buildFloorGantt(tasks, dayStart, now, resolveFloor, baseRows = [
     const e = sp.e > sp.s ? sp.e : sp.s + 1;
     if (e <= dayStart || sp.s >= dayEnd) continue; // 这一天没碰上
 
-    const f = (resolveFloor && resolveFloor(t)) || { key: '__none__', label: '未记录楼层', order: 999 };
+    const f = (resolveFloor && resolveFloor(t)) || { key: '__none__', label: tr('records.no_floor'), order: 999 };
     let g = groups.get(f.key);
     if (!g) {
       g = { key: f.key, label: f.label, order: Number.isFinite(f.order) ? f.order : 900, items: [], overlaps: [] };
