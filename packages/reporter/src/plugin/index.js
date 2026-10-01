@@ -421,6 +421,18 @@ function createIngestPlugin(options, { location, base } = {}) {
   /** 会话 id → 本轮开跑的时刻（startTask 落的）。用来给会话级 diff 划一条"这一轮"的界线（见 steppedOf） */
   const roundStartAt = new Map()
   /**
+   * 会话 id → 本轮每个 assistant 消息的 token（messageID → 那一份 usage）。
+   *
+   * 为什么按消息存而不是"来一条加一次"：`message.updated` 对同一条消息会**反复触发**
+   * （流式更新，实测一条消息好几次），每次都把它的 usage 加一遍就是成倍虚高。
+   * 每条消息只留**最后一次**看到的值（后来的覆盖先来的），收工时再跨消息求和 ——
+   * 与库里 `message.data.tokens` 是"这条消息的用量"同一个口径（见 kilo.js 的 foldKiloTokens）。
+   *
+   * 插件这一路的相位与台账都是**上报真值**，token 也就地取：装了这个插件，7F/8F 的台账行
+   * 是插件写的（轮询会让位，见 kiloTasks.js 的 yieldsOf），轮询那条路够不着这些行。
+   */
+  const roundMsgTokens = new Map()
+  /**
    * 会话 id → 最近一次"被打断收尾"的时刻。
    * 用户按 ESC / 停止时 Kilo / OpenCode 只发一条 `session.idle`（没有 `finish=stop`）——
    * 这一轮按**取消**收尾并落一枚 `done.cancelled`。但偶尔会有一条迟到的 assistant
@@ -608,6 +620,7 @@ function createIngestPlugin(options, { location, base } = {}) {
     const taskId = `k_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
     taskIds.set(sid, taskId)
     roundFiles.set(sid, new Set())
+    roundMsgTokens.set(sid, new Map())
     // 本轮的时间界线：session.diff 是会话级的，靠它才知道哪些文件是**这一轮**动的（见 steppedOf）
     roundStartAt.set(sid, Date.now())
     // 新一轮开始：上一次的"被打断"标记作废（迟到的旧 done 不该再压住这一轮的完成）
@@ -670,6 +683,18 @@ function createIngestPlugin(options, { location, base } = {}) {
     taskIds.delete(sid)
     const touched = [...(roundFiles.get(sid) || new Set())]
     roundFiles.delete(sid)
+    // 本轮 token：逐条 assistant 消息的那份 usage **求和**（同一条消息的多次更新只算最后一次，
+    // 见 roundMsgTokens）。四项全 0 = 这一轮一条带 tokens 的消息都没有（老版本 Kilo 不写这一项）
+    // → 不上报，服务端留 NULL，报表显示 "—" 而不是 0。
+    const tk = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    for (const one of (roundMsgTokens.get(sid) || new Map()).values()) {
+      tk.input += one.input
+      tk.output += one.output
+      tk.cacheRead += one.cacheRead
+      tk.cacheWrite += one.cacheWrite
+    }
+    roundMsgTokens.delete(sid)
+    const tokens = tk.input + tk.output + tk.cacheRead + tk.cacheWrite > 0 ? tk : null
     // 先把这一轮的改动文件算出来，再抹掉起点时刻 —— steppedOf 要靠它划窗口
     const stepped = steppedOf(sid, wsOf(event))
     roundStartAt.delete(sid)
@@ -699,6 +724,8 @@ function createIngestPlugin(options, { location, base } = {}) {
       client,
       form,
       ...(models.get(sid) ? { model: models.get(sid) } : {}),
+      // 没有这一项就整块不带（服务端按"没报"处理），别发个空的让人以为报了 0
+      ...(tokens ? { tokens } : {}),
       workspacePath: ws,
     })
     // 本轮的收尾自述也进对话记录（type=result）；没有自述就不写 —— 不拿文件清单凑数
@@ -812,6 +839,23 @@ function createIngestPlugin(options, { location, base } = {}) {
         const mid = String(info.id || "")
         const role = String(info.role || "")
         if (mid) msgRoles.set(mid, role)
+        /* 本轮 token：assistant 消息的 `info.tokens`（形状 `{input,output,reasoning,cache:{read,write}}`，
+           与库里 message.data.tokens 同一份）。**按消息覆盖着存**——这条事件对同一条消息会反复触发，
+           每次累加就是成倍虚高（去重口径见 roundMsgTokens 的说明）。 */
+        if (sid && role === "assistant" && mid && info.tokens && typeof info.tokens === "object") {
+          const t = info.tokens
+          const cache = (t.cache && typeof t.cache === "object") ? t.cache : {}
+          const pos = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0)
+          const bucket = roundMsgTokens.get(sid) || new Map()
+          bucket.set(mid, {
+            input: pos(t.input),
+            // reasoning 并进 output：Claude / Codex 的 output 本来含思考，不并的话同一列在 7F/8F 会少一截
+            output: pos(t.output) + pos(t.reasoning),
+            cacheRead: pos(cache.read),
+            cacheWrite: pos(cache.write),
+          })
+          roundMsgTokens.set(sid, bucket)
+        }
         // user 消息：若它的 text part 先到了，这里补开任务（正常顺序是 part 后到，这里兜底）
         if (role === "user" && sid && !taskIds.has(sid)) {
           const early = pendingUserText.get(mid)

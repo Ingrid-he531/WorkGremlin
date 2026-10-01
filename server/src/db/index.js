@@ -541,6 +541,25 @@ function createRepo(db) {
         duration_ms = COALESCE(@durationMs, duration_ms)
       WHERE id = @id
     `),
+    /**
+     * 一轮消耗的 token（四列，语义见 schema.sql 的注释）。
+     *
+     * 为什么单起一条、而不是并进 endTaskRun：endTaskRun 的每个字段都是
+     * `COALESCE(@x, x)` —— "没报就别动"。token 恰恰相反，**读到的就是最新的、要覆盖**：
+     * 7F/8F 每 1.5s 轮询一次、同一行反复写，正在跑的那一轮 token 是**长出来的**
+     * （第一次轮询只读得到一部分），COALESCE 会把偏小的那个值永久钉死。
+     * 各楼层真正的写入时机也只有一次（收工 / 每次轮询），不存在"该保留旧值"的场景。
+     *
+     * 读不到真值时调用方传 null —— 那就如实写 NULL，报表显示 "—"，不拿 0 或旧值冒充。
+     */
+    setTaskRunTokens: db.prepare(`
+      UPDATE task_runs SET
+        input_tokens       = @inputTokens,
+        output_tokens      = @outputTokens,
+        cache_read_tokens  = @cacheReadTokens,
+        cache_write_tokens = @cacheWriteTokens
+      WHERE id = @id
+    `),
     listTaskRuns: db.prepare(`
       SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?
     `),

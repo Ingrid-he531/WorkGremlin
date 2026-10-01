@@ -245,6 +245,48 @@ app.use('/api/v1', createIngestRouter({ bus }));
   const healed = await get('limit=50');
   ok('列表里 A 跟着变回「进行中」', stateOf(healed.body, 't-cli-a') === 'running', JSON.stringify(stateOf(healed.body, 't-cli-a')));
 
+  console.log('[7] 收工带上来的 token 落进 task_runs 四列 → 接口里读得到（取不到如实 NULL）');
+  /**
+   * 走**真上报路径**（POST /task/end → bus.endTask → setTaskRunTokens）：reporter hook、
+   * 7F Kilo / 8F OpenCode 轮询三路都汇到同一条语句上，所以在这里验一次就够。
+   */
+  const endStatus = await post('/task/end', {
+    taskId: 't-cli',
+    sessionId: 's-t-cli',
+    client: 'codex',
+    state: 'done',
+    tokens: { input: 385, output: 440, cacheRead: 93568, cacheWrite: 1024 },
+  });
+  ok('POST /task/end 200', endStatus === 200, String(endStatus));
+  // 没有 usage 的楼层（5F TraeCode / 6F Qoder transcript 里根本没有）整块不发 → 四列留空
+  const endNoTokens = await post('/task/end', { taskId: 't-old', sessionId: 's-t-old', client: 'codex', state: 'done' });
+  ok('不带 tokens 的收工也 200（缺字段不许把上报打挂）', endNoTokens === 200, String(endNoTokens));
+
+  const tkRows = await get('limit=50');
+  const tkRow = (tkRows.body.items || []).find((t) => t.id === 't-cli') || {};
+  ok(
+    '四列原样落库、且在 /task-runs 的 SELECT 里（渲染层靠它们画「输入 / 输出 token」）',
+    tkRow.input_tokens === 385 && tkRow.output_tokens === 440 && tkRow.cache_read_tokens === 93568 && tkRow.cache_write_tokens === 1024,
+    JSON.stringify([tkRow.input_tokens, tkRow.output_tokens, tkRow.cache_read_tokens, tkRow.cache_write_tokens])
+  );
+  const noTk = (tkRows.body.items || []).find((t) => t.id === 't-old') || {};
+  ok(
+    '没报 token 的那条四列是 null（不是 0 —— 详情显示 "—"，0 是"确实消耗为零"）',
+    noTk.input_tokens === null && noTk.output_tokens === null && noTk.cache_read_tokens === null && noTk.cache_write_tokens === null,
+    JSON.stringify([noTk.input_tokens, noTk.output_tokens, noTk.cache_read_tokens, noTk.cache_write_tokens])
+  );
+
+  // 同一轮收工两次（Stop 之后 SessionEnd 再来一刀、或打断路径紧随其后）：后一刀读不出 usage
+  // 就整块不带 —— 那种"没报"只该表示这次没带数，**不许把前一刀落的真值擦成 NULL**。
+  await post('/task/end', { taskId: 't-cli', sessionId: 's-t-cli', client: 'codex', state: 'done' });
+  const reEnded = await get('limit=50');
+  const reRow = (reEnded.body.items || []).find((t) => t.id === 't-cli') || {};
+  ok(
+    '二次收工没带 token → 已有的真值不被擦掉',
+    reRow.input_tokens === 385 && reRow.output_tokens === 440 && reRow.cache_write_tokens === 1024,
+    JSON.stringify([reRow.input_tokens, reRow.output_tokens, reRow.cache_write_tokens])
+  );
+
   server.close();
   close();
   fs.rmSync(WG_HOME, { recursive: true, force: true });

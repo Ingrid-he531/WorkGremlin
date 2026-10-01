@@ -52,7 +52,7 @@ function projectIdOf(s) {
  * 写一条台账（tasks + task_runs 两行）。8F 是**每一轮一条**。
  * @returns {string|null} 这条记录的 files_json（心跳里的 current_files 直接复用）
  */
-function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result }) {
+function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
   const running = st === 'running';
   repo.insertTask.run({
@@ -91,6 +91,16 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     filesJson,
     endedAt: endedAt || null,
     durationMs: endedAt && startedAt ? endedAt - startedAt : null,
+  });
+  /* 本轮消耗的 token（readOpencodeTurns 从 session_message.data.tokens 折出来，见 opencode.js）。
+     同 7F：**覆盖写**而不是 COALESCE —— 这一轮还在跑时每次轮询都会重算，数值是长出来的。
+     tokens 为 null（没读到）时如实写 NULL，不拿上一次的顶。 */
+  repo.setTaskRunTokens.run({
+    id,
+    inputTokens: tokens ? tokens.input : null,
+    outputTokens: tokens ? tokens.output : null,
+    cacheReadTokens: tokens ? tokens.cacheRead : null,
+    cacheWriteTokens: tokens ? tokens.cacheWrite : null,
   });
   return filesJson;
 }
@@ -258,6 +268,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
         state,
         files,
         result: t.endedAt ? t.result || '' : '',
+        tokens: t.tokens,
       });
       hbId = id;
       running = !t.endedAt;

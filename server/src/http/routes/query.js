@@ -168,6 +168,13 @@ function createQueryRouter({ bus, repo }) {
            tr.file_count AS file_count,
            tr.files_json AS files_json,
            tr.result AS result,
+           -- 这一轮消耗的 token（四列分列存，语义见 db/schema.sql 的注释：input_tokens
+           -- 只是**没命中缓存**的那部分）。取不到时如实是 NULL —— 前端显示 "—"，
+           -- **不是 0**（0 是"确实消耗为零"，跟"没读到"不是一回事）。
+           tr.input_tokens AS input_tokens,
+           tr.output_tokens AS output_tokens,
+           tr.cache_read_tokens AS cache_read_tokens,
+           tr.cache_write_tokens AS cache_write_tokens,
            CASE
              WHEN t.state = 'running'
                   AND NOT EXISTS (

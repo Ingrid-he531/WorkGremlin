@@ -524,6 +524,39 @@ function lastUserText(sessionId) {
  * @returns {Array<{index:number, prompt:string, startedAt:number, endedAt:number|null,
  *                  outcome:string, files:string[], result:string}>}
  */
+/** 非负数才认（与 reporter/src/usage.js 的 num 同口径：缺字段就是没有，不拿别的顶上） */
+function posNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 这份累计里真有数吗 —— 四项全 0 就是"没读到"，不是"消耗为零"（见调用处的 return） */
+function hasTokens(t) {
+  return Boolean(t) && t.input + t.output + t.cacheRead + t.cacheWrite > 0;
+}
+
+/**
+ * 把一条 assistant 消息的 `data.tokens` 折进本轮的累计。
+ *
+ * 形状与语义**同 7F Kilo**（`{input, output, reasoning, cache:{read,write}}`，`input` 不含缓存、
+ * `reasoning` 单列）—— 两家同源，OpenCode 只是没有 `total` 那一项（实测 314 条消息全都没有，
+ * 所以这里也没法用它自校验）。会话表 `session_v2.tokens_*` 是这些消息的累加
+ * （实测 277,421 vs 消息求和 277,410，差 11：最后一条还没并进会话计数器）。
+ *
+ * `reasoning` 并进 `output`，与 7F 及 Claude / Codex 保持同一列口径（理由见 kilo.js 同名函数）。
+ * @param {{input:number,output:number,cacheRead:number,cacheWrite:number}} acc 本轮累计（原地改）
+ * @param {any} t 一条消息的 data.tokens（形状不对就当没有）
+ */
+function foldOpencodeTokens(acc, t) {
+  if (!t || typeof t !== 'object') return acc;
+  const cache = t.cache && typeof t.cache === 'object' ? t.cache : {};
+  acc.input += posNum(t.input);
+  acc.output += posNum(t.output) + posNum(t.reasoning);
+  acc.cacheRead += posNum(cache.read);
+  acc.cacheWrite += posNum(cache.write);
+  return acc;
+}
+
 function readOpencodeTurns(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return [];
@@ -557,6 +590,7 @@ function readOpencodeTurns(sessionId) {
         lastAt: at,
         files: new Set(),
         closed: false,
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       };
       continue;
     }
@@ -574,6 +608,8 @@ function readOpencodeTurns(sessionId) {
     if (type === 'assistant') {
       const fin = String(d.finish || '');
       if (fin) cur.finish = fin;
+      // 本轮的 token 消耗：assistant 消息的 data.tokens 逐条累加（user / idle 行没有这一项）
+      foldOpencodeTokens(cur.tokens, d.tokens);
       // 这一轮的收尾自述：取 assistant 消息里的 text（后面的消息会覆盖前面的，
       // 所以最终留下的是"最后那条消息说的话"）。压空白 + 上限 4000，与 hook 那一路同口径。
       const said = (Array.isArray(d.content) ? d.content : [])
@@ -608,6 +644,8 @@ function readOpencodeTurns(sessionId) {
       outcome,
       files: [...t.files],
       result: t.result || '',
+      // 本轮消耗的 token（语义见 foldOpencodeTokens）。四项全 0 = 没读到 → null，台账留空
+      tokens: hasTokens(t.tokens) ? t.tokens : null,
     };
   });
 }

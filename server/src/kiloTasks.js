@@ -84,7 +84,7 @@ function projectIdOf(s) {
  * （它接受显式 state 与 result —— Kilo 两样都要：分辨 done / cancelled，以及这一轮的收尾自述）。
  * @returns {string|null} 这条记录的 files_json（心跳里的 current_files 直接复用）
  */
-function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result }) {
+function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
   const running = st === 'running';
   repo.insertTask.run({
@@ -123,6 +123,16 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     filesJson,
     endedAt: endedAt || null,
     durationMs: endedAt && startedAt ? endedAt - startedAt : null,
+  });
+  /* 本轮消耗的 token（readKiloRounds 从 message.data.tokens 折出来，语义见 kilo.js）。
+     这条语句是**覆盖写**而不是 COALESCE：这一轮还在跑时每次轮询都会重算，数值是长出来的，
+     用 COALESCE 会把第一次读到的那个偏小的值钉死。tokens 为 null 时如实写 NULL。 */
+  repo.setTaskRunTokens.run({
+    id,
+    inputTokens: tokens ? tokens.input : null,
+    outputTokens: tokens ? tokens.output : null,
+    cacheReadTokens: tokens ? tokens.cacheRead : null,
+    cacheWriteTokens: tokens ? tokens.cacheWrite : null,
   });
   return filesJson;
 }
@@ -320,6 +330,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       state: last.outcome,
       files: relFiles(last.files),
       result: last.endedAt ? last.result || '' : '',
+      tokens: last.tokens,
     });
     count += 1;
 
@@ -345,6 +356,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
           state: r.outcome,
           files: relFiles(r.files),
           result: r.endedAt ? r.result || '' : '',
+          tokens: r.tokens,
         });
         count += 1;
       }
@@ -371,6 +383,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
         state: old.outcome,
         files: relFiles(old.files),
         result: old.endedAt ? old.result || '' : '',
+        tokens: old.tokens,
       });
       count += 1;
     }

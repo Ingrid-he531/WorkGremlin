@@ -29,6 +29,7 @@
  *   D. 读不出来不许冒泡
  *     [B10] 逐轮清单：轮边界 / 收工判据 / 用户原话 / 改动文件（台账「每一轮一条」的真源）
  *     [B11] 逐轮清单的边界：没干完又过了窗口 → cancelled；compaction 注入不算新任务
+ *     [B12] 逐轮清单带 token 真值（reasoning 并进 output）；这一轮一条都没读到 → null 留空
  *     [D1] 库缺 event/message 表（Kilo 改版换表）→ 楼层仍列出，会话为空，接口不挂
  */
 'use strict';
@@ -568,6 +569,61 @@ head('[B11] 逐轮清单的两个边界：没干完又过了窗口 → cancelled
     String(rounds[0].endedAt)
   );
   ok('没干完的那轮不写收尾自述（半截话不算产出）', rounds[0].result === '', JSON.stringify(rounds[0].result));
+}
+
+head('[B12] 逐轮清单带 token 真值（reasoning 并进 output）；这一轮一条都没读到 → null 留空');
+{
+  const db = new Database(DB);
+  db.prepare('DELETE FROM event').run();
+  db.prepare('DELETE FROM message').run();
+  db.prepare('DELETE FROM part').run();
+  seq = 0;
+  const now = Date.now();
+
+  // 第 0 轮：两条 assistant 各带一份 tokens。Kilo 的语义与 Claude 一致
+  // （input **不含**缓存、reasoning **单列**），所以折法只有一处选择：reasoning 并进 output。
+  const u0 = addMessage(db, SID, { role: 'user', time: { created: now - 40 * MIN } }, now - 39 * MIN);
+  addPart(db, SID, u0, { type: 'text', text: JSON.stringify('把 token 落库') }, now - 39 * MIN);
+  const a0 = addMessage(
+    db,
+    SID,
+    {
+      role: 'assistant',
+      time: { created: now - 39 * MIN, completed: now - 38 * MIN },
+      finish: 'stop',
+      tokens: { total: 160, input: 100, output: 30, reasoning: 20, cache: { read: 5, write: 5 } },
+    },
+    now - 38 * MIN
+  );
+  addPart(db, SID, a0, { type: 'text', text: '落好了' }, now - 38 * MIN);
+  // 同一轮的第二次请求：后面这条的消息会覆盖 finish，但 token 是**逐条累加**的（一轮里可能有多次 API 请求）
+  addMessage(
+    db,
+    SID,
+    {
+      role: 'assistant',
+      time: { created: now - 37 * MIN },
+      finish: 'stop',
+      tokens: { total: 40, input: 10, output: 10, reasoning: 0, cache: { read: 20, write: 0 } },
+    },
+    now - 37 * MIN
+  );
+
+  // 第 1 轮：assistant 消息里**没有** tokens（老版本 Kilo 不写 / 这一轮还没跑完一次请求）
+  // —— 这一轮必须回 null，让台账留空，不写 4 个 0 冒充"消耗为零"。
+  const u1 = addMessage(db, SID, { role: 'user', time: { created: now - 30 * MIN } }, now - 29 * MIN);
+  addPart(db, SID, u1, { type: 'text', text: JSON.stringify('这一轮没数') }, now - 29 * MIN);
+  const a1 = addMessage(db, SID, { role: 'assistant', time: { created: now - 29 * MIN }, finish: 'tool-calls' }, now - 28 * MIN);
+  addPart(db, SID, a1, { type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'ls' } } }, now - 28 * MIN);
+  db.close();
+
+  const rounds = kilo.readKiloRounds(SID);
+  const t0 = rounds[0] && rounds[0].tokens;
+  ok('两条 assistant 的 token 逐条累加（input 100+10）', t0 && t0.input === 110, JSON.stringify(t0));
+  // 30+20(reasoning) + 10+0 —— reasoning 并进 output，跟 4F Claude 的 output_tokens 同口径
+  ok('reasoning 并进 output（30+20+10=60，不是 40）', t0 && t0.output === 60, t0 && String(t0.output));
+  ok('缓存读 / 写分列原样取（read 5+20、write 5+0）', t0 && t0.cacheRead === 25 && t0.cacheWrite === 5, JSON.stringify(t0));
+  ok('这一轮一条 tokens 都没读到 → null（不是 4 个 0）', rounds[1] && rounds[1].tokens === null, JSON.stringify(rounds[1] && rounds[1].tokens));
 }
 
 /* ------------------------------ D. 读不出来不许冒泡 ------------------------------ */

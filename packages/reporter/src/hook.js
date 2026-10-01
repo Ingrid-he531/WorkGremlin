@@ -52,6 +52,8 @@ const path = require('node:path');
 const { spawn, execSync } = require('node:child_process');
 
 const { readServerInfo, HTTP_ROUTES } = require('./index');
+// 本轮消耗的 token（读会话落盘的真值，读不到回 null → 服务端留 NULL）。见 usage.js 头部。
+const { turnTokens } = require('./usage');
 const { fnv1a32 } = require('@workgremlin/shared');
 // 进程间互斥 + 原子写：CLI 会在同一毫秒并行触发多个 hook 进程，各写各的会互相覆盖
 // （见 fslock.js 头部的实测记录）。writeState / updateState / updateFeedFile 都走这里。
@@ -1746,6 +1748,10 @@ async function main() {
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
     const result0 = String(last0 || '').trim().slice(0, RESULT_MAX);
     if (taskId0) {
+      /* 本轮消耗的 token：与 Stop 那条同源同口径（见 usage.js）。**被打断 ≠ 没消耗** ——
+         掐掉之前真跑过的那几次请求是花了 token 的，读得出就按真值落库；读不出整块不带，
+         服务端那一行留空（更是**不动**已有的值，见 bus.endTask）。 */
+      const tokens0 = turnTokens(ev0.transcript_path || st0.transcriptPath || '', startedAt0);
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
         memberId: AGENT,
@@ -1757,6 +1763,7 @@ async function main() {
         files: files0,
         fileCount: files0.length,
         form: sessionForm(st0, ev0),
+        ...(tokens0 ? { tokens: tokens0 } : {}),
       });
     }
     writeState(file, {
@@ -2093,6 +2100,11 @@ async function main() {
     if (taskId) {
       // 收工时再认一次形态（开轮时 rollout / transcript 还没落盘、读不出时兜底）：TASK_END 与开轮同口径
       const form = sessionForm(st, ev);
+      /* 本轮消耗的 token：从 transcript 里读真值（见 usage.js）。
+         必须在上面那次 taskId 回捞**之后**取 —— startedAt 是"本轮从哪开始"的唯一依据，
+         回捞回来的那份才准；取不到（Qoder 的 transcript 没有 usage、CodeBuddy 插件形态是
+         index.json、startedAt 未知…）就是 null，服务端留 NULL，报表显示 "—"。 */
+      const tokens = turnTokens(ev.transcript_path || st.transcriptPath || '', startedAt);
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
         memberId: AGENT,
@@ -2105,6 +2117,8 @@ async function main() {
         files: roundFileDetails,
         fileCount: roundFileDetails.length,
         form,
+        // 没有这一项就整块不带（服务端按"没报"处理），别发个 {} 让人以为报了 0
+        ...(tokens ? { tokens } : {}),
       });
     }
     // 每次 AI 回复都进对话记录（messages 表）——这是"每次回复入库"那条线，

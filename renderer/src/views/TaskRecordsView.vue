@@ -113,6 +113,50 @@ function fmtTokens(n) {
   if (n == null) return '—';
   return n.toLocaleString('en-US');
 }
+/**
+ * 本轮的**输入总量** = 非缓存 + 缓存读 + 缓存写。
+ *
+ * 库里三列是分开存的（语义见 server/src/db/schema.sql 的注释：`input_tokens` 只是**没命中缓存**
+ * 的那部分），而人问"这轮输入了多少"问的是整段送进去的上下文 —— 只显示 input_tokens 那一列，
+ * 4F Claude 会显示成 161 而实际是 46,497，看着像坏了。拆分明细挂在 title 上。
+ * 三列全 NULL = 这个楼层报不出 token（5F/6F/9F…）→ 返回 null 显示 "—"，
+ * 与"消耗为 0"区分开（后者会显示 0）。
+ */
+function inputTotalOf(t) {
+  if (!t) return null;
+  const parts = [t.input_tokens, t.cache_read_tokens, t.cache_write_tokens];
+  if (parts.every((v) => v == null)) return null;
+  return parts.reduce((s, v) => s + (Number(v) || 0), 0);
+}
+/**
+ * 「词元」那一行：四项**全摊开**、用 " / " 隔开（2026-10-01 用户要求）。
+ * 顺序照库里的列序 —— **非缓存输入 / 缓存读输入 / 缓存写输入 / 输出**，
+ * 前三项相加才是"这一轮输入总量"（库里 `input_tokens` 不含缓存，见 schema.sql 的注释；
+ * 只显示它的话 4F Claude 会出现 "5,662" 而实际送进去 1,457,438，看着像坏了）。
+ * 每一项各取各的：报不出 token 的楼层四项都是 "—"（**不是 0** ——"报不出来"与"消耗为零"是两回事）。
+ */
+function tokenQuadOf(t) {
+  const s = t || {};
+  return [s.input_tokens, s.cache_read_tokens, s.cache_write_tokens, s.output_tokens].map(fmtTokens).join(' / ');
+}
+/** 「词元」那一行的悬停说明：四个数各是什么（顺序与主行一致）+ 前三项的合计 */
+function tokenTitleOf(t) {
+  const head = '依次为：非缓存输入 / 缓存读输入 / 缓存写输入 / 输出';
+  const total = inputTotalOf(t);
+  return total == null ? head : `${head}（前三项合计 = 输入总量 ${fmtTokens(total)}）`;
+}
+/**
+ * 一条任务的**总词元** = 非缓存输入 + 缓存读输入 + 缓存写输入 + 输出（四项全加）。
+ * 汇总报表「按时间」那张表（一行一个任务）的「词元」列用它。
+ * 四项全 NULL（5F TraeCode / 6F Qoder 这些报不出 token 的楼层）→ null 显示 "—"，
+ * 与"消耗为 0"区分开（后者会显示 0）。
+ */
+function totalTokensOf(t) {
+  if (!t) return null;
+  const parts = [t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens];
+  if (parts.every((v) => v == null)) return null;
+  return parts.reduce((s, v) => s + (Number(v) || 0), 0);
+}
 const STATE_LABEL = { all: '全部', pending: '待命', running: '运行中', done: '完成', failed: '失败', cancelled: '已取消' };
 function stateLabel(s) {
   return STATE_LABEL[s] || s || '—';
@@ -264,7 +308,7 @@ const reportGroups = computed(() => {
     const k = dimValue(t, dim);
     let g = map.get(k);
     if (!g) {
-      g = { key: k, label: dimLabel(t, dim), taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0 };
+      g = { key: k, label: dimLabel(t, dim), taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 };
       map.set(k, g);
     }
     g.taskCount += 1;
@@ -273,6 +317,10 @@ const reportGroups = computed(() => {
     g.fileCount += Number(t.file_count) || 0;
     const d = Number(t.duration_ms) || 0;
     if (d > 0) { g.durationSum += d; g.durN += 1; }
+    // 词元合计：**只累加报得出 token 的任务**（报不出的不计入、也不当 0 拉低，
+    // 口径与「按时间」那张表的表尾合计一致）。tokenN 记"这一组有几条真有数"。
+    const tk = totalTokensOf(t);
+    if (tk != null) { g.tokenSum += tk; g.tokenN += 1; }
   }
   return [...map.values()].map((g) => {
     const avgDuration = g.durN ? g.durationSum / g.durN : 0;
@@ -288,11 +336,13 @@ const reportTotal = computed(() => {
       fileCount: s.fileCount + g.fileCount,
       durationSum: s.durationSum + g.durationSum,
       durN: s.durN + g.durN,
+      tokenSum: s.tokenSum + g.tokenSum,
+      tokenN: s.tokenN + g.tokenN,
     }),
-    { taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0 }
+    { taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 }
   );
   const avgDuration = a.durN ? a.durationSum / a.durN : 0;
-  return { label: '合计', taskCount: a.taskCount, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration };
+  return { label: '合计', taskCount: a.taskCount, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration, tokenSum: a.tokenSum, tokenN: a.tokenN };
 });
 const reportSorted = computed(() => {
   const rows = reportGroups.value.slice();
@@ -336,11 +386,30 @@ function timeSortCls(key) {
 }
 const timeRows = computed(() => {
   const { key, dir } = timeSort.value;
-  const val = (t) => Number(key === 'duration_ms' ? t.duration_ms : t.started_at) || 0;
+  const val = (t) => {
+    if (key === 'tokens') return Number(totalTokensOf(t)) || 0;
+    if (key === 'duration_ms') return Number(t.duration_ms) || 0;
+    return Number(t.started_at) || 0;
+  };
   return list.value.slice().sort((a, b) => (dir === 'asc' ? val(a) - val(b) : val(b) - val(a)));
 });
 /** 表尾那一行：条数 + 总时长（没收工的任务没有 duration，不计入，不编造） */
 const timeTotalMs = computed(() => timeRows.value.reduce((s, t) => s + (Number(t.duration_ms) || 0), 0));
+/**
+ * 表尾的词元合计：**只累加报得出 token 的那些任务**（报不出的不计入，也不当 0 拉低）。
+ * 一条都报不出 → null 显示 "—"（这一屏压根没有真值，写 0 会让人以为"跑了但不耗词元"）。
+ */
+const timeTotalTokens = computed(() => {
+  let sum = 0;
+  let n = 0;
+  for (const t of timeRows.value) {
+    const v = totalTokensOf(t);
+    if (v == null) continue;
+    sum += v;
+    n += 1;
+  }
+  return n ? sum : null;
+});
 
 /** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
 function drillDown(row) {
@@ -379,13 +448,15 @@ function downloadCsv(fileName, lines) {
 /** 导出报表为 CSV（客户端下载，含当前排序与合计行；按时间那一版导的就是逐条任务） */
 function exportCsv() {
   if (reportDim.value === 'time') {
-    const head = ['时间', '任务', '客户端', '模型', '工程', '时长(ms)', '状态'];
+    const head = ['时间', '任务', '客户端', '模型', '工程', '词元', '时长(ms)', '状态'];
     const rows = timeRows.value.map((t) => [
       fmtTime(t.started_at),
       promptOf(t) || '(未命名任务)', // 导出用完整标题，别把省略号也导出去
       clientLabel(t.client, t.form),
       t.model || '',
       projectOf(t),
+      // 词元导出的是**裸数字**（不带千位逗号，Excel 才好当数值算）；取不到留空，不写 0
+      totalTokensOf(t) == null ? '' : totalTokensOf(t),
       t.duration_ms == null ? '' : Math.round(t.duration_ms),
       stateLabel(t.state),
     ]);
@@ -393,14 +464,18 @@ function exportCsv() {
     return;
   }
   const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
-  const head = ['维度', '任务数', '成功数', '取消数', '改动文件数', '总耗时(ms)', '平均耗时(ms)'];
+  const head = ['维度', '任务数', '成功数', '取消数', '改动文件数', '词元合计', '总耗时(ms)', '平均耗时(ms)'];
+  // 词元导出**裸数字**（不带千位逗号，Excel 里才能直接算）；这一组没有真值就留空，不写 0
+  const tokenCell = (x) => (x.tokenN ? x.tokenSum : '');
   const rows = reportSorted.value.map((r) => [
     r.label, r.taskCount, r.successCount, r.cancelCount, r.fileCount,
+    tokenCell(r),
     Math.round(r.durationSum), Math.round(r.avgDuration),
   ]);
   const totalLine = [
     reportTotal.value.label, reportTotal.value.taskCount, reportTotal.value.successCount,
     reportTotal.value.cancelCount, reportTotal.value.fileCount,
+    tokenCell(reportTotal.value),
     Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration),
   ];
   rows.push(totalLine);
@@ -678,6 +753,14 @@ async function saveRetention() {
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
             <div class="k">文件变化</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
+            <!-- 本轮消耗的词元：四项摊开、用 " / " 隔开（2026-10-01 用户要求）——
+                 `非缓存输入 / 缓存读输入 / 缓存写输入 / 输出`，顺序与库里的列序一致，
+                 鼠标悬停看这四个数各是什么。真值来自各楼层自己的会话落盘
+                 （见 reporter/src/usage.js），拿不到的楼层（5F TraeCode 没有 usage、
+                 6F Qoder 的 transcript 里没有、2F/9F 没接）显示 "—"，不显示 0 ——
+                 「报不出来」和「消耗为零」是两回事。 -->
+            <div class="k">词元</div>
+            <div class="v" :title="tokenTitleOf(tasks.selectedTask)">{{ tokenQuadOf(tasks.selectedTask) }}</div>
           </div>
 
           <div v-if="filesOf(tasks.selectedTask).length" class="files">
@@ -826,7 +909,7 @@ async function saveRetention() {
         <button type="button" class="btn export" @click="exportCsv">导出 CSV</button>
       </div>
 
-      <!-- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 时长 / 状态 -->
+      <!-- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 词元 / 时长 / 状态 -->
       <div v-if="reportDim === 'time' && timeRows.length" class="report-scroll">
         <table class="report-table">
           <thead>
@@ -836,6 +919,9 @@ async function saveRetention() {
               <th class="th-dim">客户端</th>
               <th class="th-dim">模型</th>
               <th class="th-dim">工程</th>
+              <!-- 一行一个任务，这一列 = **这条任务的总词元**（四项全加，见 totalTokensOf）。
+                   悬停看四项拆分；报不出 token 的楼层显示 "—"（不是 0）。 -->
+              <th class="sortable num" :class="timeSortCls('tokens')" @click="sortTimeBy('tokens')" title="这一轮消耗的总词元（非缓存输入 + 缓存读 + 缓存写 + 输出）">词元</th>
               <th class="sortable num" :class="timeSortCls('duration_ms')" @click="sortTimeBy('duration_ms')">时长</th>
               <th class="th-dim">状态</th>
             </tr>
@@ -848,6 +934,7 @@ async function saveRetention() {
               <td class="td-dim">{{ clientLabel(t.client, t.form) }}</td>
               <td class="td-dim">{{ t.model || '—' }}</td>
               <td class="td-dim">{{ projectOf(t) }}</td>
+              <td class="num" :title="tokenTitleOf(t)">{{ fmtTokens(totalTokensOf(t)) }}</td>
               <td class="num">{{ fmtDuration(t.duration_ms) }}</td>
               <td class="td-dim" :class="'st-' + t.state">{{ stateLabel(t.state) }}</td>
             </tr>
@@ -859,6 +946,8 @@ async function saveRetention() {
               <td class="td-dim" />
               <td class="td-dim" />
               <td class="td-dim" />
+              <!-- 合计只累加报得出 token 的任务；一条都没有 → "—"（不拿 0 顶） -->
+              <td class="num">{{ fmtTokens(timeTotalTokens) }}</td>
               <td class="num">{{ fmtDuration(timeTotalMs) }}</td>
               <td class="td-dim" />
             </tr>
@@ -875,6 +964,8 @@ async function saveRetention() {
               <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">成功数</th>
               <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">取消数</th>
               <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">改动文件数</th>
+              <!-- 词元合计 = 这一组里**报得出 token 的那些任务**的四项全加（与「按时间」表尾同一口径） -->
+              <th class="sortable num" :class="sortCls('tokenSum')" @click="sortBy('tokenSum')" title="这一组任务的词元合计（只累加报得出 token 的；非缓存输入 + 缓存读 + 缓存写 + 输出）">词元合计</th>
               <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">总耗时</th>
               <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">平均耗时</th>
             </tr>
@@ -891,6 +982,8 @@ async function saveRetention() {
               <td class="num">{{ r.successCount }}</td>
               <td class="num">{{ r.cancelCount }}</td>
               <td class="num">{{ r.fileCount }}</td>
+              <!-- 一条都没报出 token 的组显示 "—"（不是 0 ——「报不出来」与「消耗为零」是两回事） -->
+              <td class="num">{{ fmtTokens(r.tokenN ? r.tokenSum : null) }}</td>
               <td class="num">{{ fmtDuration(r.durationSum) }}</td>
               <td class="num">{{ fmtDuration(r.avgDuration) }}</td>
             </tr>
@@ -902,6 +995,7 @@ async function saveRetention() {
               <td class="num">{{ reportTotal.successCount }}</td>
               <td class="num">{{ reportTotal.cancelCount }}</td>
               <td class="num">{{ reportTotal.fileCount }}</td>
+              <td class="num">{{ fmtTokens(reportTotal.tokenN ? reportTotal.tokenSum : null) }}</td>
               <td class="num">{{ fmtDuration(reportTotal.durationSum) }}</td>
               <td class="num">{{ fmtDuration(reportTotal.avgDuration) }}</td>
             </tr>

@@ -284,6 +284,40 @@ function filesOf(raw) {
  * @returns {Array<{index:number, prompt:string, startedAt:number, endedAt:number|null,
  *   outcome:'running'|'done'|'cancelled', files:string[], result:string}>}
  */
+/**
+ * 把一条 assistant 消息的 `data.tokens` 折进本轮的累计。
+ *
+ * 库里那一项的形状是 `{total, input, output, reasoning, cache:{read,write}}`，语义**与 Claude 一致**
+ * （`input` 不含缓存、`reasoning` 单列）：全库实测 `input+output+reasoning+read+write == total`
+ * （590 条里 589 条精确成立，1 条差 26 —— Kilo 自己写的，不是我们算的）。
+ *
+ * 折法只有一处选择：**reasoning 并进 output**。因为对账的另一头 Claude 的 `output_tokens`
+ * 本来就含思考（`output_tokens_details.thinking_tokens` 是它的明细），Codex 的 `output_tokens`
+ * 同理（`reasoning_output_tokens` 含在里面）。留着单列，同一列在 7F/8F 会凭空少一截。
+ * @param {{input:number,output:number,cacheRead:number,cacheWrite:number}} acc 本轮累计（原地改）
+ * @param {any} t 一条消息的 data.tokens（形状不对就当没有）
+ */
+function foldKiloTokens(acc, t) {
+  if (!t || typeof t !== 'object') return acc;
+  const cache = t.cache && typeof t.cache === 'object' ? t.cache : {};
+  acc.input += posNum(t.input);
+  acc.output += posNum(t.output) + posNum(t.reasoning);
+  acc.cacheRead += posNum(cache.read);
+  acc.cacheWrite += posNum(cache.write);
+  return acc;
+}
+
+/** 非负数才认（与 reporter/src/usage.js 的 num 同口径：缺字段就是没有，不拿别的顶上） */
+function posNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 这份累计里真有数吗 —— 四项全 0 就是"没读到"，不是"消耗为零"（见调用处的 return） */
+function hasTokens(t) {
+  return Boolean(t) && t.input + t.output + t.cacheRead + t.cacheWrite > 0;
+}
+
 function readKiloRounds(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return [];
@@ -379,6 +413,7 @@ function readKiloRounds(sessionId) {
         over: false,
         files: new Set(),
         result: '',
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       };
       foldAt(cur, own);
       continue;
@@ -387,6 +422,8 @@ function readKiloRounds(sessionId) {
     if (!cur) continue; // 会话开头不是 user 消息的，不编一轮
     cur.lastAt = Math.max(cur.lastAt, at);
     foldAt(cur, own);
+    // 本轮的 token 消耗：assistant 消息的 data.tokens 逐条累加（user 消息没有这一项）
+    foldKiloTokens(cur.tokens, md.tokens);
     if (turnIsOver(m.data)) cur.over = true;
     const fin = String(md.finish || '');
     if (fin) cur.finish = fin;
@@ -427,6 +464,10 @@ function readKiloRounds(sessionId) {
       outcome,
       files: [...r.files],
       result: r.result,
+      // 本轮消耗的 token（语义见 foldKiloTokens）。四项全 0 = 这一轮库里一条 tokens 都没有
+      // （Kilo 老版本不写这一项、或这一轮还没跑完一次请求）→ **null**，让台账留空，
+      // 而不是写 4 个 0 冒充"消耗为零"。
+      tokens: hasTokens(r.tokens) ? r.tokens : null,
     };
   });
 }

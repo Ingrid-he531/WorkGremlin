@@ -34,6 +34,7 @@
     "test:plugin-e2e": "node server/test/kiloPluginE2E.test.js",
     "test:ghost-feed": "node server/test/ghostFeed.test.js",
     "test:opencode": "node server/test/opencodeFloor.test.js",
+    "test:tokens": "node server/test/taskTokens.test.js",
     "test:done-shape": "node server/test/doneShape.test.js",
     "test:task-filter": "node server/test/taskFilter.test.js",
     "test:claude-model": "node server/test/claudeModel.test.js",

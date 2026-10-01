@@ -98,6 +98,29 @@ function jsonOrNull(v) {
   }
 }
 
+/** 一个 token 计数：非负整数才认（浮点四舍五入、负数与非有限值一律当"没报"） */
+function normCount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+/**
+ * 收工带上来的 token（`{input, output, cacheRead, cacheWrite}`，语义见 schema.sql 的注释）。
+ * 整块没带 / 某一项读不出 → 该项 NULL：报表留空显示 "—"，**不拿 0 冒充**"消耗为零"。
+ * 取不到的楼层（5F TraeCode 无 usage、6F Qoder transcript 里没有、9F Copilot 没接）
+ * 本来就整块不发，反正留空。
+ * @returns {{input: number|null, output: number|null, cacheRead: number|null, cacheWrite: number|null}}
+ */
+function normTokens(t) {
+  const o = t && typeof t === 'object' ? t : {};
+  return {
+    input: normCount(o.input),
+    output: normCount(o.output),
+    cacheRead: normCount(o.cacheRead),
+    cacheWrite: normCount(o.cacheWrite),
+  };
+}
+
 /**
  * 当前 HEAD 的 commit sha（工作区不是 git 仓库 / 没装 git 时返回 null）。
  * 用于"任务开始时"打基线，任务结束时再 diff 基线..HEAD 拿全量改动（含已提交部分）。
@@ -685,6 +708,24 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         endedAt: ts,
         durationMs: startedAt && ts > startedAt ? ts - startedAt : null,
       });
+      /* 本轮消耗的 token：hook / 插件从会话落盘里读出来的真值
+         （见 reporter/src/usage.js 与 plugin/index.js）。
+         取不到就是 NULL —— 这一列空着表示"这个楼层报不出来"，与"消耗为 0"是两回事。
+
+         **整块没带就不动这一行已有的值**（不是写 NULL）：同一个 taskId 可能被收工两次
+         （Stop 之后再来一刀 SessionEnd / 打断路径），后一刀读不出 usage 时若照着 NULL 写，
+         会把前一刀落的真值擦掉 —— "没报"只该表示"这次没带数"，不该抹掉已经记下的数。
+         全新的一行本来就是 NULL，所以"不动"与"留空"在这里是同一个结果。 */
+      if (p.tokens && typeof p.tokens === 'object') {
+        const tk = normTokens(p.tokens);
+        repo.setTaskRunTokens.run({
+          id: p.taskId,
+          inputTokens: tk.input,
+          outputTokens: tk.output,
+          cacheReadTokens: tk.cacheRead,
+          cacheWriteTokens: tk.cacheWrite,
+        });
+      }
     }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));

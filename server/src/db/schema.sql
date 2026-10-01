@@ -171,7 +171,18 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_member_ts ON artifacts(member_id, ts_ms
 -- 一轮**用户任务**的台账（报表主表）。
 -- 主键就是 tasks.id（主 agent 那一轮的任务），不另起一套 id —— 用户任务的起止、
 -- 输入（用户原话）、产出都在 tasks / artifacts 里，这里只补"报表要算"的那几列。
--- 没有真值就留 NULL（token 尤其如此）：本环境 hook 不报 usage、插件也没落盘，绝不编造。
+-- 没有真值就留 NULL，绝不编造。
+--
+-- 四列 token 的**统一语义**（各楼层的原始口径不同，落库前已归一，见 reporter/src/usage.js）：
+--   input_tokens       = 本轮**没命中缓存**的那部分输入
+--   cache_read_tokens  = 本轮命中缓存的输入
+--   cache_write_tokens = 本轮写入缓存的输入
+--   output_tokens      = 本轮模型吐出的（**含思考**）
+-- 恒有 input + cache_read + cache_write = 这一轮所有请求的 prompt 总长。之所以要归一：
+-- Claude / Kilo / OpenCode 的原始 `input` 本来就不含缓存，而 Codex 与 CodeBuddy 的中转上报里
+-- `input_tokens`(prompt_tokens) **含**缓存命中（本机实测 hit+miss==prompt，142/142 条成立）。
+-- 不归一，同一列在 1F/3F 记的是整段上下文、在 4F/7F/8F 只记没命中缓存的那一小截。
+-- 轮的粒度：一轮用户任务里的**每一次 API 请求**都算（计费口径），不是"最后一次请求的上下文"。
 CREATE TABLE IF NOT EXISTS task_runs (
   id                  TEXT PRIMARY KEY,   -- = tasks.id
   project_id          TEXT NOT NULL,

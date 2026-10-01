@@ -34,6 +34,7 @@
  *     [C2] finish=tool-calls → 不算完成（还要接着调工具）
  *     [C3] finish=error → 不算完成
  *     [C4] 过期的完成标记（DONE_TTL_MS 之外）→ 当没有
+ *     [C5] 逐轮清单带 token 真值（reasoning 并进 output）；这一轮一条都没读到 → null 留空
  *   D. 读不出来不许冒泡
  *     [D1] 库缺 session_message 表（OpenCode 改版换表）→ 楼层仍列出，会话表仍读得出、
  *         相位/完成标记/instrumented 如实回空，接口不挂（**降级而不是瘫**）
@@ -487,6 +488,65 @@ head('[C2] 被打断的一轮（idle.outcome=interrupted）→ 完成标记带 d
   ok('被打断的一轮也回一枚完成标记（不然主控制台拿不到"这一轮结束了"）', d && d.doneAt > 0, JSON.stringify(d));
   ok('且带 doneCancelled=true（→ 红色「任务取消」，不是「任务完成」）', d && d.doneCancelled === true, JSON.stringify(d));
   ok('正常完成的那条 doneCancelled=false（不臆造取消）', opencode.readOpencodeDone('ses_done0000000000000000000001', {}).doneCancelled === false);
+}
+
+/* ------------------------------ C3. 每一轮的 token 真值 ------------------------------ */
+
+head('[C5] 逐轮清单带 token 真值（reasoning 并进 output）；这一轮一条都没读到 → null 留空');
+{
+  const db = new Database(DB);
+  const sid = 'ses_tokens00000000000000000001';
+  const msg = db.prepare(
+    `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)`
+  );
+  const put = (seq, type, data, at) => msg.run(`${sid}#${seq}`, sid, type, seq, at, at, JSON.stringify(data));
+
+  // 第 0 轮：两条 assistant 各带一份 tokens。形状与语义**同 7F Kilo**（input 不含缓存、reasoning 单列），
+  // 所以折法也一样：reasoning 并进 output（Claude 的 output_tokens 本来就含思考）。
+  put(1, 'user', { time: { created: now - 40 * 60_000 }, text: '把 token 落库' }, now - 40 * 60_000);
+  put(
+    2,
+    'assistant',
+    {
+      time: { created: now - 39 * 60_000, completed: now - 38 * 60_000 },
+      finish: 'tool-calls',
+      tokens: { input: 100, output: 30, reasoning: 20, cache: { read: 5, write: 5 } },
+      content: [{ type: 'text', text: '落好了' }],
+    },
+    now - 38 * 60_000
+  );
+  // 同一轮的第二次请求：token 逐条累加（一轮里可能有多次 API 请求）
+  put(
+    3,
+    'assistant',
+    {
+      time: { created: now - 37 * 60_000, completed: now - 36 * 60_000 },
+      finish: 'stop',
+      tokens: { input: 10, output: 10, reasoning: 0, cache: { read: 20, write: 0 } },
+      content: [{ type: 'text', text: '都好了' }],
+    },
+    now - 36 * 60_000
+  );
+  put(4, 'idle', { time: { created: now - 35 * 60_000 }, outcome: 'succeeded' }, now - 35 * 60_000);
+
+  // 第 1 轮：assistant 行里**没有** tokens（老版本 OpenCode 不写 / 这一轮还没跑完一次请求）
+  // —— 这一轮回 null，让台账留空，不写 4 个 0 冒充"消耗为零"。
+  put(5, 'user', { time: { created: now - 20 * 60_000 }, text: '这一轮没数' }, now - 20 * 60_000);
+  put(
+    6,
+    'assistant',
+    { time: { created: now - 19 * 60_000, completed: now - 18 * 60_000 }, finish: 'stop', content: [{ type: 'text', text: '嗯' }] },
+    now - 18 * 60_000
+  );
+  put(7, 'idle', { time: { created: now - 17 * 60_000 }, outcome: 'succeeded' }, now - 17 * 60_000);
+  db.close();
+
+  const turns = opencode.readOpencodeTurns(sid);
+  const t0 = turns[0] && turns[0].tokens;
+  ok('两条 assistant 的 token 逐条累加（input 100+10）', t0 && t0.input === 110, JSON.stringify(t0));
+  ok('reasoning 并进 output（30+20+10=60，不是 40）', t0 && t0.output === 60, t0 && String(t0.output));
+  ok('缓存读 / 写分列原样取（read 5+20、write 5+0）', t0 && t0.cacheRead === 25 && t0.cacheWrite === 5, JSON.stringify(t0));
+  ok('这一轮一条 tokens 都没读到 → null（不是 4 个 0）', turns[1] && turns[1].tokens === null, JSON.stringify(turns[1] && turns[1].tokens));
 }
 
 /* ------------------------------ D. 读不出来不许冒泡 ------------------------------ */
