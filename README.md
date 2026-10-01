@@ -6,9 +6,6 @@
 
 ![WorkGremlin 演示：办公室里的主 Agent 与小怪物 → 任务记录的图形看板](docs/assets/demo.gif)
 
-> 上面这段是自己录的：`scripts/record-demo.py` 录屏 → `scripts/make-demo-gif.sh` 转 GIF
-> （自动裁掉录屏黑边、两遍调色板压到 1000px 宽）。重新录一段后重跑这两条命令即可。
-
 ## 快速开始
 
 ```bash
