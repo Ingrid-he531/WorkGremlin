@@ -29,7 +29,16 @@ import {
 } from './iso';
 import { CONSOLE } from './officeMap';
 
-/** 屏幕第一层：五个阶段。busy 决定有没有光标 / 加载动画 */
+/**
+ * 屏幕第一层：相位表。busy 决定有没有光标 / 加载动画。
+ *
+ * 2026-10-01 去掉「规划中（plan）」与「汇总中（summarize）」两个相位：它们只活在演示脚本里，
+ * 真机上不产生 —— upstream 要么是演示编排，要么是服务端两条几乎触发不到的推断分支
+ * （IDE 插件的 awaitingSessionIdle / 排队消息，见 server/src/sessions.js），而 reporter hook、
+ * Kilo、OpenCode 都明确不把 step-start / step-finish 映射成它们（一步边界太频繁，映射后
+ * 每次工具跑完都会卡在「汇总中」）。留着会让人以为真有一种"规划 / 汇总"工作阶段。
+ * 那两类信息改用「待命中 + 操作行说明」表达（见 mainAgent.enterPause / sessions.inferPhase）。
+ */
 export const PHASES = {
   idle: { label: '待命中', color: '#6b7c94', glow: 0.22, busy: false },
   /**
@@ -37,11 +46,9 @@ export const PHASES = {
    * 也不假装它在调工具（以前会显示「调用工具 · 改 xxx.jsonl」，那是拿文件名编造）。
    */
   unreported: { label: '未上报', color: '#6b7c94', glow: 0.18, busy: false },
-  plan: { label: '规划中', color: '#7fb0ff', glow: 0.55, busy: true },
   thinking: { label: '思考中', color: '#ffcf5c', glow: 0.6, busy: true },
   tool: { label: '调用工具', color: '#4c8dff', glow: 0.85, busy: true },
   dispatch: { label: '委托专家', color: '#7fb0ff', glow: 1.0, busy: true },
-  summarize: { label: '汇总中', color: '#2fbf71', glow: 0.7, busy: true },
   /** 任务完成：屏上写"任务完成"，剪影回到静观；内容第三层显示本次改动概要 */
   done: { label: '任务完成', color: '#2fbf71', glow: 0.5, busy: false },
   /**

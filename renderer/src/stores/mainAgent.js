@@ -18,7 +18,10 @@
  *      屏上第一行与 tooltip 第一行统一写「调用工具」（见 iso/mainConsole.js 的
  *      consolePhaseLabel），操作仍是实际命令，互不串味；
  *   3) 会话停止（setLiveState/applySession 收到 null，或手动 stop）时，先亮出
- *      "任务完成/已暂停" 摘要（summarize）持续 10s，期间无新事件则退回待命(idle)。
+ *      "任务完成 / 已暂停" 摘要持续 10s，期间无新事件则退回待命(idle)。
+ *   4) 2026-10-01：演示脚本不再演「规划中」；`stop()` 亮出的「已暂停」也不再借用
+ *      summarize（「汇总中」）相位 —— 这两个相位真机上不产生，已从 PHASES 里去掉
+ *      （见 iso/mainConsole.js）。暂停现在就是"待命中 + 操作行写『已暂停』"。
  */
 
 import { defineStore, acceptHMRUpdate } from 'pinia';
@@ -28,7 +31,6 @@ import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
 const SCRIPT = [
   { phase: 'idle', action: '', context: ['等待派单'], skill: '', tool: '', prompt: '', ms: 6000 },
-  { phase: 'plan', action: '正在拆解任务', context: ['任务：重构用户登录模块', '目标：拆成 3 个子任务'], skill: 'planning（规划）', tool: '', prompt: '请帮我重构用户登录模块', ms: 5200 },
   { phase: 'thinking', action: '正在分析你的请求', context: ['任务：重构用户登录模块', '思考：先理清登录链路'], skill: 'reasoning（推理）', tool: '', prompt: '请帮我重构用户登录模块，先理清登录链路', ms: 4200 },
   { phase: 'tool', action: '正在读取 src/main.js', context: ['任务：重构用户登录模块', '进度：已读取 1 个文件'], skill: '', tool: 'mcp: filesystem.read_file', prompt: '', ms: 3800 },
   { phase: 'tool', action: '正在搜索 login 相关引用', context: ['任务：重构用户登录模块', '进度：已读取 3 个文件', '命中：7 处引用'], skill: '', tool: 'mcp: ripgrep.search', prompt: '', ms: 3800 },
@@ -307,10 +309,16 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.prompt = '';
     },
 
-    /** 手动暂停演示：亮出"已暂停"摘要（summarize 阶段），持续 10s 后退回待命 */
+    /**
+     * 手动暂停演示：亮出"已暂停"提示，持续 10s 后退回待命。
+     *
+     * 相位用 idle（「待命中」）而不是另造一个：暂停就是"没在干活"，屏上第一行写「待命中」
+     * 是对的；"已暂停"这三个字写在 tooltip 的操作行上。以前借 summarize（「汇总中」）
+     * 当暂停的相位，看着像真有个"汇总"阶段（2026-10-01 去掉，见 iso/mainConsole.js 的 PHASES）。
+     */
     enterPause(summary = '已暂停 · 等待下一步') {
       clearTimeout(stopTimer);
-      this.phase = 'summarize';
+      this.phase = 'idle';
       this.action = summary;
       this.context = [];
       this.tool = '';

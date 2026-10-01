@@ -375,3 +375,37 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 实测：手工往 `__demo__` 塞 `role='subagent'` 的 leo（复现"灰着的残留"）→ 切出再切回演示即清掉、
 用户级 simmon 保留；再塞 susan 后**重启服务**（落盘仍停在演示工程）也在启动期清掉。
 （`ops[灰]` 是演示数据里**故意**留的 degraded 样本，不是残留。）
+
+**演示模式两处收尾**（2026-10-01，用户实测提的两条）：
+
+① **去掉「规划中（plan）/ 汇总中（summarize）」两个相位**。它们只活在演示脚本里，真机上不产生：
+   reporter hook 只写 `await/idle/thinking/tool/done`；Kilo / OpenCode 明确不把 `step-start` /
+   `step-finish` 映射成它们（一步边界太频繁，映射后每次工具跑完都卡在「汇总中」，见 `kilo.js`）；
+   服务端 `inferPhase` 那两条推断分支（IDE 插件的 `awaitingSessionIdle` / 排队消息）没有实测样本。
+   改动：`iso/mainConsole.js` 的 `PHASES` 删掉两项；演示 `SCRIPT` 删掉 plan 那一站；
+   `mainAgent.enterPause()`（`stop()` 亮「已暂停」用的）改成"待命中 + 操作行写已暂停"，不再借 summarize；
+   `sessions.inferPhase` 那两条分支同样落回 `idle + action`（信息没丢，只是不再冒充一个工作阶段）。
+
+② **退出演示后，演示小怪物在真实工程里"闪回来"**。根因在**事件串工程**，不在渲染帧：
+   渲染层的 WS 订阅不带 `project`（它显示的是"服务端当前打开的那个工程"），服务端于是把
+   **所有**工程的 `member.status` 都送过来，而 `upsertMember` 只看事件类型、不看工程。
+   退出演示后 `__demo__` 那 8 只不再有心跳，60s 后 `bus.sweepDegraded()`（每 10s 扫一次）
+   在把它们标成 degraded 的同时**逐个广播了成员卡** → 客户端照单收下 → 屋里闪回 8 只 →
+   下一次对账（15s，整份快照覆盖）又清掉。**改法**：成员卡带上 `project`（`bus.buildMemberCard`），
+   渲染层用 `lib/projectScope.js` 的 `memberBelongsToProject()` 在 `applyWorkspace` /
+   `applySnapshot` / `upsertMember` 三处过滤（缺字段一律放行，老服务端 / 老事件不受影响）；
+   `applyWorkspace` 那一道还顺手把"换工程之后、新快照到达之前"的旧工程成员立刻撤掉。
+   回归：`npm run test:project-scope`（判据）+ 真服务端复现脚本（退出演示 → 强制扫一次超时 → 屋里仍为 0 人）。
+
+**小幽灵一律从大门飘进来**（2026-10-01）：演示模式那两只临时成员和真实场景里被召唤的
+subagent 实例走的是同一套（`engine.js` 的 `makeGhost` / `stepGhosts`）。以前幽灵是**凭空出现在
+悬浮点**上的，现在：① 先在门外候场（`gx < 0`，整只不画 —— 等距投影下墙外那点身子会从门缝里
+漏到关着的门板上）；② 等**所有小怪物都进了屋**（`entering` / `atDoor` 全清，开闸时刻记在
+`ghostGateAt`）再一个接一个出发（间隔 `GHOST_ENTRY_STAGGER` 420ms，名次取同批序号）；
+③ 从门外飘向自己的悬浮点，这一段用更快的 `GHOST_ENTRY_SPEED`，且 `gx < 0` 时同小怪物一样
+裁在门洞里 —— 看着就是"从门口飘进来"；穿越门洞期间 `atDoor` 让 `stepDoor` 把门敞着。
+兜底：`GHOST_ENTRY_WAIT_MAX`（5s）—— 召唤会打断小怪物的入场（直接落座 / 被叫去控制台），
+不能因为有人一直没落座就把幽灵永远关在门外；`setMembers` 里只要有**新**小怪物进来就把闸门
+重新关上一档（`if (enterSlot) ghostGateAt = 0`），已经在屋里飘着的幽灵不受影响。
+实测（无头驱动引擎、演示那份 6 人 + 2 幽灵的名单）：小怪物 676→3092ms 依次进屋，
+两只幽灵 4254ms / 4466ms 才从门口出现。

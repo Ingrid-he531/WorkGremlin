@@ -1008,6 +1008,12 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // 临时成员（无工位 → 场景里飘着的幽灵）+ 所属项目名
       ephemeral: Boolean(m.ephemeral),
       projectLabel: m.project_label ?? null,
+      // 所属工程 id：客户端据此把"别的工程的成员卡"挡在门外。
+      // WS 订阅不带 project 时（渲染层就是这样，因为它只显示"当前打开的工程"），
+      // 服务端会把**所有**工程的广播都送过来 —— 退出演示后 __demo__ 那批成员的心跳
+      // 超时扫描仍会推它们的成员卡，客户端照单全收就会让演示小怪物在真实工程里闪回来
+      // （2026-10-01 用户实测）。渲染层照这张卡上的 project 过滤，见 renderer/src/lib/projectScope.js。
+      project: m.project_id,
       // 来源客户端：办公室据此按楼层过滤（NULL = 不知道，哪层都显示）
       client: m.client || null,
       // subagent 级别（用户级 / 项目级）：驱动小怪物脖子上的工牌配色

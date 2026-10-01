@@ -1419,7 +1419,7 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
   // 早先这里只认 await / tool 两个分支，剩下的全落进最后的 thinking 兜底，于是
   // 「写 idle 的一轮结束了」与「写 done 的任务完成了」在控制台上都显示成「思考中」——
   // 收工了还在显示在思考，是把已完成说成还在忙。相位词汇表里本来就有
-  // idle / unreported / plan / dispatch / summarize / done / waiting 这几项
+  // idle / unreported / dispatch / done / waiting 这几项
   // （见 renderer/src/iso/mainConsole.js 的 PHASES），透传即可，不必各自再包一层。
   // 真正**不认识**的相位才落 thinking（兜底，且只对未知值生效）。
   if (rp.phase && rp.phase !== 'await' && rp.phase !== 'tool') {
@@ -1936,8 +1936,11 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
   if (runtime.paused && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'idle', action: '会话已暂停', inferred: true };
   }
+  // 「等会话空闲后收尾」：插件把消息排到了这一轮结束之后再发，人没在干活 —— 报待命，
+  // 把原因写在 action 上。以前这里报 summarize（「汇总中」），但那个相位真机上不产生
+  // （演示脚本才有），留着会让"没在干活"看着像"正在汇总"（2026-10-01 去掉，见 renderer/src/iso/mainConsole.js）。
   if (runtime.awaitingSessionIdle && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
-    return { phase: 'summarize', action: '等会话空闲后收尾', inferred: true };
+    return { phase: 'idle', action: '等会话空闲后收尾', inferred: true };
   }
 
   // 正在干活：必须"新鲜"证据，否则 IDE 关掉后残留的 in_progress 待办 / 文件改动会一直显示「工具中」
@@ -1954,12 +1957,13 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
     return { phase: 'thinking', action: '', inferred: true };
   }
 
-  // 有排队待发消息（且不是陈年残留）→ 规划 / 待处理
+  // 有排队待发消息（且不是陈年残留）→ 待命 + 说明排队条数。
+  // 以前报 plan（「规划中」），但排队消息不等于 agent 在规划 —— 同一个演示态，2026-10-01 一起去掉。
   if (pending > 0 && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
-    return { phase: 'plan', action: `${pending} 条待发消息排队中`, inferred: true };
+    return { phase: 'idle', action: `${pending} 条待发消息排队中`, inferred: true };
   }
 
-  // 没有新动静：IDE 多半关了 / 在等用户。回空闲，不再凭"激活过"瞎显示「规划中」
+  // 没有新动静：IDE 多半关了 / 在等用户。回空闲，不凭"激活过"瞎显示活跃相位
   return { phase: 'idle', action: '会话空闲', inferred: true };
 }
 
@@ -1972,7 +1976,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   // 活跃 = 当前会话且近期有动静 / 运行态新鲜 / 刚改过文件。
   // 关键：关掉 IDE 后插件不再落盘，但 current.json 仍指向它、runtime.activated 也残留为真，
   // 所以不能只靠 current / activated 判定活跃，必须用"近期有写入"确认它真的还活着，
-  // 否则关掉窗口的会话会一直卡在列表里、相位还停在「规划中」。
+  // 否则关掉窗口的会话会一直卡在列表里、相位还停在某个活跃态。
   const active = Boolean(
     (current && lastUpdated && now - lastUpdated < IDLE_MS) ||
       (mq.runtime.activated && lastUpdated && now - lastUpdated < IDLE_MS) ||

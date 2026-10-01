@@ -96,6 +96,19 @@ const DISPATCH_TALK = 3.6;
 /** 收工汇报：小怪物跑到主 agent 面前说出结果摘要的停留时长（秒） */
 const REPORT_TALK = 3.4;
 /**
+ * 小幽灵入场：**一律从大门飘进来**（演示模式的临时成员、真实场景里被召唤的 subagent 实例
+ * 走的是同一套）。门外那一段（gx < 0）被墙挡着，只有穿过门洞时才看得见，所以"飘进来"
+ * 是真的从门口出现，不是凭空出现在悬浮点上。
+ *
+ * 出发时机：先等**所有小怪物都进了屋**（没有还没露面的、也没有还卡在门洞里的），
+ * 再一个接一个出发 —— 演示模式的开场因此是"小怪物一个个走进来坐下，幽灵随后从门口飘进来"，
+ * 不是人和幽灵一起糊在门口。
+ */
+const GHOST_ENTRY_SPEED = 1.9; // tile/s：从门外飘到悬浮点这一段（比平时溜达快，不然要飘十几秒）
+const GHOST_ENTRY_STAGGER = 420; // 毫秒：同批幽灵一只一只出发，不在门口叠成一坨
+const GHOST_ENTRY_SETTLE = 280; // 毫秒：等了小怪物进屋之后再缓这半拍，两段节奏才分得开
+const GHOST_ENTRY_WAIT_MAX = 5000; // 毫秒：等小怪物的兜底（召唤会打断入场，别把幽灵永远关在门外）
+/**
  * 入场：小怪物不是凭空出现在工位上，而是一个个从大门进来、走到自己工位坐下。
  * @property {number} ENTER_DELAY 第一批露面前的等待（等画面先亮起来）
  * @property {number} ENTER_STAGGER 相邻两只之间隔多久（毫秒）
@@ -211,6 +224,11 @@ export function createIsoOffice(canvas, opts = {}) {
   let agents = [];
   /** @type {any[]} */
   let ghosts = [];
+  /**
+   * 小幽灵的"开闸"时刻：所有小怪物进完屋的那一刻（见 stepGhosts）。
+   * 第一批幽灵从这一刻起一个接一个从大门飘进来；0 = 还没开闸。
+   */
+  let ghostGateAt = 0;
   let selectedId = '';
   let hoverId = '';
   let showPaths = false;
@@ -379,7 +397,7 @@ export function createIsoOffice(canvas, opts = {}) {
     pumpDispatch();
   }
 
-  /** 小怪物回到工位：显示之前被隐藏的召唤幽灵（飘在它头顶） */
+  /** 小怪物回到工位：显示之前被隐藏的召唤幽灵（跟别的幽灵一样从大门飘进来，再落到它头顶） */
   function revealGhost(ghostId) {
     pendingGhostIds.delete(ghostId);
     if (ghosts.some((g) => g.memberId === ghostId)) return;
@@ -508,23 +526,44 @@ export function createIsoOffice(canvas, opts = {}) {
     };
   }
 
+  /**
+   * 造一只小幽灵。
+   *
+   * 不管演示还是真实场景，它都**从大门外起步**（gx < 0，被墙挡着 → 看不见），
+   * 等所有小怪物进了屋再飘向自己的悬浮点（见 stepGhosts 与 GHOST_ENTRY_*）。
+   * 对应坐工位小怪物的"头顶幽灵"（nearSeat 非空：被召唤的小怪物头顶那只）到位后围绕工位上方
+   * 小范围飘；其它临时成员飘在通用悬浮区。
+   *
+   * @param {number} i 同批幽灵里的序号：决定它飘到哪个悬浮点，也决定它排在第几个进门
+   * @param {{x:number,y:number}|null} nearSeat 非空 = 头顶幽灵，围绕这个工位飘
+   */
   function makeGhost(member, i, nearSeat) {
-    // 对应坐工位小怪物的"头顶幽灵"：围绕工位上方一小片区域慢慢飘；
-    // 其它临时成员飘在通用悬浮区。
     const center = nearSeat ? { x: nearSeat.x, y: nearSeat.y - 0.1, z: 2.15 } : null;
     const a = center || GHOST_SPOTS[i % GHOST_SPOTS.length];
+    const now = performance.now();
     return {
       memberId: member.memberId,
       name: member.name || member.memberId,
-      x: a.x,
-      y: a.y,
-      z: a.z,
+      // 门外起点：门洞里稍偏一侧（沿洞口抖一点，几只不会叠在一条线上），高度抬到门楣以下
+      x: PLACES.doorOut.x,
+      y: PLACES.doorOut.y + (Math.random() - 0.5) * 0.36,
+      z: 1.45,
       anchor: a,
       center, // 非空 = 头顶幽灵，围绕它小范围飘荡
       target: null,
+      /** 还候在门外（没出发）：画的时候裁在门洞里，等于看不见 */
+      waiting: true,
+      /** 正在从门外飘向悬浮点（这一段速度更快） */
+      entering: false,
+      /** 正在穿门洞：门得敞着（见 stepDoor） */
+      atDoor: false,
+      /** 在队伍里排第几（出发时刻 = 开闸时刻 + SETTLE + order × STAGGER，见 stepGhosts） */
+      order: i,
+      /** 等小怪物进屋的兜底：到点不管人在不在屋里都出发 */
+      enterDeadline: now + GHOST_ENTRY_WAIT_MAX,
       phase: Math.random() * 6.28,
       speed: center ? 0.35 : 0.5 + Math.random() * 0.35,
-      hold: performance.now() + 800 + Math.random() * 2000,
+      hold: 0,
       inMeeting: false,
       nearSeat: Boolean(nearSeat),
       color: colorOf(member.memberId),
@@ -565,6 +604,12 @@ export function createIsoOffice(canvas, opts = {}) {
       if (nm) byName[nm] = { seat: DESK_UNITS[i].seat, agentId: m.memberId };
     });
     seatByName = byName;
+    /**
+     * 这一轮新来了小怪物（正一个个从门口走进来）→ 把幽灵的门重新关上一档：
+     * 它得等这批人进完屋再飘进来（演示模式的开场就是"所有人先进屋、幽灵再飘进来"）。
+     * 没有新人的那几轮不动它 —— 已经在屋里飘着的幽灵不受影响。
+     */
+    if (enterSlot) ghostGateAt = 0;
 
     const gIds = new Set(floating.map((m) => m.memberId));
     ghosts = ghosts.filter((g) => gIds.has(g.memberId));
@@ -767,18 +812,42 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   function stepGhosts(dt, now) {
+    /**
+     * 小怪物都进屋了吗：没有还没露面的（entering），也没有还卡在门洞里的（atDoor）。
+     * 幽灵要等这个才出发 —— 演示模式的开场就是"人先进屋、幽灵再飘进来"。
+     */
+    const gremlinsIn = !agents.some((a) => a.entering || a.atDoor);
+    // 开闸时刻只记一次：第一批幽灵按它排出发顺序；之后新来的幽灵（收工汇报 / 新召唤）
+    // 拿到的出发时刻早已过去，等于立刻从门口飘进来。
+    if (gremlinsIn && !ghostGateAt) ghostGateAt = now;
     for (const g of ghosts) {
+      // 还在门外候场：到点了、并且屋里的人都进去了，才动身
+      if (g.waiting) {
+        // 还没开闸（小怪物还在陆续进）就先在门外候着；
+        // 但 enterDeadline 是兜底 —— 召唤会打断小怪物的入场（直接落座 / 被叫去控制台），
+        // 不能因为有人永远不落座，就把幽灵永远关在门外。
+        if (!ghostGateAt && now < g.enterDeadline) continue;
+        const readyAt = ghostGateAt + GHOST_ENTRY_SETTLE + g.order * GHOST_ENTRY_STAGGER;
+        if (ghostGateAt && now < readyAt && now < g.enterDeadline) continue;
+        g.waiting = false;
+        g.entering = true;
+        g.atDoor = true;
+        // 开会期间飘进来的直接去会议室，别先绕回自己的悬浮点
+        g.target = g.inMeeting ? GHOST_MEET : g.anchor;
+      }
       if (g.target) {
         const dx = g.target.x - g.x;
         const dy = g.target.y - g.y;
         const dz = g.target.z - g.z;
         const d = Math.hypot(dx, dy, dz);
-        const step = g.speed * dt;
+        // 入场那一段走快一点：从门口飘到悬浮点是横跨半个屋子的距离
+        const step = (g.entering ? GHOST_ENTRY_SPEED : g.speed) * dt;
         if (d <= step || d < 0.02) {
           g.x = g.target.x;
           g.y = g.target.y;
           g.z = g.target.z;
           g.target = null;
+          g.entering = false;
           g.hold = now + (g.nearSeat ? 1000 + Math.random() * 2000 : 6000 + Math.random() * 9000);
         } else {
           g.x += (dx / d) * step;
@@ -803,6 +872,8 @@ export function createIsoOffice(canvas, opts = {}) {
           g.target = g.anchor;
         }
       }
+      // 整个人进到屋里了 → 门不用再为它敞着（同小怪物的 atDoor）
+      if (g.atDoor && g.x >= DOOR_INSIDE_X) g.atDoor = false;
     }
   }
 
@@ -2049,6 +2120,12 @@ export function createIsoOffice(canvas, opts = {}) {
     for (const a of agents) {
       if ((a.entering && now >= a.spawnAt - DOOR_LEAD) || a.atDoor) { busy = true; break; }
     }
+    // 小幽灵也走这道门：它正在门洞里时，门同样得敞着（不然门拍在幽灵身上）
+    if (!busy) {
+      for (const g of ghosts) {
+        if (g.atDoor) { busy = true; break; }
+      }
+    }
     if (busy) door.holdUntil = Math.max(door.holdUntil, now + DOOR_LINGER);
     const want = now < door.holdUntil ? 1 : 0;
     const step = dt / DOOR_SWING;
@@ -2487,7 +2564,7 @@ export function createIsoOffice(canvas, opts = {}) {
           goHome(a);
         }
       }
-      a.facing = -1; // 面向控制台（更小 gy）
+      a.facing = -1; // 站位在控制台右侧（见 officeMap 的 CONSOLE_FRONT），翻转过来即面向左边那台控制台
     } else if (!a.moving && !a.path.length && Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
       // 已回到工位：让召唤幽灵出现在头顶，收尾本次编排
       finishDispatch();
@@ -2515,7 +2592,7 @@ export function createIsoOffice(canvas, opts = {}) {
           goHome(a);
         }
       }
-      a.facing = -1;
+      a.facing = -1; // 同 stepDispatch：站在控制台右侧，面向左边的控制台
     } else if (!a.moving && !a.path.length && Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
       finishReport();
       return;
@@ -2634,7 +2711,24 @@ export function createIsoOffice(canvas, opts = {}) {
         },
       });
     }
-    for (const g of ghosts) items.push({ depth: depthOf(g.x, g.y) + 3, draw: (c) => drawGhostSprite(c, g) });
+    for (const g of ghosts) {
+      // 还在门外（候场 / 正穿门洞）：同小怪物，只露门洞里那一块 —— 看着才是"从门口飘进来"
+      const outside = g.x < 0;
+      items.push({
+        depth: depthOf(g.x, g.y) + 3,
+        draw: (c) => {
+          // 还在门外候场：整只不画（墙外那点身子在等距投影里会从门缝里漏出来，
+          // 而门那会儿是关着的 —— 漏出来就是"门板前面贴了块幽灵"）
+          if (g.waiting) return;
+          if (!outside) { drawGhostSprite(c, g); return; }
+          c.save();
+          doorwayPath(c);
+          c.clip();
+          drawGhostSprite(c, g);
+          c.restore();
+        },
+      });
+    }
     if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, dispatchGhost) });
     if (reportGhost) items.push({ depth: depthOf(reportGhost.x, reportGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, reportGhost) });
     items.sort((p, q) => p.depth - q.depth);
@@ -2664,6 +2758,8 @@ export function createIsoOffice(canvas, opts = {}) {
     // 幽灵本身仍然不给 tooltip（memberAt 里排除），但不能因为它挡在上面，
     // 就让底下正在干活的那只小怪物也失去 tooltip。
     for (const g of ghosts) {
+      // 还在门外 / 门洞里（身子被墙挡着）：不进屏幕坐标表，标签与点选一并跟着不出现
+      if (g.x < 0) continue;
       const s = toScreen(g.x, g.y, g.z);
       screenPos.set(g.memberId, s);
       const h = SPRITE_H * UNIT_Z * cam.zoom * 0.92;

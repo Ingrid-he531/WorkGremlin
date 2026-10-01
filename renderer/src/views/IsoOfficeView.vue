@@ -197,10 +197,8 @@ function onConsoleLeave() {
 /** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
 const mainAgentState = computed(() => mainAgent.snapshot);
 
-/** 收尾相位（任务完成 / 任务取消 / 汇总中）：tooltip 里改列"产出概要"而不是 action */
-const isFinishPhase = computed(
-  () => mainAgent.phase === 'done' || mainAgent.phase === 'cancelled' || mainAgent.phase === 'summarize'
-);
+/** 收尾相位（任务完成 / 任务取消）：tooltip 里改列"产出概要"而不是 action */
+const isFinishPhase = computed(() => mainAgent.phase === 'done' || mainAgent.phase === 'cancelled');
 
 /** 字节数 -> 人类可读（B / KB / MB），与任务记录页同一套显示 */
 function fmtSize(n) {
@@ -303,7 +301,7 @@ const busySubagents = computed(() => {
  *
  * 主会话还没收到 Stop（相位仍是 idle）而屋里已经有 subagent 在跑 —— 这时写"待命中"
  * 是错的：人明明还在这一轮任务里，只是在等小怪物交活。单独给"等待中"，并写出在等谁。
- * 收到 Stop 后相位变 done / summarize，不再被这里覆盖，"任务完成 → 待命中"照旧。
+ * 收到 Stop 后相位变 done，不再被这里覆盖，"任务完成 → 待命中"照旧。
  */
 const consoleLive = computed(() => {
   const v = consoleBase.value;
@@ -691,7 +689,7 @@ onBeforeUnmount(() => {
         <!-- 「任务取消」那三个字也跟着相位色走（红）—— 只在这一相染色，别的相位维持原样 -->
         <span class="ct-phase" :style="mainAgent.phase === 'cancelled' ? { color: mainAgent.phaseColor } : null">{{ mainAgent.phaseLabel }}</span>
       </div>
-      <!-- 收尾相位（任务完成 / 任务取消 / 汇总中）：第三层那几句"产出概要"才是要看的东西，
+      <!-- 收尾相位（任务完成 / 任务取消）：第三层那几句"产出概要"才是要看的东西，
            所以它们压过 action —— 取消时这里是"改动了哪些文件"，一个都没动就是「没有输出」。 -->
       <div
         class="ct-row"

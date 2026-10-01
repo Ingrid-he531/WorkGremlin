@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { getServerInfo, getWorkspace, openWorkspace, wsUrl, httpBase } from '../api/bridge';
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
+import { memberBelongsToProject } from '../lib/projectScope';
 
 /** 兜底对账间隔：WS 增量事件（尤其 member.remove）是一次性的，漏收就永久陈旧，靠它自愈 */
 const RECONCILE_MS = 15_000;
@@ -13,6 +14,12 @@ export const useProjectStore = defineStore('project', {
     projects: [],
     /** 当前工程 */
     project: null,
+    /**
+     * 当前工程 id（server 的 projects.id —— 等于 workspace 响应里的 project、成员卡上的 project）。
+     * 单独存一份是因为 workspace 响应只给 id 字符串、快照给的是整行对象，两处都要能参与过滤。
+     * 空串 = 还不知道（老服务端 / 还没拿到 workspace）→ 不过滤，见 lib/projectScope.js。
+     */
+    projectId: '',
     members: [],
     /** 当前工程显示名（server 解析：package.json name > 目录名；演示工程为固定名） */
     projectName: '',
@@ -139,14 +146,19 @@ export const useProjectStore = defineStore('project', {
 
     applySnapshot(snapshot) {
       this.project = snapshot.project;
+      if (snapshot.project && snapshot.project.id) this.projectId = String(snapshot.project.id);
       this.projects = snapshot.projects || [];
-      this.members = snapshot.members || [];
+      // 快照本身就是按当前工程切的，这里再滤一道只是防御（服务端换了 / 老快照混进来）
+      this.members = (snapshot.members || []).filter((m) => memberBelongsToProject(m, this.projectId));
       if (snapshot.projectName) this.projectName = snapshot.projectName;
     },
 
     /** @param {any} card */
     upsertMember(card) {
       if (!card) return;
+      // 别的工程的成员卡一律不收：WS 订阅不带 project，服务端会把所有工程的广播都发过来
+      // （退出演示后 __demo__ 的心跳超时扫描就是一例），塞进来就会在屋里闪一下又消失。
+      if (!memberBelongsToProject(card, this.projectId)) return;
       const idx = this.members.findIndex((m) => m.memberId === card.memberId);
       if (idx >= 0) this.members.splice(idx, 1, { ...this.members[idx], ...card });
       else this.members.push(card);
@@ -166,6 +178,14 @@ export const useProjectStore = defineStore('project', {
       this.feedPath = ws.feedPath || '';
       this.recent = Array.isArray(ws.recent) ? ws.recent : [];
       this.demo = Boolean(ws.demo);
+      // 换工程要立刻把上一个工程的人从屋里撤掉：服务端的新快照是**异步**到的（同一次请求里广播），
+      // 不先滤一道，上一个工程的成员会在这段时间继续站在工位上 —— 退出演示时那 8 只演示小怪物
+      // 是最容易被看见的一例（2026-10-01 用户实测：退出演示、切楼层后它们又短暂出现）。
+      // 拿不到新工程 id 时（老服务端 / 响应缺字段）不换 projectId、也不过滤，维持原样。
+      if (ws.project) {
+        this.projectId = String(ws.project);
+        this.members = this.members.filter((m) => memberBelongsToProject(m, this.projectId));
+      }
     },
 
     /**
