@@ -131,6 +131,7 @@ npm run launch
 
 | 想看什么 | 看哪份 |
 | --- | --- |
+| 这一版发了什么、已知问题 | `docs/releases/` |
 | 产品要什么、验收标准 | `docs/requirements.md` |
 | 代码实际怎么做的、与文档哪里对不上 | `docs/implementation-status.md` |
 | 技术选型与数据结构 | `docs/tech-design.md` |
