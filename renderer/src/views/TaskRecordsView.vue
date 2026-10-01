@@ -5,7 +5,15 @@ import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
 import { clientLabel } from '../lib/clientMatch';
 import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM } from '../lib/dayBoard';
-import { clientBase } from '@workgremlin/shared';
+import {
+  TIME_RANGES,
+  clampDay,
+  dayInRange,
+  dayRangeOf,
+  inTimeWindow as inWindowAt,
+  timeWindowOf,
+} from '../lib/timeRange';
+import { DEFAULTS, clientBase } from '@workgremlin/shared';
 import { httpBase } from '../api/bridge';
 
 const project = useProjectStore();
@@ -43,6 +51,17 @@ function floorOfClient(c) {
   );
 }
 
+/**
+ * 「此刻」有两处用：看板上**还在跑的任务画到哪一格**、以及时间筛选的「今天 / 过去 7 天」
+ * 从哪算起（见 lib/timeRange.js）。跟着本页已有的 4s 轮询一起走，不另起定时器 ——
+ * 页面开着跨过午夜时，「今天」会自己滚到新的一天。
+ *
+ * **必须声明在 list 之前**：下面那个 `watch(list, …, { immediate: true })` 在注册的那一刻就
+ * 求值，而它经 inTimeWindow → timeWindow 读 nowMs；挪到文件后半段就是 TDZ
+ * （Cannot access 'nowMs' before initialization），整个页面白屏。
+ */
+const nowMs = ref(Date.now());
+
 /** 每 4s 轮询一次（任务/ subagent 是低频事件，轮询足够，不必挂 WS） */
 const POLL_MS = 4000;
 let timer = null;
@@ -76,6 +95,9 @@ watch(
     tasks.filterProject = 'all';
     tasks.filterClient = 'all';
     filterState.value = 'all';
+    filterTime.value = 'all';
+    customFrom.value = '';
+    customTo.value = '';
     keyword.value = '';
     filterModel.value = '';
     if (id) tasks.fetchTasks();
@@ -147,7 +169,7 @@ function tokenTitleOf(t) {
 }
 /**
  * 一条任务的**总词元** = 非缓存输入 + 缓存读输入 + 缓存写输入 + 输出（四项全加）。
- * 汇总报表「按时间」那张表（一行一个任务）的「词元」列用它。
+ * 汇总报表「数据总览」那张表（一行一个任务）的「词元」列用它。
  * 四项全 NULL（5F TraeCode / 6F Qoder 这些报不出 token 的楼层）→ null 显示 "—"，
  * 与"消耗为 0"区分开（后者会显示 0）。
  */
@@ -237,6 +259,23 @@ const FILTER_STATES = ['all', 'running', 'done', 'failed', 'cancelled', 'pending
 const filterState = ref('all');
 const keyword = ref('');
 
+/**
+ * 时间筛选（2026-10-01 用户要求）。档位表与窗口算法都在 lib/timeRange.js（纯函数、有回归
+ * 测试 —— 这里全是跨午夜 / 月末 / 夏令时的边界，混在 SFC 里测不动）。
+ *
+ * "此刻"取 nowMs（跟着本页 4s 轮询走）：页面开着跨过午夜时，「今天」会自己滚到新的一天，
+ * 不必另起定时器。
+ */
+const filterTime = ref('all');
+/** 自定义区间：两个 <input type="date"> 的值，本地 YYYY-MM-DD（空 = 那一端不设限） */
+const customFrom = ref('');
+const customTo = ref('');
+const timeWindow = computed(() => timeWindowOf(filterTime.value, nowMs.value, customFrom.value, customTo.value));
+/** 这条任务的开始时刻落在当前时间窗里吗（口径见 lib/timeRange.js 的 inTimeWindow） */
+function inTimeWindow(t) {
+  return inWindowAt(t && t.started_at, timeWindow.value);
+}
+
 /** 三个并列视图，共享上方筛选条件：列表视图（默认）/ 汇总报表 / 图形看板 */
 const VIEWS = [
   { key: 'list', label: '列表视图' },
@@ -253,6 +292,7 @@ const list = computed(() => {
   const fm = filterModel.value;
   return (tasks.tasks || []).filter((t) => {
     if (filterState.value !== 'all' && t.state !== filterState.value) return false;
+    if (!inTimeWindow(t)) return false;
     if (kw && !promptOf(t).toLowerCase().includes(kw)) return false;
     if (fm && (t.model || '') !== fm) return false;
     return true;
@@ -269,15 +309,21 @@ watch(
 );
 
 // ---- 汇总报表：按维度聚合（基于已筛选的 list，三视图共享筛选条件）----
-/** 维度页签的顺序 = 数组顺序。「按时间」放最前面（用户 2026-10-01 要求），它也是打开报表时的默认视图 */
+/**
+ * 维度页签的顺序 = 数组顺序。「数据总览」放最前面（用户 2026-10-01 要求），它也是打开报表时的
+ * 默认视图。
+ *
+ * key 仍叫 `time`：它标的是"这一版按时间逐条列任务"（跟那三个按维度聚合的并列），
+ * 只是页签文案改成了「数据总览」—— key 是内部标识，跟着 CSV 分支与测试走，不改。
+ */
 const DIMS = [
-  { key: 'time', label: '按时间' },
+  { key: 'time', label: '数据总览' },
   { key: 'project', label: '按工程' },
   { key: 'model', label: '按模型' },
   { key: 'floor', label: '按楼层' },
 ];
 const DIM_COL = { project: '工程', model: '模型', floor: '楼层', time: '时间' };
-/** 默认停在第一个维度（现在就是「按时间」）—— 页签排在最前、打开也是它 */
+/** 默认停在第一个维度（现在就是「数据总览」）—— 页签排在最前、打开也是它 */
 const reportDim = ref(DIMS[0].key);
 const reportSort = ref({ key: 'taskCount', dir: 'desc' });
 
@@ -318,7 +364,7 @@ const reportGroups = computed(() => {
     const d = Number(t.duration_ms) || 0;
     if (d > 0) { g.durationSum += d; g.durN += 1; }
     // 词元合计：**只累加报得出 token 的任务**（报不出的不计入、也不当 0 拉低，
-    // 口径与「按时间」那张表的表尾合计一致）。tokenN 记"这一组有几条真有数"。
+    // 口径与「数据总览」那张表的表尾合计一致）。tokenN 记"这一组有几条真有数"。
     const tk = totalTokensOf(t);
     if (tk != null) { g.tokenSum += tk; g.tokenN += 1; }
   }
@@ -374,7 +420,7 @@ function shortTitle(t, n = 10) {
 function projectOf(t) {
   return t.project_label || t.project_name || t.project_id || '—';
 }
-/** 按时间那一版的排序（默认新→旧；点表头切换） */
+/** 数据总览那一版的排序（默认新→旧；点表头切换） */
 const timeSort = ref({ key: 'started_at', dir: 'desc' });
 function sortTimeBy(key) {
   if (timeSort.value.key === key) timeSort.value = { key, dir: timeSort.value.dir === 'asc' ? 'desc' : 'asc' };
@@ -414,7 +460,7 @@ const timeTotalTokens = computed(() => {
 /** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
 function drillDown(row) {
   const dim = reportDim.value;
-  // 按时间那一版列的就是任务本身，点一行 = 直接看这条任务的详情
+  // 数据总览那一版列的就是任务本身，点一行 = 直接看这条任务的详情
   if (dim === 'time') {
     tasks.selectTask(row.id);
     view.value = 'list';
@@ -445,7 +491,7 @@ function downloadCsv(fileName, lines) {
   URL.revokeObjectURL(url);
 }
 
-/** 导出报表为 CSV（客户端下载，含当前排序与合计行；按时间那一版导的就是逐条任务） */
+/** 导出报表为 CSV（客户端下载，含当前排序与合计行；数据总览那一版导的就是逐条任务） */
 function exportCsv() {
   if (reportDim.value === 'time') {
     const head = ['时间', '任务', '客户端', '模型', '工程', '词元', '时长(ms)', '状态'];
@@ -460,7 +506,8 @@ function exportCsv() {
       t.duration_ms == null ? '' : Math.round(t.duration_ms),
       stateLabel(t.state),
     ]);
-    downloadCsv('汇总报表_按时间.csv', [head, ...rows]);
+    // 文件名跟页签走（下面聚合那几版也是拿 label 拼的），改页签文案时这里要一起改
+    downloadCsv('汇总报表_数据总览.csv', [head, ...rows]);
     return;
   }
   const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
@@ -506,34 +553,68 @@ const LANE_H = 16;
 
 const boardDay = ref(dayStartOf(Date.now()));
 const boardIsToday = computed(() => boardDay.value === dayStartOf(Date.now()));
+
+/**
+ * 看板能翻到哪几天 = 顶部时间筛选的那个窗口（用户 2026-10-01 要求）。
+ * 选中「今天」就只剩今天，前一天 / 后一天都没得点；「过去 7 天」只能在 9/25–10/1 之间翻。
+ * 「全部时间」两端都是 null —— 跟以前一样自由翻。算法在 lib/timeRange.js（有回归测试）。
+ */
+const boardDayRange = computed(() => dayRangeOf(timeWindow.value));
+/** 当前档位的文案（给灰掉的按钮写 title 用，让人知道是被哪个筛选卡住的） */
+const filterTimeLabel = computed(
+  () => (TIME_RANGES.find((r) => r.key === filterTime.value) || {}).label || ''
+);
+/** 换档位 / 跨过午夜后，把停在窗外的这天拉回来 —— 否则画出来是一片空白，看着像坏了 */
+watch(
+  boardDayRange,
+  () => {
+    const next = clampDay(boardDay.value, boardDayRange.value);
+    if (next !== boardDay.value) boardDay.value = next;
+  },
+  { immediate: true }
+);
+
 function shiftDay(n) {
   const d = new Date(boardDay.value);
   d.setDate(d.getDate() + n);
   d.setHours(0, 0, 0, 0);
-  boardDay.value = d.getTime();
+  boardDay.value = clampDay(d.getTime(), boardDayRange.value);
 }
-function backToToday() {
-  boardDay.value = dayStartOf(Date.now());
-}
-/** <input type="date"> 的值（本地 YYYY-MM-DD，不能用 toISOString —— 那是 UTC，会差一天） */
-const boardDayValue = computed(() => {
+/** 这一天能不能翻过去：翻过去还在筛选窗口里才让点（否则按钮置灰） */
+function canShiftDay(n) {
   const d = new Date(boardDay.value);
+  d.setDate(d.getDate() + n);
+  d.setHours(0, 0, 0, 0);
+  return dayInRange(d.getTime(), boardDayRange.value);
+}
+/** 「今天」这一跳：窗口里没有今天（比如筛的是"上个月"）时置灰，不把人送到窗外 */
+const canBackToToday = computed(() => dayInRange(dayStartOf(Date.now()), boardDayRange.value));
+
+function backToToday() {
+  boardDay.value = clampDay(dayStartOf(Date.now()), boardDayRange.value);
+}
+/** 本地 YYYY-MM-DD（不能用 toISOString —— 那是 UTC，会差一天） */
+function dayValueOf(ms) {
+  const d = new Date(ms);
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-});
+}
+const boardDayValue = computed(() => dayValueOf(boardDay.value));
+/** <input type="date"> 的 min / max：不设限的那一端给 undefined（属性整个不渲染） */
+const boardDayMin = computed(() =>
+  boardDayRange.value.minDay == null ? undefined : dayValueOf(boardDayRange.value.minDay)
+);
+const boardDayMax = computed(() =>
+  boardDayRange.value.maxDay == null ? undefined : dayValueOf(boardDayRange.value.maxDay)
+);
 function onBoardDayInput(e) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String((e.target && e.target.value) || ''));
   if (!m) return;
   const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   d.setHours(0, 0, 0, 0);
-  boardDay.value = d.getTime();
+  // 手敲 / 浏览器不认 min·max 的情况都兜一下：夹回窗口，别让看板停在窗外
+  boardDay.value = clampDay(d.getTime(), boardDayRange.value);
 }
-
-/**
- * 「此刻」只用来决定**还在跑的任务画到哪一格**。跟着本页已有的 4s 轮询一起走，
- * 不另起定时器（板上没有别的每帧/每秒的东西）。
- */
-const nowMs = ref(Date.now());
 
 /** 一次任务落在哪一行：client → 楼层（合并楼层按基名认，见 floorOfClient） */
 function rowOfTask(t) {
@@ -611,19 +692,33 @@ function cancelDelete() {
   confirmId.value = null;
 }
 
-/** 批量删除：删除当前筛选（工程/楼层）下的全部记录（手动、立即生效） */
+/**
+ * 批量删除：删除当前筛选（工程/楼层）下的全部记录（手动、立即生效）。
+ *
+ * 注意这两组筛选的范围**不一样**：工程/楼层走服务端（DELETE 的 query），状态/关键词/时间
+ * 走本页客户端。所以列表上看着只剩几条时，这一下删的仍是工程/楼层那一整片 —— 文案得把这个
+ * 差额说清楚，不能只报个头衔。
+ */
 function bulkDeleteAll() {
   const n = tasks.tasks.length;
-  if (!window.confirm(`将删除当前筛选（工程/楼层）下的全部 ${n} 条任务记录，含其 subagent 与产出，此操作不可撤销。确认？`)) return;
+  const shown = list.value.length;
+  const scope = `当前筛选（工程/楼层）下的全部 ${n} 条`;
+  const gap = shown < n ? `\n\n（列表上因状态/关键词/时间筛选只显示了 ${shown} 条，但删除按工程/楼层执行。）` : '';
+  if (!window.confirm(`将删除${scope}任务记录，含其 subagent 与产出，此操作不可撤销。${gap}\n确认？`)) return;
   tasks.deleteByFilter('all');
 }
-/** 记录保留天数：服务端按此自动清理更早的任务记录（改动才写回，不轮询） */
-const retentionDays = ref(30);
+/**
+ * 记录保留天数：服务端按此自动清理更早的任务记录（改动才写回，不轮询）。
+ *
+ * 初值只是**在拉到服务端设置之前**先显个像样的数 —— 真值以 GET /settings/retention 为准
+ * （用户改过的话落库值优先，跟这里的缺省无关）。缺省跟着 DEFAULTS 走，别在这写死。
+ */
+const retentionDays = ref(DEFAULTS.RETENTION_DAYS);
 async function loadRetention() {
   try {
     retentionDays.value = await tasks.fetchRetention();
   } catch {
-    /* 拉不到就用默认 30 */
+    /* 拉不到就留着缺省值（不是"写回 90"—— 没读到就不动服务端） */
   }
 }
 async function saveRetention() {
@@ -651,6 +746,15 @@ async function saveRetention() {
         <option value="all">全部状态</option>
         <option v-for="s in FILTER_STATES.filter((s) => s !== 'all')" :key="s" :value="s">{{ stateLabel(s) }}</option>
       </select>
+      <!-- 时间筛选：口径 = 任务的开始时刻（见 timeWindow）。选「自定义」才露出两个日期框 -->
+      <select v-model="filterTime" class="sel" aria-label="按时间筛选">
+        <option v-for="r in TIME_RANGES" :key="r.key" :value="r.key">{{ r.label }}</option>
+      </select>
+      <template v-if="filterTime === 'custom'">
+        <input v-model="customFrom" class="day-input" type="date" aria-label="起始日期" />
+        <span class="dim">→</span>
+        <input v-model="customTo" class="day-input" type="date" aria-label="结束日期" />
+      </template>
       <input
         v-model="keyword"
         class="search"
@@ -964,7 +1068,7 @@ async function saveRetention() {
               <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">成功数</th>
               <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">取消数</th>
               <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">改动文件数</th>
-              <!-- 词元合计 = 这一组里**报得出 token 的那些任务**的四项全加（与「按时间」表尾同一口径） -->
+              <!-- 词元合计 = 这一组里**报得出 token 的那些任务**的四项全加（与「数据总览」表尾同一口径） -->
               <th class="sortable num" :class="sortCls('tokenSum')" @click="sortBy('tokenSum')" title="这一组任务的词元合计（只累加报得出 token 的；非缓存输入 + 缓存读 + 缓存写 + 输出）">词元合计</th>
               <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">总耗时</th>
               <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">平均耗时</th>
@@ -1009,20 +1113,42 @@ async function saveRetention() {
 
     <!-- 图形看板 · 每日：横轴＝当天每小时的竖线，纵轴＝楼层；行里的实心块就是这一层的一次任务 -->
     <div v-else class="board">
+      <!-- 翻页与选日期都限制在顶部的时间筛选窗口里（选中「今天」就只有今天可看） -->
       <div class="board-bar">
-        <button type="button" class="btn" title="前一天" @click="shiftDay(-1)">← 前一天</button>
+        <button
+          type="button"
+          class="btn"
+          :disabled="!canShiftDay(-1)"
+          :title="canShiftDay(-1) ? '前一天' : `前一天不在当前时间筛选（${filterTimeLabel}）内`"
+          @click="shiftDay(-1)"
+        >← 前一天</button>
         <input
           class="day-input"
           type="date"
           :value="boardDayValue"
+          :min="boardDayMin"
+          :max="boardDayMax"
+          :title="`可选范围：${filterTimeLabel}`"
           aria-label="看板日期"
           @change="onBoardDayInput"
         />
         <span class="day-label">
           {{ fmtDay(boardDay) }}<span v-if="boardIsToday" class="dim">（今天）</span>
         </span>
-        <button type="button" class="btn" title="后一天" @click="shiftDay(1)">后一天 →</button>
-        <button type="button" class="btn" :disabled="boardIsToday" title="回到今天" @click="backToToday">今天</button>
+        <button
+          type="button"
+          class="btn"
+          :disabled="!canShiftDay(1)"
+          :title="canShiftDay(1) ? '后一天' : `后一天不在当前时间筛选（${filterTimeLabel}）内`"
+          @click="shiftDay(1)"
+        >后一天 →</button>
+        <button
+          type="button"
+          class="btn"
+          :disabled="boardIsToday || !canBackToToday"
+          :title="canBackToToday ? '回到今天' : `今天不在当前时间筛选（${filterTimeLabel}）内`"
+          @click="backToToday"
+        >今天</button>
         <span class="spacer" />
         <span class="legend">
           <i class="dot st-running" />运行中
@@ -1349,7 +1475,7 @@ async function saveRetention() {
 }
 .report-table td.td-dim { text-align: left; }
 .report-table .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-/* 按时间那一版：时间列用等宽字体（一列数字对得齐），任务列限宽 + 省略号（前 10 个字） */
+/* 数据总览那一版：时间列用等宽字体（一列数字对得齐），任务列限宽 + 省略号（前 10 个字） */
 .report-table td.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .report-table td.td-task { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 状态色：`.report-table td` 的 color 比 .st-* 更具体，不单独写一遍的话状态就全是白的 */
@@ -1566,6 +1692,10 @@ async function saveRetention() {
   cursor: pointer;
 }
 .btn:hover { border-color: var(--accent); }
+/* 置灰的按钮（看板翻页被时间筛选卡住时）：光靠 disabled 不够 —— 上面写死了
+   background / color，会把浏览器默认的置灰样式盖掉，看着跟能点一样 */
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); }
 
 /* 删除按钮（单条 + 批量通用） */
 .del-btn {

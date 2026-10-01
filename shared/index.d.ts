@@ -143,6 +143,7 @@ export declare const DEFAULTS: {
   readonly MESSAGE_WINDOW: number;
   readonly WAL_AUTOCHECKPOINT_PAGES: number;
   readonly WAL_CHECKPOINT_INTERVAL_MS: number;
+  readonly RETENTION_DAYS: number;
 };
 export declare const WS_EVENTS: Record<string, string>;
 export declare const IPC_EVENTS: Record<string, string>;

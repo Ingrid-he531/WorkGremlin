@@ -245,7 +245,7 @@ function createQueryRouter({ bus, repo }) {
   /**
    * 按一级检索（工程 + 楼层）批量删除：
    *   - mode=all    ：删掉筛选条件下的全部记录；
-   *   - mode=recent ：仅保留最近 days 天（默认 30，可配 1~3650），删更早的。
+   *   - mode=recent ：仅保留最近 days 天（缺省取 DEFAULTS.RETENTION_DAYS，可配 1~3650），删更早的。
    * 这两条都是破坏性操作，前端会先弹确认框展示影响条数。
    */
   router.delete('/task-runs', (req, res) => {
@@ -255,7 +255,8 @@ function createQueryRouter({ bus, repo }) {
     const mode = req.query.mode || 'all';
     let beforeTs = null;
     if (mode === 'recent') {
-      const days = Math.max(1, Math.min(Number(req.query.days) || 30, 3650));
+      // 没带 days 时按"保留期"理解，取跟设置项同一个缺省值（当前 UI 只发 mode=all）
+      const days = Math.max(1, Math.min(Number(req.query.days) || DEFAULTS.RETENTION_DAYS, 3650));
       beforeTs = Date.now() - days * 24 * 60 * 60 * 1000;
     }
     const n = repo.deleteTaskRunsByFilter({ project, client, beforeTs });
@@ -267,7 +268,8 @@ function createQueryRouter({ bus, repo }) {
     res.json({ ok: true, days: repo.getRetentionDays() });
   });
   router.put('/settings/retention', (req, res) => {
-    const days = Math.max(1, Math.min(Number(req.query.days) || 30, 3650));
+    // 没带 days / 带了个读不出数 → 回缺省值（跟 getRetentionDays 的缺省同一个源）
+    const days = Math.max(1, Math.min(Number(req.query.days) || DEFAULTS.RETENTION_DAYS, 3650));
     repo.setSetting('retentionDays', days);
     // 立即按新保留期清一次更早的记录，让改动即时生效（每日定时器仍负责后续滚动清理）
     let cleaned = 0;

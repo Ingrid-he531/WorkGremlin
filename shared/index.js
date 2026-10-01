@@ -47,6 +47,13 @@ const DEFAULTS = Object.freeze({
   WAL_AUTOCHECKPOINT_PAGES: 512,
   /** 主动 checkpoint 间隔 */
   WAL_CHECKPOINT_INTERVAL_MS: 30_000,
+  /**
+   * 任务记录默认保留天数（「自动保留最近 N 天」，用户 2026-10-01 要求 90）。
+   * 只是**缺省值**：用户在界面上改过就以落库的 settings.retentionDays 为准（1~3650）。
+   * 服务端/前端共用一个源 —— 这个数以前散在三处（服务端 fallback、PUT 的兜底、前端 ref
+   * 的初值），改一处忘一处就会出现"界面显示 30、实际按 90 清"这种对不上的情况。
+   */
+  RETENTION_DAYS: 90,
 });
 
 /** 服务端 -> 客户端 */

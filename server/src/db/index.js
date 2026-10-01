@@ -867,13 +867,14 @@ function createRepo(db) {
     setSettingStmt.run(key, String(value));
   }
   /**
-   * 记录保留天数（天）：缺省 30；前端改过则优先用落库值，并夹在 1~3650。
-   * 服务端自动清理任务记录以它为准（见 server/src/index.js 的 runRetentionCleanup）。
+   * 记录保留天数（天）：缺省取 DEFAULTS.RETENTION_DAYS（90）；前端改过则优先用落库值，
+   * 并夹在 1~3650。服务端自动清理任务记录以它为准（见 server/src/index.js 的
+   * runRetentionCleanup）—— 这个数一变小，下次清理会**真删**更早的记录。
    */
   function getRetentionDays() {
     const raw = getSetting('retentionDays');
     const n = raw != null ? Number(raw) : NaN;
-    if (!Number.isFinite(n) || n < 1) return 30;
+    if (!Number.isFinite(n) || n < 1) return DEFAULTS.RETENTION_DAYS;
     return Math.min(n, 3650);
   }
 
