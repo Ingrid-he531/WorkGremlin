@@ -2,15 +2,12 @@
 
 把本机在跑的 AI 编码 agent 变成一间**看得见的办公室**：谁在线、在忙什么、哪一层在干活，一眼扫完。
 
-## 演示视频
+## 演示
 
-<!--
-  演示动画放这里。录好之后把文件放进 docs/assets/，再把下面这行的注释去掉即可
-  （GitHub 的 README 支持 GIF；要嵌 mp4 就用 <video src="docs/assets/demo.mp4" controls width="720"></video>）
--->
-<!-- ![WorkGremlin 演示](docs/assets/demo.gif) -->
+![WorkGremlin 演示：办公室里的主 Agent 与小怪物 → 任务记录的图形看板](docs/assets/demo.gif)
 
-> 占位：演示动画待录 —— 文件放 `docs/assets/demo.gif`，然后把上面那行取消注释。
+> 上面这段是自己录的：`scripts/record-demo.py` 录屏 → `scripts/make-demo-gif.sh` 转 GIF
+> （自动裁掉录屏黑边、两遍调色板压到 1000px 宽）。重新录一段后重跑这两条命令即可。
 
 ## 快速开始
 

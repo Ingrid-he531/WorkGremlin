@@ -4,6 +4,9 @@ release/
 *.log
 .DS_Store
 
+# 录制的演示视频（本地产物）
+recordings/
+
 # 本地运行态（端口/token/数据库）
 .workgremlin/
 *.db
