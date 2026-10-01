@@ -4,6 +4,7 @@ import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
 import { clientLabel } from '../lib/clientMatch';
+import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM } from '../lib/dayBoard';
 import { clientBase } from '@workgremlin/shared';
 import { httpBase } from '../api/bridge';
 
@@ -47,9 +48,14 @@ const POLL_MS = 4000;
 let timer = null;
 
 function start() {
+  nowMs.value = Date.now();
   tasks.fetchTasks();
   if (timer) clearInterval(timer);
-  timer = setInterval(() => tasks.fetchTasks(), POLL_MS);
+  // 「此刻」跟着这轮轮询一起走：看板上"还在跑的任务画到哪一格"才不会停在打开页面那一刻
+  timer = setInterval(() => {
+    nowMs.value = Date.now();
+    tasks.fetchTasks();
+  }, POLL_MS);
 }
 function stop() {
   if (timer) clearInterval(timer);
@@ -219,13 +225,16 @@ watch(
 );
 
 // ---- 汇总报表：按维度聚合（基于已筛选的 list，三视图共享筛选条件）----
+/** 维度页签的顺序 = 数组顺序。「按时间」放最前面（用户 2026-10-01 要求），它也是打开报表时的默认视图 */
 const DIMS = [
+  { key: 'time', label: '按时间' },
   { key: 'project', label: '按工程' },
   { key: 'model', label: '按模型' },
   { key: 'floor', label: '按楼层' },
 ];
-const DIM_COL = { project: '工程', model: '模型', floor: '楼层' };
-const reportDim = ref('project');
+const DIM_COL = { project: '工程', model: '模型', floor: '楼层', time: '时间' };
+/** 默认停在第一个维度（现在就是「按时间」）—— 页签排在最前、打开也是它 */
+const reportDim = ref(DIMS[0].key);
 const reportSort = ref({ key: 'taskCount', dir: 'desc' });
 
 function dimValue(t, dim) {
@@ -300,17 +309,89 @@ function sortCls(key) {
   const s = reportSort.value;
   return { active: s.key === key, asc: s.key === key && s.dir === 'asc', desc: s.key === key && s.dir === 'desc' };
 }
+/* ---- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 时长 / 状态 ---- */
+/**
+ * 任务标题只取前 10 个字（超了加省略号）：这一版一行一个任务，
+ * 标题原样铺开会把右边的客户端 / 模型 / 工程挤出去。完整标题挂在 title 上。
+ * 用 [...s] 按**码点**切 —— 直接 slice 会把 emoji / 生僻字劈成半个，显出乱码。
+ */
+function shortTitle(t, n = 10) {
+  const s = promptOf(t) || '(未命名任务)';
+  const chars = [...s];
+  return chars.length > n ? `${chars.slice(0, n).join('')}…` : s;
+}
+/** 工程列：与任务详情同一口径（服务端按工程目录现算的 project_label > 库里的 name > id） */
+function projectOf(t) {
+  return t.project_label || t.project_name || t.project_id || '—';
+}
+/** 按时间那一版的排序（默认新→旧；点表头切换） */
+const timeSort = ref({ key: 'started_at', dir: 'desc' });
+function sortTimeBy(key) {
+  if (timeSort.value.key === key) timeSort.value = { key, dir: timeSort.value.dir === 'asc' ? 'desc' : 'asc' };
+  else timeSort.value = { key, dir: 'desc' };
+}
+function timeSortCls(key) {
+  const s = timeSort.value;
+  return { active: s.key === key, asc: s.key === key && s.dir === 'asc', desc: s.key === key && s.dir === 'desc' };
+}
+const timeRows = computed(() => {
+  const { key, dir } = timeSort.value;
+  const val = (t) => Number(key === 'duration_ms' ? t.duration_ms : t.started_at) || 0;
+  return list.value.slice().sort((a, b) => (dir === 'asc' ? val(a) - val(b) : val(b) - val(a)));
+});
+/** 表尾那一行：条数 + 总时长（没收工的任务没有 duration，不计入，不编造） */
+const timeTotalMs = computed(() => timeRows.value.reduce((s, t) => s + (Number(t.duration_ms) || 0), 0));
+
 /** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
 function drillDown(row) {
   const dim = reportDim.value;
+  // 按时间那一版列的就是任务本身，点一行 = 直接看这条任务的详情
+  if (dim === 'time') {
+    tasks.selectTask(row.id);
+    view.value = 'list';
+    return;
+  }
   filterModel.value = '';
   if (dim === 'project') { tasks.filterProject = row.key || 'all'; tasks.filterClient = 'all'; }
   else if (dim === 'floor') { tasks.filterClient = row.key || 'all'; tasks.filterProject = 'all'; }
   else if (dim === 'model') { filterModel.value = row.key; }
   view.value = 'list';
 }
-/** 导出报表为 CSV（客户端 Blob 下载，含当前排序与合计行） */
+/** 把二维数组写成 CSV 并下载（客户端 Blob，手机号/身份证那类敏感数据不在这里，无需额外处理） */
+function downloadCsv(fileName, lines) {
+  const csv = lines
+    .map((line) => line.map((c) => {
+      const s = String(c);
+      return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    }).join(','))
+    .join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** 导出报表为 CSV（客户端下载，含当前排序与合计行；按时间那一版导的就是逐条任务） */
 function exportCsv() {
+  if (reportDim.value === 'time') {
+    const head = ['时间', '任务', '客户端', '模型', '工程', '时长(ms)', '状态'];
+    const rows = timeRows.value.map((t) => [
+      fmtTime(t.started_at),
+      promptOf(t) || '(未命名任务)', // 导出用完整标题，别把省略号也导出去
+      clientLabel(t.client, t.form),
+      t.model || '',
+      projectOf(t),
+      t.duration_ms == null ? '' : Math.round(t.duration_ms),
+      stateLabel(t.state),
+    ]);
+    downloadCsv('汇总报表_按时间.csv', [head, ...rows]);
+    return;
+  }
   const dimLabelNow = (DIMS.find((d) => d.key === reportDim.value) || {}).label || '';
   const head = ['维度', '任务数', '成功数', '取消数', '改动文件数', '总耗时(ms)', '平均耗时(ms)'];
   const rows = reportSorted.value.map((r) => [
@@ -323,21 +404,121 @@ function exportCsv() {
     Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration),
   ];
   rows.push(totalLine);
-  const csv = [head, ...rows]
-    .map((line) => line.map((c) => {
-      const s = String(c);
-      return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    }).join(','))
-    .join('\r\n');
-  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `汇总报表_${dimLabelNow}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  downloadCsv(`汇总报表_${dimLabelNow}.csv`, [head, ...rows]);
+}
+
+/* ------------------------------ 图形看板：每日 ------------------------------
+ * 一天一张甘特图：
+ *   横轴 = 当天 00:00–24:00，**每小时一条竖线**（刻度 09:00 / 10:00 …）；
+ *   纵轴 = **楼层**（一层一行，如「3F Codex」）；
+ *   行里的实心块 = 这一层的一次任务，左右两条竖边把相邻任务切开（"用竖线分割任务"）。
+ * **一层恒定一行**：同一层同一时刻并行好几轮时不再往下摞泳道，而是把重叠的那一段**加深**
+ * （暗色叠在块上）—— 行数稳，也照样看得出"这会儿同时跑了两三条"。
+ *
+ * 口径：
+ *   · 不分楼层？不 —— 看板就是按楼层分行的；上方筛选栏照旧生效（工程 / 楼层 / 状态 / 关键字
+ *     都作用在 list 上），所以只筛某一层时图上就只有那一行；
+ *   · 跨天 / 没有结束时间 / 只有开始时间这些边界都在 lib/dayBoard.js（纯函数，有回归测试）。
+ */
+function fmtDay(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} 周${'日一二三四五六'[d.getDay()]}`;
+}
+
+/** 一行的行高（px）：一层恒定一行，这个值同时决定行高与块高 */
+const LANE_H = 16;
+
+const boardDay = ref(dayStartOf(Date.now()));
+const boardIsToday = computed(() => boardDay.value === dayStartOf(Date.now()));
+function shiftDay(n) {
+  const d = new Date(boardDay.value);
+  d.setDate(d.getDate() + n);
+  d.setHours(0, 0, 0, 0);
+  boardDay.value = d.getTime();
+}
+function backToToday() {
+  boardDay.value = dayStartOf(Date.now());
+}
+/** <input type="date"> 的值（本地 YYYY-MM-DD，不能用 toISOString —— 那是 UTC，会差一天） */
+const boardDayValue = computed(() => {
+  const d = new Date(boardDay.value);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+});
+function onBoardDayInput(e) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String((e.target && e.target.value) || ''));
+  if (!m) return;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  d.setHours(0, 0, 0, 0);
+  boardDay.value = d.getTime();
+}
+
+/**
+ * 「此刻」只用来决定**还在跑的任务画到哪一格**。跟着本页已有的 4s 轮询一起走，
+ * 不另起定时器（板上没有别的每帧/每秒的东西）。
+ */
+const nowMs = ref(Date.now());
+
+/** 一次任务落在哪一行：client → 楼层（合并楼层按基名认，见 floorOfClient） */
+function rowOfTask(t) {
+  const f = floorOfClient(t.client);
+  if (f) return { key: f.id, label: floorText(f), order: Number.parseInt(f.id, 10) || 900 };
+  if (!t.client) return { key: '__none__', label: '未记录楼层', order: 999 };
+  // 有 client 但不在楼层表里（老数据 / 该产品没装）：如实标出是哪个 client，不硬塞进某层
+  return { key: String(t.client), label: clientLabel(t.client, t.form), order: 900 };
+}
+
+/**
+ * 就算这一天没有任务也要占一行的楼层（用户 2026-10-01 要求）：
+ *   · 楼层筛选 = 全部楼层 → **所有已安装的楼层**都画出来，空的留一行空格子；
+ *   · 筛了具体楼层 → 只留命中的那几层（合并楼层的值是逗号分隔的一串 client）。
+ * 任务真落在没列出来的地方（不在楼层表里的 client / 压根没 client）时，
+ * buildFloorGantt 仍会为它补一行 —— 一行都不会丢。
+ */
+const boardBaseRows = computed(() => {
+  const want = String(tasks.filterClient || 'all').toLowerCase();
+  const hit = (f) => {
+    if (want === 'all') return f.installed !== false;
+    const list = floorClients(f).map((c) => String(c).toLowerCase());
+    return String(tasks.filterClient)
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+      .some((c) => list.includes(c));
+  };
+  return floorOptions.value
+    .filter(hit)
+    .map((f) => ({ key: f.id, label: floorText(f), order: Number.parseInt(f.id, 10) || 900 }));
+});
+
+const boardGantt = computed(() =>
+  buildFloorGantt(list.value, boardDay.value, nowMs.value, rowOfTask, boardBaseRows.value)
+);
+const boardRows = computed(() => boardGantt.value.rows);
+/** 「此刻」在横轴上的位置（%）；看的不是今天就返回 -1（不画那条线） */
+const boardNowPct = computed(() => {
+  if (!boardIsToday.value) return -1;
+  return ((nowMs.value - boardDay.value) / (MIN_PER_DAY * 60 * 1000)) * 100;
+});
+
+/** 块上的悬停提示：是哪条任务、几点到几点、多久、什么状态 */
+function blockTitle(it) {
+  const t = it.task;
+  const dur = t.duration_ms != null ? fmtDuration(t.duration_ms) : '未收工';
+  return `${promptOf(t) || '(未命名任务)'}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(t.state)}`;
+}
+/**
+ * 重叠段的加深：同时跑 2 条加一档、3 条再加一档（最深压住，免得糊成一块黑）。
+ * 只加暗、不换色 —— 块本身的状态色不被这层盖掉多少，仍读得出是"完成"还是"在跑"。
+ */
+function scrimAlpha(count) {
+  return Math.min(0.6, 0.22 * (count - 1));
+}
+/** 点块 = 看这条任务的详情：跳到列表视图并选中它 */
+function openTask(id) {
+  tasks.selectTask(id);
+  view.value = 'list';
 }
 
 // ---- 删除 ----
@@ -645,7 +826,47 @@ async function saveRetention() {
         <button type="button" class="btn export" @click="exportCsv">导出 CSV</button>
       </div>
 
-      <div v-if="reportGroups.length" class="report-scroll">
+      <!-- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 时长 / 状态 -->
+      <div v-if="reportDim === 'time' && timeRows.length" class="report-scroll">
+        <table class="report-table">
+          <thead>
+            <tr>
+              <th class="th-dim sortable" :class="timeSortCls('started_at')" @click="sortTimeBy('started_at')">时间</th>
+              <th class="th-dim">任务</th>
+              <th class="th-dim">客户端</th>
+              <th class="th-dim">模型</th>
+              <th class="th-dim">工程</th>
+              <th class="sortable num" :class="timeSortCls('duration_ms')" @click="sortTimeBy('duration_ms')">时长</th>
+              <th class="th-dim">状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="t in timeRows" :key="t.id" class="report-row" @click="drillDown(t)">
+              <td class="td-dim mono">{{ fmtTime(t.started_at) }}</td>
+              <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
+              <td class="td-dim td-task" :title="promptOf(t) || '(未命名任务)'">{{ shortTitle(t) }}</td>
+              <td class="td-dim">{{ clientLabel(t.client, t.form) }}</td>
+              <td class="td-dim">{{ t.model || '—' }}</td>
+              <td class="td-dim">{{ projectOf(t) }}</td>
+              <td class="num">{{ fmtDuration(t.duration_ms) }}</td>
+              <td class="td-dim" :class="'st-' + t.state">{{ stateLabel(t.state) }}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr class="total-row">
+              <td class="td-dim">合计</td>
+              <td class="td-dim">{{ timeRows.length }} 次</td>
+              <td class="td-dim" />
+              <td class="td-dim" />
+              <td class="td-dim" />
+              <td class="num">{{ fmtDuration(timeTotalMs) }}</td>
+              <td class="td-dim" />
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div v-else-if="reportDim !== 'time' && reportGroups.length" class="report-scroll">
         <table class="report-table">
           <thead>
             <tr>
@@ -692,9 +913,115 @@ async function saveRetention() {
       </div>
     </div>
 
-    <!-- 图形看板：占位，后续落地 -->
-    <div v-else class="empty-pane">
-      <span class="dim">图形看板（待实现）</span>
+    <!-- 图形看板 · 每日：横轴＝当天每小时的竖线，纵轴＝楼层；行里的实心块就是这一层的一次任务 -->
+    <div v-else class="board">
+      <div class="board-bar">
+        <button type="button" class="btn" title="前一天" @click="shiftDay(-1)">← 前一天</button>
+        <input
+          class="day-input"
+          type="date"
+          :value="boardDayValue"
+          aria-label="看板日期"
+          @change="onBoardDayInput"
+        />
+        <span class="day-label">
+          {{ fmtDay(boardDay) }}<span v-if="boardIsToday" class="dim">（今天）</span>
+        </span>
+        <button type="button" class="btn" title="后一天" @click="shiftDay(1)">后一天 →</button>
+        <button type="button" class="btn" :disabled="boardIsToday" title="回到今天" @click="backToToday">今天</button>
+        <span class="spacer" />
+        <span class="legend">
+          <i class="dot st-running" />运行中
+          <i class="dot st-done" />完成
+          <i class="dot st-failed" />失败
+          <i class="dot st-cancelled" />已取消
+          <i class="dot st-pending" />待命
+        </span>
+      </div>
+
+      <div class="board-scroll">
+        <div class="gantt">
+          <!-- 表头：每小时一格刻度，格子左边那条竖线就是小时线 -->
+          <div class="gantt-head">
+            <div class="gutter" />
+            <div class="axis">
+              <div v-for="h in HOUR_COLS" :key="h" class="tick">{{ fmtHM((h - 1) * 60) }}</div>
+            </div>
+          </div>
+
+          <div v-for="row in boardRows" :key="row.key" class="gantt-row">
+            <div class="gutter" :title="row.label">{{ row.label }}</div>
+            <div class="lane-area" :style="{ height: `${LANE_H}px` }">
+              <div
+                v-if="boardNowPct >= 0"
+                class="now-line"
+                :style="{ left: `${boardNowPct}%` }"
+                title="此刻"
+              />
+              <button
+                v-for="it in row.items"
+                :key="it.task.id"
+                type="button"
+                class="block"
+                :class="`st-${it.task.state || 'pending'}`"
+                :style="{
+                  left: `${it.left}%`,
+                  width: `${it.width}%`,
+                  top: '2px',
+                  height: `${LANE_H - 4}px`,
+                }"
+                :title="blockTitle(it)"
+                @click="openTask(it.task.id)"
+              />
+              <!-- 同一时间不止一条：叠一层暗色（不是再占一行） -->
+              <span
+                v-for="(o, i) in row.overlaps"
+                :key="`o${i}`"
+                class="overlap"
+                :style="{
+                  left: `${o.left}%`,
+                  width: `${o.width}%`,
+                  top: '2px',
+                  height: `${LANE_H - 4}px`,
+                  background: `rgba(0, 0, 0, ${scrimAlpha(o.count)})`,
+                }"
+              />
+            </div>
+          </div>
+
+          <!-- 这一天没有任务：照样把表格画出来（空行 + 小时线），不留一块"没有任务"的提示板 -->
+          <div v-if="!boardRows.length" class="gantt-row">
+            <div class="gutter" />
+            <div class="lane-area empty" :style="{ height: `${LANE_H * 3}px` }">
+              <div
+                v-if="boardNowPct >= 0"
+                class="now-line"
+                :style="{ left: `${boardNowPct}%` }"
+                title="此刻"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="board-foot dim">
+        <!-- 没有任务的日子不写"任务 0 次"这类话：空表格本身就说清楚了（所以这里看的是 task 数，不是行数） -->
+        <template v-if="boardGantt.total">
+          <span>任务 {{ boardGantt.total }} 次</span>
+          <span class="sep">·</span>
+          <span>楼层 {{ boardRows.length }} 个</span>
+          <template v-if="boardGantt.firstMin >= 0">
+            <span class="sep">·</span>
+            <span>活跃时段 {{ fmtHM(boardGantt.firstMin) }}–{{ fmtHM(boardGantt.lastMin) }}</span>
+          </template>
+        </template>
+        <template v-if="boardGantt.untimed">
+          <span v-if="boardGantt.total" class="sep">·</span>
+          <span>另有 {{ boardGantt.untimed }} 条没有开始时间，画不进图</span>
+        </template>
+        <span class="spacer" />
+        <span>只列这一天有任务的楼层 · 同一时间并行的那段会加深（一层就一行）· 点块跳到列表里那条任务</span>
+      </div>
     </div>
   </div>
 </template>
@@ -734,7 +1061,7 @@ async function saveRetention() {
 .view-tab:hover { color: var(--text); border-color: var(--accent); }
 .view-tab.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 
-/* 未落地视图的占位面板 */
+/* 空面板：某个视图当前没有内容可画时用它兜底 */
 .empty-pane {
   flex: 1;
   min-height: 0;
@@ -745,6 +1072,131 @@ async function saveRetention() {
   border-radius: var(--radius);
   background: var(--bg-panel);
 }
+
+/* 图形看板 · 每日：纵轴＝楼层（一层一行），横轴＝当天每小时一条竖线 */
+.board {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+}
+.board-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.day-label { font-size: 13px; color: var(--text); white-space: nowrap; }
+.day-input {
+  padding: 2px 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, #2a2f3a);
+  color: var(--text);
+  font-family: var(--mono);
+}
+.day-input:hover { border-color: var(--accent); }
+/* 图例：色块与块、左边那条状态色一致（色值来自列表视图的 .st-* 那一套） */
+.legend { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); }
+.legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+.legend .dot.st-running { background: var(--accent); }
+.legend .dot.st-done { background: #7ee787; }
+.legend .dot.st-failed { background: #ff7b72; }
+.legend .dot.st-cancelled { background: var(--state-offline, #4a5160); }
+.legend .dot.st-pending { background: var(--state-idle, #7f8c9b); }
+.board-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  padding: 10px 12px 12px;
+}
+/* 窄窗口下不让 24 小时挤成一团（每小时至少 ~36px）：放不下就横向滚动 */
+.gantt { min-width: 960px; }
+.gantt-head { display: flex; }
+/* 左侧楼层名（每行一个），宽度固定，右侧时间轴才对得齐。
+   124px 是为了放得下最长的那个名字（「9F GitHub Copilot」），再窄就要靠 title 提示了 */
+.gutter {
+  flex: none;
+  width: 124px;
+  padding-right: 8px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gantt-head .gutter { height: 18px; }
+.axis { flex: 1; min-width: 0; display: flex; }
+.tick {
+  flex: 1 1 0;
+  min-width: 0;
+  padding-left: 3px;
+  font-size: 10px;
+  line-height: 18px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  border-left: 1px solid var(--border);
+}
+.gantt-row { display: flex; }
+.gantt-row .gutter { padding-top: 1px; line-height: 1.2; }
+/**
+ * 一层一行：每小时一条竖线（1px 的线平铺，平铺宽度 = 容器宽 / 24），块绝对定位落在上面。
+ * 不用 repeating-linear-gradient 的 calc 停靠点 —— 那个写法一旦被解析器判无效，整条
+ * background-image 会静默失效（小时线全没了，还不报错）。背景平铺这套没有这个坑。
+ */
+.lane-area {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  background-image: linear-gradient(to right, var(--border) 0 1px, transparent 1px);
+  background-size: calc(100% / 24) 100%;
+  background-repeat: repeat-x;
+}
+/* 没有任务的那一天：只留这张空表格（底下补一条边把表收口） */
+.lane-area.empty { border-bottom: 1px solid var(--border); }
+.block {
+  position: absolute;
+  box-sizing: border-box;
+  /* 至少 3px：左右各 1px 竖边之外还留 1px 的颜色，短任务也看得出是块不是线 */
+  min-width: 3px;
+  padding: 0;
+  border: 0;
+  /* 左右两条竖边：相邻任务贴在一起时，这两条边就是"任务之间的分割线" */
+  border-left: 1px solid rgba(0, 0, 0, 0.55);
+  border-right: 1px solid rgba(0, 0, 0, 0.55);
+  border-radius: 2px;
+  cursor: pointer;
+  /* 兜底色：万一 state 是没见过的值，块也照样看得见（不给它凭空消失的机会） */
+  background: var(--state-idle, #7f8c9b);
+}
+.block:hover { filter: brightness(1.18); }
+.block.st-running { background: var(--accent); }
+.block.st-done { background: #7ee787; }
+.block.st-failed { background: #ff7b72; }
+.block.st-cancelled { background: var(--state-offline, #4a5160); }
+.block.st-pending { background: var(--state-idle, #7f8c9b); }
+/**
+ * 同一时间并行的那一段：盖一层暗色（不是再占一行）。最深压到 0.6，不糊成一块黑。
+ * 不吃鼠标事件 —— 悬停还是落在下面那块任务上（照样出任务标题）。
+ */
+.overlap {
+  position: absolute;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.now-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px dashed var(--accent);
+  opacity: 0.75;
+  pointer-events: none;
+}
+.board-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.board-foot .sep { color: var(--text-faint); }
 
 /* 汇总报表 */
 .report {
@@ -803,6 +1255,15 @@ async function saveRetention() {
 }
 .report-table td.td-dim { text-align: left; }
 .report-table .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* 按时间那一版：时间列用等宽字体（一列数字对得齐），任务列限宽 + 省略号（前 10 个字） */
+.report-table td.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.report-table td.td-task { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 状态色：`.report-table td` 的 color 比 .st-* 更具体，不单独写一遍的话状态就全是白的 */
+.report-table td.st-running { color: var(--accent); }
+.report-table td.st-done { color: #7ee787; }
+.report-table td.st-failed { color: #ff7b72; }
+.report-table td.st-cancelled { color: var(--text-faint); }
+.report-table td.st-pending { color: var(--text-dim); }
 .report-row { cursor: pointer; transition: background 0.12s; }
 .report-row:hover { background: var(--bg-elevated); }
 .total-row td {
