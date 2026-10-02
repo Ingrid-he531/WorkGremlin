@@ -10,6 +10,8 @@ import DeskLabView from './views/DeskLabView.vue';
 import WorkstationView from './views/WorkstationView.vue';
 import ConversationView from './views/ConversationView.vue';
 import TaskRecordsView from './views/TaskRecordsView.vue';
+import CouncilView from './views/CouncilView.vue';
+import { useCouncilStore } from './stores/council';
 import { useProjectStore } from './stores/project';
 import { useMessageStore } from './stores/messages';
 import { useSessionStore } from './stores/sessions';
@@ -21,6 +23,7 @@ import { useI18n } from './i18n';
 const project = useProjectStore();
 const msgs = useMessageStore();
 const sessions = useSessionStore();
+const council = useCouncilStore();
 const { t } = useI18n();
 
 /**
@@ -39,6 +42,14 @@ const initialTab = (() => {
 })();
 const tab = ref(initialTab);
 const selectedId = ref('');
+
+/**
+ * 「不是电梯场景」的那几页（任务记录、议事厅）：左边楼层胶囊、右上会话下拉与全屏都收掉。
+ * 收到这里是因为这几个条件本来散在四处（楼层胶囊 / 会话下拉 / 全屏按钮 / 门楣液晶屏），
+ * 每加一个页面就要记得改四遍，漏一处就会出现"页面收干净了、门楣还挂着一层楼"。
+ * 工位卡片**不**算：它还要切楼层看，只是不收会话下拉和全屏。
+ */
+const bareTab = computed(() => tab.value === 'conversation' || tab.value === 'council');
 
 /**
  * 全屏（专注）模式：只留主舞台（办公室场景，也就是主 Agent 控制台那块屏），
@@ -216,10 +227,19 @@ onMounted(async () => {
     if (msg.type === WS_EVENTS.SNAPSHOT && !sessions.floorEmpty) msgs.setSnapshot(msg.payload.recentMessages || []);
     // 会话（开/关工程·会话）实时推送：立即刷新楼层与下拉，不等 10s 轮询
     if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
+    // 议事厅：发起 / 逐轮发言 / 判票 / 收尾。project 传 null 广播，与工程无关
+    if (msg.type === WS_EVENTS.COUNCIL) council.applyEvent(msg.payload);
   });
   await refreshMessages();
   await sessions.refresh(project.serverInfo || {});
   sessions.startPolling(project.serverInfo || {});
+  // 议事厅入口要知道"有没有楼层请得动"才好决定按钮点不点得动（拉不到就照常可点，页面里说原因）
+  await council.fetchFloors();
+});
+
+// 切过去时拉一次历史：这期间在别处开的会不该等页面刷新才出现
+watch(tab, (v) => {
+  if (v === 'council') council.fetchList();
 });
 
 onUnmounted(() => {
@@ -243,19 +263,26 @@ onUnmounted(() => {
       <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
       <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">{{ t('nav.workstation') }}</button>
       <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">{{ t('nav.records') }}</button>
+      <!-- 议事厅：一层 CLI 都没装时不留死入口 —— 按钮禁用，title 里说清为什么 -->
+      <button
+        :class="{ on: tab === 'council' }"
+        :disabled="!council.canStart"
+        :title="council.canStart ? '' : t('nav.council_title')"
+        @click="tab = 'council'"
+      >{{ t('nav.council') }}</button>
       <span class="spacer" />
       <!-- 语言切换常驻（会话下拉与全屏在工位卡片 / 任务记录页会收掉，语言开关留着） -->
       <LangSwitch />
-      <!-- 工位卡片 / 任务记录页不需要会话下拉与全屏，收掉右上角这两样 -->
+      <!-- 工位卡片 / 任务记录页 / 议事厅不需要会话下拉与全屏，收掉右上角这两样 -->
       <SessionSwitcher
-        v-if="tab !== 'workstation' && tab !== 'conversation'"
+        v-if="!bareTab && tab !== 'workstation'"
         :items="sessionItems"
         :model-value="sessionValue"
         :empty-label="sessionEmptyLabel"
         @update:model-value="selectSession($event)"
       />
       <button
-        v-if="tab !== 'workstation' && tab !== 'conversation'"
+        v-if="!bareTab && tab !== 'workstation'"
         class="fs-btn"
         :title="t('nav.fullscreen_title')"
         @click="toggleFullscreen"
@@ -266,7 +293,7 @@ onUnmounted(() => {
       <!-- 楼层：一层一个受监控的智能体；状态点绿 = 这一层有活跃会话。
            任务记录页不需要井道（不是电梯场景），去掉左边胶囊楼层 -->
       <FloorSelector
-        v-if="!fullscreen && tab !== 'conversation'"
+        v-if="!fullscreen && !bareTab"
         :products="sessions.floors"
         :model-value="sessions.selectedFloor"
         @update:model-value="requestFloor($event)"
@@ -277,8 +304,8 @@ onUnmounted(() => {
         :floors="sessions.floors"
         :flash="flash"
         :project-label="projectLabel"
-        :show-floor-lcd="tab !== 'conversation'"
-        :show-lintel="tab !== 'conversation'"
+        :show-floor-lcd="!bareTab"
+        :show-lintel="!bareTab"
       >
         <section class="stage">
           <IsoOfficeView
@@ -297,6 +324,7 @@ onUnmounted(() => {
           <WorkstationView v-else-if="tab === 'workstation'" />
           <DeskLabView v-else-if="tab === 'lab'" />
           <TaskRecordsView v-else-if="tab === 'conversation'" />
+          <CouncilView v-else-if="tab === 'council'" />
           <ConversationView v-else />
         </section>
       </ElevatorDoors>
@@ -333,6 +361,12 @@ onUnmounted(() => {
 .tabs button.on {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+/* 禁用态要看得出来还是"点不动"，不是"坏了"：压暗 + 问号光标 + title 说明原因 */
+.tabs button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .spacer {

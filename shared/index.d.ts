@@ -144,6 +144,14 @@ export declare const DEFAULTS: {
   readonly WAL_AUTOCHECKPOINT_PAGES: number;
   readonly WAL_CHECKPOINT_INTERVAL_MS: number;
   readonly RETENTION_DAYS: number;
+  /** 议事厅：讨论轮上限缺省值 / 硬顶 / 单轮超时 / 材料字节上限（见 shared/index.js 的注释） */
+  readonly COUNCIL_ROUNDS_DEFAULT: number;
+  readonly COUNCIL_ROUNDS_MAX: number;
+  /** 'unanimous'（无反对 + 过半）或 'majority'（少数服从多数） */
+  readonly COUNCIL_THRESHOLD_DEFAULT: string;
+  readonly COUNCIL_TURN_TIMEOUT_MS: number;
+  readonly COUNCIL_MATERIAL_MAX_BYTES: number;
+  readonly COUNCIL_MATERIAL_TOTAL_MAX_BYTES: number;
 };
 export declare const WS_EVENTS: Record<string, string>;
 export declare const IPC_EVENTS: Record<string, string>;

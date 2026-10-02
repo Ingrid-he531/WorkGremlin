@@ -611,6 +611,51 @@ pnpm test:it -- db        # 建表 / 写 1 万条 / 读回 / integrity_check
 | CTRL-05 | 不可用场景 | 目标 `offline`/`degraded` 时动作禁用或需额外确认；不下发无效指令 |
 | CTRL-06 | 无副作用 | 误点、重复点击（防连点）不产生重复指令；执行失败有明确反馈且不改本地状态 |
 
+**议事厅（§3.16）不在本节范围内**：它不向任何被监控会话下发指令，参与者是服务端新起的一次性进程。
+CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
+
+---
+
+## 3.16 议事厅（COUNCIL-*）
+
+范围与能力边界见 `requirements.md` §15，实现形态见 `implementation-status.md` §4.2。
+**落地方式与本文其它用例不同**：不是 Vitest / Playwright，而是**普通 node 脚本**，
+挂在根 `package.json` 的 `test:council-*` 上（`ok(标签, 条件)` 计数器，失败即非零退出）。
+理由与仓库其余 40 多个 `test:*` 一致：零依赖、`node 文件` 直接跑、CI 与本地同一套。
+
+### 3.16.1 必测断言（按"错了会真出什么事"排）
+
+| 编号 | 用例 | 断言 | 落在哪 |
+| --- | --- | --- | --- |
+| **COUNCIL-01** | **只读保证** | 1F/4F 的参数里有 `--tools` 且值为**空串**（空串最容易被"顺手清理"成没填，单独钉一次）；7F/8F 注入的配置里 `permission['*']` 及逐项都是 `deny`；7F 的 `plugin` 被摘成空数组 | `test:council-agents` |
+| **COUNCIL-02** | **隔离** | 四层的 `env` 里都**没有 `HOME`**（挡掉 HOME = 挡掉登录凭据）；提示词走 stdin 时不出现在 `argv` 里 | `test:council-agents` |
+| **COUNCIL-03** | **不猜立场** | 解析不出正文 / 没有 vote 字段 / 票型是没见过的词 / 进程超时或崩掉 → `vote` 一律 **null**，界面写「未表态」，**绝不能按语气猜、也不能默认同意或弃权** | `test:council-consensus`、`test:council-agents` |
+| **COUNCIL-04** | **真线格式** | 用**真机抓下来的原样输出**（opencode 的两行事件流、CodeBuddy 的五条记录数组）断言：正文取到、**提问原文与快照/reasoning 不许混进来**、答复只出现一次、词元读得到 | `test:council-agents` |
+| **COUNCIL-05** | 判票规则 | 无反对 + 同意 ≥ 半数 → 一致；有反对 → 不一致；**弃权不计入分母**；反对者的多份修订案取附议最多者、并列取楼层号最小（确定性） | `test:council-consensus` |
+| **COUNCIL-06** | 谈不拢就如实说 | 到 `max_rounds` 仍分歧 → `verdict='no_consensus'`，**不是错误、也不硬凑一个结论**；界面展示最后一轮提案原文并标注"未通过" | `test:council-consensus`、`test:render-smoke` |
+| **COUNCIL-07** | 单次调用 | 用临时目录里的 `#!/bin/sh` stub 当 CLI：JSON 解析、**超时杀进程**（含子进程组）、非零退出如实记 error、缺 `vote` 不编造 | `test:council-runner` |
+| **COUNCIL-08** | 编排 | 端到端跑一场（stub 参与者）：轮次推进、提案**逐轮存档**、WS 事件、`verdict` 正确、**临时目录被清理** | `test:council-orchestrator` |
+| **COUNCIL-09** | 接口 | 真实 express + 真实 repo + 临时 DB：发起 / 列表 / 详情 / 取消 / 删除；**409（还在跑）不许当成功**，服务端原话照搬给界面 | `test:council-api`、`test:council-ui-store` |
+| **COUNCIL-10** | 材料截断 | 超限文件按上限截断，`bytes_total` / `bytes_included` 落真值，界面显示「原文 N 字节，只嵌了前 M 字节」；文件读不到 → NULL（**不是 0**） | `test:council-materials`、`test:render-smoke` |
+| **COUNCIL-11** | 界面数据合并 | HTTP 详情（快照）与 WS 增量（最新）按**轮次号**取新的那份；增量不许抹掉已有的正文；收尾推送只有摘要 → 必须**回拉详情**，否则页面停在没有结论的"已结束"上 | `test:council-ui-store` |
+| **COUNCIL-12** | 不进办公室 | 跑完一场会，`members` / `task_runs` 里**一条都不许多**；办公室与任务记录页看不到任何痕迹 | `test:council-orchestrator`（断言表未被动） |
+
+### 3.16.2 人工烟测（自动化覆盖不到的部分）
+
+外部 CLI 的真实输出格式只能真跑才知道 —— 2026-10-01 的烟测正是这样抓到两个单测全绿的真 bug
+（opencode 的正文在 `part.text` 而不是 `parts`；CodeBuddy 给的是整个对话数组、
+把提问原文当成了它的发言）。两条都写进了 `implementation-status.md` §4.2。
+
+| 项 | 怎么做 | 期望 |
+| --- | --- | --- |
+| 四层命令 | 各开一场一人小会（`WORKGREMLIN_HOME` 指向临时目录，**别碰用户自己的库**） | 各自的正文能读出来、票型解析得到 |
+| 关工具真的有效 | 在临时目录里放一个标记文件，让它去读 | 读不到（8F 实测：不锁时能读到，锁上后工具调用被拒） |
+| 无孤儿进程 | 会开完（或被取消）后 `ps` 查这帮 CLI | 一个都不剩；`/tmp` 下的一次性目录被清掉 |
+| 拿不到就留空 | 看 8F 的词元 | 显示「—」而不是 0（OpenCode 确实不发 usage） |
+
+**取样纪律**：烟测产出的原始 stdout 要**原样存进单测**（见 COUNCIL-04）——
+照着猜的线格式写测试等于没测，这是那次两个 bug 的共同根因。
+
 ## 4. 缺陷分级标准
 
 ### 4.1 严重度（Severity）

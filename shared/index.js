@@ -54,6 +54,33 @@ const DEFAULTS = Object.freeze({
    * 的初值），改一处忘一处就会出现"界面显示 30、实际按 90 清"这种对不上的情况。
    */
   RETENTION_DAYS: 90,
+
+  /**
+   * 议事厅（Council Chamber）—— 选定几个楼层的 agent 讨论一个问题并达成一致。
+   *
+   * 这里只放**全局缺省**；每场会自己的设置（轮数 / 判定口径）落在 councils 行上，
+   * 发起时按这里的缺省填，之后不随全局改动而变（一场已经开过的会不该被改口径）。
+   */
+  /** 讨论轮上限的缺省值（不含第 0 轮议题陈述） */
+  COUNCIL_ROUNDS_DEFAULT: 3,
+  /** 讨论轮上限的硬顶（用户在界面上调不上去） */
+  COUNCIL_ROUNDS_MAX: 8,
+  /**
+   * 判定口径缺省值。取值见 server/src/council/consensus.js 的 THRESHOLDS：
+   *   'unanimous' —— 无反对票 + 同意票过半（缺省，最保守：任何一个人不同意就不算谈成）
+   *   'majority'  —— 少数服从多数（同意 > 反对）
+   * 两种口径都要求**无人未表态**：缺席者的立场我们不知道，把不知道当默许就是编。
+   */
+  COUNCIL_THRESHOLD_DEFAULT: 'unanimous',
+  /**
+   * 单个参与者一轮的超时。到点**杀进程**并按「未表态」如实记 —— 这里的超时不是"再等等"，
+   * 而是"这一票我们确定拿不到"。所以它按最慢的一层留足余量（一次回答要跑完一整个模型调用）。
+   */
+  COUNCIL_TURN_TIMEOUT_MS: 120_000,
+  /** 单个内联材料文件的字节上限；超出的部分截断，并在界面标注「已截断」 */
+  COUNCIL_MATERIAL_MAX_BYTES: 64 * 1024,
+  /** 全部内联材料的字节上限（提示词要塞进 argv / stdin，不能无限长） */
+  COUNCIL_MATERIAL_TOTAL_MAX_BYTES: 200 * 1024,
 });
 
 /** 服务端 -> 客户端 */
@@ -70,6 +97,12 @@ const WS_EVENTS = Object.freeze({
   ERROR: 'error',
   /** 全局活跃会话表变化（开/关工程·会话）：服务端按变化实时推送，客户端即时刷新 */
   SESSIONS: 'sessions',
+  /**
+   * 议事厅的增量更新（一场会的状态 / 某人的发言 / 本轮票型 / 收尾结论）。
+   * 议事厅与「当前工程」「当前楼层」都无关（它是一场独立发起的会），所以广播时 project 传 null。
+   * payload 是**增量**，客户端按 councilId 归位，见 server/src/council/orchestrator.js。
+   */
+  COUNCIL: 'council.update',
 });
 
 /** 客户端 -> 服务端 */

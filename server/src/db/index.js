@@ -878,7 +878,189 @@ function createRepo(db) {
     return Math.min(n, 3650);
   }
 
-  return { ...stmt, listMessages, purgeProject, purgeMember, deleteTaskRun, deleteTaskRunsByFilter, getSetting, setSetting, getRetentionDays, raw: db };
+  /* ============================ 议事厅（Council Chamber） ============================
+   *
+   * 自成一套，不掺进上面那张大 stmt 表：议事厅的表与办公室那套（members / tasks /
+   * task_runs / messages）没有任何外键或查询交集，混在一起只会让两边都难读。
+   * 取数一律**按 council_id 走**，没有"按工程 / 按楼层"的入口 —— 这是隔离要求的落点：
+   * 议事厅的数据出不了议事厅页面。
+   *
+   * 写入顺序是编排器定的（见 server/src/council/orchestrator.js）：
+   *   建会 → 记出席/材料 → 每轮 upsertRound → 每人 insertUtterance → 收尾 finishCouncil。
+   * 这里全是平铺的薄封装，不含业务判断（判票在 council/consensus.js，跑进程在 council/runner.js）。
+   */
+  const councilStmt = {
+    insert: db.prepare(`
+      INSERT INTO councils (id, topic, status, threshold, max_rounds, created_at)
+      VALUES (@id, @topic, 'draft', @threshold, @maxRounds, @createdAt)
+    `),
+    get: db.prepare(`SELECT * FROM councils WHERE id = ?`),
+    /** 历史列表：按发起时间倒序。不带出席者，列表页要的话再单独取 */
+    list: db.prepare(`SELECT * FROM councils ORDER BY created_at DESC LIMIT ?`),
+    markRunning: db.prepare(`UPDATE councils SET status = 'running', started_at = ? WHERE id = ? AND status = 'draft'`),
+    setRound: db.prepare(`UPDATE councils SET round_current = ? WHERE id = ?`),
+    finish: db.prepare(`
+      UPDATE councils
+         SET status = @status, verdict = @verdict, verdict_round = @verdictRound,
+             error = @error, ended_at = @endedAt
+       WHERE id = @id
+    `),
+    /** 启动对账：上次进程被硬杀时留下的 running 行 —— 如实标成 failed，不假装它还在跑 */
+    failStaleRunning: db.prepare(`
+      UPDATE councils SET status = 'failed', verdict = 'failed', error = @error, ended_at = @at
+       WHERE status = 'running'
+    `),
+    del: db.prepare(`DELETE FROM councils WHERE id = ?`),
+
+    insertParticipant: db.prepare(`
+      INSERT INTO council_participants (council_id, floor_id, agent, cli_path, status)
+      VALUES (@councilId, @floorId, @agent, @cliPath, 'pending')
+    `),
+    setParticipantStatus: db.prepare(`
+      UPDATE council_participants SET status = @status, error = @error
+       WHERE council_id = @councilId AND floor_id = @floorId
+    `),
+    listParticipants: db.prepare(`SELECT * FROM council_participants WHERE council_id = ? ORDER BY floor_id`),
+
+    insertMaterial: db.prepare(`
+      INSERT INTO council_materials (council_id, ord, path, bytes_total, bytes_included, truncated, content)
+      VALUES (@councilId, @ord, @path, @bytesTotal, @bytesIncluded, @truncated, @content)
+    `),
+    listMaterials: db.prepare(`SELECT * FROM council_materials WHERE council_id = ? ORDER BY ord`),
+
+    upsertRound: db.prepare(`
+      INSERT INTO council_rounds
+        (council_id, round_no, kind, proposal_text, proposal_from, agree, disagree, abstain, invalid, consensus, started_at, ended_at)
+      VALUES
+        (@councilId, @roundNo, @kind, @proposalText, @proposalFrom, @agree, @disagree, @abstain, @invalid, @consensus, @startedAt, @endedAt)
+      ON CONFLICT(council_id, round_no) DO UPDATE SET
+        proposal_text = excluded.proposal_text, proposal_from = excluded.proposal_from,
+        agree = excluded.agree, disagree = excluded.disagree, abstain = excluded.abstain,
+        invalid = excluded.invalid, consensus = excluded.consensus,
+        started_at = COALESCE(council_rounds.started_at, excluded.started_at),
+        ended_at = excluded.ended_at
+    `),
+    listRounds: db.prepare(`SELECT * FROM council_rounds WHERE council_id = ? ORDER BY round_no`),
+
+    insertUtterance: db.prepare(`
+      INSERT INTO council_utterances
+        (council_id, round_no, floor_id, role, content, vote, vote_reason, proposal_text, second_floor,
+         status, error, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+         started_at, ended_at, duration_ms)
+      VALUES
+        (@councilId, @roundNo, @floorId, @role, @content, @vote, @voteReason, @proposalText, @secondFloor,
+         @status, @error, @inputTokens, @outputTokens, @cacheReadTokens, @cacheWriteTokens,
+         @startedAt, @endedAt, @durationMs)
+    `),
+    listUtterances: db.prepare(`SELECT * FROM council_utterances WHERE council_id = ? ORDER BY round_no, floor_id`),
+  };
+
+  /** 级联删那几张子表（schema.sql 里没建外键，删除顺序就在这看着） */
+  const councilChildDeletes = [
+    'DELETE FROM council_utterances WHERE council_id = ?',
+    'DELETE FROM council_rounds WHERE council_id = ?',
+    'DELETE FROM council_materials WHERE council_id = ?',
+    'DELETE FROM council_participants WHERE council_id = ?',
+  ].map((sql) => db.prepare(sql));
+
+  /** @param {{id:string, topic:string, threshold:string, maxRounds:number, createdAt:number}} arg */
+  function createCouncil(arg) {
+    councilStmt.insert.run(arg);
+    return councilStmt.get.get(arg.id);
+  }
+  const getCouncil = (id) => councilStmt.get.get(id) || null;
+  /** @param {number} limit */
+  const listCouncils = (limit) => councilStmt.list.all(Math.max(1, Math.min(Number(limit) || 50, 500)));
+  /** 把一场会置为 running；已经在跑的（或已结束的）不动，返回是否真的翻过来了 */
+  const markCouncilRunning = (id, at) => councilStmt.markRunning.run(at, id).changes > 0;
+  const setCouncilRound = (id, roundNo) => councilStmt.setRound.run(roundNo, id);
+  /** @param {{verdict:string, verdictRound?:number|null, error?:string|null, status?:string}} arg */
+  function finishCouncil(id, arg) {
+    const verdict = arg.verdict;
+    // verdict → status 的对照（三种收尾各归各的，别把"取消"混进"失败"）：
+    //   consensus / no_consensus → done（**谈不拢也是正常收场**，不是错误）
+    //   cancelled               → cancelled
+    //   其余（failed）           → failed
+    const status =
+      arg.status ||
+      (verdict === 'consensus' || verdict === 'no_consensus' ? 'done' : verdict === 'cancelled' ? 'cancelled' : 'failed');
+    councilStmt.finish.run({
+      id,
+      status,
+      verdict,
+      verdictRound: arg.verdictRound != null ? arg.verdictRound : null,
+      error: arg.error != null ? arg.error : null,
+      endedAt: arg.endedAt != null ? arg.endedAt : Date.now(),
+    });
+    return councilStmt.get.get(id);
+  }
+  /** 删一场会：连它自己的子表一起删。**返回是否删到了**，路由据此分 404 与 200 */
+  function deleteCouncil(id) {
+    const del = db.transaction((cid) => {
+      for (const st of councilChildDeletes) st.run(cid);
+      return councilStmt.del.run(cid).changes;
+    });
+    const n = del(id);
+    if (n > 0) db.pragma('wal_checkpoint(TRUNCATE)');
+    return n > 0;
+  }
+  /**
+   * 服务启动时的对账：上一次进程被硬杀（或崩了）时，库里会留下 status='running' 的会，
+   * 那些会议的参与进程早就没了。**如实标成 failed** 并写明原因 —— 不留在那儿假装还在讨论。
+   * @returns {number} 被标掉的行数
+   */
+  function failStaleCouncils(reason, at) {
+    return councilStmt.failStaleRunning.run({ error: reason, at: at != null ? at : Date.now() }).changes;
+  }
+
+  const insertParticipant = (p) => councilStmt.insertParticipant.run(p);
+  const setParticipantStatus = (councilId, floorId, status, error) =>
+    councilStmt.setParticipantStatus.run({ councilId, floorId, status, error: error != null ? error : null });
+  const listParticipants = (councilId) => councilStmt.listParticipants.all(councilId);
+
+  const insertMaterial = (m) => councilStmt.insertMaterial.run(m);
+  const listMaterials = (councilId) => councilStmt.listMaterials.all(councilId);
+
+  const upsertRound = (r) => councilStmt.upsertRound.run(r);
+  const listRounds = (councilId) => councilStmt.listRounds.all(councilId);
+
+  /** 一条发言/一票。取不到的字段一律给 null，别用 0 或空串顶替（0 词元和"读不到词元"不是一回事） */
+  function insertUtterance(u) {
+    councilStmt.insertUtterance.run({
+      councilId: u.councilId,
+      roundNo: u.roundNo,
+      floorId: u.floorId,
+      role: u.role || 'speaker',
+      content: u.content != null ? u.content : null,
+      vote: u.vote != null ? u.vote : null,
+      voteReason: u.voteReason != null ? u.voteReason : null,
+      proposalText: u.proposalText != null ? u.proposalText : null,
+      secondFloor: u.secondFloor != null ? u.secondFloor : null,
+      status: u.status || 'ok',
+      error: u.error != null ? u.error : null,
+      inputTokens: u.inputTokens != null ? u.inputTokens : null,
+      outputTokens: u.outputTokens != null ? u.outputTokens : null,
+      cacheReadTokens: u.cacheReadTokens != null ? u.cacheReadTokens : null,
+      cacheWriteTokens: u.cacheWriteTokens != null ? u.cacheWriteTokens : null,
+      startedAt: u.startedAt != null ? u.startedAt : null,
+      endedAt: u.endedAt != null ? u.endedAt : null,
+      durationMs: u.durationMs != null ? u.durationMs : null,
+    });
+  }
+  const listUtterances = (councilId) => councilStmt.listUtterances.all(councilId);
+
+  return {
+    ...stmt,
+    listMessages, purgeProject, purgeMember, deleteTaskRun, deleteTaskRunsByFilter,
+    getSetting, setSetting, getRetentionDays,
+    createCouncil, getCouncil, listCouncils, markCouncilRunning, setCouncilRound, finishCouncil,
+    deleteCouncil, failStaleCouncils,
+    insertParticipant, setParticipantStatus, listParticipants,
+    insertMaterial, listMaterials,
+    upsertRound, listRounds,
+    insertUtterance, listUtterances,
+    raw: db,
+  };
 }
 
 module.exports = { openDatabase, createRepo, applyPragmas, migrate, SCHEMA_PATH };

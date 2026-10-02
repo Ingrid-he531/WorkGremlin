@@ -250,3 +250,113 @@ CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- ============================ 议事厅（Council Chamber） ============================
+--
+-- 选定几个楼层的 agent，就一个问题开一场会，讨论到达成一致。这是仓库里唯一一处
+-- **由服务端拉起外部 agent 进程**的地方（别处的 agent 进程都是用户自己起的），所以这一组表
+-- 刻意与办公室那套完全隔离：
+--   · 不挂 project_id、不写 members / tasks / task_runs —— 参与者不进办公室、不占工位、
+--     不计入任务台账与词元汇总；它们只在议事厅页面看得到。
+--   · 参与者跑在服务端建的一次性临时目录里，且**关掉了全部工具**（见 server/src/council/agents.js），
+--     所以它们碰不到工作区。
+--   · 铁律同样适用：进程崩了 / 超时 / 输出解析不出，一律如实记 status='failed'/'timeout'/'unparsed'
+--     并把错误原文留下，**绝不替它补一个立场**（见 council_utterances.vote 的注释）。
+
+-- 一场会。结论**不是一个新生成的摘要**，而是「达成一致的那一轮桌上那份提案原文」——
+-- 所以这里只记 verdict 与 verdict_round，正文去 council_rounds 里按 round_no 取。
+CREATE TABLE IF NOT EXISTS councils (
+  id            TEXT PRIMARY KEY,          -- c_<时间戳>_<随机>
+  topic         TEXT NOT NULL,             -- 议题正文（用户粘贴的原文）
+  status        TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft','running','done','failed','cancelled')),
+  -- 判定口径：unanimous（缺省，无反对且同意够半数）/ majority（同意>反对）。见 council/consensus.js
+  threshold     TEXT NOT NULL DEFAULT 'unanimous'
+                CHECK (threshold IN ('unanimous','majority')),
+  max_rounds    INTEGER NOT NULL,          -- 讨论轮上限（不含第 0 轮议题陈述）
+  round_current INTEGER NOT NULL DEFAULT 0,-- 当前推进到第几轮（0 = 只有议题陈述轮）
+  -- 收尾：consensus / no_consensus / cancelled / failed。
+  -- **no_consensus 是合法结果**，不是错误 —— 谈不拢就如实说谈不拢，不硬凑一个结论。
+  verdict       TEXT
+                CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','cancelled','failed')),
+  verdict_round INTEGER,                   -- 达成一致的是第几轮（NO CONCENSUS 时留 NULL）
+  error         TEXT,                      -- 整场级别的失败原因（单人的失败记在 participants/utterances）
+  created_at    INTEGER NOT NULL,
+  started_at    INTEGER,
+  ended_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_councils_created ON councils(created_at DESC);
+
+-- 出席者 = 发起时选定的楼层各一个座位。cli_path 是探测到的可执行文件绝对路径
+-- （探测不到就不会被选中，见 council/floors.js），失败时也留着真值便于排查。
+CREATE TABLE IF NOT EXISTS council_participants (
+  council_id TEXT NOT NULL,
+  floor_id   TEXT NOT NULL,                -- '1F' / '4F' / '7F' / '8F'
+  agent      TEXT NOT NULL,                -- codebuddy / claude / kilo / opencode
+  cli_path   TEXT,                         -- cliInstallPath；NULL = 当时没探到
+  status     TEXT NOT NULL DEFAULT 'pending'
+             CHECK (status IN ('pending','running','ok','failed')),
+  error      TEXT,
+  PRIMARY KEY (council_id, floor_id)
+);
+
+-- 内联的背景材料。content 存的是**实际发出去的那段文本**（已按上限截断），
+-- 留着是为了复现"当时到底给它看了什么"；bytes_total 是文件原始大小（读不到 = NULL，不是 0）。
+CREATE TABLE IF NOT EXISTS council_materials (
+  council_id     TEXT NOT NULL,
+  ord            INTEGER NOT NULL,         -- 第几个文件（决定拼进提示词的顺序）
+  path           TEXT NOT NULL,            -- 用户给的绝对路径
+  bytes_total    INTEGER,                  -- 原文件大小；读不到留 NULL
+  bytes_included INTEGER,                  -- 实际内联进去的字节数
+  truncated      INTEGER NOT NULL DEFAULT 0,
+  content        TEXT,                     -- 原样内容（截断后）
+  PRIMARY KEY (council_id, ord)
+);
+
+-- 每一轮一行。round_no = 0 是**议题陈述轮**（服务端把议题 + 材料摆上桌，不投票）；
+-- 1..N 是讨论轮。proposal_* 是**这一轮投票针对的那份提案**，逐轮存档 → 全程可追溯
+-- （"第 3 轮的结论是拿第 2 轮谁提的那版投出来的"要能复盘）。
+-- 票数由 council/consensus.js 现算后落库，不是模型自报。
+CREATE TABLE IF NOT EXISTS council_rounds (
+  council_id     TEXT NOT NULL,
+  round_no       INTEGER NOT NULL,         -- 0 = 议题陈述轮
+  kind           TEXT NOT NULL CHECK (kind IN ('brief','debate')),
+  proposal_text  TEXT,                     -- 本轮桌上那份提案原文
+  proposal_from  TEXT,                     -- 谁提的：楼层号；'chair' = 服务端拿议题做初始提案
+  agree          INTEGER NOT NULL DEFAULT 0,
+  disagree       INTEGER NOT NULL DEFAULT 0,
+  abstain        INTEGER NOT NULL DEFAULT 0,
+  invalid        INTEGER NOT NULL DEFAULT 0,  -- 没表态的人数（超时/崩/解析不出）
+  consensus      INTEGER NOT NULL DEFAULT 0,
+  started_at     INTEGER,
+  ended_at       INTEGER,
+  PRIMARY KEY (council_id, round_no)
+);
+
+-- 每人每轮一行：发言 + 结构化投票。
+-- **vote 留 NULL = 未表态**（进程超时 / 崩了 / 输出解析不出）：这时 status 记真实原因，
+-- 界面写「未表态」并显示 error 原文 —— 绝不能因为"没回话"就默认它同意或弃权。
+CREATE TABLE IF NOT EXISTS council_utterances (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  council_id    TEXT NOT NULL,
+  round_no      INTEGER NOT NULL,
+  floor_id      TEXT NOT NULL,
+  role          TEXT NOT NULL DEFAULT 'speaker'
+                CHECK (role IN ('chair','speaker')),  -- chair = 服务端的议题陈述
+  content       TEXT,                      -- 发言正文
+  vote          TEXT CHECK (vote IS NULL OR vote IN ('agree','disagree','abstain')),
+  vote_reason   TEXT,                      -- 一句话理由
+  proposal_text TEXT,                      -- 投反对者提交的修订案（下轮的候选）
+  second_floor  TEXT,                      -- 附议了哪个楼层的提案（选下一轮提案用）
+  status        TEXT NOT NULL DEFAULT 'ok'
+                CHECK (status IN ('ok','failed','timeout','unparsed')),
+  error         TEXT,                      -- 失败原文（stderr 摘要 / 超时说明）
+  input_tokens       INTEGER,
+  output_tokens      INTEGER,
+  cache_read_tokens  INTEGER,
+  cache_write_tokens INTEGER,
+  started_at    INTEGER,
+  ended_at      INTEGER,
+  duration_ms   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_council_utt ON council_utterances(council_id, round_no, floor_id);

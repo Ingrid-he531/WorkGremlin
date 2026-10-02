@@ -65,7 +65,16 @@
     "test:final-stop": "node server/test/finalStop.test.js",
     "test:stop-interrupt": "node server/test/stopInterrupt.test.js",
     "test:task-runs-route": "node server/test/taskRunsRoute.test.js",
-    "test:task-sync": "node server/test/taskSync.test.js"
+    "test:task-sync": "node server/test/taskSync.test.js",
+    "test:council-consensus": "node server/test/councilConsensus.test.js",
+    "test:council-store": "node server/test/councilStore.test.js",
+    "test:council-agents": "node server/test/councilAgents.test.js",
+    "test:council-runner": "node server/test/councilRunner.test.js",
+    "test:council-orchestrator": "node server/test/councilOrchestrator.test.js",
+    "test:council-materials": "node server/test/councilMaterials.test.js",
+    "test:council-api": "node server/test/councilApi.test.js",
+    "test:council-timeline": "node renderer/test/councilTimeline.test.mjs",
+    "test:council-ui-store": "node renderer/test/councilUiStore.test.mjs"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

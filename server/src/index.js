@@ -27,6 +27,8 @@ const { createIngestRouter } = require('./http/routes/ingest');
 const { createWorkspaceRouter } = require('./http/routes/workspace');
 const { createProductsRouter } = require('./http/routes/products');
 const { createSessionsRouter } = require('./http/routes/sessions');
+const { createCouncilRouter } = require('./http/routes/council');
+const { createCouncilOrchestrator } = require('./council/orchestrator');
 const { requireToken } = require('./http/auth');
 const { createDemo } = require('./demo');
 const { createLifecycle } = require('./lifecycle');
@@ -176,6 +178,20 @@ function createServer(opts = {}) {
   /** 会话下拉：所有工程里的活跃会话 */
   app.use('/api/v1', requireToken(token), createSessionsRouter({ workspace }));
 
+  /**
+   * 议事厅：选几个楼层的 agent 开一场会。
+   *
+   * 这是仓库里第一处由服务端**异步拉起并托管长驻子进程**的地方（别处的 child_process 都是
+   * 启动期同步跑一下就完的）。参与者跑在一次性临时目录里、工具全关、只写议事厅自己的表 ——
+   * 它不碰任何被监控的会话，也不碰工作区，所以在办公室和任务记录里看不到它。
+   * 广播传 project=null：一场会与"当前工程"无关。
+   */
+  const orchestrator = createCouncilOrchestrator({
+    repo,
+    broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
+  });
+  app.use('/api/v1', requireToken(token), createCouncilRouter({ repo, orchestrator }));
+
   if (opts.serveStatic) {
     app.use(express.static(path.resolve(opts.serveStatic)));
   }
@@ -308,6 +324,16 @@ function createServer(opts = {}) {
     runRetentionCleanup();
     timers.push(setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000));
 
+    // 议事厅对账：上次进程被硬杀（或崩了）时，库里会留下 status='running' 的会 —— 那些会的
+    // 参与进程早就不在了。如实标成 failed 并写明原因，不留在那儿假装还在讨论。
+    // （正常关服那一路由 orchestrator.shutdown() 自己收尾，这里管的是没跑成正常关服的情况。）
+    try {
+      const stale = repo.failStaleCouncils('服务上次没有正常退出，这场会没跑完', clock.now());
+      if (stale > 0 && !opts.silent) console.log(`[workgremlin] 议事厅：${stale} 场没跑完的会已如实标为失败`);
+    } catch (err) {
+      if (!opts.silent) console.warn('[workgremlin] 议事厅对账失败：', err && err.message);
+    }
+
     for (const t of timers) if (t.unref) t.unref();
 
     // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）
@@ -352,6 +378,15 @@ function createServer(opts = {}) {
     lifecycle.onClose(() => demo.stop());
     lifecycle.onClose(() => { if (subagentFeed) subagentFeed.stop(); });
     lifecycle.onClose(() => { if (agentRoster) agentRoster.stop(); });
+    // 议事厅：先杀掉在飞的参与者进程（SIGTERM → SIGKILL），再给每场在飞的会落个结局。
+    // 放在 hub.close() 前面 —— 收尾那一下还要往客户端广播最后一条状态。
+    lifecycle.onClose(() => {
+      try {
+        orchestrator.shutdown();
+      } catch (err) {
+        if (!opts.silent) console.warn('[workgremlin] 议事厅收尾失败：', err && err.message);
+      }
+    });
     lifecycle.onClose(() => { try { hub.close(); } catch {} });
 
     startFeed();

@@ -18,7 +18,10 @@
 - 领域模型由 **team** 改为 **工程（project）**（commit `def3fee`）；
 - 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~7F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
 - 成员来源从「roster（`config.json`）+ A 路线目录监听」改为 **hook 上报 / `.codebuddy/agents` 名册 / `.workgremlin/subagents.json` 清单**三路；
-- 承诺的 **A 路线（`chokidar`）、消息脱敏、FTS5 查询、双连接存储、TS 迁移、自动化测试** 均未落地。
+- 多了一个 **议事厅**：选定几个楼层就一个议题开一场多轮讨论，服务端数票判定是否达成一致；
+  参与者是服务端拉起的一次性无工具进程，跑在临时目录里，**不进办公室、不进任务记录**（§4.2）；
+- 承诺的 **A 路线（`chokidar`）、消息脱敏、FTS5 查询、双连接存储、TS 迁移、自动化测试** 均未落地
+  （最后一条现在只对**旧**功能成立：`test:*` 已有 49 个脚本 / 49 个测试文件，但都是普通 node 脚本，不是文档里写的 Vitest + Playwright）。
 
 ---
 
@@ -138,6 +141,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | `file_activity` | `op` CHECK 仅 `('read','write')` | 缺 `edit` |
 | `tool_usage` | `task_id` + `tool` 主键、`count`、`first_at` / `last_at` | **新表**（任务详情「工具使用」）：按 `(任务, 工具)` 累加次数，不给每次调用落一行。上报见 `POST /api/v1/tool/use`（hook 的 PreToolUse / 插件的 tool part 各报一条，插件按 `callID` 去重、`pending` 不算）；`/task-runs` 每行带 `tools: [{tool,count}]`，删除任务时随 `deleteByTopIds` 一起清 |
 | `artifacts` / `events` | 产出与审计 | `events` 表已建但**无写入方** |
+| `councils` / `council_participants` / `council_materials` / `council_rounds` / `council_utterances` | 议事厅五张表（见 §4.2） | **新表**，文档里没有。与 `members` / `task_runs` **完全无交集**：议事厅的参与者不是楼层成员，不进办公室、不进任务记录。收尾字段叫 `verdict`（`consensus` / `no_consensus` / `cancelled` / `failed`，**`no_consensus` 是合法结果不是错误**）；`council_rounds` 逐轮存档 `proposal_text` / `proposal_from`（那一轮投票针对的是哪份提案，全程可追溯），票数是 `consensus.js` 现算后落库、不是模型自报；`council_utterances.vote` 取不到就是 NULL（界面「未表态」），**不补默认票** |
 
 ---
 
@@ -240,6 +244,70 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 
 ---
 
+### 4.2 议事厅：一种**新的进程形态**（2026-10-01）
+
+上面 §4 那一整表说的都是**被监控**的会话：别人（你的终端、编辑器）把 agent 跑起来，我们只读它
+落在磁盘上的痕迹。议事厅是**反过来**的那一种 —— 外部 CLI 由**我们**拉起、托管到结束，然后什么都不留：
+
+| | 被监控的会话（§4） | 议事厅的参与者（本节） |
+| --- | --- | --- |
+| 谁起的进程 | 用户 / 编辑器插件 | **服务端**（`child_process.spawn`） |
+| 进不进会话注册表 | 进（`sessionRegistry`，出现在楼层与主控制台） | **不进**。只活在 `council_*` 五张表里 |
+| 有没有工具 | 有，照各 CLI 自己的配置 | **没有**（`--tools ""` 或注入权限全 deny 的配置） |
+| 工作目录 | 用户自己的工程目录 | 服务端在 `/tmp` 下现建的**一次性目录**，一场一个，收尾即删 |
+| 会不会写台账 | 会（`task_runs` / `messages` / `file_activity`） | **不会**。办公室与任务记录页看不到任何痕迹 |
+| 相位 | 上报或轮询推导 | 无相位概念（它不是"在干活的 agent"，是"正在发言的与会者"） |
+
+这是仓库里第一次由服务端**长驻托管**子进程。现成的边界因此有三条硬约束，都写在
+`server/src/council/agents.js` 的注释里：
+
+1. **关工具不是可选项，是功能的前提。** 1F CodeBuddy / 4F Claude Code 用 `--tools ""`
+   （两家 help 都写着 `Use "" to disable all tools`）；7F Kilo / 8F OpenCode **没有关工具的开关**
+   （`kilo --pure` 只关外部插件，跟工具无关，名字容易骗人），只能注入一份 `permission` 全 deny 的
+   配置（`KILO_CONFIG_CONTENT` / `OPENCODE_CONFIG_CONTENT`）。自检第一条就钉这个：
+   `npm run test:council-agents`。
+2. **环境变量是叠加不是替换。** 各 CLI 的登录凭据在 `~/.claude` / `~/.codebuddy` 这些目录里，
+   靠 `HOME` 找 —— 挡掉 `HOME` 等于挡掉登录。隔离只靠 **cwd（一次性临时目录）+ 关工具**，
+   不动 env（`agents.js` 的 `env` 里没有 `HOME`，且有一条测试专门钉这件事）。
+3. **7F 必须摘掉 WorkGremlin 自己的上报插件**（`plugin: []`）。kilo 的全局配置里挂着的正是
+   `packages/reporter/src/plugin/index.js`，不摘的话议事厅的参与者会被上报进办公室，
+   直接违反"隔离，只在议事厅看"。
+
+**与实施计划的两处出入**（计划写在 `~/.claude/plans/`，不进仓库；此处留档以免后来者按计划找表）：
+
+- 计划里的 `council_events` 表**没有建**。时间线由 `council_rounds`（每轮一行）+
+  `council_utterances`（每人每轮一行）当场拼出来即可，另开一张 append-only 事件表是重复记账。
+- 计划里的字段名与落库的实际名字对不上：`councils.topic_text` → **`topic`**、`materials_json` →
+  **`council_materials` 表**（材料要逐份记 `bytes_total` / `bytes_included`，塞一个 JSON 列里没法查）、
+  `outcome` → **`verdict`**；参与者表的两列是 `floor_id` / `agent`（不是 `floor` / `client`）。
+  另多出三样计划没写的：`threshold`（判定口径，`unanimous` / `majority`）、
+  `round_current`（推进到第几轮）、`error`（整场级别的失败原因，单人的失败记在参与者/发言行上）。
+  以 `schema.sql` 为准。
+
+**真机烟测（2026-10-01，4 层里跑通了 1F / 4F / 8F，7F 未跑）** —— 这一步抓出两个单测全绿的真 bug，
+根因是同一个，值得记下来：
+
+- **8F OpenCode 每一轮都判成"输出解析不出内容"**，尽管回答完全正常。`opencode run --format json`
+  的正文在 `part.text` 里（**单数** `part`，不是 `parts`），而 `textOf` 的候选键里只有照猜写的 `parts`。
+- **1F CodeBuddy 的正文有 16397 个字符**，里面是 CLI 自己塞的 `<system-reminder data-role="memory">`
+  开场白 + **提问原文** + 答复，答复还出现两遍。`codebuddy -p --output-format json` 给的
+  **是一整个数组**（一份完整对话记录：`user → file-history-snapshot → reasoning → assistant → result`），
+  按"把每条 content 拼起来"读就会把提问当成它的发言。现在只认收尾事件的 `result`（退一步认最后一条
+  assistant 消息），改完正文 849 字符、干净、词元也读到了（6677/985/512/6165）。
+- **教训（已写进 `agents.js` 与 `councilAgents.test.js` 的注释）**：两个 bug 单测都是全绿的，
+  因为**单测是照着猜的线格式写的**——照着同一个猜测写测试等于没测。现在真机抓下来的原样输出
+  已经钉进 `councilAgents.test.js`（两行 opencode 事件流、五条一组的 CodeBuddy 记录），别再改回猜的。
+
+另外两条如实记录的观察：
+
+- **8F OpenCode 不给用量**：它的事件流里只有 `step_start` / `text`，没有 usage —— 于是 8F 的词元
+  一律 NULL、界面显示「—」。这是**服务端拿不到，不是解析漏了**，符合"取不到就留空、绝不补 0"。
+- **CodeBuddy 会把一次性目录登记成项目**：每跑一场，它就在 `~/.codebuddy/projects/tmp-wg-council-*/`
+  下留一个目录（一条 session `.jsonl`）。这是 CLI 自己的行为，我们没动它，也没有去清理
+  ——**清理别人的历史记录比留着更危险**。要清的话请你自己删。
+
+---
+
 ## 5. 文档 ↔ 实现 差异清单
 
 | # | 条目 | 文档说法 | 实现现状 | 证据 |
@@ -260,9 +328,11 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 | 14 | 告警与通知 | 站内 S1 提示（M1）+ 系统通知（M3） | **未实现** | 全仓检索无命中 |
 | 15 | 语言栈 | TypeScript（main 拍板，含 1 天上限与切 B 条件） | **CommonJS JavaScript** + `jsconfig.json` | `package.json` |
 | 16 | 测试 | Vitest + Playwright，15 条可测性契约，L1 覆盖 ≥80% | **无任何测试文件**（只有 `docs/test-strategy.md`）；契约中仅时钟抽象等少数落地 | 仓库 |
-| 17 | 界面 | 工位视图 + 对话记录两个 Tab | **办公室（等距 Canvas，默认）/ 工位卡片 / 对话记录**，另有 `?tab=flat`、`?tab=lab` | `renderer/src/App.vue` |
+| 17 | 界面 | 工位视图 + 对话记录两个 Tab | **办公室（等距 Canvas，默认）/ 工位卡片 / 对话记录 / 议事厅**，另有 `?tab=flat`、`?tab=lab` | `renderer/src/App.vue`、`views/CouncilView.vue` |
 | 18 | 反向控制（M4） | 派活 + 中断，需二次确认 | 未实现（办公室里的「集合开会 / 全员回工位」是纯本地动画，不是向 agent 下发指令） | `renderer/src/iso/engine.js` |
 | 19 | 打包 | electron-builder，x64 三平台 | 未接入（`build` 只构建 renderer） | `package.json`、`scripts/build.js` |
+| 20 | 编排 | 「不是」列写明不做 agent 调度器 / 编排引擎，差分表也写「编排一律不做」 | **议事厅是唯一的例外**（`requirements.md` §15）：服务端确实会拉起外部 CLI —— 但拉的是**全新、一次性、无工具**的进程，不碰任何被监控的会话，也不写 `members` / `task_runs`。差分那段的口径已改为「编排**被监控的团队**不做」，P2-1 原文一字未动 | `requirements.md` §15、`server/src/council/` |
+| 21 | 反向控制（M4） | 对正在被监控的会话派活 / 中断 | 仍**不做**。议事厅不在这个范畴：它不往任何已有会话里塞话，参与者与被监控会话之间没有任何通道（见 §4.2 对照表）。别把议事厅当 P2-1 的起步 | `requirements.md` §15.2 |
 
 ---
 
