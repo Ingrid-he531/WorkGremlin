@@ -74,8 +74,10 @@
     "test:council-orchestrator": "node server/test/councilOrchestrator.test.js",
     "test:council-materials": "node server/test/councilMaterials.test.js",
     "test:council-api": "node server/test/councilApi.test.js",
+    "test:council-quiet-plugin": "node server/test/councilPluginQuiet.test.js",
     "test:council-timeline": "node renderer/test/councilTimeline.test.mjs",
-    "test:council-ui-store": "node renderer/test/councilUiStore.test.mjs"
+    "test:council-ui-store": "node renderer/test/councilUiStore.test.mjs",
+    "test:all": "node scripts/run-tests.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

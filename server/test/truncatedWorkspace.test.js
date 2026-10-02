@@ -122,6 +122,32 @@ if (row) {
   ok('inferred 为 false（真值不灰显）', row.inferred === false, String(row.inferred));
 }
 
+/* ---------------------------------------------------------------------------
+ * [2b] 端到端：两条候选共享同一截断前缀、且"顺序"与"长短"给出相反结论时，
+ * 必须按可信度顺序取（ws 在先），不能退回"取最短"。
+ *
+ * 这是这批改动的核心语义（92b4bde 把「取最短」改成「顺序即优先级」），单靠 [3] 的函数级
+ * 断言守住不够：那里 candidates 是手搓的，绕过 listSessions 的 [ws, workspacePath] 拼装。
+ * 没有这一段的话，把实现换回「取最短」整套测试照样全绿 —— 回归等于没盯住。
+ * --------------------------------------------------------------------------- */
+head('[2b] 端到端：候选一长一短、共享同一截断前缀时，按可信度排在前的那条赢');
+// 诱饵工程：与 WS 共享被截断的那 48 字节前缀，但比 WS 短 —— 「取最短」会挑它、于是挑错工程。
+// 它走的是第二个候选（workspacePath），排在真实活动工程（ws，来自 hook）之后。
+const DECOY = `${decoded}z`;
+fs.mkdirSync(DECOY, { recursive: true });
+fs.writeFileSync(path.join(DECOY, 'package.json'), JSON.stringify({ name: 'decoy' }));
+ok('诱饵前提：与 WS 共享被截断的那段前缀', WS.startsWith(decoded) && DECOY.startsWith(decoded), DECOY);
+ok('诱饵前提：比 WS 短（「取最短」会挑它）', DECOY.length < WS.length, `${DECOY.length} < ${WS.length}`);
+const st2 = listSessions({ workspacePath: DECOY, client: CLIENT, force: true });
+ok('currentId 仍指向这条会话（主控制台 fresh 的前提）', st2.current === SID, JSON.stringify(st2.current));
+const row2 = (st2.sessions || []).find((s) => s.id === SID);
+ok('这条会话在表里', Boolean(row2));
+if (row2) {
+  ok('补的是真实活动工程 WS，不是更短的诱饵', row2.projectPath === WS, `${row2.projectPath} vs ${DECOY}`);
+  ok('工程名是 workgremlin（不是诱饵的 decoy）', row2.project === 'workgremlin', JSON.stringify(row2.project));
+  ok('mine 仍置真（会话归属没被诱饵抢走）', row2.mine === true);
+}
+
 head('[3] 单元：completeTruncatedWorkspace 的边界');
 // 未截断：磁盘上真有这个目录 → 原样返回，绝不乱补
 const realDir = path.join(TMP, 'short', 'proj');
