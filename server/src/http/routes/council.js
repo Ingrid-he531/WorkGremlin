@@ -8,7 +8,9 @@
  *   · 材料文件读不到 / 是二进制 → **整条请求拒掉并列明是哪几个**，不静默跳过
  *     （用户挑的文件没进去，他必须知道，否则他会以为参与者看过它）；
  *   · 在跑的会不许删（先取消）—— 删了之后在飞的发言还会往一个不存在的会里写，
- *     而这几张表没有外键，那些行就成了孤儿。
+ *     而这几张表没有外键，那些行就成了孤儿；
+ *   · 模式（表决 / 分析）与工作目录（工程模式）都在**这里**校验完：模式认不出就拒，
+ *     目录必须是存在且可读的**绝对路径**。放过去的话，错在四个参与者各失败一次之后才显形。
  *
  * 发起接口**不 await 整场会**：一场会要跑几分钟，HTTP 早该返回了。`POST /councils` 落库之后
  * 立刻返回，进度走 WS 推送（WS_EVENTS.COUNCIL），断线了前端拉 `GET /councils/:id` 补。
@@ -16,6 +18,9 @@
 
 const express = require('express');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { DEFAULTS } = require('@workgremlin/shared');
 
@@ -31,6 +36,36 @@ const defaultThreshold = () =>
 
 /** 一场会的 id。不用自增：议事厅的表要能整体删干净，id 里别带顺序信息 */
 const newId = () => `c_${crypto.randomBytes(12).toString('hex')}`;
+
+/** 两种谈法。见 shared 的 COUNCIL_MODE_DEFAULT 与 council/orchestrator.js 的分支 */
+const MODES = Object.freeze(['vote', 'analysis']);
+
+/**
+ * 工作目录（工程模式）的校验。**只认绝对路径** —— 相对路径按服务端 cwd 解析出来的结果，
+ * 和用户心里的那个目录常常不是一回事；与其替他猜，不如让他写全。
+ *
+ * 展开开头的 `~`（用户在输入框里最常敲的就是它），然后**必须存在且是目录**：
+ * 不存在的路径要是放过去，四个参与者会各自失败一次，最后报一个"谁都没表态"的会，
+ * 真因（目录写错了）反而看不见。
+ *
+ * @param {unknown} raw 请求体里的 workspacePath
+ * @returns {{path:string}|{error:string}} path 为空串 = 用户没填（隔离模式）
+ */
+function resolveWorkspaceDir(raw) {
+  let s = String(raw == null ? '' : raw).trim();
+  if (!s) return { path: '' };
+  if (s === '~' || s.startsWith('~/')) s = path.join(os.homedir(), s.slice(s === '~' ? 1 : 2));
+  if (!path.isAbsolute(s)) return { error: `工作目录要写绝对路径（留空 = 隔离模式）：${s}` };
+  const resolved = path.resolve(s);
+  let st;
+  try {
+    st = fs.statSync(resolved);
+  } catch {
+    return { error: `工作目录不存在：${resolved}` };
+  }
+  if (!st.isDirectory()) return { error: `工作目录不是目录：${resolved}` };
+  return { path: resolved };
+}
 
 const bad = (res, message) => res.status(400).json({ ok: false, error: { code: 'bad_payload', message } });
 const notFound = (res) => res.status(404).json({ ok: false, error: { code: 'not_found', message: '没有这场会' } });
@@ -57,7 +92,11 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
         maxRounds: DEFAULTS.COUNCIL_ROUNDS_DEFAULT,
         maxRoundsLimit: DEFAULTS.COUNCIL_ROUNDS_MAX,
         threshold: defaultThreshold(),
+        modes: [...MODES],
+        mode: DEFAULTS.COUNCIL_MODE_DEFAULT,
         turnTimeoutMs: DEFAULTS.COUNCIL_TURN_TIMEOUT_MS,
+        // 工程模式的单轮超时（参与者要自己翻代码，比上面那个宽）—— 界面要能写明"最长等多久"
+        workspaceTurnTimeoutMs: DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS,
         materialMaxBytes: DEFAULTS.COUNCIL_MATERIAL_MAX_BYTES,
         materialTotalMaxBytes: DEFAULTS.COUNCIL_MATERIAL_TOTAL_MAX_BYTES,
       },
@@ -69,6 +108,14 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const body = req.body || {};
     const topic = String(body.topic == null ? '' : body.topic).trim();
     if (!topic) return bad(res, '议题不能是空的');
+
+    // 谈法：认不出来就拒，不静默降级成表决（用户选了"分析"却被当成"表决"跑，是最坏的一种错）
+    const mode = body.mode == null || body.mode === '' ? DEFAULTS.COUNCIL_MODE_DEFAULT : String(body.mode);
+    if (!MODES.includes(mode)) return bad(res, `模式只能是 ${MODES.join(' / ')}：${mode}`);
+
+    // 在哪儿谈：留空 = 隔离模式（与改动前逐字相同）；填了必须是存在且可读的目录
+    const ws = resolveWorkspaceDir(body.workspacePath);
+    if (ws.error) return bad(res, ws.error);
 
     const wanted = Array.isArray(body.floors) ? [...new Set(body.floors.map((f) => String(f)))] : [];
     if (wanted.length < 2) return bad(res, '至少要请两个楼层 —— 一个人不叫讨论');
@@ -102,7 +149,7 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const createdAt = Date.now();
     const floorOf = (f) => known.get(f) || {};
     try {
-      repo.createCouncil({ id, topic, threshold, maxRounds, createdAt });
+      repo.createCouncil({ id, topic, mode, workspacePath: ws.path || null, threshold, maxRounds, createdAt });
       for (const f of wanted) {
         repo.insertParticipant({ councilId: id, floorId: f, agent: floorOf(f).agent || '', cliPath: floorOf(f).cliPath || null });
       }
@@ -175,4 +222,4 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
   return router;
 }
 
-module.exports = { createCouncilRouter };
+module.exports = { createCouncilRouter, resolveWorkspaceDir };

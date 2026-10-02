@@ -55,6 +55,7 @@ process.env.PATH = BIN;
 process.env.WORKGREMLIN_KILO_HOME = KILO_HOME;
 
 const { detectProducts } = require('../src/products');
+const { DEFAULTS } = require('@workgremlin/shared');
 const kilo = require('../src/kilo');
 
 let pass = 0;
@@ -703,6 +704,43 @@ head('[E] 装了 WorkGremlin 插件时：kilo-plugin 的状态文件被认出（
 
   // 清掉插件状态文件，避免污染 [D] 那一段（它会去扫 hooks 目录）
   fs.rmSync(path.join(WG, 'hooks', `${key}.json`), { force: true });
+}
+
+/* ------------------------- F. 议事厅参与者不进办公室 ------------------------- */
+
+head('[F] 议事厅参与者（title = COUNCIL_SESSION_TITLE）不出现在 7F 的会话表里');
+{
+  // 为什么值得单独钉：Kilo 把会话记在**全局** SQLite 里，`session.directory` 是当时的 cwd。
+  // 工程模式下参与者的 cwd 就是用户的工程 —— 不挡的话它当场变成办公室 7F 上多出来的一个
+  // "会话"（还带着真实工程路径），而 requirements.md §15.2 写死了「那两页看不出任何痕迹」。
+  //
+  // 换一份干净的数据根：会话表按**库路径**分键缓存（见 kilo.js 的 listKiloSessions），
+  // 同一个根里还存着上面那份好数据，用同一个根会读到缓存、看不出真实行为。
+  // 同一份库里放**两条**会话（一条普通、一条参与者标题），才能证明"真的读了库、
+  // 只挡住了那一条"，而不是整层读空。
+  const ROOT = path.join(TMP, 'kilo-council');
+  fs.mkdirSync(ROOT, { recursive: true });
+  const db = makeKiloDb(path.join(ROOT, 'kilo.db'));
+  const now = Date.now();
+  const ins = db.prepare(
+    'INSERT INTO session (id, project_id, directory, title, agent, model, summary_files, summary_additions, summary_deletions, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+  );
+  ins.run('ses_user_1', 'proj1', WS, '我自己开的会话', 'code', '{"id":"kilo-auto/free"}', 0, 0, 0, now - MIN, now);
+  ins.run('ses_council_1', 'proj1', WS, DEFAULTS.COUNCIL_SESSION_TITLE, 'code', '{"id":"kilo-auto/free"}', 2, 9, 1, now - MIN, now);
+  db.close();
+  process.env.WORKGREMLIN_KILO_HOME = ROOT;
+
+  const list = kilo.listKiloSessions();
+  const ids = list.map((s) => s.id);
+  ok('同库同工程里的**用户会话**照常列出来（挡的不是整个工程）', ids.includes('ses_user_1'), ids.join(' '));
+  ok('参与者那条被挡住了', !ids.includes('ses_council_1'), ids.join(' '));
+  ok('这个工程下只剩一条（另一条是被挡掉的那条）', list.filter((s) => s.projectPath === WS).length === 1, ids.join(' '));
+  // 过滤的判据是"标题"这个约定：一头在 agents.js（发 --title），另一头在这儿（跳过它）。
+  // 两头不一致的话过滤会**静默失效**（参与者照样出现在办公室），所以直接把它们对起来钉死。
+  const args = require('../src/council/agents').RECIPES['7F'].build({ bin: 'kilo', prompt: 'x', allow: 'none' }).args;
+  const at = args.indexOf('--title');
+  ok('7F 配方发的标题 = 这里过滤的标题（两头不一致 = 过滤白写）', at >= 0 && args[at + 1] === DEFAULTS.COUNCIL_SESSION_TITLE, JSON.stringify(args));
+  process.env.WORKGREMLIN_KILO_HOME = KILO_HOME;
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

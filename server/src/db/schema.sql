@@ -265,9 +265,21 @@ CREATE TABLE IF NOT EXISTS settings (
 
 -- 一场会。结论**不是一个新生成的摘要**，而是「达成一致的那一轮桌上那份提案原文」——
 -- 所以这里只记 verdict 与 verdict_round，正文去 council_rounds 里按 round_no 取。
+--
+-- 两个**正交**的开关（四种组合都成立）：
+--   · mode          —— 怎么收场：'vote' 数票判共识 / 'analysis' 不判共识、跑满轮数出简报
+--   · workspace_path —— 在哪儿谈：有值 = 参与者以它为工作目录、给只读工具；
+--                       NULL = 今天那样跑在一次性临时目录里、没有工具
 CREATE TABLE IF NOT EXISTS councils (
   id            TEXT PRIMARY KEY,          -- c_<时间戳>_<随机>
   topic         TEXT NOT NULL,             -- 议题正文（用户粘贴的原文）
+  -- 'vote'（缺省，服务端机械计票）/ 'analysis'（不投票：见 council/prompt.js 的 ANALYSIS_PROTOCOL）
+  mode          TEXT NOT NULL DEFAULT 'vote'
+                CHECK (mode IN ('vote','analysis')),
+  -- 参与者的工作目录（绝对路径，发起时校验过存在且是目录）。
+  -- NULL = 隔离模式：服务端现建一次性临时目录，收尾即删（见 council/orchestrator.js）。
+  -- **非 NULL 时那个目录是用户的，收尾绝不许删** —— 编排器里有测试钉着这条。
+  workspace_path TEXT,
   status        TEXT NOT NULL DEFAULT 'draft'
                 CHECK (status IN ('draft','running','done','failed','cancelled')),
   -- 判定口径：unanimous（缺省，无反对且同意够半数）/ majority（同意>反对）。见 council/consensus.js
@@ -275,10 +287,12 @@ CREATE TABLE IF NOT EXISTS councils (
                 CHECK (threshold IN ('unanimous','majority')),
   max_rounds    INTEGER NOT NULL,          -- 讨论轮上限（不含第 0 轮议题陈述）
   round_current INTEGER NOT NULL DEFAULT 0,-- 当前推进到第几轮（0 = 只有议题陈述轮）
-  -- 收尾：consensus / no_consensus / cancelled / failed。
+  -- 收尾：consensus / no_consensus / cancelled / failed，外加分析模式的 reported。
   -- **no_consensus 是合法结果**，不是错误 —— 谈不拢就如实说谈不拢，不硬凑一个结论。
+  -- **reported 也是合法结果**：分析模式压根没有"谈成没谈成"这件事，它只保证"每人都跑完了、
+  -- 发言都在库里"，所以这里记的是"已呈报"，不是一个判定（见 councils.mode）。
   verdict       TEXT
-                CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','cancelled','failed')),
+                CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','reported','cancelled','failed')),
   verdict_round INTEGER,                   -- 达成一致的是第几轮（NO CONCENSUS 时留 NULL）
   error         TEXT,                      -- 整场级别的失败原因（单人的失败记在 participants/utterances）
   created_at    INTEGER NOT NULL,
@@ -333,9 +347,14 @@ CREATE TABLE IF NOT EXISTS council_rounds (
   PRIMARY KEY (council_id, round_no)
 );
 
--- 每人每轮一行：发言 + 结构化投票。
--- **vote 留 NULL = 未表态**（进程超时 / 崩了 / 输出解析不出）：这时 status 记真实原因，
--- 界面写「未表态」并显示 error 原文 —— 绝不能因为"没回话"就默认它同意或弃权。
+-- 每人每轮一行：发言 + 结构化尾块。
+--
+-- 表决模式用 vote/vote_reason/proposal_text/second_floor；分析模式用 stance/findings_json。
+-- 两套字段**互不覆盖**，各写各的（同一行不会两套都有，但表结构上不加约束 —— 一场会的 mode
+-- 是行级事实，靠 councils.mode 判断该读哪一套）。
+--
+-- **留 NULL = 未表态**（进程超时 / 崩了 / 输出解析不出）：这时 status 记真实原因，
+-- 界面写「未表态」并显示 error 原文 —— 绝不能因为"没回话"就默认它同意、弃权或"没意见"。
 CREATE TABLE IF NOT EXISTS council_utterances (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   council_id    TEXT NOT NULL,
@@ -348,6 +367,12 @@ CREATE TABLE IF NOT EXISTS council_utterances (
   vote_reason   TEXT,                      -- 一句话理由
   proposal_text TEXT,                      -- 投反对者提交的修订案（下轮的候选）
   second_floor  TEXT,                      -- 附议了哪个楼层的提案（选下一轮提案用）
+  -- 分析模式的立场（councils.mode='analysis' 时才有值）。NULL = 未表态，不猜。
+  stance        TEXT CHECK (stance IS NULL OR stance IN ('support','oppose','unsure')),
+  -- 分析模式的结构化要点：{"points":[…],"risks":[…],"questions":[…]}。
+  -- **NULL = 整个尾块没解析出来，不是"三条都空"**（后者是 {"points":[],"risks":[],"questions":[]}）——
+  -- 这两件事在界面上显示得不一样（「没按约定给要点」vs「给了，是空的」）。
+  findings_json TEXT,
   status        TEXT NOT NULL DEFAULT 'ok'
                 CHECK (status IN ('ok','failed','timeout','unparsed')),
   error         TEXT,                      -- 失败原文（stderr 摘要 / 超时说明）

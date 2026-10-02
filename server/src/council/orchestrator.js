@@ -4,17 +4,26 @@
  * 议事厅的状态机 —— 把"开一场会"从一次 HTTP 请求变成一串没人盯着也要跑完的动作。
  *
  *   draft ──start()──▶ running ──┬─ 第 0 轮 议题陈述（服务端把题目摆上桌，不调模型）
- *                                ├─ 第 1..N 轮：并发问所有人 → 收齐（或超时）→ 机械计票
- *                                │    · 达成 → consensus，用**那一轮桌上那份提案原文**当结论
- *                                │    · 没达成 → 拿反对者的修订案当下一轮的提案，继续
- *                                └─ 到上限还没谈成 → no_consensus（合法结果，如实说）
+ *                                ├─ 第 1..N 轮：并发问所有人 → 收齐（或超时）
+ *                                │    · 表决模式：机械计票。达成 → consensus（用**那一轮桌上
+ *                                │      那份提案原文**当结论）；没达成 → 拿反对者的修订案当
+ *                                │      下一轮的提案，继续；到上限 → no_consensus（合法结果）
+ *                                │    · 分析模式：不判票、不换提案，跑满 N 轮 → reported
+ *                                └─ 收尾（落 verdict、清临时目录、广播）
+ *
+ * 两个正交的开关（都读 councils 行，起跑时定死，中途不变）：
+ *   · mode            —— 'vote' 表决 / 'analysis' 分析
+ *   · workspace_path  —— 有值 = 工程模式（cwd = 用户的真实工程 + 只读工具）；
+ *                        NULL = 隔离模式（cwd = 现建的一次性临时目录 + 工具全关）
  *
  * 三条贯穿始终的规矩：
  *   1. **绝不编造**。某个人超时 / 崩了 / 输出解析不出 → 如实记 status + 错误原文，
- *      vote 留 NULL。缺席的那一票**不参与**共识判定（见 consensus.js：有未表态就不算数）。
+ *      立场留 NULL。缺席的那一票**不参与**共识判定（见 consensus.js：有未表态就不算数）。
  *      谈不拢就是谈不拢 —— 不为了给个交代而合成一个"结论"。
- *   2. **隔离**。参与者跑在一次性临时目录里（cwd），工具全关（见 agents.js），
- *      cwd 用完就删；它们的数据只进议事厅自己的表，不碰 members / tasks。
+ *   2. **隔离**。隔离模式跑在一次性临时目录里、工具全关；工程模式的 cwd 是**用户的**目录、
+ *      只给只读工具，并靠 WORKGREMLIN_DISABLE 关掉上报（见 agents.js）。两种模式下
+ *      它们的数据都只进议事厅自己的表，不碰 members / tasks。
+ *      **工程模式的目录不是我们的，收尾时绝不删** —— 见 closeCouncil 里那两道锁。
  *   3. **进程必须收得干净**。在飞的子进程登记在 active 里 ——「取消」和「关服」都要
  *      把它们连同各自的子进程一起杀掉，不能留孤儿。
  *
@@ -34,7 +43,7 @@ const path = require('node:path');
 const { DEFAULTS, WS_EVENTS } = require('@workgremlin/shared');
 
 const { runOnce, killTree } = require('./runner');
-const { RECIPES, parseVoteBlock } = require('./agents');
+const { RECIPES, parseVoteBlock, parseAnalysisBlock } = require('./agents');
 const { buildSpeechPrompt, buildBriefText } = require('./prompt');
 const { decideRound } = require('./consensus');
 const { cliPathOf } = require('./floors');
@@ -64,7 +73,17 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   /** 收**前缀**、返回目录路径（跟 fs.mkdtempSync 同一个语义，测试好替换） */
   const mkdtemp = deps.mkdtemp || ((prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const timeoutMs = deps.timeoutMs || DEFAULTS.COUNCIL_TURN_TIMEOUT_MS;
+  /** 工程模式的单轮超时：参与者要自己翻代码，比"动嘴"那种宽得多（见 shared/index.js） */
+  const workspaceTimeoutMs = deps.workspaceTimeoutMs || DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS;
   const removeDir = deps.removeDir || ((dir) => fs.rmSync(dir, { recursive: true, force: true }));
+  /** 目录还在不在（工程模式起跑前要再确认一次，可注入） */
+  const isDir = deps.isDir || ((p) => {
+    try {
+      return fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  });
   /** 楼层 → 可执行文件路径。缺省走 products 探测；测试注入假的 */
   const cliPath = deps.cliPathOf || ((floorId) => cliPathOf(floorId));
 
@@ -88,11 +107,15 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
   /**
    * 跑一个人的一轮。
+   *
+   * @param {{ctx:object, floor:object, prompt:string, allow:'none'|'read',
+   *          mode:'vote'|'analysis', timeoutMs:number}} arg
    * @returns {Promise<{floorId:string, status:string, content:string|null, vote:string|null,
-   *   voteReason:string|null, proposal:string|null, second:string|null, error:string|null,
+   *   voteReason:string|null, proposal:string|null, second:string|null,
+   *   stance:string|null, findings:object|null, error:string|null,
    *   tokens:object|null, startedAt:number, endedAt:number, durationMs:number}>}
    */
-  async function askOne({ ctx, floor, prompt }) {
+  async function askOne({ ctx, floor, prompt, allow, mode, timeoutMs: perTurnMs }) {
     const startedAt = now();
     const recipe = RECIPES[floor.floor_id];
     const bin = floor.cli_path || cliPath(floor.floor_id);
@@ -106,6 +129,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         floorId: floor.floor_id,
         status: 'failed',
         content: null, vote: null, voteReason: null, proposal: null, second: null,
+        stance: null, findings: null,
         error: '这一轮还没发问，这场会就已经在收尾了',
         tokens: null, startedAt, endedAt: now(), durationMs: 0,
       };
@@ -117,16 +141,17 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         floorId: floor.floor_id,
         status: 'failed',
         content: null, vote: null, voteReason: null, proposal: null, second: null,
+        stance: null, findings: null,
         error: recipe ? '没有可用的命令行可执行文件' : `议事厅不支持 ${floor.floor_id} 这一层`,
         tokens: null, startedAt, endedAt: now(), durationMs: 0,
       };
     }
 
-    const inv = recipe.build({ bin, prompt });
+    const inv = recipe.build({ bin, prompt, allow });
     const r = await runTurn({
       ...inv,
-      cwd: ctx.tmpDir,
-      timeoutMs,
+      cwd: ctx.workDir,
+      timeoutMs: perTurnMs,
       agent: recipe.agent,
       onChild: (child) => {
         // 迟到的句柄直接杀掉，不挂进一个已经不会再被遍历的登记表（理由同上，今天到不了）
@@ -143,14 +168,26 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     const base = {
       floorId: floor.floor_id,
       content: null, vote: null, voteReason: null, proposal: null, second: null,
+      stance: null, findings: null,
       tokens: r.tokens || null, startedAt, endedAt, durationMs: r.durationMs,
       error: r.error || null,
       status: r.status === 'ok' ? 'ok' : r.status,
     };
-    if (r.status !== 'ok') return base; // 失败 / 超时：正文和票都留空
+    if (r.status !== 'ok') return base; // 失败 / 超时：正文和尾块都留空
 
-    // 跑通了但**没给出可解析的投票** —— 这跟"没跑成"要分开：它是说了话的，
-    // 只是没按约定表态。正文照存，vote 留空，status 记 'unparsed'。
+    // 跑通了但**没给出可解析的尾块** —— 这跟"没跑成"要分开：它是说了话的，
+    // 只是没按约定表态。正文照存，立场留空，status 记 'unparsed'。
+    // 两种模式各解析各的（表决认 vote，分析认 stance），**认不出就不认**，绝不按语气猜。
+    if (mode === 'analysis') {
+      const a = parseAnalysisBlock(r.text);
+      return {
+        ...base,
+        content: r.text,
+        stance: a.stance,
+        findings: a.findings,
+        status: a.stance ? 'ok' : 'unparsed',
+      };
+    }
     const vote = parseVoteBlock(r.text);
     return {
       ...base,
@@ -177,6 +214,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         floorId: arg.floor.floor_id,
         status: 'failed',
         content: null, vote: null, voteReason: null, proposal: null, second: null,
+        stance: null, findings: null,
         tokens: null, error: `调用参与者时出错：${err && err.message}`,
         startedAt: at, endedAt: at, durationMs: 0,
       };
@@ -189,6 +227,10 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       councilId, roundNo, floorId: u.floorId, role: 'speaker',
       content: u.content, vote: u.vote, voteReason: u.voteReason,
       proposalText: u.proposal, secondFloor: u.second,
+      stance: u.stance,
+      // 结构化要点落库时**序列化**成文本：DB 那一列是 TEXT，查询/复现要看的是当时的原文，
+      // 不给它建表（这三条是展示用的，不参与任何判定）。null 照旧是 null，不写成 '{}'。
+      findingsJson: u.findings ? JSON.stringify(u.findings) : null,
       status: u.status, error: u.error,
       inputTokens: u.tokens ? u.tokens.input : null,
       outputTokens: u.tokens ? u.tokens.output : null,
@@ -201,6 +243,9 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       utterance: {
         roundNo, floorId: u.floorId, content: u.content, vote: u.vote,
         voteReason: u.voteReason, proposal: u.proposal, second: u.second,
+        // 分析模式那两个字段走 WS 时是**已解析的对象**（HTTP 那条路给的是 TEXT）——
+        // 前端归一函数两种都要吃，见 renderer/src/lib/councilTimeline.js 的 normFindings
+        stance: u.stance, findings: u.findings,
         status: u.status, error: u.error, durationMs: u.durationMs,
       },
     });
@@ -221,10 +266,16 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     for (const child of ctx.children) killTree(child);
     ctx.children.clear();
     const c = repo.finishCouncil(ctx.councilId, { verdict, verdictRound, error, endedAt: now() });
-    try {
-      removeDir(ctx.tmpDir);
-    } catch {
-      /* 删不掉就留着，不要因为清理失败把整场会判成失败 */
+    // **只删我们自己建的那个临时目录。**
+    // 工程模式下 cwd 是用户的真实工程（ctx.tmpDir 为 null、ownsTmpDir 为 false）——
+    // 这两道锁缺一条，这里就变成 `rm -rf 用户的工程`。`ownsTmpDir` 看起来冗余
+    // （tmpDir 非空本来就等于"我们建的"），它是给以后的人看的：改这块代码时先读懂这条。
+    if (ctx.ownsTmpDir && ctx.tmpDir) {
+      try {
+        removeDir(ctx.tmpDir);
+      } catch {
+        /* 删不掉就留着，不要因为清理失败把整场会判成失败 */
+      }
     }
     active.delete(ctx.councilId);
     emit(WS_EVENTS.COUNCIL, {
@@ -251,20 +302,44 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       return repo.getCouncil(councilId);
     }
 
-    // 隔离目录建不出来就到此为止 —— 已经标成 running 了，必须给它一个结局，
-    // 否则库里会留一场谁也取消不掉的僵尸会（只有下次启动的对账才会收拾）
-    let tmpDir;
-    try {
-      tmpDir = mkdtemp(TMP_PREFIX);
-    } catch (err) {
-      return repo.finishCouncil(councilId, {
-        verdict: 'failed', error: `建不出隔离目录：${err && err.message}`, endedAt: now(),
-      });
+    // 在哪儿谈（与怎么谈正交，见 schema.sql 里 councils 的注释）：
+    //   · 工程模式 —— 用**用户的**目录。注意 ctx.tmpDir 保持 null：收尾时那个"删目录"
+    //     的分支因此不会碰到它（见 closeCouncil 里那两道锁）。
+    //   · 隔离模式 —— 现建一个一次性临时目录，收尾即删。与改动前逐字相同。
+    const workspace = council.workspace_path ? String(council.workspace_path) : '';
+    const mode = council.mode === 'analysis' ? 'analysis' : 'vote';
+    const allow = workspace ? 'read' : 'none';
+    const perTurnMs = workspace ? workspaceTimeoutMs : timeoutMs;
+
+    let tmpDir = null;
+    let workDir = workspace;
+    if (workspace) {
+      // 发起时校验过一次，但用户可能在这两步之间把它删了 —— 起跑前再确认一次。
+      // 不确认的话，四个参与者会各自失败一次，最后报一个"谁都没表态"的会，看不出真因。
+      if (!isDir(workspace)) {
+        return repo.finishCouncil(councilId, {
+          verdict: 'failed', error: `工作目录不存在或不是目录：${workspace}`, endedAt: now(),
+        });
+      }
+    } else {
+      // 临时目录建不出来就到此为止 —— 已经标成 running 了，必须给它一个结局，
+      // 否则库里会留一场谁也取消不掉的僵尸会（只有下次启动的对账才会收拾）
+      try {
+        tmpDir = mkdtemp(TMP_PREFIX);
+      } catch (err) {
+        return repo.finishCouncil(councilId, {
+          verdict: 'failed', error: `建不出隔离目录：${err && err.message}`, endedAt: now(),
+        });
+      }
+      workDir = tmpDir;
     }
 
-    const ctx = { councilId, cancelled: false, closed: false, children: new Set(), tmpDir };
+    const ctx = {
+      councilId, cancelled: false, closed: false, children: new Set(),
+      tmpDir, ownsTmpDir: Boolean(tmpDir), workDir,
+    };
     active.set(councilId, ctx);
-    emit(WS_EVENTS.COUNCIL, { councilId, status: 'running' });
+    emit(WS_EVENTS.COUNCIL, { councilId, status: 'running', mode, workspace: workspace || null });
 
     try {
       const participants = repo.listParticipants(councilId);
@@ -302,6 +377,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       });
 
       // ---- 第 1..N 轮
+      const analysis = mode === 'analysis';
       let proposal = council.topic;
       let proposalFrom = 'chair';
       let history = [];
@@ -312,23 +388,35 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         if (ctx.cancelled) break;
 
         repo.setCouncilRound(councilId, roundNo);
+        // 分析模式没有"桌上那份提案"——proposal_* 留空，别把议题冒充成一份被人表决过的提案
         repo.upsertRound({
-          councilId, roundNo, kind: 'debate', proposalText: proposal, proposalFrom,
+          councilId, roundNo, kind: 'debate',
+          proposalText: analysis ? null : proposal,
+          proposalFrom: analysis ? null : proposalFrom,
           agree: 0, disagree: 0, abstain: 0, invalid: 0, consensus: 0, startedAt: now(), endedAt: null,
         });
-        emit(WS_EVENTS.COUNCIL, { councilId, roundNo, phase: 'debate', proposal, proposalFrom });
+        emit(WS_EVENTS.COUNCIL, {
+          councilId, roundNo, phase: 'debate', mode,
+          proposal: analysis ? null : proposal,
+          proposalFrom: analysis ? null : proposalFrom,
+        });
 
         // 并发问所有人 —— 一轮里几个人是各自独立的，串行只会白白多等几倍时间
         const prompts = participants.map((floor) => ({
           floor,
           prompt: buildSpeechPrompt({
-            topic: council.topic, materials, proposal, proposalFrom,
+            topic: council.topic, materials,
+            proposal: analysis ? '' : proposal,
+            proposalFrom: analysis ? '' : proposalFrom,
             roundNo, maxRounds, history,
             floorId: floor.floor_id, floorName: floorName(floor.floor_id),
+            mode, workspace: workspace || null,
           }),
         }));
         for (const floor of participants) repo.setParticipantStatus(councilId, floor.floor_id, 'running', null);
-        const answers = await Promise.all(prompts.map((p) => askOneSafe({ ctx, ...p })));
+        const answers = await Promise.all(
+          prompts.map((p) => askOneSafe({ ctx, ...p, allow, mode, timeoutMs: perTurnMs }))
+        );
 
         if (ctx.cancelled) break;
 
@@ -338,6 +426,27 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           repo.setParticipantStatus(councilId, a.floorId, a.status === 'ok' ? 'ok' : 'failed', a.error);
         }
 
+        // 进历史的发言要带轮次和楼层名 —— renderHistory 按轮次分组、按名字称呼，
+        // answers 里只有 floorId
+        history = [
+          ...history,
+          ...answers.map((a) => ({ ...a, roundNo, floorName: floorName(a.floorId) })),
+        ];
+
+        if (analysis) {
+          // 分析模式**不判票、不换提案、没有提前结束**：跑满设定轮数。
+          // 三个票型列记 0（这一场确实没人投票，不是"投了 0 票"），只把"这轮没能
+          // 给出立场的人数"记进 invalid —— 那个口径两种模式是同一个意思。
+          const invalid = answers.filter((a) => a.status !== 'ok').length;
+          repo.upsertRound({
+            councilId, roundNo, kind: 'debate', proposalText: null, proposalFrom: null,
+            agree: 0, disagree: 0, abstain: 0, invalid, consensus: 0,
+            startedAt: null, endedAt: now(),
+          });
+          emit(WS_EVENTS.COUNCIL, { councilId, roundNo, mode, round: { agree: 0, disagree: 0, abstain: 0, invalid, consensus: 0 } });
+          continue;
+        }
+
         const decision = decideRound({ utterances: answers, threshold, maxRounds, roundNo });
         repo.upsertRound({
           councilId, roundNo, kind: 'debate', proposalText: proposal, proposalFrom,
@@ -345,14 +454,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           abstain: decision.tally.abstain, invalid: decision.tally.invalid,
           consensus: decision.consensus ? 1 : 0, startedAt: null, endedAt: now(),
         });
-        emit(WS_EVENTS.COUNCIL, { councilId, roundNo, round: { ...decision.tally, consensus: decision.consensus } });
-
-        // 进历史的发言要带轮次和楼层名 —— renderHistory 按轮次分组、按名字称呼，
-        // answers 里只有 floorId
-        history = [
-          ...history,
-          ...answers.map((a) => ({ ...a, roundNo, floorName: floorName(a.floorId) })),
-        ];
+        emit(WS_EVENTS.COUNCIL, { councilId, roundNo, mode, round: { ...decision.tally, consensus: decision.consensus } });
 
         if (decision.done) {
           verdict = decision.outcome;
@@ -369,8 +471,10 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
       if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
 
-      // 循环跑满都没 break（理论上不会：最后一轮 decision.done 必为 true，这里只是兜底）
-      if (!verdict) verdict = 'no_consensus';
+      // 分析模式跑满轮数就是正常收场：**没有"谈成没谈成"这回事**，所以 verdict 是
+      // 'reported'（已呈报），不是一个判定 —— 界面照这份记录出简报，不合成结论。
+      // 表决模式兜底：循环跑满都没 break（理论上不会，最后一轮 decision.done 必为 true）
+      if (!verdict) verdict = analysis ? 'reported' : 'no_consensus';
       return closeCouncil(ctx, { verdict, verdictRound });
     } catch (err) {
       // 整场级别的意外（落库失败之类）—— 如实记 failed，把错误原文留住

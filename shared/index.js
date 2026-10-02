@@ -61,6 +61,13 @@ const DEFAULTS = Object.freeze({
    * 这里只放**全局缺省**；每场会自己的设置（轮数 / 判定口径）落在 councils 行上，
    * 发起时按这里的缺省填，之后不随全局改动而变（一场已经开过的会不该被改口径）。
    */
+  /**
+   * 议事厅的两种形态（councils.mode）：
+   *   'vote'     —— 就一份提案多轮表决，服务端机械计票判共识（见 council/consensus.js）
+   *   'analysis' —— 不投票、不判共识：各轮自由分析，跑满轮数后出一份分组简报
+   * 与「在哪儿谈」（councils.workspace_path 有没有值）是**两个正交的开关**。
+   */
+  COUNCIL_MODE_DEFAULT: 'vote',
   /** 讨论轮上限的缺省值（不含第 0 轮议题陈述） */
   COUNCIL_ROUNDS_DEFAULT: 3,
   /** 讨论轮上限的硬顶（用户在界面上调不上去） */
@@ -77,6 +84,31 @@ const DEFAULTS = Object.freeze({
    * 而是"这一票我们确定拿不到"。所以它按最慢的一层留足余量（一次回答要跑完一整个模型调用）。
    */
   COUNCIL_TURN_TIMEOUT_MS: 120_000,
+  /**
+   * **工程模式**（councils.workspace_path 有值）下单个参与者一轮的超时。
+   *
+   * 比隔离模式宽得多：隔离模式的参与者只是"动嘴"，而工程模式的参与者要自己用只读工具
+   * 一轮轮翻代码（读文件 → 搜引用 → 再读），一次回答里可能夹着几十次工具调用。
+   * 120s 对它是常态超时，不是异常 —— 那会把"它还在读"误记成"它没表态"。
+   */
+  COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: 300_000,
+  /**
+   * 7F Kilo / 8F OpenCode 参与者的会话标题（`--title`），**也就是把它们挡在办公室外面的那把锁**。
+   *
+   * 为什么非有这么一个标记不可：这两家没有 1F/4F 那种 `--no-session-persistence`，
+   * 会话一律记进**全局** SQLite（`session.directory` = 当时的 cwd）。隔离模式下 cwd 是
+   * /tmp 里的一次性目录，办公室按工程过滤看不见它们；**工程模式下 cwd 就是用户的工程** ——
+   * 不标记的话，参与者当场变成办公室 7F/8F 上多出来的一个"会话"，违反 requirements.md
+   * §15.2「一场会开完，那两页看不出任何痕迹」。
+   *
+   * 数据目录也不能挪：实测 `XDG_DATA_HOME` 确实能把这些库挪走（Kilo 的 kilo.db 会落在新目录下），
+   * 但**登录态跟着一起没了**（挪完再跑，Kilo 回 401「You need to sign in」、OpenCode 直接挂住），
+   * 参与者会连话都说不出来。所以改成"照常落盘 + 打上固定标题"，
+   * 由 server/src/kilo.js 与 server/src/opencode.js 在**列出会话时跳过这个标题**。
+   *
+   * 标题里带 WorkGremlin，是为了让用户在 Kilo / OpenCode 自己的会话历史里认得出这是谁留下的。
+   */
+  COUNCIL_SESSION_TITLE: '议事厅参与者（WorkGremlin）',
   /** 单个内联材料文件的字节上限；超出的部分截断，并在界面标注「已截断」 */
   COUNCIL_MATERIAL_MAX_BYTES: 64 * 1024,
   /** 全部内联材料的字节上限（提示词要塞进 argv / stdin，不能无限长） */

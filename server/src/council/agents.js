@@ -26,49 +26,119 @@
  * 都要落到 status='unparsed' 并把原文留着，绝不能猜一个"大概是同意吧"。
  */
 
-/** 7F / 8F 共用的权限封锁：把工具按类别全 deny。`*` 是兜底，列出来的是明写一遍好读 */
-const DENY_ALL_PERMISSION = Object.freeze({
-  '*': 'deny',
-  bash: 'deny',
-  edit: 'deny',
-  write: 'deny',
-  read: 'deny',
-  glob: 'deny',
-  grep: 'deny',
-  list: 'deny',
-  webfetch: 'deny',
-  websearch: 'deny',
-  task: 'deny',
-  skill: 'deny',
-  todowrite: 'deny',
-  external_directory: 'deny',
-});
+const { DEFAULTS } = require('@workgremlin/shared');
+
+/**
+ * 关掉 WorkGremlin **自己**的上报 —— 每条配方都注入，两种模式都注入。
+ *
+ * 为什么是必须的：隔离模式靠 cwd 在 /tmp 就够（参与者上报的工程路径是那个临时目录，
+ * 办公室根本看不见）。**工程模式下 cwd 是用户的真实工程**，`~/.claude/settings.json` /
+ * `~/.codebuddy/settings.json` 里装着的上报 hook 会带着真实工程路径上报 —— 参与者当场
+ * 变成"你工程里的一个成员"，直接违反"只在议事厅看得见"。所以这里不再依赖 cwd，
+ * 改成显式关掉上报：hook（packages/reporter/src/hook.js）与插件
+ * （packages/reporter/src/plugin/index.js）都认这一条，认到就原地退出。
+ */
+const QUIET_ENV = Object.freeze({ WORKGREMLIN_DISABLE: '1' });
+
+/**
+ * 7F / 8F 参与者会话的固定标题 —— 这两家没有 1F/4F 那种"不落盘"开关，
+ * 会话一定会记进它们的**全局** SQLite（`session.directory` = 当时的 cwd）。
+ * 隔离模式下 cwd 在 /tmp，办公室按工程过滤看不见；工程模式下 cwd 就是用户的工程，
+ * 不挡的话参与者会直接出现在办公室的 7F/8F 上。挡法是"打一个固定标题"，
+ * 由 server/src/kilo.js 与 server/src/opencode.js 列出会话时跳过它 —— 理由与代价
+ * 都写在 shared/index.js 的 COUNCIL_SESSION_TITLE 那一段。
+ */
+const SESSION_TITLE = DEFAULTS.COUNCIL_SESSION_TITLE;
+
+/** 7F / 8F 的权限表要逐项写全（`*` 是兜底，列出来的是明写一遍好读、也方便断言） */
+const PERMISSION_KEYS = Object.freeze([
+  'bash', 'edit', 'write', 'read', 'glob', 'grep', 'list',
+  'webfetch', 'websearch', 'task', 'skill', 'todowrite', 'external_directory',
+]);
+
+/** 7F / 8F 共用的权限封锁：把工具按类别全 deny —— 隔离模式用这份 */
+const DENY_ALL_PERMISSION = Object.freeze(
+  Object.fromEntries([['*', 'deny'], ...PERMISSION_KEYS.map((k) => [k, 'deny'])])
+);
+
+/**
+ * 工程模式（allow='read'）给 7F / 8F 的权限表：**只**放行读类工具，其余照旧全 deny。
+ *
+ * 7F Kilo / 8F OpenCode 没有 1F/4F 那种 `--tools` 开关（`kilo --pure` 只关外部插件，
+ * 跟工具无关），所以"只读"只能靠喂这份配置。两处**必须**保持 deny：
+ *   · `bash` / `write` / `edit` —— 参与者不许改用户的代码，也不许在用户机器上跑命令；
+ *   · `external_directory` —— 工程模式只许看工程里。缺省它是 ask，而议事厅的参与者
+ *     没人应答权限询问，ask 会变成"卡住到超时"；明写 deny 才是确定的行为。
+ */
+const READ_PERMISSION = Object.freeze(
+  Object.fromEntries([
+    ['*', 'deny'],
+    ...PERMISSION_KEYS.map((k) => [k, ['read', 'glob', 'grep', 'list'].includes(k) ? 'allow' : 'deny']),
+  ])
+);
+
+/** @param {string} allow 'none'（缺省，隔离模式的"没有工具"）或 'read'（工程模式的只读工具） */
+function permissionFor(allow) {
+  return allow === 'read' ? READ_PERMISSION : DENY_ALL_PERMISSION;
+}
+
+/**
+ * 1F / 4F 的只读工具白名单。给 `--tools` 与 `--allowedTools` **同一份**：
+ *   · `--tools`        —— 限制它**能用**哪些内置工具（其余根本不出现）；
+ *   · `--allowedTools` —— 允许这些工具**不用问**就直接用。
+ * `-p` 是非交互的，没人应答权限询问，只给前一个的话读文件会被拒（每一步都要问），
+ * 于是参与者只能干瞪眼 —— 那不是只读，那是读不了。
+ */
+const READ_TOOLS = 'Read,Grep,Glob';
 
 /**
  * 每层一个配方。
  *
- * build({ bin, prompt }) → { bin, args, env, stdin }
+ * build({ bin, prompt, allow }) → { bin, args, env, stdin }
+ *   · `allow` = 'none'（缺省）| 'read' —— 见上面 READ_TOOLS / READ_PERMISSION。
+ *     **两种取值都必须把工具的出口堵死或窄成只读**，没有"给一半"的中间态。
  *   · env 是**叠加**在 process.env 之上的（不是替换）—— 各 CLI 的登录凭据在 ~/.claude、
- *     ~/.config/kilo 这些目录里，靠 HOME 找。挡掉 HOME 等于挡掉登录，所以隔离只靠
- *     cwd（临时目录）+ 关工具，不靠改环境变量。
+ *     ~/.config/kilo 这些目录里，靠 HOME 找。挡掉 HOME 等于挡掉登录，所以隔离靠
+ *     cwd + 工具收敛 + QUIET_ENV，不靠改环境变量。
  *   · stdin 非 null 时提示词走管道（不进 argv）：长文本不会撞 ARG_MAX，也不会出现在
  *     `ps` 的命令行里被同机其他进程看到。
+ *
+ * 1F / 4F 都带 `--no-session-persistence`（两家 help 里都有，均限 `--print` 下有效）：
+ * 参与者的对话**不落盘**。工程模式下这条是隔离的必需品 —— 落了盘，各 CLI 会把参与者
+ * 按**用户真实工程路径**记进它自己的历史（`~/.claude/projects/<工程>/`），
+ * 全局会话列表里就会多出几个"你工程里的活跃会话"。隔离模式同样受益：不再留
+ * `tmp-wg-council-*` 那种一次性工程的残骸。
+ *
+ * `--strict-mcp-config` 且不给 `--mcp-config`：不加载用户配置里的 MCP server。
+ * `--tools ""` 管的是**内置**工具集，MCP 工具不在其中 —— 不挡的话"没有工具的参与者"
+ * 这句话就不成立（顺带说明：这一条是对既有行为的收紧，不是本次新开的口子）。
  */
 const RECIPES = {
   '1F': {
     agent: 'codebuddy',
     name: 'CodeBuddy',
     // 实测：`-p` 不带消息即读管道（help 原文 "useful for pipes"）
-    build({ bin, prompt }) {
-      return { bin, args: ['-p', '--output-format', 'json', '--tools', ''], env: {}, stdin: prompt };
+    build({ bin, prompt, allow }) {
+      const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
+      if (allow === 'read') args.push('--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
+      else args.push('--tools', '');
+      return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
   },
 
   '4F': {
     agent: 'claude',
     name: 'Claude Code',
-    build({ bin, prompt }) {
-      return { bin, args: ['-p', '--output-format', 'json', '--tools', ''], env: {}, stdin: prompt };
+    build({ bin, prompt, allow }) {
+      const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
+      if (allow === 'read') {
+        // `--permission-prompts none` = 没人应答就拒（不是"挂在那儿等"）。排在
+        // `--allowedTools` **前面**：那个开关收的是变长参数，放后面会被它吃掉。
+        args.push('--permission-prompts', 'none', '--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
+      } else {
+        args.push('--tools', '');
+      }
+      return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
   },
 
@@ -78,15 +148,16 @@ const RECIPES = {
     // 提示词走位置参数（kilo run <message>）：这两家不读 stdin。
     // 我们的提示词永远以自己那段模板开头，不会以 '-' 打头，所以不必再塞 '--' 分隔符
     // （塞了反而可能被 yargs 当成分隔符吃掉，得不偿失）。
-    build({ bin, prompt }) {
+    build({ bin, prompt, allow }) {
       return {
         bin,
-        args: ['run', prompt, '--format', 'json'],
+        args: ['run', prompt, '--format', 'json', '--title', SESSION_TITLE],
         env: {
           KILO_CONFIG_CONTENT: JSON.stringify({
             plugin: [], // 摘掉 WorkGremlin 自己的上报插件（否则参与者会被上报进办公室）
-            permission: DENY_ALL_PERMISSION,
+            permission: permissionFor(allow),
           }),
+          ...QUIET_ENV,
         },
         stdin: null,
       };
@@ -96,11 +167,14 @@ const RECIPES = {
   '8F': {
     agent: 'opencode',
     name: 'OpenCode',
-    build({ bin, prompt }) {
+    build({ bin, prompt, allow }) {
       return {
         bin,
-        args: ['run', prompt, '--format', 'json'],
-        env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: DENY_ALL_PERMISSION }) },
+        args: ['run', prompt, '--format', 'json', '--title', SESSION_TITLE],
+        env: {
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: permissionFor(allow) }),
+          ...QUIET_ENV,
+        },
         stdin: null,
       };
     },
@@ -282,7 +356,7 @@ function parseVoteBlock(text) {
   const s = String(text == null ? '' : text);
   if (!s.trim()) return empty;
 
-  const obj = lastJsonObjectWithVote(s);
+  const obj = lastJsonBlock(s, (o) => 'vote' in o);
   if (obj) {
     const vote = normalizeVoteToken(obj.vote);
     if (vote) {
@@ -323,30 +397,86 @@ function strOrNull(v) {
   return t ? t : null;
 }
 
+/* ---------------------------------- 分析解析 ---------------------------------- */
+
 /**
- * 从一段文本里找**最后一个**含 vote 的 JSON 对象。
- * 先试 ```json 围栏（从后往前），再退化成全文扫括号配对。
+ * 分析模式的结构化尾块。约定的形状（提示词里写死，见 prompt.js 的 ANALYSIS_PROTOCOL）：
+ *
+ * ```json
+ * {"stance":"support|oppose|unsure","points":[…],"risks":[…],"questions":[…]}
+ * ```
+ *
+ * 两条与表决解析同一套的规矩：
+ *   · 认不出就留 null —— `stance` 读了半天读不出就是"未表态"，never 按语气猜；
+ *   · `findings` 的 null 与空对象**不是一回事**：null = 整个尾块没解析出来，
+ *     `{points:[],risks:[],questions:[]}` = 它答了，只是三条都空。界面上这两种写法不同。
+ *
+ * @param {string} text
+ * @returns {{stance:string|null, findings:{points:string[],risks:string[],questions:string[]}|null}}
  */
-function lastJsonObjectWithVote(s) {
+function parseAnalysisBlock(text) {
+  const empty = { stance: null, findings: null };
+  const s = String(text == null ? '' : text);
+  if (!s.trim()) return empty;
+  const obj = lastJsonBlock(
+    s,
+    (o) => 'stance' in o || 'points' in o || 'risks' in o || 'questions' in o
+  );
+  if (!obj) return empty;
+  return { stance: normalizeStanceToken(obj.stance), findings: findingsOf(obj) };
+}
+
+/** 立场词表。归一规则与 normalizeVoteToken 一个路子：认识的归一，不认识的返 null */
+function normalizeStanceToken(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  if (/^(support|yes|pro|for|agree|赞成|支持|可行|同意)$/.test(s)) return 'support';
+  if (/^(oppose|no|against|con|disagree|反对|不可行|不同意)$/.test(s)) return 'oppose';
+  if (/^(unsure|unknown|maybe|unclear|不确定|存疑|拿不准|说不准|待定)$/.test(s)) return 'unsure';
+  return null;
+}
+
+/**
+ * 三个列表字段。**一个都没给**（或给的不是数组）→ null（= 没解析出来）；
+ * 只要有一个是数组，就返回三个键都齐的对象（缺的那些是空数组）。
+ * 元素只收非空字符串 —— 模型偶尔塞个 `{"point":"…"}` 进来，那不是我们要的形状，丢掉。
+ */
+function findingsOf(obj) {
+  const listOf = (v) =>
+    Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean) : [];
+  if (!['points', 'risks', 'questions'].some((k) => Array.isArray(obj[k]))) return null;
+  return { points: listOf(obj.points), risks: listOf(obj.risks), questions: listOf(obj.questions) };
+}
+
+/**
+ * 从一段文本里找**最后一个**满足判据的 JSON 对象。
+ * 先试 ```json 围栏（从后往前），再退化成全文扫括号配对。
+ * 表决块与分析块共用这一套（判据不同：一个认 `vote`，一个认 `stance`/`points`）。
+ *
+ * @param {string} s
+ * @param {(obj:object)=>boolean} ok
+ */
+function lastJsonBlock(s, ok) {
   const fenced = [...s.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1]);
   for (let i = fenced.length - 1; i >= 0; i -= 1) {
-    const obj = tryParseWithVote(fenced[i]);
+    const obj = tryParseJsonObject(fenced[i], ok);
     if (obj) return obj;
   }
-  // 没有围栏：从每个 '{' 起做括号配对，取最后一个能解析出 vote 的
+  // 没有围栏：从每个 '{' 起做括号配对，取最后一个满足判据的
   for (let i = s.lastIndexOf('{'); i >= 0; i = s.lastIndexOf('{', i - 1)) {
-    const obj = tryParseWithVote(extractBalanced(s, i));
+    const obj = tryParseJsonObject(extractBalanced(s, i), ok);
     if (obj) return obj;
     if (i === 0) break;
   }
   return null;
 }
 
-function tryParseWithVote(chunk) {
+function tryParseJsonObject(chunk, ok) {
   if (!chunk) return null;
   try {
     const obj = JSON.parse(chunk.trim());
-    if (obj && typeof obj === 'object' && !Array.isArray(obj) && 'vote' in obj) return obj;
+    if (obj && typeof obj === 'object' && !Array.isArray(obj) && ok(obj)) return obj;
   } catch {
     /* 解析不了就换下一个候选 */
   }
@@ -376,4 +506,15 @@ function extractBalanced(s, from) {
   return '';
 }
 
-module.exports = { RECIPES, DENY_ALL_PERMISSION, parseOutput, parseVoteBlock, normalizeVoteToken };
+module.exports = {
+  RECIPES,
+  DENY_ALL_PERMISSION,
+  READ_PERMISSION,
+  READ_TOOLS,
+  QUIET_ENV,
+  parseOutput,
+  parseVoteBlock,
+  normalizeVoteToken,
+  parseAnalysisBlock,
+  normalizeStanceToken,
+};

@@ -12,12 +12,12 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useCouncilStore } from '../stores/council';
 import { useI18n } from '../i18n';
-import { voteKey, tokenTotal } from '../lib/councilTimeline';
+import { voteKey, stanceKey, tokenTotal } from '../lib/councilTimeline';
 
 const store = useCouncilStore();
 const { t } = useI18n();
 
-const form = reactive({ topic: '', floors: [], files: '', maxRounds: 3 });
+const form = reactive({ topic: '', floors: [], files: '', maxRounds: 3, mode: 'vote', workspace: '' });
 const formError = ref('');
 
 onMounted(async () => {
@@ -49,11 +49,21 @@ async function submit() {
     formError.value = t('council.need_two_floors');
     return;
   }
+  // 工作目录前端只拦一件事：**必须写绝对路径**。存在不存在、是不是目录，交给服务端 ——
+  // 它在发起的那一刻校验，比前端猜准，而且它说的话原样显示给用户。
+  // 前端自己判一句的原因只是"让用户少等一趟往返"，不是为了替他做判断。
+  const ws = form.workspace.trim();
+  if (ws && !/^(~\/|\/|[A-Za-z]:[\\/]|\\\\)/.test(ws)) {
+    formError.value = t('council.workspace_abs');
+    return;
+  }
   const id = await store.create({
     topic: form.topic.trim(),
     floors: form.floors,
     files: files(),
     maxRounds: Number(form.maxRounds) || store.defaults.maxRounds,
+    mode: form.mode,
+    workspacePath: ws,
   });
   if (id) form.topic = '';
 }
@@ -76,8 +86,51 @@ const lastDebate = computed(() => {
   return rounds.length ? rounds[rounds.length - 1] : null;
 });
 
+/** 这场会是哪种谈法。老行没有 mode → 表决（那时候只有这一种，见 stores/council.js 的 mode） */
+const modeOf = (c) => ((c && c.mode) === 'analysis' ? 'analysis' : 'vote');
+
 const statusKey = (s) => (['draft', 'running', 'done', 'failed', 'cancelled'].includes(s) ? s : 'done');
-const verdictKey = (v) => (['consensus', 'no_consensus', 'cancelled', 'failed'].includes(v) ? v : 'failed');
+const verdictKey = (v) =>
+  ['consensus', 'no_consensus', 'reported', 'cancelled', 'failed'].includes(v) ? v : 'failed';
+
+/**
+ * 分析模式的简报分组 —— **服务端不合成结论，我们也不合成**。
+ * 只做一件事：把最后一轮各人的最终判断按立场摆到一起，`points` / `risks` / `questions`
+ * 原样列出。顺序固定四档（支持 → 反对 → 不确定 → 未表态），空组不渲染。
+ *
+ * 为什么以**最后一轮**为准：提示词里明写了最后那轮要给最终判断，而中间轮次是过程 ——
+ * 把每一轮的立场都堆上来，读的人反而看不出他们最后到底站哪儿。过程在下面的时间线里，
+ * 一条都没丢。
+ */
+const STANCE_ORDER = ['support', 'oppose', 'unsure', 'none'];
+const report = computed(() => {
+  if (!lastDebate.value) return [];
+  const seats = lastDebate.value.utterances.filter((u) => u.role !== 'chair');
+  return STANCE_ORDER.map((key) => ({
+    key,
+    items: seats.filter((u) => stanceKey(u.stance) === key),
+  })).filter((g) => g.items.length);
+});
+
+/** 简报里的立场计数（从发言现数）。chair 不占席位，与表决那套口径一致 */
+const stanceTally = computed(() => (lastDebate.value ? lastDebate.value.stanceTally : null));
+
+/**
+ * 一条发言的要点 → 「标题键 + 该列的条目」两两一组，空列不出现。
+ * findings 为 null（没解析出来）时返回空数组 —— 那是另一句话（findings_unparsed），
+ * 调用方按 `!u.findings` 分开走，不靠这个空数组来区分。
+ */
+const findingRows = (u) => {
+  const f = u && u.findings;
+  if (!f) return [];
+  return [
+    ['council.points', f.points],
+    ['council.risks', f.risks],
+    ['council.questions', f.questions],
+  ]
+    .filter(([, v]) => Array.isArray(v) && v.length)
+    .map(([k, v]) => ({ k, v }));
+};
 
 const fmtBytes = (n) => (n == null ? '—' : `${n.toLocaleString()}`);
 
@@ -111,6 +164,13 @@ function confirmRemove(id) {
           rows="3"
           :placeholder="t('council.topic_ph')"
         />
+
+        <label class="lbl" for="cv-mode">{{ t('council.mode') }}</label>
+        <select id="cv-mode" v-model="form.mode" class="sel" data-testid="cv-mode">
+          <option value="vote">{{ t('council.mode.vote') }}</option>
+          <option value="analysis">{{ t('council.mode.analysis') }}</option>
+        </select>
+        <p class="hint">{{ form.mode === 'analysis' ? t('council.mode_analysis_note') : t('council.mode_vote_note') }}</p>
 
         <label class="lbl">{{ t('council.floors') }}</label>
         <p v-if="!store.canStart" class="why bad" data-testid="cv-no-floors">{{ t('council.empty_floors') }}</p>
@@ -146,6 +206,20 @@ function confirmRemove(id) {
           {{ t('council.files_hint', { kb: Math.round((store.defaults.materialMaxBytes || 0) / 1024) }) }}
         </p>
 
+        <label class="lbl" for="cv-workspace">{{ t('council.workspace') }}</label>
+        <input
+          id="cv-workspace"
+          v-model="form.workspace"
+          class="ta mono"
+          type="text"
+          data-testid="cv-workspace"
+          :placeholder="t('council.workspace_ph')"
+        />
+        <p class="hint">{{ t('council.workspace_hint') }}</p>
+        <p v-if="form.workspace.trim()" class="hint">
+          {{ t('council.workspace_timeout', { min: Math.round((store.defaults.workspaceTurnTimeoutMs || 0) / 60000) }) }}
+        </p>
+
         <div class="row">
           <label class="lbl inline" for="cv-rounds">{{ t('council.rounds') }}</label>
           <input
@@ -157,9 +231,9 @@ function confirmRemove(id) {
             :max="store.defaults.maxRoundsLimit || 8"
           />
         </div>
-        <p class="hint">{{ t('council.rounds_note') }}</p>
+        <p class="hint">{{ form.mode === 'analysis' ? t('council.rounds_note_analysis') : t('council.rounds_note') }}</p>
 
-        <p class="hint">
+        <p v-if="form.mode === 'vote'" class="hint">
           {{ t('council.threshold') }}：{{
             store.defaults.threshold === 'majority' ? t('council.threshold.majority') : t('council.threshold.unanimous')
           }} —— {{ t('council.threshold_note') }}
@@ -186,6 +260,7 @@ function confirmRemove(id) {
             <span class="v" :class="'v-' + verdictKey(c.verdict || 'failed')">
               {{ c.verdict ? t('council.verdict.' + verdictKey(c.verdict)) : t('council.status.' + statusKey(c.status)) }}
             </span>
+            <span class="m" :title="t('council.mode.' + modeOf(c))">{{ t('council.mode.' + modeOf(c)) }}</span>
             <span class="topic">{{ c.topic }}</span>
           </li>
         </ul>
@@ -202,9 +277,16 @@ function confirmRemove(id) {
             <span class="badge" :class="'v-' + verdictKey(council.verdict || 'failed')">
               {{ council.verdict ? t('council.verdict.' + verdictKey(council.verdict)) : t('council.status.' + statusKey(council.status)) }}
             </span>
+            <!-- 谈法与工作目录都摆在这儿：事后来看，"他们在哪儿谈的"是理解这场会的前提 -->
+            <span class="badge m" :class="'m-' + store.mode" data-testid="cv-mode-badge">
+              {{ t('council.mode.' + store.mode) }}
+            </span>
             <span v-if="store.live" class="live" data-testid="cv-live">● {{ t('council.live') }}</span>
           </div>
           <h2 class="topic-h">{{ council.topic }}</h2>
+          <p v-if="store.workspacePath" class="ws mono" data-testid="cv-workspace-show">
+            {{ t('council.workspace_line') }}<span class="ws-path">{{ store.workspacePath }}</span>
+          </p>
           <div class="acts">
             <button v-if="store.live" class="ghost" @click="store.cancel(council.id)">{{ t('council.cancel') }}</button>
             <button v-else class="ghost danger" @click="confirmRemove(council.id)">{{ t('council.delete') }}</button>
@@ -213,8 +295,75 @@ function confirmRemove(id) {
 
         <p v-if="store.error" class="why bad" data-testid="cv-op-error">{{ store.error }}</p>
 
+        <!--
+          分析模式的简报。**必须排在下面那个通用 verdict 分支之前** ——
+          否则 verdict='reported' 会掉进最后那个"中断"框，看起来像这场会出事了。
+          这里同样不合成结论：只按立场分组，各自说了什么照原样列。
+        -->
+        <div
+          v-if="store.mode === 'analysis' && council.verdict === 'reported'"
+          class="result report"
+          data-testid="cv-report"
+        >
+          <h3 class="h3">{{ t('council.report') }}</h3>
+          <p class="hint">{{ t('council.report_hint', { n: council.max_rounds }) }}</p>
+          <p v-if="stanceTally" class="tally" data-testid="cv-report-tally">
+            {{
+              t('council.stance_tally', {
+                support: stanceTally.support,
+                oppose: stanceTally.oppose,
+                unsure: stanceTally.unsure,
+                none: stanceTally.none,
+              })
+            }}
+          </p>
+
+          <section
+            v-for="g in report"
+            :key="g.key"
+            class="rgroup"
+            :class="'v-' + g.key"
+            :data-testid="'cv-group-' + g.key"
+          >
+            <h4 class="gh">{{ t('council.stance.' + g.key) }}（{{ g.items.length }}）</h4>
+            <ul class="rlist">
+              <li v-for="u in g.items" :key="u.floorId">
+                <div class="line">
+                  <span class="fid">{{ u.floorId }}</span>
+                  <span class="fname">{{ floorName(u.floorId) }}</span>
+                  <span v-if="u.stance" class="v" :class="'v-' + stanceKey(u.stance)">
+                    {{ t('council.stance.' + stanceKey(u.stance)) }}
+                  </span>
+                </div>
+
+                <!-- 未表态的：它要么没答上来、要么没按约定给尾块。错误原文照摆，别拿别的凑 -->
+                <p v-if="g.key === 'none'" class="why bad">
+                  {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
+                  <span v-if="u.error"> —— {{ u.error }}</span>
+                </p>
+
+                <!-- 表了态却没给要点：这是"没按约定给"，不是"它说没有风险"，两句话不一样 -->
+                <p v-else-if="!u.findings" class="why dim" :data-testid="'cv-nofindings-' + u.floorId">
+                  {{ t('council.findings_unparsed') }}
+                </p>
+
+                <template v-else>
+                  <div v-for="row in findingRows(u)" :key="row.k" class="fl">
+                    <span class="fk">{{ t(row.k) }}</span>
+                    <ul class="fv">
+                      <li v-for="(x, i) in row.v" :key="i">{{ x }}</li>
+                    </ul>
+                  </div>
+                  <!-- 三条数组都空：它答了，答的是"没有"。这跟上面"没给"要分得开 -->
+                  <p v-if="!findingRows(u).length" class="why dim">{{ t('council.findings_empty') }}</p>
+                </template>
+              </li>
+            </ul>
+          </section>
+        </div>
+
         <!-- 结论：谈成了就原样引用那一轮的提案；没谈成就说没谈成 -->
-        <div v-if="council.verdict === 'consensus' && consensusRound" class="result win" data-testid="cv-conclusion">
+        <div v-else-if="council.verdict === 'consensus' && consensusRound" class="result win" data-testid="cv-conclusion">
           <h3 class="h3">{{ t('council.conclusion') }}</h3>
           <p class="hint">{{ t('council.conclusion_from_round', { n: consensusRound.round_no }) }}</p>
           <blockquote class="quote">{{ consensusRound.proposal_text }}</blockquote>
@@ -246,8 +395,8 @@ function confirmRemove(id) {
           <p v-if="council.error" class="why bad">{{ council.error }}</p>
         </div>
 
-        <!-- 现在桌上的是哪份提案 -->
-        <div v-if="store.live && store.currentProposal" class="proposal" data-testid="cv-proposal">
+        <!-- 现在桌上的是哪份提案（只有表决模式有"桌上那份提案"这回事） -->
+        <div v-if="store.mode === 'vote' && store.live && store.currentProposal" class="proposal" data-testid="cv-proposal">
           <span class="tag">{{ t('council.current_proposal') }}</span>
           <span class="p-round">{{ t('council.round_of', { n: store.currentProposal.roundNo, total: council.max_rounds }) }}</span>
           <p class="p-text">{{ store.currentProposal.proposal }}</p>
@@ -266,10 +415,21 @@ function confirmRemove(id) {
           <li v-for="g in store.timeline" :key="g.roundNo" class="round">
             <div class="round-head">
               <span class="rno">{{ g.roundNo === 0 ? t('council.round_brief') : t('council.round_n', { n: g.roundNo }) }}</span>
-              <span v-if="g.roundNo > 0" class="tally">
+              <span v-if="g.roundNo > 0 && store.mode === 'vote'" class="tally">
                 {{ t('council.tally', { agree: g.tally.agree, disagree: g.tally.disagree, abstain: g.tally.abstain, invalid: g.tally.invalid }) }}
               </span>
-              <span v-if="serverTally(g.roundNo) && serverTally(g.roundNo).consensus === 1" class="won">
+              <!-- 分析模式不数票：这一行给的是"这轮各人的倾向"，口径与未表态人数都写清 -->
+              <span v-else-if="g.roundNo > 0" class="tally">
+                {{
+                  t('council.stance_tally', {
+                    support: g.stanceTally.support,
+                    oppose: g.stanceTally.oppose,
+                    unsure: g.stanceTally.unsure,
+                    none: g.stanceTally.none,
+                  })
+                }}
+              </span>
+              <span v-if="store.mode === 'vote' && serverTally(g.roundNo) && serverTally(g.roundNo).consensus === 1" class="won">
                 {{ t('council.consensus_reached') }}
               </span>
             </div>
@@ -278,8 +438,17 @@ function confirmRemove(id) {
               <div class="line">
                 <span class="fid">{{ u.floorId }}</span>
                 <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
-                <span v-if="u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
-                  {{ t('council.vote.' + voteKey(u.vote)) }}
+                <!-- 两种谈法各标各的：表决标票型、分析标立场。都没解析出来就是「未表态」 -->
+                <span
+                  v-if="u.role !== 'chair'"
+                  class="v"
+                  :class="'v-' + (store.mode === 'analysis' ? stanceKey(u.stance) : voteKey(u.vote))"
+                >
+                  {{
+                    store.mode === 'analysis'
+                      ? t('council.stance.' + stanceKey(u.stance))
+                      : t('council.vote.' + voteKey(u.vote))
+                  }}
                 </span>
                 <span v-if="u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
                 <span class="spacer" />
@@ -296,6 +465,14 @@ function confirmRemove(id) {
 
               <p v-if="u.voteReason" class="sub"><span class="k">{{ t('council.reason') }}</span>{{ u.voteReason }}</p>
               <p v-if="u.proposal" class="sub"><span class="k">{{ t('council.proposal') }}</span>{{ u.proposal }}</p>
+
+              <!-- 分析模式：把解析出的三条单列一遍（正文里那截 JSON 也还在上面，那是原文） -->
+              <div v-for="row in findingRows(u)" :key="row.k" class="fl">
+                <span class="fk">{{ t(row.k) }}</span>
+                <ul class="fv">
+                  <li v-for="(x, i) in row.v" :key="i">{{ x }}</li>
+                </ul>
+              </div>
             </article>
           </li>
         </ol>
@@ -377,6 +554,19 @@ function confirmRemove(id) {
 }
 .ta.mono { font-family: var(--mono); font-size: 11px; }
 
+.sel {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+input.ta { padding: 6px 8px; }
+
 .floors { list-style: none; margin: 0; padding: 0; }
 .floors li { margin: 3px 0; }
 .floors label { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
@@ -434,6 +624,11 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 历史列表里的谈法角标：短、不抢眼，只是为了把两种会分开 */
+.m { font-size: 10px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.badge.m-analysis { color: var(--accent); border-color: var(--accent); }
+.ws { font-size: 11px; color: var(--text-faint); margin: 0; word-break: break-all; }
+.ws-path { color: var(--text-dim); margin-left: 4px; }
 
 /* ------------------------------------------------------------ 右栏 */
 .main {
@@ -472,12 +667,16 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
   border: 1px solid var(--border-strong);
   white-space: nowrap;
 }
-.v-agree { color: var(--state-online); border-color: var(--state-online); }
-.v-disagree { color: var(--state-blocked); border-color: var(--state-blocked); }
-.v-abstain { color: var(--state-idle); }
+.v-agree,
+.v-support { color: var(--state-online); border-color: var(--state-online); }
+.v-disagree,
+.v-oppose { color: var(--state-blocked); border-color: var(--state-blocked); }
+.v-abstain,
+.v-unsure { color: var(--state-idle); }
 .v-none { color: var(--text-faint); }
 .v-consensus { color: var(--state-online); border-color: var(--state-online); }
 .v-no_consensus { color: var(--state-busy); border-color: var(--state-busy); }
+.v-reported { color: var(--accent); border-color: var(--accent); }
 .v-cancelled,
 .v-failed { color: var(--text-dim); }
 
@@ -489,6 +688,26 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 }
 .result.win { border-color: var(--state-online); }
 .result.lose { border-color: var(--state-busy); }
+/* 简报：不着色 —— 它不是一个判定，只是把各方说的话摆到一起 */
+.result.report { border-color: var(--border-strong); }
+
+.rgroup { margin-top: 10px; }
+.rgroup .gh { font-size: 12px; margin: 0 0 6px; color: var(--text-dim); }
+/* 左边一道色条，四档一眼分得开（未表态那档是灰的，不假装它有立场） */
+.rgroup { border-left: 3px solid var(--border-strong); padding-left: 10px; }
+.rgroup.v-support { border-left-color: var(--state-online); }
+.rgroup.v-oppose { border-left-color: var(--state-blocked); }
+.rgroup.v-unsure { border-left-color: var(--state-idle); }
+.rgroup.v-none { border-left-color: var(--text-faint); }
+.rlist { list-style: none; margin: 0; padding: 0; }
+.rlist > li { margin: 0 0 8px; }
+.rlist > li:last-child { margin-bottom: 0; }
+
+/* 要点三行：结论 / 风险 / 存疑。原样列，不重写、不排序 */
+.fl { display: flex; gap: 8px; margin: 4px 0 0; font-size: 12px; }
+.fk { color: var(--text-faint); flex: 0 0 auto; min-width: 32px; }
+.fv { list-style: none; margin: 0; padding: 0; color: var(--text); line-height: 1.5; }
+.fv li::before { content: '· '; color: var(--text-faint); }
 .quote {
   margin: 6px 0 0;
   padding: 8px 10px;

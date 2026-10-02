@@ -351,6 +351,123 @@ const waitFor = async (cond, ms = 3_000) => {
     ok('那个没跑完的会没有凭空多出结论轮次', repo.listRounds('cG-stale').length === 0);
   }
 
+  // ============================================================ 分析模式
+  head('分析模式：不判票、跑满轮数、如实呈报');
+  {
+    const h = makeHarness();
+    const orch = mkOrchestrator(h);
+    h.all(() => OK('我的分析：这个改法可以，但要盯住并发。\n```json\n' +
+      JSON.stringify({ stance: 'support', points: ['改法可行'], risks: ['并发下可能重复写'], questions: ['有没有测试覆盖'] }) +
+      '\n```'));
+    repo.createCouncil({ id: 'cA1', topic: '这个 bug fix 会不会引入回归', mode: 'analysis', threshold: 'unanimous', maxRounds: 2, createdAt: now() });
+    for (const f of ['1F', '4F', '7F']) repo.insertParticipant({ councilId: 'cA1', floorId: f, agent: 'x', cliPath: null });
+
+    const row = await orch.start('cA1');
+    ok('跑满就是正常收场：verdict=reported', row.verdict === 'reported', String(row.verdict));
+    ok('status=done（不是 failed）', row.status === 'done', String(row.status));
+    ok('跑到第 2 轮（没有被"达成一致"提前截断）', row.round_current === 2, String(row.round_current));
+
+    const us = repo.listUtterances('cA1').filter((u) => u.role !== 'chair');
+    ok('三个楼层 × 两轮都发了言', us.length === 6, String(us.length));
+    ok('每条都落了立场', us.every((u) => u.stance === 'support'), us.map((u) => u.stance).join(','));
+    ok('结构化要点原样落库（JSON 文本）',
+      us.every((u) => /"risks":\["并发下可能重复写"\]/.test(String(u.findings_json))), String(us[0].findings_json));
+    ok('分析模式不数票：三个票型列全是 0',
+      repo.listRounds('cA1').filter((r) => r.round_no > 0).every((r) => r.agree === 0 && r.disagree === 0 && r.abstain === 0));
+    ok('那一轮里没人给立场的人数和其它模式同一个口径',
+      repo.listRounds('cA1').filter((r) => r.round_no > 0).every((r) => r.invalid === 0));
+    ok('没有"桌上那份提案"（不能把议题冒充成被人表决过的提案）',
+      repo.listRounds('cA1').filter((r) => r.round_no > 0).every((r) => r.proposal_text == null));
+
+    const prompt = h.seen[0].prompt;
+    ok('提示词里没有"现在要表决的提案"那一段', !/现在要表决的提案/.test(prompt));
+    ok('提示词里换成了分析模式的输出协议', /"stance":"support"/.test(prompt));
+    ok('提示词里写明第几轮', /第 1\/2 轮/.test(prompt));
+    ok('最后一轮明说要给最终判断', h.seen.filter((s) => s.round === 2).every((s) => /这是最后一轮/.test(s.prompt)));
+  }
+
+  head('分析模式：认不出立场就是未表态，不按语气猜');
+  {
+    const h = makeHarness();
+    const orch = mkOrchestrator(h);
+    // 头两轮说了话但没给尾块 —— 正文照存，立场留空，status=unparsed
+    h.all(() => OK('我觉得还行吧，大概。'));
+    repo.createCouncil({ id: 'cA2', topic: '没给尾块会怎样', mode: 'analysis', threshold: 'unanimous', maxRounds: 1, createdAt: now() });
+    for (const f of ['1F', '4F']) repo.insertParticipant({ councilId: 'cA2', floorId: f, agent: 'x', cliPath: null });
+
+    const row = await orch.start('cA2');
+    ok('照样收场成 reported（一句话没解析出来不该把整场会判成失败）', row.verdict === 'reported', String(row.verdict));
+    const us = repo.listUtterances('cA2').filter((u) => u.role !== 'chair');
+    ok('正文留着（它确实说了话）', us.every((u) => /我觉得还行吧/.test(String(u.content))));
+    ok('立场留空 —— 绝不按语气猜成 support', us.every((u) => u.stance === null), us.map((u) => u.stance).join(','));
+    ok('要点留空（不是空对象：那是"没说"，不是"说没有"）', us.every((u) => u.findings_json === null), String(us[0].findings_json));
+    ok('status 记成 unparsed（"没按约定表态"与"没跑成"要分得开）', us.every((u) => u.status === 'unparsed'), us.map((u) => u.status).join(','));
+  }
+
+  // ============================================================ 工程模式
+  head('工程模式：在用户的目录里谈，收尾时**绝不**碰那个目录');
+  {
+    // 这次注入的 removeDir / isDir 是**替身**，不碰真文件系统 —— 要断言的就是
+    // "收尾路径到底有没有走到删目录那一步"。真删一个用户目录的代价太大，不能用真件试。
+    const dirs = [];
+    const removed = [];
+    const h = makeHarness();
+    const wsDir = path.join(TMP, 'user-project');
+    fs.mkdirSync(wsDir, { recursive: true });
+    fs.writeFileSync(path.join(wsDir, 'IMPORTANT.txt'), 'user data');
+    const orch = createCouncilOrchestrator({
+      repo,
+      broadcast: (project, type, payload) => broadcasts.push({ project, type, payload }),
+      deps: {
+        runTurn: h.runTurn,
+        now,
+        cliPathOf: (floorId) => `/fake/${floorId}`,
+        mkdtemp: (prefix) => { const d = fs.mkdtempSync(path.join(TMP, prefix)); dirs.push(d); return d; },
+        removeDir: (d) => { removed.push(d); fs.rmSync(d, { recursive: true, force: true }); },
+        isDir: (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } },
+      },
+    });
+    h.all(() => OK(says('agree')));
+    repo.createCouncil({ id: 'cW1', topic: '看真实代码表决', workspacePath: wsDir, threshold: 'unanimous', maxRounds: 1, createdAt: now() });
+    for (const f of ['1F', '4F']) repo.insertParticipant({ councilId: 'cW1', floorId: f, agent: 'x', cliPath: null });
+
+    const row = await orch.start('cW1');
+    ok('在用户给的目录里跑', h.seen.every((s) => s.cwd === wsDir), h.seen.map((s) => s.cwd).join(','));
+    ok('**没有**建临时目录（工程模式不建一次性目录）', dirs.length === 0, dirs.join(','));
+    ok('**没有**调过 removeDir —— 这是本次改动最危险的一处，钉死它', removed.length === 0, removed.join(','));
+    ok('用户的工程目录原封不动还在', fs.existsSync(path.join(wsDir, 'IMPORTANT.txt')));
+    ok('正常收场', row.verdict === 'consensus', String(row.verdict));
+    ok('提示词里写明了工作目录', h.seen.every((s) => s.prompt.includes(wsDir)));
+    ok('提示词里说了它只能只读地翻代码', h.seen.every((s) => /不能修改任何文件/.test(s.prompt)));
+  }
+
+  head('工程模式：目录在发起与开跑之间没了 → 如实 failed，不空转四轮');
+  {
+    const removed = [];
+    const h = makeHarness();
+    const orch = createCouncilOrchestrator({
+      repo,
+      broadcast: (project, type, payload) => broadcasts.push({ project, type, payload }),
+      deps: {
+        runTurn: h.runTurn,
+        now,
+        cliPathOf: (floorId) => `/fake/${floorId}`,
+        mkdtemp: (prefix) => fs.mkdtempSync(path.join(TMP, prefix)),
+        removeDir: (d) => removed.push(d),
+        isDir: () => false,
+      },
+    });
+    h.all(() => OK(says('agree')));
+    repo.createCouncil({ id: 'cW2', topic: '目录没了', workspacePath: path.join(TMP, 'not-there'), threshold: 'unanimous', maxRounds: 2, createdAt: now() });
+    for (const f of ['1F', '4F']) repo.insertParticipant({ councilId: 'cW2', floorId: f, agent: 'x', cliPath: null });
+
+    const row = await orch.start('cW2');
+    ok('verdict=failed', row.verdict === 'failed', String(row.verdict));
+    ok('一句话没问（不空转四轮再报"谁都没表态"）', h.seen.length === 0, String(h.seen.length));
+    ok('错误原文里带着那个路径，用户一眼看得出是写错了', String(row.error).includes('not-there'), String(row.error));
+    ok('也没去删那个不存在的目录', removed.length === 0, removed.join(','));
+  }
+
   // ============================================================ 隔离
   // 这一组是"隔离，只在议事厅看"这条口径的**机器证据**：前面十几场会（含失败、取消、
   // 关服）跑完之后，被监控那侧的三张表必须一条都不多 —— 参与者不是楼层成员，

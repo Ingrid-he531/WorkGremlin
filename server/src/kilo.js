@@ -57,7 +57,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolveProjectName } = require('./project');
-const { clientBase } = require('@workgremlin/shared');
+const { clientBase, DEFAULTS } = require('@workgremlin/shared');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -497,6 +497,13 @@ function modelIdOf(raw) {
  *               worktree 子会话跑在别处时 directory 才是真的）
  *   time_updated → 最后活动时间（Kilo 每写一条消息/事件都推进它，比翻文件时间准）
  *
+ * **议事厅的参与者不进这张表**（`title = COUNCIL_SESSION_TITLE` 的直接跳过）：
+ * 工程模式下参与者的 cwd 就是用户的工程，会话会带着真实工程路径落进这个库 ——
+ * 不挡的话它当场变成办公室 7F 上多出来的一个"会话"，而 requirements.md §15.2 白纸黑字写着
+ * 「一场会开完，办公室那页看不出任何痕迹」。挡的**依据是标题**（参与者是我们自己拉起来的，
+ * 标题由 council/agents.js 指定），不改库、不必知道议事厅的状态，所以这条过滤在
+ * "这一场会还在不在跑"之外也成立。
+ *
  * @returns {Array<{id,title,directory,project,projectPath,lastEventAt,agent,model,fileCount}>}
  */
 function listKiloSessions() {
@@ -512,9 +519,10 @@ function listKiloSessions() {
                 summary_files, summary_additions, summary_deletions
            FROM session
           WHERE time_archived IS NULL
+            AND (title IS NULL OR title <> ?)
           ORDER BY time_updated DESC`
       )
-      .all()
+      .all(DEFAULTS.COUNCIL_SESSION_TITLE)
   );
   const value = (Array.isArray(rows) ? rows : []).map((r) => {
     const dir = String(r.directory || '');

@@ -68,14 +68,24 @@ const server = http.createServer((req, res) => {
   });
 });
 
-function runHook(payload) {
+/**
+ * 跑一次 hook。extraEnv 用来试 WORKGREMLIN_DISABLE（议事厅的参与者注入的就是它）。
+ * resolve 退出码 —— 各家 CLI 是**同步等着** hook 结束的，早退那一路的退出码也是行为的一部分。
+ */
+function runHookWithEnv(payload, extraEnv) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', 'claude'], { cwd: WS, stdio: ['pipe', 'ignore', 'ignore'] });
+    const child = spawn(process.execPath, [HOOK, '--agent', 'claude'], {
+      cwd: WS,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: { ...process.env, ...(extraEnv || {}) },
+    });
     child.stdin.write(JSON.stringify(payload));
     child.stdin.end();
-    child.on('close', () => resolve());
+    child.on('close', (code) => resolve(code));
   });
 }
+
+const runHook = (payload) => runHookWithEnv(payload, null);
 
 /** 最近一次 task/start、task/end 收到的请求体 */
 const lastStart = () => starts[starts.length - 1] || {};
@@ -251,6 +261,32 @@ async function main() {
   });
   ok('照常开任务（它是真 prompt，不能整条丢掉）', starts.length === starts9 + 1, `starts ${starts9} → ${starts.length}`);
   ok('标题是用户原话（不是那串 XML）', lastStart().title === '装上吧', JSON.stringify(lastStart().title));
+
+  /* [10] WORKGREMLIN_DISABLE=1：议事厅的参与者一个字都不上报（见 council/agents.js 的 QUIET_ENV）
+   *      工程模式下参与者的 cwd 就是用户的真实工程，挡不住这一下，参与者当场变成
+   *      "你工程里的一个成员" —— 直接违反"只在议事厅看得见"。*/
+  head('[10] WORKGREMLIN_DISABLE=1 → 什么都不上报（议事厅的参与者）');
+  const quietPayload = {
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 'cfm-quiet',
+    cwd: WS,
+    prompt: '议事厅参与者说的这一句不该出现在任何地方',
+    transcript_path: mkTranscript('cfm-quiet.jsonl', 'cli'),
+  };
+  const starts10 = starts.length;
+  const ends10 = ends.length;
+  const code = await runHookWithEnv(quietPayload, { WORKGREMLIN_DISABLE: '1' });
+  ok('没有 task/start（这是"参与者进办公室"的唯一入口）', starts.length === starts10, `starts ${starts10} → ${starts.length}`);
+  ok('没有 task/end', ends.length === ends10, `ends ${ends10} → ${ends.length}`);
+  ok('也没留下会话状态文件', stateOf('cfm-quiet') === null);
+  ok('退出码 0（各家 CLI 同步等它，早退不能变成一条报错）', code === 0, String(code));
+
+  // 对照：同一条 payload、去掉那个变量 → 必须真的上报。
+  // 少了这一条，上面四条是"因为整条路都坏了"才通过的，验不出什么。
+  head('[10b] 对照组：不设那个变量时，同一条 payload 照常上报');
+  const starts10b = starts.length;
+  await runHook(quietPayload);
+  ok('task/start 来了（说明上面挡住的确实是我们挡的）', starts.length === starts10b + 1, `starts ${starts10b} → ${starts.length}`);
 
   server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

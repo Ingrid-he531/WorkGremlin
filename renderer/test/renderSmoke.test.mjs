@@ -45,8 +45,20 @@ const { normUtterance } = await server.ssrLoadModule('/src/lib/councilTimeline.j
 
 /** 每个语言里几个"一眼能认出这一页在说什么"的词 */
 const WORDS = {
-  zh: { agreed: '达成一致', noStance: '未表态', truncated: '已截断', noAgreement: '到第 2 轮上限仍未达成一致', notPassed: '没通过' },
-  en: { agreed: 'agreed', noStance: 'no stance', truncated: 'truncated', noAgreement: 'No agreement within 2 rounds', notPassed: 'did not pass' },
+  zh: {
+    agreed: '达成一致', noStance: '未表态', truncated: '已截断', noAgreement: '到第 2 轮上限仍未达成一致', notPassed: '没通过',
+    reported: '已呈报', report: '分析简报', support: '支持', oppose: '反对', unsure: '不确定',
+    points: '要点', risks: '风险', questions: '存疑', noFindings: '没按约定给出要点',
+    // "本轮达成一致"这一句只在**结果区**出现（'达成一致' 本身会撞上发起表单的提示文案，
+    // 拿它当判据会把静态文案也算进去）
+    reached: '本轮达成一致',
+  },
+  en: {
+    agreed: 'agreed', noStance: 'no stance', truncated: 'truncated', noAgreement: 'No agreement within 2 rounds', notPassed: 'did not pass',
+    reported: 'reported', report: 'Analysis briefing', support: 'support', oppose: 'oppose', unsure: 'unsure',
+    points: 'Points', risks: 'Risks', questions: 'Open questions', noFindings: 'no points/risks/questions',
+    reached: 'agreed this round',
+  },
 };
 
 /** 渲染一个组件；抛错就如实报出来（返回 null） */
@@ -124,6 +136,52 @@ const NO_CONSENSUS = {
   council: { ...COUNCIL.council, verdict: 'no_consensus', verdict_round: null, max_rounds: 2 },
   rounds: COUNCIL.rounds.slice(0, 2),
   utterances: COUNCIL.utterances.filter((u) => u.round_no <= 1),
+};
+
+/**
+ * 分析模式的收场。**故意塞了四种"不好看但必须如实"的形态**：
+ *   · 表了态、要点齐全（1F）；
+ *   · 表了态但**没给要点**（7F，findings 是 NULL）—— 必须和"给了三条空数组"分开写；
+ *   · 表了态、要点三条都空（4F）；—— 这是"答了，答的是没有"
+ *   · 压根没表态（8F 超时）—— 必须带错误原文，不许并进某一方。
+ * 再加一条：`mode='analysis'` 却**没有** consensus 轮次 —— 界面不许凭空长出共识横幅。
+ */
+const ANALYSIS = {
+  ...COUNCIL,
+  council: {
+    ...COUNCIL.council,
+    topic: '这个 bug fix 会不会引入回归',
+    mode: 'analysis',
+    workspace_path: '/home/me/proj',
+    status: 'done',
+    verdict: 'reported',
+    verdict_round: null,
+    max_rounds: 2,
+  },
+  participants: [
+    { floor_id: '1F', status: 'ok', error: null },
+    { floor_id: '4F', status: 'ok', error: null },
+    { floor_id: '7F', status: 'ok', error: null },
+    { floor_id: '8F', status: 'timeout', error: '进程超时（300s）' },
+  ],
+  rounds: [
+    { round_no: 0, kind: 'brief', proposal_text: '这个 bug fix 会不会引入回归', proposal_from: 'chair', consensus: 0 },
+    // 分析模式没有"桌上那份提案"：proposal_* 是 NULL，票型三个列全是 0
+    { round_no: 1, kind: 'debate', proposal_text: null, proposal_from: null, agree: 0, disagree: 0, abstain: 0, invalid: 1, consensus: 0 },
+    { round_no: 2, kind: 'debate', proposal_text: null, proposal_from: null, agree: 0, disagree: 0, abstain: 0, invalid: 1, consensus: 0 },
+  ],
+  utterances: [
+    { round_no: 0, floor_id: 'chair', role: 'chair', content: '这个 bug fix 会不会引入回归', status: 'ok' },
+    { round_no: 1, floor_id: '1F', role: 'speaker', content: '我看了一遍调用方', stance: 'support', findings_json: '{"points":["影响面只有一处"],"risks":[],"questions":[]}', status: 'ok' },
+    { round_no: 1, floor_id: '4F', role: 'speaker', content: '我觉得还得看测试', stance: 'unsure', findings_json: '{"points":[],"risks":[],"questions":[]}', status: 'ok' },
+    { round_no: 1, floor_id: '7F', role: 'speaker', content: '我反对这么改', stance: 'oppose', findings_json: null, status: 'ok' },
+    { round_no: 1, floor_id: '8F', role: 'speaker', content: null, stance: null, status: 'timeout', error: '进程超时（300s）' },
+    // 最后一轮才是简报的依据 —— 4F 从"不确定"改成了"反对"
+    { round_no: 2, floor_id: '1F', role: 'speaker', content: '结论不变', stance: 'support', findings_json: '{"points":["影响面只有一处"],"risks":["并发下可能重复写"],"questions":[]}', status: 'ok' },
+    { round_no: 2, floor_id: '4F', role: 'speaker', content: '看完测试我改反对', stance: 'oppose', findings_json: '{"points":[],"risks":["没有覆盖并发路径"],"questions":["谁来补测试"]}', status: 'ok' },
+    { round_no: 2, floor_id: '7F', role: 'speaker', content: '我还是反对', stance: 'oppose', findings_json: null, status: 'ok' },
+    { round_no: 2, floor_id: '8F', role: 'speaker', content: null, stance: null, status: 'timeout', error: '进程超时（300s）' },
+  ],
 };
 
 for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
@@ -215,6 +273,38 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     ok('议事厅：没谈成时**不**出现结论区块', !lost.includes('cv-conclusion'));
     ok(`议事厅：最后一轮那份提案照样摆出来，但标明${W.notPassed}`, lost.includes(W.notPassed) && lost.includes('上限提到 5，但只对幂等操作生效'));
     ok(`议事厅：各方最后立场列出来了（${W.noStance}）`, lost.includes(W.noStance));
+  }
+
+  // ---- 议事厅 · 分析模式 ----
+  const rep = await render('/src/views/CouncilView.vue', seedCouncil(ANALYSIS));
+  ok('议事厅 · 分析模式：渲染没抛错', typeof rep === 'string', rep && rep.error);
+  if (typeof rep === 'string') {
+    ok(`议事厅：出的是简报（${W.report}）`, rep.includes('cv-report') && rep.includes(W.report));
+    ok(`议事厅：verdict 写的是${W.reported}`, rep.includes(W.reported));
+    // 这一条是顺序问题的机器证据：reported 要是掉进下面那个"中断"框，这座号就没了
+    ok('议事厅：reported 没掉进通用的"中断"框（简报分支在它前面）', !rep.includes('cv-aborted'));
+    ok('议事厅：分析模式不出现共识横幅', !rep.includes('cv-conclusion') && !rep.includes(W.reached));
+    // 分析模式没有可对照的服务端票型，界面不许假装有
+    ok('议事厅：分析模式不渲染"同意 N · 反对 N"那套票型', !rep.includes('同意 0 · 反对 0'));
+
+    ok(`议事厅：按立场分了组（${W.support} / ${W.oppose}）`, rep.includes('cv-group-support') && rep.includes('cv-group-oppose'));
+    ok(`议事厅：未表态单列一组（${W.noStance}）`, rep.includes('cv-group-none'));
+    ok(`议事厅：未表态那组附了错误原文`, rep.includes('进程超时（300s）'));
+
+    // "说了没有"与"没说"必须分开写 —— 这两句混起来，读的人会以为它看过风险
+    ok(`议事厅：答了三条都空的那一层写成"${W.questions}"而不是沉默`, rep.includes(W.points) && rep.includes(W.risks));
+    ok(`议事厅：没给出要点的那一层单独标一句（${W.noFindings}）`,
+      rep.includes('cv-nofindings-7F') && rep.includes(W.noFindings));
+
+    // 原文照录：不摘要、不改写
+    ok('议事厅：要点原文照录（风险那条）', rep.includes('并发下可能重复写') && rep.includes('没有覆盖并发路径'));
+    ok('议事厅：存疑原文照录', rep.includes('谁来补测试'));
+    // 简报依据的是**最后一轮**：4F 在第 1 轮是不确定、第 2 轮改成反对，简报里它得在反对那组
+    ok('议事厅：以最后一轮为准（4F 改口后的立场进的是反对组）',
+      rep.indexOf('cv-group-oppose') < rep.indexOf('cv-group-none') && rep.includes('没有覆盖并发路径'));
+    // 工作目录要摆出来：事后来看"他们在哪儿谈的"是理解这场会的前提
+    ok('议事厅：标题区显示了工作目录', rep.includes('cv-workspace-show') && rep.includes('/home/me/proj'));
+    ok('议事厅：历史/标题上有谈法角标', rep.includes('cv-mode-badge'));
   }
 }
 

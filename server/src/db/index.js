@@ -69,7 +69,14 @@ function migrate(db) {
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
+  // 议事厅：从"只有表决"扩成"表决 / 分析 × 隔离目录 / 工程目录"。
+  // 老库补列后行为与改动前**逐字一致**：mode='vote'、workspace_path=NULL（= 临时目录 + 无工具）。
+  ensureColumn(db, 'councils', 'mode', "mode TEXT NOT NULL DEFAULT 'vote'");
+  ensureColumn(db, 'councils', 'workspace_path', 'workspace_path TEXT');
+  ensureColumn(db, 'council_utterances', 'stance', 'stance TEXT');
+  ensureColumn(db, 'council_utterances', 'findings_json', 'findings_json TEXT');
   ensureAgentStatusThinking(db);
+  ensureCouncilVerdictReported(db);
   // 回填：CLIENT_BASES 漏配过的产品，其主 agent 成员的 client 会被写成 NULL，
   // 而空 client 在前端被当「通用、哪层都显示」，于是这个产品的成员飘进所有楼层
   // （实测 qoder 主 agent 行就是这么飘进 1F 工位卡片的）。按"名字正好等于已知产品基名"
@@ -115,6 +122,63 @@ function ensureAgentStatusThinking(db) {
     FROM _agent_status_old;
     DROP TABLE _agent_status_old;
     CREATE INDEX IF NOT EXISTS idx_status_state ON agent_status(state);
+  `);
+}
+
+/**
+ * 老库的 councils.verdict 带旧 CHECK（不含分析模式的 'reported'），
+ * 而 CREATE TABLE IF NOT EXISTS 不会改已有表的约束。
+ *
+ * 与 agent_status 那次不同，议事厅的**历史会不能丢**（那是用户开过的会），所以这里是
+ * 原样搬行、不是重建空表。安全的前提有两条，都成立：
+ *   · 议事厅这几张表 schema.sql 里**刻意没建外键**（reconcile 靠 deleteCouncil 手工级联），
+ *     所以 RENAME 不会牵动别的表；
+ *   · councils 只有 council_rounds / council_utterances 等子表**引用它**（同样没有外键），
+ *     重建期间子表行按 council_id 挂着，重新出现同名表后照样查得到。
+ *
+ * 注意 CREATE 里必须把**当前 schema 的全部列**写全（含刚 ensureColumn 补的 mode /
+ * workspace_path）与那条 idx_councils_created —— 少一列就等于用一次迁移把新加的列又删掉。
+ * @param {import('better-sqlite3').Database} db
+ */
+function ensureCouncilVerdictReported(db) {
+  let sql = '';
+  try {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='councils'").get();
+    sql = (row && row.sql) || '';
+  } catch {
+    return;
+  }
+  if (!sql || /reported/.test(sql)) return; // 已是新约束或表不存在
+  db.exec(`
+    ALTER TABLE councils RENAME TO _councils_old;
+    CREATE TABLE councils (
+      id            TEXT PRIMARY KEY,
+      topic         TEXT NOT NULL,
+      mode          TEXT NOT NULL DEFAULT 'vote'
+                    CHECK (mode IN ('vote','analysis')),
+      workspace_path TEXT,
+      status        TEXT NOT NULL DEFAULT 'draft'
+                    CHECK (status IN ('draft','running','done','failed','cancelled')),
+      threshold     TEXT NOT NULL DEFAULT 'unanimous'
+                    CHECK (threshold IN ('unanimous','majority')),
+      max_rounds    INTEGER NOT NULL,
+      round_current INTEGER NOT NULL DEFAULT 0,
+      verdict       TEXT
+                    CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','reported','cancelled','failed')),
+      verdict_round INTEGER,
+      error         TEXT,
+      created_at    INTEGER NOT NULL,
+      started_at    INTEGER,
+      ended_at      INTEGER
+    );
+    INSERT INTO councils
+      (id, topic, mode, workspace_path, status, threshold, max_rounds, round_current,
+       verdict, verdict_round, error, created_at, started_at, ended_at)
+    SELECT id, topic, mode, workspace_path, status, threshold, max_rounds, round_current,
+           verdict, verdict_round, error, created_at, started_at, ended_at
+    FROM _councils_old;
+    DROP TABLE _councils_old;
+    CREATE INDEX IF NOT EXISTS idx_councils_created ON councils(created_at DESC);
   `);
 }
 
@@ -891,8 +955,8 @@ function createRepo(db) {
    */
   const councilStmt = {
     insert: db.prepare(`
-      INSERT INTO councils (id, topic, status, threshold, max_rounds, created_at)
-      VALUES (@id, @topic, 'draft', @threshold, @maxRounds, @createdAt)
+      INSERT INTO councils (id, topic, mode, workspace_path, status, threshold, max_rounds, created_at)
+      VALUES (@id, @topic, @mode, @workspacePath, 'draft', @threshold, @maxRounds, @createdAt)
     `),
     get: db.prepare(`SELECT * FROM councils WHERE id = ?`),
     /** 历史列表：按发起时间倒序。不带出席者，列表页要的话再单独取 */
@@ -945,10 +1009,12 @@ function createRepo(db) {
     insertUtterance: db.prepare(`
       INSERT INTO council_utterances
         (council_id, round_no, floor_id, role, content, vote, vote_reason, proposal_text, second_floor,
+         stance, findings_json,
          status, error, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
          started_at, ended_at, duration_ms)
       VALUES
         (@councilId, @roundNo, @floorId, @role, @content, @vote, @voteReason, @proposalText, @secondFloor,
+         @stance, @findingsJson,
          @status, @error, @inputTokens, @outputTokens, @cacheReadTokens, @cacheWriteTokens,
          @startedAt, @endedAt, @durationMs)
     `),
@@ -963,9 +1029,22 @@ function createRepo(db) {
     'DELETE FROM council_participants WHERE council_id = ?',
   ].map((sql) => db.prepare(sql));
 
-  /** @param {{id:string, topic:string, threshold:string, maxRounds:number, createdAt:number}} arg */
+  /**
+   * @param {{id:string, topic:string, threshold:string, maxRounds:number, createdAt:number,
+   *          mode?:string, workspacePath?:string|null}} arg
+   *   mode / workspacePath 缺省就是老行为：表决 + 一次性临时目录。调用方（路由）已经把这两项
+   *   校验过了，这里只做"没给就按缺省"的兜底，不做取值判断 —— 那是路由的事。
+   */
   function createCouncil(arg) {
-    councilStmt.insert.run(arg);
+    councilStmt.insert.run({
+      id: arg.id,
+      topic: arg.topic,
+      mode: arg.mode != null && arg.mode !== '' ? arg.mode : 'vote',
+      workspacePath: arg.workspacePath != null && arg.workspacePath !== '' ? arg.workspacePath : null,
+      threshold: arg.threshold,
+      maxRounds: arg.maxRounds,
+      createdAt: arg.createdAt,
+    });
     return councilStmt.get.get(arg.id);
   }
   const getCouncil = (id) => councilStmt.get.get(id) || null;
@@ -978,12 +1057,17 @@ function createRepo(db) {
   function finishCouncil(id, arg) {
     const verdict = arg.verdict;
     // verdict → status 的对照（三种收尾各归各的，别把"取消"混进"失败"）：
-    //   consensus / no_consensus → done（**谈不拢也是正常收场**，不是错误）
-    //   cancelled               → cancelled
-    //   其余（failed）           → failed
+    //   consensus / no_consensus / reported → done（**谈不拢、以及分析模式"跑完了"都是正常收场**，
+    //                                          不是错误）
+    //   cancelled                          → cancelled
+    //   其余（failed）                      → failed
     const status =
       arg.status ||
-      (verdict === 'consensus' || verdict === 'no_consensus' ? 'done' : verdict === 'cancelled' ? 'cancelled' : 'failed');
+      (verdict === 'consensus' || verdict === 'no_consensus' || verdict === 'reported'
+        ? 'done'
+        : verdict === 'cancelled'
+          ? 'cancelled'
+          : 'failed');
     councilStmt.finish.run({
       id,
       status,
@@ -1036,6 +1120,10 @@ function createRepo(db) {
       voteReason: u.voteReason != null ? u.voteReason : null,
       proposalText: u.proposalText != null ? u.proposalText : null,
       secondFloor: u.secondFloor != null ? u.secondFloor : null,
+      // 分析模式那两列：**没解析出来就是 null**，不是 '{}' —— 界面上"没给要点"与
+      // "给了但三条都空"显示得不一样（见 schema.sql 里 findings_json 的注释）
+      stance: u.stance != null ? u.stance : null,
+      findingsJson: u.findingsJson != null ? u.findingsJson : null,
       status: u.status || 'ok',
       error: u.error != null ? u.error : null,
       inputTokens: u.inputTokens != null ? u.inputTokens : null,

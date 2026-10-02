@@ -15,6 +15,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const Database = require('better-sqlite3');
+
 const { openDatabase } = require('../src/db');
 
 let pass = 0;
@@ -192,6 +194,103 @@ head('隔离：一场会能连子表删干净，不留孤儿');
 }
 
 close();
+
+// ------------------------------------------------------------ 老库迁移
+// 用户机器上已经跑着改动前建的库。schema.sql 的 CREATE TABLE IF NOT EXISTS **改不动**
+// 已有的表和已有的 CHECK 约束，所以这一组是"升级到新版本之后，昨天那几场会还在不在、
+// 还读不读得出来"的机器证据 —— 顺便钉住 `reported` 这个新 verdict 真的能写进去
+// （SQLite 改不了 CHECK，只能整表重建，而重建是会把数据搬来搬去的那类操作）。
+head('老库迁移：没有 mode / workspace_path 的库升级后照常能用');
+{
+  const oldPath = path.join(TMP, 'old.db');
+  const old = new Database(oldPath);
+  // 改动前的 councils：没有 mode、没有 workspace_path，verdict 的 CHECK 里没有 reported
+  old.exec(`
+    CREATE TABLE councils (
+      id            TEXT PRIMARY KEY,
+      topic         TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'draft'
+                    CHECK (status IN ('draft','running','done','failed','cancelled')),
+      threshold     TEXT NOT NULL DEFAULT 'unanimous'
+                    CHECK (threshold IN ('unanimous','majority')),
+      max_rounds    INTEGER NOT NULL,
+      round_current INTEGER NOT NULL DEFAULT 0,
+      verdict       TEXT
+                    CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','cancelled','failed')),
+      verdict_round INTEGER,
+      error         TEXT,
+      created_at    INTEGER NOT NULL,
+      started_at    INTEGER,
+      ended_at      INTEGER
+    );
+    CREATE INDEX idx_councils_created ON councils(created_at DESC);
+    -- 改动前的发言表：没有 stance / findings_json
+    CREATE TABLE council_utterances (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      council_id    TEXT NOT NULL,
+      round_no      INTEGER NOT NULL,
+      floor_id      TEXT NOT NULL,
+      role          TEXT NOT NULL DEFAULT 'speaker' CHECK (role IN ('chair','speaker')),
+      content       TEXT,
+      vote          TEXT CHECK (vote IS NULL OR vote IN ('agree','disagree','abstain')),
+      vote_reason   TEXT,
+      proposal_text TEXT,
+      second_floor  TEXT,
+      status        TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','failed','timeout','unparsed')),
+      error         TEXT,
+      input_tokens       INTEGER,
+      output_tokens      INTEGER,
+      cache_read_tokens  INTEGER,
+      cache_write_tokens INTEGER,
+      started_at    INTEGER,
+      ended_at      INTEGER,
+      duration_ms   INTEGER
+    );
+  `);
+  old.prepare(
+    `INSERT INTO councils (id, topic, status, threshold, max_rounds, verdict, created_at, ended_at)
+     VALUES ('c_old', '昨天那场没谈成的会', 'done', 'unanimous', 2, 'no_consensus', ?, ?)`
+  ).run(AT, AT + 1);
+  old.prepare(
+    `INSERT INTO council_utterances (council_id, round_no, floor_id, role, content, vote, status)
+     VALUES ('c_old', 1, '4F', 'speaker', '我反对', 'disagree', 'ok')`
+  ).run();
+  old.close();
+
+  // 升级：就是用新代码打开这个老库
+  const up = openDatabase(oldPath);
+  const r2 = up.repo;
+
+  const cols = r2.raw.prepare('PRAGMA table_info(councils)').all().map((c) => c.name);
+  ok('补上了 mode 列', cols.includes('mode'), cols.join(','));
+  ok('补上了 workspace_path 列', cols.includes('workspace_path'));
+
+  const row = r2.getCouncil('c_old');
+  ok('老会还在，内容没在重建里丢', row !== null && row.topic === '昨天那场没谈成的会', JSON.stringify(row && row.topic));
+  // 这是最关键的一条：老行必须落到"与改动前逐字相同"的那一档
+  ok('老会读出来是表决模式（不是别的猜法）', row.mode === 'vote', String(row.mode));
+  ok('老会读出来是隔离模式（workspace_path 为 NULL）', row.workspace_path === null, String(row.workspace_path));
+  ok('老会原来的结论没丢', row.verdict === 'no_consensus' && row.status === 'done', `${row.verdict}/${row.status}`);
+
+  const uc = r2.raw.prepare('PRAGMA table_info(council_utterances)').all().map((c) => c.name);
+  ok('发言表补上了 stance / findings_json', uc.includes('stance') && uc.includes('findings_json'));
+  const u = r2.listUtterances('c_old')[0];
+  ok('老发言还在，票也没丢', u && u.vote === 'disagree' && u.content === '我反对', JSON.stringify(u && u.vote));
+  ok('老发言的 stance 是 NULL（当时没这个字段，不是"未表态"以外的任何东西）', u.stance === null);
+
+  // verdict 的 CHECK 重建之后必须能收下新值 —— 收不下的话分析模式会在收尾那一刻炸
+  const created = r2.createCouncil({ id: 'c_new', topic: '新的一场', mode: 'analysis', threshold: 'unanimous', maxRounds: 2, createdAt: AT + 100 });
+  ok('新库这一侧照样能建分析模式的会', created.mode === 'analysis');
+  const fin = r2.finishCouncil('c_new', { verdict: 'reported', endedAt: AT + 200 });
+  ok('reported 能写进去（老库的 CHECK 确实被重建了）', fin.verdict === 'reported', String(fin.verdict));
+  ok('reported 归到 status=done（跑完是正常收场，不是失败）', fin.status === 'done', String(fin.status));
+
+  // 老行 + 新行并存时列表仍按时间倒序、两行都能读
+  const list = r2.listCouncils(10);
+  ok('老会和新会都在列表里', list.length === 2, String(list.length));
+  up.close();
+}
+
 console.log(`\n${fail ? '✗' : '✓'} council-store: ${pass} 通过 / ${fail} 失败`);
 // 临时库连目录一起拆掉（同 councilRunner：自己搭的台子自己拆，失败时也拆）
 fs.rmSync(TMP, { recursive: true, force: true });

@@ -22,6 +22,40 @@ function pick(camel, snake, src) {
   return v === undefined ? null : v;
 }
 
+/** 三个要点数组：不是数组一律当空 —— 里面每一项还必须是字符串，其余丢掉（不 toString 猜） */
+function listOf(v) {
+  return Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean) : [];
+}
+
+/**
+ * 分析模式的要点 → 统一形状。
+ *
+ * **要同时吃两种输入**：详情接口给的是 DB 里的 JSON 字符串（`findings_json`），
+ * WS 增量给的是服务端已经解析好的对象（`findings`）。不兼容的话就会出现
+ * "刷新前有要点、刷新后没了"。
+ *
+ * 最关键的一条：`null` 与 `{}` **不是一回事**，不许合并：
+ *   · null / '' / 坏 JSON → null —— 它没按约定给出要点（解析不出来），界面要说这句；
+ *   · {} → 三个空数组 —— 它给出了要点，只是三条都空（问了，答的是"没有"）。
+ * 前者是"没说"，后者是"说了没有"，界面上的话术不一样。
+ *
+ * @param {unknown} raw JSON 字符串 / 已解析对象 / null
+ * @returns {{points:string[],risks:string[],questions:string[]}|null}
+ */
+export function normFindings(raw) {
+  if (raw == null || raw === '') return null;
+  let obj = raw;
+  if (typeof raw === 'string') {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return null; // 坏 JSON = 解析不出来 = null，绝不当成空数组
+    }
+  }
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+  return { points: listOf(obj.points), risks: listOf(obj.risks), questions: listOf(obj.questions) };
+}
+
 /**
  * 一条发言 → 统一形状。
  * @param {object} raw DB 行或 WS 增量
@@ -35,6 +69,10 @@ export function normUtterance(raw) {
     content: u.content == null ? null : String(u.content),
     // 票：认得出的三种之外一律 null（未表态）。**不猜语气**
     vote: u.vote === 'agree' || u.vote === 'disagree' || u.vote === 'abstain' ? u.vote : null,
+    // 分析模式的立场：同样只认白名单，其余一律 null（未表态）
+    stance: u.stance === 'support' || u.stance === 'oppose' || u.stance === 'unsure' ? u.stance : null,
+    // 要点：详情给 JSON 字符串、WS 给对象，两边都吃；解析不出来是 null，不是空数组
+    findings: normFindings(pick('findings', 'findings_json', u)),
     voteReason: pick('voteReason', 'vote_reason', u),
     proposal: pick('proposal', 'proposal_text', u),
     second: pick('second', 'second_floor', u),
@@ -96,8 +134,30 @@ export function tallyOf(utterances) {
 }
 
 /**
+ * 分析模式的立场汇总（从发言现算）。主席不占席位，与 tallyOf 同一套规矩 ——
+ * 这样"表决时的未表态人数"和"分析时的未表态人数"口径一致，用户不必学两套。
+ *
+ * `none` 这一档必须存在：超时 / 崩了 / 解析不出立场的都落在这里，界面写「未表态」
+ * 并附上错误原文。**不许**把它们悄悄塞进某一方 —— 那是替它表态。
+ */
+export function stanceCountsOf(utterances) {
+  const list = Array.isArray(utterances) ? utterances : [];
+  const t = { seats: list.length, support: 0, oppose: 0, unsure: 0, none: 0 };
+  for (const u of list) {
+    if (u.role === 'chair') {
+      t.seats -= 1; // 主席是服务端的议题陈述，不占席位、不表态
+      continue;
+    }
+    if (u.status !== 'ok' || !u.stance) t.none += 1;
+    else t[u.stance] += 1;
+  }
+  return t;
+}
+
+/**
  * 按轮次分组，供时间线渲染。轮次升序；同一轮里主席排最前，其余按楼层号。
- * @returns {Array<{roundNo:number, utterances:Array, tally:object}>}
+ * `stanceTally` 是**加出来的字段**，表决那条路的 `tally` 逐字未动。
+ * @returns {Array<{roundNo:number, utterances:Array, tally:object, stanceTally:object}>}
  */
 export function groupByRound(utterances) {
   const list = Array.isArray(utterances) ? utterances : [];
@@ -113,7 +173,7 @@ export function groupByRound(utterances) {
         if (a.role !== b.role) return a.role === 'chair' ? -1 : 1;
         return String(a.floorId).localeCompare(String(b.floorId), 'en', { numeric: true });
       });
-      return { roundNo, utterances: items, tally: tallyOf(items) };
+      return { roundNo, utterances: items, tally: tallyOf(items), stanceTally: stanceCountsOf(items) };
     });
 }
 
@@ -123,6 +183,11 @@ export function groupByRound(utterances) {
  */
 export function voteKey(vote) {
   return vote === 'agree' || vote === 'disagree' || vote === 'abstain' ? vote : 'none';
+}
+
+/** 分析模式的立场 → i18n 键后缀。与 voteKey 同一条规矩：认不出就是 'none' */
+export function stanceKey(stance) {
+  return stance === 'support' || stance === 'oppose' || stance === 'unsure' ? stance : 'none';
 }
 
 /** 发言状态 → 能不能算一句"有效的话"（失败 / 超时 / 没表态的不算） */

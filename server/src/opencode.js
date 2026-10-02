@@ -62,6 +62,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolveProjectName } = require('./project');
+const { DEFAULTS } = require('@workgremlin/shared');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -236,6 +237,10 @@ function modelIdOf(raw) {
  *
  * 列是**探测**着拼的（下面 pickSessionColumns）：少一列不该让整条查询失败、也不该让整层 500。
  *
+ * **议事厅的参与者不进这张表**（`title = COUNCIL_SESSION_TITLE` 的直接跳过）：理由与
+ * 7F 那边一字不差，见 kilo.js 同名过滤上方的说明。这里多一条：title 列也是探测着用的，
+ * 老库没有 title 列时**不过滤**（宁可多列出一条真会话，也不能因为少一列就把整层清空）。
+ *
  * @returns {Array<{id,title,directory,project,projectPath,lastEventAt,agent,model,fileCount,additions,deletions}>}
  */
 function listOpencodeSessions() {
@@ -262,11 +267,16 @@ function listOpencodeSessionsUncached() {
     const where = [];
     if (cols.has('time_archived')) where.push('"time_archived" IS NULL');
     if (cols.has('parent_id')) where.push('"parent_id" IS NULL');
+    // 议事厅参与者：老库没有 title 列时不做这个过滤（宁可多列出一条，也不清空整层）。
+    // 它排在最后，所以下面的参数数组只放这一个值。
+    const skipCouncil = cols.has('title');
+    if (skipCouncil) where.push('("title" IS NULL OR "title" <> ?)');
+    const params = skipCouncil ? [DEFAULTS.COUNCIL_SESSION_TITLE] : [];
     const order = cols.has('time_updated') ? '"time_updated" DESC' : 'rowid DESC';
 
     return db
       .prepare(`SELECT ${sel} FROM "${table}"${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order}`)
-      .all();
+      .all(...params);
   });
 
   return (Array.isArray(rows) ? rows : []).map((r) => {

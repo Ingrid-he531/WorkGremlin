@@ -95,6 +95,11 @@ let server = null;
     ok('并给了原因（界面要显示给用户，不能只说"不可用"）', Boolean(body.floors.find((f) => f.floorId === '8F').reason));
     ok('带上了缺省轮数（前端不用再写死一份）', body.defaults.maxRounds >= 1 && body.defaults.maxRoundsLimit >= body.defaults.maxRounds);
     ok('带上了材料字节上限（界面要拿它标注"已截断"）', body.defaults.materialMaxBytes > 0);
+    ok('带上了两种谈法（前端别自己再写死一份白名单）',
+      Array.isArray(body.defaults.modes) && body.defaults.modes.includes('vote') && body.defaults.modes.includes('analysis'),
+      JSON.stringify(body.defaults.modes));
+    ok('带上了缺省谈法', body.defaults.mode === 'vote', String(body.defaults.mode));
+    ok('带上了工程模式的单轮超时（界面要写明"最长等多久"）', body.defaults.workspaceTurnTimeoutMs >= 60_000, String(body.defaults.workspaceTurnTimeoutMs));
   }
 
   /* ------------------------------------------------------------ 发起：拒绝 */
@@ -115,6 +120,37 @@ let server = null;
     }
     ok('一层都没建成（拒掉就是拒掉，不留半场会）', repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
     ok('也没让编排器开跑', orch.started.length === 0);
+  }
+
+  head('发起：谈法认不出来就拒（不静默降级成表决）');
+  {
+    for (const mode of ['投票', 'VOTE', 'debate', 'analysis ']) {
+      const res = await post('/councils', { topic: '议题', floors: ['1F', '4F'], mode });
+      const r = await res.json();
+      // 'analysis ' 带尾巴空格也算认不出：白名单是逐字比对，不替它 trim 成别的意思
+      ok(`拒绝不认识的谈法：${JSON.stringify(mode)}`, res.status === 400 && /模式/.test(String(r.error.message)), `${res.status} ${JSON.stringify(r).slice(0, 100)}`);
+    }
+    ok('一场都没建成（选了"分析"却跑成"表决"是最坏的一种错，不能悄悄发生）',
+      repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
+  }
+
+  head('发起：工作目录写错就拒，并说清哪儿不对');
+  {
+    const doc = path.join(TMP, 'not-a-dir.txt');
+    fs.writeFileSync(doc, 'x');
+    const cases = [
+      ['相对路径', 'relative/path'],
+      ['不存在的目录', path.join(TMP, 'no-such-dir-xyz')],
+      ['是个文件不是目录', doc],
+    ];
+    for (const [why, workspacePath] of cases) {
+      const res = await post('/councils', { topic: '议题', floors: ['1F', '4F'], workspacePath });
+      const r = await res.json();
+      ok(`拒绝：工作目录${why}`, res.status === 400 && /工作目录/.test(String(r.error.message)), `${res.status} ${JSON.stringify(r).slice(0, 100)}`);
+      // 错误里带上用户写的那个路径 —— 否则他不知道自己写的哪个字错了
+      ok(`并原样带回那个路径（${why}）`, String(r.error.message).includes(workspacePath), String(r.error.message));
+    }
+    ok('还是没建成半场会', repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
   }
 
   head('发起：材料文件读不到 → 整条拒掉，并点明是哪个文件');
@@ -150,6 +186,9 @@ let server = null;
     ok('议题按用户原话存着', r.council.topic === '要不要把 A 方案换成 B 方案？');
     ok('轮数按请求存（不是写死的缺省）', r.council.max_rounds === 2, String(r.council.max_rounds));
     ok('判定口径落在这一场上（不被后续全局改动影响）', r.council.threshold === 'unanimous', String(r.council.threshold));
+    // 没填 mode / workspacePath = 与改动前逐字相同的行为（老前端不发这两个字段也必须照常能用）
+    ok('不填谈法就是表决（缺省没变）', r.council.mode === 'vote', String(r.council.mode));
+    ok('不填工作目录就是隔离模式（NULL，不是空串）', r.council.workspace_path === null, String(r.council.workspace_path));
 
     ok('编排器被叫起来跑这一场', orch.started.includes(id), JSON.stringify(orch.started));
     const ps = repo.listParticipants(id);
@@ -158,6 +197,38 @@ let server = null;
     const ms = repo.listMaterials(id);
     ok('材料正文落库了（可追溯"到底喂进去了什么"）', ms.length === 1 && ms[0].content === '这是背景材料的正文。', JSON.stringify(ms));
     ok('材料带上了字节数', ms[0].bytes_included === Buffer.byteLength('这是背景材料的正文。', 'utf8'));
+  }
+
+  head('发起：分析模式 + 工程目录，两个开关都如实落库');
+  {
+    const wsDir = path.join(TMP, 'real-project');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const res = await post('/councils', {
+      topic: '这个改法会不会引入回归？',
+      floors: ['1F', '4F'],
+      mode: 'analysis',
+      workspacePath: wsDir,
+    });
+    const r = await res.json();
+    ok('201', res.status === 201, `${res.status} ${JSON.stringify(r).slice(0, 120)}`);
+    ok('谈法落库', r.council.mode === 'analysis', String(r.council.mode));
+    ok('工作目录落库（解析后的绝对路径）', r.council.workspace_path === wsDir, String(r.council.workspace_path));
+    ok('详情接口把这两个开关带回来（界面要据此切分支）',
+      (await (await get(`/councils/${r.council.id}`)).json()).council.mode === 'analysis');
+    // 收拾干净：这一场只是来验两个开关的，后面几组按"列表里有几场会"数数，
+    // 留着它会让那些断言变成"因为多了个夹具才失败"，看不出真正的原因
+    await del(`/councils/${r.council.id}`);
+  }
+
+  head('发起：~ 开头的路径按用户的家目录展开');
+  {
+    // 输入框里最常被敲的就是 `~` 开头这一种。展开出来的目录存不存在是另一回事 ——
+    // 这一条只钉"它确实被当成家目录，而不是被当成一个字面量目录名"。
+    const res = await post('/councils', { topic: '议题', floors: ['1F', '4F'], workspacePath: '~/绝对不存在的工程目录-xyz' });
+    const r = await res.json();
+    ok('400（那个目录确实不存在）', res.status === 400, String(res.status));
+    ok('错误里是展开后的路径（说明 ~ 被展开了，不是被当字面量）',
+      String(r.error.message).includes(os.homedir()) && !String(r.error.message).includes('~'), String(r.error.message));
   }
 
   head('发起：超上限的材料会被截断，且截断的事实一起落库');

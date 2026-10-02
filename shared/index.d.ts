@@ -145,11 +145,17 @@ export declare const DEFAULTS: {
   readonly WAL_CHECKPOINT_INTERVAL_MS: number;
   readonly RETENTION_DAYS: number;
   /** 议事厅：讨论轮上限缺省值 / 硬顶 / 单轮超时 / 材料字节上限（见 shared/index.js 的注释） */
+  /** 'vote'（表决，服务端计票判共识）或 'analysis'（分析，不投票、跑满轮数出简报） */
+  readonly COUNCIL_MODE_DEFAULT: string;
   readonly COUNCIL_ROUNDS_DEFAULT: number;
   readonly COUNCIL_ROUNDS_MAX: number;
   /** 'unanimous'（无反对 + 过半）或 'majority'（少数服从多数） */
   readonly COUNCIL_THRESHOLD_DEFAULT: string;
   readonly COUNCIL_TURN_TIMEOUT_MS: number;
+  /** 工程模式（参与者要用只读工具自己翻代码）下的单轮超时，比上面那个宽 */
+  readonly COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: number;
+  /** 7F/8F 参与者会话的固定标题：kilo.js / opencode.js 靠它把参与者挡在楼层之外 */
+  readonly COUNCIL_SESSION_TITLE: string;
   readonly COUNCIL_MATERIAL_MAX_BYTES: number;
   readonly COUNCIL_MATERIAL_TOTAL_MAX_BYTES: number;
 };

@@ -638,7 +638,20 @@ CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
 | **COUNCIL-09** | 接口 | 真实 express + 真实 repo + 临时 DB：发起 / 列表 / 详情 / 取消 / 删除；**409（还在跑）不许当成功**，服务端原话照搬给界面 | `test:council-api`、`test:council-ui-store` |
 | **COUNCIL-10** | 材料截断 | 超限文件按上限截断，`bytes_total` / `bytes_included` 落真值，界面显示「原文 N 字节，只嵌了前 M 字节」；文件读不到 → NULL（**不是 0**） | `test:council-materials`、`test:render-smoke` |
 | **COUNCIL-11** | 界面数据合并 | HTTP 详情（快照）与 WS 增量（最新）按**轮次号**取新的那份；增量不许抹掉已有的正文；收尾推送只有摘要 → 必须**回拉详情**，否则页面停在没有结论的"已结束"上 | `test:council-ui-store` |
-| **COUNCIL-12** | 不进办公室 | 跑完一场会，`members` / `task_runs` 里**一条都不许多**；办公室与任务记录页看不到任何痕迹 | `test:council-orchestrator`（断言表未被动） |
+| **COUNCIL-12** | 不进办公室 | 跑完一场会，`members` / `task_runs` 里**一条都不许多**；办公室与任务记录页看不到任何痕迹（工程模式下还要加上 7F/8F 的会话清单，见 COUNCIL-18） | `test:council-orchestrator`（断言表未被动） |
+
+**2026-10-02 加的两个开关（`mode` 谈法 / `workspace_path` 在哪儿谈）补的用例**：
+
+| 编号 | 用例 | 断言 | 落在哪 |
+| --- | --- | --- | --- |
+| **COUNCIL-13** | **只读工具那一档** | `allow='read'`：1F/4F 的 `--tools` 是 `Read,Grep,Glob`（**不再是空串**）且给 `--allowedTools` 同一份、4F 的 `--permission-prompts none` 排在它**前面**；7F/8F 放行 `read/glob/grep/list`，`bash/edit/write/webfetch` 与 **`external_directory`** 全 deny。`allow` 缺省 / `'none'` 时与改动前**逐字相同**（回归对照） | `test:council-agents` |
+| **COUNCIL-14** | **分析模式怎么收场** | 跑满 `max_rounds`、`verdict='reported'`、`status='done'`；**不判票**（票型列全 0、无提案、提示词里没有"现在要表决的提案"那段）；逐轮落库与广播照旧；最后一轮的提示词里有"最后一轮" | `test:council-orchestrator` |
+| **COUNCIL-15** | **分析模式也不猜** | `parseAnalysisBlock`：没有尾块 / 怪词 / 缺 `stance` → `stance=null`（正文照存、`status='unparsed'`）；`maybe` 归 `unsure`（它本就是"拿不准"那一档）。**`points:[]`（答了，答的是没有）与 `null`（没说）必须分开** | `test:council-agents`、`test:council-timeline` |
+| **COUNCIL-16** | **工程目录不许被动** | 注入 `removeDir` / `isDir` stub：工程模式下**不建也不删**临时目录、断言用户的目录没被删；提示词里带上工程路径与"不能修改任何文件"；目录在发起后被删掉 → `verdict='failed'` + 原话落库，**一个进程都不起** | `test:council-orchestrator` |
+| **COUNCIL-17** | 两个新入参的校验 | `mode` 不在白名单（`投票` / `VOTE` / `debate` / 带尾空格）→ 400，**不静默降级**；`workspacePath` 是相对路径 / 不存在 / 是个文件 → 400 且**原话里带上那个路径**；`~` 展开成 home 再判 | `test:council-api` |
+| **COUNCIL-18** | **工程模式的两道隔离锁** | ①四层配方（两种 allow）的 `env` 都带 `WORKGREMLIN_DISABLE=1`；hook 认到就**原地退出**（不连服务端、不写状态文件、退出码 0），插件两条入口都认（返回的形状不许变，否则 7F 会当成"插件加载失败"）；②7F/8F 配方发的 `--title` = 会话清单过滤的那个标题 —— 同库同工程里**用户会话照常列出、只有参与者那条被挡住** | `test:council-agents`、`test:claude-hook`、`test:council-quiet-plugin`、`test:kilo`、`test:opencode` |
+| **COUNCIL-19** | 老库迁移 | 没有 `mode` / `workspace_path` 的老库 → 补列且行为**不变**（`vote` / NULL），老行原样读得出来；`verdict` 的 CHECK 重建之后 `reported` 写得进去 | `test:council-store` |
+| **COUNCIL-20** | 分析模式的界面 | 分组按 `支持 → 反对 → 不确定 → 未表态` 固定顺序、只渲染非空组、`points/risks/questions` 原文照录；**有立场但没给要点**单独标一句；**不出现共识横幅与票型**；老 fixture（没有 `mode`）不许被新分支命中 | `test:render-smoke`、`test:council-timeline` |
 
 ### 3.16.2 人工烟测（自动化覆盖不到的部分）
 
@@ -652,6 +665,9 @@ CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
 | 关工具真的有效 | 在临时目录里放一个标记文件，让它去读 | 读不到（8F 实测：不锁时能读到，锁上后工具调用被拒） |
 | 无孤儿进程 | 会开完（或被取消）后 `ps` 查这帮 CLI | 一个都不剩；`/tmp` 下的一次性目录被清掉 |
 | 拿不到就留空 | 看 8F 的词元 | 显示「—」而不是 0（OpenCode 确实不发 usage） |
+| **真读到代码了吗**（工程模式） | 拿一个真实工程目录发起，问一个**只有看代码才知道**的问题（例如"这个函数在哪儿被调用"） | 回答里出现**真实的文件名 / 符号**，不是在复述材料 |
+| **工程目录原封不动**（工程模式） | 跑完一场后看那个目录 | `git status` 干净、没有新增文件、目录还在（这条**单独手验一遍再合**） |
+| **办公室还是干净的**（工程模式） | 跑完一场后看办公室、任务记录、7F/8F 的会话清单 | 都看不到参与者（Kilo / OpenCode **自己的**界面里还会留着那几条"议事厅参与者"，那是 CLI 的历史，我们只读不写） |
 
 **取样纪律**：烟测产出的原始 stdout 要**原样存进单测**（见 COUNCIL-04）——
 照着猜的线格式写测试等于没测，这是那次两个 bug 的共同根因。

@@ -14,6 +14,9 @@ const {
   groupByRound,
   tallyOf,
   voteKey,
+  stanceKey,
+  stanceCountsOf,
+  normFindings,
   tokenTotal,
 } = await import('../src/lib/councilTimeline.js');
 
@@ -131,6 +134,114 @@ head('从发言数出来的票型：跟服务端那份互相印证');
   ok('同意 1 反对 1', t.agree === 1 && t.disagree === 1);
   ok('超时的那位算未表态，不算反对也不算同意', t.invalid === 1, String(t.invalid));
   ok('两边加起来等于席位（没漏算）', t.agree + t.disagree + t.abstain + t.invalid === t.seats);
+}
+
+/* ============================================================ 分析模式
+ * 这一组盯的是分析模式那两个新字段。最容易出事的不是"读不到"，而是**把读不到当成读到了**：
+ *   · 立场认不出 → 必须 'none'（未表态），绝不能拿别的场子里的 vote 顶上；
+ *   · 要点解析不出（null）与"答了三条都空"（{}）**不是一回事**，界面上的话术不同；
+ *   · DB 那条路给的是 JSON 字符串、WS 那条路给的是对象 —— 两种都要吃，否则
+ *     "刷新前有要点、刷新后没了"。
+ * 另外钉一条回归：表决模式那条路（tally / voteKey / vote）**逐字不许变**。 */
+head('分析模式：立场归一，认不出就是未表态');
+{
+  const u = normUtterance({ roundNo: 1, floorId: '4F', stance: 'oppose', content: '我看不行' });
+  ok('stance 认出来了', u.stance === 'oppose', String(u.stance));
+  ok('没给 vote 时 vote 仍是 null（两条路互不冒充）', u.vote === null, String(u.vote));
+  ok('stanceKey 认得三个值', stanceKey('support') === 'support' && stanceKey('oppose') === 'oppose' && stanceKey('unsure') === 'unsure');
+  ok('认不出的立场 → none（未表态），不猜', stanceKey('maybe') === 'none' && stanceKey(null) === 'none' && stanceKey(undefined) === 'none');
+  const bad = normUtterance({ roundNo: 1, floorId: '4F', stance: '支持' });
+  ok('怪词不硬塞：stance 归一成 null', bad.stance === null, String(bad.stance));
+  // 表决那套一字未动（分析模式的字段不该渗进 vote 的判定）
+  const v = normUtterance({ roundNo: 1, floorId: '4F', vote: 'agree', stance: 'oppose' });
+  ok('同一行里 vote 与 stance 各归各的，互不影响', v.vote === 'agree' && v.stance === 'oppose');
+  ok('voteKey 回归：认不出仍是 none', voteKey('maybe') === 'none' && voteKey('agree') === 'agree');
+}
+
+head('分析模式：要点要同时吃 JSON 字符串与已解析对象');
+{
+  const fromDb = normFindings('{"points":["A"],"risks":["B"],"questions":["C"]}');
+  ok('DB 那条路：JSON 字符串解析出来', fromDb && fromDb.points[0] === 'A' && fromDb.risks[0] === 'B' && fromDb.questions[0] === 'C', JSON.stringify(fromDb));
+  const fromWs = normFindings({ points: ['A'], risks: ['B'], questions: ['C'] });
+  ok('WS 那条路：对象直接用', fromWs && fromWs.points[0] === 'A', JSON.stringify(fromWs));
+  ok('两条路归一成同一种形状（否则会出现"刷新一下要点就变了"）', JSON.stringify(fromDb) === JSON.stringify(fromWs));
+
+  ok('null → null（"没说"）', normFindings(null) === null);
+  ok('空串 → null', normFindings('') === null);
+  ok('坏 JSON → null（不炸、也不当成空数组）', normFindings('{不是 json') === null, JSON.stringify(normFindings('{不是 json')));
+  ok('数组不是我们要的形状 → null', normFindings('[1,2]') === null && normFindings('[]') === null);
+  // 这一条是本次最容易被合并掉的区别
+  const empty = normFindings('{"points":[],"risks":[],"questions":[]}');
+  ok('三个空数组 → 不是 null（"答了，答的是没有"）', empty !== null, JSON.stringify(empty));
+  ok('空数组那三条确实是空的', empty.points.length === 0 && empty.risks.length === 0 && empty.questions.length === 0);
+  ok('缺的键补成空数组（不是 undefined）', JSON.stringify(normFindings('{"points":["A"]}')) === JSON.stringify({ points: ['A'], risks: [], questions: [] }));
+  ok('非字符串元素与空白被丢掉，不硬转字符串',
+    JSON.stringify(normFindings({ points: ['好', { o: 1 }, '   ', 42] }).points) === JSON.stringify(['好']));
+
+  const u = normUtterance({ roundNo: 1, floorId: '4F', findings_json: '{"points":["来自库"]}' });
+  ok('normUtterance 把 findings_json 一起归一了', u.findings && u.findings.points[0] === '来自库', JSON.stringify(u.findings));
+  const w = normUtterance({ roundNo: 1, floorId: '4F', findings: { points: ['来自 WS'] } });
+  ok('normUtterance 也吃 WS 的 findings 对象', w.findings && w.findings.points[0] === '来自 WS', JSON.stringify(w.findings));
+}
+
+head('分析模式：WS 增量合并不许把正文抹掉');
+{
+  // WS 是增量推送：先来正文，再来尾块。第二条里没提到的字段是 null，
+  // 按"后到的赢"合并就会把正文抹成 null —— 界面上表现为"刷新一下正文就没了"。
+  let list = mergeUtterance([], { roundNo: 1, floorId: '1F', content: '我的分析正文' });
+  list = mergeUtterance(list, { roundNo: 1, floorId: '1F', stance: 'support', findings: { points: ['P'] } });
+  ok('正文还在', list[0].content === '我的分析正文', String(list[0].content));
+  ok('后到的立场与要点补上了', list[0].stance === 'support' && list[0].findings.points[0] === 'P');
+  // 反过来：尾块先到、正文后到
+  let list2 = mergeUtterance([], { roundNo: 1, floorId: '1F', stance: 'oppose', findings: { points: ['Q'] } });
+  list2 = mergeUtterance(list2, { roundNo: 1, floorId: '1F', content: '正文晚一步到' });
+  ok('先到的要点不被后到的正文抹掉', list2[0].findings.points[0] === 'Q' && list2[0].stance === 'oppose', JSON.stringify(list2[0].findings));
+}
+
+head('分析模式的立场汇总：口径与票型那套一致（chair 不占席位、未表态单列）');
+{
+  const t = stanceCountsOf([
+    { roundNo: 1, floorId: 'chair', role: 'chair' },
+    { roundNo: 1, floorId: '1F', status: 'ok', stance: 'support' },
+    { roundNo: 1, floorId: '4F', status: 'ok', stance: 'oppose' },
+    { roundNo: 1, floorId: '7F', status: 'ok', stance: 'unsure' },
+    { roundNo: 1, floorId: '8F', status: 'timeout', stance: null },
+  ].map(normUtterance));
+  ok('主席不占席位（4 人而不是 5 人）', t.seats === 4, String(t.seats));
+  ok('支持 1 / 反对 1 / 不确定 1', t.support === 1 && t.oppose === 1 && t.unsure === 1);
+  ok('超时的那位算未表态', t.none === 1, String(t.none));
+  ok('四档加起来等于席位（没漏算）', t.support + t.oppose + t.unsure + t.none === t.seats);
+  // 说了话但没给出立场（unparsed）也落进未表态 —— 它确实没表态，只是原因不同
+  const t2 = stanceCountsOf([{ roundNo: 1, floorId: '1F', status: 'unparsed', stance: null }].map(normUtterance));
+  ok('没按约定给出立场（unparsed）也算未表态', t2.none === 1, JSON.stringify(t2));
+  ok('空输入不炸', stanceCountsOf([]).seats === 0 && stanceCountsOf(null).seats === 0);
+}
+
+head('groupByRound 多挂了一个 stanceTally（加字段，不是改字段）');
+{
+  const g = groupByRound([
+    { roundNo: 1, floorId: '1F', status: 'ok', vote: 'agree', stance: 'support' },
+    { roundNo: 1, floorId: '4F', status: 'ok', vote: 'disagree', stance: 'oppose' },
+  ].map(normUtterance));
+  ok('stanceTally 在', Boolean(g[0].stanceTally));
+  ok('它数的是立场', g[0].stanceTally.support === 1 && g[0].stanceTally.oppose === 1);
+  // 回归：表决那条路的分组结果逐字不变（分析字段是**加**出来的，没动旧的）
+  ok('tally 仍然是票型那一份（没被立场污染）', g[0].tally.agree === 1 && g[0].tally.disagree === 1, JSON.stringify(g[0].tally));
+  ok('分组形状里的键只多了 stanceTally', Object.keys(g[0]).sort().join() === 'roundNo,stanceTally,tally,utterances', Object.keys(g[0]).join());
+}
+
+head('回归：分析模式的行不许影响表决那套');
+{
+  // 一场"老库里的表决会"——没有 mode、没有 stance、没有 findings。所有旧口径必须原样成立
+  const rows = [
+    { round_no: 0, floor_id: 'chair', role: 'chair', content: '议题' },
+    { round_no: 1, floor_id: '1F', role: 'speaker', status: 'ok', vote: 'agree', vote_reason: '可以' },
+    { round_no: 1, floor_id: '4F', role: 'speaker', status: 'ok', vote: 'disagree', proposal_text: '换方案 B' },
+  ].map(normUtterance);
+  ok('票型照旧（同意 1 反对 1，主席不占席位）', JSON.stringify(tallyOf(rows.filter((u) => u.roundNo === 1))) === JSON.stringify({ seats: 2, agree: 1, disagree: 1, abstain: 0, invalid: 0 }));
+  ok('没给 stance 的老行读出 null（不是别的）', rows.every((u) => u.stance === null));
+  ok('没给 findings 的老行读出 null', rows.every((u) => u.findings === null));
+  ok('立场汇总里老行全算未表态（它们确实没表过态）', stanceCountsOf(rows.filter((u) => u.roundNo === 1)).none === 2);
 }
 
 console.log(`\n${fail ? '✗' : '✓'} council-timeline: ${pass} 通过 / ${fail} 失败`);

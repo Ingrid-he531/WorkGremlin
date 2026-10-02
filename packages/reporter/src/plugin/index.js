@@ -1092,6 +1092,10 @@ export default {
 
   /** 8F OpenCode —— 走这个入口就说明是 OpenCode，产品基名不用猜 */
   async setup(ctx) {
+    // 议事厅的参与者不该被上报（见 server/src/council/agents.js 的 QUIET_ENV）：
+    // 工程模式下它的 cwd 是用户的真实工程，上报了就会变成"你工程里的一个成员"。
+    // 这里返回一个空的拆卸函数 —— OpenCode 照常加载，只是什么都不订阅。
+    if (process.env.WORKGREMLIN_DISABLE === "1") return () => {}
     const inst = createIngestPlugin(ctx && ctx.options, { location: ctx && ctx.location, base: "opencode" })
     const controller = new AbortController()
     void (async () => {
@@ -1111,6 +1115,9 @@ export default {
 
   /** 7F Kilo —— 契约见 packages/plugin/src/index.ts 的 `PluginModule` */
   async server(input, options) {
+    // 同上（7F Kilo）：议事厅的参与者不上报。返回空的 Hooks 对象而不是 undefined ——
+    // Kilo 会校验 server() 的返回值形状，给 undefined 可能被当成加载失败。
+    if (process.env.WORKGREMLIN_DISABLE === "1") return {}
     // `base: "kilo"`：走 server() 这个入口就是 Kilo（setup() 才是 OpenCode），产品基名不用猜。
     // 早先这里是 `options || { client: "kilo" }` —— 目录注册那份没有 options，于是被喂了一个
     // 假默认 `{client:"kilo"}`，把 resolveClient 里的环境判定（形态 CLI / Plugin）整段遮死。

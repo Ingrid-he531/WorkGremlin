@@ -47,7 +47,15 @@ const json = (body, status = 200) => ({ status, ok: status < 400, json: async ()
 
 globalThis.fetch = async (url, opts) => {
   const path = String(url).replace(/^https?:\/\/[^/]+/, '');
-  calls.push({ path, method: (opts && opts.method) || 'GET' });
+  // body 也记下来：发起那一段要断言的是"发出去的到底是什么"（mode / workspacePath 有没有带、
+  // 空路径有没有被硬塞成一个 key）
+  let body = null;
+  try {
+    body = opts && opts.body ? JSON.parse(opts.body) : null;
+  } catch {
+    body = opts && opts.body ? String(opts.body) : null;
+  }
+  calls.push({ path, method: (opts && opts.method) || 'GET', body });
   const hit = Object.keys(routes).find((k) => k === `${(opts && opts.method) || 'GET'} ${path}`);
   if (!hit) return json({ ok: false, error: { code: 'not_found', message: `没有这条路由：${path}` } }, 404);
   return routes[hit]();
@@ -207,6 +215,90 @@ head('发起：服务端拒绝时原因原样带出来，不自己编一句');
   ok('没有返回 id', id === null);
   ok('原因就是服务端那句', s.error === '4F：没找到命令行可执行文件', s.error);
   ok('没有留下半场会', s.current === null);
+}
+
+head('发起：两个新开关原样进 body，留空的不发这个 key');
+{
+  const s = fresh();
+  routes['POST /api/v1/councils'] = () => json({ ok: true, council: { id: 'c9', topic: 'x', status: 'draft', mode: 'analysis', max_rounds: 2 } });
+  routes['GET /api/v1/councils'] = () => json({ ok: true, councils: [] });
+  routes['GET /api/v1/councils/c9'] = () =>
+    json({ ok: true, council: { id: 'c9', topic: 'x', status: 'draft', mode: 'analysis', workspace_path: '/home/me/proj', max_rounds: 2 }, participants: [], materials: [], rounds: [], utterances: [], live: false });
+
+  await s.create({ topic: 'x', floors: ['1F', '4F'], files: [], maxRounds: 2, mode: 'analysis', workspacePath: '/home/me/proj' });
+  const sent = calls.find((c) => c.method === 'POST');
+  ok('谈法原样进 body', sent.body.mode === 'analysis', JSON.stringify(sent.body));
+  ok('工作目录原样进 body', sent.body.workspacePath === '/home/me/proj', JSON.stringify(sent.body));
+}
+{
+  const s = fresh();
+  routes['POST /api/v1/councils'] = () => json({ ok: true, council: { id: 'c10', topic: 'x', status: 'draft', mode: 'vote', max_rounds: 2 } });
+  routes['GET /api/v1/councils'] = () => json({ ok: true, councils: [] });
+  routes['GET /api/v1/councils/c10'] = () =>
+    json({ ok: true, council: { id: 'c10', topic: 'x', status: 'draft', mode: 'vote', workspace_path: null, max_rounds: 2 }, participants: [], materials: [], rounds: [], utterances: [], live: false });
+
+  await s.create({ topic: 'x', floors: ['1F', '4F'], files: [], maxRounds: 2, mode: 'vote', workspacePath: '   ' });
+  const sent = calls.find((c) => c.method === 'POST');
+  // 空路径**不发这个 key**：隔离模式是服务端的缺省行为，发一个空串过去只是把
+  // "没填"翻译成"填了个空"，服务端要多一步才能认出它。老前端本来就不发它。
+  ok('留空的工作目录不进 body（不发这个 key，不是发空串）', !('workspacePath' in sent.body), JSON.stringify(sent.body));
+  ok('谈法照发（缺省也要显式说清）', sent.body.mode === 'vote', JSON.stringify(sent.body));
+}
+
+head('谈法 getter：老行没有 mode → 当表决（那时候只有这一种谈法）');
+{
+  const s = fresh();
+  s.current = { council: { id: 'c1', mode: 'analysis' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
+  ok('新行读得出分析', s.mode === 'analysis', s.mode);
+  s.current = { council: { id: 'c0' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
+  ok('没有 mode 的老行 → vote', s.mode === 'vote', s.mode);
+  s.current = { council: { id: 'cx', mode: '看不懂的值' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
+  ok('认不出的值也回落到 vote（不把界面引到一条没走过的分支上）', s.mode === 'vote', s.mode);
+  s.current = null;
+  ok('没有当前会时是 vote，不炸', s.mode === 'vote');
+}
+
+head('谈法 getter：workspacePath 取不到就是空串（隔离模式）');
+{
+  const s = fresh();
+  s.current = { council: { id: 'c1', workspace_path: '/home/me/proj' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
+  ok('有值就照给', s.workspacePath === '/home/me/proj', s.workspacePath);
+  s.current = { council: { id: 'c2', workspace_path: null }, participants: [], materials: [], rounds: [], utterances: [], live: false };
+  ok('NULL → 空串（界面据此知道是隔离模式）', s.workspacePath === '', JSON.stringify(s.workspacePath));
+}
+
+head('收尾：reported 也是一场会开完了，照旧回拉详情');
+{
+  const s = fresh();
+  s.current = { council: { id: 'c1', topic: 'x', status: 'running', mode: 'analysis' }, participants: [], materials: [], rounds: [], utterances: [], live: true };
+  let detailHits = 0;
+  routes['GET /api/v1/councils/c1'] = () => {
+    detailHits += 1;
+    return json({ ok: true, council: { id: 'c1', topic: 'x', status: 'done', verdict: 'reported', mode: 'analysis', max_rounds: 2 }, participants: [], materials: [], rounds: [], utterances: [], live: false });
+  };
+  routes['GET /api/v1/councils'] = () => json({ ok: true, councils: [] });
+
+  s.applyEvent({ councilId: 'c1', status: 'done', verdict: 'reported' });
+  ok('回拉了详情（结论只在库里有，WS 那个摘要带不出来）', detailHits === 1, String(detailHits));
+  await new Promise((r) => setTimeout(r, 20));
+  ok('收尾后 status 落到详情那一份上', s.current.council.status === 'done' && s.current.council.verdict === 'reported', JSON.stringify(s.current.council));
+  ok('不再是"在跑"（界面据此停掉实时提示）', s.live === false);
+}
+
+head('分析模式的 WS 增量：只带立场与要点，也不许把正文抹掉');
+{
+  const s = fresh();
+  s.current = {
+    council: { id: 'c1', topic: 'x', status: 'running', mode: 'analysis' },
+    participants: [], materials: [], rounds: [],
+    utterances: [{ roundNo: 1, floorId: '1F', role: 'speaker', content: '分析正文', vote: null, voteReason: null, proposal: null, second: null, stance: null, findings: null, status: 'ok', error: null, durationMs: null, inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null }],
+    live: true,
+  };
+  s.applyEvent({ councilId: 'c1', utterance: { roundNo: 1, floorId: '1F', stance: 'support', findings: { points: ['结论 A'], risks: [], questions: [] } } });
+  const u = s.current.utterances[0];
+  ok('正文没被抹掉', u.content === '分析正文', String(u.content));
+  ok('立场补上了', u.stance === 'support', String(u.stance));
+  ok('要点补上了', u.findings && u.findings.points[0] === '结论 A', JSON.stringify(u.findings));
 }
 
 await server.close();

@@ -68,6 +68,7 @@ process.env.WORKGREMLIN_OPENCODE_HOME = OC_HOME;
 const Database = require('better-sqlite3');
 
 const { detectProducts } = require('../src/products');
+const { DEFAULTS } = require('@workgremlin/shared');
 const opencode = require('../src/opencode');
 // sessions / sessionRegistry **必须在取任何时间戳之前**加载：它们在模块加载那一刻记下
 // SERVER_STARTED_AT（"重启纪元"），而 readReporterPhase 只采信本进程启动之后写入的相位
@@ -140,7 +141,15 @@ function buildDb({ withMessages = true } = {}) {
   });
   ins.run({
     id: 'ses_arch0000000000000000000001', parent: null, dir: '/tmp/ProjO', title: '归档了',
-    model: '{"id":"space-bunny-free","providerID":"opencode"}', files: 0, created: now - 5 * HOUR, updated: now, archived: now, 
+    model: '{"id":"space-bunny-free","providerID":"opencode"}', files: 0, created: now - 5 * HOUR, updated: now, archived: now,
+  });
+  // 议事厅参与者的会话：与上面几条**同一个工程、同样新鲜**，只有标题不同。
+  // 它必须不出现在任何一份会话清单里（见 opencode.js 的 listOpencodeSessionsUncached），
+  // 所以它的存在不会改上面任何一条计数 —— 这条 fixture 本身就是下面 [G] 断言的一半：
+  // 光断言"没列出来"证明不了什么，得先有这一行在库里。
+  ins.run({
+    id: 'ses_council00000000000000000001', parent: null, dir: '/tmp/ProjO', title: DEFAULTS.COUNCIL_SESSION_TITLE,
+    model: '{"id":"space-bunny-free","providerID":"opencode"}', files: 1, created: now - 60_000, updated: now, archived: null,
   });
 
   if (withMessages) {
@@ -547,6 +556,35 @@ head('[C5] 逐轮清单带 token 真值（reasoning 并进 output）；这一轮
   ok('reasoning 并进 output（30+20+10=60，不是 40）', t0 && t0.output === 60, t0 && String(t0.output));
   ok('缓存读 / 写分列原样取（read 5+20、write 5+0）', t0 && t0.cacheRead === 25 && t0.cacheWrite === 5, JSON.stringify(t0));
   ok('这一轮一条 tokens 都没读到 → null（不是 4 个 0）', turns[1] && turns[1].tokens === null, JSON.stringify(turns[1] && turns[1].tokens));
+}
+
+/* ------------------------- G. 议事厅参与者不进办公室 ------------------------- */
+
+head('[G] 议事厅参与者（title = COUNCIL_SESSION_TITLE）不出现在 8F 的会话表里');
+{
+  // 为什么值得单独钉：OpenCode 把会话记在**全局** SQLite 里，`session_v2.directory` 是当时的
+  // cwd。工程模式下参与者的 cwd 就是用户的工程 —— 不挡的话它当场变成办公室 8F 上多出来的
+  // 一个"会话"，而 requirements.md §15.2 写死了「那两页看不出任何痕迹」。
+  const COUNCIL_SID = 'ses_council00000000000000000001';
+  // 先证明那一行**真的在库里**（否则"没列出来"可能只是 fixture 压根没插进去，测了个寂寞）
+  const db = new Database(DB, { readonly: true });
+  const row = db.prepare('SELECT id, title, directory FROM session_v2 WHERE id = ?').get(COUNCIL_SID);
+  db.close();
+  ok(
+    '参与者的会话行确实在库里（同工程、标题就是那个标记）',
+    Boolean(row) && row.title === DEFAULTS.COUNCIL_SESSION_TITLE && row.directory === '/tmp/ProjO',
+    JSON.stringify(row)
+  );
+
+  const ids = opencode.listOpencodeSessions().map((s) => s.id);
+  ok('但它不出现在 8F 的会话清单里', !ids.includes(COUNCIL_SID), ids.join(' '));
+  ok('同一工程里的用户会话照常列出来（挡的是这一条，不是整个工程）', ids.includes('ses_live0000000000000000000001'), ids.join(' '));
+
+  // 过滤判据是"标题"这个约定：一头在 agents.js（发 --title），另一头在 opencode.js（跳过它）。
+  // 两头不一致的话过滤会**静默失效**，所以直接把它们对起来钉死。
+  const args = require('../src/council/agents').RECIPES['8F'].build({ bin: 'opencode', prompt: 'x', allow: 'none' }).args;
+  const at = args.indexOf('--title');
+  ok('8F 配方发的标题 = 这里过滤的标题（两头不一致 = 过滤白写）', at >= 0 && args[at + 1] === DEFAULTS.COUNCIL_SESSION_TITLE, JSON.stringify(args));
 }
 
 /* ------------------------------ D. 读不出来不许冒泡 ------------------------------ */

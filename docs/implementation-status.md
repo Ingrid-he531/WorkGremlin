@@ -253,10 +253,25 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 | --- | --- | --- |
 | 谁起的进程 | 用户 / 编辑器插件 | **服务端**（`child_process.spawn`） |
 | 进不进会话注册表 | 进（`sessionRegistry`，出现在楼层与主控制台） | **不进**。只活在 `council_*` 五张表里 |
-| 有没有工具 | 有，照各 CLI 自己的配置 | **没有**（`--tools ""` 或注入权限全 deny 的配置） |
-| 工作目录 | 用户自己的工程目录 | 服务端在 `/tmp` 下现建的**一次性目录**，一场一个，收尾即删 |
+| 有没有工具 | 有，照各 CLI 自己的配置 | **看模式**（见下）：隔离模式**没有**（`--tools ""` 或注入权限全 deny 的配置）；工程模式**只读**（`Read,Grep,Glob`） |
+| 工作目录 | 用户自己的工程目录 | **看模式**（见下）：隔离模式是 `/tmp` 下现建的**一次性目录**，一场一个、收尾即删；工程模式是用户填的那个绝对路径，**我们一行都不改它、收尾也不删** |
 | 会不会写台账 | 会（`task_runs` / `messages` / `file_activity`） | **不会**。办公室与任务记录页看不到任何痕迹 |
 | 相位 | 上报或轮询推导 | 无相位概念（它不是"在干活的 agent"，是"正在发言的与会者"） |
+
+**两个正交的开关（2026-10-02 加）**：`councils.mode`（`vote` 表决 / `analysis` 分析）×
+`councils.workspace_path`（NULL 隔离 / 绝对路径 工程），四种组合都成立。
+下面这张表是"两个开关各自打开时，上面那两行变成什么"：
+
+| | 谈法：`vote`（缺省） | 谈法：`analysis` |
+| --- | --- | --- |
+| **在哪儿谈：隔离**（缺省） | 首版的样子：临时目录 + 无工具，多轮表决 | 临时目录 + 无工具，各轮分析、跑满轮数出一份简报 |
+| **在哪儿谈：工程**（填了绝对路径） | 参与者**看着真实代码**对一个提案表决 —— 评估回归风险要的就是这个形态 | 看着真实代码分析一个做法（例如某个 bug fix 的思路），跑满轮数出简报 |
+
+工程模式下 `cwd` 就是用户的工程，**工具只读到工程里**：1F/4F 给 `--tools Read,Grep,Glob`
+（同一份也给 `--allowedTools`，否则 `-p` 无人应答权限询问会直接拒掉；4F 另加
+`--permission-prompts none`）；7F/8F 沿用注入配置那一套，把全 deny 的权限表换成只放行
+`read/glob/grep/list`，`bash/edit/write/webfetch` 与 **`external_directory`** 照旧 deny
+（最后那条是命门：放行它等于让参与者顺着 `~` 读用户所有的东西）。
 
 这是仓库里第一次由服务端**长驻托管**子进程。现成的边界因此有三条硬约束，都写在
 `server/src/council/agents.js` 的注释里：
@@ -272,6 +287,28 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 3. **7F 必须摘掉 WorkGremlin 自己的上报插件**（`plugin: []`）。kilo 的全局配置里挂着的正是
    `packages/reporter/src/plugin/index.js`，不摘的话议事厅的参与者会被上报进办公室，
    直接违反"隔离，只在议事厅看"。
+4. **工程模式下"不上报"不能靠 cwd，得显式关**（2026-10-02 补）。上面第 3 条与"临时目录"
+   这两道锁都建立在 **cwd 是那个一次性目录** 之上：参与者上报出来的工程名是临时目录，
+   办公室按工程过滤就看不见它。工程模式下这套全失效 —— cwd 是你自己的工程，
+   `~/.claude/settings.json` / `~/.codebuddy/settings.json` 里装着的上报 hook 会带着
+   **真实工程路径**上报，参与者当场变成"你工程里的一个成员"。所以四条配方一律注入
+   `WORKGREMLIN_DISABLE=1`，由**我们自己的代码**（`packages/reporter/src/hook.js` 的 `main()`
+   开头、`packages/reporter/src/plugin/index.js` 的两个入口）认到就原地退出。
+   放在自己的代码里而不是某家的配置里，是因为各 CLI 的配置优先级我们并不都握得住，
+   而这两处是我们说关就能关的。自检：`npm run test:claude-hook`（hook 那条路）
+   + `npm run test:council-quiet-plugin`（7F/8F 插件那两条入口）。
+5. **7F/8F 的会话落盘挡不住，只能给它打个标记**（2026-10-02 补，真机验过）。
+   `kilo run` / `opencode run` 没有 `--no-session-persistence` 这种开关，会话一律记进
+   **全局** SQLite，`session.directory` 记的是**当时的 cwd** —— 工程模式下它就是你工程的名字，
+   办公室按工程过滤，于是 7F/8F 上会多出一个"正在开工的会话"，而 requirement §15.2 写着
+   "那两页看不出任何痕迹"。数据目录也不能挪：实测 `XDG_DATA_HOME` 确实能把库挪走
+   （kilo 的 `kilo.db` 会落到新目录下），但**登录态跟着一起没了**（挪完再跑，Kilo 回
+   401「You need to sign in」、OpenCode 直接挂住），参与者会连话都说不出来。
+   兜底办法是"照常落盘 + 打固定标题"：`--title '议事厅参与者（WorkGremlin）'`
+   （`DEFAULTS.COUNCIL_SESSION_TITLE`），`server/src/kilo.js` 与 `server/src/opencode.js`
+   在**列出会话时跳过这个标题**。自检：`npm run test:kilo` / `test:opencode` 各有一段
+   "同库同工程的用户会话照常列出、只有参与者那条被挡住"，另有
+   `test:council-agents` 钉住"配方发的标题 = 过滤的标题"（两头不一致 = 过滤白写）。
 
 **与实施计划的两处出入**（计划写在 `~/.claude/plans/`，不进仓库；此处留档以免后来者按计划找表）：
 
@@ -305,6 +342,21 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 - **CodeBuddy 会把一次性目录登记成项目**：每跑一场，它就在 `~/.codebuddy/projects/tmp-wg-council-*/`
   下留一个目录（一条 session `.jsonl`）。这是 CLI 自己的行为，我们没动它，也没有去清理
   ——**清理别人的历史记录比留着更危险**。要清的话请你自己删。
+  （2026-10-02 起 1F/4F 都加了 `--no-session-persistence`，新跑的场次不再产生这种记录；
+  以前跑出来的那几条还躺在那里。）
+
+**真机验证（2026-10-02，为工程模式补的）** —— 单测全绿之后仍要真机验一遍的原因与上面那次一样：
+
+- **工程模式下参与者的 cwd 就是你的工程，但工程目录**没有被它写过：用一个临时工程目录跑
+  `kilo run`（带上议事厅那套 env）之后，`find` 出来的还是只有那个目录本身 —— 没有
+  `.workgremlin/`、没有任何新文件。`.workgremlin/subagents.json` 是 **WorkGremlin 自己的插件**
+  写的，配方里的 `plugin: []` 把它摘掉了；kilo 自己不在 cwd 里落东西。
+  （这条只验到"跑起来那一步"：那次调用本身因为没登录态被模型拒绝，见下条。）
+- **`--title` 真的会落进库里**：`kilo run ... --title '议事厅参与者（WorkGremlin）'` 跑完，
+  `kilo.db` 的 `session` 表里那一行 `title` 就是原文、`directory` 就是 cwd。第 5 条那条过滤
+  靠的就是这个事实。
+- **`XDG_DATA_HOME` 挪不动（登录态一起挪走）**：见上面第 5 条。这一条是**失败经验**，写下来
+  是为了别有人再试一遍：数据目录这条路看着最干净，实际上会把参与者变成"能跑但说不出话"。
 
 ---
 

@@ -14,7 +14,17 @@
  */
 'use strict';
 
-const { RECIPES, parseOutput, parseVoteBlock, normalizeVoteToken } = require('../src/council/agents');
+const {
+  RECIPES,
+  parseOutput,
+  parseVoteBlock,
+  normalizeVoteToken,
+  parseAnalysisBlock,
+  normalizeStanceToken,
+  READ_TOOLS,
+  QUIET_ENV,
+} = require('../src/council/agents');
+const { DEFAULTS } = require('@workgremlin/shared');
 
 let pass = 0;
 let fail = 0;
@@ -280,6 +290,151 @@ ok('agree / 同意 / AGREE 都归成 agree', normalizeVoteToken('agree') === 'ag
 ok('disagree / 反对 归成 disagree', normalizeVoteToken('反对') === 'disagree' && normalizeVoteToken('no') === 'disagree');
 ok('abstain / 弃权 归成 abstain', normalizeVoteToken('弃权') === 'abstain');
 ok('认不出返回 null', normalizeVoteToken('随便') === null && normalizeVoteToken(null) === null);
+
+// ==================================================== 工程模式：只读，不是"能读能写"
+// 这一组与上面那组是**同一件事的两档**：allow='none' 是"什么都没有"，allow='read' 是
+// "只有读类工具"。第二种情况更容易出事 —— 多放行一个 write/edit/bash，参与者就能改用户的
+// 代码、在用户机器上跑命令。所以这里逐项断言放行了什么、没放行什么，而不是只看它"有没有工具"。
+head('只读保证（工程模式）：放行的只有读类工具，写类一律 deny');
+{
+  const i1 = RECIPES['1F'].build({ bin: '/usr/bin/codebuddy', prompt: '问题', allow: 'read' });
+  const a1 = i1.args;
+  ok('1F 的 --tools 不再是空串（隔离模式是空串，工程模式是白名单）', a1[a1.indexOf('--tools') + 1] !== '');
+  ok(`1F 的 --tools 就是那份白名单（${READ_TOOLS}）`, a1[a1.indexOf('--tools') + 1] === READ_TOOLS, JSON.stringify(a1));
+  // -p 是非交互的：只给 --tools 不给 --allowedTools，读文件时没人应答权限询问会被直接拒，
+  // 参与者就变成"干瞪眼"。这一条钉的是"它是只读，不是读不了"。
+  ok('1F 同时给了 --allowedTools 同一份（否则读文件会被权限询问拦下）',
+    a1[a1.indexOf('--allowedTools') + 1] === READ_TOOLS, JSON.stringify(a1));
+
+  const a4 = RECIPES['4F'].build({ bin: '/usr/bin/claude', prompt: '问题', allow: 'read' }).args;
+  ok('4F 的 --tools 也是那份白名单', a4[a4.indexOf('--tools') + 1] === READ_TOOLS, JSON.stringify(a4));
+  ok('4F 同样给了 --allowedTools', a4[a4.indexOf('--allowedTools') + 1] === READ_TOOLS, JSON.stringify(a4));
+  // --allowedTools 收的是变长参数，排在它后面的开关会被吃掉 → --permission-prompts 必须在前面
+  ok('4F 的 --permission-prompts none 排在 --allowedTools 前面（否则会被变长参数吃掉）',
+    a4.indexOf('--permission-prompts') < a4.indexOf('--allowedTools'), JSON.stringify(a4));
+  ok('4F 明说"没人应答就拒"（不是挂在那儿等）', a4[a4.indexOf('--permission-prompts') + 1] === 'none');
+}
+{
+  const cfg = JSON.parse(RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: 'p', allow: 'read' }).env.KILO_CONFIG_CONTENT);
+  ok('7F 放行 read / glob / grep / list',
+    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
+    cfg.permission.grep === 'allow' && cfg.permission.list === 'allow', JSON.stringify(cfg.permission));
+  ok('7F 的兜底仍然是 deny（没在表里的工具一个都别想用）', cfg.permission['*'] === 'deny');
+  ok('7F 的写类照旧全 deny（bash / edit / write）',
+    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' && cfg.permission.write === 'deny');
+  ok('7F 仍然摘掉上报插件（工程模式同样不许上报）', Array.isArray(cfg.plugin) && cfg.plugin.length === 0);
+}
+{
+  const cfg = JSON.parse(RECIPES['8F'].build({ bin: '/usr/bin/opencode', prompt: 'p', allow: 'read' }).env.OPENCODE_CONFIG_CONTENT);
+  ok('8F 放行 read / glob / grep / list',
+    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
+    cfg.permission.grep === 'allow' && cfg.permission.list === 'allow', JSON.stringify(cfg.permission));
+  ok('8F 的写类照旧全 deny（bash / edit / write）',
+    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' && cfg.permission.write === 'deny');
+  // 命门：工程模式只许看工程里。这条松了，参与者能顺着 ~ 读到用户所有的东西
+  ok('8F 仍然挡住 external_directory（只许看工程里，不许看 ~）', cfg.permission.external_directory === 'deny');
+  ok('8F 也仍然挡 webfetch / task / skill',
+    cfg.permission.webfetch === 'deny' && cfg.permission.task === 'deny' && cfg.permission.skill === 'deny');
+}
+{
+  // 隔离模式（allow 缺省 / 'none'）必须与改动前逐字相同 —— 这条是回归对照
+  for (const f of ['1F', '4F', '7F', '8F']) {
+    const withDefault = RECIPES[f].build({ bin: '/x', prompt: 'p' });
+    const withNone = RECIPES[f].build({ bin: '/x', prompt: 'p', allow: 'none' });
+    ok(`${f} 不传 allow 与传 'none' 逐字相同`, JSON.stringify(withDefault) === JSON.stringify(withNone));
+  }
+  ok('不传 allow 时 1F/4F 依然是空串 --tools',
+    RECIPES['1F'].build({ bin: '/x', prompt: 'p' }).args[RECIPES['1F'].build({ bin: '/x', prompt: 'p' }).args.indexOf('--tools') + 1] === '');
+}
+
+// ================================================== 不上报：工程模式隔离的命门
+// cwd 是用户的真实工程时，装了 WorkGremlin 上报 hook/插件的机器会把参与者**按真实工程
+// 路径**上报 —— 参与者就变成"你工程里的一个成员"。cwd 挡不住这件事，只有显式关掉上报。
+head('所有配方都关掉了 WorkGremlin 自己的上报');
+for (const f of ['1F', '4F', '7F', '8F']) {
+  for (const allow of ['none', 'read']) {
+    const env = RECIPES[f].build({ bin: '/x', prompt: 'p', allow }).env;
+    ok(`${f}（allow=${allow}）注入了 WORKGREMLIN_DISABLE=1`, env.WORKGREMLIN_DISABLE === '1', JSON.stringify(env));
+  }
+}
+ok('QUIET_ENV 只有这一条（别顺手塞别的东西进去）', Object.keys(QUIET_ENV).length === 1 && QUIET_ENV.WORKGREMLIN_DISABLE === '1');
+
+// ============================================== 7F/8F 的会话标记（第二道隔离）
+// 这两家没有 1F/4F 那种 `--no-session-persistence`，会话一定落进它们**全局**的 SQLite，
+// 而 session.directory 记的是当时的 cwd。工程模式下 cwd 就是用户的工程 —— 不标记的话，
+// 参与者会当场出现在办公室的 7F/8F 上（办公室按工程过滤，它正好落在那个工程里）。
+// 挡法是固定标题 + server/src/kilo.js / opencode.js 列出会话时跳过它。
+// 这里只钉"发出去的确实是那个标题"；"跳过了"由 kiloFloor / opencodeFloor 那两个用例钉。
+head('7F/8F 发送固定的会话标题（办公室据此把参与者挡在外面）');
+for (const f of ['7F', '8F']) {
+  for (const allow of ['none', 'read']) {
+    const args = RECIPES[f].build({ bin: '/x', prompt: 'p', allow }).args;
+    const at = args.indexOf('--title');
+    ok(`${f}（allow=${allow}）带了 --title`, at >= 0, JSON.stringify(args));
+    ok(`${f}（allow=${allow}）标题就是 DEFAULTS.COUNCIL_SESSION_TITLE`,
+      args[at + 1] === DEFAULTS.COUNCIL_SESSION_TITLE, JSON.stringify(args));
+  }
+  // 只给这两家加：1F/4F 靠 --no-session-persistence 根本不产生记录，标题对它们是多余的
+  ok(`${f} 的标题在参数里只出现一次`, RECIPES[f].build({ bin: '/x', prompt: 'p' }).args.filter((a) => a === '--title').length === 1);
+}
+for (const f of ['1F', '4F']) {
+  ok(`${f} 不带 --title（它靠 --no-session-persistence，压根不落盘）`,
+    !RECIPES[f].build({ bin: '/x', prompt: 'p' }).args.includes('--title'), JSON.stringify(RECIPES[f].build({ bin: '/x', prompt: 'p' }).args));
+}
+ok('标记里带 WorkGremlin（用户在 Kilo / OpenCode 自己的会话历史里认得出这是谁留下的）',
+  DEFAULTS.COUNCIL_SESSION_TITLE.includes('WorkGremlin'), DEFAULTS.COUNCIL_SESSION_TITLE);
+
+// ============================================================ 分析解析
+head('分析解析：约定的结构化尾块');
+{
+  const r = parseAnalysisBlock('我的分析……\n\n```json\n' +
+    JSON.stringify({ stance: 'support', points: ['A', 'B'], risks: ['C'], questions: ['D'] }) + '\n```\n');
+  ok('stance 解析出来', r.stance === 'support', JSON.stringify(r));
+  ok('三条要点都在', r.findings.points.length === 2 && r.findings.risks[0] === 'C' && r.findings.questions[0] === 'D', JSON.stringify(r.findings));
+}
+{
+  const r = parseAnalysisBlock('```json\n{"stance":"oppose","points":[],"risks":[],"questions":[]}\n```');
+  ok('空数组是合法的（"答了，答的是没有"）', r.stance === 'oppose' && Array.isArray(r.findings.points) && r.findings.points.length === 0);
+  ok('findings 不是 null —— 与"整个尾块没解析出来"是两回事', r.findings !== null);
+}
+{
+  const r = parseAnalysisBlock('```json\n{"stance":"unsure"}\n```');
+  ok('只给了 stance、一条要点都没有 → findings=null（"没说" ≠ "说没有"）', r.stance === 'unsure' && r.findings === null, JSON.stringify(r));
+}
+{
+  const r = parseAnalysisBlock('```json\n{"points":["有结论没立场"]}\n```');
+  ok('有要点但没给 stance → stance=null（立场这东西不许替它定）', r.stance === null);
+  ok('要点照收（它说了的话不因为缺立场就丢掉）', r.findings && r.findings.points[0] === '有结论没立场');
+}
+{
+  // 注意"看情况""maybe"这类**模糊词**是归到 unsure 的 —— unsure 本来就是"没拿定主意"
+  // 那一档，收下它不算替它表态（与表决里 neutral → abstain 同一个路子）。
+  // 真正认不出的词（下面这个）才必须是 null。
+  const r = parseAnalysisBlock('```json\n{"stance":"banana","points":["x"]}\n```');
+  ok('立场是个没见过的词 → null，不硬塞成 support', r.stance === null, JSON.stringify(r));
+  ok('模糊词归到 unsure（它就是"没拿定主意"那一档）', parseAnalysisBlock('```json\n{"stance":"maybe"}\n```').stance === 'unsure');
+}
+{
+  ok('整个没有 JSON 块 → 两样都是 null', JSON.stringify(parseAnalysisBlock('就说了一段话，没给尾块')) === JSON.stringify({ stance: null, findings: null }));
+  ok('空文本 → 全 null', parseAnalysisBlock('').stance === null && parseAnalysisBlock(null).stance === null);
+}
+{
+  // 模型爱在中间举例：取**最后**一个块才是它的结论（与表决解析同一条规矩）
+  const r = parseAnalysisBlock('例如可以这样写：\n```json\n{"stance":"oppose"}\n```\n而我最后判断是：\n```json\n{"stance":"support","points":["最后说的算"]}\n```');
+  ok('中间举例的块不会被误当结论（取最后一个）', r.stance === 'support', JSON.stringify(r));
+}
+{
+  // 元素不是字符串的（模型偶尔塞对象进来）丢掉，不当成一条要点
+  const r = parseAnalysisBlock('```json\n{"stance":"support","points":["好的",{"point":"坏的"},"  "],"risks":[]}\n```');
+  ok('非字符串元素与空串被丢掉，不硬转成字符串', r.findings.points.length === 1 && r.findings.points[0] === '好的', JSON.stringify(r.findings));
+}
+
+head('立场词表：认识的归一，不认识的一律 null');
+ok('support / 支持 / 赞成 / 可行 归成 support',
+  ['support', '支持', '赞成', '可行', 'agree'].every((s) => normalizeStanceToken(s) === 'support'));
+ok('oppose / 反对 / 不可行 归成 oppose', ['oppose', '反对', 'no', 'disagree'].every((s) => normalizeStanceToken(s) === 'oppose'));
+ok('unsure / 不确定 / 存疑 归成 unsure', ['unsure', '不确定', '存疑', 'maybe'].every((s) => normalizeStanceToken(s) === 'unsure'));
+ok('认不出返回 null', normalizeStanceToken('随便') === null && normalizeStanceToken(null) === null && normalizeStanceToken('') === null);
 
 console.log(`\n${fail ? '✗' : '✓'} council-agents: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

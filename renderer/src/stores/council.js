@@ -20,7 +20,16 @@ export const useCouncilStore = defineStore('council', {
   state: () => ({
     /** 可选楼层（含没装 CLI 的那几层与原因） */
     floors: [],
-    defaults: { maxRounds: 3, maxRoundsLimit: 8, threshold: 'unanimous', materialMaxBytes: 0, materialTotalMaxBytes: 0 },
+    defaults: {
+      maxRounds: 3,
+      maxRoundsLimit: 8,
+      threshold: 'unanimous',
+      modes: ['vote', 'analysis'],
+      mode: 'vote',
+      workspaceTurnTimeoutMs: 0,
+      materialMaxBytes: 0,
+      materialTotalMaxBytes: 0,
+    },
     /** 历史列表 */
     list: [],
     /** 当前打开的那场会 */
@@ -39,6 +48,13 @@ export const useCouncilStore = defineStore('council', {
     canStart: (s) => s.floors.length === 0 || s.floors.some((f) => f.ready),
     /** 会还在推进吗（在页面上显示实时时间线；结束了就不必再等推送） */
     live: (s) => Boolean(s.current && ['draft', 'running'].includes(s.current.council.status)),
+    /**
+     * 当前这场会的谈法。老行没有 mode 列（迁移前建的会）→ 一律当 'vote'：
+     * 那时候只有这一种谈法，猜成别的会把界面引到一条它根本没走过的分支上。
+     */
+    mode: (s) => ((s.current && s.current.council.mode) === 'analysis' ? 'analysis' : 'vote'),
+    /** 当前这场会的工作目录（工程模式）；空 = 隔离模式 */
+    workspacePath: (s) => (s.current && s.current.council.workspace_path) || '',
     /** 按轮次分好的时间线（含从发言现数的票型），见 lib/councilTimeline.js */
     timeline: (s) => (s.current ? groupByRound(s.current.utterances) : []),
 
@@ -134,16 +150,21 @@ export const useCouncilStore = defineStore('council', {
      * 发起一场会。
      * @returns {Promise<string|null>} 新会的 id；失败返回 null 并把原因放进 error
      */
-    async create({ topic, floors, files, maxRounds }) {
+    async create({ topic, floors, files, maxRounds, mode, workspacePath }) {
       const project = useProjectStore();
       this.submitting = true;
       this.error = '';
+      const body = { topic, floors, files, maxRounds, mode: mode || 'vote' };
+      // 工作目录**留空就不发这个 key**：隔离模式是服务端的缺省行为，
+      // 发一个空串过去只是把"没填"翻译成"填了个空"，服务端要多一步才能认出它。
+      const ws = String(workspacePath == null ? '' : workspacePath).trim();
+      if (ws) body.workspacePath = ws;
       try {
         const info = project.serverInfo || {};
         const res = await fetch(`${httpBase(info)}/api/v1/councils`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(authHeaders(info) || {}) },
-          body: JSON.stringify({ topic, floors, files, maxRounds }),
+          body: JSON.stringify(body),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
@@ -216,7 +237,9 @@ export const useCouncilStore = defineStore('council', {
         // 增量合并（去重 + 非空覆盖），见 lib/councilTimeline.js
         cur.utterances = mergeUtterance(cur.utterances, p.utterance);
       }
-      if (isCurrent && p.roundNo != null && p.phase === 'debate') {
+      // 桌上真有一份提案才叫"当前提案"。分析模式的 debate 事件里 proposal 恒为 null
+      // （见 orchestrator.js）—— 认 null 当提案的话，界面上会挂起一条空横幅。
+      if (isCurrent && p.roundNo != null && p.phase === 'debate' && p.proposal) {
         this.liveProposal = { roundNo: p.roundNo, proposal: p.proposal, proposalFrom: p.proposalFrom };
       }
       if (isCurrent && p.round) {

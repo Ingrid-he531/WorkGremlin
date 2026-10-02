@@ -1618,6 +1618,14 @@ async function runHeartbeat(info, agent, session = '') {
 }
 
 async function main() {
+  // 议事厅的参与者不上报（见 server/src/council/agents.js 的 QUIET_ENV）。
+  // 必须在**读 stdin、连服务端之前**就退出：hook 是被各家 CLI 同步等着的，
+  // 早退一步，参与者就少等一步。
+  //
+  // 为什么非有这条不可：隔离模式靠 cwd 在 /tmp 就够了（上报出来的工程是那个临时目录，
+  // 办公室看不见）；但**工程模式下 cwd 是用户的真实工程**，不挡的话参与者当场变成
+  // "你工程里的一个成员"，直接违反"只在议事厅看得见"。
+  if (process.env.WORKGREMLIN_DISABLE === '1') return;
   const argv = process.argv.slice(2);
   // 主 agent 身份：安装器在命令里用 --agent 注入，必填；缺了直接报错退出。
   AGENT = flag(argv, '--agent');
