@@ -2058,16 +2058,50 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
 /* ------------------------------ 对外：列会话 ------------------------------ */
 
 /**
- * genie-history 下每个 base64 目录 = 一个工程（目录名解出来就是工程绝对路径）。
+ * 补全被扩展截断的工程路径。
+ *
+ * **扩展把 genie-history 的目录名（工程路径的 base64）截到 64 字符**，而 64 个 base64
+ * 字符只装得下 48 字节 —— 路径一长，解出来就只剩半截：
+ *   实测（Windows）：`c:/Users/yingh/WorkBuddy/2026-09-14-19-28-26/WorkGremlin`（52 字符）
+ *   → 目录名解码只得 `…/2026-09-14-19-28-26/Wor`，工程名跟着变成 **"Wor"**。
+ * 常见的 macOS/Linux 家目录路径短于 48 字符，看不出这个问题 —— 是 Windows（长路径）专属坑。
+ * 目录里也没别处存完整路径（current.json 只有 conversationId，conversations/<id> 是空壳），
+ * 所以只能拿"已知的真实工程"做前缀补全：解出的半截在磁盘上不是目录时，若候选里恰有一个
+ * 以它为前缀，就用候选那条。补不上就原样返回，不影响没被截断的机器。
+ *
+ * @param {string} decoded decodeDirName 的结果
+ * @param {string[]} candidates 已知的真实工程路径（当前工程 / reporter 上报的工程）
+ * @returns {string}
+ */
+function completeTruncatedWorkspace(decoded, candidates) {
+  const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (!decoded || isDir(decoded)) return decoded; // 磁盘上真有这个目录 = 没被截断
+  const want = norm(decoded);
+  if (!want) return decoded;
+  const hits = (candidates || []).filter((c) => {
+    if (!c) return false;
+    const n = norm(c);
+    return n && n !== want && n.startsWith(want);
+  });
+  if (!hits.length) return decoded;
+  // 多条命中取最短的那条：越短越贴近原本被截掉的那条路径
+  return hits.sort((a, b) => String(a).length - String(b).length)[0];
+}
+
+/**
+ * genie-history 下每个 base64 目录 = 一个工程（目录名解出来就是工程绝对路径；
+ * 长度超过 48 字节的路径会被扩展截断，靠 candidates 补全，见 completeTruncatedWorkspace）。
+ * @param {string} storage 插件落盘根
+ * @param {string[]} [candidates] 已知的真实工程路径
  * @returns {Array<{dir: string, path: string, project: string}>}
  */
-function collectProjects(storage) {
+function collectProjects(storage, candidates = []) {
   const gh = path.join(storage, 'genie-history');
   const out = [];
   for (const name of readDir(gh)) {
     const dir = path.join(gh, name);
     if (!isDir(dir)) continue;
-    const ws = decodeDirName(name);
+    const ws = completeTruncatedWorkspace(decodeDirName(name), candidates);
     if (!ws) continue;
     out.push({ dir, path: ws, project: resolveProjectName(ws) || path.basename(ws) });
   }
@@ -2109,7 +2143,9 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const meta = new Map();
   const perProjectCurrent = new Map(); // 工程路径 -> 该工程 current.json 指向的会话 id
   let currentId = '';
-  for (const p of collectProjects(storage)) {
+  // candidates 传"当前工程 + 本次查询的工程"：genie-history 目录名可能被扩展截断，
+  // 用它俩把半截路径补回完整路径（否则工程名会显示成被截断后的残尾，见 completeTruncatedWorkspace）
+  for (const p of collectProjects(storage, [ws, workspacePath])) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
     if (cid) {
