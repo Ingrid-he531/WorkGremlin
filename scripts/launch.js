@@ -143,8 +143,22 @@ function waitFor(predicate, timeoutMs, label) {
   });
 }
 
+/**
+ * 解析 Electron 可执行文件。
+ * Windows 优先用 electron 包自带的 `electron.exe`：`node_modules\.bin\electron.cmd` 是批处理，
+ * 见 startClient 的注释（spawn .cmd 会 EINVAL / 走 shell 又有 DEP0190 告警）。
+ */
 function electronBin() {
+  if (process.platform === 'win32') {
+    const exe = path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe');
+    if (fs.existsSync(exe)) return exe;
+  }
   return path.join(ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'electron.cmd' : 'electron');
+}
+
+/** 只有落到 .cmd/.bat 批处理（没找到 electron.exe 时的兜底）才需要 shell */
+function needsShell(bin) {
+  return process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin);
 }
 
 /** 后台常驻启动 server（detached + unref，独立于本脚本生命周期） */
@@ -159,13 +173,22 @@ function startServer() {
   return child;
 }
 
-/** 前台启动 client：连接本脚本已起好的 server，不读环境变量、不自行启动 server */
+/**
+ * 前台启动 client：连接本脚本已起好的 server，不读环境变量、不自行启动 server。
+ *
+ * Windows 注意：不要直接 spawn `node_modules\.bin\electron.cmd` —— Node >= 20.12
+ * （CVE-2024-27980 修复）起，不带 shell 直接 spawn .cmd/.bat 会抛 `spawn EINVAL`，
+ * launch 直接起不来；而给它加 shell 又会引入 DEP0190 告警（参数不做转义）。
+ * 所以优先走 electronBin() 解析出的 electron.exe（无需 shell），仅兜底落到 .cmd 时才加 shell。
+ */
 function startClient() {
-  return spawn(electronBin(), [...ELECTRON_ARGS, 'desktop/src/main.js'], {
+  const bin = electronBin();
+  return spawn(bin, [...ELECTRON_ARGS, 'desktop/src/main.js'], {
     cwd: ROOT,
     env: { ...process.env },
     stdio: 'inherit',
     detached: false,
+    shell: needsShell(bin),
   });
 }
 
