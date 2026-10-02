@@ -2066,11 +2066,12 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
  *   → 目录名解码只得 `…/2026-09-14-19-28-26/Wor`，工程名跟着变成 **"Wor"**。
  * 常见的 macOS/Linux 家目录路径短于 48 字符，看不出这个问题 —— 是 Windows（长路径）专属坑。
  * 目录里也没别处存完整路径（current.json 只有 conversationId，conversations/<id> 是空壳），
- * 所以只能拿"已知的真实工程"做前缀补全：解出的半截在磁盘上不是目录时，若候选里恰有一个
- * 以它为前缀，就用候选那条。补不上就原样返回，不影响没被截断的机器。
+ * 所以只能拿"已知的真实工程"做前缀补全：解出的半截在磁盘上不是目录时，就在候选里找一条
+ * 以它为前缀、**且磁盘上真实存在**的目录补上。补不上就原样返回，不影响没被截断的机器。
  *
  * @param {string} decoded decodeDirName 的结果
- * @param {string[]} candidates 已知的真实工程路径（当前工程 / reporter 上报的工程）
+ * @param {string[]} candidates 已知的真实工程路径，**按可信度排序**：越靠前越优先
+ *   （调用点 = [freshestReporterWs 的真实活动工程, 办公室打开的工程]）
  * @returns {string}
  */
 function completeTruncatedWorkspace(decoded, candidates) {
@@ -2078,21 +2079,24 @@ function completeTruncatedWorkspace(decoded, candidates) {
   if (!decoded || isDir(decoded)) return decoded; // 磁盘上真有这个目录 = 没被截断
   const want = norm(decoded);
   if (!want) return decoded;
-  const hits = (candidates || []).filter((c) => {
-    if (!c) return false;
+  // 顺序即优先级，先中即用：候选里第一条"以半截串为前缀（截断=纯前缀截断）且磁盘上真是目录"
+  // 就是答案。不做"取最短"——两条候选共享同一截断前缀时，按长短挑会挑错工程；按可信度排序
+  // 才能保证真实活动工程（ws，放最前）优先补上，`p.path === ws` 才成立。
+  // 要求 isDir：绝不把不存在的路径当工程根返回（对齐"绝不编造"）。
+  for (const c of candidates || []) {
+    if (!c) continue;
     const n = norm(c);
-    return n && n !== want && n.startsWith(want);
-  });
-  if (!hits.length) return decoded;
-  // 多条命中取最短的那条：越短越贴近原本被截掉的那条路径
-  return hits.sort((a, b) => String(a).length - String(b).length)[0];
+    if (!n || n === want || !n.startsWith(want)) continue;
+    if (isDir(c)) return c;
+  }
+  return decoded;
 }
 
 /**
  * genie-history 下每个 base64 目录 = 一个工程（目录名解出来就是工程绝对路径；
  * 长度超过 48 字节的路径会被扩展截断，靠 candidates 补全，见 completeTruncatedWorkspace）。
  * @param {string} storage 插件落盘根
- * @param {string[]} [candidates] 已知的真实工程路径
+ * @param {string[]} [candidates] 已知的真实工程路径，按可信度排序（越靠前越优先）
  * @returns {Array<{dir: string, path: string, project: string}>}
  */
 function collectProjects(storage, candidates = []) {
@@ -2143,8 +2147,9 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const meta = new Map();
   const perProjectCurrent = new Map(); // 工程路径 -> 该工程 current.json 指向的会话 id
   let currentId = '';
-  // candidates 传"当前工程 + 本次查询的工程"：genie-history 目录名可能被扩展截断，
-  // 用它俩把半截路径补回完整路径（否则工程名会显示成被截断后的残尾，见 completeTruncatedWorkspace）
+  // candidates 传"真实活动工程 + 本次查询的工程"，顺序即优先级（ws 放最前）：
+  // genie-history 目录名可能被扩展截断，用它俩把半截路径补回完整路径，且只补到磁盘上真实存在的
+  // 目录（否则工程名会显示成被截断后的残尾、currentId 落空，见 completeTruncatedWorkspace）
   for (const p of collectProjects(storage, [ws, workspacePath])) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
@@ -2358,6 +2363,7 @@ module.exports = {
   nonCopilotSessionIds, // 别的产品的落盘认领了哪些会话 id（9F 清理张冠李戴的历史行用）
   findPluginStorage,
   decodeDirName,
+  completeTruncatedWorkspace, // 被截断的 genie-history 目录名 → 完整工程路径（回归测试直接盯它）
   reporterMainPhase,
   freshestReporterWs,
   readReporterPhase, // 主控制台那口实时相位（打断后作废的逻辑在这里，回归测试直接盯它）

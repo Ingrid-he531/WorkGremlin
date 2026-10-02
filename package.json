@@ -60,6 +60,7 @@
     "test:claude-cancel": "node server/test/claudeCancel.test.js",
     "test:cancel-flush": "node server/test/cancelFlush.test.js",
     "test:project-attribution": "node server/test/projectAttribution.test.js",
+    "test:truncated-ws": "node server/test/truncatedWorkspace.test.js",
     "test:cancel": "node server/test/interruptCancel.test.js",
     "test:codebuddy-cancel": "node server/test/codebuddyCancel.test.js",
     "test:final-stop": "node server/test/finalStop.test.js",
