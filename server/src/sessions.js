@@ -2067,7 +2067,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
  * 常见的 macOS/Linux 家目录路径短于 48 字符，看不出这个问题 —— 是 Windows（长路径）专属坑。
  * 目录里也没别处存完整路径（current.json 只有 conversationId，conversations/<id> 是空壳），
  * 所以只能拿"已知的真实工程"做前缀补全：解出的半截在磁盘上不是目录时，就在候选里找一条
- * 以它为前缀、**且磁盘上真实存在**的目录补上。补不上就原样返回，不影响没被截断的机器。
+ * 以它为前缀的补上（优先磁盘上真实存在的目录）。补不上就原样返回，不影响没被截断的机器。
  *
  * @param {string} decoded decodeDirName 的结果
  * @param {string[]} candidates 已知的真实工程路径，**按可信度排序**：越靠前越优先
@@ -2079,17 +2079,22 @@ function completeTruncatedWorkspace(decoded, candidates) {
   if (!decoded || isDir(decoded)) return decoded; // 磁盘上真有这个目录 = 没被截断
   const want = norm(decoded);
   if (!want) return decoded;
-  // 顺序即优先级，先中即用：候选里第一条"以半截串为前缀（截断=纯前缀截断）且磁盘上真是目录"
-  // 就是答案。不做"取最短"——两条候选共享同一截断前缀时，按长短挑会挑错工程；按可信度排序
-  // 才能保证真实活动工程（ws，放最前）优先补上，`p.path === ws` 才成立。
-  // 要求 isDir：绝不把不存在的路径当工程根返回（对齐"绝不编造"）。
+  // 顺序即优先级：候选里第一条"以半截串为前缀（截断=纯前缀截断）"就是答案。不做"取最短"——
+  // 两条候选共享同一截断前缀时，按长短挑会挑错工程；按可信度排序才能保证真实活动工程（ws，
+  // 放最前）优先补上，`p.path === ws` 才成立。
+  // isDir 只作**优先判据，不作硬门槛**：优先补到磁盘上真实存在的目录，都没有就按顺序退回第一条命中。
+  // 若拿 isDir 当硬门槛，工程目录被删 / 改名 / 网络盘 stat 不到时半截路径就补不回来 —— 正是 ec10df
+  // 要修的那个 bug 复发（currentId 落空、主控制台丢相位）。宁可补一条"前缀对得上但目录不在"的
+  // 路径，也不回到半截残尾。
+  let fallback = '';
   for (const c of candidates || []) {
     if (!c) continue;
     const n = norm(c);
     if (!n || n === want || !n.startsWith(want)) continue;
     if (isDir(c)) return c;
+    if (!fallback) fallback = c;
   }
-  return decoded;
+  return fallback || decoded;
 }
 
 /**
@@ -2148,8 +2153,8 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const perProjectCurrent = new Map(); // 工程路径 -> 该工程 current.json 指向的会话 id
   let currentId = '';
   // candidates 传"真实活动工程 + 本次查询的工程"，顺序即优先级（ws 放最前）：
-  // genie-history 目录名可能被扩展截断，用它俩把半截路径补回完整路径，且只补到磁盘上真实存在的
-  // 目录（否则工程名会显示成被截断后的残尾、currentId 落空，见 completeTruncatedWorkspace）
+  // genie-history 目录名可能被扩展截断，用它俩把半截路径补回完整路径（优先磁盘上真实存在的目录），
+  // 否则工程名会显示成被截断后的残尾、currentId 落空，见 completeTruncatedWorkspace
   for (const p of collectProjects(storage, [ws, workspacePath])) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';

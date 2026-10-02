@@ -133,8 +133,20 @@ ok('候选里没有前缀命中 → 原样返回', completeTruncatedWorkspace(de
 ok('候选命中 → 补成完整路径', completeTruncatedWorkspace(decoded, [WS]) === WS);
 // 候选里那条正好等于截断串本身 → 不算命中（否则会把半截串当补全目标）
 ok('候选等于半截串本身 → 跳过它，取另一条', completeTruncatedWorkspace(decoded, [decoded, WS]) === WS);
-// 要求 isDir：命中前缀但磁盘上没有该目录 → 原样返回，绝不编造不存在的工程根
-ok('命中前缀但磁盘上没有该目录 → 原样返回（不编造）', completeTruncatedWorkspace(decoded, [`${WS}-nope`]) === decoded);
+// isDir 只作优先判据，不作硬门槛：命中前缀但磁盘上没有该目录 → 仍然补上，
+// 不能因为 stat 不到就退回半截残尾（那正是 ec10df 要修的 bug 复发）
+ok('命中前缀但磁盘上没有该目录 → 仍补上（isDir 不是硬门槛）', completeTruncatedWorkspace(decoded, [`${WS}-nope`]) === `${WS}-nope`);
+// isDir 优先：顺序在前的那条不存在时，让位给后面真实存在的那条
+{
+  const gBase = path.join(TMP, 'ghost', 'ghost-project-name-here');
+  const gMissing = `${gBase}-one`; // 不建目录
+  const gReal = `${gBase}-two`; // 真建目录
+  fs.mkdirSync(gReal, { recursive: true });
+  const gPart = gBase.slice(0, gBase.length - 4); // 半截串：两条都以它为前缀，它本身不是目录
+  ok('半截串本身不是目录（前提）', !fs.existsSync(gPart));
+  ok('顺序在前但不存在 → 让位给后面真实存在的', completeTruncatedWorkspace(gPart, [gMissing, gReal]) === gReal);
+  ok('两条都不存在 → 退回顺序第一条（不硬失败）', completeTruncatedWorkspace(gPart, [gMissing, `${gPart}-x`]) === gMissing);
+}
 // 顺序即优先级：两条候选共享同一截断前缀时，用排在前面的那条（不做"取最短"）
 {
   const common = path.join(TMP, 'collide', 'long-project-name-here');
