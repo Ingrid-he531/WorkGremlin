@@ -49,6 +49,7 @@ const WORDS = {
     agreed: '达成一致', noStance: '未表态', truncated: '已截断', noAgreement: '到第 2 轮上限仍未达成一致', notPassed: '没通过',
     reported: '已呈报', report: '分析简报', support: '支持', oppose: '反对', unsure: '不确定',
     points: '要点', risks: '风险', questions: '存疑', noFindings: '没按约定给出要点',
+    voteAgree: '同意', voteObject: '反对', couldNotSpeak: '这一轮没能发言', pickSpeaker: '选看哪一层的发言',
     // "本轮达成一致"这一句只在**结果区**出现（'达成一致' 本身会撞上发起表单的提示文案，
     // 拿它当判据会把静态文案也算进去）
     reached: '本轮达成一致',
@@ -57,6 +58,7 @@ const WORDS = {
     agreed: 'agreed', noStance: 'no stance', truncated: 'truncated', noAgreement: 'No agreement within 2 rounds', notPassed: 'did not pass',
     reported: 'reported', report: 'Analysis briefing', support: 'support', oppose: 'oppose', unsure: 'unsure',
     points: 'Points', risks: 'Risks', questions: 'Open questions', noFindings: 'no points/risks/questions',
+    voteAgree: 'agree', voteObject: 'object', couldNotSpeak: 'could not speak this round', pickSpeaker: 'Choose whose reply to show',
     reached: 'agreed this round',
   },
 };
@@ -75,6 +77,23 @@ async function render(path, setup, props) {
     return { error: String((err && err.message) || err) };
   }
 }
+
+/**
+ * 从渲染出来的 HTML 里抠出挂某个 testid 的那一小块（含它自己的开标签，到 `</div>` 为止）。
+ * 用处：断言"这一排圆点上有什么、没什么"——按整页搜会搜到别处的同名文案，
+ * 比如简报里那几组也写着「支持 / 反对」。
+ *
+ * 注释要先剔掉：SSR 会**原样带上模板里的注释**（打包时才会去掉），
+ * 而注释里正写着「支持/反对」这几个字 —— 不剔就会把讲解当成人说的话。
+ */
+const regionOf = (html, testid) => {
+  const clean = html.replace(/<!--[\s\S]*?-->/g, '');
+  const at = clean.indexOf(`data-testid="${testid}"`);
+  if (at < 0) return '';
+  const start = clean.lastIndexOf('<div', at);
+  const end = clean.indexOf('</div>', at);
+  return clean.slice(start, end < 0 ? clean.length : end);
+};
 
 const TASK = {
   id: 't1',
@@ -264,6 +283,21 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     ok(`议事厅：超时算作未表态（${W.noStance} 1），没有变成同意`, won.includes(`${W.noStance} 1`));
     ok(`议事厅：材料截断有标注（${W.truncated}）`, won.includes(W.truncated));
     ok('议事厅：请不动的楼层写着原因', won.includes('没找到可执行文件'));
+
+    // 一轮里好几层各说一大段，全摊开是一屏接一屏的正文，"谁说了什么"反而找不着 ——
+    // 所以一轮只摊开一个人的，上面一排圆点选是谁。**收起来的是正文，不是事实**：
+    // 票型与"这轮没能发言"必须留在那一行上，否则折叠就成了掩盖。
+    const picks1 = regionOf(won, 'cv-picks-1');
+    const picks2 = regionOf(won, 'cv-picks-2');
+    ok('议事厅：一轮里的人摆成一排，可单选（radio）',
+      picks1.includes('type="radio"') && picks1.includes(W.pickSpeaker));
+    ok('议事厅：选中的那位在下面摊开，没选的那层正文不出现',
+      won.includes('我觉得可以') && !won.includes('不行，得限定幂等'));
+    ok('议事厅：收起来的那几层，票型照旧挂在那一行上',
+      picks1.includes(W.voteAgree) && picks1.includes(W.voteObject));
+    ok('议事厅：没能发言的那层，收起来也看得见（不是收起来就当没发生）', picks1.includes(W.couldNotSpeak));
+    ok('议事厅：每一轮的圆点各自成组（同一轮单选，不同轮不互相踢）',
+      picks2.includes('type="radio"') && picks1.includes('name="cv-pick-1"') && picks2.includes('name="cv-pick-2"'));
   }
 
   const lost = await render('/src/views/CouncilView.vue', seedCouncil(NO_CONSENSUS));
@@ -271,7 +305,10 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
   if (typeof lost === 'string') {
     ok(`议事厅：没谈成就写没谈成（${W.noAgreement}）`, lost.includes('cv-no-conclusion') && lost.includes(W.noAgreement));
     ok('议事厅：没谈成时**不**出现结论区块', !lost.includes('cv-conclusion'));
-    ok(`议事厅：最后一轮那份提案照样摆出来，但标明${W.notPassed}`, lost.includes(W.notPassed) && lost.includes('上限提到 5，但只对幂等操作生效'));
+    // 桌上最后是这份、没通过 —— 这一块来自服务端的轮次记录，不受"一轮只摊开一个人"影响
+    const lastProposal = regionOf(lost, 'cv-last-proposal');
+    ok(`议事厅：最后一轮那份提案照样摆出来，但标明${W.notPassed}`,
+      lastProposal.includes(W.notPassed) && lastProposal.includes('把重试上限从 3 提到 5 吗'));
     ok(`议事厅：各方最后立场列出来了（${W.noStance}）`, lost.includes(W.noStance));
   }
 
@@ -305,6 +342,16 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     // 工作目录要摆出来：事后来看"他们在哪儿谈的"是理解这场会的前提
     ok('议事厅：标题区显示了工作目录', rep.includes('cv-workspace-show') && rep.includes('/home/me/proj'));
     ok('议事厅：历史/标题上有谈法角标', rep.includes('cv-mode-badge'));
+
+    // 分析议题里**不许**在楼层名字右边贴「支持/反对」：那会让分析看起来像在投票
+    // （立场归上面那份简报按组说，轮次标题上的那句合计也还在）。
+    const aPicks = regionOf(rep, 'cv-picks-2');
+    if (process.env.DBG) console.log('DBG aPicks 支持?', aPicks.includes('支持'), '反对?', aPicks.includes('反对'), 'len', aPicks.length, 'tail', JSON.stringify(aPicks.slice(-400)));
+    ok('议事厅：分析模式的圆点行上不出现「支持/反对」',
+      aPicks.includes('type="radio"') && !aPicks.includes(W.support) && !aPicks.includes(W.oppose) && !aPicks.includes(W.unsure));
+    ok('议事厅：分析模式的简报里立场照旧分组写着（不是整页都不许提）',
+      rep.includes('cv-group-support') && rep.includes(W.support));
+    ok('议事厅：分析模式没能发言的那层也没被折叠掉', aPicks.includes(W.couldNotSpeak));
   }
 }
 

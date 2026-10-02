@@ -652,6 +652,7 @@ CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
 | **COUNCIL-18** | **工程模式的两道隔离锁** | ①四层配方（两种 allow）的 `env` 都带 `WORKGREMLIN_DISABLE=1`；hook 认到就**原地退出**（不连服务端、不写状态文件、退出码 0），插件两条入口都认（返回的形状不许变，否则 7F 会当成"插件加载失败"）；②7F/8F 配方发的 `--title` = 会话清单过滤的那个标题 —— 同库同工程里**用户会话照常列出、只有参与者那条被挡住** | `test:council-agents`、`test:claude-hook`、`test:council-quiet-plugin`、`test:kilo`、`test:opencode` |
 | **COUNCIL-19** | 老库迁移 | 没有 `mode` / `workspace_path` 的老库 → 补列且行为**不变**（`vote` / NULL），老行原样读得出来；`verdict` 的 CHECK 重建之后 `reported` 写得进去 | `test:council-store` |
 | **COUNCIL-20** | 分析模式的界面 | 分组按 `支持 → 反对 → 不确定 → 未表态` 固定顺序、只渲染非空组、`points/risks/questions` 原文照录；**有立场但没给要点**单独标一句；**不出现共识横幅与票型**；老 fixture（没有 `mode`）不许被新分支命中 | `test:render-smoke`、`test:council-timeline` |
+| **COUNCIL-21** | **一轮只摊开一个人的发言**（2026-10-02） | 一轮的发言摆成一排 radio **单选** —— 同一轮同一组、不同轮各成一组（选这轮不许把上轮的选择踢掉）；**只渲染选中那一位的正文**，没选的那几层正文一个字都不出现；但**收起来的是正文不是事实**：表决模式的票型、附议、"这轮没能发言"照旧挂在那一行上（超时那层收起来也得看得见）；**分析模式的这一排上不许出现「支持 / 反对 / 不确定」**，立场只在简报里分组说 | `test:render-smoke` |
 
 ### 3.16.2 人工烟测（自动化覆盖不到的部分）
 

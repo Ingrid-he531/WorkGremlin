@@ -9,7 +9,7 @@
  *   · 材料截断了就在材料清单里写明"原文多少字节、只给了多少"；
  *   · 没谈成就大大方方写「未达成一致」并列出各自最后的立场，不合成一份"结论"。
  */
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useCouncilStore } from '../stores/council';
 import { useI18n } from '../i18n';
 import { voteKey, stanceKey, tokenTotal } from '../lib/councilTimeline';
@@ -131,6 +131,31 @@ const findingRows = (u) => {
     .filter(([, v]) => Array.isArray(v) && v.length)
     .map(([k, v]) => ({ k, v }));
 };
+
+/* ------------------------------------------------------- 一轮里看谁的发言 */
+
+/**
+ * 一轮里可能有好几层各说了一大段，全摊开就是一屏接一屏的正文，"谁说了什么"反而找不着。
+ * 所以一轮**一次只摊开一个人的**，上面一排圆点选是谁 —— 收起来的是正文，不是事实：
+ * 票型（表决模式）与"这轮没能发言"照旧留在那一行上，谁也不许被折叠掉。
+ *
+ * 键是轮次号，值是楼层。没选过、或选的那一层在这一轮里没了 → 退回本轮第一位，
+ * **绝不空着**：一轮里一个人都不显示，看起来就像这轮没人说话。
+ */
+const picked = reactive({});
+const shownId = (g) => {
+  const want = picked[g.roundNo];
+  return g.utterances.some((u) => u.floorId === want) ? want : g.utterances[0] && g.utterances[0].floorId;
+};
+const shown = (g) => g.utterances.filter((u) => u.floorId === shownId(g));
+/** 第 0 轮只有主席在陈述议题，没有"选谁"这回事，就别摆一排只有一个选项的圆点 */
+const hasPicks = (g) => g.utterances.length > 1 || (g.utterances.length === 1 && g.utterances[0].role !== 'chair');
+
+/** 换一场会就把选择清空：上一场选的 7F 不该管到这一场 */
+watch(
+  () => (store.current ? store.current.council.id : null),
+  () => Object.keys(picked).forEach((k) => delete picked[k]),
+);
 
 const fmtBytes = (n) => (n == null ? '—' : `${n.toLocaleString()}`);
 
@@ -384,7 +409,7 @@ function confirmRemove(id) {
           </ul>
           <!-- 最后一轮桌上那份也要摆出来（可追溯），但**标明它没通过** ——
                不能长得跟上面那个「结论」区块一样，否则会被当成谈成了什么 -->
-          <div v-if="store.currentProposal" class="last-proposal">
+          <div v-if="store.currentProposal" class="last-proposal" data-testid="cv-last-proposal">
             <p class="hint">{{ t('council.last_proposal', { round: store.currentProposal.roundNo }) }}</p>
             <blockquote class="quote notpassed">{{ store.currentProposal.proposal }}</blockquote>
           </div>
@@ -434,23 +459,54 @@ function confirmRemove(id) {
               </span>
             </div>
 
-            <article v-for="u in g.utterances" :key="u.floorId" class="said" :class="[u.status, u.role]">
-              <div class="line">
+            <!-- 一轮里选看谁的发言。收起来的只是正文，票型与"没答上来"照旧挂在行上 -->
+            <div
+              v-if="hasPicks(g)"
+              class="picks"
+              role="radiogroup"
+              :aria-label="t('council.pick_speaker')"
+              :data-testid="'cv-picks-' + g.roundNo"
+            >
+              <label
+                v-for="u in g.utterances"
+                :key="u.floorId"
+                class="pick"
+                :class="[{ on: shownId(g) === u.floorId }, u.status]"
+                :data-testid="'cv-pick-' + g.roundNo + '-' + u.floorId"
+              >
+                <input
+                  type="radio"
+                  :name="'cv-pick-' + g.roundNo"
+                  :value="u.floorId"
+                  :checked="shownId(g) === u.floorId"
+                  @change="picked[g.roundNo] = u.floorId"
+                />
                 <span class="fid">{{ u.floorId }}</span>
                 <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
-                <!-- 两种谈法各标各的：表决标票型、分析标立场。都没解析出来就是「未表态」 -->
-                <span
-                  v-if="u.role !== 'chair'"
-                  class="v"
-                  :class="'v-' + (store.mode === 'analysis' ? stanceKey(u.stance) : voteKey(u.vote))"
-                >
-                  {{
-                    store.mode === 'analysis'
-                      ? t('council.stance.' + stanceKey(u.stance))
-                      : t('council.vote.' + voteKey(u.vote))
-                  }}
+                <!-- 票型只标在表决模式。分析模式的立场在上面那份简报里按组写着 ——
+                     把「支持/反对」贴在楼层名字右边，会让人以为分析也是在投票 -->
+                <span v-if="store.mode === 'vote' && u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
+                  {{ t('council.vote.' + voteKey(u.vote)) }}
                 </span>
-                <span v-if="u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
+                <span v-if="store.mode === 'vote' && u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
+                <!-- 没能发言的那一层：正文收起来了，这件事也不能跟着看不见。
+                     原因（error 原文）挂在 title 上就地可取；出席那一栏里也照旧列着全文 -->
+                <span v-if="u.status !== 'ok'" class="bad" :title="u.error || ''">
+                  {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
+                </span>
+              </label>
+            </div>
+
+            <article v-for="u in shown(g)" :key="u.floorId" class="said" :class="[u.status, u.role]">
+              <!-- 只有一处发言时（第 0 轮的主席陈述）没有上面那排圆点，署名就得自己写在这儿 -->
+              <div v-if="!hasPicks(g)" class="line">
+                <span class="fid">{{ u.floorId }}</span>
+                <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
+                <!-- 同上：分析模式不在楼层右边贴立场 -->
+                <span v-if="store.mode === 'vote' && u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
+                  {{ t('council.vote.' + voteKey(u.vote)) }}
+                </span>
+                <span v-if="store.mode === 'vote' && u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
                 <span class="spacer" />
                 <span v-if="metaOf(u)" class="meta dim">{{ metaOf(u) }}</span>
               </div>
@@ -745,6 +801,25 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .rno { font-size: 12px; color: var(--text-dim); font-weight: 600; }
 .tally { font-size: 11px; color: var(--text-faint); }
 .won { font-size: 11px; color: var(--state-online); }
+
+/* 一轮里选看谁的发言：一排圆点，选中的那个在下面摊开正文 */
+.picks { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-bottom: 6px; }
+.pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.pick:hover { background: var(--bg-elevated); }
+.pick.on { background: var(--accent-soft); border-color: var(--border-strong); color: var(--text); }
+.pick input { margin: 0; accent-color: var(--accent); }
+.pick.failed,
+.pick.timeout { color: var(--state-blocked); }
 
 .said {
   border: 1px solid var(--border);
