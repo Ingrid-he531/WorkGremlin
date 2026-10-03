@@ -17,8 +17,23 @@ import { voteKey, stanceKey, tokenTotal } from '../lib/councilTimeline';
 const store = useCouncilStore();
 const { t } = useI18n();
 
-const form = reactive({ topic: '', floors: [], files: '', maxRounds: 3, mode: 'vote', workspace: '' });
+/**
+ * 角色分配：主持人、主答各一人，参会者可多选。
+ * 向后兼容：提交时把三种角色的楼层合并成 floors 数组发给服务端，
+ * 服务端暂时不区分角色（等后续再改 orchestrator）。
+ */
+const form = reactive({
+  topic: '',
+  chair: '',
+  mainAnswerer: '',
+  participants: [],
+  files: '',
+  maxRounds: 3,
+  mode: 'vote',
+  workspace: '',
+});
 const formError = ref('');
+const showAdvanced = ref(false);
 
 onMounted(async () => {
   await store.fetchFloors();
@@ -31,11 +46,13 @@ const floorName = (id) => {
   return f ? f.name : id;
 };
 
-const toggleFloor = (id) => {
-  const at = form.floors.indexOf(id);
-  if (at >= 0) form.floors.splice(at, 1);
-  else form.floors.push(id);
-};
+const readyFloors = computed(() => store.readyFloors);
+/** 参会者候选项：除主持人和主答之外的可用楼层 */
+const participantOptions = computed(() =>
+  readyFloors.value.filter((f) => f.floorId !== form.chair && f.floorId !== form.mainAnswerer),
+);
+/** 请不动的楼层（装了插件但没装 CLI 等），列出来并写明原因 */
+const notReadyFloors = computed(() => store.floors.filter((f) => !f.ready));
 
 const files = () => form.files.split('\n').map((s) => s.trim()).filter(Boolean);
 
@@ -45,7 +62,16 @@ async function submit() {
     formError.value = t('council.need_topic');
     return;
   }
-  if (form.floors.length < 2) {
+  if (!form.chair) {
+    formError.value = t('council.need_chair');
+    return;
+  }
+  if (!form.mainAnswerer) {
+    formError.value = t('council.need_main_answerer');
+    return;
+  }
+  const floors = [...new Set([form.chair, form.mainAnswerer, ...form.participants].filter(Boolean))];
+  if (floors.length < 2) {
     formError.value = t('council.need_two_floors');
     return;
   }
@@ -59,7 +85,7 @@ async function submit() {
   }
   const id = await store.create({
     topic: form.topic.trim(),
-    floors: form.floors,
+    floors,
     files: files(),
     maxRounds: Number(form.maxRounds) || store.defaults.maxRounds,
     mode: form.mode,
@@ -85,9 +111,6 @@ const lastDebate = computed(() => {
   const rounds = store.timeline.filter((g) => g.roundNo > 0);
   return rounds.length ? rounds[rounds.length - 1] : null;
 });
-
-/** 这场会是哪种谈法。老行没有 mode → 表决（那时候只有这一种，见 stores/council.js 的 mode） */
-const modeOf = (c) => ((c && c.mode) === 'analysis' ? 'analysis' : 'vote');
 
 const statusKey = (s) => (['draft', 'running', 'done', 'failed', 'cancelled'].includes(s) ? s : 'done');
 const verdictKey = (v) =>
@@ -172,6 +195,17 @@ const metaOf = (u) => {
 function confirmRemove(id) {
   if (window.confirm(t('council.delete_confirm'))) store.remove(id);
 }
+
+/** 历史列表里的时间：紧凑显示，今天的只看时分，更早的看月日+时分 */
+function fmtTime(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return sameDay ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
 </script>
 
 <template>
@@ -179,8 +213,6 @@ function confirmRemove(id) {
     <!-- ------------------------------------------------------------ 左栏：发起 + 历史 -->
     <aside class="side">
       <form class="compose" @submit.prevent="submit">
-        <h2 class="h2">{{ t('council.new') }}</h2>
-
         <label class="lbl" for="cv-topic">{{ t('council.topic') }}</label>
         <textarea
           id="cv-topic"
@@ -190,79 +222,114 @@ function confirmRemove(id) {
           :placeholder="t('council.topic_ph')"
         />
 
-        <label class="lbl" for="cv-mode">{{ t('council.mode') }}</label>
-        <select id="cv-mode" v-model="form.mode" class="sel" data-testid="cv-mode">
-          <option value="vote">{{ t('council.mode.vote') }}</option>
-          <option value="analysis">{{ t('council.mode.analysis') }}</option>
-        </select>
-        <p class="hint">{{ form.mode === 'analysis' ? t('council.mode_analysis_note') : t('council.mode_vote_note') }}</p>
-
-        <label class="lbl">{{ t('council.floors') }}</label>
         <p v-if="!store.canStart" class="why bad" data-testid="cv-no-floors">{{ t('council.empty_floors') }}</p>
-        <ul class="floors">
-          <li v-for="f in store.floors" :key="f.floorId" :class="{ off: !f.ready }">
-            <label :title="f.ready ? f.cliPath : f.reason">
-              <input
-                type="checkbox"
-                :value="f.floorId"
-                :checked="form.floors.includes(f.floorId)"
-                :disabled="!f.ready"
-                @change="toggleFloor(f.floorId)"
-              />
-              <span class="fid">{{ f.floorId }}</span>
-              <span class="fname">{{ f.name }}</span>
-              <span v-if="!f.ready" class="why">{{ t('council.floor_not_ready') }}</span>
-            </label>
-            <!-- 请不动的原因原样显示（"只装了 IDE 插件"和"没装"要分得开） -->
-            <p v-if="!f.ready" class="why dim">{{ f.reason }}</p>
+
+        <div class="role-row">
+          <label class="role-lbl" for="cv-chair">{{ t('council.role.chair') }}</label>
+          <select id="cv-chair" v-model="form.chair" class="sel" data-testid="cv-chair" :disabled="!readyFloors.length">
+            <option value="">{{ t('council.role.please_select') }}</option>
+            <option v-for="f in readyFloors" :key="f.floorId" :value="f.floorId">
+              {{ f.floorId }} · {{ f.name }}
+            </option>
+          </select>
+        </div>
+
+        <div class="role-row">
+          <label class="role-lbl" for="cv-main">{{ t('council.role.main_answerer') }}</label>
+          <select id="cv-main" v-model="form.mainAnswerer" class="sel" data-testid="cv-main" :disabled="!readyFloors.length">
+            <option value="">{{ t('council.role.please_select') }}</option>
+            <option
+              v-for="f in readyFloors"
+              :key="f.floorId"
+              :value="f.floorId"
+              :disabled="f.floorId === form.chair"
+            >
+              {{ f.floorId }} · {{ f.name }}
+            </option>
+          </select>
+        </div>
+
+        <div class="role-row">
+          <span class="role-lbl">{{ t('council.role.participants') }}</span>
+          <ul class="plist">
+            <li v-for="f in participantOptions" :key="f.floorId">
+              <label>
+                <input type="checkbox" :value="f.floorId" v-model="form.participants" />
+                <span class="fid">{{ f.floorId }}</span>
+                <span class="fname">{{ f.name }}</span>
+              </label>
+            </li>
+            <li v-if="!participantOptions.length" class="hint">{{ t('council.role.no_participants') }}</li>
+          </ul>
+        </div>
+
+        <ul v-if="notReadyFloors.length" class="floors">
+          <li v-for="f in notReadyFloors" :key="f.floorId" class="off">
+            <span class="fid">{{ f.floorId }}</span>
+            <span class="fname">{{ f.name }}</span>
+            <span class="why">{{ t('council.floor_not_ready') }}</span>
+            <p class="why dim">{{ f.reason }}</p>
           </li>
         </ul>
-        <p class="hint">{{ t('council.floors_hint') }}</p>
 
-        <label class="lbl" for="cv-files">{{ t('council.files') }}</label>
-        <textarea
-          id="cv-files"
-          v-model="form.files"
-          class="ta mono"
-          rows="2"
-          :placeholder="t('council.files_ph')"
-        />
-        <p class="hint">
-          {{ t('council.files_hint', { kb: Math.round((store.defaults.materialMaxBytes || 0) / 1024) }) }}
-        </p>
+        <div class="accordion" :class="{ open: showAdvanced }">
+          <button
+            type="button"
+            class="accordion-hd"
+            @click="showAdvanced = !showAdvanced"
+            :aria-expanded="showAdvanced"
+            data-testid="cv-advanced-toggle"
+          >
+            <span>{{ t('council.advanced') }}</span>
+            <span class="caret" aria-hidden="true">▸</span>
+          </button>
+          <div class="accordion-bd">
+            <label class="lbl" for="cv-files">{{ t('council.files') }}</label>
+            <textarea
+              id="cv-files"
+              v-model="form.files"
+              class="ta mono"
+              rows="2"
+              :placeholder="t('council.files_ph')"
+            />
+            <p class="hint">
+              {{ t('council.files_hint', { kb: Math.round((store.defaults.materialMaxBytes || 0) / 1024) }) }}
+            </p>
 
-        <label class="lbl" for="cv-workspace">{{ t('council.workspace') }}</label>
-        <input
-          id="cv-workspace"
-          v-model="form.workspace"
-          class="ta mono"
-          type="text"
-          data-testid="cv-workspace"
-          :placeholder="t('council.workspace_ph')"
-        />
-        <p class="hint">{{ t('council.workspace_hint') }}</p>
-        <p v-if="form.workspace.trim()" class="hint">
-          {{ t('council.workspace_timeout', { min: Math.round((store.defaults.workspaceTurnTimeoutMs || 0) / 60000) }) }}
-        </p>
+            <label class="lbl" for="cv-workspace">{{ t('council.workspace') }}</label>
+            <input
+              id="cv-workspace"
+              v-model="form.workspace"
+              class="ta mono"
+              type="text"
+              data-testid="cv-workspace"
+              :placeholder="t('council.workspace_ph')"
+            />
+            <p class="hint">{{ t('council.workspace_hint') }}</p>
+            <p v-if="form.workspace.trim()" class="hint">
+              {{ t('council.workspace_timeout', { min: Math.round((store.defaults.workspaceTurnTimeoutMs || 0) / 60000) }) }}
+            </p>
 
-        <div class="row">
-          <label class="lbl inline" for="cv-rounds">{{ t('council.rounds') }}</label>
-          <input
-            id="cv-rounds"
-            v-model.number="form.maxRounds"
-            class="num"
-            type="number"
-            min="1"
-            :max="store.defaults.maxRoundsLimit || 8"
-          />
+            <div class="row">
+              <label class="lbl inline" for="cv-rounds">{{ t('council.rounds') }}</label>
+              <input
+                id="cv-rounds"
+                v-model.number="form.maxRounds"
+                class="num"
+                type="number"
+                min="1"
+                :max="store.defaults.maxRoundsLimit || 8"
+              />
+            </div>
+            <p class="hint">{{ form.mode === 'analysis' ? t('council.rounds_note_analysis') : t('council.rounds_note') }}</p>
+
+            <p v-if="form.mode === 'vote'" class="hint">
+              {{ t('council.threshold') }}：{{
+                store.defaults.threshold === 'majority' ? t('council.threshold.majority') : t('council.threshold.unanimous')
+              }} —— {{ t('council.threshold_note') }}
+            </p>
+          </div>
         </div>
-        <p class="hint">{{ form.mode === 'analysis' ? t('council.rounds_note_analysis') : t('council.rounds_note') }}</p>
-
-        <p v-if="form.mode === 'vote'" class="hint">
-          {{ t('council.threshold') }}：{{
-            store.defaults.threshold === 'majority' ? t('council.threshold.majority') : t('council.threshold.unanimous')
-          }} —— {{ t('council.threshold_note') }}
-        </p>
 
         <p v-if="formError" class="why bad" data-testid="cv-form-error">{{ formError }}</p>
         <p v-if="store.error" class="why bad" data-testid="cv-store-error">{{ store.error }}</p>
@@ -282,10 +349,7 @@ function confirmRemove(id) {
             :class="{ on: council && council.id === c.id }"
             @click="store.open(c.id)"
           >
-            <span class="v" :class="'v-' + verdictKey(c.verdict || 'failed')">
-              {{ c.verdict ? t('council.verdict.' + verdictKey(c.verdict)) : t('council.status.' + statusKey(c.status)) }}
-            </span>
-            <span class="m" :title="t('council.mode.' + modeOf(c))">{{ t('council.mode.' + modeOf(c)) }}</span>
+            <span class="ctime">{{ fmtTime(c.created_at) }}</span>
             <span class="topic">{{ c.topic }}</span>
           </li>
         </ul>
@@ -637,6 +701,55 @@ input.ta { padding: 6px 8px; }
 .why { font-size: 11px; margin: 2px 0 0 22px; }
 .why.bad { color: var(--state-blocked); }
 
+/* ---- 角色分配 ---- */
+.role-row { margin-top: 8px; }
+.role-lbl {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.role-row .plist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.role-row .plist li { margin: 3px 0; }
+.role-row .plist label { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+
+/* ---- 手风琴折叠 ---- */
+.accordion {
+  margin-top: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-elevated);
+}
+.accordion-hd {
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.accordion-hd:hover { color: var(--text); }
+.accordion .caret {
+  font-size: 10px;
+  transition: transform 0.2s ease;
+}
+.accordion.open .caret { transform: rotate(90deg); }
+.accordion-bd {
+  padding: 0 10px 10px;
+  display: none;
+}
+.accordion.open .accordion-bd { display: block; }
+
 .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 .num {
   width: 56px;
@@ -675,6 +788,13 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 .history li:hover { background: var(--bg-elevated); }
 .history li.on { background: var(--accent-soft); }
+.history .ctime {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  min-width: 80px;
+}
 .history .topic {
   overflow: hidden;
   text-overflow: ellipsis;
