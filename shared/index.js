@@ -157,6 +157,9 @@ const HTTP_ROUTES = Object.freeze({
   TASK_END: '/api/v1/task/end',
   // 收工兜底（bug 3）：状态文件被并发覆盖丢了 taskId 时，hook 按会话回捞"当前在跑的任务"
   TASK_CURRENT: '/api/v1/task/current',
+  // 收工后补报 token：有些楼层（CodeBuddy 插件形态实测）usage 落盘比 Stop 晚得多，
+  // 收工那一刻读不到 → 等落盘了再来补一刀，只写 token 四列，不动这一行别的字段。
+  TASK_TOKENS: '/api/v1/task/tokens',
   STATUS: '/api/v1/status',
   MESSAGE: '/api/v1/message',
   FILE_TOUCH: '/api/v1/file/touch',

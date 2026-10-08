@@ -77,7 +77,8 @@
     "test:council-quiet-plugin": "node server/test/councilPluginQuiet.test.js",
     "test:council-timeline": "node renderer/test/councilTimeline.test.mjs",
     "test:council-ui-store": "node renderer/test/councilUiStore.test.mjs",
-    "test:all": "node scripts/run-tests.js"
+    "test:all": "node scripts/run-tests.js",
+    "test:token-backfill": "node server/test/tokenBackfill.test.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

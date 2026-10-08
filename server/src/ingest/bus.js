@@ -736,6 +736,43 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * 收工**之后**补报这一轮的 token（只写 token 四列，别的字段一个都不动）。
+   *
+   * 为什么要单开这一条、而不是再调一次 endTask：endTask 会重写 result / files / ended_at
+   * （`COALESCE` 挡不住显式的空字符串），补报时手上只有 token，一刀下去会把收工时落的
+   * 产出摘要和文件清单抹掉。
+   *
+   * 为什么要补：CodeBuddy **插件**形态（VS Code 扩展）那条 request 的 usage 落盘比 Stop
+   * 晚得多 —— 收工那一刻（甚至等 1.2s 之后）index.json 里它还是 `{state:'running'}`，
+   * 没有 startedAt 也没有 usage（本机实测：0c1f… 会话第一轮 Stop 于 14:12:41，
+   * 那条 request 直到第二轮开始之后才补上 usage）。所以收工时读不到真值不是"没数"，
+   * 是"数还没落到盘上" —— 等它落了再补一刀才是真值。
+   *
+   * 定位不到（会话里没有"收工了但没数"的行 / 起点对不上）就原样返回 ok，
+   * 一行都不写 —— 与"没数就是没数"同一条纪律：绝不写到别的轮次头上。
+   */
+  function backfillTaskTokens(p) {
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    const tk = normTokens(p.tokens);
+    if (tk.input == null && tk.output == null && tk.cacheRead == null && tk.cacheWrite == null) {
+      return { ok: true, skipped: 'no_tokens' };
+    }
+    const row = repo.runAwaitingTokens.get(project, normSession(p.sessionId), Number(p.startedAt) || 0);
+    if (!row) return { ok: true, skipped: 'no_run' };
+    repo.setTaskRunTokens.run({
+      id: row.id,
+      inputTokens: tk.input,
+      outputTokens: tk.output,
+      cacheReadTokens: tk.cacheRead,
+      cacheWriteTokens: tk.cacheWrite,
+    });
+    hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(row.id));
+    return { ok: true, taskId: row.id };
+  }
+
+  /**
    * 台账：记一次召唤（subagent 实例）的开场。
    * 有小工位的（susan）和没工位的（code-explorer / 内置专家直接 spawn 的）都记 ——
    * 「这一轮用了几个 subagent」这条账就是靠它。
@@ -1212,6 +1249,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     startTask,
     taskProgress,
     endTask,
+    backfillTaskTokens,
     recordMessage,
     fileTouch,
     toolUse,

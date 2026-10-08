@@ -65,6 +65,16 @@ function createIngestRouter({ bus }) {
     projectFirst((b) => (b.memberId && b.taskId ? bus.endTask(b) : { ok: false, error: 'missing memberId/taskId' }))
   );
 
+  /* 收工后补报 token：有些楼层的 usage 落盘比 Stop 晚（CodeBuddy 插件形态实测），
+     收工那一刻读不到真值 —— 等它落盘了用这条补一刀，只写 token 四列（见 bus.backfillTaskTokens）。
+     定位不到该补哪一行时服务端原样返回 ok（不写），所以这条可以放心重试。 */
+  router.post(
+    '/task/tokens',
+    projectFirst((b) =>
+      b.memberId && b.tokens ? bus.backfillTaskTokens(b) : { ok: false, error: 'missing memberId/tokens' }
+    )
+  );
+
   // 收工兜底（bug 3）：状态文件被并发覆盖丢了 taskId 时，hook 用这条回捞当前任务再收工。
   router.post(
     '/task/current',

@@ -624,6 +624,31 @@ function createRepo(db) {
         cache_write_tokens = @cacheWriteTokens
       WHERE id = @id
     `),
+    /**
+     * 待补 token 的那一行 —— 收工后补报 token 用（见 bus.backfillTaskTokens）。
+     *
+     * 认领线索："会话 + 起点附近 + 四列全空"，取最近开始的那一轮。
+     *
+     * 为什么按"会话 + 起点附近"认、而不是按 taskId：补报的那一刻 hook 手上没有 taskId
+     * （状态文件收工时就清了），只有"上一轮从哪开始"这个时刻。而 task_runs.started_at 是
+     * 服务端写的、hook 那份是自己记的，两者差一个 HTTP 往返（几毫秒到几十毫秒），
+     * 精确等值匹配**必然**对不上 —— 所以按 ±10s 认。
+     *
+     * 为什么**不**要求 ended_at IS NOT NULL（早期版本的限制）：被取消 / 打断的那一轮，
+     * 收工流程可能在 taskId 被并发清掉时没跑成功（真实案例：10-08 13:40 一条 codebuddy CLI
+     * 任务，ended_at 一直空着、token 全空），它在"会话 + 起点 + 四列全空"这条线索上和别的可补行
+     * 并无二致 —— 取消 ≠ 没消耗 token，这类行一样要补。约束交给调用时机即可：补报只在
+     * Stop（已收工）之后、或下一轮 UserPromptSubmit（上一轮上下文已结束）时发起，不会误伤真在跑的任务。
+     * 认不出（会话里没有这种行 / 起点对不上）就不补：宁可留 "—"，也不写到别的轮次头上。
+     */
+    runAwaitingTokens: db.prepare(`
+      SELECT id FROM task_runs
+      WHERE project_id = ? AND session_id = ?
+        AND input_tokens IS NULL AND output_tokens IS NULL
+        AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+        AND ABS(COALESCE(started_at, 0) - ?) < 10000
+      ORDER BY started_at DESC LIMIT 1
+    `),
     listTaskRuns: db.prepare(`
       SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?
     `),

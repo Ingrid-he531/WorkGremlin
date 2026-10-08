@@ -6,7 +6,7 @@ const express = require('express');
 const { DEFAULTS } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
-const { resolveSessionTitle } = require('../../sessionTitle');
+const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessionTitle');
 
 /**
  * 楼层筛选参数 → client 列表。
@@ -198,18 +198,24 @@ function createQueryRouter({ bus, repo }) {
       )
       .all(args);
 
+    // 兜底的会话标题（会话第一轮的用户原话）：先按这批任务的 session_id 一次查完，
+    // 别在 map 里逐条开查询（2000 条 × 一次查询 = 拖垮这个接口）。
+    const firstPrompts = sessionFirstPrompts(repo.raw, rows.map((r) => r.session_id));
+
     const items = rows.map((r) => ({
       ...r,
       duration_ms: r.ended_at && r.started_at ? r.ended_at - r.started_at : null,
       subagentCount: repo.countSubagentRuns.get(r.id).c,
       /**
-       * 会话标题（agent 自动生成的摘要）。只对 7F Kilo / 8F OpenCode / 6F Qoder 有值：
-       * 它们各自的 SQLite 里存了独立的 session.title，与用户原话不同。
-       * 其他楼层（1F/2F/3F/4F/5F/9F）没有独立会话标题 → 这里如实回空，
-       * 前端退回 promptOf(t)（用户原话，已存在 tasks.title）。
-       * 取不到（库没装 / session_id 为空）一律空串，绝不编造。
+       * 会话标题：**会话级**的名字，同一 session_id 的所有任务拿到同一个值 ——
+       * 凭它把同一会话的多轮任务认出来（一轮一行任务，各轮标题互不相同）。
+       * 取值顺序：
+       *   1. 楼层自己的 SQLite 会话标题（7F Kilo / 8F OpenCode / 6F Qoder，agent 起的摘要）；
+       *   2. 兜底 = 这条会话**第一轮**的用户原话（其余楼层：会话开始时的标题就是用户原话）。
+       * 两者都拿不到（没有 session_id / 库里没那一轮）一律空串，绝不编造 ——
+       * 前端这时不显示那一行。
        */
-      session_title: resolveSessionTitle(r.session_id, r.client),
+      session_title: resolveSessionTitle(r.session_id, r.client) || firstPrompts.get(String(r.session_id || '').trim()) || '',
       /**
        * 任务详情「工程」显示的名字：按工程**目录**现算（`package.json name > 目录名`，
        * 与"打开工程"同一口径），拿不到目录/读不到 name 才退回库里那行 projects.name。

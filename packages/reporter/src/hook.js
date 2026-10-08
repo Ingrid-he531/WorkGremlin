@@ -53,7 +53,9 @@ const { spawn, execSync } = require('node:child_process');
 
 const { readServerInfo, HTTP_ROUTES } = require('./index');
 // 本轮消耗的 token（读会话落盘的真值，读不到回 null → 服务端留 NULL）。见 usage.js 头部。
-const { turnTokens } = require('./usage');
+// 用 turnTokensSettled 而不是 turnTokens：CodeBuddy **插件**形态那份 usage 比 Stop 晚 30~50ms
+// 才落盘（见 usage.js 的实测记录），只读一次必然扑空 —— 那样插件形态永远是 "—"。
+const { turnTokens, turnTokensSettled } = require('./usage');
 const { fnv1a32 } = require('@workgremlin/shared');
 // 进程间互斥 + 原子写：CLI 会在同一毫秒并行触发多个 hook 进程，各写各的会互相覆盖
 // （见 fslock.js 头部的实测记录）。writeState / updateState / updateFeedFile 都走这里。
@@ -1746,8 +1748,20 @@ async function main() {
   const finishCancelled = async (ev0) => {
     // 被打断的这一轮：之后再来一句 user，本轮回复就永远落在"上一条 user 之前"了 —— 先补一刀留档。
     const st0 = readState(file);
-    const taskId0 = st0.taskId || '';
-    const startedAt0 = Number(st0.taskStartedAt) || 0;
+    let taskId0 = st0.taskId || '';
+    let startedAt0 = Number(st0.taskStartedAt) || 0;
+    // 兜底（同 Stop 分支 bug 3）：状态文件的 taskId 被并发覆盖清掉时，下面 `if (taskId0)` 会整段跳过，
+    // 这一轮就被丢成"取消没收工、ended_at 一直空" —— 报表里既没结束时间也没时长（10-08 13:40 那条
+    // codebuddy CLI 任务正是这样）。这里同 Stop 一样向服务端回捞"本成员 + 本会话当前在跑的任务"，
+    // 拿回来照常按 cancelled 收尾，结束时间 = 标记取消的那一刻（而非无限期 running）。
+    if (!taskId0) {
+      const cur = await request(info, HTTP_ROUTES.TASK_CURRENT, { ...base, memberId: AGENT });
+      if (cur && cur.taskId) {
+        taskId0 = cur.taskId;
+        if (!startedAt0 && cur.startedAt) startedAt0 = Number(cur.startedAt) || 0;
+        trace('task-recover-cancel', { agent: AGENT, taskId: taskId0, sessionId: st0.sessionId || '' });
+      }
+    }
     const replies0 = turnReplies(ev0.transcript_path || st0.transcriptPath || '');
     await reportAiReplies(info, base, AGENT, taskId0, replies0, String((ev0 && ev0.session_id) || st0.sessionId || ''), cl);
     sweepGhosts(file, REAL_WS, cl);
@@ -1759,7 +1773,7 @@ async function main() {
       /* 本轮消耗的 token：与 Stop 那条同源同口径（见 usage.js）。**被打断 ≠ 没消耗** ——
          掐掉之前真跑过的那几次请求是花了 token 的，读得出就按真值落库；读不出整块不带，
          服务端那一行留空（更是**不动**已有的值，见 bus.endTask）。 */
-      const tokens0 = turnTokens(ev0.transcript_path || st0.transcriptPath || '', startedAt0);
+      const tokens0 = await turnTokensSettled(ev0.transcript_path || st0.transcriptPath || '', startedAt0);
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
         memberId: AGENT,
@@ -1849,6 +1863,9 @@ async function main() {
       debug('注入消息，不当新一轮任务：', String(ev.prompt).slice(0, 60));
       return;
     }
+    /* 上一轮的"完成"标记先留一份：里面带着上一轮的开始时刻，补报 token 要用。
+       必须在下面 clearAwait 之前读 —— 那一刀会把 done 也一起清掉。 */
+    const prevDone = (readState(file) || {}).done || null;
     // 新一轮用户输入 = 上一轮已经结束：Task 是阻塞工具，轮次一结束它就不可能在飞了。
     // 结束事件可能丢（实测：打断时 PostToolUse / SubagentStop 都不来），这里兜底扫掉。
     sweepGhosts(file, REAL_WS, cl);
@@ -1881,6 +1898,10 @@ async function main() {
       patch.taskStartedAt = Date.now();
     }
     writeState(file, patch);
+    /* 上一轮收工时没读到 token 的（CodeBuddy 插件形态：usage 落盘比 Stop 晚，收工那刻真的没有），
+       到这一刻肯定已经落盘了 —— 补一刀。服务端只在那一行 token 四列**全 NULL** 时才写
+       （见 bus.backfillTaskTokens），所以重复补也改不坏已有的真值。 */
+    await backfillPrevTokens(prevDone, String(ev.transcript_path || st0.transcriptPath || ''));
     // 进入"思考中"：直到下一个事件（PreToolUse / Notification / Stop）才切换
     writeState(file, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: REAL_WS } });
     // 用户刚提交：进入"思考中"，直到下一个事件（PreToolUse / Stop / Notification）才切换。
@@ -2042,6 +2063,51 @@ async function main() {
     return;
   }
 
+  /**
+   * 给**上一轮**补报 token（新一轮开始时用，见 tokenBackfill.js 里"为什么补"那段）。
+   *
+   * 上一轮的开始时刻来自收工落的那枚 done 标记；读不到 usage（这一家压根不落 token）
+   * 就什么都不发 —— 服务端那边按"会话 + 起点附近"认行，认不出就原样返回 ok，不写。
+   */
+  async function backfillPrevTokens(prevDone, transcriptPath) {
+    const startedAt = Number(prevDone && prevDone.startedAt) || 0;
+    if (!transcriptPath || !(startedAt > 0)) return;
+    const tokens = turnTokens(transcriptPath, startedAt);
+    if (!tokens) return;
+    await request(info, HTTP_ROUTES.TASK_TOKENS, { ...base, memberId: AGENT, startedAt, tokens });
+  }
+
+  /**
+   * 收工那一刻没读到 token 时，放一个小工在外面等落盘再补报（见 tokenBackfill.js）。
+   *
+   * 只有"知道本轮从哪开始 + 有会话落盘路径"才起小工：两样缺一样，补报就无从定位是哪一轮，
+   * 起了也是白跑。小工自己会重试几次，读不到就静静退出。
+   */
+  function spawnTokenBackfill(transcriptPath, startedAt) {
+    if (!transcriptPath || !(Number(startedAt) > 0)) return;
+    try {
+      const child = spawn(
+        process.execPath,
+        [
+          path.join(__dirname, 'tokenBackfill.js'),
+          JSON.stringify({
+            info,
+            project: ctx.project,
+            workspacePath: ctx.workspacePath,
+            sessionId: SESSION,
+            memberId: AGENT,
+            transcriptPath,
+            startedAt: Number(startedAt),
+          }),
+        ],
+        { detached: true, stdio: 'ignore' }
+      );
+      child.unref(); // 别拖住本进程退出：hook 收工就该走，补报在外头慢慢来
+    } catch {
+      /* 起不来就算了：这一轮 token 留空（显示 "—"），与主流程无关 */
+    }
+  }
+
   if (event === 'Stop') {
     /* clearAwait 撤的是"等权限 / 待认领"那一整块，会顺手把 done 也清掉 ——
        先留一份：判断这一轮是不是**刚被打断**（见下面 justCancelled）要看 Interrupt 落的那枚取消标记，
@@ -2110,9 +2176,17 @@ async function main() {
       const form = sessionForm(st, ev);
       /* 本轮消耗的 token：从 transcript 里读真值（见 usage.js）。
          必须在上面那次 taskId 回捞**之后**取 —— startedAt 是"本轮从哪开始"的唯一依据，
-         回捞回来的那份才准；取不到（Qoder 的 transcript 没有 usage、CodeBuddy 插件形态是
-         index.json、startedAt 未知…）就是 null，服务端留 NULL，报表显示 "—"。 */
-      const tokens = turnTokens(ev.transcript_path || st.transcriptPath || '', startedAt);
+         回捞回来的那份才准；取不到（Qoder 的 transcript 没有 usage、startedAt 未知…）
+         就是 null，服务端留 NULL，报表显示 "—"。
+         CodeBuddy **插件**形态（index.json）会在这里等那份晚到 30~50ms 的 usage 落盘
+         （turnTokensSettled），不等的话这一路永远是 "—"。 */
+      const tokens = await turnTokensSettled(ev.transcript_path || st.transcriptPath || '', startedAt);
+      /* 还是没读到（插件形态：扩展那份 usage 落盘比 Stop 晚得多，等 1.2s 也等不着）
+         → 放一个小工在外面等它落盘再补报（见 tokenBackfill.js）。
+         detached + unref：本 hook 进程退出后它照常活着；它只写 token 四列，
+         服务端认不出该补哪一行时原样返回 ok（不写），所以晚到 / 没到都无害。
+         起不来（沙箱 / 权限）就算了 —— 主流程不受影响。 */
+      if (!tokens) spawnTokenBackfill(ev.transcript_path || st.transcriptPath || '', startedAt);
       await request(info, HTTP_ROUTES.TASK_END, {
         ...base,
         memberId: AGENT,

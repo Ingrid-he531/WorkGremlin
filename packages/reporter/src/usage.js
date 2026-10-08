@@ -31,8 +31,13 @@
  * 两条纪律（对齐 requirements.md §P0-6「绝不编造」）：
  *   1. **Claude 家族一份 usage 会在 transcript 里重复落 2~5 行**（同一 `message.id`，
  *      一行一个 content block）。实测 1049 行只对应 403 个请求 —— 不去重就是几倍虚高。
- *   2. 认不出的形状（Qoder 的 transcript 根本没有 usage、CodeBuddy 插件形态的 index.json
- *      也没有）→ 返回 null，让那一行留空。
+ *   2. 认不出的形状（Qoder 的 transcript 根本没有 usage）→ 返回 null，让那一行留空。
+ *
+ * **CodeBuddy 插件形态走另一条路**（见 codebuddyRequestTokens）：transcriptPath 指向的
+ * index.json **不是 JSONL**（缩进过的多行 JSON，逐行 parse 必全败），usage 也不在正文里 ——
+ * 它在顶层 `requests[]` 上，一次用户请求一条，自带 startedAt 与 usage。
+ * 而这一份 usage **比 Stop 晚 30~50ms 才落盘**（实测 14/14 轮），所以 Stop 里要用
+ * turnTokensSettled 等它落盘，不能只读一次（只读一次 = 恒 null = 满屏 "—"）。
  */
 
 const fs = require('node:fs');
@@ -189,6 +194,60 @@ function codexDelta(rows, startedAt) {
 }
 
 /**
+ * CodeBuddy **插件**形态（VS Code 扩展）的本轮 token。
+ *
+ * transcriptPath 指向 `history/<会话>/index.json` —— 缩进过的多行 JSON，**按行 parse 必全败**，
+ * 正文在同目录 `messages/<id>.json`，而 usage 两者都没有：它在顶层 `requests[]` 上，一条请求一条：
+ *   { id, type, state, startedAt, usage: { inputTokens, outputTokens, cacheTokens,
+ *                                          cachedWriteTokens, cachedMissTokens, credit } }
+ * 口径同 OpenAI（本机 25 份 index.json / 572 条实测，0 例不符）：`inputTokens` **含**缓存命中，
+ *   恒有 inputTokens − cacheTokens − cachedWriteTokens === cachedMissTokens
+ * 所以照旧交给 normOpenAI 归一 —— 落库才与 CLI 形态那一家的口径一致（四项分列的语义统一）。
+ *
+ * **对轮（对人）的口径要特别小心**：request 由扩展先建、hook 后收到 UserPromptSubmit，
+ * 实测 request.startedAt 比本轮 startedAt **早 84~204ms**（16 轮全如此）。写成 >= startedAt
+ * 会把本轮的整条漏掉 —— 一条都捞不着，满屏就是 "—"。所以前后各留 GRACE_MS 的窗口。
+ * 窗口里取 startedAt 最大的那条：实测每个会话 tasks 与 requests **严格 1:1**（16/16、25/25、25/25），
+ * Stop 时刻最后一条必然就是本轮那条；若本轮的 usage 还没落盘，窗口为空 → null（宁可留 "—"）。
+ *
+ * **这一份 usage 落盘得比 Stop 晚**（"插件形态一直显示 —"的真正原因，2026-10-08 实测）：
+ *   · 轮次进行中，本轮那条 request 只有 `{ id, type, messages, state:'running' }` ——
+ *     **没有 startedAt、也没有 usage**（扩展要等这一轮彻底收尾才补上这两项）；
+ *   · 补上的时刻实测比服务端记的 ended_at **晚 31~51ms**（同一会话 14/14 轮全如此，
+ *     看 index.json 的 mtime 与 task_runs.ended_at 对得上）。
+ * 于是 Stop 里第一次读**必然**扑空 —— 窗口里一条都没有，与"这一轮没消耗"长得一样。
+ * 只有回头再读一次才拿得到，见 turnTokensSettled。
+ */
+const CB_REQ_GRACE_MS = 5_000;
+
+function codebuddyRequestTokens(indexPath, startedAt) {
+  let idx;
+  try {
+    idx = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  } catch {
+    return null; // 读不到 / 半截 JSON：本轮就是没数，不是 0
+  }
+  const reqs = Array.isArray(idx && idx.requests) ? idx.requests : [];
+  let best = null;
+  for (const r of reqs) {
+    if (!r || typeof r !== 'object') continue;
+    const ts = Number(r.startedAt);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts < startedAt - CB_REQ_GRACE_MS || ts > startedAt + CB_REQ_GRACE_MS) continue;
+    if (!best || ts > Number(best.startedAt)) best = r;
+  }
+  if (!best) return null;
+  const u = best.usage;
+  if (!u || typeof u !== 'object') return null;
+  return normOpenAI({
+    prompt_tokens: u.inputTokens,
+    prompt_cache_hit_tokens: u.cacheTokens,
+    prompt_cache_write_tokens: u.cachedWriteTokens,
+    completion_tokens: u.outputTokens,
+  });
+}
+
+/**
  * 这一轮消耗的 token。
  * @param {string} transcriptPath hook payload 的 `transcript_path`（或状态文件里缓存的那份）
  * @param {number} startedAt 本轮开始时刻（见 hook 状态文件的 taskStartedAt）
@@ -200,18 +259,58 @@ function turnTokens(transcriptPath, startedAt) {
   if (!file) return null;
   // 本轮从哪开始都不知道，就没法把 usage 归到这一轮头上（宁可留空）
   if (!(Number(startedAt) > 0)) return null;
-  // CodeBuddy **插件**形态的 transcriptPath 指向 history/<会话>/index.json，那份索引里
-  // 没有 usage（实测 377 字节，连 token 字样都没有）—— CLI 形态才落在 projects/*.jsonl。
-  if (/index\.json$/i.test(file)) return null;
+  const isCbIndex = /index\.json$/i.test(file);
+  // CodeBuddy **插件**形态：history/<会话>/index.json（缩进过的 JSON，不是 JSONL，
+  // 逐行 parse 必全败），usage 在顶层 requests[] 上 —— 走专门那条路（见 codebuddyRequestTokens）
+  if (isCbIndex) return finish(codebuddyRequestTokens(file, Number(startedAt)));
 
   const rows = parseLines(file);
   if (!rows) return null;
 
   const t = codexDelta(rows, Number(startedAt)) || requestSum(rows, Number(startedAt));
+  return finish(t);
+}
+
+/** 收尾同一把尺：取不到 → null；四项全零 → null（"一条都没读到"与"消耗为零"是两回事） */
+function finish(t) {
   if (!t) return null;
   // 四项全零 = 这一轮一条有效 usage 都没读到（Stop 早于落盘），留空而不是写 0
   if (t.input + t.output + t.cacheRead + t.cacheWrite <= 0) return null;
   return t;
 }
 
-module.exports = { turnTokens };
+/** CodeBuddy 插件形态：等那份"晚到的 usage"最多多久 / 每隔多久回头看一眼 */
+const CB_FLUSH_WAIT_MS = 1_200;
+const CB_FLUSH_STEP_MS = 120;
+
+/**
+ * 这一轮消耗的 token，**必要时等落盘**（只为 CodeBuddy 插件形态等）。
+ *
+ * 为什么要有这个函数：插件那条 request 的 usage 比 Stop 晚 31~51ms 才写进 index.json
+ * （见 codebuddyRequestTokens 的实测记录），而 Stop 里这一次读是**在 TASK_END 之前** ——
+ * 此刻窗口里一条 request 都没有，turnTokens 恒 null，报表就是满屏 "—"。
+ * 补读一次即可：实测差距只有几十毫秒，第一次回头（120ms）就命中。
+ *
+ * 只在这两处等：① 路径是插件那份 index.json；② 第一读确实扑空。其余形态（CLI 的 JSONL /
+ * Claude / Codex）落盘都早于 Stop，读一次就有 —— 不该为它们凭空加延迟。
+ * 等不到（被掐掉的轮次里扩展可能永远不补 / 这一轮真的一条 usage 都没有）就回 null，
+ * 与"没数就是没数"同一条纪律：绝不拿上一轮的数顶上。
+ *
+ * @param {string} transcriptPath
+ * @param {number} startedAt 本轮开始时刻（0 / 路径为空 → 立刻 null，连等都不等）
+ * @returns {Promise<{input:number, output:number, cacheRead:number, cacheWrite:number}|null>}
+ */
+async function turnTokensSettled(transcriptPath, startedAt) {
+  const file = String(transcriptPath || '');
+  const first = turnTokens(file, startedAt);
+  if (first || !file || !(Number(startedAt) > 0)) return first;
+  if (!/index\.json$/i.test(file)) return null; // 只有插件那一份会晚到
+  for (let waited = 0; waited < CB_FLUSH_WAIT_MS; waited += CB_FLUSH_STEP_MS) {
+    await new Promise((r) => setTimeout(r, CB_FLUSH_STEP_MS));
+    const t = turnTokens(file, startedAt);
+    if (t) return t;
+  }
+  return null;
+}
+
+module.exports = { turnTokens, turnTokensSettled };

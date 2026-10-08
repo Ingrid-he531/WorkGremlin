@@ -151,46 +151,47 @@ function fmtTokens(n) {
   return n.toLocaleString('en-US');
 }
 /**
- * 本轮的**输入总量** = 非缓存 + 缓存读 + 缓存写。
+ * 本轮的**输入总量** = 非缓存 + 缓存读。
  *
- * 库里三列是分开存的（语义见 server/src/db/schema.sql 的注释：`input_tokens` 只是**没命中缓存**
+ * 库里两列是分开存的（语义见 server/src/db/schema.sql 的注释：`input_tokens` 只是**没命中缓存**
  * 的那部分），而人问"这轮输入了多少"问的是整段送进去的上下文 —— 只显示 input_tokens 那一列，
  * 4F Claude 会显示成 161 而实际是 46,497，看着像坏了。拆分明细挂在 title 上。
- * 三列全 NULL = 这个楼层报不出 token（5F/6F/9F…）→ 返回 null 显示 "—"，
+ * 两列全 NULL = 这个楼层报不出 token（5F/6F/9F…）→ 返回 null 显示 "—"，
  * 与"消耗为 0"区分开（后者会显示 0）。
  */
 function inputTotalOf(t) {
   if (!t) return null;
-  const parts = [t.input_tokens, t.cache_read_tokens, t.cache_write_tokens];
+  const parts = [t.input_tokens, t.cache_read_tokens];
   if (parts.every((v) => v == null)) return null;
   return parts.reduce((s, v) => s + (Number(v) || 0), 0);
 }
 /**
- * 「词元」那一行：四项**全摊开**、用 " / " 隔开（2026-10-01 用户要求）。
- * 顺序照库里的列序 —— **非缓存输入 / 缓存读输入 / 缓存写输入 / 输出**，
- * 前三项相加才是"这一轮输入总量"（库里 `input_tokens` 不含缓存，见 schema.sql 的注释；
+ * 「词元」那一行：三项**全摊开**、用 " / " 隔开（2026-10-01 用户要求；2026-10-08 用户要求
+ * 去掉「缓存写输入」—— 本机 12 个楼层实测这一列**恒为 0**，占一格还不带信息）。
+ * 顺序照库里的列序 —— **非缓存输入 / 缓存读输入 / 输出**，
+ * 前两项相加才是"这一轮输入总量"（库里 `input_tokens` 不含缓存，见 schema.sql 的注释；
  * 只显示它的话 4F Claude 会出现 "5,662" 而实际送进去 1,457,438，看着像坏了）。
- * 每一项各取各的：报不出 token 的楼层四项都是 "—"（**不是 0** ——"报不出来"与"消耗为零"是两回事）。
+ * 每一项各取各的：报不出 token 的楼层三项都是 "—"（**不是 0** ——"报不出来"与"消耗为零"是两回事）。
  */
 function tokenQuadOf(t) {
   const s = t || {};
-  return [s.input_tokens, s.cache_read_tokens, s.cache_write_tokens, s.output_tokens].map(fmtTokens).join(' / ');
+  return [s.input_tokens, s.cache_read_tokens, s.output_tokens].map(fmtTokens).join(' / ');
 }
-/** 「词元」那一行的悬停说明：四个数各是什么（顺序与主行一致）+ 前三项的合计 */
+/** 「词元」那一行的悬停说明：三个数各是什么（顺序与主行一致）+ 前两项的合计 */
 function tokenTitleOf(t) {
   const head = tr('records.tokens_order');
   const total = inputTotalOf(t);
   return total == null ? head : tr('records.tokens_total', { head, n: fmtTokens(total) });
 }
 /**
- * 一条任务的**总词元** = 非缓存输入 + 缓存读输入 + 缓存写输入 + 输出（四项全加）。
+ * 一条任务的**总词元** = 非缓存输入 + 缓存读输入 + 输出（三项全加）。
  * 汇总报表「数据总览」那张表（一行一个任务）的「词元」列用它。
- * 四项全 NULL（5F TraeCode / 6F Qoder 这些报不出 token 的楼层）→ null 显示 "—"，
+ * 三项全 NULL（5F TraeCode / 6F Qoder 这些报不出 token 的楼层）→ null 显示 "—"，
  * 与"消耗为 0"区分开（后者会显示 0）。
  */
 function totalTokensOf(t) {
   if (!t) return null;
-  const parts = [t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens];
+  const parts = [t.input_tokens, t.cache_read_tokens, t.output_tokens];
   if (parts.every((v) => v == null)) return null;
   return parts.reduce((s, v) => s + (Number(v) || 0), 0);
 }
@@ -261,19 +262,20 @@ function promptOf(t) {
   return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
 }
 /**
- * 会话标题（agent 自动生成的摘要，如 Kilo 的 "feat: add login"）：
- * 来自 /task-runs 的 session_title，只有 6F Qoder / 7F Kilo / 8F OpenCode 三层有值，
- * 其余楼层拿不到就是空串（服务端那里就不编造，见 server/src/sessionTitle.js）。
+ * 会话标题：**会话级**的名字 —— 同一条会话的各轮任务拿到同一个值，
+ * 凭它认出"哪些任务属于同一个会话"（一轮 = 一行任务，各轮自己的标题互不相同）。
+ * 服务端取值顺序：6F/7F/8F 用它们 SQLite 里的会话摘要；其余楼层兜底成
+ * 这条会话**第一轮**的用户原话（会话开始时的标题就是用户原话）。
+ * 拿不到一律空串（见 server/src/sessionTitle.js），这里就不显示那一行。
  */
 function sessionTitleOf(t) {
   return String((t && t.session_title) || '').trim();
 }
 /**
- * 任务显示标题：优先用会话标题（摘要），没有再退回 promptOf(t)（用户原话）。
+ * 列表 / 汇总 / 甘特 / 导出一律显示**这一轮自己的用户输入**（promptOf），不用会话标题 ——
+ * 会话标题是会话级的（同一会话各轮共用同一个值），拿它当行标题会让一列任务全显示成
+ * 第一轮的那一句，分不出谁是谁。它只在详情里单列一行（见详情的「会话标题」）。
  */
-function displayTitle(t) {
-  return sessionTitleOf(t) || promptOf(t);
-}
 /** 把 hook 的 op 归到三类：add=新增 / del=删除 / mod=改动（含老数据无 op） */
 function classify(f) {
   if (f.op === 'delete') return 'del';
@@ -410,10 +412,15 @@ const reportGroups = computed(() => {
     const k = dimValue(t, dim);
     let g = map.get(k);
     if (!g) {
-      g = { key: k, label: dimLabel(t, dim), taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 };
+      // sids：这一组里出现过的 session_id（去重用）—— 会话数 = 它有多少个元素，
+      // 不是任务数（一条会话通常有多轮任务）。会话级去重，任务数照旧一轮算一条。
+      g = { key: k, label: dimLabel(t, dim), taskCount: 0, sids: new Set(), successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 };
       map.set(k, g);
     }
     g.taskCount += 1;
+    const sid = String(t.session_id || '').trim();
+    if (sid) g.sids.add(sid);
+    // 没有 session_id 的老任务：占一条任务，但不撑会话数（不知道它属于哪条会话，不编造）
     if (t.state === 'done') g.successCount += 1;
     else if (t.state === 'cancelled') g.cancelCount += 1;
     g.fileCount += Number(t.file_count) || 0;
@@ -426,25 +433,31 @@ const reportGroups = computed(() => {
   }
   return [...map.values()].map((g) => {
     const avgDuration = g.durN ? g.durationSum / g.durN : 0;
-    return { ...g, avgDuration };
+    return { ...g, avgDuration, sessionCount: g.sids.size };
   });
 });
 const reportTotal = computed(() => {
+  // 合计的会话数 = 所有组去重后的并集（不是各组会话数相加 —— 一条会话可能同时落在
+  // 两个组里，比如同一个 session 里换过模型，按模型分组时它会进两组）
+  const allSids = new Set();
   const a = reportGroups.value.reduce(
-    (s, g) => ({
-      taskCount: s.taskCount + g.taskCount,
-      successCount: s.successCount + g.successCount,
-      cancelCount: s.cancelCount + g.cancelCount,
-      fileCount: s.fileCount + g.fileCount,
-      durationSum: s.durationSum + g.durationSum,
-      durN: s.durN + g.durN,
-      tokenSum: s.tokenSum + g.tokenSum,
-      tokenN: s.tokenN + g.tokenN,
-    }),
+    (s, g) => {
+      for (const id of g.sids) allSids.add(id);
+      return {
+        taskCount: s.taskCount + g.taskCount,
+        successCount: s.successCount + g.successCount,
+        cancelCount: s.cancelCount + g.cancelCount,
+        fileCount: s.fileCount + g.fileCount,
+        durationSum: s.durationSum + g.durationSum,
+        durN: s.durN + g.durN,
+        tokenSum: s.tokenSum + g.tokenSum,
+        tokenN: s.tokenN + g.tokenN,
+      };
+    },
     { taskCount: 0, successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 }
   );
   const avgDuration = a.durN ? a.durationSum / a.durN : 0;
-  return { label: tr('records.total'), taskCount: a.taskCount, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration, tokenSum: a.tokenSum, tokenN: a.tokenN };
+  return { label: tr('records.total'), taskCount: a.taskCount, sessionCount: allSids.size, successCount: a.successCount, cancelCount: a.cancelCount, fileCount: a.fileCount, avgDuration, tokenSum: a.tokenSum, tokenN: a.tokenN };
 });
 const reportSorted = computed(() => {
   const rows = reportGroups.value.slice();
@@ -467,11 +480,14 @@ function sortCls(key) {
  * 标题原样铺开会把右边的客户端 / 模型 / 工程挤出去。完整标题挂在 title 上。
  * 用 [...s] 按**码点**切 —— 直接 slice 会把 emoji / 生僻字劈成半个，显出乱码。
  */
+/** 按**码点**截断（直接 slice 会把 emoji / 生僻字劈成半个，显出乱码） */
+function shortText(s, n = 10) {
+  const chars = [...String(s || '')];
+  return chars.length > n ? `${chars.slice(0, n).join('')}…` : String(s || '');
+}
 function shortTitle(task, n = 10) {
   // 注意参数名别叫 t：这个文件里 t 到处都是"一条任务"，翻译函数取的是 tr
-  const s = displayTitle(task) || tr('records.untitled_task');
-  const chars = [...s];
-  return chars.length > n ? `${chars.slice(0, n).join('')}…` : s;
+  return shortText(promptOf(task) || tr('records.untitled_task'), n);
 }
 /** 工程列：与任务详情同一口径（服务端按工程目录现算的 project_label > 库里的 name > id） */
 function projectOf(t) {
@@ -498,6 +514,15 @@ const timeRows = computed(() => {
 });
 /** 表尾那一行：条数 + 总时长（没收工的任务没有 duration，不计入，不编造） */
 const timeTotalMs = computed(() => timeRows.value.reduce((s, t) => s + (Number(t.duration_ms) || 0), 0));
+/** 表尾的会话数：这一屏涉及多少条**不同**的会话（没有 session_id 的老任务不计，不编造） */
+const timeSessionCount = computed(() => {
+  const sids = new Set();
+  for (const t of timeRows.value) {
+    const sid = String(t.session_id || '').trim();
+    if (sid) sids.add(sid);
+  }
+  return sids.size;
+});
 /**
  * 表尾的词元合计：**只累加报得出 token 的那些任务**（报不出的不计入，也不当 0 拉低）。
  * 一条都报不出 → null 显示 "—"（这一屏压根没有真值，写 0 会让人以为"跑了但不耗词元"）。
@@ -552,13 +577,15 @@ function downloadCsv(fileName, lines) {
 function exportCsv() {
   if (reportDim.value === 'time') {
     const head = [
-      tr('records.col.time'), tr('records.col.task'), tr('records.col.client'),
+      tr('records.col.time'), tr('records.col.task'), tr('records.col.session'),
+      tr('records.col.client'),
       tr('records.col.model'), tr('records.col.project'), tr('records.col.tokens'),
       `${tr('records.col.duration')}(ms)`, tr('records.col.state'),
     ];
     const rows = timeRows.value.map((t) => [
       fmtTime(t.started_at),
-      displayTitle(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
+      promptOf(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
+      sessionTitleOf(t), // 会话：拿不到就是空串（表里显示 "—"，导出留空，不写占位）
       clientLabel(t.client, t.form),
       t.model || '',
       projectOf(t),
@@ -573,19 +600,21 @@ function exportCsv() {
   }
   const dimLabelNow = tr((DIMS.find((d) => d.key === reportDim.value) || {}).label || 'records.dim.default');
   const head = [
-    tr('records.dim.default'), tr('records.col.task_count'), tr('records.col.success_count'),
+    tr('records.dim.default'), tr('records.col.task_count'), tr('records.col.session_count'),
+    tr('records.col.success_count'),
     tr('records.col.cancel_count'), tr('records.col.file_count'), tr('records.col.token_sum'),
     `${tr('records.col.duration_sum')}(ms)`, `${tr('records.col.avg_duration')}(ms)`,
   ];
   // 词元导出**裸数字**（不带千位逗号，Excel 里才能直接算）；这一组没有真值就留空，不写 0
   const tokenCell = (x) => (x.tokenN ? x.tokenSum : '');
   const rows = reportSorted.value.map((r) => [
-    r.label, r.taskCount, r.successCount, r.cancelCount, r.fileCount,
+    r.label, r.taskCount, r.sessionCount, r.successCount, r.cancelCount, r.fileCount,
     tokenCell(r),
     Math.round(r.durationSum), Math.round(r.avgDuration),
   ]);
   const totalLine = [
-    reportTotal.value.label, reportTotal.value.taskCount, reportTotal.value.successCount,
+    reportTotal.value.label, reportTotal.value.taskCount, reportTotal.value.sessionCount,
+    reportTotal.value.successCount,
     reportTotal.value.cancelCount, reportTotal.value.fileCount,
     tokenCell(reportTotal.value),
     Math.round(reportTotal.value.durationSum), Math.round(reportTotal.value.avgDuration),
@@ -728,7 +757,7 @@ const boardNowPct = computed(() => {
 function blockTitle(it) {
   const task = it.task;
   const dur = task.duration_ms != null ? fmtDuration(task.duration_ms) : tr('records.unfinished');
-  return `${displayTitle(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
+  return `${promptOf(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
 }
 /**
  * 重叠段的加深：同时跑 2 条加一档、3 条再加一档（最深压住，免得糊成一块黑）。
@@ -880,7 +909,7 @@ async function saveRetention() {
               >{{ tr('records.delete') }}</button>
             </span>
           </div>
-          <div class="row-title">{{ displayTitle(t) || tr('records.untitled_task') }}</div>
+          <div class="row-title">{{ promptOf(t) || tr('records.untitled_task') }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
             <span v-if="t.client">{{ clientLabel(t.client, t.form) }}</span>
@@ -896,9 +925,8 @@ async function saveRetention() {
       <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
-            <!-- 详情标题用**用户原话**（会话标题在下面的键值网格里单列一行）——
-                 6F/7F/8F 两条都有时，这样摘要与原话各归各位，不会同一个串出现两遍 -->
-            <div class="detail-title">{{ promptOf(tasks.selectedTask) || displayTitle(tasks.selectedTask) || tr('records.untitled_task') }}</div>
+            <!-- 详情标题 = 这一轮自己的用户输入；会话标题在下面的键值网格里单列一行 -->
+            <div class="detail-title">{{ promptOf(tasks.selectedTask) || tr('records.untitled_task') }}</div>
             <div class="detail-meta">
               <span>{{ fmtTime(tasks.selectedTask.started_at) }}</span>
               <span v-if="tasks.selectedTask.ended_at">→ {{ fmtTime(tasks.selectedTask.ended_at) }}</span>
@@ -929,16 +957,17 @@ async function saveRetention() {
             <div class="k">{{ tr('records.detail.project') }}</div>
             <div class="v">{{ tasks.selectedTask.project_label || tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
+            <div class="k">{{ tr('records.detail.tokens') }}</div>
+            <div class="v" :title="tokenTitleOf(tasks.selectedTask)">{{ tokenQuadOf(tasks.selectedTask) }}</div>
             <div class="k">{{ tr('records.detail.files') }}</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
-            <!-- 本轮消耗的词元：四项摊开、用 " / " 隔开（2026-10-01 用户要求）——
-                 `非缓存输入 / 缓存读输入 / 缓存写输入 / 输出`，顺序与库里的列序一致，
+            <!-- 本轮消耗的词元：三项摊开、用 " / " 隔开（2026-10-01 用户要求）——
+                 `非缓存输入 / 缓存读输入 / 输出`，顺序与库里的列序一致
+                 （「缓存写输入」2026-10-08 用户要求去掉：本机实测恒为 0，占一格不带信息），
                  鼠标悬停看这四个数各是什么。真值来自各楼层自己的会话落盘
                  （见 reporter/src/usage.js），拿不到的楼层（5F TraeCode 没有 usage、
                  6F Qoder 的 transcript 里没有、2F/9F 没接）显示 "—"，不显示 0 ——
                  「报不出来」和「消耗为零」是两回事。 -->
-            <div class="k">{{ tr('records.detail.tokens') }}</div>
-            <div class="v" :title="tokenTitleOf(tasks.selectedTask)">{{ tokenQuadOf(tasks.selectedTask) }}</div>
           </div>
 
           <div v-if="filesOf(tasks.selectedTask).length" class="files">
@@ -1094,11 +1123,14 @@ async function saveRetention() {
             <tr>
               <th class="th-dim sortable" :class="timeSortCls('started_at')" @click="sortTimeBy('started_at')">{{ tr('records.col.time') }}</th>
               <th class="th-dim">{{ tr('records.col.task') }}</th>
+              <!-- 会话：这一轮属于哪条会话（会话级标题，同一会话的各轮共用同一个值）——
+                   拿不到（老任务没有 session_id / 服务端查不到）显示 "—"，不编造 -->
+              <th class="th-dim">{{ tr('records.col.session') }}</th>
               <th class="th-dim">{{ tr('records.col.client') }}</th>
               <th class="th-dim">{{ tr('records.col.model') }}</th>
               <th class="th-dim">{{ tr('records.col.project') }}</th>
-              <!-- 一行一个任务，这一列 = **这条任务的总词元**（四项全加，见 totalTokensOf）。
-                   悬停看四项拆分；报不出 token 的楼层显示 "—"（不是 0）。 -->
+              <!-- 一行一个任务，这一列 = **这条任务的总词元**（三项全加，见 totalTokensOf）。
+                   悬停看三项拆分；报不出 token 的楼层显示 "—"（不是 0）。 -->
               <th class="sortable num" :class="timeSortCls('tokens')" @click="sortTimeBy('tokens')" :title="tr('records.col.tokens_title')">{{ tr('records.col.tokens') }}</th>
               <th class="sortable num" :class="timeSortCls('duration_ms')" @click="sortTimeBy('duration_ms')">{{ tr('records.col.duration') }}</th>
               <th class="th-dim">{{ tr('records.col.state') }}</th>
@@ -1108,7 +1140,8 @@ async function saveRetention() {
             <tr v-for="t in timeRows" :key="t.id" class="report-row" @click="drillDown(t)">
               <td class="td-dim mono">{{ fmtTime(t.started_at) }}</td>
               <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
-              <td class="td-dim td-task" :title="displayTitle(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
+              <td class="td-dim td-task" :title="promptOf(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
+              <td class="td-dim td-session" :title="sessionTitleOf(t) || ''">{{ sessionTitleOf(t) ? shortText(sessionTitleOf(t)) : '—' }}</td>
               <td class="td-dim">{{ clientLabel(t.client, t.form) }}</td>
               <td class="td-dim">{{ t.model || '—' }}</td>
               <td class="td-dim">{{ projectOf(t) }}</td>
@@ -1121,6 +1154,8 @@ async function saveRetention() {
             <tr class="total-row">
               <td class="td-dim">{{ tr('records.total') }}</td>
               <td class="td-dim">{{ tr('records.times', { n: timeRows.length }) }}</td>
+              <!-- 会话数：这一屏涉及多少条**不同**的会话（不是任务数） -->
+              <td class="num">{{ timeSessionCount }}</td>
               <td class="td-dim" />
               <td class="td-dim" />
               <td class="td-dim" />
@@ -1139,6 +1174,9 @@ async function saveRetention() {
             <tr>
               <th class="th-dim">{{ dimColName }}</th>
               <th class="sortable num" :class="sortCls('taskCount')" @click="sortBy('taskCount')">{{ tr('records.col.task_count') }}</th>
+              <!-- 会话数：这一组里有多少条**不同**的会话（一轮 = 一条任务，所以它通常远小于任务数）；
+                   没有 session_id 的老任务只进任务数，不撑会话数 -->
+              <th class="sortable num" :class="sortCls('sessionCount')" @click="sortBy('sessionCount')" :title="tr('records.col.session_count')">{{ tr('records.col.session_count') }}</th>
               <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">{{ tr('records.col.success_count') }}</th>
               <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">{{ tr('records.col.cancel_count') }}</th>
               <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">{{ tr('records.col.file_count') }}</th>
@@ -1157,6 +1195,7 @@ async function saveRetention() {
             >
               <td class="td-dim">{{ r.label }}</td>
               <td class="num">{{ r.taskCount }}</td>
+              <td class="num">{{ r.sessionCount }}</td>
               <td class="num">{{ r.successCount }}</td>
               <td class="num">{{ r.cancelCount }}</td>
               <td class="num">{{ r.fileCount }}</td>
@@ -1169,7 +1208,9 @@ async function saveRetention() {
           <tfoot>
             <tr class="total-row">
               <td class="td-dim">{{ reportTotal.label }}</td>
-<td class="num">{{ reportTotal.taskCount }}</td>
+              <td class="num">{{ reportTotal.taskCount }}</td>
+              <!-- 合计的会话数是各组**去重后的并集**，不是把各组会话数加起来 -->
+              <td class="num">{{ reportTotal.sessionCount }}</td>
               <td class="num">{{ reportTotal.successCount }}</td>
               <td class="num">{{ reportTotal.cancelCount }}</td>
               <td class="num">{{ reportTotal.fileCount }}</td>
@@ -1552,6 +1593,8 @@ async function saveRetention() {
 /* 数据总览那一版：时间列用等宽字体（一列数字对得齐），任务列限宽 + 省略号（前 10 个字） */
 .report-table td.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .report-table td.td-task { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 会话列：跟任务列同一套限宽 + 省略号，别把右边的客户端 / 模型挤出去 */
+.report-table td.td-session { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 状态色：`.report-table td` 的 color 比 .st-* 更具体，不单独写一遍的话状态就全是白的 */
 .report-table td.st-running { color: var(--accent); }
 .report-table td.st-done { color: #7ee787; }

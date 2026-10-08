@@ -18,7 +18,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { turnTokens } = require('../../packages/reporter/src/usage');
+const { turnTokens, turnTokensSettled } = require('../../packages/reporter/src/usage');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-tokens-'));
 
@@ -219,15 +219,92 @@ head('[4] 认不出 / 读不到 → null（服务端留 NULL，报表显示 "—
   ]);
   ok('四项全是 0 → null（"没读到"不是"消耗为零"）', turnTokens(zeros, T0) === null, JSON.stringify(turnTokens(zeros, T0)));
 
-  // CodeBuddy **插件**形态的 transcriptPath 指向 history/<会话>/index.json，那份索引没有 usage
-  const indexJson = writeJsonl('index.json', [{ type: 'assistant', timestamp: after, message: { id: 'm', usage: { input_tokens: 5, output_tokens: 5 } } }]);
-  ok('index.json（CodeBuddy 插件形态）→ null，连读都不读', turnTokens(indexJson, T0) === null, String(turnTokens(indexJson, T0)));
+  // CodeBuddy **插件**形态的 transcriptPath 指向 history/<会话>/index.json：缩进过的 JSON
+  //（不是 JSONL），usage 在顶层 requests[] 上。见 usage.js 的 codebuddyRequestTokens。
+  const mkIndex = (name, reqs) => {
+    const file = path.join(TMP, name);
+    fs.writeFileSync(file, JSON.stringify({ messages: [], requests: reqs }, null, 2) + '\n');
+    return file;
+  };
+  // 实测口径：inputTokens **含**缓存命中，inputTokens − cacheTokens − cachedWriteTokens = cachedMissTokens
+  const req = (id, startedAt, usage) => ({ id, type: 'craft', state: 'complete', startedAt, usage });
+  const uNow = { inputTokens: 18407, outputTokens: 163, cacheTokens: 18176, cachedWriteTokens: 0, cachedMissTokens: 231, credit: 0.18 };
+  const uOld = { inputTokens: 999999, outputTokens: 999, cacheTokens: 999000, cachedWriteTokens: 0, cachedMissTokens: 999, credit: 9.99 };
+  // 本轮那条 request 实测早于 hook 记的本轮起点 84~204ms —— 所以不能写成 >= startedAt
+  const idxFile = mkIndex('cb-index.json', [req('r_old', T0 - 600_000, uOld), req('r_now', T0 - 107, uNow)]);
+  ok(
+    '插件形态 index.json：取本轮那条 request（input 是没命中缓存的 231，不是 18407）',
+    sameTokens(turnTokens(idxFile, T0), { input: 231, output: 163, cacheRead: 18176, cacheWrite: 0 }),
+    JSON.stringify(turnTokens(idxFile, T0))
+  );
+  ok(
+    '插件形态：上一轮那条不计入（10 分钟前那条的用量没被算进来）',
+    turnTokens(idxFile, T0) && turnTokens(idxFile, T0).output === 163,
+    String(turnTokens(idxFile, T0) && turnTokens(idxFile, T0).output)
+  );
+  // 窗口 Grace 之外（本轮 usage 还没落盘，只找得到更早的那些）→ null，不能把老数据当这轮的
+  ok(
+    '插件形态：本轮那条还没落盘（只剩窗口外的老 request）→ null',
+    turnTokens(mkIndex('cb-wait.json', [req('r_old', T0 - 600_000, uOld)]), T0) === null,
+    String(turnTokens(mkIndex('cb-wait.json', [req('r_old', T0 - 600_000, uOld)]), T0))
+  );
+  ok(
+    '插件形态：一条合法 request 都没有 → null',
+    turnTokens(mkIndex('cb-none.json', []), T0) === null,
+    String(turnTokens(mkIndex('cb-none.json', []), T0))
+  );
 
   ok('文件不存在 → null', turnTokens(path.join(TMP, 'nope.jsonl'), T0) === null, String(turnTokens(path.join(TMP, 'nope.jsonl'), T0)));
   ok('没给 transcript 路径 → null', turnTokens('', T0) === null, String(turnTokens('', T0)));
   ok('不知道本轮从哪开始（startedAt=0）→ null', turnTokens(none, 0) === null, String(turnTokens(none, 0)));
 }
 
-console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
-fs.rmSync(TMP, { recursive: true, force: true });
-process.exit(fail ? 1 : 0);
+/* ------------------------------ 插件形态：usage 晚落盘 ------------------------------ */
+
+/**
+ * 插件形态**这一条最关键**：扩展把本轮 request 的 startedAt / usage 补进 index.json 的时刻
+ * 比 Stop **晚 31~51ms**（本机 14/14 轮实测，见 usage.js 的 codebuddyRequestTokens）。
+ * 轮次中途那份 request 只有 `{id, type, messages, state:'running'}` —— 没有 startedAt，
+ * 于是 Stop 里第一次读必然扑空（窗口里一条都没有）。只读一次 = 插件形态永远 "—"。
+ */
+(async () => {
+  head('[5] 插件形态：usage 比 Stop 晚落盘 → turnTokensSettled 回头再读一次');
+  const uLate = { inputTokens: 18407, outputTokens: 163, cacheTokens: 18176, cachedWriteTokens: 0, cachedMissTokens: 231, credit: 0.18 };
+  const uEarly = { inputTokens: 999999, outputTokens: 999, cacheTokens: 999000, cachedWriteTokens: 0, cachedMissTokens: 999, credit: 9.99 };
+  // 造一份"Stop 那一刻"的 index.json：本轮那条还是 running，没有 startedAt / usage
+  const late = path.join(TMP, 'cb-late.index.json');
+  fs.writeFileSync(late, JSON.stringify({ messages: [], requests: [{ id: 'r_now', type: 'craft', state: 'running' }] }, null, 2));
+  const pending = turnTokensSettled(late, T0);
+  // 扩展在 Stop 之后 ~40ms 补上（这里 150ms，够代表"晚一步"）
+  setTimeout(() => {
+    fs.writeFileSync(
+      late,
+      JSON.stringify({ messages: [], requests: [{ id: 'r_now', type: 'craft', state: 'complete', startedAt: T0 - 107, usage: uLate }] }, null, 2)
+    );
+  }, 150);
+  const gotLate = await pending;
+  ok(
+    '晚落盘：等到补上那份（input 231 / output 163 / cacheRead 18,176）',
+    sameTokens(gotLate, { input: 231, output: 163, cacheRead: 18176, cacheWrite: 0 }),
+    JSON.stringify(gotLate)
+  );
+
+  // 别的形态（CLI 的 JSONL）落盘早于 Stop —— 不该为它凭空等一秒
+  const plain = writeJsonl('plain-no-usage.jsonl', [{ type: 'user', timestamp: T0 + 1_000, message: { role: 'user', content: '嗯' } }]);
+  const t0 = Date.now();
+  await turnTokensSettled(plain, T0);
+  ok('非插件形态扑空就立刻返回（不加等待）', Date.now() - t0 < 50, `${Date.now() - t0}ms`);
+
+  // 等不到（被掐掉的轮次里扩展可能永远不补）→ null，绝不拿上一轮的数顶上
+  const never = path.join(TMP, 'cb-never.index.json');
+  fs.writeFileSync(
+    never,
+    JSON.stringify({ messages: [], requests: [{ id: 'r_old', type: 'craft', state: 'complete', startedAt: T0 - 600_000, usage: uEarly }] }, null, 2)
+  );
+  const gotNever = await turnTokensSettled(never, T0);
+  ok('等到底也没有本轮那条 → null（不是 10 分钟前那条）', gotNever === null, JSON.stringify(gotNever));
+
+  console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
+  fs.rmSync(TMP, { recursive: true, force: true });
+  process.exit(fail ? 1 : 0);
+})();
