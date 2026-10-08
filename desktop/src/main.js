@@ -17,6 +17,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const { execSync } = require('node:child_process');
 const { IPC_EVENTS } = require('@workgremlin/shared');
 
 /** @type {BrowserWindow | null} */
@@ -80,6 +81,26 @@ async function bootstrap() {
     return serverInfo;
   });
   ipcMain.handle(IPC_EVENTS.GET_APP_VERSION, () => app.getVersion());
+
+  // 构建信息（设置面板展示）：应用版本 + 最近 commit 短 sha + Electron / Node 运行时版本。
+  // commit 在打包产物里没有 .git 会取不到，回退空串，渲染层据此决定要不要加括号。
+  ipcMain.handle(IPC_EVENTS.GET_BUILD_INFO, () => {
+    let commit = '';
+    try {
+      commit = execSync('git rev-parse --short=8 HEAD', {
+        cwd: path.resolve(__dirname, '..', '..'),
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).toString().trim();
+    } catch {
+      /* 无 .git（打包产物）或 git 不可用：commit 留空 */
+    }
+    return {
+      version: app.getVersion(),
+      commit,
+      electron: process.versions.electron || '',
+      node: process.versions.node || '',
+    };
+  });
 
   // 退出整个应用（设置面板里的「退出 WorkGremlin」）
   ipcMain.handle(IPC_EVENTS.QUIT, () => {

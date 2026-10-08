@@ -72,6 +72,8 @@ const MESSAGES = {
     'settings.version': '版本',
     'settings.github': 'GitHub',
     'settings.feedback': '反馈',
+    'settings.electron': 'Electron',
+    'settings.node': 'Node.js',
     'settings.quit': '退出 WorkGremlin',
 
     // ---- 会话下拉 / 门楣 ----
@@ -493,6 +495,8 @@ const MESSAGES = {
     'settings.version': 'Version',
     'settings.github': 'GitHub',
     'settings.feedback': 'Feedback',
+    'settings.electron': 'Electron',
+    'settings.node': 'Node.js',
     'settings.quit': 'Quit WorkGremlin',
 
     // ---- session switcher / lintel ----

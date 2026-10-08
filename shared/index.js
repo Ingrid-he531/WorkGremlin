@@ -315,6 +315,7 @@ const IPC_EVENTS = Object.freeze({
   EVENT: 'workgremlin:event',
   QUIT: 'workgremlin:quit',
   OPEN_EXTERNAL: 'workgremlin:open-external',
+  GET_BUILD_INFO: 'workgremlin:get-build-info',
 });
 
 /**

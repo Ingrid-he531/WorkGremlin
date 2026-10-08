@@ -56,6 +56,8 @@ contextBridge.exposeInMainWorld('workgremlin', {
   },
   /** 退出整个应用 */
   quit: () => ipcRenderer.invoke(IPC_EVENTS.QUIT),
+  /** 构建信息：{ version, commit, electron, node } @returns {Promise<{version:string,commit:string,electron:string,node:string}>} */
+  getBuildInfo: () => ipcRenderer.invoke(IPC_EVENTS.GET_BUILD_INFO),
   /** @param {string} url 用系统默认程序打开的外部链接 @returns {Promise<boolean>} */
   openExternal: (url) => ipcRenderer.invoke(IPC_EVENTS.OPEN_EXTERNAL, url),
 });

@@ -1,33 +1,48 @@
 <script setup>
 /**
  * 设置面板：把原来的「中文 / En」语言开关升级成一个「设置」按钮 + 弹出面板。
- * 面板里同时放：语言切换、版本号、GitHub / 反馈外链、以及退出应用。
+ * 面板里放：语言切换、版本号（含最近 commit 短 sha）、Electron / Node 运行时版本、
+ * GitHub / 反馈外链、以及退出应用。
  * 语言切换即时生效并记住（见 i18n/index.js 的 setLocale），其余行走 Electron 桥接（bridge.js）。
  */
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useI18n } from '../i18n';
-import { getAppVersion, openExternal, quitApp } from '../api/bridge';
+import { getBuildInfo, openExternal, quitApp } from '../api/bridge';
 
 const { locale, setLocale, locales, t } = useI18n();
 
 const open = ref(false);
-const version = ref('—');
+// 构建信息：版本号 + commit 短 sha + 运行时版本；读取失败前显示占位，读取后替换
+const info = ref({ version: '—', commit: '', electron: '', node: '' });
 // 外链：项目仓库在 GitHub，反馈走 Issues 页（这两个地址在仓库里是确定的，改这里即可）
 const GITHUB_URL = 'https://github.com/Ingrid-he531/WorkGremlin';
 const FEEDBACK_URL = 'https://github.com/Ingrid-he531/WorkGremlin/issues';
 
-async function loadVersion() {
+async function loadInfo() {
   try {
-    const v = await getAppVersion();
-    if (v) version.value = v;
+    const b = await getBuildInfo();
+    if (b) {
+      info.value = {
+        version: b.version || '—',
+        commit: b.commit || '',
+        electron: b.electron || '',
+        node: b.node || '',
+      };
+    }
   } catch {
     /* 读不到就保留占位 */
   }
 }
 
+// 应用版本展示格式：0.1.10(xxxxxxxx)，commit 取不到就只显示版本号
+const appVersion = computed(() => {
+  const v = info.value;
+  return v.commit ? `${v.version}(${v.commit})` : v.version;
+});
+
 function toggle() {
   open.value = !open.value;
-  if (open.value) loadVersion();
+  if (open.value) loadInfo();
 }
 function close() {
   open.value = false;
@@ -72,8 +87,19 @@ function onQuit() {
 
         <div class="row">
           <span class="label">{{ t('settings.version') }}</span>
-          <span class="val">{{ version }}</span>
+          <span class="val">{{ appVersion }}</span>
         </div>
+        <div class="row">
+          <span class="label">{{ t('settings.electron') }}</span>
+          <span class="val">{{ info.electron || '—' }}</span>
+        </div>
+        <div class="row">
+          <span class="label">{{ t('settings.node') }}</span>
+          <span class="val">{{ info.node || '—' }}</span>
+        </div>
+
+        <div class="sep" />
+
         <a class="row link" href="#" @click.prevent="onLink(GITHUB_URL)">
           <span class="label">{{ t('settings.github') }}</span>
           <span class="val link-text">github.com/Ingrid-he531/WorkGremlin</span>
@@ -113,7 +139,7 @@ function onQuit() {
   top: calc(100% + 6px);
   right: 0;
   z-index: 901;
-  width: 264px;
+  width: 272px;
   padding: 8px 0;
   background: var(--bg-elevated, #232a36);
   border: 1px solid var(--border);
@@ -149,7 +175,7 @@ a.row:hover { background: var(--accent-soft); }
 .val { color: var(--text); font-variant-numeric: tabular-nums; }
 .link-text {
   color: var(--accent);
-  max-width: 158px;
+  max-width: 178px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

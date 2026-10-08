@@ -149,6 +149,22 @@ export async function getAppVersion() {
 }
 
 /**
+ * 构建信息：应用版本 + 最近 commit 短 sha + Electron / Node 运行时版本。
+ * @returns {Promise<{version:string, commit:string, electron:string, node:string}>}
+ */
+export async function getBuildInfo() {
+  if (hasBridge() && typeof window.workgremlin.getBuildInfo === 'function') {
+    try {
+      const info = await window.workgremlin.getBuildInfo();
+      if (info && typeof info === 'object') return info;
+    } catch {
+      /* 降级到空对象 */
+    }
+  }
+  return { version: '', commit: '', electron: '', node: '' };
+}
+
+/**
  * 退出整个应用。Electron 内走 IPC；浏览器 dev 模式下降级为关闭窗口。
  */
 export async function quitApp() {
