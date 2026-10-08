@@ -257,36 +257,41 @@ onUnmounted(() => {
   <div class="app" :class="{ fullscreen }" :data-motion="motionMode">
     <!-- 全屏：顶栏整条收掉（页签 + 会话下拉），出口见 .fs-exit。
          连接 / 相位来源 在办公室左下角说明条里（IsoOfficeView 的 .tip）；
-         项目名在门楣（楼层液晶屏那块板）最左边（ElevatorDoors 的 .lintel-proj）——
+         项目名在顶栏（"设置"那一行）居中（App 的 .tabs-proj）——
          三样都不占顶栏，所以收掉顶栏不会丢信息。 -->
     <nav v-if="!fullscreen" class="tabs">
-      <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
-      <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">{{ t('nav.workstation') }}</button>
-      <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">{{ t('nav.records') }}</button>
-      <!-- 议事厅：一层 CLI 都没装时不留死入口 —— 按钮禁用，title 里说清为什么 -->
-      <button
-        :class="{ on: tab === 'council' }"
-        :disabled="!council.canStart"
-        :title="council.canStart ? '' : t('nav.council_title')"
-        @click="tab = 'council'"
-      >{{ t('nav.council') }}</button>
-      <span class="spacer" />
-      <!-- 语言切换常驻（会话下拉与全屏在工位卡片 / 任务记录页会收掉，语言开关留着） -->
-      <LangSwitch />
-      <!-- 工位卡片 / 任务记录页 / 议事厅不需要会话下拉与全屏，收掉右上角这两样 -->
-      <SessionSwitcher
-        v-if="!bareTab && tab !== 'workstation'"
-        :items="sessionItems"
-        :model-value="sessionValue"
-        :empty-label="sessionEmptyLabel"
-        @update:model-value="selectSession($event)"
-      />
-      <button
-        v-if="!bareTab && tab !== 'workstation'"
-        class="fs-btn"
-        :title="t('nav.fullscreen_title')"
-        @click="toggleFullscreen"
-      >{{ t('nav.fullscreen') }}</button>
+      <div class="tabs-group">
+        <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
+        <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">{{ t('nav.workstation') }}</button>
+        <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">{{ t('nav.records') }}</button>
+        <!-- 议事厅：一层 CLI 都没装时不留死入口 —— 按钮禁用，title 里说清为什么 -->
+        <button
+          :class="{ on: tab === 'council' }"
+          :disabled="!council.canStart"
+          :title="council.canStart ? '' : t('nav.council_title')"
+          @click="tab = 'council'"
+        >{{ t('nav.council') }}</button>
+      </div>
+      <!-- 项目名：居中放在顶栏（"设置"那一行）中间，不占门楣单独一行 -->
+      <span v-if="projectLabel" class="tabs-proj">{{ t('lintel.project') }}：{{ projectLabel }}</span>
+      <div class="tabs-group">
+        <!-- 语言切换常驻（会话下拉与全屏在工位卡片 / 任务记录页会收掉，语言开关留着） -->
+        <LangSwitch />
+        <!-- 工位卡片 / 任务记录页 / 议事厅不需要会话下拉与全屏，收掉右上角这两样 -->
+        <SessionSwitcher
+          v-if="!bareTab && tab !== 'workstation'"
+          :items="sessionItems"
+          :model-value="sessionValue"
+          :empty-label="sessionEmptyLabel"
+          @update:model-value="selectSession($event)"
+        />
+        <button
+          v-if="!bareTab && tab !== 'workstation'"
+          class="fs-btn"
+          :title="t('nav.fullscreen_title')"
+          @click="toggleFullscreen"
+        >{{ t('nav.fullscreen') }}</button>
+      </div>
     </nav>
 
     <main class="body">
@@ -302,7 +307,6 @@ onUnmounted(() => {
       <ElevatorDoors
         :phase="phase"
         :flash="flash"
-        :project-label="projectLabel"
         :show-screen="!bareTab"
         :show-lintel="!bareTab"
       >
@@ -368,8 +372,26 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
-.spacer {
-  flex: 1;
+/* 顶栏左右两组：页签在左、设置等在右，各占自己内容宽（不撑开） */
+.tabs-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* 项目名：居中放在顶栏中间（"设置"那一行），不占门楣单独一行 */
+.tabs-proj {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: center;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--muted, #6e7681);
 }
 
 .body {

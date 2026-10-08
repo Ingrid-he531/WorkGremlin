@@ -264,6 +264,11 @@ let lastTs = 0;
 let offset = 0;
 /** 整条传送带宽度（px）= 各 (w + GAP) 之和，wrap 阈值用 */
 let totalWidth = 0;
+/** 整条滚出后停顿多久再从最右重新进（ms）：让屏空一会儿，避免"尾字刚出左、头字又从右进"连成一气 */
+const PAUSE_MS = 5000;
+/** 停顿期标记：整条离屏后停 PAUSE_MS，再从左边缘重新进 */
+let paused = false;
+let pauseUntil = 0;
 
 /** 重测每行宽度 + 屏宽 + 整条宽度（写回 belt[i].w / viewW / totalWidth） */
 function measureBelt() {
@@ -294,14 +299,26 @@ function tick(ts) {
   }
   if (beltDirty) measureBelt();
   if (!reduce.value && belt.value.length) {
-    offset -= SPEED_PX_S * dt;
-    // 整条滚出左边缘（右沿到了屏左）→ 瞬移回最右重新进：
-    // 因整条已离屏，瞬移不可见、不会跳；结束行滚过这一遍后清掉（只一遍）。
-    if (offset <= -totalWidth) {
-      offset = viewW.value || 600;
-      if (belt.value.some((it) => it.kind !== 'running')) {
-        belt.value = belt.value.filter((it) => it.kind === 'running');
-        beltDirty = true;
+    if (paused) {
+      // 停顿期：整条已离屏，静候 PAUSE_MS（屏空），到点再从最右重新进
+      if (ts >= pauseUntil) {
+        paused = false;
+        // 结束行滚过这一遍后清掉（只一遍）
+        if (belt.value.some((it) => it.kind !== 'running')) {
+          belt.value = belt.value.filter((it) => it.kind === 'running');
+          beltDirty = true;
+        }
+        offset = viewW.value || 600; // 从最右重新进
+      }
+      // 否则停在离屏位（屏空），不动 offset
+    } else {
+      offset -= SPEED_PX_S * dt;
+      // 整条滚出左边缘（右沿到了屏左）→ 先停 PAUSE_MS（屏空），再从左边缘重新进。
+      // 因整条已离屏，停顿与重进都不可见、不会跳；同一任务也绝不重复。
+      if (offset <= -totalWidth) {
+        paused = true;
+        pauseUntil = ts + PAUSE_MS;
+        offset = -totalWidth; // 停在离屏位
       }
     }
     el.style.transform = `translateX(${offset}px)`;
