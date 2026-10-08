@@ -25,8 +25,10 @@ const props = defineProps({
       项目名不归这里管 —— 它挂在门楣最左边，见 ElevatorDoors 的 projectLabel */
   connection: { type: Object, default: () => ({ state: '' }) },
   source: { type: String, default: '' },
+  /** 是否全屏（App.vue 传下）：决定全屏按钮显示「全屏」还是「退出全屏」 */
+  fullscreen: { type: Boolean, default: false },
 });
-const emit = defineEmits(['select']);
+const emit = defineEmits(['select', 'toggle-fullscreen']);
 
 const project = useProjectStore();
 const sessions = useSessionStore();
@@ -752,6 +754,15 @@ onBeforeUnmount(() => {
       >
         {{ project.demo ? t('office.exit_demo') : t('office.demo') }}
       </button>
+      <!-- 全屏切换：放在「演示模式」这一行（和演示模式同类「显示」开关），收掉顶栏后也在此处，
+           不会落到滚动屏右边；标签在「全屏」/「退出全屏」间切换，按钮固定宽、不跳位 -->
+      <button
+        class="fs-hud-btn"
+        :title="fullscreen ? t('nav.exit_fullscreen_title') : t('nav.fullscreen_title')"
+        @click="emit('toggle-fullscreen')"
+      >
+        {{ fullscreen ? t('nav.exit_fullscreen') : t('nav.fullscreen') }}
+      </button>
       <button @click="callAll">{{ t('office.meeting') }}</button>
       <button @click="dismiss">{{ t('office.back_to_desk') }}</button>
       <button @click="resetView">{{ t('office.reset_view') }}</button>
@@ -830,6 +841,13 @@ onBeforeUnmount(() => {
 .hud button.on {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+/* 全屏按钮：固定宽度，标签在「全屏」(2字) / 「退出全屏」(4字) 间切换时不跳位 */
+.fs-hud-btn {
+  min-width: 76px;
+  text-align: center;
+  white-space: nowrap;
 }
 
 .legend {

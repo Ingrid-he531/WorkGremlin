@@ -255,10 +255,10 @@ onUnmounted(() => {
 <template>
   <!-- data-motion 挂在根部：它要同时罩住左栏（轿厢）和主舞台（门）—— 挂 .stage 就罩不到左栏 -->
   <div class="app" :class="{ fullscreen }" :data-motion="motionMode">
-    <!-- 全屏：顶栏整条收掉（页签 + 会话下拉），出口见 .fs-exit。
+    <!-- 全屏：顶栏整条收掉（页签 + 会话下拉）。全屏切换按钮在办公室 HUD 的「演示模式」那一行
+         （IsoOfficeView 的 .hud），收掉顶栏也不会丢出口，且不会落到滚动屏右边。
          连接 / 相位来源 在办公室左下角说明条里（IsoOfficeView 的 .tip）；
-         项目名在顶栏（"设置"那一行）居中（App 的 .tabs-proj）——
-         三样都不占顶栏，所以收掉顶栏不会丢信息。 -->
+         项目名在顶栏（"设置"那一行）居中（App 的 .tabs-proj）。 -->
     <nav v-if="!fullscreen" class="tabs">
       <div class="tabs-group">
         <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
@@ -275,9 +275,9 @@ onUnmounted(() => {
       <!-- 项目名：居中放在顶栏（"设置"那一行）中间，不占门楣单独一行 -->
       <span v-if="projectLabel" class="tabs-proj">{{ t('lintel.project') }}：{{ projectLabel }}</span>
       <div class="tabs-group">
-        <!-- 语言切换常驻（会话下拉与全屏在工位卡片 / 任务记录页会收掉，语言开关留着） -->
+        <!-- 语言切换常驻（会话下拉在工位卡片 / 任务记录页会收掉，语言开关留着） -->
         <LangSwitch />
-        <!-- 工位卡片 / 任务记录页 / 议事厅不需要会话下拉与全屏，收掉右上角这两样 -->
+        <!-- 工位卡片 / 任务记录页 / 议事厅不需要会话下拉，收掉右上角这一样 -->
         <SessionSwitcher
           v-if="!bareTab && tab !== 'workstation'"
           :items="sessionItems"
@@ -285,12 +285,6 @@ onUnmounted(() => {
           :empty-label="sessionEmptyLabel"
           @update:model-value="selectSession($event)"
         />
-        <button
-          v-if="!bareTab && tab !== 'workstation'"
-          class="fs-btn"
-          :title="t('nav.fullscreen_title')"
-          @click="toggleFullscreen"
-        >{{ t('nav.fullscreen') }}</button>
       </div>
     </nav>
 
@@ -316,7 +310,9 @@ onUnmounted(() => {
             :selected-id="selectedId"
             :connection="project.connection"
             :source="phaseSource"
+            :fullscreen="fullscreen"
             @select="selectDesk"
+            @toggle-fullscreen="toggleFullscreen"
           />
           <!-- 旧的 2D 正视场景，?tab=flat 还能进，用来和新场景对比 -->
           <OfficeSceneView
@@ -332,16 +328,6 @@ onUnmounted(() => {
         </section>
       </ElevatorDoors>
     </main>
-
-    <!-- 全屏唯一的常驻出口：平时压到很淡，鼠标靠近才亮，不抢画面 -->
-    <button
-      v-if="fullscreen"
-      class="fs-exit"
-      :title="t('nav.exit_fullscreen_title')"
-      @click="exitFullscreen"
-    >
-      {{ t('nav.exit_fullscreen') }}
-    </button>
   </div>
 </template>
 
@@ -428,23 +414,4 @@ onUnmounted(() => {
   border-radius: 0;
 }
 
-.fs-btn {
-  flex: 0 0 auto;
-}
-
-/* 右上角出口：半透明常驻，hover 才完全亮起来 */
-.fs-exit {
-  position: fixed;
-  right: 12px;
-  top: 10px;
-  z-index: 50;
-  opacity: 0.3;
-  transition: opacity 0.15s ease;
-  background: rgba(12, 15, 20, 0.82);
-}
-
-.fs-exit:hover,
-.fs-exit:focus-visible {
-  opacity: 1;
-}
 </style>
