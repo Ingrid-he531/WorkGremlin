@@ -1,6 +1,6 @@
 {
   "name": "workgremlin",
-  "version": "0.1.0",
+  "version": "0.1.10",
   "private": true,
   "description": "WorkGremlin - 可视化桌面程序：管理与监控多 agent 协作团队",
   "license": "MIT",
