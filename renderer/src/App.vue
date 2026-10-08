@@ -47,7 +47,7 @@ const selectedId = ref('');
  * 「不是电梯场景」的那几页（任务记录、议事厅）：左边楼层胶囊、右上会话下拉与全屏都收掉。
  * 收到这里是因为这几个条件本来散在四处（楼层胶囊 / 会话下拉 / 全屏按钮 / 门楣液晶屏），
  * 每加一个页面就要记得改四遍，漏一处就会出现"页面收干净了、门楣还挂着一层楼"。
- * 工位卡片**不**算：它还要切楼层看，只是不收会话下拉和全屏。
+ * 工位卡片**不**算：它还要切楼层看，所以保留楼层胶囊和会话下拉。
  */
 const bareTab = computed(() => tab.value === 'conversation' || tab.value === 'council');
 
@@ -145,24 +145,6 @@ function selectDesk(id) {
 }
 
 /**
- * 顶栏"项目"：优先跟着选中的会话走；
- * 切到没有活跃会话的楼层时显示楼层本身 —— 项目还挂着上一个工程的名字，
- * 会让人以为楼层没切（屋里的人已经是上一层那个工程的了）。
- *
- * 演示模式**压过**上面两条：屋里站的是演示成员、控制台演的是演示脚本，这时还跟着
- * 下拉里那条真会话显示真工程名就自相矛盾了（放最前面判）。
- */
-const projectLabel = computed(() => {
-  if (project.demo) return `${project.projectName || t('session.demo_project')} · ${t('session.demo_mode')}`;
-  if (sessions.selected) return sessions.selected.project;
-  if (sessions.floorEmpty) {
-    const f = sessions.floors.find((x) => x.id === sessions.selectedFloor);
-    return f ? t('session.floor_empty', { name: f.name }) : '';
-  }
-  return project.projectName;
-});
-
-/**
  * 会话下拉的内容：演示模式下换成**唯一一项**「演示工程 · 演示会话」。
  *
  * 为什么不把真会话继续列着：演示不是任何一条真会话 —— 列着既点不动（演示期间不切工程，
@@ -257,8 +239,7 @@ onUnmounted(() => {
   <div class="app" :class="{ fullscreen }" :data-motion="motionMode">
     <!-- 全屏：顶栏整条收掉（页签 + 会话下拉）。全屏切换按钮在办公室 HUD 的「演示模式」那一行
          （IsoOfficeView 的 .hud），收掉顶栏也不会丢出口，且不会落到滚动屏右边。
-         连接 / 相位来源 在办公室左下角说明条里（IsoOfficeView 的 .tip）；
-         项目名在顶栏（"设置"那一行）居中（App 的 .tabs-proj）。 -->
+         连接 / 相位来源 在办公室左下角说明条里（IsoOfficeView 的 .tip）。 -->
     <nav v-if="!fullscreen" class="tabs">
       <div class="tabs-group">
         <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
@@ -272,19 +253,15 @@ onUnmounted(() => {
           @click="tab = 'council'"
         >{{ t('nav.council') }}</button>
       </div>
-      <!-- 项目名：居中放在顶栏（"设置"那一行）中间，不占门楣单独一行 -->
-      <span v-if="projectLabel" class="tabs-proj">{{ t('lintel.project') }}：{{ projectLabel }}</span>
-      <div class="tabs-group">
-        <!-- 语言切换常驻（会话下拉在工位卡片 / 任务记录页会收掉，语言开关留着） -->
-        <LangSwitch />
-        <!-- 工位卡片 / 任务记录页 / 议事厅不需要会话下拉，收掉右上角这一样 -->
+      <div class="tabs-group tabs-actions">
         <SessionSwitcher
-          v-if="!bareTab && tab !== 'workstation'"
+          v-if="!bareTab"
           :items="sessionItems"
           :model-value="sessionValue"
           :empty-label="sessionEmptyLabel"
           @update:model-value="selectSession($event)"
         />
+        <LangSwitch />
       </div>
     </nav>
 
@@ -366,18 +343,8 @@ onUnmounted(() => {
   flex: none;
 }
 
-/* 项目名：居中放在顶栏中间（"设置"那一行），不占门楣单独一行 */
-.tabs-proj {
-  flex: 1 1 auto;
-  min-width: 0;
-  text-align: center;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 1px;
-  color: var(--muted, #6e7681);
+.tabs-actions {
+  margin-left: auto;
 }
 
 .body {
