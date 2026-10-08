@@ -754,7 +754,10 @@ onBeforeUnmount(() => {
       >
         {{ project.demo ? t('office.exit_demo') : t('office.demo') }}
       </button>
-      <!-- 全屏切换：放在「演示模式」这一行（和演示模式同类「显示」开关），收掉顶栏后也在此处，
+      <button @click="callAll">{{ t('office.meeting') }}</button>
+      <button @click="dismiss">{{ t('office.back_to_desk') }}</button>
+      <button @click="resetView">{{ t('office.reset_view') }}</button>
+      <!-- 全屏切换：放在「演示模式」这一行末尾，收掉顶栏后也在此处，
            不会落到滚动屏右边；标签在「全屏」/「退出全屏」间切换，按钮固定宽、不跳位 -->
       <button
         class="fs-hud-btn"
@@ -763,9 +766,6 @@ onBeforeUnmount(() => {
       >
         {{ fullscreen ? t('nav.exit_fullscreen') : t('nav.fullscreen') }}
       </button>
-      <button @click="callAll">{{ t('office.meeting') }}</button>
-      <button @click="dismiss">{{ t('office.back_to_desk') }}</button>
-      <button @click="resetView">{{ t('office.reset_view') }}</button>
     </div>
 
     <!-- 左下角说明条：连接状态 + 相位来源（原来在左上角那枚小徽标里）与操作说明**并列**一条。
