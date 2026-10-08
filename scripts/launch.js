@@ -56,7 +56,8 @@ function nodeVer() {
   return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
 }
 
-/** 低于声明版本时直接报错退出：低版本根本起不了 server，早失败早提示 */
+/** 启动器自身的 Node 版本提示（不再阻断）：server 改由 Electron 内置 Node 启动（见 startServer），
+ *  启动器用什么 node 跑都不影响 server 的运行环境，所以只在明显过低时给个提示，不 exit。 */
 function checkNodeVersion() {
   const req = requiredNodeVersion();
   if (!req) return; // 没声明就不拦
@@ -66,11 +67,10 @@ function checkNodeVersion() {
     (cur[0] === req[0] && cur[1] < req[1]) ||
     (cur[0] === req[0] && cur[1] === req[1] && cur[2] < req[2]);
   if (!lower) return;
-  console.error(
-    `[launch] Node 版本过低：当前 v${cur.join('.')}，WorkGremlin 需要 >= v${req.join('.')}。\n` +
-      '        请先升级 Node（例如 nvm install 24 && nvm use 24），否则 server 无法启动。'
+  console.warn(
+    `[launch] 提示：当前 Node v${cur.join('.')} 低于建议的 v${req.join('.')}；` +
+      'server 将由 Electron 内置 Node 运行，不影响启动。'
   );
-  process.exit(1);
 }
 
 function readServerInfo() {
@@ -161,13 +161,18 @@ function needsShell(bin) {
   return process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin);
 }
 
-/** 后台常驻启动 server（detached + unref，独立于本脚本生命周期） */
+/** 后台常驻启动 server（detached + unref，独立于本脚本生命周期）。
+ *  关键：server 用 **Electron 内置 Node** 跑（而非系统 node），这样机器上只要装了 Electron
+ *  （自带 Node 22.x）就能起 server，无需单独安装 Node。better-sqlite3 也正是在 postinstall 时
+ *  按 Electron ABI 编译的，二者配套。 */
 function startServer() {
-  const child = spawn(process.execPath, ['server/src/cli.js'], {
+  const bin = electronBin();
+  const child = spawn(bin, ['server/src/cli.js'], {
     cwd: ROOT,
     env: { ...process.env },
     stdio: 'ignore',
     detached: true,
+    shell: needsShell(bin),
   });
   child.unref();
   return child;
