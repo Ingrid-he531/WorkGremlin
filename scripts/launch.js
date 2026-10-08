@@ -56,8 +56,9 @@ function nodeVer() {
   return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
 }
 
-/** 启动器自身的 Node 版本提示（不再阻断）：server 改由 Electron 内置 Node 启动（见 startServer），
- *  启动器用什么 node 跑都不影响 server 的运行环境，所以只在明显过低时给个提示，不 exit。 */
+/** 启动器自身的 Node 版本校验（严格，过低直接退出）：client 仍由**系统 Node** 跑 Vite，
+ *  在 Node 22 下会启动失败（需 >= 24），所以这里卡住，避免在 client 起不来后才暴露问题。
+ *  server 已改用 Electron 内置 Node 启动（见 startServer，自带 Node 22.x），不受系统 Node 版本限制。 */
 function checkNodeVersion() {
   const req = requiredNodeVersion();
   if (!req) return; // 没声明就不拦
@@ -67,10 +68,12 @@ function checkNodeVersion() {
     (cur[0] === req[0] && cur[1] < req[1]) ||
     (cur[0] === req[0] && cur[1] === req[1] && cur[2] < req[2]);
   if (!lower) return;
-  console.warn(
-    `[launch] 提示：当前 Node v${cur.join('.')} 低于建议的 v${req.join('.')}；` +
-      'server 将由 Electron 内置 Node 运行，不影响启动。'
+  console.error(
+    `[launch] 当前 Node v${cur.join('.')} 过低，需要 >= v${req.join('.')}。\n` +
+      '        client（Vite）在 Node 22 下无法启动，请升级系统 Node 到 24+。\n' +
+      '        （server 由 Electron 内置 Node 运行，不受此限制；但启动器本身也用系统 Node 跑 client）'
   );
+  process.exit(1);
 }
 
 function readServerInfo() {
