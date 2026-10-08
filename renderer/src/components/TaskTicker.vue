@@ -12,10 +12,11 @@
  * 三条硬约束（沿用 FloorLcd 那套）：
  *   1. 唯一真相源：条目全部来自服务端的 tasks 表（/api/v1/task-feed），本组件**不推断任务状态**；
  *      楼层号由 task.client 反查 sessions.floors 得到，不在这里另排一份楼层表；
- *   2. 只动 transform：滚动是 CSS keyframes 的 translateX，位移量 = 一份序列的实测宽度
- *      （写进 --ticker-shift），不碰 width / left / top；
- *   3. 无缝循环：轨道里放 N 份相同序列，动画正好走**一份**的宽度就回到原点，所以看不出接缝。
- *      N 由"一份宽度 vs 屏宽"算出来（屏比一份宽时补到填满，否则尾部会空一段）。
+ *   2. 只动 transform：滚动由 JS rAF 每帧写 `translateX(offset)`，offset 连续累加，
+ *      不碰 width / left / top；这样增删内容（尤其是结束行）不会让已滚到一半的位置跳一下；
+ *   3. 单条传送带：所有行（进行中 + 结束）都从最右侧进、向左滚；进行中行滚出左边缘
+ *      就循环回右端（常驻滚动、字都从最右进），结束行滚出即删（只一遍，不重复）。
+ *      offset 连续累加、回收时按"滚出行的宽度"补偿，增删内容不会让后面的字跳一下。
  *
  * 无障碍：滚动的段码对读屏是噪音 → 屏幕本体 aria-hidden，另给一句 sr-only 的静态文本。
  */
@@ -34,14 +35,12 @@ const sessions = useSessionStore();
 const POLL_MS = 5000;
 /**
  * 收工后还"看不看得见"的窗口（分钟）：服务端按这个窗口回"刚收工"的那几条，
- * 本组件据此挑出要播报的结束提示。播报只滚一遍（见 detectEnded / onIter），
+ * 本组件据此挑出要播报的结束提示。播报只滚一遍（见 detectEnded：结束行滚出左边缘即删），
  * 窗口只决定能捕捉到哪些刚结束的任务，不影响"已结束就不再循环"。
  */
 const END_KEEP_MIN = 5;
 /** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
 const SPEED_PX_S = 70;
-/** 最短一圈时长（s）：条目很短（比如只有「当前无任务」）时也别快成一道闪光 */
-const MIN_DUR_S = 12;
 /** 单条文本**不限制长度**：用户原话在任务记录里可能是长句，门楣照原样滚，不截断。
  *  轨道 white-space:nowrap + 屏 overflow:hidden，长文本只是滚得久一点，不会溢出。 */
 /** 降级路径（老服务端）一次取多少条台账：够覆盖"在跑的"，又不至于每 5s 拉一大包 */
@@ -51,24 +50,31 @@ const FALLBACK_LIMIT = 60;
 const rows = ref([]);
 let timer = null;
 
-/** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 在窗口里只滚一遍 */
+/** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
-/** 正在"滚一遍"的结束提示（done/cancelled/failed）；滚完一圈即清空，回到只滚进行中 */
-const flashItems = ref([]);
-let flashTimer = null;
-let flashPending = false;
+/**
+ * 传送带上的显示行（进行中 running + 待滚一遍的结束行 done/cancelled/failed）。
+ * 统一从右端进、向左滚；进行中行滚出左边缘就挪回右端继续循环（常驻滚动），
+ * 结束行滚出就直接删掉（只一遍，绝不重复成"一堆"）。w = 实测宽度，回收/补偿用。
+ */
+const belt = ref([]);
+/** 行间距（px）：与 CSS .line 的 padding-right 一致，回收阈值用 */
+const GAP = 48;
+/** 内容变了要重测每行宽度（避免每帧读 layout） */
+let beltDirty = true;
 const firstLoad = ref(true);
 
 /** 结束任务 → 屏上那一行（绿=完成 / 红=取消·失败）。只要「时间 楼层 任务完成」，不接用户输入——
- *  接了会很长、且和进行中的任务混在一起分不清谁收的工；滚一遍即退场。 */
+ *  接了会很长、且和进行中的任务混在一起分不清谁收的工；只滚一遍即退场。 */
 function endedText(r) {
   const floor = floorOf(r.client);
   const kind = r.state === 'done' ? 'done' : 'cancelled';
   const tail = r.state === 'done' ? t('ticker.done') : r.state === 'failed' ? t('ticker.failed') : t('ticker.cancelled');
-  return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}` };
+  return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}`, w: 0 };
 }
 
-/** 从 rows 里挑出"刚结束、还没播报过"的任务，塞进 flashItems 滚一遍 */
+/** 从 rows 里挑出"刚结束、还没播报过"的任务：把还在带上的 running 行摘掉（若有）、
+ *  换成结束行，追加到传送带右端（从最右侧进）。 */
 function detectEnded() {
   const pid = project.projectId;
   const since = Date.now() - END_KEEP_MIN * 60_000;
@@ -80,24 +86,19 @@ function detectEnded() {
     if (announcedIds.has(r.id)) continue;
     announcedIds.add(r.id);
     if (firstLoad.value) continue; // 首屏不回放历史结束，避免一上来刷一堆
-    flashItems.value.push(endedText(r));
-    flashPending = true;
+    // 摘掉这条任务还在带上的 running 行（保持后面内容不跳：offset 补其宽度）
+    const kept = [];
+    for (const it of belt.value) {
+      if (it.kind === 'running' && it.id === r.id) offset += it.w + GAP;
+      else kept.push(it);
+    }
+    kept.push(endedText(r)); // 结束行追加到右端 → 从最右侧进
+    const wasEmpty = belt.value.length === 0;
+    belt.value = kept;
+    beltDirty = true;
+    if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右重新开始
   }
   firstLoad.value = false;
-}
-
-/** 结束提示滚完一遍（或超时）后清掉，回到只滚进行中任务 */
-function clearFlash() {
-  if (flashTimer) {
-    clearTimeout(flashTimer);
-    flashTimer = null;
-  }
-  flashItems.value = [];
-  flashPending = false;
-}
-/** 无缝循环滚完一圈：刚加进去的结束提示已过去一遍，移除 */
-function onIter() {
-  if (flashPending) clearFlash();
 }
 
 async function getJson(path) {
@@ -140,6 +141,7 @@ async function load() {
     const feed = await getJson(`/api/v1/task-feed?${q.toString()}`);
     if (feed) {
       rows.value = feed.items || [];
+      reconcileRunning();
       detectEnded();
       return;
     }
@@ -155,6 +157,7 @@ async function load() {
     // 两条路都拿不到：留着上一份，下一轮再试（不把屏清空）
     if (runs) {
       rows.value = pickFeed(runs.items || []);
+      reconcileRunning();
       detectEnded();
     }
   } catch {
@@ -221,66 +224,101 @@ const runningItems = computed(() =>
 );
 
 /**
- * 屏上滚动的序列 = 进行中任务 + 正在播一遍的结束提示。
- * 结束提示只活在 flashItems，滚完一圈（onIter）即清空 → 之后只剩进行中任务。
+ * 把"进行中任务"同步进传送带：新开的任务追加到右端（从最右侧进）；
+ * 已不在 running 的任务（收工/取消由 detectEnded 处理，这里兜底删除）从中段摘掉并补 offset。
  */
-const items = computed(() => [...flashItems.value, ...runningItems.value]);
+function reconcileRunning() {
+  const want = runningItems.value;
+  const wantIds = new Set(want.map((i) => i.id));
+  const kept = [];
+  for (const it of belt.value) {
+    if (it.kind === 'running' && !wantIds.has(it.id)) offset += it.w + GAP; // 摘掉：后面内容左移，offset 右移抵消
+    else kept.push(it);
+  }
+  const have = new Set(kept.filter((i) => i.kind === 'running').map((i) => i.id));
+  for (const it of want) if (!have.has(it.id)) kept.push({ ...it, w: 0 });
+  if (kept.length !== belt.value.length || kept.some((k, i) => k.id !== belt.value[i]?.id)) {
+    const wasEmpty = belt.value.length === 0;
+    belt.value = kept;
+    beltDirty = true;
+    if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右侧重新开始
+  }
+}
 
 /** 没有任务：屏上只摆一句静态居中的话，不进滚动轨道 */
-const idle = computed(() => items.value.length === 0);
+const idle = computed(() => belt.value.length === 0);
 
 /** 读屏文本：屏上那串滚动的段码对 AT 是噪音，这里给一句静态的 */
-const srText = computed(() => items.value.map((i) => i.text).join('；'));
+const srText = computed(() => belt.value.map((i) => i.text).join('；'));
 
-/* ------------------------------ 滚动（无缝循环） ------------------------------ */
+/* ------------------------------ 滚动（JS rAF 传送带） ------------------------------
+ * 单条传送带：所有行（进行中 + 结束）都从最右侧进、向左滚。
+ *   · 进行中行滚出左边缘 → 挪回右端继续循环（所以"字都从最右进"、且常驻滚动）。
+ *   · 结束行滚出左边缘 → 直接删掉（只一遍，绝不重复成"一堆"）。
+ * 增删只动 belt 数组；offset 连续累加、回收时按"滚出行的宽度"补偿，
+ * 所以摘行 / 循环都不会让后面的内容跳一下。 */
 
 const viewEl = ref(null);
 const trackEl = ref(null);
-/** 一份序列的实测宽度（px）= 动画要走的距离 */
-const seqW = ref(0);
 /** 屏幕可视宽度（px） */
 const viewW = ref(0);
 /** 系统「减弱动态效果」：不滚，静态摆着 */
 const reduce = ref(false);
 let ro = null;
+let raf = null;
+let lastTs = 0;
+let offset = 0;
 
-/** 内容指纹：变了才重启动画（否则每次轮询都会把滚到一半的字扯回原点） */
-const sig = computed(() => items.value.map((i) => `${i.kind}:${i.text}`).join('|'));
+/** 重测每行宽度 + 屏宽（写回 belt[i].w / viewW），回收阈值要用 */
+function measureBelt() {
+  if (viewEl.value) viewW.value = viewEl.value.clientWidth;
+  const el = trackEl.value;
+  if (!el) return;
+  const lines = el.querySelectorAll('.line');
+  let i = 0;
+  for (const ln of lines) {
+    if (i < belt.value.length) belt.value[i].w = ln.getBoundingClientRect().width;
+    i++;
+  }
+  beltDirty = false;
+}
 
-/**
- * 轨道里放几份序列：动画走完一份就回原点，所以轨道至少要"一份 + 一屏"宽，
- * 否则尾部会先空出来一段（条目少 / 屏很宽时最容易撞上）。
- */
-const reps = computed(() => {
-  if (reduce.value) return 1; // 不滚就只摆一份
-  // 结束播报在场时只放**一份**序列：完成/取消只滚一遍，不因无缝补位复制成多份
-  // （否则一条「任务完成」会同时出现 N 份，看着像一堆任务一起收工）。
-  // 份数为 1 时尾部空一段也没关系 —— 这一遍滚完（onIter）提示就退场了。
-  if (flashItems.value.length) return 1;
-  // 还没量到宽度（首帧）时先按 2 份排 —— 拿 1 当除数会算出上千份，白铺一屏 DOM
-  if (!seqW.value) return 2;
-  return Math.max(2, Math.ceil(1 + viewW.value / seqW.value));
-});
-/** 一圈时长：按内容宽度算，保证快慢一致（条目多就滚得久，不是快得看不清） */
-const durS = computed(() => (seqW.value ? Math.max(MIN_DUR_S, seqW.value / SPEED_PX_S) : 0));
-const trackStyle = computed(() => ({
-  animationDuration: `${durS.value}s`,
-  '--ticker-shift': `-${seqW.value}px`,
-}));
-
-function measure() {
-  const v = viewEl.value;
-  if (v) viewW.value = v.clientWidth;
-  // 轨道不在（没有任务时只摆一句静态的话）→ 宽度归零，别拿上一份的旧宽度算份数
-  const seq = trackEl.value && trackEl.value.firstElementChild;
-  seqW.value = seq ? seq.getBoundingClientRect().width : 0;
+function tick(ts) {
+  if (!lastTs) lastTs = ts;
+  const dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+  const el = trackEl.value;
+  if (!el) {
+    raf = requestAnimationFrame(tick);
+    return;
+  }
+  if (beltDirty) measureBelt();
+  if (!reduce.value && belt.value.length) {
+    offset -= SPEED_PX_S * dt;
+    // 最前面的行滚出左边缘（它的右沿到了屏左）→ 回收
+    while (belt.value.length && belt.value[0].w + GAP <= -offset) {
+      const it = belt.value[0];
+      const w = it.w + GAP;
+      if (it.kind === 'running') belt.value.push(belt.value.shift()); // 循环到右端，仍从最右进
+      else belt.value.shift(); // 结束行：只滚一遍，删
+      offset += w; // 补偿，保持后面的内容不跳
+      beltDirty = true;
+    }
+    if (beltDirty) measureBelt();
+    el.style.transform = `translateX(${offset}px)`;
+  } else if (el) {
+    el.style.transform = 'translateX(0)';
+  }
+  raf = requestAnimationFrame(tick);
 }
 
 onMounted(async () => {
   await load();
-  measure();
+  await nextTick();
+  measureBelt();
+  if (belt.value.length && offset === 0) offset = viewW.value || 600; // 首屏也从最右进
   if (typeof ResizeObserver !== 'undefined' && viewEl.value) {
-    ro = new ResizeObserver(() => measure());
+    ro = new ResizeObserver(() => measureBelt());
     ro.observe(viewEl.value);
   }
   if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
@@ -293,6 +331,7 @@ onMounted(async () => {
     else if (mq.addListener) mq.addListener(onChange); // 老 Safari
   }
   timer = setInterval(load, POLL_MS);
+  raf = requestAnimationFrame(tick);
 });
 
 onBeforeUnmount(() => {
@@ -300,22 +339,9 @@ onBeforeUnmount(() => {
   timer = null;
   if (ro) ro.disconnect();
   ro = null;
+  if (raf) cancelAnimationFrame(raf);
+  raf = null;
 });
-
-// 内容变了（新任务 / 收工 / 切语言）→ DOM 换了 → 重新量宽度，动画按新宽度走
-watch(sig, () => nextTick(measure));
-// 份数变了（窗口缩放 / 初次量到宽度）→ 轨道重排，也要重量
-watch(reps, () => nextTick(measure));
-// 结束提示进/出：重量宽度（内容变了），并兜底清掉（减弱动态或动画迭代事件没触发时）
-watch(
-  () => flashItems.value.length,
-  () => {
-    if (flashItems.value.length && !flashTimer) {
-      flashTimer = setTimeout(clearFlash, reduce.value ? 4000 : 30000);
-    }
-    nextTick(measure);
-  }
-);
 </script>
 
 <template>
@@ -323,20 +349,17 @@ watch(
     <div ref="viewEl" class="screen">
       <!-- 没有任务：静态居中一句，不滚 -->
       <span v-if="idle" class="idle-line">{{ t('ticker.no_task') }}</span>
-      <!-- 有任务：滚动的段码不进无障碍树，读屏听下面的 .sr -->
+      <!-- 有任务：滚动的段码不进无障碍树，读屏听下面的 .sr。
+           单条传送带：每条行（进行中 / 结束）都从最右端进、向左滚；
+           进行中行滚出左边缘循环回右端，结束行滚出即删（只一遍）。位移由 JS rAF 驱动。 -->
       <div
         v-else
         ref="trackEl"
-        :key="sig"
         class="track"
         :class="{ static: reduce }"
-        :style="trackStyle"
-        @animationiteration="onIter"
         aria-hidden="true"
       >
-        <span v-for="n in reps" :key="n" class="seq">
-          <span v-for="it in items" :key="it.id" class="line" :class="`k-${it.kind}`">{{ it.text }}</span>
-        </span>
+        <span v-for="it in belt" :key="it.id" class="line" :class="`k-${it.kind}`">{{ it.text }}</span>
       </div>
       <span class="scan" aria-hidden="true" />
     </div>
@@ -380,17 +403,8 @@ watch(
   );
 }
 
-/* 轨道：N 份序列横排，动画正好走一份（--ticker-shift）就无缝回到原点 */
+/* 轨道：传送带本体，行横排；位移由 JS rAF 直接写 transform，不挂 CSS 动画 */
 .track {
-  display: flex;
-  flex: none;
-  animation-name: ticker-roll;
-  animation-timing-function: linear;
-  animation-iteration-count: infinite;
-}
-
-/* 一份序列 */
-.seq {
   display: flex;
   flex: none;
 }
@@ -431,25 +445,8 @@ watch(
   color: var(--text-dim, #9aa3b2);
 }
 
-@keyframes ticker-roll {
-  from {
-    transform: translateX(0);
-  }
-  to {
-    transform: translateX(var(--ticker-shift, -50%));
-  }
-}
-
-/* 系统「减弱动态效果」：不滚，静态摆着（JS 那边同时把份数降到 1，不重复文本） */
-@media (prefers-reduced-motion: reduce) {
-  .track {
-    animation: none !important;
-  }
-}
-
-.track.static {
-  animation: none;
-}
+/* 系统「减弱动态效果」：不滚，JS 那边把 offset 固定为 0（见 tick），
+   轨道本就没有 CSS 动画，这里无需再禁。 */
 
 /* 屏上段码不进无障碍树（见模板 aria-hidden），这一句是给 AT 的替代文本 */
 .sr {
