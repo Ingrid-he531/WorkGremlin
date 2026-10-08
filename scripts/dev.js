@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * 开发启动器：并行拉起 Vite（renderer, 5173）与 Electron（desktop）。
+ * 开发启动器：并行拉起 Vite（renderer, 5173）与 Electron。Electron 入口为
+ * desktop/src/launcher.js，它会用 Electron 内置 Node 起 server、再起 client（dev 模式加载 Vite URL）。
  * 用法：
  *   npm run dev                 接真实数据源
  *
@@ -72,6 +73,6 @@ const electronBin = path.join(
 
 // 开发态一律接真实数据源；演示模式在界面里现切（见文件头的说明）。
 run('vite', npm, ['run', 'dev', '--workspace', '@workgremlin/renderer']);
-run('electron', electronBin, [path.join('desktop', 'src', 'main.js'), ...extra], {
+run('electron', electronBin, [path.join('desktop', 'src', 'launcher.js'), ...extra], {
   env: { WORKGREMLIN_DEV: '1' },
 });

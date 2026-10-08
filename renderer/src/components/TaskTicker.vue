@@ -5,8 +5,9 @@
  * 上一版（FloorLcd）是"层站指示器"：答"现在在哪层 / 要去哪层"。现在整块屏改成任务流：
  *   · **不再显示当前楼层** —— 楼层在左边胶囊（FloorSelector）与轿厢里都有，屏上重复一份没用；
  *   · 屏**尽可能长**：门楣上项目名占它自己那点宽，剩下全给这块屏（见 ElevatorDoors 的布局）；
- *   · 内容 = **所有楼层**的当前任务，多个任务依次滚动；任务收工/取消后它就不再滚
- *     （服务端只回"还在跑的 + 最近几分钟收工的"，见 /api/v1/task-feed）。
+ *   · 内容 = **所有楼层正在跑**的任务（running），依次无限滚动；任务收工/取消时，结果行
+ *     **只滚一遍**就退场（不再循环），之后只剩进行中的任务；都没了居中显示「暂无活跃任务」。
+ *     服务端回"还在跑的 + 最近几分钟收工的"，见 /api/v1/task-feed。
  *
  * 三条硬约束（沿用 FloorLcd 那套）：
  *   1. 唯一真相源：条目全部来自服务端的 tasks 表（/api/v1/task-feed），本组件**不推断任务状态**；
@@ -32,22 +33,72 @@ const sessions = useSessionStore();
 /** 轮询间隔：任务是低频事件（开工/收工），5s 足够，不必挂 WS */
 const POLL_MS = 5000;
 /**
- * 收工后还滚多久（分钟）：服务端按这个窗口回"刚收工"的那几条。
- * 用户要求"任务结束或取消后不再滚动" —— 这里是"结果再滚一会儿让人看见，之后自动退场"。
+ * 收工后还"看不看得见"的窗口（分钟）：服务端按这个窗口回"刚收工"的那几条，
+ * 本组件据此挑出要播报的结束提示。播报只滚一遍（见 detectEnded / onIter），
+ * 窗口只决定能捕捉到哪些刚结束的任务，不影响"已结束就不再循环"。
  */
 const END_KEEP_MIN = 5;
 /** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
 const SPEED_PX_S = 70;
 /** 最短一圈时长（s）：条目很短（比如只有「当前无任务」）时也别快成一道闪光 */
 const MIN_DUR_S = 12;
-/** 单条文本上限：一条滚过去要看得完，超长的标题截断（原文在悬停/任务记录页里看） */
-const MAX_LEN = 120;
+/** 单条文本**不限制长度**：用户原话在任务记录里可能是长句，门楣照原样滚，不截断。
+ *  轨道 white-space:nowrap + 屏 overflow:hidden，长文本只是滚得久一点，不会溢出。 */
 /** 降级路径（老服务端）一次取多少条台账：够覆盖"在跑的"，又不至于每 5s 拉一大包 */
 const FALLBACK_LIMIT = 60;
 
 /** 服务端回来的原始行 */
 const rows = ref([]);
 let timer = null;
+
+/** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 在窗口里只滚一遍 */
+const announcedIds = new Set();
+/** 正在"滚一遍"的结束提示（done/cancelled/failed）；滚完一圈即清空，回到只滚进行中 */
+const flashItems = ref([]);
+let flashTimer = null;
+let flashPending = false;
+const firstLoad = ref(true);
+
+/** 结束任务 → 屏上那一行（绿=完成 / 红=取消·失败）。只要「时间 楼层 任务完成」，不接用户输入——
+ *  接了会很长、且和进行中的任务混在一起分不清谁收的工；滚一遍即退场。 */
+function endedText(r) {
+  const floor = floorOf(r.client);
+  const kind = r.state === 'done' ? 'done' : 'cancelled';
+  const tail = r.state === 'done' ? t('ticker.done') : r.state === 'failed' ? t('ticker.failed') : t('ticker.cancelled');
+  return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}` };
+}
+
+/** 从 rows 里挑出"刚结束、还没播报过"的任务，塞进 flashItems 滚一遍 */
+function detectEnded() {
+  const pid = project.projectId;
+  const since = Date.now() - END_KEEP_MIN * 60_000;
+  for (const r of rows.value) {
+    if (!r || r.parent_task_id) continue;
+    if (pid && r.project_id !== pid) continue;
+    if (!['done', 'failed', 'cancelled'].includes(r.state)) continue;
+    if (Number(r.ended_at) < since) continue;
+    if (announcedIds.has(r.id)) continue;
+    announcedIds.add(r.id);
+    if (firstLoad.value) continue; // 首屏不回放历史结束，避免一上来刷一堆
+    flashItems.value.push(endedText(r));
+    flashPending = true;
+  }
+  firstLoad.value = false;
+}
+
+/** 结束提示滚完一遍（或超时）后清掉，回到只滚进行中任务 */
+function clearFlash() {
+  if (flashTimer) {
+    clearTimeout(flashTimer);
+    flashTimer = null;
+  }
+  flashItems.value = [];
+  flashPending = false;
+}
+/** 无缝循环滚完一圈：刚加进去的结束提示已过去一遍，移除 */
+function onIter() {
+  if (flashPending) clearFlash();
+}
 
 async function getJson(path) {
   const info = project.serverInfo || {};
@@ -89,10 +140,11 @@ async function load() {
     const feed = await getJson(`/api/v1/task-feed?${q.toString()}`);
     if (feed) {
       rows.value = feed.items || [];
+      detectEnded();
       return;
     }
     /**
-     * 降级：server 是**常驻进程**（scripts/launch.js 管生命周期，重启客户端不会重启它），
+     * 降级：server 是**常驻进程**（launcher（desktop/src/launcher.js）管生命周期，重启客户端不会重启它），
      * 所以"新版客户端 + 旧版服务端"是常见组合 —— 旧进程上没有 /task-feed（404），
      * 这时退到台账接口 /task-runs 自己筛，别让屏上一句"暂无活跃任务"把真在跑的任务盖住
      * （2026-10-08 实测：1F 那条任务在库里好好跑着，屏上却什么都没有）。
@@ -101,10 +153,14 @@ async function load() {
      */
     const runs = await getJson(`/api/v1/task-runs?limit=${FALLBACK_LIMIT}`);
     // 两条路都拿不到：留着上一份，下一轮再试（不把屏清空）
-    if (runs) rows.value = pickFeed(runs.items || []);
+    if (runs) {
+      rows.value = pickFeed(runs.items || []);
+      detectEnded();
+    }
   } catch {
     /* 拉不到就留着上一份，下一轮再试 */
   }
+  firstLoad.value = false;
 }
 
 /** HH:mm（屏上是段码手感，只要时与分；日期交给任务记录页） */
@@ -135,7 +191,8 @@ function promptOf(title) {
   return body.replace(/\s+/g, ' ').trim();
 }
 
-const clip = (s) => (s.length > MAX_LEN ? `${s.slice(0, MAX_LEN)}…` : s);
+/** 不截断：保留 promptOf 取出的完整用户原话（见顶部 MAX_LEN 说明）。 */
+const clip = (s) => s;
 
 /**
  * client → 楼层号（1F / 3F …）。
@@ -151,29 +208,26 @@ function floorOf(client) {
   return f ? f.id : '—';
 }
 
-/** 滚动条目：kind 决定颜色，text 是屏上那一整行 */
-const items = computed(() => {
-  const list = [];
-  for (const r of rows.value) {
-    if (!r) continue;
-    const floor = floorOf(r.client);
-    if (r.state === 'running') {
+/** 进行中的任务（running）：无限滚动循环的常驻内容 */
+const runningItems = computed(() =>
+  rows.value
+    .filter((r) => r && !r.parent_task_id && r.state === 'running' && (!project.projectId || r.project_id === project.projectId))
+    .sort((a, b) => Number(a.started_at) - Number(b.started_at))
+    .map((r) => {
+      const floor = floorOf(r.client);
       const text = promptOf(r.title) || t('ticker.untitled');
-      list.push({ id: r.id, kind: 'running', text: `${hhmm(r.started_at)} ${floor} ${t('ticker.task', { text: clip(text) })}` });
-      continue;
-    }
-    // 收工的三态：完成（绿）/ 取消（红）/ 失败（红，文案如实写"失败"）
-    const kind = r.state === 'done' ? 'done' : 'cancelled';
-    const tail = r.state === 'done' ? t('ticker.done') : r.state === 'failed' ? t('ticker.failed') : t('ticker.cancelled');
-    list.push({ id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}` });
-  }
-  // 一条都没有：静态居中一句「暂无活跃任务」——不是留一块黑屏，也不滚
-  // （滚一条"没有任务"看着像有东西在动，反倒像漏了什么）
-  return list.length ? list : [{ id: 'none', kind: 'none', text: t('ticker.no_task') }];
-});
+      return { id: r.id, kind: 'running', text: `${hhmm(r.started_at)} ${floor} ${t('ticker.task', { text: clip(text) })}` };
+    })
+);
+
+/**
+ * 屏上滚动的序列 = 进行中任务 + 正在播一遍的结束提示。
+ * 结束提示只活在 flashItems，滚完一圈（onIter）即清空 → 之后只剩进行中任务。
+ */
+const items = computed(() => [...flashItems.value, ...runningItems.value]);
 
 /** 没有任务：屏上只摆一句静态居中的话，不进滚动轨道 */
-const idle = computed(() => items.value.length === 1 && items.value[0].kind === 'none');
+const idle = computed(() => items.value.length === 0);
 
 /** 读屏文本：屏上那串滚动的段码对 AT 是噪音，这里给一句静态的 */
 const srText = computed(() => items.value.map((i) => i.text).join('；'));
@@ -199,6 +253,10 @@ const sig = computed(() => items.value.map((i) => `${i.kind}:${i.text}`).join('|
  */
 const reps = computed(() => {
   if (reduce.value) return 1; // 不滚就只摆一份
+  // 结束播报在场时只放**一份**序列：完成/取消只滚一遍，不因无缝补位复制成多份
+  // （否则一条「任务完成」会同时出现 N 份，看着像一堆任务一起收工）。
+  // 份数为 1 时尾部空一段也没关系 —— 这一遍滚完（onIter）提示就退场了。
+  if (flashItems.value.length) return 1;
   // 还没量到宽度（首帧）时先按 2 份排 —— 拿 1 当除数会算出上千份，白铺一屏 DOM
   if (!seqW.value) return 2;
   return Math.max(2, Math.ceil(1 + viewW.value / seqW.value));
@@ -248,13 +306,23 @@ onBeforeUnmount(() => {
 watch(sig, () => nextTick(measure));
 // 份数变了（窗口缩放 / 初次量到宽度）→ 轨道重排，也要重量
 watch(reps, () => nextTick(measure));
+// 结束提示进/出：重量宽度（内容变了），并兜底清掉（减弱动态或动画迭代事件没触发时）
+watch(
+  () => flashItems.value.length,
+  () => {
+    if (flashItems.value.length && !flashTimer) {
+      flashTimer = setTimeout(clearFlash, reduce.value ? 4000 : 30000);
+    }
+    nextTick(measure);
+  }
+);
 </script>
 
 <template>
   <div class="ticker">
     <div ref="viewEl" class="screen">
       <!-- 没有任务：静态居中一句，不滚 -->
-      <span v-if="idle" class="idle-line">{{ items[0].text }}</span>
+      <span v-if="idle" class="idle-line">{{ t('ticker.no_task') }}</span>
       <!-- 有任务：滚动的段码不进无障碍树，读屏听下面的 .sr -->
       <div
         v-else
@@ -263,6 +331,7 @@ watch(reps, () => nextTick(measure));
         class="track"
         :class="{ static: reduce }"
         :style="trackStyle"
+        @animationiteration="onIter"
         aria-hidden="true"
       >
         <span v-for="n in reps" :key="n" class="seq">

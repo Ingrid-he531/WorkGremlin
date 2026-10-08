@@ -616,7 +616,7 @@ function createIngestPlugin(options, { location, base } = {}) {
    */
   function startTask(event, sid, prompt = "") {
     const said = String(prompt || "").replace(/\s+/g, " ").trim()
-    const title = (said || titles.get(sid) || "").slice(0, 80) || "(未命名任务)"
+    const title = said || titles.get(sid) || "(未命名任务)"
     const taskId = `k_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
     taskIds.set(sid, taskId)
     roundFiles.set(sid, new Set())
@@ -636,11 +636,11 @@ function createIngestPlugin(options, { location, base } = {}) {
     // 早先这里只抹 done、不写 taskTitle，于是 7F/8F 的「思考中」屏上**一个字都没有** ——
     // 别的楼层（hook 那一路，hook.js 的 TASK_START 分支）都写 taskTitle，所以只有 7F/8F 空着。
     //
-    // 只写 `said`（用户原话，截到与 hook 同一口径的 80 字），**不写会话标题**：
+    // 只写 `said`（用户原话，完整不截断——与 hook 同一口径），**不写会话标题**：
     // 会话标题默认是 "New session - <时间戳>" 这种没信息量的值，拿它当"用户问了什么"是编造。
     // 拿不到原话就写空串（而不是留着上一轮的旧 prompt）—— 空屏好过显示上一轮的内容。
     try {
-      writeState(statePath(client, wsOf(event), sid), { done: null, taskTitle: said.slice(0, 80) })
+      writeState(statePath(client, wsOf(event), sid), { done: null, taskTitle: said })
     } catch {
       /* 抹不掉就算了：readReporterDone 有 TTL，最多多显示一会儿 */
     }

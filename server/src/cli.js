@@ -13,7 +13,7 @@
  * 服务端会按需播种并起推进器（见 index.js 的 syncDemo）；界面上就是 HUD 的「演示模式」按钮。
  */
 
-// 运行时版本校验：server 现在优先由 Electron 内置 Node 启动（见 scripts/launch.js 的 startServer），
+// 运行时版本校验：server 现在优先由 Electron 内置 Node 启动（见 desktop/src/launcher.js 的 startServer），
 // 所以这里不再强卡 Node 大版本。仅在「纯 node 运行时」且低于 Node 22 时提示——
 // better-sqlite3@13 是 N-API，跨 Node 22/24 与 Electron 内置 Node 二进制兼容，22 即可。
 {
@@ -25,7 +25,7 @@
     if (less(cur.slice(1).map(Number), floor)) {
       console.error(
         `[workgremlin] Node 版本过低：当前 ${process.version}，需要 >= v22。\n` +
-          '        可改用 Electron 内置 Node 启动（无需单独安装 Node）：见 scripts/launch.js。'
+          '        可改用 Electron 内置 Node 启动（无需单独安装 Node）：见 desktop/src/launcher.js。'
       );
       process.exit(1);
     }

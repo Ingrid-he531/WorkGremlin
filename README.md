@@ -10,19 +10,20 @@
 ## 快速开始
 
 ```bash
-# 前置：Node >= 24；Linux 另需 python3 + make + g++（编译 better-sqlite3）
+# 前置：Node >= 18（dev 模式的 Vite 需要）；Linux 另需 python3 + make + g++（npm install 时编译 better-sqlite3）。
+# server/client 跑在 Electron 内置 Node 上，无需单独装 Node。
 node -v && npm -v && python3 --version && which make g++
 
 # 安装依赖（postinstall 会自动跑 electron-rebuild 重建 better-sqlite3）
 npm install
 
-# 启动（先起本地服务，再开桌面窗口）
-npm run launch
+# 启动（Electron 自带 Node 起 server + 开桌面窗口；应用退出后 server 仍在后台常驻）
+npm run launch:electron
 
-# 想重启服务：npm run launch -- --restart
+# 开发模式（Vite 热更 + Electron 窗口）：npm run dev
+# 构建 renderer 后启动（prod）：npm run build:electron
 # 只跑本地服务、不开窗口：npm run server
 # 只验一下原生模块能不能用（建表 → 写入 → 读回）：npm run db:check
-# 开发模式（Vite 热更 + 窗口）：npm run dev
 ```
 
 **演示模式**：起完之后，在办公室右下角操作条上点「演示模式」（在「集合开会」左边）——

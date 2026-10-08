@@ -3,9 +3,10 @@
 /**
  * Electron 主进程入口（client）。
  *
- * 关键设计：server 由启动器 scripts/launch.js 先行以独立进程启动（node server/src/cli.js），
- * 并写入 ~/.workgremlin/server.json；本进程只读取 server.json 连接该 server，**不自行启动 server**，
- * 也不依赖任何环境变量。server 的生命周期完全由 launch.js 管理。
+ * 关键设计：server 由 launcher（desktop/src/launcher.js，Electron 主进程入口）先行以独立进程
+ * 启动（electron server/src/cli.js，即 Electron 内置 Node 跑），并写入 ~/.workgremlin/server.json；
+ * 本进程只读取 server.json 连接该 server，**不自行启动 server**，也不依赖任何环境变量。
+ * server 的内存持久由 launcher 管理（detached，应用退出不随之退出）。
  *
  * 启动顺序：app.ready -> 读 server.json 连接已起好的 server -> 建窗
  */
@@ -56,13 +57,13 @@ async function bootstrap() {
   // 演示模式**没有启动开关**（原来的 --demo / --demo-seed / WORKGREMLIN_DEMO* 都散了）：
   // 它由界面上的「演示模式」按钮切换工程触发（见 server 的 syncDemo），启动一律接真实数据。
 
-  // server 由启动器(launch.js)先行启动并写入 server.json；client 只读取并连接，不自行启动 server。
+  // server 由 launcher（desktop/src/launcher.js）先行启动并写入 server.json；client 只读取并连接，不自行启动 server。
   const existing = readServerInfoFile();
   if (existing && (await pingPort(existing.port))) {
     serverInfo = existing;
     console.log(`[workgremlin] 连接 server：port=${existing.port}`);
   } else {
-    console.error('[workgremlin] 未找到可用 server（请先通过 launch.js 启动），退出');
+    console.error('[workgremlin] 未找到可用 server（请先通过 npm run dev / npm run launch:electron 启动），退出');
     app.quit();
     return;
   }

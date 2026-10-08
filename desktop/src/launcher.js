@@ -3,13 +3,14 @@
 /**
  * 打包产物（AppImage / deb / dmg）的 Electron 主进程入口。
  *
- * 背景：AppImage 内没有 `node` 命令，无法再用 `scripts/launch.js`（node 脚本）启动，
+ * 背景：AppImage 内没有 `node` 命令，故由 Electron 主进程自己承担「起 server + 起 client」；
  * 所以由 Electron 主进程自己承担「起 server + 起 client」：
  *   1. 用 AppImage 自带的 Electron（process.execPath）起 server 子进程（server/src/cli.js）
  *   2. 等 server 就绪（探活 server.json 里的端口）
  *   3. require('./main') —— 复用 main.js 的全部 client 逻辑（建窗 / IPC / 菜单 / 全屏）
  *
- * dev 模式（npm run launch / npm run dev）不走这里，仍由 scripts/launch.js 驱动。
+ * dev 模式（npm run dev / npm run launch:electron）也走这里：Electron 主进程用内置 Node 起
+ * server + 复用 main.js 的 client，不依赖 scripts/launch.js。
  */
 const { app } = require('electron');
 const net = require('node:net');
@@ -20,8 +21,28 @@ const path = require('node:path');
 
 const HOME = process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
 const SERVER_JSON = path.join(HOME, 'server.json');
-// 打包后指向 asar 内的项目根；dev 下指向项目根
-const ROOT = app.getAppPath();
+// 打包后指向 asar 内的项目根；dev 下指向项目根。
+// 注意：Electron 以 `electron <file.js>` 启动时 app.getAppPath() 只返回该文件所在目录
+// （不会向上找 package.json），dev 下直接跑 launcher.js 会算成 desktop/src，导致 server
+// 路径错误。故这里向上找到含 workspaces 的仓库根；asar 内无 workspaces 字段时回退到
+// app.getAppPath()，打包行为不变。
+function findRepoRoot(from) {
+  let dir = from;
+  for (let i = 0; i < 6; i += 1) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      if (Array.isArray(pkg.workspaces)) return dir;
+    } catch {
+      /* 读不到/无 workspaces：继续向上 */
+    }
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return from;
+}
+
+const ROOT = findRepoRoot(app.getAppPath());
 
 function readServerInfo() {
   try {
@@ -56,14 +77,27 @@ function waitFor(predicate, timeoutMs, label) {
   });
 }
 
+// 把 client 收到的 sandbox/headless 类 flag（--no-sandbox / --disable-*）透传给 server 子进程。
+// 否则在多 sandbox 受限的环境里，client 关了 sandbox 但 server 仍走默认 sandbox 会起不来，
+// 表现为 launcher 等 15s 超时后退出（"没法启动"）。
+function passthroughFlags() {
+  return process.argv
+    .slice(2)
+    .filter((a) => a.startsWith('--no-sandbox') || a.startsWith('--disable-'));
+}
+
 function startServer() {
   // 用 AppImage 自带的 Electron 跑 server（不是系统 node）；asar 内脚本可作为 electron 入口
-  const child = spawn(process.execPath, [path.join(ROOT, 'server/src/cli.js')], {
-    cwd: ROOT,
-    env: { ...process.env },
-    stdio: 'ignore',
-    detached: true,
-  });
+  const child = spawn(
+    process.execPath,
+    [...passthroughFlags(), path.join(ROOT, 'server/src/cli.js')],
+    {
+      cwd: ROOT,
+      env: { ...process.env },
+      stdio: 'ignore',
+      detached: true,
+    }
+  );
   child.unref();
 }
 

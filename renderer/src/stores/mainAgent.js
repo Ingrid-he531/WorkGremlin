@@ -29,6 +29,10 @@ import { defineStore, acceptHMRUpdate } from 'pinia';
 import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 import { t } from '../i18n/index.js';
 
+/** 进行中的相位：这些相位下，若实时相位回落到空闲（没有新工具调用），
+ *  应回「思考中」而非「待命」——Agent 正在推理、等下一口工具。 */
+const ACTIVE_PHASES = ['tool', 'thinking', 'await', 'dispatch', 'waiting'];
+
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
 const SCRIPT = [
   { phase: 'idle', action: '', context: ['等待派单'], skill: '', tool: '', prompt: '', ms: 6000 },
@@ -198,18 +202,31 @@ export const useMainAgentStore = defineStore('mainAgent', {
         phase = 'tool';
       } else if (hookPhase === 'blocked') {
         phase = 'await';
-      } else if (PHASES[hookPhase]) {
+      } else if (PHASES[hookPhase] && hookPhase !== 'idle' && hookPhase !== 'online' && hookPhase !== 'offline' && hookPhase !== 'unreported') {
+        // thinking / tool / await / dispatch / waiting / done / cancelled：照单全收
         phase = hookPhase;
+      } else if (hookPhase === 'idle' || hookPhase === 'online') {
+        // 没有新的工具调用 / 实时相位回落：这一轮任务还在进行中（刚还在调工具 / 思考）就回
+        // 「思考中」，而不是「待命中」—— Agent 正在推理、等下一口工具。离线（offline）/ 未知才真·待命。
+        phase = ACTIVE_PHASES.includes(this.phase) ? 'thinking' : 'idle';
       } else {
-        phase = 'idle';
+        phase = 'idle'; // offline / unreported / 未知：确实没在干活
       }
       this.phase = phase;
-      this.action = s.action || '';
+      // 回到「思考中」的那一口：保留上一口的状态文案（刚在调的工具 / 用户的 prompt），别清空成空白；
+      // 真正待命（idle）才清空。
+      if (phase === 'thinking' && (hookPhase === 'idle' || hookPhase === 'online')) {
+        this.action = s.action || this.action;
+        this.context = Array.isArray(s.context) && s.context.length ? s.context : this.context;
+        this.prompt = s.prompt || this.prompt;
+      } else {
+        this.action = s.action || '';
+        this.context = Array.isArray(s.context) ? s.context : [];
+        this.prompt = s.prompt || '';
+      }
       this.skill = s.skill || '';
       this.tool = s.tool || '';
       this.target = s.target || null;
-      this.context = Array.isArray(s.context) ? s.context : [];
-      this.prompt = s.prompt || '';
     },
 
     /**

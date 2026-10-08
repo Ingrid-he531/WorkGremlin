@@ -187,7 +187,8 @@ const HB_INTERVAL_MS = 15_000;
 const HB_IDLE_EXIT_MS = 30 * 60_000;
 /** 兜底：再怎么样 6 小时也退 */
 const HB_MAX_LIFE_MS = 6 * 60 * 60_000;
-const TITLE_MAX = 80;
+/** 任务标题（用户原话）不做长度截断：DB 列是 TEXT，详情 / 门楣都按完整原文显示。
+ *  早先截前 80 字，会导致"任务详情 / 滚动字幕里的用户输入"被砍掉（见 plugin/index.js 的同源处理）。 */
 /** 台账"产出"全文上限（服务端另有上限，见 server/src/ingest/bus.js 的 RUN_RESULT_MAX） */
 const RESULT_MAX = 4_000;
 /** 单条 AI 回复进对话记录的长度上限 */
@@ -464,7 +465,7 @@ const INJECTED_PROMPT_RE = /^\s*<(?:task-notification|agent-message)[\s>]/i;
  *   ## My request:
  *   <用户真正写的那句话>
  * 整段拿去当标题，任务列表里就只剩 "Context from my IDE setup: ## Active file: … ##"
- * （标题只截前 TITLE_MAX 字，全被注入块占满，用户的话一个字都看不见）。所以：认得出这是注入块
+ * （注入块占满前 80 字时用户的话一个字都看不见，已落过两条全是信封的任务）。所以：认得出这是注入块
  * （有那个标题行，或 Active file / Open tabs 小节）+ 有请求分隔行，就只取分隔行后面的正文；
  * 注入块里没有正文就返回空串（调用方退化成"（未命名任务）"，好过把 IDE 上下文当任务名）。
  * 不像注入块的原样返回 —— 用户真在 prompt 里写 "My request:" 这类字样的不会被误伤。
@@ -474,7 +475,7 @@ function userRequestText(raw) {
     .replace(/\r\n?/g, '\n')
     // IDE 注入的"打开了某文件"块是**拼在用户原话前面**的（实测 2026-09-24 的
     // bd0c4119 会话：整条 = `<ide_opened_file>…</ide_opened_file>先不谈 cli 和 plugin,
-    // 单说 cli 和主 agent…`）。标题只取前 TITLE_MAX(80) 字，正好被这个块占满，
+    // 单说 cli 和主 agent…`）。标题只取前 80 字时正好被这个块占满，
     // 用户的话一个字都看不见 —— 实测已经因此落了两条标题全是信封的任务（t_muf561ug / t_muf6mx6w）。
     // 所以整块剥掉再往下走。
     // 注意它和 <task-notification> / <agent-message> **不是一回事**：那两个是"整条就是信封"
@@ -1872,7 +1873,7 @@ async function main() {
     clearAwait(file); // 新的一轮用户输入：之前挂起的"等授权"作废
     // 用户原话 = 剥掉 IDE 注入块之后的正文（见 userRequestText）
     const prompt = userRequestText(ev.prompt);
-    const title = prompt.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX) || '（未命名任务）';
+    const title = prompt.replace(/\s+/g, ' ').trim() || '（未命名任务）';
     // 这一轮走的形态（CLI / IDE 插件）：Codex（3F）与 Claude（4F）的两种形态都共用一份落盘、
     // client 也相同，只有会话自己落的记录分得出 —— Codex 看 rollout 的 session_meta，
     // Claude 看 transcript 的 entrypoint（见 codexForm / claudeForm）。认一次存进状态文件。
