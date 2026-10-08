@@ -964,7 +964,7 @@ async function saveRetention() {
                  其余楼层本来就没有这东西，不显示 "—" 占位（免得看着像"丢了"） -->
             <template v-if="sessionTitleOf(tasks.selectedTask)">
               <div class="k">{{ tr('records.detail.session_title') }}</div>
-              <div class="v v-bright">{{ sessionTitleOf(tasks.selectedTask) }}</div>
+              <div class="v">{{ sessionTitleOf(tasks.selectedTask) }}</div>
             </template>
             <div class="k">{{ tr('records.detail.state') }}</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
             <!-- 「进度」暂时不显示（2026-09-29 用户要求注释掉）：progress 现在拿不到真值 ——
