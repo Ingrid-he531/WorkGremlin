@@ -283,6 +283,9 @@ const MESSAGES = {
     'records.retention_save': '保存天数',
     'records.retention_failed': '保存保留天数失败',
     'records.n_files': '{n} 文件',
+    // 会话标题 = agent 自动生成的会话摘要（6F/7F/8F 才有，见 server/src/sessionTitle.js），
+    // 与「用户原话」不是一回事 —— 详情里单列一行，让用户能分清哪个是摘要、哪个是原话
+    'records.detail.session_title': '会话标题',
     'records.detail.state': '状态',
     'records.detail.client': '客户端',
     'records.detail.model': '模型',
@@ -689,6 +692,7 @@ const MESSAGES = {
     'records.retention_save': 'Save',
     'records.retention_failed': 'Failed to save retention days',
     'records.n_files': '{n} files',
+    'records.detail.session_title': 'Session title',
     'records.detail.state': 'State',
     'records.detail.client': 'Client',
     'records.detail.model': 'Model',

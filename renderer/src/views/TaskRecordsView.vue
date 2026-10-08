@@ -261,14 +261,18 @@ function promptOf(t) {
   return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
 }
 /**
- * 任务显示标题：优先用落盘里的 session_title（agent 自动生成的摘要，
- * 如 Kilo 的 "feat: add login"），没有再退回 promptOf(t)（用户原话）。
- * session_title 来自 /task-runs 返回，只对 6F/7F/8F 有值，其他楼层自然回落到用户原话。
+ * 会话标题（agent 自动生成的摘要，如 Kilo 的 "feat: add login"）：
+ * 来自 /task-runs 的 session_title，只有 6F Qoder / 7F Kilo / 8F OpenCode 三层有值，
+ * 其余楼层拿不到就是空串（服务端那里就不编造，见 server/src/sessionTitle.js）。
+ */
+function sessionTitleOf(t) {
+  return String((t && t.session_title) || '').trim();
+}
+/**
+ * 任务显示标题：优先用会话标题（摘要），没有再退回 promptOf(t)（用户原话）。
  */
 function displayTitle(t) {
-  const st = String((t && t.session_title) || '').trim();
-  if (st) return st;
-  return promptOf(t);
+  return sessionTitleOf(t) || promptOf(t);
 }
 /** 把 hook 的 op 归到三类：add=新增 / del=删除 / mod=改动（含老数据无 op） */
 function classify(f) {
@@ -892,7 +896,9 @@ async function saveRetention() {
       <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
-            <div class="detail-title">{{ displayTitle(tasks.selectedTask) || tr('records.untitled_task') }}</div>
+            <!-- 详情标题用**用户原话**（会话标题在下面的键值网格里单列一行）——
+                 6F/7F/8F 两条都有时，这样摘要与原话各归各位，不会同一个串出现两遍 -->
+            <div class="detail-title">{{ promptOf(tasks.selectedTask) || displayTitle(tasks.selectedTask) || tr('records.untitled_task') }}</div>
             <div class="detail-meta">
               <span>{{ fmtTime(tasks.selectedTask.started_at) }}</span>
               <span v-if="tasks.selectedTask.ended_at">→ {{ fmtTime(tasks.selectedTask.ended_at) }}</span>
@@ -901,6 +907,12 @@ async function saveRetention() {
           </header>
 
           <div class="kv">
+            <!-- 会话标题（agent 摘要）：只对 6F/7F/8F 有值，拿到才列这一行 ——
+                 其余楼层本来就没有这东西，不显示 "—" 占位（免得看着像"丢了"） -->
+            <template v-if="sessionTitleOf(tasks.selectedTask)">
+              <div class="k">{{ tr('records.detail.session_title') }}</div>
+              <div class="v v-bright">{{ sessionTitleOf(tasks.selectedTask) }}</div>
+            </template>
             <div class="k">{{ tr('records.detail.state') }}</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
             <!-- 「进度」暂时不显示（2026-09-29 用户要求注释掉）：progress 现在拿不到真值 ——
                  开工写 0、收工写 1，中间没人推进（唯一会推的是 hook 里"按 TodoWrite 清单
