@@ -1,0 +1,40 @@
+# WorkGremlin 桌面打包配置（M3）
+# 用法：先 `npm run build` 生成 renderer/dist，再 `npx electron-builder --linux AppImage --x64`
+# 注意：架构由 CLI 的 --x64 传入，此处不硬编码（docs 要求参数化）。
+
+appId: com.workgremlin.app
+productName: WorkGremlin
+copyright: Copyright © 2026 WorkGremlin
+
+directories:
+  output: dist
+  # 打包资源（图标等）放这里；没有可留空，但目录要存在
+  buildResources: build
+
+# 主进程入口（electron-builder 读取 package.json 的 main 字段）
+# desktop/src/launcher.js：打包后用 Electron 自带 Node 起 server + 复用 main.js 的 client 逻辑
+
+files:
+  - package.json
+  - desktop
+  - server
+  - shared
+  - packages
+  - renderer/dist
+  - scripts
+  - node_modules
+
+# 原生模块必须解包出 asar，否则 asar 内无法 dlopen（better-sqlite3 的 .node）
+# server 目录整体解包更省心：要读 cli.js / config，还要在 HOME 写 db
+asarUnpack:
+  - "server/**"
+  - "**/better-sqlite3/**/*.node"
+
+linux:
+  target:
+    - AppImage
+  category: Utility
+  # executableName 默认取 productName 小写；如需自定义在此指定
+
+# 体积优化（可选，先跑通再开）：
+# 用 .electron-builderignore 排除 node_modules 里的 dev 依赖（vite / esbuild / @electron/rebuild 等）
