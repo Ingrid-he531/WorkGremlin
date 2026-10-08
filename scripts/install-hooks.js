@@ -135,35 +135,20 @@ function parseArgs(argv) {
   return args;
 }
 
-function codebuddyCommand() {
-  // codebuddy 家族（cli/plugin 共用 ~/.codebuddy/settings.json）：--agent codebuddy，
-  // 由 hook 再按 payload 的 client 分 cli（1F）/ plugin（3F）。
-  return `node "${HOOK_SCRIPT}" --agent codebuddy`;
-}
-
 /**
- * Codex 的 hook 命令：用 --agent codex 注入产品家族身份（hook 靠它选事件名与工具名口径，
- * 见 packages/reporter/src/hook.js 的 IS_CODEX），默认工位名也换成 codex —— 不跟 CodeBuddy
- * 抢同一张工位卡。
+ * hook 命令：`node <hook.js> --agent <name>` —— 一个产品一行，差别只在 --agent 那一个名字。
+ *
+ * name 是**产品家族基名**（codebuddy / workbuddy / codex / claude / trae / qoder），
+ * 不是"随手写个标识"：
+ *   · 运行时 hook 靠它选事件名与工具名口径（见 packages/reporter/src/hook.js 的 IS_CODEX），
+ *     默认工位名也用它 —— 每层各占一张工位卡，不跟别家抢；
+ *   · 有的产品**运行时分不出来**：trae 与 codebuddy 都自报 client:'vscode'，只能靠安装期
+ *     注入的身份区分，所以这里写错（比如统统写成 codebuddy）会把 5F 的账记到 1F 头上；
+ *   · codebuddy 这一家 cli / plugin 共用 ~/.codebuddy/settings.json，装一条就够：hook 再按
+ *     payload 的 client 分 cli（1F）/ plugin（3F）。
  */
-function codexCommand() {
-  return `node "${HOOK_SCRIPT}" --agent codex`;
-}
-
-/** WorkBuddy 同理：用 --agent workbuddy 注入产品家族身份，别写成 codebuddy */
-function workbuddyCommand() {
-  return `node "${HOOK_SCRIPT}" --agent workbuddy`;
-}
-
-/** TraeCode 插件：用 --agent trae 注入产品家族身份（trae 与 codebuddy 都自报 client:'vscode'，
- *  运行时分不出，只能靠安装期身份），别写成 codebuddy。工位名默认 trae。 */
-function traeCommand() {
-  return `node "${HOOK_SCRIPT}" --agent trae`;
-}
-
-/** Claude Code CLI：用 --agent claude 注入产品家族身份，工位名默认 claude */
-function claudeCommand() {
-  return `node "${HOOK_SCRIPT}" --agent claude`;
+function hookCommand(name) {
+  return `node "${HOOK_SCRIPT}" --agent ${name}`;
 }
 
 /**
@@ -175,11 +160,6 @@ function claudeCommand() {
  * 不涉及 hook.js 逻辑 —— hook.js 靠 --agent qoder 走通用路径（非 codex / 非 claude）。
  */
 const QODER_EVENTS = CLAUDE_EVENTS;
-
-/** Qoder CLI：用 --agent qoder 注入产品家族身份，工位名默认 qoder */
-function qoderCommand() {
-  return `node "${HOOK_SCRIPT}" --agent qoder`;
-}
 
 /** 我们加的那几条：按 command 里有没有 hook 脚本路径识别 */
 function isOurs(group) {
@@ -463,8 +443,8 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const codebuddyCmd = codebuddyCommand();
-  const buildOurs = (events, hookCmd) => {
+  const buildOurs = (events, agent) => {
+    const hookCmd = hookCommand(agent);
     const out = {};
     for (const [event, matcher] of events) {
       const entry = { type: 'command', command: hookCmd, timeout: 10 };
@@ -472,12 +452,12 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
     return out;
   };
-  const codebuddyOurs = buildOurs(CODEBUDDY_EVENTS, codebuddyCmd);
-  const codexOurs = buildOurs(CODEX_EVENTS, codexCommand());
-  const workbuddyOurs = buildOurs(CODEBUDDY_EVENTS, workbuddyCommand());
-  const traeOurs = buildOurs(EVENTS, traeCommand());
-  const claudeOurs = buildOurs(CLAUDE_EVENTS, claudeCommand());
-  const qoderOurs = buildOurs(QODER_EVENTS, qoderCommand());
+  const codebuddyOurs = buildOurs(CODEBUDDY_EVENTS, 'codebuddy');
+  const codexOurs = buildOurs(CODEX_EVENTS, 'codex');
+  const workbuddyOurs = buildOurs(CODEBUDDY_EVENTS, 'workbuddy');
+  const traeOurs = buildOurs(EVENTS, 'trae');
+  const claudeOurs = buildOurs(CLAUDE_EVENTS, 'claude');
+  const qoderOurs = buildOurs(QODER_EVENTS, 'qoder');
 
   const all = [
     {
@@ -582,10 +562,10 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     throw new Error(`找不到 hook 脚本：${HOOK_SCRIPT}`);
   }
 
-  console.log(`[workgremlin] hook 命令：${codebuddyCmd}`);
-  if (!wanted.length || wanted.includes('codex')) console.log(`[workgremlin] Codex 命令：${codexCommand()}`);
-  if (!wanted.length || wanted.includes('trae')) console.log(`[workgremlin] TraeCode 命令：${traeCommand()}`);
-  if (!wanted.length || wanted.includes('claude')) console.log(`[workgremlin] Claude Code 命令：${claudeCommand()}`);
+  console.log(`[workgremlin] hook 命令：${hookCommand('codebuddy')}`);
+  if (!wanted.length || wanted.includes('codex')) console.log(`[workgremlin] Codex 命令：${hookCommand('codex')}`);
+  if (!wanted.length || wanted.includes('trae')) console.log(`[workgremlin] TraeCode 命令：${hookCommand('trae')}`);
+  if (!wanted.length || wanted.includes('claude')) console.log(`[workgremlin] Claude Code 命令：${hookCommand('claude')}`);
   if (dryRun) console.log('[workgremlin] --dry-run：不落盘');
 
   // 7F **只能有一处注册**。全局那条（kilo.jsonc 的 plugin 数组）已经够用；工程目录里再留
