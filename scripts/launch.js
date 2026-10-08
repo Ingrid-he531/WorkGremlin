@@ -56,9 +56,16 @@ function nodeVer() {
   return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0];
 }
 
-/** 启动器自身的 Node 版本校验（严格，过低直接退出）：运行 `node scripts/launch.js`
- *  这个启动脚本本身需要在 Node >= 24 下才能跑（v22 会失败，v24 才行），与 server/client
- *  内部是否用 Electron 内置 Node 无关。所以这里卡住，避免脚本一启动就崩。 */
+/** 启动器自身的 Node 版本提示（不阻断）：launch 全程用 **Electron 内置 Node** 跑
+ *  server（startServer，自带 Node 22.x）与 client（startClient，prod 模式 loadFile
+ *  renderer/dist），不依赖系统 Node，所以即使系统 Node 偏低也只提示、不退出。
+ *
+ *  历史背景：早期 server 直接由**系统 Node 直跑**，better-sqlite3 在 Node 22 下加载/运行
+ *  失败（当初靠升级到 Node 24 解决，故曾加过 >= 24 的硬卡）。如今 server 改用 Electron
+ *  内置 Node 启动，better-sqlite3 为 N-API 二进制（ABI 稳定），已在 Electron Node 22.20.0
+ *  下 `--self-test` 验证通过，不再受系统 Node 版本影响。
+ *
+ *  真正需要系统 Node 24+ 的是 **dev 模式**（`npm run dev` 的 Vite dev server），它不走 launch。 */
 function checkNodeVersion() {
   const req = requiredNodeVersion();
   if (!req) return; // 没声明就不拦
@@ -68,12 +75,11 @@ function checkNodeVersion() {
     (cur[0] === req[0] && cur[1] < req[1]) ||
     (cur[0] === req[0] && cur[1] === req[1] && cur[2] < req[2]);
   if (!lower) return;
-  console.error(
-    `[launch] 当前 Node v${cur.join('.')} 过低，需要 >= v${req.join('.')}。\n` +
-      '        运行 `node scripts/launch.js` 这个启动脚本本身需要 Node 24+（v22 会失败，v24 才行）。\n' +
-      '        （server 与 client 运行时由 Electron 内置 Node 承担，不依赖此处的系统 Node 版本）'
+  console.warn(
+    `[launch] 提示：当前系统 Node v${cur.join('.')} 低于建议的 v${req.join('.')}。` +
+      '  launch 全程用 Electron 内置 Node（server + client prod 模式），不依赖系统 Node，可正常启动；' +
+      '  但若使用 dev 模式（Vite dev server），需系统 Node 24+。'
   );
-  process.exit(1);
 }
 
 function readServerInfo() {
