@@ -58,9 +58,8 @@ const announcedIds = new Set();
  * 结束行滚过一遍即在 wrap 时清掉（只一遍）。w = 实测宽度，wrap 阈值用。
  */
 const belt = ref([]);
-/** 行间距（px）：与 CSS .line 的 padding-right 一致 */
-const GAP = 48;
-/** 内容变了要重测每行宽度（避免每帧读 layout） */
+/** 行间距就是 CSS .line 的 padding-right（48px），它已算进每条 .line 的实测宽度里，
+ *  所以 wrap 阈值 / 补偿只按 .line 实测宽度走，不再单独加 gap（避免重复计间距）。 */
 let beltDirty = true;
 /** 本次会话启动时刻：只播报启动后才结束的任务，不回放历史（避免一启动就滚一堆"任务完成"） */
 const sessionStart = Date.now();
@@ -226,7 +225,7 @@ function reconcileRunning() {
   for (const it of belt.value) {
     if (it.kind === 'running') {
       if (wantIds.has(it.id)) kept.push(it); // 常驻保留
-      else offset += it.w + GAP; // 任务已结束：摘掉，后面内容左移、offset 右移抵消
+      else offset += it.w; // 任务已结束：摘掉，后面内容左移、offset 右移抵消（.line 宽度已含间距）
     } else {
       kept.push(it); // 结束行保留（滚过一遍后在 wrap 时清）
     }
@@ -262,7 +261,7 @@ let ro = null;
 let raf = null;
 let lastTs = 0;
 let offset = 0;
-/** 整条传送带宽度（px）= 各 (w + GAP) 之和，wrap 阈值用 */
+/** 整条传送带宽度（px）= 各 .line 实测宽度之和（含 padding-right 间距），wrap 阈值用 */
 let totalWidth = 0;
 /** 整条滚出后停顿多久再从最右重新进（ms）：让屏空一会儿，避免"尾字刚出左、头字又从右进"连成一气 */
 const PAUSE_MS = 5000;
@@ -281,7 +280,7 @@ function measureBelt() {
   for (const ln of lines) {
     const w = i < belt.value.length ? ln.getBoundingClientRect().width : 0;
     if (i < belt.value.length) belt.value[i].w = w;
-    total += w + GAP;
+    total += w; // .line 宽度已含 padding-right（行间距），不再额外加 gap
     i++;
   }
   totalWidth = total;
@@ -395,9 +394,9 @@ onBeforeUnmount(() => {
   position: relative;
   display: flex;
   align-items: center;
-  /* 居中：① 没有任务时那句话居中；② 有任务时轨道比屏宽，横向溢出两边均分，
-     位移一份宽度后画面与起点完全重合，接缝照样看不出来 */
-  justify-content: center;
+  /* 轨道锚定左边缘：translateX(offset) 从 viewW(最右) 一路走到 -totalWidth(最左全出)，
+     内容比屏窄时也贴着左边缘滚到底、不居中停留（否则"短内容滚不到最左、卡在中间"） */
+  justify-content: flex-start;
   height: calc(var(--lcd-slot, 26px) + 16px);
   overflow: hidden;
   border: 1px solid var(--border-strong, #333b4a);
@@ -451,9 +450,9 @@ onBeforeUnmount(() => {
   text-shadow: 0 0 6px currentColor;
 }
 
-/* 没有任务：静态居中，颜色比"暗段"亮一档（--text-dim）——
-   压得太暗会看成屏坏了，太亮又会跟蓝/绿/红那三条任务状态抢眼 */
+/* 没有任务：静态居中（轨道用 flex-start 贴左，这句单独用 auto 居中），颜色比"暗段"亮一档 */
 .idle-line {
+  margin: 0 auto;
   padding: 0 12px;
   font-size: 13px;
   letter-spacing: 1px;
