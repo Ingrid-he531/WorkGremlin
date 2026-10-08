@@ -80,7 +80,22 @@ async function bootstrap() {
     if (fresh) serverInfo = fresh;
     return serverInfo;
   });
-  ipcMain.handle(IPC_EVENTS.GET_APP_VERSION, () => app.getVersion());
+  // 应用版本号：直接读**仓库根** package.json。monorepo 下 desktop 子包也有自己的 version，
+  // 而 Electron 的 app.getVersion() 在 dev 启动（electron desktop/src/main.js）时会回退到
+  // Electron 自身版本（38.8.6），不可靠 —— 故显式读根目录文件，与设置面板口径一致。
+  function readAppVersion() {
+    try {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8')
+      );
+      if (pkg && typeof pkg.version === 'string' && pkg.version) return pkg.version;
+    } catch {
+      /* 读不到就退回 Electron 口径 */
+    }
+    return app.getVersion();
+  }
+
+  ipcMain.handle(IPC_EVENTS.GET_APP_VERSION, () => readAppVersion());
 
   // 构建信息（设置面板展示）：应用版本 + 最近 commit 短 sha + Electron / Node 运行时版本。
   // commit 在打包产物里没有 .git 会取不到，回退空串，渲染层据此决定要不要加括号。
@@ -95,7 +110,7 @@ async function bootstrap() {
       /* 无 .git（打包产物）或 git 不可用：commit 留空 */
     }
     return {
-      version: app.getVersion(),
+      version: readAppVersion(),
       commit,
       electron: process.versions.electron || '',
       node: process.versions.node || '',
