@@ -236,6 +236,58 @@ function createQueryRouter({ bus, repo }) {
   });
 
   /**
+   * 门楣滚动屏的任务流（renderer 的 TaskTicker.vue）：**所有楼层**（不按楼层过滤）
+   * 的当前任务，加最近 `minutes` 分钟内收工的那几条。
+   *
+   * 与 /task-runs 的分工：那个是"翻旧账"的台账（默认 2000 行、按开始时刻倒序，给任务记录页用）；
+   * 这里要的是"现在正在发生什么"，所以：
+   *   · 只取**还在跑**的（含等权限的 blocked）与**刚收工**的，条数天然很小；
+   *   · 不受 limit 截断影响 —— 一条跑了三小时的任务不会因为中间插进几百条新任务就滚不出屏；
+   *   · 排序：在跑的在前（按开工时刻升序），收工的在后（按收工时刻升序），
+   *     前端拿到就直接按这个顺序依次滚动。
+   *
+   * state 归一与 /task-runs 同一口径（遗留 running 任务按心跳判定，没心跳算 cancelled），
+   * 免得屏上滚出一条"永远在进行中"的僵尸任务。
+   */
+  router.get('/task-feed', (req, res) => {
+    const minutes = Math.min(Math.max(Number(req.query.minutes) || 5, 1), 120);
+    const since = Date.now() - minutes * 60_000;
+    // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑
+    const cutoff = Date.now() - 10 * 60_000;
+    const project = req.query.project;
+
+    // 还在跑：agent_status 里有近期心跳，且相位仍在 active（blocked = 等授权，也算在跑）
+    const ALIVE =
+      "EXISTS (SELECT 1 FROM agent_status s WHERE s.task_id = t.id AND s.last_heartbeat_at > @cutoff AND s.state IN ('busy', 'thinking', 'blocked'))";
+
+    const conds = [
+      't.parent_task_id IS NULL',
+      `((t.state = 'running' AND ${ALIVE}) OR (t.state IN ('done', 'failed', 'cancelled') AND t.ended_at >= @since))`,
+    ];
+    const args = { since, cutoff, limit: 100 };
+    if (project && project !== 'all') {
+      conds.push('t.project_id = @project');
+      args.project = project;
+    }
+
+    const items = repo.raw
+      .prepare(
+        `SELECT t.id, t.project_id, t.title, t.started_at, t.ended_at,
+                COALESCE(tr.client, m.client) AS client,
+                CASE WHEN t.state = 'running' AND NOT ${ALIVE} THEN 'cancelled' ELSE t.state END AS state
+           FROM tasks t
+           LEFT JOIN task_runs tr ON tr.id = t.id
+           LEFT JOIN members m ON m.id = t.member_id
+          WHERE ${conds.join(' AND ')}
+          ORDER BY CASE WHEN t.state = 'running' AND ${ALIVE} THEN 0 ELSE 1 END,
+                   COALESCE(t.ended_at, t.started_at) ASC
+          LIMIT @limit`
+      )
+      .all(args);
+    return res.json({ ok: true, items });
+  });
+
+  /**
    * 单个用户任务召唤出去的 subagent 实例（subagent_runs）。
    * parent 必填，值为 task_runs.id。
    */

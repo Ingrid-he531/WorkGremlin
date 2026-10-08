@@ -18,8 +18,8 @@
  * 电梯（design-elevator-transition.md §1 / §5.2）：`.rail` 就是井道，本组件额外挂一个
  * `.car` 轿厢覆盖层。高亮与轿厢位置都从 useElevator 拿（effort §2.3 方案 A），
  * 保证「高亮在 4F、轿厢在 3F」这种错位不会出现。
- * 楼层显示屏（FloorLcd）**不在这里**：它挂在电梯门上方（ElevatorDoors 的门楣），
- * 由 App.vue 把楼层表传过去（effort §2.4）。井道这边只负责井道 + 轿厢。
+ * 门楣那块屏（TaskTicker，滚各层任务）**不在这里**：它挂在电梯门上方（ElevatorDoors 的门楣）。
+ * 井道这边只负责井道 + 轿厢。
  */
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';

@@ -116,10 +116,14 @@ const MESSAGES = {
     'floor.form_plugin': '插件',
     'floor.form_ide': 'IDE',
     'floor.kind_dir': '数据',
-    'lcd.to_floor': '正在前往 {floor}',
-    'lcd.from_to': '当前 {from}，将前往 {to}',
-    'lcd.not_ready': '电梯尚未就位',
-    'lcd.current': '当前 {floor}',
+
+    // ---- 门楣任务滚动屏（TaskTicker）----
+    'ticker.task': '任务：{text}',
+    'ticker.done': '任务完成',
+    'ticker.cancelled': '任务取消',
+    'ticker.failed': '任务失败',
+    'ticker.untitled': '未命名任务',
+    'ticker.no_task': '暂无活跃任务',
 
     // ---- 办公室 HUD / 说明条 ----
     'office.demo': '演示模式',
@@ -539,10 +543,14 @@ const MESSAGES = {
     'floor.form_plugin': 'Plugin',
     'floor.form_ide': 'IDE',
     'floor.kind_dir': 'Data',
-    'lcd.to_floor': 'Going to {floor}',
-    'lcd.from_to': 'At {from}, going to {to}',
-    'lcd.not_ready': 'Lift not ready',
-    'lcd.current': 'At {floor}',
+
+    // ---- lintel task ticker (TaskTicker) ----
+    'ticker.task': 'Task: {text}',
+    'ticker.done': 'Task completed',
+    'ticker.cancelled': 'Task cancelled',
+    'ticker.failed': 'Task failed',
+    'ticker.untitled': 'Untitled task',
+    'ticker.no_task': 'No active tasks',
 
     // ---- office HUD / tip bar ----
     'office.demo': 'Demo mode',

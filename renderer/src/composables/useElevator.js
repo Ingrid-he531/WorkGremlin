@@ -374,7 +374,7 @@ export async function request(id) {
 /**
  * 单例出口。返回的都是同一个 ref —— 每次调用不会新建状态。
  * （App.vue 拿 phase / motionMode / request，FloorSelector 拿 carFloor / displayFloor / moveMs，
- *   FloorLcd 拿 carFloor / pendingFloor / direction / moveMs —— 液晶屏不自己算楼层。）
+ *   门楣那块屏（TaskTicker）不取楼层 —— 它滚的是各层的任务，自己不管在哪层。）
  */
 export function useElevator() {
   return {

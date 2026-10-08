@@ -1,14 +1,18 @@
 <script setup>
 /**
- * ElevatorDoors —— 门楣（电梯门上方那块楼层显示器）+ 主舞台的两扇门。
+ * ElevatorDoors —— 门楣（电梯门上方那块长屏）+ 主舞台的两扇门。
  *
  * 设计依据：design-elevator-transition.md §1（门做在主舞台而不是轿厢上）/ §7.2、
  *          design-elevator-effort.md §2.4（门楣液晶屏）。
  *
  * 结构（一列两层，像真电梯的门套）：
  *   .elevator-doors
- *     ├─ .lintel  ← 门楣：**不参与动画**的墙带，楼层屏固定在这里（真实电梯的层站指示器位置）
+ *     ├─ .lintel  ← 门楣：**不参与动画**的墙带，屏固定在这里（真实电梯的层站指示器位置）
+ *     │              左=项目名（占自己那份宽）／右=任务滚动屏（吃掉剩下**全部**宽度）
  *     └─ .portal  ← 门洞：主舞台内容 + 两扇门扇，门只在这个区域内开合
+ *
+ * 屏上滚的是**所有楼层的当前任务**（TaskTicker），不再是"当前楼层"：
+ * 楼层在左边胶囊与轿厢里都有，门楣这块最宽的地方留给"各层正在发生什么"更有用。
  *
  * 要点：
  *   - 门是**装饰层**：`pointer-events: none` + `aria-hidden`，关门瞬间也不许吞点击；
@@ -19,7 +23,7 @@
  *   - 到层响一声"叮"：phase 进 `opening`（门开始开）那一刻触发，见 elevatorChime.js。
  */
 import { watch } from 'vue';
-import FloorLcd from './FloorLcd.vue';
+import TaskTicker from './TaskTicker.vue';
 import { playArrivalChime } from '../lib/elevatorChime';
 import { useI18n } from '../i18n';
 
@@ -28,15 +32,13 @@ const { t } = useI18n();
 const props = defineProps({
   /** idle | closing | moving | opening | settling —— 来自 useElevator 的 phase */
   phase: { type: String, default: 'idle' },
-  /** 楼层表（门楣上的屏要用它排数字带）：与井道 / 轿厢同一份来源 */
-  floors: { type: Array, default: () => [] },
   /** 降级档（系统「减弱动态效果」）的淡出/淡入开关，来自 useElevator 的 flash */
   flash: { type: Boolean, default: false },
   /** 当前工程名：放在门楣**最左边**（原来在办公室左上角那枚小徽标里） */
   projectLabel: { type: String, default: '' },
-  /** 门楣中间的楼层液晶屏是否显示。任务记录页等非电梯场景不需要那块屏，
-   *  关掉它只留左边「项目」，门楣不会空出一块黑屏。默认开（办公室等页面仍然显示）。 */
-  showFloorLcd: { type: Boolean, default: true },
+  /** 门楣右边那块任务滚动屏是否显示。任务记录页等非电梯场景不需要它，
+   *  关掉只留左边「项目」，门楣不会空出一块黑屏。默认开（办公室等页面仍然显示）。 */
+  showScreen: { type: Boolean, default: true },
   /** 整条门楣（项目名 + 楼层屏）是否显示。任务记录页整页都不需要电梯门楣，关掉它，
    *  内容直接顶到顶部。默认开（办公室等电梯场景保留门楣）。 */
   showLintel: { type: Boolean, default: true },
@@ -53,14 +55,12 @@ watch(
 
 <template>
   <div class="elevator-doors" :data-phase="phase" :data-flash="flash ? 'on' : 'off'">
-    <!-- 门楣：墙带 + 固定的楼层显示屏。门扇在下面的 .portal 里滑，够不到这里。
-         三列：左=项目名 / 中=楼层屏（居中）/ 右=等宽占位，所以屏不会被项目名挤偏 -->
+    <!-- 门楣：墙带 + 任务滚动屏。门扇在下面的 .portal 里滑，够不到这里。
+         两列：左=项目名（占自己那份宽，长了截断）/ 右=滚动屏（吃掉剩下**全部**宽度，
+         屏要尽可能长 —— 一行里得装得下"时刻 + 楼层 + 用户原话"） -->
     <div v-if="showLintel" class="lintel">
-      <div class="lintel-side">
-        <span v-if="projectLabel" class="lintel-proj">{{ t('lintel.project') }}：{{ projectLabel }}</span>
-      </div>
-      <FloorLcd v-if="showFloorLcd" :floors="floors" />
-      <div class="lintel-side" aria-hidden="true" />
+      <span v-if="projectLabel" class="lintel-proj">{{ t('lintel.project') }}：{{ projectLabel }}</span>
+      <TaskTicker v-if="showScreen" class="lintel-screen" />
     </div>
     <div class="portal">
       <!-- 内容外面再包一层：这是"内容就位"动效的作用对象（直接给 slot 内容的根元素写样式会落到子组件上） -->
@@ -94,8 +94,8 @@ watch(
 .lintel {
   flex: none;
   display: flex;
-  justify-content: center;
   align-items: center;
+  gap: 12px;
   margin: 12px 12px 0;
   padding: 8px 12px;
   background: var(--iso-bg, #151a22);
@@ -103,21 +103,14 @@ watch(
   border-radius: var(--radius);
 }
 
-/* 左右两列等宽（flex:1 1 0），中间的楼层屏才仍然居中 ——
-   只给左边放一列、靠 justify-content:center 会把屏推偏。 */
-.lintel-side {
-  flex: 1 1 0;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-}
-
 /* 项目名：直接写在门楣这块板上，**不另加黑色小底板**（就是在板上排一行字）。
    字号跟左侧「楼层」标题（FloorSelector 的 .rail-title）对齐：14px / 600 ——
    两边同一级，扫一眼能连读成"楼层 · 项目"。
-   工程名可能很长：占满左列后省略号截断，不许把中间的楼层屏挤走。 */
+   宽度只占自己那一份（不许把右边的屏挤短）：工程名很长时截断到最多三成宽、省略号收尾。 */
 .lintel-proj {
-  max-width: 100%;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 30%;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -127,6 +120,14 @@ watch(
   /* 亮度跟左侧「楼层」标题（.rail-title）取同一个变量，两边看起来是一套 */
   color: var(--muted, #6e7681);
   line-height: 1.2;
+}
+
+/* 任务滚动屏：吃掉项目名之后的**全部**宽度（屏尽可能长）。
+   它是子组件（TaskTicker）的根元素 —— scoped 样式能命中子组件根元素，所以这里给宽度就够，
+   屏壳自己的样子（暗底 / 等宽字 / 扫描线）由组件内部管。 */
+.lintel-screen {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* 门洞：舞台内容与门扇的容器，门扇滑到 ±100% 时不撑出横向滚动条 */

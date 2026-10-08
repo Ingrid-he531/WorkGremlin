@@ -30,9 +30,9 @@
   --gap: 12px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
 
-  /* 楼层液晶屏（FloorLcd.vue）：暗底 + 发光段码。零图片、零依赖，全靠这几个色。
-     --lcd-slot 是「一位数字」的格子高，滚动位移由 JS 写成 calc(idx × --lcd-slot)，
-     所以改字号时改这一处就够，别在 JS 里再写一份 px。 */
+  /* 门楣那块屏（现在是 TaskTicker 的任务滚动条）：暗底 + 发光等宽字。零图片、零依赖。
+     --lcd-slot 是屏里一行的格子高（屏高 = 它 + 16px），改行高只改这一处，
+     别在组件里再写一份 px。 */
   --lcd-bg: #05070a;
   --lcd-lit: #7fe6ff;
   --lcd-dim: #33414d;
@@ -69,12 +69,12 @@
   }
 
   /* 与已有组件（DeskScene / GremlinSprite / GhostSprite）一致的兜底写法：
-     光把 token 归零不够 —— 轿厢、轿厢层号带与门楣屏数字条的 transition-duration
+     光把 token 归零不够 —— 轿厢、轿厢层号带与门楣屏滚动条的 transition-duration
      都是内联写的，会盖过 token */
   .door,
   .car,
   .car-odo-strip,
-  .lcd-odo {
+  .track {
     transition: none !important;
   }
 }
@@ -84,7 +84,7 @@
 [data-motion='off'] .door,
 [data-motion='off'] .car,
 [data-motion='off'] .car-odo-strip,
-[data-motion='off'] .lcd-odo {
+[data-motion='off'] .track {
   transition-duration: 0ms !important;
 }
 

@@ -301,10 +301,9 @@ onUnmounted(() => {
 
       <ElevatorDoors
         :phase="phase"
-        :floors="sessions.floors"
         :flash="flash"
         :project-label="projectLabel"
-        :show-floor-lcd="!bareTab"
+        :show-screen="!bareTab"
         :show-lintel="!bareTab"
       >
         <section class="stage">
