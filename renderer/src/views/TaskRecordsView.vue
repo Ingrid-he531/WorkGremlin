@@ -16,6 +16,7 @@ import {
 import { DEFAULTS, clientBase } from '@workgremlin/shared';
 import { httpBase } from '../api/bridge';
 import { useI18n } from '../i18n';
+import { marked } from 'marked';
 
 /**
  * 打开时停在哪个视图（list / summary / board）。
@@ -34,6 +35,30 @@ const tasks = useTaskStore();
  * 模板里的行变量），用 `tr` 当翻译函数就永远不会被行变量遮住。
  */
 const { t: tr } = useI18n();
+
+/**
+ * 任务详情「产出摘要」的 markdown 渲染。
+ * agent 的 result 是一段 markdown（标题 / 列表 / 代码块 / 加粗 …），原先用 <p> + pre-wrap 当纯文本，
+ * 标题列表代码块全糊成一团。这里解析成 HTML 再用 DOMParser 做一层轻量 sanitize
+ * （去掉 script/style 与 on* 属性、javascript: 链接）—— 产出来自本机 agent，风险很低，
+ * 但渲染层不该原样执行任意 HTML。非浏览器环境（单测）直接返回 marked 原输出，不影响断言。
+ */
+const md = (text) => {
+  if (!text) return '';
+  const html = marked.parse(String(text), { breaks: true, gfm: true });
+  if (typeof document === 'undefined') return html;
+  const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+  doc.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach((e) => e.remove());
+  doc.querySelectorAll('*').forEach((el) => {
+    for (const a of [...el.attributes]) {
+      if (/^on/i.test(a.name) || /^javascript:/i.test(a.value)) el.removeAttribute(a.name);
+    }
+    if (el.tagName === 'A' && /^\s*javascript:/i.test(el.getAttribute('href') || '')) {
+      el.removeAttribute('href');
+    }
+  });
+  return doc.body.innerHTML;
+};
 
 /** 一级检索的可选项：所有工程 + 所有楼层（楼层 = 成员 client） */
 const projectOptions = computed(() => project.projects || []);
@@ -1015,7 +1040,8 @@ async function saveRetention() {
 
           <div class="result-block">
             <div class="files-head">{{ tr('records.detail.result') }}</div>
-            <p class="result">{{ tasks.selectedTask.result || tr('records.none_paren') }}</p>
+            <div v-if="tasks.selectedTask.result" class="result-md" v-html="md(tasks.selectedTask.result)"></div>
+            <p v-else class="result">{{ tr('records.none_paren') }}</p>
           </div>
 
           <!-- subagent 列表：点击单个看详情 -->
@@ -1079,7 +1105,8 @@ async function saveRetention() {
                   </div>
                   <div class="result-block">
                     <div class="files-head">{{ tr('records.detail.sub_result') }}</div>
-                    <p class="result">{{ s.result || tr('records.none_paren') }}</p>
+                    <div v-if="s.result" class="result-md" v-html="md(s.result)"></div>
+                    <p v-else class="result">{{ tr('records.none_paren') }}</p>
                   </div>
                 </div>
               </li>
@@ -1754,6 +1781,27 @@ async function saveRetention() {
 
 .result-block { margin-top: 12px; }
 .result { margin: 0; font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
+/* 「产出摘要」markdown 渲染（见 md()）：清单里的 HTML 标签只在这块内生效，不影响别处 */
+.result-md { font-size: 13px; color: var(--text); line-height: 1.6; word-break: break-word; }
+.result-md > :first-child { margin-top: 0; }
+.result-md > :last-child { margin-bottom: 0; }
+.result-md h1, .result-md h2, .result-md h3, .result-md h4, .result-md h5, .result-md h6 { margin: 10px 0 6px; line-height: 1.3; font-weight: 600; }
+.result-md h1 { font-size: 1.25em; }
+.result-md h2 { font-size: 1.15em; }
+.result-md h3 { font-size: 1.05em; }
+.result-md p { margin: 6px 0; }
+.result-md ul, .result-md ol { margin: 6px 0; padding-left: 22px; }
+.result-md li { margin: 2px 0; }
+.result-md code { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 0.92em; background: var(--bg-sunken, #1f2430); padding: 1px 5px; border-radius: 4px; }
+.result-md pre { background: var(--bg-sunken, #1f2430); padding: 10px 12px; border-radius: 8px; overflow: auto; margin: 8px 0; }
+.result-md pre code { background: none; padding: 0; font-size: 0.9em; }
+.result-md blockquote { margin: 8px 0; padding: 4px 12px; border-left: 3px solid var(--border, #2a3142); color: var(--text-faint); }
+.result-md a { color: var(--accent, #6ea8fe); text-decoration: none; }
+.result-md a:hover { text-decoration: underline; }
+.result-md table { border-collapse: collapse; margin: 8px 0; }
+.result-md th, .result-md td { border: 1px solid var(--border, #2a3142); padding: 4px 8px; }
+.result-md hr { border: none; border-top: 1px solid var(--border, #2a3142); margin: 10px 0; }
+.result-md img { max-width: 100%; }
 
 .subs { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
 .sub-list { list-style: none; margin: 6px 0 0; padding: 0; }
