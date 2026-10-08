@@ -11,7 +11,8 @@
  *
  * dev 模式（npm run launch / npm run dev）不走这里，仍由 scripts/launch.js 驱动。
  */
-const { app, net } = require('electron');
+const { app } = require('electron');
+const net = require('node:net');
 const { spawn } = require('child_process');
 const fs = require('node:fs');
 const os = require('node:os');

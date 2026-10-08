@@ -12,6 +12,11 @@
     "renderer",
     "packages/reporter"
   ],
+  "dependencies": {
+    "@workgremlin/shared": "*",
+    "@workgremlin/server": "*",
+    "@workgremlin/reporter": "*"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
@@ -83,7 +88,8 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",
-    "electron": "38.8.6"
+    "electron": "38.8.6",
+    "electron-builder": "^26.15.3"
   },
   "allowScripts": {
     "electron@38.8.6": true,
