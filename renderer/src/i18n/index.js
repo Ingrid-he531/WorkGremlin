@@ -66,6 +66,13 @@ const MESSAGES = {
     'nav.exit_fullscreen': '退出全屏',
     'nav.exit_fullscreen_title': '退出全屏（Esc / F）',
     'nav.lang_title': '界面语言',
+    'nav.settings': '设置',
+    'settings.title': '设置',
+    'settings.language': '语言',
+    'settings.version': '版本',
+    'settings.github': 'GitHub',
+    'settings.feedback': '反馈',
+    'settings.quit': '退出 WorkGremlin',
 
     // ---- 会话下拉 / 门楣 ----
     'session.demo_project': '演示工程',
@@ -480,6 +487,13 @@ const MESSAGES = {
     'nav.exit_fullscreen': 'Exit fullscreen',
     'nav.exit_fullscreen_title': 'Exit fullscreen (Esc / F)',
     'nav.lang_title': 'Language',
+    'nav.settings': 'Settings',
+    'settings.title': 'Settings',
+    'settings.language': 'Language',
+    'settings.version': 'Version',
+    'settings.github': 'GitHub',
+    'settings.feedback': 'Feedback',
+    'settings.quit': 'Quit WorkGremlin',
 
     // ---- session switcher / lintel ----
     'session.demo_project': 'Demo project',

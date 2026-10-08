@@ -1,53 +1,173 @@
 <script setup>
 /**
- * 界面语言切换（中文 / En）：顶栏里、会话下拉前面。
- * 点了立刻生效并记住（见 i18n/index.js 的 setLocale）——所有走 t() 的文案都会跟着换。
+ * 设置面板：把原来的「中文 / En」语言开关升级成一个「设置」按钮 + 弹出面板。
+ * 面板里同时放：语言切换、版本号、GitHub / 反馈外链、以及退出应用。
+ * 语言切换即时生效并记住（见 i18n/index.js 的 setLocale），其余行走 Electron 桥接（bridge.js）。
  */
+import { ref } from 'vue';
 import { useI18n } from '../i18n';
+import { getAppVersion, openExternal, quitApp } from '../api/bridge';
 
 const { locale, setLocale, locales, t } = useI18n();
+
+const open = ref(false);
+const version = ref('—');
+// 外链：项目仓库在 GitHub，反馈走 Issues 页（这两个地址在仓库里是确定的，改这里即可）
+const GITHUB_URL = 'https://github.com/Ingrid-he531/WorkGremlin';
+const FEEDBACK_URL = 'https://github.com/Ingrid-he531/WorkGremlin/issues';
+
+async function loadVersion() {
+  try {
+    const v = await getAppVersion();
+    if (v) version.value = v;
+  } catch {
+    /* 读不到就保留占位 */
+  }
+}
+
+function toggle() {
+  open.value = !open.value;
+  if (open.value) loadVersion();
+}
+function close() {
+  open.value = false;
+}
+function onSelectLanguage(e) {
+  setLocale(e.target.value);
+}
+function onLink(url) {
+  openExternal(url);
+  close();
+}
+function onQuit() {
+  quitApp();
+}
 </script>
 
 <template>
-  <div class="lang" role="group" :aria-label="t('nav.lang_title')">
+  <div class="settings">
     <button
-      v-for="l in locales"
-      :key="l.key"
       type="button"
-      class="lang-btn"
-      :class="{ on: locale === l.key }"
-      :title="l.title"
-      :aria-pressed="locale === l.key"
-      data-testid="lang-switch"
-      @click="setLocale(l.key)"
-    >{{ l.label }}</button>
+      class="set-btn"
+      :class="{ on: open }"
+      :title="t('nav.settings')"
+      data-testid="settings-btn"
+      @click.stop="toggle"
+    >{{ t('nav.settings') }}</button>
+
+    <template v-if="open">
+      <!-- 透明遮罩：点面板以外任意处关闭（按钮自身已 stop 冒泡，不会立即触发关闭） -->
+      <div class="pop-mask" @click="close" />
+      <div class="pop" role="menu" data-testid="settings-pop">
+        <div class="pop-title">{{ t('settings.title') }}</div>
+
+        <div class="row">
+          <span class="label">{{ t('settings.language') }}</span>
+          <select class="lang-select" :value="locale" @change="onSelectLanguage">
+            <option v-for="l in locales" :key="l.key" :value="l.key">{{ l.label }}</option>
+          </select>
+        </div>
+
+        <div class="sep" />
+
+        <div class="row">
+          <span class="label">{{ t('settings.version') }}</span>
+          <span class="val">{{ version }}</span>
+        </div>
+        <a class="row link" href="#" @click.prevent="onLink(GITHUB_URL)">
+          <span class="label">{{ t('settings.github') }}</span>
+          <span class="val link-text">github.com/Ingrid-he531/WorkGremlin</span>
+        </a>
+        <a class="row link" href="#" @click.prevent="onLink(FEEDBACK_URL)">
+          <span class="label">{{ t('settings.feedback') }}</span>
+          <span class="val link-text">{{ t('settings.feedback') }} / Issue</span>
+        </a>
+
+        <div class="sep" />
+
+        <button type="button" class="row quit" @click="onQuit">{{ t('settings.quit') }}</button>
+      </div>
+    </template>
   </div>
 </template>
 
 <style scoped>
-/* 小胶囊：跟顶栏其它控件同一套观感（细边 + 圆角），两个按钮拼一格，选中的那个亮起来 */
-.lang {
-  display: inline-flex;
-  align-items: stretch;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  overflow: hidden;
-  flex: none;
-}
-.lang-btn {
-  padding: 3px 9px;
+.settings { position: relative; flex: none; }
+.set-btn {
+  padding: 3px 12px;
   font-size: 12px;
   line-height: 1.6;
-  border: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
 }
-.lang-btn + .lang-btn { border-left: 1px solid var(--border); }
-.lang-btn:hover { color: var(--text); }
-.lang-btn.on {
-  color: var(--accent);
-  background: var(--accent-soft);
-  font-weight: 600;
+.set-btn:hover { color: var(--text); }
+.set-btn.on { color: var(--accent); background: var(--accent-soft); }
+
+/* 遮罩：铺满视口、透明，专门用来「点外面关闭」；面板 z-index 更高，不会被它挡住 */
+.pop-mask { position: fixed; inset: 0; z-index: 900; }
+.pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 901;
+  width: 264px;
+  padding: 8px 0;
+  background: var(--bg-elevated, #232a36);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  color: var(--text);
+  user-select: none;
 }
+.pop-title {
+  padding: 4px 14px 8px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 14px;
+  font-size: 13px;
+  color: var(--text);
+  text-decoration: none;
+  background: transparent;
+  border: 0;
+  box-sizing: border-box;
+  cursor: default;
+}
+a.row { cursor: pointer; }
+a.row:hover { background: var(--accent-soft); }
+.label { color: var(--text-dim); }
+.val { color: var(--text); font-variant-numeric: tabular-nums; }
+.link-text {
+  color: var(--accent);
+  max-width: 158px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lang-select {
+  background: var(--bg, #1a1f29);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sep { height: 1px; background: var(--border); margin: 6px 0; }
+.row.quit {
+  text-align: left;
+  color: var(--danger, #ff6b6b);
+  cursor: pointer;
+}
+.row.quit:hover { background: rgba(255, 107, 107, 0.12); }
 </style>

@@ -313,6 +313,8 @@ const IPC_EVENTS = Object.freeze({
   IS_FULL_SCREEN: 'workgremlin:is-full-screen',
   FULL_SCREEN_EVENT: 'workgremlin:full-screen',
   EVENT: 'workgremlin:event',
+  QUIT: 'workgremlin:quit',
+  OPEN_EXTERNAL: 'workgremlin:open-external',
 });
 
 /**

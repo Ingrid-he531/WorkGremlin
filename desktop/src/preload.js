@@ -54,4 +54,8 @@ contextBridge.exposeInMainWorld('workgremlin', {
     fullScreenListeners.add(cb);
     return () => fullScreenListeners.delete(cb);
   },
+  /** 退出整个应用 */
+  quit: () => ipcRenderer.invoke(IPC_EVENTS.QUIT),
+  /** @param {string} url 用系统默认程序打开的外部链接 @returns {Promise<boolean>} */
+  openExternal: (url) => ipcRenderer.invoke(IPC_EVENTS.OPEN_EXTERNAL, url),
 });

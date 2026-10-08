@@ -132,3 +132,59 @@ export function httpBase(info) {
   if (info && info.port && !info.fallback) return `http://127.0.0.1:${info.port}`;
   return '';
 }
+
+/**
+ * 应用版本号（来自 package.json 的 version，主进程经 getAppVersion 读）。
+ * @returns {Promise<string>} 读不到返回空串
+ */
+export async function getAppVersion() {
+  if (hasBridge() && typeof window.workgremlin.getAppVersion === 'function') {
+    try {
+      return (await window.workgremlin.getAppVersion()) || '';
+    } catch {
+      /* 降级到空串 */
+    }
+  }
+  return '';
+}
+
+/**
+ * 退出整个应用。Electron 内走 IPC；浏览器 dev 模式下降级为关闭窗口。
+ */
+export async function quitApp() {
+  if (hasBridge() && typeof window.workgremlin.quit === 'function') {
+    try {
+      return await window.workgremlin.quit();
+    } catch {
+      /* 降级到关窗 */
+    }
+  }
+  try {
+    window.close();
+  } catch {
+    /* 关不掉就随它（dev 下常有） */
+  }
+}
+
+/**
+ * 用系统默认程序打开外部链接（Electron 走 shell.openExternal，不会在应用内嵌网页）。
+ * 浏览器 dev 模式下降级为 window.open。
+ * @param {string} url
+ * @returns {Promise<boolean>}
+ */
+export async function openExternal(url) {
+  if (!url) return false;
+  if (hasBridge() && typeof window.workgremlin.openExternal === 'function') {
+    try {
+      return Boolean(await window.workgremlin.openExternal(url));
+    } catch {
+      /* 降级到 window.open */
+    }
+  }
+  try {
+    window.open(url, '_blank', 'noopener,noreferrer');
+  } catch {
+    /* 忽略 */
+  }
+  return true;
+}

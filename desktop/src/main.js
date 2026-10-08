@@ -10,7 +10,7 @@
  * 启动顺序：app.ready -> 读 server.json 连接已起好的 server -> 建窗
  */
 
-const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen } = require('electron');
+const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen, shell } = require('electron');
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
 const fs = require('node:fs');
@@ -80,6 +80,21 @@ async function bootstrap() {
     return serverInfo;
   });
   ipcMain.handle(IPC_EVENTS.GET_APP_VERSION, () => app.getVersion());
+
+  // 退出整个应用（设置面板里的「退出 WorkGremlin」）
+  ipcMain.handle(IPC_EVENTS.QUIT, () => {
+    app.quit();
+  });
+
+  // 用系统默认程序打开外部链接（不会在应用内嵌网页）；失败返回 false
+  ipcMain.handle(IPC_EVENTS.OPEN_EXTERNAL, async (_e, url) => {
+    try {
+      await shell.openExternal(String(url || ''));
+      return true;
+    } catch {
+      return false;
+    }
+  });
 
   // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）
   ipcMain.handle(IPC_EVENTS.CHOOSE_WORKSPACE, async () => {
