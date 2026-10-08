@@ -54,15 +54,16 @@ let timer = null;
 const announcedIds = new Set();
 /**
  * 传送带上的显示行（进行中 running + 待滚一遍的结束行 done/cancelled/failed）。
- * 统一从右端进、向左滚；进行中行滚出左边缘就挪回右端继续循环（常驻滚动），
- * 结束行滚出就直接删掉（只一遍，绝不重复成"一堆"）。w = 实测宽度，回收/补偿用。
+ * 统一从右端进、向左滚；整条滚出左边缘后瞬移回最右重新进（包裹式循环、单份、绝不重复），
+ * 结束行滚过一遍即在 wrap 时清掉（只一遍）。w = 实测宽度，wrap 阈值用。
  */
 const belt = ref([]);
-/** 行间距（px）：与 CSS .line 的 padding-right 一致，回收阈值用 */
+/** 行间距（px）：与 CSS .line 的 padding-right 一致 */
 const GAP = 48;
 /** 内容变了要重测每行宽度（避免每帧读 layout） */
 let beltDirty = true;
-const firstLoad = ref(true);
+/** 本次会话启动时刻：只播报启动后才结束的任务，不回放历史（避免一启动就滚一堆"任务完成"） */
+const sessionStart = Date.now();
 
 /** 结束任务 → 屏上那一行（绿=完成 / 红=取消·失败）。只要「时间 楼层 任务完成」，不接用户输入——
  *  接了会很长、且和进行中的任务混在一起分不清谁收的工；只滚一遍即退场。 */
@@ -73,32 +74,24 @@ function endedText(r) {
   return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}`, w: 0 };
 }
 
-/** 从 rows 里挑出"刚结束、还没播报过"的任务：把还在带上的 running 行摘掉（若有）、
- *  换成结束行，追加到传送带右端（从最右侧进）。 */
+/** 从 rows 里挑出"本次会话启动后才结束"的任务，把结束行追加到传送带右端（从最右侧进）。
+ *  启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；announcedIds 防同任务重复。
+ *  进行中行由 reconcileRunning 负责摘，这里只加结束行。 */
 function detectEnded() {
-  const pid = project.projectId;
-  const since = Date.now() - END_KEEP_MIN * 60_000;
   for (const r of rows.value) {
     if (!r || r.parent_task_id) continue;
-    if (pid && r.project_id !== pid) continue;
+    if (project.projectId && r.project_id !== project.projectId) continue;
     if (!['done', 'failed', 'cancelled'].includes(r.state)) continue;
-    if (Number(r.ended_at) < since) continue;
+    if (Number(r.ended_at) < sessionStart) continue; // 不回放启动前已结束的
     if (announcedIds.has(r.id)) continue;
     announcedIds.add(r.id);
-    if (firstLoad.value) continue; // 首屏不回放历史结束，避免一上来刷一堆
-    // 摘掉这条任务还在带上的 running 行（保持后面内容不跳：offset 补其宽度）
-    const kept = [];
-    for (const it of belt.value) {
-      if (it.kind === 'running' && it.id === r.id) offset += it.w + GAP;
-      else kept.push(it);
-    }
+    const kept = belt.value.concat();
     kept.push(endedText(r)); // 结束行追加到右端 → 从最右侧进
     const wasEmpty = belt.value.length === 0;
     belt.value = kept;
     beltDirty = true;
     if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右重新开始
   }
-  firstLoad.value = false;
 }
 
 async function getJson(path) {
@@ -163,7 +156,6 @@ async function load() {
   } catch {
     /* 拉不到就留着上一份，下一轮再试 */
   }
-  firstLoad.value = false;
 }
 
 /** HH:mm（屏上是段码手感，只要时与分；日期交给任务记录页） */
@@ -224,25 +216,27 @@ const runningItems = computed(() =>
 );
 
 /**
- * 把"进行中任务"同步进传送带：新开的任务追加到右端（从最右侧进）；
- * 已不在 running 的任务（收工/取消由 detectEnded 处理，这里兜底删除）从中段摘掉并补 offset。
+ * 把"进行中任务"同步进传送带：保留已在带上的 running 行（常驻、包裹式循环），
+ * 新开的任务追加到右端（从最右侧进），已收工/取消的行从中段摘掉并补 offset（让后面不跳）。
  */
 function reconcileRunning() {
   const want = runningItems.value;
   const wantIds = new Set(want.map((i) => i.id));
   const kept = [];
   for (const it of belt.value) {
-    if (it.kind === 'running' && !wantIds.has(it.id)) offset += it.w + GAP; // 摘掉：后面内容左移，offset 右移抵消
-    else kept.push(it);
+    if (it.kind === 'running') {
+      if (wantIds.has(it.id)) kept.push(it); // 常驻保留
+      else offset += it.w + GAP; // 任务已结束：摘掉，后面内容左移、offset 右移抵消
+    } else {
+      kept.push(it); // 结束行保留（滚过一遍后在 wrap 时清）
+    }
   }
   const have = new Set(kept.filter((i) => i.kind === 'running').map((i) => i.id));
   for (const it of want) if (!have.has(it.id)) kept.push({ ...it, w: 0 });
-  if (kept.length !== belt.value.length || kept.some((k, i) => k.id !== belt.value[i]?.id)) {
-    const wasEmpty = belt.value.length === 0;
-    belt.value = kept;
-    beltDirty = true;
-    if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右侧重新开始
-  }
+  const wasEmpty = belt.value.length === 0;
+  belt.value = kept;
+  beltDirty = true;
+  if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右重新开始
 }
 
 /** 没有任务：屏上只摆一句静态居中的话，不进滚动轨道 */
@@ -251,12 +245,12 @@ const idle = computed(() => belt.value.length === 0);
 /** 读屏文本：屏上那串滚动的段码对 AT 是噪音，这里给一句静态的 */
 const srText = computed(() => belt.value.map((i) => i.text).join('；'));
 
-/* ------------------------------ 滚动（JS rAF 传送带） ------------------------------
+/* ------------------------------ 滚动（JS rAF 传送带 · 包裹式循环） ------------------------------
  * 单条传送带：所有行（进行中 + 结束）都从最右侧进、向左滚。
- *   · 进行中行滚出左边缘 → 挪回右端继续循环（所以"字都从最右进"、且常驻滚动）。
- *   · 结束行滚出左边缘 → 直接删掉（只一遍，绝不重复成"一堆"）。
- * 增删只动 belt 数组；offset 连续累加、回收时按"滚出行的宽度"补偿，
- * 所以摘行 / 循环都不会让后面的内容跳一下。 */
+ *   · 进行中行常驻：整条滚出左边缘后，offset 瞬移回最右重新进（包裹式循环）。
+ *     瞬移不可见（整条已离屏），所以同一任务**绝不会同时出现两份**、也不会从中间蹦出来。
+ *   · 结束行滚过一遍即在 wrap 时清掉（只一遍，绝不重复成"一堆"）。
+ * 增删只动 belt 数组；offset 连续累加，摘行时按"被摘行的宽度"补偿，不跳。 */
 
 const viewEl = ref(null);
 const trackEl = ref(null);
@@ -268,18 +262,24 @@ let ro = null;
 let raf = null;
 let lastTs = 0;
 let offset = 0;
+/** 整条传送带宽度（px）= 各 (w + GAP) 之和，wrap 阈值用 */
+let totalWidth = 0;
 
-/** 重测每行宽度 + 屏宽（写回 belt[i].w / viewW），回收阈值要用 */
+/** 重测每行宽度 + 屏宽 + 整条宽度（写回 belt[i].w / viewW / totalWidth） */
 function measureBelt() {
   if (viewEl.value) viewW.value = viewEl.value.clientWidth;
   const el = trackEl.value;
   if (!el) return;
   const lines = el.querySelectorAll('.line');
   let i = 0;
+  let total = 0;
   for (const ln of lines) {
-    if (i < belt.value.length) belt.value[i].w = ln.getBoundingClientRect().width;
+    const w = i < belt.value.length ? ln.getBoundingClientRect().width : 0;
+    if (i < belt.value.length) belt.value[i].w = w;
+    total += w + GAP;
     i++;
   }
+  totalWidth = total;
   beltDirty = false;
 }
 
@@ -295,16 +295,15 @@ function tick(ts) {
   if (beltDirty) measureBelt();
   if (!reduce.value && belt.value.length) {
     offset -= SPEED_PX_S * dt;
-    // 最前面的行滚出左边缘（它的右沿到了屏左）→ 回收
-    while (belt.value.length && belt.value[0].w + GAP <= -offset) {
-      const it = belt.value[0];
-      const w = it.w + GAP;
-      if (it.kind === 'running') belt.value.push(belt.value.shift()); // 循环到右端，仍从最右进
-      else belt.value.shift(); // 结束行：只滚一遍，删
-      offset += w; // 补偿，保持后面的内容不跳
-      beltDirty = true;
+    // 整条滚出左边缘（右沿到了屏左）→ 瞬移回最右重新进：
+    // 因整条已离屏，瞬移不可见、不会跳；结束行滚过这一遍后清掉（只一遍）。
+    if (offset <= -totalWidth) {
+      offset = viewW.value || 600;
+      if (belt.value.some((it) => it.kind !== 'running')) {
+        belt.value = belt.value.filter((it) => it.kind === 'running');
+        beltDirty = true;
+      }
     }
-    if (beltDirty) measureBelt();
     el.style.transform = `translateX(${offset}px)`;
   } else if (el) {
     el.style.transform = 'translateX(0)';
@@ -316,7 +315,7 @@ onMounted(async () => {
   await load();
   await nextTick();
   measureBelt();
-  if (belt.value.length && offset === 0) offset = viewW.value || 600; // 首屏也从最右进
+  if (belt.value.length) offset = viewW.value || 600; // 首屏从最右进（覆盖 load 时 viewW 未量的 600 猜测）
   if (typeof ResizeObserver !== 'undefined' && viewEl.value) {
     ro = new ResizeObserver(() => measureBelt());
     ro.observe(viewEl.value);
