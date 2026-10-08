@@ -260,6 +260,16 @@ function promptOf(t) {
   );
   return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
 }
+/**
+ * 任务显示标题：优先用落盘里的 session_title（agent 自动生成的摘要，
+ * 如 Kilo 的 "feat: add login"），没有再退回 promptOf(t)（用户原话）。
+ * session_title 来自 /task-runs 返回，只对 6F/7F/8F 有值，其他楼层自然回落到用户原话。
+ */
+function displayTitle(t) {
+  const st = String((t && t.session_title) || '').trim();
+  if (st) return st;
+  return promptOf(t);
+}
 /** 把 hook 的 op 归到三类：add=新增 / del=删除 / mod=改动（含老数据无 op） */
 function classify(f) {
   if (f.op === 'delete') return 'del';
@@ -330,7 +340,7 @@ const list = computed(() => {
   return (tasks.tasks || []).filter((t) => {
     if (filterState.value !== 'all' && t.state !== filterState.value) return false;
     if (!inTimeWindow(t)) return false;
-    if (kw && !promptOf(t).toLowerCase().includes(kw)) return false;
+    if (kw && !promptOf(t).toLowerCase().includes(kw) && !String((t.session_title) || '').toLowerCase().includes(kw)) return false;
     if (fm && (t.model || '') !== fm) return false;
     return true;
   });
@@ -455,7 +465,7 @@ function sortCls(key) {
  */
 function shortTitle(task, n = 10) {
   // 注意参数名别叫 t：这个文件里 t 到处都是"一条任务"，翻译函数取的是 tr
-  const s = promptOf(task) || tr('records.untitled_task');
+  const s = displayTitle(task) || tr('records.untitled_task');
   const chars = [...s];
   return chars.length > n ? `${chars.slice(0, n).join('')}…` : s;
 }
@@ -544,7 +554,7 @@ function exportCsv() {
     ];
     const rows = timeRows.value.map((t) => [
       fmtTime(t.started_at),
-      promptOf(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
+      displayTitle(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
       clientLabel(t.client, t.form),
       t.model || '',
       projectOf(t),
@@ -714,7 +724,7 @@ const boardNowPct = computed(() => {
 function blockTitle(it) {
   const task = it.task;
   const dur = task.duration_ms != null ? fmtDuration(task.duration_ms) : tr('records.unfinished');
-  return `${promptOf(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
+  return `${displayTitle(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
 }
 /**
  * 重叠段的加深：同时跑 2 条加一档、3 条再加一档（最深压住，免得糊成一块黑）。
@@ -866,7 +876,7 @@ async function saveRetention() {
               >{{ tr('records.delete') }}</button>
             </span>
           </div>
-          <div class="row-title">{{ promptOf(t) || tr('records.untitled_task') }}</div>
+          <div class="row-title">{{ displayTitle(t) || tr('records.untitled_task') }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
             <span v-if="t.client">{{ clientLabel(t.client, t.form) }}</span>
@@ -882,7 +892,7 @@ async function saveRetention() {
       <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
-            <div class="detail-title">{{ promptOf(tasks.selectedTask) || tr('records.untitled_task') }}</div>
+            <div class="detail-title">{{ displayTitle(tasks.selectedTask) || tr('records.untitled_task') }}</div>
             <div class="detail-meta">
               <span>{{ fmtTime(tasks.selectedTask.started_at) }}</span>
               <span v-if="tasks.selectedTask.ended_at">→ {{ fmtTime(tasks.selectedTask.ended_at) }}</span>
@@ -1086,7 +1096,7 @@ async function saveRetention() {
             <tr v-for="t in timeRows" :key="t.id" class="report-row" @click="drillDown(t)">
               <td class="td-dim mono">{{ fmtTime(t.started_at) }}</td>
               <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
-              <td class="td-dim td-task" :title="promptOf(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
+              <td class="td-dim td-task" :title="displayTitle(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
               <td class="td-dim">{{ clientLabel(t.client, t.form) }}</td>
               <td class="td-dim">{{ t.model || '—' }}</td>
               <td class="td-dim">{{ projectOf(t) }}</td>

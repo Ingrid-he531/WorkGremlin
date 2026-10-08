@@ -6,6 +6,7 @@ const express = require('express');
 const { DEFAULTS } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
+const { resolveSessionTitle } = require('../../sessionTitle');
 
 /**
  * 楼层筛选参数 → client 列表。
@@ -201,6 +202,14 @@ function createQueryRouter({ bus, repo }) {
       ...r,
       duration_ms: r.ended_at && r.started_at ? r.ended_at - r.started_at : null,
       subagentCount: repo.countSubagentRuns.get(r.id).c,
+      /**
+       * 会话标题（agent 自动生成的摘要）。只对 7F Kilo / 8F OpenCode / 6F Qoder 有值：
+       * 它们各自的 SQLite 里存了独立的 session.title，与用户原话不同。
+       * 其他楼层（1F/2F/3F/4F/5F/9F）没有独立会话标题 → 这里如实回空，
+       * 前端退回 promptOf(t)（用户原话，已存在 tasks.title）。
+       * 取不到（库没装 / session_id 为空）一律空串，绝不编造。
+       */
+      session_title: resolveSessionTitle(r.session_id, r.client),
       /**
        * 任务详情「工程」显示的名字：按工程**目录**现算（`package.json name > 目录名`，
        * 与"打开工程"同一口径），拿不到目录/读不到 name 才退回库里那行 projects.name。
