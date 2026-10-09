@@ -411,6 +411,14 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     const owner = pluginOwnsMember.has(projectId)
       ? null
       : activeByProject.get(projectId) || newestByProject.get(projectId);
+    bus.setSessionStatus({
+      project: projectId,
+      memberId: 'kilo',
+      sessionId: s.id,
+      state: isActiveOf(s) ? 'thinking' : 'idle',
+      taskId: isActiveOf(s) ? lastId : null,
+      ts: now,
+    });
     if (owner === s) {
       repo.upsertStatus.run({
         memberId,

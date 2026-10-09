@@ -252,6 +252,14 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
     // 状态栏：只在"这个工程该由本条会话上报"、且 CLI 那一路没占着的时候写。
     // 在跑 = thinking（推断），收工 = idle；槽位指向正在跑的那条（没有就最新那条）。
     const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
+    bus.setSessionStatus({
+      project: projectId,
+      memberId: CLIENT,
+      sessionId: s.id,
+      state: running ? 'thinking' : 'idle',
+      taskId: running ? hbId : null,
+      ts: now,
+    });
     if (owner === s && hbId && !hookOwnsMember(repo, memberId, now)) {
       repo.upsertStatus.run({
         memberId,

@@ -373,6 +373,14 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       });
       statusWritten.add(memberId);
     }
+    bus.setSessionStatus({
+      project: projectId,
+      memberId: 'copilot',
+      sessionId: s.id,
+      state: isActive ? 'thinking' : 'idle',
+      taskId: isActive ? runningId : null,
+      ts: now,
+    });
   }
 
   // 收工：这一轮没轮到写状态的成员（工程里连会话都没有）同样落回空闲 —— 别让「思考中」烂在库里

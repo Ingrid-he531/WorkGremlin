@@ -245,6 +245,30 @@ app.use('/api/v1', createIngestRouter({ bus }));
   const healed = await get('limit=50');
   ok('列表里 A 跟着变回「进行中」', stateOf(healed.body, 't-cli-a') === 'running', JSON.stringify(stateOf(healed.body, 't-cli-a')));
 
+  console.log('[6b] CodeBuddy CLI 与 Plugin 是两个会话：后开的任务不能把先开的会话判成已取消');
+  bus.registerMember({ project: 'p1', memberId: 'codebuddy', name: 'CodeBuddy', role: 'agent', client: 'codebuddy-plugin' });
+  await post('/task/start', {
+    memberId: 'codebuddy', taskId: 't-cb-plugin', sessionId: 'cb-plugin-session',
+    client: 'codebuddy-plugin', title: 'Plugin 任务',
+  });
+  bus.registerMember({ project: 'p1', memberId: 'codebuddy', name: 'CodeBuddy', role: 'agent', client: 'codebuddy' });
+  await post('/task/start', {
+    memberId: 'codebuddy', taskId: 't-cb-cli', sessionId: 'cb-cli-session',
+    client: 'codebuddy', title: 'CLI 任务',
+  });
+  const bothCodeBuddy = await get('limit=50&client=codebuddy,codebuddy-plugin');
+  ok('Plugin 会话任务仍显示 running', stateOf(bothCodeBuddy.body, 't-cb-plugin') === 'running', JSON.stringify(stateOf(bothCodeBuddy.body, 't-cb-plugin')));
+  ok('CLI 会话任务也显示 running', stateOf(bothCodeBuddy.body, 't-cb-cli') === 'running', JSON.stringify(stateOf(bothCodeBuddy.body, 't-cb-cli')));
+  const pluginSessionStatus = repo.getSessionStatus.get({ memberId: 'codebuddy@p1', sessionId: 'cb-plugin-session' });
+  const cliSessionStatus = repo.getSessionStatus.get({ memberId: 'codebuddy@p1', sessionId: 'cb-cli-session' });
+  ok('Plugin 与 CLI 各自有独立 task 状态行', pluginSessionStatus && pluginSessionStatus.task_id === 't-cb-plugin' && cliSessionStatus && cliSessionStatus.task_id === 't-cb-cli');
+  await post('/task/end', {
+    memberId: 'codebuddy', taskId: 't-cb-plugin', sessionId: 'cb-plugin-session', state: 'cancelled',
+  });
+  const afterPluginEnd = await get('limit=50&client=codebuddy,codebuddy-plugin');
+  ok('Plugin 收工后只结束自己的任务', stateOf(afterPluginEnd.body, 't-cb-plugin') === 'cancelled', JSON.stringify(stateOf(afterPluginEnd.body, 't-cb-plugin')));
+  ok('Plugin 收工不影响 CLI 会话继续 running', stateOf(afterPluginEnd.body, 't-cb-cli') === 'running', JSON.stringify(stateOf(afterPluginEnd.body, 't-cb-cli')));
+
   console.log('[7] 收工带上来的 token 落进 task_runs 四列 → 接口里读得到（取不到如实 NULL）');
   /**
    * 走**真上报路径**（POST /task/end → bus.endTask → setTaskRunTokens）：reporter hook、

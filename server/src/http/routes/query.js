@@ -22,6 +22,27 @@ function clientFilter(raw) {
     .filter((s) => s && s !== 'all');
 }
 
+/** Prefer exact session activity; retain member-slot fallback for legacy and untracked rows. */
+function taskAliveSql() {
+  return `(
+    EXISTS (
+      SELECT 1 FROM session_status ss
+       WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
+         AND ss.task_id = t.id AND ss.last_heartbeat_at > @cutoff
+         AND ss.state IN ('busy', 'thinking', 'blocked')
+    ) OR (
+      (tr.session_id IS NULL OR NOT EXISTS (
+        SELECT 1 FROM session_status ss
+         WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
+      )) AND EXISTS (
+        SELECT 1 FROM agent_status s
+         WHERE s.task_id = t.id AND s.last_heartbeat_at > @cutoff
+           AND s.state IN ('busy', 'thinking', 'blocked')
+      )
+    )
+  )`;
+}
+
 /**
  * 工程目录 → 显示名（`package.json name > 目录名`，与"打开工程"用的
  * `server/src/project.js` 的 resolveProjectName 同一口径）。
@@ -118,8 +139,8 @@ function createQueryRouter({ bus, repo }) {
    *   - client / model / file_count / files_json / result 来自报表层 task_runs（LEFT JOIN，可能为空）；
    *     client 再回落到 members.client，保证老任务也能标出所属楼层。
    *   - duration_ms = ended_at - started_at（现算）；subagentCount = subagent_runs 计数。
-   *   - state 归一：堆积的遗留 'running' 任务（进程已不在跑）一律视作 'cancelled'；
-   *     只有确实在当前有活跃心跳（agent_status 近期 busy/thinking/**blocked** 且 task_id 匹配）的才保留 'running'。
+  *   - state 归一：堆积的遗留 'running' 任务（进程已不在跑）一律视作 'cancelled'；
+  *     有 session_status 时按该会话的 task_id / 心跳判活；旧记录才回退到成员级 agent_status。
    *     注意 blocked 必须算"还在跑"：等权限时 hook 上报的就是 blocked（awaiting_permission），
    *     漏掉它会让任务在弹权限框的那一刻显示成「已取消」，批准后又跳回「进行中」——纯属误报。
    */
@@ -131,6 +152,7 @@ function createQueryRouter({ bus, repo }) {
     const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
     // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑
     const cutoff = Date.now() - 10 * 60 * 1000;
+    const ALIVE = taskAliveSql();
 
     const conds = ['t.parent_task_id IS NULL'];
     const args = { limit, cutoff };
@@ -178,13 +200,7 @@ function createQueryRouter({ bus, repo }) {
            tr.cache_write_tokens AS cache_write_tokens,
            CASE
              WHEN t.state = 'running'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM agent_status s
-                    WHERE s.task_id = t.id
-                      AND s.last_heartbeat_at > @cutoff
-                      -- blocked = 等权限，仍然是"这一轮在飞"，不能算已取消
-                      AND s.state IN ('busy', 'thinking', 'blocked')
-                  )
+                  AND NOT ${ALIVE}
              THEN 'cancelled'
              ELSE t.state
            END AS state
@@ -256,9 +272,8 @@ function createQueryRouter({ bus, repo }) {
     const cutoff = Date.now() - 10 * 60_000;
     const project = req.query.project;
 
-    // 还在跑：agent_status 里有近期心跳，且相位仍在 active（blocked = 等授权，也算在跑）
-    const ALIVE =
-      "EXISTS (SELECT 1 FROM agent_status s WHERE s.task_id = t.id AND s.last_heartbeat_at > @cutoff AND s.state IN ('busy', 'thinking', 'blocked'))";
+    // 任务记录按 task_runs.session_id 查会话状态；agent_status 仅为老数据兜底。
+    const ALIVE = taskAliveSql();
 
     const conds = [
       't.parent_task_id IS NULL',

@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS agent_status_history (
 );
 CREATE INDEX IF NOT EXISTS idx_status_hist_member_ts ON agent_status_history(member_id, ts_ms);
 
+-- Each member/session pair tracks its own task; agent_status remains the member-card aggregate.
+CREATE TABLE IF NOT EXISTS session_status (
+  member_id          TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+  session_id         TEXT NOT NULL,
+  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline', 'thinking')),
+  state_since        INTEGER NOT NULL,
+  task_id            TEXT,
+  last_heartbeat_at  INTEGER,
+  updated_at         INTEGER NOT NULL,
+  PRIMARY KEY (member_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_status_task ON session_status(task_id, last_heartbeat_at);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id              TEXT PRIMARY KEY,
   project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

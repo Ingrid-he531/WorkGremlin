@@ -167,6 +167,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('没改文件的那轮不许报文件（读过的文件不算改动）', Boolean(row0) && row0.file_count === 0 && row0.files_json === null, row0 && `${row0.file_count} ${row0.files_json}`);
   ok('模型带上了（Copilot 的来自 VS Code state.vscdb）', Boolean(row1) && row1.model === 'GPT-5 mini', row1 && row1.model);
   ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf('copilot@p1') === 'thinking' && taskIdOf('copilot@p1') === 'copilot:cop-sid-1:2', `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1')}`);
+  const copilotSessionStatus = repo.getSessionStatus.get({ memberId: 'copilot@p1', sessionId: 'cop-sid-1' });
+  ok('Copilot 的在飞任务也记在该会话状态行上', copilotSessionStatus && copilotSessionStatus.task_id === 'copilot:cop-sid-1:2' && copilotSessionStatus.state === 'thinking');
 
   console.log('[2] 9F Copilot：在飞那轮收工 → 变 done + 成员卡回落 idle');
   copilotRows = [
@@ -227,6 +229,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   // 那个故障（老会话里跑新任务，行还是几天前那条、时间戳被 insertTask 的 COALESCE 钉死）。
   ok('台账起点 = 这一轮的起点（不是会话第一次被看见的时刻）', Boolean(row7) && Number(row7.started_at) === round7Start, row7 && String(row7.started_at));
   ok('活跃会话 → 成员卡 thinking', stateOf('kilo@p1') === 'thinking', stateOf('kilo@p1'));
+  const kiloSessionStatus = repo.getSessionStatus.get({ memberId: 'kilo@p1', sessionId: 'kilo-sid-1' });
+  ok('Kilo 的在飞任务也记在该会话状态行上', kiloSessionStatus && kiloSessionStatus.task_id === 'kilo:kilo-sid-1:3' && kiloSessionStatus.state === 'thinking');
 
   console.log('[4] 7F Kilo Code：一轮收工 → 成员卡回落 idle，时长是真的');
   const round7End = Date.now() - 30 * 60_000;
@@ -501,6 +505,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('还在跑的那轮不写产出摘要（半截话不算）', Boolean(oc1) && !oc1.result, oc1 && oc1.result);
   ok('模型带上了（OpenCode 的 session.model）', Boolean(oc0) && oc0.model === 'longcat-2.5-preview-free', oc0 && oc0.model);
   ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf('opencode@p1') === 'thinking' && taskIdOf('opencode@p1') === 'opencode:oc-sid-1:1', `${stateOf('opencode@p1')} / ${taskIdOf('opencode@p1')}`);
+  const opencodeSessionStatus = repo.getSessionStatus.get({ memberId: 'opencode@p1', sessionId: 'oc-sid-1' });
+  ok('OpenCode 的在飞任务也记在该会话状态行上', opencodeSessionStatus && opencodeSessionStatus.task_id === 'opencode:oc-sid-1:1' && opencodeSessionStatus.state === 'thinking');
 
   opencodeRows = [
     {

@@ -269,6 +269,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('改动文件转成工程相对路径', Boolean(row0) && row0.file_count === 1 && String(row0.files_json) === JSON.stringify(['server/test/pluginReply.test.js']), row0 && `${row0.file_count} ${row0.files_json}`);
   ok('形态标成 plugin（任务列表显示「Qoder Plugin」而不是 CLI）', Boolean(row1) && row1.form === 'plugin', row1 && row1.form);
   ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf(MEMBER) === 'thinking' && taskIdOf(MEMBER) === `${TASK_ID_PREFIX}s-live:1`, `${stateOf(MEMBER)} / ${taskIdOf(MEMBER)}`);
+  const sessionStatus = repo.getSessionStatus.get({ memberId: MEMBER, sessionId: 's-live' });
+  ok('Qoder 插件的在飞任务也记在该会话状态行上', sessionStatus && sessionStatus.task_id === `${TASK_ID_PREFIX}s-live:1` && sessionStatus.state === 'thinking');
   ok('成员与 CLI 那一路是同一个（qoder@p1，同一层同一个工位），插件先来的话名字叫 Qoder', (repo.getMember.get(MEMBER) || {}).name === 'Qoder', JSON.stringify(repo.getMember.get(MEMBER)));
 
   head('[B1b] 幂等：连跑两次不会插重、不会把起点推走');

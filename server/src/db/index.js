@@ -493,6 +493,19 @@ function createRepo(db) {
         updated_at = excluded.updated_at
     `),
     getStatus: db.prepare(`SELECT * FROM agent_status WHERE member_id = ?`),
+    upsertSessionStatus: db.prepare(`
+      INSERT INTO session_status
+        (member_id, session_id, state, state_since, task_id, last_heartbeat_at, updated_at)
+      VALUES
+        (@memberId, @sessionId, @state, @stateSince, @taskId, @lastHeartbeatAt, @updatedAt)
+      ON CONFLICT(member_id, session_id) DO UPDATE SET
+        state = excluded.state,
+        state_since = CASE WHEN session_status.state = excluded.state THEN session_status.state_since ELSE excluded.state_since END,
+        task_id = excluded.task_id,
+        last_heartbeat_at = excluded.last_heartbeat_at,
+        updated_at = excluded.updated_at
+    `),
+    getSessionStatus: db.prepare(`SELECT * FROM session_status WHERE member_id = @memberId AND session_id = @sessionId`),
     /**
      * 清掉成员状态里的任务槽位（upsertStatus 的 task_id 是 COALESCE，传 null 清不掉）。
      * 9F 收工时用：会话没了，槽位里那条任务（可能已经不存在）也不该再挂着。

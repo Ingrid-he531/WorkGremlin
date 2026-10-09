@@ -293,6 +293,14 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     const owner = pluginOwnsMember.has(projectId)
       ? null
       : activeByProject.get(projectId) || newestByProject.get(projectId);
+    bus.setSessionStatus({
+      project: projectId,
+      memberId: 'opencode',
+      sessionId: s.id,
+      state: running ? 'thinking' : 'idle',
+      taskId: running ? hbId : null,
+      ts: now,
+    });
     if (owner === s && hbId) {
       const last = turns[turns.length - 1] || {};
       repo.upsertStatus.run({

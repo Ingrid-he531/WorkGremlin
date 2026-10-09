@@ -247,6 +247,13 @@
 
 索引：`idx_status_team_state(state)`（便于「谁阻塞了」查询）
 
+### 4.3.1 `session_status`（每个成员 / 会话一行）
+`member_id, session_id, state, state_since, task_id, last_heartbeat_at, updated_at`
+
+`agent_status` 是成员卡的聚合快照；任务记录的运行状态按 `task_runs.session_id` 对应到此表，
+因此同一成员下并行会话的任务不会因成员卡只显示一个 `task_id` 而互相误判为取消。旧任务或
+没有会话 ID 的上报仍可回退到 `agent_status`。
+
 ### 4.4 `agent_status_history`（状态变更流水，供时间线/耗时统计）
 `id INTEGER PK AUTOINCREMENT, member_id, state, ts_ms, reason, source`
 索引：`idx_status_hist_member_ts(member_id, ts_ms)`

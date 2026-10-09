@@ -264,7 +264,8 @@ head('[A5] CLI 落盘扫得到活会话时，hook 兜底整层让位（同一条
   ok('CLI 会话改由 jsonl 那一路列出', fromJsonl.length === 1, floor.sessions.map((s) => `${s.source}:${s.id}`).join(' '));
   ok('同一条 CLI 会话没有同时留下 hook 那一路的行（不重复）', fromHook.length === 0);
   ok('插件那条会话照常还在（两处落盘互不影响）', floor.sessions.some((s) => s.sessionId === PLUGIN_SID));
-  const storage = listSessions({ force: true, client: 'codebuddy-plugin' });
+  const codebuddyPluginRe = detectProducts({ force: true }).find((p) => p.id === '1F').pluginRe;
+  const storage = listSessions({ force: true, client: 'codebuddy-plugin', pluginRe: codebuddyPluginRe });
   ok('插件落盘这一路自己仍然列得出会话', (storage.sessions || []).some((s) => s.id === PLUGIN_SID));
 }
 

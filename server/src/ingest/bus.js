@@ -288,6 +288,31 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     return m;
   }
 
+  function writeSessionStatus(memberId, sessionId, state, taskId, ts) {
+    const sid = normSession(sessionId);
+    if (!sid) return;
+    repo.upsertSessionStatus.run({
+      memberId,
+      sessionId: sid,
+      state,
+      stateSince: ts,
+      taskId: normTaskId(taskId),
+      lastHeartbeatAt: ts,
+      updatedAt: ts,
+    });
+  }
+
+  function setSessionStatus(p) {
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    if (!normSession(p.sessionId)) return { ok: true, skipped: 'missing_session' };
+    const ts = Number(p.ts) || now();
+    const state = AGENT_STATES.includes(p.state) ? p.state : 'idle';
+    writeSessionStatus(member.id, p.sessionId, state, p.taskId, ts);
+    return { ok: true };
+  }
+
   /**
    * 心跳 / 轻量状态更新。
    * @param {{project: string, memberId: string, state?: string, progress?: number, taskId?: string, files?: string[], ts?: number}} p
@@ -300,19 +325,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
 
     const prev = repo.getStatus.get(id);
+    const sessionId = normSession(p.sessionId);
+    const sessionPrev = sessionId ? repo.getSessionStatus.get({ memberId: id, sessionId }) : null;
     /**
      * 这条会话**自己**还没收工的那条任务（没有 → null）。
      *
-     * 心跳是"这条会话还活着"最直接的证据，而槽位（`agent_status.task_id`）是**一行一成员、
-     * 只有一个**：同产品的两条会话同时在跑时，槽位归"最后一个 `/task/start` 的会话"。先收工的
-     * 那条会话 `/task/end` 时，因为"别的会话还活着"整块跳过这次状态写入（见
-     * keepStateForOtherSession）—— 槽位就停在**它自己已经结束的**任务上，**还在跑**的那条在
-     * `/task-runs` 的存活判定里找不到匹配行，于是显示「已取消」。实测 2026-09-30 14:03 的
-     * Kilo CLI（两条会话：13:58 那条一直显示已取消，槽位指着 14:03 那条已经结束的）。
-     *
-     * 所以心跳顺带**认领**槽位：带 taskId 的上报仍以 taskId 为准（优先级 1，见 nextTaskSlot），
-     * 没带就写自己这条在飞的任务。它也是这套判定的自愈口 —— 槽位因为任何原因指歪了，
-     * 下一次心跳就掰回来，不必等新任务开始。
+    * `agent_status.task_id` 仍是成员卡的单槽位聚合值；任务记录的精确存活状态另写入
+    * `session_status`。心跳仍认领成员槽位，让成员卡跟上最近活动的会话，但不会替代会话级状态。
      */
     const mine = liveTaskOf(project, id, p.sessionId);
     const state = AGENT_STATES.includes(p.state)
@@ -337,6 +356,17 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       source: 'report',
       updatedAt: ts,
     });
+    if (sessionId) {
+      const sessionTaskId = normTaskId(p.taskId) || mine || (sessionPrev && sessionPrev.task_id) || null;
+      const sessionState = AGENT_STATES.includes(p.state)
+        ? p.state
+        : sessionPrev
+          ? sessionPrev.state
+          : sessionTaskId
+            ? 'busy'
+            : 'online';
+      writeSessionStatus(id, sessionId, sessionState, sessionTaskId, ts);
+    }
     repo.touchMember.run(ts, id);
     if (!prev || prev.state !== state) {
       repo.insertStatusHistory.run(id, state, ts, 'heartbeat', 'report');
@@ -383,11 +413,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   /**
    * 成员行上挂的那个 task，是不是**本次上报这条会话**的（轴 2）。
    *
-   * 为什么需要判：`agent_status` 是**一行一成员**、只有一个 task_id 槽位，同产品的多条会话
-   * 共用它。不判的话，槽位归"最后调 startTask 的那条会话"占着 —— 实测的后果是状态**正好反了**：
-   * 已退出的那条会话的任务在报表里显示「进行中」（成员行的 task_id 指着它、心跳又由活着的
-   * 那条会话刷着，`/task-runs` 的存活判定就认为它还在跑），而**正在干活**的那条显示「已取消」
-   * （成员行的 task_id 不指向它，存活判定找不到匹配行）。
+  * 用途：`agent_status` 的成员卡只有一个 task_id 槽位；任务记录现由 `session_status` 独立判活。
+  * 这里仍需判断归属，避免一个会话的 idle / 收工状态清掉另一会话在成员卡上的任务指针。
    *
    * 归属靠 `task_runs.session_id`（轴 2 新加的列）。
    * @returns {boolean|null} true=是它的 / false=不是它的 / null=判不了（查不到这一行，或两边有一边没会话标识）
@@ -410,7 +437,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    *
    * 优先级：
    *   1. 上报体**带了个真 taskId**（新 hook 干活时每次都带）→ 以它为准。
-   *      这条会话就此认领槽位，报表的存活判定才能把**它自己**的任务认成在跑。
+  *      这条会话就此认领成员卡槽位；任务存活证明写在该会话自己的 session_status 行。
    *   2. **显式 null**（新 hook 收工时带）= "我这边没任务了" → 只清**自己**占的槽位：
    *      槽位是空的、或本来就是我的、或归属判不出来 → 清掉；
    *      槽位被**别的会话**占着 → 留着，别把人家还在跑的任务擦掉（A 收工不能把 B 的任务抹了）。
@@ -465,6 +492,14 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
     const state = AGENT_STATES.includes(p.state) ? p.state : 'idle';
     const prev = repo.getStatus.get(id);
+    const sessionId = normSession(p.sessionId);
+    const sessionPrev = sessionId ? repo.getSessionStatus.get({ memberId: id, sessionId }) : null;
+    if (sessionId) {
+      const sessionTaskId = Object.prototype.hasOwnProperty.call(p, 'taskId')
+        ? normTaskId(p.taskId)
+        : sessionPrev && sessionPrev.task_id;
+      writeSessionStatus(id, sessionId, state, sessionTaskId, ts);
+    }
     // 别的会话还在跑 → 别把成员整体压成空闲/离线
     if (keepStateForOtherSession(state, member, p)) {
       return { ok: true, skipped: 'other_session_live', card: buildMemberCard(id) };
@@ -518,6 +553,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       source: 'report',
       updatedAt: ts,
     });
+    writeSessionStatus(member.id, p.sessionId, 'busy', id, ts);
     // 台账：**主 agent** 的一轮任务 = 一次用户任务（输入就是用户原话）。
     // subagent 实例不走这条（它们记 subagent_runs），所以判据是"上报者是不是主 agent"。
     if (String(member.role || '') === 'agent') {
@@ -564,6 +600,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       source: 'report',
       updatedAt: ts,
     });
+    writeSessionStatus(member.id, p.sessionId, 'busy', p.taskId, ts);
     if (p.files && p.files.length) {
       for (const f of p.files) repo.insertFileActivity.run(member.id, f, 'write', ts);
       repo.trimFileActivity.run(member.id, member.id, 200);
@@ -582,6 +619,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
 
     repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
     const prev = repo.getStatus.get(member.id);
+    const nextSessionTask = liveTaskOf(project, member.id, p.sessionId);
+    writeSessionStatus(member.id, p.sessionId, nextSessionTask ? 'busy' : 'idle', nextSessionTask, ts);
     // 收工要把成员压回 idle；但同产品的别的会话还在跑时不能压（否则 B 干着活、卡片显示空闲，
     // 而且 taskId / currentFiles 会被清空、把 B 的任务卡一起擦掉）。见 keepStateForOtherSession。
     if (!keepStateForOtherSession('idle', member, p)) {
@@ -601,19 +640,15 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       /**
        * 还有别的会话在跑 → 不压 idle，但槽位**不能就这么留着**。
        *
-       * 槽位只有一个、归"最后一个 `/task/start` 的会话"：这次收工的会话如果正是那个（同产品两条
-       * 会话同时在跑时就是如此），槽位会停在**它自己已经结束的**任务上 —— 还在跑的那条在
-       * `/task-runs` 的存活判定里找不到匹配行，显示「已取消」（实测 2026-09-30 14:03 Kilo CLI：
-       * 13:58 起的那条整轮显示已取消，槽位指着 14:03 那条刚结束的）。原来的写法整块跳过这次写入
-       * （本意是保住"还在跑的那条会话"的 taskId/currentFiles），但那个前提不成立：槽位里的
-       * taskId 是**收工这条**的，不是还在跑那条的。
+      * 槽位只有一个、归"最后一个 `/task/start` 的会话"。收工的会话如果正是它，成员卡指针会停在
+      * 已结束任务上；任务列表不受影响，因为它按 session_status 判活。这里仍须交接槽位，避免
+      * 成员卡显示旧任务或空闲。
        *
        * 所以按台账把槽位**交接**给本成员还没收工的最新那条任务；台账里一条都没有（别的会话只在
        * hook 状态文件里活着、还没写台账）→ 清空槽位，宁可空着也不要指错。
        *
-       * state 一般保持原样（那条会话的相位由它自己的心跳写，这里不越权改）；只有交接成功、
-       * 而槽位挂在 idle/offline 上时才抬成 busy —— 与 heartbeat 的认领同一条理由：
-       * "任务在跑、成员空闲"在 `/task-runs` 的存活判定里照样看不见。
+      * state 一般保持原样（那条会话的相位由它自己的心跳写，这里不越权改）；只有交接成功、
+      * 而槽位挂在 idle/offline 上时才抬成 busy，保持成员卡与其任务指针一致。
        */
       const next = liveTaskOf(project, member.id, '');
       repo.upsertStatus.run({
@@ -1246,6 +1281,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     endSubagentRun,
     heartbeat,
     setStatus,
+    setSessionStatus,
     startTask,
     taskProgress,
     endTask,
