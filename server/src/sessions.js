@@ -41,7 +41,8 @@ const { clientBase } = require('@workgremlin/shared');
 const { selectedModelOf: traeModelOf } = require('./traeModels');
 const { selectedModelOf: claudeModelOf } = require('./claudeModels');
 // TraeCode 取消检测（renderer.log 里 DoneHandler status:"canceled" 等标记）
-const { traeCancelAt, allCancels } = require('./traeCancel');
+// + DoneHandler 最终状态（completed|canceled）—— readReporterDones 用它合成正常完成标记
+const { traeCancelAt, allCancels, allDoneHandlers } = require('./traeCancel');
 // Claude 的配置根（认 CLAUDE_CONFIG_DIR）只留在 products.js 那一处定义，这里复用，别另写一份
 const { claudeHome } = require('./products');
 
@@ -949,6 +950,56 @@ function codebuddyPauseCancelAt(sessionId, sinceTs = 0) {
 }
 
 /**
+ * 扫所有 CodeBuddy 插件 message-queue，汇总"被用户取消"的会话 → `{ [sessionId]: 取消时刻 }`。
+ * 与 codebuddyPauseCancelAt 同口径（globalStorageRoots → message-queue → mtime+size 缓存），
+ * 但**不做 sinceTs 过滤、按会话聚合全部取消**（像 Trae 的 allCancels）—— 因为本函数服务于
+ * readReporterDones 里**独立于 hook 状态文件**的取消扫描：取消时插件不重写状态文件、甚至把
+ * taskId 清空，再拿 startedAt 去卡就认不出取消。渲染层用 phase.ts vs done.at 自行决断显示，
+ * 这里只管"这一轮被取消了"，不需要 smart 过滤。
+ *
+ * 不做扁平 TTL 缓存：直接按文件 mtime+size 增量（走 _pauseCancelCache），每次重新聚合。
+ * message-queue 文件极少（同一窗口几个），重新聚合很便宜；扁平缓存会让"刚写入的取消"最多
+ * 延迟一个 TTL 才被识别，反而拖慢了取消亮红灯。
+ */
+function allCodebuddyCancels() {
+  const merged = {};
+  for (const root of globalStorageRoots()) {
+    for (const name of readDir(root)) {
+      if (!/coding-copilot|tencent|ingram|codebuddy/i.test(name)) continue;
+      const dir = path.join(root, name, 'message-queue');
+      for (const f of readDir(dir)) {
+        if (!/\.json$/i.test(f)) continue;
+        const p = path.join(dir, f);
+        let stat = null;
+        try {
+          stat = fs.statSync(p);
+        } catch {
+          continue;
+        }
+        const cached = _pauseCancelCache.get(p);
+        let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
+        if (!data) {
+          data = readJson(p);
+          _pauseCancelCache.set(p, { m: stat.mtimeMs, size: stat.size, data });
+        }
+        const convs = data && data.conversations ? data.conversations : null;
+        if (!convs) continue;
+        for (const sid of Object.keys(convs)) {
+          const c = convs[sid];
+          const rt = c && c.runtime;
+          if (!rt || !rt.paused) continue;
+          if (String(rt.pauseReason || '').toLowerCase() !== 'cancel') continue;
+          const at = Number(rt.updatedAt) || Number(c.updatedAt) || 0;
+          if (!at) continue;
+          if (!merged[sid] || at > merged[sid]) merged[sid] = at;
+        }
+      }
+    }
+  }
+  return merged;
+}
+
+/**
  * reporter hook 在"等权限"时会把要执行的工具 + 目标文件写进 ~/.workgremlin/hooks/<工位>.json
  * 的 `await` 字段（见 packages/reporter/src/hook.js）。这里读回来给主控制台用。
  * 多工位时取 workspacePath 匹配且最新的一条；没有匹配工程就取最新一条。
@@ -1821,14 +1872,9 @@ function readReporterDones(workspacePath, client = '') {
           });
         }
       }
-      /* CodeBuddy **插件**（IDE 扩展）：取消时同样一个 hook 事件都不发（CLI 那条 FinalStop
-         在 IDE 形态等不到 —— 扩展日志里只有 AgentState.cancelled，没有任何 HookExecutor），
-         但插件自己把 `{paused:true, pauseReason:'cancel', updatedAt}` 写在 message-queue 里
-         （会话 id 与状态文件的 sessionId 一字不差）。见 codebuddyPauseCancelAt。 */
-      if (base === 'codebuddy') {
-        const atP = codebuddyPauseCancelAt(id, startedAtJ);
-        if (atP) synthCancel({ id, j, ws, at: atP, files: roundFilesOf(j) });
-      }
+      /* CodeBuddy **插件**（IDE 扩展）的取消检测**不放在这里**（不在 `if (j.taskId)` 门槛内）：
+         它和 Trae 同因 —— 见下面的「CodeBuddy 插件（IDE 扩展）独立扫取消信号」，那段独立扫、
+         与 taskId 无关，理由同 Trae（取消时 taskId 会被覆盖/清空，卡在 gate 里就认不出）。 */
       /* TraeCode 的取消检测**不放在这里**（不在 `if (j.taskId)` 门槛内）：
          因为 renderer.log 里的取消信号（traeCancelAt / allCancels）**不依赖 hook 状态文件**，
          taskId 被新一轮覆盖了、或者 taskId 清掉了（会话结束），都能从 renderer.log 拿到。
@@ -1869,37 +1915,132 @@ function readReporterDones(workspacePath, client = '') {
   const clients = String(client || '').split(',').map((s) => clientBase(s.trim())).filter(Boolean);
   const isTrae = !client || clients.includes('trae');
   if (isTrae) {
+    // ── 先扫 DoneHandler（最终状态真相）──
+    // completed → 合成正常完成标记（覆盖可能存在的 cancelled:true）
+    // canceled  → 合成取消标记（同 synthCancel）
+    const handlers = allDoneHandlers();
+    const hookBySid = new Map();
+    for (const name of readDir(dir)) {
+      if (!/\.json$/i.test(name)) continue;
+      const j = readJson(path.join(dir, name));
+      if (j && j.sessionId) hookBySid.set(String(j.sessionId), { j });
+    }
+    for (const h of handlers) {
+      const sid = h.sessionId;
+      if (!sid || !h.at) continue;
+      const hook = hookBySid.get(sid);
+      const j = hook ? hook.j : null;
+      const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
+      if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
+      if (j && client && !clientHit(client, j.client)) continue;
+
+      if (h.status === 'completed') {
+        // DoneHandler completed → 合成正常完成标记（cancelled:false）
+        // 覆盖 bySession 里已有的 cancelled:true（from allCancels / hook 状态文件），
+        // 但**只在 DoneHandler at 更大时**覆盖 —— completed 信号应该比取消信号晚到，
+        // 如果 cancel 信号真的是最后那一下（DoneHandler 也是 canceled），就不会走到这。
+        const existing = bySession.get(sid);
+        if (!existing || h.at >= Number(existing.at || 0)) {
+          const mark = {
+            at: h.at,
+            title: (j && j.taskTitle) || '',
+            workspacePath: hookWs || workspacePath || '',
+            sessionId: sid,
+            cancelled: false, // 正常完成！
+            files: [],
+            fileCount: 0,
+            said: '',
+          };
+          bySession.set(sid, mark);
+          if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
+        }
+      } else {
+        // DoneHandler canceled → 同 synthCancel
+        const existing = bySession.get(sid);
+        if (existing && existing.cancelled && Math.abs(Number(existing.at) - h.at) < 5_000) continue;
+        synthCancel({
+          id: sid,
+          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
+          ws: hookWs || workspacePath || '',
+          at: h.at,
+          files: j ? roundFilesOf(j) : [],
+        });
+      }
+    }
+
+    // ── 再扫 allCancels（更早的取消信号）──
+    // 只作补充：allCancels 扫 stop_button / NotificationPort cancel，
+    // 比 DoneHandler 更早，对 readReporterPhase / readReporterActiveTask 有用。
+    // 但对 bySession/latest：DoneHandler 后到且更权威，所以 allCancels 只在
+    // bySession 还**没有 mark** 时才写入（避免先写 cancelled:true 又被覆盖掉逻辑）。
     const traeCancels = allCancels();
     const traeSids = Object.keys(traeCancels || {});
     if (traeSids.length) {
+      for (const sid of traeSids) {
+        const atC = Number(traeCancels[sid]) || 0;
+        if (!atC) continue;
+        // DoneHandler 已经给这条会话写了 mark → 跳过（DoneHandler 更权威）
+        if (bySession.has(sid)) continue;
+        const hook = hookBySid.get(sid);
+        const j = hook ? hook.j : null;
+        const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
+        if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
+        if (j && client && !clientHit(client, j.client)) continue;
+        synthCancel({
+          id: sid,
+          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
+          ws: hookWs || workspacePath || '',
+          at: atC,
+          files: j ? roundFilesOf(j) : [],
+        });
+      }
+    }
+  }
+
+  /* --- CodeBuddy 插件（IDE 扩展）独立扫取消信号 ---
+     与 TraeCode 同因、同形：CodeBuddy 插件取消时**一个 hook 事件都不发**（CLI 那条 FinalStop 在
+     IDE 形态等不到 —— 扩展日志里只有 AgentState.cancelled，没有任何 HookExecutor），唯一权威信号
+     在 message-queue 的 `runtime.pauseReason:'cancel'`（会话 id 与 hook 状态文件 sessionId 一字不差，
+     见 codebuddyPauseCancelAt / allCodebuddyCancels）。
+
+     为什么**不在**上面的 hook 状态文件扫描循环里做、为什么也不做 sinceTs/smart 判断：
+       · 取消时状态文件的 taskId 会被**新一轮覆盖 / 清空**（插件不发 Stop，但常在开新轮时重写状态文件），
+         一旦 taskId 丢了或变成新一轮的，绑在 `if (j.taskId)` + `j.taskStartedAt` 上的探测就再也认不出
+         这口取消 —— 主控制台红灯灭、台账也补不上。所以像 Trae 一样独立扫，只认"会话 id + 取消落盘"。
+       · 渲染层自己用 "phase.ts vs done.at 谁更新" 决定显示：done.at 旧但 phase.ts 新 → 新一轮正常跑
+         覆盖 cancelled 状态（IsoOfficeView.vue），**不会误亮红灯**。所以无需 smart 过滤。 */
+  const isCodebuddy = !client || clients.includes('codebuddy');
+  if (isCodebuddy) {
+    const cbCancels = allCodebuddyCancels();
+    const cbSids = Object.keys(cbCancels || {});
+    if (cbSids.length) {
       const hookBySid = new Map();
       for (const name of readDir(dir)) {
         if (!/\.json$/i.test(name)) continue;
         const j = readJson(path.join(dir, name));
-        if (j && j.sessionId) hookBySid.set(String(j.sessionId), { j });
+        if (j && j.sessionId) hookBySid.set(String(j.sessionId), j);
       }
-      for (const sid of traeSids) {
-        const atC = Number(traeCancels[sid]) || 0;
+      for (const sid of cbSids) {
+        const atC = Number(cbCancels[sid]) || 0;
         if (!atC) continue;
-        // bySession 里已有同一取消（±5s 容差）→ 跳过（避免重复合成、
-        // 也避免 sessionRegistry 重复补发 task/end(cancelled)）
+        // 已有同一取消（±5s 容差）→ 跳过，避免重复合成 / 重复补发 task/end(cancelled)
         const existing = bySession.get(sid);
         if (existing && existing.cancelled && Math.abs(Number(existing.at) - atC) < 5_000) continue;
-
-        const hook = hookBySid.get(sid);
-        const j = hook ? hook.j : null;
+        const j = hookBySid.get(sid) || null;
+        // 只认"本轮开始之后"的取消：老取消（上一轮）不能算到新一轮头上，否则主控制台会把当前这轮
+        // 亮成「任务取消」。这跟老实现 codebuddyPauseCancelAt 的 sinceTs 同口径，但不再依赖 j.taskId
+        // —— taskId 被清空了也能靠 hook 状态文件的 taskStartedAt 判断本轮起点。
+        const sinceTs = j ? Number(j.taskStartedAt) || 0 : 0;
+        if (sinceTs && atC < sinceTs) continue;
         const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
-
         if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
         if (j && client && !clientHit(client, j.client)) continue;
-
         synthCancel({
           id: sid,
-          // 对 Trae 传 taskId=null：hook 状态文件里的 taskId 永远是**新一轮**的，
-          // 取消信号属于**上一轮**（hook 状态文件是一会话一份，新一轮一开就覆盖）。
-          // sessionRegistry.flushSynthesizedCancels 会用 sessionId + cancelAt
-          // 去 task_runs 里找 started_at <= cancelAt、还挂 running 的那条来补。
-          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
+          // taskId 与 Trae 同理：hook 状态文件里的 taskId 可能是新一轮的（甚至被清空），
+          // 取消属于被顶掉的上一轮；sessionRegistry.flushSynthesizedCancels 会用 sessionId + cancelAt
+          // 去 task_runs 找 started_at <= cancelAt、还挂 running 的那条来补 task/end(cancelled)。
+          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'codebuddy' },
           ws: hookWs || workspacePath || '',
           at: atC,
           files: j ? roundFilesOf(j) : [],

@@ -187,6 +187,133 @@ function traeCancelAt(sessionId, sinceTs = 0) {
   return at;
 }
 
+/* ─────────────────────────────────────────────────────────────────────
+ * Trae DoneHandler 扫描 —— renderer.log 里每轮结束的权威状态信号。
+ *
+ * 格式：
+ *   [DoneHandler] Stream done event received {"sessionId":"…","status":"completed|canceled","agentMessageId":"…"}
+ *
+ * 与 allCancels()（扫更早的 stop_button / NotificationPort cancel 信号）的分工：
+ *   · readReporterPhase / readReporterActiveTask 用 traeCancelAt —— 越早戳破相位越好
+ *   · flushTraeDone 用 allDoneHandlers —— DoneHandler 是最终状态真相
+ *   · readReporterDones 合成标记用 DoneHandler —— completed/canceled 不会错
+ *
+ * 缓存复用 allCancels 的 mtime+size + TTL 15s 口径，扫同样的文件集。
+ * ───────────────────────────────────────────────────────────────────── */
+
+/** 一行是不是 DoneHandler 的 Stream done event —— 带 sessionId + status(completed|canceled) + agentMessageId */
+function parseDoneHandlerLine(line) {
+  if (!line || !/DoneHandler.*Stream done event received/.test(line)) return null;
+  const brace = line.indexOf('{');
+  let j = null;
+  if (brace >= 0) {
+    try { j = JSON.parse(line.slice(brace)); } catch { /* 不是合法 JSON */ }
+  }
+  if (!j || !j.sessionId || !j.status) return null;
+  const s = String(j.status).toLowerCase();
+  if (s !== 'completed' && s !== 'canceled' && s !== 'cancelled') return null;
+  const sid = String(j.sessionId);
+  const agentMsg = j.agentMessageId ? String(j.agentMessageId) : '';
+  // 时间戳：行首 ISO 格式
+  const tsMatch = line.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+/);
+  let at = 0;
+  if (tsMatch) {
+    const at2 = Date.parse(tsMatch[0]);
+    if (Number.isFinite(at2)) at = at2;
+  }
+  return { sessionId: sid, agentMessageId: agentMsg, status: s === 'completed' ? 'completed' : 'canceled', at };
+}
+
+/** 单个 renderer.log → DoneHandler 事件数组（每轮一个，按 at 升序，不去重 sessionId） */
+function parseFileDoneHandlers(f) {
+  const content = readLog(f);
+  const out = [];
+  const seen = new Set(); // 同一行可能被重复扫 → 用 agentMessageId + at 去重
+  for (const line of String(content || '').split('\n')) {
+    const hit = parseDoneHandlerLine(line);
+    if (!hit) continue;
+    const dedup = `${hit.sessionId}|${hit.agentMessageId}|${hit.at}`;
+    if (seen.has(dedup)) continue;
+    seen.add(dedup);
+    out.push(hit);
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+
+/** 文件级缓存：path → { mtimeMs, size, handlers } */
+const _doneFileCache = new Map();
+/** 全局 TTL 缓存（避免每次扫全盘）—— 跟 _cache（cancels）同 TTL */
+let _doneCache = { at: 0, list: null };
+
+/**
+ * 扫所有 Trae renderer.log，汇总 DoneHandler 信号 → 事件数组
+ * `[{sessionId, agentMessageId, status:'completed'|'canceled', at}, ...]`
+ * 按 at 升序排列（每轮结束一条，不会被 sessionId 覆盖）。
+ *
+ * 跟 allCancels() 同文件集、同 mtime+size 增量、同 TTL 15s。
+ */
+function allDoneHandlers() {
+  const now = Date.now();
+  if (_doneCache.list && now - _doneCache.at < TTL_MS) return _doneCache.list;
+
+  const files = [];
+  for (const logsRoot of traeLogRoots()) {
+    for (const launch of safeReadDir(logsRoot)) {
+      const launchDir = path.join(logsRoot, launch);
+      if (!isDirSafe(launchDir)) continue;
+      for (const win of safeReadDir(launchDir)) {
+        if (!/^window/.test(win)) continue;
+        const f = path.join(launchDir, win, 'renderer.log');
+        try {
+          const st = fs.statSync(f);
+          if (st.isFile()) files.push({ f, mtimeMs: st.mtimeMs, size: st.size });
+        } catch { /* skip */ }
+      }
+    }
+  }
+  files.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.f < b.f ? -1 : 1));
+  const seen = new Set(files.map((x) => x.f));
+  for (const k of [..._doneFileCache.keys()]) if (!seen.has(k)) _doneFileCache.delete(k);
+
+  const merged = [];
+  const globalSeen = new Set();
+  for (const { f, mtimeMs, size } of files) {
+    const hit = _doneFileCache.get(f);
+    let arr;
+    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) {
+      arr = hit.handlers;
+    } else {
+      arr = parseFileDoneHandlers(f);
+      _doneFileCache.set(f, { mtimeMs, size, handlers: arr });
+    }
+    for (const h of arr) {
+      const dedup = `${h.sessionId}|${h.agentMessageId}|${h.at}`;
+      if (globalSeen.has(dedup)) continue;
+      globalSeen.add(dedup);
+      merged.push(h);
+    }
+  }
+  merged.sort((a, b) => a.at - b.at);
+  _doneCache = { at: now, list: merged };
+  return merged;
+}
+
+/**
+ * 这条 TraeCode 会话最新一轮 DoneHandler 状态是什么。
+ * @param {string} sessionId
+ * @returns {{status:'completed'|'canceled', at:number, agentMessageId:string}|null} null = 没扫到 DoneHandler（还在跑 / 没被识别）
+ */
+function traeDoneStatus(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const list = allDoneHandlers();
+  let latest = null;
+  for (const h of list) {
+    if (h.sessionId === sid && (!latest || h.at > latest.at)) latest = h;
+  }
+  return latest;
+}
+
 function safeReadDir(p) {
   try { return fs.readdirSync(p); } catch { return []; }
 }
@@ -194,4 +321,4 @@ function isDirSafe(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 }
 
-module.exports = { traeCancelAt, allCancels };
+module.exports = { traeCancelAt, allCancels, allDoneHandlers, traeDoneStatus };
