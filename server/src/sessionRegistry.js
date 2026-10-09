@@ -43,6 +43,7 @@ const { listOpencodeSessions, readOpencodePhase, readOpencodeDone } = require('.
 // 逐字正文是密文 —— 会话 / 相位 / 完成标记都只能从"最后一次落盘"推断（见 lingma.js）。
 const { listLingmaSessions, readLingmaRounds, readLingmaPhase, readLingmaDone } = require('./lingma');
 const { detectProducts } = require('./products');
+const { allTokenUsages } = require('./traeTokens');
 const { resolveProjectName } = require('./project');
 // clientOf：7F 那支要按上报身份去问真相位（kilo-plugin / kilo 两个都试，见 kilo 分支的注释）
 const { clientOf } = require('@workgremlin/shared');
@@ -843,13 +844,15 @@ function refresh({ workspacePath = '', force = false } = {}) {
     }
   }
 
-  // 兜底合成的"取消"标记：去重后补发一次 task/end(cancelled)，把台账里卡在「进行中」的任务收掉。
-  // cancels 由 readReporterDones 合成，来源是**用户真按了停止**的信号（Claude / Qoder：
-  // transcript 尾部的打断标记，或 Claude 自己那份会话状态文件说 idle）—— 这些产品按停止时
-  // 一个 hook 事件都不发，台账那行会一直挂在「进行中」。doneScans 在 refresh 开头已清空、
-  // 本轮回填完，正好遍历它收集到的 cancels。
+  // Trae 的 cn_session_usage_tail  = 任务结束信号 + 金额。
+  // **必须在 flushSupersededTasks 之前跑** —— 否则 superseded 会先把 Trae 正常完成的
+  // 任务改成 cancelled（Trae 的 Stop hook 不触发，done 信号永远到不了）。
+  flushTraeYuan(now);
+  // transcript 尾部的打断标记、Claude 状态文件说 idle —— 合成的"取消"信号，把真被 stop
+  // 掉的任务收掉（与 flushTraeYuan 正交：这里处理取消，上面处理完成）。
   flushSynthesizedCancels(doneScans, now);
-  // 被新一轮顶掉的上一轮（同会话一个结束事件都没到的那行）：也补一刀 cancelled
+  // 被新一轮顶掉的上一轮（同会话一个结束事件都没到的那行）：也补一刀 cancelled。
+  // 注意：flushTraeYuan 已先把 Trae 正常完成的任务改成 done，superseded 不会再碰它们。
   flushSupersededTasks(doneScans);
 
   prune(now);
@@ -869,27 +872,39 @@ function flushSynthesizedCancels(doneScans, now) {
   if (!bus || typeof bus.endTask !== 'function') return;
   for (const scan of doneScans.values()) {
     for (const c of scan.cancels || []) {
-      const key = `${c.sessionId}|${c.taskId}|${c.workspacePath}|${c.at}`;
+      // taskId 可能为空（Trae：取消信号来自 renderer.log，hook 状态文件的 taskId 永远是新一轮的）。
+      // 用 cancelAt 参与去重 key，避免同一取消反复补发。
+      const key = `${c.sessionId}|${c.taskId || ''}|${c.workspacePath}|${c.at}`;
       if (postedCancels.get(key) > now) continue;
-      /* 归属**从台账那行任务上取**，别拿状态文件里的字面量顶：bus.endTask 收的是
-         工程 id + 成员 id（`<名字>@<工程id>`，见 bus.memberIdOf），而状态文件里只有
-         工程**路径**（c.workspacePath）和客户端名（c.client）—— 直接传过去会算成
-         `claude@/home/yinghui/work/WorkGremlin` 这种不存在的成员，endTask 当场返回
-         unknown_member（不抛错），取消照旧收不了尾：任务永远挂在「进行中」、
-         产出与改动文件整块丢。实测 2026-09-29：所有 cancelled 行 ended_at 全是 NULL。
-         拿不到这一行（老数据 / 任务已被清）就不发 —— 绝不编造一个工程去写。 */
-      const task = repo && repo.getTask ? repo.getTask.get(c.taskId) : null;
+      let task = null;
+      if (c.taskId) {
+        // Claude / Qoder / CodeBuddy 插件：taskId 直接可取（hook 状态文件里存的是被取消那一轮的）
+        task = repo && repo.getTask ? repo.getTask.get(c.taskId) : null;
+      }
+      if (!task && repo && repo.listStaleRunningBySession && c.sessionId) {
+        // Trae：taskId 为空，从 task_runs 里找这条会话里"cancelAt 之前开始、
+        // 至今还挂 running"的那条（它就是被取消的上一轮；新一轮 startedAt > cancelAt，
+        // 不会被误取）。按 started_at DESC 取最新一条。
+        const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(c.workspacePath || '')) : null;
+        if (proj) {
+          const all = repo.listStaleRunningBySession.all(proj.id, c.sessionId);
+          const atC = Number(c.at) || 0;
+          // 最新开始的那条 <= cancelAt —— 那就是被取消的
+          const match = all
+            .filter((r) => Number(r.startedAt) && (!atC || Number(r.startedAt) <= atC))
+            .sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
+          if (match) task = repo.getTask ? repo.getTask.get(match.id) : null;
+        }
+      }
       if (!task) continue;
       postedCancels.set(key, now + 10 * 60_000);
       try {
         bus.endTask({
           project: task.project_id,
           memberId: task.member_id,
-          taskId: c.taskId,
+          taskId: task.id,
           state: 'cancelled',
           model: '',
-          // 取消只是"没干完"，不是"没产出"：这一轮改过的文件与已经吐出来的收尾自述照常带上
-          // （与 reporter 直接上报的取消标记同口径，见 sessions.js readReporterDones 的合成那段）。
           result: String(c.result || ''),
           files: Array.isArray(c.files) ? c.files : [],
           fileCount: Number.isFinite(Number(c.fileCount)) ? Number(c.fileCount) : (Array.isArray(c.files) ? c.files.length : 0),
@@ -903,6 +918,92 @@ function flushSynthesizedCancels(doneScans, now) {
     }
   }
   for (const [k, v] of postedCancels) if (v <= now) postedCancels.delete(k);
+}
+
+/**
+ * Trae 的 cn_session_usage_tail 事件 → 补 task_runs.usage_yuan **和 state='done'**。
+ *
+ * 关键：usage_tail 不只是金额 —— 它是 Trae 的**任务完成信号**。Trae 写这条日志时，
+ * 任务已正常结束（如果是取消，Trae 根本不会写这条）。所以我们原子 set usage_yuan + state='done'，
+ * 并且**必须在 flushSupersededTasks 之前跑**（否则 superseded 会先把它改成 cancelled）。
+ *
+ * 收尾还顺手 retroFixTraeState 清旧账：之前损坏的（usage_yuan 有值但 state 还是 running/cancelled）
+ * 也拉回 done，幂等。
+ */
+const postedYuan = new Map();
+function flushTraeYuan(now) {
+  const { repo } = backend || {};
+  if (!repo) return;
+  const usages = allTokenUsages();
+  if (!usages.length) return;
+  // usage 事件本身没有 projectId —— 从 hook 状态文件反查 workspacePath → projectId
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const hookDir = path.join(os.homedir(), '.workgremlin', 'hooks');
+  const sidProject = new Map(); // sessionId → { projectId, workspacePath }
+  try {
+    for (const f of fs.readdirSync(hookDir)) {
+      if (!/\.json$/i.test(f)) continue;
+      let j;
+      try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
+      if (!j || !j.sessionId) continue;
+      const ws = j.taskWorkspacePath || j.sessionWorkspacePath || '';
+      if (!ws) continue;
+      const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
+      if (proj) sidProject.set(j.sessionId, { projectId: proj.id, workspacePath: ws });
+    }
+  } catch { /* no hook dir */ }
+
+  // 主流程：扫 usage → set usage_yuan + bus.endTask(state='done')
+  // 关键：usage_tail 就是 Trae 的完成信号，setTaskRunYuan 写 task_runs.usage_yuan，
+  // bus.endTask 写 tasks.state='done'（tasks 表才有 state 列）。
+  const { bus } = backend || {};
+  for (const u of usages) {
+    const sid = u.sessionId;
+    if (!sid) continue;
+    const info = sidProject.get(sid);
+    if (!info) continue;
+    const key = `${sid}|${u.agentMessageId}|${u.usageYuan}`;
+    if (postedYuan.get(key) > now) continue;
+    const row = repo.runAwaitingYuan.get(info.projectId, sid, u.ts);
+    if (!row) continue;
+    repo.setTaskRunYuan.run({ id: row.id, usageYuan: u.usageYuan });
+    // 同时 endTask —— usage 事件就是 Trae 正常完成的信号
+    const task = repo.getTaskRun.get(row.id);
+    if (task && bus && typeof bus.endTask === 'function') {
+      try {
+        bus.endTask({
+          project: info.projectId,
+          memberId: task.member_id,
+          taskId: row.id,
+          state: 'done',
+          model: task.model || '',
+          result: String(task.result || ''),
+          form: task.form || '',
+          sessionId: sid,
+        });
+      } catch { /* 补发失败不影响台账 */ }
+    }
+    postedYuan.set(key, now + 10 * 60_000);
+  }
+
+  // 收尾：清理之前损坏的旧数据
+  // 找 tasks.state IN ('running','cancelled') 但关联的 task_runs.usage_yuan IS NOT NULL 的 → 拉回 done
+  // （flushSupersededTasks 抢在我们之前跑过、或者之前没加 bus.endTask 时的遗留）
+  const raw = backend && backend.repo && backend.repo.raw;
+  if (raw) {
+    const bad = raw.prepare(`
+      SELECT t.id, t.project_id, tr.session_id FROM tasks t
+      JOIN task_runs tr ON tr.id = t.id
+      WHERE t.state IN ('running','cancelled')
+        AND tr.client LIKE '%trae%'
+        AND tr.usage_yuan IS NOT NULL
+    `).all();
+    const fixDone = raw.prepare("UPDATE tasks SET state = 'done' WHERE id = ?");
+    for (const r of bad) fixDone.run(r.id);
+  }
+
+  for (const [k, v] of postedYuan) if (v <= now) postedYuan.delete(k);
 }
 
 /**

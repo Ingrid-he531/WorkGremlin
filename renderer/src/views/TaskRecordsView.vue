@@ -175,6 +175,18 @@ function fmtTokens(n) {
   if (n == null) return '—';
   return n.toLocaleString('en-US');
 }
+/** 金额（元）。null 显示 "—"（与 token 行口径一致），否则 ¥12.50 保留两位小数。 */
+function fmtYuan(n) {
+  if (n == null) return '—';
+  return `¥${Number(n).toFixed(2)}`;
+}
+/** 判断是否 Trae 任务：Trae 客户端有 `"trae"`（纯 trae）或 `"trae,trae-plugin"`（逗号分隔）。
+ *  Trae 的 renderer.log 只给金额、不给 input/output_tokens 分项 → 详情面板用「金额」代替「词元」。 */
+function isTraeTask(t) {
+  const c = t && String(t.client || '');
+  if (!c) return false;
+  return c.split(',').map((x) => x.trim()).includes('trae');
+}
 /**
  * 本轮的**输入总量** = 非缓存 + 缓存读。
  *
@@ -982,8 +994,16 @@ async function saveRetention() {
             <div class="k">{{ tr('records.detail.project') }}</div>
             <div class="v">{{ tasks.selectedTask.project_label || tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
             <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
-            <div class="k">{{ tr('records.detail.tokens') }}</div>
-            <div class="v" :title="tokenTitleOf(tasks.selectedTask)">{{ tokenQuadOf(tasks.selectedTask) }}</div>
+            <!-- 词元 / 金额 二选一：Trae 有金额无 token 分项 → 显示「金额」行代替「词元」；
+                 其他楼层有 token 无金额 → 照常显示「词元」行。互斥，不重复占一格。 -->
+            <template v-if="isTraeTask(tasks.selectedTask)">
+              <div class="k">{{ tr('records.detail.amount') }}</div>
+              <div class="v">{{ fmtYuan(tasks.selectedTask.usage_yuan) }}</div>
+            </template>
+            <template v-else>
+              <div class="k">{{ tr('records.detail.tokens') }}</div>
+              <div class="v" :title="tokenTitleOf(tasks.selectedTask)">{{ tokenQuadOf(tasks.selectedTask) }}</div>
+            </template>
             <div class="k">{{ tr('records.detail.files') }}</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
             <!-- 本轮消耗的词元：三项摊开、用 " / " 隔开（2026-10-01 用户要求）——

@@ -66,6 +66,9 @@ function migrate(db) {
   // 轴 2（会话）：老库里没有这两列，补上；老行留 NULL（不是"没有会话"，是"当时还没记"）
   ensureColumn(db, 'task_runs', 'session_id', 'session_id TEXT');
   ensureColumn(db, 'task_runs', 'form', 'form TEXT');
+  // Trae 的 cn_session_usage_tail 只有金额（元）、没有 token 分项。单独一列存，
+  // 不硬塞进 input_tokens / output_tokens —— 那是给真有 token 分项的产品用的。
+  ensureColumn(db, 'task_runs', 'usage_yuan', 'usage_yuan REAL');
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
@@ -637,6 +640,12 @@ function createRepo(db) {
         cache_write_tokens = @cacheWriteTokens
       WHERE id = @id
     `),
+    /** Trae 的 cn_session_usage_tail = 任务结束信号 + 金额。
+     *  原子写入：set usage_yuan。state 在 tasks 表，由 flushTraeYuan 里的 bus.endTask 处理。 */
+    setTaskRunYuan: db.prepare(`
+      UPDATE task_runs SET usage_yuan = @usageYuan
+      WHERE id = @id
+    `),
     /**
      * 待补 token 的那一行 —— 收工后补报 token 用（见 bus.backfillTaskTokens）。
      *
@@ -672,6 +681,20 @@ function createRepo(db) {
         AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
         AND ABS(COALESCE(started_at, 0) - ?) < 10000
       ORDER BY started_at DESC LIMIT 1
+    `),
+    /** Trae 的 cn_session_usage_tail 只有金额。用 ended_at 匹配：
+     *  usage 事件是任务结束后 Trae 写 renderer.log 的（差 27~120 秒），所以
+     *  ended_at <= usage.ts 必成立；ORDER BY ended_at DESC LIMIT 1 取
+     *  "ended_at 最接近 usage.ts 且在之前"的那条空 usage_yuan 行——
+     *  这就是产生该 usage 的那一轮任务。started_at 不准（Trae hook
+     *  上报的任务开始时间可能比 renderer.log 的 usage 时间还晚）。 */
+    runAwaitingYuan: db.prepare(`
+      SELECT id FROM task_runs
+      WHERE project_id = ? AND session_id = ?
+        AND usage_yuan IS NULL
+        AND ended_at IS NOT NULL
+        AND ended_at <= ?
+      ORDER BY ended_at DESC LIMIT 1
     `),
     listTaskRuns: db.prepare(`
       SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?

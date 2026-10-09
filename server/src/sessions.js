@@ -40,6 +40,8 @@ const { clientBase } = require('@workgremlin/shared');
 // 就会正好造出"某一层取不到模型"这个本次要修的 bug。
 const { selectedModelOf: traeModelOf } = require('./traeModels');
 const { selectedModelOf: claudeModelOf } = require('./claudeModels');
+// TraeCode 取消检测（renderer.log 里 DoneHandler status:"canceled" 等标记）
+const { traeCancelAt, allCancels } = require('./traeCancel');
 // Claude 的配置根（认 CLAUDE_CONFIG_DIR）只留在 products.js 那一处定义，这里复用，别另写一份
 const { claudeHome } = require('./products');
 
@@ -1128,6 +1130,12 @@ function readReporterPhase(workspacePath, client = '', session = '') {
         const atP = codebuddyPauseCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
         if (atP && atP + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
       }
+      // TraeCode 同理：renderer.log 里 DoneHandler 的 status:"canceled" 比这口相位新 → 作废
+      // （TraeCode 取消时 Stop hook 不触发，相位冻在取消前那一口）。
+      if (!iv.hit && clientBase(j.client) === 'trae') {
+        const atT = traeCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+        if (atT && atT + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
+      }
     }
     if (!win || sp.ts > win.ts) {
       win = sp;
@@ -1464,6 +1472,12 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
       Number(j.sessionPhase && j.sessionPhase.ts) || 0
     );
     if (!lastAt || now - lastAt > TASK_RUN_MS) continue;
+    // TraeCode 取消兜底：renderer.log 里已确认取消（取消时刻比本轮开始新）→ 不算活跃
+    // （TraeCode 取消不发 Stop hook 事件，taskId 永远占着，这里手动戳破它）。
+    if (clientBase(j.client) === 'trae') {
+      const atT = traeCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+      if (atT) continue;
+    }
     return true;
   }
   return false;
@@ -1814,6 +1828,82 @@ function readReporterDones(workspacePath, client = '') {
       if (base === 'codebuddy') {
         const atP = codebuddyPauseCancelAt(id, startedAtJ);
         if (atP) synthCancel({ id, j, ws, at: atP, files: roundFilesOf(j) });
+      }
+      /* TraeCode 的取消检测**不放在这里**（不在 `if (j.taskId)` 门槛内）：
+         因为 renderer.log 里的取消信号（traeCancelAt / allCancels）**不依赖 hook 状态文件**，
+         taskId 被新一轮覆盖了、或者 taskId 清掉了（会话结束），都能从 renderer.log 拿到。
+         独立扫描见下面的 for 循环之后。 */
+    }
+  }
+  /* --- TraeCode 独立扫取消信号 ---
+     数据源是 Trae 自己的 renderer.log（DoneHandler status:"canceled" / StreamDomainService
+     cancelReason:"stop_button" / NotificationPort stopType:"cancel" / stream-diagnostics
+     transformedStatus:"canceled"，四种都带 sessionId），由 traeCancel.js 的 allCancels()
+     解析出来（按 mtime+size 缓存，与 traeModels.js 同口径）。
+
+     为什么**不在**上面的 hook 状态文件扫描循环里做：
+       · Trae 取消时**Stop hook 不触发**（hooks.json 里明明配了 Stop，execCommandHook 再也没
+         被调过一次），唯一权威信号是 renderer.log。
+       · hook 状态文件是"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt /
+         sessionPhase —— 如果我们把取消检测绑在 `if (j.taskId)` + `j.taskStartedAt` 的
+         sinceTs 过滤上，那"上一轮取消 → 新一轮立刻启动"这个窗口一过，上一轮的取消
+         信号就被新 startedAtJ 过滤掉了，done 标记永远合成不了。
+
+  /* --- TraeCode 独立扫取消信号 ---
+     数据源是 Trae 自己的 renderer.log（DoneHandler status:"canceled" / StreamDomainService
+     cancelReason:"stop_button" / NotificationPort stopType:"cancel" / stream-diagnostics
+     transformedStatus:"canceled"，四种都带 sessionId），由 traeCancel.js 的 allCancels()
+     解析出来（按 mtime+size 缓存，与 traeModels.js 同口径）。
+
+     为什么**不在** hook 状态文件扫描循环里做、为什么**也不做** sinceTs/smart 判断：
+       · Trae 取消时 Stop hook 不触发，唯一权威信号是 renderer.log。
+       · hook 状态文件是"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt。
+         如果取消检测绑在 `startedAtJ` 上，"上一轮取消 → 新一轮立刻启动"这个窗口一过，
+         旧取消信号就被新 startedAtJ 过滤掉，done 标记永远合成不了。
+       · 渲染层自己用 "phase.ts vs done.at 谁更新" 来决定显示：done.at 旧但 phase.ts 新 →
+         新一轮正常跑覆盖 cancelled 状态（L459-470 IsoOfficeView.vue），**不会误亮红灯**。
+         所以无需 smart 判断过滤。 */
+  // client 可能是逗号分隔（products.js 的 hook source 常写 "trae,trae-plugin"），
+  // clientBase 只去 -plugin 后缀、不拆逗号，"trae,trae-plugin".replace(/-plugin$/,'') = "trae,trae" ≠ "trae"，
+  // 所以单独拆一下再判。
+  const clients = String(client || '').split(',').map((s) => clientBase(s.trim())).filter(Boolean);
+  const isTrae = !client || clients.includes('trae');
+  if (isTrae) {
+    const traeCancels = allCancels();
+    const traeSids = Object.keys(traeCancels || {});
+    if (traeSids.length) {
+      const hookBySid = new Map();
+      for (const name of readDir(dir)) {
+        if (!/\.json$/i.test(name)) continue;
+        const j = readJson(path.join(dir, name));
+        if (j && j.sessionId) hookBySid.set(String(j.sessionId), { j });
+      }
+      for (const sid of traeSids) {
+        const atC = Number(traeCancels[sid]) || 0;
+        if (!atC) continue;
+        // bySession 里已有同一取消（±5s 容差）→ 跳过（避免重复合成、
+        // 也避免 sessionRegistry 重复补发 task/end(cancelled)）
+        const existing = bySession.get(sid);
+        if (existing && existing.cancelled && Math.abs(Number(existing.at) - atC) < 5_000) continue;
+
+        const hook = hookBySid.get(sid);
+        const j = hook ? hook.j : null;
+        const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
+
+        if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
+        if (j && client && !clientHit(client, j.client)) continue;
+
+        synthCancel({
+          id: sid,
+          // 对 Trae 传 taskId=null：hook 状态文件里的 taskId 永远是**新一轮**的，
+          // 取消信号属于**上一轮**（hook 状态文件是一会话一份，新一轮一开就覆盖）。
+          // sessionRegistry.flushSynthesizedCancels 会用 sessionId + cancelAt
+          // 去 task_runs 里找 started_at <= cancelAt、还挂 running 的那条来补。
+          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
+          ws: hookWs || workspacePath || '',
+          at: atC,
+          files: j ? roundFilesOf(j) : [],
+        });
       }
     }
   }

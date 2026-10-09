@@ -104,6 +104,9 @@ function padN(it) {
  *  announcedIds 防同一任务重复播报。 */
 function detectEnded() {
   let added = false;
+  const runningIds = new Set(
+    rows.value.filter((r) => r && r.state === 'running').map((r) => r.id)
+  );
   for (const r of rows.value) {
     if (!r || r.parent_task_id) continue;
     if (project.projectId && r.project_id !== project.projectId) continue;
@@ -113,9 +116,26 @@ function detectEnded() {
     announcedIds.add(r.id);
     pendingEnded.value = pendingEnded.value.concat(endedText(r));
     added = true;
+    // 调试日志：记录检测到的结束任务
+    if (typeof console !== 'undefined' && console.debug) {
+      console.debug('[TaskTicker] 检测到结束任务:', {
+        id: r.id,
+        state: r.state,
+        title: String(r.title || '').slice(0, 40),
+        endedAt: r.ended_at ? new Date(r.ended_at).toISOString() : null,
+      });
+    }
   }
   // 屏上已经空了（之前没任务）却有东西要播：立刻补一段，别等下一轮轮询才动
   if (added && segs.value.length === 0) pushSeg();
+  
+  // 清理：把不在 running 列表中的 announcedIds 移除，允许重新播报
+  // （以防任务状态从 running 变成 done/cancelled 时没有被正确检测）
+  for (const id of announcedIds) {
+    if (!runningIds.has(id) && !rows.value.some((r) => r && r.id === id)) {
+      announcedIds.delete(id);
+    }
+  }
 }
 
 async function getJson(path) {
@@ -456,7 +476,7 @@ onBeforeUnmount(() => {
   color: var(--text-dim, #9aa3b2);
 }
 
-/* 屏壳：暗底 + 等宽字（段码手感），高度沿用液晶屏那一格（--lcd-slot） */
+/* 屏壳：暗底 + 清晰字体，高度沿用液晶屏那一格（--lcd-slot） */
 .screen {
   position: relative;
   flex: 1 1 auto; /* 门楣剩下的宽度全给屏，标签只占它自己那点 */
@@ -472,7 +492,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius, 10px);
   background: var(--lcd-bg, #05070a);
   box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.75);
-  font-family: var(--mono, monospace);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
 }
 
 /* 扫描线：静态背景（不参与动画），手感来自"有栅格"而不是"在闪" */
@@ -507,7 +527,9 @@ onBeforeUnmount(() => {
   flex: none;
   /* 条目之间的空档：一条滚完再接下一条，别让两条粘在一起 */
   padding-right: 48px;
-  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-size: 15px;
+  font-weight: 500;
   letter-spacing: 0.5px;
   /* 补的空格就靠它留着，不然末尾那一串空格会被折叠掉 */
   white-space: pre;
@@ -534,7 +556,9 @@ onBeforeUnmount(() => {
   left: 0;
   visibility: hidden;
   pointer-events: none;
-  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-size: 15px;
+  font-weight: 500;
   letter-spacing: 0.5px;
   white-space: pre;
 }
@@ -570,7 +594,9 @@ onBeforeUnmount(() => {
 .idle-line {
   margin: 0 auto;
   padding: 0 12px;
-  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-size: 15px;
+  font-weight: 500;
   letter-spacing: 1px;
   white-space: nowrap;
   color: var(--text-dim, #9aa3b2);

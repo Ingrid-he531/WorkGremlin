@@ -198,6 +198,10 @@ function createQueryRouter({ bus, repo }) {
            tr.output_tokens AS output_tokens,
            tr.cache_read_tokens AS cache_read_tokens,
            tr.cache_write_tokens AS cache_write_tokens,
+           -- 这一轮的金额（元）。只有 Trae 客户端有 —— Trae 的 ai-agent/database.db
+           -- 加密解不开、renderer.log 也不下发 input/output_tokens 分项，只给金额。
+           -- 非 Trae 楼层这列是 NULL，前端显示 "—"（与 token 列同口径）。
+           tr.usage_yuan AS usage_yuan,
            CASE
              WHEN t.state = 'running'
                   AND NOT ${ALIVE}
