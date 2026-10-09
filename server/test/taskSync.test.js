@@ -3,7 +3,7 @@
  * 7F Kilo / 9F GitHub Copilot 的**任务台账同步器**自检。
  *
  * 为什么单独一个文件：这两层没有 reporter hook，任务记录全靠服务端同步器往 tasks /
- * task_runs 写（server/src/kiloTasks.js / copilotTasks.js）。而任务列表是按**楼层的 clients**
+ * task_runs 写（server/src/kilo.js / copilot.js）。而任务列表是按**楼层的 clients**
  * 精确过滤的（query.js 的 instr(...) 判定）—— 同步器写的身份与楼层接纳的身份对不上，
  * 记录会被静默挡在列表外：库里有行，页面上一条都看不到。
  * （2026-09-28 实测：9F 同步器写 'copilot'，而 9F 只认 'copilot-plugin'，任务记录页永远空。）
@@ -35,14 +35,15 @@ process.env.WORKGREMLIN_HOME = WG;
 const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
-const { detectProducts, RE_GITHUB_COPILOT } = require('../src/products');
+const { detectProducts } = require('../src/floors');
+const { RE_GITHUB_COPILOT } = require('../src/copilot');
 const sessionsMod = require('../src/sessions');
 const kiloMod = require('../src/kilo');
 const opencodeMod = require('../src/opencode');
 
 /* 固定数据打桩：只把"厂商落盘"那一层换掉，repo / 路由 / 同步器全是真的。
  * [9] 那一节要跑**真实的扫盘**证明别的产品的会话不会被写进 9F —— 用一个开关切过去：
- * copilotTasks 在 require 时就把 listSessions 解构走了，之后改模块导出对它无效。 */
+ * copilot.js 的同步器按需从 sessions.js 取 listSessions（sess() 延迟 require），模块加载顺序不再是约束。 */
 const realListSessions = sessionsMod.listSessions;
 let scanReal = false;
 let lastScanOpts = null;
@@ -60,9 +61,9 @@ kiloMod.readKiloRounds = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).ro
 opencodeMod.listOpencodeSessions = () => opencodeRows;
 opencodeMod.readOpencodeTurns = (sid) => ((opencodeRows.find((r) => r.id === sid) || {}).turns || []);
 
-const { syncCopilotTasks } = require('../src/copilotTasks');
-const { syncKiloTasks } = require('../src/kiloTasks');
-const { syncOpencodeTasks } = require('../src/opencodeTasks');
+const { syncCopilotTasks } = require('../src/copilot');
+const { syncKiloTasks } = require('../src/kilo');
+const { syncOpencodeTasks } = require('../src/opencode');
 
 let pass = 0;
 let fail = 0;

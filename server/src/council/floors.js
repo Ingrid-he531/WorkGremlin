@@ -16,7 +16,7 @@
  * 而议事厅要拉起的是一个**可执行文件**，插件形态跑不了。
  */
 
-const { detectProducts } = require('../products');
+const { detectProducts } = require('../floors');
 const { RECIPES } = require('./agents');
 
 /** 首版可用的四层。顺序 = 界面上出现的顺序 */

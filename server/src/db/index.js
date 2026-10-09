@@ -474,7 +474,7 @@ function createRepo(db) {
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
     listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),
-    /** 按上报身份取成员（9F 的同步器据它收工：没有会话时也要把状态落回空闲，见 copilotTasks.js） */
+    /** 按上报身份取成员（9F 的同步器据它收工：没有会话时也要把状态落回空闲，见 copilot.js） */
     listMembersByClient: db.prepare(`SELECT * FROM members WHERE client = ? ORDER BY name`),
     listEphemeral: db.prepare(`SELECT * FROM members WHERE project_id = ? AND ephemeral = 1`),
     touchMember: db.prepare(`UPDATE members SET last_seen_at = ? WHERE id = ?`),
@@ -700,12 +700,12 @@ function createRepo(db) {
       SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?
     `),
     getTaskRun: db.prepare(`SELECT * FROM task_runs WHERE id = ?`),
-    /** 某条会话名下的全部台账行（7F 轮询兜底据此判断"插件是不是已经上报了真值"，见 kiloTasks.js） */
+    /** 某条会话名下的全部台账行（7F 轮询兜底据此判断"插件是不是已经上报了真值"，见 kilo.js） */
     // started_at 也要：kiloTasks 用它判断"插件这一轮写了没有"（见那里的 yieldsOf）
     taskRunsOfSession: db.prepare(`SELECT id, client, started_at FROM task_runs WHERE session_id = ?`),
     /**
      * 某客户端名下**还没收工**的台账行（9F Copilot 据此收掉"张冠李戴"的在飞行：
-     * 别的产品的会话被误当成 Copilot 写进来的历史行，见 copilotTasks.js 的 pruneForeignRunningRuns）。
+     * 别的产品的会话被误当成 Copilot 写进来的历史行，见 copilot.js 的 pruneForeignRunningRuns）。
      * 只取 running 的：这类错行全靠同步器写、又永远等不到收工，done 的历史行不在这条路上。
      */
     liveTaskRunsOfClient: db.prepare(`

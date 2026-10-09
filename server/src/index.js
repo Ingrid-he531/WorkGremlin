@@ -34,10 +34,10 @@ const { createDemo } = require('./demo');
 const { createLifecycle } = require('./lifecycle');
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { snapshot: registrySnapshot, setBackend: setRegistryBackend } = require('./sessionRegistry');
-const { startCopilotTaskSyncer } = require('./copilotTasks');
-const { startKiloTaskSyncer } = require('./kiloTasks');
-const { startOpencodeTaskSyncer } = require('./opencodeTasks');
-const { startQoderPluginTaskSyncer } = require('./qoderPluginTasks');
+const { startCopilotTaskSyncer } = require('./copilot');
+const { startKiloTaskSyncer } = require('./kilo');
+const { startOpencodeTaskSyncer } = require('./opencode');
+const { startQoderPluginTaskSyncer } = require('./qoder');
 const config = require('./config');
 const clock = require('./clock');
 

@@ -6,7 +6,7 @@ const express = require('express');
 const { DEFAULTS } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
-const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessionTitle');
+const { resolveSessionTitle, sessionFirstPrompts } = require('../../floors');
 
 /**
  * 楼层筛选参数 → client 列表。

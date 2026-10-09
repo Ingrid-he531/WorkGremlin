@@ -54,7 +54,7 @@ process.env.PATH = BIN;
 // 指向沙箱里的 Kilo 数据根（等价于 XDG 位置，显式写出来免得受调用环境影响）
 process.env.WORKGREMLIN_KILO_HOME = KILO_HOME;
 
-const { detectProducts } = require('../src/products');
+const { detectProducts } = require('../src/floors');
 const { DEFAULTS } = require('@workgremlin/shared');
 const kilo = require('../src/kilo');
 

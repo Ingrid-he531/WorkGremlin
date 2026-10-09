@@ -34,19 +34,20 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
-// 7F Kilo Code：Kilo 没有 hook、没有会话 jsonl，会话/相位/完成标记由这里轮询它的 SQLite 推导
-const { listKiloSessions, readKiloPhase, readKiloDone } = require('./kilo');
-// 8F OpenCode：与 7F 同类（轮询 SQLite），但读的是 session_message 而不是 event 表
-const { listOpencodeSessions, readOpencodePhase, readOpencodeDone } = require('./opencode');
-// 6F Qoder 的**插件形态**（VS Code / Trae CN 里的「Qoder CN (Formerly Lingma)」扩展）：
-// 与 7F/8F 同类（轮询它自己的 SQLite），但只有 chat_session / chat_record 两张表可读，
-// 逐字正文是密文 —— 会话 / 相位 / 完成标记都只能从"最后一次落盘"推断（见 lingma.js）。
-const { listLingmaSessions, readLingmaRounds, readLingmaPhase, readLingmaDone } = require('./lingma');
-const { detectProducts } = require('./products');
-const { allTokenUsages } = require('./traeTokens');
-const { allDoneHandlers } = require('./traeCancel');
+const { detectProducts } = require('./floors');
+const { floorOf, floors } = require('./floors');
+
+/**
+ * agent 名 → 楼层 meta（只建一次）。各楼层的"会话文件落在哪棵子树 / 文件名怎么解出 sessionId"
+ * 已经下放到 meta.sessionSubtree / meta.sessionIdOfFile，本文件只按 meta 做通用派发，不再写
+ * 任何具体产品的解析规则（见各 <product>.js）。
+ */
+const metaByAgent = {};
+for (const id of Object.keys(floors)) {
+  const m = floors[id] && floors[id].meta;
+  if (m && m.agent) metaByAgent[String(m.agent)] = m;
+}
 const { resolveProjectName } = require('./project');
-// clientOf：7F 那支要按上报身份去问真相位（kilo-plugin / kilo 两个都试，见 kilo 分支的注释）
 const { clientOf } = require('@workgremlin/shared');
 
 /** 超过这么久没有事件 → 从表里移除 */
@@ -272,28 +273,16 @@ function isDir(p) {
  * @param {string} kind 产品基名（products 的 agent：claude / codex / codebuddy …）
  * @returns {string} 会话 id；取不到回空串
  */
+/**
+ * 文件名 → 会话 id。规则由各楼层 meta.sessionIdOfFile 自带（见各 <product>.js），
+ * 本文件只按 agent 查 meta 做通用派发；查不到 / 没有该楼层 → 回空串（退老行为，绝不张冠李戴）。
+ * @param {string} name 文件名（含扩展名）
+ * @param {string} kind 产品基名（楼层 meta.agent：claude / codex / codebuddy …）
+ * @returns {string} 会话 id；取不到回空串
+ */
 function sessionIdOfFile(name, kind) {
-  // Claude Code 与 Qoder 的 transcript 都叫 `<session_id>.jsonl`：去扩展名即是
-  // （Qoder 是 Claude Code 同款格式，文件名即 hook payload 的 session_id，三处实测一致）。
-  if (kind === 'claude' || kind === 'qoder') return name.replace(/\.jsonl$/i, '');
-  if (kind === 'codex') {
-    const m = String(name).match(
-      /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
-    );
-    return m ? m[1] : '';
-  }
-  // CodeBuddy CLI：transcript 同样叫 `<session_id>.jsonl`（2026-09-27 实测：
-  // ~/.codebuddy/projects/<工程>/01a0e136-9b12-75d9-a218-f6bd35e168aa.jsonl 与 hook 状态文件
-  // codebuddy__…_01a0e136-9b12-75d9-a218-f6bd35e168aa.json 里的 sessionId 一字不差）。
-  // 老版本给的是 32 位十六进制（无连字符，见 hooks 目录里那几份旧状态文件），一并认。
-  // 形状对不上（history.jsonl 之类）→ 回空，退回老行为。
-  if (kind === 'codebuddy') {
-    const stem = name.replace(/\.jsonl$/i, '');
-    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (isUuid.test(stem) || /^[0-9a-f]{32}$/i.test(stem)) return stem;
-    return '';
-  }
-  return '';
+  const m = metaByAgent[String(kind)];
+  return m && typeof m.sessionIdOfFile === 'function' ? m.sessionIdOfFile(name) : '';
 }
 
 /**
@@ -307,15 +296,12 @@ function sessionIdOfFile(name, kind) {
  */
 function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   if (!dataPath) return [];
-  // 只扫真正放会话文件的那棵子树：Codex 在 sessions/ 下，Claude Code 与 CodeBuddy 在 projects/ 下。
-  // 根目录里还有 history.jsonl / settings.json 这类不是会话的文件，扫进来全是噪声
-  // （顺带也少走一遍 cache / plugins 那些大目录）。
-  // CodeBuddy 这一条是实测补的（2026-09-27）：它漏了，于是 root 退回整个 ~/.codebuddy，
-  // 把 CLI 的**输入历史** history.jsonl（每行 {"display":"…","project":"…"}，你每敲一次回车
-  // 它就更新、还总是最新）当成一条会话列进下拉。
-  // 目录不存在时退回整棵（下面的 isDir 判定），老安装的行为不变。
-  const SUBTREE = { codex: 'sessions', claude: 'projects', qoder: 'projects', codebuddy: 'projects' };
-  const sub = SUBTREE[kind] ? path.join(dataPath, SUBTREE[kind]) : '';
+  // 只扫真正放会话文件的那棵子树 —— 哪棵由本楼层 meta.sessionSubtree 定（见各 <product>.js）：
+  // Codex 在 sessions/ 下，Claude / Qoder / CodeBuddy 在 projects/ 下。根目录里还有
+  // history.jsonl / settings.json 这类不是会话的文件，扫进来全是噪声（顺带也少走一遍 cache / plugins
+  // 那些大目录）。目录不存在时退回整棵（下面的 isDir 判定），老安装的行为不变。
+  const meta = metaByAgent[String(kind)] || {};
+  const sub = meta.sessionSubtree ? path.join(dataPath, meta.sessionSubtree) : '';
   const root = sub && isDir(sub) ? sub : dataPath;
   // transcript 里还没有第一条对话时（会话刚起），cwd 只能在本产品自己的会话状态文件里找 ——
   // sessionId -> cwd（见 liveSessionCwds）。整趟扫描共用一份，别每个会话文件都重读一遍目录。
@@ -347,7 +333,7 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
       // 它照样有 mtime、照样落进 60 分钟活跃窗口，于是下拉里凭空多一条「未知工程」。
       if (!sizeOf(p)) continue;
       const at = mtime(p);
-      const sid = sessionIdOfFile(e.name, kind);
+      const sid = typeof meta.sessionIdOfFile === 'function' ? meta.sessionIdOfFile(e.name) : sessionIdOfFile(e.name, kind);
       // 工程路径：先看 transcript 头部的 cwd（解析规则见 cwdOfHead）；第一条对话还没落盘时那里
       // 没有，退回正在运行的 CLI 写的会话状态文件（按 sessionId 精确匹配，见 liveSessionCwds）
       const cwd = cwdOfHead(p) || liveCwds.get(sid) || '';
@@ -510,7 +496,6 @@ function refresh({ workspacePath = '', force = false } = {}) {
    */
   const products = detectProducts({});
   const seen = new Set();
-  /** CLI JSONL 已列出的会话 id（只对同一会话去重，不屏蔽同层其他新会话） */
   const cliLandingSessions = new Map();
   const claim = (floor, sessionId) => {
     if (!sessionId) return true;
@@ -519,344 +504,48 @@ function refresh({ workspacePath = '', force = false } = {}) {
     seen.add(k);
     return true;
   };
+  // 框架把共享工具打包成 ctx 交给每个楼层的来源分支（标准 handler 见下方 DEFAULT_KIND_HANDLERS，
+  // 楼层特有的在各自文件 modules/kindHandlers）—— 调试一个楼层不可能碰到别的楼层。
+  const ctx = {
+    now, workspacePath, force,
+    table, backend, TIMEOUT_MS,
+    seen, claim, cliLandingSessions, doneScans,
+    resolveProjectName, clientOf, formatAge,
+    upsert, doneFieldsOf, doneFieldsFromReporter,
+    scanCliSessions, liveSessionCwds, listReporterSessions,
+    listSessions, reporterMainPhase, readReporterDone,
+  };
 
   for (const p of products) {
+    const mod = floorOf(p.id);
+    ctx.product = p;
     for (const src of p.sources) {
       // 只作落盘展示的那几路（kind 'dir'，如 5F 的 ~/.trae-cn 与 ~/.marscode）不产会话：
       // 目录里有东西，但读不出会话索引 —— 它们只进楼层悬浮提示，不进会话表。
       if (src.sessions === false) continue;
 
-      // ---- 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）----
-      if (src.kind === 'plugin') {
-        const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
-        const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
-        const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
-        if (endedSessionIds.size) {
-          for (const [key, session] of table) {
-            if (session.floor === p.id && endedSessionIds.has(session.sessionId)) {
-              table.delete(key);
-            }
-          }
-        }
-        const pluginSessions = (st.sessions || []).filter((s) => !endedSessionIds.has(s.id));
-        if (!pluginSessions.length) continue;
-        for (const s of pluginSessions) {
-          // 轴 2：插件的会话 id 就是 hook payload 的 session_id（实测 genie-history 的
-          // conversationId 与状态文件里的 sessionId 一字不差）。带上它，同一层里多条会话
-          // （CLI + Plugin 同时跑）才能各取各的实时相位 / 完成标记，不"谁最新显示谁"。
-          if (!claim(p.id, s.id)) continue;
-          upsert({
-            floor: p.id,
-            id: s.id,
-            sessionId: s.id,
-            source: 'plugin',
-            project: s.project || '',
-            projectPath: s.projectPath || '',
-            mine: Boolean(s.mine),
-            current: Boolean(s.current),
-            // 该层全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
-            // 只有它才配叠加实时相位，其余 current=true 的工程当前会话只用自己工程的上报，
-            // 绝不借别人的相位冒充（否则切回旧会话会误显别的工程的"调用工具"）。
-            fresh: s.id === st.current,
-            live: Boolean(s.live),
-            runtime: s.runtime,
-            pending: s.pending || 0,
-            todos: s.todos,
-            files: s.files,
-            phase: s.phase,
-            action: s.action,
-            target: s.target || '',
-            tool: s.tool || '',
-            context: s.context || [],
-            prompt: s.prompt || '',
-            // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
-            doneAt: s.doneAt || 0,
-            doneTitle: s.doneTitle || '',
-            doneCount: s.doneCount || 0,
-            doneFiles: s.doneFiles || [],
-            // 这一轮是被打断（Interrupt）收掉的 → UI 亮「任务取消」，不亮「任务完成」
-            doneCancelled: Boolean(s.doneCancelled),
-            // 真值 / 推断由 sessions.js 的 sessionInfo 判定（reported → false），这里照搬，
-            // 别写死 true——否则 reporter 上报的相位也会被 UI 当成「推断」灰显。
-            inferred: Boolean(s.inferred),
-            lastEventAt: s.lastUpdated || 0,
-          });
-        }
-        continue;
-      }
+      // ---- kilo / opencode / lingma 三路（7F / 8F / 6F-插件）----
+      // 这几路不是"扫文件"，而是轮询各产品自己的落盘库（kilo.db / opencode.db / 灵码 local.db），
+      // 形状与 cli/hook 不同（带真相位与模型）。它们的实现已搬到各自的楼层文件
+      // （kilo.js / opencode.js / qoder.js 的 kindHandlers），由下面的通用派发按 src.kind 调用，
+      // 调试 6F/7F/8F 不再需要碰本文件。
 
-      // ---- hook 那一路：由 reporter 状态文件构成会话表 ----
-      // 两个用途：① 5F TraeCode 两个形态都没有可扫的会话落盘，它是唯一来源；
-      // ② 1F CodeBuddy CLI 的兜底 —— CLI 常常只留 hook 状态文件。
-      // 但只要有 jsonl 可扫就不走这条（同一条会话两路都看得到时，只有 jsonl 那路拿不到
-      // 会话 id，混着列会把一条会话显示成两条，见上面 refresh 的说明）。
-      // ---- Kilo 那一路（7F）：轮询 Kilo 自己的 SQLite 库 ----
-      // Kilo 没有 hook 子系统，也没有可扫的会话 jsonl，会话 / 相位 / 完成标记都由
-      // server/src/kilo.js 读 kilo.db 推导（与 8F OpenCode 同属轮询路线，取法不同：
-      // 8F 的 event 表是空的，改读 session_message —— 各自认各自的 kind）。
-      // 它与 cli / hook 两路形状不同（带真的相位与模型），所以单独一支，不塞进下面的
-      // `rows` 三元里 —— 那两路只有"文件时间"这一个证据。
-      if (src.kind === 'kilo') {
-        for (const s of listKiloSessions()) {
-          if (!claim(p.id, s.id)) continue;
-          // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook 两路完全一致
-          if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
-          const ph = readKiloPhase(s.id) || null;
-          // ---- 装了 WorkGremlin 插件吗？装了就用它上报的**真值** ----
-          //
-          // 7F 有两路：轮询（这一支，永远在场）与插件写的状态文件。真相位要压过轮询推导，
-          // 但**不靠 sources 的顺序**（claim 先到先得，hook 那一支沿用老约定只报
-          // 'unreported'，让它先 claim 反而信息更少），而是这一支自己去问一句。
-          //
-          // 两个 client 都要试：插件装在 VS Code 扩展上判出来是 kilo-plugin，
-          // 装在 CLI / TUI 上判出来是 **kilo**（见 plugin/index.js 的 resolveClient）——
-          // 只试前者的话「CLI 装了插件」这个组合的真相位就白写了。
-          const wsOfSession = s.projectPath || workspacePath;
-          const truth =
-            reporterMainPhase(wsOfSession, clientOf('kilo', true), s.id) ||
-            reporterMainPhase(wsOfSession, clientOf('kilo', false), s.id) ||
-            null;
-          // 完成标记同理：插件那份带改动文件清单（还带"被打断"标记），轮询那份只有计数。
-          // 与相位同样两个 client 都试 —— 插件装在 CLI / TUI 上时上报身份是 kilo（不是 kilo-plugin），
-          // 只问后者会把"CLI 装了插件"这条路的完成标记整条漏掉。
-          const doneTruth =
-            readReporterDone(wsOfSession, clientOf('kilo', true), s.id) ||
-            readReporterDone(wsOfSession, clientOf('kilo', false), s.id);
-          const donePoll = readKiloDone(s.id, s);
-          upsert({
-            floor: p.id,
-            id: s.id,
-            // 轴 2：Kilo 的 ses_xxx 就是它自己的 session_id（与 message.session_id、
-            // event.aggregate_id、文件名 ses_f2261460….json 三处一致）
-            sessionId: s.id,
-            source: truth ? 'kilo-plugin' : 'kilo',
-            /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
-            sourceKind: 'kilo',
-            project: s.project,
-            projectPath: s.projectPath,
-            mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
-            current: false,
-            // Kilo 没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
-            live: true,
-            // 相位：插件在 → 用它的真值（不标 inferred，UI 不灰显）；不在 → 用轮询推导的
-            phase: truth ? truth.phase : ph ? ph.phase : 'unreported',
-            action: truth ? truth.action || '' : ph ? ph.action : '',
-            target: truth ? truth.target || '' : ph ? ph.target : '',
-            tool: truth ? truth.tool || '' : ph ? ph.tool : '',
-            context: truth ? truth.context || [] : ph ? ph.context : [],
-            // 「思考中」屏上显示的那句用户原话。轮询这一路**也要给**（kilo.js 自己从库里取，
-            // 见 readRoundPrompt）—— 早先这里只透传插件那份、轮询一律空串，于是没装插件时
-            // 7F 的「思考中」一个字都没有（别的楼层都有，因为它们的 hook 写了 taskTitle）。
-            prompt: truth ? truth.prompt || '' : ph ? ph.prompt || '' : '',
-            // **只有轮询推导才标 inferred**（我们是轮询，不是它主动报的）；
-            // 插件上报的是真值，标 true 会让 UI 把上报也灰显掉。
-            inferred: !truth,
-            // 完成标记：插件那份带 files 清单（还有 cancelled），没有才用轮询那份。
-            // 原始 done 要转成会话行形状，否则 doneAt / doneCancelled 取不到（见 doneFieldsFromReporter）。
-            ...(doneTruth && doneTruth.at ? doneFieldsFromReporter(doneTruth) : donePoll),
-            lastEventAt: s.lastEventAt,
-          });
-        }
-        continue;
-      }
-
-      // ---- OpenCode 那一路（8F）：轮询 OpenCode 自己的 SQLite 库 ----
-      // 与 7F 同一类（不靠上报、单独一支、不塞进下面的 rows 三元），但**取法不同**：
-      // OpenCode 2.0.18 的 event 表是空的（事件不落盘），所以 opencode.js 读的是
-      // session_message 的 content[]，见那个文件头的分叉实测。
-      //
-      // 与 7F 的一个**能力差**（不是 bug，是 OpenCode 的落盘里根本没有这个信号）：
-      // 轮询推不出「等待授权」—— 它的 tool 状态只有 completed/error/running。
-      // 装了 WorkGremlin 插件时真相位由 hook 那一路补上（见 products.js 的 8F sources）。
-      if (src.kind === 'opencode') {
-        for (const s of listOpencodeSessions()) {
-          if (!claim(p.id, s.id)) continue;
-          // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook / kilo 四路完全一致
-          if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
-          const ph = readOpencodePhase(s.id) || null;
-          // 完成标记：插件那一路写状态文件（带改动文件清单 + "被打断"标记），轮询那一路只有计数。
-          // 两个 client 都试 —— 插件装在 CLI / TUI 上时身份是 opencode（不是 opencode-plugin）。
-          const doneTruth =
-            readReporterDone(s.projectPath || workspacePath, clientOf('opencode', true), s.id) ||
-            readReporterDone(s.projectPath || workspacePath, clientOf('opencode', false), s.id);
-          upsert({
-            floor: p.id,
-            id: s.id,
-            // 轴 2：OpenCode 的 ses_xxx 就是它自己的 session_id（与 session_message.session_id、
-            // 事件流 data.sessionID 三处一致）
-            sessionId: s.id,
-            source: 'opencode',
-            /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
-            sourceKind: 'opencode',
-            project: s.project,
-            projectPath: s.projectPath,
-            mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
-            current: false,
-            // OpenCode 没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
-            live: true,
-            // 相位来自 opencode.js 对 session_message 的推导（见那里的新鲜度口径）——
-            // 它是**推断**（我们是轮询，不是它主动报的），所以 inferred 一律 true。
-            phase: ph ? ph.phase : 'unreported',
-            action: ph ? ph.action : '',
-            target: ph ? ph.target : '',
-            tool: ph ? ph.tool : '',
-            context: ph ? ph.context : [],
-            // 「思考中」屏上那句用户原话（opencode.js 从 user 消息的 data.text 取；没有就空）
-            prompt: (ph && ph.prompt) || '',
-            // 模型从会话表取（真实值，取不到留空不猜）
-            model: s.model || '',
-            inferred: true,
-            // 完成标记：插件那份（带 cancelled）优先，没有才用轮询那份
-            // （轮询等价于"assistant 消息 finish=stop"，被打断的那轮见 opencode.js 的 idle.outcome）
-            ...(doneTruth && doneTruth.at ? doneFieldsFromReporter(doneTruth) : readOpencodeDone(s.id, s)),
-            lastEventAt: s.lastEventAt,
-          });
-        }
-        continue;
-      }
-
-      // ---- 6F Qoder 的**插件形态**那一路：轮询扩展自己的 local.db ----
-      // 与 7F/8F 同一类（不靠上报、单独一支），取法是"chat_session + chat_record"两张表
-      // （见 lingma.js 文件头：扩展以通义灵码发布、没有 hook 子系统，逐字正文是密文）。
-      //
-      // 这一路**必须存在**，否则插件里跑的任务在任务记录里看得到、主控制台却一条会话都没有 ——
-      // 主控制台严格跟随所选会话（见 IsoOfficeView 的 consoleBase），没有会话行就没有它的屏。
-      // 能力也比 7F/8F 更窄：源里连"工具状态"都没有，只有"最后一次落盘的时刻"，
-      // 所以相位只在「思考中 / 待命中」之间二选一，恒带 inferred（见 readLingmaPhase）。
-      if (src.kind === 'lingma') {
-        for (const s of listLingmaSessions()) {
-          if (!claim(p.id, s.id)) continue;
-          // "活着"用同一把尺子（TIMEOUT_MS），与 cli / hook / kilo / opencode 五路完全一致。
-          // 先过这一关再读轮次：超时的会话不必再去查 chat_record（一个库几十条会话、每 5s 一轮）。
-          if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
-          const rounds = readLingmaRounds(s.id);
-          // 只在插件里开了会话、一句话都没说：不建行 —— 与台账那一路口径一致
-          // （qoderPluginTasks 也是这样，免得 6F 凭空多一个空工位 / 空会话）。
-          if (!rounds.length) continue;
-          const ph = readLingmaPhase(s.id, rounds, s, now);
-          upsert({
-            floor: p.id,
-            id: s.id,
-            // 轴 2：插件的 chat_session.session_id 就是它自己的会话 id（台账那一行写的也是它）
-            sessionId: s.id,
-            source: 'lingma',
-            /** 这一行来自哪一路：让"jsonl 优先"那套撤行逻辑认得出它不是 hook 行 */
-            sourceKind: 'lingma',
-            project: s.project,
-            projectPath: s.projectPath,
-            mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
-            current: false,
-            // 插件没有 hook 心跳；"活着"只看它自己的时间戳在 60 分钟窗口内
-            live: true,
-            phase: ph ? ph.phase : 'unreported',
-            action: ph ? ph.action : '',
-            target: ph ? ph.target : '',
-            tool: ph ? ph.tool : '',
-            context: ph ? ph.context : [],
-            // 「思考中」屏上那句用户原话（extra.originalContent 是明文）
-            prompt: (ph && ph.prompt) || '',
-            model: (ph && ph.model) || '',
-            // 相位是轮询推断出来的（不是它主动报的）→ UI 灰显
-            inferred: true,
-            // 完成标记：扩展自己写的 summary 就是"这一轮收工了"的凭据（见 readLingmaDone）
-            ...readLingmaDone(s.id, rounds, s, now),
-            lastEventAt: s.lastEventAt,
-          });
-        }
-        continue;
-      }
-
-      // 两路产出的会话行同构（都只有文件时间 / 心跳时间，没有运行态）：
-      // jsonl 路给出 projectPath（从文件头部的 cwd 解析，读不到就空）；
-      // hook 路给出 workspacePath（hook payload 实测值）。
-      const reporterSessions = src.kind === 'cli' ? listReporterSessions(src.client, { includeEnded: true }) : [];
-      const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
-      for (const [key, session] of table) {
-        if (session.floor === p.id && endedSessionIds.has(session.sessionId) && ['cli', 'hook'].includes(session.sourceKind)) {
-          table.delete(key);
-        }
-      }
-      const rows =
-        src.kind === 'cli'
-          ? scanCliSessions(src.dataPath, { kind: p.agent }).filter((s) => !s.sessionId || !endedSessionIds.has(s.sessionId))
-          : listReporterSessions(src.client).map((s) => ({
-              id: s.sessionId,
-              sessionId: s.sessionId,
-              project: s.workspacePath ? resolveProjectName(s.workspacePath) || path.basename(s.workspacePath) : '',
-              projectPath: s.workspacePath,
-              lastEventAt: s.lastEventAt,
-            }));
-      // 判据得是"这一路扫到了【还活着】的会话"，而不是"扫到了任何行"。
-      // 陈旧 jsonl（早已超过 60min 超时、马上要被 prune() 剔除）也算数会把 hook 兜底那一路
-      // 整层让位，导致只有 hook 状态文件的正在跑会话连表都进不去、整层显示 0 会话
-      // （见 mergedFloors.test.js [A4] 复现）。
-      // "活着"与 prune / snapshot 用同一把尺子（TIMEOUT_MS = 60 分钟）；陈旧行本来也会被
-      // prune 掉（snapshot 只列 active 的），所以连登记都不登记它们 —— 顺带避免它用
-      // 会话 id 去 claim（那会让同名 id 的活会话在 claim 那一步被顶掉）。
-      const live = rows.filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS);
-      // CLI JSONL 与 hook 可能描述同一会话。只按真实 sessionId 去重；同一楼层其他
-      // SessionStart 会话仍由 hook 列出，不能因旧 JSONL 活跃而整层让位。
-      if (src.kind === 'cli' && live.length) {
-        const ids = new Set(live.map((s) => s.sessionId).filter(Boolean));
-        cliLandingSessions.set(p.id, ids);
-        for (const sessionId of ids) {
-          const oldHookKey = `${p.id}:${sessionId}`;
-          const oldHook = table.get(oldHookKey);
-          if (oldHook && oldHook.sourceKind === 'hook') table.delete(oldHookKey);
-        }
-      }
-
-      for (const s of live) {
-        const sessionId = s.sessionId || '';
-        if (src.kind === 'hook' && sessionId && cliLandingSessions.get(p.id)?.has(sessionId)) continue;
-        if (!claim(p.id, sessionId)) continue;
-        const lastEventAt = s.lastEventAt;
-        upsert({
-          floor: p.id,
-          id: s.id,
-          // 轴 2：会话 id —— Claude 取 transcript 文件名、Codex 取 rollout 文件名的尾段、
-          // TraeCode / CodeBuddy CLI 的 hook 那一路取状态文件里的 sessionId。
-          // 渲染层拿它去问 `/api/v1/reporter-phase?session=`，就能只取这条会话的实时相位，
-          // 不再"同一个 client 里谁最新就显示谁"。取不到（CodeBuddy CLI 的 jsonl 文件名不含 id）
-          // → 空串，退回旧行为。
-          sessionId,
-          source: 'cli',
-          /** 这一行具体来自哪一路（cli / hook）：让"jsonl 优先"规则能撤掉旧的 hook 行 */
-          sourceKind: src.kind,
-          project: s.project,
-          projectPath: s.projectPath,
-          mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
-          current: false,
-          live: true,
-          // 相位不在这里造（项目铁律：绝不编造）：实时相位由 /reporter-phase 快轮询单独拉，
-          // 这里老实报 phase:'unreported'（未上报），让渲染层在没有相位时显示「待命」。
-          // CLI 落盘只有文件时间，于是把"文件多久前动过"写进 context —— 那是观测到的事实。
-          phase: 'unreported',
-          action: '',
-          context:
-            src.kind === 'cli' ? [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`] : [],
-          inferred: true,
-          // 完成标记只认**这一路自己的 client**（CLI 那路 codebuddy、插件那路 codebuddy-plugin）：
-          // 拿整层的 client 列表去查会把另一路刚收的工搬到这条头上（同工程、无会话 id 时尤其）。
-          ...doneFieldsOf(s.projectPath, src.client, sessionId),
-          lastEventAt,
-        });
-      }
+      // 通用派发：楼层特有的来源分支（kilo / opencode / lingma）优先用楼层自己的 handler；
+      // 否则用框架内置的标准 handler（plugin / cli / hook）。这一行就是"每个楼层的东西
+      // 限定到自己的文件"的落地 —— 新增 / 调整一个楼层只改它的文件 + floors.js，本文件不变。
+      const handler = (mod && mod.kindHandlers && mod.kindHandlers[src.kind]) || DEFAULT_KIND_HANDLERS[src.kind];
+      if (handler) handler(p, src, ctx);
     }
+    // 楼层自己的后台 flush（如 5F Trae 的 endTask / 金额补发）：必须在通用 flush 之前跑，
+    // 否则 superseded 会把 Trae 正常完成的 running 任务先改成 cancelled。
+    if (mod && typeof mod.flushBackend === 'function') mod.flushBackend(ctx);
   }
 
-  // Trae 结束状态的唯一真相：DoneHandler status（completed|canceled）
-  // → bus.endTask 补 tasks.state。必须在 flushSupersededTasks 之前跑，
-  // 否则 superseded 会把 Trae 正常完成的 running 任务先改成 cancelled。
-  flushTraeDone(now);
-  // Trae usage_tail → 只补 task_runs.usage_yuan（金额），不碰 state。
-  // 正常完成和被取消的轮次都有 usage_tail，它只管一件事：补金额。
-  flushTraeYuan(now);
-  // transcript 尾部的打断标记、Claude 状态文件说 idle —— 合成的"取消"信号，把真被 stop
-  // 掉的任务收掉（与 flushTraeDone 正交：那里用 DoneHandler 最终状态，这里用更早的取消信号）。
+  // 通用 flush（与楼层无关，操作 doneScans）：把"用户真按了停止"的合成取消 / 被顶掉的上一轮收尾。
+  // （Trae 自己的 endTask / 金额补发由 trae.js 的 flushBackend 在上面楼层循环里已经跑过。）
   flushSynthesizedCancels(doneScans, now);
   // 被新一轮顶掉的上一轮（同会话一个结束事件都没到的那行）：也补一刀 cancelled。
-  // 注意：flushTraeDone 已先把 Trae 有 DoneHandler 的任务改成 done/cancelled，
+  // 注意：Trae 的 flushBackend 已先把有 DoneHandler 的任务改成 done/cancelled，
   // superseded 只会碰"连 DoneHandler 都没的" running 任务（极少数极端情况）。
   flushSupersededTasks(doneScans);
 
@@ -865,86 +554,133 @@ function refresh({ workspacePath = '', force = false } = {}) {
   lastSnapshot = null;
 }
 
-/**
- * Trae DoneHandler → bus.endTask（最终状态真相）。
- *
- * Trae 的 Stop hook 不触发，正常完成和被取消都不会发 Stop 事件 —— 唯一权威信号是
- * renderer.log 里的 DoneHandler status:"completed" | "canceled"。每轮结束（不管完成/取消）
- * Trae 都写一条，所以扫到就调 bus.endTask 补 tasks.state。
- *
- * 与 flushSynthesizedCancels 正交：那里扫更早的 stop_button / pauseReason（越早戳破相位越好），
- * 这里扫最终确定的 DoneHandler（completed/canceled 不会错）。DoneHandler 后到也没关系 ——
- * bus.endTask 幂等，state='done' 覆盖 state='cancelled' 才是真正的纠偏。
- *
- * 匹配：同一个 sessionId 下永远串行 → ORDER BY started_at DESC LIMIT 1 取最新那条 running 的。
- */
-const postedDoneHandler = new Map(); // key → 过期时间戳
-function flushTraeDone(now) {
-  const { bus, repo } = backend || {};
-  if (!bus || typeof bus.endTask !== 'function' || !repo) return;
-  const handlers = allDoneHandlers();
-  if (!Object.keys(handlers).length) return;
+/* ------------------------------ 标准来源分支（框架内置，所有楼层共用） ------------------------------ */
 
-  // sessionId → { projectId, workspacePath }，从 hook 状态文件反查（同 flushTraeYuan）
-  const fs = require('node:fs');
-  const os = require('node:os');
-  const hookDir = path.join(os.homedir(), '.workgremlin', 'hooks');
-  const sidProject = new Map();
-  try {
-    for (const f of fs.readdirSync(hookDir)) {
-      if (!/\.json$/i.test(f)) continue;
-      let j;
-      try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
-      if (!j || !j.sessionId) continue;
-      const ws = j.taskWorkspacePath || j.sessionWorkspacePath || '';
-      if (!ws) continue;
-      const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
-      if (proj) sidProject.set(j.sessionId, { projectId: proj.id, workspacePath: ws });
+// 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）。
+// 1F/9F 的 plugin 来源走这里；逻辑原样保留，只是从 refresh 的巨 switch 里抽出来。
+function handlePlugin(p, src, ctx) {
+  const { workspacePath, force, table, claim, upsert, listSessions, listReporterSessions, doneFieldsOf } = ctx;
+  const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
+  const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
+  const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
+  if (endedSessionIds.size) {
+    for (const [key, session] of table) {
+      if (session.floor === p.id && endedSessionIds.has(session.sessionId)) table.delete(key);
     }
-  } catch { /* no hook dir */ }
-
-  // 按 at 升序处理——最早的 DoneHandler 先匹配最早结束的 running 任务，
-  // 这样每条 DoneHandler 自然对应它自己的那轮（而不是全部匹配到最新那条）
-  const sorted = [...handlers].sort((a, b) => a.at - b.at);
-  for (const h of sorted) {
-    const sid = h.sessionId;
-    if (!sid || !h.at) continue;
-    const info = sidProject.get(sid);
-    if (!info) continue;
-    // 去重：同一 DoneHandler 10 分钟内不重复发
-    const key = `${sid}|${h.agentMessageId}|${h.status}|${h.at}`;
-    if (postedDoneHandler.get(key) > now) continue;
-    // 找这条 session 里挂 running、且 startedAt <= h.at 的最新那条
-    // （时间窗过滤：避免 13:35 的 DoneHandler 匹配到 17:42 才开始的任务 → 负数时长）
-    const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(info.workspacePath) : null;
-    if (!proj) continue;
-    const all = repo.listStaleRunningBySession ? repo.listStaleRunningBySession.all(proj.id, sid) : [];
-    const atH = Number(h.at) || 0;
-    const match = all
-      .filter((r) => Number(r.startedAt) && (!atH || Number(r.startedAt) <= atH))
-      .sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
-    if (!match) continue;
-    // 状态映射：DoneHandler 的 completed → done，canceled → cancelled
-    const state = h.status === 'completed' ? 'done' : 'cancelled';
-    const task = repo.getTask ? repo.getTask.get(match.id) : null;
-    if (!task) continue;
-    postedDoneHandler.set(key, now + 10 * 60_000);
-    try {
-      bus.endTask({
-        project: proj.id,
-        memberId: task.member_id,
-        taskId: match.id,
-        state,
-        model: task.model || '',
-        result: String(task.result || ''),
-        form: task.form || '',
-        sessionId: sid,
-        ts: h.at, // DoneHandler 写入时刻 = 这轮真实结束时刻
-      });
-    } catch { /* 补发失败不影响台账 */ }
   }
-  for (const [k, v] of postedDoneHandler) if (v <= now) postedDoneHandler.delete(k);
+  const pluginSessions = (st.sessions || []).filter((s) => !endedSessionIds.has(s.id));
+  if (!pluginSessions.length) return;
+  for (const s of pluginSessions) {
+    if (!claim(p.id, s.id)) continue;
+    upsert({
+      floor: p.id,
+      id: s.id,
+      sessionId: s.id,
+      source: 'plugin',
+      project: s.project || '',
+      projectPath: s.projectPath || '',
+      mine: Boolean(s.mine),
+      current: Boolean(s.current),
+      // 该层全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
+      // 只有它才配叠加实时相位，其余 current=true 的工程当前会话只用自己工程的上报。
+      fresh: s.id === st.current,
+      live: Boolean(s.live),
+      runtime: s.runtime,
+      pending: s.pending || 0,
+      todos: s.todos,
+      files: s.files,
+      phase: s.phase,
+      action: s.action,
+      target: s.target || '',
+      tool: s.tool || '',
+      context: s.context || [],
+      prompt: s.prompt || '',
+      // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
+      doneAt: s.doneAt || 0,
+      doneTitle: s.doneTitle || '',
+      doneCount: s.doneCount || 0,
+      doneFiles: s.doneFiles || [],
+      doneCancelled: Boolean(s.doneCancelled),
+      inferred: Boolean(s.inferred),
+      lastEventAt: s.lastUpdated || 0,
+    });
+  }
 }
+
+// cli / hook 两路共用：扫 jsonl 或读 reporter 状态文件，按 src.kind 区分。
+// 1F~5F、9F 的 cli/hook 来源都走这里（标准形状：只有文件时间 / 心跳时间，没有运行态）。
+function handleCliHook(p, src, ctx) {
+  const {
+    workspacePath, table, claim, upsert, now, TIMEOUT_MS,
+    scanCliSessions, listReporterSessions, doneFieldsOf, formatAge, resolveProjectName, cliLandingSessions,
+  } = ctx;
+  const reporterSessions = src.kind === 'cli' ? listReporterSessions(src.client, { includeEnded: true }) : [];
+  const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
+  for (const [key, session] of table) {
+    if (session.floor === p.id && endedSessionIds.has(session.sessionId) && ['cli', 'hook'].includes(session.sourceKind)) {
+      table.delete(key);
+    }
+  }
+  const rows =
+    src.kind === 'cli'
+      ? scanCliSessions(src.dataPath, { kind: p.agent }).filter((s) => !s.sessionId || !endedSessionIds.has(s.sessionId))
+      : listReporterSessions(src.client).map((s) => ({
+          id: s.sessionId,
+          sessionId: s.sessionId,
+          project: s.workspacePath ? resolveProjectName(s.workspacePath) || path.basename(s.workspacePath) : '',
+          projectPath: s.workspacePath,
+          lastEventAt: s.lastEventAt,
+        }));
+  // 判据得是"这一路扫到了【还活着】的会话"，而不是"扫到了任何行"（与 prune / snapshot 同尺 TIMEOUT_MS）。
+  const live = rows.filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS);
+  // CLI JSONL 与 hook 可能描述同一会话：只按真实 sessionId 去重；cli 路扫到活会话时，撤掉旧的 hook 行。
+  if (src.kind === 'cli' && live.length) {
+    const ids = new Set(live.map((s) => s.sessionId).filter(Boolean));
+    cliLandingSessions.set(p.id, ids);
+    for (const sessionId of ids) {
+      const oldHookKey = `${p.id}:${sessionId}`;
+      const oldHook = table.get(oldHookKey);
+      if (oldHook && oldHook.sourceKind === 'hook') table.delete(oldHookKey);
+    }
+  }
+  for (const s of live) {
+    const sessionId = s.sessionId || '';
+    if (src.kind === 'hook' && sessionId && cliLandingSessions.get(p.id)?.has(sessionId)) continue;
+    if (!claim(p.id, sessionId)) continue;
+    const lastEventAt = s.lastEventAt;
+    upsert({
+      floor: p.id,
+      id: s.id,
+      sessionId,
+      source: 'cli',
+      /** 这一行具体来自哪一路（cli / hook）：让"jsonl 优先"规则能撤掉旧的 hook 行 */
+      sourceKind: src.kind,
+      project: s.project,
+      projectPath: s.projectPath,
+      mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
+      current: false,
+      live: true,
+      // 相位不在这里造（项目铁律：绝不编造）—— 实时相位由 /reporter-phase 快轮询单独拉。
+      phase: 'unreported',
+      action: '',
+      context: src.kind === 'cli' ? [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`] : [],
+      inferred: true,
+      // 完成标记只认**这一路自己的 client**（见 refresh 的说明）。
+      ...doneFieldsOf(s.projectPath, src.client, sessionId),
+      lastEventAt,
+    });
+  }
+}
+
+/**
+ * 标准来源分支表：key 是来源 kind。楼层文件可以用自己的 kindHandlers 覆盖任意一种
+ * （见 kilo.js / opencode.js / qoder.js）。'dir' 不产会话，refresh 里已提前跳过。
+ */
+const DEFAULT_KIND_HANDLERS = {
+  plugin: handlePlugin,
+  cli: handleCliHook,
+  hook: handleCliHook,
+};
 
 /**
  * 去重键含 taskStartedAt（at），同一轮只要补发一次；新一轮（at 变了）照常再发。
@@ -1006,58 +742,7 @@ function flushSynthesizedCancels(doneScans, now) {
 }
 
 /**
- * Trae usage_tail → 只补 task_runs.usage_yuan（金额），**不碰 state**。
- *
- * 正常完成和被取消的 Trae 轮次**都写 usage_tail**（只要模型开始跑了就有金额），
- * 所以它不能用来判断完成/取消——那是 DoneHandler 的事（见 flushTraeDone）。
- * 这里只管一件事：给 task_runs 里还没补金额的行填上 usage_yuan。
- *
- * 匹配：同一个 sessionId 下永远串行，runAwaitingYuan 用 started_at/ended_at 时间窗
- * 取最新那条没补的就行。
- */
-const postedYuan = new Map();
-function flushTraeYuan(now) {
-  const { repo } = backend || {};
-  if (!repo) return;
-  const usages = allTokenUsages();
-  if (!usages.length) return;
-
-  // usage 事件本身没有 projectId —— 从 hook 状态文件反查 workspacePath → projectId
-  const fs = require('node:fs');
-  const os = require('node:os');
-  const hookDir = path.join(os.homedir(), '.workgremlin', 'hooks');
-  const sidProject = new Map();
-  try {
-    for (const f of fs.readdirSync(hookDir)) {
-      if (!/\.json$/i.test(f)) continue;
-      let j;
-      try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
-      if (!j || !j.sessionId) continue;
-      const ws = j.taskWorkspacePath || j.sessionWorkspacePath || '';
-      if (!ws) continue;
-      const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
-      if (proj) sidProject.set(j.sessionId, { projectId: proj.id, workspacePath: ws });
-    }
-  } catch { /* no hook dir */ }
-
-  for (const u of usages) {
-    const sid = u.sessionId;
-    if (!sid) continue;
-    const info = sidProject.get(sid);
-    if (!info) continue;
-    // 去重：同一条 usage（sessionId + agentMessageId + amount）10 分钟内不重复补
-    const key = `${sid}|${u.agentMessageId}|${u.usageYuan}`;
-    if (postedYuan.get(key) > now) continue;
-    const row = repo.runAwaitingYuan.get(info.projectId, sid, u.ts);
-    if (!row) continue;
-    repo.setTaskRunYuan.run({ id: row.id, usageYuan: u.usageYuan });
-    postedYuan.set(key, now + 10 * 60_000);
-  }
-
-  for (const [k, v] of postedYuan) if (v <= now) postedYuan.delete(k);
-}
-
-/**
+ * 收掉**被新一轮顶掉的上一轮**：同一会话里比"当前这一轮"更早开始、却至今挂着 running 的任务。
  * 收掉**被新一轮顶掉的上一轮**：同一会话里比"当前这一轮"更早开始、却至今挂着 running 的任务。
  *
  * 判据是硬的：一个会话不可能同时跑两轮。它之所以还挂着，是因为这一轮的结束事件永远到不了 ——

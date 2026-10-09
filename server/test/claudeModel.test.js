@@ -29,7 +29,7 @@ process.env.CLAUDE_CONFIG_DIR = CLAUDE;
 
 const { selectedModelOf } = require('../src/claudeModels');
 const { sessionModel, reporterMainPhase } = require('../src/sessions');
-const { claudeHome } = require('../src/products');
+const { claudeHome } = require('../src/claude');
 
 /* ------------------------------ 断言 ------------------------------ */
 

@@ -64,7 +64,7 @@ process.env.PATH = BIN;
 
 const { snapshot, table } = require('../src/sessionRegistry');
 const { reporterMainPhase, listReporterSessions, listSessions } = require('../src/sessions');
-const { detectProducts } = require('../src/products');
+const { detectProducts } = require('../src/floors');
 
 /* ------------------------------ 造数据 ------------------------------ */
 

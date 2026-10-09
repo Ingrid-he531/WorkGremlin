@@ -4,7 +4,7 @@
  *
  * 为什么单独一个文件：这个扩展没有 hook 子系统（实测 2026-09-30，extension.js 里连
  * SessionStart / PreToolUse 都搜不到），任务记录只能靠服务端轮询它自己的落盘
- * （server/src/lingma.js 读 → server/src/qoderPluginTasks.js 写）。
+ * （server/src/qoder.js：6F Qoder 插件形态，数据源与任务同步器合并于一处）。
  * 与 7F/8F/9F 的 [test:task-sync] 同一个道理，测的是**用户看到的那条路**：
  *   造一个与扩展同构的库 → 同步器写库 → /api/v1/task-runs?client=qoder 取回来。
  * 顺带锁住 6F 独有的两个点：
@@ -25,7 +25,7 @@ const path = require('node:path');
 const express = require('express');
 
 /* ------------------------------ 沙箱 ------------------------------ */
-// lingma.js / project.js 都在调用时读环境与文件，但 HOME 还是先设为妙（与别的自检一致）
+// qoder.js / project.js 都在调用时读环境与文件，但 HOME 还是先设为妙（与别的自检一致）
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-qoder-plugin-'));
 const HOME = path.join(TMP, 'home');
 const WG = path.join(TMP, 'wg');
@@ -43,10 +43,10 @@ const Database = require('better-sqlite3');
 const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
-const { detectProducts } = require('../src/products');
+const { detectProducts } = require('../src/floors');
 const { snapshot } = require('../src/sessionRegistry');
-const lingma = require('../src/lingma');
-const { syncQoderPluginTasks, LIVE_MS, TASK_ID_PREFIX } = require('../src/qoderPluginTasks');
+const qoder = require('../src/qoder');
+const { syncQoderPluginTasks, LIVE_MS, TASK_ID_PREFIX } = qoder;
 
 let pass = 0;
 let fail = 0;
@@ -88,7 +88,7 @@ const SCHEMA = `
 `;
 
 /**
- * 重建库。`sessions` / `records` 的形状刻意贴住 lingma.js 的读法：
+ * 重建库。`sessions` / `records` 的形状刻意贴住 qoder.js 的读法：
  *   session: {id, title, projectPath, createdAt, lastEventAt, type}
  *   record : {requestId, sessionId, prompt, summary, model, startedAt, updatedAt}
  *   snapshot: {id, sessionId, recordId|null, at, files:[绝对路径]}
@@ -129,7 +129,7 @@ function writeDb({ sessions = [], records = [], snapshots = [], schema = SCHEMA 
     }
   }
   db.close();
-  lingma.resetLingmaCache(); // 会话表有 5s 缓存：刚换过库/刚写过行必须清掉
+  qoder.resetLingmaCache(); // 会话表有 5s 缓存：刚换过库/刚写过行必须清掉
 }
 
 const NOW = Date.now();
@@ -165,7 +165,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   head('[0] 前置：6F 接纳的上报身份（同步器必须写这里的值，否则被楼层筛选挡掉）');
   ok('6F 接纳 qoder（CLI 与插件合并单楼层）', F6.includes('qoder'), F6.join(','));
-  ok('库还没造出来时 → 路径回空串（没装扩展就是这个样子）', lingma.lingmaDbPath() === '', lingma.lingmaDbPath());
+  ok('库还没造出来时 → 路径回空串（没装扩展就是这个样子）', qoder.lingmaDbPath() === '', qoder.lingmaDbPath());
 
   /* ------------------------------ A. 读法 ------------------------------ */
 
@@ -180,14 +180,14 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       { requestId: 'r1', sessionId: 's-a', prompt: '第一轮', startedAt: NOW - 30 * MIN, updatedAt: NOW - 25 * MIN },
     ],
   });
-  const sess = lingma.listLingmaSessions();
+  const sess = qoder.listLingmaSessions();
   const idsA = sess.map((s) => s.id);
-  ok('库路径认 WORKGREMLIN_LINGMA_DB（自检指到临时库上）', lingma.lingmaDbPath() === DBP, lingma.lingmaDbPath());
+  ok('库路径认 WORKGREMLIN_LINGMA_DB（自检指到临时库上）', qoder.lingmaDbPath() === DBP, qoder.lingmaDbPath());
   ok('对话会话列出来了', idsA.includes('s-a'), idsA.join(' '));
   ok('行内补全（session_type=completion）不算任务', !idsA.includes('s-completion'), idsA.join(' '));
   ok('没有工程路径的跳过', !idsA.includes('s-noproj'), idsA.join(' '));
   ok('工程名与 CLI 那一路同一条解析（package.json name）', (sess.find((s) => s.id === 's-a') || {}).project === 'p1', JSON.stringify(sess[0] && sess[0].project));
-  ok('核心表齐了', lingma.hasCoreTables() === true);
+  ok('核心表齐了', qoder.hasCoreTables() === true);
 
   head('[A2] 每一轮：标题=用户原话（明文）、产出=扩展写的 summary、模型只在用户真的选了时才有');
   writeDb({
@@ -197,14 +197,14 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       { requestId: 'r1', sessionId: 's-a', prompt: '再改一处', model: 'auto', startedAt: NOW - 10 * MIN, updatedAt: NOW - 5 * MIN },
     ],
   });
-  const rounds = lingma.readLingmaRounds('s-a');
+  const rounds = qoder.readLingmaRounds('s-a');
   ok('按 gmt_create 升序（真实先后）', rounds.length === 2 && rounds[0].index === 0 && rounds[1].index === 1, JSON.stringify(rounds.map((r) => r.index)));
   ok('标题 = 用户原话（extra.originalContent 是明文）', rounds[0].prompt === '把 6F 接上台账' && rounds[1].prompt === '再改一处', `${rounds[0].prompt} / ${rounds[1].prompt}`);
   ok('产出 = 扩展自己写的 summary（明文）', rounds[0].summary === '**对话总结：** 接好了', rounds[0].summary);
   ok('用户选了模型就带上', rounds[0].model === 'qwen3-coder', rounds[0].model);
   ok("'auto' 不算模型名（那是让插件自己挑）→ 留空", rounds[1].model === '', JSON.stringify(rounds[1].model));
   ok('逐字正文一个字都不碰（question/answer 是密文）', !JSON.stringify(rounds).includes('CIPHER'), '应只出现明文那两处');
-  ok('认不出 extra 的回合回空标题，不猜', lingma.readLingmaRounds('不存在的会话').length === 0);
+  ok('认不出 extra 的回合回空标题，不猜', qoder.readLingmaRounds('不存在的会话').length === 0);
 
   head('[A3] 改动文件：快照挂到轮次上才认，挂不上的整个跳过');
   writeDb({
@@ -218,7 +218,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       { id: 'snap-live', sessionId: 's-a', recordId: null, at: NOW, files: [path.join(PROJ, 'server/src/半截.js')] },
     ],
   });
-  const rWithFiles = lingma.readLingmaRounds('s-a');
+  const rWithFiles = qoder.readLingmaRounds('s-a');
   ok('挂上轮次的快照算这一轮改过', rWithFiles[0].files.length === 2, JSON.stringify(rWithFiles[0].files));
   ok('同一路径去重', rWithFiles[0].files.filter((f) => f.endsWith('a.js')).length === 1, JSON.stringify(rWithFiles[0].files));
   ok('没有轮次归属的快照（正在写的那一个）不挂给任何一轮', rWithFiles[1].files.length === 0 && !JSON.stringify(rWithFiles).includes('半截'), JSON.stringify(rWithFiles.map((r) => r.files)));
@@ -228,19 +228,19 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const dbStub = new Database(DBP);
   dbStub.exec('CREATE TABLE chat_session (session_id text primary key, session_title text, project_uri text, session_type text, mode text, gmt_create integer, gmt_modified integer);');
   dbStub.close();
-  lingma.resetLingmaCache();
+  qoder.resetLingmaCache();
   let threw = '';
   try {
-    lingma.listLingmaSessions();
-    lingma.readLingmaRounds('s-a');
+    qoder.listLingmaSessions();
+    qoder.readLingmaRounds('s-a');
   } catch (e) {
     threw = String(e && e.message);
   }
   ok('缺表（扩展改版换表）→ 不抛', threw === '', threw);
-  ok('缺表 → hasCoreTables 如实说 false', lingma.hasCoreTables() === false, String(lingma.hasCoreTables()));
+  ok('缺表 → hasCoreTables 如实说 false', qoder.hasCoreTables() === false, String(qoder.hasCoreTables()));
   fs.rmSync(DBP, { force: true });
-  lingma.resetLingmaCache();
-  ok('库文件不在（没装扩展）→ 空清单，不抛', lingma.lingmaDbPath() === '' && lingma.listLingmaSessions().length === 0);
+  qoder.resetLingmaCache();
+  ok('库文件不在（没装扩展）→ 空清单，不抛', qoder.lingmaDbPath() === '' && qoder.listLingmaSessions().length === 0);
 
   /* ------------------------------ B. 写台账 ------------------------------ */
 
@@ -360,7 +360,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   head('[B6] 库读不出来（没装扩展 / 改版换表）→ 一条都不写，也不抛');
   fs.rmSync(DBP, { force: true });
-  lingma.resetLingmaCache();
+  qoder.resetLingmaCache();
   let threw2 = '';
   let wrote = -1;
   try {

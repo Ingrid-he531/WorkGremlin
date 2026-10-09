@@ -3,7 +3,7 @@
 /**
  * Claude Code 的「会话 → 当前模型」补全。
  *
- * 为什么单独成文件：跟 traeModels.js 同样的理由 —— 这段是"某个产品的私有落盘格式怎么读"，
+ * 为什么单独成文件：跟 trae.js 同样的理由 —— 这段是"某个产品的私有落盘格式怎么读"，
  * 搬进 sessions.js 会把那份文件"读 json + mtime"的均质性搅乱；而且 Claude 的落盘根在哪已由
  * products.js 的 claudeHome() 定下，这里只负责"根下的 transcript 怎么读"，成对，不劈成两半。
  *
@@ -23,7 +23,7 @@
 
 const fs = require('node:fs');
 const path = require('path');
-const { claudeHome } = require('./products');
+const { claudeHome } = require('./claude');
 
 /** 尾部窗口起步 64KB，找不到翻 4 倍；封顶 1MB（本机实测最长行 117KB，1MB 足够兜住） */
 const TAIL_START = 64 * 1024;

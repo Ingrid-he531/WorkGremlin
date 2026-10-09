@@ -26,7 +26,7 @@ fs.mkdirSync(HOME, { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_DATA_ROOTS = DATA;
 
-const { selectedModelOf, traeModelName, parseTraeLogEvents } = require('../src/traeModels');
+const { selectedModelOf, traeModelName, parseTraeLogEvents } = require('../src/trae');
 
 /** 造一次 Trae 启动的 renderer.log；返回写入的文件路径 */
 function writeLog(launch, win, lines) {

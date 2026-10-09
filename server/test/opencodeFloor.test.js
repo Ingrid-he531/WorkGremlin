@@ -67,7 +67,7 @@ process.env.WORKGREMLIN_OPENCODE_HOME = OC_HOME;
 
 const Database = require('better-sqlite3');
 
-const { detectProducts } = require('../src/products');
+const { detectProducts } = require('../src/floors');
 const { DEFAULTS } = require('@workgremlin/shared');
 const opencode = require('../src/opencode');
 // sessions / sessionRegistry **必须在取任何时间戳之前**加载：它们在模块加载那一刻记下
