@@ -972,6 +972,10 @@ function flushTraeYuan(now) {
     const task = repo.getTaskRun.get(row.id);
     if (task && bus && typeof bus.endTask === 'function') {
       try {
+        // ts 必须用 usage 事件自己的时刻（renderer.log 写入时刻），
+        // 不能让 bus.endTask 默认 now() —— 否则重启后扫到的历史任务
+        // ended_at 全变成"重启时刻"，刚好等于 TaskTicker.sessionStart，
+        // detectEnded 里 ended_at >= sessionStart 全部通过 → 批量重播
         bus.endTask({
           project: info.projectId,
           memberId: task.member_id,
@@ -981,6 +985,7 @@ function flushTraeYuan(now) {
           result: String(task.result || ''),
           form: task.form || '',
           sessionId: sid,
+          ts: u.ts,
         });
       } catch { /* 补发失败不影响台账 */ }
     }
