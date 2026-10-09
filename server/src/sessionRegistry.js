@@ -527,8 +527,18 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // ---- 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）----
       if (src.kind === 'plugin') {
         const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
-        if (!st.sessions || !st.sessions.length) continue;
-        for (const s of st.sessions) {
+        const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
+        const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
+        if (endedSessionIds.size) {
+          for (const [key, session] of table) {
+            if (session.floor === p.id && endedSessionIds.has(session.sessionId)) {
+              table.delete(key);
+            }
+          }
+        }
+        const pluginSessions = (st.sessions || []).filter((s) => !endedSessionIds.has(s.id));
+        if (!pluginSessions.length) continue;
+        for (const s of pluginSessions) {
           // 轴 2：插件的会话 id 就是 hook payload 的 session_id（实测 genie-history 的
           // conversationId 与状态文件里的 sessionId 一字不差）。带上它，同一层里多条会话
           // （CLI + Plugin 同时跑）才能各取各的实时相位 / 完成标记，不"谁最新显示谁"。

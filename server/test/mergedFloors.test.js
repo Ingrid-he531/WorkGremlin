@@ -224,6 +224,19 @@ head('[A3] 同一层里两条会话的实时相位各认各的（这一层要认
   ok('只传插件那一路时，CLI 会话的相位取不到（不串味）', reporterMainPhase(WS, 'codebuddy-plugin', CLI_SID) === null);
 }
 
+head('[A3b] CodeBuddy Plugin 收到 SessionEnd 后移除；再次 SessionStart 后重新列出');
+{
+  const endedAt = Date.now();
+  writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: endedAt });
+  let snap = snapshot({ force: true, workspacePath: WS });
+  let floor = snap.floors.find((f) => f.id === '1F');
+  ok('Plugin SessionEnd 后会话立即从下拉数据移除', !floor.sessions.some((s) => s.sessionId === PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
+  writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: null, sessionWorkspacePath: WS });
+  snap = snapshot({ force: true, workspacePath: WS });
+  floor = snap.floors.find((f) => f.id === '1F');
+  ok('同一 Plugin 会话再次 SessionStart 后重新出现', floor.sessions.some((s) => s.sessionId === PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
+}
+
 /* [A4] 陈旧 jsonl 不能让正在跑的会话从 1F 消失（jsonl 优先的判据得看"活着的"，不是"任何行"） */
 head('[A4] 陈旧 jsonl 在，也不该让 hook 那一路的正在跑会话从 1F 失踪');
 {
