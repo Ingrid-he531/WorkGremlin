@@ -35,6 +35,7 @@
     "test:elevator": "node renderer/test/elevator.t3.test.mjs",
     "test:done": "node server/test/doneAttribution.test.js",
     "test:floors": "node server/test/mergedFloors.test.js",
+    "test:session-project": "node server/test/sessionProject.test.js",
     "test:kilo": "node server/test/kiloFloor.test.js",
     "test:plugin-ingest": "node server/test/pluginIngest.test.js",
     "test:plugin-e2e": "node server/test/kiloPluginE2E.test.js",

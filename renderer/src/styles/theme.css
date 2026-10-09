@@ -112,12 +112,44 @@ body,
   margin: 0;
 }
 
+/* 鼠标随手一拖不该把整屏文字拖成一片蓝（选中了也没处用，还要再点一下才消掉）。
+   整个应用默认不可选中，只有真要打字的控件还回来 —— 输入框里不选中就没法改字、没法复制。
+   user-select 是继承属性，写在 #app 上就能罩住所有组件内部（scoped 只加属性，不阻断继承）。 */
+#app {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input,
+textarea,
+select,
+[contenteditable='true'] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Roboto, sans-serif;
   font-size: 13px;
   line-height: 1.5;
+  /* 这是桌面应用（不是网页）：界面上的字默认**不可选** —— 拖一下、划过去不会再刷出
+     一片蓝色选区底色。要复制的地方在下面单独放开。 */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 该能选的还是能选：输入框 / 可编辑区，以及台账表格里的内容（任务原话要能复制走）。
+   将来还有要复制的区块，加 .selectable 一个类就行。 */
+input,
+textarea,
+[contenteditable='true'],
+.selectable,
+td,
+th {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 button {

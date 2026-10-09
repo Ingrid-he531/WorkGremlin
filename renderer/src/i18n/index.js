@@ -124,6 +124,7 @@ const MESSAGES = {
     'ticker.failed': '任务失败',
     'ticker.untitled': '未命名任务',
     'ticker.no_task': '暂无活跃任务',
+    'ticker.tag': '全楼层监控',
 
     // ---- 办公室 HUD / 说明条 ----
     'office.demo': '演示模式',
@@ -551,6 +552,7 @@ const MESSAGES = {
     'ticker.failed': 'Task failed',
     'ticker.untitled': 'Untitled task',
     'ticker.no_task': 'No active tasks',
+    'ticker.tag': 'All floors',
 
     // ---- office HUD / tip bar ----
     'office.demo': 'Demo mode',

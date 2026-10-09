@@ -1733,6 +1733,9 @@ async function saveRetention() {
   padding: 14px 16px;
   overflow-y: auto;
   min-height: 0;
+  /* 详情页是"给人读、给人复制"的（任务原话 / 文件清单 / 报错），全局禁选在这里放开 */
+  -webkit-user-select: text;
+  user-select: text;
 }
 .detail.empty-detail {
   display: flex;

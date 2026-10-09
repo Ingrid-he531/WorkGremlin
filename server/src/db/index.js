@@ -654,6 +654,17 @@ function createRepo(db) {
      * Stop（已收工）之后、或下一轮 UserPromptSubmit（上一轮上下文已结束）时发起，不会误伤真在跑的任务。
      * 认不出（会话里没有这种行 / 起点对不上）就不补：宁可留 "—"，也不写到别的轮次头上。
      */
+    /**
+     * 同会话里**更早开始、至今没收尾**的任务（开新轮时给上一轮补一刀用）。
+     * 一个会话不可能同时跑两轮 —— 这里有行，就说明上一轮的结束事件压根没到
+     * （CodeBuddy 插件按停止时一个 hook 事件都不发，见 bus.startTask 的说明）。
+     */
+    listStaleRunningBySession: db.prepare(`
+      SELECT r.id AS id, r.member_id AS memberId, r.started_at AS startedAt, r.client AS client
+      FROM task_runs r JOIN tasks t ON t.id = r.id
+      WHERE r.project_id = ? AND r.session_id = ? AND t.state = 'running'
+      ORDER BY r.started_at ASC
+    `),
     runAwaitingTokens: db.prepare(`
       SELECT id FROM task_runs
       WHERE project_id = ? AND session_id = ?

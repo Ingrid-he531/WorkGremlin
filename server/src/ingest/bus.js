@@ -530,6 +530,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
     const id = p.taskId || `t_${ts.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
+    // 开新轮之前先给上一轮补一刀（同一会话不可能同时跑两轮），见 endStaleTasksOfSession。
+    // 带 client：CLI 的新轮只收 CLI 同会话的旧任务，不会把 IDE 插件还在跑的任务掐掉。
+    endStaleTasksOfSession({ project, sessionId: p.sessionId, ts, excludeTaskId: id, client: normClient(p.client) });
+
     repo.insertTask.run({
       id,
       projectId: project,
@@ -608,6 +612,45 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
     return { ok: true };
+  }
+
+  /**
+   * 收掉同一会话里**更早开始、至今还没收尾**的任务 —— 也就是被这一轮顶掉的上一轮。
+   *
+   * 判据是硬的：**一个会话不可能同时跑两轮**。新一轮都开跑了，上一轮必定已经结束，
+   * 台账上它还挂着 running 只是因为它的结束事件永远到不了。
+   *
+   * 为什么必须服务端自己补：CodeBuddy **插件**（IDE 形态）按停止时**一个 hook 事件都不发**
+   * （CLI 那条 FinalStop 在 IDE 形态等不到），而 hook 的状态文件是**一会话一份**的 ——
+   * 新一轮的 /task/start 会把 taskId / taskStartedAt 整份覆盖，上一轮从此连兜底扫描
+   * （readReporterDones → codebuddyPauseCancelAt）都够不着，那一行就永远挂在「进行中」：
+   * 用户看到的就是"取消了任务，屏上还是进行中，主控制台却已经待命中"。
+   *
+   * 状态用 cancelled：真正常收工的产品会发 Stop / FinalStop（那是 done），走到这里说明
+   * 这一轮没有任何结束事件 —— 它不是正常收工。只按**同一 sessionId** 收，
+   * 不动别的会话（同一成员开两个窗口是合法的并行，不能互相掐）。
+   * @returns {number} 收掉几条
+   */
+  function endStaleTasksOfSession({ project: p0, sessionId, ts: ts0, excludeTaskId = '', client: client0 } = {}) {
+    const project = projectIdOf(p0);
+    const sid = normSession(sessionId);
+    if (!sid || !repo.listStaleRunningBySession) return 0;
+    const ts = Number(ts0) || now();
+    // 只收"同一形态（CLI / 插件）"的旧任务。CodeBuddy 的 CLI 与 Plugin 同属 1F、还可能共用
+    // 同一个 session_id（同一个对话既能被终端命令又能被 IDE 扩展上报），但它们各跑各的任务 ——
+    // CLI 开新轮绝不能把 IDE 插件还在跑的任务取消掉（这就是之前"跑 CLI 把插件任务掐了"的 bug）。
+    // want 为空（上报没带 client，老数据）时退回只按会话过滤，保持旧行为。
+    const want = normClient(client0);
+    let n = 0;
+    for (const old of repo.listStaleRunningBySession.all(project, sid)) {
+      if (!old.id || old.id === excludeTaskId) continue;
+      if (Number(old.startedAt) && Number(old.startedAt) > ts) continue; // 比这一轮还新：不是被顶掉的
+      const oc = normClient(old.client);
+      if (want && oc && oc !== want) continue; // 不同形态互不相掐
+      endTask({ project, memberId: old.memberId, taskId: old.id, state: 'cancelled', ts });
+      n += 1;
+    }
+    return n;
   }
 
   function endTask(p) {
@@ -1285,6 +1328,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     startTask,
     taskProgress,
     endTask,
+    endStaleTasksOfSession,
     backfillTaskTokens,
     recordMessage,
     fileTouch,

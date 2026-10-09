@@ -63,7 +63,7 @@ process.env.WORKGREMLIN_HOME = WG;
 process.env.PATH = BIN;
 
 const { snapshot, table } = require('../src/sessionRegistry');
-const { reporterMainPhase, listSessions } = require('../src/sessions');
+const { reporterMainPhase, listReporterSessions, listSessions } = require('../src/sessions');
 const { detectProducts } = require('../src/products');
 
 /* ------------------------------ 造数据 ------------------------------ */
@@ -252,21 +252,53 @@ head('[A4] 陈旧 jsonl 在，也不该让 hook 那一路的正在跑会话从 1
 /* [A5] jsonl 优先：CLI 落盘有【活】会话时，hook 那一路整层让位（同一条会话不列两遍） */
 head('[A5] CLI 落盘扫得到活会话时，hook 兜底整层让位（同一条会话不会列两遍）');
 {
-  const rel = path.join('projects', 'x.jsonl');
+  const rel = path.join('projects', `${CLI_SID}.jsonl`);
   const file = path.join(HOME, '.codebuddy', rel);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify({ cwd: WS, type: 'message', text: 'hi' })}\n`);
 
   const snap = snapshot({ force: true, workspacePath: WS });
   const floor = snap.floors.find((f) => f.id === '1F');
-  const fromHook = floor.sessions.filter((s) => s.sessionId === CLI_SID);
-  const fromJsonl = floor.sessions.filter((s) => String(s.id).includes('x.jsonl'));
+  const fromHook = floor.sessions.filter((s) => s.source === 'hook' && s.sessionId === CLI_SID);
+  const fromJsonl = floor.sessions.filter((s) => String(s.id).includes(`${CLI_SID}.jsonl`));
   ok('CLI 会话改由 jsonl 那一路列出', fromJsonl.length === 1, floor.sessions.map((s) => `${s.source}:${s.id}`).join(' '));
   ok('同一条 CLI 会话没有同时留下 hook 那一路的行（不重复）', fromHook.length === 0);
   ok('插件那条会话照常还在（两处落盘互不影响）', floor.sessions.some((s) => s.sessionId === PLUGIN_SID));
   const codebuddyPluginRe = detectProducts({ force: true }).find((p) => p.id === '1F').pluginRe;
   const storage = listSessions({ force: true, client: 'codebuddy-plugin', pluginRe: codebuddyPluginRe });
   ok('插件落盘这一路自己仍然列得出会话', (storage.sessions || []).some((s) => s.id === PLUGIN_SID));
+}
+
+head('[A6] CLI 收到 SessionEnd 后重开：旧 JSONL 不能挡住新 SessionStart 会话');
+{
+  const endedAt = Date.now();
+  writeState('codebuddy', CLI_SID, {
+    hb: { pid: process.pid, lastEventAt: endedAt - 1_000 },
+    sessionPhase: null,
+    taskId: '',
+    taskWorkspacePath: '',
+    taskStartedAt: 0,
+    sessionEndedAt: endedAt,
+  });
+  const reopenedSid = 'bbbb1111-2222-3333-4444-555566667777';
+  writeState('codebuddy', reopenedSid, {
+    hb: { pid: process.pid, lastEventAt: endedAt + 1 },
+    sessionPhase: null,
+    sessionWorkspacePath: WS,
+    taskId: '',
+    taskWorkspacePath: '',
+    taskStartedAt: 0,
+    sessionEndedAt: null,
+  });
+  const ended = listReporterSessions('codebuddy', { includeEnded: true }).find((s) => s.sessionId === CLI_SID);
+  ok('reporter 索引识别旧会话的 SessionEnd 标记', ended && ended.endedAt === endedAt, JSON.stringify(ended));
+
+  const snap = snapshot({ force: true, workspacePath: WS });
+  const floor = snap.floors.find((f) => f.id === '1F');
+  const reopened = floor.sessions.find((s) => s.sessionId === reopenedSid);
+  ok('新 SessionStart 会话在尚未输入时就已列出', Boolean(reopened), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
+  ok('新会话无需等 JSONL 首条记录就归属当前工程', reopened && reopened.projectPath === WS && reopened.mine, reopened && `${reopened.projectPath} mine=${reopened.mine}`);
+  ok('SessionEnd 的旧会话不再作为活跃会话列出', !floor.sessions.some((s) => s.sessionId === CLI_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
 }
 
 /* [B1] 5F TraeCode：IDE 与插件也是一层 */

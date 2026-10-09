@@ -128,6 +128,19 @@ async function main() {
   const st3 = stateOf(sid3);
   ok('仍落了取消标记（下一轮开始会被清掉）', Boolean(st3 && st3.done && st3.done.cancelled === true), st3 && JSON.stringify(st3.done));
 
+  head('[4] SessionEnd 标记会话结束；重新 SessionStart 清除标记');
+  const sid4 = 'codebuddy-session-reopen';
+  await runHook('codebuddy', { hook_event_name: 'SessionStart', session_id: sid4, cwd: WS });
+  const beforeEnd = stateOf(sid4);
+  ok('SessionStart 后会话未标记结束', Boolean(beforeEnd && !beforeEnd.sessionEndedAt), beforeEnd && String(beforeEnd.sessionEndedAt));
+  ok('SessionStart 即记录工程路径（无需等首条用户输入）', Boolean(beforeEnd && beforeEnd.sessionWorkspacePath === WS), beforeEnd && beforeEnd.sessionWorkspacePath);
+  await runHook('codebuddy', { hook_event_name: 'SessionEnd', session_id: sid4, cwd: WS });
+  const ended = stateOf(sid4);
+  ok('SessionEnd 落下结束时间', Boolean(ended && Number(ended.sessionEndedAt) > 0), ended && String(ended.sessionEndedAt));
+  await runHook('codebuddy', { hook_event_name: 'SessionStart', session_id: sid4, cwd: WS });
+  const reopened = stateOf(sid4);
+  ok('重新 SessionStart 清除结束时间', Boolean(reopened && !reopened.sessionEndedAt), reopened && String(reopened.sessionEndedAt));
+
   server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });

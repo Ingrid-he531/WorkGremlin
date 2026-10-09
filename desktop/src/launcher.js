@@ -11,6 +11,12 @@
  *
  * dev 模式（npm run dev / npm run launch:electron）也走这里：Electron 主进程用内置 Node 起
  * server + 复用 main.js 的 client，不依赖 scripts/launch.js。
+ *
+ * 参数：
+ *   --restart   不管有没有在跑的 server，**先停掉旧的再起新的**（改了 server 代码后常用；
+ *               不传的话，端口通就直接复用旧进程，改的代码不会生效）。
+ *               用法：npm run launch:electron -- --restart
+ *   其余 --no-sandbox / --disable-* 透传给 server 子进程（见 passthroughFlags）。
  */
 const { app } = require('electron');
 const net = require('node:net');
@@ -86,6 +92,62 @@ function passthroughFlags() {
     .filter((a) => a.startsWith('--no-sandbox') || a.startsWith('--disable-'));
 }
 
+/** 本次要不要重启 server（--restart） */
+const WANT_RESTART = process.argv.includes('--restart');
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0); // 信号 0：只探测在不在
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function dropServerInfo() {
+  try {
+    fs.rmSync(SERVER_JSON, { force: true });
+  } catch {
+    /* 删不掉就算了，后面还会 ping 端口判活 */
+  }
+}
+
+/**
+ * 停掉在跑的 server（--restart 用）：先 SIGTERM 让它走正常收尾（它会自己清 server.json、
+ * 关库、停钩子），等它退；超时就 SIGKILL 兜底，再把残留的 server.json 删掉 ——
+ * 不删的话下面会把它当成"已有可用 server"，新代码起不来。
+ */
+async function stopServer(info) {
+  const pid = info && Number.isInteger(info.pid) ? info.pid : 0;
+  if (!pid || !pidAlive(pid)) {
+    dropServerInfo();
+    return;
+  }
+  console.log(`[launcher] --restart：停掉旧 server（pid ${pid}）`);
+  try {
+    if (process.platform === 'win32') {
+      // Windows 没有进程组信号，用 taskkill 连子进程一起收
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' }).unref();
+    } else {
+      process.kill(pid, 'SIGTERM');
+    }
+  } catch {
+    /* 已经没了 */
+  }
+  const port = Number(info.port);
+  const hasPort = Number.isInteger(port) && port > 0;
+  await waitFor(async () => !pidAlive(pid) || (hasPort && !(await pingPort(port))), 5000, '旧 server 退出');
+  if (pidAlive(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* 已经退了 */
+    }
+  }
+  dropServerInfo();
+}
+
 function startServer() {
   // 用 AppImage 自带的 Electron 跑 server（不是系统 node）；asar 内脚本可作为 electron 入口
   const child = spawn(
@@ -102,7 +164,11 @@ function startServer() {
 }
 
 app.whenReady().then(async () => {
-  const existing = readServerInfo();
+  let existing = readServerInfo();
+  if (WANT_RESTART) {
+    await stopServer(existing);
+    existing = null; // 旧的已经停了，下面必须重新起
+  }
   if (!existing || !(await pingPort(existing.port))) {
     console.log('[launcher] 启动 server...');
     startServer();

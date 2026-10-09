@@ -14,9 +14,11 @@
  *      楼层号由 task.client 反查 sessions.floors 得到，不在这里另排一份楼层表；
  *   2. 只动 transform：滚动由 JS rAF 每帧写 `translateX(offset)`，offset 连续累加，
  *      不碰 width / left / top；这样增删内容（尤其是结束行）不会让已滚到一半的位置跳一下；
- *   3. 单条传送带：所有行（进行中 + 结束）都从最右侧进、向左滚；进行中行滚出左边缘
- *      就循环回右端（常驻滚动、字都从最右进），结束行滚出即删（只一遍，不重复）。
- *      offset 连续累加、回收时按"滚出行的宽度"补偿，增删内容不会让后面的字跳一下。
+ *   3. 分段传送带：轨道是一串"段"（一遍内容的快照），从最右侧进、向左滚，滚出左边缘即回收、
+ *      右端再补新段 —— 两遍之间只隔 5s 的行程（上一遍**最后一个字符进屏**起算 5s，下一遍
+ *      头字符就进屏，见 GAP_MS），不是"整条滚出左边缘后再空等 5s"。
+ *      结束行只进**一个**段（滚出去就没了，屏上绝不会同时摆好几遍）；段滚完且没有别的
+ *      任务时，轨道空 → 屏上回到「暂无活跃任务」。段是快照，所以增删任务不会让屏上的字跳。
  *
  * 无障碍：滚动的段码对读屏是噪音 → 屏幕本体 aria-hidden，另给一句 sr-only 的静态文本。
  */
@@ -53,14 +55,21 @@ let timer = null;
 /** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
 /**
- * 传送带上的显示行（进行中 running + 待滚一遍的结束行 done/cancelled/failed）。
- * 统一从右端进、向左滚；整条滚出左边缘后瞬移回最右重新进（包裹式循环、单份、绝不重复），
- * 结束行滚过一遍即在 wrap 时清掉（只一遍）。w = 实测宽度，wrap 阈值用。
+ * 轨道上的**段**（一遍内容）：段是生成时就定好的**快照**，滚出左边缘即回收、右端再补新段。
+ * 这么改是因为"结束行只滚一遍"和"多份填满屏"会打架 —— 一份内容重复渲染 N 份时，
+ * 同一个"任务完成"会同时在屏上摆着 N 份（实测滚出 4~5 遍）。改成分段快照后：
+ *   · 结束行只进**一个段**（见 makeSeg），屏上从头到尾只有一遍，滚出去就没了；
+ *   · 新开/收工的任务只影响**之后**生成的段，已在屏上的字不会被改掉、也不会跳。
  */
-const belt = ref([]);
-/** 行间距就是 CSS .line 的 padding-right（48px），它已算进每条 .line 的实测宽度里，
- *  所以 wrap 阈值 / 补偿只按 .line 实测宽度走，不再单独加 gap（避免重复计间距）。 */
-let beltDirty = true;
+const segs = ref([]);
+/** 待播报的结束行：下次补段时一起进那一段（只进一次），进完即清 */
+const pendingEnded = ref([]);
+/** 段宽/屏宽的测量脏标记：段增删、窗口或屏宽变化后要重测 */
+let segsDirty = true;
+/** 刚补的段还没测到宽度（有它就不继续补，免得一帧补出好几段） */
+let freshSeg = false;
+/** 段 id 序列 */
+let segSeq = 0;
 /** 本次会话启动时刻：只播报启动后才结束的任务，不回放历史（避免一启动就滚一堆"任务完成"） */
 const sessionStart = Date.now();
 
@@ -70,13 +79,14 @@ function endedText(r) {
   const floor = floorOf(r.client);
   const kind = r.state === 'done' ? 'done' : 'cancelled';
   const tail = r.state === 'done' ? t('ticker.done') : r.state === 'failed' ? t('ticker.failed') : t('ticker.cancelled');
-  return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}`, w: 0 };
+  return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}` };
 }
 
-/** 从 rows 里挑出"本次会话启动后才结束"的任务，把结束行追加到传送带右端（从最右侧进）。
- *  启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；announcedIds 防同任务重复。
- *  进行中行由 reconcileRunning 负责摘，这里只加结束行。 */
+/** 从 rows 里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded —— 下次补段时
+ *  跟着进那一段，**只滚一遍**。启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；
+ *  announcedIds 防同一任务重复播报。 */
 function detectEnded() {
+  let added = false;
   for (const r of rows.value) {
     if (!r || r.parent_task_id) continue;
     if (project.projectId && r.project_id !== project.projectId) continue;
@@ -84,13 +94,11 @@ function detectEnded() {
     if (Number(r.ended_at) < sessionStart) continue; // 不回放启动前已结束的
     if (announcedIds.has(r.id)) continue;
     announcedIds.add(r.id);
-    const kept = belt.value.concat();
-    kept.push(endedText(r)); // 结束行追加到右端 → 从最右侧进
-    const wasEmpty = belt.value.length === 0;
-    belt.value = kept;
-    beltDirty = true;
-    if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右重新开始
+    pendingEnded.value = pendingEnded.value.concat(endedText(r));
+    added = true;
   }
+  // 屏上已经空了（之前没任务）却有东西要播：立刻补一段，别等下一轮轮询才动
+  if (added && segs.value.length === 0) pushSeg();
 }
 
 async function getJson(path) {
@@ -133,7 +141,6 @@ async function load() {
     const feed = await getJson(`/api/v1/task-feed?${q.toString()}`);
     if (feed) {
       rows.value = feed.items || [];
-      reconcileRunning();
       detectEnded();
       return;
     }
@@ -149,7 +156,6 @@ async function load() {
     // 两条路都拿不到：留着上一份，下一轮再试（不把屏清空）
     if (runs) {
       rows.value = pickFeed(runs.items || []);
-      reconcileRunning();
       detectEnded();
     }
   } catch {
@@ -215,76 +221,107 @@ const runningItems = computed(() =>
 );
 
 /**
- * 把"进行中任务"同步进传送带：保留已在带上的 running 行（常驻、包裹式循环），
- * 新开的任务追加到右端（从最右侧进），已收工/取消的行从中段摘掉并补 offset（让后面不跳）。
+ * 屏上摆静态居中那句话的条件：**轨道上一段都没有，且确实没东西可滚**（没有在跑的任务、
+ * 也没有待播的结束行）。只按"轨道空"判断不行 —— 刚有新任务时轨道也是空的，
+ * 那是要开始滚的（轨道得先渲染出来，tick 才能往里补段）。
  */
-function reconcileRunning() {
-  const want = runningItems.value;
-  const wantIds = new Set(want.map((i) => i.id));
-  const kept = [];
-  for (const it of belt.value) {
-    if (it.kind === 'running') {
-      if (wantIds.has(it.id)) kept.push(it); // 常驻保留
-      else offset += it.w; // 任务已结束：摘掉，后面内容左移、offset 右移抵消（.line 宽度已含间距）
-    } else {
-      kept.push(it); // 结束行保留（滚过一遍后在 wrap 时清）
-    }
-  }
-  const have = new Set(kept.filter((i) => i.kind === 'running').map((i) => i.id));
-  for (const it of want) if (!have.has(it.id)) kept.push({ ...it, w: 0 });
-  const wasEmpty = belt.value.length === 0;
-  belt.value = kept;
-  beltDirty = true;
-  if (wasEmpty && kept.length) offset = viewW.value || 600; // 从空到非空：从最右重新开始
-}
-
-/** 没有任务：屏上只摆一句静态居中的话，不进滚动轨道 */
-const idle = computed(() => belt.value.length === 0);
+const idle = computed(
+  () => segs.value.length === 0 && runningItems.value.length === 0 && pendingEnded.value.length === 0
+);
 
 /** 读屏文本：屏上那串滚动的段码对 AT 是噪音，这里给一句静态的 */
-const srText = computed(() => belt.value.map((i) => i.text).join('；'));
+const srText = computed(() => [...runningItems.value, ...pendingEnded.value].map((i) => i.text).join('；'));
 
-/* ------------------------------ 滚动（JS rAF 传送带 · 包裹式循环） ------------------------------
- * 单条传送带：所有行（进行中 + 结束）都从最右侧进、向左滚。
- *   · 进行中行常驻：整条滚出左边缘后，offset 瞬移回最右重新进（包裹式循环）。
- *     瞬移不可见（整条已离屏），所以同一任务**绝不会同时出现两份**、也不会从中间蹦出来。
- *   · 结束行滚过一遍即在 wrap 时清掉（只一遍，绝不重复成"一堆"）。
- * 增删只动 belt 数组；offset 连续累加，摘行时按"被摘行的宽度"补偿，不跳。 */
+/* ------------------------------ 滚动（JS rAF · 分段传送带） ------------------------------
+ * 轨道是一串**段**（一遍内容），段尾各带一份空档；段滚出左边缘就回收、右端随时补新段。
+ *   · 段是快照：生成时定下内容，滚出去之前不改。所以新开/收工的任务只影响**之后**的段，
+ *     屏上正在滚的字既不会被改掉、也不会跳位置。
+ *   · 间隔 GAP_MS：段尾空档 = GAP_MS 的行程，所以"上一遍最后一个字进屏"起算 5s，
+ *     下一遍的头一个字就从右边进屏 —— 屏一直在滚，没有空着不动的死等。
+ *   · 结束行只滚一遍：它只随**一个段**生成（makeSeg 里 pendingEnded 进段即清），
+ *     屏上不会同时摆着好几份，滚出去就没了；后面没别的任务时，轨道空 → 显示「暂无活跃任务」。 */
 
 const viewEl = ref(null);
 const trackEl = ref(null);
+/** 量单字符宽用的探针：一串等宽数字，测出来除以长度就是"一个字"占多宽（含 letter-spacing） */
+const probeEl = ref(null);
+const PROBE_LEN = 20;
+/** 单字符宽度（px）：字号固定，量一次就够，不随窗口变（用 ref 是为了量到之后 perLine 能自己重算） */
+const charW = ref(0);
+/** 圆点 + 它右边的空隙（px）：算"一屏能放几个字"时要先扣掉它 */
+const DOT_W = 14;
 /** 屏幕可视宽度（px） */
 const viewW = ref(0);
+/** 一屏能放下的字符数：短句按这个数在后面补空格，凑满一屏（长句照原样滚，不截断） */
+const perLine = computed(() => {
+  if (!viewW.value || !charW.value) return 0;
+  return Math.max(0, Math.floor((viewW.value - DOT_W) / charW.value));
+});
+/** 不足一屏的行在末尾补空格，让每条都占满一屏那么长 */
+function padText(s) {
+  const n = perLine.value;
+  const str = String(s || '');
+  return n && str.length < n ? str + ' '.repeat(n - str.length) : str;
+}
 /** 系统「减弱动态效果」：不滚，静态摆着 */
 const reduce = ref(false);
 let ro = null;
 let raf = null;
 let lastTs = 0;
 let offset = 0;
-/** 整条传送带宽度（px）= 各 .line 实测宽度之和（含 padding-right 间距），wrap 阈值用 */
-let totalWidth = 0;
-/** 整条滚出后停顿多久再从最右重新进（ms）：让屏空一会儿，避免"尾字刚出左、头字又从右进"连成一气 */
-const PAUSE_MS = 5000;
-/** 停顿期标记：整条离屏后停 PAUSE_MS，再从左边缘重新进 */
-let paused = false;
-let pauseUntil = 0;
+/** 轨道上所有段的总宽（px，含段尾空档）：补段 / 回收的判断用它 */
+let trackW = 0;
+/**
+ * 两遍之间的间隔（ms）：**从上一遍最后一个字符由右边进屏**起算，到下一遍头字符从右边进屏。
+ * 不是"整条滚出后再静止等 5s" —— 那样实际间隔 = 滚出剩余行程 + 5s，读数的人会觉得等太久。
+ * 屏是连续滚的，这个间隔只是"字与字之间空出的那一段行程"（gapPx），没有屏空着不动的停顿。
+ */
+const GAP_MS = 5000;
+/** 行间距 = CSS .line 的 padding-right（48px），已算进每条实测宽度里；算段尾空档时要扣掉它，否则间隔会多出这一段 */
+const LINE_GAP_PX = 48;
+/** 段尾空档（px）：间隔时间 × 速度 − 行尾自带 padding，使"尾字进屏 → GAP_MS → 下一段进屏"精确成立 */
+const gapPx = () => Math.max(0, (GAP_MS / 1000) * SPEED_PX_S - LINE_GAP_PX);
 
-/** 重测每行宽度 + 屏宽 + 整条宽度（写回 belt[i].w / viewW / totalWidth） */
-function measureBelt() {
+/** 生成一段：当前进行中的任务 + 待播报的结束行（结束行进段即清，所以它只属于这一段） */
+function makeSeg() {
+  const lines = runningItems.value.map((it) => ({ ...it }));
+  if (pendingEnded.value.length) {
+    lines.push(...pendingEnded.value);
+    pendingEnded.value = [];
+  }
+  return { id: `seg-${(segSeq += 1)}`, lines, w: 0 };
+}
+
+/** 右端补一段：只在该补的时候调（见 tick），补进来时它还在屏右外，看不见 */
+function pushSeg() {
+  if (segs.value.length === 0) offset = viewW.value || 600; // 从空到非空：从最右进
+  segs.value.push(makeSeg());
+  freshSeg = true;
+  segsDirty = true;
+}
+
+/** 重测屏宽 + 各段宽度（写回 segs[i].w / viewW / trackW） */
+function measureSegs() {
   if (viewEl.value) viewW.value = viewEl.value.clientWidth;
+  // 探针只在第一次量得到宽度时取值：字号不变，一个字多宽就不变
+  if (probeEl.value && !charW.value) {
+    const w = probeEl.value.getBoundingClientRect().width;
+    if (w > 0) charW.value = w / PROBE_LEN;
+  }
   const el = trackEl.value;
   if (!el) return;
-  const lines = el.querySelectorAll('.line');
-  let i = 0;
+  const nodes = el.querySelectorAll('.seg');
   let total = 0;
-  for (const ln of lines) {
-    const w = i < belt.value.length ? ln.getBoundingClientRect().width : 0;
-    if (i < belt.value.length) belt.value[i].w = w;
-    total += w; // .line 宽度已含 padding-right（行间距），不再额外加 gap
-    i++;
+  let i = 0;
+  for (const n of nodes) {
+    const w = n.getBoundingClientRect().width;
+    if (i < segs.value.length) segs.value[i].w = w;
+    total += w;
+    i += 1;
   }
-  totalWidth = total;
-  beltDirty = false;
+  trackW = total;
+  if (i >= segs.value.length) freshSeg = false; // 段都量过了，可以继续补
+  segsDirty = false;
 }
 
 function tick(ts) {
@@ -296,44 +333,36 @@ function tick(ts) {
     raf = requestAnimationFrame(tick);
     return;
   }
-  if (beltDirty) measureBelt();
-  if (!reduce.value && belt.value.length) {
-    if (paused) {
-      // 停顿期：整条已离屏，静候 PAUSE_MS（屏空），到点再从最右重新进
-      if (ts >= pauseUntil) {
-        paused = false;
-        // 结束行滚过这一遍后清掉（只一遍）
-        if (belt.value.some((it) => it.kind !== 'running')) {
-          belt.value = belt.value.filter((it) => it.kind === 'running');
-          beltDirty = true;
-        }
-        offset = viewW.value || 600; // 从最右重新进
-      }
-      // 否则停在离屏位（屏空），不动 offset
-    } else {
-      offset -= SPEED_PX_S * dt;
-      // 整条滚出左边缘（右沿到了屏左）→ 先停 PAUSE_MS（屏空），再从左边缘重新进。
-      // 因整条已离屏，停顿与重进都不可见、不会跳；同一任务也绝不重复。
-      if (offset <= -totalWidth) {
-        paused = true;
-        pauseUntil = ts + PAUSE_MS;
-        offset = -totalWidth; // 停在离屏位
-      }
+  if (segsDirty) measureSegs();
+  if (!reduce.value && segs.value.length) {
+    offset -= SPEED_PX_S * dt;
+    // 回收：最左那段整个滚出左边缘就丢掉，offset 右移它的宽度 —— 后面的段原地不动，不跳
+    let head = segs.value[0];
+    while (head && head.w > 0 && offset + head.w <= 0) {
+      offset += head.w;
+      trackW -= head.w;
+      segs.value.shift();
+      segsDirty = true;
+      head = segs.value[0];
     }
-    el.style.transform = `translateX(${offset}px)`;
-  } else if (el) {
-    el.style.transform = 'translateX(0)';
   }
+  // 补段：轨道右端已经露进屏里就再补一段（补在屏右外，看不见）。
+  // 没内容可补（既没在跑的任务、也没待播的结束行）就不补 —— 剩下的段滚完，屏上回到「暂无活跃任务」。
+  const hasContent = runningItems.value.length > 0 || pendingEnded.value.length > 0;
+  // +4 是提前量：赶在轨道右端露进屏**之前**补，新段就从屏外进，不会凭空冒在屏里
+  if (!freshSeg && hasContent && offset + trackW <= viewW.value + 4) pushSeg();
+  el.style.transform = `translateX(${offset}px)`;
   raf = requestAnimationFrame(tick);
 }
 
 onMounted(async () => {
   await load();
   await nextTick();
-  measureBelt();
-  if (belt.value.length) offset = viewW.value || 600; // 首屏从最右进（覆盖 load 时 viewW 未量的 600 猜测）
+  measureSegs();
   if (typeof ResizeObserver !== 'undefined' && viewEl.value) {
-    ro = new ResizeObserver(() => measureBelt());
+    ro = new ResizeObserver(() => {
+      segsDirty = true;
+    });
     ro.observe(viewEl.value);
   }
   if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
@@ -361,21 +390,29 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="ticker">
+    <!-- 屏左边的静态标签：说明这块屏滚的是什么（所有楼层的任务），它**不参与滚动** -->
+    <span class="tag">{{ t('ticker.tag') }}</span>
     <div ref="viewEl" class="screen">
       <!-- 没有任务：静态居中一句，不滚 -->
       <span v-if="idle" class="idle-line">{{ t('ticker.no_task') }}</span>
-      <!-- 有任务：滚动的段码不进无障碍树，读屏听下面的 .sr。
-           单条传送带：每条行（进行中 / 结束）都从最右端进、向左滚；
-           进行中行滚出左边缘循环回右端，结束行滚出即删（只一遍）。位移由 JS rAF 驱动。 -->
+      <!-- 有内容：滚动的段码不进无障碍树，读屏听下面的 .sr。
+           轨道是一串段（一遍内容），段尾各带 --loop-gap 空档；滚出左边的段被回收、右端再补新段。
+           结束行只进其中一段，所以屏上从头到尾只有一遍「任务完成」，滚出去就没了。位移由 JS rAF 驱动。 -->
       <div
         v-else
         ref="trackEl"
         class="track"
         :class="{ static: reduce }"
+        :style="{ '--loop-gap': `${gapPx()}px` }"
         aria-hidden="true"
       >
-        <span v-for="it in belt" :key="it.id" class="line" :class="`k-${it.kind}`">{{ it.text }}</span>
+        <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
+        <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
+          <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`">{{ padText(it.text) }}</span>
+        </span>
       </div>
+      <!-- 量字宽的探针：一串等宽数字，看不见也不占地方（算"一屏能放几个字"用） -->
+      <span ref="probeEl" class="probe" aria-hidden="true">{{ '0'.repeat(PROBE_LEN) }}</span>
       <span class="scan" aria-hidden="true" />
     </div>
     <p class="sr" role="status" aria-live="polite">{{ srText }}</p>
@@ -383,18 +420,37 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-/* 门楣里的一列：项目名占自己那份宽，剩下**全给这块屏**（屏尽可能长，见 ElevatorDoors） */
+/* 门楣里的一列：标签占自己那份宽，剩下**全给这块屏**（屏尽可能长，见 ElevatorDoors） */
 .ticker {
   flex: 1 1 auto;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 屏左边的静态标签：说清这块屏滚的是什么。它不滚、也不跟着内容变宽。
+   纯文字，别给它描边 / 底色 —— 有框+有底看着就是一枚不能点的按钮，那不是它。 */
+.tag {
+  flex: none;
+  display: flex;
+  align-items: center;
+  height: calc(var(--lcd-slot, 26px) + 16px); /* 与屏等高，两个盒子顶底齐平 */
+  padding: 0 8px 0 2px;
+  font-size: 12px;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  color: var(--text-dim, #9aa3b2);
 }
 
 /* 屏壳：暗底 + 等宽字（段码手感），高度沿用液晶屏那一格（--lcd-slot） */
 .screen {
   position: relative;
+  flex: 1 1 auto; /* 门楣剩下的宽度全给屏，标签只占它自己那点 */
+  min-width: 0;
   display: flex;
   align-items: center;
-  /* 轨道锚定左边缘：translateX(offset) 从 viewW(最右) 一路走到 -totalWidth(最左全出)，
+  /* 轨道锚定左边缘：translateX(offset) 从 viewW(最右进) 一路走到 -period(一份滚完回绕)，
      内容比屏窄时也贴着左边缘滚到底、不居中停留（否则"短内容滚不到最左、卡在中间"） */
   justify-content: flex-start;
   height: calc(var(--lcd-slot, 26px) + 16px);
@@ -418,20 +474,56 @@ onBeforeUnmount(() => {
   );
 }
 
-/* 轨道：传送带本体，行横排；位移由 JS rAF 直接写 transform，不挂 CSS 动画 */
+/* 轨道：传送带本体，若干份（.seg）横排；位移由 JS rAF 直接写 transform，不挂 CSS 动画 */
 .track {
   display: flex;
   flex: none;
 }
 
+/* 一段（一整遍内容）：段尾的空档 = --loop-gap（= GAP_MS 的行程 − 行尾自带的 padding），
+   它就是"上一遍最后一个字"到"下一遍第一个字"之间那段空白 —— 间隔时间由它决定，见 GAP_MS */
+.seg {
+  display: flex;
+  flex: none;
+  padding-right: var(--loop-gap, 302px);
+}
+
 .line {
+  display: inline-flex;
+  align-items: center;
   flex: none;
   /* 条目之间的空档：一条滚完再接下一条，别让两条粘在一起 */
   padding-right: 48px;
   font-size: 13px;
   letter-spacing: 0.5px;
-  white-space: nowrap;
+  /* 补的空格就靠它留着，不然末尾那一串空格会被折叠掉 */
+  white-space: pre;
   color: var(--text-dim);
+}
+
+/* 每条前面的圆点：颜色跟着这一条自己的颜色走（蓝=在跑 / 绿=完成 / 红=取消），
+   所以"看圆点就知道是哪一类"，不用读完那行字 */
+.line::before {
+  content: '';
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+
+/* 量字宽的探针：绝对定位 + 看不见，不参与布局 */
+.probe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  white-space: pre;
 }
 
 /* 蓝 = 任务开始（正在跑）；绿 = 完成；红 = 取消 / 失败；灰 = 没有任务 */

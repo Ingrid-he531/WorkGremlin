@@ -14,7 +14,9 @@
  *   2F WorkBuddy、
  *   3F Codex CLI、
  *   4F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
- *                        工程名从文件**头部若干行**里找 cwd，读不到就留空（不猜）。
+ *                        工程名从文件**头部若干行**里找 cwd（见 cwdOfHead）；
+ *                        那儿还没有（第一条对话没落盘）→ 退回 sessions/<pid>.json 里登记的 cwd
+ *                        （见 liveSessionCwds）；两处都读不到才留空（不猜）。
  *                        注意不是"首行"：Claude 的首行是 mode / queue-operation 这类
  *                        元记录，压根没有 cwd，cwd 从第 3 行的 user 记录才有（见 cwdOfHead）
  *                        （Codex 的 cwd 藏在 payload.cwd 里，同样由 cwdOfHead 覆盖）
@@ -179,6 +181,62 @@ function cwdOfHead(p, { cap = 524_288, maxLines = 60 } = {}) {
   }
 }
 
+/**
+ * 运行中的 CLI 进程自己写的**会话状态文件**：`<产品 home>/sessions/<pid>.json`，一个进程一份。
+ * 实测形状（CodeBuddy CLI 2.162.0，本机 2026-10-09）：
+ *   { pid, sessionId, cwd, startedAt, kind:'interactive', url, endpoint, mode, updatedAt }
+ * Claude Code 2.1.283 的同名文件同样带 cwd（sessions.js 的 claudeSessionStatus 早就在读它）。
+ *
+ * 它比 transcript **更早**：进程一起来就写，那时 projects/<工程>/<会话>.jsonl 里一条对话都
+ * 还没有 —— 正是 cwdOfHead 回空、下拉显示「未知工程」的那段窗口（用户 2026-10-09 问的就是它）。
+ *
+ * 为什么不用目录名兜底：projects 下那层目录名确实编码了工程路径（`<cwd 去掉分隔符>`），
+ * 但分隔符已经丢了，`home-yinghui-work-WorkGremlin` 反解回 `/home/yinghui/work/WorkGremlin`
+ * 只能靠猜（"work-gremlin" 到底是一个目录还是两个？）。projectPath 一路喂给 `mine` 判定和
+ * 主控制台的快轮询，猜错的代价比显示一串「未知工程」大得多 —— 所以宁可不兜底。
+ *
+ * 只按 sessionId **精确**匹配；目录不存在 / 解析失败 / 缺 cwd 一律当"没有"，不猜。
+ * 一个会话文件会问一次，上百个会话文件就是上百次，所以目录列举与内容都带 2s 缓存。
+ * @param {string} dataPath 产品落盘根（如 ~/.codebuddy）
+ * @returns {Map<string, string>} sessionId -> cwd
+ */
+const _liveState = { dir: '', at: 0, cwds: new Map() };
+function liveSessionCwds(dataPath) {
+  const dir = dataPath ? path.join(dataPath, 'sessions') : '';
+  const now = Date.now();
+  if (dir === _liveState.dir && now - _liveState.at < 2_000) return _liveState.cwds;
+  _liveState.dir = dir;
+  _liveState.at = now;
+  _liveState.cwds = new Map();
+  if (!dir || !isDir(dir)) return _liveState.cwds;
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((n) => /\.json$/i.test(n));
+  } catch {
+    return _liveState.cwds;
+  }
+  /** @type {Map<string, {cwd: string, updatedAt: number}>} */
+  const best = new Map();
+  for (const name of names.slice(0, 200)) {
+    let j = null;
+    try {
+      j = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+    } catch {
+      continue; // 进程可能正在写 / 中途被杀→残缺。残缺就算没读到，不猜
+    }
+    const sid = j && typeof j.sessionId === 'string' ? j.sessionId.trim() : '';
+    const cwd = j && typeof j.cwd === 'string' ? j.cwd.trim() : '';
+    if (!sid || !cwd) continue;
+    // 同一个会话可能留着好几份（老 pid 没清干净）→ 取最新的那份，与 claudeSessionStatus 同口径
+    const prev = best.get(sid);
+    const at = Number(j.updatedAt || 0);
+    if (prev && Number(prev.updatedAt || 0) >= at) continue;
+    best.set(sid, { cwd, updatedAt: at });
+  }
+  for (const [sid, v] of best) _liveState.cwds.set(sid, v.cwd);
+  return _liveState.cwds;
+}
+
 /** 人类可读的相对时间（只用于"会话文件多久前动过"这类说明文案） */
 function formatAge(ms) {
   const n = Number(ms) || 0;
@@ -257,6 +315,9 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   const SUBTREE = { codex: 'sessions', claude: 'projects', qoder: 'projects', codebuddy: 'projects' };
   const sub = SUBTREE[kind] ? path.join(dataPath, SUBTREE[kind]) : '';
   const root = sub && isDir(sub) ? sub : dataPath;
+  // transcript 里还没有第一条对话时（会话刚起），cwd 只能在本产品自己的会话状态文件里找 ——
+  // sessionId -> cwd（见 liveSessionCwds）。整趟扫描共用一份，别每个会话文件都重读一遍目录。
+  const liveCwds = liveSessionCwds(dataPath);
   const out = [];
   const walk = (d, depth) => {
     if (depth > 4 || out.length >= limit) return;
@@ -284,12 +345,14 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
       // 它照样有 mtime、照样落进 60 分钟活跃窗口，于是下拉里凭空多一条「未知工程」。
       if (!sizeOf(p)) continue;
       const at = mtime(p);
-      // 文件头部里可能有 cwd（工程路径）；读不到就留空，不猜（解析规则见 cwdOfHead）
-      const cwd = cwdOfHead(p);
+      const sid = sessionIdOfFile(e.name, kind);
+      // 工程路径：先看 transcript 头部的 cwd（解析规则见 cwdOfHead）；第一条对话还没落盘时那里
+      // 没有，退回正在运行的 CLI 写的会话状态文件（按 sessionId 精确匹配，见 liveSessionCwds）
+      const cwd = cwdOfHead(p) || liveCwds.get(sid) || '';
       out.push({
         id: path.relative(root, p),
         // 轴 2：这条落盘属于哪条会话（解析规则与实测依据见 sessionIdOfFile）
-        sessionId: sessionIdOfFile(e.name, kind),
+        sessionId: sid,
         project: cwd ? resolveProjectName(cwd) || path.basename(cwd) : '',
         projectPath: cwd,
         lastEventAt: at || Date.now(),
@@ -439,16 +502,14 @@ function refresh({ workspacePath = '', force = false } = {}) {
    * 于是每条会话的相位、完成标记、活跃窗口都只认自己那一路的落盘 ——
    * 同一个产品同时开着 CLI 与 Plugin 时，两条会话各显示各的，不会互相串味。
    *
-   * 两种来源之间有个例外（见下面的 cli 分支）：CLI 的会话 jsonl 与 reporter 状态文件
-   * 说的是同一批会话，但 jsonl 那条路拿不到会话 id —— 两路一起列，同一条会话会显示成两条。
-   * 所以**jsonl 优先，但只算"还活着的"**：这一层的 CLI 落盘扫到了 60 分钟窗口内还动过的
-   * 会话，hook 那一路才整层跳过；一条活会话都没扫到（CodeBuddy CLI 的常见形态：只留 hook
-   * 状态文件；或只剩陈旧 jsonl）就用状态文件兜底。
+  * CLI 的 JSONL 与 hook 状态文件可能描述同一会话。两路都提供 sessionId 时只对同一 id 去重；
+  * SessionEnd 的 reporter 标记会同时排除旧 hook 行与对应 JSONL。CLI 新会话即使还没有 transcript，
+  * 仍由 SessionStart 的 hook 状态列出，不会被同楼层另一条近期 JSONL 屏蔽。
    */
   const products = detectProducts({});
   const seen = new Set();
-  /** 这一层的 CLI 落盘到底扫出【活】会话没有（决定 hook 那一路要不要兜底，见上面的说明） */
-  const cliLandingSeen = new Set();
+  /** CLI JSONL 已列出的会话 id（只对同一会话去重，不屏蔽同层其他新会话） */
+  const cliLandingSessions = new Map();
   const claim = (floor, sessionId) => {
     if (!sessionId) return true;
     const k = `${floor}:${sessionId}`;
@@ -517,10 +578,6 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // ② 1F CodeBuddy CLI 的兜底 —— CLI 常常只留 hook 状态文件。
       // 但只要有 jsonl 可扫就不走这条（同一条会话两路都看得到时，只有 jsonl 那路拿不到
       // 会话 id，混着列会把一条会话显示成两条，见上面 refresh 的说明）。
-      if (src.kind === 'hook') {
-        if (cliLandingSeen.has(p.id)) continue;
-      }
-
       // ---- Kilo 那一路（7F）：轮询 Kilo 自己的 SQLite 库 ----
       // Kilo 没有 hook 子系统，也没有可扫的会话 jsonl，会话 / 相位 / 完成标记都由
       // server/src/kilo.js 读 kilo.db 推导（与 8F OpenCode 同属轮询路线，取法不同：
@@ -700,9 +757,16 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // 两路产出的会话行同构（都只有文件时间 / 心跳时间，没有运行态）：
       // jsonl 路给出 projectPath（从文件头部的 cwd 解析，读不到就空）；
       // hook 路给出 workspacePath（hook payload 实测值）。
+      const reporterSessions = src.kind === 'cli' ? listReporterSessions(src.client, { includeEnded: true }) : [];
+      const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
+      for (const [key, session] of table) {
+        if (session.floor === p.id && endedSessionIds.has(session.sessionId) && ['cli', 'hook'].includes(session.sourceKind)) {
+          table.delete(key);
+        }
+      }
       const rows =
         src.kind === 'cli'
-          ? scanCliSessions(src.dataPath, { kind: p.agent })
+          ? scanCliSessions(src.dataPath, { kind: p.agent }).filter((s) => !s.sessionId || !endedSessionIds.has(s.sessionId))
           : listReporterSessions(src.client).map((s) => ({
               id: s.sessionId,
               sessionId: s.sessionId,
@@ -718,21 +782,21 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // prune 掉（snapshot 只列 active 的），所以连登记都不登记它们 —— 顺带避免它用
       // 会话 id 去 claim（那会让同名 id 的活会话在 claim 那一步被顶掉）。
       const live = rows.filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS);
-      // `cliLandingSeen` / 撤 hook 行**只由 CLI 落盘那一路决定**，判据挂在具体的 kind 上：
-      //   · hook 那一路自己不是判据来源 —— 挂在通用的 rows/live 上，它每轮都会先把自己那几行
-      //     删掉再重新 upsert（firstSeenAt 也跟着重置），语义上更是"让位给自己"；
-      //   · 按 kind 判定与声明顺序无关：哪天把 sources 写成 ['hook', 'cli']，结论不变
-      //     （hook 先登记、cli 那一趟再把它们撤掉；cli 没有活会话时 hook 正常留着）。
+      // CLI JSONL 与 hook 可能描述同一会话。只按真实 sessionId 去重；同一楼层其他
+      // SessionStart 会话仍由 hook 列出，不能因旧 JSONL 活跃而整层让位。
       if (src.kind === 'cli' && live.length) {
-        cliLandingSeen.add(p.id);
-        // 这一层以前可能正靠 hook 兜底列会话（见上面那段说明）：CLI 落盘现在有【活】会话了，
-        // 就把那些 hook 行撤掉 —— 表按 `楼层:id` 存，一条会话的两路 id 不同，不会自动重合，
-        // 不撤就会同一会话挂两行（一行 hook、一行 jsonl）。
-        for (const [k, v] of table) if (v.floor === p.id && v.sourceKind === 'hook') table.delete(k);
+        const ids = new Set(live.map((s) => s.sessionId).filter(Boolean));
+        cliLandingSessions.set(p.id, ids);
+        for (const sessionId of ids) {
+          const oldHookKey = `${p.id}:${sessionId}`;
+          const oldHook = table.get(oldHookKey);
+          if (oldHook && oldHook.sourceKind === 'hook') table.delete(oldHookKey);
+        }
       }
 
       for (const s of live) {
         const sessionId = s.sessionId || '';
+        if (src.kind === 'hook' && sessionId && cliLandingSessions.get(p.id)?.has(sessionId)) continue;
         if (!claim(p.id, sessionId)) continue;
         const lastEventAt = s.lastEventAt;
         upsert({
@@ -775,6 +839,8 @@ function refresh({ workspacePath = '', force = false } = {}) {
   // 一个 hook 事件都不发，台账那行会一直挂在「进行中」。doneScans 在 refresh 开头已清空、
   // 本轮回填完，正好遍历它收集到的 cancels。
   flushSynthesizedCancels(doneScans, now);
+  // 被新一轮顶掉的上一轮（同会话一个结束事件都没到的那行）：也补一刀 cancelled
+  flushSupersededTasks(doneScans);
 
   prune(now);
   lastScanAt = now;
@@ -827,6 +893,39 @@ function flushSynthesizedCancels(doneScans, now) {
     }
   }
   for (const [k, v] of postedCancels) if (v <= now) postedCancels.delete(k);
+}
+
+/**
+ * 收掉**被新一轮顶掉的上一轮**：同一会话里比"当前这一轮"更早开始、却至今挂着 running 的任务。
+ *
+ * 判据是硬的：一个会话不可能同时跑两轮。它之所以还挂着，是因为这一轮的结束事件永远到不了 ——
+ * CodeBuddy 插件按停止时一个 hook 事件都不发，而 hook 的状态文件按**会话**一份，新一轮的
+ * /task/start 会把 taskId / taskStartedAt 整份覆盖，上一轮连兜底扫描（上面的 cancels，
+ * 它只认状态文件里"当前那个" taskId）都够不着，于是永远停在「进行中」。
+ * 用户看到的就是：取消了任务 → 屏上还是「进行中」，主控制台却已经「待命中」。
+ *
+ * 与 flushSynthesizedCancels 的分工：那里靠"用户真按了停止"的落盘信号（越早越好，取消当场就能亮）；
+ * 这里是**不依赖任何产品信号**的硬兜底 —— 被顶掉的上一轮，无论它是被掐了还是事件丢了，都得收尾。
+ * @param {Map<string, {rounds?: Array}>} doneScans key 是 `${工程路径}|${client}`
+ */
+function flushSupersededTasks(doneScans) {
+  const { bus, repo } = backend || {};
+  if (!bus || typeof bus.endStaleTasksOfSession !== 'function' || !repo) return;
+  for (const [key, scan] of doneScans) {
+    const ws = String(key || '').split('|')[0];
+    if (!ws || !scan.rounds || !scan.rounds.length) continue;
+    // 工程 id 只能从路径换：bus 收的是工程 id（`<名字>@<工程id>`），传路径会算出不存在的成员
+    const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
+    if (!proj) continue;
+    for (const r of scan.rounds) {
+      if (!r.sessionId || !Number(r.taskStartedAt)) continue;
+      try {
+        bus.endStaleTasksOfSession({ project: proj.id, sessionId: r.sessionId, ts: Number(r.taskStartedAt), client: r.client });
+      } catch {
+        /* 台账补发失败不影响会话表 */
+      }
+    }
+  }
 }
 
 /**
@@ -908,4 +1007,4 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   };
 }
 
-module.exports = { snapshot, refresh, prune, TIMEOUT_MS, table, setBackend };
+module.exports = { snapshot, refresh, prune, TIMEOUT_MS, table, setBackend, scanCliSessions, liveSessionCwds };

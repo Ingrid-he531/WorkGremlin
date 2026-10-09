@@ -1715,6 +1715,12 @@ function readReporterDones(workspacePath, client = '') {
    *  然后由 sessionRegistry 在 refresh 时去重后补发一次 task/end —— 否则台账那行一直挂在「进行中」。 */
   const cancels = [];
   /**
+   * 扫到的"当前这一轮"：会话 id + 本轮开始时刻。
+   * 交给 sessionRegistry 去收**被这一轮顶掉的上一轮**（同会话至今没收到结束事件、
+   * 台账上还挂 running 的那些）—— 一个会话不可能同时跑两轮，见 bus.endStaleTasksOfSession。
+   */
+  const rounds = [];
+  /**
    * 合成一枚取消标记：既有按会话给控制台的那份（bySession，红灯靠它），
    * 也有列进 cancels 让台账补一刀的那份。两个信号共用，别再各写一遍。
    */
@@ -1770,6 +1776,7 @@ function readReporterDones(workspacePath, client = '') {
        待命），也不误报取消。 */
     if (j.taskId) {
       const startedAtJ = Number(j.taskStartedAt) || 0;
+      if (id && startedAtJ) rounds.push({ sessionId: id, taskStartedAt: startedAtJ, client: j.client });
       /* Claude Code / Qoder（4F / 6F，CLI 与 IDE 扩展都一样）：用户按"停止"后**一个 hook
          事件都不发** —— 实测 2026-09-29 的 4F：events.log 里 Stop / SessionEnd / Notification
          全无，事件流停在最后一次 PostToolUse。hook 侧那条 `turnInterrupted` 跑在 Stop 分支里，
@@ -1808,7 +1815,7 @@ function readReporterDones(workspacePath, client = '') {
       }
     }
   }
-  return { latest, bySession, cancels };
+  return { latest, bySession, cancels, rounds };
 }
 
 /** "任务完成"的唯一真源：取**某条会话**的完成标记（不靠相位回落到空闲来猜，避免中途误弹）。
@@ -1849,9 +1856,10 @@ function readCopilotDone(sessionId) {
  * sessionId 就是 hook payload 的 `session_id`，工程路径取相位 / 任务里记的 workspacePath ——
  * 两个都是实测值，不猜。老命名文件（没有 sessionId）没有会话维度，不算。
  * @param {string} client 客户端身份（**这一路来源**的 client，如 trae / codebuddy）；空则不限
- * @returns {Array<{sessionId: string, workspacePath: string, lastEventAt: number}>}
+ * @param {{includeEnded?: boolean}} options 默认不返回收到 SessionEnd 的会话；CLI JSONL 清理时需要完整状态
+ * @returns {Array<{sessionId: string, workspacePath: string, lastEventAt: number, endedAt: number}>}
  */
-function listReporterSessions(client = '') {
+function listReporterSessions(client = '', { includeEnded = false } = {}) {
   const dir = path.join(reporterHookHome(), 'hooks');
   const byId = new Map();
   for (const name of readDir(dir)) {
@@ -1862,6 +1870,7 @@ function listReporterSessions(client = '') {
     const sessionId = String(j.sessionId || '').trim();
     if (!sessionId) continue;
     const sp = j.sessionPhase || {};
+    const endedAt = Number(j.sessionEndedAt) || 0;
     const lastEventAt = Math.max(
       Number(j.hb && j.hb.lastEventAt) || 0,
       Number(sp.ts) || 0,
@@ -1869,16 +1878,19 @@ function listReporterSessions(client = '') {
     );
     if (!lastEventAt) continue;
     const prev = byId.get(sessionId);
+    const recordAt = Math.max(lastEventAt, endedAt);
     // 同一会话可能有多份状态文件（换过工程 / 老命名残留）：取最新那份的工程
-    if (!prev || lastEventAt > prev.lastEventAt) {
+    if (!prev || recordAt > prev.recordAt) {
       byId.set(sessionId, {
         sessionId,
-        workspacePath: String(sp.workspacePath || j.taskWorkspacePath || ''),
+        workspacePath: String(sp.workspacePath || j.sessionWorkspacePath || j.taskWorkspacePath || ''),
         lastEventAt,
+        endedAt,
+        recordAt,
       });
     }
   }
-  return [...byId.values()];
+  return [...byId.values()].filter((s) => includeEnded || !s.endedAt);
 }
 
 /**

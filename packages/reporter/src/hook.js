@@ -1692,6 +1692,8 @@ async function main() {
   writeState(file, {
     client: cl,
     sessionId: String((ev && ev.session_id) || ''),
+    ...(event === 'SessionStart' ? { sessionEndedAt: null } : {}),
+    ...(event === 'SessionStart' ? { sessionWorkspacePath: REAL_WS } : {}),
     ...(agentType ? { agentType } : {}),
   });
 
@@ -2350,6 +2352,7 @@ async function main() {
     writeState(file, {
       await: null,
       pending: null,
+      sessionEndedAt: Date.now(),
       sessionPhase: isCoarseAgent() ? { phase: 'done', ts: Date.now(), workspacePath: REAL_WS } : null,
     });
     stopHeartbeat(AGENT);
