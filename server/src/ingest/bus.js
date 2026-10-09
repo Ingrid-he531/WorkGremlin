@@ -644,7 +644,12 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     let n = 0;
     for (const old of repo.listStaleRunningBySession.all(project, sid)) {
       if (!old.id || old.id === excludeTaskId) continue;
-      if (Number(old.startedAt) && Number(old.startedAt) > ts) continue; // 比这一轮还新：不是被顶掉的
+      // **同刻开工的也是这一轮自己**，不是被顶掉的上一轮：新一轮的 started_at 与注册表扫描
+      // 从状态文件读到的 taskStartedAt 是同一个值（同一份 hook 上报），而且这里的调用方
+      // （sessionRegistry.flushSupersededTasks）传不出 excludeTaskId —— 曾经用 `>` 判界，
+      // 结果每条新任务开工瞬间就被这一刀当成"上一轮"写成 cancelled（ticker 开场就滚
+      // 「已取消」、任务记录/成员卡全跟着错，真收工时才被重写回来）。实测 2026-10-09。
+      if (Number(old.startedAt) && Number(old.startedAt) >= ts) continue;
       const oc = normClient(old.client);
       if (want && oc && oc !== want) continue; // 不同形态互不相掐
       endTask({ project, memberId: old.memberId, taskId: old.id, state: 'cancelled', ts });

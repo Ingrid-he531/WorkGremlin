@@ -920,7 +920,9 @@ function flushSupersededTasks(doneScans) {
     for (const r of scan.rounds) {
       if (!r.sessionId || !Number(r.taskStartedAt)) continue;
       try {
-        bus.endStaleTasksOfSession({ project: proj.id, sessionId: r.sessionId, ts: Number(r.taskStartedAt), client: r.client });
+        // excludeTaskId = 当轮自己的 taskId：扫尾只收"被顶掉的上一轮"，
+        // 绝不能把状态文件里指向的当前轮收掉（startedAt >= ts 判界之外的双保险）。
+        bus.endStaleTasksOfSession({ project: proj.id, sessionId: r.sessionId, ts: Number(r.taskStartedAt), excludeTaskId: r.taskId || '', client: r.client });
       } catch {
         /* 台账补发失败不影响会话表 */
       }

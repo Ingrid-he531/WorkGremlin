@@ -73,13 +73,30 @@ let segSeq = 0;
 /** 本次会话启动时刻：只播报启动后才结束的任务，不回放历史（避免一启动就滚一堆"任务完成"） */
 const sessionStart = Date.now();
 
-/** 结束任务 → 屏上那一行（绿=完成 / 红=取消·失败）。只要「时间 楼层 任务完成」，不接用户输入——
- *  接了会很长、且和进行中的任务混在一起分不清谁收的工；只滚一遍即退场。 */
+/**
+ * 结束任务 → 屏上那一行：复用**它原本滚动的那条文案**（时间 楼层 任务：原话），
+ * 只在末尾追加状态字（绿=完成「（完成）」/ 红=取消·失败「（已取消）」），不再单独出一行"任务完成/取消"。
+ * 整条只滚一遍即退场（见 pendingEnded → makeSeg 进段即清）。failed 归到取消的红色。
+ */
 function endedText(r) {
   const floor = floorOf(r.client);
-  const kind = r.state === 'done' ? 'done' : 'cancelled';
-  const tail = r.state === 'done' ? t('ticker.done') : r.state === 'failed' ? t('ticker.failed') : t('ticker.cancelled');
-  return { id: `${r.id}:${r.state}`, kind, text: `${hhmm(r.ended_at)} ${floor} ${tail}` };
+  const base = promptOf(r.title) || t('ticker.untitled');
+  const suffixKind = r.state === 'done' ? 'done' : 'cancelled';
+  const suffix = suffixKind === 'done' ? t('ticker.doneSuffix') : t('ticker.cancelledSuffix');
+  return {
+    id: `${r.id}:${r.state}`,
+    kind: 'running',
+    text: `${hhmm(r.started_at)} ${floor} ${t('ticker.task', { text: clip(base) })}`,
+    suffix,
+    suffixKind,
+  };
+}
+
+/** 一条 line 还差多少字符才凑满一屏：不足就在「后缀之后」补空格（整行 + 后缀一起占满一屏）。 */
+function padN(it) {
+  const n = perLine.value;
+  const len = (it.text ? it.text.length : 0) + (it.suffix ? it.suffix.length : 0);
+  return n && len < n ? n - len : 0;
 }
 
 /** 从 rows 里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded —— 下次补段时
@@ -230,7 +247,9 @@ const idle = computed(
 );
 
 /** 读屏文本：屏上那串滚动的段码对 AT 是噪音，这里给一句静态的 */
-const srText = computed(() => [...runningItems.value, ...pendingEnded.value].map((i) => i.text).join('；'));
+const srText = computed(() =>
+  [...runningItems.value, ...pendingEnded.value].map((i) => `${i.text}${i.suffix || ''}`).join('；')
+);
 
 /* ------------------------------ 滚动（JS rAF · 分段传送带） ------------------------------
  * 轨道是一串**段**（一遍内容），段尾各带一份空档；段滚出左边缘就回收、右端随时补新段。
@@ -257,12 +276,6 @@ const perLine = computed(() => {
   if (!viewW.value || !charW.value) return 0;
   return Math.max(0, Math.floor((viewW.value - DOT_W) / charW.value));
 });
-/** 不足一屏的行在末尾补空格，让每条都占满一屏那么长 */
-function padText(s) {
-  const n = perLine.value;
-  const str = String(s || '');
-  return n && str.length < n ? str + ' '.repeat(n - str.length) : str;
-}
 /** 系统「减弱动态效果」：不滚，静态摆着 */
 const reduce = ref(false);
 let ro = null;
@@ -408,7 +421,7 @@ onBeforeUnmount(() => {
       >
         <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
-          <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`">{{ padText(it.text) }}</span>
+          <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`"><span class="body">{{ it.text }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span><span class="pad">{{ ' '.repeat(padN(it)) }}</span></span>
         </span>
       </div>
       <!-- 量字宽的探针：一串等宽数字，看不见也不占地方（算"一屏能放几个字"用） -->
@@ -538,6 +551,17 @@ onBeforeUnmount(() => {
 }
 
 .k-cancelled {
+  color: var(--state-blocked, #ff5c5c);
+  text-shadow: 0 0 6px currentColor;
+}
+
+/* 结束行末尾的状态字：独立上色（绿=完成 / 红=取消·失败），主体仍沿用任务的蓝色 */
+.suf.s-done {
+  color: var(--state-online, #2ecc71);
+  text-shadow: 0 0 6px currentColor;
+}
+
+.suf.s-cancelled {
   color: var(--state-blocked, #ff5c5c);
   text-shadow: 0 0 6px currentColor;
 }

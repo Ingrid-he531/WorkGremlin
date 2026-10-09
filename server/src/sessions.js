@@ -1776,7 +1776,9 @@ function readReporterDones(workspacePath, client = '') {
        待命），也不误报取消。 */
     if (j.taskId) {
       const startedAtJ = Number(j.taskStartedAt) || 0;
-      if (id && startedAtJ) rounds.push({ sessionId: id, taskStartedAt: startedAtJ, client: j.client });
+      // taskId 一并带上：sessionRegistry 的"被顶掉上一轮"扫尾拿它显式排除当轮自己
+      //（光靠 startedAt >= ts 判界不够直观，双保险），见 bus.endStaleTasksOfSession。
+      if (id && startedAtJ) rounds.push({ sessionId: id, taskId: j.taskId, taskStartedAt: startedAtJ, client: j.client });
       /* Claude Code / Qoder（4F / 6F，CLI 与 IDE 扩展都一样）：用户按"停止"后**一个 hook
          事件都不发** —— 实测 2026-09-29 的 4F：events.log 里 Stop / SessionEnd / Notification
          全无，事件流停在最后一次 PostToolUse。hook 侧那条 `turnInterrupted` 跑在 Stop 分支里，

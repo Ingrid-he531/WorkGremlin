@@ -123,6 +123,8 @@ const MESSAGES = {
     'ticker.cancelled': '任务取消',
     'ticker.failed': '任务失败',
     'ticker.untitled': '未命名任务',
+    'ticker.doneSuffix': '（完成）',
+    'ticker.cancelledSuffix': '（已取消）',
     'ticker.no_task': '暂无活跃任务',
     'ticker.tag': '全楼层监控',
 
@@ -551,6 +553,8 @@ const MESSAGES = {
     'ticker.cancelled': 'Task cancelled',
     'ticker.failed': 'Task failed',
     'ticker.untitled': 'Untitled task',
+    'ticker.doneSuffix': '(Done)',
+    'ticker.cancelledSuffix': '(Cancelled)',
     'ticker.no_task': 'No active tasks',
     'ticker.tag': 'All floors',
 
