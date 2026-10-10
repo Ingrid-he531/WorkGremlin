@@ -45,7 +45,7 @@ const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
 const { detectProducts } = require('../src/floors');
 const { snapshot } = require('../src/sessionRegistry');
-const qoder = require('../src/qoder');
+const qoder = require('../src/floorQoder');
 const { syncQoderPluginTasks, LIVE_MS, TASK_ID_PREFIX } = qoder;
 
 let pass = 0;

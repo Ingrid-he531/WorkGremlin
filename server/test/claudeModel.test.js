@@ -27,9 +27,9 @@ process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
 process.env.CLAUDE_CONFIG_DIR = CLAUDE;
 
-const { selectedModelOf } = require('../src/claude');
+const { selectedModelOf } = require('../src/floorClaude');
 const { sessionModel, reporterMainPhase } = require('../src/sessions');
-const { claudeHome } = require('../src/claude');
+const { claudeHome } = require('../src/floorClaude');
 
 /* ------------------------------ 断言 ------------------------------ */
 

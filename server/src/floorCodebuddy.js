@@ -159,6 +159,20 @@ const meta = {
   },
 };
 
+/**
+ * 这口"在跑"的 reporter 相位是否被本楼层的取消标记作废。
+ * CodeBuddy 插件取消时一个 hook 事件都不发，相位冻在「思考中 / 调用工具」，只能靠
+ * message-queue 的 pauseReason='cancel' 那刻来戳破（见 codebuddyPauseCancelAt）。
+ * 供 sessions.js 的 readReporterPhase 派发调用。
+ * @param {object} j hook 状态文件
+ * @param {object} sp 状态文件里的 sessionPhase
+ * @param {number} slack 相位时间戳容差（ms）
+ */
+function phaseSuperseded(j, sp, slack = 1_000) {
+  const at = codebuddyPauseCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+  return !!at && at + slack >= Number(sp.ts || 0);
+}
+
 module.exports = {
   id: '1F',
   meta,
@@ -166,6 +180,7 @@ module.exports = {
   RE_PLUGIN,
   // 取消检测（统一模块组接口：cancelAt / allCancels，与 trae 同签名）
   cancelAt: codebuddyPauseCancelAt,
+  phaseSuperseded,
   allCancels: allCodebuddyCancels,
   // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 CodeBuddy 专属逻辑）
   synthMarks,

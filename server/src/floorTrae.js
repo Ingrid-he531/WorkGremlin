@@ -791,6 +791,20 @@ function flushBackend(ctx) {
   flushTraeYuan(now, backend);
 }
 
+/**
+ * 这口"在跑"的 reporter 相位是否被本楼层的取消标记作废。
+ * TraeCode 取消时 Stop hook 不触发，相位冻在取消前那一口，只能靠 renderer.log 里
+ * DoneHandler 的 status:"canceled" 那刻来戳破（见 traeCancelAt）。
+ * 供 sessions.js 的 readReporterPhase 派发调用。
+ * @param {object} j hook 状态文件
+ * @param {object} sp 状态文件里的 sessionPhase
+ * @param {number} slack 相位时间戳容差（ms）
+ */
+function phaseSuperseded(j, sp, slack = 1_000) {
+  const at = traeCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+  return !!at && at + slack >= Number(sp.ts || 0);
+}
+
 module.exports = {
   // 5F TraeCode
   id: '5F',
@@ -812,6 +826,7 @@ module.exports = {
   // 统一接口别名
   cancelAt: traeCancelAt,
   modelOf: selectedModelOf,
+  phaseSuperseded,
   // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Trae 专属逻辑）
   synthMarks,
 };

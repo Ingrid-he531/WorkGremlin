@@ -36,6 +36,8 @@ const path = require('path');
 const { clientBase } = require('@workgremlin/shared');
 // 通用落盘扫描基础设施（目录约定 + 容错文件读取），readJson / readDir 统一从 roots 取，不在各处重复定义
 const { readJson, readDir } = require('./roots');
+// 楼层模块注册表（floors.js）：会话标题按 client 派发到对应楼层模块时要用 registry 里的 sessionTitle
+const { floors: floorRegistry } = require('./floors');
 // 楼层能力模块（module group）：每个楼层（trae / claude / codebuddy / copilot）实现同一份
 // "会话能力"接口，sessions.js 一律用 `楼层.能力` 成员访问。新增楼层 = 在 FLOORS 里加一行
 // require + 在该 floor 模块里实现需要的几个能力，调用点不用改。
@@ -46,16 +48,19 @@ const { readJson, readDir } = require('./roots');
 //   interruptOf(j, startedAt)              打断检测（claude / qoder）
 //   interruptTail(path, sinceTs)
 //   sessionStatus(sessionId)
-const trae = require('./trae');
-const claude = require('./claude');
-const codebuddy = require('./codebuddy');
-const copilot = require('./copilot');
+const trae = require('./floorTrae');
+const claude = require('./floorClaude');
+const codebuddy = require('./floorCodebuddy');
+const copilot = require('./floorCopilot');
 // 插件结构化落盘读取器（genie-history / todos / message-queue / file-changes / Copilot SQLite）：
 // 所有 plugin kind 的取数都收口在 plugin.js，本文件只负责把这些落盘 + reporter 状态文件
 // 综合成会话行，不再掺和插件的内部目录结构。
 const plugin = require('./plugin');
 
-const FLOORS = { trae, claude, codebuddy, copilot };
+// qoder 与 claude 共用同一套 transcript 打断检测（见 claude.synthMarks），
+// 直接别名到 claude 模块，公共派发里就不必为它写特判了。
+const qoder = claude;
+const FLOORS = { trae, claude, codebuddy, copilot, qoder };
 
 // 落盘窗口常量（与 CLI 楼层对齐）定义在 plugin.js，sessions.js / copilot.js 共用同一份，避免各定义一遍
 const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
@@ -118,33 +123,12 @@ const AWAIT_TTL_MS = 5 * 60_000;
  */
 const TASK_RUN_MS = 2 * 60_000;
 /**
- * 等授权兜底阈值：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
- * 所以靠 hook 留下的 pending 推断——PreToolUse 写 pending + sessionPhase=tool，PostToolUse 才清掉它。
- * 一旦 pending 超过这个时间仍没被清（没有 PostToolUse 来），就认为工具被权限框卡住了 → 标「等待授权」。
- * 设 3.5s：绝大多数工具在 PreToolUse..PostToolUse 之间远小于此值，不会误报；权限框通常一弹就卡住不动。
- */
-const AWAIT_PROBE_MS = 3_500;
-/**
  * "打断标记"与"最后一个 hook 事件"的先后容差（见 readReporterPhase 里那处作废判定）：
  * 标记的 ts 由 CLI 自己落盘、相位的 ts 由 hook 进程落盘，两者可能差几毫秒 —— 用户正是在
  * 最后一个工具的 hook 还没写完时按的停止。所以标记不比相位"旧过 1s"就算标记更新。
  * 代价：紧接着（<1s）重发一轮时，新相位会被压一小会儿；换来的是"按了停止就永不回弹"。
  */
 const INTERRUPT_PHASE_SLACK_MS = 1_000;
-
-/**
- * 这些工具永远不该被标成"等待授权"：
- *  - 只读 / 诊断类（Read/Grep/Glob/...）：本就不弹权限框；且本环境实测它们不发 PostToolUse，
- *    一旦 pending 残留就会误报成 await。
- *  - 命令类（Bash/execute_command）：可能弹 run 权限框，但本环境实测同样不发 PostToolUse，
- *    点了 run 开始执行后 pending 永远清不掉 → 会卡成"等待授权"。所以也不参与兜底推断，
- *    避免出现"点了 run 还在等授权"的误报（需要真信号时再放开，见 hook.js 的 PROBE_TOOLS）。
- */
-const NEVER_AWAIT_TOOLS = new Set([
-  'Read', 'Grep', 'Glob', 'ReadLints', 'read_file', 'search_content', 'search_file', 'read_lints', 'list_dir',
-  'RAG_search', 'web_fetch', 'web_search', 'use_skill', 'ask_followup_question', 'read_rules', 'task', 'update_memory', 'todo_write', 'send_message',
-  'Bash', 'execute_command',
-]);
 
 /**
  * 命令类工具（Bash / execute_command …）：**服务端一律按"调用工具"上报，不做任何特殊化**。
@@ -217,31 +201,12 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
     if (sp.ts < SERVER_STARTED_AT) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
-    /* 用户按了"停止"、但**一个 hook 事件都不发**的产品（Claude Code / Qoder，见 claude.interruptTail）：
-       这口相位没人清 —— taskId 还占着、sp.ts 冻在被打断前最后一个事件那一刻，而服务端照
-       新鲜期还能再认它 TASK_RUN_MS（2 分钟）。也就是说"取消标记"与"这口 stale 相位"有一整段
-       重叠期：红色「任务取消」亮 10s 退回待命后，1.5s 快轮询又把这口相位喂回来，
-       主控制台于是挂回「调用工具 / 思考中」——正是"用户终止了任务，控制台却一直停在取消前那个状态"。
-       真值在 transcript 末尾那条 `[Request interrupted by user]`：**标记比相位更新 = 这口相位作废**
-       （hook 那条路会写显式 idle，这里补的是"没有 hook 事件"那条路）。
-       标记之后用户又发了一轮的话，UserPromptSubmit 写的相位 ts 更新 → 这里不再命中，按新相位走。 */
+    // 这口"在跑"的相位是否被该楼层的取消/打断标记作废：打断检测是楼层私有知识
+    // （Claude/Qoder 看 transcript 末尾、CodeBuddy 看 message-queue pauseReason、Trae 看 DoneHandler），
+    // 由各楼层的 phaseSuperseded 自己判断，公共相位读取只负责派发（见各 floor 模块）。
     if (j.taskId) {
-      // 打断成立（transcript 标记 / Claude 自己的会话状态说 idle，见 claude.interruptOf）且打断时刻
-      // 不比这口相位旧 → 这口相位作废，不再喂给控制台（否则红灯亮完 10s 又被喂回来）。
-      const iv = claude.interruptOf(j, Number(j.taskStartedAt) || 0);
-      if (iv.hit && (!iv.at || iv.at + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts))) continue;
-      // CodeBuddy 插件同理：message-queue 里 pauseReason='cancel' 的那一刻比这口相位新 → 作废
-      // （插件取消时一个 hook 事件都不发，相位会冻在「思考中 / 调用工具」）。
-      if (!iv.hit && clientBase(j.client) === 'codebuddy') {
-        const atP = codebuddy.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
-        if (atP && atP + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
-      }
-      // TraeCode 同理：renderer.log 里 DoneHandler 的 status:"canceled" 比这口相位新 → 作废
-      // （TraeCode 取消时 Stop hook 不触发，相位冻在取消前那一口）。
-      if (!iv.hit && clientBase(j.client) === 'trae') {
-        const atT = trae.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
-        if (atT && atT + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
-      }
+      const floorMod = FLOORS[clientBase(j.client)];
+      if (floorMod && typeof floorMod.phaseSuperseded === 'function' && floorMod.phaseSuperseded(j, sp, INTERRUPT_PHASE_SLACK_MS)) continue;
     }
     if (!win || sp.ts > win.ts) {
       win = sp;
@@ -723,12 +688,6 @@ function readReporterDones(workspacePath, client = '') {
          sinceTs 过滤上，那"上一轮取消 → 新一轮立刻启动"这个窗口一过，上一轮的取消
          信号就被新 startedAtJ 过滤掉了，done 标记永远合成不了。
 
-  /* --- TraeCode 独立扫取消信号 ---
-     数据源是 Trae 自己的 renderer.log（DoneHandler status:"canceled" / StreamDomainService
-     cancelReason:"stop_button" / NotificationPort stopType:"cancel" / stream-diagnostics
-     transformedStatus:"canceled"，四种都带 sessionId），由 trae.allCancels()
-     解析出来（按 mtime+size 缓存，与 traeModels.js 同口径）。
-
      为什么**不在** hook 状态文件扫描循环里做、为什么**也不做** sinceTs/smart 判断：
        · Trae 取消时 Stop hook 不触发，唯一权威信号是 renderer.log。
        · hook 状态文件是"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt。
@@ -738,13 +697,16 @@ function readReporterDones(workspacePath, client = '') {
          新一轮正常跑覆盖 cancelled 状态（L459-470 IsoOfficeView.vue），**不会误亮红灯**。
          所以无需 smart 判断过滤。 */
   // 楼层特有的取消/完成标记合成：每条楼层自己实现 synthMarks（见各 floor 模块），公共代码只负责派发。
-  // client 为空（不指定产品）时扫全部楼层；否则只跑被点名的那一层（qoder 归到 claude 模块处理）。
+  // client 为空（不指定产品）时扫全部楼层；否则只跑被点名的那一层。
+  // qoder 已在 FLOORS 里别名到 claude 模块，这里无需特判。
   const bases = client
     ? String(client).split(',').map((s) => clientBase(s.trim())).filter(Boolean)
     : Object.keys(FLOORS);
+  const seen = new Set();
   for (const base of bases) {
-    const floor = FLOORS[base] || (base === 'qoder' ? FLOORS.claude : null);
-    if (floor && typeof floor.synthMarks === 'function') {
+    const floor = FLOORS[base] || null;
+    if (!floor || seen.has(floor) || typeof floor.synthMarks !== 'function') continue;
+    seen.add(floor);
       floor.synthMarks({
         workspacePath,
         client,
@@ -757,7 +719,6 @@ function readReporterDones(workspacePath, client = '') {
         bySession,
         now,
       });
-    }
   }
 
   return { latest, bySession, cancels, rounds };
@@ -1131,7 +1092,135 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   return cache.value;
 }
 
+/* ============================================================== 会话标题（原 sessionTitle.js，从 floors.js 迁入） */
+
+/**
+ * 会话标题：给"这一轮属于哪条会话"一个**会话级**的名字 —— 同一 session_id 的所有任务拿到同一个值，
+ * 凭它把同一会话的多轮任务认出来（一轮 = 一行任务，一条会话通常有多轮；各轮自己的标题互不相同，
+ * 只有会话标题是共同的）。
+ *
+ * 两条来源，按顺序取：
+ *   1. 各楼层自己的会话标题（agent 起的摘要，与用户原话不同）：
+ *        7F Kilo Code → SQLite session.title
+ *        8F OpenCode  → SQLite session.title
+ *        6F Qoder     → SQLite chat_session.session_title
+ *      这些函数（kiloTitleOf / opencodeTitleOf / lingmaTitleOf）已经搬进各自的楼层文件（kilo.js /
+ *      opencode.js / qoder.js），这里只从楼层注册表动态构建分发表。
+ *   2. **兜底（所有楼层）**：这条会话第一轮的用户原话。
+ *      会话开始时的标题就是用户原话 —— 1F/2F/3F/4F/5F/9F 没有第 1 条那种摘要列，但它们每一轮的
+ *      prompt 都在 tasks.title 里，取同一 session_id 里**最早那一轮**的即可（见 sessionFirstPrompts()）。
+ *
+ * 纪律：任何一层查不到一律回空串，绝不冒泡、绝不编造。
+ */
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 分发表**惰性构建并缓存**：凡是楼层模块导出了 sessionTitle 的，都按它的 client 与
+ * client-plugin 两种身份注册。延迟到首次调用才构建，避免在模块加载期去读（没有 sessionTitle 的）
+ * 楼层 exports 的属性，从而避开 Node 的循环依赖告警。
+ * @returns {Array<{match: RegExp, fn: Function}>}
+ */
+let _routers = null;
+function routers() {
+  if (_routers) return _routers;
+  const mods = /** @type {any[]} */ (Object.values(floorRegistry));
+  _routers = mods
+    .filter((mod) => typeof mod.sessionTitle === 'function' && mod.client)
+    .map((mod) => ({ match: new RegExp('^' + escapeRegExp(mod.client) + '(?:-plugin)?$', 'i'), fn: mod.sessionTitle }));
+  return _routers;
+}
+
+/**
+ * 占位标题：Kilo 起会话时默认写的是 "New session - <ISO 时间戳>"（它自己占的位，不是摘要）。
+ * 把它当"有标题"列出来，详情里就多一行时间戳，纯噪声 —— 一律当没有。
+ */
+const PLACEHOLDER_TITLE = /^new session\b/i;
+
+/**
+ * 根据 client 分发到对应楼层查 title。找不到、库没装、表结构变了、查出来是占位名一律回空串。
+ * @param {string|null|undefined} sessionId
+ * @param {string|null|undefined} client
+ * @returns {string}
+ */
+function resolveSessionTitle(sessionId, client) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return '';
+  const c = String(client || '').trim();
+  if (!c) return '';
+  for (const r of routers()) {
+    if (!r.match.test(c)) continue;
+    const title = r.fn(sid);
+    return title && !PLACEHOLDER_TITLE.test(title) ? title : '';
+  }
+  return '';
+}
+
+/* ------------------------------ 兜底：会话第一轮的用户原话 ------------------------------ */
+
+/**
+ * 老数据（hook 修掉之前）把 IDE 注入的那段上下文整段当标题存了下来 ——
+ * `# Context from my IDE setup: ## Active file: …`。规则与前端 promptOf()、
+ * hook 侧 userRequestText 保持一致：只在真出现那段上下文时才按「My request:」切开取后面。
+ */
+const IDE_INJECTED = [/^[ \t]*#{0,6}[ \t]*Context from my IDE setup\b/im, /^[ \t]*#{1,6}[ \t]*(?:Active file|Open tabs)\b/im];
+const REQUEST_SPLIT = /^[ \t]*#{0,6}[ \t]*(?:My request|User request|Request|我的请求|用户请求)[ \t]*[:：][ \t]*$/im;
+
+/** 一条 tasks.title → 用户原话（首行，够当标题用；过长截断，免得详情那一行撑爆） */
+function userRequestOf(raw) {
+  const s = String(raw || '').replace(/\r\n?/g, '\n');
+  if (!s.trim()) return '';
+  const text = IDE_INJECTED.some((re) => re.test(s)) ? (s.split(REQUEST_SPLIT).slice(1).join('\n') || '') : s;
+  const first = text.split('\n').map((l) => l.trim()).find(Boolean) || '';
+  return first.length > 120 ? `${first.slice(0, 120)}…` : first;
+}
+
+/**
+ * 一批会话各自"第一轮说了什么"（用户原话）。
+ *
+ * 只查一次：按 session_id 分组取 started_at 最小的那一轮 —— SQLite 的规矩是
+ * `MIN()` 与裸列同用时，裸列取自 MIN 命中的那一行，所以 t.title 就是最早那轮的标题。
+ *
+ * @param {import('better-sqlite3').Database|null} raw 主库（只读用）
+ * @param {string[]} sessionIds
+ * @returns {Map<string, string>} 查不到的会话不在表里（调用方当"没有"）
+ */
+function sessionFirstPrompts(raw, sessionIds) {
+  const out = new Map();
+  const ids = [...new Set(sessionIds.map((s) => String(s || '').trim()).filter(Boolean))];
+  if (!raw || !ids.length) return out;
+  // 占位符别一次塞太多（SQLite 默认上限 999）：分批查
+  for (let i = 0; i < ids.length; i += 400) {
+    const chunk = ids.slice(i, i + 400);
+    const holes = chunk.map(() => '?').join(',');
+    try {
+      const rows = /** @type {Array<{ sid: string, title: string }>} */ (
+        raw
+          .prepare(
+            `SELECT tr.session_id AS sid, t.title AS title, MIN(t.started_at) AS started_at
+               FROM tasks t
+               JOIN task_runs tr ON tr.id = t.id
+              WHERE tr.session_id IN (${holes})
+              GROUP BY tr.session_id`
+          )
+          .all(...chunk)
+      );
+      for (const r of rows) {
+        const title = userRequestOf(r.title);
+        if (title) out.set(String(r.sid), title);
+      }
+    } catch {
+      /* 表结构变了 / 库被锁：这一批没有，调用方按"没有会话标题"走，不编造 */
+    }
+  }
+  return out;
+}
+
 module.exports = {
+  resolveSessionTitle, // 会话标题：按 client 派发到对应楼层模块（kilo/opencode/qoder 的 SQLite title）
+  sessionFirstPrompts, // 兜底：一批会话各自第一轮用户原话（从 tasks 表取最早一轮）
   hasReporterState,
   reporterStateMeta,
   hasOtherLiveSession,// 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）

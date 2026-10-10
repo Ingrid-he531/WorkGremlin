@@ -56,7 +56,7 @@ process.env.WORKGREMLIN_KILO_HOME = KILO_HOME;
 
 const { detectProducts } = require('../src/floors');
 const { DEFAULTS } = require('@workgremlin/shared');
-const kilo = require('../src/kilo');
+const kilo = require('../src/floorKilo');
 
 let pass = 0;
 let fail = 0;

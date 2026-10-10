@@ -36,10 +36,10 @@ const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
 const { detectProducts } = require('../src/floors');
-const { RE_GITHUB_COPILOT } = require('../src/copilot');
+const { RE_GITHUB_COPILOT } = require('../src/floorCopilot');
 const sessionsMod = require('../src/sessions');
-const kiloMod = require('../src/kilo');
-const opencodeMod = require('../src/opencode');
+const kiloMod = require('../src/floorKilo');
+const opencodeMod = require('../src/floorOpencode');
 
 /* 固定数据打桩：只把"厂商落盘"那一层换掉，repo / 路由 / 同步器全是真的。
  * [9] 那一节要跑**真实的扫盘**证明别的产品的会话不会被写进 9F —— 用一个开关切过去：
@@ -60,12 +60,12 @@ kiloMod.readKiloRounds = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).ro
 opencodeMod.listOpencodeSessions = () => opencodeRows;
 opencodeMod.readOpencodeTurns = (sid) => ((opencodeRows.find((r) => r.id === sid) || {}).turns || []);
 
-const copilotMod = require('../src/copilot');
+const copilotMod = require('../src/floorCopilot');
 const { syncCopilotTasks } = copilotMod;
-const { syncKiloTasks } = require('../src/kilo');
+const { syncKiloTasks } = require('../src/floorKilo');
 // Copilot 的模型来自 VS Code state.vscdb，测试把它换成熟桩（见 copilot.js 的 syncCopilotTasks）
 copilotMod.copilotCurrentModel = () => 'GPT-5 mini';
-const { syncOpencodeTasks } = require('../src/opencode');
+const { syncOpencodeTasks } = require('../src/floorOpencode');
 
 let pass = 0;
 let fail = 0;

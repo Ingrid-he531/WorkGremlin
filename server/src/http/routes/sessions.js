@@ -3,10 +3,10 @@
 const express = require('express');
 const { reporterMainPhase, freshestReporterWs, reporterStateMeta, readReporterDone } = require('../../sessions');
 // 7F Kilo Code：Kilo 没有 hook 状态文件，相位/完成标记从它自己的 SQLite 推导
-const { kiloMainPhase, readKiloDone, kiloInstrumented } = require('../../kilo');
+const { kiloMainPhase, readKiloDone, kiloInstrumented } = require('../../floorKilo');
 // 8F OpenCode：**两路**——装了 WorkGremlin 插件时真相位走 reporter 状态文件，
 // 没装（或还没写过）才退回轮询 opencode.db 的推导。形态与 7F 不同，理由见下面那段注释。
-const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('../../opencode');
+const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('../../floorOpencode');
 const { clientBase } = require('@workgremlin/shared');
 
 /**

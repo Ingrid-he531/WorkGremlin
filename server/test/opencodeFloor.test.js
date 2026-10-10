@@ -69,7 +69,7 @@ const Database = require('better-sqlite3');
 
 const { detectProducts } = require('../src/floors');
 const { DEFAULTS } = require('@workgremlin/shared');
-const opencode = require('../src/opencode');
+const opencode = require('../src/floorOpencode');
 // sessions / sessionRegistry **必须在取任何时间戳之前**加载：它们在模块加载那一刻记下
 // SERVER_STARTED_AT（"重启纪元"），而 readReporterPhase 只采信本进程启动之后写入的相位
 // （sessions.js 里那句 `if (sp.ts < SERVER_STARTED_AT) continue`）。
@@ -644,7 +644,7 @@ head('[E] 插件写的状态文件能被认出来（真相位优先于轮询）'
   ok('clients = opencode + opencode-plugin（前端按它过滤相位与成员）', snap.floors.every((f) => f.id !== '8F' || JSON.stringify(f.clients) === JSON.stringify(['opencode', 'opencode-plugin'])));
 
   // 真相位那一路：/reporter-phase 的组装逻辑（直接调函数，免得起服务）
-  const { opencodeMainPhase, opencodeInstrumented } = require('../src/opencode');
+  const { opencodeMainPhase, opencodeInstrumented } = require('../src/floorOpencode');
   const client = 'opencode';
   const rpTruth = reporterMainPhase('/tmp/ProjO', client, sid);
   const metaTruth = reporterStateMeta('/tmp/ProjO', client, sid);

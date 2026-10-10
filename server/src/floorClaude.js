@@ -442,6 +442,21 @@ const meta = {
   sessionIdOfFile: (name) => String(name).replace(/\.jsonl$/i, ''),
 };
 
+/**
+ * 这口"在跑"的 reporter 相位是否被本楼层的取消/打断标记作废。
+ * 用户按停止但 hook 一个事件都不发（Claude Code / Qoder，见 claude.interruptTail）：transcript 末尾的
+ * `[Request interrupted by user]`（或 ~/.claude/sessions 说 idle）比这口相位新 → 这口相位作废，
+ * 否则取消标记亮完又被 stale 相位喂回「思考中 / 调用工具」。
+ * 供 sessions.js 的 readReporterPhase 派发调用（公共相位读取只负责派发，打断知识归本楼层）。
+ * @param {object} j hook 状态文件
+ * @param {object} sp 状态文件里的 sessionPhase
+ * @param {number} slack 相位时间戳容差（ms）
+ */
+function phaseSuperseded(j, sp, slack = 1_000) {
+  const iv = claudeInterruptOf(j, Number(j.taskStartedAt) || 0);
+  return iv.hit && (!iv.at || iv.at + slack >= Number(sp.ts || 0));
+}
+
 module.exports = { 
   id: '4F', 
   meta, 
@@ -451,6 +466,7 @@ module.exports = {
   interruptTail: claudeInterruptTail,
   sessionStatus: claudeSessionStatus,
   interruptOf: claudeInterruptOf,
+  phaseSuperseded,
   CLAUDE_IDLE_GRACE_MS,
   // 当前模型（读 transcript 补，hook payload 无 model 字段）
   selectedModelOf,
