@@ -457,6 +457,54 @@ function phaseSuperseded(j, sp, slack = 1_000) {
   return iv.hit && (!iv.at || iv.at + slack >= Number(sp.ts || 0));
 }
 
+/* ============================================================== hook 事件（服务端落盘解析） */
+
+/**
+ * 服务端读 Claude 的 JSONL transcript，取这一轮（最后一条 user 之后）的 AI 回复。
+ * 与 hookCommon.jsonlReplies 同口径（Claude/Codex 同款 JSONL）；保留导出名以兼容历史引用。
+ * @param {string} transcriptPath
+ * @returns {Array<{id: string, text: string}>}
+ */
+function readClaudeReplies(transcriptPath) {
+  return jsonlReplies(transcriptPath);
+}
+
+/**
+ * 服务端 hook 事件处理（CLI hook 转发来的原始事件）。
+ *
+ * 落盘解析全归服务端：本文件只提供 Claude 的"落盘差异"（回复解析 / 打断检测 / 形态判定），
+ * 事件开关与文件/token/ghost 等公共逻辑全部委托 hookCommon.runHookEvent。会话状态由 dispatcher
+ * 按 sessionId 持有（替代 hook 的 state 文件）。
+ */
+const { runHookEvent, jsonlReplies, headJsonLines } = require('./ingest/hookCommon');
+
+/** Claude 这一轮的形态（cli / plugin）：读 transcript 头部的 entrypoint */
+function claudeForm(transcriptPath) {
+  for (const obj of headJsonLines(transcriptPath)) {
+    const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
+    if (!ep) continue;
+    if (ep === 'claude-vscode') return 'plugin';
+    return ep === 'cli' ? 'cli' : '';
+  }
+  return '';
+}
+
+/** Claude 的落盘差异：其余逻辑都在 hookCommon.runHookEvent */
+const claudeImpl = {
+  client: 'claude',
+  coarse: false,
+  hasPermissionEvent: true,
+  awaitingPermission: (ev) => String((ev && ev.notification_type) || '') === 'permission_prompt',
+  hasSubagentStart: false,
+  repliesOf: readClaudeReplies,
+  filesSince: () => [],
+  interruptedSince: (tp, since) => claudeInterruptTail(tp, since || 0).interrupted,
+  formOf: (tp) => claudeForm(tp),
+};
+async function handleHookEvent(ev, ctx) {
+  return runHookEvent(ev, ctx, claudeImpl);
+}
+
 module.exports = { 
   id: '4F', 
   meta, 
@@ -470,8 +518,13 @@ module.exports = {
   CLAUDE_IDLE_GRACE_MS,
   // 当前模型（读 transcript 补，hook payload 无 model 字段）
   selectedModelOf,
+  // 形态判定（cli / plugin）
+  claudeForm,
   // 取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Claude/Qoder 专属逻辑）
   synthMarks,
+  // 服务端 hook 事件处理（落盘解析归服务端）：Claude 通过 hookCommon.runHookEvent 派发
+  handleHookEvent,
+  readClaudeReplies,
 };
 
 /**

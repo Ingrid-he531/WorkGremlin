@@ -28,4 +28,22 @@ const meta = {
   cliBinDirs: [path.join(HOME, '.workbuddy', 'bin')],
 };
 
-module.exports = { id: '2F', meta };
+const { runHookEvent, jsonlReplies, codebuddyReplies, turnInterrupted } = require('./ingest/hookCommon');
+
+/** WorkBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+const workbuddyImpl = {
+  client: 'workbuddy',
+  coarse: false,
+  hasPermissionEvent: false,
+  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
+  hasSubagentStart: false,
+  repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
+  interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  formOf: () => '',
+};
+
+async function handleHookEvent(ev, ctx) {
+  return runHookEvent(ev, ctx, workbuddyImpl);
+}
+
+module.exports = { id: '2F', meta, handleHookEvent };

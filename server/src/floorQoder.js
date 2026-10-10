@@ -730,6 +730,24 @@ function lingmaHandler(p, src, ctx) {
 
 const kindHandlers = { lingma: lingmaHandler };
 
+const { runHookEvent, jsonlReplies, codebuddyReplies, qoderForm, turnInterrupted } = require('./ingest/hookCommon');
+
+/** Qoder 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+const qoderImpl = {
+  client: 'qoder',
+  coarse: false,
+  hasPermissionEvent: false,
+  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
+  hasSubagentStart: false,
+  repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
+  interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  formOf: (tp) => qoderForm(tp),
+};
+
+async function handleHookEvent(ev, ctx) {
+  return runHookEvent(ev, ctx, qoderImpl);
+}
+
 module.exports = {
   // 6F Qoder
   id: '6F',
@@ -759,4 +777,6 @@ module.exports = {
   readPhase: readLingmaPhase,
   readDone: readLingmaDone,
   syncTasks: syncQoderPluginTasks,
+  // 服务端 hook 事件处理（落盘解析归服务端）
+  handleHookEvent,
 };

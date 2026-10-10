@@ -57,7 +57,6 @@ import path from "node:path"
  */
 import { createRequire } from "node:module"
 const require_ = createRequire(import.meta.url)
-const ghostFeed = require_("../ghostFeed.js")
 
 /* ------------------------------ 上报身份 ------------------------------ */
 
@@ -883,7 +882,7 @@ function createIngestPlugin(options, { location, base } = {}) {
           const files = steppedOf(sid, ws)
           endTask(event, sid, "done", result || titles.get(sid) || "")
           // 收工扫场：带 result 的"待汇报"保留给服务端的汇报动画
-          ghostFeed.sweepGhosts(ws, client, { all: false }, sid)
+          post("/ghost", { action: "sweep", all: false, workspacePath: ws, client, sessionId: sid })
           report(event, "done", {
             action: "",
             done: {
@@ -965,10 +964,20 @@ function createIngestPlugin(options, { location, base } = {}) {
           }
           // 台账：只报**写类**工具（读类不报 —— 读了不留改动痕迹，报上去只是噪声）
           if (sid && opOfTool(part.tool) === "write" && status !== "pending") touchFile(sid, target, wsOf(event))
-          // 召唤 subagent（task 工具）时飘一只小幽灵
+          // 召唤 subagent（task 工具）时飘一只小幽灵（统一走服务端 /ghost，由 hookCommon 写清单）
           if (sid && isSubagentTool(part.tool) && status !== "pending") {
             const sa = subagentOf(input)
-            ghostFeed.addGhost(wsOf(event), sa.name, sa.task, String(part.callID || ""), taskIds.get(sid) || "", "", client, sid)
+            post("/ghost", {
+              action: "spawn",
+              workspacePath: wsOf(event),
+              name: sa.name,
+              task: sa.task,
+              id: String(part.callID || ""),
+              parent: taskIds.get(sid) || "",
+              model: "",
+              client,
+              sessionId: sid,
+            })
           }
           if (status === "pending") {
             // Kilo 的 tool 状态实测有 pending —— 这就是「等待授权」，
@@ -1036,7 +1045,7 @@ function createIngestPlugin(options, { location, base } = {}) {
           cancelledAt.set(sid, Date.now())
           endTask(event, sid, "cancelled", result)
           assistantText.delete(sid)
-          ghostFeed.sweepGhosts(ws, client, { all: true }, sid)
+          post("/ghost", { action: "sweep", all: true, workspacePath: ws, client, sessionId: sid })
           report(event, "idle", {
             done: {
               at: Date.now(),

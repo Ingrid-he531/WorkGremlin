@@ -49,4 +49,22 @@ const meta = {
   },
 };
 
-module.exports = { id: '3F', meta, RE_CODEX_HOST };
+const { runHookEvent, jsonlReplies, codexForm, turnInterrupted } = require('./ingest/hookCommon');
+
+/** Codex 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+const codexImpl = {
+  client: 'codex',
+  coarse: false,
+  hasPermissionEvent: true, // Codex 有独立的 PermissionRequest 事件
+  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"（idle 已在前面处理）
+  hasSubagentStart: true, // Codex 发 SubagentStart / SubagentStop
+  repliesOf: jsonlReplies,
+  interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  formOf: (tp) => codexForm(tp),
+};
+
+async function handleHookEvent(ev, ctx) {
+  return runHookEvent(ev, ctx, codexImpl);
+}
+
+module.exports = { id: '3F', meta, RE_CODEX_HOST, handleHookEvent };

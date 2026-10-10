@@ -159,7 +159,7 @@ function createServer(opts = {}) {
 
   // 上报与查询需要 token；health 不需要（供 Electron 做存活探测）
   app.use('/api/v1', requireToken(token), createQueryRouter({ bus, repo }));
-  app.use('/api/v1', requireToken(token), createIngestRouter({ bus }));
+  app.use('/api/v1', requireToken(token), createIngestRouter({ bus, repo }));
 
   /** 工程（"打开工程"）：一个 workspace 一个工程，切换即换屋里显示的那批成员 */
   const workspace = createWorkspaceManager({

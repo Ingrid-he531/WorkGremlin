@@ -8,12 +8,18 @@
 const express = require('express');
 const { ERROR_CODES } = require('@workgremlin/shared');
 
+const { createHookDispatch } = require('../../ingest/hookDispatch');
+const { addGhost, retireGhost, sweepGhosts } = require('../../ingest/hookCommon');
+
 /**
- * @param {{bus: any}} ctx
+ * @param {{bus: any, repo?: any}} ctx
  */
-function createIngestRouter({ bus }) {
+function createIngestRouter({ bus, repo }) {
   const router = express.Router();
   router.use(express.json({ limit: '2mb' }));
+
+  // 服务端 hook 事件分发：CLI hook 退化成事件转发器后，落盘解析 / 会话状态 / 台账写入都在这里。
+  const hookDispatch = createHookDispatch();
 
   const wrap = (fn) => (req, res) => {
     try {
@@ -87,6 +93,49 @@ function createIngestRouter({ bus }) {
 
   // 工具使用：一轮任务里某个工具又用了一次（任务详情的「工具使用」按 (taskId, tool) 累加）
   router.post('/tool/use', projectFirst((b) => (b.memberId ? bus.toolUse(b) : { ok: false, error: 'missing memberId' })));
+
+  /* subagent 幽灵（临时成员）写入：原本 IDE 插件直接写 <工程>/.workgremlin/subagents.json，
+     现在统一收口到服务端 hookCommon（与 CLI hook 路径同一份实现），避免两边各写一份 JSON
+     结构再分叉（见 ghostFeed 历史）。动作：spawn（召唤飘幽灵）/ finish（改待汇报）/
+     sweep（清本会话幽灵）。归属以 workspacePath 为准，client 用来认领/隔离。 */
+  router.post('/ghost', projectFirst((b) => {
+    const ws = String(b.workspacePath || '');
+    const client = String(b.client || '');
+    const session = String(b.sessionId || b.session || '');
+    const action = String(b.action || '');
+    if (action === 'spawn') {
+      addGhost(ws, String(b.name || 'subagent'), String(b.task || ''), String(b.id || ''), String(b.parent || ''), String(b.model || ''), client, session);
+      return { ok: true, action: 'spawn' };
+    }
+    if (action === 'finish') {
+      retireGhost(ws, String(b.name || ''), String(b.id || ''), String(b.result || ''), client, session);
+      return { ok: true, action: 'finish' };
+    }
+    if (action === 'sweep') {
+      sweepGhosts(ws, client, { all: b.all === true }, session);
+      return { ok: true, action: 'sweep' };
+    }
+    return { ok: false, error: 'unknown_action' };
+  }));
+
+  /* CLI hook 转发来的原始事件：不再拆成语义路由，直接丢给服务端分发器，
+     由对应楼层的 handleHookEvent 读落盘、写台账。project 以 workspacePath（cwd）归真，
+     没带工程时回落到「办公室当前打开的工程」。 */
+  router.post('/hook', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const ws = body.workspacePath || '';
+      const project = bus.projectForReport(body.project || '', ws);
+      if (!project) {
+        return res.status(400).json({ ok: false, error: { code: ERROR_CODES.BAD_PAYLOAD, message: 'missing project' } });
+      }
+      bus.ensureProject(project, ws, body.mainConversationId || null, 'report');
+      const result = await hookDispatch.dispatch({ ...body, project }, { project, workspacePath: ws, bus, repo });
+      return res.json({ ok: true, ...(result || {}) });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: { code: ERROR_CODES.INTERNAL, message: String((err && err.message) || err) } });
+    }
+  });
 
   return router;
 }

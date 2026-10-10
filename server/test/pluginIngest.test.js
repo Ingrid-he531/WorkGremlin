@@ -233,9 +233,9 @@ await fire(part({ id: 'prt_4', type: 'tool', tool: 'read', callID: 'c0', state: 
 }
 await fire(part({ id: 'prt_5', type: 'tool', tool: 'task', callID: 'c2', state: { status: 'running', input: { subagent_type: 'leo', description: '顺手看一眼' } } }));
 {
-  const g = readFeed().agents.find((a) => a.id === 'c2');
-  ok('task 工具召唤 → 飘起一只小幽灵', Boolean(g), JSON.stringify(readFeed().agents));
-  ok('幽灵带 client / sessionId / ts', g && g.client === 'kilo' && g.sessionId === SID && g.ts > 0, g && JSON.stringify(g));
+  const g = lastFor('/api/v1/ghost');
+  ok('task 工具召唤 → 发 /ghost spawn（统一走服务端，不再本地写文件）', g && g.body && g.body.action === 'spawn', JSON.stringify(seen.filter((s) => s.route === '/api/v1/ghost').map((s) => s.body)));
+  ok('幽灵请求带 client / sessionId / id / name', g && g.body.client === 'kilo' && g.body.sessionId === SID && g.body.id === 'c2' && g.body.name === 'leo', g && JSON.stringify(g.body));
 }
 // assistant 的 text part 要带 **assistant 那条 message 的 id**：角色是从 message.updated 记下来的，
 // 挂错 messageID 就会被当成用户的话、又开一个任务
@@ -304,7 +304,7 @@ await fire(ev('session.idle', {}));
   ok('取消标记是刚落的（at 在 3s 内）', Boolean(st && st.done && Date.now() - st.done.at < 3000), st && JSON.stringify(st.done));
   ok('取消标记也带上这一轮的输出（said）', Boolean(st && st.done && st.done.said === '改到一半就被掐了'), st && JSON.stringify(st.done && st.done.said));
   ok('取消标记带本轮改动文件清单（没有就是空数组，UI 显示「没有输出」）', Boolean(st && st.done && Array.isArray(st.done.files)), st && JSON.stringify(st.done && st.done.files));
-  ok('扫场：这一轮召唤的幽灵收掉了', !readFeed().agents.find((a) => a.id === 'c2'), JSON.stringify(readFeed().agents));
+  ok('扫场：收工发了 /ghost sweep（服务端负责清本会话幽灵）', seen.some((s) => s.route === '/api/v1/ghost' && s.body && s.body.action === 'sweep' && s.body.all === true && s.body.sessionId === SID && s.body.client === 'kilo'), JSON.stringify(seen.filter((s) => s.route === '/api/v1/ghost').map((s) => s.body)));
 
   // 打断后紧跟着一条迟到的 finish=stop：不许把红色「任务取消」盖成绿色「任务完成」
   await fire(msg({ id: 'msg_6b', role: 'assistant', finish: 'stop', time: { created: Date.now(), completed: Date.now() } }));

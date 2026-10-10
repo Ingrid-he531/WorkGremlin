@@ -173,6 +173,24 @@ function phaseSuperseded(j, sp, slack = 1_000) {
   return !!at && at + slack >= Number(sp.ts || 0);
 }
 
+const { runHookEvent, jsonlReplies, codebuddyReplies, turnInterrupted } = require('./ingest/hookCommon');
+
+/** CodeBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+const codebuddyImpl = {
+  client: 'codebuddy',
+  coarse: false,
+  hasPermissionEvent: false,
+  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
+  hasSubagentStart: false,
+  repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
+  interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  formOf: () => '',
+};
+
+async function handleHookEvent(ev, ctx) {
+  return runHookEvent(ev, ctx, codebuddyImpl);
+}
+
 module.exports = {
   id: '1F',
   meta,
@@ -184,6 +202,8 @@ module.exports = {
   allCancels: allCodebuddyCancels,
   // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 CodeBuddy 专属逻辑）
   synthMarks,
+  // 服务端 hook 事件处理（落盘解析归服务端）
+  handleHookEvent,
 };
 
 /**
