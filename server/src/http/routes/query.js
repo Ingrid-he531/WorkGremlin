@@ -224,6 +224,9 @@ function createQueryRouter({ bus, repo }) {
 
     const items = rows.map((r) => ({
       ...r,
+      // 注册身份（agent 基名，如 codebuddy / kilo）—— 前端按它归楼层、显示「客户端」，
+      // 与落盘的 client/form（形态：vscode / cli）区分开。DB 列是 member_id，这里转 camelCase。
+      memberId: r.member_id,
       duration_ms: r.ended_at && r.started_at ? r.ended_at - r.started_at : null,
       subagentCount: repo.countSubagentRuns.get(r.id).c,
       /**
@@ -291,7 +294,7 @@ function createQueryRouter({ bus, repo }) {
 
     const items = repo.raw
       .prepare(
-        `SELECT t.id, t.project_id, t.title, t.started_at, t.ended_at,
+        `SELECT t.id, t.project_id, t.member_id AS memberId, t.title, t.started_at, t.ended_at,
                 COALESCE(tr.client, m.client) AS client,
                 CASE WHEN t.state = 'running' AND NOT ${ALIVE} THEN 'cancelled' ELSE t.state END AS state
            FROM tasks t
