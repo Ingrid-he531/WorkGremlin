@@ -54,15 +54,17 @@ sessionsMod.listSessions = (opts = {}) => {
   lastScanOpts = opts;
   return scanReal ? realListSessions(opts) : { sessions: copilotRows };
 };
-sessionsMod.copilotCurrentModel = () => 'GPT-5 mini';
 kiloMod.listKiloSessions = () => kiloRows;
 // 7F 是「每一轮一条」：会话行上挂 `rounds`（形状同 kilo.js 的 readKiloRounds）
 kiloMod.readKiloRounds = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).rounds || []);
 opencodeMod.listOpencodeSessions = () => opencodeRows;
 opencodeMod.readOpencodeTurns = (sid) => ((opencodeRows.find((r) => r.id === sid) || {}).turns || []);
 
-const { syncCopilotTasks } = require('../src/copilot');
+const copilotMod = require('../src/copilot');
+const { syncCopilotTasks } = copilotMod;
 const { syncKiloTasks } = require('../src/kilo');
+// Copilot 的模型来自 VS Code state.vscdb，测试把它换成熟桩（见 copilot.js 的 syncCopilotTasks）
+copilotMod.copilotCurrentModel = () => 'GPT-5 mini';
 const { syncOpencodeTasks } = require('../src/opencode');
 
 let pass = 0;

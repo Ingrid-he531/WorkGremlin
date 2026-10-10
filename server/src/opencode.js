@@ -978,7 +978,9 @@ function turnIndexOf(taskId, prefix) {
  * @returns {number} 本次同步写/改了几条任务
  */
 function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
-  const sessions = listOpencodeSessions();
+  // 经 module.exports 解析数据源：测试把 listOpencodeSessions / readOpencodeTurns 换成熟数据桩，
+  // 这条同步器照样可端到端自检（见 test/taskSync.test.js）。生产里指向读 OpenCode 落盘的真函数，行为不变。
+  const sessions = module.exports.listOpencodeSessions();
   if (!sessions.length) return 0;
 
   const now = nowFn();
@@ -988,7 +990,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   const turnsOf = new Map();
   const runsOf = new Map();
   for (const s of sessions) {
-    turnsOf.set(s.id, readOpencodeTurns(s.id));
+    turnsOf.set(s.id, module.exports.readOpencodeTurns(s.id));
     runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
   }
   /** 这条会话现在算不算在跑（还有一轮没收工） */

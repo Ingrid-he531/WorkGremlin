@@ -10,7 +10,7 @@
  * 中间一个工具事件都没有）。宁可这种轮暂时停在旧相位（相位新鲜期到了会回落待命），也不误报取消。
  *
  * 真正"用户按了停止"的信号只认 Claude / Qoder 那两个（transcript 尾部的打断标记、
- * Claude 自己那份会话状态文件说 idle），见 server/src/sessions.js 的 claudeInterruptOf
+ * Claude 自己那份会话状态文件说 idle），见 server/src/sessions.js 的 claude.interruptOf
  * 与 server/test/claudeCancel.test.js。
  *
  * 本文件钉住的是"去掉"这件事：

@@ -798,7 +798,6 @@ module.exports = {
   meta,
   flushBackend,
   // 取消检测（原 traeCancel.js）
-  traeCancelAt,
   allCancels,
   allDoneHandlers,
   traeDoneStatus,
@@ -813,4 +812,83 @@ module.exports = {
   // 统一接口别名
   cancelAt: traeCancelAt,
   modelOf: selectedModelOf,
+  // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Trae 专属逻辑）
+  synthMarks,
 };
+
+/**
+ * 楼层特有的"完成/取消"标记合成，由 sessions.js 的 readReporterDones 统一派发。
+ * 公共代码里不写任何 TraeCode 专属逻辑：这里只认 Trae 自己的 renderer.log（DoneHandler / allCancels）。
+ *
+ * 为什么独立扫、不绑在 hook 状态文件的 `if (j.taskId)` 上：
+ *   · Trae 取消时 Stop hook 不触发，唯一权威信号是 renderer.log。
+ *   · hook 状态文件"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt；
+ *     绑在 startedAt 上会让"上一轮取消 → 新一轮启动"窗口一过的旧取消信号被过滤掉。
+ *   · 渲染层用 "phase.ts vs done.at 谁更新" 决定显示，done.at 旧但 phase.ts 新 → 新一轮覆盖 cancelled，
+ *     不会误亮红灯，所以无需 smart 过滤。
+ *
+ * @param {object} ctx
+ *   { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession }
+ */
+function synthMarks(ctx) {
+  const { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession } = ctx;
+  // ── 先扫 DoneHandler（最终状态真相）──
+  // completed → 合成正常完成标记（cancelled:false，覆盖可能存在的 cancelled:true）
+  // canceled  → 合成取消标记（同 synthCancel）
+  const handlers = allDoneHandlers();
+  for (const h of handlers) {
+    const sid = h.sessionId;
+    if (!sid || !h.at) continue;
+    const hook = hookBySid.get(sid);
+    const j = hook ? hook.j : null;
+    const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
+    if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
+    if (j && client && !clientHit(client, j.client)) continue;
+    if (h.status === 'completed') {
+      // DoneHandler completed → 正常完成标记（cancelled:false），覆盖 bySession 里已有的 cancelled:true；
+      // 只在 DoneHandler at 更大时覆盖 —— completed 信号本应比取消信号晚到。
+      synthDone({
+        id: sid,
+        ws: hookWs || workspacePath || '',
+        at: h.at,
+        title: (j && j.taskTitle) || '',
+        files: [],
+      });
+    } else {
+      // DoneHandler canceled → 同 synthCancel；已有同取消（±5s 容差）则跳过，避免重复合成
+      const existing = bySession.get(sid);
+      if (existing && existing.cancelled && Math.abs(Number(existing.at) - h.at) < 5_000) continue;
+      synthCancel({
+        id: sid,
+        j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
+        ws: hookWs || workspacePath || '',
+        at: h.at,
+        files: j ? roundFilesOf(j) : [],
+      });
+    }
+  }
+
+  // ── 再扫 allCancels（更早的取消信号，作补充）──
+  // DoneHandler 已给该会话写 mark → 跳过（DoneHandler 更权威）
+  const traeCancels = allCancels();
+  const traeSids = Object.keys(traeCancels || {});
+  if (traeSids.length) {
+    for (const sid of traeSids) {
+      const atC = Number(traeCancels[sid]) || 0;
+      if (!atC) continue;
+      if (bySession.has(sid)) continue;
+      const hook = hookBySid.get(sid);
+      const j = hook ? hook.j : null;
+      const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
+      if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
+      if (j && client && !clientHit(client, j.client)) continue;
+      synthCancel({
+        id: sid,
+        j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
+        ws: hookWs || workspacePath || '',
+        at: atC,
+        files: j ? roundFilesOf(j) : [],
+      });
+    }
+  }
+}

@@ -573,7 +573,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         form: normForm(p.form),
         // hook payload 里没有模型字段的产品（TraeCode 六个事件都不带、Claude Code 除
         // SessionStart 外也都不带），为空时按会话去**各自的落盘**里取当前模型
-        // （见 sessions.sessionModel：traeModels / claudeModels 两个适配器）。
+        // （见 sessions.sessionModel：trae / claude 两个适配器）。
         // 取不到就是空 —— 报表的"模型"列留空，不拿默认模型冒充。
         model: normModel(p.model) || sessionModel(client0, p.sessionId) || null,
         title: p.title || '(未命名任务)',
@@ -623,7 +623,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    * 为什么必须服务端自己补：CodeBuddy **插件**（IDE 形态）按停止时**一个 hook 事件都不发**
    * （CLI 那条 FinalStop 在 IDE 形态等不到），而 hook 的状态文件是**一会话一份**的 ——
    * 新一轮的 /task/start 会把 taskId / taskStartedAt 整份覆盖，上一轮从此连兜底扫描
-   * （readReporterDones → codebuddyPauseCancelAt）都够不着，那一行就永远挂在「进行中」：
+   * （readReporterDones → codebuddy.cancelAt）都够不着，那一行就永远挂在「进行中」：
    * 用户看到的就是"取消了任务，屏上还是进行中，主控制台却已经待命中"。
    *
    * 状态用 cancelled：真正常收工的产品会发 Stop / FinalStop（那是 done），走到这里说明

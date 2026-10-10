@@ -30,7 +30,7 @@ fs.mkdirSync(path.join(HOME, 'hooks'), { recursive: true });
 process.env.WORKGREMLIN_HOME = HOME;
 /**
  * Claude Code 的**会话状态文件**根：`<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`。
- * 「刚提交、一个字都没吐就 ESC」这一种 transcript 一行都不写，只有它能判（见 claudeInterruptOf）。
+ * 「刚提交、一个字都没吐就 ESC」这一种 transcript 一行都不写，只有它能判（见 claude.interruptOf）。
  */
 const CLAUDE_DIR = path.join(TMP, 'claude');
 fs.mkdirSync(path.join(CLAUDE_DIR, 'sessions'), { recursive: true });

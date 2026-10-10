@@ -34,99 +34,35 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('path');
-const { resolveProjectName } = require('./project');
 const { clientBase } = require('@workgremlin/shared');
-// 两个适配器同名导出（selectedModelOf），这里必须改名 —— 否则后一个静默盖掉前一个，
-// 就会正好造出"某一层取不到模型"这个本次要修的 bug。
-const { selectedModelOf: traeModelOf } = require('./trae');
-const { selectedModelOf: claudeModelOf } = require('./claudeModels');
-// TraeCode 取消检测（renderer.log 里 DoneHandler status:"canceled" 等标记）
-// + DoneHandler 最终状态（completed|canceled）—— readReporterDones 用它合成正常完成标记
-const { traeCancelAt, allCancels, allDoneHandlers } = require('./trae');
-// Claude 的配置根（认 CLAUDE_CONFIG_DIR）只留在 products.js 那一处定义，这里复用，别另写一份
-const { claudeHome } = require('./claude');
+// 楼层能力模块（module group）：每个楼层（trae / claude / codebuddy / copilot）实现同一份
+// "会话能力"接口，sessions.js 一律用 `楼层.能力` 成员访问。新增楼层 = 在 FLOORS 里加一行
+// require + 在该 floor 模块里实现需要的几个能力，调用点不用改。
+//   selectedModelOf(sessionId, agentType)  当前模型（hook payload 无 model 字段的楼层才有）
+//   cancelAt(sessionId, sinceTs)           这一轮被取消的时刻（0 = 未取消）
+//   allCancels()                           全量取消扫描 → { [sessionId]: 时刻 }
+//   allDoneHandlers()                      DoneHandler 终态（trae 特有）
+//   interruptOf(j, startedAt)              打断检测（claude / qoder）
+//   interruptTail(path, sinceTs)
+//   sessionStatus(sessionId)
+const trae = require('./trae');
+const claude = require('./claude');
+const codebuddy = require('./codebuddy');
+const copilot = require('./copilot');
+// 插件结构化落盘读取器（genie-history / todos / message-queue / file-changes / Copilot SQLite）：
+// 所有 plugin kind 的取数都收口在 plugin.js，本文件只负责把这些落盘 + reporter 状态文件
+// 综合成会话行，不再掺和插件的内部目录结构。
+const plugin = require('./plugin');
+
+const FLOORS = { trae, claude, codebuddy, copilot };
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
 
-/** 插件目录名（腾讯 Coding Copilot、GitHub Copilot、别名兜底） */
-const PLUGIN_RE = [/coding-copilot/i, /github\.copilot/i, /github-copilot/i, /^codebuddy/i, /^tencent/i, /^ingram/i, /^copilot/i];
+// 落盘窗口常量（与 CLI 楼层对齐）定义在 plugin.js，sessions.js / copilot.js 共用同一份，避免各定义一遍
+const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
 
-/** GitHub Copilot 的真实会话落盘是 SQLite `session-store.db`，不是 genie-history 目录。 */
-function readSqliteSessionRows(storage) {
-  const dbFile = path.join(storage, 'session-store.db');
-  if (!isFile(dbFile)) return [];
-  try {
-    const Database = require('better-sqlite3');
-    const db = new Database(dbFile, { readonly: true, fileMustExist: true });
-    try {
-      const cols = db.prepare('PRAGMA table_info(sessions)').all().map((c) => String(c.name || '').trim());
-      if (!cols.length) return [];
-      const idCol = cols.includes('id') ? 'id' : cols[0];
-      const cwdCol = cols.includes('cwd') ? 'cwd' : cols.includes('current_directory') ? 'current_directory' : '';
-      const repoCol = cols.includes('repository') ? 'repository' : cols.includes('repo') ? 'repo' : '';
-      const updatedCol = ['updated_at', 'last_updated', 'created_at', 'modified_at'].find((name) => cols.includes(name)) || '';
-      const summaryCol = cols.includes('summary') ? 'summary' : '';
-      const selectCols = [idCol, cwdCol, repoCol, updatedCol, summaryCol].filter(Boolean);
-      if (!selectCols.length) return [];
-      const query = `SELECT ${selectCols.join(', ')} FROM sessions WHERE ${idCol} IS NOT NULL AND TRIM(${idCol}) <> '' ${updatedCol ? `ORDER BY datetime(${updatedCol}) DESC` : ''}`;
-      const rows = db.prepare(query).all();
 
-      // turns 表：取每个会话的 turn 数 + 最后一条 user_message（作任务标题/提示语兜底）。
-      // session_files 表：取每个会话碰过的文件路径 + 工具名（作文件改动清单）。
-      // 两张表不一定在（Copilot 版本可能变），查不到就回空，不冒泡。
-      const turnsBySid = C.readCopilotTurns(db);
-      const filesBySid = C.readCopilotFiles(db);
-      // 「这一轮在不在飞」的旁证（VS Code 的 chat 索引，见 readCopilotChatIndex）
-      const chatBySid = C.readCopilotChatIndex();
-
-      return rows
-        .map((row) => {
-          const id = String(row[idCol] || '').trim();
-          if (!id) return null;
-          const cwd = cwdCol ? String(row[cwdCol] || '').trim() : '';
-          const projectPath = cwd || '';
-          const project = resolveProjectName(projectPath) || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
-          const ts = updatedCol ? row[updatedCol] : null;
-          // 拿不到真实时间戳 → lastUpdated=0，让下游 freshness 检查正确判过期（idle），
-          // 不要用 Date.now() 冒充 —— 一冒充就永远"新鲜"，相位卡死在 thinking。
-          const lastUpdated = ts ? (Number(new Date(ts).getTime()) || 0) : 0;
-          const summary = summaryCol ? String(row[summaryCol] || '').trim() : '';
-          const t = turnsBySid.get(id) || {};
-          const rawFiles = filesBySid.get(id) || [];
-          // session_files 存的是绝对路径，其他 agent 都用相对路径 —— 统一成相对路径
-          const files = rawFiles.map((f) => ({
-            ...f,
-            path: projectPath && f.path ? path.relative(projectPath, f.path) || f.path : f.path,
-          }));
-          return {
-            id,
-            project,
-            projectPath,
-            lastUpdated,
-            summary,
-            turnCount: t.turnCount || 0,
-            lastUserMessage: t.lastUserMessage || '',
-            hasPendingTurn: t.hasPendingTurn || false,
-            files,
-            turns: Array.isArray(t.turns) ? t.turns : [],
-            chat: chatBySid.get(id) || null,
-            // 最新那一轮请求（VS Code 会话日志）：在不在飞 + 用户原话 + 起止时间
-            live: C.readCopilotLiveRequest(id),
-          };
-        })
-        .filter(Boolean);
-    } finally {
-      db.close();
-    }
-  } catch {
-    return [];
-  }
-}
-
-/* → copilot.js */
-
-/* → copilot.js */
 
 /**
  * 插件落盘这一路的来源客户端：**按楼层传入**，不再写死。
@@ -137,14 +73,7 @@ function readSqliteSessionRows(storage) {
  * 合并楼层（1F CodeBuddy）另有一路 CLI 身份：见下面的 clientHit —— 它可以一次收一串 client。
  */
 
-/**
- * 老状态文件（引入 client 字段之前写的）没有 client —— 那时只有 CodeBuddy 家族在写，
- * 所以这类文件按 codebuddy（CLI）归属。新文件一律带 client，不会走到这个兜底。
- * 注意：这只是历史兼容，绝不能当"默认客户端"用——client 必须显式传入。
- */
-const LEGACY_STATE_CLIENT = 'codebuddy';
-
-/**
+ /**
  * 楼层身份匹配（轴 1 的过滤口径，全文件只此一处）。
  *
  * want 既可以是**单个 client**（如 'codebuddy-plugin'），也可以是**逗号分隔的一串** ——
@@ -157,6 +86,9 @@ const LEGACY_STATE_CLIENT = 'codebuddy';
  * @param {string} want 楼层要求的 client（单个，或逗号分隔多个）；空 = 不限
  * @param {string} got 状态文件里的 client
  */
+/** 老状态文件没有 client 字段时，按其 CLI 形态归属到 codebuddy（见 clientHit）。 */
+const LEGACY_STATE_CLIENT = 'codebuddy';
+
 function clientHit(want, got) {
   if (!want) return true;
   const set = String(want)
@@ -180,49 +112,10 @@ let cache = { at: 0, key: '', value: null };
  */
 const SERVER_STARTED_AT = Date.now();
 
-/** 多久没动静算"不活跃"（插件 runtime 没有心跳，只能用文件时间） */
-const IDLE_MS = 10 * 60_000;
-/* → copilot.js */
-/** 文件改动在这么久之内 → 认为正在动手 */
-const BUSY_MS = 90_000;
-/** 落盘在这么久之内 → 认为这一轮对话还在推进（含纯推理、只读工具等拿不到文件/待办证据的情况） */
-const FRESH_MS = 2 * 60_000;
-/**
- * 会话"还在下拉里"的窗口 —— 与 CLI 楼层对齐（sessionRegistry 的 TIMEOUT_MS = 60 分钟）。
- *
- * 为什么不再用 IDLE_MS(10 分钟) 当在列标准：IDE 里开着但十几分钟没敲字的会话会被整条剔除，
- * 而同样空闲的 CLI 会话（3F Codex）却还在列表里，两边口径不一致（实测：插件那路空、CLI 有 4 条）。
- * 现在 IDLE_MS 只用来判断"相位还热不热"（inferPhase），不再决定会话是否出现。
- */
-const LISTED_MS = 60 * 60_000;
-/**
- * 完成标记的"新鲜期"：只有这么久之内结束的才算"刚发生"，才会回给界面。
- *
- * 为什么必须有：done 是**持久状态**（为了让一次一进程的 `codex exec` 也能看到完成摘要，
- * 会话结束后不清它），于是页面/楼层一打开就可能读到上一轮（甚至几小时前）的完成标记，
- * 把历史当成新闻重播一遍（现象：一开 3F 就弹「任务完成 · 链路测试完成」）。
- * 渲染层也做了"首次只当基线"的防护，这里是第二道，而且对旧前端也生效。
- */
-const DONE_TTL_MS = 10 * 60_000;
+// 落盘窗口常量（IDLE_MS / BUSY_MS / FRESH_MS / LISTED_MS / DONE_TTL_MS）与 Copilot 共享，
+// 统一定义在 plugin.js，避免 sessions.js / copilot.js 各写一份。上面已由 `const { ... } = plugin` 引入。
 
 /* ------------------------------ 基础工具 ------------------------------ */
-
-function isDir(p) {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function isFile(p) {
-  try {
-    return fs.statSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
-
 function readJson(p) {
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -239,198 +132,9 @@ function readDir(p) {
   }
 }
 
-function mtime(p) {
-  try {
-    return Math.round(fs.statSync(p).mtimeMs);
-  } catch {
-    return 0;
-  }
-}
-
-/* ------------------------------ 定位插件落盘 ------------------------------ */
-
-/** 平台级应用数据根目录 */
-function dataRoots() {
-  const roots = [];
-  if (process.platform === 'darwin') {
-    roots.push(path.join(HOME, 'Library', 'Application Support'));
-  } else if (IS_WIN) {
-    if (process.env.APPDATA) roots.push(process.env.APPDATA);
-    if (process.env.LOCALAPPDATA) roots.push(process.env.LOCALAPPDATA);
-  } else {
-    roots.push(path.join(HOME, '.config'), path.join(HOME, '.local', 'share'));
-  }
-  return roots.filter(isDir);
-}
-
-/** 编辑器 globalStorage 目录（插件落盘的地方） */
-function globalStorageRoots() {
-  const out = [];
-  for (const r of dataRoots()) {
-    for (const ed of ['Code', 'Code - Insiders', 'Cursor', 'Trae', 'Windsurf', 'VSCodium']) {
-      const p = path.join(r, ed, 'User', 'globalStorage');
-      if (isDir(p)) out.push(p);
-    }
-  }
-  const srv = path.join(HOME, '.vscode-server', 'data', 'User', 'globalStorage');
-  if (isDir(srv)) out.push(srv);
-  return out;
-}
-
-/** 编辑器 workspaceStorage 目录（VS Code 按工作区存 state.vscdb 的地方） */
-function workspaceStorageRoots() {
-  const out = [];
-  for (const r of dataRoots()) {
-    for (const ed of ['Code', 'Code - Insiders', 'Cursor', 'Trae', 'Windsurf', 'VSCodium']) {
-      const p = path.join(r, ed, 'User', 'workspaceStorage');
-      if (isDir(p)) out.push(p);
-    }
-  }
-  const srv = path.join(HOME, '.vscode-server', 'data', 'User', 'workspaceStorage');
-  if (isDir(srv)) out.push(srv);
-  return out;
-}
-
-/* → copilot.js */
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/* → copilot.js */
-
-/** 插件目录名会带版本号，所以按名字前缀找；要求里面有会话相关子目录才算数 */
-function findPluginStorage(re = PLUGIN_RE) {
-  // 与 products.js 的 matchIn 保持一致：pluginRe 既可是正则数组，也可是单个正则（如 /trae/i）
-  const list = re instanceof RegExp ? [re] : re || [];
-  const marks = ['genie-history', 'todos', 'file-changes', 'message-queue', 'session-store.db'];
-  const priority = (name) => {
-    const n = String(name || '').toLowerCase();
-    if (/github\.copilot|github-copilot|^copilot/i.test(n)) return 0;
-    if (/coding-copilot|tencent|ingram|codebuddy/i.test(n)) return 1;
-    return 2;
-  };
-  for (const root of globalStorageRoots()) {
-    const names = [...readDir(root)].sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
-    for (const name of names) {
-      if (!list.some((rx) => rx.test(name))) continue;
-      const p = path.join(root, name);
-      const hasSessionStore = isFile(path.join(p, 'session-store.db'));
-      if (hasSessionStore || marks.some((m) => isDir(path.join(p, m)) || (m === 'session-store.db' ? isFile(path.join(p, m)) : false))) {
-        return p;
-      }
-    }
-  }
-  return '';
-}
-
-/** 目录名是工程路径的 base64；解不出来（不是路径）就返回空 */
-function decodeDirName(name) {
-  try {
-    const s = Buffer.from(String(name), 'base64').toString('utf8');
-    if (!s || s.includes('\u0000')) return '';
-    if (s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
-  } catch {
-    /* 不是 base64，跳过 */
-  }
-  return '';
-}
-
 /* ------------------------------ 会话数据 ------------------------------ */
 
-/** 每个会话的待办：total / done / doing（第一条 in_progress）/ 前几条的文案 */
-function readTodos(storage, id) {
-  const file = path.join(storage, 'todos', `${id}.json`);
-  const data = readJson(file);
-  const list = Array.isArray(data && data.todos) ? data.todos : [];
-  const doing = list.find((t) => t && t.status === 'in_progress') || null;
-  return {
-    total: list.length,
-    done: list.filter((t) => t && t.status === 'completed').length,
-    doing: doing ? String(doing.content || '') : '',
-    items: list.slice(0, 8).map((t) => ({
-      status: String((t && t.status) || 'pending'),
-      content: String((t && t.content) || '').replace(/\s+/g, ' ').trim(),
-    })),
-    at: mtime(file),
-  };
-}
-
-/** 文件当前字节大小（按绝对路径现 stat）。删除类改动的源文件已不存在 → null，绝不编造。 */
-function fileSizeOf(fp) {
-  if (!fp || typeof fp !== 'string') return null;
-  try {
-    const s = fs.statSync(fp);
-    return s.isFile() ? s.size : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 改动文件：按最后写入倒序取最近几个 */
-function readFileChanges(storage, id) {
-  const dir = path.join(storage, 'file-changes', id);
-  const out = [];
-  for (const name of readDir(dir)) {
-    if (!/\.json$/i.test(name)) continue;
-    const p = path.join(dir, name);
-    const j = readJson(p);
-    if (!j) continue;
-    out.push({
-      name: String(j.fileName || path.basename(String(j.filePath || name))),
-      op: String(j.changeType || ''),
-      added: Number(j.addedLines) || 0,
-      removed: Number(j.removedLines) || 0,
-      // 字节大小：文件本体（filePath 是绝对路径）现 stat。插件 / IDE 这份落盘只给行数、
-      // 不给体积，只能服务端现算；删除类改动的源文件已不在，算不到就留 null。
-      size: fileSizeOf(j.filePath),
-      at: mtime(p),
-    });
-  }
-  out.sort((a, b) => b.at - a.at);
-  return { count: out.length, recent: out.slice(0, 6), lastAt: out.length ? out[0].at : 0 };
-}
-
-/**
- * 消息队列里该会话的运行态 + 排队条数。
- * 一个 message-queue 文件里可能装着多个会话，全部扫一遍取自己的那份。
- */
-function readRuntime(storage, id) {
-  const dir = path.join(storage, 'message-queue');
-  let runtime = null;
-  let pending = 0;
-  let updatedAt = 0;
-  for (const name of readDir(dir)) {
-    if (!/\.json$/i.test(name)) continue;
-    const j = readJson(path.join(dir, name));
-    const conv = j && j.conversations ? j.conversations[id] : null;
-    if (!conv) continue;
-    if (conv.runtime) runtime = { ...(runtime || {}), ...conv.runtime };
-    for (const it of conv.items || []) if (it && it.status === 'pending') pending += 1;
-    updatedAt = Math.max(updatedAt, Number(conv.updatedAt) || 0, mtime(path.join(dir, name)));
-  }
-  return {
-    runtime: runtime || { activated: false, paused: false, awaitingSessionIdle: false },
-    pending,
-    hasRuntime: Boolean(runtime),
-    updatedAt,
-  };
-}
+/** 每个会话的待办 / 改动文件 / 消息队列运行态的读取收口在 plugin.js（plugin.readTodos / readFileChanges / readRuntime）。 */
 
 /**
  * CodeBuddy **插件（IDE 扩展）**的"用户按了停止"信号。
@@ -456,94 +160,6 @@ function readRuntime(storage, id) {
  * @param {string} sessionId
  * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）
  * @returns {number} 取消时刻（0 = 没有 / 判不出）
- */
-const _pauseCancelCache = new Map(); // path -> {m, size, data}
-function codebuddyPauseCancelAt(sessionId, sinceTs = 0) {
-  const sid = String(sessionId || '');
-  if (!sid) return 0;
-  let best = 0;
-  for (const root of globalStorageRoots()) {
-    for (const name of readDir(root)) {
-      if (!/coding-copilot|tencent|ingram|codebuddy/i.test(name)) continue;
-      const dir = path.join(root, name, 'message-queue');
-      for (const f of readDir(dir)) {
-        if (!/\.json$/i.test(f)) continue;
-        const p = path.join(dir, f);
-        let stat = null;
-        try {
-          stat = fs.statSync(p);
-        } catch {
-          continue;
-        }
-        const cached = _pauseCancelCache.get(p);
-        let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
-        if (!data) {
-          data = readJson(p);
-          _pauseCancelCache.set(p, { m: stat.mtimeMs, size: stat.size, data });
-        }
-        const conv = data && data.conversations ? data.conversations[sid] : null;
-        const rt = (conv && conv.runtime) || null;
-        if (!rt || !rt.paused) continue;
-        if (String(rt.pauseReason || '').toLowerCase() !== 'cancel') continue;
-        const at = Number(rt.updatedAt) || Number(conv.updatedAt) || 0;
-        if (!at) continue;
-        if (sinceTs && at < sinceTs) continue; // 老取消不能算到新一轮头上
-        if (at > best) best = at;
-      }
-    }
-  }
-  return best;
-}
-
-/**
- * 扫所有 CodeBuddy 插件 message-queue，汇总"被用户取消"的会话 → `{ [sessionId]: 取消时刻 }`。
- * 与 codebuddyPauseCancelAt 同口径（globalStorageRoots → message-queue → mtime+size 缓存），
- * 但**不做 sinceTs 过滤、按会话聚合全部取消**（像 Trae 的 allCancels）—— 因为本函数服务于
- * readReporterDones 里**独立于 hook 状态文件**的取消扫描：取消时插件不重写状态文件、甚至把
- * taskId 清空，再拿 startedAt 去卡就认不出取消。渲染层用 phase.ts vs done.at 自行决断显示，
- * 这里只管"这一轮被取消了"，不需要 smart 过滤。
- *
- * 不做扁平 TTL 缓存：直接按文件 mtime+size 增量（走 _pauseCancelCache），每次重新聚合。
- * message-queue 文件极少（同一窗口几个），重新聚合很便宜；扁平缓存会让"刚写入的取消"最多
- * 延迟一个 TTL 才被识别，反而拖慢了取消亮红灯。
- */
-function allCodebuddyCancels() {
-  const merged = {};
-  for (const root of globalStorageRoots()) {
-    for (const name of readDir(root)) {
-      if (!/coding-copilot|tencent|ingram|codebuddy/i.test(name)) continue;
-      const dir = path.join(root, name, 'message-queue');
-      for (const f of readDir(dir)) {
-        if (!/\.json$/i.test(f)) continue;
-        const p = path.join(dir, f);
-        let stat = null;
-        try {
-          stat = fs.statSync(p);
-        } catch {
-          continue;
-        }
-        const cached = _pauseCancelCache.get(p);
-        let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
-        if (!data) {
-          data = readJson(p);
-          _pauseCancelCache.set(p, { m: stat.mtimeMs, size: stat.size, data });
-        }
-        const convs = data && data.conversations ? data.conversations : null;
-        if (!convs) continue;
-        for (const sid of Object.keys(convs)) {
-          const c = convs[sid];
-          const rt = c && c.runtime;
-          if (!rt || !rt.paused) continue;
-          if (String(rt.pauseReason || '').toLowerCase() !== 'cancel') continue;
-          const at = Number(rt.updatedAt) || Number(c.updatedAt) || 0;
-          if (!at) continue;
-          if (!merged[sid] || at > merged[sid]) merged[sid] = at;
-        }
-      }
-    }
-  }
-  return merged;
-}
 
 /**
  * reporter hook 在"等权限"时会把要执行的工具 + 目标文件写进 ~/.workgremlin/hooks/<工位>.json
@@ -620,7 +236,7 @@ function reporterHookHome() {
 /**
  * 这条会话在用什么模型。
  * 各产品模型字段的取法不通用，所以一个产品一个适配器、都从**各自的落盘**里捞：
- * TraeCode 见 traeModels.selectedModelOf，Claude Code 见 claudeModels.selectedModelOf。
+ * TraeCode 见 trae.selectedModelOf，Claude Code 见 claude.selectedModelOf。
  * 两者都是因为 hook payload 里压根没有模型字段才只能读盘。
  * 其余产品（CodeBuddy / Codex）payload 里有，用不着适配器；真取不到就留空（绝不编造）。
  * 这里只做"按 client 分派适配器"这一件事，避免把某个产品的私有存储格式写死进通用读函数，
@@ -629,8 +245,12 @@ function reporterHookHome() {
  * @param {string} sessionId hook payload 的 session_id
  * @param {string} agentType hook payload 的 agent_type（已落盘）
  */
-/** client → 取"这条会话当前模型"的适配器表；没挂的照旧取不到 */
-const MODEL_SOURCES = { trae: traeModelOf, claude: claudeModelOf };
+/** client(基名) → 取"这条会话当前模型"的适配器；由各楼层的 selectedModelOf 自动汇总（见 FLOORS）。
+ *  没实现 selectedModelOf 的楼层（codebuddy / copilot）自然落空，照旧取不到。 */
+const MODEL_SOURCES = {};
+for (const [key, mod] of Object.entries(FLOORS)) {
+  if (typeof mod.selectedModelOf === 'function') MODEL_SOURCES[key] = mod.selectedModelOf;
+}
 function sessionModel(client, sessionId, agentType = '') {
   // 按**基名**查表：同一产品的插件/CLI 两种形态（trae-plugin / claude-plugin …）落盘是同一份，
   // 适配器也只认产品，不该因为客户端带了个后缀就取不到（适配器对不认识的会话 id 一律回空串，
@@ -638,8 +258,6 @@ function sessionModel(client, sessionId, agentType = '') {
   const fn = MODEL_SOURCES[clientBase(client)];
   return fn ? fn(sessionId, agentType) || '' : '';
 }
-
-/* → copilot.js */
 
 function readReporterPhase(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
@@ -668,7 +286,7 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
     if (sp.ts < SERVER_STARTED_AT) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
-    /* 用户按了"停止"、但**一个 hook 事件都不发**的产品（Claude Code / Qoder，见 claudeInterruptTail）：
+    /* 用户按了"停止"、但**一个 hook 事件都不发**的产品（Claude Code / Qoder，见 claude.interruptTail）：
        这口相位没人清 —— taskId 还占着、sp.ts 冻在被打断前最后一个事件那一刻，而服务端照
        新鲜期还能再认它 TASK_RUN_MS（2 分钟）。也就是说"取消标记"与"这口 stale 相位"有一整段
        重叠期：红色「任务取消」亮 10s 退回待命后，1.5s 快轮询又把这口相位喂回来，
@@ -677,26 +295,26 @@ function readReporterPhase(workspacePath, client = '', session = '') {
        （hook 那条路会写显式 idle，这里补的是"没有 hook 事件"那条路）。
        标记之后用户又发了一轮的话，UserPromptSubmit 写的相位 ts 更新 → 这里不再命中，按新相位走。 */
     if (j.taskId) {
-      // 打断成立（transcript 标记 / Claude 自己的会话状态说 idle，见 claudeInterruptOf）且打断时刻
+      // 打断成立（transcript 标记 / Claude 自己的会话状态说 idle，见 claude.interruptOf）且打断时刻
       // 不比这口相位旧 → 这口相位作废，不再喂给控制台（否则红灯亮完 10s 又被喂回来）。
-      const iv = claudeInterruptOf(j, Number(j.taskStartedAt) || 0);
+      const iv = claude.interruptOf(j, Number(j.taskStartedAt) || 0);
       if (iv.hit && (!iv.at || iv.at + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts))) continue;
       // CodeBuddy 插件同理：message-queue 里 pauseReason='cancel' 的那一刻比这口相位新 → 作废
       // （插件取消时一个 hook 事件都不发，相位会冻在「思考中 / 调用工具」）。
       if (!iv.hit && clientBase(j.client) === 'codebuddy') {
-        const atP = codebuddyPauseCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+        const atP = codebuddy.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
         if (atP && atP + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
       }
       // TraeCode 同理：renderer.log 里 DoneHandler 的 status:"canceled" 比这口相位新 → 作废
       // （TraeCode 取消时 Stop hook 不触发，相位冻在取消前那一口）。
       if (!iv.hit && clientBase(j.client) === 'trae') {
-        const atT = traeCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+        const atT = trae.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
         if (atT && atT + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts)) continue;
       }
     }
     if (!win || sp.ts > win.ts) {
       win = sp;
-      winClient = String(j.client || LEGACY_STATE_CLIENT);
+      winClient = String(j.client || '');
       // 同一份状态文件里的 pending：PreToolUse 写、PostToolUse 清掉；迟迟不清 = 工具被权限框卡住
       winPending = j.pending || null;
       // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
@@ -708,14 +326,13 @@ function readReporterPhase(workspacePath, client = '', session = '') {
       winModel = String(j.model || "") || sessionModel(winClient, j.sessionId, j.agentType);
     }
   }
-  if (!win) {
-    const sqlFallback = C.readCopilotPhaseFromSqlite(workspacePath, client, session);
-    if (sqlFallback) return sqlFallback;
-    return null;
-  }
+  // Copilot 9F 没有 reporter hook，相位不在这份状态文件里 —— 它的相位由 9F 自己的 readPhase
+  // 提供（见 reporterMainPhase 对 FLOORS[base].readPhase 的派发：copilot.readPhase = readCopilotPhaseFromSqlite）。
+  // 这里只负责有 hook 的产品；读不到就如实返回 null，绝不编造兜底。
+  if (!win) return null;
   return {
     // 这份相位是哪个客户端写的（Codex 有显式 PermissionRequest，不需要 pending 推断）
-    client: String(winClient || LEGACY_STATE_CLIENT).toLowerCase(),
+    client: String(winClient || ''),
     phase: String(win.phase || 'thinking'),
     tool: String(win.tool || ''),
     file: String(win.file || ''),
@@ -922,7 +539,12 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
 }
 
 function reporterMainPhase(workspacePath, client = '', session = '') {
-  const rp = readReporterPhase(workspacePath, client, session);
+  // 各楼层（尤其是 9F Copilot，没有 reporter hook）可自己实现 readPhase 来提供相位；
+  // 没实现的（带 hook 的产品）退回通用的 readReporterPhase。相位职责按楼层派发，不把兜底塞进 generic 里。
+  const base = clientBase(client);
+  const floor = FLOORS[base];
+  const readPhase = floor && typeof floor.readPhase === 'function' ? floor.readPhase : readReporterPhase;
+  const rp = readPhase(workspacePath, client, session);
   if (!rp) return null;
   // 下面每个分支都是**各建各的对象**，不是展开 rp —— 要往外带什么字段，每个分支都得加一遍，
   // 漏了就会静默丢掉（model 就这么丢过一次）。
@@ -935,31 +557,6 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       prompt: rp.prompt || '',
       model: rp.model || '',
       // 相位写入时刻：渲染层拿它跟收尾标记比先后（见 IsoOfficeView 的 consoleLive 守卫）
-      ts: Number(rp.ts) || 0,
-    };
-  }
-  // 等授权兜底：本环境实测 CodeBuddy 不发 permission_prompt 通知（events.log 无 Notification 行），
-  // 所以靠 hook 留下的 pending 推断——PreToolUse 写了 pending + sessionPhase=tool，
-  // 若超过 AWAIT_PROBE_MS 仍无 PostToolUse 来清掉，说明工具被权限框卡住了。
-  // 只读 / 命令类工具（NEVER_AWAIT_TOOLS）本就不发 PostToolUse、也不该弹权限框，排除掉避免误报
-  // （典型误报：读文件却显示「等待授权」、点了 run 还在「等待授权」）。
-  if (
-    clientBase(rp.client) !== 'codex' && // Codex 用显式 PermissionRequest，跳过这套推断（codex / codex-plugin 都算）
-    rp.phase === 'tool' &&
-    rp.pending &&
-    rp.pending.at &&
-    Date.now() - rp.pending.at > AWAIT_PROBE_MS &&
-    !NEVER_AWAIT_TOOLS.has(rp.pending.tool || rp.tool)
-  ) {
-    const tool = rp.pending.tool || rp.tool;
-    const file = rp.pending.file || rp.file;
-    return {
-      phase: 'await',
-      action: tool ? `申请执行 ${tool}` : '等待用户授权',
-      target: file || '',
-      context: ['等待用户授权后继续', tool && `工具：${tool}`, file && `目标：${file}`].filter(Boolean),
-      prompt: rp.prompt || '',
-      model: rp.model || '',
       ts: Number(rp.ts) || 0,
     };
   }
@@ -1032,7 +629,7 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     // TraeCode 取消兜底：renderer.log 里已确认取消（取消时刻比本轮开始新）→ 不算活跃
     // （TraeCode 取消不发 Stop hook 事件，taskId 永远占着，这里手动戳破它）。
     if (clientBase(j.client) === 'trae') {
-      const atT = traeCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+      const atT = trae.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
       if (atT) continue;
     }
     return true;
@@ -1076,203 +673,6 @@ function roundFilesOf(j) {
   return out;
 }
 
-/**
- * Claude / Qoder 风格 transcript 的**尾部窗口**：这一轮有没有被用户打断、以及打断前最后说了什么。
- *
- * 为什么必须由服务端来判：这两家（实测 2026-09-29，4F Claude Code 的 VS Code 扩展形态）
- * 用户按"停止"后**一个 hook 事件都不发** —— events.log 里 Stop / SessionEnd / Notification
- * 全无，事件流停在最后一次 PostToolUse，所以 hook 侧的 `turnInterrupted`（跑在 Stop 分支里）
- * 根本没机会执行。唯一权威的痕迹是 transcript 末尾那条 user 消息
- * `[Request interrupted by user]`（工具中途打断带 ` for tool use` 后缀）。
- *
- * 读法：只读文件**最后 128KB**（标记永远写在末尾，长会话不必整份读），按 mtime+size+sinceTs 缓存，
- * 同一个文件在标记落盘后只会被解析一次。逐行 `JSON.parse` 按结构判（`type:'user'` 且正文文本
- * 命中标记），工具结果 / 思考里带同名字符串一律不算。
- *
- * **CLI 与 VS Code 扩展不一样，差别在"什么时候按的停止"**（实测 2026-09-29，同一台机器两边复现）：
- *   · 模型已经吐出东西（工具在跑）再打断 → 两边都落 ` for tool use` 那条标记，本函数认得到。
- *   · 刚提交、模型还没输出就按停止 → **扩展照样落 `[Request interrupted by user]`（认得到）；
- *     终端 CLI 一行都不写**：提示词被还原回输入框，events.log 停在同秒的 UserPromptSubmit，
- *     transcript 停在用户那条 prompt 上 —— 这一种在盘上**没有任何痕迹**，不是读取口径的问题。
- *     真实案例：任务 t_mumetsne_quls1x（"测试 claude code CLI任务取消"，16:24，CLI 形态）。
- *   于是这一种只能等相位新鲜期（TASK_RUN_MS 2 分钟）过期后控制台回待命，红灯不亮、
- *   台账那行的结束时间一直是空 —— 这是**已知缺口**，不是回归。
- *
- * 上面那个缺口**2026-09-29 已接上**（用户明确同意用未公开内部文件）：Claude Code 自己在
- * `<claudeHome>/sessions/<pid>.json` 里记 `{sessionId, entrypoint, status, statusUpdatedAt}` ——
- * `status` 只有 busy / idle，一轮结束就翻 idle、时间戳很准（实测那轮 08:24:00.769 提交、
- * 08:24:03.137 翻 idle，早打断同样对上；且 idle 期间文件不再刷新，所以那个时间戳就是"这轮
- * 什么时候结束的"）。判据与实现见下面 claudeInterruptOf 的 ② 号信号：状态文件里 taskId 还占着 +
- * 没有收工标记 + status=idle 且 statusUpdatedAt ≥ taskStartedAt ⇒ 这一轮被掐了。
- * 已知风险：那是**未公开的内部文件**（格式随时可能变）→ 读不到/字段缺失一律当"没有"，绝不猜。
- *
- * @param {string} transcriptPath
- * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的标记，老一轮的不算
- * @returns {{interrupted:boolean, said:string, at:number}}
- */
-const TRANSCRIPT_TAIL_BYTES = 128 * 1024;
-const _claudeTailCache = new Map();
-function claudeInterruptTail(transcriptPath, sinceTs = 0) {
-  const miss = { interrupted: false, said: '', at: 0 };
-  if (!transcriptPath || !isFile(transcriptPath)) return miss;
-  let stat = null;
-  try {
-    stat = fs.statSync(transcriptPath);
-  } catch {
-    return miss;
-  }
-  const cached = _claudeTailCache.get(transcriptPath);
-  if (cached && cached.m === stat.mtimeMs && cached.size === stat.size && cached.sinceTs === sinceTs) {
-    return cached.res;
-  }
-  let raw = '';
-  try {
-    const start = Math.max(0, stat.size - TRANSCRIPT_TAIL_BYTES);
-    const len = stat.size - start;
-    if (len <= 0) return miss;
-    const fd = fs.openSync(transcriptPath, 'r');
-    try {
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, start);
-      raw = buf.toString('utf8');
-    } finally {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        /* 关不上也不影响这次读取 */
-      }
-    }
-  } catch {
-    return miss;
-  }
-  let interrupted = false;
-  let said = '';
-  let at = 0;
-  for (const line of raw.split(/\r?\n/)) {
-    // 便宜先行：这一行连关键词、也不是 assistant 正文候选就跳过（尾部第一行多半是被截断的，解析会失败）
-    if (!line || !/interrupted|"role"\s*:\s*"assistant"/.test(line)) continue;
-    let o = null;
-    try {
-      o = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!o || typeof o !== 'object') continue;
-    const ts = Date.parse(String(o.timestamp || '')) || 0;
-    if (sinceTs && ts && ts < sinceTs) continue;
-    const msg = o.message && typeof o.message === 'object' ? o.message : null;
-    const content = msg ? msg.content : o.content;
-    const texts =
-      typeof content === 'string'
-        ? [content]
-        : Array.isArray(content)
-          ? content
-              .filter((x) => x && (x.type === 'text' || x.type === 'output_text') && typeof x.text === 'string')
-              .map((x) => x.text)
-          : [];
-    if (!texts.length) continue;
-    // 打断标记：一条 user 消息，正文（text part，不是 tool_result）就是 [Request interrupted by user]
-    if (o.type === 'user' && texts.some((t) => /^\s*\[?request interrupted by user/i.test(String(t)))) {
-      interrupted = true;
-      if (ts) at = Math.max(at, ts);
-      continue;
-    }
-    const role = String((msg && msg.role) || o.role || '');
-    if (role === 'assistant') {
-      const txt = texts.join('\n').trim();
-      if (txt) said = txt; // 取最后一段（覆盖前面的）
-    }
-  }
-  const res = { interrupted, said, at };
-  _claudeTailCache.set(transcriptPath, { m: stat.mtimeMs, size: stat.size, sinceTs, res });
-  return res;
-}
-
-/**
- * Claude Code 自己的**会话状态文件**：`<claudeHome>/sessions/<pid>.json`，
- * 一个运行中的 CLI 进程一个文件。字段实测（2026-09-29，2.1.281/2.1.283）：
- *   { pid, sessionId, cwd, startedAt, kind:'interactive', entrypoint:'cli'|'claude-vscode',
- *     status:'busy'|'idle', updatedAt, statusUpdatedAt }
- *
- * **这是 Claude Code 未公开的内部文件**（用户 2026-09-29 明确同意用它做兜底），格式随时可能变 ——
- * 所以读不到 / 缺字段 / 解析失败一律当"没有"，绝不猜；只按 sessionId **精确**匹配。
- * 关键实测：**idle 期间这个文件不再刷新**（statusUpdatedAt 一直冻在"翻 idle 的那一刻"），
- * 于是它就是"这一轮什么时候结束的"时间戳；反过来 status='busy' = 正在生成。
- *
- * 目录列举缓存 2s、文件按 (mtime,size) 缓存 —— 每个扫盘周期会被问好几次，别每次都重读。
- * @param {string} sessionId
- * @returns {{status:string, statusUpdatedAt:number, updatedAt:number, pid:number, entrypoint:string, kind:string}|null}
- */
-const _claudeSessFiles = { at: 0, names: [] };
-const _claudeSessData = new Map(); // path -> {m, size, data}
-function claudeSessionStatus(sessionId) {
-  const sid = String(sessionId || '');
-  if (!sid) return null;
-  const dir = path.join(claudeHome(), 'sessions');
-  const now = Date.now();
-  if (now - _claudeSessFiles.at > 2_000) {
-    _claudeSessFiles.names = readDir(dir).filter((n) => /\.json$/i.test(n));
-    _claudeSessFiles.at = now;
-  }
-  let best = null;
-  for (const name of _claudeSessFiles.names) {
-    const p = path.join(dir, name);
-    let stat = null;
-    try {
-      stat = fs.statSync(p);
-    } catch {
-      continue; // 进程退出时文件可能被删掉：跳过，不猜
-    }
-    const cached = _claudeSessData.get(p);
-    let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
-    if (!data) {
-      data = readJson(p);
-      _claudeSessData.set(p, { m: stat.mtimeMs, size: stat.size, data });
-    }
-    if (!data || String(data.sessionId || '') !== sid) continue;
-    // 同一个 sessionId 可能同时有多份（老进程残留）→ 取 updatedAt 最新的那份
-    if (!best || Number(data.updatedAt || 0) > Number(best.updatedAt || 0)) best = data;
-  }
-  return best;
-}
-
-/**
- * 这一轮（状态文件 `j`）是不是被用户打断了；是的话给出**打断时刻**。
- *
- * 两个信号（都是"按了停止却一个 hook 事件都不发"那条路的兜底），取先命中的：
- *   ① `claudeInterruptTail`：transcript 尾部那条 `[Request interrupted by user]`
- *      —— 模型已经吐过字 / 正在跑工具时打断，CLI 与 IDE 扩展都会写；
- *   ② `~/.claude/sessions/<pid>.json` 写着 `status='idle'` 且 statusUpdatedAt 晚于本轮开始
- *      —— "刚提交、模型一个字都没吐就按 ESC"：transcript **一行都不写**、hook **一个事件都不发**，
- *         只有这里看得出（2026-09-29 接上；用户明确同意用这个未公开文件）。
- *         ⚠ 只在"本轮已经开始 ≥ CLAUDE_IDLE_GRACE_MS"之后才采信：开轮那一瞬 CLI 可能还写着
- *         idle（还没翻 busy），不设宽限会把刚提交的正常一轮误判成取消。
- *      取消时间用 statusUpdatedAt（**不拿"现在"冒充**）。
- *
- * 另有一条硬前提：这一轮**没有收工标记**（`j.done` 早于本轮开始 = 上一轮残留，不算数）。
- * @param {any} j reporter 状态文件内容
- * @param {number} startedAt 本轮开始时刻
- * @returns {{hit:boolean, at:number, via:'transcript'|'idle'|''}} at=0 表示打断成立但拿不到时刻
- */
-const CLAUDE_IDLE_GRACE_MS = 3_000;
-function claudeInterruptOf(j, startedAt) {
-  const none = { hit: false, at: 0, via: '' };
-  if (!j) return none;
-  const base = clientBase(j.client);
-  if (base !== 'claude' && base !== 'qoder') return none;
-  const started = Number(startedAt) || 0;
-  const doneAt = Number(j.done && j.done.at) || 0;
-  if (doneAt && (!started || doneAt >= started)) return none; // 这一轮已经正常收尾
-  const ci = claudeInterruptTail(j.transcriptPath, started);
-  if (ci.interrupted) return { hit: true, at: Number(ci.at) || 0, via: 'transcript' };
-  const st = claudeSessionStatus(j.sessionId);
-  if (!st || String(st.status) !== 'idle') return none;
-  const at = Number(st.statusUpdatedAt || st.updatedAt) || 0;
-  if (!at || !started || at < started) return none; // idle 是开轮之前翻的 → 那一轮还没结束
-  if (Date.now() - started < CLAUDE_IDLE_GRACE_MS) return none; // 刚开轮，别误伤
-  return { hit: true, at, via: 'idle' };
-}
-
 function readReporterDones(workspacePath, client = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
@@ -1282,7 +682,7 @@ function readReporterDones(workspacePath, client = '') {
   let latest = null;
   /** 兜底合成的"取消"标记里、需要服务端补发 task/end(cancelled) 的那些（见 sessionRegistry 的 flush）。
    *  这些产品（Claude / Qoder 按停止、CodeBuddy 插件按停止）取消时**一个 hook 事件都不发**，
-   *  只能由服务端从落盘里认出来（见 claudeInterruptOf / codebuddyPauseCancelAt），
+   *  只能由服务端从落盘里认出来（见 claude.interruptOf / codebuddy.cancelAt），
    *  然后由 sessionRegistry 在 refresh 时去重后补发一次 task/end —— 否则台账那行一直挂在「进行中」。 */
   const cancels = [];
   /**
@@ -1322,10 +722,36 @@ function readReporterDones(workspacePath, client = '') {
       result,
     });
   };
+  /** 真·完成（楼层补的"正常完成"标记，cancelled:false）：只在比现有 mark 新（或相等）时覆盖，
+   *  让 DoneHandler 的 completed 能盖掉之前合成的 cancelled:true。不产生 cancels 行。 */
+  const synthDone = ({ id, ws, at, title = '', files = [] }) => {
+    if (!at) return;
+    const existing = bySession.get(id);
+    if (!existing || Number(at) >= Number(existing.at || 0)) {
+      const mark = {
+        at,
+        title: title || '',
+        workspacePath: ws,
+        sessionId: id,
+        cancelled: false,
+        files: files.slice(0, 8),
+        fileCount: files.length,
+        said: '',
+      };
+      bySession.set(id, mark);
+      if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
+    }
+  };
+  /** hook 状态文件按 sessionId 归并（楼层自己的取消/完成探测从这里取 workspacePath / roundFiles / client 过滤） */
+  const hookBySid = new Map();
+  /** 全部 hook 状态文件（不按 sessionId 去重）：Claude/Qoder 的取消探测要逐文件扫，与主线循环同口径 */
+  const allFiles = [];
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
+    allFiles.push(j);
+    if (j.sessionId) hookBySid.set(String(j.sessionId), { j });
     if (!clientHit(client, j.client)) continue;
     const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
@@ -1337,60 +763,25 @@ function readReporterDones(workspacePath, client = '') {
       if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
       if (!latest || Number(done.at) > Number(latest.at)) latest = done;
     }
-    /* 兜底合成取消标记。
-       **只认"用户真按了停止"的信号**（Claude/Qoder，见 claudeInterruptOf 的两个信号）。
-       这里曾经还有一条"任务槽卡死 + transcript 末轮 state='running' ⇒ 判被打断"的兜底
-       （CodeBuddy IDE 收不到 Stop / Interrupt 时用），**2026-09-29 去掉了**：它判不出
-       "还在慢慢想"和"被打断"—— 长时间不调工具的轮（模型纯推理 > TASK_RUN_MS）会被误判成
-       取消，控制台先弹红色「任务取消」+「待命中」，下一条事件回来又跳回「思考中」，
-       用户看到的就是"任务没完成却报取消"。宁可这种轮暂时停在旧相位（相位新鲜期到了会回落
-       待命），也不误报取消。 */
+    /* 楼层特有的"取消"标记合成（Claude/Qoder 的 transcript 信号、Trae 的 renderer.log、
+       CodeBuddy 插件的 message-queue）已统一收口到各楼层模块的 synthMarks（见文件底部按
+       FLOORS 派发），这里不再写任何产品专属逻辑。历史上"任务槽卡死 + transcript 末轮
+       state='running' ⇒ 判被打断"的兜底（2026-09-29 去掉）：它判不出"还在慢慢想"和"被打断"，
+       长时间不调工具的轮会被误判取消，控制台先弹红色「任务取消」又跳回「思考中」，所以宁可
+       停在旧相位、等新鲜期回落待命，也不误报取消。 */
     if (j.taskId) {
       const startedAtJ = Number(j.taskStartedAt) || 0;
       // taskId 一并带上：sessionRegistry 的"被顶掉上一轮"扫尾拿它显式排除当轮自己
       //（光靠 startedAt >= ts 判界不够直观，双保险），见 bus.endStaleTasksOfSession。
       if (id && startedAtJ) rounds.push({ sessionId: id, taskId: j.taskId, taskStartedAt: startedAtJ, client: j.client });
-      /* Claude Code / Qoder（4F / 6F，CLI 与 IDE 扩展都一样）：用户按"停止"后**一个 hook
-         事件都不发** —— 实测 2026-09-29 的 4F：events.log 里 Stop / SessionEnd / Notification
-         全无，事件流停在最后一次 PostToolUse。hook 侧那条 `turnInterrupted` 跑在 Stop 分支里，
-         没事件就永远执行不到，于是控制台一直停在「思考中」、也永远不亮红色「任务取消」。
-         只能由服务端在轮询时自己认，两个信号见 claudeInterruptOf：
-           ① transcript 尾部那条 `[Request interrupted by user]`（模型已输出 / 正在跑工具时打断）；
-           ② Claude 自己的会话状态文件 `<claudeHome>/sessions/<pid>.json` 说 idle
-              （"刚提交、一个字都没吐就 ESC"——transcript 一行都不写，只有这里看得出）。
-         认出来就合成取消标记。
-         **不设 TASK_RUN_MS 门槛**：信号一到位就该亮（服务端 5~10s 扫一轮 + 前端 1.5s 快轮询，
-         足够"准实时"）；同一轮靠 (会话, 任务, at) 去重，只补发一次。 */
-      const base = clientBase(j.client);
-      if (base === 'claude' || base === 'qoder') {
-        const iv = claudeInterruptOf(j, startedAtJ);
-        if (iv.hit) {
-          // 收尾自述只有 transcript 那条路有（idle 兜底认出来的早打断，本来就没吐过字）
-          const ci = claudeInterruptTail(j.transcriptPath, startedAtJ);
-          synthCancel({
-            id,
-            j,
-            ws,
-            at: iv.at || Number(j.sessionPhase && j.sessionPhase.ts) || startedAtJ || now,
-            files: roundFilesOf(j),
-            said: String(ci.said || '').replace(/\s+/g, ' ').trim().slice(0, 160),
-            result: String(ci.said || '').trim().slice(0, 4_000),
-          });
-        }
-      }
-      /* CodeBuddy **插件**（IDE 扩展）的取消检测**不放在这里**（不在 `if (j.taskId)` 门槛内）：
-         它和 Trae 同因 —— 见下面的「CodeBuddy 插件（IDE 扩展）独立扫取消信号」，那段独立扫、
-         与 taskId 无关，理由同 Trae（取消时 taskId 会被覆盖/清空，卡在 gate 里就认不出）。 */
-      /* TraeCode 的取消检测**不放在这里**（不在 `if (j.taskId)` 门槛内）：
-         因为 renderer.log 里的取消信号（traeCancelAt / allCancels）**不依赖 hook 状态文件**，
-         taskId 被新一轮覆盖了、或者 taskId 清掉了（会话结束），都能从 renderer.log 拿到。
-         独立扫描见下面的 for 循环之后。 */
     }
+    // 楼层特有的"用户按停止却一个 hook 事件都不发"的取消探测，统一交给各楼层模块
+    // （见文件底部按 FLOORS 派发的 synthMarks）；公共代码只收"当前这一轮"起点，不写死任何产品。
   }
   /* --- TraeCode 独立扫取消信号 ---
      数据源是 Trae 自己的 renderer.log（DoneHandler status:"canceled" / StreamDomainService
      cancelReason:"stop_button" / NotificationPort stopType:"cancel" / stream-diagnostics
-     transformedStatus:"canceled"，四种都带 sessionId），由 traeCancel.js 的 allCancels()
+     transformedStatus:"canceled"，四种都带 sessionId），由 trae.allCancels()
      解析出来（按 mtime+size 缓存，与 traeModels.js 同口径）。
 
      为什么**不在**上面的 hook 状态文件扫描循环里做：
@@ -1404,7 +795,7 @@ function readReporterDones(workspacePath, client = '') {
   /* --- TraeCode 独立扫取消信号 ---
      数据源是 Trae 自己的 renderer.log（DoneHandler status:"canceled" / StreamDomainService
      cancelReason:"stop_button" / NotificationPort stopType:"cancel" / stream-diagnostics
-     transformedStatus:"canceled"，四种都带 sessionId），由 traeCancel.js 的 allCancels()
+     transformedStatus:"canceled"，四种都带 sessionId），由 trae.allCancels()
      解析出来（按 mtime+size 缓存，与 traeModels.js 同口径）。
 
      为什么**不在** hook 状态文件扫描循环里做、为什么**也不做** sinceTs/smart 判断：
@@ -1415,145 +806,29 @@ function readReporterDones(workspacePath, client = '') {
        · 渲染层自己用 "phase.ts vs done.at 谁更新" 来决定显示：done.at 旧但 phase.ts 新 →
          新一轮正常跑覆盖 cancelled 状态（L459-470 IsoOfficeView.vue），**不会误亮红灯**。
          所以无需 smart 判断过滤。 */
-  // client 可能是逗号分隔（products.js 的 hook source 常写 "trae,trae-plugin"），
-  // clientBase 只去 -plugin 后缀、不拆逗号，"trae,trae-plugin".replace(/-plugin$/,'') = "trae,trae" ≠ "trae"，
-  // 所以单独拆一下再判。
-  const clients = String(client || '').split(',').map((s) => clientBase(s.trim())).filter(Boolean);
-  const isTrae = !client || clients.includes('trae');
-  if (isTrae) {
-    // ── 先扫 DoneHandler（最终状态真相）──
-    // completed → 合成正常完成标记（覆盖可能存在的 cancelled:true）
-    // canceled  → 合成取消标记（同 synthCancel）
-    const handlers = allDoneHandlers();
-    const hookBySid = new Map();
-    for (const name of readDir(dir)) {
-      if (!/\.json$/i.test(name)) continue;
-      const j = readJson(path.join(dir, name));
-      if (j && j.sessionId) hookBySid.set(String(j.sessionId), { j });
-    }
-    for (const h of handlers) {
-      const sid = h.sessionId;
-      if (!sid || !h.at) continue;
-      const hook = hookBySid.get(sid);
-      const j = hook ? hook.j : null;
-      const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
-      if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
-      if (j && client && !clientHit(client, j.client)) continue;
-
-      if (h.status === 'completed') {
-        // DoneHandler completed → 合成正常完成标记（cancelled:false）
-        // 覆盖 bySession 里已有的 cancelled:true（from allCancels / hook 状态文件），
-        // 但**只在 DoneHandler at 更大时**覆盖 —— completed 信号应该比取消信号晚到，
-        // 如果 cancel 信号真的是最后那一下（DoneHandler 也是 canceled），就不会走到这。
-        const existing = bySession.get(sid);
-        if (!existing || h.at >= Number(existing.at || 0)) {
-          const mark = {
-            at: h.at,
-            title: (j && j.taskTitle) || '',
-            workspacePath: hookWs || workspacePath || '',
-            sessionId: sid,
-            cancelled: false, // 正常完成！
-            files: [],
-            fileCount: 0,
-            said: '',
-          };
-          bySession.set(sid, mark);
-          if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
-        }
-      } else {
-        // DoneHandler canceled → 同 synthCancel
-        const existing = bySession.get(sid);
-        if (existing && existing.cancelled && Math.abs(Number(existing.at) - h.at) < 5_000) continue;
-        synthCancel({
-          id: sid,
-          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
-          ws: hookWs || workspacePath || '',
-          at: h.at,
-          files: j ? roundFilesOf(j) : [],
-        });
-      }
-    }
-
-    // ── 再扫 allCancels（更早的取消信号）──
-    // 只作补充：allCancels 扫 stop_button / NotificationPort cancel，
-    // 比 DoneHandler 更早，对 readReporterPhase / readReporterActiveTask 有用。
-    // 但对 bySession/latest：DoneHandler 后到且更权威，所以 allCancels 只在
-    // bySession 还**没有 mark** 时才写入（避免先写 cancelled:true 又被覆盖掉逻辑）。
-    const traeCancels = allCancels();
-    const traeSids = Object.keys(traeCancels || {});
-    if (traeSids.length) {
-      for (const sid of traeSids) {
-        const atC = Number(traeCancels[sid]) || 0;
-        if (!atC) continue;
-        // DoneHandler 已经给这条会话写了 mark → 跳过（DoneHandler 更权威）
-        if (bySession.has(sid)) continue;
-        const hook = hookBySid.get(sid);
-        const j = hook ? hook.j : null;
-        const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
-        if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
-        if (j && client && !clientHit(client, j.client)) continue;
-        synthCancel({
-          id: sid,
-          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'trae' },
-          ws: hookWs || workspacePath || '',
-          at: atC,
-          files: j ? roundFilesOf(j) : [],
-        });
-      }
+  // 楼层特有的取消/完成标记合成：每条楼层自己实现 synthMarks（见各 floor 模块），公共代码只负责派发。
+  // client 为空（不指定产品）时扫全部楼层；否则只跑被点名的那一层（qoder 归到 claude 模块处理）。
+  const bases = client
+    ? String(client).split(',').map((s) => clientBase(s.trim())).filter(Boolean)
+    : Object.keys(FLOORS);
+  for (const base of bases) {
+    const floor = FLOORS[base] || (base === 'qoder' ? FLOORS.claude : null);
+    if (floor && typeof floor.synthMarks === 'function') {
+      floor.synthMarks({
+        workspacePath,
+        client,
+        hookBySid,
+        allFiles,
+        clientHit,
+        roundFilesOf,
+        synthCancel,
+        synthDone,
+        bySession,
+        now,
+      });
     }
   }
 
-  /* --- CodeBuddy 插件（IDE 扩展）独立扫取消信号 ---
-     与 TraeCode 同因、同形：CodeBuddy 插件取消时**一个 hook 事件都不发**（CLI 那条 FinalStop 在
-     IDE 形态等不到 —— 扩展日志里只有 AgentState.cancelled，没有任何 HookExecutor），唯一权威信号
-     在 message-queue 的 `runtime.pauseReason:'cancel'`（会话 id 与 hook 状态文件 sessionId 一字不差，
-     见 codebuddyPauseCancelAt / allCodebuddyCancels）。
-
-     为什么**不在**上面的 hook 状态文件扫描循环里做、为什么也不做 sinceTs/smart 判断：
-       · 取消时状态文件的 taskId 会被**新一轮覆盖 / 清空**（插件不发 Stop，但常在开新轮时重写状态文件），
-         一旦 taskId 丢了或变成新一轮的，绑在 `if (j.taskId)` + `j.taskStartedAt` 上的探测就再也认不出
-         这口取消 —— 主控制台红灯灭、台账也补不上。所以像 Trae 一样独立扫，只认"会话 id + 取消落盘"。
-       · 渲染层自己用 "phase.ts vs done.at 谁更新" 决定显示：done.at 旧但 phase.ts 新 → 新一轮正常跑
-         覆盖 cancelled 状态（IsoOfficeView.vue），**不会误亮红灯**。所以无需 smart 过滤。 */
-  const isCodebuddy = !client || clients.includes('codebuddy');
-  if (isCodebuddy) {
-    const cbCancels = allCodebuddyCancels();
-    const cbSids = Object.keys(cbCancels || {});
-    if (cbSids.length) {
-      const hookBySid = new Map();
-      for (const name of readDir(dir)) {
-        if (!/\.json$/i.test(name)) continue;
-        const j = readJson(path.join(dir, name));
-        if (j && j.sessionId) hookBySid.set(String(j.sessionId), j);
-      }
-      for (const sid of cbSids) {
-        const atC = Number(cbCancels[sid]) || 0;
-        if (!atC) continue;
-        // 已有同一取消（±5s 容差）→ 跳过，避免重复合成 / 重复补发 task/end(cancelled)
-        const existing = bySession.get(sid);
-        if (existing && existing.cancelled && Math.abs(Number(existing.at) - atC) < 5_000) continue;
-        const j = hookBySid.get(sid) || null;
-        // 只认"本轮开始之后"的取消：老取消（上一轮）不能算到新一轮头上，否则主控制台会把当前这轮
-        // 亮成「任务取消」。这跟老实现 codebuddyPauseCancelAt 的 sinceTs 同口径，但不再依赖 j.taskId
-        // —— taskId 被清空了也能靠 hook 状态文件的 taskStartedAt 判断本轮起点。
-        const sinceTs = j ? Number(j.taskStartedAt) || 0 : 0;
-        if (sinceTs && atC < sinceTs) continue;
-        const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
-        if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
-        if (j && client && !clientHit(client, j.client)) continue;
-        synthCancel({
-          id: sid,
-          // taskId 与 Trae 同理：hook 状态文件里的 taskId 可能是新一轮的（甚至被清空），
-          // 取消属于被顶掉的上一轮；sessionRegistry.flushSynthesizedCancels 会用 sessionId + cancelAt
-          // 去 task_runs 找 started_at <= cancelAt、还挂 running 的那条来补 task/end(cancelled)。
-          j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'codebuddy' },
-          ws: hookWs || workspacePath || '',
-          at: atC,
-          files: j ? roundFilesOf(j) : [],
-        });
-      }
-    }
-  }
   return { latest, bySession, cancels, rounds };
 }
 
@@ -1568,13 +843,13 @@ function readReporterDone(workspacePath, client = '', session = '') {
   // （最新那一轮 request 的 completedAt，见 readCopilotLiveRequest）——不然 9F 永远没有
   // 「任务完成」那一下（实测 2026-09-28：7F/8F 都有、9F 一直空）。
   if (clientBase(client) === 'copilot') {
-    const d = C.readCopilotDone(session);
+    const d = copilot.readCopilotDone(session);
     if (d) return d;
   }
   return hit;
 }
 
-/* → copilot.js */
+
 
 /**
  * hook 上报的会话清单 —— 给"只认 hook"的楼层当会话来源（见 products.js 的 hookSource）。
@@ -1709,9 +984,10 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
 
 /** 单个会话的完整信息 */
 function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false, client = '' } = {}) {
-  const todos = readTodos(storage, id);
-  const files = readFileChanges(storage, id);
-  const mq = readRuntime(storage, id);
+  // 结构化落盘（todos / file-changes / message-queue）的读取统一收口在 plugin.js，本文件只综合。
+  const todos = plugin.readTodos(storage, id);
+  const files = plugin.readFileChanges(storage, id);
+  const mq = plugin.readRuntime(storage, id);
   const lastUpdated = Math.max(todos.at, files.lastAt, mq.updatedAt) || null;
   // 活跃 = 当前会话且近期有动静 / 运行态新鲜 / 刚改过文件。
   // 关键：关掉 IDE 后插件不再落盘，但 current.json 仍指向它、runtime.activated 也残留为真，
@@ -1797,65 +1073,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
 
 /* ------------------------------ 对外：列会话 ------------------------------ */
 
-/**
- * 补全被扩展截断的工程路径。
- *
- * **扩展把 genie-history 的目录名（工程路径的 base64）截到 64 字符**，而 64 个 base64
- * 字符只装得下 48 字节 —— 路径一长，解出来就只剩半截：
- *   实测（Windows）：`c:/Users/yingh/WorkBuddy/2026-09-14-19-28-26/WorkGremlin`（52 字符）
- *   → 目录名解码只得 `…/2026-09-14-19-28-26/Wor`，工程名跟着变成 **"Wor"**。
- * 常见的 macOS/Linux 家目录路径短于 48 字符，看不出这个问题 —— 是 Windows（长路径）专属坑。
- * 目录里也没别处存完整路径（current.json 只有 conversationId，conversations/<id> 是空壳），
- * 所以只能拿"已知的真实工程"做前缀补全：解出的半截在磁盘上不是目录时，就在候选里找一条
- * 以它为前缀的补上（优先磁盘上真实存在的目录）。补不上就原样返回，不影响没被截断的机器。
- *
- * @param {string} decoded decodeDirName 的结果
- * @param {string[]} candidates 已知的真实工程路径，**按可信度排序**：越靠前越优先
- *   （调用点 = [freshestReporterWs 的真实活动工程, 办公室打开的工程]）
- * @returns {string}
- */
-function completeTruncatedWorkspace(decoded, candidates) {
-  const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-  if (!decoded || isDir(decoded)) return decoded; // 磁盘上真有这个目录 = 没被截断
-  const want = norm(decoded);
-  if (!want) return decoded;
-  // 顺序即优先级：候选里第一条"以半截串为前缀（截断=纯前缀截断）"就是答案。不做"取最短"——
-  // 两条候选共享同一截断前缀时，按长短挑会挑错工程；按可信度排序才能保证真实活动工程（ws，
-  // 放最前）优先补上，`p.path === ws` 才成立。
-  // isDir 只作**优先判据，不作硬门槛**：优先补到磁盘上真实存在的目录，都没有就按顺序退回第一条命中。
-  // 若拿 isDir 当硬门槛，工程目录被删 / 改名 / 网络盘 stat 不到时半截路径就补不回来 —— 正是 ec10df
-  // 要修的那个 bug 复发（currentId 落空、主控制台丢相位）。宁可补一条"前缀对得上但目录不在"的
-  // 路径，也不回到半截残尾。
-  let fallback = '';
-  for (const c of candidates || []) {
-    if (!c) continue;
-    const n = norm(c);
-    if (!n || n === want || !n.startsWith(want)) continue;
-    if (isDir(c)) return c;
-    if (!fallback) fallback = c;
-  }
-  return fallback || decoded;
-}
-
-/**
- * genie-history 下每个 base64 目录 = 一个工程（目录名解出来就是工程绝对路径；
- * 长度超过 48 字节的路径会被扩展截断，靠 candidates 补全，见 completeTruncatedWorkspace）。
- * @param {string} storage 插件落盘根
- * @param {string[]} [candidates] 已知的真实工程路径，按可信度排序（越靠前越优先）
- * @returns {Array<{dir: string, path: string, project: string}>}
- */
-function collectProjects(storage, candidates = []) {
-  const gh = path.join(storage, 'genie-history');
-  const out = [];
-  for (const name of readDir(gh)) {
-    const dir = path.join(gh, name);
-    if (!isDir(dir)) continue;
-    const ws = completeTruncatedWorkspace(decodeDirName(name), candidates);
-    if (!ws) continue;
-    out.push({ dir, path: ws, project: resolveProjectName(ws) || path.basename(ws) });
-  }
-  return out;
-}
+/** 工程路径补全与 genie-history 工程归集的读取收口在 plugin.js（plugin.completeTruncatedWorkspace / plugin.collectProjects）。 */
 
 /**
  * 列出**所有工程**里的活跃会话（不局限于当前打开的那个工程）。
@@ -1864,7 +1082,7 @@ function collectProjects(storage, candidates = []) {
  *            storage: string, reason?: string}}
  *   reason: 'no-storage' 没找到插件落盘 / 'no-open-project' 一个活跃会话都没有
  */
-function listSessions({ workspacePath = '', force = false, client = '', pluginRe = PLUGIN_RE } = {}) {
+function listSessions({ workspacePath = '', force = false, client = '', pluginRe = plugin.PLUGIN_RE } = {}) {
   // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
   // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
   // 只认传入的 client 这一路：这份清单属于某个插件楼层，别层（其它产品 / 同一产品的 CLI）
@@ -1876,7 +1094,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const key = `${client}@@${ws}@@${String(pluginRe instanceof RegExp ? pluginRe.source : Array.isArray(pluginRe) ? pluginRe.map((r) => (r && r.source) || String(r)).join('|') : String(pluginRe || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
-  const storage = findPluginStorage(pluginRe);
+  const storage = plugin.findPluginStorage(pluginRe);
   if (!storage) {
     cache = {
       at: now,
@@ -1895,7 +1113,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   // candidates 传"真实活动工程 + 本次查询的工程"，顺序即优先级（ws 放最前）：
   // genie-history 目录名可能被扩展截断，用它俩把半截路径补回完整路径（优先磁盘上真实存在的目录），
   // 否则工程名会显示成被截断后的残尾、currentId 落空，见 completeTruncatedWorkspace
-  for (const p of collectProjects(storage, [ws, workspacePath])) {
+  for (const p of plugin.collectProjects(storage, [ws, workspacePath])) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
     if (cid) {
@@ -1911,9 +1129,10 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
 
   // GitHub Copilot 这类真实插件落盘用 SQLite `session-store.db`，不是 `genie-history`：
   // 这里单独把它们并进同一张会话表，否则 9F 永远会被旧的 Tencent 目录吞掉、UI 不点亮。
-  const sqliteSessions = readSqliteSessionRows(storage);
+  // 整段 Copilot SQLite 的读取 + enrich 在 copilot.js 的 readCopilotSessions 里做（plugin 来源统一收口）。
+  const sqliteRows = copilot.readCopilotSessions(storage, { ws, now });
   const sqliteById = new Map();
-  for (const row of sqliteSessions) {
+  for (const row of sqliteRows) {
     if (!row || !row.id) continue;
     sqliteById.set(row.id, row);
     meta.set(row.id, { project: row.project, projectPath: row.projectPath });
@@ -1938,68 +1157,21 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     // hasPendingTurn（空 assistant_response 的 turn）不单独使用 —— Copilot 是批次写入，
     // 放弃/取消的 turn 也留空 response，2 分钟外的空 turn 是已废弃不是正在跑。
     const reporterInWindow = readReporterActiveTask(m.projectPath, client);
-    const inWindow = sqliteRow
-      ? (reporterInWindow || C.copilotInWindow(sqliteRow, now))
-      : reporterInWindow;
-    const inFlight = sqliteRow ? C.copilotInFlight(sqliteRow) : null;
-    const info = sqliteRow
-      ? {
-          id,
-          // 这条会话来自 Copilot 自己的 SQLite 会话库 —— 它才是 9F 的真会话。
-          // 有它是为了让"按楼层扫盘"的那条路（copilot.js）能把 Copilot 会话和
-          // 同目录里别的产品的会话分开：共享的 PLUGIN_RE 会把 Tencent / Trae 的目录也算进来。
-          copilot: true,
-          current: Boolean(isProjectCurrent || (sqliteRow.projectPath && sqliteRow.projectPath === ws)),
-          active: Boolean(sqliteRow.lastUpdated && now - sqliteRow.lastUpdated < IDLE_MS),
-          listed: Boolean(sqliteRow.lastUpdated && now - sqliteRow.lastUpdated < LISTED_MS),
-          live: true,
-          lastUpdated: sqliteRow.lastUpdated || 0,
-          runtime: { activated: true, paused: false, awaitingSessionIdle: false },
-          pending: 0,
-          todos: { total: 0, done: 0, doing: '', items: [] },
-          // Copilot 的 session_files 表给出本轮碰过的文件路径 + 工具名；有就带上，
-          // 没有回空列表（老版本 Copilot 可能没这张表 —— readCopilotFiles 已兜底回空）。
-          files: { count: (sqliteRow.files || []).length, recent: sqliteRow.files || [], lastAt: sqliteRow.lastUpdated || null },
-          phase: inWindow ? 'thinking' : 'idle',
-          action: '',
-          target: '',
-          tool: '',
-          context: [],
-          // 「思考中」屏上那句话：正在飞的那一轮用 VS Code 会话日志里的用户原话（最新），
-          // 否则退回 Copilot 的 turns 表里最后一条 user_message；summary（sessions 表）
-          // 是 Copilot 自己取的会话标题 —— 都带上，渲染层按它的规则择优展示。
-          prompt: (inFlight && sqliteRow.live && sqliteRow.live.prompt) || sqliteRow.lastUserMessage || '',
-          // 「任务完成」标记：9F 没有 hook，完成时刻只能从会话日志取（最新那一轮 request 的
-          // completedAt）—— 与 7F/8F 的 read*Done 同口径，超 DONE_TTL_MS 就算过期（不弹）。
-          doneAt: C.copilotDoneAt(sqliteRow, now),
-          doneTitle: sqliteRow.summary || '',
-          doneCount: sqliteRow.turnCount || 0,
-          doneFiles: [],
-          // 9F 没有 hook，拿不到"打断"信号 → 一律按正常完成显示，不猜取消
-          doneCancelled: false,
-          inferred: true,
-          hasPendingTurn: sqliteRow.hasPendingTurn || false,
-          // 「这一轮在不在飞」：true / false / null（没旁证）。台账同步器（copilot.js）
-          // 靠它决定这条会话的任务是"运行中"还是"已完成"，比时间窗准。
-          inFlight,
-          /** 正在飞的那一轮：用户原话 + 起始时间 + 轮序号（台账按轮记账用） */
-          livePrompt: (sqliteRow.live && sqliteRow.live.prompt) || '',
-          liveStartedAt: (sqliteRow.live && sqliteRow.live.startedAt) || 0,
-          liveIndex: sqliteRow.live ? sqliteRow.live.index : null,
-          /** 最近几轮各自的起止时间（会话日志里的 completedAt - elapsedMs） */
-          liveReqs: (sqliteRow.live && sqliteRow.live.reqs) || [],
-          /** 最近几轮各自**改动过的文件**（会话日志里写工具碰过的；read_file 不算） */
-          liveChanged: (sqliteRow.live && sqliteRow.live.changed) || [],
-          /** 逐轮清单（turns 表）：任务台账「每一轮一条」用 */
-          copilotTurns: sqliteRow.turns || [],
-        }
-      : sessionInfo(storage, id, {
-          current: isProjectCurrent,
-          now,
-          workspacePath: m.projectPath,
-          inWindow,
-          client,
-        });
+    let info;
+    if (sqliteRow) {
+      // 整条 enrich 已在 copilot.readCopilotSessions 完成（phase / inFlight / doneAt / live* 系列），
+      // 这里只叠加 reporter 这一层的 inWindow，以及统一"当前工程"口径（isProjectCurrent || projectPath===ws）。
+      info = { ...sqliteRow, inWindow: reporterInWindow || sqliteRow.inWindow };
+      info.current = Boolean(isProjectCurrent || (sqliteRow.projectPath && sqliteRow.projectPath === ws));
+    } else {
+      info = sessionInfo(storage, id, {
+        current: isProjectCurrent,
+        now,
+        workspacePath: m.projectPath,
+        inWindow: reporterInWindow,
+        client,
+      });
+    }
     if (!info.listed) continue;
     sessions.push({
       ...info,
@@ -2028,13 +1200,6 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   return cache.value;
 }
 
-/* → copilot.js */
-/* → copilot.js */
-
-/* → copilot.js */
-
-const C = require('./copilot');
-
 module.exports = {
   hasReporterState,
   reporterStateMeta,
@@ -2048,9 +1213,6 @@ module.exports = {
 
   listSessions,
 
-  findPluginStorage,
-  decodeDirName,
-  completeTruncatedWorkspace, // 被截断的 genie-history 目录名 → 完整工程路径（回归测试直接盯它）
   reporterMainPhase,
   freshestReporterWs,
   readReporterPhase, // 主控制台那口实时相位（打断后作废的逻辑在这里，回归测试直接盯它）

@@ -1042,7 +1042,10 @@ function roundIndexOf(taskId, prefix) {
  * @returns {number} 本次同步写/改了几条任务
  */
 function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
-  const sessions = listKiloSessions();
+  // 经 module.exports 解析数据源：测试把 listKiloSessions / readKiloRounds 换成熟数据桩，
+  // 这条同步器照样可端到端自检（见 test/taskSync.test.js）。生产里 module.exports 指向
+  // 读 Kilo 自己落盘的真函数，行为不变。
+  const sessions = module.exports.listKiloSessions();
   if (!sessions.length) return 0;
 
   const now = nowFn();
@@ -1055,7 +1058,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   const roundsOf = new Map();
   const runsOf = new Map();
   for (const s of sessions) {
-    roundsOf.set(s.id, readKiloRounds(s.id));
+    roundsOf.set(s.id, module.exports.readKiloRounds(s.id));
     runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
   }
   const isActiveOf = (s) => (roundsOf.get(s.id) || []).some((r) => r.outcome === 'running');
