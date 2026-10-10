@@ -568,7 +568,11 @@ function handlePlugin(p, src, ctx) {
       if (session.floor === p.id && endedSessionIds.has(session.sessionId)) table.delete(key);
     }
   }
-  const pluginSessions = (st.sessions || []).filter((s) => !endedSessionIds.has(s.id));
+  const pluginSessions = (st.sessions || []).filter(
+    (s) =>
+      !endedSessionIds.has(s.id) &&
+      !(src.client === 'codebuddy-plugin' && s.runtime && s.runtime.paused && String(s.runtime.pauseReason || '').toLowerCase() === 'cancel')
+  );
   if (!pluginSessions.length) return;
   for (const s of pluginSessions) {
     if (!claim(p.id, s.id)) continue;

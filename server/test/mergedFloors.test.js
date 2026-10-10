@@ -71,6 +71,7 @@ const { detectProducts } = require('../src/floors');
 const WS = '/tmp/ProjCB';
 /** 插件的会话 id：实测就是 hook payload 的 session_id（genie-history 的 conversationId 与之一字不差） */
 const PLUGIN_SID = '0819ef3ed32241a4970a17b8013f9289';
+const CANCELLED_PLUGIN_SID = 'cancelled-plugin-conversation';
 /** CLI 的会话 id：hook payload 的 session_id（uuid 形状） */
 const CLI_SID = 'aaaa1111-2222-3333-4444-555566667777';
 
@@ -88,6 +89,7 @@ function writeState(client, sessionId, extra, ws = WS) {
 const STORAGE = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'tencent-cloud.coding-copilot');
 const PROJ_DIR = path.join(STORAGE, 'genie-history', Buffer.from(WS).toString('base64'));
 fs.mkdirSync(path.join(PROJ_DIR, 'conversations', PLUGIN_SID), { recursive: true });
+fs.mkdirSync(path.join(PROJ_DIR, 'conversations', CANCELLED_PLUGIN_SID), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'todos'), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'file-changes', PLUGIN_SID), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'message-queue'), { recursive: true });
@@ -129,7 +131,14 @@ fs.writeFileSync(
 );
 fs.writeFileSync(
   path.join(STORAGE, 'message-queue', 'mq.json'),
-  JSON.stringify({ conversations: { [PLUGIN_SID]: { runtime: { activated: true, paused: false }, updatedAt: Date.now(), items: [] } } })
+  JSON.stringify({ conversations: {
+    [PLUGIN_SID]: { runtime: { activated: true, paused: false }, updatedAt: Date.now(), items: [] },
+    [CANCELLED_PLUGIN_SID]: {
+      runtime: { activated: true, paused: true, pauseReason: 'cancel', updatedAt: Date.now() - 2 * 60 * 60_000 },
+      updatedAt: Date.now() - 2 * 60 * 60_000,
+      items: [],
+    },
+  } })
 );
 
 // 两份 hook 状态文件：同一个工程、两种身份、各自有新鲜的相位
@@ -209,6 +218,7 @@ head('[A2] 同时开着 CLI 与 Plugin：是这一层里的两条会话，不是
   ok('插件那条走结构化那一场（plugin 来源、有运行态）', Boolean(pluginRow) && pluginRow.source === 'plugin' && pluginRow.live === true);
   ok('CLI 那条没有会话 jsonl 时由 hook 状态文件兜底列出', Boolean(cliRow) && cliRow.projectPath === WS, cliRow && JSON.stringify(cliRow.projectPath));
   ok('两条都归属同一工程', Boolean(pluginRow && cliRow) && pluginRow.projectPath === WS && cliRow.projectPath === WS);
+  ok('取消的 Plugin 会话不留在下拉列表', !floor.sessions.some((s) => s.sessionId === CANCELLED_PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
 }
 
 /* [A3] 相位各认各的（不串味） */

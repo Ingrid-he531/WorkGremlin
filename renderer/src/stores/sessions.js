@@ -17,7 +17,7 @@ import { consolePhaseLabel } from '../iso/mainConsole';
 import { t } from '../i18n/index.js';
 import { useProjectStore } from './project';
 
-const POLL_MS = 10_000;
+const POLL_MS = 5_000;
 /** 定时器放在 store 外面：它不是状态 */
 let timer = null;
 
