@@ -208,6 +208,13 @@ function readReporterPhase(workspacePath, client = '', session = '') {
       const floorMod = FLOORS[clientBase(j.client)];
       if (floorMod && typeof floorMod.phaseSuperseded === 'function' && floorMod.phaseSuperseded(j, sp, INTERRUPT_PHASE_SLACK_MS)) continue;
     }
+    // 会话已被用户取消（CLI 按 ESC 停止：reporter Stop 落盘的 done.cancelled）：相位冻在
+    // 「等待授权 / 调用工具」都不再是实时状态，必须作废，否则主控制台被取消后还亮「等待授权」。
+    // 插件形态的同款作废走上面 phaseSuperseded 的 message-queue 信号；这里补 CLI 形态这一份
+    // （readReporterDones 把 done.cancelled 写进 bySession、任务列表据此亮「已取消」—— 相位层这里
+    // 同步作废，主控制台才会切到「任务取消」红灯，而不是停在「等待授权」）。收尾不比相位旧（容差
+    // INTERRUPT_PHASE_SLACK_MS）才算戳破它，避免正常「调用工具 → 收尾」被旧相位误盖。
+    if (j.done && j.done.cancelled && j.done.at && Number(j.done.at) + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts || 0)) continue;
     if (!win || sp.ts > win.ts) {
       win = sp;
       winClient = String(j.client || '');
@@ -658,6 +665,32 @@ function readReporterDones(workspacePath, client = '') {
       const prev = id ? bySession.get(id) : null;
       if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
       if (!latest || Number(done.at) > Number(latest.at)) latest = done;
+      // CLI 形态取消（按 ESC 停止）：Stop 落盘 done.cancelled 是 reporter 自己的权威标记，楼层无关。
+      // 除了进 bySession（主控制台据此亮红灯），还要合成进 cancels —— 否则 sessionRegistry 的
+      // flushSynthesizedCancels 扫不到它，task_runs 会一直停在 CLI 自己上报的 done（result 还是
+      // 那句「interrupted by user」），滚动屏 / 任务状态显示「完成」，与主控制台红灯对不上。
+      // 插件形态取消走各楼层 synthMarks（它有 message-queue 信号，CLI 没有）；这里补 CLI 这条。
+      // result 用 done.said 那句原话，取消也照带产出摘要（"没干完"不是"没产出"）。
+      if (done.cancelled) {
+        const cancelledAt = Number(done.at) || 0;
+        // 只认"本轮开始之后"的取消：老取消（上一轮）不能算到新一轮头上（同 synthMarks 的 sinceTs 口径）。
+        const sinceTs = Number(j.taskStartedAt) || 0;
+        if (!sinceTs || cancelledAt >= sinceTs) {
+          const doneFiles = Array.isArray(done.files) ? done.files : [];
+          cancels.push({
+            sessionId: id,
+            taskId: j.taskId,
+            client: j.client,
+            workspacePath: ws,
+            at: cancelledAt,
+            title: j.taskTitle || '',
+            form: j.form || '',
+            files: doneFiles,
+            fileCount: Number.isFinite(Number(done.fileCount)) ? Number(done.fileCount) : doneFiles.length,
+            result: String(done.said || ''),
+          });
+        }
+      }
     }
     /* 楼层特有的"取消"标记合成（Claude/Qoder 的 transcript 信号、Trae 的 renderer.log、
        CodeBuddy 插件的 message-queue）已统一收口到各楼层模块的 synthMarks（见文件底部按

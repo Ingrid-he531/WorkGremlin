@@ -559,7 +559,18 @@ function refresh({ workspacePath = '', force = false } = {}) {
 // 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）。
 // 1F/9F 的 plugin 来源走这里；逻辑原样保留，只是从 refresh 的巨 switch 里抽出来。
 function handlePlugin(p, src, ctx) {
-  const { workspacePath, force, table, claim, upsert, listSessions, listReporterSessions, doneFieldsOf } = ctx;
+  const { workspacePath, force, table, claim, upsert, listSessions, listReporterSessions, doneFieldsOf, doneScans } = ctx;
+  /**
+   * 合并楼层（1F CodeBuddy）的**插件来源**也会产出「取消」标记：插件按停止一个 hook 事件都不发，
+   * 唯一真信号在 message-queue 的 `pauseReason:'cancel'`（见 floorCodebuddy.synthMarks），由
+   * readReporterDones 合成、挂在 doneScans 上。flushSynthesizedCancels / flushSupersededTasks
+   * 只扫 doneScans，而 handlePlugin 自己不调 doneFieldsOf（done* 字段走 listSessions 那条独立路径算），
+   * 于是 codebuddy-plugin 的 doneScan 永远是空，插件取消永远扫不到 → task_runs 一直挂 running，
+   * 滚动屏幕 / 任务列表收不到「已取消」，只能等新一轮开工（endStaleTasksOfSession）把上一轮顶掉。
+   * 这里把这一份 doneScan 建出来（与 doneFieldsOf 同一把缓存键），让 flush 能补刀 task/end(cancelled)。
+   */
+  const scanKey = `${workspacePath || ''}|${src.client || ''}`;
+  if (!doneScans.has(scanKey)) doneScans.set(scanKey, readReporterDones(workspacePath, src.client));
   const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
   const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
   const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));

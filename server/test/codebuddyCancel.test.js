@@ -57,8 +57,12 @@ function head(t) {
   console.log(`\n${t}`);
 }
 
-/** 写一个 CodeBuddy reporter 状态文件 + 对应的 transcript（末轮 state 可控） */
-function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phase, phaseTs }) {
+/**
+ * 写一个 CodeBuddy reporter 状态文件 + 对应的 transcript（末轮 state 可控）。
+ * @param {{ name: string, taskId?: string, startedAt?: number, running?: boolean, client?: string,
+ *           phase?: string, phaseTs?: number, done?: object }} o
+ */
+function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phase, phaseTs, done }) {
   const tp = path.join(HOME, `transcript-${name}.json`);
   fs.writeFileSync(tp, JSON.stringify({ requests: [{ state: running ? 'running' : 'complete' }] }));
   fs.writeFileSync(
@@ -73,6 +77,8 @@ function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phas
       transcriptPath: tp,
       // 相位：不传就不写（老夹具行为）；传了才写，供 [4] 验"取消后 stale 相位作废"
       ...(phase ? { sessionPhase: { phase, ts: phaseTs, workspacePath: WS } } : {}),
+      // 完成/取消标记：Stop 落盘（cancelled=true 即被用户掐断）；不传就不写
+      ...(done ? { done } : {}),
     })
   );
 }
@@ -146,6 +152,11 @@ head('[4] CodeBuddy 插件按停止：message-queue 写 pauseReason=cancel → �
   ok('取消时刻用 runtime.updatedAt（不拿"现在"冒充）', Boolean(hit) && hit.at === at, hit && String(hit.at));
   const mark = bySession.get(sid) || null;
   ok('控制台那枚取消标记也在（红灯能亮）', Boolean(mark) && mark.cancelled === true, JSON.stringify(mark));
+  // 纯插件客户端（handlePlugin 给 doneFieldsOf 喂的就是 src.client='codebuddy-plugin'）也要
+  // 合成取消：否则 doneScans 里永远没有这一份，flushSynthesizedCancels 扫不到，task_runs 一直挂
+  // running（见 sessionRegistry.handlePlugin 的修复）。
+  const plug = readReporterDones(WS, 'codebuddy-plugin');
+  ok('纯 codebuddy-plugin 客户端也合成取消（滚动屏幕 / 任务列表收得到「已取消」）', Boolean(plug.cancels.find((c) => c.sessionId === sid)), JSON.stringify(plug.cancels));
   // 顺手钉住相位作废：取消前那口 stale「思考中」不许再当实时相位喂给控制台
   // （否则红灯亮完 10s 又被喂回来，看着像"取消了还停在思考中"）
   const rp = readReporterPhase(WS, 'codebuddy,codebuddy-plugin', sid);
@@ -170,6 +181,82 @@ head('[6] 取消时刻早于本轮开始（上一轮的取消）→ 不算到新
   const { cancels, bySession } = readReporterDones(WS, 'codebuddy,codebuddy-plugin');
   ok('cancels 不含它', !cancels.some((c) => c.sessionId === sid), JSON.stringify(cancels));
   ok('也没有取消标记', !bySession.get(sid), JSON.stringify(bySession.get(sid)));
+}
+
+head('[7] CodeBuddy CLI 等待授权时按 ESC（Stop 落盘 done.cancelled）→ 主控制台相位作废（不再亮「等待授权」）');
+{
+  const sid = 'cb-cli-cancel-1';
+  const at = Date.now() - 5_000;
+  scenario({
+    name: sid,
+    taskId: 't_cli',
+    startedAt: Date.now() - 60_000,
+    running: true,
+    client: 'codebuddy',
+    // 冻结在「等待授权」（用户按 ESC 前那一刻）
+    phase: 'await',
+    phaseTs: Date.now() - 30_000,
+    // Stop 落盘的取消标记（任务列表据此亮「已取消」）
+    done: { cancelled: true, at },
+  });
+  const rp = readReporterPhase(WS, 'codebuddy', sid);
+  ok('相位作废（主控制台切到「任务取消」红灯，不再是「等待授权」）', rp === null, JSON.stringify(rp));
+}
+
+head('[7b] 正常「等待授权」、没有取消标记 → 相位照常上报（不误作废）');
+{
+  const sid = 'cb-cli-await-1';
+  // phaseTs 取当前时刻：保证越过 readReporterPhase 的「重启后残留相位」过滤（SERVER_STARTED_AT），
+  // 把验证点收口在"done.cancelled 不误作废正常 await"上。
+  scenario({
+    name: sid,
+    taskId: 't_cli2',
+    startedAt: Date.now() - 60_000,
+    running: true,
+    client: 'codebuddy',
+    phase: 'await',
+    phaseTs: Date.now(),
+  });
+  const rp = readReporterPhase(WS, 'codebuddy', sid);
+  ok('仍上报「等待授权」', Boolean(rp) && rp.phase === 'await', JSON.stringify(rp));
+}
+
+head('[7c] CLI 取消（done.cancelled）→ 也合成进 cancels（flush 才能把 task_runs 收成 cancelled，与主控制台/滚动屏统一）');
+{
+  const sid = 'cb-cli-cancel-2';
+  const at = Date.now() - 5_000;
+  scenario({
+    name: sid,
+    taskId: 't_cli3',
+    startedAt: Date.now() - 60_000,
+    running: true,
+    client: 'codebuddy',
+    phase: 'await',
+    phaseTs: Date.now() - 30_000,
+    // Stop 落盘：取消 + 那句「interrupted by user」产出摘要
+    done: { cancelled: true, at, said: 'interrupted by user', workspacePath: WS, files: [] },
+  });
+  const { cancels, bySession } = readReporterDones(WS, 'codebuddy');
+  const hit = cancels.find((c) => c.sessionId === sid) || null;
+  ok('cancels 含 CLI 取消（补刀 task/end(cancelled) 用）', Boolean(hit), JSON.stringify(cancels));
+  ok('result 带那句「interrupted by user」（取消也照带产出摘要）', Boolean(hit) && hit.result === 'interrupted by user', hit && hit.result);
+  const mark = bySession.get(sid) || null;
+  ok('bySession 取消标记也在（主控制台红灯）', Boolean(mark) && mark.cancelled === true, JSON.stringify(mark));
+}
+
+head('[7d] CLI 正常收尾（done.cancelled=false）→ 不合成 cancels（不误判成取消）');
+{
+  const sid = 'cb-cli-done-1';
+  scenario({
+    name: sid,
+    taskId: 't_cli4',
+    startedAt: Date.now() - 60_000,
+    running: false,
+    client: 'codebuddy',
+    done: { cancelled: false, at: Date.now() - 5_000, said: 'done', workspacePath: WS, files: [] },
+  });
+  const { cancels } = readReporterDones(WS, 'codebuddy');
+  ok('cancels 不含正常收尾', !cancels.some((c) => c.sessionId === sid), JSON.stringify(cancels));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
