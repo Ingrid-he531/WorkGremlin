@@ -82,11 +82,14 @@ function floorText(f) {
 }
 /** 这条任务的 agent 归哪个楼层（按 agent 基名认，CLI/插件同层） */
 function floorOfClient(c) {
-  const k = String(c || '').replace(/-plugin$/i, '').toLowerCase();
+  const k = String(c || '')
+    .replace(/-plugin$/i, '')
+    .split('@')[0]
+    .toLowerCase();
   if (!k) return null;
   return (
     floorOptions.value.find(
-      (f) => String(f.agent || f.client || '').replace(/-plugin$/i, '').toLowerCase() === k,
+      (f) => String(f.agent || f.client || '').replace(/-plugin$/i, '').split('@')[0].toLowerCase() === k,
     ) || null
   );
 }
