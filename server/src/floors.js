@@ -287,9 +287,37 @@ function detectProducts({ force = false } = {}) {
 const TTL = 60_000;
 let cache = { at: 0, products: [] };
 
+/* ============================================================== 任务同步器编排 */
+
+/**
+ * 启动所有"无 hook 上报能力"楼层的后台任务同步器。
+ *
+ * 这些楼层（6F Qoder 插件形态 / 7F Kilo / 8F OpenCode / 9F Copilot）不会自己往 tasks 表写东西，
+ * 靠这个兜底同步器每 5s 轮询各自本地库（session-store.db / kilo.db / opencode.db / local.db），
+ * 把会话或每一轮对话补写成 task + task_run，让任务列表和主控制台都能看到它们。
+ *
+ * 各同步器内部异常各自吞掉、不阻断主流程；返回的定时器都已 unref，不阻止进程退出。
+ * @param {{bus: object, repo: object, now: ()=>number}} ctx
+ * @returns {Array<object>} 各同步器注册的定时器
+ */
+function startTaskSyncers({ bus, repo, now }) {
+  const timers = [];
+  // 9F Copilot：无 reporter hook，每 5s 轮询 session-store.db 把会话写成 task + task_run。
+  timers.push(floors['9F'].startCopilotTaskSyncer({ bus, repo, now }));
+  // 7F Kilo Code：同 9F，轮询 kilo.db（含 model 信息）。
+  timers.push(floors['7F'].startKiloTaskSyncer({ bus, repo, now }));
+  // 8F OpenCode：轮询 opencode.db 的 session_message 流，按每一轮用户任务写。
+  timers.push(floors['8F'].startOpencodeTaskSyncer({ bus, repo, now }));
+  // 6F Qoder 插件形态：扩展无 hook 子系统，轮询 local.db，按每一轮写（标题=用户原话、产出=summary）。
+  // 同一成员若被 CLI 一路占着状态栏，这一路只写台账、不动相位（见 floorQoder.js 头）。
+  timers.push(floors['6F'].startQoderPluginTaskSyncer({ bus, repo, now }));
+  return timers;
+}
+
 /* ============================================================== 导出 */
 
 module.exports.FLOOR_CONTRACT = FLOOR_CONTRACT;
 module.exports.floors = floors;
 module.exports.floorOf = floorOf;
 module.exports.detectProducts = detectProducts;
+module.exports.startTaskSyncers = startTaskSyncers;
