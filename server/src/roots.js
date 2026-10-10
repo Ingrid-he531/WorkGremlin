@@ -37,6 +37,24 @@ function isFile(p) {
   }
 }
 
+/** 读 JSON 文件（容错：解析失败/不存在回 null） */
+function readJson(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** 读目录（容错：不存在/无权限回空数组） */
+function readDir(p) {
+  try {
+    return fs.readdirSync(p);
+  } catch {
+    return [];
+  }
+}
+
 /** 把绝对路径缩成 ~ 开头，UI 里好读 */
 function shorten(p) {
   if (!p) return '';
@@ -272,6 +290,8 @@ module.exports = {
   HOME,
   isDir,
   isFile,
+  readJson,
+  readDir,
   shorten,
   humanSize,
   resolveCommand,

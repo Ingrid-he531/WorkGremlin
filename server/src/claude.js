@@ -12,6 +12,8 @@ const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
 const { clientBase } = require('@workgremlin/shared');
+// 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
+const { readJson, readDir } = require('./roots');
 
 const HOME = os.homedir();
 
@@ -43,28 +45,6 @@ function isFile(p) {
     return fs.statSync(p).isFile();
   } catch {
     return false;
-  }
-}
-
-/**
- * 读目录（容错）
- */
-function readDir(p) {
-  try {
-    return fs.readdirSync(p);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * 读 JSON 文件（容错）
- */
-function readJson(p) {
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
-    return null;
   }
 }
 

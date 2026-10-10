@@ -16,7 +16,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { clientOf } = require('@workgremlin/shared');
 // globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
-const { globalStorageRoots } = require('./roots');
+const { globalStorageRoots, readJson, readDir } = require('./roots');
 
 const HOME = os.homedir();
 
@@ -30,28 +30,6 @@ const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
  * 按 mtime+size 增量，文件没变就不重读。
  */
 const _pauseCancelCache = new Map();
-
-/**
- * 读 JSON 文件（容错）
- */
-function readJson(p) {
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 读目录（容错）
- */
-function readDir(p) {
-  try {
-    return fs.readdirSync(p);
-  } catch {
-    return [];
-  }
-}
 
 /**
  * CodeBuddy 插件取消检测：从 message-queue 的 `pauseReason='cancel'` 读出取消时刻。

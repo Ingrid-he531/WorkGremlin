@@ -7,11 +7,10 @@
  *   · 插件那路（1F CodeBuddy 的插件形态）：就是本文件下面这套结构化落盘
  *     （genie-history / todos / message-queue / file-changes），能拿到运行态；
  *     TraeCode 的插件形态没有这套落盘（实测只有运行时文件），所以它那两路落盘
- *     （~/.trae-cn、~/.marscode）只作展示、不进会话来源（见 products.js 的 sources）。
+ *     （~/.trae-cn、~/.marscode）只作展示、不进会话来源（见 trae.js）。
  *   · CLI 那路（1F CodeBuddy、2F、3F、4F）：会话在各自的会话 jsonl 里，只有文件时间可靠；
  *   · hook 那路（5F TraeCode、1F CodeBuddy CLI 的兜底）：连 jsonl 都没有时，
  *     会话来源就是 reporter 状态文件（listReporterSessions）。
- * 楼层吃哪几路由 server/src/products.js 的 sources 声明（合并楼层可多路）。
  *
  * 真源是插件自己的落盘（不经我们同意也一直在写），四个目录互相索引：
  *   genie-history/{base64(工程目录)}/conversations/{会话id}/   工程 ↔ 会话名单（目录本身是空的）
@@ -35,6 +34,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('path');
 const { clientBase } = require('@workgremlin/shared');
+// 通用落盘扫描基础设施（目录约定 + 容错文件读取），readJson / readDir 统一从 roots 取，不在各处重复定义
+const { readJson, readDir } = require('./roots');
 // 楼层能力模块（module group）：每个楼层（trae / claude / codebuddy / copilot）实现同一份
 // "会话能力"接口，sessions.js 一律用 `楼层.能力` 成员访问。新增楼层 = 在 FLOORS 里加一行
 // require + 在该 floor 模块里实现需要的几个能力，调用点不用改。
@@ -56,12 +57,8 @@ const plugin = require('./plugin');
 
 const FLOORS = { trae, claude, codebuddy, copilot };
 
-const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
-const IS_WIN = process.platform === 'win32';
-
 // 落盘窗口常量（与 CLI 楼层对齐）定义在 plugin.js，sessions.js / copilot.js 共用同一份，避免各定义一遍
 const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
-
 
 
 /**
@@ -73,22 +70,6 @@ const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
  * 合并楼层（1F CodeBuddy）另有一路 CLI 身份：见下面的 clientHit —— 它可以一次收一串 client。
  */
 
- /**
- * 楼层身份匹配（轴 1 的过滤口径，全文件只此一处）。
- *
- * want 既可以是**单个 client**（如 'codebuddy-plugin'），也可以是**逗号分隔的一串** ——
- * 合并楼层（1F CodeBuddy 把 CLI 与 Plugin 合成一层）就是"一个楼层吃两路上报身份"，
- * 它把 clients 列表一起传进来（见 server/src/products.js 的 sources / clients）。
- * 别的楼层一律传单值，行为与改动前逐字一致（精确比对，不做基名放宽）——
- * 合并楼层的两路（如 5F TraeCode = trae + trae-plugin）则一次收一串。
- *
- * got 是状态文件里记的 client；老状态文件没有 client 字段 → 按 codebuddy（CLI）归属。
- * @param {string} want 楼层要求的 client（单个，或逗号分隔多个）；空 = 不限
- * @param {string} got 状态文件里的 client
- */
-/** 老状态文件没有 client 字段时，按其 CLI 形态归属到 codebuddy（见 clientHit）。 */
-const LEGACY_STATE_CLIENT = 'codebuddy';
-
 function clientHit(want, got) {
   if (!want) return true;
   const set = String(want)
@@ -96,7 +77,7 @@ function clientHit(want, got) {
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   if (!set.length) return true;
-  return set.includes(String(got || LEGACY_STATE_CLIENT).toLowerCase());
+  return set.includes(String(got || '').toLowerCase());
 }
 
 /** 缓存：列表扫盘 + 读十几个小 json，5 秒足够 */
@@ -115,59 +96,9 @@ const SERVER_STARTED_AT = Date.now();
 // 落盘窗口常量（IDLE_MS / BUSY_MS / FRESH_MS / LISTED_MS / DONE_TTL_MS）与 Copilot 共享，
 // 统一定义在 plugin.js，避免 sessions.js / copilot.js 各写一份。上面已由 `const { ... } = plugin` 引入。
 
-/* ------------------------------ 基础工具 ------------------------------ */
-function readJson(p) {
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function readDir(p) {
-  try {
-    return fs.readdirSync(p);
-  } catch {
-    return [];
-  }
-}
-
 /* ------------------------------ 会话数据 ------------------------------ */
-
 /** 每个会话的待办 / 改动文件 / 消息队列运行态的读取收口在 plugin.js（plugin.readTodos / readFileChanges / readRuntime）。 */
 
-/**
- * CodeBuddy **插件（IDE 扩展）**的"用户按了停止"信号。
- *
- * 插件取消时**一个 hook 事件都不发**（实测 2026-09-29：扩展日志里是
- * `AgentState.cancelled → ChatStateEvent.stop`、`AgentSessionManager state: running → cancelled`、
- * `MessageQueueStateListener Session settled … state=cancelled`，但**没有任何 HookExecutor 去跑
- * Stop / FinalStop**）—— 所以 CLI 那条 `FinalStop` 在 IDE 形态根本等不到。好在插件自己把会话
- * 运行态写在 `<globalStorage>/<codebuddy 插件目录>/message-queue/*.json` 里：
- *
- *   conversations[<会话 id>].runtime = { activated: true, paused: true,
- *                                        pauseReason: "cancel", updatedAt: <按停止那一刻> }
- *
- * 实测 18:03:44 那次停止，`4a670fe4…` 那条会话的 runtime 就是
- * `{"paused":true,"pauseReason":"cancel","updatedAt":1790676224193}` —— 会话 id 与
- * hook 状态文件的 sessionId 一字不差，时间戳就是取消时刻。
- *
- * 这份落盘**我们本来就在读**（`sessionInfo` / `readRuntime` 一直读 message-queue），
- * 所以不新增任何"新路径"，只是把 `pauseReason='cancel'` 当取消信号用。
- *
- * 只认 `pauseReason === 'cancel'` 且 `updatedAt ≥ 本轮开始`：`paused` 还有别的来源
- * （手工暂停 / 队列等待），拿 `paused` 当取消会误报；老时间戳也不能算到新一轮头上。
- * @param {string} sessionId
- * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）
- * @returns {number} 取消时刻（0 = 没有 / 判不出）
-
-/**
- * reporter hook 在"等权限"时会把要执行的工具 + 目标文件写进 ~/.workgremlin/hooks/<工位>.json
- * 的 `await` 字段（见 packages/reporter/src/hook.js）。这里读回来给主控制台用。
- * 多工位时取 workspacePath 匹配且最新的一条；没有匹配工程就取最新一条。
- * 超过新鲜期的（默认 5 分钟）视为过期作废，避免权限已处理却还显示"等待授权"。
- * @returns {{tool: string, file: string}|null}
- */
 const AWAIT_TTL_MS = 5 * 60_000;
 /**
  * 任务"还在跑"的判定窗口：只有最近**有过 hook 事件**（UserPromptSubmit / PreToolUse /
@@ -1203,16 +1134,12 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
 module.exports = {
   hasReporterState,
   reporterStateMeta,
-  // 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）
-  hasOtherLiveSession,
+  hasOtherLiveSession,// 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）
   readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
   readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
-  listReporterSessions, // 会话只能靠 hook 的楼层（5F TraeCode）与合并楼层的 hook 那一路（1F CodeBuddy CLI）
-
+  listReporterSessions, // 会话只能靠 hook 的楼层（5F TraeCode/ 1F CodeBuddy CLI）
   sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
-
   listSessions,
-
   reporterMainPhase,
   freshestReporterWs,
   readReporterPhase, // 主控制台那口实时相位（打断后作废的逻辑在这里，回归测试直接盯它）

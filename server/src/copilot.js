@@ -27,7 +27,9 @@ const os = require('node:os');
 const { clientBase, clientOf } = require('@workgremlin/shared');
 // 插件落盘读取（findPluginStorage / globalStorageRoots / workspaceStorageRoots / 落盘窗口常量）
 // 收口在 plugin.js；本文件只依赖它，不再反向 require sessions.js（消除 sessions ↔ copilot 的循环依赖）。
-const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, readJson, IDLE_MS, LISTED_MS, DONE_TTL_MS } = require('./plugin');
+const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, IDLE_MS, LISTED_MS, DONE_TTL_MS } = require('./plugin');
+// 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
+const { readJson, readDir } = require('./roots');
 const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -41,9 +43,6 @@ function isFile(p) {
 }
 function isDir(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
-}
-function readDir(p) {
-  try { return fs.readdirSync(p); } catch { return []; }
 }
 /* ───────────── 原 sessions.js 的 Copilot 读取函数 ───────────── */
 

@@ -19,7 +19,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { dataRoots, globalStorageRoots, isDir, isFile } = require('./roots');
+const { dataRoots, globalStorageRoots, isDir, isFile, readJson, readDir } = require('./roots');
 const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -34,25 +34,11 @@ const FRESH_MS = 2 * 60_000; // 落盘在这么久之内 → 这一轮对话还�
 const LISTED_MS = 60 * 60_000; // 会话"还在下拉里"的窗口（见 sessions.js 说明）
 const DONE_TTL_MS = 10 * 60_000; // 完成标记的"新鲜期"：只有这么久之内结束的才算"刚发生"
 
-function readDir(p) {
-  try {
-    return fs.readdirSync(p);
-  } catch {
-    return [];
-  }
-}
 function mtime(p) {
   try {
     return Math.round(fs.statSync(p).mtimeMs);
   } catch {
     return 0;
-  }
-}
-function readJson(p) {
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
-    return null;
   }
 }
 
@@ -233,7 +219,6 @@ module.exports = {
   PLUGIN_RE,
   findPluginStorage,
   dataRoots,
-  readJson,
   globalStorageRoots,
   workspaceStorageRoots,
   decodeDirName,
