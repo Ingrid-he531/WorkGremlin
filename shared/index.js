@@ -337,25 +337,39 @@ const IPC_EVENTS = Object.freeze({
  * 以后再加别产品/变体，只需在 products.js 改一条楼层（sources 里挂几路、clients 就收几种身份）。
  */
 
-/** 去 '-plugin' 后缀，拿到产品基名（小写）；非法/空输入返回 '' */
-function clientBase(client) {
-  return String(client || '').replace(/-plugin$/i, '').toLowerCase();
-}
-
-/** 是否 plugin 形态（带 -plugin 后缀） */
+/**
+ * 是否 plugin 形态（IDE 扩展）。判定以 hook event 自报的 `client`（形态）为准，
+ * 目前以 vscode 系 IDE 为 plugin；以后支持其他 IDE（jetbrains / cursor …）在此数组扩展。
+ *
+ * 注意：agent 直接代表楼层，client 只描述形态（vscode / cli …），不再用 `agent + '-plugin'`
+ * 这样的合成字符串当身份。磁盘落盘键等内部用途如需合成，由各调用点按此函数就地拼，不再有 clientOf。
+ * @param {string} client 形态（vscode / cli / codebuddy …）
+ */
+const PLUGIN_FORMS = ['vscode'];
 function isPluginClient(client) {
-  return /-plugin$/i.test(String(client || ''));
+  return PLUGIN_FORMS.includes(String(client || '').toLowerCase());
 }
 
-/** 由 agent 基名 + 是否 plugin 拼出 client 字符串 */
-function clientOf(agent, plugin) {
+/**
+ * 由 agent 基名 + 形态就地拼出磁盘落盘键（<agent>[-plugin]）。
+ * 仅内部落盘 / reporter 相位使用；数据模型与身份里不再出现合成字符串。
+ * @param {string} agent 楼层基名
+ * @param {string} form 形态（vscode 等 plugin 形态才追加 -plugin）
+ */
+function diskKey(agent, form) {
   const a = String(agent || '').toLowerCase();
-  return plugin ? `${a}-plugin` : a;
+  return isPluginClient(form) ? `${a}-plugin` : a;
 }
 
-/** client 反推 agent 基名（= clientBase） */
-function agentOf(client) {
-  return clientBase(client);
+/**
+ * WorkGremlin 家目录：默认 ~/.workgremlin，可用 WORKGREMLIN_HOME 覆盖。
+ * 用懒加载 node:os / node:path —— 本模块同时被 Node 与浏览器(renderer)引用，不能在顶层
+ * require Node 内建模块，否则 renderer 打包会崩。home() 只在 Node 侧被调用，renderer 永不触发里面的 require。
+ */
+function home() {
+  const os = require('node:os');
+  const path = require('node:path');
+  return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
 }
 
 module.exports = {
@@ -380,8 +394,7 @@ module.exports = {
   fnv1a32,
   formatDuration,
   formatClock,
-  clientBase,
   isPluginClient,
-  clientOf,
-  agentOf,
+  diskKey,
+  home,
 };

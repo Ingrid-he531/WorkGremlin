@@ -22,10 +22,10 @@ const { app } = require('electron');
 const net = require('node:net');
 const { spawn } = require('child_process');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { home } = require('@workgremlin/shared');
 
-const HOME = process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
+const HOME = home();
 const SERVER_JSON = path.join(HOME, 'server.json');
 // 打包后指向 asar 内的项目根；dev 下指向项目根。
 // 注意：Electron 以 `electron <file.js>` 启动时 app.getAppPath() 只返回该文件所在目录

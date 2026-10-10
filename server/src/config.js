@@ -9,14 +9,9 @@
 
 const fs = require('node:fs');
 const net = require('node:net');
-const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DEFAULTS } = require('@workgremlin/shared');
-
-function home() {
-  return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
-}
+const { DEFAULTS, home } = require('@workgremlin/shared');
 
 function ensureHome() {
   const dir = home();

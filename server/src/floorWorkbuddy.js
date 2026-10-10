@@ -9,7 +9,7 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { clientOf } = require('@workgremlin/shared');
+const { diskKey } = require('@workgremlin/shared');
 
 const HOME = os.homedir();
 
@@ -20,7 +20,7 @@ const meta = {
   cmd: 'workbuddy',
   agent: 'workbuddy',
   plugin: false,
-  dataKind: clientOf('workbuddy', false),
+  dataKind: 'workbuddy',
   // 落盘探测（findDataPath 用）
   matchRe: [/^workbuddy/i, /^work-?buddy/i],
   homeDirs: [path.join(HOME, '.workbuddy')],

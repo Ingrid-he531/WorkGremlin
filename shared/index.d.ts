@@ -182,10 +182,9 @@ export declare function formatDuration(ms: number): string;
 export declare function formatClock(ms: number): string;
 
 /**
- * 智能体（agent）与客户端（client）的关系：client = agent，或 agent + '-plugin'。
- * 这是全局唯一合同（hook 的 eventClient 据此产出 client 字段，server/前端据此归层）。
+ * 新合同（与 hook 的 eventClient 一致）：agent 直接代表楼层，client 只描述形态
+ * （vscode / cli …）。isPluginClient(client) 判定 plugin 形态；diskKey(agent, form)
+ * 仅内部落盘合成 <agent>[-plugin] 串，数据模型与身份里不再出现合成字符串。
  */
-export declare function clientBase(client: string): string;
 export declare function isPluginClient(client: string): boolean;
-export declare function clientOf(agent: string, plugin: boolean): string;
-export declare function agentOf(client: string): string;
+export declare function diskKey(agent: string, form: string): string;

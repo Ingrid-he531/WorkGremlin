@@ -61,7 +61,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { DEFAULTS, clientOf } = require('@workgremlin/shared');
+const { DEFAULTS, diskKey } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
 
@@ -82,15 +82,15 @@ const meta = {
     {
       kind: 'opencode',
       label: 'CLI/Desktop',
-      client: clientOf('opencode', false),
+      client: 'opencode',
       dirs: [opencodeHome()],
       note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
     // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client = opencode-plugin）。
-    { kind: 'hook', client: clientOf('opencode', true) },
+    { kind: 'hook', client: diskKey('opencode', 'vscode') },
   ],
   hookSource: true,
-  dataKind: clientOf('opencode', false),
+  dataKind: 'opencode',
   // OpenCode CLI 自己的安装目录（PATH 查不到时兜底）
   cliBinDirs: [path.join(HOME, '.opencode', 'bin')],
 };
@@ -1206,14 +1206,14 @@ function startOpencodeTaskSyncer(ctx) {
  * @param {object} ctx 框架提供的共享工具
  */
 function opencodeHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, clientOf, doneFieldsFromReporter } = ctx;
+  const { claim, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, doneFieldsFromReporter } = ctx;
   for (const s of listOpencodeSessions()) {
     if (!claim(p.id, s.id)) continue;
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const ph = readOpencodePhase(s.id) || null;
     const doneTruth =
-      readReporterDone(s.projectPath || workspacePath, clientOf('opencode', true), s.id) ||
-      readReporterDone(s.projectPath || workspacePath, clientOf('opencode', false), s.id);
+      readReporterDone(s.projectPath || workspacePath, diskKey('opencode', 'vscode'), s.id) ||
+      readReporterDone(s.projectPath || workspacePath, 'opencode', s.id);
     upsert({
       floor: p.id,
       id: s.id,

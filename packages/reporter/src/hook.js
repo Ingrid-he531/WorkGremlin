@@ -23,20 +23,16 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
 
 // 只取 readServerInfo（探测本地 server 的 port / token，转发 POST 要用）；其余路由常量由服务端持有。
 const { readServerInfo } = require('./index');
+const { home } = require('@workgremlin/shared');
 
 const REQ_TIMEOUT_MS = 2_000;
 const STDIN_TIMEOUT_MS = 1_500;
 
 const DEBUG = process.env.WORKGREMLIN_HOOK_DEBUG === '1';
 const debug = (...args) => { if (DEBUG) console.error('[workgremlin-hook]', ...args); };
-
-function home() {
-  return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
-}
 
 /** 追加式事件时间线（诊断用），写到 ~/.workgremlin/hooks/events.log */
 function trace(event, extra) {

@@ -47,7 +47,6 @@
 
 /* Node 内置模块，插件运行环境自带的，不需要额外依赖。 */
 import fs from "node:fs"
-import os from "node:os"
 import path from "node:path"
 
 /**
@@ -57,6 +56,7 @@ import path from "node:path"
  */
 import { createRequire } from "node:module"
 const require_ = createRequire(import.meta.url)
+const { home } = require_('@workgremlin/shared')
 
 /* ------------------------------ 上报身份 ------------------------------ */
 
@@ -110,9 +110,7 @@ function resolveClient(options, base = "opencode") {
 
 /** 状态文件根：与 server/src/sessions.js 的 reporterHookHome() 同一口径 */
 function hooksDir() {
-  const explicit = typeof process !== "undefined" && process.env && process.env.WORKGREMLIN_HOME
-  const home = explicit || path.join(os.homedir(), ".workgremlin")
-  return path.join(home, "hooks")
+  return path.join(home(), "hooks")
 }
 
 /**
@@ -121,8 +119,8 @@ function hooksDir() {
  * 带上"工程 + 会话"两级归属是必须的：同一个工程里同一个产品开着多条会话时，
  * 少了这两级，A 会话的相位会被 B 覆盖（见 hook.js 里 statePath 的长注释）。
  */
-function statePath(client, workspacePath, sessionId) {
-  const parts = [String(client), String(workspacePath || "")]
+function statePath(diskClient, workspacePath, sessionId) {
+  const parts = [String(diskClient), String(workspacePath || "")]
   if (sessionId) parts.push(String(sessionId))
   const key = parts.join("@").replace(/[^a-zA-Z0-9._-]/g, "_")
   return path.join(hooksDir(), `${key}.json`)
@@ -175,9 +173,8 @@ function writeState(file, patch) {
 
 /** 读 ~/.workgremlin/server.json（认 WORKGREMLIN_HOME，与 hook.js 的 readServerInfo 同口径） */
 function readServerInfo() {
-  const home = (process.env && process.env.WORKGREMLIN_HOME) || path.join(os.homedir(), ".workgremlin")
   try {
-    return JSON.parse(fs.readFileSync(path.join(home, "server.json"), "utf8"))
+    return JSON.parse(fs.readFileSync(path.join(home(), "server.json"), "utf8"))
   } catch {
     return null
   }
@@ -385,14 +382,13 @@ function subagentOf(input) {
  * @param {{location?: any, base?: string}} ctx `base` = 产品基名，**由入口给**（见 resolveClient）
  */
 function createIngestPlugin(options, { location, base } = {}) {
-  const client = resolveClient(options, base)
-  /**
-   * 形态（落 task_runs.form，任务列表按它显示「… CLI」/「… Plugin」）。
-   * 与 `client` 的 `-plugin` 后缀是同一件事，所以只在这里算一次 —— 原先开轮（task/start）
-   * 与工具计数（tool/use）两处各写一遍 `client.endsWith("-plugin") ? …`，将来改一处必漏另一处。
-   * 口径与 shared 的 isPluginClient 一致。
-   */
-  const form = /-plugin$/i.test(client) ? "plugin" : "cli"
+  // 形态（落 task_runs.form，任务列表按它显示「… CLI」/「… Plugin」）。插件即 IDE 扩展，恒为 vscode；
+  // 口径与 shared.isPluginClient 一致（vscode 系 IDE 算 plugin）。agent 直接代表楼层。
+  const client = 'vscode'
+  // 落盘键：base ± plugin（IDE 扩展恒为 base-plugin）。状态文件与 hook.js 的 statePath 同一套命名，
+  // 也是 readReporterPhase 里 clientHit 匹配的依据 —— 不能传形态，否则楼层读数错位。
+  const diskClient = resolveClient(options, base)
+  const form = 'vscode'
   /** 会话 id → 工程路径（session.created 给的是权威值，事件信封的 location.directory 兜底） */
   const dirs = new Map()
   /** 工具调用 id → 工具名（`session.tool.called` 不带工具名，只有配对的 input.started 里有） */
@@ -495,8 +491,8 @@ function createIngestPlugin(options, { location, base } = {}) {
             return false
           }
           const res = await ingest.post("/register", {
-            memberId: client,
-            name: client,
+            memberId: base,
+            name: base,
             client,
             role: "agent",
             workspacePath: ownDir,
@@ -557,17 +553,17 @@ function createIngestPlugin(options, { location, base } = {}) {
       const ws = wsOf(event)
       const now = Date.now()
       const patch = {
-        client,
+        client: diskClient,
         sessionId: sid,
         hb: { pid: process.pid, lastEventAt: now },
         sessionPhase: { phase, ts: now, workspacePath: ws, ...phaseFields },
       }
       if (done) patch.done = done
-      writeState(statePath(client, ws, sid), patch)
+      writeState(statePath(diskClient, ws, sid), patch)
       // 心跳跟着相位一起发：>60s 没有心跳服务端就把这只成员标 degraded 灰显
       // 带上真实工程路径：服务端以它为准反查工程（见 bus.projectForReport）——
       // 不带的话会落到"办公室当前打开的工程"，开着 A、在 B 里干活时成员/心跳就挂错了工程。
-      post("/heartbeat", { memberId: client, sessionId: sid, ts: now, workspacePath: ws })
+      post("/heartbeat", { memberId: base, sessionId: sid, ts: now, workspacePath: ws })
     } catch {
       /* 上报失败不影响 agent */
     }
@@ -639,14 +635,14 @@ function createIngestPlugin(options, { location, base } = {}) {
     // 会话标题默认是 "New session - <时间戳>" 这种没信息量的值，拿它当"用户问了什么"是编造。
     // 拿不到原话就写空串（而不是留着上一轮的旧 prompt）—— 空屏好过显示上一轮的内容。
     try {
-      writeState(statePath(client, wsOf(event), sid), { done: null, taskTitle: said })
+      writeState(statePath(diskClient, wsOf(event), sid), { done: null, taskTitle: said })
     } catch {
       /* 抹不掉就算了：readReporterDone 有 TTL，最多多显示一会儿 */
     }
     // 形态标记（form）在 createIngestPlugin 里算一次，这里直接用。
     // 工程由 post() 里的 ensureRegistered 保证已解析（拿不到就整条不发 —— 见那里的注释）。
     post("/task/start", {
-      memberId: client,
+      memberId: base,
       taskId,
       title,
       sessionId: sid,
@@ -669,7 +665,7 @@ function createIngestPlugin(options, { location, base } = {}) {
     if (!file) return
     const set = roundFiles.get(sid)
     if (set) set.add(file)
-    post("/file/touch", { memberId: client, files: [file], op: "write", sessionId: sid, client, workspacePath: ws })
+    post("/file/touch", { memberId: base, files: [file], op: "write", sessionId: sid, client, workspacePath: ws })
   }
 
   /**
@@ -714,7 +710,7 @@ function createIngestPlugin(options, { location, base } = {}) {
     const all = [...new Set([...stepped, ...touched].map(rel).filter(Boolean))]
     // 形态标记（form）在 createIngestPlugin 里算一次，这里直接用
     post("/task/end", {
-      memberId: client,
+      memberId: base,
       taskId,
       state,
       result: String(result || "").slice(0, 4_000) || undefined,
@@ -731,8 +727,8 @@ function createIngestPlugin(options, { location, base } = {}) {
     const said = String(result || "").trim()
     if (said) {
       post("/message", {
-        memberId: client,
-        from: client,
+        memberId: base,
+        from: base,
         to: null,
         type: "result",
         subject: null,
@@ -811,7 +807,7 @@ function createIngestPlugin(options, { location, base } = {}) {
         if (sid && model) {
           models.set(sid, model)
           // 主控制台要显示模型；轮询那一路本来也能从库里取到，装了插件就用真值
-          writeState(statePath(client, ws, sid), { model })
+          writeState(statePath(diskClient, ws, sid), { model })
         }
         break
       }
@@ -827,7 +823,7 @@ function createIngestPlugin(options, { location, base } = {}) {
         const model = String((info.model && (info.model.id || info.model.modelID)) || info.modelID || "")
         if (sid && model) {
           models.set(sid, model)
-          writeState(statePath(client, dirOf() || wsOf(event), sid), { model })
+          writeState(statePath(diskClient, dirOf() || wsOf(event), sid), { model })
         }
         break
       }
@@ -882,7 +878,7 @@ function createIngestPlugin(options, { location, base } = {}) {
           const files = steppedOf(sid, ws)
           endTask(event, sid, "done", result || titles.get(sid) || "")
           // 收工扫场：带 result 的"待汇报"保留给服务端的汇报动画
-          post("/ghost", { action: "sweep", all: false, workspacePath: ws, client, sessionId: sid })
+          post("/ghost", { action: "sweep", all: false, workspacePath: ws, client: diskClient, sessionId: sid })
           report(event, "done", {
             action: "",
             done: {
@@ -952,7 +948,7 @@ function createIngestPlugin(options, { location, base } = {}) {
             const taskId = taskIds.get(sid) || ""
             if (toolName && taskId) {
               post("/tool/use", {
-                memberId: client,
+                memberId: base,
                 taskId,
                 tool: toolName,
                 sessionId: sid,
@@ -975,7 +971,7 @@ function createIngestPlugin(options, { location, base } = {}) {
               id: String(part.callID || ""),
               parent: taskIds.get(sid) || "",
               model: "",
-              client,
+              client: diskClient,
               sessionId: sid,
             })
           }
@@ -1045,7 +1041,7 @@ function createIngestPlugin(options, { location, base } = {}) {
           cancelledAt.set(sid, Date.now())
           endTask(event, sid, "cancelled", result)
           assistantText.delete(sid)
-          post("/ghost", { action: "sweep", all: true, workspacePath: ws, client, sessionId: sid })
+          post("/ghost", { action: "sweep", all: true, workspacePath: ws, client: diskClient, sessionId: sid })
           report(event, "idle", {
             done: {
               at: Date.now(),
@@ -1062,7 +1058,7 @@ function createIngestPlugin(options, { location, base } = {}) {
           // 清掉状态文件里的 taskId：否则服务端兜底合成取消标记会在 ≥TASK_RUN_MS 后
           // 再补一发 task/end(cancelled)（重复），也避免任务槽一直占着、相位卡在「调用工具」。
           // 与 hook.js 的 Interrupt 同口径（它也把 taskId 清成 null）。
-          try { writeState(statePath(client, ws, sid), { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 }) } catch {}
+          try { writeState(statePath(diskClient, ws, sid), { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 }) } catch {}
           break
         }
         report(event, "idle")

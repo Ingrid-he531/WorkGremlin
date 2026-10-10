@@ -10,7 +10,7 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { clientOf } = require('@workgremlin/shared');
+const { diskKey } = require('@workgremlin/shared');
 
 const HOME = os.homedir();
 
@@ -28,7 +28,7 @@ const meta = {
   // 但确实在跑（会话就是证据），所以 altPluginRe 补抓安装证据。
   altPluginRe: RE_CODEX_HOST,
   sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
-  dataKind: clientOf('codex', false),
+  dataKind: 'codex',
   // 落盘探测（findDataPath 用）
   matchRe: [/^codex/i],
   homeDirs: [path.join(HOME, '.codex')],

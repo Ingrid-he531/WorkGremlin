@@ -444,7 +444,8 @@ function codexForm(transcriptPath) {
     if (!p || typeof p !== 'object') continue;
     if (obj.type !== 'session_meta' && !p.source && !p.originator) continue;
     const who = `${String(p.source || '')} ${String(p.originator || '')}`.toLowerCase();
-    if (/vscode|jetbrains|extension|plugin|visual studio/.test(who)) return 'plugin';
+    if (/jetbrains/.test(who)) return 'jetbrains';
+    if (/vscode|visual studio|extension|plugin/.test(who)) return 'vscode';
     if (who.trim()) return 'cli';
   }
   return '';
@@ -455,7 +456,7 @@ function qoderForm(transcriptPath) {
   for (const obj of headJsonLines(transcriptPath)) {
     const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
     if (!ep) continue;
-    if (ep.includes('vscode') || ep.includes('plugin')) return 'plugin';
+    if (ep.includes('vscode') || ep.includes('plugin')) return 'vscode';
     return ep === 'cli' ? 'cli' : '';
   }
   return '';
@@ -858,13 +859,15 @@ async function reportReplies(ctx, agent, taskId, replies, sessionId, client) {
 /* ============================== 形态（cli / plugin）判定 ============================== */
 
 /**
- * 由事件自报的 client 字段判定 plugin 形态。vscode / extension / jetbrains / plugin 一律算 plugin；
- * CLI 用户（client 为 null / 'codex' / 'cli' 等）返回 ''（交给 impl.formOf 或落盘头再判）。
- * hook 已把原始 client 原样透传过来，plugin 判定就以此为准，不再靠拼 `-plugin` 后缀或猜落盘头。
+ * 由事件自报的 client 字段取出**形态**（form）。IDE 扩展（vscode / jetbrains / extension /
+ * plugin / cursor / windsurf …）原样返回该 IDE 串，便于以后扩展；其余（CLI，client 为产品名 /
+ * 'cli' / null）一律归为 'cli'，空返回 ''。
+ * agent 直接代表楼层，client 只描述形态 —— 与 hook event 的语义一致。
  */
-function clientPluginForm(ev) {
+function clientFormOf(ev) {
   const c = String((ev && ev.client) || '').toLowerCase();
-  return /vscode|jetbrains|extension|plugin/.test(c) ? 'plugin' : '';
+  if (/vscode|jetbrains|extension|plugin|cursor|windsurf/.test(c)) return c;
+  return c ? 'cli' : '';
 }
 
 /* ============================== 通用事件开关（忠实搬运 hook.js main） ============================== */
@@ -880,8 +883,9 @@ async function runHookEvent(ev, ctx, impl) {
   const event = ev && ev.hook_event_name;
   if (!event) return { ok: false, error: 'missing hook_event_name' };
 
-  const client = impl.client;
-  const memberId = String(ev.agent || client);
+  const agent = String(ev.agent || impl.client || '').replace(/-plugin$/i, '');
+  const client = clientFormOf(ev); // 形态（vscode / cli / ''）作为 client 列；agent 直接代表楼层
+  const memberId = agent;
   const sessionId = String(ev.session_id || '');
   const cwd = String(ev.cwd || '');
   const base = { project, workspacePath, memberId, client };
@@ -900,7 +904,7 @@ async function runHookEvent(ev, ctx, impl) {
 
   // plugin 形态优先由事件自报的 client 判定（vscode 只是壳，rollout 头常仍标 cli，猜不准），
   // 落盘头只作 fallback。hook 已把原始 client 透传过来，这里按它识别 plugin。
-  const clientForm = clientPluginForm(ev);
+  const clientForm = clientFormOf(ev);
   const formOf = () => clientForm || impl.formOf(tp());
 
   // 给上一轮补报 token（新一轮开始时用）

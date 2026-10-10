@@ -48,7 +48,6 @@ for (const id of Object.keys(floors)) {
   if (m && m.agent) metaByAgent[String(m.agent)] = m;
 }
 const { resolveProjectName } = require('./project');
-const { clientOf } = require('@workgremlin/shared');
 
 /** 超过这么久没有事件 → 从表里移除 */
 const TIMEOUT_MS = 60 * 60_000;
@@ -510,7 +509,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
     now, workspacePath, force,
     table, backend, TIMEOUT_MS,
     seen, claim, cliLandingSessions, doneScans,
-    resolveProjectName, clientOf, formatAge,
+    resolveProjectName, formatAge,
     upsert, doneFieldsOf, doneFieldsFromReporter,
     scanCliSessions, liveSessionCwds, listReporterSessions,
     listSessions, reporterMainPhase, readReporterDone,

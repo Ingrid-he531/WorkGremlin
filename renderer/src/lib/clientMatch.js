@@ -1,96 +1,72 @@
-import { clientBase } from '@workgremlin/shared';
+import { isPluginClient } from '@workgremlin/shared';
 
 /**
  * 客户端身份归一化（前端共用）。
  *
- * 合同来自 hook 的 eventClient（packages/reporter/src/hook.js），clientBase 直接复用
- * @workgremlin/shared 的全局定义（client = agent 或 agent + '-plugin'）：
- *   - 非 plugin：agent 本身（codebuddy / codex / trae / workbuddy / claude …）
- *   - plugin   ：agent + '-plugin'（codebuddy-plugin / codex-plugin / trae-plugin …）
- *
- * codex / trae 这种可能既有 CLI 又有 plugin 的产品，两种变体都按同一套字符串上报；
- * 楼层（floor.client）与成员（member.client）都吃这套字符串，归层 / 过滤时据此判定。
+ * 新合同（与 hook 的 eventClient 一致）：**agent 直接代表楼层**，client 只描述形态
+ * （vscode / cli …）。isPluginClient(client) 判定 plugin 形态（vscode 系 IDE）。
+ * 因此楼层与成员都按 agent 基名匹配与显示，不再用 `agent + '-plugin'` 这种合成字符串当身份。
  */
 
 /**
- * 某楼层（floorClient）是否接纳某成员（memberClient）。
+ * 某楼层（floorAgent）是否接纳某成员（memberAgent）。
  *
- * 小怪物是常住 / 项目级成员（躺在 ~/.codebuddy/agents 这类目录里），与"走 CLI 还是 Plugin"
- * 无关：同一个产品的 CLI 与 Plugin 现在同属一层（1F CodeBuddy 就是这么合并的），
- * 常驻小怪物当然要跟着出现；codex 这种「CLI 与 IDE 合并成一层」的同理。
- * 所以按 **agent 基名**（剥掉 -plugin 后缀）匹配，不再精确区分 CLI / Plugin。
- * （claude 只有 4F 一层 —— 它的 CLI 与 IDE 插件共用同一份配置与 hook、上报同一个 client；
- * 两者是这一层里的两条会话，形态标在任务行的 form 上，与归层无关。）
+ * 常驻小怪物（写在 agents 目录里）与"走 CLI 还是 Plugin"无关：同一产品的 CLI 与 Plugin
+ * 同属一层（1F CodeBuddy 就是这么合并的）；codex 这种「CLI 与 IDE 合并成一层」同理。
+ * 所以按 **agent 基名**匹配（剥掉残留的 -plugin 后缀兜底）。
  * client 为空的（演示数据 / 老库没补上 client 的）视作通用，哪层都显示。
  *
- * @param {string} floorClient 楼层身份（floor.client，如 codebuddy / codebuddy-plugin）
- * @param {string} memberClient 成员身份（member.client）
+ * @param {string} floorAgent 楼层身份（floor.agent，如 codebuddy / kilo）
+ * @param {string} memberAgent 成员身份（member.memberId，如 codebuddy / kilo）
  */
-export function floorAcceptsClient(floorClient, memberClient) {
-  if (!memberClient || !floorClient) return true;
-  const fb = clientBase(String(floorClient).toLowerCase());
-  const mb = clientBase(String(memberClient).toLowerCase());
-  // 空基名（clientBase 异常兜底）不误吞：基名相同才认
-  if (!fb || !mb) return false;
-  return fb === mb;
+export function floorAcceptsClient(floorAgent, memberAgent) {
+  if (!memberAgent || !floorAgent) return true;
+  const fa = String(floorAgent || '').replace(/-plugin$/i, '').toLowerCase();
+  const ma = String(memberAgent || '').replace(/-plugin$/i, '').toLowerCase();
+  // 空基名（异常兜底）不误吞：基名相同才认
+  if (!fa || !ma) return false;
+  return fa === ma;
 }
 
 /**
- * client → 显示名。
- * 注意 codebuddy / codebuddy-plugin 的 **楼层** 是同一层（1F CodeBuddy，见 products.js），
- * 但这两个标签不合并：任务记录里逐条标出"这一轮走的 CLI 还是 Plugin"，是有效信息
- * （楼层归属由 floors[].clients 决定；只有楼层名才叫「CodeBuddy」）。
+ * 是否为"产品基名"（楼层主 agent）：leo / peter 这类子代理不在其中。
+ * 用于区分某成员是不是它所在楼层的主 agent（与 floorAcceptsClient 无关——
+ * 新模型下成员的 client 字段是形态，不能拿它和 name 比）。
+ * @param {string} id memberId / name
  */
-const CLIENT_LABELS = {
-  codebuddy: 'CodeBuddy CLI',
-  'codebuddy-plugin': 'CodeBuddy Plugin',
-  workbuddy: 'WorkBuddy CLI',
-  'workbuddy-plugin': 'WorkBuddy Plugin',
+export function isBaseAgent(id) {
+  const a = String(id || '').replace(/-plugin$/i, '').toLowerCase();
+  return Boolean(BASE_LABELS[a]);
+}
+
+/**
+ * agent → 显示名（楼层 / 产品基名）。
+ */
+const BASE_LABELS = {
+  codebuddy: 'CodeBuddy',
+  workbuddy: 'WorkBuddy',
   codex: 'Codex',
-  'codex-plugin': 'Codex Plugin',
-  // Claude Code 只有一层（CLI 与 IDE 插件共用同一份 ~/.claude 配置、hook 与 client 身份）。
-  // 形态由 form 补出来：hook 从 transcript 的 entrypoint 认出（见 hook.js 的 claudeForm）
   claude: 'Claude Code',
-  // 5F TraeCode：非 plugin 的那一种形态是**桌面 IDE 本体**（trae / trae-cn），不是 CLI
-  // （Trae 没有独立的 trae CLI），所以标签叫 IDE 而不是 CLI；插件形态仍是 trae-plugin。
-  // 两种形态靠上报身份（client）就能分开，不需要像 Codex / Claude 那样靠 form 补。
-  trae: 'TraeCode IDE',
-  'trae-plugin': 'TraeCode Plugin',
-  // 7F Kilo Code：CLI（TUI）与 VS Code 扩展是同一个二进制、同一个数据根（见 products.js），
-  // 但装了 WorkGremlin 插件时**相位是上报真值**（不标 inferred、UI 不灰显），
-  // 而且只有它能给「等待授权」—— Kilo 的 tool 状态实测也只有 completed / error / running，
-  // 没有 pending，轮询推不出等授权。插件实例的上报身份是 kilo-plugin（扩展起 server 时带
-  // KILO_CLIENT=vscode 等，见 plugin/index.js 的 resolveClient），与 CLI 的 kilo 分开。
-  // 两种形态靠上报身份（client）就能分开，不需要像 Codex / Claude 那样靠 form 补。
+  trae: 'TraeCode',
   kilo: 'Kilo Code',
-  'kilo-plugin': 'Kilo Code Plugin',
-  // 6F Qoder：CLI 与插件共用同一份 ~/.qoder，合并成一层（见 products.js）。
-  // 形态由 form 补出来：hook 从 transcript 的 entrypoint 认出（见 hook.js 的 qoderForm，同 Claude Code 格式）
   qoder: 'Qoder',
-  // 8F OpenCode：CLI / TUI / 桌面端 / 网页端同一个二进制、同一个数据根，合并成一层。
-  // 装了 WorkGremlin 插件时相位是上报真值，否则退回轮询 opencode.db 的推导（见 server/src/opencode.js）。
-  // 形态由 form 补出来：插件从环境变量认出（见 plugin/index.js 的 resolveClient）
   opencode: 'OpenCode',
-  'opencode-plugin': 'OpenCode Plugin',
   copilot: 'GitHub Copilot',
-  'copilot-plugin': 'GitHub Copilot Plugin',
 };
 
 /**
- * 把 client 字符串显示成友好的产品名；认不出的原样返回。
+ * 由 agent + 形态得到显示名。
+ * 形态 plugin（vscode 系 IDE）标注为 "… Plugin"；CLI 标注为 "… CLI"。
+ * 标签里已经带形态的（TraeCode IDE）不重复追加。
  *
- * `form` = 这一轮走的**形态**（'cli' / 'plugin'）：只有"CLI 与 IDE 插件共用一份落盘"的产品
- * 才需要它 —— 它们的 client 分不出两种形态（3F Codex、4F Claude Code 都是如此：hook 从会话
- * 自己落的记录里认出来单独上报，见 packages/reporter/src/hook.js 的 codexForm / claudeForm），
- * 任务列表才能标成「Codex CLI / Codex Plugin」「Claude Code CLI / Claude Code Plugin」。
- * 标签里已经带形态的（CodeBuddy CLI / CodeBuddy Plugin / TraeCode IDE / TraeCode Plugin）不重复追加。
+ * @param {string} agent 楼层基名（kilo / codebuddy …）
+ * @param {string} form 形态（vscode / cli / ''）
  */
-export function clientLabel(c, form) {
-  const k = String(c || '').toLowerCase();
-  const label = CLIENT_LABELS[k] || c || '—';
+export function clientLabel(agent, form) {
+  const a = String(agent || '').replace(/-plugin$/i, '').toLowerCase();
+  const base = BASE_LABELS[a] || a || '—';
   const f = String(form || '').toLowerCase();
-  if ((f === 'cli' || f === 'plugin') && !/(?:^|\s)(?:CLI|Plugin|IDE)$/i.test(label)) {
-    return `${label} ${f === 'plugin' ? 'Plugin' : 'CLI'}`;
-  }
-  return label;
+  if (isPluginClient(f)) return `${base} Plugin`;
+  if (f === 'cli' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} CLI`;
+  return base;
 }

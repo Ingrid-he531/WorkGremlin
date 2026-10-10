@@ -24,7 +24,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { clientOf } = require('@workgremlin/shared');
+const { diskKey } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
 
@@ -43,17 +43,17 @@ const meta = {
   plugin: false,
   altPluginRe: /tongyi-lingma/i,
   sources: [
-    { kind: 'cli', label: 'CLI', client: clientOf('qoder', false), dirs: [path.join(HOME, '.qoder'), path.join(HOME, '.qoder-cn')] },
+    { kind: 'cli', label: 'CLI', client: 'qoder', dirs: [path.join(HOME, '.qoder'), path.join(HOME, '.qoder-cn')] },
     {
       kind: 'lingma',
       label: 'Plugin',
-      client: clientOf('qoder', false),
+      client: 'qoder',
       note: '这一路读的是 Qoder CN 编辑器插件自己的 local.db（SQLite，chat_session / chat_record）：扩展没有 hook 子系统、也不写 ~/.qoder 的 transcript，所以会话与相位只能由服务端轮询它这份落盘（相位是推断值）',
     },
     { kind: 'hook' },
   ],
   hookSource: true,
-  dataKind: clientOf('qoder', false),
+  dataKind: 'qoder',
   // Qoder CLI 自己的安装目录（PATH 查不到时兜底；两个入口都试）
   cliBinDirs: [path.join(HOME, '.qoder', 'entry'), path.join(HOME, '.qoder-cn', 'entry')],
   // CLI 会话文件（Claude Code 同款格式）落在 <dataRoot>/projects/<工程>/ 下，文件名即 session_id

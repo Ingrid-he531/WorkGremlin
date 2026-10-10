@@ -22,23 +22,16 @@
  *   返回任意对象都会原样回给 hook（{ ok:true, ... } 包装）；返回 {ok:false,...} 走 400。
  */
 
-const { clientBase } = require('@workgremlin/shared');
 const { floors } = require('../floors');
 
-/** 客户端归一化（仅处理老数据里残留的 `-plugin` 后缀；正常 hook 已不再发后缀，只发原始 client） */
-function normalizeClient(c) {
-  return String(c || '').replace(/-plugin$/, '');
-}
-
 /**
- * 由事件解析楼层身份。优先级：**ev.agent 反推 > ev.client**。
+ * 由事件解析楼层身份（agent 基名）。优先级：**ev.agent > ev.client**（均剥掉老数据残留的 `-plugin` 后缀）。
  * 楼层身份始终由 agent 唯一确定（plugin 与 CLI 同楼层），client 字段只描述形态
- * （vscode / plugin / cli / null），不再参与路由 —— 这样 hook 原样把 client 透传过来也不会落空。
+ * （vscode / cli / null），不再参与路由 —— 这样 hook 原样把 client 透传过来也不会落空。
  */
 function resolveClient(ev) {
-  if (ev && ev.agent) return clientBase(ev.agent);
-  if (ev && ev.client) return normalizeClient(ev.client);
-  return '';
+  const raw = ev && ev.agent ? ev.agent : ev && ev.client ? ev.client : '';
+  return String(raw || '').replace(/-plugin$/i, '').toLowerCase();
 }
 
 function createHookDispatch() {
@@ -51,11 +44,14 @@ function createHookDispatch() {
     sessions.set(id, { ...(sessions.get(id) || {}), ...(patch || {}) });
   };
 
-  // client -> floor 索引（merged 楼层可能挂多个 client，建一次即可）
+  // agent(楼层基名) -> floor 索引（merged 楼层可能挂多个 client，建一次即可）
   const byClient = new Map();
   for (const f of Object.values(floors)) {
-    const c = f.meta && (f.meta.client || f.meta.dataKind);
-    if (c) byClient.set(c, f);
+    const cs = f.meta && (f.meta.client || f.meta.dataKind);
+    if (!cs) continue;
+    (Array.isArray(cs) ? cs : [cs]).forEach((c) =>
+      byClient.set(String(c).replace(/-plugin$/i, '').toLowerCase(), f),
+    );
   }
 
   /**

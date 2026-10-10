@@ -57,7 +57,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolveProjectName } = require('./project');
-const { clientBase, DEFAULTS, clientOf } = require('@workgremlin/shared');
+const { DEFAULTS, diskKey } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -79,15 +79,15 @@ const meta = {
     {
       kind: 'kilo',
       label: 'CLI/Plugin',
-      client: clientOf('kilo', false),
+      client: 'kilo',
       dirs: [kiloHome()],
       note: '这一路读的是数据根里的 kilo.db（SQLite），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
     // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client = kilo-plugin）。
-    { kind: 'hook', client: clientOf('kilo', true) },
+    { kind: 'hook', client: diskKey('kilo', 'vscode') },
   ],
   hookSource: true,
-  dataKind: clientOf('kilo', false),
+  dataKind: 'kilo',
   // Kilo CLI 自己的安装目录（PATH 查不到时兜底）
   cliBinDirs: [path.join(HOME, '.kilo', 'bin')],
 };
@@ -1356,19 +1356,19 @@ function startKiloTaskSyncer(ctx) {
  * @param {object} ctx 框架提供的共享工具
  */
 function kiloHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, clientOf, doneFieldsFromReporter } = ctx;
+  const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
   for (const s of listKiloSessions()) {
     if (!claim(p.id, s.id)) continue;
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const ph = readKiloPhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;
     const truth =
-      reporterMainPhase(wsOfSession, clientOf('kilo', true), s.id) ||
-      reporterMainPhase(wsOfSession, clientOf('kilo', false), s.id) ||
+      reporterMainPhase(wsOfSession, diskKey('kilo', 'vscode'), s.id) ||
+      reporterMainPhase(wsOfSession, 'kilo', s.id) ||
       null;
     const doneTruth =
-      readReporterDone(wsOfSession, clientOf('kilo', true), s.id) ||
-      readReporterDone(wsOfSession, clientOf('kilo', false), s.id);
+      readReporterDone(wsOfSession, diskKey('kilo', 'vscode'), s.id) ||
+      readReporterDone(wsOfSession, 'kilo', s.id);
     const donePoll = readKiloDone(s.id, s);
     upsert({
       floor: p.id,

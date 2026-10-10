@@ -13,7 +13,7 @@ import {
   inTimeWindow as inWindowAt,
   timeWindowOf,
 } from '../lib/timeRange';
-import { DEFAULTS, clientBase } from '@workgremlin/shared';
+import { DEFAULTS } from '@workgremlin/shared';
 import { httpBase } from '../api/bridge';
 import { useI18n } from '../i18n';
 import { marked } from 'marked';
@@ -80,14 +80,14 @@ function floorValue(f) {
 function floorText(f) {
   return [f.id, f.name].filter(Boolean).join(' ');
 }
-/** 这条任务的 client 归哪个楼层（先精确命中，再按基名兜底认合并楼层） */
+/** 这条任务的 agent 归哪个楼层（按 agent 基名认，CLI/插件同层） */
 function floorOfClient(c) {
-  const k = String(c || '').toLowerCase();
+  const k = String(c || '').replace(/-plugin$/i, '').toLowerCase();
   if (!k) return null;
   return (
-    floorOptions.value.find((f) => floorClients(f).some((x) => String(x).toLowerCase() === k)) ||
-    floorOptions.value.find((f) => f.client && clientBase(f.client) === clientBase(k)) ||
-    null
+    floorOptions.value.find(
+      (f) => String(f.agent || f.client || '').replace(/-plugin$/i, '').toLowerCase() === k,
+    ) || null
   );
 }
 
@@ -427,7 +427,7 @@ function dimValue(t, dim) {
   if (dim === 'model') return t.model || '';
   // 按楼层聚合：CLI 与 Plugin 两个 client 归同一个楼层（1F CodeBuddy）→ 同一个分组 key
   if (dim === 'floor') {
-    const f = floorOfClient(t.client);
+    const f = floorOfClient(t.memberId || t.client);
     return f ? floorValue(f) : t.client || '';
   }
   return '';
@@ -436,9 +436,9 @@ function dimLabel(t, dim) {
   if (dim === 'project') return (projectOptions.value.find((p) => p.id === t.project_id) || {}).name || t.project_id || tr('records.unnamed_project');
   if (dim === 'model') return t.model || tr('records.unrecorded');
   if (dim === 'floor') {
-    const f = floorOfClient(t.client);
+    const f = floorOfClient(t.memberId || t.client);
     if (f) return f.name;
-    return t.client ? clientLabel(t.client) : tr('records.unrecorded');
+    return t.memberId || t.client ? clientLabel(t.memberId || t.client) : tr('records.unrecorded');
   }
   return '';
 }
@@ -750,11 +750,11 @@ function onBoardDayInput(e) {
 
 /** 一次任务落在哪一行：client → 楼层（合并楼层按基名认，见 floorOfClient） */
 function rowOfTask(t) {
-  const f = floorOfClient(t.client);
+  const f = floorOfClient(t.memberId || t.client);
   if (f) return { key: f.id, label: floorText(f), order: Number.parseInt(f.id, 10) || 900 };
-  if (!t.client) return { key: '__none__', label: tr('records.no_floor'), order: 999 };
+  if (!(t.memberId || t.client)) return { key: '__none__', label: tr('records.no_floor'), order: 999 };
   // 有 client 但不在楼层表里（老数据 / 该产品没装）：如实标出是哪个 client，不硬塞进某层
-  return { key: String(t.client), label: clientLabel(t.client, t.form), order: 900 };
+  return { key: String(t.memberId || t.client), label: clientLabel(t.memberId || t.client, t.form), order: 900 };
 }
 
 /**
@@ -949,7 +949,7 @@ async function saveRetention() {
           <div class="row-title">{{ promptOf(t) || tr('records.untitled_task') }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
-            <span v-if="t.client">{{ clientLabel(t.client, t.form) }}</span>
+            <span v-if="t.memberId || t.client">{{ clientLabel(t.memberId || t.client, t.form) }}</span>
             <span v-if="t.model">{{ t.model }}</span>
             <span>{{ fmtDuration(t.duration_ms) }}</span>
             <span v-if="t.file_count != null">{{ tr('records.n_files', { n: t.file_count }) }}</span>
@@ -985,7 +985,7 @@ async function saveRetention() {
                  本机库实测：489 条任务的 progress 只有 0（80 条）和 1（409 条）两种取值，
                  一个中间值都没有 —— 显示出来就是「0% / 100%」两个数跳，纯误导。
                  将来有了能按轮次推进的真实进度来源，再把这一行放回来（fmtProgress 一并复活）。 -->
-            <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
+            <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(tasks.selectedTask.memberId || tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
             <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- 工程：这一轮归属的工程名。服务端按工程**目录**现算（package.json name > 目录名，
                  与"打开工程"同一口径，见 /task-runs 的 project_label）；拿不到目录才退回库里的
@@ -1083,7 +1083,7 @@ async function saveRetention() {
                   <div class="kv">
                     <div class="k">{{ tr('records.detail.sub_name') }}</div><div class="v">{{ s.name }}</div>
                     <div class="k">{{ tr('records.detail.sub_task') }}</div><div class="v">{{ s.title || tr('records.sub_untitled') }}</div>
-                    <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(s.client) }}</div>
+                    <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(s.memberId || s.client) }}</div>
                     <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ s.model || '—' }}</div>
                     <div class="k">{{ tr('records.detail.sub_start') }}</div><div class="v">{{ fmtTime(s.started_at) }}</div>
                     <div class="k">{{ tr('records.detail.sub_end') }}</div><div class="v">{{ fmtTime(s.ended_at) }}</div>
@@ -1189,7 +1189,7 @@ async function saveRetention() {
               <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
               <td class="td-dim td-task" :title="promptOf(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
               <td class="td-dim td-session" :title="sessionTitleOf(t) || ''">{{ sessionTitleOf(t) ? shortText(sessionTitleOf(t)) : '—' }}</td>
-              <td class="td-dim">{{ clientLabel(t.client, t.form) }}</td>
+              <td class="td-dim">{{ clientLabel(t.memberId || t.client, t.form) }}</td>
               <td class="td-dim">{{ t.model || '—' }}</td>
               <td class="td-dim">{{ projectOf(t) }}</td>
               <td class="num" :title="tokenTitleOf(t)">{{ fmtTokens(totalTokensOf(t)) }}</td>

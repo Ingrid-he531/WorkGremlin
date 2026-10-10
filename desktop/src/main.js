@@ -15,11 +15,10 @@ const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen, shell } = r
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { execSync } = require('node:child_process');
-const { IPC_EVENTS } = require('@workgremlin/shared');
+const { IPC_EVENTS, home: wgHome } = require('@workgremlin/shared');
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
@@ -32,7 +31,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 读 ~/.workgremlin/server.json（与 server 包 config.home() 同规则） */
 function readServerInfoFile() {
-  const home = process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
+  const home = wgHome();
   try {
     const info = JSON.parse(fs.readFileSync(path.join(home, 'server.json'), 'utf8'));
     if (info && Number.isInteger(info.port) && typeof info.token === 'string') return info;

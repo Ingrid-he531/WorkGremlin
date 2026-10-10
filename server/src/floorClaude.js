@@ -11,7 +11,7 @@
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
-const { clientBase } = require('@workgremlin/shared');
+const {} = require('@workgremlin/shared');
 // 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
 const { readJson, readDir } = require('./roots');
 
@@ -213,8 +213,7 @@ const CLAUDE_IDLE_GRACE_MS = 3_000;
 function claudeInterruptOf(j, startedAt) {
   const none = { hit: false, at: 0, via: '' };
   if (!j) return none;
-  const base = clientBase(j.client);
-  if (base !== 'claude' && base !== 'qoder') return none;
+  // client 现在只描述形态（cli / vscode），楼层由调用方（claude/qoder reader）保证
   const started = Number(startedAt) || 0;
   const doneAt = Number(j.done && j.done.at) || 0;
   if (doneAt && (!started || doneAt >= started)) return none; // 这一轮已经正常收尾
@@ -433,7 +432,7 @@ const meta = {
   // 只装 IDE 扩展的人这一层照样"装了"，altPluginRe 补抓安装证据。
   altPluginRe: RE_CLAUDE_HOST,
   sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
-  dataKind: clientBase('claude', false),
+  dataKind: 'claude',
   // 落盘探测（findDataPath 用）
   matchRe: [/^claude/i],
   homeDirs: [claudeHome()],
@@ -483,7 +482,7 @@ function claudeForm(transcriptPath) {
   for (const obj of headJsonLines(transcriptPath)) {
     const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
     if (!ep) continue;
-    if (ep === 'claude-vscode') return 'plugin';
+    if (ep === 'claude-vscode') return 'vscode';
     return ep === 'cli' ? 'cli' : '';
   }
   return '';
@@ -543,8 +542,7 @@ function synthMarks(ctx) {
   const { workspacePath, client, allFiles, clientHit, roundFilesOf, synthCancel, now } = ctx;
   for (const j of allFiles) {
     if (!j || !j.taskId) continue;
-    const base = clientBase(j.client);
-    if (base !== 'claude' && base !== 'qoder') continue;
+    // client 现在只描述形态，楼层由调用方保证
     const startedAtJ = Number(j.taskStartedAt) || 0;
     const iv = claudeInterruptOf(j, startedAtJ);
     if (!iv.hit) continue;

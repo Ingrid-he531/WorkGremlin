@@ -79,7 +79,7 @@ const sessionStart = Date.now();
  * 整条只滚一遍即退场（见 pendingEnded → makeSeg 进段即清）。failed 归到取消的红色。
  */
 function endedText(r) {
-  const floor = floorOf(r.client);
+  const floor = floorOf(r.memberId || r.client);
   const base = promptOf(r.title) || t('ticker.untitled');
   const suffixKind = r.state === 'done' ? 'done' : 'cancelled';
   const suffix = suffixKind === 'done' ? t('ticker.doneSuffix') : t('ticker.cancelledSuffix');
@@ -240,7 +240,7 @@ function floorOf(client) {
   const c = String(client || '');
   if (!c) return '—';
   const f = (sessions.floors || []).find((x) =>
-    [x.client, ...(Array.isArray(x.clients) ? x.clients : [])].some((cc) => cc && floorAcceptsClient(cc, c))
+    [x.client, ...(Array.isArray(x.clients) ? x.clients : [])].some((cc) => cc && floorAcceptsClient(cc, c.memberId || c.client))
   );
   return f ? f.id : '—';
 }
@@ -251,7 +251,7 @@ const runningItems = computed(() =>
     .filter((r) => r && !r.parent_task_id && r.state === 'running' && (!project.projectId || r.project_id === project.projectId))
     .sort((a, b) => Number(a.started_at) - Number(b.started_at))
     .map((r) => {
-      const floor = floorOf(r.client);
+      const floor = floorOf(r.memberId || r.client);
       const text = promptOf(r.title) || t('ticker.untitled');
       return { id: r.id, kind: 'running', text: `${hhmm(r.started_at)} ${floor} ${t('ticker.task', { text: clip(text) })}` };
     })

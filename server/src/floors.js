@@ -26,7 +26,7 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { clientOf } = require('@workgremlin/shared');
+const { diskKey } = require('@workgremlin/shared');
 
 // 通用扫描基础设施（操作系统/编辑器目录枚举、目录体积、正则匹配……不认任何具体产品）
 const {
@@ -169,7 +169,7 @@ function sourceSpecs(p) {
 
 /** 这一路的上报身份：显式给了就用它，否则按 kind 推（plugin → agent-plugin，其余 → agent） */
 function sourceClient(p, spec) {
-  return spec.client || clientOf(p.agent, spec.kind === 'plugin');
+  return spec.client || diskKey(p.agent, spec.kind === 'plugin' ? 'vscode' : 'cli');
 }
 
 /** 这一路的落盘目录候选（顺序即优先级）：hook 没有落盘目录；'dir' 用显式 dirs */

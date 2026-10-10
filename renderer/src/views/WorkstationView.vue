@@ -4,8 +4,7 @@ import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { isEphemeralMember } from '../lib/ephemeral';
-import { floorAcceptsClient } from '../lib/clientMatch';
-import { clientBase } from '@workgremlin/shared';
+import { floorAcceptsClient, isBaseAgent } from '../lib/clientMatch';
 import { useI18n } from '../i18n';
 
 const project = useProjectStore();
@@ -15,7 +14,10 @@ const { t } = useI18n();
 // 主 agent：成员名（剥 -plugin）等于其 client 基名（codebuddy / qoder / codex …），
 // 对应 hook 注册的那只"本层主 agent"；子代理（leo / peter / software-architect…）名与基名不同。
 function isMainAgent(m) {
-  return clientBase(m.name) === clientBase(m.client);
+  // 主 agent = 成员身份（memberId / name）是产品基名（codebuddy / kilo …），
+  // 子代理（leo / peter …）不是产品基名，据此排到主 agent 之后。
+  // 新模型下成员的 client 是形态（vscode / cli），不能拿它和 name 比基名。
+  return isBaseAgent(m.memberId || m.name);
 }
 
 const sorted = computed(() => {
@@ -29,7 +31,7 @@ const sorted = computed(() => {
     // 工位卡片只显示常住小怪物；临时召唤出来的幽灵（subagent-xxx）不在这张表里占位，
     // 避免"召唤后卡片列表里多出同名小怪物"的误会。
     .filter((m) => !isEphemeralMember(m))
-    .filter((m) => floorAcceptsClient(want, m.client, allClients))
+    .filter((m) => floorAcceptsClient(want, m.memberId || m.client))
     .slice()
     // 主 agent 卡片固定排最前（其余仍按相位顺序），不再随机
     .sort((a, b) => {
@@ -59,7 +61,7 @@ const MAIN_STATE_OF_PHASE = {
 };
 const floorAgentBase = computed(() => {
   const f = (sessions.floors || []).find((x) => x.id === sessions.selectedFloor);
-  return f && f.client ? clientBase(f.client) : '';
+  return f && f.client ? String(f.client).replace(/-plugin$/i, '').toLowerCase() : '';
 });
 const mainAgentCard = computed(() => {
   // 已有真实主 agent 成员：直接用，不合成

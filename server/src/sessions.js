@@ -31,9 +31,8 @@
  */
 
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('path');
-const { clientBase } = require('@workgremlin/shared');
+const { home } = require('@workgremlin/shared');
 // 通用落盘扫描基础设施（目录约定 + 容错文件读取），readJson / readDir 统一从 roots 取，不在各处重复定义
 const { readJson, readDir } = require('./roots');
 // 楼层模块注册表（floors.js）：会话标题按 client 派发到对应楼层模块时要用 registry 里的 sessionTitle
@@ -145,7 +144,7 @@ const INTERRUPT_PHASE_SLACK_MS = 1_000;
  */
 
 function reporterHookHome() {
-  return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
+  return home();
 }
 
 /**
@@ -170,7 +169,7 @@ function sessionModel(client, sessionId, agentType = '') {
   // 按**基名**查表：同一产品的插件/CLI 两种形态（trae-plugin / claude-plugin …）落盘是同一份，
   // 适配器也只认产品，不该因为客户端带了个后缀就取不到（适配器对不认识的会话 id 一律回空串，
   // 所以这里放宽只会"多给一次机会"，不会给错模型）。
-  const fn = MODEL_SOURCES[clientBase(client)];
+  const fn = MODEL_SOURCES[String(client || '').toLowerCase()];
   return fn ? fn(sessionId, agentType) || '' : '';
 }
 
@@ -205,7 +204,7 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // （Claude/Qoder 看 transcript 末尾、CodeBuddy 看 message-queue pauseReason、Trae 看 DoneHandler），
     // 由各楼层的 phaseSuperseded 自己判断，公共相位读取只负责派发（见各 floor 模块）。
     if (j.taskId) {
-      const floorMod = FLOORS[clientBase(j.client)];
+      const floorMod = FLOORS[String(client || '').replace(/-plugin$/i, '').toLowerCase()];
       if (floorMod && typeof floorMod.phaseSuperseded === 'function' && floorMod.phaseSuperseded(j, sp, INTERRUPT_PHASE_SLACK_MS)) continue;
     }
     // 会话已被用户取消（CLI 按 ESC 停止：reporter Stop 落盘的 done.cancelled）：相位冻在
@@ -444,7 +443,7 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
 function reporterMainPhase(workspacePath, client = '', session = '') {
   // 各楼层（尤其是 9F Copilot，没有 reporter hook）可自己实现 readPhase 来提供相位；
   // 没实现的（带 hook 的产品）退回通用的 readReporterPhase。相位职责按楼层派发，不把兜底塞进 generic 里。
-  const base = clientBase(client);
+  const base = String(client || '').replace(/-plugin$/i, '').toLowerCase();
   const floor = FLOORS[base];
   const readPhase = floor && typeof floor.readPhase === 'function' ? floor.readPhase : readReporterPhase;
   const rp = readPhase(workspacePath, client, session);
@@ -531,7 +530,7 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     if (!lastAt || now - lastAt > TASK_RUN_MS) continue;
     // TraeCode 取消兜底：renderer.log 里已确认取消（取消时刻比本轮开始新）→ 不算活跃
     // （TraeCode 取消不发 Stop hook 事件，taskId 永远占着，这里手动戳破它）。
-    if (clientBase(j.client) === 'trae') {
+    if (String(client || '').replace(/-plugin$/i, '').toLowerCase() === 'trae') {
       const atT = trae.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
       if (atT) continue;
     }
@@ -733,7 +732,7 @@ function readReporterDones(workspacePath, client = '') {
   // client 为空（不指定产品）时扫全部楼层；否则只跑被点名的那一层。
   // qoder 已在 FLOORS 里别名到 claude 模块，这里无需特判。
   const bases = client
-    ? String(client).split(',').map((s) => clientBase(s.trim())).filter(Boolean)
+    ? String(client).split(',').map((s) => s.trim().replace(/-plugin$/i, '').toLowerCase()).filter(Boolean)
     : Object.keys(FLOORS);
   const seen = new Set();
   for (const base of bases) {
@@ -767,7 +766,7 @@ function readReporterDone(workspacePath, client = '', session = '') {
   // 9F GitHub Copilot 没有 hook：状态文件这条路永远是空的，完成标记得从它自己的会话日志取
   // （最新那一轮 request 的 completedAt，见 readCopilotLiveRequest）——不然 9F 永远没有
   // 「任务完成」那一下（实测 2026-09-28：7F/8F 都有、9F 一直空）。
-  if (clientBase(client) === 'copilot') {
+  if (String(client || '').replace(/-plugin$/i, '').toLowerCase() === 'copilot') {
     const d = copilot.readCopilotDone(session);
     if (d) return d;
   }

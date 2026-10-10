@@ -17,14 +17,9 @@
  */
 
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 
-const { HTTP_ROUTES } = require('@workgremlin/shared');
-
-function home() {
-  return process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');
-}
+const { HTTP_ROUTES, home } = require('@workgremlin/shared');
 
 function readServerInfo() {
   const file = path.join(home(), 'server.json');

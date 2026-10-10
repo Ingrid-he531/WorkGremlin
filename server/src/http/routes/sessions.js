@@ -7,7 +7,7 @@ const { kiloMainPhase, readKiloDone, kiloInstrumented } = require('../../floorKi
 // 8F OpenCode：**两路**——装了 WorkGremlin 插件时真相位走 reporter 状态文件，
 // 没装（或还没写过）才退回轮询 opencode.db 的推导。形态与 7F 不同，理由见下面那段注释。
 const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('../../floorOpencode');
-const { clientBase } = require('@workgremlin/shared');
+
 
 /**
  * 完成标记统一成 **reporter 形状**（`{ at, title, fileCount, files, sessionId }`）。
@@ -47,9 +47,9 @@ function toReporterDone(done, sessionId, workspacePath = '') {
  * 楼层客户端串里有没有**这一路**。
  *
  * 渲染层传的是**整个楼层的 clients 串**（`sessions.selectedClients.join(',')`），合并楼层就是
- * 逗号串（7F `kilo,kilo-plugin`、8F `opencode,opencode-plugin`）。以前这里写的是
- * `clientBase(client) === 'kilo' | 'opencode'` —— clientBase 只剥单个 -plugin 后缀，
- * 逗号串永远不相等，于是这两条分支**整条不生效**：相位 / 模型 / 完成标记全空。
+ * 逗号串（7F `kilo,kilo-plugin`、8F `opencode,opencode-plugin`）。按基名比对：把每个候选剥掉
+ * `-plugin` 后与 base 比较（见 floorAcceptsClient / clientListHas），逗号串也能命中，于是
+ * 插件这一路不再被漏掉：相位 / 模型 / 完成标记都能带出来。
  * （实测 2026-09-28：8F 楼层加了 opencode-plugin 这一路之后，主控制台只剩"思考中"、没有内容。）
  */
 function clientListHas(client, base) {
@@ -57,7 +57,7 @@ function clientListHas(client, base) {
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
-    .some((c) => clientBase(c) === base);
+    .some((c) => c.replace(/-plugin$/i, '') === base);
 }
 
 /**

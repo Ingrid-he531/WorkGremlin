@@ -13,7 +13,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync } = require('node:child_process');
-const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey } = require('@workgremlin/shared');
+const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey, isPluginClient } = require('@workgremlin/shared');
 const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
@@ -32,21 +32,25 @@ function memberIdOf(project, name) {
 
 /**
  * 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL）。
- * 合同见 hook 的 eventClient：非 plugin 直接返回 agent（codebuddy / codex / trae / …），
- * plugin 返回 agent + '-plugin'（codebuddy-plugin / codex-plugin / trae-plugin）。
- * 因此白名单同时认 base 与 base-plugin 两种形态；新加的产品补进 CLIENT_BASES 即可。
+ * client 列现在只存**形态**（form）：'cli' / 'vscode' / 'jetbrains' …（agent 直接代表楼层，
+ * 见 shared.isPluginClient）。白名单认这些形态；同时为兼容老数据保留的 combined 串
+ * （base / base-plugin）归一为 'cli' 形态。空串返回 null —— 见 clientMatch.floorAcceptsClient：
+ * 空 client 视作通用、哪层都显示。
  *
- * **漏一个产品 = 它的成员 client 变 NULL，而"空 client 视作通用、哪层都显示"**
+ * **漏一个形态 = 它的成员 client 变 NULL，而"空 client 视作通用、哪层都显示"**
  * （见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）—— 于是这个产品的成员会
- * 出现在**每一个**楼层里。实测 2026-09-27：6F Qoder / 7F Kilo / 8F OpenCode 都不在名单里，
- * qoder 那一行于是飘进了 1F 的工位卡片（members 表实测 client IS NULL）。
- * 加楼层（products.js）时**必须**同步这里，别只改一半。
+ * 出现在**每一个**楼层里。新增 IDE 形态时补进 FORM_VALUES 即可。
  */
-const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode', 'copilot', 'opencode-plugin'];
-const CLIENTS = new Set([...CLIENT_BASES, ...CLIENT_BASES.map((b) => `${b}-plugin`)]);
+const FORM_VALUES = ['cli', 'vscode', 'jetbrains', 'cursor', 'windsurf', 'plugin'];
+const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode', 'copilot'];
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
-  return CLIENTS.has(c) ? c : null;
+  if (!c) return null;
+  if (FORM_VALUES.includes(c)) return c;
+  // 兼容老数据：base / base-plugin 归一为 'cli' 形态
+  const base = c.replace(/-plugin$/i, '');
+  if (CLIENT_BASES.includes(base)) return 'cli';
+  return null;
 }
 
 /**
@@ -55,7 +59,7 @@ function normClient(v) {
  */
 function normForm(v) {
   const s = String(v || '').trim().toLowerCase();
-  return s === 'cli' || s === 'plugin' ? s : null;
+  return s === 'cli' || isPluginClient(s) ? s : null;
 }
 
 /** 模型名：拿不到就是 NULL（绝不猜），超长截断 */
@@ -575,7 +579,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         // SessionStart 外也都不带），为空时按会话去**各自的落盘**里取当前模型
         // （见 sessions.sessionModel：trae / claude 两个适配器）。
         // 取不到就是空 —— 报表的"模型"列留空，不拿默认模型冒充。
-        model: normModel(p.model) || sessionModel(client0, p.sessionId) || null,
+        model: normModel(p.model) || sessionModel(p.memberId, p.sessionId) || null,
         title: p.title || '(未命名任务)',
         startedAt: ts,
         baselineCommit: baseline,

@@ -24,7 +24,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { clientBase, clientOf } = require('@workgremlin/shared');
+const { diskKey } = require('@workgremlin/shared');
 // 插件落盘读取（findPluginStorage / globalStorageRoots / workspaceStorageRoots / 落盘窗口常量）
 // 收口在 plugin.js；本文件只依赖它，不再反向 require sessions.js（消除 sessions ↔ copilot 的循环依赖）。
 const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, IDLE_MS, LISTED_MS, DONE_TTL_MS } = require('./plugin');
@@ -658,7 +658,7 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
 }
 
 function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
-  if (clientBase(client) !== 'copilot') return null;
+  // copilot 专属：client 现在只描述形态（cli / vscode），楼层由调用方保证
   const storage = findPluginStorage();
   if (!storage) return null;
   const rowList = readSqliteSessionRows(storage)
@@ -1261,7 +1261,7 @@ const meta = {
   pluginRe: RE_GITHUB_COPILOT,
   // 仅展示 GitHub Copilot VS Code 插件这一层（无独立 CLI 形态）。
   sources: ['plugin'],
-  dataKind: clientOf('copilot', true),
+  dataKind: diskKey('copilot', 'vscode'),
   // 落盘探测（findDataPath 用）：插件形态在 VS Code 的 globalStorage 下找
   matchRe: RE_GITHUB_COPILOT,
   homeDirs: [path.join(HOME, '.config', 'Code', 'User', 'globalStorage')],

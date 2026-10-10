@@ -253,6 +253,9 @@ await fire(msg({ id: 'msg_2', role: 'assistant', finish: 'stop', time: { created
   const st = stateFile();
   ok('相位 = done', st && st.sessionPhase.phase === 'done', st && st.sessionPhase.phase);
   ok('完成标记带改动文件清单', st && st.done && Array.isArray(st.done.files), st && JSON.stringify(st.done));
+  // 此时这轮正常收尾（未取消），相位新鲜 —— reporterMainPhase 应把模型带出来。
+  const rp = reporterMainPhase(WS, 'kilo', SID);
+  ok('reporterMainPhase 把这个模型带出来了', rp && rp.model === 'kilo-auto/free', rp && rp.model);
 }
 
 /* ------------------------------ C. finish=tool-calls 不算完成 ------------------------------ */
@@ -319,8 +322,6 @@ head('[D] 状态文件：hb.pid 与 model');
   const st = stateFile();
   ok('hb.pid = 插件所在进程 pid（hasOtherLiveSession 判据 1）', st && st.hb && st.hb.pid === process.pid, st && JSON.stringify(st.hb));
   ok('model 写上了（session.created.info.model.id）', st && st.model === 'kilo-auto/free', st && st.model);
-  const rp = reporterMainPhase(WS, 'kilo', SID);
-  ok('reporterMainPhase 把这个模型带出来了', rp && rp.model === 'kilo-auto/free', rp && JSON.stringify(rp));
 }
 
 /* ------------------------------ F. 边界 ------------------------------ */

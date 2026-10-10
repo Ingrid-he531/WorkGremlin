@@ -14,7 +14,7 @@
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
-const { clientOf } = require('@workgremlin/shared');
+const { diskKey } = require('@workgremlin/shared');
 // globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
 const { globalStorageRoots, readJson, readDir } = require('./roots');
 
@@ -141,7 +141,7 @@ const meta = {
   pluginRe: RE_PLUGIN,
   // 合并楼层：三路都归这一层；同一会话被两路同时看到时按 session_id 去重（见 sessionRegistry）。
   sources: ['cli', 'plugin', 'hook'],
-  dataKind: clientOf('codebuddy', false),
+  dataKind: 'codebuddy',
   // 落盘探测（findDataPath 用）：按名字匹配什么、家目录里哪些候选
   matchRe: [/^codebuddy/i, /^code-?buddy/i, /^tencent/i, /^ingram/i],
   homeDirs: [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')],
