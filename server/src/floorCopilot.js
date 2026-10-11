@@ -29,7 +29,7 @@ const { diskKey } = require('@workgremlin/shared');
 // 收口在 plugin.js；本文件只依赖它，不再反向 require sessions.js（消除 sessions ↔ copilot 的循环依赖）。
 const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, IDLE_MS, LISTED_MS, DONE_TTL_MS } = require('./plugin');
 // 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
-const { readJson, readDir } = require('./roots');
+const { readJson, readDir, isFile, isDir } = require('./roots');
 const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -37,13 +37,7 @@ const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 // 9F 专属：本楼层 pluginRe（products.js 的 findDataPath 的 copilot 分支也要它），放这里避免循环 require。
 const RE_GITHUB_COPILOT = [/^github\.copilot/i, /^github-copilot/i, /^github\.copilot-chat/i, /^copilot/i];
 
-// 三个极小的通用文件工具（与 sessions.js 同款；本文件读取函数用到）
-function isFile(p) {
-  try { return fs.statSync(p).isFile(); } catch { return false; }
-}
-function isDir(p) {
-  try { return fs.statSync(p).isDirectory(); } catch { return false; }
-}
+// 通用文件判断（isFile / isDir）统一从 roots 取，避免各处重复定义
 /* ───────────── 原 sessions.js 的 Copilot 读取函数 ───────────── */
 
 /**

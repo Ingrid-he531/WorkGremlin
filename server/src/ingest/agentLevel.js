@@ -18,6 +18,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { isFile } = require('../roots');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const USER_AGENTS_DIR = path.join(HOME, '.codebuddy', 'agents');
@@ -32,7 +33,7 @@ function fileOf(dir, name) {
   for (const f of cands) {
     const p = path.join(dir, f);
     try {
-      if (fs.statSync(p).isFile()) return p;
+      if (isFile(p)) return p;
     } catch {
       /* 试下一个候选 */
     }

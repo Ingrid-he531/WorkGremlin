@@ -31,7 +31,7 @@ const sorted = computed(() => {
     // 工位卡片只显示常住小怪物；临时召唤出来的幽灵（subagent-xxx）不在这张表里占位，
     // 避免"召唤后卡片列表里多出同名小怪物"的误会。
     .filter((m) => !isEphemeralMember(m))
-    .filter((m) => floorAcceptsClient(want, m.memberId || m.client))
+    .filter((m) => floorAcceptsClient(want, m.client))
     .slice()
     // 主 agent 卡片固定排最前（其余仍按相位顺序），不再随机
     .sort((a, b) => {

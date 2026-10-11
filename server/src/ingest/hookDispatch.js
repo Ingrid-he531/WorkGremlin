@@ -22,17 +22,7 @@
  *   返回任意对象都会原样回给 hook（{ ok:true, ... } 包装）；返回 {ok:false,...} 走 400。
  */
 
-const { floors } = require('../floors');
-
-/**
- * 由事件解析楼层身份（agent 基名）。优先级：**ev.agent > ev.client**（均剥掉老数据残留的 `-plugin` 后缀）。
- * 楼层身份始终由 agent 唯一确定（plugin 与 CLI 同楼层），client 字段只描述形态
- * （vscode / cli / null），不再参与路由 —— 这样 hook 原样把 client 透传过来也不会落空。
- */
-function resolveClient(ev) {
-  const raw = ev && ev.agent ? ev.agent : ev && ev.client ? ev.client : '';
-  return String(raw || '').replace(/-plugin$/i, '').toLowerCase();
-}
+const { floorByAgent } = require('../floors');
 
 function createHookDispatch() {
   // 会话状态：替代 hook 的 state 文件。sessionId -> 本轮任务上下文。
@@ -44,16 +34,6 @@ function createHookDispatch() {
     sessions.set(id, { ...(sessions.get(id) || {}), ...(patch || {}) });
   };
 
-  // agent(楼层基名) -> floor 索引（merged 楼层可能挂多个 client，建一次即可）
-  const byClient = new Map();
-  for (const f of Object.values(floors)) {
-    const cs = f.meta && (f.meta.client || f.meta.dataKind);
-    if (!cs) continue;
-    (Array.isArray(cs) ? cs : [cs]).forEach((c) =>
-      byClient.set(String(c).replace(/-plugin$/i, '').toLowerCase(), f),
-    );
-  }
-
   /**
    * 派发一次 hook 事件。
    * @param {object} ev 原始 hook 事件（含 hook_event_name / session_id / cwd / transcript_path / client / agent …）
@@ -61,16 +41,16 @@ function createHookDispatch() {
    */
   async function dispatch(ev, ctx) {
     const event = ev && ev.hook_event_name;
-    if (!event) return { ok: false, error: 'missing hook_event_name' };
-    const client = resolveClient(ev);
-    const floor = client ? byClient.get(client) : null;
+    if (!event || !ev.agent) {
+      return { ok: false, error: 'missing hook_event_name or agent' };
+    }
+    const floor = floorByAgent[String(ev.agent).toLowerCase()];
     if (!floor || typeof floor.handleHookEvent !== 'function') {
-      return { ok: true, ignored: true, client: client || null };
+      return { ok: true, ignored: true };
     }
     return floor.handleHookEvent(ev, {
       project: ctx.project,
       workspacePath: ctx.workspacePath,
-      client,
       bus: ctx.bus,
       repo: ctx.repo,
       sessionGet,
@@ -81,4 +61,4 @@ function createHookDispatch() {
   return { dispatch, sessionGet, sessionSet, _sessions: sessions };
 }
 
-module.exports = { createHookDispatch, resolveClient };
+module.exports = { createHookDispatch };

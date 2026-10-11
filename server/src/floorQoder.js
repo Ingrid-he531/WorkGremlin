@@ -21,12 +21,12 @@
  *   syncTasks     = syncQoderPluginTasks
  */
 
-const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { diskKey } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
+const { isFile } = require('./roots');
 
 const HOME = os.homedir();
 
@@ -79,11 +79,7 @@ function lingmaDbPath() {
   const p = explicit
     ? path.resolve(explicit)
     : path.join(HOME, '.lingma', 'vscode', 'sharedClientCache', 'cache', 'db', 'local.db');
-  try {
-    return fs.statSync(p).isFile() ? p : '';
-  } catch {
-    return '';
-  }
+  return isFile(p) ? p : '';
 }
 
 /**
@@ -730,15 +726,24 @@ function lingmaHandler(p, src, ctx) {
 
 const kindHandlers = { lingma: lingmaHandler };
 
-const { runHookEvent, jsonlReplies, codebuddyReplies, qoderForm, turnInterrupted } = require('./ingest/hookCommon');
+const { runHookEvent, sharedHookImpl, jsonlReplies, codebuddyReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
+
+/** Qoder 形态（cli / plugin）：transcript 首行 user 的 entrypoint。
+ * 原在 hookCommon，现挪到本楼层（"楼层自己的接口"）；没覆盖的字段回退 sharedHookImpl。 */
+function qoderForm(transcriptPath) {
+  for (const obj of headJsonLines(transcriptPath)) {
+    const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
+    if (!ep) continue;
+    if (ep.includes('vscode') || ep.includes('plugin')) return 'vscode';
+    return ep === 'cli' ? 'cli' : '';
+  }
+  return '';
+}
 
 /** Qoder 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
 const qoderImpl = {
-  client: 'qoder',
-  coarse: false,
-  hasPermissionEvent: false,
+  ...sharedHookImpl,
   awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
-  hasSubagentStart: false,
   repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
   formOf: (tp) => qoderForm(tp),
@@ -779,4 +784,5 @@ module.exports = {
   syncTasks: syncQoderPluginTasks,
   // 服务端 hook 事件处理（落盘解析归服务端）
   handleHookEvent,
+  qoderForm,
 };

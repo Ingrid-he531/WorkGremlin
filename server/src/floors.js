@@ -74,6 +74,13 @@ const floors = {
   '9F': require('./floorCopilot'),
 };
 
+/** agent（楼层基名，如 'codebuddy'）→ 楼层模块；hookDispatch 据此把事件派发给对应楼层的 handleHookEvent */
+const floorByAgent = {};
+for (const f of Object.values(floors)) {
+  const a = f?.meta?.agent;
+  if (a) floorByAgent[String(a).toLowerCase()] = f;
+}
+
 /** 按楼层 id 取模块；没有返回 null */
 function floorOf(id) {
   return floors[String(id)] || null;
@@ -319,5 +326,6 @@ function startTaskSyncers({ bus, repo, now }) {
 module.exports.FLOOR_CONTRACT = FLOOR_CONTRACT;
 module.exports.floors = floors;
 module.exports.floorOf = floorOf;
+module.exports.floorByAgent = floorByAgent;
 module.exports.detectProducts = detectProducts;
 module.exports.startTaskSyncers = startTaskSyncers;

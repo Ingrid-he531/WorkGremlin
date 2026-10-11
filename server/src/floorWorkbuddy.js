@@ -28,18 +28,15 @@ const meta = {
   cliBinDirs: [path.join(HOME, '.workbuddy', 'bin')],
 };
 
-const { runHookEvent, jsonlReplies, codebuddyReplies, turnInterrupted } = require('./ingest/hookCommon');
+const { runHookEvent, sharedHookImpl, jsonlReplies, codebuddyReplies, turnInterrupted } = require('./ingest/hookCommon');
 
-/** WorkBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+/** WorkBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent。
+ * 只覆盖与公有默认不同的接口；其余回退 sharedHookImpl。 */
 const workbuddyImpl = {
-  client: 'workbuddy',
-  coarse: false,
-  hasPermissionEvent: false,
+  ...sharedHookImpl,
   awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
-  hasSubagentStart: false,
   repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
-  formOf: () => '',
 };
 
 async function handleHookEvent(ev, ctx) {

@@ -130,7 +130,7 @@ function createIngestRouter({ bus, repo }) {
         return res.status(400).json({ ok: false, error: { code: ERROR_CODES.BAD_PAYLOAD, message: 'missing project' } });
       }
       bus.ensureProject(project, ws, body.mainConversationId || null, 'report');
-      const result = await hookDispatch.dispatch({ ...body, project }, { project, workspacePath: ws, bus, repo });
+      const result = await hookDispatch.dispatch({ ...body }, { project, workspacePath: ws, bus, repo });
       return res.json({ ok: true, ...(result || {}) });
     } catch (err) {
       return res.status(500).json({ ok: false, error: { code: ERROR_CODES.INTERNAL, message: String((err && err.message) || err) } });

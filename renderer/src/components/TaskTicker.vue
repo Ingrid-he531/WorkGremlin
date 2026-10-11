@@ -27,6 +27,7 @@ import { httpBase } from '../api/bridge';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { floorAcceptsClient } from '../lib/clientMatch';
+import { colorsFor } from '../iso/officeMap';
 import { useI18n } from '../i18n';
 
 const { t } = useI18n();
@@ -83,10 +84,18 @@ function endedText(r) {
   const base = promptOf(r.title) || t('ticker.untitled');
   const suffixKind = r.state === 'done' ? 'done' : 'cancelled';
   const suffix = suffixKind === 'done' ? t('ticker.doneSuffix') : t('ticker.cancelledSuffix');
+  const taskLabel = t('ticker.taskLabel');
+  const taskText = clip(base);
+  const time = hhmm(r.started_at);
   return {
     id: `${r.id}:${r.state}`,
     kind: 'running',
-    text: `${hhmm(r.started_at)} ${floor} ${t('ticker.task', { text: clip(base) })}`,
+    time,
+    floor,
+    taskLabel,
+    taskText,
+    floorColor: colorsFor(floor).wood,
+    text: `${time} ${floor} ${taskLabel}${taskText}`,
     suffix,
     suffixKind,
   };
@@ -128,7 +137,7 @@ function detectEnded() {
   }
   // 屏上已经空了（之前没任务）却有东西要播：立刻补一段，别等下一轮轮询才动
   if (added && segs.value.length === 0) pushSeg();
-  
+
   // 清理：把不在 running 列表中的 announcedIds 移除，允许重新播报
   // （以防任务状态从 running 变成 done/cancelled 时没有被正确检测）
   for (const id of announcedIds) {
@@ -253,7 +262,19 @@ const runningItems = computed(() =>
     .map((r) => {
       const floor = floorOf(r.memberId || r.client);
       const text = promptOf(r.title) || t('ticker.untitled');
-      return { id: r.id, kind: 'running', text: `${hhmm(r.started_at)} ${floor} ${t('ticker.task', { text: clip(text) })}` };
+      const taskLabel = t('ticker.taskLabel');
+      const taskText = clip(text);
+      const time = hhmm(r.started_at);
+      return {
+        id: r.id,
+        kind: 'running',
+        time,
+        floor,
+        taskLabel,
+        taskText,
+        floorColor: colorsFor(floor).wood,
+        text: `${time} ${floor} ${taskLabel}${taskText}`,
+      };
     })
 );
 
@@ -441,7 +462,7 @@ onBeforeUnmount(() => {
       >
         <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
-          <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`"><span class="body">{{ it.text }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span><span class="pad">{{ ' '.repeat(padN(it)) }}</span></span>
+          <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span><span class="pad">{{ ' '.repeat(padN(it)) }}</span></span>
         </span>
       </div>
       <!-- 量字宽的探针：一串等宽数字，看不见也不占地方（算"一屏能放几个字"用） -->
@@ -533,7 +554,9 @@ onBeforeUnmount(() => {
   letter-spacing: 0.5px;
   /* 补的空格就靠它留着，不然末尾那一串空格会被折叠掉 */
   white-space: pre;
-  color: var(--text-dim);
+  /* 行本体色 = 楼层桌面木件色（圆点、时间、楼层号、"任务："标签都继承它），
+     没设楼层色时兜底用运行蓝 */
+  color: var(--floor-color, var(--accent, #4c8dff));
 }
 
 /* 每条前面的圆点：颜色跟着这一条自己的颜色走（蓝=在跑 / 绿=完成 / 红=取消），
@@ -547,6 +570,19 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   background: currentColor;
   box-shadow: 0 0 6px currentColor;
+}
+
+/* 一行里分段上色：
+   · 圆点 / 时间 / 楼层号(xF) / "任务：" 标签 / 任务原话 → 全部用楼层桌面的木件色
+     （--floor-color，colorsFor(floor).wood），跟办公室里那一层的桌椅木件同色，
+     一眼能认出是哪层的任务；
+   · 结束行末尾的状态字（.suf）→ 绿/红，独立上色。 */
+.line .time,
+.line .floor,
+.line .task-label,
+.line .task-text {
+  color: var(--floor-color);
+  text-shadow: 0 0 6px currentColor;
 }
 
 /* 量字宽的探针：绝对定位 + 看不见，不参与布局 */
@@ -563,21 +599,8 @@ onBeforeUnmount(() => {
   white-space: pre;
 }
 
-/* 蓝 = 任务开始（正在跑）；绿 = 完成；红 = 取消 / 失败；灰 = 没有任务 */
-.k-running {
-  color: var(--accent, #4c8dff);
-  text-shadow: 0 0 6px currentColor;
-}
-
-.k-done {
-  color: var(--state-online, #2ecc71);
-  text-shadow: 0 0 6px currentColor;
-}
-
-.k-cancelled {
-  color: var(--state-blocked, #ff5c5c);
-  text-shadow: 0 0 6px currentColor;
-}
+/* 行本体颜色由 --floor-color 驱动（见 .line），k-* 类保留以备将来按状态整体上色。
+   任务原话（.task-text）用运行蓝，结束状态字（.suf）用绿/红，均独立于行本体色。 */
 
 /* 结束行末尾的状态字：独立上色（绿=完成 / 红=取消·失败），主体仍沿用任务的蓝色 */
 .suf.s-done {

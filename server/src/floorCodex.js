@@ -49,12 +49,26 @@ const meta = {
   },
 };
 
-const { runHookEvent, jsonlReplies, codexForm, turnInterrupted } = require('./ingest/hookCommon');
+const { runHookEvent, sharedHookImpl, jsonlReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
+
+/** Codex 形态（cli / plugin）：rollout 首行 session_meta 的 source/originator。
+ * 原在 hookCommon，现挪到本楼层（"楼层自己的接口"）；没覆盖的字段回退 sharedHookImpl。 */
+function codexForm(transcriptPath) {
+  for (const obj of headJsonLines(transcriptPath)) {
+    const p = obj && obj.payload;
+    if (!p || typeof p !== 'object') continue;
+    if (obj.type !== 'session_meta' && !p.source && !p.originator) continue;
+    const who = `${String(p.source || '')} ${String(p.originator || '')}`.toLowerCase();
+    if (/jetbrains/.test(who)) return 'jetbrains';
+    if (/vscode|visual studio|extension|plugin/.test(who)) return 'vscode';
+    if (who.trim()) return 'cli';
+  }
+  return '';
+}
 
 /** Codex 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
 const codexImpl = {
-  client: 'codex',
-  coarse: false,
+  ...sharedHookImpl,
   hasPermissionEvent: true, // Codex 有独立的 PermissionRequest 事件
   awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"（idle 已在前面处理）
   hasSubagentStart: true, // Codex 发 SubagentStart / SubagentStop
@@ -67,4 +81,4 @@ async function handleHookEvent(ev, ctx) {
   return runHookEvent(ev, ctx, codexImpl);
 }
 
-module.exports = { id: '3F', meta, RE_CODEX_HOST, handleHookEvent };
+module.exports = { id: '3F', meta, RE_CODEX_HOST, handleHookEvent, codexForm };

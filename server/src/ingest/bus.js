@@ -31,26 +31,16 @@ function memberIdOf(project, name) {
 }
 
 /**
- * 来源客户端白名单（办公室按楼层的客户端过滤；不认识的值一律当"不知道"= NULL）。
- * client 列现在只存**形态**（form）：'cli' / 'vscode' / 'jetbrains' …（agent 直接代表楼层，
- * 见 shared.isPluginClient）。白名单认这些形态；同时为兼容老数据保留的 combined 串
- * （base / base-plugin）归一为 'cli' 形态。空串返回 null —— 见 clientMatch.floorAcceptsClient：
- * 空 client 视作通用、哪层都显示。
+ * 成员 client 归一化：只做 trim / 转小写，空值归 null。
  *
- * **漏一个形态 = 它的成员 client 变 NULL，而"空 client 视作通用、哪层都显示"**
- * （见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）—— 于是这个产品的成员会
- * 出现在**每一个**楼层里。新增 IDE 形态时补进 FORM_VALUES 即可。
+ * 约定（与楼层 / client 模型一致）：**client 就是楼层产品基名**（codebuddy / codex …），
+ * 由 registerMember 的调用方负责传对——调用方本来就处在某个楼层的上下文里，它默认知道
+ * 自己是哪一层。这里**不校验**"是不是已知楼层"：传错（形态串 cli/vscode、或拼错的基名）
+ * 就自然对不上任何楼层的过滤条件，前端不显示，无需在此拦截。
  */
-const FORM_VALUES = ['cli', 'vscode', 'jetbrains', 'cursor', 'windsurf', 'plugin'];
-const CLIENT_BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode', 'copilot'];
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
-  if (!c) return null;
-  if (FORM_VALUES.includes(c)) return c;
-  // 兼容老数据：base / base-plugin 归一为 'cli' 形态
-  const base = c.replace(/-plugin$/i, '');
-  if (CLIENT_BASES.includes(base)) return 'cli';
-  return null;
+  return c || null;
 }
 
 /**
@@ -253,8 +243,15 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * 注册一个成员（小怪物 / 主 agent / 幽灵）。
+   *
+   * 契约：**client 必传，且就是楼层产品基名**（codebuddy / codex …）。调用方本身就处于某个
+   * 楼层的上下文里，必须传对自己那一层；传错（形态串或拼错的基名）前端按楼层过滤自然不显示，
+   * 这里不校验。memberId 是成员**名字**（含工程后缀，如 peter@workgremlin），与 client 是两回事，
+   * 不要混用——楼层比的是 client，memberId 只当主键。
+   *
    * @param {{project: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string,
-   *          ephemeral?: boolean, projectLabel?: string|null}} p
+   *          ephemeral?: boolean, projectLabel?: string|null, client: string, reported?: number}} p
    */
   function registerMember(p) {
     const project = projectIdOf(p.project);
@@ -291,7 +288,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!m) return null;
     return m;
   }
-
   function writeSessionStatus(memberId, sessionId, state, taskId, ts) {
     const sid = normSession(sessionId);
     if (!sid) return;
@@ -406,7 +402,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     try {
       return hasOtherLiveSession({
         workspacePath: p.workspacePath || '',
-        client: member.client || normClient(p.client) || '',
+        client: member.client || '',
         session: String(p.sessionId),
       });
     } catch {
@@ -567,7 +563,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (String(member.role || '') === 'agent') {
       const wsRow0 = repo.getProject.get(project);
       const baseline = wsRow0 && wsRow0.workspace_path ? gitHead(wsRow0.workspace_path) : null;
-      const client0 = member.client || normClient(p.client) || null;
+      const client0 = member.client || null;
       repo.upsertTaskRun.run({
         id,
         projectId: project,
@@ -733,7 +729,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // 模型靠**落盘**取的产品（Claude Code / TraeCode）在这儿补一刀：开轮时 transcript 里还
       // 没有本轮的 assistant 行，读到的是上一轮的模型（会话第一轮则一条都没有、直接为空），
       // 收尾时再按会话取一次就能拿到本轮真实的那个。见 sessions.sessionModel。
-      const endClient = (run && run.client) || member.client || normClient(p.client) || null;
+      const endClient = (run && run.client) || member.client || null;
       const endSession = (run && run.session_id) || normSession(p.sessionId);
       // 但**只在行上还没有模型时才回填**：endTaskRun 是 `model = COALESCE(@model, model)`，
       // COALESCE 挡的是 null、不挡非空值 —— 无脑回填会把别的楼层开轮时取到的模型改写成
@@ -1016,7 +1012,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       tool,
       projectId: project,
       memberId: member.id,
-      client: member.client || normClient(p.client) || null,
+      client: member.client || null,
       sessionId: p.sessionId ? String(p.sessionId) : null,
       ts,
     });

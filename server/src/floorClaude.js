@@ -13,7 +13,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const {} = require('@workgremlin/shared');
 // 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
-const { readJson, readDir } = require('./roots');
+const { readJson, readDir, isFile } = require('./roots');
 
 const HOME = os.homedir();
 
@@ -36,17 +36,6 @@ const TRANSCRIPT_TAIL_BYTES = 128 * 1024;
  * 按 mtime+size+sinceTs 增量，文件没变就不重读。
  */
 const _claudeTailCache = new Map();
-
-/**
- * 判断文件是否存在
- */
-function isFile(p) {
-  try {
-    return fs.statSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Claude / Qoder 风格 transcript 的**尾部窗口**：这一轮有没有被用户打断、以及打断前最后说了什么。
@@ -303,7 +292,7 @@ function transcriptOf(sessionId) {
   for (const d of projectDirs()) {
     const p = path.join(d, name);
     try {
-      if (fs.statSync(p).isFile()) return p;
+      if (isFile(p)) return p;
     } catch {
       // 这个工程目录里没有这条会话，接着看下一个
     }
@@ -475,7 +464,7 @@ function readClaudeReplies(transcriptPath) {
  * 事件开关与文件/token/ghost 等公共逻辑全部委托 hookCommon.runHookEvent。会话状态由 dispatcher
  * 按 sessionId 持有（替代 hook 的 state 文件）。
  */
-const { runHookEvent, jsonlReplies, headJsonLines } = require('./ingest/hookCommon');
+const { runHookEvent, sharedHookImpl, jsonlReplies, headJsonLines } = require('./ingest/hookCommon');
 
 /** Claude 这一轮的形态（cli / plugin）：读 transcript 头部的 entrypoint */
 function claudeForm(transcriptPath) {
@@ -488,10 +477,9 @@ function claudeForm(transcriptPath) {
   return '';
 }
 
-/** Claude 的落盘差异：其余逻辑都在 hookCommon.runHookEvent */
+/** Claude 的落盘差异：其余逻辑都在 hookCommon.runHookEvent；只覆盖与公有默认不同的接口，其余回退 sharedHookImpl */
 const claudeImpl = {
-  client: 'claude',
-  coarse: false,
+  ...sharedHookImpl,
   hasPermissionEvent: true,
   awaitingPermission: (ev) => String((ev && ev.notification_type) || '') === 'permission_prompt',
   hasSubagentStart: false,

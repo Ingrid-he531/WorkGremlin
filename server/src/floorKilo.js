@@ -53,12 +53,12 @@
  * 相位与完成标记**不缓存** —— 渲染层 1.5s 拉一次，宁可每次多读一次库。
  */
 
-const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolveProjectName } = require('./project');
 const { DEFAULTS, diskKey } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
+const { isFile } = require('./roots');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -129,11 +129,7 @@ function kiloHome() {
 function kiloDbPath() {
   const explicit = String(process.env.WORKGREMLIN_KILO_DB || '').trim();
   const p = explicit ? path.resolve(explicit) : path.join(kiloHome(), 'kilo.db');
-  try {
-    return fs.statSync(p).isFile() ? p : '';
-  } catch {
-    return '';
-  }
+  return isFile(p) ? p : '';
 }
 
 /**

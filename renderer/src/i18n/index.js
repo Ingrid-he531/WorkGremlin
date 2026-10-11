@@ -119,6 +119,7 @@ const MESSAGES = {
 
     // ---- 门楣任务滚动屏（TaskTicker）----
     'ticker.task': '任务：{text}',
+    'ticker.taskLabel': '任务：',
     'ticker.done': '任务完成',
     'ticker.cancelled': '任务取消',
     'ticker.failed': '任务失败',
@@ -560,6 +561,7 @@ const MESSAGES = {
 
     // ---- lintel task ticker (TaskTicker) ----
     'ticker.task': 'Task: {text}',
+    'ticker.taskLabel': 'Task: ',
     'ticker.done': 'Task completed',
     'ticker.cancelled': 'Task cancelled',
     'ticker.failed': 'Task failed',

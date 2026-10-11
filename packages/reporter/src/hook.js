@@ -101,8 +101,8 @@ async function main() {
 
   const argv = process.argv.slice(2);
   // 主 agent 身份：安装器在命令里用 --agent 注入，必填；缺了直接报错退出。
-  const AGENT = flag(argv, '--agent');
-  if (!AGENT) {
+  const agent = flag(argv, '--agent');
+  if (!agent) {
     console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / workbuddy / trae / claude / qoder）');
     process.exit(1);
   }
@@ -122,19 +122,15 @@ async function main() {
     debug('stdin 不是 JSON —— 跳过');
     return;
   }
-  const event = ev.hook_event_name;
   /**
-   * 本事件来自哪个客户端（vscode / null / cli …）。
-   * 与 hookCommon 的 form 计算，按 client 是否含 vscode/extension/jetbrains/plugin 识别）。
+   * 本事件ev.client来自哪个客户端（vscode / null / cli …）。
    */
-  const client = ev.client ? String(ev.client).trim() : '';
+  trace(ev.hook_event_name, { agent: ev.agent || agent, client:ev.client, tool: ev.tool_name, notification_type: ev.notification_type });
+
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
-
-  trace(event, { client, agent: AGENT, tool: ev.tool_name, notification_type: ev.notification_type });
-
   // 纯转发：落盘解析 / 会话状态 / 台账 / token / 子代理幽灵 全在服务端做（server/src/ingest/hookCommon.js）。
-  // 把 agent / client / workspacePath 一并带上，服务端据此路由到对应楼层并归工程。
-  await request(info, '/api/v1/hook', { ...ev, agent: AGENT, client, workspacePath: cwd });
+  // 把 agent / form / workspacePath 一并带上，服务端据此路由到对应楼层并归工程。
+  await request(info, '/api/v1/hook', { ...ev, agent, workspacePath: cwd });
 }
 
 main().catch((err) => {

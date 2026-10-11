@@ -10,7 +10,7 @@ const express = require('express');
 const { ERROR_CODES } = require('@workgremlin/shared');
 
 /**
- * @param {{workspace: ReturnType<typeof import('../project').createWorkspaceManager>}} ctx
+ * @param {{workspace: ReturnType<typeof import('../../project').createWorkspaceManager>}} ctx
  */
 function createWorkspaceRouter({ workspace }) {
   const router = express.Router();

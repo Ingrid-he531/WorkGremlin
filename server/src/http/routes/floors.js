@@ -6,7 +6,7 @@ const express = require('express');
 function createProductsRouter() {
   const router = express.Router();
   router.get('/products', (req, res) => {
-    const { detectProducts } = require('../../products');
+    const { detectProducts } = require('../../floors');
     res.json({ ok: true, products: detectProducts({ force: req.query.refresh === '1' }) });
   });
   return router;

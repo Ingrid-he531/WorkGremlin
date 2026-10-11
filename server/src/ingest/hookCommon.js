@@ -19,17 +19,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
 const { updateJson } = require('@workgremlin/shared/fslock');
-const { fnv1a32 } = require('@workgremlin/shared');
+const { fnv1a32, home, isPluginClient } = require('@workgremlin/shared');
 const { feedFilePath } = require('./subagentFeed');
-
-/** 文件是否存在且为普通文件（读取落盘前先探一下） */
-function isFile(p) {
-  try {
-    return fs.statSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
+const { isFile } = require('../roots');
 
 /* ============================== 常量（与 hook.js 对齐） ============================== */
 const RESULT_MAX = 4_000;
@@ -271,8 +263,8 @@ function replyKeyOf(reply) {
   return 'h' + fnv1a32(String((reply && reply.text) || ''));
 }
 
-function aiDedupeKey(client, sessionId, msgId) {
-  return `ai:${client}:${String(sessionId || 'nosession')}:${String(msgId || 'noid')}`;
+function aiDedupeKey(floor, sessionId, msgId) {
+  return `ai:${floor}:${String(sessionId || 'nosession')}:${String(msgId || 'noid')}`;
 }
 
 /* ============================== 回复解析（产品无关：jsonl / codebuddy index.json） ============================== */
@@ -435,31 +427,6 @@ function headJsonLines(file, maxLines = 20) {
     }
   }
   return out;
-}
-
-/** Codex 形态（cli / plugin）：rollout 首行 session_meta 的 source/originator */
-function codexForm(transcriptPath) {
-  for (const obj of headJsonLines(transcriptPath)) {
-    const p = obj && obj.payload;
-    if (!p || typeof p !== 'object') continue;
-    if (obj.type !== 'session_meta' && !p.source && !p.originator) continue;
-    const who = `${String(p.source || '')} ${String(p.originator || '')}`.toLowerCase();
-    if (/jetbrains/.test(who)) return 'jetbrains';
-    if (/vscode|visual studio|extension|plugin/.test(who)) return 'vscode';
-    if (who.trim()) return 'cli';
-  }
-  return '';
-}
-
-/** Qoder 形态（cli / plugin）：transcript 首行 user 的 entrypoint */
-function qoderForm(transcriptPath) {
-  for (const obj of headJsonLines(transcriptPath)) {
-    const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
-    if (!ep) continue;
-    if (ep.includes('vscode') || ep.includes('plugin')) return 'vscode';
-    return ep === 'cli' ? 'cli' : '';
-  }
-  return '';
 }
 
 /** 这一轮有没有被用户打断的痕迹（给"没有显式 Interrupt 事件"的产品用）：Codex turn_aborted / Claude·Qoder 的 user 标记 */
@@ -724,19 +691,9 @@ function resultOfResponse(ev) {
 }
 
 /* ============================== ghost feed 写入（替代 hook 的 addGhost/finishGhost/sweepGhosts） ============================== */
-
-function clientFamily(c) {
-  return String(c || '').trim().toLowerCase().replace(/-plugin$/, '');
-}
-
-function ownsEntry(a, client, session = '') {
+function ownsEntry(a, floor, session = '') {
   if (!a) return false;
-  const fam = clientFamily(a.client);
-  if (fam) {
-    if (fam !== clientFamily(client)) return false;
-  } else if (clientFamily(client) !== 'codebuddy') {
-    return false;
-  }
+  if (a.floor !== floor) return false;
   if (session) {
     const s = String(a.sessionId || '').trim();
     if (s && s !== session) return false;
@@ -744,8 +701,8 @@ function ownsEntry(a, client, session = '') {
   return true;
 }
 
-/** 主 Agent 召唤 subagent → 加一只小幽灵（直接写 feed 文件，带 ts/client/sessionId 归属） */
-function addGhost(workspacePath, name, task, id, parent, model, client, session = '') {
+/** 主 Agent 召唤 subagent → 加一只小幽灵（直接写 feed 文件，带 ts/floor/sessionId 归属） */
+function addGhost(workspacePath, name, task, id, parent, model, floor, session = '') {
   const file = feedFilePath(workspacePath);
   updateJson(
     file,
@@ -758,7 +715,7 @@ function addGhost(workspacePath, name, task, id, parent, model, client, session 
         name,
         state: 'busy',
         ts: Date.now(),
-        client,
+        floor,
         ...(session ? { sessionId: String(session) } : {}),
         ...(task ? { task } : {}),
         ...(id ? { id } : {}),
@@ -772,7 +729,7 @@ function addGhost(workspacePath, name, task, id, parent, model, client, session 
 }
 
 /** subagent 收工 → 改成"已收工待汇报"（不直接删，让 subagentFeed 播完汇报再回收） */
-function retireGhost(workspacePath, name, id, result, client, session = '') {
+function retireGhost(workspacePath, name, id, result, floor, session = '') {
   const file = feedFilePath(workspacePath);
   let changed = false;
   updateJson(
@@ -786,7 +743,7 @@ function retireGhost(workspacePath, name, id, result, client, session = '') {
       }
       if (hit < 0) return undefined;
       const cur = feed.agents[hit] || {};
-      if (!ownsEntry(cur, client, session)) return undefined;
+      if (!ownsEntry(cur, floor, session)) return undefined;
       const task = String(cur.task || '').trim();
       const said = String(result || '').replace(/\s+/g, ' ').trim().slice(0, 200);
       feed.agents[hit] = { ...cur, state: 'idle', result: said || (task ? `已完成：${task}` : '已完成') };
@@ -799,14 +756,14 @@ function retireGhost(workspacePath, name, id, result, client, session = '') {
 }
 
 /** 扫掉本 hook 召唤的幽灵（带 ts 的），并清掉会话台账里对应的记录 */
-function sweepGhosts(workspacePath, client, opts = {}, session = '', sessionState = null) {
+function sweepGhosts(workspacePath, floor, opts = {}, session = '', sessionState = null) {
   const file = feedFilePath(workspacePath);
   let doomed = [];
   updateJson(
     file,
     (feed) => {
       doomed = feed.agents.filter(
-        (a) => a && a.ts && ownsEntry(a, client, session) && (opts.all || !a.result)
+        (a) => a && a.ts && ownsEntry(a, floor, session) && (opts.all || !a.result)
       );
       if (!doomed.length) return undefined;
       feed.agents = feed.agents.filter((a) => !doomed.includes(a));
@@ -826,8 +783,7 @@ function sweepGhosts(workspacePath, client, opts = {}, session = '', sessionStat
 }
 
 /* ============================== 回复入库（替代 reportAiReplies） ============================== */
-
-async function reportReplies(ctx, agent, taskId, replies, sessionId, client) {
+async function reportReplies(ctx, memberId, taskId, replies, sessionId, floor) {
   const { bus, project, workspacePath } = ctx;
   if (!Array.isArray(replies) || !replies.length) return;
   const list = replies.slice(-MAX_REPLIES);
@@ -841,15 +797,15 @@ async function reportReplies(ctx, agent, taskId, replies, sessionId, client) {
         return bus.recordMessage({
           project,
           workspacePath,
-          memberId: agent,
-          from: agent,
+          memberId: memberId,
+          from: floor,
           to: null,
           type: i === list.length - 1 ? 'result' : 'task_update',
           subject: null,
           content: content.slice(0, MSG_MAX),
           taskId: taskId || null,
           ts,
-          dedupeKey: aiDedupeKey(client, sessionId, replyKeyOf(list[i])),
+          dedupeKey: aiDedupeKey(floor, sessionId, replyKeyOf(list[i])),
         });
       })
       .filter(Boolean)
@@ -859,15 +815,15 @@ async function reportReplies(ctx, agent, taskId, replies, sessionId, client) {
 /* ============================== 形态（cli / plugin）判定 ============================== */
 
 /**
- * 由事件自报的 client 字段取出**形态**（form）。IDE 扩展（vscode / jetbrains / extension /
- * plugin / cursor / windsurf …）原样返回该 IDE 串，便于以后扩展；其余（CLI，client 为产品名 /
- * 'cli' / null）一律归为 'cli'，空返回 ''。
- * agent 直接代表楼层，client 只描述形态 —— 与 hook event 的语义一致。
+ * 由事件自报的 form 字段取出**形态**（form）。form 仅两种语义：plugin / 非plugin（cli）。
+ * 是否 plugin 由 `isPluginClient` 唯一判定（当前只认 vscode，未来可扩展 jetbrains/cursor…）；
+ * plugin 形态原样保留用于落盘区分，其它一律视作 'cli'（非 plugin）；空返回 null。
+ * agent（ev.agent）直接代表楼层，form 只描述形态 —— 与 hook event 的语义一致。
  */
-function clientFormOf(ev) {
+function fixedFormOf(ev) {
   const c = String((ev && ev.client) || '').toLowerCase();
-  if (/vscode|jetbrains|extension|plugin|cursor|windsurf/.test(c)) return c;
-  return c ? 'cli' : '';
+  if (!c) return null;
+  return isPluginClient(c) ? c : 'cli';
 }
 
 /* ============================== 通用事件开关（忠实搬运 hook.js main） ============================== */
@@ -878,20 +834,75 @@ function clientFormOf(ev) {
  * @param {{project:string, workspacePath:string, bus:any, sessionGet:Function, sessionSet:Function}} ctx
  * @param {object} impl 产品差异
  */
-async function runHookEvent(ev, ctx, impl) {
+
+/**
+ * hook 事件的实时相位落盘点。
+ * 重构把会话状态收口进 dispatcher 的内存 Map（见 hookDispatch.js），但 `/reporter-phase`、
+ * `freshestReporterWs`/(listSessions 的 current/fresh) 仍按 `<floor>@<工程>@<会话>.json` 文件读。
+ * plugin 路径（IDE 扩展直接 writeState）会写这份文件，hook 路径（CodeBuddy / Codex / WorkBuddy /
+ * Trae / Qoder …）原本只在内存里 set —— 于是这些楼层的实时相位永远读不到，主控制台相位卡死。
+ * 这里每次 set 时把同一份状态同步写盘，与 plugin 路径口径一致。
+ */
+function reporterHooksDir() {
+  return path.join(home(), 'hooks');
+}
+function reporterStatePath(floor, workspacePath, sessionId) {
+  const parts = [String(floor), String(workspacePath || '')];
+  if (sessionId) parts.push(String(sessionId));
+  const key = parts.join('@').replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(reporterHooksDir(), `${key}.json`);
+}
+
+/** 公有默认 hook 行为：楼层模块没自己提供的接口就回退到这份（见各 floorXXX.js 的 handleHookEvent）。
+ * 各楼层用 `{ ...sharedHookImpl, ...本楼层覆盖 }` 组装 impl，没覆盖的字段自动用公有默认。 */
+const sharedHookImpl = {
+  coarse: false,
+  coarseTitle: '',
+  hasPermissionEvent: false,
+  hasSubagentStart: false,
+  awaitingPermission: null,
+  repliesOf: (tp) => jsonlReplies(tp),
+  interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  formOf: () => '',
+};
+
+async function runHookEvent(ev, ctx, floorImpl) {
+  const impl = { ...sharedHookImpl, ...(floorImpl || {}) };
   const { bus, project, workspacePath, sessionGet, sessionSet } = ctx;
   const event = ev && ev.hook_event_name;
   if (!event) return { ok: false, error: 'missing hook_event_name' };
 
-  const agent = String(ev.agent || impl.client || '').replace(/-plugin$/i, '');
-  const client = clientFormOf(ev); // 形态（vscode / cli / ''）作为 client 列；agent 直接代表楼层
-  const memberId = agent;
+  const memberId = ev.agent;
   const sessionId = String(ev.session_id || '');
   const cwd = String(ev.cwd || '');
-  const base = { project, workspacePath, memberId, client };
+  const floor = ev.agent;
+  const base = { project, workspacePath, memberId, sessionId };
 
   const get = () => sessionGet(sessionId) || {};
-  const set = (patch) => sessionSet(sessionId, patch);
+  // 内存 Map（dispatcher）与落盘状态文件双写：前者是服务端单一真源，后者供 /reporter-phase、
+  // listSessions(current/fresh) 读取实时相位。只写内存会丢掉 hook 型楼层的实时相位（见上方注释）。
+  const set = (patch) => {
+    sessionSet(sessionId, patch);
+    if (!floor || !sessionId) return;
+    try {
+      fs.mkdirSync(reporterHooksDir(), { recursive: true });
+      updateJson(
+        reporterStatePath(floor, workspacePath, sessionId),
+        (prev) => ({
+          ...(prev || {}),
+          floor,
+          client: floor,
+          form: formOf(),
+          sessionId,
+          ...patch,
+          hb: { pid: process.pid, lastEventAt: Date.now() },
+        }),
+        { fallback: {} }
+      );
+    } catch {
+      /* 落盘失败不影响 agent 主流程 */
+    }
+  };
 
   // 缓存 transcript 路径（后续事件从会话状态里取，hook 原逻辑见 SessionStart 那段）
   if (ev.transcript_path) set({ transcriptPath: String(ev.transcript_path) });
@@ -900,12 +911,13 @@ async function runHookEvent(ev, ctx, impl) {
   const status = (state, reason) =>
     bus.setStatus({ ...base, state, taskId: get().taskId || null, ...(reason ? { reason } : {}) });
   const beat = () => bus.heartbeat({ ...base, memberId });
-  const register = () => bus.registerMember({ ...base, name: memberId, role: 'agent' });
+  // 主 agent 的楼层身份补进 client：memberId 基名(= ev.agent)与 client 同为产品基名(codebuddy)，
+  // 与静态小怪物 / 幽灵统一成"client = 楼层(产品基名)、memberId 仅作主键"的约定。
+  const register = () => bus.registerMember({ ...base, name: memberId, role: 'agent', client: ev.agent });
 
-  // plugin 形态优先由事件自报的 client 判定（vscode 只是壳，rollout 头常仍标 cli，猜不准），
-  // 落盘头只作 fallback。hook 已把原始 client 透传过来，这里按它识别 plugin。
-  const clientForm = clientFormOf(ev);
-  const formOf = () => clientForm || impl.formOf(tp());
+  // plugin 形态优先由事件自报的 form 判定（vscode 只是壳，rollout 头常仍标 cli，猜不准），
+  // 落盘头只作 fallback。hook 已把原始 form 透传过来，这里按它识别 plugin。
+  const formOf = () => fixedFormOf(ev) || impl.formOf(tp());
 
   // 给上一轮补报 token（新一轮开始时用）
   async function backfillPrevTokens(prevDone, transcriptPath) {
@@ -929,8 +941,8 @@ async function runHookEvent(ev, ctx, impl) {
       }
     }
     const replies0 = impl.repliesOf(tp());
-    await reportReplies(ctx, memberId, taskId0, replies0, sessionId, client);
-    sweepGhosts(workspacePath, client, {}, sessionId, st0);
+    await reportReplies(ctx, memberId, taskId0, replies0, sessionId, floor);
+    sweepGhosts(workspacePath, floor, {}, sessionId, st0);
     const files0 = collectRoundFiles(st0, ev0, cwd, startedAt0, workspacePath);
     const last0 = replies0.length ? replies0[replies0.length - 1].text : '';
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -997,7 +1009,7 @@ async function runHookEvent(ev, ctx, impl) {
   if (event === 'UserPromptSubmit') {
     if (INJECTED_PROMPT_RE.test(String((ev && ev.prompt) || ''))) return { ok: true, ignored: 'injected' };
     const prevDone = get().done || null;
-    sweepGhosts(workspacePath, client, {}, sessionId, get());
+    sweepGhosts(workspacePath, floor, {}, sessionId, get());
     // 新的一轮：清"等授权/挂起/上一轮完成标记"
     set({ await: null, pending: null, done: null });
     const prompt = userRequestText(ev.prompt);
@@ -1066,12 +1078,12 @@ async function runHookEvent(ev, ctx, impl) {
           if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name: nm, at: Date.now() });
           else if (!id && nm && !ledger.some((r) => r.name === nm)) ledger.push({ id: '', name: nm, at: Date.now() });
           set({ subagents: ledger });
-          addGhost(workspacePath, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId);
+          addGhost(workspacePath, nm, task, id, String(get().taskId || ''), String(ev.model || ''), floor, sessionId);
         }
       }
       const toolTaskId = String(get().taskId || '');
       if (tool && toolTaskId) {
-        await bus.toolUse({ ...base, taskId: toolTaskId, tool, sessionId, client });
+        await bus.toolUse({ ...base, taskId: toolTaskId, tool });
       }
       await status('busy');
     } else {
@@ -1094,7 +1106,7 @@ async function runHookEvent(ev, ctx, impl) {
         if (tid) await bus.taskProgress({ ...base, taskId: tid, progress: prog });
       }
       if (isSubagentTool(ev.tool_name) && !impl.hasSubagentStart) {
-        finishGhostServer(sessionId, get(), workspacePath, ev, client, set);
+        finishGhostServer(sessionId, get(), workspacePath, ev, floor, set);
       }
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
       await status('thinking');
@@ -1142,13 +1154,13 @@ async function runHookEvent(ev, ctx, impl) {
     const ledger = ((st.subagents) || []).slice(-8);
     if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name, at: Date.now() });
     set({ subagents: ledger, pendingSpawn: null });
-    addGhost(workspacePath, name, (pend && pend.task) || '', id, String(st.taskId || ''), String(ev.model || ''), client, sessionId);
+    addGhost(workspacePath, name, (pend && pend.task) || '', id, String(st.taskId || ''), String(ev.model || ''), floor, sessionId);
     await beat();
     return { ok: true, handled: event };
   }
 
   if (event === 'SubagentStop') {
-    finishGhostServer(sessionId, get(), workspacePath, { ...ev, last_assistant_message: ev.last_assistant_message }, client, set);
+    finishGhostServer(sessionId, get(), workspacePath, { ...ev, last_assistant_message: ev.last_assistant_message }, floor, set);
     await beat();
     return { ok: true, handled: event };
   }
@@ -1160,7 +1172,7 @@ async function runHookEvent(ev, ctx, impl) {
     );
     // 清"等授权/挂起"（done 已先读）
     set({ await: null, pending: null, done: null });
-    sweepGhosts(workspacePath, client, {}, sessionId, get());
+    sweepGhosts(workspacePath, floor, {}, sessionId, get());
     const st = get();
     let taskId = st.taskId;
     let title = st.taskTitle || '';
@@ -1219,7 +1231,7 @@ async function runHookEvent(ev, ctx, impl) {
     });
     await beat();
     await status('idle');
-    await reportReplies(ctx, memberId, taskId, replies, sessionId, client);
+    await reportReplies(ctx, memberId, taskId, replies, sessionId, floor);
     return { ok: true, handled: event };
   }
 
@@ -1238,7 +1250,7 @@ async function runHookEvent(ev, ctx, impl) {
 
   if (event === 'SessionEnd') {
     const stEnd = get();
-    await reportReplies(ctx, memberId, stEnd.taskId, impl.repliesOf(tp()), sessionId, client);
+    await reportReplies(ctx, memberId, stEnd.taskId, impl.repliesOf(tp()), sessionId, floor);
     if (impl.coarse) {
       const qFormEnd = formOf() || stEnd.form || '';
       if (qFormEnd && qFormEnd !== stEnd.form) set({ form: qFormEnd });
@@ -1261,7 +1273,7 @@ async function runHookEvent(ev, ctx, impl) {
       sessionEndedAt: Date.now(),
       sessionPhase: impl.coarse ? { phase: 'done', ts: Date.now(), workspacePath } : null,
     });
-    sweepGhosts(workspacePath, client, { all: true }, sessionId, get());
+    sweepGhosts(workspacePath, floor, { all: true }, sessionId, get());
     set({ taskId: null, taskWorkspacePath: '', taskStartedAt: 0, subagents: [] });
     await status('offline');
     return { ok: true, handled: event };
@@ -1271,7 +1283,7 @@ async function runHookEvent(ev, ctx, impl) {
 }
 
 /** 服务端版 finishGhost：从会话台账找召唤记录，再写 feed 飘成"待汇报" */
-function finishGhostServer(sessionId, st, workspacePath, ev, client, set) {
+function finishGhostServer(sessionId, st, workspacePath, ev, floor, set) {
   const ti = ev && ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : null;
   const nm = ti ? agentName(ti) : '';
   const task = ti ? agentTask(ti) : '';
@@ -1288,7 +1300,7 @@ function finishGhostServer(sessionId, st, workspacePath, ev, client, set) {
   if (!hit) return;
   st.subagents = list.filter((x) => x !== hit);
   if (set) set({ subagents: st.subagents });
-  retireGhost(workspacePath, hit.name, hit.id, resultOfResponse(ev), client, sessionId);
+  retireGhost(workspacePath, hit.name, hit.id, resultOfResponse(ev), floor, sessionId);
 }
 
 module.exports = {
@@ -1296,10 +1308,12 @@ module.exports = {
   // 产品无关助手（导出便于单测与复用）
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
   transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens, readTokensSettled,
-  addGhost, retireGhost, sweepGhosts, ownsEntry, clientFamily, agentName, agentTask, subagentKeys,
+  addGhost, retireGhost, sweepGhosts, ownsEntry, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS, CB_REQ_GRACE_MS, CB_FLUSH_WAIT_MS, CB_FLUSH_STEP_MS,
   // 回复解析 / 形态 / 打断（产品无关）
   extractText, msgOf, isInterruptLine, sinceLastUser, jsonlReplies, codebuddyReplies,
-  headJsonLines, codexForm, qoderForm, turnInterrupted, INTERRUPT_HINT_RE,
+  headJsonLines, turnInterrupted, INTERRUPT_HINT_RE,
+  // 公有默认 hook 行为（楼层模块没覆盖的接口回退到这份）
+  sharedHookImpl,
 };

@@ -58,11 +58,11 @@
  * 相位与完成标记**不缓存** —— 渲染层 1.5s 拉一次，宁可每次多读一次库。
  */
 
-const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { DEFAULTS, diskKey } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
+const { isFile } = require('./roots');
 const { resolveProjectName } = require('./project');
 
 const HOME = os.homedir();
@@ -133,11 +133,7 @@ function opencodeHome() {
 function opencodeDbPath() {
   const explicit = String(process.env.WORKGREMLIN_OPENCODE_DB || '').trim();
   const p = explicit ? path.resolve(explicit) : path.join(opencodeHome(), 'opencode.db');
-  try {
-    return fs.statSync(p).isFile() ? p : '';
-  } catch {
-    return '';
-  }
+  return isFile(p) ? p : '';
 }
 
 /**

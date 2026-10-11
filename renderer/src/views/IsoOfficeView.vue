@@ -509,9 +509,11 @@ const sceneMembers = computed(() => {
   return project.members
     .filter((m) => m.role !== 'agent')
     .filter((m) => !(emptyFloor && isEphemeralMember(m))) // 空楼层：只留常驻的
-    // 按 agent 基名过滤来源：3F 只看 Codex 的成员与幽灵，1F 只看 CodeBuddy 的。
-    // client 为空的（演示数据、手工 scripts/subagents.js 写的、老库还没补上的）视作通用，哪层都显示。
-    .filter((m) => floorAcceptsClient(want, m.memberId || m.client))
+    // 按 client（产品 / 楼层标识）过滤来源：3F 只看 Codex、1F 只看 CodeBuddy。
+    // client 才代表"属于哪一层"——常驻小怪物写在 agents 目录里，memberId 是 peter/leo 这种
+    // 给人起的名字，跟产品无关，绝不拿它去比楼层。client 为空（老库 / 演示数据 /
+    // 手工 scripts 写的）视作通用、哪层都显示（floorAcceptsClient 的语义）。
+    .filter((m) => floorAcceptsClient(want, m.client))
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],
