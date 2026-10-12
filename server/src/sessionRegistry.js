@@ -859,6 +859,9 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   // 同时顺手取出 tasks.started_at（任务真正开始的时间），滚动屏时间用它，而不是"当前时间"。
   const runningTitleByFloor = new Map();
   const runningStartedByFloor = new Map();
+  // 按会话匹配运行任务：每个会话只显示它自己的任务标题，不被同楼层其他会话串扰
+  const runningBySession = new Map();
+  const aliveSessions = new Set();
   // 检测用"活着"的楼层：账本里 state='running' 且**心跳/agent_status 活着**（非粘性判定）。
   // 关键：这里把 @fresh 设到未来，彻底关掉查询里的 started_at 兜底窗口——
   // 那个窗口是"挂 3h / 重启复活"的根源（停掉的插件任务在账本里一直挂 running，started_at 又很新就又被认领）。
@@ -881,13 +884,28 @@ function snapshot({ workspacePath = '', force = false } = {}) {
     for (const r of titleRows) {
       const f = floorByAgent[agentBase(r.client)];
       if (f && f.id) {
-        if (r.title && !runningTitleByFloor.has(f.id)) runningTitleByFloor.set(f.id, r.title);
-        if (r.startedAt && !runningStartedByFloor.has(f.id)) runningStartedByFloor.set(f.id, Number(r.startedAt));
+        // 楼层级 fallback（会话没有 sessionId 时用）
+        const at = Number(r.startedAt) || 0;
+        const prev = runningStartedByFloor.get(f.id) || 0;
+        if (at >= prev) {
+          if (r.title) runningTitleByFloor.set(f.id, r.title);
+          runningStartedByFloor.set(f.id, at);
+        }
+      }
+      // 按会话级匹配：sessionId → {title, startedAt}
+      // 这样每个会话只显示它自己的运行任务标题，不会被同楼层的旧僵尸任务串扰
+      if (r.sessionId) {
+        const at = Number(r.startedAt) || 0;
+        const prev = runningBySession.get(r.sessionId);
+        if (!prev || at >= prev.startedAt) {
+          runningBySession.set(r.sessionId, { title: r.title || '', startedAt: at });
+        }
       }
     }
     for (const r of detectRows) {
       const f = floorByAgent[agentBase(r.client)];
       if (f && f.id) ledgerAliveFloors.add(f.id);
+      if (r.sessionId) aliveSessions.add(r.sessionId);
     }
   } else {
     /* repo/activeRunningByProject 缺失时跳过账本信号（老行为） */
@@ -906,20 +924,21 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       })
       .map((s) => {
         // taskState —— 这条会话"有没有在跑的任务"的唯一真相源，门楣滚动屏与主控制台都读它。
-        // 跑：本层相位新鲜（runningFloors）。结束：reporter 落的 doneAt，且必须是**本进程启动之后**
-        // 发生的（重启后旧的 doneAt 不认，否则会复活上一轮的"任务取消/完成"）。
+        // 按会话级判定：只有这条会话自己有 alive task 才算 running，不再被同楼层其他会话的活跃任务牵连。
+        // 无 sessionId 的会话（老数据）退回楼层级判定。
         let taskState;
-        if (runningFloors.has(s.floor)) taskState = 'running';
+        if (s.sessionId && aliveSessions.has(s.sessionId)) taskState = 'running';
+        else if (!s.sessionId && runningFloors.has(s.floor)) taskState = 'running';
         // 结束态：reporter 落的 doneAt，且（1）必须是**本进程启动之后**发生的（重启后旧 doneAt 不认，
         // 否则复活上一轮"任务取消/完成"）；（2）本会话近期（10s 内）没有新活动——新一轮任务刚起步时
         // 旧的 doneAt 还挂着、相位又来不及翻新，若直接认它就会先闪一下"任务取消"再跳回"思考中"，
         // 所以只要会话最近还有动静（新任务已经在跑了）就压住旧结束态。
         else if (s.doneAt && s.doneAt > SINCE_BOOT && now - (Number(s.lastEventAt) || 0) > 10_000) taskState = s.doneCancelled ? 'cancelled' : 'done';
         else taskState = null;
-        // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——不依赖会话里常常为空的 prompt；
-        // 同时带上任务真正开始的时间（tasks.started_at），滚动屏时间用它而非"当前时间"。
-        const taskTitle = taskState === 'running' ? runningTitleByFloor.get(s.floor) || '' : '';
-        const taskStartedAt = taskState === 'running' ? Number(runningStartedByFloor.get(s.floor) || 0) : 0;
+        // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——优先按会话匹配，fallback 楼层级。
+        const runningBySid = s.sessionId ? runningBySession.get(s.sessionId) : null;
+        const taskTitle = taskState === 'running' ? (runningBySid?.title || runningTitleByFloor.get(s.floor) || '') : '';
+        const taskStartedAt = taskState === 'running' ? (runningBySid?.startedAt || Number(runningStartedByFloor.get(s.floor) || 0)) : 0;
         return { ...s, taskState, taskTitle, taskStartedAt };
       });
     return {
