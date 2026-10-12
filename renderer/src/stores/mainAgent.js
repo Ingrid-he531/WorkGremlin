@@ -252,7 +252,11 @@ export const useMainAgentStore = defineStore('mainAgent', {
       clearTimeout(timer);
       timer = null;
       this.live = true;
-      this.phase = s.phase || 'idle';
+      // done/cancelled 不直接设：切会话回来时 consoleBase 从 sel.taskState='done'
+      // 喂回 {phase:'done'}，直接设会没有 stopTimer → 永远卡「任务完成」。
+      // 收尾展示由 watch 的 enterDone/enterCancelled 路径（带 stopTimer）独占。
+      const sp = s.phase;
+      this.phase = (sp === 'done' || sp === 'cancelled') ? 'idle' : (sp || 'idle');
       this.action = s.action || '';
       this.skill = s.skill || '';
       this.tool = s.tool || '';
