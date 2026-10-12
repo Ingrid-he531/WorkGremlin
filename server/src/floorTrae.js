@@ -979,6 +979,8 @@ function synthMarks(ctx) {
       if (bySession.has(sid)) continue;
       const hook = hookBySid.get(sid);
       const j = hook ? hook.j : null;
+      // 同上：上一轮的取消信号（atC < 当前 taskStartedAt）跨轮复活，跳过
+      if (j && Number(j.taskStartedAt) && atC < Number(j.taskStartedAt)) continue;
       const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
       if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
       if (j && client && !clientHit(client, j.client)) continue;
