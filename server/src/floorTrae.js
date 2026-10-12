@@ -940,6 +940,10 @@ function synthMarks(ctx) {
     const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
     if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
     if (j && client && !clientHit(client, j.client)) continue;
+    // 上一轮的 DoneHandler 残留：h.at 属于更早的一轮（< 当前轮 taskStartedAt），
+    // 新一轮已经开始了就不该再把上一轮的完成/取消标记塞进 bySession —— reporter-phase
+    // 会把这份旧 done 连同新 taskTitle 一起返回，前端看到 doneAt 变化误以为任务完成。
+    if (j && Number(j.taskStartedAt) && h.at < Number(j.taskStartedAt)) continue;
     if (h.status === 'completed') {
       // DoneHandler completed → 正常完成标记（cancelled:false），覆盖 bySession 里已有的 cancelled:true；
       // 只在 DoneHandler at 更大时覆盖 —— completed 信号本应比取消信号晚到。
