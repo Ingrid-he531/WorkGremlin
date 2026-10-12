@@ -16,6 +16,9 @@ const path = require('node:path');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-hook-dispatch-'));
 const TP = path.join(TMP, 'sess.jsonl');
+const WG_HOME = path.join(TMP, 'workgremlin');
+process.env.WORKGREMLIN_HOME = WG_HOME;
+fs.mkdirSync(path.join(WG_HOME, 'hooks'), { recursive: true });
 // 一条 user + 一条 assistant（最后一句即产出）
 fs.writeFileSync(
   TP,
@@ -27,6 +30,7 @@ fs.writeFileSync(
 );
 
 const { createHookDispatch } = require('../src/ingest/hookDispatch');
+const { listReporterSessions } = require('../src/sessions');
 
 let pass = 0;
 let fail = 0;
@@ -53,6 +57,7 @@ function ok(label, cond, extra = '') {
     heartbeat: (b) => { calls.push(['heartbeat', b]); return { ok: true }; },
     recordMessage: (b) => { calls.push(['recordMessage', b]); return { ok: true }; },
     currentTaskFor: () => null,
+    projectForReport: (_project, workspacePath) => workspacePath || 'P',
   };
   const ctx = { project: 'P', workspacePath: TMP, bus, repo: {} };
   const d = createHookDispatch();
@@ -61,7 +66,7 @@ function ok(label, cond, extra = '') {
   {
     calls.length = 0;
     const r = await d.dispatch(
-      { hook_event_name: 'UserPromptSubmit', session_id: 's1', client: 'claude', prompt: '帮我写个函数', agent: 'claude' },
+      { hook_event_name: 'UserPromptSubmit', session_id: '11111111-1111-4111-8111-111111111111', client: 'claude', prompt: '帮我写个函数', agent: 'claude' },
       ctx
     );
     const start = calls.find((c) => c[0] === 'startTask');
@@ -69,7 +74,7 @@ function ok(label, cond, extra = '') {
     ok('[2] UserPromptSubmit 落到 startTask', !!start);
     ok('[2] 任务标题取用户原话', start && start[1].title === '帮我写个函数', start && start[1].title);
     ok('[2] 相位 thinking', st && st[1].state === 'thinking');
-    ok('[2] 本轮 taskId 记入会话状态', d.sessionGet('s1') && d.sessionGet('s1').taskId === 't_generated');
+    ok('[2] 本轮 taskId 记入会话状态', d.sessionGet('11111111-1111-4111-8111-111111111111') && d.sessionGet('11111111-1111-4111-8111-111111111111').taskId === 't_generated');
     ok('[2] 返回 handled: UserPromptSubmit', r && r.handled === 'UserPromptSubmit');
   }
 
@@ -77,7 +82,7 @@ function ok(label, cond, extra = '') {
   {
     calls.length = 0;
     const r = await d.dispatch(
-      { hook_event_name: 'Stop', session_id: 's1', client: 'claude', transcript_path: TP, agent: 'claude' },
+      { hook_event_name: 'Stop', session_id: '11111111-1111-4111-8111-111111111111', client: 'claude', transcript_path: TP, agent: 'claude' },
       ctx
     );
     const end = calls.find((c) => c[0] === 'endTask');
@@ -92,9 +97,25 @@ function ok(label, cond, extra = '') {
   // [3] 无 handleHookEvent 的楼层（kilo）被忽略
   {
     calls.length = 0;
-    const r = await d.dispatch({ hook_event_name: 'Stop', session_id: 'sx', client: 'kilo', agent: 'kilo' }, ctx);
+    const r = await d.dispatch({ hook_event_name: 'Stop', session_id: '22222222-2222-4222-8222-222222222222', client: 'kilo', agent: 'kilo' }, ctx);
     ok('[3] kilo 事件被忽略', r && r.ignored === true);
     ok('[3] 没触发任何 bus 调用', calls.length === 0, JSON.stringify(calls.map((c) => c[0])));
+  }
+
+  // [4] CodeBuddy SessionStart / SessionEnd 立刻更新服务端会话列表
+  {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const payload = { session_id: sessionId, cwd: TMP, agent: 'codebuddy' };
+    await d.dispatch({ ...payload, hook_event_name: 'SessionStart' }, ctx);
+    const opened = listReporterSessions('codebuddy').find((s) => s.sessionId === sessionId);
+    ok('[4] SessionStart 后会话立即进入 reporter 列表', Boolean(opened), JSON.stringify(opened));
+    ok('[4] SessionStart 立即记录所属工程', opened && opened.workspacePath === TMP, opened && opened.workspacePath);
+
+    await d.dispatch({ ...payload, hook_event_name: 'SessionEnd' }, ctx);
+    ok('[4] SessionEnd 后会话立即从活跃列表移除', !listReporterSessions('codebuddy').some((s) => s.sessionId === sessionId));
+
+    await d.dispatch({ ...payload, hook_event_name: 'SessionStart' }, ctx);
+    ok('[4] 同一会话重新 SessionStart 后再次出现', listReporterSessions('codebuddy').some((s) => s.sessionId === sessionId));
   }
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -571,6 +571,10 @@ function synthMarks(ctx) {
     // 亮成「任务取消」。不再依赖 j.taskId —— taskId 被清空了也能靠 hook 状态文件的 taskStartedAt 判断本轮起点。
     const sinceTs = j ? Number(j.taskStartedAt) || 0 : 0;
     if (sinceTs && atC < sinceTs) continue;
+    // 过期取消：message-queue 的 paused=true 是上一轮取消的残留，updatedAt 可能被后续写操作刷新。
+    // 如果取消后 10s 还有 hook 事件进来（PreToolUse/PostToolUse），说明任务在"取消"后还在跑 → 假取消，跳过。
+    const lastEv = j && j.hb ? Number(j.hb.lastEventAt) || 0 : 0;
+    if (lastEv && lastEv > atC + 10_000) continue;
     const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
     if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
     if (j && client && !clientHit(client, j.client)) continue;
