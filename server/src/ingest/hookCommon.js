@@ -858,11 +858,14 @@ async function runHookEvent(ev, ctx, floorImpl) {
   const memberId = String(ev.agent);
   const client = String(ev.agent || '').trim().toLowerCase();
   let sessionId = String(ev.session_id || '');
-  // sessionId 格式校验：必须是 UUID 或 32hex（老版本 CodeBuddy CLI）
-  // 非法格式（如 ghost-xxx 测试伪造）不写状态文件，避免脏会话混进列表
-  const RE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const RE_SESSION_ID_HEX = /^[0-9a-f]{32}$/i;
-  if (sessionId && !RE_SESSION_ID.test(sessionId) && !RE_SESSION_ID_HEX.test(sessionId)) {
+  // sessionId 格式校验：只认 hex 串（含 UUID 短横线）
+  // · CodeBuddy CLI: UUID（8-4-4-4-12）
+  // · CodeBuddy Plugin: 16hex（82c644195fde）
+  // · Codex / 老 CodeBuddy: 32hex
+  // 非法格式（如 ghost-xxx 测试伪造、aaa2a0f... 脏数据）置空，不写状态文件防脏会话
+  const RE_SESSION_OK = /^[0-9a-f]{8,}$/i; // 纯 hex（最少 8 位）
+  const RE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (sessionId && !RE_SESSION_OK.test(sessionId) && !RE_UUID.test(sessionId)) {
     console.error('[hookCommon] ignoring invalid session_id:', sessionId, 'from', client);
     sessionId = '';
   }
