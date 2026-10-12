@@ -60,7 +60,9 @@ const roleLabel = computed(() => {
 
     <div class="task">
       <div class="label dim">{{ t('card.current_task') }}</div>
-      <div class="task-title" :class="{ na: !hasTask }">{{ taskTitle }}</div>
+      <!-- 截断后原文读不全，所以把整句挂在原生 title 上：鼠标悬停能看全，
+           不用为此加弹层、也不占卡片一寸地方（taskTitle 为「空闲」时不必挂） -->
+      <div class="task-title" :class="{ na: !hasTask }" :title="hasTask ? taskTitle : null">{{ taskTitle }}</div>
       <!-- 进度条暂时去掉（2026-09-29）：task.progress 没有真值 —— 开工 0、收工 1，
            中间没人推进它（本机库 489 条任务全落在 {0,1}，见 TaskRecordsView「进度」那行），
            画出来只有"空条"和"满条"两种状态，等于报了个不存在的进度。
@@ -118,8 +120,27 @@ h3 {
   letter-spacing: 0.04em;
 }
 
+/*
+ * 「当前任务」这一块的高度写死两行，写不下的用省略号截掉 —— 卡片不许被标题撑高。
+ *
+ * 为什么必须写死高度：卡片是网格里的一格（WorkstationView 的 .grid），同一行里最高的那张
+ * 决定整行高度。一个长标题会把整排工位一起拉高，标题一变长一排卡片就跟着一起变，
+ * 屏幕上再也找不到齐平的边缘 —— 扫一眼认工位这件事就废了。
+ *
+ * 为什么是两行：与 DeskScene 显示器上的同一句话（.scr-title）取齐，那里也是 2 行截断。
+ * 短标题照样占满两行（不是"长就高、短就矮"），卡片高度因此与标题长度无关。
+ */
 .task-title {
   margin: 2px 0 6px;
+  /* 行高 × 行数 = 固定块高：em 跟着自身字号走，改字号不用改这里 */
+  line-height: 1.4;
+  height: calc(1.4em * 2);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  /* 没有空格的长串（英文标题 / 文件路径）也得能换行，否则会被硬裁掉而没有省略号 */
+  overflow-wrap: anywhere;
 }
 
 /* 没有当前任务时那一栏写「空闲」——不抢眼，但不留空 */
