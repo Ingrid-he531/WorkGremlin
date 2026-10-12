@@ -202,18 +202,16 @@ export const useMainAgentStore = defineStore('mainAgent', {
         phase = 'tool';
       } else if (hookPhase === 'blocked') {
         phase = 'await';
-      } else if (hookPhase === 'done' || hookPhase === 'cancelled') {
-        // 收尾相位不能直接 set：需要走 enterFinish（带 10s stopTimer），
-        // 否则 consoleBase 从 sel.taskState='done' 喂回来的 done 相位没有定时器，
-        // stopTimer 过期后又被喂回来 → 永远停在「任务完成」不回「待命中」。
-        this.enterFinish(hookPhase, s.action || (hookPhase === 'done' ? t('console.done') : t('console.cancelled')), Array.isArray(s.context) ? s.context : []);
-        return;
-      } else if (PHASES[hookPhase] && hookPhase !== 'idle' && hookPhase !== 'online' && hookPhase !== 'offline' && hookPhase !== 'unreported') {
+      } else if (PHASES[hookPhase] && hookPhase !== 'idle' && hookPhase !== 'online' && hookPhase !== 'offline' && hookPhase !== 'unreported' && hookPhase !== 'done' && hookPhase !== 'cancelled') {
         // thinking / tool / await / dispatch / waiting：照单全收
+        // done / cancelled 不走 setLiveState —— 收尾由 watch 的 enterDone/enterCancelled 路径
+        // （带 10s stopTimer）管理，consoleBase 不该持续喂回 done 否则 stopTimer 到期又弹回来
         phase = hookPhase;
-      } else if (hookPhase === 'idle' || hookPhase === 'online') {
-        // 没有新的工具调用 / 实时相位回落：这一轮任务还在进行中（刚还在调工具 / 思考）就回
-        // 「思考中」，而不是「待命中」—— Agent 正在推理、等下一口工具。离线（offline）/ 未知才真·待命。
+      } else if (hookPhase === 'idle' || hookPhase === 'online' || hookPhase === 'done' || hookPhase === 'cancelled') {
+        // done/cancelled 从 consoleBase 喂来时当 idle 处理：stopTimer 已管了 10s 展示期，
+        // 到期后该回待命，不能被 consoleBase 的 taskState='done' 持续顶回「任务完成」。
+        // idle/online：没有新的工具调用 / 实时相位回落——这一轮任务还在进行中（刚还在调工具 / 思考）
+        // 就回「思考中」而不是「待命中」（Agent 正在推理、等下一口工具）。离线 / 未知才真·待命。
         phase = ACTIVE_PHASES.includes(this.phase) ? 'thinking' : 'idle';
       } else {
         phase = 'idle'; // offline / unreported / 未知：确实没在干活
