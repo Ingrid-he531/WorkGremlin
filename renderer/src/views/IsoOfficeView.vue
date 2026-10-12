@@ -223,16 +223,7 @@ function sameWorkspace(a, b) {
  * 选中会话本身是否"正在跑"（服务端统一合成的 taskState：reporter 完成标记优先、否则看台账活着的
  * running 任务，见 server/src/sessionRegistry.js 的 taskStateOf）。门楣滚动屏与主控制台读的是**同一个**
  * 字段，所以两者不会再不一致。
- *
- * 这是主控制台"无新 hook 事件时该显示什么"的关键判据：重启应用、或长时间没有新 hook 事件，
- * 但只要这条会话的任务确实还在跑（taskState === 'running'），主控制台就该显示「思考中」而不是
- * 「待命」——人明明还在这轮任务里。一旦任务结束（reporter 落了 doneAt），taskState 变 cancelled/done，
- * 主控制台就回落任务取消 / 待命，绝不会卡在「思考中」。
  */
-const floorTaskActive = computed(() => {
-  const sel = sessions.selected;
-  return Boolean(sel && sel.taskState === 'running');
-});
 
 /**
  * 主控制台严格跟随下拉选中的会话：显示"这条会话自己"的相位
@@ -294,29 +285,12 @@ const consoleBase = computed(() => {
   }
   // 接了 hook 的工程(plugin/cli/ide):当前没有相位 = 这一路现在确实没产生新事件。
   if (isHookSource && sameWs && sameSession && fp.instrumented) {
-    if (floorTaskActive.value) {
-      return { phase: 'thinking', action: '', context: [], target: null, tool: '', prompt: '' };
-    }
     return { phase: 'idle', action: '', context: [], target: null, tool: '', prompt: '' };
   }
   // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
   // 下拉切到旧工程会话就显示旧会话自己的状态，不再被新工程的实时相位覆盖。
   const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
   const phase = sel.phase || 'idle';
-  // 会话自身是 idle / unreported（没有实时相位、推断也回落待命）：只要这一层确实还有 running 任务
-  // （门楣滚动屏同口径），就显示「思考中」——人还在这轮任务里，只是暂时没产生新事件；
-  // 没有任何活跃任务（已收工 / 空楼层）才回落「待命」。这是"重启应用后、长时间没新 hook 事件时
-  // 本层任务还在跑却一直显示待命"的修复（同一份 running 信号驱动门楣滚动屏与主控制台）。
-  if ((phase === 'idle' || phase === 'unreported') && floorTaskActive.value) {
-    return {
-      phase: 'thinking',
-      action: sel.action || '',
-      context: sel.context && sel.context.length ? sel.context : [],
-      target: sel.target || null,
-      tool: sel.tool || '',
-      prompt: sel.prompt || '',
-    };
-  }
   return {
     phase,
     action: sel.action || selPrompt,
