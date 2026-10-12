@@ -202,8 +202,14 @@ export const useMainAgentStore = defineStore('mainAgent', {
         phase = 'tool';
       } else if (hookPhase === 'blocked') {
         phase = 'await';
+      } else if (hookPhase === 'done' || hookPhase === 'cancelled') {
+        // 收尾相位不能直接 set：需要走 enterFinish（带 10s stopTimer），
+        // 否则 consoleBase 从 sel.taskState='done' 喂回来的 done 相位没有定时器，
+        // stopTimer 过期后又被喂回来 → 永远停在「任务完成」不回「待命中」。
+        this.enterFinish(hookPhase, s.action || (hookPhase === 'done' ? t('console.done') : t('console.cancelled')), Array.isArray(s.context) ? s.context : []);
+        return;
       } else if (PHASES[hookPhase] && hookPhase !== 'idle' && hookPhase !== 'online' && hookPhase !== 'offline' && hookPhase !== 'unreported') {
-        // thinking / tool / await / dispatch / waiting / done / cancelled：照单全收
+        // thinking / tool / await / dispatch / waiting：照单全收
         phase = hookPhase;
       } else if (hookPhase === 'idle' || hookPhase === 'online') {
         // 没有新的工具调用 / 实时相位回落：这一轮任务还在进行中（刚还在调工具 / 思考）就回

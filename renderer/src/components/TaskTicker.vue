@@ -22,13 +22,38 @@
  *
  * 无障碍：滚动的段码对读屏是噪音 → 屏幕本体 aria-hidden，另给一句 sr-only 的静态文本。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useSessionStore } from '../stores/sessions';
 import { colorsFor } from '../iso/officeMap';
 import { useI18n } from '../i18n';
+import { agentBase } from '@workgremlin/shared';
+import { httpBase, getServerInfo } from '../api/bridge';
 
 const { t } = useI18n();
 const sessions = useSessionStore();
+
+/**
+ * 滚动屏的**唯一真相源**：服务端 /api/v1/task-feed（见 server/src/http/routes/query.js）。
+ * 它直接按 taskId 列 tasks 表，返回每条任务的 { id, title, started_at, ended_at, client, state }，
+ * state 用 taskAliveSql 归一（僵尸 running 会被判成 cancelled）—— 与楼层 / 会话**完全无关**，
+ * 所以不再做楼层去重 / 会话聚合，每条活跃任务独立显示。client 反查楼层号（见 floorLabelForClient）。
+ */
+const feed = ref([]);
+let feedTimer = null;
+async function loadFeed() {
+  try {
+    const info = await getServerInfo();
+    const headers = info && info.token ? { Authorization: `Bearer ${info.token}` } : undefined;
+    const res = await fetch(`${httpBase(info)}/api/v1/task-feed?minutes=5`, { headers });
+    const data = await res.json();
+    if (data && data.ok && Array.isArray(data.items)) {
+      feed.value = data.items;
+      detectEnded();
+    }
+  } catch {
+    /* 拉不到就留着上一份，别把屏闪空 */
+  }
+}
 
 /**
  * 收工后还"看不看得见"的窗口（分钟）：服务端按这个窗口回"刚收工"的那几条，
@@ -67,16 +92,17 @@ const sessionStart = Date.now();
  * 只在末尾追加状态字（绿=完成「（完成）」/ 红=取消·失败「（已取消）」），不再单独出一行"任务完成/取消"。
  * 整条只滚一遍即退场（见 pendingEnded → makeSeg 进段即清）。failed 归到取消的红色。
  */
-function endedText(s) {
-  const floor = floorName(s.floor);
-  const base = promptOf(s.doneTitle || s.prompt || '') || t('ticker.untitled');
-  const suffixKind = s.taskState === 'done' ? 'done' : 'cancelled';
+function endedText(it) {
+  const floor = floorLabelForClient(it.client);
+  const base = promptOf(it.title || '') || t('ticker.untitled');
+  // done 绿标完成；cancelled / failed 一律红标"已取消"
+  const suffixKind = it.state === 'done' ? 'done' : 'cancelled';
   const suffix = suffixKind === 'done' ? t('ticker.doneSuffix') : t('ticker.cancelledSuffix');
   const taskLabel = t('ticker.taskLabel');
   const taskText = clip(base);
-  const time = hhmm(s.doneAt);
+  const time = hhmm(it.ended_at);
   return {
-    id: `${s.id}:${s.taskState}`,
+    id: `${it.id}:${it.state}`,
     kind: 'running',
     time,
     floor,
@@ -102,18 +128,19 @@ function padN(it) {
  *  与门楣 / 主控制台同一个真相源，不再各算各的。 */
 function detectEnded() {
   let added = false;
-  for (const s of sessions.sessions) {
-    if (s.floor && (s.taskState === 'done' || s.taskState === 'cancelled') && Number(s.doneAt) >= sessionStart) {
-      if (announcedIds.has(s.id)) continue;
-      announcedIds.add(s.id);
-      pendingEnded.value = pendingEnded.value.concat(endedText(s));
+  for (const it of feed.value) {
+    // 只播报"本次会话启动之后"才结束的任务，避免一启动就滚一堆"任务完成"
+    if ((it.state === 'done' || it.state === 'cancelled' || it.state === 'failed') && Number(it.ended_at) >= sessionStart) {
+      if (announcedIds.has(it.id)) continue;
+      announcedIds.add(it.id);
+      pendingEnded.value = pendingEnded.value.concat(endedText(it));
       added = true;
       if (typeof console !== 'undefined' && console.debug) {
         console.debug('[TaskTicker] 检测到结束任务:', {
-          id: s.id,
-          taskState: s.taskState,
-          title: String(s.doneTitle || s.prompt || '').slice(0, 40),
-          doneAt: s.doneAt ? new Date(s.doneAt).toISOString() : null,
+          id: it.id,
+          state: it.state,
+          title: String(it.title || '').slice(0, 40),
+          endedAt: it.ended_at ? new Date(it.ended_at).toISOString() : null,
         });
       }
     }
@@ -122,8 +149,7 @@ function detectEnded() {
   if (added && segs.value.length === 0) pushSeg();
 }
 
-/** 会话快照刷新（新开 / 收工 / 被顶掉 / 取消）就重新挑一遍结束行 */
-watch(() => sessions.sessions, () => detectEnded());
+/** 结束行由 loadFeed（轮询 /api/v1/task-feed）触发 detectEnded 挑出，不再依赖会话快照 */
 
 
 /** HH:mm（屏上是段码手感，只要时与分；日期交给任务记录页） */
@@ -158,40 +184,35 @@ function promptOf(title) {
 const clip = (s) => s;
 
 /**
- * client → 楼层号（1F / 3F …）。
- * 楼层归属以 sessions.floors 为准（与胶囊、轿厢同一份来源）；合并楼层（1F = CLI + Plugin）
- * 楼层直接取服务端快照里的 floor id，名字再在 floors 里查（都是服务端给的，前端不重算）。
+ * client（agent 基名，如 codebuddy / traecode）→ 楼层号（1F / 3F …）。
+ * 与胶囊、轿厢同一份 floors 来源：拿 client 的 agent 基名去 floors[].clients 里反查，
+ * 命中哪层就显示那层的 id（1F）。查不到（floors 还没加载 / 老库没 client）兜底用基名本身。
  */
-function floorName(id) {
-  const f = (sessions.floors || []).find((x) => x.id === id);
-  // 屏上用楼层号（1F / 3F …）更直观；拿不到名字的兜底情况才退 name。
-  // （product 的显示名是 "CodeBuddy" 这类，滚动屏历史上一直用楼层号，保持原样。）
-  if (!f) return id || '—';
-  return /^\d+F$/i.test(id || '') ? id : f.name || id;
+function floorLabelForClient(client) {
+  const base = agentBase(client);
+  const f = (sessions.floors || []).find(
+    (x) => Array.isArray(x.clients) && x.clients.some((c) => agentBase(c) === base)
+  );
+  return f ? f.id || f.name || base : base || client || '—';
 }
 
-/** 进行中的任务（taskState === 'running'）：无限滚动循环的常驻内容。
- *  与主控制台读的是**同一个**服务端合成字段（sessions.sessions[].taskState），所以两者一致。 */
+/**
+ * 进行中的任务（feed 里 state === 'running'）：无限滚动循环的常驻内容。
+ * 直接来自 /api/v1/task-feed，每条任务独立一行，**不再按楼层去重**——
+ * 同一楼层同时跑多条（比如僵尸旧任务 + 新任务）会各自显示，互不串味。
+ */
 const runningItems = computed(() => {
-  // 楼层级判定会让同层多条活跃会话都带 taskState==='running'，按楼层去重，只留最近活跃的那条
-  // （即真正在跑的那条），避免滚动屏把历史会话也当在跑重复播。
-  const byFloor = new Map();
-  for (const s of sessions.sessions) {
-    if (s.taskState !== 'running') continue;
-    const prev = byFloor.get(s.floor);
-    if (!prev || Number(s.lastEventAt) > Number(prev.lastEventAt)) byFloor.set(s.floor, s);
-  }
-  return [...byFloor.values()]
-    .map((s) => {
-      const floor = floorName(s.floor);
-      const text = promptOf(s.taskTitle || s.prompt || s.action || '') || t('ticker.untitled');
+  return feed.value
+    .filter((it) => it.state === 'running')
+    .map((it) => {
+      const floor = floorLabelForClient(it.client);
+      const text = promptOf(it.title || '') || t('ticker.untitled');
       const taskLabel = t('ticker.taskLabel');
       const taskText = clip(text);
-      // 时间用任务真正开始的时间（taskStartedAt = 台账 tasks.started_at），而不是"当前时间"；
-      // 取不到时兜底用 lastEventAt（会话最近活动）避免空屏。
-      const time = hhmm(s.taskStartedAt || s.lastEventAt);
+      // 时间用任务真正开始的时间（tasks.started_at），不再用"当前时间"
+      const time = hhmm(it.started_at);
       return {
-        id: s.id,
+        id: it.id,
         kind: 'running',
         time,
         floor,
@@ -199,7 +220,7 @@ const runningItems = computed(() => {
         taskText,
         floorColor: colorsFor(floor).wood,
         text: `${time} ${floor} ${taskLabel}${taskText}`,
-        startedAt: Number(s.lastEventAt) || 0,
+        startedAt: Number(it.started_at) || 0,
       };
     })
     .sort((a, b) => a.startedAt - b.startedAt);
@@ -337,8 +358,9 @@ function tick(ts) {
 }
 
 onMounted(async () => {
-  // 任务流（unified taskState）随会话快照一起由 sessions store 拉取，这里只负责读它
-  detectEnded();
+  // 滚动屏数据由自己的轮询拉取（见 loadFeed），与会话快照解耦
+  loadFeed();
+  feedTimer = setInterval(loadFeed, 3000);
   await nextTick();
   measureSegs();
   if (typeof ResizeObserver !== 'undefined' && viewEl.value) {
@@ -364,6 +386,8 @@ onBeforeUnmount(() => {
   ro = null;
   if (raf) cancelAnimationFrame(raf);
   raf = null;
+  if (feedTimer) clearInterval(feedTimer);
+  feedTimer = null;
 });
 </script>
 
