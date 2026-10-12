@@ -554,7 +554,14 @@ module.exports = {
  * @param {object} ctx
  *   { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, bySession }
  */
-function synthMarks(ctx) {
+function synthMarks(_ctx) {
+  // CodeBuddy 的 message-queue 里 runtime.pauseReason='cancel' 不可靠：
+  // CodeBuddy 内部超时（agent 长时间无响应）也会写 pauseReason=cancel，
+  // 但任务实际还在跑（用户没取消）。这导致假取消被合成 → 任务被误标 cancelled。
+  // 停止检测改回只认 hook 事件的 Stop/Interrupt 信号（CodeBuddy Plugin 不发 Stop，
+  // 所以任务会保持 running 直到超时或被新一轮顶掉——这比假取消更正确）。
+  return;
+  /* 以下旧逻辑保留备查，但不再执行：
   const { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, bySession } = ctx;
   const cbCancels = allCodebuddyCancels();
   const cbSids = Object.keys(cbCancels || {});
@@ -562,13 +569,10 @@ function synthMarks(ctx) {
   for (const sid of cbSids) {
     const atC = Number(cbCancels[sid]) || 0;
     if (!atC) continue;
-    // 已有同一取消（±5s 容差）→ 跳过，避免重复合成 / 重复补发 task/end(cancelled)
     const existing = bySession.get(sid);
     if (existing && existing.cancelled && Math.abs(Number(existing.at) - atC) < 5_000) continue;
     const hook = hookBySid.get(sid);
     const j = hook ? hook.j : null;
-    // 只认"本轮开始之后"的取消：老取消（上一轮）不能算到新一轮头上，否则主控制台会把当前这轮
-    // 亮成「任务取消」。不再依赖 j.taskId —— taskId 被清空了也能靠 hook 状态文件的 taskStartedAt 判断本轮起点。
     const sinceTs = j ? Number(j.taskStartedAt) || 0 : 0;
     if (sinceTs && atC < sinceTs) continue;
     const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
@@ -576,13 +580,11 @@ function synthMarks(ctx) {
     if (j && client && !clientHit(client, j.client)) continue;
     synthCancel({
       id: sid,
-      // taskId 与 Trae 同理：hook 状态文件里的 taskId 可能是新一轮的（甚至被清空），取消属于被顶掉的上一轮；
-      // sessionRegistry.flushSynthesizedCancels 会用 sessionId + cancelAt 去 task_runs 找
-      // started_at <= cancelAt、还挂 running 的那条来补 task/end(cancelled)。
       j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'codebuddy' },
       ws: hookWs || workspacePath || '',
       at: atC,
       files: j ? roundFilesOf(j) : [],
     });
   }
+  */
 }

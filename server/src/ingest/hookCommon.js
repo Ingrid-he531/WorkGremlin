@@ -1016,6 +1016,14 @@ async function runHookEvent(ev, ctx, floorImpl) {
 
   if (event === 'SessionStart') {
     const st = get();
+    set({
+      sessionEndedAt: null,
+      sessionWorkspacePath: workspacePath,
+      taskWorkspacePath: '',
+      taskId: null,
+      taskStartedAt: 0,
+      sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath },
+    });
     if (impl.coarse) {
       const qForm = formOf();
       const started = await bus.startTask({ ...base, title: impl.coarseTitle, model: '', form: qForm });
