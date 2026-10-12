@@ -37,7 +37,6 @@ const { listSessions, listReporterSessions, readReporterDones, readReporterDone,
 const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
 const { formToSource } = require('@workgremlin/shared');
-const { taskAliveSql } = require('./db/taskAlive');
 
 // 进程启动时刻：doneAt 等"结束态"只在"本进程启动之后"发生的才认，重启后旧的结束态不再复活。
 const SINCE_BOOT = Date.now();
@@ -816,6 +815,40 @@ function agentBase(id) {
     .toLowerCase();
 }
 
+/**
+ * 会话的「统一任务状态」—— 门楣滚动屏与主控制台判定"本层有没有任务在跑"的**唯一真相源**。
+ *   - 'running'：本工程里这一层（按 agent 基名归层）还有"活着"的在飞任务——主控制台据此显示「思考中」。
+ *     **优先于**上一轮残留的 doneAt：新开一轮时旧 doneAt 还在，若按 doneAt 先判会先闪一下"任务取消/完成"，
+ *     所以活着任务优先。归层用 agent 基名（剥 -plugin / @工程 后缀），与前端 floorAcceptsClient 同口径——
+ *     插件会话 client 是 codebuddy-plugin、ledger 里 task_runs.client 是裸 codebuddy，基名相同即算同层，
+ *     不再因字符串不同漏配（之前按精确 client 比对，整条漏掉插件在跑任务）。
+ *   - 'cancelled' / 'done'：reporter 在 Stop / 打断时落的完成标记（doneAt）是"已结束"最可靠信号
+ *     （CodeBuddy 插件按停止连 hook 都不发，task_runs 未必被翻成 cancelled，见 flushSynthesizedCancels
+ *     的注释），所以没在跑时才以 reporter 为准；
+ *   - null：这条会话既没在跑的任务、也没结束标记（纯空闲 / 化石数据）。
+ * 两条屏幕都读这个字段，就不会再一个显示任务取消、另一个还亮着思考中。
+ * @param {object} session 来自 table 的会话行（含 floor / client / projectPath / doneAt / doneCancelled）
+ * @param {object} repo db 句柄
+ * @param {(projectId:number)=>string[]} runningClientsFor 取某工程（0=不限）所有在飞任务的 client 列表
+ */
+function taskStateOf(session, repo, runningClientsFor) {
+  // 1) 先看本层（按**楼层**，不再依赖 session.client——注册表里的 session.client 常为空，
+  //    拿它去跟台账 client 比必然落空）有没有"活着"的在飞任务——**跨工程全量比对**：
+  //    门楣滚动屏是全楼层监控，不做工程隔离。优先于残留 doneAt，避免新开一轮先闪"任务取消/完成"。
+  //    把账台上所有在飞任务的 client 按 agent 基名归到楼层（floorByAgent），命中 session.floor 即算在跑。
+  if (repo && runningClientsFor) {
+    const runningFloors = new Set();
+    for (const c of runningClientsFor(0)) {
+      const f = floorByAgent[agentBase(c)];
+      if (f && f.id) runningFloors.add(f.id);
+    }
+    if (runningFloors.has(session.floor)) return 'running';
+  }
+  // 2) 没有在跑 → reporter 完成标记（doneAt）才是"已结束"最可靠信号
+  if (session.doneAt) return session.doneCancelled ? 'cancelled' : 'done';
+  return null;
+}
+
 function snapshot({ workspacePath = '', force = false } = {}) {
   refresh({ workspacePath, force });
   const now = Date.now();
@@ -826,26 +859,22 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   // 同时顺手取出 tasks.started_at（任务真正开始的时间），滚动屏时间用它，而不是"当前时间"。
   const runningTitleByFloor = new Map();
   const runningStartedByFloor = new Map();
-  // 在跑判定：与 /api/v1/task-feed **同一份** taskAliveSql（server/src/db/taskAlive.js）——
-  // feed 判活的，这里必然判活，主控屏与滚动屏口径完全一致，不会一边跑一边显示"任务取消"。
-  // 不再用 activeRunningByProject 的 started_at 窗口（那是"挂 3h / 重启复活"的根源）。
+  // 检测用"活着"的楼层：账本里 state='running' 且**心跳/agent_status 活着**（非粘性判定）。
+  // 关键：这里把 @fresh 设到未来，彻底关掉查询里的 started_at 兜底窗口——
+  // 那个窗口是"挂 3h / 重启复活"的根源（停掉的插件任务在账本里一直挂 running，started_at 又很新就又被认领）。
+  // 关掉后只剩心跳活着判定，停掉的任务（无心跳）立刻出局，重启也不会复活。
+  // 插件任务不写心跳 → 由下面的"实时相位新鲜"信号兜底认领，两者取并集，互不漏判。
   const ledgerAliveFloors = new Set();
-  if (repo && repo.raw) {
+  if (repo && repo.activeRunningByProject) {
     const cutoff = now - 10 * 60 * 1000;
     const grace = now - 30 * 60 * 1000;
     let titleRows = [];
-    let aliveRows = [];
+    let detectRows = [];
     try {
       // 标题 / 开始时间：所有在跑任务都取（宽窗口，只当文案与时间戳，不参与"在跑"判定）
       titleRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now - 3 * 60 * 60 * 1000, cutoff, grace }) || [];
-      // 在跑检测：用 taskAliveSql（心跳/agent_status 活着，非粘性），与 feed 同口径
-      aliveRows = repo.raw.prepare(`
-        SELECT DISTINCT COALESCE(tr.client, m.client) AS client
-        FROM tasks t
-        LEFT JOIN task_runs tr ON tr.id = t.id
-        LEFT JOIN members m ON m.id = t.member_id
-        WHERE t.parent_task_id IS NULL AND t.state = 'running' AND ( ${taskAliveSql()} )
-      `).all({ cutoff, grace_cutoff: grace }) || [];
+      // 检测：@fresh 设到未来 → started_at 子句恒假，只剩"心跳/agent_status 活着"这一非粘性判定
+      detectRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now + 1e15, cutoff, grace }) || [];
     } catch (e) {
       /* 账本查询异常不影响会话表构建 */
     }
@@ -856,28 +885,18 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         if (r.startedAt && !runningStartedByFloor.has(f.id)) runningStartedByFloor.set(f.id, Number(r.startedAt));
       }
     }
-    for (const r of aliveRows) {
+    for (const r of detectRows) {
       const f = floorByAgent[agentBase(r.client)];
       if (f && f.id) ledgerAliveFloors.add(f.id);
     }
   } else {
-    /* repo/raw 缺失时跳过账本信号（老行为） */
+    /* repo/activeRunningByProject 缺失时跳过账本信号（老行为） */
   }
-  // 在跑判定 = 账本 ALIVE（taskAliveSql：state='running' 且有近期心跳/活跃状态）∪ 实时相位新鲜。
-  // 二者取并集，缺一不可：
-  //  - 账本 ALIVE 对 CLI / Codex 这类**写心跳/agent_status** 的任务可靠，且是"任务表"同一把尺子；
-  //  - 但 CodeBuddy 插件任务**全程不写心跳**（handlePlugin 注释已确认 task_runs 一直挂 running），
-  //    纯心跳 ALIVE 会整条漏掉 → 明明在跑却被判死、回退到陈旧 doneAt 显示"任务取消"。
-  //    这类任务靠 hook 事件刷新会话 lastEventAt，所以"本次启动之后还有新鲜事件"即视为在跑。
-  //    用 `lea > SINCE_BOOT` 兜底：进程重启后旧的 hook 时间戳不会让已死的会话复活（与 doneAt 的
-  //    SINCE_BOOT 同理），只在重启后真正收到新事件的那层才点亮。
+  // "在跑"只认账本 ALIVE（与任务表同一把尺子 taskAliveSql：state='running' 且有近期心跳/活跃状态）。
+  // 之前曾把"会话实时相位新鲜"也当在跑信号，但实测插件会在重连/重启时把上一条任务的相位重播成
+  // thinking 并刷新时间戳，导致已取消的旧任务被误判在跑、与任务表（按 ALIVE 判）打架。去掉它后，
+  // 两边口径一致——任务表显示"已取消"的，滚动屏/主控制台绝不会再显示"进行中"。
   const runningFloors = new Set(ledgerAliveFloors);
-  const PHASE_FRESH_MS = 60 * 1000;
-  for (const s of table.values()) {
-    if (!s.active) continue;
-    const lea = Number(s.lastEventAt) || 0;
-    if (lea > SINCE_BOOT && now - lea < PHASE_FRESH_MS) runningFloors.add(s.floor);
-  }
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)
