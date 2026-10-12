@@ -703,7 +703,9 @@ function flushTraeDone(now, backend) {
       let j;
       try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
       if (!j || !j.sessionId) continue;
-      const ws = j.taskWorkspacePath || j.sessionWorkspacePath || '';
+      // Trae hook 在任务完成后会把 taskWorkspacePath 清空、把路径写入 done.workspacePath ——
+      // 与 Claude/CodeBuddy 一致，优先读 done.workspacePath 兜底（见 sessions.js:658、floorCodebuddy.js:242）
+      const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || j.sessionWorkspacePath || '';
       if (!ws) continue;
       const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
       if (proj) sidProject.set(j.sessionId, { projectId: proj.id, workspacePath: ws });
@@ -762,7 +764,8 @@ function flushTraeYuan(now, backend) {
       let j;
       try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
       if (!j || !j.sessionId) continue;
-      const ws = j.taskWorkspacePath || j.sessionWorkspacePath || '';
+      // 同上：Trae hook 完成后 taskWorkspacePath 被清空，路径在 done.workspacePath 里
+      const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || j.sessionWorkspacePath || '';
       if (!ws) continue;
       const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
       if (proj) sidProject.set(j.sessionId, { projectId: proj.id, workspacePath: ws });
