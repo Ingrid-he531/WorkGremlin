@@ -34,6 +34,15 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
+
+// 调试日志（取消检测排查用，可整体删除）：写到 ~/.workgremlin/cb-cancel-debug.log
+const _dbgLogPath = path.join(require('node:os').homedir(), '.workgremlin', 'cb-cancel-debug.log');
+function dbgLog(...a) {
+  try {
+    const line = `[CB-CANCEL ${new Date().toISOString()}] ` + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
+    fs.appendFileSync(_dbgLogPath, line + '\n');
+  } catch {}
+}
 const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
 const { formToSource } = require('@workgremlin/shared');
@@ -573,7 +582,13 @@ function handlePlugin(p, src, ctx) {
    * 这里把这一份 doneScan 建出来（与 doneFieldsOf 同一把缓存键），让 flush 能补刀 task/end(cancelled)。
    */
   const scanKey = `${workspacePath || ''}|${src.client || ''}`;
-  if (!doneScans.has(scanKey)) doneScans.set(scanKey, readReporterDones(workspacePath, src.client));
+  if (!doneScans.has(scanKey)) {
+    dbgLog('[handlePlugin] readReporterDones for client=', src.client, 'workspacePath=', workspacePath);
+    const scan = readReporterDones(workspacePath, src.client);
+    dbgLog('[handlePlugin]   -> cancels=', (scan.cancels || []).map((c) => ({ sid: c.sessionId, taskId: c.taskId || '(empty)', at: c.at })),
+      'bySession=', [...(scan.bySession || new Map()).keys()]);
+    doneScans.set(scanKey, scan);
+  }
   const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
   const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
   const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
@@ -711,35 +726,42 @@ const DEFAULT_KIND_HANDLERS = {
 const postedCancels = new Map(); // key -> 过期时间戳（避免进程存活期间反复补发）
 function flushSynthesizedCancels(doneScans, now) {
   const { bus, repo } = backend || {};
+  dbgLog('[flushSynthesizedCancels] called; doneScans=', doneScans.size, 'backend.bus=', !!(bus && typeof bus.endTask === 'function'), 'backend.repo=', !!repo);
   if (!bus || typeof bus.endTask !== 'function') return;
   for (const scan of doneScans.values()) {
     for (const c of scan.cancels || []) {
       // taskId 可能为空（Trae：取消信号来自 renderer.log，hook 状态文件的 taskId 永远是新一轮的）。
       // 用 cancelAt 参与去重 key，避免同一取消反复补发。
+      dbgLog('[flush] cancel: sessionId=', c.sessionId, 'taskId=', c.taskId || '(empty)', 'at=', new Date(Number(c.at)).toISOString(), 'ws=', c.workspacePath, 'client=', c.client);
       const key = `${c.sessionId}|${c.taskId || ''}|${c.workspacePath}|${c.at}`;
-      if (postedCancels.get(key) > now) continue;
+      if (postedCancels.get(key) > now) { dbgLog('  -> dedup skip (already posted)'); continue; }
       let task = null;
       if (c.taskId) {
         // Claude / Qoder / CodeBuddy 插件：taskId 直接可取（hook 状态文件里存的是被取消那一轮的）
         task = repo && repo.getTask ? repo.getTask.get(c.taskId) : null;
+        dbgLog('  getTask by taskId ->', task ? ('FOUND ' + task.id + ' state=' + task.state) : 'NULL');
       }
       if (!task && repo && repo.listStaleRunningBySession && c.sessionId) {
         // Trae：taskId 为空，从 task_runs 里找这条会话里"cancelAt 之前开始、
         // 至今还挂 running"的那条（它就是被取消的上一轮；新一轮 startedAt > cancelAt，
         // 不会被误取）。按 started_at DESC 取最新一条。
         const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(c.workspacePath || '')) : null;
-        if (proj) {
+        if (!proj) { dbgLog('  getProjectByWorkspace -> NULL (workspace not registered?)'); }
+        else {
           const all = repo.listStaleRunningBySession.all(proj.id, c.sessionId);
+          dbgLog('  project=', proj.id, 'staleRunning=', all ? all.length : 0, all && all.map((r) => ({ id: r.id, startedAt: r.startedAt })));
           const atC = Number(c.at) || 0;
           // 最新开始的那条 <= cancelAt —— 那就是被取消的
           const match = all
             .filter((r) => Number(r.startedAt) && (!atC || Number(r.startedAt) <= atC))
             .sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
+          dbgLog('  fallback match ->', match ? ('FOUND ' + match.id) : 'NULL (no stale running <= cancelAt)');
           if (match) task = repo.getTask ? repo.getTask.get(match.id) : null;
         }
       }
-      if (!task) continue;
+      if (!task) { dbgLog('  -> NO TASK matched, skip'); continue; }
       postedCancels.set(key, now + 10 * 60_000);
+      dbgLog('  -> bus.endTask(cancelled) taskId=', task.id);
       try {
         bus.endTask({
           project: task.project_id,
@@ -754,7 +776,8 @@ function flushSynthesizedCancels(doneScans, now) {
           sessionId: c.sessionId,
           ts: c.at,
         });
-      } catch {
+      } catch (e) {
+        dbgLog('  -> bus.endTask threw:', e && e.message);
         /* 补发失败不影响会话表 */
       }
     }

@@ -125,7 +125,7 @@ async function main() {
   /**
    * 本事件ev.client来自哪个客户端（vscode / null / cli …）。
    */
-  trace(ev.hook_event_name, { agent: ev.agent || agent, client:ev.client, tool: ev.tool_name, notification_type: ev.notification_type });
+  trace(ev.hook_event_name, { agent: ev.agent || agent, client:ev.client, session: ev.session_id, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // 纯转发：落盘解析 / 会话状态 / 台账 / token / 子代理幽灵 全在服务端做（server/src/ingest/hookCommon.js）。

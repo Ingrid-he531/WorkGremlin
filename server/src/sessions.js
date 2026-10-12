@@ -597,8 +597,9 @@ function readReporterDones(workspacePath, client = '') {
    * 合成一枚取消标记：既有按会话给控制台的那份（bySession，红灯靠它），
    * 也有列进 cancels 让台账补一刀的那份。两个信号共用，别再各写一遍。
    */
-  const synthCancel = ({ id, j, ws, at, files = [], said = '', result = '' }) => {
+  const synthCancel = ({ id, j, ws, at, files = [], said = '', result = '', consoleMark = true, taskId }) => {
     if (!at) return;
+    const tid = taskId !== undefined ? taskId : (j ? j.taskId : '');
     const mark = {
       at,
       title: j.taskTitle || '',
@@ -609,11 +610,13 @@ function readReporterDones(workspacePath, client = '') {
       fileCount: files.length,
       said,
     };
-    if (id && (!bySession.get(id) || Number(mark.at) > Number(bySession.get(id).at))) bySession.set(id, mark);
-    if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
+    if (consoleMark) {
+      if (id && (!bySession.get(id) || Number(mark.at) > Number(bySession.get(id).at))) bySession.set(id, mark);
+      if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
+    }
     cancels.push({
       sessionId: id,
-      taskId: j.taskId,
+      taskId: tid,
       client: j.client,
       workspacePath: ws,
       at,

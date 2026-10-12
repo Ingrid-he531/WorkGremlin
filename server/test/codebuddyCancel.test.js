@@ -9,14 +9,20 @@
  * 控制台先弹「任务取消」+「待命中」，下一条事件回来又跳回「思考中」（模型有一次纯推理 >2 分钟、
  * 中间一个工具事件都没有）。宁可这种轮暂时停在旧相位（相位新鲜期到了会回落待命），也不误报取消。
  *
- * 真正"用户按了停止"的信号只认 Claude / Qoder 那两个（transcript 尾部的打断标记、
- * Claude 自己那份会话状态文件说 idle），见 server/src/sessions.js 的 claude.interruptOf
- * 与 server/test/claudeCancel.test.js。
+ * 真正"用户按了停止"的信号：Claude / Qoder 认 transcript 尾部的打断标记 + 会话状态文件说 idle；
+ * CodeBuddy 插件（IDE 扩展）认它自己 transcript 目录 messages/ 里那条 role=assistant、
+ * text==='[User Cancelled]' 的消息（实测：每次用户按停止精确产生一条，内部超时不会产生——这正是对比
+ * message-queue 的 pauseReason='cancel' 不可靠的原因，见 [5]）。见 server/src/sessions.js 的
+ * claude.interruptOf 与 server/test/claudeCancel.test.js，CodeBuddy 这一路见 floorCodebuddy.js 的
+ * codebuddyCancelAt。
  *
- * 本文件钉住的是"去掉"这件事：
+ * 本文件钉住的是"去掉 message-queue 误判 + 改用 transcript 真信号"这件事：
  *   [1] 长思考（taskId 占着、空闲 5 分钟、末轮 state='running'）→ **不再**合成取消；
  *   [2] 末轮 state='complete'（正常收尾）→ 当然也不合成；
- *   [3] 没有 taskId（已经收过尾）→ 不合成。
+ *   [3] 没有 taskId（已经收过尾）→ 不合成；
+ *   [4] CodeBuddy 插件 transcript 写 [User Cancelled] → 合成取消（插件形态真信号）；
+ *   [5] 只有 message-queue 的 pauseReason=cancel（内部超时）→ **不**合成取消；
+ *   [6] 取消时刻早于本轮开始（上一轮取消）→ 不算到新一轮头上。
  *
  * 跑法：`npm run test:codebuddy-cancel`（零依赖）
  */
@@ -62,7 +68,7 @@ function head(t) {
  * @param {{ name: string, taskId?: string, startedAt?: number, running?: boolean, client?: string,
  *           phase?: string, phaseTs?: number, done?: object }} o
  */
-function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phase, phaseTs, done }) {
+function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phase, phaseTs, done, transcriptPath }) {
   const tp = path.join(HOME, `transcript-${name}.json`);
   fs.writeFileSync(tp, JSON.stringify({ requests: [{ state: running ? 'running' : 'complete' }] }));
   fs.writeFileSync(
@@ -74,7 +80,7 @@ function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phas
       taskStartedAt: startedAt || 0,
       taskTitle: '改个东西',
       taskWorkspacePath: WS,
-      transcriptPath: tp,
+      transcriptPath: transcriptPath || tp,
       // 相位：不传就不写（老夹具行为）；传了才写，供 [4] 验"取消后 stale 相位作废"
       ...(phase ? { sessionPhase: { phase, ts: phaseTs, workspacePath: WS } } : {}),
       // 完成/取消标记：Stop 落盘（cancelled=true 即被用户掐断）；不传就不写
@@ -86,9 +92,30 @@ function scenario({ name, taskId, startedAt, running, client = 'codebuddy', phas
 const OLD = Date.now() - 5 * 60_000; // 5 分钟前（远超 TASK_RUN_MS = 2 分钟）
 
 /**
- * 写一个 CodeBuddy **插件（IDE 扩展）**的 message-queue 落盘（`<globalStorage>/<插件目录>/message-queue/*.json`）。
- * 插件按"停止"时会把 `runtime.pauseReason='cancel'` 写在这里 —— 那是插件形态唯一的取消真信号
- * （扩展日志里只有 AgentState.cancelled，没有任何 HookExecutor；CLI 那条 FinalStop 等不到）。
+ * 写一个 CodeBuddy **插件（IDE 扩展）**的 transcript 落盘（`<dir>/index.json` + `messages/<id>.json`）。
+ * 用户按"停止"时插件在 messages 里写一条 role=assistant、text='[User Cancelled]' 的消息 ——
+ * 那是插件形态唯一的取消真信号（message-queue 的 pauseReason='cancel' 内部超时也会写，不可靠；
+ * CLI 那条 FinalStop 在 IDE 形态等不到）。取消时刻用这条消息文件的 mtime。
+ */
+function writeCancelTranscript(sid, at) {
+  const dir = path.join(HOME, `tr-${sid}`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'index.json'), JSON.stringify({ requests: [{ state: 'running' }] }));
+  const mdir = path.join(dir, 'messages');
+  fs.mkdirSync(mdir, { recursive: true });
+  const fp = path.join(mdir, 'cancel.json');
+  fs.writeFileSync(fp, JSON.stringify({
+    role: 'assistant',
+    message: JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: '[User Cancelled]' }] }),
+  }));
+  fs.utimesSync(fp, new Date(at), new Date(at));
+  return path.join(dir, 'index.json');
+}
+
+/**
+ * 写一个 CodeBuddy 插件 message-queue 落盘（`<globalStorage>/<插件目录>/message-queue/*.json`），
+ * 把 `runtime.pauseReason='cancel'` 写进去 —— 这是**不可靠**的历史信号（插件内部超时也会写），
+ * 新逻辑已不再读取它（见 [5]）。
  */
 function writePauseRuntime(sid, { pauseReason, updatedAt }) {
   const dir = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'tencent-cloud.coding-copilot', 'message-queue');
@@ -131,11 +158,11 @@ scenario({ name: 'c', taskId: '', startedAt: OLD, running: true });
   ok('cancels 不含没在跑任务的会话', !cancels.some((c) => c.sessionId === 'c'), JSON.stringify(cancels));
 }
 
-head('[4] CodeBuddy 插件按停止：message-queue 写 pauseReason=cancel → 合成取消（插件形态的真信号）');
+head('[4] CodeBuddy 插件按停止：transcript 写 [User Cancelled] → 合成取消（插件形态的真信号）');
 {
   const sid = 'cb-pause-1';
   const at = Date.now() - 20_000;
-  writePauseRuntime(sid, { pauseReason: 'cancel', updatedAt: at });
+  const tp = writeCancelTranscript(sid, at);
   scenario({
     name: sid,
     taskId: 't_pause',
@@ -145,42 +172,45 @@ head('[4] CodeBuddy 插件按停止：message-queue 写 pauseReason=cancel → �
     // 取消前冻着的那口相位（比取消时刻旧）
     phase: 'thinking',
     phaseTs: Date.now() - 35_000,
+    transcriptPath: tp,
   });
   const { cancels, bySession } = readReporterDones(WS, 'codebuddy,codebuddy-plugin');
   const hit = cancels.find((c) => c.sessionId === sid) || null;
   ok('cancels 含它（补发 task/end 用）', Boolean(hit), JSON.stringify(cancels));
-  ok('取消时刻用 runtime.updatedAt（不拿"现在"冒充）', Boolean(hit) && hit.at === at, hit && String(hit.at));
+  ok('取消时刻用消息文件 mtime（不拿"现在"冒充）', Boolean(hit) && Math.abs(Number(hit.at) - at) <= 1000, hit && String(hit.at));
   const mark = bySession.get(sid) || null;
   ok('控制台那枚取消标记也在（红灯能亮）', Boolean(mark) && mark.cancelled === true, JSON.stringify(mark));
-  // 纯插件客户端（handlePlugin 给 doneFieldsOf 喂的就是 src.client='codebuddy-plugin'）也要
-  // 合成取消：否则 doneScans 里永远没有这一份，flushSynthesizedCancels 扫不到，task_runs 一直挂
-  // running（见 sessionRegistry.handlePlugin 的修复）。
+  // 纯插件客户端也要合成取消：否则 flushSynthesizedCancels 扫不到，task_runs 一直挂 running。
   const plug = readReporterDones(WS, 'codebuddy-plugin');
   ok('纯 codebuddy-plugin 客户端也合成取消（滚动屏幕 / 任务列表收得到「已取消」）', Boolean(plug.cancels.find((c) => c.sessionId === sid)), JSON.stringify(plug.cancels));
-  // 顺手钉住相位作废：取消前那口 stale「思考中」不许再当实时相位喂给控制台
-  // （否则红灯亮完 10s 又被喂回来，看着像"取消了还停在思考中"）
+  // 相位作废：取消前那口 stale「思考中」不许再当实时相位喂给控制台
   const rp = readReporterPhase(WS, 'codebuddy,codebuddy-plugin', sid);
   ok('取消后那口 stale 相位作废（不再上报「思考中」）', rp === null, JSON.stringify(rp));
 }
 
-head('[5] paused 但不是 cancel（手工暂停 / 队列等待）→ 不误判成取消');
+head('[5] 只有 message-queue 的 pauseReason=cancel、transcript 没有 [User Cancelled]（插件内部超时）→ 不误判成取消');
 {
   const sid = 'cb-pause-2';
-  writePauseRuntime(sid, { pauseReason: 'manual', updatedAt: Date.now() - 20_000 });
+  writePauseRuntime(sid, { pauseReason: 'cancel', updatedAt: Date.now() - 20_000 });
   scenario({ name: sid, taskId: 't_pause2', startedAt: Date.now() - 30_000, running: true, client: 'codebuddy-plugin' });
   const { cancels, bySession } = readReporterDones(WS, 'codebuddy,codebuddy-plugin');
-  ok('cancels 不含它', !cancels.some((c) => c.sessionId === sid), JSON.stringify(cancels));
+  ok('cancels 不含它（不再信 pauseReason，只认 transcript [User Cancelled]）', !cancels.some((c) => c.sessionId === sid), JSON.stringify(cancels));
   ok('也没有取消标记', !bySession.get(sid), JSON.stringify(bySession.get(sid)));
 }
 
-head('[6] 取消时刻早于本轮开始（上一轮的取消）→ 不算到新一轮头上');
+head('[6] 取消时刻早于本轮开始（上一轮的取消）→ 旧任务仍被兜底标 cancelled，但当前在跑任务不被误标');
 {
   const sid = 'cb-pause-3';
-  writePauseRuntime(sid, { pauseReason: 'cancel', updatedAt: Date.now() - 10 * 60_000 });
-  scenario({ name: sid, taskId: 't_pause3', startedAt: Date.now() - 30_000, running: true, client: 'codebuddy-plugin' });
+  const at = Date.now() - 10 * 60_000;
+  const tp = writeCancelTranscript(sid, at);
+  scenario({ name: sid, taskId: 't_pause3', startedAt: Date.now() - 30_000, running: true, client: 'codebuddy-plugin', transcriptPath: tp });
   const { cancels, bySession } = readReporterDones(WS, 'codebuddy,codebuddy-plugin');
-  ok('cancels 不含它', !cancels.some((c) => c.sessionId === sid), JSON.stringify(cancels));
-  ok('也没有取消标记', !bySession.get(sid), JSON.stringify(bySession.get(sid)));
+  // 多任务会话：上一轮的取消要被认出来（交给 flushSynthesizedCancels 按会话兜底匹配旧任务）
+  const hit = cancels.find((c) => c.sessionId === sid) || null;
+  ok('cancels 含它（旧任务会被兜底标 cancelled）', Boolean(hit), JSON.stringify(cancels));
+  ok('但它不绑当前 taskId（交给会话兜底匹配，不误伤当前在跑任务）', Boolean(hit) && !hit.taskId, JSON.stringify(hit));
+  // 当前这一轮还在跑，主控制台绝不能被上一轮的取消误标成「已取消」
+  ok('主控制台不把当前在跑任务误标为取消', !bySession.get(sid) || bySession.get(sid).cancelled !== true, JSON.stringify(bySession.get(sid)));
 }
 
 head('[7] CodeBuddy CLI 等待授权时按 ESC（Stop 落盘 done.cancelled）→ 主控制台相位作废（不再亮「等待授权」）');

@@ -16,9 +16,18 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { diskKey } = require('@workgremlin/shared');
 // globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
-const { globalStorageRoots, readJson, readDir } = require('./roots');
+const { globalStorageRoots, dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
 
 const HOME = os.homedir();
+
+// 调试日志（取消检测排查用，可整体删除）：写到 ~/.workgremlin/cb-cancel-debug.log
+const _dbgLogPath = path.join(HOME, '.workgremlin', 'cb-cancel-debug.log');
+function dbgLog(...a) {
+  try {
+    const line = `[CB-CANCEL ${new Date().toISOString()}] ` + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
+    fs.appendFileSync(_dbgLogPath, line + '\n');
+  } catch {}
+}
 
 /** 插件目录名匹配（仅 plugin 楼层需要）；findPluginDir 的默认正则也用它 */
 const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
@@ -26,104 +35,177 @@ const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
 /* ------------------------------ 取消检测 ------------------------------ */
 
 /**
- * message-queue 文件缓存：path -> {m, size, data}
- * 按 mtime+size 增量，文件没变就不重读。
+ * CodeBuddy 插件 transcript 取消信号缓存：messages 目录 -> {m, size, cancels:[mtime...]}
+ * 按目录 mtime+size 增量；sinceTs 过滤在调用处做，缓存只存"原始取消时刻列表"避免重复扫盘。
  */
-const _pauseCancelCache = new Map();
+const _cbCancelCache = new Map();
 
 /**
- * CodeBuddy 插件取消检测：从 message-queue 的 `pauseReason='cancel'` 读出取消时刻。
- *
- * 为什么需要这个：CodeBuddy 插件（IDE 扩展）取消任务时**一个 hook 事件都不发**
- * （CLI 那条 FinalStop 在 IDE 形态等不到 —— 扩展日志里只有 AgentState.cancelled，
- * 没有任何 HookExecutor），唯一权威信号在 message-queue 的 `runtime.pauseReason:'cancel'`。
- *
- * 只认 `pauseReason === 'cancel'` 且 `updatedAt ≥ 本轮开始`：`paused` 还有别的来源
- * （手工暂停 / 队列等待），拿 `paused` 当取消会误报；老时间戳也不能算到新一轮头上。
- * @param {string} sessionId
- * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）
- * @returns {number} 取消时刻（0 = 没有 / 判不出）
+ * 兜底定位某会话的 transcript 目录（含 index.json 与 messages/）。
+ * 正常情况 transcript_path 已由 hook 落到 reporter 状态文件 j.transcriptPath（见 hookCommon.js），
+ * 无需扫描；本函数只在"状态文件没有 transcriptPath"时用。落盘结构：
+ *   <dataRoot>/CodeBuddyExtension/Data/<uuid>/VSCode/<uuid>/history/<projectId>/<sessionId>/index.json
  */
-function codebuddyPauseCancelAt(sessionId, sinceTs = 0) {
+function codebuddyTranscriptDirOf(sessionId) {
   const sid = String(sessionId || '');
-  if (!sid) return 0;
-  let best = 0;
-  for (const root of globalStorageRoots()) {
-    for (const name of readDir(root)) {
-      if (!/coding-copilot|tencent|ingram|codebuddy/i.test(name)) continue;
-      const dir = path.join(root, name, 'message-queue');
-      for (const f of readDir(dir)) {
-        if (!/\.json$/i.test(f)) continue;
-        const p = path.join(dir, f);
-        let stat = null;
-        try {
-          stat = fs.statSync(p);
-        } catch {
-          continue;
+  if (!sid) return '';
+  for (const r of dataRoots()) {
+    const base = path.join(r, 'CodeBuddyExtension', 'Data');
+    if (!isDir(base)) continue;
+    for (const a of readDir(base)) {
+      const vsc = path.join(base, a, 'VSCode');
+      if (!isDir(vsc)) continue;
+      for (const b of readDir(vsc)) {
+        const hist = path.join(vsc, b, 'history');
+        if (!isDir(hist)) continue;
+        for (const proj of readDir(hist)) {
+          if (isFile(path.join(hist, proj, sid, 'index.json'))) return path.join(hist, proj, sid);
         }
-        const cached = _pauseCancelCache.get(p);
-        let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
-        if (!data) {
-          data = readJson(p);
-          _pauseCancelCache.set(p, { m: stat.mtimeMs, size: stat.size, data });
-        }
-        const conv = data && data.conversations ? data.conversations[sid] : null;
-        const rt = (conv && conv.runtime) || null;
-        if (!rt || !rt.paused) continue;
-        if (String(rt.pauseReason || '').toLowerCase() !== 'cancel') continue;
-        const at = Number(rt.updatedAt) || Number(conv.updatedAt) || 0;
-        if (!at) continue;
-        if (sinceTs && at < sinceTs) continue; // 老取消不能算到新一轮头上
-        if (at > best) best = at;
       }
     }
+  }
+  return '';
+}
+
+/**
+ * CodeBuddy 插件取消检测：从 transcript 目录的 `messages/<id>.json` 里找
+ * **role=assistant、content 含 text==='[User Cancelled]'** 的那条消息，取其文件 mtime 作为取消时刻。
+ *
+ * 为什么读 transcript 而不是 message-queue：CodeBuddy 插件取消时**一个 hook 事件都不发**
+ * （CLI 那条 FinalStop 在 IDE 形态等不到），而 message-queue 的 `runtime.pauseReason='cancel'`
+ * 并不可靠——插件内部超时（agent 长时间无响应）也会写它，会把"还在跑"误判成"已取消"。
+ * transcript 的 `[User Cancelled]` 只在用户真按停止时出现（实测 2026-10-12：今天 4 次终止精确命中 4 条，
+ * 内部超时不产生），是唯一的可靠信号。
+ *
+ * transcript_path（j.transcriptPath）指向 `.../history/<projectId>/<sessionId>/index.json`，
+ * messages 在其同级 messages/ 目录。
+ *
+ * @param {string} sessionId
+ * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的取消，老一轮的不算
+ * @param {string} [transcriptDir] 会话 transcript 目录；空则自动定位
+ * @returns {number} 取消时刻（消息文件 mtime；0 = 没有 / 判不出）
+ */
+/**
+ * 读某 transcript 目录 messages/ 里**全部** `[User Cancelled]` 的取消时刻（消息文件 mtime）。
+ * 按 messages 目录 mtime+size 增量缓存；不做 sinceTs 过滤 —— 过滤交给调用方按用途决定。
+ * @returns {number[]}
+ */
+function codebuddyReadCancels(transcriptDir) {
+  if (!transcriptDir) return [];
+  const mdir = path.join(transcriptDir, 'messages');
+  let files;
+  try {
+    files = readDir(mdir).filter((n) => /\.json$/i.test(n));
+  } catch {
+    dbgLog('[cancelTimes] mdir MISSING:', mdir);
+    return [];
+  }
+  // 失效信号必须看"具体文件的 mtime/size"，不能只看目录 mtime：取消消息常是就地改写
+  // 最后一条 assistant 消息（不新建文件），目录 mtime 不变 → 旧缓存永远命中 → 漏检（早取消必现）。
+  let sig = '';
+  for (const n of files) {
+    try {
+      const st = fs.statSync(path.join(mdir, n));
+      sig += `${n}:${st.mtimeMs}:${st.size};`;
+    } catch { sig += `${n}:?;`; }
+  }
+  const cached = _cbCancelCache.get(mdir);
+  if (cached && cached.sig === sig) {
+    dbgLog('[cancelTimes] cache HIT', mdir, '->', cached.cancels);
+    return cached.cancels;
+  }
+  const cancels = [];
+  let fileCount = files.length, matched = 0;
+  try {
+    for (const name of files) {
+      const fp = path.join(mdir, name);
+      let o;
+      try {
+        o = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      } catch {
+        continue;
+      }
+      if (!o || o.role !== 'assistant') continue;
+      let inner;
+      try {
+        inner = JSON.parse(o.message);
+      } catch {
+        continue;
+      }
+      const txt = Array.isArray(inner && inner.content)
+        ? inner.content.filter((p) => p && p.type === 'text').map((p) => p.text).join('')
+        : '';
+      if (txt !== '[User Cancelled]') continue; // 精确匹配（带方括号、英文）；工具回显里的同名串因 role 过滤不算
+      matched++;
+      let at = 0;
+      try {
+        at = Math.round(fs.statSync(fp).mtimeMs);
+      } catch {
+        continue;
+      }
+      dbgLog('[cancelTimes]   FOUND cancel file=', name, 'at=', new Date(at).toISOString());
+      cancels.push(at);
+    }
+  } catch {
+    /* 读不到就跳过 */
+  }
+  cancels.sort((a, b) => a - b);
+  _cbCancelCache.set(mdir, { sig, cancels });
+  dbgLog('[cancelTimes] cache MISS', mdir, 'files=', fileCount, 'matched=', matched, '-> cancels=', cancels);
+  return cancels;
+}
+
+/**
+ * CodeBuddy 插件取消检测（按 sinceTs 取"这一轮"的最新取消；0 = 不过滤）。
+ * 供 phaseSuperseded / cancelAt 出口使用。
+ */
+function codebuddyCancelAt(sessionId, sinceTs = 0, transcriptDir = '') {
+  const sid = String(sessionId || '');
+  const dir = transcriptDir || codebuddyTranscriptDirOf(sid);
+  if (!dir) return 0;
+  let best = 0;
+  for (const at of codebuddyReadCancels(dir)) {
+    if (sinceTs && at < sinceTs) continue; // 老一轮的取消不能算到新一轮头上
+    if (at > best) best = at;
   }
   return best;
 }
 
 /**
- * 扫所有 CodeBuddy 插件 message-queue，汇总"被用户取消"的会话 → `{ [sessionId]: 取消时刻 }`。
- * 与 codebuddyPauseCancelAt 同口径（globalStorageRoots → message-queue → mtime+size 缓存），
- * 但**不做 sinceTs 过滤、按会话聚合全部取消**（像 Trae 的 allCancels）—— 因为本函数服务于
- * readReporterDones 里**独立于 hook 状态文件**的取消扫描：取消时插件不重写状态文件、甚至把
- * taskId 清空，再拿 startedAt 去卡就认不出取消。渲染层用 phase.ts vs done.at 自行决断显示，
- * 这里只管"这一轮被取消了"，不需要 smart 过滤。
- *
- * 不做扁平 TTL 缓存：直接按文件 mtime+size 增量（走 _pauseCancelCache），每次重新聚合。
- * message-queue 文件极少（同一窗口几个），重新聚合很便宜；扁平缓存会让"刚写入的取消"最多
- * 延迟一个 TTL 才被识别，反而拖慢了取消亮红灯。
+ * 返回某会话 transcript 里**全部** `[User Cancelled]` 取消时刻（不过滤 sinceTs）。
+ * 多任务会话（一个 CodeBuddy 会话里塞了多个任务）用：每个取消对应一个被终止的任务，
+ * 由 synthMarks 逐个交给 flushSynthesizedCancels 按"取消时刻匹配在途任务"兜底标 cancelled。
+ */
+function codebuddyCancelTimes(sessionId, transcriptDir = '') {
+  const sid = String(sessionId || '');
+  const dir = transcriptDir || codebuddyTranscriptDirOf(sid);
+  if (!dir) return [];
+  return codebuddyReadCancels(dir);
+}
+
+/**
+ * 扫所有 CodeBuddy 会话 transcript，汇总"被用户取消"的会话 → `{ [sessionId]: 取消时刻 }`。
+ * 与 codebuddyCancelAt 同口径，但**不做 sinceTs 过滤、按会话聚合全部取消**（像 Trae 的 allCancels）——
+ * 取消时插件不重写状态文件、甚至把 taskId 清空，再拿 startedAt 去卡就认不出取消；渲染层用
+ * phase.ts vs done.at 自行决断显示，这里只管"这一轮被取消了"，不需要 smart 过滤。
  */
 function allCodebuddyCancels() {
   const merged = {};
-  for (const root of globalStorageRoots()) {
-    for (const name of readDir(root)) {
-      if (!/coding-copilot|tencent|ingram|codebuddy/i.test(name)) continue;
-      const dir = path.join(root, name, 'message-queue');
-      for (const f of readDir(dir)) {
-        if (!/\.json$/i.test(f)) continue;
-        const p = path.join(dir, f);
-        let stat = null;
-        try {
-          stat = fs.statSync(p);
-        } catch {
-          continue;
-        }
-        const cached = _pauseCancelCache.get(p);
-        let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
-        if (!data) {
-          data = readJson(p);
-          _pauseCancelCache.set(p, { m: stat.mtimeMs, size: stat.size, data });
-        }
-        const convs = data && data.conversations ? data.conversations : null;
-        if (!convs) continue;
-        for (const sid of Object.keys(convs)) {
-          const c = convs[sid];
-          const rt = c && c.runtime;
-          if (!rt || !rt.paused) continue;
-          if (String(rt.pauseReason || '').toLowerCase() !== 'cancel') continue;
-          const at = Number(rt.updatedAt) || Number(c.updatedAt) || 0;
-          if (!at) continue;
-          if (!merged[sid] || at > merged[sid]) merged[sid] = at;
+  for (const r of dataRoots()) {
+    const base = path.join(r, 'CodeBuddyExtension', 'Data');
+    if (!isDir(base)) continue;
+    for (const a of readDir(base)) {
+      const vsc = path.join(base, a, 'VSCode');
+      if (!isDir(vsc)) continue;
+      for (const b of readDir(vsc)) {
+        const hist = path.join(vsc, b, 'history');
+        if (!isDir(hist)) continue;
+        for (const proj of readDir(hist)) {
+          const projDir = path.join(hist, proj);
+          for (const sid of readDir(projDir)) {
+            const at = codebuddyCancelAt(sid, 0, path.join(projDir, sid));
+            if (at && (!merged[sid] || at > merged[sid])) merged[sid] = at;
+          }
         }
       }
     }
@@ -162,14 +244,16 @@ const meta = {
 /**
  * 这口"在跑"的 reporter 相位是否被本楼层的取消标记作废。
  * CodeBuddy 插件取消时一个 hook 事件都不发，相位冻在「思考中 / 调用工具」，只能靠
- * message-queue 的 pauseReason='cancel' 那刻来戳破（见 codebuddyPauseCancelAt）。
+ * transcript 的 `[User Cancelled]` 那刻来戳破（见 codebuddyCancelAt）。
+ * transcript_path 由 j.transcriptPath 给出（hook 落到状态文件），指向会话 transcript 目录。
  * 供 sessions.js 的 readReporterPhase 派发调用。
  * @param {object} j hook 状态文件
  * @param {object} sp 状态文件里的 sessionPhase
  * @param {number} slack 相位时间戳容差（ms）
  */
 function phaseSuperseded(j, sp, slack = 1_000) {
-  const at = codebuddyPauseCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
+  const dir = j && j.transcriptPath ? path.dirname(j.transcriptPath) : '';
+  const at = codebuddyCancelAt(j.sessionId, Number(j.taskStartedAt) || 0, dir);
   return !!at && at + slack >= Number(sp.ts || 0);
 }
 
@@ -529,7 +613,7 @@ module.exports = {
   // 供 findPluginDir / findPluginStorageDir 默认正则复用
   RE_PLUGIN,
   // 取消检测（统一模块组接口：cancelAt / allCancels，与 trae 同签名）
-  cancelAt: codebuddyPauseCancelAt,
+  cancelAt: codebuddyCancelAt,
   phaseSuperseded,
   allCancels: allCodebuddyCancels,
   // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 CodeBuddy 专属逻辑）
@@ -541,50 +625,52 @@ module.exports = {
 /**
  * 楼层特有的"取消"标记合成，由 sessions.js 的 readReporterDones 统一派发。
  *
- * CodeBuddy **插件**（IDE 扩展）取消时**一个 hook 事件都不发**（CLI 那条 FinalStop 在 IDE 形态等不到，
- * 扩展日志里只有 AgentState.cancelled，没有任何 HookExecutor），唯一权威信号在 message-queue 的
- * `runtime.pauseReason:'cancel'`（会话 id 与 hook 状态文件 sessionId 一字不差，见 allCodebuddyCancels）。
+ * CodeBuddy **插件**（IDE 扩展）取消时**一个 hook 事件都不发**（CLI 那条 FinalStop 在 IDE 形态等不到），
+ * 唯一权威信号在 transcript 的 `messages/<id>.json` 里那条 role=assistant、text==='[User Cancelled]'
+ * 的消息（见 codebuddyCancelTimes）。会话的 transcript_path 已由 hook 落到状态文件 j.transcriptPath，
+ * 直接按会话读它即可，不必整盘扫 message-queue。
  *
- * 为什么独立扫、不绑在 hook 状态文件的 `if (j.taskId)` 上：
- *   · 取消时状态文件的 taskId 会被**新一轮覆盖 / 清空**，绑在 taskId 上的探测就再也认不出这口取消，
- *     主控制台红灯灭、台账也补不上。所以像 Trae 一样独立扫，只认"会话 id + 取消落盘"。
- *   · 渲染层用 "phase.ts vs done.at 谁更新" 决定显示，done.at 旧但 phase.ts 新 → 新一轮覆盖 cancelled，
- *     不会误亮红灯，所以无需 smart 过滤。
+ * 多任务会话的处理（一个 CodeBuddy 会话里塞了多个任务 / 对话）：
+ *   · 一个会话可能有**多条** `[User Cancelled]`（每次终止一条），每条对应一个被终止的任务。
+ *   · 状态文件只留"当前任务"的 taskId / taskStartedAt；取消后开新任务会把这两个字段整份覆盖，
+ *     所以绝不能把取消绑在 j.taskId 上、也不能用当前 taskStartedAt 去卡（否则上一轮取消永远认不出，
+ *     被取消的任务一直挂 running）。
+ *   · 因此：每条取消都合成一枚取消标记，taskId 留空 → 交给 sessionRegistry.flushSynthesizedCancels
+ *     的"按会话 + 取消时刻匹配在途任务"兜底（listStaleRunningBySession 找 startedAt<=at 的最近在途任务；
+ *     新一轮 startedAt>at 不会被误取），精确标到被终止的那一轮。
+ *   · 主控制台那枚红灯（bySession）只认"最近一次取消就是当前这一轮"（at >= taskStartedAt），
+ *     否则会把上一轮的取消误标到当前正在跑的任务头上。
  *
- * @param {object} ctx
- *   { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, bySession }
+ * @param {object} ctx { workspacePath, client, hookBySid, clientHit, synthCancel, bySession }
  */
-function synthMarks(_ctx) {
-  // CodeBuddy 的 message-queue 里 runtime.pauseReason='cancel' 不可靠：
-  // CodeBuddy 内部超时（agent 长时间无响应）也会写 pauseReason=cancel，
-  // 但任务实际还在跑（用户没取消）。这导致假取消被合成 → 任务被误标 cancelled。
-  // 停止检测改回只认 hook 事件的 Stop/Interrupt 信号（CodeBuddy Plugin 不发 Stop，
-  // 所以任务会保持 running 直到超时或被新一轮顶掉——这比假取消更正确）。
-  return;
-  /* 以下旧逻辑保留备查，但不再执行：
-  const { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, bySession } = ctx;
-  const cbCancels = allCodebuddyCancels();
-  const cbSids = Object.keys(cbCancels || {});
-  if (!cbSids.length) return;
-  for (const sid of cbSids) {
-    const atC = Number(cbCancels[sid]) || 0;
-    if (!atC) continue;
-    const existing = bySession.get(sid);
-    if (existing && existing.cancelled && Math.abs(Number(existing.at) - atC) < 5_000) continue;
-    const hook = hookBySid.get(sid);
-    const j = hook ? hook.j : null;
-    const sinceTs = j ? Number(j.taskStartedAt) || 0 : 0;
-    if (sinceTs && atC < sinceTs) continue;
-    const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
-    if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
-    if (j && client && !clientHit(client, j.client)) continue;
-    synthCancel({
-      id: sid,
-      j: j ? { taskTitle: j.taskTitle || '', client: j.client } : { taskTitle: '', client: 'codebuddy' },
-      ws: hookWs || workspacePath || '',
-      at: atC,
-      files: j ? roundFilesOf(j) : [],
-    });
+function synthMarks(ctx) {
+  const { workspacePath, hookBySid, synthCancel } = ctx || {};
+  dbgLog('[synthMarks] enter; workspacePath=', workspacePath, 'hookBySid.size=', hookBySid && hookBySid.size);
+  if (!hookBySid) return;
+  for (const [sid, entry] of hookBySid) {
+    const j = entry && entry.j; // hookBySid 的值是 { j } 包装，不是直接的 j
+    if (!j) continue;
+    if (!/^codebuddy/i.test(String(j.client || ''))) continue;
+    const dir = j.transcriptPath ? path.dirname(j.transcriptPath) : '';
+    const times = codebuddyCancelTimes(sid, dir); // 该会话全部 [User Cancelled] 时刻（不过滤）
+    dbgLog('[synthMarks] sid=', sid, 'client=', j.client, 'transcriptPath=', j.transcriptPath,
+      'dir=', dir, 'taskStartedAt=', j.taskStartedAt, 'taskId=', j.taskId, 'cancelTimes=', times);
+    if (!times.length) continue;
+    const taskStarted = Number(j.taskStartedAt) || 0;
+    const latest = times.reduce((a, b) => Math.max(a, b), 0);
+    for (const at of times) {
+      if (taskStarted && at < taskStarted) {
+        // 历史任务的取消：taskId 留空，交给会话兜底匹配（不误伤当前在跑任务，也不亮当前红灯）
+        dbgLog('[synthMarks]   -> push HISTORICAL cancel (taskId empty) at=', at);
+        synthCancel({ id: sid, j, ws: workspacePath || '', at, consoleMark: false, taskId: '' });
+      }
+    }
+    // 当前这一轮（或没有本轮起点）：正常合成（带 taskId + 亮主控制台红灯）
+    if (!taskStarted || latest >= taskStarted) {
+      dbgLog('[synthMarks]   -> push CURRENT cancel (taskId=', j.taskId, ') at=', latest);
+      synthCancel({ id: sid, j, ws: workspacePath || '', at: latest });
+    } else {
+      dbgLog('[synthMarks]   -> skip current (latest<taskStarted, 只处理历史)');
+    }
   }
-  */
 }
