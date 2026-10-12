@@ -58,6 +58,89 @@ import { createRequire } from "node:module"
 const require_ = createRequire(import.meta.url)
 const { home } = require_('@workgremlin/shared')
 
+/* ------------------------------ CodeBuddy 磁盘 token 补读 ------------------------------
+ *
+ * CodeBuddy 插件（VS Code 扩展）在"取消"场景下 assistant 消息还没走完就断了，
+ * roundMsgTokens（内存事件流累积）里这一轮没有 token → 上报时 tokens 为 null。
+ *
+ * 但**磁盘上的 index.json** 里其实有完整 usage（CodeBuddy Extension 自己落的），
+ * 只是比 roundMsgTokens 晚个几十到几百毫秒落盘。这份函数从 sessionId 推导出
+ * index.json 路径、读 usage、转成 token 形状，给 endTask 做取消兜底。
+ *
+ * 不能 require server 的 hookCommon（两个独立进程），所以这里**复制一份最小化实现**：
+ *   · 只覆盖 Plugin index.json（CLI trace/jsonl 格式不在插件进程职责内）
+ *   · 时间窗口 ±5s（和 hookCommon.CB_REQ_GRACE_MS 对齐）
+ */
+
+const CB_REQ_GRACE_MS = 5_000
+const CB_EXT_ROOT = () => path.join(home(), '.local', 'share', 'CodeBuddyExtension')
+
+/** 给定 sessionId，在 CodeBuddy Extension Data 下找到 history/<sessionId>，
+ *  取其任一子目录的 index.json（一轮一个子目录）。找不到返回空串。 */
+function inferCodebuddyIndex(sessionId) {
+  const sid = String(sessionId || "")
+  if (!sid) return ""
+  const root = CB_EXT_ROOT()
+  if (!fs.existsSync(root)) return ""
+  const dataDir = path.join(root, "Data")
+  if (!fs.existsSync(dataDir)) return ""
+  const walk = (dir) => {
+    let found = ""
+    try {
+      for (const e of fs.readdirSync(dir)) {
+        const p = path.join(dir, e)
+        let st
+        try { st = fs.statSync(p) } catch { continue }
+        if (!st.isDirectory()) continue
+        // 直接子目录就叫 sessionId？下面找 history/sessionId
+        const hist = path.join(p, "history", sid)
+        if (fs.existsSync(hist) && fs.statSync(hist).isDirectory()) {
+          try {
+            for (const sub of fs.readdirSync(hist)) {
+              const idx = path.join(hist, sub, "index.json")
+              if (fs.existsSync(idx)) return idx
+            }
+          } catch { /* ignore */ }
+        }
+        found = walk(p)
+        if (found) return found
+      }
+    } catch { /* permission denied 等 */ }
+    return found
+  }
+  return walk(dataDir)
+}
+
+/** 从 index.json 里找 startedAt 附近的那一条 request，转成 {input, output, cacheRead, cacheWrite}。
+ *  和 hookCommon.codebuddyRequestTokens 同口径：usage 字段是 CodeBuddy Plugin 自定的 inputTokens/cacheTokens/cachedWriteTokens/outputTokens。
+ *  取不到或全零返回 null。 */
+function codebuddyDiskTokens(sessionId, startedAt) {
+  const idxPath = inferCodebuddyIndex(sessionId)
+  if (!idxPath) return null
+  let data
+  try { data = JSON.parse(fs.readFileSync(idxPath, "utf8")) } catch { return null }
+  const reqs = Array.isArray(data && data.requests) ? data.requests : []
+  if (!reqs.length) return null
+  const target = Number(startedAt) || 0
+  let best = null
+  for (const r of reqs) {
+    const ts = Number(r && r.startedAt)
+    if (!Number.isFinite(ts) || ts <= 0) continue
+    if (target > 0 && (ts < target - CB_REQ_GRACE_MS || ts > target + CB_REQ_GRACE_MS)) continue
+    if (!best || ts > Number(best.startedAt)) best = r
+  }
+  if (!best) return null
+  const u = best.usage
+  if (!u || typeof u !== "object") return null
+  const pr = Number(u.cacheTokens || 0) || 0
+  const pw = Number(u.cachedWriteTokens || 0) || 0
+  const input = Math.max(Number(u.inputTokens || 0) - pr - pw, 0)
+  const output = Number(u.outputTokens || 0) || 0
+  const tk = { input, output, cacheRead: pr, cacheWrite: pw }
+  if (tk.input + tk.output + tk.cacheRead + tk.cacheWrite <= 0) return null
+  return tk
+}
+
 /* ------------------------------ 上报身份 ------------------------------ */
 
 /**
@@ -723,6 +806,23 @@ function createIngestPlugin(options, { location, base } = {}) {
       ...(tokens ? { tokens } : {}),
       workspacePath: ws,
     })
+    // CodeBuddy 磁盘 token 补报：取消场景 roundMsgTokens（内存事件流累积）为空，
+    // 但 CodeBuddy Extension 自己的 index.json 里其实有完整 usage —— 只是晚几十到几百毫秒落盘。
+    // 等它落盘后读一把、POST /task/tokens 补进数据库（服务端 backfillTaskTokens 只写 token 四列）。
+    if (!tokens && client === "codebuddy") {
+      const taskStartAt = roundStartAt.get(sid) || 0
+      setTimeout(() => {
+        const fromDisk = codebuddyDiskTokens(sid, taskStartAt)
+        if (fromDisk) {
+          post("/task/tokens", {
+            memberId: base,
+            sessionId: sid,
+            startedAt: taskStartAt,
+            tokens: fromDisk,
+          })
+        }
+      }, 600)
+    }
     // 本轮的收尾自述也进对话记录（type=result）；没有自述就不写 —— 不拿文件清单凑数
     const said = String(result || "").trim()
     if (said) {

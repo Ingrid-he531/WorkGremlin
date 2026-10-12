@@ -38,6 +38,9 @@ const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
 const { formToSource } = require('@workgremlin/shared');
 
+// 进程启动时刻：doneAt 等"结束态"只在"本进程启动之后"发生的才认，重启后旧的结束态不再复活。
+const SINCE_BOOT = Date.now();
+
 /**
  * agent 名 → 楼层 meta（只建一次）。各楼层的"会话文件落在哪棵子树 / 文件名怎么解出 sessionId"
  * 已经下放到 meta.sessionSubtree / meta.sessionIdOfFile，本文件只按 meta 做通用派发，不再写
@@ -812,14 +815,6 @@ function agentBase(id) {
     .toLowerCase();
 }
 
-// === DEBUG（确认问题后删除）===
-const DBG_LOG = path.join(__dirname, 'debug-taskstate.log');
-function dlog(...args) {
-  try {
-    fs.appendFileSync(DBG_LOG, `[${new Date().toISOString()}] ` + args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') + '\n');
-  } catch {}
-}
-
 /**
  * 会话的「统一任务状态」—— 门楣滚动屏与主控制台判定"本层有没有任务在跑"的**唯一真相源**。
  *   - 'running'：本工程里这一层（按 agent 基名归层）还有"活着"的在飞任务——主控制台据此显示「思考中」。
@@ -848,9 +843,6 @@ function taskStateOf(session, repo, runningClientsFor) {
       if (f && f.id) runningFloors.add(f.id);
     }
     if (runningFloors.has(session.floor)) return 'running';
-    if (runningFloors.size) {
-      dlog('[taskStateOf] floor=', session.floor, 'runningFloors=', JSON.stringify([...runningFloors]), '=> matched=', runningFloors.has(session.floor));
-    }
   }
   // 2) 没有在跑 → reporter 完成标记（doneAt）才是"已结束"最可靠信号
   if (session.doneAt) return session.doneCancelled ? 'cancelled' : 'done';
@@ -858,41 +850,53 @@ function taskStateOf(session, repo, runningClientsFor) {
 }
 
 function snapshot({ workspacePath = '', force = false } = {}) {
-  dlog('[snapshot] begin; backend.repo=', !!(backend && backend.repo), 'hasQuery=', !!(backend && backend.repo && backend.repo.activeRunningByProject));
   refresh({ workspacePath, force });
   const now = Date.now();
 
   const products = detectProducts({});
-  // 一次 snapshot 查一次"所有工程里还在跑的顶层任务"（含 client + 标题 tasks.title），按 agent 基名归到楼层：
-  //   runningFloors        —— 有在飞任务的楼层集合（命中 session.floor 即算"本层在跑"）
-  //   runningTitleByFloor  —— 每层在飞任务标题，滚动屏 running 行用它当文案（不依赖会话里常空的 prompt）
   const repo = backend && backend.repo;
-  const runningFloors = new Set();
+  // 标题取账本 tasks.title（用户那句话，渲染层不丢）——所有在跑任务都取，窗口放宽，只当文案不影响判定。
+  // 同时顺手取出 tasks.started_at（任务真正开始的时间），滚动屏时间用它，而不是"当前时间"。
   const runningTitleByFloor = new Map();
+  const runningStartedByFloor = new Map();
+  // 检测用"活着"的楼层：账本里 state='running' 且**心跳/agent_status 活着**（非粘性判定）。
+  // 关键：这里把 @fresh 设到未来，彻底关掉查询里的 started_at 兜底窗口——
+  // 那个窗口是"挂 3h / 重启复活"的根源（停掉的插件任务在账本里一直挂 running，started_at 又很新就又被认领）。
+  // 关掉后只剩心跳活着判定，停掉的任务（无心跳）立刻出局，重启也不会复活。
+  // 插件任务不写心跳 → 由下面的"实时相位新鲜"信号兜底认领，两者取并集，互不漏判。
+  const ledgerAliveFloors = new Set();
   if (repo && repo.activeRunningByProject) {
-    let rows = [];
+    const cutoff = now - 10 * 60 * 1000;
+    const grace = now - 30 * 60 * 1000;
+    let titleRows = [];
+    let detectRows = [];
     try {
-      rows =
-        repo.activeRunningByProject.all({
-          projectId: 0,
-          fresh: Date.now() - 3 * 60 * 60 * 1000,
-          cutoff: Date.now() - 10 * 60 * 1000,
-          grace: Date.now() - 30 * 60 * 1000,
-        }) || [];
+      // 标题 / 开始时间：所有在跑任务都取（宽窗口，只当文案与时间戳，不参与"在跑"判定）
+      titleRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now - 3 * 60 * 60 * 1000, cutoff, grace }) || [];
+      // 检测：@fresh 设到未来 → started_at 子句恒假，只剩"心跳/agent_status 活着"这一非粘性判定
+      detectRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now + 1e15, cutoff, grace }) || [];
     } catch (e) {
-      dlog('[running] query threw:', e && e.message);
+      /* 账本查询异常不影响会话表构建 */
     }
-    for (const r of rows) {
+    for (const r of titleRows) {
       const f = floorByAgent[agentBase(r.client)];
       if (f && f.id) {
-        runningFloors.add(f.id);
         if (r.title && !runningTitleByFloor.has(f.id)) runningTitleByFloor.set(f.id, r.title);
+        if (r.startedAt && !runningStartedByFloor.has(f.id)) runningStartedByFloor.set(f.id, Number(r.startedAt));
       }
     }
-    dlog('[running] clients=', JSON.stringify(rows.map((r) => r.client)), 'floors=', JSON.stringify([...runningFloors]), 'titles=', JSON.stringify([...runningTitleByFloor]));
+    for (const r of detectRows) {
+      const f = floorByAgent[agentBase(r.client)];
+      if (f && f.id) ledgerAliveFloors.add(f.id);
+    }
   } else {
-    dlog('[running] repo/activeRunningByProject missing; repo=', !!repo);
+    /* repo/activeRunningByProject 缺失时跳过账本信号（老行为） */
   }
+  // "在跑"只认账本 ALIVE（与任务表同一把尺子 taskAliveSql：state='running' 且有近期心跳/活跃状态）。
+  // 之前曾把"会话实时相位新鲜"也当在跑信号，但实测插件会在重连/重启时把上一条任务的相位重播成
+  // thinking 并刷新时间戳，导致已取消的旧任务被误判在跑、与任务表（按 ALIVE 判）打架。去掉它后，
+  // 两边口径一致——任务表显示"已取消"的，滚动屏/主控制台绝不会再显示"进行中"。
+  const runningFloors = new Set(ledgerAliveFloors);
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)
@@ -901,17 +905,22 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         return b.lastEventAt - a.lastEventAt;
       })
       .map((s) => {
-        // taskState —— 这条会话"有没有在跑的任务"的**唯一真相源**，门楣滚动屏与主控制台都读它。
-        // 优先于残留 doneAt：新开一轮先按"本层有活着的在飞任务"判 running，避免先闪"任务取消/完成"。
-        // "已结束"以 reporter 落的 doneAt 为准（CodeBuddy 插件按停止连 hook 都不发，见 flushSynthesizedCancels）。
+        // taskState —— 这条会话"有没有在跑的任务"的唯一真相源，门楣滚动屏与主控制台都读它。
+        // 跑：本层相位新鲜（runningFloors）。结束：reporter 落的 doneAt，且必须是**本进程启动之后**
+        // 发生的（重启后旧的 doneAt 不认，否则会复活上一轮的"任务取消/完成"）。
         let taskState;
         if (runningFloors.has(s.floor)) taskState = 'running';
-        else if (s.doneAt) taskState = s.doneCancelled ? 'cancelled' : 'done';
+        // 结束态：reporter 落的 doneAt，且（1）必须是**本进程启动之后**发生的（重启后旧 doneAt 不认，
+        // 否则复活上一轮"任务取消/完成"）；（2）本会话近期（10s 内）没有新活动——新一轮任务刚起步时
+        // 旧的 doneAt 还挂着、相位又来不及翻新，若直接认它就会先闪一下"任务取消"再跳回"思考中"，
+        // 所以只要会话最近还有动静（新任务已经在跑了）就压住旧结束态。
+        else if (s.doneAt && s.doneAt > SINCE_BOOT && now - (Number(s.lastEventAt) || 0) > 10_000) taskState = s.doneCancelled ? 'cancelled' : 'done';
         else taskState = null;
-        // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——不依赖会话里常常为空的 prompt，
-        // 这正是以前"滚动屏内容对、但只在取消后才出来"用过的同一份数据源。
+        // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——不依赖会话里常常为空的 prompt；
+        // 同时带上任务真正开始的时间（tasks.started_at），滚动屏时间用它而非"当前时间"。
         const taskTitle = taskState === 'running' ? runningTitleByFloor.get(s.floor) || '' : '';
-        return { ...s, taskState, taskTitle };
+        const taskStartedAt = taskState === 'running' ? Number(runningStartedByFloor.get(s.floor) || 0) : 0;
+        return { ...s, taskState, taskTitle, taskStartedAt };
       });
     return {
       id: p.id,

@@ -58,6 +58,13 @@ const RETIRE_MS = 10_000;
 const GHOST_TTL_MS =
   Number(process.env.WORKGREMLIN_GHOST_TTL_MS) > 0 ? Number(process.env.WORKGREMLIN_GHOST_TTL_MS) : 60 * 60_000;
 /**
+ * 孤儿幽灵兜底（毫秒）：hook 写的幽灵，如果 state=busy 且**没 result**，说明 subagent 还在跑或
+ * 被中断没收尾信号（进程被 SIGKILL、Stop hook 没发、matcher 没放开 SubagentStop 等）。
+ * 超过这个时间还没收工信号就认定孤儿，**直接从清单里删掉**——不只是内存过滤，真散幽灵。
+ * 5 分钟是折中：正常 subagent 任务几秒到几分钟就该 PostToolUse 收尾，拖过 5 分钟不可能是正忙。
+ */
+const ORPHAN_TTL_MS = 5 * 60_000;
+/**
  * 收工摘要的落点：artifacts 表的 kind 只有 file / doc / pr / text 四种（CHECK 约束），
  * 所以摘要记成 kind='text'，再用 path 打这个标记让渲染层认出来
  * （检索处：renderer/src/views/IsoOfficeView.vue 的 sceneMembers）。
@@ -180,6 +187,27 @@ function createSubagentFeed(opts) {
 
   function sync() {
     if (!running) return 0;
+    // 孤儿兜底：hook 写的幽灵 state=busy 且没 result，拖过 ORPHAN_TTL_MS 还没收工信号就从文件里删掉。
+    // 不只是内存过滤（readFeed 里 GHOST_TTL_MS 是 60 分钟），这里真清——孤儿就是孤儿，别让它飘着。
+    const now0 = Date.now();
+    updateJson(
+      file,
+      (feed0) => {
+        const doomed = (feed0.agents || []).filter(
+          (a) =>
+            a &&
+            a.ts &&
+            a.state === 'busy' &&
+            !a.result &&
+            now0 - Number(a.ts) > ORPHAN_TTL_MS
+        );
+        if (!doomed.length) return undefined;
+        feed0.agents = (feed0.agents || []).filter((a) => !doomed.includes(a));
+        return feed0;
+      },
+      { fallback: { project: '', agents: [] }, pretty: true }
+    );
+
     const feed = readFeed(file);
     const feedProject = feed.project || projectName;
     // 内容没变就只续心跳（否则每 2s 都会重写一遍状态行）
@@ -202,7 +230,7 @@ function createSubagentFeed(opts) {
           memberId,
           name: a.name,
           role: 'subagent',
-          sessionId: null,
+          sessionId: a.sessionId || null, // 幽灵归属哪条会话：空=跨会话飘（老库/手工写的）
           ephemeral: true,
           projectLabel: a.project || feedProject,
           workspacePath: opts.workspacePath || '',

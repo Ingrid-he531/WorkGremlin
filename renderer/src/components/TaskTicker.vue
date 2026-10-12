@@ -187,7 +187,9 @@ const runningItems = computed(() => {
       const text = promptOf(s.taskTitle || s.prompt || s.action || '') || t('ticker.untitled');
       const taskLabel = t('ticker.taskLabel');
       const taskText = clip(text);
-      const time = hhmm(s.lastEventAt);
+      // 时间用任务真正开始的时间（taskStartedAt = 台账 tasks.started_at），而不是"当前时间"；
+      // 取不到时兜底用 lastEventAt（会话最近活动）避免空屏。
+      const time = hhmm(s.taskStartedAt || s.lastEventAt);
       return {
         id: s.id,
         kind: 'running',

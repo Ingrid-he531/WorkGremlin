@@ -726,7 +726,7 @@ function lingmaHandler(p, src, ctx) {
 
 const kindHandlers = { lingma: lingmaHandler };
 
-const { runHookEvent, sharedHookImpl, jsonlReplies, codebuddyReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
+const { runHookEvent, sharedHookImpl, jsonlReplies, indexJsonReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
 
 /** Qoder 形态（cli / plugin）：transcript 首行 user 的 entrypoint。
  * 原在 hookCommon，现挪到本楼层（"楼层自己的接口"）；没覆盖的字段回退 sharedHookImpl。 */
@@ -744,7 +744,7 @@ function qoderForm(transcriptPath) {
 const qoderImpl = {
   ...sharedHookImpl,
   awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
-  repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
+  repliesOf: (tp) => (/index\.json$/i.test(tp) ? indexJsonReplies(tp) : jsonlReplies(tp)),
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
   formOf: (tp) => qoderForm(tp),
 };

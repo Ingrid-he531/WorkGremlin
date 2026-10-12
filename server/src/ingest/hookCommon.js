@@ -28,9 +28,8 @@ const RESULT_MAX = 4_000;
 const MSG_MAX = 8_000;
 const MAX_REPLIES = 50;
 const PENDING_SPAWN_MS = 2 * 60_000;
-const CB_REQ_GRACE_MS = 5_000;
-const CB_FLUSH_WAIT_MS = 1_200;
-const CB_FLUSH_STEP_MS = 120;
+// CodeBuddy 专属常量（CB_REQ_GRACE_MS / CB_FLUSH_WAIT_MS / CB_FLUSH_STEP_MS）已移到 floorCodebuddy.js
+// —— 这三家只被 CodeBuddy 楼层消费，不再污染框架层
 
 const PROBE_TOOLS = new Set([
   'Edit', 'MultiEdit', 'NotebookEdit', 'Write', 'Delete',
@@ -363,11 +362,12 @@ function jsonlReplies(file) {
 }
 
 /**
- * CodeBuddy 的会话正文不在索引里：索引 history/<sessionId>/index.json（缩进多行 JSON，非 JSONL），
- * 正文在同目录 messages/<id>.json（{role, message:"<JSON 字符串>"}）。一轮回复在索引里被切成若干
- * assistant 分片，按最后一个请求把分片拼成一条，去重键用请求 id。Qoder / WorkBuddy 的插件同款。
+ * IDE 插件形态的会话正文解析（index.json 格式）—— 被 CodeBuddy / Qoder / WorkBuddy 三家共用。
+ * 格式：索引 history/<sessionId>/index.json（缩进多行 JSON，非 JSONL），正文在同目录
+ * messages/<id>.json（{role, message:"<JSON 字符串>"}）。一轮回复在索引里被切成若干 assistant
+ * 分片，按最后一个请求把分片拼成一条，去重键用请求 id。
  */
-function codebuddyReplies(indexPath) {
+function indexJsonReplies(indexPath) {
   const dir = path.dirname(indexPath);
   let idx;
   try {
@@ -576,63 +576,29 @@ function codexDelta(rows, startedAt) {
   });
 }
 
-function codebuddyRequestTokens(indexPath, startedAt) {
-  let idx;
-  try {
-    idx = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
-  } catch {
-    return null;
-  }
-  const reqs = Array.isArray(idx && idx.requests) ? idx.requests : [];
-  let best = null;
-  for (const r of reqs) {
-    if (!r || typeof r !== 'object') continue;
-    const ts = Number(r.startedAt);
-    if (!Number.isFinite(ts) || ts <= 0) continue;
-    if (ts < startedAt - CB_REQ_GRACE_MS || ts > startedAt + CB_REQ_GRACE_MS) continue;
-    if (!best || ts > Number(best.startAt)) best = r;
-  }
-  if (!best) return null;
-  const u = best.usage;
-  if (!u || typeof u !== 'object') return null;
-  return normOpenAI({
-    prompt_tokens: u.inputTokens,
-    prompt_cache_hit_tokens: u.cacheTokens,
-    prompt_cache_write_tokens: u.cachedWriteTokens,
-    completion_tokens: u.outputTokens,
-  });
-}
-
 function tokenFinish(t) {
   if (!t) return null;
   if (t.input + t.output + t.cacheRead + t.cacheWrite <= 0) return null;
   return t;
 }
 
-/** 这一轮消耗的 token（产品无关：JSONL 走 requestSum/codexDelta；CodeBuddy 插件 index.json 走专门路） */
-function readTokens(transcriptPath, startedAt) {
-  const file = String(transcriptPath || '');
-  if (!file) return null;
-  if (!(Number(startedAt) > 0)) return null;
-  if (/index\.json$/i.test(file)) return tokenFinish(codebuddyRequestTokens(file, Number(startedAt)));
+/**
+ * 一轮任务消耗的 token —— **纯 JSONL 格式**解析框架层原语。
+ *
+ * 这是"框架能看懂的格式"：Codex rollout jsonl（event_msg/token_count）、Claude Code transcript
+ * （message.usage / providerData.rawUsage）。楼层有更特殊的格式（如 IDE 插件 index.json、
+ * OTel trace jsonl）时，由楼层自己的 readTokensOf 覆盖来处理——框架层不管格式种类。
+ *
+ * 返回 `{input, output, cacheRead, cacheWrite} | null` —— 取不到或四项全零都回 null。
+ * 楼层 readTokensOf 也是同一套口径，服务端 bus.endTask / backfillTaskTokens 统一吃这个形状。
+ */
+function readTokens(jsonlPath, startedAt) {
+  const file = String(jsonlPath || '');
+  if (!file || !(Number(startedAt) > 0)) return null;
   const rows = parseLines(file);
   if (!rows) return null;
   const t = codexDelta(rows, Number(startedAt)) || requestSum(rows, Number(startedAt));
   return tokenFinish(t);
-}
-
-/** 必要时等落盘（只为 CodeBuddy 插件那一手 index.json，比 Stop 晚 30~50ms） */
-async function readTokensSettled(transcriptPath, startedAt) {
-  const file = String(transcriptPath || '');
-  const first = readTokens(file, startedAt);
-  if (first || !file || !(Number(startedAt) > 0)) return first;
-  if (!/index\.json$/i.test(file)) return null;
-  for (let waited = 0; waited < CB_FLUSH_WAIT_MS; waited += CB_FLUSH_STEP_MS) {
-    await new Promise((r) => setTimeout(r, CB_FLUSH_STEP_MS));
-    const t = readTokens(file, startedAt);
-    if (t) return t;
-  }
-  return null;
 }
 
 /* ============================== 子代理 key 合成 ============================== */
@@ -853,8 +819,13 @@ function reporterStatePath(floor, workspacePath, sessionId) {
   return path.join(reporterHooksDir(), `${key}.json`);
 }
 
-/** 公有默认 hook 行为：楼层模块没自己提供的接口就回退到这份（见各 floorXXX.js 的 handleHookEvent）。
- * 各楼层用 `{ ...sharedHookImpl, ...本楼层覆盖 }` 组装 impl，没覆盖的字段自动用公有默认。 */
+/**
+ * 公有默认 hook 行为：楼层模块没自己提供的接口就回退到这份（见各 floorXXX.js 的 handleHookEvent）。
+ * 各楼层用 `{ ...sharedHookImpl, ...本楼层覆盖 }` 组装 impl，没覆盖的字段自动用公有默认。
+ *
+ * 新增 `transcriptPathOf` 和 `readTokensOf` 让楼层把产品专属的 transcript 路径推导 / 格式解析
+ * 下沉到自己的文件里——框架层只做事件分发和状态管理，不硬编码 CodeBuddy/Claude/Codex 的路径。
+ */
 const sharedHookImpl = {
   coarse: false,
   coarseTitle: '',
@@ -864,6 +835,18 @@ const sharedHookImpl = {
   repliesOf: (tp) => jsonlReplies(tp),
   interruptedSince: (tp, since, sessionId) => turnInterrupted(tp, since),
   formOf: () => '',
+  /**
+   * 这一轮的 transcript 路径。默认：事件 payload 里有就用，没有就空着。
+   * CodeBuddy 覆盖：hook 事件经常不带 transcript_path（Plugin 和部分 CLI 形态），
+   * 需要从 sessionId + workspacePath 反推两个候选位置（见 floorCodebuddy.js）。
+   */
+  transcriptPathOf: (ev, st, sessionId, workspacePath) => String((ev && ev.transcript_path) || ''),
+  /**
+   * 这一轮的 token 读取。默认：纯 JSONL 格式（Codex rollout / Claude transcript）。
+   * CodeBuddy 覆盖：三路分发（index.json 走 codebuddyRequestTokens、
+   * trace OTel span 走 codebuddyTraceTokens、projects jsonl 走 requestSum）。
+   */
+  readTokensOf: (tp, startedAt) => readTokens(tp, startedAt),
 };
 
 async function runHookEvent(ev, ctx, floorImpl) {
@@ -873,16 +856,24 @@ async function runHookEvent(ev, ctx, floorImpl) {
   if (!event) return { ok: false, error: 'missing hook_event_name' };
 
   const memberId = String(ev.agent);
-  const sessionId = String(ev.session_id || '');
+  const client = String(ev.agent || '').trim().toLowerCase();
+  let sessionId = String(ev.session_id || '');
+  // sessionId 格式校验：必须是 UUID 或 32hex（老版本 CodeBuddy CLI）
+  // 非法格式（如 ghost-xxx 测试伪造）不写状态文件，避免脏会话混进列表
+  const RE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const RE_SESSION_ID_HEX = /^[0-9a-f]{32}$/i;
+  if (sessionId && !RE_SESSION_ID.test(sessionId) && !RE_SESSION_ID_HEX.test(sessionId)) {
+    console.error('[hookCommon] ignoring invalid session_id:', sessionId, 'from', client);
+    sessionId = '';
+  }
   const cwd = String(ev.cwd || '');
-  // client = 楼层产品基名（codebuddy），与 memberId 基名一致；floor 直接用它代表楼层，
+  // client = 楼层产品基名，与 memberId 基名一致；floor 直接用它代表楼层，
   // 和 registerMember 契约（client 即楼层）统一，避免 client / floor 两处各算各的、
   // 写相位文件时 client 字段跟楼层过滤对不上（见 readReporterPhase 的 clientHit）。
-  const client = String(ev.agent || '').trim().toLowerCase();
   const get = () => sessionGet(sessionId) || {};
   // 稳定的工程路径 / 工程 id：每事件的 cwd 会漂移（如 Bash 在 home 下执行、命令里才 cd 进工程），
-  // 直接用它推 project 会把同一会话推成 "yinghui" 之类 → requireMember 解析成 codebuddy@yinghui，
-  // 匹配不到 codebuddy@workgremlin → bus.toolUse / status 整段跳过（工具计数全空、状态不更新）。
+  // 直接用它推 project 会把同一会话推成某个非工程路径 → requireMember 解析成 "<产品基名>@home"，
+  // 匹配不到 "<产品基名>@<工程路径>" → bus.toolUse / status 整段跳过（工具计数全空、状态不更新）。
   // 优先取本轮任务落下来的工程目录（UserPromptSubmit 时就是工程目录），没有再退回本次事件的 workspacePath。
   const stableWs = get().taskWorkspacePath || workspacePath;
   const stableProject = bus.projectForReport('', stableWs) || project;
@@ -941,12 +932,14 @@ async function runHookEvent(ev, ctx, floorImpl) {
 
   // 缓存 transcript 路径（后续事件从会话状态里取，hook 原逻辑见 SessionStart 那段）
   if (ev.transcript_path) set({ transcriptPath: String(ev.transcript_path) });
-  const tp = () => String(ev.transcript_path || get().transcriptPath || '');
+  // tp() 走 impl.transcriptPathOf：默认只认事件 payload；楼层可覆盖来推导路径
+  // （部分产品的 hook 事件不带 transcript_path，需要从 sessionId+workspacePath 反推）。
+  const tp = () => String(impl.transcriptPathOf(ev, get(), sessionId, workspacePath) || get().transcriptPath || '');
 
   const status = (state, reason) =>
     bus.setStatus({ ...base, state, taskId: get().taskId || null, ...(reason ? { reason } : {}) });
   const beat = () => bus.heartbeat({ ...base, memberId });
-  // 主 agent 的楼层身份补进 client：memberId 基名(= ev.agent)与 client 同为产品基名(codebuddy)，
+  // 主 agent 的楼层身份补进 client：memberId 基名(= ev.agent)与 client 同为产品基名，
   // 与静态小怪物 / 幽灵统一成"client = 楼层(产品基名)、memberId 仅作主键"的约定。
   const register = () => bus.registerMember({ ...base, name: memberId, role: 'agent', client });
 
@@ -954,11 +947,11 @@ async function runHookEvent(ev, ctx, floorImpl) {
   // 落盘头只作 fallback。hook 已把原始 form 透传过来，这里按它识别 plugin。
   const formOf = () => fixedFormOf(ev) || impl.formOf(tp());
 
-  // 给上一轮补报 token（新一轮开始时用）
+  // 给上一轮补报 token（新一轮开始时用）—— 走 impl.readTokensOf，让楼层决定用哪种解析器
   async function backfillPrevTokens(prevDone, transcriptPath) {
     const startedAt = Number(prevDone && prevDone.startedAt) || 0;
     if (!transcriptPath || !(startedAt > 0)) return;
-    const tokens = readTokens(transcriptPath, startedAt);
+    const tokens = await impl.readTokensOf(transcriptPath, startedAt);
     if (!tokens) return;
     await bus.backfillTaskTokens({ ...base, startedAt, tokens, sessionId });
   }
@@ -983,7 +976,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
     const result0 = String(last0 || '').trim().slice(0, RESULT_MAX);
     if (taskId0) {
-      const tokens0 = await readTokensSettled(tp(), startedAt0);
+      const tokens0 = await impl.readTokensOf(tp(), startedAt0);
       await bus.endTask({
         ...base,
         taskId: taskId0,
@@ -1081,9 +1074,11 @@ async function runHookEvent(ev, ctx, floorImpl) {
 
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     await beat();
+    // hook 事件里工具名字段可能是 tool_name（上游原生）或 tool（某些上报层映射）
+    const toolName = ev.tool_name || ev.tool || '';
     if (event === 'PreToolUse') {
-      const tool = ev.tool_name || '';
-      const f = relFile(fileOf(ev.tool_input, ev.tool_name), cwd);
+      const tool = toolName;
+      const f = relFile(fileOf(ev.tool_input, toolName), cwd);
       const input = ev.tool_input || {};
       const toolLabel = tool.replace(/^collaboration/, '');
       const cmdText = /^apply_patch$/.test(tool) ? '' : input.command || input.cmd || '';
@@ -1122,11 +1117,11 @@ async function runHookEvent(ev, ctx, floorImpl) {
       }
       await status('busy');
     } else {
-      const touched = filesOf(ev.tool_input, ev.tool_name)
-        .map((x) => ({ abs: path.resolve(x), path: relFile(x, cwd), op: opOf(ev.tool_name) }))
+      const touched = filesOf(ev.tool_input, toolName)
+        .map((x) => ({ abs: path.resolve(x), path: relFile(x, cwd), op: opOf(toolName) }))
         .filter((t) => t.path);
       if (touched.length) {
-        await bus.fileTouch({ ...base, files: touched.map((t) => t.path), op: opOf(ev.tool_name) });
+        await bus.fileTouch({ ...base, files: touched.map((t) => t.path), op: opOf(toolName) });
         const ledger = ((get().roundFiles) || []).slice();
         for (const t of touched) {
           const ex = ledger.find((x) => x && x.path === t.path);
@@ -1135,12 +1130,12 @@ async function runHookEvent(ev, ctx, floorImpl) {
         }
         set({ roundFiles: ledger.slice(-30) });
       }
-      const prog = todoProgress(ev.tool_name, ev.tool_input);
+      const prog = todoProgress(toolName, ev.tool_input);
       if (prog != null) {
         const tid = get().taskId;
         if (tid) await bus.taskProgress({ ...base, taskId: tid, progress: prog });
       }
-      if (isSubagentTool(ev.tool_name) && !impl.hasSubagentStart) {
+      if (isSubagentTool(toolName) && !impl.hasSubagentStart) {
         finishGhostServer(sessionId, get(), workspacePath, ev, client, set);
       }
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
@@ -1156,7 +1151,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     } else if (impl.awaitingPermission && !impl.awaitingPermission(ev)) {
       return { ok: true, ignored: event }; // 非权限类型（如 Claude 的 auth_success）不动状态
     } else {
-      const tool = (ev && ev.tool_name) || get().lastTool || '';
+      const tool = (ev && (ev.tool_name || ev.tool)) || get().lastTool || '';
       const input = (ev && ev.tool_input) || get().lastInput || '';
       const ff = relFile(fileOf(input, tool), cwd);
       set({
@@ -1169,7 +1164,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
   }
 
   if (event === 'PermissionRequest') {
-    const tool = (ev && ev.tool_name) || get().lastTool || '';
+    const tool = (ev && (ev.tool_name || ev.tool)) || get().lastTool || '';
     const input = (ev && ev.tool_input) || get().lastInput || '';
     const ff = relFile(fileOf(input, tool), cwd);
     set({
@@ -1231,7 +1226,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
     if (taskId) {
       const form = formOf() || st.form || '';
-      const tokens = await readTokensSettled(tp(), startedAt);
+      const tokens = await impl.readTokensOf(tp(), startedAt);
       await bus.endTask({
         ...base,
         taskId,
@@ -1342,12 +1337,14 @@ module.exports = {
   runHookEvent,
   // 产品无关助手（导出便于单测与复用）
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
-  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens, readTokensSettled,
+  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens,
   addGhost, retireGhost, sweepGhosts, ownsEntry, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
-  PENDING_SPAWN_MS, CB_REQ_GRACE_MS, CB_FLUSH_WAIT_MS, CB_FLUSH_STEP_MS,
+  PENDING_SPAWN_MS,
+  // token 归一原语（产品无关）
+  normOpenAI, normAnthropic, tokenFinish,
   // 回复解析 / 形态 / 打断（产品无关）
-  extractText, msgOf, isInterruptLine, sinceLastUser, jsonlReplies, codebuddyReplies,
+  extractText, msgOf, isInterruptLine, sinceLastUser, jsonlReplies, indexJsonReplies,
   headJsonLines, turnInterrupted, INTERRUPT_HINT_RE,
   // 公有默认 hook 行为（楼层模块没覆盖的接口回退到这份）
   sharedHookImpl,

@@ -208,7 +208,8 @@ function createServer(opts = {}) {
   function startFeed() {
     if (subagentFeed) subagentFeed.stop();
     const cur = workspace.current();
-    if (!cur.workspacePath) return null;
+    console.log('[workgremlin] startFeed called, workspacePath:', cur.workspacePath || '(empty)');
+    if (!cur.workspacePath) { console.log('[workgremlin] startFeed skipped: no workspace'); return null; }
     subagentFeed = createSubagentFeed({
       bus,
       repo,

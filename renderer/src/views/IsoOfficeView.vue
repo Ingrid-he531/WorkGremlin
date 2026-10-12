@@ -220,10 +220,13 @@ function sameWorkspace(a, b) {
 }
 
 /**
- * 选中会话本身是否"正在跑"（服务端统一合成的 taskState：reporter 完成标记优先、否则看台账活着的
- * running 任务，见 server/src/sessionRegistry.js 的 taskStateOf）。门楣滚动屏与主控制台读的是**同一个**
- * 字段，所以两者不会再不一致。
+ * 选中会话本身是否"正在跑"（服务端统一合成的 taskState：本层实时相位新鲜 = running）。
+ * 门楣滚动屏与主控制台读的是**同一个**字段，所以两者不会再不一致。
  */
+const floorTaskActive = computed(() => {
+  const sel = sessions.selected;
+  return Boolean(sel && sel.taskState === 'running');
+});
 
 /**
  * 主控制台严格跟随下拉选中的会话：显示"这条会话自己"的相位
@@ -283,14 +286,31 @@ const consoleBase = computed(() => {
       return { phase: 'thinking', action: fp.action || p, context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, prompt: p };
     }
   }
-  // 接了 hook 的工程(plugin/cli/ide):当前没有相位 = 这一路现在确实没产生新事件。
+  // 接了 hook 的工程(plugin/cli/ide):本层有在飞任务（floorTaskActive）但当前没有实时相位 =
+  // 这一轮还在跑、只是暂时没产生新事件（思考/等待中），显示「思考中」而非「待命」。
   if (isHookSource && sameWs && sameSession && fp.instrumented) {
+    if (floorTaskActive.value) {
+      return { phase: 'thinking', action: '', context: [], target: null, tool: '', prompt: '' };
+    }
     return { phase: 'idle', action: '', context: [], target: null, tool: '', prompt: '' };
+  }
+  const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
+  const phase = sel.phase || 'idle';
+  // 会话自身是 idle / unreported（没有实时相位、推断也回落待命）：只要这一层确实还有 running 任务
+  // （门楣滚动屏同口径），就显示「思考中」——人还在这轮任务里，只是暂时没产生新事件；
+  // 没有任何活跃任务（已收工 / 空楼层）才回落「待命」。
+  if ((phase === 'idle' || phase === 'unreported') && floorTaskActive.value) {
+    return {
+      phase: 'thinking',
+      action: sel.action || '',
+      context: sel.context && sel.context.length ? sel.context : [],
+      target: sel.target || null,
+      tool: sel.tool || '',
+      prompt: sel.prompt || '',
+    };
   }
   // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
   // 下拉切到旧工程会话就显示旧会话自己的状态，不再被新工程的实时相位覆盖。
-  const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
-  const phase = sel.phase || 'idle';
   return {
     phase,
     action: sel.action || selPrompt,
@@ -520,6 +540,7 @@ const sceneMembers = computed(() => {
    */
   const emptyFloor = sessions.floorEmpty && !demo;
   const want = demo ? '' : sessions.selectedClient;
+  const wantSession = demo ? '' : sessions.selectedSessionId;
   // 小怪物按 agent 基名归层：CLI 与 plugin 两种形态同属一层（1F CodeBuddy 就是这么合并的），
   // 所以常驻小怪物只要基名对得上就摆。floorAcceptsClient 内部剥 -plugin 后比基名。
   const live = demo || sessions.live;
@@ -531,6 +552,10 @@ const sceneMembers = computed(() => {
     // 给人起的名字，跟产品无关，绝不拿它去比楼层。client 为空（老库 / 演示数据 /
     // 手工 scripts 写的）视作通用、哪层都显示（floorAcceptsClient 的语义）。
     .filter((m) => floorAcceptsClient(want, m.client))
+    // 幽灵（subagent- 前缀）带 sessionId —— 只显示当前选中会话的幽灵。
+    // 常驻小怪物（role=subagent 但不是 ephemeral）没 sessionId，全层共享，不该被这条过滤掉。
+    // sessionId 为空的幽灵（老库 / 手工 scripts）也放过——退化行为，总比全滤掉好。
+    .filter((m) => !isEphemeralMember(m) || !wantSession || !m.sessionId || m.sessionId === wantSession)
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],

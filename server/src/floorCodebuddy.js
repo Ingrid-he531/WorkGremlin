@@ -173,21 +173,353 @@ function phaseSuperseded(j, sp, slack = 1_000) {
   return !!at && at + slack >= Number(sp.ts || 0);
 }
 
-const { runHookEvent, sharedHookImpl, jsonlReplies, codebuddyReplies, turnInterrupted } = require('./ingest/hookCommon');
+const { runHookEvent, sharedHookImpl, jsonlReplies, indexJsonReplies, turnInterrupted,
+  normOpenAI, tokenFinish, readTokens,
+  headJsonLines } = require('./ingest/hookCommon');
+
+/* ============================== CodeBuddy 专属常量 ==============================
+ * 跟着 codebuddyRequestTokens / codebuddyReadTokensOf 一起从 hookCommon 下沉到这里，
+ * 只被本楼层消费，不再污染框架层。 */
+
+const CB_REQ_GRACE_MS = 5_000;
+const CB_FLUSH_WAIT_MS = 1_200;
+const CB_FLUSH_STEP_MS = 120;
+
+/* ============================== CodeBuddy Plugin index.json token 解析 ==============================
+ * 从 hookCommon 下沉过来——这是 CodeBuddy 专属的 index.json usage 格式（CodeBuddy Plugin 自定的
+ * inputTokens/cacheTokens/cachedWriteTokens/outputTokens），框架层不该硬编码它。 */
+
+function codebuddyRequestTokens(indexPath, startedAt) {
+  let idx;
+  try { idx = JSON.parse(fs.readFileSync(indexPath, 'utf8')); } catch { return null; }
+  const reqs = Array.isArray(idx && idx.requests) ? idx.requests : [];
+  let best = null;
+  for (const r of reqs) {
+    if (!r || typeof r !== 'object') continue;
+    const ts = Number(r.startedAt);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts < startedAt - CB_REQ_GRACE_MS || ts > startedAt + CB_REQ_GRACE_MS) continue;
+    if (!best || ts > Number(best.startedAt)) best = r;
+  }
+  if (!best) return null;
+  const u = best.usage;
+  if (!u || typeof u !== 'object') return null;
+  return normOpenAI({
+    prompt_tokens: u.inputTokens,
+    prompt_cache_hit_tokens: u.cacheTokens,
+    prompt_cache_write_tokens: u.cachedWriteTokens,
+    completion_tokens: u.outputTokens,
+  });
+}
+
+/* ============================== CodeBuddy transcript 路径推导 ==============================
+ *
+ * CodeBuddy 有三套独立落盘，hook 事件的 transcript_path 字段**经常缺失**（Plugin 形态
+ * 几乎总不带，CLI trace 形态也有缺的情况）。框架层 tp() 默认只认事件 payload——
+ * 所以让楼层 transcriptPathOf 覆盖来推导。
+ *
+ * 优先级：事件 payload > 会话状态缓存 > 三处候选位置按 sessionId/mtime 搜索。
+ */
+
+/** 从工程路径推 CodeBuddy CLI projects 下的 slug。
+ *  ~/.codebuddy/projects/home-yinghui-work-WorkGremlin/<sessionId>.jsonl */
+function slugForWs(ws) {
+  const s = String(ws || '').trim();
+  if (!s) return '';
+  return s.replace(/^\/+/, '').replace(/[^a-zA-Z0-9_-]/g, '-').replace(/-+/g, '-').replace(/\/+$/, '');
+}
+
+/** 给定 sessionId + workspacePath，按优先级搜三处 CodeBuddy transcript 落盘。
+ *  返回第一个存在的文件绝对路径；都没有返回空串。 */
+function inferCodebuddyTranscript(sessionId, workspacePath) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return '';
+  const wsSlug = slugForWs(workspacePath);
+
+  // 1. CLI projects jsonl —— ~/.codebuddy/projects/<ws-slug>/<sessionId>.jsonl
+  if (wsSlug) {
+    const p = path.join(HOME, '.codebuddy', 'projects', wsSlug, `${sid}.jsonl`);
+    if (fs.existsSync(p)) return p;
+  }
+
+  // 2. Plugin index.json —— ~/.local/share/CodeBuddyExtension/Data/**/history/<sessionId>/*/index.json
+  //    history 目录名 == sessionId（见 ~/.local/share/CodeBuddyExtension/Data/<uuid>/VSCode/<uuid>/history/）
+  const pluginRoot = path.join(HOME, '.local', 'share', 'CodeBuddyExtension');
+  if (fs.existsSync(pluginRoot)) {
+    // 找 history/<sessionId> 这个目录，再取它下面任意一个子目录的 index.json
+    const dataDir = path.join(pluginRoot, 'Data');
+    if (fs.existsSync(dataDir)) {
+      for (const entry of fs.readdirSync(dataDir)) {
+        const cand = path.join(dataDir, entry);
+        if (!fs.statSync(cand).isDirectory()) continue;
+        // 递归找 history/<sessionId> 目录
+        const hit = findPluginHistoryIndex(cand, sid);
+        if (hit) return hit;
+      }
+    }
+  }
+
+  // 3. CLI trace jsonl (OTel) —— ~/.codebuddy/traces/*/trace_*.jsonl
+  //    trace 文件名里**不含 sessionId**，只能取 mtime 最近的那一个。
+  //    这位置最不可靠（可能匹配到别的 session），放最后。
+  const tracesDir = path.join(HOME, '.codebuddy', 'traces');
+  if (fs.existsSync(tracesDir)) {
+    let best = '';
+    let bestMtime = 0;
+    for (const sub of fs.readdirSync(tracesDir)) {
+      const subDir = path.join(tracesDir, sub);
+      try { if (!fs.statSync(subDir).isDirectory()) continue; } catch { continue; }
+      for (const f of fs.readdirSync(subDir)) {
+        if (!/^trace_.*\.jsonl$/i.test(f)) continue;
+        const full = path.join(subDir, f);
+        try {
+          const st = fs.statSync(full);
+          if (st.mtimeMs > bestMtime) { bestMtime = st.mtimeMs; best = full; }
+        } catch { /* ignore */ }
+      }
+    }
+    if (best) return best;
+  }
+
+  return '';
+}
+
+/** 在 CodeBuddy Plugin Data 下递归搜 history/<sessionId>，找到就返回子目录的 index.json 路径 */
+function findPluginHistoryIndex(root, sessionId) {
+  // 先看直接 history 目录
+  const historyDir = path.join(root, 'history');
+  if (fs.existsSync(historyDir)) {
+    const sessionDir = path.join(historyDir, sessionId);
+    if (fs.existsSync(sessionDir) && fs.statSync(sessionDir).isDirectory()) {
+      // 取 session 目录下的 index.json（session 目录可能有多轮，每轮一个子目录）
+      for (const sub of fs.readdirSync(sessionDir)) {
+        const idx = path.join(sessionDir, sub, 'index.json');
+        if (fs.existsSync(idx)) return idx;
+      }
+    }
+  }
+  // 递归下一级（VSCode/<uuid> 层）
+  let found = '';
+  try {
+    for (const e of fs.readdirSync(root)) {
+      const p = path.join(root, e);
+      let st; try { st = fs.statSync(p); } catch { continue; }
+      if (st.isDirectory()) {
+        found = findPluginHistoryIndex(p, sessionId);
+        if (found) return found;
+      }
+    }
+  } catch { /* ignore permission */ }
+  return found;
+}
+
+/* ============================== CodeBuddy trace jsonl (OTel) token 解析 ==============================
+ *
+ * CLI 新形态 trace jsonl 不是普通的 JSONL message 流，是 OpenTelemetry span 格式：
+ *   {"type":"span_end","span":{"type":"generation","startedAt":"ISO","toolOutput":"[{\"usage\":{...}}]"}}
+ * usage 在 toolOutput 字符串里，被 JSON 再包一层数组；usage 格式与 OpenAI 一致（prompt_tokens /
+ * completion_tokens / prompt_tokens_details.cached_tokens）。
+ */
+function codebuddyTraceTokens(tracePath, startedAt) {
+  const file = String(tracePath || '');
+  if (!file || !(Number(startedAt) > 0)) return null;
+  let rows;
+  try { rows = fs.readFileSync(file, 'utf8').split('\n').map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  catch { return null; }
+  if (!rows.length) return null;
+  let acc = null;
+  for (const o of rows) {
+    if (o.type !== 'span_end') continue;
+    const span = o.span;
+    if (!span || span.type !== 'generation') continue;
+    const ts = Date.parse(span.startedAt);
+    if (!ts || ts < startedAt) continue;
+    let toolOut; try { toolOut = JSON.parse(span.toolOutput); } catch { continue; }
+    const first = Array.isArray(toolOut) ? toolOut[0] : toolOut;
+    const u = first && first.usage;
+    if (!u) continue;
+    const part = normOpenAI({
+      prompt_tokens: u.prompt_tokens,
+      prompt_cache_hit_tokens: u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens,
+      prompt_cache_write_tokens: u.prompt_cache_write_tokens,
+      completion_tokens: u.completion_tokens,
+    });
+    if (!acc) acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    acc.input += part.input;
+    acc.output += part.output;
+    acc.cacheRead += part.cacheRead;
+    acc.cacheWrite += part.cacheWrite;
+  }
+  return tokenFinish(acc);
+}
+
+/* ============================== CodeBuddy 三路 token 读取 ==============================
+ *
+ * 框架层 readTokensOf 默认实现只认"标准 JSONL 格式"（Codex rollout / Claude transcript）。
+ * CodeBuddy 有三种格式，按文件后缀分支：
+ *   · index.json → codebuddyRequestTokens（Plugin 落盘）
+ *   · trace_*.jsonl → codebuddyTraceTokens（CLI OTel trace 形态）
+ *   · 其余 jsonl → readTokens（projects 目录下老形态，走 requestSum 解析）
+ *
+ * 另外 CodeBuddy Plugin 的 index.json **比 Stop hook 事件晚 ~30-50ms 才落盘**，
+ * 所以这里带一个"等落盘"的重试环（原 hookCommon.readTokensSettled 的职责）。
+ */
+async function codebuddyReadTokensOf(transcriptPath, startedAt) {
+  const file = String(transcriptPath || '');
+  if (!file || !(Number(startedAt) > 0)) return null;
+  const t = codebuddyTryRead(file, startedAt);
+  if (t) return t;
+  // 只有 index.json 需要等落盘；其余 jsonl 格式 Stop 时刻之前已经写完了
+  if (!/index\.json$/i.test(file)) return null;
+  for (let waited = 0; waited < CB_FLUSH_WAIT_MS; waited += CB_FLUSH_STEP_MS) {
+    await new Promise((r) => setTimeout(r, CB_FLUSH_STEP_MS));
+    const t2 = codebuddyTryRead(file, startedAt);
+    if (t2) return t2;
+  }
+  return null;
+}
+
+/** 同步版的三路分发（codebuddyReadTokensOf 内部也调它做首次尝试 + 重试） */
+function codebuddyTryRead(file, startedAt) {
+  if (/index\.json$/i.test(file)) return tokenFinish(codebuddyRequestTokens(file, Number(startedAt)));
+  if (/trace_.*\.jsonl$/i.test(file)) return codebuddyTraceTokens(file, Number(startedAt));
+  return readTokens(file, Number(startedAt));
+}
+
+/* ============================== CodeBuddy sessionId 推断 ==============================
+ *
+ * CodeBuddy CLI / Plugin 的 hook 事件里没有 session_id 字段（events.log 实锤全是 None）。
+ * 需要服务端自己从 transcript 文件推 —— transcript 文件名/目录名就是 sessionId。
+ *
+ * 反向推导（没有 sessionId 时）：
+ *   1. CLI projects 目录（最可靠）：~/.codebuddy/projects/<ws-slug>/<sid>.jsonl
+ *      取 mtime 最新的 .jsonl => basename
+ *   2. Plugin history 目录:
+ *      ~/.local/share/CodeBuddyExtension/Data/<uuid>/<ver>/history/<sid>/
+ *      取 mtime 最新的 history/<sid> 目录 => sid
+ *
+ * 并发安全：用模块级 Map 缓存 workspacePath -> 最近 sessionId。
+ * SessionStart 事件更新缓存，后续事件直接复用，避免并发误匹配。
+ */
+
+/** ws-slug 缓存（diskKey 比较贵，只算一次） */
+const _wsSlugCache = new Map();
+function slugForWs(workspacePath) {
+  const ws = String(workspacePath || '').trim();
+  if (!ws) return '';
+  const hit = _wsSlugCache.get(ws);
+  if (hit != null) return hit;
+  const s = (typeof diskKey === 'function' ? diskKey(ws) : '') || '';
+  _wsSlugCache.set(ws, s);
+  return s;
+}
+
+/** 活跃会话缓存：workspacePath → sessionId（最近一次 SessionStart 推出来的） */
+const _activeSessionCache = new Map();
+
+/** 从 workspacePath 推 CodeBuddy 当前活跃会话的 sessionId */
+function inferCodebuddySessionId(workspacePath) {
+  const ws = String(workspacePath || '').trim();
+
+  // 0. 缓存命中（同 workspace 下 SessionStart 已推过）
+  if (ws && _activeSessionCache.has(ws)) {
+    const cached = _activeSessionCache.get(ws);
+    if (cached) return cached;
+  }
+
+  const wsSlug = slugForWs(ws);
+
+  // 1. CLI projects —— 最可靠：文件名就是 sessionId
+  if (wsSlug) {
+    const dir = path.join(HOME, '.codebuddy', 'projects', wsSlug);
+    if (fs.existsSync(dir)) {
+      let best = '';
+      let bestMtime = 0;
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith('.jsonl') || f.startsWith('.')) continue;
+        const full = path.join(dir, f);
+        try {
+          const st = fs.statSync(full);
+          if (st.mtimeMs > bestMtime) {
+            bestMtime = st.mtimeMs;
+            best = f.replace(/\.jsonl$/i, '');
+          }
+        } catch { /* ignore */ }
+      }
+      if (best) {
+        if (ws) _activeSessionCache.set(ws, best);
+        return best;
+      }
+    }
+  }
+
+  // 2. Plugin history —— 目录名就是 sessionId
+  const pluginRoot = path.join(HOME, '.local', 'share', 'CodeBuddyExtension', 'Data');
+  if (fs.existsSync(pluginRoot)) {
+    let best = '';
+    let bestMtime = 0;
+    for (const entry of fs.readdirSync(pluginRoot)) {
+      const cand = path.join(pluginRoot, entry);
+      try { if (!fs.statSync(cand).isDirectory()) continue; } catch { continue; }
+      // 找 history/<uuid>/ 目录
+      for (const sub of fs.readdirSync(cand)) {
+        const historyDir = path.join(cand, sub, 'history');
+        if (!fs.existsSync(historyDir)) continue;
+        try {
+          if (!fs.statSync(historyDir).isDirectory()) continue;
+          for (const histEntry of fs.readdirSync(historyDir)) {
+            const histFull = path.join(historyDir, histEntry);
+            try {
+              const st = fs.statSync(histFull);
+              if (!st.isDirectory()) continue;
+              if (st.mtimeMs > bestMtime) {
+                bestMtime = st.mtimeMs;
+                best = histEntry; // 目录名 = sessionId
+              }
+            } catch { /* ignore */ }
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    if (best) {
+      if (ws) _activeSessionCache.set(ws, best);
+      return best;
+    }
+  }
+
+  return '';
+}
+
+/** CodeBuddy CLI 的 transcriptPathOf 覆盖：事件 payload > 状态缓存 > 三处候选位置推导 */
+function codebuddyTranscriptPathOf(ev, st, sessionId, workspacePath) {
+  if (ev && ev.transcript_path) return String(ev.transcript_path);
+  if (st && st.transcriptPath) return String(st.transcriptPath);
+  return inferCodebuddyTranscript(sessionId, workspacePath);
+}
 
 /** CodeBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent。
- * 只覆盖与公有默认不同的接口；其余（coarse/hasPermissionEvent/formOf）回退 sharedHookImpl。
- * hasSubagentStart 必须显式置 true：CodeBuddy 插件发 SubagentStart/SubagentStop（带 agent_type），
- * 经 PostToolUse 的 pendingSpawn 桥接认领，不能回退成 sharedHookImpl 的 false（那会跳过整个 SubagentStart 分支）。 */
+ * 只覆盖与公有默认不同的接口；其余回退 sharedHookImpl。 */
 const codebuddyImpl = {
   ...sharedHookImpl,
-  hasSubagentStart: true, // CodeBuddy 发 SubagentStart / SubagentStop（带 agent_type）
+  // hasSubagentStart 必须回退 sharedHookImpl 的 false：CodeBuddy 发 0 次 SubagentStart（events.log 实锤），
+  // 只有 SubagentStop。PreToolUse 等 pendingSpawn 认领永远等不到 → addGhost 永远被跳过。
+  // 走 !hasSubagentStart 分支：PreToolUse(Task/Agent) 直接 addGhost，PostToolUse / SubagentStop 各自 finishGhostServer。
+  // 重构 commit 9d0a11c 本来就是 false，后来 07dec75 误改成 true（注释编造了"插件发 SubagentStart"）——这是回归。
   awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
-  repliesOf: (tp) => (/index\.json$/i.test(tp) ? codebuddyReplies(tp) : jsonlReplies(tp)),
+  repliesOf: (tp) => (/index\.json$/i.test(tp) ? indexJsonReplies(tp) : jsonlReplies(tp)),
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  // 新增接口覆盖：transcript 路径推导 + 三路 token 解析
+  transcriptPathOf: codebuddyTranscriptPathOf,
+  readTokensOf: codebuddyReadTokensOf,
 };
 
 async function handleHookEvent(ev, ctx) {
+  // CodeBuddy CLI/Plugin hook 事件里没有 session_id —— 从 transcript 文件推
+  if (!String((ev && ev.session_id) || '').trim()) {
+    const ws = String((ctx && ctx.workspacePath) || (ev && ev.cwd) || '').trim();
+    const sid = inferCodebuddySessionId(ws);
+    if (sid) ev.session_id = sid;
+  }
   return runHookEvent(ev, ctx, codebuddyImpl);
 }
 
