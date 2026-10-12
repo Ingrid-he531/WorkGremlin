@@ -332,6 +332,76 @@ function isPluginClient(form) {
 }
 
 /**
+ * form → source 派生：三种形态统一口径。
+ *   isPluginClient(form) → 'plugin'（vscode 等 IDE 扩展）
+ *   form === 'ide'        → 'ide'（独立 IDE 产品，如 TraeCode IDE）
+ *   form === 'cli'        → 'cli'
+ *   其它（空 / 未知）     → 'cli'（兜底：分不出形态就当 CLI）
+ *
+ * 前端和后端都用这个函数，保证 form→source 映射只有一份。
+ * @param {string} form 形态
+ * @returns {'plugin'|'cli'|'ide'}
+ */
+function formToSource(form) {
+  const f = String(form || '').toLowerCase();
+  if (isPluginClient(f)) return 'plugin';
+  if (f === 'ide') return 'ide';
+  return 'cli';
+}
+
+/**
+ * agent 基名 → 产品显示名表。前后端共用一份(见 clientLabel)。
+ * 追加新楼层时在这里注册,不要散落到各调用点。
+ */
+const AGENT_LABELS = {
+  codebuddy: 'CodeBuddy',
+  workbuddy: 'WorkBuddy',
+  codex: 'Codex',
+  claude: 'Claude Code',
+  trae: 'TraeCode',
+  kilo: 'Kilo Code',
+  qoder: 'Qoder',
+  opencode: 'OpenCode',
+  copilot: 'GitHub Copilot',
+};
+
+/**
+ * 身份 → agent 基名：剥掉 -plugin 后缀与 @<工程/实例> 后缀。
+ * 前后端共用(前端原 clientMatch.agentBase,后端 query.js 里 task-runs 的 client/member_id 都过这层)。
+ * @param {string} id memberId / name / client
+ */
+function agentBase(id) {
+  return String(id || '')
+    .replace(/-plugin$/i, '')
+    .split('@')[0]
+    .toLowerCase();
+}
+
+/**
+ * 由 agent + 形态得到最终显示名。前后端共用唯一源头,API 直接返回算好的字符串,
+ * 前端不再自己按 form 拼。
+ *
+ * 规则：
+ *   isPluginClient(form)      → `${base} Plugin`
+ *   form === 'cli'             → `${base} CLI`(base 已含 CLI/IDE 则不追加)
+ *   form === 'ide'             → `${base} IDE`(同上)
+ *   其它(空 / form 本身带形态) → base 基名
+ *
+ * @param {string} agent 楼层身份(client / memberId 等)
+ * @param {string} form  形态(vscode / cli / ide / '')
+ * @returns {string} 显示名,如 "TraeCode IDE" / "CodeBuddy Plugin" / "Kilo Code CLI" / "Codex"
+ */
+function clientLabel(agent, form) {
+  const a = agentBase(agent);
+  const base = AGENT_LABELS[a] || a || '—';
+  const f = String(form || '').toLowerCase();
+  if (isPluginClient(f)) return `${base} Plugin`;
+  if (f === 'cli' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} CLI`;
+  if (f === 'ide' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} IDE`;
+  return base;
+}
+
+/**
  * 由 agent 基名 + 形态就地拼出磁盘落盘键（<agent>[-plugin]）。
  * 仅内部落盘 / reporter 相位使用；数据模型与身份里不再出现合成字符串。
  * @param {string} agent 楼层基名
@@ -376,6 +446,10 @@ module.exports = {
   formatDuration,
   formatClock,
   isPluginClient,
+  formToSource,
+  clientLabel,
+  agentBase,
+  AGENT_LABELS,
   diskKey,
   home,
 };

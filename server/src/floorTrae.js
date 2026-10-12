@@ -805,6 +805,27 @@ function phaseSuperseded(j, sp, slack = 1_000) {
   return !!at && at + slack >= Number(sp.ts || 0);
 }
 
+/* ───────────── hook 事件处理（重构后补上） ─────────────
+ * Trae IDE 的 hook 事件 payload 没有 client 字段,只有 agent:'trae'。
+ * runHookEvent 里 client = agent 基名(trae)刚好能用;
+ * form 由事件自报 client 判定(fixedFormOf)时拿不到 → fallback impl.formOf,
+ * 这里返回 'IDE':不是 VS Code 插件扩展(isPluginClient 只认 'vscode'),
+ * 也不是 CLI('cli'),是独立的 IDE 产品形态。clientLabel 三个分支都不命中,
+ * 只返回基名 "TraeCode"——与任务列表里显示的一致。
+ * 没有 CodeBuddy 那种 subagent/权限/transcript 特化,impl 就只覆盖 formOf。 */
+const { runHookEvent, sharedHookImpl } = require('./ingest/hookCommon');
+
+const traeImpl = {
+  ...sharedHookImpl,
+  // Trae IDE 是独立产品形态:不是 VS Code 插件(isPluginClient 只认 vscode),
+  // 也不是 CLI('cli'),返回 'IDE' 让 clientLabel 返回基名 "TraeCode"(三个分支都不命中)
+  formOf: () => 'IDE',
+};
+
+async function handleHookEvent(ev, ctx) {
+  return runHookEvent(ev, ctx, traeImpl);
+}
+
 module.exports = {
   // 5F TraeCode
   id: '5F',
@@ -829,6 +850,8 @@ module.exports = {
   phaseSuperseded,
   // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Trae 专属逻辑）
   synthMarks,
+  // hook 事件处理（落盘 reporter 状态文件 → 会话表 → 主控制台相位）
+  handleHookEvent,
 };
 
 /**

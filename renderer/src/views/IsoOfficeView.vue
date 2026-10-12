@@ -220,6 +220,21 @@ function sameWorkspace(a, b) {
 }
 
 /**
+ * 选中会话本身是否"正在跑"（服务端统一合成的 taskState：reporter 完成标记优先、否则看台账活着的
+ * running 任务，见 server/src/sessionRegistry.js 的 taskStateOf）。门楣滚动屏与主控制台读的是**同一个**
+ * 字段，所以两者不会再不一致。
+ *
+ * 这是主控制台"无新 hook 事件时该显示什么"的关键判据：重启应用、或长时间没有新 hook 事件，
+ * 但只要这条会话的任务确实还在跑（taskState === 'running'），主控制台就该显示「思考中」而不是
+ * 「待命」——人明明还在这轮任务里。一旦任务结束（reporter 落了 doneAt），taskState 变 cancelled/done，
+ * 主控制台就回落任务取消 / 待命，绝不会卡在「思考中」。
+ */
+const floorTaskActive = computed(() => {
+  const sel = sessions.selected;
+  return Boolean(sel && sel.taskState === 'running');
+});
+
+/**
  * 主控制台严格跟随下拉选中的会话：显示"这条会话自己"的相位
  * （它自己工程 reporter 上报的真值，或落盘推断值），绝不拿别的工程的实时相位冒充。
  * 这样多个工程同时开着时，下拉切到哪条就显示哪条，与所选会话一一对应。
@@ -247,10 +262,11 @@ const consoleBase = computed(() => {
   // 的相对路径），子串匹配既可能漏判也可能误判。现在两边都有真会话 id 就直接相等判定。
   // 任何一边拿不到会话 id（Codex 的 rollout 文件名不含 session_id、老状态文件）→ 宽松放行，维持老行为。
   const sameSession = Boolean(fp) && (!fp.sessionId || !selSessionId || fp.sessionId === selSessionId);
-  // `fresh` 只有插件那一路的会话会设（= 全局唯一"正在敲"的那条）。CLI 楼层（1F/2F/3F/4F）没这个标记，
-  // 但同样有 hook 上报的相位 —— 只要"相位所属工程 == 这条会话的工程"就该用它；
-  // 否则 3F 永远只能显示会话表里"按 jsonl 文件时间猜"的兜底：一直「调用工具」+ 文案是那个 rollout 文件名。
-  const canUseFast = Boolean(sel.fresh) || (sel.source === 'cli' && Boolean(sel.projectPath));
+  // hook 来源的三种形态(plugin/cli/ide)都该放行快轮询相位,不再把 cli/ide 硬编码成两分支。
+  // plugin 有 fresh 标记(handlePlugin 设的),cli/ide 是 hook 落盘那两路(handleCliHook),
+  // 共同点都是"接了 reporter hook,实时相位来自 /reporter-phase 快轮询"。
+  const isHookSource = Boolean(sel.fresh) || ['cli', 'ide', 'plugin'].includes(sel.source);
+  const canUseFast = isHookSource && Boolean(sel.projectPath);
   if (canUseFast && sameWs && sameSession && fp.phase) {
     if (fp.phase === 'await') {
       return { phase: 'await', action: fp.action || t('console.await_action'), context: fp.context && fp.context.length ? fp.context : [t('console.await_hint')], target: fp.target || null, prompt: fp.prompt || '' };
@@ -268,16 +284,33 @@ const consoleBase = computed(() => {
       return { phase: 'thinking', action: fp.action || p, context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, prompt: p };
     }
   }
-  // 接了我们 hook 的 CLI 工程：当前没有相位 = 这一路现在真的没事干 → 待命。
-  // 不能退回会话表里那个"按文件 mtime 猜"的结果（它会在 5 分钟窗口内一直说「调用工具」）。
-  if (sel.source === 'cli' && sameWs && sameSession && fp.instrumented) {
+  // 接了 hook 的工程(plugin/cli/ide):当前没有相位 = 这一路现在确实没产生新事件。
+  if (isHookSource && sameWs && sameSession && fp.instrumented) {
+    if (floorTaskActive.value) {
+      return { phase: 'thinking', action: '', context: [], target: null, tool: '', prompt: '' };
+    }
     return { phase: 'idle', action: '', context: [], target: null, tool: '', prompt: '' };
   }
   // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
   // 下拉切到旧工程会话就显示旧会话自己的状态，不再被新工程的实时相位覆盖。
   const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
+  const phase = sel.phase || 'idle';
+  // 会话自身是 idle / unreported（没有实时相位、推断也回落待命）：只要这一层确实还有 running 任务
+  // （门楣滚动屏同口径），就显示「思考中」——人还在这轮任务里，只是暂时没产生新事件；
+  // 没有任何活跃任务（已收工 / 空楼层）才回落「待命」。这是"重启应用后、长时间没新 hook 事件时
+  // 本层任务还在跑却一直显示待命"的修复（同一份 running 信号驱动门楣滚动屏与主控制台）。
+  if ((phase === 'idle' || phase === 'unreported') && floorTaskActive.value) {
+    return {
+      phase: 'thinking',
+      action: sel.action || '',
+      context: sel.context && sel.context.length ? sel.context : [],
+      target: sel.target || null,
+      tool: sel.tool || '',
+      prompt: sel.prompt || '',
+    };
+  }
   return {
-    phase: sel.phase || 'idle',
+    phase,
     action: sel.action || selPrompt,
     context: sel.context && sel.context.length ? sel.context : [],
     target: sel.target || null,
@@ -401,11 +434,13 @@ watch(
       return;
     }
     // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
+    // 这一轮明明还在跑（taskState==='running'，服务端按在飞任务判定，会盖过上一轮残留的 doneAt）：
+    // 不弹取消/完成摘要，避免新开一轮先闪一下"任务取消"。
     // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
     // 首次拿到标记：早于 trackSince（= 开始盯这条会话）的只记基线（上一轮的收工，不重播）；
     // 之后发生的不能当基线 —— 那是盯着的时候真实收到的 Stop，走下面正常判断弹摘要
     if (firstFastDone && doneAt < trackSince) lastDoneAt = doneAt;
-    if (doneAt && doneAt !== lastDoneAt) {
+    if (doneAt && doneAt !== lastDoneAt && !(sel && sel.taskState === 'running')) {
       lastDoneAt = doneAt;
       // 改动清单：优先用会话快照的 doneFiles（plugin/IDE 楼层这份，带 +/- 行数 + size），
       // 没有则退回 reporter 落盘的 done.files（CLI 这一路，只有 size）。插件 / IDE 的

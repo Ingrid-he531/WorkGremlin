@@ -3,7 +3,6 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
-import { clientLabel } from '../lib/clientMatch';
 import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM } from '../lib/dayBoard';
 import {
   TIME_RANGES,
@@ -441,7 +440,7 @@ function dimLabel(t, dim) {
   if (dim === 'floor') {
     const f = floorOfClient(t.memberId || t.client);
     if (f) return f.name;
-    return t.memberId || t.client ? clientLabel(t.memberId || t.client) : tr('records.unrecorded');
+    return t.client_label || tr('records.unrecorded');
   }
   return '';
 }
@@ -626,7 +625,7 @@ function exportCsv() {
       fmtTime(t.started_at),
       promptOf(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
       sessionTitleOf(t), // 会话：拿不到就是空串（表里显示 "—"，导出留空，不写占位）
-      clientLabel(t.client, t.form),
+      t.client_label,
       t.model || '',
       projectOf(t),
       // 词元导出的是**裸数字**（不带千位逗号，Excel 才好当数值算）；取不到留空，不写 0
@@ -757,7 +756,7 @@ function rowOfTask(t) {
   if (f) return { key: f.id, label: floorText(f), order: Number.parseInt(f.id, 10) || 900 };
   if (!(t.memberId || t.client)) return { key: '__none__', label: tr('records.no_floor'), order: 999 };
   // 有 client 但不在楼层表里（老数据 / 该产品没装）：如实标出是哪个 client，不硬塞进某层
-  return { key: String(t.memberId || t.client), label: clientLabel(t.memberId || t.client, t.form), order: 900 };
+  return { key: String(t.memberId || t.client), label: t.client_label, order: 900 };
 }
 
 /**
@@ -952,7 +951,7 @@ async function saveRetention() {
           <div class="row-title">{{ promptOf(t) || tr('records.untitled_task') }}</div>
           <div class="row-meta">
             <span v-if="t.state" class="st" :class="'st-' + t.state">{{ stateLabel(t.state) }}</span>
-            <span v-if="t.memberId || t.client">{{ clientLabel(t.memberId || t.client, t.form) }}</span>
+            <span v-if="t.memberId || t.client">{{ t.client_label }}</span>
             <span v-if="t.model">{{ t.model }}</span>
             <span>{{ fmtDuration(t.duration_ms) }}</span>
             <span v-if="t.file_count != null">{{ tr('records.n_files', { n: t.file_count }) }}</span>
@@ -988,7 +987,7 @@ async function saveRetention() {
                  本机库实测：489 条任务的 progress 只有 0（80 条）和 1（409 条）两种取值，
                  一个中间值都没有 —— 显示出来就是「0% / 100%」两个数跳，纯误导。
                  将来有了能按轮次推进的真实进度来源，再把这一行放回来（fmtProgress 一并复活）。 -->
-            <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(tasks.selectedTask.memberId || tasks.selectedTask.client, tasks.selectedTask.form) }}</div>
+            <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ tasks.selectedTask.client_label }}</div>
             <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- 工程：这一轮归属的工程名。服务端按工程**目录**现算（package.json name > 目录名，
                  与"打开工程"同一口径，见 /task-runs 的 project_label）；拿不到目录才退回库里的
@@ -1086,7 +1085,7 @@ async function saveRetention() {
                   <div class="kv">
                     <div class="k">{{ tr('records.detail.sub_name') }}</div><div class="v">{{ s.name }}</div>
                     <div class="k">{{ tr('records.detail.sub_task') }}</div><div class="v">{{ s.title || tr('records.sub_untitled') }}</div>
-                    <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ clientLabel(s.memberId || s.client) }}</div>
+                    <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ s.client_label }}</div>
                     <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ s.model || '—' }}</div>
                     <div class="k">{{ tr('records.detail.sub_start') }}</div><div class="v">{{ fmtTime(s.started_at) }}</div>
                     <div class="k">{{ tr('records.detail.sub_end') }}</div><div class="v">{{ fmtTime(s.ended_at) }}</div>
@@ -1192,7 +1191,7 @@ async function saveRetention() {
               <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
               <td class="td-dim td-task" :title="promptOf(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
               <td class="td-dim td-session" :title="sessionTitleOf(t) || ''">{{ sessionTitleOf(t) ? shortText(sessionTitleOf(t)) : '—' }}</td>
-              <td class="td-dim">{{ clientLabel(t.memberId || t.client, t.form) }}</td>
+              <td class="td-dim">{{ t.client_label }}</td>
               <td class="td-dim">{{ t.model || '—' }}</td>
               <td class="td-dim">{{ projectOf(t) }}</td>
               <td class="num" :title="tokenTitleOf(t)">{{ fmtTokens(totalTokensOf(t)) }}</td>

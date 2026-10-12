@@ -23,19 +23,13 @@
  * 无障碍：滚动的段码对读屏是噪音 → 屏幕本体 aria-hidden，另给一句 sr-only 的静态文本。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { httpBase } from '../api/bridge';
-import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
-import { floorAcceptsClient } from '../lib/clientMatch';
 import { colorsFor } from '../iso/officeMap';
 import { useI18n } from '../i18n';
 
 const { t } = useI18n();
-const project = useProjectStore();
 const sessions = useSessionStore();
 
-/** 轮询间隔：任务是低频事件（开工/收工），5s 足够，不必挂 WS */
-const POLL_MS = 5000;
 /**
  * 收工后还"看不看得见"的窗口（分钟）：服务端按这个窗口回"刚收工"的那几条，
  * 本组件据此挑出要播报的结束提示。播报只滚一遍（见 detectEnded：结束行滚出左边缘即删），
@@ -46,12 +40,6 @@ const END_KEEP_MIN = 5;
 const SPEED_PX_S = 70;
 /** 单条文本**不限制长度**：用户原话在任务记录里可能是长句，门楣照原样滚，不截断。
  *  轨道 white-space:nowrap + 屏 overflow:hidden，长文本只是滚得久一点，不会溢出。 */
-/** 降级路径（老服务端）一次取多少条台账：够覆盖"在跑的"，又不至于每 5s 拉一大包 */
-const FALLBACK_LIMIT = 60;
-
-/** 服务端回来的原始行 */
-const rows = ref([]);
-let timer = null;
 
 /** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
@@ -79,16 +67,16 @@ const sessionStart = Date.now();
  * 只在末尾追加状态字（绿=完成「（完成）」/ 红=取消·失败「（已取消）」），不再单独出一行"任务完成/取消"。
  * 整条只滚一遍即退场（见 pendingEnded → makeSeg 进段即清）。failed 归到取消的红色。
  */
-function endedText(r) {
-  const floor = floorOf(r.memberId || r.client);
-  const base = promptOf(r.title) || t('ticker.untitled');
-  const suffixKind = r.state === 'done' ? 'done' : 'cancelled';
+function endedText(s) {
+  const floor = floorName(s.floor);
+  const base = promptOf(s.doneTitle || s.prompt || '') || t('ticker.untitled');
+  const suffixKind = s.taskState === 'done' ? 'done' : 'cancelled';
   const suffix = suffixKind === 'done' ? t('ticker.doneSuffix') : t('ticker.cancelledSuffix');
   const taskLabel = t('ticker.taskLabel');
   const taskText = clip(base);
-  const time = hhmm(r.started_at);
+  const time = hhmm(s.doneAt);
   return {
-    id: `${r.id}:${r.state}`,
+    id: `${s.id}:${s.taskState}`,
     kind: 'running',
     time,
     floor,
@@ -108,106 +96,35 @@ function padN(it) {
   return n && len < n ? n - len : 0;
 }
 
-/** 从 rows 里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded —— 下次补段时
- *  跟着进那一段，**只滚一遍**。启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；
- *  announcedIds 防同一任务重复播报。 */
+/** 从所有工程的所有会话里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded ——
+ *  下次补段时跟着进那一段，**只滚一遍**。启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；
+ *  announcedIds 防同一任务重复播报。结束判据用服务端统一合成的 taskState（见 server 的 taskStateOf），
+ *  与门楣 / 主控制台同一个真相源，不再各算各的。 */
 function detectEnded() {
   let added = false;
-  const runningIds = new Set(
-    rows.value.filter((r) => r && r.state === 'running').map((r) => r.id)
-  );
-  for (const r of rows.value) {
-    if (!r || r.parent_task_id) continue;
-    if (project.projectId && r.project_id !== project.projectId) continue;
-    if (!['done', 'failed', 'cancelled'].includes(r.state)) continue;
-    if (Number(r.ended_at) < sessionStart) continue; // 不回放启动前已结束的
-    if (announcedIds.has(r.id)) continue;
-    announcedIds.add(r.id);
-    pendingEnded.value = pendingEnded.value.concat(endedText(r));
-    added = true;
-    // 调试日志：记录检测到的结束任务
-    if (typeof console !== 'undefined' && console.debug) {
-      console.debug('[TaskTicker] 检测到结束任务:', {
-        id: r.id,
-        state: r.state,
-        title: String(r.title || '').slice(0, 40),
-        endedAt: r.ended_at ? new Date(r.ended_at).toISOString() : null,
-      });
+  for (const s of sessions.sessions) {
+    if (s.floor && (s.taskState === 'done' || s.taskState === 'cancelled') && Number(s.doneAt) >= sessionStart) {
+      if (announcedIds.has(s.id)) continue;
+      announcedIds.add(s.id);
+      pendingEnded.value = pendingEnded.value.concat(endedText(s));
+      added = true;
+      if (typeof console !== 'undefined' && console.debug) {
+        console.debug('[TaskTicker] 检测到结束任务:', {
+          id: s.id,
+          taskState: s.taskState,
+          title: String(s.doneTitle || s.prompt || '').slice(0, 40),
+          doneAt: s.doneAt ? new Date(s.doneAt).toISOString() : null,
+        });
+      }
     }
   }
   // 屏上已经空了（之前没任务）却有东西要播：立刻补一段，别等下一轮轮询才动
   if (added && segs.value.length === 0) pushSeg();
-
-  // 清理：把不在 running 列表中的 announcedIds 移除，允许重新播报
-  // （以防任务状态从 running 变成 done/cancelled 时没有被正确检测）
-  for (const id of announcedIds) {
-    if (!runningIds.has(id) && !rows.value.some((r) => r && r.id === id)) {
-      announcedIds.delete(id);
-    }
-  }
 }
 
-async function getJson(path) {
-  const info = project.serverInfo || {};
-  const res = await fetch(`${httpBase(info)}${path}`, {
-    headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  return data && data.ok ? data : null;
-}
+/** 会话快照刷新（新开 / 收工 / 被顶掉 / 取消）就重新挑一遍结束行 */
+watch(() => sessions.sessions, () => detectEnded());
 
-/**
- * 降级路径里自己筛出"该滚的那几条"，口径与服务端 /task-feed 一致：
- * 在跑的（僵尸任务服务端已归一成 cancelled，这里照单全收）+ 最近 END_KEEP_MIN 分钟收工的。
- * 只要**当前工程**的顶层任务（子任务是 subagent，滚出来会跟父任务重复一行）。
- */
-function pickFeed(items) {
-  const pid = project.projectId;
-  const since = Date.now() - END_KEEP_MIN * 60_000;
-  const running = [];
-  const ended = [];
-  for (const r of items) {
-    if (!r || r.parent_task_id) continue;
-    if (pid && r.project_id !== pid) continue;
-    if (r.state === 'running') running.push(r);
-    else if (['done', 'failed', 'cancelled'].includes(r.state) && Number(r.ended_at) >= since) ended.push(r);
-  }
-  running.sort((a, b) => Number(a.started_at) - Number(b.started_at));
-  ended.sort((a, b) => Number(a.ended_at) - Number(b.ended_at));
-  return [...running, ...ended];
-}
-
-async function load() {
-  try {
-    const q = new URLSearchParams({ minutes: String(END_KEEP_MIN) });
-    // 只滚**当前工程**的任务：屋里站的是这个工程的人，别的工程的任务混进来是噪音
-    if (project.projectId) q.set('project', project.projectId);
-
-    const feed = await getJson(`/api/v1/task-feed?${q.toString()}`);
-    if (feed) {
-      rows.value = feed.items || [];
-      detectEnded();
-      return;
-    }
-    /**
-     * 降级：server 是**常驻进程**（launcher（desktop/src/launcher.js）管生命周期，重启客户端不会重启它），
-     * 所以"新版客户端 + 旧版服务端"是常见组合 —— 旧进程上没有 /task-feed（404），
-     * 这时退到台账接口 /task-runs 自己筛，别让屏上一句"暂无活跃任务"把真在跑的任务盖住
-     * （2026-10-08 实测：1F 那条任务在库里好好跑着，屏上却什么都没有）。
-     * 代价：/task-runs 按开工时刻倒序截断，一条跑了很久、又被几百条新任务挤到窗口外的
-     * 老任务可能漏掉 —— 这只是降级档，正式路径仍走 /task-feed。
-     */
-    const runs = await getJson(`/api/v1/task-runs?limit=${FALLBACK_LIMIT}`);
-    // 两条路都拿不到：留着上一份，下一轮再试（不把屏清空）
-    if (runs) {
-      rows.value = pickFeed(runs.items || []);
-      detectEnded();
-    }
-  } catch {
-    /* 拉不到就留着上一份，下一轮再试 */
-  }
-}
 
 /** HH:mm（屏上是段码手感，只要时与分；日期交给任务记录页） */
 function hhmm(ms) {
@@ -243,30 +160,33 @@ const clip = (s) => s;
 /**
  * client → 楼层号（1F / 3F …）。
  * 楼层归属以 sessions.floors 为准（与胶囊、轿厢同一份来源）；合并楼层（1F = CLI + Plugin）
- * 两种身份都要认。认不出（老任务没补 client）就写 '—'，不猜楼层。
+ * 楼层直接取服务端快照里的 floor id，名字再在 floors 里查（都是服务端给的，前端不重算）。
  */
-function floorOf(client) {
-  const c = String(client || '');
-  if (!c) return '—';
-  const f = (sessions.floors || []).find((x) =>
-    [x.client, ...(Array.isArray(x.clients) ? x.clients : [])].some((cc) => cc && floorAcceptsClient(cc, c.memberId || c.client))
-  );
-  return f ? f.id : '—';
+function floorName(id) {
+  const f = (sessions.floors || []).find((x) => x.id === id);
+  return (f && f.name) || id || '—';
 }
 
-/** 进行中的任务（running）：无限滚动循环的常驻内容 */
-const runningItems = computed(() =>
-  rows.value
-    .filter((r) => r && !r.parent_task_id && r.state === 'running' && (!project.projectId || r.project_id === project.projectId))
-    .sort((a, b) => Number(a.started_at) - Number(b.started_at))
-    .map((r) => {
-      const floor = floorOf(r.memberId || r.client);
-      const text = promptOf(r.title) || t('ticker.untitled');
+/** 进行中的任务（taskState === 'running'）：无限滚动循环的常驻内容。
+ *  与主控制台读的是**同一个**服务端合成字段（sessions.sessions[].taskState），所以两者一致。 */
+const runningItems = computed(() => {
+  // 楼层级判定会让同层多条活跃会话都带 taskState==='running'，按楼层去重，只留最近活跃的那条
+  // （即真正在跑的那条），避免滚动屏把历史会话也当在跑重复播。
+  const byFloor = new Map();
+  for (const s of sessions.sessions) {
+    if (s.taskState !== 'running') continue;
+    const prev = byFloor.get(s.floor);
+    if (!prev || Number(s.lastEventAt) > Number(prev.lastEventAt)) byFloor.set(s.floor, s);
+  }
+  return [...byFloor.values()]
+    .map((s) => {
+      const floor = floorName(s.floor);
+      const text = promptOf(s.prompt || s.action || '') || t('ticker.untitled');
       const taskLabel = t('ticker.taskLabel');
       const taskText = clip(text);
-      const time = hhmm(r.started_at);
+      const time = hhmm(s.lastEventAt);
       return {
-        id: r.id,
+        id: s.id,
         kind: 'running',
         time,
         floor,
@@ -274,9 +194,11 @@ const runningItems = computed(() =>
         taskText,
         floorColor: colorsFor(floor).wood,
         text: `${time} ${floor} ${taskLabel}${taskText}`,
+        startedAt: Number(s.lastEventAt) || 0,
       };
     })
-);
+    .sort((a, b) => a.startedAt - b.startedAt);
+});
 
 /**
  * 屏上摆静态居中那句话的条件：**轨道上一段都没有，且确实没东西可滚**（没有在跑的任务、
@@ -410,7 +332,8 @@ function tick(ts) {
 }
 
 onMounted(async () => {
-  await load();
+  // 任务流（unified taskState）随会话快照一起由 sessions store 拉取，这里只负责读它
+  detectEnded();
   await nextTick();
   measureSegs();
   if (typeof ResizeObserver !== 'undefined' && viewEl.value) {
@@ -428,13 +351,10 @@ onMounted(async () => {
     if (mq.addEventListener) mq.addEventListener('change', onChange);
     else if (mq.addListener) mq.addListener(onChange); // 老 Safari
   }
-  timer = setInterval(load, POLL_MS);
   raf = requestAnimationFrame(tick);
 });
 
 onBeforeUnmount(() => {
-  if (timer) clearInterval(timer);
-  timer = null;
   if (ro) ro.disconnect();
   ro = null;
   if (raf) cancelAnimationFrame(raf);

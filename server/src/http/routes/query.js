@@ -3,10 +3,19 @@
 /** 只读查询接口。WS 断线时前端降级轮询 /api/v1/snapshot 也会走这里。 */
 
 const express = require('express');
-const { DEFAULTS } = require('@workgremlin/shared');
+const { DEFAULTS, formToSource, clientLabel } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
 const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessions');
+
+/**
+ * 任务"还在跑"的宽限窗口（ms）：纯思考（模型在生成、还没调工具）期间 agent 不会发任何 hook
+ * 事件、也就没有心跳，心跳会在 10 分钟后过期把任务误判成取消 → 主控制台 / 滚动屏在长思考时
+ * 随机掉回「待命」。给"最后状态还是 active"的任务一个更长的宽限：只要最近一次 active 状态
+ * （state_since）不早于这个窗口，就仍然算在跑。长思考是连续的 thinking，state_since 不会太旧；
+ * 真死的进程（active 状态卡在很久以前）才会超出宽限被正常判死。
+ */
+const TASK_ALIVE_GRACE_MS = 30 * 60 * 1000;
 
 /**
  * 楼层筛选参数 → client 列表。
@@ -22,22 +31,26 @@ function clientFilter(raw) {
     .filter((s) => s && s !== 'all');
 }
 
-/** Prefer exact session activity; retain member-slot fallback for legacy and untracked rows. */
+/** Prefer exact session activity; retain member-slot fallback for legacy and untracked rows.
+ *  心跳窗口（@cutoff，10min）内还有 active 心跳 = 真在跑；但纯思考期间没有心跳会过期，
+ *  所以再给"最后状态仍是 active"的任务一个更长宽限：state_since 不早于 @grace_cutoff 仍算活。 */
 function taskAliveSql() {
   return `(
     EXISTS (
       SELECT 1 FROM session_status ss
        WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
-         AND ss.task_id = t.id AND ss.last_heartbeat_at > @cutoff
-         AND ss.state IN ('busy', 'thinking', 'blocked')
+         AND ss.task_id = t.id
+         AND (ss.last_heartbeat_at > @cutoff
+              OR (ss.state IN ('busy', 'thinking', 'blocked') AND ss.state_since > @grace_cutoff))
     ) OR (
       (tr.session_id IS NULL OR NOT EXISTS (
         SELECT 1 FROM session_status ss
          WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
       )) AND EXISTS (
         SELECT 1 FROM agent_status s
-         WHERE s.task_id = t.id AND s.last_heartbeat_at > @cutoff
-           AND s.state IN ('busy', 'thinking', 'blocked')
+         WHERE s.task_id = t.id
+           AND (s.last_heartbeat_at > @cutoff
+                OR (s.state IN ('busy', 'thinking', 'blocked') AND s.state_since > @grace_cutoff))
       )
     )
   )`;
@@ -150,12 +163,14 @@ function createQueryRouter({ bus, repo }) {
     // 一个楼层对应两种成员 client，选它要一次把两路都取回来（口径见 products.js 的 clients）。
     const clients = clientFilter(req.query.client);
     const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
-    // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑
+    // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑（纯思考无心跳时，
+    // 再靠 TASK_ALIVE_GRACE_MS 的 state_since 宽限兜底，见 taskAliveSql）
     const cutoff = Date.now() - 10 * 60 * 1000;
+    const graceCutoff = Date.now() - TASK_ALIVE_GRACE_MS;
     const ALIVE = taskAliveSql();
 
     const conds = ['t.parent_task_id IS NULL'];
-    const args = { limit, cutoff };
+    const args = { limit, cutoff, grace_cutoff: graceCutoff };
     if (project && project !== 'all') {
       conds.push('t.project_id = @project');
       args.project = project;
@@ -224,8 +239,12 @@ function createQueryRouter({ bus, repo }) {
 
     const items = rows.map((r) => ({
       ...r,
-      // 注册身份（agent 基名，如 codebuddy / kilo）—— 前端按它归楼层、显示「客户端」，
-      // 与落盘的 client/form（形态：vscode / cli）区分开。DB 列是 member_id，这里转 camelCase。
+      // 直接给最终显示字符串，前端不再自己按 form 拼
+      //   client_label → 任务详情/列表里「客户端」那行显示的字，如 "TraeCode IDE"
+      //   source       → 归一形态标识（plugin/cli/ide），前端会话下拉加前缀用
+      client_label: clientLabel(r.client || r.member_id, r.form),
+      source: formToSource(r.form),
+      // 注册身份（agent 基名，如 codebuddy / kilo）—— 前端按它归楼层
       memberId: r.member_id,
       duration_ms: r.ended_at && r.started_at ? r.ended_at - r.started_at : null,
       subagentCount: repo.countSubagentRuns.get(r.id).c,
@@ -269,14 +288,17 @@ function createQueryRouter({ bus, repo }) {
    *   · 排序：在跑的在前（按开工时刻升序），收工的在后（按收工时刻升序），
    *     前端拿到就直接按这个顺序依次滚动。
    *
-   * state 归一与 /task-runs 同一口径（遗留 running 任务按心跳判定，没心跳算 cancelled），
+   * state 归一与 /task-runs 同一口径（遗留 running 任务按心跳判定；纯思考无心跳时再靠
+   * TASK_ALIVE_GRACE_MS 的 state_since 宽限兜底，免得长思考时任务被误判成 cancelled），
    * 免得屏上滚出一条"永远在进行中"的僵尸任务。
    */
   router.get('/task-feed', (req, res) => {
     const minutes = Math.min(Math.max(Number(req.query.minutes) || 5, 1), 120);
     const since = Date.now() - minutes * 60_000;
-    // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑
+    // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑（纯思考无心跳时，
+    // 再靠 TASK_ALIVE_GRACE_MS 的 state_since 宽限兜底，见 taskAliveSql）
     const cutoff = Date.now() - 10 * 60_000;
+    const graceCutoff = Date.now() - TASK_ALIVE_GRACE_MS;
     const project = req.query.project;
 
     // 任务记录按 task_runs.session_id 查会话状态；agent_status 仅为老数据兜底。
@@ -286,7 +308,7 @@ function createQueryRouter({ bus, repo }) {
       't.parent_task_id IS NULL',
       `((t.state = 'running' AND ${ALIVE}) OR (t.state IN ('done', 'failed', 'cancelled') AND t.ended_at >= @since))`,
     ];
-    const args = { since, cutoff, limit: 100 };
+    const args = { since, cutoff, grace_cutoff: graceCutoff, limit: 100 };
     if (project && project !== 'all') {
       conds.push('t.project_id = @project');
       args.project = project;
@@ -316,7 +338,11 @@ function createQueryRouter({ bus, repo }) {
   router.get('/subagent-runs', (req, res) => {
     const parent = req.query.parent;
     if (!parent) return res.status(400).json({ ok: false, error: { code: 'bad_payload', message: 'missing parent' } });
-    const items = repo.listSubagentRuns.all(parent);
+    const items = repo.listSubagentRuns.all(parent).map((r) => ({
+      ...r,
+      // subagent_runs 表里没 form 字段,clientLabel 不传 form 时按基名返回
+      client_label: clientLabel(r.client || r.member_id, r.form),
+    }));
     return res.json({ ok: true, items });
   });
 

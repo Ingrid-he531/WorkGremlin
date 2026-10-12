@@ -811,6 +811,7 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
       byId.set(sessionId, {
         sessionId,
         workspacePath: String(sp.workspacePath || j.sessionWorkspacePath || j.taskWorkspacePath || ''),
+        form: String(j.form || ''),
         lastEventAt,
         endedAt,
         recordAt,

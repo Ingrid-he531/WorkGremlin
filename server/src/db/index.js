@@ -674,6 +674,40 @@ function createRepo(db) {
       WHERE r.project_id = ? AND r.session_id = ? AND t.state = 'running'
       ORDER BY r.started_at ASC
     `),
+
+    /**
+     * 某工程（projectId，传 0 表示不限工程）里所有"还在跑"的顶层任务，返回它们的 client。
+     * 门楣滚动屏 / 主控制台判定"本层有任务在跑"的**统一口径**，在 JS 端按 agent 基名（剥 -plugin /
+     * @工程 后缀）归层——和前端的 floorAcceptsClient 同口径，避免插件会话 client 是 codebuddy-plugin、
+     * 而 ledger 里 task_runs.client 是裸 codebuddy 这种"基名相同、字符串不同"的漏配。
+     *
+     * 判定"在跑" = tasks.state='running' 且（有心跳活着 OR 是近期新开的）。**关键**：1F CodeBuddy 这类
+     * 插件任务全程不写 session_status / agent_status 心跳（handlePlugin 注释已确认 task_runs 一直挂
+     * running），纯靠心跳的 ALIVE 判定会整条漏掉 → 滚动屏在跑时不显示、取消后才冒出来。所以除心跳外，
+     * 再加一条"started_at 在 @fresh 窗口内"的兜底——插件任务靠它认领；CLI / Codex 等有心跳的照旧走 ALIVE。
+     * @fresh 给得宽（默认 3h）只为挡住"进程早死、台账却永远 running"的僵尸，正常任务不会超。
+     */
+    activeRunningByProject: db.prepare(`
+      SELECT COALESCE(r.client, m.client) AS client FROM tasks t
+      LEFT JOIN task_runs r ON r.id = t.id
+      LEFT JOIN members m ON m.id = t.member_id
+      WHERE t.parent_task_id IS NULL AND t.state = 'running'
+        AND (@projectId = 0 OR t.project_id = @projectId)
+        AND (
+          t.started_at > @fresh
+          OR EXISTS (
+            SELECT 1 FROM session_status ss
+             WHERE ss.member_id = t.member_id AND ss.session_id = r.session_id AND ss.task_id = t.id
+               AND (ss.last_heartbeat_at > @cutoff
+                    OR (ss.state IN ('busy', 'thinking', 'blocked') AND ss.state_since > @grace))
+          ) OR EXISTS (
+            SELECT 1 FROM agent_status s
+             WHERE s.task_id = t.id
+               AND (s.last_heartbeat_at > @cutoff
+                    OR (s.state IN ('busy', 'thinking', 'blocked') AND s.state_since > @grace))
+          )
+        )
+    `),
     runAwaitingTokens: db.prepare(`
       SELECT id FROM task_runs
       WHERE project_id = ? AND session_id = ?

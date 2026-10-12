@@ -35,7 +35,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
 const { detectProducts } = require('./floors');
-const { floorOf, floors } = require('./floors');
+const { floorOf, floors, floorByAgent } = require('./floors');
+const { formToSource } = require('@workgremlin/shared');
 
 /**
  * agent 名 → 楼层 meta（只建一次）。各楼层的"会话文件落在哪棵子树 / 文件名怎么解出 sessionId"
@@ -643,6 +644,7 @@ function handleCliHook(p, src, ctx) {
           sessionId: s.sessionId,
           project: s.workspacePath ? resolveProjectName(s.workspacePath) || path.basename(s.workspacePath) : '',
           projectPath: s.workspacePath,
+          form: s.form || '',
           lastEventAt: s.lastEventAt,
         }));
   // 判据得是"这一路扫到了【还活着】的会话"，而不是"扫到了任何行"（与 prune / snapshot 同尺 TIMEOUT_MS）。
@@ -666,9 +668,11 @@ function handleCliHook(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId,
-      source: 'cli',
+      // source 按 form 派生:plugin/CLI/IDE 三种形态,空 form 当 CLI
+      source: formToSource(s.form),
       /** 这一行具体来自哪一路（cli / hook）：让"jsonl 优先"规则能撤掉旧的 hook 行 */
       sourceKind: src.kind,
+      form: s.form || '',
       project: s.project,
       projectPath: s.projectPath,
       mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
@@ -797,18 +801,107 @@ function flushSupersededTasks(doneScans) {
  * @returns {{ok: true, floors: Array, sessions: Array, defaultFloor: string,
  *            workspacePath: string, timeoutMs: number, updatedAt: number, reason?: string}}
  */
+/**
+ * 客户端身份归一化为 agent 基名：剥掉 -plugin 后缀与工程/实例后缀（形如 codebuddy@workgremlin 的 @ 后缀）、转小写。
+ * 与前端 floorAcceptsClient 的 agentBase 同口径——同一产品 CLI 与 Plugin 同层，靠基名认。
+ */
+function agentBase(id) {
+  return String(id || '')
+    .replace(/-plugin$/i, '')
+    .split('@')[0]
+    .toLowerCase();
+}
+
+// === DEBUG（确认问题后删除）===
+const DBG_LOG = path.join(__dirname, 'debug-taskstate.log');
+function dlog(...args) {
+  try {
+    fs.appendFileSync(DBG_LOG, `[${new Date().toISOString()}] ` + args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') + '\n');
+  } catch {}
+}
+
+/**
+ * 会话的「统一任务状态」—— 门楣滚动屏与主控制台判定"本层有没有任务在跑"的**唯一真相源**。
+ *   - 'running'：本工程里这一层（按 agent 基名归层）还有"活着"的在飞任务——主控制台据此显示「思考中」。
+ *     **优先于**上一轮残留的 doneAt：新开一轮时旧 doneAt 还在，若按 doneAt 先判会先闪一下"任务取消/完成"，
+ *     所以活着任务优先。归层用 agent 基名（剥 -plugin / @工程 后缀），与前端 floorAcceptsClient 同口径——
+ *     插件会话 client 是 codebuddy-plugin、ledger 里 task_runs.client 是裸 codebuddy，基名相同即算同层，
+ *     不再因字符串不同漏配（之前按精确 client 比对，整条漏掉插件在跑任务）。
+ *   - 'cancelled' / 'done'：reporter 在 Stop / 打断时落的完成标记（doneAt）是"已结束"最可靠信号
+ *     （CodeBuddy 插件按停止连 hook 都不发，task_runs 未必被翻成 cancelled，见 flushSynthesizedCancels
+ *     的注释），所以没在跑时才以 reporter 为准；
+ *   - null：这条会话既没在跑的任务、也没结束标记（纯空闲 / 化石数据）。
+ * 两条屏幕都读这个字段，就不会再一个显示任务取消、另一个还亮着思考中。
+ * @param {object} session 来自 table 的会话行（含 floor / client / projectPath / doneAt / doneCancelled）
+ * @param {object} repo db 句柄
+ * @param {(projectId:number)=>string[]} runningClientsFor 取某工程（0=不限）所有在飞任务的 client 列表
+ */
+function taskStateOf(session, repo, runningClientsFor) {
+  // 1) 先看本层（按**楼层**，不再依赖 session.client——注册表里的 session.client 常为空，
+  //    拿它去跟台账 client 比必然落空）有没有"活着"的在飞任务——**跨工程全量比对**：
+  //    门楣滚动屏是全楼层监控，不做工程隔离。优先于残留 doneAt，避免新开一轮先闪"任务取消/完成"。
+  //    把账台上所有在飞任务的 client 按 agent 基名归到楼层（floorByAgent），命中 session.floor 即算在跑。
+  if (repo && runningClientsFor) {
+    const runningFloors = new Set();
+    for (const c of runningClientsFor(0)) {
+      const f = floorByAgent[agentBase(c)];
+      if (f && f.id) runningFloors.add(f.id);
+    }
+    if (runningFloors.has(session.floor)) return 'running';
+    if (runningFloors.size) {
+      dlog('[taskStateOf] floor=', session.floor, 'runningFloors=', JSON.stringify([...runningFloors]), '=> matched=', runningFloors.has(session.floor));
+    }
+  }
+  // 2) 没有在跑 → reporter 完成标记（doneAt）才是"已结束"最可靠信号
+  if (session.doneAt) return session.doneCancelled ? 'cancelled' : 'done';
+  return null;
+}
+
 function snapshot({ workspacePath = '', force = false } = {}) {
+  dlog('[snapshot] begin; backend.repo=', !!(backend && backend.repo), 'hasQuery=', !!(backend && backend.repo && backend.repo.activeRunningByProject));
   refresh({ workspacePath, force });
   const now = Date.now();
 
   const products = detectProducts({});
+  // 某工程（0=不限工程）所有"活着"的在飞任务 client 列表，一次 snapshot 内按工程缓存，
+  // 避免每条会话各查一次。taskStateOf 拿到它后按 agent 基名归层，判定"本层有没有在跑的任务"。
+  const repo = backend && backend.repo;
+  const runningClientsCache = new Map();
+  const runningClientsFor = (projectId) => {
+    if (!runningClientsCache.has(projectId)) {
+      let rows = [];
+      if (repo && repo.activeRunningByProject) {
+        try {
+          rows =
+            repo.activeRunningByProject.all({
+              projectId,
+              fresh: Date.now() - 3 * 60 * 60 * 1000,
+              cutoff: Date.now() - 10 * 60 * 1000,
+              grace: Date.now() - 30 * 60 * 1000,
+            }) || [];
+        } catch (e) {
+          dlog('[runningClientsFor] query threw:', e && e.message);
+        }
+      } else {
+        dlog('[runningClientsFor] repo/activeRunningByProject missing; repo=', !!repo, 'hasQuery=', !!(repo && repo.activeRunningByProject));
+      }
+      runningClientsCache.set(projectId, rows.map((r) => r.client));
+      dlog('[runningClientsFor] projectId=', projectId, 'clients=', JSON.stringify(runningClientsCache.get(projectId)));
+    }
+    return runningClientsCache.get(projectId);
+  };
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)
       .sort((a, b) => {
         if (a.mine !== b.mine) return a.mine ? -1 : 1;
         return b.lastEventAt - a.lastEventAt;
-      });
+      })
+      // taskState —— 这条会话"有没有在跑的任务"的**唯一真相源**，门楣滚动屏与主控制台都读它，
+      // 不再各算各的。reporter 在 Stop / 打断时落的完成标记（doneAt）是"已结束"最可靠信号
+      // （CodeBuddy 插件按停止连 hook 都不发，task_runs 未必被翻成 cancelled，见 flushSynthesizedCancels
+      // 的注释），所以"已结束"以 reporter 为准；没结束才看台账里是否还有活着的 running 任务。
+      .map((s) => ({ ...s, taskState: taskStateOf(s, repo, runningClientsFor) }));
     return {
       id: p.id,
       name: p.name,

@@ -126,11 +126,19 @@ export const useSessionStore = defineStore('sessions', {
     options: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
       if (!f) return [];
-      return f.sessions.map((x) => ({
-        value: x.id,
-        label: [x.project || t('sessions.unknown_project'), shortId(x.id)].filter(Boolean).join(' '),
-        title: x.projectPath || x.project || x.id,
-      }));
+      return f.sessions.map((x) => {
+        // 来源标识:后端 source 已按 form 派生好(plugin/cli/ide),前端直接用
+        // plugin → Plugin-,cli → CLI-,ide → IDE-,空 → 无前缀
+        const src = String(x.source || '').toLowerCase();
+        const tag = src === 'plugin' ? 'Plugin' : src === 'cli' ? 'CLI' : src === 'ide' ? 'IDE' : '';
+        const proj = x.project || t('sessions.unknown_project');
+        const body = tag ? `${tag}-${proj}` : proj;
+        return {
+          value: x.id,
+          label: [body, shortId(x.id)].filter(Boolean).join(' '),
+          title: x.projectPath || x.project || x.id,
+        };
+      });
     },
 
     total: (s) => s.sessions.length,

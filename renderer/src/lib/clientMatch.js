@@ -1,4 +1,4 @@
-import { isPluginClient } from '@workgremlin/shared';
+import { agentBase, AGENT_LABELS } from '@workgremlin/shared';
 
 /**
  * 客户端身份归一化（前端共用）。
@@ -6,20 +6,10 @@ import { isPluginClient } from '@workgremlin/shared';
  * 新合同（与 hook 的 eventClient 一致）：**agent 直接代表楼层**，client 只描述形态
  * （vscode / cli …）。isPluginClient(client) 判定 plugin 形态（vscode 系 IDE）。
  * 因此楼层与成员都按 agent 基名匹配与显示，不再用 `agent + '-plugin'` 这种合成字符串当身份。
+ *
+ * 显示名 / clientLabel 已搬到 shared/index.js 并由后端 API 直接返回（client_label 字段），
+ * 前端不再自己按 form 拼 —— 本文件只保留楼层匹配逻辑。
  */
-
-/**
- * 身份 → agent 基名：剥掉 -plugin 后缀与 @<工程/实例> 后缀。
- * 同一产品 CLI / Plugin 同层，而成员 id 常带工程后缀（如 codebuddy@workgremlin、
- * kilo@<projectId>），显示与归层都按基名认，所以这里统一收口。
- * @param {string} id memberId / name / floor.agent / floor.client
- */
-function agentBase(id) {
-  return String(id || '')
-    .replace(/-plugin$/i, '')
-    .split('@')[0]
-    .toLowerCase();
-}
 
 /**
  * 某楼层（floorAgent）是否接纳某成员（memberAgent）。
@@ -48,37 +38,5 @@ export function floorAcceptsClient(floorAgent, memberAgent) {
  * @param {string} id memberId / name
  */
 export function isBaseAgent(id) {
-  return Boolean(BASE_LABELS[agentBase(id)]);
-}
-
-/**
- * agent → 显示名（楼层 / 产品基名）。
- */
-const BASE_LABELS = {
-  codebuddy: 'CodeBuddy',
-  workbuddy: 'WorkBuddy',
-  codex: 'Codex',
-  claude: 'Claude Code',
-  trae: 'TraeCode',
-  kilo: 'Kilo Code',
-  qoder: 'Qoder',
-  opencode: 'OpenCode',
-  copilot: 'GitHub Copilot',
-};
-
-/**
- * 由 agent + 形态得到显示名。
- * 形态 plugin（vscode 系 IDE）标注为 "… Plugin"；CLI 标注为 "… CLI"。
- * 标签里已经带形态的（TraeCode IDE）不重复追加。
- *
- * @param {string} agent 楼层基名（kilo / codebuddy …，可带 -plugin 或 @工程 后缀）
- * @param {string} form 形态（vscode / cli / ''）
- */
-export function clientLabel(agent, form) {
-  const a = agentBase(agent);
-  const base = BASE_LABELS[a] || a || '—';
-  const f = String(form || '').toLowerCase();
-  if (isPluginClient(f)) return `${base} Plugin`;
-  if (f === 'cli' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} CLI`;
-  return base;
+  return Boolean(AGENT_LABELS[agentBase(id)]);
 }

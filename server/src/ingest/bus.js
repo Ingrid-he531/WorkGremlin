@@ -49,7 +49,8 @@ function normClient(v) {
  */
 function normForm(v) {
   const s = String(v || '').trim().toLowerCase();
-  return s === 'cli' || isPluginClient(s) ? s : null;
+  if (s === 'cli' || s === 'ide' || isPluginClient(s)) return s;
+  return null;
 }
 
 /** 模型名：拿不到就是 NULL（绝不猜），超长截断 */
