@@ -806,23 +806,78 @@ function phaseSuperseded(j, sp, slack = 1_000) {
 }
 
 /* ───────────── hook 事件处理（重构后补上） ─────────────
- * Trae IDE 的 hook 事件 payload 没有 client 字段,只有 agent:'trae'。
- * runHookEvent 里 client = agent 基名(trae)刚好能用;
- * form 由事件自报 client 判定(fixedFormOf)时拿不到 → fallback impl.formOf,
- * 这里返回 'IDE':不是 VS Code 插件扩展(isPluginClient 只认 'vscode'),
- * 也不是 CLI('cli'),是独立的 IDE 产品形态。clientLabel 三个分支都不命中,
- * 只返回基名 "TraeCode"——与任务列表里显示的一致。
- * 没有 CodeBuddy 那种 subagent/权限/transcript 特化,impl 就只覆盖 formOf。 */
+ * Trae IDE 的 hook 事件 payload 没有 session_id 字段,
+ * runHookEvent 里 sessionId = String(ev.session_id || '') → 空串,
+ * sessionGet/sessionSet 的 guard (if(!id)return) 直接让整条实时状态链路空转:
+ *   Stop handler 里 get().taskId 永远 undefined → endTask 永远不调 → 任务永远 running。
+ *
+ * 修复方案:handleHookEvent 入口处从已落盘的 Trae hook 状态文件里补 session_id,
+ * 让 Trae 也走上 runHookEvent 的完整链路 (写内存 Map → Stop handler 能取到 taskId)。
+ *
+ * 同时覆盖 interruptedSince —— Trae 的取消信号在 renderer.log 里 (DoneHandler status:"canceled" /
+ * stop_button / NotificationPort),不在 transcript 里,用 traeCancelAt 扫 renderer.log。 */
 const { runHookEvent, sharedHookImpl } = require('./ingest/hookCommon');
+const { home } = require('@workgremlin/shared');
+
+function _hooksDir() { return path.join(home(), 'hooks'); }
+
+/**
+ * 从已有的 Trae hook 状态文件里补 sessionId。
+ * 同 workspacePath 匹配优先,找不到就退回最新的那份 (按 mtime)。
+ * @param {string} workspacePath
+ * @returns {string} sessionId (空串 = 找不到)
+ */
+function _inferSessionIdFromStateFile(workspacePath) {
+  const dir = _hooksDir();
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return ''; }
+
+  const files = names
+    .filter((n) => n.startsWith('trae') && n.endsWith('.json'))
+    .map((n) => ({ name: n, mtime: fs.statSync(path.join(dir, n)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+
+  if (!files.length) return '';
+
+  // 优先匹配 workspacePath 对应的文件 (文件名 sanitize 过, 也做 sanitize 后再比)
+  const wsPart = String(workspacePath || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (wsPart) {
+    for (const f of files) {
+      if (f.name.includes(wsPart)) {
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(dir, f.name), 'utf8'));
+          const sid = String(j.sessionId || '').trim();
+          if (sid) return sid;
+        } catch { /* 跳过 */ }
+      }
+    }
+  }
+
+  // 退回最新的那份
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dir, files[0].name), 'utf8'));
+    return String(j.sessionId || '').trim();
+  } catch {
+    return '';
+  }
+}
 
 const traeImpl = {
   ...sharedHookImpl,
   // Trae IDE 是独立产品形态:不是 VS Code 插件(isPluginClient 只认 vscode),
   // 也不是 CLI('cli'),返回 'IDE' 让 clientLabel 返回基名 "TraeCode"(三个分支都不命中)
   formOf: () => 'IDE',
+  // Trae 的取消信号在 renderer.log 里 (DoneHandler status:"canceled" / stop_button / NotificationPort),
+  // 不在 transcript 里。用 traeCancelAt 扫 renderer.log。签名 (tp, since, sessionId) 第三个参数由 runHookEvent 传入。
+  interruptedSince: (tp, since, sessionId) => Boolean(traeCancelAt(sessionId, since)),
 };
 
 async function handleHookEvent(ev, ctx) {
+  // Trae hook 事件 payload 没有 session_id —— 从已落盘的 hook 状态文件里补注入
+  if (!String(ev.session_id || '').trim()) {
+    const inferred = _inferSessionIdFromStateFile(ctx.workspacePath || '');
+    if (inferred) ev.session_id = inferred;
+  }
   return runHookEvent(ev, ctx, traeImpl);
 }
 

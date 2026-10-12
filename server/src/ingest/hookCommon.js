@@ -862,7 +862,7 @@ const sharedHookImpl = {
   hasSubagentStart: false,
   awaitingPermission: null,
   repliesOf: (tp) => jsonlReplies(tp),
-  interruptedSince: (tp, since) => turnInterrupted(tp, since),
+  interruptedSince: (tp, since, sessionId) => turnInterrupted(tp, since),
   formOf: () => '',
 };
 
@@ -1228,7 +1228,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     if (!replies.length && lastText) replies.push({ id: 'h' + fnv1a32(lastText), text: lastText });
     const roundFileDetails = collectRoundFiles(st, ev, cwd, startedAt, workspacePath);
     const justCancelled = prevCancelledDone && !taskId;
-    const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt);
+    const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
     if (taskId) {
       const form = formOf() || st.form || '';
       const tokens = await readTokensSettled(tp(), startedAt);

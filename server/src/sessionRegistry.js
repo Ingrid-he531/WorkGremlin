@@ -863,33 +863,36 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   const now = Date.now();
 
   const products = detectProducts({});
-  // 某工程（0=不限工程）所有"活着"的在飞任务 client 列表，一次 snapshot 内按工程缓存，
-  // 避免每条会话各查一次。taskStateOf 拿到它后按 agent 基名归层，判定"本层有没有在跑的任务"。
+  // 一次 snapshot 查一次"所有工程里还在跑的顶层任务"（含 client + 标题 tasks.title），按 agent 基名归到楼层：
+  //   runningFloors        —— 有在飞任务的楼层集合（命中 session.floor 即算"本层在跑"）
+  //   runningTitleByFloor  —— 每层在飞任务标题，滚动屏 running 行用它当文案（不依赖会话里常空的 prompt）
   const repo = backend && backend.repo;
-  const runningClientsCache = new Map();
-  const runningClientsFor = (projectId) => {
-    if (!runningClientsCache.has(projectId)) {
-      let rows = [];
-      if (repo && repo.activeRunningByProject) {
-        try {
-          rows =
-            repo.activeRunningByProject.all({
-              projectId,
-              fresh: Date.now() - 3 * 60 * 60 * 1000,
-              cutoff: Date.now() - 10 * 60 * 1000,
-              grace: Date.now() - 30 * 60 * 1000,
-            }) || [];
-        } catch (e) {
-          dlog('[runningClientsFor] query threw:', e && e.message);
-        }
-      } else {
-        dlog('[runningClientsFor] repo/activeRunningByProject missing; repo=', !!repo, 'hasQuery=', !!(repo && repo.activeRunningByProject));
-      }
-      runningClientsCache.set(projectId, rows.map((r) => r.client));
-      dlog('[runningClientsFor] projectId=', projectId, 'clients=', JSON.stringify(runningClientsCache.get(projectId)));
+  const runningFloors = new Set();
+  const runningTitleByFloor = new Map();
+  if (repo && repo.activeRunningByProject) {
+    let rows = [];
+    try {
+      rows =
+        repo.activeRunningByProject.all({
+          projectId: 0,
+          fresh: Date.now() - 3 * 60 * 60 * 1000,
+          cutoff: Date.now() - 10 * 60 * 1000,
+          grace: Date.now() - 30 * 60 * 1000,
+        }) || [];
+    } catch (e) {
+      dlog('[running] query threw:', e && e.message);
     }
-    return runningClientsCache.get(projectId);
-  };
+    for (const r of rows) {
+      const f = floorByAgent[agentBase(r.client)];
+      if (f && f.id) {
+        runningFloors.add(f.id);
+        if (r.title && !runningTitleByFloor.has(f.id)) runningTitleByFloor.set(f.id, r.title);
+      }
+    }
+    dlog('[running] clients=', JSON.stringify(rows.map((r) => r.client)), 'floors=', JSON.stringify([...runningFloors]), 'titles=', JSON.stringify([...runningTitleByFloor]));
+  } else {
+    dlog('[running] repo/activeRunningByProject missing; repo=', !!repo);
+  }
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)
@@ -897,11 +900,19 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         if (a.mine !== b.mine) return a.mine ? -1 : 1;
         return b.lastEventAt - a.lastEventAt;
       })
-      // taskState —— 这条会话"有没有在跑的任务"的**唯一真相源**，门楣滚动屏与主控制台都读它，
-      // 不再各算各的。reporter 在 Stop / 打断时落的完成标记（doneAt）是"已结束"最可靠信号
-      // （CodeBuddy 插件按停止连 hook 都不发，task_runs 未必被翻成 cancelled，见 flushSynthesizedCancels
-      // 的注释），所以"已结束"以 reporter 为准；没结束才看台账里是否还有活着的 running 任务。
-      .map((s) => ({ ...s, taskState: taskStateOf(s, repo, runningClientsFor) }));
+      .map((s) => {
+        // taskState —— 这条会话"有没有在跑的任务"的**唯一真相源**，门楣滚动屏与主控制台都读它。
+        // 优先于残留 doneAt：新开一轮先按"本层有活着的在飞任务"判 running，避免先闪"任务取消/完成"。
+        // "已结束"以 reporter 落的 doneAt 为准（CodeBuddy 插件按停止连 hook 都不发，见 flushSynthesizedCancels）。
+        let taskState;
+        if (runningFloors.has(s.floor)) taskState = 'running';
+        else if (s.doneAt) taskState = s.doneCancelled ? 'cancelled' : 'done';
+        else taskState = null;
+        // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——不依赖会话里常常为空的 prompt，
+        // 这正是以前"滚动屏内容对、但只在取消后才出来"用过的同一份数据源。
+        const taskTitle = taskState === 'running' ? runningTitleByFloor.get(s.floor) || '' : '';
+        return { ...s, taskState, taskTitle };
+      });
     return {
       id: p.id,
       name: p.name,

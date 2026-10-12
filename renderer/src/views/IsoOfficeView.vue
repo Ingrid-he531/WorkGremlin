@@ -242,6 +242,14 @@ const floorTaskActive = computed(() => {
 const consoleBase = computed(() => {
   const sel = sessions.selected;
   if (!sel) return null;
+  // 已结束（取消 / 完成）的任务：优先亮结束态，绝不被快轮询里残留的"调用工具"盖掉。
+  // 现象：用户按停止后 reporter 还没落 Stop、或实时相位仍停在 tool，若放行 fastPhase 就会从
+  // 「任务取消」跳回「调用工具」并卡住；而 taskState 已是 cancelled / done（本层无在飞任务），
+  // 就该稳定显示结束态。新开一轮后本层重新 running，taskState 变回 running，这里不再拦截。
+  if (sel.taskState === 'cancelled' || sel.taskState === 'done' || sel.phase === 'cancelled' || sel.phase === 'done') {
+    const finished = sel.taskState === 'done' || sel.phase === 'done' ? 'done' : 'cancelled';
+    return { phase: finished, action: '', context: [], target: null, tool: '', prompt: '' };
+  }
   // 选中的恰好是"全局当前在敲"的那条（fresh）：叠加 1.5s 快轮询的实时相位，
   // 让"调用工具 / 等待授权"更跟手（比 10s 会话轮询新鲜）。其余会话（哪怕是各自工程的
   // current=true）只用自己会话轮询的数据，绝不借全局实时相位冒充——否则切回旧会话会误显新工程的"调用工具"。

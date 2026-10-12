@@ -164,7 +164,10 @@ const clip = (s) => s;
  */
 function floorName(id) {
   const f = (sessions.floors || []).find((x) => x.id === id);
-  return (f && f.name) || id || '—';
+  // 屏上用楼层号（1F / 3F …）更直观；拿不到名字的兜底情况才退 name。
+  // （product 的显示名是 "CodeBuddy" 这类，滚动屏历史上一直用楼层号，保持原样。）
+  if (!f) return id || '—';
+  return /^\d+F$/i.test(id || '') ? id : f.name || id;
 }
 
 /** 进行中的任务（taskState === 'running'）：无限滚动循环的常驻内容。
@@ -181,7 +184,7 @@ const runningItems = computed(() => {
   return [...byFloor.values()]
     .map((s) => {
       const floor = floorName(s.floor);
-      const text = promptOf(s.prompt || s.action || '') || t('ticker.untitled');
+      const text = promptOf(s.taskTitle || s.prompt || s.action || '') || t('ticker.untitled');
       const taskLabel = t('ticker.taskLabel');
       const taskText = clip(text);
       const time = hhmm(s.lastEventAt);
