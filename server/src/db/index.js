@@ -688,7 +688,7 @@ function createRepo(db) {
      * @fresh 给得宽（默认 3h）只为挡住"进程早死、台账却永远 running"的僵尸，正常任务不会超。
      */
     activeRunningByProject: db.prepare(`
-      SELECT COALESCE(r.client, m.client) AS client, t.title AS title, t.started_at AS startedAt, r.session_id AS sessionId FROM tasks t
+      SELECT COALESCE(r.client, m.client) AS client, t.title AS title, t.started_at AS startedAt FROM tasks t
       LEFT JOIN task_runs r ON r.id = t.id
       LEFT JOIN members m ON m.id = t.member_id
       WHERE t.parent_task_id IS NULL AND t.state = 'running'
