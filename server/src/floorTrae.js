@@ -927,7 +927,10 @@ module.exports = {
  *   { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession }
  */
 function synthMarks(ctx) {
-  const { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession } = ctx;
+  const { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession, now } = ctx;
+  // 完成/取消标记的新鲜期：与 sessions.js 的 j.done 读取同一口径（DONE_TTL_MS = 10 分钟）。
+  // renderer.log 里 3 天前的 DoneHandler 不加这层就会顶进 latest，旧会话的取消标记跨天复活。
+  const DONE_TTL_MS = 10 * 60_000;
   // ── 先扫 DoneHandler（最终状态真相）──
   // completed → 合成正常完成标记（cancelled:false，覆盖可能存在的 cancelled:true）
   // canceled  → 合成取消标记（同 synthCancel）
@@ -944,6 +947,8 @@ function synthMarks(ctx) {
     // 新一轮已经开始了就不该再把上一轮的完成/取消标记塞进 bySession —— reporter-phase
     // 会把这份旧 done 连同新 taskTitle 一起返回，前端看到 doneAt 变化误以为任务完成。
     if (j && Number(j.taskStartedAt) && h.at < Number(j.taskStartedAt)) continue;
+    // TTL：3 天前的 DoneHandler 不该顶进 latest（旧会话的取消标记跨天复活）
+    if (now && now - h.at > DONE_TTL_MS) continue;
     if (h.status === 'completed') {
       // DoneHandler completed → 正常完成标记（cancelled:false），覆盖 bySession 里已有的 cancelled:true；
       // 只在 DoneHandler at 更大时覆盖 —— completed 信号本应比取消信号晚到。
@@ -981,6 +986,8 @@ function synthMarks(ctx) {
       const j = hook ? hook.j : null;
       // 同上：上一轮的取消信号（atC < 当前 taskStartedAt）跨轮复活，跳过
       if (j && Number(j.taskStartedAt) && atC < Number(j.taskStartedAt)) continue;
+      // TTL：旧会话的取消标记过期了就不该顶进 latest
+      if (now && now - atC > DONE_TTL_MS) continue;
       const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
       if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
       if (j && client && !clientHit(client, j.client)) continue;
