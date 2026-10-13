@@ -791,6 +791,27 @@ function createRepo(db) {
       SELECT * FROM subagent_runs WHERE parent_task_id = ? ORDER BY started_at, id
     `),
     countSubagentRuns: db.prepare(`SELECT COUNT(*) AS c FROM subagent_runs WHERE parent_task_id = ?`),
+    /** 找某会话在指定时刻正在运行的任务 —— Trae 子代理贡献补录用。
+     *  同一 sessionId 下任务串行执行（不重叠），所以 started_at <= at 的最新一条
+     *  就是贡献事件发生时正在运行的那个任务；at=0（解析不出时间）时退化为不限时间取最新。 */
+    latestTaskBySession: db.prepare(`
+      SELECT r.id AS id, r.member_id AS memberId, r.started_at AS startedAt
+      FROM task_runs r JOIN tasks t ON t.id = r.id
+      WHERE r.project_id = ? AND r.session_id = ?
+        AND (? = 0 OR r.started_at <= ?)
+      ORDER BY r.started_at DESC LIMIT 1
+    `),
+    /** 去重检查：同一父任务下同一个 operationId（存在 name 列）不重复补录 */
+    hasSubagentByName: db.prepare(
+      `SELECT COUNT(*) AS c FROM subagent_runs WHERE parent_task_id = ? AND name = ?`
+    ),
+    /** Trae 子代理贡献一次性写入（含 result / files_json / ended_at，不分两步） */
+    insertSubagentContribution: db.prepare(`
+      INSERT INTO subagent_runs
+        (project_id, parent_task_id, member_id, name, client, title, result, files_json, started_at, ended_at)
+      VALUES
+        (@projectId, @parentTaskId, @memberId, @name, @client, @title, @result, @filesJson, @startedAt, @endedAt)
+    `),
     /** 删除：按顶层任务（及其 subagent 子任务）整条清掉，含台账/消息/产出 */
     selectChildTaskIds: db.prepare(`SELECT id FROM tasks WHERE parent_task_id IN (SELECT value FROM json_each(?))`),
     deleteTasksById: db.prepare(`DELETE FROM tasks WHERE id IN (SELECT value FROM json_each(?))`),
