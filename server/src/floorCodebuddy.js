@@ -841,6 +841,11 @@ function synthMarks(ctx) {
     if (!times.length) continue;
     const taskStarted = Number(j.taskStartedAt) || 0;
     const latest = times.reduce((a, b) => Math.max(a, b), 0);
+    // 这一轮是否已经**正常收尾**：Stop 落盘的 done 比取消更新 → 这次取消属于更早的轮次，
+    // 不该亮主控制台红灯、也不该绑当前 taskId。必须比对 done —— 插件会话列表按 src.client
+    // ('codebuddy-plugin') 读完成标记，而插件上报身份是 codebuddy(+form=vscode)，这一路**读不到**
+    // done；不看 done 的话，一个"先取消过、后正常收尾"的会话会一直显示「任务取消」（实测 2026-10-13）。
+    const doneAt = Number(j.done && j.done.at) || 0;
     for (const at of times) {
       if (taskStarted && at < taskStarted) {
         // 历史任务的取消：taskId 留空，交给会话兜底匹配（不误伤当前在跑任务，也不亮当前红灯）
@@ -849,7 +854,12 @@ function synthMarks(ctx) {
     }
     // 当前这一轮（或没有本轮起点）：正常合成（带 taskId + 亮主控制台红灯）
     if (!taskStarted || latest >= taskStarted) {
-      synthCancel({ id: sid, j, ws: workspacePath || '', at: latest });
+      if (doneAt && latest <= doneAt) {
+        // 已经有更新的正常收尾 → 只登记进台账（兜底收掉更早那轮），不亮红灯、不绑当前 taskId
+        synthCancel({ id: sid, j, ws: workspacePath || '', at: latest, consoleMark: false, taskId: '' });
+      } else {
+        synthCancel({ id: sid, j, ws: workspacePath || '', at: latest });
+      }
     }
   }
 }

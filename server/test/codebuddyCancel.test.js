@@ -213,6 +213,35 @@ head('[6] 取消时刻早于本轮开始（上一轮的取消）→ 旧任务仍
   ok('主控制台不把当前在跑任务误标为取消', !bySession.get(sid) || bySession.get(sid).cancelled !== true, JSON.stringify(bySession.get(sid)));
 }
 
+head('[6b] 插件列表那一路（client=codebuddy-plugin）：先取消过、后正常收尾的会话不许显示「任务取消」');
+{
+  const sid = 'cb-plugin-done-1';
+  const cancelAt = Date.now() - 60_000; // 早先取消过一轮
+  const doneAt = Date.now() - 10_000; // 之后这一轮正常收尾（比取消新）
+  const tp = writeCancelTranscript(sid, cancelAt);
+  // 插件上报身份是 codebuddy(+form=vscode)，不是 codebuddy-plugin —— 正常收尾的 done 只在 codebuddy 这一路可见
+  scenario({
+    name: sid,
+    taskId: '',
+    startedAt: 0,
+    running: false,
+    client: 'codebuddy',
+    transcriptPath: tp,
+    done: { at: doneAt, cancelled: false, title: '改个东西' },
+  });
+  // 插件会话列表按 src.client='codebuddy-plugin' 读完成标记：这一路读不到 done，过去就被合成取消误标成「任务取消」
+  const plug = readReporterDones(WS, 'codebuddy-plugin');
+  ok(
+    '插件那一路不把已正常收尾的会话标成取消',
+    !plug.bySession.get(sid) || plug.bySession.get(sid).cancelled !== true,
+    JSON.stringify(plug.bySession.get(sid))
+  );
+  // 合并那一路（渲染层快轮询用的就是它）：done 比取消新 → 亮「任务完成」
+  const merged = readReporterDones(WS, 'codebuddy,codebuddy-plugin');
+  const mark = merged.bySession.get(sid) || null;
+  ok('合并那一路是正常完成（cancelled 不为真）', Boolean(mark) && mark.cancelled !== true, JSON.stringify(mark));
+}
+
 head('[7] CodeBuddy CLI 等待授权时按 ESC（Stop 落盘 done.cancelled）→ 主控制台相位作废（不再亮「等待授权」）');
 {
   const sid = 'cb-cli-cancel-1';
