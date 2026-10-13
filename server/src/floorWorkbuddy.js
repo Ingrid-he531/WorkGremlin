@@ -29,6 +29,16 @@ const meta = {
 };
 
 const { runHookEvent, sharedHookImpl, jsonlReplies, indexJsonReplies, turnInterrupted } = require('./ingest/hookCommon');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
+
+/**
+ * 2F 的静态 subagent 定义目录：项目级 <ws>/.workbuddy/agents、用户级 ~/.workbuddy/agents。
+ * 返回 [{ dir, level }]，项目级先于用户级。
+ */
+function agentDirs(workspacePath) {
+  return genericAgentDirs([path.join(HOME, '.workbuddy')], workspacePath);
+}
 
 /** WorkBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent。
  * 只覆盖与公有默认不同的接口；其余回退 sharedHookImpl。 */
@@ -43,4 +53,4 @@ async function handleHookEvent(ev, ctx) {
   return runHookEvent(ev, ctx, workbuddyImpl);
 }
 
-module.exports = { id: '2F', meta, handleHookEvent };
+module.exports = { id: '2F', meta, handleHookEvent, agentDirs };

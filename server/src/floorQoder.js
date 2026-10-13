@@ -27,6 +27,18 @@ const { formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
 const { isFile } = require('./roots');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
+
+/**
+ * 6F 的静态 subagent 定义目录。Qoder 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
+ * 这里走通用推导（meta.homeDirs 为空 → 返回 []，不扫盘）。若将来 Qoder 在某目录放 agent 定义，
+ * 在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function agentDirs(workspacePath) {
+  return genericAgentDirs((meta && meta.homeDirs) || [], workspacePath);
+}
 
 const HOME = os.homedir();
 
@@ -772,6 +784,8 @@ module.exports = {
   readLingmaDone,
   hasCoreTables,
   resetLingmaCache,
+  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  agentDirs,
   LIVE_MS,
   TTL,
   SESSION_LIMIT,

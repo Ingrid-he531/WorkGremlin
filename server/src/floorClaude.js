@@ -14,6 +14,8 @@ const fs = require('node:fs');
 const {} = require('@workgremlin/shared');
 // 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
 const { readJson, readDir, isFile } = require('./roots');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
 
 const HOME = os.homedir();
 
@@ -24,6 +26,14 @@ const HOME = os.homedir();
  */
 function claudeHome() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+}
+
+/**
+ * 4F 的静态 subagent 定义目录：项目级 <ws>/.claude/agents、用户级 <claudeHome()>/agents。
+ * 返回 [{ dir, level }]，项目级先于用户级。
+ */
+function agentDirs(workspacePath) {
+  return genericAgentDirs([claudeHome()], workspacePath);
 }
 
 /* ------------------------------ 打断检测 ------------------------------ */
@@ -507,6 +517,8 @@ module.exports = {
   selectedModelOf,
   // 形态判定（cli / plugin）
   claudeForm,
+  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  agentDirs,
   // 取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Claude/Qoder 专属逻辑）
   synthMarks,
   // 服务端 hook 事件处理（落盘解析归服务端）：Claude 通过 hookCommon.runHookEvent 派发

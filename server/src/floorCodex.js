@@ -11,6 +11,8 @@
 const os = require('node:os');
 const path = require('node:path');
 const { diskKey } = require('@workgremlin/shared');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
 
 const HOME = os.homedir();
 
@@ -81,4 +83,13 @@ async function handleHookEvent(ev, ctx) {
   return runHookEvent(ev, ctx, codexImpl);
 }
 
-module.exports = { id: '3F', meta, RE_CODEX_HOST, handleHookEvent, codexForm };
+/**
+ * 3F 的静态 subagent 定义目录：项目级 <ws>/.codex/agents、用户级 $CODEX_HOME/agents
+ * （CODEX_HOME 缺省回退 ~/.codex）。返回 [{ dir, level }]，项目级先于用户级。
+ */
+function agentDirs(workspacePath) {
+  const home = process.env.CODEX_HOME || path.join(HOME, '.codex');
+  return genericAgentDirs([home], workspacePath);
+}
+
+module.exports = { id: '3F', meta, RE_CODEX_HOST, handleHookEvent, codexForm, agentDirs };

@@ -64,6 +64,18 @@ const { DEFAULTS, formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { isFile } = require('./roots');
 const { resolveProjectName } = require('./project');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
+
+/**
+ * 8F 的静态 subagent 定义目录。OpenCode 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
+ * 这里走通用推导（meta.homeDirs 为空 → 返回 []，不扫盘）。若将来 OpenCode 在某目录放 agent 定义，
+ * 在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function agentDirs(workspacePath) {
+  return genericAgentDirs((meta && meta.homeDirs) || [], workspacePath);
+}
 
 const HOME = os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -1249,4 +1261,6 @@ module.exports = {
   syncOpencodeTasks,
   startOpencodeTaskSyncer,
   SYNC_INTERVAL_MS,
+  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  agentDirs,
 };

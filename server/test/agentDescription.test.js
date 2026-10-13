@@ -18,7 +18,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-/* HOME 必须在 require 之前指到沙箱：agentLevel.js 在 require 时就把家目录记下来了 */
+/* HOME 必须在 require 之前指到沙箱：floors.js 在 require 时各楼层就把家目录记下来了 */
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-agent-desc-'));
 const HOME = path.join(TMP, 'home');
 const WS = path.join(TMP, 'proj');
@@ -28,7 +28,9 @@ process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = path.join(TMP, 'wg');
 delete process.env.CODEX_HOME; // 用沙箱里的 ~/.codex
 
-const { agentDescription, detectLevel } = require('../src/ingest/agentLevel');
+// 静态 subagent 的发现已下放到各楼层（见 server/src/floor<X>.js 的 agentDirs），
+// floors.js 负责按目录聚合 + 按 client 派发；这里直接从 floors 取。
+const { agentDescription, detectLevel } = require('../src/floors');
 const { openDatabase } = require('../src/db');
 const { createIngestBus } = require('../src/ingest/bus');
 

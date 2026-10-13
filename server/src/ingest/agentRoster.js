@@ -4,9 +4,10 @@
  * 常驻小怪物名册：把"已定义的 subagent"（项目级 + 用户级）注册成坐工位的小怪物。
  *
  * 设计（见办公室可视化规范）：
- *   · 工位上的小怪物 = 用户级 / 项目级 subagent（写在 <workspace>/.codebuddy/agents
- *     或 ~/.codebuddy/agents 里的 *.md）。它们常驻、脖子上带工牌（级别牌由 agentLevel
- *     按名字判定），即使当下没被召唤也在。
+ *   · 工位上的小怪物 = 用户级 / 项目级 subagent（写在 <workspace>/<点目录>/agents
+ *     或 ~/.xxx/agents 里的定义文件）。它们常驻、脖子上带工牌（级别牌由各楼层 agentDirs
+ *     声明目录、agentLevel 引擎按名字判定），即使当下没被召唤也在。
+ *   · 已定义清单由 floors.listStaticSubagents 跨所有楼层聚合得到（见 floors.js）。
  *   · 召唤时由 subagentFeed 另外生成"头顶小幽灵"（ephemeral）代表本次运行，
  *     本模块只负责"小怪物"本身（role=subagent, ephemeral=false）。
  *
@@ -17,56 +18,9 @@
  *   两者 memberId 不同（小怪物用裸名，幽灵用 subagent-<name>），互不冲突。
  */
 
-const fs = require('node:fs');
-const path = require('node:path');
-const os = require('node:os');
 const log = require('../log');
-const { detectLevel } = require('./agentLevel');
+const { listStaticSubagents } = require('../floors');
 const config = require('../config');
-
-const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
-const USER_AGENTS_DIR = path.join(HOME, '.codebuddy', 'agents');
-/** Codex CLI 的 agent 定义目录（实测 codex home 下有 agents/） */
-const USER_CODEX_AGENTS_DIR = path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'agents');
-
-/** 列出目录下的 agent 文件名（去 .md），目录不可读返回空 */
-function listAgentFiles(dir) {
-  try {
-    return fs
-      .readdirSync(dir)
-      .filter((f) => /\.(md|toml)$/i.test(f)) // CodeBuddy 用 .md；Codex 的 agent 定义可能是 .toml
-      .map((f) => f.replace(/\.(md|toml)$/i, ''));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * 列出已定义的 subagent（项目级优先于用户级，重名去重），返回 [{ name, level }]。
- *
- * **workspacePath 为空 = 没有当前工程目录**（演示工程就是这种）：此时只列用户级 ——
- * 项目级 agent 挂在某个真实目录下，没有目录就无从谈起，也不该被算进演示工程。
- * @param {string} workspacePath 当前工程路径（用于扫项目级 agents 目录）
- */
-function listDefinedAgents(workspacePath) {
-  const ws = String(workspacePath || '').trim();
-  const projDir = ws ? path.join(path.resolve(ws), '.codebuddy', 'agents') : '';
-  const seen = new Map();
-  const add = (dir, level, client) => {
-    for (const n of listAgentFiles(dir)) if (!seen.has(n)) seen.set(n, { level, client });
-  };
-  if (projDir) add(projDir, 'project', 'codebuddy');
-  // Codex CLI 的 agent 定义（项目级 <ws>/.codex/agents、用户级 $CODEX_HOME/agents）
-  if (ws) add(path.join(path.resolve(ws), '.codex', 'agents'), 'project', 'codex');
-  add(USER_CODEX_AGENTS_DIR, 'user', 'codex');
-  add(USER_AGENTS_DIR, 'user', 'codebuddy');
-  const out = [];
-  for (const [name, meta] of seen) {
-    const level = detectLevel(name, ws) || meta.level;
-    if (level) out.push({ name, level, client: meta.client });
-  }
-  return out;
-}
 
 /**
  * @param {{bus:any, project?:string, getProject?:()=>string, getWorkspacePath?:()=>string, intervalMs?:number}} opts
@@ -100,11 +54,12 @@ function createAgentRoster(opts) {
   const ACTIVE_TTL_MS = 10 * 60_000;
   const activeNames = new Map();
 
+  
   function sync() {
     if (!running) return;
     const project = getProject();
     const ws = getWorkspacePath();
-    const list = listDefinedAgents(ws);
+    const list = listStaticSubagents(ws);
     const sig = `${project}|${list
       .map((a) => a.name)
       .sort()
@@ -238,4 +193,4 @@ function createAgentRoster(opts) {
   };
 }
 
-module.exports = { createAgentRoster, listDefinedAgents };
+module.exports = { createAgentRoster };

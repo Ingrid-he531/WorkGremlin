@@ -17,7 +17,7 @@ const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey, isPluginCli
 const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
-const { detectLevel, agentDescription } = require('./agentLevel');
+const { detectLevel, agentDescription } = require('../floors');
 // 成员状态降级前的守卫：别的会话还在跑就别压成空闲/离线（见 keepStateForOtherSession）。
 // 只单向依赖（sessions.js 不 require ingest/），没有循环。
 const { hasOtherLiveSession, sessionModel } = require('../sessions');
@@ -278,7 +278,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       client: normClient(p.client),
     });
     // subagent 级别（用户级 / 项目级）：按名字扫 agent 目录判定，记进内存 map
-    const lvl = detectLevel(p.name || p.memberId || '', p.workspacePath || '');
+    const lvl = detectLevel(p.name || p.memberId || '', p.workspacePath || '', p.client);
     if (lvl) levels.set(id, lvl);
     else levels.delete(id);
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(id));
@@ -1184,7 +1184,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       level: levels.get(memberId) || null,
       // 常驻 subagent 的**功能描述**（agent 定义文件里的静态数据）：卡片上显示"它是干什么的"，
       // 不是状态。取不到回空串，由渲染层隐藏那一栏 —— 不拿"项目子代理 · 空闲"顶替。
-      description: String(m.role || '').startsWith('subagent') ? agentDescription(m.name, projectWorkspacePath(m.project_id)) : '',
+      description: String(m.role || '').startsWith('subagent') ? agentDescription(m.name, projectWorkspacePath(m.project_id), m.client || '') : '',
     };
   }
 

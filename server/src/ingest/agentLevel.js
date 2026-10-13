@@ -1,13 +1,19 @@
 'use strict';
 
 /**
- * subagent 元信息：级别（用户级 vs 项目级）+ 功能描述（description）。
+ * 静态 subagent 元信息引擎（产品无关）。
  *
  * 渲染层是沙箱（读不了文件系统），所以"这个成员是用户级还是项目级 subagent"与"它是干什么的"
- * 都必须由服务端读出来、随成员卡下发。判定口径与 CodeBuddy / Codex 一致：
- *   · 项目级：<workspacePath>/.codebuddy/agents/<name>.md、<workspacePath>/.codex/agents/<name>.toml
- *   · 用户级：~/.codebuddy/agents/<name>.md、$CODEX_HOME/agents/<name>.toml
+ * 都必须由服务端读出来、随成员卡下发。判定口径与 CodeBuddy / Codex / Claude 一致：
+ *   · 项目级：<workspacePath>/<点目录>/agents/<name>.(md|toml)
+ *   · 用户级：<家目录>/<点目录>/agents/<name>.(md|toml)
  * 都不在 -> 级别 null（普通成员 / 演示数据，不戴级别牌）、描述空串。
+ *
+ * 本文件**不认识任何具体产品**：它只按"调用方给的一组候选目录"去找 agent 定义文件、读描述、
+ * 判级别。各楼层在哪放自己的静态 subagent，由各自的 `agentDirs(workspacePath)` 声明
+ * （见 server/src/floor<X>.js），floors.js 负责把各楼层的目录聚合成统一接口 —— 这正是把
+ * "找静态 subagent"从中央 agentLevel 下放到楼层的原则（与 refresh 的楼层化同思路：
+ * 中央只做通用派发 + 聚合，产品知识全在楼层文件里）。
  *
  * 功能描述是 agent 定义文件里的**静态数据**（"这个子代理是干什么的"），不是运行状态 ——
  * 卡片上要显示的是它，而不是"项目子代理 · 空闲"这种状态话术。
@@ -16,16 +22,10 @@
  */
 
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const { isFile } = require('../roots');
 
-const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
-const USER_AGENTS_DIR = path.join(HOME, '.codebuddy', 'agents');
-/** Codex CLI 的 agent 定义目录（实测：codex home 下有 agents/；扩展名以 .md / .toml 都试） */
-const USER_CODEX_AGENTS_DIR = path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'agents');
-
-/** 文件名大小写兼容：CodeBuddy 文档要求小写连字符，但保险起见两种都试 */
+/** 文件名大小写兼容：文档要求小写连字符，但保险起见两种都试 */
 function fileOf(dir, name) {
   const base = String(name || '').trim();
   if (!base) return '';
@@ -42,37 +42,30 @@ function fileOf(dir, name) {
 }
 
 /**
- * 找出这个 subagent 的 agent 定义文件本身（项目级优先，其次用户级）。
+ * 从一组候选目录里找这个 subagent 的 agent 定义文件本身（项目级优先，其次用户级）。
+ * 顺序即优先级：命中第一个存在的就返回。
+ * @param {string} name
+ * @param {Array<{dir: string, level: 'project'|'user'}>} dirs
  * @returns {{ path: string, level: 'project'|'user' }|null}
  */
-function findAgentFile(name, workspacePath) {
-  const ws = String(workspacePath || '').trim();
-  const dirs = [];
-  if (ws) {
-    const root = path.resolve(ws);
-    dirs.push([path.join(root, '.codebuddy', 'agents'), 'project']);
-    dirs.push([path.join(root, '.codex', 'agents'), 'project']); // Codex CLI
-  }
-  dirs.push([USER_AGENTS_DIR, 'user']);
-  dirs.push([USER_CODEX_AGENTS_DIR, 'user']); // Codex CLI
-  for (const [dir, level] of dirs) {
+function findAgentFile(name, dirs) {
+  for (const { dir, level } of dirs || []) {
     const p = fileOf(dir, name);
     if (p) return { path: p, level };
   }
   return null;
 }
 
-const cache = new Map(); // "name workspacePath" -> level
-
-function detectLevel(name, workspacePath) {
-  const ws = String(workspacePath || '').trim();
-  const key = `${name} ${ws}`;
-  if (cache.has(key)) return cache.get(key);
-
-  const hit = findAgentFile(name, ws);
-  const level = hit ? hit.level : null;
-  cache.set(key, level);
-  return level;
+/** 列出目录下的 agent 文件名（去 .md/.toml 后缀），目录不可读返回空 */
+function listAgentFiles(dir) {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((f) => /\.(md|toml)$/i.test(f))
+      .map((f) => f.replace(/\.(md|toml)$/i, ''));
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -123,6 +116,25 @@ function readDescription(file) {
   return cleanDescription(inline);
 }
 
+const levelCache = new Map(); // "name workspacePath" -> level
+
+/**
+ * 按给定目录判级别（项目级 / 用户级）。取不到回 null。按 name+workspacePath 缓存。
+ * @param {string} name
+ * @param {string} workspacePath
+ * @param {Array<{dir:string, level:'project'|'user'}>} dirs 顺序即优先级
+ * @returns {'project'|'user'|null}
+ */
+function detectLevelInDirs(name, workspacePath, dirs) {
+  const ws = String(workspacePath || '').trim();
+  const key = `${name} ${ws}`;
+  if (levelCache.has(key)) return levelCache.get(key);
+  const hit = findAgentFile(name, dirs);
+  const level = hit ? hit.level : null;
+  levelCache.set(key, level);
+  return level;
+}
+
 const descCache = new Map(); // 文件路径 -> { mtimeMs, size, value }
 
 /**
@@ -130,9 +142,10 @@ const descCache = new Map(); // 文件路径 -> { mtimeMs, size, value }
  * 不拿"项目子代理 · 空闲"之类的状态话术顶替。
  * @param {string} name subagent 名（成员名，如 leo）
  * @param {string} workspacePath 当前工程路径（项目级 agent 在这里找）
+ * @param {Array<{dir:string, level:'project'|'user'}>} dirs 候选目录（顺序即优先级）
  */
-function agentDescription(name, workspacePath) {
-  const hit = findAgentFile(name, workspacePath);
+function descriptionInDirs(name, workspacePath, dirs) {
+  const hit = findAgentFile(name, dirs);
   if (!hit) return '';
   let st = null;
   try {
@@ -147,9 +160,42 @@ function agentDescription(name, workspacePath) {
   return value;
 }
 
+/**
+ * 通用：由"agent 家目录列表"推出项目级 / 用户级 agent 目录。
+ *   · 项目级 = <workspacePath>/<家目录基名>/agents
+ *   · 用户级 = <家目录>/agents
+ * 各楼层若落盘点不遵循这个规律（如 Codex 认 CODEX_HOME、Claude 认 CLAUDE_CONFIG_DIR，
+ * 或 subagent 根本不是单文件而是内嵌在别处），在自己的 `agentDirs` 里显式给目录 /
+ * 自定义逻辑即可，不必走这里。
+ * @param {string[]} homeDirs agent 家目录（如 [path.join(HOME, '.codebuddy')]）
+ * @param {string} workspacePath
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function genericAgentDirs(homeDirs, workspacePath) {
+  const ws = String(workspacePath || '').trim();
+  const root = ws ? path.resolve(ws) : '';
+  const out = /** @type {{dir: string, level: 'project'|'user'}[]} */ ([]);
+  for (const h of homeDirs || []) {
+    const home = String(h);
+    if (root) out.push({ dir: path.join(root, path.basename(home), 'agents'), level: 'project' });
+    out.push({ dir: path.join(home, 'agents'), level: 'user' });
+  }
+  return out;
+}
+
 function clearCache() {
-  cache.clear();
+  levelCache.clear();
   descCache.clear();
 }
 
-module.exports = { detectLevel, agentDescription, clearCache };
+module.exports = {
+  fileOf,
+  findAgentFile,
+  listAgentFiles,
+  readDescription,
+  cleanDescription,
+  detectLevelInDirs,
+  descriptionInDirs,
+  genericAgentDirs,
+  clearCache,
+};

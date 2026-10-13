@@ -1264,6 +1264,14 @@ const meta = {
   homeDirs: [path.join(HOME, '.config', 'Code', 'User', 'globalStorage')],
 };
 module.exports.meta = meta;
+/**
+ * 9F 的静态 subagent 定义目录。GitHub Copilot 没有"用户级 / 项目级 agent 定义文件"这套机制
+ * （它的 globalStorage 不是 agent 定义目录），这里返回 []，不扫盘。
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+module.exports.agentDirs = function agentDirs() {
+  return [];
+};
 module.exports.syncCopilotTasks = syncCopilotTasks;
 module.exports.startCopilotTaskSyncer = startCopilotTaskSyncer;
 module.exports.SYNC_INTERVAL_MS = SYNC_INTERVAL_MS;

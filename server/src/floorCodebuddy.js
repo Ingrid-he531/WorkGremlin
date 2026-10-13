@@ -19,6 +19,16 @@ const { diskKey } = require('@workgremlin/shared');
 const { dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
 // 工程名解析（genie-history 目录名 → 工程名）收口在 project.js
 const { resolveProjectName } = require('./project');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
+
+/**
+ * 1F 的静态 subagent 定义目录：项目级 <ws>/.codebuddy/agents、用户级 ~/.codebuddy/agents。
+ * 返回 [{ dir, level }]，项目级先于用户级（命中优先级）。floors.js 据此聚合 + 判级别。
+ */
+function agentDirs(workspacePath) {
+  return genericAgentDirs([path.join(HOME, '.codebuddy')], workspacePath);
+}
 
 const HOME = os.homedir();
 
@@ -778,6 +788,8 @@ module.exports = {
   synthMarks,
   // 服务端 hook 事件处理（落盘解析归服务端）
   handleHookEvent,
+  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  agentDirs,
 };
 
 /**

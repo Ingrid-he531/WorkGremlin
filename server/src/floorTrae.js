@@ -19,6 +19,18 @@ const os = require('node:os');
 const path = require('node:path');
 // Trae 家族的 globalStorage / logs 根目录：本楼层私有，放在本文件（不再污染 floors.js）。
 const { isDir, dataRoots } = require('./roots');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
+
+/**
+ * 5F 的静态 subagent 定义目录。Trae 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
+ * 这里走通用推导（meta.homeDirs 为空 → 返回 []，不扫盘）。若将来 Trae 在某目录放 agent 定义，
+ * 在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function agentDirs(workspacePath) {
+  return genericAgentDirs((meta && meta.homeDirs) || [], workspacePath);
+}
 
 /**
  * TraeCode 家族的 globalStorage（模型选择就记在它的 state.vscdb 里）。单列一份、不并进
@@ -1095,6 +1107,8 @@ module.exports = {
   traeDoneStatus,
   // token 金额（原 traeTokens.js）
   allTokenUsages,
+  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  agentDirs,
   traeTokenOf,
   // 子代理贡献补录（IdeSubagentContribution → subagent_runs）
   allSubagentContribs,

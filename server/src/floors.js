@@ -50,6 +50,10 @@ const {
   extraDirs,
 } = require('./roots');
 
+// 静态 subagent 发现引擎（产品无关，只按"给定目录"找定义文件 / 读描述 / 判级别）。
+// 各楼层自己的目录知识在 floor<X>.js 的 agentDirs 里；本文件只做聚合 + 按 client 派发。
+const { detectLevelInDirs, descriptionInDirs, listAgentFiles } = require('./ingest/agentLevel');
+
 const HOME = os.homedir();
 
 /** 契约要求/约定的导出名（仅文档与自检用，不强制） */
@@ -342,6 +346,72 @@ function startTaskSyncers({ bus, repo, now }) {
   return timers;
 }
 
+/* ============================================================== 静态 subagent 聚合 */
+
+/**
+ * 取某 client（楼层基名）对应的 agent 目录列表；client 缺省时汇总所有楼层。
+ * 顺序即优先级（楼层内 project 先于 user；跨楼层按 1F…9F）。
+ * @param {string} [client]
+ * @param {string} [workspacePath]
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function dirsForClient(client, workspacePath) {
+  if (client) {
+    const f = floorByAgent[String(client).toLowerCase()];
+    return f && typeof f.agentDirs === 'function' ? f.agentDirs(workspacePath) : [];
+  }
+  const out = [];
+  for (const f of Object.values(floors)) {
+    if (typeof f.agentDirs === 'function') out.push(...f.agentDirs(workspacePath));
+  }
+  return out;
+}
+
+/**
+ * subagent 级别（用户级 / 项目级）。client 给定时只在该楼层目录里找；缺省时汇总所有楼层。
+ * 取不到回 null（普通成员 / 演示数据，不戴级别牌）。
+ * @param {string} name
+ * @param {string} workspacePath
+ * @param {string} [client]
+ * @returns {'project'|'user'|null}
+ */
+function detectLevel(name, workspacePath, client) {
+  return detectLevelInDirs(name, workspacePath, dirsForClient(client, workspacePath));
+}
+
+/**
+ * subagent 功能描述（agent 定义文件里的静态数据）。client 给定时只在该楼层目录里找；缺省时
+ * 汇总所有楼层，命中第一个。取不到回空串（渲染层据此隐藏那一栏）。
+ * @param {string} name
+ * @param {string} workspacePath
+ * @param {string} [client]
+ */
+function agentDescription(name, workspacePath, client) {
+  return descriptionInDirs(name, workspacePath, dirsForClient(client, workspacePath));
+}
+
+/**
+ * 汇总所有楼层"已定义的静态 subagent"（项目级优先于用户级，跨楼层重名去重）。
+ * 返回 [{ name, level, client }]，供 agentRoster 注册成坐工位、带工牌的小怪物。
+ * @param {string} workspacePath 当前工程路径（项目级 agent 在这里找）
+ * @returns {Array<{name:string, level:'project'|'user', client:string}>}
+ */
+function listStaticSubagents(workspacePath) {
+  const ws = String(workspacePath || '').trim();
+  const seen = new Map(); // name -> { name, level, client }
+  for (const f of Object.values(floors)) {
+    if (typeof f.agentDirs !== 'function') continue;
+    const client = (f.meta && f.meta.agent) || '';
+    // 楼层内 project 目录先于 user 目录（agentDirs 已按此顺序返回），先见者胜出
+    for (const { dir, level } of f.agentDirs(ws)) {
+      for (const n of listAgentFiles(dir)) {
+        if (!seen.has(n)) seen.set(n, { name: n, level, client });
+      }
+    }
+  }
+  return [...seen.values()];
+}
+
 /* ============================================================== 导出 */
 
 module.exports.FLOOR_CONTRACT = FLOOR_CONTRACT;
@@ -350,3 +420,6 @@ module.exports.floorOf = floorOf;
 module.exports.floorByAgent = floorByAgent;
 module.exports.detectProducts = detectProducts;
 module.exports.startTaskSyncers = startTaskSyncers;
+module.exports.detectLevel = detectLevel;
+module.exports.agentDescription = agentDescription;
+module.exports.listStaticSubagents = listStaticSubagents;

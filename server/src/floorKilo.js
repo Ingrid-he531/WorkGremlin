@@ -59,6 +59,18 @@ const { resolveProjectName } = require('./project');
 const { DEFAULTS, formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { isFile } = require('./roots');
+// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+const { genericAgentDirs } = require('./ingest/agentLevel');
+
+/**
+ * 7F 的静态 subagent 定义目录。Kilo Code 目前没有"用户级 / 项目级 agent 定义文件"这套机制
+ * （其 agent 配置走别处，不在 <点目录>/agents 下），这里返回 []，不扫盘。若将来 Kilo 在某目录
+ * 放 agent 定义，在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function agentDirs() {
+  return [];
+}
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -1405,4 +1417,6 @@ module.exports = {
   meta,
   kindHandlers,
   sessionTitle,
+  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  agentDirs,
 };
