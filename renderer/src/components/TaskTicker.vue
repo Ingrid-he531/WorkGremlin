@@ -25,6 +25,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useSessionStore } from '../stores/sessions';
 import { colorsFor } from '../iso/officeMap';
+import { shade } from '../iso/iso';
 import { useI18n } from '../i18n';
 import { agentBase } from '@workgremlin/shared';
 import { httpBase, getServerInfo } from '../api/bridge';
@@ -108,7 +109,7 @@ function endedText(it) {
     floor,
     taskLabel,
     taskText,
-    floorColor: colorsFor(floor).wood,
+    floorColor: shade(colorsFor(floor).wood, 1.6),
     text: `${time} ${floor} ${taskLabel}${taskText}`,
     suffix,
     suffixKind,
@@ -218,7 +219,7 @@ const runningItems = computed(() => {
         floor,
         taskLabel,
         taskText,
-        floorColor: colorsFor(floor).wood,
+        floorColor: shade(colorsFor(floor).wood, 1.6),
         text: `${time} ${floor} ${taskLabel}${taskText}`,
         startedAt: Number(it.started_at) || 0,
       };
