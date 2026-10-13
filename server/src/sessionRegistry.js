@@ -34,15 +34,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
-
-// 调试日志（取消检测排查用，可整体删除）：写到 ~/.workgremlin/cb-cancel-debug.log
-const _dbgLogPath = path.join(require('node:os').homedir(), '.workgremlin', 'cb-cancel-debug.log');
-function dbgLog(...a) {
-  try {
-    const line = `[CB-CANCEL ${new Date().toISOString()}] ` + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
-    fs.appendFileSync(_dbgLogPath, line + '\n');
-  } catch {}
-}
 const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
 const { formToSource } = require('@workgremlin/shared');
@@ -573,39 +564,32 @@ function refresh({ workspacePath = '', force = false } = {}) {
 function handlePlugin(p, src, ctx) {
   const { workspacePath, force, table, claim, upsert, listSessions, listReporterSessions, doneFieldsOf, doneScans } = ctx;
   /**
-   * 合并楼层（1F CodeBuddy）的**插件来源**也会产出「取消」标记：插件按停止一个 hook 事件都不发，
-   * 唯一真信号在 message-queue 的 `pauseReason:'cancel'`（见 floorCodebuddy.synthMarks），由
-   * readReporterDones 合成、挂在 doneScans 上。flushSynthesizedCancels / flushSupersededTasks
-   * 只扫 doneScans，而 handlePlugin 自己不调 doneFieldsOf（done* 字段走 listSessions 那条独立路径算），
-   * 于是 codebuddy-plugin 的 doneScan 永远是空，插件取消永远扫不到 → task_runs 一直挂 running，
-   * 滚动屏幕 / 任务列表收不到「已取消」，只能等新一轮开工（endStaleTasksOfSession）把上一轮顶掉。
-   * 这里把这一份 doneScan 建出来（与 doneFieldsOf 同一把缓存键），让 flush 能补刀 task/end(cancelled)。
+   * plugin 这路也要建一份 doneScan：某些楼层的插件**取消时一个 hook 事件都不发**，只能由楼层自己的
+   * synthMarks 从落盘认出来、经 readReporterDones 合成取消/完成标记（楼层私有逻辑，这里不掺和）。
+   * 而 flush* 只扫 doneScans，handlePlugin 又不走 doneFieldsOf（done* 字段经 listSessions 另外算）——
+   * 不建这份，插件取消就永远扫不到，task_runs 一直挂 running、滚动屏 / 任务列表收不到「已取消」。
+   * 这里按 (工程 | client) 建一份（与 doneFieldsOf 同一把缓存键），让 flush 能补刀 task/end(cancelled)。
    */
   const scanKey = `${workspacePath || ''}|${src.client || ''}`;
-  if (!doneScans.has(scanKey)) {
-    dbgLog('[handlePlugin] readReporterDones for client=', src.client, 'workspacePath=', workspacePath);
-    const scan = readReporterDones(workspacePath, src.client);
-    dbgLog('[handlePlugin]   -> cancels=', (scan.cancels || []).map((c) => ({ sid: c.sessionId, taskId: c.taskId || '(empty)', at: c.at })),
-      'bySession=', [...(scan.bySession || new Map()).keys()]);
-    doneScans.set(scanKey, scan);
-  }
-  const isCodebuddyPlugin = p.agent === 'codebuddy' && src.client === 'codebuddy-plugin';
+  if (!doneScans.has(scanKey)) doneScans.set(scanKey, readReporterDones(workspacePath, src.client));
+
+  // 楼层可选的**插件会话策略**（谁算当前会话 / 谁已结束 / 谁不该列进下拉）：框架不认识任何产品，
+  // 只按接口派发（见 floors.js 的 FLOOR_CONTRACT: pluginPolicy；1F 的实现见 floorCodebuddy.js）。
+  // 没实现策略的楼层就是"全量列出 + 只排除 reporter 里已 SessionEnd 的"（下面 policy 为空时的默认行为）。
+  const mod = floorOf(p.id);
+  const policy = mod && typeof mod.pluginPolicy === 'function' ? mod.pluginPolicy(ctx) || {} : {};
   const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
-  const pluginLifecycleSessions = isCodebuddyPlugin
-    ? listReporterSessions('codebuddy', { includeEnded: true }).filter((s) => s.form === 'vscode')
-    : [];
   const endedSessionIds = new Set([
     ...reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId),
-    ...pluginLifecycleSessions.filter((s) => s.endedAt).map((s) => s.sessionId),
+    ...(policy.ended || []).map((s) => s.sessionId),
   ]);
-  const activePluginSessions = pluginLifecycleSessions.filter((s) => s.currentProcess && !s.endedAt);
   const st = listSessions({
     workspacePath,
     force,
     client: src.client,
     pluginRe: p.pluginRe,
-    currentOnly: isCodebuddyPlugin,
-    activeSessions: activePluginSessions,
+    currentOnly: Boolean(policy.currentOnly),
+    activeSessions: policy.active || [],
   });
   if (endedSessionIds.size) {
     for (const [key, session] of table) {
@@ -613,9 +597,7 @@ function handlePlugin(p, src, ctx) {
     }
   }
   const pluginSessions = (st.sessions || []).filter(
-    (s) =>
-      !endedSessionIds.has(s.id) &&
-      !(src.client === 'codebuddy-plugin' && s.runtime && s.runtime.paused && String(s.runtime.pauseReason || '').toLowerCase() === 'cancel')
+    (s) => !endedSessionIds.has(s.id) && !(typeof policy.exclude === 'function' && policy.exclude(s))
   );
   const pluginSessionIds = new Set(pluginSessions.map((s) => s.id));
   for (const [key, session] of table) {
@@ -745,42 +727,35 @@ const DEFAULT_KIND_HANDLERS = {
 const postedCancels = new Map(); // key -> 过期时间戳（避免进程存活期间反复补发）
 function flushSynthesizedCancels(doneScans, now) {
   const { bus, repo } = backend || {};
-  dbgLog('[flushSynthesizedCancels] called; doneScans=', doneScans.size, 'backend.bus=', !!(bus && typeof bus.endTask === 'function'), 'backend.repo=', !!repo);
   if (!bus || typeof bus.endTask !== 'function') return;
   for (const scan of doneScans.values()) {
     for (const c of scan.cancels || []) {
       // taskId 可能为空（Trae：取消信号来自 renderer.log，hook 状态文件的 taskId 永远是新一轮的）。
       // 用 cancelAt 参与去重 key，避免同一取消反复补发。
-      dbgLog('[flush] cancel: sessionId=', c.sessionId, 'taskId=', c.taskId || '(empty)', 'at=', new Date(Number(c.at)).toISOString(), 'ws=', c.workspacePath, 'client=', c.client);
       const key = `${c.sessionId}|${c.taskId || ''}|${c.workspacePath}|${c.at}`;
-      if (postedCancels.get(key) > now) { dbgLog('  -> dedup skip (already posted)'); continue; }
+      if (postedCancels.get(key) > now) continue;
       let task = null;
       if (c.taskId) {
         // Claude / Qoder / CodeBuddy 插件：taskId 直接可取（hook 状态文件里存的是被取消那一轮的）
         task = repo && repo.getTask ? repo.getTask.get(c.taskId) : null;
-        dbgLog('  getTask by taskId ->', task ? ('FOUND ' + task.id + ' state=' + task.state) : 'NULL');
       }
       if (!task && repo && repo.listStaleRunningBySession && c.sessionId) {
         // Trae：taskId 为空，从 task_runs 里找这条会话里"cancelAt 之前开始、
         // 至今还挂 running"的那条（它就是被取消的上一轮；新一轮 startedAt > cancelAt，
         // 不会被误取）。按 started_at DESC 取最新一条。
         const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(c.workspacePath || '')) : null;
-        if (!proj) { dbgLog('  getProjectByWorkspace -> NULL (workspace not registered?)'); }
-        else {
+        if (proj) {
           const all = repo.listStaleRunningBySession.all(proj.id, c.sessionId);
-          dbgLog('  project=', proj.id, 'staleRunning=', all ? all.length : 0, all && all.map((r) => ({ id: r.id, startedAt: r.startedAt })));
           const atC = Number(c.at) || 0;
           // 最新开始的那条 <= cancelAt —— 那就是被取消的
           const match = all
             .filter((r) => Number(r.startedAt) && (!atC || Number(r.startedAt) <= atC))
             .sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
-          dbgLog('  fallback match ->', match ? ('FOUND ' + match.id) : 'NULL (no stale running <= cancelAt)');
           if (match) task = repo.getTask ? repo.getTask.get(match.id) : null;
         }
       }
-      if (!task) { dbgLog('  -> NO TASK matched, skip'); continue; }
+      if (!task) continue;
       postedCancels.set(key, now + 10 * 60_000);
-      dbgLog('  -> bus.endTask(cancelled) taskId=', task.id);
       try {
         bus.endTask({
           project: task.project_id,
@@ -795,8 +770,7 @@ function flushSynthesizedCancels(doneScans, now) {
           sessionId: c.sessionId,
           ts: c.at,
         });
-      } catch (e) {
-        dbgLog('  -> bus.endTask threw:', e && e.message);
+      } catch {
         /* 补发失败不影响会话表 */
       }
     }

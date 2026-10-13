@@ -64,6 +64,30 @@ const FLOORS = { trae, claude, codebuddy, copilot, qoder };
 // 落盘窗口常量（与 CLI 楼层对齐）定义在 plugin.js，sessions.js / copilot.js 共用同一份，避免各定义一遍
 const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
 
+/**
+ * 按 client 找楼层模块：client 形如 `codebuddy` / `codebuddy-plugin`（剥掉 `-plugin` 后缀按基名认）。
+ * 楼层的"插件结构化落盘读取器 / 落盘标记"都挂在楼层模块上（见 floorCodebuddy 的 pluginStore），
+ * 本文件只按 client 派发，不掺任何产品的内部目录结构。
+ */
+function floorModuleOf(client) {
+  const base = String(client || '').replace(/-plugin$/i, '').toLowerCase();
+  return FLOORS[base] || null;
+}
+
+/** 空读取器：楼层没实现 pluginStore（如 9F Copilot 走自己的 SQLite）时用它，读到的都是"没有" */
+const EMPTY_PLUGIN_STORE = {
+  readTodos: () => ({ total: 0, done: 0, doing: '', items: [], at: 0 }),
+  readFileChanges: () => ({ count: 0, recent: [], lastAt: 0 }),
+  readRuntime: () => ({ runtime: { activated: false, paused: false, awaitingSessionIdle: false }, pending: 0, hasRuntime: false, updatedAt: 0 }),
+  collectProjects: () => [],
+};
+
+/** 这一路（client）的插件结构化落盘读取器；楼层没实现就回空读取器（读不到就是读不到） */
+function pluginStoreOf(client) {
+  const mod = floorModuleOf(client);
+  return (mod && mod.pluginStore) || EMPTY_PLUGIN_STORE;
+}
+
 
 /**
  * 插件落盘这一路的来源客户端：**按楼层传入**，不再写死。
@@ -101,7 +125,7 @@ const SERVER_STARTED_AT = Date.now();
 // 统一定义在 plugin.js，避免 sessions.js / copilot.js 各写一份。上面已由 `const { ... } = plugin` 引入。
 
 /* ------------------------------ 会话数据 ------------------------------ */
-/** 每个会话的待办 / 改动文件 / 消息队列运行态的读取收口在 plugin.js（plugin.readTodos / readFileChanges / readRuntime）。 */
+/** 每个会话的待办 / 改动文件 / 消息队列运行态按 client 派发到楼层的 pluginStore（见 floorCodebuddy.js）。 */
 
 const AWAIT_TTL_MS = 5 * 60_000;
 /**
@@ -913,10 +937,12 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
 
 /** 单个会话的完整信息 */
 function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false, client = '' } = {}) {
-  // 结构化落盘（todos / file-changes / message-queue）的读取统一收口在 plugin.js，本文件只综合。
-  const todos = plugin.readTodos(storage, id);
-  const files = plugin.readFileChanges(storage, id);
-  const mq = plugin.readRuntime(storage, id);
+  // 结构化落盘（todos / file-changes / message-queue）的读取按 client 派发到对应楼层的 pluginStore
+  // （1F CodeBuddy 那套 genie-history 落盘归 floorCodebuddy.js；本文件只综合，不懂任何产品的目录结构）。
+  const store = pluginStoreOf(client);
+  const todos = store.readTodos(storage, id);
+  const files = store.readFileChanges(storage, id);
+  const mq = store.readRuntime(storage, id);
   const lastUpdated = Math.max(todos.at, files.lastAt, mq.updatedAt) || null;
   // 活跃 = 当前会话且近期有动静 / 运行态新鲜 / 刚改过文件。
   // 关键：关掉 IDE 后插件不再落盘，但 current.json 仍指向它、runtime.activated 也残留为真，
@@ -1006,16 +1032,21 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
 
 /* ------------------------------ 对外：列会话 ------------------------------ */
 
-/** 工程路径补全与 genie-history 工程归集的读取收口在 plugin.js（plugin.completeTruncatedWorkspace / plugin.collectProjects）。 */
+/** 工程路径补全与 genie-history 工程归集由楼层的 pluginStore 提供（见 floorCodebuddy.js 的 collectProjects）。 */
 
 /**
  * 列出**所有工程**里的活跃会话（不局限于当前打开的那个工程）。
- * @param {{workspacePath?: string, force?: boolean, client?: string, pluginRe?: RegExp[]}} o
+ * @param {{workspacePath?: string, force?: boolean, client?: string, pluginRe?: RegExp[], currentOnly?: boolean, activeSessions?: object[]}} o
  * @returns {{ok: true, sessions: Array, current: string, workspacePath: string,
  *            storage: string, reason?: string}}
  *   reason: 'no-storage' 没找到插件落盘 / 'no-open-project' 一个活跃会话都没有
  */
-function listSessions({ workspacePath = '', force = false, client = '', pluginRe = plugin.PLUGIN_RE, currentOnly = false, activeSessions = [] } = {}) {
+function listSessions({ workspacePath = '', force = false, client = '', pluginRe = null, currentOnly = false, activeSessions = [] } = {}) {
+  // 这一路的楼层：落盘目录正则 / 落盘标记 / 结构化读取器都按它取（缺省就用楼层自己 meta 里的 pluginRe）。
+  // 不在这里内置"所有插件产品"的并集 —— 那会让某一层扫到别的楼层的落盘（见 taskSync.test [8]）。
+  const mod = floorModuleOf(client);
+  const re = pluginRe || (mod && mod.meta && mod.meta.pluginRe) || [];
+  const storageMarks = (mod && mod.meta && mod.meta.pluginStorageMarks) || [];
   // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
   // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
   // 只认传入的 client 这一路：这份清单属于某个插件楼层，别层（其它产品 / 同一产品的 CLI）
@@ -1025,10 +1056,10 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   // 缓存键必须覆盖 client / pluginRe / 工程，否则同一工程里的不同插件楼层、或 CLI/Plugin 视图
   // 会复用上一次的旧结果（例如 A5 里 plugin 那路读到先前写入的窗口值、误以为还在全局表里）。
   const activeKey = activeSessions.map((s) => `${s.sessionId}:${s.lastEventAt}`).sort().join(',');
-  const key = `${client}@@${ws}@@${currentOnly ? 'current-only' : 'all'}@@${activeKey}@@${String(pluginRe instanceof RegExp ? pluginRe.source : Array.isArray(pluginRe) ? pluginRe.map((r) => (r && r.source) || String(r)).join('|') : String(pluginRe || ''))}`;
+  const key = `${client}@@${ws}@@${currentOnly ? 'current-only' : 'all'}@@${activeKey}@@${String(Array.isArray(re) ? re.map((r) => (r && r.source) || String(r)).join('|') : re instanceof RegExp ? re.source : String(re || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
-  const storage = plugin.findPluginStorage(pluginRe);
+  const storage = plugin.findPluginStorage(re, storageMarks);
   if (!storage) {
     cache = {
       at: now,
@@ -1047,7 +1078,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   // candidates 传"真实活动工程 + 本次查询的工程"，顺序即优先级（ws 放最前）：
   // genie-history 目录名可能被扩展截断，用它俩把半截路径补回完整路径（优先磁盘上真实存在的目录），
   // 否则工程名会显示成被截断后的残尾、currentId 落空，见 completeTruncatedWorkspace
-  for (const p of plugin.collectProjects(storage, [ws, workspacePath])) {
+  for (const p of pluginStoreOf(client).collectProjects(storage, [ws, workspacePath])) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
     if (cid) {

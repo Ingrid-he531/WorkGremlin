@@ -677,9 +677,11 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   fs.writeFileSync(path.join(TEN, 'todos', `${cbSid}.json`), JSON.stringify({ todos: [{ status: 'in_progress', content: '别的楼层正在跑' }] }));
   fs.mkdirSync(path.join(TEN, 'file-changes', cbSid), { recursive: true });
 
-  // 先证明事故现场：共享 PLUGIN_RE 确实把这条会话扫得出来（不锁 pluginRe 就是这个后果）
-  const unionSnap = realListSessions({ force: true, client: 'copilot-plugin' });
-  ok('前置：共享 PLUGIN_RE 会把 Tencent 目录里正在跑的会话当 Copilot 扫出来（事故现场）', unionSnap.sessions.some((s) => s.id === cbSid), unionSnap.storage);
+  // 历史事故根因：默认 pluginRe 曾是"所有插件产品的并集"，会把 Tencent 目录里的会话当成 Copilot 扫出来。
+  // 现在默认不带 pluginRe 时按 client 锁到**本楼层**的 pluginRe + 落盘标记（见 sessions.js / plugin.js）。
+  const defaultSnap = realListSessions({ force: true, client: 'copilot-plugin' });
+  ok('默认（不带 pluginRe）按楼层锁定 9F 自己的落盘，扫不到 Tencent 目录里的会话', !defaultSnap.sessions.some((s) => s.id === cbSid), defaultSnap.storage);
+  ok('默认落盘根不是 Tencent 的插件目录', defaultSnap.storage !== TEN, defaultSnap.storage);
   const scopedSnap = realListSessions({ force: true, client: 'copilot-plugin', pluginRe: RE_GITHUB_COPILOT });
   ok('9F 自己的 pluginRe 不会把别的产品的落盘当自己的', !scopedSnap.sessions.some((s) => s.id === cbSid), scopedSnap.storage);
 

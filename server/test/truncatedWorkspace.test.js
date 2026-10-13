@@ -35,7 +35,8 @@ process.env.WORKGREMLIN_HOME = WG;
 // 先 require：sessions.js 的 SERVER_STARTED_AT 必须早于下面写的 hook 时间戳，
 // 否则相位会被"重启纪元"守卫丢掉 —— 那不是这里要测的东西。
 const { listSessions } = require('../src/sessions');
-const { decodeDirName, completeTruncatedWorkspace } = require('../src/plugin');
+// genie-history 目录名解码 / 截断补全是 1F CodeBuddy 的落盘知识，归 floorCodebuddy
+const { decodeDirName, completeTruncatedWorkspace } = require('../src/floorCodebuddy');
 
 let pass = 0;
 let fail = 0;

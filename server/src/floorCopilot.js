@@ -36,6 +36,8 @@ const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 
 // 9F 专属：本楼层 pluginRe（products.js 的 findDataPath 的 copilot 分支也要它），放这里避免循环 require。
 const RE_GITHUB_COPILOT = [/^github\.copilot/i, /^github-copilot/i, /^github\.copilot-chat/i, /^copilot/i];
+// 本楼层插件存储根的标记：目录里得有会话库才算（挡掉同前缀的 `github.copilot` 基础扩展目录）
+const RE_GITHUB_COPILOT_MARKS = ['session-store.db'];
 
 // 通用文件判断（isFile / isDir）统一从 roots 取，避免各处重复定义
 /* ───────────── 原 sessions.js 的 Copilot 读取函数 ───────────── */
@@ -653,7 +655,7 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
 
 function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
   // copilot 专属：client 现在只描述形态（cli / vscode），楼层由调用方保证
-  const storage = findPluginStorage();
+  const storage = findPluginStorage(RE_GITHUB_COPILOT, RE_GITHUB_COPILOT_MARKS);
   if (!storage) return null;
   const rowList = readSqliteSessionRows(storage)
     .filter((r) => (!session || String(r.id || '') === String(session)))
@@ -692,7 +694,7 @@ function copilotCurrentModel() {
   if (copilotModelCache.value && now - copilotModelCache.at < COPILOT_MODEL_CACHE_TTL) {
     return copilotModelCache.value;
   }
-  const storage = findPluginStorage([/github\.copilot/i, /github-copilot/i, /^copilot/i]);
+  const storage = findPluginStorage([/github\.copilot/i, /github-copilot/i, /^copilot/i], RE_GITHUB_COPILOT_MARKS);
   if (!storage) {
     copilotModelCache = { at: now, value: '' };
     return '';
@@ -1253,6 +1255,8 @@ const meta = {
   agent: 'copilot',
   plugin: true,
   pluginRe: RE_GITHUB_COPILOT,
+  // 这一层的插件存储根标记：同前缀的 `github.copilot`（基础扩展）里没有会话库，用 session-store.db 把它挡掉
+  pluginStorageMarks: ['session-store.db'],
   // 仅展示 GitHub Copilot VS Code 插件这一层（无独立 CLI 形态）。
   sources: ['plugin'],
   dataKind: diskKey('copilot', 'vscode'),

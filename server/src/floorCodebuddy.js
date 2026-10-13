@@ -16,21 +16,175 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { diskKey } = require('@workgremlin/shared');
 // globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
-const { globalStorageRoots, dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
+const { dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
+// 工程名解析（genie-history 目录名 → 工程名）收口在 project.js
+const { resolveProjectName } = require('./project');
 
 const HOME = os.homedir();
 
-// 调试日志（取消检测排查用，可整体删除）：写到 ~/.workgremlin/cb-cancel-debug.log
-const _dbgLogPath = path.join(HOME, '.workgremlin', 'cb-cancel-debug.log');
-function dbgLog(...a) {
-  try {
-    const line = `[CB-CANCEL ${new Date().toISOString()}] ` + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
-    fs.appendFileSync(_dbgLogPath, line + '\n');
-  } catch {}
-}
-
 /** 插件目录名匹配（仅 plugin 楼层需要）；findPluginDir 的默认正则也用它 */
 const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
+
+/* ===================== CodeBuddy 家族插件结构化落盘（plugin kind 取数） =====================
+ * genie-history（工程归集）/ todos / file-changes / message-queue 这一套目录结构是 CodeBuddy
+ * （腾讯 Coding Copilot）插件**独有**的，别的插件楼层各有各的落盘（9F Copilot 是 session-store.db，
+ * 见 floorCopilot.js）。所以它归本楼层所有 —— 由 sessions.js 的 listSessions 按 client 派发到
+ * 下面的 pluginStore，通用插件读取器（plugin.js）不再掺和任何产品的内部目录结构。
+ */
+
+/** 文件 mtime（ms）；读不到回 0（"没动过"，绝不编造） */
+function mtime(p) {
+  try {
+    return Math.round(fs.statSync(p).mtimeMs);
+  } catch {
+    return 0;
+  }
+}
+
+/** 目录名是工程路径的 base64；解不出来（不是路径）就返回空 */
+function decodeDirName(name) {
+  try {
+    const s = Buffer.from(String(name), 'base64').toString('utf8');
+    if (!s || s.includes('\u0000')) return '';
+    if (s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
+  } catch {
+    /* 不是 base64，跳过 */
+  }
+  return '';
+}
+
+/**
+ * 补全被扩展截断的工程路径（genie-history 目录名截到 64 字符 → 解出来只剩半截）。
+ * 在已知真实工程（按可信度排序）里找一条以半截串为前缀的补上；优先磁盘上真实存在的目录。
+ * 补不上就原样返回，不影响没被截断的机器。
+ */
+function completeTruncatedWorkspace(decoded, candidates) {
+  const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (!decoded || isDir(decoded)) return decoded; // 磁盘上真有这个目录 = 没被截断
+  const want = norm(decoded);
+  if (!want) return decoded;
+  // 顺序即优先级：候选里第一条"以半截串为前缀（截断=纯前缀截断）"就是答案。不做"取最短"——
+  // 两条候选共享同一截断前缀时，按长短挑会挑错工程；按可信度排序才能保证真实活动工程（ws，放最前）优先补上。
+  // isDir 只作**优先判据，不作硬门槛**：优先补到磁盘上真实存在的目录，都没有就按顺序退回第一条命中。
+  let fallback = '';
+  for (const c of candidates || []) {
+    if (!c) continue;
+    const n = norm(c);
+    if (!n || n === want || !n.startsWith(want)) continue;
+    if (isDir(c)) return c;
+    if (!fallback) fallback = c;
+  }
+  return fallback || decoded;
+}
+
+/** genie-history 下每个 base64 目录 = 一个工程（目录名解出来就是工程绝对路径） */
+function collectProjects(storage, candidates = []) {
+  const gh = path.join(storage, 'genie-history');
+  const out = [];
+  for (const name of readDir(gh)) {
+    const dir = path.join(gh, name);
+    if (!isDir(dir)) continue;
+    const ws = completeTruncatedWorkspace(decodeDirName(name), candidates);
+    if (!ws) continue;
+    out.push({ dir, path: ws, project: resolveProjectName(ws) || path.basename(ws) });
+  }
+  return out;
+}
+
+/** 每个会话的待办：total / done / doing（第一条 in_progress）/ 前几条的文案 */
+function readTodos(storage, id) {
+  const file = path.join(storage, 'todos', `${id}.json`);
+  const data = readJson(file);
+  const list = Array.isArray(data && data.todos) ? data.todos : [];
+  const doing = list.find((t) => t && t.status === 'in_progress') || null;
+  return {
+    total: list.length,
+    done: list.filter((t) => t && t.status === 'completed').length,
+    doing: doing ? String(doing.content || '') : '',
+    items: list.slice(0, 8).map((t) => ({
+      status: String((t && t.status) || 'pending'),
+      content: String((t && t.content) || '').replace(/\s+/g, ' ').trim(),
+    })),
+    at: mtime(file),
+  };
+}
+
+/** 文件当前字节大小（按绝对路径现 stat）。删除类改动的源文件已不存在 → null，绝不编造。 */
+function fileSizeOf(fp) {
+  if (!fp || typeof fp !== 'string') return null;
+  try {
+    const s = fs.statSync(fp);
+    return s.isFile() ? s.size : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 改动文件：按最后写入倒序取最近几个 */
+function readFileChanges(storage, id) {
+  const dir = path.join(storage, 'file-changes', id);
+  const out = [];
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const p = path.join(dir, name);
+    const j = readJson(p);
+    if (!j) continue;
+    out.push({
+      name: String(j.fileName || path.basename(String(j.filePath || name))),
+      op: String(j.changeType || ''),
+      added: Number(j.addedLines) || 0,
+      removed: Number(j.removedLines) || 0,
+      // 字节大小：文件本体（filePath 是绝对路径）现 stat。插件 / IDE 这份落盘只给行数、
+      // 不给体积，只能服务端现算；删除类改动的源文件已不在，算不到就留 null。
+      size: fileSizeOf(j.filePath),
+      at: mtime(p),
+    });
+  }
+  out.sort((a, b) => b.at - a.at);
+  return { count: out.length, recent: out.slice(0, 6), lastAt: out.length ? out[0].at : 0 };
+}
+
+/**
+ * 消息队列里该会话的运行态 + 排队条数。
+ * 一个 message-queue 文件里可能装着多个会话，全部扫一遍取自己的那份。
+ */
+function readRuntime(storage, id) {
+  const dir = path.join(storage, 'message-queue');
+  let runtime = null;
+  let pending = 0;
+  let updatedAt = 0;
+  for (const name of readDir(dir)) {
+    if (!/\.json$/i.test(name)) continue;
+    const j = readJson(path.join(dir, name));
+    const conv = j && j.conversations ? j.conversations[id] : null;
+    if (!conv) continue;
+    if (conv.runtime) runtime = { ...(runtime || {}), ...conv.runtime };
+    for (const it of conv.items || []) if (it && it.status === 'pending') pending += 1;
+    const itemUpdatedAt = (conv.items || []).reduce((best, item) => Math.max(
+      best,
+      Number(item && (item.updatedAt || item.createdAt || item.at)) || 0
+    ), 0);
+    updatedAt = Math.max(
+      updatedAt,
+      Number(conv.updatedAt) || 0,
+      Number(conv.runtime && conv.runtime.updatedAt) || 0,
+      itemUpdatedAt
+    );
+  }
+  return {
+    runtime: runtime || { activated: false, paused: false, awaitingSessionIdle: false },
+    pending,
+    hasRuntime: Boolean(runtime),
+    updatedAt,
+  };
+}
+
+/**
+ * 本楼层 plugin kind 的结构化落盘读取器 —— sessions.js 的 listSessions / sessionInfo 按 client
+ * 派发到这里（见 sessions.js 的 pluginStoreOf）。接口与"插件落盘读取"约定一致：
+ *   readTodos(storage, id) / readFileChanges(storage, id) / readRuntime(storage, id) / collectProjects(storage, candidates)
+ */
+const pluginStore = { readTodos, readFileChanges, readRuntime, collectProjects };
 
 /* ------------------------------ 取消检测 ------------------------------ */
 
@@ -97,7 +251,6 @@ function codebuddyReadCancels(transcriptDir) {
   try {
     files = readDir(mdir).filter((n) => /\.json$/i.test(n));
   } catch {
-    dbgLog('[cancelTimes] mdir MISSING:', mdir);
     return [];
   }
   // 失效信号必须看"具体文件的 mtime/size"，不能只看目录 mtime：取消消息常是就地改写
@@ -111,11 +264,9 @@ function codebuddyReadCancels(transcriptDir) {
   }
   const cached = _cbCancelCache.get(mdir);
   if (cached && cached.sig === sig) {
-    dbgLog('[cancelTimes] cache HIT', mdir, '->', cached.cancels);
     return cached.cancels;
   }
   const cancels = [];
-  let fileCount = files.length, matched = 0;
   try {
     for (const name of files) {
       const fp = path.join(mdir, name);
@@ -136,14 +287,12 @@ function codebuddyReadCancels(transcriptDir) {
         ? inner.content.filter((p) => p && p.type === 'text').map((p) => p.text).join('')
         : '';
       if (txt !== '[User Cancelled]') continue; // 精确匹配（带方括号、英文）；工具回显里的同名串因 role 过滤不算
-      matched++;
       let at = 0;
       try {
         at = Math.round(fs.statSync(fp).mtimeMs);
       } catch {
         continue;
       }
-      dbgLog('[cancelTimes]   FOUND cancel file=', name, 'at=', new Date(at).toISOString());
       cancels.push(at);
     }
   } catch {
@@ -151,7 +300,6 @@ function codebuddyReadCancels(transcriptDir) {
   }
   cancels.sort((a, b) => a - b);
   _cbCancelCache.set(mdir, { sig, cancels });
-  dbgLog('[cancelTimes] cache MISS', mdir, 'files=', fileCount, 'matched=', matched, '-> cancels=', cancels);
   return cancels;
 }
 
@@ -221,6 +369,9 @@ const meta = {
   agent: 'codebuddy',
   plugin: false,
   pluginRe: RE_PLUGIN,
+  // 这一层的插件结构化落盘"长什么样"的标记：命中 pluginRe 的目录里得有其中任一，才算它的插件存储根
+  // （见 plugin.js 的 findPluginStorage）。放在 meta 里，通用定位器不写死任何产品目录名。
+  pluginStorageMarks: ['genie-history', 'todos', 'file-changes', 'message-queue'],
   // 合并楼层：三路都归这一层；同一会话被两路同时看到时按 session_id 去重（见 sessionRegistry）。
   sources: ['cli', 'plugin', 'hook'],
   dataKind: 'codebuddy',
@@ -612,6 +763,13 @@ module.exports = {
   meta,
   // 供 findPluginDir / findPluginStorageDir 默认正则复用
   RE_PLUGIN,
+  // plugin kind 的结构化落盘读取：sessions.js 按 client 派发到这里（见 pluginStore）
+  pluginStore,
+  // genie-history 目录名解码 / 截断补全（自检用；collectProjects 内部也用它）
+  decodeDirName,
+  completeTruncatedWorkspace,
+  // plugin kind 的会话列表策略：sessionRegistry.handlePlugin 按接口通用派发（见 pluginPolicy）
+  pluginPolicy,
   // 取消检测（统一模块组接口：cancelAt / allCancels，与 trae 同签名）
   cancelAt: codebuddyCancelAt,
   phaseSuperseded,
@@ -621,6 +779,34 @@ module.exports = {
   // 服务端 hook 事件处理（落盘解析归服务端）
   handleHookEvent,
 };
+
+/**
+ * 1F 插件（VS Code 扩展）的**会话列表策略** —— 由 sessionRegistry.handlePlugin 通用派发。
+ * 框架不认识任何 CodeBuddy 细节，只认这个接口（见 floors.js 的 FLOOR_CONTRACT）。
+ *
+ * 为什么需要：插件形态的会话"在册 / 已退"由 reporter 状态文件里的 SessionStart / SessionEnd
+ * 记（上报 client 记成 `codebuddy`、form 记成 `vscode` —— CLI 客户端不带 form）。需求是
+ * 1F 下拉**只列当前会话**、按 SessionStart / SessionEnd 动态加减，不把历史会话全塞进去。
+ *
+ * @param {object} ctx refresh 的共享工具包（用到 listReporterSessions）
+ * @returns {{currentOnly?:boolean, active?:object[], ended?:object[], exclude?:(row:object)=>boolean}}
+ */
+function pluginPolicy(ctx) {
+  const listReporterSessions = ctx && ctx.listReporterSessions;
+  if (typeof listReporterSessions !== 'function') return {};
+  const life = listReporterSessions('codebuddy', { includeEnded: true }).filter((s) => s.form === 'vscode');
+  return {
+    // 只列 current.json 指的那条 + 活跃会话，不把历史会话塞进下拉
+    currentOnly: true,
+    // SessionStart 落过、还没 SessionEnd 的：必须列出来（哪怕它还不是 current.json 指的那条）
+    active: life.filter((s) => s.currentProcess && !s.endedAt),
+    // 已 SessionEnd 的：从列表移除
+    ended: life.filter((s) => s.endedAt),
+    // runtime 已取消的：仍不该进下拉（取消 = 没干完，也不该占着一条会话）
+    exclude: (row) =>
+      Boolean(row && row.runtime && row.runtime.paused && String(row.runtime.pauseReason || '').toLowerCase() === 'cancel'),
+  };
+}
 
 /**
  * 楼层特有的"取消"标记合成，由 sessions.js 的 readReporterDones 统一派发。
@@ -645,7 +831,6 @@ module.exports = {
  */
 function synthMarks(ctx) {
   const { workspacePath, hookBySid, synthCancel } = ctx || {};
-  dbgLog('[synthMarks] enter; workspacePath=', workspacePath, 'hookBySid.size=', hookBySid && hookBySid.size);
   if (!hookBySid) return;
   for (const [sid, entry] of hookBySid) {
     const j = entry && entry.j; // hookBySid 的值是 { j } 包装，不是直接的 j
@@ -653,24 +838,18 @@ function synthMarks(ctx) {
     if (!/^codebuddy/i.test(String(j.client || ''))) continue;
     const dir = j.transcriptPath ? path.dirname(j.transcriptPath) : '';
     const times = codebuddyCancelTimes(sid, dir); // 该会话全部 [User Cancelled] 时刻（不过滤）
-    dbgLog('[synthMarks] sid=', sid, 'client=', j.client, 'transcriptPath=', j.transcriptPath,
-      'dir=', dir, 'taskStartedAt=', j.taskStartedAt, 'taskId=', j.taskId, 'cancelTimes=', times);
     if (!times.length) continue;
     const taskStarted = Number(j.taskStartedAt) || 0;
     const latest = times.reduce((a, b) => Math.max(a, b), 0);
     for (const at of times) {
       if (taskStarted && at < taskStarted) {
         // 历史任务的取消：taskId 留空，交给会话兜底匹配（不误伤当前在跑任务，也不亮当前红灯）
-        dbgLog('[synthMarks]   -> push HISTORICAL cancel (taskId empty) at=', at);
         synthCancel({ id: sid, j, ws: workspacePath || '', at, consoleMark: false, taskId: '' });
       }
     }
     // 当前这一轮（或没有本轮起点）：正常合成（带 taskId + 亮主控制台红灯）
     if (!taskStarted || latest >= taskStarted) {
-      dbgLog('[synthMarks]   -> push CURRENT cancel (taskId=', j.taskId, ') at=', latest);
       synthCancel({ id: sid, j, ws: workspacePath || '', at: latest });
-    } else {
-      dbgLog('[synthMarks]   -> skip current (latest<taskStarted, 只处理历史)');
     }
   }
 }

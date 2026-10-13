@@ -19,6 +19,11 @@
  *   kindHandlers (可选) 该楼层特有的"会话来源分支"：{ <kind>: (product, spec, ctx) => void }
  *   sessionTitle (可选) 该楼层自己的会话标题读取：function(sessionId) => string
  *   syncTasks / startSyncer (可选) 后台台账同步器（见各楼层文件）
+ *   pluginStore  (可选) 该楼层 plugin kind 的结构化落盘读取器：
+ *                { readTodos(storage,id), readFileChanges(storage,id), readRuntime(storage,id),
+ *                  collectProjects(storage,candidates) } —— sessions.js 按 client 派发（1F 见 floorCodebuddy）
+ *   pluginPolicy (可选) 该楼层 plugin kind 的会话列表策略，由 sessionRegistry.handlePlugin 通用派发：
+ *                (ctx) => { currentOnly?, active?, ended?, exclude?(row) }（1F 见 floorCodebuddy）
  *
  * 依赖方向：本文件 require 所有楼层模块（构建注册表）；楼层模块只 require 通用模块（roots.js /
  * @workgremlin/shared），不再 require 本文件 —— 因此不存在循环 require。
@@ -57,6 +62,8 @@ const FLOOR_CONTRACT = [
   'syncTasks',
   'startSyncer',
   'modelOf',
+  'pluginStore',
+  'pluginPolicy',
 ];
 
 /* ============================================================== 注册表 */

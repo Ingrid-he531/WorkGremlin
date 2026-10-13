@@ -65,7 +65,9 @@ process.env.PATH = BIN;
 const { snapshot, table, setBackend } = require('../src/sessionRegistry');
 const { reporterMainPhase, listReporterSessions, listSessions } = require('../src/sessions');
 const { detectProducts } = require('../src/floors');
-const { readRuntime } = require('../src/plugin');
+// readRuntime 是 1F 自己的插件结构化落盘读取器（genie-history 那套），归 floorCodebuddy
+const { pluginStore } = require('../src/floorCodebuddy');
+const { readRuntime } = pluginStore;
 
 /* ------------------------------ 造数据 ------------------------------ */
 
