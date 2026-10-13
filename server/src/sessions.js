@@ -199,7 +199,6 @@ function sessionModel(client, sessionId, agentType = '') {
 
 function readReporterPhase(workspacePath, client = '', session = '') {
   const dir = path.join(reporterHookHome(), 'hooks');
-  const now = Date.now();
   let win = null;
   let winPending = null;
   let winPrompt = '';
@@ -215,14 +214,18 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // 3F 会短暂借到 1F 的相位）。
     if (!clientHit(client, j.client)) continue;
     const sp = j.sessionPhase;
-    // 相位新鲜期：默认 AWAIT_TTL_MS（IDE 关掉后残留相位不挂）。
-    // 但 taskId 还占着（这轮"在跑"）却很久没新 hook 事件（sessionPhase.ts 冻结）= 这一轮其实
-    // 已经结束（CodeBuddy ESC 取消不发事件、心跳照跳），不能还显示"调用工具/思考中"，
-    // 按更短的 TASK_RUN_MS 回落待命。
-    const staleMs = j.taskId ? TASK_RUN_MS : AWAIT_TTL_MS;
-    if (!sp || !sp.ts || now - sp.ts > staleMs) continue;
+    // 相位新鲜度不再靠"最后一次 hook 事件时刻"做超时作废（旧的第一道闸）：那道闸会让长任务
+    // 中途无中间事件、或被 IDE 掐断但无 Stop 时相位过早回落；"是否还在忙"改由渲染端
+    // floorTaskActive（任务台账仍 running 即显示思考中）+ 取消检测兜底。这里只校验相位本身
+    // 存在且有写盘时刻，不再按 hook 事件时刻过期。
+    if (!sp || !sp.ts) continue;
     // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
     if (sp.ts < SERVER_STARTED_AT) continue;
+    // IDE/插件形态：心跳 pid 已死 = 工程/窗口被关掉（无 Stop，相位冻在最后一口）。
+    // 用"进程不在了"这个可靠信号作废相位，避免窗口突然关闭后主控制台永远卡思考中/调用工具。
+    // 只用 pid 死亡判"不在了"，绝不用心跳"还活着"判"在忙"（ESC 取消时心跳照跳，
+    // 那得靠 phaseSuperseded / done.cancelled 作废，见下）。
+    if (j.hb && Number.isInteger(j.hb.pid) && !pidAlive(j.hb.pid)) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
     // 这口"在跑"的相位是否被该楼层的取消/打断标记作废：打断检测是楼层私有知识
     // （Claude/Qoder 看 transcript 末尾、CodeBuddy 看 message-queue pauseReason、Trae 看 DoneHandler），
