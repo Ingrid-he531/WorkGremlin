@@ -8,6 +8,8 @@
  *   node server/src/cli.js --db /tmp/wg.db
  *   node server/src/cli.js --self-test          只验证 better-sqlite3 建表/读写（V1 判据 3）
  *   node server/src/cli.js --no-token           关闭本地 token（仅调试）
+ *   node server/src/cli.js --log=debug          日志级别（error|warn|info|debug，默认 info）
+ *   node server/src/cli.js --log-file=0         关掉文件日志（~/.workgremlin/workgremlin.log）
  *
  * 演示模式没有启动参数了：起完之后 POST /api/v1/workspace（空路径）即切到演示工程，
  * 服务端会按需播种并起推进器（见 index.js 的 syncDemo）；界面上就是 HUD 的「演示模式」按钮。
@@ -16,6 +18,7 @@
 // 运行时版本校验：server 现在优先由 Electron 内置 Node 启动（见 desktop/src/launcher.js 的 startServer），
 // 所以这里不再强卡 Node 大版本。仅在「纯 node 运行时」且低于 Node 22 时提示——
 // better-sqlite3@13 是 N-API，跨 Node 22/24 与 Electron 内置 Node 二进制兼容，22 即可。
+const log = require('./log');
 {
   const cur = process.version.match(/^v(\d+)\.(\d+)\.(\d+)/);
   const inElectron = Boolean(process.versions && process.versions.electron);
@@ -23,7 +26,7 @@
   if (cur && !process.env.WORKGREMLIN_SKIP_VERSION_CHECK && !inElectron) {
     const less = (a, b) => (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) < 0;
     if (less(cur.slice(1).map(Number), floor)) {
-      console.error(
+      log.error(
         `[workgremlin] Node 版本过低：当前 ${process.version}，需要 >= v22。\n` +
           '        可改用 Electron 内置 Node 启动（无需单独安装 Node）：见 desktop/src/launcher.js。'
       );
@@ -107,7 +110,8 @@ async function selfTest() {
   const cp = checkpoint('TRUNCATE');
   close();
 
-  console.log(JSON.stringify({
+  // 结构化输出，机器要读 —— 不打日志前缀、直接写 stdout
+  process.stdout.write(`${JSON.stringify({
     ok: true,
     dbFile: file,
     read: row,
@@ -115,13 +119,13 @@ async function selfTest() {
     secure_delete: pragmaSecure,
     journal_mode: pragmaWal,
     checkpoint: cp,
-  }, null, 2));
+  }, null, 2)}\n`);
 
   if (!row || row.content !== 'world') {
-    console.error('[self-test] FAILED: 写入后读回不一致');
+    log.error('[self-test] FAILED: 写入后读回不一致');
     process.exit(1);
   }
-  console.log('[self-test] PASS: better-sqlite3 建表/写入/读取/checkpoint 均正常');
+  log.info('[self-test] PASS: better-sqlite3 建表/写入/读取/checkpoint 均正常');
 }
 
 async function main() {
@@ -137,11 +141,14 @@ async function main() {
     port: args.port ? Number(args.port) : undefined,
     token: args['no-token'] ? '' : undefined,
     workspacePath: typeof args.workspace === 'string' ? args.workspace : undefined,
+    // --log=debug / --log=error …（等价于 WORKGREMLIN_LOG；--log-file=0 关掉文件日志）
+    log: typeof args.log === 'string' ? args.log : undefined,
   });
+  if (args['log-file'] === '0') log.setFileEnabled(false);
 
   await server.start(args.port ? Number(args.port) : undefined);
-  console.log(`[workgremlin] server.json -> ${config.serverInfoPath()}`);
-  console.log('[workgremlin] Ctrl+C 退出');
+  log.info(`[workgremlin] server.json -> ${config.serverInfoPath()}`);
+  log.info('[workgremlin] Ctrl+C 退出');
 
   const shutdown = async () => {
     await server.close();
@@ -152,6 +159,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('[workgremlin] 启动失败：', err);
+  log.error('[workgremlin] 启动失败：', err);
   process.exit(1);
 });

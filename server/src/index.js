@@ -14,6 +14,7 @@ const http = require('node:http');
 const express = require('express');
 const path = require('node:path');
 
+const log = require('./log');
 const { openDatabase } = require('./db');
 const { createIngestBus } = require('./ingest/bus');
 const { createSubagentFeed } = require('./ingest/subagentFeed');
@@ -51,7 +52,7 @@ const VERSION = '0.1.0';
  */
 function autoInstallHooks() {
   if (process.env.WORKGREMLIN_NO_AUTO_HOOKS === '1') {
-    console.log('[workgremlin] WORKGREMLIN_NO_AUTO_HOOKS=1：跳过自动接入 hook');
+    log.info('[workgremlin] WORKGREMLIN_NO_AUTO_HOOKS=1：跳过自动接入 hook');
     return null;
   }
   try {
@@ -59,14 +60,14 @@ function autoInstallHooks() {
     const { installHooks } = require('../../scripts/install-hooks');
     const result = installHooks({});
     if (result.installed.length) {
-      console.log(`[workgremlin] 自动接入 hook：${result.installed.join('、')}`);
+      log.info(`[workgremlin] 自动接入 hook：${result.installed.join('、')}`);
     }
     if (result.failed.length) {
-      console.warn(`[workgremlin] 自动接入 hook 跳过（配置不是合法 JSON）：${result.failed.join('、')}`);
+      log.warn(`[workgremlin] 自动接入 hook 跳过（配置不是合法 JSON）：${result.failed.join('、')}`);
     }
     return result;
   } catch (err) {
-    console.warn(`[workgremlin] 自动接入 hook 失败（不影响使用）：${err && err.message}`);
+    log.warn(`[workgremlin] 自动接入 hook 失败（不影响使用）：${err && err.message}`);
     return null;
   }
 }
@@ -100,6 +101,8 @@ function isLoopbackOrigin(origin) {
  * }} [opts]
  */
 function createServer(opts = {}) {
+  // 日志级别：入参优先（--log=debug / Electron 启动时传），其次环境变量（见 log.js）
+  if (opts.log) log.setLevel(opts.log);
   const dbPath = opts.dbPath || process.env.WORKGREMLIN_DB || config.defaultDbPath();
   // 传字符串（含空串）即采用：空串 = 显式关闭校验（--no-token，仅调试）；未传才生成随机 token。
   // 注意不能用 `opts.token || newToken()` —— 空串是 falsy，会让 --no-token 静默失效。
@@ -295,9 +298,9 @@ function createServer(opts = {}) {
         const days = repo.getRetentionDays();
         const beforeTs = clock.now() - days * 24 * 60 * 60 * 1000;
         const n = repo.deleteTaskRunsByFilter({ beforeTs });
-        if (n > 0 && !opts.silent) console.log(`[workgremlin] 自动清理：删除 ${n} 条超过 ${days} 天的任务记录`);
+        if (n > 0 && !opts.silent) log.info(`[workgremlin] 自动清理：删除 ${n} 条超过 ${days} 天的任务记录`);
       } catch (err) {
-        if (!opts.silent) console.warn('[workgremlin] 自动清理失败：', err && err.message);
+        if (!opts.silent) log.warn('[workgremlin] 自动清理失败：', err && err.message);
       }
     };
     runRetentionCleanup();
@@ -308,9 +311,9 @@ function createServer(opts = {}) {
     // （正常关服那一路由 orchestrator.shutdown() 自己收尾，这里管的是没跑成正常关服的情况。）
     try {
       const stale = repo.failStaleCouncils('服务上次没有正常退出，这场会没跑完', clock.now());
-      if (stale > 0 && !opts.silent) console.log(`[workgremlin] 议事厅：${stale} 场没跑完的会已如实标为失败`);
+      if (stale > 0 && !opts.silent) log.info(`[workgremlin] 议事厅：${stale} 场没跑完的会已如实标为失败`);
     } catch (err) {
-      if (!opts.silent) console.warn('[workgremlin] 议事厅对账失败：', err && err.message);
+      if (!opts.silent) log.warn('[workgremlin] 议事厅对账失败：', err && err.message);
     }
 
     for (const t of timers) if (t.unref) t.unref();
@@ -363,7 +366,7 @@ function createServer(opts = {}) {
       try {
         orchestrator.shutdown();
       } catch (err) {
-        if (!opts.silent) console.warn('[workgremlin] 议事厅收尾失败：', err && err.message);
+        if (!opts.silent) log.warn('[workgremlin] 议事厅收尾失败：', err && err.message);
       }
     });
     lifecycle.onClose(() => { try { hub.close(); } catch {} });
@@ -375,12 +378,12 @@ function createServer(opts = {}) {
     demo.onSwitch(workspace.current(), agentRoster);
 
     if (!opts.silent) {
-      console.log(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
-      if (!token) console.warn('[workgremlin] 已关闭 token 校验（--no-token，仅调试用）');
+      log.info(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
+      if (!token) log.warn('[workgremlin] 已关闭 token 校验（--no-token，仅调试用）');
       const cur = workspace.current();
-      if (cur.demo) console.log('[workgremlin] 当前：演示工程');
-      else console.log(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
-      console.log(`[workgremlin] subagent 清单：${cur.feedPath}`);
+      if (cur.demo) log.info('[workgremlin] 当前：演示工程');
+      else log.info(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
+      log.info(`[workgremlin] subagent 清单：${cur.feedPath}`);
     }
     return info;
   }

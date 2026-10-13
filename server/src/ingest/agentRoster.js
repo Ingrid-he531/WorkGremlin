@@ -20,6 +20,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const log = require('../log');
 const { detectLevel } = require('./agentLevel');
 const config = require('../config');
 
@@ -207,7 +208,7 @@ function createAgentRoster(opts) {
     try {
       sync();
     } catch (err) {
-      console.warn('[workgremlin] 小怪物名册同步失败：', err && err.message);
+      log.warn('[workgremlin] 小怪物名册同步失败：', err && err.message);
     }
   }
 

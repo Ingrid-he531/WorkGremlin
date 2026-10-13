@@ -160,6 +160,11 @@ npm run launch:electron
 - 打开工程：服务启动时定 —— `WORKGREMLIN_WORKSPACE=<目录>`（或
   `npm run server -- --workspace <目录>`），都没给就用启动时所在目录；
   上次打开过哪个工程会记住，下次启动自动恢复。
+- 日志：默认输出 `info` / `warn` / `error`，同时按天落到
+  `~/.workgremlin/logs/workgremlin-<YYYY-MM-DD>.log`。排障要更细：`WORKGREMLIN_LOG=debug`
+  （或 `npm run server -- --log=debug`）打开逐事件 debug；只想看问题：`WORKGREMLIN_LOG=error`；
+  `WORKGREMLIN_LOG_FILE=0` 关掉文件日志。**默认只保留 7 天**（`WORKGREMLIN_LOG_KEEP_DAYS` 可改）：
+  过期的按天文件、`hooks/events.log` 里过期的行会在启动时/跨天自动清掉。
 
 ## 文档
 

@@ -18,6 +18,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
+const log = require('../log');
 const { updateJson } = require('@workgremlin/shared/fslock');
 const { fnv1a32, home, isPluginClient } = require('@workgremlin/shared');
 const { feedFilePath } = require('./subagentFeed');
@@ -858,15 +859,12 @@ async function runHookEvent(ev, ctx, floorImpl) {
   const memberId = String(ev.agent);
   const client = String(ev.agent || '').trim().toLowerCase();
   let sessionId = String(ev.session_id || '');
-  // sessionId 格式校验：只认 hex 串（含 UUID 短横线）
-  // · CodeBuddy CLI: UUID（8-4-4-4-12）
-  // · CodeBuddy Plugin: 16hex（82c644195fde）
-  // · Codex / 老 CodeBuddy: 32hex
-  // 非法格式（如 ghost-xxx 测试伪造、aaa2a0f... 脏数据）置空，不写状态文件防脏会话
-  const RE_SESSION_OK = /^[0-9a-f]{8,}$/i; // 纯 hex（最少 8 位）
-  const RE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (sessionId && !RE_SESSION_OK.test(sessionId) && !RE_UUID.test(sessionId)) {
-    console.error('[hookCommon] ignoring invalid session_id:', sessionId, 'from', client);
+  // sessionId 格式校验：只挡明确的脏数据（ghost- 前缀的测试伪造）
+  // 不再限制 hex/UUID 格式——测试用的 session ID（cancel-a 等）和各产品
+  // 的 session ID 格式各异（UUID、16hex、24hex、短横线串等），过窄的格式
+  // 校验会误杀合法 session ID，导致状态文件不写 → 相位和任务全断。
+  if (sessionId && /^ghost-/i.test(sessionId)) {
+    log.error('[hookCommon] ignoring ghost- session_id:', sessionId);
     sessionId = '';
   }
   const cwd = String(ev.cwd || '');

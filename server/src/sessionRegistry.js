@@ -33,6 +33,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const log = require('./log');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
 const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
@@ -882,7 +883,8 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       // 检测：@fresh 设到未来 → started_at 子句恒假，只剩"心跳/agent_status 活着"这一非粘性判定
       detectRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now + 1e15, cutoff, grace }) || [];
     } catch (e) {
-      /* 账本查询异常不影响会话表构建 */
+      // 账本查询异常不影响会话表构建，但必须留痕 —— 否则"任务表/滚动屏没数据"只能靠猜
+      log.debug('账本查询异常（不影响会话表构建）：', e);
     }
     for (const r of titleRows) {
       const f = floorByAgent[agentBase(r.client)];

@@ -6,6 +6,8 @@
  *   - onClose：服务关闭前触发（停定时器之外的资源）
  * 钩子内部出错不应阻断其他钩子，因此逐个 try/catch。
  */
+const log = require('./log');
+
 function createLifecycle() {
   const switchHooks = [];
   const closeHooks = [];
@@ -22,7 +24,7 @@ function createLifecycle() {
         try {
           fn();
         } catch (err) {
-          console.warn('[workgremlin] afterWorkspaceSwitch 钩子失败：', err && err.message);
+          log.warn('[workgremlin] afterWorkspaceSwitch 钩子失败：', err && err.message);
         }
       }
     },
@@ -31,7 +33,7 @@ function createLifecycle() {
         try {
           fn();
         } catch (err) {
-          console.warn('[workgremlin] beforeClose 钩子失败：', err && err.message);
+          log.warn('[workgremlin] beforeClose 钩子失败：', err && err.message);
         }
       }
     },

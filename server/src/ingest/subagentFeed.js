@@ -31,6 +31,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const log = require('../log');
 const { AGENT_STATES } = require('@workgremlin/shared');
 // 与 hook 共用同一份清单文件 <workspace>/.workgremlin/subagents.json：
 // 读改写要加锁 + 原子写，否则会和并发的 hook 进程互相覆盖（见 shared/fslock.js）。
@@ -267,7 +268,7 @@ function createSubagentFeed(opts) {
                 artifacts: [{ kind: 'text', title: a.result, path: SUMMARY_PATH }],
               });
             } catch (err) {
-              console.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
+              log.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
             }
             bus.endSubagentRun({ id: known.runId, project, result: a.result, model: a.model, files: a.files });
             tasks.delete(gkey);
@@ -406,7 +407,7 @@ function createSubagentFeed(opts) {
         { fallback: { project: '', agents: [] }, pretty: true }
       );
     } catch (err) {
-      console.warn('[workgremlin] subagent 收工回收失败：', err && err.message);
+      log.warn('[workgremlin] subagent 收工回收失败：', err && err.message);
     }
   }
 
@@ -437,7 +438,7 @@ function createSubagentFeed(opts) {
     try {
       sync();
     } catch (err) {
-      console.warn('[workgremlin] subagent 清单同步失败：', err && err.message);
+      log.warn('[workgremlin] subagent 清单同步失败：', err && err.message);
     }
   }
 

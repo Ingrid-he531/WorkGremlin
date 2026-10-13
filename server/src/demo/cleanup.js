@@ -1,5 +1,6 @@
 'use strict';
 
+const log = require('../log');
 const { DEMO_MEMBER_NAMES } = require('../mock/generator');
 const config = require('../config');
 
@@ -24,7 +25,7 @@ function createDemoCleaner({ repo, bus }) {
         /* 单个清不掉不影响别的 */
       }
     }
-    if (n) console.log(`[workgremlin] 已清理 ${n} 个混进工程「${cur.projectName || cur.project}」的演示残留成员`);
+    if (n) log.info(`[workgremlin] 已清理 ${n} 个混进工程「${cur.projectName || cur.project}」的演示残留成员`);
     return n;
   }
 
@@ -46,7 +47,7 @@ function createDemoCleaner({ repo, bus }) {
         /* 单个清不掉不影响别的 */
       }
     }
-    if (n) console.log(`[workgremlin] 已清理 ${n} 个不属于演示工程的小怪物（名册残留）`);
+    if (n) log.info(`[workgremlin] 已清理 ${n} 个不属于演示工程的小怪物（名册残留）`);
     return n;
   }
 

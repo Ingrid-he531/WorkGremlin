@@ -8,6 +8,7 @@
 const express = require('express');
 const { ERROR_CODES } = require('@workgremlin/shared');
 
+const log = require('../../log');
 const { createHookDispatch } = require('../../ingest/hookDispatch');
 const { addGhost, retireGhost, sweepGhosts } = require('../../ingest/hookCommon');
 
@@ -125,14 +126,18 @@ function createIngestRouter({ bus, repo }) {
     try {
       const body = req.body || {};
       const ws = body.workspacePath || '';
+      // 只在开 debug 时打全量事件，平时一行足够定位（agent / 事件 / 会话）。
+      log.debug('hook recv', body.hook_event_name, body.agent, body.session_id || '');
       const project = bus.projectForReport(body.project || '', ws);
       if (!project) {
+        log.warn('hook 没有归属工程，忽略', body.hook_event_name, body.agent, ws);
         return res.status(400).json({ ok: false, error: { code: ERROR_CODES.BAD_PAYLOAD, message: 'missing project' } });
       }
       bus.ensureProject(project, ws, body.mainConversationId || null, 'report');
       const result = await hookDispatch.dispatch({ ...body }, { project, workspacePath: ws, bus, repo });
       return res.json({ ok: true, ...(result || {}) });
     } catch (err) {
+      log.error('hook 处理失败：', err);
       return res.status(500).json({ ok: false, error: { code: ERROR_CODES.INTERNAL, message: String((err && err.message) || err) } });
     }
   });

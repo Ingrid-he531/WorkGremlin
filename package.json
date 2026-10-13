@@ -37,6 +37,7 @@
     "test:floors": "node server/test/mergedFloors.test.js",
     "test:session-project": "node server/test/sessionProject.test.js",
     "test:kilo": "node server/test/kiloFloor.test.js",
+    "test:log": "node server/test/log.test.js",
     "test:plugin-ingest": "node server/test/pluginIngest.test.js",
     "test:plugin-e2e": "node server/test/kiloPluginE2E.test.js",
     "test:ghost-feed": "node server/test/ghostFeed.test.js",

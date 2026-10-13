@@ -19,6 +19,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const log = require('../log');
 const Database = require('better-sqlite3');
 const { DEFAULTS } = require('@workgremlin/shared');
 
@@ -385,7 +386,7 @@ function openDatabase(dbPath) {
   const legacy = migrateLegacyTeamSchema(db);
   if (legacy) {
     const backup = backupLegacyDatabase(db, dbPath);
-    console.warn(
+    log.warn(
       `[workgremlin] 检测到 team 时代的老库，已迁移到 project 时代${backup ? `（备份：${backup}）` : ''}`
     );
   }
@@ -394,7 +395,7 @@ function openDatabase(dbPath) {
   db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
   migrate(db);
   const restored = restoreLegacyRows(db, legacy);
-  if (restored) console.warn(`[workgremlin] 老库迁移完成，回填 ${restored} 行历史数据`);
+  if (restored) log.warn(`[workgremlin] 老库迁移完成，回填 ${restored} 行历史数据`);
 
   chmod600(dbPath);
   chmod600(`${dbPath}-wal`);

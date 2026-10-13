@@ -1,5 +1,6 @@
 'use strict';
 
+const log = require('../log');
 const { seedDemoData } = require('../mock/generator');
 
 /**
@@ -22,7 +23,7 @@ function createDemoSeeder({ bus, repo }) {
         });
       } catch (err) {
         // 播种失败不能拖垮切换本身（切工程照旧发生，只是屋里空着）
-        console.warn('[workgremlin] 演示数据播种失败（不影响真实数据）：', err && err.message);
+        log.warn('[workgremlin] 演示数据播种失败（不影响真实数据）：', err && err.message);
       }
     },
   };
