@@ -1060,7 +1060,6 @@ function createIngestPlugin(options, { location, base } = {}) {
               })
             }
           }
-          // 台账：只报**写类**工具（读类不报 —— 读了不留改动痕迹，报上去只是噪声）
           if (sid && opOfTool(part.tool) === "write" && status !== "pending") touchFile(sid, target, wsOf(event))
           // 召唤 subagent（task 工具）时飘一只小幽灵（统一走服务端 /ghost，由 hookCommon 写清单）
           if (sid && isSubagentTool(part.tool) && status !== "pending") {
