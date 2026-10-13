@@ -12,6 +12,10 @@ const os = require('node:os');
 const path = require('node:path');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-hook-rt-'));
+// 隔离状态文件：不设 WORKGREMLIN_HOME 的话，hookCommon 会把相位/会话状态写进**真实的**
+// ~/.workgremlin/hooks/ —— 每跑一次测试就在真机上多一条幽灵会话。
+process.env.WORKGREMLIN_HOME = path.join(TMP, 'wg');
+fs.mkdirSync(process.env.WORKGREMLIN_HOME, { recursive: true });
 const TP = path.join(TMP, 'sess.jsonl');
 fs.writeFileSync(
   TP,
