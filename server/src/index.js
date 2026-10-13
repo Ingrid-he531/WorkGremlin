@@ -205,8 +205,9 @@ function createServer(opts = {}) {
   const demo = createDemo({ bus, repo, getRoster: () => agentRoster });
 
   /**
-   * （重）启动 subagent 清单监听 —— 盯的是**当前打开工程**下的
-   * <workspace>/.workgremlin/subagents.json。演示数据模式没有工程目录，不监听。
+   * （重）启动 subagent 清单监听 —— 读**数据目录单份**清单（~/.workgremlin/subagents.json，
+   * 见 subagentFeed.feedFilePath），按条目里的工程/会话归属在当前打开工程里飘幽灵。
+   * 演示数据模式没有工程目录，不监听。
    */
   function startFeed() {
     if (subagentFeed) subagentFeed.stop();

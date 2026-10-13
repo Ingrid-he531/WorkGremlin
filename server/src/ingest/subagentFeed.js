@@ -32,7 +32,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const log = require('../log');
-const { AGENT_STATES } = require('@workgremlin/shared');
+const { AGENT_STATES, home } = require('@workgremlin/shared');
 // 与 hook 共用同一份清单文件 <workspace>/.workgremlin/subagents.json：
 // 读改写要加锁 + 原子写，否则会和并发的 hook 进程互相覆盖（见 shared/fslock.js）。
 const { updateJson } = require('@workgremlin/shared/fslock');
@@ -74,13 +74,21 @@ const SUMMARY_PATH = 'workgremlin:summary';
 
 /**
  * 清单文件路径。
- * @param {string} workspacePath
+ *
+ * 统一收口到 workgremlin 数据目录的【单份】清单（~/.workgremlin/subagents.json），
+ * 不再按 workspacePath 在工程目录里各放一份。理由：不同 agent 的 ev.cwd 各异
+ * （CodeBuddy 的工具事件 cwd 是 $HOME，Claude/Codex 才是工程根），拿 cwd 当落盘目录
+ * 会把幽灵写进错误的 feed，而 UI 监听的是真实工程那份 → 写了却不显示。
+ *
+ * 幽灵的归属（工程 / 会话 / 楼层）记在条目内部的字段里，文件放哪跟它无关；
+ * subagentFeed 读取后按条目字段处理。
+ *
+ * @param {string} [workspacePath] 仅为兼容旧调用方；本实现已忽略它（恒返回数据目录单文件）。
  */
 function feedFilePath(workspacePath) {
   const env = String(process.env.WORKGREMLIN_SUBAGENTS_FILE || '').trim();
   if (env) return path.resolve(env);
-  const dir = workspacePath || process.cwd();
-  return path.join(dir, '.workgremlin', 'subagents.json');
+  return path.join(home(), 'subagents.json');
 }
 
 /**

@@ -21,6 +21,8 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-ghost-'))
 const WS = path.join(TMP, 'proj')
 fs.mkdirSync(WS, { recursive: true })
 const FILE = path.join(WS, '.workgremlin', 'subagents.json')
+// 幽灵清单统一收口到数据目录单文件；测试用 env 指向临时文件，避免污染真机（见 subagentFeed.feedFilePath）
+process.env.WORKGREMLIN_SUBAGENTS_FILE = FILE
 
 // 读清单（直接解析，catch → 空），不依赖 hookCommon 未导出的辅助函数
 function readFeed() {

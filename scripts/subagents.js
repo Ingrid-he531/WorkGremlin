@@ -25,13 +25,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 // 与 hook / 服务端共用同一份清单文件：读改写加锁 + 原子写（见 shared/fslock.js）。
 const { updateJson } = require('@workgremlin/shared/fslock');
+const { home } = require('@workgremlin/shared');
 
-/** 与 server/src/ingest/subagentFeed.js 的 feedFilePath 保持一致 */
+/** 与 server/src/ingest/subagentFeed.js 的 feedFilePath 保持一致：统一收口到数据目录单文件 */
 function feedFilePath() {
   const env = String(process.env.WORKGREMLIN_SUBAGENTS_FILE || '').trim();
   if (env) return path.resolve(env);
-  const ws = String(process.env.WORKGREMLIN_WORKSPACE || '').trim();
-  return path.join(ws ? path.resolve(ws) : process.cwd(), '.workgremlin', 'subagents.json');
+  return path.join(home(), 'subagents.json');
 }
 
 function readFile(file) {

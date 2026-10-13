@@ -15,9 +15,9 @@
  * 工程管理：一个 workspace 一个 project：打开哪个工程，屋里就显示哪个工程的成员（含这个工程下的 subagent 幽灵）。
  * 选择会落盘到 ~/.workgremlin/workspaces.json，重开还在；演示数据作为一项可随时切回。
  *
- * 为什么要手工打开：磁盘上没有"当前在跑哪些 subagent"的运行态，
- * 服务端只能盯住**某个工程**的清单文件 <workspace>/.workgremlin/subagents.json。
- * 工程不定，清单就无从谈起。
+ * 为什么要手工打开：办公室（成员 / 小怪物 / 幽灵）是**按工程**聚合显示的，打开哪个工程
+ * 就看哪个工程的屋里。幽灵清单本身是数据目录的单份文件（~/.workgremlin/subagents.json，
+ * 见 subagentFeed.feedFilePath），不再按工程分散存放，但显示仍跟随当前打开的工程。
  */
 
 const fs = require('node:fs');

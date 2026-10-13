@@ -31,6 +31,8 @@ const { createHookDispatch } = require('../src/ingest/hookDispatch');
 const { feedFilePath } = require('../src/ingest/subagentFeed');
 
 const FEED = path.join(PROJECT, '.workgremlin', 'subagents.json');
+// 幽灵清单统一收口到数据目录单文件；测试用 env 指向 FEED，让 feedFilePath 落到这里（见 subagentFeed.feedFilePath）
+process.env.WORKGREMLIN_SUBAGENTS_FILE = FEED;
 const SESSION = 'sess-race';
 
 let pass = 0;
