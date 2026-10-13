@@ -56,7 +56,7 @@
 const os = require('node:os');
 const path = require('node:path');
 const { resolveProjectName } = require('./project');
-const { DEFAULTS, diskKey } = require('@workgremlin/shared');
+const { DEFAULTS, formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { isFile } = require('./roots');
 
@@ -83,8 +83,8 @@ const meta = {
       dirs: [kiloHome()],
       note: '这一路读的是数据根里的 kilo.db（SQLite），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
-    // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client = kilo-plugin）。
-    { kind: 'hook', client: diskKey('kilo', 'vscode') },
+    // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client 恒为楼层基名 kilo，形态 form=vscode）
+    { kind: 'hook', form: 'vscode' },
   ],
   hookSource: true,
   dataKind: 'kilo',
@@ -958,7 +958,7 @@ const PLUGIN_COVER_MS = 2_000;
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'kilo:';
 
-/** 这一层的上报身份：轮询这一路（7F 由 sources 反推得到 ["kilo","kilo-plugin"]，前者是它） */
+/** 这一层的上报身份 = 楼层基名（7F 的 clients 现在就是 ["kilo"]，形态另走 form） */
 const CLIENT = 'kilo';
 
 /** 这个工程名（工程 id）—— 成员 / 台账都按它归组 */
@@ -1359,18 +1359,18 @@ function kiloHandler(p, src, ctx) {
     const ph = readKiloPhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;
     const truth =
-      reporterMainPhase(wsOfSession, diskKey('kilo', 'vscode'), s.id) ||
       reporterMainPhase(wsOfSession, 'kilo', s.id) ||
       null;
     const doneTruth =
-      readReporterDone(wsOfSession, diskKey('kilo', 'vscode'), s.id) ||
       readReporterDone(wsOfSession, 'kilo', s.id);
     const donePoll = readKiloDone(s.id, s);
     upsert({
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      source: truth ? 'kilo-plugin' : 'kilo',
+      // source = form→source（plugin / cli / ide）；这一行是不是插件形态由 truth（插件写过状态文件）判
+      source: formToSource(truth ? 'vscode' : 'cli'),
+      form: truth ? 'vscode' : 'cli',
       sourceKind: 'kilo',
       project: s.project,
       projectPath: s.projectPath,

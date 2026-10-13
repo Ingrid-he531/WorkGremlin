@@ -17,7 +17,6 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { diskKey } = require('@workgremlin/shared');
 // Trae 家族的 globalStorage / logs 根目录：本楼层私有，放在本文件（不再污染 floors.js）。
 const { isDir, dataRoots } = require('./roots');
 
@@ -66,7 +65,7 @@ const meta = {
   pluginRe: /trae|coding-copilot/i,
   sources: [
     { kind: 'dir', label: 'IDE', client: 'trae', dirs: [path.join(os.homedir(), '.trae-cn'), path.join(os.homedir(), '.trae')] },
-    { kind: 'dir', label: 'plugin', client: diskKey('trae', 'vscode'), dirs: [path.join(os.homedir(), '.marscode')] },
+    { kind: 'dir', label: 'plugin', form: 'vscode', dirs: [path.join(os.homedir(), '.marscode')] },
     { kind: 'hook' },
   ],
   hookSource: true,

@@ -216,7 +216,7 @@ head('[A] 楼层表：8F 只有一层 OpenCode');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '8F');
   ok('8F 存在且名叫 OpenCode', floor && floor.name === 'OpenCode', floor && floor.name);
-  ok('这一层接纳 opencode 与 opencode-plugin 两种上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode', 'opencode-plugin']), floor && JSON.stringify(floor.clients));
+  ok('楼层身份恒为基名（opencode）；形态由 source.form 表达', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode']), floor && JSON.stringify(floor.clients));
   ok(
     '两路来源：opencode（轮询产会话 + 数据根落盘统计，标 CLI/Desktop）+ hook（收插件真相位）',
     floor && floor.sources.length === 2 && floor.sources.map((s) => s.kind).join(',') === 'opencode,hook' && floor.sources[0].label === 'CLI/Desktop',
@@ -641,7 +641,7 @@ head('[E] 插件写的状态文件能被认出来（真相位优先于轮询）'
   // 4 小时前那条早过了 60 分钟超时（与 prune 同一把尺子），所以只剩"正在跑"+"刚收工"两条
   ok('8F 会话表列得出**还在超时窗口内**的会话', ids8.includes('ses_live0000000000000000000001') && ids8.includes('ses_done0000000000000000000001'), ids8.join(' '));
   ok('超时（60 分钟无动静）的会话已被剔除', !ids8.includes('ses_old00000000000000000000001'), ids8.join(' '));
-  ok('clients = opencode + opencode-plugin（前端按它过滤相位与成员）', snap.floors.every((f) => f.id !== '8F' || JSON.stringify(f.clients) === JSON.stringify(['opencode', 'opencode-plugin'])));
+  ok('clients = [opencode]（前端按它过滤相位与成员）', snap.floors.every((f) => f.id !== '8F' || JSON.stringify(f.clients) === JSON.stringify(['opencode'])));
 
   // 真相位那一路：/reporter-phase 的组装逻辑（直接调函数，免得起服务）
   const { opencodeMainPhase, opencodeInstrumented } = require('../src/floorOpencode');

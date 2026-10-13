@@ -31,7 +31,6 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { diskKey } = require('@workgremlin/shared');
 
 // 通用扫描基础设施（操作系统/编辑器目录枚举、目录体积、正则匹配……不认任何具体产品）
 const {
@@ -181,9 +180,22 @@ function sourceSpecs(p) {
   return [...new Set(raw)].map((kind) => ({ kind }));
 }
 
-/** 这一路的上报身份：显式给了就用它，否则按 kind 推（plugin → agent-plugin，其余 → agent） */
+/**
+ * 这一路的上报身份 client —— **恒等于楼层基名**（agent）。
+ * 形态（CLI / 插件）不走身份：由下面的 sourceForm / spec.kind 表达，是不是插件用 shared.isPluginClient(form) 判。
+ * 允许 spec.client 显式覆盖（极少），但**别再用 diskKey 合成 `<agent>-plugin` 当身份** —— 那是落盘键，
+ * 不是身份；上报状态文件里 client 写的就是基名（见 hookCommon 的 `client = ev.agent`）。
+ */
 function sourceClient(p, spec) {
-  return spec.client || diskKey(p.agent, spec.kind === 'plugin' ? 'vscode' : 'cli');
+  return spec.client || p.agent;
+}
+
+/** 这一路的形态（cli / vscode / ide …）：显式给了就用它，否则按 kind 推；hook 那一路形态不定（''，两种都收） */
+function sourceForm(spec) {
+  if (spec.form) return spec.form;
+  if (spec.kind === 'plugin') return 'vscode';
+  if (spec.kind === 'cli') return 'cli';
+  return '';
 }
 
 /** 这一路的落盘目录候选（顺序即优先级）：hook 没有落盘目录；'dir' 用显式 dirs */
@@ -217,7 +229,9 @@ function detectSource(p, spec, clients) {
   return {
     kind: spec.kind,
     label: spec.label || '',
-    client: (spec.kind === 'hook' || spec.kind === 'kilo') ? clients.join(',') : sourceClient(p, spec),
+    // client 恒为楼层基名；形态另放 form（消费者按 isPluginClient(form) 判插件）
+    client: sourceClient(p, spec),
+    form: sourceForm(spec),
     sessions: spec.kind !== 'dir',
     dataPath,
     dataPathLabel: shorten(dataPath),

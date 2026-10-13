@@ -267,7 +267,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('产出摘要用扩展写的 summary', Boolean(row0) && row0.result === '做完了', row0 && row0.result);
   ok('还在飞的那轮不写产出（半截话不算）', Boolean(row1) && !row1.result, row1 && row1.result);
   ok('改动文件转成工程相对路径', Boolean(row0) && row0.file_count === 1 && String(row0.files_json) === JSON.stringify(['server/test/pluginReply.test.js']), row0 && `${row0.file_count} ${row0.files_json}`);
-  ok('形态标成 plugin（任务列表显示「Qoder Plugin」而不是 CLI）', Boolean(row1) && row1.form === 'plugin', row1 && row1.form);
+  ok('形态标成 vscode（isPluginClient 认它 → 任务列表显示「Qoder Plugin」而不是 CLI）', Boolean(row1) && row1.form === 'vscode', row1 && row1.form);
   ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf(MEMBER) === 'thinking' && taskIdOf(MEMBER) === `${TASK_ID_PREFIX}s-live:1`, `${stateOf(MEMBER)} / ${taskIdOf(MEMBER)}`);
   const sessionStatus = repo.getSessionStatus.get({ memberId: MEMBER, sessionId: 's-live' });
   ok('Qoder 插件的在飞任务也记在该会话状态行上', sessionStatus && sessionStatus.task_id === `${TASK_ID_PREFIX}s-live:1` && sessionStatus.state === 'thinking');

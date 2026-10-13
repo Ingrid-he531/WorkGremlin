@@ -43,21 +43,9 @@ function toReporterDone(done, sessionId, workspacePath = '') {
   };
 }
 
-/**
- * 楼层客户端串里有没有**这一路**。
- *
- * 渲染层传的是**整个楼层的 clients 串**（`sessions.selectedClients.join(',')`），合并楼层就是
- * 逗号串（7F `kilo,kilo-plugin`、8F `opencode,opencode-plugin`）。按基名比对：把每个候选剥掉
- * `-plugin` 后与 base 比较（见 floorAcceptsClient / clientListHas），逗号串也能命中，于是
- * 插件这一路不再被漏掉：相位 / 模型 / 完成标记都能带出来。
- * （实测 2026-09-28：8F 楼层加了 opencode-plugin 这一路之后，主控制台只剩"思考中"、没有内容。）
- */
+/** 请求里的 client 是不是**这一路**（身份恒为楼层基名，等值比对）。 */
 function clientListHas(client, base) {
-  return String(client || '')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean)
-    .some((c) => c.replace(/-plugin$/i, '') === base);
+  return String(client || '').trim().toLowerCase() === String(base || '').toLowerCase();
 }
 
 /**

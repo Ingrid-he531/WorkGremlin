@@ -60,7 +60,7 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { DEFAULTS, diskKey } = require('@workgremlin/shared');
+const { DEFAULTS, formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { isFile } = require('./roots');
 const { resolveProjectName } = require('./project');
@@ -86,8 +86,8 @@ const meta = {
       dirs: [opencodeHome()],
       note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
-    // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client = opencode-plugin）。
-    { kind: 'hook', client: diskKey('opencode', 'vscode') },
+    // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client 恒为楼层基名 opencode，形态 form=vscode）
+    { kind: 'hook', form: 'vscode' },
   ],
   hookSource: true,
   dataKind: 'opencode',
@@ -895,7 +895,7 @@ const PLUGIN_COVER_MS = 2_000;
 
 /** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
 const TASK_ID_PREFIX = 'opencode:';
-/** 这一层的上报身份：8F 由 sources 反推得到 ["opencode","opencode-plugin"]，轮询这一路是前者 */
+/** 这一层的上报身份 = 楼层基名（8F 的 clients 现在就是 ["opencode"]，形态另走 form） */
 const CLIENT = 'opencode';
 
 /** 这个工程名（工程 id）—— 成员 / 台账都按它归组 */
@@ -1208,13 +1208,14 @@ function opencodeHandler(p, src, ctx) {
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const ph = readOpencodePhase(s.id) || null;
     const doneTruth =
-      readReporterDone(s.projectPath || workspacePath, diskKey('opencode', 'vscode'), s.id) ||
       readReporterDone(s.projectPath || workspacePath, 'opencode', s.id);
     upsert({
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      source: 'opencode',
+      // source = form→source（这一路读的是 opencode.db，CLI/Desktop 形态）
+      source: formToSource('cli'),
+      form: 'cli',
       sourceKind: 'opencode',
       project: s.project,
       projectPath: s.projectPath,

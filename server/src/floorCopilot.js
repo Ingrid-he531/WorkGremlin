@@ -673,7 +673,7 @@ function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
     (fresh && row.live && row.live.prompt) || row.lastUserMessage || row.summary || ''
   ).trim();
   return {
-    client: String(client || 'copilot-plugin').toLowerCase(),
+    client: String(client || 'copilot').toLowerCase(),
     phase: fresh ? 'thinking' : 'idle',
     tool: '',
     file: '',
@@ -864,12 +864,11 @@ const TASK_ID_PREFIX = 'copilot:';
 /**
  * 这一层写进台账 / 成员表的**上报身份**。
  *
- * 必须用 'copilot-plugin'，不能想当然写 'copilot'：9F 的 clients 由 products.js 的
- * sources 反推（9F 只有插件一个形态），只有 ['copilot-plugin']；而任务列表是按楼层
- * clients **精确**过滤的（query.js 的 `instr(@client, ',' || COALESCE(tr.client, m.client) || ',')`）。
- * 写成 'copilot' 的记录会被静默挡在 9F 的筛选之外 —— 库里有行、页面上一条都看不到。
+ * client 恒为**楼层基名** `copilot`（形态走 form）；9F 的 clients 由 sources 反推，
+ * 现在也是 ['copilot']，任务列表按楼层 clients 过滤时两边对得上。
+ * （历史行里带 `-plugin` 后缀的由 DB 的 client 归一化迁移抹掉；ingest 侧 bus.normClient 也会剥。）
  */
-const CLIENT = 'copilot-plugin';
+const CLIENT = 'copilot';
 
 /**
  * @param {{bus: any, repo: any, now?: () => number}} ctx
@@ -1036,7 +1035,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   // ws 不传（任务同步按全量会话对账，不依赖"当前工程"）：current 恒为 false，syncCopilotTasks 本来也不消费它。
   const sessions = (require('./sessions').listSessions({
     force: true,
-    client: 'copilot-plugin',
+    client: 'copilot',
     pluginRe: RE_GITHUB_COPILOT,
   }).sessions || []).filter((s) => s.copilot === true);
   // 一条 Copilot 会话都没有时也要跑：上面那条错行正是在这种机器上冒出来的（只有别的产品的落盘）。

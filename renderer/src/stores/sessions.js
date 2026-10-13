@@ -97,9 +97,8 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * 当前楼层接纳的**全部**客户端（服务端 floors[].clients 原样透传：合并楼层两个、单层一个）。
-     * /reporter-phase 收逗号分隔的一串（见 server 的 clientHit）；楼层 ↔ client 的对应关系以
-     * server/src/products.js 为准，这里不重复列举（免得跟着楼层重编号过期）。
+     * 当前楼层接纳的客户端（服务端 floors[].clients 原样透传；身份恒为楼层基名，如 1F 的 ['codebuddy']）。
+     * /reporter-phase 按它过滤相位；楼层 ↔ client 的对应关系以服务端 floors 为准，这里不重复列举。
      */
     selectedClients: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
@@ -109,9 +108,8 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * 当前楼层的**主**客户端（= clients[0]）。plugin（VS Code 系扩展）统一带 -plugin 后缀。
-     * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）——
-     * 过滤按**基名**认，所以主 client=codebuddy 的楼层也收 codebuddy-plugin 的成员。
+     * 当前楼层的客户端（= clients[0]，楼层基名，如 codebuddy / kilo）。
+     * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）——按基名认。
      */
     selectedClient: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);

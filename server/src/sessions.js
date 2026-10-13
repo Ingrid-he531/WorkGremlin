@@ -65,13 +65,11 @@ const FLOORS = { trae, claude, codebuddy, copilot, qoder };
 const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
 
 /**
- * 按 client 找楼层模块：client 形如 `codebuddy` / `codebuddy-plugin`（剥掉 `-plugin` 后缀按基名认）。
- * 楼层的"插件结构化落盘读取器 / 落盘标记"都挂在楼层模块上（见 floorCodebuddy 的 pluginStore），
- * 本文件只按 client 派发，不掺任何产品的内部目录结构。
+ * 按 client（楼层基名）找楼层模块。楼层的"插件结构化落盘读取器 / 落盘标记"都挂在楼层模块上
+ * （见 floorCodebuddy 的 pluginStore），本文件只按 client 派发，不掺任何产品的内部目录结构。
  */
 function floorModuleOf(client) {
-  const base = String(client || '').replace(/-plugin$/i, '').toLowerCase();
-  return FLOORS[base] || null;
+  return FLOORS[String(client || '').trim().toLowerCase()] || null;
 }
 
 /** 空读取器：楼层没实现 pluginStore（如 9F Copilot 走自己的 SQLite）时用它，读到的都是"没有" */
@@ -94,18 +92,14 @@ function pluginStoreOf(client) {
  * reporter 的状态文件按客户端分开写（同一个工程里 CodeBuddy / Codex / Claude … 各一份），
  * 每个插件楼层（1F CodeBuddy 的插件那一路、5F TraeCode-Plugin、未来的 Codex-Plugin …）只认自己
  * 这一路 —— 否则切到某层会看见别层在敲的命令、收工时还弹别层的「任务完成」。
- * 调用方（sessionRegistry）会把该楼层的 client（例如 'codebuddy-plugin' / 'trae-plugin'）传进来。
- * 合并楼层（1F CodeBuddy）另有一路 CLI 身份：见下面的 clientHit —— 它可以一次收一串 client。
+ * 调用方（sessionRegistry）传的是**楼层基名**（'codebuddy' / 'trae' …）—— 与上报状态文件里的
+ * `client` 一字不差（见 hookCommon 的 `client = ev.agent`）。形态（CLI / 插件）走 `form`，不进身份，
+ * 所以这里就是**等值比对**（大小写归一），不认任何 `-plugin` 后缀、也不是一串。
  */
 
 function clientHit(want, got) {
   if (!want) return true;
-  const set = String(want)
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  if (!set.length) return true;
-  return set.includes(String(got || '').toLowerCase());
+  return String(want).trim().toLowerCase() === String(got || '').trim().toLowerCase();
 }
 
 /** 缓存：列表扫盘 + 读十几个小 json，5 秒足够 */
@@ -179,20 +173,17 @@ function reporterHookHome() {
  * 其余产品（CodeBuddy / Codex）payload 里有，用不着适配器；真取不到就留空（绝不编造）。
  * 这里只做"按 client 分派适配器"这一件事，避免把某个产品的私有存储格式写死进通用读函数，
  * 也保持和 products.js 的表驱动扩展约定一致（加新产品就往 MODEL_SOURCES 挂一条，不必改 this 函数）。
- * @param {string} client 楼层客户端（如 'trae' / 'trae-plugin' / 'claude' / 'codex' …）
+ * @param {string} client 楼层客户端（基名：'trae' / 'claude' / 'codex' …）
  * @param {string} sessionId hook payload 的 session_id
  * @param {string} agentType hook payload 的 agent_type（已落盘）
  */
-/** client(基名) → 取"这条会话当前模型"的适配器；由各楼层的 selectedModelOf 自动汇总（见 FLOORS）。
+/** client(楼层基名) → 取"这条会话当前模型"的适配器；由各楼层的 selectedModelOf 自动汇总（见 FLOORS）。
  *  没实现 selectedModelOf 的楼层（codebuddy / copilot）自然落空，照旧取不到。 */
 const MODEL_SOURCES = {};
 for (const [key, mod] of Object.entries(FLOORS)) {
   if (typeof mod.selectedModelOf === 'function') MODEL_SOURCES[key] = mod.selectedModelOf;
 }
 function sessionModel(client, sessionId, agentType = '') {
-  // 按**基名**查表：同一产品的插件/CLI 两种形态（trae-plugin / claude-plugin …）落盘是同一份，
-  // 适配器也只认产品，不该因为客户端带了个后缀就取不到（适配器对不认识的会话 id 一律回空串，
-  // 所以这里放宽只会"多给一次机会"，不会给错模型）。
   const fn = MODEL_SOURCES[String(client || '').toLowerCase()];
   return fn ? fn(sessionId, agentType) || '' : '';
 }
@@ -231,7 +222,7 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // （Claude/Qoder 看 transcript 末尾、CodeBuddy 看 message-queue pauseReason、Trae 看 DoneHandler），
     // 由各楼层的 phaseSuperseded 自己判断，公共相位读取只负责派发（见各 floor 模块）。
     if (j.taskId) {
-      const floorMod = FLOORS[String(client || '').replace(/-plugin$/i, '').toLowerCase()];
+      const floorMod = FLOORS[String(client || '').trim().toLowerCase()];
       if (floorMod && typeof floorMod.phaseSuperseded === 'function' && floorMod.phaseSuperseded(j, sp, INTERRUPT_PHASE_SLACK_MS)) continue;
     }
     // 会话已被用户取消（CLI 按 ESC 停止：reporter Stop 落盘的 done.cancelled）：相位冻在
@@ -470,7 +461,7 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
 function reporterMainPhase(workspacePath, client = '', session = '') {
   // 各楼层（尤其是 9F Copilot，没有 reporter hook）可自己实现 readPhase 来提供相位；
   // 没实现的（带 hook 的产品）退回通用的 readReporterPhase。相位职责按楼层派发，不把兜底塞进 generic 里。
-  const base = String(client || '').replace(/-plugin$/i, '').toLowerCase();
+  const base = String(client || '').trim().toLowerCase();
   const floor = FLOORS[base];
   const readPhase = floor && typeof floor.readPhase === 'function' ? floor.readPhase : readReporterPhase;
   const rp = readPhase(workspacePath, client, session);
@@ -557,7 +548,7 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     if (!lastAt || now - lastAt > TASK_RUN_MS) continue;
     // TraeCode 取消兜底：renderer.log 里已确认取消（取消时刻比本轮开始新）→ 不算活跃
     // （TraeCode 取消不发 Stop hook 事件，taskId 永远占着，这里手动戳破它）。
-    if (String(client || '').replace(/-plugin$/i, '').toLowerCase() === 'trae') {
+    if (String(client || '').trim().toLowerCase() === 'trae') {
       const atT = trae.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
       if (atT) continue;
     }
@@ -762,7 +753,7 @@ function readReporterDones(workspacePath, client = '') {
   // client 为空（不指定产品）时扫全部楼层；否则只跑被点名的那一层。
   // qoder 已在 FLOORS 里别名到 claude 模块，这里无需特判。
   const bases = client
-    ? String(client).split(',').map((s) => s.trim().replace(/-plugin$/i, '').toLowerCase()).filter(Boolean)
+    ? [String(client).trim().toLowerCase()].filter(Boolean)
     : Object.keys(FLOORS);
   const seen = new Set();
   for (const base of bases) {
@@ -796,7 +787,7 @@ function readReporterDone(workspacePath, client = '', session = '') {
   // 9F GitHub Copilot 没有 hook：状态文件这条路永远是空的，完成标记得从它自己的会话日志取
   // （最新那一轮 request 的 completedAt，见 readCopilotLiveRequest）——不然 9F 永远没有
   // 「任务完成」那一下（实测 2026-09-28：7F/8F 都有、9F 一直空）。
-  if (String(client || '').replace(/-plugin$/i, '').toLowerCase() === 'copilot') {
+  if (String(client || '').trim().toLowerCase() === 'copilot') {
     const d = copilot.readCopilotDone(session);
     if (d) return d;
   }
@@ -1220,7 +1211,7 @@ function escapeRegExp(s) {
 
 /**
  * 分发表**惰性构建并缓存**：凡是楼层模块导出了 sessionTitle 的，都按它的 client 与
- * client-plugin 两种身份注册。延迟到首次调用才构建，避免在模块加载期去读（没有 sessionTitle 的）
+ * 各楼层注册。延迟到首次调用才构建，避免在模块加载期去读（没有 sessionTitle 的）
  * 楼层 exports 的属性，从而避开 Node 的循环依赖告警。
  * @returns {Array<{match: RegExp, fn: Function}>}
  */
@@ -1230,7 +1221,7 @@ function routers() {
   const mods = /** @type {any[]} */ (Object.values(floorRegistry));
   _routers = mods
     .filter((mod) => typeof mod.sessionTitle === 'function' && mod.client)
-    .map((mod) => ({ match: new RegExp('^' + escapeRegExp(mod.client) + '(?:-plugin)?$', 'i'), fn: mod.sessionTitle }));
+    .map((mod) => ({ match: new RegExp('^' + escapeRegExp(mod.client) + '$', 'i'), fn: mod.sessionTitle }));
   return _routers;
 }
 

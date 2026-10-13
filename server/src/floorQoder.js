@@ -23,7 +23,7 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { diskKey } = require('@workgremlin/shared');
+const { formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
 const { isFile } = require('./roots');
@@ -430,12 +430,14 @@ function resetLingmaCache() {
 
 const SYNC_INTERVAL_MS = 5_000;
 
-/** task id 前缀：认人用（我们自己写的行都是这个前缀，hook 那一路是 `t_*`），也避免撞 id */
-const TASK_ID_PREFIX = 'qoder-plugin:';
+/** task id 前缀：认人用（我们自己写的行都是这个前缀，hook 那一路是 `t_*`），也避免撞 id。
+ *  身份恒为基名 —— 不再带 `-plugin`（旧写法 `qoder-plugin:`，那是把形态塞进了 id）。 */
+const TASK_ID_PREFIX = 'qoder:';
 /** 这一路的 client：与 6F 的 CLI 同一个（products.js：CLI 与插件合并单楼层） */
 const CLIENT = 'qoder';
-/** 形态列：插件那一路（任务列表里显示 "Qoder Plugin" 而不是 "Qoder CLI"） */
-const FORM = 'plugin';
+/** 形态列：**存的是形态**（vscode），不是 source（plugin）—— 任务列表据此显示 "Qoder Plugin"。
+ *  以前写的是 'plugin'，而 isPluginClient 只认 'vscode' → 标签退回 "Qoder"、source 也算成 cli。 */
+const FORM = 'vscode';
 /** 产出摘要的长度上限（与 hook.js 的 RESULT_MAX 同量级） */
 const RESULT_MAX = 4_000;
 /** hook（CLI）那一路的心跳多久算"还活着"—— 活着就让位，不碰状态栏 */
@@ -496,7 +498,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
-/** 台账 id 里的轮序号（`qoder-plugin:<会话id>:<序号>`）；不是这个形状就回 null */
+/** 台账 id 里的轮序号（`<前缀><会话id>:<序号>`）；不是这个形状就回 null */
 function turnIndexOf(taskId, prefix) {
   const id = String(taskId || '');
   if (!id.startsWith(`${prefix}:`)) return null;
@@ -703,7 +705,9 @@ function lingmaHandler(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      source: 'lingma',
+      // source = form→source（灵码是 VS Code 系扩展 → 插件形态）
+      source: formToSource('vscode'),
+      form: 'vscode',
       sourceKind: 'lingma',
       project: s.project,
       projectPath: s.projectPath,

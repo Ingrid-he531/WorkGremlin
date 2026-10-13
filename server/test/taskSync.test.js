@@ -122,7 +122,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   console.log('[0] 前置：两层接纳的身份（同步器必须写这里的值，否则被楼层筛选挡掉）');
   ok('7F 接纳 kilo', F7.includes('kilo'), F7.join(','));
-  ok('9F 只接纳 copilot-plugin', F9.length === 1 && F9[0] === 'copilot-plugin', F9.join(','));
+  ok('9F 身份恒为基名 copilot', F9.length === 1 && F9[0] === 'copilot', F9.join(','));
 
   console.log('[1] 9F Copilot：每一轮一条台账（收工的两轮 + 在飞那一轮）');
   const t0 = Date.now() - 10 * 60_000;
@@ -537,7 +537,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   // 装了 WorkGremlin 插件时让位（插件那一路上报的才是真值）
   repo.insertTask.run({ id: 't_oc_plugin', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件那一路', state: 'done', progress: 1, startedAt: o2, endedAt: o2 + 1000 });
-  repo.upsertTaskRun.run({ id: 't_oc_plugin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode-plugin', sessionId: 'oc-sid-1', form: 'plugin', model: 'x', title: '插件那一路', startedAt: o2, baselineCommit: null });
+  repo.upsertTaskRun.run({ id: 't_oc_plugin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-1', form: 'vscode', model: 'x', title: '插件那一路', startedAt: o2, baselineCommit: null });
   syncOpencodeTasks({ bus, repo });
   const eight3 = await get(`project=p1&client=${F8.join(',')}&limit=50`);
   ok(
@@ -687,7 +687,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   // 上一版留下的错行：同步器写的在飞记录（那条会话永远等不到收工）
   repo.insertTask.run({ id: `copilot:${cbSid}:0`, projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: '(Copilot 会话)', state: 'running', progress: null, startedAt: Date.now() - 60_000, endedAt: null });
-  repo.upsertTaskRun.run({ id: `copilot:${cbSid}:0`, projectId: 'p1', memberId: 'copilot@p1', client: 'copilot-plugin', sessionId: cbSid, form: null, model: null, title: '(Copilot 会话)', startedAt: Date.now() - 60_000, baselineCommit: null });
+  repo.upsertTaskRun.run({ id: `copilot:${cbSid}:0`, projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: cbSid, form: null, model: null, title: '(Copilot 会话)', startedAt: Date.now() - 60_000, baselineCommit: null });
 
   scanReal = true;
   const phantomWrote = syncCopilotTasks({ bus, repo });
@@ -708,7 +708,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   // 9F 没有 hook / 插件上报，这条状态行只有同步器会写；不在的会话就必须落回 idle。
   const staleAt = Date.now() - 5 * 60_000;
   repo.insertTask.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: '(Copilot 会话)', state: 'running', progress: null, startedAt: staleAt, endedAt: null });
-  repo.upsertTaskRun.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot-plugin', sessionId: 'gone', form: null, model: null, title: '(Copilot 会话)', startedAt: staleAt, baselineCommit: null });
+  repo.upsertTaskRun.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'gone', form: null, model: null, title: '(Copilot 会话)', startedAt: staleAt, baselineCommit: null });
   repo.upsertStatus.run({ memberId: 'copilot@p1', state: 'thinking', stateSince: staleAt, taskId: 'copilot:gone:0', progress: null, currentFiles: null, lastHeartbeatAt: staleAt, degraded: 1, source: 'timeout', updatedAt: staleAt });
   copilotRows = [];
   syncCopilotTasks({ bus, repo });
@@ -740,11 +740,12 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   syncCopilotTasks({ bus, repo });
   ok('会话停掉后再跑一轮 → 落回 idle', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
 
-  console.log('[9] /reporter-phase：楼层客户端是逗号串也要走对那条路（8F 回归）');
+  console.log('[9] /reporter-phase：按楼层基名（opencode）走对那一路（8F 回归）');
   // 回归（2026-09-28 实测）：route 里两条分支曾写成 `clientBase(client) === 'opencode' | 'kilo'`，
-  // 而渲染层传的是**整个楼层的 clients 串**（合并楼层就是 'opencode,opencode-plugin'），
+  // 而那时渲染层传的是"整个楼层的 clients 串"（合并楼层是 'opencode,opencode-plugin'），
   // clientBase 只剥单个 -plugin 后缀、逗号串永远不相等 → 整条分支不生效：
   // 主控制台相位/模型/完成标记全空，只剩一句"思考中"、没有任何内容。
+  // 现在身份恒为基名（单值），routes 直接等值判 → 走对那一路。
   sessionsMod.reporterMainPhase = () => null;
   sessionsMod.reporterStateMeta = () => ({ sessionId: '', instrumented: false });
   sessionsMod.readReporterDone = () => null;
@@ -770,7 +771,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const srvPhase = appPhase.listen(0, '127.0.0.1');
   await new Promise((r) => srvPhase.once('listening', r));
   const rpComma = await (
-    await fetch(`http://127.0.0.1:${srvPhase.address().port}/api/v1/reporter-phase?client=opencode,opencode-plugin`)
+    await fetch(`http://127.0.0.1:${srvPhase.address().port}/api/v1/reporter-phase?client=opencode`)
   ).json();
   ok(
     '逗号串也走 8F 轮询那一路（相位 / 用户原话 / 模型都在）',
@@ -790,7 +791,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const srv2 = appPhase.listen(0, '127.0.0.1');
   await new Promise((r) => srv2.once('listening', r));
   const rpCancel = await (
-    await fetch(`http://127.0.0.1:${srv2.address().port}/api/v1/reporter-phase?client=opencode,opencode-plugin`)
+    await fetch(`http://127.0.0.1:${srv2.address().port}/api/v1/reporter-phase?client=opencode`)
   ).json();
   ok(
     '8F 被打断：快轮询的 done.cancelled=true（主控制台据此亮红色「任务取消」）',

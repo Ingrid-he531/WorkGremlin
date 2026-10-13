@@ -34,9 +34,8 @@ function memberIdOf(project, name) {
  * 成员 client 归一化：只做 trim / 转小写，空值归 null。
  *
  * 约定（与楼层 / client 模型一致）：**client 就是楼层产品基名**（codebuddy / codex …），
- * 由 registerMember 的调用方负责传对——调用方本来就处在某个楼层的上下文里，它默认知道
- * 自己是哪一层。这里**不校验**"是不是已知楼层"：传错（形态串 cli/vscode、或拼错的基名）
- * 就自然对不上任何楼层的过滤条件，前端不显示，无需在此拦截。
+ * 形态（CLI / 插件）走 `form`，不进身份。这里**不校验**"是不是已知楼层"：传错（形态串
+ * cli/vscode、或拼错的基名）就自然对不上任何楼层的过滤条件，前端不显示，无需在此拦截。
  */
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
@@ -49,6 +48,9 @@ function normClient(v) {
  */
 function normForm(v) {
   const s = String(v || '').trim().toLowerCase();
+  // form 存的是**形态**（cli / vscode / ide）。老数据 / 个别上报会把"来源名" plugin 当 form 传，
+  // 归一到它对应的形态 vscode —— 否则 isPluginClient 不认，任务列表的「… Plugin」标签会丢。
+  if (s === 'plugin') return 'vscode';
   if (s === 'cli' || s === 'ide' || isPluginClient(s)) return s;
   return null;
 }

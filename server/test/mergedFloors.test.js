@@ -10,7 +10,7 @@
  *
  * 覆盖：
  *   A. 1F CodeBuddy（cli + plugin + hook 三路）
- *     [A1] 一层：clients = codebuddy + codebuddy-plugin；只装 IDE 插件、没有 CLI 可执行文件也算"装了"
+ *     [A1] 一层：client 恒为基名 codebuddy（形态由 source.form 表达）；只装 IDE 插件、没有 CLI 可执行文件也算"装了"
  *     [A2] 同时开着 CLI 与 Plugin → 这一层里**两条会话**，不是两个楼层
  *     [A3] 相位各认各的：client 传整层的串时，插件会话拿到插件的 tool、CLI 会话拿到自己的 thinking；
  *          只传单 client 时互不串味
@@ -18,10 +18,10 @@
  *          会话照样要进表 —— jsonl 优先的判据必须是"扫到了还活着的会话"，不是"扫到了任何行"
  *     [A5] jsonl 那一路优先：CLI 落盘扫得到**活**会话时，hook 那一路整层让位（同一条会话不列两遍）
  *   B. 5F TraeCode（IDE + 插件合并，会话只能靠 hook 状态文件）
- *     [B1] 一层：clients = trae + trae-plugin；三路来源（IDE 落盘 + 插件落盘 + hook）
+ *     [B1] 一层：client 恒为基名 trae；三路来源（IDE 落盘 + 插件落盘 + hook）
  *     [B2] **两个形态的落盘目录都要列出来**（~/.trae-cn 与 ~/.marscode）；这两路只作展示、
  *          取不到会话 → 各带一句说明（楼层胶囊 tooltip 显示它们）
- *     [B3] 两种身份的 hook 状态文件（trae / trae-plugin）都归这一层
+ *     [B3] 两个形态的 hook 状态文件（form=ide / form=vscode）都归这一层
  *   C. 6F Qoder（CLI 与插件合并：同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F）
  *     [C] 一层：只接纳 qoder 一种身份（CLI 与插件共用同一 client）；三路来源（cli 扫 transcript 产会话 + lingma 轮询插件的 local.db + hook 实时相位兜底）；只装了 qoder 就算"装了"
  *     [C2] 会话来自 hook 状态文件兜底：qoder 状态文件归这一层、相位按整层 client 取得到
@@ -151,23 +151,25 @@ fs.writeFileSync(
   } })
 );
 
-// 两份 hook 状态文件：同一个工程、两种身份、各自有新鲜的相位
-writeState('codebuddy-plugin', PLUGIN_SID, {
+// 两份 hook 状态文件：同一个工程、同一身份（client=基名），形态分别是插件 / CLI
+writeState('codebuddy', PLUGIN_SID, {
+  form: 'vscode',
   sessionPhase: { phase: 'tool', ts: Date.now(), workspacePath: WS, tool: 'Edit', target: 'renderer/x.js', detail: '改 renderer/x.js' },
   pending: null,
 });
 writeState('codebuddy', CLI_SID, {
+  form: 'cli',
   sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: WS, detail: '' },
   pending: null,
 });
 
-// 5F TraeCode：同样是"两种身份、同一层"。TraeCode **没有可扫的会话落盘**，
-// 两条会话都只能靠 hook 状态文件列出来（这正是这一层要合并成一层的原因）。
+// 5F TraeCode：同一层、同一身份（trae），形态分别 IDE / 插件。TraeCode **没有可扫的会话落盘**，
+// 两条会话都只能靠 hook 状态文件列出来。
 const TR_WS = '/tmp/ProjTr';
 const TRAE_SID = '6ab7214d6fa5e51568fec603';
 const TRAE_PLUGIN_SID = '6ab52af89e789b7a36fd23b9';
-writeState('trae', TRAE_SID, { sessionPhase: { phase: 'tool', ts: Date.now(), workspacePath: TR_WS, detail: '改 renderer' }, pending: null }, TR_WS);
-writeState('trae-plugin', TRAE_PLUGIN_SID, { sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: TR_WS, detail: '' }, pending: null }, TR_WS);
+writeState('trae', TRAE_SID, { form: 'ide', sessionPhase: { phase: 'tool', ts: Date.now(), workspacePath: TR_WS, detail: '改 renderer' }, pending: null }, TR_WS);
+writeState('trae', TRAE_PLUGIN_SID, { form: 'vscode', sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath: TR_WS, detail: '' }, pending: null }, TR_WS);
 
 /* ------------------------------ 断言 ------------------------------ */
 
@@ -194,9 +196,14 @@ head('[A1] 楼层表：1F 只有一层 CodeBuddy，两种 client、三路来源�
   ok('只有一个 CodeBuddy 楼层（没有第二个 CodeBuddy Plugin 层）', products.filter((p) => p.agent === 'codebuddy').length === 1);
   ok('1F 名叫 CodeBuddy', floor && floor.name === 'CodeBuddy', floor && floor.name);
   ok(
-    '这一层接纳 codebuddy + codebuddy-plugin 两种上报身份',
-    floor && JSON.stringify(floor.clients) === JSON.stringify(['codebuddy', 'codebuddy-plugin']),
+    '楼层身份恒为基名（codebuddy），不再有 codebuddy-plugin 这种合成身份',
+    floor && JSON.stringify(floor.clients) === JSON.stringify(['codebuddy']),
     floor && JSON.stringify(floor.clients)
+  );
+  ok(
+    '三路来源各带形态 form：cli / vscode / 空（hook 两态都收）',
+    floor && JSON.stringify(floor.sources.map((s) => s.form)) === JSON.stringify(['cli', 'vscode', '']),
+    floor && JSON.stringify(floor.sources.map((s) => s.form))
   );
   ok(
     '三路来源：cli（~/.codebuddy）+ plugin（globalStorage）+ hook（状态文件）',
@@ -254,16 +261,17 @@ head('[A2b] 1F 任务状态严格按所选 sessionId 归属');
 }
 
 /* [A3] 相位各认各的（不串味） */
-head('[A3] 同一层里两条会话的实时相位各认各的（这一层要认一串 client）');
+head('[A3] 同一层里两条会话的实时相位各认各的（同一 client，按会话 id 归属）');
 {
-  const both = 'codebuddy,codebuddy-plugin';
+  const both = 'codebuddy';
   const p = reporterMainPhase(WS, both, PLUGIN_SID);
   const c = reporterMainPhase(WS, both, CLI_SID);
   ok('插件会话拿到插件那路的相位（tool）', Boolean(p) && p.phase === 'tool', p && JSON.stringify(p));
   ok('CLI 会话拿到 CLI 那路的相位（thinking）', Boolean(c) && c.phase === 'thinking', c && JSON.stringify(c));
   ok('两条会话的相位互不相同（没有谁最新谁生效）', Boolean(p && c) && p.phase !== c.phase);
-  ok('只传 CLI 那一路时，插件会话的相位取不到（不串味）', reporterMainPhase(WS, 'codebuddy', PLUGIN_SID) === null);
-  ok('只传插件那一路时，CLI 会话的相位取不到（不串味）', reporterMainPhase(WS, 'codebuddy-plugin', CLI_SID) === null);
+  // 同一楼层现在共用一个 client（基名），防串味靠**会话 id**（状态文件一条会话一份），不再靠 client 后缀
+  ok('按会话 id 精确读：查插件会话拿到插件那份（tool）', (reporterMainPhase(WS, 'codebuddy', PLUGIN_SID) || {}).phase === 'tool');
+  ok('按会话 id 精确读：查 CLI 会话拿到 CLI 那份（thinking）', (reporterMainPhase(WS, 'codebuddy', CLI_SID) || {}).phase === 'thinking');
 }
 
 head('[A3b] CodeBuddy Plugin 收到 SessionEnd 后移除；再次 SessionStart 后重新列出');
@@ -284,11 +292,11 @@ head('[A3b] CodeBuddy Plugin 收到 SessionEnd 后移除；再次 SessionStart �
   floor = snap.floors.find((f) => f.id === '1F');
   ok('新 Plugin SessionEnd 后从下拉移除', !floor.sessions.some((s) => s.sessionId === NEW_PLUGIN_SID), floor.sessions.map((s) => s.sessionId).join(' '));
 
-  writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: endedAt });
+  writeState('codebuddy', PLUGIN_SID, { form: 'vscode', sessionEndedAt: endedAt });
   snap = snapshot({ force: true, workspacePath: WS });
   floor = snap.floors.find((f) => f.id === '1F');
   ok('Plugin SessionEnd 后会话立即从下拉数据移除', !floor.sessions.some((s) => s.sessionId === PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
-  writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: null, sessionWorkspacePath: WS });
+  writeState('codebuddy', PLUGIN_SID, { form: 'vscode', sessionEndedAt: null, sessionWorkspacePath: WS });
   snap = snapshot({ force: true, workspacePath: WS });
   floor = snap.floors.find((f) => f.id === '1F');
   ok('同一 Plugin 会话再次 SessionStart 后重新出现', floor.sessions.some((s) => s.sessionId === PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
@@ -335,7 +343,7 @@ head('[A5] CLI 落盘扫得到活会话时，hook 兜底整层让位（同一条
   ok('同一条 CLI 会话没有同时留下 hook 那一路的行（不重复）', fromHook.length === 0);
   ok('插件那条会话照常还在（两处落盘互不影响）', floor.sessions.some((s) => s.sessionId === PLUGIN_SID));
   const codebuddyPluginRe = detectProducts({ force: true }).find((p) => p.id === '1F').pluginRe;
-  const storage = listSessions({ force: true, client: 'codebuddy-plugin', pluginRe: codebuddyPluginRe });
+  const storage = listSessions({ force: true, client: 'codebuddy', pluginRe: codebuddyPluginRe });
   ok('插件落盘这一路自己仍然列得出会话', (storage.sessions || []).some((s) => s.id === PLUGIN_SID));
 }
 
@@ -386,8 +394,8 @@ head('[B1] 楼层表：5F 只有一层 TraeCode（IDE 与插件合并）');
   ok('楼层编号从 1F 起连续、没有重号', nums.length === ids.length && nums.every((n, i) => n === i + 1), ids.join(' '));
   ok('7F 是 Kilo Code（轮询 SQLite 那一路）', products.some((p) => p.id === '7F' && p.name === 'Kilo Code'), products.map((p) => `${p.id}:${p.name}`).join(' '));
   ok(
-    '这一层接纳 trae + trae-plugin 两种上报身份',
-    floor && JSON.stringify(floor.clients) === JSON.stringify(['trae', 'trae-plugin']),
+    '楼层身份恒为基名（trae）',
+    floor && JSON.stringify(floor.clients) === JSON.stringify(['trae']),
     floor && JSON.stringify(floor.clients)
   );
   ok(
@@ -423,7 +431,7 @@ head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都�
   ok('两路都没有 genie-history 这类会话索引', !fs.existsSync(path.join(ideSrc.dataPath, 'genie-history')) && !fs.existsSync(path.join(pluginSrc.dataPath, 'genie-history')));
 
   // 真值验证：插件那一路的会话列举确实拿不到东西（不是我们没去问）
-  const st = listSessions({ force: true, client: 'trae-plugin', pluginRe: /trae/i });
+  const st = listSessions({ force: true, client: 'trae', pluginRe: /trae/i });
   ok('listSessions 对插件那一路回空（没有结构化落盘）', (st.sessions || []).length === 0, JSON.stringify(st.sessions).slice(0, 200));
 
   // 楼层快照（前端拿到的就是这份）也要带上这两路（前端 tooltip 直接列它们）
@@ -434,16 +442,16 @@ head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都�
 }
 
 /* [B3] 会话来自 hook 状态文件；两种身份都归这一层 */
-head('[B3] 5F 的会话来自 hook：trae 与 trae-plugin 两种状态文件都归这一层');
+head('[B3] 5F 的会话来自 hook：form=ide / form=vscode 两个形态的状态文件都归这一层');
 {
   const snap = snapshot({ force: true, workspacePath: TR_WS });
   const floor = snap.floors.find((f) => f.id === '5F');
   const ids = floor.sessions.map((s) => s.sessionId).sort();
   ok('这一层两条会话', floor.sessions.length === 2, floor.sessions.map((s) => `${s.sessionId}`).join(' '));
-  ok('两种身份的会话都在（trae + trae-plugin）', JSON.stringify(ids) === JSON.stringify([TRAE_PLUGIN_SID, TRAE_SID].sort()), JSON.stringify(ids));
+  ok('两条会话都在（同一 client=trae，形态不同）', JSON.stringify(ids) === JSON.stringify([TRAE_PLUGIN_SID, TRAE_SID].sort()), JSON.stringify(ids));
   ok('两条都归属同一个工程', floor.sessions.every((s) => s.projectPath === TR_WS), JSON.stringify(floor.sessions.map((s) => s.projectPath)));
-  const both = 'trae,trae-plugin';
-  ok('相位按这一层的 client 串取得到（整层的两路都认）', Boolean(reporterMainPhase(TR_WS, both, TRAE_SID)));
+  const both = 'trae';
+  ok('相位按这一层的 client 取得到', Boolean(reporterMainPhase(TR_WS, both, TRAE_SID)));
   ok('相位按会话精确：两条会话拿到各自的相位', reporterMainPhase(TR_WS, both, TRAE_SID).phase === 'tool' && reporterMainPhase(TR_WS, both, TRAE_PLUGIN_SID).phase === 'thinking');
 }
 
@@ -509,7 +517,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
   const floor = products.find((p) => p.id === '9F');
   ok('有 9F 这一层', Boolean(floor), products.map((p) => p.id).join(' '));
   ok('9F 名叫 GitHub Copilot', floor && floor.name === 'GitHub Copilot', floor && floor.name);
-  ok('9F 只接纳 copilot-plugin 这一路上报身份', floor && JSON.stringify(floor.clients) === JSON.stringify(['copilot-plugin']), floor && JSON.stringify(floor.clients));
+  ok('9F 身份恒为基名（copilot）', floor && JSON.stringify(floor.clients) === JSON.stringify(['copilot']), floor && JSON.stringify(floor.clients));
   ok('插件扩展目录命中后会被判定为已安装', floor && floor.installed === true, floor && String(floor.installPath));
   ok('9F 视图层会拿到插件落盘源', floor && floor.sources.some((s) => s.kind === 'plugin'), floor && JSON.stringify(floor.sources.map((s) => s.kind)));
 
@@ -578,7 +586,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
 
   // 这条是根因回归：同一台机上会同时有老的 Tencent Copilot 目录和新的 GitHub Copilot 目录；
   // 代码必须优先选真正的 GitHub Copilot，不然 9F 会被旧目录吞掉，胶囊永远不亮。
-  const sessionSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const sessionSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
   const storage = sessionSnap.storage;
   ok('9F 优先选 GitHub Copilot 的真实插件存储', storage === ghStorage, `实际 ${storage}，期望 ${ghStorage}`);
   ok('9F 能从 GitHub Copilot 的真实 SQLite 会话库读出活跃会话', Array.isArray(sessionSnap.sessions) && sessionSnap.sessions.some((s) => s.id === ghSid), JSON.stringify(sessionSnap.sessions.map((s) => s.id)));
@@ -595,7 +603,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
     ghSession && JSON.stringify(ghSession.files)
   );
 
-  const ghPhase = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot-plugin', ghSid);
+  const ghPhase = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot', ghSid);
   ok('9F 主 Agent 相位可从 GitHub Copilot SQLite 会话回退得到', ghPhase && ghPhase.phase === 'thinking' && ghPhase.prompt === 'fix the highlight bug', ghPhase && JSON.stringify(ghPhase));
 
   // 9F 相位：Copilot 自己的库是**整轮写完**才落的（turns 行带 assistant_response 一起出现，
@@ -632,20 +640,20 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
   };
 
   writeChatIndex(1790580000000, 0); // 只有开始、没有结束 = 这一轮在飞
-  const liveSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const liveSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
   const liveRow = liveSnap.sessions.find((s) => s.id === ghSid);
   ok(
     '9F 相位：chat 索引说这一轮在飞 → thinking（不是待命）',
     liveRow && liveRow.phase === 'thinking' && liveRow.inFlight === true,
     liveRow && JSON.stringify({ phase: liveRow.phase, inFlight: liveRow.inFlight })
   );
-  const livePhase = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot-plugin', ghSid);
+  const livePhase = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot', ghSid);
   ok('9F 主 Agent 相位同口径（在飞 → thinking）', livePhase && livePhase.phase === 'thinking', livePhase && livePhase.phase);
 
   const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   sleepSync(20);
   writeChatIndex(1790580000000, 1790580050000, 'ended'); // 结束晚于开始 = 这一轮收工了
-  const idleSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const idleSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
   const idleRow = idleSnap.sessions.find((s) => s.id === ghSid);
   ok(
     '9F 相位：索引说这一轮已收工 → idle（不再拿 2 分钟窗口糊着）',
@@ -666,7 +674,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
     k: ['requests'],
     v: [{ requestId: 'r1', timestamp: liveStart, message: { text: '这一轮在做 9F 相位' }, modelState: { value: 0 } }],
   });
-  const liveSnap2 = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const liveSnap2 = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
   const liveRow2 = liveSnap2.sessions.find((s) => s.id === ghSid);
   ok(
     '9F 相位：会话日志说这一轮刚开始 → thinking',
@@ -674,7 +682,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
     liveRow2 && JSON.stringify({ phase: liveRow2.phase, inFlight: liveRow2.inFlight })
   );
   ok('9F「思考中」带的是这一轮用户原话（不是上一轮）', liveRow2 && liveRow2.prompt === '这一轮在做 9F 相位', liveRow2 && liveRow2.prompt);
-  const livePhase2 = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot-plugin', ghSid);
+  const livePhase2 = reporterMainPhase('/tmp/ProjGitHubCopilot', 'copilot', ghSid);
   ok(
     '9F 主 Agent 相位同口径（在飞 → thinking + 原话）',
     livePhase2 && livePhase2.phase === 'thinking' && livePhase2.prompt === '这一轮在做 9F 相位',
@@ -683,7 +691,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
 
   writeLog({ kind: 1, k: ['requests', 0, 'elapsedMs'], v: 42000 });
   writeLog({ kind: 1, k: ['requests', 0, 'modelState'], v: { value: 1, completedAt: liveStart + 42000 } });
-  const doneSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const doneSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
   const doneRow = doneSnap.sessions.find((s) => s.id === ghSid);
   ok(
     '9F 相位：日志补上完成标记后 → idle',
@@ -719,7 +727,7 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
       { kind: 'toolInvocationSerialized', toolId: 'copilot_multiReplaceString', invocationMessage: { value: 'Replacing 1 lines with 2 lines in [](file:///tmp/ProjGitHubCopilot/src/highlight.ts)' } },
     ],
   });
-  const newSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot-plugin' });
+  const newSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
   const newRow = newSnap.sessions.find((s) => s.id === ghSid);
   ok(
     '9F 相位：新一轮刚开始（完成补丁还没落、索引又写成 started==ended）→ 仍然 thinking',
@@ -756,14 +764,16 @@ head('[A2c] 1F 插件相位按 sessionId 归属（空闲会话不借同层忙碌
       },
     })
   );
-  writeState('codebuddy-plugin', IDLE_SID, {
+  writeState('codebuddy', IDLE_SID, {
+    form: 'vscode',
     taskId: null,
     taskStartedAt: 0,
     sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: WS },
     pending: null,
   });
   // 同层另一条插件会话正在跑（新鲜 taskId + thinking 相位，且 ts 更新）
-  writeState('codebuddy-plugin', BUSY_SID, {
+  writeState('codebuddy', BUSY_SID, {
+    form: 'vscode',
     sessionPhase: { phase: 'thinking', ts: Date.now() + 5_000, workspacePath: WS },
     pending: null,
   });
@@ -776,6 +786,27 @@ head('[A2c] 1F 插件相位按 sessionId 归属（空闲会话不借同层忙碌
     idle && idle.phase === 'idle',
     idle && JSON.stringify({ phase: idle.phase, inferred: idle.inferred })
   );
+}
+
+/* [A2d] CLI 那路扫出的会话，形态要取 reporter 的 form（CLI / 插件共用一棵落盘，如 3F Codex） */
+head('[A2d] CLI 裸 jsonl 的会话，形态取 reporter 状态文件的 form');
+{
+  // 一条 CLI jsonl 会话（CLI 那路扫得到），但 reporter 说它是插件形态（form=vscode）→ source 应为 plugin
+  const SID = 'cccc1111-2222-3333-4444-555566667777';
+  const file = path.join(HOME, '.codebuddy', 'projects', `${SID}.jsonl`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ cwd: WS, type: 'message', text: 'hi' })}\n`);
+  writeState('codebuddy', SID, {
+    form: 'vscode',
+    sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: WS },
+    pending: null,
+  });
+  const snap = snapshot({ force: true, workspacePath: WS });
+  const floor = snap.floors.find((f) => f.id === '1F');
+  const row = floor.sessions.find((s) => s.sessionId === SID);
+  ok('这条是 CLI 那路扫出来的（jsonl）', Boolean(row) && row.sourceKind === 'cli', row && JSON.stringify({ sourceKind: row.sourceKind, source: row.source }));
+  ok('CLI 裸 jsonl 行也带上了 reporter 的 form（vscode）', Boolean(row) && row.form === 'vscode', row && JSON.stringify({ form: row.form, source: row.source }));
+  ok('source 随之算成 plugin（下拉前缀不再误显示 CLI）', Boolean(row) && row.source === 'plugin', row && row.source);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -36,7 +36,7 @@ const path = require('node:path');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
 const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
-const { formToSource } = require('@workgremlin/shared');
+const { formToSource, agentBase } = require('@workgremlin/shared');
 
 // 进程启动时刻：doneAt 等"结束态"只在"本进程启动之后"发生的才认，重启后旧的结束态不再复活。
 const SINCE_BOOT = Date.now();
@@ -489,9 +489,8 @@ function refresh({ workspacePath = '', force = false } = {}) {
    * 会话来源：每个楼层按自己的 sources 逐路取 —— 普通楼层一路，合并楼层多路
    * （1F CodeBuddy = CLI 落盘 + 插件结构化落盘 + reporter 状态文件，见 products.js 的 sources）。
    *
-   * 每一路都带上**这一路自己的 client**：插件那路是 codebuddy-plugin，CLI / hook 那路是 codebuddy。
-   * 于是每条会话的相位、完成标记、活跃窗口都只认自己那一路的落盘 ——
-   * 同一个产品同时开着 CLI 与 Plugin 时，两条会话各显示各的，不会互相串味。
+   * 每一路的 client 都是**楼层基名**（插件 / CLI / hook 三路相同），形态由该路的 form / kind 表达。
+   * 会话按 sessionId 归属：同一个产品同时开着 CLI 与 Plugin 时，两条会话各读各的落盘，不会串味。
    *
   * CLI 的 JSONL 与 hook 状态文件可能描述同一会话。两路都提供 sessionId 时只对同一 id 去重；
   * SessionEnd 的 reporter 标记会同时排除旧 hook 行与对应 JSONL。CLI 新会话即使还没有 transcript，
@@ -601,7 +600,9 @@ function handlePlugin(p, src, ctx) {
   );
   const pluginSessionIds = new Set(pluginSessions.map((s) => s.id));
   for (const [key, session] of table) {
-    if (session.floor === p.id && session.source === 'plugin' && !pluginSessionIds.has(session.sessionId)) table.delete(key);
+    // 按 **sourceKind** 认"这是插件结构化落盘那一路的行"——不能按 source（form→source，CLI 路扫出的
+    // 会话也可能是 plugin 形态，如 3F Codex 共用落盘），否则会把它们一起裁掉。
+    if (session.floor === p.id && session.sourceKind === 'plugin' && !pluginSessionIds.has(session.sessionId)) table.delete(key);
   }
   if (!pluginSessions.length) return;
   for (const s of pluginSessions) {
@@ -610,7 +611,11 @@ function handlePlugin(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      source: 'plugin',
+      // source = form→source（这一路是插件的结构化落盘，形态 vscode）
+      source: formToSource(src.form),
+      // sourceKind = 这一行由哪一路读出来（plugin 结构化落盘）：裁剪/让位规则按它认，别拿 source 认
+      sourceKind: 'plugin',
+      form: src.form || '',
       project: s.project || '',
       projectPath: s.projectPath || '',
       mine: Boolean(s.mine),
@@ -650,6 +655,9 @@ function handleCliHook(p, src, ctx) {
   } = ctx;
   const reporterSessions = src.kind === 'cli' ? listReporterSessions(src.client, { includeEnded: true }) : [];
   const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
+  // 会话形态（cli / vscode）**只有 reporter 状态文件里记着**：CLI 那路扫的是 jsonl，看不出形态
+  // （CLI 与 IDE 共用同一棵落盘，如 3F Codex）。按会话 id 把 form 取回来，供 source=formToSource(form) 判形态。
+  const formBySession = new Map(reporterSessions.filter((s) => s.form).map((s) => [s.sessionId, s.form]));
   for (const [key, session] of table) {
     if (session.floor === p.id && endedSessionIds.has(session.sessionId) && ['cli', 'hook'].includes(session.sourceKind)) {
       table.delete(key);
@@ -683,15 +691,16 @@ function handleCliHook(p, src, ctx) {
     if (src.kind === 'hook' && sessionId && cliLandingSessions.get(p.id)?.has(sessionId)) continue;
     if (!claim(p.id, sessionId)) continue;
     const lastEventAt = s.lastEventAt;
+    const form = s.form || formBySession.get(sessionId) || '';
     upsert({
       floor: p.id,
       id: s.id,
       sessionId,
       // source 按 form 派生:plugin/CLI/IDE 三种形态,空 form 当 CLI
-      source: formToSource(s.form),
+      source: formToSource(form),
       /** 这一行具体来自哪一路（cli / hook）：让"jsonl 优先"规则能撤掉旧的 hook 行 */
       sourceKind: src.kind,
-      form: s.form || '',
+      form,
       project: s.project,
       projectPath: s.projectPath,
       mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
@@ -815,29 +824,10 @@ function flushSupersededTasks(doneScans) {
 }
 
 /**
- * 全局活跃会话表（按楼层分组）。
- * @param {{workspacePath?: string, force?: boolean}} o
- * @returns {{ok: true, floors: Array, sessions: Array, defaultFloor: string,
- *            workspacePath: string, timeoutMs: number, updatedAt: number, reason?: string}}
- */
-/**
- * 客户端身份归一化为 agent 基名：剥掉 -plugin 后缀与工程/实例后缀（形如 codebuddy@workgremlin 的 @ 后缀）、转小写。
- * 与前端 floorAcceptsClient 的 agentBase 同口径——同一产品 CLI 与 Plugin 同层，靠基名认。
- */
-function agentBase(id) {
-  return String(id || '')
-    .replace(/-plugin$/i, '')
-    .split('@')[0]
-    .toLowerCase();
-}
-
-/**
  * 会话的「统一任务状态」—— 门楣滚动屏与主控制台判定"本层有没有任务在跑"的**唯一真相源**。
  *   - 'running'：本工程里这一层（按 agent 基名归层）还有"活着"的在飞任务——主控制台据此显示「思考中」。
  *     **优先于**上一轮残留的 doneAt：新开一轮时旧 doneAt 还在，若按 doneAt 先判会先闪一下"任务取消/完成"，
- *     所以活着任务优先。归层用 agent 基名（剥 -plugin / @工程 后缀），与前端 floorAcceptsClient 同口径——
- *     插件会话 client 是 codebuddy-plugin、ledger 里 task_runs.client 是裸 codebuddy，基名相同即算同层，
- *     不再因字符串不同漏配（之前按精确 client 比对，整条漏掉插件在跑任务）。
+ *     所以活着任务优先。归层用 agent 基名（剥 @<工程/实例> 后缀），与前端 floorAcceptsClient 同口径。
  *   - 'cancelled' / 'done'：reporter 在 Stop / 打断时落的完成标记（doneAt）是"已结束"最可靠信号
  *     （CodeBuddy 插件按停止连 hook 都不发，task_runs 未必被翻成 cancelled，见 flushSynthesizedCancels
  *     的注释），所以没在跑时才以 reporter 为准；
@@ -945,11 +935,10 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       kind: p.kind,
       // 这一层监控的是哪个客户端（codebuddy / workbuddy / codex / claude）——
       // 办公室按它过滤成员，切到 3F 就不该再看见 CodeBuddy 的小怪物
-      // （成员过滤按 **基名** 认：1F 的 codebuddy 也收 codebuddy-plugin 的小怪物，
-      //  见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）
+      // （成员过滤按 **agent 基名**认，见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）
       client: p.dataKind || '',
-      // 这一层接纳的全部客户端（合并楼层多个，如 1F = codebuddy + codebuddy-plugin）：
-      // 前端按它过滤实时相位（/reporter-phase?client=a,b）与任务记录里的楼层归属
+      // 这一层接纳的客户端（= 楼层基名，如 1F 的 ['codebuddy']）：
+      // 前端按它过滤实时相位（/reporter-phase?client=codebuddy）与任务记录里的楼层归属
       clients: p.clients && p.clients.length ? p.clients : p.dataKind ? [p.dataKind] : [],
       installed: Boolean(p.installed),
       installPathLabel: p.installPathLabel || '',

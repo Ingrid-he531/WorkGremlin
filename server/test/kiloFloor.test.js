@@ -192,8 +192,8 @@ head('[A1] 7F 只有一层 Kilo Code：clients = kilo + kilo-plugin，两路来�
   ok('7F 这一层存在', Boolean(floor), '楼层表里没有 7F');
   ok('7F 名名叫 Kilo Code', floor && floor.name === 'Kilo Code', floor && floor.name);
   ok(
-    '这一层接纳两种上报身份：kilo（CLI/TUI）与 kilo-plugin（VS Code 扩展装了 WorkGremlin 插件）',
-    floor && JSON.stringify(floor.clients) === JSON.stringify(['kilo', 'kilo-plugin']),
+    '楼层身份恒为基名（kilo）；形态（CLI/TUI vs VS Code 插件）由 source.form 表达',
+    floor && JSON.stringify(floor.clients) === JSON.stringify(['kilo']),
     floor && JSON.stringify(floor.clients)
   );
   ok(
@@ -205,7 +205,11 @@ head('[A1] 7F 只有一层 Kilo Code：clients = kilo + kilo-plugin，两路来�
   );
   ok('kilo 那一路产会话，不标 sessions:false', floor && floor.sources.every((s) => s.sessions !== false), floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
   ok('hook 那一路也产会话（插件写的状态文件）', floor && floor.sources.find((s) => s.kind === 'hook') && floor.sources.find((s) => s.kind === 'hook').sessions !== false, floor && JSON.stringify(floor.sources.map((s) => `${s.kind}:${s.sessions}`)));
-  ok('hook 那一路按整层过滤：client = kilo,kilo-plugin（合并楼层两路都认）', floor && floor.sources.find((s) => s.kind === 'hook').client === 'kilo,kilo-plugin', floor && JSON.stringify(floor.sources.find((s) => s.kind === 'hook')));
+  ok(
+    'hook 那一路：client = kilo（基名）+ form = vscode（插件真相位）',
+    floor && floor.sources.find((s) => s.kind === 'hook').client === 'kilo' && floor.sources.find((s) => s.kind === 'hook').form === 'vscode',
+    floor && JSON.stringify(floor.sources.find((s) => s.kind === 'hook'))
+  );
 }
 
 head('[A2] 装了 kilo 可执行文件就算"装了"；数据根是 XDG 位置');

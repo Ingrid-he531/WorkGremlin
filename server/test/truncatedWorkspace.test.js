@@ -62,7 +62,7 @@ fs.writeFileSync(path.join(WS, 'package.json'), JSON.stringify({ name: 'workgrem
 
 const STORAGE = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'tencent-cloud.coding-copilot');
 const SID = '0819ef3ed32241a4970a17b8013f9289';
-const CLIENT = 'codebuddy-plugin';
+const CLIENT = 'codebuddy';
 const b64 = Buffer.from(WS).toString('base64url');
 const TRUNC = b64.slice(0, 64); // 扩展的截断口径：base64 目录名只留 64 字符
 const decoded = decodeDirName(TRUNC); // 只剩前 48 字节
@@ -100,6 +100,7 @@ fs.writeFileSync(
   path.join(WG, 'hooks', `${hookName}.json`),
   JSON.stringify({
     client: CLIENT,
+    form: 'vscode',
     sessionId: SID,
     taskId: 'task-1',
     taskStartedAt: now,
