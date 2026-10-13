@@ -589,9 +589,24 @@ function handlePlugin(p, src, ctx) {
       'bySession=', [...(scan.bySession || new Map()).keys()]);
     doneScans.set(scanKey, scan);
   }
-  const st = listSessions({ workspacePath, force, client: src.client, pluginRe: p.pluginRe });
+  const isCodebuddyPlugin = p.agent === 'codebuddy' && src.client === 'codebuddy-plugin';
   const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
-  const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
+  const pluginLifecycleSessions = isCodebuddyPlugin
+    ? listReporterSessions('codebuddy', { includeEnded: true }).filter((s) => s.form === 'vscode')
+    : [];
+  const endedSessionIds = new Set([
+    ...reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId),
+    ...pluginLifecycleSessions.filter((s) => s.endedAt).map((s) => s.sessionId),
+  ]);
+  const activePluginSessions = pluginLifecycleSessions.filter((s) => s.currentProcess && !s.endedAt);
+  const st = listSessions({
+    workspacePath,
+    force,
+    client: src.client,
+    pluginRe: p.pluginRe,
+    currentOnly: isCodebuddyPlugin,
+    activeSessions: activePluginSessions,
+  });
   if (endedSessionIds.size) {
     for (const [key, session] of table) {
       if (session.floor === p.id && endedSessionIds.has(session.sessionId)) table.delete(key);
@@ -602,6 +617,10 @@ function handlePlugin(p, src, ctx) {
       !endedSessionIds.has(s.id) &&
       !(src.client === 'codebuddy-plugin' && s.runtime && s.runtime.paused && String(s.runtime.pauseReason || '').toLowerCase() === 'cancel')
   );
+  const pluginSessionIds = new Set(pluginSessions.map((s) => s.id));
+  for (const [key, session] of table) {
+    if (session.floor === p.id && session.source === 'plugin' && !pluginSessionIds.has(session.sessionId)) table.delete(key);
+  }
   if (!pluginSessions.length) return;
   for (const s of pluginSessions) {
     if (!claim(p.id, s.id)) continue;
@@ -880,14 +899,14 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   const repo = backend && backend.repo;
   // 标题取账本 tasks.title（用户那句话，渲染层不丢）——所有在跑任务都取，窗口放宽，只当文案不影响判定。
   // 同时顺手取出 tasks.started_at（任务真正开始的时间），滚动屏时间用它，而不是"当前时间"。
-  const runningTitleByFloor = new Map();
-  const runningStartedByFloor = new Map();
+  const runningTitleBySession = new Map();
+  const runningStartedBySession = new Map();
   // 检测用"活着"的楼层：账本里 state='running' 且**心跳/agent_status 活着**（非粘性判定）。
   // 关键：这里把 @fresh 设到未来，彻底关掉查询里的 started_at 兜底窗口——
   // 那个窗口是"挂 3h / 重启复活"的根源（停掉的插件任务在账本里一直挂 running，started_at 又很新就又被认领）。
   // 关掉后只剩心跳活着判定，停掉的任务（无心跳）立刻出局，重启也不会复活。
   // 插件任务不写心跳 → 由下面的"实时相位新鲜"信号兜底认领，两者取并集，互不漏判。
-  const ledgerAliveFloors = new Set();
+  const ledgerAliveSessions = new Set();
   if (repo && repo.activeRunningByProject) {
     const cutoff = now - 10 * 60 * 1000;
     const grace = now - 30 * 60 * 1000;
@@ -903,14 +922,16 @@ function snapshot({ workspacePath = '', force = false } = {}) {
     }
     for (const r of titleRows) {
       const f = floorByAgent[agentBase(r.client)];
-      if (f && f.id) {
-        if (r.title && !runningTitleByFloor.has(f.id)) runningTitleByFloor.set(f.id, r.title);
-        if (r.startedAt && !runningStartedByFloor.has(f.id)) runningStartedByFloor.set(f.id, Number(r.startedAt));
-      }
+      const sessionId = String(r.sessionId || '');
+      if (!f || !f.id || !sessionId) continue;
+      const key = `${f.id}:${sessionId}`;
+      if (r.title && !runningTitleBySession.has(key)) runningTitleBySession.set(key, r.title);
+      if (r.startedAt && !runningStartedBySession.has(key)) runningStartedBySession.set(key, Number(r.startedAt));
     }
     for (const r of detectRows) {
       const f = floorByAgent[agentBase(r.client)];
-      if (f && f.id) ledgerAliveFloors.add(f.id);
+      const sessionId = String(r.sessionId || '');
+      if (f && f.id && sessionId) ledgerAliveSessions.add(`${f.id}:${sessionId}`);
     }
   } else {
     /* repo/activeRunningByProject 缺失时跳过账本信号（老行为） */
@@ -919,7 +940,6 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   // 之前曾把"会话实时相位新鲜"也当在跑信号，但实测插件会在重连/重启时把上一条任务的相位重播成
   // thinking 并刷新时间戳，导致已取消的旧任务被误判在跑、与任务表（按 ALIVE 判）打架。去掉它后，
   // 两边口径一致——任务表显示"已取消"的，滚动屏/主控制台绝不会再显示"进行中"。
-  const runningFloors = new Set(ledgerAliveFloors);
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)
@@ -928,11 +948,11 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         return b.lastEventAt - a.lastEventAt;
       })
       .map((s) => {
-        // taskState —— 这条会话"有没有在跑的任务"的唯一真相源，门楣滚动屏与主控制台都读它。
-        // 跑：本层相位新鲜（runningFloors）。结束：reporter 落的 doneAt，且必须是**本进程启动之后**
-        // 发生的（重启后旧的 doneAt 不认，否则会复活上一轮的"任务取消/完成"）。
+        // taskState 必须按所选会话归属：同一楼层可同时有 CLI / Plugin 多个会话，
+        // 不能因为其中一条有 running task 就把整层每条会话都标成 running。
+        const sessionKey = `${s.floor}:${String(s.sessionId || '')}`;
         let taskState;
-        if (runningFloors.has(s.floor)) taskState = 'running';
+        if (s.sessionId && ledgerAliveSessions.has(sessionKey)) taskState = 'running';
         // 结束态：reporter 落的 doneAt，且（1）必须是**本进程启动之后**发生的（重启后旧 doneAt 不认，
         // 否则复活上一轮"任务取消/完成"）；（2）本会话近期（10s 内）没有新活动——新一轮任务刚起步时
         // 旧的 doneAt 还挂着、相位又来不及翻新，若直接认它就会先闪一下"任务取消"再跳回"思考中"，
@@ -941,8 +961,8 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         else taskState = null;
         // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——不依赖会话里常常为空的 prompt；
         // 同时带上任务真正开始的时间（tasks.started_at），滚动屏时间用它而非"当前时间"。
-        const taskTitle = taskState === 'running' ? runningTitleByFloor.get(s.floor) || '' : '';
-        const taskStartedAt = taskState === 'running' ? Number(runningStartedByFloor.get(s.floor) || 0) : 0;
+        const taskTitle = taskState === 'running' ? runningTitleBySession.get(sessionKey) || '' : '';
+        const taskStartedAt = taskState === 'running' ? Number(runningStartedBySession.get(sessionKey) || 0) : 0;
         return { ...s, taskState, taskTitle, taskStartedAt };
       });
     return {

@@ -29,10 +29,6 @@ import { defineStore, acceptHMRUpdate } from 'pinia';
 import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 import { t } from '../i18n/index.js';
 
-/** 进行中的相位：这些相位下，若实时相位回落到空闲（没有新工具调用），
- *  应回「思考中」而非「待命」——Agent 正在推理、等下一口工具。 */
-const ACTIVE_PHASES = ['tool', 'thinking', 'await', 'dispatch', 'waiting'];
-
 /** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
 const SCRIPT = [
   { phase: 'idle', action: '', context: ['等待派单'], skill: '', tool: '', prompt: '', ms: 6000 },
@@ -210,9 +206,9 @@ export const useMainAgentStore = defineStore('mainAgent', {
       } else if (hookPhase === 'idle' || hookPhase === 'online' || hookPhase === 'done' || hookPhase === 'cancelled') {
         // done/cancelled 从 consoleBase 喂来时当 idle 处理：stopTimer 已管了 10s 展示期，
         // 到期后该回待命，不能被 consoleBase 的 taskState='done' 持续顶回「任务完成」。
-        // idle/online：没有新的工具调用 / 实时相位回落——这一轮任务还在进行中（刚还在调工具 / 思考）
-        // 就回「思考中」而不是「待命中」（Agent 正在推理、等下一口工具）。离线 / 未知才真·待命。
-        phase = ACTIVE_PHASES.includes(this.phase) ? 'thinking' : 'idle';
+        // idle 是当前选中会话的明确状态；是否仍有任务在跑由该会话自己的 taskState 决定，
+        // 不能沿用此前的 thinking/tool，也不能借同楼层另一条会话的任务状态。
+        phase = 'idle';
       } else {
         phase = 'idle'; // offline / unreported / 未知：确实没在干活
       }

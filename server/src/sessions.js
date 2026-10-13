@@ -817,6 +817,7 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
         form: String(j.form || ''),
         lastEventAt,
         endedAt,
+        currentProcess: Number(j.hb && j.hb.pid) === process.pid,
         recordAt,
       });
     }
@@ -943,7 +944,10 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   let reported = false;
   let prompt = '';
   if (current && inWindow) {
-    const rp = reporterMainPhase(workspacePath, client);
+    // **必须带上本会话 id**（轴 2）：状态文件按会话一份，不带 session 就会拿到同层最新那份——
+    // 同一楼层同时开着多条会话（CLI + Plugin / 两条插件会话）时，空闲会话会借到别人正在跑的
+    // 「思考中」，主控制台就卡死在思考中下不来（本函数是三处漏筛之一，另见 inWindow / done）。
+    const rp = reporterMainPhase(workspacePath, client, id);
     if (rp) {
       reported = true;
       phase = rp.phase;
@@ -957,7 +961,8 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
 
   // 完成标记：reporter 仅在 Stop 时落盘（按工程 + 客户端区分），是"任务完成"的唯一真源；
   // 比"相位回落到空闲"可靠——任务中途因轮询间隙 / 跨工程串味出现空闲，绝不冒充完成。
-  const done = readReporterDone(workspacePath, client) || null;
+  // 同样按**本会话 id** 取：不带 session 会退回同层最新一份，把别的会话的「完成 / 取消」搬到它头上。
+  const done = readReporterDone(workspacePath, client, id) || null;
   const doneAt = done ? done.at : 0;
   const doneTitle = done ? done.title || '' : '';
   // 只挑"本轮任务开始之后"改过的文件：file-changes 是整个会话累积的，
@@ -1010,7 +1015,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
  *            storage: string, reason?: string}}
  *   reason: 'no-storage' 没找到插件落盘 / 'no-open-project' 一个活跃会话都没有
  */
-function listSessions({ workspacePath = '', force = false, client = '', pluginRe = plugin.PLUGIN_RE } = {}) {
+function listSessions({ workspacePath = '', force = false, client = '', pluginRe = plugin.PLUGIN_RE, currentOnly = false, activeSessions = [] } = {}) {
   // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
   // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
   // 只认传入的 client 这一路：这份清单属于某个插件楼层，别层（其它产品 / 同一产品的 CLI）
@@ -1019,7 +1024,8 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const now = Date.now();
   // 缓存键必须覆盖 client / pluginRe / 工程，否则同一工程里的不同插件楼层、或 CLI/Plugin 视图
   // 会复用上一次的旧结果（例如 A5 里 plugin 那路读到先前写入的窗口值、误以为还在全局表里）。
-  const key = `${client}@@${ws}@@${String(pluginRe instanceof RegExp ? pluginRe.source : Array.isArray(pluginRe) ? pluginRe.map((r) => (r && r.source) || String(r)).join('|') : String(pluginRe || ''))}`;
+  const activeKey = activeSessions.map((s) => `${s.sessionId}:${s.lastEventAt}`).sort().join(',');
+  const key = `${client}@@${ws}@@${currentOnly ? 'current-only' : 'all'}@@${activeKey}@@${String(pluginRe instanceof RegExp ? pluginRe.source : Array.isArray(pluginRe) ? pluginRe.map((r) => (r && r.source) || String(r)).join('|') : String(pluginRe || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
   const storage = plugin.findPluginStorage(pluginRe);
@@ -1074,17 +1080,35 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     if (id && !meta.has(id)) meta.set(id, { project: '', projectPath: '' });
   }
 
+  const activeById = new Map();
+  for (const session of activeSessions) {
+    const id = String(session && session.sessionId || '').trim();
+    if (!id) continue;
+    activeById.set(id, session);
+    if (!meta.has(id)) {
+      const projectPath = String(session.workspacePath || '');
+      meta.set(id, {
+        project: projectPath ? resolveProjectName(projectPath) || path.basename(projectPath) : '',
+        projectPath,
+      });
+    }
+  }
+
   const sessions = [];
   for (const [id, m] of meta) {
     const sqliteRow = sqliteById.get(id);
     const isProjectCurrent = id === (perProjectCurrent.get(m.projectPath) || '');
+    const activeSession = activeById.get(id) || null;
+    if (currentOnly && !isProjectCurrent && !activeSession) continue;
     // Copilot 没有 reporter hook，readReporterActiveTask 恒为空，相位只能推断（inferred）：
     //   ① 有 VS Code chat 索引的「这一轮在不在飞」→ 直接听它（跑着就是 thinking，收工就是 idle），
     //      这是唯一能看见"轮进行中"的旁证，见 readCopilotChatIndex；
     //   ② 没有旁证（老版本 / 库被占用）才退回 updated_at 的 COPILOT_PHASE_MS(2 分钟)窗口。
     // hasPendingTurn（空 assistant_response 的 turn）不单独使用 —— Copilot 是批次写入，
     // 放弃/取消的 turn 也留空 response，2 分钟外的空 turn 是已废弃不是正在跑。
-    const reporterInWindow = readReporterActiveTask(m.projectPath, client);
+    // 活跃窗口也按**本会话 id** 判：不带 session 时，同层任意一条会话在跑就会把 inWindow 顶成真，
+    // 空闲会话据此被推断成「思考中」（同 sessionInfo 那处漏筛）。见 [A2c]。
+    const reporterInWindow = readReporterActiveTask(m.projectPath, client, id);
     let info;
     if (sqliteRow) {
       // 整条 enrich 已在 copilot.readCopilotSessions 完成（phase / inFlight / doneAt / live* 系列），
@@ -1100,7 +1124,14 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
         client,
       });
     }
-    if (!info.listed) continue;
+    if (!info.listed && !currentOnly && !activeSession) continue;
+    if (currentOnly && isProjectCurrent) info.listed = true;
+    if (activeSession) {
+      info.listed = true;
+      info.active = now - Number(activeSession.lastEventAt || 0) < IDLE_MS;
+      info.live = true;
+      info.lastUpdated = Math.max(Number(info.lastUpdated) || 0, Number(activeSession.lastEventAt) || 0);
+    }
     sessions.push({
       ...info,
       project: m.project,

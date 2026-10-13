@@ -29,13 +29,24 @@ async function run() {
   const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-hookfwd-'));
   let received = null;
   let exitCode = null;
+  let hookAttempts = 0;
+  let failNextLifecycle = false;
 
   const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/api/v1/hook') {
+      hookAttempts += 1;
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', () => {
-        try { received = JSON.parse(body); } catch { received = body; }
+        let parsed;
+        try { parsed = JSON.parse(body); } catch { parsed = body; }
+        if (failNextLifecycle && parsed && parsed.hook_event_name === 'SessionStart') {
+          failNextLifecycle = false;
+          res.writeHead(503);
+          res.end();
+          return;
+        }
+        received = parsed;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       });
@@ -80,6 +91,30 @@ async function run() {
   ok('转发 body 带 workspacePath(=cwd)', received && received.workspacePath === '/home/u/proj');
   ok('转发 body 透传 transcript_path', received && received.transcript_path === '/tmp/rollout.jsonl');
   ok('hook 进程退出码为 0', exitCode === 0, `exitCode=${exitCode}`);
+
+  received = null;
+  exitCode = null;
+  hookAttempts = 0;
+  failNextLifecycle = true;
+  const lifecycleEvent = {
+    hook_event_name: 'SessionStart',
+    session_id: '12345678-1234-4234-8234-123456789abc',
+    cwd: '/home/u/proj',
+    agent: 'codebuddy',
+    client: 'CLI',
+  };
+  await new Promise((resolve) => {
+    const child = spawn(process.execPath, [HOOK, '--agent', 'codebuddy'], {
+      env: { ...process.env, WORKGREMLIN_HOME: TMP },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdin.write(JSON.stringify(lifecycleEvent));
+    child.stdin.end();
+    child.on('close', (code) => { exitCode = code; resolve(); });
+  });
+  ok('SessionStart 遇到 503 后只重试一次', hookAttempts === 2, `attempts=${hookAttempts}`);
+  ok('重试后 SessionStart 最终送达', received && received.hook_event_name === 'SessionStart', JSON.stringify(received));
+  ok('生命周期重试后 hook 仍以 0 退出', exitCode === 0, `exitCode=${exitCode}`);
 
   server.close();
   fs.rmSync(TMP, { recursive: true, force: true });

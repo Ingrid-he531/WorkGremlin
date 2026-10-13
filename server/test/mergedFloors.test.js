@@ -62,15 +62,18 @@ process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
 process.env.PATH = BIN;
 
-const { snapshot, table } = require('../src/sessionRegistry');
+const { snapshot, table, setBackend } = require('../src/sessionRegistry');
 const { reporterMainPhase, listReporterSessions, listSessions } = require('../src/sessions');
 const { detectProducts } = require('../src/floors');
+const { readRuntime } = require('../src/plugin');
 
 /* ------------------------------ 造数据 ------------------------------ */
 
 const WS = '/tmp/ProjCB';
 /** 插件的会话 id：实测就是 hook payload 的 session_id（genie-history 的 conversationId 与之一字不差） */
 const PLUGIN_SID = '0819ef3ed32241a4970a17b8013f9289';
+const OLD_PLUGIN_SID = 'older-plugin-conversation';
+const NEW_PLUGIN_SID = 'new-plugin-conversation';
 const CANCELLED_PLUGIN_SID = 'cancelled-plugin-conversation';
 /** CLI 的会话 id：hook payload 的 session_id（uuid 形状） */
 const CLI_SID = 'aaaa1111-2222-3333-4444-555566667777';
@@ -89,6 +92,8 @@ function writeState(client, sessionId, extra, ws = WS) {
 const STORAGE = path.join(HOME, '.config', 'Code', 'User', 'globalStorage', 'tencent-cloud.coding-copilot');
 const PROJ_DIR = path.join(STORAGE, 'genie-history', Buffer.from(WS).toString('base64'));
 fs.mkdirSync(path.join(PROJ_DIR, 'conversations', PLUGIN_SID), { recursive: true });
+fs.mkdirSync(path.join(PROJ_DIR, 'conversations', OLD_PLUGIN_SID), { recursive: true });
+fs.mkdirSync(path.join(PROJ_DIR, 'conversations', NEW_PLUGIN_SID), { recursive: true });
 fs.mkdirSync(path.join(PROJ_DIR, 'conversations', CANCELLED_PLUGIN_SID), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'todos'), { recursive: true });
 fs.mkdirSync(path.join(STORAGE, 'file-changes', PLUGIN_SID), { recursive: true });
@@ -133,6 +138,9 @@ fs.writeFileSync(
   path.join(STORAGE, 'message-queue', 'mq.json'),
   JSON.stringify({ conversations: {
     [PLUGIN_SID]: { runtime: { activated: true, paused: false }, updatedAt: Date.now(), items: [] },
+    // 同文件 mtime 会因 PLUGIN_SID 更新而变新，但不能把这个旧会话也唤醒。
+    [OLD_PLUGIN_SID]: { runtime: { activated: true, paused: false, updatedAt: Date.now() - 2 * 60 * 60_000 }, updatedAt: Date.now() - 2 * 60 * 60_000, items: [] },
+    [NEW_PLUGIN_SID]: { runtime: { activated: true, paused: false }, updatedAt: Date.now(), items: [] },
     [CANCELLED_PLUGIN_SID]: {
       runtime: { activated: true, paused: true, pauseReason: 'cancel', updatedAt: Date.now() - 2 * 60 * 60_000 },
       updatedAt: Date.now() - 2 * 60 * 60_000,
@@ -213,12 +221,34 @@ head('[A2] 同时开着 CLI 与 Plugin：是这一层里的两条会话，不是
   const ids = floor.sessions.map((s) => s.sessionId).sort();
   ok('1F 上两条活跃会话', floor.sessions.length === 2, floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
   ok('两条会话的 id 分别是插件与 CLI 的', JSON.stringify(ids) === JSON.stringify([CLI_SID, PLUGIN_SID].sort()), JSON.stringify(ids));
+  ok('共享队列文件 mtime 不会冒充旧会话的更新时间', Date.now() - readRuntime(STORAGE, OLD_PLUGIN_SID).updatedAt > 60 * 60_000, String(readRuntime(STORAGE, OLD_PLUGIN_SID).updatedAt));
   const pluginRow = floor.sessions.find((s) => s.sessionId === PLUGIN_SID);
   const cliRow = floor.sessions.find((s) => s.sessionId === CLI_SID);
   ok('插件那条走结构化那一场（plugin 来源、有运行态）', Boolean(pluginRow) && pluginRow.source === 'plugin' && pluginRow.live === true);
+  ok('启动时不把非 current 的旧 Plugin 会话塞进下拉', !floor.sessions.some((s) => s.sessionId === OLD_PLUGIN_SID), floor.sessions.map((s) => s.sessionId).join(' '));
+  ok('共享队列文件刚更新也不唤醒同文件中的旧会话', !floor.sessions.some((s) => s.sessionId === CANCELLED_PLUGIN_SID), floor.sessions.map((s) => s.sessionId).join(' '));
   ok('CLI 那条没有会话 jsonl 时由 hook 状态文件兜底列出', Boolean(cliRow) && cliRow.projectPath === WS, cliRow && JSON.stringify(cliRow.projectPath));
   ok('两条都归属同一工程', Boolean(pluginRow && cliRow) && pluginRow.projectPath === WS && cliRow.projectPath === WS);
   ok('取消的 Plugin 会话不留在下拉列表', !floor.sessions.some((s) => s.sessionId === CANCELLED_PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
+}
+
+head('[A2b] 1F 任务状态严格按所选 sessionId 归属');
+{
+  setBackend({
+    bus: {},
+    repo: {
+      activeRunningByProject: {
+        all: () => [{ client: 'codebuddy', sessionId: CLI_SID, title: 'CLI 正在跑', startedAt: Date.now() }],
+      },
+    },
+  });
+  const snap = snapshot({ force: true, workspacePath: WS });
+  const floor = snap.floors.find((f) => f.id === '1F');
+  const pluginRow = floor.sessions.find((s) => s.sessionId === PLUGIN_SID);
+  const cliRow = floor.sessions.find((s) => s.sessionId === CLI_SID);
+  ok('CLI 任务运行中', cliRow && cliRow.taskState === 'running', cliRow && cliRow.taskState);
+  ok('空闲 Plugin 会话不继承 CLI 的 running', pluginRow && pluginRow.taskState !== 'running', pluginRow && pluginRow.taskState);
+  setBackend(null);
 }
 
 /* [A3] 相位各认各的（不串味） */
@@ -236,10 +266,25 @@ head('[A3] 同一层里两条会话的实时相位各认各的（这一层要认
 
 head('[A3b] CodeBuddy Plugin 收到 SessionEnd 后移除；再次 SessionStart 后重新列出');
 {
-  const endedAt = Date.now();
-  writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: endedAt });
+  writeState('codebuddy', NEW_PLUGIN_SID, {
+    client: 'codebuddy',
+    form: 'vscode',
+    sessionWorkspacePath: WS,
+    sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: WS },
+  });
   let snap = snapshot({ force: true, workspacePath: WS });
   let floor = snap.floors.find((f) => f.id === '1F');
+  ok('新 Plugin SessionStart 可加入下拉，即使它不是 current.json 指向的会话', floor.sessions.some((s) => s.sessionId === NEW_PLUGIN_SID), floor.sessions.map((s) => s.sessionId).join(' '));
+
+  const endedAt = Date.now();
+  writeState('codebuddy', NEW_PLUGIN_SID, { sessionEndedAt: endedAt });
+  snap = snapshot({ force: true, workspacePath: WS });
+  floor = snap.floors.find((f) => f.id === '1F');
+  ok('新 Plugin SessionEnd 后从下拉移除', !floor.sessions.some((s) => s.sessionId === NEW_PLUGIN_SID), floor.sessions.map((s) => s.sessionId).join(' '));
+
+  writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: endedAt });
+  snap = snapshot({ force: true, workspacePath: WS });
+  floor = snap.floors.find((f) => f.id === '1F');
   ok('Plugin SessionEnd 后会话立即从下拉数据移除', !floor.sessions.some((s) => s.sessionId === PLUGIN_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
   writeState('codebuddy-plugin', PLUGIN_SID, { sessionEndedAt: null, sessionWorkspacePath: WS });
   snap = snapshot({ force: true, workspacePath: WS });
@@ -684,6 +729,50 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
     '9F 改动文件只认写工具碰过的（read_file 不算）',
     Boolean(newRow) && Array.isArray(newRow.liveChanged) && newRow.liveChanged[0] && JSON.stringify(newRow.liveChanged[0].files) === JSON.stringify(['/tmp/ProjGitHubCopilot/src/highlight.ts']),
     JSON.stringify(newRow && newRow.liveChanged)
+  );
+}
+
+/* [A2c] 相位按会话 id 归属：空闲会话不许借同层别的会话的实时相位（stuck「思考中」回归） */
+head('[A2c] 1F 插件相位按 sessionId 归属（空闲会话不借同层忙碌会话的「思考中」）');
+{
+  const IDLE_SID = 'idle-plugin-conversation';
+  const BUSY_SID = 'busy-plugin-conversation';
+  fs.mkdirSync(path.join(PROJ_DIR, 'conversations', IDLE_SID), { recursive: true });
+  fs.mkdirSync(path.join(PROJ_DIR, 'conversations', BUSY_SID), { recursive: true });
+  // current.json 指向空闲会话：它才是"这个工程当前开着的会话"，吃得到 reporter 实时相位
+  fs.writeFileSync(
+    path.join(PROJ_DIR, 'current.json'),
+    JSON.stringify({ conversationId: IDLE_SID, lastUpdated: new Date().toISOString() })
+  );
+  // 空闲会话：3 分钟前落过盘（> FRESH_MS、< IDLE_MS），自己没有在跑任务 → 该显示待命
+  fs.writeFileSync(
+    path.join(STORAGE, 'message-queue', 'mq.json'),
+    JSON.stringify({
+      conversations: {
+        [IDLE_SID]: { runtime: { activated: true, paused: false }, updatedAt: Date.now() - 3 * 60_000, items: [] },
+        [BUSY_SID]: { runtime: { activated: true, paused: false }, updatedAt: Date.now(), items: [] },
+      },
+    })
+  );
+  writeState('codebuddy-plugin', IDLE_SID, {
+    taskId: null,
+    taskStartedAt: 0,
+    sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath: WS },
+    pending: null,
+  });
+  // 同层另一条插件会话正在跑（新鲜 taskId + thinking 相位，且 ts 更新）
+  writeState('codebuddy-plugin', BUSY_SID, {
+    sessionPhase: { phase: 'thinking', ts: Date.now() + 5_000, workspacePath: WS },
+    pending: null,
+  });
+  const snap = snapshot({ force: true, workspacePath: WS });
+  const floor = snap.floors.find((f) => f.id === '1F');
+  const idle = floor.sessions.find((s) => s.sessionId === IDLE_SID);
+  ok('空闲插件会话在表里', Boolean(idle), floor.sessions.map((s) => s.sessionId).join(' '));
+  ok(
+    '空闲插件会话相位 = idle，不借同层忙碌会话的 thinking',
+    idle && idle.phase === 'idle',
+    idle && JSON.stringify({ phase: idle.phase, inferred: idle.inferred })
   );
 }
 

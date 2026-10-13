@@ -191,7 +191,16 @@ function readRuntime(storage, id) {
     if (!conv) continue;
     if (conv.runtime) runtime = { ...(runtime || {}), ...conv.runtime };
     for (const it of conv.items || []) if (it && it.status === 'pending') pending += 1;
-    updatedAt = Math.max(updatedAt, Number(conv.updatedAt) || 0, mtime(path.join(dir, name)));
+    const itemUpdatedAt = (conv.items || []).reduce((best, item) => Math.max(
+      best,
+      Number(item && (item.updatedAt || item.createdAt || item.at)) || 0
+    ), 0);
+    updatedAt = Math.max(
+      updatedAt,
+      Number(conv.updatedAt) || 0,
+      Number(conv.runtime && conv.runtime.updatedAt) || 0,
+      itemUpdatedAt
+    );
   }
   return {
     runtime: runtime || { activated: false, paused: false, awaitingSessionIdle: false },
