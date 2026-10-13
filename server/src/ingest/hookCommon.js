@@ -959,6 +959,23 @@ async function runHookEvent(ev, ctx, floorImpl) {
     await bus.backfillTaskTokens({ ...base, startedAt, tokens, sessionId });
   }
 
+  // 延迟回填词元：插件 index.json 的 usage 常在 Stop/取消 时刻尚未落盘
+  // （codebuddyReadTokensOf 仅重试 1200ms，不够稳），而 backfillPrevTokens 只在「下一轮开始时」
+  // 触发 —— 最后一个任务没有下一轮就永远补不到词元。这里在 endTask 后延迟若干秒再读一次并写回，
+  // 保证收尾任务也能拿到词元（setTimeout 不阻塞 Stop 处理）。读取仍在 server 侧、写回 task_runs。
+  const TOKEN_BACKFILL_DELAY_MS = 5_000;
+  function scheduleDelayedBackfill(startedAt, transcriptPath) {
+    const sa = Number(startedAt) || 0;
+    if (!transcriptPath || !(sa > 0)) return;
+    setTimeout(async () => {
+      try {
+        const tokens = await impl.readTokensOf(transcriptPath, sa);
+        if (!tokens) return;
+        await bus.backfillTaskTokens({ ...base, startedAt: sa, tokens, sessionId });
+      } catch { /* 落盘读取失败不影响主流程 */ }
+    }, TOKEN_BACKFILL_DELAY_MS);
+  }
+
   // 这一轮被用户掐掉 → 按"取消"收尾（与 Stop 同一条线，三点不同）
   async function finishCancelled(ev0) {
     const st0 = get();
@@ -979,7 +996,8 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
     const result0 = String(last0 || '').trim().slice(0, RESULT_MAX);
     if (taskId0) {
-      const tokens0 = await impl.readTokensOf(tp(), startedAt0);
+      const transcriptPath = tp();
+      const tokens0 = await impl.readTokensOf(transcriptPath, startedAt0);
       await bus.endTask({
         ...base,
         taskId: taskId0,
@@ -991,6 +1009,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         form: formOf(),
         ...(tokens0 ? { tokens: tokens0 } : {}),
       });
+      scheduleDelayedBackfill(startedAt0, transcriptPath);
     }
     set({
       taskId: null,
@@ -1237,7 +1256,8 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
     if (taskId) {
       const form = formOf() || st.form || '';
-      const tokens = await impl.readTokensOf(tp(), startedAt);
+      const transcriptPath = tp();
+      const tokens = await impl.readTokensOf(transcriptPath, startedAt);
       await bus.endTask({
         ...base,
         taskId,
@@ -1249,6 +1269,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         form,
         ...(tokens ? { tokens } : {}),
       });
+      scheduleDelayedBackfill(startedAt, transcriptPath);
     }
     set({
       taskId: null,

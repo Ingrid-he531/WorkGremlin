@@ -193,10 +193,12 @@ function cliFormLabel(p) {
 const TIP_INDENT = '  ';
 
 /**
- * 把一路来源归一成 { label, detail, note }：
- *   label  形态名（CLI / 插件 / 服务端给的 label，如 IDE）
- *   detail 落盘目录 + 统计（`~/.codebuddy（1 个会话文件 · …）`）
- *   note   这一路取不到会话时的说明
+ * Normalize one source into { label, detail, note }:
+ *   label  form name (CLI / plugin / server-provided label, e.g. IDE)
+ *   detail data directory + stats — both `dataPathLabel` and `stats` are supplied
+ *          by the server; the renderer only displays them and never reads the
+ *          agent's local storage directly.
+ *   note   explanation shown when this source has no sessions
  */
 function sourceInfo(src) {
   const raw = src.label || sourceLabelOf(src);
@@ -230,17 +232,22 @@ function pushSection(lines, title, rows) {
 }
 
 /**
- * 悬浮提示：活跃会话 +「安装」+「落盘」两个分区，各分区内逐形态列（CLI / 插件）。
+ * Hover tooltip: active sessions + "Installed" + "Data" sections, each listing
+ * its forms (CLI / plugin) row by row.
  *
- * 形如：
+ * All values are supplied by the server and rendered as-is — the renderer never
+ * reads the agent's local storage directly. The "Installed" paths and the "Data"
+ * directory (`dataPathLabel`) together with its `stats` (session/file counts,
+ * size, last write) are resolved server-side; the renderer only displays
+ * `src.dataPathLabel`, `src.stats` and `src.note`. Shape:
  *   CodeBuddy
- *   活跃会话：1 个
- *   安装：
- *     CLI - /usr/local/nodejs/bin/codebuddy
- *     插件 - ~/.vscode/extensions/tencent-cloud.coding-copilot-…
- *   落盘：
- *     CLI - ~/.codebuddy（1 个会话文件 · …）
- *     插件 - ~/.config/Code/User/globalStorage/tencent-cloud.coding-copilot（…）
+ *   Active sessions: 1
+ *   Installed:
+ *     CLI - <server-reported install path>
+ *     Plugin - <server-reported extension dir>
+ *   Data:
+ *     CLI - <server-reported data dir> (1 session file · …)
+ *     Plugin - <server-reported data dir> (…)
  */
 function tip(p) {
   const lines = [p.name, t('floor.active_sessions', { n: p.activeCount || 0 })];

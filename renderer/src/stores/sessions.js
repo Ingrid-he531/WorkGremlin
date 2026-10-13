@@ -79,13 +79,16 @@ export const useSessionStore = defineStore('sessions', {
     selected: (s) => s.sessions.find((x) => x.id === s.selectedId) || null,
 
     /**
-     * 选中会话的**会话 id**（轴 2）—— hook payload 里的 `session_id`，服务端拿它过滤
-     * `/api/v1/reporter-phase`，这样同一个楼层里多条会话（两个终端 / CLI 与插件混跑）
-     * 各显示各的实时相位，不会"谁最新显示谁"。
+     * The **session id** (axis 2) of the selected session — the `session_id`
+     * carried in the agent's hook payload. The server scopes `/api/v1/reporter-phase`
+     * by it, so multiple sessions on the same floor (two terminals, or CLI + plugin
+     * mixed) each show their own live phase instead of "whoever is newest wins".
      *
-     * 它跟 `id` 不是一回事：`id` 是**落盘定位符**（CLI 是 `<工程目录>/<会话>.jsonl` 的相对路径，
-     * 插件是 genie-history 的会话 id），只有落盘文件名本身就等于会话 id 的产品（Claude Code）
-     * 才拿得到。拿不到（Codex 的 rollout-*.jsonl、插件）就返回空串 → 服务端退回老行为。
+     * This is distinct from `id`: `id` is the server-assigned session key the
+     * renderer simply receives. How the server derives it (e.g. CLI jsonl path vs
+     * plugin history id) is a server-side concern, not the renderer's. When the
+     * server cannot resolve a session id it returns an empty string and falls back
+     * to its legacy behavior.
      * @returns {string}
      */
     selectedSessionId: (s) => {
