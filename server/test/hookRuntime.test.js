@@ -39,6 +39,7 @@ function ok(label, cond, extra = '') {
 
 const calls = [];
 const bus = {
+  projectForReport: () => 'P',
   registerMember: (b) => { calls.push(['registerMember', b]); return b.memberId; },
   setStatus: (b) => { calls.push(['setStatus', b]); return { ok: true }; },
   startTask: (b) => { calls.push(['startTask', b]); return { taskId: 't_gen' }; },

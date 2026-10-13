@@ -26,16 +26,16 @@ function ok(label, cond, extra = '') {
 
 console.log('\n[1] Codex：client 分不出两种形态，靠 form 补');
 ok('form=cli → Codex CLI', clientLabel('codex', 'cli') === 'Codex CLI', clientLabel('codex', 'cli'));
-ok('form=plugin → Codex Plugin', clientLabel('codex', 'plugin') === 'Codex Plugin', clientLabel('codex', 'plugin'));
+ok('form=vscode → Codex Plugin', clientLabel('codex', 'vscode') === 'Codex Plugin', clientLabel('codex', 'vscode'));
 ok('没有 form（老数据 / 读不到 rollout）→ 还是 Codex', clientLabel('codex') === 'Codex', clientLabel('codex'));
-ok('form 大小写不敏感', clientLabel('codex', 'PLUGIN') === 'Codex Plugin', clientLabel('codex', 'PLUGIN'));
+ok('form 大小写不敏感', clientLabel('codex', 'VSCODE') === 'Codex Plugin', clientLabel('codex', 'VSCODE'));
 
 console.log('\n[2] Claude Code：同理，靠 form 补（CLI 与 VS Code 扩展共用同一个 client）');
 ok('form=cli → Claude Code CLI', clientLabel('claude', 'cli') === 'Claude Code CLI', clientLabel('claude', 'cli'));
 ok(
-  'form=plugin → Claude Code Plugin',
-  clientLabel('claude', 'plugin') === 'Claude Code Plugin',
-  clientLabel('claude', 'plugin')
+  'form=vscode → Claude Code Plugin',
+  clientLabel('claude', 'vscode') === 'Claude Code Plugin',
+  clientLabel('claude', 'vscode')
 );
 ok('没有 form（老数据 / 下游没认出来）→ 还是 Claude Code', clientLabel('claude') === 'Claude Code', clientLabel('claude'));
 
@@ -43,10 +43,10 @@ console.log('\n[3] 已经带形态的 client 不重复追加');
 ok('codebuddy → CodeBuddy CLI', clientLabel('codebuddy', 'cli') === 'CodeBuddy CLI', clientLabel('codebuddy', 'cli'));
 ok(
   'codebuddy-plugin → CodeBuddy Plugin（只一个）',
-  clientLabel('codebuddy-plugin', 'plugin') === 'CodeBuddy Plugin',
-  clientLabel('codebuddy-plugin', 'plugin')
+  clientLabel('codebuddy-plugin', 'vscode') === 'CodeBuddy Plugin',
+  clientLabel('codebuddy-plugin', 'vscode')
 );
-ok('codex-plugin（标签自带形态）→ 不重复追加', clientLabel('codex-plugin', 'plugin') === 'Codex Plugin', clientLabel('codex-plugin', 'plugin'));
+ok('codex-plugin（标签自带形态）→ 不重复追加', clientLabel('codex-plugin', 'vscode') === 'Codex Plugin', clientLabel('codex-plugin', 'vscode'));
 
 console.log('\n[4] 认不出的一律不猜');
 ok("form='' → Claude Code", clientLabel('claude', '') === 'Claude Code', clientLabel('claude', ''));

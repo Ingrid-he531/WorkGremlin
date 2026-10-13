@@ -458,6 +458,12 @@ function turnInterrupted(transcriptPath, startedAt) {
 
 /* ============================== token 读取（搬 usage.js，产品无关） ============================== */
 
+// CodeBuddy Plugin index.json 的 request.startedAt 与 hook 记的本轮起点有几十毫秒偏差
+// （实测早 84~204ms），给一个宽窗口匹配那条 request。
+const CB_REQ_GRACE_MS = 5_000;
+const CB_FLUSH_WAIT_MS = 1_200;
+const CB_FLUSH_STEP_MS = 120;
+
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : 0;
@@ -584,22 +590,69 @@ function tokenFinish(t) {
 }
 
 /**
- * 一轮任务消耗的 token —— **纯 JSONL 格式**解析框架层原语。
+ * CodeBuddy Plugin index.json 的 token 解析（usage 在顶层 requests[] 上）。
+ * CodeBuddy Plugin 自定的 inputTokens/cacheTokens/cachedWriteTokens/outputTokens 口径与 OpenAI 一致。
+ */
+function codebuddyRequestTokens(indexPath, startedAt) {
+  let idx;
+  try { idx = JSON.parse(fs.readFileSync(indexPath, 'utf8')); } catch { return null; }
+  const reqs = Array.isArray(idx && idx.requests) ? idx.requests : [];
+  let best = null;
+  for (const r of reqs) {
+    if (!r || typeof r !== 'object') continue;
+    const ts = Number(r.startedAt);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts < startedAt - CB_REQ_GRACE_MS || ts > startedAt + CB_REQ_GRACE_MS) continue;
+    if (!best || ts > Number(best.startedAt)) best = r;
+  }
+  if (!best) return null;
+  const u = best.usage;
+  if (!u || typeof u !== 'object') return null;
+  return normOpenAI({
+    prompt_tokens: u.inputTokens,
+    prompt_cache_hit_tokens: u.cacheTokens,
+    prompt_cache_write_tokens: u.cachedWriteTokens,
+    completion_tokens: u.outputTokens,
+  });
+}
+
+/**
+ * 一轮任务消耗的 token —— 框架层原语，兼容 JSONL 与 CodeBuddy Plugin index.json。
  *
- * 这是"框架能看懂的格式"：Codex rollout jsonl（event_msg/token_count）、Claude Code transcript
- * （message.usage / providerData.rawUsage）。楼层有更特殊的格式（如 IDE 插件 index.json、
- * OTel trace jsonl）时，由楼层自己的 readTokensOf 覆盖来处理——框架层不管格式种类。
+ * JSONL 格式（Codex rollout event_msg/token_count、Claude Code transcript message.usage /
+ * providerData.rawUsage）走 parseLines → codexDelta / requestSum。
+ * index.json 格式（CodeBuddy Plugin）走 codebuddyRequestTokens。
+ * 楼层有更特殊的格式（OTel trace jsonl）时，由楼层自己的 readTokensOf 覆盖来处理。
  *
  * 返回 `{input, output, cacheRead, cacheWrite} | null` —— 取不到或四项全零都回 null。
  * 楼层 readTokensOf 也是同一套口径，服务端 bus.endTask / backfillTaskTokens 统一吃这个形状。
  */
-function readTokens(jsonlPath, startedAt) {
-  const file = String(jsonlPath || '');
+function readTokens(transcriptPath, startedAt) {
+  const file = String(transcriptPath || '');
   if (!file || !(Number(startedAt) > 0)) return null;
+  if (/index\.json$/i.test(file)) return tokenFinish(codebuddyRequestTokens(file, Number(startedAt)));
   const rows = parseLines(file);
   if (!rows) return null;
   const t = codexDelta(rows, Number(startedAt)) || requestSum(rows, Number(startedAt));
   return tokenFinish(t);
+}
+
+/**
+ * 带重试的 token 读取：CodeBuddy Plugin 的 index.json usage 比 Stop 晚 ~30-50ms 落盘，
+ * Stop 时刻第一次读经常扑空。本函数在 index.json 扑空时回头再读（最多 1200ms），
+ * 其余格式（JSONL）落盘早于 Stop，扑空就立刻返回 null。
+ */
+async function readTokensSettled(transcriptPath, startedAt) {
+  const file = String(transcriptPath || '');
+  const first = readTokens(file, startedAt);
+  if (first || !file || !(Number(startedAt) > 0)) return first;
+  if (!/index\.json$/i.test(file)) return null;
+  for (let waited = 0; waited < CB_FLUSH_WAIT_MS; waited += CB_FLUSH_STEP_MS) {
+    await new Promise((r) => setTimeout(r, CB_FLUSH_STEP_MS));
+    const t = readTokens(file, startedAt);
+    if (t) return t;
+  }
+  return null;
 }
 
 /* ============================== 子代理 key 合成 ============================== */
@@ -658,9 +711,19 @@ function resultOfResponse(ev) {
 }
 
 /* ============================== ghost feed 写入（替代 hook 的 addGhost/finishGhost/sweepGhosts） ============================== */
+/**
+ * client 基名归一：剥掉 -plugin 后缀，使 codebuddy-plugin 与 codebuddy 归同一家族。
+ * 没写 client 的历史条目归 codebuddy（旧版落盘没这字段时默认值就是 codebuddy）。
+ */
+function clientFamily(client) {
+  const c = String(client || '').trim().toLowerCase();
+  if (!c) return 'codebuddy';
+  return c.replace(/-plugin$/i, '');
+}
+
 function ownsEntry(a, client, session = '') {
   if (!a) return false;
-  if (a.client !== client) return false;
+  if (clientFamily(a.client) !== clientFamily(client)) return false;
   if (session) {
     const s = String(a.sessionId || '').trim();
     if (s && s !== session) return false;
@@ -1132,10 +1195,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
         } else {
           const id = subagentKeys(ev, nm, task)[0] || '';
           // 记一笔召唤台账（收工回来查），再写 feed 飘幽灵
-          const ledger = ((get().subagents) || []).filter((r) => r && (r.id || r.name)).slice(-8);
+          const ledger = ((get().subagents) || []).filter((r) => r && (r.id || r.name));
           if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name: nm, at: Date.now() });
           else if (!id && nm && !ledger.some((r) => r.name === nm)) ledger.push({ id: '', name: nm, at: Date.now() });
-          set({ subagents: ledger });
+          set({ subagents: ledger.slice(-8) });
           addGhost(workspacePath, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId);
         }
       }
@@ -1209,9 +1272,9 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const type = String(ev.agent_type || '').trim();
     const name = (type && type !== 'default' ? type : '') || (pend && pend.name) || 'subagent';
     const id = agentIdOf(ev) || subagentKeys(ev, name, (pend && pend.task) || '')[0] || '';
-    const ledger = ((st.subagents) || []).slice(-8);
+    const ledger = ((st.subagents) || []);
     if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name, at: Date.now() });
-    set({ subagents: ledger, pendingSpawn: null });
+    set({ subagents: ledger.slice(-8), pendingSpawn: null });
     addGhost(workspacePath, name, (pend && pend.task) || '', id, String(st.taskId || ''), String(ev.model || ''), client, sessionId);
     await beat();
     return { ok: true, handled: event };
@@ -1367,8 +1430,9 @@ module.exports = {
   runHookEvent,
   // 产品无关助手（导出便于单测与复用）
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
-  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens,
-  addGhost, retireGhost, sweepGhosts, ownsEntry, agentName, agentTask, subagentKeys,
+  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens, readTokensSettled,
+  codebuddyRequestTokens,
+  addGhost, retireGhost, sweepGhosts, ownsEntry, clientFamily, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS,
   // token 归一原语（产品无关）

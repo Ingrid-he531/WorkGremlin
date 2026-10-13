@@ -2,13 +2,15 @@
 /**
  * 回归测试：并发 hook 的"丢失更新"与"幽灵收不掉"（2026-09-27 的 bug 1 / 2 / 3）。
  *
- * 背景（实测）：CodeBuddy CLI 会在**同一毫秒**并行触发多个 hook 进程 ——
+ * 背景（实测）：CodeBuddy CLI 会在**同一毫秒**并行触发多个 hook 事件 ——
  * ~/.workgremlin/hooks/events.log 里 05:29:45.178 / .184 / .189 三条 PreToolUse(Agent)。
- * 每个 hook 都是独立进程，各自 readFile → 改内存 → writeFileSync，于是互相覆盖：
+ * 旧代码每个 hook 是独立进程，各自 readFile → 改内存 → writeFileSync，于是互相覆盖：
  *   · 三条 ghost+ 只落两条 —— 召唤台账丢了，幽灵收不掉（bug 1）；
  *   · 状态文件里的 taskId / roundFiles / done 被"回写旧版本"削掉 —— 整轮产出全丢、
  *     任务永远挂 running（bug 2 / 3）。
- * 修法见 shared/fslock.js（O_EXCL 抢锁 + 原子 rename）。本测试直接拉 hook.js 子进程复现。
+ * 修法见 shared/fslock.js（O_EXCL 抢锁 + 原子 rename）。
+ * 重构后 hook 退化成纯转发器，ghost 操作全在服务端 hookCommon 完成 ——
+ * 本测试用 createHookDispatch 直接调服务端 dispatch 复现并发场景。
  *
  * 跑法：`node server/test/ghostRace.test.js`（零依赖）。
  */
@@ -22,12 +24,12 @@ const HOME = path.join(TMP, 'home');
 const WG = path.join(TMP, 'wg');
 const PROJECT = path.join(TMP, 'project');
 for (const d of [HOME, WG, PROJECT]) fs.mkdirSync(d, { recursive: true });
-// 假的 server.json：越过"WorkGremlin 没在跑就跳过"的闸门；端口 9 连不通 → 上报静默失败（纪律 #1）
-fs.writeFileSync(path.join(WG, 'server.json'), JSON.stringify({ port: 9, token: 'x' }));
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
 
-const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
+const { createHookDispatch } = require('../src/ingest/hookDispatch');
+const { feedFilePath } = require('../src/ingest/subagentFeed');
+
 const FEED = path.join(PROJECT, '.workgremlin', 'subagents.json');
 const SESSION = 'sess-race';
 
@@ -43,18 +45,30 @@ function ok(label, cond, extra = '') {
   }
 }
 
-function runHook(eventName, payload = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', 'codebuddy'], {
-      cwd: PROJECT,
-      stdio: ['pipe', 'ignore', 'ignore'],
-    });
-    child.stdin.write(
-      JSON.stringify({ hook_event_name: eventName, session_id: SESSION, cwd: PROJECT, client: 'CLI', ...payload })
-    );
-    child.stdin.end();
-    child.on('close', () => resolve());
-  });
+const calls = [];
+const bus = {
+  projectForReport: () => 'WorkGremlin',
+  registerMember: (b) => { calls.push(['registerMember', b]); return b.memberId; },
+  setStatus: (b) => { calls.push(['setStatus', b]); return { ok: true }; },
+  startTask: (b) => { calls.push(['startTask', b]); return { taskId: 't_gen' }; },
+  endTask: (b) => { calls.push(['endTask', b]); return { ok: true }; },
+  toolUse: (b) => { calls.push(['toolUse', b]); return { ok: true }; },
+  fileTouch: (b) => { calls.push(['fileTouch', b]); return { ok: true }; },
+  taskProgress: (b) => { calls.push(['taskProgress', b]); return { ok: true }; },
+  heartbeat: (b) => { calls.push(['heartbeat', b]); return { ok: true }; },
+  recordMessage: (b) => { calls.push(['recordMessage', b]); return { ok: true }; },
+  backfillTaskTokens: (b) => { calls.push(['backfillTaskTokens', b]); return { ok: true }; },
+  currentTaskFor: () => null,
+};
+
+const d = createHookDispatch();
+const ctx = { project: 'WorkGremlin', workspacePath: PROJECT, bus, repo: {} };
+
+async function runHook(eventName, payload = {}) {
+  await d.dispatch(
+    { hook_event_name: eventName, session_id: SESSION, cwd: PROJECT, client: 'CLI', agent: 'codebuddy', ...payload },
+    ctx
+  );
 }
 
 function readFeed() {
@@ -93,22 +107,23 @@ function stateOf(session) {
   }
 }
 
-/** 清空状态文件里的召唤台账（保留 hb —— 里面记着心跳守护的 pid） */
+/** 清空状态文件里的召唤台账 + 内存台账 */
 function resetLedger() {
   const p = stateFileOf(SESSION);
-  if (!p) return;
-  fs.writeFileSync(p, `${JSON.stringify({ ...(stateOf(SESSION) || {}), subagents: [] })}\n`, 'utf8');
+  if (p) {
+    fs.writeFileSync(p, `${JSON.stringify({ ...(stateOf(SESSION) || {}), subagents: [] })}\n`, 'utf8');
+  }
+  d.sessionSet(SESSION, { subagents: [] });
 }
 
 function killHeartbeat() {
+  // hook 已退化为转发器，没有独立心跳进程需要杀；dispatch 在本进程内跑，
+  // hb.pid 就是本进程的 pid，不能杀。这里只清状态文件里的 hb 字段。
+  const p = stateFileOf(SESSION);
+  if (!p) return;
   const st = stateOf(SESSION);
-  const pid = st && st.hb && st.hb.pid;
-  if (pid) {
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      /* 已经退了 */
-    }
+  if (st && st.hb) {
+    fs.writeFileSync(p, `${JSON.stringify({ ...st, hb: null })}\n`, 'utf8');
   }
 }
 

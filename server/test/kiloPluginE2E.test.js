@@ -154,7 +154,7 @@ async function main() {
   {
     // 轮中的 assistant 文字 → 思考中，不是待命（实测 2026-09-28 修的坑）。
     // 早先这里报 idle，主 agent 会在任务还在跑的时候闪回「待命中」。
-    const rpMid = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID)}`, info.token)
+    const rpMid = await get(`${base}/api/v1/reporter-phase?client=kilo&session=${encodeURIComponent(SID)}`, info.token)
     ok('轮中的 assistant 文字 → 思考中（不是待命）', rpMid.phase === 'thinking', JSON.stringify(rpMid))
     ok('「思考中」带上了用户那句话', rpMid.prompt === '端到端：让 7F 记上任务', JSON.stringify(rpMid.prompt))
   }
@@ -175,8 +175,8 @@ async function main() {
   const db = new Database(info.dbPath, { readonly: true, fileMustExist: true })
   const all = (sql, ...a) => db.prepare(sql).all(...a)
   // 身份**按精确值**认：VS Code 起的这份必须是 kilo-plugin（判成 kilo 就是本次修的 bug）
-  const mem = all("SELECT * FROM members WHERE client = 'kilo-plugin'")[0]
-  ok('members 里有 client=kilo-plugin 的成员', Boolean(mem), JSON.stringify(all('SELECT client, role FROM members')))
+  const mem = all("SELECT * FROM members WHERE client = 'kilo'")[0]
+  ok('members 里有 client=kilo 的成员', Boolean(mem), JSON.stringify(all('SELECT client, role FROM members')))
   ok('role = agent（否则 bus.endTask 不写 task_runs）', mem && mem.role === 'agent', mem && mem.role)
   ok('member 归属 proj-e2e 工程', mem && mem.project_id === 'proj-e2e', mem && mem.project_id)
 
@@ -193,7 +193,7 @@ async function main() {
   const tk = all("SELECT * FROM tasks WHERE id = ?", t && t.id)[0]
   ok('task_runs 里有这条任务', Boolean(t), JSON.stringify(all('SELECT client, count(*) c FROM task_runs GROUP BY client')))
   if (t) console.log('    [task_runs 行]', JSON.stringify(t))
-  ok('client = kilo-plugin（VS Code 形态的身份，不是裸 kilo）', t && t.client === 'kilo-plugin', t && t.client)
+  ok('client = kilo（VS Code 形态的身份基名）', t && t.client === 'kilo', t && t.client)
   ok('标题 = 用户那句话', t && t.title === '端到端：让 7F 记上任务', t && t.title)
   ok('tasks 里 state = done', tk && tk.state === 'done', tk && tk.state)
   ok('收尾自述 = 会话标题', t && String(t.result || '').includes('端到端这一轮做完了'), t && t.result)
@@ -201,7 +201,7 @@ async function main() {
   ok('本轮改动文件**去重后**只有一个（相对/绝对路径不许记两遍）', t && t.file_count === 1, t && `${t.file_count} ${t.files_json}`)
   ok('带 session_id（轴 2）', t && t.session_id === SID, t && t.session_id)
   ok('带 model', t && t.model === 'kilo-auto/free', t && t.model)
-  ok('带形态（plugin）', t && t.form === 'plugin', t && t.form)
+  ok('带形态（vscode）', t && t.form === 'vscode', t && t.form)
 
   console.log('\n[3] 对话记录 + 文件活动 + agent_status')
   const m = all("SELECT * FROM messages WHERE content LIKE '%端到端这一轮做完了%'")[0]
@@ -222,7 +222,7 @@ async function main() {
   ok('相位是上报真值（reported，不灰显）', row && row.inferred === false, row && JSON.stringify({ phase: row.phase, inferred: row.inferred }))
 
   console.log('\n[5] /reporter-phase 给得出真相位 + 模型 + instrumented')
-  const rp = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID)}`, info.token)
+  const rp = await get(`${base}/api/v1/reporter-phase?client=kilo&session=${encodeURIComponent(SID)}`, info.token)
   // 收工之后相位回到 idle（待命）——**这是对的**：Kilo 收完工会发 session.idle。
   // 「任务完成」不靠相位显示，而靠 done 标记（渲染层把 mainAgent.phase 置成 'done' 的条件是
   // fastDoneAt 有值，见 IsoOfficeView）——所以这里断言 idle 与 done 标记同时成立。
@@ -237,20 +237,20 @@ async function main() {
   ok('召唤时飘起来过、收工后散场了', !feed.agents.find((a) => a.id === 'c2'), JSON.stringify(feed.agents))
   db.close()
 
-  console.log('\n[7] 状态文件按身份命名：VS Code 那份是 kilo-plugin_…')
+  console.log('\n[7] 状态文件按身份命名：VS Code 那份是 kilo_…')
   // 状态文件名是 `<client>@<工程>@<会话>.json`（plugin/index.js 的 statePath），
-  // 服务端按文件**内容里的 client** 匹配（sessions.js 的 clientHit）——两处都得是 kilo-plugin，
+  // 服务端按文件**内容里的 client** 匹配（sessions.js 的 clientHit）——两处都得是 kilo，
   // 少一处就表现为「任务列表显示 CLI / 相位读不到」。旧命名（kilo@…）那份是 VS Code
   // 老会话留下的孤儿，不续写、不删（有 TTL 兜底）。
   // 分隔符实测是 `_` 不是 `@`：statePath 的名字是 `join("@")` 之后又过了一道
   // `replace(/[^a-zA-Z0-9._-]/g, "_")`，`@` 不在白名单里，全被洗成 `_`
-  // —— 所以真实文件名形如 `kilo-plugin__tmp_ProjE2E_ses_e2e_0001.json`。
+  // —— 所以真实文件名形如 `kilo__tmp_ProjE2E_ses_e2e_0001.json`。
   // 认身份就认**开头的 client 段**（client 里不会有 `_`），别按文档里那个 `@` 去认。
   const stateFiles = fs.existsSync(path.join(WG, 'hooks')) ? fs.readdirSync(path.join(WG, 'hooks')) : []
-  const vscodeState = stateFiles.filter((n) => n.startsWith('kilo-plugin_'))
-  ok('有 kilo-plugin_ 开头的状态文件', vscodeState.length === 1, JSON.stringify(stateFiles))
+  const vscodeState = stateFiles.filter((n) => n.startsWith('kilo_') && n.includes(SID))
+  ok('有 kilo_ 开头的状态文件', vscodeState.length === 1, JSON.stringify(stateFiles))
   const stBody = vscodeState.length ? JSON.parse(fs.readFileSync(path.join(WG, 'hooks', vscodeState[0]), 'utf8')) : {}
-  ok('文件内容里的 client 也是 kilo-plugin（服务端按它匹配）', stBody.client === 'kilo-plugin', JSON.stringify(stBody.client))
+  ok('文件内容里的 client 也是 kilo（服务端按它匹配）', stBody.client === 'kilo', JSON.stringify(stBody.client))
 
   console.log('\n[8] 终端 CLI 形态：同一份实现、环境里没有 KILO_* → client=kilo / form=cli')
   // 和 [1] 那组是**同一个入口、同一个选项**，只有环境不同 —— 这正是本次要立的规矩：
@@ -275,7 +275,7 @@ async function main() {
   dbCli.close()
   ok('台账里这条是 client=kilo、form=cli（形态由环境判，不写死在选项里）',
     cliRows.length === 1 && cliRows[0].client === 'kilo' && cliRows[0].form === 'cli', JSON.stringify(cliRows))
-  const cliState = fs.readdirSync(path.join(WG, 'hooks')).filter((n) => n.startsWith('kilo_'))
+  const cliState = fs.readdirSync(path.join(WG, 'hooks')).filter((n) => n.startsWith('kilo_') && n.includes(SID2))
   ok('状态文件名是 kilo_ 开头（同一份实现，两个身份各写各的）', cliState.length === 1, JSON.stringify(cliState))
 
   console.log('\n[9] 应用晚起：建实例时还没有 server.json → 写进去之后下一条事件就接得上')
@@ -337,10 +337,10 @@ async function main() {
   const mem4 = pid4 ? dbR.prepare('SELECT id, client, role FROM members WHERE project_id = ?').all(pid4) : []
   dbR.close()
   ok('没有 session.created 也落了台账（注册改成"重试到成功为止"）', rows4.length === 1, JSON.stringify(rows4))
-  ok('client=kilo-plugin / form=plugin —— 任务记录里标的是「Kilo Code Plugin」',
-    rows4[0] && rows4[0].client === 'kilo-plugin' && rows4[0].form === 'plugin', JSON.stringify(rows4))
+  ok('client=kilo / form=vscode —— 任务记录里标的是「Kilo Code Plugin」',
+    rows4[0] && rows4[0].client === 'kilo' && rows4[0].form === 'vscode', JSON.stringify(rows4))
   ok('成员是这个工程上报时现注册出来的（不是蹭前面几组注册的）',
-    mem4.some((m) => m.client === 'kilo-plugin' && m.role === 'agent'), JSON.stringify(mem4))
+    mem4.some((m) => m.client === 'kilo' && m.role === 'agent'), JSON.stringify(mem4))
 
   console.log('\n[11] 会话级 diff 不许把**别人改的**文件算进这一轮（按 mtime 划窗口）')
   // 真实现场（2026-09-30 12:35，用户报的「这个任务显示有两个文件改动，kilotask.js /
@@ -386,7 +386,7 @@ async function main() {
       && !String(rows5[0].files_json || '').includes('old-by-someone-else'),
     JSON.stringify(rows5.map((r) => ({ c: r.file_count, f: r.files_json }))))
   // 主控制台「改动文件」那一栏走的是另一条路（report 的 done.files），也得是筛过的
-  const rp5 = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID5)}`, info.token)
+  const rp5 = await get(`${base}/api/v1/reporter-phase?client=kilo&session=${encodeURIComponent(SID5)}`, info.token)
   const done5 = (rp5.done && rp5.done.files) || []
   ok('控制台的「改动文件」也只有本轮那个', done5.length === 1 && String(done5[0].path || '').endsWith('made-this-round.ts'),
     JSON.stringify(done5))

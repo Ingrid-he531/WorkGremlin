@@ -70,19 +70,27 @@ function readStdin() {
   });
 }
 
-/** 转发到本地 server（复用 Bearer 令牌）。body 非空即 POST，否则 GET。 */
+/** 转发到本地 server（复用 Bearer 令牌）。body 非空即 POST，否则 GET。503 时重试一次。 */
 async function request(info, route, body) {
-  const init = {
-    method: body ? 'POST' : 'GET',
-    headers: info.token ? { authorization: `Bearer ${info.token}` } : {},
-    signal: AbortSignal.timeout(REQ_TIMEOUT_MS),
+  const doFetch = () => {
+    const init = {
+      method: body ? 'POST' : 'GET',
+      headers: info.token ? { authorization: `Bearer ${info.token}` } : {},
+      signal: AbortSignal.timeout(REQ_TIMEOUT_MS),
+    };
+    if (body) {
+      init.headers['content-type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    return fetch(`http://127.0.0.1:${info.port}${route}`, init);
   };
-  if (body) {
-    init.headers['content-type'] = 'application/json';
-    init.body = JSON.stringify(body);
-  }
   try {
-    const res = await fetch(`http://127.0.0.1:${info.port}${route}`, init);
+    let res = await doFetch();
+    if (res.status === 503) {
+      debug(route, '-> 503, retrying once');
+      await new Promise((r) => setTimeout(r, 100));
+      res = await doFetch();
+    }
     if (!res.ok) {
       debug(route, '->', res.status);
       return null;
