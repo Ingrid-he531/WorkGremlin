@@ -64,8 +64,8 @@ async function loadFeed() {
 const END_KEEP_MIN = 5;
 /** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
 const SPEED_PX_S = 70;
-/** 单条文本**不限制长度**：用户原话在任务记录里可能是长句，门楣照原样滚，不截断。
- *  轨道 white-space:nowrap + 屏 overflow:hidden，长文本只是滚得久一点，不会溢出。 */
+/** 单条文本显示长度限制为一屏（perLine 个字符）：超出则在用户原话末尾截 "..."，
+ *  不足则补空格凑满一屏 —— 长短任务统一一屏长、间隔一致（不再无限滚动长句）。 */
 
 /** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
@@ -116,11 +116,28 @@ function endedText(it) {
   };
 }
 
-/** 一条 line 还差多少字符才凑满一屏：不足就在「后缀之后」补空格（整行 + 后缀一起占满一屏）。 */
-function padN(it) {
-  const n = perLine.value;
-  const len = (it.text ? it.text.length : 0) + (it.suffix ? it.suffix.length : 0);
-  return n && len < n ? n - len : 0;
+/**
+ * 单条任务在屏上的显示长度统一限制为一屏（perLine 个字符）：
+ *   · 超出 → 截断 taskText 并在末尾加 "..."；
+ *   · 不足 → 在「后缀之后」补空格凑满一屏，使长短任务一样长、彼此间隔一致。
+ * 渲染期调用，随 perLine（屏宽/字号）变化自动重算。
+ */
+function fitLine(it) {
+  const per = perLine.value || 0;
+  const time = it.time || '';
+  const floor = it.floor || '';
+  const label = it.taskLabel || '';
+  const text = it.taskText || '';
+  const suffix = it.suffix || '';
+  // 渲染字符数 ≈ time + nbsp + floor + nbsp + label + text + suffix
+  const core = time.length + 1 + floor.length + 1 + label.length + text.length + suffix.length;
+  if (per > 0 && core > per) {
+    const avail = per - (time.length + 1 + floor.length + 1 + label.length + suffix.length + 3);
+    const t = avail > 0 ? text.slice(0, avail) : '';
+    return { text: t + '...', pad: 0 };
+  }
+  const pad = per > 0 ? Math.max(0, per - core) : 0;
+  return { text, pad };
 }
 
 /** 从所有工程的所有会话里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded ——
@@ -412,7 +429,7 @@ onBeforeUnmount(() => {
       >
         <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
-          <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span><span class="pad">{{ ' '.repeat(padN(it)) }}</span></span>
+        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ fitLine(it).text }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span><span class="pad">{{ ' '.repeat(fitLine(it).pad) }}</span></span>
         </span>
       </div>
       <!-- 量字宽的探针：一串等宽数字，看不见也不占地方（算"一屏能放几个字"用） -->
