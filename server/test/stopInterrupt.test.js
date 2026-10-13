@@ -21,8 +21,6 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
-const { spawn } = require('node:child_process');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-stopint-'));
 const HOME = path.join(TMP, 'home');
@@ -31,8 +29,9 @@ const WS = path.join(TMP, 'ws');
 for (const d of [HOME, WG, WS]) fs.mkdirSync(d, { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
+process.chdir(WS);
 
-const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
+const { createHookDispatch } = require('../src/ingest/hookDispatch');
 
 let pass = 0;
 let fail = 0;
@@ -53,27 +52,26 @@ let taskSeq = 0;
 const ends = [];
 /** /tool/use 收到的上报（工具使用计数） */
 const toolUses = [];
-const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
-  req.on('end', () => {
-    if (req.url === '/api/v1/task/end') ends.push(JSON.parse(body || '{}'));
-    if (req.url === '/api/v1/tool/use') toolUses.push(JSON.parse(body || '{}'));
-    const out = req.url === '/api/v1/task/start'
-      ? { ok: true, taskId: `t_${++taskSeq}`, project: 'WorkGremlin', workspacePath: WS }
-      : { ok: true, project: 'WorkGremlin', workspacePath: WS, taskId: null, title: '' };
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify(out));
-  });
-});
+const starts = [];
+const { dispatch } = createHookDispatch();
+const bus = {
+  startTask: async (args) => { starts.push(args); return { ok: true, taskId: `t_${++taskSeq}`, project: 'WorkGremlin', workspacePath: WS }; },
+  endTask: async (args) => { ends.push(args); },
+  toolUse: async (args) => { toolUses.push(args); },
+  setStatus: async () => {},
+  heartbeat: async () => {},
+  registerMember: async () => {},
+  projectForReport: () => '',
+  backfillTaskTokens: async () => {},
+  currentTaskFor: () => null,
+  recordMessage: async () => {},
+  fileTouch: async () => {},
+  taskProgress: async () => {},
+};
+const ctx = { project: 'WorkGremlin', workspacePath: WS, bus };
 
-function runHook(agent, payload) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', agent], { cwd: WS, stdio: ['pipe', 'ignore', 'ignore'] });
-    child.stdin.write(JSON.stringify(payload));
-    child.stdin.end();
-    child.on('close', () => resolve());
-  });
+async function runHook(agent, payload) {
+  await dispatch({ ...payload, agent, workspacePath: payload.cwd || WS }, ctx);
 }
 
 function stateOf(sid) {
@@ -153,9 +151,6 @@ function mkCodexNoiseRollout(sid) {
 }
 
 async function main() {
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  fs.writeFileSync(path.join(WG, 'server.json'), JSON.stringify({ port: server.address().port, token: 'x' }));
-
   /* [1] Claude：ESC 之后 Stop，transcript 里有 [Request interrupted by user] → 任务取消 */
   head('[1] Claude Code：Stop 前 transcript 落了 [Request interrupted by user] → 任务取消');
   const claudeSid = 'claude-cancel-1';
@@ -250,7 +245,6 @@ async function main() {
   );
   ok('都挂在当前这一轮任务上（带 taskId）', toolUses.length === 3 && toolUses.every((u) => u.taskId === toolTaskId), JSON.stringify(toolUses));
 
-  server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);

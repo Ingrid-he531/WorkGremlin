@@ -40,6 +40,7 @@ const bus = {
   taskProgress: () => ({ ok: true }),
   backfillTaskTokens: () => ({ ok: true }),
   currentTaskFor: () => null,
+  projectForReport: () => '',
 };
 
 const ctx = { project: 'P', workspacePath: TMP, bus, repo: {} };
@@ -115,7 +116,7 @@ const CB_TP = path.join(CB_DIR, 'index.json');
   await d.dispatch({ hook_event_name: 'UserPromptSubmit', session_id: 's_codex_vsc', client: 'vscode', prompt: '再', agent: 'codex', cwd: TMP, transcript_path: CODEX_TP }, ctx);
   const stV = calls.find((c) => c[0] === 'startTask');
   ok('Codex + client=vscode 路由仍落到 codex 楼层', !!stV, stV && JSON.stringify(stV[1]));
-  ok('Codex + client=vscode 被识别为 plugin', stV && stV[1].form === 'plugin', stV && JSON.stringify(stV[1]));
+  ok('Codex + client=vscode 被识别为 vscode（plugin 形态）', stV && stV[1].form === 'vscode', stV && JSON.stringify(stV[1]));
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });

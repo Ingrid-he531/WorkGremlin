@@ -21,8 +21,6 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
-const { spawn } = require('node:child_process');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-cancel-'));
 const HOME = path.join(TMP, 'home');
@@ -31,8 +29,11 @@ const WS = path.join(TMP, 'ws'); // 假的工程目录 = hook 子进程的 cwd
 for (const d of [HOME, WG, WS]) fs.mkdirSync(d, { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
+// relFile 用 path.resolve(file)（相对 process.cwd()），hook 子进程原来 cwd=WS，直接调用需对齐
+process.chdir(WS);
 
-const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
+// 必须在设置 WORKGREMLIN_HOME 之后再 require（home() 每次调用读 env）
+const { createHookDispatch } = require('../src/ingest/hookDispatch');
 
 let pass = 0;
 let fail = 0;
@@ -49,32 +50,30 @@ function head(t) {
   console.log(`\n${t}`);
 }
 
-/* ------------------------------ 假服务端（只回 hook 要的那几个字段） ------------------------------ */
+/* ------------------------------ 直接调用服务端 dispatch（不经 HTTP 转发） ------------------------------ */
 let taskSeq = 0;
 /** 收到的 task/start、task/end 请求体 */
 const starts = [];
 const ends = [];
-const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
-  req.on('end', () => {
-    if (req.url === '/api/v1/task/start') starts.push(JSON.parse(body || '{}'));
-    if (req.url === '/api/v1/task/end') ends.push(JSON.parse(body || '{}'));
-    const out = req.url === '/api/v1/task/start'
-      ? { ok: true, taskId: `t_cancel_${++taskSeq}` }
-      : { ok: true, project: 'WorkGremlin', workspacePath: WS, taskId: null, title: '' };
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify(out));
-  });
-});
+const { dispatch } = createHookDispatch();
+const bus = {
+  startTask: async (args) => { starts.push(args); return { ok: true, taskId: `t_cancel_${++taskSeq}` }; },
+  endTask: async (args) => { ends.push(args); },
+  toolUse: async () => {},
+  setStatus: async () => {},
+  heartbeat: async () => {},
+  registerMember: async () => {},
+  projectForReport: () => '',
+  backfillTaskTokens: async () => {},
+  currentTaskFor: () => null,
+  recordMessage: async () => {},
+  fileTouch: async () => {},
+  taskProgress: async () => {},
+};
+const ctx = { project: 'WorkGremlin', workspacePath: WS, bus };
 
-function runHook(payload) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', 'claude'], { cwd: WS, stdio: ['pipe', 'ignore', 'ignore'] });
-    child.stdin.write(JSON.stringify(payload));
-    child.stdin.end();
-    child.on('close', () => resolve());
-  });
+async function runHook(payload) {
+  await dispatch({ ...payload, agent: 'claude', workspacePath: payload.cwd || WS }, ctx);
 }
 
 const lastStart = () => starts[starts.length - 1] || {};
@@ -112,9 +111,6 @@ function mkTranscript(file, { withReply = true } = {}) {
 }
 
 async function main() {
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  fs.writeFileSync(path.join(WG, 'server.json'), JSON.stringify({ port: server.address().port, token: 'x' }));
-
   const ts = mkTranscript('cancel-a.jsonl');
 
   /* [1] 打断：落"取消"标记 */
@@ -180,7 +176,6 @@ async function main() {
   ok('done.files 含取消前改过的文件', st5.done && Array.isArray(st5.done.files) && st5.done.files.some((f) => String(f.path || f) === 'src/foo.js'), JSON.stringify(st5.done && st5.done.files));
   ok('done.fileCount >= 1（不是「没有输出」）', st5.done && st5.done.fileCount >= 1, JSON.stringify(st5.done && st5.done.fileCount));
 
-  server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);

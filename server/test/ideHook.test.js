@@ -16,8 +16,6 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
-const { spawn } = require('node:child_process');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-ide-hook-'));
 const HOME = path.join(TMP, 'home');
@@ -26,8 +24,9 @@ const WS = path.join(TMP, 'ws'); // 假的工程目录 = hook 子进程的 cwd
 for (const d of [HOME, WG, path.join(WS, 'src')]) fs.mkdirSync(d, { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
+process.chdir(WS);
 
-const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
+const { createHookDispatch } = require('../src/ingest/hookDispatch');
 
 let pass = 0;
 let fail = 0;
@@ -44,30 +43,29 @@ function head(t) {
   console.log(`\n${t}`);
 }
 
-/* ------------------------------ 假服务端（只回 hook 要的那几个字段） ------------------------------ */
+/* ------------------------------ 直接调用服务端 dispatch（不经 HTTP 转发） ------------------------------ */
 let taskSeq = 0;
 /** 收到的 task/start 请求体（要断言 form = 这一轮走的形态） */
 const starts = [];
-const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
-  req.on('end', () => {
-    if (req.url === '/api/v1/task/start') starts.push(JSON.parse(body || '{}'));
-    const out = req.url === '/api/v1/task/start'
-      ? { ok: true, taskId: `t_ide_${++taskSeq}` }
-      : { ok: true, project: 'WorkGremlin', workspacePath: WS, taskId: null, title: '' };
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify(out));
-  });
-});
+const { dispatch } = createHookDispatch();
+const bus = {
+  startTask: async (args) => { starts.push(args); return { ok: true, taskId: `t_ide_${++taskSeq}` }; },
+  endTask: async () => {},
+  toolUse: async () => {},
+  setStatus: async () => {},
+  heartbeat: async () => {},
+  registerMember: async () => {},
+  projectForReport: () => '',
+  backfillTaskTokens: async () => {},
+  currentTaskFor: () => null,
+  recordMessage: async () => {},
+  fileTouch: async () => {},
+  taskProgress: async () => {},
+};
+const ctx = { project: 'WorkGremlin', workspacePath: WS, bus };
 
-function runHook(payload) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', 'codex'], { cwd: WS, stdio: ['pipe', 'ignore', 'ignore'] });
-    child.stdin.write(JSON.stringify(payload));
-    child.stdin.end();
-    child.on('close', () => resolve());
-  });
+async function runHook(payload) {
+  await dispatch({ ...payload, agent: 'codex', workspacePath: payload.cwd || WS }, ctx);
 }
 
 function stateOf(sid) {
@@ -103,9 +101,6 @@ const IDE_PROMPT = [
 ].join('\n');
 
 async function main() {
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  fs.writeFileSync(path.join(WG, 'server.json'), JSON.stringify({ port: server.address().port, token: 'x' }));
-
   /* [1] 用户原话：剥掉 IDE 注入块 */
   head('[1] IDE 注入的 prompt → 标题只取用户那句话');
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideprompt1', cwd: WS, prompt: IDE_PROMPT });
@@ -193,8 +188,8 @@ async function main() {
   };
   const TS_IDE = mkRollout('rollout-ide.jsonl', { session_id: 'ideform1', source: 'vscode', originator: 'codex_vscode' });
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform1', cwd: WS, prompt: 'IDE 里的一轮', transcript_path: TS_IDE });
-  ok('VS Code 扩展起的会话 → form=plugin', starts[starts.length - 1].form === 'plugin', JSON.stringify(starts[starts.length - 1]));
-  ok('形态写进了状态文件（下一轮直接用）', stateOf('ideform1').form === 'plugin', stateOf('ideform1').form);
+  ok('VS Code 扩展起的会话 → form=vscode', starts[starts.length - 1].form === 'vscode', JSON.stringify(starts[starts.length - 1]));
+  ok('形态写进了状态文件（下一轮直接用）', stateOf('ideform1').form === 'vscode', stateOf('ideform1').form);
 
   const TS_TUI = mkRollout('rollout-tui.jsonl', { session_id: 'ideform2', source: 'cli', originator: 'codex-tui' });
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform2', cwd: WS, prompt: '终端里的一轮', transcript_path: TS_TUI });
@@ -222,7 +217,6 @@ async function main() {
   ok('改过的已跟踪文件进来了', files8.includes('src/tracked.js:edit'), JSON.stringify(files8));
   ok('新建的未跟踪文件按 write 记', files8.includes('src/new.js:write'), JSON.stringify(files8));
   ok('本轮之前就有的文件不算（src/foo.js 是上一轮写的）', !files8.some((x) => x.startsWith('src/foo.js')), JSON.stringify(files8));
-  server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 }

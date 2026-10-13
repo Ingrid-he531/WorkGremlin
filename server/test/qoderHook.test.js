@@ -18,10 +18,8 @@
  * 跑法：`npm run test:qoder`（零依赖，直接跑 hook.js 子进程）。
  */
 const fs = require('node:fs');
-const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-qoder-hook-'));
 const HOME = path.join(TMP, 'home');
@@ -31,9 +29,10 @@ for (const d of [HOME, WG, BIN]) fs.mkdirSync(d, { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
 process.env.PATH = BIN;
-
-const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
 const CWD = TMP;
+process.chdir(CWD);
+
+const { createHookDispatch } = require('../src/ingest/hookDispatch');
 
 let pass = 0;
 let fail = 0;
@@ -56,13 +55,25 @@ function since(mark) {
 const pathsOf = (list) => list.map((r) => r.path);
 const startOf = (list) => list.filter((r) => r.path === '/api/v1/task/start');
 
-function runHook(agent, eventName, sessionId, extra = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', agent], { cwd: CWD, stdio: ['pipe', 'ignore', 'ignore'] });
-    child.stdin.write(JSON.stringify({ hook_event_name: eventName, session_id: sessionId, cwd: CWD, ...extra }));
-    child.stdin.end();
-    child.on('close', () => resolve());
-  });
+const { dispatch } = createHookDispatch();
+const bus = {
+  startTask: async (args) => { seen.push({ path: '/api/v1/task/start', body: args }); return { ok: true, taskId: 't-fake-1' }; },
+  endTask: async (args) => { seen.push({ path: '/api/v1/task/end', body: args }); },
+  toolUse: async (args) => { seen.push({ path: '/api/v1/tool/use', body: args }); },
+  registerMember: async (args) => { seen.push({ path: '/api/v1/register', body: args }); },
+  heartbeat: async (args) => { seen.push({ path: '/api/v1/heartbeat', body: args }); },
+  setStatus: async (args) => { seen.push({ path: '/api/v1/status', body: args }); },
+  projectForReport: () => '',
+  backfillTaskTokens: async () => {},
+  currentTaskFor: () => null,
+  recordMessage: async () => {},
+  fileTouch: async () => {},
+  taskProgress: async () => {},
+};
+const ctx = { project: 'WorkGremlin', workspacePath: CWD, bus };
+
+async function runHook(agent, eventName, sessionId, extra = {}) {
+  await dispatch({ hook_event_name: eventName, session_id: sessionId, cwd: CWD, ...extra, agent, workspacePath: CWD }, ctx);
 }
 
 function stateFile(sessionId) {
@@ -82,44 +93,10 @@ function stateFile(sessionId) {
   }
 }
 
-function killHeartbeat(sessionId) {
-  const st = stateFile(sessionId);
-  const pid = st && st.hb && st.hb.pid;
-  if (pid) {
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      /* 已经退了 */
-    }
-  }
-}
+// 直接调用 dispatch 不经子进程，无需 kill 心跳
+function killHeartbeat() {}
 
 (async () => {
-  // 假服务端：除了越过"WorkGremlin 没在跑就跳过"的闸门，还要看清 hook 报了什么。
-  // /task/start 必须回一个 taskId（hook 会把它写进状态文件，后续那一轮靠它收工）。
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (c) => {
-      raw += c;
-    });
-    req.on('end', () => {
-      let body = null;
-      try {
-        body = raw ? JSON.parse(raw) : null;
-      } catch {
-        body = null;
-      }
-      seen.push({ path: req.url, body });
-      res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify(req.url === '/api/v1/task/start' ? { ok: true, taskId: 't-fake-1' } : { ok: true }));
-    });
-  });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  fs.writeFileSync(
-    path.join(WG, 'server.json'),
-    JSON.stringify({ port: server.address().port, token: 'x' })
-  );
-
   console.log('Qoder：细粒度产品 —— 会话边界不补任务、不补相位，相位交给 UserPromptSubmit / Stop');
 
   /* [1] SessionStart：只注册 / 心跳 / 状态，**不许**发 /task/start */
@@ -129,7 +106,7 @@ function killHeartbeat(sessionId) {
   let st = stateFile('qtest-qoder-1');
   ok('SessionStart 照常注册（发了 /register 与 /heartbeat）', pathsOf(got).includes('/api/v1/register') && pathsOf(got).includes('/api/v1/heartbeat'), pathsOf(got).join(' '));
   ok('SessionStart **没有**发会话级任务（/task/start 一条都没有）', startOf(got).length === 0, JSON.stringify(startOf(got)));
-  ok('SessionStart 不编造相位（留给 UserPromptSubmit）', Boolean(st && !st.sessionPhase), st && JSON.stringify(st.sessionPhase));
+  ok('SessionStart 不编造任务相位（只落 idle，留给 UserPromptSubmit 推进）', Boolean(st && st.sessionPhase && st.sessionPhase.phase === 'idle'), st && JSON.stringify(st.sessionPhase));
   ok('状态文件里没有会话级 taskId', Boolean(st && !st.taskId), st && JSON.stringify(st.taskId));
   killHeartbeat('qtest-qoder-1');
 
@@ -158,11 +135,10 @@ function killHeartbeat(sessionId) {
   await runHook('claude', 'SessionStart', 'qtest-claude-1');
   got = since(mark);
   st = stateFile('qtest-claude-1');
-  ok('claude SessionStart 同样不补相位、不发 /task/start', Boolean(st && !st.sessionPhase) && startOf(got).length === 0, st && JSON.stringify(st.sessionPhase));
+  ok('claude SessionStart 只落 idle 相位、不发 /task/start', Boolean(st && st.sessionPhase && st.sessionPhase.phase === 'idle') && startOf(got).length === 0, st && JSON.stringify(st.sessionPhase));
   killHeartbeat('qtest-claude-1');
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
-  server.close();
   fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);
 })();

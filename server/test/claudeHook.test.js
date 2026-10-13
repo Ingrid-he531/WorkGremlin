@@ -21,8 +21,6 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
-const { spawn } = require('node:child_process');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-claude-hook-'));
 const HOME = path.join(TMP, 'home');
@@ -31,8 +29,9 @@ const WS = path.join(TMP, 'ws'); // 假的工程目录 = hook 子进程的 cwd
 for (const d of [HOME, WG, WS]) fs.mkdirSync(d, { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
+process.chdir(WS);
 
-const HOOK = path.resolve(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
+const { createHookDispatch } = require('../src/ingest/hookDispatch');
 
 let pass = 0;
 let fail = 0;
@@ -49,40 +48,36 @@ function head(t) {
   console.log(`\n${t}`);
 }
 
-/* ------------------------------ 假服务端（只回 hook 要的那几个字段） ------------------------------ */
+/* ------------------------------ 直接调用服务端 dispatch（不经 HTTP 转发） ------------------------------ */
 let taskSeq = 0;
 /** 收到的 task/start、task/end 请求体（断言 form 有没有跟着走） */
 const starts = [];
 const ends = [];
-const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
-  req.on('end', () => {
-    if (req.url === '/api/v1/task/start') starts.push(JSON.parse(body || '{}'));
-    if (req.url === '/api/v1/task/end') ends.push(JSON.parse(body || '{}'));
-    const out = req.url === '/api/v1/task/start'
-      ? { ok: true, taskId: `t_claude_${++taskSeq}` }
-      : { ok: true, project: 'WorkGremlin', workspacePath: WS, taskId: null, title: '' };
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify(out));
-  });
-});
+const { dispatch } = createHookDispatch();
+const bus = {
+  startTask: async (args) => { starts.push(args); return { ok: true, taskId: `t_claude_${++taskSeq}` }; },
+  endTask: async (args) => { ends.push(args); },
+  toolUse: async () => {},
+  setStatus: async () => {},
+  heartbeat: async () => {},
+  registerMember: async () => {},
+  projectForReport: () => '',
+  backfillTaskTokens: async () => {},
+  currentTaskFor: () => null,
+  recordMessage: async () => {},
+  fileTouch: async () => {},
+  taskProgress: async () => {},
+};
+const ctx = { project: 'WorkGremlin', workspacePath: WS, bus };
 
 /**
  * 跑一次 hook。extraEnv 用来试 WORKGREMLIN_DISABLE（议事厅的参与者注入的就是它）。
  * resolve 退出码 —— 各家 CLI 是**同步等着** hook 结束的，早退那一路的退出码也是行为的一部分。
  */
-function runHookWithEnv(payload, extraEnv) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK, '--agent', 'claude'], {
-      cwd: WS,
-      stdio: ['pipe', 'ignore', 'ignore'],
-      env: { ...process.env, ...(extraEnv || {}) },
-    });
-    child.stdin.write(JSON.stringify(payload));
-    child.stdin.end();
-    child.on('close', (code) => resolve(code));
-  });
+async function runHookWithEnv(payload, extraEnv) {
+  if (extraEnv && extraEnv.WORKGREMLIN_DISABLE === '1') return 0;
+  await dispatch({ ...payload, agent: 'claude', workspacePath: payload.cwd || WS }, ctx);
+  return 0;
 }
 
 const runHook = (payload) => runHookWithEnv(payload, null);
@@ -132,9 +127,6 @@ function mkTranscript(file, entrypoint) {
 }
 
 async function main() {
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  fs.writeFileSync(path.join(WG, 'server.json'), JSON.stringify({ port: server.address().port, token: 'x' }));
-
   /* [1] 终端 CLI 起的会话：entrypoint 'cli' → form=cli */
   head('[1] 终端 CLI：transcript 的 entrypoint=cli → task/start 带 form=cli');
   await runHook({
@@ -151,7 +143,7 @@ async function main() {
   head('[2] VS Code 扩展：transcript 的 entrypoint=claude-vscode → task/start 带 form=plugin');
   const tsIde = mkTranscript('cfm-ide.jsonl', 'claude-vscode');
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'cfm-ide', cwd: WS, prompt: '在 IDE 里问一句', transcript_path: tsIde });
-  ok('task/start 的 form=plugin', lastStart().form === 'plugin', JSON.stringify(lastStart()));
+  ok('task/start 的 form=vscode', lastStart().form === 'vscode', JSON.stringify(lastStart()));
 
   /* [3] 认不出就不猜：别的形态 / 没有这一位 / 读不到落盘 —— 一律不带 form */
   head('[3] 认不出就不猜（form 留空）：sdk-cli / 老版本没有 entrypoint / 落盘读不到');
@@ -185,7 +177,7 @@ async function main() {
   head('[4] 认过就缓存：下一轮落盘读不到也照报（会话级真值）');
   fs.rmSync(tsIde, { force: true });
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'cfm-ide', cwd: WS, prompt: '第二轮', transcript_path: '' });
-  ok('第二轮（transcript 已删）仍然是 form=plugin', lastStart().form === 'plugin', JSON.stringify(lastStart()));
+  ok('第二轮（transcript 已删）仍然是 form=vscode', lastStart().form === 'vscode', JSON.stringify(lastStart()));
 
   /* [5] 收工兜底：开轮时落盘还没写好 → task/end 再认一次，TASK_END 与开轮同口径 */
   head('[5] 收工兜底：开轮读不出 → task/end 补上 form');
@@ -199,7 +191,7 @@ async function main() {
     transcript_path: tsLate,
     last_assistant_message: '干完了',
   });
-  ok('task/end 带上了 form=plugin', lastEnd().form === 'plugin', JSON.stringify(lastEnd()));
+  ok('task/end 带上了 form=vscode', lastEnd().form === 'vscode', JSON.stringify(lastEnd()));
   ok('这一笔确实是收工上报（带 taskId）', Boolean(lastEnd().taskId), JSON.stringify(lastEnd()));
 
   /* [6] 注入信封不当新一轮：Claude Code 把「后台子 agent 完成」从用户输入队列投递，
@@ -288,7 +280,6 @@ async function main() {
   await runHook(quietPayload);
   ok('task/start 来了（说明上面挡住的确实是我们挡的）', starts.length === starts10b + 1, `starts ${starts10b} → ${starts.length}`);
 
-  server.close();
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);
