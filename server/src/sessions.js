@@ -189,6 +189,10 @@ function sessionModel(client, sessionId, agentType = '') {
 }
 
 function readReporterPhase(workspacePath, client = '', session = '') {
+  // 相位**必须绑会话**：没有会话就没有相位。这里不再"按 client 取最新一条"兜底 ——
+  // 那条兜底会让主控制台显示同层**别的会话**的相位（"上面没选会话、下面却亮着某个相位"），
+  // 正是把状态搞乱的地方。调用方要相位就必须点名 session。
+  if (!session) return null;
   const dir = path.join(reporterHookHome(), 'hooks');
   let win = null;
   let winPending = null;
@@ -459,6 +463,8 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
 }
 
 function reporterMainPhase(workspacePath, client = '', session = '') {
+  // 相位必须绑会话（见 readReporterPhase）：没点名会话 / 拿不到会话 id → 没有相位。
+  if (!session) return null;
   // 各楼层（尤其是 9F Copilot，没有 reporter hook）可自己实现 readPhase 来提供相位；
   // 没实现的（带 hook 的产品）退回通用的 readReporterPhase。相位职责按楼层派发，不把兜底塞进 generic 里。
   const base = String(client || '').trim().toLowerCase();
@@ -525,6 +531,8 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
  * @returns {boolean}
  */
 function readReporterActiveTask(workspacePath, client = '', session = '') {
+  // 同理：活跃窗口也按**会话**判 —— 不点名会话就无从谈起"这条会话在不在跑"。
+  if (!session) return false;
   const dir = path.join(reporterHookHome(), 'hooks');
   const now = Date.now();
   for (const name of readDir(dir)) {
@@ -781,8 +789,11 @@ function readReporterDones(workspacePath, client = '') {
  *  同一个 (工程, 客户端) 下可能有多条会话，各取各的；会话 id 拿不到的楼层（Codex 的
  *  rollout 文件名不含 session_id）退回"该 client 最新的一份"——不猜，只是放宽到这一步。 */
 function readReporterDone(workspacePath, client = '', session = '') {
-  const { latest, bySession } = readReporterDones(workspacePath, client);
-  const hit = session ? bySession.get(String(session)) || null : latest;
+  // 完成标记同理**必须绑会话**：没有会话就没有"这一轮完成了"可言。
+  // （以前 `session` 为空会退回"该 client 最新一份"——那会把同层别的会话的收工算到你头上。）
+  if (!session) return null;
+  const { bySession } = readReporterDones(workspacePath, client);
+  const hit = bySession.get(String(session)) || null;
   if (hit) return hit;
   // 9F GitHub Copilot 没有 hook：状态文件这条路永远是空的，完成标记得从它自己的会话日志取
   // （最新那一轮 request 的 completedAt，见 readCopilotLiveRequest）——不然 9F 永远没有

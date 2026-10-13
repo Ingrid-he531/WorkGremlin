@@ -10,10 +10,10 @@
  * 覆盖（每条都对应一个踩过的坑）：
  *   [1] 5F TraeCode（会话只能靠 hook）：有会话 id、工程为空（Stop 后 hook 清空了 sessionPhase）
  *       → 标记照样亮（守卫只砍 latest 兜底，不许砍精确命中；一刀砍就会让 5F 永不亮 + 下一轮假弹）
- *   [2] 1F CLI：没有会话 id、工程也解析不出来 → 返回空标记，**不能**拿别工程的 latest 冒充
+ *   [2] 1F CLI：会话 id 解不出来（文件名不是会话 id）→ **不进会话表**（相位/完成/台账都按会话走）
  *   [3] 3F Codex：会话 id 从 rollout 文件名取到 → 完成标记按会话精确，不吃同工程别人刚收工
  *   [4] 相同工程但 id 对不上 → 空标记（"命中不了"= 没完成过，不退回 latest）
- *   [5] 有工程、没有 id（1F）→ 走该工程内的 latest 兜底，且跨工程那份（更新的）不会赢
+ *   [5] 有工程、但会话 id 解不出来（1F）→ **也不列**：不再拿该工程的 latest 兜底
  *   [6] 1F CLI：transcript 文件名**就是**会话 id（CodeBuddy 与 Claude 同款命名）→ 按会话精确，
  *       同工程那条更新的收工不会串到它头上（这也盖住"cli 那一路以前拿不到 id"的旧行为）
  *   [7] 噪声文件不进会话表：根目录的输入历史 history.jsonl（扫 projects 子树后自然落不到它）、
@@ -165,16 +165,12 @@ head('[1] 5F TraeCode（会话只能靠 hook 状态文件）：有会话 id、�
   }
 }
 
-head('[2] 1F CLI：没有会话 id、工程也解析不出来 → 空标记（不许拿别工程的 latest 冒充）');
+head('[2] 1F CLI：没有会话 id 的行不列出来（相位/完成/台账都按会话走）');
 {
   const r = rows('1F').find((x) => String(x.id).includes('nocwd'));
-  ok('1F 这一行存在', Boolean(r));
-  if (r) {
-    ok('工程确实为空、也没有会话 id', r.projectPath === '' && r.sessionId === '', desc(r));
-    ok('完成标记为空（守卫挡住了跨工程兜底）', r.doneAt === 0 && r.doneTitle === '', desc(r));
-  }
-  // 记录守卫存在的理由：此刻"不按工程过滤"的那份 latest 是全库最新的一份（[5] 里 /tmp/ProjC 那份），
-  // 一旦守卫放宽，这一行就会显示成它的收工。
+  ok('会话 id 解不出来（文件名不是会话 id）→ 不进会话表', !r, r ? desc(r) : '');
+  // 记录"以前会怎么错"：不带工程过滤的 latest 是全库最新的一份（[5] 里 /tmp/ProjC 那份），
+  // 以前这种没有会话 id 的行就会拿它当自己的「任务完成」。
   const { latest } = readReporterDones('', 'codebuddy');
   ok('（背景）不带工程过滤时 latest 是别工程最新的一份', Boolean(latest && latest.title === '别工程更新'), JSON.stringify(latest && latest.title));
 }
@@ -199,13 +195,10 @@ head('[4] 4F Claude：同工程但 id 对不上 → 空标记（"命中不了"= 
   }
 }
 
-head('[5] 有工程、没有 id（1F）→ 该工程内的 latest 兜底，跨工程那份更新的不赢');
+head('[5] 有工程、但没有会话 id（1F）→ 也不列（不再拿该工程的 latest 兜底）');
 {
   const r = rows('1F').find((x) => String(x.id).includes('withcwd'));
-  ok('1F 这一行存在且工程解析出来了', Boolean(r) && r.projectPath === '/tmp/ProjB', r ? desc(r) : '');
-  if (r) {
-    ok('拿到本工程的收工（不是更新的"别工程更新"）', r.doneAt === NOW - 120 && r.doneTitle === '同工程收工', desc(r));
-  }
+  ok('工程能解析出来、但会话 id 解不出来 → 照样不进会话表', !r, r ? desc(r) : '');
 }
 
 head('[6] 1F CLI：文件名即会话 id → 同工程两条各自精确，不吃对方那份更新的');

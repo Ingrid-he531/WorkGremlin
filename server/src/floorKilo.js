@@ -904,19 +904,12 @@ function kiloInstrumented(sessionId) {
  * @returns {{sessionId:string,phase:string,action:string,target:string,context:string[],tool:string,prompt:string,model:string}|null}
  */
 function kiloMainPhase(workspacePath, session = '') {
+  // 相位必须绑会话：不点名会话就没有相位（不再"取同工程最近更新那条"兜底 ——
+  // 那会让主控制台显示同层别的会话的相位，跟 reporter 那一路统一口径）。
+  if (!session) return null;
   const list = listKiloSessions();
   if (!list.length) return null;
-  const ws = String(workspacePath || '').trim();
-  let row = '';
-  if (session) {
-    row = list.find((s) => s.id === session) || '';
-  } else if (ws) {
-    // 同一工程多条会话时，取最近更新的那条（没有就别人的工程串味）
-    const mine = list.filter((s) => s.projectPath && path.resolve(s.projectPath) === path.resolve(ws));
-    row = mine.sort((a, b) => b.lastEventAt - a.lastEventAt)[0] || '';
-  } else {
-    row = list[0];
-  }
+  const row = list.find((s) => s.id === session) || '';
   if (!row) return null;
   const ph = readKiloPhase(row.id);
   if (!ph) return null;

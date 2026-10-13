@@ -435,35 +435,16 @@ function doneFieldsFromReporter(done) {
  * 文件清单只有路径：hook 不做 diff，没有 +/- 行数（那是 plugin 落盘的 file-changes 才有的）。
  * @param {string} projectPath 会话所属工程（读状态文件时按它过滤）；**可能为空**，见下面的守卫
  * @param {string} client 客户端身份（**这一路来源**的 client，如 codex / trae / codebuddy）
- * @param {string} sessionId 会话 id；拿不到才退回"该（工程 + client）最新的一份"
+ * @param {string} sessionId 会话 id；**必填** —— 没有会话 id 就没有"这一轮完成了"可言
  */
 function doneFieldsOf(projectPath, client, sessionId = '') {
-  /**
-   * 守卫：工程归属不明的会话**不许走兜底**。
-   * readReporterDones 在没有 projectPath 时不做工程过滤，那份 latest 可能来自别的工程 ——
-   * 会把别工程的收工（连同文件名）当成这条会话的"任务完成"显示出来。
-   *
-   * 但只砍**兜底**这一支，**不砍有会话 id 的精确命中**（两者安全性不同：id 唯一，精确命中
-   * 与工程无关）。一刀砍掉会误伤两条真实路径：
-   *   · 5F TraeCode（会话只能靠 hook 状态文件）—— 会话一 Stop，hook 就把 sessionPhase 与
-   *     taskWorkspacePath 一起清空（实测 sessionPhase:null、taskWorkspacePath:""），于是
-   *     "有完成标记"与"工程归属非空"按构造互斥：守卫一开，5F 的「任务完成」永远不亮，
-   *     反而要等下一轮开工、工程回来了才突然亮起上一轮的完成（假弹）。
-   *   · Claude 会话的 cwd 没解析出来时工程也是空，但它有会话 id，精确命中照样是对的。
-   * 反过来，没有会话 id 的（1F/2F）行为不变：仍返回空标记（合"绝不编造"纪律）。
-   *
-   * 守卫只加在这里，别加进 readReporterDone：/reporter-phase 在 freshestReporterWs
-   * 返回空时也会调它，那样会连快轮询的精确标记一起废掉。
-   */
-  if (!projectPath && !sessionId) return NO_DONE;
-  // projectPath 为空时 key 塌成 `|client`，与 readReporterDones 的"空串 = 不过滤"是同一语义：
-  // 这类会话只可能靠下面的精确命中取到东西，走不到 latest（守卫已拦）。
+  // 按会话精确取：拿不到会话 id → 没有完成标记（不再退回"该 client 最新一份"）。
+  if (!sessionId) return NO_DONE;
+  // projectPath 只用于缓存键（readReporterDones 扫一遍的成本）；精确命中与会话 id 唯一绑定。
   const key = `${projectPath || ''}|${client || ''}`;
   if (!doneScans.has(key)) doneScans.set(key, readReporterDones(projectPath, client));
-  const { latest, bySession } = doneScans.get(key);
-  // 有会话 id 就必须精确命中：命中不了就是"这条会话没完成过"，
-  // 不能退回 latest —— 那会把同层别的会话的收工搬到它头上（错误归因）。
-  const done = sessionId ? bySession.get(String(sessionId)) || null : latest;
+  const { bySession } = doneScans.get(key);
+  const done = bySession.get(String(sessionId)) || null;
   if (!done) return NO_DONE;
   const files = Array.isArray(done.files) ? done.files : [];
   const count = Number(done.fileCount);
@@ -676,7 +657,11 @@ function handleCliHook(p, src, ctx) {
           lastEventAt: s.lastEventAt,
         }));
   // 判据得是"这一路扫到了【还活着】的会话"，而不是"扫到了任何行"（与 prune / snapshot 同尺 TIMEOUT_MS）。
-  const live = rows.filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS);
+  // 还要有**会话 id** 才列：相位 / 完成标记 / 台账归属全都按会话走，没有 id 的行参与不了任何一条链路
+  // （以前列出来只能靠"按 client 取最新"的兜底，那正是把状态搞乱的来源）。
+  const live = rows
+    .filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS)
+    .filter((r) => r.sessionId);
   // CLI JSONL 与 hook 可能描述同一会话：只按真实 sessionId 去重；cli 路扫到活会话时，撤掉旧的 hook 行。
   if (src.kind === 'cli' && live.length) {
     const ids = new Set(live.map((s) => s.sessionId).filter(Boolean));

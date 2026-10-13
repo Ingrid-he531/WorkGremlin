@@ -38,12 +38,12 @@ const isIdleish = (s) => !s || s.phase === 'idle' || s.phase === 'done' || s.pha
 // 相位文案与主控制台同源（中英两套都在 i18n 词条表里），别在这里再维护一份
 const phaseLabel = (p) => consolePhaseLabel({ phase: p });
 /**
- * 下拉里的短 id：取**文件名那一段**再截 8 位。
- * CLI 楼层的 id 是 transcript 的**相对路径**（`projects/<工程>/<会话>.jsonl` 或扫了子树后的
- * `<工程>/<会话>.jsonl`），直接从头截 8 位拿到的是目录名（三条会话全是 `projects`，分不出谁是谁）；
- * 插件 / Claude 那些 id 本身就是一个 uuid，不含路径分隔符，取文件名段等于原样 —— 行为不变。
+ * 下拉里的短 id：**会话 id 的前 8 位**。
+ * 不再拿落盘定位符（`x.id`，CLI 楼层它是 transcript 的相对路径）去猜文件名 —— 3F Codex 的文件名是
+ * `rollout-<时间戳>-<会话id>.jsonl`，取前 8 位永远得到 `rollout-`，分不出谁是谁。
+ * 相位就是从**会话**来的，下拉显示的也该是会话 id。
  */
-const shortId = (id) => String(id || '').split(/[\\/]/).pop().replace(/\.jsonl$/i, '').slice(0, 8);
+const shortId = (sessionId) => String(sessionId || '').slice(0, 8);
 
 export const useSessionStore = defineStore('sessions', {
   state: () => ({
@@ -136,8 +136,8 @@ export const useSessionStore = defineStore('sessions', {
         const body = tag ? `${tag}-${proj}` : proj;
         return {
           value: x.id,
-          label: [body, shortId(x.id)].filter(Boolean).join(' '),
-          title: x.projectPath || x.project || x.id,
+          label: [body, shortId(x.sessionId)].filter(Boolean).join(' '),
+          title: [x.projectPath || x.project || '', x.sessionId].filter(Boolean).join(' · '),
         };
       });
     },

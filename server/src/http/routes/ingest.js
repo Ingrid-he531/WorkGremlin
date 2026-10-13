@@ -126,8 +126,8 @@ function createIngestRouter({ bus, repo }) {
     try {
       const body = req.body || {};
       const ws = body.workspacePath || '';
-      // 只在开 debug 时打全量事件，平时一行足够定位（agent / 事件 / 会话）。
-      log.debug('hook recv', body.hook_event_name, body.agent, body.session_id || '');
+      // 诊断：每次收到 hook 事件都打一行（info 级，默认落盘），看清楚"服务端到底收没收到、字段长啥样"
+      log.info('[ghost-debug] /hook recv', JSON.stringify({ event: body.hook_event_name, agent: body.agent, client: body.client, tool: body.tool_name || body.tool, ws, session: body.session_id || '' }));
       const project = bus.projectForReport(body.project || '', ws);
       if (!project) {
         log.warn('hook 没有归属工程，忽略', body.hook_event_name, body.agent, ws);
