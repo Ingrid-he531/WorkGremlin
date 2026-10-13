@@ -16,6 +16,8 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-hook-rt-'));
 // ~/.workgremlin/hooks/ —— 每跑一次测试就在真机上多一条幽灵会话。
 process.env.WORKGREMLIN_HOME = path.join(TMP, 'wg');
 fs.mkdirSync(process.env.WORKGREMLIN_HOME, { recursive: true });
+// 幽灵清单统一收口到数据目录单文件；测试用 env 指向临时文件，避免污染真机（见 subagentFeed.feedFilePath）
+process.env.WORKGREMLIN_SUBAGENTS_FILE = path.join(process.env.WORKGREMLIN_HOME, 'subagents.json');
 const TP = path.join(TMP, 'sess.jsonl');
 fs.writeFileSync(
   TP,

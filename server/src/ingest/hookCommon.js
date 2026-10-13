@@ -670,8 +670,10 @@ function ownsEntry(a, client, session = '') {
   return true;
 }
 
-/** 主 Agent 召唤 subagent → 加一只小幽灵（直接写 feed 文件，带 ts/floor/sessionId 归属） */
-function addGhost(workspacePath, name, task, id, parent, model, client, session = '') {
+/** 主 Agent 召唤 subagent → 加一只小幽灵（直接写 feed 文件，带 ts/floor/sessionId/归属工程）。
+ *  project：这只幽灵会话所在工程（由会话可靠推导，不靠易漂移的 ev.cwd），写进条目，
+ *  供 subagentFeed 把它归到对应工程办公室桶、并据此查 roster 触发小怪物互动。 */
+function addGhost(workspacePath, name, task, id, parent, model, client, session = '', project = '') {
   const file = feedFilePath(workspacePath);
   updateJson(
     file,
@@ -686,6 +688,7 @@ function addGhost(workspacePath, name, task, id, parent, model, client, session 
         ts: Date.now(),
         client,
         ...(session ? { sessionId: String(session) } : {}),
+        ...(project ? { project: String(project) } : {}),
         ...(task ? { task } : {}),
         ...(id ? { id } : {}),
         ...(parent ? { parent } : {}),
@@ -1138,7 +1141,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
           if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name: nm, at: Date.now() });
           else if (!id && nm && !ledger.some((r) => r.name === nm)) ledger.push({ id: '', name: nm, at: Date.now() });
           set({ subagents: ledger });
-          addGhost(workspacePath, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId);
+          addGhost(workspacePath, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId, stableProject);
         }
       }
       const toolTaskId = String(get().taskId || '');

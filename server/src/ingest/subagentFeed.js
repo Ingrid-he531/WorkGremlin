@@ -217,24 +217,32 @@ function createSubagentFeed(opts) {
     lastSig = sig;
 
     const alive = new Set();
+    // 本批幽灵涉及到的工程（含当前工程），收尾清理按各自工程来——全局清单里别的工程的
+    // 幽灵不会被当前工程的 feed 误删，也不会在没打开的工程里滞留（那个工程一旦打开自会清理）。
+    const touched = new Set([project]);
 
     for (const a of feed.agents) {
+      // 幽灵归属工程以条目里的 project 字段为准（文件放哪与它无关，由会话可靠推导）；缺省退回当前工程。
+      // 这样一条幽灵就归到它"会话所在工程"的办公室桶里，UI 显示当前工程成员时自然出现，
+      // 而别的工程的幽灵不会串进当前办公室。
+      const proj = a.project || project;
+      touched.add(proj);
       // 加 subagent- 前缀：免得跟常驻专家重名（清单里也有个 coder 的话，会把坐在工位上的那位顶掉）
       const memberId = `subagent-${a.name}`;
-      const fullId = bus.memberIdOf(project, memberId);
+      const fullId = bus.memberIdOf(proj, memberId);
       alive.add(fullId);
       // 老库的幽灵行没有 client，顺手补（只在缺失/不一致时写）
-      if (a.client) bus.tagMemberClient(project, memberId, a.client);
+      if (a.client) bus.tagMemberClient(proj, memberId, a.client);
       if (changed) {
         bus.registerMember({
-          project,
+          project: proj,
           memberId,
           name: a.name,
           role: 'subagent',
           sessionId: a.sessionId || null, // 幽灵归属哪条会话：空=跨会话飘（老库/手工写的）
           ephemeral: true,
           projectLabel: a.project || feedProject,
-          workspacePath: opts.workspacePath || '',
+          workspacePath: '',
           client: a.client || '',
         });
       }
@@ -248,7 +256,7 @@ function createSubagentFeed(opts) {
       // （2026-09-27 实测：同一只被记 944 次；DB 里 13:45 那批三条任务每 2 秒翻一遍也是它）。
       const known = tasks.get(gkey);
       // 召唤它的那轮用户任务：清单里写了就用写的，没写（老 hook）就认主 agent 当前在跑的那个
-      const parentTaskId = a.parent || bus.currentMainTaskId(project);
+      const parentTaskId = a.parent || bus.currentMainTaskId(proj);
       if (a.result) {
         // 收工**只记一次**：这一条在清单里还要再活 RETIRE_MS（播"走到主 agent 面前汇报"
         // 那段动画），期间 sync() 每 2s 都会再进来一趟 —— 而 known 上头刚被 delete 掉，
@@ -261,7 +269,7 @@ function createSubagentFeed(opts) {
             // 摘要写失败也不能拖住收工（否则幽灵既不汇报也不散）
             try {
               bus.endTask({
-                project,
+                project: proj,
                 memberId,
                 taskId: known.id,
                 state: 'done',
@@ -270,13 +278,13 @@ function createSubagentFeed(opts) {
             } catch (err) {
               log.warn('[workgremlin] subagent 收工摘要落盘失败：', err && err.message);
             }
-            bus.endSubagentRun({ id: known.runId, project, result: a.result, model: a.model, files: a.files });
+            bus.endSubagentRun({ id: known.runId, project: proj, result: a.result, model: a.model, files: a.files });
             tasks.delete(gkey);
           } else {
             // 从没开过任务行（召唤时没写任务文案）也照样记一笔：
             // 名字 + 产出有了，开始时刻只能承认不知道（startedAt=null → 耗时 NULL）。
             const runId = bus.startSubagentRun({
-              project,
+              project: proj,
               memberId: fullId,
               name: a.name,
               client: a.client,
@@ -286,18 +294,18 @@ function createSubagentFeed(opts) {
               taskId: null,
               startedAt: null,
             });
-            bus.endSubagentRun({ id: runId, project, result: a.result, model: a.model, files: a.files });
+            bus.endSubagentRun({ id: runId, project: proj, result: a.result, model: a.model, files: a.files });
           }
           retiring.set(gkey, { name: a.name, result: a.result, at: Date.now() + RETIRE_MS });
         }
       } else if (a.task) {
         if (!known || known.title !== a.task) {
           if (known) {
-            bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
-            bus.endSubagentRun({ id: known.runId, project, model: a.model, files: a.files });
+            bus.endTask({ project: proj, memberId, taskId: known.id, state: 'done' });
+            bus.endSubagentRun({ id: known.runId, project: proj, model: a.model, files: a.files });
           }
           const r = bus.startTask({
-            project,
+            project: proj,
             memberId,
             title: a.task,
             progress: a.progress ?? 0,
@@ -307,7 +315,7 @@ function createSubagentFeed(opts) {
           if (r && r.taskId) {
             // 台账：一次召唤一行 —— 类型（name）/ 任务 / 父任务，收工时补产出与耗时
             const runId = bus.startSubagentRun({
-              project,
+              project: proj,
               memberId: fullId,
               name: a.name,
               client: a.client,
@@ -320,18 +328,18 @@ function createSubagentFeed(opts) {
             tasks.set(gkey, { id: r.taskId, title: a.task, runId, fullId });
           }
         } else if (a.progress !== null) {
-          bus.taskProgress({ project, memberId, taskId: known.id, progress: a.progress, files: a.files });
+          bus.taskProgress({ project: proj, memberId, taskId: known.id, progress: a.progress, files: a.files });
         }
       } else if (known) {
-        bus.endTask({ project, memberId, taskId: known.id, state: 'done' });
+        bus.endTask({ project: proj, memberId, taskId: known.id, state: 'done' });
         // 没写 result 的收尾：产出留 NULL（不编造），但结束时间与耗时照记
-        bus.endSubagentRun({ id: known.runId, project, model: a.model, files: a.files });
+        bus.endSubagentRun({ id: known.runId, project: proj, model: a.model, files: a.files });
         tasks.delete(gkey);
       }
 
       // 心跳：state 变了才写历史，同时刷新 last_heartbeat_at（不然 60s 后被判 degraded）
       bus.heartbeat({
-        project,
+        project: proj,
         memberId,
         state: normState(a.state),
         progress: a.progress,
@@ -340,9 +348,11 @@ function createSubagentFeed(opts) {
 
       // 清单里的"已定义 subagent"被召唤：把对应小怪物的工位状态同步为忙碌，
       // 并登记活跃（roster 心跳不再覆盖它）。召唤结束（从清单移除）时由下方 stale 清理复位。
-      if (roster && roster.isDefined(a.name)) {
+      // 只在"这只幽灵属于当前工程"时才同步——它是当前办公室里那只小怪物的互动；
+      // 别的工程的幽灵登记进各自工程桶，但不该错动当前办公室的小怪物。
+      if (roster && roster.isDefined(a.name) && proj === project) {
         bus.heartbeat({
-          project,
+          project: proj,
           memberId: a.name,
           state: gremlinState(a.state, a.result),
           progress: a.progress,
@@ -360,22 +370,25 @@ function createSubagentFeed(opts) {
       retireFromFeed(plan.name, plan.result);
     }
 
-    // 清单里没了 -> 幽灵散掉（含上一轮残留的临时成员）
-    const stale = repo.listEphemeral.all(project);
-    for (const m of stale) {
-      if (alive.has(m.id)) continue;
-      // 若这是某个已定义 subagent 的幽灵，先把对应小怪物工位复位为在线
-      if (roster && m.name && roster.isDefined(m.name)) roster.markIdle(m.name);
-      // 台账：这一只就这么没了（清单里直接被摘掉、没写过 result）——
-      // 产出留 NULL，但结束时间与耗时得记上，否则报表里永远挂着一笔"还在跑"的账。
-      // 按成员找、不按 gkey 找：成员消失时我们只剩成员 id，而同名并发下一个成员挂着好几只的账，
-      // 要全部收掉（tasks 的键是 gkey，值里存着 fullId，见上）。
-      for (const [k, t] of [...tasks]) {
-        if (t.fullId !== m.id) continue;
-        bus.endSubagentRun({ id: t.runId, project });
-        tasks.delete(k);
+    // 清单里没了 -> 幽灵散掉（含上一轮残留的临时成员）。按本批涉及到的工程各自清理，
+    // 这样全局清单里别的工程的幽灵不会被当前工程的 feed 误删、也不会在没打开的工程里滞留。
+    for (const pr of touched) {
+      const stale = repo.listEphemeral.all(pr);
+      for (const m of stale) {
+        if (alive.has(m.id)) continue;
+        // 若这是某个已定义 subagent 的幽灵，先把对应小怪物工位复位为在线
+        if (roster && m.name && roster.isDefined(m.name) && pr === project) roster.markIdle(m.name);
+        // 台账：这一只就这么没了（清单里直接被摘掉、没写过 result）——
+        // 产出留 NULL，但结束时间与耗时得记上，否则报表里永远挂着一笔"还在跑"的账。
+        // 按成员找、不按 gkey 找：成员消失时我们只剩成员 id，而同名并发下一个成员挂着好几只的账，
+        // 要全部收掉（tasks 的键是 gkey，值里存着 fullId，见上）。
+        for (const [k, t] of [...tasks]) {
+          if (t.fullId !== m.id) continue;
+          bus.endSubagentRun({ id: t.runId, project: pr });
+          tasks.delete(k);
+        }
+        bus.removeMember({ project: pr, memberId: m.id });
       }
-      bus.removeMember({ project, memberId: m.id });
     }
 
     return feed.agents.length;
