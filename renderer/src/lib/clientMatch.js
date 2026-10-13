@@ -1,4 +1,4 @@
-import { agentBase, AGENT_LABELS, clientLabel } from '@workgremlin/shared';
+import { agentBase, AGENT_LABELS } from '@workgremlin/shared';
 
 /**
  * 客户端身份归一化（前端共用）。
@@ -40,5 +40,3 @@ export function floorAcceptsClient(floorAgent, memberAgent) {
 export function isBaseAgent(id) {
   return Boolean(AGENT_LABELS[agentBase(id)]);
 }
-
-export { clientLabel };

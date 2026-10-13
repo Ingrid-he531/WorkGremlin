@@ -125,7 +125,7 @@ console.log('\n[10] 派发：sessionModel 按**基名**查表');
 {
   const sid = writeTranscript([assistant('deepseek-flash')]);
   ok('claude', sessionModel('claude', sid), 'deepseek-flash');
-  ok('claude-plugin（同产品另一形态）', sessionModel('claude-plugin', sid), 'deepseek-flash');
+  ok('claude-plugin（新模型 client 即基名，不剥离后缀 → 查不到）', sessionModel('claude-plugin', sid), '');
   ok('CLAUDE（大小写）', sessionModel('CLAUDE', sid), 'deepseek-flash');
   // 适配器只认产品，但会话 id 对不上就是空 —— 别的楼层不会被这条 Claude 会话串味
   ok('codex 走不到 claude 的落盘', sessionModel('codex', sid), '');

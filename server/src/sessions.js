@@ -32,7 +32,7 @@
 
 const fs = require('node:fs');
 const path = require('path');
-const { home, agentBase } = require('@workgremlin/shared');
+const { home } = require('@workgremlin/shared');
 // 通用落盘扫描基础设施（目录约定 + 容错文件读取），readJson / readDir 统一从 roots 取，不在各处重复定义
 const { readJson, readDir } = require('./roots');
 // 楼层模块注册表（floors.js）：会话标题按 client 派发到对应楼层模块时要用 registry 里的 sessionTitle
@@ -184,7 +184,7 @@ for (const [key, mod] of Object.entries(FLOORS)) {
   if (typeof mod.selectedModelOf === 'function') MODEL_SOURCES[key] = mod.selectedModelOf;
 }
 function sessionModel(client, sessionId, agentType = '') {
-  const fn = MODEL_SOURCES[agentBase(String(client || '').toLowerCase())];
+  const fn = MODEL_SOURCES[String(client || '').toLowerCase()];
   return fn ? fn(sessionId, agentType) || '' : '';
 }
 

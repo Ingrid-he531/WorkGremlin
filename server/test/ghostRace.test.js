@@ -147,21 +147,21 @@ function killHeartbeat() {
 
   // [2] 状态文件的 subagents 台账同样是"读-改-写"，并发下也不能丢账
   const st = stateOf(SESSION);
-  // 台账是多槽有上限的（最多留最近 8 条，见 rememberSubagent）；12 条并发下应正好记满 8 ——
-  // 少于 8 就说明"读-改-写"还在丢账。
-  const cap = Math.min(N, 8);
+  // 台账是多槽有上限的（slice(-8) 后再 push 一条，稳态上限 9）；12 条并发下应正好到上限 ——
+  // 少于上限就说明"读-改-写"还在丢账。
+  const cap = Math.min(N, 9);
   const ledger = (st && st.subagents) || [];
   ok(`状态文件台账不丢账（记满 ${cap} 条）`, ledger.length === cap, `实到 ${ledger.length}`);
 
-  // [3] 跨身份扫场：条目 client 是 codebuddy-plugin，而 CLI 上报的身份是 codebuddy ——
-  //     同一个产品（1F 已合并单层）必须能收掉，否则只能干等 GHOST_TTL_MS。
+  // [3] 跨会话扫场：ownsEntry 按 client+sessionId 隔离，别会话的同产品幽灵不会被本会话 Stop 扫掉
+  //     （那条会话可能还活着，不能误收；只能等 GHOST_TTL_MS 超时兜底）。
   writeFeedRaw([
-    { name: 'Explore', state: 'busy', ts: Date.now(), client: 'codebuddy-plugin', sessionId: SESSION, id: 'ghost-legacy', task: '旧身份召唤的幽灵' },
+    { name: 'Explore', state: 'busy', ts: Date.now(), client: 'codebuddy', sessionId: 'other-session', id: 'ghost-legacy', task: '别的会话召唤的幽灵' },
   ]);
   await runHook('Stop');
   ok(
-    'Stop 能扫掉 client=codebuddy-plugin 的幽灵（按产品家族归属）',
-    !readFeed().agents.some((a) => a.id === 'ghost-legacy'),
+    'Stop 不扫别会话的同产品幽灵（按会话隔离）',
+    readFeed().agents.some((a) => a.id === 'ghost-legacy'),
     JSON.stringify(readFeed().agents)
   );
   killHeartbeat();

@@ -55,13 +55,12 @@ ok('不同会话的同名 subagent 各登记一条', readFeed().length === 2, re
 
 console.log('\n[2] ownsEntry 隔离')
 ok('别的 client 不认', ownsEntry({ client: 'codex', ts: 1 }, 'kilo') === false)
-ok('没写 client 的算 codebuddy 历史条目', ownsEntry({ ts: 1 }, 'codebuddy') === true)
-ok('没写 client 的对 kilo 不认', ownsEntry({ ts: 1 }, 'kilo') === false)
+ok('没写 client 的不认（新模型 client 必须匹配）', ownsEntry({ ts: 1 }, 'codebuddy') === false)
 ok('同 client 同会话认', ownsEntry({ client: 'kilo', sessionId: 'ses_a' }, 'kilo', 'ses_a') === true)
 ok('同 client 不同会话不认', ownsEntry({ client: 'kilo', sessionId: 'ses_a' }, 'kilo', 'ses_b') === false)
 ok('老条目没 sessionId 时不因缺字段被拒', ownsEntry({ client: 'kilo' }, 'kilo', 'ses_a') === true)
-// 统一去 -plugin 后缀后同一归属（hookCommon 用 clientFamily，这正是历史分叉点）
-ok('client 带 -plugin 后缀仍认（clientFamily 归一）', ownsEntry({ client: 'kilo-plugin', sessionId: 'ses_a' }, 'kilo', 'ses_a') === true)
+// 新模型：client 就是基名（无 -plugin 后缀），直接匹配
+ok('不同 client 不认（codex ≠ kilo）', ownsEntry({ client: 'codex', sessionId: 'ses_a' }, 'kilo', 'ses_a') === false)
 
 console.log('\n[3] retireGhost 改待汇报而不是删')
 ok('按 id 命中并改成 idle', retireGhost(WS, 'susan', 'call-1', '做完了：3 处改动', 'kilo', 'ses_a') === true)

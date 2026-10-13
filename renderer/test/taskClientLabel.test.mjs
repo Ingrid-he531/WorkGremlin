@@ -10,7 +10,7 @@
  *
  * 跑法：`npm run test:task-client`（node 直接跑；renderer 的 .js 由 node 的语法检测当 ESM）
  */
-const { clientLabel } = await import('../src/lib/clientMatch.js');
+const { clientLabel } = await import('@workgremlin/shared');
 
 let pass = 0;
 let fail = 0;
@@ -54,10 +54,10 @@ ok("form='weird' → Claude Code", clientLabel('claude', 'weird') === 'Claude Co
 ok('未知 client 原样返回 + 形态', clientLabel('mystery', 'cli') === 'mystery CLI', clientLabel('mystery', 'cli'));
 ok('空 client 显示占位符', clientLabel('') === '—', clientLabel(''));
 
-console.log('\n[5] TraeCode（5F）：IDE 与 Plugin 靠上报身份（client）就分得开，不用 form');
-ok('trae → TraeCode IDE（非 plugin 形态是桌面 IDE 本体，不是 CLI）', clientLabel('trae') === 'TraeCode IDE', clientLabel('trae'));
-ok('trae-plugin → TraeCode Plugin', clientLabel('trae-plugin') === 'TraeCode Plugin', clientLabel('trae-plugin'));
-ok('标签已带形态，再给 form 也不重复追加', clientLabel('trae', 'cli') === 'TraeCode IDE', clientLabel('trae', 'cli'));
+console.log('\n[5] TraeCode（5F）：base 标签是 TraeCode，形态靠 form 区分');
+ok('trae（无 form）→ TraeCode', clientLabel('trae') === 'TraeCode', clientLabel('trae'));
+ok('trae + form=vscode → TraeCode Plugin', clientLabel('trae', 'vscode') === 'TraeCode Plugin', clientLabel('trae', 'vscode'));
+ok('trae + form=cli → TraeCode CLI', clientLabel('trae', 'cli') === 'TraeCode CLI', clientLabel('trae', 'cli'));
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -358,7 +358,7 @@ const AGENT_LABELS = {
   workbuddy: 'WorkBuddy',
   codex: 'Codex',
   claude: 'Claude Code',
-  trae: 'TraeCode IDE',
+  trae: 'TraeCode',
   kilo: 'Kilo Code',
   qoder: 'Qoder',
   opencode: 'OpenCode',
@@ -392,13 +392,10 @@ function agentBase(id) {
  * @returns {string} 显示名,如 "TraeCode IDE" / "CodeBuddy Plugin" / "Kilo Code CLI" / "Codex"
  */
 function clientLabel(agent, form) {
-  const raw = String(agent || '');
-  const isPluginByName = /-plugin$/i.test(raw);
-  const a = agentBase(raw);
+  const a = agentBase(agent);
   const base = AGENT_LABELS[a] || a || '—';
   const f = String(form || '').toLowerCase();
-  const stripForm = (s) => s.replace(/\s+(?:CLI|IDE)$/i, '');
-  if (isPluginClient(f) || isPluginByName) return `${stripForm(base)} Plugin`;
+  if (isPluginClient(f)) return `${base} Plugin`;
   if (f === 'cli' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} CLI`;
   if (f === 'ide' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} IDE`;
   return base;

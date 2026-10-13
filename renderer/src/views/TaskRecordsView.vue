@@ -177,13 +177,13 @@ function fmtTokens(n) {
   if (n == null) return '—';
   return n.toLocaleString('en-US');
 }
-/** 积分。null 显示 "—"（与 token 行口径一致），否则 12.50 保留两位小数（不带货币符号）。 */
+/** 金额（元）。null 显示 "—"（与 token 行口径一致），否则 ¥12.50 保留两位小数。 */
 function fmtYuan(n) {
   if (n == null) return '—';
-  return Number(n).toFixed(2);
+  return `¥${Number(n).toFixed(2)}`;
 }
 /** 判断是否 Trae 任务：Trae 客户端有 `"trae"`（纯 trae）或 `"trae,trae-plugin"`（逗号分隔）。
- *  Trae 的 renderer.log 只给积分、不给 input/output_tokens 分项 → 详情面板用「积分」代替「词元」。 */
+ *  Trae 的 renderer.log 只给金额、不给 input/output_tokens 分项 → 详情面板用「金额」代替「词元」。 */
 function isTraeTask(t) {
   const c = t && String(t.client || '');
   if (!c) return false;

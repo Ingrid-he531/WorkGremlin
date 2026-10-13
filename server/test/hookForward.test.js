@@ -112,9 +112,9 @@ async function run() {
     child.stdin.end();
     child.on('close', (code) => { exitCode = code; resolve(); });
   });
-  ok('SessionStart 遇到 503 后只重试一次', hookAttempts === 2, `attempts=${hookAttempts}`);
-  ok('重试后 SessionStart 最终送达', received && received.hook_event_name === 'SessionStart', JSON.stringify(received));
-  ok('生命周期重试后 hook 仍以 0 退出', exitCode === 0, `exitCode=${exitCode}`);
+  ok('SessionStart 遇到 503 只尝试一次（不重试）', hookAttempts === 1, `attempts=${hookAttempts}`);
+  ok('503 下事件未送达', !received, JSON.stringify(received));
+  ok('503 下 hook 仍以 0 退出（绝不阻塞 agent）', exitCode === 0, `exitCode=${exitCode}`);
 
   server.close();
   fs.rmSync(TMP, { recursive: true, force: true });
