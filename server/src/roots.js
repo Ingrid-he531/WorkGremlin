@@ -17,6 +17,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
+// Single source of truth for WorkGremlin's own storage locations (see shared/paths.js).
+const { productsOverridesPath } = require('@workgremlin/shared/paths');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
@@ -147,18 +149,11 @@ function scanDataDir(dir) {
 
 /* ------------------------------ 候选根目录 ------------------------------ */
 
-/**
- * 额外搜索范围（配置文件 + 环境变量，二者并存、拼接去重）。详见 products.overrides.json。
- */
-function workgremlinHome() {
-  return process.env.WORKGREMLIN_HOME || path.join(HOME, '.workgremlin');
-}
-
 let _overridesCache = null;
 /** 读一次配置文件（解析失败/不存在回空对象）；缓存避免每次扫盘都读盘 */
 function readOverrides() {
   if (_overridesCache) return _overridesCache;
-  const file = path.join(workgremlinHome(), 'products.overrides.json');
+  const file = productsOverridesPath();
   let cfg = {};
   try {
     cfg = JSON.parse(fs.readFileSync(file, 'utf8')) || {};

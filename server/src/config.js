@@ -9,28 +9,17 @@
 
 const fs = require('node:fs');
 const net = require('node:net');
-const path = require('node:path');
 const crypto = require('node:crypto');
 const { DEFAULTS, home } = require('@workgremlin/shared');
-
-function ensureHome() {
-  const dir = home();
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(dir, 0o700);
-  } catch {
-    /* 非 POSIX 系统忽略 */
-  }
-  return dir;
-}
-
-function serverInfoPath() {
-  return path.join(home(), 'server.json');
-}
-
-function defaultDbPath() {
-  return path.join(home(), 'workgremlin.db');
-}
+// WorkGremlin's own storage locations + logic-free file helpers come from shared/paths.js
+// (single source of truth). config.js keeps only the behavior: token / port / file permissions.
+const {
+  ensureHome,
+  serverInfoPath,
+  dbPath: defaultDbPath,
+  isPidAlive,
+  readServerInfo: readServerInfoFile,
+} = require('@workgremlin/shared/paths');
 
 /**
  * 演示工程的 id。
@@ -60,16 +49,6 @@ function isPortFree(port) {
     srv.once('listening', () => srv.close(() => resolve(true)));
     srv.listen(port, '127.0.0.1');
   });
-}
-
-function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -104,14 +83,8 @@ function writeServerInfo(info) {
 
 /** @returns {Record<string, any>|null} */
 function readServerInfo() {
-  const file = serverInfoPath();
-  if (!fs.existsSync(file)) return null;
-  try {
-    const info = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return isPidAlive(info.pid) ? info : null;
-  } catch {
-    return null;
-  }
+  // Server-side reader: a server.json left behind by a crashed run must not be treated as valid.
+  return readServerInfoFile({ requireAlive: true });
 }
 
 function clearServerInfo() {

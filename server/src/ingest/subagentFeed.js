@@ -32,7 +32,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const log = require('../log');
-const { AGENT_STATES, home } = require('@workgremlin/shared');
+const { AGENT_STATES } = require('@workgremlin/shared');
+const { subagentsPath } = require('@workgremlin/shared/paths');
 // 与 hook 共用同一份清单文件 <workspace>/.workgremlin/subagents.json：
 // 读改写要加锁 + 原子写，否则会和并发的 hook 进程互相覆盖（见 shared/fslock.js）。
 const { updateJson } = require('@workgremlin/shared/fslock');
@@ -88,7 +89,7 @@ const SUMMARY_PATH = 'workgremlin:summary';
 function feedFilePath(workspacePath) {
   const env = String(process.env.WORKGREMLIN_SUBAGENTS_FILE || '').trim();
   if (env) return path.resolve(env);
-  return path.join(home(), 'subagents.json');
+  return subagentsPath();
 }
 
 /**

@@ -32,7 +32,8 @@
 
 const fs = require('node:fs');
 const path = require('path');
-const { home } = require('@workgremlin/shared');
+// WorkGremlin's own storage locations (the state-file dir) come from shared/paths.js.
+const { hooksDir } = require('@workgremlin/shared/paths');
 // 通用落盘扫描基础设施（目录约定 + 容错文件读取），readJson / readDir 统一从 roots 取，不在各处重复定义
 const { readJson, readDir } = require('./roots');
 // 楼层模块注册表（floors.js）：会话标题按 client 派发到对应楼层模块时要用 registry 里的 sessionTitle
@@ -161,10 +162,6 @@ const INTERRUPT_PHASE_SLACK_MS = 1_000;
  * 仍走下面 rp.phase === 'await' 那条真值分支——那段逻辑保留不动。
  */
 
-function reporterHookHome() {
-  return home();
-}
-
 /**
  * 这条会话在用什么模型。
  * 各产品模型字段的取法不通用，所以一个产品一个适配器、都从**各自的落盘**里捞：
@@ -193,7 +190,7 @@ function readReporterPhase(workspacePath, client = '', session = '') {
   // 那条兜底会让主控制台显示同层**别的会话**的相位（"上面没选会话、下面却亮着某个相位"），
   // 正是把状态搞乱的地方。调用方要相位就必须点名 session。
   if (!session) return null;
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   let win = null;
   let winPending = null;
   let winPrompt = '';
@@ -333,7 +330,7 @@ function hasOtherLiveSession({ workspacePath = '', client = '', session = '', no
   // 没有会话标识就无从谈起"别的会话"（老 hook / 别的产品）→ 一律不拦
   if (!ws || !session) return false;
   const m = stateFileWs(ws);
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   for (const name of readDir(dir)) {
     const fileSession = stateFileSession(name, m, dir);
     if (fileSession === null || !fileSession || fileSession === session) continue;
@@ -414,7 +411,7 @@ function hasReporterState(workspacePath, client = '') {
   const ws = String(workspacePath || '').trim();
   if (!ws) return false;
   const m = stateFileWs(ws);
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   for (const name of readDir(dir)) {
     // 注意判 null 而不是判 falsy：老命名文件（不带会话）返回的是空串，那也是**本工程的**状态文件
     if (stateFileSession(name, m, dir) === null) continue;
@@ -439,7 +436,7 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
   const ws = String(workspacePath || '').trim();
   if (!ws) return { instrumented: false, sessionId: '' };
   const m = stateFileWs(ws);
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   let best = null;
   let bestTs = -1;
   for (const name of readDir(dir)) {
@@ -533,7 +530,7 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
 function readReporterActiveTask(workspacePath, client = '', session = '') {
   // 同理：活跃窗口也按**会话**判 —— 不点名会话就无从谈起"这条会话在不在跑"。
   if (!session) return false;
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   const now = Date.now();
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
@@ -602,7 +599,7 @@ function roundFilesOf(j) {
 }
 
 function readReporterDones(workspacePath, client = '') {
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   const now = Date.now();
   /** sessionId -> 该会话最新的一份 */
   const bySession = new Map();
@@ -819,7 +816,7 @@ function readReporterDone(workspacePath, client = '', session = '') {
  * @returns {Array<{sessionId: string, workspacePath: string, lastEventAt: number, endedAt: number}>}
  */
 function listReporterSessions(client = '', { includeEnded = false } = {}) {
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   const byId = new Map();
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
@@ -863,7 +860,7 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
  * @returns {string}
  */
 function freshestReporterWs(fallback, client = '', session = '') {
-  const dir = path.join(reporterHookHome(), 'hooks');
+  const dir = hooksDir();
   const now = Date.now();
   let best = '';
   let bestTs = 0;

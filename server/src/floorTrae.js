@@ -21,6 +21,8 @@ const path = require('node:path');
 const { isDir, dataRoots } = require('./roots');
 // 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
 const { genericAgentDirs } = require('./ingest/agentLevel');
+// WorkGremlin's own state-file dir comes from shared/paths.js (single source of truth).
+const { hooksDir } = require('@workgremlin/shared/paths');
 
 /**
  * 5F 的静态 subagent 定义目录。Trae 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
@@ -642,7 +644,7 @@ function flushTraeSubagents(now, backend) {
   if (!contribs.length) return;
 
   // sessionId → { projectId }，从 hook 状态文件反查（同 flushTraeDone / flushTraeYuan）
-  const hookDir = path.join(os.homedir(), '.workgremlin', 'hooks');
+  const hookDir = hooksDir();
   const sidProject = new Map();
   try {
     for (const f of fs.readdirSync(hookDir)) {
@@ -905,7 +907,7 @@ function flushTraeDone(now, backend) {
   if (!Object.keys(handlers).length) return;
 
   // sessionId → { projectId, workspacePath }，从 hook 状态文件反查（同 flushTraeYuan）
-  const hookDir = path.join(os.homedir(), '.workgremlin', 'hooks');
+  const hookDir = hooksDir();
   const sidProject = new Map();
   try {
     for (const f of fs.readdirSync(hookDir)) {
@@ -966,7 +968,7 @@ function flushTraeYuan(now, backend) {
   const usages = allTokenUsages();
   if (!usages.length) return;
 
-  const hookDir = path.join(os.homedir(), '.workgremlin', 'hooks');
+  const hookDir = hooksDir();
   const sidProject = new Map();
   try {
     for (const f of fs.readdirSync(hookDir)) {
@@ -1031,9 +1033,6 @@ function phaseSuperseded(j, sp, slack = 1_000) {
  * 同时覆盖 interruptedSince —— Trae 的取消信号在 renderer.log 里 (DoneHandler status:"canceled" /
  * stop_button / NotificationPort),不在 transcript 里,用 traeCancelAt 扫 renderer.log。 */
 const { runHookEvent, sharedHookImpl } = require('./ingest/hookCommon');
-const { home } = require('@workgremlin/shared');
-
-function _hooksDir() { return path.join(home(), 'hooks'); }
 
 /**
  * 从已有的 Trae hook 状态文件里补 sessionId。
@@ -1042,7 +1041,7 @@ function _hooksDir() { return path.join(home(), 'hooks'); }
  * @returns {string} sessionId (空串 = 找不到)
  */
 function _inferSessionIdFromStateFile(workspacePath) {
-  const dir = _hooksDir();
+  const dir = hooksDir();
   let names;
   try { names = fs.readdirSync(dir); } catch { return ''; }
 

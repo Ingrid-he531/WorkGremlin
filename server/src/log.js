@@ -25,6 +25,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { home } = require('@workgremlin/shared');
+// Storage locations come from shared/paths.js (single source of truth).
+const { logsDir, eventsLogPath } = require('@workgremlin/shared/paths');
 
 /** 级别序：数值越小越"重要"（默认阈值 info，只放行 ≤ info 的） */
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
@@ -42,10 +44,6 @@ function normalizeLevel(v) {
 let level = normalizeLevel(process.env.WORKGREMLIN_LOG || process.env.WORKGREMLIN_LOG_LEVEL);
 let fileEnabled = process.env.WORKGREMLIN_LOG_FILE !== '0';
 const keepDays = Math.max(1, Math.floor(Number(process.env.WORKGREMLIN_LOG_KEEP_DAYS)) || 7);
-
-function logsDir() {
-  return path.join(home(), 'logs');
-}
 
 /** 日期戳（UTC，与日志行的时间戳同一把尺子） */
 function dateStamp(d = new Date()) {
@@ -119,7 +117,7 @@ function pruneOldLogs() {
   }
 
   // ② reporter 的事件时间线：按行时间戳留最近 N 天
-  lines += trimLinesByAge(path.join(home(), 'hooks', 'events.log'), cutoff);
+  lines += trimLinesByAge(eventsLogPath(), cutoff);
 
   // ③ 已废弃的单文件日志（写入方早没了）：直接清
   for (const n of ['cb-cancel-debug.log', 'debug-taskstate.log', 'workgremlin.log', 'workgremlin.log.1']) {

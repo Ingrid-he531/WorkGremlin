@@ -20,7 +20,8 @@ const path = require('node:path');
 const { execSync } = require('node:child_process');
 const log = require('../log');
 const { updateJson } = require('@workgremlin/shared/fslock');
-const { fnv1a32, home, isPluginClient } = require('@workgremlin/shared');
+const { fnv1a32, isPluginClient } = require('@workgremlin/shared');
+const { hooksDir, statePath } = require('@workgremlin/shared/paths');
 const { feedFilePath } = require('./subagentFeed');
 const { isFile } = require('../roots');
 
@@ -805,22 +806,17 @@ function fixedFormOf(ev) {
  */
 
 /**
- * hook 事件的实时相位落盘点。
- * 重构把会话状态收口进 dispatcher 的内存 Map（见 hookDispatch.js），但 `/reporter-phase`、
- * `freshestReporterWs`/(listSessions 的 current/fresh) 仍按 `<floor>@<工程>@<会话>.json` 文件读。
- * plugin 路径（IDE 扩展直接 writeState）会写这份文件，hook 路径（CodeBuddy / Codex / WorkBuddy /
- * Trae / Qoder …）原本只在内存里 set —— 于是这些楼层的实时相位永远读不到，主控制台相位卡死。
- * 这里每次 set 时把同一份状态同步写盘，与 plugin 路径口径一致。
+ * The real-time phase write point for hook events.
+ *
+ * The refactor moved session state into the dispatcher's in-memory Map (see hookDispatch.js),
+ * but `/reporter-phase` and `freshestReporterWs` / listSessions(current/fresh) still read the
+ * `<floor>@<workspace>@<session>.json` file. The plugin path (IDE extensions writing directly)
+ * writes that file; the hook path (CodeBuddy / Codex / WorkBuddy / Trae / Qoder …) used to only
+ * `set` in memory — so those floors' real-time phase was never readable and the main console's
+ * phase hung. Every `set` now syncs the same state to disk, matching the plugin path.
+ *
+ * The location and naming come from shared/paths.js (single source of truth).
  */
-function reporterHooksDir() {
-  return path.join(home(), 'hooks');
-}
-function reporterStatePath(floor, workspacePath, sessionId) {
-  const parts = [String(floor), String(workspacePath || '')];
-  if (sessionId) parts.push(String(sessionId));
-  const key = parts.join('@').replace(/[^a-zA-Z0-9._-]/g, '_');
-  return path.join(reporterHooksDir(), `${key}.json`);
-}
 
 /**
  * 公有默认 hook 行为：楼层模块没自己提供的接口就回退到这份（见各 floorXXX.js 的 handleHookEvent）。
@@ -893,9 +889,9 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const effWs = get().taskWorkspacePath || workspacePath;
     if (!client || !sessionId) return;
     try {
-      fs.mkdirSync(reporterHooksDir(), { recursive: true });
+      fs.mkdirSync(hooksDir(), { recursive: true });
       updateJson(
-        reporterStatePath(client, effWs, sessionId),
+        statePath(client, effWs, sessionId),
         (prev) => {
           const next = {
             ...(prev || {}),
@@ -919,7 +915,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     // 保留了 taskId —— 同步读盘把 taskId 回灌进内存，否则接下来 bus.toolUse 因 get().taskId
     // 为空而整段跳过 → 任务详情「各工具调用次数」全空。
     try {
-      const onDisk = JSON.parse(fs.readFileSync(reporterStatePath(client, effWs, sessionId), 'utf8') || '{}');
+      const onDisk = JSON.parse(fs.readFileSync(statePath(client, effWs, sessionId), 'utf8') || '{}');
       if (onDisk && onDisk.taskId && !get().taskId) {
         sessionSet(sessionId, {
           taskId: onDisk.taskId,

@@ -24,6 +24,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { WS_EVENTS } = require('@workgremlin/shared');
+const { workspacesPath } = require('@workgremlin/shared/paths');
 const { feedFilePath } = require('./ingest/subagentFeed');
 const config = require('./config');
 
@@ -68,7 +69,7 @@ function resolveProjectName(workspacePath) {
 /* ============================ 工程管理 ============================ */
 
 function storePath() {
-  return path.join(config.home(), 'workspaces.json');
+  return workspacesPath();
 }
 
 function readStore() {
