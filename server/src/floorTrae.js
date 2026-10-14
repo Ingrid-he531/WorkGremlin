@@ -20,7 +20,7 @@ const path = require('node:path');
 // Trae 家族的 globalStorage / logs 根目录：本楼层私有，放在本文件（不再污染 floors.js）。
 const { isDir, dataRoots } = require('./roots');
 // 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
-const { genericAgentDirs } = require('./ingest/agentLevel');
+const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 // WorkGremlin's own state-file dir comes from shared/paths.js (single source of truth).
 const { hooksDir } = require('@workgremlin/shared/paths');
 
@@ -1106,8 +1106,10 @@ module.exports = {
   traeDoneStatus,
   // token 金额（原 traeTokens.js）
   allTokenUsages,
-  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  // Static subagent dirs (project / user level): read by this floor's own syncAgents
   agentDirs,
+  // Register this floor's user / project subagents with the roster (see agentLevel.makeAgentSync)
+  syncAgents: makeAgentSync(agentDirs, meta.agent),
   traeTokenOf,
   // 子代理贡献补录（IdeSubagentContribution → subagent_runs）
   allSubagentContribs,

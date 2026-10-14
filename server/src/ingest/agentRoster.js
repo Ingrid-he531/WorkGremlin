@@ -1,194 +1,180 @@
 'use strict';
 
 /**
- * 常驻小怪物名册：把"已定义的 subagent"（项目级 + 用户级）注册成坐工位的小怪物。
+ * Sitting-gremlin roster: registers the "defined subagents" (project-level + user-level) as members
+ * with workstations.
  *
- * 设计（见办公室可视化规范）：
- *   · 工位上的小怪物 = 用户级 / 项目级 subagent（写在 <workspace>/<点目录>/agents
- *     或 ~/.xxx/agents 里的定义文件）。它们常驻、脖子上带工牌（级别牌由各楼层 agentDirs
- *     声明目录、agentLevel 引擎按名字判定），即使当下没被召唤也在。
- *   · 已定义清单由 floors.listStaticSubagents 跨所有楼层聚合得到（见 floors.js）。
- *   · 召唤时由 subagentFeed 另外生成"头顶小幽灵"（ephemeral）代表本次运行，
- *     本模块只负责"小怪物"本身（role=subagent, ephemeral=false）。
+ * Ownership lives in the floors: each floor scans its OWN agent dirs (its `syncAgents`, built from
+ * `agentDirs` — see agentLevel.makeAgentSync) and calls `registerAgent` / `unregisterAgent` here.
+ * This module is the upper-layer registration API plus the in-memory bookkeeping (ownership, the
+ * "defined" set, the "summoned" set). It owns **no timer** — the server's unified poller drives the
+ * floors (see poller.js).
  *
- * 与 subagentFeed 的分工：
- *   · 本模块：确保每个已定义 subagent 有一个坐工位、带工牌的小怪物；
- *   · subagentFeed：处理"正在跑"的实例，生成/回收 ephemeral 小幽灵
- *     （含插件专家、主 agent 临时组队生成的实例，这些不对应小怪物）。
- *   两者 memberId 不同（小怪物用裸名，幽灵用 subagent-<name>），互不冲突。
+ * Split with subagentFeed:
+ *   · this module ensures every defined subagent has a sitting, badged gremlin;
+ *   · subagentFeed handles the running instances (ephemeral ghosts).
+ *   memberIds differ (a gremlin uses the bare name, a ghost uses `subagent-<name>`), so they never clash.
  */
 
-const log = require('../log');
-const { listStaticSubagents } = require('../floors');
 const config = require('../config');
 
 /**
- * @param {{bus:any, project?:string, getProject?:()=>string, getWorkspacePath?:()=>string, intervalMs?:number}} opts
+ * @param {{bus:any, project?:string, getProject?:()=>string, getWorkspacePath?:()=>string}} opts
  */
 function createAgentRoster(opts) {
   const bus = opts.bus;
   /**
-   * 小怪物注册到哪个工程：**跟随"当前打开的工程"**。
-   * 传 getProject() 让它每次现取当前工程 —— 否则名册会固定写死进一个工程
-   * （老代码写死演示工程 id，只因演示工程恰好和真实工程同名才"蒙对"），
-   * 一旦演示数据隔离 / 换工程，小怪物就跟不过去。
+   * Which project the gremlins register under: **follows the currently open project**. Pass
+   * `getProject()` so it is read fresh each time — otherwise the roster pins to one project (the old
+   * code hardcoded the demo project id, which only "worked" because the demo happened to share the
+   * real project's name) and gremlins won't follow a project switch.
    */
   const getProject = typeof opts.getProject === 'function' ? opts.getProject : () => opts.project || config.DEMO_PROJECT;
-  const getWorkspacePath = opts.getWorkspacePath || (() => '');
-  const intervalMs = Number(opts.intervalMs) || 15_000;
+  const getWorkspacePath = typeof opts.getWorkspacePath === 'function' ? opts.getWorkspacePath : () => '';
 
-  let running = false;
-  let timer = null;
-  let lastSig = '';
-  const defined = new Set();
-  /** project -> 本名册在该 project 上注册过的名字（换工程时各自记账，互不干扰） */
+  /** project -> Set(name) this roster registered there */
   const registered = new Map();
+  /** project -> Map(name -> floor id that claimed it); the first floor to claim a duplicate name wins */
+  const owners = new Map();
+  /** project -> Map(name -> last summoned timestamp): drives "don't heartbeat over busy" + the TTL */
+  const active = new Map();
+
   /**
-   * 正在被召唤（活跃）的小怪物 name -> 最近一次被标活跃的时刻。这些由 subagentFeed
-   * 负责把工位状态设为忙碌，roster 心跳不要把它覆盖回 online。召唤结束（markIdle）即复位。
-   *
-   * 带时刻是为了**超时兜底**：markIdle 是唯一复位入口，而它只在 subagentFeed 里被调用，
-   * 一旦幽灵因别的原因消失（换工程导致 feed 被 stop、名册摘掉成员、hook 没送到结束信号），
-   * 这个名字就永远不再被心跳 —— 它会一直挂着"忙碌"，60s 后变 busy + degraded。
+   * Summoned bookkeeping expires on its own: markIdle is the only reset entry point and it is only
+   * called by subagentFeed, so a ghost that disappears for another reason would otherwise leave the
+   * name stuck "busy" (and un-heartbeated) forever.
    */
   const ACTIVE_TTL_MS = 10 * 60_000;
-  const activeNames = new Map();
 
-  
-  function sync() {
-    if (!running) return;
-    const project = getProject();
-    const ws = getWorkspacePath();
-    const list = listStaticSubagents(ws);
-    const sig = `${project}|${list
-      .map((a) => a.name)
-      .sort()
-      .join(',')}`;
-
-    // 这条 project 上"本名册注册过"的名字；换工程（project 变）时 sig 会变，会重新在这条 project 上注册。
+  function state(project) {
     let mine = registered.get(project);
     if (!mine) {
       mine = new Set();
       registered.set(project, mine);
     }
-
-    // 名册集合（或当前 project）变化时才动注册（补新增的、摘掉不再定义的）
-    if (sig !== lastSig) {
-      lastSig = sig;
-      // 换工程 / 名册变了：上一轮的"召唤中"记账作废（feed 也会跟着重启），
-      // 否则旧工程留下的 activeNames 会让新工程里同名的小怪物一直不心跳。
-      activeNames.clear();
-      defined.clear();
-      const keep = new Set();
-      for (const { name, client, level } of list) {
-        defined.add(name);
-        keep.add(name);
-        if (!mine.has(name)) {
-          bus.registerMember({
-            project,
-            memberId: name,
-            name,
-            // 项目级 / 用户级 subagent 用不同的 role 码，前端映射成「项目子代理」/「用户子代理」
-            role: level === 'project' ? 'subagent:project' : 'subagent:user',
-            sessionId: null,
-            ephemeral: false,
-            projectLabel: '',
-            workspacePath: ws,
-            client,
-          });
-          mine.add(name);
-        }
-      }
-      // 不再定义的：只从**当前这条 project** 上摘掉，别的工程的 project 不动
-      for (const name of [...mine]) {
-        if (!keep.has(name)) {
-          try {
-            bus.removeMember({ project, memberId: name });
-          } catch {
-            /* ignore */
-          }
-          mine.delete(name);
-          activeNames.delete(name); // 成员都摘了，别再拿"召唤中"压着它的心跳
-        }
-      }
+    let own = owners.get(project);
+    if (!own) {
+      own = new Map();
+      owners.set(project, own);
     }
-
-    // 召唤中的记账超时兜底：见 ACTIVE_TTL_MS 的说明 ——
-    // 幽灵没了却没走 markIdle 时，别让这个名字永久"忙碌 + 不心跳"。
-    for (const [name, at] of [...activeNames]) {
-      if (Date.now() - Number(at || 0) > ACTIVE_TTL_MS) activeNames.delete(name);
+    let act = active.get(project);
+    if (!act) {
+      act = new Map();
+      active.set(project, act);
     }
+    return { mine, own, act };
+  }
 
-    // 心跳：保持在线、避免被 sweepDegraded 判灰。
-    // 正在被召唤（activeNames）的小怪物由 subagentFeed 把工位状态设为忙碌，
-    // 这里跳过，不把它覆盖回 online。
-    for (const name of mine) {
-      // 老库的成员行没有 client，顺手补上（只在缺失/不一致时写）
-      const meta = list.find((x) => x.name === name);
-      if (meta) bus.tagMemberClient(project, name, meta.client);
-      if (activeNames.has(name)) continue;
-      try {
-        bus.heartbeat({ project, memberId: name, state: 'online', progress: null, files: [] });
-      } catch {
-        /* ignore */
-      }
+  function sweep(act, nowTs) {
+    for (const [name, at] of [...act]) {
+      if (nowTs - Number(at || 0) > ACTIVE_TTL_MS) act.delete(name);
     }
   }
 
-  /** 小怪物被召唤：登记活跃，roster 心跳不再覆盖其工位状态（忙碌由 subagentFeed 下发） */
-  function markActive(name) {
-    activeNames.set(String(name || '').trim(), Date.now());
-  }
-
-  /** 召唤结束：立即把小怪物工位复位为在线，并从活跃名单移除 */
-  function markIdle(name) {
-    name = String(name || '').trim();
-    if (!activeNames.delete(name)) return;
+  /** Keep the gremlin online; skip while it is summoned (subagentFeed owns the workstation state then). */
+  function heartbeat(project, name, act) {
+    if (act.has(name)) return;
     try {
-      bus.heartbeat({ project: getProject(), memberId: name, state: 'online', progress: null, files: [] });
+      bus.heartbeat({ project, memberId: name, state: 'online', progress: null, files: [] });
     } catch {
       /* ignore */
     }
   }
 
-  function start() {
-    if (running) return;
-    running = true;
-    sync();
-    timer = setInterval(safeSync, intervalMs);
-    if (timer.unref) timer.unref();
+  /**
+   * A floor found this subagent defined: register it under the current project (the first floor to
+   * claim a duplicate name wins), then heartbeat it.
+   * @param {{meta?: {id?: string, agent?: string}}} floor
+   * @param {{name: string, level: 'project'|'user', client?: string}} a
+   */
+  function registerAgent(floor, a) {
+    const project = getProject();
+    const ws = getWorkspacePath();
+    const name = String((a && a.name) || '').trim();
+    if (!name) return;
+    const floorId = (floor && floor.meta && floor.meta.id) || '';
+    const client = (a && a.client) || (floor && floor.meta && floor.meta.agent) || '';
+    const { mine, own, act } = state(project);
+    sweep(act, Date.now());
+    if (mine.has(name)) {
+      // Already registered (by some floor). Keep the first owner's client/level; just keep it online.
+      heartbeat(project, name, act);
+      return;
+    }
+    mine.add(name);
+    own.set(name, floorId);
+    bus.registerMember({
+      project,
+      memberId: name,
+      name,
+      role: a.level === 'project' ? 'subagent:project' : 'subagent:user',
+      sessionId: null,
+      ephemeral: false,
+      projectLabel: '',
+      workspacePath: ws,
+      client,
+      // The floor already knows the level; pass it so bus does not re-scan the disk by name.
+      level: a.level,
+    });
+    heartbeat(project, name, act);
   }
 
-  function safeSync() {
+  /**
+   * A floor no longer finds this subagent: remove it (only if that floor is the one that claimed it).
+   * @param {{meta?: {id?: string}}} floor
+   * @param {string} name
+   */
+  function unregisterAgent(floor, name) {
+    name = String(name || '').trim();
+    if (!name) return;
+    const project = getProject();
+    const floorId = (floor && floor.meta && floor.meta.id) || '';
+    const { mine, own, act } = state(project);
+    if (!mine.has(name)) return;
+    if (floorId && own.get(name) !== floorId) return; // a different floor owns this name
     try {
-      sync();
-    } catch (err) {
-      log.warn('[workgremlin] 小怪物名册同步失败：', err && err.message);
+      bus.removeMember({ project, memberId: name });
+    } catch {
+      /* ignore */
+    }
+    mine.delete(name);
+    own.delete(name);
+    act.delete(name);
+  }
+
+  /** Summoned: the roster stops heartbeating this workstation (subagentFeed sets it busy). */
+  function markActive(name) {
+    const { act } = state(getProject());
+    act.set(String(name || '').trim(), Date.now());
+  }
+
+  /** Summon finished: reset the workstation to online and stop tracking the name as active. */
+  function markIdle(name) {
+    name = String(name || '').trim();
+    const project = getProject();
+    const { act } = state(project);
+    if (!act.delete(name)) return;
+    try {
+      bus.heartbeat({ project, memberId: name, state: 'online', progress: null, files: [] });
+    } catch {
+      /* ignore */
     }
   }
 
-  function stop() {
-    running = false;
-    if (timer) clearInterval(timer);
-    timer = null;
-  }
-
   function isDefined(name) {
-    return defined.has(String(name || '').trim());
+    const mine = registered.get(getProject());
+    return Boolean(mine && mine.has(String(name || '').trim()));
   }
 
   return {
-    start,
-    stop,
-    sync,
-    isDefined,
+    registerAgent,
+    unregisterAgent,
     markActive,
     markIdle,
-    get running() {
-      return running;
-    },
+    isDefined,
     get defined() {
-      return [...defined];
+      const mine = registered.get(getProject());
+      return mine ? [...mine] : [];
     },
   };
 }

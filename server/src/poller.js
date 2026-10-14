@@ -4,22 +4,24 @@
  * Unified poller — the server's only periodic clock.
  *
  * Floor modules hold **no process / thread / timer**; they only export functions. This loop walks the
- * floor registry and owns all three periodic duties, each throttled on its own cadence:
+ * floor registry and owns all periodic duties, each throttled on its own cadence:
  *   · session scan (2s)      — registrySnapshot(force): the full session table + phase, broadcast only on change;
  *   · floor task sync        — per floor `pollMs` (default 5s); floors opt in by exporting `syncTasks(ctx)`
  *                              (6F Qoder plugin / 7F Kilo / 8F OpenCode / 9F Copilot);
+ *   · floor agent sync       — per floor `agentsPollMs` (default 15s); floors opt in by exporting
+ *                              `syncAgents(ctx)`; the floor scans its OWN agent dirs and registers the
+ *                              changes through the upper layer's register / unregister callbacks;
  *   · degraded sweep (10s)   — bus.sweepDegraded(): drop stale heartbeats.
  *
- * Everything floor-specific (shell schemas, "yield to the plugin" rules, phase inference) stays inside
- * the floor functions — this file contains no floor knowledge, and the server owns the single clock so
- * there is exactly one place that decides cadence, ordering and shutdown.
- *
- * Hook reporting is unaffected: it is a push path (POST /api/v1/hook etc.), not a poll.
+ * Everything floor-specific (store schemas, "yield to the plugin" rules, phase inference, which dirs
+ * hold agents) stays inside the floor functions — this file contains no floor knowledge, and the
+ * server owns the single clock so there is exactly one place that decides cadence, ordering and
+ * shutdown. Hook reporting is unaffected: it is a push path (POST /api/v1/hook etc.), not a poll.
  */
 
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { snapshot: registrySnapshot } = require('./sessionRegistry');
-const { taskSyncerFloors } = require('./floors');
+const { taskSyncerFloors, agentSyncerFloors } = require('./floors');
 
 /** Base tick. Duty cadences below are throttled against `now`, so this only bounds latency. */
 const TICK_MS = 1_000;
@@ -27,16 +29,22 @@ const SESSION_SCAN_MS = 2_000;
 const SWEEP_DEGRADED_MS = 10_000;
 /** Default task-sync cadence when a floor does not declare `pollMs`. */
 const DEFAULT_POLL_MS = 5_000;
+/** Default agent-sync cadence when the caller does not declare `agents.pollMs`. */
+const DEFAULT_AGENT_POLL_MS = 15_000;
 
 /**
  * @param {{
  *   bus: object,
  *   repo: object,
- *   getWorkspace: () => { workspacePath?: string },
+ *   getWorkspace: () => { workspacePath?: string, project?: string, projectName?: string },
  *   broadcast?: (project: string|null, type: string, payload: any) => void,
  *   now?: () => number,
  *   getFloors?: () => Array<object>,
+ *   getAgentFloors?: () => Array<object>,
  *   snapshot?: (opts: { workspacePath: string, force: boolean }) => object,
+ *   agents?: { registerAgent: (floor: object, a: object) => void,
+ *              unregisterAgent: (floor: object, name: string) => void,
+ *              pollMs?: number } | null,
  * }} deps
  */
 function createPoller({
@@ -46,9 +54,12 @@ function createPoller({
   broadcast,
   now = () => Date.now(),
   getFloors = taskSyncerFloors,
+  getAgentFloors = agentSyncerFloors,
   snapshot = registrySnapshot,
+  agents = null,
 }) {
   const lastTaskAt = new Map();
+  const lastAgentsAt = new Map();
   let lastSessionAt = 0;
   let lastSweepAt = 0;
   let lastSessionSig = '';
@@ -84,6 +95,39 @@ function createPoller({
     }
   }
 
+  /**
+   * Let every floor scan its own agent dirs and register the changes through the upper layer. The floor
+   * gets the current project (id + display name) and workspace path, and the register / unregister
+   * callbacks; the server keeps no per-product agent knowledge.
+   */
+  function syncFloorAgents(at) {
+    const cur = (getWorkspace && getWorkspace()) || {};
+    const ms = Number(agents.pollMs) > 0 ? Number(agents.pollMs) : DEFAULT_AGENT_POLL_MS;
+    for (const f of getAgentFloors()) {
+      const id = f.meta ? f.meta.id : f;
+      if (at - (lastAgentsAt.get(id) || 0) < ms) continue;
+      lastAgentsAt.set(id, at);
+      try {
+        f.syncAgents({
+          project: cur.project,
+          projectName: cur.projectName,
+          workspacePath: cur.workspacePath,
+          registerAgent: (a) => agents.registerAgent(f, a),
+          unregisterAgent: (name) => agents.unregisterAgent(f, name),
+        });
+      } catch {
+        /* One floor's dir scan failing must not stall the others. */
+      }
+    }
+  }
+
+  /** Run the agent sync now, ignoring the cadence (e.g. right after a workspace switch). */
+  function syncAgentsNow() {
+    if (!agents) return;
+    lastAgentsAt.clear();
+    syncFloorAgents(now());
+  }
+
   function tick() {
     const at = now();
     if (at - lastSessionAt >= SESSION_SCAN_MS) {
@@ -95,6 +139,7 @@ function createPoller({
       }
     }
     syncFloorTasks(at);
+    if (agents) syncFloorAgents(at);
     if (at - lastSweepAt >= SWEEP_DEGRADED_MS) {
       lastSweepAt = at;
       try {
@@ -118,7 +163,7 @@ function createPoller({
     timer = null;
   }
 
-  return { start, stop, tick };
+  return { start, stop, tick, syncAgentsNow };
 }
 
-module.exports = { createPoller, TICK_MS, SESSION_SCAN_MS, SWEEP_DEGRADED_MS, DEFAULT_POLL_MS };
+module.exports = { createPoller, TICK_MS, SESSION_SCAN_MS, SWEEP_DEGRADED_MS, DEFAULT_POLL_MS, DEFAULT_AGENT_POLL_MS };

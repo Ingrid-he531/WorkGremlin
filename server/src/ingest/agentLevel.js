@@ -183,6 +183,50 @@ function genericAgentDirs(homeDirs, workspacePath) {
   return out;
 }
 
+/**
+ * List the agents defined in a set of candidate dirs (project dirs first — the caller's `agentDirs`
+ * already orders them that way). Cross-dir duplicates keep the first hit (project beats user).
+ * @param {Array<{dir: string, level: 'project'|'user'}>} dirs
+ * @returns {Array<{name: string, level: 'project'|'user'}>}
+ */
+function listAgentsInDirs(dirs) {
+  const seen = new Map();
+  for (const { dir, level } of dirs || []) {
+    for (const n of listAgentFiles(dir)) {
+      if (!seen.has(n)) seen.set(n, { name: n, level });
+    }
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Build a floor's `syncAgents(ctx)` from its own `agentDirs(workspacePath)` + client.
+ *
+ * The floor owns its scan: this closes over the floor's dirs, diffs the current set against what the
+ * floor registered last time **for that project**, and calls the upper layer's `registerAgent` /
+ * `unregisterAgent` for the changes. So the server walks the floor registry and the floor decides
+ * what "its own user-level / project-level agents" are — no product knowledge in the central code.
+ *
+ * @param {(workspacePath?: string) => Array<{dir: string, level: 'project'|'user'}>} agentDirs
+ * @param {string} client floor base name (kilo / codebuddy / …)
+ * @returns {(ctx: { project: string, projectName?: string, workspacePath?: string,
+ *                   registerAgent: (a: {name:string, level:string, client:string}) => void,
+ *                   unregisterAgent: (name: string) => void }) => void}
+ */
+function makeAgentSync(agentDirs, client) {
+  const lastByProject = new Map(); // project -> Set(agent name)
+  return function syncAgents(ctx) {
+    const { project, workspacePath, registerAgent, unregisterAgent } = ctx || {};
+    if (typeof registerAgent !== 'function' || typeof unregisterAgent !== 'function') return;
+    const list = listAgentsInDirs(typeof agentDirs === 'function' ? agentDirs(workspacePath) : []);
+    const nowNames = new Set(list.map((a) => a.name));
+    const prev = lastByProject.get(project) || new Set();
+    for (const a of list) registerAgent({ name: a.name, level: a.level, client });
+    for (const n of prev) if (!nowNames.has(n)) unregisterAgent(n);
+    lastByProject.set(project, nowNames);
+  };
+}
+
 function clearCache() {
   levelCache.clear();
   descCache.clear();
@@ -197,5 +241,7 @@ module.exports = {
   detectLevelInDirs,
   descriptionInDirs,
   genericAgentDirs,
+  listAgentsInDirs,
+  makeAgentSync,
   clearCache,
 };

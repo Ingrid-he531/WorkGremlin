@@ -9,7 +9,7 @@
  * Run: `npm run test:poller`
  */
 const { createPoller, DEFAULT_POLL_MS } = require('../src/poller');
-const { floors, taskSyncerFloors } = require('../src/floors');
+const { floors, taskSyncerFloors, agentSyncerFloors } = require('../src/floors');
 
 let pass = 0;
 let fail = 0;
@@ -93,6 +93,63 @@ head('[3] 没声明 pollMs 的楼层按缺省 5000 节流');
   });
   for (let i = 0; i <= 5; i += 1) { t = 2_000_000 + i * 1000; poller.tick(); }
   ok(`缺省 cadence = ${DEFAULT_POLL_MS}ms → 0/5000 两次`, n === 2, String(n));
+}
+
+head('[4] 楼层自己扫 agent，经上层注册；当前工程名随 ctx 传入；按 agents 节奏节流');
+{
+  const ctxs = [];
+  const registered = [];
+  const removed = [];
+  const floorA = {
+    meta: { id: '1F', agent: 'codebuddy' },
+    syncAgents: (ctx) => {
+      ctxs.push(ctx);
+      ctx.registerAgent({ name: 'leo', level: 'project', client: 'codebuddy' });
+      ctx.registerAgent({ name: 'architect', level: 'user', client: 'codebuddy' });
+      if (ctxs.length > 1) ctx.unregisterAgent('gone');
+    },
+  };
+  let t = 3_000_000;
+  const poller = createPoller({
+    bus: { sweepDegraded() {} },
+    repo: {},
+    getWorkspace: () => ({ workspacePath: '/ws', project: 'p1', projectName: 'Demo Project' }),
+    now: () => t,
+    getFloors: () => [],
+    getAgentFloors: () => [floorA],
+    snapshot: () => ({ defaultFloor: '1F', floors: [], sessions: [] }),
+    agents: {
+      pollMs: 15_000,
+      registerAgent: (floor, a) => registered.push([floor.meta.id, a.name, a.level]),
+      unregisterAgent: (floor, name) => removed.push([floor.meta.id, name]),
+    },
+  });
+
+  poller.tick();
+  ok('第一次 tick 就扫了（floor 注册了两个 agent）', registered.length === 2, JSON.stringify(registered));
+  ok('上层收到的是 { name, level, client }（level 由楼层判定）', registered[0][1] === 'leo' && registered[0][2] === 'project');
+  ok('ctx 带上了当前工程 id + 显示名 + 工作区', ctxs[0].project === 'p1' && ctxs[0].projectName === 'Demo Project' && ctxs[0].workspacePath === '/ws');
+
+  t += 5_000;
+  poller.tick();
+  ok('未到 15s 不再扫（仍只扫过一次）', ctxs.length === 1, String(ctxs.length));
+
+  t += 10_000; // cum 15s
+  poller.tick();
+  ok('到 15s 又扫一次', ctxs.length === 2, String(ctxs.length));
+  ok('楼层发现消失的 agent → 调上层 unregister', removed.length === 1 && removed[0][1] === 'gone', JSON.stringify(removed));
+
+  poller.syncAgentsNow();
+  ok('syncAgentsNow() 忽略节流，立刻再扫一次（换工程用）', ctxs.length === 3, String(ctxs.length));
+}
+
+head('[5] 楼层注册表：agentSyncerFloors 是"导出了 syncAgents"的楼层');
+{
+  const list = agentSyncerFloors();
+  const ids = list.map((f) => f.meta.id).sort();
+  ok('有 agent 目录的楼层都参与（1F~6F/8F；7F/9F 目录为空不参与）',
+    JSON.stringify(ids) === JSON.stringify(['1F', '2F', '3F', '4F', '5F', '6F', '8F']), JSON.stringify(ids));
+  ok('每层都有 syncAgents 函数', list.every((f) => typeof f.syncAgents === 'function'));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

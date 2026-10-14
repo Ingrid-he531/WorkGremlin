@@ -19,7 +19,7 @@ const { dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
 // 工程名解析（genie-history 目录名 → 工程名）收口在 project.js
 const { resolveProjectName } = require('./project');
 // 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
-const { genericAgentDirs } = require('./ingest/agentLevel');
+const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 /**
  * 1F 的静态 subagent 定义目录：项目级 <ws>/.codebuddy/agents、用户级 ~/.codebuddy/agents。
@@ -784,8 +784,10 @@ module.exports = {
   synthMarks,
   // 服务端 hook 事件处理（落盘解析归服务端）
   handleHookEvent,
-  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  // Static subagent dirs (project / user level): read by this floor's own syncAgents
   agentDirs,
+  // Register this floor's user / project subagents with the roster (see agentLevel.makeAgentSync)
+  syncAgents: makeAgentSync(agentDirs, meta.agent),
 };
 
 /**

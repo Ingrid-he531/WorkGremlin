@@ -58,9 +58,12 @@ const {
   extraDirs,
 } = require('./roots');
 
-// 静态 subagent 发现引擎（产品无关，只按"给定目录"找定义文件 / 读描述 / 判级别）。
-// 各楼层自己的目录知识在 floor<X>.js 的 agentDirs 里；本文件只做聚合 + 按 client 派发。
-const { detectLevelInDirs, descriptionInDirs, listAgentFiles } = require('./ingest/agentLevel');
+// Static subagent discovery engine (product-agnostic: it only finds files / reads descriptions /
+// decides levels for a given set of dirs). Each floor's own dir knowledge lives in its `agentDirs`;
+// each floor scans those dirs itself via agentLevel.makeAgentSync and registers through the upper
+// layer (see poller.js) — this file only dispatches lookups by client (detectLevel / agentDescription)
+// and no longer aggregates across floors.
+const { detectLevelInDirs, descriptionInDirs } = require('./ingest/agentLevel');
 
 const HOME = os.homedir();
 
@@ -392,25 +395,16 @@ function agentDescription(name, workspacePath, client) {
 }
 
 /**
- * 汇总所有楼层"已定义的静态 subagent"（项目级优先于用户级，跨楼层重名去重）。
- * 返回 [{ name, level, client }]，供 agentRoster 注册成坐工位、带工牌的小怪物。
- * @param {string} workspacePath 当前工程路径（项目级 agent 在这里找）
- * @returns {Array<{name:string, level:'project'|'user', client:string}>}
+ * Floors that sync their own user / project subagents into the roster.
+ *
+ * A floor opts in by exporting `syncAgents(ctx)` (built with agentLevel.makeAgentSync from its own
+ * `agentDirs`): it scans its own dirs, diffs against what it registered last time for the current
+ * project, and calls the upper layer's register / unregister callbacks. The server's unified poller
+ * drives them (see poller.js) — floors hold no timers.
+ * @returns {Array<object>} floor modules that participate in agent sync
  */
-function listStaticSubagents(workspacePath) {
-  const ws = String(workspacePath || '').trim();
-  const seen = new Map(); // name -> { name, level, client }
-  for (const f of Object.values(floors)) {
-    if (typeof f.agentDirs !== 'function') continue;
-    const client = (f.meta && f.meta.agent) || '';
-    // 楼层内 project 目录先于 user 目录（agentDirs 已按此顺序返回），先见者胜出
-    for (const { dir, level } of f.agentDirs(ws)) {
-      for (const n of listAgentFiles(dir)) {
-        if (!seen.has(n)) seen.set(n, { name: n, level, client });
-      }
-    }
-  }
-  return [...seen.values()];
+function agentSyncerFloors() {
+  return Object.values(floors).filter((f) => typeof f.syncAgents === 'function');
 }
 
 /* ============================================================== 导出 */
@@ -421,6 +415,6 @@ module.exports.floorOf = floorOf;
 module.exports.floorByAgent = floorByAgent;
 module.exports.detectProducts = detectProducts;
 module.exports.taskSyncerFloors = taskSyncerFloors;
+module.exports.agentSyncerFloors = agentSyncerFloors;
 module.exports.detectLevel = detectLevel;
 module.exports.agentDescription = agentDescription;
-module.exports.listStaticSubagents = listStaticSubagents;

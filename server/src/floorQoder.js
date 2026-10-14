@@ -28,7 +28,7 @@ const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
 const { isFile } = require('./roots');
 // 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
-const { genericAgentDirs } = require('./ingest/agentLevel');
+const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 /**
  * 6F 的静态 subagent 定义目录。Qoder 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
@@ -767,8 +767,10 @@ module.exports = {
   readLingmaDone,
   hasCoreTables,
   resetLingmaCache,
-  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  // Static subagent dirs (project / user level): read by this floor's own syncAgents
   agentDirs,
+  // Register this floor's user / project subagents with the roster (see agentLevel.makeAgentSync)
+  syncAgents: makeAgentSync(agentDirs, meta.agent),
   LIVE_MS,
   TTL,
   SESSION_LIMIT,

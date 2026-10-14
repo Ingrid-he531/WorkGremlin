@@ -277,8 +277,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // 来源客户端（演示/手工数据没有，就是 NULL）
       client: normClient(p.client),
     });
-    // subagent 级别（用户级 / 项目级）：按名字扫 agent 目录判定，记进内存 map
-    const lvl = detectLevel(p.name || p.memberId || '', p.workspacePath || '', p.client);
+    // subagent level (user / project): the caller may pass it (floors detect their own agents);
+    // otherwise scan the agent dirs by name. Stored in the in-memory map.
+    const lvl = p.level || detectLevel(p.name || p.memberId || '', p.workspacePath || '', p.client);
     if (lvl) levels.set(id, lvl);
     else levels.delete(id);
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(id));

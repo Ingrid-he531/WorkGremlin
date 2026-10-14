@@ -80,6 +80,7 @@
     "test:task-runs-route": "node server/test/taskRunsRoute.test.js",
     "test:task-sync": "node server/test/taskSync.test.js",
     "test:poller": "node server/test/poller.test.js",
+    "test:agent-roster": "node server/test/agentRoster.test.js",
     "test:superseded-sweep": "node server/test/supersededSweep.test.js",
     "test:council-consensus": "node server/test/councilConsensus.test.js",
     "test:council-store": "node server/test/councilStore.test.js",

@@ -256,17 +256,6 @@ function createServer(opts = {}) {
 
     timers.push(startCheckpointLoop());
 
-    /* The one clock: session scan + per-floor task-ledger sync (per `pollMs`) + heartbeat sweep all
-       live in this single unified poller, so floor modules hold no timers (see poller.js). */
-    const poller = createPoller({
-      bus,
-      repo,
-      getWorkspace: () => workspace.current(),
-      broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
-      now: () => clock.now(),
-    });
-    timers.push(poller.start());
-
     // 记录自动保留：启动即清一次，之后每 24h 按 retentionDays 清掉更早的任务记录。
     // 定时器 unref 不阻止进程退出；清理失败不影响主流程。
     const runRetentionCleanup = () => {
@@ -324,18 +313,35 @@ function createServer(opts = {}) {
       getWorkspacePath: () => workspace.current().workspacePath,
     });
 
+    /* The one clock: session scan + per-floor task-ledger sync + per-floor agent sync + heartbeat
+       sweep all live in this single unified poller, so floor modules hold no timers (see poller.js).
+       It starts here — after workspace.restore() — so the first tick scans the restored project and
+       replaces the roster's old boot-time sync. */
+    const poller = createPoller({
+      bus,
+      repo,
+      getWorkspace: () => workspace.current(),
+      broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
+      now: () => clock.now(),
+      agents: {
+        registerAgent: (floor, a) => agentRoster.registerAgent(floor, a),
+        unregisterAgent: (floor, name) => agentRoster.unregisterAgent(floor, name),
+        pollMs: 15_000,
+      },
+    });
+    timers.push(poller.start());
+
     // 生命周期钩子：切换工程后（恢复 / 手动切 / 演示切换都走这）按注册顺序触发。
     lifecycle.onWorkspaceSwitch(() => {
       startFeed();
-      agentRoster.sync();
+      poller.syncAgentsNow();
     });
     lifecycle.onWorkspaceSwitch(() => demo.onSwitch(workspace.current(), agentRoster));
     workspace.setOnSwitch(() => lifecycle.afterWorkspaceSwitch());
 
-    // 关闭钩子：按注册顺序停掉定时器之外的资源（demo 推进器 / 清单监听 / 名册 / hub）。
+    // Close hooks: stop non-timer resources in registration order (demo driver / feed watcher / hub).
     lifecycle.onClose(() => demo.stop());
     lifecycle.onClose(() => { if (subagentFeed) subagentFeed.stop(); });
-    lifecycle.onClose(() => { if (agentRoster) agentRoster.stop(); });
     // 议事厅：先杀掉在飞的参与者进程（SIGTERM → SIGKILL），再给每场在飞的会落个结局。
     // 放在 hub.close() 前面 —— 收尾那一下还要往客户端广播最后一条状态。
     lifecycle.onClose(() => {
@@ -348,9 +354,8 @@ function createServer(opts = {}) {
     lifecycle.onClose(() => { try { hub.close(); } catch {} });
 
     startFeed();
-    agentRoster.start();
-    // 名册起来之后才有"已定义"的准数（演示对账要用它），所以演示的准备放这里：
-    // 上次停在演示工程 → 这回启动照旧是演示，播种 / 心跳 / 残留清理都交给它。
+    // The roster's ground truth is "defined" (the demo reconciliation uses it): the poller's first
+    // tick already ran it (poller.start() runs after workspace.restore()), so the demo prep goes here.
     demo.onSwitch(workspace.current(), agentRoster);
 
     if (!opts.silent) {

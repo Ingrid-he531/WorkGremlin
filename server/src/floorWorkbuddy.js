@@ -29,7 +29,7 @@ const meta = {
 
 const { runHookEvent, sharedHookImpl, jsonlReplies, indexJsonReplies, turnInterrupted } = require('./ingest/hookCommon');
 // 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
-const { genericAgentDirs } = require('./ingest/agentLevel');
+const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 /**
  * 2F 的静态 subagent 定义目录：项目级 <ws>/.workbuddy/agents、用户级 ~/.workbuddy/agents。
@@ -52,4 +52,4 @@ async function handleHookEvent(ev, ctx) {
   return runHookEvent(ev, ctx, workbuddyImpl);
 }
 
-module.exports = { id: '2F', meta, handleHookEvent, agentDirs };
+module.exports = { id: '2F', meta, handleHookEvent, agentDirs, syncAgents: makeAgentSync(agentDirs, meta.agent) };
