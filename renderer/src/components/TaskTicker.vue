@@ -64,9 +64,10 @@ async function loadFeed() {
 const END_KEEP_MIN = 5;
 /** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
 const SPEED_PX_S = 70;
-/** Each task line occupies exactly one screen width: a long task is cut by the `.line` CSS ellipsis
- *  (true width, so CJK/ASCII are both exact) and a short task leaves the rest of its screen-wide box
- *  blank — every line is one screen long and the spacing is uniform. */
+/** Each task line occupies exactly one screen width. A long task is cut by the ellipsis on its
+ *  **task text** (true width, so CJK/ASCII are both exact), while the trailing status word
+ *  ("（完成）/（已取消）") is kept and a short task leaves the rest of its screen-wide box blank —
+ *  every line is one screen long and the spacing is uniform. */
 
 /** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
@@ -468,26 +469,41 @@ onBeforeUnmount(() => {
 }
 
 .line {
+  display: flex;
+  align-items: center;
   flex: none;
   box-sizing: border-box;
-  /* A task line occupies exactly one screen: `width` (not `max-width`) makes a short task leave the
-     rest of its screen-wide box blank (the old "pad with spaces" effect), while a long task is cut
-     by the ellipsis at true width — no char-count estimate, so CJK and ASCII are both exact, and a
-     padded short line can no longer trigger the ellipsis. */
+  /* One task line occupies exactly one screen: `width` (not `max-width`) with no flex-grow leaves the
+     rest of a short task's box blank, while a long task is cut by the ellipsis on `.task-text` only.
+     The trailing status word (`.suf`) is `flex: none`, so "（完成）/（已取消）" is never pushed out. */
   width: var(--screen-w, 100%);
   overflow: hidden;
-  text-overflow: ellipsis;
   /* 条目之间的空档：一条滚完再接下一条，别让两条粘在一起 */
   padding-right: 48px;
+  white-space: nowrap;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
   font-size: 15px;
   font-weight: 500;
   letter-spacing: 0.5px;
-  /* 补的空格就靠它留着，不然末尾那一串空格会被折叠掉 */
-  white-space: pre;
   /* 行本体色 = 楼层桌面木件色（圆点、时间、楼层号、"任务："标签都继承它），
      没设楼层色时兜底用运行蓝 */
   color: var(--floor-color, var(--accent, #4c8dff));
+}
+
+/* 前缀（时间 / 楼层号 / "任务："标签）与末尾状态字都按原样显示：只有**任务原话**可以被省略号
+   截断（flex-shrink + min-width:0 + ellipsis）。这样「（完成）/（已取消）」永远跟在原话后面看得见，
+   不会被长标题挤出屏外 —— 这正是"结束行只见 ...、不见状态字"那个 bug 的根因。 */
+.line .time,
+.line .floor,
+.line .task-label,
+.line .suf {
+  flex: none;
+}
+.line .task-text {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 每条前面的圆点：颜色跟着这一条自己的颜色走（蓝=在跑 / 绿=完成 / 红=取消），
