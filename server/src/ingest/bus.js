@@ -195,6 +195,25 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   const context = { projectName, project: project || null, workspacePath: '' };
   /** memberId -> 'user' | 'project'：注册时按 subagent 目录判定一次 */
   const levels = new Map();
+
+  /**
+   * Live ghost records (subagent summons), keyed by `project|client|session|idOrName`.
+   *
+   * The hook is a pure forwarder now, so summon / retire / sweep all run server-side and write
+   * straight into the DB (an ephemeral member + a subagent_run, tied to the session and the parent
+   * task) instead of a manifest file that a separate poller read back. gcGhosts() (driven by the
+   * unified poller) disperses any record whose parent task ended or that outlived the orphan TTL.
+   */
+  const ghosts = new Map();
+  /** Orphan TTL: a summon with no end signal is treated as gone after this long. */
+  const GHOST_ORPHAN_MS = 5 * 60_000;
+  /**
+   * Where the finish summary lands: artifacts.kind is limited to file/doc/pr/text (CHECK), so the
+   * summary is stored as kind='text' plus this path marker, which the renderer reads as the "report".
+   */
+  const GHOST_SUMMARY_PATH = 'workgremlin:summary';
+  /** Agent roster (injected by index.js once it exists); a summoned gremlin shows busy. Optional. */
+  let ghostRoster = null;
   const now = () => clock.now();
 
   function ensureProject(name, workspacePath = '', mainConversationId = null, source = 'report') {
@@ -884,7 +903,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
 
   /**
    * 台账：subagent 实例收工 —— 补产出（收工摘要）、结束时间与花费时间。
-   * @param {{id: number|null, result?: string, model?: string, endedAt?: number}} p
+   * @param {{id: number|null, project?: string, result?: string, model?: string, files?: string[], endedAt?: number}} p
    */
   function endSubagentRun(p) {
     if (!p || !p.id) return 0;
@@ -899,6 +918,220 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       filesJson: filesJson ? JSON.stringify(filesJson) : null,
       endedAt: Number(p.endedAt) || now(),
     }).changes;
+  }
+
+  /* ------------------------------ ghosts (subagent summons) ------------------------------ */
+
+  /** ghost key: one record per (project, floor, session, per-call id or name) */
+  function ghostKey(project, client, sessionId, idOrName) {
+    return [project, client || '', sessionId || '', String(idOrName || '')].join('|');
+  }
+
+  /** Concurrent same-name summons share one ephemeral member; drop the member only when the last record is gone. */
+  function removeGhostMemberIfUnused(rec) {
+    for (const r of ghosts.values()) if (r.memberId === rec.memberId) return;
+    try {
+      removeMember({ project: rec.project, memberId: rec.memberName });
+    } catch {
+      /* ignore */
+    }
+    // A roster "defined subagent": summon ended → its workstation goes back online (current project only)
+    if (ghostRoster && rec.project === context.project && typeof ghostRoster.isDefined === 'function' && ghostRoster.isDefined(rec.name)) {
+      try {
+        ghostRoster.markIdle(rec.name);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** Pick a live record: by per-call id first, then by name (limited to this project + floor/session) */
+  function pickGhost(project, client, sessionId, name, id) {
+    const list = [...ghosts.values()];
+    if (id) {
+      const byId = list.find((r) => r.project === project && r.id && r.id === id);
+      if (byId) return byId;
+    }
+    return (
+      list.find(
+        (r) =>
+          r.project === project &&
+          (!client || r.client === client) &&
+          (!sessionId || !r.sessionId || r.sessionId === sessionId) &&
+          (!name || r.name === name)
+      ) || null
+    );
+  }
+
+  /** Close a ghost: end its own task + its subagent run (result is only given on the finish path) */
+  function closeGhost(rec, p = {}) {
+    if (rec.endedAt) return;
+    if (rec.taskId) {
+      try {
+        endTask({
+          project: rec.project,
+          memberId: rec.memberName,
+          taskId: rec.taskId,
+          state: 'done',
+          artifacts: p.result ? [{ kind: 'text', title: p.result, path: GHOST_SUMMARY_PATH }] : undefined,
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    endSubagentRun({ id: rec.runId, project: rec.project, result: p.result, model: p.model, files: p.files });
+    rec.endedAt = now();
+  }
+
+  /**
+   * The main agent summoned a subagent: create its ephemeral ghost member + open a subagent_run,
+   * tied to the **session and the parent (user) task**. A repeated hook fire for the same record
+   * reuses the still-open run instead of double-booking.
+   * @param {{project:string, workspacePath?:string, client:string, sessionId?:string, name:string,
+   *          task?:string, id?:string, parentTaskId?:string, taskId?:string, model?:string,
+   *          progress?:number, files?:string[], startedAt?:number}} p
+   * @returns {{memberId:string, runId:number|null}}
+   */
+  function ghostSpawn(p) {
+    const project = projectIdOf(p.project);
+    const name = normText(p.name, 64) || 'subagent';
+    const client = normClient(p.client);
+    const sessionId = normSession(p.sessionId);
+    const memberName = `subagent-${name}`;
+    const memberId = memberIdOf(project, memberName);
+    const key = ghostKey(project, client, sessionId, p.id || name);
+    const existing = ghosts.get(key);
+    if (existing && !existing.endedAt) {
+      heartbeat({ project, memberId: memberName, state: 'busy', progress: null, files: [] });
+      return { memberId, runId: existing.runId };
+    }
+    registerMember({
+      project,
+      memberId: memberName,
+      name,
+      role: 'subagent',
+      sessionId,
+      ephemeral: true,
+      projectLabel: '',
+      workspacePath: p.workspacePath || '',
+      client,
+    });
+    const parentTaskId = p.parentTaskId || currentMainTaskId(project) || null;
+    // This ghost's own task row (office shows it as "current task"; the finish report hangs on it)
+    const taskRes = startTask({
+      project,
+      memberId: memberName,
+      title: p.task || '',
+      progress: Number.isFinite(p.progress) ? p.progress : 0,
+      files: p.files,
+      parentTaskId,
+    });
+    const taskId = taskRes && taskRes.taskId ? taskRes.taskId : null;
+    const runId = startSubagentRun({
+      project,
+      memberId,
+      name,
+      client,
+      model: p.model,
+      title: p.task || '',
+      parentTaskId,
+      taskId,
+      startedAt: Number.isFinite(Number(p.startedAt)) ? Number(p.startedAt) : now(),
+    });
+    ghosts.set(key, {
+      key,
+      project,
+      memberId,
+      memberName,
+      name,
+      client,
+      sessionId,
+      id: p.id || '',
+      taskId,
+      runId,
+      parentTaskId,
+      endedAt: 0,
+      at: now(),
+    });
+    heartbeat({ project, memberId: memberName, state: 'busy', progress: null, files: [] });
+    if (ghostRoster && project === context.project && typeof ghostRoster.isDefined === 'function' && ghostRoster.isDefined(name)) {
+      try {
+        ghostRoster.markActive(name);
+      } catch {
+        /* ignore */
+      }
+    }
+    return { memberId, runId };
+  }
+
+  /**
+   * A subagent finished: close its run; the ghost **disperses immediately** (no report-animation
+   * linger for now).
+   * @param {{project:string, client?:string, sessionId?:string, name?:string, id?:string,
+   *          result?:string, model?:string, files?:string[]}} p
+   */
+  function ghostRetire(p) {
+    const project = projectIdOf(p.project);
+    const rec = pickGhost(project, normClient(p.client), normSession(p.sessionId), p.name, p.id);
+    if (!rec) return false;
+    closeGhost(rec, { result: p.result, model: p.model, files: p.files });
+    ghosts.delete(rec.key);
+    removeGhostMemberIfUnused(rec);
+    return true;
+  }
+
+  /**
+   * Sweep one session's (or one floor's) ghosts (Stop / SessionEnd / UserPromptSubmit, or the
+   * task-ended fallback).
+   * @param {{project:string, client?:string, sessionId?:string, all?:boolean}} p
+   * @returns {number} how many were dispersed
+   */
+  function ghostSweep(p) {
+    const project = projectIdOf(p.project);
+    const client = normClient(p.client);
+    const sessionId = normSession(p.sessionId);
+    let n = 0;
+    for (const rec of [...ghosts.values()]) {
+      if (rec.project !== project) continue;
+      if (client && rec.client !== client) continue;
+      if (sessionId && rec.sessionId !== sessionId) continue;
+      if (!p.all && rec.endedAt) continue;
+      closeGhost(rec);
+      ghosts.delete(rec.key);
+      removeGhostMemberIfUnused(rec);
+      n += 1;
+    }
+    return n;
+  }
+
+  /**
+   * Ghost fallback (driven by the unified poller): disperse any summon whose parent task ended or
+   * that outlived the orphan TTL — no longer depends on any hook event arriving. The parent truth
+   * comes from tasks.state; the summon link from the record's parentTaskId.
+   * @returns {number} how many were dispersed
+   */
+  function gcGhosts() {
+    const t = now();
+    let n = 0;
+    for (const rec of [...ghosts.values()]) {
+      let drop = false;
+      if (rec.parentTaskId) {
+        const task = repo.getTask.get(rec.parentTaskId);
+        if (task && task.state && task.state !== 'running') drop = true;
+      }
+      if (!drop && rec.at && t - rec.at > GHOST_ORPHAN_MS) drop = true;
+      if (!drop) continue;
+      closeGhost(rec);
+      ghosts.delete(rec.key);
+      removeGhostMemberIfUnused(rec);
+      n += 1;
+    }
+    return n;
+  }
+
+  /** Inject the roster (index.js calls this once it exists) so a summoned gremlin shows busy */
+  function setGhostRoster(roster) {
+    ghostRoster = roster || null;
   }
 
   /**
@@ -1091,10 +1324,11 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 幽灵（召唤实例）的产出。**常驻小怪物自己没有产出时**才借它的：
-   * 真正被召唤出去干活的是 subagent-<名字> 那个实例，它的收工摘要
-   * （subagentFeed 收工时按 kind='text' 落的产出）就是这位小怪物这一轮的产出。
-   * @param {any} member 常驻成员行（ephemeral=0）
+   * Output of a ghost (a summon instance). Borrowed by a resident gremlin only when it has **no
+   * output of its own**: the one actually summoned to work is the `subagent-<name>` instance, and
+   * its finish summary (the kind='text' output the ghost writes when it retires) is that gremlin's
+   * output for this run.
+   * @param {any} member resident member row (ephemeral=0)
    */
   function ghostArtifacts(member) {
     if (!member || member.ephemeral || !member.name) return [];
@@ -1331,6 +1565,11 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     currentTaskFor,
     startSubagentRun,
     endSubagentRun,
+    ghostSpawn,
+    ghostRetire,
+    ghostSweep,
+    gcGhosts,
+    setGhostRoster,
     heartbeat,
     setStatus,
     setSessionStatus,

@@ -28,7 +28,6 @@ const env = {
   ...process.env,
   HOME: TMP,
   WORKGREMLIN_HOME: WG,
-  WORKGREMLIN_SUBAGENTS_FILE: path.join(TMP, 'subagents.json'),
   WORKGREMLIN_NO_AUTO_HOOKS: '1',
 }
 

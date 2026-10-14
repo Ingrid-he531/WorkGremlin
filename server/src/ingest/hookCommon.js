@@ -1,18 +1,21 @@
 'use strict';
 
 /**
- * 服务端 hook 事件通用运行器 + 产品无关助手。
+ * Server-side generic hook-event runner + product-agnostic helpers.
  *
- * 这是 hook.js 事件处理逻辑的"服务端版"：CLI 的 hook 退化成事件转发器后，原本在 hook 侧做的
- * 落盘解析 / 会话状态 / 台账写入全部搬到这里。设计目标：
- *   · **产品无关的部分**（文件抽取、todo 进度、ghost feed 写入、token 读取、事件开关）只写一次；
- *   · **产品差异**（回复解析、文件清单、打断检测、形态、token 口径）由各 floor 通过 `impl` 提供，
- *     真正做到"floorXXX 处理各自落盘的不同"。
+ * This is the "server-side" version of the hook.js event handling: once the CLI hook became a pure
+ * forwarder, all the on-disk parsing / session state / ledger writing moved here. Design goals:
+ *   · **product-agnostic parts** (file extraction, todo progress, ghost persistence, token read,
+ *     event switches) are written once;
+ *   · **product differences** (reply parsing, file lists, interrupt detection, form, token flavor)
+ *     come from each floor via `impl`, so "floorXXX handles its own on-disk differences" really holds.
  *
- * 会话状态：替代 hook 的 state 文件，按 sessionId 存在 dispatcher 的内存 Map 里（见 hookDispatch.js）。
- * ghost 台账：直接写 `<workspace>/.workgremlin/subagents.json`（与 hook 同文件，subagentFeed 读它）。
+ * Session state: replaces the hook's state file, kept per sessionId in the dispatcher's in-memory map
+ * (see hookDispatch.js).
+ * Ghosts: summon / retire / sweep write straight to the DB (an ephemeral member + a subagent_run),
+ * living and dying with the session and parent task (see the bus ghost API).
  *
- * 用法：每个 floor 导出 `handleHookEvent(ev, ctx)` → `return runHookEvent(ev, ctx, impl)`。
+ * Usage: each floor exports `handleHookEvent(ev, ctx)` → `return runHookEvent(ev, ctx, impl)`.
  */
 
 const fs = require('node:fs');
@@ -22,7 +25,6 @@ const log = require('../log');
 const { updateJson } = require('@workgremlin/shared/fslock');
 const { fnv1a32, isPluginClient } = require('@workgremlin/shared');
 const { hooksDir, statePath } = require('@workgremlin/shared/paths');
-const { feedFilePath } = require('./subagentFeed');
 const { isFile } = require('../roots');
 
 /* ============================== 常量（与 hook.js 对齐） ============================== */
@@ -658,98 +660,51 @@ function resultOfResponse(ev) {
   return String(s || '').replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
-/* ============================== ghost feed 写入（替代 hook 的 addGhost/finishGhost/sweepGhosts） ============================== */
-function ownsEntry(a, client, session = '') {
-  if (!a) return false;
-  // 按楼层基名比对；两侧都归一（trim + 小写）——`/ghost` 路由送进来的 client 是原样字符串，
-  // 不归一的话，上报方给个 `Kilo` / `" kilo "` 就再也认不出自己写的幽灵（只能等 TTL 兜底）。
-  if (String(a.client || '').trim().toLowerCase() !== String(client || '').trim().toLowerCase()) return false;
-  if (session) {
-    const s = String(a.sessionId || '').trim();
-    if (s && s !== session) return false;
-  }
-  return true;
+/* ============================== ghosts (subagent summons) ==============================
+ * The hook is a pure forwarder, so these run server-side: summon / retire / sweep write straight
+ * into the DB (an ephemeral member + a subagent_run; tied to the session and the parent task),
+ * instead of a manifest file. Ownership = project + floor (client) + session + parent task, and
+ * the ghost lives and dies with the task state. */
+
+/**
+ * The main agent summoned a subagent → record a ghost (ephemeral member) + a subagent_run, tied to
+ * the session and the parent task.
+ * @param {any} bus
+ * @param {string} project project id
+ */
+function addGhost(bus, project, workspacePath, name, task, id, parent, model, client, session = '') {
+  if (!bus || typeof bus.ghostSpawn !== 'function') return null;
+  return bus.ghostSpawn({
+    project,
+    workspacePath,
+    client,
+    sessionId: session,
+    name: name || 'subagent',
+    task,
+    id,
+    parentTaskId: parent,
+    model,
+  });
 }
 
-/** 主 Agent 召唤 subagent → 加一只小幽灵（直接写 feed 文件，带 ts/floor/sessionId 归属） */
-function addGhost(workspacePath, name, task, id, parent, model, client, session = '') {
-  const file = feedFilePath(workspacePath);
-  updateJson(
-    file,
-    (feed) => {
-      const dup = id
-        ? (a) => a.id === id
-        : (a) => a.name === name && String(a.sessionId || '') === String(session || '');
-      if (feed.agents.some(dup)) return undefined;
-      feed.agents.push({
-        name,
-        state: 'busy',
-        ts: Date.now(),
-        client,
-        ...(session ? { sessionId: String(session) } : {}),
-        ...(task ? { task } : {}),
-        ...(id ? { id } : {}),
-        ...(parent ? { parent } : {}),
-        ...(model ? { model } : {}),
-      });
-      return feed;
-    },
-    { fallback: { project: '', agents: [] }, pretty: true }
-  );
+/** A subagent finished → close its run; the ghost disperses (no linger for now — see bus.ghostRetire). */
+function retireGhost(bus, project, name, id, result, client, session = '') {
+  if (!bus || typeof bus.ghostRetire !== 'function') return false;
+  return bus.ghostRetire({ project, client, sessionId: session, name, id, result });
 }
 
-/** subagent 收工 → 改成"已收工待汇报"（不直接删，让 subagentFeed 播完汇报再回收） */
-function retireGhost(workspacePath, name, id, result, client, session = '') {
-  const file = feedFilePath(workspacePath);
-  let changed = false;
-  updateJson(
-    file,
-    (feed) => {
-      let hit = id ? feed.agents.findIndex((a) => a.id === id) : -1;
-      if (hit < 0) {
-        hit = feed.agents.findIndex(
-          (a) => a.name === name && (!session || !a.sessionId || String(a.sessionId) === String(session))
-        );
-      }
-      if (hit < 0) return undefined;
-      const cur = feed.agents[hit] || {};
-      if (!ownsEntry(cur, client, session)) return undefined;
-      const task = String(cur.task || '').trim();
-      const said = String(result || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-      feed.agents[hit] = { ...cur, state: 'idle', result: said || (task ? `已完成：${task}` : '已完成') };
-      changed = true;
-      return feed;
-    },
-    { fallback: { project: '', agents: [] }, pretty: true }
-  );
-  return changed;
-}
-
-/** 扫掉本 hook 召唤的幽灵（带 ts 的），并清掉会话台账里对应的记录 */
-function sweepGhosts(workspacePath, client, opts = {}, session = '', sessionState = null) {
-  const file = feedFilePath(workspacePath);
-  let doomed = [];
-  updateJson(
-    file,
-    (feed) => {
-      doomed = feed.agents.filter(
-        (a) => a && a.ts && ownsEntry(a, client, session) && (opts.all || !a.result)
-      );
-      if (!doomed.length) return undefined;
-      feed.agents = feed.agents.filter((a) => !doomed.includes(a));
-      return feed;
-    },
-    { fallback: { project: '', agents: [] }, pretty: true }
-  );
-  if (!doomed.length) return 0;
-  // 清会话台账里对应的召唤记录
-  if (sessionState && Array.isArray(sessionState.subagents)) {
-    sessionState.subagents = sessionState.subagents.filter((r) => {
-      if (!r) return false;
-      return !doomed.some((a) => (a.id ? r.id === a.id : !r.id && r.name === a.name));
-    });
-  }
-  return doomed.length;
+/**
+ * Sweep one session's (or one floor's) ghosts: close their runs, drop the ephemeral members; also
+ * clear the session ledger's summon records (they can no longer be retired after a sweep).
+ * @param {{all?: boolean}} opts
+ */
+function sweepGhosts(bus, project, client, opts = {}, session = '', sessionState = null) {
+  const n =
+    bus && typeof bus.ghostSweep === 'function'
+      ? bus.ghostSweep({ project, client, sessionId: session, all: Boolean(opts && opts.all) })
+      : 0;
+  if (sessionState && Array.isArray(sessionState.subagents)) sessionState.subagents = [];
+  return n;
 }
 
 /* ============================== 回复入库（替代 reportAiReplies） ============================== */
@@ -986,7 +941,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     }
     const replies0 = impl.repliesOf(tp());
     await reportReplies(ctx, memberId, taskId0, replies0, sessionId, client);
-    sweepGhosts(workspacePath, client, {}, sessionId, st0);
+    sweepGhosts(bus, stableProject, client, {}, sessionId, st0);
     const files0 = collectRoundFiles(st0, ev0, cwd, startedAt0, workspacePath);
     const last0 = replies0.length ? replies0[replies0.length - 1].text : '';
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -1063,7 +1018,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
   if (event === 'UserPromptSubmit') {
     if (INJECTED_PROMPT_RE.test(String((ev && ev.prompt) || ''))) return { ok: true, ignored: 'injected' };
     const prevDone = get().done || null;
-    sweepGhosts(workspacePath, client, {}, sessionId, get());
+    sweepGhosts(bus, stableProject, client, {}, sessionId, get());
     // 新的一轮：清"等授权/挂起/上一轮完成标记"
     set({ await: null, pending: null, done: null });
     const prompt = userRequestText(ev.prompt);
@@ -1134,7 +1089,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
           if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name: nm, at: Date.now() });
           else if (!id && nm && !ledger.some((r) => r.name === nm)) ledger.push({ id: '', name: nm, at: Date.now() });
           set({ subagents: ledger });
-          addGhost(workspacePath, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId);
+          addGhost(bus, stableProject, stableWs, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId);
         }
       }
       const toolTaskId = String(get().taskId || '');
@@ -1162,7 +1117,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         if (tid) await bus.taskProgress({ ...base, taskId: tid, progress: prog });
       }
       if (isSubagentTool(toolName) && !impl.hasSubagentStart) {
-        finishGhostServer(sessionId, get(), workspacePath, ev, client, set);
+        finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
       }
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
       await status('thinking');
@@ -1210,13 +1165,13 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const ledger = ((st.subagents) || []).slice(-8);
     if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name, at: Date.now() });
     set({ subagents: ledger, pendingSpawn: null });
-    addGhost(workspacePath, name, (pend && pend.task) || '', id, String(st.taskId || ''), String(ev.model || ''), client, sessionId);
+    addGhost(bus, stableProject, stableWs, name, (pend && pend.task) || '', id, String(st.taskId || ''), String(ev.model || ''), client, sessionId);
     await beat();
     return { ok: true, handled: event };
   }
 
   if (event === 'SubagentStop') {
-    finishGhostServer(sessionId, get(), workspacePath, { ...ev, last_assistant_message: ev.last_assistant_message }, client, set);
+    finishGhostServer(bus, stableProject, sessionId, get(), { ...ev, last_assistant_message: ev.last_assistant_message }, client, set);
     await beat();
     return { ok: true, handled: event };
   }
@@ -1228,7 +1183,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     );
     // 清"等授权/挂起"（done 已先读）
     set({ await: null, pending: null, done: null });
-    sweepGhosts(workspacePath, client, {}, sessionId, get());
+    sweepGhosts(bus, stableProject, client, {}, sessionId, get());
     const st = get();
     let taskId = st.taskId;
     let title = st.taskTitle || '';
@@ -1331,7 +1286,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
       sessionEndedAt: Date.now(),
       sessionPhase: impl.coarse ? { phase: 'done', ts: Date.now(), workspacePath } : null,
     });
-    sweepGhosts(workspacePath, client, { all: true }, sessionId, get());
+    sweepGhosts(bus, stableProject, client, { all: true }, sessionId, get());
     set({ taskId: null, taskWorkspacePath: '', taskStartedAt: 0, subagents: [] });
     await status('offline');
     return { ok: true, handled: event };
@@ -1340,8 +1295,8 @@ async function runHookEvent(ev, ctx, floorImpl) {
   return { ok: true, ignored: event };
 }
 
-/** 服务端版 finishGhost：从会话台账找召唤记录，再写 feed 飘成"待汇报" */
-function finishGhostServer(sessionId, st, workspacePath, ev, floor, set) {
+/** Server-side finishGhost: find the summon record in the session ledger, then retire its ghost */
+function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
   const ti = ev && ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : null;
   const nm = ti ? agentName(ti) : '';
   const task = ti ? agentTask(ti) : '';
@@ -1358,7 +1313,7 @@ function finishGhostServer(sessionId, st, workspacePath, ev, floor, set) {
   if (!hit) return;
   st.subagents = list.filter((x) => x !== hit);
   if (set) set({ subagents: st.subagents });
-  retireGhost(workspacePath, hit.name, hit.id, resultOfResponse(ev), floor, sessionId);
+  retireGhost(bus, project, hit.name, hit.id, resultOfResponse(ev), floor, sessionId);
 }
 
 module.exports = {
@@ -1366,7 +1321,7 @@ module.exports = {
   // 产品无关助手（导出便于单测与复用）
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
   transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens,
-  addGhost, retireGhost, sweepGhosts, ownsEntry, agentName, agentTask, subagentKeys,
+  addGhost, retireGhost, sweepGhosts, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS,
   // token 归一原语（产品无关）

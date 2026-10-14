@@ -1,11 +1,11 @@
 'use strict';
 /**
- * 服务端 hook 通用运行器（Claude 全事件链路）集成测试。
+ * Server-side generic hook runner integration test (the full Claude event chain).
  *
- * 覆盖：SessionStart / UserPromptSubmit / PreToolUse(Agent 召唤幽灵) / PostToolUse(幽灵收工) /
- * Stop(产出+收尾) / Interrupt(取消收尾)，并验证幽灵 feed 文件与服务端 bus 调用。
- *
- * 跑法：`npm run test:hook-runtime`
+ * Covers: SessionStart / UserPromptSubmit / PreToolUse(Agent summons a ghost) /
+ * PostToolUse(ghost retires) / Stop(output + finish) / Interrupt(cancelled finish), and checks the
+ * server bus calls (ghosts go through ghostSpawn/ghostRetire/ghostSweep).
+ * Run: `npm run test:hook-runtime`
  */
 const fs = require('node:fs');
 const os = require('node:os');
@@ -16,8 +16,6 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-hook-rt-'));
 // ~/.workgremlin/hooks/ —— 每跑一次测试就在真机上多一条幽灵会话。
 process.env.WORKGREMLIN_HOME = path.join(TMP, 'wg');
 fs.mkdirSync(process.env.WORKGREMLIN_HOME, { recursive: true });
-// 幽灵清单统一收口到数据目录单文件；测试用 env 指向临时文件，避免污染真机（见 subagentFeed.feedFilePath）
-process.env.WORKGREMLIN_SUBAGENTS_FILE = path.join(process.env.WORKGREMLIN_HOME, 'subagents.json');
 const TP = path.join(TMP, 'sess.jsonl');
 fs.writeFileSync(
   TP,
@@ -29,7 +27,6 @@ fs.writeFileSync(
 );
 
 const { createHookDispatch } = require('../src/ingest/hookDispatch');
-const { feedFilePath } = require('../src/ingest/subagentFeed');
 
 let pass = 0;
 let fail = 0;
@@ -57,13 +54,11 @@ const bus = {
   recordMessage: (b) => { calls.push(['recordMessage', b]); return { ok: true }; },
   backfillTaskTokens: (b) => { calls.push(['backfillTaskTokens', b]); return { ok: true }; },
   currentTaskFor: () => null,
+  currentMainTaskId: () => 't_main',
+  ghostSpawn: (b) => { calls.push(['ghostSpawn', b]); return { memberId: `subagent-${b.name}@P`, runId: 1 }; },
+  ghostRetire: (b) => { calls.push(['ghostRetire', b]); return true; },
+  ghostSweep: (b) => { calls.push(['ghostSweep', b]); return 0; },
 };
-
-function feedAgents() {
-  const f = feedFilePath(TMP);
-  if (!fs.existsSync(f)) return [];
-  try { return JSON.parse(fs.readFileSync(f, 'utf8')).agents || []; } catch { return []; }
-}
 
 (async () => {
   console.log('服务端 hook 通用运行器（Claude 全链路）');
@@ -85,18 +80,16 @@ function feedAgents() {
   ok('UserPromptSubmit → 标题取原话', start && start[1].title === '写个函数');
   ok('UserPromptSubmit → thinking', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'thinking'));
 
-  // PreToolUse：Agent 工具召唤子代理 → 飘幽灵(busy) + toolUse
+  // PreToolUse: the Agent tool summons a subagent → record a ghost (busy) + toolUse
   calls.length = 0;
   await d.dispatch(ev('PreToolUse', { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', description: '搜代码' }, tool_use_id: 'call_1' }), ctx);
   ok('PreToolUse Agent → toolUse', calls.some((c) => c[0] === 'toolUse' && c[1].tool === 'Agent'));
-  const ghostBusy = feedAgents().find((a) => a.id === 'call_1');
-  ok('PreToolUse Agent → feed 飘幽灵(busy)', !!ghostBusy && ghostBusy.state === 'busy' && ghostBusy.name === 'Explore', JSON.stringify(feedAgents()));
+  ok('PreToolUse Agent → ghostSpawn(Explore)', calls.some((c) => c[0] === 'ghostSpawn' && c[1].name === 'Explore'), JSON.stringify(calls.map((x) => x[0])));
 
-  // PostToolUse：Agent 收工 → 幽灵变 idle 待汇报
+  // PostToolUse: the Agent tool finishes → retire the ghost
   calls.length = 0;
   await d.dispatch(ev('PostToolUse', { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', description: '搜代码' }, tool_use_id: 'call_1', tool_response: '找到了三处用法' }), ctx);
-  const ghostDone = feedAgents().find((a) => a.id === 'call_1');
-  ok('PostToolUse Agent → 幽灵收工(idle+result)', ghostDone && ghostDone.state === 'idle' && /找到了三处用法/.test(ghostDone.result || ''), JSON.stringify(feedAgents()));
+  ok('PostToolUse Agent → ghostRetire(result)', calls.some((c) => c[0] === 'ghostRetire' && /找到了三处用法/.test(c[1].result || '')), JSON.stringify(calls.map((x) => x[0])));
 
   // Stop → 服务端读 transcript 取产出 + 收尾 done
   calls.length = 0;
@@ -107,16 +100,13 @@ function feedAgents() {
   ok('Stop → 状态 done', end && end[1].state === 'done');
   ok('Stop → 收尾 idle', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'idle'));
 
-  // 已收工（带 result）的幽灵不会被 UserPromptSubmit 扫掉（它要留给 subagentFeed 播完汇报再回收）
-  ok('已收工的幽灵在 feed 里保留待汇报', feedAgents().some((a) => a.id === 'call_1' && a.state === 'idle'), JSON.stringify(feedAgents()));
-
-  // 召唤了一个但没收工（孤儿，无 result）→ 下一轮 UserPromptSubmit 应被扫掉
+  // Summoned but not finished (orphan) → swept along with the next UserPromptSubmit
+  calls.length = 0;
   await d.dispatch(ev('PreToolUse', { tool_name: 'Agent', tool_input: { subagent_type: 'Plan', description: '做计划' }, tool_use_id: 'call_2' }), ctx);
-  ok('孤儿幽灵已被加入(busy, 无 result)', feedAgents().some((a) => a.id === 'call_2' && a.state === 'busy'));
+  ok('孤儿幽灵也落了库', calls.some((c) => c[0] === 'ghostSpawn' && c[1].name === 'Plan'));
   calls.length = 0;
   await d.dispatch(ev('UserPromptSubmit', { prompt: '再写个测试' }), ctx);
-  ok('新轮 UserPromptSubmit → 扫掉上一轮的孤儿幽灵', !feedAgents().some((a) => a.id === 'call_2'), JSON.stringify(feedAgents()));
-  ok('已收工的幽灵不被误扫', feedAgents().some((a) => a.id === 'call_1'), JSON.stringify(feedAgents()));
+  ok('新轮 UserPromptSubmit → 扫场 ghostSweep', calls.some((c) => c[0] === 'ghostSweep' && c[1].sessionId === 's1'), JSON.stringify(calls.map((x) => x[0])));
 
   // Interrupt → 取消收尾
   calls.length = 0;

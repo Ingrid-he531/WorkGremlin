@@ -49,7 +49,6 @@
     "test:claude-model": "node server/test/claudeModel.test.js",
     "test:trae-model": "node server/test/traeModel.test.js",
     "test:ghost": "node server/test/ghostRace.test.js",
-    "test:ghost-ledger": "node server/test/ghostLedger.test.js",
     "test:recover": "node server/test/taskRecover.test.js",
     "test:qoder": "node server/test/qoderHook.test.js",
     "test:qoder-plugin": "node server/test/qoderPlugin.test.js",

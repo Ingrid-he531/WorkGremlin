@@ -11,6 +11,8 @@
  *   · floor agent sync       — per floor `agentsPollMs` (default 15s); floors opt in by exporting
  *                              `syncAgents(ctx)`; the floor scans its OWN agent dirs and registers the
  *                              changes through the upper layer's register / unregister callbacks;
+ *   · ghost GC (2s)          — bus.gcGhosts(): disperse subagent ghosts whose parent task ended or
+ *                              that outlived the orphan TTL;
  *   · degraded sweep (10s)   — bus.sweepDegraded(): drop stale heartbeats.
  *
  * Everything floor-specific (store schemas, "yield to the plugin" rules, phase inference, which dirs
@@ -31,6 +33,8 @@ const SWEEP_DEGRADED_MS = 10_000;
 const DEFAULT_POLL_MS = 5_000;
 /** Default agent-sync cadence when the caller does not declare `agents.pollMs`. */
 const DEFAULT_AGENT_POLL_MS = 15_000;
+/** Ghost GC cadence: disperse summons whose parent task ended or that outlived the orphan TTL. */
+const GHOST_GC_MS = 2_000;
 
 /**
  * @param {{
@@ -62,6 +66,7 @@ function createPoller({
   const lastAgentsAt = new Map();
   let lastSessionAt = 0;
   let lastSweepAt = 0;
+  let lastGhostAt = 0;
   let lastSessionSig = '';
   let timer = null;
 
@@ -140,6 +145,14 @@ function createPoller({
     }
     syncFloorTasks(at);
     if (agents) syncFloorAgents(at);
+    if (at - lastGhostAt >= GHOST_GC_MS) {
+      lastGhostAt = at;
+      try {
+        if (typeof bus.gcGhosts === 'function') bus.gcGhosts();
+      } catch {
+        /* ignore */
+      }
+    }
     if (at - lastSweepAt >= SWEEP_DEGRADED_MS) {
       lastSweepAt = at;
       try {

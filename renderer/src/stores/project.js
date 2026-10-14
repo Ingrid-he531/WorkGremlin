@@ -25,8 +25,6 @@ export const useProjectStore = defineStore('project', {
     projectName: '',
     /** 当前工程根目录（演示工程为空） */
     workspacePath: '',
-    /** 当前工程的 subagent 清单文件路径（幽灵的数据源） */
-    feedPath: '',
     /** 最近打开过的工程 */
     recent: [],
     connection: { state: 'connecting', source: 'ws' },
@@ -175,7 +173,6 @@ export const useProjectStore = defineStore('project', {
       if (!ws) return;
       this.projectName = ws.projectName || '';
       this.workspacePath = ws.workspacePath || '';
-      this.feedPath = ws.feedPath || '';
       this.recent = Array.isArray(ws.recent) ? ws.recent : [];
       this.demo = Boolean(ws.demo);
       // 换工程要立刻把上一个工程的人从屋里撤掉：服务端的新快照是**异步**到的（同一次请求里广播），

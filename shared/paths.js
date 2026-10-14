@@ -74,11 +74,6 @@ function workspacesPath() {
   return path.join(home(), 'workspaces.json');
 }
 
-/** Subagent ghost list (single file): `~/.workgremlin/subagents.json` */
-function subagentsPath() {
-  return path.join(home(), 'subagents.json');
-}
-
 /** Server log dir: `~/.workgremlin/logs` */
 function logsDir() {
   return path.join(home(), 'logs');
@@ -218,7 +213,6 @@ module.exports = {
   serverInfoPath,
   dbPath,
   workspacesPath,
-  subagentsPath,
   logsDir,
   eventsLogPath,
   productsOverridesPath,

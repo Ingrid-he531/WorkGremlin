@@ -567,11 +567,11 @@ const sceneMembers = computed(() => {
       // taskProgress 已删（2026-09-29）：3D 办公室显示器上那条进度条改成"不确定走条"了，
       // 不再消费这个字段；而 task.progress 本身没有真值（只有 0/1 两个取值，见
       // TaskRecordsView 里「进度」那一行的说明），留着只会误导下一个人再去接它。
-      // 被召唤的 subagent 当前任务名：主 agent 会用气泡把它交代给小怪物
+      // Current task name of a summoned subagent: the main agent hands it to the gremlin via a bubble
       task: m.task && m.task.title ? m.task.title : '',
-      // 收工摘要：清单里写的 result 由服务端作为 artifact 随成员卡下发
-      // （kind 只有 file/doc/pr/text，所以记成 kind='text' + path 标记，见 subagentFeed 的 SUMMARY_PATH），
-      // 小怪物收工时会把它说给主 agent 听（见 iso/engine 的 stepReport）。
+      // Finish summary: the server delivers the subagent's result as an artifact on the member card
+      // (kind is only file/doc/pr/text, so it is stored as kind='text' + a path marker — see bus's
+      // GHOST_SUMMARY_PATH); the gremlin says it to the main agent when it finishes (see iso/engine's stepReport).
       result: ((m.artifacts || []).find((a) => a && a.kind === 'text' && a.path === 'workgremlin:summary') || {}).title || '',
     }));
 });

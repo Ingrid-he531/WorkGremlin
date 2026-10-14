@@ -81,7 +81,6 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-plugin-'));
 const WG = path.join(TMP, 'wg');
 fs.mkdirSync(path.join(WG, 'hooks'), { recursive: true });
 process.env.WORKGREMLIN_HOME = WG;
-process.env.WORKGREMLIN_SUBAGENTS_FILE = path.join(TMP, 'subagents.json');
 
 const WS = '/tmp/ProjPlugin';
 const SID = 'ses_plugin_0001';

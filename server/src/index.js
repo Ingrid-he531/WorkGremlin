@@ -17,7 +17,6 @@ const path = require('node:path');
 const log = require('./log');
 const { openDatabase } = require('./db');
 const { createIngestBus } = require('./ingest/bus');
-const { createSubagentFeed } = require('./ingest/subagentFeed');
 const { createAgentRoster } = require('./ingest/agentRoster');
 const { resolveWorkspacePath, resolveProjectName, createWorkspaceManager } = require('./project');
 const { createHub } = require('./ws/hub');
@@ -197,33 +196,11 @@ function createServer(opts = {}) {
 
   const timers = [];
   let info = null;
-  let subagentFeed = null;
   let agentRoster = null;
 
   // 生命周期钩子 + 演示逻辑（从 index.js 拆出，见 server/src/lifecycle.js 与 server/src/demo/）。
   const lifecycle = createLifecycle();
   const demo = createDemo({ bus, repo, getRoster: () => agentRoster });
-
-  /**
-   * （重）启动 subagent 清单监听 —— 读**数据目录单份**清单（~/.workgremlin/subagents.json，
-   * 见 subagentFeed.feedFilePath），按条目里的工程/会话归属在当前打开工程里飘幽灵。
-   * 演示数据模式没有工程目录，不监听。
-   */
-  function startFeed() {
-    if (subagentFeed) subagentFeed.stop();
-    const cur = workspace.current();
-    if (!cur.workspacePath) return null;
-    subagentFeed = createSubagentFeed({
-      bus,
-      repo,
-      project: cur.project || config.DEMO_PROJECT,
-      workspacePath: cur.workspacePath,
-      projectName: cur.projectName,
-      roster: agentRoster,
-    });
-    subagentFeed.start();
-    return subagentFeed;
-  }
 
   /**
    * 启动监听。
@@ -302,6 +279,9 @@ function createServer(opts = {}) {
       // 切到演示工程后屋里演的是演示团队，那几个"本工程的 agent"不该跟着飘进来。
       getWorkspacePath: () => workspace.current().workspacePath,
     });
+    // Hand the roster to the bus: a summoned "defined subagent" shows busy in the office
+    // (the ghost path marks it active / idle)
+    bus.setGhostRoster(agentRoster);
 
     /* The one clock: session scan + per-floor task-ledger sync + per-floor agent sync + heartbeat
        sweep all live in this single unified poller, so floor modules hold no timers (see poller.js).
@@ -323,15 +303,13 @@ function createServer(opts = {}) {
 
     // 生命周期钩子：切换工程后（恢复 / 手动切 / 演示切换都走这）按注册顺序触发。
     lifecycle.onWorkspaceSwitch(() => {
-      startFeed();
       poller.syncAgentsNow();
     });
     lifecycle.onWorkspaceSwitch(() => demo.onSwitch(workspace.current(), agentRoster));
     workspace.setOnSwitch(() => lifecycle.afterWorkspaceSwitch());
 
-    // Close hooks: stop non-timer resources in registration order (demo driver / feed watcher / hub).
+    // Close hooks: stop non-timer resources in registration order (demo driver / hub).
     lifecycle.onClose(() => demo.stop());
-    lifecycle.onClose(() => { if (subagentFeed) subagentFeed.stop(); });
     // 议事厅：先杀掉在飞的参与者进程（SIGTERM → SIGKILL），再给每场在飞的会落个结局。
     // 放在 hub.close() 前面 —— 收尾那一下还要往客户端广播最后一条状态。
     lifecycle.onClose(() => {
@@ -343,7 +321,6 @@ function createServer(opts = {}) {
     });
     lifecycle.onClose(() => { try { hub.close(); } catch {} });
 
-    startFeed();
     // The roster's ground truth is "defined" (the demo reconciliation uses it): the poller's first
     // tick already ran it (poller.start() runs after workspace.restore()), so the demo prep goes here.
     demo.onSwitch(workspace.current(), agentRoster);
@@ -354,7 +331,6 @@ function createServer(opts = {}) {
       const cur = workspace.current();
       if (cur.demo) log.info('[workgremlin] 当前：演示工程');
       else log.info(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
-      log.info(`[workgremlin] subagent 清单：${cur.feedPath}`);
     }
     return info;
   }

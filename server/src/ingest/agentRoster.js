@@ -10,9 +10,9 @@
  * "defined" set, the "summoned" set). It owns **no timer** — the server's unified poller drives the
  * floors (see poller.js).
  *
- * Split with subagentFeed:
+ * Split with the ghost path (bus.ghostSpawn / ghostRetire / ghostSweep):
  *   · this module ensures every defined subagent has a sitting, badged gremlin;
- *   · subagentFeed handles the running instances (ephemeral ghosts).
+ *   · the ghost path handles the running instances (ephemeral members).
  *   memberIds differ (a gremlin uses the bare name, a ghost uses `subagent-<name>`), so they never clash.
  */
 
@@ -41,8 +41,8 @@ function createAgentRoster(opts) {
 
   /**
    * Summoned bookkeeping expires on its own: markIdle is the only reset entry point and it is only
-   * called by subagentFeed, so a ghost that disappears for another reason would otherwise leave the
-   * name stuck "busy" (and un-heartbeated) forever.
+   * called when a summon ends, so a ghost that disappears for another reason would otherwise leave
+   * the name stuck "busy" (and un-heartbeated) forever.
    */
   const ACTIVE_TTL_MS = 10 * 60_000;
 
@@ -71,7 +71,7 @@ function createAgentRoster(opts) {
     }
   }
 
-  /** Keep the gremlin online; skip while it is summoned (subagentFeed owns the workstation state then). */
+  /** Keep the gremlin online; skip while it is summoned (the ghost path owns the workstation state then). */
   function heartbeat(project, name, act) {
     if (act.has(name)) return;
     try {
@@ -142,7 +142,7 @@ function createAgentRoster(opts) {
     act.delete(name);
   }
 
-  /** Summoned: the roster stops heartbeating this workstation (subagentFeed sets it busy). */
+  /** Summoned: the roster stops heartbeating this workstation (a summon sets it busy). */
   function markActive(name) {
     const { act } = state(getProject());
     act.set(String(name || '').trim(), Date.now());

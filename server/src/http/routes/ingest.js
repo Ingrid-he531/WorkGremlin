@@ -95,25 +95,26 @@ function createIngestRouter({ bus, repo }) {
   // 工具使用：一轮任务里某个工具又用了一次（任务详情的「工具使用」按 (taskId, tool) 累加）
   router.post('/tool/use', projectFirst((b) => (b.memberId ? bus.toolUse(b) : { ok: false, error: 'missing memberId' })));
 
-  /* subagent 幽灵（临时成员）写入：原本 IDE 插件直接写 <工程>/.workgremlin/subagents.json，
-     现在统一收口到服务端 hookCommon（与 CLI hook 路径同一份实现），避免两边各写一份 JSON
-     结构再分叉（见 ghostFeed 历史）。动作：spawn（召唤飘幽灵）/ finish（改待汇报）/
-     sweep（清本会话幽灵）。归属以 workspacePath 为准，client 用来认领/隔离。 */
+  /* subagent ghost (ephemeral member) writes: funnelled into server-side hookCommon (the same
+     implementation as the CLI hook path). No manifest file anymore — it writes straight to the DB as
+     an ephemeral member + subagent_runs. Actions: spawn (summon a ghost) / finish (retire it) /
+     sweep (clear this session's ghosts). Ownership follows workspacePath; client is used to claim /
+     isolate. */
   router.post('/ghost', projectFirst((b) => {
     const ws = String(b.workspacePath || '');
     const client = String(b.client || '');
     const session = String(b.sessionId || b.session || '');
     const action = String(b.action || '');
     if (action === 'spawn') {
-      addGhost(ws, String(b.name || 'subagent'), String(b.task || ''), String(b.id || ''), String(b.parent || ''), String(b.model || ''), client, session);
+      addGhost(bus, b.project, ws, String(b.name || 'subagent'), String(b.task || ''), String(b.id || ''), String(b.parent || ''), String(b.model || ''), client, session);
       return { ok: true, action: 'spawn' };
     }
     if (action === 'finish') {
-      retireGhost(ws, String(b.name || ''), String(b.id || ''), String(b.result || ''), client, session);
+      retireGhost(bus, b.project, String(b.name || ''), String(b.id || ''), String(b.result || ''), client, session);
       return { ok: true, action: 'finish' };
     }
     if (action === 'sweep') {
-      sweepGhosts(ws, client, { all: b.all === true }, session);
+      sweepGhosts(bus, b.project, client, { all: b.all === true }, session);
       return { ok: true, action: 'sweep' };
     }
     return { ok: false, error: 'unknown_action' };

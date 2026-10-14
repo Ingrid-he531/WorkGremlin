@@ -12,12 +12,13 @@
  *
  * 拿不到就是空串 —— UI 侧回落到原来的提示，绝不编造一个"看起来像"的项目名。
  *
- * 工程管理：一个 workspace 一个 project：打开哪个工程，屋里就显示哪个工程的成员（含这个工程下的 subagent 幽灵）。
- * 选择会落盘到 ~/.workgremlin/workspaces.json，重开还在；演示数据作为一项可随时切回。
+ * Project management: one workspace = one project: opening a project shows that project's members
+ * in the office (including its subagent ghosts). The choice is persisted to
+ * ~/.workgremlin/workspaces.json and restored on restart; demo data is an item you can switch back to.
  *
- * 为什么要手工打开：办公室（成员 / 小怪物 / 幽灵）是**按工程**聚合显示的，打开哪个工程
- * 就看哪个工程的屋里。幽灵清单本身是数据目录的单份文件（~/.workgremlin/subagents.json，
- * 见 subagentFeed.feedFilePath），不再按工程分散存放，但显示仍跟随当前打开的工程。
+ * Why open manually: the office (members / gremlins / ghosts) aggregates **by project**, so you see
+ * whichever project is open. Subagent ghosts now write straight to the DB (an ephemeral member +
+ * a subagent_run) attributed to their own project / session, so the view still follows the open project.
  */
 
 const fs = require('node:fs');
@@ -25,7 +26,6 @@ const os = require('node:os');
 const path = require('node:path');
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { workspacesPath } = require('@workgremlin/shared/paths');
-const { feedFilePath } = require('./ingest/subagentFeed');
 const config = require('./config');
 
 /* ============================ 工程名解析 ============================ */
@@ -230,9 +230,8 @@ function createWorkspaceManager(opts) {
   }
 
   return {
-    current: () => ({ ...current, feedPath: current.workspacePath ? feedFilePath(current.workspacePath) : '' }),
+    current: () => ({ ...current }),
     recent: () => recent.slice(),
-    feedPath: () => (current.workspacePath ? feedFilePath(current.workspacePath) : ''),
     open,
     openDemo,
     restore,
