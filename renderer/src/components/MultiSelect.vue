@@ -3,16 +3,14 @@
  * A checkbox dropdown for multi-value filters.
  *
  * Native `<select multiple>` needs Ctrl/Cmd-click and shows almost nothing, so this uses
- * `<details>` + checkboxes: the summary shows the current selection and the body is a checkbox
- * list. `<details>` handles open/close natively, so there is no click-outside listener and it
- * renders fine under SSR.
+ * `<details>` + checkboxes: the summary shows the current selection and the body is a checkbox list.
  *
- * `modelValue` is the array of selected option values. An empty array means "no filter" (= all), and
- * in that state every checkbox shows as checked and the summary falls back to `allLabel`
- * (e.g. "All projects"). Toggling an item off switches to an explicit selection; selecting every item
- * again collapses back to the empty "all" state.
+ * `modelValue` is the array of selected option values; an empty array means "no filter" (= all) and
+ * the summary falls back to `allLabel` (e.g. "All projects") with nothing checked.
+ * `<details>` handles opening natively; closing is handled here so the menu also collapses when the
+ * pointer or focus moves to another control.
  */
-import { computed } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from '../i18n';
 
 const props = defineProps({
@@ -26,7 +24,8 @@ const emit = defineEmits(['update:modelValue']);
 
 const { t } = useI18n();
 
-const allValues = computed(() => props.options.map((o) => o.value));
+const root = ref(null);
+const selectedSet = computed(() => new Set(props.modelValue));
 
 /** Summary text: the single selected label, or the count when several are selected, or `allLabel` when none. */
 const summaryText = computed(() => {
@@ -39,30 +38,50 @@ const summaryText = computed(() => {
   return t('records.filter.selected_n', { n });
 });
 
-/** An empty modelValue means "all", so in that state every option reads as checked. */
-function isChecked(value) {
-  return props.modelValue.length === 0 || props.modelValue.includes(value);
+function toggle(value) {
+  const next = props.modelValue.slice();
+  const i = next.indexOf(value);
+  if (i >= 0) next.splice(i, 1);
+  else next.push(value);
+  emit('update:modelValue', next);
 }
 
-function toggle(value) {
-  // Work off the effective set: an empty modelValue stands for "all options selected".
-  const current = props.modelValue.length ? props.modelValue : allValues.value;
-  const next = current.filter((v) => v !== value);
-  if (next.length === current.length) next.push(value); // the value was not selected → select it
-  // Having every option selected is the same as "all" → collapse back to the empty representation.
-  emit('update:modelValue', next.length === allValues.value.length ? [] : next);
+function close() {
+  if (root.value && root.value.open) root.value.open = false;
 }
+
+/** Close when a pointer press lands outside this dropdown. */
+function onPointerDown(e) {
+  if (root.value && !root.value.contains(e.target)) close();
+}
+
+/** Close when focus moves to a control outside this dropdown (Tab, or clicking another filter). */
+function onFocusOut(e) {
+  if (!root.value) return;
+  const next = e.relatedTarget;
+  if (!next || !root.value.contains(next)) close();
+}
+
+onMounted(() => {
+  if (typeof document === 'undefined') return;
+  // Capture phase so it runs even if an inner element stops propagation.
+  document.addEventListener('pointerdown', onPointerDown, true);
+});
+onBeforeUnmount(() => {
+  if (typeof document === 'undefined') return;
+  document.removeEventListener('pointerdown', onPointerDown, true);
+});
 </script>
 
 <template>
-  <details class="msel">
+  <details ref="root" class="msel" @focusout="onFocusOut">
     <summary class="msel-btn" :aria-label="ariaLabel" :title="summaryText">
       <span class="msel-text">{{ summaryText }}</span>
       <span class="msel-caret" aria-hidden="true">▾</span>
     </summary>
     <div class="msel-menu" role="listbox" aria-multiselectable="true">
       <label v-for="o in options" :key="o.value" class="msel-opt">
-        <input type="checkbox" :checked="isChecked(o.value)" @change="toggle(o.value)" />
+        <input type="checkbox" :checked="selectedSet.has(o.value)" @change="toggle(o.value)" />
         <span class="msel-opt-text">{{ o.label }}</span>
       </label>
       <div v-if="!options.length" class="msel-empty">—</div>
