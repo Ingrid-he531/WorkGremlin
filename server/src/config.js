@@ -67,7 +67,8 @@ async function pickPort(start = DEFAULTS.PORT_START, end = DEFAULTS.PORT_END) {
 
 /**
  * @param {{port: number, token: string, pid: number, dbPath: string, startedAt: number,
- *          version?: string, previousPid?: number|null, project?: string, workspacePath?: string}} info
+ *          version?: string, previousPid?: number|null, project?: string, projectName?: string,
+ *          workspacePath?: string}} info
  */
 function writeServerInfo(info) {
   ensureHome();

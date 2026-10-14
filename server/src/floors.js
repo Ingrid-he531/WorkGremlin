@@ -347,7 +347,7 @@ let cache = { at: 0, products: [] };
  * @returns {Array<object>} floor modules that participate in task polling
  */
 function taskSyncerFloors() {
-  return Object.values(floors).filter((f) => typeof f.syncTasks === 'function');
+  return /** @type {Array<any>} */ (Object.values(floors)).filter((f) => typeof f.syncTasks === 'function');
 }
 
 /* ============================================================== 静态 subagent 聚合 */
@@ -404,7 +404,7 @@ function agentDescription(name, workspacePath, client) {
  * @returns {Array<object>} floor modules that participate in agent sync
  */
 function agentSyncerFloors() {
-  return Object.values(floors).filter((f) => typeof f.syncAgents === 'function');
+  return /** @type {Array<any>} */ (Object.values(floors)).filter((f) => typeof f.syncAgents === 'function');
 }
 
 /* ============================================================== 导出 */

@@ -97,6 +97,7 @@ function isLoopbackOrigin(origin) {
  *   workspacePath?: string,
  *   serveStatic?: string,
  *   silent?: boolean,
+ *   log?: string,
  * }} [opts]
  */
 function createServer(opts = {}) {
