@@ -18,9 +18,9 @@ const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessions');
 const TASK_ALIVE_GRACE_MS = 30 * 60 * 1000;
 
 /**
- * 楼层筛选参数 → client 列表。
- * 可以是单个 client（'codebuddy'），也可以是逗号分隔的一串（'codebuddy,codebuddy-plugin'，
- * 合并楼层用）；'all' / 空 = 不过滤。
+ * Floor filter param → client list.
+ * A single client ('codebuddy') or a comma-separated string ('codebuddy,codebuddy-plugin', used by
+ * merged floors); 'all' / empty = no filter.
  * @param {unknown} raw
  * @returns {string[]}
  */
@@ -28,6 +28,20 @@ function clientFilter(raw) {
   return String(raw || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
+    .filter((s) => s && s !== 'all');
+}
+
+/**
+ * Project filter param → id list.
+ * A single project id or a comma-separated list (the multi-select frontend joins them with commas);
+ * 'all' / empty = no filter.
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function projectFilter(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((s) => s.trim())
     .filter((s) => s && s !== 'all');
 }
 
@@ -138,46 +152,52 @@ function createQueryRouter({ bus, repo }) {
   });
 
   /**
-   * 任务记录：一轮用户任务一行，以 tasks 表为唯一真值（含全部工程、全部楼层的历史任务）。
-   * 只取顶层用户任务（parent_task_id IS NULL）；subagent 子行走 /subagent-runs。
+   * Task records: one row per user task, with the tasks table as the single source of truth (history
+   * across all projects and floors). Only top-level user tasks (parent_task_id IS NULL); subagent
+   * child rows come from /subagent-runs.
    *
-   * 一级检索（服务端过滤）：
-   *   - project：工程 id；缺省 / 'all' = 所有工程。
-   *   - client ：楼层 = 执行该任务的成员 client（codebuddy/codex/workbuddy/claude…）；
-   *              可为逗号分隔的一串（合并楼层 1F CodeBuddy = codebuddy + codebuddy-plugin）；
-   *              缺省 / 'all' = 所有楼层。
-   * 二级检索（状态）由前端在已拉取结果上按 state 再筛（见 TaskRecordsView 的状态分段）。
+   * Top-level filters (server-side):
+   *   - project: a project id, or a comma-separated list of ids (multi-select); absent / 'all' = all projects.
+   *   - client : floor = the member client that ran the task (codebuddy/codex/workbuddy/claude…);
+   *              may be a comma-separated string (merged floor 1F CodeBuddy = codebuddy + codebuddy-plugin);
+   *              absent / 'all' = all floors.
+   * The second-level filter (state) is applied by the frontend on the fetched rows (see the state
+   * segment in TaskRecordsView).
    *
-   * 字段补全（tasks 表本身只有骨架列）：
-   *   - client / model / file_count / files_json / result 来自报表层 task_runs（LEFT JOIN，可能为空）；
-   *     client 再回落到 members.client，保证老任务也能标出所属楼层。
-   *   - duration_ms = ended_at - started_at（现算）；subagentCount = subagent_runs 计数。
-  *   - state 归一：堆积的遗留 'running' 任务（进程已不在跑）一律视作 'cancelled'；
-  *     有 session_status 时按该会话的 task_id / 心跳判活；旧记录才回退到成员级 agent_status。
-   *     注意 blocked 必须算"还在跑"：等权限时 hook 上报的就是 blocked（awaiting_permission），
-   *     漏掉它会让任务在弹权限框的那一刻显示成「已取消」，批准后又跳回「进行中」——纯属误报。
+   * Field completion (the tasks table itself only has skeleton columns):
+   *   - client / model / file_count / files_json / result come from the report layer task_runs
+   *     (LEFT JOIN, may be empty); client falls back to members.client so old tasks still show a floor.
+   *   - duration_ms = ended_at - started_at (computed); subagentCount = subagent_runs count.
+   *   - state normalization: stale 'running' tasks (process no longer alive) are treated as
+   *     'cancelled'; when session_status is present, liveness is judged by that session's task_id /
+   *     heartbeat; only old records fall back to the member-level agent_status. Note blocked must
+   *     count as "still running": while waiting for permission the hook reports blocked
+   *     (awaiting_permission), and dropping it would show the task as "cancelled" the moment a
+   *     permission dialog appears and jump back to "running" after approval — a pure false alarm.
    */
   router.get('/task-runs', (req, res) => {
-    const project = req.query.project;
-    // 楼层筛选：client 可以是**逗号分隔的一串** —— 合并楼层（1F CodeBuddy = CLI + Plugin）
-    // 一个楼层对应两种成员 client，选它要一次把两路都取回来（口径见 products.js 的 clients）。
+    const projects = projectFilter(req.query.project);
+    // Floor filter: client may be a **comma-separated string** — a merged floor (1F CodeBuddy =
+    // CLI + Plugin) maps to two member clients, and selecting it must fetch both (see products.js).
     const clients = clientFilter(req.query.client);
     const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
-    // "还在进行"的判定窗口：10 分钟内还有心跳的 active 状态才算真在跑（纯思考无心跳时，
-    // 再靠 TASK_ALIVE_GRACE_MS 的 state_since 宽限兜底，见 taskAliveSql）
+    // Liveness window: only active states with a heartbeat in the last 10 minutes count as really
+    // running (during pure thinking there is no heartbeat, so the TASK_ALIVE_GRACE_MS state_since
+    // grace below covers it — see taskAliveSql)
     const cutoff = Date.now() - 10 * 60 * 1000;
     const graceCutoff = Date.now() - TASK_ALIVE_GRACE_MS;
     const ALIVE = taskAliveSql();
 
     const conds = ['t.parent_task_id IS NULL'];
     const args = { limit, cutoff, grace_cutoff: graceCutoff };
-    if (project && project !== 'all') {
-      conds.push('t.project_id = @project');
-      args.project = project;
+    if (projects.length) {
+      const names = projects.map((_, i) => `@proj${i}`);
+      conds.push(`t.project_id IN (${names.join(', ')})`);
+      projects.forEach((id, i) => { args[`proj${i}`] = id; });
     }
     if (clients.length) {
-      // 命中口径与报表分组一致（COALESCE(tr.client, m.client)），用 instr 做集合成员判定：
-      // @client 是 ",a,b," 形式，单个 client 也走同一条（1F 之外行为不变）。
+      // Same match as report grouping (COALESCE(tr.client, m.client)); instr does set-membership:
+      // @client is ",a,b," and a single client takes the same path (",codebuddy," matches codebuddy).
       conds.push("instr(@client, ',' || COALESCE(tr.client, m.client) || ',') > 0");
       args.client = `,${clients.join(',')},`;
     }
@@ -358,19 +378,20 @@ function createQueryRouter({ bus, repo }) {
   });
 
   /**
-   * 按一级检索（工程 + 楼层）批量删除：
-   *   - mode=all    ：删掉筛选条件下的全部记录；
-   *   - mode=recent ：仅保留最近 days 天（缺省取 DEFAULTS.RETENTION_DAYS，可配 1~3650），删更早的。
-   * 这两条都是破坏性操作，前端会先弹确认框展示影响条数。
+   * Bulk delete by the top-level filters (project + floor):
+   *   - mode=all    : delete every record matching the filters;
+   *   - mode=recent : keep only the last days (defaults to DEFAULTS.RETENTION_DAYS, 1~3650) and delete older ones.
+   * Both are destructive, so the frontend shows a confirmation with the affected count first.
    */
   router.delete('/task-runs', (req, res) => {
-    const project = req.query.project;
-    // 同 GET：client 可以是逗号分隔的一串（合并楼层一次删两路）
+    // Same as GET: project / client may each be a comma-separated list (multi-select, and a merged
+    // floor deletes both of its clients at once).
+    const project = projectFilter(req.query.project).join(',') || null;
     const client = clientFilter(req.query.client).join(',') || null;
     const mode = req.query.mode || 'all';
     let beforeTs = null;
     if (mode === 'recent') {
-      // 没带 days 时按"保留期"理解，取跟设置项同一个缺省值（当前 UI 只发 mode=all）
+      // Without days, read it as the "retention period" and take the same default as the setting (the current UI only sends mode=all)
       const days = Math.max(1, Math.min(Number(req.query.days) || DEFAULTS.RETENTION_DAYS, 3650));
       beforeTs = Date.now() - days * 24 * 60 * 60 * 1000;
     }

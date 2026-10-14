@@ -7,10 +7,10 @@ function authHeaders(info) {
 }
 
 /**
- * 任务记录：从 DB 的 tasks 逐任务拉取（一行一次用户任务），
- * 一级检索（服务端）：filterProject（工程）/ filterClient（楼层=成员 client）；
- * 二级检索（状态）与关键词由前端在已拉结果上再筛（见 TaskRecordsView）。
- * 数据完全来自数据库，前端不编造任何字段。
+ * Task records: fetched task by task from the DB `tasks` table (one row per user task).
+ * Top-level filters (server-side): filterProjects (projects) / filterClients (floors = member clients).
+ * The second-level filters (states) and the keyword are applied on the fetched rows by the frontend
+ * (see TaskRecordsView). All data comes from the database; the frontend never invents a field.
  */
 export const useTaskStore = defineStore('tasks', {
   state: () => ({
@@ -19,13 +19,42 @@ export const useTaskStore = defineStore('tasks', {
     selectedTaskId: null,
     loading: false,
     subLoading: false,
-    /** 一级检索：'all' = 不过滤。工程按 project_id，楼层按成员 client */
-    filterProject: 'all',
-    filterClient: 'all',
+    /**
+     * Top-level filters: empty array = no filter. A project entry is a project id; a client entry is
+     * a member client, and it may itself be a comma-separated string (a merged floor such as
+     * 1F CodeBuddy = codebuddy + codebuddy-plugin), matched by the server as a set.
+     * They live in the store so the selection survives switching pages.
+     */
+    filterProjects: [],
+    filterClients: [],
+    /**
+     * Second-level filters, kept here for the same reason (survive page switches): the state filter
+     * (client-side, applied in TaskRecordsView), the time filter and its custom range.
+     */
+    filterStates: [],
+    filterTime: 'all',
+    customFrom: '',
+    customTo: '',
   }),
 
   getters: {
     selectedTask: (s) => s.tasks.find((t) => t.id === s.selectedTaskId) || null,
+    /** Deduped client list from the selected floors (flatten each entry's comma-separated clients) */
+    clientList: (s) => {
+      const set = new Set();
+      for (const v of s.filterClients) {
+        for (const c of String(v || '').split(',')) {
+          const t = c.trim();
+          if (t) set.add(t);
+        }
+      }
+      return [...set];
+    },
+    /** Comma-joined server params; an empty string means "no filter" */
+    projectParam: (s) => s.filterProjects.filter(Boolean).join(','),
+    clientParam() {
+      return this.clientList.join(',');
+    },
   },
 
   actions: {
@@ -35,8 +64,8 @@ export const useTaskStore = defineStore('tasks', {
       try {
         const info = project.serverInfo || {};
         const params = new URLSearchParams();
-        if (this.filterProject && this.filterProject !== 'all') params.set('project', this.filterProject);
-        if (this.filterClient && this.filterClient !== 'all') params.set('client', this.filterClient);
+        if (this.projectParam) params.set('project', this.projectParam);
+        if (this.clientParam) params.set('client', this.clientParam);
         params.set('limit', '2000');
         const res = await fetch(
           `${httpBase(info)}/api/v1/task-runs?${params.toString()}`,
@@ -46,7 +75,7 @@ export const useTaskStore = defineStore('tasks', {
         const data = await res.json();
         if (data && data.ok) this.tasks = data.items || [];
       } catch {
-        /* 拉不到留空，下一轮再试 */
+        /* If the fetch fails, leave it empty and retry on the next poll */
       } finally {
         this.loading = false;
       }
@@ -104,12 +133,12 @@ export const useTaskStore = defineStore('tasks', {
       return false;
     },
 
-    /** 批量删除：mode='all' 删筛选条件全部；mode='recent' 仅保留最近 days 天 */
+    /** Bulk delete: mode='all' deletes everything matching the filters; mode='recent' keeps only the last days */
     async deleteByFilter(mode, days) {
       const info = (useProjectStore().serverInfo) || {};
       const params = new URLSearchParams();
-      if (this.filterProject && this.filterProject !== 'all') params.set('project', this.filterProject);
-      if (this.filterClient && this.filterClient !== 'all') params.set('client', this.filterClient);
+      if (this.projectParam) params.set('project', this.projectParam);
+      if (this.clientParam) params.set('client', this.clientParam);
       params.set('mode', mode || 'all');
       if (mode === 'recent' && days) params.set('days', String(days));
       try {

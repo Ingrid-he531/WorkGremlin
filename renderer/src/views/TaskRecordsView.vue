@@ -16,6 +16,7 @@ import { DEFAULTS } from '@workgremlin/shared';
 import { httpBase } from '../api/bridge';
 import { useI18n } from '../i18n';
 import { marked } from 'marked';
+import MultiSelect from '../components/MultiSelect.vue';
 
 /**
  * Which view to open on (list / summary / board).
@@ -141,12 +142,12 @@ watch(
   (id) => {
     tasks.selectedTaskId = null;
     tasks.subagents = [];
-    tasks.filterProject = 'all';
-    tasks.filterClient = 'all';
-    filterState.value = 'all';
-    filterTime.value = 'all';
-    customFrom.value = '';
-    customTo.value = '';
+    tasks.filterProjects = [];
+    tasks.filterClients = [];
+    tasks.filterStates = [];
+    tasks.filterTime = 'all';
+    tasks.customFrom = '';
+    tasks.customTo = '';
     keyword.value = '';
     filterModel.value = '';
     if (id) tasks.fetchTasks();
@@ -154,7 +155,7 @@ watch(
 );
 // Top-level filter changed → refetch (project / client go through the server)
 watch(
-  () => [tasks.filterProject, tasks.filterClient],
+  () => [tasks.projectParam, tasks.clientParam],
   () => tasks.fetchTasks()
 );
 
@@ -352,9 +353,12 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
-/** Top filters: state segments + title keyword (page-local only, pure client-side filtering, no schema change) */
-const FILTER_STATES = ['all', 'running', 'done', 'failed', 'cancelled', 'pending'];
-const filterState = ref('all');
+/**
+ * Top filters: state filter + title keyword (page-local only, pure client-side filtering, no schema
+ * change). The state filter is multi-select and its selection lives in the store so it survives page
+ * switches; an empty selection means "no filter". "failed" and "pending" were dropped per request.
+ */
+const FILTER_STATES = ['running', 'done', 'cancelled'];
 const keyword = ref('');
 
 /**
@@ -362,10 +366,11 @@ const keyword = ref('');
  * lib/timeRange.js (pure functions with regression tests — everything here is a midnight / month-end
  * / DST boundary and can't be tested inside an SFC).
  *
+ * The selection (bucket + custom range) lives in the store so it survives page switches.
+ *
  * "Now" comes from nowMs (riding along with the page's 4s poll): when the page stays open across
  * midnight "today" rolls over to the new day by itself, no extra timer needed.
  */
-const filterTime = ref('all');
 /** Time bucket labels (the bucket table is in lib/timeRange.js, the text is in the i18n tables; an unknown key is shown as-is) */
 const TIME_KEY = {
   all: 'records.time.all',
@@ -380,10 +385,12 @@ const TIME_KEY = {
 function timeRangeLabel(key) {
   return TIME_KEY[key] ? tr(TIME_KEY[key]) : String(key || '');
 }
-/** Custom range: the values of two <input type="date"> fields, local YYYY-MM-DD (empty = that end is unbounded) */
-const customFrom = ref('');
-const customTo = ref('');
-const timeWindow = computed(() => timeWindowOf(filterTime.value, nowMs.value, customFrom.value, customTo.value));
+const timeWindow = computed(() => timeWindowOf(tasks.filterTime, nowMs.value, tasks.customFrom, tasks.customTo));
+
+/** Options for the three multi-select checkbox dropdowns (project / floor / state) */
+const projectSelOptions = computed(() => projectOptions.value.map((p) => ({ value: p.id, label: p.name })));
+const floorSelOptions = computed(() => floorOptions.value.map((f) => ({ value: floorValue(f), label: floorText(f) })));
+const stateSelOptions = computed(() => FILTER_STATES.map((s) => ({ value: s, label: stateLabel(s) })));
 /** Does this task's start time fall in the current time window? (semantics in inTimeWindow in lib/timeRange.js) */
 function inTimeWindow(t) {
   return inWindowAt(t && t.started_at, timeWindow.value);
@@ -404,7 +411,7 @@ const list = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
   const fm = filterModel.value;
   return (tasks.tasks || []).filter((t) => {
-    if (filterState.value !== 'all' && t.state !== filterState.value) return false;
+    if (tasks.filterStates.length && !tasks.filterStates.includes(t.state)) return false;
     if (!inTimeWindow(t)) return false;
     if (kw && !promptOf(t).toLowerCase().includes(kw) && !String((t.session_title) || '').toLowerCase().includes(kw)) return false;
     if (fm && (t.model || '') !== fm) return false;
@@ -616,8 +623,8 @@ function drillDown(row) {
     return;
   }
   filterModel.value = '';
-  if (dim === 'project') { tasks.filterProject = row.key || 'all'; tasks.filterClient = 'all'; }
-  else if (dim === 'floor') { tasks.filterClient = row.key || 'all'; tasks.filterProject = 'all'; }
+  if (dim === 'project') { tasks.filterProjects = row.key ? [row.key] : []; tasks.filterClients = []; }
+  else if (dim === 'floor') { tasks.filterClients = row.key ? [row.key] : []; tasks.filterProjects = []; }
   else if (dim === 'model') { filterModel.value = row.key; }
   view.value = 'list';
 }
@@ -729,7 +736,7 @@ const boardIsToday = computed(() => boardDay.value === dayStartOf(Date.now()));
 const boardDayRange = computed(() => dayRangeOf(timeWindow.value));
 /** The current bucket's text (used as the title of disabled buttons so people know which filter is blocking them) */
 const filterTimeLabel = computed(
-  () => timeRangeLabel(filterTime.value)
+  () => timeRangeLabel(tasks.filterTime)
 );
 /** After switching buckets / crossing midnight, pull the day back if it's outside the window — otherwise the chart is blank and looks broken */
 watch(
@@ -795,21 +802,16 @@ function rowOfTask(t) {
 /**
  * Floors that still get a row even with no tasks that day (user request 2026-10-01):
  *   · Floor filter = all floors → **every installed floor** is drawn, empty ones leaving an empty row;
- *   · A specific floor is filtered → only the matching floors remain (a merged floor's value is a
+ *   · One or more floors are selected → only the matching floors remain (a merged floor's value is a
  *     comma-separated client string).
  * When a task really lands somewhere not listed (a client not in the floor table / no client at all),
  * buildFloorGantt still adds a row for it — not a single row is lost.
  */
 const boardBaseRows = computed(() => {
-  const want = String(tasks.filterClient || 'all').toLowerCase();
+  const wantSet = new Set(tasks.clientList.map((c) => c.toLowerCase()));
   const hit = (f) => {
-    if (want === 'all') return f.installed !== false;
-    const list = floorClients(f).map((c) => String(c).toLowerCase());
-    return String(tasks.filterClient)
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean)
-      .some((c) => list.includes(c));
+    if (!wantSet.size) return f.installed !== false;
+    return floorClients(f).some((c) => wantSet.has(String(c).toLowerCase()));
   };
   return floorOptions.value
     .filter(hit)
@@ -902,31 +904,39 @@ async function saveRetention() {
 
 <template>
   <div class="view" data-testid="task-records">
-    <!-- Filters: top-level (project + floor) + second-level (state segments) + title search + count; page-local only -->
+    <!-- Filters: top-level (project + floor) + second-level (state) + title search + count; page-local only.
+         The first three are multi-select checkbox dropdowns; their selection lives in the store so it
+         survives page switches, like the time bucket. -->
     <div class="filters">
       <span class="spacer" />
-      <select v-model="tasks.filterProject" class="sel" :aria-label="tr('records.col.project')">
-        <option value="all">{{ tr('records.filter.project') }}</option>
-        <option v-for="p in projectOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
-      </select>
-      <select v-model="tasks.filterClient" class="sel" :aria-label="tr('records.dim.floor')">
-        <option value="all">{{ tr('records.filter.floor') }}</option>
-        <!-- A merged floor (1F CodeBuddy) value is a comma-separated client string, matched as a set by the server (see query.js);
-             the item text includes the floor number ("1F CodeBuddy") — with only the product name you can't tell which floor it is -->
-        <option v-for="f in floorOptions" :key="f.id" :value="floorValue(f)">{{ floorText(f) }}</option>
-      </select>
-      <select v-model="filterState" class="sel" :aria-label="tr('records.col.state')">
-        <option value="all">{{ tr('records.filter.state') }}</option>
-        <option v-for="s in FILTER_STATES.filter((s) => s !== 'all')" :key="s" :value="s">{{ stateLabel(s) }}</option>
-      </select>
+      <MultiSelect
+        v-model="tasks.filterProjects"
+        :options="projectSelOptions"
+        :all-label="tr('records.filter.project')"
+        :aria-label="tr('records.col.project')"
+      />
+      <!-- A merged floor (1F CodeBuddy) value is a comma-separated client string, matched as a set by the server (see query.js);
+           the item text includes the floor number ("1F CodeBuddy") — with only the product name you can't tell which floor it is -->
+      <MultiSelect
+        v-model="tasks.filterClients"
+        :options="floorSelOptions"
+        :all-label="tr('records.filter.floor')"
+        :aria-label="tr('records.dim.floor')"
+      />
+      <MultiSelect
+        v-model="tasks.filterStates"
+        :options="stateSelOptions"
+        :all-label="tr('records.filter.state')"
+        :aria-label="tr('records.col.state')"
+      />
       <!-- Time filter: keyed on the task's start time (see timeWindow). Only "custom" reveals the two date fields -->
-      <select v-model="filterTime" class="sel" :aria-label="tr('records.col.time')">
+      <select v-model="tasks.filterTime" class="sel" :aria-label="tr('records.col.time')">
         <option v-for="r in TIME_RANGES" :key="r.key" :value="r.key">{{ timeRangeLabel(r.key, r.label) }}</option>
       </select>
-      <template v-if="filterTime === 'custom'">
-        <input v-model="customFrom" class="day-input" type="date" :aria-label="tr('records.filter.custom_from')" />
+      <template v-if="tasks.filterTime === 'custom'">
+        <input v-model="tasks.customFrom" class="day-input" type="date" :aria-label="tr('records.filter.custom_from')" />
         <span class="dim">→</span>
-        <input v-model="customTo" class="day-input" type="date" :aria-label="tr('records.filter.custom_to')" />
+        <input v-model="tasks.customTo" class="day-input" type="date" :aria-label="tr('records.filter.custom_to')" />
       </template>
       <input
         v-model="keyword"
