@@ -1,177 +1,121 @@
 # WorkGremlin
 
-把本机在跑的 AI 编码 agent 变成一间**看得见的办公室**：谁在线、在忙什么、哪一层在干活，一眼扫完。
-还能叫上几个楼层的 agent 开一场**议事厅**，就一个议题讨论到达成一致，或者分析一个做法行不行。
+Turn the AI coding agents running on your machine into a **visible office**: who is online, what they are busy with, which floor is working — all at a glance. You can also invite agents from several floors into a **council** to discuss one topic to agreement, or to analyze whether an approach holds up.
 
-## 演示
+## Demo
 
-![WorkGremlin 演示：办公室里的主 Agent 与小怪物 → 任务记录的图形看板](docs/assets/demo.gif)
+![WorkGremlin demo: the main agent and gremlins in the office → the graphical board of task records](docs/assets/demo.gif)
 
-## 快速开始
+## Quick start
 
 ```bash
-# 前置：Node >= 18（dev 模式的 Vite 需要）；Linux 另需 python3 + make + g++（npm install 时编译 better-sqlite3）。
-# server/client 跑在 Electron 内置 Node 上，无需单独装 Node。
+# Requirements: Node >= 18 (Vite needs it in dev mode); on Linux also python3 + make + g++ (better-sqlite3 is compiled during npm install).
+# server/client run on Electron's bundled Node, so you do not install Node separately.
 node -v && npm -v && python3 --version && which make g++
 
-# 安装依赖（postinstall 会自动跑 electron-rebuild 重建 better-sqlite3）
+# Install dependencies (postinstall runs electron-rebuild to rebuild better-sqlite3)
 npm install
 
-# 启动（Electron 自带 Node 起 server + 开桌面窗口；应用退出后 server 仍在后台常驻）
+# Start (Electron's Node runs the server + opens the desktop window; after the app exits the server stays resident in the background)
 npm run launch:electron
 
-# 开发模式（Vite 热更 + Electron 窗口）：npm run dev
-# 构建 renderer 后启动（prod）：npm run build:electron
-# 只跑本地服务、不开窗口：npm run server
-# 只验一下原生模块能不能用（建表 → 写入 → 读回）：npm run db:check
+# Dev mode (Vite HMR + Electron window): npm run dev
+# Build the renderer then start (prod): npm run build:electron
+# Run only the local server, no window: npm run server
+# Just check the native module works (create table → write → read back): npm run db:check
 ```
 
-**演示模式**：起完之后，在办公室右下角操作条上点「演示模式」（在「集合开会」左边）——
-界面切到一条独立的**演示工程**，主控制台会自动演一轮完整任务，屋里的成员换成演示团队
-（6 位专家 + 2 个临时成员）。再点一次「退出演示」就回到进演示前打开的那个工程。
+**Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the UI switches to an isolated **demo project**, the main console automatically plays a full round, and the members in the room become the demo team (6 experts + 2 temporary members). Click "Exit demo" again to return to the project that was open before.
 
-## 四个页面
+## Four pages
 
-### 办公室（默认）
+### Office (default)
 
-一间等距（2.5D）办公室，把"哪个 agent 在干什么"画出来：
+An isometric (2.5D) office that draws "which agent is doing what":
 
-- **楼层**：左侧胶囊选层，切换时走**电梯动画**（门关上、门后在换层、门开就是新楼层）；
-  每层家具材质配色不同，一眼认得出在哪层。胶囊上的圆点/数字 = 这一层有没有活跃会话、有几条；
-  没安装的产品灰显、点不动。门楣上写着当前工程名与楼层。
-- **主 Agent 控制台**：悬浮屏上是它当前的相位 ——
-  `待命中 / 未上报 / 思考中 / 调用工具 / 委托专家 / 等待授权 / 等待中（等 subagent 汇报）/ 任务完成 / 任务取消`。
-  鼠标停在悬浮屏上会弹出操作、目标、技能与上下文；左下角标着这一份相位是**上报真值 / 推断值 / 演示脚本**。
-- **小怪物（坐工位的 subagent）**：上班时一个个从大门走进来坐下；被主 Agent 召唤（`task` 工具）时
-  跑到控制台**右侧**领任务、答一句"收到"，再回工位干活，干完回控制台汇报结果；
-  被召唤期间头顶会出现一只**小幽灵**（这次 subagent 的实例），它从大门飘进来。
-  空闲的会去接水、打印、找人聊天；两个以上被阻塞会自己「集合开会」。
-- **交互**：拖拽平移 · 滚轮缩放 · 双击复位；点工位弹任务卡；悬停小怪物看当前任务；
-  悬停控制台悬浮屏看相位详情；`F` 全屏 / `Esc` 退出全屏。
-- **顶栏会话下拉**：选哪一条会话，主控制台就显示**那条会话自己**的相位（多开会话时各显示各的，
-  不会串味）；没选就跟着当前楼层。
-- 右下角操作条：`演示模式` / `集合开会` / `全员回工位` / `复位视角`。
+- **Floors**: pick a floor from the capsules on the left; switching plays an **elevator animation** (doors close, the car changes floors behind them, doors open on the new floor); each floor has its own furniture material/color so you can tell where you are. The dot/number on a capsule = whether that floor has active sessions and how many; products that are not installed are greyed out and not clickable. The lintel shows the current project name and floor.
+- **Main agent console**: the floating screen shows its current phase — `idle / unreported / thinking / calling a tool / delegating to an expert / awaiting permission / waiting (for a subagent to report) / task done / task cancelled`. Hover the screen to pop up the action, target, skills and context; the bottom-left marks whether this phase is a **reported truth / inferred value / demo script**.
+- **Gremlins (subagents at their desks)**: they walk in through the front door one by one and sit down; when summoned by the main agent (the `task` tool) they run to the **right side** of the console, take the task, reply "got it", then go back to their desk to work, and report the result at the console when done; while summoned, a **ghost** (this subagent instance) appears above their head and floats in through the front door. Idle ones go get water, print, or chat with someone; two or more blocked ones gather for a meeting on their own.
+- **Interaction**: drag to pan · scroll to zoom · double-click to reset; click a desk for the task card; hover a gremlin for its current task; hover the console screen for phase details; `F` fullscreen / `Esc` exit fullscreen.
+- **Top-bar session dropdown**: pick a session and the main console shows **that session's own** phase (with several sessions open, each shows its own — no cross-talk); with none picked it follows the current floor.
+- Bottom-right action bar: `Demo mode` / `Gather for a meeting` / `Everyone back to their desks` / `Reset view`.
 
-### 工位卡片
+### Desk cards
 
-当前楼层每个成员一张卡片（主 Agent 固定第一张）：
+One card per member on the current floor (the main agent is always the first):
 
-- **角色**：主代理 / 项目子代理 / 用户子代理；
-- **状态**：只有两档 —— 忙碌 / 空闲（状态点与文案同色，不会出现"绿点 + 空闲"）；
-- **当前任务**：正在干的那条；空闲时如实写「空闲」，不会把上一个任务留在卡片上；
-- **描述**：子代理定义里写的"它是干什么的"（静态信息，不是状态）；
-- **时间**：进行中显示「开始 MM-DD HH:mm」，空闲显示「最近活跃 MM-DD HH:mm」；
-- 没接上报的成员标「被动观测」，状态按推断灰显。
+- **Role**: main agent / project subagent / user subagent;
+- **State**: only two levels — busy / idle (the status dot and the text share the same color; you never get a "green dot + idle");
+- **Current task**: the one in progress; when idle it honestly says "idle" and does not leave the previous task on the card;
+- **Description**: the "what it does" written in the subagent definition (static information, not state);
+- **Time**: in progress shows "started MM-DD HH:mm", idle shows "last active MM-DD HH:mm";
+- members that do not report are marked "passively observed" and their state is greyed out as inferred.
 
-只列常住小怪物；临时召唤出来的幽灵不占卡片位（避免"召唤一次，列表里多一只"的误会）。
+Only resident gremlins are listed; ghosts summoned temporarily do not take a card slot (avoiding the "summon once, one more in the list" confusion).
 
-### 任务记录
+### Task records
 
-上方筛选对三个视图同时生效：
+The filters at the top apply to all three views at once:
 
-- **工程 / 楼层**（走服务端取数）、**状态 / 时间 / 关键字**（在当前结果上再筛）；
-- **时间**有八个档位：全部时间 / 今天 / 昨天 / 过去 7 天 / 过去 30 天 / 这个月 / 上个月 / 自定义
-  （自定义露出起止两个日期框）。口径是任务的**开始时刻**，按自然日算。
+- **Project / floor** (fetched from the server), **state / time / keyword** (filtered further on the current result);
+- **Time** has eight presets: all time / today / yesterday / last 7 days / last 30 days / this month / last month / custom (custom reveals two date boxes). The basis is the task's **start time**, by calendar day.
 
-1. **列表视图** —— 一行一次任务，点开右侧详情：状态、客户端、模型、工程、改动过的文件、
-   **词元**（非缓存输入 / 缓存读 / 缓存写 / 输出四项分开写，报不出的楼层显示「—」而不是 0）、
-   工具使用次数、产出结果、以及它召唤过的 subagent 明细。可单条删除、按当前筛选「删除筛选结果」，
-   也能设置记录的自动保留天数（默认保留最近 90 天，更早的由服务端自动清理）。
-2. **汇总报表** —— 第一个页签是**数据总览**：按时间逐条列
-   `时间 / 任务 / 客户端 / 模型 / 工程 / 词元 / 时长 / 状态`
-   （任务标题只取前 10 个字加省略号，鼠标悬停看全文；点任意一行跳回列表并选中那条任务）。
-   另有**按工程 / 按模型 / 按楼层**的聚合表：任务数、成功数、取消数、改动文件数、词元合计、
-   总耗时、平均耗时，点行即可下钻到列表。整表可导出 CSV。
-3. **图形看板（每日）** —— 一天一张**楼层 × 时间**的甘特图：横轴是当天 00:00–24:00
-   （每小时一条竖线），纵轴是楼层（如「3F Codex」），行里的色块就是那一层的一次任务，
-   块的颜色对应该任务的状态。同一时间并行跑好几条时，把重叠的那一段**颜色加深**
-   （一层恒定一行，不往下摞）；看今天时有一条「此刻」虚线；点块跳到列表里那条任务。
-   **能往前/往后翻到哪几天，由上方的时间筛选决定**（不在窗口里的按钮置灰）。
-   没任务的日子照样画空表格；筛选是「全部楼层」时，**所有已安装的楼层各占一行**（空的留空格子）。
+1. **List view** — one row per task; open the details on the right: state, client, model, project, changed files, **tokens** (uncached input / cache read / cache write / output written separately; floors that cannot report it show "—" not 0), tool-usage counts, output result, and the subagent details it summoned. You can delete a single row, "delete the filtered results" for the current filter, and set the automatic retention days (default keeps the last 90 days; older ones are cleaned up by the server).
+2. **Summary report** — the first tab is **data overview**: a per-row list `time / task / client / model / project / tokens / duration / state` (the task title takes only the first 10 characters plus an ellipsis; hover to see the full text; click any row to jump back to the list with that task selected). There are also **by project / by model / by floor** aggregate tables: task count, success count, cancelled count, changed-file count, total tokens, total duration, average duration; click a row to drill down to the list. The whole table can be exported to CSV.
+3. **Graphical board (daily)** — one **floor × time** Gantt chart per day: the horizontal axis is 00:00–24:00 (one vertical line per hour), the vertical axis is floors (e.g. "3F Codex"), and the blocks in a row are that floor's tasks, colored by the task's state. When several run in parallel at the same time, the overlapping stretch is **darkened** (one row per floor, no stacking downward); when viewing today there is a "now" dashed line; click a block to jump to that task in the list. **Which days you can page back/forward to is decided by the time filter above** (buttons outside the window are greyed out). Days with no tasks still draw an empty table; when the filter is "all floors", **every installed floor gets its own row** (empty ones stay blank).
 
-### 议事厅
+### Council
 
-前三页都是**看**（别人把 agent 跑起来，我们读它留下的痕迹）。议事厅是唯一一页**用**：
-选几个楼层，就一个议题开一场多轮讨论。
+The first three pages are all about **looking** (others run the agents, we read the traces they leave). The council is the only page that **uses**: pick a few floors and start a multi-round discussion on one topic.
 
-- **怎么开**：写议题（粘贴正文）→ 勾楼层 → 选**谈法** → 可选贴几个文件路径（服务端读原文嵌进
-  提示词，超限就截断，界面上会写明「原文 N 字节，只嵌了前 M 字节」）→ 可选填**工作目录** →
-  定最多谈几轮 → 发起。**只有已装且能无头调用的楼层可选**，其余灰显并写出原因
-  （比如"没找到命令行可执行文件"）。
-- **谈法有两种**（两个开关互相独立，怎么组合都行）：
-  - **表决**（缺省）：第 0 轮服务端把议题摆上桌（不表态），第 1..N 轮每人先发言、末尾附一个
-    `{"vote":"agree|disagree|abstain","reason":"…"}` 的结构化尾块；投反对的还要给一份修订案。
-    **服务端数票**——本轮没有反对票、且同意票够半数就算达成一致，结论就是**桌上那份提案原文**
-    （原样引用，服务端不合成、不改写）；否则把附议最多的那份修订案摆上桌接着谈；
-    谈到轮数上限还没谈成就如实写「未达成一致」，列出各方立场与最后一版提案。
-  - **分析**：不投票、不判共识。每人每轮末尾附
-    `{"stance":"support|oppose|unsure","points":[…],"risks":[…],"questions":[…]}`，
-    跑满轮数后给一份**分组简报**（支持 / 反对 / 不确定 / 未表态），每人的结论、风险、
-    存疑**原样列出**，服务端不合成一句话。适合"这个 bug fix 的思路行不行""会不会导致回归"
-    这类没有"谈成没谈成"的问题。
-  - 两者都让参与者在提示词里看到**之前每一轮的所有发言**。
-- **在哪儿谈也有两种**：**留空**（缺省）就是隔离 —— 服务端现建的一次性临时目录，一场一删，
-  参与者**没有工具**（纯嘴）。**填一个绝对路径**（你的工程目录）就是工程模式 —— 参与者以它为
-  工作目录，拿到**只读工具**，可以自己去翻代码（读文件、按名字/内容搜），拿不准就去读、别猜；
-  **改不了任何文件、跑不了命令、上不了网**。服务端**一行都不改**你那个目录，跑完也不删它。
-  拿"会不会回归"去问它的时候，用这个模式。
-- **进不了办公室**：参与者不进办公室、不进任务记录，只在议事厅看得见。工程模式下这条要多花
-  两道锁（关掉 WorkGremlin 自己的上报；7F/8F 的参与者会话带固定标题，办公室的会话清单跳过它），
-  细节见 `docs/requirements.md` §15.3。
+- **How to start**: write the topic (paste the text) → tick floors → pick the **deliberation style** → optionally paste a few file paths (the server reads the text and inlines it into the prompt; over the limit it truncates and the UI states "original N bytes, only the first M inlined") → optionally set a **working directory** → set the max rounds → start. **Only floors that are installed and can be invoked headlessly are selectable**; the rest are greyed out with the reason (e.g. "no command-line executable found").
+- **Two deliberation styles** (two independent switches; any combination works):
+  - **Vote** (default): in round 0 the server puts the topic on the table (no stance); in rounds 1..N each person speaks first, ending with a structured `{"vote":"agree|disagree|abstain","reason":"…"}` block; anyone voting against also gives an amendment. **The server counts the votes** — if the round has no objections and enough yes votes for a majority, it is agreement, and the conclusion is **the proposal text on the table** (quoted verbatim; the server does not synthesize or rewrite it); otherwise the amendment with the most seconds goes on the table and the discussion continues; if the round limit is reached without agreement it honestly says "no agreement" and lists each side's position and the last proposal.
+  - **Analysis**: no voting, no consensus. Each person ends each round with `{"stance":"support|oppose|unsure","points":[…],"risks":[…],"questions":[…]}`; after the full number of rounds you get a **grouped briefing** (support / oppose / unsure / no stance), each person's conclusion, risks and open questions **listed verbatim** — the server does not synthesize a sentence. Good for questions with no "agreed or not", like "is this bug-fix approach sound" or "could it cause a regression".
+  - Both show participants **all previous rounds' utterances** in the prompt.
+- **Where to talk also has two modes**: **blank** (default) is isolated — a throwaway temp directory the server creates, deleted after each council, and participants have **no tools** (talk only). **An absolute path** (your project directory) is workspace mode — participants use it as the working directory and get **read-only tools**, so they can look up code themselves (read files, search by name/content), read when unsure instead of guessing; **they cannot modify any file, run commands, or access the network**. The server **does not change a single line** in that directory and does not delete it afterwards. Use this mode when asking "could this regress".
+- **Not in the office**: participants do not appear in the office or in task records; they are visible only in the council. In workspace mode this takes two extra locks (turn off WorkGremlin's own reporting; 7F/8F participant sessions carry a fixed title that the office's session list skips) — see `docs/requirements.md` §15.3 for details.
 
-两件它**不做**的事，免得误会：① 它不碰你正在跑的那些会话（不发指令、不打断它们）；
-② 它不替你编结论 —— 有人没答话、进程崩了、输出解析不出来，那一票（或那个立场）就留空、
-界面写「未表态」并显示原始错误，**绝不因为"没回话"就算它同意，也绝不从语气里猜**。
-拿不到的词元显示「—」，不写 0。
+Two things it does **not** do, to avoid misunderstanding: ① it does not touch the sessions you are running (no commands, no interruptions); ② it does not make up a conclusion for you — if someone did not answer, a process crashed, or the output cannot be parsed, that vote (or stance) stays blank, the UI says "no stance" and shows the raw error; it **never treats "did not reply" as agreement, and never guesses from tone**. Tokens it cannot get show "—", not 0.
 
-## 支持的楼层
+## Supported floors
 
-一层一个受监控的产品（左侧胶囊按这个顺序排），**装了哪个哪层能点**，没装的灰显：
+One monitored product per floor (the left capsules are ordered this way); **a floor is clickable only if installed**, otherwise greyed out:
 
-| 楼层 | 产品 | 形态 |
+| Floor | Product | Form |
 | --- | --- | --- |
-| 1F | CodeBuddy | CLI（终端）与 IDE 插件，合并成一层 |
+| 1F | CodeBuddy | CLI (terminal) and IDE plugin, merged into one floor |
 | 2F | WorkBuddy | CLI |
-| 3F | Codex | CLI 与 IDE 插件（同一份落盘，合并成一层） |
-| 4F | Claude Code | CLI 与 IDE 插件（同一份落盘，合并成一层） |
-| 5F | TraeCode | IDE 本体与插件 |
-| 6F | Qoder | CLI 与插件（同一份落盘，合并成一层） |
-| 7F | Kilo Code | 终端 TUI 与 VS Code 扩展 |
-| 8F | OpenCode | CLI / TUI / 桌面端 / 网页端（同一份数据） |
-| 9F | GitHub Copilot | VS Code 插件 |
+| 3F | Codex | CLI and IDE plugin (same on-disk store, merged into one floor) |
+| 4F | Claude Code | CLI and IDE plugin (same on-disk store, merged into one floor) |
+| 5F | TraeCode | IDE proper and plugin |
+| 6F | Qoder | CLI and plugin (same on-disk store, merged into one floor) |
+| 7F | Kilo Code | Terminal TUI and VS Code extension |
+| 8F | OpenCode | CLI / TUI / desktop / web (same data) |
+| 9F | GitHub Copilot | VS Code plugin |
 
-其中 **1F / 4F / 7F / 8F 还能进议事厅**（这四层验证过可以无头调用、能关掉工具）；
-其余楼层即使装了也不会出现在议事厅的候选里，其他页面照常显示它们。
+Among them, **1F / 4F / 7F / 8F can also join the council** (these four are verified to be invocable headlessly and to have tools disabled); the other floors do not appear in the council candidates even if installed, and the other pages still show them.
 
-## 它显示什么、不显示什么
+## What it shows and does not show
 
-- **只画真值**：状态、任务、文件、耗时都来自 agent 自己上报或它本地的落盘；拿不到就写
-  「未上报 / —」，不替你编一个数字。
-- **没有假进度**：进度条已经去掉 —— 拿不到能逐轮推进的真实进度时，画出来只会骗人。
-- **状态两档**：忙碌 / 空闲（办公室名牌与卡片同一套口径）；更细的相位只在主控制台那一屏上写。
-- **心跳断了就灰**：超过 60s 没有心跳的成员标成 degraded（推断值），界面灰显并标注。
+- **Only truths**: state, tasks, files and duration all come from the agent's own reports or its local on-disk data; if it cannot get them it writes "unreported / —" rather than making up a number.
+- **No fake progress**: the progress bar is gone — when there is no real per-round progress to advance, drawing one would only deceive.
+- **Two state levels**: busy / idle (the office nameplate and the cards use the same rule); finer phases are written only on the main console screen.
+- **Grey when the heartbeat stops**: a member with no heartbeat for over 60s is marked degraded (an inferred value) and greyed out with a label.
 
-## 数据与配置
+## Data and configuration
 
-- 数据都在 `~/.workgremlin/`：`workgremlin.db`（一个 SQLite 库）+ 各产品的状态文件。
-  换目录用 `WORKGREMLIN_HOME`，换库文件用 `WORKGREMLIN_DB`。
-- 启动时会**自动把"状态上报 hook"写进已装产品的配置**（只加/更新我们自己的条目，
-  改动前备份成 `.bak-workgremlin`）。不想被自动改配置：`WORKGREMLIN_NO_AUTO_HOOKS=1`。
-- 打开工程：服务启动时定 —— `WORKGREMLIN_WORKSPACE=<目录>`（或
-  `npm run server -- --workspace <目录>`），都没给就用启动时所在目录；
-  上次打开过哪个工程会记住，下次启动自动恢复。
-- 日志：默认输出 `info` / `warn` / `error`，同时按天落到
-  `~/.workgremlin/logs/workgremlin-<YYYY-MM-DD>.log`。排障要更细：`WORKGREMLIN_LOG=debug`
-  （或 `npm run server -- --log=debug`）打开逐事件 debug；只想看问题：`WORKGREMLIN_LOG=error`；
-  `WORKGREMLIN_LOG_FILE=0` 关掉文件日志。**默认只保留 7 天**（`WORKGREMLIN_LOG_KEEP_DAYS` 可改）：
-  过期的按天文件、`hooks/events.log` 里过期的行会在启动时/跨天自动清掉。
+- All data lives in `~/.workgremlin/`: `workgremlin.db` (one SQLite database) + each product's state files. Change the directory with `WORKGREMLIN_HOME`, change the database file with `WORKGREMLIN_DB`.
+- At startup it **automatically writes the "status reporting hook" into the config of installed products** (only adds/updates our own entry, backing up to `.bak-workgremlin` before changing). To opt out of automatic config changes: `WORKGREMLIN_NO_AUTO_HOOKS=1`.
+- Open a project: decided at server startup — `WORKGREMLIN_WORKSPACE=<dir>` (or `npm run server -- --workspace <dir>`); if neither is given it uses the directory it was started from. The last opened project is remembered and restored on the next startup.
+- Logs: by default outputs `info` / `warn` / `error`, and writes per-day to `~/.workgremlin/logs/workgremlin-<YYYY-MM-DD>.log`. For finer troubleshooting: `WORKGREMLIN_LOG=debug` (or `npm run server -- --log=debug`) enables per-event debug; to see only problems: `WORKGREMLIN_LOG=error`; `WORKGREMLIN_LOG_FILE=0` turns off file logging. **Keeps only 7 days by default** (`WORKGREMLIN_LOG_KEEP_DAYS` changes it): expired per-day files and expired lines in `hooks/events.log` are cleaned up at startup / when the day changes.
 
-## 文档
+## Documentation
 
-| 想看什么 | 看哪份 |
+| What you want | Which file |
 | --- | --- |
-| 这一版发了什么、已知问题 | `docs/releases/` |
-| 产品要什么、验收标准 | `docs/requirements.md` |
-| 代码实际怎么做的、与文档哪里对不上 | `docs/implementation-status.md` |
-| 技术选型与数据结构 | `docs/tech-design.md` |
-| 跑起来 / 排障 | `docs/runbook.md` |
+| What this release shipped, known issues | `docs/releases/` |
+| What the product requires, acceptance criteria | `docs/requirements.md` |
+| How the code actually works, where it diverges from the docs | `docs/implementation-status.md` |
+| Tech choices and data structures | `docs/tech-design.md` |
+| Run it / troubleshoot | `docs/runbook.md` |
