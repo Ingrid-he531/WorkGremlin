@@ -2,29 +2,31 @@
 'use strict';
 
 /**
- * 各受监控产品的 hook 入口（codebuddy / codex / workbuddy / trae / claude / qoder …）。
+ * Hook entry point for the monitored products (codebuddy / codex / workbuddy / trae / claude / qoder …).
  *
- * 2026-10 重构：hook 退化成「只读 stdin 事件 → POST /api/v1/hook → 退出」的纯转发器。
- * 所有落盘解析 / 会话状态 / 台账写入 / token 读取 / 子代理幽灵 全部在服务端完成
- * （server/src/ingest/hookCommon.js）—— 服务端是本地进程，与 CLI 同机同文件系统，本就读得到 agent 的落盘。
+ * Refactor 2026-10: the hook became a pure forwarder — "read a stdin event → POST /api/v1/hook → exit".
+ * All on-disk parsing / session state / ledger writes / token reading / subagent ghosts happen on the
+ * server (server/src/ingest/hookCommon.js) — the server is a local process on the same machine and
+ * filesystem as the CLI, so it can read the agent's on-disk data anyway.
  *
- * 由 scripts/install-hooks.js 写进各家的 settings.json，形如：
+ * Written into each product's settings.json by scripts/install-hooks.js, like:
  *   { "hooks": { "SessionStart": [ { "matcher": "", "hooks": [
  *       { "type": "command", "command": "node /abs/packages/reporter/src/hook.js --agent codex", "timeout": 10 } ] } ] } }
  *
- * 三条纪律（与重构前一致）：
- *   1) 服务没起 / 拿不到上下文 / 上报失败 —— 一律静默退出 0，绝不阻塞 agent；
- *   2) stdout 一个字都不写（调试走 stderr + WORKGREMLIN_HOOK_DEBUG=1）；
- *   3) 失败时吞掉异常，process.exit(0)，agent 不能被 hook 卡住。
+ * Three disciplines (same as before the refactor):
+ *   1) server not running / no context / report failed — always exit 0 silently, never block the agent;
+ *   2) write not a single byte to stdout (debugging goes to stderr with WORKGREMLIN_HOOK_DEBUG=1);
+ *   3) swallow exceptions on failure and process.exit(0); the agent must not be held up by the hook.
  *
- * 用法：node hook.js --agent <name>
- * 环境变量：WORKGREMLIN_DISABLE=1 直接跳过；WORKGREMLIN_HOOK_DEBUG=1 打 stderr 诊断。
+ * Usage: node hook.js --agent <name>
+ * Env: WORKGREMLIN_DISABLE=1 skips entirely; WORKGREMLIN_HOOK_DEBUG=1 prints stderr diagnostics.
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 
-// 只取 readServerInfo（探测本地 server 的 port / token，转发 POST 要用）；其余路由常量由服务端持有。
+// Only readServerInfo is needed (to find the local server's port / token for the forwarding POST);
+// the route constants are owned by the server.
 const { readServerInfo } = require('./index');
 const { home } = require('@workgremlin/shared');
 
@@ -34,13 +36,13 @@ const STDIN_TIMEOUT_MS = 1_500;
 const DEBUG = process.env.WORKGREMLIN_HOOK_DEBUG === '1';
 const debug = (...args) => { if (DEBUG) console.error('[workgremlin-hook]', ...args); };
 
-/** 追加式事件时间线（诊断用），写到 ~/.workgremlin/hooks/events.log */
+/** Append-only event timeline (for diagnostics), written to ~/.workgremlin/hooks/events.log */
 function trace(event, extra) {
   try {
     const line = `${new Date().toISOString()} ${event}${extra ? ' ' + JSON.stringify(extra) : ''}\n`;
     fs.appendFileSync(path.join(home(), 'hooks', 'events.log'), line);
   } catch {
-    /* 落盘失败不影响 hook */
+    /* a failed write must not affect the hook */
   }
 }
 
@@ -49,7 +51,7 @@ function flag(argv, name) {
   return i >= 0 ? argv[i + 1] || '' : '';
 }
 
-/** 读 stdin 全部内容（带超时兜底，绝不阻塞 agent） */
+/** Read all of stdin (with a timeout fallback; never block the agent) */
 function readStdin() {
   return new Promise((resolve) => {
     let data = '';
@@ -70,7 +72,7 @@ function readStdin() {
   });
 }
 
-/** 转发到本地 server（复用 Bearer 令牌）。body 非空即 POST，否则 GET。 */
+/** Forward to the local server (reusing the Bearer token). A non-empty body means POST, otherwise GET. */
 async function request(info, route, body) {
   const init = {
     method: body ? 'POST' : 'GET',
@@ -95,12 +97,13 @@ async function request(info, route, body) {
 }
 
 async function main() {
-  // 议事厅参与者不上报（见 server/src/council/agents.js 的 QUIET_ENV）：在读 stdin / 连服务端前就退。
-  // 必须在最前面：hook 是被各家 CLI 同步等着的，早退一步参与者就少等一步。
+  // Council participants are not reported (see server/src/council/agents.js QUIET_ENV): exit before
+  // reading stdin / connecting to the server. Must be first — the hook is awaited synchronously by each
+  // CLI, so returning a step earlier saves the participant a step.
   if (process.env.WORKGREMLIN_DISABLE === '1') return;
 
   const argv = process.argv.slice(2);
-  // 主 agent 身份：安装器在命令里用 --agent 注入，必填；缺了直接报错退出。
+  // Main agent identity: the installer injects it via --agent; required, error out if missing.
   const agent = flag(argv, '--agent');
   if (!agent) {
     console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / workbuddy / trae / claude / qoder）');
@@ -123,17 +126,18 @@ async function main() {
     return;
   }
   /**
-   * 本事件ev.client来自哪个客户端（vscode / null / cli …）。
+   * Which client this event's ev.client came from (vscode / null / cli …).
    */
   trace(ev.hook_event_name, { agent: ev.agent || agent, client:ev.client, session: ev.session_id, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
-  // 纯转发：落盘解析 / 会话状态 / 台账 / token / 子代理幽灵 全在服务端做（server/src/ingest/hookCommon.js）。
-  // 把 agent / form / workspacePath 一并带上，服务端据此路由到对应楼层并归工程。
+  // Pure forwarding: on-disk parsing / session state / ledger / tokens / subagent ghosts all happen on
+  // the server (server/src/ingest/hookCommon.js). Pass agent / form / workspacePath along; the server
+  // routes them to the right floor and resolves the project.
   await request(info, '/api/v1/hook', { ...ev, agent, workspacePath: cwd });
 }
 
 main().catch((err) => {
   debug('异常（忽略）：', err && err.message);
-  process.exit(0); // hook 失败绝不能把 agent 卡住
+  process.exit(0); // a failed hook must never hold up the agent
 });

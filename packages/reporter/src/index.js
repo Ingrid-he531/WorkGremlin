@@ -1,19 +1,19 @@
 'use strict';
 
 /**
- * agent 侧上报 SDK（零依赖，Node >= 18 自带 fetch）。
+ * Agent-side reporting SDK (zero dependencies; Node >= 18 ships fetch).
  *
- * 用法（agent runner 内）：
+ * Usage (inside an agent runner):
  *   const rep = await createReporter({ project: 'my-project', member: 'coder' });
- *   const task = rep.task('实现工位视图');
+ *   const task = rep.task('implement the workstation view');
  *   await task.progress(0.4, { files: ['renderer/src/components/WorkstationCard.vue'] });
  *   await task.end('done', { artifacts: [{ kind: 'file', title: 'WorkstationCard.vue', path: '...' }] });
  *   rep.close();
  *
- * 设计原则：
- *   - 上报失败**静默重试一次**，绝不阻塞 agent 主流程；
- *   - 服务端地址与 token 从 ~/.workgremlin/server.json 读取（可用 WORKGREMLIN_HOME 覆盖）；
- *   - 拿不到的数据就不上报（progress/files 允许缺省），后端据此显示"未知"，不编造。
+ * Design principles:
+ *   - a failed report **retries silently once** and never blocks the agent's main flow;
+ *   - the server address and token are read from ~/.workgremlin/server.json (overridable with WORKGREMLIN_HOME);
+ *   - don't report what you don't have (progress/files may be omitted); the backend then shows "unknown", never invent.
  */
 
 const fs = require('node:fs');
@@ -44,7 +44,7 @@ async function createReporter(opts) {
   const member = opts.member;
   const silent = opts.silent !== false;
 
-  /** 上报归属的工程：没显式指定就跟随服务端"当前打开的工程" */
+  /** The project this report belongs to: follow the server's "currently open project" unless set explicitly */
   let project = opts.project;
   if (!project) {
     try {
@@ -54,7 +54,7 @@ async function createReporter(opts) {
       const cur = res.ok ? await res.json() : null;
       project = (cur && cur.project) || '';
     } catch {
-      /* 服务端不可达：留空，后续上报会被拒（总比写进错的工程好） */
+      /* server unreachable: leave it empty; later reports get rejected (better than writing into the wrong project) */
     }
   }
 
