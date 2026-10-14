@@ -18,9 +18,10 @@ import { useI18n } from '../i18n';
 import { marked } from 'marked';
 
 /**
- * 打开时停在哪个视图（list / summary / board）。
- * 只有默认值在真跑时用得上；SSR 冒烟测试（renderSmoke）靠它把汇总 / 看板那两个分支也渲染一遍 ——
- * 否则那两块只有手点才走到，白屏类的问题（2026-10-01 汇总页整页空白）测不出来。
+ * Which view to open on (list / summary / board).
+ * Only the default matters at runtime; the SSR smoke test (renderSmoke) uses it to render the
+ * summary / board branches too — otherwise those two are only reachable by hand, and white-screen
+ * bugs (the 2026-10-01 blank summary page) would go untested.
  */
 const props = defineProps({
   initialView: { type: String, default: 'list' },
@@ -30,17 +31,20 @@ const project = useProjectStore();
 const session = useSessionStore();
 const tasks = useTaskStore();
 /**
- * 取个别名 `tr`：这个文件里 `t` 到处都是"一条任务"（`dimLabel(t, dim)`、`v-for="t in list"`、
- * 模板里的行变量），用 `tr` 当翻译函数就永远不会被行变量遮住。
+ * Alias the translator as `tr`: in this file `t` means "a task" everywhere (`dimLabel(t, dim)`,
+ * `v-for="t in list"`, row variables in the template), so calling the translation function `tr`
+ * keeps it from ever being shadowed by a row variable.
  */
 const { t: tr } = useI18n();
 
 /**
- * 任务详情「产出摘要」的 markdown 渲染。
- * agent 的 result 是一段 markdown（标题 / 列表 / 代码块 / 加粗 …），原先用 <p> + pre-wrap 当纯文本，
- * 标题列表代码块全糊成一团。这里解析成 HTML 再用 DOMParser 做一层轻量 sanitize
- * （去掉 script/style 与 on* 属性、javascript: 链接）—— 产出来自本机 agent，风险很低，
- * 但渲染层不该原样执行任意 HTML。非浏览器环境（单测）直接返回 marked 原输出，不影响断言。
+ * Markdown rendering for the task-detail "output summary".
+ * An agent's result is a chunk of markdown (headings / lists / code blocks / bold …); it used to be
+ * shown as plain text with <p> + pre-wrap, which mashed headings, lists and code blocks together.
+ * Here it is parsed to HTML and then lightly sanitized with DOMParser (drop script/style and on*
+ * attributes, javascript: links) — the output comes from a local agent so the risk is low, but the
+ * render layer should not execute arbitrary HTML as-is. In non-browser environments (unit tests) it
+ * returns marked's raw output so assertions are unaffected.
  */
 const md = (text) => {
   if (!text) return '';
@@ -59,15 +63,17 @@ const md = (text) => {
   return doc.body.innerHTML;
 };
 
-/** 一级检索的可选项：所有工程 + 所有楼层（楼层 = 成员 client） */
+/** Top-level filter options: all projects + all floors (a floor = a member client) */
 const projectOptions = computed(() => project.projects || []);
-// 楼层里只有带 client 的才能当任务过滤维度（部分楼层 unreported 没有 client）
+// Only floors with a client can serve as a task filter dimension (some floors are unreported and have no client)
 const floorOptions = computed(() => (session.floors || []).filter((f) => f.client));
 
 /**
- * 楼层 ↔ 客户端（轴 1）：
- *   - 合并楼层（1F CodeBuddy = CLI + Plugin）的 key 是**逗号分隔的 client 串**，服务端按集合取；
- *   - 单楼层就是一个 client，走同一条路（串里只有它自己），行为不变。
+ * Floor ↔ client (axis 1):
+ *   - A merged floor (1F CodeBuddy = CLI + Plugin) has a **comma-separated client string** as its
+ *     key; the server matches it as a set;
+ *   - A single floor is just one client and takes the same path (the string holds only itself), so
+ *     behavior is unchanged.
  */
 function floorClients(f) {
   return Array.isArray(f.clients) && f.clients.length ? f.clients : f.client ? [f.client] : [];
@@ -75,11 +81,11 @@ function floorClients(f) {
 function floorValue(f) {
   return floorClients(f).join(',');
 }
-/** 下拉条目文案：楼层号 + 产品名（"1F CodeBuddy"）；楼层号缺省时只给名字，不编造 */
+/** Dropdown item text: floor number + product name ("1F CodeBuddy"); when the floor number is missing, give only the name — never invent one */
 function floorText(f) {
   return [f.id, f.name].filter(Boolean).join(' ');
 }
-/** 这条任务的 agent 归哪个楼层（按 agent 基名认，CLI/插件同层） */
+/** Which floor this task's agent belongs to (matched by base agent name; CLI and plugin share a floor) */
 function floorOfClient(c) {
   const k = String(c || '')
     .split('@')[0]
@@ -93,17 +99,19 @@ function floorOfClient(c) {
 }
 
 /**
- * 「此刻」有两处用：看板上**还在跑的任务画到哪一格**、以及时间筛选的「今天 / 过去 7 天」
- * 从哪算起（见 lib/timeRange.js）。跟着本页已有的 4s 轮询一起走，不另起定时器 ——
- * 页面开着跨过午夜时，「今天」会自己滚到新的一天。
+ * "Now" is used in two places: which cell a **still-running task** is drawn up to on the board, and
+ * where the time-filter "today / past 7 days" starts from (see lib/timeRange.js). It rides along
+ * with the page's existing 4s poll instead of starting another timer — the page can stay open across
+ * midnight, and "today" rolls over to the new day by itself.
  *
- * **必须声明在 list 之前**：下面那个 `watch(list, …, { immediate: true })` 在注册的那一刻就
- * 求值，而它经 inTimeWindow → timeWindow 读 nowMs；挪到文件后半段就是 TDZ
- * （Cannot access 'nowMs' before initialization），整个页面白屏。
+ * **Must be declared before list**: the `watch(list, …, { immediate: true })` below evaluates the
+ * moment it is registered, and it reads nowMs through inTimeWindow → timeWindow; moving it to the
+ * second half of the file causes a TDZ error (Cannot access 'nowMs' before initialization) and
+ * blanks the whole page.
  */
 const nowMs = ref(Date.now());
 
-/** 每 4s 轮询一次（任务/ subagent 是低频事件，轮询足够，不必挂 WS） */
+/** Poll every 4s (tasks / subagents are low-frequency events, so polling is enough; no WS needed) */
 const POLL_MS = 4000;
 let timer = null;
 
@@ -111,7 +119,7 @@ function start() {
   nowMs.value = Date.now();
   tasks.fetchTasks();
   if (timer) clearInterval(timer);
-  // 「此刻」跟着这轮轮询一起走：看板上"还在跑的任务画到哪一格"才不会停在打开页面那一刻
+  // "Now" rides along with each poll so the board's "how far a running task is drawn" doesn't freeze at page-open time
   timer = setInterval(() => {
     nowMs.value = Date.now();
     tasks.fetchTasks();
@@ -127,7 +135,7 @@ onMounted(() => {
   loadRetention();
 });
 onUnmounted(stop);
-// 切工程时重拉 + 复位筛选
+// When the project changes, refetch and reset filters
 watch(
   () => project.project && project.project.id,
   (id) => {
@@ -144,7 +152,7 @@ watch(
     if (id) tasks.fetchTasks();
   }
 );
-// 一级检索变化 → 重新拉取（project / client 走服务端）
+// Top-level filter changed → refetch (project / client go through the server)
 watch(
   () => [tasks.filterProject, tasks.filterClient],
   () => tasks.fetchTasks()
@@ -155,7 +163,7 @@ function toggleSub(id) {
   expandedSub.value = expandedSub.value === id ? null : id;
 }
 
-// ---- 格式化 ----
+// ---- Formatting ----
 function fmtTime(ms) {
   if (!ms) return '—';
   const d = new Date(ms);
@@ -176,26 +184,30 @@ function fmtTokens(n) {
   if (n == null) return '—';
   return n.toLocaleString('en-US');
 }
-/** 金额（元）。null 显示 "—"（与 token 行口径一致），否则 ¥12.50 保留两位小数。 */
-function fmtYuan(n) {
+/** Usage points. null shows "—" (same convention as the token row); otherwise a plain number with
+ *  two decimals, no currency symbol. */
+function fmtPoints(n) {
   if (n == null) return '—';
-  return `¥${Number(n).toFixed(2)}`;
+  return Number(n).toFixed(2);
 }
-/** 判断是否 Trae 任务：Trae 客户端有 `"trae"`（纯 trae）或 `"trae,trae-plugin"`（逗号分隔）。
- *  Trae 的 renderer.log 只给金额、不给 input/output_tokens 分项 → 详情面板用「金额」代替「词元」。 */
+/** Whether this is a Trae task: the Trae client reports `"trae"` (plain trae) or `"trae,trae-plugin"`
+ *  (comma-separated). Trae's renderer.log only gives an amount, not an input/output_tokens breakdown
+ *  → the detail panel shows "points" instead of "tokens". */
 function isTraeTask(t) {
   const c = t && String(t.client || '');
   if (!c) return false;
   return c.split(',').map((x) => x.trim()).includes('trae');
 }
 /**
- * 本轮的**输入总量** = 非缓存 + 缓存读。
+ * This round's **total input** = non-cached + cache reads.
  *
- * 库里两列是分开存的（语义见 server/src/db/schema.sql 的注释：`input_tokens` 只是**没命中缓存**
- * 的那部分），而人问"这轮输入了多少"问的是整段送进去的上下文 —— 只显示 input_tokens 那一列，
- * 4F Claude 会显示成 161 而实际是 46,497，看着像坏了。拆分明细挂在 title 上。
- * 两列全 NULL = 这个楼层报不出 token（5F/6F/9F…）→ 返回 null 显示 "—"，
- * 与"消耗为 0"区分开（后者会显示 0）。
+ * The two columns are stored separately in the DB (semantics in the comment in
+ * server/src/db/schema.sql: `input_tokens` is only the part that **did not hit the cache**), and when
+ * a person asks "how much went in this round" they mean the whole context that was sent — showing
+ * only the input_tokens column makes 4F Claude display 161 when the real number is 46,497, which
+ * looks broken. The breakdown is attached to the title.
+ * Both columns NULL = this floor can't report tokens (5F/6F/9F…) → return null to show "—", which is
+ * distinct from "consumed zero" (the latter displays 0).
  */
 function inputTotalOf(t) {
   if (!t) return null;
@@ -204,28 +216,30 @@ function inputTotalOf(t) {
   return parts.reduce((s, v) => s + (Number(v) || 0), 0);
 }
 /**
- * 「词元」那一行：三项**全摊开**、用 " / " 隔开（2026-10-01 用户要求；2026-10-08 用户要求
- * 去掉「缓存写输入」—— 本机 12 个楼层实测这一列**恒为 0**，占一格还不带信息）。
- * 顺序照库里的列序 —— **非缓存输入 / 缓存读输入 / 输出**，
- * 前两项相加才是"这一轮输入总量"（库里 `input_tokens` 不含缓存，见 schema.sql 的注释；
- * 只显示它的话 4F Claude 会出现 "5,662" 而实际送进去 1,457,438，看着像坏了）。
- * 每一项各取各的：报不出 token 的楼层三项都是 "—"（**不是 0** ——"报不出来"与"消耗为零"是两回事）。
+ * The "tokens" row: all three values **laid out**, separated by " / " (user request 2026-10-01;
+ * on 2026-10-08 the user asked to drop "cache write input" — on this machine that column is always 0
+ * across all 12 floors, so it takes a cell without adding information).
+ * Order follows the DB column order — **non-cached input / cache-read input / output**; the first
+ * two sum to "this round's total input" (input_tokens in the DB excludes the cache, see schema.sql;
+ * showing only it makes 4F Claude read "5,662" when 1,457,438 actually went in, which looks broken).
+ * Each item is taken on its own: for floors that can't report tokens all three are "—" (**not 0** —
+ * "can't report" and "consumed zero" are two different things).
  */
 function tokenQuadOf(t) {
   const s = t || {};
   return [s.input_tokens, s.cache_read_tokens, s.output_tokens].map(fmtTokens).join(' / ');
 }
-/** 「词元」那一行的悬停说明：三个数各是什么（顺序与主行一致）+ 前两项的合计 */
+/** Hover text for the "tokens" row: what each of the three numbers is (same order as the main row) + the sum of the first two */
 function tokenTitleOf(t) {
   const head = tr('records.tokens_order');
   const total = inputTotalOf(t);
   return total == null ? head : tr('records.tokens_total', { head, n: fmtTokens(total) });
 }
 /**
- * 一条任务的**总词元** = 非缓存输入 + 缓存读输入 + 输出（三项全加）。
- * 汇总报表「数据总览」那张表（一行一个任务）的「词元」列用它。
- * 三项全 NULL（5F TraeCode / 6F Qoder 这些报不出 token 的楼层）→ null 显示 "—"，
- * 与"消耗为 0"区分开（后者会显示 0）。
+ * A task's **total tokens** = non-cached input + cache-read input + output (all three added).
+ * The "tokens" column of the summary report's "data overview" table (one row per task) uses it.
+ * All three NULL (5F TraeCode / 6F Qoder and other floors that can't report tokens) → null shows "—",
+ * distinct from "consumed zero" (the latter displays 0).
  */
 function totalTokensOf(t) {
   if (!t) return null;
@@ -233,7 +247,7 @@ function totalTokensOf(t) {
   if (parts.every((v) => v == null)) return null;
   return parts.reduce((s, v) => s + (Number(v) || 0), 0);
 }
-/** 状态 key → i18n 词条（筛选项与表格里的状态列共用） */
+/** State key → i18n entry (shared by the filter options and the state column in the table) */
 const STATE_KEY = {
   all: 'records.state.all',
   pending: 'records.state.pending',
@@ -245,8 +259,9 @@ const STATE_KEY = {
 function stateLabel(s) {
   return STATE_KEY[s] ? tr(STATE_KEY[s]) : s || '—';
 }
-/** 当前**没有调用方**：详情里那一行「进度」按 2026-09-29 的要求注释掉了（见模板里的说明），
- *  留着是为了将来有真进度时一行就能放回来。progress 现在只有 0 / 1 两个取值。 */
+/** Currently **has no caller**: the "progress" row in the detail was commented out per the
+ *  2026-09-29 request (see the note in the template); it is kept so one line can bring it back once
+ *  there is real progress. progress now only takes 0 / 1. */
 function fmtProgress(p) {
   if (p == null) return '—';
   return `${Math.round(p * 100)}%`;
@@ -259,7 +274,7 @@ function filesOf(task) {
   } catch {
     a = [];
   }
-  // 兼容老数据（纯路径字符串 / {path,added,removed}）与新结构（{path,op,size}）
+  // Tolerate old data (plain path strings / {path,added,removed}) and the new shape ({path,op,size})
   return a.map((x) => {
     if (typeof x === 'string') return { path: x, op: null, size: null };
     return { path: x.path, op: x.op ?? null, size: x.size ?? null };
@@ -267,9 +282,10 @@ function filesOf(task) {
 }
 
 /**
- * 这一轮用过的工具（名字 + 次数）。服务端按 tool_usage 表聚合好随任务行下发
- * （见 server/src/http/routes/query.js 的 /task-runs）；没有记录就是空数组，
- * 详情里那一段整块不显示 —— 前端不折算、不编造。
+ * Tools used this round (name + count). The server aggregates them from the tool_usage table and
+ * sends them with the task row (see /task-runs in server/src/http/routes/query.js); with no records
+ * it's an empty array and that whole section is hidden in the detail — the frontend neither converts
+ * nor invents anything.
  */
 function toolsOf(task) {
   const a = task && task.tools;
@@ -280,12 +296,13 @@ function toolsOf(task) {
 }
 
 /**
- * 任务标题里的"用户原话"。
+ * The "user's own words" inside a task title.
  *
- * 老数据（hook 修掉之前）把 IDE 注入的那段上下文整段当标题存了下来 ——
- * `# Context from my IDE setup: ## Active file: …`。钩子那边已经不再这么存（规则见
- * packages/reporter/src/hook.js 的 userRequestText），但**历史行**还在库里，显示时按
- * 同一套规则再剥一次，任务列表才不是一屏 IDE 上下文。规则与 hook 侧保持一致。
+ * Old data (from before the hook was fixed) stored the whole IDE-injected context block as the title
+ * — `# Context from my IDE setup: ## Active file: …`. The hook no longer stores it that way (the
+ * rule is in userRequestText in packages/reporter/src/hook.js), but **historical rows** are still in
+ * the DB, so strip it once more with the same rule at display time — otherwise the task list is a
+ * screen of IDE context. The rule is kept consistent with the hook side.
  */
 function promptOf(t) {
   const raw = String((t && t.title) || '').replace(/\r\n?/g, '\n');
@@ -300,21 +317,25 @@ function promptOf(t) {
   return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
 }
 /**
- * 会话标题：**会话级**的名字 —— 同一条会话的各轮任务拿到同一个值，
- * 凭它认出"哪些任务属于同一个会话"（一轮 = 一行任务，各轮自己的标题互不相同）。
- * 服务端取值顺序：6F/7F/8F 用它们 SQLite 里的会话摘要；其余楼层兜底成
- * 这条会话**第一轮**的用户原话（会话开始时的标题就是用户原话）。
- * 拿不到一律空串（见 server/src/sessionTitle.js），这里就不显示那一行。
+ * Session title: a **session-level** name — every round of the same session gets the same value, and
+ * it is how you tell "which tasks belong to the same session" (a round = a task row; each round's own
+ * title differs).
+ * Server lookup order: 6F/7F/8F use the session summary in their SQLite; other floors fall back to
+ * the user's words from the **first round** of that session (the title when the session starts is
+ * the user's words).
+ * When it can't be found it's always an empty string (see server/src/sessionTitle.js), and that row
+ * is simply not shown here.
  */
 function sessionTitleOf(t) {
   return String((t && t.session_title) || '').trim();
 }
 /**
- * 列表 / 汇总 / 甘特 / 导出一律显示**这一轮自己的用户输入**（promptOf），不用会话标题 ——
- * 会话标题是会话级的（同一会话各轮共用同一个值），拿它当行标题会让一列任务全显示成
- * 第一轮的那一句，分不出谁是谁。它只在详情里单列一行（见详情的「会话标题」）。
+ * The list / summary / gantt / export all show **this round's own user input** (promptOf), never the
+ * session title — the session title is session-level (shared by every round of a session), so using
+ * it as a row title would make a whole column read as the first round's sentence, indistinguishable.
+ * It appears only as a single row in the detail (see "session title" in the detail).
  */
-/** 把 hook 的 op 归到三类：add=新增 / del=删除 / mod=改动（含老数据无 op） */
+/** Bucket a hook op into one of three kinds: add = new / del = deleted / mod = changed (includes old data with no op) */
 function classify(f) {
   if (f.op === 'delete') return 'del';
   if (f.op === 'write') return 'add';
@@ -323,7 +344,7 @@ function classify(f) {
 const addedFiles = (t) => filesOf(t).filter((f) => classify(f) === 'add');
 const modifiedFiles = (t) => filesOf(t).filter((f) => classify(f) === 'mod');
 const deletedFiles = (t) => filesOf(t).filter((f) => classify(f) === 'del');
-/** 字节数 -> 人类可读（B / KB / MB） */
+/** Byte count -> human readable (B / KB / MB) */
 function fmtSize(n) {
   if (n == null) return '';
   if (n < 1024) return `${n}B`;
@@ -331,20 +352,21 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
-/** 顶部筛选：状态分段 + 标题关键词（仅本页生效，纯客户端过滤，不改表结构） */
+/** Top filters: state segments + title keyword (page-local only, pure client-side filtering, no schema change) */
 const FILTER_STATES = ['all', 'running', 'done', 'failed', 'cancelled', 'pending'];
 const filterState = ref('all');
 const keyword = ref('');
 
 /**
- * 时间筛选（2026-10-01 用户要求）。档位表与窗口算法都在 lib/timeRange.js（纯函数、有回归
- * 测试 —— 这里全是跨午夜 / 月末 / 夏令时的边界，混在 SFC 里测不动）。
+ * Time filter (user request 2026-10-01). The bucket table and window algorithm live in
+ * lib/timeRange.js (pure functions with regression tests — everything here is a midnight / month-end
+ * / DST boundary and can't be tested inside an SFC).
  *
- * "此刻"取 nowMs（跟着本页 4s 轮询走）：页面开着跨过午夜时，「今天」会自己滚到新的一天，
- * 不必另起定时器。
+ * "Now" comes from nowMs (riding along with the page's 4s poll): when the page stays open across
+ * midnight "today" rolls over to the new day by itself, no extra timer needed.
  */
 const filterTime = ref('all');
-/** 时间档位的文案（档位表在 lib/timeRange.js，文案在中英文案表里；认不出的 key 原样显示） */
+/** Time bucket labels (the bucket table is in lib/timeRange.js, the text is in the i18n tables; an unknown key is shown as-is) */
 const TIME_KEY = {
   all: 'records.time.all',
   today: 'records.time.today',
@@ -358,16 +380,16 @@ const TIME_KEY = {
 function timeRangeLabel(key) {
   return TIME_KEY[key] ? tr(TIME_KEY[key]) : String(key || '');
 }
-/** 自定义区间：两个 <input type="date"> 的值，本地 YYYY-MM-DD（空 = 那一端不设限） */
+/** Custom range: the values of two <input type="date"> fields, local YYYY-MM-DD (empty = that end is unbounded) */
 const customFrom = ref('');
 const customTo = ref('');
 const timeWindow = computed(() => timeWindowOf(filterTime.value, nowMs.value, customFrom.value, customTo.value));
-/** 这条任务的开始时刻落在当前时间窗里吗（口径见 lib/timeRange.js 的 inTimeWindow） */
+/** Does this task's start time fall in the current time window? (semantics in inTimeWindow in lib/timeRange.js) */
 function inTimeWindow(t) {
   return inWindowAt(t && t.started_at, timeWindow.value);
 }
 
-/** 三个并列视图，共享上方筛选条件：列表视图（默认）/ 汇总报表 / 图形看板 */
+/** Three parallel views sharing the filters above: list (default) / summary report / graphical board */
 const VIEWS = [
   { key: 'list', label: 'records.view.list' },
   { key: 'summary', label: 'records.view.summary' },
@@ -375,7 +397,7 @@ const VIEWS = [
 ];
 const view = ref(props.initialView);
 
-// 模型无专属下拉，留给“汇总报表”点行下钻时用的客户端筛选（默认空=不过滤，不影响列表视图现有逻辑）
+// There is no dedicated model dropdown; this backs the client-side filter used when drilling down from a summary report row (empty = no filter, list-view logic unchanged)
 const filterModel = ref('');
 
 const list = computed(() => {
@@ -390,7 +412,7 @@ const list = computed(() => {
   });
 });
 
-// 列表视图打开 / 数据刷新后，若尚未选中任何任务则默认选中第一条；无任务时右侧留空。
+// After the list opens / data refreshes, default-select the first task if none is selected; with no tasks the right side stays empty.
 watch(
   list,
   (arr) => {
@@ -399,13 +421,14 @@ watch(
   { immediate: true }
 );
 
-// ---- 汇总报表：按维度聚合（基于已筛选的 list，三视图共享筛选条件）----
+// ---- Summary report: aggregate by dimension (based on the filtered list, filters shared by all three views) ----
 /**
- * 维度页签的顺序 = 数组顺序。「数据总览」放最前面（用户 2026-10-01 要求），它也是打开报表时的
- * 默认视图。
+ * The dimension tab order = the array order. "Data overview" comes first (user request 2026-10-01)
+ * and is also the default view when the report opens.
  *
- * key 仍叫 `time`：它标的是"这一版按时间逐条列任务"（跟那三个按维度聚合的并列），
- * 只是页签文案改成了「数据总览」—— key 是内部标识，跟着 CSV 分支与测试走，不改。
+ * The key is still `time`: it marks "this version lists tasks one by one in time order" (parallel to
+ * the three dimension-aggregated ones); only the tab text became "data overview" — the key is an
+ * internal identifier used by the CSV branch and tests, so it stays.
  */
 const DIMS = [
   { key: 'time', label: 'records.dim.time' },
@@ -419,14 +442,14 @@ const DIM_COL = {
   floor: 'records.dim.floor',
   time: 'records.col.time',
 };
-/** 默认停在第一个维度（现在就是「数据总览」）—— 页签排在最前、打开也是它 */
+/** Default to the first dimension (currently "data overview") — it is the first tab and what opens by default */
 const reportDim = ref(DIMS[0].key);
 const reportSort = ref({ key: 'taskCount', dir: 'desc' });
 
 function dimValue(t, dim) {
   if (dim === 'project') return t.project_id || '';
   if (dim === 'model') return t.model || '';
-  // 按楼层聚合：CLI 与 Plugin 两个 client 归同一个楼层（1F CodeBuddy）→ 同一个分组 key
+  // Aggregate by floor: the CLI and Plugin clients belong to the same floor (1F CodeBuddy) → same group key
   if (dim === 'floor') {
     const f = floorOfClient(t.memberId || t.client);
     return f ? floorValue(f) : t.client || '';
@@ -450,22 +473,24 @@ const reportGroups = computed(() => {
     const k = dimValue(t, dim);
     let g = map.get(k);
     if (!g) {
-      // sids：这一组里出现过的 session_id（去重用）—— 会话数 = 它有多少个元素，
-      // 不是任务数（一条会话通常有多轮任务）。会话级去重，任务数照旧一轮算一条。
+      // sids: the session_ids seen in this group (for dedup) — the session count = how many elements
+      // it has, not the task count (a session usually has several rounds). Session-level dedup; the
+      // task count still counts one per round.
       g = { key: k, label: dimLabel(t, dim), taskCount: 0, sids: new Set(), successCount: 0, cancelCount: 0, fileCount: 0, durationSum: 0, durN: 0, tokenSum: 0, tokenN: 0 };
       map.set(k, g);
     }
     g.taskCount += 1;
     const sid = String(t.session_id || '').trim();
     if (sid) g.sids.add(sid);
-    // 没有 session_id 的老任务：占一条任务，但不撑会话数（不知道它属于哪条会话，不编造）
+    // Old tasks without a session_id: they count as one task but do not inflate the session count (we don't know which session they belong to, so don't invent one)
     if (t.state === 'done') g.successCount += 1;
     else if (t.state === 'cancelled') g.cancelCount += 1;
     g.fileCount += Number(t.file_count) || 0;
     const d = Number(t.duration_ms) || 0;
     if (d > 0) { g.durationSum += d; g.durN += 1; }
-    // 词元合计：**只累加报得出 token 的任务**（报不出的不计入、也不当 0 拉低，
-    // 口径与「数据总览」那张表的表尾合计一致）。tokenN 记"这一组有几条真有数"。
+    // Token total: **only sum tasks that can report tokens** (ones that can't are excluded, not
+    // counted as 0, matching the footer total of the "data overview" table). tokenN records "how
+    // many rows in this group have real numbers".
     const tk = totalTokensOf(t);
     if (tk != null) { g.tokenSum += tk; g.tokenN += 1; }
   }
@@ -475,8 +500,9 @@ const reportGroups = computed(() => {
   });
 });
 const reportTotal = computed(() => {
-  // 合计的会话数 = 所有组去重后的并集（不是各组会话数相加 —— 一条会话可能同时落在
-  // 两个组里，比如同一个 session 里换过模型，按模型分组时它会进两组）
+  // Total session count = the deduplicated union over all groups (not the sum of the groups' session
+  // counts — one session can fall into two groups, e.g. switching models within a session puts it in
+  // two groups when grouping by model)
   const allSids = new Set();
   const a = reportGroups.value.reduce(
     (s, g) => {
@@ -512,26 +538,28 @@ function sortCls(key) {
   const s = reportSort.value;
   return { active: s.key === key, asc: s.key === key && s.dir === 'asc', desc: s.key === key && s.dir === 'desc' };
 }
-/* ---- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 时长 / 状态 ---- */
+/* ---- By time: list tasks one by one (no aggregation); columns = time / task / client / model / project / duration / state ---- */
 /**
- * 任务标题只取前 10 个字（超了加省略号）：这一版一行一个任务，
- * 标题原样铺开会把右边的客户端 / 模型 / 工程挤出去。完整标题挂在 title 上。
- * 用 [...s] 按**码点**切 —— 直接 slice 会把 emoji / 生僻字劈成半个，显出乱码。
+ * The task title is truncated to the first 10 characters (adds an ellipsis if longer): this version
+ * shows one task per row, and a full title would squeeze out client / model / project on the right.
+ * The full title is attached to `title`.
+ * Use [...s] to split by **code point** — a direct slice cuts emoji / rare characters in half and
+ * shows mojibake.
  */
-/** 按**码点**截断（直接 slice 会把 emoji / 生僻字劈成半个，显出乱码） */
+/** Truncate by **code point** (a direct slice cuts emoji / rare characters in half and shows mojibake) */
 function shortText(s, n = 10) {
   const chars = [...String(s || '')];
   return chars.length > n ? `${chars.slice(0, n).join('')}…` : String(s || '');
 }
 function shortTitle(task, n = 10) {
-  // 注意参数名别叫 t：这个文件里 t 到处都是"一条任务"，翻译函数取的是 tr
+  // Don't name the parameter t: in this file t means "a task" everywhere, and the translator is tr
   return shortText(promptOf(task) || tr('records.untitled_task'), n);
 }
-/** 工程列：与任务详情同一口径（服务端按工程目录现算的 project_label > 库里的 name > id） */
+/** Project column: same semantics as the task detail (server-computed project_label from the project dir > name in the DB > id) */
 function projectOf(t) {
   return t.project_label || t.project_name || t.project_id || '—';
 }
-/** 数据总览那一版的排序（默认新→旧；点表头切换） */
+/** Sorting for the data-overview version (default newest → oldest; click a header to toggle) */
 const timeSort = ref({ key: 'started_at', dir: 'desc' });
 function sortTimeBy(key) {
   if (timeSort.value.key === key) timeSort.value = { key, dir: timeSort.value.dir === 'asc' ? 'desc' : 'asc' };
@@ -550,9 +578,9 @@ const timeRows = computed(() => {
   };
   return list.value.slice().sort((a, b) => (dir === 'asc' ? val(a) - val(b) : val(b) - val(a)));
 });
-/** 表尾那一行：条数 + 总时长（没收工的任务没有 duration，不计入，不编造） */
+/** Footer row: count + total duration (tasks that never finished have no duration and are excluded, not invented) */
 const timeTotalMs = computed(() => timeRows.value.reduce((s, t) => s + (Number(t.duration_ms) || 0), 0));
-/** 表尾的会话数：这一屏涉及多少条**不同**的会话（没有 session_id 的老任务不计，不编造） */
+/** Footer session count: how many **distinct** sessions this screen covers (old tasks without a session_id are excluded, not invented) */
 const timeSessionCount = computed(() => {
   const sids = new Set();
   for (const t of timeRows.value) {
@@ -562,8 +590,9 @@ const timeSessionCount = computed(() => {
   return sids.size;
 });
 /**
- * 表尾的词元合计：**只累加报得出 token 的那些任务**（报不出的不计入，也不当 0 拉低）。
- * 一条都报不出 → null 显示 "—"（这一屏压根没有真值，写 0 会让人以为"跑了但不耗词元"）。
+ * Footer token total: **only sum tasks that can report tokens** (ones that can't are excluded, not
+ * counted as 0). If none can → null shows "—" (this screen has no real value at all; a 0 would make
+ * people think "it ran but used no tokens").
  */
 const timeTotalTokens = computed(() => {
   let sum = 0;
@@ -577,10 +606,10 @@ const timeTotalTokens = computed(() => {
   return n ? sum : null;
 });
 
-/** 点报表行：切到列表视图并按该行维度值筛选（工程/楼层走服务端筛选，模型/Agent 走客户端筛选） */
+/** Click a report row: switch to the list view and filter by that row's dimension value (project/floor go through server-side filtering, model/agent through client-side) */
 function drillDown(row) {
   const dim = reportDim.value;
-  // 数据总览那一版列的就是任务本身，点一行 = 直接看这条任务的详情
+  // The data-overview version lists tasks themselves, so clicking a row = open that task's detail
   if (dim === 'time') {
     tasks.selectTask(row.id);
     view.value = 'list';
@@ -592,7 +621,7 @@ function drillDown(row) {
   else if (dim === 'model') { filterModel.value = row.key; }
   view.value = 'list';
 }
-/** 把二维数组写成 CSV 并下载（客户端 Blob，手机号/身份证那类敏感数据不在这里，无需额外处理） */
+/** Write a 2D array as CSV and download it (client-side Blob; sensitive data like phone/ID numbers isn't here, so no extra handling) */
 function downloadCsv(fileName, lines) {
   const csv = lines
     .map((line) => line.map((c) => {
@@ -611,7 +640,7 @@ function downloadCsv(fileName, lines) {
   URL.revokeObjectURL(url);
 }
 
-/** 导出报表为 CSV（客户端下载，含当前排序与合计行；数据总览那一版导的就是逐条任务） */
+/** Export the report as CSV (client-side download, includes the current sort and the total row; the data-overview version exports the per-task rows) */
 function exportCsv() {
   if (reportDim.value === 'time') {
     const head = [
@@ -622,17 +651,17 @@ function exportCsv() {
     ];
     const rows = timeRows.value.map((t) => [
       fmtTime(t.started_at),
-      promptOf(t) || tr('records.untitled_task'), // 导出用完整标题，别把省略号也导出去
-      sessionTitleOf(t), // 会话：拿不到就是空串（表里显示 "—"，导出留空，不写占位）
+      promptOf(t) || tr('records.untitled_task'), // Export the full title, don't export the ellipsis
+      sessionTitleOf(t), // Session: empty string when unavailable (the table shows "—", the export stays empty, no placeholder)
       t.client_label,
       t.model || '',
       projectOf(t),
-      // 词元导出的是**裸数字**（不带千位逗号，Excel 才好当数值算）；取不到留空，不写 0
+      // Tokens export as a **bare number** (no thousands separators, so Excel can treat it as a number); empty when unavailable, never 0
       totalTokensOf(t) == null ? '' : totalTokensOf(t),
       t.duration_ms == null ? '' : Math.round(t.duration_ms),
       stateLabel(t.state),
     ]);
-    // 文件名跟页签走（下面聚合那几版也是拿 label 拼的），改页签文案时这里要一起改
+    // The file name follows the tab (the aggregated versions below also build it from the label); changing the tab text means changing this too
     downloadCsv(`${tr('records.view.summary')}_${tr('records.dim.time')}.csv`, [head, ...rows]);
     return;
   }
@@ -643,7 +672,7 @@ function exportCsv() {
     tr('records.col.cancel_count'), tr('records.col.file_count'), tr('records.col.token_sum'),
     `${tr('records.col.duration_sum')}(ms)`, `${tr('records.col.avg_duration')}(ms)`,
   ];
-  // 词元导出**裸数字**（不带千位逗号，Excel 里才能直接算）；这一组没有真值就留空，不写 0
+  // Tokens export as a **bare number** (no thousands separators, so Excel can calculate directly); empty when this group has no real value, never 0
   const tokenCell = (x) => (x.tokenN ? x.tokenSum : '');
   const rows = reportSorted.value.map((r) => [
     r.label, r.taskCount, r.sessionCount, r.successCount, r.cancelCount, r.fileCount,
@@ -661,18 +690,22 @@ function exportCsv() {
   downloadCsv(`${tr('records.view.summary')}_${dimLabelNow}.csv`, [head, ...rows]);
 }
 
-/* ------------------------------ 图形看板：每日 ------------------------------
- * 一天一张甘特图：
- *   横轴 = 当天 00:00–24:00，**每小时一条竖线**（刻度 09:00 / 10:00 …）；
- *   纵轴 = **楼层**（一层一行，如「3F Codex」）；
- *   行里的实心块 = 这一层的一次任务，左右两条竖边把相邻任务切开（"用竖线分割任务"）。
- * **一层恒定一行**：同一层同一时刻并行好几轮时不再往下摞泳道，而是把重叠的那一段**加深**
- * （暗色叠在块上）—— 行数稳，也照样看得出"这会儿同时跑了两三条"。
+/* ------------------------------ Graphical board: daily ------------------------------
+ * One gantt chart per day:
+ *   x-axis = the day 00:00–24:00, **one vertical line per hour** (ticks 09:00 / 10:00 …);
+ *   y-axis = **floor** (one row per floor, e.g. "3F Codex");
+ *   a solid block in a row = one task on that floor; its left and right vertical edges cut it off
+ *   from the neighboring tasks ("divide tasks with vertical lines").
+ * **One row per floor, always**: when several rounds run in parallel on the same floor we no longer
+ * stack more lanes downward but **darken** the overlapping span (a dark layer on the block) — the row
+ * count stays stable, and you can still see "two or three are running at once".
  *
- * 口径：
- *   · 不分楼层？不 —— 看板就是按楼层分行的；上方筛选栏照旧生效（工程 / 楼层 / 状态 / 关键字
- *     都作用在 list 上），所以只筛某一层时图上就只有那一行；
- *   · 跨天 / 没有结束时间 / 只有开始时间这些边界都在 lib/dayBoard.js（纯函数，有回归测试）。
+ * Semantics:
+ *   · Split by floor? No — the board is divided by floor by definition; the filter bar above still
+ *     applies (project / floor / state / keyword all act on list), so filtering to one floor leaves
+ *     only that row on the chart;
+ *   · Cross-day / no end time / start time only — these boundaries are all in lib/dayBoard.js (pure
+ *     functions with regression tests).
  */
 function fmtDay(ms) {
   const d = new Date(ms);
@@ -681,23 +714,24 @@ function fmtDay(ms) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())}${wd ? ` ${wd}` : ''}`;
 }
 
-/** 一行的行高（px）：一层恒定一行，这个值同时决定行高与块高 */
+/** Row height (px): one row per floor always; this value determines both the row height and the block height */
 const LANE_H = 16;
 
 const boardDay = ref(dayStartOf(Date.now()));
 const boardIsToday = computed(() => boardDay.value === dayStartOf(Date.now()));
 
 /**
- * 看板能翻到哪几天 = 顶部时间筛选的那个窗口（用户 2026-10-01 要求）。
- * 选中「今天」就只剩今天，前一天 / 后一天都没得点；「过去 7 天」只能在 9/25–10/1 之间翻。
- * 「全部时间」两端都是 null —— 跟以前一样自由翻。算法在 lib/timeRange.js（有回归测试）。
+ * The days the board can page to = the window of the top time filter (user request 2026-10-01).
+ * With "today" selected only today remains, and neither previous nor next day is clickable; "past 7
+ * days" can only page within 9/25–10/1. "All time" is null at both ends — paging is free as before.
+ * The algorithm is in lib/timeRange.js (with regression tests).
  */
 const boardDayRange = computed(() => dayRangeOf(timeWindow.value));
-/** 当前档位的文案（给灰掉的按钮写 title 用，让人知道是被哪个筛选卡住的） */
+/** The current bucket's text (used as the title of disabled buttons so people know which filter is blocking them) */
 const filterTimeLabel = computed(
   () => timeRangeLabel(filterTime.value)
 );
-/** 换档位 / 跨过午夜后，把停在窗外的这天拉回来 —— 否则画出来是一片空白，看着像坏了 */
+/** After switching buckets / crossing midnight, pull the day back if it's outside the window — otherwise the chart is blank and looks broken */
 watch(
   boardDayRange,
   () => {
@@ -713,27 +747,27 @@ function shiftDay(n) {
   d.setHours(0, 0, 0, 0);
   boardDay.value = clampDay(d.getTime(), boardDayRange.value);
 }
-/** 这一天能不能翻过去：翻过去还在筛选窗口里才让点（否则按钮置灰） */
+/** Whether the board can page to that day: clickable only if the target is inside the filter window (otherwise the button is greyed out) */
 function canShiftDay(n) {
   const d = new Date(boardDay.value);
   d.setDate(d.getDate() + n);
   d.setHours(0, 0, 0, 0);
   return dayInRange(d.getTime(), boardDayRange.value);
 }
-/** 「今天」这一跳：窗口里没有今天（比如筛的是"上个月"）时置灰，不把人送到窗外 */
+/** The "today" jump: greyed out when the window has no today (e.g. filtering "last month"), so nobody is sent outside the window */
 const canBackToToday = computed(() => dayInRange(dayStartOf(Date.now()), boardDayRange.value));
 
 function backToToday() {
   boardDay.value = clampDay(dayStartOf(Date.now()), boardDayRange.value);
 }
-/** 本地 YYYY-MM-DD（不能用 toISOString —— 那是 UTC，会差一天） */
+/** Local YYYY-MM-DD (don't use toISOString — that's UTC and can be off by a day) */
 function dayValueOf(ms) {
   const d = new Date(ms);
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 const boardDayValue = computed(() => dayValueOf(boardDay.value));
-/** <input type="date"> 的 min / max：不设限的那一端给 undefined（属性整个不渲染） */
+/** min / max of <input type="date">: give undefined for the unbounded end (the attribute isn't rendered at all) */
 const boardDayMin = computed(() =>
   boardDayRange.value.minDay == null ? undefined : dayValueOf(boardDayRange.value.minDay)
 );
@@ -745,25 +779,26 @@ function onBoardDayInput(e) {
   if (!m) return;
   const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   d.setHours(0, 0, 0, 0);
-  // 手敲 / 浏览器不认 min·max 的情况都兜一下：夹回窗口，别让看板停在窗外
+  // Cover both manual typing and browsers that ignore min/max: clamp back into the window so the board never sits outside it
   boardDay.value = clampDay(d.getTime(), boardDayRange.value);
 }
 
-/** 一次任务落在哪一行：client → 楼层（合并楼层按基名认，见 floorOfClient） */
+/** Which row a task lands on: client → floor (merged floors matched by base name, see floorOfClient) */
 function rowOfTask(t) {
   const f = floorOfClient(t.memberId || t.client);
   if (f) return { key: f.id, label: floorText(f), order: Number.parseInt(f.id, 10) || 900 };
   if (!(t.memberId || t.client)) return { key: '__none__', label: tr('records.no_floor'), order: 999 };
-  // 有 client 但不在楼层表里（老数据 / 该产品没装）：如实标出是哪个 client，不硬塞进某层
+  // Has a client but not in the floor table (old data / product not installed): show which client it is honestly, don't force it into a floor
   return { key: String(t.memberId || t.client), label: t.client_label, order: 900 };
 }
 
 /**
- * 就算这一天没有任务也要占一行的楼层（用户 2026-10-01 要求）：
- *   · 楼层筛选 = 全部楼层 → **所有已安装的楼层**都画出来，空的留一行空格子；
- *   · 筛了具体楼层 → 只留命中的那几层（合并楼层的值是逗号分隔的一串 client）。
- * 任务真落在没列出来的地方（不在楼层表里的 client / 压根没 client）时，
- * buildFloorGantt 仍会为它补一行 —— 一行都不会丢。
+ * Floors that still get a row even with no tasks that day (user request 2026-10-01):
+ *   · Floor filter = all floors → **every installed floor** is drawn, empty ones leaving an empty row;
+ *   · A specific floor is filtered → only the matching floors remain (a merged floor's value is a
+ *     comma-separated client string).
+ * When a task really lands somewhere not listed (a client not in the floor table / no client at all),
+ * buildFloorGantt still adds a row for it — not a single row is lost.
  */
 const boardBaseRows = computed(() => {
   const want = String(tasks.filterClient || 'all').toLowerCase();
@@ -785,33 +820,34 @@ const boardGantt = computed(() =>
   buildFloorGantt(list.value, boardDay.value, nowMs.value, rowOfTask, boardBaseRows.value)
 );
 const boardRows = computed(() => boardGantt.value.rows);
-/** 「此刻」在横轴上的位置（%）；看的不是今天就返回 -1（不画那条线） */
+/** The position of "now" on the x-axis (%); returns -1 when not viewing today (so the line isn't drawn) */
 const boardNowPct = computed(() => {
   if (!boardIsToday.value) return -1;
   return ((nowMs.value - boardDay.value) / (MIN_PER_DAY * 60 * 1000)) * 100;
 });
 
-/** 块上的悬停提示：是哪条任务、几点到几点、多久、什么状态 */
+/** Hover tooltip on a block: which task, from when to when, how long, and what state */
 function blockTitle(it) {
   const task = it.task;
   const dur = task.duration_ms != null ? fmtDuration(task.duration_ms) : tr('records.unfinished');
   return `${promptOf(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
 }
 /**
- * 重叠段的加深：同时跑 2 条加一档、3 条再加一档（最深压住，免得糊成一块黑）。
- * 只加暗、不换色 —— 块本身的状态色不被这层盖掉多少，仍读得出是"完成"还是"在跑"。
+ * Darkening of overlapping spans: 2 running at once adds one step, 3 adds another (capped at the
+ * darkest so it doesn't smear into a black blob). Darken only, no recolor — the block's own state
+ * color is barely covered by this layer, so you can still read "done" vs "running".
  */
 function scrimAlpha(count) {
   return Math.min(0.6, 0.22 * (count - 1));
 }
-/** 点块 = 看这条任务的详情：跳到列表视图并选中它 */
+/** Click a block = view that task's detail: jump to the list view and select it */
 function openTask(id) {
   tasks.selectTask(id);
   view.value = 'list';
 }
 
-// ---- 删除 ----
-/** 单个删除：二次确认（点一次变"确认删除?"，再点才真删，期间可"取消"） */
+// ---- Delete ----
+/** Single delete: confirm twice (the first click turns into "confirm delete?", the second actually deletes; you can cancel in between) */
 const confirmId = ref(null);
 function askDelete(t) {
   if (confirmId.value === t.id) {
@@ -826,11 +862,13 @@ function cancelDelete() {
 }
 
 /**
- * 批量删除：删除当前筛选（工程/楼层）下的全部记录（手动、立即生效）。
+ * Bulk delete: delete every record under the current filters (project/floor) (manual, takes effect
+ * immediately).
  *
- * 注意这两组筛选的范围**不一样**：工程/楼层走服务端（DELETE 的 query），状态/关键词/时间
- * 走本页客户端。所以列表上看着只剩几条时，这一下删的仍是工程/楼层那一整片 —— 文案得把这个
- * 差额说清楚，不能只报个头衔。
+ * Note the two filter groups have **different scopes**: project/floor go through the server (the
+ * DELETE query), while state/keyword/time are client-side on this page. So even when only a few rows
+ * remain visible, this still deletes the whole project/floor slice — the copy must make that gap
+ * clear, not just report a headline number.
  */
 function bulkDeleteAll() {
   const n = tasks.tasks.length;
@@ -841,17 +879,19 @@ function bulkDeleteAll() {
   tasks.deleteByFilter('all');
 }
 /**
- * 记录保留天数：服务端按此自动清理更早的任务记录（改动才写回，不轮询）。
+ * Record retention days: the server auto-cleans older task records by this (written back only on
+ * change, no polling).
  *
- * 初值只是**在拉到服务端设置之前**先显个像样的数 —— 真值以 GET /settings/retention 为准
- * （用户改过的话落库值优先，跟这里的缺省无关）。缺省跟着 DEFAULTS 走，别在这写死。
+ * The initial value just shows something sensible **before the server setting is fetched** — the
+ * real value comes from GET /settings/retention (a user-modified value stored in the DB wins, and is
+ * unrelated to this default). The default follows DEFAULTS; don't hardcode it here.
  */
 const retentionDays = ref(DEFAULTS.RETENTION_DAYS);
 async function loadRetention() {
   try {
     retentionDays.value = await tasks.fetchRetention();
   } catch {
-    /* 拉不到就留着缺省值（不是"写回 90"—— 没读到就不动服务端） */
+    /* If it can't be fetched, keep the default (not "write back 90" — if it wasn't read, leave the server alone) */
   }
 }
 async function saveRetention() {
@@ -862,7 +902,7 @@ async function saveRetention() {
 
 <template>
   <div class="view" data-testid="task-records">
-    <!-- 筛选：一级（工程 + 楼层）+ 二级（状态分段）+ 标题搜索 + 计数，仅本页生效 -->
+    <!-- Filters: top-level (project + floor) + second-level (state segments) + title search + count; page-local only -->
     <div class="filters">
       <span class="spacer" />
       <select v-model="tasks.filterProject" class="sel" :aria-label="tr('records.col.project')">
@@ -871,15 +911,15 @@ async function saveRetention() {
       </select>
       <select v-model="tasks.filterClient" class="sel" :aria-label="tr('records.dim.floor')">
         <option value="all">{{ tr('records.filter.floor') }}</option>
-        <!-- 合并楼层（1F CodeBuddy）的值是逗号分隔的 client 串，服务端按集合取（见 query.js）；
-             条目文案带上楼层号（"1F CodeBuddy"）—— 只有产品名时认不出是哪层 -->
+        <!-- A merged floor (1F CodeBuddy) value is a comma-separated client string, matched as a set by the server (see query.js);
+             the item text includes the floor number ("1F CodeBuddy") — with only the product name you can't tell which floor it is -->
         <option v-for="f in floorOptions" :key="f.id" :value="floorValue(f)">{{ floorText(f) }}</option>
       </select>
       <select v-model="filterState" class="sel" :aria-label="tr('records.col.state')">
         <option value="all">{{ tr('records.filter.state') }}</option>
         <option v-for="s in FILTER_STATES.filter((s) => s !== 'all')" :key="s" :value="s">{{ stateLabel(s) }}</option>
       </select>
-      <!-- 时间筛选：口径 = 任务的开始时刻（见 timeWindow）。选「自定义」才露出两个日期框 -->
+      <!-- Time filter: keyed on the task's start time (see timeWindow). Only "custom" reveals the two date fields -->
       <select v-model="filterTime" class="sel" :aria-label="tr('records.col.time')">
         <option v-for="r in TIME_RANGES" :key="r.key" :value="r.key">{{ timeRangeLabel(r.key, r.label) }}</option>
       </select>
@@ -898,7 +938,7 @@ async function saveRetention() {
       <span class="dim count">{{ tr('records.count', { n: list.length }) }}</span>
     </div>
 
-    <!-- 三视图切换：共享上方筛选条件 -->
+    <!-- Three-view switch: shares the filters above -->
     <div class="view-tabs">
       <button
         v-for="v in VIEWS"
@@ -911,7 +951,7 @@ async function saveRetention() {
     </div>
 
     <div class="body" v-if="view === 'list'">
-      <!-- 左：每行一次任务 -->
+      <!-- Left: one task per row -->
       <ul class="task-list" :class="{ empty: !list.length }">
         <li
           v-for="t in list"
@@ -959,11 +999,11 @@ async function saveRetention() {
         <li v-if="!list.length" class="empty-hint">{{ tr('records.list.empty') }}</li>
       </ul>
 
-      <!-- 右：选中任务的详情 + 它的 subagent -->
+      <!-- Right: the selected task's detail + its subagents -->
       <section class="detail">
         <template v-if="tasks.selectedTask">
           <header class="detail-head">
-            <!-- 详情标题 = 这一轮自己的用户输入；会话标题在下面的键值网格里单列一行 -->
+            <!-- Detail title = this round's own user input; the session title is a separate row in the key-value grid below -->
             <div class="detail-title">{{ promptOf(tasks.selectedTask) || tr('records.untitled_task') }}</div>
             <div class="detail-meta">
               <span>{{ fmtTime(tasks.selectedTask.started_at) }}</span>
@@ -973,33 +1013,33 @@ async function saveRetention() {
           </header>
 
           <div class="kv">
-            <!-- 会话标题（agent 摘要）：只对 6F/7F/8F 有值，拿到才列这一行 ——
-                 其余楼层本来就没有这东西，不显示 "—" 占位（免得看着像"丢了"） -->
+            <!-- Session title (agent summary): only 6F/7F/8F have a value, and the row is listed only when present —
+                 other floors simply don't have this, so no "—" placeholder (which would look like something was lost) -->
             <template v-if="sessionTitleOf(tasks.selectedTask)">
               <div class="k">{{ tr('records.detail.session_title') }}</div>
               <div class="v">{{ sessionTitleOf(tasks.selectedTask) }}</div>
             </template>
             <div class="k">{{ tr('records.detail.state') }}</div><div class="v">{{ stateLabel(tasks.selectedTask.state) }}</div>
-            <!-- 「进度」暂时不显示（2026-09-29 用户要求注释掉）：progress 现在拿不到真值 ——
-                 开工写 0、收工写 1，中间没人推进（唯一会推的是 hook 里"按 TodoWrite 清单
-                 折算几项做完"那一条，见 reporter/hook.js 的 todoProgress，实测落不到库里）。
-                 本机库实测：489 条任务的 progress 只有 0（80 条）和 1（409 条）两种取值，
-                 一个中间值都没有 —— 显示出来就是「0% / 100%」两个数跳，纯误导。
-                 将来有了能按轮次推进的真实进度来源，再把这一行放回来（fmtProgress 一并复活）。 -->
+            <!-- "Progress" is hidden for now (commented out per the 2026-09-29 request): progress has no real value —
+                 it's 0 at start and 1 at finish, with nobody advancing it in between (the only thing that would is the
+                 hook rule "count finished items from the TodoWrite list", see todoProgress in reporter/hook.js, which in
+                 practice never reaches the DB). Measured on this machine's DB: across 489 tasks progress only takes 0
+                 (80) and 1 (409), with no intermediate value at all — showing it would just be "0% / 100%" jumping, purely
+                 misleading. Put this row back once there's a real per-round progress source (reviving fmtProgress too). -->
             <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ tasks.selectedTask.client_label }}</div>
             <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
-            <!-- 工程：这一轮归属的工程名。服务端按工程**目录**现算（package.json name > 目录名，
-                 与"打开工程"同一口径，见 /task-runs 的 project_label）；拿不到目录才退回库里的
-                 projects.name（可能带同名冲突后缀，如 stb-dashboard-2），再没有退 project_id，
-                 最后才写占位 —— 绝不编造 -->
+            <!-- Project: the project this round belongs to. The server computes it from the project **directory** on the fly
+                 (package.json name > directory name, the same semantics as "open project", see project_label in /task-runs);
+                 only when the directory is unavailable does it fall back to projects.name in the DB (which may carry a
+                 same-name conflict suffix like stb-dashboard-2), then to project_id, and only then a placeholder — never invented -->
             <div class="k">{{ tr('records.detail.project') }}</div>
             <div class="v">{{ tasks.selectedTask.project_label || tasks.selectedTask.project_name || tasks.selectedTask.project_id || '—' }}</div>
-            <!-- 文件数挪到键值网格、与「模型」对齐；无改动（纯问答）显示 0 -->
-            <!-- 词元 / 金额 二选一：Trae 有金额无 token 分项 → 显示「金额」行代替「词元」；
-                 其他楼层有 token 无金额 → 照常显示「词元」行。互斥，不重复占一格。 -->
+            <!-- The file count moved into the key-value grid to line up with "model"; no changes (pure Q&A) shows 0 -->
+            <!-- Tokens / points, pick one: Trae has an amount but no token breakdown → show the "points" row instead of "tokens";
+                 other floors have tokens but no amount → show the "tokens" row as usual. Mutually exclusive, no duplicate cell. -->
             <template v-if="isTraeTask(tasks.selectedTask)">
               <div class="k">{{ tr('records.detail.amount') }}</div>
-              <div class="v">{{ fmtYuan(tasks.selectedTask.usage_yuan) }}</div>
+              <div class="v">{{ fmtPoints(tasks.selectedTask.usage_yuan) }}</div>
             </template>
             <template v-else>
               <div class="k">{{ tr('records.detail.tokens') }}</div>
@@ -1007,13 +1047,13 @@ async function saveRetention() {
             </template>
             <div class="k">{{ tr('records.detail.files') }}</div>
             <div class="v v-bright">{{ filesOf(tasks.selectedTask).length || (tasks.selectedTask.file_count != null ? tasks.selectedTask.file_count : 0) }}</div>
-            <!-- 本轮消耗的词元：三项摊开、用 " / " 隔开（2026-10-01 用户要求）——
-                 `非缓存输入 / 缓存读输入 / 输出`，顺序与库里的列序一致
-                 （「缓存写输入」2026-10-08 用户要求去掉：本机实测恒为 0，占一格不带信息），
-                 鼠标悬停看这四个数各是什么。真值来自各楼层自己的会话落盘
-                 （见 reporter/src/usage.js），拿不到的楼层（5F TraeCode 没有 usage、
-                 6F Qoder 的 transcript 里没有、2F/9F 没接）显示 "—"，不显示 0 ——
-                 「报不出来」和「消耗为零」是两回事。 -->
+            <!-- Tokens consumed this round: all three laid out, separated by " / " (user request 2026-10-01) —
+                 `non-cached input / cache-read input / output`, in the same order as the DB columns
+                 ("cache write input" was dropped per the 2026-10-08 request: it's always 0 on this machine, taking a cell
+                 without adding information); hover to see what each number is. The real values come from each floor's own
+                 session files (see reporter/src/usage.js); floors that can't provide them (5F TraeCode has no usage,
+                 6F Qoder's transcript doesn't have it, 2F/9F aren't wired up) show "—", not 0 —
+                 "can't report" and "consumed zero" are two different things. -->
           </div>
 
           <div v-if="filesOf(tasks.selectedTask).length" class="files">
@@ -1048,7 +1088,7 @@ async function saveRetention() {
             </template>
           </div>
 
-          <!-- 工具使用：这一轮每个工具用了几次（上报方逐次 +1，见 server/src/ingest/bus.js 的 toolUse） -->
+          <!-- Tool usage: how many times each tool was used this round (the reporter increments per call, see toolUse in server/src/ingest/bus.js) -->
           <div v-if="toolsOf(tasks.selectedTask).length" class="tools">
             <div class="files-head">{{ tr('records.detail.tools') }}</div>
             <ul class="tool-list">
@@ -1065,7 +1105,7 @@ async function saveRetention() {
             <p v-else class="result">{{ tr('records.none_paren') }}</p>
           </div>
 
-          <!-- subagent 列表：点击单个看详情 -->
+          <!-- Subagent list: click one to view its detail -->
           <div v-if="tasks.subagents.length" class="subs">
             <div class="files-head">{{ tr('records.detail.subagents', { n: tasks.subagents.length }) }}</div>
             <ul class="sub-list">
@@ -1138,7 +1178,7 @@ async function saveRetention() {
       </section>
     </div>
 
-    <!-- 批量操作：删除筛选结果（手动）/ 记录保留天数（服务端自动清理）；仅列表视图，位于列表页底部 -->
+    <!-- Bulk actions: delete filtered results (manual) / record retention days (server auto-clean); list view only, at the bottom of the list page -->
     <div class="bulk-bar" v-if="view === 'list'">
       <span class="dim">{{ tr('records.bulk_ops') }}</span>
       <button type="button" class="del-btn danger" @click="bulkDeleteAll">{{ tr('records.bulk_delete') }}</button>
@@ -1148,7 +1188,7 @@ async function saveRetention() {
       <button type="button" class="btn" @click="saveRetention">{{ tr('records.retention_save') }}</button>
     </div>
 
-    <!-- 汇总报表：按维度聚合的表格；共享上方筛选栏条件 -->
+    <!-- Summary report: a table aggregated by dimension; shares the filter bar above -->
     <div v-else-if="view === 'summary'" class="report">
       <div class="report-bar">
         <div class="dim-tabs">
@@ -1164,21 +1204,21 @@ async function saveRetention() {
         <button type="button" class="btn export" @click="exportCsv">{{ tr('records.export') }}</button>
       </div>
 
-      <!-- 按时间：逐条列任务（不聚合），列 = 时间 / 任务 / 客户端 / 模型 / 工程 / 词元 / 时长 / 状态 -->
+      <!-- By time: list tasks one by one (no aggregation); columns = time / task / client / model / project / tokens / duration / state -->
       <div v-if="reportDim === 'time' && timeRows.length" class="report-scroll">
         <table class="report-table">
           <thead>
             <tr>
               <th class="th-dim sortable" :class="timeSortCls('started_at')" @click="sortTimeBy('started_at')">{{ tr('records.col.time') }}</th>
               <th class="th-dim">{{ tr('records.col.task') }}</th>
-              <!-- 会话：这一轮属于哪条会话（会话级标题，同一会话的各轮共用同一个值）——
-                   拿不到（老任务没有 session_id / 服务端查不到）显示 "—"，不编造 -->
+              <!-- Session: which session this round belongs to (session-level title, shared by every round of the session) —
+                   shows "—" when unavailable (old task without a session_id / not found by the server), never invented -->
               <th class="th-dim">{{ tr('records.col.session') }}</th>
               <th class="th-dim">{{ tr('records.col.client') }}</th>
               <th class="th-dim">{{ tr('records.col.model') }}</th>
               <th class="th-dim">{{ tr('records.col.project') }}</th>
-              <!-- 一行一个任务，这一列 = **这条任务的总词元**（三项全加，见 totalTokensOf）。
-                   悬停看三项拆分；报不出 token 的楼层显示 "—"（不是 0）。 -->
+              <!-- One task per row; this column = **this task's total tokens** (all three added, see totalTokensOf).
+                   Hover to see the three-part breakdown; floors that can't report tokens show "—" (not 0). -->
               <th class="sortable num" :class="timeSortCls('tokens')" @click="sortTimeBy('tokens')" :title="tr('records.col.tokens_title')">{{ tr('records.col.tokens') }}</th>
               <th class="sortable num" :class="timeSortCls('duration_ms')" @click="sortTimeBy('duration_ms')">{{ tr('records.col.duration') }}</th>
               <th class="th-dim">{{ tr('records.col.state') }}</th>
@@ -1187,7 +1227,7 @@ async function saveRetention() {
           <tbody>
             <tr v-for="t in timeRows" :key="t.id" class="report-row" @click="drillDown(t)">
               <td class="td-dim mono">{{ fmtTime(t.started_at) }}</td>
-              <!-- 标题只取前 10 个字，完整的那句挂在 title 上（悬停可看） -->
+              <!-- The title takes only the first 10 characters; the full sentence is attached to `title` (hover to see) -->
               <td class="td-dim td-task" :title="promptOf(t) || tr('records.untitled_task')">{{ shortTitle(t) }}</td>
               <td class="td-dim td-session" :title="sessionTitleOf(t) || ''">{{ sessionTitleOf(t) ? shortText(sessionTitleOf(t)) : '—' }}</td>
               <td class="td-dim">{{ t.client_label }}</td>
@@ -1202,12 +1242,12 @@ async function saveRetention() {
             <tr class="total-row">
               <td class="td-dim">{{ tr('records.total') }}</td>
               <td class="td-dim">{{ tr('records.times', { n: timeRows.length }) }}</td>
-              <!-- 会话数：这一屏涉及多少条**不同**的会话（不是任务数） -->
+              <!-- Session count: how many **distinct** sessions this screen covers (not the task count) -->
               <td class="num">{{ timeSessionCount }}</td>
               <td class="td-dim" />
               <td class="td-dim" />
               <td class="td-dim" />
-              <!-- 合计只累加报得出 token 的任务；一条都没有 → "—"（不拿 0 顶） -->
+              <!-- The total only sums tasks that can report tokens; when there are none → "—" (never 0) -->
               <td class="num">{{ fmtTokens(timeTotalTokens) }}</td>
               <td class="num">{{ fmtDuration(timeTotalMs) }}</td>
               <td class="td-dim" />
@@ -1222,13 +1262,13 @@ async function saveRetention() {
             <tr>
               <th class="th-dim">{{ dimColName }}</th>
               <th class="sortable num" :class="sortCls('taskCount')" @click="sortBy('taskCount')">{{ tr('records.col.task_count') }}</th>
-              <!-- 会话数：这一组里有多少条**不同**的会话（一轮 = 一条任务，所以它通常远小于任务数）；
-                   没有 session_id 的老任务只进任务数，不撑会话数 -->
+              <!-- Session count: how many **distinct** sessions this group has (a round = one task, so it's usually far below the task count);
+                   old tasks without a session_id only count as tasks, not as sessions -->
               <th class="sortable num" :class="sortCls('sessionCount')" @click="sortBy('sessionCount')" :title="tr('records.col.session_count')">{{ tr('records.col.session_count') }}</th>
               <th class="sortable num" :class="sortCls('successCount')" @click="sortBy('successCount')">{{ tr('records.col.success_count') }}</th>
               <th class="sortable num" :class="sortCls('cancelCount')" @click="sortBy('cancelCount')">{{ tr('records.col.cancel_count') }}</th>
               <th class="sortable num" :class="sortCls('fileCount')" @click="sortBy('fileCount')">{{ tr('records.col.file_count') }}</th>
-              <!-- 词元合计 = 这一组里**报得出 token 的那些任务**的四项全加（与「数据总览」表尾同一口径） -->
+              <!-- Token sum = all three parts of **the tasks in this group that can report tokens**, added up (same semantics as the data-overview footer) -->
               <th class="sortable num" :class="sortCls('tokenSum')" @click="sortBy('tokenSum')" :title="tr('records.col.token_sum_title')">{{ tr('records.col.token_sum') }}</th>
               <th class="sortable num" :class="sortCls('durationSum')" @click="sortBy('durationSum')">{{ tr('records.col.duration_sum') }}</th>
               <th class="sortable num" :class="sortCls('avgDuration')" @click="sortBy('avgDuration')">{{ tr('records.col.avg_duration') }}</th>
@@ -1247,7 +1287,7 @@ async function saveRetention() {
               <td class="num">{{ r.successCount }}</td>
               <td class="num">{{ r.cancelCount }}</td>
               <td class="num">{{ r.fileCount }}</td>
-              <!-- 一条都没报出 token 的组显示 "—"（不是 0 ——「报不出来」与「消耗为零」是两回事） -->
+              <!-- A group with no reported tokens shows "—" (not 0 — "can't report" and "consumed zero" are two different things) -->
               <td class="num">{{ fmtTokens(r.tokenN ? r.tokenSum : null) }}</td>
               <td class="num">{{ fmtDuration(r.durationSum) }}</td>
               <td class="num">{{ fmtDuration(r.avgDuration) }}</td>
@@ -1257,7 +1297,7 @@ async function saveRetention() {
             <tr class="total-row">
               <td class="td-dim">{{ reportTotal.label }}</td>
               <td class="num">{{ reportTotal.taskCount }}</td>
-              <!-- 合计的会话数是各组**去重后的并集**，不是把各组会话数加起来 -->
+              <!-- The total session count is the **deduplicated union** over the groups, not the sum of the groups' session counts -->
               <td class="num">{{ reportTotal.sessionCount }}</td>
               <td class="num">{{ reportTotal.successCount }}</td>
               <td class="num">{{ reportTotal.cancelCount }}</td>
@@ -1274,9 +1314,9 @@ async function saveRetention() {
       </div>
     </div>
 
-    <!-- 图形看板 · 每日：横轴＝当天每小时的竖线，纵轴＝楼层；行里的实心块就是这一层的一次任务 -->
+    <!-- Graphical board · daily: x-axis = an hourly vertical line for the day, y-axis = floor; a solid block in a row is one task on that floor -->
     <div v-else class="board">
-      <!-- 翻页与选日期都限制在顶部的时间筛选窗口里（选中「今天」就只有今天可看） -->
+      <!-- Paging and date selection are confined to the top time-filter window (with "today" selected only today is viewable) -->
       <div class="board-bar">
         <button
           type="button"
@@ -1324,7 +1364,7 @@ async function saveRetention() {
 
       <div class="board-scroll">
         <div class="gantt">
-          <!-- 表头：每小时一格刻度，格子左边那条竖线就是小时线 -->
+          <!-- Header: one tick per hour; the vertical line on the left of a cell is the hour line -->
           <div class="gantt-head">
             <div class="gutter" />
             <div class="axis">
@@ -1356,7 +1396,7 @@ async function saveRetention() {
                 :title="blockTitle(it)"
                 @click="openTask(it.task.id)"
               />
-              <!-- 同一时间不止一条：叠一层暗色（不是再占一行） -->
+              <!-- More than one at the same time: lay down a dark layer (not another row) -->
               <span
                 v-for="(o, i) in row.overlaps"
                 :key="`o${i}`"
@@ -1372,7 +1412,7 @@ async function saveRetention() {
             </div>
           </div>
 
-          <!-- 这一天没有任务：照样把表格画出来（空行 + 小时线），不留一块"没有任务"的提示板 -->
+          <!-- No tasks this day: still draw the table (an empty row + hour lines), don't leave a "no tasks" notice board -->
           <div v-if="!boardRows.length" class="gantt-row">
             <div class="gutter" />
             <div class="lane-area empty" :style="{ height: `${LANE_H * 3}px` }">
@@ -1388,7 +1428,7 @@ async function saveRetention() {
       </div>
 
       <div class="board-foot dim">
-        <!-- 没有任务的日子不写"任务 0 次"这类话：空表格本身就说清楚了（所以这里看的是 task 数，不是行数） -->
+        <!-- On a day with no tasks, don't write things like "0 tasks": the empty table says it all (so this checks the task count, not the row count) -->
         <template v-if="boardGantt.total">
           <span>{{ tr('records.board.sum_tasks', { n: boardGantt.total }) }}</span>
           <span class="sep">·</span>
@@ -1419,12 +1459,12 @@ async function saveRetention() {
 }
 .dim { color: var(--text-dim); font-size: 12px; }
 .loading { color: var(--accent); }
-/* 弹性占位：把筛选控件组整体顶到右侧 */
+/* Flexible spacer: pushes the filter control group to the right as a whole */
 .spacer { flex: 1; }
-/* 计数：固定宽度 + 右对齐 + 等宽数字，避免数字位数变化引发水平抖动 */
+/* Count: fixed width + right align + tabular numerals, to avoid horizontal jitter when the digit count changes */
 .count { flex: 0 0 100px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
-/* 三视图切换 */
+/* Three-view switch */
 .view-tabs {
   display: flex;
   gap: 6px;
@@ -1444,7 +1484,7 @@ async function saveRetention() {
 .view-tab:hover { color: var(--text); border-color: var(--accent); }
 .view-tab.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 
-/* 空面板：某个视图当前没有内容可画时用它兜底 */
+/* Empty pane: a fallback when a view currently has nothing to draw */
 .empty-pane {
   flex: 1;
   min-height: 0;
@@ -1456,7 +1496,7 @@ async function saveRetention() {
   background: var(--bg-panel);
 }
 
-/* 图形看板 · 每日：纵轴＝楼层（一层一行），横轴＝当天每小时一条竖线 */
+/* Graphical board · daily: y-axis = floor (one row per floor), x-axis = one vertical line per hour of the day */
 .board {
   display: flex;
   flex-direction: column;
@@ -1477,7 +1517,7 @@ async function saveRetention() {
   font-family: var(--mono);
 }
 .day-input:hover { border-color: var(--accent); }
-/* 图例：色块与块、左边那条状态色一致（色值来自列表视图的 .st-* 那一套） */
+/* Legend: the swatches match the block / left-edge state colors (values come from the list view's .st-* set) */
 .legend { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); }
 .legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
 .legend .dot.st-running { background: var(--accent); }
@@ -1494,11 +1534,11 @@ async function saveRetention() {
   background: var(--bg-panel);
   padding: 10px 12px 12px;
 }
-/* 窄窗口下不让 24 小时挤成一团（每小时至少 ~36px）：放不下就横向滚动 */
+/* Don't let the 24 hours cram together in a narrow window (at least ~36px per hour): scroll horizontally when it doesn't fit */
 .gantt { min-width: 960px; }
 .gantt-head { display: flex; }
-/* 左侧楼层名（每行一个），宽度固定，右侧时间轴才对得齐。
-   124px 是为了放得下最长的那个名字（「9F GitHub Copilot」），再窄就要靠 title 提示了 */
+/* Left-side floor name (one per row), fixed width so the time axis on the right lines up.
+   124px fits the longest name ("9F GitHub Copilot"); any narrower and you'd have to rely on the title tooltip */
 .gutter {
   flex: none;
   width: 124px;
@@ -1525,9 +1565,11 @@ async function saveRetention() {
 .gantt-row { display: flex; }
 .gantt-row .gutter { padding-top: 1px; line-height: 1.2; }
 /**
- * 一层一行：每小时一条竖线（1px 的线平铺，平铺宽度 = 容器宽 / 24），块绝对定位落在上面。
- * 不用 repeating-linear-gradient 的 calc 停靠点 —— 那个写法一旦被解析器判无效，整条
- * background-image 会静默失效（小时线全没了，还不报错）。背景平铺这套没有这个坑。
+ * One row per floor: one vertical line per hour (a 1px line tiled, tile width = container width / 24),
+ * with blocks absolutely positioned on top.
+ * Don't use repeating-linear-gradient's calc stop points — if the parser deems that form invalid, the
+ * whole background-image silently fails (all hour lines vanish, with no error). This tiled-background
+ * approach has no such pitfall.
  */
 .lane-area {
   position: relative;
@@ -1538,21 +1580,21 @@ async function saveRetention() {
   background-size: calc(100% / 24) 100%;
   background-repeat: repeat-x;
 }
-/* 没有任务的那一天：只留这张空表格（底下补一条边把表收口） */
+/* A day with no tasks: only this empty table remains (add a bottom border to close it off) */
 .lane-area.empty { border-bottom: 1px solid var(--border); }
 .block {
   position: absolute;
   box-sizing: border-box;
-  /* 至少 3px：左右各 1px 竖边之外还留 1px 的颜色，短任务也看得出是块不是线 */
+  /* At least 3px: 1px on each side for the vertical edges plus 1px of color, so a short task still reads as a block and not a line */
   min-width: 3px;
   padding: 0;
   border: 0;
-  /* 左右两条竖边：相邻任务贴在一起时，这两条边就是"任务之间的分割线" */
+  /* Left and right vertical edges: when neighboring tasks touch, these two edges are the "divider between tasks" */
   border-left: 1px solid rgba(0, 0, 0, 0.55);
   border-right: 1px solid rgba(0, 0, 0, 0.55);
   border-radius: 2px;
   cursor: pointer;
-  /* 兜底色：万一 state 是没见过的值，块也照样看得见（不给它凭空消失的机会） */
+  /* Fallback color: if state is an unseen value, the block is still visible (never let it vanish into nothing) */
   background: var(--state-idle, #7f8c9b);
 }
 .block:hover { filter: brightness(1.18); }
@@ -1562,8 +1604,9 @@ async function saveRetention() {
 .block.st-cancelled { background: var(--state-offline, #4a5160); }
 .block.st-pending { background: var(--state-idle, #7f8c9b); }
 /**
- * 同一时间并行的那一段：盖一层暗色（不是再占一行）。最深压到 0.6，不糊成一块黑。
- * 不吃鼠标事件 —— 悬停还是落在下面那块任务上（照样出任务标题）。
+ * The span where tasks run in parallel: lay down a dark layer (not another row). Capped at 0.6 so it
+ * doesn't smear into a black blob. It doesn't take mouse events — hover still lands on the task block
+ * underneath (the task tooltip still shows).
  */
 .overlap {
   position: absolute;
@@ -1581,7 +1624,7 @@ async function saveRetention() {
 .board-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
 .board-foot .sep { color: var(--text-faint); }
 
-/* 汇总报表 */
+/* Summary report */
 .report {
   display: flex;
   flex-direction: column;
@@ -1638,12 +1681,12 @@ async function saveRetention() {
 }
 .report-table td.td-dim { text-align: left; }
 .report-table .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-/* 数据总览那一版：时间列用等宽字体（一列数字对得齐），任务列限宽 + 省略号（前 10 个字） */
+/* The data-overview version: the time column uses a monospace font (digits line up), the task column is width-limited + ellipsis (first 10 chars) */
 .report-table td.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .report-table td.td-task { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 会话列：跟任务列同一套限宽 + 省略号，别把右边的客户端 / 模型挤出去 */
+/* Session column: same width limit + ellipsis as the task column, so it doesn't squeeze out client / model on the right */
 .report-table td.td-session { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 状态色：`.report-table td` 的 color 比 .st-* 更具体，不单独写一遍的话状态就全是白的 */
+/* State colors: `.report-table td`'s color is more specific than .st-*, so without writing these the states would all be white */
 .report-table td.st-running { color: var(--accent); }
 .report-table td.st-done { color: #7ee787; }
 .report-table td.st-failed { color: #ff7b72; }
@@ -1754,7 +1797,7 @@ async function saveRetention() {
   padding: 14px 16px;
   overflow-y: auto;
   min-height: 0;
-  /* 详情页是"给人读、给人复制"的（任务原话 / 文件清单 / 报错），全局禁选在这里放开 */
+  /* The detail page is "for reading and copying" (task text / file list / errors), so the global select-off is lifted here */
   -webkit-user-select: text;
   user-select: text;
 }
@@ -1775,7 +1818,7 @@ async function saveRetention() {
 }
 .kv .k { color: var(--text-faint); }
 .kv .v { color: var(--text); font-family: var(--mono); word-break: break-all; }
-/* 文件数量：亮白色 + 加粗，与上方各值区分 */
+/* File count: bright white + bold, to stand out from the values above */
 .kv .v.v-bright { color: #fff; font-weight: 600; }
 
 .files { margin-top: 12px; }
@@ -1786,7 +1829,7 @@ async function saveRetention() {
 .files li .fp { word-break: break-all; }
 .files li .sz { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
-/* 工具使用：名字在左、次数在右（次数等宽数字，一列对齐好扫） */
+/* Tool usage: name on the left, count on the right (tabular numerals so the column lines up for scanning) */
 .tools { margin-top: 12px; }
 .tool-list { list-style: none; margin: 4px 0 0; padding: 0; }
 .tool-item {
@@ -1799,13 +1842,13 @@ async function saveRetention() {
   font-family: var(--mono);
   padding: 2px 0;
 }
-/* 工具名用亮白色，次数留暗色 —— 一眼看到"用了哪些工具"，次数是次要信息 */
+/* Tool names in bright white, counts dimmed — you see "which tools were used" at a glance, the count is secondary */
 .tool-item .tool-name { word-break: break-all; color: #fff; }
 .tool-item .tool-count { color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .result-block { margin-top: 12px; }
 .result { margin: 0; font-size: 13px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
-/* 「产出摘要」markdown 渲染（见 md()）：清单里的 HTML 标签只在这块内生效，不影响别处 */
+/* "Output summary" markdown rendering (see md()): the HTML tags in the list only take effect inside this block, not elsewhere */
 .result-md { font-size: 13px; color: var(--text); line-height: 1.6; word-break: break-word; }
 .result-md > :first-child { margin-top: 0; }
 .result-md > :last-child { margin-bottom: 0; }
@@ -1851,7 +1894,7 @@ async function saveRetention() {
 .sub-dur { color: var(--text-faint); font-family: var(--mono); font-size: 12px; }
 .sub-detail { padding: 10px 12px; border-top: 1px solid var(--border); background: var(--bg-elevated); }
 
-/* 批量删除工具条 */
+/* Bulk-delete toolbar */
 .bulk-bar {
   display: flex;
   align-items: center;
@@ -1881,12 +1924,13 @@ async function saveRetention() {
   cursor: pointer;
 }
 .btn:hover { border-color: var(--accent); }
-/* 置灰的按钮（看板翻页被时间筛选卡住时）：光靠 disabled 不够 —— 上面写死了
-   background / color，会把浏览器默认的置灰样式盖掉，看着跟能点一样 */
+/* Greyed-out buttons (when board paging is blocked by the time filter): disabled alone isn't enough —
+   background / color are hardcoded above, which overrides the browser's default greyed style and
+   makes them look clickable */
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn:disabled:hover { border-color: var(--border); }
 
-/* 删除按钮（单条 + 批量通用） */
+/* Delete button (shared by single + bulk) */
 .del-btn {
   padding: 2px 8px;
   font-size: 11px;
