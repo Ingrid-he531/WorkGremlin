@@ -1,12 +1,12 @@
 'use strict';
 
 /**
- * WorkGremlin 共享常量 / 协议 / 类型（运行时部分）。
- * 本文件必须保持**零运行时依赖**，同时被 Node（server/desktop）与浏览器（renderer）引用。
- * 类型声明见同目录 index.d.ts。
+ * WorkGremlin shared constants / protocol / types (runtime part).
+ * This file must stay **zero-runtime-dependency** and is referenced by both Node (server/desktop) and
+ * the browser (renderer). Type declarations are in index.d.ts in the same dir.
  */
 
-/** v2：把 team 概念统一为 project（信封字段 team -> project）。 */
+/** v2: unified the team concept into project (envelope field team -> project). */
 const PROTOCOL_VERSION = 2;
 
 /** @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'|'thinking'>} */
@@ -29,93 +29,100 @@ const MESSAGE_TYPES = Object.freeze([
   'system',
 ]);
 
-/** 数据来源：report=agent 主动上报（真值）；watch=目录监听兜底（推断）；timeout=心跳超时（推断） */
+/** Data source: report = the agent reports it (truth); watch = dir-watch fallback (inferred); timeout = heartbeat timeout (inferred) */
 const SOURCES = Object.freeze(['report', 'watch', 'timeout']);
 
 const DEFAULTS = Object.freeze({
   PORT_START: 21800,
   PORT_END: 21820,
-  /** 超过该时长未收到上报心跳 -> degraded（灰显 + 标注"推断"） */
+  /** No reported heartbeat for longer than this -> degraded (greyed out + marked "inferred") */
   HEARTBEAT_TIMEOUT_MS: 60_000,
-  /** WS 断线后的 HTTP 轮询间隔 */
+  /** HTTP poll interval after the WS drops */
   DEGRADED_POLL_MS: 2_000,
-  /** member.status 广播合并窗口 */
+  /** member.status broadcast merge window */
   STATUS_MERGE_MS: 200,
-  /** M0 消息窗口上限（M2 换成虚拟滚动） */
+  /** M0 message window cap (M2 swaps in virtual scrolling) */
   MESSAGE_WINDOW: 500,
-  /** WAL 自动 checkpoint 页数（约 2MB） */
+  /** WAL auto-checkpoint pages (~2MB) */
   WAL_AUTOCHECKPOINT_PAGES: 512,
-  /** 主动 checkpoint 间隔 */
+  /** Active checkpoint interval */
   WAL_CHECKPOINT_INTERVAL_MS: 30_000,
   /**
-   * 任务记录默认保留天数（「自动保留最近 N 天」，用户 2026-10-01 要求 90）。
-   * 只是**缺省值**：用户在界面上改过就以落库的 settings.retentionDays 为准（1~3650）。
-   * 服务端/前端共用一个源 —— 这个数以前散在三处（服务端 fallback、PUT 的兜底、前端 ref
-   * 的初值），改一处忘一处就会出现"界面显示 30、实际按 90 清"这种对不上的情况。
+   * Default task-record retention days ("auto-keep the last N days"; the user asked for 90 on 2026-10-01).
+   * Just the **default**: if the user changed it in the UI, the stored settings.retentionDays wins (1~3650).
+   * One source shared by server/frontend — this number used to be in three places (server fallback, the PUT
+   * fallback, the frontend ref's initial value), and changing one but forgetting another produced mismatches
+   * like "the UI says 30, the cleanup uses 90".
    */
   RETENTION_DAYS: 90,
 
   /**
-   * 议事厅（Council Chamber）—— 选定几个楼层的 agent 讨论一个问题并达成一致。
+   * Council Chamber — pick agents from several floors to discuss one topic to agreement.
    *
-   * 这里只放**全局缺省**；每场会自己的设置（轮数 / 判定口径）落在 councils 行上，
-   * 发起时按这里的缺省填，之后不随全局改动而变（一场已经开过的会不该被改口径）。
+   * Only **global defaults** live here; each council's own settings (rounds / decision rule) are stored on
+   * the councils row, filled from these defaults at launch and not affected by later global changes (a
+   * council that already ran should not have its rule changed).
    */
   /**
-   * 议事厅的两种形态（councils.mode）：
-   *   'vote'     —— 就一份提案多轮表决，服务端机械计票判共识（见 council/consensus.js）
-   *   'analysis' —— 不投票、不判共识：各轮自由分析，跑满轮数后出一份分组简报
-   * 与「在哪儿谈」（councils.workspace_path 有没有值）是**两个正交的开关**。
+   * The council's two modes (councils.mode):
+   *   'vote'     — several rounds of voting on one proposal; the server mechanically counts votes (see council/consensus.js)
+   *   'analysis' — no voting, no consensus: free analysis each round, then a grouped briefing after the full round count
+   * Orthogonal to "where to talk" (whether councils.workspace_path has a value) — two independent switches.
    */
   COUNCIL_MODE_DEFAULT: 'vote',
-  /** 讨论轮上限的缺省值（不含第 0 轮议题陈述） */
+  /** Default discussion-round cap (excluding round 0, the topic statement) */
   COUNCIL_ROUNDS_DEFAULT: 3,
-  /** 讨论轮上限的硬顶（用户在界面上调不上去） */
+  /** Hard cap on discussion rounds (the user cannot raise it in the UI) */
   COUNCIL_ROUNDS_MAX: 8,
   /**
-   * 判定口径缺省值。取值见 server/src/council/consensus.js 的 THRESHOLDS：
-   *   'unanimous' —— 无反对票 + 同意票过半（缺省，最保守：任何一个人不同意就不算谈成）
-   *   'majority'  —— 少数服从多数（同意 > 反对）
-   * 两种口径都要求**无人未表态**：缺席者的立场我们不知道，把不知道当默许就是编。
+   * Default decision rule. Values in server/src/council/consensus.js THRESHOLDS:
+   *   'unanimous' — no objections + majority yes (default, most conservative: any single objection means no agreement)
+   *   'majority'  — simple majority (yes > no)
+   * Both require **no one abstaining**: we do not know an absent member's stance, and treating unknown as
+   * tacit consent is inventing.
    */
   COUNCIL_THRESHOLD_DEFAULT: 'unanimous',
   /**
-   * 单个参与者一轮的超时。到点**杀进程**并按「未表态」如实记 —— 这里的超时不是"再等等"，
-   * 而是"这一票我们确定拿不到"。所以它按最慢的一层留足余量（一次回答要跑完一整个模型调用）。
+   * Timeout for a single participant's turn. On expiry we **kill the process** and record "no stance"
+   * honestly — the timeout here is not "wait a bit longer", it is "we definitely cannot get this vote". So
+   * it leaves ample margin for the slowest floor (one answer runs a whole model call).
    */
   COUNCIL_TURN_TIMEOUT_MS: 120_000,
   /**
-   * **工程模式**（councils.workspace_path 有值）下单个参与者一轮的超时。
+   * Timeout for a single participant's turn in **workspace mode** (councils.workspace_path has a value).
    *
-   * 比隔离模式宽得多：隔离模式的参与者只是"动嘴"，而工程模式的参与者要自己用只读工具
-   * 一轮轮翻代码（读文件 → 搜引用 → 再读），一次回答里可能夹着几十次工具调用。
-   * 120s 对它是常态超时，不是异常 —— 那会把"它还在读"误记成"它没表态"。
+   * Much wider than isolated mode: an isolated-mode participant just "talks", whereas a workspace-mode
+   * participant uses read-only tools to dig through the code round after round (read a file → search
+   * references → read again), so one answer may contain dozens of tool calls. 120s is a normal timeout for
+   * it, not an anomaly — using it would misrecord "it is still reading" as "it gave no stance".
    */
   COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: 300_000,
   /**
-   * 7F Kilo / 8F OpenCode 参与者的会话标题（`--title`），**也就是把它们挡在办公室外面的那把锁**。
+   * The session title (`--title`) for 7F Kilo / 8F OpenCode participants — **also the lock that keeps them
+   * out of the office**.
    *
-   * 为什么非有这么一个标记不可：这两家没有 1F/4F 那种 `--no-session-persistence`，
-   * 会话一律记进**全局** SQLite（`session.directory` = 当时的 cwd）。隔离模式下 cwd 是
-   * /tmp 里的一次性目录，办公室按工程过滤看不见它们；**工程模式下 cwd 就是用户的工程** ——
-   * 不标记的话，参与者当场变成办公室 7F/8F 上多出来的一个"会话"，违反 requirements.md
-   * §15.2「一场会开完，那两页看不出任何痕迹」。
+   * Why this marker is required: these two lack 1F/4F's `--no-session-persistence`, so sessions are always
+   * recorded in the **global** SQLite (`session.directory` = the cwd at the time). In isolated mode the cwd
+   * is a throwaway dir in /tmp, so the office's per-project filter cannot see them; **in workspace mode the
+   * cwd is the user's project** — without the marker, participants immediately become an extra "session" on
+   * 7F/8F in the office, violating requirements.md §15.2 "after a council ends, those two pages show no trace".
    *
-   * 数据目录也不能挪：实测 `XDG_DATA_HOME` 确实能把这些库挪走（Kilo 的 kilo.db 会落在新目录下），
-   * 但**登录态跟着一起没了**（挪完再跑，Kilo 回 401「You need to sign in」、OpenCode 直接挂住），
-   * 参与者会连话都说不出来。所以改成"照常落盘 + 打上固定标题"，
-   * 由 server/src/kilo.js 与 server/src/opencode.js 在**列出会话时跳过这个标题**。
+   * The data dir cannot be moved either: measured, `XDG_DATA_HOME` does move these databases (Kilo's kilo.db
+   * lands in the new dir), but **the login state goes with it** (after moving, Kilo returns 401 "You need to
+   * sign in" and OpenCode hangs outright), so participants cannot even speak. So instead it is "persist as
+   * usual + stamp a fixed title", and server/src/floorKilo.js and server/src/floorOpencode.js **skip this
+   * title when listing sessions**.
    *
-   * 标题里带 WorkGremlin，是为了让用户在 Kilo / OpenCode 自己的会话历史里认得出这是谁留下的。
+   * The title contains WorkGremlin so the user can tell, in Kilo / OpenCode's own session history, who left it.
    */
   COUNCIL_SESSION_TITLE: '议事厅参与者（WorkGremlin）',
-  /** 单个内联材料文件的字节上限；超出的部分截断，并在界面标注「已截断」 */
+  /** Byte cap for a single inlined material file; the excess is truncated and the UI marks it "truncated" */
   COUNCIL_MATERIAL_MAX_BYTES: 64 * 1024,
-  /** 全部内联材料的字节上限（提示词要塞进 argv / stdin，不能无限长） */
+  /** Byte cap for all inlined material (the prompt must fit into argv / stdin; it cannot grow without bound) */
   COUNCIL_MATERIAL_TOTAL_MAX_BYTES: 200 * 1024,
 });
 
-/** 服务端 -> 客户端 */
+/** server -> client */
 const WS_EVENTS = Object.freeze({
   SNAPSHOT: 'snapshot',
   MEMBER_STATUS: 'member.status',
@@ -127,17 +134,18 @@ const WS_EVENTS = Object.freeze({
   ARTIFACT_NEW: 'artifact.new',
   CONNECTION: 'connection',
   ERROR: 'error',
-  /** 全局活跃会话表变化（开/关工程·会话）：服务端按变化实时推送，客户端即时刷新 */
+  /** Global active-session table changed (open/close project·session): the server pushes on change, the client refreshes immediately */
   SESSIONS: 'sessions',
   /**
-   * 议事厅的增量更新（一场会的状态 / 某人的发言 / 本轮票型 / 收尾结论）。
-   * 议事厅与「当前工程」「当前楼层」都无关（它是一场独立发起的会），所以广播时 project 传 null。
-   * payload 是**增量**，客户端按 councilId 归位，见 server/src/council/orchestrator.js。
+   * Council incremental update (a council's status / someone's utterance / this round's votes / the closing conclusion).
+   * The council is unrelated to "current project" / "current floor" (it is an independently launched meeting), so
+   * project is null on broadcast. The payload is an **increment**; the client places it by councilId, see
+   * server/src/council/orchestrator.js.
    */
   COUNCIL: 'council.update',
 });
 
-/** 客户端 -> 服务端 */
+/** client -> server */
 const CLIENT_EVENTS = Object.freeze({
   HELLO: 'hello',
   SUBSCRIBE: 'subscribe',
@@ -155,15 +163,17 @@ const HTTP_ROUTES = Object.freeze({
   TASK_START: '/api/v1/task/start',
   TASK_PROGRESS: '/api/v1/task/progress',
   TASK_END: '/api/v1/task/end',
-  // 收工兜底（bug 3）：状态文件被并发覆盖丢了 taskId 时，hook 按会话回捞"当前在跑的任务"
+  // Round-end fallback (bug 3): when a concurrent overwrite of the state file loses taskId, the hook re-fetches
+  // "the task currently running" by session
   TASK_CURRENT: '/api/v1/task/current',
-  // 收工后补报 token：有些楼层（CodeBuddy 插件形态实测）usage 落盘比 Stop 晚得多，
-  // 收工那一刻读不到 → 等落盘了再来补一刀，只写 token 四列，不动这一行别的字段。
+  // Post-round token backfill: some floors (CodeBuddy plugin form, measured) persist usage much later than Stop,
+  // so it is unreadable at round end → wait for it to land and backfill, writing only the four token columns and
+  // not touching any other field of the row.
   TASK_TOKENS: '/api/v1/task/tokens',
   STATUS: '/api/v1/status',
   MESSAGE: '/api/v1/message',
   FILE_TOUCH: '/api/v1/file/touch',
-  // 工具使用计数：一轮任务里某个工具又用了一次（任务详情的「工具使用」）
+  // Tool-usage count: a tool was used again within a task round (task detail's "tool usage")
   TOOL_USE: '/api/v1/tool/use',
 });
 
@@ -177,9 +187,9 @@ const ERROR_CODES = Object.freeze({
 });
 
 /**
- * 构造协议信封。
+ * Build a protocol envelope.
  * @param {string} type
- * @param {string} project 工程标识
+ * @param {string} project project id
  * @param {string} actor
  * @param {unknown} payload
  * @param {number} [ts]
@@ -189,9 +199,9 @@ function envelope(type, project, actor, payload, ts = Date.now()) {
 }
 
 /**
- * 32 位 FNV-1a（同构实现，避免在浏览器里依赖 node:crypto）。
+ * 32-bit FNV-1a (isomorphic, to avoid depending on node:crypto in the browser).
  * @param {string} str
- * @returns {string} 8 位十六进制
+ * @returns {string} 8 hex digits
  */
 function fnv1a32(str) {
   let h = 0x811c9dc5;
@@ -203,7 +213,7 @@ function fnv1a32(str) {
 }
 
 /**
- * 消息去重键。A/B 两条来源写入同一张表时用它做幂等。
+ * Message dedupe key. Used for idempotency when two sources A/B write into the same table.
  * @param {{project: string, from: string, to?: string|null, ts: number, content?: string}} m
  * @returns {string}
  */
@@ -213,7 +223,7 @@ function dedupeKey(m) {
 }
 
 /**
- * 毫秒时长的人类可读形式（用于"已耗时"）。
+ * Human-readable form of a millisecond duration (for "elapsed").
  * @param {number} ms
  */
 function formatDuration(ms) {
@@ -227,11 +237,12 @@ function formatDuration(ms) {
 }
 
 /**
- * 绝对时刻 `MM-DD HH:mm`（用于「开始 / 最近活跃」这类时间点）。
+ * Absolute time `MM-DD HH:mm` (for points in time like "started / last active").
  *
- * 为什么不用相对时长（"53m前"）：那要求界面每秒重算，而重算一旦断了，就会出现
- * "1F 的最近活跃不动、3F 的已耗时还在涨"这种同一屏两种行为（用户 2026-09-30 实测）。
- * 时间点写死不动，既不需要定时器，也不会有"谁没刷新"的问题。秒级不要 —— 那是给相对时长看的。
+ * Why not a relative duration ("53m ago"): that requires the UI to recompute every second, and once that
+ * recompute breaks you get two behaviors on one screen — "1F's last-active frozen while 3F's elapsed keeps
+ * climbing" (user-measured 2026-09-30). A fixed point in time needs no timer and cannot suffer "someone
+ * didn't refresh". No seconds — those are for relative durations.
  * @param {number} ms
  */
 function formatClock(ms) {
@@ -242,7 +253,7 @@ function formatClock(ms) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 状态 -> 中文标签 */
+/** State -> label (user-facing UI text, kept in Chinese) */
 const STATE_LABELS = Object.freeze({
   online: '在线',
   busy: '忙碌',
@@ -251,7 +262,7 @@ const STATE_LABELS = Object.freeze({
   offline: '离线',
 });
 
-/** 状态 -> 主题色（与 renderer/src/styles/theme.css 保持一致） */
+/** State -> theme color (kept in sync with renderer/src/styles/theme.css) */
 const STATE_COLORS = Object.freeze({
   online: 'var(--state-online)',
   busy: 'var(--state-busy)',
@@ -261,8 +272,9 @@ const STATE_COLORS = Object.freeze({
 });
 
 /**
- * 角色形象（SVG Gremlin）：身体/角配色 + 手持配饰。
- * key 用成员名（leader / researcher / coder / tester ...），未命中走 AVATAR_FALLBACK。
+ * Character avatars (SVG Gremlin): body/horn colors + a held prop.
+ * key is the member name (leader / researcher / coder / tester ...); a miss falls back to AVATAR_FALLBACK.
+ * (label values are user-facing UI text, kept in Chinese.)
  */
 const AVATARS = Object.freeze({
   leader: { label: '队长', body: '#f2a33c', horn: '#ffd27a', prop: 'megaphone' },
@@ -282,7 +294,7 @@ const AVATAR_FALLBACK = Object.freeze({
 });
 
 /**
- * 取成员形象配置。memberId 形如 `coder@workgremlin`，按 `@` 前的名字匹配。
+ * Get a member's avatar config. memberId looks like `coder@workgremlin`; match by the name before `@`.
  * @param {string} name
  */
 function avatarOf(name) {
@@ -293,18 +305,18 @@ function avatarOf(name) {
 }
 
 /* ------------------------------------------------------------------ *
- * 临时成员（幽灵）
+ * Temporary members (ghosts)
  *
- * 专家团队是常驻成员，一人一个工位；为某个项目临时组队拉进来的成员
- * 没有工位，在场景里以"幽灵"形态飘在空中。
+ * The expert team are resident members, one desk each; members pulled in for a temporary team on some
+ * project have no desk and float in the scene as "ghosts".
  *
- * 判定规则属于展示层（见 renderer/src/lib/ephemeral.js）：
- *   ephemeral === true > memberId 前缀 ghost- / tmp- > role === 'ghost'。
- * 这里只声明数据契约字段，供将来 server 直接下发。
+ * The deciding rule belongs to the presentation layer (see renderer/src/lib/ephemeral.js):
+ *   ephemeral === true > memberId prefix ghost- / tmp- > role === 'ghost'.
+ * Here we only declare the data-contract field, for the server to send directly later.
  * ------------------------------------------------------------------ */
 
 
-/** 主进程 <-> 渲染层 IPC 通道（与 WS_EVENTS 同款约定，集中管理避免拼写漂移导致静默断链） */
+/** Main process <-> renderer IPC channels (same convention as WS_EVENTS; centralized to avoid a typo silently breaking the link) */
 const IPC_EVENTS = Object.freeze({
   GET_SERVER_INFO: 'workgremlin:get-server-info',
   GET_APP_VERSION: 'workgremlin:get-app-version',
@@ -332,14 +344,14 @@ function isPluginClient(form) {
 }
 
 /**
- * form → source 派生：三种形态统一口径。
- *   isPluginClient(form) → 'plugin'（vscode 等 IDE 扩展）
- *   form === 'ide'        → 'ide'（独立 IDE 产品，如 TraeCode IDE）
+ * form → source derivation: one rule for the three forms.
+ *   isPluginClient(form) → 'plugin' (vscode-family IDE extensions)
+ *   form === 'ide'        → 'ide' (standalone IDE products, e.g. TraeCode IDE)
  *   form === 'cli'        → 'cli'
- *   其它（空 / 未知）     → 'cli'（兜底：分不出形态就当 CLI）
+ *   other (empty / unknown) → 'cli' (fallback: if the form can't be told, treat it as CLI)
  *
- * 前端和后端都用这个函数，保证 form→source 映射只有一份。
- * @param {string} form 形态
+ * Both frontend and backend use this function, so the form→source mapping exists in exactly one place.
+ * @param {string} form form
  * @returns {'plugin'|'cli'|'ide'}
  */
 function formToSource(form) {
@@ -350,8 +362,8 @@ function formToSource(form) {
 }
 
 /**
- * agent 基名 → 产品显示名表。前后端共用一份(见 clientLabel)。
- * 追加新楼层时在这里注册,不要散落到各调用点。
+ * agent base name → product display name table. One copy shared by frontend and backend (see clientLabel).
+ * Register a new floor here, don't scatter it across call sites.
  */
 const AGENT_LABELS = {
   codebuddy: 'CodeBuddy',
@@ -379,18 +391,18 @@ function agentBase(id) {
 }
 
 /**
- * 由 agent + 形态得到最终显示名。前后端共用唯一源头,API 直接返回算好的字符串,
- * 前端不再自己按 form 拼。
+ * Final display name from agent + form. The single source shared by frontend and backend; the API returns
+ * the already-computed string, so the frontend no longer assembles it from form itself.
  *
- * 规则：
+ * Rules:
  *   isPluginClient(form)      → `${base} Plugin`
- *   form === 'cli'             → `${base} CLI`(base 已含 CLI/IDE 则不追加)
- *   form === 'ide'             → `${base} IDE`(同上)
- *   其它(空 / form 本身带形态) → base 基名
+ *   form === 'cli'             → `${base} CLI` (not appended if base already contains CLI/IDE)
+ *   form === 'ide'             → `${base} IDE` (same)
+ *   other (empty / form already carries the form) → base name
  *
- * @param {string} agent 楼层身份(client / memberId 等)
- * @param {string} form  形态(vscode / cli / ide / '')
- * @returns {string} 显示名,如 "TraeCode IDE" / "CodeBuddy Plugin" / "Kilo Code CLI" / "Codex"
+ * @param {string} agent floor identity (client / memberId etc.)
+ * @param {string} form  form (vscode / cli / ide / '')
+ * @returns {string} display name, e.g. "TraeCode IDE" / "CodeBuddy Plugin" / "Kilo Code CLI" / "Codex"
  */
 function clientLabel(agent, form) {
   const a = agentBase(agent);
@@ -403,9 +415,10 @@ function clientLabel(agent, form) {
 }
 
 /**
- * WorkGremlin 家目录：默认 ~/.workgremlin，可用 WORKGREMLIN_HOME 覆盖。
- * 用懒加载 node:os / node:path —— 本模块同时被 Node 与浏览器(renderer)引用，不能在顶层
- * require Node 内建模块，否则 renderer 打包会崩。home() 只在 Node 侧被调用，renderer 永不触发里面的 require。
+ * WorkGremlin home dir: default ~/.workgremlin, overridable with WORKGREMLIN_HOME.
+ * Lazily requires node:os / node:path — this module is referenced by both Node and the browser (renderer), so
+ * it must not require Node built-ins at the top level, or the renderer bundle breaks. home() is only called
+ * on the Node side; the renderer never triggers the require inside.
  */
 function home() {
   const os = require('node:os');

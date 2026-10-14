@@ -15,7 +15,7 @@ export interface Envelope<T = unknown> {
   v: number;
   type: string;
   ts: number;
-  /** 工程标识 */
+  /** project id */
   project: string;
   actor: string;
   payload: T;
@@ -27,7 +27,7 @@ export interface Member {
   name: string;
   role: string | null;
   sessionId: string | null;
-  /** 是否接入了主动上报（B 路线）。false = 仅被动观测（A 路线） */
+  /** Whether it does active reporting (route B). false = passively observed only (route A) */
   reported: boolean;
   createdAt: number;
   lastSeenAt: number;
@@ -38,7 +38,7 @@ export interface MemberTaskRef {
   title: string;
   progress: number | null;
   startedAt: number;
-  /** 收工时刻；null = 还在跑。卡片据此区分「当前任务」与「上一个任务」（槽位不会随收工清空） */
+  /** End time; null = still running. The card uses this to tell "current task" from "previous task" (the slot is not cleared on finish) */
   endedAt?: number | null;
   state?: TaskState;
 }
@@ -51,33 +51,33 @@ export interface Artifact {
   title: string;
   path: string | null;
   tsMs: number;
-  /** true = 由「本轮改动文件」推导出来的产出（artifacts 表无真值时的兜底），非上报真值 */
+  /** true = output derived from "this round's changed files" (fallback when the artifacts table has no truth), not reported truth */
   derived?: boolean;
 }
 
-/** 工位视图直接绑定的数据结构 */
+/** The data structure the workstation view binds to directly */
 export interface MemberCard {
   memberId: string;
   name: string;
   role: string | null;
   state: AgentState;
-  /** 进入当前状态的时刻，用于计算"已耗时" */
+  /** When it entered the current state, for computing "elapsed" */
   stateSince: number;
   task: MemberTaskRef | null;
   currentFiles: string[];
   artifacts: Artifact[];
   lastSeenAt: number;
-  /** 最近一条**已收工**任务的收工时刻：「最近活跃」= 距今多久（不是最后一次心跳） */
+  /** End time of the most recent **finished** task: "last active" = how long ago (not the last heartbeat) */
   lastTaskAt?: number | null;
-  /** true = 状态为推断值（A 路线兜底 / 心跳超时），非上报真值 */
+  /** true = the state is inferred (route-A fallback / heartbeat timeout), not reported truth */
   degraded: boolean;
   reported: boolean;
   messageCount: number;
-  /** 常驻子代理的功能描述（agent 定义文件里的静态数据，非运行状态）；没有则空串 */
+  /** The resident subagent's functional description (static data from the agent definition file, not runtime state); empty string if none */
   description?: string | null;
-  /** 临时组队成员（无工位，场景里以幽灵形态飘在空中） */
+  /** Temporary-team member (no desk; floats in the scene as a ghost) */
   ephemeral?: boolean;
-  /** 临时成员所属项目名，缺省用 role */
+  /** Project name a temporary member belongs to; defaults to role */
   projectLabel?: string | null;
 }
 
@@ -102,17 +102,17 @@ export interface Project {
   mainConversationId: string | null;
   source: Source | string;
   createdAt: number;
-  /** 工程显示名（package.json name > 目录名）；演示工程为固定名 */
+  /** Project display name (package.json name > dir name); the demo project has a fixed name */
   projectName: string;
 }
 
 export interface Snapshot {
-  /** 当前工程 */
+  /** current project */
   project: Project | null;
-  /** 全部工程（含演示工程） */
+  /** all projects (including the demo project) */
   projects: Project[];
   members: MemberCard[];
-  /** 当前工程显示名（package.json name > 目录名） */
+  /** current project display name (package.json name > dir name) */
   projectName?: string;
   recentMessages: Message[];
   serverTime: number;
@@ -144,17 +144,17 @@ export declare const DEFAULTS: {
   readonly WAL_AUTOCHECKPOINT_PAGES: number;
   readonly WAL_CHECKPOINT_INTERVAL_MS: number;
   readonly RETENTION_DAYS: number;
-  /** 议事厅：讨论轮上限缺省值 / 硬顶 / 单轮超时 / 材料字节上限（见 shared/index.js 的注释） */
-  /** 'vote'（表决，服务端计票判共识）或 'analysis'（分析，不投票、跑满轮数出简报） */
+  /** Council: default round cap / hard cap / turn timeout / material byte caps (see shared/index.js for the comments) */
+  /** 'vote' (voting; the server counts votes for consensus) or 'analysis' (analysis; no voting, a briefing after the full rounds) */
   readonly COUNCIL_MODE_DEFAULT: string;
   readonly COUNCIL_ROUNDS_DEFAULT: number;
   readonly COUNCIL_ROUNDS_MAX: number;
-  /** 'unanimous'（无反对 + 过半）或 'majority'（少数服从多数） */
+  /** 'unanimous' (no objections + majority) or 'majority' (simple majority) */
   readonly COUNCIL_THRESHOLD_DEFAULT: string;
   readonly COUNCIL_TURN_TIMEOUT_MS: number;
-  /** 工程模式（参与者要用只读工具自己翻代码）下的单轮超时，比上面那个宽 */
+  /** Turn timeout in workspace mode (participants use read-only tools to dig through code themselves), wider than the one above */
   readonly COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: number;
-  /** 7F/8F 参与者会话的固定标题：kilo.js / opencode.js 靠它把参与者挡在楼层之外 */
+  /** Fixed title for 7F/8F participant sessions: floorKilo.js / floorOpencode.js use it to keep participants off the floor */
   readonly COUNCIL_SESSION_TITLE: string;
   readonly COUNCIL_MATERIAL_MAX_BYTES: number;
   readonly COUNCIL_MATERIAL_TOTAL_MAX_BYTES: number;
@@ -181,7 +181,7 @@ export declare function dedupeKey(m: {
 }): string;
 export declare function fnv1a32(str: string): string;
 export declare function formatDuration(ms: number): string;
-/** 绝对时刻 `MM-DD HH:mm`（「开始 / 最近活跃」这类时间点；写死不动，不需要定时器重算） */
+/** Absolute time `MM-DD HH:mm` (points in time like "started / last active"; fixed, no timer recompute) */
 export declare function formatClock(ms: number): string;
 /** Member avatar config by name (before `@`); unmatched → AVATAR_FALLBACK. */
 export declare function avatarOf(name: string): { label: string; body: string; horn: string; prop: string };

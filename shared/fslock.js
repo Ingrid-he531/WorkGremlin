@@ -1,44 +1,46 @@
 'use strict';
 
 /**
- * 进程间小工具：加锁的读-改-写 + 原子写（仅 Node，不进浏览器包；用
- * require('@workgremlin/shared/fslock') 单独引入）。
+ * Cross-process helper: locked read-modify-write + atomic write (Node only, not in the browser bundle;
+ * import it explicitly via require('@workgremlin/shared/fslock')).
  *
- * 为什么需要（2026-09-27 实测）：hook 会被 CLI 在**同一毫秒**并行触发多次 ——
- * 同一次对话里连发三条 PreToolUse(Agent)，时间戳只差 5~11ms（见
- * ~/.workgremlin/hooks/events.log 的 05:29:45.178/.184/.189）。每个 hook 都是**独立进程**，
- * 各自 readFile → 改内存 → writeFileSync，于是互相覆盖：
- *   · 三条 ghost+ 只落两条（第三只被前一只的回写冲掉）；
- *   · 状态文件里的 taskId / roundFiles / done 被"回写旧版本"削掉，整轮产出全丢；
- *   · 更糟的是读到**半截 JSON**：readState/readFeedFile 对坏文件一律退回 {} / 空清单，
- *     紧接着的一次 patch 就把整份状态写没。
+ * Why it is needed (measured 2026-09-27): the CLI can trigger the hook several times in parallel **within
+ * the same millisecond** — one conversation emitted three PreToolUse(Agent) in a row, timestamps 5~11ms apart
+ * (see ~/.workgremlin/hooks/events.log at 05:29:45.178/.184/.189). Each hook is a **separate process** doing
+ * its own readFile → edit in memory → writeFileSync, so they overwrite each other:
+ *   · three ghost+ only land two (the third is clobbered by the first's write-back);
+ *   · the state file's taskId / roundFiles / done get cut by "writing back an older version", losing the whole round's output;
+ *   · worse, a **half-written JSON** is read: readState/readFeedFile fall back to {} / an empty manifest for a
+ *     corrupt file, and the very next patch wipes the whole state.
  *
- * 这里给两件东西：
- *   1. atomicWriteJson：先写同目录临时文件再 rename —— 读者永远看不到半截文件；
- *   2. withLock / updateJson：O_EXCL 抢锁 + 短自旋，把"读-改-写"整段串起来，消掉 lost update。
+ * Two things are provided here:
+ *   1. atomicWriteJson: write a temp file in the same dir, then rename — a reader never sees a half-written file;
+ *   2. withLock / updateJson: O_EXCL lock + short spin, serializing the whole "read-modify-write" and removing lost updates.
  *
- * 两条纪律：
- *   · 锁是**顾问式**的 —— 拿不到（超时）就退化成本次不加锁直接跑，绝不把调用方卡死。
- *     hook 的第一纪律是"绝不阻塞 agent"，一个卡死的锁比偶发丢一次更新严重得多。
- *   · 锁文件 = <目标文件>.lock；持锁进程崩溃留下的陈锁按 mtime 过期（默认 10s）自动接管。
+ * Two disciplines:
+ *   · The lock is **advisory** — if it can't be taken (timeout), fall back to running without the lock this
+ *     time; never wedge the caller. The hook's first discipline is "never block the agent", and a wedged lock
+ *     is far worse than occasionally losing one update.
+ *   · Lock file = <target file>.lock; a stale lock left by a crashed holder is taken over automatically once
+ *     its mtime is old enough (default 10s).
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 
-/** 抢锁最多等多久（毫秒）—— 一次读改写只有几毫秒，1.5s 足够排掉一串并发 hook */
+/** How long to wait for the lock at most (ms) — one read-modify-write takes a few ms, so 1.5s is enough to clear a burst of hooks */
 const DEFAULT_TIMEOUT_MS = 1500;
-/** 锁文件超过这么久没被释放，就当持锁进程已经崩了，接管它 */
+/** A lock file not released for longer than this is treated as a crashed holder; take it over */
 const DEFAULT_STALE_MS = 10_000;
 
-/** 同步 sleep：锁自旋需要等一下（Atomics.wait 不烧 CPU，且不依赖 event loop） */
+/** Synchronous sleep: the lock spin needs to wait (Atomics.wait does not burn CPU and does not depend on the event loop) */
 function sleepSync(ms) {
   const wait = Math.max(0, Math.round(ms));
   if (!wait) return;
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
   } catch {
-    const end = Date.now() + wait; // 受限环境没有 Atomics → 退化成忙等
+    const end = Date.now() + wait; // no Atomics in a restricted env → degrade to a busy wait
     while (Date.now() < end) {
       /* busy */
     }
@@ -50,8 +52,8 @@ function lockPathOf(file) {
 }
 
 /**
- * 抢锁。拿到返回锁文件路径；超时 / 出错返回 null（**不抛**，调用方自行决定退让）。
- * @param {string} file 被保护的**目标文件**（锁文件是它加 .lock）
+ * Acquire the lock. Returns the lock file path on success; null on timeout / error (**does not throw**; the caller decides how to yield).
+ * @param {string} file the **target file** being protected (the lock file is it plus .lock)
  * @param {{timeoutMs?: number, staleMs?: number}} [opts]
  * @returns {string|null}
  */
@@ -67,7 +69,7 @@ function acquireLock(file, opts = {}) {
   }
   for (;;) {
     try {
-      // 'wx' = O_CREAT | O_EXCL | O_WRONLY：只有抢到的那个进程能建成功
+      // 'wx' = O_CREAT | O_EXCL | O_WRONLY: only the process that wins can create it
       const fd = fs.openSync(lock, 'wx');
       try {
         fs.writeSync(fd, `${process.pid} ${Date.now()}\n`);
@@ -77,7 +79,7 @@ function acquireLock(file, opts = {}) {
       return lock;
     } catch (err) {
       if (!err || err.code !== 'EEXIST') return null;
-      // 陈锁接管：持锁进程崩了 → 锁文件留在这。mtime 够老就当它已经没了，删掉重抢。
+      // Stale-lock takeover: the holder crashed → the lock file stays. If the mtime is old enough, treat it as gone, delete it, and retry.
       try {
         const st = fs.statSync(lock);
         if (Date.now() - st.mtimeMs > staleMs) {
@@ -85,15 +87,15 @@ function acquireLock(file, opts = {}) {
           continue;
         }
       } catch {
-        continue; // 刚被别人删掉 → 立刻重抢
+        continue; // just deleted by someone else → retry immediately
       }
       if (Date.now() >= deadline) return null;
-      sleepSync(3 + Math.floor(Math.random() * 12)); // 抖动，避免两进程同拍死磕
+      sleepSync(3 + Math.floor(Math.random() * 12)); // jitter, so two processes don't lock-step
     }
   }
 }
 
-/** 释放锁；本来就不在了也无所谓（陈锁接管 / 别人已经删掉） */
+/** Release the lock; fine if it is already gone (stale takeover / someone already deleted it) */
 function releaseLock(lock) {
   try {
     fs.unlinkSync(lock);
@@ -103,7 +105,7 @@ function releaseLock(lock) {
 }
 
 /**
- * 在锁里跑 fn。**拿不到锁也照跑**（只是这次失去互斥）—— 见文件头"顾问式"那条。
+ * Run fn inside the lock. **Runs even if the lock is not taken** (it just loses mutual exclusion this time) — see the "advisory" note in the header.
  * @template T
  * @param {string} file
  * @param {() => T} fn
@@ -120,8 +122,8 @@ function withLock(file, fn, opts) {
 }
 
 /**
- * 原子写文件：同目录临时文件 + rename（同一文件系统内 rename 是原子的）。
- * 读者要么看到旧内容、要么看到新内容，**永远看不到半截**。
+ * Atomic file write: a temp file in the same dir + rename (rename within one filesystem is atomic).
+ * A reader sees either the old content or the new content, **never a half-written one**.
  */
 function atomicWriteFile(file, text) {
   const dir = path.dirname(file);
@@ -141,18 +143,18 @@ function atomicWriteFile(file, text) {
 }
 
 /**
- * 原子写 JSON。
+ * Atomic JSON write.
  * @param {string} file
  * @param {any} data
- * @param {{pretty?: boolean}} [opts] pretty 默认 true（2 空格缩进，清单文件一直这么写）；
- *   状态文件传 pretty:false 保持原来的紧凑单行格式。
+ * @param {{pretty?: boolean}} [opts] pretty defaults to true (2-space indent, how manifest files have always been written);
+ *   state files pass pretty:false to keep the original compact single-line format.
  */
 function atomicWriteJson(file, data, opts = {}) {
   const space = opts.pretty === false ? 0 : 2;
   atomicWriteFile(file, `${JSON.stringify(data, null, space)}\n`);
 }
 
-/** 宽容读 JSON：文件不存在 / 坏掉 / 非对象都回 fallback（与 readState/readFeedFile 同口径） */
+/** Lenient JSON read: missing / corrupt / non-object all return fallback (same as readState/readFeedFile) */
 function readJson(file, fallback = null) {
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -163,12 +165,12 @@ function readJson(file, fallback = null) {
 }
 
 /**
- * 加锁的读-改-写：mutate 收到当前值（读不到给 fallback），返回值写回。
- * mutate 返回 undefined 表示**放弃这次更新**（不写盘，用于"已满足条件 / 无匹配"的短路）。
+ * Locked read-modify-write: mutate receives the current value (fallback if unreadable) and its return value is written back.
+ * mutate returning undefined means **abandon this update** (no write; for short-circuiting "condition already met / no match").
  * @param {string} file
  * @param {(cur: any) => any} mutate
  * @param {{fallback?: any, pretty?: boolean, timeoutMs?: number, staleMs?: number}} [opts]
- * @returns {any} 写完后的值（放弃更新时是读到的原值）
+ * @returns {any} the value after writing (the read value when the update is abandoned)
  */
 function updateJson(file, mutate, opts = {}) {
   const { fallback = {}, pretty = true, ...lockOpts } = opts;
