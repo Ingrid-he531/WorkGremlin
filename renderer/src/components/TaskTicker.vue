@@ -117,9 +117,11 @@ function endedText(it) {
 }
 
 /**
- * 单条任务在屏上的显示长度统一限制为一屏（perLine 个字符）：
- *   · 超出 → 截断 taskText 并在末尾加 "..."；
- *   · 不足 → 在「后缀之后」补空格凑满一屏，使长短任务一样长、彼此间隔一致。
+ * 单条任务在屏上的显示：
+ *   · 短任务 → 在「后缀之后」补空格凑满一屏（perLine 个字符），使长短任务一样长、彼此间隔一致；
+ *   · 超长任务 → **不在这里截断**，交给 .line 的 CSS `text-overflow: ellipsis` 按"真实屏宽"收尾。
+ *     之前是按字数估算 perLine 截断，但中文/全角比数字宽得多，估算值偏小会让长任务溢出可视区、
+ *     又看不到省略号。改成 CSS 真宽度截断后，无论中英文都严格卡在屏宽内，超出即显省略号。
  * 渲染期调用，随 perLine（屏宽/字号）变化自动重算。
  */
 function fitLine(it) {
@@ -131,11 +133,7 @@ function fitLine(it) {
   const suffix = it.suffix || '';
   // 渲染字符数 ≈ time + nbsp + floor + nbsp + label + text + suffix
   const core = time.length + 1 + floor.length + 1 + label.length + text.length + suffix.length;
-  if (per > 0 && core > per) {
-    const avail = per - (time.length + 1 + floor.length + 1 + label.length + suffix.length + 3);
-    const t = avail > 0 ? text.slice(0, avail) : '';
-    return { text: t + '...', pad: 0 };
-  }
+  // 只补空格把短任务凑满一屏；超长任务的溢出交给 .line 的 CSS 省略号，这里不再切 "..."（避免双重省略号）
   const pad = per > 0 ? Math.max(0, per - core) : 0;
   return { text, pad };
 }
@@ -413,7 +411,7 @@ onBeforeUnmount(() => {
   <div class="ticker">
     <!-- 屏左边的静态标签：说明这块屏滚的是什么（所有楼层的任务），它**不参与滚动** -->
     <span class="tag">{{ t('ticker.tag') }}</span>
-    <div ref="viewEl" class="screen">
+    <div ref="viewEl" class="screen" :style="{ '--screen-w': (viewW > 0 ? viewW : 100000) + 'px' }">
       <!-- 没有任务：静态居中一句，不滚 -->
       <span v-if="idle" class="idle-line">{{ t('ticker.no_task') }}</span>
       <!-- 有内容：滚动的段码不进无障碍树，读屏听下面的 .sr。
@@ -510,9 +508,12 @@ onBeforeUnmount(() => {
 }
 
 .line {
-  display: inline-flex;
-  align-items: center;
   flex: none;
+  box-sizing: border-box;
+  /* 一条任务最长就是屏宽：超出屏宽的部分用省略号收掉，绝不溢出可视区（真宽度截断，中英文都准） */
+  max-width: var(--screen-w, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
   /* 条目之间的空档：一条滚完再接下一条，别让两条粘在一起 */
   padding-right: 48px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
@@ -530,7 +531,8 @@ onBeforeUnmount(() => {
    所以"看圆点就知道是哪一类"，不用读完那行字 */
 .line::before {
   content: '';
-  flex: none;
+  display: inline-block;
+  vertical-align: middle;
   width: 7px;
   height: 7px;
   margin-right: 7px;
