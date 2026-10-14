@@ -7,8 +7,10 @@
  * list. `<details>` handles open/close natively, so there is no click-outside listener and it
  * renders fine under SSR.
  *
- * `modelValue` is the array of selected option values; an empty array means "no filter" and the
- * summary falls back to `allLabel` (e.g. "All projects").
+ * `modelValue` is the array of selected option values. An empty array means "no filter" (= all), and
+ * in that state every checkbox shows as checked and the summary falls back to `allLabel`
+ * (e.g. "All projects"). Toggling an item off switches to an explicit selection; selecting every item
+ * again collapses back to the empty "all" state.
  */
 import { computed } from 'vue';
 import { useI18n } from '../i18n';
@@ -24,7 +26,7 @@ const emit = defineEmits(['update:modelValue']);
 
 const { t } = useI18n();
 
-const selectedSet = computed(() => new Set(props.modelValue));
+const allValues = computed(() => props.options.map((o) => o.value));
 
 /** Summary text: the single selected label, or the count when several are selected, or `allLabel` when none. */
 const summaryText = computed(() => {
@@ -37,12 +39,18 @@ const summaryText = computed(() => {
   return t('records.filter.selected_n', { n });
 });
 
+/** An empty modelValue means "all", so in that state every option reads as checked. */
+function isChecked(value) {
+  return props.modelValue.length === 0 || props.modelValue.includes(value);
+}
+
 function toggle(value) {
-  const next = props.modelValue.slice();
-  const i = next.indexOf(value);
-  if (i >= 0) next.splice(i, 1);
-  else next.push(value);
-  emit('update:modelValue', next);
+  // Work off the effective set: an empty modelValue stands for "all options selected".
+  const current = props.modelValue.length ? props.modelValue : allValues.value;
+  const next = current.filter((v) => v !== value);
+  if (next.length === current.length) next.push(value); // the value was not selected → select it
+  // Having every option selected is the same as "all" → collapse back to the empty representation.
+  emit('update:modelValue', next.length === allValues.value.length ? [] : next);
 }
 </script>
 
@@ -54,7 +62,7 @@ function toggle(value) {
     </summary>
     <div class="msel-menu" role="listbox" aria-multiselectable="true">
       <label v-for="o in options" :key="o.value" class="msel-opt">
-        <input type="checkbox" :checked="selectedSet.has(o.value)" @change="toggle(o.value)" />
+        <input type="checkbox" :checked="isChecked(o.value)" @change="toggle(o.value)" />
         <span class="msel-opt-text">{{ o.label }}</span>
       </label>
       <div v-if="!options.length" class="msel-empty">—</div>
