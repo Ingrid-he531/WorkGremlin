@@ -64,8 +64,9 @@ async function loadFeed() {
 const END_KEEP_MIN = 5;
 /** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
 const SPEED_PX_S = 70;
-/** 单条文本显示长度限制为一屏（perLine 个字符）：超出则在用户原话末尾截 "..."，
- *  不足则补空格凑满一屏 —— 长短任务统一一屏长、间隔一致（不再无限滚动长句）。 */
+/** Each task line occupies exactly one screen width: a long task is cut by the `.line` CSS ellipsis
+ *  (true width, so CJK/ASCII are both exact) and a short task leaves the rest of its screen-wide box
+ *  blank — every line is one screen long and the spacing is uniform. */
 
 /** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
@@ -114,28 +115,6 @@ function endedText(it) {
     suffix,
     suffixKind,
   };
-}
-
-/**
- * 单条任务在屏上的显示：
- *   · 短任务 → 在「后缀之后」补空格凑满一屏（perLine 个字符），使长短任务一样长、彼此间隔一致；
- *   · 超长任务 → **不在这里截断**，交给 .line 的 CSS `text-overflow: ellipsis` 按"真实屏宽"收尾。
- *     之前是按字数估算 perLine 截断，但中文/全角比数字宽得多，估算值偏小会让长任务溢出可视区、
- *     又看不到省略号。改成 CSS 真宽度截断后，无论中英文都严格卡在屏宽内，超出即显省略号。
- * 渲染期调用，随 perLine（屏宽/字号）变化自动重算。
- */
-function fitLine(it) {
-  const per = perLine.value || 0;
-  const time = it.time || '';
-  const floor = it.floor || '';
-  const label = it.taskLabel || '';
-  const text = it.taskText || '';
-  const suffix = it.suffix || '';
-  // 渲染字符数 ≈ time + nbsp + floor + nbsp + label + text + suffix
-  const core = time.length + 1 + floor.length + 1 + label.length + text.length + suffix.length;
-  // 只补空格把短任务凑满一屏；超长任务的溢出交给 .line 的 CSS 省略号，这里不再切 "..."（避免双重省略号）
-  const pad = per > 0 ? Math.max(0, per - core) : 0;
-  return { text, pad };
 }
 
 /** 从所有工程的所有会话里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded ——
@@ -267,20 +246,8 @@ const srText = computed(() =>
 
 const viewEl = ref(null);
 const trackEl = ref(null);
-/** 量单字符宽用的探针：一串等宽数字，测出来除以长度就是"一个字"占多宽（含 letter-spacing） */
-const probeEl = ref(null);
-const PROBE_LEN = 20;
-/** 单字符宽度（px）：字号固定，量一次就够，不随窗口变（用 ref 是为了量到之后 perLine 能自己重算） */
-const charW = ref(0);
-/** 圆点 + 它右边的空隙（px）：算"一屏能放几个字"时要先扣掉它 */
-const DOT_W = 14;
-/** 屏幕可视宽度（px） */
+/** Screen visible width (px) */
 const viewW = ref(0);
-/** 一屏能放下的字符数：短句按这个数在后面补空格，凑满一屏（长句照原样滚，不截断） */
-const perLine = computed(() => {
-  if (!viewW.value || !charW.value) return 0;
-  return Math.max(0, Math.floor((viewW.value - DOT_W) / charW.value));
-});
 /** 系统「减弱动态效果」：不滚，静态摆着 */
 const reduce = ref(false);
 let ro = null;
@@ -321,11 +288,6 @@ function pushSeg() {
 /** 重测屏宽 + 各段宽度（写回 segs[i].w / viewW / trackW） */
 function measureSegs() {
   if (viewEl.value) viewW.value = viewEl.value.clientWidth;
-  // 探针只在第一次量得到宽度时取值：字号不变，一个字多宽就不变
-  if (probeEl.value && !charW.value) {
-    const w = probeEl.value.getBoundingClientRect().width;
-    if (w > 0) charW.value = w / PROBE_LEN;
-  }
   const el = trackEl.value;
   if (!el) return;
   const nodes = el.querySelectorAll('.seg');
@@ -427,11 +389,9 @@ onBeforeUnmount(() => {
       >
         <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
-        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ fitLine(it).text }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span><span class="pad">{{ ' '.repeat(fitLine(it).pad) }}</span></span>
+        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span></span>
         </span>
       </div>
-      <!-- 量字宽的探针：一串等宽数字，看不见也不占地方（算"一屏能放几个字"用） -->
-      <span ref="probeEl" class="probe" aria-hidden="true">{{ '0'.repeat(PROBE_LEN) }}</span>
       <span class="scan" aria-hidden="true" />
     </div>
     <p class="sr" role="status" aria-live="polite">{{ srText }}</p>
@@ -510,8 +470,11 @@ onBeforeUnmount(() => {
 .line {
   flex: none;
   box-sizing: border-box;
-  /* 一条任务最长就是屏宽：超出屏宽的部分用省略号收掉，绝不溢出可视区（真宽度截断，中英文都准） */
-  max-width: var(--screen-w, 100%);
+  /* A task line occupies exactly one screen: `width` (not `max-width`) makes a short task leave the
+     rest of its screen-wide box blank (the old "pad with spaces" effect), while a long task is cut
+     by the ellipsis at true width — no char-count estimate, so CJK and ASCII are both exact, and a
+     padded short line can no longer trigger the ellipsis. */
+  width: var(--screen-w, 100%);
   overflow: hidden;
   text-overflow: ellipsis;
   /* 条目之间的空档：一条滚完再接下一条，别让两条粘在一起 */
@@ -552,20 +515,6 @@ onBeforeUnmount(() => {
 .line .task-text {
   color: var(--floor-color);
   text-shadow: 0 0 6px currentColor;
-}
-
-/* 量字宽的探针：绝对定位 + 看不见，不参与布局 */
-.probe {
-  position: absolute;
-  top: 0;
-  left: 0;
-  visibility: hidden;
-  pointer-events: none;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
-  font-size: 15px;
-  font-weight: 500;
-  letter-spacing: 0.5px;
-  white-space: pre;
 }
 
 /* 行本体颜色由 --floor-color 驱动（见 .line），k-* 类保留以备将来按状态整体上色。
