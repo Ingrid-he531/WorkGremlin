@@ -291,17 +291,6 @@ function createServer(opts = {}) {
       config.writeServerInfo(info);
     }
 
-    // 清理历史遗留：旧版 agentScan 注册的 "agent-<级别>-<id>" 成员已被 agentRoster 取代，
-    // 但库里的旧行不会自动消失，会和 roster 的小怪物同名（出现"Peter/Leo 各两只"）。这里一次性删掉。
-    try {
-      const legacy = repo
-        .listMembers.all(config.DEMO_PROJECT)
-        .filter((m) => /^agent-(user|project)-/.test(m.id));
-      for (const m of legacy) bus.removeMember({ project: config.DEMO_PROJECT, memberId: m.id });
-    } catch {
-      /* 清理失败不影响启动 */
-    }
-
     // 常驻小怪物名册：把已定义的 subagent（项目级 + 用户级）注册成坐工位、带工牌的小怪物。
     // 演示工程没有目录（workspacePath === ''），名册于是只列**用户级** agent。
     agentRoster = createAgentRoster({
