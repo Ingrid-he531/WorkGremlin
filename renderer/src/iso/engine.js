@@ -236,8 +236,6 @@ export function createIsoOffice(canvas, opts = {}) {
   let manualMeeting = false;
   /** 召唤编排状态：{ agentId, start, back, task, ghostId, reply } */
   let dispatch = null;
-  /** 召唤时出现的临时小幽灵：显示具体工作任务 */
-  let dispatchGhost = null;
   /** 召唤队列：收到召唤 -> 排队走"跑到主 agent 面前领任务"的编排 */
   const summonQueue = [];
   /** 坐工位小怪物名字 -> { seat, agentId }：把"被召唤的幽灵"对到它的小怪物 */
@@ -376,15 +374,6 @@ export function createIsoOffice(canvas, opts = {}) {
       task: s.task,
       ghostId: s.ghostId || null,
     };
-    dispatchGhost = {
-      x: a.seat.x + 0.25,
-      y: a.seat.y - 0.15,
-      z: 1.7,
-      color: a.color,
-      phase: Math.random() * 6.28,
-      name: a.name,
-      task: s.task,
-    };
   }
 
   /** 收尾当前编排：回工位后让"召唤幽灵"出现在头顶，并推进队列 */
@@ -392,7 +381,6 @@ export function createIsoOffice(canvas, opts = {}) {
     if (!dispatch) return;
     const ghostId = dispatch.ghostId;
     dispatch = null;
-    dispatchGhost = null;
     if (ghostId) revealGhost(ghostId);
     pumpDispatch();
   }
@@ -2570,7 +2558,6 @@ export function createIsoOffice(canvas, opts = {}) {
       finishDispatch();
       return;
     }
-    if (dispatchGhost) dispatchGhost.phase = (now - t0) / 780;
   }
 
   /** 收工汇报推进：走到控制台跟前 -> 说出结果摘要 -> 回工位 -> 幽灵散掉 */
@@ -2729,7 +2716,6 @@ export function createIsoOffice(canvas, opts = {}) {
         },
       });
     }
-    if (dispatchGhost) items.push({ depth: depthOf(dispatchGhost.x, dispatchGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, dispatchGhost) });
     if (reportGhost) items.push({ depth: depthOf(reportGhost.x, reportGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, reportGhost) });
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
@@ -2800,20 +2786,6 @@ export function createIsoOffice(canvas, opts = {}) {
         color: STATE_COLOR[bucketOf(stateOf(a.memberId))],
       });
       pushHit(a.memberId, s.x - box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12 - box.h, s.x + box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12);
-    }
-
-    // 召唤时的临时小幽灵：名字 + 具体任务
-    if (dispatchGhost) {
-      const s = toScreen(dispatchGhost.x, dispatchGhost.y, dispatchGhost.z);
-      const y = s.y - SPRITE_H * UNIT_Z * cam.zoom * 0.92 - 12;
-      const box = drawTag(ctx, {
-        x: s.x,
-        y,
-        text: dispatchGhost.name,
-        color: STATE_COLOR.busy,
-        dashed: true,
-      });
-      pushHit('__dispatch_ghost', s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
     }
 
     // 汇报期间补画的幽灵：名字 + "正在汇报"（结果摘要在气泡里说）
