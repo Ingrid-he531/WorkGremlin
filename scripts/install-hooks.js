@@ -20,9 +20,10 @@
  *   - CodeBuddy Plugin and CodeBuddy CLI share one user-level config (~/.codebuddy/settings.json), so the
  *     `codebuddy` entry covers both; the matcher includes both CLI-style (Write/Edit) and IDE-style
  *     (write_to_file/replace_in_file), so either side matches.
- *   - Merge-write, re-runnable: first strip the entries we added last time (identified by the hook script
- *     path in the command), then append; others' hooks are untouched. Before the first change it backs up
- *     to <file>.bak-workgremlin.
+ *   - Merge-write, re-runnable: first strip the entries we added last time (identified by our reporter
+ *     hook's **repo-relative** path in the command — any checkout, so cloning/moving the repo self-heals
+ *     instead of leaving a second, dead-or-double registration), then append; others' hooks are untouched.
+ *     Before the first change it backs up to <file>.bak-workgremlin.
  *   - CLI-side changes do not take effect immediately: hooks are snapshotted at startup, so external
  *     changes must be reviewed once in the /hooks panel (a security design). Plugin-side: just reopen the session.
  *   - **7F Kilo Code is not in this list**: Kilo has no hook subsystem (no hooks.json, no attachable event
@@ -43,6 +44,20 @@ const HOOK_SCRIPT = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'hook.js
  * their config instead.
  */
 const PLUGIN_ENTRY_FILE = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'plugin', 'index.js');
+
+/**
+ * Repo-relative signatures of our own files. Entries are matched by these **suffixes**, never by the
+ * absolute HOOK_SCRIPT / PLUGIN_ENTRY_FILE: when the repo is cloned to / run from another directory,
+ * an entry written by an earlier install still carries the OLD absolute path. Matching the current
+ * absolute path would not recognize it, so the merge would keep it and append a second entry — the
+ * same event then fires our hook **twice** (measured: every event twice, two same-title tasks in one
+ * session with the earlier one cancelled by endStaleTasksOfSession).
+ */
+const HOOK_SCRIPT_REL = 'packages/reporter/src/hook.js';
+const PLUGIN_ENTRY_REL = 'packages/reporter/src/plugin/index.js';
+function normSlash(s) {
+  return String(s || '').replace(/\\/g, '/');
+}
 
 /**
  * A null matcher means the event takes no matcher (UserPromptSubmit / Stop).
@@ -171,9 +186,15 @@ function hookCommand(name) {
  */
 const QODER_EVENTS = CLAUDE_EVENTS;
 
-/** The entries we add: identified by whether the command contains the hook script path */
+/** Is this one of our hook commands? Path-independent: our reporter hook suffix + a product --agent. */
+function isOurCommand(command) {
+  const c = normSlash(command);
+  return c.includes(HOOK_SCRIPT_REL) && c.includes('--agent');
+}
+
+/** The entries we add: identified by whether the command points at our reporter hook (**any checkout**) */
 function isOurs(group) {
-  return !!group && Array.isArray(group.hooks) && group.hooks.some((h) => h && typeof h.command === 'string' && h.command.includes(HOOK_SCRIPT));
+  return !!group && Array.isArray(group.hooks) && group.hooks.some((h) => h && isOurCommand(h.command));
 }
 
 /** Whether this config already has our hook (decides whether to back up) */
@@ -270,7 +291,7 @@ function projectPluginEntryFiles(dir) {
           continue;
         }
         // Count it if the name or content mentions us — a shim only forwards, so matching content is more reliable than the filename
-        if (/workgremlin/i.test(n) || body.includes(PLUGIN_ENTRY_FILE) || /workgremlin/i.test(body)) hits.push(f);
+        if (/workgremlin/i.test(n) || body.includes(PLUGIN_ENTRY_REL) || /workgremlin/i.test(body)) hits.push(f);
       }
     }
   }
@@ -285,11 +306,15 @@ function pluginPathOf(entry) {
   return '';
 }
 
+/** Is this one of our plugin entries? Path-independent (any checkout's PLUGIN_ENTRY_REL). */
+function isOurPluginPath(p) {
+  return normSlash(p).includes(PLUGIN_ENTRY_REL);
+}
+
 /** Whether this config already has our plugin entry (identified by the package path, not by name) */
 function hasPluginEntry(settings, client) {
   const list = Array.isArray(settings && settings.plugin) ? settings.plugin : [];
-  const want = pluginEntry(client)[0];
-  return list.some((p) => pluginPathOf(p) === want);
+  return list.some((p) => isOurPluginPath(pluginPathOf(p)));
 }
 
 /**
@@ -301,8 +326,7 @@ function hasPluginEntry(settings, client) {
  */
 function mergePlugins(existing, client, uninstall) {
   const list = Array.isArray(existing.plugin) ? existing.plugin : [];
-  const want = pluginEntry(client)[0];
-  const kept = list.filter((p) => pluginPathOf(p) !== want);
+  const kept = list.filter((p) => !isOurPluginPath(pluginPathOf(p)));
   const out = { ...existing };
   delete out.plugins;
   const next = uninstall ? kept : [...kept, pluginEntry(client)];
