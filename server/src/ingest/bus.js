@@ -1117,7 +1117,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       let drop = false;
       if (rec.parentTaskId) {
         const task = repo.getTask.get(rec.parentTaskId);
-        if (task && task.state && task.state !== 'running') drop = true;
+        // Only disperse when the parent **ended after this summon started**: a parent that was already
+        // done/cancelled before the summon (e.g. a superseded twin task, or a stale parentTaskId) must
+        // not kill a ghost whose own end signal (PostToolUse / SubagentStop) hasn't arrived yet.
+        if (task && task.state && task.state !== 'running') {
+          const endAt = Number(task.ended_at) || 0;
+          if (!endAt || endAt >= Number(rec.at || 0)) drop = true;
+        }
       }
       if (!drop && rec.at && t - rec.at > GHOST_ORPHAN_MS) drop = true;
       if (!drop) continue;
