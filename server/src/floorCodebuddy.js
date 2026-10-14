@@ -14,6 +14,8 @@
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
+// Shared server logger (warn goes to stderr and to ~/.workgremlin/logs).
+const log = require('./log');
 // globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
 const { dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
 // 工程名解析（genie-history 目录名 → 工程名）收口在 project.js
@@ -63,39 +65,84 @@ function decodeDirName(name) {
 }
 
 /**
- * 补全被扩展截断的工程路径（genie-history 目录名截到 64 字符 → 解出来只剩半截）。
- * 在已知真实工程（按可信度排序）里找一条以半截串为前缀的补上；优先磁盘上真实存在的目录。
- * 补不上就原样返回，不影响没被截断的机器。
+ * Ordered candidates that could be the untruncated form of `decoded`.
+ *
+ * The extension cuts the genie-history directory name (base64 of the project path) to 64
+ * characters, so truncation is a plain prefix cut of the decoded string. A candidate
+ * qualifies when it starts with `decoded` (normalized: backslashes -> slashes, trailing
+ * slashes trimmed, case-insensitive). A candidate equal to `decoded` is not a match: it
+ * would mean the path was never cut, so there is nothing to complete. Duplicates are
+ * dropped, so `[ws, workspacePath]` holding the same path counts as a single candidate.
+ *
+ * @param {string} decoded result of decodeDirName
+ * @param {string[]} candidates known real project paths, most trustworthy first
+ * @returns {string[]}
  */
-function completeTruncatedWorkspace(decoded, candidates) {
+function truncatedWorkspaceMatches(decoded, candidates) {
   const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-  if (!decoded || isDir(decoded)) return decoded; // 磁盘上真有这个目录 = 没被截断
   const want = norm(decoded);
-  if (!want) return decoded;
-  // 顺序即优先级：候选里第一条"以半截串为前缀（截断=纯前缀截断）"就是答案。不做"取最短"——
-  // 两条候选共享同一截断前缀时，按长短挑会挑错工程；按可信度排序才能保证真实活动工程（ws，放最前）优先补上。
-  // isDir 只作**优先判据，不作硬门槛**：优先补到磁盘上真实存在的目录，都没有就按顺序退回第一条命中。
-  let fallback = '';
+  if (!want) return [];
+  const seen = new Set();
+  const out = [];
   for (const c of candidates || []) {
     if (!c) continue;
     const n = norm(c);
     if (!n || n === want || !n.startsWith(want)) continue;
-    if (isDir(c)) return c;
-    if (!fallback) fallback = c;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(c);
   }
-  return fallback || decoded;
+  return out;
 }
 
-/** genie-history 下每个 base64 目录 = 一个工程（目录名解出来就是工程绝对路径） */
+/**
+ * Complete a project path that the extension truncated (genie-history directory names are
+ * cut to 64 base64 characters, which only fits 48 bytes -> the decoded path is a half).
+ *
+ * Matches are consumed in candidate order, and that order *is* the priority (the active
+ * project comes first). A candidate that really exists on disk wins; when none exists, the
+ * first match is used as a best-effort guess, so the caller never falls back to a truncated
+ * stub just because the directory cannot be stat'ed. With no match at all the decoded string
+ * is returned unchanged (machines with short paths are untouched).
+ *
+ * Ambiguity: two real projects can share the whole truncated prefix (`/u/base/proj` and
+ * `/u/base/proj-utils`), and the prefix alone cannot tell them apart. collectProjects logs a
+ * warning when that happens so a wrong attribution can be traced back later.
+ *
+ * @param {string} decoded result of decodeDirName
+ * @param {string[]} candidates known real project paths, most trustworthy first
+ * @returns {string}
+ */
+function completeTruncatedWorkspace(decoded, candidates) {
+  if (!decoded || isDir(decoded)) return decoded; // real dir on disk = not truncated
+  const matches = truncatedWorkspaceMatches(decoded, candidates);
+  if (!matches.length) return decoded;
+  return matches.find((c) => isDir(c)) || matches[0]; // prefer a real dir; else first by priority
+}
+
+/** genie-history: one base64 dir per project (the dir name decodes to the project path) */
 function collectProjects(storage, candidates = []) {
   const gh = path.join(storage, 'genie-history');
   const out = [];
   for (const name of readDir(gh)) {
     const dir = path.join(gh, name);
     if (!isDir(dir)) continue;
-    const ws = completeTruncatedWorkspace(decodeDirName(name), candidates);
+    const raw = decodeDirName(name);
+    const ws = completeTruncatedWorkspace(raw, candidates);
     if (!ws) continue;
-    out.push({ dir, path: ws, project: resolveProjectName(ws) || path.basename(ws) });
+    const matches = truncatedWorkspaceMatches(raw, candidates);
+    // guessed: the path was reconstructed from a truncated dir name, not read as-is.
+    // ambiguous: several known projects share the truncated prefix, so the guess can be
+    // wrong (another project may own this dir). Log it for post-mortem triage.
+    const guessed = ws !== raw;
+    const ambiguous = guessed && matches.length > 1;
+    if (ambiguous) {
+      log.warn(
+        `genie-history 工程目录「${name}」被截断：解出的「${raw}」命中 ${matches.length} 个已知工程 ` +
+          `[${matches.join('、')}]，补全取「${ws}」（猜测，可能归属有误）`
+      );
+    }
+    out.push({ dir, path: ws, project: resolveProjectName(ws) || path.basename(ws), guessed, ambiguous });
   }
   return out;
 }
@@ -771,9 +818,10 @@ module.exports = {
   RE_PLUGIN,
   // plugin kind 的结构化落盘读取：sessions.js 按 client 派发到这里（见 pluginStore）
   pluginStore,
-  // genie-history 目录名解码 / 截断补全（自检用；collectProjects 内部也用它）
+  // genie-history dir-name decoding / truncated-path completion (used by self-checks and collectProjects)
   decodeDirName,
   completeTruncatedWorkspace,
+  truncatedWorkspaceMatches,
   // plugin kind 的会话列表策略：sessionRegistry.handlePlugin 按接口通用派发（见 pluginPolicy）
   pluginPolicy,
   // 取消检测（统一模块组接口：cancelAt / allCancels，与 trae 同签名）

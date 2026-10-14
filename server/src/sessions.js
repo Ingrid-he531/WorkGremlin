@@ -1089,9 +1089,13 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
       if (p.path === ws) currentId = currentId || cid;
     }
     for (const id of readDir(path.join(p.dir, 'conversations'))) {
-      if (id) meta.set(id, { project: p.project, projectPath: p.path });
+      if (id) {
+        meta.set(id, { project: p.project, projectPath: p.path, guessed: p.guessed, ambiguous: p.ambiguous });
+      }
     }
-    if (cid && !meta.has(cid)) meta.set(cid, { project: p.project, projectPath: p.path });
+    if (cid && !meta.has(cid)) {
+      meta.set(cid, { project: p.project, projectPath: p.path, guessed: p.guessed, ambiguous: p.ambiguous });
+    }
   }
 
   // GitHub Copilot 这类真实插件落盘用 SQLite `session-store.db`，不是 `genie-history`：
@@ -1169,6 +1173,10 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
       ...info,
       project: m.project,
       projectPath: m.projectPath,
+      // projectPath was reconstructed from a truncated genie-history dir name (a guess, not a
+      // fact); when ambiguous is true several known projects shared the truncated prefix.
+      projectPathGuessed: Boolean(m.guessed),
+      projectPathAmbiguous: Boolean(m.ambiguous),
       mine: Boolean(ws) && m.projectPath === ws,
     });
   }
