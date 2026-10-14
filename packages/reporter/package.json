@@ -2,7 +2,7 @@
   "name": "@workgremlin/reporter",
   "version": "0.1.0",
   "private": true,
-  "description": "agent 侧上报 SDK + CLI（零运行时依赖，仅用 fetch）",
+  "description": "agent-side reporting SDK + CLI (zero runtime dependencies; uses only fetch)",
   "main": "src/index.js",
   "dependencies": {
     "@workgremlin/shared": "*"
