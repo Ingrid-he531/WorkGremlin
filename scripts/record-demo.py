@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""WorkGremlin 演示视频录制（Wayland / GNOME）。
+"""WorkGremlin demo video recording (Wayland / GNOME).
 
-思路：Wayland 下 ffmpeg 的 x11grab 抓不到画面，所以走
-xdg-desktop-portal 的 ScreenCast 接口拿到 PipeWire 流，
-gstreamer 负责抓帧 + 转成原始 I420，ffmpeg 负责编码成 mp4。
+Approach: under Wayland, ffmpeg's x11grab cannot capture the screen, so we go through
+xdg-desktop-portal's ScreenCast interface to get a PipeWire stream; gstreamer captures frames and
+converts them to raw I420, and ffmpeg encodes to mp4.
 
-首次调用时 GNOME 会弹「共享屏幕」确认框，需要点一下确认。
+On the first call GNOME shows a "Share your screen" confirmation; click to confirm.
 
-用法:
-  scripts/record-demo.py                      # 录 30 秒整屏
-  scripts/record-demo.py -d 60 --window       # 录 60 秒，弹窗里挑某个窗口
-  scripts/record-demo.py -d 0 --mic           # 不限时长（Ctrl+C 结束）+ 麦克风旁白
+Usage:
+  scripts/record-demo.py                      # record the whole screen for 30s
+  scripts/record-demo.py -d 60 --window       # record 60s, pick a window in the dialog
+  scripts/record-demo.py -d 0 --mic           # no time limit (Ctrl+C to stop) + mic narration
   scripts/record-demo.py -s 1280x720 -o /tmp/demo.mp4
 
-依赖: gstreamer1.0(含 pipewiresrc) / pipewire / ffmpeg / python3-gi
+Dependencies: gstreamer1.0 (with pipewiresrc) / pipewire / ffmpeg / python3-gi
 """
 
 import argparse
@@ -56,7 +56,7 @@ def next_token(prefix='wg'):
 
 
 class Screencast:
-    """封装 ScreenCast 会话：创建 -> 选源 -> 启动 -> 打开 PipeWire 连接。"""
+    """Wraps a ScreenCast session: create -> select source -> start -> open the PipeWire connection."""
 
     def __init__(self, source_type):
         self.bus = connect_bus()
@@ -69,7 +69,7 @@ class Screencast:
         self.session_handle = None
 
     def _request(self, method, params, timeout=120):
-        """调用带 handle_token 的异步方法，等 Request::Response 信号。"""
+        """Call an async method with a handle_token and wait for the Request::Response signal."""
         token = next_token()
         req_path = f'/org/freedesktop/portal/desktop/request/{self.sender}/{token}'
         loop = GLib.MainLoop()
@@ -100,9 +100,9 @@ class Screencast:
         self.bus.signal_unsubscribe(sub)
 
         if 'code' not in box:
-            raise PortalError(f'{method} 超时（等了 {timeout}s）')
+            raise PortalError(f'{method} timed out (waited {timeout}s)')
         if box['code'] != 0:
-            raise PortalError(f'{method} 被拒绝或取消（code={box["code"]}）')
+            raise PortalError(f'{method} denied or cancelled (code={box["code"]})')
         return box['results']
 
     def start(self):
@@ -126,7 +126,7 @@ class Screencast:
             })))
         streams = results.get('streams')
         if not streams:
-            raise PortalError('portal 没有返回任何视频流')
+            raise PortalError('portal returned no video stream')
         node_id = int(streams[0][0])
         size = None
         raw = streams[0][1].get('size') if streams[0][1] else None
@@ -140,7 +140,7 @@ class Screencast:
             Gio.DBusCallFlags.NONE, -1, None,
         )
         if fd_list is None or fd_list.get_length() < 1:
-            raise PortalError('拿不到 PipeWire 的 fd')
+            raise PortalError('could not get the PipeWire fd')
         return node_id, fd_list.get(0), size
 
     def close(self):
@@ -193,21 +193,21 @@ def build_ffmpeg(out_path, width, height, fps, crf, mic, duration):
 def parse_size(text):
     w, _, h = text.lower().replace('*', 'x').partition('x')
     width, height = int(w), int(h)
-    # libx264 要求偶数宽高
+    # libx264 requires even width/height
     return width // 2 * 2, height // 2 * 2
 
 
 def main():
-    ap = argparse.ArgumentParser(description='录制 WorkGremlin 桌面演示视频')
-    ap.add_argument('-d', '--duration', type=int, default=30, help='录制秒数，0 表示手动 Ctrl+C 停止（默认 30）')
-    ap.add_argument('-o', '--out', default='', help='输出文件，默认 recordings/demo-<时间戳>.mp4')
-    ap.add_argument('-s', '--size', default='', help='录制分辨率，默认跟随窗口/屏幕实际尺寸（如 1280x720）')
-    ap.add_argument('-f', '--fps', type=int, default=30, help='帧率（默认 30）')
-    ap.add_argument('--crf', type=int, default=23, help='x264 质量，越小越清晰（默认 23）')
-    ap.add_argument('--window', action='store_true', help='只录某个窗口（弹窗里选），默认整屏')
-    ap.add_argument('--mic', action='store_true', help='同时录麦克风（alsa default）')
+    ap = argparse.ArgumentParser(description='Record a WorkGremlin desktop demo video')
+    ap.add_argument('-d', '--duration', type=int, default=30, help='recording seconds; 0 = stop manually with Ctrl+C (default 30)')
+    ap.add_argument('-o', '--out', default='', help='output file; default recordings/demo-<timestamp>.mp4')
+    ap.add_argument('-s', '--size', default='', help='recording resolution; default follows the window/screen size (e.g. 1280x720)')
+    ap.add_argument('-f', '--fps', type=int, default=30, help='frame rate (default 30)')
+    ap.add_argument('--crf', type=int, default=23, help='x264 quality, lower is clearer (default 23)')
+    ap.add_argument('--window', action='store_true', help='record a single window (pick it in the dialog); default is the whole screen')
+    ap.add_argument('--mic', action='store_true', help='also record the microphone (alsa default)')
     ap.add_argument('-c', '--countdown', type=int, default=5,
-                    help='开录前的倒计时秒数，留时间切窗口（默认 5，0 表示不倒计时）')
+                    help='countdown seconds before recording starts, time to switch windows (default 5; 0 = no countdown)')
     args = ap.parse_args()
 
     if args.out:
@@ -216,40 +216,40 @@ def main():
         out_path = ROOT / 'recordings' / time.strftime('demo-%Y%m%d-%H%M%S.mp4')
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print('[1/3] 向 portal 申请录屏权限（GNOME 会弹确认框，请点「共享」）...')
+    print('[1/3] requesting screen-capture permission from the portal (GNOME will show a dialog; click "Share")...')
     cast = Screencast(SOURCE_WINDOW if args.window else SOURCE_MONITOR)
     try:
         node_id, fd, stream_size = cast.start()
     except PortalError as exc:
-        print(f'录屏申请失败：{exc}', file=sys.stderr)
+        print(f'screen-capture request failed: {exc}', file=sys.stderr)
         return 1
-    print(f'      拿到 PipeWire 流 node={node_id}')
+    print(f'      got PipeWire stream node={node_id}')
 
     if args.size:
         width, height = parse_size(args.size)
     else:
         width, height = stream_size or (1920, 1080)
-        width, height = width // 2 * 2, height // 2 * 2  # libx264 要求偶数宽高
-    print(f'      分辨率 {width}x{height}')
+        width, height = width // 2 * 2, height // 2 * 2  # libx264 requires even width/height
+    print(f'      resolution {width}x{height}')
 
     gst_cmd = build_gst(node_id, fd, width, height, args.fps)
     ff_cmd = build_ffmpeg(out_path, width, height, args.fps, args.crf, args.mic, args.duration)
 
-    print(f'[2/3] 开始录制 -> {out_path}')
+    print(f'[2/3] recording -> {out_path}')
     if args.duration > 0:
-        print(f'      {args.duration} 秒后自动结束；现在可以把窗口切到要演示的画面')
+        print(f'      auto-stops after {args.duration}s; now switch the window to the scene to demo')
     else:
-        print('      不限时长，按 Ctrl+C 结束')
+        print('      no time limit, press Ctrl+C to stop')
 
     if args.countdown > 0:
-        print(f'      {args.countdown} 秒后开录，请把画面切到 WorkGremlin（建议先开「演示模式」）')
+        print(f'      recording starts in {args.countdown}s; switch to WorkGremlin (open "Demo mode" first)')
         for left in range(args.countdown, 0, -1):
             print(f'      {left}', flush=True)
             time.sleep(1)
 
     gst = subprocess.Popen(gst_cmd, stdout=subprocess.PIPE, pass_fds=(fd,))
     ff = subprocess.Popen(ff_cmd, stdin=gst.stdout)
-    gst.stdout.close()  # 只有 ffmpeg 持有管道读端
+    gst.stdout.close()  # only ffmpeg holds the read end of the pipe
 
     interrupted = False
     try:
@@ -260,7 +260,7 @@ def main():
                 time.sleep(0.3)
     except KeyboardInterrupt:
         interrupted = True
-        print('\n      收到 Ctrl+C，正在收尾...')
+        print('\n      got Ctrl+C, wrapping up...')
         ff.send_signal(signal.SIGINT)
         try:
             ff.wait(timeout=15)
@@ -280,9 +280,9 @@ def main():
     os.close(fd)
     cast.close()
 
-    print('[3/3] 收尾')
+    print('[3/3] wrapping up')
     if not out_path.exists():
-        print('没有产出视频文件，检查上面的报错。', file=sys.stderr)
+        print('no video file was produced; check the errors above.', file=sys.stderr)
         return 1
 
     size_mb = out_path.stat().st_size / 1024 / 1024
@@ -293,8 +293,8 @@ def main():
              '-of', 'csv=p=0', str(out_path)],
             capture_output=True, text=True)
         if probe.stdout.strip():
-            seconds = f' 时长 {float(probe.stdout.strip()):.1f}s'
-    print(f'完成：{out_path}（{size_mb:.1f} MB{seconds}）')
+            seconds = f'  duration {float(probe.stdout.strip()):.1f}s'
+    print(f'done: {out_path} ({size_mb:.1f} MB{seconds})')
     return 0 if not interrupted else 0
 
 

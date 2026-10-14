@@ -2,32 +2,34 @@
 'use strict';
 
 /**
- * subagent 清单 CLI —— 把"谁在帮你写代码、它现在什么状态"写进清单文件，
- * 服务端（server/src/ingest/subagentFeed.js）读它，办公室里就飘出对应名字 + 状态的幽灵。
+ * subagent manifest CLI — writes "who is helping you code and what state it is in" into the manifest
+ * file; the server (server/src/ingest/subagentFeed.js) reads it and the office floats a ghost with the
+ * matching name + state.
  *
- * 用法：
- *   node scripts/subagents.js set <name> <state> [--task "在做的事"] [--progress 0.4] [--project 工程名]
+ * Usage:
+ *   node scripts/subagents.js set <name> <state> [--task "what it is doing"] [--progress 0.4] [--project <project>]
  *   node scripts/subagents.js rm <name>
  *   node scripts/subagents.js list
  *   node scripts/subagents.js clear
  *
- * state 取 online | busy | idle | blocked | offline（写错或不写 -> online，不编造 busy）。
+ * state is one of online | busy | idle | blocked | offline (typo or omitted -> online; never invent busy).
  *
- * 收工（推荐）：写一句结果摘要，办公室里小怪物会走到主 agent 面前把这句话说出来，
- * 播完汇报服务端自动把这条回收（幽灵散掉、工位回空闲）：
- *   node scripts/subagents.js set simmon idle --result "设计文档已落地，390 行，含时序表与状态机"
+ * Finishing (recommended): write a one-line result summary; the gremlin in the office walks up to the main
+ * agent and says it, and once the report finishes the server recycles this entry (the ghost disperses, the
+ * desk goes idle):
+ *   node scripts/subagents.js set simmon idle --result "design doc landed, 390 lines, with a timing table and state machine"
  *
- * 清单文件位置（与服务端同一套规则）：
+ * Manifest file location (same rule as the server):
  *   $WORKGREMLIN_SUBAGENTS_FILE  >  $WORKGREMLIN_WORKSPACE/.workgremlin/subagents.json  >  <cwd>/.workgremlin/subagents.json
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
-// 与 hook / 服务端共用同一份清单文件：读改写加锁 + 原子写（见 shared/fslock.js）。
+// Share the same manifest file with the hook / server: read-modify-write is locked + atomic (see shared/fslock.js).
 const { updateJson } = require('@workgremlin/shared/fslock');
 const { home } = require('@workgremlin/shared');
 
-/** 与 server/src/ingest/subagentFeed.js 的 feedFilePath 保持一致：统一收口到数据目录单文件 */
+/** Keep in sync with server/src/ingest/subagentFeed.js feedFilePath: a single file in the data dir */
 function feedFilePath() {
   const env = String(process.env.WORKGREMLIN_SUBAGENTS_FILE || '').trim();
   if (env) return path.resolve(env);
@@ -45,7 +47,7 @@ function readFile(file) {
   }
 }
 
-/** 加锁的清单读-改-写：mutate 收到归一化后的 { project, agents }，返回新清单写回。 */
+/** Locked manifest read-modify-write: mutate receives the normalized { project, agents } and returns the new manifest to write. */
 function updateFeed(file, mutate) {
   return updateJson(
     file,
@@ -84,9 +86,9 @@ function main() {
   const feed = readFile(file);
 
   if (cmd === 'list') {
-    console.log(`清单：${file}`);
+    console.log(`manifest: ${file}`);
     if (!feed.agents.length) {
-      console.log('（空 —— 屋里现在没有临时成员的幽灵）');
+      console.log('(empty — no temporary-member ghosts in the office right now)');
       return;
     }
     for (const a of feed.agents) {
@@ -98,18 +100,18 @@ function main() {
 
   if (cmd === 'clear') {
     updateFeed(file, (f) => ({ project: f.project, agents: [] }));
-    console.log(`已清空：${file}`);
+    console.log(`cleared: ${file}`);
     return;
   }
 
   if (cmd === 'rm') {
     const name = String(args._[1] || '');
     if (!name) {
-      console.error('用法：node scripts/subagents.js rm <name>');
+      console.error('Usage: node scripts/subagents.js rm <name>');
       process.exit(1);
     }
     updateFeed(file, (f) => ({ project: f.project, agents: f.agents.filter((a) => a.name !== name) }));
-    console.log(`已移除 ${name}：${file}`);
+    console.log(`removed ${name}: ${file}`);
     return;
   }
 
@@ -117,14 +119,14 @@ function main() {
     const name = String(args._[1] || '');
     const state = String(args._[2] || '').trim();
     if (!name) {
-      console.error('用法：node scripts/subagents.js set <name> <state> [--task "…"] [--progress 0.4]');
+      console.error('Usage: node scripts/subagents.js set <name> <state> [--task "…"] [--progress 0.4]');
       process.exit(1);
     }
     const entry = {
       name,
       state: state || 'online',
-      // 收工摘要：写了它 = 这次召唤干完了（服务端播完汇报会自动回收这条），
-      // 没写就置空 —— 免得上一轮的 result 粘到新一轮召唤上
+      // Result summary: writing it = this summon is done (the server recycles the entry after the report
+      // finishes); otherwise set it empty — so a previous round's result does not stick to a new summon.
       result: args.result ? String(args.result) : '',
       ...(args.task ? { task: String(args.task) } : {}),
       ...(args.progress !== undefined && Number.isFinite(Number(args.progress))
@@ -139,11 +141,11 @@ function main() {
       else f.agents.push(entry);
       return f;
     });
-    console.log(`${entry.name} -> ${entry.state}（写入 ${file}）`);
+    console.log(`${entry.name} -> ${entry.state} (written to ${file})`);
     return;
   }
 
-  console.error(`未知命令：${cmd}`);
+  console.error(`Unknown command: ${cmd}`);
   process.exit(1);
 }
 

@@ -3,7 +3,7 @@
   "version": "0.1.10",
   "private": true,
   "main": "desktop/src/launcher.js",
-  "description": "WorkGremlin - 可视化桌面程序：管理与监控多 agent 协作团队",
+  "description": "WorkGremlin - a visual desktop app to manage and monitor a multi-agent collaboration team",
   "license": "MIT",
   "workspaces": [
     "shared",

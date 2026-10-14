@@ -1,6 +1,6 @@
-# WorkGremlin 桌面打包配置（M3）
-# 用法：先 `npm run build` 生成 renderer/dist，再 `npx electron-builder --linux AppImage --x64`
-# 注意：架构由 CLI 的 --x64 传入，此处不硬编码（docs 要求参数化）。
+# WorkGremlin desktop packaging config (M3)
+# Usage: first `npm run build` to produce renderer/dist, then `npx electron-builder --linux AppImage --x64`
+# Note: the arch is passed via the CLI's --x64; it is not hardcoded here (docs require it to be parameterized).
 
 appId: com.workgremlin.app
 productName: WorkGremlin
@@ -8,11 +8,11 @@ copyright: Copyright © 2026 WorkGremlin
 
 directories:
   output: dist
-  # 打包资源（图标等）放这里；没有可留空，但目录要存在
+  # Packaging resources (icons etc.) go here; can be left empty, but the dir must exist
   buildResources: build
 
-# 主进程入口（electron-builder 读取 package.json 的 main 字段）
-# desktop/src/launcher.js：打包后用 Electron 自带 Node 起 server + 复用 main.js 的 client 逻辑
+# Main-process entry (electron-builder reads package.json's main field)
+# desktop/src/launcher.js: after packaging, uses Electron's bundled Node to start the server and reuse main.js's client logic
 
 files:
   - package.json
@@ -24,8 +24,8 @@ files:
   - scripts
   - node_modules
 
-# 原生模块必须解包出 asar，否则 asar 内无法 dlopen（better-sqlite3 的 .node）
-# server 目录整体解包更省心：要读 cli.js / config，还要在 HOME 写 db
+# Native modules must be unpacked out of asar, otherwise they cannot be dlopen'd inside asar (better-sqlite3's .node)
+# Unpacking the whole server dir is simpler: it reads cli.js / config and writes the db under HOME
 asarUnpack:
   - "server/**"
   - "**/better-sqlite3/**/*.node"
@@ -34,7 +34,7 @@ linux:
   target:
     - AppImage
   category: Utility
-  # executableName 默认取 productName 小写；如需自定义在此指定
+  # executableName defaults to productName lowercased; specify here to customize
 
-# 体积优化（可选，先跑通再开）：
-# 用 .electron-builderignore 排除 node_modules 里的 dev 依赖（vite / esbuild / @electron/rebuild 等）
+# Size optimization (optional; enable after it builds):
+# Use .electron-builderignore to exclude dev dependencies in node_modules (vite / esbuild / @electron/rebuild …)

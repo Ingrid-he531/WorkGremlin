@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * 开发启动器：并行拉起 Vite（renderer, 5173）与 Electron。Electron 入口为
- * desktop/src/launcher.js，它会用 Electron 内置 Node 起 server、再起 client（dev 模式加载 Vite URL）。
- * 用法：
- *   npm run dev                 接真实数据源
+ * Dev launcher: start Vite (renderer, 5173) and Electron in parallel. The Electron entry is
+ * desktop/src/launcher.js, which uses Electron's bundled Node to start the server, then the client
+ * (dev mode loads the Vite URL).
+ * Usage:
+ *   npm run dev                 connect to the real data source
  *
- * 演示模式没有启动开关了（原 `--demo` / `--demo-seed` / WORKGREMLIN_DEMO* 已移除）：
- * 起完之后在办公室的 HUD 上点「演示模式」（集合开会左边）切到演示工程。
+ * There is no startup flag for demo mode anymore (the old `--demo` / `--demo-seed` / WORKGREMLIN_DEMO*
+ * were removed): once it is up, click "Demo mode" on the office HUD (left of "Gather for a meeting")
+ * to switch to the demo project.
  *
- * 额外的命令行参数会透传给 Electron 主进程（进而传给内嵌 server）。
+ * Extra command-line arguments are passed through to the Electron main process (and on to the embedded server).
  */
 'use strict';
 
@@ -22,8 +24,9 @@ const npm = isWin ? 'npm.cmd' : 'npm';
 const children = [];
 
 function run(name, cmd, args, opts = {}) {
-  // 注意：opts 里可能带 env，必须**先拆出来与 process.env 合并**再展开其余选项，
-  // 否则 `...opts` 会把 env 整体覆盖掉，子进程丢失 DISPLAY/XAUTHORITY（Electron 起不来）。
+  // Note: opts may carry env; it must be **pulled out and merged with process.env first**, then the
+  // remaining options spread — otherwise `...opts` overwrites env wholesale and the child loses
+  // DISPLAY/XAUTHORITY (Electron won't start).
   const { env: extraEnv = {}, ...restOpts } = opts;
   const child = spawn(cmd, args, {
     cwd: root,
@@ -46,7 +49,7 @@ function run(name, cmd, args, opts = {}) {
   pipe(child.stdout);
   pipe(child.stderr);
   child.on('exit', (code, signal) => {
-    if (code !== 0 && code !== null) console.log(`${tag} 退出 code=${code} signal=${signal}`);
+    if (code !== 0 && code !== null) console.log(`${tag} exited code=${code} signal=${signal}`);
   });
   children.push(child);
   return child;
@@ -63,7 +66,7 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 const extra = process.argv.slice(2);
-// 直接调用 node_modules/.bin 里的 electron：走 `npm run start` 时子进程 PATH 不一定带 .bin
+// Call the electron in node_modules/.bin directly: when run via `npm run start`, the child's PATH may not include .bin
 const electronBin = path.join(
   root,
   'node_modules',
@@ -71,7 +74,7 @@ const electronBin = path.join(
   isWin ? 'electron.cmd' : 'electron'
 );
 
-// 开发态一律接真实数据源；演示模式在界面里现切（见文件头的说明）。
+// In dev, always connect to the real data source; demo mode is switched in the UI (see the header).
 run('vite', npm, ['run', 'dev', '--workspace', '@workgremlin/renderer']);
 run('electron', electronBin, [path.join('desktop', 'src', 'launcher.js'), ...extra], {
   env: { WORKGREMLIN_DEV: '1' },

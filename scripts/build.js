@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * M0 的 "build"：只构建 renderer 静态资源，供 Electron 以 file:// 加载。
- * M3 再接入 electron-builder 产出安装包。
+ * M0 "build": build only the renderer static assets, for Electron to load over file://.
+ * M3 will wire in electron-builder to produce installers.
  */
 'use strict';
 
