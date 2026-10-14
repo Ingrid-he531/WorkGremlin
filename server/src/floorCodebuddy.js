@@ -14,7 +14,6 @@
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
-const { diskKey } = require('@workgremlin/shared');
 // globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
 const { dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
 // 工程名解析（genie-history 目录名 → 工程名）收口在 project.js
@@ -466,12 +465,21 @@ function codebuddyRequestTokens(indexPath, startedAt) {
  * 优先级：事件 payload > 会话状态缓存 > 三处候选位置按 sessionId/mtime 搜索。
  */
 
-/** 从工程路径推 CodeBuddy CLI projects 下的 slug。
- *  ~/.codebuddy/projects/home-yinghui-work-WorkGremlin/<sessionId>.jsonl */
+/** ws-slug cache: compute a given workspace path's slug once */
+const _wsSlugCache = new Map();
+
+/**
+ * Derive the CodeBuddy CLI projects slug from a workspace path.
+ *   /home/me/proj → home-me-proj  →  ~/.codebuddy/projects/home-me-proj/<sessionId>.jsonl
+ */
 function slugForWs(ws) {
   const s = String(ws || '').trim();
   if (!s) return '';
-  return s.replace(/^\/+/, '').replace(/[^a-zA-Z0-9_-]/g, '-').replace(/-+/g, '-').replace(/\/+$/, '');
+  const hit = _wsSlugCache.get(s);
+  if (hit != null) return hit;
+  const slug = s.replace(/^\/+/, '').replace(/[^a-zA-Z0-9_-]/g, '-').replace(/-+/g, '-').replace(/\/+$/, '');
+  _wsSlugCache.set(s, slug);
+  return slug;
 }
 
 /** 给定 sessionId + workspacePath，按优先级搜三处 CodeBuddy transcript 落盘。
@@ -646,18 +654,6 @@ function codebuddyTryRead(file, startedAt) {
  * 并发安全：用模块级 Map 缓存 workspacePath -> 最近 sessionId。
  * SessionStart 事件更新缓存，后续事件直接复用，避免并发误匹配。
  */
-
-/** ws-slug 缓存（diskKey 比较贵，只算一次） */
-const _wsSlugCache = new Map();
-function slugForWs(workspacePath) {
-  const ws = String(workspacePath || '').trim();
-  if (!ws) return '';
-  const hit = _wsSlugCache.get(ws);
-  if (hit != null) return hit;
-  const s = (typeof diskKey === 'function' ? diskKey(ws) : '') || '';
-  _wsSlugCache.set(ws, s);
-  return s;
-}
 
 /** 活跃会话缓存：workspacePath → sessionId（最近一次 SessionStart 推出来的） */
 const _activeSessionCache = new Map();

@@ -10,7 +10,6 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { diskKey } = require('@workgremlin/shared');
 // 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
 const { genericAgentDirs } = require('./ingest/agentLevel');
 

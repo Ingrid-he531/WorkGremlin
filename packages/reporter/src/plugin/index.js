@@ -1,51 +1,54 @@
 /**
- * WorkGremlin 的 OpenCode / Kilo Code 插件 —— 给 8F OpenCode（以及任何同族产品）上报**真相位**。
+ * WorkGremlin plugin for OpenCode / Kilo Code — reports the **true phase** to 8F OpenCode
+ * (and any sibling product).
  *
- * ## 为什么需要它
+ * ## Why it exists
  *
- * 7F/8F 那一类楼层是**轮询**产品的 SQLite 落盘推导相位的（见 server/src/opencode.js）：
- * 零安装、装完即用，但相位一律带 `inferred: true`，UI 按推断灰显。
- * 而且对 OpenCode 来说，轮询**有一个补不上的洞**：
+ * Floors like 7F/8F poll the product's SQLite on disk to infer the phase (see
+ * server/src/floorOpencode.js): zero install, works out of the box, but the phase always
+ * carries `inferred: true` and the UI greys it out. For OpenCode, polling also has a hole it
+ * cannot fill:
  *
- *   实测 OpenCode 2.0.18 全库 114 条 assistant 消息里，tool 块的 `state.status` 只出现过
- *   **completed / error / running** —— 从来没有 `pending`。也就是说"这个工具正在等用户授权"
- *   这个状态**根本没有落盘**，轮询永远推不出「等待授权」。
- *   OpenCode 把授权做成了独立事件（`permission.asked` / `permission.replied`），
- *   那个信号只在内存事件流里推。
+ *   Measured on OpenCode 2.0.18: across 114 assistant messages in the whole DB, a tool
+ *   block's `state.status` only ever showed **completed / error / running** — never `pending`.
+ *   So "this tool is waiting for user approval" is **never persisted**, and polling can never
+ *   derive "awaiting permission". OpenCode models approval as separate events
+ *   (`permission.asked` / `permission.replied`), pushed only on the in-memory event stream.
  *
- * 这个插件订阅那条事件流，把相位/完成标记写成 reporter 状态文件，于是：
- *   · 相位是**上报真值**（服务端不标 inferred，UI 不灰显）
- *   · 能显示「等待授权」（轮询做不到的那一相位）
- *   · 完成标记能带**改动文件清单**（实测 `session.step.ended` 事件的 `data.files` 就是本轮
- *     改动的文件路径数组；轮询那边只有 `session.summary_files` 一个计数）
+ * This plugin subscribes to that stream and writes the phase / completion markers into the
+ * reporter state file, so:
+ *   · the phase is a **reported truth** (the server does not mark it inferred, the UI does not grey it);
+ *   · "awaiting permission" can be shown (the phase polling cannot produce);
+ *   · the completion marker can carry the **changed-file list** (taken from `session.diff`,
+ *     filtered to this round; polling only has a single `session.summary_files` count).
  *
- * 没装插件也能用 —— 8F 会自动退回轮询推导，只是相位灰显、没有「等待授权」、完成标记没有文件清单。
+ * It works without the plugin too — 8F falls back to polling, just with a greyed-out phase, no
+ * "awaiting permission", and no file list on the completion marker.
  *
- * ## 事件契约（**实测** 2026-09-27，Kilo 7.8.1，插件内探针跑出来的真实词汇表）
+ * ## Event contract (measured 2026-09-27, Kilo 7.8.1, via an in-plugin probe)
  *
- * 信封是 `{ id, type, properties }` —— **不是** `{ type, data, location }`。
- * 实测只发下面这 10 类事件；早先这里按 `data` 信封与 `session.inbox.enqueued` /
- * `session.tool.called` / `session.execution.succeeded` / `permission.asked` /
- * `session.step.ended` 写，那一串**实测一个都不出现** —— 插件能装上、加载不报错，
- * 却一条状态文件都不写（7F 的任务台账因此永远是空的）。
+ * The envelope is `{ id, type, properties }` — **not** `{ type, data, location }`.
+ * Only these 10 event types are emitted; other vocabularies (`session.inbox.enqueued`,
+ * `session.tool.called`, `session.execution.succeeded`, `permission.asked`, `session.step.ended`, …)
+ * were measured and never appear.
  *
- *   session.created        info.directory=工程路径 · info.model.id=模型
- *   session.updated        info.title · info.model.id（**模型常常在这才出现**）
+ *   session.created        info.directory=workspace path · info.model.id=model
+ *   session.updated        info.title · info.model.id (the model often appears only here)
  *   message.updated        info.role · info.finish · info.time.completed · info.path.cwd
  *   message.part.updated   part{type:text|tool|reasoning|step-start|step-finish|patch,
  *                           text, tool, callID, state{status,input}, messageID}
- *   message.part.delta     token 级增量 —— 忽略
+ *   message.part.delta     token-level delta — ignored
  *   session.status         status.type = busy | idle
- *   session.idle           这一轮彻底结束
- *   session.drained        队列排空
- *   session.diff           diff[] = 相对**会话**快照的差集（不是"本轮"，见 steppedOf 的注释）
- *   session.next.tool.input.delta  工具入参增量 —— 忽略
+ *   session.idle           this round has fully ended
+ *   session.drained        queue drained
+ *   session.diff           diff[] = delta against the **session** snapshot (not "this round", see steppedOf)
+ *   session.next.tool.input.delta  tool-input delta — ignored
  *
- * 派生规则见 `handle()` 的长注释（任务起于 role=user 的 text part、收于 assistant 的
- * finish=stop、等待授权看 tool 的 state.status==='pending'）。
+ * Derivation rules are in the long comment above `handle()` (a task starts at a role=user text
+ * part, ends at an assistant finish=stop; awaiting permission is tool state.status==='pending').
  */
 
-/* Node 内置模块，插件运行环境自带的，不需要额外依赖。 */
+/* Node built-ins; the plugin runtime provides them, no extra dependency. */
 import fs from "node:fs"
 import path from "node:path"
 
@@ -58,13 +61,14 @@ import { createRequire } from "node:module"
 const require_ = createRequire(import.meta.url)
 const { statePath, writeState, readServerInfo, isPidAlive } = require_('@workgremlin/shared/paths')
 
-/* ------------------------------ 上报身份 ------------------------------ */
+/* ------------------------------ Report identity ------------------------------ */
 
 /**
- * 「这个进程是编辑器里起的吗」的专属信号 —— **按产品分开列**。
- * 混在一起认会让两边的变量互相污染：Kilo 的 CLI 进程里一个 KILO_* 都没有（实测 2026-09-30，
- * `/proc/<pid>/environ` 只有安装垫片留下的 KILO_TREE_SITTER_WASM_DIR），而 VS Code 扩展起的
- * `kilo serve` 三个都齐（KILO_CLIENT=vscode / KILOCODE_FEATURE=vscode-extension / KILO_PLATFORM=vscode）。
+ * The "was this process started inside an editor?" signal — **listed per product**.
+ * Mixing the two pollutes each other: a Kilo CLI process has no KILO_* at all (measured
+ * 2026-09-30: `/proc/<pid>/environ` only had KILO_TREE_SITTER_WASM_DIR left by the install
+ * shim), while `kilo serve` started by the VS Code extension has all three
+ * (KILO_CLIENT=vscode / KILOCODE_FEATURE=vscode-extension / KILO_PLATFORM=vscode).
  */
 const VSCODE_ENV = {
   kilo: [
@@ -79,88 +83,101 @@ const VSCODE_ENV = {
 }
 
 /**
- * 上报身份（= products.js 里的 client）= **产品基名** + **形态**，两件事分开定：
+ * Report identity has **two separate axes** — the floor base name (client) and the form:
  *
- *   · 产品基名（kilo / opencode）**由入口给**：`setup(ctx)` 是 OpenCode 的插件 API、
- *     `server(input, options)` 是 Kilo 的 —— 走哪个入口就说明是哪个产品，不用猜。
- *     配置里显式写了 `client` 也归一到基名（`kilo-plugin` → `kilo`）。
- *   · 形态（CLI / VS Code 插件）**由环境判**：同一份二进制在终端里和编辑器里各起一次，
- *     事件流完全一样（见文件头），只有环境变量分得出 —— 见上面的 VSCODE_ENV。
+ *   · **client** (kilo / opencode): the floor's product base name, which the server keys
+ *     everything on (state-file naming, `clientHit` matching, ledger ownership). It comes from
+ *     the entry point (`setup` → opencode, `server` → kilo); an explicit `options.client` also
+ *     names the product. The plugin never synthesizes or strips a `-plugin` suffix — the server
+ *     no longer uses `codebuddy` / `codebuddy-plugin` style identities, so the floor name is
+ *     taken as-is.
+ *   · **form** (cli / vscode): whether this instance was started inside an editor. The same
+ *     binary in a terminal and in the editor emits an identical event stream (see the file
+ *     header); only env vars tell them apart — see VSCODE_ENV. On the server,
+ *     `isPluginClient(form)` decides plugin-vs-not and `formToSource(form)` maps it to the
+ *     frontend `source` (plugin / cli / ide).
  *
- * **这里踩过的坑（2026-09-30 修）**：早先第一行是 `if (explicit) return explicit` ——
- * 而安装器写进 kilo.jsonc 的正是 `{client:"kilo"}`、`server()` 里还有个 `|| {client:"kilo"}`
- * 的兜底，于是**显式分支把下面整段环境判定全遮死**：VS Code 里跑出来的插件也报 `kilo`、
- * `form` 随之恒为 `cli`，任务列表里永远显示「Kilo Code CLI」（7F 的 plugin 形态从来没出现过）。
- * 安装器那条注释本来就是「`options.client` 钉住产品、形态由扩展自己判」的意图，
- * 是这里的判定顺序把那个意图杀死了。
+ * The explicit `client` option names the **product** only, never the form: that config is read by
+ * both the CLI and the editor extension (Kilo ships the same binary and reads the same
+ * ~/.config/kilo/kilo.jsonc), so hardcoding `-plugin` in the option would be wrong in the terminal
+ * and vice versa. The environment is the only signal for "who started this instance".
  */
 function resolveClient(options, base = "opencode") {
-  const env = (typeof process !== "undefined" && process.env) || {}
+  // The explicit option already names the floor base name; fall back to the entry point's base name.
   const explicit = String((options && options.client) || "").trim().toLowerCase()
-  // 显式选项**只说产品**：`kilo` / `kilo-plugin` / `opencode` 都归一到基名，形态仍然由环境判。
-  // 选项表达不了形态 —— 它写在配置里，而那**同一份配置 CLI 和编辑器扩展都会读**（Kilo 就是这样：
-  // 扩展自带同一个二进制、读同一个 ~/.config/kilo/kilo.jsonc），所以选项里写死 `-plugin`
-  // 在终端里就是错的，反之亦然。环境是唯一分得出"这一次是谁起的"的信号。
-  const name = explicit ? explicit.replace(/-plugin$/i, "") : base
-  const vscode = (VSCODE_ENV[name] || []).some(([k, v]) => env[k] === v)
-  return vscode ? `${name}-plugin` : name
+  return explicit || base
 }
 
-/* ------------------------------ 台账上报（HTTP） ------------------------------ */
+/**
+ * The **form** (cli / vscode) from the environment: the only signal that distinguishes the same
+ * binary started in a terminal from one started by the editor extension. See VSCODE_ENV.
+ */
+function resolveForm(client) {
+  const env = (typeof process !== "undefined" && process.env) || {}
+  const vscode = (VSCODE_ENV[client] || []).some(([k, v]) => env[k] === v)
+  return vscode ? "vscode" : "cli"
+}
+
+/* ------------------------------ Ledger reporting (HTTP) ------------------------------ */
 
 /**
- * 除了相位，本插件还往 WorkGremlin 的**台账**上报：成员、任务、对话记录、文件活动。
+ * Besides the phase, the plugin also reports to WorkGremlin's **ledger**: members, tasks,
+ * conversations, file activity.
  *
- * 之前只写状态文件，于是 7F/8F 在库里是"有相位、没有台账"：办公室没有这只小怪物
- * （`members` 里没有 client=kilo 的行）、任务列表与对话记录是空的。
- * 轮询那一路**补不了**这个洞 —— 它只读 SQLite，监控端伪造上报就违背"绝不编造"。
- * 只有本插件（跑在 agent 进程里、握着真相位事件流）能补。
+ * Writing only the state file left 7F/8F with "a phase but no ledger": no gremlin in the office
+ * (no row with client=kilo in `members`), and the task list / conversation records were empty.
+ * The polling path **cannot** fill this hole — it only reads SQLite, and a monitoring side
+ * fabricating reports would violate "never invent". Only this plugin (running inside the agent
+ * process, holding the true-phase event stream) can.
  *
- * 全部按 hook.js 的同一套 ingest 路由打（`shared` 的 HTTP_ROUTES），字段形状也照它：
- *   register    成员注册（**必须带 role:'agent'** —— bus.endTask 只对 role=agent 的成员
- *               写 task_runs 台账，漏了这个字段任务会开了但台账里没有）
- *   heartbeat   保活（>60s 没有心跳服务端就标 degraded 灰显）
- *   task/start  用户提交新一轮 = 一个任务；标题取用户那句话
- *   task/end    一轮结束（succeeded→done / failed·interrupted→cancelled），带 result 与 files
- *   message     本轮的收尾自述进对话记录（type=result）
- *   file/touch  写类工具动过的文件（正在改什么）
+ * All of it posts to the same ingest routes as the hook path (`shared`'s HTTP_ROUTES), with the
+ * same field shapes:
+ *   register    member registration (**must carry role:'agent'** — bus.endTask only writes
+ *               task_runs for role=agent members; omit it and the task opens but no ledger row)
+ *   heartbeat   keep-alive (no heartbeat for >60s and the server marks the member degraded)
+ *   task/start  a new user turn = a task; the title is the user's sentence
+ *   task/end    round end (succeeded→done / failed·interrupted→cancelled), with result and files
+ *   message     this round's closing summary into the conversation (type=result)
+ *   file/touch  files touched by write-class tools ("what is being edited")
  *
- * 三条纪律，与 hook.js 一致：
- *   1) 服务没起 / 拿不到上下文 / 上报失败 —— 一律静默，**绝不阻塞 agent**；
- *   2) 拿不到的数据就不上报（标题、result、文件都允许缺省），由服务端显示"未知"，不编造；
- *   3) 一律 fire-and-forget（不 await 事件处理），事件流绝不被 HTTP 拖住。
+ * Three disciplines, same as the hook path:
+ *   1) server down / no context / report failed — always silent, **never block the agent**;
+ *   2) don't report what you don't have (title, result, files may be absent); the server shows
+ *      "unknown", never invent;
+ *   3) always fire-and-forget (never await in event handling); the event stream must not be held
+ *      up by HTTP.
  */
 
-/** 单次 HTTP 的超时；超了就当这次没报出去，不重试到把 agent 拖住 */
+/** Timeout for a single HTTP call; on timeout treat it as unsent, don't retry into the agent's way */
 const HTTP_TIMEOUT_MS = 2_000
 
-/** server.json 的重读间隔：读一次几百字节，5 秒足够跟上"应用刚起来 / 刚换了端口" */
+/** server.json re-read interval: a few hundred bytes; 5s is enough to catch "app just started / changed port" */
 const SERVER_INFO_TTL_MS = 5_000
 
 /**
- * 建一个台账上报器。
- * @param {string} client 上报身份（kilo / kilo-plugin / opencode）—— 同时也是 memberId
+ * Build a ledger reporter.
+ * @param {string} client floor base name (kilo / opencode) — also the memberId
  */
 function createIngest(client) {
   /**
-   * 连接信息**惰性重读**，不在建实例那一刻定死。
+   * Connection info is **lazily re-read**, not fixed at construction time.
    *
-   * **这里踩过的坑（2026-09-30 修）**：早先这里读一次就把 `base` 定成常量、`enabled()`
-   * 恒为 `Boolean(base)` —— 而插件是**跟着 agent 的 server 进程活的**：Kilo 的 VS Code 扩展
-   * 09:04 起 server，WorkGremlin 10:42 才起，那个实例的 `post()` / `resolveProject()`
-   * 就一辈子直接 return（状态文件照写本地磁盘、台账一条不来，且**完全无声**）。
-   * 实测症状：那条 VS Code 会话在任务列表里只有轮询推导的行、没有任何插件行。
-   * 现在改成带 TTL 的重读：应用晚起 / 重启换了端口，下一个事件就能接上。
+   * The plugin lives as long as the agent's server process: the Kilo VS Code extension might start
+   * its server at 09:04 while WorkGremlin starts at 10:42 — if `base` were read once and `enabled()`
+   * were `Boolean(base)`, that instance's `post()` / `resolveProject()` would return forever (the
+   * state file is still written to disk, but not a single ledger row arrives, completely silently).
+   * The TTL re-read means a late app start / a restart on a new port is picked up by the next event.
    *
-   * 也补上了插件原先缺的存活判定（`isPidAlive`）：否则崩掉那次留下的 server.json
-   * 会被一直当成有效连接，每次都往一个死端口撞。
+   * It also adds the liveness check the plugin was missing (`isPidAlive`): otherwise a server.json
+   * left behind by a crashed run would be treated as a valid connection and every call would hit a
+   * dead port.
    */
   let conn = null
   let connAt = 0
   function connect() {
     const now = Date.now()
-    // 命中缓存：端口/令牌没变、且没过期 —— 高频事件（*.delta 虽然不写盘，但 part 更新很密）
-    // 下不能每个事件都去读一次盘
+    // Cache hit: port/token unchanged and not expired — high-frequency events (part updates are dense)
+    // must not read the disk on every one
     if (conn && now - connAt < SERVER_INFO_TTL_MS) return conn
     connAt = now
     const info = readServerInfo()
@@ -176,22 +193,21 @@ function createIngest(client) {
     return conn
   }
 
-  /** WorkGremlin 没在跑 / 没装 → 这次上报不发，绝不撞一个已知不通的端口 */
+  /** WorkGremlin not running / not installed → don't send, never hit a known-dead port */
   const enabled = () => Boolean(connect())
 
   /**
-   * 记一条台账。**调用方一律不 await** —— 事件处理绝不因 HTTP 被拖住；
-   * 但**把响应返回出去**，让"这一条到底发出去没有"变成可判的：`ensureRegistered`
-   * 就是靠它决定"注册成功没有、要不要重试"（早先这里返回 undefined、错误全吞，
-   * 于是注册悄悄失败也无人知晓，见那里踩的坑）。
+   * Record one ledger entry. **Callers never await** — event handling must not be held up by HTTP;
+   * but the response **is returned** so "did this one actually go out" becomes decidable:
+   * `ensureRegistered` relies on it to decide "did registration succeed, retry or not".
    *
-   * `project` 在这里**统一注入**，不交给各调用点：ingest 的 `projectFirst` 中间件
-   * 要求 body 里有 project，缺了就直接 400（`missing project`）—— 而 400 是
-   * **静默**的（上报 fire-and-forget，没人看响应），漏一处就表现为"这个产品的台账
-   * 永远是空的"，极难定位。SDK 那边（packages/reporter/src/index.js 的 post）是
-   * `{ project, ...body }` 统一加的，这里必须同一个口径。
+   * `project` is **injected here**, not left to each call site: the ingest `projectFirst` middleware
+   * requires `project` in the body and otherwise returns 400 (`missing project`) — and a 400 is
+   * **silent** (fire-and-forget, nobody reads the response), so one missed spot shows up as "this
+   * product's ledger is always empty" and is very hard to trace. The SDK
+   * (packages/reporter/src/index.js `post`) adds it the same way (`{ project, ...body }`).
    *
-   * @returns {Promise<Response|null>} 没连上 / 发不出去 → null
+   * @returns {Promise<Response|null>} null when not connected / not sent
    */
   function post(route, body) {
     const c = connect()
@@ -204,15 +220,15 @@ function createIngest(client) {
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       }).catch(() => null)
     } catch {
-      /* 发不出去就算了 */
+      /* can't send → skip */
       return Promise.resolve(null)
     }
   }
 
   /**
-   * 上报归属的工程：跟随服务端"当前打开的工程"，与 hook.js 的 resolveCtx 同一口径。
-   * 服务端不可达就留空 —— 留空时 post() 照样会带上空 project、被服务端 400 拒掉，
-   * 宁可不上报也不写进别的工程。
+   * The workspace this report belongs to: follows the server's "currently open workspace", same as
+   * the hook path. Leave it empty when the server is unreachable — `post()` still sends the empty
+   * project and the server 400s it; better to not report than to write into another workspace.
    */
   let projectCache = ""
   let projectPromise = null
@@ -229,12 +245,13 @@ function createIngest(client) {
           projectCache = p
           return p
         }
-        // 没拿到工程就别缓存 —— 下次调用重试，否则服务端晚起就永远拿不到工程、
-        // register / task/start / task/end 全被 `if (!project) return` 静默跳过
+        // Don't cache a missing workspace — retry next call; otherwise a late server start would never
+        // get a workspace and register / task/start / task/end would all be silently skipped by
+        // `if (!project) return`
         projectPromise = null
         return ""
       } catch {
-        // 网络失败同样不缓存，下次重试
+        // A network failure is not cached either; retry next time
         projectPromise = null
         return ""
       }
@@ -245,9 +262,9 @@ function createIngest(client) {
   return { post, resolveProject, enabled }
 }
 
-/* ------------------------------ 工具入参 ------------------------------ */
+/* ------------------------------ Tool input ------------------------------ */
 
-/** 工具入参里的可读命令（OpenCode 的 shell 工具入参是 command） */
+/** Human-readable command in the tool input (OpenCode's shell tool input is `command`) */
 function commandOf(input) {
   const s = input && typeof input === "object" ? input : {}
   const c = String(s.command || "")
@@ -256,7 +273,7 @@ function commandOf(input) {
   return d.replace(/\s+/g, " ").trim().slice(0, 120)
 }
 
-/** 工具入参里的目标文件（各家字段名不统一，都认一遍） */
+/** Target file in the tool input (field names differ per product; accept them all) */
 function fileOf(input) {
   const s = input && typeof input === "object" ? input : {}
   const p = s.file || s.filePath || s.file_path || s.path || s.target_file || ""
@@ -264,12 +281,14 @@ function fileOf(input) {
 }
 
 /**
- * 这个工具的**读/写**分类 —— 决定要不要上 file/touch（"正在读/改什么"）。
+ * The **read/write** classification of a tool — decides whether to send file/touch
+ * ("what is being read/edited").
  *
- * 只认写类：写类工具会真的改文件，读类（read/grep/glob…）读了不留下任何"改动"痕迹，
- * 报上去只会让"正在修改"那一栏全是噪声。判不出就当**读**（不上报）—— 宁可少报，
- * 也不把"读了个文件"说成"改了文件"（那属于编造）。
- * 名单与 hook.js 的 PROBE_TOOLS / opOf 保持同一套口径（大小写不敏感）。
+ * Only write-class tools count: they actually change files; read-class tools (read/grep/glob…)
+ * leave no "change" trace, so reporting them would just fill the "editing" column with noise.
+ * When undecidable, treat it as **read** (don't report) — better to under-report than to call
+ * "read a file" an edit (that would be inventing).
+ * The list matches the hook path's PROBE_TOOLS / opOf (case-insensitive).
  */
 function opOfTool(name) {
   const t = String(name || "").trim().toLowerCase()
@@ -281,7 +300,7 @@ function opOfTool(name) {
   return "read"
 }
 
-/** 剥掉外层 JSON 引号：实测 `part.text` 的值是 '"用 bash 执行 echo hi"'（自带一层引号） */
+/** Strip the outer JSON quotes: measured, `part.text` is `'"run echo hi with bash"'` (one quote layer) */
 function unquote(text) {
   const s = String(text == null ? "" : text)
   if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
@@ -294,13 +313,13 @@ function unquote(text) {
   return s
 }
 
-/** 召唤 subagent 的工具名（Kilo / OpenCode 都叫 task；Codex 风格是 spawn_agent 后缀） */
+/** Tool name for summoning a subagent (Kilo / OpenCode use `task`; Codex style is a spawn_agent suffix) */
 function isSubagentTool(name) {
   const t = String(name || "").trim().toLowerCase()
   return t === "task" || t === "agent" || t.endsWith("spawn_agent")
 }
 
-/** subagent 工具入参里的名字与任务描述（各版本字段名不统一，都认一遍；取不到就兜底） */
+/** Name and task description in a subagent tool input (field names differ per version; accept them all; fall back when absent) */
 function subagentOf(input) {
   const s = input && typeof input === "object" ? input : {}
   const name = s.subagent_type || s.subagent_name || s.task_name || s.agent || s.name || ""
@@ -308,117 +327,107 @@ function subagentOf(input) {
   return { name: String(name || "").trim() || "subagent", task: String(task).replace(/\s+/g, " ").trim().slice(0, 80) }
 }
 
-/* ------------------------------ 插件 ------------------------------ */
+/* ------------------------------ Plugin ------------------------------ */
 
 /**
- * 核心：把「一个上报实例」建起来，返回 `handle(event)` 与拆掉订阅的 `dispose()`。
+ * Core: build one reporting instance and return `handle(event)` plus `dispose()` to tear the
+ * subscription down.
  *
- * **两套产品、两套插件 API，但喂进来的是同一种事件**：
- *   · 8F OpenCode：`setup(ctx)` + `ctx.event.subscribe()` 拿事件流
- *   · 7F Kilo   ：`server(input)` 返回 `{ event }` 钩子，Kilo 每条事件调一次
- * 所以事件处理（相位 / 台账 / 幽灵）只写一份，两个入口各自接线。
+ * **Two products, two plugin APIs, but the same events fed in**:
+ *   · 8F OpenCode: `setup(ctx)` + `ctx.event.subscribe()` for the event stream
+ *   · 7F Kilo: `server(input)` returns an `{ event }` hook; Kilo calls it once per event
+ * So event handling (phase / ledger / ghost) is written once, and the two entry points just wire it up.
  *
- * @param {any} options 配置里那条 plugin 条目的选项（目录注册的没有，是 undefined）
- * @param {{location?: any, base?: string}} ctx `base` = 产品基名，**由入口给**（见 resolveClient）
+ * @param {any} options the plugin entry's options from config (directory-registered ones have none → undefined)
+ * @param {{location?: any, base?: string}} ctx `base` = product base name, **given by the entry point** (see resolveClient)
  */
 function createIngestPlugin(options, { location, base } = {}) {
-  // 产品身份由 resolveClient 定（入口给的 base，配置里的 options.client 可覆盖），形态由环境判。
-  const key = resolveClient(options, base)
-  // **身份恒为楼层产品基名**（kilo / opencode）—— 与 hookCommon 写的 `client = ev.agent` 同口径，
-  // 也是 readReporterPhase 里 clientHit 匹配的依据。以前这里把形态（'vscode'）当 client 发出去，
-  // 楼层读数、台账归属全对不上（`client === 'codebuddy'` 那种按产品判的分支更是永远不成立）。
-  const client = key.replace(/-plugin$/i, '')
-  // 形态（cli / vscode）：同一份二进制在终端与编辑器里各起一次，只有环境变量分得出（见 resolveClient）；
-  // 落 task_runs.form / 状态文件 form，任务列表据此显示「… CLI」/「… Plugin」。
-  const form = key.endsWith('-plugin') ? 'vscode' : 'cli'
-  /** 会话 id → 工程路径（session.created 给的是权威值，事件信封的 location.directory 兜底） */
+  // Floor base name (client) + form (cli / vscode), decided separately (see resolveClient / resolveForm).
+  // **client is always the floor's product base name** (kilo / opencode) — same as hookCommon's
+  // `client = ev.agent`, and what readReporterPhase's clientHit matches on. The form ('cli' /
+  // 'vscode') is a separate axis and is never mixed into the identity.
+  const client = resolveClient(options, base)
+  // Form lands in the state file's form / task_runs.form; the server maps it to
+  // source = formToSource(form) (plugin / cli / ide) for display.
+  const form = resolveForm(client)
+  /** session id → workspace path (session.created gives the authoritative value; the envelope's location.directory is a fallback) */
   const dirs = new Map()
-  /** 工具调用 id → 工具名（`session.tool.called` 不带工具名，只有配对的 input.started 里有） */
-  const toolNames = new Map()
   /**
-   * 会话 id → 最近一条 `session.diff` 给的文件清单。
-   * **是会话级的**（对照会话自己的快照基线），不是"本轮改动"—— 取用一律走 steppedOf 按本轮
-   * 窗口筛，别直接读（见那里的注释：直接读会把同工程另一个 agent 改的文件算进这一轮）。
+   * session id → file list from the latest `session.diff`.
+   * **Session-scoped** (against the session's own snapshot baseline), not "this round's changes" —
+   * always filter through steppedOf by this round's window; don't read it directly (reading it
+   * directly would count files another agent changed in the same workspace as this round's).
    */
   const lastFiles = new Map()
-  /** 会话 id → 会话标题 */
+  /** session id → session title */
   const titles = new Map()
-  /** 会话 id → 模型（session.created 带 data.model；台账要它，MODEL_SOURCES 里没有 kilo） */
+  /** session id → model (session.created carries data.model; the ledger needs it, and kilo is not in MODEL_SOURCES) */
   const models = new Map()
-  /** messageID → role（user / assistant）。part 只带 messageID，角色要从 message.updated 取 */
+  /** messageID → role (user / assistant). A part only carries messageID; the role comes from message.updated */
   const msgRoles = new Map()
-  /** messageID → 用户的原话（万一 text part 比 message.updated 先到，先挂这儿等角色确认） */
+  /** messageID → the user's sentence (in case a text part arrives before message.updated, park it here until the role is known) */
   const pendingUserText = new Map()
-  /** 会话 id → 本轮 assistant 的最后一段文本（收尾自述；实测每次 part 更新带的是全文，不是增量） */
+  /** session id → this round's last assistant text (closing summary; measured, each part update carries the full text, not a delta) */
   const assistantText = new Map()
-  /** 会话 id → 本轮的任务 id（台账；task/end 与 message 都要用） */
+  /** session id → this round's task id (ledger; used by task/end and message) */
   const taskIds = new Map()
-  /** 会话 id → 本轮动过的文件（台账 file/touch 累积，收尾时并进 task/end 的 files） */
+  /** session id → files touched this round (accumulated by file/touch, merged into task/end's files at the end) */
   const roundFiles = new Map()
-  /** 会话 id → 本轮开跑的时刻（startTask 落的）。用来给会话级 diff 划一条"这一轮"的界线（见 steppedOf） */
+  /** session id → this round's start time (set by startTask). Used to draw the "this round" line for the session-scoped diff (see steppedOf) */
   const roundStartAt = new Map()
   /**
-   * 会话 id → 本轮每个 assistant 消息的 token（messageID → 那一份 usage）。
+   * session id → this round's per-message assistant tokens (messageID → that message's usage).
    *
-   * 为什么按消息存而不是"来一条加一次"：`message.updated` 对同一条消息会**反复触发**
-   * （流式更新，实测一条消息好几次），每次都把它的 usage 加一遍就是成倍虚高。
-   * 每条消息只留**最后一次**看到的值（后来的覆盖先来的），收工时再跨消息求和 ——
-   * 与库里 `message.data.tokens` 是"这条消息的用量"同一个口径（见 kilo.js 的 foldKiloTokens）。
+   * Why per message instead of "add one on every event": `message.updated` fires **repeatedly** for
+   * the same message (streaming updates), so adding its usage each time would double-count. Each
+   * message keeps only the **last** value seen; the sum across messages happens at round end —
+   * matching the DB's `message.data.tokens` ("this message's usage").
    *
-   * 插件这一路的相位与台账都是**上报真值**，token 也就地取：装了这个插件，7F/8F 的台账行
-   * 是插件写的（轮询会让位，见 kiloTasks.js 的 yieldsOf），轮询那条路够不着这些行。
+   * This plugin's phase and ledger are **reported truth**, so tokens are taken in place: with the
+   * plugin installed, 7F/8F's ledger rows are written by the plugin (polling yields to it), and the
+   * polling path cannot reach these rows.
    */
   const roundMsgTokens = new Map()
   /**
-   * 会话 id → 最近一次"被打断收尾"的时刻。
-   * 用户按 ESC / 停止时 Kilo / OpenCode 只发一条 `session.idle`（没有 `finish=stop`）——
-   * 这一轮按**取消**收尾并落一枚 `done.cancelled`。但偶尔会有一条迟到的 assistant
-   * `finish=stop` 消息跟在后面，别让它把红色「任务取消」盖成绿色「任务完成」（同 hook.js 的 justCancelled）。
+   * session id → the last "interrupted" time.
+   * On ESC / stop, Kilo / OpenCode emit only a `session.idle` (no `finish=stop`) — the round is
+   * closed as **cancelled** and a `done.cancelled` marker is written. But a late assistant
+   * `finish=stop` message sometimes follows; don't let it turn the red "task cancelled" into a green
+   * "task done" (same as the hook path's justCancelled).
    */
   const cancelledAt = new Map()
   /**
-   * 已经计过一次「工具使用」的工具调用 id（Kilo / OpenCode 的 `part.callID`）。
-   * 工具的 part 会反复更新（pending → running → completed），每一条都算一次的话次数会成倍虚高；
-   * 同一个 callID 只记一次。攒到一定量整批清掉 —— 它只是"本进程见过的调用"，不需要长留。
+   * Tool call ids already counted for "tool usage" (Kilo / OpenCode's `part.callID`).
+   * A tool's part updates repeatedly (pending → running → completed); counting every one would double
+   * the count, so a callID is counted once. Cleared wholesale once it grows — it is only "calls seen by
+   * this process", no need to keep long.
    */
   let toolCallSeen = new Set()
   const ingest = createIngest(client)
-  /** 本插件实例自己的工程（事件流是**全服务**的，不只这个工程 —— 见下面 wsOf 的注释） */
+  /** This plugin instance's own workspace (the event stream is **whole-server**, not just this workspace — see wsOf below) */
   const ownDir = String((location && location.directory) || "")
 
-  /* ------------------------------ 成员注册 ------------------------------ */
+  /* ------------------------------ Member registration ------------------------------ */
 
-  /** 这个 client 的成员建出来了没有（建出来就不再重复补） */
+  /** Whether this client's member has been created (once created, don't re-add) */
   let registered = false
-  /** 在途的那次注册（事件很密，几十毫秒里能来一串 —— 别每来一条就发一次 register） */
+  /** The in-flight registration (events are dense; don't send a register on every one) */
   let registering = null
 
   /**
-   * 确保"本身份的成员"已经在服务端建出来了，返回一个 Promise：
-   * 建好了 → true；WorkGremlin 不可达 / 没拿到工程 / 服务端拒了 → false（**下次再试**）。
+   * Make sure "this identity's member" exists on the server, returning a Promise:
+   * created → true; WorkGremlin unreachable / no workspace / server rejected → false (**retry next time**).
    *
-   * ## 为什么必须有这个函数，以及为什么它要重试
+   * ## Why this function is required, and why it retries
    *
-   * 服务端 bus 的**每一个**上报入口开头都是 `requireMember(...)`，查不到就把整条请求
-   * 404 掉（`unknown_member`）—— 而插件这侧是 fire-and-forget，**404 完全无声**。
-   * 也就是说：成员没建出来 ⇒ 这个进程上报的**每一条台账**都石沉大海，只剩本地状态文件。
+   * Every server bus ingest entry point starts with `requireMember(...)` and 404s the whole request
+   * (`unknown_member`) when it can't find the member — while this side is fire-and-forget, so a **404
+   * is completely silent**. That is: if the member was never created, **every ledger entry** this
+   * process reports sinks without a trace, leaving only the local state file.
    *
-   * **这里踩过的坑（2026-09-30 修，实测）**：早先只在 `session.created` 那一支注册一次，
-   * 而且 `registered = true` 是在**发出去之前**就置上的。两个后果都真实发生过：
-   *
-   *   1) **会话先于进程存在** —— Kilo 的 VS Code 扩展重开窗口会重启 `kilo serve`，而会话
-   *      （`ses_f196…`）是更早那个进程建的：新进程从头到尾**等不到 session.created**，
-   *      于是它一次注册都不发。实测症状：状态文件照写（相位 / 完成标记都对）、台账一条不来。
-   *   2) **注册那一次正好撞上应用没起**（本就该跳过）时 `registered` 已置真 → 应用起来后
-   *      也永远不再注册。
-   *
-   * 两种情形的表现是同一个：任务列表里那一轮显示的是**轮询兜底**写的那一行
-   * （`kiloTasks.js` 写的 client=kilo / form=null），用户看到的就是「Kilo Code」而不是
-   * 「Kilo Code Plugin」—— 2026-09-30 用户报的正是这个。
-   *
-   * 所以：注册**重试到成功为止**（失败就把在途标记清掉，下一条事件再试），
-   * 且下面所有台账上报都先等它 —— 顺序也由此有了保证（否则 register 与 task/start
-   * 并发发出去，谁先到服务端不一定，task/start 先到就是一条 404）。
+   * Registration **retries until it succeeds** (on failure clear the in-flight marker and try on the
+   * next event), and all ledger reporting below waits for it — which also guarantees ordering
+   * (otherwise register and task/start race and task/start could arrive first as a 404).
    */
   function ensureRegistered() {
     if (registered) return Promise.resolve(true)
@@ -427,7 +436,7 @@ function createIngestPlugin(options, { location, base } = {}) {
       registering = ingest
         .resolveProject()
         .then(async (project) => {
-          // 没拿到工程（应用晚起 / 刚换了端口）→ 这次不发，下一条事件重试
+          // No workspace (app started late / just changed port) → don't send; retry on the next event
           if (!project) {
             registering = null
             return false
@@ -456,14 +465,14 @@ function createIngestPlugin(options, { location, base } = {}) {
   }
 
   /**
-   * 台账上报的统一入口：**先确保成员已注册，再发**（理由见 ensureRegistered 的长注释）。
-   * `/register` 自己走 `ingest.post` —— 从这里走就递归了。
+   * The single entry point for ledger reporting: **ensure the member is registered first, then send**
+   * (see ensureRegistered). `/register` itself goes through `ingest.post` — routing it here would recurse.
    */
   const post = (route, body) => ensureRegistered().then((ok) => (ok ? ingest.post(route, body) : null))
 
-  /** 取这条会话的工程路径；查不到就退回本实例的工程 */
+  /** This session's workspace path; fall back to this instance's workspace when unknown */
   const wsOf = (event) => {
-    // 信封两代并存：Kilo 7.8.1 是 properties，OpenCode 2.x 是 data。两边都认。
+    // Two envelope generations coexist: Kilo 7.8.1 uses `properties`, OpenCode 2.x uses `data`. Accept both.
     const p = (event && (event.properties || event.data)) || {}
     const sid = String(p.sessionID || "")
     const known = sid ? dirs.get(sid) : ""
@@ -477,58 +486,53 @@ function createIngestPlugin(options, { location, base } = {}) {
   }
 
   /**
-   * 写一次相位 + 心跳。
-   * `phaseFields` 里的键进 sessionPhase；`done` 单独进 done 字段（两者在 hook.js 里
-   * 本来就是两个字段，不该把 done 塞进相位对象）。
+   * Write the phase + a heartbeat.
+   * Keys in `phaseFields` go into sessionPhase; `done` goes into the separate done field (the state
+   * file keeps them as two fields; done should not be nested inside the phase object).
    *
-   * `hb.pid` = 本进程 pid：这是 `sessions.js` 的 `hasOtherLiveSession()` 判据 1
-   * （"这份状态文件所属的会话还活着吗" 看 `pidAlive(j.hb.pid)`）。本插件跑在
-   * Kilo / OpenCode 的 server 进程里 —— 那个进程死了就不会再有任何事件落到这份文件上，
-   * 所以拿它当"活着"的判据是成立的。**早先这里只写 lastEventAt、没有 pid**，
-   * 于是同工程开两条会话时，A 收工会把仍在跑的 B 一起降级，B 的卡片误显示空闲。
+   * `hb.pid` = this process's pid: this is `sessions.js` `hasOtherLiveSession()`'s criterion 1
+   * ("is the session that owns this state file still alive" looks at `pidAlive(j.hb.pid)`). This
+   * plugin runs inside the Kilo / OpenCode server process — once that process dies no further event
+   * lands on this file, so it is a valid "alive" signal.
    */
   const report = (event, phase, { done = null, ...phaseFields } = {}) => {
     try {
-      // 信封两代并存：Kilo 7.8.1 是 properties，OpenCode 2.x 是 data
+      // Two envelope generations coexist: Kilo 7.8.1 uses `properties`, OpenCode 2.x uses `data`
       const sid = String((((event && (event.properties || event.data)) || {}).sessionID) || "")
       if (!sid) return
       const ws = wsOf(event)
       const now = Date.now()
       const patch = {
         client: client,
+        form: form,
         sessionId: sid,
         hb: { pid: process.pid, lastEventAt: now },
         sessionPhase: { phase, ts: now, workspacePath: ws, ...phaseFields },
       }
       if (done) patch.done = done
       writeState(statePath(client, ws, sid), patch)
-      // 心跳跟着相位一起发：>60s 没有心跳服务端就把这只成员标 degraded 灰显
-      // 带上真实工程路径：服务端以它为准反查工程（见 bus.projectForReport）——
-      // 不带的话会落到"办公室当前打开的工程"，开着 A、在 B 里干活时成员/心跳就挂错了工程。
+      // The heartbeat goes out with the phase: no heartbeat for >60s and the server marks the member degraded
+      // Send the real workspace path: the server uses it to resolve the workspace (see bus.projectForReport) —
+      // without it the report lands on "the workspace open in the office", so working in B while A is open misattributes.
       post("/heartbeat", { memberId: base, sessionId: sid, ts: now, workspacePath: ws })
     } catch {
-      /* 上报失败不影响 agent */
+      /* a failed report must not affect the agent */
     }
   }
 
-  /* ---- 台账上报的三个小动作（都不 await，绝不拖住事件流） ---- */
+  /* ---- The three small ledger actions (none await; never hold up the event stream) ---- */
 
   /**
-   * 这一轮**真的动过**的文件：Kilo 的 `session.diff` 按 mtime 过一道筛子，只留本轮窗口内的。
+   * Files **actually changed** this round: Kilo's `session.diff` filtered by mtime to this round's window.
    *
-   * 为什么不能直接信 `session.diff`：它不是"本轮改动"，是**会话级**的差集（对照会话自己的
-   * 快照基线），会话开着的时候别人在同一个工程里改的文件照样列进来。实测 2026-09-30 12:35：
-   * 一条 5 秒就被用户打断的 Kilo 任务（一条 patch part、一个写类工具都没有）在台账上写了两个
-   * 文件（server/src/kiloTasks.js、server/test/taskSync.test.js）—— 那两个文件是**同工程另一个
-   * agent 12:25 改完的**（本轮 12:35:42 才起，从头到尾没碰）。拿 7F 轮询那一路对（kilo.js：
-   * 「改动文件只认 patch part」）算出来是 0 个 —— 同一条会话两条路给出两个数，用户看到的就是
-   * "这轮凭什么说我改了这两个文件"。
-   *
-   * 所以按 **mtime 落在本轮窗口内**（>= startTask 落的 roundStartAt）过筛：本轮落盘的留下
-   * （**bash 里改的也算** —— 那是这一轮真干的活，写类工具那一栏看不见它，只有 diff 看得见），
-   * 会话里别人改的、以及更早几轮改过的（mtime 更早）剔掉。
-   * stat 拿不到（文件被删 / 没权限）→ 留着：删除也是一种改动，宁可多记一条。
-   * 这一轮的起点没记到（插件启动前就开跑的会话）→ 不过滤，维持原样，不凭空少记。
+   * Why not trust `session.diff` directly: it is not "this round's changes" but a **session-scoped**
+   * diff (against the session's own snapshot baseline), so files another agent changed in the same
+   * workspace while the session was open get listed too. So filter by **mtime within this round's
+   * window** (>= the roundStartAt set by startTask): keep what was written this round (including
+   * changes made in bash — real work this round that the write-tool column can't see, only the diff
+   * can), drop what others changed in the session and what earlier rounds changed.
+   * If stat fails (file deleted / no permission) → keep it: a delete is a change too.
+   * If this round's start is unknown (session started before the plugin) → don't filter, keep as-is.
    */
   function steppedOf(sid, ws) {
     const since = Number(roundStartAt.get(sid) || 0)
@@ -544,12 +548,12 @@ function createIngestPlugin(options, { location, base } = {}) {
   }
 
   /**
-   * 开一个任务。标题 = **用户那句话**，由调用方从 role=user 的 text part 里取到传进来
-   * （实测 Kilo 的用户原话就在 `message.part.updated` 的 `part.type==='text'` 里，
-   * 信封没有 prompt 字段，所以拿不到就退回会话标题 / 占位，不编）。
-   * @param {any} event 触发的事件（取工程路径 / 形态用）
-   * @param {string} sid 会话 id
-   * @param {string} prompt 用户那句话（可能为空）
+   * Open a task. Title = **the user's sentence**, taken by the caller from the role=user text part
+   * (measured, the user's sentence is in `message.part.updated`'s `part.type==='text'`; the envelope
+   * has no prompt field, so fall back to the session title / a placeholder rather than invent).
+   * @param {any} event the triggering event (for workspace path / form)
+   * @param {string} sid session id
+   * @param {string} prompt the user's sentence (may be empty)
    */
   function startTask(event, sid, prompt = "") {
     const said = String(prompt || "").replace(/\s+/g, " ").trim()
@@ -558,31 +562,27 @@ function createIngestPlugin(options, { location, base } = {}) {
     taskIds.set(sid, taskId)
     roundFiles.set(sid, new Set())
     roundMsgTokens.set(sid, new Map())
-    // 本轮的时间界线：session.diff 是会话级的，靠它才知道哪些文件是**这一轮**动的（见 steppedOf）
+    // This round's time line: session.diff is session-scoped; this is how we know which files changed **this round** (see steppedOf)
     roundStartAt.set(sid, Date.now())
-    // 新一轮开始：上一次的"被打断"标记作废（迟到的旧 done 不该再压住这一轮的完成）
+    // New round: the previous "interrupted" marker is void (a late old done must not suppress this round's completion)
     cancelledAt.delete(sid)
-    // **新一轮开始时把上一轮的「任务完成」标记抹掉。**
-    // 状态文件是合并写（readState → 打补丁 → 写回），不显式清的话旧 done 会一直挂着 ——
-    // 新任务已经在跑了，控制台却还亮着上一轮的「任务完成」。done 置 null 而不是删键：
-    // 合并写只认键值，null 就够服务端 readReporterDone 判成"没有"（见 sessions.js）。
+    // **Clear the previous round's "task done" marker when a new round starts.** The state file is
+    // merge-written, so an old done would otherwise linger while the new task runs. Set done to null
+    // rather than delete the key: the merge only knows values, and null is enough for the server's
+    // readReporterDone to read "none".
     //
-    // 同一个补丁里带上 **taskTitle = 用户那句话**：服务端 readReporterPhase 把它读成
-    // `prompt`，「思考中」时主控制台第二/第三层显示的就是它（见 sessions.js 的
-    // winPrompt 与 renderer/src/views/IsoOfficeView.vue 的 thinking 分支）。
-    // 早先这里只抹 done、不写 taskTitle，于是 7F/8F 的「思考中」屏上**一个字都没有** ——
-    // 别的楼层（hook 那一路，hook.js 的 TASK_START 分支）都写 taskTitle，所以只有 7F/8F 空着。
-    //
-    // 只写 `said`（用户原话，完整不截断——与 hook 同一口径），**不写会话标题**：
-    // 会话标题默认是 "New session - <时间戳>" 这种没信息量的值，拿它当"用户问了什么"是编造。
-    // 拿不到原话就写空串（而不是留着上一轮的旧 prompt）—— 空屏好过显示上一轮的内容。
+    // The same patch carries **taskTitle = the user's sentence**: the server's readReporterPhase reads
+    // it as `prompt`, which the main console shows while "thinking". Only write `said` (the user's
+    // sentence, untruncated — same as the hook path), **not the session title**: the session title
+    // defaults to an uninformative "New session - <timestamp>". If the sentence is unknown, write an
+    // empty string rather than keep the previous round's prompt.
     try {
       writeState(statePath(client, wsOf(event), sid), { done: null, taskTitle: said })
     } catch {
-      /* 抹不掉就算了：readReporterDone 有 TTL，最多多显示一会儿 */
+      /* failing to clear is fine: readReporterDone has a TTL, it will just show a bit longer */
     }
-    // 形态标记（form）在 createIngestPlugin 里算一次，这里直接用。
-    // 工程由 post() 里的 ensureRegistered 保证已解析（拿不到就整条不发 —— 见那里的注释）。
+    // The form marker is computed once in createIngestPlugin and used directly here.
+    // The workspace is guaranteed resolved by ensureRegistered inside post() (if not, the whole report is skipped).
     post("/task/start", {
       memberId: base,
       taskId,
@@ -590,9 +590,9 @@ function createIngestPlugin(options, { location, base } = {}) {
       sessionId: sid,
       client,
       form,
-      // 模型从 session.created 记下来了（models map）。**必须自己带**：bus.endTask 的
-      // 兜底 refill 走 sessionModel() 的 MODEL_SOURCES 表，那里只挂了 trae / claude，
-      // 没有 kilo → 轮询/适配器都取不到，task_runs.model 会留 null（任务列表少一列）。
+      // The model was recorded from session.created (models map). **Must carry it ourselves**: the
+      // server-side fallback (MODEL_SOURCES in sessions.js) does not cover kilo/opencode, so
+      // task_runs.model would stay null (a missing column in the task list).
       ...(models.get(sid) ? { model: models.get(sid) } : {}),
       workspacePath: wsOf(event),
     })
@@ -600,8 +600,8 @@ function createIngestPlugin(options, { location, base } = {}) {
   }
 
   /**
-   * 写类工具动过的文件 → 台账 file/touch（"正在改什么"）。
-   * **只在写类时调用**：读类工具不报（读了不留改动痕迹，报上去只是噪声）。
+   * Files touched by write-class tools → ledger file/touch ("what is being edited").
+   * **Called only for write-class tools**: read-class tools are not reported (they leave no change trace).
    */
   function touchFile(sid, file, ws = "") {
     if (!file) return
@@ -611,7 +611,8 @@ function createIngestPlugin(options, { location, base } = {}) {
   }
 
   /**
-   * 一轮收尾：task/end（带 result 与本轮改动文件）+ 收工自述进对话记录。
+   * Close a round: task/end (with result and this round's changed files) + the closing summary into
+   * the conversation.
    * @param {"done"|"failed"|"cancelled"} state
    */
   function endTask(event, sid, state, result) {
@@ -620,9 +621,9 @@ function createIngestPlugin(options, { location, base } = {}) {
     taskIds.delete(sid)
     const touched = [...(roundFiles.get(sid) || new Set())]
     roundFiles.delete(sid)
-    // 本轮 token：逐条 assistant 消息的那份 usage **求和**（同一条消息的多次更新只算最后一次，
-    // 见 roundMsgTokens）。四项全 0 = 这一轮一条带 tokens 的消息都没有（老版本 Kilo 不写这一项）
-    // → 不上报，服务端留 NULL，报表显示 "—" 而不是 0。
+    // This round's tokens: **sum** each assistant message's usage (multiple updates to one message
+    // count once, see roundMsgTokens). All four zero = no message with tokens this round (older Kilo
+    // doesn't write it) → don't report, the server keeps NULL and shows "—" not 0.
     const tk = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
     for (const one of (roundMsgTokens.get(sid) || new Map()).values()) {
       tk.input += one.input
@@ -632,13 +633,13 @@ function createIngestPlugin(options, { location, base } = {}) {
     }
     roundMsgTokens.delete(sid)
     const tokens = tk.input + tk.output + tk.cacheRead + tk.cacheWrite > 0 ? tk : null
-    // 先把这一轮的改动文件算出来，再抹掉起点时刻 —— steppedOf 要靠它划窗口
+    // Compute this round's changed files first, then drop the start time — steppedOf needs it for the window
     const stepped = steppedOf(sid, wsOf(event))
     roundStartAt.delete(sid)
-    // **同一个文件会被记两遍**：`session.step.ended` 给的是工作区相对路径（a.ts），
-    // file/touch 记的是工具入参原样（可能是绝对路径 /tmp/…/a.ts）。直接并起来，
-    // file_count 与 files 列表里同一个文件会出现两次（实测 file_count=2，其实只改了一个）。
-    // 所以先按工作区统一解析成相对路径再去重 —— 台账上的"本轮改了几个文件"必须是真的。
+    // **The same file gets recorded twice**: `session.diff` gives workspace-relative paths (a.ts) while
+    // file/touch records the tool input verbatim (possibly absolute). Merging directly would list the
+    // same file twice in file_count and the files list. So normalize to workspace-relative first, then
+    // dedupe — "how many files this round" on the ledger must be real.
     const ws = wsOf(event)
     const rel = (f) => {
       const s = String(f || "")
@@ -650,7 +651,7 @@ function createIngestPlugin(options, { location, base } = {}) {
       }
     }
     const all = [...new Set([...stepped, ...touched].map(rel).filter(Boolean))]
-    // 形态标记（form）在 createIngestPlugin 里算一次，这里直接用
+    // The form marker is computed once in createIngestPlugin and used directly here
     post("/task/end", {
       memberId: base,
       taskId,
@@ -661,11 +662,11 @@ function createIngestPlugin(options, { location, base } = {}) {
       client,
       form,
       ...(models.get(sid) ? { model: models.get(sid) } : {}),
-      // 没有这一项就整块不带（服务端按"没报"处理），别发个空的让人以为报了 0
+      // Omit the whole block when absent (the server treats it as "not reported"); don't send an empty one implying 0
       ...(tokens ? { tokens } : {}),
       workspacePath: ws,
     })
-    // 本轮的收尾自述也进对话记录（type=result）；没有自述就不写 —— 不拿文件清单凑数
+    // The closing summary also goes into the conversation (type=result); no summary → don't write (don't pad with the file list)
     const said = String(result || "").trim()
     if (said) {
       post("/message", {
@@ -684,63 +685,63 @@ function createIngestPlugin(options, { location, base } = {}) {
     }
   }
 
-  // 这里**不订阅**：事件从哪来由入口决定（OpenCode 走 subscribe 流、Kilo 走 server 的
-  // event 钩子），工厂只负责"拿到一条事件怎么处理"。
+  // No subscription here: where events come from is up to the entry point (OpenCode uses the subscribe
+  // stream, Kilo uses the server event hook); the factory only handles "given one event, what to do".
   /**
-   * 处理一条事件。
+   * Handle one event.
    *
-   * ## 事件契约（**实测** 2026-09-27，Kilo 7.8.1，探针跑出来的真实词汇表）
+   * ## Event contract (measured 2026-09-27, Kilo 7.8.1, real vocabulary from a probe)
    *
-   * 信封是 `{ id, type, properties }` —— **不是** `{ type, data, location }`。
-   * 早先这里按 `data` / `location` 和一串 `session.inbox.enqueued` / `session.tool.called` /
-   * `session.execution.succeeded` / `permission.asked` / `session.step.ended` 来写，
-   * 那些**实测一个都不出现**（`kilo run` 跑两轮，真实事件只有下面这 10 个）。
-   * 工程路径因此也拿不到 `location.directory`，只能从 `session.created` 的 `info.directory`
-   * （或 `message.updated` 的 `info.path.cwd`）取 —— 那才是权威值。
+   * The envelope is `{ id, type, properties }` — **not** `{ type, data, location }`. Other
+   * vocabularies (`session.inbox.enqueued`, `session.tool.called`, `session.execution.succeeded`,
+   * `permission.asked`, `session.step.ended`, …) were measured and never appear (`kilo run` for two
+   * rounds emits only the 10 below). So the workspace path cannot come from `location.directory`
+   * either — it comes from `session.created`'s `info.directory` (or `message.updated`'s
+   * `info.path.cwd`), which is the authoritative value.
    *
-   *   session.created        info.directory=工程路径 · info.model.id=模型
-   *   session.updated        info.title（会话改名）
+   *   session.created        info.directory=workspace path · info.model.id=model
+   *   session.updated        info.title (session renamed)
    *   message.updated        info.role / info.finish / info.time.completed / info.path.cwd
    *   message.part.updated   part{type:text|tool|reasoning|step-start|step-finish|patch,
    *                           text, tool, callID, state{status,input}, messageID}
-   *   message.part.delta     token 级增量 —— 忽略（每 token 一条，写盘会聊崩）
+   *   message.part.delta     token-level delta — ignored (one per token; writing per token would thrash)
    *   session.status         status.type = busy | idle
-   *   session.idle           这一轮彻底结束
-   *   session.drained        队列排空（收尾信号）
-   *   session.diff           diff[] = 相对**会话**快照的差集（不是"本轮"，见 steppedOf 的注释）
-   *   session.next.tool.input.delta  工具入参增量 —— 忽略（part 更新里已有完整 input）
+   *   session.idle           this round has fully ended
+   *   session.drained        queue drained (closing signal)
+   *   session.diff           diff[] = delta against the **session** snapshot (not "this round", see steppedOf)
+   *   session.next.tool.input.delta  tool-input delta — ignored (part updates already carry the full input)
    *
-   * ## 由此推出的几条判定
+   * ## Rules derived from it
    *
-   * · **任务开始 = 一条 role=user 的 text part**。用户那句话就在
-   *   `part.type==='text'` 的 `part.text` 里（实测值带一层 JSON 引号，要剥掉）。
-   *   `message.updated` 给出该 messageID 的 role；万一 part 先到（顺序不该变，但不想赌），
-   *   先把 text 挂到 messageID 上，等 role=user 的 message.updated 到了再开任务。
-   * · **任务结束 = 一条 role=assistant 且 `finish` + `time.completed` 的 message.updated**。
-   *   `finish==='stop'` 才是"说完收工"（= 台账的 done，也是「任务完成」）；
-   *   `finish==='tool-calls'` 只是**这条消息**到工具调用处断了，**整轮还没完**，不能收。
-   *   （与 kilo.js 从 SQLite 读 `message.finish` 的口径一致，见那里的注释）
-   * · **收尾自述 = 本轮 assistant 的 text part**（按 messageID 归属，取最后一条完整的）。
-   * · **等待授权 = tool part 的 `state.status==='pending'`**。Kilo 的 tool 状态实测有
-   *   pending / running / completed / error —— pending 就是还没放行。
-   *   SQLite 落盘里同样有这个 pending（轮询那一路据此推「等待授权」），插件这一路是**真值**。
+   * · **Task start = a role=user text part.** The user's sentence is in `part.type==='text'`'s
+   *   `part.text` (measured value carries one JSON quote layer; strip it). `message.updated` gives
+   *   that messageID's role; if a part arrives first (the order shouldn't change, but don't gamble),
+   *   park the text on the messageID and open the task when the role=user message.updated arrives.
+   * · **Task end = a role=assistant message.updated with `finish` + `time.completed`**.
+   *   `finish==='stop'` means "finished speaking" (= ledger done, and "task done");
+   *   `finish==='tool-calls'` means **this message** broke at a tool call, **the round is not over**.
+   *   (same as reading `message.finish` from SQLite in floorKilo.js)
+   * · **Closing summary = this round's assistant text part** (attributed by messageID, the last complete one).
+   * · **Awaiting permission = a tool part with `state.status==='pending'`**. Kilo's tool status is
+   *   measured as pending / running / completed / error — pending means not yet released. SQLite also
+   *   persists this pending (polling derives "awaiting permission" from it); the plugin path is the **truth**.
    */
   function handle(event) {
     const type = String((event && event.type) || "")
-    // 信封两代并存：Kilo 7.8.1 是 properties，OpenCode 2.x 是 data。两种都认。
+    // Two envelope generations coexist: Kilo 7.8.1 uses `properties`, OpenCode 2.x uses `data`. Accept both.
     const p = (event && (event.properties || event.data)) || {}
     const sid = String(p.sessionID || "")
-    // 工程路径：事件信封没有 location（Kilo 侧），回落 ownDir
+    // Workspace path: the envelope has no location (Kilo side), fall back to ownDir
     const dirOf = () => String((p.info && p.info.directory) || (p.info && p.info.path && p.info.path.cwd) || "")
 
-    // 成员注册：**每一条事件都顺手确保一次**，而不是等 `session.created` 那一支。
-    // 一定要这么做：Kilo 的 VS Code 扩展重开窗口会重启 kilo serve，而会话是**早就存在**的
-    // —— 新进程等不到 session.created，只在那一支注册的话它一次都不发（见 ensureRegistered）。
-    // 已注册时这只是一次布尔判断，高频的 `*.delta` 也扛得住。
+    // Member registration: **ensure on every event**, not only on `session.created`. Must: reopening the
+    // Kilo VS Code window restarts kilo serve while the session already exists, so a new process never
+    // sees session.created and would never register if only that branch did. Once registered this is a
+    // boolean check, cheap even for the high-frequency `*.delta`.
     void ensureRegistered()
 
     switch (type) {
-      /* ---- 会话创建：工程路径与模型的权威来源 ---- */
+      /* ---- Session created: the authoritative source of workspace path and model ---- */
       case "session.created": {
         const info = p.info || {}
         const ws = dirOf() || ownDir
@@ -748,20 +749,20 @@ function createIngestPlugin(options, { location, base } = {}) {
         const model = String((info.model && (info.model.id || info.model.modelID)) || info.modelID || "")
         if (sid && model) {
           models.set(sid, model)
-          // 主控制台要显示模型；轮询那一路本来也能从库里取到，装了插件就用真值
+          // The main console shows the model; polling can read it from the DB too, but with the plugin we use the truth
           writeState(statePath(client, ws, sid), { model })
         }
         break
       }
 
-      /* ---- 会话改名 = 标题（任务收尾时没有标题可退，就用会话标题） ---- */
+      /* ---- Session renamed = title (used as the task title fallback at round end) ---- */
       case "session.updated":
       case "session.renamed": {
         const info = p.info || {}
         if (sid && info.title) titles.set(sid, String(info.title))
-        // 模型**常常在 session.created 时还没有**（实测：created 的 info 里没 model，
-        // 是紧接着的 session.updated 才带上 model.id）—— 所以两处都要认，
-        // 少一处就表现为「主控制台不显示模型」。早先只读 created，主控制台一直空着。
+        // The model **often is not present at session.created** (measured: created's info has no model,
+        // it comes with the immediately following session.updated) — so accept it in both places;
+        // missing one shows as "the main console shows no model".
         const model = String((info.model && (info.model.id || info.model.modelID)) || info.modelID || "")
         if (sid && model) {
           models.set(sid, model)
@@ -770,15 +771,15 @@ function createIngestPlugin(options, { location, base } = {}) {
         break
       }
 
-      /* ---- 消息：role / finish / time.completed 是任务台账的三个判据 ---- */
+      /* ---- Message: role / finish / time.completed are the three task-ledger criteria ---- */
       case "message.updated": {
         const info = p.info || {}
         const mid = String(info.id || "")
         const role = String(info.role || "")
         if (mid) msgRoles.set(mid, role)
-        /* 本轮 token：assistant 消息的 `info.tokens`（形状 `{input,output,reasoning,cache:{read,write}}`，
-           与库里 message.data.tokens 同一份）。**按消息覆盖着存**——这条事件对同一条消息会反复触发，
-           每次累加就是成倍虚高（去重口径见 roundMsgTokens 的说明）。 */
+        /* This round's tokens: an assistant message's `info.tokens` (shape `{input,output,reasoning,cache:{read,write}}`,
+           the same as the DB's message.data.tokens). **Stored per message, overwriting** — this event fires
+           repeatedly for the same message, so adding each time would double-count (see roundMsgTokens). */
         if (sid && role === "assistant" && mid && info.tokens && typeof info.tokens === "object") {
           const t = info.tokens
           const cache = (t.cache && typeof t.cache === "object") ? t.cache : {}
@@ -786,14 +787,15 @@ function createIngestPlugin(options, { location, base } = {}) {
           const bucket = roundMsgTokens.get(sid) || new Map()
           bucket.set(mid, {
             input: pos(t.input),
-            // reasoning 并进 output：Claude / Codex 的 output 本来含思考，不并的话同一列在 7F/8F 会少一截
+            // reasoning is folded into output: Claude / Codex output already includes thinking; without
+            // folding, the same column would be short on 7F/8F
             output: pos(t.output) + pos(t.reasoning),
             cacheRead: pos(cache.read),
             cacheWrite: pos(cache.write),
           })
           roundMsgTokens.set(sid, bucket)
         }
-        // user 消息：若它的 text part 先到了，这里补开任务（正常顺序是 part 后到，这里兜底）
+        // user message: if its text part arrived first, open the task here (the normal order is part-last; this is a fallback)
         if (role === "user" && sid && !taskIds.has(sid)) {
           const early = pendingUserText.get(mid)
           if (early) {
@@ -801,13 +803,14 @@ function createIngestPlugin(options, { location, base } = {}) {
             startTask(event, sid, early)
           }
         }
-        // assistant 消息收尾：finish + completed 才是"这条消息结束了"
+        // assistant message end: finish + completed means "this message is done"
         if (role === "assistant" && info.finish && info.time && info.time.completed) {
-          // finish=tool-calls 只是"到工具调用处断了"，整轮还没完 —— 不能收工
+          // finish=tool-calls means "broke at a tool call", the round is not over — don't close
           if (info.finish === "tool-calls") break
-          /* 刚被 session.idle 判成"打断"的那一轮不许再用一枚"完成"盖回来：
-             ① 取消标记是刚才落的（60s 内）；② 这一轮已经没有任务在跑（taskId 已被 endTask 清掉）。
-             打断后又发了新任务时 taskId 是新那一轮的，startTask 也会清掉 cancelledAt，照常落完成。 */
+          /* A round just marked "interrupted" by session.idle must not be overwritten by a "done":
+             ① the cancel marker was just written (within 60s); ② this round has no task running (taskId
+             cleared by endTask). After an interrupt, a new task sets a new taskId and startTask clears
+             cancelledAt, so completion still lands normally. */
           if (sid && cancelledAt.has(sid) && !taskIds.has(sid) && Date.now() - Number(cancelledAt.get(sid) || 0) < 60_000) {
             assistantText.delete(sid)
             break
@@ -815,18 +818,18 @@ function createIngestPlugin(options, { location, base } = {}) {
           const result = String(assistantText.get(sid) || "")
           assistantText.delete(sid)
           const ws = wsOf(event)
-          // 同样要按本轮窗口筛（见 steppedOf）：这里喂的是主控制台「改动文件」那一栏，
-          // 直接拿会话级 diff 的话，同工程别人改的文件会被算进这一轮的产出
+          // Filter by this round's window too (see steppedOf): this feeds the main console's "changed files"
+          // column; the session-scoped diff would count files others changed in the same workspace.
           const files = steppedOf(sid, ws)
           endTask(event, sid, "done", result || titles.get(sid) || "")
-          // 收工扫场：带 result 的"待汇报"保留给服务端的汇报动画
+          // Sweep on round end: "pending report" entries with a result are kept for the server's report animation
           post("/ghost", { action: "sweep", all: false, workspacePath: ws, client: client, sessionId: sid })
           report(event, "done", {
             action: "",
             done: {
               at: Number(info.time.completed) || Date.now(),
-              // 标题优先用**这一轮自己的收尾自述**（agent 真正说的话），
-              // 拿不到才退会话标题 —— 会话标题是 "New session - <时间戳>" 这种没信息量的默认值
+              // Title prefers **this round's own closing summary** (what the agent actually said), falling
+              // back to the session title — which is an uninformative default like "New session - <timestamp>"
               title: result || titles.get(sid) || "",
               fileCount: files.length,
               files: files.slice(0, 20).map((f) => ({ path: f, size: null })),
@@ -839,7 +842,7 @@ function createIngestPlugin(options, { location, base } = {}) {
         break
       }
 
-      /* ---- 部件：相位与「本轮改了什么」的来源 ---- */
+      /* ---- Parts: the source of the phase and "what changed this round" ---- */
       case "message.part.updated": {
         const part = p.part || {}
         const mid = String(part.messageID || "")
@@ -847,28 +850,24 @@ function createIngestPlugin(options, { location, base } = {}) {
         const kind = String(part.type || "")
 
         if (kind === "text") {
-          // 实测 part.text 带一层 JSON 引号（'"用 bash 执行 echo hi"'"），剥掉再用
+          // Measured: part.text carries one JSON quote layer ('"run echo hi with bash"'); strip it
           const text = unquote(part.text)
           if (role === "user") {
-            // 用户那句话 = 任务标题。没装插件时这条路径不存在，任务台账也就没有 Kilo 的记录
+            // The user's sentence = the task title. Without the plugin this path doesn't exist, so the Kilo ledger has no record.
             if (sid && !taskIds.has(sid)) startTask(event, sid, text)
             else if (mid) pendingUserText.set(mid, text)
             report(event, "thinking")
           } else {
-            // assistant 的文本是这一轮的收尾自述；实测每次 part 更新带的是**当前全文**，不是增量
+            // assistant text is this round's closing summary; measured, each part update carries the **current full text**, not a delta
             if (sid) assistantText.set(sid, text)
-            // **这里原来报的是 idle（待命），是错的** —— 改过，实测踩的坑：
-            // Kilo 在**一轮之内**会多次吐 assistant 文字（每次工具调用前后都可能来一段）。
-            // 一律报 idle 的话，模型在两次工具调用之间说话时主 agent 就闪回「待命中」，
-            // 几秒后又被下一条 tool 事件顶回「调用工具」—— 用户看到的是相位在两个值之间来回跳，
-            // 而任务明明还在跑。其它楼层（hook 那一路）在这段间隙是**回落到思考中**的
-            // （见 hook.js 的 PostToolUse：工具跑完 → 写 sessionPhase thinking），
-            // 7F/8F 跟同一口径。
+            // **Report thinking, not idle** (idle was wrong): Kilo emits assistant text **multiple times within one round**
+            // (before/after each tool call). Reporting idle would flash the main agent back to "idle" between tool calls and
+            // then back to "tool" on the next tool event, while the task is clearly still running. Other floors fall back to
+            // "thinking" in that gap (the hook path: after a tool finishes → sessionPhase thinking); 7F/8F follow the same rule.
             //
-            // 真正"这一轮结束了"有独立的判据，不靠这条：message.updated 带
-            // finish + time.completed（且不是 tool-calls）→ 报 done（上面那个分支）；
-            // session.idle / session.status=idle → 报 idle。所以这里报 thinking 不会让
-            // 相位卡在"思考中"收不了尾。
+            // "This round ended" has its own criteria, not this one: message.updated with finish + time.completed
+            // (and not tool-calls) → done (branch above); session.idle / session.status=idle → idle. So reporting
+            // thinking here won't leave the phase stuck.
             report(event, "thinking")
           }
           break
@@ -878,13 +877,13 @@ function createIngestPlugin(options, { location, base } = {}) {
           const status = String((part.state && part.state.status) || "")
           const input = (part.state && part.state.input) || {}
           const target = fileOf(input)
-          /* 工具使用计数（任务详情「工具使用」）：同一个 callID 只记一次
-             （part 会反复更新 pending/running/completed，逐条记就成倍虚高）。
-             pending 不算"用过"（还没放行），其余状态都算"调过它了"。 */
+          /* Tool-usage count (task detail "tool usage"): count each callID once (the part updates repeatedly
+             pending/running/completed; counting each would double it). pending doesn't count as "used" (not
+             released yet); any other status counts as "called it". */
           const callId = String(part.callID || part.id || "")
           if (sid && callId && status && status !== "pending" && !toolCallSeen.has(callId)) {
             toolCallSeen.add(callId)
-            // 只当"本进程见过的调用"用，攒太多就丢掉重来（同一支工具的下一次调用照样会记）
+            // Only "calls seen by this process"; drop wholesale once too large (the next call of the same tool is still counted)
             if (toolCallSeen.size > 500) toolCallSeen = new Set([callId])
             const toolName = String(part.tool || "")
             const taskId = taskIds.get(sid) || ""
@@ -901,7 +900,7 @@ function createIngestPlugin(options, { location, base } = {}) {
             }
           }
           if (sid && opOfTool(part.tool) === "write" && status !== "pending") touchFile(sid, target, wsOf(event))
-          // 召唤 subagent（task 工具）时飘一只小幽灵（统一走服务端 /ghost，由 hookCommon 写清单）
+          // Summon a subagent (task tool) → float a ghost (goes through the server /ghost; hookCommon writes the list)
           if (sid && isSubagentTool(part.tool) && status !== "pending") {
             const sa = subagentOf(input)
             post("/ghost", {
@@ -917,8 +916,8 @@ function createIngestPlugin(options, { location, base } = {}) {
             })
           }
           if (status === "pending") {
-            // Kilo 的 tool 状态实测有 pending —— 这就是「等待授权」，
-            // 也是轮询那一路补不上的那一相位（那边落盘里同样能推，但插件是上报真值）
+            // Kilo's tool status is measured to include pending — this is "awaiting permission", the phase the
+            // polling path cannot produce (polling can derive it from disk too, but the plugin is the reported truth)
             report(event, "await", {
               tool: part.tool || "",
               target,
@@ -929,7 +928,7 @@ function createIngestPlugin(options, { location, base } = {}) {
           } else if (status === "error") {
             report(event, "tool", { tool: part.tool || "", cmd: commandOf(input), file: target, action: `调用 ${part.tool || "工具"} 报错` })
           }
-          // completed：不回退相位（那一支跑完了，下一条 part 会再推进）
+          // completed: don't roll the phase back (this branch finished; the next part advances it)
           break
         }
 
@@ -942,12 +941,13 @@ function createIngestPlugin(options, { location, base } = {}) {
           report(event, "tool", { action: f ? `改 ${f}` : "落盘改动", target: f, file: f, tool: "patch" })
           break
         }
-        // step-start / step-finish **不是相位**：实测一个会话里各 300+ 次，是「一步」的边界记账。
-        // 套成「规划中 / 汇总中」会让控制台在每次工具跑完后一直卡在「汇总中」（见 kilo.js 同名注释）
+        // step-start / step-finish are **not phases**: measured 300+ each per session, they are "step" boundary
+        // bookkeeping. Mapping them to "planning / summarizing" would leave the console stuck on "summarizing"
+        // after every tool run (see the same note in floorKilo.js).
         break
       }
 
-      /* ---- 本轮改动的文件：实测是 diff 数组 ---- */
+      /* ---- This round's changed files: measured as a diff array ---- */
       case "session.diff": {
         const arr = Array.isArray(p.diff) ? p.diff : []
         if (sid && arr.length) {
@@ -956,27 +956,25 @@ function createIngestPlugin(options, { location, base } = {}) {
         break
       }
 
-      /* ---- 忙碌 / 空闲 ---- */
+      /* ---- Busy / idle ---- */
       case "session.status": {
         const st = String((p.status && p.status.type) || "")
         if (st === "idle") report(event, "idle")
         break
       }
       case "session.idle": {
-        /* 兜底：真收到"这一轮结束了"却没有 finish=stop 的 assistant 消息
-           （比如用户按 ESC / 停止打断）—— 这一轮按**取消**收尾，不亮「任务完成」。
-           Kilo / OpenCode 打断时不发 finish=stop，只发这一条 session.idle ——
-           以前这里只把台账收成 cancelled，**没有往状态文件落取消标记**，于是主控制台
-           拿不到任何"这是被打断"的证据，红色「任务取消」永远不亮（只能干等回待命）。
-           现在补一枚 done（与 hook.js 的 Interrupt 同形，多一个 cancelled:true）：
-             ① 台账 task/end(state=cancelled)（endTask 里）；
-             ② 状态文件 done.cancelled=true → /reporter-phase 与 /sessions 透传 →
-                主控制台照「任务取消」亮红色，「改动文件」或「没有输出」照常。 */
+        /* Fallback: we truly got "this round ended" but no assistant message with finish=stop (e.g. the user
+           pressed ESC / stop) — close the round as **cancelled**, don't light "task done". On interrupt
+           Kilo / OpenCode don't emit finish=stop, only this session.idle. This writes a done marker (same shape
+           as the hook path's Interrupt, plus cancelled:true):
+             ① ledger task/end(state=cancelled) (inside endTask);
+             ② state file done.cancelled=true → passed through by /reporter-phase and /sessions → the main
+                console lights the red "task cancelled", with "changed files" or "no output" as usual. */
         if (sid && taskIds.has(sid)) {
-          // 统计本轮动过的文件：steppedOf（session.diff 给的，按本轮窗口筛过）∪ roundFiles（写类工具给）
+          // Count files touched this round: steppedOf (from session.diff, filtered) ∪ roundFiles (from write-class tools)
           const files = [...new Set([...steppedOf(sid, wsOf(event)), ...((roundFiles.get(sid)) || [])].map(String).filter(Boolean))]
-          // 这一轮已经吐出来的文字也照常收（与 message.updated 那条 done 同口径）：
-          // 取消只是"没干完"，不是"没产出"——台账的产出摘要 / 对话记录照记。
+          // Text already emitted this round is collected too (same as the message.updated done branch): cancel
+          // means "didn't finish", not "no output" — the ledger summary / conversation record are still written.
           const result = String(assistantText.get(sid) || "")
           const ws = wsOf(event)
           cancelledAt.set(sid, Date.now())
@@ -991,14 +989,14 @@ function createIngestPlugin(options, { location, base } = {}) {
               files: files.slice(0, 20).map((f) => ({ path: f, size: null })),
               workspacePath: ws,
               sessionId: sid,
-              // 这一轮已经吐出来的话照常记（有就记、没有就空 —— 与「任务完成」一致）
+              // Text already emitted this round is recorded as usual (record if present, empty if not — same as "task done")
               said: result.replace(/\s+/g, " ").trim().slice(0, 160),
               cancelled: true,
             },
           })
-          // 清掉状态文件里的 taskId：否则服务端兜底合成取消标记会在 ≥TASK_RUN_MS 后
-          // 再补一发 task/end(cancelled)（重复），也避免任务槽一直占着、相位卡在「调用工具」。
-          // 与 hook.js 的 Interrupt 同口径（它也把 taskId 清成 null）。
+          // Clear taskId in the state file: otherwise the server's fallback would synthesize a cancel marker
+          // ≥TASK_RUN_MS later (a duplicate), and the task slot would stay occupied with the phase stuck on "tool".
+          // Same as the hook path's Interrupt (which also nulls taskId).
           try { writeState(statePath(client, ws, sid), { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 }) } catch {}
           break
         }
@@ -1007,8 +1005,8 @@ function createIngestPlugin(options, { location, base } = {}) {
       }
 
       default:
-        // 其余事件（含 *.delta 高频流）一律不写盘：相位在对应的 part/status 上已经设好了，
-        // 按 token 写状态文件会把磁盘和渲染层一起聊崩。
+        // Other events (including the high-frequency *.delta stream) are never written: the phase is already
+        // set on the relevant part/status; writing per token would thrash the disk and the renderer.
         break
     }
   }
@@ -1017,30 +1015,29 @@ function createIngestPlugin(options, { location, base } = {}) {
 }
 
 /**
- * 模块默认导出 —— **Kilo 与 OpenCode 两套入口，喂的是同一种事件**。
+ * Module default export — **two entry points, Kilo and OpenCode, fed the same events**.
  *
- * 两边的插件 API 完全不同（实测 2026-09-27，Kilo 7.8.1）：
- *   · 8F OpenCode：`setup(ctx)` 返回一个拆函数；事件靠 `ctx.event.subscribe()` 拿流
- *   · 7F Kilo   ：**`server(input, options)`** 返回 `Hooks` 对象，Kilo 每条事件调
- *                 `hooks.event({ event })`。而且 Kilo 会校验：
- *                 「Plugin must default export an object with server()」——
- *                 只给 setup() 的话 **Kilo 直接拒绝加载**（日志里一条 ERROR，
- *                 表现为插件看着装上了、但状态文件与台账一条都不来）。
- *                 另外 `file://` 的本地路径插件**必须导出 `id`**。
- *   两边**不能同时**导出 `server` 与 `tui`（Kilo 会抛 "either server() or tui(), not both"）；
- *   `setup` 与 `server` 并存不冲突（校验只看后两个）。
+ * The two plugin APIs are completely different (measured 2026-09-27, Kilo 7.8.1):
+ *   · 8F OpenCode: `setup(ctx)` returns a teardown function; events come from `ctx.event.subscribe()`
+ *   · 7F Kilo: **`server(input, options)`** returns a `Hooks` object; Kilo calls `hooks.event({ event })`
+ *     per event. Kilo validates: "Plugin must default export an object with server()" — with only
+ *     setup() **Kilo refuses to load** (an ERROR in the log, showing as "the plugin looks installed but
+ *     no state file / ledger ever arrives"). Also a local `file://` plugin **must export `id`**.
+ *   The two **cannot both** export `server` and `tui` (Kilo throws "either server() or tui(), not both");
+ *   `setup` and `server` coexisting is fine (validation only looks at the latter two).
  *
- * 为什么 7F 值得单独写一个入口：Kilo 那一路是 CLI 任务台账的**唯一**来源
- * （服务端轮询是只读的，监控端不能伪造上报），入口不对就等于这条记录永远出不来。
+ * Why 7F deserves its own entry point: the Kilo path is the **only** source for the CLI task ledger
+ * (server polling is read-only; a monitoring side must not fabricate reports), so a wrong entry point
+ * means this record never appears.
  */
 export default {
   id: "workgremlin",
 
-  /** 8F OpenCode —— 走这个入口就说明是 OpenCode，产品基名不用猜 */
+  /** 8F OpenCode — going through this entry point says it is OpenCode; the product base name needs no guessing */
   async setup(ctx) {
-    // 议事厅的参与者不该被上报（见 server/src/council/agents.js 的 QUIET_ENV）：
-    // 工程模式下它的 cwd 是用户的真实工程，上报了就会变成"你工程里的一个成员"。
-    // 这里返回一个空的拆卸函数 —— OpenCode 照常加载，只是什么都不订阅。
+    // Council participants must not be reported (see server/src/council/agents.js QUIET_ENV): in workspace
+    // mode their cwd is the user's real workspace, so reporting would make them a member of your workspace.
+    // Return an empty teardown function — OpenCode still loads, it just subscribes to nothing.
     if (process.env.WORKGREMLIN_DISABLE === "1") return () => {}
     const inst = createIngestPlugin(ctx && ctx.options, { location: ctx && ctx.location, base: "opencode" })
     const controller = new AbortController()
@@ -1050,7 +1047,7 @@ export default {
           inst.handle(event)
         }
       } catch {
-        /* 订阅断了就断了：退回轮询推导 */
+        /* subscription dropped → fall back to polling */
       }
     })()
     return () => {
@@ -1059,20 +1056,20 @@ export default {
     }
   },
 
-  /** 7F Kilo —— 契约见 packages/plugin/src/index.ts 的 `PluginModule` */
+  /** 7F Kilo — contract in packages/plugin/src/index.ts `PluginModule` */
   async server(input, options) {
-    // 同上（7F Kilo）：议事厅的参与者不上报。返回空的 Hooks 对象而不是 undefined ——
-    // Kilo 会校验 server() 的返回值形状，给 undefined 可能被当成加载失败。
+    // Same as above (7F Kilo): council participants are not reported. Return an empty Hooks object rather
+    // than undefined — Kilo validates the shape of server()'s return value, and undefined may look like a load failure.
     if (process.env.WORKGREMLIN_DISABLE === "1") return {}
-    // `base: "kilo"`：走 server() 这个入口就是 Kilo（setup() 才是 OpenCode），产品基名不用猜。
-    // 早先这里是 `options || { client: "kilo" }` —— 目录注册那份没有 options，于是被喂了一个
-    // 假默认 `{client:"kilo"}`，把 resolveClient 里的环境判定（形态 CLI / Plugin）整段遮死。
+    // `base: "kilo"`: going through server() says it is Kilo (setup() is OpenCode); no guessing.
+    // Pass `options || {}` (directory registration has no options) so an explicit client in config can
+    // name the product without a fake default shadowing the entry point's base name.
     const inst = createIngestPlugin(options || {}, {
       location: { directory: String((input && input.directory) || (input && input.worktree) || "") },
       base: "kilo",
     })
     return {
-      /** Kilo 的每一条事件都从这里过一遍（含 `*.delta`，靠 handle 里的 switch 只认需要的那些） */
+      /** Every Kilo event goes through here (including `*.delta`; handle's switch only takes the ones it needs) */
       async event({ event } = {}) {
         if (event) inst.handle(event)
       },

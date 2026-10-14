@@ -9,7 +9,6 @@
 
 const os = require('node:os');
 const path = require('node:path');
-const { diskKey } = require('@workgremlin/shared');
 
 const HOME = os.homedir();
 

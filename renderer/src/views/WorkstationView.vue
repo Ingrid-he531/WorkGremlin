@@ -61,7 +61,7 @@ const MAIN_STATE_OF_PHASE = {
 };
 const floorAgentBase = computed(() => {
   const f = (sessions.floors || []).find((x) => x.id === sessions.selectedFloor);
-  return f && f.client ? String(f.client).replace(/-plugin$/i, '').toLowerCase() : '';
+  return f && f.client ? String(f.client).toLowerCase() : '';
 });
 const mainAgentCard = computed(() => {
   // 已有真实主 agent 成员：直接用，不合成

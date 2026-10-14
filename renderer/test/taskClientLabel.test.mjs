@@ -1,14 +1,16 @@
 /**
- * 任务列表「客户端」标签自检：一轮任务走的**形态**（CLI / IDE 插件）要出现在标签里。
+ * Task-list "client" label self-check: the **form** a round ran as (CLI / IDE plugin) must appear
+ * in the label.
  *
- * 背景：Codex（3F）与 Claude Code（4F）的 CLI 与自家 IDE 扩展都共用一份落盘、同一个 client
- * （楼层就是这么合并的），光看 client 只能显示 "Codex" / "Claude Code"。hook 从会话自己落的
- * 记录里认出形态（form = 'cli' | 'plugin'，见 packages/reporter/src/hook.js 的 codexForm /
- * claudeForm）随任务一起上报，这一层只负责把两样拼成「Codex CLI / Codex Plugin」、
- * 「Claude Code CLI / Claude Code Plugin」；标签里已经带形态的
- * （CodeBuddy CLI / CodeBuddy Plugin）不重复追加，认不出的 form 一律不猜。
+ * Background: Codex (3F) and Claude Code (4F) share one on-disk store and one client between the
+ * CLI and their IDE extension (that is why the floor is merged); from the client alone you can
+ * only show "Codex" / "Claude Code". The hook recognizes the form from the session's own record
+ * (form = 'cli' | 'plugin', see packages/reporter/src/hook.js codexForm / claudeForm) and reports
+ * it with the task; this layer only joins the two into "Codex CLI / Codex Plugin" and
+ * "Claude Code CLI / Claude Code Plugin". The client is always the floor base name and the form is
+ * the only axis — an unrecognized form is never guessed.
  *
- * 跑法：`npm run test:task-client`（node 直接跑；renderer 的 .js 由 node 的语法检测当 ESM）
+ * Run: `npm run test:task-client` (node runs it directly; renderer .js is treated as ESM by node's syntax check)
  */
 const { clientLabel } = await import('@workgremlin/shared');
 
@@ -39,14 +41,10 @@ ok(
 );
 ok('没有 form（老数据 / 下游没认出来）→ 还是 Claude Code', clientLabel('claude') === 'Claude Code', clientLabel('claude'));
 
-console.log('\n[3] 已经带形态的 client 不重复追加');
-ok('codebuddy → CodeBuddy CLI', clientLabel('codebuddy', 'cli') === 'CodeBuddy CLI', clientLabel('codebuddy', 'cli'));
-ok(
-  'codebuddy-plugin → CodeBuddy Plugin（只一个）',
-  clientLabel('codebuddy-plugin', 'vscode') === 'CodeBuddy Plugin',
-  clientLabel('codebuddy-plugin', 'vscode')
-);
-ok('codex-plugin（标签自带形态）→ 不重复追加', clientLabel('codex-plugin', 'vscode') === 'Codex Plugin', clientLabel('codex-plugin', 'vscode'));
+console.log('\n[3] 楼层基名 + form（client 不再带 -plugin 后缀）');
+ok('codebuddy + form=cli → CodeBuddy CLI', clientLabel('codebuddy', 'cli') === 'CodeBuddy CLI', clientLabel('codebuddy', 'cli'));
+ok('codebuddy + form=vscode → CodeBuddy Plugin', clientLabel('codebuddy', 'vscode') === 'CodeBuddy Plugin', clientLabel('codebuddy', 'vscode'));
+ok('memberId 形态（name@project）也归到楼层', clientLabel('codebuddy@proj', 'vscode') === 'CodeBuddy Plugin', clientLabel('codebuddy@proj', 'vscode'));
 
 console.log('\n[4] 认不出的一律不猜');
 ok("form='' → Claude Code", clientLabel('claude', '') === 'Claude Code', clientLabel('claude', ''));

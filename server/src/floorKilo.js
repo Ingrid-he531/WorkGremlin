@@ -1105,8 +1105,9 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
 
   /**
    * 让位给插件的那条会话，插件是不是**冒我们这个身份、而且现在正跑着**？
-   * CLI 形态的插件（`kilo run`，没有 VS Code 环境变量）报的就是裸 `kilo` —— 同一个成员
-   * `kilo@<工程>`，见 plugin/index.js 的 resolveClient；只有 VS Code 扩展起的才是 `kilo-plugin`。
+   * client 恒为楼层基名（见 plugin/index.js 的 resolveClient）：CLI 形态的插件（`kilo run`，
+   * 没有 VS Code 环境变量）报的就是裸 `kilo`，与 VS Code 扩展起的同为一个成员 `kilo@<工程>`，
+   * 形态另由 form（cli / vscode）区分。
    * 是的话这条工程的成员状态就先归插件写：轮询这一路连心跳都不碰 —— 否则 5s 一次轮询会把
    * 插件刚写的相位覆盖成轮询视角下的旧状态（agent_status 谁最后写谁赢），现场就是相位来回跳。
    * 只在那轮**还没收工**时让位（isActiveOf）：插件那条停下来了就把这一栏交回轮询，

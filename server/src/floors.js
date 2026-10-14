@@ -187,8 +187,8 @@ function sourceSpecs(p) {
 /**
  * 这一路的上报身份 client —— **恒等于楼层基名**（agent）。
  * 形态（CLI / 插件）不走身份：由下面的 sourceForm / spec.kind 表达，是不是插件用 shared.isPluginClient(form) 判。
- * 允许 spec.client 显式覆盖（极少），但**别再用 diskKey 合成 `<agent>-plugin` 当身份** —— 那是落盘键，
- * 不是身份；上报状态文件里 client 写的就是基名（见 hookCommon 的 `client = ev.agent`）。
+ * A spec.client override is allowed (rare), but never synthesize an `<agent>-plugin` identity —
+ * the reported state file's client is the bare base name (see hookCommon's `client = ev.agent`).
  */
 function sourceClient(p, spec) {
   return spec.client || p.agent;

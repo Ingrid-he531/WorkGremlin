@@ -166,6 +166,9 @@ export declare const HTTP_ROUTES: Record<string, string>;
 export declare const ERROR_CODES: Record<string, string>;
 export declare const STATE_LABELS: Record<AgentState, string>;
 export declare const STATE_COLORS: Record<AgentState, string>;
+/** Gremlin avatar config keyed by member name (leader / coder / …); unmatched falls back to AVATAR_FALLBACK. */
+export declare const AVATARS: Record<string, { label: string; body: string; horn: string; prop: string }>;
+export declare const AVATAR_FALLBACK: { label: string; body: string; horn: string; prop: string };
 
 
 export declare function envelope<T>(type: string, project: string, actor: string, payload: T, ts?: number): Envelope<T>;
@@ -180,11 +183,21 @@ export declare function fnv1a32(str: string): string;
 export declare function formatDuration(ms: number): string;
 /** 绝对时刻 `MM-DD HH:mm`（「开始 / 最近活跃」这类时间点；写死不动，不需要定时器重算） */
 export declare function formatClock(ms: number): string;
+/** Member avatar config by name (before `@`); unmatched → AVATAR_FALLBACK. */
+export declare function avatarOf(name: string): { label: string; body: string; horn: string; prop: string };
+/** form → source: vscode-like → 'plugin', 'ide' → 'ide', everything else → 'cli'. */
+export declare function formToSource(form: string): 'plugin' | 'cli' | 'ide';
+/** agent base name → product display name table. */
+export declare const AGENT_LABELS: Record<string, string>;
+/** Identity → agent base name (strips an `@<project>` suffix; plugin-vs-not is decided by `form`). */
+export declare function agentBase(id: string): string;
+/** Final display name from agent + form (e.g. "Kilo Code CLI" / "CodeBuddy Plugin"). */
+export declare function clientLabel(agent: string, form: string): string;
+/** WorkGremlin home dir: default ~/.workgremlin, overridable with WORKGREMLIN_HOME. */
+export declare function home(): string;
 
 /**
- * 新合同（与 hook 的 eventClient 一致）：agent 直接代表楼层，client 只描述形态
- * （vscode / cli …）。isPluginClient(client) 判定 plugin 形态；diskKey(agent, form)
- * 仅内部落盘合成 <agent>[-plugin] 串，数据模型与身份里不再出现合成字符串。
+ * Whether a form means "plugin" (IDE extension) — the only plugin-vs-not decision. Identity is
+ * always the bare floor base name (never a synthesized `agent + '-plugin'`).
  */
-export declare function isPluginClient(client: string): boolean;
-export declare function diskKey(agent: string, form: string): string;
+export declare function isPluginClient(form: string): boolean;

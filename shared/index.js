@@ -319,12 +319,12 @@ const IPC_EVENTS = Object.freeze({
 });
 
 /**
- * 是否 plugin 形态（IDE 扩展）。判定以 hook event 自报的 `client`（形态）为准，
- * 目前以 vscode 系 IDE 为 plugin；以后支持其他 IDE（jetbrains / cursor …）在此数组扩展。
+ * Whether a **form** means "plugin" (IDE extension). Decided by the form the hook event reports
+ * (ev.client): vscode-family IDEs count as plugin today; add jetbrains / cursor … to this list later.
  *
- * 注意：agent 直接代表楼层，client 只描述形态（vscode / cli …），不再用 `agent + '-plugin'`
- * 这样的合成字符串当身份。磁盘落盘键等内部用途如需合成，由各调用点按此函数就地拼，不再有 clientOf。
- * @param {string} client 形态（vscode / cli / codebuddy …）
+ * This is the **only** place that decides plugin-vs-not. Identity (agent / client) is always the
+ * bare floor base name, never a synthesized `agent + '-plugin'` string.
+ * @param {string} form form (vscode / cli / ide …)
  */
 const PLUGIN_FORMS = ['vscode'];
 function isPluginClient(form) {
@@ -366,13 +366,14 @@ const AGENT_LABELS = {
 };
 
 /**
- * 身份 → agent 基名：剥掉 -plugin 后缀与 @<工程/实例> 后缀。
- * 前后端共用(前端原 clientMatch.agentBase,后端 query.js 里 task-runs 的 client/member_id 都过这层)。
+ * Identity → agent base name: strip the `@<project>` suffix (memberId is `name@project`) and
+ * lowercase. Identity is always the floor base name now — there is no synthesized `-plugin`
+ * suffix to strip (plugin-vs-not is decided by `form`, see isPluginClient).
+ * Shared by both frontend and backend (clientLabel, renderer matching, sessionRegistry).
  * @param {string} id memberId / name / client
  */
 function agentBase(id) {
   return String(id || '')
-    .replace(/-plugin$/i, '')
     .split('@')[0]
     .toLowerCase();
 }
@@ -399,17 +400,6 @@ function clientLabel(agent, form) {
   if (f === 'cli' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} CLI`;
   if (f === 'ide' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} IDE`;
   return base;
-}
-
-/**
- * 由 agent 基名 + 形态就地拼出磁盘落盘键（<agent>[-plugin]）。
- * 仅内部落盘 / reporter 相位使用；数据模型与身份里不再出现合成字符串。
- * @param {string} agent 楼层基名
- * @param {string} form 形态（vscode 等 plugin 形态才追加 -plugin）
- */
-function diskKey(agent, form) {
-  const a = String(agent || '').toLowerCase();
-  return isPluginClient(form) ? `${a}-plugin` : a;
 }
 
 /**
@@ -450,6 +440,5 @@ module.exports = {
   clientLabel,
   agentBase,
   AGENT_LABELS,
-  diskKey,
   home,
 };

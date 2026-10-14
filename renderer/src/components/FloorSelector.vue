@@ -181,7 +181,7 @@ function sourceLabelOf(src) {
  */
 const FORM_LABEL = { trae: 'IDE' };
 function cliFormLabel(p) {
-  const base = String((p && (p.client || p.dataKind)) || '').toLowerCase().replace(/-plugin$/, '');
+  const base = String((p && (p.client || p.dataKind)) || '').toLowerCase();
   return FORM_LABEL[base] || 'CLI';
 }
 
