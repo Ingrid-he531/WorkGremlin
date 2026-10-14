@@ -1183,21 +1183,6 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   return count;
 }
 
-/** 适合 setInterval 的包装：吞异常、不阻断主循环 */
-function startOpencodeTaskSyncer(ctx) {
-  const tick = () => {
-    try {
-      syncOpencodeTasks(ctx);
-    } catch {
-      /* OpenCode 没装 / 库被占 → 这轮跳过 */
-    }
-  };
-  tick();
-  const timer = setInterval(tick, SYNC_INTERVAL_MS);
-  if (timer.unref) timer.unref();
-  return timer;
-}
-
 /**
  * opencode 来源分支（8F）：轮询 OpenCode 自己的 SQLite（opencode.db 的 session_message）。
  * 原 sessionRegistry.js 的 opencode 分支整体搬到这里，调试 8F 不再碰中央文件。
@@ -1259,8 +1244,9 @@ module.exports = {
   NO_DONE,
   // ---- 8F 任务同步器（原 opencodeTasks.js）----
   syncOpencodeTasks,
-  startOpencodeTaskSyncer,
-  SYNC_INTERVAL_MS,
+  // Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
+  syncTasks: syncOpencodeTasks,
+  pollMs: SYNC_INTERVAL_MS,
   // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
   agentDirs,
 };

@@ -681,23 +681,6 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
   return count;
 }
 
-/** 适合 setInterval 的包装：吞异常、不阻断主循环 */
-function startQoderPluginTaskSyncer(ctx) {
-  const tick = () => {
-    try {
-      syncQoderPluginTasks(ctx);
-    } catch {
-      /* 插件界面没开过 / 库被占 / 原生模块缺失 → 这轮跳过，其余楼层照常 */
-    }
-  };
-  tick();
-  const timer = setInterval(tick, SYNC_INTERVAL_MS);
-  if (timer.unref) timer.unref();
-  return timer;
-}
-
-
-
 /**
  * lingma 来源分支（6F 插件形态）：轮询 Qoder CN 扩展自己的 local.db。
  * 原 sessionRegistry.js 的 lingma 分支整体搬到这里，调试 6F 不再碰中央文件。
@@ -791,8 +774,8 @@ module.exports = {
   SESSION_LIMIT,
   // 插件形态任务同步器（原 qoderPluginTasks.js）
   syncQoderPluginTasks,
-  startQoderPluginTaskSyncer,
-  SYNC_INTERVAL_MS,
+  // Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
+  pollMs: SYNC_INTERVAL_MS,
   TASK_ID_PREFIX,
   // 统一接口别名
   listSessions: listLingmaSessions,

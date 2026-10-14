@@ -1224,22 +1224,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   return count;
 }
 
-/** 适合 setInterval 的包装：吞异常、不阻断主循环 */
-function startCopilotTaskSyncer(ctx) {
-  const tick = () => {
-    try {
-      syncCopilotTasks(ctx);
-    } catch {
-      /* Copilot 没装 / 库被占 → 这轮跳过 */
-    }
-  };
-  tick();
-  const timer = setInterval(tick, SYNC_INTERVAL_MS);
-  if (timer.unref) timer.unref();
-  return timer;
-}
-
-
 /* ── 统一接口别名 + 导出（用 mutation，保证 sessions.js 循环加载时拿到的 C 引用稳定）── */
 module.exports.id = '9F';
 module.exports.client = 'copilot';
@@ -1272,9 +1256,9 @@ module.exports.agentDirs = function agentDirs() {
   return [];
 };
 module.exports.syncCopilotTasks = syncCopilotTasks;
-module.exports.startCopilotTaskSyncer = startCopilotTaskSyncer;
-module.exports.SYNC_INTERVAL_MS = SYNC_INTERVAL_MS;
 module.exports.syncTasks = syncCopilotTasks;
+// Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
+module.exports.pollMs = SYNC_INTERVAL_MS;
 module.exports.readPhase = readCopilotPhaseFromSqlite;
 module.exports.readDone = readCopilotDone;
 module.exports.modelOf = copilotCurrentModel;

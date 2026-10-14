@@ -1335,21 +1335,6 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   return count;
 }
 
-/** 适合 setInterval 的包装：吞异常、不阻断主循环 */
-function startKiloTaskSyncer(ctx) {
-  const tick = () => {
-    try {
-      syncKiloTasks(ctx);
-    } catch {
-      /* Kilo 没装 / 库被占 → 这轮跳过 */
-    }
-  };
-  tick();
-  const timer = setInterval(tick, SYNC_INTERVAL_MS);
-  if (timer.unref) timer.unref();
-  return timer;
-}
-
 /**
  * kilo 来源分支（7F）：轮询 Kilo 自己的 event-sourced SQLite（kilo.db）。
  * 原 sessionRegistry.js 的 kilo 分支整体搬到这里，调试 7F 不再碰中央文件。
@@ -1413,8 +1398,9 @@ module.exports = {
   NO_DONE,
   // ---- 7F 任务同步器（原 kiloTasks.js）----
   syncKiloTasks,
-  startKiloTaskSyncer,
-  SYNC_INTERVAL_MS,
+  // Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
+  syncTasks: syncKiloTasks,
+  pollMs: SYNC_INTERVAL_MS,
   meta,
   kindHandlers,
   sessionTitle,

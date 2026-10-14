@@ -1,32 +1,40 @@
 'use strict';
 
 /**
- * 楼层模块统一注册表 + 探测编排（框架核心）。
+ * Floor registry + detection orchestration (framework core).
  *
- * 设计目标：**一个楼层 = 一个文件**（`server/src/<product>.js`，如 `codebuddy.js` /
- * `trae.js` …）。新增 / 修改一个楼层只动它自己的文件 + 在下面的 `floors` 里挂一行，
- * 绝不用改 `sessionRegistry.js` / `sessions.js` 这些中央文件 —— 这正是过去 regression 的来源。
+ * Design goal: **one floor = one file** (`server/src/<product>.js`, e.g. `codebuddy.js` / `trae.js` …).
+ * Adding or changing a floor touches only its own file plus one line in `floors` below — never
+ * `sessionRegistry.js` / `sessions.js` or other central files, which is exactly where past
+ * regressions came from.
  *
- * 本文件**只做两件事**：① 注册表（floors / floorOf）；② 探测编排（detectProducts 把各楼层
- * meta 聚合成探测结果）。凡是「某个产品叫什么、装在哪、按什么名字匹配」都下放到楼层 meta
- * （matchRe / homeDirs / homeDirsPlugin / pluginRe / altPluginRe / cliBinDirs …），本文件不出现
- * 任何具体楼层的内容。通用的「操作系统/编辑器目录枚举、目录体积统计」放在 roots.js（同样不含楼层知识）。
+ * This file does **only two things**: ① the registry (`floors` / `floorOf`); ② detection orchestration
+ * (`detectProducts` aggregates each floor's `meta` into detect results). Anything about "what a
+ * product is called, where it is installed, what names match it" lives in each floor's meta
+ * (`matchRe` / `homeDirs` / `homeDirsPlugin` / `pluginRe` / `altPluginRe` / `cliBinDirs` …); this file
+ * contains no product-specific content. Generic "OS/editor directory enumeration, directory size"
+ * helpers live in roots.js (also floor-agnostic).
  *
- * 每个楼层模块约定导出：
- *   id           楼层 id（'1F' … '9F'）
- *   meta         产品探测元数据（id/name/kind/cmd/agent/plugin/pluginRe/altPluginRe/
- *                sources/hookSource/dataKind/matchRe/homeDirs/homeDirsPlugin/cliBinDirs）
- *   kindHandlers (可选) 该楼层特有的"会话来源分支"：{ <kind>: (product, spec, ctx) => void }
- *   sessionTitle (可选) 该楼层自己的会话标题读取：function(sessionId) => string
- *   syncTasks / startSyncer (可选) 后台台账同步器（见各楼层文件）
- *   pluginStore  (可选) 该楼层 plugin kind 的结构化落盘读取器：
+ * Floor module contract:
+ *   id           floor id ('1F' … '9F')
+ *   meta         product detection metadata (id/name/kind/cmd/agent/plugin/pluginRe/altPluginRe/
+ *                sources/hookSource/dataKind/matchRe/homeDirs/homeDirsPlugin/cliBinDirs)
+ *   kindHandlers (optional) this floor's own "session source branch": { <kind>: (product, spec, ctx) => void }
+ *   sessionTitle (optional) this floor's own session-title read: function(sessionId) => string
+ *   syncTasks / pollMs (optional) floors that write the task ledger by polling (see each floor file):
+ *                syncTasks(ctx) reads the local store and fills in task + task_run; pollMs declares
+ *                the cadence (default 5000). **Floors hold no timers** — the single clock lives in
+ *                server/src/poller.js, which walks this registry.
+ *   pluginStore  (optional) structured on-disk reader for this floor's plugin kind:
  *                { readTodos(storage,id), readFileChanges(storage,id), readRuntime(storage,id),
- *                  collectProjects(storage,candidates) } —— sessions.js 按 client 派发（1F 见 floorCodebuddy）
- *   pluginPolicy (可选) 该楼层 plugin kind 的会话列表策略，由 sessionRegistry.handlePlugin 通用派发：
- *                (ctx) => { currentOnly?, active?, ended?, exclude?(row) }（1F 见 floorCodebuddy）
+ *                  collectProjects(storage,candidates) } — sessions.js dispatches by client (1F: floorCodebuddy)
+ *   pluginPolicy (optional) session-list policy for this floor's plugin kind, dispatched generically
+ *                by sessionRegistry.handlePlugin: (ctx) => { currentOnly?, active?, ended?, exclude?(row) }
+ *                (1F: floorCodebuddy)
  *
- * 依赖方向：本文件 require 所有楼层模块（构建注册表）；楼层模块只 require 通用模块（roots.js /
- * @workgremlin/shared），不再 require 本文件 —— 因此不存在循环 require。
+ * Dependency direction: this file requires every floor module (to build the registry); floor modules
+ * require only generic modules (roots.js / @workgremlin/shared) and never this file — so there is no
+ * circular require.
  */
 
 const os = require('node:os');
@@ -56,14 +64,14 @@ const { detectLevelInDirs, descriptionInDirs, listAgentFiles } = require('./inge
 
 const HOME = os.homedir();
 
-/** 契约要求/约定的导出名（仅文档与自检用，不强制） */
+/** Contract export names (docs / self-check only; not enforced) */
 const FLOOR_CONTRACT = [
   'id',
   'meta',
   'kindHandlers',
   'sessionTitle',
   'syncTasks',
-  'startSyncer',
+  'pollMs',
   'modelOf',
   'pluginStore',
   'pluginPolicy',
@@ -319,31 +327,24 @@ function detectProducts({ force = false } = {}) {
 const TTL = 60_000;
 let cache = { at: 0, products: [] };
 
-/* ============================================================== 任务同步器编排 */
+/* ============================================================== Polling floor registry */
 
 /**
- * 启动所有"无 hook 上报能力"楼层的后台任务同步器。
+ * Floors that write the task ledger by polling (no hook / no reporter).
  *
- * 这些楼层（6F Qoder 插件形态 / 7F Kilo / 8F OpenCode / 9F Copilot）不会自己往 tasks 表写东西，
- * 靠这个兜底同步器每 5s 轮询各自本地库（session-store.db / kilo.db / opencode.db / local.db），
- * 把会话或每一轮对话补写成 task + task_run，让任务列表和主控制台都能看到它们。
+ * These floors (6F Qoder plugin / 7F Kilo / 8F OpenCode / 9F Copilot) never write to `tasks`
+ * themselves; the server reads their local store (local.db / kilo.db / opencode.db /
+ * session-store.db) and writes the task + task_run per session turn. A floor does that inside
+ * `syncTasks(ctx)` and **holds no timer** — the server's single unified poller (see poller.js) walks
+ * this registry and calls each floor on its declared `pollMs` (default 5000). Per-floor failures are
+ * swallowed by the poller, so one missing/locked store never stalls the loop.
  *
- * 各同步器内部异常各自吞掉、不阻断主流程；返回的定时器都已 unref，不阻止进程退出。
- * @param {{bus: object, repo: object, now: ()=>number}} ctx
- * @returns {Array<object>} 各同步器注册的定时器
+ * The opt-in signal is simply "exports syncTasks": 1F~5F and 6F CLI report via hooks and do not
+ * export it, so they only get their sessions scanned.
+ * @returns {Array<object>} floor modules that participate in task polling
  */
-function startTaskSyncers({ bus, repo, now }) {
-  const timers = [];
-  // 9F Copilot：无 reporter hook，每 5s 轮询 session-store.db 把会话写成 task + task_run。
-  timers.push(floors['9F'].startCopilotTaskSyncer({ bus, repo, now }));
-  // 7F Kilo Code：同 9F，轮询 kilo.db（含 model 信息）。
-  timers.push(floors['7F'].startKiloTaskSyncer({ bus, repo, now }));
-  // 8F OpenCode：轮询 opencode.db 的 session_message 流，按每一轮用户任务写。
-  timers.push(floors['8F'].startOpencodeTaskSyncer({ bus, repo, now }));
-  // 6F Qoder 插件形态：扩展无 hook 子系统，轮询 local.db，按每一轮写（标题=用户原话、产出=summary）。
-  // 同一成员若被 CLI 一路占着状态栏，这一路只写台账、不动相位（见 floorQoder.js 头）。
-  timers.push(floors['6F'].startQoderPluginTaskSyncer({ bus, repo, now }));
-  return timers;
+function taskSyncerFloors() {
+  return Object.values(floors).filter((f) => typeof f.syncTasks === 'function');
 }
 
 /* ============================================================== 静态 subagent 聚合 */
@@ -419,7 +420,7 @@ module.exports.floors = floors;
 module.exports.floorOf = floorOf;
 module.exports.floorByAgent = floorByAgent;
 module.exports.detectProducts = detectProducts;
-module.exports.startTaskSyncers = startTaskSyncers;
+module.exports.taskSyncerFloors = taskSyncerFloors;
 module.exports.detectLevel = detectLevel;
 module.exports.agentDescription = agentDescription;
 module.exports.listStaticSubagents = listStaticSubagents;

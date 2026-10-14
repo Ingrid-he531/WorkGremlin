@@ -32,9 +32,8 @@ const { createCouncilOrchestrator } = require('./council/orchestrator');
 const { requireToken } = require('./http/auth');
 const { createDemo } = require('./demo');
 const { createLifecycle } = require('./lifecycle');
-const { WS_EVENTS } = require('@workgremlin/shared');
-const { snapshot: registrySnapshot, setBackend: setRegistryBackend } = require('./sessionRegistry');
-const { startTaskSyncers } = require('./floors');
+const { setBackend: setRegistryBackend } = require('./sessionRegistry');
+const { createPoller } = require('./poller');
 const config = require('./config');
 const clock = require('./clock');
 
@@ -256,44 +255,20 @@ function createServer(opts = {}) {
     config.writeServerInfo(info);
 
     timers.push(startCheckpointLoop());
-    timers.push(
-      setInterval(() => {
-        try {
-          bus.sweepDegraded();
-        } catch {
-          /* ignore */
-        }
-      }, 10_000)
-    );
-    // 会话（全局活跃会话表）变化实时推送：开/关工程（会话）立刻反映到办公室，不再等 10s 轮询。
-    // 每 2s 强制扫盘一次，按"活跃会话集合"算签名，只在变化时广播，避免无谓推送。
-    let lastSessionSig = '';
-    timers.push(
-      setInterval(() => {
-        try {
-          const cur = workspace.current();
-          const snap = registrySnapshot({ workspacePath: cur.workspacePath || '', force: true });
-          const sig = JSON.stringify({
-            d: snap.defaultFloor,
-            f: snap.floors.map((f) => [f.id, f.activeCount, f.installed ? 1 : 0]),
-            s: snap.sessions.map((x) => [x.floor, x.id, x.active ? 1 : 0, x.lastEventAt]),
-          });
-          if (sig !== lastSessionSig) {
-            lastSessionSig = sig;
-            hub.broadcast(null, WS_EVENTS.SESSIONS, snap);
-          }
-        } catch {
-          /* 扫盘失败不阻断主流程 */
-        }
-      }, 2000)
-    );
+
+    /* The one clock: session scan + per-floor task-ledger sync (per `pollMs`) + heartbeat sweep all
+       live in this single unified poller, so floor modules hold no timers (see poller.js). */
+    const poller = createPoller({
+      bus,
+      repo,
+      getWorkspace: () => workspace.current(),
+      broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
+      now: () => clock.now(),
+    });
+    timers.push(poller.start());
 
     // 记录自动保留：启动即清一次，之后每 24h 按 retentionDays 清掉更早的任务记录。
     // 定时器 unref 不阻止进程退出；清理失败不影响主流程。
-    // 无 hook 上报能力的楼层：启动后台任务同步器（每 5s 轮询各自本地库，补写 task + task_run，
-    // 让任务列表/主控制台能看到 6F/7F/8F/9F）。各同步器异常各自吞掉不阻断主流程；细节见 floors.js。
-    timers.push(...startTaskSyncers({ bus, repo, now: () => clock.now() }));
-
     const runRetentionCleanup = () => {
       try {
         const days = repo.getRetentionDays();
