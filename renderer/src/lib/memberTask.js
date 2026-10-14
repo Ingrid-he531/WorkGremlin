@@ -10,6 +10,7 @@
  */
 // 显式写 /index.js：这个文件被 renderer/test 的 node 脚本直接 import，Node 不会补扩展名
 import { t } from '../i18n/index.js';
+import { isEphemeralMember } from './ephemeral.js';
 
 /** 算在干活的相位：与主控制台"在不在跑"的口径一致（见 iso/mainConsole.js 的 PHASES.busy） */
 export const WORKING_STATES = ['busy', 'thinking', 'blocked'];
@@ -55,4 +56,37 @@ export function currentTaskTitle(member) {
 export function currentTaskStartedAt(member) {
   const t = currentTaskOf(member);
   return t && typeof t === 'object' ? Number(t.startedAt) || 0 : 0;
+}
+
+/**
+ * 「有效当前任务」：常驻小怪物自己槽位里没在跑的任务、但它**正被召唤**（同名幽灵在跑）时，
+ * 借用那只幽灵的任务 —— 与办公室 tooltip 同一口径（见 IsoOfficeView 的 mtipTask）。
+ *
+ * 为什么需要：召唤出去干活的实例是 `subagent-<名字>` 那只幽灵，任务挂在它身上；常驻小怪物
+ * 的槽位里没有任务。只看成员自己的 task，工位卡片就会「状态忙碌、当前任务：空闲」。
+ * @param {object} member 常驻成员（或任意成员）
+ * @param {Array} allMembers 同一工程的全部成员（含幽灵）
+ * @returns {object|string|null}
+ */
+export function summonTaskOf(member, allMembers) {
+  if (!member || !isWorking(member)) return null;
+  const own = currentTaskOf(member);
+  if (own) return own;
+  const g = (Array.isArray(allMembers) ? allMembers : []).find(
+    (x) => isEphemeralMember(x) && x.name === member.name && currentTaskOf(x)
+  );
+  return g ? currentTaskOf(g) : null;
+}
+
+/** 「有效当前任务」的标题；没有回空串（调用方显示「空闲」） */
+export function summonTaskTitle(member, allMembers) {
+  const task = summonTaskOf(member, allMembers);
+  if (!task) return '';
+  return typeof task === 'string' ? task : String(task.title || '');
+}
+
+/** 「有效当前任务」的开工时刻；拿不到回 0 */
+export function summonTaskStartedAt(member, allMembers) {
+  const task = summonTaskOf(member, allMembers);
+  return task && typeof task === 'object' ? Number(task.startedAt) || 0 : 0;
 }

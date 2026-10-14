@@ -97,13 +97,14 @@ const DISPATCH_TALK = 3.6;
 /** 收工汇报：小怪物跑到主 agent 面前说出结果摘要的停留时长（秒） */
 const REPORT_TALK = 3.4;
 /**
- * 小幽灵入场：**一律从大门飘进来**（演示模式的临时成员、真实场景里被召唤的 subagent 实例
- * 走的是同一套）。门外那一段（gx < 0）被墙挡着，只有穿过门洞时才看得见，所以"飘进来"
- * 是真的从门口出现，不是凭空出现在悬浮点上。
+ * 小幽灵入场：
+ *   · **有小怪物对应的**（被召唤实例，name 命中坐工位的小怪物）→ **直接从那只小怪物头顶出现**，
+ *     不从大门绕——召唤的看点是"小怪物领了任务回工位、幽灵同时出现在它头顶"，绕门会晚一拍。
+ *   · **独立幽灵**（没有同名小怪物，如演示模式的临时成员）→ 从大门外飘进来。门外那一段（gx < 0）
+ *     被墙挡着，只有穿过门洞时才看得见，所以"飘进来"是真的从门口出现，不是凭空出现在悬浮点上。
  *
- * 出发时机：先等**所有小怪物都进了屋**（没有还没露面的、也没有还卡在门洞里的），
- * 再一个接一个出发 —— 演示模式的开场因此是"小怪物一个个走进来坐下，幽灵随后从门口飘进来"，
- * 不是人和幽灵一起糊在门口。
+ * 独立幽灵的出发时机：先等**所有小怪物都进了屋**（没有还没露面的、也没有还卡在门洞里的），
+ * 再一个接一个出发 —— 演示模式的开场因此是"小怪物一个个走进来坐下，幽灵随后从门口飘进来"。
  */
 const GHOST_ENTRY_SPEED = 1.9; // tile/s：从门外飘到悬浮点这一段（比平时溜达快，不然要飘十几秒）
 const GHOST_ENTRY_STAGGER = 420; // 毫秒：同批幽灵一只一只出发，不在门口叠成一坨
@@ -383,6 +384,9 @@ export function createIsoOffice(canvas, opts = {}) {
     dispatch = null;
     if (ghostId) revealGhost(ghostId);
     pumpDispatch();
+    // 领到任务、幽灵也现身之后，才轮到"收工汇报"（见 pumpReport 的 dispatch 守卫）——
+    // 这样即便 subagent 收得很快，汇报也会等小怪物回到工位、幽灵现身之后再演，幽灵一定看得见。
+    pumpReport();
   }
 
   /** 小怪物回到工位：显示之前被隐藏的召唤幽灵（跟别的幽灵一样从大门飘进来，再落到它头顶） */
@@ -435,7 +439,10 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   function pumpReport() {
-    if (report || !reportQueue.length) return;
+    // 「领任务」编排还没走完就先不汇报：subagent 可能收得比小怪物走到控制台还快，
+    // 这时若立刻开演汇报，小怪物会一边往控制台走去领任务、一边又去汇报（同一只被两段编排抢）。
+    // 等 finishDispatch（回工位 + 幽灵现身）再开演，幽灵也才一定看得见。
+    if (report || dispatch || !reportQueue.length) return;
     const r = reportQueue.shift();
     const a = agents.find((x) => x.memberId === r.agentId);
     if (!a) return;
@@ -532,15 +539,16 @@ export function createIsoOffice(canvas, opts = {}) {
     return {
       memberId: member.memberId,
       name: member.name || member.memberId,
-      // 门外起点：门洞里稍偏一侧（沿洞口抖一点，几只不会叠在一条线上），高度抬到门楣以下
-      x: PLACES.doorOut.x,
-      y: PLACES.doorOut.y + (Math.random() - 0.5) * 0.36,
-      z: 1.45,
+      // 头顶幽灵：直接出现在小怪物头顶（waiting=false，从 anchor 起飘）；
+      // 独立幽灵：门外起点（gx < 0，被墙挡着），等窗户开闸再飘进来。
+      x: nearSeat ? a.x : PLACES.doorOut.x,
+      y: nearSeat ? a.y : PLACES.doorOut.y + (Math.random() - 0.5) * 0.36,
+      z: nearSeat ? a.z : 1.45,
       anchor: a,
       center, // 非空 = 头顶幽灵，围绕它小范围飘荡
       target: null,
       /** 还候在门外（没出发）：画的时候裁在门洞里，等于看不见 */
-      waiting: true,
+      waiting: !nearSeat,
       /** 正在从门外飘向悬浮点（这一段速度更快） */
       entering: false,
       /** 正在穿门洞：门得敞着（见 stepDoor） */

@@ -14,7 +14,7 @@ import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
-import { currentTaskOf, currentTaskTitle } from '../lib/memberTask';
+import { summonTaskTitle } from '../lib/memberTask';
 import { httpBase, getServerInfo } from '../api/bridge';
 import { createIsoOffice } from '../iso/engine';
 import { useI18n } from '../i18n';
@@ -143,13 +143,9 @@ const mtipMember = computed(() =>
 const mtipTask = computed(() => {
   const m = mtipMember.value;
   if (!m) return '';
-  // 「当前任务」口径与工位卡一致（见 lib/memberTask.js）：空闲时槽位里那条是上一条已收工的任务，
-  // 不能拿来当"当前任务"。
-  const own = currentTaskTitle(m);
-  if (own) return own;
-  // 回落到本次召唤派下来的那只同名幽灵（只在它确实在跑的时候）
-  const g = project.members.find((x) => isEphemeralMember(x) && x.name === m.name && currentTaskOf(x));
-  return g ? currentTaskTitle(g) : '';
+  // 「当前任务」口径与工位卡一致（见 lib/memberTask.summonTaskTitle）：小怪物自己没在跑的任务时，
+  // 借用本次召唤派下来的那只同名幽灵（只在它确实在跑的时候）—— 与工位卡片同一处实现。
+  return summonTaskTitle(m, project.members);
 });
 /** 最近一次完成的结果（汇报演完时引擎记下的那笔） */
 const mtipResult = computed(() => (mtip.value.id && office ? office.lastResult(mtip.value.id) : null));

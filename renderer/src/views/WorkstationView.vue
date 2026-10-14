@@ -90,8 +90,8 @@ const mainAgentCard = computed(() => {
 <template>
   <div class="view">
     <div class="grid">
-      <WorkstationCard v-if="mainAgentCard" :key="mainAgentCard.memberId" :member="mainAgentCard" />
-      <WorkstationCard v-for="m in sorted" :key="m.memberId" :member="m" />
+      <WorkstationCard v-if="mainAgentCard" :key="mainAgentCard.memberId" :member="mainAgentCard" :members="project.members" />
+      <WorkstationCard v-for="m in sorted" :key="m.memberId" :member="m" :members="project.members" />
     </div>
 
     <p v-if="!mainAgentCard && !sorted.length" class="empty dim">{{ t('workstation.empty') }}</p>

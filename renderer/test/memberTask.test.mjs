@@ -8,7 +8,7 @@
  *
  * 跑法：`npm run test:member-task`（node 直接跑；renderer 的 .js 由 node 的语法检测当 ESM）
  */
-const { currentTaskOf, currentTaskTitle, currentTaskStartedAt, isWorking, statusLabel, statusTone } = await import(
+const { currentTaskOf, currentTaskTitle, currentTaskStartedAt, isWorking, statusLabel, statusTone, summonTaskOf, summonTaskTitle } = await import(
   '../src/lib/memberTask.js'
 );
 
@@ -70,6 +70,19 @@ ok('格式是 MM-DD HH:mm', formatClock(at) === '09-30 21:05', formatClock(at));
 ok('没有值 / 非法值回空串（卡片自己写「—」）', formatClock(0) === '' && formatClock(NaN) === '' && formatClock(null) === '');
 ok('同一时刻永远是同一个字符串（不随"现在几点"变化 = 不需要 tick）', formatClock(at) === formatClock(at));
 ok('不带秒、不带"前"（那些是相对时长的写法）', !/前|:\d\d:\d\d/.test(formatClock(at)), formatClock(at));
+
+console.log('\n[6] 被召唤的小怪物：借用同名幽灵的任务（回归：状态忙碌、当前任务却写「空闲」）');
+{
+  const susan = { memberId: 'susan@p', name: 'susan', role: 'subagent:project', state: 'busy', task: null };
+  const ghost = { memberId: 'subagent-susan@p', name: 'susan', ephemeral: true, state: 'busy', task: { id: 'g1', title: '写文档', startedAt: T, endedAt: null } };
+  ok('自己没任务 + 同名幽灵在跑 → 借它的任务', summonTaskTitle(susan, [susan, ghost]) === '写文档', summonTaskTitle(susan, [susan, ghost]));
+  ok('summonTaskOf 拿到的是幽灵那条', summonTaskOf(susan, [susan, ghost]) === ghost.task);
+  ok('幽灵已收工 → 不借（卡片回「空闲」）', summonTaskTitle(susan, [susan, { ...ghost, task: { ...ghost.task, endedAt: T } }]) === '');
+  ok('自己有在跑的任务 → 用自己的', summonTaskTitle({ ...susan, task: { id: 't', title: '自己的', endedAt: null } }, [susan, ghost]) === '自己的');
+  ok('成员不在干活（idle）→ 不借', summonTaskTitle({ ...susan, state: 'idle' }, [susan, ghost]) === '');
+  ok('同名但不是幽灵（另一个常驻成员）→ 不借', summonTaskTitle(susan, [susan, { ...ghost, ephemeral: false, memberId: 'susan2@p' }]) === '');
+  ok('名字不同的幽灵 → 不借', summonTaskTitle(susan, [susan, { ...ghost, name: 'leo' }]) === '');
+}
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
