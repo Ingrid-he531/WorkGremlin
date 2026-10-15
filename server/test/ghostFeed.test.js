@@ -88,6 +88,28 @@ console.log('\n[5] gcGhosts：父任务收工才散；召唤前就已收工的�
   ok('父任务在召唤后收工 → 散场', bus.gcGhosts() >= 1 && !member('subagent-C'));
 }
 
+console.log('\n[6] gcGhosts：父任务还在跑时，孤儿 TTL 不得把还在干活的 subagent 误散');
+// Regression (measured 2026-10-15): a CodeBuddy `Task` subagent can run longer than the orphan TTL —
+// its real end signal only arrives when it actually finishes. The 5-minute TTL force-closed a still-working
+// subagent (ghost dispersed, its own task marked done) while the parent task was still running. A running
+// parent is positive evidence the summon is still alive, so the TTL must not apply to it; the genuine end
+// event retires the ghost later, as designed.
+{
+  const clock = require('../src/clock');
+  let fake = 1_000_000;
+  clock.__setClock({ now: () => fake, monotonic: () => fake });
+  try {
+    const longMain = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '长任务', client: 'codebuddy', sessionId: 's6' }).taskId;
+    bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's6', name: 'Long', id: 'l1', parentTaskId: longMain });
+    fake += 10 * 60_000; // 10 minutes pass (well past the 5-minute orphan TTL)
+    ok('父任务仍在跑 → 过了孤儿 TTL 幽灵还在', bus.gcGhosts() === 0 && !!member('subagent-Long'));
+    bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: longMain, state: 'done' });
+    ok('父任务收工后 → 散场（TTL 之外仍靠父任务收尾）', bus.gcGhosts() >= 1 && !member('subagent-Long'));
+  } finally {
+    clock.__resetClock();
+  }
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 close();
 fs.rmSync(TMP, { recursive: true, force: true });

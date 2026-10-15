@@ -11,8 +11,8 @@
  *   · floor agent sync       — per floor `agentsPollMs` (default 15s); floors opt in by exporting
  *                              `syncAgents(ctx)`; the floor scans its OWN agent dirs and registers the
  *                              changes through the upper layer's register / unregister callbacks;
- *   · ghost GC (2s)          — bus.gcGhosts(): disperse subagent ghosts whose parent task ended or
- *                              that outlived the orphan TTL;
+ *   · ghost GC (2s)          — bus.gcGhosts(): disperse subagent ghosts whose parent task ended, or
+ *                              that outlived the orphan TTL while no running parent vouches for them;
  *   · degraded sweep (10s)   — bus.sweepDegraded(): drop stale heartbeats.
  *
  * Everything floor-specific (store schemas, "yield to the plugin" rules, phase inference, which dirs

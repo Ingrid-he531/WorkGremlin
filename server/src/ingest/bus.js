@@ -1108,6 +1108,14 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    * Ghost fallback (driven by the unified poller): disperse any summon whose parent task ended or
    * that outlived the orphan TTL — no longer depends on any hook event arriving. The parent truth
    * comes from tasks.state; the summon link from the record's parentTaskId.
+   *
+   * The orphan TTL is only a fallback for a summon **no running parent vouches for**: a parent task that
+   * is still running is positive evidence the round (and its subagent) is still active, so it must not be
+   * reaped by the TTL. A subagent can legitimately run longer than the TTL — its real end signal
+   * (PostToolUse(Task/Agent) / SubagentStop) only arrives when it actually finishes. Measured 2026-10-15:
+   * a CodeBuddy `Task` subagent still working at the 5-minute mark was force-closed by the TTL (ghost
+   * dispersed, its task marked done) while its parent task was still running — the user saw a live
+   * subagent vanish and read as completed. The genuine end event closes it later, as designed.
    * @returns {number} how many were dispersed
    */
   function gcGhosts() {
@@ -1115,17 +1123,23 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     let n = 0;
     for (const rec of [...ghosts.values()]) {
       let drop = false;
+      // A running parent keeps the ghost alive regardless of the TTL (see the JSDoc above).
+      let parentRunning = false;
       if (rec.parentTaskId) {
         const task = repo.getTask.get(rec.parentTaskId);
         // Only disperse when the parent **ended after this summon started**: a parent that was already
         // done/cancelled before the summon (e.g. a superseded twin task, or a stale parentTaskId) must
         // not kill a ghost whose own end signal (PostToolUse / SubagentStop) hasn't arrived yet.
-        if (task && task.state && task.state !== 'running') {
-          const endAt = Number(task.ended_at) || 0;
-          if (!endAt || endAt >= Number(rec.at || 0)) drop = true;
+        if (task && task.state) {
+          if (task.state === 'running') {
+            parentRunning = true;
+          } else {
+            const endAt = Number(task.ended_at) || 0;
+            if (!endAt || endAt >= Number(rec.at || 0)) drop = true;
+          }
         }
       }
-      if (!drop && rec.at && t - rec.at > GHOST_ORPHAN_MS) drop = true;
+      if (!drop && !parentRunning && rec.at && t - rec.at > GHOST_ORPHAN_MS) drop = true;
       if (!drop) continue;
       closeGhost(rec);
       ghosts.delete(rec.key);
