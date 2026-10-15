@@ -1,20 +1,22 @@
 'use strict';
 
 /**
- * 6F Qoder（CLI 与插件合并单楼层）楼层模块 —— 把插件形态的**数据源**与**任务同步器**
- * （原 lingma.js / qoderPluginTasks.js）合并到这一个文件。
+ * 6F Qoder (CLI and plugin merged single floor) floor module —— merges the plugin form's **data
+ * source** and **task synchronizer** (formerly lingma.js / qoderPluginTasks.js) into this one file.
  *
- * 6F 只有一种上报身份 qoder（CLI 与插件分不出，共用同一 client），三路来源：
- *   · cli    —— 扫 ~/.qoder/projects transcript 产会话（与 4F Claude 同款）
- *   · lingma —— 轮询 Qoder CN 扩展自己的 SQLite（local.db），插件形态专用
- *   · hook   —— 实时相位兜底
+ * 6F has only one reporting identity, qoder (the CLI and the plugin cannot be told apart, they share
+ * the same client), and three sources:
+ *   · cli    —— scan ~/.qoder/projects transcripts to produce sessions (same as 4F Claude)
+ *   · lingma —— poll Qoder CN's own SQLite (local.db), plugin form only
+ *   · hook   —— real-time phase fallback
  *
- * 这一文件只负责其中"插件形态"那一路：lingma.js 读落盘、qoderPluginTasks.js 写台账。
- * 详细纪律（只读打开 / 短超时 / 缓存 / 相位是推断不是上报）见各函数上方注释。
+ * This file only owns the "plugin form" path: lingma.js reads the disk, qoderPluginTasks.js writes the
+ * ledger. Detailed discipline (read-only opening / short timeouts / caching / phase is inferred not
+ * reported) is documented above each function.
  *
- * 统一接口（见 floors.js 的 FLOOR_CONTRACT）：
- *   id / client   楼层身份
- *   listSessions  插件这一路的会话（= listLingmaSessions）
+ * Unified interface (see FLOOR_CONTRACT in floors.js):
+ *   id / client   floor identity
+ *   listSessions  this plugin path's sessions (= listLingmaSessions)
  *   readRounds    = readLingmaRounds
  *   readPhase     = readLingmaPhase
  *   readDone      = readLingmaDone
@@ -27,13 +29,15 @@ const { formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { resolveProjectName } = require('./project');
 const { isFile } = require('./roots');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent directories (project-level / user-level): private knowledge of this floor, kept here
+// rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 /**
- * 6F 的静态 subagent 定义目录。Qoder 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
- * 这里走通用推导（meta.homeDirs 为空 → 返回 []，不扫盘）。若将来 Qoder 在某目录放 agent 定义，
- * 在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * 6F's static subagent definition directories. Qoder has no such thing as "user-level / project-level
+ * agent definition files" yet, so this goes through the generic derivation (meta.homeDirs is empty →
+ * returns [], no disk scan). If Qoder ever puts agent definitions in some directory, just give the
+ * explicit directories here (same interface as CodeBuddy / Codex / Claude).
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
 function agentDirs(workspacePath) {
@@ -43,7 +47,7 @@ function agentDirs(workspacePath) {
 const HOME = os.homedir();
 
 /**
- * 6F Qoder 楼层元数据（原 products.js 的 6F 条目）。CLI 与插件合并楼层。
+ * 6F Qoder floor metadata (formerly the 6F entry in products.js). CLI and plugin merged floor.
  */
 const meta = {
   id: '6F',
@@ -66,26 +70,26 @@ const meta = {
   ],
   hookSource: true,
   dataKind: 'qoder',
-  // Qoder CLI 自己的安装目录（PATH 查不到时兜底；两个入口都试）
+  // Qoder CLI's own install directory (fallback when PATH lookup fails; both entry points are tried)
   cliBinDirs: [path.join(HOME, '.qoder', 'entry'), path.join(HOME, '.qoder-cn', 'entry')],
-  // CLI 会话文件（Claude Code 同款格式）落在 <dataRoot>/projects/<工程>/ 下，文件名即 session_id
+  // CLI session files (Claude Code's same format) land under <dataRoot>/projects/<project>/, named
+  // after session_id
   sessionSubtree: 'projects',
   sessionIdOfFile: (name) => String(name).replace(/\.jsonl$/i, ''),
 };
 
-/* ───────────── 原 lingma.js ───────────── */
+/* ───────────── formerly lingma.js ───────────── */
 
 
 
-
-/** 打开只读连接的超时：被扩展的写事务占住时立刻放弃（见文件头纪律 2） */
+/** Timeout for opening a read-only connection: give up immediately when the extension's write transaction holds it (discipline 2 in the file header) */
 const OPEN_TIMEOUT_MS = 3_000;
-/** 会话表缓存时长 */
+/** Session table cache duration */
 const TTL = 5_000;
-/** 一次最多带出多少条会话（倒序取最新的，剩下的由"最近"口径兜底） */
+/** How many sessions to bring out at most (newest first, descending; the rest falls back to the "recent" criterion) */
 const SESSION_LIMIT = 50;
 
-/** 扩展的库文件；WORKGREMLIN_LINGMA_DB 是自检用的（指到临时造的库上） */
+/** The extension's DB file; WORKGREMLIN_LINGMA_DB is for self-tests (pointing at a DB built in a temp directory) */
 function lingmaDbPath() {
   const explicit = String(process.env.WORKGREMLIN_LINGMA_DB || '').trim();
   const p = explicit
@@ -95,8 +99,9 @@ function lingmaDbPath() {
 }
 
 /**
- * 会话标题（6F Qoder / Lingma）：SQLite chat_session.session_title。
- * 原 sessionTitle.js 的 lingmaTitleOf 搬到这里 —— 调试 6F 标题不必碰中央文件。
+ * Session title (6F Qoder / Lingma): SQLite chat_session.session_title.
+ * lingmaTitleOf from the old sessionTitle.js moved here —— debugging 6F titles no longer touches a
+ * central file.
  * @param {string|null|undefined} sessionId
  * @returns {string}
  */
@@ -119,14 +124,14 @@ function sessionTitle(sessionId) {
 
 let Database = null;
 let DatabaseTried = false;
-/** 开一个只读连接；拿不到（没装 / 被锁 / 原生模块没编出来）一律回 null */
+/** Open a read-only connection; return null whenever it cannot be had (not installed / locked / native module not built) */
 function openDb() {
   const file = lingmaDbPath();
   if (!file) return null;
   if (!DatabaseTried) {
     DatabaseTried = true;
     try {
-      // better-sqlite3 是 server 的既有依赖（见 server/src/db/index.js），走工作区那份
+      // better-sqlite3 is an existing server dependency (see server/src/db/index.js), use the workspace copy
       Database = require('better-sqlite3');
     } catch {
       Database = null;
@@ -140,7 +145,7 @@ function openDb() {
   }
 }
 
-/** 在只读连接上跑查询；表不存在 / SQL 不对（扩展改版）都回 null，不冒泡 */
+/** Run a query on the read-only connection; a missing table / bad SQL (extension changed shape) both return null, never bubble */
 function query(fn) {
   const db = openDb();
   if (!db) return null;
@@ -152,7 +157,7 @@ function query(fn) {
     try {
       db.close();
     } catch {
-      /* 关不掉无所谓，结果已经拿到了 */
+      /* fine if it cannot be closed, the result is already in hand */
     }
   }
 }
@@ -160,11 +165,11 @@ function query(fn) {
 const cache = { at: 0, key: '', value: null };
 
 /**
- * 插件里聊过的会话（**只认对话会话**）。
+ * Sessions chatted in the plugin (**conversation sessions only**).
  *
- * 只看 `session_type = 'assistant'`：实测对话会话就是这个值、`mode = 'agent'`；
- * 行内补全（code completion）那些不是任务，不能进台账。没有工程路径的会话也跳过
- * （归不到任何工程上去）。
+ * Only `session_type = 'assistant'` counts: measured, conversation sessions carry exactly this value
+ * and `mode = 'agent'`; inline completions (code completion) are not tasks and must not enter the
+ * ledger. Sessions with no project path are skipped too (they belong to no project).
  *
  * @returns {Array<{id: string, title: string, project: string, projectPath: string,
  *                  lastEventAt: number, createdAt: number, mode: string, rounds: number}>}
@@ -207,7 +212,7 @@ function listLingmaSessions() {
   return value;
 }
 
-/** extra 是 JSON：`originalContent` 就是用户敲的那句话（明文）。认不出回空，不猜 */
+/** extra is JSON: `originalContent` is the sentence the user typed (plaintext). Return empty when unrecognized, do not guess */
 function promptOf(extra) {
   try {
     const j = JSON.parse(String(extra || '') || '{}');
@@ -218,10 +223,11 @@ function promptOf(extra) {
 }
 
 /**
- * 这一轮用的模型：extra.modelConfig.key（用户选的模型）。
+ * The model used this round: extra.modelConfig.key (the model the user picked).
  *
- * `'auto'` 不算 —— 那是"让插件自己挑"，不是一个模型名，如实留空比在卡片上写个
- * "auto" 有用地少。键缺失/认不出也回空（同 promptOf 的纪律：认不出就不猜）。
+ * `'auto'` does not count —— that means "let the plugin pick", not a model name; leaving it honestly
+ * empty is far more useful than printing "auto" on the card. A missing / unrecognized key returns empty
+ * too (same discipline as promptOf: unrecognized means no guessing).
  */
 function modelOf(extra) {
   try {
@@ -234,24 +240,29 @@ function modelOf(extra) {
 }
 
 /**
- * "这一轮还在跑"的判据：这是本会话最后一轮、且距今 LIVE_MS 内还有落盘。
+ * The criterion for "this round is still running": it is this session's last round and there are still
+ * on-disk writes within LIVE_MS.
  *
- * 为什么可以用新鲜度：插件一轮里每吐一条消息 / 每跑一次工具都会写 chat_message
- * （实测一轮 2 分钟里写了 8 条），所以"一分半没动静"基本就等于收工了。反过来定太短
- * （比如 30 秒）会把"模型正在长时间思考、还没有任何消息落盘"的那一轮判成已收工。
- * 定 90 秒：实测最长的静默间隔（一次回答的生成）在 30 秒以内，留三倍余量。
+ * Why freshness can be used: the plugin writes chat_message every time it emits a message or runs a
+ * tool within a round (measured: 8 writes in a 2-minute round), so "no movement for a minute and a
+ * half" basically equals done. Setting it too short (say 30s) conversely judges a round where "the
+ * model is thinking for a long time and nothing has landed on disk yet" as finished.
+ * 90 seconds: the longest measured silence (the generation of one answer) was under 30 seconds, so this
+ * leaves three times the margin.
  *
- * 台账（qoderPluginTasks.js）与会话表（sessionRegistry.js 的 lingma 那一支）共用这一把尺子 ——
- * 两边对"这一轮还在不在跑"必须给同一个答案，否则主控制台与任务记录会互相打架。
+ * The ledger (qoderPluginTasks.js) and the session table (the lingma branch of sessionRegistry.js) share
+ * this one yardstick —— they must give the same answer to "is this round still running", otherwise the
+ * main console and the task records fight each other.
  */
 const LIVE_MS = 90_000;
 
 /**
- * 这一条会话里**每一轮**插件的落盘（按 gmt_create 升序 = 真实先后）。
+ * What the plugin wrote to disk in **each round** of this session (ascending gmt_create = real order).
  *
- * ⚠️ 源里**没有**"这一轮跑完了没有"的真值：`finish_status` 实测常驻 0（跑完的也是 0），
- * 逐字 answer 又是密文。所以这里只给"最后一次更新"（updatedAt），"还在跑还是已收工"
- * 交给调用方按新鲜度判（见 qoderPluginTasks.js 的 LIVE_MS），并且必须如实标成推断。
+ * ⚠️ The source has **no** truth for "did this round finish": `finish_status` stays 0 (measured, even
+ * for finished rounds), and the verbatim `answer` is ciphertext. So only "the last update"
+ * (updatedAt) is given here; whether it is still running or finished is left to the caller to judge by
+ * freshness (see LIVE_MS in qoderPluginTasks.js), and it must be honestly flagged as inferred.
  *
  * @param {string} sessionId
  * @returns {Array<{index: number, requestId: string, prompt: string, summary: string,
@@ -288,12 +299,14 @@ function readLingmaRounds(sessionId) {
 }
 
 /**
- * 每一轮改过哪些文件：快照表把快照挂到轮次上（chat_record_id），文件表挂在快照上。
+ * Which files each round changed: the snapshot table hangs snapshots off rounds (chat_record_id), and
+ * the file table hangs off snapshots.
  *
- * 没有轮次归属的快照（`chat_record_id` 为空，实测是会话当前**正在写**的那一个）
- * 整个跳过 —— 挂错轮次比少记几个文件糟得多（这一条与 7F 的 session.diff 教训同一个道理）。
+ * Snapshots with no round attribution (`chat_record_id` empty, measured to be the one the session is
+ * **currently writing**) are skipped entirely —— attributing to the wrong round is far worse than
+ * missing a few files (same reasoning as 7F's session.diff lesson).
  *
- * @returns {Map<string, string[]>} request_id → 绝对路径清单（去重、保持先后）
+ * @returns {Map<string, string[]>} request_id → list of absolute paths (deduped, order preserved)
  */
 function filesByRecord(sessionId) {
   const out = new Map();
@@ -317,14 +330,15 @@ function filesByRecord(sessionId) {
   return out;
 }
 
-/* ------------------------------ 相位 / 完成标记（会话表用） ------------------------------ */
+/* ------------------------------ Phase / done marker (for the session table) ------------------------------ */
 
 /**
- * 最后一轮是不是"还在跑"（判据与理由见 LIVE_MS）。
+ * Is the last round "still running" (criterion and reasoning under LIVE_MS).
  *
- * 与 qoderPluginTasks.js 的 isLive 同一个式子：**本会话最后一轮** + 90 秒内还有落盘。
- * 会话自己的 gmt_modified（meta.lastEventAt）也一起取最大值 —— 扩展不一定把每一次
- * 消息落盘都反映到 chat_record.gmt_modified 上，会话行那个时间同样是它写的。
+ * The same expression as qoderPluginTasks.js's isLive: **this session's last round** + disk writes
+ * within 90 seconds. The session's own gmt_modified (meta.lastEventAt) is taken into the max as well
+ * —— the extension does not necessarily reflect every message write onto chat_record.gmt_modified, and
+ * that timestamp on the session row is also written by it.
  */
 function lastRoundLive(rounds, meta = {}, now = Date.now()) {
   const last = rounds[rounds.length - 1];
@@ -333,16 +347,17 @@ function lastRoundLive(rounds, meta = {}, now = Date.now()) {
 }
 
 /**
- * 这条插件会话**此刻的相位**（**推断**，不是它上报的）。
+ * This plugin session's phase **right now** (**inferred**, not reported by it).
  *
- * 源里没有"这一轮跑完了没有"的真值（finish_status 常驻 0、answer 是密文），只有
- * "最后一次落盘的时刻"，所以只能二选一：最后一轮还新鲜 → thinking，否则 idle。
- * 拿不到更细的东西（在调哪个工具、等不等授权），**一个字都不补** —— 宁可只给
- * 「思考中 / 待命中」，也不拿时间窗去编造"调用工具 xxx"。
+ * The source has no truth for "did this round finish" (finish_status stays 0, answer is ciphertext),
+ * only "when it last wrote to disk", so there is a binary choice: last round still fresh → thinking,
+ * otherwise idle. Nothing finer can be had (which tool it is calling, whether it waits for permission),
+ * and **not one word is filled in** —— better to give just "thinking / standby" than to fabricate
+ * "calling tool xxx" from a time window.
  *
  * @param {string} sessionId
- * @param {Array|null} rounds 调用方已经读过就传进来（免得同一轮里重复查库）
- * @param {{lastEventAt?: number}} meta 会话行自己的最后更新时刻
+ * @param {Array|null} rounds pass in what the caller already read (avoids querying the DB twice in one round)
+ * @param {{lastEventAt?: number}} meta the session row's own last-update time
  * @returns {{phase:string,action:string,target:string,tool:string,context:string[],prompt:string,model:string,inferred:boolean}|null}
  */
 function readLingmaPhase(sessionId, rounds = null, meta = {}, now = Date.now()) {
@@ -351,33 +366,36 @@ function readLingmaPhase(sessionId, rounds = null, meta = {}, now = Date.now()) 
   const last = rs[rs.length - 1];
   return {
     phase: lastRoundLive(rs, meta, now) ? 'thinking' : 'idle',
-    // 工具 / 目标：源里没有，不猜（见上面"一个字都不补"）
+    // Tool / target: not in the source, do not guess (see "not one word is filled in" above)
     action: '',
     target: '',
     tool: '',
     context: [],
-    // 「思考中」屏上那句用户原话（extra.originalContent 是明文）
+    // The user's own words on the "thinking" screen (extra.originalContent is plaintext)
     prompt: String(last.prompt || ''),
     model: String(last.model || ''),
     inferred: true,
   };
 }
 
-/** 完成标记的新鲜期：只有这么久之内收工的才算"刚发生"，否则一开页面就重播上一轮（与 kilo.js 同口径） */
+/** Freshness window of the done marker: only wrapping up within this long counts as "just happened", otherwise opening the page replays the previous round (same criterion as kilo.js) */
 const DONE_TTL_MS = 10 * 60_000;
 /**
- * 完成标记缺省值（没有就是"没有"，不臆造）。
- * doneCancelled 恒 false：扩展的落盘里**没有**"用户按了停止"这个信号（连逐字正文都是密文，
- * 更没有 interrupt 痕迹），所以不亮红色「任务取消」—— 与 9F Copilot 同口径。
+ * Default value of the done marker (none means none, no fabrication).
+ * doneCancelled is always false: the extension's on-disk data has **no** "the user pressed stop" signal
+ * (even the verbatim body is ciphertext, let alone an interrupt trace), so the red "task cancelled" is
+ * not lit —— same criterion as 9F Copilot.
  */
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false, doneSaid: '' };
 
 /**
- * 这条插件会话的"完成"标记 —— 对应 hook 那边 Stop 落下的 done。
+ * This plugin session's "done" marker —— the counterpart of the `done` that the hook path drops on Stop.
  *
- * 判据只有一条：**最后一轮已经收工**，凭据是扩展自己写的 `summary`（明文对话总结，
- * 一轮跑完它才写）。还在飞（90 秒内还有落盘）不算；没写总结的不算（那是"没跑完
- * 或扩展还没总结"，不是"完成了"）。收工时刻取那一轮最后一次落盘 —— 源里没有更准的。
+ * There is exactly one criterion: **the last round has finished**, evidenced by the `summary` the
+ * extension wrote itself (a plaintext conversation summary, written only once a round completes). Still
+ * in flight (disk writes within 90s) does not count; no summary written does not count either (that
+ * means "not finished or the extension has not summarized yet", not "done"). The finish time is that
+ * round's last disk write —— the source has nothing more precise.
  *
  * @param {string} sessionId
  * @param {Array|null} rounds
@@ -394,7 +412,8 @@ function readLingmaDone(sessionId, rounds = null, meta = {}, now = Date.now()) {
   const at = Number(last.updatedAt) || 0;
   if (!at || now - at > DONE_TTL_MS) return NO_DONE;
   const projectPath = String((meta && meta.projectPath) || '');
-  // 改动文件：扩展记的是绝对路径，转工程相对（与台账那一路口径一致）；工程外的留绝对路径
+  // Changed files: the extension records absolute paths, convert to project-relative (same criterion as
+  // the ledger path); ones outside the project keep their absolute path
   const files = (Array.isArray(last.files) ? last.files : []).slice(0, 6).map((abs) => {
     if (!projectPath) return String(abs || '');
     const rel = path.relative(projectPath, String(abs || ''));
@@ -406,12 +425,13 @@ function readLingmaDone(sessionId, rounds = null, meta = {}, now = Date.now()) {
     doneCount: Array.isArray(last.files) ? last.files.length : 0,
     doneFiles: files.map((name) => ({ name })),
     doneCancelled: false,
-    // 收尾自述：扩展自己写的对话总结（明文）—— 主控制台那句"说了什么"就是它
+    // Wrap-up self-report: the conversation summary the extension wrote itself (plaintext) —— that is
+    // the "what it said" line on the main console
     doneSaid: summary.replace(/\s+/g, ' ').trim().slice(0, 200),
   };
 }
 
-/** 库里到底有没有这些表 —— 给前端一句"这一路读不出会话"的说明（与 kilo.js 的 hasCoreTables 同款） */
+/** Are these tables actually in the DB —— gives the frontend a line explaining "this path reads no sessions" (same as kilo.js's hasCoreTables) */
 function hasCoreTables() {
   return (
     query((db) => {
@@ -426,7 +446,7 @@ function hasCoreTables() {
   );
 }
 
-/** 自检 / 调试用：把缓存清掉（换了库、或自检里刚写了新行） */
+/** For self-tests / debugging: clear the cache (the DB was swapped, or the self-test just wrote new rows) */
 function resetLingmaCache() {
   cache.at = 0;
   cache.key = '';
@@ -434,29 +454,29 @@ function resetLingmaCache() {
 }
 
 
-/* ───────────── 原 qoderPluginTasks.js ───────────── */
+/* ───────────── formerly qoderPluginTasks.js ───────────── */
 
-// LIVE_MS（"这一轮还在跑"的判据）与会话表那一支共用同一把尺子，定义在 lingma.js ——
-// 两边对"这一轮还在不在跑"必须给同一个答案，否则主控制台与任务记录会互相打架。
+// LIVE_MS (the criterion for "this round is still running") is shared with the session-table branch and
+// defined in lingma.js —— both must give the same answer to "is this round still running", otherwise the
+// main console and the task records fight each other.
 
 
 const SYNC_INTERVAL_MS = 5_000;
 
-/** task id 前缀：认人用（我们自己写的行都是这个前缀，hook 那一路是 `t_*`），也避免撞 id。
- *  身份恒为基名 —— 不再带 `-plugin`（旧写法 `qoder-plugin:`，那是把形态塞进了 id）。 */
+/** task id prefix: for identification (every row **we** write carries this prefix, the hook path uses `t_*`), and it avoids id collisions.
+ *  The identity is always the base name —— no more `-plugin` (the old `qoder-plugin:` packed the form into the id). */
 const TASK_ID_PREFIX = 'qoder:';
-/** 这一路的 client：与 6F 的 CLI 同一个（products.js：CLI 与插件合并单楼层） */
+/** This path's client: the same one as 6F's CLI (products.js: CLI and plugin merged into a single floor) */
 const CLIENT = 'qoder';
-/** 形态列：**存的是形态**（vscode），不是 source（plugin）—— 任务列表据此显示 "Qoder Plugin"。
- *  以前写的是 'plugin'，而 isPluginClient 只认 'vscode' → 标签退回 "Qoder"、source 也算成 cli。 */
+/** The form column: it stores the **form** (vscode), not the source (plugin) —— task lists show "Qoder Plugin" from it.
+ *  It used to be 'plugin', while isPluginClient only recognizes 'vscode' → the label fell back to "Qoder" and the source was computed as cli. */
 const FORM = 'vscode';
-/** 产出摘要的长度上限（与 hook.js 的 RESULT_MAX 同量级） */
+/** Cap on the length of the output summary (same order of magnitude as RESULT_MAX in hook.js) */
 const RESULT_MAX = 4_000;
-/** hook（CLI）那一路的心跳多久算"还活着"—— 活着就让位，不碰状态栏 */
+/** How fresh a heartbeat has to be for the hook (CLI) path to count as "alive" —— while it is alive it takes precedence and the status bar is left alone */
 const HOOK_FRESH_MS = 60_000;
 
-/** 工程名（工程 id）：与 CLI 那一路用同一条解析（hook 报的是 package.json 里的名字，
- *  实测 `qoder@workgremlin`），否则插件与 CLI 会各自建一个成员、同一层里两个工位 */
+/** Project name (project id): resolved the same way as the CLI path (the hook reports the name from package.json, measured as `qoder@workgremlin`), otherwise the plugin and the CLI each create their own member and this floor ends up with two workstations */
 function projectIdOf(s) {
   const projectPath = s.projectPath || '';
   if (!projectPath) return '';
@@ -464,8 +484,8 @@ function projectIdOf(s) {
 }
 
 /**
- * 写一条台账（tasks + task_runs 两行）。6F 插件这一路是**每一轮一条**。
- * @returns {string|null} 这条记录的 files_json（心跳里的 current_files 直接复用）
+ * Write one ledger entry (two rows, tasks + task_runs). 6F's plugin path is **one entry per round**.
+ * @returns {string|null} this record's files_json (reused directly by current_files in the heartbeat)
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result }) {
   const st = state || (endedAt ? 'done' : 'running');
@@ -499,8 +519,9 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     title,
     model: model || null,
     form: FORM,
-    // 产出摘要：扩展自己写的 summary（明文）。还在飞的那轮先不写（半截话不算产出），
-    // 收工时由下一次同步补上 —— 与 7F/8F 同款。
+    // Output summary: the summary the extension wrote itself (plaintext). A round still in flight is
+    // left empty for now (half a sentence is not output), and filled in at wrap-up by the next sync ——
+    // same as 7F/8F.
     result: result || null,
     fileCount: files ? files.length : 0,
     filesJson,
@@ -510,7 +531,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
-/** 台账 id 里的轮序号（`<前缀><会话id>:<序号>`）；不是这个形状就回 null */
+/** The round sequence number in the ledger id (`<prefix><session id>:<seq>`); null when it is not this shape */
 function turnIndexOf(taskId, prefix) {
   const id = String(taskId || '');
   if (!id.startsWith(`${prefix}:`)) return null;
@@ -518,7 +539,7 @@ function turnIndexOf(taskId, prefix) {
   return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
-/** hook（CLI）那一路此刻是不是正占着这个成员：状态栏挂在一条**不是我们写的**任务上、且心跳新鲜 */
+/** Is the hook (CLI) path currently occupying this member: the status bar hangs off a task **we did not write**, with a fresh heartbeat */
 function hookOwnsMember(repo, memberId, now) {
   try {
     const st = repo.getStatus.get(memberId);
@@ -532,7 +553,7 @@ function hookOwnsMember(repo, memberId, now) {
 
 /**
  * @param {{bus: any, repo: any, now?: () => number}} ctx
- * @returns {number} 本次同步写/改了几条任务
+ * @returns {number} how many tasks this sync wrote / changed
  */
 function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
   const sessions = listLingmaSessions();
@@ -548,7 +569,7 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
     runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
   }
 
-  /** 这一轮是不是"还在跑"（本会话最后一轮 + 90 秒内还有落盘；判据与理由见 LIVE_MS） */
+  /** Is this round "still running" (this session's last round + disk writes within 90s; criterion and reasoning under LIVE_MS) */
   const isLive = (s, round) => {
     const rounds = roundsOf.get(s.id) || [];
     if (!rounds.length || rounds[rounds.length - 1] !== round) return false;
@@ -556,9 +577,10 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
   };
 
   /**
-   * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
-   * 同工程多条插件会话时谁最后写谁赢，所以先选出"该由哪条会话代表这个工程上报"：
-   * 活跃里最新的；都不活跃就报最新那条（卡片挂住最后一条任务）。与 7F/8F 同款。
+   * One project writes **one** member status row (agent_status's primary key is member_id).
+   * With several plugin sessions in one project, whoever writes last wins, so first choose "which
+   * session should represent this project": the newest among the active ones; if none are active, report
+   * the newest one (the card hangs off the last task). Same as 7F/8F.
    */
   const activeByProject = new Map();
   const newestByProject = new Map();
@@ -580,20 +602,22 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
     if (!projectId) continue;
     const rounds = roundsOf.get(s.id) || [];
     const prefix = `${TASK_ID_PREFIX}${s.id}`;
-    // 工程里没有可写的轮次（只在插件里开了个会话、一句话没说）：不建工程也不建成员，
-    // 免得 6F 的工位上凭空多出一个空工位
+    // No writable rounds in this project (opened a session in the plugin and said not one word): create
+    // neither the project nor the member, so 6F's floor does not sprout an empty workstation
     if (!rounds.length) continue;
 
-    // 确保工程 & 成员存在（安静写入，不广播；工程名与 CLI 那一路同一条解析）
+    // Make sure the project & member exist (quiet write, no broadcast; the project name resolves the
+    // same way as the CLI path)
     bus.ensureProject(projectId, projectPath, null, 'report');
     const memberId = `${CLIENT}@${projectId}`;
     const existing = repo.getMember.get(memberId);
     repo.upsertMember.run({
       id: memberId,
       projectId,
-      // 名字只在**新建**成员时生效（repo.upsertMember 的 ON CONFLICT 不更新 name，见 db/index.js
-      // 那一句"名字由第一次落库的那一路定"）。CLI 那一路先来的话它叫 'qoder'（hook 上报没带
-      // 名字，bus 按 memberId 前缀落），这里不会把它改名。
+      // The name only takes effect when the member is **newly created** (repo.upsertMember's
+      // ON CONFLICT does not update name, see that line "the name is set by whichever path lands it
+      // first" in db/index.js). If the CLI path came first it is called 'qoder' (the hook report carried
+      // no name, the bus used the memberId prefix), and this does not rename it.
       name: 'Qoder',
       role: 'agent',
       sessionId: s.id || null,
@@ -610,7 +634,8 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
     let running = false;
     for (const t of rounds) {
       const id = `${prefix}:${t.index}`;
-      // 改动文件：扩展记的是绝对路径，统一转工程相对（与 7F/8F 同款）
+      // Changed files: the extension records absolute paths, uniformly converted to project-relative
+      // (same as 7F/8F)
       const files = (t.files || [])
         .map((abs) => {
           const p = String(abs || '');
@@ -630,11 +655,12 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
         model: t.model || '',
         title,
         startedAt: t.startedAt || now,
-        // 收工时间 = 这一轮最后一次落盘的时刻（源里没有更准的收工信号，见文件头）
+        // Finish time = when this round last wrote to disk (the source has no more precise finish signal, see the file header)
         endedAt: live ? null : t.updatedAt || t.startedAt || now,
         state: live ? 'running' : 'done',
         files,
-        // 还在飞的那轮不写产出（下一轮开始时它已经在源里定稿，那个时候再补）
+        // A round still in flight writes no output (it is already finalized in the source by the time
+        // the next round starts, then it gets filled in)
         result: live ? '' : String(t.summary || '').slice(0, RESULT_MAX),
       });
       hbId = id;
@@ -642,8 +668,9 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
-    // 收掉"源里已经没有"的轮次（插件里删了会话/清过记录）：那几行永远等不到自己的轮，
-    // 会一直挂在 'running' 被 query.js 判成「已取消」。判据是"这一轮还在不在源里"（byIndex）。
+    // Retire rounds "no longer in the source" (the session was deleted in the plugin / records were
+    // cleared): those rows never get their own round again and hang on 'running' forever, judged
+    // "cancelled" by query.js. The criterion is "is this round still in the source" (byIndex).
     const byIndex = new Set(rounds.map((t) => t.index));
     for (const r of runsOf.get(s.id)) {
       const idx = turnIndexOf(r.id, prefix);
@@ -651,8 +678,9 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
       repo.deleteTaskRun(r.id);
     }
 
-    // 状态栏：只在"这个工程该由本条会话上报"、且 CLI 那一路没占着的时候写。
-    // 在跑 = thinking（推断），收工 = idle；槽位指向正在跑的那条（没有就最新那条）。
+    // Status bar: written only when "this project should be reported by this session" and the CLI path
+    // is not holding it. Running = thinking (inferred), finished = idle; the slot points at the running
+    // one (or the newest when there is none).
     const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
     bus.setSessionStatus({
       project: projectId,
@@ -682,11 +710,12 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
 }
 
 /**
- * lingma 来源分支（6F 插件形态）：轮询 Qoder CN 扩展自己的 local.db。
- * 原 sessionRegistry.js 的 lingma 分支整体搬到这里，调试 6F 不再碰中央文件。
- * @param {object} p 楼层元数据
- * @param {object} src 来源规格（kind === 'lingma'）
- * @param {object} ctx 框架提供的共享工具（claim / upsert / now / workspacePath / TIMEOUT_MS …）
+ * The lingma source branch (6F plugin form): polls Qoder CN's own local.db.
+ * The whole lingma branch from the old sessionRegistry.js moved here, so debugging 6F no longer touches
+ * a central file.
+ * @param {object} p floor metadata
+ * @param {object} src source spec (kind === 'lingma')
+ * @param {object} ctx shared utilities provided by the framework (claim / upsert / now / workspacePath / TIMEOUT_MS …)
  */
 function lingmaHandler(p, src, ctx) {
   const { claim, upsert, now, workspacePath, TIMEOUT_MS } = ctx;
@@ -700,7 +729,7 @@ function lingmaHandler(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      // source = form→source（灵码是 VS Code 系扩展 → 插件形态）
+      // source = form→source (Lingma is a VS Code-family extension → plugin form)
       source: formToSource('vscode'),
       form: 'vscode',
       sourceKind: 'lingma',
@@ -727,8 +756,8 @@ const kindHandlers = { lingma: lingmaHandler };
 
 const { runHookEvent, sharedHookImpl, jsonlReplies, indexJsonReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
 
-/** Qoder 形态（cli / plugin）：transcript 首行 user 的 entrypoint。
- * 原在 hookCommon，现挪到本楼层（"楼层自己的接口"）；没覆盖的字段回退 sharedHookImpl。 */
+/** Qoder form (cli / plugin): the entrypoint of the first user line of the transcript.
+ * Moved from hookCommon to this floor ("the floor's own interface"); fields not overridden fall back to sharedHookImpl. */
 function qoderForm(transcriptPath) {
   for (const obj of headJsonLines(transcriptPath)) {
     const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
@@ -739,10 +768,10 @@ function qoderForm(transcriptPath) {
   return '';
 }
 
-/** Qoder 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+/** Qoder's on-disk differences: event gating and the common file/token/ghost logic all live in hookCommon.runHookEvent */
 const qoderImpl = {
   ...sharedHookImpl,
-  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
+  awaitingPermission: () => true, // any non-idle Notification counts as "awaiting permission"
   repliesOf: (tp) => (/index\.json$/i.test(tp) ? indexJsonReplies(tp) : jsonlReplies(tp)),
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
   formOf: (tp) => qoderForm(tp),
@@ -759,7 +788,7 @@ module.exports = {
   meta,
   kindHandlers,
   sessionTitle,
-  // 插件形态数据源（原 lingma.js）
+  // Plugin-form data source (formerly lingma.js)
   lingmaDbPath,
   listLingmaSessions,
   readLingmaRounds,
@@ -774,18 +803,18 @@ module.exports = {
   LIVE_MS,
   TTL,
   SESSION_LIMIT,
-  // 插件形态任务同步器（原 qoderPluginTasks.js）
+  // Plugin-form task synchronizer (formerly qoderPluginTasks.js)
   syncQoderPluginTasks,
   // Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
   pollMs: SYNC_INTERVAL_MS,
   TASK_ID_PREFIX,
-  // 统一接口别名
+  // Unified interface aliases
   listSessions: listLingmaSessions,
   readRounds: readLingmaRounds,
   readPhase: readLingmaPhase,
   readDone: readLingmaDone,
   syncTasks: syncQoderPluginTasks,
-  // 服务端 hook 事件处理（落盘解析归服务端）
+  // Server-side hook event handling (disk parsing belongs to the server)
   handleHookEvent,
   qoderForm,
 };

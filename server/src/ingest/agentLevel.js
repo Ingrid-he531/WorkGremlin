@@ -1,31 +1,37 @@
 'use strict';
 
 /**
- * 静态 subagent 元信息引擎（产品无关）。
+ * Static subagent metadata engine (product-agnostic).
  *
- * 渲染层是沙箱（读不了文件系统），所以"这个成员是用户级还是项目级 subagent"与"它是干什么的"
- * 都必须由服务端读出来、随成员卡下发。判定口径与 CodeBuddy / Codex / Claude 一致：
- *   · 项目级：<workspacePath>/<点目录>/agents/<name>.(md|toml)
- *   · 用户级：<家目录>/<点目录>/agents/<name>.(md|toml)
- * 都不在 -> 级别 null（普通成员 / 演示数据，不戴级别牌）、描述空串。
+ * The render layer is a sandbox (it cannot read the file system), so both "is this member a
+ * user-level or a project-level subagent" and "what does it do" have to be read by the server and
+ * shipped with the member card. The criteria match CodeBuddy / Codex / Claude:
+ *   · project level: <workspacePath>/<dot directory>/agents/<name>.(md|toml)
+ *   · user level:    <home directory>/<dot directory>/agents/<name>.(md|toml)
+ * In neither place -> level null (an ordinary member / demo data, wearing no level badge) and an
+ * empty description.
  *
- * 本文件**不认识任何具体产品**：它只按"调用方给的一组候选目录"去找 agent 定义文件、读描述、
- * 判级别。各楼层在哪放自己的静态 subagent，由各自的 `agentDirs(workspacePath)` 声明
- * （见 server/src/floor<X>.js），floors.js 负责把各楼层的目录聚合成统一接口 —— 这正是把
- * "找静态 subagent"从中央 agentLevel 下放到楼层的原则（与 refresh 的楼层化同思路：
- * 中央只做通用派发 + 聚合，产品知识全在楼层文件里）。
+ * This file **does not know any specific product**: it only walks "a set of candidate directories
+ * given by the caller" to find agent definition files, read their description, and determine the
+ * level. Where each floor keeps its own static subagents is declared by that floor's
+ * `agentDirs(workspacePath)` (see server/src/floor<X>.js), and floors.js aggregates the floors'
+ * directories into a unified interface —— exactly the principle of pushing "find the static
+ * subagent" from the central agentLevel down into the floors (same thinking as floor-ifying
+ * refresh: the center does generic dispatch + aggregation, product knowledge lives in floor files).
  *
- * 功能描述是 agent 定义文件里的**静态数据**（"这个子代理是干什么的"），不是运行状态 ——
- * 卡片上要显示的是它，而不是"项目子代理 · 空闲"这种状态话术。
+ * The functional description is **static data** from the agent definition file ("what this
+ * subagent is for"), not runtime state —— that is what belongs on the card, rather than state
+ * phrasing like "project subagent · idle".
  *
- * 结果按 "name + workspacePath" / 文件 mtime 缓存（agent 定义一个会话内很少变）。
+ * Results are cached by "name + workspacePath" / file mtime (agent definitions rarely change
+ * within a session).
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { isFile } = require('../roots');
 
-/** 文件名大小写兼容：文档要求小写连字符，但保险起见两种都试 */
+/** Filename case tolerance: the docs ask for lowercase hyphenated names, but try both just in case */
 function fileOf(dir, name) {
   const base = String(name || '').trim();
   if (!base) return '';
@@ -35,15 +41,15 @@ function fileOf(dir, name) {
     try {
       if (isFile(p)) return p;
     } catch {
-      /* 试下一个候选 */
+      /* try the next candidate */
     }
   }
   return '';
 }
 
 /**
- * 从一组候选目录里找这个 subagent 的 agent 定义文件本身（项目级优先，其次用户级）。
- * 顺序即优先级：命中第一个存在的就返回。
+ * Find this subagent's agent definition file among a set of candidate directories (project level
+ * first, then user level). Order is priority: return the first one that exists.
  * @param {string} name
  * @param {Array<{dir: string, level: 'project'|'user'}>} dirs
  * @returns {{ path: string, level: 'project'|'user' }|null}
@@ -56,7 +62,7 @@ function findAgentFile(name, dirs) {
   return null;
 }
 
-/** 列出目录下的 agent 文件名（去 .md/.toml 后缀），目录不可读返回空 */
+/** List the agent file names in a directory (stripping the .md/.toml suffix); empty when the directory cannot be read */
 function listAgentFiles(dir) {
   try {
     return fs
@@ -69,9 +75,11 @@ function listAgentFiles(dir) {
 }
 
 /**
- * 去掉 description 尾巴上那句**给模型看的**英文触发说明（"（use PROACTIVELY …）"）。
- * agent 定义的 description 是给 LLM 路由用的，末句常带这句；卡片上要的是"能干什么"，
- * 那句是噪声。只裁含 `use PROACTIVELY` 的结尾括号 —— 别的括号（哪怕是英文）一律不动。
+ * Drop the trailing English trigger note aimed at the model —— "(use PROACTIVELY …)".
+ * An agent definition's description exists to route the LLM and often ends with that sentence;
+ * what belongs on the card is "what it can do" —— the tail is noise. Only a closing parenthesis
+ * clause containing `use PROACTIVELY` is trimmed —— every other parenthesis (English ones too)
+ * is left alone.
  */
 function cleanDescription(raw) {
   let s = String(raw || '').replace(/\s+/g, ' ').trim();
@@ -80,7 +88,7 @@ function cleanDescription(raw) {
   return s;
 }
 
-/** 从一个 agent 定义文件里取 description（.md 读 YAML frontmatter，.toml 读 `description = …`） */
+/** Read the description from an agent definition file (.md reads YAML frontmatter, .toml reads `description = …`) */
 function readDescription(file) {
   let txt = '';
   try {
@@ -92,14 +100,14 @@ function readDescription(file) {
     const m = txt.match(/^\s*description\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/m);
     return cleanDescription(m ? m[1] ?? m[2] ?? '' : '');
   }
-  // .md：只看文件头那段 frontmatter（没有 --- 包裹就用整个文件头）
+  // .md: only look at the frontmatter block at the top (without --- wrappers, use the whole file head)
   const fm = txt.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---/);
   const head = fm ? fm[1] : txt;
   const lines = head.split(/\r?\n/);
   const at = lines.findIndex((l) => /^\s*description\s*:/.test(l));
   if (at < 0) return '';
   const inline = lines[at].replace(/^\s*description\s*:\s*/, '').trim();
-  // 块标量（description: > / |）：把后面缩进的几行并成一行
+  // Block scalar (description: > / |): fold the following indented lines into one
   if (/^[>|][+-]?$/.test(inline)) {
     const out = [];
     for (let i = at + 1; i < lines.length; i += 1) {
@@ -108,7 +116,7 @@ function readDescription(file) {
         if (out.length) out.push('');
         continue;
       }
-      if (!/^\s/.test(line)) break; // 回到顶格 = 描述结束
+      if (!/^\s/.test(line)) break; // back to column 0 = description ended
       out.push(line.trim());
     }
     return cleanDescription(out.join(' '));
@@ -119,10 +127,11 @@ function readDescription(file) {
 const levelCache = new Map(); // "name workspacePath" -> level
 
 /**
- * 按给定目录判级别（项目级 / 用户级）。取不到回 null。按 name+workspacePath 缓存。
+ * Determine the level (project / user) from the given directories. null when unavailable.
+ * Cached by name+workspacePath.
  * @param {string} name
  * @param {string} workspacePath
- * @param {Array<{dir:string, level:'project'|'user'}>} dirs 顺序即优先级
+ * @param {Array<{dir:string, level:'project'|'user'}>} dirs order is priority
  * @returns {'project'|'user'|null}
  */
 function detectLevelInDirs(name, workspacePath, dirs) {
@@ -135,14 +144,15 @@ function detectLevelInDirs(name, workspacePath, dirs) {
   return level;
 }
 
-const descCache = new Map(); // 文件路径 -> { mtimeMs, size, value }
+const descCache = new Map(); // file path -> { mtimeMs, size, value }
 
 /**
- * subagent 的功能描述（静态数据，来自它的 agent 定义文件）。取不到回空串 —— 渲染层据此隐藏那一栏，
- * 不拿"项目子代理 · 空闲"之类的状态话术顶替。
- * @param {string} name subagent 名（成员名，如 leo）
- * @param {string} workspacePath 当前工程路径（项目级 agent 在这里找）
- * @param {Array<{dir:string, level:'project'|'user'}>} dirs 候选目录（顺序即优先级）
+ * A subagent's functional description (static data, from its agent definition file). Empty string
+ * when unavailable —— the render layer hides that field accordingly, instead of substituting state
+ * phrasing like "project subagent · idle".
+ * @param {string} name subagent name (the member name, e.g. leo)
+ * @param {string} workspacePath current project path (project-level agents are looked for here)
+ * @param {Array<{dir:string, level:'project'|'user'}>} dirs candidate directories (order is priority)
  */
 function descriptionInDirs(name, workspacePath, dirs) {
   const hit = findAgentFile(name, dirs);
@@ -161,13 +171,13 @@ function descriptionInDirs(name, workspacePath, dirs) {
 }
 
 /**
- * 通用：由"agent 家目录列表"推出项目级 / 用户级 agent 目录。
- *   · 项目级 = <workspacePath>/<家目录基名>/agents
- *   · 用户级 = <家目录>/agents
- * 各楼层若落盘点不遵循这个规律（如 Codex 认 CODEX_HOME、Claude 认 CLAUDE_CONFIG_DIR，
- * 或 subagent 根本不是单文件而是内嵌在别处），在自己的 `agentDirs` 里显式给目录 /
- * 自定义逻辑即可，不必走这里。
- * @param {string[]} homeDirs agent 家目录（如 [path.join(HOME, '.codebuddy')]）
+ * Generic: derive project-level / user-level agent directories from an "agent home directory list".
+ *   · project level = <workspacePath>/<home directory basename>/agents
+ *   · user level    = <home directory>/agents
+ * Floors whose data does not follow this rule (e.g. Codex honoring CODEX_HOME, Claude honoring
+ * CLAUDE_CONFIG_DIR, or subagents that are not single files but embedded elsewhere) can simply
+ * give explicit directories / custom logic in their own `agentDirs` instead of going through here.
+ * @param {string[]} homeDirs agent home directories (e.g. [path.join(HOME, '.codebuddy')])
  * @param {string} workspacePath
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */

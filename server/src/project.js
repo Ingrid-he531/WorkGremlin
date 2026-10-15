@@ -1,16 +1,19 @@
 'use strict';
 
 /**
- * 工程（workspace）标识解析 + 工程管理（"打开工程"）。
+ * Project (workspace) identity resolution + project management ("open project").
  *
- * 本文件合并了原 src/project.js（工程名解析）与 src/workspace.js（打开/切换工程管理）。
+ * This file merges the former src/project.js (project name resolution) and src/workspace.js
+ * (open/switch project management).
  *
- * 工程名解析：顶部连接条要显示"现在盯的是哪个工程"，名字按优先级取：
- *   1. WORKGREMLIN_WORKSPACE / 入参指定的目录
- *   2. 否则 process.cwd()
- * 名字本身：<dir>/package.json 的 name（去 scope） > 目录名 > 空串。
+ * Project name resolution: the top connection bar shows "which project is being watched now",
+ * and the name is taken by priority:
+ *   1. WORKGREMLIN_WORKSPACE / the directory given as a parameter
+ *   2. otherwise process.cwd()
+ * The name itself: <dir>/package.json's name (scope stripped) > the directory name > empty string.
  *
- * 拿不到就是空串 —— UI 侧回落到原来的提示，绝不编造一个"看起来像"的项目名。
+ * When it cannot be resolved it is the empty string —— the UI falls back to the original hint
+ * and never fabricates a project name that merely "looks right".
  *
  * Project management: one workspace = one project: opening a project shows that project's members
  * in the office (including its subagent ghosts). The choice is persisted to
@@ -28,11 +31,11 @@ const { WS_EVENTS } = require('@workgremlin/shared');
 const { workspacesPath } = require('@workgremlin/shared/paths');
 const config = require('./config');
 
-/* ============================ 工程名解析 ============================ */
+/* ============================ Project name resolution ============================ */
 
 /**
  * @param {string} [dir]
- * @returns {string} package.json 的 name（已去掉 @scope/），读不到返回 ''
+ * @returns {string} the name from package.json (with @scope/ stripped); '' when it cannot be read
  */
 function readPackageName(dir) {
   try {
@@ -45,7 +48,7 @@ function readPackageName(dir) {
 }
 
 /**
- * 工程根目录。
+ * Project root directory.
  * @param {string} [input]
  */
 function resolveWorkspacePath(input) {
@@ -55,7 +58,7 @@ function resolveWorkspacePath(input) {
 }
 
 /**
- * 工程名。
+ * Project name.
  * @param {string} [workspacePath]
  */
 function resolveProjectName(workspacePath) {
@@ -66,7 +69,7 @@ function resolveProjectName(workspacePath) {
   return base && base !== path.sep ? base : '';
 }
 
-/* ============================ 工程管理 ============================ */
+/* ============================ Project management ============================ */
 
 function storePath() {
   return workspacesPath();
@@ -88,12 +91,12 @@ function writeStore(data) {
   try {
     fs.chmodSync(file, 0o600);
   } catch {
-    /* 非 POSIX 忽略 */
+    /* non-POSIX: ignore */
   }
   return file;
 }
 
-/** 工程目录名 -> project id */
+/** Project directory name -> project id */
 function slug(name) {
   return (
     String(name || '')
@@ -104,7 +107,7 @@ function slug(name) {
   );
 }
 
-/** 把 ~/xxx 展开成绝对路径 */
+/** Expand ~/xxx into an absolute path */
 function expand(p) {
   const raw = String(p || '').trim();
   if (!raw) return '';
@@ -130,7 +133,7 @@ function createWorkspaceManager(opts) {
     demo: false,
   };
   let recent = [];
-  /** 工程切换后的回调（index.js 里用来重启 subagent 清单监听） */
+  /** Callback after a project switch (index.js uses it to restart subagent manifest watching) */
   let onSwitch = null;
 
   function persist() {
@@ -141,7 +144,7 @@ function createWorkspaceManager(opts) {
     recent = [entry, ...recent.filter((r) => r.path !== entry.path)].slice(0, 8);
   }
 
-  /** 切换生效：更新 bus 上下文 -> 落盘 -> 通知 -> 广播新快照 */
+  /** Apply the switch: update bus context -> persist -> notify -> broadcast the new snapshot */
   function apply() {
     bus.setContext({ projectName: current.projectName, project: current.project, workspacePath: current.workspacePath });
     persist();
@@ -150,7 +153,7 @@ function createWorkspaceManager(opts) {
     return { ...current };
   }
 
-  /** 打开一个工程目录；目录不存在或不是目录就抛错（不猜、不新建） */
+  /** Open a project directory; throws if the directory does not exist or is not a directory (no guessing, no creating) */
   function open(rawPath) {
     const abs = expand(rawPath);
     if (!abs) throw new Error('empty path');
@@ -163,7 +166,8 @@ function createWorkspaceManager(opts) {
     if (!st || !st.isDirectory()) throw new Error(`不是目录：${abs}`);
 
     const projectName = resolveProjectName(abs);
-    // 同一个目录复用同一个工程；不同目录同名就加后缀，别互相顶掉
+    // The same directory reuses the same project; same-named directories in different places get
+    // a suffix instead of overwriting each other
     let row = repo.getProjectByWorkspace.get(abs);
     if (!row) {
       let id = slug(projectName);
@@ -180,7 +184,7 @@ function createWorkspaceManager(opts) {
     return apply();
   }
 
-  /** 切到演示工程（不删库里的真数据，只是把显示切到演示工程） */
+  /** Switch to the demo project (does not delete real data in the DB, it only switches the view to the demo project) */
   function openDemo() {
     bus.ensureProject(demoProject, '', null, 'report');
     current = { workspacePath: '', projectName: config.DEMO_PROJECT_NAME, project: demoProject, demo: true };
@@ -188,31 +192,35 @@ function createWorkspaceManager(opts) {
   }
 
   /**
-   * 兜底：把"启动时解析出来的工程"（cwd / --workspace）真正 open 一次。
+   * Fallback: actually open() "the project resolved at startup" (cwd / --workspace) once.
    *
-   * 关键：必须走 open() —— 它会把 current.project 落成这个工程对应的 project，并 setContext 交给 bus。
-   * 老代码在兜底分支直接 `return {...current}`，project 仍是 null；而 buildSnapshot 在拿不到
-   * project 时会回落到 projects[0]（可能正是演示/被污染的 project），办公室就挂着错的成员，
-   * 跟不上当前会话。目录不存在 / 没路径就原样返回（此时确实没有"当前工程"可言）。
+   * Key point: it must go through open() —— that settles current.project into the project this
+   * directory maps to and hands it to bus via setContext. The old code did `return {...current}`
+   * right in the fallback branch, leaving project null; and buildSnapshot falls back to
+   * projects[0] when it has no project (which may be exactly the demo / a polluted project), so
+   * the office shows the wrong members and does not track the current session. If the directory
+   * is missing or there is no path, return as-is (there really is no "current project" then).
    */
   function openInitial() {
     if (initial.workspacePath) {
       try {
         return open(initial.workspacePath);
       } catch {
-        /* 目录没了 / 不是目录：保持现状 */
+        /* directory gone / not a directory: keep the current state */
       }
     }
     return { ...current };
   }
 
   /**
-   * 启动时恢复上次打开的工程；目录已经没了就落到启动时解析出来的工程（cwd / --workspace）。
+   * Restore the last opened project at startup; if that directory is gone, fall back to the
+   * project resolved at startup (cwd / --workspace).
    *
-   * 关于演示工程：**这里只认落盘的历史**，没有"启动就进演示"这回事了 ——
-   * 演示模式改由界面上的按钮切换（见 server/src/index.js 的 syncDemo）。
-   * 上次是用户自己点的「演示模式」→ 这次启动照旧回到演示工程（和回到任何别的工程一样）；
-   * 从没打开过工程 → 落到启动时解析出来的工程，而不是硬塞演示数据。
+   * About the demo project: **only the persisted history counts here**, there is no longer such a
+   * thing as "start into demo" —— demo mode is toggled from the UI instead (see syncDemo in
+   * server/src/index.js). If the user last clicked "demo mode" himself, this startup returns to
+   * the demo project as usual (just like returning to any other project); if no project was ever
+   * opened, fall back to the project resolved at startup rather than forcing demo data in.
    */
   function restore() {
     const store = readStore();
@@ -224,7 +232,7 @@ function createWorkspaceManager(opts) {
       const savedPath = saved.workspacePath || saved.path;
       if (savedPath) return open(savedPath);
     } catch {
-      /* 目录没了 / 换了机器：回落默认 */
+      /* directory gone / machine changed: fall back to the default */
     }
     return openInitial();
   }

@@ -1,34 +1,44 @@
 'use strict';
 
 /**
- * sessionRegistry.js —— 全局活跃会话表。
+ * sessionRegistry.js —— the global active session table.
  *
- * 一张表管所有智能体（楼层）在所有工程里开着的会话，跟当前打开哪个工程无关。
- * 表里每条记录 = 一个会话，按**楼层**（受监控产品）分组，超时就剔除：
+ * One table manages the sessions every agent (floor) has open in every project, regardless of which
+ * project is currently open. Each record = one session, grouped by **floor** (monitored product), and
+ * removed on timeout:
  *
- *   1F CodeBuddy —— **合并楼层**：CLI 与 Plugin 是同一产品的两种形态，合成一层。
- *                        插件那路是结构化落盘（genie-history / todos / message-queue /
- *                        file-changes），拿得到运行态、待办清单、改动文件（见 sessions.js）；
- *                        CLI 那路是 ~/.codebuddy 的会话 jsonl + reporter 状态文件。
- *                        两路同时有会话 = 这一层里的两条会话（按 session_id 区分），不是两层。
- *   2F WorkBuddy、
- *   3F Codex CLI、
- *   4F Claude Code CLI —— 落盘目录里的 *.jsonl 会话文件，只有文件时间可靠；
- *                        工程名从文件**头部若干行**里找 cwd（见 cwdOfHead）；
- *                        那儿还没有（第一条对话没落盘）→ 退回 sessions/<pid>.json 里登记的 cwd
- *                        （见 liveSessionCwds）；两处都读不到才留空（不猜）。
- *                        注意不是"首行"：Claude 的首行是 mode / queue-operation 这类
- *                        元记录，压根没有 cwd，cwd 从第 3 行的 user 记录才有（见 cwdOfHead）
- *                        （Codex 的 cwd 藏在 payload.cwd 里，同样由 cwdOfHead 覆盖）
- *   7F Kilo Code —— **轮询路线**：Kilo 没有 hook、也没有会话 jsonl，会话/相位/完成标记
- *                  全部由 server/src/kilo.js 读它自己的 event-sourced SQLite（kilo.db）推导。
- *                  相位带 inferred:true 却又有真相位来源（推导自 event 流）。
+ *   1F CodeBuddy —— **merged floor**: the CLI and Plugin are two forms of the same product, merged into
+ *                        one floor. The plugin path is structured on-disk data (genie-history / todos /
+ *                        message-queue / file-changes), from which runtime state, todo lists and changed
+ *                        files can be had (see sessions.js);
+ *                        the CLI path is ~/.codebuddy's session jsonl + reporter state file.
+ *                        Sessions on both paths at once = two sessions in this floor (distinguished by
+ *                        session_id), not two floors.
+ *   2F WorkBuddy,
+ *   3F Codex CLI,
+ *   4F Claude Code CLI —— *.jsonl session files in the on-disk directory, only file times are reliable;
+ *                        the project name comes from finding cwd in the file's **first few lines** (see
+ *                        cwdOfHead);
+ *                        when it is not there yet (the first conversation has not landed on disk) it
+ *                        falls back to the cwd registered in sessions/<pid>.json (see liveSessionCwds);
+ *                        only when neither can be read does it stay empty (no guessing).
+ *                        Note it is not "the first line": Claude's first line is a meta record like mode
+ *                        / queue-operation with no cwd at all, and cwd only appears from line 3's user
+ *                        record on (see cwdOfHead)
+ *                        (Codex's cwd hides in payload.cwd, likewise covered by cwdOfHead)
+ *   7F Kilo Code —— **polling route**: Kilo has no hook and no session jsonl; sessions / phases / done
+ *                   markers are all derived by server/src/kilo.js reading its own event-sourced SQLite
+ *                   (kilo.db).
+ *                   The phase carries inferred:true yet has a true phase source (derived from the event
+ *                   stream).
  *
- * 超时：一个会话 60 分钟没有事件（最后更新时间没往前走）就从表里移除。
- * 它被移除只是"不再活跃"，下次它又有动静会被当成新会话重新登记。
+ * Timeout: a session with no events for 60 minutes (its last update time has not moved forward) is
+ * removed from the table.
+ * Being removed only means "no longer active"; when it stirs again it is registered anew as a new
+ * session.
  *
- * 纪律（docs/requirements.md §P0-6「绝不编造」）：会话里没有职务 / 进度 / 耗时，
- * 一行都不补；阶段一律是推断值，带 inferred: true。
+ * Discipline (docs/requirements.md §P0-6 "never fabricate"): a session that carries no role / progress
+ * / duration gets not one line filled in; phases are always inferred values, carrying inferred: true.
  */
 
 const fs = require('node:fs');
@@ -39,13 +49,15 @@ const { detectProducts } = require('./floors');
 const { floorOf, floors, floorByAgent } = require('./floors');
 const { formToSource, agentBase } = require('@workgremlin/shared');
 
-// 进程启动时刻：doneAt 等"结束态"只在"本进程启动之后"发生的才认，重启后旧的结束态不再复活。
+// Process start moment: "end states" like doneAt only count when they happened **after this process
+// started**, so old end states do not resurrect after a restart.
 const SINCE_BOOT = Date.now();
 
 /**
- * agent 名 → 楼层 meta（只建一次）。各楼层的"会话文件落在哪棵子树 / 文件名怎么解出 sessionId"
- * 已经下放到 meta.sessionSubtree / meta.sessionIdOfFile，本文件只按 meta 做通用派发，不再写
- * 任何具体产品的解析规则（见各 <product>.js）。
+ * agent name → floor meta (built once). Each floor's "which subtree session files land in / how to get
+ * the sessionId out of a file name" has been pushed down into meta.sessionSubtree / meta.sessionIdOfFile;
+ * this file only does generic dispatch by meta and writes no product-specific parsing rules anymore (see
+ * each <product>.js).
  */
 const metaByAgent = {};
 for (const id of Object.keys(floors)) {
@@ -54,26 +66,27 @@ for (const id of Object.keys(floors)) {
 }
 const { resolveProjectName } = require('./project');
 
-/** 超过这么久没有事件 → 从表里移除 */
+/** No events for longer than this → removed from the table */
 const TIMEOUT_MS = 60 * 60_000;
-/** 扫盘缓存（扫一次要读十几个小文件 + 走一遍目录树） */
+/** Disk-scan cache (one scan reads a dozen small files + walks the directory tree) */
 const TTL = 5_000;
 
-/** @type {Map<string, any>} key（`<楼层>:<会话id>`）-> 会话 */
+/** @type {Map<string, any>} key (`<floor>:<session id>`) -> session */
 const table = new Map();
 
 let lastScanAt = 0;
 let lastSnapshot = null;
-/** 本次扫盘里 (工程|客户端) -> readReporterDones 的结果；每次 refresh 重建。
- *  一个 CLI 楼层一次能扫出上百个历史会话文件，逐个去扫 hooks 目录太浪费，所以按 client 读一次盘。 */
+/** This scan's (project|client) -> readReporterDones result; rebuilt on every refresh.
+ *  A CLI floor can scan out hundreds of historical session files, and walking the hooks directory for
+ *  each one is too wasteful, so the disk is read once per client. */
 let doneScans = new Map();
 
 /**
- * 台账写入端（bus + repo），由 index.js 装配时注入 —— 见 flushSynthesizedCancels。
- * 为什么必须注入：本模块是被路由层 require 的，而 bus 实例是 index.js 里
- * createIngestBus() 造出来的，模块里 require('./ingest/bus') 只能拿到
- * `{ createIngestBus, projectIdOf, memberIdOf }` 这个**工厂**，`bus.endTask` 压根不存在。
- * 测试（只调 snapshot 的那几个）不注入 → 这一步照旧什么都不做。
+ * Ledger write side (bus + repo), injected by index.js at assembly time —— see flushSynthesizedCancels.
+ * Why it must be injected: this module is required by the route layer, while the bus instance is created
+ * by createIngestBus() inside index.js; require('./ingest/bus') in a module only gets that **factory**
+ * `{ createIngestBus, projectIdOf, memberIdOf }`, and `bus.endTask` does not exist at all.
+ * Tests (the ones that only call snapshot) inject nothing → this step does nothing, as before.
  * @type {{bus: any, repo: any}|null}
  */
 let backend = null;
@@ -91,7 +104,7 @@ function mtime(p) {
   }
 }
 
-/** 文件字节数；读不到当 0（0 = 空文件，不算会话，见 scanCliSessions） */
+/** File size in bytes; unreadable counts as 0 (0 = empty file, not a session, see scanCliSessions) */
 function sizeOf(p) {
   try {
     return fs.statSync(p).size || 0;
@@ -101,8 +114,10 @@ function sizeOf(p) {
 }
 
 /**
- * 一行里取工程路径。CodeBuddy 家族 cwd 在顶层；Codex 藏在 payload 里。
- * 这一行 parse 不了（被截断 / 根本不是 JSON）→ 回空，由调用方决定要不要退正则。
+ * Get the project path out of one line. The CodeBuddy family has cwd at the top level; Codex hides it in
+ * payload.
+ * If this line cannot be parsed (truncated / not JSON at all) → empty, and the caller decides whether to
+ * fall back to a regex.
  */
 function cwdOfLine(line) {
   if (!line) return '';
@@ -112,28 +127,32 @@ function cwdOfLine(line) {
   } catch {
     return '';
   }
-  // CodeBuddy 家族：cwd 在顶层
+  // CodeBuddy family: cwd at the top level
   if (j && typeof j.cwd === 'string') return j.cwd;
-  // Codex：{"type":"session_meta","payload":{"cwd":...}} —— cwd 藏在 payload 里
+  // Codex: {"type":"session_meta","payload":{"cwd":...}} —— cwd hidden in payload
   if (j && j.payload && typeof j.payload.cwd === 'string') return j.payload.cwd;
   return '';
 }
 
 /**
- * 从会话文件**头部若干行**里取工程路径；读不到就留空，不猜。
+ * Get the project path from the session file's **first few lines**; leave it empty when unreadable, do
+ * not guess.
  *
- * 为什么不能只看第一行：**Claude Code 的首行不是对话内容**。实测它的 transcript 开头是
- * `{"type":"queue-operation",...}`（新版）或 `{"type":"mode",...}`（旧版），两样都不带 `cwd`；
- * `cwd` 从第 3 行的 `user` / `attachment` 记录才开始有（顶层字段）。
- * 老实现只读第一行，于是 4F **每一条**会话的工程都是空 —— 一个空值同时引出三个症状：
- * 下拉显示「未知工程」、`mine` 永远 false、连实时相位都叠不上去（渲染层要 `projectPath`
- * 非空才肯用快轮询，见 IsoOfficeView 的 canUseFast）→ 主控制台一直挂在「未上报」。
+ * Why looking at the first line only is not enough: **Claude Code's first line is not conversation
+ * content**. Measured, its transcript starts with `{"type":"queue-operation",...}` (new versions) or
+ * `{"type":"mode",...}` (old versions), neither of which carries `cwd`; `cwd` only appears from line 3's
+ * `user` / `attachment` record on (a top-level field).
+ * The old implementation read only the first line, so **every** 4F session's project was empty —— one
+ * empty value causing three symptoms at once: the dropdown shows "unknown project", `mine` is always
+ * false, and even the live phase cannot be overlaid (the render layer requires a non-empty `projectPath`
+ * before using fast polling, see canUseFast in IsoOfficeView) → the main console hangs on "unreported".
  *
- * 边读边试、命中就收工：这个函数会被每个会话文件、每几秒调一次，不许为了一行 cwd 读完整棵树。
- * 上限给得宽（512KB / 60 行）：Codex 的 session_meta 那一行里塞了整份 base_instructions，
- * 8KB 会把它截断成残缺 JSON，cwd 就读不出来了。
- * @param {string} p 会话 jsonl 路径
- * @returns {string} 工程绝对路径；读不到回空串
+ * Read and try as you go, stop on a hit: this function is called once per session file every few seconds,
+ * and it must not walk a whole tree just for one line of cwd.
+ * The cap is generous (512KB / 60 lines): Codex's session_meta line carries the entire base_instructions,
+ * and 8KB would truncate it into broken JSON from which cwd cannot be read.
+ * @param {string} p session jsonl path
+ * @returns {string} absolute project path; empty string when unreadable
  */
 function cwdOfHead(p, { cap = 524_288, maxLines = 60 } = {}) {
   let fd;
@@ -144,7 +163,8 @@ function cwdOfHead(p, { cap = 524_288, maxLines = 60 } = {}) {
   }
   try {
     const CHUNK = 8192;
-    // buf 里只留"还没凑成完整一行"的残段（完整的行当场切走并试掉），所以 cap 实际限的是单行长度
+    // buf only keeps the fragment that has not yet formed a complete line (complete lines are cut away and
+    // tried on the spot), so cap really limits a single line's length
     let buf = Buffer.alloc(0);
     let lines = 0;
     while (buf.length < cap && lines < maxLines) {
@@ -162,9 +182,11 @@ function cwdOfHead(p, { cap = 524_288, maxLines = 60 } = {}) {
       }
       if (n < CHUNK) break;
     }
-    // 走到这儿 buf 没有换行收尾：要么文件就到这里（末尾无换行），要么这条超长行撞上了 cap。
-    // 两种情况都先整行 parse，不成再退到正则捞**第一个** cwd —— 它仍是这条会话自己的
-    // （后面的事件压根还没读到），同老实现的口径。
+    // Getting here means buf has no newline terminator: either the file simply ends here (no trailing
+    // newline), or this very long line hit cap.
+    // Both cases first parse the whole line, and only fall back to a regex fishing out the **first** cwd
+    // —— which is still this session's own (later events have not been read at all), same criterion as the
+    // old implementation.
     if (lines >= maxLines || !buf.length) return '';
     const tail = buf.toString('utf8');
     const direct = cwdOfLine(tail);
@@ -183,28 +205,35 @@ function cwdOfHead(p, { cap = 524_288, maxLines = 60 } = {}) {
     try {
       fs.closeSync(fd);
     } catch {
-      /* 关闭失败无所谓 */
+      /* failing to close does not matter */
     }
   }
 }
 
 /**
- * 运行中的 CLI 进程自己写的**会话状态文件**：`<产品 home>/sessions/<pid>.json`，一个进程一份。
- * 实测形状（CodeBuddy CLI 2.162.0，本机 2026-10-09）：
+ * The **session state file** a running CLI process writes itself: `<product home>/sessions/<pid>.json`,
+ * one per process. Measured shape (CodeBuddy CLI 2.162.0, this machine, 2026-10-09):
  *   { pid, sessionId, cwd, startedAt, kind:'interactive', url, endpoint, mode, updatedAt }
- * Claude Code 2.1.283 的同名文件同样带 cwd（sessions.js 的 claudeSessionStatus 早就在读它）。
+ * Claude Code 2.1.283's file of the same name carries cwd too (claudeSessionStatus in sessions.js has
+ * been reading it for a while).
  *
- * 它比 transcript **更早**：进程一起来就写，那时 projects/<工程>/<会话>.jsonl 里一条对话都
- * 还没有 —— 正是 cwdOfHead 回空、下拉显示「未知工程」的那段窗口（用户 2026-10-09 问的就是它）。
+ * It exists **earlier** than the transcript: it is written as soon as the process is up, when
+ * projects/<project>/<session>.jsonl does not yet hold a single conversation —— exactly the window where
+ * cwdOfHead returns empty and the dropdown shows "unknown project" (which the user asked about on
+ * 2026-10-09).
  *
- * 为什么不用目录名兜底：projects 下那层目录名确实编码了工程路径（`<cwd 去掉分隔符>`），
- * 但分隔符已经丢了，`home-yinghui-work-WorkGremlin` 反解回 `/home/yinghui/work/WorkGremlin`
- * 只能靠猜（"work-gremlin" 到底是一个目录还是两个？）。projectPath 一路喂给 `mine` 判定和
- * 主控制台的快轮询，猜错的代价比显示一串「未知工程」大得多 —— 所以宁可不兜底。
+ * Why the directory name is not used as a fallback: that directory layer under projects really does encode
+ * the project path (`<cwd with separators removed>`), but the separators are gone, and turning
+ * `home-yinghui-work-WorkGremlin` back into `/home/yinghui/work/WorkGremlin` can only be guessed (is
+ * "work-gremlin" one directory or two?). projectPath feeds both the `mine` judgment and the main
+ * console's fast polling, so the cost of guessing wrong is much larger than showing "unknown project" ——
+ * hence no fallback.
  *
- * 只按 sessionId **精确**匹配；目录不存在 / 解析失败 / 缺 cwd 一律当"没有"，不猜。
- * 一个会话文件会问一次，上百个会话文件就是上百次，所以目录列举与内容都带 2s 缓存。
- * @param {string} dataPath 产品落盘根（如 ~/.codebuddy）
+ * Matching is **exact** by sessionId only; a missing directory / parse failure / absent cwd all count as
+ * "none", no guessing.
+ * It is asked once per session file, and with hundreds of session files that is hundreds of times, so both
+ * directory listing and contents are cached for 2s.
+ * @param {string} dataPath product on-disk root (e.g. ~/.codebuddy)
  * @returns {Map<string, string>} sessionId -> cwd
  */
 const _liveState = { dir: '', at: 0, cwds: new Map() };
@@ -229,12 +258,13 @@ function liveSessionCwds(dataPath) {
     try {
       j = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
     } catch {
-      continue; // 进程可能正在写 / 中途被杀→残缺。残缺就算没读到，不猜
+      continue; // the process may be mid-write / killed halfway → fragmentary. A fragment counts as not read, do not guess
     }
     const sid = j && typeof j.sessionId === 'string' ? j.sessionId.trim() : '';
     const cwd = j && typeof j.cwd === 'string' ? j.cwd.trim() : '';
     if (!sid || !cwd) continue;
-    // 同一个会话可能留着好几份（老 pid 没清干净）→ 取最新的那份，与 claudeSessionStatus 同口径
+    // The same session may keep several copies (old pids not cleaned up) → take the newest, same
+    // criterion as claudeSessionStatus
     const prev = best.get(sid);
     const at = Number(j.updatedAt || 0);
     if (prev && Number(prev.updatedAt || 0) >= at) continue;
@@ -244,7 +274,7 @@ function liveSessionCwds(dataPath) {
   return _liveState.cwds;
 }
 
-/** 人类可读的相对时间（只用于"会话文件多久前动过"这类说明文案） */
+/** Human-readable relative time (only for copy like "how long ago the session file was touched") */
 function formatAge(ms) {
   const n = Number(ms) || 0;
   if (n < 60_000) return '刚刚有更新';
@@ -261,28 +291,32 @@ function isDir(p) {
 }
 
 /**
- * 从会话文件名里取会话 id（拿不到回空串 —— 不猜）。
+ * Get the session id out of the session file name (empty when it cannot be had —— no guessing).
  *
- *   - Claude Code：transcript 就叫 `<session_id>.jsonl`，去扩展名即是
- *     （hook payload 的 session_id，实测三处 100% 一致）。
- *   - Codex：`rollout-<YYYY-MM-DDTHH-MM-SS>-<session_id>.jsonl` —— id 在**时间戳后面那一段**。
- *     早先这里写的是"形状不同，不猜，留空"，其实是**取法不同**：直接去扩展名拿到的是
- *     `rollout-…-<id>` 整串。本机实测 3/3，尾段 uuid 与 hooks 状态文件里的 session_id
- *     一字不差（rollout-2026-09-26T11-15-56-01a0dbb6-…  ==  codex__…_01a0dbb6-….json）。
- *     取到 id 的收益是让 3F 的"完成"从"该工程最新"变成按会话精确（见 doneFieldsOf），
- *     渲染层的快轮询也会开始带 ?session=（相位同样受益）。
- *     失败是安全的：形状对不上就回空串 → 退回老行为，不会张冠李戴。
- *   - 其余产品（WorkBuddy CLI）：文件名不含会话 id，留空。
- * @param {string} name 文件名（含扩展名）
- * @param {string} kind 产品基名（products 的 agent：claude / codex / codebuddy …）
- * @returns {string} 会话 id；取不到回空串
+ *   - Claude Code: the transcript is called `<session_id>.jsonl`, stripping the extension gives it
+ *     (the hook payload's session_id; measured 100% consistent across three places).
+ *   - Codex: `rollout-<YYYY-MM-DDTHH-MM-SS>-<session_id>.jsonl` —— the id is **the segment after the
+ *     timestamp**. What used to be written here was "different shape, do not guess, leave empty", but it
+ *     is really **a different way of taking it**: stripping the extension yields the whole
+ *     `rollout-…-<id>` string. Measured 3/3 on this machine, the trailing uuid matches the session_id in
+ *     the hooks state file character for character (rollout-2026-09-26T11-15-56-01a0dbb6-…  ==  codex__…
+ *     _01a0dbb6-….json).
+ *     The gain from getting the id is making 3F's "done" go from "newest in this project" to per-session
+ *     exact (see doneFieldsOf), and the render layer's fast polling starts carrying ?session= too (the
+ *     phase benefits likewise).
+ *     Failure is safe: a shape mismatch returns empty → falls back to the old behavior, no mix-ups.
+ *   - Other products (WorkBuddy CLI): the file name carries no session id, leave empty.
+ * @param {string} name file name (with extension)
+ * @param {string} kind product base name (products' agent: claude / codex / codebuddy …)
+ * @returns {string} session id; empty string when it cannot be had
  */
 /**
- * 文件名 → 会话 id。规则由各楼层 meta.sessionIdOfFile 自带（见各 <product>.js），
- * 本文件只按 agent 查 meta 做通用派发；查不到 / 没有该楼层 → 回空串（退老行为，绝不张冠李戴）。
- * @param {string} name 文件名（含扩展名）
- * @param {string} kind 产品基名（楼层 meta.agent：claude / codex / codebuddy …）
- * @returns {string} 会话 id；取不到回空串
+ * File name → session id. The rule comes with each floor's meta.sessionIdOfFile (see each <product>.js);
+ * this file only looks up meta by agent and does generic dispatch; no meta / no such floor → empty string
+ * (falls back to the old behavior, never misattributes).
+ * @param {string} name file name (with extension)
+ * @param {string} kind product base name (floor meta.agent: claude / codex / codebuddy …)
+ * @returns {string} session id; empty string when it cannot be had
  */
 function sessionIdOfFile(name, kind) {
   const m = metaByAgent[String(kind)];
@@ -290,25 +324,28 @@ function sessionIdOfFile(name, kind) {
 }
 
 /**
- * CLI 落盘里的会话文件（*.jsonl）：一个文件算一个会话。
- * 只有文件时间可靠，别的字段读不到就留空。
+ * Session files in the CLI's on-disk data (*.jsonl): one file counts as one session.
+ * Only file times are reliable; fields that cannot be read are left empty.
  *
- * 按 kind 只扫真正放会话的那棵子树：Codex 写在 sessions/YYYY/MM/DD/ 下、
- * Claude Code 与 CodeBuddy 写在 projects/<工程目录>/ 下；三家根目录都还有 history.jsonl、
- * settings.json 这类不是会话的文件，扫进来全是噪声（顺带也少走一遍 cache / plugins
- * 那些大目录）。
+ * By kind, only the subtree that really holds sessions is scanned: Codex writes under
+ * sessions/YYYY/MM/DD/, Claude Code and CodeBuddy under projects/<project dir>/; all three roots also
+ * hold non-session files like history.jsonl and settings.json, which would be pure noise if scanned in
+ * (and it avoids walking those big cache / plugins directories as a bonus).
  */
 function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   if (!dataPath) return [];
-  // 只扫真正放会话文件的那棵子树 —— 哪棵由本楼层 meta.sessionSubtree 定（见各 <product>.js）：
-  // Codex 在 sessions/ 下，Claude / Qoder / CodeBuddy 在 projects/ 下。根目录里还有
-  // history.jsonl / settings.json 这类不是会话的文件，扫进来全是噪声（顺带也少走一遍 cache / plugins
-  // 那些大目录）。目录不存在时退回整棵（下面的 isDir 判定），老安装的行为不变。
+  // Only scan the subtree that really holds session files —— which one is decided by this floor's
+  // meta.sessionSubtree (see each <product>.js): Codex under sessions/, Claude / Qoder / CodeBuddy under
+  // projects/. The root also holds non-session files like history.jsonl / settings.json, which would be
+  // pure noise if scanned in (and it avoids walking those big cache / plugins directories as a bonus).
+  // When the directory does not exist it falls back to the whole tree (the isDir check below), so old
+  // installs behave unchanged.
   const meta = metaByAgent[String(kind)] || {};
   const sub = meta.sessionSubtree ? path.join(dataPath, meta.sessionSubtree) : '';
   const root = sub && isDir(sub) ? sub : dataPath;
-  // transcript 里还没有第一条对话时（会话刚起），cwd 只能在本产品自己的会话状态文件里找 ——
-  // sessionId -> cwd（见 liveSessionCwds）。整趟扫描共用一份，别每个会话文件都重读一遍目录。
+  // When the transcript has no first conversation yet (the session just started), cwd can only be found in
+  // this product's own session state file —— sessionId -> cwd (see liveSessionCwds). One copy is shared
+  // across the whole scan; do not re-read the directory for every session file.
   const liveCwds = liveSessionCwds(dataPath);
   const out = [];
   const walk = (d, depth) => {
@@ -324,26 +361,33 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
       if (SKIP.has(e.name)) continue;
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
-        // 子代理的 transcript 不是独立会话：它们住在 `<会话 id>/subagents/agent-<agentId>.jsonl`，
-        // 和父会话共享同一个 sessionId（首行也带 cwd，所以"读首行判工程"会把它当成一条会话）。
-        // 收进来的后果：一条会话配上多少个 subagent 就多出多少条"会话"，全是噪声。
+        // A subagent's transcript is not an independent session: they live in
+        // `<session id>/subagents/agent-<agentId>.jsonl` and share the same sessionId as the parent
+        // session (their first line carries cwd too, so "read the first line to judge the project" would
+        // treat it as a session).
+        // The consequence of taking them in: one session plus as many extra "sessions" as it has
+        // subagents, all noise.
         if (e.name === 'subagents') continue;
         walk(p, depth + 1);
         continue;
       }
       if (!/\.jsonl$/i.test(e.name)) continue;
-      // 空文件不算会话：会话刚起来、还没写入就被打断，会留下一个 0 字节的 jsonl 占位
-      // （实测 ~/.codebuddy/projects/home-yinghui/<会话>.jsonl 就是这样）。
-      // 它照样有 mtime、照样落进 60 分钟活跃窗口，于是下拉里凭空多一条「未知工程」。
+      // An empty file is not a session: a session that just started and was interrupted before writing
+      // leaves behind a 0-byte jsonl placeholder
+      // (measured: ~/.codebuddy/projects/home-yinghui/<session>.jsonl is exactly that).
+      // It still has an mtime and still falls into the 60-minute active window, so the dropdown grows a
+      // phantom "unknown project" entry.
       if (!sizeOf(p)) continue;
       const at = mtime(p);
       const sid = typeof meta.sessionIdOfFile === 'function' ? meta.sessionIdOfFile(e.name) : sessionIdOfFile(e.name, kind);
-      // 工程路径：先看 transcript 头部的 cwd（解析规则见 cwdOfHead）；第一条对话还没落盘时那里
-      // 没有，退回正在运行的 CLI 写的会话状态文件（按 sessionId 精确匹配，见 liveSessionCwds）
+      // Project path: first look at cwd in the transcript head (parsing rules under cwdOfHead); when the
+      // first conversation has not landed on disk it is not there, so fall back to the session state file
+      // the running CLI wrote (matched exactly by sessionId, see liveSessionCwds)
       const cwd = cwdOfHead(p) || liveCwds.get(sid) || '';
       out.push({
         id: path.relative(root, p),
-        // 轴 2：这条落盘属于哪条会话（解析规则与实测依据见 sessionIdOfFile）
+        // Axis 2: which session this on-disk data belongs to (parsing rules and measured evidence under
+        // sessionIdOfFile)
         sessionId: sid,
         project: cwd ? resolveProjectName(cwd) || path.basename(cwd) : '',
         projectPath: cwd,
@@ -355,13 +399,14 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   return out;
 }
 
-/** 登记 / 更新一条会话 */
+/** Register / update one session */
 function upsert(entry) {
   const key = `${entry.floor}:${entry.id}`;
   const prev = table.get(key);
   const now = Date.now();
-  // 拿不到事件时间（插件没给最后更新）就沿用上次登记的时间；
-  // 用"现在"冒充事件的话，这种会话永远超时不了，会一直挂在表里。
+  // When no event time can be had (the plugin gave no last update) keep the previously registered time;
+  // impersonating the event with "now" would make such a session never time out and hang in the table
+  // forever.
   const lastEventAt = Number(entry.lastEventAt) || (prev ? prev.lastEventAt : now);
   table.set(key, {
     ...entry,
@@ -372,7 +417,7 @@ function upsert(entry) {
   });
 }
 
-/** 超时（60 分钟没事件）的会话移出表 */
+/** Remove sessions that timed out (no events for 60 minutes) from the table */
 function prune(now = Date.now()) {
   let removed = 0;
   for (const [key, s] of table) {
@@ -384,18 +429,20 @@ function prune(now = Date.now()) {
   return removed;
 }
 
-/** 完成标记缺失时的统一返回值（没有就是"没有"，不臆造）
- *  doneCancelled：那一轮是被用户打断（ESC / 停止）的，渲染层据此亮红色「任务取消」而不是「任务完成」。 */
+/** The uniform return value when a done marker is missing (none means none, no fabrication)
+ *  doneCancelled: that round was interrupted by the user (ESC / stop); the render layer lights a red
+ *  "task cancelled" instead of "task finished" based on it. */
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false };
 
 /**
- * reporter 状态文件里的**原始** done（`{at,title,files,fileCount,cancelled,workspacePath}`）→
- * 会话行形状（`{doneAt,doneTitle,doneCount,doneFiles,doneCancelled}`）。
+ * The **raw** done in the reporter state file (`{at,title,files,fileCount,cancelled,workspacePath}`) →
+ * the session row shape (`{doneAt,doneTitle,doneCount,doneFiles,doneCancelled}`).
  *
- * 为什么要有这一步：7F/8F 的会话行以前直接把原始 done 摊进来（`...doneTruth`），字段名
- * （`at` / `files`）与会话行约定的（`doneAt` / `doneFiles`）对不上 —— 渲染层读 `sel.doneAt`
- * 拿不到值，装了插件反而比轮询那一份还少信息。统一在这里转一次，顺带把 `cancelled` 透传成
- * `doneCancelled`（主控制台据此亮红色「任务取消」）。
+ * Why this step: 7F/8F session rows used to spread the raw done in directly (`...doneTruth`), and the
+ * field names (`at` / `files`) do not line up with the session row's convention (`doneAt` / `doneFiles`)
+ * —— the render layer reading `sel.doneAt` gets nothing, so installing the plugin ends up with less
+ * information than the polling copy. Converting once here also passes `cancelled` through as
+ * `doneCancelled` (the main console lights a red "task cancelled" based on it).
  * @param {{at?:number,title?:string,files?:Array,fileCount?:number,cancelled?:boolean}} done
  */
 function doneFieldsFromReporter(done) {
@@ -405,7 +452,8 @@ function doneFieldsFromReporter(done) {
     doneAt: Number(done.at) || 0,
     doneTitle: done.title || '',
     doneCount: Number.isFinite(count) ? count : files.length,
-    // 带 size 的保留 size（插件那一路有），只有路径的退回 name（与 doneFieldsOf 同形）
+    // Keep size where it exists (the plugin path has it); entries with only a path fall back to name
+    // (same shape as doneFieldsOf)
     doneFiles: files.slice(0, 6).map((f) =>
       typeof f === 'string'
         ? { name: f }
@@ -416,31 +464,40 @@ function doneFieldsFromReporter(done) {
 }
 
 /**
- * CLI / hookSource 楼层的"完成标记"，字段名与 plugin 分支完全一致。
+ * The "done marker" of CLI / hookSource floors, with field names exactly matching the plugin branch.
  *
- * 以前只有 plugin 楼层在会话表里带 doneAt（插件落盘那条路算的），CLI 楼层只能等渲染层的
- * 1.5s 快轮询把完成标记带回来 —— 于是"完成"这件事在 UI 上有两套来源，切楼层时还因此
- * 误弹过「任务完成」（渲染层拿不到会话快照里的 doneAt，只能把快轮询第一次见到的当成新事件）。
- * 时间戳来源统一了：CLI / hookSource 楼层走本函数（读 reporter 在 Stop 时落盘的 done），
- * 不再依赖渲染层 1.5s 快轮询第一次见到才算"新事件"，所以渲染层不再需要按楼层分叉判断。
- * 但"同源"只对了时间戳来源、没对归属：**有会话 id 的按 bySession 精确命中，没有 id 的
- * 只能退回 (工程+client) 的 latest** —— 同层跑多条会话时，后者仍可能把"别人刚收工"
- * 算到当前这条头上。这是已知残留，不是本次回归。
- * 现在拿得到 id 的是：Claude CLI（文件名）、Codex（rollout 文件名，见 sessionIdOfFile）、
- * 5F TraeCode（listReporterSessions 本来就只列得出有 sessionId 的）、以及 1F CodeBuddy 的
- * hook 那一路。剩下 1F（CLI 的 jsonl）/ 2F 两个 CLI 楼层的文件名不含 id，退回该工程内的 latest；
- * plugin 那一路的会话行现在也带 sessionId 了，但它们的 doneAt 另走 sessions.js 的 sessionInfo，
- * 不经过本函数。
+ * Previously only plugin floors carried doneAt in the session table (computed on the plugin on-disk path),
+ * while CLI floors could only wait for the render layer's 1.5s fast polling to bring the done marker back
+ * —— so "finished" had two sources in the UI, and switching floors even popped a false "task finished"
+ * once (the render layer could not get doneAt from the session snapshot and had to treat the first thing
+ * the fast polling saw as a new event).
+ * The timestamp source is now unified: CLI / hookSource floors go through this function (reading the done
+ * the reporter drops at Stop), no longer depending on "the render layer's fast polling seeing it for the
+ * first time counts as a new event", so the render layer no longer needs to branch by floor.
+ * But "same source" only aligned the timestamp source, not the attribution: **those with a session id hit
+ * exactly via bySession, those without one can only fall back to (project+client)'s latest** —— with
+ * several sessions running on the same floor, the latter may still credit "someone else just finished" to
+ * the current one. That is known residue, not a regression this time.
+ * Those for which an id can now be had: Claude CLI (file name), Codex (rollout file name, see
+ * sessionIdOfFile), 5F TraeCode (listReporterSessions could only ever list ones with a sessionId), and
+ * 1F CodeBuddy's hook path. The remaining 1F (CLI jsonl) / 2F CLI floors have file names without an id,
+ * so they fall back to the latest within that project; the plugin path's session rows carry a sessionId
+ * too now, but their doneAt goes through sessionInfo in sessions.js, not this function.
  *
- * 文件清单只有路径：hook 不做 diff，没有 +/- 行数（那是 plugin 落盘的 file-changes 才有的）。
- * @param {string} projectPath 会话所属工程（读状态文件时按它过滤）；**可能为空**，见下面的守卫
- * @param {string} client 客户端身份（**这一路来源**的 client，如 codex / trae / codebuddy）
- * @param {string} sessionId 会话 id；**必填** —— 没有会话 id 就没有"这一轮完成了"可言
+ * The file list has paths only: the hook does no diff, so there are no +/- line counts (that is something
+ * only the plugin's on-disk file-changes has).
+ * @param {string} projectPath the project this session belongs to (used to filter when reading the state
+ *   file); **may be empty**, see the guard below
+ * @param {string} client client identity (the client of **this path**, e.g. codex / trae / codebuddy)
+ * @param {string} sessionId session id; **required** —— without a session id there is no such thing as
+ *   "this round finished"
  */
 function doneFieldsOf(projectPath, client, sessionId = '') {
-  // 按会话精确取：拿不到会话 id → 没有完成标记（不再退回"该 client 最新一份"）。
+  // Take it exactly by session: no session id → no done marker (no longer falling back to "the newest of
+  // this client").
   if (!sessionId) return NO_DONE;
-  // projectPath 只用于缓存键（readReporterDones 扫一遍的成本）；精确命中与会话 id 唯一绑定。
+  // projectPath is only used as the cache key (readReporterDones scans everything once); the exact hit is
+  // uniquely bound to the session id.
   const key = `${projectPath || ''}|${client || ''}`;
   if (!doneScans.has(key)) doneScans.set(key, readReporterDones(projectPath, client));
   const { bySession } = doneScans.get(key);
@@ -453,13 +510,13 @@ function doneFieldsOf(projectPath, client, sessionId = '') {
     doneTitle: done.title || '',
     doneCount: Number.isFinite(count) ? count : files.length,
     doneFiles: files.slice(0, 6).map((f) => ({ name: typeof f === 'string' ? f : (f && f.path) || '' })),
-    // reporter 的 done.cancelled（Interrupt 落的那一枚）：原样透传，不猜、不补
+    // The reporter's done.cancelled (the one Interrupt drops): passed through as-is, no guessing, no filling in
     doneCancelled: Boolean(done.cancelled),
   };
 }
 
 /**
- * 扫一遍所有数据源，更新表。
+ * Scan every data source once and update the table.
  * @param {{workspacePath?: string, force?: boolean}} o
  */
 function refresh({ workspacePath = '', force = false } = {}) {
@@ -468,15 +525,19 @@ function refresh({ workspacePath = '', force = false } = {}) {
   doneScans = new Map();
 
   /**
-   * 会话来源：每个楼层按自己的 sources 逐路取 —— 普通楼层一路，合并楼层多路
-   * （1F CodeBuddy = CLI 落盘 + 插件结构化落盘 + reporter 状态文件，见 products.js 的 sources）。
+   * Session sources: each floor fetches per its own sources —— one path for ordinary floors, several for
+   * merged ones (1F CodeBuddy = CLI on-disk + plugin structured on-disk + reporter state file, see
+   * sources in products.js).
    *
-   * 每一路的 client 都是**楼层基名**（插件 / CLI / hook 三路相同），形态由该路的 form / kind 表达。
-   * 会话按 sessionId 归属：同一个产品同时开着 CLI 与 Plugin 时，两条会话各读各的落盘，不会串味。
+   * Every path's client is the **floor base name** (same for the plugin / CLI / hook paths), and the form
+   * is expressed by that path's form / kind.
+   * Sessions are attributed by sessionId: when the same product has both CLI and Plugin open, the two
+   * sessions each read their own on-disk data and do not bleed into each other.
    *
-  * CLI 的 JSONL 与 hook 状态文件可能描述同一会话。两路都提供 sessionId 时只对同一 id 去重；
-  * SessionEnd 的 reporter 标记会同时排除旧 hook 行与对应 JSONL。CLI 新会话即使还没有 transcript，
-  * 仍由 SessionStart 的 hook 状态列出，不会被同楼层另一条近期 JSONL 屏蔽。
+   * The CLI's JSONL and the hook state file may describe the same session. When both paths provide a
+   * sessionId, dedup only happens for the same id; the SessionEnd reporter marker excludes both the old
+   * hook row and the corresponding JSONL. A brand-new CLI session is still listed by the SessionStart hook
+   * state even without a transcript, and is not masked by another recent JSONL on the same floor.
    */
   const products = detectProducts({});
   const seen = new Set();
@@ -488,8 +549,9 @@ function refresh({ workspacePath = '', force = false } = {}) {
     seen.add(k);
     return true;
   };
-  // 框架把共享工具打包成 ctx 交给每个楼层的来源分支（标准 handler 见下方 DEFAULT_KIND_HANDLERS，
-  // 楼层特有的在各自文件 modules/kindHandlers）—— 调试一个楼层不可能碰到别的楼层。
+  // The framework packs the shared utilities into ctx and hands them to each floor's source branch (the
+  // standard handlers are DEFAULT_KIND_HANDLERS below, floor-specific ones in each file's
+  // modules/kindHandlers) —— debugging one floor cannot touch another's.
   const ctx = {
     now, workspacePath, force,
     table, backend, TIMEOUT_MS,
@@ -504,33 +566,39 @@ function refresh({ workspacePath = '', force = false } = {}) {
     const mod = floorOf(p.id);
     ctx.product = p;
     for (const src of p.sources) {
-      // 只作落盘展示的那几路（kind 'dir'，如 5F 的 ~/.trae-cn 与 ~/.marscode）不产会话：
-      // 目录里有东西，但读不出会话索引 —— 它们只进楼层悬浮提示，不进会话表。
+      // The paths that exist only for on-disk display (kind 'dir', like 5F's ~/.trae-cn and ~/.marscode)
+      // produce no sessions: there is stuff in the directory but no session index to read —— they only
+      // enter the floor tooltip, not the session table.
       if (src.sessions === false) continue;
 
-      // ---- kilo / opencode / lingma 三路（7F / 8F / 6F-插件）----
-      // 这几路不是"扫文件"，而是轮询各产品自己的落盘库（kilo.db / opencode.db / 灵码 local.db），
-      // 形状与 cli/hook 不同（带真相位与模型）。它们的实现已搬到各自的楼层文件
-      // （kilo.js / opencode.js / qoder.js 的 kindHandlers），由下面的通用派发按 src.kind 调用，
-      // 调试 6F/7F/8F 不再需要碰本文件。
+      // ---- the kilo / opencode / lingma paths (7F / 8F / 6F-plugin) ----
+      // These are not "scan files" but polling each product's own on-disk store (kilo.db / opencode.db /
+      // Lingma local.db), with a shape different from cli/hook (they carry a true phase and a model).
+      // Their implementations have moved into each floor's file (kindHandlers in kilo.js / opencode.js /
+      // qoder.js), called by the generic dispatch below via src.kind, so debugging 6F/7F/8F no longer
+      // requires touching this file.
 
-      // 通用派发：楼层特有的来源分支（kilo / opencode / lingma）优先用楼层自己的 handler；
-      // 否则用框架内置的标准 handler（plugin / cli / hook）。这一行就是"每个楼层的东西
-      // 限定到自己的文件"的落地 —— 新增 / 调整一个楼层只改它的文件 + floors.js，本文件不变。
+      // Generic dispatch: a floor's own source branch (kilo / opencode / lingma) takes precedence over the
+      // framework's built-in standard handler (plugin / cli / hook). This line is "each floor's stuff is
+      // confined to its own file" landed —— adding / adjusting a floor touches only its file + floors.js,
+      // this file stays unchanged.
       const handler = (mod && mod.kindHandlers && mod.kindHandlers[src.kind]) || DEFAULT_KIND_HANDLERS[src.kind];
       if (handler) handler(p, src, ctx);
     }
-    // 楼层自己的后台 flush（如 5F Trae 的 endTask / 金额补发）：必须在通用 flush 之前跑，
-    // 否则 superseded 会把 Trae 正常完成的 running 任务先改成 cancelled。
+    // The floor's own background flush (e.g. 5F Trae's endTask / amount re-emission): it must run before
+    // the generic flush, otherwise superseded would first turn Trae's normally finished running tasks into
+    // cancelled.
     if (mod && typeof mod.flushBackend === 'function') mod.flushBackend(ctx);
   }
 
-  // 通用 flush（与楼层无关，操作 doneScans）：把"用户真按了停止"的合成取消 / 被顶掉的上一轮收尾。
-  // （Trae 自己的 endTask / 金额补发由 trae.js 的 flushBackend 在上面楼层循环里已经跑过。）
+  // Generic flush (floor-agnostic, operates on doneScans): the synthesized cancels for "the user really
+  // pressed stop" / wrapping up the previous round that got pushed out.
+  // (Trae's own endTask / amount re-emission already ran via trae.js's flushBackend in the floor loop above.)
   flushSynthesizedCancels(doneScans, now);
-  // 被新一轮顶掉的上一轮（同会话一个结束事件都没到的那行）：也补一刀 cancelled。
-  // 注意：Trae 的 flushBackend 已先把有 DoneHandler 的任务改成 done/cancelled，
-  // superseded 只会碰"连 DoneHandler 都没的" running 任务（极少数极端情况）。
+  // The previous round pushed out by a new one (the row whose session never got an end event): give it a
+  // cancelled too.
+  // Note: Trae's flushBackend has already turned tasks with a DoneHandler into done/cancelled, so
+  // superseded only touches running tasks that "do not even have a DoneHandler" (a rare extreme case).
   flushSupersededTasks(doneScans);
 
   prune(now);
@@ -538,25 +606,31 @@ function refresh({ workspacePath = '', force = false } = {}) {
   lastSnapshot = null;
 }
 
-/* ------------------------------ 标准来源分支（框架内置，所有楼层共用） ------------------------------ */
+/* ------------------------------ Standard source branches (built into the framework, shared by all floors) ------------------------------ */
 
-// 插件那一路：编辑器 globalStorage 的结构化落盘（genie-history / todos / …）。
-// 1F/9F 的 plugin 来源走这里；逻辑原样保留，只是从 refresh 的巨 switch 里抽出来。
+// The plugin path: the editor's globalStorage structured on-disk data (genie-history / todos / …).
+// 1F/9F's plugin sources go through here; the logic is preserved as-is, just pulled out of refresh's giant
+// switch.
 function handlePlugin(p, src, ctx) {
   const { workspacePath, force, table, claim, upsert, listSessions, listReporterSessions, doneFieldsOf, doneScans } = ctx;
   /**
-   * plugin 这路也要建一份 doneScan：某些楼层的插件**取消时一个 hook 事件都不发**，只能由楼层自己的
-   * synthMarks 从落盘认出来、经 readReporterDones 合成取消/完成标记（楼层私有逻辑，这里不掺和）。
-   * 而 flush* 只扫 doneScans，handlePlugin 又不走 doneFieldsOf（done* 字段经 listSessions 另外算）——
-   * 不建这份，插件取消就永远扫不到，task_runs 一直挂 running、滚动屏 / 任务列表收不到「已取消」。
-   * 这里按 (工程 | client) 建一份（与 doneFieldsOf 同一把缓存键），让 flush 能补刀 task/end(cancelled)。
+   * This path needs a doneScan too: some floors' plugins **emit not a single hook event when cancelling**,
+   * so only the floor's own synthMarks can recognize it from the on-disk data and synthesize a cancel /
+   * done marker through readReporterDones (floor-private logic, not mixed in here).
+   * And flush* only scans doneScans, while handlePlugin does not go through doneFieldsOf (the done* fields
+   * are computed separately via listSessions) —— without this, plugin cancels would never be scanned,
+   * task_runs would stay running forever, and the ticker / task list would never receive "cancelled".
+   * One is built per (project | client) here (the same cache key as doneFieldsOf) so flush can add its
+   * task/end(cancelled) stroke.
    */
   const scanKey = `${workspacePath || ''}|${src.client || ''}`;
   if (!doneScans.has(scanKey)) doneScans.set(scanKey, readReporterDones(workspacePath, src.client));
 
-  // 楼层可选的**插件会话策略**（谁算当前会话 / 谁已结束 / 谁不该列进下拉）：框架不认识任何产品，
-  // 只按接口派发（见 floors.js 的 FLOOR_CONTRACT: pluginPolicy；1F 的实现见 floorCodebuddy.js）。
-  // 没实现策略的楼层就是"全量列出 + 只排除 reporter 里已 SessionEnd 的"（下面 policy 为空时的默认行为）。
+  // A floor's optional **plugin session policy** (who counts as the current session / who has ended / who
+  // should not be listed in the dropdown): the framework knows no product, it only dispatches by interface
+  // (see FLOOR_CONTRACT: pluginPolicy in floors.js; 1F's implementation is in floorCodebuddy.js).
+  // A floor implementing no policy gets "list everything + only exclude those already SessionEnd'd in the
+  // reporter" (the default behavior when policy is empty).
   const mod = floorOf(p.id);
   const policy = mod && typeof mod.pluginPolicy === 'function' ? mod.pluginPolicy(ctx) || {} : {};
   const reporterSessions = listReporterSessions(src.client, { includeEnded: true });
@@ -582,8 +656,9 @@ function handlePlugin(p, src, ctx) {
   );
   const pluginSessionIds = new Set(pluginSessions.map((s) => s.id));
   for (const [key, session] of table) {
-    // 按 **sourceKind** 认"这是插件结构化落盘那一路的行"——不能按 source（form→source，CLI 路扫出的
-    // 会话也可能是 plugin 形态，如 3F Codex 共用落盘），否则会把它们一起裁掉。
+    // Recognize "a row from the plugin structured on-disk path" by **sourceKind** —— not by source
+    // (form→source; sessions scanned on the CLI path can be of plugin form too, e.g. 3F Codex shares its
+    // on-disk data), otherwise they would be trimmed together.
     if (session.floor === p.id && session.sourceKind === 'plugin' && !pluginSessionIds.has(session.sessionId)) table.delete(key);
   }
   if (!pluginSessions.length) return;
@@ -593,17 +668,20 @@ function handlePlugin(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      // source = form→source（这一路是插件的结构化落盘，形态 vscode）
+      // source = form→source (this path is the plugin's structured on-disk data, form vscode)
       source: formToSource(src.form),
-      // sourceKind = 这一行由哪一路读出来（plugin 结构化落盘）：裁剪/让位规则按它认，别拿 source 认
+      // sourceKind = which path read this row (plugin structured on-disk data): trimming / yielding rules
+      // recognize it by this, do not use source
       sourceKind: 'plugin',
       form: src.form || '',
       project: s.project || '',
       projectPath: s.projectPath || '',
       mine: Boolean(s.mine),
       current: Boolean(s.current),
-      // 该层全局唯一"正在真实活动"的那条（freshest reporter 所在工程当前会话）；
-      // 只有它才配叠加实时相位，其余 current=true 的工程当前会话只用自己工程的上报。
+      // The one session on this floor that is globally "really active" (the current session of the project
+      // the freshest reporter is in);
+      // only it is allowed to overlay the live phase; the other current=true project current sessions only
+      // use their own project's reports.
       fresh: s.id === st.current,
       live: Boolean(s.live),
       runtime: s.runtime,
@@ -616,7 +694,8 @@ function handlePlugin(p, src, ctx) {
       tool: s.tool || '',
       context: s.context || [],
       prompt: s.prompt || '',
-      // reporter 在 Stop 时落的"完成"标记：唯一真源，绝不靠相位回落到空闲来猜。
+      // The "done" marker the reporter drops at Stop: the only true source, never guessed from the phase
+      // falling back to idle.
       doneAt: s.doneAt || 0,
       doneTitle: s.doneTitle || '',
       doneCount: s.doneCount || 0,
@@ -628,8 +707,9 @@ function handlePlugin(p, src, ctx) {
   }
 }
 
-// cli / hook 两路共用：扫 jsonl 或读 reporter 状态文件，按 src.kind 区分。
-// 1F~5F、9F 的 cli/hook 来源都走这里（标准形状：只有文件时间 / 心跳时间，没有运行态）。
+// Shared by the cli / hook paths: scan jsonl or read the reporter state file, distinguished by src.kind.
+// The cli/hook sources of 1F~5F and 9F all go through here (standard shape: only file times / heartbeat
+// times, no runtime state).
 function handleCliHook(p, src, ctx) {
   const {
     workspacePath, table, claim, upsert, now, TIMEOUT_MS,
@@ -637,8 +717,9 @@ function handleCliHook(p, src, ctx) {
   } = ctx;
   const reporterSessions = src.kind === 'cli' ? listReporterSessions(src.client, { includeEnded: true }) : [];
   const endedSessionIds = new Set(reporterSessions.filter((s) => s.endedAt).map((s) => s.sessionId));
-  // 会话形态（cli / vscode）**只有 reporter 状态文件里记着**：CLI 那路扫的是 jsonl，看不出形态
-  // （CLI 与 IDE 共用同一棵落盘，如 3F Codex）。按会话 id 把 form 取回来，供 source=formToSource(form) 判形态。
+  // The session form (cli / vscode) **is only recorded in the reporter state file**: the CLI path scans
+  // jsonl and cannot tell the form (the CLI and the IDE share the same on-disk tree, e.g. 3F Codex). The
+  // form is fetched back by session id for source=formToSource(form) to judge the form.
   const formBySession = new Map(reporterSessions.filter((s) => s.form).map((s) => [s.sessionId, s.form]));
   for (const [key, session] of table) {
     if (session.floor === p.id && endedSessionIds.has(session.sessionId) && ['cli', 'hook'].includes(session.sourceKind)) {
@@ -656,13 +737,17 @@ function handleCliHook(p, src, ctx) {
           form: s.form || '',
           lastEventAt: s.lastEventAt,
         }));
-  // 判据得是"这一路扫到了【还活着】的会话"，而不是"扫到了任何行"（与 prune / snapshot 同尺 TIMEOUT_MS）。
-  // 还要有**会话 id** 才列：相位 / 完成标记 / 台账归属全都按会话走，没有 id 的行参与不了任何一条链路
-  // （以前列出来只能靠"按 client 取最新"的兜底，那正是把状态搞乱的来源）。
+  // The criterion has to be "this path scanned a session that is **still alive**", not "scanned any row"
+  // (same TIMEOUT_MS yardstick as prune / snapshot).
+  // It also needs a **session id** to be listed: phases / done markers / ledger attribution all go by
+  // session, and a row without an id cannot participate in any of those chains
+  // (listing it used to rely only on the "take the newest by client" fallback, which is exactly what messed
+  // the state up).
   const live = rows
     .filter((r) => now - (Number(r.lastEventAt) || 0) < TIMEOUT_MS)
     .filter((r) => r.sessionId);
-  // CLI JSONL 与 hook 可能描述同一会话：只按真实 sessionId 去重；cli 路扫到活会话时，撤掉旧的 hook 行。
+  // The CLI JSONL and the hook may describe the same session: dedup by real sessionId only; when the cli
+  // path scans a live session, withdraw the old hook row.
   if (src.kind === 'cli' && live.length) {
     const ids = new Set(live.map((s) => s.sessionId).filter(Boolean));
     cliLandingSessions.set(p.id, ids);
@@ -682,9 +767,9 @@ function handleCliHook(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId,
-      // source 按 form 派生:plugin/CLI/IDE 三种形态,空 form 当 CLI
+      // source derived from form: the three shapes plugin/CLI/IDE, empty form counts as CLI
       source: formToSource(form),
-      /** 这一行具体来自哪一路（cli / hook）：让"jsonl 优先"规则能撤掉旧的 hook 行 */
+      /** which path exactly read this row (cli / hook): lets the "jsonl first" rule withdraw old hook rows */
       sourceKind: src.kind,
       form,
       project: s.project,
@@ -692,12 +777,13 @@ function handleCliHook(p, src, ctx) {
       mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
       current: false,
       live: true,
-      // 相位不在这里造（项目铁律：绝不编造）—— 实时相位由 /reporter-phase 快轮询单独拉。
+      // The phase is not fabricated here (project iron rule: never fabricate) —— the live phase is pulled
+      // separately by the /reporter-phase fast polling.
       phase: 'unreported',
       action: '',
       context: src.kind === 'cli' ? [`会话文件${formatAge(now - lastEventAt)}（本层未接 hook，不推断动作）`] : [],
       inferred: true,
-      // 完成标记只认**这一路自己的 client**（见 refresh 的说明）。
+      // The done marker only recognizes **this path's own client** (see the notes in refresh).
       ...doneFieldsOf(s.projectPath, src.client, sessionId),
       lastEventAt,
     });
@@ -705,8 +791,9 @@ function handleCliHook(p, src, ctx) {
 }
 
 /**
- * 标准来源分支表：key 是来源 kind。楼层文件可以用自己的 kindHandlers 覆盖任意一种
- * （见 kilo.js / opencode.js / qoder.js）。'dir' 不产会话，refresh 里已提前跳过。
+ * Table of standard source branches: the key is the source kind. A floor file may override any of them
+ * with its own kindHandlers (see kilo.js / opencode.js / qoder.js). 'dir' produces no sessions and is
+ * already skipped early in refresh.
  */
 const DEFAULT_KIND_HANDLERS = {
   plugin: handlePlugin,
@@ -715,34 +802,37 @@ const DEFAULT_KIND_HANDLERS = {
 };
 
 /**
- * 去重键含 taskStartedAt（at），同一轮只要补发一次；新一轮（at 变了）照常再发。
+ * The dedup key includes taskStartedAt (at), so one round is only re-emitted once; a new round (at changed)
+ * is emitted again as usual.
  * @param {Map<string, {cancels?: Array}>} doneScans
  * @param {number} now
  */
-const postedCancels = new Map(); // key -> 过期时间戳（避免进程存活期间反复补发）
+const postedCancels = new Map(); // key -> expiry timestamp (avoids repeated re-emission while the process lives)
 function flushSynthesizedCancels(doneScans, now) {
   const { bus, repo } = backend || {};
   if (!bus || typeof bus.endTask !== 'function') return;
   for (const scan of doneScans.values()) {
     for (const c of scan.cancels || []) {
-      // taskId 可能为空（Trae：取消信号来自 renderer.log，hook 状态文件的 taskId 永远是新一轮的）。
-      // 用 cancelAt 参与去重 key，避免同一取消反复补发。
+      // taskId may be empty (Trae: the cancel signal comes from renderer.log, while the hook state file's
+      // taskId is always the new round's).
+      // cancelAt participates in the dedup key so the same cancel is not re-emitted repeatedly.
       const key = `${c.sessionId}|${c.taskId || ''}|${c.workspacePath}|${c.at}`;
       if (postedCancels.get(key) > now) continue;
       let task = null;
       if (c.taskId) {
-        // Claude / Qoder / CodeBuddy 插件：taskId 直接可取（hook 状态文件里存的是被取消那一轮的）
+        // Claude / Qoder / CodeBuddy plugin: taskId is directly available (the hook state file stores the
+        // cancelled round's)
         task = repo && repo.getTask ? repo.getTask.get(c.taskId) : null;
       }
       if (!task && repo && repo.listStaleRunningBySession && c.sessionId) {
-        // Trae：taskId 为空，从 task_runs 里找这条会话里"cancelAt 之前开始、
-        // 至今还挂 running"的那条（它就是被取消的上一轮；新一轮 startedAt > cancelAt，
-        // 不会被误取）。按 started_at DESC 取最新一条。
+        // Trae: taskId is empty, so find in task_runs the one in this session that started before cancelAt
+        // and is still hanging on running (that is the cancelled previous round; the new round's startedAt
+        // > cancelAt, so it is never taken by mistake). Take the newest by started_at DESC.
         const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(c.workspacePath || '')) : null;
         if (proj) {
           const all = repo.listStaleRunningBySession.all(proj.id, c.sessionId);
           const atC = Number(c.at) || 0;
-          // 最新开始的那条 <= cancelAt —— 那就是被取消的
+          // The most recently started one <= cancelAt —— that is the cancelled one
           const match = all
             .filter((r) => Number(r.startedAt) && (!atC || Number(r.startedAt) <= atC))
             .sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
@@ -766,7 +856,7 @@ function flushSynthesizedCancels(doneScans, now) {
           ts: c.at,
         });
       } catch {
-        /* 补发失败不影响会话表 */
+        /* a failed re-emission does not affect the session table */
       }
     }
   }
@@ -774,18 +864,22 @@ function flushSynthesizedCancels(doneScans, now) {
 }
 
 /**
- * 收掉**被新一轮顶掉的上一轮**：同一会话里比"当前这一轮"更早开始、却至今挂着 running 的任务。
- * 收掉**被新一轮顶掉的上一轮**：同一会话里比"当前这一轮"更早开始、却至今挂着 running 的任务。
+ * Retire **the previous round pushed out by the new one**: tasks in the same session that started earlier
+ * than "the current round" yet are still hanging on running.
  *
- * 判据是硬的：一个会话不可能同时跑两轮。它之所以还挂着，是因为这一轮的结束事件永远到不了 ——
- * CodeBuddy 插件按停止时一个 hook 事件都不发，而 hook 的状态文件按**会话**一份，新一轮的
- * /task/start 会把 taskId / taskStartedAt 整份覆盖，上一轮连兜底扫描（上面的 cancels，
- * 它只认状态文件里"当前那个" taskId）都够不着，于是永远停在「进行中」。
- * 用户看到的就是：取消了任务 → 屏上还是「进行中」，主控制台却已经「待命中」。
+ * The criterion is hard: one session cannot run two rounds at once. The reason it is still hanging is that
+ * this round's end event will never arrive —— the CodeBuddy plugin emits not one hook event when stopping,
+ * and the hook's state file is one per **session**, so the new round's /task/start overwrites taskId /
+ * taskStartedAt wholesale, and the previous round cannot even be reached by the fallback scan (cancels
+ * above, which only recognize the "current" taskId in the state file), so it stays "in progress" forever.
+ * What the user sees: cancelled the task → the screen still says "in progress" while the main console is
+ * already "standby".
  *
- * 与 flushSynthesizedCancels 的分工：那里靠"用户真按了停止"的落盘信号（越早越好，取消当场就能亮）；
- * 这里是**不依赖任何产品信号**的硬兜底 —— 被顶掉的上一轮，无论它是被掐了还是事件丢了，都得收尾。
- * @param {Map<string, {rounds?: Array}>} doneScans key 是 `${工程路径}|${client}`
+ * Division of labor with flushSynthesizedCancels: that one relies on the on-disk signal of "the user
+ * really pressed stop" (the earlier the better, it lights up right at the cancel); this one is a hard
+ * fallback that **depends on no product signal** —— a previous round that got pushed out has to be wrapped
+ * up whether it was cut short or its event was lost.
+ * @param {Map<string, {rounds?: Array}>} doneScans key is `${project path}|${client}`
  */
 function flushSupersededTasks(doneScans) {
   const { bus, repo } = backend || {};
@@ -793,41 +887,54 @@ function flushSupersededTasks(doneScans) {
   for (const [key, scan] of doneScans) {
     const ws = String(key || '').split('|')[0];
     if (!ws || !scan.rounds || !scan.rounds.length) continue;
-    // 工程 id 只能从路径换：bus 收的是工程 id（`<名字>@<工程id>`），传路径会算出不存在的成员
+    // The project id can only be swapped from the path: bus takes a project id (`<name>@<project id>`),
+    // passing a path would compute a member that does not exist
     const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
     if (!proj) continue;
     for (const r of scan.rounds) {
       if (!r.sessionId || !Number(r.taskStartedAt)) continue;
       try {
-        // excludeTaskId = 当轮自己的 taskId：扫尾只收"被顶掉的上一轮"，
-        // 绝不能把状态文件里指向的当前轮收掉（startedAt >= ts 判界之外的双保险）。
+        // excludeTaskId = the current round's own taskId: the sweep only retires "the previous round that
+        // got pushed out",
+        // it must never retire the current round the state file points at (a double safeguard alongside the
+        // startedAt >= ts boundary).
         bus.endStaleTasksOfSession({ project: proj.id, sessionId: r.sessionId, ts: Number(r.taskStartedAt), excludeTaskId: r.taskId || '', client: r.client });
       } catch {
-        /* 台账补发失败不影响会话表 */
+        /* a failed ledger re-emission does not affect the session table */
       }
     }
   }
 }
 
 /**
- * 会话的「统一任务状态」—— 门楣滚动屏与主控制台判定"本层有没有任务在跑"的**唯一真相源**。
- *   - 'running'：本工程里这一层（按 agent 基名归层）还有"活着"的在飞任务——主控制台据此显示「思考中」。
- *     **优先于**上一轮残留的 doneAt：新开一轮时旧 doneAt 还在，若按 doneAt 先判会先闪一下"任务取消/完成"，
- *     所以活着任务优先。归层用 agent 基名（剥 @<工程/实例> 后缀），与前端 floorAcceptsClient 同口径。
- *   - 'cancelled' / 'done'：reporter 在 Stop / 打断时落的完成标记（doneAt）是"已结束"最可靠信号
- *     （CodeBuddy 插件按停止连 hook 都不发，task_runs 未必被翻成 cancelled，见 flushSynthesizedCancels
- *     的注释），所以没在跑时才以 reporter 为准；
- *   - null：这条会话既没在跑的任务、也没结束标记（纯空闲 / 化石数据）。
- * 两条屏幕都读这个字段，就不会再一个显示任务取消、另一个还亮着思考中。
- * @param {object} session 来自 table 的会话行（含 floor / client / projectPath / doneAt / doneCancelled）
- * @param {object} repo db 句柄
- * @param {(projectId:number)=>string[]} runningClientsFor 取某工程（0=不限）所有在飞任务的 client 列表
+ * A session's "unified task state" —— the **single source of truth** for the lintel ticker and the main
+ * console judging "does this floor have a task running".
+ *   - 'running': this floor (grouped by agent base name) still has a "living" in-flight task in this
+ *     project —— the main console shows "thinking" accordingly.
+ *     **Takes precedence over** the previous round's leftover doneAt: when a new round starts the old
+ *     doneAt is still there, and judging by doneAt first would flash "task cancelled/finished" once, so a
+ *     living task wins. Grouping uses the agent base name (stripping the @<project/instance> suffix), same
+ *     criterion as the frontend's floorAcceptsClient.
+ *   - 'cancelled' / 'done': the done marker (doneAt) the reporter drops at Stop / interrupt is the most
+ *     reliable signal of "has ended"
+ *     (the CodeBuddy plugin does not even emit a hook when stopping, and task_runs is not necessarily
+ *     flipped to cancelled, see the notes in flushSynthesizedCancels), so when nothing is running the
+ *     reporter is the authority;
+ *   - null: this session has neither a running task nor an end marker (pure idle / fossil data).
+ * Both screens read this field, so one can no longer show "task cancelled" while the other still lights up
+ * "thinking".
+ * @param {object} session a session row from table (with floor / client / projectPath / doneAt / doneCancelled)
+ * @param {object} repo db handle
+ * @param {(projectId:number)=>string[]} runningClientsFor the client list of all in-flight tasks in a project (0 = any)
  */
 function taskStateOf(session, repo, runningClientsFor) {
-  // 1) 先看本层（按**楼层**，不再依赖 session.client——注册表里的 session.client 常为空，
-  //    拿它去跟台账 client 比必然落空）有没有"活着"的在飞任务——**跨工程全量比对**：
-  //    门楣滚动屏是全楼层监控，不做工程隔离。优先于残留 doneAt，避免新开一轮先闪"任务取消/完成"。
-  //    把账台上所有在飞任务的 client 按 agent 基名归到楼层（floorByAgent），命中 session.floor 即算在跑。
+  // 1) First check whether this floor (by **floor**, no longer relying on session.client —— the registry's
+  //    session.client is often empty, and comparing it against the ledger client necessarily misses) has a
+  //    "living" in-flight task —— **full cross-project comparison**:
+  //    the lintel ticker monitors all floors and does no project isolation. It takes precedence over a
+  //    leftover doneAt, avoiding a flash of "task cancelled/finished" when a new round starts.
+  //    Every in-flight task's client in the ledger is grouped to a floor by agent base name (floorByAgent),
+  //    and hitting session.floor counts as running.
   if (repo && runningClientsFor) {
     const runningFloors = new Set();
     for (const c of runningClientsFor(0)) {
@@ -836,7 +943,7 @@ function taskStateOf(session, repo, runningClientsFor) {
     }
     if (runningFloors.has(session.floor)) return 'running';
   }
-  // 2) 没有在跑 → reporter 完成标记（doneAt）才是"已结束"最可靠信号
+  // 2) Nothing running → the reporter's done marker (doneAt) is the most reliable "has ended" signal
   if (session.doneAt) return session.doneCancelled ? 'cancelled' : 'done';
   return null;
 }
@@ -847,15 +954,22 @@ function snapshot({ workspacePath = '', force = false } = {}) {
 
   const products = detectProducts({});
   const repo = backend && backend.repo;
-  // 标题取账本 tasks.title（用户那句话，渲染层不丢）——所有在跑任务都取，窗口放宽，只当文案不影响判定。
-  // 同时顺手取出 tasks.started_at（任务真正开始的时间），滚动屏时间用它，而不是"当前时间"。
+  // The title comes from the ledger's tasks.title (the user's own sentence, the render layer does not lose
+  // it) —— taken for all running tasks, with a wide window, used as copy only and not affecting the judgment.
+  // It also picks up tasks.started_at along the way (when the task really started); the ticker's time uses
+  // that rather than "now".
   const runningTitleBySession = new Map();
   const runningStartedBySession = new Map();
-  // 检测用"活着"的楼层：账本里 state='running' 且**心跳/agent_status 活着**（非粘性判定）。
-  // 关键：这里把 @fresh 设到未来，彻底关掉查询里的 started_at 兜底窗口——
-  // 那个窗口是"挂 3h / 重启复活"的根源（停掉的插件任务在账本里一直挂 running，started_at 又很新就又被认领）。
-  // 关掉后只剩心跳活着判定，停掉的任务（无心跳）立刻出局，重启也不会复活。
-  // 插件任务不写心跳 → 由下面的"实时相位新鲜"信号兜底认领，两者取并集，互不漏判。
+  // Detection uses "living" floors: state='running' in the ledger and **heartbeat/agent_status alive**
+  // (non-sticky judgment).
+  // Key point: @fresh is set into the future here, turning off the started_at fallback window in the query
+  // entirely ——
+  // that window is the root of "hangs for 3h / resurrects on restart" (a stopped plugin task stays running
+  // in the ledger, and started_at being recent gets it claimed again).
+  // With it off only the heartbeat-alive judgment remains, so stopped tasks (no heartbeat) drop out at once
+  // and do not resurrect on restart.
+  // Plugin tasks write no heartbeat → claimed as a fallback by the "live phase is fresh" signal below; the
+  // two are unioned so neither misses.
   const ledgerAliveSessions = new Set();
   if (repo && repo.activeRunningByProject) {
     const cutoff = now - 10 * 60 * 1000;
@@ -863,12 +977,15 @@ function snapshot({ workspacePath = '', force = false } = {}) {
     let titleRows = [];
     let detectRows = [];
     try {
-      // 标题 / 开始时间：所有在跑任务都取（宽窗口，只当文案与时间戳，不参与"在跑"判定）
+      // Title / start time: taken for all running tasks (wide window, copy and timestamp only, not part of
+      // the "running" judgment)
       titleRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now - 3 * 60 * 60 * 1000, cutoff, grace }) || [];
-      // 检测：@fresh 设到未来 → started_at 子句恒假，只剩"心跳/agent_status 活着"这一非粘性判定
+      // Detection: @fresh into the future → the started_at clause is always false, leaving only the
+      // non-sticky "heartbeat/agent_status alive" judgment
       detectRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now + 1e15, cutoff, grace }) || [];
     } catch (e) {
-      // 账本查询异常不影响会话表构建，但必须留痕 —— 否则"任务表/滚动屏没数据"只能靠猜
+      // A ledger query exception does not affect building the session table, but it must leave a trace ——
+      // otherwise "no data in the task table / ticker" can only be guessed at
       log.debug('账本查询异常（不影响会话表构建）：', e);
     }
     for (const r of titleRows) {
@@ -885,12 +1002,15 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       if (f && f.id && sessionId) ledgerAliveSessions.add(`${f.id}:${sessionId}`);
     }
   } else {
-    /* repo/activeRunningByProject 缺失时跳过账本信号（老行为） */
+    /* skip the ledger signal when repo/activeRunningByProject is missing (old behavior) */
   }
-  // "在跑"只认账本 ALIVE（与任务表同一把尺子 taskAliveSql：state='running' 且有近期心跳/活跃状态）。
-  // 之前曾把"会话实时相位新鲜"也当在跑信号，但实测插件会在重连/重启时把上一条任务的相位重播成
-  // thinking 并刷新时间戳，导致已取消的旧任务被误判在跑、与任务表（按 ALIVE 判）打架。去掉它后，
-  // 两边口径一致——任务表显示"已取消"的，滚动屏/主控制台绝不会再显示"进行中"。
+  // "Running" only recognizes the ledger's ALIVE (the same yardstick as the task table's taskAliveSql:
+  // state='running' with a recent heartbeat / active state).
+  // "Session live phase is fresh" was once counted as a running signal too, but measured behavior shows the
+  // plugin replays the previous task's phase as thinking on reconnect/restart and refreshes its timestamp,
+  // so an already cancelled old task was misjudged as running and fought with the task table (which judges
+  // by ALIVE). Removing it aligns both criteria —— whatever the task table shows as "cancelled", the
+  // ticker / main console will never show as "in progress" again.
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)
@@ -899,19 +1019,25 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         return b.lastEventAt - a.lastEventAt;
       })
       .map((s) => {
-        // taskState 必须按所选会话归属：同一楼层可同时有 CLI / Plugin 多个会话，
-        // 不能因为其中一条有 running task 就把整层每条会话都标成 running。
+        // taskState must follow the selected session's attribution: the same floor can have several CLI /
+        // Plugin sessions at once,
+        // and one of them having a running task must not mark every session on the floor as running.
         const sessionKey = `${s.floor}:${String(s.sessionId || '')}`;
         let taskState;
         if (s.sessionId && ledgerAliveSessions.has(sessionKey)) taskState = 'running';
-        // 结束态：reporter 落的 doneAt，且（1）必须是**本进程启动之后**发生的（重启后旧 doneAt 不认，
-        // 否则复活上一轮"任务取消/完成"）；（2）本会话近期（10s 内）没有新活动——新一轮任务刚起步时
-        // 旧的 doneAt 还挂着、相位又来不及翻新，若直接认它就会先闪一下"任务取消"再跳回"思考中"，
-        // 所以只要会话最近还有动静（新任务已经在跑了）就压住旧结束态。
+        // End state: the doneAt the reporter dropped, and (1) it must have happened **after this process
+        // started** (after a restart an old doneAt is not recognized, otherwise the previous round's "task
+        // cancelled/finished" resurrects); (2) this session has had no new activity recently (within 10s)
+        // —— when a new round is just starting the old doneAt is still hanging and the phase has no time to
+        // refresh, so recognizing it directly would flash "task cancelled" and then jump back to
+        // "thinking"; hence any recent movement in the session (a new task is already running) suppresses
+        // the old end state.
         else if (s.doneAt && s.doneAt > SINCE_BOOT && now - (Number(s.lastEventAt) || 0) > 10_000) taskState = s.doneCancelled ? 'cancelled' : 'done';
         else taskState = null;
-        // 在跑任务用台账标题（tasks.title = 用户那句话）当文案——不依赖会话里常常为空的 prompt；
-        // 同时带上任务真正开始的时间（tasks.started_at），滚动屏时间用它而非"当前时间"。
+        // A running task uses the ledger title (tasks.title = the user's sentence) as its copy —— it does
+        // not depend on the session's often-empty prompt;
+        // it also carries when the task really started (tasks.started_at), and the ticker time uses that
+        // rather than "now".
         const taskTitle = taskState === 'running' ? runningTitleBySession.get(sessionKey) || '' : '';
         const taskStartedAt = taskState === 'running' ? Number(runningStartedBySession.get(sessionKey) || 0) : 0;
         return { ...s, taskState, taskTitle, taskStartedAt };
@@ -920,44 +1046,51 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       id: p.id,
       name: p.name,
       kind: p.kind,
-      // 这一层监控的是哪个客户端（codebuddy / workbuddy / codex / claude）——
-      // 办公室按它过滤成员，切到 3F 就不该再看见 CodeBuddy 的小怪物
-      // （成员过滤按 **agent 基名**认，见 renderer/src/lib/clientMatch.js 的 floorAcceptsClient）
+      // Which client this floor monitors (codebuddy / workbuddy / codex / claude) ——
+      // the office filters members by it, so switching to 3F should not show CodeBuddy's gremlins anymore
+      // (member filtering recognizes by **agent base name**, see floorAcceptsClient in
+      // renderer/src/lib/clientMatch.js)
       client: p.dataKind || '',
-      // 这一层接纳的客户端（= 楼层基名，如 1F 的 ['codebuddy']）：
-      // 前端按它过滤实时相位（/reporter-phase?client=codebuddy）与任务记录里的楼层归属
+      // The clients this floor accepts (= the floor base name, e.g. 1F's ['codebuddy']):
+      // the frontend filters the live phase (/reporter-phase?client=codebuddy) and the floor attribution in
+      // task records by it
       clients: p.clients && p.clients.length ? p.clients : p.dataKind ? [p.dataKind] : [],
       installed: Boolean(p.installed),
       installPathLabel: p.installPathLabel || '',
-      // 安装位置逐形态清单（CLI / 插件各一条，见 products.js 的 detectOne）：
-      // 楼层胶囊 tooltip 照它逐行显示"安装 CLI / 安装 插件"。**必须显式透传** ——
-      // 这里只挑字段下发，漏了它前端就拿不到、退回单行兜底，合并楼层（1F CodeBuddy）
-      // 的插件扩展目录会被吞掉。
+      // Per-form install location list (one each for CLI / plugin, see detectOne in products.js):
+      // the floor capsule tooltip shows "installed CLI / installed plugin" line by line from it.
+      // **It must be passed through explicitly** ——
+      // only selected fields are sent here, and missing it means the frontend cannot get it and falls back
+      // to the single-line fallback, swallowing the merged floor's (1F CodeBuddy) plugin extension directory.
       installPaths: Array.isArray(p.installPaths) ? p.installPaths : [],
       dataPathLabel: p.dataPathLabel || '',
       stats: p.stats || null,
-      // 落盘来源（合并楼层多路，含每路的落盘目录与统计）—— 楼层悬浮提示按它逐路显示
+      // On-disk sources (several for merged floors, including each path's on-disk directory and stats) ——
+      // the floor tooltip shows them path by path
       sources: (p.sources || []).map((s) => ({
         kind: s.kind,
-        // 显示名（'IDE' / 'plugin' …）：同 kind 可能有两路（5F 的 IDE 与插件都是 'dir'）
+        // Display name ('IDE' / 'plugin' …): two paths can share a kind (5F's IDE and plugin are both 'dir')
         label: s.label || '',
-        // 这一路产不产会话：false = 只作落盘展示（悬浮提示里说明"读不出会话"）
+        // Whether this path produces sessions: false = on-disk display only (the tooltip explains "no
+        // sessions can be read")
         sessions: s.sessions !== false,
         client: s.client,
         dataPathLabel: s.dataPathLabel || '',
         stats: s.stats || null,
-        // 这一路取不到会话时的说明（如 TraeCode 的插件落盘没有会话索引）——
-        // 前端悬浮提示照它显示，让"没数据"和"读不到"分得清
+        // Explanation when this path cannot read sessions (e.g. TraeCode's plugin on-disk data has no
+        // session index) ——
+        // the frontend tooltip shows it so "no data" and "cannot read" stay distinguishable
         note: s.note || '',
       })),
-      /** 这一层有几个活跃会话 —— 左侧状态点绿/灰就看它 */
+      /** How many active sessions this floor has —— the left status dot's green/gray follows it */
       activeCount: sessions.length,
       sessions,
     };
   });
 
   const sessions = floors.flatMap((f) => f.sessions);
-  // 默认楼层：优先有活跃会话的层；都没有就退到装了的层；再没有就第一层
+  // Default floor: prefer a floor with active sessions; if none, fall back to an installed one; if none
+  // again, the first floor
   const hot = floors.find((f) => f.activeCount > 0);
   const on = floors.find((f) => f.installed);
   const pick = hot || on || floors[0];
@@ -967,7 +1100,7 @@ function snapshot({ workspacePath = '', force = false } = {}) {
     ok: true,
     floors,
     sessions,
-    /** 没有活跃会话时给个兜底楼层：办公室照常显示，只是下拉为空 */
+    /** A fallback floor when there are no active sessions: the office still shows, only the dropdown is empty */
     defaultFloor,
     workspacePath,
     timeoutMs: TIMEOUT_MS,

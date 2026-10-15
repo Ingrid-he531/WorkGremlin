@@ -1,21 +1,24 @@
 'use strict';
 
 /**
- * 3F Codex（CLI 与 IDE 合并楼层）。
+ * 3F Codex (CLI and IDE merged floor).
  *
- * CLI 与 IDE 插件共用同一份 ~/.codex、同一套 hook，分不出来，合并成单楼层
- * （见 server/src/products.js 文件头）。只有一路 cli 来源（CLI/Plugin 两种形态都由它代表）。
- * 标准来源由 sessionRegistry 默认 handler 处理，本文件只声明元数据。
+ * The CLI and the IDE plugin share the same ~/.codex and the same set of hooks, and cannot be
+ * told apart, so they are merged into a single floor (see the header of server/src/products.js).
+ * There is only one cli source (both the CLI and the Plugin forms are represented by it).
+ * Standard sources are handled by the sessionRegistry default handler; this file only declares
+ * metadata.
  */
 
 const os = require('node:os');
 const path = require('node:path');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent directories (project-level / user-level): private knowledge of this floor,
+// kept here rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 const HOME = os.homedir();
 
-/** Codex 的宿主扩展目录名：VS Code 里的 openai.chatgpt-* / openai.codex-*（它们自带 codex） */
+/** Codex host extension directory names: openai.chatgpt-* / openai.codex-* in VS Code (they ship codex themselves) */
 const RE_CODEX_HOST = [/^openai\.(chatgpt|codex)/i];
 
 const meta = {
@@ -25,22 +28,24 @@ const meta = {
   cmd: 'codex',
   agent: 'codex',
   plugin: false,
-  // 「CLI 与 IDE 合并」楼层：只装 VS Code 扩展 / ChatGPT 桌面版的人命令行里没有 codex，
-  // 但确实在跑（会话就是证据），所以 altPluginRe 补抓安装证据。
+  // A "CLI and IDE merged" floor: someone who only installed the VS Code extension / ChatGPT
+  // desktop app has no `codex` on the command line, yet is clearly running it (a session is
+  // the evidence), so altPluginRe picks up that install evidence.
   altPluginRe: RE_CODEX_HOST,
   sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
   dataKind: 'codex',
-  // 落盘探测（findDataPath 用）
+  // On-disk detection (used by findDataPath)
   matchRe: [/^codex/i],
   homeDirs: [path.join(HOME, '.codex')],
-  // Codex 同款 = ChatGPT 桌面端：CLI 装在这两个资源目录里（与具体产品无关的位置在通用兜底里）
+  // The Codex equivalent = the ChatGPT desktop app: the CLI lives in these two resource
+  // directories (product-independent locations are in the generic fallback)
   cliBinDirs: [
     '/usr/lib/chatgpt/resources',
     '/opt/chatgpt/resources',
     ...(process.platform === 'darwin' ? ['/Applications/ChatGPT.app/Contents/Resources'] : []),
   ],
-  // CLI 会话文件落在 <dataRoot>/sessions/YYYY/MM/DD/ 下，文件名形如
-  // rollout-<时间戳>-<session_id>.jsonl，id 在尾段
+  // CLI session files land under <dataRoot>/sessions/YYYY/MM/DD/, named like
+  // rollout-<timestamp>-<session_id>.jsonl, with the id in the trailing segment
   sessionSubtree: 'sessions',
   sessionIdOfFile: (name) => {
     const m = String(name).match(
@@ -52,8 +57,9 @@ const meta = {
 
 const { runHookEvent, sharedHookImpl, jsonlReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
 
-/** Codex 形态（cli / plugin）：rollout 首行 session_meta 的 source/originator。
- * 原在 hookCommon，现挪到本楼层（"楼层自己的接口"）；没覆盖的字段回退 sharedHookImpl。 */
+/** Codex form (cli / plugin): the source/originator of the session_meta first line of a rollout.
+ * Moved here from hookCommon (it is part of "the floor's own interface"); fields not overridden
+ * fall back to sharedHookImpl. */
 function codexForm(transcriptPath) {
   for (const obj of headJsonLines(transcriptPath)) {
     const p = obj && obj.payload;
@@ -67,12 +73,13 @@ function codexForm(transcriptPath) {
   return '';
 }
 
-/** Codex 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent */
+/** Codex differs only in how it reads its on-disk data: event gating and the common
+ * file/token/ghost logic all live in hookCommon.runHookEvent */
 const codexImpl = {
   ...sharedHookImpl,
-  hasPermissionEvent: true, // Codex 有独立的 PermissionRequest 事件
-  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"（idle 已在前面处理）
-  hasSubagentStart: true, // Codex 发 SubagentStart / SubagentStop
+  hasPermissionEvent: true, // Codex has its own dedicated PermissionRequest event
+  awaitingPermission: () => true, // any non-idle Notification counts as "awaiting permission" (idle is already handled earlier)
+  hasSubagentStart: true, // Codex emits SubagentStart / SubagentStop
   repliesOf: jsonlReplies,
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
   formOf: (tp) => codexForm(tp),
@@ -83,8 +90,9 @@ async function handleHookEvent(ev, ctx) {
 }
 
 /**
- * 3F 的静态 subagent 定义目录：项目级 <ws>/.codex/agents、用户级 $CODEX_HOME/agents
- * （CODEX_HOME 缺省回退 ~/.codex）。返回 [{ dir, level }]，项目级先于用户级。
+ * 3F static subagent definition directories: project-level <ws>/.codex/agents and user-level
+ * $CODEX_HOME/agents (CODEX_HOME falls back to ~/.codex).
+ * Returns [{ dir, level }], project level before user level.
  */
 function agentDirs(workspacePath) {
   const home = process.env.CODEX_HOME || path.join(HOME, '.codex');

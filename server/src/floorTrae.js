@@ -1,33 +1,36 @@
 'use strict';
 
 /**
- * 5F TraeCode（Trae / Trae CN）楼层模块 —— 把取消检测、token 金额、模型补全三件套
- * （原 traeCancel.js / traeTokens.js / traeModels.js）合并到这一个文件。
+ * 5F TraeCode (Trae / Trae CN) floor module —— merges cancel detection, token amounts and model
+ * completion (formerly traeCancel.js / traeTokens.js / traeModels.js) into this one file.
  *
- * 三条信号都从 Trae 自己的落盘挖（renderer.log / globalStorage 的 state.vscdb），
- * 互不依赖、各自带 mtime+size 增量 + TTL 缓存。详细语义见各函数上方注释。
+ * All three signals are dug out of Trae's own on-disk data (renderer.log / globalStorage's
+ * state.vscdb), independent of each other, each with an mtime+size incremental + TTL cache. Detailed
+ * semantics are in the comments above each function.
  *
- * 统一接口（见 floors.js 的 FLOOR_CONTRACT）：
- *   id / client   楼层身份
- *   cancelAt      取消时刻检测（= traeCancelAt）
- *   allCancels    全量取消扫描（flush 写回 DB 用）
- *   modelOf       取会话当前模型（= selectedModelOf）
+ * Unified interface (see FLOOR_CONTRACT in floors.js):
+ *   id / client   floor identity
+ *   cancelAt      cancel moment detection (= traeCancelAt)
+ *   allCancels    full cancel scan (written back to the DB by flush)
+ *   modelOf       this session's current model (= selectedModelOf)
  */
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-// Trae 家族的 globalStorage / logs 根目录：本楼层私有，放在本文件（不再污染 floors.js）。
+// The Trae family's globalStorage / logs roots: private to this floor, kept here (no longer polluting floors.js).
 const { isDir, dataRoots } = require('./roots');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent directories (project-level / user-level): private knowledge of this floor, kept here
+// rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 // WorkGremlin's own state-file dir comes from shared/paths.js (single source of truth).
 const { hooksDir } = require('@workgremlin/shared/paths');
 
 /**
- * 5F 的静态 subagent 定义目录。Trae 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
- * 这里走通用推导（meta.homeDirs 为空 → 返回 []，不扫盘）。若将来 Trae 在某目录放 agent 定义，
- * 在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * 5F's static subagent definition directories. Trae has no "user-level / project-level agent definition
+ * file" mechanism yet, so this goes through the generic derivation (meta.homeDirs is empty → returns [],
+ * no disk scan). If Trae ever puts agent definitions in some directory, just give the explicit directories
+ * here (same interface as CodeBuddy / Codex / Claude).
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
 function agentDirs(workspacePath) {
@@ -35,8 +38,9 @@ function agentDirs(workspacePath) {
 }
 
 /**
- * TraeCode 家族的 globalStorage（模型选择就记在它的 state.vscdb 里）。单列一份、不并进
- * globalStorageRoots：那份是**插件楼层的落盘位置**，一改就会把 5F 的落盘从 ~/.marscode 带偏。
+ * The TraeCode family's globalStorage (the model selection is recorded in its state.vscdb). Listed
+ * separately and not merged into globalStorageRoots: that one is **the plugin floors' on-disk location**,
+ * and changing it would drag 5F's on-disk data away from ~/.marscode.
  */
 function traeGlobalStorageRoots() {
   const out = [];
@@ -50,8 +54,9 @@ function traeGlobalStorageRoots() {
 }
 
 /**
- * TraeCode 家族的 logs 根。新版 Trae 把「会话 → 当前选中模型」搬进了内存态 store + 加密库，
- * state.vscdb 里那条不再写 —— renderer.log 的 model-store 事件成了唯一明文来源。
+ * The TraeCode family's logs root. Newer Trae moved "session → currently selected model" into an in-memory
+ * store + encrypted DB, and that row in state.vscdb is no longer written —— the model-store events in
+ * renderer.log became the only plaintext source.
  */
 function traeLogRoots() {
   const out = [];
@@ -65,8 +70,9 @@ function traeLogRoots() {
 }
 
 /**
- * 5F TraeCode 楼层元数据（原 products.js 的 5F 条目）。IDE 与 Plugin 合并楼层：
- * 两路 dir 只作落盘展示（读不出会话），会话来源是 hook 状态文件。
+ * 5F TraeCode floor metadata (formerly the 5F entry in products.js). IDE and plugin merged floor:
+ * both dir paths exist only for on-disk display (no sessions can be read), the session source is the hook
+ * state file.
  */
 const meta = {
   id: '5F',
@@ -94,36 +100,36 @@ function isDirSafe(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 }
 
-/* ───────────── 原 traeCancel.js ───────────── */
+/* ───────────── formerly traeCancel.js ───────────── */
 
 
 
-/** 取消标记判定的四条规则：每条是 [log 标签片段, JSON 里检查的 key-value 对] */
+/** The four rules for recognizing a cancel marker: each is [log tag fragment, key-value pair to check in the JSON] */
 const CANCEL_RULES = [
-  // DoneHandler: status:"canceled"（整条行尾 JSON 含这个字段）
+  // DoneHandler: status:"canceled" (the JSON at the end of the whole line contains this field)
   ['DoneHandler', { status: (v) => String(v).toLowerCase() === 'canceled' || String(v).toLowerCase() === 'cancelled' }],
-  // StreamDomainService: cancelReason:"stop_button"（stop / esc 都是这个）
+  // StreamDomainService: cancelReason:"stop_button" (both stop and esc are this)
   ['StreamDomainService', { cancelReason: (v) => !!v }],
   // NotificationPort: stopType:"cancel"
   ['NotificationPort', { stopType: (v) => String(v).toLowerCase() === 'cancel' || String(v).toLowerCase() === 'abort' }],
-  // stream-diagnostics done: transformedStatus:"canceled" 或 stopType:"cancel"
-  ['stream-diagnostics', null], // 特殊处理：行内同时有 canceled 且含 "done" 关键字
+  // stream-diagnostics done: transformedStatus:"canceled" or stopType:"cancel"
+  ['stream-diagnostics', null], // special handling: the line has both canceled and the "done" keyword
 ];
 
 /**
- * 一行 renderer.log 里是不是 TraeCode 的取消信号。
- * 行尾跟一段 JSON（与 traeModels.js 解析 model-store 事件同形状），
- * 只认四种带 sessionId 的结构化标记。
- * @returns {{sessionId:string, at:number}|null} at = 这一行的时间戳（ms），0 = 解析不到
+ * Whether a line of renderer.log is TraeCode's cancel signal.
+ * The line ends with a chunk of JSON (same shape as traeModels.js's model-store event parsing),
+ * and only four structured markers carrying a sessionId are recognized.
+ * @returns {{sessionId:string, at:number}|null} at = this line's timestamp (ms), 0 = unparseable
  */
 function parseCancelLine(line) {
   if (!line || !/cancel|canceled|cancelled|stop_button/.test(line)) return null;
-  // 提取 sessionId（任意一种取消标记都带）
+  // Extract sessionId (every one of the cancel markers carries it)
   const sidMatch = line.match(/"sessionId"\s*:\s*"([^"]+)"/) || line.match(/"chat_session_id"\s*:\s*"([^"]+)"/);
   const sid = sidMatch ? sidMatch[1] : '';
   if (!sid) return null;
 
-  // 行尾 JSON（第一个 { 之后）
+  // The JSON at the end of the line (everything after the first {)
   const brace = line.indexOf('{');
   let j = null;
   if (brace >= 0) {
@@ -135,20 +141,20 @@ function parseCancelLine(line) {
     const s = JSON.stringify(j).toLowerCase();
     // ① DoneHandler: status:"canceled"
     if (j.status && /^cancel(ed|led)$/i.test(String(j.status))) hit = true;
-    // ② StreamDomainService: cancelReason 非空
+    // ② StreamDomainService: cancelReason non-empty
     else if (j.cancelReason && typeof j.cancelReason === 'string') hit = true;
     // ③ NotificationPort: stopType:"cancel"
     else if (j.stopType && /^(cancel|abort|interrupt)/i.test(String(j.stopType))) hit = true;
     // ④ stream-diagnostics done: transformedStatus:"canceled"
     else if (j.transformedStatus && /^cancel(ed|led)$/i.test(String(j.transformedStatus))) hit = true;
   } else {
-    // JSON 解析失败 —— 退而求其次，在行里直接搜 sessionId + cancel 关键词
+    // JSON parse failed —— next best thing, search the line directly for sessionId + cancel keywords
     hit = /cancel(ed|led)|stop_button|stopType.*cancel/i.test(line);
   }
 
   if (!hit) return null;
 
-  // 时间戳：行首 ISO 格式 2026-10-09T13:35:43.609+08:00
+  // Timestamp: ISO format at the start of the line 2026-10-09T13:35:43.609+08:00
   const tsMatch = line.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+/);
   let at = 0;
   if (tsMatch) {
@@ -159,27 +165,28 @@ function parseCancelLine(line) {
 }
 
 /**
- * 整份读 renderer.log（UTF-8）。Trae 的 renderer.log 一般 1-5MB，不会太大；
- * 而且按 mtime+size 缓存（traeModels.js 同口径），文件没动就不重读，所以每次扫全盘只在
- * 少数正在写的那个文件上真正消耗 IO。
+ * Read renderer.log in full (UTF-8). Trae's renderer.log is generally 1-5MB, not too big;
+ * and it is cached by mtime+size (same criterion as traeModels.js), so an untouched file is not re-read
+ * —— every full scan only really spends IO on the few files currently being written.
  *
- * 曾经尝试只读末尾 256KB（取消信号"应该"在末尾追加），但实测 renderer.log 里同一窗口
- * 会连续跑多轮会话（一轮取消 → 新一轮开始），老一轮的取消信号被推到文件中间，
- * 只读末尾会把历史取消都丢掉。整份扫更稳妥。
+ * Reading only the trailing 256KB was tried once (cancel signals "should" be appended at the end), but
+ * measured behavior shows renderer.log runs several consecutive conversation rounds in the same window
+ * (one round cancelled → a new one starts), pushing the old round's cancel signal into the middle of the
+ * file, so reading only the tail loses every historical cancel. Scanning the whole file is safer.
  */
 function readLog(f) {
   try { return fs.readFileSync(f, 'utf8'); } catch { return ''; }
 }
 
-/** 文件级缓存：path -> { mtimeMs, size, cancels: { [sessionId]: at } } */
+/** File-level cache: path -> { mtimeMs, size, cancels: { [sessionId]: at } } */
 const _fileCache = new Map();
-/** 全局 TTL 缓存（避免每次扫全盘） */
+/** Global TTL cache (avoid scanning the whole disk every time) */
 
 let _cache = { at: 0, map: null };
 
 /**
- * 扫所有 Trae renderer.log，汇总取消信号 → `{ [sessionId]: 最靠后的取消时刻 }`
- * 按 mtime+size 增量（traeModels.js 同口径）。
+ * Scan every Trae renderer.log, aggregate cancel signals → `{ [sessionId]: latest cancel moment }`
+ * Incremental by mtime+size (same criterion as traeModels.js).
  */
 function allCancels() {
   const now = Date.now();
@@ -202,7 +209,7 @@ function allCancels() {
       }
     }
   }
-  // mtime 升序 → 后处理的覆盖先处理的（同一会话多次取消取最后一次）
+  // Ascending mtime → later processing overwrites earlier (multiple cancels of one session take the last)
   files.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.f < b.f ? -1 : 1));
   const seen = new Set(files.map((x) => x.f));
   for (const k of [..._fileCache.keys()]) if (!seen.has(k)) _fileCache.delete(k);
@@ -225,7 +232,7 @@ function allCancels() {
   return merged;
 }
 
-/** 单个 renderer.log → `{ [sessionId]: at }` */
+/** One renderer.log → `{ [sessionId]: at }` */
 function parseFileCancels(f) {
   const content = readLog(f);
   const out = {};
@@ -238,10 +245,10 @@ function parseFileCancels(f) {
 }
 
 /**
- * 这条 TraeCode 会话有没有被用户取消、取消时刻是什么。
+ * Whether this TraeCode session was cancelled by the user, and when.
  * @param {string} sessionId
- * @param {number} sinceTs 只认这一刻之后的取消（0 = 不过滤）
- * @returns {number} 取消时刻（0 = 没取消 / 没识别出来）
+ * @param {number} sinceTs only cancels after this moment count (0 = no filtering)
+ * @returns {number} cancel moment (0 = not cancelled / not recognized)
  */
 function traeCancelAt(sessionId, sinceTs = 0) {
   const sid = String(sessionId || '').trim();
@@ -249,38 +256,40 @@ function traeCancelAt(sessionId, sinceTs = 0) {
   const map = allCancels();
   const at = Number(map[sid]) || 0;
   if (!at) return 0;
-  if (sinceTs && at < sinceTs) return 0; // 老取消不算到新一轮头上
+  if (sinceTs && at < sinceTs) return 0; // an old cancel does not count against the new round
   return at;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * Trae DoneHandler 扫描 —— renderer.log 里每轮结束的权威状态信号。
+ * Trae DoneHandler scan —— the authoritative status signal for every round's end in renderer.log.
  *
- * 格式：
+ * Format:
  *   [DoneHandler] Stream done event received {"sessionId":"…","status":"completed|canceled","agentMessageId":"…"}
  *
- * 与 allCancels()（扫更早的 stop_button / NotificationPort cancel 信号）的分工：
- *   · readReporterPhase / readReporterActiveTask 用 traeCancelAt —— 越早戳破相位越好
- *   · flushTraeDone 用 allDoneHandlers —— DoneHandler 是最终状态真相
- *   · readReporterDones 合成标记用 DoneHandler —— completed/canceled 不会错
+ * Division of labor with allCancels() (which scans the earlier stop_button / NotificationPort cancel
+ * signals):
+ *   · readReporterPhase / readReporterActiveTask use traeCancelAt —— puncturing the phase as early as
+ *     possible is best
+ *   · flushTraeDone uses allDoneHandlers —— DoneHandler is the final state truth
+ *   · readReporterDones synthesizes markers from DoneHandler —— completed/canceled cannot be wrong
  *
- * 缓存复用 allCancels 的 mtime+size + TTL 15s 口径，扫同样的文件集。
+ * The cache reuses allCancels' mtime+size + TTL 15s criterion, scanning the same file set.
  * ───────────────────────────────────────────────────────────────────── */
 
-/** 一行是不是 DoneHandler 的 Stream done event —— 带 sessionId + status(completed|canceled) + agentMessageId */
+/** Whether a line is a DoneHandler Stream done event —— carrying sessionId + status(completed|canceled) + agentMessageId */
 function parseDoneHandlerLine(line) {
   if (!line || !/DoneHandler.*Stream done event received/.test(line)) return null;
   const brace = line.indexOf('{');
   let j = null;
   if (brace >= 0) {
-    try { j = JSON.parse(line.slice(brace)); } catch { /* 不是合法 JSON */ }
+    try { j = JSON.parse(line.slice(brace)); } catch { /* not valid JSON */ }
   }
   if (!j || !j.sessionId || !j.status) return null;
   const s = String(j.status).toLowerCase();
   if (s !== 'completed' && s !== 'canceled' && s !== 'cancelled') return null;
   const sid = String(j.sessionId);
   const agentMsg = j.agentMessageId ? String(j.agentMessageId) : '';
-  // 时间戳：行首 ISO 格式
+  // Timestamp: ISO format at the start of the line
   const tsMatch = line.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+/);
   let at = 0;
   if (tsMatch) {
@@ -290,11 +299,11 @@ function parseDoneHandlerLine(line) {
   return { sessionId: sid, agentMessageId: agentMsg, status: s === 'completed' ? 'completed' : 'canceled', at };
 }
 
-/** 单个 renderer.log → DoneHandler 事件数组（每轮一个，按 at 升序，不去重 sessionId） */
+/** One renderer.log → DoneHandler event array (one per round, ascending by at, sessionId not deduped) */
 function parseFileDoneHandlers(f) {
   const content = readLog(f);
   const out = [];
-  const seen = new Set(); // 同一行可能被重复扫 → 用 agentMessageId + at 去重
+  const seen = new Set(); // the same line may be scanned twice → dedup by agentMessageId + at
   for (const line of String(content || '').split('\n')) {
     const hit = parseDoneHandlerLine(line);
     if (!hit) continue;
@@ -306,17 +315,17 @@ function parseFileDoneHandlers(f) {
   return out.sort((a, b) => a.at - b.at);
 }
 
-/** 文件级缓存：path → { mtimeMs, size, handlers } */
+/** File-level cache: path → { mtimeMs, size, handlers } */
 const _doneFileCache = new Map();
-/** 全局 TTL 缓存（避免每次扫全盘）—— 跟 _cache（cancels）同 TTL */
+/** Global TTL cache (avoid scanning the whole disk every time) —— same TTL as _cache (cancels) */
 let _doneCache = { at: 0, list: null };
 
 /**
- * 扫所有 Trae renderer.log，汇总 DoneHandler 信号 → 事件数组
+ * Scan every Trae renderer.log, aggregate DoneHandler signals → event array
  * `[{sessionId, agentMessageId, status:'completed'|'canceled', at}, ...]`
- * 按 at 升序排列（每轮结束一条，不会被 sessionId 覆盖）。
+ * Sorted ascending by at (one per round's end, never overwritten by sessionId).
  *
- * 跟 allCancels() 同文件集、同 mtime+size 增量、同 TTL 15s。
+ * Same file set, same mtime+size increment, same TTL 15s as allCancels().
  */
 function allDoneHandlers() {
   const now = Date.now();
@@ -365,9 +374,10 @@ function allDoneHandlers() {
 }
 
 /**
- * 这条 TraeCode 会话最新一轮 DoneHandler 状态是什么。
+ * What the latest round's DoneHandler status of this TraeCode session is.
  * @param {string} sessionId
- * @returns {{status:'completed'|'canceled', at:number, agentMessageId:string}|null} null = 没扫到 DoneHandler（还在跑 / 没被识别）
+ * @returns {{status:'completed'|'canceled', at:number, agentMessageId:string}|null} null = no DoneHandler
+ *   scanned (still running / not recognized)
  */
 function traeDoneStatus(sessionId) {
   const sid = String(sessionId || '').trim();
@@ -383,8 +393,7 @@ function traeDoneStatus(sessionId) {
 
 
 
-
-/* ───────────── 原 traeTokens.js ───────────── */
+/* ───────────── formerly traeTokens.js ───────────── */
 
 
 
@@ -395,8 +404,8 @@ let _usagesCache = { at: 0, list: null };
 
 
 /**
- * 一行 renderer.log → token usage 事件（只认 action="show" 的那条，request_success 是前置、
- * request_fail 是取消场景，不拿它们当金额）。
+ * One line of renderer.log → token usage event (only the one with action="show" counts; request_success
+ * is a precursor and request_fail is a cancel scenario, neither is taken as the amount).
  * @returns {{sessionId:string, agentMessageId:string, userMessageId:string, usageYuan:number, ts:number}|null}
  */
 function parseUsageLine(line) {
@@ -426,7 +435,7 @@ function parseUsageLine(line) {
   };
 }
 
-/** 单个 renderer.log → 这一份文件里的 usage 事件数组 */
+/** One renderer.log → the usage event array in that file */
 function parseFileUsages(f) {
   const content = (() => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } })();
   const out = [];
@@ -443,8 +452,8 @@ function parseFileUsages(f) {
 }
 
 /**
- * 扫所有 Trae renderer.log，汇总所有 cn_session_usage_tail 事件。
- * 按 mtime+size 增量缓存（traeCancel.js 同口径）。
+ * Scan every Trae renderer.log, aggregate all cn_session_usage_tail events.
+ * Cached incrementally by mtime+size (same criterion as traeCancel.js).
  * @returns {Array<{sessionId:string, agentMessageId:string, userMessageId:string, usageYuan:number, ts:number}>}
  */
 function allTokenUsages() {
@@ -467,7 +476,7 @@ function allTokenUsages() {
     }
   }
 
-  // 文件级缓存：每个文件按 mtime+size 去重解析
+  // File-level cache: each file is parsed once per mtime+size
   const _fileCache = new Map();
   const results = [];
   for (const { f, mtimeMs, size } of files) {
@@ -482,8 +491,8 @@ function allTokenUsages() {
     results.push(...arr);
   }
 
-  // 全局去重：同 sessionId + agentMessageId 可能跨文件（老文件留存），
-  // 按 ts 最大的那个覆盖
+  // Global dedup: the same sessionId + agentMessageId may span files (old files are kept),
+  // the one with the largest ts wins
   const global = new Map();
   for (const r of results) {
     const key = r.sessionId + '|' + r.agentMessageId;
@@ -497,7 +506,7 @@ function allTokenUsages() {
 }
 
 /**
- * 只取某条会话的 token 消耗事件。
+ * Only the token consumption events of a given session.
  * @param {string} sessionId
  */
 function traeTokenOf(sessionId) {
@@ -507,40 +516,40 @@ function traeTokenOf(sessionId) {
 }
 
 
-/* ───────────── 子代理贡献（IdeSubagentContribution）─────────────
- * Trae IDE 的子代理（专家）不通过 hook 系统上报 Task/Agent 工具调用，
- * 只在 renderer.log 里留事后汇报信号。格式：
+/* ───────────── Subagent contributions (IdeSubagentContribution) ─────────────
+ * Trae IDE's subagents (experts) do not report Task/Agent tool calls through the hook system,
+ * they only leave a post-hoc report signal in renderer.log. Format:
  *   [tooling] [IdeSubagentContribution] downstream SDK report started:
  *     source=ide_subagent, sessionId=..., parentOperationId=..., operationId=...,
  *     documentUri=file:///..., acceptCodeLength=N, line=N
  *
- * source=ide_agent 的是主 agent 自己，不记；只认 source=ide_subagent。
- * 这是事后信号（子代理已完工、代码已被采纳），不能用来做实时幽灵——
- * 但能补录到任务详情的子代理调用列表里。
+ * source=ide_agent is the main agent itself and is not recorded; only source=ide_subagent counts.
+ * This is a post-hoc signal (the subagent has finished and its code was accepted), it cannot drive a live
+ * ghost —— but it can be backfilled into the subagent call list in task details.
  */
 
 /**
- * 一行 renderer.log → 子代理贡献事件。
- * 只认 IdeSubagentContribution 且 source=ide_subagent 的行。
+ * One line of renderer.log → subagent contribution event.
+ * Only IdeSubagentContribution lines with source=ide_subagent count.
  * @returns {{sessionId:string, operationId:string, documentUri:string, acceptCodeLength:number, at:number}|null}
  */
 function parseSubagentLine(line) {
   if (!line || !line.includes('IdeSubagentContribution')) return null;
-  // 只认 source=ide_subagent（主 agent 自己的不记）
+  // Only source=ide_subagent counts (the main agent's own is not recorded)
   if (!/source=ide_subagent/.test(line)) return null;
-  // 只认 report started / report succeeded（有 documentUri 的明细行），
-  // 跳过 report finished（汇总行，无 documentUri / acceptCodeLength）
+  // Only report started / report succeeded (the detail lines carrying documentUri),
+  // skip report finished (a summary line with no documentUri / acceptCodeLength)
   if (!/report (started|succeeded)/.test(line)) return null;
 
   const sessionId = (line.match(/sessionId=([^,]+)/) || [])[1] || '';
-  // operationId 是小写 o，不会误匹配 parentOperationId（大写 O）
+  // operationId has a lowercase o, so it never mismatches parentOperationId (capital O)
   const operationId = (line.match(/\boperationId=([^,]+)/) || [])[1] || '';
   const documentUri = (line.match(/documentUri=([^,]+)/) || [])[1] || '';
   const acceptCodeLength = parseInt((line.match(/acceptCodeLength=(\d+)/) || [])[1] || '0', 10);
 
   if (!sessionId || !operationId) return null;
 
-  // 时间戳：行首 ISO 格式
+  // Timestamp: ISO format at the start of the line
   const tsMatch = line.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+/);
   let at = 0;
   if (tsMatch) {
@@ -548,7 +557,7 @@ function parseSubagentLine(line) {
     if (Number.isFinite(t)) at = t;
   }
 
-  // documentUri 是 file:///... 格式，转成本地路径
+  // documentUri is in file:///... format, convert to a local path
   let filePath = '';
   if (documentUri) {
     try { filePath = decodeURIComponent(documentUri.replace(/^file:\/\//, '')); } catch { filePath = documentUri; }
@@ -557,7 +566,7 @@ function parseSubagentLine(line) {
   return { sessionId: sessionId.trim(), operationId: operationId.trim(), documentUri: filePath, acceptCodeLength, at };
 }
 
-/** 单个 renderer.log → 子代理贡献事件数组 */
+/** One renderer.log → subagent contribution event array */
 function parseFileSubagents(f) {
   const content = readLog(f);
   const out = [];
@@ -573,14 +582,14 @@ function parseFileSubagents(f) {
   return out;
 }
 
-/** 文件级缓存：path → { mtimeMs, size, list } */
+/** File-level cache: path → { mtimeMs, size, list } */
 const _subagentFileCache = new Map();
-/** 全局 TTL 缓存 */
+/** Global TTL cache */
 let _subagentCache = { at: 0, list: null };
 
 /**
- * 扫所有 Trae renderer.log，汇总子代理贡献事件。
- * 按 mtime+size 增量缓存（allCancels / allTokenUsages 同口径）。
+ * Scan every Trae renderer.log, aggregate subagent contribution events.
+ * Cached incrementally by mtime+size (same criterion as allCancels / allTokenUsages).
  * @returns {Array<{sessionId, operationId, documentUri, acceptCodeLength, at}>}
  */
 function allSubagentContribs() {
@@ -630,12 +639,12 @@ function allSubagentContribs() {
 }
 
 /**
- * 后台 flush：把 Trae 子代理贡献补录到 subagent_runs 表。
- * 由 flushBackend 调用（与 flushTraeDone / flushTraeYuan 同周期）。
- * @param {number} now 当前时刻
+ * Background flush: backfill Trae subagent contributions into the subagent_runs table.
+ * Called by flushBackend (same cycle as flushTraeDone / flushTraeYuan).
+ * @param {number} now current moment
  * @param {object} backend { bus, repo }
  */
-const postedSubagent = new Map(); // key → 过期时间戳（内存去重，重启后靠 DB hasSubagentByName 兜底）
+const postedSubagent = new Map(); // key → expiry timestamp (in-memory dedup, after a restart the DB's hasSubagentByName is the fallback)
 
 function flushTraeSubagents(now, backend) {
   const { repo } = backend || {};
@@ -643,7 +652,7 @@ function flushTraeSubagents(now, backend) {
   const contribs = allSubagentContribs();
   if (!contribs.length) return;
 
-  // sessionId → { projectId }，从 hook 状态文件反查（同 flushTraeDone / flushTraeYuan）
+  // sessionId → { projectId }, looked up from the hook state file (same as flushTraeDone / flushTraeYuan)
   const hookDir = hooksDir();
   const sidProject = new Map();
   try {
@@ -665,25 +674,26 @@ function flushTraeSubagents(now, backend) {
     const projectId = sidProject.get(sid);
     if (!projectId) continue;
 
-    // 找这条会话在贡献事件发生时正在运行的任务（串行执行 → started_at <= at 的最新一条）
+    // Find the task this session was running when the contribution event happened (serial execution → the
+    // newest one with started_at <= at)
     const task = repo.latestTaskBySession ? repo.latestTaskBySession.get(projectId, sid, c.at, c.at) : null;
     if (!task) continue;
 
-    // DB 级去重：同一父任务 + 同一 operationId 不重复补录
+    // DB-level dedup: the same parent task + the same operationId is not backfilled twice
     const exists = repo.hasSubagentByName ? repo.hasSubagentByName.get(task.id, c.operationId) : null;
     if (exists && exists.c > 0) continue;
 
-    // 内存级去重（避免同一 flush 周期内重复尝试）
+    // In-memory dedup (avoid retrying within the same flush cycle)
     const key = `${task.id}|${c.operationId}`;
     if (postedSubagent.get(key) > now) continue;
 
-    // 构造 member_id：subagent-<operationId 前 8 位>@<project>（与 hook 驱动的格式一致）
+    // Build member_id: subagent-<first 8 chars of operationId>@<project> (same format as hook-driven ones)
     const memberId = `subagent-${c.operationId.slice(0, 8)}@${projectId}`;
-    // files_json：改了哪些文件
+    // files_json: which files were changed
     const filesJson = c.documentUri
       ? JSON.stringify([{ path: c.documentUri, added: c.acceptCodeLength || 0, removed: 0 }])
       : null;
-    // result：采纳了多少行代码
+    // result: how many lines of code were accepted
     const result = c.acceptCodeLength > 0 ? `采纳 ${c.acceptCodeLength} 行` : '';
 
     try {
@@ -700,7 +710,7 @@ function flushTraeSubagents(now, backend) {
         endedAt: c.at || null,
       });
       postedSubagent.set(key, now + 10 * 60_000);
-    } catch { /* 补录失败不影响台账 */ }
+    } catch { /* a failed backfill does not affect the ledger */ }
   }
   for (const [k, v] of postedSubagent) if (v <= now) postedSubagent.delete(k);
 }
@@ -713,22 +723,23 @@ function flushTraeSubagents(now, backend) {
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 
-/** TraeCode 记"每个会话选了哪个模型"的那条 ItemTable key（前缀是用户 id，只认后缀） */
+/** The ItemTable key where TraeCode records "which model each session selected" (prefix is the user id, only the suffix is matched) */
 const TRAE_MODEL_KEY_SUFFIX = ':AI.agent.model.session_selected_model';
-/** vscdb 是 TraeCode 自己在写的库：开一次留一小会儿，别在 1.5s 快轮询里反复开 */
+/** vscdb is a DB TraeCode itself is writing: open it once and keep it a moment, do not reopen it on every 1.5s fast poll */
 const TRAE_MODEL_TTL_MS = 15_000;
 let traeModelCache = { at: 0, map: null };
 
-/** renderer.log 里模型变更事件的标记（行尾跟一段 JSON，逐行追加、只追加） */
+/** The marker of model-change events in renderer.log (the line ends with a chunk of JSON, appended line by line, append-only) */
 const TRAE_LOG_EVENT = 'session selected model changed';
-/** 日志扫描同样带 TTL + 按 mtime/size 增量：文件没变就不重读 */
+/** Log scanning also carries a TTL + an mtime/size increment: an unchanged file is not re-read */
 let traeLogCache = { at: 0, map: null };
-const traeLogFileCache = new Map(); // renderer.log 绝对路径 → { mtimeMs, size, map }
+const traeLogFileCache = new Map(); // renderer.log absolute path → { mtimeMs, size, map }
 
 /**
- * 从 TraeCode 的 modelId 里解出模型名：`solo_agent_1__deepseek-v4.1-flash_null` → `deepseek-v4.1-flash`。
- * 这个格式和 TraeCode 自己的 renderer.log 交叉核对过（`agent_1__Doubao-Seed-Code_null` ↔ `Doubao-Seed-Code`）。
- * 解不出来返回空串 —— 不猜。
+ * Get the model name out of TraeCode's modelId: `solo_agent_1__deepseek-v4.1-flash_null` → `deepseek-v4.1-flash`.
+ * This format was cross-checked against TraeCode's own renderer.log (`agent_1__Doubao-Seed-Code_null` ↔
+ * `Doubao-Seed-Code`).
+ * Returns an empty string when it cannot be decoded —— no guessing.
  */
 function traeModelName(modelId) {
   const s = String(modelId || '');
@@ -738,8 +749,8 @@ function traeModelName(modelId) {
 }
 
 /**
- * 老版 Trae 的「会话 → 当前选中模型」表（globalStorage state.vscdb）。
- * @returns {Object|null} 读不到（没装 / 库被占 / 没这条 key）就是 null
+ * Old Trae's "session → currently selected model" table (globalStorage state.vscdb).
+ * @returns {Object|null} null when it cannot be read (not installed / DB busy / no such key)
  */
 function traeSelectedModelsFromDb() {
   const now = Date.now();
@@ -760,13 +771,14 @@ function traeSelectedModelsFromDb() {
         }
       }
     } catch {
-      // 库被 TraeCode 占着 / 表结构不是预期的：这轮取不到就当没有，上层留空
+      // the DB is held by TraeCode / the table shape is not as expected: if it cannot be read this round
+      // it counts as absent, the upper layer leaves it empty
     } finally {
       if (db) {
         try {
           db.close();
         } catch {
-          /* 关不掉不影响读取结果 */
+          /* failing to close does not affect what was read */
         }
       }
     }
@@ -776,9 +788,10 @@ function traeSelectedModelsFromDb() {
 }
 
 /**
- * 解析一段 renderer.log 文本里的模型变更事件 → `{ sessionId: { agentLabel: { modelId } } }`。
- * 形状故意对齐 vscdb 那张表（只是键从 agentType 换成日志里的 agentLabel —— 值域一致，
- * selectedModelOf 的兜底链两头通用）。行尾 JSON 解析失败（半截行）就跳过这条。
+ * Parse the model-change events in a chunk of renderer.log text → `{ sessionId: { agentLabel: { modelId } } }`.
+ * The shape deliberately matches vscdb's table (only the key swaps agentType for the log's agentLabel ——
+ * the value domain is the same, so both ends of selectedModelOf's fallback chain work with it).
+ * A line whose trailing JSON fails to parse (a half-written line) skips that entry.
  */
 function parseTraeLogEvents(text) {
   const out = {};
@@ -795,7 +808,7 @@ function parseTraeLogEvents(text) {
       if (!sid || !modelId || !label) continue;
       (out[sid] = out[sid] || {})[label] = { modelId };
     } catch {
-      /* 半截行 / 非 JSON：跳过 */
+      /* half line / not JSON: skip */
     }
   }
   return out;
@@ -804,11 +817,11 @@ function parseTraeLogEvents(text) {
 
 
 /**
- * 新版 Trae 的兜底表：从 logs/<启动>/windowN/renderer.log 的事件流里汇总。
- * 按 mtime 增量：文件没变（mtime+size 都没动）直接复用上次的解析结果，
- * 只有正在写的那个文件会重读。目录按 mtime 升序处理，后处理的覆盖先处理的 —— 同一会话
- * 以最新一次事件为准。
- * @returns {Object|null} 一条事件都没有就是 null
+ * New Trae's fallback table: aggregated from the event stream in logs/<launch>/windowN/renderer.log.
+ * Incremental by mtime: an unchanged file (neither mtime nor size moved) reuses the previous parse result,
+ * and only the file currently being written is re-read. Directories are processed in ascending mtime order,
+ * later ones overwrite earlier ones —— the same session takes its latest event.
+ * @returns {Object|null} null when there is not a single event
  */
 function traeSelectedModelsFromLogs() {
   const now = Date.now();
@@ -825,7 +838,7 @@ function traeSelectedModelsFromLogs() {
           const st = fs.statSync(f);
           if (st.isFile()) files.push({ f, mtimeMs: st.mtimeMs, size: st.size });
         } catch {
-          /* 没有 renderer.log 的窗口：跳过 */
+          /* a window with no renderer.log: skip */
         }
       }
     }
@@ -854,9 +867,10 @@ function traeSelectedModelsFromLogs() {
 }
 
 /**
- * TraeCode 的「会话 → 当前选中模型」表：老版走 vscdb，新版走日志事件，按会话 id 合并
- * （同一会话 id 只会存在于其中一路；万一两路都有，结构化落盘的 vscdb 优先）。
- * @returns {Object|null} 两路都取不到就是 null
+ * TraeCode's "session → currently selected model" table: the old version goes through vscdb, the new one
+ * through log events, merged by session id (a given session id only exists on one of the two paths; if it
+ * somehow exists on both, the structured on-disk vscdb wins).
+ * @returns {Object|null} null when neither path yields anything
  */
 function traeSelectedModels() {
   const db = traeSelectedModelsFromDb();
@@ -867,10 +881,11 @@ function traeSelectedModels() {
 }
 
 /**
- * 这条 TraeCode 会话在用什么模型。
- * @param {string} sessionId hook payload 的 session_id
- * @param {string} agentType hook payload 的 agent_type（已落盘），决定取 agent / solo_agent 哪一项
- * @returns {string} 取不到返回空串
+ * Which model this TraeCode session is using.
+ * @param {string} sessionId the hook payload's session_id
+ * @param {string} agentType the hook payload's agent_type (already on disk), decides whether to take the
+ *   agent / solo_agent entry
+ * @returns {string} empty string when it cannot be had
  */
 function selectedModelOf(sessionId, agentType = '') {
   const sid = String(sessionId || '').trim();
@@ -890,15 +905,18 @@ function selectedModelOf(sessionId, agentType = '') {
 
 
 /**
- * Trae 的后台 flush：把"结束状态的唯一真相"补进台账。由 sessionRegistry 的楼层循环调用
- * （在通用 flush 之前跑，否则 superseded 会把 Trae 正常完成的 running 任务先改成 cancelled）。
- * 两个动作：① DoneHandler status → bus.endTask（最终状态真相）；② usage_tail → 只补金额。
+ * Trae's background flush: backfill "the only truth about the end state" into the ledger. Called by
+ * sessionRegistry's floor loop (it runs before the generic flush, otherwise superseded would first turn
+ * Trae's normally finished running tasks into cancelled).
+ * Two actions: ① DoneHandler status → bus.endTask (final state truth); ② usage_tail → only the amount is
+ * filled in.
  *
- * 这里集中了 5F 与台账交互的全部逻辑，调试 Trae 不必碰 sessionRegistry。
- * @param {object} ctx 框架提供的共享上下文（now / backend）
+ * All of 5F's interaction with the ledger is concentrated here, so debugging Trae never requires touching
+ * sessionRegistry.
+ * @param {object} ctx the shared context the framework provides (now / backend)
  */
-const postedDoneHandler = new Map(); // key → 过期时间戳
-const postedYuan = new Map(); // key → 过期时间戳
+const postedDoneHandler = new Map(); // key → expiry timestamp
+const postedYuan = new Map(); // key → expiry timestamp
 
 function flushTraeDone(now, backend) {
   const { bus, repo } = backend || {};
@@ -906,7 +924,7 @@ function flushTraeDone(now, backend) {
   const handlers = allDoneHandlers();
   if (!Object.keys(handlers).length) return;
 
-  // sessionId → { projectId, workspacePath }，从 hook 状态文件反查（同 flushTraeYuan）
+  // sessionId → { projectId, workspacePath }, looked up from the hook state file (same as flushTraeYuan)
   const hookDir = hooksDir();
   const sidProject = new Map();
   try {
@@ -915,8 +933,9 @@ function flushTraeDone(now, backend) {
       let j;
       try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
       if (!j || !j.sessionId) continue;
-      // Trae hook 在任务完成后会把 taskWorkspacePath 清空、把路径写入 done.workspacePath ——
-      // 与 Claude/CodeBuddy 一致，优先读 done.workspacePath 兜底（见 sessions.js:658、floorCodebuddy.js:242）
+      // The Trae hook clears taskWorkspacePath and writes the path into done.workspacePath once the task
+      // finishes —— same as Claude/CodeBuddy, prefer done.workspacePath as the fallback
+      // (see sessions.js:658, floorCodebuddy.js:242)
       const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || j.sessionWorkspacePath || '';
       if (!ws) continue;
       const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
@@ -924,7 +943,7 @@ function flushTraeDone(now, backend) {
     }
   } catch { /* no hook dir */ }
 
-  // 按 at 升序处理——最早的 DoneHandler 先匹配最早结束的 running 任务
+  // Process in ascending at —— the earliest DoneHandler matches the earliest finished running task first
   const sorted = [...handlers].sort((a, b) => a.at - b.at);
   for (const h of sorted) {
     const sid = h.sessionId;
@@ -955,9 +974,9 @@ function flushTraeDone(now, backend) {
         result: String(task.result || ''),
         form: task.form || '',
         sessionId: sid,
-        ts: h.at, // DoneHandler 写入时刻 = 这轮真实结束时刻
+        ts: h.at, // when DoneHandler was written = the real end moment of this round
       });
-    } catch { /* 补发失败不影响台账 */ }
+    } catch { /* a failed re-emission does not affect the ledger */ }
   }
   for (const [k, v] of postedDoneHandler) if (v <= now) postedDoneHandler.delete(k);
 }
@@ -976,7 +995,8 @@ function flushTraeYuan(now, backend) {
       let j;
       try { j = JSON.parse(fs.readFileSync(path.join(hookDir, f), 'utf8')); } catch { continue; }
       if (!j || !j.sessionId) continue;
-      // 同上：Trae hook 完成后 taskWorkspacePath 被清空，路径在 done.workspacePath 里
+      // Same as above: once the Trae hook finishes, taskWorkspacePath is cleared and the path lives in
+      // done.workspacePath
       const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || j.sessionWorkspacePath || '';
       if (!ws) continue;
       const proj = repo.getProjectByWorkspace ? repo.getProjectByWorkspace.get(path.resolve(ws)) : null;
@@ -1008,37 +1028,39 @@ function flushBackend(ctx) {
 }
 
 /**
- * 这口"在跑"的 reporter 相位是否被本楼层的取消标记作废。
- * TraeCode 取消时 Stop hook 不触发，相位冻在取消前那一口，只能靠 renderer.log 里
- * DoneHandler 的 status:"canceled" 那刻来戳破（见 traeCancelAt）。
- * 供 sessions.js 的 readReporterPhase 派发调用。
- * @param {object} j hook 状态文件
- * @param {object} sp 状态文件里的 sessionPhase
- * @param {number} slack 相位时间戳容差（ms）
+ * Whether this "running" reporter phase is voided by this floor's cancel marker.
+ * When TraeCode cancels, the Stop hook does not fire and the phase freezes at the moment before the cancel,
+ * so only the moment of DoneHandler's status:"canceled" in renderer.log can puncture it (see traeCancelAt).
+ * For readReporterPhase in sessions.js to dispatch.
+ * @param {object} j hook state file
+ * @param {object} sp the state file's sessionPhase
+ * @param {number} slack phase timestamp tolerance (ms)
  */
 function phaseSuperseded(j, sp, slack = 1_000) {
   const at = traeCancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
   return !!at && at + slack >= Number(sp.ts || 0);
 }
 
-/* ───────────── hook 事件处理（重构后补上） ─────────────
- * Trae IDE 的 hook 事件 payload 没有 session_id 字段,
- * runHookEvent 里 sessionId = String(ev.session_id || '') → 空串,
- * sessionGet/sessionSet 的 guard (if(!id)return) 直接让整条实时状态链路空转:
- *   Stop handler 里 get().taskId 永远 undefined → endTask 永远不调 → 任务永远 running。
+/* ───────────── Hook event handling (added after the refactor) ─────────────
+ * Trae IDE's hook event payload has no session_id field,
+ * so in runHookEvent sessionId = String(ev.session_id || '') → empty string,
+ * and the guard in sessionGet/sessionSet (if(!id)return) makes the whole live state chain spin in place:
+ *   in the Stop handler, get().taskId is forever undefined → endTask is never called → the task stays
+ *   running forever.
  *
- * 修复方案:handleHookEvent 入口处从已落盘的 Trae hook 状态文件里补 session_id,
- * 让 Trae 也走上 runHookEvent 的完整链路 (写内存 Map → Stop handler 能取到 taskId)。
+ * Fix: in handleHookEvent's entry point, fill session_id in from the Trae hook state file already on disk,
+ * so Trae also walks runHookEvent's full chain (writing to the in-memory Map → the Stop handler can get
+ * taskId).
  *
- * 同时覆盖 interruptedSince —— Trae 的取消信号在 renderer.log 里 (DoneHandler status:"canceled" /
- * stop_button / NotificationPort),不在 transcript 里,用 traeCancelAt 扫 renderer.log。 */
+ * interruptedSince is covered too —— Trae's cancel signal is in renderer.log (DoneHandler status:"canceled"
+ * / stop_button / NotificationPort), not in the transcript, so traeCancelAt scans renderer.log. */
 const { runHookEvent, sharedHookImpl } = require('./ingest/hookCommon');
 
 /**
- * 从已有的 Trae hook 状态文件里补 sessionId。
- * 同 workspacePath 匹配优先,找不到就退回最新的那份 (按 mtime)。
+ * Fill in sessionId from an existing Trae hook state file.
+ * Matching workspacePath takes priority; failing that it falls back to the newest one (by mtime).
  * @param {string} workspacePath
- * @returns {string} sessionId (空串 = 找不到)
+ * @returns {string} sessionId (empty string = not found)
  */
 function _inferSessionIdFromStateFile(workspacePath) {
   const dir = hooksDir();
@@ -1052,7 +1074,7 @@ function _inferSessionIdFromStateFile(workspacePath) {
 
   if (!files.length) return '';
 
-  // 优先匹配 workspacePath 对应的文件 (文件名 sanitize 过, 也做 sanitize 后再比)
+  // Prefer the file matching workspacePath (file names are sanitized, so sanitize before comparing)
   const wsPart = String(workspacePath || '').replace(/[^a-zA-Z0-9._-]/g, '_');
   if (wsPart) {
     for (const f of files) {
@@ -1061,12 +1083,12 @@ function _inferSessionIdFromStateFile(workspacePath) {
           const j = JSON.parse(fs.readFileSync(path.join(dir, f.name), 'utf8'));
           const sid = String(j.sessionId || '').trim();
           if (sid) return sid;
-        } catch { /* 跳过 */ }
+        } catch { /* skip */ }
       }
     }
   }
 
-  // 退回最新的那份
+  // Fall back to the newest one
   try {
     const j = JSON.parse(fs.readFileSync(path.join(dir, files[0].name), 'utf8'));
     return String(j.sessionId || '').trim();
@@ -1077,16 +1099,18 @@ function _inferSessionIdFromStateFile(workspacePath) {
 
 const traeImpl = {
   ...sharedHookImpl,
-  // Trae IDE 是独立产品形态:不是 VS Code 插件(isPluginClient 只认 vscode),
-  // 也不是 CLI('cli'),返回 'IDE' 让 clientLabel 返回基名 "TraeCode"(三个分支都不命中)
+  // Trae IDE is a standalone product form: not a VS Code plugin (isPluginClient only recognizes vscode),
+  // and not a CLI ('cli'); returning 'IDE' makes clientLabel fall back to the base name "TraeCode" (none of
+  // the three branches hit)
   formOf: () => 'IDE',
-  // Trae 的取消信号在 renderer.log 里 (DoneHandler status:"canceled" / stop_button / NotificationPort),
-  // 不在 transcript 里。用 traeCancelAt 扫 renderer.log。签名 (tp, since, sessionId) 第三个参数由 runHookEvent 传入。
+  // Trae's cancel signal is in renderer.log (DoneHandler status:"canceled" / stop_button /
+  // NotificationPort), not in the transcript. traeCancelAt scans renderer.log.
+  // Signature (tp, since, sessionId) —— the third parameter is passed in by runHookEvent.
   interruptedSince: (tp, since, sessionId) => Boolean(traeCancelAt(sessionId, since)),
 };
 
 async function handleHookEvent(ev, ctx) {
-  // Trae hook 事件 payload 没有 session_id —— 从已落盘的 hook 状态文件里补注入
+  // Trae hook event payloads carry no session_id —— inject it from the hook state file already on disk
   if (!String(ev.session_id || '').trim()) {
     const inferred = _inferSessionIdFromStateFile(ctx.workspacePath || '');
     if (inferred) ev.session_id = inferred;
@@ -1100,56 +1124,62 @@ module.exports = {
   client: 'trae',
   meta,
   flushBackend,
-  // 取消检测（原 traeCancel.js）
+  // Cancel detection (formerly traeCancel.js)
   allCancels,
   allDoneHandlers,
   traeDoneStatus,
-  // token 金额（原 traeTokens.js）
+  // Token amounts (formerly traeTokens.js)
   allTokenUsages,
   // Static subagent dirs (project / user level): read by this floor's own syncAgents
   agentDirs,
   // Register this floor's user / project subagents with the roster (see agentLevel.makeAgentSync)
   syncAgents: makeAgentSync(agentDirs, meta.agent),
   traeTokenOf,
-  // 子代理贡献补录（IdeSubagentContribution → subagent_runs）
+  // Subagent contribution backfill (IdeSubagentContribution → subagent_runs)
   allSubagentContribs,
-  // 模型补全（原 traeModels.js）
+  // Model completion (formerly traeModels.js)
   selectedModelOf,
   traeModelName,
   traeSelectedModels,
   parseTraeLogEvents,
-  // 统一接口别名
+  // Unified interface aliases
   cancelAt: traeCancelAt,
   modelOf: selectedModelOf,
   phaseSuperseded,
-  // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Trae 专属逻辑）
+  // Done / cancel marker synthesis: dispatched uniformly by readReporterDones (sessions.js's common code
+  // keeps no Trae-specific logic)
   synthMarks,
-  // hook 事件处理（落盘 reporter 状态文件 → 会话表 → 主控制台相位）
+  // Hook event handling (reporter state file on disk → session table → main console phase)
   handleHookEvent,
 };
 
 /**
- * 楼层特有的"完成/取消"标记合成，由 sessions.js 的 readReporterDones 统一派发。
- * 公共代码里不写任何 TraeCode 专属逻辑：这里只认 Trae 自己的 renderer.log（DoneHandler / allCancels）。
+ * Floor-specific "done/cancel" marker synthesis, dispatched uniformly by readReporterDones in sessions.js.
+ * No TraeCode-specific logic is written in the common code: this only recognizes Trae's own renderer.log
+ * (DoneHandler / allCancels).
  *
- * 为什么独立扫、不绑在 hook 状态文件的 `if (j.taskId)` 上：
- *   · Trae 取消时 Stop hook 不触发，唯一权威信号是 renderer.log。
- *   · hook 状态文件"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt；
- *     绑在 startedAt 上会让"上一轮取消 → 新一轮启动"窗口一过的旧取消信号被过滤掉。
- *   · 渲染层用 "phase.ts vs done.at 谁更新" 决定显示，done.at 旧但 phase.ts 新 → 新一轮覆盖 cancelled，
- *     不会误亮红灯，所以无需 smart 过滤。
+ * Why scan independently rather than hooking onto the state file's `if (j.taskId)`:
+ *   · When Trae cancels, the Stop hook does not fire, so renderer.log is the only authoritative signal.
+ *   · The hook state file is "one per session", and starting a new round overwrites the old taskId /
+ *     taskStartedAt wholesale; hooking onto startedAt would filter out the old cancel signal as soon as
+ *     the "previous round cancelled → new round started" window passes.
+ *   · The render layer decides what to show by "whose phase.ts vs done.at is newer"; an old done.at with a
+ *     new phase.ts → the new round overwrites cancelled, so no false red light and no smart filtering
+ *     needed.
  *
  * @param {object} ctx
  *   { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession }
  */
 function synthMarks(ctx) {
   const { workspacePath, client, hookBySid, clientHit, roundFilesOf, synthCancel, synthDone, bySession, now } = ctx;
-  // 完成/取消标记的新鲜期：与 sessions.js 的 j.done 读取同一口径（DONE_TTL_MS = 10 分钟）。
-  // renderer.log 里 3 天前的 DoneHandler 不加这层就会顶进 latest，旧会话的取消标记跨天复活。
+  // Freshness window of the done/cancel marker: same criterion as sessions.js reading j.done (DONE_TTL_MS =
+  // 10 minutes).
+  // Without this, a DoneHandler from 3 days ago in renderer.log would push into latest, and an old session's
+  // cancel marker would resurrect across days.
   const DONE_TTL_MS = 10 * 60_000;
-  // ── 先扫 DoneHandler（最终状态真相）──
-  // completed → 合成正常完成标记（cancelled:false，覆盖可能存在的 cancelled:true）
-  // canceled  → 合成取消标记（同 synthCancel）
+  // ── Scan DoneHandler first (final state truth) ──
+  // completed → synthesize a normal done marker (cancelled:false, overwriting a possible cancelled:true)
+  // canceled  → synthesize a cancel marker (same as synthCancel)
   const handlers = allDoneHandlers();
   for (const h of handlers) {
     const sid = h.sessionId;
@@ -1159,15 +1189,19 @@ function synthMarks(ctx) {
     const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
     if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;
     if (j && client && !clientHit(client, j.client)) continue;
-    // 上一轮的 DoneHandler 残留：h.at 属于更早的一轮（< 当前轮 taskStartedAt），
-    // 新一轮已经开始了就不该再把上一轮的完成/取消标记塞进 bySession —— reporter-phase
-    // 会把这份旧 done 连同新 taskTitle 一起返回，前端看到 doneAt 变化误以为任务完成。
+    // Leftover DoneHandler from the previous round: h.at belongs to an earlier round (< the current round's
+    // taskStartedAt), so once the new round has started the previous round's done/cancel marker must not be
+    // stuffed into bySession —— reporter-phase would return that old done together with the new taskTitle,
+    // and the frontend would see doneAt change and mistake it for "task finished".
     if (j && Number(j.taskStartedAt) && h.at < Number(j.taskStartedAt)) continue;
-    // TTL：3 天前的 DoneHandler 不该顶进 latest（旧会话的取消标记跨天复活）
+    // TTL: a DoneHandler from 3 days ago must not push into latest (an old session's cancel marker
+    // resurrecting across days)
     if (now && now - h.at > DONE_TTL_MS) continue;
     if (h.status === 'completed') {
-      // DoneHandler completed → 正常完成标记（cancelled:false），覆盖 bySession 里已有的 cancelled:true；
-      // 只在 DoneHandler at 更大时覆盖 —— completed 信号本应比取消信号晚到。
+      // DoneHandler completed → a normal done marker (cancelled:false), overwriting any cancelled:true
+      // already in bySession;
+      // only overwrite when DoneHandler's at is greater —— a completed signal should arrive later than a
+      // cancel signal.
       synthDone({
         id: sid,
         ws: hookWs || workspacePath || '',
@@ -1176,7 +1210,8 @@ function synthMarks(ctx) {
         files: [],
       });
     } else {
-      // DoneHandler canceled → 同 synthCancel；已有同取消（±5s 容差）则跳过，避免重复合成
+      // DoneHandler canceled → same as synthCancel; skip when the same cancel (±5s tolerance) already
+      // exists, to avoid synthesizing it twice
       const existing = bySession.get(sid);
       if (existing && existing.cancelled && Math.abs(Number(existing.at) - h.at) < 5_000) continue;
       synthCancel({
@@ -1189,8 +1224,8 @@ function synthMarks(ctx) {
     }
   }
 
-  // ── 再扫 allCancels（更早的取消信号，作补充）──
-  // DoneHandler 已给该会话写 mark → 跳过（DoneHandler 更权威）
+  // ── Then scan allCancels (the earlier cancel signal, as a supplement) ──
+  // If DoneHandler already wrote a mark for that session → skip (DoneHandler is more authoritative)
   const traeCancels = allCancels();
   const traeSids = Object.keys(traeCancels || {});
   if (traeSids.length) {
@@ -1200,9 +1235,10 @@ function synthMarks(ctx) {
       if (bySession.has(sid)) continue;
       const hook = hookBySid.get(sid);
       const j = hook ? hook.j : null;
-      // 同上：上一轮的取消信号（atC < 当前 taskStartedAt）跨轮复活，跳过
+      // Same as above: the previous round's cancel signal (atC < the current taskStartedAt) resurrecting
+      // across rounds, skip
       if (j && Number(j.taskStartedAt) && atC < Number(j.taskStartedAt)) continue;
-      // TTL：旧会话的取消标记过期了就不该顶进 latest
+      // TTL: an old session's cancel marker is expired and must not push into latest
       if (now && now - atC > DONE_TTL_MS) continue;
       const hookWs = j ? ((j.done && j.done.workspacePath) || j.taskWorkspacePath || '') : '';
       if (workspacePath && hookWs && path.resolve(hookWs) !== path.resolve(workspacePath)) continue;

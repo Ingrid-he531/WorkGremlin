@@ -1,22 +1,31 @@
 'use strict';
 
 /**
- * plugin.js —— IDE 插件（编辑器 globalStorage）落盘的**通用定位与公共约定**。
+ * plugin.js —— **generic location resolution and shared conventions** for IDE plugin
+ * (editor globalStorage) on-disk data.
  *
- * 本文件只做"与具体产品无关"的那一层，谁都别往这里塞某个楼层的知识：
- *   · 插件落在哪：globalStorageRoots（扩展数据根）/ workspaceStorageRoots（按工作区数据）
- *   · 在 globalStorage 里按**调用方给的**目录名正则 + 落盘标记找某个产品的插件存储根
- *     （findPluginStorage —— 匹配规则全部由调用方按楼层传入）
- *   · 插件来源共用的落盘窗口常量（IDLE_MS / … / DONE_TTL_MS）
+ * This file holds only the layer that is "independent of any specific product"; nobody should
+ * push knowledge of a particular floor in here:
+ *   · Where plugins land: globalStorageRoots (extension data roots) / workspaceStorageRoots
+ *     (per-workspace data)
+ *   · Finding one product's plugin storage root inside globalStorage by a **caller-supplied**
+ *     directory-name regex + on-disk marker (findPluginStorage —— all matching rules come from
+ *     the caller, per floor)
+ *   · On-disk window constants shared by plugin sources (IDLE_MS / … / DONE_TTL_MS)
  *
- * 各楼层**自己的**落盘格式一律留在各楼层文件里（见 floors.js 的 FLOOR_CONTRACT）：
- *   · 1F CodeBuddy 的 genie-history / todos / file-changes / message-queue → floorCodebuddy.js 的 pluginStore
- *   · 9F GitHub Copilot 的 session-store.db / state.vscdb                    → floorCopilot.js
- * sessions.js 的 listSessions 按 client 把落盘读取派发到对应楼层，本文件只被它们当成
- * "找目录 + 窗口常量"用 —— 不再出现任何产品目录名，也不再内置"所有插件产品的并集"这类兜底
- * （那个并集正是"9F 误扫 1F 落盘"的根因，见 server/test/taskSync.test.js [8]）。
+ * Each floor's **own** on-disk format stays in that floor's file (see FLOOR_CONTRACT in
+ * floors.js):
+ *   · 1F CodeBuddy's genie-history / todos / file-changes / message-queue → pluginStore in
+ *     floorCodebuddy.js
+ *   · 9F GitHub Copilot's session-store.db / state.vscdb                  → floorCopilot.js
+ * sessions.js's listSessions dispatches on-disk reads to the right floor by client, and uses
+ * this file only as "find the directory + window constants" —— no product directory names
+ * appear here anymore, and there is no built-in fallback like "the union of all plugin
+ * products" (that union was the root cause of "9F scanning into 1F's on-disk data", see
+ * server/test/taskSync.test.js [8]).
  *
- * 「绝不编造」纪律：找不到就是找不到，回空串 / 空数组，绝不猜。
+ * The "never fabricate" discipline: not found means not found —— return an empty string / empty
+ * array, never guess.
  */
 
 const path = require('node:path');
@@ -25,14 +34,14 @@ const { dataRoots, globalStorageRoots, isDir, isFile, readDir } = require('./roo
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 
-/** 落盘窗口（与 CLI 楼层对齐，sessionRegistry 的 TIMEOUT_MS = 60 分钟） */
-const IDLE_MS = 10 * 60_000; // 多久没动静算"不活跃"（插件 runtime 没有心跳，只能用文件时间）
-const BUSY_MS = 90_000; // 文件改动在这么久之内 → 认为正在动手
-const FRESH_MS = 2 * 60_000; // 落盘在这么久之内 → 这一轮对话还在推进（含纯推理、只读工具等拿不到文件/待办证据的情况）
-const LISTED_MS = 60 * 60_000; // 会话"还在下拉里"的窗口（见 sessions.js 说明）
-const DONE_TTL_MS = 10 * 60_000; // 完成标记的"新鲜期"：只有这么久之内结束的才算"刚发生"
+/** On-disk windows (aligned with the CLI floors; sessionRegistry's TIMEOUT_MS = 60 minutes) */
+const IDLE_MS = 10 * 60_000; // how long without activity counts as "inactive" (the plugin runtime has no heartbeat, so only file times can be used)
+const BUSY_MS = 90_000; // a file changed within this long → considered to be actively working
+const FRESH_MS = 2 * 60_000; // on-disk writes within this long → this round of conversation is still advancing (covers cases like pure reasoning or read-only tools that leave no file/todo evidence)
+const LISTED_MS = 60 * 60_000; // window in which a session is "still in the dropdown" (see the notes in sessions.js)
+const DONE_TTL_MS = 10 * 60_000; // "freshness" window of the done marker: only something that finished within this long counts as "just happened"
 
-/** 编辑器 workspaceStorage 目录（VS Code 按工作区存 state.vscdb 的地方） */
+/** Editor workspaceStorage directories (where VS Code keeps per-workspace state.vscdb) */
 function workspaceStorageRoots() {
   const out = [];
   for (const r of dataRoots()) {
@@ -47,13 +56,17 @@ function workspaceStorageRoots() {
 }
 
 /**
- * 插件存储根目录：按调用方给的目录名正则，在 globalStorage 里找出**这一个楼层**的插件目录。
- * 调用方一律传**自己楼层的** meta.pluginRe（别用"所有产品"的并集），并可用 marks 再确认
- * 这一份是"有会话落盘的那份"（例如 `github.copilot` 基础扩展与 `github.copilot-chat` 同前缀时，
- * 用 ['session-store.db'] 把没有会话库的那个挡掉）。
- * @param {RegExp|RegExp[]} re 该产品目录名匹配；**按给定顺序**在目录列表里找第一个命中。不传 = 不匹配。
- * @param {string[]} [marks] 命中目录里必须存在的子目录 / 文件名（任一即可）。空 = 不校验。
- * @returns {string} 命中的存储根绝对路径；找不到回 ''
+ * Plugin storage root: find **this one floor's** plugin directory inside globalStorage using
+ * the caller-supplied directory-name regex.
+ * Callers always pass **their own floor's** meta.pluginRe (never a union across "all products")
+ * and may additionally use marks to confirm this is "the one with session data on disk"
+ * (for instance, when `github.copilot` and `github.copilot-chat` share a prefix, pass
+ * ['session-store.db'] to filter out the one without a session store).
+ * @param {RegExp|RegExp[]} re directory-name matcher for this product; iterates the directory
+ *   list **in the given order** and takes the first hit. Omitted = no matching.
+ * @param {string[]} [marks] subdirectory / file names that must exist inside a hit directory
+ *   (any one suffices). Empty = no validation.
+ * @returns {string} absolute path of the matching storage root; '' when not found
  */
 function findPluginStorage(re, marks = []) {
   const list = (Array.isArray(re) ? re : re ? [re] : []).filter(Boolean);
@@ -71,12 +84,13 @@ function findPluginStorage(re, marks = []) {
 }
 
 module.exports = {
-  // 与产品无关的落盘定位
+  // Product-independent on-disk resolution
   dataRoots,
   globalStorageRoots,
   workspaceStorageRoots,
   findPluginStorage,
-  // 插件来源共用的落盘窗口常量（sessions.js / floorCopilot.js 共用，避免各定义一份）
+  // On-disk window constants shared by plugin sources (used by sessions.js / floorCopilot.js,
+  // so each does not have to define its own copy)
   IDLE_MS,
   BUSY_MS,
   FRESH_MS,

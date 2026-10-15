@@ -1,67 +1,77 @@
 'use strict';
 
 /**
- * 4F Claude Code（CLI 与 IDE 合并楼层）。
+ * 4F Claude Code (CLI and IDE merged floor).
  *
- * CLI 与 IDE 插件共用同一份 ~/.claude 配置、同一套 hook、同一个落盘目录，分不出来，
- * 合并成单楼层（见 server/src/products.js 文件头）。只有一路 cli 来源（CLI/Plugin 两形态都由它代表）。
- * 标准来源由 sessionRegistry 默认 handler 处理，本文件只声明元数据。
+ * The CLI and the IDE plugin share the same ~/.claude config, the same set of hooks and the same
+ * on-disk directory, and cannot be told apart, so they are merged into a single floor (see the header
+ * of server/src/products.js). There is only one cli source (both the CLI and Plugin forms are
+ * represented by it). Standard sources are handled by the sessionRegistry default handler; this file
+ * only declares metadata.
  */
 
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
 const {} = require('@workgremlin/shared');
-// 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
+// Generic fault-tolerant file reads (readJson / readDir) all come from roots, avoiding duplicate
+// definitions everywhere
 const { readJson, readDir, isFile } = require('./roots');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent directories (project-level / user-level): private knowledge of this floor, kept here
+// rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 const HOME = os.homedir();
 
 /**
- * Claude Code 的配置根 —— 配置、hook（settings.json）与会话落盘（projects/）都在它下面。
- * 认 CLAUDE_CONFIG_DIR（装 hook 那头早认了，找落盘这一头也得认，否则 ~/.claude 写死会偏）。
- * 这是 4F 自己私有的目录知识，放在本文件而非中央模块。
+ * Claude Code's config root —— config, hooks (settings.json) and session data (projects/) all live
+ * under it. Honors CLAUDE_CONFIG_DIR (the hook-installing side already did; the data-locating side
+ * has to as well, otherwise hardcoding ~/.claude skews results).
+ * This is 4F's own private directory knowledge, kept in this file rather than a central module.
  */
 function claudeHome() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
 }
 
 /**
- * 4F 的静态 subagent 定义目录：项目级 <ws>/.claude/agents、用户级 <claudeHome()>/agents。
- * 返回 [{ dir, level }]，项目级先于用户级。
+ * 4F static subagent definition directories: project-level <ws>/.claude/agents and user-level
+ * <claudeHome()>/agents.
+ * Returns [{ dir, level }], project level before user level.
  */
 function agentDirs(workspacePath) {
   return genericAgentDirs([claudeHome()], workspacePath);
 }
 
-/* ------------------------------ 打断检测 ------------------------------ */
+/* ------------------------------ Interrupt detection ------------------------------ */
 
-/** transcript 尾部读取窗口：打断标记永远写在末尾，长会话不必整份读 */
+/** Transcript tail read window: interrupt markers are always written at the end, so long sessions need not be read in full */
 const TRANSCRIPT_TAIL_BYTES = 128 * 1024;
 
 /**
- * transcript 文件缓存：path -> {m, size, sinceTs, res}
- * 按 mtime+size+sinceTs 增量，文件没变就不重读。
+ * Transcript file cache: path -> {m, size, sinceTs, res}
+ * Incremented by mtime+size+sinceTs; an unchanged file is never re-read.
  */
 const _claudeTailCache = new Map();
 
 /**
- * Claude / Qoder 风格 transcript 的**尾部窗口**：这一轮有没有被用户打断、以及打断前最后说了什么。
+ * The **tail window** of a Claude / Qoder style transcript: whether this round was interrupted by the
+ * user, and what it last said before the interrupt.
  *
- * 为什么必须由服务端来判：这两家（实测 2026-09-29，4F Claude Code 的 VS Code 扩展形态）
- * 用户按"停止"后**一个 hook 事件都不发** —— events.log 里 Stop / SessionEnd / Notification
- * 全无，事件流停在最后一次 PostToolUse，所以 hook 侧的 `turnInterrupted`（跑在 Stop 分支里）
- * 根本没机会执行。唯一权威的痕迹是 transcript 末尾那条 user 消息
- * `[Request interrupted by user]`（工具中途打断带 ` for tool use` 后缀）。
+ * Why the server has to judge this: after the user presses "stop", these two products (measured
+ * 2026-09-29 on 4F Claude Code's VS Code extension form) emit **not a single hook event** —— Stop /
+ * SessionEnd / Notification are all absent from events.log, the event stream stops at the last
+ * PostToolUse, so the hook side's `turnInterrupted` (which runs in the Stop branch) never gets a
+ * chance to execute. The only authoritative trace is that trailing user message in the transcript
+ * `[Request interrupted by user]` (a mid-tool interrupt carries the ` for tool use` suffix).
  *
- * 读法：只读文件**最后 128KB**（标记永远写在末尾，长会话不必整份读），按 mtime+size+sinceTs 缓存，
- * 同一个文件在标记落盘后只会被解析一次。逐行 `JSON.parse` 按结构判（`type:'user'` 且正文文本
- * 命中标记），工具结果 / 思考里带同名字符串一律不算。
+ * How it reads: only the **last 128KB** of the file (markers are always written at the end, so long
+ * sessions need not be read in full), cached by mtime+size+sinceTs, so once the marker lands each file
+ * is parsed only once. Judgment is structural via line-by-line `JSON.parse` (`type:'user'` with body
+ * text hitting the marker); the same string inside tool results or thinking never counts.
  *
  * @param {string} transcriptPath
- * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的标记，老一轮的不算
+ * @param {number} sinceTs start time of this round (0 = no filtering): only markers from this round
+ *   count, ones from earlier rounds do not
  * @returns {{interrupted:boolean, said:string, at:number}}
  */
 function claudeInterruptTail(transcriptPath, sinceTs = 0) {
@@ -91,7 +101,7 @@ function claudeInterruptTail(transcriptPath, sinceTs = 0) {
       try {
         fs.closeSync(fd);
       } catch {
-        /* 关不上也不影响这次读取 */
+        /* failing to close does not affect this read */
       }
     }
   } catch {
@@ -101,7 +111,8 @@ function claudeInterruptTail(transcriptPath, sinceTs = 0) {
   let said = '';
   let at = 0;
   for (const line of raw.split(/\r?\n/)) {
-    // 便宜先行：这一行连关键词、也不是 assistant 正文候选就跳过（尾部第一行多半是被截断的，解析会失败）
+    // Cheap check first: skip lines with neither the keyword nor a candidate assistant body (the first
+    // line of the tail is usually truncated and fails to parse)
     if (!line || !/interrupted|"role"\s*:\s*"assistant"/.test(line)) continue;
     let o = null;
     try {
@@ -123,7 +134,8 @@ function claudeInterruptTail(transcriptPath, sinceTs = 0) {
               .map((x) => x.text)
           : [];
     if (!texts.length) continue;
-    // 打断标记：一条 user 消息，正文（text part，不是 tool_result）就是 [Request interrupted by user]
+    // Interrupt marker: a user message whose body (a text part, not tool_result) is exactly
+    // [Request interrupted by user]
     if (o.type === 'user' && texts.some((t) => /^\s*\[?request interrupted by user/i.test(String(t)))) {
       interrupted = true;
       if (ts) at = Math.max(at, ts);
@@ -132,7 +144,7 @@ function claudeInterruptTail(transcriptPath, sinceTs = 0) {
     const role = String((msg && msg.role) || o.role || '');
     if (role === 'assistant') {
       const txt = texts.join('\n').trim();
-      if (txt) said = txt; // 取最后一段（覆盖前面的）
+      if (txt) said = txt; // take the last stretch (overwriting earlier ones)
     }
   }
   const res = { interrupted, said, at };
@@ -141,17 +153,20 @@ function claudeInterruptTail(transcriptPath, sinceTs = 0) {
 }
 
 /**
- * Claude Code 自己的**会话状态文件**：`<claudeHome>/sessions/<pid>.json`，
- * 一个运行中的 CLI 进程一个文件。字段实测（2026-09-29，2.1.281/2.1.283）：
+ * Claude Code's own **session state file**: `<claudeHome>/sessions/<pid>.json`, one file per running
+ * CLI process. Fields as measured (2026-09-29, 2.1.281/2.1.283):
  *   { pid, sessionId, cwd, startedAt, kind:'interactive', entrypoint:'cli'|'claude-vscode',
  *     status:'busy'|'idle', updatedAt, statusUpdatedAt }
  *
- * **这是 Claude Code 未公开的内部文件**（用户 2026-09-29 明确同意用它做兜底），格式随时可能变 ——
- * 所以读不到 / 缺字段 / 解析失败一律当"没有"，绝不猜；只按 sessionId **精确**匹配。
- * 关键实测：**idle 期间这个文件不再刷新**（statusUpdatedAt 一直冻在"翻 idle 的那一刻"），
- * 于是它就是"这一轮什么时候结束的"时间戳；反过来 status='busy' = 正在生成。
+ * **This is an undocumented internal Claude Code file** (the user explicitly agreed on 2026-09-29 to
+ * use it as a fallback), its format may change at any time —— so unreadable / missing fields / parse
+ * failures all mean "absent", never guess; and match strictly **by sessionId**.
+ * Key measurement: **it stops refreshing while idle** (statusUpdatedAt stays frozen at the moment it
+ * flipped to idle), which makes it exactly the timestamp of "when this round ended"; conversely
+ * status='busy' means it is generating right now.
  *
- * 目录列举缓存 2s、文件按 (mtime,size) 缓存 —— 每个扫盘周期会被问好几次，别每次都重读。
+ * Directory listing cached 2s, files cached by (mtime,size) —— every scan cycle asks several times, do
+ * not re-read each time.
  * @param {string} sessionId
  * @returns {{status:string, statusUpdatedAt:number, updatedAt:number, pid:number, entrypoint:string, kind:string}|null}
  */
@@ -173,7 +188,7 @@ function claudeSessionStatus(sessionId) {
     try {
       stat = fs.statSync(p);
     } catch {
-      continue; // 进程退出时文件可能被删掉：跳过，不猜
+      continue; // the file may be deleted when the process exits: skip, do not guess
     }
     const cached = _claudeSessData.get(p);
     let data = cached && cached.m === stat.mtimeMs && cached.size === stat.size ? cached.data : null;
@@ -182,91 +197,105 @@ function claudeSessionStatus(sessionId) {
       _claudeSessData.set(p, { m: stat.mtimeMs, size: stat.size, data });
     }
     if (!data || String(data.sessionId || '') !== sid) continue;
-    // 同一个 sessionId 可能同时有多份（老进程残留）→ 取 updatedAt 最新的那份
+    // The same sessionId can exist in several copies (leftovers of old processes) → keep the newest by
+    // updatedAt
     if (!best || Number(data.updatedAt || 0) > Number(best.updatedAt || 0)) best = data;
   }
   return best;
 }
 
-/** 开轮宽限期：刚提交那一瞬 CLI 可能还写着 idle，不设宽限会把正常一轮误判成取消 */
+/** Round-start grace: right after submitting, the CLI may still say idle; without this grace a normal round gets misjudged as cancelled */
 const CLAUDE_IDLE_GRACE_MS = 3_000;
 
 /**
- * 这一轮（状态文件 `j`）是不是被用户打断了；是的话给出**打断时刻**。
+ * Whether this round (state file `j`) was interrupted by the user; if so, give the **interrupt time**.
  *
- * 两个信号（都是"按了停止却一个 hook 事件都不发"那条路的兜底），取先命中的：
- *   ① `claudeInterruptTail`：transcript 尾部那条 `[Request interrupted by user]`
- *      —— 模型已经吐过字 / 正在跑工具时打断，CLI 与 IDE 扩展都会写；
- *   ② `~/.claude/sessions/<pid>.json` 写着 `status='idle'` 且 statusUpdatedAt 晚于本轮开始
- *      —— "刚提交、模型一个字都没吐就按 ESC"：transcript **一行都不写**、hook **一个事件都不发**，
- *         只有这里看得出（2026-09-29 接上；用户明确同意用这个未公开文件）。
- *         ⚠ 只在"本轮已经开始 ≥ CLAUDE_IDLE_GRACE_MS"之后才采信：开轮那一瞬 CLI 可能还写着
- *         idle（还没翻 busy），不设宽限会把刚提交的正常一轮误判成取消。
- *      取消时间用 statusUpdatedAt（**不拿"现在"冒充**）。
+ * Two signals (both fallbacks on the "pressed stop yet emitted not one hook event" path), first hit
+ * wins:
+ *   ① `claudeInterruptTail`: that trailing `[Request interrupted by user]` in the transcript
+ *      —— written by both the CLI and the IDE extension when interrupting while the model has already
+ *      spoken or a tool is running;
+ *   ② `~/.claude/sessions/<pid>.json` saying `status='idle'` with statusUpdatedAt later than this
+ *      round's start
+ *      —— "pressed ESC right after submitting, before the model uttered a word": the transcript gets
+ *         **not one line** and hooks emit **not one event**, so this is the only place it shows
+ *         (added 2026-09-29; the user explicitly agreed to use this undocumented file).
+ *         ⚠ Only trusted once "this round has been running ≥ CLAUDE_IDLE_GRACE_MS": at the very instant
+ *         a round starts the CLI may still say idle (not yet flipped to busy), and without the grace a
+ *         freshly submitted normal round gets misjudged as cancelled.
+ *      The cancel time is statusUpdatedAt (**not "now" impersonating it**).
  *
- * 另有一条硬前提：这一轮**没有收工标记**（`j.done` 早于本轮开始 = 上一轮残留，不算数）。
- * @param {any} j reporter 状态文件内容
- * @param {number} startedAt 本轮开始时刻
- * @returns {{hit:boolean, at:number, via:'transcript'|'idle'|''}} at=0 表示打断成立但拿不到时刻
+ * One more hard prerequisite: this round has **no wrap-up marker** (`j.done` earlier than this round's
+ * start = leftover from the previous round, does not count).
+ * @param {any} j reporter state file contents
+ * @param {number} startedAt start time of this round
+ * @returns {{hit:boolean, at:number, via:'transcript'|'idle'|''}} at=0 means the interrupt holds but no time is available
  */
 function claudeInterruptOf(j, startedAt) {
   const none = { hit: false, at: 0, via: '' };
   if (!j) return none;
-  // client 现在只描述形态（cli / vscode），楼层由调用方（claude/qoder reader）保证
+  // client now describes only the form (cli / vscode); the floor is guaranteed by the caller (the
+  // claude/qoder reader)
   const started = Number(startedAt) || 0;
   const doneAt = Number(j.done && j.done.at) || 0;
-  if (doneAt && (!started || doneAt >= started)) return none; // 这一轮已经正常收尾
+  if (doneAt && (!started || doneAt >= started)) return none; // this round already wrapped up normally
   const ci = claudeInterruptTail(j.transcriptPath, started);
   if (ci.interrupted) return { hit: true, at: Number(ci.at) || 0, via: 'transcript' };
   const st = claudeSessionStatus(j.sessionId);
   if (!st || String(st.status) !== 'idle') return none;
   const at = Number(st.statusUpdatedAt || st.updatedAt) || 0;
-  if (!at || !started || at < started) return none; // idle 是开轮之前翻的 → 那一轮还没结束
-  if (Date.now() - started < CLAUDE_IDLE_GRACE_MS) return none; // 刚开轮，别误伤
+  if (!at || !started || at < started) return none; // idle was flipped before this round started → that round has not ended
+  if (Date.now() - started < CLAUDE_IDLE_GRACE_MS) return none; // just started, do not misfire
   return { hit: true, at, via: 'idle' };
 }
 
-/* ------------------------------ 当前模型（selectedModelOf） ------------------------------ */
+/* ------------------------------ Current model (selectedModelOf) ------------------------------ */
 
 /**
- * Claude Code 的「会话 → 当前模型」补全。
+ * Claude Code's "session → current model" completion.
  *
- * 为什么放本文件（而不是单开一个 claudeModels.js）：跟 trae.js 同构 —— 这段是"某个产品的私有
- * 落盘格式怎么读"，而它读的正好是 claude.js 里打断检测也读的同一份 transcript
- * （`<claudeHome>/projects/<slug>/<session>.jsonl`），放一起最顺；单开文件反而把同一格式的解析
- * 劈成两半。
+ * Why it lives in this file (rather than a separate claudeModels.js): same structure as trae.js ——
+ * this chunk is "how to read one product's private on-disk format", and what it reads is exactly the
+ * same transcript that interrupt detection in claude.js also reads
+ * (`<claudeHome>/projects/<slug>/<session>.jsonl`), so keeping them together reads best; a separate
+ * file would split parsing of the same format in two.
  *
- * 为什么必须从落盘捞：**Claude Code 的 hook payload 里没有模型字段**。反编译 CLI 二进制的
- * payload schema 实测：UserPromptSubmit 只有 prompt / source / session_title，PreToolUse /
- * PostToolUse 只有工具字段；公共前缀是 session_id / transcript_path / cwd / permission_mode /
- * prompt_id / agent_id / agent_type / effort —— 都没有 model。只有 SessionStart 带一个可选的
- * model，那也拿不到"每轮用的是哪个模型"。所以 reporter 上报的 model 对 Claude 结构性地永远是
- * 空串（见 packages/reporter/src/hook.js），填这一列只能服务端读 transcript 自己补。
+ * Why it has to be fished out of disk: **Claude Code's hook payload has no model field**. Decompiling
+ * the CLI binary showed the payload schema: UserPromptSubmit carries only prompt / source /
+ * session_title, PreToolUse / PostToolUse only tool fields; the common prefix is session_id /
+ * transcript_path / cwd / permission_mode / prompt_id / agent_id / agent_type / effort —— none of them
+ * model. Only SessionStart carries an optional model, which still cannot tell "which model this round
+ * used". So the model reported by the reporter is structurally always an empty string for Claude (see
+ * packages/reporter/src/hook.js), and filling that column means the server reading the transcript and
+ * completing it itself.
  *
- * 真值在哪：`<claudeHome>/projects/<工程 slug>/<session_id>.jsonl`，每一条 assistant 行都带
- * `message.model`（实测形如 `deepseek-flash`）。取最后一条，即「本回合开始时生效的模型」。
+ * Where the truth is: `<claudeHome>/projects/<project slug>/<session_id>.jsonl`, where every assistant
+ * line carries `message.model` (measured values look like `deepseek-flash`). Take the last one, i.e.
+ * "the model in effect when this turn started".
  *
- * 取不到（没装 / 没这个会话 / 一条 assistant 都还没有）一律返回空串 —— 不拿默认模型冒充
- * （这条会话还没回复过就说"不知道"，不说成"用的是默认模型"）。
+ * Anything unavailable (not installed / no such session / not a single assistant line yet) returns an
+ * empty string —— never pass the default model off as the answer (if this session has not replied yet,
+ * say "do not know", not "it is using the default model").
  */
 
-/** 尾部窗口起步 64KB，找不到翻 4 倍；封顶 1MB（本机实测最长行 117KB，1MB 足够兜住） */
+/** Tail window starts at 64KB and quadruples when nothing is found; capped at 1MB (longest measured line locally: 117KB, so 1MB covers it) */
 const TAIL_START = 64 * 1024;
 const TAIL_MAX = 1024 * 1024;
 
-/** projects 下的一层工程目录：别每次调用都 readdir */
+/** One level of project directories under projects: do not readdir on every call */
 const DIR_TTL_MS = 30_000;
 let dirCache = { at: 0, dirs: null };
 
-/** 会话 -> 模型：热路径（UI 1.5s 轮询 → readReporterPhase，而它自己没有缓存）全靠这条缓存 */
+/** Session -> model: the hot path (the UI polls readReporterPhase every 1.5s and it has no cache of its own) relies entirely on this cache */
 const MODEL_TTL_MS = 15_000;
 const CACHE_MAX = 200;
 const modelCache = new Map();
 
 /**
- * 会话 id 能不能当文件名用。
- * 它从 HTTP 的 `?session=` 与 hook payload 来，是**外部输入**：不校验的话 `../../` 能穿出
- * projects 目录去读任意文件。真值实测是 UUID，这里只认保守字符集。
+ * Whether a session id can be used as a file name.
+ * It comes from HTTP's `?session=` and hook payloads, i.e. **external input**: without validation
+ * `../../` could escape the projects directory and read arbitrary files. The real value is a UUID, so
+ * only a conservative character set is accepted here.
  */
 function safeSessionId(id) {
   const s = String(id == null ? '' : id).trim();
@@ -275,7 +304,7 @@ function safeSessionId(id) {
   return /^[A-Za-z0-9._-]+$/.test(s) ? s : '';
 }
 
-/** `<claudeHome>/projects` 下的一层工程目录 */
+/** One level of project directories under `<claudeHome>/projects` */
 function projectDirs() {
   const now = Date.now();
   if (dirCache.dirs && now - dirCache.at < DIR_TTL_MS) return dirCache.dirs;
@@ -287,15 +316,16 @@ function projectDirs() {
       .filter((e) => e.isDirectory())
       .map((e) => path.join(root, e.name));
   } catch {
-    // 没装 / 没跑过：这轮当没有，上层留空
+    // not installed / never run: treat this round as "none" and let the upper layer leave it empty
   }
   dirCache = { at: now, dirs };
   return dirs;
 }
 
 /**
- * 这条会话的 transcript 绝对路径；找不到回空串。
- * 会话 id 就是文件名（products.js 文件头：三处实测 100% 一致），所以只需在工程目录里找同名文件。
+ * Absolute path of this session's transcript; empty string when not found.
+ * The session id is the file name (header of products.js: three measured locations agree 100%), so all
+ * that is needed is looking for a same-named file inside the project directories.
  */
 function transcriptOf(sessionId) {
   const name = `${sessionId}.jsonl`;
@@ -304,25 +334,27 @@ function transcriptOf(sessionId) {
     try {
       if (isFile(p)) return p;
     } catch {
-      // 这个工程目录里没有这条会话，接着看下一个
+      // this project directory has no such session; check the next one
     }
   }
   return '';
 }
 
 /**
- * 从文件尾部往前找出"最后一条 assistant 的 model"。
+ * Walk backwards from the end of the file to find "the last assistant's model".
  *
- * 为什么要反读而不是顺序读：transcript 动辄几百 KB ~ 几十 MB，而这个函数在轮询热路径上。
- * assistant 行密，尾巴上 64KB 基本一定捞得到；只在遇到超长行时翻倍升窗口，且封顶不整文件读
- * （cwdOfHead 是它的镜像，理由同 —— 见 sessionRegistry.js）。
+ * Why read backwards instead of sequentially: transcripts run hundreds of KB to tens of MB while this
+ * function sits on a polling hot path. Assistant lines are dense, so 64KB at the tail almost always
+ * catches one; the window only quadruples on very long lines, and it is capped so the whole file is
+ * never read (cwdOfHead is its mirror, same reasoning —— see sessionRegistry.js).
  *
- * 这里是"整窗解码 + 倒序逐行 parse"，不是"倒着分块拼接"：整窗一次读，窗口起点若不在文件头
- * 就丢掉第一个换行之前的残段 —— 被多字节字符截断的只可能是那段残段，所以解码后每一行都是
- * 完整的（0x0a 不会出现在多字节序列内部）。
+ * This is "decode the whole window + parse line by line in reverse", not "stitch chunks backwards": the
+ * window is read once, and when the window does not start at the file head, the fragment before the
+ * first newline is dropped —— the only thing a multibyte character can have split is that fragment, so
+ * every decoded line is complete (0x0a never occurs inside a multibyte sequence).
  *
- * @param {string} file transcript 路径
- * @returns {{model: string, mtimeMs: number, size: number}|null} 打不开回 null
+ * @param {string} file transcript path
+ * @returns {{model: string, mtimeMs: number, size: number}|null} null when it cannot be opened
  */
 function tailModel(file) {
   let fd;
@@ -332,8 +364,9 @@ function tailModel(file) {
     return null;
   }
   try {
-    // 用 fstat 而不是 statSync：拿到的是**这个 fd 上**的大小/时间，跟下面按位置读的是同一个
-    // inode。改名轮转时 fd 仍指着一致（哪怕已过期）的那份；被截断则会读到 n <= 0。
+    // fstat rather than statSync: it gives the size/time **on this fd**, i.e. the same inode the
+    // positional reads below hit. On rename rotation the fd still points at the consistent (if stale)
+    // copy; on truncation the read returns n <= 0.
     const st = fs.fstatSync(fd);
     const size = st.size;
     if (!size) return { model: '', mtimeMs: st.mtimeMs, size };
@@ -342,7 +375,8 @@ function tailModel(file) {
       const len = size - start;
       const buf = Buffer.alloc(len);
       const n = fs.readSync(fd, buf, 0, len, start);
-      // 该读到 len 个字节却读少了 = 文件正在被截断 / 轮转：宁可说不认识，也不拿半截去 parse
+      // Fewer bytes read than expected = the file is being truncated / rotated: better to say
+      // "unrecognized" than parse a half window
       if (n < len) return { model: '', mtimeMs: st.mtimeMs, size };
       let text = buf.toString('utf8');
       if (start > 0) {
@@ -357,17 +391,17 @@ function tailModel(file) {
         try {
           j = JSON.parse(line);
         } catch {
-          // 截断 / 正在写入的半行 / 非 JSON：跳过接着往前找（不拿正则救，那可能从 tool_result
-          // 里捞出个假的 model 来）
+          // truncated / half-written / non-JSON: skip and keep looking backwards (no regex rescue, that
+          // could fish a fake model out of a tool_result)
           continue;
         }
         if (!j || j.type !== 'assistant') continue;
-        // 子代理的回合（老格式会内联在父文件里）不是这条会话的模型，跳过
+        // Subagent turns (older formats inline them in the parent file) are not this session's model
         if (j.isSidechain === true) continue;
         const m = j.message && j.message.model;
         if (typeof m === 'string' && m.trim()) return { model: m.trim(), mtimeMs: st.mtimeMs, size };
       }
-      if (start === 0) break; // 已读到文件头，没有就是没有
+      if (start === 0) break; // reached the head of the file; absent means absent
     }
     return { model: '', mtimeMs: st.mtimeMs, size };
   } catch {
@@ -376,32 +410,34 @@ function tailModel(file) {
     try {
       fs.closeSync(fd);
     } catch {
-      /* 关不掉不影响已经读到的内容 */
+      /* failing to close does not affect what was already read */
     }
   }
 }
 
 /**
- * 这条 Claude Code 会话在用什么模型。
- * @param {string} sessionId hook payload 的 session_id（也是 transcript 的文件名）
- * @param {string} [_agentType] 为了和 trae.selectedModelOf 同签名；Claude 用不上
- * @returns {string} 取不到返回空串
+ * Which model this Claude Code session is using.
+ * @param {string} sessionId the hook payload's session_id (also the transcript's file name)
+ * @param {string} [_agentType] kept for the same signature as trae.selectedModelOf; Claude does not use it
+ * @returns {string} empty string when unavailable
  */
 function selectedModelOf(sessionId, _agentType = '') {
   const sid = safeSessionId(sessionId);
   if (!sid) return '';
   const now = Date.now();
 
-  // 缓存优先：命中就直接 stat 上一次那个文件，**不做目录扫描**（有几十个工程的用户
-  // 一次扫描要 stat 几十个目录，比真正读尾巴还贵）。文件没动过连读都不读。
+  // Cache first: on a hit, stat the file from last time directly with **no directory scan** (for a user
+  // with dozens of projects, one scan stats dozens of directories and costs more than actually reading
+  // the tail). Nothing is even read while the file is untouched.
   const hit = modelCache.get(sid);
   if (hit && now - hit.at < MODEL_TTL_MS) {
-    if (!hit.file) return ''; // 上次就没找到这条会话 —— 短期内不反复扫盘
+    if (!hit.file) return ''; // this session was not found last time —— do not rescan repeatedly
     try {
       const st = fs.statSync(hit.file);
       if (st.mtimeMs === hit.mtimeMs && st.size === hit.size) return hit.model;
     } catch {
-      // 文件没了：往下重新找一次（可能换了工程目录），找不到就把空结果也缓存住
+      // the file is gone: look it up again below (maybe the project directory changed); if it is still
+      // missing, cache the empty result too
     }
   }
 
@@ -418,7 +454,7 @@ function selectedModelOf(sessionId, _agentType = '') {
   return r ? r.model : '';
 }
 
-/** Claude Code 的 VS Code 扩展目录名：anthropic.claude-code-<版本> */
+/** Claude Code's VS Code extension directory name: anthropic.claude-code-<version> */
 const RE_CLAUDE_HOST = [/^anthropic\.claude/i];
 
 const meta = {
@@ -428,38 +464,42 @@ const meta = {
   cmd: 'claude',
   agent: 'claude',
   plugin: false,
-  // 只装 IDE 扩展的人这一层照样"装了"，altPluginRe 补抓安装证据。
+  // Someone who only installed the IDE extension still counts as "installed" here; altPluginRe picks up
+  // that install evidence.
   altPluginRe: RE_CLAUDE_HOST,
   sources: [{ kind: 'cli', label: 'CLI/Plugin' }],
   dataKind: 'claude',
-  // 落盘探测（findDataPath 用）
+  // On-disk detection (used by findDataPath)
   matchRe: [/^claude/i],
   homeDirs: [claudeHome()],
-  // CLI 会话文件落在 <dataRoot>/projects/<工程>/ 下，文件名即 session_id
+  // CLI session files land under <dataRoot>/projects/<project>/, named after session_id
   sessionSubtree: 'projects',
   sessionIdOfFile: (name) => String(name).replace(/\.jsonl$/i, ''),
 };
 
 /**
- * 这口"在跑"的 reporter 相位是否被本楼层的取消/打断标记作废。
- * 用户按停止但 hook 一个事件都不发（Claude Code / Qoder，见 claude.interruptTail）：transcript 末尾的
- * `[Request interrupted by user]`（或 ~/.claude/sessions 说 idle）比这口相位新 → 这口相位作废，
- * 否则取消标记亮完又被 stale 相位喂回「思考中 / 调用工具」。
- * 供 sessions.js 的 readReporterPhase 派发调用（公共相位读取只负责派发，打断知识归本楼层）。
- * @param {object} j hook 状态文件
- * @param {object} sp 状态文件里的 sessionPhase
- * @param {number} slack 相位时间戳容差（ms）
+ * Whether this "running" reporter phase is voided by this floor's cancel / interrupt marker.
+ * The user pressed stop yet hooks emitted no event at all (Claude Code / Qoder, see claude.interruptTail):
+ * if the trailing `[Request interrupted by user]` (or ~/.claude/sessions saying idle) is newer than this
+ * phase, the phase is void —— otherwise the cancel marker lights up and a stale phase immediately feeds
+ * it back into "thinking / calling tool".
+ * Called by readReporterPhase in sessions.js through dispatch (common phase reading only dispatches;
+ * interrupt knowledge belongs to this floor).
+ * @param {object} j hook state file
+ * @param {object} sp sessionPhase inside the state file
+ * @param {number} slack phase timestamp tolerance (ms)
  */
 function phaseSuperseded(j, sp, slack = 1_000) {
   const iv = claudeInterruptOf(j, Number(j.taskStartedAt) || 0);
   return iv.hit && (!iv.at || iv.at + slack >= Number(sp.ts || 0));
 }
 
-/* ============================================================== hook 事件（服务端落盘解析） */
+/* ============================================================== Hook events (server-side disk parsing) */
 
 /**
- * 服务端读 Claude 的 JSONL transcript，取这一轮（最后一条 user 之后）的 AI 回复。
- * 与 hookCommon.jsonlReplies 同口径（Claude/Codex 同款 JSONL）；保留导出名以兼容历史引用。
+ * The server reads Claude's JSONL transcript and takes this round's AI replies (after the last user
+ * line). Same criterion as hookCommon.jsonlReplies (Claude/Codex share the JSONL shape); the export
+ * name is kept for backwards compatibility.
  * @param {string} transcriptPath
  * @returns {Array<{id: string, text: string}>}
  */
@@ -468,15 +508,16 @@ function readClaudeReplies(transcriptPath) {
 }
 
 /**
- * 服务端 hook 事件处理（CLI hook 转发来的原始事件）。
+ * Server-side hook event handling (raw events forwarded by the CLI hook).
  *
- * 落盘解析全归服务端：本文件只提供 Claude 的"落盘差异"（回复解析 / 打断检测 / 形态判定），
- * 事件开关与文件/token/ghost 等公共逻辑全部委托 hookCommon.runHookEvent。会话状态由 dispatcher
- * 按 sessionId 持有（替代 hook 的 state 文件）。
+ * Disk parsing belongs entirely to the server: this file provides only Claude's "disk differences"
+ * (reply parsing / interrupt detection / form detection), while event gating and the common
+ * file/token/ghost logic are delegated to hookCommon.runHookEvent. Session state is held by the
+ * dispatcher keyed by sessionId (replacing the hook's state file).
  */
 const { runHookEvent, sharedHookImpl, jsonlReplies, headJsonLines } = require('./ingest/hookCommon');
 
-/** Claude 这一轮的形态（cli / plugin）：读 transcript 头部的 entrypoint */
+/** Claude's form this round (cli / plugin): read the entrypoint at the head of the transcript */
 function claudeForm(transcriptPath) {
   for (const obj of headJsonLines(transcriptPath)) {
     const ep = obj && typeof obj.entrypoint === 'string' ? obj.entrypoint.trim().toLowerCase() : '';
@@ -487,7 +528,7 @@ function claudeForm(transcriptPath) {
   return '';
 }
 
-/** Claude 的落盘差异：其余逻辑都在 hookCommon.runHookEvent；只覆盖与公有默认不同的接口，其余回退 sharedHookImpl */
+/** Claude differs only in how it reads its on-disk data: everything else lives in hookCommon.runHookEvent; only interfaces differing from the shared default are overridden, the rest falls back to sharedHookImpl */
 const claudeImpl = {
   ...sharedHookImpl,
   hasPermissionEvent: true,
@@ -507,35 +548,39 @@ module.exports = {
   meta, 
   RE_CLAUDE_HOST,
   claudeHome,
-  // 打断检测（统一模块组接口：interruptOf / interruptTail / sessionStatus）
+  // Interrupt detection (unified module-group interface: interruptOf / interruptTail / sessionStatus)
   interruptTail: claudeInterruptTail,
   sessionStatus: claudeSessionStatus,
   interruptOf: claudeInterruptOf,
   phaseSuperseded,
   CLAUDE_IDLE_GRACE_MS,
-  // 当前模型（读 transcript 补，hook payload 无 model 字段）
+  // Current model (completed by reading the transcript; the hook payload has no model field)
   selectedModelOf,
-  // 形态判定（cli / plugin）
+  // Form detection (cli / plugin)
   claudeForm,
   // Static subagent dirs (project / user level): read by this floor's own syncAgents
   agentDirs,
   // Register this floor's user / project subagents with the roster (see agentLevel.makeAgentSync)
   syncAgents: makeAgentSync(agentDirs, meta.agent),
-  // 取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 Claude/Qoder 专属逻辑）
+  // Cancel marker synthesis: dispatched uniformly by readReporterDones (the common code in sessions.js
+  // keeps no Claude/Qoder-specific logic)
   synthMarks,
-  // 服务端 hook 事件处理（落盘解析归服务端）：Claude 通过 hookCommon.runHookEvent 派发
+  // Server-side hook event handling (disk parsing belongs to the server): Claude dispatches through
+  // hookCommon.runHookEvent
   handleHookEvent,
   readClaudeReplies,
 };
 
 /**
- * 楼层特有的"取消"标记合成（Claude / Qoder 共用，两者都靠 transcript 尾部信号判断打断），
- * 由 sessions.js 的 readReporterDones 统一派发。
+ * Floor-specific "cancelled" marker synthesis (shared by Claude / Qoder; both judge interrupts from the
+ * transcript tail signal), dispatched uniformly by readReporterDones in sessions.js.
  *
- * 这两家用户按"停止"后**一个 hook 事件都不发** —— 唯一权威痕迹在 transcript 末尾那条
- * `[Request interrupted by user]`（或 Claude 自己的会话状态文件说 idle）。服务端在轮询时自己认
- * （见 claudeInterruptOf 的两个信号），合成取消标记，由 sessionRegistry 去重后补发 task/end(cancelled)。
- * 不设 TASK_RUN_MS 门槛：信号一到位就该亮，同一轮靠 (会话, 任务, at) 去重只补发一次。
+ * After the user presses "stop", these two products emit **not a single hook event** —— the only
+ * authoritative trace is that trailing `[Request interrupted by user]` (or Claude's own session state
+ * file saying idle). The server recognizes it itself while polling (see claudeInterruptOf's two
+ * signals), synthesizes a cancel marker, and sessionRegistry dedupes it before re-issuing
+ * task/end(cancelled). No TASK_RUN_MS threshold: once the signal is there it should light up, and the
+ * same round dedupes by (session, task, at) so it is re-issued only once.
  *
  * @param {object} ctx
  *   { workspacePath, client, allFiles, clientHit, roundFilesOf, synthCancel, now }
@@ -544,11 +589,12 @@ function synthMarks(ctx) {
   const { workspacePath, client, allFiles, clientHit, roundFilesOf, synthCancel, now } = ctx;
   for (const j of allFiles) {
     if (!j || !j.taskId) continue;
-    // client 现在只描述形态，楼层由调用方保证
+    // client now describes only the form; the floor is guaranteed by the caller
     const startedAtJ = Number(j.taskStartedAt) || 0;
     const iv = claudeInterruptOf(j, startedAtJ);
     if (!iv.hit) continue;
-    // 收尾自述只有 transcript 那条路有（idle 兜底认出来的早打断，本来就没吐过字）
+    // The wrap-up self-report only exists on the transcript path (an early interrupt recognized by the
+    // idle fallback never uttered a word at all)
     const ci = claudeInterruptTail(j.transcriptPath, startedAtJ);
     const id = String(j.sessionId || '');
     const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || '';

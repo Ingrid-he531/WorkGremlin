@@ -1,24 +1,32 @@
 'use strict';
 
 /**
- * 议事厅的提示词 —— 纯函数，不碰 IO（材料内容是调用方读好传进来的）。
+ * The council room's prompts —— pure functions, no IO (material content is read by the caller and
+ * passed in).
  *
- * 参与者能干什么，取决于**在哪儿谈**（见 agents.js）：
- *   · 隔离模式（工作目录 = 服务端现建的一次性临时目录）—— 它没有工具，读不到文件、跑不了
- *     命令、上不了网。所以背景材料必须由服务端**原样塞进提示词**，它才知道该讨论什么；
- *   · 工程模式（工作目录 = 用户的真实工程）—— 它有一套**只读**工具，可以自己去翻代码。
+ * What a participant can do depends on **where it is talking** (see agents.js):
+ *   · Isolated mode (working directory = a throwaway temp directory created by the server) —— it has
+ *     no tools, cannot read files, cannot run commands, cannot reach the network. So the background
+ *     material must be **stuffed into the prompt as-is by the server**, otherwise it has no idea
+ *     what is being discussed;
+ *   · Project mode (working directory = the user's real project) —— it has a **read-only** tool set
+ *     and can go dig through the code itself.
  *
- * 两种情况下都要把"你不知道什么"讲明白，免得它拿训练数据里的印象当事实说。
+ * In both cases "what you do not know" has to be spelled out, so it does not pass off impressions
+ * from its training data as facts.
  *
- * 另外，一场会两种谈法（councils.mode）：'vote' 表决（提案 + 数票判共识）、
- * 'analysis' 分析（不投票，各写各的分析与风险，服务端不合成结论）。
+ * Also, a meeting can run in two ways (councils.mode): 'vote' (proposal + count votes to decide
+ * consensus) and 'analysis' (no voting, each writes its own analysis and risks, and the server does
+ * not synthesize a conclusion).
  *
- * 另外要把"输出协议"写死，并且**由我们给出的例子本身带上围栏**：模型最爱模仿提示词里的
- * 格式，把例子写成它该交的样子，比用文字描述一遍可靠得多（解析端按"最后一个 JSON 块"取，
- * 见 agents.js 的 parseVoteBlock，所以中间出现的例子不会被误当结论）。
+ * The "output protocol" must be pinned down, and **the examples we give should carry the fences
+ * themselves**: models love to imitate the format in the prompt, so writing the example in the shape
+ * they should submit is far more reliable than describing it in prose (the parser takes "the last
+ * JSON block", see parseVoteBlock in agents.js, so intermediate examples are never mistaken for the
+ * conclusion).
  */
 
-/** 材料拼成一段文本；超限截断的事实必须写出来（谁看了都要知道给的内容不是全的） */
+/** Materials joined into one block of text; the fact of truncation must be spelled out (anyone reading it has to know the content given is not complete) */
 function renderMaterials(materials) {
   const list = Array.isArray(materials) ? materials : [];
   if (!list.length) return '';
@@ -35,12 +43,12 @@ function renderMaterials(materials) {
   return blocks.join('\n\n');
 }
 
-/** 表决模式的票型 → 中文（历史里给参与者看的那一版） */
+/** Vote type -> Chinese (the version shown to participants in the history) */
 const VOTE_ZH = { agree: '同意', disagree: '反对', abstain: '弃权' };
-/** 分析模式的立场 → 中文 */
+/** Stance -> Chinese (analysis mode) */
 const STANCE_ZH = { support: '支持', oppose: '反对', unsure: '不确定' };
 
-/** 前几轮发言按轮次列出。空历史返回 ''（第 1 轮没有人说过话） */
+/** List earlier speeches by round. Empty history returns '' (in round 1 nobody has spoken) */
 function renderHistory(history) {
   const list = Array.isArray(history) ? history : [];
   if (!list.length) return '';
@@ -54,8 +62,9 @@ function renderHistory(history) {
     const lines = byRound.get(roundNo).map((h) => {
       const who = `${h.floorId}${h.floorName ? ` ${h.floorName}` : ''}`;
       if (h.status !== 'ok') return `- ${who}：**未能发言**（${h.status}${h.error ? `：${h.error}` : ''}）`;
-      // 分析模式认 stance，表决模式认 vote —— 两种场子的发言都可能出现在历史里，
-      // 按谁来就标谁，都没有就不标（不猜立场）
+      // Analysis mode carries stance, vote mode carries vote —— speeches from either kind of meeting
+      // may show up in the history, so label whichever one is present, and label nothing when
+      // neither is (never guess a stance)
       const mark = h.stance ? STANCE_ZH[h.stance] : h.vote ? VOTE_ZH[h.vote] : '';
       const stance = mark ? `［${mark}］` : '';
       const reason = h.voteReason ? `\n  理由：${h.voteReason}` : '';
@@ -68,7 +77,7 @@ function renderHistory(history) {
   return chunks.join('\n\n');
 }
 
-/** 分析模式的结构化要点，拼成提示词里的三行。没给（null）就一个字都不加 */
+/** Structured points of analysis mode, rendered as three lines in the prompt. Nothing (null) adds not a single word */
 function renderFindings(f) {
   if (!f) return '';
   return [
@@ -82,13 +91,15 @@ function renderFindings(f) {
 }
 
 /**
- * 所有参与者共用的那段"你是谁、你不能干什么"。每轮都带上，防止它在多轮里忘掉。
+ * The "who you are and what you cannot do" block shared by every participant. Carried every round
+ * so it cannot forget over multiple rounds.
  *
- * 两档（`workspace` 有没有值），**能力边界必须说准**：说了"能读代码"它就会去读，
- * 说了"什么都没有"它就只能拿材料说话。说岔了它的行为就跟着岔。
+ * Two tiers (depending on whether `workspace` has a value), and **the capability boundary must be
+ * accurate**: say "you can read code" and it will read; say "you have nothing" and it can only
+ * speak from the material. Get it wrong and its behavior goes wrong with it.
  * @param {string} floorId
  * @param {string} floorName
- * @param {string|null} [workspace] 工作目录；空 = 隔离模式（无工具）
+ * @param {string|null} [workspace] working directory; empty = isolated mode (no tools)
  */
 function roleBlock(floorId, floorName, workspace) {
   const head = `你是 WorkGremlin 议事厅里【${floorId} ${floorName}】这一层的代表，正在参加一场多方讨论。`;
@@ -109,7 +120,7 @@ function roleBlock(floorId, floorName, workspace) {
   ].join('\n');
 }
 
-/** 输出协议。例子带上围栏，模型照抄格式最稳 */
+/** Output protocol. The example carries the fence, so copying the format is the safest bet */
 const OUTPUT_PROTOCOL = [
   '【本轮怎么回】',
   '1. 先用自然语言说你的看法（可以直接指出别人发言里的问题，也可以改变自己的立场）。',
@@ -131,9 +142,10 @@ const OUTPUT_PROTOCOL = [
 ].join('\n');
 
 /**
- * 分析模式的输出协议。**没有投票、没有提案、没有共识** —— 服务端不会去数票，
- * 也不会替它们合成一句结论；这里要的是"每人各自的分析"和"分歧在哪"。
- * 同样把例子带上围栏：模型照抄提示词里的格式，比用文字描述一遍可靠得多。
+ * Output protocol for analysis mode. **No voting, no proposal, no consensus** —— the server does not
+ * count votes and does not synthesize a conclusion for them; what is wanted here is "each one's own
+ * analysis" and "where the disagreement lies".
+ * The examples carry the fences too: copying the prompt's format beats describing it in prose.
  */
 const ANALYSIS_PROTOCOL = [
   '【本轮怎么回】',
@@ -150,13 +162,14 @@ const ANALYSIS_PROTOCOL = [
 ].join('\n');
 
 /**
- * 一轮的发言提示词。
+ * The speech prompt for one round.
  *
  * @param {{topic:string, materials:Array, proposal?:string, proposalFrom?:string,
  *          roundNo:number, maxRounds:number, history:Array,
  *          floorId:string, floorName:string,
  *          mode?:'vote'|'analysis', workspace?:string|null}} arg
- *   mode 缺省按 'vote'（老调用方不必改）；proposal / proposalFrom 只有表决模式用得上。
+ *   mode defaults to 'vote' (old callers need no change); proposal / proposalFrom are only used in
+ *   vote mode.
  * @returns {string}
  */
 function buildSpeechPrompt(arg) {
@@ -168,14 +181,16 @@ function buildSpeechPrompt(arg) {
     String(arg.topic || '').trim(),
   ];
 
-  // 工作目录写在议题下面：工程模式下这是它"该去哪儿找答案"的唯一线索
+  // The working directory goes under the topic: in project mode it is the only clue about "where to
+  // look for the answer"
   if (arg.workspace) parts.push('', '【工作目录】', String(arg.workspace));
 
   const mats = renderMaterials(arg.materials);
   if (mats) parts.push('', '【背景材料】', mats);
 
   if (analysis) {
-    // 分析模式没有"桌上那份提案"这回事 —— 摆出来的只有议题本身
+    // Analysis mode has no such thing as "the proposal on the table" —— all that is put forward is
+    // the topic itself
     parts.push('', `【第 ${arg.roundNo}/${arg.maxRounds} 轮】`);
     if (arg.roundNo === arg.maxRounds) parts.push('这是最后一轮 —— 请给出你的最终判断。');
   } else {
@@ -196,8 +211,9 @@ function buildSpeechPrompt(arg) {
 }
 
 /**
- * 议题陈述轮（第 0 轮）的文本 —— 这一轮**不调模型**，是服务端把题目摆上桌，
- * 落成一条 role='chair' 的发言，好让界面上的时间线从"议题是什么"开始。
+ * Text for the topic presentation round (round 0) —— this round **does not call a model**; it is the
+ * server putting the question on the table, recorded as a role='chair' speech so the timeline in the
+ * UI starts from "what the topic is".
  */
 function buildBriefText(topic, materials) {
   const mats = renderMaterials(materials);

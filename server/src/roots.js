@@ -1,16 +1,18 @@
 'use strict';
 
 /**
- * 通用「落盘扫描基础设施」—— 只认操作系统/编辑器的目录约定，**不含任何具体楼层（产品）的知识**。
+ * Generic "on-disk scanning infrastructure" —— it only knows the OS/editor directory conventions
+ * and contains **no knowledge of any specific floor (product)**.
  *
- * 楼层相关的「按名字匹配什么」「家目录哪些候选」「CLI 装在哪」「pluginRe 是什么」全部下放到
- * 各楼层的 meta（见 floors.js 注册表 + 各 <product>.js 文件）。本模块只回答：
- *   · 平台级应用数据根在哪（dataRoots）
- *   · 编辑器扩展/插件装在哪（extensionRoots / globalStorageRoots）
- *   · 怎么数一个目录的体积（scanDataDir）
- *   · 怎么按正则在某个根下找命中的子项（matchIn / firstMatch / firstExisting）
- * 这样 floors.js 只做「注册表 + 探测编排」，trae.js 等楼层模块直接复用这里的通用能力，
- * 谁都不用写重复的目录枚举。
+ * Everything floor-related —— "what to match by name", "which home directories are candidates",
+ * "where the CLI is installed", "what pluginRe is" —— is pushed down into each floor's meta
+ * (see the floors.js registry + each <product>.js file). This module answers only:
+ *   · Where the platform-level application data roots are (dataRoots)
+ *   · Where editor extensions/plugins are installed (extensionRoots / globalStorageRoots)
+ *   · How to measure the size of a directory (scanDataDir)
+ *   · How to find a matching child under a root by regex (matchIn / firstMatch / firstExisting)
+ * That way floors.js only does "registry + detection orchestration", floor modules like trae.js
+ * reuse the generic capabilities here directly, and nobody writes duplicate directory enumeration.
  */
 
 const fs = require('node:fs');
@@ -39,7 +41,7 @@ function isFile(p) {
   }
 }
 
-/** 读 JSON 文件（容错：解析失败/不存在回 null） */
+/** Read a JSON file (tolerant: returns null on parse failure / missing file) */
 function readJson(p) {
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -48,7 +50,7 @@ function readJson(p) {
   }
 }
 
-/** 读目录（容错：不存在/无权限回空数组） */
+/** Read a directory (tolerant: returns an empty array when missing / no permission) */
 function readDir(p) {
   try {
     return fs.readdirSync(p);
@@ -57,7 +59,7 @@ function readDir(p) {
   }
 }
 
-/** 把绝对路径缩成 ~ 开头，UI 里好读 */
+/** Shrink an absolute path to a ~ prefix, easier to read in the UI */
 function shorten(p) {
   if (!p) return '';
   if (HOME && p.startsWith(HOME)) return `~${p.slice(HOME.length)}`;
@@ -77,7 +79,7 @@ function humanSize(bytes) {
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
-/** PATH 里的命令解析成绝对路径 */
+/** Resolve a command on PATH into an absolute path */
 function resolveCommand(cmd) {
   try {
     const out = execSync(IS_WIN ? `where ${cmd}` : `command -v ${cmd}`, {
@@ -96,12 +98,12 @@ function resolveCommand(cmd) {
   }
 }
 
-/** 扫目录时跳过这些（又大又没信息量） */
+/** Skip these while scanning (big and uninformative) */
 const SKIP_DIRS = new Set(['node_modules', '.git', '.svn', 'cache', 'Cache', 'logs', 'GPUCache']);
 
 /**
- * 统计落盘数据：文件数、会话文件数（*.jsonl）、总字节、最后写入时间。
- * 有上限保护（深度 5 / 4000 个文件），避免大目录把接口拖死。
+ * Statistics for on-disk data: file count, session file count (*.jsonl), total bytes, last write time.
+ * Bounded (depth 5 / 4000 files) so huge directories cannot stall the endpoint.
  */
 function scanDataDir(dir) {
   let files = 0;
@@ -131,7 +133,7 @@ function scanDataDir(dir) {
         bytes += st.size || 0;
         if (!lastModifiedAt || st.mtimeMs > lastModifiedAt) lastModifiedAt = st.mtimeMs;
       } catch {
-        /* 忽略读不到的文件 */
+        /* ignore unreadable files */
       }
       if (files > 4000) return;
     }
@@ -147,10 +149,10 @@ function scanDataDir(dir) {
   };
 }
 
-/* ------------------------------ 候选根目录 ------------------------------ */
+/* ------------------------------ Candidate root directories ------------------------------ */
 
 let _overridesCache = null;
-/** 读一次配置文件（解析失败/不存在回空对象）；缓存避免每次扫盘都读盘 */
+/** Read the config file once (returns an empty object on parse failure / missing file); cached so rescanning does not hit the disk every time */
 function readOverrides() {
   if (_overridesCache) return _overridesCache;
   const file = productsOverridesPath();
@@ -164,12 +166,12 @@ function readOverrides() {
   return cfg;
 }
 
-/** 把开头的 ~ 展开成家目录 */
+/** Expand a leading ~ into the home directory */
 function expandHome(p) {
   return /^~([/\\]|$)/.test(p) ? path.join(HOME, p.replace(/^~[/\\]?/, '')) : p;
 }
 
-/** 合并「配置文件字段」+「环境变量」（env 优先同名，但二者都给则拼接去重）；~ 自动展开 */
+/** Merge the "config file field" + "environment variable" (env wins on the same name, but if both are given they are concatenated and deduped); ~ expands automatically */
 function extraDirs(field, env) {
   const out = new Set();
   const cfg = readOverrides();
@@ -181,7 +183,7 @@ function extraDirs(field, env) {
   return [...out];
 }
 
-/** 平台级应用数据根目录 */
+/** Platform-level application data roots */
 function dataRoots() {
   const roots = [];
   if (process.platform === 'darwin') {
@@ -196,7 +198,7 @@ function dataRoots() {
   return roots.filter(isDir);
 }
 
-/** 编辑器扩展目录（插件安装位置） */
+/** Editor extension directories (where plugins are installed) */
 function extensionRoots() {
   const base = [
     '.vscode',
@@ -221,7 +223,7 @@ function extensionRoots() {
     .filter(isDir);
 }
 
-/** 编辑器 globalStorage（插件的落盘位置） */
+/** Editor globalStorage (where plugins write their data) */
 function globalStorageRoots() {
   const out = [];
   for (const r of dataRoots()) {
@@ -236,7 +238,7 @@ function globalStorageRoots() {
   return out;
 }
 
-/** nvm 的 bin：<HOME>/.nvm/versions/node/<版本>/bin */
+/** nvm's bin: <HOME>/.nvm/versions/node/<version>/bin */
 function nvmBinDirs() {
   const root = path.join(HOME, '.nvm', 'versions', 'node');
   if (!isDir(root)) return [];
@@ -250,7 +252,7 @@ function nvmBinDirs() {
   }
 }
 
-/** 在某个根目录下找名字命中的子项（只看一层，快） */
+/** Find a child whose name matches under a root directory (one level only, fast) */
 function matchIn(root, res) {
   const list = res instanceof RegExp ? [res] : res || [];
   try {
@@ -263,7 +265,7 @@ function matchIn(root, res) {
     candidates.sort((a, b) => a.idx - b.idx || a.name.localeCompare(b.name));
     return path.join(root, candidates[0].name);
   } catch {
-    /* 读不到就跳过 */
+    /* unreadable: skip */
   }
   return '';
 }

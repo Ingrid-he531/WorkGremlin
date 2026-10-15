@@ -2,7 +2,7 @@
 
 const express = require('express');
 
-/** 楼层（受监控产品）及其安装位置 / 落盘信息。?refresh=1 强制重新扫盘 */
+/** Floors (monitored products) with their install locations / on-disk info. ?refresh=1 forces a rescan */
 function createProductsRouter() {
   const router = express.Router();
   router.get('/products', (req, res) => {

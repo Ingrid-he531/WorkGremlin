@@ -1,79 +1,91 @@
 'use strict';
 
 /**
- * 会话（conversation）—— 受监控产品在各个工程下开着的会话。
+ * Sessions (conversations) — the conversations a monitored product has open under each project.
  *
- * 同一层的 CLI 与 Plugin 两路落盘**不是同一份**，各自有各自的取法，但产出同一种会话行：
- *   · 插件那路（1F CodeBuddy 的插件形态）：就是本文件下面这套结构化落盘
- *     （genie-history / todos / message-queue / file-changes），能拿到运行态；
- *     TraeCode 的插件形态没有这套落盘（实测只有运行时文件），所以它那两路落盘
- *     （~/.trae-cn、~/.marscode）只作展示、不进会话来源（见 trae.js）。
- *   · CLI 那路（1F CodeBuddy、2F、3F、4F）：会话在各自的会话 jsonl 里，只有文件时间可靠；
- *   · hook 那路（5F TraeCode、1F CodeBuddy CLI 的兜底）：连 jsonl 都没有时，
- *     会话来源就是 reporter 状态文件（listReporterSessions）。
+ * The CLI and Plugin paths of the same floor write **different** on-disk state, each with its own way of
+ * reading it, but both produce the same kind of session row:
+ *   · The plugin path (1F CodeBuddy's plugin form): the structured on-disk layout described below in this
+ *     file (genie-history / todos / message-queue / file-changes), which exposes the running state;
+ *     TraeCode's plugin form has no such layout (measured: only runtime files), so its two on-disk
+ *     locations (~/.trae-cn, ~/.marscode) are display-only and do not enter the session sources
+ *     (see trae.js).
+ *   · The CLI path (1F CodeBuddy, 2F, 3F, 4F): sessions live in each product's session jsonl; only file
+ *     times are reliable.
+ *   · The hook path (5F TraeCode, the fallback of 1F CodeBuddy CLI): when there is not even a jsonl, the
+ *     session source is the reporter state file (listReporterSessions).
  *
- * 真源是插件自己的落盘（不经我们同意也一直在写），四个目录互相索引：
- *   genie-history/{base64(工程目录)}/conversations/{会话id}/   工程 ↔ 会话名单（目录本身是空的）
- *   genie-history/{base64(工程目录)}/current.json              { conversationId, lastUpdated } 该工程当前会话
- *   todos/{会话id}.json                                        { conversationId, todos:[{id,status,content}] }
- *   message-queue/*.json                                       每会话 runtime:{activated,paused,awaitingSessionIdle} + 排队消息
- *   file-changes/{会话id}/*.json                               改动文件（增删行 + diff）
+ * The true source is the plugin's own on-disk state (written continuously, with or without our consent);
+ * four directories index each other:
+ *   genie-history/{base64(project dir)}/conversations/{session id}/   project ↔ session roster (dir itself empty)
+ *   genie-history/{base64(project dir)}/current.json                   { conversationId, lastUpdated } that project's current session
+ *   todos/{session id}.json                                            { conversationId, todos:[{id,status,content}] }
+ *   message-queue/*.json                                               per session runtime:{activated,paused,awaitingSessionIdle} + queued messages
+ *   file-changes/{session id}/*.json                                   changed files (added/removed lines + diff)
  *
- * 下拉要的是**所有工程里活跃着的会话**（不限当前打开的那个工程），所以这里
- * 遍历 genie-history 下每个工程目录；一个活跃会话都没有 → reason: 'no-open-project'。
+ * The dropdown wants **the sessions active in every project** (not only the currently opened one), so this
+ * walks each project dir under genie-history; when there is not a single active session →
+ * reason: 'no-open-project'.
  *
- * 纪律（对齐 docs/requirements.md §P0-6「绝不编造」）：
- *   - 会话里**没有**职务 / 进度 / 耗时这些字段，一行都不补，拿不到就是拿不到；
- *   - 主 Agent 的阶段是从 runtime + todos + 文件改动**推**出来的，全部标 `inferred: true`，
- *     UI 侧要按"推断"展示（灰显 + 标注），不能当成上报值。
+ * Discipline (aligned with docs/requirements.md §P0-6 "never fabricate"):
+ *   - Sessions have **no** role / progress / elapsed fields; not one is filled in — unreachable means
+ *     unreachable;
+ *   - The main agent's phase is **inferred** from runtime + todos + file changes; every result carries
+ *     `inferred: true`, and the UI must present it as inferred (greyed + labelled), never as reported truth.
  *
- * 扫盘便宜（几十个文件），缓存 5 秒足够。
+ * Scanning the disk is cheap (a few dozen files); a 5-second cache is enough.
  */
 
 const fs = require('node:fs');
 const path = require('path');
 // WorkGremlin's own storage locations (the state-file dir) come from shared/paths.js.
 const { hooksDir } = require('@workgremlin/shared/paths');
-// 通用落盘扫描基础设施（目录约定 + 容错文件读取），readJson / readDir 统一从 roots 取，不在各处重复定义
+// Generic on-disk scanning infrastructure (dir conventions + tolerant file reads); readJson / readDir come
+// from roots so they are not redefined everywhere
 const { readJson, readDir } = require('./roots');
-// 楼层模块注册表（floors.js）：会话标题按 client 派发到对应楼层模块时要用 registry 里的 sessionTitle
+// Floor module registry (floors.js): needed when dispatching session titles by client to the registry's
+// sessionTitle
 const { floors: floorRegistry } = require('./floors');
-// 楼层能力模块（module group）：每个楼层（trae / claude / codebuddy / copilot）实现同一份
-// "会话能力"接口，sessions.js 一律用 `楼层.能力` 成员访问。新增楼层 = 在 FLOORS 里加一行
-// require + 在该 floor 模块里实现需要的几个能力，调用点不用改。
-//   selectedModelOf(sessionId, agentType)  当前模型（hook payload 无 model 字段的楼层才有）
-//   cancelAt(sessionId, sinceTs)           这一轮被取消的时刻（0 = 未取消）
-//   allCancels()                           全量取消扫描 → { [sessionId]: 时刻 }
-//   allDoneHandlers()                      DoneHandler 终态（trae 特有）
-//   interruptOf(j, startedAt)              打断检测（claude / qoder）
+// Floor capability modules (module group): every floor (trae / claude / codebuddy / copilot) implements the
+// same "session capability" interface, and sessions.js always reaches it as `floor.capability`. Adding a
+// floor = one require line in FLOORS + implementing whichever capabilities that floor module needs; call
+// sites stay untouched.
+//   selectedModelOf(sessionId, agentType)  current model (only floors whose hook payload has no model field)
+//   cancelAt(sessionId, sinceTs)           when this turn was cancelled (0 = not cancelled)
+//   allCancels()                           full cancel scan → { [sessionId]: time }
+//   allDoneHandlers()                      DoneHandler terminal state (trae only)
+//   interruptOf(j, startedAt)              interrupt detection (claude / qoder)
 //   interruptTail(path, sinceTs)
 //   sessionStatus(sessionId)
 const trae = require('./floorTrae');
 const claude = require('./floorClaude');
 const codebuddy = require('./floorCodebuddy');
 const copilot = require('./floorCopilot');
-// 插件结构化落盘读取器（genie-history / todos / message-queue / file-changes / Copilot SQLite）：
-// 所有 plugin kind 的取数都收口在 plugin.js，本文件只负责把这些落盘 + reporter 状态文件
-// 综合成会话行，不再掺和插件的内部目录结构。
+// Plugin structured on-disk readers (genie-history / todos / message-queue / file-changes / Copilot SQLite):
+// every plugin-kind read is funneled into plugin.js; this file only combines that on-disk state with the
+// reporter state files into session rows and no longer meddles with the plugin's internal dir layout.
 const plugin = require('./plugin');
 
-// qoder 与 claude 共用同一套 transcript 打断检测（见 claude.synthMarks），
-// 直接别名到 claude 模块，公共派发里就不必为它写特判了。
+// qoder and claude share the same transcript interrupt detection (see claude.synthMarks), so alias it
+// straight to the claude module and the generic dispatcher needs no special case for it.
 const qoder = claude;
 const FLOORS = { trae, claude, codebuddy, copilot, qoder };
 
-// 落盘窗口常量（与 CLI 楼层对齐）定义在 plugin.js，sessions.js / copilot.js 共用同一份，避免各定义一遍
+// The flush-window constants (aligned with the CLI floors) live in plugin.js and are shared by sessions.js /
+// copilot.js so they are not defined twice
 const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
 
 /**
- * 按 client（楼层基名）找楼层模块。楼层的"插件结构化落盘读取器 / 落盘标记"都挂在楼层模块上
- * （见 floorCodebuddy 的 pluginStore），本文件只按 client 派发，不掺任何产品的内部目录结构。
+ * Find a floor module by client (floor base name). A floor's "plugin structured readers / disk markers" hang
+ * off the floor module (see floorCodebuddy's pluginStore); this file only dispatches by client and knows no
+ * product's internal dir layout.
  */
 function floorModuleOf(client) {
   return FLOORS[String(client || '').trim().toLowerCase()] || null;
 }
 
-/** 空读取器：楼层没实现 pluginStore（如 9F Copilot 走自己的 SQLite）时用它，读到的都是"没有" */
+/** Empty reader: used when a floor has no pluginStore (e.g. 9F Copilot reads its own SQLite); everything
+ *  reads as "none" */
 const EMPTY_PLUGIN_STORE = {
   readTodos: () => ({ total: 0, done: 0, doing: '', items: [], at: 0 }),
   readFileChanges: () => ({ count: 0, recent: [], lastAt: 0 }),
@@ -81,7 +93,8 @@ const EMPTY_PLUGIN_STORE = {
   collectProjects: () => [],
 };
 
-/** 这一路（client）的插件结构化落盘读取器；楼层没实现就回空读取器（读不到就是读不到） */
+/** This path's (client's) plugin structured reader; a floor without one falls back to the empty reader
+ *  (unreadable means unreadable) */
 function pluginStoreOf(client) {
   const mod = floorModuleOf(client);
   return (mod && mod.pluginStore) || EMPTY_PLUGIN_STORE;
@@ -89,13 +102,15 @@ function pluginStoreOf(client) {
 
 
 /**
- * 插件落盘这一路的来源客户端：**按楼层传入**，不再写死。
- * reporter 的状态文件按客户端分开写（同一个工程里 CodeBuddy / Codex / Claude … 各一份），
- * 每个插件楼层（1F CodeBuddy 的插件那一路、5F TraeCode-Plugin、未来的 Codex-Plugin …）只认自己
- * 这一路 —— 否则切到某层会看见别层在敲的命令、收工时还弹别层的「任务完成」。
- * 调用方（sessionRegistry）传的是**楼层基名**（'codebuddy' / 'trae' …）—— 与上报状态文件里的
- * `client` 一字不差（见 hookCommon 的 `client = ev.agent`）。形态（CLI / 插件）走 `form`，不进身份，
- * 所以这里就是**等值比对**（大小写归一），不认任何 `-plugin` 后缀、也不是一串。
+ * The source client of the plugin on-disk path: **passed in per floor**, never hardcoded.
+ * The reporter writes its state files per client (CodeBuddy / Codex / Claude … each has its own inside the
+ * same project), and every plugin floor (1F CodeBuddy's plugin path, 5F TraeCode-Plugin, a future
+ * Codex-Plugin …) recognizes only its own path — otherwise switching to one floor would show the commands
+ * another floor is typing, and pop another floor's "task done" at closing time.
+ * Callers (sessionRegistry) pass the **floor base name** ('codebuddy' / 'trae' …) — character for character
+ * the `client` in the reported state file (see hookCommon's `client = ev.agent`). The form (CLI / plugin)
+ * travels as `form` and is not part of the identity, so this is a plain **equality comparison**
+ * (case-normalized): no `-plugin` suffix is recognized, and it is not a list.
  */
 
 function clientHit(want, got) {
@@ -103,79 +118,93 @@ function clientHit(want, got) {
   return String(want).trim().toLowerCase() === String(got || '').trim().toLowerCase();
 }
 
-/** 缓存：列表扫盘 + 读十几个小 json，5 秒足够 */
+/** Cache: listing scans the disk + reads a dozen small json files; 5 seconds is enough */
 const TTL = 5_000;
 let cache = { at: 0, key: '', value: null };
 
 /**
- * 本进程（server）的启动时刻 —— "纪元"起点。
- * reporter 把相位写进本地状态文件、且不会被主动删除；上次运行（尤其被 kill/崩溃、
- * 没走 SessionEnd）留下的相位会在重启后被重新读到，表现为"已关闭的工程又亮了思考中"。
- * 所以只采信"本进程启动之后"写入的相位：重启后一律先回到待命，等下一个新事件再点亮。
- * 用时间戳比较而不是"退出时删文件"，是因为删除依赖干净退出，kill -9 / 崩溃时根本删不到。
+ * The start moment of this process (server) — the origin of the "epoch".
+ * The reporter writes phases into local state files and never deletes them on its own; a phase left behind
+ * by the previous run (especially after a kill/crash without SessionEnd) is re-read after a restart and shows
+ * up as "a closed project lights up thinking again". So only phases written **after this process started**
+ * are trusted: after a restart everything goes back to idle first and lights up again on the next new event.
+ * Comparing timestamps instead of "delete the file on exit" because deletion depends on a clean exit, and
+ * kill -9 / a crash never reaches it.
  */
 const SERVER_STARTED_AT = Date.now();
 
-// 落盘窗口常量（IDLE_MS / BUSY_MS / FRESH_MS / LISTED_MS / DONE_TTL_MS）与 Copilot 共享，
-// 统一定义在 plugin.js，避免 sessions.js / copilot.js 各写一份。上面已由 `const { ... } = plugin` 引入。
+// The flush-window constants (IDLE_MS / BUSY_MS / FRESH_MS / LISTED_MS / DONE_TTL_MS) are shared with
+// Copilot and defined centrally in plugin.js, so sessions.js / copilot.js do not each write their own copy.
+// They are already imported above via `const { ... } = plugin`.
 
-/* ------------------------------ 会话数据 ------------------------------ */
-/** 每个会话的待办 / 改动文件 / 消息队列运行态按 client 派发到楼层的 pluginStore（见 floorCodebuddy.js）。 */
+/* ------------------------------ Session data ------------------------------ */
+/** Each session's todos / changed files / message-queue runtime are dispatched by client to the floor's
+ *  pluginStore (see floorCodebuddy.js). */
 
 const AWAIT_TTL_MS = 5 * 60_000;
 /**
- * 任务"还在跑"的判定窗口：只有最近**有过 hook 事件**（UserPromptSubmit / PreToolUse /
- * PostToolUse / Notification …）才算这一轮在生成。心跳守护的 `hb.lastEventAt` 不能算——
- * 它只证明 IDE 会话还开着，不证明 agent 在干活。
+ * The window that decides whether a task "is still running": only a **recent hook event**
+ * (UserPromptSubmit / PreToolUse / PostToolUse / Notification …) means this turn is generating. The heartbeat
+ * daemon's `hb.lastEventAt` does not count — it only proves the IDE session is still open, not that the agent
+ * is working.
  *
- * 为什么需要它：CodeBuddy IDE 在「思考中 / 调用工具」时按 ESC 取消，既不发 Stop 也不发
- * Interrupt（实测 events.log 无此事件），但 IDE 会话没关、心跳守护照跳，于是 taskId 一直
- * 占着、sessionPhase 冻在最后一笔（tool / thinking）。旧逻辑拿 hb.lastEventAt 当新鲜度，
- * inWindow / sessionPhase 永远回落不下来 → 主控制台一直显示「调用工具 / 思考中」，实则那
- * 一轮早被掐断了。改成只看 hook 事件时间：取消后没有新事件，超过这个窗口就当这轮结束、回落待命。
- * 窗口与 inferPhase 的 FRESH_MS 对齐（2 分钟）——项目统一口径："近 2 分钟没活动就不当它在忙"。
+ * Why it is needed: pressing ESC in CodeBuddy IDE while it is "thinking / calling a tool" cancels the turn
+ * and sends neither Stop nor Interrupt (measured: no such event in events.log), yet the IDE session stays open
+ * and the heartbeat daemon keeps ticking, so taskId stays occupied and sessionPhase freezes on its last value
+ * (tool / thinking). The old logic used hb.lastEventAt as freshness, so inWindow / sessionPhase could never
+ * fall back → the main console kept showing "calling a tool / thinking" although that turn had long been cut.
+ * Now only hook event times count: after a cancel there are no new events, so past this window the turn counts
+ * as ended and falls back to idle. The window matches inferPhase's FRESH_MS (2 minutes) — the project's
+ * uniform rule: "no activity in the last 2 minutes means it is not busy".
  *
- * 已知取舍：一次 hook 事件都没有的中途长工具（比如跑了 >2 分钟的 Bash 构建，期间只有
- * PreToolUse 起手、PostToolUse 收尾，中间毫无事件）会被这个窗口误判成"已结束"、短暂回落待命，
- * 等 PostToolUse 一来相位又恢复。属于可接受的小抖动，不比"取消后永远卡在思考中"更糟。
+ * Known trade-off: a long-running intermediate tool with no hook events at all (say a Bash build taking >2
+ * minutes, with only a PreToolUse at the start and a PostToolUse at the end and nothing in between) is
+ * misjudged as "ended" and briefly falls back to idle until the PostToolUse restores the phase. That is an
+ * acceptable small jitter, no worse than "stuck on thinking forever after a cancel".
  */
 const TASK_RUN_MS = 2 * 60_000;
 /**
- * "打断标记"与"最后一个 hook 事件"的先后容差（见 readReporterPhase 里那处作废判定）：
- * 标记的 ts 由 CLI 自己落盘、相位的 ts 由 hook 进程落盘，两者可能差几毫秒 —— 用户正是在
- * 最后一个工具的 hook 还没写完时按的停止。所以标记不比相位"旧过 1s"就算标记更新。
- * 代价：紧接着（<1s）重发一轮时，新相位会被压一小会儿；换来的是"按了停止就永不回弹"。
+ * Tolerance between the "interrupt marker" and "the last hook event" (see the invalidation in
+ * readReporterPhase): the marker's ts is written by the CLI itself while the phase's ts is written by the hook
+ * process, and the two can differ by a few milliseconds — the user pressed stop exactly while the last tool's
+ * hook was still being written. So a marker is considered newer unless it is "older than the phase by 1s".
+ * Cost: when a new turn is sent immediately afterwards (<1s), the new phase is suppressed for a moment; the
+ * gain is "once stop is pressed, it never bounces back".
  */
 const INTERRUPT_PHASE_SLACK_MS = 1_000;
 
 /**
- * 命令类工具（Bash / execute_command …）：**服务端一律按"调用工具"上报，不做任何特殊化**。
+ * Command-type tools (Bash / execute_command …): **the server always reports them as "calling a tool" with
+ * no specialization**.
  *
- * 为什么不在这里把 Bash 标成 await（等待授权）或改文案：
- * 本环境实测 CodeBuddy Plugin既不发"等授权"通知、也不发"授权结束"通知，而命令类工具
- * 又不发 PostToolUse —— 于是"到底有没有在等授权"根本没有真信号。以前靠"工具是 Bash"
- * 直接标 await，结果点了 run 之后没有任何事件能把它清掉，主控制台就一路卡在「等待授权」。
+ * Why Bash is not marked await (awaiting authorization) or given different wording here:
+ * In this environment, CodeBuddy Plugin sends neither an "awaiting authorization" notification nor an
+ * "authorization finished" one, and command-type tools send no PostToolUse either — so "is it actually waiting
+ * for authorization" has no true signal at all. Marking await purely because "the tool is Bash" meant nothing
+ * could clear it after run was clicked, and the main console stayed stuck on "awaiting authorization".
  *
- * 现在服务端只如实上报：相位 tool（调用工具）+ 工具名 + 实际命令。
- * 展示层一律写「调用工具」（不再按工具名换文案），这样展示口径改起来不用动服务端。
- * 真正的授权信号（Notification）来时，
- * 仍走下面 rp.phase === 'await' 那条真值分支——那段逻辑保留不动。
+ * Now the server only reports honestly: phase tool (calling a tool) + tool name + the real command.
+ * The display layer always writes "calling a tool" (no longer swapping wording per tool name), so changing the
+ * display rule does not require touching the server. When a real authorization signal (Notification) does
+ * arrive, it still takes the `rp.phase === 'await'` truth branch below — that logic is kept as is.
  */
 
 /**
- * 这条会话在用什么模型。
- * 各产品模型字段的取法不通用，所以一个产品一个适配器、都从**各自的落盘**里捞：
- * TraeCode 见 trae.selectedModelOf，Claude Code 见 claude.selectedModelOf。
- * 两者都是因为 hook payload 里压根没有模型字段才只能读盘。
- * 其余产品（CodeBuddy / Codex）payload 里有，用不着适配器；真取不到就留空（绝不编造）。
- * 这里只做"按 client 分派适配器"这一件事，避免把某个产品的私有存储格式写死进通用读函数，
- * 也保持和 products.js 的表驱动扩展约定一致（加新产品就往 MODEL_SOURCES 挂一条，不必改 this 函数）。
- * @param {string} client 楼层客户端（基名：'trae' / 'claude' / 'codex' …）
- * @param {string} sessionId hook payload 的 session_id
- * @param {string} agentType hook payload 的 agent_type（已落盘）
+ * Which model this session is using.
+ * Every product's model field is read differently, so each product gets an adapter that digs into **its own
+ * on-disk state**: TraeCode in trae.selectedModelOf, Claude Code in claude.selectedModelOf. Both exist only
+ * because the hook payload has no model field at all. The other products (CodeBuddy / Codex) carry it in the
+ * payload and need no adapter; when it truly cannot be read it stays empty (never fabricated).
+ * This function only does "dispatch the adapter by client", keeping any product's private storage format out
+ * of the generic reader and staying consistent with products.js's table-driven extension convention (adding a
+ * product = hanging one entry on MODEL_SOURCES, no change to this function).
+ * @param {string} client floor client (base name: 'trae' / 'claude' / 'codex' …)
+ * @param {string} sessionId the hook payload's session_id
+ * @param {string} agentType the hook payload's agent_type (already persisted)
  */
-/** client(楼层基名) → 取"这条会话当前模型"的适配器；由各楼层的 selectedModelOf 自动汇总（见 FLOORS）。
- *  没实现 selectedModelOf 的楼层（codebuddy / copilot）自然落空，照旧取不到。 */
+/** client (floor base name) → adapter that reads "the model of this session"; auto-assembled from each
+ *  floor's selectedModelOf (see FLOORS). Floors without selectedModelOf (codebuddy / copilot) naturally fall
+ *  through and stay unreadable, as before. */
 const MODEL_SOURCES = {};
 for (const [key, mod] of Object.entries(FLOORS)) {
   if (typeof mod.selectedModelOf === 'function') MODEL_SOURCES[key] = mod.selectedModelOf;
@@ -186,9 +215,10 @@ function sessionModel(client, sessionId, agentType = '') {
 }
 
 function readReporterPhase(workspacePath, client = '', session = '') {
-  // 相位**必须绑会话**：没有会话就没有相位。这里不再"按 client 取最新一条"兜底 ——
-  // 那条兜底会让主控制台显示同层**别的会话**的相位（"上面没选会话、下面却亮着某个相位"），
-  // 正是把状态搞乱的地方。调用方要相位就必须点名 session。
+  // A phase **must be tied to a session**: no session, no phase. There is no longer a "take the newest one for
+  // this client" fallback — that fallback made the main console show **another session's** phase on the same
+  // floor ("nothing selected above, yet some phase is lit below"), which is exactly what scrambled the state.
+  // Callers that want a phase must name the session.
   if (!session) return null;
   const dir = hooksDir();
   let win = null;
@@ -201,71 +231,84 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     const j = readJson(path.join(dir, name));
     if (!j) continue;
     if (!sameSession(j, session)) continue;
-    // 按客户端过滤。老状态文件（本次改动之前写的）没有 client 字段 —— 那会儿只有 CodeBuddy，
-    // 所以按 codebuddy 归属，而不是"对谁都匹配"（否则刚重启、Codex 还没写过状态文件时，
-    // 3F 会短暂借到 1F 的相位）。
+    // Filter by client. Old state files (written before this change) have no client field — back then there
+    // was only CodeBuddy, so attribute them to codebuddy rather than "matches everyone" (otherwise, right
+    // after a restart while Codex has not written a state file yet, 3F would briefly borrow 1F's phase).
     if (!clientHit(client, j.client)) continue;
     const sp = j.sessionPhase;
-    // 相位新鲜度不再靠"最后一次 hook 事件时刻"做超时作废（旧的第一道闸）：那道闸会让长任务
-    // 中途无中间事件、或被 IDE 掐断但无 Stop 时相位过早回落；"是否还在忙"改由渲染端
-    // floorTaskActive（任务台账仍 running 即显示思考中）+ 取消检测兜底。这里只校验相位本身
-    // 存在且有写盘时刻，不再按 hook 事件时刻过期。
+    // Phase freshness no longer expires by "the last hook event time" (the old first gate): that gate made
+    // phases fall back too early on long tasks with no intermediate events, or when the IDE cut the turn off
+    // with no Stop. "Still busy or not" now belongs to the render side (floorTaskActive: a task still running
+    // in the ledger shows thinking) plus cancel detection as a fallback. Here we only check that the phase
+    // itself exists and has a write time; it no longer expires by hook event time.
     if (!sp || !sp.ts) continue;
-    // 相位早于本进程启动 → 上次运行留下的残留（已关闭的工程），不采信；重启后等新事件再亮
+    // A phase older than this process's start is residue from the previous run (a closed project); do not
+    // trust it — after a restart wait for a new event before lighting up
     if (sp.ts < SERVER_STARTED_AT) continue;
-    // IDE/插件形态：心跳 pid 已死 = 工程/窗口被关掉（无 Stop，相位冻在最后一口）。
-    // 用"进程不在了"这个可靠信号作废相位，避免窗口突然关闭后主控制台永远卡思考中/调用工具。
-    // 只用 pid 死亡判"不在了"，绝不用心跳"还活着"判"在忙"（ESC 取消时心跳照跳，
-    // 那得靠 phaseSuperseded / done.cancelled 作废，见下）。
+    // IDE / plugin form: the heartbeat pid is dead = the project / window was closed (no Stop, phase frozen
+    // on its last breath). Use this reliable "the process is gone" signal to void the phase, so the main
+    // console does not stay stuck on thinking / calling a tool after a window closes abruptly.
+    // Only use pid death to judge "gone", never a live heartbeat to judge "busy" (on ESC cancel the heartbeat
+    // keeps ticking; that must be voided by phaseSuperseded / done.cancelled, see below).
     if (j.hb && Number.isInteger(j.hb.pid) && !pidAlive(j.hb.pid)) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
-    // 这口"在跑"的相位是否被该楼层的取消/打断标记作废：打断检测是楼层私有知识
-    // （Claude/Qoder 看 transcript 末尾、CodeBuddy 看 message-queue pauseReason、Trae 看 DoneHandler），
-    // 由各楼层的 phaseSuperseded 自己判断，公共相位读取只负责派发（见各 floor 模块）。
+    // Is this "running" phase voided by that floor's cancel / interrupt marker: interrupt detection is floor
+    // private knowledge (Claude/Qoder look at the transcript tail, CodeBuddy at message-queue's pauseReason,
+    // Trae at DoneHandler), judged by each floor's own phaseSuperseded; the generic phase reader only
+    // dispatches (see each floor module).
     if (j.taskId) {
       const floorMod = FLOORS[String(client || '').trim().toLowerCase()];
       if (floorMod && typeof floorMod.phaseSuperseded === 'function' && floorMod.phaseSuperseded(j, sp, INTERRUPT_PHASE_SLACK_MS)) continue;
     }
-    // 会话已被用户取消（CLI 按 ESC 停止：reporter Stop 落盘的 done.cancelled）：相位冻在
-    // 「等待授权 / 调用工具」都不再是实时状态，必须作废，否则主控制台被取消后还亮「等待授权」。
-    // 插件形态的同款作废走上面 phaseSuperseded 的 message-queue 信号；这里补 CLI 形态这一份
-    // （readReporterDones 把 done.cancelled 写进 bySession、任务列表据此亮「已取消」—— 相位层这里
-    // 同步作废，主控制台才会切到「任务取消」红灯，而不是停在「等待授权」）。收尾不比相位旧（容差
-    // INTERRUPT_PHASE_SLACK_MS）才算戳破它，避免正常「调用工具 → 收尾」被旧相位误盖。
+    // The session was cancelled by the user (CLI pressing ESC to stop: the reporter's Stop writes
+    // done.cancelled): a phase frozen on "awaiting authorization / calling a tool" is no longer live and must
+    // be voided, otherwise the main console stays lit as "awaiting authorization" after the cancel.
+    // The same voiding for the plugin form goes through phaseSuperseded's message-queue signal above; this
+    // adds the CLI form (readReporterDones writes done.cancelled into bySession and the task list lights
+    // "cancelled" from it — voiding it here on the phase layer is what makes the main console switch to the
+    // red "task cancelled" light instead of sitting on "awaiting authorization"). Only a finish not older than
+    // the phase (tolerance INTERRUPT_PHASE_SLACK_MS) punctures it, so a normal "calling a tool → finishing"
+    // is not wrongly covered by a stale phase.
     if (j.done && j.done.cancelled && j.done.at && Number(j.done.at) + INTERRUPT_PHASE_SLACK_MS >= Number(sp.ts || 0)) continue;
     if (!win || sp.ts > win.ts) {
       win = sp;
       winClient = String(j.client || '');
-      // 同一份状态文件里的 pending：PreToolUse 写、PostToolUse 清掉；迟迟不清 = 工具被权限框卡住
+      // pending from the same state file: written by PreToolUse, cleared by PostToolUse; not cleared for a
+      // long time = the tool is blocked by a permission dialog
       winPending = j.pending || null;
-      // 同一份状态文件里的 taskTitle = 用户那句话（标题），思考中时要顶到屏幕最前显示
+      // taskTitle from the same state file = the user's sentence (title); shown front and center while thinking
       winPrompt = j.taskTitle || '';
-      // 模型不在这份状态文件里（多数产品的 hook payload 不带），按会话去 TraeCode 自己的落盘取。
-      // 但 Kilo / OpenCode 插件（packages/reporter/src/plugin/）**直接把模型写进状态文件**
-      // （它们的 session.created 事件带 data.model，轮询那一路本来也能从库里取到）——
-      // 所以先认状态文件里这个值，取不到才退回落盘适配器。
+      // The model is not in this state file (most products' hook payloads do not carry it); read it from
+      // TraeCode's own disk state per session. But Kilo / OpenCode plugins
+      // (packages/reporter/src/plugin/) **write the model straight into the state file** (their
+      // session.created event carries data.model, and the polling path can read it from the db anyway) —
+      // so trust that value first and fall back to the disk adapter only when it is missing.
       winModel = String(j.model || "") || sessionModel(winClient, j.sessionId, j.agentType);
     }
   }
-  // Copilot 9F 没有 reporter hook，相位不在这份状态文件里 —— 它的相位由 9F 自己的 readPhase
-  // 提供（见 reporterMainPhase 对 FLOORS[base].readPhase 的派发：copilot.readPhase = readCopilotPhaseFromSqlite）。
-  // 这里只负责有 hook 的产品；读不到就如实返回 null，绝不编造兜底。
+  // Copilot 9F has no reporter hook, so its phase is not in this state file — 9F supplies its own readPhase
+  // (see reporterMainPhase dispatching to FLOORS[base].readPhase: copilot.readPhase =
+  // readCopilotPhaseFromSqlite). This function only covers products with hooks; unreadable → return null
+  // honestly, never fabricate a fallback.
   if (!win) return null;
   return {
-    // 这份相位是哪个客户端写的（Codex 有显式 PermissionRequest，不需要 pending 推断）
+    // Which client wrote this phase (Codex has an explicit PermissionRequest and needs no pending inference)
     client: String(winClient || ''),
     phase: String(win.phase || 'thinking'),
     tool: String(win.tool || ''),
     file: String(win.file || ''),
-    // hook 在 PreToolUse 写的"实际调用"可读命令（Read src/main.js / grep ... / Bash ...），
-    // 给主控制台 tips 当"工具"显示，比纯工具名更直观
+    // The readable "actual call" the hook wrote at PreToolUse (Read src/main.js / grep ... / Bash ...), shown
+    // as the "tool" in the main console tips — more intuitive than the bare tool name
     cmd: String(win.cmd || ''),
-    // 用户那句话（思考中时主控制台屏幕第三层顶到最前显示；UI 只在 thinking 相位用）
+    // The user's sentence (the third layer of the main console screen while thinking; the UI uses it only in
+    // the thinking phase)
     prompt: String(winPrompt || ''),
-    // 这条会话在用什么模型（只有 TraeCode 取得到；别的楼层留空）。取不到就是空串，不猜。
+    // Which model this session uses (only TraeCode can read it; other floors leave it empty). Unreadable
+    // means empty string, never guessed.
     model: String(winModel || ''),
-    // 这份相位的写入时刻：渲染层拿它跟"收尾标记"比先后 —— 只有**比收尾还新**的实时相位
-    // 才算"用户又发了一轮"，取消前那一口 stale 的 thinking / tool 不许把红色「任务取消」盖回去。
+    // When this phase was written: the render layer compares it with the "finish marker" — only a live phase
+    // **newer than the finish** counts as "the user sent another turn"; the stale thinking / tool breath
+    // before the cancel must not cover the red "task cancelled" light again.
     ts: Number(win.ts) || 0,
     pending: winPending
       ? { tool: String(winPending.tool || ''), file: String(winPending.file || ''), cmd: String(winPending.cmd || ''), at: Number(winPending.at) || 0 }
@@ -273,23 +316,24 @@ function readReporterPhase(workspacePath, client = '', session = '') {
   };
 }
 
-/** 状态文件名里"这个工程"那一段：`@<工程绝对路径>` 整体 sanitize。 */
+/** The "this project" part of a state file name: `@<absolute project path>` sanitized as a whole. */
 function stateFileWs(ws) {
   return `@${path.resolve(ws)}`.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
 /**
- * 会话过滤（轴 2）：这条状态文件是不是 `session` 那条会话写的。
+ * Session filter (axis 2): was this state file written by the `session` session?
  *
- * `session` 为空 → **不限**（保持老行为：同 client 里取最新那份）。
- * 指定了会话时，老状态文件（没有 sessionId 字段）一律不算 —— 它们属于"还没有会话概念"的时代，
- * 硬算给某条会话会让"看 A 会话"读到 B 会话的数据。
+ * `session` empty → **no filter** (keeps the old behavior: take the newest one among the same client).
+ * When a session is specified, old state files (no sessionId field) never count — they belong to the era
+ * "before the session concept existed", and hard-attributing them to some session would make "looking at
+ * session A" read session B's data.
  */
 function sameSession(j, session) {
   return !session || String((j && j.sessionId) || '') === String(session);
 }
 
-/** 进程还在不在（信号 0 = 只探测不投递）。权限不足也算"在"。 */
+/** Is the process still alive (signal 0 = probe only, no delivery). Insufficient permission counts as alive. */
 function pidAlive(pid) {
   const n = Number(pid);
   if (!n || n < 1) return false;
@@ -297,37 +341,40 @@ function pidAlive(pid) {
     process.kill(n, 0);
     return true;
   } catch (e) {
-    // EPERM = 进程存在但不归我们管；ESRCH = 真没了
+    // EPERM = the process exists but is not ours; ESRCH = truly gone
     return Boolean(e && e.code === 'EPERM');
   }
 }
 
 /**
- * 这个成员**还有没有别的会话在跑**（轴 2）。
+ * Does this member still have **another session running** (axis 2)?
  *
- * 为什么需要它：`agent_status` 是**按成员一行**存的（`member_id` 是主键），没有会话维度。
- * 同一个 Claude Code 同时开着 A / B 两条会话时，A 收工（Stop → idle）或退出（SessionEnd → offline）
- * 都会去写那**唯一一行**，于是 B 还在干活、工位卡片已经显示「空闲 / 离线」。
- * 所以降级之前先问一句"这条成员的别的会话还活着吗"，活着就别降。
+ * Why it is needed: `agent_status` stores **one row per member** (`member_id` is the primary key) and has no
+ * session dimension. When one Claude Code has sessions A and B open at once, A finishing (Stop → idle) or
+ * exiting (SessionEnd → offline) writes that **single row**, so while B is still working the station card
+ * already shows "idle / offline". So before demoting, ask "is another session of this member still alive";
+ * if yes, do not demote.
  *
- * 「活着」的判据（任一）：
- *   - 那份状态文件的**心跳守护进程还在**（`hb.pid` 存活）—— 主判据：会话没退，守护就没退；
- *   - 或者它还有**在飞的相位 / 任务**（`sessionPhase` 或 `taskId` 是新鲜的）——
- *     覆盖"守护没起来 / 刚被杀"的情况。注意 SessionEnd 会把这两样清空，所以干净退出的
- *     会话不会被这条误判成活着。
+ * "Alive" tests (either one):
+ *   - That state file's **heartbeat daemon process is still there** (`hb.pid` alive) — the main test: while
+ *     the session has not exited, the daemon has not exited;
+ *   - Or it still has **a phase / task in flight** (`sessionPhase` or `taskId` is fresh) — covers "the daemon
+ *     never started / was just killed". Note SessionEnd clears both, so a cleanly exited session is never
+ *     misjudged as alive by this.
  *
- * **不能用 `hb.lastEventAt` 当判据**：会话干净退出后它照样是新的（它记的是"最后一次事件"，
- * 不是"最后一次心跳"），拿它判会把已结束的会话当成还在跑 —— 实测的症状是：A 退会话后
- * B 也退了，工位卡片还挂在「思考中」，永远降不下来。
+ * **Never use `hb.lastEventAt` as the test**: it stays fresh after a clean session exit (it records "the last
+ * event", not "the last heartbeat"), and judging by it treats finished sessions as still running — the
+ * measured symptom: after A exited and B exited too, the station card stayed on "thinking" and never fell.
  *
- * 只认**同一个 client + 同一个工程**下、**会话 id 不同**的状态文件；老命名文件（没有会话）
- * 不算"别的会话"（它压根没有会话维度，认了会把单会话场景也拦下来）。
+ * Only state files under **the same client + the same project** with **a different session id** count; old
+ * naming files (no session) do not count as "another session" (they have no session dimension at all;
+ * counting them would block the single-session case too).
  * @param {{workspacePath?: string, client?: string, session?: string, now?: number}} o
  * @returns {boolean}
  */
 function hasOtherLiveSession({ workspacePath = '', client = '', session = '', now = Date.now() } = {}) {
   const ws = String(workspacePath || '').trim();
-  // 没有会话标识就无从谈起"别的会话"（老 hook / 别的产品）→ 一律不拦
+  // Without a session identifier there is no "another session" to speak of (old hook / other product) → never block
   if (!ws || !session) return false;
   const m = stateFileWs(ws);
   const dir = hooksDir();
@@ -337,12 +384,13 @@ function hasOtherLiveSession({ workspacePath = '', client = '', session = '', no
     const j = readJson(path.join(dir, name));
     if (!j) continue;
     if (!clientHit(client, j.client)) continue;
-    // 判据 1：心跳守护还活着（最可靠）
+    // Test 1: the heartbeat daemon is alive (most reliable)
     if (j.hb && pidAlive(j.hb.pid)) return true;
-    // 判据 2：还有在飞的相位 / 任务（见函数说明，**不能**用 hb.lastEventAt）。
-    // **idle 相位不算"在飞"**：收尾（Stop / Interrupt / idle_prompt）现在都会写一笔显式 idle，
-    // 它只说明"这一轮结束了、在等下一句"，把它当"别的会话还在跑"会让成员卡永远回不到空闲
-    // （同层 CLI + 插件混跑时尤其明显）。
+    // Test 2: a phase / task still in flight (see the function note: **never** use hb.lastEventAt).
+    // **An idle phase does not count as in flight**: finishing (Stop / Interrupt / idle_prompt) now writes an
+    // explicit idle, which only means "this turn is over, waiting for the next sentence"; treating it as
+    // "another session is still running" keeps the member card from ever returning to idle (especially
+    // visible when CLI and plugin run side by side on the same floor).
     const spPhase = String((j.sessionPhase && j.sessionPhase.phase) || '');
     const phaseTs = Number(j.sessionPhase && j.sessionPhase.ts) || 0;
     if (spPhase && spPhase !== 'idle' && phaseTs && now - phaseTs <= AWAIT_TTL_MS) return true;
@@ -352,27 +400,31 @@ function hasOtherLiveSession({ workspacePath = '', client = '', session = '', no
   return false;
 }
 
-/** 会话 id 的规范形状：UUID（Claude Code 实测就是这个）。 */
+/** The canonical shape of a session id: a UUID (measured, that is what Claude Code uses). */
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * 状态文件的文件名 → 它属于哪个会话（`''` = 老命名，没带会话）。
- * 不认识这个名字（不是这个工程的状态文件 / 根本不是状态文件）→ 返回 `null`。
+ * State file name → which session it belongs to (`''` = old naming, no session).
+ * An unrecognized name (not this project's state file / not a state file at all) → `null`.
  *
- * 命名由 hook 的 statePath() 决定：`<agent>@<工程绝对路径>[@<会话>]` 整体 sanitize 成 `[A-Za-z0-9._-]`。
- * **加了会话之后文件名尾巴多一段 `_<会话>`**，所以老的 `endsWith('@<工程>.json')` 会全部匹配不上 ——
- * 两处调用（hasReporterState / reporterStateMeta）都走这里，别退回去用 endsWith。
+ * The name is decided by the hook's statePath(): `<agent>@<absolute project path>[@<session>]` sanitized as a
+ * whole into `[A-Za-z0-9._-]`. **Adding the session appends one more `_<session>` segment to the name**, so the
+ * old `endsWith('@<project>.json')` matches nothing — both call sites (hasReporterState / reporterStateMeta)
+ * go through here; do not fall back to endsWith.
  *
- * **这个编码是有损的**（`_` 既是分隔符又是合法字符），所以单看文件名分不清
- * "工程 `/a/b` + 会话 `sub`" 和 "工程 `/a/b/sub` + 没有会话"——后者是老命名的文件，
- * 会被前者误认成自己的会话。所以尾巴分两步认：
- *   1. 是 UUID → 直接认（Claude Code 的规范形状，绝大多数情况走这条，不读文件）；
- *   2. 不是 UUID → 回读文件内容，**内容里的 `sessionId` 才是权威**（它是 hook 原样写进去的，
- *      没过 sanitize）。内容对不上就不认 —— 于是上面那个 `/a/b/sub` 的老文件会被正确排除。
- * @param {string} name 文件名
- * @param {string} wsPart stateFileWs() 的结果
- * @param {string} dir hooks 目录（第 2 步回读内容用）
- * @returns {string|null} 会话 id（可为 ''）
+ * **This encoding is lossy** (`_` is both a separator and a legal character), so from the name alone one
+ * cannot tell "project `/a/b` + session `sub`" from "project `/a/b/sub` + no session" — the latter is an
+ * old-naming file and would be misread by the former as its own session. So the tail is recognized in two
+ * steps:
+ *   1. Is it a UUID → accept directly (Claude Code's canonical shape; the vast majority of cases take this
+ *      path without reading the file);
+ *   2. Not a UUID → read the file content back; **the `sessionId` inside is authoritative** (the hook wrote it
+ *      verbatim, unsanitized). A mismatch means reject — so the `/a/b/sub` old file above is correctly
+ *      excluded.
+ * @param {string} name file name
+ * @param {string} wsPart the result of stateFileWs()
+ * @param {string} dir the hooks dir (used to read content back in step 2)
+ * @returns {string|null} session id (may be '')
  */
 function stateFileSession(name, wsPart, dir) {
   if (!/\.json$/i.test(name)) return null;
@@ -381,14 +433,16 @@ function stateFileSession(name, wsPart, dir) {
   const i = base.lastIndexOf(wsPart);
   if (i < 0) return null;
   const tail = base.slice(i + wsPart.length);
-  // 会话尾巴是一段 `_<id>`。**`_` 本身必须允许出现在 id 里** —— Kilo / OpenCode 的会话 id
-  // 形如 `ses_f22614607ffeQV…`（OpenCode 同款），id 内不含 `_`，但**测试夹具与将来任何
-  // 带下划线的 id** 都会被这里挡掉：那一份状态文件就被当成"不认识的文件"跳过，
-  // `hasReporterState` / `reporterStateMeta` 恒返回 false → UI 一直显示「未上报」，
-  // 而不是「接了 hook、当前没事干」。之前这里写的是 `[A-Za-z0-9.-]`（只有 UUID 成立）。
+  // The session tail is one `_<id>` segment. **`_` itself must be allowed inside the id** — Kilo / OpenCode
+  // session ids look like `ses_f22614607ffeQV…` (OpenCode is the same), and while the id contains no `_`,
+  // **test fixtures and any future id with an underscore** would be filtered out here: that state file would
+  // be treated as "unrecognized" and skipped, so `hasReporterState` / `reporterStateMeta` always return false
+  // → the UI keeps showing "not reported" instead of "hook connected, nothing happening right now".
+  // This used to be `[A-Za-z0-9.-]` (only UUIDs passed).
   //
-  // 放宽不会引入歧义：这个编码本来就是有损的（`_` 既是分隔符又是合法字符），
-  // 下面紧接着就是靠**回读文件内容里的 sessionId** 来定音的 —— 内容对不上照样不认。
+  // Loosening introduces no ambiguity: this encoding is lossy anyway (`_` is both a separator and a legal
+  // character), and the very next step settles it by **reading the sessionId from the file content** — a
+  // mismatch still means reject.
   if (!/^_[A-Za-z0-9._-]+$/.test(tail)) return null;
   const cand = tail.slice(1);
   if (SESSION_UUID_RE.test(cand)) return cand;
@@ -397,15 +451,17 @@ function stateFileSession(name, wsPart, dir) {
 }
 
 /**
- * 这个工程有没有接过 hook（= 有没有对应的 hook 状态文件）。
+ * Has this project ever had a hook (i.e. does it have a matching hook state file)?
  *
- * 和"有没有新鲜相位"是两回事：会话结束后 hook 会把 sessionPhase 清空（正确行为），
- * 但此时 CLI 楼层不该退回"按 jsonl mtime 猜"的兜底（那会让 3F 一直显示「调用工具 / 改 xxx.jsonl」），
- * 而应该显示「待命」。渲染层靠这个字段区分"没接 hook"与"接了但当前没事干"。
+ * This is different from "is there a fresh phase": after a session ends the hook clears sessionPhase
+ * (correct behavior), but then the CLI floor must not fall back to "guessing from the jsonl mtime" (that
+ * would keep 3F showing "calling a tool / editing xxx.jsonl"); it should show "idle". The render layer uses
+ * this field to tell "no hook" from "hook connected but nothing happening right now".
  *
- * 状态文件名由 hook 的 statePath() 生成：`<member>@<工程绝对路径>[@<会话>]`，非 [A-Za-z0-9._-] 换成 `_`。
+ * The state file name is generated by the hook's statePath(): `<member>@<absolute project path>[@<session>]`,
+ * with anything outside [A-Za-z0-9._-] replaced by `_`.
  * @param {string} workspacePath
- * @param {string} [client] 来源客户端；空则不限
+ * @param {string} [client] source client; empty means no filter
  */
 function hasReporterState(workspacePath, client = '') {
   const ws = String(workspacePath || '').trim();
@@ -413,23 +469,25 @@ function hasReporterState(workspacePath, client = '') {
   const m = stateFileWs(ws);
   const dir = hooksDir();
   for (const name of readDir(dir)) {
-    // 注意判 null 而不是判 falsy：老命名文件（不带会话）返回的是空串，那也是**本工程的**状态文件
+    // Note: test for null, not for falsy — old-naming files (no session) return an empty string, and those
+    // are **this project's** state files too
     if (stateFileSession(name, m, dir) === null) continue;
     if (!client) return true;
     const j = readJson(path.join(dir, name));
-    // 老文件没记 client → 按 codebuddy 归属（同上）
+    // Old files record no client → attribute to codebuddy (as above)
     if (clientHit(client, j && j.client)) return true;
   }
   return false;
 }
 
 /**
- * 这个工程有没有接过 hook，以及那份状态文件属于**哪条会话**。
+ * Has this project ever had a hook, and **which session** does that state file belong to?
  *
- * 为什么要会话 id：hook 是会话级加载的（会话启动时装，之后改配置不影响它），
- * 所以"工程里有状态文件"不等于"你正在看的这条会话在上报"——
- * 实测：13:40 开的旧会话没有 hook，但同工程里跑过 `codex exec`，状态文件存在，
- * 界面就会把这条会话显示成「待命」，看起来像"整轮对话没有状态变化"。
+ * Why the session id matters: hooks are loaded per session (installed at session start, and config changes
+ * afterwards do not affect it), so "a state file exists in the project" does not mean "the session you are
+ * looking at is reporting" — measured: an old session opened at 13:40 had no hook, but `codex exec` had run
+ * in the same project, so the state file existed and the UI showed this session as "idle", looking like
+ * "the whole conversation had no state change".
  * @returns {{instrumented: boolean, sessionId: string}}
  */
 function reporterStateMeta(workspacePath, client = '', session = '') {
@@ -442,12 +500,13 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
   for (const name of readDir(dir)) {
     const fileSession = stateFileSession(name, m, dir);
     if (fileSession === null) continue;
-    // 指定了会话就只认那一条：文件名里的会话是 hook 写的，最可信；
-    // 老命名文件（没带会话）在指定会话时一律不算 —— 否则"看会话 B"会借到会话 A 的老文件。
+    // With a session specified, only that one counts: the session in the file name was written by the hook and
+    // is the most trustworthy; old-naming files (no session) never count when a session is specified —
+    // otherwise "looking at session B" would borrow session A's old file.
     if (session && fileSession !== session) continue;
     const j = readJson(path.join(dir, name));
     if (!j) continue;
-    // 老状态文件没记 client → 按 codebuddy 归属（与相位读取同一口径）
+    // Old state files record no client → attribute to codebuddy (same rule as the phase reader)
     if (!clientHit(client, j.client)) continue;
     const ts = (j.sessionPhase && j.sessionPhase.ts) || j.taskStartedAt || (j.hb && j.hb.lastEventAt) || 0;
     if (ts >= bestTs) {
@@ -460,17 +519,18 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
 }
 
 function reporterMainPhase(workspacePath, client = '', session = '') {
-  // 相位必须绑会话（见 readReporterPhase）：没点名会话 / 拿不到会话 id → 没有相位。
+  // A phase must be tied to a session (see readReporterPhase): no session named / no session id available → no phase.
   if (!session) return null;
-  // 各楼层（尤其是 9F Copilot，没有 reporter hook）可自己实现 readPhase 来提供相位；
-  // 没实现的（带 hook 的产品）退回通用的 readReporterPhase。相位职责按楼层派发，不把兜底塞进 generic 里。
+  // Each floor (especially 9F Copilot, which has no reporter hook) may implement readPhase to supply its
+  // phase; floors without one (products with hooks) fall back to the generic readReporterPhase. The phase
+  // duty is dispatched per floor; no fallback is stuffed into generic.
   const base = String(client || '').trim().toLowerCase();
   const floor = FLOORS[base];
   const readPhase = floor && typeof floor.readPhase === 'function' ? floor.readPhase : readReporterPhase;
   const rp = readPhase(workspacePath, client, session);
   if (!rp) return null;
-  // 下面每个分支都是**各建各的对象**，不是展开 rp —— 要往外带什么字段，每个分支都得加一遍，
-  // 漏了就会静默丢掉（model 就这么丢过一次）。
+  // Every branch below **builds its own object** instead of spreading rp — whatever needs to be carried out
+  // must be added in each branch; missing one silently drops it (that is how model was lost once).
   if (rp.phase === 'await') {
     return {
       phase: 'await',
@@ -479,14 +539,15 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, rp.file && `目标：${rp.file}`].filter(Boolean),
       prompt: rp.prompt || '',
       model: rp.model || '',
-      // 相位写入时刻：渲染层拿它跟收尾标记比先后（见 IsoOfficeView 的 consoleLive 守卫）
+      // When the phase was written: the render layer compares it with the finish marker
+      // (see IsoOfficeView's consoleLive guard)
       ts: Number(rp.ts) || 0,
     };
   }
   if (rp.phase === 'tool') {
-    // 优先显示 hook 报上来的完整命令（Read src/main.js / grep ... / Bash npm run build），
-    // 没有再回退到「调用 Xxx」泛化文案。
-    // action 是具体在做什么；tool 只显示工具名，不要塞完整命令。
+    // Prefer the full command reported by the hook (Read src/main.js / grep ... / Bash npm run build), and
+    // fall back to the generic "calling Xxx" wording when there is none.
+    // action is what it is doing concretely; tool shows only the tool name, never the full command.
     const cmd = rp.cmd || (rp.tool ? `调用 ${rp.tool}` : '调用工具');
     return {
       phase: 'tool',
@@ -499,36 +560,39 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
       ts: Number(rp.ts) || 0,
     };
   }
-  // 其余相位**原样透传**，不要压成 thinking。
+  // Every other phase is **passed through verbatim**; do not squash it into thinking.
   //
-  // 早先这里只认 await / tool 两个分支，剩下的全落进最后的 thinking 兜底，于是
-  // 「写 idle 的一轮结束了」与「写 done 的任务完成了」在控制台上都显示成「思考中」——
-  // 收工了还在显示在思考，是把已完成说成还在忙。相位词汇表里本来就有
-  // idle / unreported / dispatch / done / waiting 这几项
-  // （见 renderer/src/iso/mainConsole.js 的 PHASES），透传即可，不必各自再包一层。
-  // 真正**不认识**的相位才落 thinking（兜底，且只对未知值生效）。
+  // This used to recognize only the await / tool branches and dump everything else into the final thinking
+  // fallback, so "a turn that wrote idle has ended" and "a task that wrote done has completed" both displayed
+  // as "thinking" on the console — showing thinking after finishing is reporting completed work as still busy.
+  // The phase vocabulary already contains idle / unreported / dispatch / done / waiting
+  // (see PHASES in renderer/src/iso/mainConsole.js), so pass them through; no need to wrap each one.
+  // Only a genuinely **unknown** phase falls into thinking (the fallback, and only for unknown values).
   if (rp.phase && rp.phase !== 'await' && rp.phase !== 'tool') {
     return { phase: rp.phase, action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '', ts: Number(rp.ts) || 0 };
   }
-  // thinking：干净，不堆示意字；但把用户那句话（prompt）一并带出，屏幕第三层顶到最前显示
+  // thinking: clean, no filler words; but carry the user's sentence (prompt) out too, shown front and center
+  // on the third layer of the screen
   return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '', ts: Number(rp.ts) || 0 };
 }
 
 /**
- * reporter hook 的"活跃窗口"：UserPromptSubmit 落 taskId、Stop 清空。
- * 只有在这个窗口内（用户提交了任务、agent 还没收工）才算"活着"；
- * 会话存在但没有事件时一律待命 —— 主控制台据此决定要不要显示活跃状态。
+ * The reporter hook's "active window": UserPromptSubmit sets taskId, Stop clears it.
+ * Only inside this window (the user submitted a task and the agent has not finished) does it count as "alive";
+ * a session that exists but has no events is always idle — the main console uses this to decide whether to
+ * show an active state.
  *
- * 还要校验"这份状态文件本身是否还活着"：历史遗留 / 已退出的会话会在 hooks 目录里
- * 留下 taskId 不再更新的死文件（例如改「按工位+工程分文件」之前的老命名文件）。
- * 不校验的话，只要有一个死文件的 taskId 跟当前工程匹配，inWindow 就会被永久顶成 true，
- * 于是 Stop 之后仍旧按"还在干活"推出「思考中」。
- * @param {string} workspacePath 当前打开的工程；空则不限工程
- * @param {string} [client] 来源客户端；空则不限客户端
+ * It also checks "whether this state file itself is still alive": leftover / exited sessions leave dead files
+ * in the hooks dir whose taskId never updates (e.g. old-naming files from before the switch to "one file per
+ * station + project"). Without that check, a single dead file whose taskId matches the current project pins
+ * inWindow to true forever, so after Stop it still infers "thinking" from "still working".
+ * @param {string} workspacePath currently opened project; empty means no project filter
+ * @param {string} [client] source client; empty means no client filter
  * @returns {boolean}
  */
 function readReporterActiveTask(workspacePath, client = '', session = '') {
-  // 同理：活跃窗口也按**会话**判 —— 不点名会话就无从谈起"这条会话在不在跑"。
+  // Same reasoning: the active window is judged **per session** — without naming a session there is no
+  // "is this session running" to speak of.
   if (!session) return false;
   const dir = hooksDir();
   const now = Date.now();
@@ -537,22 +601,24 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     const j = readJson(path.join(dir, name));
     if (!j || !j.taskId) continue;
     if (!sameSession(j, session)) continue;
-    // 按客户端过滤（口径同 readReporterPhase：老状态文件没记 client → 归 codebuddy）：
-    // 同一工程里别的产品在跑时，别把它的任务算成本层"还在干活"的活跃窗口
+    // Filter by client (same rule as readReporterPhase: old state files record no client → codebuddy):
+    // when another product is running in the same project, do not count its task as this floor's active window
     if (!clientHit(client, j.client)) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
-    // 心跳时间**不能**算"任务在跑"：它只证明 IDE 会话还开着（见 hasOtherLiveSession 的同名纪律），
-    // 取消时心跳照跳会让 taskId 永远新鲜、相位卡死在思考中/调用工具。只认 hook 事件时间
-    // （taskStartedAt 起轮、sessionPhase.ts 每次事件刷新）：取消后没有新事件，超 TASK_RUN_MS
-    // 就当这一轮结束了，inWindow 回落待命。
+    // The heartbeat time **cannot** count as "the task is running": it only proves the IDE session is open
+    // (same discipline as hasOtherLiveSession) — on cancel the heartbeat keeps ticking, which would keep
+    // taskId forever fresh and freeze the phase on thinking / calling a tool. Only hook event times count
+    // (taskStartedAt starts the turn, sessionPhase.ts refreshes on every event): after a cancel there are no
+    // new events, so past TASK_RUN_MS the turn counts as finished and inWindow falls back to idle.
     const lastAt = Math.max(
       Number(j.taskStartedAt) || 0,
       Number(j.sessionPhase && j.sessionPhase.ts) || 0
     );
     if (!lastAt || now - lastAt > TASK_RUN_MS) continue;
-    // TraeCode 取消兜底：renderer.log 里已确认取消（取消时刻比本轮开始新）→ 不算活跃
-    // （TraeCode 取消不发 Stop hook 事件，taskId 永远占着，这里手动戳破它）。
+    // TraeCode cancel fallback: a cancel already confirmed in renderer.log (the cancel time is newer than this
+    // turn's start) → not active (TraeCode sends no Stop hook event on cancel and keeps taskId occupied
+    // forever, so we puncture it manually here).
     if (String(client || '').trim().toLowerCase() === 'trae') {
       const atT = trae.cancelAt(j.sessionId, Number(j.taskStartedAt) || 0);
       if (atT) continue;
@@ -563,18 +629,19 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
 }
 
 /**
- * reporter hook 在 Stop 时落的"完成"标记（带工程路径），按**工程 + 客户端**一次扫盘取回。
- * 返回 { latest, bySession }：latest = 该 (工程, 客户端) 里最新的一份；bySession = 会话 id -> 该会话最新的一份。
+ * The "done" marker the reporter hook writes at Stop (carrying the project path), read back in **one disk
+ * scan per project + client**. Returns { latest, bySession }: latest = the newest one in that
+ * (project, client); bySession = session id -> that session's newest one.
  *
- * 为什么拆成"一次读盘"和"按会话取"两步：会话表扫盘一次能扫出上百个历史会话文件，
- * 若每扫到一条就去调一次 readReporterDone，hooks 目录就要被扫上百遍
- * （消费方见 sessionRegistry 里按 (工程, 客户端) 缓存的 doneScans）。
+ * Why it is split into "one disk read" and "take by session": a session-table scan can turn up hundreds of
+ * historical session files, and calling readReporterDone once per row would scan the hooks dir hundreds of
+ * times (see the doneScans cache keyed by (project, client) in sessionRegistry).
  */
 /**
- * 状态文件里的 `roundFiles`（`{path,op,abs}`）→ 完成标记的 `files` 形状（带 size）。
- * 取消时用它补"取消前已经动了哪些文件"（与 hook.js 的 collectRoundFiles 同口径）：
- * 去重、删除类不给 size、stat 不到就不给（绝不编造）。
- * @param {{roundFiles?: Array<any>}} j 状态文件内容
+ * The state file's `roundFiles` (`{path,op,abs}`) → the done marker's `files` shape (with size).
+ * On cancel it fills in "which files were already touched before the cancel" (same rule as hook.js's
+ * collectRoundFiles): dedupe, deletions get no size, unstattable gets none (never fabricated).
+ * @param {{roundFiles?: Array<any>}} j state file content
  */
 function roundFilesOf(j) {
   const out = [];
@@ -590,7 +657,7 @@ function roundFilesOf(j) {
         const s = fs.statSync(abs);
         if (s.isFile()) size = s.size;
       } catch {
-        /* 文件删了 / 挪了：不给 size，路径照记 */
+        /* File deleted / moved: no size, the path is still recorded */
       }
     }
     out.push(size == null ? { path: p } : { path: p, size });
@@ -601,24 +668,26 @@ function roundFilesOf(j) {
 function readReporterDones(workspacePath, client = '') {
   const dir = hooksDir();
   const now = Date.now();
-  /** sessionId -> 该会话最新的一份 */
+  /** sessionId -> that session's newest one */
   const bySession = new Map();
-  /** 该工程 + 客户端里最新的一份（会话 id 拿不到的楼层用它兜底） */
+  /** The newest one in this project + client (floors that cannot get a session id fall back to it) */
   let latest = null;
-  /** 兜底合成的"取消"标记里、需要服务端补发 task/end(cancelled) 的那些（见 sessionRegistry 的 flush）。
-   *  这些产品（Claude / Qoder 按停止、CodeBuddy 插件按停止）取消时**一个 hook 事件都不发**，
-   *  只能由服务端从落盘里认出来（见 claude.interruptOf / codebuddy.cancelAt），
-   *  然后由 sessionRegistry 在 refresh 时去重后补发一次 task/end —— 否则台账那行一直挂在「进行中」。 */
+  /** Among the synthesized fallback "cancel" markers, those for which the server must re-issue task/end
+   *  (cancelled) (see sessionRegistry's flush). These products (Claude / Qoder pressing stop, CodeBuddy
+   *  plugin pressing stop) send **not a single hook event** on cancel, so the server can only recognize it
+   *  from disk (see claude.interruptOf / codebuddy.cancelAt) and then have sessionRegistry de-duplicate and
+   *  re-issue one task/end on refresh — otherwise that ledger row hangs on "in progress" forever. */
   const cancels = [];
   /**
-   * 扫到的"当前这一轮"：会话 id + 本轮开始时刻。
-   * 交给 sessionRegistry 去收**被这一轮顶掉的上一轮**（同会话至今没收到结束事件、
-   * 台账上还挂 running 的那些）—— 一个会话不可能同时跑两轮，见 bus.endStaleTasksOfSession。
+   * The "current turn" found by the scan: session id + this turn's start time.
+   * Handed to sessionRegistry to close **the previous turn pushed out by this one** (those that never
+   * received an end event for this session and still hang as running in the ledger) — one session cannot run
+   * two turns at once, see bus.endStaleTasksOfSession.
    */
   const rounds = [];
   /**
-   * 合成一枚取消标记：既有按会话给控制台的那份（bySession，红灯靠它），
-   * 也有列进 cancels 让台账补一刀的那份。两个信号共用，别再各写一遍。
+   * Synthesize one cancel marker: both the per-session copy for the console (bySession, the red light depends
+   * on it) and a copy listed in cancels so the ledger gets its cut. Both signals share it; do not write it twice.
    */
   const synthCancel = ({ id, j, ws, at, files = [], said = '', result = '', consoleMark = true, taskId }) => {
     if (!at) return;
@@ -650,8 +719,9 @@ function readReporterDones(workspacePath, client = '') {
       result,
     });
   };
-  /** 真·完成（楼层补的"正常完成"标记，cancelled:false）：只在比现有 mark 新（或相等）时覆盖，
-   *  让 DoneHandler 的 completed 能盖掉之前合成的 cancelled:true。不产生 cancels 行。 */
+  /** A real completion (a "normal finish" marker supplied by the floor, cancelled:false): overwrites only
+   *  when it is newer than (or equal to) the existing mark, so DoneHandler's completed can cover an
+   *  earlier synthesized cancelled:true. Produces no cancels row. */
   const synthDone = ({ id, ws, at, title = '', files = [] }) => {
     if (!at) return;
     const existing = bySession.get(id);
@@ -670,9 +740,11 @@ function readReporterDones(workspacePath, client = '') {
       if (!latest || Number(mark.at) > Number(latest.at)) latest = mark;
     }
   };
-  /** hook 状态文件按 sessionId 归并（楼层自己的取消/完成探测从这里取 workspacePath / roundFiles / client 过滤） */
+  /** Hook state files merged by sessionId (each floor's own cancel/completion probe takes workspacePath /
+   *  roundFiles / the client filter from here) */
   const hookBySid = new Map();
-  /** 全部 hook 状态文件（不按 sessionId 去重）：Claude/Qoder 的取消探测要逐文件扫，与主线循环同口径 */
+  /** All hook state files (not deduped by sessionId): Claude/Qoder's cancel probe scans file by file, same
+   *  rule as the main loop */
   const allFiles = [];
   for (const name of readDir(dir)) {
     if (!/\.json$/i.test(name)) continue;
@@ -684,21 +756,26 @@ function readReporterDones(workspacePath, client = '') {
     const ws = (j.done && j.done.workspacePath) || j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
     const id = String(j.sessionId || '');
-    // 真·完成标记（Stop 落盘）：取每会话最新的一份
+    // The real done marker (written by Stop): keep the newest one per session
     if (j.done && j.done.at && now - Number(j.done.at) <= DONE_TTL_MS) {
       const done = j.done;
       const prev = id ? bySession.get(id) : null;
       if (id && (!prev || Number(done.at) > Number(prev.at))) bySession.set(id, done);
       if (!latest || Number(done.at) > Number(latest.at)) latest = done;
-      // CLI 形态取消（按 ESC 停止）：Stop 落盘 done.cancelled 是 reporter 自己的权威标记，楼层无关。
-      // 除了进 bySession（主控制台据此亮红灯），还要合成进 cancels —— 否则 sessionRegistry 的
-      // flushSynthesizedCancels 扫不到它，task_runs 会一直停在 CLI 自己上报的 done（result 还是
-      // 那句「interrupted by user」），滚动屏 / 任务状态显示「完成」，与主控制台红灯对不上。
-      // 插件形态取消走各楼层 synthMarks（它有 message-queue 信号，CLI 没有）；这里补 CLI 这条。
-      // result 用 done.said 那句原话，取消也照带产出摘要（"没干完"不是"没产出"）。
+      // CLI-form cancel (ESC to stop): the reporter's own authoritative marker is the done.cancelled Stop
+      // writes; it is floor-agnostic.
+      // Besides going into bySession (the main console lights red from it), it must also be synthesized into
+      // cancels — otherwise sessionRegistry's flushSynthesizedCancels never sees it and task_runs stays on the
+      // done the CLI itself reported (result still being that "interrupted by user" sentence), so the ticker /
+      // task status shows "completed" and does not match the main console's red light.
+      // The plugin form's cancel goes through each floor's synthMarks (it has the message-queue signal the CLI
+      // lacks); this adds the CLI case.
+      // result uses done.said verbatim: a cancel still carries the output summary ("did not finish" is not
+      // "produced nothing").
       if (done.cancelled) {
         const cancelledAt = Number(done.at) || 0;
-        // 只认"本轮开始之后"的取消：老取消（上一轮）不能算到新一轮头上（同 synthMarks 的 sinceTs 口径）。
+        // Only accept a cancel "after this turn started": an old cancel (previous turn) must not be charged
+        // to the new turn (same sinceTs rule as synthMarks).
         const sinceTs = Number(j.taskStartedAt) || 0;
         if (!sinceTs || cancelledAt >= sinceTs) {
           const doneFiles = Array.isArray(done.files) ? done.files : [];
@@ -717,46 +794,53 @@ function readReporterDones(workspacePath, client = '') {
         }
       }
     }
-    /* 楼层特有的"取消"标记合成（Claude/Qoder 的 transcript 信号、Trae 的 renderer.log、
-       CodeBuddy 插件的 message-queue）已统一收口到各楼层模块的 synthMarks（见文件底部按
-       FLOORS 派发），这里不再写任何产品专属逻辑。历史上"任务槽卡死 + transcript 末轮
-       state='running' ⇒ 判被打断"的兜底（2026-09-29 去掉）：它判不出"还在慢慢想"和"被打断"，
-       长时间不调工具的轮会被误判取消，控制台先弹红色「任务取消」又跳回「思考中」，所以宁可
-       停在旧相位、等新鲜期回落待命，也不误报取消。 */
+    /* The floor-specific "cancel" marker synthesis (Claude/Qoder's transcript signal, Trae's renderer.log,
+       CodeBuddy plugin's message-queue) is funneled into each floor module's synthMarks (dispatched by
+       FLOORS at the bottom of this file); no product-specific logic is written here. The historical
+       fallback "task slot stuck + last transcript turn state='running' ⇒ judged interrupted" was removed on
+       2026-09-29: it cannot tell "still thinking slowly" from "interrupted", so turns that go a long time
+       without calling a tool were misjudged as cancelled and the console popped a red "task cancelled" and
+       then jumped back to "thinking" — better to stay on the old phase and wait for the freshness window to
+       fall back to idle than to falsely report a cancel. */
     if (j.taskId) {
       const startedAtJ = Number(j.taskStartedAt) || 0;
-      // taskId 一并带上：sessionRegistry 的"被顶掉上一轮"扫尾拿它显式排除当轮自己
-      //（光靠 startedAt >= ts 判界不够直观，双保险），见 bus.endStaleTasksOfSession。
+      // Carry taskId too: sessionRegistry's "previous turn pushed out" cleanup uses it to explicitly exclude
+      // the current turn itself (judging the boundary by startedAt >= ts alone is not intuitive enough; belt
+      // and braces), see bus.endStaleTasksOfSession.
       if (id && startedAtJ) rounds.push({ sessionId: id, taskId: j.taskId, taskStartedAt: startedAtJ, client: j.client });
     }
-    // 楼层特有的"用户按停止却一个 hook 事件都不发"的取消探测，统一交给各楼层模块
-    // （见文件底部按 FLOORS 派发的 synthMarks）；公共代码只收"当前这一轮"起点，不写死任何产品。
+    // The floor-specific cancel probes for "the user pressed stop but not one hook event was sent" are handed
+    // to each floor module (see synthMarks dispatched by FLOORS at the bottom); the generic code only collects
+    // the "current turn" start and hardcodes nothing product-specific.
   }
-  /* --- TraeCode 独立扫取消信号 ---
-     数据源是 Trae 自己的 renderer.log（DoneHandler status:"canceled" / StreamDomainService
+  /* --- TraeCode scans its cancel signal independently ---
+     The data source is Trae's own renderer.log (DoneHandler status:"canceled" / StreamDomainService
      cancelReason:"stop_button" / NotificationPort stopType:"cancel" / stream-diagnostics
-     transformedStatus:"canceled"，四种都带 sessionId），由 trae.allCancels()
-     解析出来（按 mtime+size 缓存，与 traeModels.js 同口径）。
+     transformedStatus:"canceled" — all four carry a sessionId), parsed by trae.allCancels()
+     (cached by mtime+size, same rule as traeModels.js).
 
-     为什么**不在**上面的 hook 状态文件扫描循环里做：
-       · Trae 取消时**Stop hook 不触发**（hooks.json 里明明配了 Stop，execCommandHook 再也没
-         被调过一次），唯一权威信号是 renderer.log。
-       · hook 状态文件是"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt /
-         sessionPhase —— 如果我们把取消检测绑在 `if (j.taskId)` + `j.taskStartedAt` 的
-         sinceTs 过滤上，那"上一轮取消 → 新一轮立刻启动"这个窗口一过，上一轮的取消
-         信号就被新 startedAtJ 过滤掉了，done 标记永远合成不了。
+     Why it is **not** done inside the hook state file scan loop above:
+       · On a Trae cancel the **Stop hook never fires** (Stop is configured in hooks.json, yet
+         execCommandHook is never called again), so renderer.log is the only authoritative signal.
+       · Hook state files are "one per session": starting a new turn overwrites the old taskId /
+         taskStartedAt / sessionPhase — if cancel detection were tied to `if (j.taskId)` + `j.taskStartedAt`'s
+         sinceTs filter, then once the window "previous turn cancelled → new turn starts immediately" passes,
+         the previous turn's cancel signal is filtered out by the new startedAtJ and the done marker can never
+         be synthesized.
 
-     为什么**不在** hook 状态文件扫描循环里做、为什么**也不做** sinceTs/smart 判断：
-       · Trae 取消时 Stop hook 不触发，唯一权威信号是 renderer.log。
-       · hook 状态文件是"一份会话一份"，新一轮一开就覆盖旧的 taskId / taskStartedAt。
-         如果取消检测绑在 `startedAtJ` 上，"上一轮取消 → 新一轮立刻启动"这个窗口一过，
-         旧取消信号就被新 startedAtJ 过滤掉，done 标记永远合成不了。
-       · 渲染层自己用 "phase.ts vs done.at 谁更新" 来决定显示：done.at 旧但 phase.ts 新 →
-         新一轮正常跑覆盖 cancelled 状态（L459-470 IsoOfficeView.vue），**不会误亮红灯**。
-         所以无需 smart 判断过滤。 */
-  // 楼层特有的取消/完成标记合成：每条楼层自己实现 synthMarks（见各 floor 模块），公共代码只负责派发。
-  // client 为空（不指定产品）时扫全部楼层；否则只跑被点名的那一层。
-  // qoder 已在 FLOORS 里别名到 claude 模块，这里无需特判。
+     Why it is **not** done in the hook state file scan loop, and why there is **no** sinceTs/smart judgment
+     either:
+       · On a Trae cancel the Stop hook never fires; renderer.log is the only authoritative signal.
+       · Hook state files are "one per session": starting a new turn overwrites the old taskId / taskStartedAt.
+         If cancel detection were tied to `startedAtJ`, then once the window "previous turn cancelled → new
+         turn starts immediately" passes, the old cancel signal is filtered out by the new startedAtJ and the
+         done marker can never be synthesized.
+       · The render layer itself decides what to show by "which is newer, phase.ts or done.at": done.at older
+         but phase.ts newer → the new turn is running normally and covers the cancelled state
+         (L459-470 IsoOfficeView.vue), so **no false red light**. Hence no smart filtering is needed. */
+  // Floor-specific cancel/done marker synthesis: each floor implements synthMarks (see each floor module);
+  // the generic code only dispatches. With client empty (no product specified) scan every floor; otherwise
+  // run only the named one. qoder is already aliased to the claude module in FLOORS, so no special case here.
   const bases = client
     ? [String(client).trim().toLowerCase()].filter(Boolean)
     : Object.keys(FLOORS);
@@ -782,19 +866,22 @@ function readReporterDones(workspacePath, client = '') {
   return { latest, bySession, cancels, rounds };
 }
 
-/** "任务完成"的唯一真源：取**某条会话**的完成标记（不靠相位回落到空闲来猜，避免中途误弹）。
- *  同一个 (工程, 客户端) 下可能有多条会话，各取各的；会话 id 拿不到的楼层（Codex 的
- *  rollout 文件名不含 session_id）退回"该 client 最新的一份"——不猜，只是放宽到这一步。 */
+/** The single source of truth for "task done": take the done marker of **one session** (never guess from the
+ *  phase falling back to idle, which would pop mid-turn). Several sessions may exist under one
+ *  (project, client) and each is read separately; floors whose session id is unavailable (Codex's rollout
+ *  file names carry no session_id) fall back to "the newest one for that client" — not a guess, just relaxed
+ *  that far. */
 function readReporterDone(workspacePath, client = '', session = '') {
-  // 完成标记同理**必须绑会话**：没有会话就没有"这一轮完成了"可言。
-  // （以前 `session` 为空会退回"该 client 最新一份"——那会把同层别的会话的收工算到你头上。）
+  // The done marker likewise **must be tied to a session**: without a session there is no "this turn finished".
+  // (Previously an empty `session` fell back to "the newest one for that client" — that charged another
+  // session's finish on the same floor to you.)
   if (!session) return null;
   const { bySession } = readReporterDones(workspacePath, client);
   const hit = bySession.get(String(session)) || null;
   if (hit) return hit;
-  // 9F GitHub Copilot 没有 hook：状态文件这条路永远是空的，完成标记得从它自己的会话日志取
-  // （最新那一轮 request 的 completedAt，见 readCopilotLiveRequest）——不然 9F 永远没有
-  // 「任务完成」那一下（实测 2026-09-28：7F/8F 都有、9F 一直空）。
+  // 9F GitHub Copilot has no hook: the state-file path is always empty, so its done marker must come from its
+  // own session log (completedAt of the newest request, see readCopilotLiveRequest) — otherwise 9F never gets
+  // that "task done" moment (measured 2026-09-28: 7F/8F both had it, 9F stayed empty).
   if (String(client || '').trim().toLowerCase() === 'copilot') {
     const d = copilot.readCopilotDone(session);
     if (d) return d;
@@ -805,14 +892,16 @@ function readReporterDone(workspacePath, client = '', session = '') {
 
 
 /**
- * hook 上报的会话清单 —— 给"只认 hook"的楼层当会话来源（见 products.js 的 hookSource）。
+ * The session list reported by the hook — the session source for "hook-only" floors (see products.js's
+ * hookSource).
  *
- * TraeCode IDE 没有可扫的会话落盘（`~/.trae-cn/memory/*.jsonl` 是它自己的记忆文件，
- * 不是对话会话，拿来当会话就是编造），所以它的会话表直接由 reporter 状态文件构成：
- * sessionId 就是 hook payload 的 `session_id`，工程路径取相位 / 任务里记的 workspacePath ——
- * 两个都是实测值，不猜。老命名文件（没有 sessionId）没有会话维度，不算。
- * @param {string} client 客户端身份（**这一路来源**的 client，如 trae / codebuddy）；空则不限
- * @param {{includeEnded?: boolean}} options 默认不返回收到 SessionEnd 的会话；CLI JSONL 清理时需要完整状态
+ * TraeCode IDE has no scannable session disk state (`~/.trae-cn/memory/*.jsonl` is its own memory file, not a
+ * conversation; using it as a session would be fabrication), so its session table is built directly from the
+ * reporter state files: sessionId is the hook payload's `session_id`, and the project path comes from the
+ * workspacePath recorded in the phase / task — both measured values, never guessed. Old-naming files (no
+ * sessionId) have no session dimension and do not count.
+ * @param {string} client client identity (the client of **this source path**, e.g. trae / codebuddy); empty means no filter
+ * @param {{includeEnded?: boolean}} options by default sessions that got a SessionEnd are omitted; the CLI JSONL cleanup needs the full state
  * @returns {Array<{sessionId: string, workspacePath: string, lastEventAt: number, endedAt: number}>}
  */
 function listReporterSessions(client = '', { includeEnded = false } = {}) {
@@ -835,7 +924,8 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
     if (!lastEventAt) continue;
     const prev = byId.get(sessionId);
     const recordAt = Math.max(lastEventAt, endedAt);
-    // 同一会话可能有多份状态文件（换过工程 / 老命名残留）：取最新那份的工程
+    // One session may have several state files (project changed / old-naming residue): take the newest one's
+    // project
     if (!prev || recordAt > prev.recordAt) {
       byId.set(sessionId, {
         sessionId,
@@ -852,11 +942,13 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
 }
 
 /**
- * 当前"真正在敲"的工程：取 reporter hook 最近一次写相位 / task 的工程路径。
- * reporter 把相位打在 REAL_WS（它实际运行的工程），而不是 office 手工"打开工程"记的那个，
- * 所以这里用最新活动判定，避免 IDE 里直接开新工程时相位错归到旧工程（主控制台对不上下拉）。
- * 超过新鲜期（AWAIT_TTL_MS）视为失效，回落到传入的 fallback（通常是 office 当前打开的工程）。
- * @param {string} fallback 回落值
+ * The project currently "really being worked on": take the project path the reporter hook last wrote a phase /
+ * task into. The reporter stamps phases on REAL_WS (the project it actually runs in), not on whatever office
+ * manually recorded as "opened project", so this judges by the newest activity, avoiding phases being
+ * attributed to the old project when a new one is opened directly in the IDE (the main console would not match
+ * the dropdown). Past the freshness window (AWAIT_TTL_MS) it counts as stale and falls back to the passed-in
+ * fallback (usually office's currently opened project).
+ * @param {string} fallback fallback value
  * @returns {string}
  */
 function freshestReporterWs(fallback, client = '', session = '') {
@@ -874,7 +966,8 @@ function freshestReporterWs(fallback, client = '', session = '') {
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
     if (!ws || !ts || now - ts > AWAIT_TTL_MS) continue;
-    // 同上：只认本进程启动之后写入的相位，避免用上次运行的残留判定"当前工程"
+    // As above: only trust phases written after this process started, so residue from the previous run does
+    // not decide "the current project"
     if (ts < SERVER_STARTED_AT) continue;
     if (ts > bestTs) {
       bestTs = ts;
@@ -885,35 +978,40 @@ function freshestReporterWs(fallback, client = '', session = '') {
 }
 
 /**
- * 主 Agent 阶段：会话落盘里没有"阶段"这个字段，只能推。
- * 所以返回值一律带 inferred: true，UI 按推断展示。
+ * The main agent's phase: sessions have no "phase" field on disk, so it can only be inferred.
+ * Hence every return value carries inferred: true and the UI presents it as inferred.
  */
 function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow }) {
-  // 活跃窗口 = reporter hook 的 UserPromptSubmit..Stop（本地状态文件 taskId 非空）。
-  // 不在窗口内 → 一律待命：会话存在但没有事件，绝不凭空显示活跃状态。
+  // Active window = the reporter hook's UserPromptSubmit..Stop (the local state file's taskId is non-empty).
+  // Outside the window → always idle: the session exists but has no events, so never show an active state out
+  // of thin air.
   if (!inWindow) {
     return { phase: 'idle', action: '', inferred: true };
   }
-  // 没有任何线索（没待办、没改文件、没运行态）→ 空闲
+  // No clue at all (no todos, no changed files, no runtime) → idle
   if (!todos.total && !files.count && !runtime.activated) {
     return { phase: 'idle', action: '', inferred: true };
   }
-  // 重启纪元：推断用的时间证据（文件改动 / 待办 / 运行态落盘）也必须是**本进程启动之后**的。
-  // 否则"上次运行留下的最后一次文件改动"（仍在 BUSY_MS 窗口内）会在重启瞬间被判成「调用工具」，
-  // 与"重启后先待命、等下一个新事件"相悖。与 readReporterPhase 用同一把尺子。
+  // Restart epoch: the time evidence used for inference (file changes / todos / runtime writes) must likewise
+  // be **after this process started**. Otherwise "the last file change left by the previous run" (still inside
+  // the BUSY_MS window) is judged "calling a tool" the instant we restart, contradicting "idle first after a
+  // restart, wait for the next new event". Same yardstick as readReporterPhase.
   const afterRestart = (ts) => Number(ts) >= SERVER_STARTED_AT;
-  // 显式状态也只在"近期真有动静"时采信，避免 IDE 关掉后残留的运行态一直挂着
+  // Explicit states are trusted only when "there really was recent movement", so a runtime left behind after
+  // the IDE closes does not hang around
   if (runtime.paused && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'idle', action: '会话已暂停', inferred: true };
   }
-  // 「等会话空闲后收尾」：插件把消息排到了这一轮结束之后再发，人没在干活 —— 报待命，
-  // 把原因写在 action 上。以前这里报 summarize（「汇总中」），但那个相位真机上不产生
-  // （演示脚本才有），留着会让"没在干活"看着像"正在汇总"（2026-10-01 去掉，见 renderer/src/iso/mainConsole.js）。
+  // "Wrap up once the session is idle": the plugin queued messages to be sent after this turn ends; nobody is
+  // working — report idle and put the reason in action. This used to report summarize ("summarizing"), but
+  // that phase never occurs on a real machine (only the demo script produces it), and keeping it made "not
+  // working" look like "summarizing" (removed 2026-10-01, see renderer/src/iso/mainConsole.js).
   if (runtime.awaitingSessionIdle && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'idle', action: '等会话空闲后收尾', inferred: true };
   }
 
-  // 正在干活：必须"新鲜"证据，否则 IDE 关掉后残留的 in_progress 待办 / 文件改动会一直显示「工具中」
+  // Working: the evidence must be "fresh", otherwise leftover in_progress todos / file changes after the IDE
+  // closes keep showing "tool"
   if (todos.doing && afterRestart(todos.at) && now - todos.at < IDLE_MS) {
     return { phase: 'tool', action: todos.doing, inferred: true };
   }
@@ -921,45 +1019,51 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
     const f = files.recent[0];
     return { phase: 'tool', action: `改 ${f.name}（+${f.added}/-${f.removed}）`, inferred: true };
   }
-  // 运行态极新鲜（插件最近在落盘）→ 这一轮对话真的在推进（含纯推理、只读工具等拿不到文件/待办证据的情况）。
-  // 没有"正在调工具"的硬证据，只是知道在动，归到「思考中」——绝不凭空显示「调用工具」。
+  // The runtime is very fresh (the plugin wrote to disk recently) → this turn of conversation really is
+  // advancing (covers pure reasoning, read-only tools, and other cases with no file/todo evidence).
+  // There is no hard evidence of "calling a tool right now", only that it is moving, so file it under
+  // "thinking" — never show "calling a tool" out of thin air.
   if (afterRestart(lastUpdated) && now - lastUpdated < FRESH_MS) {
     return { phase: 'thinking', action: '', inferred: true };
   }
 
-  // 有排队待发消息（且不是陈年残留）→ 待命 + 说明排队条数。
-  // 以前报 plan（「规划中」），但排队消息不等于 agent 在规划 —— 同一个演示态，2026-10-01 一起去掉。
+  // Messages queued to be sent (and not ancient residue) → idle + the queued count.
+  // This used to report plan ("planning"), but queued messages do not mean the agent is planning — same demo
+  // state, removed together on 2026-10-01.
   if (pending > 0 && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'idle', action: `${pending} 条待发消息排队中`, inferred: true };
   }
 
-  // 没有新动静：IDE 多半关了 / 在等用户。回空闲，不凭"激活过"瞎显示活跃相位
+  // Nothing new: the IDE is probably closed / waiting for the user. Fall back to idle; do not show an active
+  // phase just because "it was activated once"
   return { phase: 'idle', action: '会话空闲', inferred: true };
 }
 
-/** 单个会话的完整信息 */
+/** Full information for one session */
 function sessionInfo(storage, id, { current = false, now = Date.now(), workspacePath = '', inWindow = false, client = '' } = {}) {
-  // 结构化落盘（todos / file-changes / message-queue）的读取按 client 派发到对应楼层的 pluginStore
-  // （1F CodeBuddy 那套 genie-history 落盘归 floorCodebuddy.js；本文件只综合，不懂任何产品的目录结构）。
+  // Reading the structured disk state (todos / file-changes / message-queue) is dispatched by client to that
+  // floor's pluginStore (1F CodeBuddy's genie-history layout belongs to floorCodebuddy.js; this file only
+  // combines and knows no product's dir layout).
   const store = pluginStoreOf(client);
   const todos = store.readTodos(storage, id);
   const files = store.readFileChanges(storage, id);
   const mq = store.readRuntime(storage, id);
   const lastUpdated = Math.max(todos.at, files.lastAt, mq.updatedAt) || null;
-  // 活跃 = 当前会话且近期有动静 / 运行态新鲜 / 刚改过文件。
-  // 关键：关掉 IDE 后插件不再落盘，但 current.json 仍指向它、runtime.activated 也残留为真，
-  // 所以不能只靠 current / activated 判定活跃，必须用"近期有写入"确认它真的还活着，
-  // 否则关掉窗口的会话会一直卡在列表里、相位还停在某个活跃态。
+  // Active = the current session with recent movement / a fresh runtime / a file changed just now.
+  // Key point: after the IDE closes the plugin stops writing, but current.json still points at it and
+  // runtime.activated stays true, so activity cannot be judged from current / activated alone — "recent writes"
+  // must confirm it is really alive, otherwise a session whose window was closed stays stuck in the list with
+  // its phase frozen on some active state.
   const active = Boolean(
     (current && lastUpdated && now - lastUpdated < IDLE_MS) ||
       (mq.runtime.activated && lastUpdated && now - lastUpdated < IDLE_MS) ||
       (files.lastAt && now - files.lastAt < BUSY_MS)
   );
-  // 还在列表里（宽窗口，60 分钟）；active 仍是"热窗口"，只影响相位推断
+  // Still listed (wide window, 60 minutes); `active` remains the "hot window" and only affects phase inference
   const listed = Boolean(lastUpdated && now - lastUpdated < LISTED_MS);
   const inferred = inferPhase({ todos, files, runtime: mq.runtime, pending: mq.pending, lastUpdated, now, inWindow });
 
-  /** 悬浮屏第三层：任务清单（状态用符号标出来，不做翻译） */
+  /** Third layer of the hover screen: the task list (status marked with symbols, not translated) */
   const mark = { completed: '✓', in_progress: '▶', pending: '·' };
   let phase = inferred.phase;
   let action = inferred.action;
@@ -967,14 +1071,16 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
   let tool = '';
   let context = todos.items.map((t) => `${mark[t.status] || '·'} ${t.content}`);
 
-  // 上报真值：reporter hook 把每个事件的相位（思考中 / 调用工具 / 等待授权）落到本地状态文件。
-  // 优先级高于从 genie-history 推断的相位；只在"当前会话"上生效（相位必然出在这只 agent 身上）。
+  // Reported truth: the reporter hook writes the phase of every event (thinking / calling a tool / awaiting
+  // authorization) into a local state file. It outranks a phase inferred from genie-history and takes effect
+  // only on the "current session" (the phase necessarily belongs to this agent).
   let reported = false;
   let prompt = '';
   if (current && inWindow) {
-    // **必须带上本会话 id**（轴 2）：状态文件按会话一份，不带 session 就会拿到同层最新那份——
-    // 同一楼层同时开着多条会话（CLI + Plugin / 两条插件会话）时，空闲会话会借到别人正在跑的
-    // 「思考中」，主控制台就卡死在思考中下不来（本函数是三处漏筛之一，另见 inWindow / done）。
+    // **This session's id must be passed (axis 2)**: state files are one per session, so without the session
+    // you get the newest one on the same floor — with several sessions open on one floor (CLI + Plugin / two
+    // plugin sessions), an idle session borrows another's running "thinking" and the main console sticks on
+    // thinking forever (this function is one of three missed filters; see also inWindow / done).
     const rp = reporterMainPhase(workspacePath, client, id);
     if (rp) {
       reported = true;
@@ -987,18 +1093,21 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     }
   }
 
-  // 完成标记：reporter 仅在 Stop 时落盘（按工程 + 客户端区分），是"任务完成"的唯一真源；
-  // 比"相位回落到空闲"可靠——任务中途因轮询间隙 / 跨工程串味出现空闲，绝不冒充完成。
-  // 同样按**本会话 id** 取：不带 session 会退回同层最新一份，把别的会话的「完成 / 取消」搬到它头上。
+  // Done marker: the reporter writes it only at Stop (distinguished by project + client) and it is the single
+  // source of truth for "task done"; more reliable than "the phase fell back to idle" — if a task goes idle
+  // mid-run because of a poll gap or cross-project bleed, it must never pose as done.
+  // Also taken by **this session's id**: without the session it falls back to the newest one on the same floor
+  // and moves another session's "done / cancelled" onto this one.
   const done = readReporterDone(workspacePath, client, id) || null;
   const doneAt = done ? done.at : 0;
   const doneTitle = done ? done.title || '' : '';
-  // 只挑"本轮任务开始之后"改过的文件：file-changes 是整个会话累积的，
-  // 不筛会把上一轮（甚至更早）的改动当成"本次完成"——典型：这一轮只是 push，却显示上一轮改了多少文件。
-  // done.startedAt 缺省（老数据）时不过滤，退回原来的"取最近几个"。
+  // Only keep files changed "after this turn's task started": file-changes accumulates for the whole session,
+  // and not filtering would present a previous turn's (or older) changes as "this completion" — typical: this
+  // turn was only a push, yet it shows how many files the previous turn changed.
+  // When done.startedAt is missing (old data) do not filter; fall back to the old "take the newest few".
   const doneStartedAt = done ? Number(done.startedAt) || 0 : 0;
   const doneAll = done && done.cancelled
-    ? [] // 被打断的那一轮常常什么都没改：不把整轮会话的文件改动算成"本次完成"
+    ? [] // An interrupted turn often changed nothing: do not count the whole session's file changes as "this completion"
     : (done
       ? (Array.isArray(files.recent) ? files.recent.filter((f) => !doneStartedAt || Number(f.at) >= doneStartedAt) : [])
       : []);
@@ -1008,7 +1117,8 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     current,
     active,
     listed,
-    // 有 runtime 说明插件还认这个会话；没有就是历史会话（只剩待办/改动的化石）
+    // Having a runtime means the plugin still recognizes this session; without one it is a historical session
+    // (only fossils of todos / changes remain)
     live: Boolean(mq.hasRuntime),
     lastUpdated,
     runtime: mq.runtime,
@@ -1023,40 +1133,45 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     prompt,
     doneAt,
     doneTitle,
-    doneCount: doneAll.length, // 本轮任务改动的文件数（在切片之前算）
+    doneCount: doneAll.length, // Files changed by this turn's task (counted before slicing)
     doneFiles: doneAll.slice(0, 6),
-    // 这一轮是被打断收掉的（reporter 在 Interrupt 时落的 done.cancelled）：
-    // 渲染层据此亮红色「任务取消」，不亮「任务完成」。
+    // This turn was cut short (the reporter writes done.cancelled at Interrupt): the render layer lights the
+    // red "task cancelled" from this, not "task done".
     doneCancelled: Boolean(done && done.cancelled),
-    inferred: !reported, // 上报真值（reporter hook）不算推断
+    inferred: !reported, // Reported truth (reporter hook) does not count as inference
   };
 }
 
-/* ------------------------------ 对外：列会话 ------------------------------ */
+/* ------------------------------ Public: listing sessions ------------------------------ */
 
-/** 工程路径补全与 genie-history 工程归集由楼层的 pluginStore 提供（见 floorCodebuddy.js 的 collectProjects）。 */
+/** Project path completion and genie-history project collection come from the floor's pluginStore
+ *  (see collectProjects in floorCodebuddy.js). */
 
 /**
- * 列出**所有工程**里的活跃会话（不局限于当前打开的那个工程）。
+ * List the active sessions in **all projects** (not limited to the currently opened one).
  * @param {{workspacePath?: string, force?: boolean, client?: string, pluginRe?: RegExp[], currentOnly?: boolean, activeSessions?: object[]}} o
  * @returns {{ok: true, sessions: Array, current: string, workspacePath: string,
  *            storage: string, reason?: string}}
- *   reason: 'no-storage' 没找到插件落盘 / 'no-open-project' 一个活跃会话都没有
+ *   reason: 'no-storage' no plugin disk state found / 'no-open-project' not a single active session
  */
 function listSessions({ workspacePath = '', force = false, client = '', pluginRe = null, currentOnly = false, activeSessions = [] } = {}) {
-  // 这一路的楼层：落盘目录正则 / 落盘标记 / 结构化读取器都按它取（缺省就用楼层自己 meta 里的 pluginRe）。
-  // 不在这里内置"所有插件产品"的并集 —— 那会让某一层扫到别的楼层的落盘（见 taskSync.test [8]）。
+  // This path's floor: the disk dir regex / disk markers / structured readers are all taken from it (default
+  // falls back to the floor's own meta.pluginRe). No union of "all plugin products" is built in here — that
+  // would let one floor scan another floor's disk state (see taskSync.test [8]).
   const mod = floorModuleOf(client);
   const re = pluginRe || (mod && mod.meta && mod.meta.pluginRe) || [];
   const storageMarks = (mod && mod.meta && mod.meta.pluginStorageMarks) || [];
-  // 会话归属用的"当前工程"跟随 reporter 真实活动的最新工程，
-  // 而不是 office 手工"打开工程"记的那个（IDE 里直接开新工程时两者会脱节）。
-  // 只认传入的 client 这一路：这份清单属于某个插件楼层，别层（其它产品 / 同一产品的 CLI）
-  // 在别的工程里活动不该决定这一层的"当前工程" —— 否则 mine / current / fresh 全被带偏。
+  // The "current project" used for session ownership follows the reporter's newest real activity project,
+  // not the one office manually recorded as "opened project" (the two drift apart when a new project is
+  // opened directly inside the IDE).
+  // Only this passed-in client's path counts: this listing belongs to one plugin floor, and another floor's
+  // (another product's / the same product's CLI) activity in another project must not decide this floor's
+  // "current project" — otherwise mine / current / fresh all get dragged off.
   const ws = freshestReporterWs(workspacePath, client);
   const now = Date.now();
-  // 缓存键必须覆盖 client / pluginRe / 工程，否则同一工程里的不同插件楼层、或 CLI/Plugin 视图
-  // 会复用上一次的旧结果（例如 A5 里 plugin 那路读到先前写入的窗口值、误以为还在全局表里）。
+  // The cache key must cover client / pluginRe / project, otherwise different plugin floors in the same
+  // project, or the CLI/Plugin views, reuse the previous result (e.g. in A5 the plugin path read a previously
+  // written window value and thought it was still in the global table).
   const activeKey = activeSessions.map((s) => `${s.sessionId}:${s.lastEventAt}`).sort().join(',');
   const key = `${client}@@${ws}@@${currentOnly ? 'current-only' : 'all'}@@${activeKey}@@${String(Array.isArray(re) ? re.map((r) => (r && r.source) || String(r)).join('|') : re instanceof RegExp ? re.source : String(re || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
@@ -1071,21 +1186,24 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     return cache.value;
   }
 
-  /** 会话 id -> 归属（工程名 / 工程路径）。每个工程自己的"当前会话"单独记，
-   *  不做成全局唯一 —— 这样多工程时每条工程里的活跃会话都能拿到自己 reporter 的实时相位，
-   *  主控制台跟随下拉选中的那条，不再被全局"最后一个 reporter"覆盖。 */
+  /** session id -> ownership (project name / project path). Each project's own "current session" is recorded
+   *  separately rather than as one global value — that way, with several projects, each project's active
+   *  session gets its own reporter's live phase, and the main console follows the one selected in the
+   *  dropdown instead of being overwritten by the global "last reporter". */
   const meta = new Map();
-  const perProjectCurrent = new Map(); // 工程路径 -> 该工程 current.json 指向的会话 id
+  const perProjectCurrent = new Map(); // project path -> the session id that project's current.json points at
   let currentId = '';
-  // candidates 传"真实活动工程 + 本次查询的工程"，顺序即优先级（ws 放最前）：
-  // genie-history 目录名可能被扩展截断，用它俩把半截路径补回完整路径（优先磁盘上真实存在的目录），
-  // 否则工程名会显示成被截断后的残尾、currentId 落空，见 completeTruncatedWorkspace
+  // candidates passes "the real activity project + the project being queried"; the order is the priority (ws
+  // first): a genie-history dir name may be truncated by the extension, so these two complete the half path
+  // back into a full one (preferring a dir that really exists on disk), otherwise the project name shows as a
+  // truncated tail and currentId comes up empty — see completeTruncatedWorkspace
   for (const p of pluginStoreOf(client).collectProjects(storage, [ws, workspacePath])) {
     const cur = readJson(path.join(p.dir, 'current.json')) || {};
     const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
     if (cid) {
       perProjectCurrent.set(p.path, cid);
-      // 全局唯一的"当前会话"仍认真实活动工程（ws）里那条，用于默认选中 / 高亮
+      // The globally unique "current session" still recognizes the one in the real activity project (ws), used
+      // for default selection / highlighting
       if (p.path === ws) currentId = currentId || cid;
     }
     for (const id of readDir(path.join(p.dir, 'conversations'))) {
@@ -1098,9 +1216,11 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     }
   }
 
-  // GitHub Copilot 这类真实插件落盘用 SQLite `session-store.db`，不是 `genie-history`：
-  // 这里单独把它们并进同一张会话表，否则 9F 永远会被旧的 Tencent 目录吞掉、UI 不点亮。
-  // 整段 Copilot SQLite 的读取 + enrich 在 copilot.js 的 readCopilotSessions 里做（plugin 来源统一收口）。
+  // Real plugin disk state like GitHub Copilot uses the SQLite `session-store.db`, not `genie-history`:
+  // merge those into the same session table here, otherwise 9F is forever swallowed by the old Tencent dir and
+  // the UI never lights up.
+  // The whole Copilot SQLite read + enrich lives in copilot.js's readCopilotSessions (plugin sources are
+  // funneled through one place).
   const sqliteRows = copilot.readCopilotSessions(storage, { ws, now });
   const sqliteById = new Map();
   for (const row of sqliteRows) {
@@ -1110,8 +1230,9 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     if (row.projectPath && row.projectPath === ws) currentId = currentId || row.id;
   }
 
-  // 兜底：插件新版可能不写 genie-history，会话只在 todos / 消息队列里露过头。
-  // 这类会话没有工程归属（project 留空），但它是"正在跑的那个"，不列出来更糟。
+  // Fallback: newer plugin versions may not write genie-history, so a session shows up only in todos / the
+  // message queue. Such sessions have no project ownership (project stays empty), but they are "the one that
+  // is running", and leaving them out is worse.
   for (const name of readDir(path.join(storage, 'todos'))) {
     const id = name.replace(/\.json$/i, '');
     if (id && !meta.has(id)) meta.set(id, { project: '', projectPath: '' });
@@ -1137,19 +1258,25 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     const isProjectCurrent = id === (perProjectCurrent.get(m.projectPath) || '');
     const activeSession = activeById.get(id) || null;
     if (currentOnly && !isProjectCurrent && !activeSession) continue;
-    // Copilot 没有 reporter hook，readReporterActiveTask 恒为空，相位只能推断（inferred）：
-    //   ① 有 VS Code chat 索引的「这一轮在不在飞」→ 直接听它（跑着就是 thinking，收工就是 idle），
-    //      这是唯一能看见"轮进行中"的旁证，见 readCopilotChatIndex；
-    //   ② 没有旁证（老版本 / 库被占用）才退回 updated_at 的 COPILOT_PHASE_MS(2 分钟)窗口。
-    // hasPendingTurn（空 assistant_response 的 turn）不单独使用 —— Copilot 是批次写入，
-    // 放弃/取消的 turn 也留空 response，2 分钟外的空 turn 是已废弃不是正在跑。
-    // 活跃窗口也按**本会话 id** 判：不带 session 时，同层任意一条会话在跑就会把 inWindow 顶成真，
-    // 空闲会话据此被推断成「思考中」（同 sessionInfo 那处漏筛）。见 [A2c]。
+    // Copilot has no reporter hook, so readReporterActiveTask is always empty and the phase can only be
+    // inferred (inferred):
+    //   ① With VS Code's chat index saying "is this turn in flight" → trust it directly (running = thinking,
+    //      finished = idle); that is the only side evidence that can see "a turn is in progress", see
+    //      readCopilotChatIndex;
+    //   ② Only without evidence (old version / db locked) fall back to updated_at's COPILOT_PHASE_MS
+    //      (2 minutes) window.
+    // hasPendingTurn (a turn with an empty assistant_response) is not used on its own — Copilot writes in
+    // batches, so abandoned / cancelled turns also leave an empty response; an empty turn older than 2 minutes
+    // is discarded, not running.
+    // The active window is also judged by **this session's id**: without the session, any session running on
+    // the same floor pins inWindow to true, and an idle session is then inferred as "thinking" (the same
+    // missed filter as in sessionInfo). See [A2c].
     const reporterInWindow = readReporterActiveTask(m.projectPath, client, id);
     let info;
     if (sqliteRow) {
-      // 整条 enrich 已在 copilot.readCopilotSessions 完成（phase / inFlight / doneAt / live* 系列），
-      // 这里只叠加 reporter 这一层的 inWindow，以及统一"当前工程"口径（isProjectCurrent || projectPath===ws）。
+      // The whole enrich is already done in copilot.readCopilotSessions (phase / inFlight / doneAt / the live*
+      // family); here we only layer the reporter's inWindow on top and unify the "current project" rule
+      // (isProjectCurrent || projectPath===ws).
       info = { ...sqliteRow, inWindow: reporterInWindow || sqliteRow.inWindow };
       info.current = Boolean(isProjectCurrent || (sqliteRow.projectPath && sqliteRow.projectPath === ws));
     } else {
@@ -1200,25 +1327,27 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   return cache.value;
 }
 
-/* ============================================================== 会话标题（原 sessionTitle.js，从 floors.js 迁入） */
+/* ============================================================== Session titles (from the old sessionTitle.js, moved in from floors.js) */
 
 /**
- * 会话标题：给"这一轮属于哪条会话"一个**会话级**的名字 —— 同一 session_id 的所有任务拿到同一个值，
- * 凭它把同一会话的多轮任务认出来（一轮 = 一行任务，一条会话通常有多轮；各轮自己的标题互不相同，
- * 只有会话标题是共同的）。
+ * Session title: give "which session this turn belongs to" a **session-level** name — every task with the
+ * same session_id gets the same value, which is how several turns of one session are recognized as such
+ * (one turn = one task row, and a session usually has several turns; each turn's own title differs, only the
+ * session title is shared).
  *
- * 两条来源，按顺序取：
- *   1. 各楼层自己的会话标题（agent 起的摘要，与用户原话不同）：
+ * Two sources, in order:
+ *   1. Each floor's own session title (a summary the agent generated, different from the user's words):
  *        7F Kilo Code → SQLite session.title
  *        8F OpenCode  → SQLite session.title
  *        6F Qoder     → SQLite chat_session.session_title
- *      这些函数（kiloTitleOf / opencodeTitleOf / lingmaTitleOf）已经搬进各自的楼层文件（kilo.js /
- *      opencode.js / qoder.js），这里只从楼层注册表动态构建分发表。
- *   2. **兜底（所有楼层）**：这条会话第一轮的用户原话。
- *      会话开始时的标题就是用户原话 —— 1F/2F/3F/4F/5F/9F 没有第 1 条那种摘要列，但它们每一轮的
- *      prompt 都在 tasks.title 里，取同一 session_id 里**最早那一轮**的即可（见 sessionFirstPrompts()）。
+ *      Those functions (kiloTitleOf / opencodeTitleOf / lingmaTitleOf) have moved into their own floor files
+ *      (kilo.js / opencode.js / qoder.js); here the dispatch table is built dynamically from the floor registry.
+ *   2. **Fallback (all floors)**: the user's words from that session's first turn.
+ *      The title at the start of a session is the user's own words — 1F/2F/3F/4F/5F/9F have no summary column
+ *      like source 1, but each of their turns' prompts is in tasks.title, so take **the earliest turn** with
+ *      the same session_id (see sessionFirstPrompts()).
  *
- * 纪律：任何一层查不到一律回空串，绝不冒泡、绝不编造。
+ * Discipline: if any layer cannot find it, return an empty string; never bubble, never fabricate.
  */
 
 function escapeRegExp(s) {
@@ -1226,9 +1355,9 @@ function escapeRegExp(s) {
 }
 
 /**
- * 分发表**惰性构建并缓存**：凡是楼层模块导出了 sessionTitle 的，都按它的 client 与
- * 各楼层注册。延迟到首次调用才构建，避免在模块加载期去读（没有 sessionTitle 的）
- * 楼层 exports 的属性，从而避开 Node 的循环依赖告警。
+ * The dispatch table is **built lazily and cached**: any floor module exporting sessionTitle is registered by
+ * its client. Building is deferred to the first call so no floor exports are read (for a sessionTitle that
+ * does not exist) during module loading, avoiding Node's circular-dependency warning.
  * @returns {Array<{match: RegExp, fn: Function}>}
  */
 let _routers = null;
@@ -1242,13 +1371,15 @@ function routers() {
 }
 
 /**
- * 占位标题：Kilo 起会话时默认写的是 "New session - <ISO 时间戳>"（它自己占的位，不是摘要）。
- * 把它当"有标题"列出来，详情里就多一行时间戳，纯噪声 —— 一律当没有。
+ * Placeholder title: Kilo writes "New session - <ISO timestamp>" by default when it opens a session (its own
+ * placeholder, not a summary). Listing that as "has a title" adds a line of timestamp to the details — pure
+ * noise — so treat it as absent.
  */
 const PLACEHOLDER_TITLE = /^new session\b/i;
 
 /**
- * 根据 client 分发到对应楼层查 title。找不到、库没装、表结构变了、查出来是占位名一律回空串。
+ * Dispatch by client to the matching floor to look up the title. Not found / db missing / schema changed /
+ * the result is a placeholder → empty string.
  * @param {string|null|undefined} sessionId
  * @param {string|null|undefined} client
  * @returns {string}
@@ -1266,17 +1397,19 @@ function resolveSessionTitle(sessionId, client) {
   return '';
 }
 
-/* ------------------------------ 兜底：会话第一轮的用户原话 ------------------------------ */
+/* ------------------------------ Fallback: the user's words from the session's first turn ------------------------------ */
 
 /**
- * 老数据（hook 修掉之前）把 IDE 注入的那段上下文整段当标题存了下来 ——
- * `# Context from my IDE setup: ## Active file: …`。规则与前端 promptOf()、
- * hook 侧 userRequestText 保持一致：只在真出现那段上下文时才按「My request:」切开取后面。
+ * Old data (before the hook was fixed) stored the whole IDE-injected context block as the title —
+ * `# Context from my IDE setup: ## Active file: …`. The rule matches the frontend's promptOf() and the hook
+ * side's userRequestText: only when that context block really appears do we split on "My request:" and take
+ * what follows.
  */
 const IDE_INJECTED = [/^[ \t]*#{0,6}[ \t]*Context from my IDE setup\b/im, /^[ \t]*#{1,6}[ \t]*(?:Active file|Open tabs)\b/im];
 const REQUEST_SPLIT = /^[ \t]*#{0,6}[ \t]*(?:My request|User request|Request|我的请求|用户请求)[ \t]*[:：][ \t]*$/im;
 
-/** 一条 tasks.title → 用户原话（首行，够当标题用；过长截断，免得详情那一行撑爆） */
+/** One tasks.title → the user's words (the first line, enough for a title; truncated when too long so the
+ *  details row does not blow up) */
 function userRequestOf(raw) {
   const s = String(raw || '').replace(/\r\n?/g, '\n');
   if (!s.trim()) return '';
@@ -1286,20 +1419,21 @@ function userRequestOf(raw) {
 }
 
 /**
- * 一批会话各自"第一轮说了什么"（用户原话）。
+ * "What was said in the first turn" (the user's words) for a batch of sessions.
  *
- * 只查一次：按 session_id 分组取 started_at 最小的那一轮 —— SQLite 的规矩是
- * `MIN()` 与裸列同用时，裸列取自 MIN 命中的那一行，所以 t.title 就是最早那轮的标题。
+ * One query only: group by session_id and take the turn with the smallest started_at — SQLite's rule is that
+ * when `MIN()` is used together with a bare column, the bare column comes from the row MIN hit, so t.title is
+ * the earliest turn's title.
  *
- * @param {import('better-sqlite3').Database|null} raw 主库（只读用）
+ * @param {import('better-sqlite3').Database|null} raw main db (read-only use)
  * @param {string[]} sessionIds
- * @returns {Map<string, string>} 查不到的会话不在表里（调用方当"没有"）
+ * @returns {Map<string, string>} sessions not found are absent from the map (callers treat that as "none")
  */
 function sessionFirstPrompts(raw, sessionIds) {
   const out = new Map();
   const ids = [...new Set(sessionIds.map((s) => String(s || '').trim()).filter(Boolean))];
   if (!raw || !ids.length) return out;
-  // 占位符别一次塞太多（SQLite 默认上限 999）：分批查
+  // Do not stuff too many placeholders at once (SQLite's default limit is 999): query in chunks
   for (let i = 0; i < ids.length; i += 400) {
     const chunk = ids.slice(i, i + 400);
     const holes = chunk.map(() => '?').join(',');
@@ -1320,24 +1454,25 @@ function sessionFirstPrompts(raw, sessionIds) {
         if (title) out.set(String(r.sid), title);
       }
     } catch {
-      /* 表结构变了 / 库被锁：这一批没有，调用方按"没有会话标题"走，不编造 */
+      /* Schema changed / db locked: this chunk has none; callers treat it as "no session title" and fabricate
+         nothing */
     }
   }
   return out;
 }
 
 module.exports = {
-  resolveSessionTitle, // 会话标题：按 client 派发到对应楼层模块（kilo/opencode/qoder 的 SQLite title）
-  sessionFirstPrompts, // 兜底：一批会话各自第一轮用户原话（从 tasks 表取最早一轮）
+  resolveSessionTitle, // Session title: dispatched by client to the floor module (kilo/opencode/qoder's SQLite title)
+  sessionFirstPrompts, // Fallback: each session's first-turn user words (taken from the tasks table, earliest turn)
   hasReporterState,
   reporterStateMeta,
-  hasOtherLiveSession,// 成员状态降级前的守卫：这条会话停了，同产品的别的会话还在跑吗（见函数说明）
-  readReporterDone,   // 完成标记（含 Codex 的收尾自述）：CLI 楼层靠它亮「任务完成」
-  readReporterDones,  // 同上，但一次取回该 (工程, 客户端) 下所有会话的 —— 会话表扫盘用
-  listReporterSessions, // 会话只能靠 hook 的楼层（5F TraeCode/ 1F CodeBuddy CLI）
-  sessionModel,       // 这条会话在用什么模型（TraeCode 从 globalStorage 取，其余留空）
+  hasOtherLiveSession,// Guard before demoting a member state: this session stopped, is another session of the same product still running (see the function note)
+  readReporterDone,   // Done marker (including Codex's closing summary): CLI floors light "task done" from it
+  readReporterDones,  // Same, but fetches every session under that (project, client) at once — for the session-table scan
+  listReporterSessions, // Floors whose sessions can only come from hooks (5F TraeCode / 1F CodeBuddy CLI)
+  sessionModel,       // Which model this session uses (TraeCode reads globalStorage; others stay empty)
   listSessions,
   reporterMainPhase,
   freshestReporterWs,
-  readReporterPhase, // 主控制台那口实时相位（打断后作废的逻辑在这里，回归测试直接盯它）
+  readReporterPhase, // The live phase on the main console (the invalidation-after-interrupt logic lives here; regression tests watch it directly)
 };

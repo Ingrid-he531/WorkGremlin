@@ -1,13 +1,13 @@
 'use strict';
 
 /**
- * 本地服务：Express(HTTP 上报/查询) + ws(推送) + SQLite(落库)。
+ * Local server: Express (HTTP reporting/query) + ws (push) + SQLite (persistence).
  *
- * 两种运行方式：
- *   1) 被 Electron 主进程内嵌（同进程，无端口/子进程管理成本）：
+ * Two ways to run it:
+ *   1) Embedded in the Electron main process (same process, no port / child-process management cost):
  *        const { createServer } = require('@workgremlin/server');
  *        const server = createServer({}); await server.start();
- *   2) 独立启动（headless / 调试 / 单测）：node server/src/cli.js
+ *   2) Standalone (headless / debugging / unit tests): node server/src/cli.js
  */
 
 const http = require('node:http');
@@ -39,14 +39,19 @@ const clock = require('./clock');
 const VERSION = '0.1.0';
 
 /**
- * 探测到"装了某个受监控 CLI"就把 hook 自动接上 —— 探测和接入本该是一件事，
- * 不该让用户装完 WorkGremlin 再手跑一遍 `npm run hooks:install`。
+ * Detecting "some monitored CLI is installed" auto-attaches its hook —— detection and attachment
+ * ought to be one step; users should not have to run `npm run hooks:install` by hand after
+ * installing WorkGremlin.
  *
- * 安全与分寸：
- *   · 只对**安装位置命中**的产品写（products.js 的判定口径：PATH 里有可执行文件 / 有插件目录）；
- *   · 合并式写入，只加/更新我们自己的条目，别人的配置一条不动，首次改动前备份 .bak-workgremlin；
- *   · 幂等：内容没变就什么都不写（所以每次启动调用是廉价的）；
- *   · 失败绝不影响服务启动；不想被自动改配置就 `WORKGREMLIN_NO_AUTO_HOOKS=1`。
+ * Safety and restraint:
+ *   · Only write into products whose **install location was hit** (products.js's criterion: an
+ *     executable on PATH / a plugin directory exists);
+ *   · Merging write: only add/update our own entries, never touch anyone else's, and back the file
+ *     up as .bak-workgremlin before the first change;
+ *   · Idempotent: nothing is written when the content is unchanged (so calling it on every start is
+ *     cheap);
+ *   · A failure must never keep the server from starting; set `WORKGREMLIN_NO_AUTO_HOOKS=1` if you
+ *     do not want your config touched automatically.
  */
 function autoInstallHooks() {
   if (process.env.WORKGREMLIN_NO_AUTO_HOOKS === '1') {
@@ -54,7 +59,7 @@ function autoInstallHooks() {
     return null;
   }
   try {
-    // 延迟 require：只有真要装的时候才加载这个脚本
+    // Lazy require: this script is only loaded when something really has to be installed
     const { installHooks } = require('../../scripts/install-hooks');
     const result = installHooks({});
     if (result.installed.length) {
@@ -71,7 +76,7 @@ function autoInstallHooks() {
 }
 
 /**
- * 判断 Origin 是否为回环地址（端口不限）。
+ * Whether Origin is a loopback address (any port).
  * @param {string} origin
  */
 function isLoopbackOrigin(origin) {
@@ -100,17 +105,20 @@ function isLoopbackOrigin(origin) {
  * }} [opts]
  */
 function createServer(opts = {}) {
-  // 日志级别：入参优先（--log=debug / Electron 启动时传），其次环境变量（见 log.js）
+  // Log level: parameters win (--log=debug / passed when Electron starts), then environment
+  // variables (see log.js)
   if (opts.log) log.setLevel(opts.log);
   const dbPath = opts.dbPath || process.env.WORKGREMLIN_DB || config.defaultDbPath();
-  // 传字符串（含空串）即采用：空串 = 显式关闭校验（--no-token，仅调试）；未传才生成随机 token。
-  // 注意不能用 `opts.token || newToken()` —— 空串是 falsy，会让 --no-token 静默失效。
+  // A string (empty included) means "use it": empty string = validation explicitly disabled
+  // (--no-token, debugging only); absent means generate a random token.
+  // Note it must not be `opts.token || newToken()` —— an empty string is falsy, which would silently
+  // break --no-token.
   const token = typeof opts.token === 'string' ? opts.token : config.newToken();
   const host = opts.host || '127.0.0.1';
 
   const { db, repo, checkpoint, startCheckpointLoop, close: closeDb } = openDatabase(dbPath);
 
-  /** 当前工程：目录来自 WORKGREMLIN_WORKSPACE / 入参，否则 cwd；名字取 package.json name，回落目录名 */
+  /** Current project: directory from WORKGREMLIN_WORKSPACE / the parameter, else cwd; name from package.json name, falling back to the directory name */
   const workspacePath = resolveWorkspacePath(opts.workspacePath);
   const projectName = resolveProjectName(workspacePath);
 
@@ -129,9 +137,11 @@ function createServer(opts = {}) {
 
   hub = createHub({ server: httpServer, token, bus, repo });
 
-  /* 会话表要能往台账补一刀（服务端自己发现的"这一轮被用户掐了" → task/end(cancelled)，
-     见 sessionRegistry 的 flushSynthesizedCancels）。bus 实例是本函数造的，模块里拿不到，
-     所以在这儿注入；不注入那一步就什么都不做（老行为）。 */
+  /* The session table needs to be able to add one more entry to the ledger (the server discovering
+     on its own that "this round was cut short by the user" → task/end(cancelled), see
+     flushSynthesizedCancels in sessionRegistry). The bus instance is created inside this function
+     and unreachable from the module, so inject it here; skip the injection and that step does
+     nothing (old behavior). */
   setRegistryBackend({ bus, repo });
 
   app.use((req, res, next) => {
@@ -139,11 +149,11 @@ function createServer(opts = {}) {
     next();
   });
 
-  // 本地源 CORS：
-  //   - dev：Vite dev server（http://127.0.0.1:5173）页面直连本地服务
-  //   - prod：file:// 加载的渲染进程，Origin 为 "null"
-  // 两者都要跨域，而本服务只监听 127.0.0.1 且所有写接口都要 Bearer token，
-  // 因此仅对回环地址 / null 源放开，不引入安全风险。
+  // Local-source CORS:
+  //   - dev: the Vite dev server (http://127.0.0.1:5173) page talks straight to the local server
+  //   - prod: the renderer loaded via file://, whose Origin is "null"
+  // Both need cross-origin, and since this server listens on 127.0.0.1 only and every write endpoint
+  // requires a Bearer token, opening it up to loopback / null origins introduces no security risk.
   app.use((req, res, next) => {
     const origin = req.get('origin');
     if (origin && (isLoopbackOrigin(origin) || origin === 'null')) {
@@ -159,11 +169,11 @@ function createServer(opts = {}) {
 
   app.use('/api/v1', createHealthRouter({ version: VERSION, projectName }));
 
-  // 上报与查询需要 token；health 不需要（供 Electron 做存活探测）
+  // Reporting and queries need a token; health does not (Electron uses it as a liveness probe)
   app.use('/api/v1', requireToken(token), createQueryRouter({ bus, repo }));
   app.use('/api/v1', requireToken(token), createIngestRouter({ bus, repo }));
 
-  /** 工程（"打开工程"）：一个 workspace 一个工程，切换即换屋里显示的那批成员 */
+  /** Project ("open project"): one workspace = one project, switching changes which members show in the room */
   const workspace = createWorkspaceManager({
     repo,
     bus,
@@ -173,16 +183,18 @@ function createServer(opts = {}) {
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
   app.use('/api/v1', requireToken(token), createProductsRouter());
-  /** 会话下拉：所有工程里的活跃会话 */
+  /** Session dropdown: active sessions across all projects */
   app.use('/api/v1', requireToken(token), createSessionsRouter({ workspace }));
 
   /**
-   * 议事厅：选几个楼层的 agent 开一场会。
+   * Council room: pick a few floors' agents and hold a meeting.
    *
-   * 这是仓库里第一处由服务端**异步拉起并托管长驻子进程**的地方（别处的 child_process 都是
-   * 启动期同步跑一下就完的）。参与者跑在一次性临时目录里、工具全关、只写议事厅自己的表 ——
-   * 它不碰任何被监控的会话，也不碰工作区，所以在办公室和任务记录里看不到它。
-   * 广播传 project=null：一场会与"当前工程"无关。
+   * This is the first place in the repo where the server **asynchronously spawns and supervises
+   * long-lived child processes** (elsewhere child_process only runs synchronously once at startup).
+   * Participants run inside a throwaway temp directory with all tools disabled and write only to the
+   * council's own tables —— they touch no monitored session and no workspace, so they do not appear
+   * in the office or in task records. Broadcasts carry project=null: a meeting has nothing to do with
+   * "the current project".
    */
   const orchestrator = createCouncilOrchestrator({
     repo,
@@ -198,16 +210,17 @@ function createServer(opts = {}) {
   let info = null;
   let agentRoster = null;
 
-  // 生命周期钩子 + 演示逻辑（从 index.js 拆出，见 server/src/lifecycle.js 与 server/src/demo/）。
+  // Lifecycle hooks + demo logic (split out of index.js, see server/src/lifecycle.js and
+  // server/src/demo/).
   const lifecycle = createLifecycle();
   const demo = createDemo({ bus, repo, getRoster: () => agentRoster });
 
   /**
-   * 启动监听。
+   * Start listening.
    * @param {number} [port]
    */
   async function start(port) {
-    // 启动即接入：探测到装了哪个 CLI 就把它那份 hook 写好（幂等）
+    // Attach right at startup: whichever CLI is detected gets its hook written (idempotent)
     autoInstallHooks();
 
     const existing = config.readServerInfo();
@@ -234,8 +247,9 @@ function createServer(opts = {}) {
 
     timers.push(startCheckpointLoop());
 
-    // 记录自动保留：启动即清一次，之后每 24h 按 retentionDays 清掉更早的任务记录。
-    // 定时器 unref 不阻止进程退出；清理失败不影响主流程。
+    // Record retention: clean once at startup, then every 24h drop task records older than
+    // retentionDays. The timer is unref'd so it never blocks process exit; cleanup failures do not
+    // affect the main flow.
     const runRetentionCleanup = () => {
       try {
         const days = repo.getRetentionDays();
@@ -249,9 +263,11 @@ function createServer(opts = {}) {
     runRetentionCleanup();
     timers.push(setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000));
 
-    // 议事厅对账：上次进程被硬杀（或崩了）时，库里会留下 status='running' 的会 —— 那些会的
-    // 参与进程早就不在了。如实标成 failed 并写明原因，不留在那儿假装还在讨论。
-    // （正常关服那一路由 orchestrator.shutdown() 自己收尾，这里管的是没跑成正常关服的情况。）
+    // Council reconciliation: when the last process was hard-killed (or crashed), meetings remain in
+    // the DB with status='running' —— their participant processes are long gone. Mark them failed and
+    // state the reason honestly, do not leave them pretending to still be discussing.
+    // (A normal shutdown is wrapped up by orchestrator.shutdown() itself; this handles cases that
+    // never got a clean shutdown.)
     try {
       const stale = repo.failStaleCouncils('服务上次没有正常退出，这场会没跑完', clock.now());
       if (stale > 0 && !opts.silent) log.info(`[workgremlin] 议事厅：${stale} 场没跑完的会已如实标为失败`);
@@ -261,7 +277,7 @@ function createServer(opts = {}) {
 
     for (const t of timers) if (t.unref) t.unref();
 
-    // 恢复上次打开的工程（没有就继续用 cwd / --workspace 解析出来的那个）
+    // Restore the last opened project (fall back to the one resolved from cwd / --workspace)
     const restored = workspace.restore();
     if (info) {
       info.projectName = restored.projectName;
@@ -269,14 +285,17 @@ function createServer(opts = {}) {
       config.writeServerInfo(info);
     }
 
-    // 常驻小怪物名册：把已定义的 subagent（项目级 + 用户级）注册成坐工位、带工牌的小怪物。
-    // 演示工程没有目录（workspacePath === ''），名册于是只列**用户级** agent。
+    // Resident gremlin roster: register defined subagents (project-level + user-level) as gremlins
+    // that sit at workstations wearing badges. The demo project has no directory
+    // (workspacePath === ''), so the roster lists only **user-level** agents then.
     agentRoster = createAgentRoster({
       bus,
-      // 小怪物跟随"当前打开的工程"的 project（不再固定写死演示 project），换工程才跟得过去
+      // Gremlins follow the project of "the currently open project" (no longer hardcoded to the demo
+      // project), so switching projects carries them along
       getProject: () => workspace.current().project || config.DEMO_PROJECT,
-      // 只认**当前工程**的路径，不回退到"服务启动时解析出来的工程"：
-      // 切到演示工程后屋里演的是演示团队，那几个"本工程的 agent"不该跟着飘进来。
+      // Only honor the **current project's** path, never fall back to "the project resolved at server
+      // start": once you switch to the demo project the room plays the demo team, and those "agents
+      // of this project" must not drift in with it.
       getWorkspacePath: () => workspace.current().workspacePath,
     });
     // Hand the roster to the bus: a summoned "defined subagent" shows busy in the office
@@ -301,7 +320,8 @@ function createServer(opts = {}) {
     });
     timers.push(poller.start());
 
-    // 生命周期钩子：切换工程后（恢复 / 手动切 / 演示切换都走这）按注册顺序触发。
+    // Lifecycle hook: fires in registration order after every project switch (restore / manual
+    // switch / demo switch all come through here).
     lifecycle.onWorkspaceSwitch(() => {
       poller.syncAgentsNow();
     });
@@ -310,8 +330,9 @@ function createServer(opts = {}) {
 
     // Close hooks: stop non-timer resources in registration order (demo driver / hub).
     lifecycle.onClose(() => demo.stop());
-    // 议事厅：先杀掉在飞的参与者进程（SIGTERM → SIGKILL），再给每场在飞的会落个结局。
-    // 放在 hub.close() 前面 —— 收尾那一下还要往客户端广播最后一条状态。
+    // Council room: first kill the in-flight participant processes (SIGTERM → SIGKILL), then record
+    // an ending for each meeting still in flight. It sits before hub.close() —— the wrap-up still has
+    // to broadcast one last state to clients.
     lifecycle.onClose(() => {
       try {
         orchestrator.shutdown();

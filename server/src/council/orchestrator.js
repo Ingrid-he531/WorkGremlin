@@ -1,39 +1,51 @@
 'use strict';
 
 /**
- * 议事厅的状态机 —— 把"开一场会"从一次 HTTP 请求变成一串没人盯着也要跑完的动作。
+ * The council room's state machine —— turns "hold a meeting" from one HTTP request into a sequence of
+ * actions that has to run to completion with nobody watching.
  *
- *   draft ──start()──▶ running ──┬─ 第 0 轮 议题陈述（服务端把题目摆上桌，不调模型）
- *                                ├─ 第 1..N 轮：并发问所有人 → 收齐（或超时）
- *                                │    · 表决模式：机械计票。达成 → consensus（用**那一轮桌上
- *                                │      那份提案原文**当结论）；没达成 → 拿反对者的修订案当
- *                                │      下一轮的提案，继续；到上限 → no_consensus（合法结果）
- *                                │    · 分析模式：不判票、不换提案，跑满 N 轮 → reported
- *                                └─ 收尾（落 verdict、清临时目录、广播）
+ *   draft ──start()──▶ running ──┬─ round 0: topic presentation (the server puts the question on the
+ *                                │  table, no model call)
+ *                                ├─ rounds 1..N: ask everyone concurrently → collect (or time out)
+ *                                │    · vote mode: mechanical vote counting. Reached → consensus (with
+ *                                │      **the verbatim proposal text that was on the table that round**
+ *                                │      as the conclusion); not reached → take an objector's revision
+ *                                │      as next round's proposal, continue; hitting the cap →
+ *                                │      no_consensus (a legitimate outcome)
+ *                                │    · analysis mode: no vote judging, no proposal swapping, run all
+ *                                │      N rounds → reported
+ *                                └─ wrap-up (persist verdict, clean the temp directory, broadcast)
  *
- * 两个正交的开关（都读 councils 行，起跑时定死，中途不变）：
- *   · mode            —— 'vote' 表决 / 'analysis' 分析
- *   · workspace_path  —— 有值 = 工程模式（cwd = 用户的真实工程 + 只读工具）；
- *                        NULL = 隔离模式（cwd = 现建的一次性临时目录 + 工具全关）
+ * Two orthogonal switches (both read from the councils row, fixed at kick-off, never changed midway):
+ *   · mode            —— 'vote' / 'analysis'
+ *   · workspace_path  —— a value = project mode (cwd = the user's real project + read-only tools);
+ *                        NULL = isolated mode (cwd = a freshly created throwaway temp directory + all
+ *                        tools disabled)
  *
- * 三条贯穿始终的规矩：
- *   1. **绝不编造**。某个人超时 / 崩了 / 输出解析不出 → 如实记 status + 错误原文，
- *      立场留 NULL。缺席的那一票**不参与**共识判定（见 consensus.js：有未表态就不算数）。
- *      谈不拢就是谈不拢 —— 不为了给个交代而合成一个"结论"。
- *   2. **隔离**。隔离模式跑在一次性临时目录里、工具全关；工程模式的 cwd 是**用户的**目录、
- *      只给只读工具，并靠 WORKGREMLIN_DISABLE 关掉上报（见 agents.js）。两种模式下
- *      它们的数据都只进议事厅自己的表，不碰 members / tasks。
- *      **工程模式的目录不是我们的，收尾时绝不删** —— 见 closeCouncil 里那两道锁。
- *   3. **进程必须收得干净**。在飞的子进程登记在 active 里 ——「取消」和「关服」都要
- *      把它们连同各自的子进程一起杀掉，不能留孤儿。
+ * Three rules running all the way through:
+ *   1. **Never fabricate**. Somebody timing out / crashing / producing unparseable output → record the
+ *      status and the raw error honestly, leave the position NULL. The absent vote **does not
+ *      participate** in consensus judging (see consensus.js: any non-position voids the round).
+ *      Failure to agree is failure to agree —— do not synthesize a "conclusion" just to have something
+ *      to show.
+ *   2. **Isolation**. Isolated mode runs in a throwaway temp directory with all tools disabled; in
+ *      project mode cwd is **the user's** directory with read-only tools only, and reporting is turned
+ *      off via WORKGREMLIN_DISABLE (see agents.js). In both modes their data goes only into the
+ *      council room's own tables and never touches members / tasks.
+ *      **The project-mode directory is not ours; never delete it during wrap-up** —— see the two locks
+ *      in closeCouncil.
+ *   3. **Processes must be reaped cleanly**. In-flight child processes are registered in active —— both
+ *      "cancel" and "shutdown" kill them together with their own children, leaving no orphans.
  *
- *      这条只在**走关服流程**时有效（`lifecycle.onClose` → `shutdown()`）。进程被 `kill -9`
- *      或 `process.exit()` 直接带走时，没有任何代码有机会去杀它们，在飞的那几个 CLI 会
- *      活到把这一轮答完（它们是一次性调用，答完自己退出）。代价有界，但确实存在 ——
- *      **不要**在服务端用 process.exit 收场，那会跳过 shutdown。
+ *      This only holds **when going through the shutdown flow** (`lifecycle.onClose` → `shutdown()`).
+ *      When the process is taken away by `kill -9` or `process.exit()` directly, no code gets a chance
+ *      to kill them and those few in-flight CLIs live until they finish answering the current round
+ *      (they are one-shot invocations and exit by themselves afterwards). The cost is bounded but
+ *      real —— **do not** wrap things up with process.exit on the server, that skips shutdown.
  *
- * 依赖全部可注入（runTurn / detect / mkdtemp / now），所以状态机能用**假参与者**整条跑通，
- * 不必真的调模型（见 server/test/councilOrchestrator.test.js）。
+ * Every dependency is injectable (runTurn / detect / mkdtemp / now), so the state machine can be run
+ * end-to-end with **fake participants** without really calling models (see
+ * server/test/councilOrchestrator.test.js).
  */
 
 const fs = require('node:fs');
@@ -48,10 +60,10 @@ const { buildSpeechPrompt, buildBriefText } = require('./prompt');
 const { decideRound } = require('./consensus');
 const { cliPathOf } = require('./floors');
 
-/** 临时目录前缀：进程列表里一眼认得出是议事厅留下的 */
+/** Temp directory prefix: recognizable at a glance in the process list as left by the council room */
 const TMP_PREFIX = 'wg-council-';
 
-/** DB 的 snake_case → 提示词 / 判定用的 camelCase。只转议事厅自己那几张表的字段 */
+/** DB snake_case → camelCase used by prompts / decisions. Only converts fields of the council room's own tables */
 function materialOf(row) {
   return {
     path: row.path,
@@ -64,19 +76,20 @@ function materialOf(row) {
 
 /**
  * @param {{repo:object, broadcast?:Function, deps?:object}} arg
- *   broadcast(project, type, payload) —— 议事厅与工程无关，project 传 null。
- *   deps 可注入：runTurn / detect / mkdtemp / now / timeoutMs，测试用。
+ *   broadcast(project, type, payload) —— the council room has nothing to do with projects, pass null.
+ *   deps is injectable: runTurn / detect / mkdtemp / now / timeoutMs, for tests.
  */
 function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   const runTurn = deps.runTurn || runOnce;
   const now = deps.now || (() => Date.now());
-  /** 收**前缀**、返回目录路径（跟 fs.mkdtempSync 同一个语义，测试好替换） */
+  /** Takes a **prefix**, returns a directory path (same semantics as fs.mkdtempSync, easy to swap in tests) */
   const mkdtemp = deps.mkdtemp || ((prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const timeoutMs = deps.timeoutMs || DEFAULTS.COUNCIL_TURN_TIMEOUT_MS;
-  /** 工程模式的单轮超时：参与者要自己翻代码，比"动嘴"那种宽得多（见 shared/index.js） */
+  /** Per-round timeout in project mode: participants dig through code themselves, much wider than the
+   *  "just talking" kind (see shared/index.js) */
   const workspaceTimeoutMs = deps.workspaceTimeoutMs || DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS;
   const removeDir = deps.removeDir || ((dir) => fs.rmSync(dir, { recursive: true, force: true }));
-  /** 目录还在不在（工程模式起跑前要再确认一次，可注入） */
+  /** Whether the directory still exists (confirmed once more before kick-off in project mode, injectable) */
   const isDir = deps.isDir || ((p) => {
     try {
       return fs.statSync(p).isDirectory();
@@ -84,10 +97,10 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       return false;
     }
   });
-  /** 楼层 → 可执行文件路径。缺省走 products 探测；测试注入假的 */
+  /** Floor → executable path. Defaults to products detection; tests inject fakes */
   const cliPath = deps.cliPathOf || ((floorId) => cliPathOf(floorId));
 
-  /** 在飞的会：councilId → { cancelled:boolean, children:Set, tmpDir:string } */
+  /** In-flight meetings: councilId → { cancelled:boolean, children:Set, tmpDir:string } */
   const active = new Map();
 
   const emit = (type, payload) => {
@@ -95,18 +108,18 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     try {
       broadcast(null, type, payload);
     } catch {
-      /* 广播失败不该影响这场会 —— 前端还会轮询补拉 */
+      /* a failed broadcast must not affect the meeting —— the frontend polls to catch up anyway */
     }
   };
 
-  /** 某个楼层的显示名（提示词里要用，让它知道对面是谁） */
+  /** Display name of a floor (the prompt needs it, so it knows whom it is facing) */
   function floorName(floorId) {
     const r = RECIPES[floorId];
     return (r && r.name) || floorId;
   }
 
   /**
-   * 跑一个人的一轮。
+   * Run one participant's round.
    *
    * @param {{ctx:object, floor:object, prompt:string, allow:'none'|'read',
    *          mode:'vote'|'analysis', timeoutMs:number}} arg
@@ -120,10 +133,11 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     const recipe = RECIPES[floor.floor_id];
     const bin = floor.cli_path || cliPath(floor.floor_id);
 
-    // 收尾之后再冒出来的调用一律不起进程。**今天到不了这里**：起进程与登记句柄在同一个
-    // 同步段内完成（本函数一路同步跑到 `await runTurn`，而 runOnce 里 spawn 是同步的），
-    // 关服插不进这个缝。留着是把它写成一条**不变量**（"收尾中不起新进程"），
-    // 免得以后 runTurn 前面多出一个 await 时，这里悄悄漏掉一个没人杀的 CLI。
+    // Spawn nothing for calls that surface after wrap-up. **Nothing can get here today**: spawning and
+    // registering the handle happen inside the same synchronous stretch (this function runs
+    // synchronously all the way to `await runTurn`, and spawn inside runOnce is synchronous), so a
+    // shutdown cannot slip in. It stays as an **invariant** ("never spawn during wrap-up") so that if
+    // an await is ever added ahead of runTurn, this cannot quietly leak a CLI nobody kills.
     if (ctx.cancelled || ctx.closed) {
       return {
         floorId: floor.floor_id,
@@ -135,7 +149,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       };
     }
 
-    // 没装（或当时没探到）——不猜、不跳过、如实记
+    // Not installed (or not detected at the time) —— no guessing, no skipping, record it honestly
     if (!recipe || !bin) {
       return {
         floorId: floor.floor_id,
@@ -154,7 +168,8 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       timeoutMs: perTurnMs,
       agent: recipe.agent,
       onChild: (child) => {
-        // 迟到的句柄直接杀掉，不挂进一个已经不会再被遍历的登记表（理由同上，今天到不了）
+        // Kill a late handle outright instead of hanging it on a registry nobody will walk again
+        // (same reason as above, unreachable today)
         if (ctx.cancelled || ctx.closed) {
           killTree(child);
           return;
@@ -173,11 +188,13 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       error: r.error || null,
       status: r.status === 'ok' ? 'ok' : r.status,
     };
-    if (r.status !== 'ok') return base; // 失败 / 超时：正文和尾块都留空
+    if (r.status !== 'ok') return base; // failed / timed out: both the body and the tail block stay empty
 
-    // 跑通了但**没给出可解析的尾块** —— 这跟"没跑成"要分开：它是说了话的，
-    // 只是没按约定表态。正文照存，立场留空，status 记 'unparsed'。
-    // 两种模式各解析各的（表决认 vote，分析认 stance），**认不出就不认**，绝不按语气猜。
+    // Ran fine but **no parseable tail block** —— kept apart from "did not run": it did speak, it just
+    // did not take a position as agreed. The body is stored as-is, the position stays empty, and the
+    // status records 'unparsed'.
+    // Each mode parses its own (vote recognizes vote, analysis recognizes stance), and **unrecognized
+    // means unrecognized** —— never guess from tone.
     if (mode === 'analysis') {
       const a = parseAnalysisBlock(r.text);
       return {
@@ -201,9 +218,10 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   }
 
   /**
-   * askOne 外面包一层：某一个参与者把自己搞崩了，不该把**整场会**带下去。
-   * 记成"它这一轮未表态"（invalid 那一票），其余人照常计票 —— 缺席会导致本轮不成立，
-   * 这正是我们想要的：少一票就是少一票，不拿三个人的意见冒充四个人的共识。
+   * A wrapper around askOne: one participant blowing itself up must not take the **whole meeting**
+   * down with it. Record it as "no position expressed this round" (that invalid vote) and let everyone
+   * else be counted normally —— an absence voids the round, which is exactly what we want: one vote
+   * short is one vote short, do not pass three people's opinions off as a four-person consensus.
    */
   async function askOneSafe(arg) {
     try {
@@ -221,15 +239,16 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     }
   }
 
-  /** 把一轮的结果落库 + 广播 */
+  /** Persist one round's results + broadcast */
   function recordUtterance(councilId, roundNo, u) {
     repo.insertUtterance({
       councilId, roundNo, floorId: u.floorId, role: 'speaker',
       content: u.content, vote: u.vote, voteReason: u.voteReason,
       proposalText: u.proposal, secondFloor: u.second,
       stance: u.stance,
-      // 结构化要点落库时**序列化**成文本：DB 那一列是 TEXT，查询/复现要看的是当时的原文，
-      // 不给它建表（这三条是展示用的，不参与任何判定）。null 照旧是 null，不写成 '{}'。
+      // Structured points are **serialized** to text when persisted: that DB column is TEXT, and
+      // querying / reproducing needs the verbatim original, so no table is built for them (these three
+      // are display-only and take part in no decision). null stays null rather than becoming '{}'.
       findingsJson: u.findings ? JSON.stringify(u.findings) : null,
       status: u.status, error: u.error,
       inputTokens: u.tokens ? u.tokens.input : null,
@@ -243,8 +262,9 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       utterance: {
         roundNo, floorId: u.floorId, content: u.content, vote: u.vote,
         voteReason: u.voteReason, proposal: u.proposal, second: u.second,
-        // 分析模式那两个字段走 WS 时是**已解析的对象**（HTTP 那条路给的是 TEXT）——
-        // 前端归一函数两种都要吃，见 renderer/src/lib/councilTimeline.js 的 normFindings
+        // Those two analysis-mode fields travel over WS as an **already parsed object** (the HTTP path
+        // hands back TEXT) —— the frontend's normalizer has to accept both, see normFindings in
+        // renderer/src/lib/councilTimeline.js
         stance: u.stance, findings: u.findings,
         status: u.status, error: u.error, durationMs: u.durationMs,
       },
@@ -252,29 +272,33 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   }
 
   /**
-   * 收尾：落 verdict、清临时目录、广播、从在飞表里摘掉。
+   * Wrap-up: persist verdict, clean the temp directory, broadcast, drop it from the in-flight table.
    *
-   * 注意**不修补半途中断的那一轮**：被取消时最后那个 round 行的 ended_at 就是 NULL，
-   * 照原样留着 —— 那一轮确实没跑完，补一个结束时间反而是编。它停在第几轮由
-   * councils.round_current 记着，界面照实说"讨论到第 N 轮时被取消"。
+   * Note that it does **not patch up** a round interrupted halfway: when cancelled, the last round
+   * row's ended_at stays NULL and is left that way —— that round genuinely did not finish, and adding
+   * an end time would be fabrication. Which round it stopped on is recorded by
+   * councils.round_current, and the UI states plainly "cancelled while discussing round N".
    */
   function closeCouncil(ctx, { verdict, verdictRound = null, error = null }) {
-    // 幂等：关服路径上 shutdown() 已经收过一次尾了，这里不能再写一遍把它的结论盖掉
+    // Idempotent: on the shutdown path shutdown() already wrapped it up; writing again here would
+    // overwrite its conclusion
     if (ctx.closed) return repo.getCouncil(ctx.councilId);
     ctx.closed = true;
-    // 还在飞的进程先收掉（正常收尾时一般已经空了，取消 / 异常路径上才有）
+    // Reap anything still in flight (normally empty on the clean-wrap-up path; only the cancel /
+    // exception paths have any)
     for (const child of ctx.children) killTree(child);
     ctx.children.clear();
     const c = repo.finishCouncil(ctx.councilId, { verdict, verdictRound, error, endedAt: now() });
-    // **只删我们自己建的那个临时目录。**
-    // 工程模式下 cwd 是用户的真实工程（ctx.tmpDir 为 null、ownsTmpDir 为 false）——
-    // 这两道锁缺一条，这里就变成 `rm -rf 用户的工程`。`ownsTmpDir` 看起来冗余
-    // （tmpDir 非空本来就等于"我们建的"），它是给以后的人看的：改这块代码时先读懂这条。
+    // **Only delete the temp directory we created ourselves.**
+    // In project mode cwd is the user's real project (ctx.tmpDir is null, ownsTmpDir is false) ——
+    // missing either lock turns this into `rm -rf the user's project`. `ownsTmpDir` looks redundant
+    // (a non-empty tmpDir already means "we created it"); it is there for whoever comes next: read this
+    // note before changing this code.
     if (ctx.ownsTmpDir && ctx.tmpDir) {
       try {
         removeDir(ctx.tmpDir);
       } catch {
-        /* 删不掉就留着，不要因为清理失败把整场会判成失败 */
+        /* leave it if it cannot be removed; never call the whole meeting failed over a cleanup failure */
       }
     }
     active.delete(ctx.councilId);
@@ -289,23 +313,26 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   }
 
   /**
-   * 开一场会。整场跑完才 resolve —— 路由**不 await** 它（发起接口要立即返回），
-   * 所以这里**不抛异常**：路由是 fire-and-forget 调的，抛出去就成了一枚没人接的
-   * unhandled rejection（Node 默认会把整个服务带下去）。找不到会 / 状态不对都安静返回。
-   * @returns {Promise<object|null>} 收尾后的 councils 行
+   * Start a meeting. It only resolves once the whole meeting has run —— the route does **not await**
+   * it (the start endpoint must return immediately), so this **throws nothing**: the route calls it
+   * fire-and-forget, and a throw would become an unhandled rejection nobody catches (Node's default
+   * behavior takes the whole service down). Missing meetings / wrong states return quietly.
+   * @returns {Promise<object|null>} the councils row after wrap-up
    */
   async function start(councilId) {
     const council = repo.getCouncil(councilId);
     if (!council) return null;
     if (!repo.markCouncilRunning(councilId, now())) {
-      // 不在 draft（已经在跑 / 已经结束）—— 什么都不做，别把一场跑着的会拉回起点
+      // Not in draft (already running / already finished) —— do nothing, do not drag a running meeting
+      // back to the starting line
       return repo.getCouncil(councilId);
     }
 
-    // 在哪儿谈（与怎么谈正交，见 schema.sql 里 councils 的注释）：
-    //   · 工程模式 —— 用**用户的**目录。注意 ctx.tmpDir 保持 null：收尾时那个"删目录"
-    //     的分支因此不会碰到它（见 closeCouncil 里那两道锁）。
-    //   · 隔离模式 —— 现建一个一次性临时目录，收尾即删。与改动前逐字相同。
+    // Where to talk (orthogonal to how, see the notes on councils in schema.sql):
+    //   · project mode —— use **the user's** directory. Note ctx.tmpDir stays null: that is why the
+    //     "delete directory" branch during wrap-up never touches it (see the two locks in closeCouncil).
+    //   · isolated mode —— create a throwaway temp directory now, delete it at wrap-up. Verbatim as
+    //     before the change.
     const workspace = council.workspace_path ? String(council.workspace_path) : '';
     const mode = council.mode === 'analysis' ? 'analysis' : 'vote';
     const allow = workspace ? 'read' : 'none';
@@ -314,16 +341,18 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     let tmpDir = null;
     let workDir = workspace;
     if (workspace) {
-      // 发起时校验过一次，但用户可能在这两步之间把它删了 —— 起跑前再确认一次。
-      // 不确认的话，四个参与者会各自失败一次，最后报一个"谁都没表态"的会，看不出真因。
+      // It was validated once at creation, but the user may have deleted it between those two steps ——
+      // confirm once more before kick-off. Without confirming, the four participants each fail once and
+      // the meeting ends up reported as "nobody expressed a position", hiding the real cause.
       if (!isDir(workspace)) {
         return repo.finishCouncil(councilId, {
           verdict: 'failed', error: `工作目录不存在或不是目录：${workspace}`, endedAt: now(),
         });
       }
     } else {
-      // 临时目录建不出来就到此为止 —— 已经标成 running 了，必须给它一个结局，
-      // 否则库里会留一场谁也取消不掉的僵尸会（只有下次启动的对账才会收拾）
+      // Stop right here if the temp directory cannot be created —— it is already marked running, so it
+      // must be given an ending, otherwise a zombie meeting nobody can cancel stays in the DB (only
+      // next startup's reconciliation would clean it up)
       try {
         tmpDir = mkdtemp(TMP_PREFIX);
       } catch (err) {
@@ -343,8 +372,9 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
     try {
       const participants = repo.listParticipants(councilId);
-      // 一个人都没有的会不是"没谈成"，是根本没开起来 —— 别让它走完 N 轮再报 no_consensus，
-      // 那看起来像讨论过。路由那边还会再校验一次（至少两层），这里是兜底。
+      // A meeting with nobody in it is not "failed to agree", it never started —— do not let it run
+      // N rounds and report no_consensus, that looks like it discussed something. The route validates
+      // once more (at least two floors); this is the fallback.
       if (!participants.length) {
         return closeCouncil(ctx, { verdict: 'failed', error: '这场会没有出席者' });
       }
@@ -359,8 +389,9 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         )
       );
 
-      // ---- 第 0 轮：议题陈述。不调模型：把议题 + 材料摆上桌，落成一条 chair 发言，
-      //      好让时间线从"题目是什么"开始，而不是凭空从第 1 轮开始。
+      // ---- Round 0: topic presentation. No model call: put the topic + materials on the table and
+      //      record it as a chair speech, so the timeline starts from "what the question is" rather
+      //      than popping into existence at round 1.
       const briefText = buildBriefText(council.topic, materials);
       repo.upsertRound({
         councilId, roundNo: 0, kind: 'brief', proposalText: council.topic,
@@ -376,7 +407,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         utterance: { roundNo: 0, floorId: 'chair', role: 'chair', content: briefText, status: 'ok' },
       });
 
-      // ---- 第 1..N 轮
+      // ---- Rounds 1..N
       const analysis = mode === 'analysis';
       let proposal = council.topic;
       let proposalFrom = 'chair';
@@ -388,7 +419,8 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         if (ctx.cancelled) break;
 
         repo.setCouncilRound(councilId, roundNo);
-        // 分析模式没有"桌上那份提案"——proposal_* 留空，别把议题冒充成一份被人表决过的提案
+        // Analysis mode has no "proposal on the table" —— leave proposal_* empty rather than passing the
+        // topic off as a proposal somebody voted on
         repo.upsertRound({
           councilId, roundNo, kind: 'debate',
           proposalText: analysis ? null : proposal,
@@ -401,7 +433,8 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           proposalFrom: analysis ? null : proposalFrom,
         });
 
-        // 并发问所有人 —— 一轮里几个人是各自独立的，串行只会白白多等几倍时间
+        // Ask everyone concurrently —— participants in a round are independent of each other; going
+        // serial only multiplies the waiting for nothing
         const prompts = participants.map((floor) => ({
           floor,
           prompt: buildSpeechPrompt({
@@ -422,21 +455,23 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
         for (const a of answers) {
           recordUtterance(councilId, roundNo, a);
-          // 出席者的总状态 = 它**最近一轮**的结果（每一轮的细节在 utterances 里，不在这儿糊）
+          // A participant's overall state = its **latest round's** result (per-round detail lives in
+          // utterances, do not smear it in here)
           repo.setParticipantStatus(councilId, a.floorId, a.status === 'ok' ? 'ok' : 'failed', a.error);
         }
 
-        // 进历史的发言要带轮次和楼层名 —— renderHistory 按轮次分组、按名字称呼，
-        // answers 里只有 floorId
+        // Speeches entering the history carry round and floor name —— renderHistory groups by round and
+        // addresses by name, while answers only hold floorId
         history = [
           ...history,
           ...answers.map((a) => ({ ...a, roundNo, floorName: floorName(a.floorId) })),
         ];
 
         if (analysis) {
-          // 分析模式**不判票、不换提案、没有提前结束**：跑满设定轮数。
-          // 三个票型列记 0（这一场确实没人投票，不是"投了 0 票"），只把"这轮没能
-          // 给出立场的人数"记进 invalid —— 那个口径两种模式是同一个意思。
+          // Analysis mode does **no vote judging, no proposal swapping, no early stop**: it runs the
+          // configured number of rounds. The three vote-type columns record 0 (this meeting really had
+          // nobody voting, not "0 votes were cast"), and only "how many failed to give a position this
+          // round" goes into invalid —— that criterion means the same thing in both modes.
           const invalid = answers.filter((a) => a.status !== 'ok').length;
           repo.upsertRound({
             councilId, roundNo, kind: 'debate', proposalText: null, proposalFrom: null,
@@ -461,8 +496,9 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           verdictRound = decision.consensus ? roundNo : null;
           break;
         }
-        // 下一轮：拿反对者的修订案换掉桌上的提案；没人提修订案就继续用这份
-        // （不是"服务端挑一份更好的" —— 那等于替参与者写提案，见 consensus.js 的说明）
+        // Next round: swap the proposal on the table for an objector's revision; with no revision
+        // submitted, keep this one (this is not "the server picking a better one" —— that would mean
+        // writing proposals for the participants, see the notes in consensus.js)
         if (decision.nextProposal) {
           proposal = decision.nextProposal.text;
           proposalFrom = decision.nextProposal.floorId;
@@ -471,21 +507,22 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
       if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
 
-      // 分析模式跑满轮数就是正常收场：**没有"谈成没谈成"这回事**，所以 verdict 是
-      // 'reported'（已呈报），不是一个判定 —— 界面照这份记录出简报，不合成结论。
-      // 表决模式兜底：循环跑满都没 break（理论上不会，最后一轮 decision.done 必为 true）
+      // Running all rounds in analysis mode is a normal ending: there is **no "reached agreement or
+      // not"**, so the verdict is 'reported' (reported), not a judgment —— the UI draws a briefing from
+      // this record and synthesizes no conclusion. Fallback for vote mode: the loop ran out without
+      // breaking (theoretically impossible, the last round's decision.done is always true)
       if (!verdict) verdict = analysis ? 'reported' : 'no_consensus';
       return closeCouncil(ctx, { verdict, verdictRound });
     } catch (err) {
-      // 整场级别的意外（落库失败之类）—— 如实记 failed，把错误原文留住
+      // A meeting-level surprise (a failed persist, etc.) —— record failed honestly and keep the raw error
       return closeCouncil(ctx, { verdict: 'failed', error: `议事中断：${err && err.message}` });
     }
   }
 
   /**
-   * 取消一场在跑的会：杀掉所有在飞的参与者进程并收尾。
-   * 进程是在 await 里跑的，靠 ctx.cancelled 标记让主循环在下一个检查点退出。
-   * @returns {boolean} 是否真的取消了一场在跑的会
+   * Cancel a running meeting: kill every in-flight participant process and wrap up.
+   * Processes run inside awaits; the ctx.cancelled flag makes the main loop exit at its next checkpoint.
+   * @returns {boolean} whether a running meeting was really cancelled
    */
   function cancel(councilId) {
     const ctx = active.get(councilId);
@@ -497,13 +534,16 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   }
 
   /**
-   * 服务关闭：杀掉所有在飞的参与者，给每场在飞的会落一个明确的结局。
+   * Server shutdown: kill every in-flight participant and give each in-flight meeting a definite ending.
    *
-   * 顺序有讲究 —— **先自己收尾，再扫剩下的**：
-   *   · 自己经手的这些会，结论是「被关服打断」= cancelled（带着原因），比一句笼统的 failed 准；
-   *   · 扫尾那一步（failStaleCouncils）留给**别的进程上次崩溃时**留下的 running 行 ——
-   *     它们对应的进程早就不在了，只能如实标 failed。这也是启动对账用的同一个方法。
-   * 反过来先扫再收尾的话，会被随后醒来的 start() 协程把结论改写一遍，谁最后写谁赢。
+   * The order matters —— **wrap up our own first, then sweep the rest**:
+   *   · Meetings we handled ourselves get "interrupted by shutdown" = cancelled (with a reason), which
+   *     is more accurate than a blanket failed;
+   *   · The sweep step (failStaleCouncils) is left for `running` rows left behind by **another process's
+   *     previous crash** —— their processes are long gone, so they can only honestly be marked failed.
+   *     This is the same method startup reconciliation uses.
+   * Reversing it (sweeping first, wrapping up after) lets the start() coroutine that wakes up later
+   * rewrite the conclusion —— last writer wins.
    */
   function shutdown() {
     for (const ctx of [...active.values()]) {
@@ -518,7 +558,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     }
   }
 
-  /** 在飞的会（测试与排障用） */
+  /** In-flight meetings (for tests and troubleshooting) */
   const activeIds = () => [...active.keys()];
 
   return { start, cancel, shutdown, activeIds };

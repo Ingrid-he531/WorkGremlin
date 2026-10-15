@@ -6,10 +6,12 @@ const { createDemoTickerManager } = require('./ticker');
 const config = require('../config');
 
 /**
- * 演示逻辑聚合：把播种 / 残留清理 / 推进器起停收拢到 demo/ 目录，
- * 让 server/index.js 只负责接线。对外暴露两个生命周期参与点：
- *   - onSwitch(cur, agentRoster)：切工程钩子里调用（清真实工程残留 + 按演示与否起停推进器）
- *   - stop()：关闭钩子里调用（停推进器）
+ * Demo logic aggregation: seeding / leftover cleanup / ticker start-and-stop are all gathered
+ * under demo/, so server/index.js only has to wire things up. Two lifecycle participation
+ * points are exposed:
+ *   - onSwitch(cur, agentRoster): called from the project-switch hook (clear real-project
+ *     leftovers + start/stop the ticker depending on whether it is the demo)
+ *   - stop(): called from the close hook (stop the ticker)
  * @param {{ bus: any, repo: any, getRoster: () => any }} deps
  */
 function createDemo({ bus, repo, getRoster }) {

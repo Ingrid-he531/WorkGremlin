@@ -1,20 +1,20 @@
 'use strict';
 
 /**
- * 9F GitHub Copilot 楼层模块 —— 把「数据源读取」与「台账同步器」合并到这一个文件
- * （原 sessions.js 里的 Copilot 读取函数 + copilotTasks.js 的同步器）。
+ * 9F GitHub Copilot floor module — merges "data-source reading" and "ledger syncer" into this one file
+ * (the Copilot readers from the old sessions.js + the syncer from copilotTasks.js).
  *
- * 9F 没有 hook、也没有 reporter，任务只能靠服务端轮询它自己的落盘：
- *   · session-store.db（GitHub Copilot 的 SQLite 会话库，见 readCopilotTurns / readCopilotFiles）
- *   · VS Code 的 state.vscdb 聊天索引（readCopilotChatIndex，唯一能看见「轮进行中」的旁证）
- *   · VS Code 的 chatSessions/<会话>.jsonl 会话日志（readCopilotLiveRequest，取用户原话/起止/在飞）
+ * 9F has neither a hook nor a reporter, so tasks can only come from the server polling its own on-disk state:
+ *   · session-store.db (GitHub Copilot's SQLite session store — see readCopilotTurns / readCopilotFiles)
+ *   · VS Code's state.vscdb chat index (readCopilotChatIndex, the only side evidence of "a turn is in flight")
+ *   · VS Code's chatSessions/<session>.jsonl session log (readCopilotLiveRequest: user prompt / start-end / in-flight)
  *
- * 本文件只依赖 plugin.js（findPluginStorage / globalStorageRoots / 落盘窗口常量）来读自己的
- * 落盘，不再反向 require sessions.js（消除 sessions ↔ copilot 的循环依赖）。读取函数（readCopilotX）
- * 由 plugin.js 的 readCopilotSessions / sessions.js 的 listSessions 调用。
+ * This file depends only on plugin.js (findPluginStorage / globalStorageRoots / flush-window constants) to read
+ * its own on-disk state; it no longer requires sessions.js back (kills the sessions ↔ copilot cycle). The
+ * readers (readCopilotX) are called by plugin.js's readCopilotSessions / sessions.js's listSessions.
  *
- * 统一接口（见 floors.js 的 FLOOR_CONTRACT）：
- *   id / client   楼层身份
+ * Unified contract (see FLOOR_CONTRACT in floors.js):
+ *   id / client   floor identity
  *   syncTasks     = syncCopilotTasks
  *   readPhase     = readCopilotPhaseFromSqlite
  *   readDone      = readCopilotDone
@@ -24,26 +24,28 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-// 插件落盘读取（findPluginStorage / globalStorageRoots / workspaceStorageRoots / 落盘窗口常量）
-// 收口在 plugin.js；本文件只依赖它，不再反向 require sessions.js（消除 sessions ↔ copilot 的循环依赖）。
+// Plugin on-disk reads (findPluginStorage / globalStorageRoots / workspaceStorageRoots / flush-window constants)
+// live in plugin.js; this file depends only on it and no longer requires sessions.js back (kills the
+// sessions ↔ copilot cycle).
 const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, IDLE_MS, LISTED_MS, DONE_TTL_MS } = require('./plugin');
-// 通用容错文件读取（readJson / readDir）统一从 roots 取，避免各处重复定义
+// Tolerant file reads (readJson / readDir) come from roots so they are not redefined everywhere
 const { readJson, readDir, isFile, isDir } = require('./roots');
 const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 
-// 9F 专属：本楼层 pluginRe（products.js 的 findDataPath 的 copilot 分支也要它），放这里避免循环 require。
+// 9F-only: this floor's pluginRe (products.js's findDataPath copilot branch needs it too); kept here to avoid a cycle.
 const RE_GITHUB_COPILOT = [/^github\.copilot/i, /^github-copilot/i, /^github\.copilot-chat/i, /^copilot/i];
-// 本楼层插件存储根的标记：目录里得有会话库才算（挡掉同前缀的 `github.copilot` 基础扩展目录）
+// Marker for this floor's plugin storage root: the dir must hold a session store to count
+// (filters out the same-prefixed `github.copilot` base extension dir)
 const RE_GITHUB_COPILOT_MARKS = ['session-store.db'];
 
-// 通用文件判断（isFile / isDir）统一从 roots 取，避免各处重复定义
-/* ───────────── 原 sessions.js 的 Copilot 读取函数 ───────────── */
+// Generic file checks (isFile / isDir) come from roots so they are not redefined everywhere
+/* ───────────── Copilot readers from the old sessions.js ───────────── */
 
 /**
- * 读 Copilot `turns` 表：每个会话的 turn 数 + 最后一条 user_message。
- * 表不存在 / 列名变了对上层透明（回空 Map，调用方照常工作）。
+ * Read Copilot's `turns` table: turn count per session + the last user_message.
+ * A missing table / renamed column is transparent to callers (returns an empty Map; callers carry on).
  */
 function readCopilotTurns(db) {
   const out = new Map();
@@ -55,15 +57,16 @@ function readCopilotTurns(db) {
     const respCol = cols.includes('assistant_response') ? 'assistant_response' : cols.includes('response') ? 'response' : '';
     const tsCol = cols.includes('timestamp') ? 'timestamp' : '';
     if (!sidCol) return out;
-    // 每个 session_id 取 turn 数 + 按 timestamp 倒序的第一条 user_message
+    // Per session_id: turn count + the first user_message in reverse timestamp order
     const countRows = db.prepare(`SELECT ${sidCol} as sid, COUNT(*) as cnt FROM turns GROUP BY ${sidCol}`).all();
     for (const r of countRows) {
       const sid = String(r.sid || '').trim();
       if (sid) out.set(sid, { turnCount: r.cnt, lastUserMessage: '', hasPendingTurn: false });
     }
-    // 有空 assistant_response 的 turn = AI 还没写完回复 → 这条会话正在跑
-    // （Copilot 是批次写入：只在用户发消息时写 turn 行，AI 回复完了才更新 assistant_response。
-    //  所以"空回复的 turn"是"正在生成"的硬证据，比看 updated_at 新鲜度准得多。）
+    // A turn with an empty assistant_response = the AI has not finished replying → this session is running
+    // (Copilot writes in batches: the turn row lands when the user sends a message, assistant_response is
+    //  only updated once the AI is done. So "a turn with an empty reply" is hard evidence of "generating",
+    //  far more reliable than the freshness of updated_at.)
     if (respCol) {
       const pendingRows = db.prepare(`SELECT ${sidCol} as sid FROM turns WHERE ${respCol} IS NULL OR TRIM(${respCol}) = ''`).all();
       for (const r of pendingRows) {
@@ -75,8 +78,8 @@ function readCopilotTurns(db) {
         }
       }
     }
-    // 逐轮清单：任务台账按「每一轮一条」记账要用（轮序号 + 用户原话 + 时间 + 有没有回复）。
-    // 列缺失（老版本）就跳过 —— 上层照常工作，只是没有逐轮台账。
+    // Per-turn listing: the ledger books "one row per turn" (turn index + user text + time + whether it has a reply).
+    // Missing columns (old versions) → skip; the upper layer still works, just without a per-turn ledger.
     const idxCol = cols.includes('turn_index') ? 'turn_index' : '';
     if (idxCol && msgCol) {
       const tsSel = tsCol ? `, ${tsCol} as ts` : '';
@@ -110,7 +113,7 @@ function readCopilotTurns(db) {
         }
       }
     } else if (msgCol) {
-      // 没 timestamp 列就取最后一条（靠默认 rowid 顺序）
+      // No timestamp column → take the last row (relying on the default rowid order)
       const lastRows = db.prepare(`SELECT ${sidCol} as sid, ${msgCol} as msg FROM turns`).all();
       const seen = new Set();
       for (let i = lastRows.length - 1; i >= 0; i--) {
@@ -125,7 +128,7 @@ function readCopilotTurns(db) {
       }
     }
   } catch {
-    /* Copilot 版本变了 turns 表名/列名 → 回空 */
+    /* Copilot changed the turns table / column names → return empty */
   }
   return out;
 }
@@ -133,8 +136,8 @@ function readCopilotTurns(db) {
 /* ───────────── */
 
 /**
- * 读 Copilot `session_files` 表：每个会话碰过的文件路径 + 工具名。
- * 表不存在 / 列名变了同样回空 Map。
+ * Read Copilot's `session_files` table: file paths each session touched + tool names.
+ * A missing table / renamed column likewise returns an empty Map.
  */
 function readCopilotFiles(db) {
   const out = new Map();
@@ -156,22 +159,24 @@ function readCopilotFiles(db) {
       const sid = String(r.sid || '').trim();
       const fp = String(r.fp || '').trim();
       if (!sid || !fp) continue;
-      // 只要**读**过的文件不算"改动文件"：Copilot 0.65.0 的 session_files 整表都是
-      // read_file（实测），拿它当"这一轮改了什么"会把一堆没动过的文件报上去。
+      // A file that was merely **read** is not a "changed file": in Copilot 0.65.0 the whole session_files
+      // table is read_file (measured), so treating it as "what this turn changed" reports a pile of untouched files.
       const tool = toolCol ? String(r.tn || '').trim() : '';
       if (tool && !COPILOT_WRITE_TOOL_RE.test(tool)) continue;
-      // Copilot 把**它自己的**临时文件也记进 session_files（工具调用的附件、
-      // chat-session-resources/.../content.txt 之类，全在 VS Code 的 workspaceStorage /
-      // globalStorage 下）。那些不是"这一轮改动的文件"，混进任务记录的文件清单只会误导
-      // （实测 9F 的记录里近一半是这种内部文件）。这里按"在编辑器存储目录下"精确剔除，
-      // 工程外的真实文件（比如另一个仓库）照旧保留。
+      // Copilot also records **its own** temp files in session_files (tool-call attachments,
+      // chat-session-resources/.../content.txt and the like, all under VS Code's workspaceStorage /
+      // globalStorage). Those are not "this turn's changed files"; mixing them into a task's file list
+      // only misleads (measured: nearly half of 9F's records were such internal files). Here they are
+      // filtered precisely by "lives under an editor storage dir"; real files outside the project
+      // (e.g. another repo) are kept.
       if (/[\\/]User[\\/](?:workspace|global)Storage[\\/]/i.test(fp)) continue;
       const arr = out.get(sid) || [];
-      // 去重（同一个文件可能被多轮碰）
+      // Dedupe (the same file may be touched by several turns)
       if (!arr.some((f) => f.path === fp)) {
-        // turn：这个文件是哪一轮碰的（台账按轮切分时用它）。
-        // 拿不准就留 null —— Copilot 0.65.0 实测 turn_index 整列是 NULL（那整张表其实是
-        // "这个会话见过的文件"），把它当成 0 会张冠李戴挂到第一轮上，宁可说不知道。
+        // turn: which turn touched this file (used when the ledger splits by turn).
+        // Leave null when unknown — in Copilot 0.65.0 the whole turn_index column is NULL (that table is
+        // really "files this session has seen"); treating it as 0 would wrongly pin it to the first turn,
+        // so better to say "unknown".
         arr.push({
           path: fp,
           tool: toolCol ? String(r.tn || '').trim() : '',
@@ -181,7 +186,7 @@ function readCopilotFiles(db) {
       }
     }
   } catch {
-    /* Copilot 版本变了 session_files 表名/列名 → 回空 */
+    /* Copilot changed the session_files table / column names → return empty */
   }
   return out;
 }
@@ -196,7 +201,7 @@ function readCopilotChatIndex() {
   try {
     Database = require('better-sqlite3');
   } catch {
-    /* 没装原生依赖就退回时间窗推断 */
+    /* Native dep missing → fall back to the time-window inference */
   }
   for (const root of workspaceStorageRoots()) {
     for (const name of readDir(root)) {
@@ -208,7 +213,8 @@ function readCopilotChatIndex() {
       } catch {
         continue;
       }
-      // 文件没动过、且上次读还在 TTL 内 → 直接用上次的结果（避免每 1.5s 开一次 SQLite）
+      // File untouched and the last read still within TTL → reuse the previous result
+      // (avoids opening SQLite every 1.5s)
       const prev = copilotIndexCache.get(dbFile);
       const unchanged = prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && now - prev.at < COPILOT_INDEX_TTL;
       let entries = prev ? prev.entries : null;
@@ -220,14 +226,14 @@ function readCopilotChatIndex() {
           const parsed = row && row.value ? JSON.parse(String(row.value)).entries : null;
           entries = parsed ? Object.entries(parsed) : null;
         } catch {
-          /* 这个工作区的库读不到（被占用 / 版本变了）→ 换下一个 */
+          /* This workspace's db is unreadable (locked / version changed) → try the next one */
           entries = prev ? prev.entries : null;
         } finally {
           if (db) {
             try {
               db.close();
             } catch {
-              /* 关不掉不影响读取 */
+              /* Failing to close does not affect the read */
             }
           }
         }
@@ -252,12 +258,14 @@ function readCopilotChatIndex() {
 /* ───────────── */
 
 /**
- * 会话行上的"在飞"标记：true 在飞 / false 已收工 / null 没有旁证（退回时间窗推断）。
+ * The "in flight" flag on a session row: true in flight / false done / null no side evidence
+ * (falls back to the time-window inference).
  *
- * 两份旁证（VS Code 的 chat 索引 / 会话日志）**谁知道的那一轮更新，就听谁**：
- * 索引常滞后（请求开始了它还没写），日志在请求开始就落；反过来日志的完成补丁又会晚一点到，
- * 所以不能简单地"谁说不忙就信谁"。另外 DB 里已经有这一轮的 turn 行 = 铁定收工
- * （Copilot 的 turn 行是整轮写完才落的）。
+ * Between the two pieces of evidence (VS Code's chat index / the session log), **whoever knows the
+ * newest turn wins**: the index often lags (the request started before it was written) while the log
+ * lands at request start; conversely the log's completion patch arrives a bit later, so we cannot simply
+ * "believe whoever says it is idle". Also, a turn row for this turn already in the DB = definitely done
+ * (Copilot only writes the turn row once the whole turn is finished).
  */
 function copilotInFlight(row) {
   if (!row) return null;
@@ -265,13 +273,14 @@ function copilotInFlight(row) {
   const live = row.live || null;
   const turns = Array.isArray(row.turns) ? row.turns : [];
   const lastTurnIdx = turns.length ? Number(turns[turns.length - 1].index) : -1;
-  // 日志**不早于**索引知道的那一轮就以日志为准。不能要求"严格更新"：实测这个 VS Code
-  // 版本把索引的 lastRequestEnded 写成和 lastRequestStarted 一样（永远判不出在飞），
-  // 平票时让索引压过日志，就会出现"日志明明说刚开跑、索引说已收工"→ 相位一直待命。
+  // Follow the log when it is **not older** than the turn the index knows about. Do not demand "strictly
+  // newer": in the measured VS Code build the index writes lastRequestEnded equal to lastRequestStarted
+  // (so in-flight can never be detected), and letting the index win ties produces "the log says it just
+  // started, the index says it is done" → the phase stays idle forever.
   const logKnowsNewer = Boolean(live && live.startedAt && (!c || live.startedAt >= (c.lastRequestStarted || 0)));
   if (logKnowsNewer) {
-    if (live.index != null && lastTurnIdx >= Number(live.index)) return false; // 这一轮的 turn 行已经落了
-    if (Date.now() - live.startedAt > 60 * 60_000) return false; // 太旧的"未完成"多半是残留，不算在飞
+    if (live.index != null && lastTurnIdx >= Number(live.index)) return false; // this turn's turn row already landed
+    if (Date.now() - live.startedAt > 60 * 60_000) return false; // a very old "unfinished" is likely residue, not in flight
     return !live.completed;
   }
   if (c) return Boolean(c.lastRequestStarted && c.lastRequestStarted > c.lastRequestEnded);
@@ -281,7 +290,8 @@ function copilotInFlight(row) {
 /* ───────────── */
 
 /**
- * Copilot 会话"算不算正在跑"：有在途旁证就听它，没有才退回 updated_at 的 2 分钟窗口。
+ * Whether a Copilot session "counts as running": trust in-flight evidence when present, otherwise fall
+ * back to the 2-minute window on updated_at.
  * @param {{chat?: any, lastUpdated?: number}} row
  * @param {number} now
  */
@@ -294,12 +304,12 @@ function copilotInWindow(row, now) {
 /* ───────────── */
 
 /**
- * 9F 的「任务完成」时刻：会话日志里最新那一轮 request 的 completedAt（超 DONE_TTL_MS 不算）。
- * Copilot 没有 hook 状态文件，完成标记只能从这份日志取 —— 与 kilo.js/opencode.js 的
- * read*Done 同一个口径（不靠"相位回落到空闲"来猜，避免中途误弹）。
+ * 9F's "task done" moment: completedAt of the newest request in the session log (ignored past DONE_TTL_MS).
+ * Copilot has no hook state file, so the done marker can only come from this log — same rule as
+ * kilo.js/opencode.js's read*Done (does not guess from "the phase fell back to idle", avoiding false pops).
  * @param {{live?: any}} row
  * @param {number} now
- * @returns {number} 0 = 没有（或已过期）
+ * @returns {number} 0 = none (or expired)
  */
 function copilotDoneAt(row, now) {
   const live = row && row.live;
@@ -311,28 +321,32 @@ function copilotDoneAt(row, now) {
 /* ───────────── */
 
 /**
- * **别的产品**的结构化落盘里认领的会话 id（genie-history / todos / message-queue / file-changes）。
+ * Session ids claimed by **other products**' structured on-disk state
+ * (genie-history / todos / message-queue / file-changes).
  *
- * 用途只有一个：9F 的台账同步器清理"张冠李戴"的历史行（见 copilotTasks.js 的
- * pruneForeignRunningRuns）。2026-09-30 实测的坑 —— 那个同步器原来用共享的 PLUGIN_RE 去要
- * 会话清单，`/^tencent/` 与 `/coding-copilot/` 会命中别的产品的插件目录（Tencent CodeBuddy 的
- * `tencent-cloud.coding-copilot`、Trae 的 coding-copilot），于是别的楼层正在跑的会话在 9F 被
- * 写成一条「(Copilot 会话)」在飞行 —— 用户根本没在 Copilot Chat 里输入，打开 VS Code 就冒一条。
+ * Only one purpose: 9F's ledger syncer cleans up misattributed history rows (see pruneForeignRunningRuns
+ * in copilotTasks.js). Measured pitfall on 2026-09-30 — that syncer used to ask for the session list with
+ * the shared PLUGIN_RE, and `/^tencent/` plus `/coding-copilot/` match other products' plugin dirs
+ * (Tencent CodeBuddy's `tencent-cloud.coding-copilot`, Trae's coding-copilot), so a session running on
+ * another floor was written into 9F as an in-flight "(Copilot 会话)" — a row appeared as soon as VS Code
+ * opened, even though the user never typed into Copilot Chat.
  *
- * **只做归属判定，不改任何落盘**：把这个 id 交给调用方，由它决定"能证明是别人的"才收行。
+ * **Attribution only, no disk writes**: the id is handed to the caller, which retracts a row only when it
+ * can prove the session belongs to someone else.
  * @returns {Set<string>}
  */
 function nonCopilotSessionIds() {
   const ids = new Set();
   for (const root of globalStorageRoots()) {
     for (const name of readDir(root)) {
-      if (COPILOT_STORAGE_RE.test(name)) continue; // Copilot 自己的目录不算"别的产品"
+      if (COPILOT_STORAGE_RE.test(name)) continue; // Copilot's own dir is not "another product"
       const dir = path.join(root, name);
       const gh = path.join(dir, 'genie-history');
       for (const proj of readDir(gh)) {
         const pdir = path.join(gh, proj);
         for (const sid of readDir(path.join(pdir, 'conversations'))) ids.add(sid);
-        // 工程级 current.json 也记着一条会话 id（会话目录可能已经不在，但这只会话还在跑）
+        // The project-level current.json also records one session id (the session dir may be gone but this
+        // session is still running)
         const cur = readJson(path.join(pdir, 'current.json'));
         const cid = cur && cur.conversationId ? String(cur.conversationId) : '';
         if (cid) ids.add(cid);
@@ -353,7 +367,7 @@ function nonCopilotSessionIds() {
 
 /* ───────────── */
 
-/** 某条 Copilot 会话的 VS Code 会话日志（chatSessions/<会话>.jsonl） */
+/** The VS Code session log (chatSessions/<session>.jsonl) of one Copilot session */
 function copilotChatLogPath(sessionId) {
   const name = `${sessionId}.jsonl`;
   for (const root of workspaceStorageRoots()) {
@@ -368,14 +382,15 @@ function copilotChatLogPath(sessionId) {
 /* ───────────── */
 
 /**
- * 读 Copilot 会话日志的**尾部**，取最新那一轮请求。
+ * Read the **tail** of a Copilot session log and take the newest request.
  *
- * 这份日志（`workspaceStorage/<hash>/chatSessions/<会话>.jsonl`）是 VS Code 自己的会话状态
- * 补丁流：`{"kind":1,"k":["requests",<n>,"…"],"v":…}` 一条条追加。关键在**时机** ——
- * 最新一轮的 `requests` 数组（含用户原话 message.text 与起始 timestamp）在这一轮**开始**时
- * 就追加进去了（实测那一行里的 modelState 还是 {value:0}，完成时间稍后才以
- * `requests.<n>.modelState.completedAt` 补上）。所以它一次给出三样 Copilot 自己的 sqlite
- * 库给不了的东西：这一轮在不在飞、用户原话、起止时间。
+ * This log (`workspaceStorage/<hash>/chatSessions/<session>.jsonl`) is VS Code's own session-state patch
+ * stream, appended line by line as `{"kind":1,"k":["requests",<n>,"…"],"v":…}`. What matters is the
+ * **timing** — the newest turn's `requests` array (with the user's message.text and the start timestamp)
+ * is appended when that turn **starts** (measured: modelState on that line is still {value:0}, and the
+ * completion time is patched in later as `requests.<n>.modelState.completedAt`). So it delivers at once
+ * three things Copilot's own sqlite store cannot: whether this turn is in flight, the user's exact words,
+ * and the start/end times.
  *
  * @param {string} sessionId
  * @returns {{index: number|null, prompt: string, startedAt: number, completed: boolean,
@@ -395,7 +410,7 @@ function readCopilotLiveRequest(sessionId) {
   const hit = copilotLiveCache.get(sessionId);
   if (hit && hit.key === key) return hit.value;
 
-  const TAIL = 4 * 1024 * 1024; // 最新那一轮那行可能很大（带整段 response），往上多读一点
+  const TAIL = 4 * 1024 * 1024; // The line for the newest turn can be large (carries the whole response) → read extra
   let txt = '';
   try {
     const start = Math.max(0, st.size - TAIL);
@@ -407,15 +422,15 @@ function readCopilotLiveRequest(sessionId) {
     } finally {
       fs.closeSync(fd);
     }
-    if (start > 0) txt = txt.slice(txt.indexOf('\n') + 1); // 丢掉可能被截断的首行
+    if (start > 0) txt = txt.slice(txt.indexOf('\n') + 1); // Drop the first line, which may be truncated
   } catch {
     return null;
   }
 
   let req = null;
-  const modelStateByIndex = new Map(); // 轮序号 -> {value, completedAt}
-  const elapsedByIndex = new Map(); // 轮序号 -> elapsedMs（起止时间 = completedAt - elapsedMs）
-  const changedByIndex = new Map(); // 轮序号 -> Set(写工具碰过的文件：绝对路径)
+  const modelStateByIndex = new Map(); // turn index -> {value, completedAt}
+  const elapsedByIndex = new Map(); // turn index -> elapsedMs (start = completedAt - elapsedMs)
+  const changedByIndex = new Map(); // turn index -> Set(files touched by write tools: absolute paths)
   let maxIndex = -1;
   for (const line of txt.split('\n')) {
     if (!line || line[0] !== '{') continue;
@@ -428,7 +443,7 @@ function readCopilotLiveRequest(sessionId) {
     const k = j && j.k;
     if (!Array.isArray(k) || k[0] !== 'requests') continue;
     if (k.length === 1) {
-      // 整份 requests（滚动窗口）：最后一条就是最新那一轮
+      // The whole requests array (rolling window): the last entry is the newest turn
       const arr = Array.isArray(j.v) ? j.v : [];
       const last = arr[arr.length - 1];
       if (last && typeof last === 'object') {
@@ -445,9 +460,9 @@ function readCopilotLiveRequest(sessionId) {
         } else if (k[2] === 'elapsedMs') {
           elapsedByIndex.set(idx, Number(j.v) || 0);
         } else if (k[2] === 'response') {
-          // 这一轮的回复流里，**写文件**的工具调用 = 这一轮改动的文件。
-          // 路径整个对象里找（invocationMessage / pastTenseMessage / toolSpecificData 都可能带），
-          // 只认 file:// URI，去掉 #Lx-y 行号后缀。
+          // Inside this turn's response stream, **file-writing** tool calls = this turn's changed files.
+          // Search the whole object for paths (invocationMessage / pastTenseMessage / toolSpecificData may
+          // carry them), accept only file:// URIs and strip the #Lx-y line suffix.
           for (const it of Array.isArray(j.v) ? j.v : []) {
             if (!it || typeof it !== 'object' || it.kind !== 'toolInvocationSerialized') continue;
             if (!COPILOT_WRITE_TOOL_RE.test(String(it.toolId || ''))) continue;
@@ -465,12 +480,14 @@ function readCopilotLiveRequest(sessionId) {
   }
   if (!req) return null;
   /*
-   * 完成判定**不能**拿"补丁里的最大轮号"当这一轮的轮号：最新一轮在开始时落的是一整份
-   * requests（此时还没有它的 requests.<n>.* 补丁），那一轮号还是上一轮的 —— 拿上一轮的
-   * modelState.completedAt 去判定，就会把"刚开始跑"判成"已经收工"（2026-09-28 实测的坑：
-   * 用户跑任务时 9F 连"思考中"都没有）。
-   * 轮次是顺序的，所以正确判据是：**有没有出现"不早于这一轮起始时间"的完成标记**。
-   * 没有（最大的 completedAt 还是上一轮的，必然早于本轮 startedAt）→ 这一轮还在飞。
+   * Completion **cannot** use "the largest turn index in the patches" as this turn's index: when the newest
+   * turn starts it appends a whole requests array (its own requests.<n>.* patches do not exist yet), so
+   * that index is still the previous turn's — judging with the previous turn's modelState.completedAt
+   * turns "just started" into "already done" (measured pitfall on 2026-09-28: while the user ran a task,
+   * 9F did not even show "thinking").
+   * Turns are sequential, so the correct test is: **has a completion marker no earlier than this turn's
+   * start appeared**? If not (the largest completedAt is still the previous turn's and is necessarily
+   * earlier than this turn's startedAt) → this turn is still in flight.
    */
   let maxCompletedAt = 0;
   let maxCompletedIndex = -1;
@@ -483,8 +500,9 @@ function readCopilotLiveRequest(sessionId) {
   req.completed = maxCompletedAt >= req.startedAt;
   req.completedAt = req.completed ? maxCompletedAt : 0;
   req.index = req.completed ? maxCompletedIndex : maxCompletedIndex >= 0 ? maxCompletedIndex + 1 : null;
-  // 顺带回一份"最近几轮各自的起止时间"（顶部窗口里带 elapsedMs 的都能算出来），
-  // 台账按轮记账时用它把每一轮的 started_at 填准（Copilot 自己的库只有完成时刻）。
+  // Also return the start/end times of the last few turns (any turn with elapsedMs in the tail window can
+  // be computed); the ledger uses it to fill each turn's started_at accurately (Copilot's own store only
+  // has the completion moment).
   req.reqs = [];
   for (const [idx, st] of modelStateByIndex) {
     if (!st.completedAt) continue;
@@ -492,7 +510,7 @@ function readCopilotLiveRequest(sessionId) {
     req.reqs.push({ index: idx, startedAt: Math.max(0, st.completedAt - el), endedAt: st.completedAt });
   }
   req.reqs.sort((a, b) => a.index - b.index);
-  // 最近几轮各自改动的文件（写工具碰过的），按轮序号给出去
+  // Files changed by each of the last few turns (touched by write tools), keyed by turn index
   req.changed = [...changedByIndex]
     .map(([index, set]) => ({ index, files: [...set] }))
     .sort((a, b) => a.index - b.index);
@@ -503,14 +521,15 @@ function readCopilotLiveRequest(sessionId) {
 /* ───────────── */
 
 /**
- * reporter hook 的"主控制台相位"：每次事件都会把当前相位（thinking/tool/await）写进
- * ~/.workgremlin/hooks/<工位>.json 的 `sessionPhase` 字段（见 packages/reporter/src/hook.js）。
- * 这是上报真值，优先级高于从 genie-history 推断出来的相位，UI 按真值展示（不标"推断"）。
- * 超过新鲜期（5 分钟）视为作废，避免 IDE 关掉后残留相位一直挂着。
- * 顺带返回同一份状态文件里的 pending（PreToolUse 写、PostToolUse 清），专供"等授权"兜底推断。
+ * The reporter hook's "main console phase": every event writes the current phase (thinking/tool/await)
+ * into `sessionPhase` in ~/.workgremlin/hooks/<station>.json (see packages/reporter/src/hook.js).
+ * That is reported truth and outranks a phase inferred from genie-history; the UI shows it as truth
+ * (not marked "inferred"). Past the freshness window (5 minutes) it is void, so a phase left behind by a
+ * closed IDE does not hang around. Also returns `pending` from the same state file (written by PreToolUse,
+ * cleared by PostToolUse), used only as the "awaiting authorization" fallback inference.
  * @returns {{phase: string, tool: string, file: string, cmd: string, prompt: string, model: string, client: string, pending: {tool: string, file: string, cmd: string, at: number}|null}|null}
  */
-/** GitHub Copilot 的真实会话落盘是 SQLite `session-store.db`，不是 genie-history 目录。 */
+/** GitHub Copilot's real session store is the SQLite `session-store.db`, not a genie-history dir. */
 function readSqliteSessionRows(storage) {
   const dbFile = path.join(storage, 'session-store.db');
   if (!isFile(dbFile)) return [];
@@ -530,12 +549,12 @@ function readSqliteSessionRows(storage) {
       const query = `SELECT ${selectCols.join(', ')} FROM sessions WHERE ${idCol} IS NOT NULL AND TRIM(${idCol}) <> '' ${updatedCol ? `ORDER BY datetime(${updatedCol}) DESC` : ''}`;
       const rows = db.prepare(query).all();
 
-      // turns 表：取每个会话的 turn 数 + 最后一条 user_message（作任务标题/提示语兜底）。
-      // session_files 表：取每个会话碰过的文件路径 + 工具名（作文件改动清单）。
-      // 两张表不一定在（Copilot 版本可能变），查不到就回空，不冒泡。
+      // turns table: turn count per session + last user_message (fallback task title / prompt).
+      // session_files table: file paths each session touched + tool names (the file-change list).
+      // Neither table is guaranteed (Copilot versions may change); missing → empty, no exception surfaced.
       const turnsBySid = readCopilotTurns(db);
       const filesBySid = readCopilotFiles(db);
-      // 「这一轮在不在飞」的旁证（VS Code 的 chat 索引，见 readCopilotChatIndex）
+      // Side evidence for "is this turn in flight" (VS Code's chat index — see readCopilotChatIndex)
       const chatBySid = readCopilotChatIndex();
 
       return rows
@@ -546,13 +565,13 @@ function readSqliteSessionRows(storage) {
           const projectPath = cwd || '';
           const project = resolveProjectName(projectPath) || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
           const ts = updatedCol ? row[updatedCol] : null;
-          // 拿不到真实时间戳 → lastUpdated=0，让下游 freshness 检查正确判过期（idle），
-          // 不要用 Date.now() 冒充 —— 一冒充就永远"新鲜"，相位卡死在 thinking。
+          // No real timestamp → lastUpdated=0 so the downstream freshness check correctly marks it stale
+          // (idle); never fake it with Date.now() — that would stay "fresh" forever and pin the phase to thinking.
           const lastUpdated = ts ? Number(new Date(ts).getTime()) || 0 : 0;
           const summary = summaryCol ? String(row[summaryCol] || '').trim() : '';
           const t = turnsBySid.get(id) || {};
           const rawFiles = filesBySid.get(id) || [];
-          // session_files 存的是绝对路径，其他 agent 都用相对路径 —— 统一成相对路径
+          // session_files stores absolute paths while other agents use relative ones — normalize to relative
           const files = rawFiles.map((f) => ({
             ...f,
             path: projectPath && f.path ? path.relative(projectPath, f.path) || f.path : f.path,
@@ -569,7 +588,7 @@ function readSqliteSessionRows(storage) {
             files,
             turns: Array.isArray(t.turns) ? t.turns : [],
             chat: chatBySid.get(id) || null,
-            // 最新那一轮请求（VS Code 会话日志）：在不在飞 + 用户原话 + 起止时间
+            // The newest request (VS Code session log): in flight or not + user text + start/end times
             live: readCopilotLiveRequest(id),
           };
         })
@@ -583,12 +602,13 @@ function readSqliteSessionRows(storage) {
 }
 
 /**
- * 读 GitHub Copilot 自己的 SQLite 会话库（session-store.db）→ 完整会话行。
- * 这是 9F 的真会话；没有它，9F 会被同目录里别的产品的插件目录吞掉。
- * 返回数组，每条已带 copilot:true 与 enrich 后的字段（phase / inFlight / doneAt / live* 系列），
- * 由调用方（sessions.listSessions / syncCopilotTasks）按 id 合并。
- * @param {string} storage 插件落盘根（findPluginStorage 的结果）
- * @param {{ws?: string, now?: number}} o ws = 当前工程（决定 current），now = 当前时刻
+ * Read GitHub Copilot's own SQLite session store (session-store.db) → full session rows.
+ * These are 9F's real sessions; without them 9F gets swallowed by other products' plugin dirs in the
+ * same directory. Returns an array; each row already carries copilot:true and the enriched fields
+ * (phase / inFlight / doneAt / the live* family), merged by id by the caller
+ * (sessions.listSessions / syncCopilotTasks).
+ * @param {string} storage plugin storage root (the result of findPluginStorage)
+ * @param {{ws?: string, now?: number}} o ws = current project (decides `current`), now = current time
  */
 function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
   if (!storage) return [];
@@ -600,7 +620,8 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
     const inFlight = copilotInFlight(row);
     out.push({
       id: row.id,
-      // 带上工程归属：sessions.listSessions 用 row.project / row.projectPath 写入 meta 并判断 current。
+      // Carry project ownership: sessions.listSessions writes row.project / row.projectPath into meta and
+      // decides `current` from them.
       project: row.project,
       projectPath: row.projectPath,
       copilot: true,
@@ -612,40 +633,42 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
       runtime: { activated: true, paused: false, awaitingSessionIdle: false },
       pending: 0,
       todos: { total: 0, done: 0, doing: '', items: [] },
-      // Copilot 的 session_files 表给出本轮碰过的文件路径 + 工具名；有就带上，
-      // 没有回空列表（老版本 Copilot 可能没这张表 —— readCopilotFiles 已兜底回空）。
+      // Copilot's session_files table gives this turn's file paths + tool names; include them when present,
+      // otherwise an empty list (older Copilot may lack that table — readCopilotFiles already returns empty).
       files: { count: (row.files || []).length, recent: row.files || [], lastAt: row.lastUpdated || null },
       phase: inWindow ? 'thinking' : 'idle',
       action: '',
       target: '',
       tool: '',
       context: [],
-      // 「思考中」屏上那句话：正在飞的那一轮用 VS Code 会话日志里的用户原话（最新），
-      // 否则退回 Copilot 的 turns 表里最后一条 user_message；summary（sessions 表）
-      // 是 Copilot 自己取的会话标题 —— 都带上，渲染层按它的规则择优展示。
+      // The line on the "thinking" screen: while a turn is in flight use the user's exact words from the VS
+      // Code session log (newest), otherwise fall back to the last user_message in Copilot's turns table;
+      // summary (sessions table) is Copilot's own session title — ship all of them and let the render layer
+      // pick by its own rule.
       prompt: (inFlight && row.live && row.live.prompt) || row.lastUserMessage || '',
-      // 「任务完成」标记：9F 没有 hook，完成时刻只能从会话日志取（最新那一轮 request 的
-      // completedAt）—— 与 7F/8F 的 read*Done 同口径，超 DONE_TTL_MS 就算过期（不弹）。
+      // The "task done" marker: 9F has no hook, so the done moment can only come from the session log
+      // (completedAt of the newest request) — same rule as 7F/8F's read*Done; past DONE_TTL_MS it is expired
+      // (no popup).
       doneAt: copilotDoneAt(row, now),
       doneTitle: row.summary || '',
       doneCount: row.turnCount || 0,
       doneFiles: [],
-      // 9F 没有 hook，拿不到"打断"信号 → 一律按正常完成显示，不猜取消
+      // 9F has no hook and cannot see an "interrupted" signal → always show a normal completion, never guess a cancel
       doneCancelled: false,
       inferred: true,
       hasPendingTurn: row.hasPendingTurn || false,
-      // 「这一轮在不在飞」：true / false / null（没旁证）。台账同步器（syncCopilotTasks）
-      // 靠它决定这条会话的任务是"运行中"还是"已完成"，比时间窗准。
+      // "Is this turn in flight": true / false / null (no evidence). The ledger syncer (syncCopilotTasks)
+      // uses it to decide whether this session's task is "running" or "done" — more accurate than a time window.
       inFlight,
-      /** 正在飞的那一轮：用户原话 + 起始时间 + 轮序号（台账按轮记账用） */
+      /** The turn in flight: user text + start time + turn index (the ledger books per turn) */
       livePrompt: (row.live && row.live.prompt) || '',
       liveStartedAt: (row.live && row.live.startedAt) || 0,
       liveIndex: row.live ? row.live.index : null,
-      /** 最近几轮各自的起止时间（会话日志里的 completedAt - elapsedMs） */
+      /** Start/end times of the last few turns (completedAt - elapsedMs from the session log) */
       liveReqs: (row.live && row.live.reqs) || [],
-      /** 最近几轮各自**改动过的文件**（会话日志里写工具碰过的；read_file 不算） */
+      /** Files **changed** by each of the last few turns (touched by write tools in the log; read_file does not count) */
       liveChanged: (row.live && row.live.changed) || [],
-      /** 逐轮清单（turns 表）：任务台账「每一轮一条」用 */
+      /** Per-turn listing (turns table): used by the ledger's "one row per turn" */
       copilotTurns: row.turns || [],
     });
   }
@@ -653,7 +676,7 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
 }
 
 function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
-  // copilot 专属：client 现在只描述形态（cli / vscode），楼层由调用方保证
+  // copilot-only: `client` now describes the form only (cli / vscode); the floor is guaranteed by the caller
   const storage = findPluginStorage(RE_GITHUB_COPILOT, RE_GITHUB_COPILOT_MARKS);
   if (!storage) return null;
   const rowList = readSqliteSessionRows(storage)
@@ -662,12 +685,13 @@ function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
   if (!rowList.length) return null;
   rowList.sort((a, b) => Number(b.lastUpdated || 0) - Number(a.lastUpdated || 0));
   const row = rowList[0];
-  // 相位：优先听 VS Code chat 索引的"这一轮在不在飞"，没有旁证才退回 2 分钟新鲜度窗口。
-  // 和 listSessions 同一口径（copilotInWindow）—— 不要让旧会话永远显示 thinking，
-  // 更不要在轮正跑着的时候报待命。
+  // Phase: trust VS Code's chat index on "is this turn in flight" first; only with no evidence fall back to the
+  // 2-minute freshness window. Same rule as listSessions (copilotInWindow) — do not let old sessions show
+  // thinking forever, and do not report idle while a turn is actually running.
   const now = Date.now();
   const fresh = copilotInWindow(row, now);
-  // 屏上那句"用户说的话"：正在飞的那一轮用会话日志里的原话（Copilot 自己的库要等整轮写完才有）
+  // The "what the user said" line: while in flight use the exact words from the session log (Copilot's own
+  // store only has them once the whole turn is written)
   const prompt = String(
     (fresh && row.live && row.live.prompt) || row.lastUserMessage || row.summary || ''
   ).trim();
@@ -698,7 +722,7 @@ function copilotCurrentModel() {
     copilotModelCache = { at: now, value: '' };
     return '';
   }
-  // state.vscdb 在 globalStorage 根下（Copilot 的 plugin storage 是它的子目录）
+  // state.vscdb sits under the globalStorage root (Copilot's plugin storage is a subdir of it)
   const dbFile = path.join(path.dirname(storage), 'state.vscdb');
   let db = null;
   try {
@@ -708,14 +732,14 @@ function copilotCurrentModel() {
     }
     const Database = require('better-sqlite3');
     db = new Database(dbFile, { readonly: true, fileMustExist: true });
-    // 当前选中的模型标识（如 "copilot/gpt-5-mini"）
+    // The currently selected model identifier (e.g. "copilot/gpt-5-mini")
     const row = db.prepare("select value from ItemTable where key = 'chat.currentLanguageModel.editor'").get();
     const identifier = row ? String(row.value || '').trim() : '';
     if (!identifier) {
       copilotModelCache = { at: now, value: '' };
       return '';
     }
-    // 从 cachedLanguageModels 查展示名（如 "GPT-5 mini"）
+    // Look up the display name in cachedLanguageModels (e.g. "GPT-5 mini")
     const cached = db.prepare("select value from ItemTable where key = 'chat.cachedLanguageModels'").get();
     if (cached && cached.value) {
       const models = JSON.parse(String(cached.value));
@@ -728,7 +752,7 @@ function copilotCurrentModel() {
         }
       }
     }
-    // 查不到展示名就用标识符去掉 vendor 前缀（"copilot/gpt-5-mini" → "gpt-5-mini"）
+    // No display name → use the identifier minus the vendor prefix ("copilot/gpt-5-mini" → "gpt-5-mini")
     const fallback = identifier.replace(/^[^/]+\//, '');
     copilotModelCache = { at: now, value: fallback };
     return fallback;
@@ -737,7 +761,7 @@ function copilotCurrentModel() {
     return '';
   } finally {
     if (db) {
-      try { db.close(); } catch { /* 关不掉不影响读取 */ }
+      try { db.close(); } catch { /* Failing to close does not affect the read */ }
     }
   }
 }
@@ -745,8 +769,9 @@ function copilotCurrentModel() {
 /* ───────────── */
 
 /**
- * 9F 的完成标记（会话表形状 `{doneAt,doneTitle,doneCount,doneFiles}`，与各产品的 read*Done 同形）。
- * 取会话日志里最新那一轮的 completedAt；超 DONE_TTL_MS 或那一轮还没收工都没有。
+ * 9F's done marker (session-table shape `{doneAt,doneTitle,doneCount,doneFiles}`, same shape as every
+ * product's read*Done). Takes completedAt of the newest turn in the session log; none when past
+ * DONE_TTL_MS or when that turn has not finished.
  * @param {string} sessionId
  */
 function readCopilotDone(sessionId) {
@@ -759,26 +784,27 @@ function readCopilotDone(sessionId) {
 
 /* ───────────── */
 
-/** Copilot 的相位新鲜窗口：2 分钟内有活动 = thinking，超了 = idle。
- *  比 IDLE_MS 短得多 —— IDLE_MS 管"活不活"（10 分钟内都算活跃会话），
- *  这个管"正在不在想"（2 分钟没动静就是待命了）。和 Kilo 的 PHASE_FRESH_MS 同量级。 */
+/** Copilot's phase freshness window: activity within 2 minutes = thinking, beyond that = idle.
+ *  Much shorter than IDLE_MS — IDLE_MS governs "alive or not" (active within 10 minutes), this governs
+ *  "thinking right now" (2 minutes of silence = idle). Same order as Kilo's PHASE_FRESH_MS. */
 const COPILOT_PHASE_MS = 2 * 60_000;
 
 /* ───────────── */
 
 /**
- * GitHub Copilot 自己的插件落盘目录名。`/copilot/i` 会把 Tencent 的
- * `tencent-cloud.coding-copilot` 一起命中，所以必须锚在开头。
+ * GitHub Copilot's own plugin storage dir name. `/copilot/i` would also match Tencent's
+ * `tencent-cloud.coding-copilot`, so it must be anchored at the start.
  */
 const COPILOT_STORAGE_RE = /^(?:github[.\-]?copilot|copilot)/i;
 
 /* ───────────── */
 
 /**
- * 会**写文件**的 Copilot 工具（toolId）。只有这些工具碰过的文件才算"这一轮改动的文件"。
- * 实测（0.65.0）toolId 长这样：copilot_readFile / copilot_findTextInFiles / run_in_terminal /
+ * Copilot tools that **write files** (toolId). Only files touched by these count as "this turn's changed files".
+ * Measured (0.65.0) toolIds look like: copilot_readFile / copilot_findTextInFiles / run_in_terminal /
  * copilot_replaceString / copilot_multiReplaceString / manage_todo_list…
- * —— session_files 那张表里**只有 read_file**，拿它当"改动文件"是错的（用户实测抓出来的）。
+ * — the session_files table holds **only read_file**, so using it as "changed files" is wrong (caught by
+ * the user in practice).
  */
 const COPILOT_WRITE_TOOL_RE =
   /replace|patch|create[_.]?file|write[_.]?file|edit[_.]?file|insert[_.]?edit|apply[_.]?edit|multi[_.]?replace|delete[_.]?file|move[_.]?file/i;
@@ -786,39 +812,40 @@ const COPILOT_WRITE_TOOL_RE =
 /* ───────────── */
 
 /**
- * Copilot「这一轮在不在飞」的旁证。
+ * Side evidence for "is this Copilot turn in flight".
  *
- * Copilot 自己的 session-store.db 是**整轮写完**才落的：turns 行带着 assistant_response
- * 一起出现，sessions.updated_at 也是那一刻才动 —— 「正在生成」在那张库里根本看不见。
- * 只看 updated_at 的 2 分钟窗口，就会出现最难看的那种错：**跑着的时候显示待命，
- * 跑完了反倒显示思考中**（实测 2026-09-28）。
+ * Copilot's own session-store.db is written **only when the whole turn finishes**: the turns row appears
+ * together with assistant_response, and sessions.updated_at moves at that same moment — "generating" is
+ * simply invisible in that store. Watching only updated_at's 2-minute window produces the ugliest kind of
+ * error: **idle while it is running, thinking right after it finished** (measured 2026-09-28).
  *
- * VS Code 自己有一份更细的索引：`workspaceStorage/<hash>/state.vscdb` 的
- * `chat.ChatSessionStore.index`，每个会话带 `timing.lastRequestStarted / lastRequestEnded`
- * （外加 lastResponseState / hasPendingEdits）。started 晚于 ended（或压根没有 ended）
- * = 这一轮还在飞。这里只读它、不写；读不到就回空 Map，上层退回原来的时间窗推断。
+ * VS Code keeps a finer index of its own: `chat.ChatSessionStore.index` in
+ * `workspaceStorage/<hash>/state.vscdb`, where each session carries `timing.lastRequestStarted /
+ * lastRequestEnded` (plus lastResponseState / hasPendingEdits). started later than ended (or no ended at
+ * all) = this turn is still in flight. Read-only here; unreadable → empty Map and the upper layer falls
+ * back to the original time-window inference.
  */
 const COPILOT_INDEX_TTL = 2_000;
 
 /* ───────────── */
 
-/** dbFile -> { mtimeMs, size, at, entries }：文件没变就不重复开库（相位 1.5s 一poll） */
+/** dbFile -> { mtimeMs, size, at, entries }: unchanged file → do not reopen the db (the phase polls every 1.5s) */
 let copilotIndexCache = new Map();
 
 /* ───────────── */
 
-/** sessionId -> { key, value }：日志是 append-only 的，mtime+size 没变就没必要重读 */
+/** sessionId -> { key, value }: the log is append-only, so unchanged mtime+size means no need to reread */
 const copilotLiveCache = new Map();
 
 /* ───────────── */
 
 /**
- * Copilot 当前选中的模型。从 VS Code 的 state.vscdb 里读 `chat.currentLanguageModel.editor`，
- * 值形如 `copilot/gpt-5-mini`；再用 `chat.cachedLanguageModels` 查展示名（如 "GPT-5 mini"）。
- * 取不到返回空串 —— 不猜。
+ * The model Copilot currently has selected. Read `chat.currentLanguageModel.editor` from VS Code's
+ * state.vscdb; the value looks like `copilot/gpt-5-mini`, then `chat.cachedLanguageModels` gives the
+ * display name (e.g. "GPT-5 mini"). Returns an empty string when unavailable — no guessing.
  *
- * 和 TraeCode 的 traeModels.selectedModelOf 同理：模型存在 globalStorage 的 state.vscdb 里，
- * Copilot 自己的 session-store.db 不记模型。
+ * Same idea as TraeCode's traeModels.selectedModelOf: the model lives in globalStorage's state.vscdb,
+ * Copilot's own session-store.db does not record models.
  */
 const COPILOT_MODEL_CACHE_TTL = 15_000;
 
@@ -826,68 +853,71 @@ const COPILOT_MODEL_CACHE_TTL = 15_000;
 
 let copilotModelCache = { at: 0, value: '' };
 
-/* ───────────── 原 copilotTasks.js 的同步器 ───────────── */
+/* ───────────── Syncer from the old copilotTasks.js ───────────── */
 
 'use strict';
 
 /**
- * 9F GitHub Copilot 的任务同步器。
+ * 9F GitHub Copilot's task syncer.
  *
- * Copilot 没有 reporter hook，不会往 WorkGremlin 的 tasks 表写东西 → 任务列表（TaskRecordsView，
- * 走 /api/v1/task-runs）永远看不到 9F 的任务。这个同步器周期性轮询 Copilot 自己的
- * session-store.db（已在 sessions.readSqliteSessionRows 里读好：sessions + turns + session_files），
- * 加上 VS Code 的会话日志（chatSessions/<会话>.jsonl，见 sessions.readCopilotLiveRequest），
- * 把**每一轮用户任务**写成一条 task + task_run，让任务列表能显示 9F。
+ * Copilot has no reporter hook and never writes into WorkGremlin's tasks table → the task list
+ * (TaskRecordsView, served by /api/v1/task-runs) would never show 9F's tasks. This syncer periodically
+ * polls Copilot's own session-store.db (already read by sessions.readSqliteSessionRows: sessions + turns
+ * + session_files) plus VS Code's session log (chatSessions/<session>.jsonl, see
+ * sessions.readCopilotLiveRequest), and writes **each turn of user work** as one task + task_run so the
+ * task list can show 9F.
  *
- * 设计：
- * - 幂等：task id = `copilot:<session_id>:<轮序号>`，每次重跑是 upsert，不会重复插。
- * - 安静：不广播 WS 事件（2s 会话扫盘 loop 会自然拾取变化并推给前端）。
- * - 只写 task_runs 有的列（client/session_id/file_count/files_json/title/started_at/ended_at），
- *   不编造 model/result（Copilot 的库里没有模型字段）。
- * - 状态：这一轮还在飞 → state=running、ended_at=null；收工 → state=done、ended_at=收工时刻。
- *   "在飞"听 VS Code 的两份旁证（state.vscdb 的 chat 索引 / 会话日志的完成标记），
- *   都不认识才退回时间窗 —— Copilot 自己的库整轮写完才落盘，只看时间窗必然判反。
+ * Design:
+ * - Idempotent: task id = `copilot:<session_id>:<turn index>`; each pass upserts, never duplicates.
+ * - Quiet: no WS broadcast (the 2s session scan loop picks changes up and pushes them naturally).
+ * - Writes only columns task_runs actually has (client/session_id/file_count/files_json/title/started_at/
+ *   ended_at); does not invent model/result (Copilot's store has no model column).
+ * - State: turn still in flight → state=running, ended_at=null; finished → state=done, ended_at=finish time.
+ *   "In flight" trusts VS Code's two pieces of evidence (state.vscdb's chat index / the session log's
+ *   completion marker); only when neither knows does it fall back to the time window — Copilot's own store
+ *   lands only after the whole turn, so a time window alone judges backwards.
  */
 
 
 
 
-/** Copilot 相位新鲜窗口：2 分钟内有活动 = running，超了 = done。
- *  比 IDLE_MS（10 分钟，管"活不活"）短，这个管"正在不在跑"。 */
+/** Copilot phase freshness window: activity within 2 minutes = running, beyond that = done.
+ *  Shorter than IDLE_MS (10 minutes, "alive or not"); this governs "running right now". */
 const PHASE_MS = 2 * 60_000;
 const SYNC_INTERVAL_MS = 5_000;
 
-/** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
+/** Task id prefix, so ids never collide with tasks written by the reporter hook */
 const TASK_ID_PREFIX = 'copilot:';
 
 /**
- * 这一层写进台账 / 成员表的**上报身份**。
+ * The **reported identity** this layer writes into the ledger / member table.
  *
- * client 恒为**楼层基名** `copilot`（形态走 form）；9F 的 clients 由 sources 反推，
- * 现在也是 ['copilot']，任务列表按楼层 clients 过滤时两边对得上。
- * （历史行里带 `-plugin` 后缀的由 DB 的 client 归一化迁移抹掉；ingest 侧 bus.normClient 也会剥。）
+ * client is always the **floor base name** `copilot` (the form travels as `form`); 9F's clients are derived
+ * from sources and are now ['copilot'] too, so both sides agree when the task list filters by floor clients.
+ * (Legacy rows carrying a `-plugin` suffix are erased by the DB's client normalization migration; the ingest
+ * side's bus.normClient strips it as well.)
  */
 const CLIENT = 'copilot';
 
 /**
  * @param {{bus: any, repo: any, now?: () => number}} ctx
- * @returns {number} 本次同步写/改了几条任务
+ * @returns {number} how many tasks this sync wrote/changed
  */
-/** 这个工程名（工程 id）—— 成员 / 台账都按它归组 */
+/** This project's name (project id) — members / the ledger are grouped by it */
 function projectIdOf(s) {
   const projectPath = s.projectPath || '';
   return s.project || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
 }
 
 /**
- * 这条会话现在算不算"正在跑"。
+ * Whether this session counts as "running" right now.
  *
- * 优先听会话行上的 `inFlight`（VS Code chat 索引给的"这一轮在不在飞"，见 sessions.js 的
- * readCopilotChatIndex）—— Copilot 自己的库整轮写完才落盘，只看时间窗会出现
- * "跑着显示待命、跑完显示思考中"。拿不到旁证（老版本 / 库被占用，inFlight === null）
- * 才退回 PHASE_MS(2 分钟) 新鲜度窗口。
+ * Trusts the session row's `inFlight` first ("is this turn in flight", from VS Code's chat index — see
+ * readCopilotChatIndex in sessions.js) — Copilot's own store lands only after the whole turn, so a time
+ * window alone shows "idle while running, thinking after it is done". Only when there is no evidence
+ * (old version / db locked, inFlight === null) does it fall back to the PHASE_MS (2 minutes) freshness window.
  *
- * 用 2 分钟而不是 IDLE_MS(10 分钟)：10 分钟太长，任务跑完后还显示 running 10 分钟。
+ * 2 minutes instead of IDLE_MS (10 minutes): 10 is too long, a finished task stays "running" for 10 minutes.
  */
 function isSessionActive(s, now) {
   if (typeof s.inFlight === 'boolean') return s.inFlight;
@@ -895,8 +925,9 @@ function isSessionActive(s, now) {
 }
 
 /**
- * 写一条台账（tasks + task_runs 两行）。9F 是**每一轮一条**，见 syncCopilotTasks 的说明。
- * @returns {string|null} 这条记录的 files_json（心跳里的 current_files 直接复用）
+ * Write one ledger row (a line in both tasks and task_runs). 9F is **one row per turn**, see
+ * syncCopilotTasks' notes.
+ * @returns {string|null} this record's files_json (the heartbeat's current_files reuses it directly)
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, files }) {
   const running = !endedAt;
@@ -924,7 +955,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     baselineCommit: null,
   });
   const filesJson = files && files.length ? JSON.stringify(files) : null;
-  // 补 file_count / files_json / ended_at / duration_ms（upsertTaskRun 不写这些列）
+  // Fill file_count / files_json / ended_at / duration_ms (upsertTaskRun does not write those columns)
   repo.endTaskRun.run({
     id,
     title,
@@ -940,22 +971,24 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
 }
 
 /**
- * 收掉"张冠李戴"的在飞行。
+ * Retract misattributed in-flight rows.
  *
- * 9F 的台账只有这个同步器写（`copilot:` 前缀 + client=copilot-plugin），所以这个前缀的行归它自己管。
- * 历史版本给 listSessions 用的是共享的 PLUGIN_RE，它会命中别的产品的插件目录
- * （Tencent CodeBuddy 的 tencent-cloud.coding-copilot、Trae 的 coding-copilot）—— 那些楼层正在跑的
- * 会话就被写成了 Copilot 任务，标题只能退回占位符「(Copilot 会话)」。而且这种行**永远不会收工**：
- * 收工靠 Copilot 自己的 turns 表，别的产品的会话在它那张表里根本没有 → 任务记录页永远挂着一条「进行中」。
- * （用户实测 2026-09-30：打开 VS Code、没在 Copilot Chat 里输入，9F 就冒一条。）
+ * Only this syncer writes 9F's ledger (`copilot:` prefix + client=copilot-plugin), so those rows are its own
+ * to manage. The historical version asked listSessions with the shared PLUGIN_RE, which matches other
+ * products' plugin dirs (Tencent CodeBuddy's tencent-cloud.coding-copilot, Trae's coding-copilot) — sessions
+ * running on those floors were written as Copilot tasks whose title could only fall back to the placeholder
+ * "(Copilot 会话)". Worse, such rows **never finish**: completion depends on Copilot's own turns table, and
+ * another product's session simply is not in it → the task records page hangs on one "in progress" row
+ * forever. (Measured by the user on 2026-09-30: open VS Code, type nothing into Copilot Chat, and 9F pops one.)
  *
- * 分寸：**只删"能证明是别人的"行** —— 这个 session id 出现在别的产品的结构化落盘里
- * （sessions.js 的 nonCopilotSessionIds）。Copilot 自己的历史（哪怕早过了清单窗口、现在不在
- * sessions 里）一律不碰；没有归属证据的行也留着 —— 宁可留错，也不误删真记录。
+ * Restraint: **delete only rows proven to belong to someone else** — the session id appears in another
+ * product's structured on-disk state (nonCopilotSessionIds in sessions.js). Copilot's own history is never
+ * touched (even rows long past the listing window and absent from sessions now), and rows without ownership
+ * evidence are kept — better to keep a wrong row than to delete a real record.
  *
  * @param {any} repo
- * @param {Set<string>} copilotIds 本次清单里认得的所有 Copilot 会话 id
- * @returns {number} 收掉几条
+ * @param {Set<string>} copilotIds every Copilot session id recognized in this listing
+ * @returns {number} how many were retracted
  */
 function pruneForeignRunningRuns(repo, copilotIds) {
   const orphans = repo.liveTaskRunsOfClient
@@ -973,24 +1006,26 @@ function pruneForeignRunningRuns(repo, copilotIds) {
 }
 
 /**
- * 收工：把这一轮**没有会话**的 9F 成员状态落回「空闲」。
+ * Closing time: put 9F members with **no session** this round back to "idle".
  *
- * agent_status 是一行一成员、由这个同步器独占写（GitHub Copilot 没有 hook，也没有插件上报）。
- * 一旦会话消失（会话库清了 / 那条会话其实属于别的楼层被收掉 / Copilot 根本没在用），
- * 最后那次「思考中」就永远挂在库里 —— 卡片上就是**一直显示忙碌、却没有任务**
- * （用户 2026-09-30 实测：9F GitHub Copilot 一直忙碌，而它那条占位任务早被收掉了）。
- * 与 7F/8F 的同步器同一口径：非活跃时补一条 idle，让状态跟着会话走，不让旧值烂在那里。
+ * agent_status is one row per member, written exclusively by this syncer (GitHub Copilot has neither a hook
+ * nor plugin reporting). Once a session disappears (the session store was cleared / that session actually
+ * belonged to another floor and was retracted / Copilot is not in use at all), the last "thinking" stays in
+ * the db forever — the card then **shows busy forever with no task** (measured by the user on 2026-09-30:
+ * 9F GitHub Copilot stayed busy although its placeholder task had long been retracted).
+ * Same rule as 7F/8F's syncers: write an idle row when inactive so the state follows the session instead of
+ * rotting there.
  *
- * 分寸：
- *   · 只碰 client=CLIENT 的成员 —— 9F 这一层没有别的写入方，不会跟谁抢；
- *   · 这一轮已经按会话写过状态（`touched`）的一律不动，用户级真值优先；
- *   · 已经是 idle / offline 的不重复写；
- *   · 没有状态行的成员不管（不凭空造一条"空闲"出来）。
+ * Restraint:
+ *   · Only members with client=CLIENT — nothing else writes 9F at this layer, so there is no contention;
+ *   · Members already written from a session this round (`touched`) are never touched — user-level truth wins;
+ *   · Already idle / offline rows are not rewritten;
+ *   · Members with no status row are ignored (no inventing an "idle" out of thin air).
  *
  * @param {any} repo
  * @param {number} now
- * @param {Set<string>} touched 这一轮已经写过状态的成员 id
- * @returns {number} 落回了几条
+ * @param {Set<string>} touched member ids already written this round
+ * @returns {number} how many were settled
  */
 function settleIdleMembers(repo, now, touched) {
   let settled = 0;
@@ -1002,7 +1037,7 @@ function settleIdleMembers(repo, now, touched) {
       memberId: m.id,
       state: 'idle',
       stateSince: now,
-      // 顺手清掉悬空的 task_id：指向的那条任务可能已经不在了（误差来源于上面说的错行清理）
+      // Also clear the dangling task_id: the task it points at may be gone (a side effect of the cleanup above)
       taskId: null,
       progress: null,
       currentFiles: null,
@@ -1011,7 +1046,7 @@ function settleIdleMembers(repo, now, touched) {
       source: 'report',
       updatedAt: now,
     });
-    // upsertStatus 的 task_id 是 COALESCE（传 null 清不掉），悬空槽位要单独清
+    // upsertStatus' task_id is COALESCE (passing null cannot clear it), so the dangling slot needs its own clear
     repo.clearStatusTask.run(m.id);
     settled += 1;
   }
@@ -1021,43 +1056,50 @@ function settleIdleMembers(repo, now, touched) {
 function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   const now = nowFn();
   /*
-   * 会话清单必须锁在 **GitHub Copilot 自己的落盘** 上，不能吃 listSessions 的默认 PLUGIN_RE：
-   * 那串里含 `/^tencent/` 与 `/coding-copilot/i`，本机上会命中 Tencent CodeBuddy 的
-   * `tencent-cloud.coding-copilot` —— 别的楼层正在跑的会话就被当成 Copilot 会话写进 9F
-   * （用户实测：打开 VS Code 什么都没问，任务记录里就多一条「(Copilot 会话)」在飞行）。
-   * `copilot === true` 是第二道闸：只有 Copilot 自己 session-store.db 里读出来的才算。
+   * The session listing must be locked to **GitHub Copilot's own on-disk state**; it must not consume
+   * listSessions' default PLUGIN_RE: that list contains `/^tencent/` and `/coding-copilot/i`, which on this
+   * machine match Tencent CodeBuddy's `tencent-cloud.coding-copilot` — a session running on another floor
+   * would then be written into 9F as a Copilot session (measured by the user: open VS Code, ask nothing, and
+   * a "(Copilot 会话)" row appears in flight in the task records).
+   * `copilot === true` is the second gate: only rows read out of Copilot's own session-store.db count.
    */
-  // 走通用 listSessions 的 copilot 分支：它内部按 RE_GITHUB_COPILOT 锁 GitHub Copilot 自己的
-  // session-store.db，再把落盘读成带 `copilot: true` 的台账口径行（见 sessions.listSessions →
-  // readCopilotSessions）。sessions.js 只负责"通用 plugin 落盘"分发，不藏 copilot 兜底逻辑。
-  // 延迟 require：copilot.js 不抢在模块顶层反向依赖 sessions.js，避免加载期循环依赖。
-  // ws 不传（任务同步按全量会话对账，不依赖"当前工程"）：current 恒为 false，syncCopilotTasks 本来也不消费它。
+  // Go through the generic listSessions' copilot branch: internally it locks onto GitHub Copilot's own
+  // session-store.db with RE_GITHUB_COPILOT, then reads the disk into ledger-shaped rows carrying
+  // `copilot: true` (see sessions.listSessions → readCopilotSessions). sessions.js only dispatches "generic
+  // plugin on-disk state" and hides no copilot fallback logic.
+  // Deferred require: copilot.js must not depend back on sessions.js at module top level (load-time cycle).
+  // ws is not passed (task syncing reconciles the full session set and does not depend on "the current
+  // project"): current is always false and syncCopilotTasks never consumes it anyway.
   const sessions = (require('./sessions').listSessions({
     force: true,
     client: 'copilot',
     pluginRe: RE_GITHUB_COPILOT,
   }).sessions || []).filter((s) => s.copilot === true);
-  // 一条 Copilot 会话都没有时也要跑：上面那条错行正是在这种机器上冒出来的（只有别的产品的落盘）。
+  // Run even when there is not a single Copilot session: the misattributed row above appeared on exactly
+  // such a machine (only other products' on-disk state present).
   pruneForeignRunningRuns(repo, new Set(sessions.map((s) => String(s.id || '')).filter(Boolean)));
   if (!sessions.length) {
-    // 一条会话都没有 —— 也要把上一轮留下的「思考中」落回空闲，否则卡片一直显示忙碌
+    // Not one session — still settle the previous round's "thinking" back to idle, or the card stays busy
     settleIdleMembers(repo, now, new Set());
     return 0;
   }
 
-  // Copilot 的模型存在 VS Code 的 state.vscdb（chat.currentLanguageModel.editor），
-  // 不是 per-session 的 —— 全局一份，所有会话共用。取不到留空，不拿默认模型冒充。
-  // 经 module.exports 解析：测试把 copilotCurrentModel 换成熟桩（见 taskSync.test.js），行为不变。
+  // Copilot's model lives in VS Code's state.vscdb (chat.currentLanguageModel.editor), not per session —
+  // one global value shared by all sessions. Leave it empty when unavailable; do not fake a default model.
+  // Resolved through module.exports so tests can swap copilotCurrentModel for a stub (see taskSync.test.js)
+  // without changing behavior.
   const model = module.exports.copilotCurrentModel();
   let count = 0;
-  /** 这一轮按会话写过状态的成员（心跳只由 owner 写）—— 收工那一步要跳过他们 */
+  /** Members whose status was written from a session this round (only the owner writes heartbeats) — the
+   *  settle step must skip them */
   const statusWritten = new Set();
 
   /**
-   * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
-   * 同工程开了多条会话时，谁最后写谁赢 —— 结果是"正在跑的那条任务在 agent_status 里
-   * 找不到对应心跳"，任务列表按 query.js 的 CASE 把它算成「已取消」，运行中的任务就不显示了。
-   * 所以先选出这个工程该报的那条：活跃里最新的；都不活跃就报最新那条（卡片挂住最后一条任务）。
+   * One project writes **one** member status (agent_status' primary key is member_id). With several sessions
+   * open in the same project, whoever writes last wins — the result is "the task that is running has no
+   * matching heartbeat in agent_status", and the task list's CASE in query.js counts it as "cancelled", so
+   * running tasks disappear. So first pick the session this project should report: the newest among active
+   * ones; if none is active, report the newest one (the card hangs on the last task).
    */
   const activeByProject = new Map();
   const newestByProject = new Map();
@@ -1075,7 +1117,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     const projectName = s.project || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
     const projectId = projectName;
 
-    // 确保工程 & 成员存在（安静写入，不广播）
+    // Make sure the project & member exist (quiet write, no broadcast)
     bus.ensureProject(projectId, projectPath, null, 'report');
     const memberId = `copilot@${projectId}`;
     const existing = repo.getMember.get(memberId);
@@ -1094,11 +1136,13 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     });
 
     /*
-     * 台账口径：**每一轮用户任务一条**（和其它楼层一样），不是"一条会话一条"。
-     * 标题 = 那一轮用户说的话；起止 = 那一轮的起止（会话日志里能算准的轮就用准的，
-     * 算不出来（老轮，日志已滚出尾部）就用 Copilot 自己落这条 turn 的时刻，不编造）。
-     * 正在飞的那一轮同样先落一条 running —— Copilot 的库要等整轮写完才写 turns 行，
-     * 只等它的话，用户跑任务时列表里会一直没有"运行中"这条。
+     * Ledger rule: **one row per turn of user work** (same as other floors), not "one row per session".
+     * Title = what the user said in that turn; start/end = that turn's start/end (use the accurate values
+     * when the session log can compute them; for old turns already scrolled out of the log tail use the
+     * moment Copilot itself landed that turn — never invent).
+     * The in-flight turn also lands a running row first — Copilot's store writes turns rows only after the
+     * whole turn finishes, so waiting for it alone means the list never shows a "running" row while the
+     * user is running a task.
      */
     const isActive = isSessionActive(s, now);
     const turns = Array.isArray(s.copilotTurns) ? s.copilotTurns : [];
@@ -1106,11 +1150,12 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       (Array.isArray(s.liveChanged) ? s.liveChanged : []).map((c) => [Number(c.index), c.files || []])
     );
     /**
-     * 这一条记录该挂哪些文件：**只认会话日志里"写"工具碰过的**（copilot_replaceString /
-     * copilot_multiReplaceString …），read_file / findTextInFiles 不算改动。
-     * 为什么不用 session_files 那张表：实测它整张表都是 read_file（Copilot 只记"读过"），
-     * 拿它当改动文件，用户没让它改文件也会报出几十个（用户实测抓出来的就是这个）。
-     * 日志窗口已经滚出去的轮就留空，不拿"读过的文件"顶替。
+     * Which files this record should carry: **only those touched by "write" tools in the session log**
+     * (copilot_replaceString / copilot_multiReplaceString …); read_file / findTextInFiles are not changes.
+     * Why not the session_files table: measured, that whole table is read_file (Copilot only records "read"),
+     * so using it as changed files reports dozens of files even when the user asked for no edits (exactly
+     * what the user caught in practice). Turns already scrolled out of the log window stay empty — never
+     * substitute "files that were read".
      */
     const filesFor = (idx) => {
       const own = changedByIndex.get(idx) || [];
@@ -1119,7 +1164,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
           const p = String(abs || '');
           if (!p || !projectPath) return p;
           const r = path.relative(projectPath, p);
-          return r && !r.startsWith('..') ? r : ''; // 工程外的文件不进这一栏
+          return r && !r.startsWith('..') ? r : ''; // Files outside the project do not enter this column
         })
         .filter(Boolean);
       return rel.length ? [...new Set(rel)] : null;
@@ -1131,16 +1176,17 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     let hbId = '';
     let hbFilesJson = null;
 
-    // ① 每一轮已收工的：一条记录（标题就是那一轮用户原话）
+    // ① Every finished turn: one record (the title is that turn's exact user text)
     for (const t of turns) {
       const id = `${TASK_ID_PREFIX}${s.id}:${t.index}`;
       const title = t.userMessage || s.doneTitle || s.prompt || '(Copilot 会话)';
       const known = liveReqByIndex.get(t.index);
       const startedAt = (known && known.startedAt) || t.at || s.lastUpdated || now;
       const endedAt = (known && known.endedAt) || t.at || startedAt;
-      // 先说"不知道起点"、后来从会话日志里算准了 → 把这条派生记录重建一次。
-      // 不然 tasks.started_at 会被 insertTask 的 COALESCE 留住旧值，而 duration 按新值算，
-      // 出现"started_at 比 ended_at 还晚"的怪值（实测 17:17:45 → 17:17:44）。
+      // If we first said "start unknown" and later computed it exactly from the session log → rebuild this
+      // derived record once. Otherwise insertTask's COALESCE keeps the old tasks.started_at while duration
+      // is computed from the new value, producing the odd "started_at later than ended_at" (measured
+      // 17:17:45 → 17:17:44).
       const prev = repo.getTask.get(id);
       if (prev && known && known.startedAt && prev.started_at !== startedAt) repo.deleteTaskRun(id);
       hbFilesJson = writeTurnRun(repo, {
@@ -1158,11 +1204,13 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
-    // ② 正在飞的那一轮：一条 running（用户原话来自 VS Code 会话日志 —— Copilot 的库此时还没有）
+    // ② The in-flight turn: one running row (the user's text comes from the VS Code session log — Copilot's
+    //    store does not have it yet)
     let runningId = '';
     if (isActive) {
-      // 轮序号 = 会话日志里的那一轮；日志还没写全时按"上一轮 + 1"兜底。
-      // 一定要大于已收工的最大轮序号 —— 否则会把上一轮那条 done 记录改回 running。
+      // Turn index = the one from the session log; before the log is complete fall back to "last turn + 1".
+      // It must be greater than the largest finished turn index — otherwise the previous turn's done record
+      // gets flipped back to running.
       const lastDone = turns.length ? turns[turns.length - 1].index : -1;
       const logIdx = Number.isFinite(Number(s.liveIndex)) && s.liveIndex != null ? Number(s.liveIndex) : -1;
       const idx = Math.max(logIdx, lastDone + 1);
@@ -1183,15 +1231,16 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
-    // ③ 收掉过渡期那条"一条会话一条"的旧记录（id 不带轮序号；只删自己前缀的）
+    // ③ Retract the transitional "one row per session" legacy record (id without a turn index; own prefix only)
     const legacyId = `${TASK_ID_PREFIX}${s.id}`;
     if (repo.getTaskRun.get(legacyId)) repo.deleteTaskRun(legacyId);
 
-    // 心跳：活跃 → thinking，停下 → idle。
-    // **不活跃时也必须写**：只写 thinking 的话，会话停下来之后这条 agent_status 就一直
-    // 挂在库里，成员卡永远显示「思考中」（实测 9F 就是这个症状：会话早停了，工位上还在思考中）。
-    // 如实回落成 idle，而不是让旧值烂在那里。
-    // 心跳只由这个工程选中的那条会话写（见上面 activeByProject 的说明）
+    // Heartbeat: active → thinking, stopped → idle.
+    // **It must be written when inactive too**: writing only thinking leaves this agent_status row hanging in
+    // the db once the session stops, and the member card shows "thinking" forever (exactly 9F's symptom: the
+    // session stopped long ago, the station still shows thinking). Fall back to idle honestly instead of
+    // letting the old value rot.
+    // Only the session selected for this project writes the heartbeat (see activeByProject above)
     const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
     if (owner === s && hbId) {
       repo.upsertStatus.run({
@@ -1218,17 +1267,18 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     });
   }
 
-  // 收工：这一轮没轮到写状态的成员（工程里连会话都没有）同样落回空闲 —— 别让「思考中」烂在库里
+  // Closing time: members that did not get a status write this round (no session at all in the project) also
+  // go back to idle — do not let "thinking" rot in the db
   settleIdleMembers(repo, now, statusWritten);
 
   return count;
 }
 
-/* ── 统一接口别名 + 导出（用 mutation，保证 sessions.js 循环加载时拿到的 C 引用稳定）── */
+/* ── Unified contract aliases + exports (via mutation, so the C reference held while sessions.js cycles stays stable) ── */
 module.exports.id = '9F';
 module.exports.client = 'copilot';
 module.exports.RE_GITHUB_COPILOT = RE_GITHUB_COPILOT;
-// 产品探测元数据（原 products.js 的 9F 条目）：9F 只有插件这一形态。
+// Product detection metadata (the old products.js 9F entry): 9F has only the plugin form.
 const meta = {
   id: '9F',
   name: 'GitHub Copilot',
@@ -1237,19 +1287,20 @@ const meta = {
   agent: 'copilot',
   plugin: true,
   pluginRe: RE_GITHUB_COPILOT,
-  // 这一层的插件存储根标记：同前缀的 `github.copilot`（基础扩展）里没有会话库，用 session-store.db 把它挡掉
+  // This floor's plugin storage root marker: the same-prefixed `github.copilot` (base extension) has no
+  // session store, so session-store.db filters it out
   pluginStorageMarks: ['session-store.db'],
-  // 仅展示 GitHub Copilot VS Code 插件这一层（无独立 CLI 形态）。
+  // Show only the GitHub Copilot VS Code plugin layer (no standalone CLI form).
   sources: ['plugin'],
   dataKind: 'copilot',
-  // 落盘探测（findDataPath 用）：插件形态在 VS Code 的 globalStorage 下找
+  // On-disk detection (used by findDataPath): the plugin form lives under VS Code's globalStorage
   matchRe: RE_GITHUB_COPILOT,
   homeDirs: [path.join(HOME, '.config', 'Code', 'User', 'globalStorage')],
 };
 module.exports.meta = meta;
 /**
- * 9F 的静态 subagent 定义目录。GitHub Copilot 没有"用户级 / 项目级 agent 定义文件"这套机制
- * （它的 globalStorage 不是 agent 定义目录），这里返回 []，不扫盘。
+ * 9F's static subagent definition dirs. GitHub Copilot has no "user-level / project-level agent definition
+ * file" mechanism (its globalStorage is not an agent definition dir), so this returns [] and scans nothing.
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
 module.exports.agentDirs = function agentDirs() {
@@ -1262,7 +1313,7 @@ module.exports.pollMs = SYNC_INTERVAL_MS;
 module.exports.readPhase = readCopilotPhaseFromSqlite;
 module.exports.readDone = readCopilotDone;
 module.exports.modelOf = copilotCurrentModel;
-/* 读取函数（原 sessions.js） */
+/* Readers (from the old sessions.js) */
 module.exports.readCopilotTurns = readCopilotTurns;
 module.exports.readCopilotFiles = readCopilotFiles;
 module.exports.readCopilotChatIndex = readCopilotChatIndex;
@@ -1273,7 +1324,7 @@ module.exports.nonCopilotSessionIds = nonCopilotSessionIds;
 module.exports.copilotChatLogPath = copilotChatLogPath;
 module.exports.readCopilotLiveRequest = readCopilotLiveRequest;
 module.exports.readCopilotPhaseFromSqlite = readCopilotPhaseFromSqlite;
-/* 读取函数（原 sessions.js）+ 9F 专属 SQLite 会话装配 */
+/* Readers (from the old sessions.js) + 9F-only SQLite session assembly */
 module.exports.readSqliteSessionRows = readSqliteSessionRows;
 module.exports.readCopilotSessions = readCopilotSessions;
 module.exports.copilotCurrentModel = copilotCurrentModel;

@@ -27,13 +27,13 @@ const { fnv1a32, isPluginClient } = require('@workgremlin/shared');
 const { hooksDir, statePath } = require('@workgremlin/shared/paths');
 const { isFile } = require('../roots');
 
-/* ============================== 常量（与 hook.js 对齐） ============================== */
+/* ============================== constants (kept in sync with hook.js) ============================== */
 const RESULT_MAX = 4_000;
 const MSG_MAX = 8_000;
 const MAX_REPLIES = 50;
 const PENDING_SPAWN_MS = 2 * 60_000;
-// CodeBuddy 专属常量（CB_REQ_GRACE_MS / CB_FLUSH_WAIT_MS / CB_FLUSH_STEP_MS）已移到 floorCodebuddy.js
-// —— 这三家只被 CodeBuddy 楼层消费，不再污染框架层
+// CodeBuddy-specific constants (CB_REQ_GRACE_MS / CB_FLUSH_WAIT_MS / CB_FLUSH_STEP_MS) have moved to floorCodebuddy.js
+// -- they are consumed only by the CodeBuddy floor, and no longer pollute the framework layer
 
 const PROBE_TOOLS = new Set([
   'Edit', 'MultiEdit', 'NotebookEdit', 'Write', 'Delete',
@@ -47,9 +47,9 @@ function isSubagentTool(tool) {
   return /^(task|agent|spawn_agent|collaborationspawn_agent)$/i.test(String(tool || '').trim());
 }
 
-/* ============================== 产品无关：文件 / 进度 ============================== */
+/* ============================== product-agnostic: files / progress ============================== */
 
-/** 工具输入里的目标文件（CodeBuddy: file_path/filePath；Codex: apply_patch 的 patch 文本） */
+/** The target file in the tool input (CodeBuddy: file_path/filePath; Codex: the patch text of apply_patch) */
 function filesOf(input, tool) {
   if (typeof input === 'string') input = { command: input };
   if (!input || typeof input !== 'object') return [];
@@ -82,7 +82,7 @@ function patchPaths(text) {
   return out;
 }
 
-/** apply_patch 结果里的权威清单：`Success. Updated the following files:` 之后的 `M/A/D <路径>` */
+/** The authoritative list in the apply_patch result: the `M/A/D <path>` lines after `Success. Updated the following files:` */
 function patchOutputFiles(text) {
   const src = String(text || '');
   const i = src.indexOf('Success. Updated the following files');
@@ -99,7 +99,7 @@ function patchOutputFiles(text) {
   return out;
 }
 
-/** 从 Codex 的 rollout transcript 读本轮真正改过的文件（apply_patch 权威清单） */
+/** Read the files actually changed this round from Codex's rollout transcript (the apply_patch authoritative list) */
 function transcriptRoundFiles(transcriptPath, sinceTs) {
   if (!transcriptPath || typeof transcriptPath !== 'string' || !(Number(sinceTs) > 0)) return [];
   let lines;
@@ -135,7 +135,7 @@ function opOf(tool) {
   return /^(Edit|MultiEdit|NotebookEdit|replace_in_file)$/.test(t) ? 'edit' : 'write';
 }
 
-/** 从 TodoWrite 类工具的入参里抽"任务进度"（已完成 / 总量） */
+/** Extract "task progress" (completed / total) from the input of TodoWrite-like tools */
 function todoProgress(tool, input) {
   if (!input || typeof input !== 'object') return null;
   if (!/todo/i.test(String(tool || ''))) return null;
@@ -150,7 +150,7 @@ function todoProgress(tool, input) {
   return Math.min(1, done / arr.length);
 }
 
-/** 工程内记相对路径，工程外记绝对路径 */
+/** Record a relative path inside the project, an absolute path outside it */
 function relFile(file, cwd) {
   if (!file) return '';
   const abs = path.resolve(file);
@@ -158,7 +158,7 @@ function relFile(file, cwd) {
   return abs;
 }
 
-/** 用户原话：剥掉 IDE 插件注入的那段上下文 */
+/** The user's own words: strip out the context injected by the IDE plugin */
 function userRequestText(raw) {
   const text = String(raw || '')
     .replace(/\r\n?/g, '\n')
@@ -174,7 +174,7 @@ function userRequestText(raw) {
   return parts.length > 1 ? parts.slice(1).join('\n').trim() : '';
 }
 
-/** 兜底：按文件 mtime 扫出这一轮碰过的文件（agent 用 shell 改文件时前两手都瞎） */
+/** Fallback: scan by file mtime for the files touched this round (the first two approaches are blind when the agent changes files via shell) */
 function touchedSince(ws, sinceTs) {
   if (!ws || !(Number(sinceTs) > 0)) return [];
   const git = (args) =>
@@ -200,14 +200,14 @@ function touchedSince(ws, sinceTs) {
     try {
       if (fs.statSync(path.resolve(ws, rel)).mtimeMs >= Number(sinceTs) - 2000) out.push({ path: rel, op });
     } catch {
-      /* 已删除 / 读不到 */
+      /* deleted / unreadable */
     }
     if (out.length >= 200) break;
   }
   return out;
 }
 
-/** 本轮（startedAt 之后）改过的文件：三路合并（PostToolUse 记录 + transcript patch + mtime 扫描），按绝对路径去重 + 补体积 */
+/** Files changed this round (after startedAt): three-way merge (PostToolUse records + transcript patch + mtime scan), deduplicated by absolute path + sizes filled in */
 function collectRoundFiles(st, ev, cwd, startedAt, workspacePath) {
   const roundFiles = ((st && st.roundFiles) || []).filter((x) => x && (typeof x === 'string' ? x : x.path));
   const baseDir = cwd || workspacePath;
@@ -243,7 +243,7 @@ function collectRoundFiles(st, ev, cwd, startedAt, workspacePath) {
             break;
           }
         } catch {
-          /* 试下一个候选 */
+          /* try the next candidate */
         }
       }
     }
@@ -258,7 +258,7 @@ function stopReasonCancelled(ev) {
   return r === 'cancelled' || r === 'canceled' || r === 'interrupted' || r === 'aborted';
 }
 
-/* ============================== 回复去重键 ============================== */
+/* ============================== reply dedupe key ============================== */
 
 function replyKeyOf(reply) {
   const id = String((reply && reply.id) || '').trim();
@@ -270,9 +270,9 @@ function aiDedupeKey(floor, sessionId, msgId) {
   return `ai:${floor}:${String(sessionId || 'nosession')}:${String(msgId || 'noid')}`;
 }
 
-/* ============================== 回复解析（产品无关：jsonl / codebuddy index.json） ============================== */
+/* ============================== Reply parsing (product-agnostic: jsonl / codebuddy index.json) ============================== */
 
-/** 从内容块里抽人类可读文本（兼容 string / [{type,text}] / {text}，跳过 tool_use/tool_result/thinking） */
+/** Extract human-readable text from content blocks (handles string / [{type,text}] / {text}, skipping tool_use/tool_result/thinking) */
 function extractText(content) {
   if (content == null) return '';
   if (typeof content === 'string') return content.trim();
@@ -293,7 +293,7 @@ function extractText(content) {
   return '';
 }
 
-/** 一条 transcript 记录里的"消息体"，统一成 {role, content, id}（兼容 Codex payload / 通用 message / 顶层） */
+/** The "message body" in a transcript record, normalized to {role, content, id} (handles Codex payload / generic message / top level) */
 function msgOf(obj) {
   if (!obj || typeof obj !== 'object') return null;
   const p = obj.payload;
@@ -310,7 +310,7 @@ function msgOf(obj) {
 
 const INTERRUPT_HINT_RE = /turn_aborted|Request interrupted by user/i;
 
-/** 一行 JSONL 是不是"用户打断了这一轮"的结构化事件（Codex turn_aborted / Claude·Qoder 的 user 标记） */
+/** Whether a JSONL line is a structured "the user interrupted this round" event (Codex turn_aborted / Claude·Qoder's user marker) */
 function isInterruptLine(o) {
   if (!o || typeof o !== 'object') return false;
   const p = o.payload;
@@ -326,7 +326,7 @@ function isInterruptLine(o) {
   return false;
 }
 
-/** 最后一条 user 之后的 assistant 消息 */
+/** Assistant messages after the last user message */
 function sinceLastUser(items) {
   let start = 0;
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -338,7 +338,7 @@ function sinceLastUser(items) {
   return items.slice(start).filter((x) => x.role === 'assistant' && x.text);
 }
 
-/** 通用 / Claude Code / Codex rollout 的 JSONL：逐行一个 JSON */
+/** JSONL of generic / Claude Code / Codex rollouts: one JSON per line */
 function jsonlReplies(file) {
   if (!file || typeof file !== 'string' || !isFile(file)) return [];
   let lines;
@@ -357,7 +357,7 @@ function jsonlReplies(file) {
     } catch {
       continue;
     }
-    if (isInterruptLine(obj)) continue; // 打断标记的 user 行不算"新一轮用户提问"边界
+    if (isInterruptLine(obj)) continue; // a user line marked as an interrupt doesn't count as a "new round of user questions" boundary
     const m = msgOf(obj);
     if (!m) continue;
     items.push({ role: String(m.role), id: m.id, text: extractText(m.content) });
@@ -366,10 +366,10 @@ function jsonlReplies(file) {
 }
 
 /**
- * IDE 插件形态的会话正文解析（index.json 格式）—— 被 CodeBuddy / Qoder / WorkBuddy 三家共用。
- * 格式：索引 history/<sessionId>/index.json（缩进多行 JSON，非 JSONL），正文在同目录
- * messages/<id>.json（{role, message:"<JSON 字符串>"}）。一轮回复在索引里被切成若干 assistant
- * 分片，按最后一个请求把分片拼成一条，去重键用请求 id。
+ * Conversation body parsing for the IDE plugin form (the index.json format) -- shared by CodeBuddy / Qoder / WorkBuddy.
+ * Format: the index history/<sessionId>/index.json (indented multi-line JSON, not JSONL), with bodies in messages/<id>.json
+ * ({role, message:"<JSON string>"}) in the same directory. One round of replies is split into several assistant
+ * fragments in the index; the fragments are joined into one by the last request, with the dedupe key using the request id.
  */
 function indexJsonReplies(indexPath) {
   const dir = path.dirname(indexPath);
@@ -403,11 +403,11 @@ function indexJsonReplies(indexPath) {
     const text = parts.join('\n\n').trim();
     if (text) return [{ id: String(req.id || req.startedAt || 'last'), text }];
   }
-  // 没有 requests 索引（老版本）：退回"最后一条 user 之后的 assistant 分片各算一条"
+  // No requests index (old version): fall back to "each assistant fragment after the last user message counts as one"
   return sinceLastUser(msgs.map((m) => ({ role: String((m && m.role) || ''), id: String((m && m.id) || ''), text: m && m.id ? read(m.id) : '' })));
 }
 
-/** 读会话落盘头部若干行（形态判定用，只读窗口不读全文件） */
+/** Read the first few lines of the session's on-disk file (for form detection, reads only a window, not the whole file) */
 function headJsonLines(file, maxLines = 20) {
   if (!file || typeof file !== 'string') return [];
   let head = '';
@@ -433,7 +433,7 @@ function headJsonLines(file, maxLines = 20) {
   return out;
 }
 
-/** 这一轮有没有被用户打断的痕迹（给"没有显式 Interrupt 事件"的产品用）：Codex turn_aborted / Claude·Qoder 的 user 标记 */
+/** Whether this round shows traces of being interrupted by the user (for products with "no explicit Interrupt event"): Codex turn_aborted / Claude·Qoder's user marker */
 function turnInterrupted(transcriptPath, startedAt) {
   if (!transcriptPath || typeof transcriptPath !== 'string') return false;
   let raw = '';
@@ -459,7 +459,7 @@ function turnInterrupted(transcriptPath, startedAt) {
   return false;
 }
 
-/* ============================== token 读取（搬 usage.js，产品无关） ============================== */
+/* ============================== token reading (moved from usage.js, product-agnostic) ============================== */
 
 function num(v) {
   const n = Number(v);
@@ -488,7 +488,7 @@ function parseLines(file) {
       const o = JSON.parse(s);
       if (o && typeof o === 'object') out.push(o);
     } catch {
-      /* 半截行 */
+      /* half a line */
     }
   }
   return out;
@@ -587,14 +587,14 @@ function tokenFinish(t) {
 }
 
 /**
- * 一轮任务消耗的 token —— **纯 JSONL 格式**解析框架层原语。
+ * The tokens a round of tasks consumed -- the framework-layer primitive for parsing the **pure JSONL format**.
  *
- * 这是"框架能看懂的格式"：Codex rollout jsonl（event_msg/token_count）、Claude Code transcript
- * （message.usage / providerData.rawUsage）。楼层有更特殊的格式（如 IDE 插件 index.json、
- * OTel trace jsonl）时，由楼层自己的 readTokensOf 覆盖来处理——框架层不管格式种类。
+ * These are the "formats the framework understands": Codex rollout jsonl (event_msg/token_count), Claude Code transcript
+ * (message.usage / providerData.rawUsage). When a floor has a more exotic format (such as the IDE plugin's index.json,
+ * or OTel trace jsonl), the floor's own readTokensOf override handles it -- the framework layer doesn't care about format variety.
  *
- * 返回 `{input, output, cacheRead, cacheWrite} | null` —— 取不到或四项全零都回 null。
- * 楼层 readTokensOf 也是同一套口径，服务端 bus.endTask / backfillTaskTokens 统一吃这个形状。
+ * Returns `{input, output, cacheRead, cacheWrite} | null` -- null when unavailable or when all four are zero.
+ * A floor's readTokensOf follows the same rule, and the server-side bus.endTask / backfillTaskTokens consume this shape uniformly.
  */
 function readTokens(jsonlPath, startedAt) {
   const file = String(jsonlPath || '');
@@ -605,7 +605,7 @@ function readTokens(jsonlPath, startedAt) {
   return tokenFinish(t);
 }
 
-/* ============================== 子代理 key 合成 ============================== */
+/* ============================== subagent key composition ============================== */
 
 function agentName(input) {
   if (!input || typeof input !== 'object') return 'subagent';
@@ -707,7 +707,7 @@ function sweepGhosts(bus, project, client, opts = {}, session = '', sessionState
   return n;
 }
 
-/* ============================== 回复入库（替代 reportAiReplies） ============================== */
+/* ============================== reply storage (replaces reportAiReplies) ============================== */
 async function reportReplies(ctx, memberId, taskId, replies, sessionId, floor) {
   const { bus, project, workspacePath } = ctx;
   if (!Array.isArray(replies) || !replies.length) return;
@@ -737,13 +737,13 @@ async function reportReplies(ctx, memberId, taskId, replies, sessionId, floor) {
   );
 }
 
-/* ============================== 形态（cli / plugin）判定 ============================== */
+/* ============================== form (cli / plugin) detection ============================== */
 
 /**
- * 由事件自报的 form 字段取出**形态**（form）。form 仅两种语义：plugin / 非plugin（cli）。
- * 是否 plugin 由 `isPluginClient` 唯一判定（当前只认 vscode，未来可扩展 jetbrains/cursor…）；
- * plugin 形态原样保留用于落盘区分，其它一律视作 'cli'（非 plugin）；空返回 null。
- * agent（ev.agent）直接代表楼层，form 只描述形态 —— 与 hook event 的语义一致。
+ * Take the **form** from the form field the event self-reports. form has only two semantics: plugin / non-plugin (cli).
+ * Whether it is a plugin is decided solely by `isPluginClient` (currently only vscode, extendable to jetbrains/cursor... in future);
+ * the plugin form is kept as is for on-disk distinction, everything else is treated as 'cli' (non-plugin); empty returns null.
+ * agent (ev.agent) directly represents the floor, and form only describes the form -- consistent with the hook event's semantics.
  */
 function fixedFormOf(ev) {
   const c = String((ev && ev.client) || '').toLowerCase();
@@ -751,13 +751,13 @@ function fixedFormOf(ev) {
   return isPluginClient(c) ? c : 'cli';
 }
 
-/* ============================== 通用事件开关（忠实搬运 hook.js main） ============================== */
+/* ============================== generic event switch (faithfully ported from hook.js main) ============================== */
 
 /**
- * 处理一次 hook 事件。产品差异通过 `impl` 注入；其余（文件/进度/token/ghost/事件开关）都在本模块。
- * @param {object} ev 原始 hook 事件
+ * Handle one hook event. Product differences are injected via `impl`; everything else (files/progress/token/ghost/event switch) lives in this module.
+ * @param {object} ev the raw hook event
  * @param {{project:string, workspacePath:string, bus:any, sessionGet:Function, sessionSet:Function}} ctx
- * @param {object} impl 产品差异
+ * @param {object} impl product differences
  */
 
 /**
@@ -774,11 +774,11 @@ function fixedFormOf(ev) {
  */
 
 /**
- * 公有默认 hook 行为：楼层模块没自己提供的接口就回退到这份（见各 floorXXX.js 的 handleHookEvent）。
- * 各楼层用 `{ ...sharedHookImpl, ...本楼层覆盖 }` 组装 impl，没覆盖的字段自动用公有默认。
+ * The public default hook behavior: floor modules fall back to this for any interface they don't provide themselves (see each floorXXX.js's handleHookEvent).
+ * Each floor assembles impl with `{ ...sharedHookImpl, ...this floor's overrides }`, so uncovered fields automatically use the public default.
  *
- * 新增 `transcriptPathOf` 和 `readTokensOf` 让楼层把产品专属的 transcript 路径推导 / 格式解析
- * 下沉到自己的文件里——框架层只做事件分发和状态管理，不硬编码 CodeBuddy/Claude/Codex 的路径。
+ * The new `transcriptPathOf` and `readTokensOf` let floors push product-specific transcript path derivation / format parsing
+ * down into their own files -- the framework layer only does event dispatch and state management, and doesn't hardcode CodeBuddy/Claude/Codex paths.
  */
 const sharedHookImpl = {
   coarse: false,
@@ -790,15 +790,15 @@ const sharedHookImpl = {
   interruptedSince: (tp, since, sessionId) => turnInterrupted(tp, since),
   formOf: () => '',
   /**
-   * 这一轮的 transcript 路径。默认：事件 payload 里有就用，没有就空着。
-   * CodeBuddy 覆盖：hook 事件经常不带 transcript_path（Plugin 和部分 CLI 形态），
-   * 需要从 sessionId + workspacePath 反推两个候选位置（见 floorCodebuddy.js）。
+   * This round's transcript path. Default: use it if the event payload has it, empty otherwise.
+   * CodeBuddy override: hook events often carry no transcript_path (the Plugin form and some CLI forms),
+   * so two candidate locations have to be reverse-derived from sessionId + workspacePath (see floorCodebuddy.js).
    */
   transcriptPathOf: (ev, st, sessionId, workspacePath) => String((ev && ev.transcript_path) || ''),
   /**
-   * 这一轮的 token 读取。默认：纯 JSONL 格式（Codex rollout / Claude transcript）。
-   * CodeBuddy 覆盖：三路分发（index.json 走 codebuddyRequestTokens、
-   * trace OTel span 走 codebuddyTraceTokens、projects jsonl 走 requestSum）。
+   * This round's token reading. Default: the pure JSONL format (Codex rollout / Claude transcript).
+   * CodeBuddy override: three-way dispatch (index.json via codebuddyRequestTokens,
+   * OTel span traces via codebuddyTraceTokens, projects jsonl via requestSum).
    */
   readTokensOf: (tp, startedAt) => readTokens(tp, startedAt),
 };
@@ -812,35 +812,35 @@ async function runHookEvent(ev, ctx, floorImpl) {
   const memberId = String(ev.agent);
   const client = String(ev.agent || '').trim().toLowerCase();
   let sessionId = String(ev.session_id || '');
-  // sessionId 格式校验：只挡明确的脏数据（ghost- 前缀的测试伪造）
-  // 不再限制 hex/UUID 格式——测试用的 session ID（cancel-a 等）和各产品
-  // 的 session ID 格式各异（UUID、16hex、24hex、短横线串等），过窄的格式
-  // 校验会误杀合法 session ID，导致状态文件不写 → 相位和任务全断。
+  // sessionId format validation: only blocks clearly dirty data (ghost- prefixed test forgeries)
+  // No longer restricts to hex/UUID formats -- test session IDs (cancel-a etc.) and each product's
+  // session ID formats vary widely (UUID, 16hex, 24hex, dashed strings, etc.), and an overly narrow format
+  // check would kill legitimate session IDs, causing the state file to go unwritten -> phase and tasks all break.
   if (sessionId && /^ghost-/i.test(sessionId)) {
     log.error('[hookCommon] ignoring ghost- session_id:', sessionId);
     sessionId = '';
   }
   const cwd = String(ev.cwd || '');
-  // client = 楼层产品基名，与 memberId 基名一致；floor 直接用它代表楼层，
-  // 和 registerMember 契约（client 即楼层）统一，避免 client / floor 两处各算各的、
-  // 写相位文件时 client 字段跟楼层过滤对不上（见 readReporterPhase 的 clientHit）。
+  // client = the floor's product base name, consistent with memberId's base name; floor uses it directly to represent the floor,
+  // unified with registerMember's contract (client is the floor), avoiding client / floor being computed separately in two places,
+  // and the client field not matching floor filters when writing the phase file (see readReporterPhase's clientHit).
   const get = () => sessionGet(sessionId) || {};
-  // 稳定的工程路径 / 工程 id：每事件的 cwd 会漂移（如 Bash 在 home 下执行、命令里才 cd 进工程），
-  // 直接用它推 project 会把同一会话推成某个非工程路径 → requireMember 解析成 "<产品基名>@home"，
-  // 匹配不到 "<产品基名>@<工程路径>" → bus.toolUse / status 整段跳过（工具计数全空、状态不更新）。
-  // 优先取本轮任务落下来的工程目录（UserPromptSubmit 时就是工程目录），没有再退回本次事件的 workspacePath。
+  // A stable project path / project id: each event's cwd drifts (e.g. Bash runs under home and only cd's into the project inside the command),
+  // so using it directly to derive project would push the same session onto some non-project path -> requireMember resolves to "<product base name>@home",
+  // which doesn't match "<product base name>@<project path>" -> bus.toolUse / status are skipped entirely (tool counts all empty, state not updated).
+  // Prefer the project directory left by this round's task (that's the project directory at UserPromptSubmit), falling back to this event's workspacePath.
   const stableWs = get().taskWorkspacePath || workspacePath;
   const stableProject = bus.projectForReport('', stableWs) || project;
   const base = { project: stableProject, workspacePath: stableWs, memberId, sessionId };
-  // 内存 Map（dispatcher）与落盘状态文件双写：前者是服务端单一真源，后者供 /reporter-phase、
-  // listSessions(current/fresh) 读取实时相位。只写内存会丢掉 hook 型楼层的实时相位（见上方注释）。
+  // Dual-write to the in-memory Map (dispatcher) and the on-disk state file: the former is the server's single source of truth, the latter is for /reporter-phase,
+  // listSessions(current/fresh) to read the real-time phase. Writing only to memory would lose the real-time phase of hook-type floors (see the comment above).
   const set = (patch) => {
     sessionSet(sessionId, patch);
-    // 相位文件的 workspacePath 必须用「工程路径」，不能用工具运行时的 cwd：cwd 随每条命令漂移
-    // （如 Bash 在 home 下执行、命令里才 cd 进工程），会既把同一会话的相位按 cwd 拆成多份文件，
-    // 又让前端 consoleBase 的 sameWs 比对失败 → 主控制台收不到实时「调用工具」相位（回落陈旧快照）。
-    // 工程路径优先取本轮任务的 taskWorkspacePath（UserPromptSubmit 落下的就是工程目录），
-    // 没有时退回本次事件的 workspacePath。
+    // The phase file's workspacePath must use the "project path", not the cwd the tool ran in: cwd drifts with every command
+    // (e.g. Bash runs under home and only cd's into the project inside the command), which both splits the same session's phase
+    // into multiple files by cwd, and makes the frontend consoleBase's sameWs comparison fail -> the main console stops receiving
+    // the real-time "calling tool" phase (falling back to a stale snapshot). The project path prefers this round's taskWorkspacePath
+    // (the one left at UserPromptSubmit is the project directory), falling back to this event's workspacePath.
     const effWs = get().taskWorkspacePath || workspacePath;
     if (!client || !sessionId) return;
     try {
@@ -856,19 +856,19 @@ async function runHookEvent(ev, ctx, floorImpl) {
             ...patch,
             hb: { pid: process.pid, lastEventAt: Date.now() },
           };
-          // 相位里的 workspacePath 也一并归一到工程路径（否则 sameWs 比对不过）
+          // Normalize the workspacePath inside the phase to the project path as well (otherwise sameWs comparison fails)
           if (next.sessionPhase) next.sessionPhase.workspacePath = effWs;
           return next;
         },
         { fallback: {} }
       );
     } catch {
-      /* 落盘失败不影响 agent 主流程 */
+      /* a failure to write to disk doesn't affect the agent's main flow */
     }
-    // 重启恢复：updateJson 是异步带锁的，上面的 updater 在本函数 return 前还没执行，
-    // 不能靠它回传 next。服务重启会清空 dispatcher 的内存态 sessions Map，而磁盘相位文件
-    // 保留了 taskId —— 同步读盘把 taskId 回灌进内存，否则接下来 bus.toolUse 因 get().taskId
-    // 为空而整段跳过 → 任务详情「各工具调用次数」全空。
+    // Restart recovery: updateJson is async and lock-based, so the updater above hasn't run before this function returns,
+    // and we can't rely on it to pass back next. A server restart clears the dispatcher's in-memory sessions Map, while the on-disk phase file
+    // retains taskId -- read it synchronously and feed taskId back into memory, otherwise the next bus.toolUse gets skipped entirely
+    // because get().taskId is empty -> "calls per tool" in the task details all empty.
     try {
       const onDisk = JSON.parse(fs.readFileSync(statePath(client, effWs, sessionId), 'utf8') || '{}');
       if (onDisk && onDisk.taskId && !get().taskId) {
@@ -880,28 +880,28 @@ async function runHookEvent(ev, ctx, floorImpl) {
         });
       }
     } catch {
-      /* 读不到盘就跳过回灌 */
+      /* skip the backfill when the disk can't be read */
     }
   };
 
-  // 缓存 transcript 路径（后续事件从会话状态里取，hook 原逻辑见 SessionStart 那段）
+  // Cache the transcript path (later events take it from the session state; for the hook's original logic see the SessionStart section)
   if (ev.transcript_path) set({ transcriptPath: String(ev.transcript_path) });
-  // tp() 走 impl.transcriptPathOf：默认只认事件 payload；楼层可覆盖来推导路径
-  // （部分产品的 hook 事件不带 transcript_path，需要从 sessionId+workspacePath 反推）。
+  // tp() goes through impl.transcriptPathOf: by default only the event payload is recognized; floors can override it to derive the path
+  // (some products' hook events carry no transcript_path, so it has to be reverse-derived from sessionId+workspacePath).
   const tp = () => String(impl.transcriptPathOf(ev, get(), sessionId, workspacePath) || get().transcriptPath || '');
 
   const status = (state, reason) =>
     bus.setStatus({ ...base, state, taskId: get().taskId || null, ...(reason ? { reason } : {}) });
   const beat = () => bus.heartbeat({ ...base, memberId });
-  // 主 agent 的楼层身份补进 client：memberId 基名(= ev.agent)与 client 同为产品基名，
-  // 与静态小怪物 / 幽灵统一成"client = 楼层(产品基名)、memberId 仅作主键"的约定。
+  // The main agent's floor identity is put into client: memberId's base name (= ev.agent) and client are both the product base name,
+  // unified with static gremlins / ghosts under the convention "client = the floor (product base name), memberId only as primary key".
   const register = () => bus.registerMember({ ...base, name: memberId, role: 'agent', client });
 
-  // plugin 形态优先由事件自报的 form 判定（vscode 只是壳，rollout 头常仍标 cli，猜不准），
-  // 落盘头只作 fallback。hook 已把原始 form 透传过来，这里按它识别 plugin。
+  // The plugin form is preferably decided by the event's self-reported form (vscode is just a shell, and the rollout header often still says cli, so it can't be guessed),
+  // with the on-disk header only as a fallback. The hook already passes the raw form through, so plugin is recognized by it here.
   const formOf = () => fixedFormOf(ev) || impl.formOf(tp());
 
-  // 给上一轮补报 token（新一轮开始时用）—— 走 impl.readTokensOf，让楼层决定用哪种解析器
+  // Backfill the previous round's tokens (used at the start of a new round) -- goes through impl.readTokensOf, letting the floor decide which parser to use
   async function backfillPrevTokens(prevDone, transcriptPath) {
     const startedAt = Number(prevDone && prevDone.startedAt) || 0;
     if (!transcriptPath || !(startedAt > 0)) return;
@@ -910,10 +910,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
     await bus.backfillTaskTokens({ ...base, startedAt, tokens, sessionId });
   }
 
-  // 延迟回填词元：插件 index.json 的 usage 常在 Stop/取消 时刻尚未落盘
-  // （codebuddyReadTokensOf 仅重试 1200ms，不够稳），而 backfillPrevTokens 只在「下一轮开始时」
-  // 触发 —— 最后一个任务没有下一轮就永远补不到词元。这里在 endTask 后延迟若干秒再读一次并写回，
-  // 保证收尾任务也能拿到词元（setTimeout 不阻塞 Stop 处理）。读取仍在 server 侧、写回 task_runs。
+  // Delayed token backfill: the plugin's index.json usage often hasn't landed on disk yet at the Stop/cancel moment
+  // (codebuddyReadTokensOf only retries for 1200ms, which isn't reliable), and backfillPrevTokens only fires "at the start of the next round"
+  // -- the last task has no next round, so its tokens can never be backfilled. Here we wait a few seconds after endTask and read/write back once more,
+  // ensuring the finishing task gets its tokens too (setTimeout doesn't block Stop handling). Reading is still server-side, writing back to task_runs.
   const TOKEN_BACKFILL_DELAY_MS = 5_000;
   function scheduleDelayedBackfill(startedAt, transcriptPath) {
     const sa = Number(startedAt) || 0;
@@ -923,11 +923,11 @@ async function runHookEvent(ev, ctx, floorImpl) {
         const tokens = await impl.readTokensOf(transcriptPath, sa);
         if (!tokens) return;
         await bus.backfillTaskTokens({ ...base, startedAt: sa, tokens, sessionId });
-      } catch { /* 落盘读取失败不影响主流程 */ }
+      } catch { /* a failure reading from disk doesn't affect the main flow */ }
     }, TOKEN_BACKFILL_DELAY_MS);
   }
 
-  // 这一轮被用户掐掉 → 按"取消"收尾（与 Stop 同一条线，三点不同）
+  // This round was killed by the user -> finish it as "cancelled" (same line as Stop, with three differences)
   async function finishCancelled(ev0) {
     const st0 = get();
     let taskId0 = st0.taskId || '';
@@ -1019,7 +1019,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     if (INJECTED_PROMPT_RE.test(String((ev && ev.prompt) || ''))) return { ok: true, ignored: 'injected' };
     const prevDone = get().done || null;
     sweepGhosts(bus, stableProject, client, {}, sessionId, get());
-    // 新的一轮：清"等授权/挂起/上一轮完成标记"
+    // A new round: clear "awaiting permission / pending / previous round's done marker"
     set({ await: null, pending: null, done: null });
     const prompt = userRequestText(ev.prompt);
     const title = prompt.replace(/\s+/g, ' ').trim() || '（未命名任务）';
@@ -1055,7 +1055,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
 
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     await beat();
-    // hook 事件里工具名字段可能是 tool_name（上游原生）或 tool（某些上报层映射）
+    // The tool name field in the hook event may be tool_name (native upstream) or tool (mapped by some reporting layers)
     const toolName = ev.tool_name || ev.tool || '';
     if (event === 'PreToolUse') {
       const tool = toolName;
@@ -1084,7 +1084,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
           set({ pendingSpawn: { name: nm, task, at: Date.now() } });
         } else {
           const id = subagentKeys(ev, nm, task)[0] || '';
-          // 记一笔召唤台账（收工回来查），再写 feed 飘幽灵
+          // Record a summon ledger entry (to look up when it finishes), then write the feed to float the ghost
           const ledger = ((get().subagents) || []).filter((r) => r && (r.id || r.name)).slice(-8);
           if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name: nm, at: Date.now() });
           else if (!id && nm && !ledger.some((r) => r.name === nm)) ledger.push({ id: '', name: nm, at: Date.now() });
@@ -1130,7 +1130,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
       set({ await: null, pending: null, sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath } });
       await status('idle');
     } else if (impl.awaitingPermission && !impl.awaitingPermission(ev)) {
-      return { ok: true, ignored: event }; // 非权限类型（如 Claude 的 auth_success）不动状态
+      return { ok: true, ignored: event }; // non-permission types (such as Claude's auth_success) don't touch state
     } else {
       const tool = (ev && (ev.tool_name || ev.tool)) || get().lastTool || '';
       const input = (ev && ev.tool_input) || get().lastInput || '';
@@ -1181,7 +1181,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const prevCancelledDone = Boolean(
       doneBeforeStop && doneBeforeStop.cancelled && Date.now() - Number(doneBeforeStop.at || 0) < 60_000
     );
-    // 清"等授权/挂起"（done 已先读）
+    // Clear "awaiting permission / pending" (done was already read first)
     set({ await: null, pending: null, done: null });
     sweepGhosts(bus, stableProject, client, {}, sessionId, get());
     const st = get();
@@ -1318,17 +1318,17 @@ function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
 
 module.exports = {
   runHookEvent,
-  // 产品无关助手（导出便于单测与复用）
+  // product-agnostic helpers (exported for unit tests and reuse)
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
   transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens,
   addGhost, retireGhost, sweepGhosts, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS,
-  // token 归一原语（产品无关）
+  // token normalization primitives (product-agnostic)
   normOpenAI, normAnthropic, tokenFinish,
-  // 回复解析 / 形态 / 打断（产品无关）
+  // reply parsing / form / interrupt (product-agnostic)
   extractText, msgOf, isInterruptLine, sinceLastUser, jsonlReplies, indexJsonReplies,
   headJsonLines, turnInterrupted, INTERRUPT_HINT_RE,
-  // 公有默认 hook 行为（楼层模块没覆盖的接口回退到这份）
+  // public default hook behavior (interfaces a floor module doesn't override fall back to this)
   sharedHookImpl,
 };

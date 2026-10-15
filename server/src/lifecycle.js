@@ -1,10 +1,12 @@
 'use strict';
 
 /**
- * 服务生命周期钩子：把 start() 里手写的串联改成显式注册，顺序即注册顺序。
- *   - onWorkspaceSwitch：每次切换工程后触发（恢复 / 手动切 / 演示切换都走它）
- *   - onClose：服务关闭前触发（停定时器之外的资源）
- * 钩子内部出错不应阻断其他钩子，因此逐个 try/catch。
+ * Server lifecycle hooks: replace the hand-written chaining in start() with explicit
+ * registration, order = registration order.
+ *   - onWorkspaceSwitch: fires after every project switch (restore / manual switch / demo
+ *     switch all go through it)
+ *   - onClose: fires before the server closes (for resources other than timers)
+ * An error inside a hook must not block the other hooks, hence the one-by-one try/catch.
  */
 const log = require('./log');
 

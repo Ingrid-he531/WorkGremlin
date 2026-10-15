@@ -1,74 +1,89 @@
 'use strict';
 
 /**
- * 四层 agent 的**命令行配方** —— 议事厅里唯一碰各 CLI 细节的地方。
+ * The **command-line recipes** for the four agents —— the only place in the council room that
+ * touches each CLI's details.
  *
- * 每个配方记三件事：怎么把提示词递进去、**怎么保证它没有工具**、怎么把它吐出来的东西读成
- * 「发言 + 票」。前两件是本文件的重点，下面每层都写了它是怎么验过的（2026-10-01 本机实测）。
+ * Every recipe records three things: how to hand the prompt over, **how to guarantee it has no
+ * tools**, and how to read what it spits out as "speech + vote". The first two are the focus here,
+ * and each floor below documents how that was verified (measured locally on 2026-10-01).
  *
- * 关于"只读、不给工具"（用户定的口径，也是能进议事厅的前提）：
- *   · 1F CodeBuddy / 4F Claude Code —— `--tools ""` 关掉全部内置工具（两家 help 里都写着
- *     `Use "" to disable all tools`）。
- *   · 7F Kilo / 8F OpenCode —— 这两家没有关工具的开关（`kilo --pure` 只关**外部插件**，
- *     跟工具无关；别被名字骗了）。它们靠**注入一份权限全 deny 的配置**：
- *       - kilo 用 `KILO_CONFIG_CONTENT`，实测 `kilo debug config` 里 permission 变成 deny；
- *       - opencode 用 `OPENCODE_CONFIG_CONTENT`，实测做过对照：不锁时它能读出临时目录里的
- *         标记文件，锁上后工具调用直接被拒、标记文件读不出来。
- *   · 8F 顺带把 HOME 之外的目录也挡在 `external_directory` 里（缺省就是 ask，不是 allow，
- *     叠加 deny 之后更不出去）。
+ * About "read-only, no tools" (the criterion the user set, and the prerequisite for entering the
+ * council room):
+ *   · 1F CodeBuddy / 4F Claude Code —— `--tools ""` disables all built-in tools (both help texts say
+ *     `Use "" to disable all tools`).
+ *   · 7F Kilo / 8F OpenCode —— neither has a tool switch (`kilo --pure` only disables **external
+ *     plugins**, nothing to do with tools; do not be fooled by the name). They rely on **injecting a
+ *     config where every permission is deny**:
+ *       - kilo uses `KILO_CONFIG_CONTENT`; measured with `kilo debug config`, permission turned into
+ *         deny;
+ *       - opencode uses `OPENCODE_CONFIG_CONTENT`; an A/B test was run: unlocked it could read a
+ *         marker file inside the temp directory, locked, tool calls were refused outright and the
+ *         marker file could not be read.
+ *   · 8F additionally keeps directories outside HOME out via `external_directory` (its default is
+ *     ask, not allow, so stacking deny makes sure nothing escapes).
  *
- * 还有一条**必须做**的事：7F 要 `"plugin": []` 把插件摘掉。kilo 的全局配置里装着
- * WorkGremlin 自己的上报插件（`packages/reporter/src/plugin/index.js`），不摘的话议事厅的
- * 参与者会被上报进办公室 —— 直接违反"隔离，只在议事厅看"。`--pure` **摘不掉**它（实测），
- * 只有配置里的 `plugin: []` 管用。
+ * One more **mandatory** step: 7F needs `"plugin": []` to strip plugins. Kilo's global config carries
+ * WorkGremlin's own reporting plugin (`packages/reporter/src/plugin/index.js`); leaving it in means
+ * council participants get reported into the office —— a direct violation of "isolated, visible only
+ * in the council room". `--pure` **cannot remove it** (measured); only `plugin: []` in the config
+ * works.
  *
- * 另一条贯穿全文件的规矩：**解析不出来就说解析不出来**。模型换个格式、CLI 改了输出，
- * 都要落到 status='unparsed' 并把原文留着，绝不能猜一个"大概是同意吧"。
+ * One more rule running through this whole file: **say it when you cannot parse**. A model switching
+ * formats or a CLI changing its output must land in status='unparsed' with the raw text kept —— never
+ * guess "probably agree".
  */
 
 const { DEFAULTS } = require('@workgremlin/shared');
 
 /**
- * 关掉 WorkGremlin **自己**的上报 —— 每条配方都注入，两种模式都注入。
+ * Turn off WorkGremlin's **own** reporting —— injected by every recipe, in both modes.
  *
- * 为什么是必须的：隔离模式靠 cwd 在 /tmp 就够（参与者上报的工程路径是那个临时目录，
- * 办公室根本看不见）。**工程模式下 cwd 是用户的真实工程**，`~/.claude/settings.json` /
- * `~/.codebuddy/settings.json` 里装着的上报 hook 会带着真实工程路径上报 —— 参与者当场
- * 变成"你工程里的一个成员"，直接违反"只在议事厅看得见"。所以这里不再依赖 cwd，
- * 改成显式关掉上报：hook（packages/reporter/src/hook.js）与插件
- * （packages/reporter/src/plugin/index.js）都认这一条，认到就原地退出。
+ * Why it is mandatory: isolated mode gets by with cwd in /tmp (the project path a participant
+ * reports is that temp directory, invisible to the office). **In project mode cwd is the user's real
+ * project**, and the reporting hooks installed in `~/.claude/settings.json` /
+ * `~/.codebuddy/settings.json` would report with the real project path —— the participant would turn
+ * into "one of the members in your project", a direct violation of "visible only in the council
+ * room". So stop relying on cwd and explicitly disable reporting instead: the hook
+ * (packages/reporter/src/hook.js) and the plugin (packages/reporter/src/plugin/index.js) both honor
+ * this flag and exit in place when they see it.
  */
 const QUIET_ENV = Object.freeze({ WORKGREMLIN_DISABLE: '1' });
 
 /**
- * 7F / 8F 参与者会话的固定标题 —— 这两家没有 1F/4F 那种"不落盘"开关，
- * 会话一定会记进它们的**全局** SQLite（`session.directory` = 当时的 cwd）。
- * 隔离模式下 cwd 在 /tmp，办公室按工程过滤看不见；工程模式下 cwd 就是用户的工程，
- * 不挡的话参与者会直接出现在办公室的 7F/8F 上。挡法是"打一个固定标题"，
- * 由 server/src/kilo.js 与 server/src/opencode.js 列出会话时跳过它 —— 理由与代价
- * 都写在 shared/index.js 的 COUNCIL_SESSION_TITLE 那一段。
+ * Fixed session title for 7F / 8F participants —— unlike 1F/4F these two have no "do not persist"
+ * switch, so sessions are always recorded in their **global** SQLite (`session.directory` = the cwd
+ * at the time). In isolated mode cwd is under /tmp and the office filters it out by project; in
+ * project mode cwd is the user's project, and unguarded participants would show up directly on the
+ * office's 7F/8F. The guard is "give it a fixed title", which server/src/kilo.js and
+ * server/src/opencode.js skip when listing sessions —— reasoning and trade-offs are written on
+ * COUNCIL_SESSION_TITLE in shared/index.js.
  */
 const SESSION_TITLE = DEFAULTS.COUNCIL_SESSION_TITLE;
 
-/** 7F / 8F 的权限表要逐项写全（`*` 是兜底，列出来的是明写一遍好读、也方便断言） */
+/** The 7F / 8F permission tables have to be spelled out item by item (`*` is the catch-all; listing the rest keeps it readable and easy to assert) */
 const PERMISSION_KEYS = Object.freeze([
   'bash', 'edit', 'write', 'read', 'glob', 'grep', 'list',
   'webfetch', 'websearch', 'task', 'skill', 'todowrite', 'external_directory',
 ]);
 
-/** 7F / 8F 共用的权限封锁：把工具按类别全 deny —— 隔离模式用这份 */
+/** Permission lockdown shared by 7F / 8F: deny every tool category —— used by isolated mode */
 const DENY_ALL_PERMISSION = Object.freeze(
   Object.fromEntries([['*', 'deny'], ...PERMISSION_KEYS.map((k) => [k, 'deny'])])
 );
 
 /**
- * 工程模式（allow='read'）给 7F / 8F 的权限表：**只**放行读类工具，其余照旧全 deny。
+ * Permission table handed to 7F / 8F in project mode (allow='read'): **only** read-type tools are
+ * allowed, everything else stays denied.
  *
- * 7F Kilo / 8F OpenCode 没有 1F/4F 那种 `--tools` 开关（`kilo --pure` 只关外部插件，
- * 跟工具无关），所以"只读"只能靠喂这份配置。两处**必须**保持 deny：
- *   · `bash` / `write` / `edit` —— 参与者不许改用户的代码，也不许在用户机器上跑命令；
- *   · `external_directory` —— 工程模式只许看工程里。缺省它是 ask，而议事厅的参与者
- *     没人应答权限询问，ask 会变成"卡住到超时"；明写 deny 才是确定的行为。
+ * 7F Kilo / 8F OpenCode have no `--tools` switch like 1F/4F (`kilo --pure` only disables external
+ * plugins, nothing to do with tools), so "read-only" can only be achieved by feeding this config.
+ * Two entries **must** stay denied:
+ *   · `bash` / `write` / `edit` —— participants may not modify the user's code nor run commands on
+ *     his machine;
+ *   · `external_directory` —— project mode allows looking inside the project only. Its default is
+ *     ask, and since nobody answers council participants' permission prompts, ask turns into "stuck
+ *     until timeout"; writing deny explicitly is deterministic behavior.
  */
 const READ_PERMISSION = Object.freeze(
   Object.fromEntries([
@@ -77,47 +92,51 @@ const READ_PERMISSION = Object.freeze(
   ])
 );
 
-/** @param {string} allow 'none'（缺省，隔离模式的"没有工具"）或 'read'（工程模式的只读工具） */
+/** @param {string} allow 'none' (default, isolated mode's "no tools") or 'read' (project mode's read-only tools) */
 function permissionFor(allow) {
   return allow === 'read' ? READ_PERMISSION : DENY_ALL_PERMISSION;
 }
 
 /**
- * 1F / 4F 的只读工具白名单。给 `--tools` 与 `--allowedTools` **同一份**：
- *   · `--tools`        —— 限制它**能用**哪些内置工具（其余根本不出现）；
- *   · `--allowedTools` —— 允许这些工具**不用问**就直接用。
- * `-p` 是非交互的，没人应答权限询问，只给前一个的话读文件会被拒（每一步都要问），
- * 于是参与者只能干瞪眼 —— 那不是只读，那是读不了。
+ * Read-only tool whitelist for 1F / 4F. The **same list** goes to `--tools` and `--allowedTools`:
+ *   · `--tools`        —— limits which built-in tools it **can use** (the rest never appear);
+ *   · `--allowedTools` —— lets those tools be used **without asking**.
+ * `-p` is non-interactive, nobody answers permission prompts, so giving only the former means reading
+ * a file gets refused (it asks at every step) and participants can only stare blankly —— that is not
+ * read-only, it is read-nothing.
  */
 const READ_TOOLS = 'Read,Grep,Glob';
 
 /**
- * 每层一个配方。
+ * One recipe per floor.
  *
  * build({ bin, prompt, allow }) → { bin, args, env, stdin }
- *   · `allow` = 'none'（缺省）| 'read' —— 见上面 READ_TOOLS / READ_PERMISSION。
- *     **两种取值都必须把工具的出口堵死或窄成只读**，没有"给一半"的中间态。
- *   · env 是**叠加**在 process.env 之上的（不是替换）—— 各 CLI 的登录凭据在 ~/.claude、
- *     ~/.config/kilo 这些目录里，靠 HOME 找。挡掉 HOME 等于挡掉登录，所以隔离靠
- *     cwd + 工具收敛 + QUIET_ENV，不靠改环境变量。
- *   · stdin 非 null 时提示词走管道（不进 argv）：长文本不会撞 ARG_MAX，也不会出现在
- *     `ps` 的命令行里被同机其他进程看到。
+ *   · `allow` = 'none' (default) | 'read' —— see READ_TOOLS / READ_PERMISSION above.
+ *     **Both values must either block tools entirely or narrow them to read-only**; there is no
+ *     halfway state.
+ *   · env is **layered on top of** process.env (not a replacement) —— each CLI's login credentials
+ *     live in ~/.claude, ~/.config/kilo, etc. and are found via HOME. Blocking HOME blocks the login,
+ *     so isolation relies on cwd + tool narrowing + QUIET_ENV, not on rewriting environment variables.
+ *   · When stdin is not null the prompt travels through a pipe (not argv): long text never hits
+ *     ARG_MAX and never shows up in `ps` output for other processes on the machine.
  *
- * 1F / 4F 都带 `--no-session-persistence`（两家 help 里都有，均限 `--print` 下有效）：
- * 参与者的对话**不落盘**。工程模式下这条是隔离的必需品 —— 落了盘，各 CLI 会把参与者
- * 按**用户真实工程路径**记进它自己的历史（`~/.claude/projects/<工程>/`），
- * 全局会话列表里就会多出几个"你工程里的活跃会话"。隔离模式同样受益：不再留
- * `tmp-wg-council-*` 那种一次性工程的残骸。
+ * Both 1F and 4F carry `--no-session-persistence` (documented in both help texts, valid under
+ * `--print` only): participant conversations are **not persisted**. In project mode this flag is an
+ * isolation necessity —— persisted, each CLI records participants under **the user's real project
+ * path** into its own history (`~/.claude/projects/<project>/`), and the global session list grows a
+ * few "active sessions in your project". Isolated mode benefits too: no more `tmp-wg-council-*`
+ * one-off project leftovers.
  *
- * `--strict-mcp-config` 且不给 `--mcp-config`：不加载用户配置里的 MCP server。
- * `--tools ""` 管的是**内置**工具集，MCP 工具不在其中 —— 不挡的话"没有工具的参与者"
- * 这句话就不成立（顺带说明：这一条是对既有行为的收紧，不是本次新开的口子）。
+ * `--strict-mcp-config` without `--mcp-config`: do not load MCP servers from the user config.
+ * `--tools ""` governs the **built-in** tool set, and MCP tools are not part of it —— leaving that
+ * open makes "a participant with no tools" a false statement (for context: this tightens existing
+ * behavior, it is not a newly opened hole).
  */
 const RECIPES = {
   '1F': {
     agent: 'codebuddy',
     name: 'CodeBuddy',
-    // 实测：`-p` 不带消息即读管道（help 原文 "useful for pipes"）
+    // Measured: `-p` with no message reads the pipe (help text: "useful for pipes")
     build({ bin, prompt, allow }) {
       const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
       if (allow === 'read') args.push('--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
@@ -132,8 +151,9 @@ const RECIPES = {
     build({ bin, prompt, allow }) {
       const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
       if (allow === 'read') {
-        // `--permission-prompts none` = 没人应答就拒（不是"挂在那儿等"）。排在
-        // `--allowedTools` **前面**：那个开关收的是变长参数，放后面会被它吃掉。
+        // `--permission-prompts none` = refuse when nobody answers (rather than "hang and wait"). It
+        // goes **before** `--allowedTools`: that switch takes variadic arguments and would swallow it
+        // if placed later.
         args.push('--permission-prompts', 'none', '--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
       } else {
         args.push('--tools', '');
@@ -145,16 +165,17 @@ const RECIPES = {
   '7F': {
     agent: 'kilo',
     name: 'Kilo Code',
-    // 提示词走位置参数（kilo run <message>）：这两家不读 stdin。
-    // 我们的提示词永远以自己那段模板开头，不会以 '-' 打头，所以不必再塞 '--' 分隔符
-    // （塞了反而可能被 yargs 当成分隔符吃掉，得不偿失）。
+    // The prompt goes as a positional argument (kilo run <message>): neither of these reads stdin.
+    // Our prompt always starts with our own template block and never begins with '-', so there is no
+    // need to add a '--' separator (adding it risks yargs eating it as a separator, doing more harm
+    // than good).
     build({ bin, prompt, allow }) {
       return {
         bin,
         args: ['run', prompt, '--format', 'json', '--title', SESSION_TITLE],
         env: {
           KILO_CONFIG_CONTENT: JSON.stringify({
-            plugin: [], // 摘掉 WorkGremlin 自己的上报插件（否则参与者会被上报进办公室）
+            plugin: [], // strip WorkGremlin's own reporting plugin (otherwise participants get reported into the office)
             permission: permissionFor(allow),
           }),
           ...QUIET_ENV,
@@ -181,9 +202,9 @@ const RECIPES = {
   },
 };
 
-/* ---------------------------------- 输出解析 ---------------------------------- */
+/* ---------------------------------- Output parsing ---------------------------------- */
 
-/** 从各种可能的字段里抠出正文。CLI 各写各的，这里只认见过的形状，认不出返回 '' */
+/** Dig the body text out of whatever field might hold it. CLIs differ; only observed shapes are recognized, unknown ones return '' */
 function textOf(obj) {
   if (obj == null) return '';
   if (typeof obj === 'string') return obj;
@@ -191,14 +212,15 @@ function textOf(obj) {
     return obj.map(textOf).filter(Boolean).join('\n');
   }
   if (typeof obj !== 'object') return '';
-  // 按"最可能是正文"的顺序试。`result` 是 claude/codebuddy 的收尾文本；
-  // `text` / `content` 是 kilo/opencode 事件流里的分片。
+  // Try keys in the order "most likely to be the body". `result` is claude/codebuddy's closing text;
+  // `text` / `content` are fragments in kilo/opencode's event streams.
   //
-  // `part` 是 **opencode 实测的形态**（2026-10-01 真机烟测）：
-  //   {"type":"text","sessionID":"...","part":{"type":"text","text":"正文…"}}
-  // 正文不在顶层，在 part 里。它**单数**，和 `parts`（复数）不是一回事 ——
-  // 当初只照猜的形状写了 `parts`，结果真跑起来 8F 每一轮都判成"解析不出内容"，
-  // 而单测是照着同一个猜测写的，全绿。教训：照着猜的线格式写单测，等于没测。
+  // `part` is **the shape opencode actually produced** (real-device smoke test, 2026-10-01):
+  //   {"type":"text","sessionID":"...","part":{"type":"text","text":"body…"}}
+  // The body is not at the top level, it is inside part. It is **singular** and not the same thing as
+  // `parts` (plural) —— initially only `parts` was written from a guessed shape, so every 8F round came
+  // back as "content could not be parsed" in real runs, while unit tests written against the same guess
+  // were all green. Lesson: writing unit tests against a guessed wire format tests nothing.
   for (const key of ['result', 'text', 'content', 'message', 'parts', 'part', 'output']) {
     const v = obj[key];
     if (typeof v === 'string' && v.trim()) return v;
@@ -210,7 +232,7 @@ function textOf(obj) {
   return '';
 }
 
-/** usage 各家字段名不一，尽量归一；取不到的一律 null（**不写 0**，见铁律） */
+/** usage field names differ per product; normalize as far as possible; anything unavailable is null (**not 0**, per the iron rule) */
 function tokensOf(obj) {
   const usage = (obj && (obj.usage || (obj.message && obj.message.usage) || obj.tokens)) || null;
   if (!usage || typeof usage !== 'object') return null;
@@ -227,11 +249,11 @@ function tokensOf(obj) {
     cacheRead: num('cache_read_input_tokens', 'cache_read_tokens', 'cached_tokens'),
     cacheWrite: num('cache_creation_input_tokens', 'cache_write_tokens'),
   };
-  // 四项全取不到 = 这家没给 usage，返回 null 而不是一个全 0 的对象
+  // All four unavailable = this product gave no usage at all, so return null rather than an all-zero object
   return Object.values(out).some((v) => v != null) ? out : null;
 }
 
-/** 这条事件是不是"用户那一侧"的回显（提问原文 / 系统提示）。正文绝不能把它捎上 */
+/** Is this event an echo from "the user side" (the question itself / a system prompt). The body must never pick it up */
 function isUserEcho(e) {
   if (!e || typeof e !== 'object') return false;
   if (e.role === 'user') return true;
@@ -240,18 +262,20 @@ function isUserEcho(e) {
 }
 
 /**
- * 从一份**完整对话记录**里挑出"它说的那一段"。
+ * Pick "the part it actually said" out of a **full conversation transcript**.
  *
- * 1F CodeBuddy `--output-format json` 实测给的就是这个（2026-10-01）：一个数组，
- * `user 消息 → file-history-snapshot → reasoning → assistant 消息 → result`，
- * 一路记全。按老办法把每条 content 拼起来，**提问原文（连 CLI 自己塞的 memory 系统提示）
- * 会被当成它的发言**，末尾还会把答复再重复一遍 —— 界面上就是每张发言卡前半截是自己的提示词。
- * 实测那次 16KB 的正文里，真正它说的话只在最后 1KB。
+ * That is what 1F CodeBuddy `--output-format json` really gives (2026-10-01): an array recording the
+ * whole path —— `user message → file-history-snapshot → reasoning → assistant message → result`.
+ * Concatenating every content the old way makes **the question itself (including the memory system
+ * prompt the CLI injects) pass as its speech**, and repeats the answer once more at the end —— so on
+ * screen the first half of every speech card is our own prompt. In the measured run only the last 1KB
+ * of a 16KB body was what it actually said.
  *
- * 所以这里只认两样，按可信度排：
- *   1. 收尾事件里的 `result` 字段（CodeBuddy / Claude Code 都给，且**只有它**是最终答复）；
- *   2. 退一步，最后一条 assistant 消息的输出。
- * 两样都找不到 → null：宁可说"解析不出"，也不把提示词端上来说成它的话。
+ * So only two things are accepted here, ordered by reliability:
+ *   1. The `result` field of the closing event (both CodeBuddy and Claude Code provide it, and **it
+ *      alone** is the final answer);
+ *   2. Failing that, the output of the last assistant message.
+ * Neither found → null: better to say "cannot parse" than to serve the prompt as if it were its words.
  *
  * @param {Array} list
  * @returns {{text:string, tokens:object|null}|null}
@@ -274,14 +298,16 @@ function pickFromTranscript(list) {
 }
 
 /**
- * 解析一次调用的 stdout。
+ * Parse the stdout of one invocation.
  *
- * 两种形态都要吃：
- *   · **单个 JSON**（1F/4F 的 `--output-format json`）—— 整个 stdout 就是一个对象；
- *   · **JSONL 事件流**（7F/8F 的 `--format json`）—— 一行一个事件，正文在若干行里拼起来。
+ * Both shapes have to be consumed:
+ *   · **A single JSON** (1F/4F's `--output-format json`) —— the whole stdout is one object;
+ *   · **A JSONL event stream** (7F/8F's `--format json`) —— one event per line, the body assembled
+ *     from several lines.
  *
- * 做法：先当整块 JSON 试，不行再逐行试。**两种都失败 = 解析不出来**，此时文本留空、
- * 把原始 stdout 原样带回（排障要看它），绝不假装读到了内容。
+ * Approach: try it as one block of JSON first, then line by line. **Both failing = cannot parse**, in
+ * which case the text stays empty and the raw stdout is carried back untouched (troubleshooting needs
+ * it), never pretending that content was read.
  *
  * @param {string} stdout
  * @returns {{ok:boolean, text:string, tokens:object|null, events:number}}
@@ -291,11 +317,11 @@ function parseOutput(stdout) {
   const trimmed = raw.trim();
   if (!trimmed) return { ok: false, text: '', tokens: null, events: 0 };
 
-  // 先当整块 JSON
+  // First as one block of JSON
   try {
     const one = JSON.parse(trimmed);
     if (Array.isArray(one)) {
-      // 一整个数组 = 一份完整对话记录，只挑它说的那段（见 pickFromTranscript）
+      // A whole array = a full transcript; take only the part it said (see pickFromTranscript)
       const got = pickFromTranscript(one);
       if (got) return { ok: true, text: got.text, tokens: got.tokens, events: one.length };
       return { ok: false, text: '', tokens: null, events: one.length };
@@ -303,11 +329,12 @@ function parseOutput(stdout) {
     const text = textOf(one);
     if (text) return { ok: true, text, tokens: tokensOf(one), events: 1 };
   } catch {
-    /* 不是单个 JSON，往下走 JSONL */
+    /* not a single JSON, fall through to JSONL */
   }
 
-  // 再当 JSONL：逐行解析，正文按出现顺序拼，usage 取**最后**一个非空的
-  // （事件流里 usage 常挂在收尾那条上，累加会在重试时重复计费）
+  // Then as JSONL: parse line by line, concatenate body pieces in order of appearance, take usage from
+  // the **last** non-empty occurrence (usage usually hangs off the closing line in a stream; summing
+  // would double-count across retries)
   let events = 0;
   const parts = [];
   let tokens = null;
@@ -318,10 +345,10 @@ function parseOutput(stdout) {
     try {
       obj = JSON.parse(s);
     } catch {
-      continue; // 单行坏了不代表整条流坏了（CLI 会往 stdout 混日志）
+      continue; // one broken line does not mean the whole stream is broken (CLIs mix logs into stdout)
     }
     events += 1;
-    // 流里混着用户消息（提示词回显）的形态：跳过它，别把提问当成它的发言
+    // Streams can carry user messages (prompt echoes): skip them, do not take the question as its speech
     if (isUserEcho(obj)) continue;
     const t = textOf(obj);
     if (t) parts.push(t);
@@ -329,24 +356,27 @@ function parseOutput(stdout) {
     if (tk) tokens = tk;
   }
   if (events > 0 && parts.length) return { ok: true, text: parts.join('\n'), tokens, events };
-  // 有事件但一句正文都没读到 —— 也算解析不出来（可能全是状态事件，或字段名又变了）
+  // Events present but not a single line of body read —— that also counts as "cannot parse" (maybe all
+  // status events, or the field names changed again)
   return { ok: false, text: '', tokens: tokens || null, events };
 }
 
-/* ---------------------------------- 投票解析 ---------------------------------- */
+/* ---------------------------------- Vote parsing ---------------------------------- */
 
 /**
- * 参与者必须在发言末尾附一段结构化投票。约定的形状（提示词里会写死）：
+ * Participants must attach a structured vote at the end of their speech. Agreed shape (pinned down in
+ * the prompt):
  *
  * ```json
- * {"vote":"agree|disagree|abstain","reason":"一句话","proposal":"（投反对时给修订案）","second":"4F"}
+ * {"vote":"agree|disagree|abstain","reason":"one sentence","proposal":"(a revision when voting disagree)","second":"4F"}
  * ```
  *
- * 解析策略（宽进严出）：
- *   1. 找**最后一个** ```json 围栏块（模型爱在中间举例，最后一块才是它的结论）；
- *   2. 没有围栏就在全文里找最后一个含 `"vote"` 的 {...} 片段；
- *   3. 再不行认 `VOTE: agree` 这样的一行；
- *   4. 全都认不出 → 返回 vote=null（**未表态**），绝不按语气猜。
+ * Parsing strategy (lenient in, strict out):
+ *   1. Find the **last** ```json fenced block (models love giving examples mid-text; the last block is
+ *      their conclusion);
+ *   2. With no fence, look for the last {...} fragment containing `"vote"` in the whole text;
+ *   3. Failing that, accept a line like `VOTE: agree`;
+ *   4. Nothing recognizable → return vote=null (**no position expressed**), never guess from tone.
  *
  * @param {string} text
  * @returns {{vote:string|null, reason:string|null, proposal:string|null, second:string|null}}
@@ -363,15 +393,16 @@ function parseVoteBlock(text) {
       return {
         vote,
         reason: strOrNull(obj.reason),
-        // 修订案照收（提示词只要求投反对的人给，但投了同意却附一版也一并留着 ——
-        // 选下一轮提案时按 consensus.js 的规则走，这里不做取舍）
+        // Revisions are accepted as-is (the prompt only requires disagreeing votes to include one, but
+        // agreeing while attaching a version keeps it too —— picking next round's proposal follows
+        // consensus.js's rules, no selection is made here)
         proposal: strOrNull(obj.proposal),
         second: strOrNull(obj.second || obj.second_floor || obj.endorse),
       };
     }
   }
 
-  // 兜底：`VOTE: agree` / `立场：反对` 这样的一行
+  // Fallback: a line like `VOTE: agree` / `立场：反对`
   const line = s.match(/(?:^|\n)\s*(?:VOTE|立场|投票)\s*[:：]\s*([^\n]{1,40})/i);
   if (line) {
     const vote = normalizeVoteToken(line[1]);
@@ -380,7 +411,7 @@ function parseVoteBlock(text) {
   return empty;
 }
 
-/** 票型词表跟 council/consensus.js 保持一套（那里是权威，这里只做同样的归一） */
+/** The vote vocabulary stays in one set with council/consensus.js (that is the authority; this only normalizes the same way) */
 function normalizeVoteToken(raw) {
   if (raw == null) return null;
   const s = String(raw).trim().toLowerCase();
@@ -397,19 +428,22 @@ function strOrNull(v) {
   return t ? t : null;
 }
 
-/* ---------------------------------- 分析解析 ---------------------------------- */
+/* ---------------------------------- Analysis parsing ---------------------------------- */
 
 /**
- * 分析模式的结构化尾块。约定的形状（提示词里写死，见 prompt.js 的 ANALYSIS_PROTOCOL）：
+ * The structured tail block for analysis mode. Agreed shape (pinned down in the prompt, see
+ * ANALYSIS_PROTOCOL in prompt.js):
  *
  * ```json
  * {"stance":"support|oppose|unsure","points":[…],"risks":[…],"questions":[…]}
  * ```
  *
- * 两条与表决解析同一套的规矩：
- *   · 认不出就留 null —— `stance` 读了半天读不出就是"未表态"，never 按语气猜；
- *   · `findings` 的 null 与空对象**不是一回事**：null = 整个尾块没解析出来，
- *     `{points:[],risks:[],questions:[]}` = 它答了，只是三条都空。界面上这两种写法不同。
+ * Two rules shared with vote parsing:
+ *   · Leave null when unrecognized —— a `stance` that cannot be read after all is "no position
+ *     expressed", never guessed from tone;
+ *   · `findings` being null and being an empty object are **not the same thing**: null = the whole
+ *     tail block failed to parse, `{points:[],risks:[],questions:[]}` = it answered, just with all
+ *     three empty. The UI renders those two differently.
  *
  * @param {string} text
  * @returns {{stance:string|null, findings:{points:string[],risks:string[],questions:string[]}|null}}
@@ -426,7 +460,7 @@ function parseAnalysisBlock(text) {
   return { stance: normalizeStanceToken(obj.stance), findings: findingsOf(obj) };
 }
 
-/** 立场词表。归一规则与 normalizeVoteToken 一个路子：认识的归一，不认识的返 null */
+/** Stance vocabulary. Same normalization approach as normalizeVoteToken: recognized ones normalize, unknown ones return null */
 function normalizeStanceToken(raw) {
   if (raw == null) return null;
   const s = String(raw).trim().toLowerCase();
@@ -438,9 +472,10 @@ function normalizeStanceToken(raw) {
 }
 
 /**
- * 三个列表字段。**一个都没给**（或给的不是数组）→ null（= 没解析出来）；
- * 只要有一个是数组，就返回三个键都齐的对象（缺的那些是空数组）。
- * 元素只收非空字符串 —— 模型偶尔塞个 `{"point":"…"}` 进来，那不是我们要的形状，丢掉。
+ * The three list fields. **None provided** (or not arrays) → null (= failed to parse); once any one of
+ * them is an array, return an object with all three keys (the missing ones being empty arrays).
+ * Only non-empty strings are accepted as elements —— models occasionally slip in a `{"point":"…"}`,
+ * which is not the shape we want, so drop it.
  */
 function findingsOf(obj) {
   const listOf = (v) =>
@@ -450,9 +485,10 @@ function findingsOf(obj) {
 }
 
 /**
- * 从一段文本里找**最后一个**满足判据的 JSON 对象。
- * 先试 ```json 围栏（从后往前），再退化成全文扫括号配对。
- * 表决块与分析块共用这一套（判据不同：一个认 `vote`，一个认 `stance`/`points`）。
+ * Find the **last** JSON object satisfying the predicate in a piece of text.
+ * Try ```json fences first (from the back), then fall back to scanning the whole text for balanced
+ * braces. Vote blocks and analysis blocks share this machinery (different predicates: one recognizes
+ * `vote`, the other `stance`/`points`).
  *
  * @param {string} s
  * @param {(obj:object)=>boolean} ok
@@ -463,7 +499,7 @@ function lastJsonBlock(s, ok) {
     const obj = tryParseJsonObject(fenced[i], ok);
     if (obj) return obj;
   }
-  // 没有围栏：从每个 '{' 起做括号配对，取最后一个满足判据的
+  // No fence: walk back from every '{' with brace matching, take the last one satisfying the predicate
   for (let i = s.lastIndexOf('{'); i >= 0; i = s.lastIndexOf('{', i - 1)) {
     const obj = tryParseJsonObject(extractBalanced(s, i), ok);
     if (obj) return obj;
@@ -478,12 +514,12 @@ function tryParseJsonObject(chunk, ok) {
     const obj = JSON.parse(chunk.trim());
     if (obj && typeof obj === 'object' && !Array.isArray(obj) && ok(obj)) return obj;
   } catch {
-    /* 解析不了就换下一个候选 */
+    /* cannot parse it, try the next candidate */
   }
   return null;
 }
 
-/** 从 s[from]=='{' 起取一个括号配平的片段（会跳过字符串里的括号） */
+/** From s[from]=='{', take a brace-balanced slice (braces inside strings are skipped) */
 function extractBalanced(s, from) {
   let depth = 0;
   let inStr = false;

@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * 只读打开各产品自己的落盘 SQLite（kilo.db / opencode.db / 灵码 local.db …）。
- * better-sqlite3 把构造函数挂在 module.exports 上（没有 .Database 具名导出），
- * 项目其它文件都是直接 require 拿构造函数。打开失败（库没装 / 表结构变了）一律回 null，
- * 调用方据此当"没有"处理，绝不冒泡、绝不编造。
+ * Open each product's own on-disk SQLite read-only (kilo.db / opencode.db / Lingma local.db …).
+ * better-sqlite3 hangs the constructor off module.exports (there is no named .Database export),
+ * and every other file in the project just requires it to get the constructor.
+ * Any open failure (library not installed / schema changed) returns null, and callers treat
+ * that as "absent" — never bubble it up, never fabricate anything.
  */
 
 const Database = require('better-sqlite3');

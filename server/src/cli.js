@@ -2,22 +2,24 @@
 'use strict';
 
 /**
- * 独立启动入口（headless 模式）：
- *   node server/src/cli.js                      默认端口探测 + 接真实数据源
+ * Standalone entry point (headless mode):
+ *   node server/src/cli.js                      default port probing + connect real data sources
  *   node server/src/cli.js --port 21800
  *   node server/src/cli.js --db /tmp/wg.db
- *   node server/src/cli.js --self-test          只验证 better-sqlite3 建表/读写（V1 判据 3）
- *   node server/src/cli.js --no-token           关闭本地 token（仅调试）
- *   node server/src/cli.js --log=debug          日志级别（error|warn|info|debug，默认 info）
- *   node server/src/cli.js --log-file=0         关掉文件日志（~/.workgremlin/workgremlin.log）
+ *   node server/src/cli.js --self-test          only verify better-sqlite3 create/read/write (V1 criterion 3)
+ *   node server/src/cli.js --no-token           disable the local token (debugging only)
+ *   node server/src/cli.js --log=debug          log level (error|warn|info|debug, default info)
+ *   node server/src/cli.js --log-file=0         turn off file logging (~/.workgremlin/workgremlin.log)
  *
- * 演示模式没有启动参数了：起完之后 POST /api/v1/workspace（空路径）即切到演示工程，
- * 服务端会按需播种并起推进器（见 index.js 的 syncDemo）；界面上就是 HUD 的「演示模式」按钮。
+ * There is no startup flag for demo mode anymore: after start, POST /api/v1/workspace (empty path)
+ * switches to the demo project, and the server seeds on demand and starts the ticker (see syncDemo
+ * in index.js); in the UI that is the "demo mode" button in the HUD.
  */
 
-// 运行时版本校验：server 现在优先由 Electron 内置 Node 启动（见 desktop/src/launcher.js 的 startServer），
-// 所以这里不再强卡 Node 大版本。仅在「纯 node 运行时」且低于 Node 22 时提示——
-// better-sqlite3@13 是 N-API，跨 Node 22/24 与 Electron 内置 Node 二进制兼容，22 即可。
+// Runtime version check: the server is now preferably started by Electron's bundled Node (see
+// startServer in desktop/src/launcher.js), so the Node major version is no longer hard-enforced
+// here. It only warns on a "pure node runtime" below Node 22 —— better-sqlite3@13 is N-API and its
+// binaries are compatible across Node 22/24 and Electron's bundled Node, so 22 suffices.
 const log = require('./log');
 {
   const cur = process.version.match(/^v(\d+)\.(\d+)\.(\d+)/);
@@ -83,8 +85,9 @@ async function selfTest() {
     createdAt: 1,
     lastSeenAt: 1,
     ephemeral: 0,
-    // 列已改名：旧 schema 的 project 现在是 project_label；并新增 client 列。
-    // 自检按 bus.js 的上报口径补齐，否则 better-sqlite3 报 Missing named parameter。
+    // Columns were renamed: the old schema's project is now project_label, and a client column was
+    // added. The self-test fills them in per bus.js's reporting criteria, otherwise better-sqlite3
+    // raises "Missing named parameter".
     projectLabel: null,
     client: null,
   });
@@ -110,7 +113,7 @@ async function selfTest() {
   const cp = checkpoint('TRUNCATE');
   close();
 
-  // 结构化输出，机器要读 —— 不打日志前缀、直接写 stdout
+  // Structured output, meant to be read by machines —— no log prefix, straight to stdout
   process.stdout.write(`${JSON.stringify({
     ok: true,
     dbFile: file,
@@ -141,7 +144,7 @@ async function main() {
     port: args.port ? Number(args.port) : undefined,
     token: args['no-token'] ? '' : undefined,
     workspacePath: typeof args.workspace === 'string' ? args.workspace : undefined,
-    // --log=debug / --log=error …（等价于 WORKGREMLIN_LOG；--log-file=0 关掉文件日志）
+    // --log=debug / --log=error … (equivalent to WORKGREMLIN_LOG; --log-file=0 disables file logging)
     log: typeof args.log === 'string' ? args.log : undefined,
   });
   if (args['log-file'] === '0') log.setFileEnabled(false);

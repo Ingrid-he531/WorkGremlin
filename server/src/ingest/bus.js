@@ -1,13 +1,13 @@
 'use strict';
 
 /**
- * Ingest 事件总线：A/B 两条来源统一落在这里 -> 写库 -> 广播。
+ * Ingest event bus: sources A/B both land here -> write to DB -> broadcast.
  *
- * 原则（leader/main 已批准，不得违反）：
- *   - B（agent 主动上报）是唯一真值来源；
- *   - A（目录监听）只兜底 roster 与消息，状态一律标记 degraded=1；
- *   - 心跳超时 60s -> degraded=1、state 不编造（保持最后一次上报值，仅打 degraded 标记）；
- *   - 进度/文件/耗时拿不到就是 NULL，绝不用 0 或随机值填充。
+ * Principles (approved by leader/main, must not be violated):
+ *   - B (agent self-report) is the single source of truth;
+ *   - A (directory watch) only backfills the roster and messages; its state is always marked degraded=1;
+ *   - heartbeat timeout 60s -> degraded=1, state is never fabricated (keep the last reported value, only flag degraded);
+ *   - progress/files/duration are NULL when unavailable, never filled with 0 or random values.
  */
 
 const path = require('node:path');
@@ -18,8 +18,8 @@ const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
 const { detectLevel, agentDescription } = require('../floors');
-// 成员状态降级前的守卫：别的会话还在跑就别压成空闲/离线（见 keepStateForOtherSession）。
-// 只单向依赖（sessions.js 不 require ingest/），没有循环。
+// Guard before degrading member state: don't push it to idle/offline while another session is still running (see keepStateForOtherSession).
+// One-way dependency only (sessions.js does not require ingest/), no cycle.
 const { hasOtherLiveSession, sessionModel } = require('../sessions');
 
 function projectIdOf(name) {
@@ -31,11 +31,12 @@ function memberIdOf(project, name) {
 }
 
 /**
- * 成员 client 归一化：只做 trim / 转小写，空值归 null。
+ * Member client normalization: trim / lowercase only, empty becomes null.
  *
- * 约定（与楼层 / client 模型一致）：**client 就是楼层产品基名**（codebuddy / codex …），
- * 形态（CLI / 插件）走 `form`，不进身份。这里**不校验**"是不是已知楼层"：传错（形态串
- * cli/vscode、或拼错的基名）就自然对不上任何楼层的过滤条件，前端不显示，无需在此拦截。
+ * Convention (consistent with the floor / client model): **client is the floor's product base name**
+ * (codebuddy / codex ...); the form (CLI / plugin) goes into `form`, not into identity. This **does not validate**
+ * "is it a known floor": a wrong value (a form string like cli/vscode, or a misspelled base name) simply
+ * matches no floor's filter, the frontend won't show it, no need to block it here.
  */
 function normClient(v) {
   const c = String(v || '').trim().toLowerCase();
@@ -43,44 +44,44 @@ function normClient(v) {
 }
 
 /**
- * 这一轮走的**形态**：'cli' / 'plugin'（IDE 扩展）。
- * 分不出的产品（Claude / Qoder…）与老数据留 NULL —— 任务列表退回只写产品名（如 "Codex"）。
+ * The **form** of this run: 'cli' / 'plugin' (IDE extension).
+ * Products that can't be distinguished (Claude / Qoder...) and old data stay NULL -- the task list falls back to the product name only (e.g. "Codex").
  */
 function normForm(v) {
   const s = String(v || '').trim().toLowerCase();
-  // form 存的是**形态**（cli / vscode / ide）。老数据 / 个别上报会把"来源名" plugin 当 form 传，
-  // 归一到它对应的形态 vscode —— 否则 isPluginClient 不认，任务列表的「… Plugin」标签会丢。
+  // form stores the **form** (cli / vscode / ide). Old data / some reports pass the "source name" plugin as form;
+  // normalize it to its corresponding form vscode -- otherwise isPluginClient won't recognize it and the task list's "... Plugin" label is lost.
   if (s === 'plugin') return 'vscode';
   if (s === 'cli' || s === 'ide' || isPluginClient(s)) return s;
   return null;
 }
 
-/** 模型名：拿不到就是 NULL（绝不猜），超长截断 */
+/** Model name: NULL when unavailable (never guessed), truncated when too long */
 function normModel(v) {
   const s = String(v == null ? '' : v).trim();
   return s ? s.slice(0, 64) : null;
 }
 
 /**
- * 会话 id（轴 2）：hook 的 payload `session_id` / 插件会话 id。
- * 拿不到就是 NULL —— 「没带会话标识」和「会话叫空串」是两回事，前者是合法的老数据形态。
- * 超长截断（128）纯属防御：真值是 UUID，插件侧可能是别的形式。
+ * Session id (axis 2): the hook payload's `session_id` / the plugin session id.
+ * NULL when unavailable -- "no session identifier" and "the session is an empty string" are two different things; the former is a legitimate legacy data shape.
+ * Truncation (128) is purely defensive: the real value is a UUID, the plugin side may use another form.
  */
 function normSession(v) {
   const s = String(v == null ? '' : v).trim();
   return s ? s.slice(0, 128) : null;
 }
 
-/** 任务 id：拿不到就是 NULL（同 normSession 的口径，绝不猜） */
+/** Task id: NULL when unavailable (same rule as normSession, never guessed) */
 function normTaskId(v) {
   const s = String(v == null ? '' : v).trim();
   return s ? s.slice(0, 128) : null;
 }
 
-/** 台账"产出"全文上限：AI 回复按 hook 侧 RESULT_MAX(4000) 送上来，这里必须 >= 它，否则会被砍掉 */
+/** Ledger "output" full-text cap: AI replies arrive with the hook-side RESULT_MAX(4000), this must be >= it or they get cut off */
 const RUN_RESULT_MAX = 4_000;
 
-/** 台账里的文本字段：压空白 + 截断；空串一律当"没有"（NULL） */
+/** Text fields in the ledger: collapse whitespace + truncate; an empty string always counts as "none" (NULL) */
 function normText(v, max) {
   const s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
   return s ? s.slice(0, max) : null;
@@ -95,17 +96,17 @@ function jsonOrNull(v) {
   }
 }
 
-/** 一个 token 计数：非负整数才认（浮点四舍五入、负数与非有限值一律当"没报"） */
+/** A single token count: only non-negative integers accepted (floats rounded, negatives and non-finite values all count as "not reported") */
 function normCount(v) {
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
 }
 
 /**
- * 收工带上来的 token（`{input, output, cacheRead, cacheWrite}`，语义见 schema.sql 的注释）。
- * 整块没带 / 某一项读不出 → 该项 NULL：报表留空显示 "—"，**不拿 0 冒充**"消耗为零"。
- * 取不到的楼层（5F TraeCode 无 usage、6F Qoder transcript 里没有、9F Copilot 没接）
- * 本来就整块不发，反正留空。
+ * Tokens reported on finish (`{input, output, cacheRead, cacheWrite}`; see the comments in schema.sql for semantics).
+ * Whole block missing / one field unreadable -> that field NULL: the report shows a blank "—", **never faking a 0** as "zero consumption".
+ * Floors that can't provide it (5F TraeCode has no usage, 6F Qoder has none in its transcript, 9F Copilot isn't wired up)
+ * don't send the block at all, so it just stays blank.
  * @returns {{input: number|null, output: number|null, cacheRead: number|null, cacheWrite: number|null}}
  */
 function normTokens(t) {
@@ -119,9 +120,9 @@ function normTokens(t) {
 }
 
 /**
- * 当前 HEAD 的 commit sha（工作区不是 git 仓库 / 没装 git 时返回 null）。
- * 用于"任务开始时"打基线，任务结束时再 diff 基线..HEAD 拿全量改动（含已提交部分）。
- * @param {string} ws 工程工作区绝对路径
+ * The current HEAD commit sha (returns null when the workspace is not a git repo / git isn't installed).
+ * Used to take a baseline at "task start"; at task end we diff baseline..HEAD for the full change set (including committed parts).
+ * @param {string} ws absolute path of the project workspace
  * @returns {string|null}
  */
 function gitHead(ws) {
@@ -137,10 +138,10 @@ function gitHead(ws) {
 }
 
 /**
- * 单个文件当前体积（字节）：按工作区路径 stat；文件不存在 / 非文件 -> null（绝不编造）。
- * 删除类文件在 enrichFiles 里直接置 null，不调本函数。
- * @param {string} ws 工程工作区绝对路径
- * @param {string} rel 工作区相对路径
+ * Current size of a single file (bytes): stat by workspace path; missing file / not a file -> null (never fabricated).
+ * Deleted files are set to null directly in enrichFiles; this function isn't called for them.
+ * @param {string} ws absolute path of the project workspace
+ * @param {string} rel path relative to the workspace
  * @returns {number|null}
  */
 function fileSize(ws, rel) {
@@ -154,31 +155,32 @@ function fileSize(ws, rel) {
 }
 
 /**
- * 把上报的文件清单补全为 [{path, op, size}]：
- *   - op 来自 hook（write=新增 / edit=改动 / delete=删除；老数据无 op 一律按改动计）；
- *   - size 由服务端按工作区路径 stat 当前文件体积（字节）；删除文件 / 不存在 -> null。
- * 同一文件多次出现时，"最后一次出现"的 op 为准（后者覆盖，决定最终归类）。
- * 最多保留前 50 条。空清单返回 null（落库时 files_json 置 NULL）。
- * @param {string} ws 工程工作区绝对路径
- * @param {Array<string|{path:string,op?:string}>} reportedFiles 上报侧给的文件
+ * Complete the reported file list into [{path, op, size}]:
+ *   - op comes from the hook (write=added / edit=modified / delete=deleted; old data without op always counts as modified);
+ *   - size is the current file size (bytes) stat'ed server-side by workspace path; deleted / missing files -> null.
+ * When the same file appears multiple times, the op of the "last occurrence" wins (later overwrites earlier, deciding the final classification).
+ * Keeps at most the first 50 entries. An empty list returns null (files_json is set to NULL when stored).
+ * @param {string} ws absolute path of the project workspace
+ * @param {Array<string|{path:string,op?:string}>} reportedFiles files given by the reporting side
  */
 function enrichFiles(ws, reportedFiles) {
   const reported = Array.isArray(reportedFiles) ? reportedFiles : [];
   const seen = new Map();
-  const sizeOf = new Map(); // hook 已算好的大小（按路径），优先于服务端 stat
+  const sizeOf = new Map(); // sizes already computed by the hook (by path), take priority over the server-side stat
   for (const it of reported) {
     const p = typeof it === 'string' ? it : (it && it.path);
     if (!p) continue;
     const op = typeof it === 'string' ? null : (it && it.op) || null;
-    seen.set(p, op); // 同一文件多次出现：后者覆盖（最后一次操作决定归类）
-    // 上报侧带了真实大小（hook 在收工那一刻按其真实工作区 stat 出来的）就记下，
-    // 服务端工程 workspace_path 对不上时也能正确显示文件大小。
+    seen.set(p, op); // same file appearing multiple times: later overwrites (the last operation decides the classification)
+    // Record it when the reporting side carried the real size (stat'ed by the hook against its real
+    // workspace at the moment of finish), so the file size still shows correctly when the server-side
+    // project workspace_path doesn't match.
     if (typeof it !== 'string' && it && typeof it.size === 'number') sizeOf.set(p, it.size);
   }
   if (!seen.size) return null;
   const list = [...seen.entries()].map(([p, op]) => {
     let size;
-    // 优先用 hook 给的大小；没有（老数据 / subagent 上报）再按服务端 workspace_path 兜底 stat。
+    // Prefer the size given by the hook; when absent (old data / subagent reports) fall back to stat by the server-side workspace_path.
     if (sizeOf.has(p)) size = sizeOf.get(p);
     else size = op === 'delete' ? null : fileSize(ws, p);
     return { path: p, op: op || 'edit', size };
@@ -191,9 +193,9 @@ function enrichFiles(ws, reportedFiles) {
  * @param {{ repo: any, hub: any, projectName?: string, project?: string|null }} ctx
  */
 function createIngestBus({ repo, hub, projectName = '', project = null }) {
-  /** 会随"打开工程"变化的东西：当前工程名 + 工程路径 + 当前工程（屋里显示谁的工位） */
+  /** Things that change with the "opened project": current project name + project path + current project (whose workstation the room shows) */
   const context = { projectName, project: project || null, workspacePath: '' };
-  /** memberId -> 'user' | 'project'：注册时按 subagent 目录判定一次 */
+  /** memberId -> 'user' | 'project': decided once at registration from the subagent directory */
   const levels = new Map();
 
   /**
@@ -230,22 +232,23 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 这一条上报该归到哪个**工程**（id）。
+   * Which **project** (id) this report should land under.
    *
-   * 上报里的 `project` 历史上取的是"办公室**当前打开**的那个工程"（hook 的 resolveCtx 从
-   * `/api/v1/workspace` 拿），而 `workspacePath` 是上报方**自己真实所在的目录**。
-   * "办公室开着 A、我在 B 里跑 CLI"的时候两者对不上：任务被归到 A。
-   * 实测 2026-09-29：在 /home/yinghui/work/stb-insight 里跑的 codex 任务，任务列表里挂在
-   * workgremlin 名下（办公室视图里那条会话的工程名却是对的 —— 会话走的是 rollout 的 cwd）。
+   * The `project` in the report historically took the project the office **currently has open**
+   * (the hook's resolveCtx reads it from `/api/v1/workspace`), while `workspacePath` is the directory
+   * the reporter **is actually in**. When "the office has A open but I'm running the CLI in B" the two
+   * disagree: the task gets attributed to A.
+   * Measured 2026-09-29: a codex task run in /home/yinghui/work/stb-insight showed up in the task list
+   * under workgremlin (the project name of that session in the office view was correct -- sessions follow the rollout's cwd).
    *
-   * 所以**以 workspacePath 为准**：
-   *   1) 按这个路径能找到已有工程 → 用它的 id（与办公室"打开工程"落的行是同一行）；
-   *   2) 找不到 → 按这个目录算名字（package.json name > 目录名，与 server/src/project.js 同口径）
-   *      并建一条；
-   *   3) 没带 workspacePath（老上报 / 手工脚本）→ 退回 `project` 字段，行为不变。
-   * @param {string} reportedProject 上报里的 project（办公室当前工程名，仅作兜底）
-   * @param {string} workspacePath 上报方真实所在目录
-   * @returns {string} 工程 id（空串 = 两边都没给，调用方按 missing project 处理）
+   * So **workspacePath wins**:
+   *   1) an existing project is found by this path -> use its id (same row as the office's "open project");
+   *   2) not found -> derive a name from this directory (package.json name > directory name, same rule as server/src/project.js)
+   *      and create one;
+   *   3) no workspacePath given (old reports / hand-written scripts) -> fall back to the `project` field, behavior unchanged.
+   * @param {string} reportedProject the project in the report (office's current project name, fallback only)
+   * @param {string} workspacePath the directory the reporter is actually in
+   * @returns {string} project id (empty string = neither side given it, the caller treats it as missing project)
    */
   function projectForReport(reportedProject, workspacePath = '') {
     const ws = String(workspacePath || '').trim();
@@ -265,12 +268,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 注册一个成员（小怪物 / 主 agent / 幽灵）。
+   * Register a member (gremlin / main agent / ghost).
    *
-   * 契约：**client 必传，且就是楼层产品基名**（codebuddy / codex …）。调用方本身就处于某个
-   * 楼层的上下文里，必须传对自己那一层；传错（形态串或拼错的基名）前端按楼层过滤自然不显示，
-   * 这里不校验。memberId 是成员**名字**（含工程后缀，如 peter@workgremlin），与 client 是两回事，
-   * 不要混用——楼层比的是 client，memberId 只当主键。
+   * Contract: **client is required and is the floor's product base name** (codebuddy / codex ...). The
+   * caller is already in some floor's context and must pass its own floor; a wrong value (a form string or
+   * a misspelled base name) simply won't match any floor filter on the frontend, and isn't validated here.
+   * memberId is the member's **name** (with the project suffix, e.g. peter@workgremlin) and is a different
+   * thing from client -- don't mix them up: floors compare client, memberId is only the primary key.
    *
    * @param {{project: string, memberId?: string, name: string, role?: string, sessionId?: string, workspacePath?: string,
    *          ephemeral?: boolean, projectLabel?: string|null, client: string, reported?: number}} p
@@ -286,14 +290,14 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       name: p.name || id.split('@')[0],
       role: p.role ?? null,
       sessionId: p.sessionId ?? null,
-      // reported=0 表示"仅被动观测"（A 路线发现的成员），不主动上报真值
+      // reported=0 means "passively observed only" (a member discovered by route A), it does not actively report truth
       reported: p.reported === 0 ? 0 : 1,
       createdAt: existing ? existing.created_at : now(),
       lastSeenAt: now(),
-      // 临时成员（无工位 / 场景里是幽灵）。老成员的 ephemeral 只升不降（见 upsertMember 的 MAX）
+      // Ephemeral member (no workstation / a ghost in the scene). An existing member's ephemeral only goes up, never down (see upsertMember's MAX)
       ephemeral: p.ephemeral ? 1 : 0,
       projectLabel: p.projectLabel ?? null,
-      // 来源客户端（演示/手工数据没有，就是 NULL）
+      // Source client (absent for demo/hand-made data, i.e. NULL)
       client: normClient(p.client),
     });
     // subagent level (user / project): the caller may pass it (floors detect their own agents);
@@ -337,7 +341,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 心跳 / 轻量状态更新。
+   * Heartbeat / lightweight state update.
    * @param {{project: string, memberId: string, state?: string, progress?: number, taskId?: string, files?: string[], ts?: number}} p
    */
   function heartbeat(p) {
@@ -351,16 +355,17 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const sessionId = normSession(p.sessionId);
     const sessionPrev = sessionId ? repo.getSessionStatus.get({ memberId: id, sessionId }) : null;
     /**
-     * 这条会话**自己**还没收工的那条任务（没有 → null）。
+     * The task of **this session** itself that hasn't finished yet (null when there is none).
      *
-    * `agent_status.task_id` 仍是成员卡的单槽位聚合值；任务记录的精确存活状态另写入
-    * `session_status`。心跳仍认领成员槽位，让成员卡跟上最近活动的会话，但不会替代会话级状态。
+    * `agent_status.task_id` remains a single-slot aggregate value on the member card; the precise liveness of
+    * task records is written separately to `session_status`. The heartbeat still claims the member slot, keeping
+    * the member card up to date with the most recently active session, but does not replace session-level state.
      */
     const mine = liveTaskOf(project, id, p.sessionId);
     const state = AGENT_STATES.includes(p.state)
       ? p.state
-      : // 认领到在飞任务、槽位却挂在 idle/offline 上 = "任务在跑、成员空闲"，存活判定照样
-        // 看不见它（判据要求 busy/thinking/blocked）→ 一起抬成 busy。只抬这两种，别的照旧。
+      : // Claimed an in-flight task but the slot still sits at idle/offline = "task running, member idle", so the liveness check
+        // can't see it either (its criteria require busy/thinking/blocked) -> lift both to busy. Only these two are lifted; everything else stays as-is.
         mine && prev && (prev.state === 'idle' || prev.state === 'offline')
         ? 'busy'
         : prev
@@ -406,18 +411,20 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 这条会话要把成员状态往下压（空闲 / 离线）时，同产品的**别的会话**是不是还在跑。
+   * When this session wants to push the member state down (idle / offline), is another session of the
+   * same product still running?
    *
-   * `agent_status` 是按成员一行存的，没有会话维度：同一个 Claude Code 开着 A / B 两条会话，
-   * A 收工（Stop → idle）或退出（SessionEnd → offline）会去写那唯一一行，B 还在干活却显示「离线」。
-   * 所以降级前先问 sessions.js 的 hasOtherLiveSession：还有别的会话活着就**整块跳过这次状态写入**
-   * （连 taskId / currentFiles 一起留着 —— 那是还在跑的那条会话的，清掉等于把它的卡也擦干净）。
+   * `agent_status` stores one row per member with no session dimension: with the same Claude Code running
+   * sessions A and B, A finishing (Stop -> idle) or exiting (SessionEnd -> offline) writes that single row,
+   * so B is still working but shows "offline". So before degrading, ask sessions.js's hasOtherLiveSession:
+   * if another session is still alive, **skip this state write entirely** (leaving taskId / currentFiles
+   * intact -- they belong to the still-running session, and clearing them would wipe its card too).
    *
-   * 不拦**升级**（busy / thinking / blocked / online）：那不会造成"还在干活却显示离线"。
-   * 也不拦没有会话标识的上报（老 hook / 别的产品）→ 行为与改动前完全一致。
-   * @param {string} state 本次想写的状态
-   * @param {any} member 服务端的成员行（client 从它取）
-   * @param {any} p 上报体
+   * **Upgrades** (busy / thinking / blocked / online) are not blocked: they can't cause "still working but showing offline".
+   * Reports with no session identifier (old hooks / other products) aren't blocked either -> behavior is exactly as before the change.
+   * @param {string} state the state this call wants to write
+   * @param {any} member the server-side member row (client is taken from it)
+   * @param {any} p the report body
    */
   function keepStateForOtherSession(state, member, p) {
     if (state !== 'idle' && state !== 'offline') return false;
@@ -429,18 +436,19 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         session: String(p.sessionId),
       });
     } catch {
-      return false; // 读盘失败就当没有 —— 宁可降级，也不要因为守卫报错把状态卡死
+      return false; // treat a read failure as none -- better to degrade than to have the guard's error freeze the state
     }
   }
 
   /**
-   * 成员行上挂的那个 task，是不是**本次上报这条会话**的（轴 2）。
+   * Is the task hanging on the member row owned by **the session in this report** (axis 2)?
    *
-  * 用途：`agent_status` 的成员卡只有一个 task_id 槽位；任务记录现由 `session_status` 独立判活。
-  * 这里仍需判断归属，避免一个会话的 idle / 收工状态清掉另一会话在成员卡上的任务指针。
+  * Purpose: the member card in `agent_status` has a single task_id slot; task records are now judged live
+  * independently by `session_status`. Ownership still has to be checked here, so one session's idle / finish
+  * state doesn't clear another session's task pointer on the member card.
    *
-   * 归属靠 `task_runs.session_id`（轴 2 新加的列）。
-   * @returns {boolean|null} true=是它的 / false=不是它的 / null=判不了（查不到这一行，或两边有一边没会话标识）
+   * Ownership comes from `task_runs.session_id` (a column newly added for axis 2).
+   * @returns {boolean|null} true=it is theirs / false=it is not theirs / null=cannot tell (that row isn't found, or one side has no session identifier)
    */
   function taskOwnedBy(taskId, sessionId) {
     const sid = normSession(sessionId);
@@ -448,7 +456,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     try {
       const run = repo.getTaskRun.get(taskId);
       const owner = run && normSession(run.session_id);
-      if (!owner) return null; // 老数据（加 session_id 之前的任务）→ 判不了，维持老行为
+      if (!owner) return null; // old data (tasks from before session_id was added) -> cannot tell, keep the old behavior
       return owner === sid;
     } catch {
       return null;
@@ -456,30 +464,32 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 决定这次 `/status` 之后，成员行的 task_id 槽位该写谁。
+   * Decide who the member row's task_id slot should hold after this `/status`.
    *
-   * 优先级：
-   *   1. 上报体**带了个真 taskId**（新 hook 干活时每次都带）→ 以它为准。
-  *      这条会话就此认领成员卡槽位；任务存活证明写在该会话自己的 session_status 行。
-   *   2. **显式 null**（新 hook 收工时带）= "我这边没任务了" → 只清**自己**占的槽位：
-   *      槽位是空的、或本来就是我的、或归属判不出来 → 清掉；
-   *      槽位被**别的会话**占着 → 留着，别把人家还在跑的任务擦掉（A 收工不能把 B 的任务抹了）。
-   *   3. 没带这个字段（老 hook / mock / 别的产品）→ 沿用 prev；但**若 prev 的 task 属于别的
-   *      会话**就清空 —— 那条会话已经不往这儿写状态了，还把它挂在成员行上，会让一个早已结束的
-   *      任务因为"心跳不断"而被判成「进行中」。
-   *   4. 归属判不了（加 session_id 之前的老数据）→ 沿用 prev，与改动前完全一致。
+   * Priority:
+   *   1. The report body **carries a real taskId** (the new hook always sends it while working) -> it wins.
+  *      This session thereby claims the member card slot; the proof that the task is alive is written to that session's own session_status row.
+   *   2. **Explicit null** (sent by the new hook on finish) = "I have no task anymore" -> clear only the slot **we** hold:
+   *      the slot is empty, or was already ours, or ownership cannot be determined -> clear it;
+   *      the slot is held by **another session** -> leave it, don't wipe someone else's still-running task (A finishing must not erase B's task).
+   *   3. The field isn't sent at all (old hook / mock / other products) -> keep prev; but if **prev's task belongs to another
+   *      session** clear it -- that session no longer writes state here, and leaving it on the member row would let a long-finished
+   *      task be judged "in progress" just because "the heartbeat keeps coming".
+   *   4. Ownership cannot be determined (old data from before session_id was added) -> keep prev, exactly as before the change.
    *
-   * 注意判的是 `hasOwnProperty` 而不是真值：省略与显式 `null` 是两件事。
-   * @param {any} prev agent_status 里现有那一行（可能不存在）
-   * @param {any} p 上报体
+   * Note this checks `hasOwnProperty` rather than truthiness: omission and an explicit `null` are two different things.
+   * @param {any} prev the existing row in agent_status (may not exist)
+   * @param {any} p the report body
    * @returns {string|null}
    */
   /**
-   * 台账里**还没收工**的那条任务是哪条 —— 心跳与收工据此决定成员行的 task_id 槽位。
+   * Which task in the ledger is **not yet finished** -- the heartbeat and finish paths use this to decide
+   * the member row's task_id slot.
    *
-   * 给了 `sessionId` 就只看这条会话名下的（心跳用：会话自己的在飞任务最准，见 heartbeat）；
-   * 没给就看本成员最新的那条（收工往外交接用，见 endTask）。查不到 / 读库报错都回 null：
-   * 宁可不动槽位，也不能让上报因为这里报错被打挂。
+   * With a `sessionId` given, only that session's tasks are considered (used by the heartbeat: a session's own
+   * in-flight task is the most accurate, see heartbeat); without it, the member's latest task (used to hand the
+   * slot over outward on finish, see endTask). Not found / a DB error both return null:
+   * better to leave the slot untouched than to have the report die from an error here.
    */
   function liveTaskOf(project, memberId, sessionId) {
     try {
@@ -505,7 +515,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 显式状态切换（含 blocked + 原因）。
+   * Explicit state transition (including blocked + reason).
    */
   function setStatus(p) {
     const project = projectIdOf(p.project);
@@ -523,7 +533,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         : sessionPrev && sessionPrev.task_id;
       writeSessionStatus(id, sessionId, state, sessionTaskId, ts);
     }
-    // 别的会话还在跑 → 别把成员整体压成空闲/离线
+    // Another session is still running -> don't push the whole member down to idle/offline
     if (keepStateForOtherSession(state, member, p)) {
       return { ok: true, skipped: 'other_session_live', card: buildMemberCard(id) };
     }
@@ -553,8 +563,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
     const id = p.taskId || `t_${ts.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // 开新轮之前先给上一轮补一刀（同一会话不可能同时跑两轮），见 endStaleTasksOfSession。
-    // 带 client：CLI 的新轮只收 CLI 同会话的旧任务，不会把 IDE 插件还在跑的任务掐掉。
+    // Before opening a new round, close out the previous one (a session can't run two rounds at once), see endStaleTasksOfSession.
+    // Passes client: a new CLI round only collects the old tasks of the same CLI session, and won't cut off tasks the IDE plugin is still running.
     endStaleTasksOfSession({ project, sessionId: p.sessionId, ts, excludeTaskId: id, client: normClient(p.client) });
 
     repo.insertTask.run({
@@ -581,8 +591,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       updatedAt: ts,
     });
     writeSessionStatus(member.id, p.sessionId, 'busy', id, ts);
-    // 台账：**主 agent** 的一轮任务 = 一次用户任务（输入就是用户原话）。
-    // subagent 实例不走这条（它们记 subagent_runs），所以判据是"上报者是不是主 agent"。
+    // Ledger: one round of tasks for the **main agent** = one user task (the input is the user's own words).
+    // subagent instances don't take this path (they record subagent_runs), so the criterion is "is the reporter a main agent".
     if (String(member.role || '') === 'agent') {
       const wsRow0 = repo.getProject.get(project);
       const baseline = wsRow0 && wsRow0.workspace_path ? gitHead(wsRow0.workspace_path) : null;
@@ -594,10 +604,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         client: client0,
         sessionId: normSession(p.sessionId),
         form: normForm(p.form),
-        // hook payload 里没有模型字段的产品（TraeCode 六个事件都不带、Claude Code 除
-        // SessionStart 外也都不带），为空时按会话去**各自的落盘**里取当前模型
-        // （见 sessions.sessionModel：trae / claude 两个适配器）。
-        // 取不到就是空 —— 报表的"模型"列留空，不拿默认模型冒充。
+        // Products whose hook payload carries no model field (TraeCode omits it in all six events, Claude Code
+        // omits it everywhere except SessionStart): when empty, fetch the current model from each session's
+        // **own on-disk files** (see sessions.sessionModel: the trae / claude adapters).
+        // Empty when unavailable -- the report's "model" column stays blank, never faked with a default model.
         model: normModel(p.model) || sessionModel(p.memberId, p.sessionId) || null,
         title: p.title || '(未命名任务)',
         startedAt: ts,
@@ -638,43 +648,49 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 收掉同一会话里**更早开始、至今还没收尾**的任务 —— 也就是被这一轮顶掉的上一轮。
+   * Close tasks in the same session that **started earlier and still haven't wrapped up** -- i.e. the
+   * previous round that this round superseded.
    *
-   * 判据是硬的：**一个会话不可能同时跑两轮**。新一轮都开跑了，上一轮必定已经结束，
-   * 台账上它还挂着 running 只是因为它的结束事件永远到不了。
+   * The criterion is hard: **a session cannot run two rounds at once**. Once the new round has started,
+   * the previous round must already be over; it only still shows running in the ledger because its end
+   * event can never arrive.
    *
-   * 为什么必须服务端自己补：CodeBuddy **插件**（IDE 形态）按停止时**一个 hook 事件都不发**
-   * （CLI 那条 FinalStop 在 IDE 形态等不到），而 hook 的状态文件是**一会话一份**的 ——
-   * 新一轮的 /task/start 会把 taskId / taskStartedAt 整份覆盖，上一轮从此连兜底扫描
-   * （readReporterDones → codebuddy.cancelAt）都够不着，那一行就永远挂在「进行中」：
-   * 用户看到的就是"取消了任务，屏上还是进行中，主控制台却已经待命中"。
+   * Why the server must do this itself: the CodeBuddy **plugin** (IDE form) sends **no hook event at all**
+   * on stop (the CLI's FinalStop never comes in the IDE form), and the hook's state file is **one per
+   * session** -- the new round's /task/start overwrites taskId / taskStartedAt wholesale, so the previous
+   * round is thereafter out of reach even for the fallback scan (readReporterDones -> codebuddy.cancelAt),
+   * and that row stays stuck at "in progress" forever: what the user sees is "I cancelled the task, the
+   * screen still says in progress, but the main console is already idle".
    *
-   * 状态用 cancelled：真正常收工的产品会发 Stop / FinalStop（那是 done），走到这里说明
-   * 这一轮没有任何结束事件 —— 它不是正常收工。只按**同一 sessionId** 收，
-   * 不动别的会话（同一成员开两个窗口是合法的并行，不能互相掐）。
-   * @returns {number} 收掉几条
+   * The state used is cancelled: products that finish normally send Stop / FinalStop (that would be done);
+   * reaching here means this round had no end event at all -- it was not a normal finish. Only collect
+   * within the **same sessionId**, and never touch other sessions (one member running two windows is
+   * legitimate parallelism, they must not cut each other off).
+   * @returns {number} how many were closed
    */
   function endStaleTasksOfSession({ project: p0, sessionId, ts: ts0, excludeTaskId = '', client: client0 } = {}) {
     const project = projectIdOf(p0);
     const sid = normSession(sessionId);
     if (!sid || !repo.listStaleRunningBySession) return 0;
     const ts = Number(ts0) || now();
-    // 只收"同一形态（CLI / 插件）"的旧任务。CodeBuddy 的 CLI 与 Plugin 同属 1F、还可能共用
-    // 同一个 session_id（同一个对话既能被终端命令又能被 IDE 扩展上报），但它们各跑各的任务 ——
-    // CLI 开新轮绝不能把 IDE 插件还在跑的任务取消掉（这就是之前"跑 CLI 把插件任务掐了"的 bug）。
-    // want 为空（上报没带 client，老数据）时退回只按会话过滤，保持旧行为。
+    // Only collect old tasks of "the same form (CLI / plugin)". CodeBuddy's CLI and Plugin are both on 1F and
+    // may even share one session_id (the same conversation can be reported by a terminal command or by an
+    // IDE extension), but they run their own tasks -- a new CLI round must never cancel a task the IDE
+    // plugin is still running (this was the earlier "running the CLI killed the plugin's task" bug).
+    // When want is empty (the report carried no client, old data), fall back to filtering by session only, keeping the old behavior.
     const want = normClient(client0);
     let n = 0;
     for (const old of repo.listStaleRunningBySession.all(project, sid)) {
       if (!old.id || old.id === excludeTaskId) continue;
-      // **同刻开工的也是这一轮自己**，不是被顶掉的上一轮：新一轮的 started_at 与注册表扫描
-      // 从状态文件读到的 taskStartedAt 是同一个值（同一份 hook 上报），而且这里的调用方
-      // （sessionRegistry.flushSupersededTasks）传不出 excludeTaskId —— 曾经用 `>` 判界，
-      // 结果每条新任务开工瞬间就被这一刀当成"上一轮"写成 cancelled（ticker 开场就滚
-      // 「已取消」、任务记录/成员卡全跟着错，真收工时才被重写回来）。实测 2026-10-09。
+      // **A task that started at the same instant is this round itself**, not the superseded previous round: the
+      // new round's started_at and the taskStartedAt the registry scan reads from the state file are the same
+      // value (from the same hook report), and the caller here (sessionRegistry.flushSupersededTasks) cannot
+      // pass excludeTaskId -- an earlier `>` boundary test made every new task get cut as the "previous round"
+      // and written as cancelled the instant it started (the ticker rolled "cancelled" from the start, and the
+      // task record / member card were both wrong until the real finish rewrote them). Measured 2026-10-09.
       if (Number(old.startedAt) && Number(old.startedAt) >= ts) continue;
       const oc = normClient(old.client);
-      if (want && oc && oc !== want) continue; // 不同形态互不相掐
+      if (want && oc && oc !== want) continue; // different forms never cut each other off
       endTask({ project, memberId: old.memberId, taskId: old.id, state: 'cancelled', ts });
       n += 1;
     }
@@ -692,8 +708,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const prev = repo.getStatus.get(member.id);
     const nextSessionTask = liveTaskOf(project, member.id, p.sessionId);
     writeSessionStatus(member.id, p.sessionId, nextSessionTask ? 'busy' : 'idle', nextSessionTask, ts);
-    // 收工要把成员压回 idle；但同产品的别的会话还在跑时不能压（否则 B 干着活、卡片显示空闲，
-    // 而且 taskId / currentFiles 会被清空、把 B 的任务卡一起擦掉）。见 keepStateForOtherSession。
+    // Finishing pushes the member back to idle; but it must not be pushed while another session of the same
+    // product is still running (otherwise B is working while the card shows idle, and taskId / currentFiles
+    // get cleared, wiping B's task card too). See keepStateForOtherSession.
     if (!keepStateForOtherSession('idle', member, p)) {
       repo.upsertStatus.run({
         memberId: member.id,
@@ -709,17 +726,18 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       });
     } else {
       /**
-       * 还有别的会话在跑 → 不压 idle，但槽位**不能就这么留着**。
+       * Another session is still running -> don't push to idle, but the slot **can't just be left as is**.
        *
-      * 槽位只有一个、归"最后一个 `/task/start` 的会话"。收工的会话如果正是它，成员卡指针会停在
-      * 已结束任务上；任务列表不受影响，因为它按 session_status 判活。这里仍须交接槽位，避免
-      * 成员卡显示旧任务或空闲。
+      * There is only one slot, owned by "the session of the last `/task/start`". If the finishing session happens to be it,
+      * the member card pointer would sit on a finished task; the task list is unaffected because it judges liveness by
+      * session_status. The slot still has to be handed over here, to avoid the member card showing an old task or idle.
        *
-       * 所以按台账把槽位**交接**给本成员还没收工的最新那条任务；台账里一条都没有（别的会话只在
-       * hook 状态文件里活着、还没写台账）→ 清空槽位，宁可空着也不要指错。
+       * So hand the slot **over** per the ledger to the member's latest unfinished task; when the ledger has none at all
+       * (the other session only lives in the hook state file and hasn't written to the ledger yet) -> clear the slot,
+       * preferring empty over pointing at the wrong thing.
        *
-      * state 一般保持原样（那条会话的相位由它自己的心跳写，这里不越权改）；只有交接成功、
-      * 而槽位挂在 idle/offline 上时才抬成 busy，保持成员卡与其任务指针一致。
+      * state usually stays as is (that session's phase is written by its own heartbeat, we don't overstep here); only when
+      * the handover succeeds and the slot sits at idle/offline is it lifted to busy, keeping the member card consistent with its task pointer.
        */
       const next = liveTaskOf(project, member.id, '');
       repo.upsertStatus.run({
@@ -746,21 +764,23 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         tsMs: ts,
       });
     }
-    // 台账收尾：结束时间 / 花费时间 / 产出（收尾自述）/ 本轮改动文件
+    // Ledger wrap-up: end time / elapsed time / output (the finish summary) / files changed this round
     if (String(member.role || '') === 'agent') {
       const run = repo.getTaskRun.get(p.taskId);
-      // 模型靠**落盘**取的产品（Claude Code / TraeCode）在这儿补一刀：开轮时 transcript 里还
-      // 没有本轮的 assistant 行，读到的是上一轮的模型（会话第一轮则一条都没有、直接为空），
-      // 收尾时再按会话取一次就能拿到本轮真实的那个。见 sessions.sessionModel。
+      // Products that get their model from **on-disk files** (Claude Code / TraeCode) get another pass here: at
+      // round start the transcript has no assistant line for this round yet, so what was read was the previous
+      // round's model (or nothing at all for a session's first round, hence empty); reading once more by session
+      // at finish gets this round's real one. See sessions.sessionModel.
       const endClient = (run && run.client) || member.client || null;
       const endSession = (run && run.session_id) || normSession(p.sessionId);
-      // 但**只在行上还没有模型时才回填**：endTaskRun 是 `model = COALESCE(@model, model)`，
-      // COALESCE 挡的是 null、不挡非空值 —— 无脑回填会把别的楼层开轮时取到的模型改写成
-      // 收尾时重取的另一个值（轮中途换过模型的话就是两个值），那是偷偷改别人楼层的历史。
+      // But **only backfill when the row has no model yet**: endTaskRun is `model = COALESCE(@model, model)`,
+      // and COALESCE only blocks null, not non-empty values -- blind backfilling would rewrite the model another
+      // floor fetched at round start into the different value re-fetched at finish (two values if the model was
+      // switched mid-round), which is silently editing another floor's history.
       const refill = !run || !run.model ? normModel(sessionModel(endClient, endSession)) : null;
       const endModel = normModel(p.model) || refill;
       if (!run) {
-        // 老 hook 或中途接上的：起点未知就别编，started_at 留 NULL、duration 也算不出来
+        // An old hook or one attached mid-round: the start is unknown, so don't fabricate it -- leave started_at NULL and duration cannot be computed either
         repo.upsertTaskRun.run({
           id: p.taskId,
           projectId: project,
@@ -776,13 +796,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       const startedAt = run ? Number(run.started_at) || null : null;
       const wsRow = repo.getProject.get(project);
       let reportedFiles = Array.isArray(p.files) ? p.files : [];
-      // 兜底（bug 3）：hook 的状态文件被并发覆盖时 roundFiles 会变空 ——"修改的文件"整列空着。
-      // file_activity 里本来就有本轮每一条 file/touch 的真值，用任务窗口回捞一次补上。
+      // Fallback (bug 3): when the hook's state file is overwritten concurrently, roundFiles becomes empty -- the whole "files modified" column is blank.
+      // file_activity already holds the truth of every file/touch in this round, so scoop it back once using the task window.
       if (!reportedFiles.length && startedAt) {
         const act = repo.listActivityInWindow.all(member.id, startedAt, ts, 50);
-        // op 照 file_activity 里记的填（本库实测只有 'write'）。不认得的值留 null，
-        // 绝不统一编造成 'edit' —— 那是把"新增"说成"改动"，正踩「绝不编造」那条纪律。
-        // 删除类文件根本不进这张表，所以回捞这条路本来就拿不到删除项，认了就是。
+        // Fill in op as recorded in file_activity (this DB only ever has 'write'). Unrecognized values stay null,
+        // and never fabricate them all as 'edit' -- that would call an "added" file "modified", stepping right on the "never fabricate" discipline.
+        // Deleted files never enter this table at all, so this scoop path can't get deletions anyway; accept that.
         if (act.length) reportedFiles = act.map((f) => ({ path: f.path, op: f.op === 'write' ? 'write' : null }));
       }
       const filesJson = enrichFiles(wsRow ? wsRow.workspace_path : '', reportedFiles);
@@ -791,9 +811,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         : Number.isFinite(Number(p.fileCount))
           ? Number(p.fileCount)
           : null;
-      // 标题兜底：开轮时 prompt 没取到（CLI 这个客户端有时不带上 prompt 文本），
-      // startTask 会落成「(未命名任务)」。收工时若还是这个默认值 / 空，就用本轮改动的文件
-      // 派生一个有意义、不编造的标题（取首个改动文件的路径），至少能跟别轮区分开。
+      // Title fallback: when the prompt wasn't available at round start (this CLI client sometimes doesn't send the prompt text),
+      // startTask lands on "(未命名任务)". If it's still that default / empty at finish, derive a meaningful, non-fabricated title
+      // from the files changed this round (take the first changed file's path), so at least rounds can be told apart.
       const UNNAMED = new Set(['', '(未命名任务)', '（未命名任务）']);
       const haveTitle = run && run.title && !UNNAMED.has(String(run.title));
       let finalTitle = haveTitle ? run.title : null;
@@ -814,14 +834,14 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         endedAt: ts,
         durationMs: startedAt && ts > startedAt ? ts - startedAt : null,
       });
-      /* 本轮消耗的 token：hook / 插件从会话落盘里读出来的真值
-         （见 reporter/src/usage.js 与 plugin/index.js）。
-         取不到就是 NULL —— 这一列空着表示"这个楼层报不出来"，与"消耗为 0"是两回事。
+      /* Tokens consumed this round: the truth read by the hook / plugin from the session's on-disk files
+         (see reporter/src/usage.js and plugin/index.js).
+         NULL when unavailable -- a blank in this column means "this floor can't report it", which is different from "zero consumption".
 
-         **整块没带就不动这一行已有的值**（不是写 NULL）：同一个 taskId 可能被收工两次
-         （Stop 之后再来一刀 SessionEnd / 打断路径），后一刀读不出 usage 时若照着 NULL 写，
-         会把前一刀落的真值擦掉 —— "没报"只该表示"这次没带数"，不该抹掉已经记下的数。
-         全新的一行本来就是 NULL，所以"不动"与"留空"在这里是同一个结果。 */
+         **When the whole block is missing, leave the row's existing value untouched** (do not write NULL): the same taskId may be
+         finished twice (a second pass with SessionEnd / the interrupt path after Stop); if the second pass wrote NULL when it
+         couldn't read usage, it would erase the truth written by the first -- "not reported" should only mean "no number this
+         time", not wipe out an already-recorded number. A brand-new row is NULL anyway, so "leave untouched" and "stay blank" are the same result here. */
       if (p.tokens && typeof p.tokens === 'object') {
         const tk = normTokens(p.tokens);
         repo.setTaskRunTokens.run({
@@ -835,27 +855,28 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
-    // 幽灵收工时顺手刷同名常驻小怪物的卡：它这一轮的产出会被那张卡借去显示（见 ghostArtifacts）
+    // On a ghost's finish, also refresh the same-named resident gremlin's card: its output this round is borrowed for display on that card (see ghostArtifacts)
     const heir = heirOf(member);
     if (heir) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(heir));
     return { ok: true };
   }
 
   /**
-   * 收工**之后**补报这一轮的 token（只写 token 四列，别的字段一个都不动）。
+   * Report this round's tokens **after** finishing (writes only the four token columns, nothing else).
    *
-   * 为什么要单开这一条、而不是再调一次 endTask：endTask 会重写 result / files / ended_at
-   * （`COALESCE` 挡不住显式的空字符串），补报时手上只有 token，一刀下去会把收工时落的
-   * 产出摘要和文件清单抹掉。
+   * Why a separate entry instead of calling endTask again: endTask rewrites result / files / ended_at
+   * (`COALESCE` can't block an explicit empty string), and on a backfill we only have the token, so one
+   * pass would wipe the output summary and file list written at finish.
    *
-   * 为什么要补：CodeBuddy **插件**形态（VS Code 扩展）那条 request 的 usage 落盘比 Stop
-   * 晚得多 —— 收工那一刻（甚至等 1.2s 之后）index.json 里它还是 `{state:'running'}`，
-   * 没有 startedAt 也没有 usage（本机实测：0c1f… 会话第一轮 Stop 于 14:12:41，
-   * 那条 request 直到第二轮开始之后才补上 usage）。所以收工时读不到真值不是"没数"，
-   * 是"数还没落到盘上" —— 等它落了再补一刀才是真值。
+   * Why backfill at all: for the CodeBuddy **plugin** form (the VS Code extension), that request's usage
+   * lands on disk much later than Stop -- at the moment of finish (even 1.2s later) it is still
+   * `{state:'running'}` in index.json, with no startedAt and no usage (measured locally: the 0c1f... session's
+   * first round stopped at 14:12:41, and that request only got usage after the second round had begun). So
+   * failing to read the truth at finish doesn't mean "there is no number", it means "the number hasn't landed
+   * on disk yet" -- waiting for it to land and then writing it again is the truth.
    *
-   * 定位不到（会话里没有"收工了但没数"的行 / 起点对不上）就原样返回 ok，
-   * 一行都不写 —— 与"没数就是没数"同一条纪律：绝不写到别的轮次头上。
+   * When it can't be located (no "finished but without numbers" row in the session / the start doesn't match),
+   * return ok as is and write nothing -- same discipline as "no number means no number": never write onto another round's head.
    */
   function backfillTaskTokens(p) {
     const project = projectIdOf(p.project);
@@ -879,10 +900,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 台账：记一次召唤（subagent 实例）的开场。
-   * 有小工位的（susan）和没工位的（code-explorer / 内置专家直接 spawn 的）都记 ——
-   * 「这一轮用了几个 subagent」这条账就是靠它。
-   * @returns {number|null} 台账行 id（收工时交给 endSubagentRun）
+   * Ledger: record the opening of one summon (a subagent instance).
+   * Records both those with a workstation (susan) and those without (code-explorer / directly spawned built-in experts) --
+   * the "how many subagents did this round use" account relies on it.
+   * @returns {number|null} the ledger row id (handed to endSubagentRun on finish)
    */
   function startSubagentRun(p) {
     const project = projectIdOf(p.project);
@@ -895,14 +916,14 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       client: normClient(p.client),
       model: normModel(p.model),
       title: normText(p.title, 200),
-      // 召唤时没给任务行的话，开始时刻就是"不知道" —— 留 NULL（耗时也算不出来），不拿现在冒充填
+      // If no task row was given at summon time, the start moment is "unknown" -- leave NULL (elapsed time can't be computed either), never filled with "now" as a stand-in
       startedAt: p.startedAt === null ? null : Number(p.startedAt) || now(),
     });
     return r && r.lastInsertRowid ? Number(r.lastInsertRowid) : null;
   }
 
   /**
-   * 台账：subagent 实例收工 —— 补产出（收工摘要）、结束时间与花费时间。
+   * Ledger: a subagent instance finished -- fill in output (the finish summary), end time and elapsed time.
    * @param {{id: number|null, project?: string, result?: string, model?: string, files?: string[], endedAt?: number}} p
    */
   function endSubagentRun(p) {
@@ -1155,8 +1176,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 当前工程里**主 agent**（role='agent'）正在跑的任务 id。
-   * 召唤关系拿不到时（老 hook 写的清单没有 parent 字段）用它兜底认父。
+   * The task id currently being run by the **main agent** (role='agent') in the current project.
+   * Used as a fallback to identify the parent when the summon relationship is unavailable (old hooks write lists with no parent field).
    * @param {string} project
    */
   function currentMainTaskId(project) {
@@ -1165,15 +1186,17 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 回捞：某成员当前进行中的任务（bug 3 兜底）。
+   * Scoop-back: a member's currently running task (bug 3 fallback).
    *
-   * 场景：hook 的状态文件是"读-改-写"的，CLI 同一毫秒并行触发多个 hook 进程时会互相覆盖，
-   * taskId 被冲掉 → Stop 不发 task/end → 产出摘要 / 改动文件 / 结束时间整块丢，任务永远挂
-   * running（实测 2026-09-27 的 13:14 / 13:18 / 13:29 三条 codebuddy 任务全部如此）。
-   * 这里让 hook 按"本成员 + 本会话"回来问一次 —— 服务端 agent_status / tasks 里有真值。
+   * Scenario: the hook's state file is "read-modify-write", so when the CLI fires several hook processes in
+   * the same millisecond they overwrite each other, taskId gets flushed out -> Stop sends no task/end ->
+   * the output summary / changed files / end time are all lost, and the task stays running forever (measured
+   * 2026-09-27: all three codebuddy tasks at 13:14 / 13:18 / 13:29 were like this). This lets the hook come
+   * back and ask once by "this member + this session" -- the truth is in the server's agent_status / tasks.
    *
-   * 保守口径：优先认**本会话**的那条；本会话对不上时，只有"全表只有一条且它没有会话标识"
-   * （老数据 / 无会话上报）才认 —— 绝不把另一条会话正在跑的任务误收掉。
+   * Conservative rule: prefer **this session's** one; when this session doesn't match, only accept when
+   * "the whole table has exactly one row and it has no session identifier" (old data / session-less reports)
+   * -- never mistakenly claim a task another session is running.
    */
   function currentTaskFor(project, memberId, sessionId = '') {
     const member = requireMember(projectIdOf(project), memberId);
@@ -1194,7 +1217,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 记录一条消息。source='report' 为上报真值；source='watch' 为目录监听兜底。
+   * Record a message. source='report' is reported truth; source='watch' is the directory-watch fallback.
    */
   function recordMessage(p) {
     const project = projectIdOf(p.project);
@@ -1244,16 +1267,17 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 这一轮任务里某个工具用了一次（任务详情里的「工具使用」）。
+   * A tool was used once in this round's task (the "tool usage" in the task details).
    *
-   * 上报方（hook / 插件）每调用一次工具报一条，这里按 `(task_id, tool)` 累加计数 ——
-   * 不给每次调用落一行（一轮里 Bash 能跑上百次，逐行落盘只会把库撑大）。
+   * The reporter (hook / plugin) reports one entry per tool invocation, and here the count is accumulated
+   * by `(task_id, tool)` -- no row per invocation (Bash can run hundreds of times in a round, and writing
+   * row by row would just bloat the DB).
    *
-   * 三条纪律：
-   *   1) **没有 taskId 就不记**：任务详情是按任务看的，把"没任务的调用"挂到别人的
-   *      任务头上属于编造归因；宁可少记。
-   *   2) 没有工具名也不记（老版本 payload / 手工脚本）—— 一个空名计数没有意义。
-   *   3) 幂等由上报方负责（同一支工具调一次报一次）；服务端只管累加，不猜、不折算。
+   * Three disciplines:
+   *   1) **No taskId, no record**: task details are viewed per task, and hanging a "call with no task" on
+   *      someone else's task is fabricated attribution; better to record less.
+   *   2) No tool name, no record either (old payload versions / hand-written scripts) -- a count with an empty name is meaningless.
+   *   3) Idempotency is the reporter's responsibility (one report per invocation of the same tool); the server only accumulates, never guessing or converting.
    * @param {{project:string, memberId:string, taskId?:string, tool?:string, sessionId?:string, client?:string, ts?:number}} p
    */
   function toolUse(p) {
@@ -1295,16 +1319,18 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 卡片上的「最近产出」。
+   * The "recent output" on the card.
    *
-   * 真值在 artifacts 表，但它**只有 /task/end 带了 artifacts 时才写**（endTask）；
-   * 而唯一的生产调用方 —— reporter hook 的 Stop —— 只发 `{taskId, state:'done'}`，从不带 artifacts
-   * （实测：全库 artifacts 0 行）。所以「最近产出」不是"写了没查出来"，而是**根本没有数据源**。
+   * The truth lives in the artifacts table, but it is **only written when /task/end carries artifacts**
+   * (endTask); and the only producing caller -- the reporter hook's Stop -- only ever sends
+   * `{taskId, state:'done'}`, never artifacts (measured: 0 rows in artifacts across the whole DB). So the
+   * "recent output" isn't "written but not queried out", there is simply **no data source at all**.
    *
-   * 真值为空时用**本轮任务真实改动过的文件**兜底（file_activity 的上报行），并标 derived=true，
-   * 由渲染层标出「改动」—— 这是落库的真事实，但它是推导出来的产出，绝不当成上报真值。
+   * When the truth is empty, fall back to **the files this round's task actually changed** (the reported rows in
+   * file_activity) and mark derived=true, with the renderer labeling them "changed" -- this is real stored
+   * fact, but it is derived output and is never treated as reported truth.
    * @param {string} memberId
-   * @param {any|null} runningTask 当前进行中的任务行（snake_case），没有就是 null
+   * @param {any|null} runningTask the currently running task row (snake_case), or null when there is none
    */
   function recentArtifacts(memberId, runningTask) {
     const rows = repo.listArtifacts.all(memberId, 3);
@@ -1319,7 +1345,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         tsMs: a.ts_ms,
       }));
     }
-    // 时间窗候选：先本轮进行中的任务（截至当下），再最近一条已结束的任务（产出已定型）
+    // Time-window candidates: first the running task of this round (up to now), then the most recently finished task (its output is finalized)
     const windows = [];
     if (runningTask && runningTask.state === 'running') {
       windows.push({ taskId: runningTask.id, from: runningTask.started_at, to: now() });
@@ -1366,8 +1392,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 幽灵散掉时产出的继承人：同名常驻小怪物（没有就 NULL，产出随幽灵一起抹掉）。
-   * @param {any} member 幽灵成员行
+   * The heir to the output when a ghost disperses: the same-named resident gremlin (NULL when there is none, and the output is wiped along with the ghost).
+   * @param {any} member the ghost member row
    */
   function heirOf(member) {
     if (!member || !member.ephemeral || !member.name) return null;
@@ -1377,7 +1403,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     return host && !host.ephemeral ? id : null;
   }
 
-  /** 成员所属工程的落盘路径（项目级 agent 定义文件在这里找）；读不到回空串，只按用户级目录找 */
+  /** The on-disk path of the member's project (project-level agent definition files are looked up here); an empty string when unreadable, so only the user-level directory is searched */
   function projectWorkspacePath(projectId) {
     const p = repo.getProject.get(projectId);
     return (p && p.workspace_path) || '';
@@ -1391,22 +1417,22 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const files = s && s.current_files ? safeJson(s.current_files, []) : [];
     const task = s && s.task_id ? repo.getTask.get(s.task_id) : null;
     let artifacts = recentArtifacts(memberId, task);
-    // 常驻小怪物自己没产出 -> 借同名幽灵实例的（幽灵还活着时借用；散掉时由 removeMember 过继）
+    // A resident gremlin with no output of its own -> borrow from the same-named ghost instance (borrowed while the ghost is alive; on dispersion, inherited via removeMember)
     if (!artifacts.length) artifacts = ghostArtifacts(m);
     const cnt = repo.countMessagesFor.get(m.project_id, memberId, memberId);
-    // 上一个任务在多久以前：最近一条**已收工**任务的收工时刻（渲染层的「最近活跃」用它）。
-    // 不能拿 lastSeenAt 顶替 —— 那是心跳时刻，成员只要在线就一直刷新，永远显示"刚刚活跃"。
+    // How long ago the previous task was: the finish moment of the most recent **finished** task (the renderer's "recently active" uses it).
+    // lastSeenAt can't stand in for it -- that's the heartbeat moment, which keeps refreshing for as long as the member is online, so it would always show "active just now".
     const lastEnd = repo.lastTaskEndOfMember.get(memberId);
 
     return {
       memberId: m.id,
       name: m.name,
       role: m.role,
-      // 没接上报且没状态行 -> offline；有状态行但 degraded -> 保持状态并标注推断
+      // No reports received and no status row -> offline; has a status row but degraded -> keep the state and mark it as inferred
       state: s ? s.state : 'offline',
       stateSince: s ? s.state_since : m.created_at,
-      // ended_at / state 一起带上：渲染层据此区分"当前任务"（还没收工）与"上一个任务"（已收工，
-      // 槽位 agent_status.task_id 不会随收工清空，不区分就会在空闲时挂着旧任务 + 旧任务的已耗时）
+      // Carry ended_at / state together: the renderer uses them to tell "current task" (not yet finished) from "previous task" (finished,
+      // since the slot agent_status.task_id isn't cleared on finish, not distinguishing them would leave an old task + the old task's elapsed time hanging there while idle)
       task: task
         ? {
             id: task.id,
@@ -1424,27 +1450,27 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       degraded: s ? Boolean(s.degraded) : true,
       reported: Boolean(m.reported),
       messageCount: cnt ? cnt.c : 0,
-      // 临时成员（无工位 → 场景里飘着的幽灵）+ 所属项目名
+      // Ephemeral member (no workstation -> a ghost drifting in the scene) + the project name it belongs to
       ephemeral: Boolean(m.ephemeral),
       projectLabel: m.project_label ?? null,
-      // 所属工程 id：客户端据此把"别的工程的成员卡"挡在门外。
-      // WS 订阅不带 project 时（渲染层就是这样，因为它只显示"当前打开的工程"），
-      // 服务端会把**所有**工程的广播都送过来 —— 退出演示后 __demo__ 那批成员的心跳
-      // 超时扫描仍会推它们的成员卡，客户端照单全收就会让演示小怪物在真实工程里闪回来
-      // （2026-10-01 用户实测）。渲染层照这张卡上的 project 过滤，见 renderer/src/lib/projectScope.js。
+      // The project id it belongs to: the client uses it to keep "member cards of other projects" out.
+      // When a WS subscription carries no project (which is what the renderer does, since it only shows the "currently open project"),
+      // the server sends broadcasts from **all** projects -- after leaving the demo, the heartbeat timeout scan still pushes those
+      // __demo__ members' cards, and a client accepting them all would let the demo gremlins flash back into a real project
+      // (user-observed 2026-10-01). The renderer filters by the project on this card, see renderer/src/lib/projectScope.js.
       project: m.project_id,
-      // 来源客户端：办公室据此按楼层过滤（NULL = 不知道，哪层都显示）
+      // Source client: the office filters by floor accordingly (NULL = unknown, shown on every floor)
       client: m.client || null,
-      // subagent 级别（用户级 / 项目级）：驱动小怪物脖子上的工牌配色
+      // subagent level (user-level / project-level): drives the badge color on the gremlin's neck
       level: levels.get(memberId) || null,
-      // 常驻 subagent 的**功能描述**（agent 定义文件里的静态数据）：卡片上显示"它是干什么的"，
-      // 不是状态。取不到回空串，由渲染层隐藏那一栏 —— 不拿"项目子代理 · 空闲"顶替。
+      // The **function description** of a resident subagent (static data from the agent definition file): shown on the card as "what it does",
+      // not a state. An empty string when unavailable, with the renderer hiding that field -- never standing in with "项目子代理 · 空闲".
       description: String(m.role || '').startsWith('subagent') ? agentDescription(m.name, projectWorkspacePath(m.project_id), m.client || '') : '',
     };
   }
 
   /**
-   * 补写来源客户端（老库的行是 NULL）。名册与清单每轮同步调一次，只在缺失/不一致时写。
+   * Backfill the source client (rows in the old DB are NULL). The roster and list call this once per sync round, writing only when missing or inconsistent.
    * @param {{project: string, memberId: string, client: string}} p
    */
   function tagMemberClient(project, memberId, client) {
@@ -1454,16 +1480,16 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 删除成员（临时成员退场：subagent 结束、幽灵散掉）。
+   * Remove a member (an ephemeral member leaving the stage: subagent finished, ghost dispersed).
    * @param {{project: string, memberId: string}} p
    */
   function removeMember(p) {
     const project = projectIdOf(p.project);
     const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
-    // 幽灵散掉：**成员行删掉，这一轮召唤的账留着**（tasks / artifacts，见 repo.purgeMember）。
-    // 产出发给谁都不改写 —— 有小工位的由那张卡借去显示（见 ghostArtifacts），
-    // 没工位的（code-explorer 这类）产出在库里照样查得到，台账 subagent_runs 也还指着它。
+    // A ghost disperses: **the member row is deleted, this round's summon account stays** (tasks / artifacts, see repo.purgeMember).
+    // The output is never rewritten no matter who it goes to -- those with a workstation have it borrowed for display by that card (see ghostArtifacts),
+    // and those without one (like code-explorer) still have their output queryable in the DB, with the ledger's subagent_runs still pointing at it.
     repo.purgeMember(member.id, { keepHistory: Boolean(member.ephemeral) });
     levels.delete(member.id);
     hub.broadcast(project, WS_EVENTS.MEMBER_REMOVE, { memberId: member.id });
@@ -1480,7 +1506,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 切换当前工程 / 团队（见 server/src/workspace.js）。
+   * Switch the current project / team (see server/src/workspace.js).
    * @param {{project?: string, project?: string|null}} next
    */
   function setContext(next = {}) {
@@ -1491,8 +1517,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 团队列表。project 的 name 是内部 slug，界面上要显示的是它所属工程的名字，
-   * 所以这里按 workspace_path 反解出 project（package.json name > 目录名）一起带出去。
+   * The team list. A project's name is an internal slug, while the UI should show the name of the project it belongs to,
+   * so the project is reverse-resolved here from workspace_path (package.json name > directory name) and sent along.
    * @returns {Array<any>}
    */
   function listProjectSummaries() {
@@ -1503,18 +1529,19 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       mainConversationId: t.main_conversation_id || null,
       source: t.source,
       createdAt: t.created_at,
-      // 演示工程没有目录，显示名固定为「演示工程」（和真实工程并列展示）
+      // The demo project has no directory, so its display name is fixed as "演示工程" (shown side by side with real projects)
       projectName: t.workspace_path ? resolveProjectName(t.workspace_path) : config.DEMO_PROJECT_NAME,
     }));
   }
 
   /**
-   * 首屏快照。没指定 project 时用"当前打开的工程"对应的团队。
+   * The first-screen snapshot. When no project is specified, use the team of the "currently open project".
    *
-   * 注意：**绝不回落到 projects[0]**。projects 是按创建时间倒序的，第一条可能是演示 data
-   * 或被污染的 project，拿它当"当前"会让办公室显示错的成员（甚至挂着几十小时前的演示残留）。
-   * 找不到对应 project 时按当前工程路径再匹配一次；还是找不到就返回空成员，由客户端显式
-   * 切成正确工程（POST /api/v1/workspace）。
+   * Note: **never fall back to projects[0]**. projects is ordered by creation time descending, so the first entry
+   * may be demo data or a polluted project; using it as "current" would make the office show the wrong members
+   * (even with demo residue from hours ago). When the matching project isn't found, match once more by the current
+   * project path; if still not found, return an empty member list and let the client explicitly switch to the correct
+   * project (POST /api/v1/workspace).
    */
   function buildSnapshot(projectId) {
     const projects = listProjectSummaries();
@@ -1552,7 +1579,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * 心跳超时扫描：超过 HEARTBEAT_TIMEOUT_MS 未上报 -> degraded=1（不改动 state，不编造）。
+   * Heartbeat timeout sweep: no report for longer than HEARTBEAT_TIMEOUT_MS -> degraded=1 (state is not modified, nothing fabricated).
    */
   function sweepDegraded() {
     const cutoff = now() - DEFAULTS.HEARTBEAT_TIMEOUT_MS;

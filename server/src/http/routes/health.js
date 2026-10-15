@@ -8,7 +8,7 @@ function createHealthRouter({ version = '0.1.0', projectName = '' } = {}) {
     res.json({
       ok: true,
       version,
-      // 当前工程名（package.json name > 目录名）；dev 模式下前端也能拿到
+      // Current project name (package.json name > directory name); the frontend gets it too in dev mode
       projectName,
       uptime: process.uptime(),
       pid: process.pid,

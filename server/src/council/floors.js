@@ -1,33 +1,38 @@
 'use strict';
 
 /**
- * 议事厅能请哪几层 —— **白名单**，不是"装了就能来"。
+ * Which floors the council room may invite — a **whitelist**, not "installed means eligible".
  *
- * 为什么要有白名单：议事厅要请的是"能被命令行无头拉起、并且能关掉全部工具"的 agent。
- * 九个楼层里只有四层验过这两条（见 server/src/council/agents.js 每个配方上的说明）：
+ * Why a whitelist: the council needs agents that "can be launched headlessly from the command
+ * line and can have all their tools turned off". Only four of the nine floors were verified
+ * for these two properties (see the notes on each recipe in server/src/council/agents.js):
  *   1F CodeBuddy / 4F Claude Code —— `--tools ""`
- *   7F Kilo Code  / 8F OpenCode   —— 注一份 permission 全 deny 的配置
- * 其余楼层（2F WorkBuddy、3F Codex、5F TraeCode、6F Qoder、9F Copilot）本机没有可用的
- * 无头入口，或者关不掉工具 —— 那就**不出现在议事厅里**，而不是请进来再说。
- * 做不做得到"只读"，是能不能进这张白名单的**门槛**，不是可以事后补的加分项。
+ *   7F Kilo Code  / 8F OpenCode   —— inject a permission config that denies everything
+ * The remaining floors (2F WorkBuddy, 3F Codex, 5F TraeCode, 6F Qoder, 9F Copilot) either lack
+ * a usable headless entry point on this machine or cannot have their tools disabled — so they
+ * **do not appear in the council room**, rather than being invited first and excused later.
+ * Whether read-only is achievable is the **threshold** for entering this whitelist, not a
+ * bonus you can add afterwards.
  *
- * 这里的 ready 只看**可执行文件在不在**（products 探测出的 cliInstallPath）。
- * 注意不能拿 `installed` 判：合并楼层（1F）装了 IDE 插件但没有 CLI 时 installed 也是 true，
- * 而议事厅要拉起的是一个**可执行文件**，插件形态跑不了。
+ * `ready` here looks only at "does the executable exist" (the cliInstallPath found by products
+ * detection). Note that `installed` must not be used: for a merged floor (1F) that has the IDE
+ * plugin but no CLI, `installed` is still true, while the council needs to launch an
+ * **executable** — the plugin form cannot run.
  */
 
 const { detectProducts } = require('../floors');
 const { RECIPES } = require('./agents');
 
-/** 首版可用的四层。顺序 = 界面上出现的顺序 */
+/** The four floors available in the first version. Order = the order they appear in the UI */
 const COUNCIL_FLOORS = Object.freeze(['1F', '4F', '7F', '8F']);
 
 /**
- * 每层现在的可用状态。给界面选人用。
+ * Current availability of each floor. Used by the UI to pick participants.
  *
- * @param {{detect?: () => Array}} [deps] 探测函数可注入（测试用）
+ * @param {{detect?: () => Array}} [deps] The detection function can be injected (for tests)
  * @returns {Array<{floorId:string,name:string,agent:string,ready:boolean,cliPath:string|null,reason:string}>}
- *   ready=false 时 reason 必须说清**为什么**（"没装"和"装了但不支持"要分得开）。
+ *   When ready=false, reason must make clear **why** ("not installed" and "installed but
+ *   unsupported" have to be distinguishable).
  */
 function listCouncilFloors(deps = {}) {
   const detect = deps.detect || detectProducts;
@@ -53,15 +58,16 @@ function listCouncilFloors(deps = {}) {
 }
 
 /**
- * 取某一层的可执行文件路径（发起一场会时用）。
- * @returns {string|null} 没装 / 不支持都是 null —— 调用方据此拒绝这场会，别硬跑
+ * Path of a floor's executable (used when starting a council run).
+ * @returns {string|null} both "not installed" and "unsupported" are null — the caller refuses
+ *   the run based on that instead of forcing it
  */
 function cliPathOf(floorId, deps = {}) {
   const found = listCouncilFloors(deps).find((f) => f.floorId === floorId);
   return found && found.ready ? found.cliPath : null;
 }
 
-/** 这个楼层号在白名单里吗 */
+/** Is this floor id on the whitelist? */
 const isCouncilFloor = (floorId) => COUNCIL_FLOORS.includes(String(floorId));
 
 module.exports = { COUNCIL_FLOORS, listCouncilFloors, cliPathOf, isCouncilFloor };

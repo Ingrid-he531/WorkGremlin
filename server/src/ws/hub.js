@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * WebSocket 集线器：连接管理、订阅过滤、事件广播。
+ * WebSocket hub: connection management, subscription filtering, event broadcasting.
  *
- * 客户端首帧必须是 {type:'hello', token, project, filters}；也可以在 URL 上带 ?token=。
- * 服务端推送统一走 envelope（见 shared/index.js）。
+ * The client's first frame must be {type:'hello', token, project, filters}; the token may also
+ * be passed as ?token= on the URL. Everything the server pushes goes out as an envelope
+ * (see shared/index.js).
  */
 
 const { WebSocketServer } = require('ws');
@@ -76,9 +77,10 @@ function createHub({ server, token, bus, repo }) {
         case CLIENT_EVENTS.HELLO:
           conn.project = msg.project || conn.project;
           conn.filters = msg.filters || conn.filters;
-          // 没指定 project 也要回一份快照（buildSnapshot(null) 会用"当前打开的工程"对应的团队）：
-          // 否则客户端连上后一帧都收不到，只能等后续推送（roster 心跳最长 15s）——
-          // 表现就是成员/小怪物"很久才出现"。
+          // Send a snapshot even when no project is specified (buildSnapshot(null) uses the team
+          // of "the currently open project"): otherwise the client receives not a single frame
+          // after connecting and has to wait for later pushes (the roster heartbeat can take up
+          // to 15s) —— which shows up as members / gremlins "appearing only after a long while".
           send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.project));
           break;
         case CLIENT_EVENTS.SUBSCRIBE:
@@ -121,7 +123,7 @@ function createHub({ server, token, bus, repo }) {
   });
 
   /**
-   * 广播。project 为 null 表示广播给所有连接。
+   * Broadcast. project === null means broadcast to every connection.
    * @param {string|null} project
    * @param {string} type
    * @param {unknown} payload

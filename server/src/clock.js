@@ -1,19 +1,21 @@
 'use strict';
 
 /**
- * 时钟抽象（对齐测试策略 v0.3 的 Clock 契约）：
- *   - 超时/间隔判定统一走 Clock.now()，测试可注入 FakeClock 做确定性断言；
- *   - 业务代码禁止裸用 Date.now()，统一 now()。
+ * Clock abstraction (aligned with the Clock contract in test strategy v0.3):
+ *   - Timeout/interval checks all go through Clock.now(); tests can inject a FakeClock
+ *     to make deterministic assertions;
+ *   - Business code must not use Date.now() directly — always now().
  *
- * M0 只有系统时钟实现；FakeClock 由测试侧注入（createTestApp）。
+ * M0 ships only the system clock implementation; the FakeClock is injected from the
+ * test side (createTestApp).
  */
 
 const systemClock = {
-  /** @returns {number} 毫秒时间戳 */
+  /** @returns {number} millisecond timestamp */
   now() {
     return Date.now();
   },
-  /** @returns {number} 单调时钟（ms），用于超时/耗时判定 */
+  /** @returns {number} monotonic clock (ms), for timeout / elapsed-time checks */
   monotonic() {
     return Number(process.hrtime.bigint() / 1000n) / 1000;
   },

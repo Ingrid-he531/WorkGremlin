@@ -1,61 +1,71 @@
 'use strict';
 
 /**
- * 8F OpenCode 的数据源 —— 读它自己落盘的 SQLite（轮询那一路）。
+ * 8F OpenCode's data source —— reads its own on-disk SQLite (the polling path).
  *
- * **为什么 8F 与 7F 不能照抄**：Kilo 与 OpenCode 同源（Kilo Code CLI 就是 OpenCode 的 fork），
- * 但**它们的 V2 schema 已经分叉**了。实测 2026-09-26（Kilo Code 7.8.1 / OpenCode 2.0.18）：
+ * **Why 8F cannot copy 7F**: Kilo and OpenCode share an origin (Kilo Code CLI is a fork of OpenCode),
+ * but **their V2 schemas have diverged**. Measured 2026-09-26 (Kilo Code 7.8.1 / OpenCode 2.0.18):
  *
  *                        Kilo 7.8.1            OpenCode 2.0.18
- *   事件流 event 表       2288 行（落盘）        **0 行**（只在内存里推流，不落盘）
- *   消息                 message(135)+part(650)  session_message(119)，无 part 表
- *   会话表               session                 session_v2（多 time_idle/idle_outcome/time_suspended）
- *   独有表               todo / kilo_board / …   session_inbox / session_pending / instruction_* / permission
+ *   event stream table    2288 rows (on disk)  **0 rows** (streamed in memory only, not persisted)
+ *   messages              message(135)+part(650) session_message(119), no part table
+ *   session table         session              session_v2 (+time_idle/idle_outcome/time_suspended)
+ *   unique tables         todo / kilo_board / … session_inbox / session_pending / instruction_* / permission
  *
- * 所以 7F 那套"从 `event` 表的 part 推导相位"（见 kilo.js 的 readKiloPhase）**在 OpenCode 上
- * 根本没有数据可读** —— 它的 `event` 表是空的（`event_sequence` 里有计数，但事件本身不落盘）。
- * 8F 改从 `session_message` 的 `content[]` 取 part，形状与 Kilo 的 part **同构**：
+ * So 7F's "derive the phase from the `event` table's parts" (see readKiloPhase in kilo.js) has **no data
+ * to read on OpenCode at all** —— its `event` table is empty (event_sequence has counts, but the events
+ * themselves are not persisted).
+ * 8F instead takes parts from `session_message`'s `content[]`, whose shape is **isomorphic** to Kilo's
+ * parts:
  *
  *   session_message(id, session_id, type, seq, time_created, time_updated, data)
  *     type  ∈ assistant | user | idle | synthetic
  *     data  = { time:{created,streamed,completed}, agent, model, content:[part], finish, cost, tokens, snapshot }
  *     part  ∈ { type:'tool',     name, state:{ status, input } }
  *            { type:'reasoning', text }
- *            { type:'text',      text }          ← 全库实测就这三种，没有 patch
- *     tool 的 state.status ∈ **completed | error | running**（全库 114 条 assistant 消息实测）
+ *            { type:'text',      text }          ← measured across the whole DB: only these three, no patch
+ *     tool's state.status ∈ **completed | error | running** (measured across all 114 assistant messages)
  *
- * **一个必须写下来的实测结论**：Kilo 的 `state.status` 有 `pending`（= 等授权），**OpenCode 没有** ——
- * 全库只出现过 completed / error / running。所以**纯轮询永远推不出「等待授权」**：
- * OpenCode 把授权做成了独立事件（实测事件流里有 `permission.asked` / `permission.replied`，
- * 载荷 `{ id, sessionID, action, resources[], source:{type,messageID,id} }`），那个信号只在
- * 内存事件流里、不进库。这就是 8F 额外挂一路**插件**的硬理由（见 packages/reporter/src/plugin/）：
- * 装了插件，相位是**上报真值**（不标 inferred、UI 不灰显），并且能显示「等待授权」；
- * 没装插件就退回下面这套轮询推导，代价是相位按推断灰显、且没有「等待授权」。
+ * **One measured conclusion that must be written down**: Kilo's `state.status` has `pending` (= awaiting
+ * permission), **OpenCode does not** —— only completed / error / running ever appear in the whole DB. So
+ * **pure polling can never derive "awaiting permission"**: OpenCode makes authorization a separate event
+ * (measured in the event stream: `permission.asked` / `permission.replied`, payload
+ * `{ id, sessionID, action, resources[], source:{type,messageID,id} }`), and that signal only lives in the
+ * in-memory event stream, never reaching the DB. That is the hard reason 8F hangs an extra **plugin** path
+ * (see packages/reporter/src/plugin/): with the plugin installed the phase is **reported truth** (not
+ * flagged inferred, not grayed out in the UI) and can show "awaiting permission"; without it, it falls
+ * back to the polling derivation below, at the cost of a grayed-out inferred phase and no "awaiting
+ * permission".
  *
- * 相位推导（从最新一条消息的 content[] 往后找第一条有信号的 part）：
- *   tool + running   → 调用工具（工具名/命令从 part.state.input 取）
- *   tool + error     → 调用工具但报错了
- *   reasoning        → 思考中
- *   text             → 待命（刚吐完一段文字）
- *   finish=stop      → 待命（这一轮说完了）
- *   type=idle 行     → 待命（**显式**空闲标记，data.outcome ∈ succeeded | interrupted）
- *   都对不上 / 事件过旧 → 待命
+ * Phase derivation (look back from the newest message's content[] for the first part carrying a signal):
+ *   tool + running   → calling a tool (tool name / command from part.state.input)
+ *   tool + error     → called a tool but it errored
+ *   reasoning        → thinking
+ *   text             → standby (just finished emitting text)
+ *   finish=stop      → standby (done talking this round)
+ *   type=idle row    → standby (**explicit** idle marker, data.outcome ∈ succeeded | interrupted)
+ *   nothing matches / events too old → standby
  *
- * **纪律（对齐 requirements.md §P0-6「绝不编造」）**：轮询这一路的一切相位都带 `inferred: true`。
- * 我们是**轮询**读它的库，不是它主动上报的，"上一条消息长什么样"只能推断"现在大致在干嘛"。
- * UI 按"推断"灰显，与 5F / CLI 落盘楼层同等待遇。
+ * **Discipline (aligned with requirements.md §P0-6 "never fabricate")**: every phase on the polling path
+ * carries `inferred: true`.
+ * We **poll** its DB, it does not report to us, so "what the last message looked like" can only infer
+ * "roughly what it is doing now".
+ * The UI grays out "inferred", same treatment as 5F / the CLI on-disk floors.
  *
- * 读法上三条纪律（与 kilo.js 一致）：
- *   1) **一律只读打开**（readonly + fileMustExist）。OpenCode 正在写这个库（WAL 模式，实测
- *      它跑着的时候读没问题），只读连接不阻塞它、也不会被它写坏；读不到就当"没数据"，绝不写。
- *   2) **短超时**（3s）。被它的 checkpoint / 迁移占住时立刻放弃 —— 宁可这一轮没有相位，
- *      也不能把 /api/v1/sessions 拖死（渲染层 1.5s 轮询一次）。
- *   3) **扫表失败不许冒泡**。这是别的产品的私有存储，OpenCode 改版换表名是迟早的事（Kilo →
- *      OpenCode 就已经换过一次：session → session_v2）；读不出来就回空，让 8F 显示"没接上"，
- *      而不是把接口打成 500。
+ * Three reading disciplines (same as kilo.js):
+ *   1) **Always open read-only** (readonly + fileMustExist). OpenCode is writing this DB (WAL mode;
+ *      measured, reading while it runs is fine), and a read-only connection neither blocks it nor gets
+ *      corrupted by it; unreadable means "no data", never write.
+ *   2) **Short timeout** (3s). Give up at once when its checkpoint / migration holds it —— better to have
+ *      no phase this round than to drag /api/v1/sessions down (the render layer polls every 1.5s).
+ *   3) **A failed table scan must not bubble up**. This is another product's private storage, and OpenCode
+ *      renaming tables on some update is only a matter of time (Kilo → OpenCode already did it once:
+ *      session → session_v2); unreadable means empty, so 8F shows "not connected" instead of turning the
+ *      endpoint into a 500.
  *
- * 缓存：会话表 5s（与 sessions.js / sessionRegistry 的 TTL 同量级）。
- * 相位与完成标记**不缓存** —— 渲染层 1.5s 拉一次，宁可每次多读一次库。
+ * Caching: the session table 5s (same order of magnitude as sessions.js / sessionRegistry's TTL).
+ * Phases and done markers are **not cached** —— the render layer pulls every 1.5s, better to read the DB
+ * one more time.
  */
 
 const os = require('node:os');
@@ -64,13 +74,15 @@ const { DEFAULTS, formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { isFile } = require('./roots');
 const { resolveProjectName } = require('./project');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent directories (project-level / user-level): private knowledge of this floor, kept here
+// rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 /**
- * 8F 的静态 subagent 定义目录。OpenCode 目前没有"用户级 / 项目级 agent 定义文件"这套机制，
- * 这里走通用推导（meta.homeDirs 为空 → 返回 []，不扫盘）。若将来 OpenCode 在某目录放 agent 定义，
- * 在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * 8F's static subagent definition directories. OpenCode has no "user-level / project-level agent
+ * definition file" mechanism yet, so this goes through the generic derivation (meta.homeDirs is empty →
+ * returns [], no disk scan). If OpenCode ever puts agent definitions in some directory, just give the
+ * explicit directories here (same interface as CodeBuddy / Codex / Claude).
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
 function agentDirs(workspacePath) {
@@ -81,7 +93,7 @@ const HOME = os.homedir();
 const IS_WIN = process.platform === 'win32';
 
 /**
- * 8F OpenCode 楼层元数据（原 products.js 的 8F 条目）。CLI 与桌面端/网页端合并楼层。
+ * 8F OpenCode floor metadata (formerly the 8F entry in products.js). CLI and desktop/web merged floor.
  */
 const meta = {
   id: '8F',
@@ -98,34 +110,36 @@ const meta = {
       dirs: [opencodeHome()],
       note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
-    // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client 恒为楼层基名 opencode，形态 form=vscode）
+    // The hook path: the true-phase path when the WorkGremlin plugin is installed (client is always the
+    // floor base name opencode, form=vscode)
     { kind: 'hook', form: 'vscode' },
   ],
   hookSource: true,
   dataKind: 'opencode',
-  // OpenCode CLI 自己的安装目录（PATH 查不到时兜底）
+  // OpenCode CLI's own install directory (fallback when PATH lookup fails)
   cliBinDirs: [path.join(HOME, '.opencode', 'bin')],
 };
 
-/** 打开只读连接的超时；被 OpenCode 占住就放弃这一轮 */
+/** Timeout for opening a read-only connection; give up on this round when OpenCode holds it */
 const OPEN_TIMEOUT_MS = 3_000;
-/** 会话表缓存（会话变化比相位慢，5s 足够；与 sessionRegistry 的 TTL 同量级） */
+/** Session table cache (sessions change slower than phases, 5s is enough; same order as sessionRegistry's TTL) */
 const TTL = 5_000;
 
 let cache = { at: 0, key: '', value: null };
 
-/* ------------------------------ 定位落盘 ------------------------------ */
+/* ------------------------------ Locating the on-disk data ------------------------------ */
 
 /**
- * OpenCode 的数据根（XDG 规范，平台标准目录，不是 ~/.opencode 那种隐藏目录）。
+ * OpenCode's data root (XDG convention, platform standard directories, not a hidden dir like ~/.opencode).
  *
- * 认三个来源，优先级从高到低：
- *   1. `WORKGREMLIN_OPENCODE_HOME` —— 显式指定（测试 / 非标准安装 / 用户自己挪过盘）
- *   2. `XDG_DATA_HOME/opencode`   —— XDG 标准位置
- *   3. 平台默认（见下）
+ * Three sources, highest priority first:
+ *   1. `WORKGREMLIN_OPENCODE_HOME` —— explicit (tests / non-standard installs / the user moved it)
+ *   2. `XDG_DATA_HOME/opencode`   —— the XDG standard location
+ *   3. platform default (see below)
  *
- * `~/.opencode` **不是**数据根：实测那个目录下只有 `bin/opencode`（可执行文件本体），
- * 会话、日志、快照、SQLite 全都在数据根下。把它当落盘会显示成"装了但 0 个会话"。
+ * `~/.opencode` is **not** the data root: measured, that directory only holds `bin/opencode` (the
+ * executable itself), while sessions, logs, snapshots and SQLite all live under the data root. Treating it
+ * as the on-disk location shows "installed but 0 sessions".
  */
 function opencodeHome() {
   const env = String(process.env.WORKGREMLIN_OPENCODE_HOME || '').trim();
@@ -141,7 +155,7 @@ function opencodeHome() {
   return path.join(HOME, '.local', 'share', 'opencode');
 }
 
-/** 会话库的绝对路径；文件不存在回空串（OpenCode 没装 / 没跑过） */
+/** Absolute path of the session DB; empty string when the file does not exist (OpenCode not installed / never run) */
 function opencodeDbPath() {
   const explicit = String(process.env.WORKGREMLIN_OPENCODE_DB || '').trim();
   const p = explicit ? path.resolve(explicit) : path.join(opencodeHome(), 'opencode.db');
@@ -149,8 +163,9 @@ function opencodeDbPath() {
 }
 
 /**
- * 会话标题（8F OpenCode）：SQLite session 的 title 列（OpenCode 各版本列名不一，自适应）。
- * 原 sessionTitle.js 的 opencodeTitleOf 搬到这里 —— 调试 8F 标题不必碰中央文件。
+ * Session title (8F OpenCode): the SQLite session's title column (OpenCode's column name differs by
+ * version, so it adapts). opencodeTitleOf from the old sessionTitle.js moved here —— debugging 8F titles
+ * no longer touches a central file.
  * @param {string|null|undefined} sessionId
  * @returns {string}
  */
@@ -183,31 +198,33 @@ function sessionTitle(sessionId) {
   }
 }
 
-/** 把绝对路径缩成 ~ 开头（UI 里好读） */
+/** Shrink an absolute path to a ~ prefix (easier to read in the UI) */
 function shorten(p) {
   if (!p) return '';
   if (HOME && p.startsWith(HOME)) return `~${p.slice(HOME.length)}`;
   return p;
 }
 
-/* ------------------------------ 只读连接 ------------------------------ */
+/* ------------------------------ Read-only connection ------------------------------ */
 
 /**
- * 开一个**只读**连接；拿不到（没装 / 没跑过 / 库被锁 / 表结构变了）一律回 null。
+ * Open a **read-only** connection; return null whenever it cannot be had (not installed / never run / DB
+ * locked / table shape changed).
  *
- * 只读是硬要求，不是省事：OpenCode 正在写这个库，我们绝不能因为一个监控端去锁它、
- * 也绝不能把它写坏。WAL 模式下只读连接不阻塞写入方，两者可以并存（实测它跑着时读没问题）。
+ * Read-only is a hard requirement, not a shortcut: OpenCode is writing this DB, and we must neither lock
+ * it nor corrupt it just to monitor. In WAL mode a read-only connection does not block the writer and both
+ * can coexist (measured, reading while it runs is fine).
  */
 function openDb() {
   const file = opencodeDbPath();
   if (!file) return null;
   let Database;
   try {
-    // better-sqlite3 是 server 的既有依赖（见 server/src/db/index.js），走工作区那份，
-    // 不在适配器里自己编译一份原生模块。
+    // better-sqlite3 is an existing server dependency (see server/src/db/index.js), use the workspace copy
+    // rather than compiling another native module inside the adapter.
     Database = require('better-sqlite3');
   } catch {
-    return null; // 原生模块没编出来：8F 读不了，其余楼层照常
+    return null; // the native module was not built: 8F cannot read, the other floors carry on
   }
   try {
     return new Database(file, { readonly: true, fileMustExist: true, timeout: OPEN_TIMEOUT_MS });
@@ -217,7 +234,8 @@ function openDb() {
 }
 
 /**
- * 在只读连接上跑一个回调；表不存在 / SQL 不对（改版换表）都回 null。
+ * Run a callback on the read-only connection; a missing table / bad SQL (a version renamed tables) return
+ * null.
  * @param {(db: any) => any} fn
  * @returns {any|null}
  */
@@ -227,21 +245,22 @@ function query(fn) {
   try {
     return fn(db);
   } catch {
-    return null; // 读不出来就是"没数据"，不冒泡（见文件头纪律 3）
+    return null; // unreadable means "no data", it does not bubble up (discipline 3 in the file header)
   } finally {
     try {
       db.close();
     } catch {
-      /* 关不掉无所谓，已经拿到结果 */
+      /* fine if it cannot be closed, the result is already in hand */
     }
   }
 }
 
 /**
- * 会话表叫 `session_v2`（2.0.18 实测），但老版本是 `session`，Kilo 至今还是 `session` ——
- * 两个都认，按优先级探，谁存在用谁。写死一个名字就等于把 8F 绑死在某个版本上。
+ * The session table is called `session_v2` (measured on 2.0.18), but old versions call it `session`, and
+ * Kilo still calls it `session` to this day —— recognize both, probe by priority, use whichever exists.
+ * Hardcoding one name ties 8F to one version.
  * @param {any} db
- * @returns {string} 表名；一个都没有回空串
+ * @returns {string} table name; empty string when neither exists
  */
 function sessionTable(db) {
   let names = [];
@@ -259,7 +278,7 @@ function sessionTable(db) {
   return '';
 }
 
-/** 库里到底有没有这些表 —— 用来给前端一句"这一路读不出会话"的说明 */
+/** Whether these tables are really in the DB —— gives the frontend a line explaining "this path reads no sessions" */
 function hasCoreTables() {
   return (
     query((db) => {
@@ -273,9 +292,9 @@ function hasCoreTables() {
   );
 }
 
-/* ------------------------------ 会话清单 ------------------------------ */
+/* ------------------------------ Session list ------------------------------ */
 
-/** 库里 model 字段是 JSON 字符串，取出 id 给人看（取不到就留空，不猜） */
+/** The model field in the DB is a JSON string; take the id for display (leave empty when it cannot be had, do not guess) */
 function modelIdOf(raw) {
   try {
     const j = JSON.parse(String(raw || ''));
@@ -286,39 +305,47 @@ function modelIdOf(raw) {
 }
 
 /**
- * OpenCode 的全部会话（未归档、未挂起），按最近更新倒序。
+ * All of OpenCode's sessions (not archived, not suspended), newest update first.
  *
- * 过滤口径：
- *   `time_archived IS NULL` —— 归档掉的会话不算"在跑"（用户手动归档之后会打这个时间戳）。
- *   `parent_id IS NULL`    —— 子代理会话不是独立会话：它们 parent_id 指向父会话，和父会话
- *                            同属一个"工位"。收进来的话，一个主会话配 N 个子代理就多出 N 条
- *                            会话，全是噪声（与 sessionRegistry 的 scanCliSessions 跳过
- *                            `<会话 id>/subagents/` 同一个道理）。
+ * Filter criteria:
+ *   `time_archived IS NULL` —— an archived session is not "running" (that timestamp is stamped when the
+ *                            user archives it manually).
+ *   `parent_id IS NULL`    —— subagent sessions are not independent sessions: their parent_id points at
+ *                            the parent session and they belong to the same "workstation". Taking them in
+ *                            means one main session plus N subagents produces N extra sessions, all noise
+ *                            (same reasoning as sessionRegistry's scanCliSessions skipping
+ *                            `<session id>/subagents/`).
  *
- * **刻意不过滤 `time_suspended`**（实测这个列会有值，会话被暂停/恢复时打上）：挂起是**临时**状态，
- * 恢复后 time_updated 会继续推进、这条会话本来就该重新出现在办公室里。用它当过滤条件等于
- * 让一条真实会话被永久藏起来 —— 宁可让它以"待命"出现，也不要假装它不存在。
- * （7F 的 kilo.js 同样只过滤 time_archived，两层口径保持一致。）
+ * **`time_suspended` is deliberately not filtered** (measured: this column does get values, stamped when a
+ * session is suspended/resumed): suspension is a **temporary** state, and after resuming time_updated keeps
+ * advancing, so this session is supposed to reappear in the office. Using it as a filter would hide a real
+ * session permanently —— better to let it show as "standby" than to pretend it does not exist.
+ * (7F's kilo.js likewise only filters time_archived; both layers keep the same criterion.)
  *
- * 字段映射（→ sessionRegistry 的会话行）：
- *   id → 会话 id（轴 2，`ses_xxx` 就是 hook 意义上的 session_id）
- *   directory → 工程路径（每条会话都记了自己的工作目录，比 project.worktree 更准 ——
- *               worktree 子会话跑在别处时 directory 才是真的）
- *   time_updated → 最后活动时间（每写一条消息都推进它，比翻文件时间准）
+ * Field mapping (→ sessionRegistry's session rows):
+ *   id → session id (axis 2, `ses_xxx` is the session_id in the hook sense)
+ *   directory → project path (each session records its own working directory, more accurate than
+ *               project.worktree —— when a worktree sub-session runs elsewhere, directory is the truth)
+ *   time_updated → last activity time (it advances on every message written, more accurate than file times)
  *
- * 列是**探测**着拼的（下面 pickSessionColumns）：少一列不该让整条查询失败、也不该让整层 500。
+ * Columns are assembled by **probing** (pickSessionColumns below): a missing column must neither fail the
+ * whole query nor turn the whole floor into a 500.
  *
- * **议事厅的参与者不进这张表**（`title = COUNCIL_SESSION_TITLE` 的直接跳过）：理由与
- * 7F 那边一字不差，见 kilo.js 同名过滤上方的说明。这里多一条：title 列也是探测着用的，
- * 老库没有 title 列时**不过滤**（宁可多列出一条真会话，也不能因为少一列就把整层清空）。
+ * **Council participants do not enter this table** (rows with `title = COUNCIL_SESSION_TITLE` are skipped
+ * outright): the reasoning is word for word the same as 7F's, see the note above the filter of the same
+ * name in kilo.js. One extra point here: the title column is also used by probing, so when an old DB has no
+ * title column **no filtering happens** (better to list one real session extra than to empty the whole
+ * floor over a missing column).
  *
  * @returns {Array<{id,title,directory,project,projectPath,lastEventAt,agent,model,fileCount,additions,deletions}>}
  */
 function listOpencodeSessions() {
   const now = Date.now();
   const file = opencodeDbPath();
-  // 缓存按**库文件路径**分键：换 OPENCODE_HOME / 换库时不会把上一处的会话端上来。
-  // 读不出来（没装 / 被锁 / 表结构变了）时缓存空清单，别让每 1.5s 的轮询都去撞一次锁。
+  // The cache is keyed by **DB file path**: swapping OPENCODE_HOME / the DB will not serve the other
+  // location's sessions.
+  // When it cannot be read (not installed / locked / table shape changed) an empty list is cached, so the
+  // 1.5s polling does not hit the lock every time.
   if (cache.value && cache.key === file && now - cache.at < TTL) return cache.value;
   const value = listOpencodeSessionsUncached();
   cache = { at: now, key: file, value };
@@ -338,8 +365,9 @@ function listOpencodeSessionsUncached() {
     const where = [];
     if (cols.has('time_archived')) where.push('"time_archived" IS NULL');
     if (cols.has('parent_id')) where.push('"parent_id" IS NULL');
-    // 议事厅参与者：老库没有 title 列时不做这个过滤（宁可多列出一条，也不清空整层）。
-    // 它排在最后，所以下面的参数数组只放这一个值。
+    // Council participants: when an old DB has no title column, this filter is skipped (better one extra
+    // row than an emptied floor).
+    // It goes last, so the parameter array below holds only this one value.
     const skipCouncil = cols.has('title');
     if (skipCouncil) where.push('("title" IS NULL OR "title" <> ?)');
     const params = skipCouncil ? [DEFAULTS.COUNCIL_SESSION_TITLE] : [];
@@ -368,7 +396,7 @@ function listOpencodeSessionsUncached() {
   });
 }
 
-/** 这个会话表实际有哪些列（少列不该让整层 500，见函数说明） */
+/** Which columns this session table really has (a missing column must not turn the whole floor into a 500, see the function note) */
 function pickSessionColumns(db, table) {
   try {
     return new Set(
@@ -382,48 +410,51 @@ function pickSessionColumns(db, table) {
   }
 }
 
-/* ------------------------------ 相位推导 ------------------------------ */
+/* ------------------------------ Phase derivation ------------------------------ */
 
 /**
- * 一条会话的**当前相位**（轮询推导，带 inferred）。
+ * A session's **current phase** (derived by polling, carries inferred).
  *
- * 取这条会话最后几条消息（`session_message` 按 (session_id, seq) 有唯一索引，取尾部很便宜），
- * 从新往旧找**第一条带信号的**：
+ * Take the last few messages of this session (session_message has a unique index on (session_id, seq), so
+ * taking the tail is cheap), and look from new to old for **the first one carrying a signal**:
  *
- *   tool + running → 调用工具（工具名/实际命令从 part.state.input 取）
- *   tool + error   → 调用工具但报错了
- *   reasoning      → 思考中
- *   text           → 待命（刚吐完一段文字）
- *   finish=stop    → 待命（这一轮说完了）
- *   type=idle 行   → 待命（**显式**空闲标记；data.outcome ∈ succeeded | interrupted）
- *   对不上 / 过旧  → 待命
+ *   tool + running → calling a tool (tool name / actual command from part.state.input)
+ *   tool + error   → called a tool but it errored
+ *   reasoning      → thinking
+ *   text           → standby (just finished emitting text)
+ *   finish=stop    → standby (done talking this round)
+ *   type=idle row  → standby (**explicit** idle marker; data.outcome ∈ succeeded | interrupted)
+ *   nothing matches / too old → standby
  *
- * **没有「等待授权」**：OpenCode 的 tool 状态实测只有 completed / error / running，授权是独立的
- * `permission.asked` 事件、只在内存事件流里。轮询这一路给不出等待授权 —— 那一相位由插件补
- * （见文件头）。宁可少一个相位，也不拿 tool+running 冒充"在等授权"。
+ * **There is no "awaiting permission"**: OpenCode's tool states measured are only completed / error /
+ * running, and authorization is a separate `permission.asked` event that only lives in the in-memory event
+ * stream. The polling path cannot produce "awaiting permission" —— that phase is filled in by the plugin
+ * (see the file header). Better to lack one phase than to pass tool+running off as "awaiting permission".
  *
- * **只认"新鲜"证据**：一轮对话结束后最后那条消息会一直躺在库里，不看新鲜度就会把三天前
- * 收工的那句回复永远显示成"刚刚在说话"。要求时间落在 `PHASE_FRESH_MS`（2 分钟，与
- * sessions.js 的 FRESH_MS 同量级）之内，超了就是待命。
+ * **Only "fresh" evidence counts**: once a round ends, its last message keeps lying in the DB, and ignoring
+ * freshness would display a reply finished three days ago as "speaking just now" forever. The time must fall
+ * within `PHASE_FRESH_MS` (2 minutes, same order as sessions.js's FRESH_MS); beyond that it is standby.
  *
  * @param {string} sessionId
  * @returns {{phase:string,action:string,target:string,tool:string,context:string[],prompt:string,model:string,inferred:boolean}|null}
  */
 const PHASE_FRESH_MS = 2 * 60_000;
-/** 往回看多少条消息够用（一轮对话末尾最多 tool→reasoning→text 几条，64 条极宽裕） */
+/** How many messages to look back at (a round's tail holds at most a few tool→reasoning→text, 64 is very generous) */
 const PHASE_LOOKBACK = 64;
 /**
- * 会**写文件**的 OpenCode 工具名。实测（2.0.18）它家工具是 read / grep / glob / shell /
- * edit / subagent —— 写文件的就叫 `edit`（入参 `state.input.path`）。只认这些，读类不算改动。
+ * OpenCode tool names that **write files**. Measured (2.0.18): its tools are read / grep / glob / shell /
+ * edit / subagent —— the one writing files is called `edit` (parameter `state.input.path`). Only these
+ * count; read-type ones are not changes.
  */
 const OPENCODE_WRITE_TOOL_RE = /edit|write|patch|create|apply|insert|replace/i;
 
 function readOpencodePhase(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
-  // 「思考中」屏上那句用户说的话：OpenCode 把原话放在 user 消息的 data.text（**不在** content[] 里，
-  // content[] 只有 assistant 的 reasoning/text/tool）。以前一律回空串，所以主控制台只有
-  // "思考中"、一个字都没有（实测 2026-09-28）。
+  // The user's sentence on the "thinking" screen: OpenCode keeps the original text in the user message's
+  // data.text (**not** in content[], which only holds the assistant's reasoning/text/tool). It used to
+  // always return an empty string, so the main console showed only "thinking" and not one word
+  // (measured 2026-09-28).
   const prompt = lastUserText(id);
   const out = (r) => (r && !r.prompt ? { ...r, prompt } : r);
   const rows = query((db) =>
@@ -439,70 +470,78 @@ function readOpencodePhase(sessionId) {
 
   const now = Date.now();
   for (const row of rows) {
-    // **显式空闲标记**：OpenCode 每轮结束会写一行 type='idle'（data = {time, outcome}）。
-    // 它比"从 part 猜"更直接：有它就是待命，不用再看更旧的行。
+    // **Explicit idle marker**: OpenCode writes a type='idle' row at the end of every round
+    // (data = {time, outcome}).
+    // It is more direct than "guessing from parts": with it, it is standby, no need to look at older rows.
     if (String(row.type || '') === 'idle') {
       const at = idleAt(row);
       if (at && now - at > PHASE_FRESH_MS) break;
       return out(idle());
     }
-    // 轮次刚开跑：最新一条是 **user** 消息（assistant 行还没写出来），或者 assistant 行还没
-    // 写出内容 —— 那都是"模型正在想"，不是待命。实测 2026-09-28：缺了这条，用户发完消息后
-    // 那十几秒主控制台是"待命"，整轮看不到"思考中"（采样区间只有 tool → idle 在来回切）。
-    // 注意它是"新到旧"扫的：真收工的轮次会先撞到更新的 idle 行，不会走到这里。
+    // A round just started: the newest row is a **user** message (the assistant row has not been written
+    // yet), or the assistant row has no content written yet —— both mean "the model is thinking", not
+    // standby. Measured 2026-09-28: without this, the dozen seconds after the user sends a message show
+    // "standby" on the main console and "thinking" is never seen for the whole round (the sampling window
+    // only ever catches tool → idle alternating).
+    // Note the scan goes new → old: a really finished round hits the newer idle row first and never gets here.
     if (String(row.type || '') === 'user') return out(thinking());
 
     let data = {};
     try {
       data = JSON.parse(String(row.data || ''));
     } catch {
-      data = {}; // 半截 / 非 JSON：跳过这一条，不猜
+      data = {}; // half-written / not JSON: skip this one, do not guess
     }
     if (!data || typeof data !== 'object') continue;
 
-    // 这一条消息的时间：优先 completed（说完了），其次 streamed（正在流），最后 created。
-    // 正在跑工具的那条只有 created/streamed，没有 completed —— 别因为缺 completed 就当陈旧。
+    // This message's time: prefer completed (finished speaking), then streamed (streaming), then created.
+    // A row whose tool is still running only has created/streamed, no completed —— do not treat a missing
+    // completed as stale.
     const tm = data.time && typeof data.time === 'object' ? data.time : {};
     const at = Number(tm.completed) || Number(tm.streamed) || Number(tm.created) || Number(row.time_created) || 0;
-    // 从新到旧，第一条过期的就说明这一轮早收工了（更旧的更没意义）
+    // New to old: the first expired one means this round finished long ago (older ones matter even less)
     if (at && now - at > PHASE_FRESH_MS) break;
 
     const parts = Array.isArray(data.content) ? data.content : [];
-    // 这条 assistant 消息**写完了没有**（time.completed 落了才算写完）。
-    // 它决定 text part 的含义，见下面 text 分支。
+    // Whether this assistant message **finished writing** (only counts when time.completed is stamped).
+    // It decides what a text part means, see the text branch below.
     const completed = Boolean(tm.completed);
     const finish = String(data.finish || '');
-    // 从后往前找第一条有信号的 part（同一条消息里既有 reasoning 也有 tool 时，
-    // 越靠后的越是"现在正在做的"）
+    // Look back for the first part carrying a signal (when one message holds both reasoning and tool, the
+    // later one is "what is being done now")
     for (let i = parts.length - 1; i >= 0; i -= 1) {
       const part = parts[i];
       if (!part || typeof part !== 'object') continue;
       const type = String(part.type || '');
       if (type === 'text') {
-        // 还没写完（没有 completed）= 正在往外吐字 → **思考中**，不是待命。
-        // 实测 2026-09-28：把流中的 text 当待命，主控制台会一直停在"任务完成"上，
-        // 整轮都看不到"思考中"（这一轮 parts 是 [reasoning, text]，从后往前先撞到 text）。
-        // 与 7F 那次同一个坑（见 kilo.js 的 readKiloPhase）。
+        // Not finished writing yet (no completed) = it is emitting text → **thinking**, not standby.
+        // Measured 2026-09-28: treating a streaming text as standby leaves the main console parked on
+        // "task finished" and "thinking" is never seen for the whole round (this round's parts are
+        // [reasoning, text], and scanning backwards hits text first).
+        // Same trap as 7F's (see readKiloPhase in kilo.js).
         if (!completed) return out(thinking());
-        // 写完了但还要接着调工具（finish=tool-calls）→ 这一条不算收口，继续看更早的 part / 行
+        // Finished writing but more tools follow (finish=tool-calls) → this one does not close the round,
+        // keep looking at earlier parts / rows
         if (finish === 'tool-calls') continue;
         return out(idle());
       }
       if (type === 'reasoning') return out(thinking());
       if (type !== 'tool') continue;
 
-      // OpenCode 的工具块：工具名在 part.name（不是 Kilo 的 part.tool），入参在 state.input
+      // OpenCode's tool block: the tool name is in part.name (not Kilo's part.tool), parameters in state.input
       const tool = String(part.name || '');
       const status = String((part.state && part.state.status) || '');
       const input = part.state && part.state.input && typeof part.state.input === 'object' ? part.state.input : {};
       /**
-       * 这一段算不算"正在用工具"：
-       *   · status=running          → 无疑（工具还在跑）
-       *   · status=completed 且这一步 finish=tool-calls → **也算**
-       *     OpenCode 是一步一条 assistant 消息：模型这一步以"要调工具"收尾（finish=tool-calls），
-       *     然后它去跑工具、再开下一步。而工具块落盘时常常已经跑完（`read` 这种毫秒级），
-       *     所以只认 running 会几乎永远看不到"调用工具"（实测 2026-09-28：一整轮 10 次工具调用，
-       *     1.5s 采样只撞到 1 帧）。"这一步以调工具收尾、下一步还没出现" = 就是在用工具。
+       * Whether this counts as "using a tool right now":
+       *   · status=running          → no doubt (the tool is still running)
+       *   · status=completed and this step's finish=tool-calls → **also counts**
+       *     OpenCode is one assistant message per step: the model closes this step with "want to call a
+       *     tool" (finish=tool-calls), then runs the tool and opens the next step. And the tool block is
+       *     often already finished by the time it lands on disk (`read` takes milliseconds), so
+       *     recognizing only running means "calling a tool" is almost never visible (measured 2026-09-28:
+       *     one round with 10 tool calls, 1.5s sampling caught only 1 frame). "This step closed by calling
+       *     a tool, next step has not appeared" = it is using a tool.
        */
       const stepCallsTool = finish === 'tool-calls' && status !== 'error';
       if (status === 'running' || (status === 'completed' && stepCallsTool)) {
@@ -529,26 +568,27 @@ function readOpencodePhase(sessionId) {
           inferred: true,
         });
       }
-      // completed：这一支跑完了，看同一条消息里更早的 part（可能还有下一个工具）
+      // completed: this one finished, look at earlier parts in the same message (there may be another tool)
     }
 
-    // 这条消息的 part 都对不上 → 看它有没有"说完了"（finish=stop 是正常收尾）
+    // Nothing in this message's parts matched → see whether it "finished speaking" (finish=stop is a normal
+    // close)
     if (finish && finish !== 'tool-calls') return out(idle());
   }
   return out(idle());
 }
 
-/** 轮询推导的"待命"（统一出口，方便以后加文案只改一处） */
+/** The polling-derived "standby" (one exit point, so future copy changes touch only one place) */
 function idle() {
   return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
 }
 
-/** 轮询推导的"思考中" */
+/** The polling-derived "thinking" */
 function thinking() {
   return { phase: 'thinking', action: '', target: '', tool: '', context: [], prompt: '', model: '', inferred: true };
 }
 
-/** type='idle' 那行的时间（data.time.created） */
+/** The time of the type='idle' row (data.time.created) */
 function idleAt(row) {
   try {
     const d = JSON.parse(String(row.data || ''));
@@ -559,8 +599,9 @@ function idleAt(row) {
 }
 
 /**
- * 这条会话**最后一条用户消息的原话**（`type='user'` 的 `data.text`）。
- * 取不到回空串 —— 宁可空屏，不拿会话标题顶替。
+ * This session's **last user message's original text** (`type='user'`'s `data.text`).
+ * Returns an empty string when it cannot be had —— better an empty screen than substituting the session
+ * title.
  * @param {string} sessionId
  */
 function lastUserText(sessionId) {
@@ -581,52 +622,59 @@ function lastUserText(sessionId) {
 }
 
 /**
- * 这条会话**逐轮**的任务清单（8F 台账按"每一轮一条"记账用）。
+ * This session's **per-round** task list (8F's ledger records "one per round").
  *
- * OpenCode 的 `session_message` 是顺序消息流：一轮 = 一条 `type='user'`（`data.text` 是用户原话，
- * `time.created` 是这一轮开始）→ 若干 `type='assistant'`（`time.completed` 是它说完的时刻，
- * `content[].state.input.path` 里是它编辑过的文件）→ 一条 `type='idle'`（这一轮显式收工）。
- * 所以：
- *   · 有 idle 行 = 收工（endedAt = 那一轮最后一次活动时刻）
- *   · 没有 idle、但最后活动在 PHASE_FRESH_MS 之外 = 也算收工（避免"永远在跑"）
- *   · 否则 = 还在飞（endedAt = null）—— 和其它楼层同口径，running 由台账同步器写
+ * OpenCode's `session_message` is a sequential message stream: one round = one `type='user'` (data.text is
+ * the user's original words, time.created is when the round started) → several `type='assistant'`
+ * (time.completed is when it finished speaking, content[].state.input.path holds the files it edited) →
+ * one `type='idle'` (this round explicitly finished). So:
+ *   · an idle row exists = finished (endedAt = that round's last activity moment)
+ *   · no idle, but the last activity is beyond PHASE_FRESH_MS = also finished (avoids "running forever")
+ *   · otherwise = still in flight (endedAt = null) —— same criterion as the other floors, running is
+ *     written by the ledger synchronizer
  *
- * `read_file`/`grep`/`glob`/`shell` 这些**不算改动文件**，只认写工具（OpenCode 实测叫 `edit`）。
+ * `read_file`/`grep`/`glob`/`shell` **do not count as changing files**, only write tools do (on OpenCode
+ * that is measured to be called `edit`).
  *
  * @param {string} sessionId
- * `outcome`：这一轮怎么结束的 —— OpenCode 的 idle 行写了 `succeeded` / `interrupted`；
- * 没有 idle 行而已经陈旧的，按最后一条 assistant 的 `finish` 判断（`stop` = 正常收尾，
- * 其余 = 被打断/放弃）。台账据此区分「完成」与「已取消」——实测 2026-09-28：用户终止了
- * 一轮（idle.outcome = interrupted），台账却报「完成」。
+ * `outcome`: how this round ended —— OpenCode's idle row writes `succeeded` / `interrupted`;
+ * a round with no idle row that is already stale is judged by the last assistant's `finish` (`stop` = a
+ * normal close, anything else = interrupted/abandoned). The ledger distinguishes "finished" from
+ * "cancelled" by this —— measured 2026-09-28: the user terminated a round (idle.outcome = interrupted) yet
+ * the ledger reported "finished".
  *
- * `result`：这一轮的**收尾自述**（这一轮最后一条 assistant 消息里的 text，压空白后截断）——
- * 任务记录里的"产出摘要"就用它（与 hook 那一路同口径，上限 4000）。
+ * `result`: this round's **wrap-up self-report** (the text in this round's last assistant message,
+ * whitespace-collapsed and truncated) —— that is what the "output summary" in task records uses (same
+ * criterion as the hook path, capped at 4000).
  *
  * @returns {Array<{index:number, prompt:string, startedAt:number, endedAt:number|null,
  *                  outcome:string, files:string[], result:string}>}
  */
-/** 非负数才认（与 reporter/src/usage.js 的 num 同口径：缺字段就是没有，不拿别的顶上） */
+/** Only non-negative numbers count (same criterion as num in reporter/src/usage.js: a missing field means none, do not substitute something else) */
 function posNum(v) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/** 这份累计里真有数吗 —— 四项全 0 就是"没读到"，不是"消耗为零"（见调用处的 return） */
+/** Does this total really hold numbers —— all four being 0 means "nothing read", not "consumption was zero" (see the return at the call site) */
 function hasTokens(t) {
   return Boolean(t) && t.input + t.output + t.cacheRead + t.cacheWrite > 0;
 }
 
 /**
- * 把一条 assistant 消息的 `data.tokens` 折进本轮的累计。
+ * Fold one assistant message's `data.tokens` into this round's running total.
  *
- * 形状与语义**同 7F Kilo**（`{input, output, reasoning, cache:{read,write}}`，`input` 不含缓存、
- * `reasoning` 单列）—— 两家同源，OpenCode 只是没有 `total` 那一项（实测 314 条消息全都没有，
- * 所以这里也没法用它自校验）。会话表 `session_v2.tokens_*` 是这些消息的累加
- * （实测 277,421 vs 消息求和 277,410，差 11：最后一条还没并进会话计数器）。
+ * Shape and semantics are **the same as 7F Kilo** (`{input, output, reasoning, cache:{read,write}}`,
+ * `input` excludes cache, `reasoning` is separate) —— the two share an origin, OpenCode just lacks the
+ * `total` entry (measured across 314 messages, none of them have it, so it cannot self-validate here
+ * either). The session table's `session_v2.tokens_*` is the sum of these messages
+ * (measured 277,421 vs the message sum 277,410, a difference of 11: the last one is not merged into the
+ * session counter yet).
  *
- * `reasoning` 并进 `output`，与 7F 及 Claude / Codex 保持同一列口径（理由见 kilo.js 同名函数）。
- * @param {{input:number,output:number,cacheRead:number,cacheWrite:number}} acc 本轮累计（原地改）
- * @param {any} t 一条消息的 data.tokens（形状不对就当没有）
+ * `reasoning` is folded into `output`, keeping the same column criterion as 7F and Claude / Codex (reasoning
+ * in the function of the same name in kilo.js).
+ * @param {{input:number,output:number,cacheRead:number,cacheWrite:number}} acc this round's running total (mutated in place)
+ * @param {any} t one message's data.tokens (a wrong shape counts as none)
  */
 function foldOpencodeTokens(acc, t) {
   if (!t || typeof t !== 'object') return acc;
@@ -675,10 +723,12 @@ function readOpencodeTurns(sessionId) {
       };
       continue;
     }
-    if (!cur) continue; // 会话开头不是 user 行的，不编一轮
-    // 这一轮已经收工（idle 行已到）：它之后的 assistant / synthetic 行都**不算它的**，
-    // 否则收工时间会被后面那条 synthetic（系统提醒）顶到下一轮的头上（实测把 14:19 收工的
-    // 那轮算成了 17:14，凭空多出 3 小时）。
+    if (!cur) continue; // a session that does not start with a user row gets no fabricated round
+    // This round already finished (the idle row arrived): the assistant / synthetic rows after it are
+    // **not part of it**,
+    // otherwise the finish time gets pushed onto the next round's head by the following synthetic row (a
+    // system reminder) (measured: a round that finished at 14:19 was computed as 17:14, conjuring 3 extra
+    // hours).
     if (cur.closed) continue;
     if (at) cur.lastAt = Math.max(cur.lastAt, at);
     if (type === 'idle') {
@@ -689,10 +739,13 @@ function readOpencodeTurns(sessionId) {
     if (type === 'assistant') {
       const fin = String(d.finish || '');
       if (fin) cur.finish = fin;
-      // 本轮的 token 消耗：assistant 消息的 data.tokens 逐条累加（user / idle 行没有这一项）
+      // This round's token consumption: accumulate each assistant message's data.tokens (user / idle rows
+      // have no such entry)
       foldOpencodeTokens(cur.tokens, d.tokens);
-      // 这一轮的收尾自述：取 assistant 消息里的 text（后面的消息会覆盖前面的，
-      // 所以最终留下的是"最后那条消息说的话"）。压空白 + 上限 4000，与 hook 那一路同口径。
+      // This round's wrap-up self-report: take the text in the assistant messages (later messages
+      // overwrite earlier ones,
+      // so what remains is "what the last message said"). Whitespace-collapsed + capped at 4000, same
+      // criterion as the hook path.
       const said = (Array.isArray(d.content) ? d.content : [])
         .filter((p) => p && p.type === 'text' && p.text)
         .map((p) => String(p.text))
@@ -715,7 +768,8 @@ function readOpencodeTurns(sessionId) {
   return turns.map((t) => {
     const stale = now - t.lastAt > PHASE_FRESH_MS;
     const ended = t.closed || stale;
-    // 收工的方式：idle 行说了算；没有 idle 行（陈旧收口）就看最后一条 assistant 的 finish
+    // How it finished: the idle row decides; with no idle row (stale close) look at the last assistant's
+    // finish
     const outcome = !ended ? 'running' : t.closed ? t.outcome || 'succeeded' : t.finish === 'stop' ? 'succeeded' : 'interrupted';
     return {
       index: t.index,
@@ -725,13 +779,14 @@ function readOpencodeTurns(sessionId) {
       outcome,
       files: [...t.files],
       result: t.result || '',
-      // 本轮消耗的 token（语义见 foldOpencodeTokens）。四项全 0 = 没读到 → null，台账留空
+      // Tokens consumed this round (semantics in foldOpencodeTokens). All four being 0 = nothing read →
+      // null, the ledger stays empty
       tokens: hasTokens(t.tokens) ? t.tokens : null,
     };
   });
 }
 
-/** 工具入参里的可读命令（OpenCode 的 shell 工具叫 `shell`，入参是 command） */
+/** The readable command in a tool's input (OpenCode's shell tool is called `shell`, its parameter is command) */
 function commandOf(input) {
   const c = String(input.command || '');
   if (c) return c.replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -739,38 +794,40 @@ function commandOf(input) {
   return d.replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
-/** 工具入参里的目标文件（实测 OpenCode 的 read 工具用 `path`，各家字段名不统一，都认一遍） */
+/** The target file in a tool's input (measured: OpenCode's read tool uses `path`; field names are not unified across products, so all are recognized) */
 function fileOf(input) {
   const p = input.file || input.filePath || input.file_path || input.path || input.target_file || '';
   return typeof p === 'string' ? p : '';
 }
 
-/* ------------------------------ 完成标记 ------------------------------ */
+/* ------------------------------ Done marker ------------------------------ */
 
-/** 完成标记的新鲜期：只有这么久之内结束的才算"刚发生"，否则页面一开就重播上一轮 */
+/** Freshness window of the done marker: only something that ended within this long counts as "just happened", otherwise opening the page replays the previous round */
 const DONE_TTL_MS = 10 * 60_000;
-/** 完成标记缺省时统一返回（没有就是"没有"，不臆造）。
- *  doneCancelled：这一轮是被用户打断（ESC / 停止）收掉的 → 主控制台亮红色「任务取消」。 */
+/** The uniform return value when a done marker is missing (none means none, no fabrication).
+ *  doneCancelled: this round was cut short by the user (ESC / stop) → the main console lights a red "task cancelled". */
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false };
 
 /**
- * 这条会话的"完成"标记 —— 对应 hook 那边 Stop 事件落下的 done。
+ * This session's "done" marker —— the counterpart of the done the hook path drops on Stop.
  *
- * OpenCode 没有 Stop 事件，但 `session_message` 里有等价的东西：一条 `type='assistant'`、
- * `finish='stop'` 且 `time.completed` 落过的消息。语义映射（与 OpenAI 风格一致，全库实测
- * finish 只出现过 stop / tool-calls / error 三种）：
- *   finish=stop        → 正常说完，**这就是"任务完成"**
- *   finish=tool-calls  → 还要接着调工具，**不是**完成（跳过）
- *   finish=error       → 出错结束，不当完成
- *   finish 为空         → 还在流式输出中，不是完成
+ * OpenCode has no Stop event, but `session_message` holds something equivalent: a `type='assistant'`
+ * message with `finish='stop'` whose `time.completed` is stamped. Semantic mapping (consistent with the
+ * OpenAI style, measured across the whole DB: finish is only ever stop / tool-calls / error):
+ *   finish=stop        → finished speaking normally, **this is "task finished"**
+ *   finish=tool-calls  → more tools follow, **not** finished (skip)
+ *   finish=error       → ended in error, not a finish
+ *   finish empty       → still streaming, not a finish
  *
- * 只认 `time.completed` 落过且在 DONE_TTL_MS 之内的；没有 completed 的（正在输出的那条）
- * 明确不算完成。标题取会话标题（OpenCode 自己起的），文件数取 session.summary_files。
- * 改动文件**清单**轮询这一路给不出（库里只有 summary_files 一个计数）—— 那一项由插件补
- * （实测 `session.step.ended` 事件的 `data.files` 就是本轮改动的文件路径数组）。
+ * Only ones whose `time.completed` is stamped and within DONE_TTL_MS count; one without completed (the row
+ * currently streaming) explicitly does not count as finished. The title is the session title (OpenCode's
+ * own), the file count is session.summary_files.
+ * The **list** of changed files cannot be given on the polling path (the DB only has the summary_files
+ * count) —— that item is filled in by the plugin (measured: the `data.files` of the `session.step.ended`
+ * event is exactly this round's changed file path array).
  *
  * @param {string} sessionId
- * @param {{title?:string,fileCount?:number}} meta 会话自身的静态信息
+ * @param {{title?:string,fileCount?:number}} meta the session's own static info
  */
 function readOpencodeDone(sessionId, meta = {}) {
   const id = String(sessionId || '').trim();
@@ -811,11 +868,13 @@ function readOpencodeDone(sessionId, meta = {}) {
     }
   }
   /**
-   * 被打断的那一轮没有 `finish=stop` 的 assistant 消息（OpenCode 每轮结束会写一行
-   * `type='idle'`，`data.outcome` 落 `succeeded` / `interrupted`）—— 上面那条路取不到，
-   * 但主控制台仍要知道"这一轮是被掐掉的"才能亮红色「任务取消」。
-   * 取逐轮清单里最新那一轮：`interrupted` 且刚结束（TTL 内）→ 落一枚取消标记。
-   * 与台账同步器（本文件下方）同一口径：绝不把被打断当成完成，也不臆造未发生的取消。
+   * An interrupted round has no `finish=stop` assistant message (OpenCode writes a `type='idle'` row at the
+   * end of every round, with `data.outcome` = `succeeded` / `interrupted`) —— the path above cannot get it,
+   * but the main console still needs to know "this round was cut short" to light the red "task cancelled".
+   * Take the newest round from the per-round list: `interrupted` and just ended (within TTL) → drop a
+   * cancel marker.
+   * Same criterion as the ledger synchronizer (below in this file): never treat an interrupted round as
+   * finished, and never fabricate a cancel that did not happen.
    */
   const turns = readOpencodeTurns(id);
   const last = turns[turns.length - 1];
@@ -826,18 +885,20 @@ function readOpencodeDone(sessionId, meta = {}) {
       doneCount: Array.isArray(last.files) ? last.files.length : 0,
       doneFiles: [],
       doneCancelled: true,
-      // 这一轮已经吐出来的文字照常带上（与「任务完成」同一条线）：取消只是没干完，不是没产出
+      // Whatever text this round already emitted is carried along as usual (same path as "task finished"):
+      // cancelling means it did not finish, not that it produced nothing
       doneSaid: String(last.result || ''),
     };
   }
   return NO_DONE;
 }
 
-/* ------------------------------ 对外 ------------------------------ */
+/* ------------------------------ Externally exposed ------------------------------ */
 
 /**
- * 这条会话有没有"接上"（库里真有它）。
- * 渲染层靠它区分"这个产品根本没在跑"与"在跑但此刻没动作"（同 reporter-phase 的 instrumented）。
+ * Whether this session is "connected" (it really is in the DB).
+ * The render layer uses it to tell "this product is not running at all" from "running but idle right now"
+ * (same as reporter-phase's instrumented).
  */
 function opencodeInstrumented(sessionId) {
   const id = String(sessionId || '').trim();
@@ -850,17 +911,19 @@ function opencodeInstrumented(sessionId) {
 }
 
 /**
- * 8F 的"上报相位"—— 与 reporterMainPhase 同一个形状，
- * 供 /api/v1/reporter-phase 在 client 是 opencode 时走这一路。
+ * 8F's "reported phase" —— the same shape as reporterMainPhase,
+ * for /api/v1/reporter-phase to take this path when the client is opencode.
  *
- * 没有 client/session 参数时按"最近更新的那条会话"取（与 hook 那侧"同 client 里谁最新显示谁"
- * 的老行为对齐）；传了 session 就只认那一条。
+ * With no client/session parameter it takes "the most recently updated session" (aligned with the hook
+ * side's old behavior of "whoever is newest under the same client"); passing a session recognizes only
+ * that one.
  * @param {string} workspacePath
  * @param {string} session
  * @returns {{sessionId:string,phase:string,action:string,target:string,context:string[],tool:string,prompt:string,model:string}|null}
  */
 function opencodeMainPhase(workspacePath, session = '') {
-  // 相位必须绑会话：不点名会话就没有相位（与 reporter / kilo 同一口径）
+  // The phase must be bound to a session: naming no session means no phase (same criterion as reporter /
+  // kilo)
   if (!session) return null;
   const list = listOpencodeSessions();
   if (!list.length) return null;
@@ -869,7 +932,7 @@ function opencodeMainPhase(workspacePath, session = '') {
   const ph = readOpencodePhase(row.id);
   if (!ph) return null;
   return {
-    /** 这份相位属于哪条会话（渲染层拿它确认"我正在看的那条会话"是不是这份） */
+    /** Which session this phase belongs to (the render layer uses it to confirm "is the session I am looking at this one") */
     sessionId: row.id,
     phase: ph.phase,
     action: ph.action,
@@ -877,40 +940,45 @@ function opencodeMainPhase(workspacePath, session = '') {
     context: ph.context,
     tool: ph.tool,
     prompt: ph.prompt,
-    // 模型从 session 表取（真实值；取不到留空，不猜）
+    // The model comes from the session table (a real value; empty when it cannot be had, do not guess)
     model: row.model || '',
   };
 }
 
-/* ===================== 任务同步器（原 opencodeTasks.js，已合并进本楼层文件） ===================== */
+/* ===================== Task synchronizer (formerly opencodeTasks.js, merged into this floor file) ===================== */
 const SYNC_INTERVAL_MS = 5_000;
 
 /**
- * 插件那一路"还活着"的两个时间参数（与 kilo.js 同名同值，理由见那边的常量注释）。
+ * The two timing parameters for "the plugin path is still alive" (same names and values as kilo.js, reasoning
+ * in the constant comments there).
  *
- * PLUGIN_GRACE_MS —— 一轮刚起的头几秒先不抢（插件本地回环，正常 1 秒内就落库）。
- *   短是必须的：它量的是"插件还没写上来"这段窗口，窗口多长用户那一轮就在列表里消失多久
- *   （实测 60 秒时，一条 8 秒的任务整轮都看不见）。
- * PLUGIN_COVER_MS —— 判"这一轮插件报过没有"时，插件那行的 started_at 与轮次起点允许的差
- *   （实测 ±90ms 内、方向不定；判漏了会多写一条孪生行，判重了会把两秒内连开两轮当同一轮）。
+ * PLUGIN_GRACE_MS —— do not grab the first few seconds after a round starts (the plugin's local loopback
+ *   normally lands in the DB within 1 second).
+ *   Short is mandatory: it measures the window where "the plugin has not written yet", and however long
+ *   that window is, the user's round is missing from the list that long (measured at 60 seconds: an
+ *   8-second task was invisible for the whole round).
+ * PLUGIN_COVER_MS —— when judging "did the plugin report this round", the allowed difference between the
+ *   plugin row's started_at and the round's start point
+ *   (measured within ±90ms, direction varies; judging too strictly writes an extra twin row, too loosely
+ *   treats two rounds opened within two seconds as one).
  */
 const PLUGIN_GRACE_MS = 3_000;
 const PLUGIN_COVER_MS = 2_000;
 
-/** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
+/** Task id prefix, to avoid id collisions with the tasks the reporter hook writes */
 const TASK_ID_PREFIX = 'opencode:';
-/** 这一层的上报身份 = 楼层基名（8F 的 clients 现在就是 ["opencode"]，形态另走 form） */
+/** This floor's reporting identity = the floor base name (8F's clients are now ["opencode"], the form goes through form separately) */
 const CLIENT = 'opencode';
 
-/** 这个工程名（工程 id）—— 成员 / 台账都按它归组 */
+/** This project's name (project id) —— members / the ledger are grouped by it */
 function projectIdOf(s) {
   const projectPath = s.projectPath || '';
   return s.project || (projectPath ? path.basename(projectPath) : 'OpenCode');
 }
 
 /**
- * 写一条台账（tasks + task_runs 两行）。8F 是**每一轮一条**。
- * @returns {string|null} 这条记录的 files_json（心跳里的 current_files 直接复用）
+ * Write one ledger entry (tasks + task_runs, two rows). 8F is **one per round**.
+ * @returns {string|null} this record's files_json (reused directly by current_files in the heartbeat)
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
@@ -932,7 +1000,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     memberId,
     client: CLIENT,
     sessionId,
-    // Form of the polling path = CLI/Desktop (same as opencodeHandler's `form: 'cli'`).
+    // Form of the polling path = CLI/Desktop (same as opencodeHandler's `form: 'cli').
     // Leaving it null made the task detail show just "OpenCode"; it must read "OpenCode CLI".
     form: 'cli',
     model: model || null,
@@ -946,17 +1014,20 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     title,
     model: model || null,
     form: 'cli',
-    // 产出摘要：OpenCode 那一轮最后说的话（见 opencode.js 的 readOpencodeTurns）；
-    // 还没收工的那轮先不写（半截话不算产出），收工时再补。
+    // Output summary: what OpenCode last said that round (see readOpencodeTurns in opencode.js);
+    // a round that has not finished writes nothing yet (half a sentence is not output), it is filled in at
+    // wrap-up.
     result: result || null,
     fileCount: files ? files.length : 0,
     filesJson,
     endedAt: endedAt || null,
     durationMs: endedAt && startedAt ? endedAt - startedAt : null,
   });
-  /* 本轮消耗的 token（readOpencodeTurns 从 session_message.data.tokens 折出来，见 opencode.js）。
-     同 7F：**覆盖写**而不是 COALESCE —— 这一轮还在跑时每次轮询都会重算，数值是长出来的。
-     tokens 为 null（没读到）时如实写 NULL，不拿上一次的顶。 */
+  /* Tokens consumed this round (readOpencodeTurns folds them out of session_message.data.tokens, see
+     opencode.js).
+     Same as 7F: **overwrite** rather than COALESCE —— while this round is still running every poll
+     recomputes, and the numbers grow.
+     When tokens is null (nothing read) NULL is written honestly rather than carrying the previous value. */
   repo.setTaskRunTokens.run({
     id,
     inputTokens: tokens ? tokens.input : null,
@@ -967,7 +1038,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
-/** 台账 id 里的轮序号（`opencode:<会话id>:<序号>`）；不是这个形状就回 null（同 kilo.js） */
+/** The round sequence number in the ledger id (`opencode:<session id>:<seq>`); null when it is not this shape (same as kilo.js) */
 function turnIndexOf(taskId, prefix) {
   const id = String(taskId || '');
   if (!id.startsWith(`${prefix}:`)) return null;
@@ -977,46 +1048,57 @@ function turnIndexOf(taskId, prefix) {
 
 /**
  * @param {{bus: any, repo: any, now?: () => number}} ctx
- * @returns {number} 本次同步写/改了几条任务
+ * @returns {number} how many tasks this sync wrote / changed
  */
 function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
-  // 经 module.exports 解析数据源：测试把 listOpencodeSessions / readOpencodeTurns 换成熟数据桩，
-  // 这条同步器照样可端到端自检（见 test/taskSync.test.js）。生产里指向读 OpenCode 落盘的真函数，行为不变。
+  // Resolve the data source through module.exports: tests swap listOpencodeSessions / readOpencodeTurns for
+  // cooked-data stubs,
+  // and this synchronizer still self-checks end to end (see test/taskSync.test.js). In production it points
+  // at the real functions reading OpenCode's on-disk data, behavior unchanged.
   const sessions = module.exports.listOpencodeSessions();
   if (!sessions.length) return 0;
 
   const now = nowFn();
   let count = 0;
 
-  // 每条会话的逐轮清单**和**它现有的台账行各只读一次：让位判定、owner 选择、写台账三处复用
+  // Each session's per-round list **and** its existing ledger rows are each read once: the yield judgment,
+  // owner selection and ledger writing all reuse them
   const turnsOf = new Map();
   const runsOf = new Map();
   for (const s of sessions) {
     turnsOf.set(s.id, module.exports.readOpencodeTurns(s.id));
     runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
   }
-  /** 这条会话现在算不算在跑（还有一轮没收工） */
+  /** Whether this session counts as running right now (a round has not finished) */
   const isActiveOf = (s) => (turnsOf.get(s.id) || []).some((t) => !t.endedAt);
 
-  /** 插件给这条会话写的那些行（服务端发的 `k_*`）各自报的轮次起点；没写过 → [] */
+  /** The round start points reported by the rows the plugin wrote for this session (`k_*` sent by the
+   *  server); never written → [] */
   const pluginStartsOf = (s) =>
     runsOf.get(s.id).filter((r) => !String(r.id).startsWith(TASK_ID_PREFIX)).map((r) => Number(r.started_at || 0));
 
-  /** 插件**为这一轮**写过行没有：按轮次起点对齐（容许 PLUGIN_COVER_MS 的误差，理由见常量） */
+  /** Whether the plugin **wrote a row for this round**: aligned by round start point (tolerating
+   *  PLUGIN_COVER_MS, reasoning under the constants) */
   const coveredBy = (starts, at) => starts.some((p) => Math.abs(p - Number(at || 0)) <= PLUGIN_COVER_MS);
 
   /**
-   * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `opencode:*`）——
-   * 有就整条让位。判据按 id 前缀而不是 client（理由见 kilo.js 同名函数）。
+   * Whether this session already has **plugin-written** rows (the plugin writes server-issued `k_*`, polling
+   * writes `opencode:*`) —— if so the whole session yields. The criterion is the id prefix, not the client
+   * (reasoning in the function of the same name in kilo.js).
    *
-   * **让位只在插件还在报的时候成立**（2026-09-30 起，与 kilo.js 同口径）：插件写的行只
-   * 证明它**曾经**在报 —— 它跟着 agent 进程活，通道断了（服务端重启换了随机 token，老进程里
-   * 那份插件从此每条上报都 401 且完全无声）时，两路都不写，用户跑的轮次就凭空消失。
-   * 判据因此是"插件**这一轮**也写了没有"：它最新那一行落在源里最新这一轮起点之后
-   * （容许 PLUGIN_COVER_MS 的误差）→ 让位；这一轮刚起就再等 PLUGIN_GRACE_MS，过了还不见
-   * 它的行 → 收回这条会话。插件活着时每轮开跑 1 秒内就写一条，正常永不命中；它只是慢了
-   * （注册重试中）就先照旧让位，等它写上来让位重新成立、轮询自己的行被收掉（自愈）。
-   * 宽限期**从这一轮的起点算**（不是"插件沉默多久"）：插件两轮之间本来就不写东西，沉默是常态。
+   * **Yielding only holds while the plugin is still reporting** (since 2026-09-30, same criterion as
+   * kilo.js): a plugin-written row only proves it **used** to report —— it lives and dies with the agent
+   * process, and when the channel breaks (the server restarted with a new random token, so in the old
+   * process that plugin's every report is a silent 401) neither path writes, and the rounds the user runs
+   * vanish into thin air.
+   * Hence the criterion is "did the plugin write **this round** too": its newest row landing after the
+   * newest round's start point in the source (tolerating PLUGIN_COVER_MS) → yield; if the round just
+   * started, wait PLUGIN_GRACE_MS more, and if its row still does not appear → take the session back.
+   * While the plugin is alive it writes one row within a second of every round starting, so this never hits
+   * normally; if it is merely slow (retrying registration) yielding continues as usual until it writes, and
+   * polling's own rows get collected (self-healing).
+   * The grace period counts **from this round's start point** (not "how long the plugin has been silent"):
+   * the plugin writes nothing between two rounds anyway, so silence is the norm.
    */
   const yieldsOf = (s) => {
     const starts = pluginStartsOf(s);
@@ -1030,11 +1112,13 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   };
 
   /**
-   * 让位给插件的那条会话，插件是不是**冒我们这个身份、而且现在正跑着**？
-   * CLI 形态的插件（没有 VS Code 环境变量）报的就是裸 `opencode` —— 同一个成员
-   * `opencode@<工程>`，见 plugin/index.js 的 resolveClient。是的话这条工程的成员状态先归
-   * 插件写：轮询这一路连心跳都不碰，否则 5s 一次轮询会把插件刚写的相位覆盖成轮询视角下的
-   * 旧状态（agent_status 谁最后写谁赢）。收工后交回轮询（与 kilo.js 同款）。
+   * For a session that yielded to the plugin: is the plugin **impersonating our identity and running right
+   * now**?
+   * A CLI-form plugin (no VS Code environment variables) reports a bare `opencode` —— the same member
+   * `opencode@<project>`, see resolveClient in plugin/index.js. If so, this project's member status is
+   * written by the plugin first: the polling path does not even touch the heartbeat, otherwise a 5s poll
+   * would overwrite the phase the plugin just wrote with the polling view's older state (in agent_status,
+   * last writer wins). Hand it back to polling once finished (same as kilo.js).
    */
   const pluginOwnsMember = new Set();
   for (const s of sessions) {
@@ -1043,16 +1127,19 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   }
 
   /**
-   * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
-   * 同工程多条会话时，谁最后写谁赢 —— 会让"正在跑的那条任务"在 agent_status 里找不到心跳，
-   * 任务列表按 query.js 的 CASE 把它算成「已取消」。所以先选出这个工程该报的那条：
-   * 活跃里最新的；都不活跃就报最新那条（卡片挂住最后一条任务）—— 与 kilo.js 同款。
+   * One project writes only **one** member status row (agent_status's primary key is member_id).
+   * With several sessions in one project, whoever writes last wins —— which leaves "the task that is
+   * running" without a heartbeat in agent_status,
+   * and the task list's CASE in query.js computes it as "cancelled". So first pick which session this
+   * project should report: the newest among the active ones; if none are active, report the newest one (the
+   * card holds the last task) —— same as kilo.js.
    */
   const activeByProject = new Map();
   const newestByProject = new Map();
   for (const s of sessions) {
-    // 让位的会话**不参与** owner 选择：它这一路根本不写心跳，把它算进来就会让同工程另一条
-    // 真在跑的会话永远选不上 owner —— 那条任务在 agent_status 里找不到心跳，被判成「已取消」。
+    // A yielded session does **not** take part in owner selection: this path writes no heartbeat at all,
+    // and counting it in would keep another session in the same project that really is running from ever
+    // being picked as owner —— that task finds no heartbeat in agent_status and gets judged "cancelled".
     if (yieldsOf(s)) continue;
     const pid = projectIdOf(s);
     const prevNew = newestByProject.get(pid);
@@ -1067,11 +1154,14 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     const projectId = projectIdOf(s);
     const prefix = `${TASK_ID_PREFIX}${s.id}`;
 
-    // 装了插件就让位（和 kilo.js 同一口径）：插件那一路上报的是每一轮真值，判据是
-    // "这个会话有没有插件写的行"（插件写的 id 是 `k_*`，按 id 认而不是按 client 认 ——
-    // 7F 那个同款判据按 client 判时从来没命中过，见 kilo.js 的说明）。
-    // 但让位只在插件**还在报**时成立（yieldsOf）：通道断了就把会话收回来，
-    // 自己上一轮抢写的兜底行同样收掉（只删自己前缀的 id，插件的行一根汗毛都不动）。
+    // With the plugin installed, yield (same criterion as kilo.js): the plugin path reports the truth of
+    // every round, and the judgment is "does this session have plugin-written rows" (the plugin writes `k_*`
+    // ids, recognized by id rather than by client ——
+    // 7F's judgment of the same kind never hit when it went by client, see the notes in kilo.js).
+    // But yielding only holds while the plugin is **still reporting** (yieldsOf): when the channel breaks,
+    // take the session back,
+    // and also collect the fallback rows polling itself grabbed earlier (only ids with our own prefix are
+    // deleted; not one hair on the plugin's rows).
     const sessionRuns = runsOf.get(s.id);
     if (yieldsOf(s)) {
       for (const r of sessionRuns) if (String(r.id).startsWith(TASK_ID_PREFIX)) repo.deleteTaskRun(r.id);
@@ -1079,11 +1169,13 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     }
     const turns = turnsOf.get(s.id) || [];
     if (!turns.length) continue;
-    // 从断线插件手里收回来的会话：**插件报过的轮次它自己管**（那些行是 `k_*`），
-    // 只补它断线之后的（判据"这一轮插件没报过"，与 kilo.js 的 ②b 同一口径）。
+    // A session taken back from a disconnected plugin: **the rounds the plugin reported are its own
+    // business** (those rows are `k_*`),
+    // only backfill the ones after it disconnected (criterion "the plugin did not report this round", same
+    // as kilo.js's ②b).
     const starts = pluginStartsOf(s);
 
-    // 确保工程 & 成员存在（安静写入，不广播）
+    // Make sure the project & member exist (quiet write, no broadcast)
     bus.ensureProject(projectId, projectPath, null, 'report');
     const memberId = `opencode@${projectId}`;
     const existing = repo.getMember.get(memberId);
@@ -1105,9 +1197,10 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     let hbFilesJson = null;
     let running = false;
     for (const t of turns) {
-      if (coveredBy(starts, t.startedAt)) continue; // 插件报过的轮次不重复写
+      if (coveredBy(starts, t.startedAt)) continue; // rounds the plugin reported are not written twice
       const id = `${prefix}:${t.index}`;
-      // 改动文件：只认写工具（edit）碰过的；OpenCode 的输入是绝对路径，统一转工程相对
+      // Changed files: only ones a write tool (edit) touched; OpenCode's input is absolute, convert
+      // uniformly to project-relative
       const files = (t.files || [])
         .map((abs) => {
           const p = String(abs || '');
@@ -1117,8 +1210,9 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
         })
         .filter(Boolean);
       const title = t.prompt || s.title || '(OpenCode 会话)';
-      // 收工方式：OpenCode 的 idle 行写 succeeded / interrupted —— 被打断的那轮记「已取消」，
-      // 不记「完成」（实测 2026-09-28：用户终止了一轮，台账却报完成）。
+      // How it finished: OpenCode's idle row writes succeeded / interrupted —— a round that was
+      // interrupted is recorded as "cancelled", not "finished" (measured 2026-09-28: the user terminated a
+      // round yet the ledger reported finished).
       const state = t.endedAt ? (t.outcome === 'interrupted' ? 'cancelled' : 'done') : 'running';
       hbFilesJson = writeTurnRun(repo, {
         id,
@@ -1139,11 +1233,12 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
-    // 收掉"源里已经没有"的那几轮（与 kilo.js 的 ③b 同一口径）：轮次表缩短时
-    // （OpenCode 清了消息 / 压过上下文），那几行永远等不到自己的轮 —— 一直挂在 'running'，
-    // 被 query.js 的 CASE 判成「已取消」，在列表里当一条假任务躺着。
-    // 判据是"这一轮还在不在源里"（byIndex），不认数组下标。turns 整个读空时上面已经
-    // continue 了（不在这里删）：读不出来 ≠ 源里没有。
+    // Retire the rounds "no longer in the source" (same criterion as kilo.js's ③b): when the round table
+    // shrinks (OpenCode cleared messages / compressed context), those rows never get their own round ——
+    // they hang on 'running' forever,
+    // get judged "cancelled" by the CASE in query.js and lie in the list as a phantom task.
+    // The criterion is "is this round still in the source" (byIndex), not the array index. When turns reads
+    // empty the code above already continued (no deletion here): unreadable ≠ absent from the source.
     const byIndex = new Set(turns.map((t) => t.index));
     for (const r of sessionRuns) {
       const idx = turnIndexOf(r.id, prefix);
@@ -1151,9 +1246,11 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       repo.deleteTaskRun(r.id);
     }
 
-    // 心跳：只在跑 = thinking，收工 = idle；指向正在跑的那条（没有就最新那条）。
-    // **只由这个工程选中的那条会话写**（见上面 activeByProject 的说明）；
-    // 插件正冒我们这个身份在报、且那轮还没收工 → 这一栏整个让给它（见 pluginOwnsMember）。
+    // Heartbeat: running = thinking, finished = idle; points at the running one (or the newest when there is
+    // none).
+    // **Only the session selected for this project writes it** (see activeByProject above);
+    // if the plugin is reporting while impersonating our identity and that round has not finished → this
+    // slot yields to it entirely (see pluginOwnsMember).
     const owner = pluginOwnsMember.has(projectId)
       ? null
       : activeByProject.get(projectId) || newestByProject.get(projectId);
@@ -1186,11 +1283,12 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
 }
 
 /**
- * opencode 来源分支（8F）：轮询 OpenCode 自己的 SQLite（opencode.db 的 session_message）。
- * 原 sessionRegistry.js 的 opencode 分支整体搬到这里，调试 8F 不再碰中央文件。
- * @param {object} p 楼层元数据
- * @param {object} src 来源规格（kind === 'opencode'）
- * @param {object} ctx 框架提供的共享工具
+ * The opencode source branch (8F): poll OpenCode's own SQLite (session_message in opencode.db).
+ * The whole opencode branch from the old sessionRegistry.js moved here, so debugging 8F no longer touches a
+ * central file.
+ * @param {object} p floor metadata
+ * @param {object} src source spec (kind === 'opencode')
+ * @param {object} ctx shared utilities provided by the framework
  */
 function opencodeHandler(p, src, ctx) {
   const { claim, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, doneFieldsFromReporter } = ctx;
@@ -1204,7 +1302,7 @@ function opencodeHandler(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      // source = form→source（这一路读的是 opencode.db，CLI/Desktop 形态）
+      // source = form→source (this path reads opencode.db, the CLI/Desktop form)
       source: formToSource('cli'),
       form: 'cli',
       sourceKind: 'opencode',
@@ -1240,11 +1338,11 @@ module.exports = {
   listOpencodeSessions,
   readOpencodePhase,
   readOpencodeDone,
-  readOpencodeTurns, // 逐轮任务清单（8F 台账按"每一轮一条"记账用，见本文件任务同步器）
+  readOpencodeTurns, // per-round task list (8F's ledger records "one per round", see the task synchronizer in this file)
   opencodeInstrumented,
   opencodeMainPhase,
   NO_DONE,
-  // ---- 8F 任务同步器（原 opencodeTasks.js）----
+  // ---- 8F task synchronizer (formerly opencodeTasks.js) ----
   syncOpencodeTasks,
   // Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
   syncTasks: syncOpencodeTasks,

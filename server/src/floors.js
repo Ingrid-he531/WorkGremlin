@@ -40,7 +40,8 @@
 const os = require('node:os');
 const path = require('node:path');
 
-// 通用扫描基础设施（操作系统/编辑器目录枚举、目录体积、正则匹配……不认任何具体产品）
+// Generic scanning infrastructure (OS/editor directory enumeration, directory size, regex matching
+// … knows no specific product)
 const {
   isDir,
   isFile,
@@ -80,9 +81,9 @@ const FLOOR_CONTRACT = [
   'pluginPolicy',
 ];
 
-/* ============================================================== 注册表 */
+/* ============================================================== Registry */
 
-/** 楼层 id → 楼层模块（每个楼层一个文件，新增楼层只在这里加一行） */
+/** Floor id → floor module (one file per floor; adding a floor is one line here) */
 const floors = {
   '1F': require('./floorCodebuddy'),
   '2F': require('./floorWorkbuddy'),
@@ -95,24 +96,24 @@ const floors = {
   '9F': require('./floorCopilot'),
 };
 
-/** agent（楼层基名，如 'codebuddy'）→ 楼层模块；hookDispatch 据此把事件派发给对应楼层的 handleHookEvent */
+/** agent (floor base name, e.g. 'codebuddy') → floor module; hookDispatch uses this to send events to that floor's handleHookEvent */
 const floorByAgent = {};
 for (const f of Object.values(floors)) {
   const a = f?.meta?.agent;
   if (a) floorByAgent[String(a).toLowerCase()] = f;
 }
 
-/** 按楼层 id 取模块；没有返回 null */
+/** Get a module by floor id; null when absent */
 function floorOf(id) {
   return floors[String(id)] || null;
 }
 
-/* ============================================================== CLI 安装目录（通用兜底） */
+/* ============================================================== CLI install directories (generic fallback) */
 
 /**
- * CLI 常见安装目录（PATH 查不到时的兜底）。**只放与具体产品无关的通用位置**——
- * 某一层自己的 CLI 装在哪（~/.codebuddy/bin、~/.qoder/entry …）由该层 meta.cliBinDirs 声明，
- * 探测时拼在本数组之前。
+ * Common CLI install directories (fallback when PATH lookup fails). **Only product-independent
+ * generic locations belong here** —— where a given floor's own CLI lives (~/.codebuddy/bin,
+ * ~/.qoder/entry …) is declared by that floor's meta.cliBinDirs, which is prepended at detection.
  */
 const BASE_CLI_BIN_DIRS = [
   path.join(HOME, '.local', 'bin'),
@@ -142,13 +143,14 @@ function findCliBin(cmd, p) {
   return '';
 }
 
-/* ============================================================== 落盘目录探测（按 meta 编排） */
+/* ============================================================== On-disk directory detection (orchestrated by meta) */
 
 /**
- * 找落盘目录。各楼层的"按名字匹配什么"与"家目录里的哪些候选"都在 meta.matchRe / meta.homeDirs
- * （plugin 形态用 meta.homeDirsPlugin）里声明 —— 本文件完全不出现具体楼层的名字/路径。
- * @param {{matchRe?: RegExp[], homeDirs?: string[], homeDirsPlugin?: string[]}} p 楼层 meta
- * @param {boolean} plugin 是否插件形态
+ * Find the on-disk directory. Each floor's "match what by name" and "which candidates in the home
+ * directory" are declared in meta.matchRe / meta.homeDirs (meta.homeDirsPlugin for the plugin form)
+ * —— concrete floor names/paths never appear in this file.
+ * @param {{matchRe?: RegExp[], homeDirs?: string[], homeDirsPlugin?: string[]}} p floor meta
+ * @param {boolean} plugin whether it is the plugin form
  */
 function findDataPath(p, plugin) {
   const res = p && p.matchRe && p.matchRe.length ? p.matchRe : [];
@@ -172,21 +174,21 @@ function findDataPath(p, plugin) {
   return '';
 }
 
-/** 找插件安装目录（编辑器扩展）。res 传楼层 meta.pluginRe（或 altPluginRe） */
+/** Find the plugin install directory (editor extension). res takes the floor's meta.pluginRe (or altPluginRe) */
 function findPluginDir(res) {
   return firstMatch(extensionRoots(), res || []);
 }
 
-/** 找插件 globalStorage 目录（扩展目录搜不到时的兜底安装证据）。res 同上 */
+/** Find the plugin's globalStorage directory (install evidence fallback when the extension directory search fails). res as above */
 function findPluginStorageDir(res) {
   return firstMatch(globalStorageRoots(), res || []);
 }
 
-/* ============================================================== 来源规格 */
+/* ============================================================== Source specs */
 
 /**
- * 这一层吃哪几路会话/落盘来源。
- * 条目是**字符串**（只给 kind）或**对象**（合并楼层用得上）。
+ * Which session / on-disk sources this floor consumes.
+ * Entries are either **strings** (kind only) or **objects** (needed by merged floors).
  * @returns {Array<{kind: string, label?: string, client?: string, dirs?: string[], note?: string}>}
  */
 function sourceSpecs(p) {
@@ -196,8 +198,9 @@ function sourceSpecs(p) {
 }
 
 /**
- * 这一路的上报身份 client —— **恒等于楼层基名**（agent）。
- * 形态（CLI / 插件）不走身份：由下面的 sourceForm / spec.kind 表达，是不是插件用 shared.isPluginClient(form) 判。
+ * The reporting identity `client` of this path —— **always equal to the floor base name** (agent).
+ * The form (CLI / plugin) is not part of the identity: it is expressed by sourceForm / spec.kind
+ * below, and whether something is a plugin is decided by shared.isPluginClient(form).
  * A spec.client override is allowed (rare), but never synthesize an `<agent>-plugin` identity —
  * the reported state file's client is the bare base name (see hookCommon's `client = ev.agent`).
  */
@@ -205,7 +208,7 @@ function sourceClient(p, spec) {
   return spec.client || p.agent;
 }
 
-/** 这一路的形态（cli / vscode / ide …）：显式给了就用它，否则按 kind 推；hook 那一路形态不定（''，两种都收） */
+/** The form of this path (cli / vscode / ide …): use the explicit value when given, otherwise derive it from kind; the hook path has no fixed form ('', both accepted) */
 function sourceForm(spec) {
   if (spec.form) return spec.form;
   if (spec.kind === 'plugin') return 'vscode';
@@ -213,7 +216,7 @@ function sourceForm(spec) {
   return '';
 }
 
-/** 这一路的落盘目录候选（顺序即优先级）：hook 没有落盘目录；'dir' 用显式 dirs */
+/** Candidate on-disk directories for this path (order is priority): the hook path has no directory; 'dir' uses explicit dirs */
 function sourceDirs(p, spec) {
   if (spec.dirs && spec.dirs.length) return spec.dirs;
   if (spec.kind === 'hook') return [];
@@ -223,12 +226,12 @@ function sourceDirs(p, spec) {
   return [findDataPath(p, spec.kind === 'plugin')];
 }
 
-/** 空统计（没有落盘目录时的占位，字段与 scanDataDir 一致） */
+/** Empty stats (placeholder when there is no on-disk directory; same fields as scanDataDir) */
 const NO_STATS = { files: 0, sessions: 0, bytes: 0, sizeLabel: '0 B', lastModifiedAt: null };
 
 /**
- * 这一路落盘**能不能读出会话** —— 不能就明说。
- * @returns {string} 说明文案；不需要说明时回空串
+ * Whether sessions can actually be **read out** of this path's on-disk data —— say so plainly when not.
+ * @returns {string} explanatory copy; empty string when no explanation is needed
  */
 function sourceNote(kind, dataPath) {
   if (kind !== 'plugin' || !dataPath) return '';
@@ -237,14 +240,16 @@ function sourceNote(kind, dataPath) {
 }
 
 /**
- * 一路来源的描述：kind + client + 落盘目录 + 落盘统计（hook 来源没有自己的落盘目录）。
+ * Description of one source: kind + client + on-disk directory + on-disk stats (the hook source has
+ * no on-disk directory of its own).
  */
 function detectSource(p, spec, clients) {
   const dataPath = sourceDirs(p, spec).find((d) => d && isDir(d)) || '';
   return {
     kind: spec.kind,
     label: spec.label || '',
-    // client 恒为楼层基名；形态另放 form（消费者按 isPluginClient(form) 判插件）
+    // client is always the floor base name; the form goes into form separately (consumers use
+    // isPluginClient(form) to detect plugins)
     client: sourceClient(p, spec),
     form: sourceForm(spec),
     sessions: spec.kind !== 'dir',
@@ -303,21 +308,21 @@ function detectOne(p) {
   };
 }
 
-/* ============================================================== 楼层元数据聚合 */
+/* ============================================================== Floor metadata aggregation */
 
 /**
- * 产品元数据不再硬编码：每个楼层在自己的文件（server/src/<product>.js）导出 `meta`，
- * 这里只从楼层注册表聚合。
+ * Product metadata is no longer hardcoded: each floor exports `meta` from its own file
+ * (server/src/<product>.js), and this only aggregates from the floor registry.
  * @returns {Array}
  */
 function floorMetas() {
-  // 按楼层 id 升序，保证 1F…9F 的顺序稳定（UI / 快照都依赖这个顺序）
+  // Ascending floor id, so the 1F…9F order stays stable (both the UI and snapshots depend on it)
   return Object.keys(floors)
     .sort()
     .map((id) => floors[id].meta);
 }
 
-/** 探测所有楼层；force 可跳过缓存重新扫盘 */
+/** Detect every floor; force skips the cache and rescans the disk */
 function detectProducts({ force = false } = {}) {
   const now = Date.now();
   if (!force && cache.products.length && now - cache.at < TTL) return cache.products;
@@ -326,7 +331,7 @@ function detectProducts({ force = false } = {}) {
   return products;
 }
 
-/** 扫盘不便宜，结果缓存 60 秒 */
+/** Scanning the disk is not cheap, so results are cached for 60 seconds */
 const TTL = 60_000;
 let cache = { at: 0, products: [] };
 
@@ -350,11 +355,11 @@ function taskSyncerFloors() {
   return /** @type {Array<any>} */ (Object.values(floors)).filter((f) => typeof f.syncTasks === 'function');
 }
 
-/* ============================================================== 静态 subagent 聚合 */
+/* ============================================================== Static subagent aggregation */
 
 /**
- * 取某 client（楼层基名）对应的 agent 目录列表；client 缺省时汇总所有楼层。
- * 顺序即优先级（楼层内 project 先于 user；跨楼层按 1F…9F）。
+ * Agent directory list for a given client (floor base name); when client is omitted all floors are
+ * aggregated. Order is priority (project before user within a floor; 1F…9F across floors).
  * @param {string} [client]
  * @param {string} [workspacePath]
  * @returns {Array<{dir:string, level:'project'|'user'}>}
@@ -372,8 +377,9 @@ function dirsForClient(client, workspacePath) {
 }
 
 /**
- * subagent 级别（用户级 / 项目级）。client 给定时只在该楼层目录里找；缺省时汇总所有楼层。
- * 取不到回 null（普通成员 / 演示数据，不戴级别牌）。
+ * subagent level (user / project). With a client, only that floor's directories are searched; without
+ * one, all floors are aggregated. null when unavailable (ordinary members / demo data wear no level
+ * badge).
  * @param {string} name
  * @param {string} workspacePath
  * @param {string} [client]
@@ -384,8 +390,9 @@ function detectLevel(name, workspacePath, client) {
 }
 
 /**
- * subagent 功能描述（agent 定义文件里的静态数据）。client 给定时只在该楼层目录里找；缺省时
- * 汇总所有楼层，命中第一个。取不到回空串（渲染层据此隐藏那一栏）。
+ * subagent functional description (static data from the agent definition file). With a client, only
+ * that floor's directories are searched; without one, all floors are aggregated and the first hit
+ * wins. Empty string when unavailable (the render layer hides that field accordingly).
  * @param {string} name
  * @param {string} workspacePath
  * @param {string} [client]
@@ -407,7 +414,7 @@ function agentSyncerFloors() {
   return /** @type {Array<any>} */ (Object.values(floors)).filter((f) => typeof f.syncAgents === 'function');
 }
 
-/* ============================================================== 导出 */
+/* ============================================================== Exports */
 
 module.exports.FLOOR_CONTRACT = FLOOR_CONTRACT;
 module.exports.floors = floors;

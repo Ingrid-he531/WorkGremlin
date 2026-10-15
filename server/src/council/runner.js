@@ -1,75 +1,85 @@
 'use strict';
 
 /**
- * 单次调用一个参与者 —— 起进程、喂提示词、收输出、**到点连它的子进程一起杀**。
+ * Invoke one participant once —— spawn it, feed it the prompt, collect the output, and
+ * **kill it together with its children when time is up**.
  *
- * 这是仓库里第一处"服务端异步拉起并托管长驻子进程"的地方（别处的 child_process 都是
- * 启动期同步跑一下就完的，见 products.js 的 resolveCommand）。所以这里要自己把几件事做全：
+ * This is the first place in the repo where the server asynchronously spawns and supervises a
+ * long-lived child process (elsewhere child_process is only used synchronously once at startup,
+ * see resolveCommand in products.js). So a few things have to be done properly here:
  *
- *   · **杀进程组**，不只是杀直接子进程。这些 CLI 自己会再起一个服务进程/子进程，
- *     只 kill 主进程会留下孤儿占着端口和内存。detached 让它自成一个进程组，
- *     然后对 `-pid` 下手，整组一起死。
- *   · **输出有上限**。CLI 抽风时能吐几百 MB，不封顶就是把服务端内存赌上去。
- *     超了就杀掉并按「失败」如实记 —— 不是截一半假装它答完了。
- *   · **超时是"这一票拿不到"，不是"再等等"**：到点杀进程，返回值里 status='timeout'，
- *     调用方据此记「未表态」。绝不返回一个半截的答案。
+ *   · **Kill the process group**, not just the direct child. These CLIs spawn their own service /
+ *     child processes, so killing only the main process leaves orphans holding ports and memory.
+ *     Start it detached so it forms its own process group, then go after `-pid` so the whole group
+ *     dies together.
+ *   · **Cap the output**. A misbehaving CLI can spew hundreds of MB; without a cap we are betting
+ *     the server's memory. It gets killed on overflow and recorded honestly as "failed" —— not
+ *     cut in half and pretended to have finished.
+ *   · **Timeout means "this vote is unavailable", not "wait a bit more"**: kill the process when
+ *     the time comes and return status='timeout', so the caller records "no position expressed".
+ *     Never return a half answer.
  *
- * 返回值里的 status 只有三种：ok / failed / timeout。
- *   · ok       —— 进程正常退出**且**输出解析得出正文。text / tokens 才有意义。
- *   · failed   —— 起不来（ENOENT）、非零退出、输出读不出。error 里是**原文**，别加工。
- *   · timeout  —— 到点被杀。
- * 解析出正文但**没有**投票块的情况不在这里判：那是调用方的事（记 status='unparsed'），
- * 因为"说了话但没投票"和"根本没说话"要分得开。
+ * There are exactly three statuses in the return value: ok / failed / timeout.
+ *   · ok       —— the process exited normally **and** the output parses into body text. Only then
+ *                 do text / tokens mean anything.
+ *   · failed   —— could not start (ENOENT), non-zero exit, unreadable output. error carries the
+ *                 **raw text**, do not dress it up.
+ *   · timeout  —— killed when the time came.
+ * Body parsed but **no** vote block is not decided here: that is the caller's job (record
+ * status='unparsed'), because "spoke but did not vote" has to stay distinguishable from "did not
+ * speak at all".
  */
 
 const { spawn } = require('node:child_process');
 
 const { parseOutput } = require('./agents');
 
-/** 单个进程的 stdout 上限：超过就杀掉。正常一轮发言几 KB，64MB 只可能是它在吐日志风暴 */
+/** stdout cap for a single process: exceeding it means get killed. A normal speech is a few KB, 64MB can only be a log storm */
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
-/** SIGTERM 之后留给它收拾的时间，再不走就 SIGKILL */
+/** Grace period after SIGTERM before SIGKILL */
 const KILL_GRACE_MS = 3_000;
 
 const IS_WIN = process.platform === 'win32';
 
 /**
- * 杀**整组**进程。POSIX 下子进程是 detached 起的（自成进程组），所以对它取负 pid。
- * 组已经没了（ESRCH）是正常情况，不算错。
+ * Kill the **whole group**. On POSIX the child was started detached (its own process group), so use
+ * its negated pid. A group that is already gone (ESRCH) is normal, not an error.
  */
 function killTree(child) {
   if (!child || child.pid == null || child.killed) return;
   if (IS_WIN) {
-    // Windows 没有进程组信号，用 taskkill 连子进程一起收
+    // Windows has no process-group signals, use taskkill to reap children along with it
     try {
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).unref();
     } catch {
-      /* 收不掉就算了，下面还有 kill 兜底 */
+      /* fine if it cannot be reaped, there is still a kill fallback below */
     }
     return;
   }
   try {
     process.kill(-child.pid, 'SIGTERM');
   } catch {
-    /* 组可能已经没了 */
+    /* the group may already be gone */
   }
   setTimeout(() => {
     try {
       process.kill(-child.pid, 'SIGKILL');
     } catch {
-      /* 已经退出 */
+      /* already exited */
     }
   }, KILL_GRACE_MS).unref();
 }
 
 /**
- * 跑一次。
+ * Run it once.
  *
  * @param {{bin:string, args?:string[], env?:object, stdin?:string|null, cwd:string,
  *          timeoutMs:number, agent:string, onChild?:(child:import('node:child_process').ChildProcess)=>void}} arg
- *   env 是**叠加**在 process.env 上的（登录凭据靠 HOME 找，不能替换）。
- *   onChild 在进程起来时被叫一次，把句柄交给调用方 —— 议事厅要能在用户点「取消」
- *   或服务关闭时杀掉在飞的进程，光靠超时是等不到的。
+ *   env is **layered on top of** process.env (login credentials are found via HOME, it must not
+ *   replace them).
+ *   onChild is called once when the process is up, handing the handle to the caller —— the council
+ *   has to be able to kill in-flight processes when the user hits "cancel" or the server closes;
+ *   a timeout alone would never get there in time.
  * @returns {Promise<{status:'ok'|'failed'|'timeout', text:string, tokens:object|null,
  *                    error:string|null, durationMs:number, exitCode:number|null}>}
  */
@@ -83,22 +93,23 @@ function runOnce(arg) {
       child = spawn(arg.bin, arg.args || [], {
         cwd: arg.cwd,
         env: { ...process.env, ...(arg.env || {}) },
-        // 自成进程组，超时/取消时能连它拉起来的子进程一起收
+        // Own process group, so on timeout/cancel everything it spawned can be reaped together
         detached: !IS_WIN,
         stdio: [arg.stdin != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
-      // spawn 同步抛（参数不合法等）—— 如实记，不吞
+      // spawn throws synchronously (invalid arguments, etc.) —— record it honestly, do not swallow
       resolve({ status: 'failed', text: '', tokens: null, error: `起进程失败：${err && err.message}`, durationMs: Date.now() - startedAt, exitCode: null });
       return;
     }
 
-    // 句柄交给调用方（议事厅要能在取消 / 关服时主动杀掉，而不是干等超时）
+    // Hand the handle to the caller (the council has to be able to kill proactively on cancel /
+    // shutdown instead of just waiting for the timeout)
     if (typeof arg.onChild === 'function' && child.pid != null) {
       try {
         arg.onChild(child);
       } catch {
-        /* 调用方的回调出错不该影响这次调用 */
+        /* an error in the caller's callback must not affect this invocation */
       }
     }
 
@@ -125,8 +136,9 @@ function runOnce(arg) {
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(child);
-      // 不在这儿 resolve：等 close 事件回来把真实退出码也收下（给排障留证据）。
-      // 万一 close 迟迟不来（进程卡在不可中断状态），兜底再 resolve 一次。
+      // Do not resolve here: wait for the close event so the real exit code is captured too
+      // (evidence for troubleshooting).
+      // If close never comes (the process is stuck uninterruptible), resolve once as a fallback.
       setTimeout(() => {
         if (!settled) finish('timeout', { error: `${Math.round(timeoutMs / 1000)}s 内没有返回，已终止该参与者`, exitCode: null });
       }, KILL_GRACE_MS + 2_000).unref();
@@ -140,7 +152,8 @@ function runOnce(arg) {
       }
     });
     child.stderr.on('data', (b) => {
-      // stderr 只留尾巴：CLI 的报错一般就那几行，前面的进度输出没用
+      // Keep only the tail of stderr: CLI errors are usually those few lines, the progress output
+      // before them is useless
       stderr += b.toString('utf8');
       if (stderr.length > 32 * 1024) stderr = stderr.slice(-32 * 1024);
     });
@@ -159,7 +172,8 @@ function runOnce(arg) {
         return;
       }
       if (code !== 0) {
-        // 非零退出：把 stderr 尾巴带上，界面要能直接看到它为什么没答上来
+        // Non-zero exit: attach the stderr tail, the UI has to be able to see right away why it
+        // did not answer
         const tail = stderr.trim().split(/\r?\n/).slice(-4).join('\n');
         finish('failed', { error: `退出码 ${code}${tail ? `：${tail}` : ''}`, exitCode: code });
         return;
@@ -175,7 +189,7 @@ function runOnce(arg) {
 
     if (arg.stdin != null && child.stdin) {
       child.stdin.on('error', () => {
-        /* 子进程提前死掉会让写管道报 EPIPE，不是我们要报的错（退出码那路已经覆盖） */
+        /* a child dying early makes the pipe write throw EPIPE, which is not the error to report (the exit-code path already covers it) */
       });
       child.stdin.end(arg.stdin, 'utf8');
     }

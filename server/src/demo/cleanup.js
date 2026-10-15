@@ -5,10 +5,14 @@ const { DEMO_MEMBER_NAMES } = require('../mock/generator');
 const config = require('../config');
 
 /**
- * 演示残留清理（两类）：
- *   - purgeLeftovers：清混进【当前真实工程】的演示种子成员（旧版演示 project 叫 workgremlin，撞名真实工程 slug）。
- *     只清演示种子名单里的名字，且跳过已被 agentRoster 管理的"已定义 subagent"（如 coder —— 真实成员，由名册持续心跳，不能误删）。
- *   - purgeStragglers：清演示工程里名册不再定义的 subagent 残留（名册摘人靠进程内记账，重启即空，按名册口径对账最可靠）。
+ * Demo leftover cleanup (two kinds):
+ *   - purgeLeftovers: purge demo seed members that leaked into the [current real project]
+ *     (the old demo project was named workgremlin, which collided with a real project slug).
+ *     Only names on the demo seed list are purged, skipping "defined subagents" already managed
+ *     by agentRoster (e.g. coder — a real member, kept alive by the roster, must not be removed).
+ *   - purgeStragglers: purge subagent leftovers in the demo project that the roster no longer
+ *     defines (roster removal is tracked in-process and wiped on restart, so reconciling by
+ *     roster criteria is the most reliable way).
  */
 function createDemoCleaner({ repo, bus }) {
   function purgeLeftovers(cur, agentRoster) {
@@ -22,7 +26,7 @@ function createDemoCleaner({ repo, bus }) {
         bus.removeMember({ project: cur.project, memberId: m.id });
         n += 1;
       } catch {
-        /* 单个清不掉不影响别的 */
+        /* failing to remove one does not affect the others */
       }
     }
     if (n) log.info(`[workgremlin] 已清理 ${n} 个混进工程「${cur.projectName || cur.project}」的演示残留成员`);
@@ -30,7 +34,8 @@ function createDemoCleaner({ repo, bus }) {
   }
 
   function purgeStragglers(agentRoster) {
-    // 名册没起来时 isDefined 不可信（会把用户级小怪物一起误摘），宁可不做
+    // When the roster is not up yet, isDefined cannot be trusted (it would remove user-level
+    // gremlins too) — better to do nothing at all
     if (!agentRoster) return 0;
     const project = config.DEMO_PROJECT;
     let n = 0;
@@ -44,7 +49,7 @@ function createDemoCleaner({ repo, bus }) {
         bus.removeMember({ project, memberId: m.id });
         n += 1;
       } catch {
-        /* 单个清不掉不影响别的 */
+        /* failing to remove one does not affect the others */
       }
     }
     if (n) log.info(`[workgremlin] 已清理 ${n} 个不属于演示工程的小怪物（名册残留）`);

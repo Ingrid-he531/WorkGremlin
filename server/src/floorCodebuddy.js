@@ -1,14 +1,16 @@
 'use strict';
 
 /**
- * 1F CodeBuddy（CLI 与 Plugin 合并楼层）。
+ * 1F CodeBuddy (CLI and Plugin merged floor).
  *
- * 这一层 = 同一个产品的两种形态合成一层（见 server/src/products.js 文件头）：
- *   cli    —— ~/.codebuddy 下的会话 jsonl（CLI 历史落盘）
- *   plugin —— 编辑器 globalStorage 里的结构化落盘（genie-history / todos / …）
- *   hook   —— reporter 状态文件（CLI 常常没有可扫的会话落盘时的唯一真值）
- * 三种标准来源（cli/plugin/hook）都由 sessionRegistry 的默认 handler 处理，
- * 本文件只声明元数据，不需要写 kindHandlers。新增/调整本楼层只改这个文件。
+ * This floor = two forms of the same product merged into one (see the header of
+ * server/src/products.js):
+ *   cli    —— session jsonl under ~/.codebuddy (CLI history on disk)
+ *   plugin —— structured on-disk data in the editor's globalStorage (genie-history / todos / …)
+ *   hook   —— reporter state file (the only truth when the CLI often has no scannable session data)
+ * All three standard sources (cli/plugin/hook) are handled by sessionRegistry's default handler; this
+ * file only declares metadata and needs no kindHandlers. Adding / adjusting this floor touches only
+ * this file.
  */
 
 const os = require('node:os');
@@ -16,16 +18,20 @@ const path = require('node:path');
 const fs = require('node:fs');
 // Shared server logger (warn goes to stderr and to ~/.workgremlin/logs).
 const log = require('./log');
-// globalStorage 根目录列表（插件落盘位置）收口在 roots.js，全仓库单一来源，避免各处各自写一份、还漏掉 macOS/Windows 平台目录
+// The list of globalStorage roots (where plugins write) is centralized in roots.js, a single source of
+// truth for the whole repo, so nobody rewrites their own copy and misses the macOS/Windows directories
 const { dataRoots, isDir, isFile, readJson, readDir } = require('./roots');
-// 工程名解析（genie-history 目录名 → 工程名）收口在 project.js
+// Project name resolution (genie-history directory name → project name) is centralized in project.js
 const { resolveProjectName } = require('./project');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent directories (project-level / user-level): private knowledge of this floor, kept here
+// rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 /**
- * 1F 的静态 subagent 定义目录：项目级 <ws>/.codebuddy/agents、用户级 ~/.codebuddy/agents。
- * 返回 [{ dir, level }]，项目级先于用户级（命中优先级）。floors.js 据此聚合 + 判级别。
+ * 1F's static subagent definition directories: project-level <ws>/.codebuddy/agents and user-level
+ * ~/.codebuddy/agents.
+ * Returns [{ dir, level }], project level before user level (match priority). floors.js aggregates from
+ * this and decides the level.
  */
 function agentDirs(workspacePath) {
   return genericAgentDirs([path.join(HOME, '.codebuddy')], workspacePath);
@@ -33,17 +39,18 @@ function agentDirs(workspacePath) {
 
 const HOME = os.homedir();
 
-/** 插件目录名匹配（仅 plugin 楼层需要）；findPluginDir 的默认正则也用它 */
+/** Plugin directory name matching (only the plugin floor needs it); findPluginDir's default regex uses it too */
 const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
 
-/* ===================== CodeBuddy 家族插件结构化落盘（plugin kind 取数） =====================
- * genie-history（工程归集）/ todos / file-changes / message-queue 这一套目录结构是 CodeBuddy
- * （腾讯 Coding Copilot）插件**独有**的，别的插件楼层各有各的落盘（9F Copilot 是 session-store.db，
- * 见 floorCopilot.js）。所以它归本楼层所有 —— 由 sessions.js 的 listSessions 按 client 派发到
- * 下面的 pluginStore，通用插件读取器（plugin.js）不再掺和任何产品的内部目录结构。
+/* ===================== CodeBuddy family plugin structured on-disk data (plugin kind reads) =====================
+ * This whole directory structure of genie-history (project grouping) / todos / file-changes /
+ * message-queue is **unique to the CodeBuddy** (Tencent Coding Copilot) plugin; other plugin floors
+ * each have their own on-disk shape (9F Copilot is session-store.db, see floorCopilot.js). So it belongs
+ * to this floor —— sessions.js's listSessions dispatches by client to pluginStore below, and the generic
+ * plugin reader (plugin.js) no longer meddles with any product's internal directory structure.
  */
 
-/** 文件 mtime（ms）；读不到回 0（"没动过"，绝不编造） */
+/** File mtime (ms); returns 0 when unreadable ("never touched", never fabricated) */
 function mtime(p) {
   try {
     return Math.round(fs.statSync(p).mtimeMs);
@@ -52,14 +59,14 @@ function mtime(p) {
   }
 }
 
-/** 目录名是工程路径的 base64；解不出来（不是路径）就返回空 */
+/** The directory name is the base64 of the project path; returns empty when it does not decode (not a path) */
 function decodeDirName(name) {
   try {
     const s = Buffer.from(String(name), 'base64').toString('utf8');
     if (!s || s.includes('\u0000')) return '';
     if (s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
   } catch {
-    /* 不是 base64，跳过 */
+    /* not base64, skip */
   }
   return '';
 }
@@ -147,7 +154,7 @@ function collectProjects(storage, candidates = []) {
   return out;
 }
 
-/** 每个会话的待办：total / done / doing（第一条 in_progress）/ 前几条的文案 */
+/** Per-session todos: total / done / doing (the first in_progress) / the text of the first few */
 function readTodos(storage, id) {
   const file = path.join(storage, 'todos', `${id}.json`);
   const data = readJson(file);
@@ -165,7 +172,7 @@ function readTodos(storage, id) {
   };
 }
 
-/** 文件当前字节大小（按绝对路径现 stat）。删除类改动的源文件已不存在 → null，绝不编造。 */
+/** Current byte size of a file (stat'ed live by absolute path). Deletion-type changes have no source file left → null, never fabricated. */
 function fileSizeOf(fp) {
   if (!fp || typeof fp !== 'string') return null;
   try {
@@ -176,7 +183,7 @@ function fileSizeOf(fp) {
   }
 }
 
-/** 改动文件：按最后写入倒序取最近几个 */
+/** Changed files: newest first, by last write */
 function readFileChanges(storage, id) {
   const dir = path.join(storage, 'file-changes', id);
   const out = [];
@@ -190,8 +197,9 @@ function readFileChanges(storage, id) {
       op: String(j.changeType || ''),
       added: Number(j.addedLines) || 0,
       removed: Number(j.removedLines) || 0,
-      // 字节大小：文件本体（filePath 是绝对路径）现 stat。插件 / IDE 这份落盘只给行数、
-      // 不给体积，只能服务端现算；删除类改动的源文件已不在，算不到就留 null。
+      // Byte size: the file itself (filePath is absolute) stat'ed live. The plugin / IDE on-disk data
+      // gives line counts only, no volume, so the server has to compute it; the source file of a
+      // deletion-type change is gone, so if it cannot be computed it stays null.
       size: fileSizeOf(j.filePath),
       at: mtime(p),
     });
@@ -201,8 +209,8 @@ function readFileChanges(storage, id) {
 }
 
 /**
- * 消息队列里该会话的运行态 + 排队条数。
- * 一个 message-queue 文件里可能装着多个会话，全部扫一遍取自己的那份。
+ * The runtime state + queued count for this session in the message queue.
+ * One message-queue file can hold several sessions, so all of them are scanned for its own share.
  */
 function readRuntime(storage, id) {
   const dir = path.join(storage, 'message-queue');
@@ -236,24 +244,27 @@ function readRuntime(storage, id) {
 }
 
 /**
- * 本楼层 plugin kind 的结构化落盘读取器 —— sessions.js 的 listSessions / sessionInfo 按 client
- * 派发到这里（见 sessions.js 的 pluginStoreOf）。接口与"插件落盘读取"约定一致：
+ * This floor's structured on-disk reader for the plugin kind —— sessions.js's listSessions /
+ * sessionInfo dispatch here by client (see pluginStoreOf in sessions.js). The interface matches the
+ * "plugin on-disk read" convention:
  *   readTodos(storage, id) / readFileChanges(storage, id) / readRuntime(storage, id) / collectProjects(storage, candidates)
  */
 const pluginStore = { readTodos, readFileChanges, readRuntime, collectProjects };
 
-/* ------------------------------ 取消检测 ------------------------------ */
+/* ------------------------------ Cancel detection ------------------------------ */
 
 /**
- * CodeBuddy 插件 transcript 取消信号缓存：messages 目录 -> {m, size, cancels:[mtime...]}
- * 按目录 mtime+size 增量；sinceTs 过滤在调用处做，缓存只存"原始取消时刻列表"避免重复扫盘。
+ * CodeBuddy plugin transcript cancel-signal cache: messages dir -> {m, size, cancels:[mtime...]}
+ * Incremented by directory mtime+size; sinceTs filtering happens at the call site, the cache only holds
+ * the "raw list of cancel moments" to avoid rescanning the disk.
  */
 const _cbCancelCache = new Map();
 
 /**
- * 兜底定位某会话的 transcript 目录（含 index.json 与 messages/）。
- * 正常情况 transcript_path 已由 hook 落到 reporter 状态文件 j.transcriptPath（见 hookCommon.js），
- * 无需扫描；本函数只在"状态文件没有 transcriptPath"时用。落盘结构：
+ * Fallback location of a session's transcript directory (containing index.json and messages/).
+ * Normally transcript_path is already put into the reporter state file j.transcriptPath by the hook (see
+ * hookCommon.js), with no scanning needed; this function is only used when "the state file has no
+ * transcriptPath". On-disk structure:
  *   <dataRoot>/CodeBuddyExtension/Data/<uuid>/VSCode/<uuid>/history/<projectId>/<sessionId>/index.json
  */
 function codebuddyTranscriptDirOf(sessionId) {
@@ -278,26 +289,31 @@ function codebuddyTranscriptDirOf(sessionId) {
 }
 
 /**
- * CodeBuddy 插件取消检测：从 transcript 目录的 `messages/<id>.json` 里找
- * **role=assistant、content 含 text==='[User Cancelled]'** 的那条消息，取其文件 mtime 作为取消时刻。
+ * CodeBuddy plugin cancel detection: from the transcript directory's `messages/<id>.json`, find the
+ * message with **role=assistant and content text==='[User Cancelled]'**, and take that file's mtime as
+ * the cancel moment.
  *
- * 为什么读 transcript 而不是 message-queue：CodeBuddy 插件取消时**一个 hook 事件都不发**
- * （CLI 那条 FinalStop 在 IDE 形态等不到），而 message-queue 的 `runtime.pauseReason='cancel'`
- * 并不可靠——插件内部超时（agent 长时间无响应）也会写它，会把"还在跑"误判成"已取消"。
- * transcript 的 `[User Cancelled]` 只在用户真按停止时出现（实测 2026-10-12：今天 4 次终止精确命中 4 条，
- * 内部超时不产生），是唯一的可靠信号。
+ * Why read the transcript rather than message-queue: the CodeBuddy plugin emits **not a single hook
+ * event** when cancelling (that FinalStop of the CLI never comes in the IDE form), and message-queue's
+ * `runtime.pauseReason='cancel'` is unreliable —— an internal plugin timeout (the agent goes
+ * unresponsive for a long time) writes it too, which misjudges "still running" as "cancelled".
+ * The transcript's `[User Cancelled]` appears only when the user really presses stop (measured
+ * 2026-10-12: 4 terminations today hit exactly 4 entries, internal timeouts produce none), the only
+ * reliable signal.
  *
- * transcript_path（j.transcriptPath）指向 `.../history/<projectId>/<sessionId>/index.json`，
- * messages 在其同级 messages/ 目录。
+ * transcript_path (j.transcriptPath) points at `.../history/<projectId>/<sessionId>/index.json`,
+ * and messages sits in the sibling messages/ directory.
  *
  * @param {string} sessionId
- * @param {number} sinceTs 本轮任务开始时刻（0 = 不过滤）：只认这一轮落的取消，老一轮的不算
- * @param {string} [transcriptDir] 会话 transcript 目录；空则自动定位
- * @returns {number} 取消时刻（消息文件 mtime；0 = 没有 / 判不出）
+ * @param {number} sinceTs start moment of this round's task (0 = no filtering): only cancels from this
+ *   round count, ones from an earlier round do not
+ * @param {string} [transcriptDir] the session transcript directory; empty = locate it automatically
+ * @returns {number} cancel moment (the message file's mtime; 0 = none / cannot be determined)
  */
 /**
- * 读某 transcript 目录 messages/ 里**全部** `[User Cancelled]` 的取消时刻（消息文件 mtime）。
- * 按 messages 目录 mtime+size 增量缓存；不做 sinceTs 过滤 —— 过滤交给调用方按用途决定。
+ * Read **all** `[User Cancelled]` cancel moments in a transcript directory's messages/ (message file
+ * mtime). Cached incrementally by messages dir mtime+size; no sinceTs filtering —— filtering is left to
+ * the caller, which decides by use case.
  * @returns {number[]}
  */
 function codebuddyReadCancels(transcriptDir) {
@@ -309,8 +325,10 @@ function codebuddyReadCancels(transcriptDir) {
   } catch {
     return [];
   }
-  // 失效信号必须看"具体文件的 mtime/size"，不能只看目录 mtime：取消消息常是就地改写
-  // 最后一条 assistant 消息（不新建文件），目录 mtime 不变 → 旧缓存永远命中 → 漏检（早取消必现）。
+  // The invalidation signal has to look at "each file's mtime/size", not just the directory mtime: the
+  // cancel message is often an in-place rewrite of the last assistant message (no new file created), so
+  // the directory mtime does not change → the stale cache hits forever → misses (early cancels always
+  // reproduce this).
   let sig = '';
   for (const n of files) {
     try {
@@ -342,7 +360,7 @@ function codebuddyReadCancels(transcriptDir) {
       const txt = Array.isArray(inner && inner.content)
         ? inner.content.filter((p) => p && p.type === 'text').map((p) => p.text).join('')
         : '';
-      if (txt !== '[User Cancelled]') continue; // 精确匹配（带方括号、英文）；工具回显里的同名串因 role 过滤不算
+      if (txt !== '[User Cancelled]') continue; // exact match (with brackets, English); same-named strings in tool echoes do not count thanks to the role filter
       let at = 0;
       try {
         at = Math.round(fs.statSync(fp).mtimeMs);
@@ -352,7 +370,7 @@ function codebuddyReadCancels(transcriptDir) {
       cancels.push(at);
     }
   } catch {
-    /* 读不到就跳过 */
+    /* skip when unreadable */
   }
   cancels.sort((a, b) => a - b);
   _cbCancelCache.set(mdir, { sig, cancels });
@@ -360,8 +378,8 @@ function codebuddyReadCancels(transcriptDir) {
 }
 
 /**
- * CodeBuddy 插件取消检测（按 sinceTs 取"这一轮"的最新取消；0 = 不过滤）。
- * 供 phaseSuperseded / cancelAt 出口使用。
+ * CodeBuddy plugin cancel detection (takes the newest cancel of "this round" by sinceTs; 0 = no filtering).
+ * Used by the phaseSuperseded / cancelAt exports.
  */
 function codebuddyCancelAt(sessionId, sinceTs = 0, transcriptDir = '') {
   const sid = String(sessionId || '');
@@ -369,16 +387,17 @@ function codebuddyCancelAt(sessionId, sinceTs = 0, transcriptDir = '') {
   if (!dir) return 0;
   let best = 0;
   for (const at of codebuddyReadCancels(dir)) {
-    if (sinceTs && at < sinceTs) continue; // 老一轮的取消不能算到新一轮头上
+    if (sinceTs && at < sinceTs) continue; // an earlier round's cancel must not land on the new round
     if (at > best) best = at;
   }
   return best;
 }
 
 /**
- * 返回某会话 transcript 里**全部** `[User Cancelled]` 取消时刻（不过滤 sinceTs）。
- * 多任务会话（一个 CodeBuddy 会话里塞了多个任务）用：每个取消对应一个被终止的任务，
- * 由 synthMarks 逐个交给 flushSynthesizedCancels 按"取消时刻匹配在途任务"兜底标 cancelled。
+ * Returns **all** `[User Cancelled]` cancel moments in a session transcript (no sinceTs filtering).
+ * For multi-task sessions (one CodeBuddy session holding several tasks): every cancel corresponds to one
+ * terminated task, and synthMarks hands each to flushSynthesizedCancels, which marks it cancelled as a
+ * fallback by "matching in-flight tasks on the cancel moment".
  */
 function codebuddyCancelTimes(sessionId, transcriptDir = '') {
   const sid = String(sessionId || '');
@@ -388,10 +407,13 @@ function codebuddyCancelTimes(sessionId, transcriptDir = '') {
 }
 
 /**
- * 扫所有 CodeBuddy 会话 transcript，汇总"被用户取消"的会话 → `{ [sessionId]: 取消时刻 }`。
- * 与 codebuddyCancelAt 同口径，但**不做 sinceTs 过滤、按会话聚合全部取消**（像 Trae 的 allCancels）——
- * 取消时插件不重写状态文件、甚至把 taskId 清空，再拿 startedAt 去卡就认不出取消；渲染层用
- * phase.ts vs done.at 自行决断显示，这里只管"这一轮被取消了"，不需要 smart 过滤。
+ * Scan every CodeBuddy session transcript and collect the "cancelled by user" ones →
+ * `{ [sessionId]: cancel moment }`.
+ * Same criterion as codebuddyCancelAt, but **no sinceTs filtering, aggregating all cancels per session**
+ * (like Trae's allCancels) —— when cancelling, the plugin does not rewrite the state file and even clears
+ * taskId, so gating on startedAt again would fail to recognize the cancel; the render layer decides what
+ * to show itself from phase.ts vs done.at, and here it only matters that "this round was cancelled", no
+ * smart filtering needed.
  */
 function allCodebuddyCancels() {
   const merged = {};
@@ -425,19 +447,23 @@ const meta = {
   agent: 'codebuddy',
   plugin: false,
   pluginRe: RE_PLUGIN,
-  // 这一层的插件结构化落盘"长什么样"的标记：命中 pluginRe 的目录里得有其中任一，才算它的插件存储根
-  // （见 plugin.js 的 findPluginStorage）。放在 meta 里，通用定位器不写死任何产品目录名。
+  // Marker for "what this floor's plugin structured on-disk data looks like": a directory matching
+  // pluginRe counts as its plugin storage root only if it holds any one of these
+  // (see findPluginStorage in plugin.js). Kept in meta so the generic locator hardcodes no product
+  // directory names.
   pluginStorageMarks: ['genie-history', 'todos', 'file-changes', 'message-queue'],
-  // 合并楼层：三路都归这一层；同一会话被两路同时看到时按 session_id 去重（见 sessionRegistry）。
+  // Merged floor: all three paths belong to it; when the same session is seen by two paths at once it is
+  // deduped by session_id (see sessionRegistry).
   sources: ['cli', 'plugin', 'hook'],
   dataKind: 'codebuddy',
-  // 落盘探测（findDataPath 用）：按名字匹配什么、家目录里哪些候选
+  // On-disk detection (used by findDataPath): what to match by name, which candidates in the home directory
   matchRe: [/^codebuddy/i, /^code-?buddy/i, /^tencent/i, /^ingram/i],
   homeDirs: [path.join(HOME, '.codebuddy'), path.join(HOME, '.codebuddy-cli')],
-  // 这一层 CLI 自己的安装目录（PATH 查不到时兜底）；与具体产品无关的位置在 floors.js 的通用兜底里
+  // This floor's own CLI install directory (fallback when PATH lookup fails); product-independent
+  // locations are in the generic fallback in floors.js
   cliBinDirs: [path.join(HOME, '.codebuddy', 'bin')],
-  // CLI 会话文件落在 <dataRoot>/projects/<工程>/ 下，文件名即 session_id
-  // （老版本给的是 32 位十六进制无连字符，一并认）
+  // CLI session files land under <dataRoot>/projects/<project>/, named after session_id
+  // (old versions give 32 hex chars without hyphens, recognized as well)
   sessionSubtree: 'projects',
   sessionIdOfFile: (name) => {
     const stem = String(name).replace(/\.jsonl$/i, '');
@@ -449,14 +475,16 @@ const meta = {
 };
 
 /**
- * 这口"在跑"的 reporter 相位是否被本楼层的取消标记作废。
- * CodeBuddy 插件取消时一个 hook 事件都不发，相位冻在「思考中 / 调用工具」，只能靠
- * transcript 的 `[User Cancelled]` 那刻来戳破（见 codebuddyCancelAt）。
- * transcript_path 由 j.transcriptPath 给出（hook 落到状态文件），指向会话 transcript 目录。
- * 供 sessions.js 的 readReporterPhase 派发调用。
- * @param {object} j hook 状态文件
- * @param {object} sp 状态文件里的 sessionPhase
- * @param {number} slack 相位时间戳容差（ms）
+ * Whether this "running" reporter phase is voided by this floor's cancel marker.
+ * The CodeBuddy plugin emits not a single hook event when cancelling, so the phase freezes at
+ * "thinking / calling tool" and only the transcript's `[User Cancelled]` moment can puncture it (see
+ * codebuddyCancelAt).
+ * transcript_path comes from j.transcriptPath (the hook drops it into the state file) and points at the
+ * session transcript directory.
+ * Called by readReporterPhase's dispatch in sessions.js.
+ * @param {object} j hook state file
+ * @param {object} sp sessionPhase inside the state file
+ * @param {number} slack phase timestamp tolerance (ms)
  */
 function phaseSuperseded(j, sp, slack = 1_000) {
   const dir = j && j.transcriptPath ? path.dirname(j.transcriptPath) : '';
@@ -468,17 +496,18 @@ const { runHookEvent, sharedHookImpl, jsonlReplies, indexJsonReplies, turnInterr
   normOpenAI, tokenFinish, readTokens,
   headJsonLines } = require('./ingest/hookCommon');
 
-/* ============================== CodeBuddy 专属常量 ==============================
- * 跟着 codebuddyRequestTokens / codebuddyReadTokensOf 一起从 hookCommon 下沉到这里，
- * 只被本楼层消费，不再污染框架层。 */
+/* ============================== CodeBuddy-only constants ==============================
+ * Moved down here from hookCommon together with codebuddyRequestTokens / codebuddyReadTokensOf,
+ * consumed by this floor only, no longer polluting the framework layer. */
 
 const CB_REQ_GRACE_MS = 5_000;
 const CB_FLUSH_WAIT_MS = 1_200;
 const CB_FLUSH_STEP_MS = 120;
 
-/* ============================== CodeBuddy Plugin index.json token 解析 ==============================
- * 从 hookCommon 下沉过来——这是 CodeBuddy 专属的 index.json usage 格式（CodeBuddy Plugin 自定的
- * inputTokens/cacheTokens/cachedWriteTokens/outputTokens），框架层不该硬编码它。 */
+/* ============================== CodeBuddy Plugin index.json token parsing ==============================
+ * Moved down from hookCommon —— this is CodeBuddy's own index.json usage format (defined by the
+ * CodeBuddy Plugin: inputTokens/cacheTokens/cachedWriteTokens/outputTokens), which the framework layer
+ * should not hardcode. */
 
 function codebuddyRequestTokens(indexPath, startedAt) {
   let idx;
@@ -503,13 +532,15 @@ function codebuddyRequestTokens(indexPath, startedAt) {
   });
 }
 
-/* ============================== CodeBuddy transcript 路径推导 ==============================
+/* ============================== CodeBuddy transcript path derivation ==============================
  *
- * CodeBuddy 有三套独立落盘，hook 事件的 transcript_path 字段**经常缺失**（Plugin 形态
- * 几乎总不带，CLI trace 形态也有缺的情况）。框架层 tp() 默认只认事件 payload——
- * 所以让楼层 transcriptPathOf 覆盖来推导。
+ * CodeBuddy has three independent on-disk layouts, and the hook event's transcript_path field is
+ * **often missing** (the Plugin form almost never carries it, and the CLI trace form misses it too at
+ * times). The framework layer's tp() only recognizes the event payload by default ——
+ * hence the floor's transcriptPathOf override derives it.
  *
- * 优先级：事件 payload > 会话状态缓存 > 三处候选位置按 sessionId/mtime 搜索。
+ * Priority: event payload > session state cache > search the three candidate locations by
+ * sessionId/mtime.
  */
 
 /** ws-slug cache: compute a given workspace path's slug once */
@@ -529,8 +560,8 @@ function slugForWs(ws) {
   return slug;
 }
 
-/** 给定 sessionId + workspacePath，按优先级搜三处 CodeBuddy transcript 落盘。
- *  返回第一个存在的文件绝对路径；都没有返回空串。 */
+/** Given sessionId + workspacePath, search the three CodeBuddy transcript locations by priority.
+ *  Returns the absolute path of the first file that exists; empty string when none does. */
 function inferCodebuddyTranscript(sessionId, workspacePath) {
   const sid = String(sessionId || '').trim();
   if (!sid) return '';
@@ -543,16 +574,16 @@ function inferCodebuddyTranscript(sessionId, workspacePath) {
   }
 
   // 2. Plugin index.json —— ~/.local/share/CodeBuddyExtension/Data/**/history/<sessionId>/*/index.json
-  //    history 目录名 == sessionId（见 ~/.local/share/CodeBuddyExtension/Data/<uuid>/VSCode/<uuid>/history/）
+  //    the history directory name == sessionId (see ~/.local/share/CodeBuddyExtension/Data/<uuid>/VSCode/<uuid>/history/)
   const pluginRoot = path.join(HOME, '.local', 'share', 'CodeBuddyExtension');
   if (fs.existsSync(pluginRoot)) {
-    // 找 history/<sessionId> 这个目录，再取它下面任意一个子目录的 index.json
+    // find the history/<sessionId> directory, then take index.json from any of its subdirectories
     const dataDir = path.join(pluginRoot, 'Data');
     if (fs.existsSync(dataDir)) {
       for (const entry of fs.readdirSync(dataDir)) {
         const cand = path.join(dataDir, entry);
         if (!fs.statSync(cand).isDirectory()) continue;
-        // 递归找 history/<sessionId> 目录
+        // recursively look for the history/<sessionId> directory
         const hit = findPluginHistoryIndex(cand, sid);
         if (hit) return hit;
       }
@@ -560,8 +591,8 @@ function inferCodebuddyTranscript(sessionId, workspacePath) {
   }
 
   // 3. CLI trace jsonl (OTel) —— ~/.codebuddy/traces/*/trace_*.jsonl
-  //    trace 文件名里**不含 sessionId**，只能取 mtime 最近的那一个。
-  //    这位置最不可靠（可能匹配到别的 session），放最后。
+  //    the trace file name does **not** contain sessionId, so only the newest by mtime can be taken.
+  //    This location is the least reliable (it may match another session), so it goes last.
   const tracesDir = path.join(HOME, '.codebuddy', 'traces');
   if (fs.existsSync(tracesDir)) {
     let best = '';
@@ -584,21 +615,21 @@ function inferCodebuddyTranscript(sessionId, workspacePath) {
   return '';
 }
 
-/** 在 CodeBuddy Plugin Data 下递归搜 history/<sessionId>，找到就返回子目录的 index.json 路径 */
+/** Recursively search for history/<sessionId> under CodeBuddy Plugin Data; return the subdirectory's index.json path when found */
 function findPluginHistoryIndex(root, sessionId) {
-  // 先看直接 history 目录
+  // first look at the direct history directory
   const historyDir = path.join(root, 'history');
   if (fs.existsSync(historyDir)) {
     const sessionDir = path.join(historyDir, sessionId);
     if (fs.existsSync(sessionDir) && fs.statSync(sessionDir).isDirectory()) {
-      // 取 session 目录下的 index.json（session 目录可能有多轮，每轮一个子目录）
+      // take index.json under the session directory (it may hold several rounds, one subdirectory each)
       for (const sub of fs.readdirSync(sessionDir)) {
         const idx = path.join(sessionDir, sub, 'index.json');
         if (fs.existsSync(idx)) return idx;
       }
     }
   }
-  // 递归下一级（VSCode/<uuid> 层）
+  // recurse one level down (the VSCode/<uuid> layer)
   let found = '';
   try {
     for (const e of fs.readdirSync(root)) {
@@ -613,12 +644,12 @@ function findPluginHistoryIndex(root, sessionId) {
   return found;
 }
 
-/* ============================== CodeBuddy trace jsonl (OTel) token 解析 ==============================
+/* ============================== CodeBuddy trace jsonl (OTel) token parsing ==============================
  *
- * CLI 新形态 trace jsonl 不是普通的 JSONL message 流，是 OpenTelemetry span 格式：
+ * The CLI's new trace jsonl is not an ordinary JSONL message stream, it is OpenTelemetry span format:
  *   {"type":"span_end","span":{"type":"generation","startedAt":"ISO","toolOutput":"[{\"usage\":{...}}]"}}
- * usage 在 toolOutput 字符串里，被 JSON 再包一层数组；usage 格式与 OpenAI 一致（prompt_tokens /
- * completion_tokens / prompt_tokens_details.cached_tokens）。
+ * usage sits inside the toolOutput string, wrapped in one more layer of JSON array; the usage format
+ * matches OpenAI (prompt_tokens / completion_tokens / prompt_tokens_details.cached_tokens).
  */
 function codebuddyTraceTokens(tracePath, startedAt) {
   const file = String(tracePath || '');
@@ -653,23 +684,23 @@ function codebuddyTraceTokens(tracePath, startedAt) {
   return tokenFinish(acc);
 }
 
-/* ============================== CodeBuddy 三路 token 读取 ==============================
+/* ============================== CodeBuddy's three-way token reading ==============================
  *
- * 框架层 readTokensOf 默认实现只认"标准 JSONL 格式"（Codex rollout / Claude transcript）。
- * CodeBuddy 有三种格式，按文件后缀分支：
- *   · index.json → codebuddyRequestTokens（Plugin 落盘）
- *   · trace_*.jsonl → codebuddyTraceTokens（CLI OTel trace 形态）
- *   · 其余 jsonl → readTokens（projects 目录下老形态，走 requestSum 解析）
+ * The framework layer's default readTokensOf implementation only recognizes "standard JSONL format"
+ * (Codex rollout / Claude transcript). CodeBuddy has three formats, branched by file suffix:
+ *   · index.json → codebuddyRequestTokens (plugin on-disk)
+ *   · trace_*.jsonl → codebuddyTraceTokens (CLI OTel trace form)
+ *   · everything else jsonl → readTokens (old form under projects, parsed with requestSum)
  *
- * 另外 CodeBuddy Plugin 的 index.json **比 Stop hook 事件晚 ~30-50ms 才落盘**，
- * 所以这里带一个"等落盘"的重试环（原 hookCommon.readTokensSettled 的职责）。
+ * Also, the CodeBuddy Plugin's index.json **lands on disk ~30-50ms later than the Stop hook event**,
+ * so there is a "wait for it to land" retry loop here (the old job of hookCommon.readTokensSettled).
  */
 async function codebuddyReadTokensOf(transcriptPath, startedAt) {
   const file = String(transcriptPath || '');
   if (!file || !(Number(startedAt) > 0)) return null;
   const t = codebuddyTryRead(file, startedAt);
   if (t) return t;
-  // 只有 index.json 需要等落盘；其余 jsonl 格式 Stop 时刻之前已经写完了
+  // Only index.json needs waiting; the other jsonl formats are already written before the Stop moment
   if (!/index\.json$/i.test(file)) return null;
   for (let waited = 0; waited < CB_FLUSH_WAIT_MS; waited += CB_FLUSH_STEP_MS) {
     await new Promise((r) => setTimeout(r, CB_FLUSH_STEP_MS));
@@ -679,37 +710,39 @@ async function codebuddyReadTokensOf(transcriptPath, startedAt) {
   return null;
 }
 
-/** 同步版的三路分发（codebuddyReadTokensOf 内部也调它做首次尝试 + 重试） */
+/** Synchronous version of the three-way dispatch (codebuddyReadTokensOf also calls it for the first attempt + retries) */
 function codebuddyTryRead(file, startedAt) {
   if (/index\.json$/i.test(file)) return tokenFinish(codebuddyRequestTokens(file, Number(startedAt)));
   if (/trace_.*\.jsonl$/i.test(file)) return codebuddyTraceTokens(file, Number(startedAt));
   return readTokens(file, Number(startedAt));
 }
 
-/* ============================== CodeBuddy sessionId 推断 ==============================
+/* ============================== CodeBuddy sessionId inference ==============================
  *
- * CodeBuddy CLI / Plugin 的 hook 事件里没有 session_id 字段（events.log 实锤全是 None）。
- * 需要服务端自己从 transcript 文件推 —— transcript 文件名/目录名就是 sessionId。
+ * CodeBuddy CLI / Plugin hook events carry no session_id field (events.log confirms: all None).
+ * The server has to derive it from the transcript file itself —— the transcript file / directory name is
+ * the sessionId.
  *
- * 反向推导（没有 sessionId 时）：
- *   1. CLI projects 目录（最可靠）：~/.codebuddy/projects/<ws-slug>/<sid>.jsonl
- *      取 mtime 最新的 .jsonl => basename
- *   2. Plugin history 目录:
+ * Reverse derivation (when there is no sessionId):
+ *   1. CLI projects directory (most reliable): ~/.codebuddy/projects/<ws-slug>/<sid>.jsonl
+ *      take the newest .jsonl by mtime => basename
+ *   2. Plugin history directory:
  *      ~/.local/share/CodeBuddyExtension/Data/<uuid>/<ver>/history/<sid>/
- *      取 mtime 最新的 history/<sid> 目录 => sid
+ *      take the newest history/<sid> directory by mtime => sid
  *
- * 并发安全：用模块级 Map 缓存 workspacePath -> 最近 sessionId。
- * SessionStart 事件更新缓存，后续事件直接复用，避免并发误匹配。
+ * Concurrency safety: a module-level Map caches workspacePath -> most recent sessionId.
+ * The SessionStart event updates the cache and later events reuse it directly, avoiding concurrent
+ * mismatches.
  */
 
-/** 活跃会话缓存：workspacePath → sessionId（最近一次 SessionStart 推出来的） */
+/** Active session cache: workspacePath → sessionId (derived by the most recent SessionStart) */
 const _activeSessionCache = new Map();
 
-/** 从 workspacePath 推 CodeBuddy 当前活跃会话的 sessionId */
+/** Derive CodeBuddy's currently active sessionId from workspacePath */
 function inferCodebuddySessionId(workspacePath) {
   const ws = String(workspacePath || '').trim();
 
-  // 0. 缓存命中（同 workspace 下 SessionStart 已推过）
+  // 0. Cache hit (SessionStart already derived it for this workspace)
   if (ws && _activeSessionCache.has(ws)) {
     const cached = _activeSessionCache.get(ws);
     if (cached) return cached;
@@ -717,7 +750,7 @@ function inferCodebuddySessionId(workspacePath) {
 
   const wsSlug = slugForWs(ws);
 
-  // 1. CLI projects —— 最可靠：文件名就是 sessionId
+  // 1. CLI projects —— most reliable: the file name is the sessionId
   if (wsSlug) {
     const dir = path.join(HOME, '.codebuddy', 'projects', wsSlug);
     if (fs.existsSync(dir)) {
@@ -741,7 +774,7 @@ function inferCodebuddySessionId(workspacePath) {
     }
   }
 
-  // 2. Plugin history —— 目录名就是 sessionId
+  // 2. Plugin history —— the directory name is the sessionId
   const pluginRoot = path.join(HOME, '.local', 'share', 'CodeBuddyExtension', 'Data');
   if (fs.existsSync(pluginRoot)) {
     let best = '';
@@ -749,7 +782,7 @@ function inferCodebuddySessionId(workspacePath) {
     for (const entry of fs.readdirSync(pluginRoot)) {
       const cand = path.join(pluginRoot, entry);
       try { if (!fs.statSync(cand).isDirectory()) continue; } catch { continue; }
-      // 找 history/<uuid>/ 目录
+      // look for the history/<uuid>/ directory
       for (const sub of fs.readdirSync(cand)) {
         const historyDir = path.join(cand, sub, 'history');
         if (!fs.existsSync(historyDir)) continue;
@@ -762,7 +795,7 @@ function inferCodebuddySessionId(workspacePath) {
               if (!st.isDirectory()) continue;
               if (st.mtimeMs > bestMtime) {
                 bestMtime = st.mtimeMs;
-                best = histEntry; // 目录名 = sessionId
+                best = histEntry; // directory name = sessionId
               }
             } catch { /* ignore */ }
           }
@@ -778,31 +811,34 @@ function inferCodebuddySessionId(workspacePath) {
   return '';
 }
 
-/** CodeBuddy CLI 的 transcriptPathOf 覆盖：事件 payload > 状态缓存 > 三处候选位置推导 */
+/** CodeBuddy CLI's transcriptPathOf override: event payload > state cache > derive from the three candidate locations */
 function codebuddyTranscriptPathOf(ev, st, sessionId, workspacePath) {
   if (ev && ev.transcript_path) return String(ev.transcript_path);
   if (st && st.transcriptPath) return String(st.transcriptPath);
   return inferCodebuddyTranscript(sessionId, workspacePath);
 }
 
-/** CodeBuddy 的落盘差异：事件开关与文件/token/ghost 等公共逻辑全在 hookCommon.runHookEvent。
- * 只覆盖与公有默认不同的接口；其余回退 sharedHookImpl。 */
+/** CodeBuddy's on-disk differences: event gating and the common file/token/ghost logic all live in hookCommon.runHookEvent.
+ *  Only interfaces differing from the shared default are overridden; the rest falls back to sharedHookImpl. */
 const codebuddyImpl = {
   ...sharedHookImpl,
-  // hasSubagentStart 必须回退 sharedHookImpl 的 false：CodeBuddy 发 0 次 SubagentStart（events.log 实锤），
-  // 只有 SubagentStop。PreToolUse 等 pendingSpawn 认领永远等不到 → addGhost 永远被跳过。
-  // 走 !hasSubagentStart 分支：PreToolUse(Task/Agent) 直接 addGhost，PostToolUse / SubagentStop 各自 finishGhostServer。
-  // 重构 commit 9d0a11c 本来就是 false，后来 07dec75 误改成 true（注释编造了"插件发 SubagentStart"）——这是回归。
-  awaitingPermission: () => true, // 非 idle 的 Notification 一律视为"等授权"
+  // hasSubagentStart must fall back to sharedHookImpl's false: CodeBuddy emits 0 SubagentStart events
+  // (events.log confirms), only SubagentStop. Things like PreToolUse pendingSpawn claims would wait
+  // forever → addGhost would always be skipped.
+  // Take the !hasSubagentStart branch: PreToolUse(Task/Agent) addGhost directly, PostToolUse /
+  // SubagentStop each finishGhostServer.
+  // Refactor commit 9d0a11c was false, and 07dec75 later changed it to true by mistake (its comment
+  // fabricated "the plugin emits SubagentStart") —— that was a regression.
+  awaitingPermission: () => true, // any non-idle Notification counts as "awaiting permission"
   repliesOf: (tp) => (/index\.json$/i.test(tp) ? indexJsonReplies(tp) : jsonlReplies(tp)),
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
-  // 新增接口覆盖：transcript 路径推导 + 三路 token 解析
+  // New interface overrides: transcript path derivation + three-way token parsing
   transcriptPathOf: codebuddyTranscriptPathOf,
   readTokensOf: codebuddyReadTokensOf,
 };
 
 async function handleHookEvent(ev, ctx) {
-  // CodeBuddy CLI/Plugin hook 事件里没有 session_id —— 从 transcript 文件推
+  // CodeBuddy CLI/Plugin hook events carry no session_id —— derive it from the transcript file
   if (!String((ev && ev.session_id) || '').trim()) {
     const ws = String((ctx && ctx.workspacePath) || (ev && ev.cwd) || '').trim();
     const sid = inferCodebuddySessionId(ws);
@@ -814,23 +850,24 @@ async function handleHookEvent(ev, ctx) {
 module.exports = {
   id: '1F',
   meta,
-  // 供 findPluginDir / findPluginStorageDir 默认正则复用
+  // For findPluginDir / findPluginStorageDir default regex reuse
   RE_PLUGIN,
-  // plugin kind 的结构化落盘读取：sessions.js 按 client 派发到这里（见 pluginStore）
+  // plugin kind structured on-disk reads: sessions.js dispatches here by client (see pluginStore)
   pluginStore,
   // genie-history dir-name decoding / truncated-path completion (used by self-checks and collectProjects)
   decodeDirName,
   completeTruncatedWorkspace,
   truncatedWorkspaceMatches,
-  // plugin kind 的会话列表策略：sessionRegistry.handlePlugin 按接口通用派发（见 pluginPolicy）
+  // plugin kind session list policy: dispatched generically by sessionRegistry.handlePlugin (see pluginPolicy)
   pluginPolicy,
-  // 取消检测（统一模块组接口：cancelAt / allCancels，与 trae 同签名）
+  // Cancel detection (unified module-group interface: cancelAt / allCancels, same signature as trae)
   cancelAt: codebuddyCancelAt,
   phaseSuperseded,
   allCancels: allCodebuddyCancels,
-  // 完成/取消标记合成：交给 readReporterDones 统一派发（sessions.js 公共代码不掺 CodeBuddy 专属逻辑）
+  // Done / cancel marker synthesis: dispatched uniformly by readReporterDones (sessions.js's common code
+  // keeps no CodeBuddy-specific logic)
   synthMarks,
-  // 服务端 hook 事件处理（落盘解析归服务端）
+  // Server-side hook event handling (disk parsing belongs to the server)
   handleHookEvent,
   // Static subagent dirs (project / user level): read by this floor's own syncAgents
   agentDirs,
@@ -839,14 +876,17 @@ module.exports = {
 };
 
 /**
- * 1F 插件（VS Code 扩展）的**会话列表策略** —— 由 sessionRegistry.handlePlugin 通用派发。
- * 框架不认识任何 CodeBuddy 细节，只认这个接口（见 floors.js 的 FLOOR_CONTRACT）。
+ * 1F plugin (VS Code extension) **session list policy** —— dispatched generically by
+ * sessionRegistry.handlePlugin.
+ * The framework knows no CodeBuddy details, only this interface (see FLOOR_CONTRACT in floors.js).
  *
- * 为什么需要：插件形态的会话"在册 / 已退"由 reporter 状态文件里的 SessionStart / SessionEnd
- * 记（上报 client 记成 `codebuddy`、form 记成 `vscode` —— CLI 客户端不带 form）。需求是
- * 1F 下拉**只列当前会话**、按 SessionStart / SessionEnd 动态加减，不把历史会话全塞进去。
+ * Why it is needed: for the plugin form, whether a session is "enrolled / retired" is recorded by
+ * SessionStart / SessionEnd in the reporter state file (reported client as `codebuddy`, form as
+ * `vscode` —— the CLI client carries no form). The requirement is that the 1F dropdown **lists only the
+ * current session**, adding / removing dynamically by SessionStart / SessionEnd, rather than stuffing
+ * every historical session in.
  *
- * @param {object} ctx refresh 的共享工具包（用到 listReporterSessions）
+ * @param {object} ctx refresh's shared toolkit (uses listReporterSessions)
  * @returns {{currentOnly?:boolean, active?:object[], ended?:object[], exclude?:(row:object)=>boolean}}
  */
 function pluginPolicy(ctx) {
@@ -854,36 +894,43 @@ function pluginPolicy(ctx) {
   if (typeof listReporterSessions !== 'function') return {};
   const life = listReporterSessions('codebuddy', { includeEnded: true }).filter((s) => s.form === 'vscode');
   return {
-    // 只列 current.json 指的那条 + 活跃会话，不把历史会话塞进下拉
+    // List only the one current.json points at + active sessions, do not stuff historical sessions into the dropdown
     currentOnly: true,
-    // SessionStart 落过、还没 SessionEnd 的：必须列出来（哪怕它还不是 current.json 指的那条）
+    // Ones SessionStart has landed for and that have no SessionEnd yet: they must be listed (even if it
+    // is not the one current.json points at)
     active: life.filter((s) => s.currentProcess && !s.endedAt),
-    // 已 SessionEnd 的：从列表移除
+    // Ones already SessionEnd'd: removed from the list
     ended: life.filter((s) => s.endedAt),
-    // runtime 已取消的：仍不该进下拉（取消 = 没干完，也不该占着一条会话）
+    // Ones whose runtime already cancelled: still should not enter the dropdown (cancelled = did not
+    // finish, so it should not hold a session slot either)
     exclude: (row) =>
       Boolean(row && row.runtime && row.runtime.paused && String(row.runtime.pauseReason || '').toLowerCase() === 'cancel'),
   };
 }
 
 /**
- * 楼层特有的"取消"标记合成，由 sessions.js 的 readReporterDones 统一派发。
+ * Floor-specific "cancel" marker synthesis, dispatched uniformly by readReporterDones in sessions.js.
  *
- * CodeBuddy **插件**（IDE 扩展）取消时**一个 hook 事件都不发**（CLI 那条 FinalStop 在 IDE 形态等不到），
- * 唯一权威信号在 transcript 的 `messages/<id>.json` 里那条 role=assistant、text==='[User Cancelled]'
- * 的消息（见 codebuddyCancelTimes）。会话的 transcript_path 已由 hook 落到状态文件 j.transcriptPath，
- * 直接按会话读它即可，不必整盘扫 message-queue。
+ * The CodeBuddy **plugin** (IDE extension) emits **not a single hook event** when cancelling (that
+ * FinalStop of the CLI never comes in the IDE form); the only authoritative signal is that
+ * role=assistant, text==='[User Cancelled]' message in the transcript's `messages/<id>.json` (see
+ * codebuddyCancelTimes). The session's transcript_path is already put into the state file j.transcriptPath
+ * by the hook, so it can be read per session directly, with no need to scan the whole message-queue disk.
  *
- * 多任务会话的处理（一个 CodeBuddy 会话里塞了多个任务 / 对话）：
- *   · 一个会话可能有**多条** `[User Cancelled]`（每次终止一条），每条对应一个被终止的任务。
- *   · 状态文件只留"当前任务"的 taskId / taskStartedAt；取消后开新任务会把这两个字段整份覆盖，
- *     所以绝不能把取消绑在 j.taskId 上、也不能用当前 taskStartedAt 去卡（否则上一轮取消永远认不出，
- *     被取消的任务一直挂 running）。
- *   · 因此：每条取消都合成一枚取消标记，taskId 留空 → 交给 sessionRegistry.flushSynthesizedCancels
- *     的"按会话 + 取消时刻匹配在途任务"兜底（listStaleRunningBySession 找 startedAt<=at 的最近在途任务；
- *     新一轮 startedAt>at 不会被误取），精确标到被终止的那一轮。
- *   · 主控制台那枚红灯（bySession）只认"最近一次取消就是当前这一轮"（at >= taskStartedAt），
- *     否则会把上一轮的取消误标到当前正在跑的任务头上。
+ * Handling multi-task sessions (one CodeBuddy session holding several tasks / conversations):
+ *   · A session may have **several** `[User Cancelled]` entries (one per termination), each corresponding
+ *     to one terminated task.
+ *   · The state file keeps only the "current task"'s taskId / taskStartedAt; starting a new task after a
+ *     cancel overwrites both fields wholesale, so a cancel must never be bound to j.taskId, nor gated by
+ *     the current taskStartedAt (otherwise the previous round's cancel is never recognized and the
+ *     cancelled task hangs on running forever).
+ *   · Hence: every cancel synthesizes one cancel marker with an empty taskId → handed to
+ *     sessionRegistry.flushSynthesizedCancels, whose "match in-flight tasks by session + cancel moment"
+ *     fallback covers it (listStaleRunningBySession finds the nearest in-flight task with startedAt<=at;
+ *     a new round with startedAt>at is never taken by mistake), landing precisely on the terminated round.
+ *   · The main console's red light (bySession) only recognizes "the latest cancel is this round"
+ *     (at >= taskStartedAt), otherwise a previous round's cancel would be misattributed to the currently
+ *     running task.
  *
  * @param {object} ctx { workspacePath, client, hookBySid, clientHit, synthCancel, bySession }
  */
@@ -891,29 +938,34 @@ function synthMarks(ctx) {
   const { workspacePath, hookBySid, synthCancel } = ctx || {};
   if (!hookBySid) return;
   for (const [sid, entry] of hookBySid) {
-    const j = entry && entry.j; // hookBySid 的值是 { j } 包装，不是直接的 j
+    const j = entry && entry.j; // hookBySid values are { j } wrappers, not the j itself
     if (!j) continue;
     if (!/^codebuddy/i.test(String(j.client || ''))) continue;
     const dir = j.transcriptPath ? path.dirname(j.transcriptPath) : '';
-    const times = codebuddyCancelTimes(sid, dir); // 该会话全部 [User Cancelled] 时刻（不过滤）
+    const times = codebuddyCancelTimes(sid, dir); // every [User Cancelled] moment of this session (unfiltered)
     if (!times.length) continue;
     const taskStarted = Number(j.taskStartedAt) || 0;
     const latest = times.reduce((a, b) => Math.max(a, b), 0);
-    // 这一轮是否已经**正常收尾**：Stop 落盘的 done 比取消更新 → 这次取消属于更早的轮次，
-    // 不该亮主控制台红灯、也不该绑当前 taskId。必须比对 done —— 插件会话列表按 src.client
-    // ('codebuddy-plugin') 读完成标记，而插件上报身份是 codebuddy(+form=vscode)，这一路**读不到**
-    // done；不看 done 的话，一个"先取消过、后正常收尾"的会话会一直显示「任务取消」（实测 2026-10-13）。
+    // Whether this round already **wrapped up normally**: if the Stop-landed done is newer than the
+    // cancel, this cancel belongs to an earlier round and should neither light the main console red nor
+    // bind the current taskId. done must be compared —— the plugin session list reads the done marker by
+    // src.client ('codebuddy-plugin'), while the plugin's reporting identity is codebuddy(+form=vscode),
+    // so this path **cannot read** done; without looking at done, a session that "was cancelled first and
+    // then wrapped up normally" would keep showing "task cancelled" (measured 2026-10-13).
     const doneAt = Number(j.done && j.done.at) || 0;
     for (const at of times) {
       if (taskStarted && at < taskStarted) {
-        // 历史任务的取消：taskId 留空，交给会话兜底匹配（不误伤当前在跑任务，也不亮当前红灯）
+        // An earlier task's cancel: taskId stays empty, handed to the session fallback match (neither
+        // misfires on the currently running task nor lights the current red light)
         synthCancel({ id: sid, j, ws: workspacePath || '', at, consoleMark: false, taskId: '' });
       }
     }
-    // 当前这一轮（或没有本轮起点）：正常合成（带 taskId + 亮主控制台红灯）
+    // This round (or no start moment for this round): synthesize normally (with taskId + light the main
+    // console red)
     if (!taskStarted || latest >= taskStarted) {
       if (doneAt && latest <= doneAt) {
-        // 已经有更新的正常收尾 → 只登记进台账（兜底收掉更早那轮），不亮红灯、不绑当前 taskId
+        // There is already a newer normal wrap-up → only register it into the ledger (retiring that
+        // earlier round as a fallback), no red light, no binding of the current taskId
         synthCancel({ id: sid, j, ws: workspacePath || '', at: latest, consoleMark: false, taskId: '' });
       } else {
         synthCancel({ id: sid, j, ws: workspacePath || '', at: latest });

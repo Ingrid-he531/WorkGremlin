@@ -1,31 +1,36 @@
 'use strict';
 
 /**
- * 服务端 hook 事件分发器。
+ * Server-side hook event dispatcher.
  *
- * 架构背景（见重构说明）：CLI 的 hook 退化成「只读 stdin 事件 → POST /api/v1/hook」，
- * 所有落盘解析 / 会话状态 / 台账写入都在**服务端**完成 —— 服务端是本地进程，
- * 跟 CLI 同机同文件系统，本来就读 agent 的落盘（Kilo/Copilot 那几家一直这么干）。
+ * Architecture background (see the refactor notes): the CLI hook is reduced to "read the stdin
+ * event -> POST /api/v1/hook"; all on-disk parsing / session state / ledger writes happen on
+ * the **server side** — the server is a local process sharing the same machine and file system
+ * as the CLI, and it already reads the agent's on-disk data anyway (that is how the
+ * Kilo/Copilot crowd has always worked).
  *
- * 本模块只做三件事：
- *   ① 从事件里解析出客户端（楼层）；
- *   ② 找到对应楼层的 `handleHookEvent` 派发过去；
- *   ③ 持有「会话状态」—— 替代 hook 曾经那份 state 文件（taskId / taskStartedAt / taskTitle …），
- *      按 sessionId 索引；拿不到时由楼层自己向 bus 回捞（currentTaskFor）。
+ * This module does only three things:
+ *   ① Work out the client (floor) from the event;
+ *   ② Find that floor's `handleHookEvent` and dispatch to it;
+ *   ③ Own the "session state" — replacing what used to be the hook's state file
+ *      (taskId / taskStartedAt / taskTitle …), indexed by sessionId; when it cannot be found,
+ *      the floor fishes it back out of the bus itself (currentTaskFor).
  *
- * 没有 `handleHookEvent` 的楼层（Kilo / Copilot / OpenCode / Trae 这类靠轮询的）直接忽略事件，
- * 它们的台账由各自的同步器兜着，不走这条 hook 路线。
+ * Floors without a `handleHookEvent` (Kilo / Copilot / OpenCode / Trae and other poll-driven
+ * ones) simply ignore events; their ledgers are covered by their own synchronizers and do not
+ * go through this hook path.
  *
- * 楼层 `handleHookEvent` 契约：
+ * Floor `handleHookEvent` contract:
  *   async (ev, ctx) => any
  *   ctx = { project, workspacePath, client, bus, repo, sessionGet(id), sessionSet(id, patch) }
- *   返回任意对象都会原样回给 hook（{ ok:true, ... } 包装）；返回 {ok:false,...} 走 400。
+ *   Any returned object is handed back to the hook as-is (wrapped as { ok:true, ... });
+ *   returning {ok:false,...} results in a 400.
  */
 
 const { floorByAgent } = require('../floors');
 
 function createHookDispatch() {
-  // 会话状态：替代 hook 的 state 文件。sessionId -> 本轮任务上下文。
+  // Session state: replaces the hook's state file. sessionId -> context of the current round.
   const sessions = new Map();
 
   const sessionGet = (id) => (id ? sessions.get(id) || null : null);
@@ -35,8 +40,8 @@ function createHookDispatch() {
   };
 
   /**
-   * 派发一次 hook 事件。
-   * @param {object} ev 原始 hook 事件（含 hook_event_name / session_id / cwd / transcript_path / client / agent …）
+   * Dispatch one hook event.
+   * @param {object} ev raw hook event (hook_event_name / session_id / cwd / transcript_path / client / agent …)
    * @param {{project: string, workspacePath: string, bus: any, repo: any}} ctx
    */
   async function dispatch(ev, ctx) {

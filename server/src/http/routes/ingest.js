@@ -1,8 +1,8 @@
 'use strict';
 
 /**
- * Agent 上报接口（B 路线，唯一真值来源）。
- * 全部为 POST + JSON，幂等（消息按 dedupe_key 去重）。
+ * Agent reporting API (route B, the single source of truth).
+ * Everything is POST + JSON, idempotent (messages are deduped by dedupe_key).
  */
 
 const express = require('express');
@@ -19,7 +19,8 @@ function createIngestRouter({ bus, repo }) {
   const router = express.Router();
   router.use(express.json({ limit: '2mb' }));
 
-  // 服务端 hook 事件分发：CLI hook 退化成事件转发器后，落盘解析 / 会话状态 / 台账写入都在这里。
+  // Server-side hook event dispatch: once the CLI hook was reduced to an event forwarder, on-disk
+  // parsing / session state / ledger writes all live here.
   const hookDispatch = createHookDispatch();
 
   const wrap = (fn) => (req, res) => {
@@ -37,10 +38,11 @@ function createIngestRouter({ bus, repo }) {
 
   const projectFirst = (fn) =>
     wrap((body) => {
-      /* 归属以**上报方真实所在目录**为准（见 bus.projectForReport 的说明）：
-         "办公室开着 A、我在 B 里跑 CLI"时，body.project 是 A（办公室当前工程），
-         body.workspacePath 才是 B —— 以前就拿 A 当归宿，任务被记到别的工程名下。
-         没带 workspacePath 的老上报退回 body.project，行为不变。 */
+      /* Ownership follows **the directory the reporter is actually in** (see the notes on
+         bus.projectForReport): with "the office showing A while I run the CLI inside B",
+         body.project is A (the office's current project) and body.workspacePath is the real B ——
+         taking A as the destination used to record the task under another project.
+         Old reports that carry no workspacePath fall back to body.project, behavior unchanged. */
       const project = bus.projectForReport(body.project || body.projectId || '', body.workspacePath || '');
       if (!project) return { ok: false, error: 'missing project' };
       bus.ensureProject(project, body.workspacePath || '', body.mainConversationId || null, 'report');
@@ -72,9 +74,11 @@ function createIngestRouter({ bus, repo }) {
     projectFirst((b) => (b.memberId && b.taskId ? bus.endTask(b) : { ok: false, error: 'missing memberId/taskId' }))
   );
 
-  /* 收工后补报 token：有些楼层的 usage 落盘比 Stop 晚（CodeBuddy 插件形态实测），
-     收工那一刻读不到真值 —— 等它落盘了用这条补一刀，只写 token 四列（见 bus.backfillTaskTokens）。
-     定位不到该补哪一行时服务端原样返回 ok（不写），所以这条可以放心重试。 */
+  /* Backfilling tokens after wrap-up: some floors persist usage later than Stop (measured on the
+     CodeBuddy plugin form), so the truth cannot be read at the moment of wrap-up —— once it lands
+     on disk, use this endpoint to patch it in, touching only the four token columns (see
+     bus.backfillTaskTokens). When the row to patch cannot be located, the server returns ok as-is
+     (writes nothing), so this endpoint can be retried safely. */
   router.post(
     '/task/tokens',
     projectFirst((b) =>
@@ -82,7 +86,8 @@ function createIngestRouter({ bus, repo }) {
     )
   );
 
-  // 收工兜底（bug 3）：状态文件被并发覆盖丢了 taskId 时，hook 用这条回捞当前任务再收工。
+  // Wrap-up fallback (bug 3): when the taskId was lost to a concurrent overwrite of the state file,
+  // the hook uses this to fish the current task back out and wrap it up.
   router.post(
     '/task/current',
     projectFirst((b) => (b.memberId ? bus.currentTaskFor(b.project, b.memberId, b.sessionId || '') : { ok: false, error: 'missing memberId' }))
@@ -92,7 +97,8 @@ function createIngestRouter({ bus, repo }) {
 
   router.post('/file/touch', projectFirst((b) => (b.memberId ? bus.fileTouch(b) : { ok: false, error: 'missing memberId' })));
 
-  // 工具使用：一轮任务里某个工具又用了一次（任务详情的「工具使用」按 (taskId, tool) 累加）
+  // Tool usage: a tool was used once more within a round (the "tool usage" panel in task details
+  // accumulates by (taskId, tool))
   router.post('/tool/use', projectFirst((b) => (b.memberId ? bus.toolUse(b) : { ok: false, error: 'missing memberId' })));
 
   /* subagent ghost (ephemeral member) writes: funnelled into server-side hookCommon (the same
@@ -120,14 +126,16 @@ function createIngestRouter({ bus, repo }) {
     return { ok: false, error: 'unknown_action' };
   }));
 
-  /* CLI hook 转发来的原始事件：不再拆成语义路由，直接丢给服务端分发器，
-     由对应楼层的 handleHookEvent 读落盘、写台账。project 以 workspacePath（cwd）归真，
-     没带工程时回落到「办公室当前打开的工程」。 */
+  /* Raw events forwarded by the CLI hook: no longer split into semantic routes, they are handed
+     straight to the server-side dispatcher, and that floor's handleHookEvent reads the disk and
+     writes the ledger. Ownership is settled by workspacePath (cwd); with no project attached it
+     falls back to "the project currently open in the office". */
   router.post('/hook', async (req, res) => {
     try {
       const body = req.body || {};
       const ws = body.workspacePath || '';
-      // 诊断：每次收到 hook 事件都打一行（info 级，默认落盘），看清楚"服务端到底收没收到、字段长啥样"
+      // Diagnostics: log one line per hook event received (info level, persisted by default) so it
+      // is plain to see "did the server actually get it, and what do the fields look like"
       log.info('[ghost-debug] /hook recv', JSON.stringify({ event: body.hook_event_name, agent: body.agent, client: body.client, tool: body.tool_name || body.tool, ws, session: body.session_id || '' }));
       const project = bus.projectForReport(body.project || '', ws);
       if (!project) {

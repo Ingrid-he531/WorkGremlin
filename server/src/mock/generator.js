@@ -1,26 +1,30 @@
 'use strict';
 
 /**
- * 演示数据生成器：给「演示工程」灌一套可看的假数据（成员 / 任务 / 消息）。
+ * Demo data generator: fills the "demo project" with a viewable set of fake data
+ * (members / tasks / messages).
  *
- * 触发时机：**不再有启动开关**（原 `--demo` / `WORKGREMLIN_DEMO=1` / `MOCK=1` 已移除）。
- * 它只由「切到演示工程」这一个动作触发 —— 界面 HUD 上的「演示模式」按钮 →
- * POST /api/v1/workspace（空路径）→ openDemo → index.js 的 syncDemo 按需播种 + 起推进器。
+ * Trigger: there is **no startup switch anymore** (the old `--demo` / `WORKGREMLIN_DEMO=1` /
+ * `MOCK=1` are gone). It is triggered only by the single action "switch to the demo project" ——
+ * the "demo mode" button in the HUD → POST /api/v1/workspace (empty path) → openDemo → syncDemo in
+ * index.js seeds on demand and starts the ticker.
  *
- * 硬性要求（tester DEMO-01~07）：
- *   - **确定性**：相同 seed 必须产出完全一致的数据（含时间戳），否则 DOM 快照会 flaky；
- *   - 覆盖 5 种主状态，且至少 1 个 degraded、1 个 blocked、1 条 error 级消息；
- *   - 消息数 >= 200。
+ * Hard requirements (tester DEMO-01~07):
+ *   - **Deterministic**: the same seed must produce exactly identical data (timestamps included),
+ *     otherwise DOM snapshots go flaky;
+ *   - cover 5 main states, with at least 1 degraded, 1 blocked, and 1 error-level message;
+ *   - message count >= 200.
  *
- * 时间基准：默认**锚定当前时间**（各事件相对偏移固定），否则「已耗时」会显示成 —、
- * 心跳超时也不会触发 degraded。需要绝对时间可复现（DOM 快照测试）时设
- * `WORKGREMLIN_DEMO_FIXED_TS=1`，退回到固定的 UTC 基准。
+ * Time base: by default it is **anchored to the current time** (each event at a fixed relative
+ * offset), otherwise "elapsed time" shows — and heartbeat timeouts never trigger degraded. When an
+ * absolutely reproducible time is needed (DOM snapshot tests), set `WORKGREMLIN_DEMO_FIXED_TS=1`
+ * to fall back to the fixed UTC base.
  */
 
 const { MESSAGE_TYPES } = require('@workgremlin/shared');
 const config = require('../config');
 
-/** mulberry32：小而确定的 PRNG */
+/** mulberry32: small and deterministic PRNG */
 function makeRng(seed) {
   let a = seed >>> 0;
   return function rng() {
@@ -38,29 +42,32 @@ const ROSTER = [
   { name: 'coder', role: '编码实现', state: 'busy', progress: 0.38, reported: 1 },
   { name: 'tester', role: '测试与验收', state: 'idle', progress: null, reported: 1 },
   { name: 'reviewer', role: '代码评审', state: 'blocked', progress: 0.2, reported: 1 },
-  { name: 'ops', role: '构建与部署', state: 'offline', progress: null, reported: 0 }, // 未接上报 -> degraded
+  { name: 'ops', role: '构建与部署', state: 'offline', progress: null, reported: 0 }, // no reporter attached -> degraded
 ];
 
 /**
- * 临时组队成员（GUESTS）：为某个项目临时拉进来的 agent。
+ * Temporary team members (GUESTS): agents pulled into a project temporarily.
  *
- * 判定靠 `ghost-` 前缀（见 shared.isEphemeralMember），UI 里是"幽灵"——
- * 不占工位、飘在空中；role 即所属项目名，显示在它头顶。
+ * They are recognized by the `ghost-` prefix (see shared.isEphemeralMember) and appear in the UI as
+ * "ghosts" —— taking no workstation and floating in the air; role is the project name they belong
+ * to, shown above their head.
  */
 const GUESTS = [
   { name: 'ghost-search', role: '临时项目 · 搜索重构', state: 'busy', progress: 0.44, reported: 1 },
   { name: 'ghost-i18n', role: '临时项目 · 多语言文案', state: 'idle', progress: null, reported: 1 },
 ];
 
-/** 专家 + 临时成员：注册/心跳/任务都按这份名单来 */
+/** Experts + temporary members: registration / heartbeat / tasks all follow this list */
 const ALL_MEMBERS = ROSTER.concat(GUESTS);
 
 /**
- * 演示种子成员的名字集合。
+ * Name set of the demo seed members.
  *
- * 供启动清理用：老版本里演示 project 叫 workgremlin，和真实工程撞名，
- * 这些名字被写进了真实工程的 project；演示 project 改名后需要把它们从真实 project 里摘掉。
- * （注意：若某名字同时是工程里**已定义 subagent**（如 coder），说明那已是真实成员，不清。）
+ * Used for startup cleanup: in older versions the demo project was named workgremlin, colliding
+ * with a real project, and these names were written into the real project; after renaming the demo
+ * project they have to be removed from the real project.
+ * (Note: if a name is also a **defined subagent** in the project (e.g. coder), it is already a real
+ * member and is not removed.)
  */
 const DEMO_MEMBER_NAMES = new Set(ALL_MEMBERS.map((m) => m.name));
 
@@ -111,7 +118,7 @@ const CONTENTS = [
 ];
 
 /**
- * 生成演示数据。
+ * Generate demo data.
  * @param {{bus: any, seed?: number, project?: string, workspacePath?: string, baseTs?: number}} opts
  */
 function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspacePath = '/demo/workspace', baseTs }) {
@@ -138,13 +145,14 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
         ts: t0 - Math.floor(rng() * 60_000),
       });
     } else {
-      // 未接上报：状态行打 degraded，UI 必须灰显并标注"推断"
+      // No reporter attached: the state row is flagged degraded, and the UI must gray it out and
+      // label it "inferred"
       bus.heartbeat({ project, memberId, state: r.state, ts: t0 - 3 * 60_000 });
       bus.raw && bus.raw;
     }
   }
 
-  // 为每个 busy 成员建一条任务
+  // Create one task for each busy member
   let leaderTaskId = null;
   for (const r of ALL_MEMBERS) {
     if (r.state !== 'busy') continue;
@@ -168,7 +176,7 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
     }
   }
 
-  // 给 leader 那轮任务挂几个 subagent，演示"多次 subagent 调用 → 点开看单个"的能力
+  // Attach a few subagents to the leader's round, to demo "multiple subagent calls → click to see one"
   if (leaderTaskId) {
     const subs = [
       { name: 'researcher', title: '调研 .codebuddy/projects 数据格式', result: '产出调研报告一份，字段与 schema 对齐', model: 'claude-opus-4' },
@@ -199,7 +207,7 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
     });
   }
 
-  // blocked 成员额外写一条原因
+  // Write an extra reason line for the blocked member
   bus.setStatus({
     project,
     memberId: 'reviewer',
@@ -208,7 +216,7 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
     ts: t0 - 120_000,
   });
 
-  // >=200 条确定性消息
+  // >=200 deterministic messages
   const names = ROSTER.map((r) => r.name);
   const count = 220;
   for (let i = 0; i < count; i += 1) {
@@ -229,7 +237,7 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
     });
   }
 
-  // 一条 error 级系统消息
+  // One error-level system message
   bus.recordMessage({
     project,
     from: 'system',
@@ -241,18 +249,21 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
     source: 'report',
   });
 
-  // ops 是"未接上报"的成员：把它的状态标成 degraded（模拟心跳超时）
+  // ops is the "no reporter attached" member: mark its state degraded (simulating heartbeat timeout)
   bus.sweepDegraded && bus.sweepDegraded();
   return { project, seed, members: ALL_MEMBERS.length, messages: count + 1, baseTs: t0 };
 }
 
 /**
- * demo 心跳推进器：让演示团队"活着"。
+ * Demo heartbeat ticker: keeps the demo team "alive".
  *
- * 只在 seed 时灌一次心跳的话，60s 后所有成员都会因超时被标 degraded，
- * 界面全灰——调试可视化时看不到状态流动。因此 demo 模式下按固定间隔：
- *   - 已接上报的成员：刷新心跳（保持不 degraded）并缓慢推进进度；
- *   - 未接上报的成员（ops）：**故意不刷新**，用于持续演示 degraded 灰显。
+ * Seeding heartbeats only once would leave every member marked degraded after 60s of timeout and
+ * the UI would go all gray —— you cannot watch state flow while debugging the visualization. So in
+ * demo mode, at a fixed interval:
+ *   - Members with a reporter attached: refresh the heartbeat (stay degraded-free) and slowly push
+ *     progress forward;
+ *   - Members without one (ops): **deliberately not refreshed**, to keep demonstrating grayed-out
+ *     degraded state.
  *
  * @param {{bus: any, repo?: any, project?: string, intervalMs?: number, seed?: number}} opts
  */
@@ -264,7 +275,7 @@ function createDemoTicker({ bus, repo, project = config.DEMO_PROJECT, intervalMs
   );
   let timer = null;
 
-  /** 找到成员当前进行中的任务（用于推进 tasks.progress，UI 进度条读的是这张表） */
+  /** Find the member's currently running task (to advance tasks.progress; the UI progress bar reads that table) */
   function runningTaskId(memberId) {
     if (!repo) return null;
     const rows = repo.listTasks.all(project) || [];

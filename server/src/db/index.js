@@ -1,20 +1,25 @@
 'use strict';
 
 /**
- * SQLite 数据访问层。
+ * SQLite data access layer.
  *
- * 安全基线（M0 强制，leader/main 已定，不得自行关闭）：
- *   1. 每个连接打开即 `PRAGMA secure_delete = ON` —— 该 PRAGMA **不持久化**，必须每连接设置。
- *      作用：删除/更新时用 0 覆写旧内容，避免明文残留在 freelist 页里被 grep 出来。
- *   2. WAL checkpoint 策略：
- *      - `wal_autocheckpoint = 512` 页（约 2MB）自动 checkpoint；
- *      - 每 30s 由定时器主动 `PRAGMA wal_checkpoint(PASSIVE)`；
- *      - 关闭时 / 执行删除-归档后执行 `PRAGMA wal_checkpoint(TRUNCATE)`（否则旧页仍留在 -wal 文件里）；
- *   3. db / -wal / -shm 文件权限 0600。
- *   4. `synchronous = NORMAL`（WAL 模式下安全且更快）。
+ * Security baseline (mandatory for M0, decided by leader/main, must not be turned off on your own):
+ *   1. Every connection sets `PRAGMA secure_delete = ON` as soon as it opens —— that PRAGMA is **not
+ *      persisted**, it has to be set per connection.
+ *      Effect: deletions / updates overwrite the old content with 0s, so no plaintext lingers in
+ *      freelist pages for someone to grep out.
+ *   2. WAL checkpoint strategy:
+ *      - `wal_autocheckpoint = 512` pages (~2MB) autocheckpoint;
+ *      - every 30s a timer actively runs `PRAGMA wal_checkpoint(PASSIVE)`;
+ *      - on close / after delete-archive run `PRAGMA wal_checkpoint(TRUNCATE)` (otherwise old pages
+ *        stay in the -wal file);
+ *   3. db / -wal / -shm file permissions 0600.
+ *   4. `synchronous = NORMAL` (safe and faster in WAL mode).
  *
- * 真正的防线是**脱敏在入库与建 FTS 索引之前**完成；DB 内不应出现明文。
- * 若发现明文落库 —— 按 P0 缺陷立即上报，不要自行修改脱敏逻辑。
+ * The real line of defense is that **masking happens before writes to the DB and before building the
+ * FTS index**; no plaintext should appear in the DB.
+ * If plaintext does land in the DB —— report it immediately as a P0 defect, do not change the masking
+ * logic yourself.
  */
 
 const fs = require('node:fs');
@@ -29,7 +34,7 @@ function chmod600(file) {
   try {
     if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
   } catch {
-    /* 非 POSIX 忽略 */
+    /* non-POSIX: ignore */
   }
 }
 
@@ -47,8 +52,9 @@ function hasColumn(db, table, column) {
 }
 
 /**
- * 增量补列：schema.sql 只管"建新库"，老库要补的列在这里加。
- * SQLite 没有 ADD COLUMN IF NOT EXISTS，所以先查 table_info 再决定。
+ * Incremental column additions: schema.sql only handles "create a new DB", columns an old DB needs
+ * are added here.
+ * SQLite has no ADD COLUMN IF NOT EXISTS, so table_info is checked first and then it decides.
  * @param {import('better-sqlite3').Database} db
  */
 function ensureColumn(db, table, column, ddl) {
@@ -64,37 +70,43 @@ function migrate(db) {
   ensureColumn(db, 'members', 'client', 'client TEXT');
   ensureColumn(db, 'subagent_runs', 'files_json', 'files_json TEXT');
   ensureColumn(db, 'task_runs', 'baseline_commit', 'baseline_commit TEXT');
-  // 轴 2（会话）：老库里没有这两列，补上；老行留 NULL（不是"没有会话"，是"当时还没记"）
+  // Axis 2 (session): old DBs lack these two columns, add them; old rows keep NULL (that is not "no
+  // session", it is "nothing was recorded back then")
   ensureColumn(db, 'task_runs', 'session_id', 'session_id TEXT');
   ensureColumn(db, 'task_runs', 'form', 'form TEXT');
-  // Trae 的 cn_session_usage_tail 只有金额（元）、没有 token 分项。单独一列存，
-  // 不硬塞进 input_tokens / output_tokens —— 那是给真有 token 分项的产品用的。
+  // Trae's cn_session_usage_tail only has the amount (CNY), no token breakdown. It gets its own
+  // column, and is not stuffed into input_tokens / output_tokens —— those are for products that
+  // really do have a token breakdown.
   ensureColumn(db, 'task_runs', 'usage_yuan', 'usage_yuan REAL');
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
-  // 议事厅：从"只有表决"扩成"表决 / 分析 × 隔离目录 / 工程目录"。
-  // 老库补列后行为与改动前**逐字一致**：mode='vote'、workspace_path=NULL（= 临时目录 + 无工具）。
+  // Council room: expanding from "voting only" to "vote / analysis × isolated directory / project
+  // directory".
+  // After an old DB gets the columns, behavior is **verbatim identical** to before the change:
+  // mode='vote', workspace_path=NULL (= temp directory + no tools).
   ensureColumn(db, 'councils', 'mode', "mode TEXT NOT NULL DEFAULT 'vote'");
   ensureColumn(db, 'councils', 'workspace_path', 'workspace_path TEXT');
   ensureColumn(db, 'council_utterances', 'stance', 'stance TEXT');
   ensureColumn(db, 'council_utterances', 'findings_json', 'findings_json TEXT');
   ensureAgentStatusThinking(db);
   ensureCouncilVerdictReported(db);
-  // 回填：CLIENT_BASES 漏配过的产品，其主 agent 成员的 client 会被写成 NULL，
-  // 而空 client 在前端被当「通用、哪层都显示」，于是这个产品的成员飘进所有楼层
-  // （实测 qoder 主 agent 行就是这么飘进 1F 工位卡片的）。按"名字正好等于已知产品基名"
-  // 回填：演示成员的通用 NULL（名字不是基名）不受影响。新成员已由 normClient 正确归一，
-  // 这里是清历史残留。
+  // Backfill: products once missing from CLIENT_BASES have their main agent member's client written as
+  // NULL, and an empty client is treated on the frontend as "generic, show it on every floor" —— so
+  // that product's members drift into every floor (measured: the qoder main agent row drifted into
+  // 1F's workstation card exactly this way). Backfill by "the name equals a known product base name":
+  // demo members' generic NULLs (names are not base names) are unaffected. New members are already
+  // normalized correctly by normClient; this clears historical residue.
   const BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
   const tagBase = db.prepare(`UPDATE members SET client = ? WHERE client IS NULL AND name = ?`);
   for (const b of BASES) tagBase.run(b, b);
 }
 
 /**
- * 老库的 agent_status.state 带旧 CHECK 约束（不含 thinking），
- * 而 CREATE TABLE IF NOT EXISTS 不会改已有表的约束。
- * 运行时状态表，内容可丢（下个上报/心跳会补齐），所以重建该表放宽为包含 thinking。
+ * An old DB's agent_status.state carries the old CHECK constraint (no thinking in it),
+ * and CREATE TABLE IF NOT EXISTS does not change an existing table's constraints.
+ * It is a runtime state table whose content is disposable (the next report / heartbeat fills it in
+ * again), so rebuild the table and relax it to include thinking.
  * @param {import('better-sqlite3').Database} db
  */
 function ensureAgentStatusThinking(db) {
@@ -105,7 +117,7 @@ function ensureAgentStatusThinking(db) {
   } catch {
     return;
   }
-  if (!sql || /thinking/.test(sql)) return; // 已是新约束或表不存在
+  if (!sql || /thinking/.test(sql)) return; // already the new constraint, or the table does not exist
   db.exec(`
     ALTER TABLE agent_status RENAME TO _agent_status_old;
     CREATE TABLE agent_status (
@@ -130,18 +142,21 @@ function ensureAgentStatusThinking(db) {
 }
 
 /**
- * 老库的 councils.verdict 带旧 CHECK（不含分析模式的 'reported'），
- * 而 CREATE TABLE IF NOT EXISTS 不会改已有表的约束。
+ * An old DB's councils.verdict carries the old CHECK (no analysis mode's 'reported'),
+ * and CREATE TABLE IF NOT EXISTS does not change an existing table's constraints.
  *
- * 与 agent_status 那次不同，议事厅的**历史会不能丢**（那是用户开过的会），所以这里是
- * 原样搬行、不是重建空表。安全的前提有两条，都成立：
- *   · 议事厅这几张表 schema.sql 里**刻意没建外键**（reconcile 靠 deleteCouncil 手工级联），
- *     所以 RENAME 不会牵动别的表；
- *   · councils 只有 council_rounds / council_utterances 等子表**引用它**（同样没有外键），
- *     重建期间子表行按 council_id 挂着，重新出现同名表后照样查得到。
+ * Unlike the agent_status case, the council room's **history must not be lost** (those are meetings
+ * the user actually held), so rows are carried over as-is rather than rebuilding an empty table. Two
+ * preconditions make that safe, and both hold:
+ *   · These council tables **deliberately have no foreign keys** in schema.sql (reconciliation relies
+ *     on deleteCouncil's manual cascade), so RENAME drags no other table with it;
+ *   · councils is only **referenced by** child tables like council_rounds / council_utterances (also
+ *     without foreign keys), so rows of the child tables stay keyed by council_id during the rebuild
+ *     and are still queryable once the same-named table reappears.
  *
- * 注意 CREATE 里必须把**当前 schema 的全部列**写全（含刚 ensureColumn 补的 mode /
- * workspace_path）与那条 idx_councils_created —— 少一列就等于用一次迁移把新加的列又删掉。
+ * Note the CREATE must spell out **every column of the current schema** (including the mode /
+ * workspace_path just added by ensureColumn) and that idx_councils_created —— missing one column means
+ * one migration silently deletes a newly added column.
  * @param {import('better-sqlite3').Database} db
  */
 function ensureCouncilVerdictReported(db) {
@@ -152,7 +167,7 @@ function ensureCouncilVerdictReported(db) {
   } catch {
     return;
   }
-  if (!sql || /reported/.test(sql)) return; // 已是新约束或表不存在
+  if (!sql || /reported/.test(sql)) return; // already the new constraint, or the table does not exist
   db.exec(`
     ALTER TABLE councils RENAME TO _councils_old;
     CREATE TABLE councils (
@@ -186,10 +201,10 @@ function ensureCouncilVerdictReported(db) {
   `);
 }
 
-/** 带 team_id 的老表（projec改成 project 之前的那一版 schema） */
+/** Old tables carrying team_id (the schema version from before project was renamed from project) */
 const LEGACY_TEAM_TABLES = ['members', 'tasks', 'messages', 'events'];
 
-/** 迁移前留一份全量备份，万一迁移出来的结果不对还能回滚 */
+/** Keep one full backup before migrating, so there is something to roll back to if the result is wrong */
 function backupLegacyDatabase(db, dbPath) {
   try {
     db.pragma('wal_checkpoint(TRUNCATE)');
@@ -203,26 +218,29 @@ function backupLegacyDatabase(db, dbPath) {
 }
 
 /**
- * team 时代 → project 时代的一次性迁移。
+ * One-off migration from the team era to the project era.
  *
- * 必须抢在 exec(schema.sql) 之前跑：schema.sql 里有一批 `CREATE INDEX ...(project_id, ...)`，
- * 老表（members / tasks / messages / events）只有 team_id，db.exec 会当场挂在
- * "no such column: project_id"，服务端起不来且不知道为什么。
+ * It must run **before** exec(schema.sql): schema.sql has a batch of `CREATE INDEX ...(project_id, ...)`
+ * while the old tables (members / tasks / messages / events) only have team_id, so db.exec would die
+ * right there on "no such column: project_id", the server would not start and nobody would know why.
  *
- * 做法：老行读进内存 → 丢掉老表（schema.sql 随后按最新定义重建）→ 建完回填，
- * 顺手把 team_id 写成 project_id、members.project 写成 project_label。
- * 全程 foreign_keys=OFF（连默认值就是这样），免得 DROP 时级联把 agent_status / 历史一起带走。
+ * Approach: read old rows into memory → drop the old tables (schema.sql then rebuilds them per the
+ * latest definition) → after creation, backfill, and while at it write team_id as project_id and
+ * members.project as project_label.
+ * foreign_keys=OFF throughout (that is the default anyway), so DROP does not cascade agent_status /
+ * history away with it.
  *
  * @param {import('better-sqlite3').Database} db
- * @returns {Record<string, any[]> | null} 需要回填的老行；null = 这个库不用迁
+ * @returns {Record<string, any[]> | null} the old rows to backfill; null = this DB needs no migration
  */
 function migrateLegacyTeamSchema(db) {
-  // 判据只看「还有表挂着 team_id」：teams 表本身允许留着（里面是历史工程），
-  // 只看它会导致每次启动都误判成待迁移、白备份一遍库。
+  // The criterion is only "is there still a table carrying team_id": the teams table itself is allowed
+  // to stay (it holds historical projects), and looking at it alone would misjudge every start as
+  // pending migration and back up the DB for nothing.
   const legacyTables = LEGACY_TEAM_TABLES.filter((t) => hasColumn(db, t, 'team_id'));
   if (!legacyTables.length) return null;
 
-  // teams 就是当年的 projects：抄过去，IGNORE 保证重复启动不会重写
+  // teams is what projects was back then: copy it over, IGNORE keeps repeated starts from rewriting
   if (tableExists(db, 'teams') && tableExists(db, 'projects')) {
     db.exec(`
       INSERT OR IGNORE INTO projects (id, name, workspace_path, main_conversation_id, source, created_at)
@@ -234,8 +252,8 @@ function migrateLegacyTeamSchema(db) {
   for (const t of legacyTables) {
     snap[t] = db.prepare(`SELECT * FROM ${t}`).all();
     if (t === 'messages') {
-      // messages_fts 是 external content 虚表（content='messages'），必须跟着一起拆，
-      // 留给 schema.sql 重建；回填完再 rebuild 索引。
+      // messages_fts is an external content virtual table (content='messages'), it has to be torn down
+      // along with it, left for schema.sql to rebuild; the index is rebuilt again after backfilling.
       db.exec(`
         DROP TRIGGER IF EXISTS messages_ai;
         DROP TRIGGER IF EXISTS messages_ad;
@@ -249,8 +267,10 @@ function migrateLegacyTeamSchema(db) {
 }
 
 /**
- * schema.sql 把表按最新定义建好之后，回填迁移前捞出来的老行。
- * 落不进去的（引用了不存在的工程）跳过并计数 —— 宁可少几条历史，也不让 server 起不来。
+ * After schema.sql has created the tables per the latest definition, backfill the old rows fished out
+ * before the migration.
+ * Rows that cannot land (referencing a project that does not exist) are skipped and counted —— better
+ * to lose a few history rows than to stop the server from starting.
  *
  * @param {import('better-sqlite3').Database} db
  * @param {Record<string, any[]> | null} snap
@@ -289,7 +309,7 @@ function restoreLegacyRows(db, snap) {
       fn(row);
       restored += 1;
     } catch {
-      /* 单行失败不影响其余：历史数据少一条，好过服务起不来 */
+      /* one row failing does not affect the rest: one less history row beats a server that cannot start */
     }
   };
 
@@ -305,7 +325,7 @@ function restoreLegacyRows(db, snap) {
       createdAt: r.created_at ?? now,
       lastSeenAt: r.last_seen_at ?? null,
       ephemeral: r.ephemeral ?? 0,
-      // 老库的 members.project（临时成员所属项目名）改名叫 project_label 了
+      // The old DB's members.project (the project name a temporary member belongs to) was renamed to project_label
       projectLabel: r.project ?? null,
       client: null,
     });
@@ -356,7 +376,7 @@ function restoreLegacyRows(db, snap) {
     try {
       db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
     } catch {
-      /* FTS 重建失败不影响主流程：搜索退化为不可用，历史消息照常可读 */
+      /* a failed FTS rebuild does not affect the main flow: search degrades to unusable, history messages are still readable */
     }
   }
   return restored;
@@ -371,7 +391,7 @@ function applyPragmas(db) {
 }
 
 /**
- * 打开（并初始化）数据库。
+ * Open (and initialize) the database.
  * @param {string} dbPath
  * @returns {{ db: import('better-sqlite3').Database, repo: ReturnType<typeof createRepo>, checkpoint: (mode?: string) => any, startCheckpointLoop: () => NodeJS.Timeout, close: () => void }}
  */
@@ -380,8 +400,9 @@ function openDatabase(dbPath) {
 
   const db = new Database(dbPath);
 
-  // team 时代的老库先迁到 project 时代 —— 必须早于 applyPragmas（foreign_keys=ON）与 schema，
-  // 否则 exec(schema.sql) 里那几条 (project_id, ...) 索引会直接 "no such column" 把启动掐死。
+  // An old team-era DB must migrate to the project era first —— before applyPragmas (foreign_keys=ON)
+  // and before the schema, otherwise those few (project_id, ...) indexes in exec(schema.sql) kill
+  // startup outright with "no such column".
   db.pragma('foreign_keys = OFF');
   const legacy = migrateLegacyTeamSchema(db);
   if (legacy) {
@@ -419,7 +440,7 @@ function openDatabase(dbPath) {
       try {
         checkpoint('PASSIVE');
       } catch {
-        /* 忽略：checkpoint 失败不影响可用性，下一轮重试 */
+        /* ignore: a failed checkpoint does not affect availability, the next round retries */
       }
     }, DEFAULTS.WAL_CHECKPOINT_INTERVAL_MS);
     if (timer.unref) timer.unref();
@@ -439,7 +460,7 @@ function openDatabase(dbPath) {
 }
 
 /**
- * 预编译语句集合。所有写入方法都不允许编造数据：未知字段一律写 NULL。
+ * The set of prepared statements. No write method may fabricate data: unknown fields are always written as NULL.
  * @param {import('better-sqlite3').Database} db
  */
 function createRepo(db) {
@@ -466,7 +487,7 @@ function createRepo(db) {
         last_seen_at = MAX(COALESCE(members.last_seen_at, 0), COALESCE(excluded.last_seen_at, 0)),
         ephemeral = MAX(members.ephemeral, excluded.ephemeral),
         project_label = COALESCE(excluded.project_label, members.project_label),
-        -- 来源客户端已知就覆盖（老库是 NULL，第一次上报/名册心跳会补上）
+        -- overwrite when the source client is known (old DBs are NULL, filled in by the first report / roster heartbeat)
         client = COALESCE(excluded.client, members.client)
     `),
     tagMemberClient: db.prepare(`
@@ -475,7 +496,7 @@ function createRepo(db) {
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
     listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),
-    /** 按上报身份取成员（9F 的同步器据它收工：没有会话时也要把状态落回空闲，见 copilot.js） */
+    /** Members by reporting identity (9F's synchronizer wraps up with it: even with no session it has to put the status back to idle, see copilot.js) */
     listMembersByClient: db.prepare(`SELECT * FROM members WHERE client = ? ORDER BY name`),
     listEphemeral: db.prepare(`SELECT * FROM members WHERE project_id = ? AND ephemeral = 1`),
     touchMember: db.prepare(`UPDATE members SET last_seen_at = ? WHERE id = ?`),
@@ -511,8 +532,8 @@ function createRepo(db) {
     `),
     getSessionStatus: db.prepare(`SELECT * FROM session_status WHERE member_id = @memberId AND session_id = @sessionId`),
     /**
-     * 清掉成员状态里的任务槽位（upsertStatus 的 task_id 是 COALESCE，传 null 清不掉）。
-     * 9F 收工时用：会话没了，槽位里那条任务（可能已经不存在）也不该再挂着。
+     * Clear the task slot in the member status (upsertStatus's task_id is COALESCE, passing null cannot clear it).
+     * Used when 9F wraps up: the session is gone, so the task in that slot (which may no longer exist) should not hang there either.
      */
     clearStatusTask: db.prepare(`UPDATE agent_status SET task_id = NULL, progress = NULL, current_files = NULL WHERE member_id = ?`),
     listStatuses: db.prepare(`
@@ -543,8 +564,8 @@ function createRepo(db) {
     getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
     listTasks: db.prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY started_at DESC`),
     /**
-     * 某成员最近一条**已收工**任务的收工时刻（工位卡的「最近活跃」用它：上一个任务在多久以前）。
-     * 用成员自己的 id 查（tasks.member_id 是 "名字@工程" 这个全量 id），命中 idx_tasks_member_state。
+     * The finish time of a member's most recent **finished** task (the workstation card's "last active" uses it: how long ago the previous task was).
+     * Looked up by the member's own id (tasks.member_id is the full "name@project" id), hitting idx_tasks_member_state.
      */
     lastTaskEndOfMember: db.prepare(`SELECT MAX(ended_at) AS at FROM tasks WHERE member_id = ? AND ended_at IS NOT NULL`),
 
@@ -571,8 +592,8 @@ function createRepo(db) {
       )
     `),
 
-    /* ---- 工具使用（任务详情里的「工具使用：工具名 + 次数」）---- */
-    /** 某工具在这一轮任务里 +1 次（按 (task_id, tool) UPSERT 累加，见 schema.sql 的说明） */
+    /* ---- Tool usage ("tool usage: tool name + count" in task details) ---- */
+    /** +1 for one tool in this round's task (UPSERT accumulates by (task_id, tool), see the notes in schema.sql) */
     bumpToolUsage: db.prepare(`
       INSERT INTO tool_usage (task_id, tool, project_id, member_id, client, session_id, count, first_at, last_at)
       VALUES (@taskId, @tool, @projectId, @memberId, @client, @sessionId, 1, @ts, @ts)
@@ -583,7 +604,7 @@ function createRepo(db) {
         client     = COALESCE(excluded.client, tool_usage.client),
         session_id = COALESCE(excluded.session_id, tool_usage.session_id)
     `),
-    /** 一轮任务的工具使用清单：次数多的在前 */
+    /** The tool usage list for one round's task: highest count first */
     listTaskTools: db.prepare(`
       SELECT tool, count, last_at FROM tool_usage WHERE task_id = ? ORDER BY count DESC, tool ASC
     `),
@@ -593,11 +614,11 @@ function createRepo(db) {
     `),
     listArtifacts: db.prepare(`SELECT * FROM artifacts WHERE member_id = ? ORDER BY ts_ms DESC LIMIT ?`),
 
-    /** 最近一条已结束的任务：给「本轮改动文件」当时间窗边界（started_at..ended_at） */
+    /** The most recent finished task: gives the "files changed this round" window its boundaries (started_at..ended_at) */
     latestEndedTask: db.prepare(`
       SELECT * FROM tasks WHERE member_id = ? AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1
     `),
-    /* ---- 台账（报表用）：一轮用户任务 + 它召唤出去的 subagent 实例 ---- */
+    /* ---- Ledger (for reports): one round of user task + the subagent instances it summoned ---- */
     upsertTaskRun: db.prepare(`
       INSERT INTO task_runs (id, project_id, member_id, client, session_id, form, model, title, started_at, baseline_commit)
       VALUES (@id, @projectId, @memberId, @client, @sessionId, @form, @model, @title, @startedAt, @baselineCommit)
@@ -623,15 +644,18 @@ function createRepo(db) {
       WHERE id = @id
     `),
     /**
-     * 一轮消耗的 token（四列，语义见 schema.sql 的注释）。
+     * The tokens consumed by one round (four columns, semantics in the comments of schema.sql).
      *
-     * 为什么单起一条、而不是并进 endTaskRun：endTaskRun 的每个字段都是
-     * `COALESCE(@x, x)` —— "没报就别动"。token 恰恰相反，**读到的就是最新的、要覆盖**：
-     * 7F/8F 每 1.5s 轮询一次、同一行反复写，正在跑的那一轮 token 是**长出来的**
-     * （第一次轮询只读得到一部分），COALESCE 会把偏小的那个值永久钉死。
-     * 各楼层真正的写入时机也只有一次（收工 / 每次轮询），不存在"该保留旧值"的场景。
+     * Why a separate statement rather than folding it into endTaskRun: every field of endTaskRun is
+     * `COALESCE(@x, x)` —— "not reported means do not touch". Tokens are exactly the opposite: **what
+     * was read is the newest and must overwrite** —— 7F/8F poll every 1.5s and write the same row
+     * repeatedly, and the tokens of a running round **grow** (the first poll only reads part of them),
+     * so COALESCE would nail the too-small value down permanently.
+     * Each floor's real write timing is also just once (at wrap-up / each poll), so there is no such
+     * thing as "the old value should be kept".
      *
-     * 读不到真值时调用方传 null —— 那就如实写 NULL，报表显示 "—"，不拿 0 或旧值冒充。
+     * When no true value can be read, the caller passes null —— then NULL is written honestly, the
+     * report shows "—", and neither 0 nor an old value poses as the answer.
      */
     setTaskRunTokens: db.prepare(`
       UPDATE task_runs SET
@@ -641,33 +665,39 @@ function createRepo(db) {
         cache_write_tokens = @cacheWriteTokens
       WHERE id = @id
     `),
-    /** Trae 的 cn_session_usage_tail = 任务结束信号 + 金额。
-     *  原子写入：set usage_yuan。state 在 tasks 表，由 flushTraeYuan 里的 bus.endTask 处理。 */
+    /** Trae's cn_session_usage_tail = task end signal + amount.
+     *  Written atomically: set usage_yuan. state lives in the tasks table, handled by bus.endTask inside flushTraeYuan. */
     setTaskRunYuan: db.prepare(`
       UPDATE task_runs SET usage_yuan = @usageYuan
       WHERE id = @id
     `),
     /**
-     * 待补 token 的那一行 —— 收工后补报 token 用（见 bus.backfillTaskTokens）。
+     * The row awaiting tokens —— used for late token backfill after wrap-up (see bus.backfillTaskTokens).
      *
-     * 认领线索："会话 + 起点附近 + 四列全空"，取最近开始的那一轮。
+     * Claiming clue: "session + near the start + all four columns empty", take the most recently started round.
      *
-     * 为什么按"会话 + 起点附近"认、而不是按 taskId：补报的那一刻 hook 手上没有 taskId
-     * （状态文件收工时就清了），只有"上一轮从哪开始"这个时刻。而 task_runs.started_at 是
-     * 服务端写的、hook 那份是自己记的，两者差一个 HTTP 往返（几毫秒到几十毫秒），
-     * 精确等值匹配**必然**对不上 —— 所以按 ±10s 认。
+     * Why claim by "session + near the start" rather than by taskId: at the moment of backfill the hook
+     * has no taskId in hand (the state file cleared it at wrap-up), only "where the previous round
+     * started". And task_runs.started_at is written by the server while the hook's copy is its own
+     * record; the two differ by one HTTP round trip (a few ms to tens of ms), so an exact equality match
+     * **necessarily** fails —— hence ±10s.
      *
-     * 为什么**不**要求 ended_at IS NOT NULL（早期版本的限制）：被取消 / 打断的那一轮，
-     * 收工流程可能在 taskId 被并发清掉时没跑成功（真实案例：10-08 13:40 一条 codebuddy CLI
-     * 任务，ended_at 一直空着、token 全空），它在"会话 + 起点 + 四列全空"这条线索上和别的可补行
-     * 并无二致 —— 取消 ≠ 没消耗 token，这类行一样要补。约束交给调用时机即可：补报只在
-     * Stop（已收工）之后、或下一轮 UserPromptSubmit（上一轮上下文已结束）时发起，不会误伤真在跑的任务。
-     * 认不出（会话里没有这种行 / 起点对不上）就不补：宁可留 "—"，也不写到别的轮次头上。
+     * Why **not** require ended_at IS NOT NULL (a restriction in earlier versions): for a cancelled /
+     * interrupted round, the wrap-up flow may not have completed because the taskId was cleared
+     * concurrently (real case: a codebuddy CLI task on 10-08 13:40 with ended_at permanently empty and
+     * all tokens empty), and on this "session + start + four empty columns" clue it is no different from
+     * any other backfillable row —— cancelled ≠ consumed no tokens, such rows need filling too.
+     * The constraint can be left to call timing: backfill is only initiated after Stop (already wrapped
+     * up) or the next UserPromptSubmit (the previous round's context has ended), so it never misfires on
+     * a genuinely running task. Not recognized (no such row in the session / start does not match)
+     * means no backfill: better to leave "—" than to write it onto another round's head.
      */
     /**
-     * 同会话里**更早开始、至今没收尾**的任务（开新轮时给上一轮补一刀用）。
-     * 一个会话不可能同时跑两轮 —— 这里有行，就说明上一轮的结束事件压根没到
-     * （CodeBuddy 插件按停止时一个 hook 事件都不发，见 bus.startTask 的说明）。
+     * Tasks in the same session that **started earlier and are still unfinished** (used to give the
+     * previous round a wrap-up when a new round starts).
+     * One session cannot run two rounds at once —— if there are rows here, the previous round's end
+     * event simply never arrived (the CodeBuddy plugin emits not one hook event when stopping, see the
+     * notes in bus.startTask).
      */
     listStaleRunningBySession: db.prepare(`
       SELECT r.id AS id, r.member_id AS memberId, r.started_at AS startedAt, r.client AS client
@@ -677,16 +707,20 @@ function createRepo(db) {
     `),
 
     /**
-     * 某工程（projectId，传 0 表示不限工程）里所有"还在跑"的顶层任务，返回它们的 client。
-     * 门楣滚动屏 / 主控制台判定"本层有任务在跑"的**统一口径**，在 JS 端按 agent 基名（剥 -plugin /
-     * @工程 后缀）归层——和前端的 floorAcceptsClient 同口径，避免插件会话 client 是 codebuddy-plugin、
-     * 而 ledger 里 task_runs.client 是裸 codebuddy 这种"基名相同、字符串不同"的漏配。
+     * All "still running" top-level tasks in a project (projectId, pass 0 for any project), returning their client.
+     * The **single criterion** for the lintel ticker / main console judging "this floor has a task running",
+     * grouped by agent base name in JS (stripping -plugin / @project suffixes) —— same criterion as the
+     * frontend's floorAcceptsClient, avoiding a miss where a plugin session's client is codebuddy-plugin
+     * while the ledger's task_runs.client is bare codebuddy ("same base name, different string").
      *
-     * 判定"在跑" = tasks.state='running' 且（有心跳活着 OR 是近期新开的）。**关键**：1F CodeBuddy 这类
-     * 插件任务全程不写 session_status / agent_status 心跳（handlePlugin 注释已确认 task_runs 一直挂
-     * running），纯靠心跳的 ALIVE 判定会整条漏掉 → 滚动屏在跑时不显示、取消后才冒出来。所以除心跳外，
-     * 再加一条"started_at 在 @fresh 窗口内"的兜底——插件任务靠它认领；CLI / Codex 等有心跳的照旧走 ALIVE。
-     * @fresh 给得宽（默认 3h）只为挡住"进程早死、台账却永远 running"的僵尸，正常任务不会超。
+     * "Running" = tasks.state='running' and (a heartbeat is alive OR it was newly started recently).
+     * **Key point**: 1F CodeBuddy plugin tasks never write a session_status / agent_status heartbeat
+     * (handlePlugin's comments confirm task_runs stays running), so a heartbeat-only ALIVE judgment
+     * misses them entirely → the ticker shows nothing while running and pops up only after cancellation.
+     * So besides the heartbeat, a fallback of "started_at within the @fresh window" is added —— plugin
+     * tasks claim themselves through it; CLI / Codex and others that have heartbeats go through ALIVE as
+     * before. @fresh is generous (3h by default) only to keep out zombies whose "process died long ago
+     * but the ledger stays running"; normal tasks never exceed it.
      */
     activeRunningByProject: db.prepare(`
       SELECT COALESCE(r.client, m.client) AS client, r.session_id AS sessionId, t.title AS title, t.started_at AS startedAt FROM tasks t
@@ -717,12 +751,12 @@ function createRepo(db) {
         AND ABS(COALESCE(started_at, 0) - ?) < 10000
       ORDER BY started_at DESC LIMIT 1
     `),
-    /** Trae 的 cn_session_usage_tail 只有金额。用 ended_at 匹配：
-     *  usage 事件是任务结束后 Trae 写 renderer.log 的（差 27~120 秒），所以
-     *  ended_at <= usage.ts 必成立；ORDER BY ended_at DESC LIMIT 1 取
-     *  "ended_at 最接近 usage.ts 且在之前"的那条空 usage_yuan 行——
-     *  这就是产生该 usage 的那一轮任务。started_at 不准（Trae hook
-     *  上报的任务开始时间可能比 renderer.log 的 usage 时间还晚）。 */
+    /** Trae's cn_session_usage_tail has only the amount. Matched by ended_at:
+     *  the usage event is Trae writing renderer.log after the task ends (27~120 seconds later), so
+     *  ended_at <= usage.ts always holds; ORDER BY ended_at DESC LIMIT 1 takes
+     *  "the row whose ended_at is closest to usage.ts and before it" with an empty usage_yuan ——
+     *  that is the round task that produced this usage. started_at is unreliable (the task start time
+     *  reported by the Trae hook can be later than the usage time in renderer.log). */
     runAwaitingYuan: db.prepare(`
       SELECT id FROM task_runs
       WHERE project_id = ? AND session_id = ?
@@ -735,13 +769,15 @@ function createRepo(db) {
       SELECT * FROM task_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?
     `),
     getTaskRun: db.prepare(`SELECT * FROM task_runs WHERE id = ?`),
-    /** 某条会话名下的全部台账行（7F 轮询兜底据此判断"插件是不是已经上报了真值"，见 kilo.js） */
-    // started_at 也要：kiloTasks 用它判断"插件这一轮写了没有"（见那里的 yieldsOf）
+    /** All ledger rows under a session (7F's polling fallback judges from this whether "the plugin already reported the true value", see kilo.js) */
+    // started_at is needed too: kiloTasks uses it to judge "did the plugin write this round" (see yieldsOf there)
     taskRunsOfSession: db.prepare(`SELECT id, client, started_at FROM task_runs WHERE session_id = ?`),
     /**
-     * 某客户端名下**还没收工**的台账行（9F Copilot 据此收掉"张冠李戴"的在飞行：
-     * 别的产品的会话被误当成 Copilot 写进来的历史行，见 copilot.js 的 pruneForeignRunningRuns）。
-     * 只取 running 的：这类错行全靠同步器写、又永远等不到收工，done 的历史行不在这条路上。
+     * Ledger rows under a client that **have not wrapped up** (9F Copilot uses this to retire "misattributed"
+     * in-flight rows: sessions of other products mistakenly written in as Copilot, see
+     * copilot.js's pruneForeignRunningRuns).
+     * Only running rows are taken: such wrong rows are written solely by the synchronizer and never get
+     * a wrap-up; done historical rows are not on this path.
      */
     liveTaskRunsOfClient: db.prepare(`
       SELECT tr.id AS id, tr.session_id AS session_id FROM task_runs tr
@@ -749,12 +785,13 @@ function createRepo(db) {
        WHERE tr.client = ? AND t.state = 'running' AND t.ended_at IS NULL
     `),
     /**
-     * 台账里**还没收工**的那条任务（`tasks.state = 'running'` 且没有 ended_at）。
+     * The one task in the ledger that **has not wrapped up** (`tasks.state = 'running'` and no ended_at).
      *
-     * 用途只有一个：`agent_status.task_id`（一行一成员、只有一个槽位）该指着谁 —— 见 bus.js 的
-     * heartbeat（按会话认领）与 endTask（收工往外交接）。`ended_at IS NULL` 是冗余判据，写在这里
-     * 是为了防"state 被别处改回过 running"的老数据；两条按 project + 成员走
-     * idx_task_runs_session 前缀，会话那条再多一个 session_id。
+     * There is exactly one use: who `agent_status.task_id` (one row per member, one slot only) should
+     * point at —— see bus.js's heartbeat (claimed by session) and endTask (handing the slot over at
+     * wrap-up). `ended_at IS NULL` is a redundant criterion, written here to guard against old data
+     * where "state was changed back to running elsewhere"; both go by project + member through the
+     * idx_task_runs_session prefix, and the session one adds session_id.
      */
     liveTaskOfSession: db.prepare(`
       SELECT t.id AS id FROM task_runs tr JOIN tasks t ON t.id = tr.id
@@ -762,7 +799,7 @@ function createRepo(db) {
          AND t.state = 'running' AND t.ended_at IS NULL
        ORDER BY tr.started_at DESC LIMIT 1
     `),
-    /** 同上，不限定会话：本成员**最新的**那条在飞任务（收工时交接槽位用） */
+    /** Same as above, without a session: this member's **newest** in-flight task (for handing the slot over at wrap-up) */
     liveTaskOfMember: db.prepare(`
       SELECT t.id AS id FROM task_runs tr JOIN tasks t ON t.id = tr.id
        WHERE tr.project_id = @projectId AND tr.member_id = @memberId
@@ -791,9 +828,10 @@ function createRepo(db) {
       SELECT * FROM subagent_runs WHERE parent_task_id = ? ORDER BY started_at, id
     `),
     countSubagentRuns: db.prepare(`SELECT COUNT(*) AS c FROM subagent_runs WHERE parent_task_id = ?`),
-    /** 找某会话在指定时刻正在运行的任务 —— Trae 子代理贡献补录用。
-     *  同一 sessionId 下任务串行执行（不重叠），所以 started_at <= at 的最新一条
-     *  就是贡献事件发生时正在运行的那个任务；at=0（解析不出时间）时退化为不限时间取最新。 */
+    /** Find the task a session was running at a given moment —— for Trae subagent contribution backfill.
+     *  Tasks under the same sessionId run serially (no overlap), so the newest one with started_at <= at
+     *  is the task running when the contribution event happened; at=0 (time cannot be parsed) degrades
+     *  to taking the newest with no time bound. */
     latestTaskBySession: db.prepare(`
       SELECT r.id AS id, r.member_id AS memberId, r.started_at AS startedAt
       FROM task_runs r JOIN tasks t ON t.id = r.id
@@ -801,18 +839,18 @@ function createRepo(db) {
         AND (? = 0 OR r.started_at <= ?)
       ORDER BY r.started_at DESC LIMIT 1
     `),
-    /** 去重检查：同一父任务下同一个 operationId（存在 name 列）不重复补录 */
+    /** Dedup check: the same operationId (stored in the name column) under the same parent task is not backfilled twice */
     hasSubagentByName: db.prepare(
       `SELECT COUNT(*) AS c FROM subagent_runs WHERE parent_task_id = ? AND name = ?`
     ),
-    /** Trae 子代理贡献一次性写入（含 result / files_json / ended_at，不分两步） */
+    /** One-shot write of a Trae subagent contribution (including result / files_json / ended_at, not in two steps) */
     insertSubagentContribution: db.prepare(`
       INSERT INTO subagent_runs
         (project_id, parent_task_id, member_id, name, client, title, result, files_json, started_at, ended_at)
       VALUES
         (@projectId, @parentTaskId, @memberId, @name, @client, @title, @result, @filesJson, @startedAt, @endedAt)
     `),
-    /** 删除：按顶层任务（及其 subagent 子任务）整条清掉，含台账/消息/产出 */
+    /** Deletion: clear a whole top-level task (and its subagent child tasks), including ledger / messages / outputs */
     selectChildTaskIds: db.prepare(`SELECT id FROM tasks WHERE parent_task_id IN (SELECT value FROM json_each(?))`),
     deleteTasksById: db.prepare(`DELETE FROM tasks WHERE id IN (SELECT value FROM json_each(?))`),
     deleteTaskRunsById: db.prepare(`DELETE FROM task_runs WHERE id IN (SELECT value FROM json_each(?))`),
@@ -837,9 +875,10 @@ function createRepo(db) {
         AND (@before IS NULL OR t.started_at < @before)
     `),
     /**
-     * 当前工程里**主 agent**（role='agent'，hook 上报的那位）正在跑的任务。
-     * 召唤关系拿不到时（老 hook 写的清单没有 parent 字段）用它兜底认父：
-     * 幽灵是主 agent 派出去的，它活着的时候主 agent 必然在跑某个用户任务。
+     * The task the **main agent** (role='agent', the one reported by the hook) in the current project is running.
+     * Used to recognize the parent as a fallback when the summoning relation cannot be had (old hook
+     * written lists have no parent field): a ghost was dispatched by the main agent, so while it is alive
+     * the main agent must be running some user task.
      */
     mainRunningTask: db.prepare(`
       SELECT s.task_id AS taskId
@@ -849,11 +888,11 @@ function createRepo(db) {
       LIMIT 1
     `),
     /**
-     * 某成员当前进行中的任务（可能多条：同产品的不同会话各占一条）。
-     * hook 的本地 taskId 被并发覆盖冲掉时，Stop 靠它回捞本轮任务（bug 3 兜底）。
-     * 按会话挑哪一条由上层 currentTaskFor 决定，这里只负责把候选捞出来。
+     * A member's currently in-progress tasks (there can be several: different sessions of the same product each hold one).
+     * When the hook's local taskId is lost to a concurrent overwrite, Stop uses this to fish the current round's task back out (bug 3 fallback).
+     * Which one to pick by session is decided by the upper layer's currentTaskFor; this only fishes out the candidates.
      */
-    // 会话标识在报表层 task_runs（tasks 表本身没有 session_id 列），所以这里 JOIN 取。
+    // The session identifier lives in the report layer task_runs (the tasks table itself has no session_id column), so it is JOINed here.
     runningTaskForMember: db.prepare(`
       SELECT t.id AS taskId, t.title AS title, tr.session_id AS sessionId, t.started_at AS startedAt
       FROM tasks t
@@ -863,9 +902,9 @@ function createRepo(db) {
       LIMIT 5
     `),
     /**
-     * 时间窗内该成员改动过的文件：按路径去重（同一文件反复改只算一个产出），取最近一次的时间。
-     * op 一并带出来（收工兜底要它，见 bus.endTask）：SQLite 的 min/max 聚合规则里，
-     * 裸列取的是**聚合命中那一行**（也就是时间最近的那次）的值，所以这里的 op 是"最后一次操作"。
+     * Files changed by this member within the time window: deduped by path (repeated changes to the same file count as one output), taking the latest time.
+     * op comes along too (the wrap-up fallback needs it, see bus.endTask): in SQLite's min/max aggregation rules,
+     * a bare column takes the value from **the row the aggregate hit** (i.e. the most recent time), so op here is "the last operation".
      */
     listActivityInWindow: db.prepare(`
       SELECT path, op, MAX(ts_ms) AS ts_ms FROM file_activity
@@ -877,19 +916,20 @@ function createRepo(db) {
   };
 
   /**
-   * 消息查询：按成员 / 类型 / 时间过滤 + 关键字搜索 + 游标分页。
-   * M0 用 LIKE；M2 切换到 FTS5 trigram（<3 字查询自动降级为 LIKE，见 README 说明）。
+   * Message query: filter by member / type / time + keyword search + cursor pagination.
+   * M0 uses LIKE; M2 switches to FTS5 trigram (<3 character queries degrade to LIKE automatically, see the README notes).
    * @param {string} projectId
    * @param {{members?: string[], types?: string[], session?: string, since?: number, until?: number, keyword?: string, direction?: string, beforeId?: number, afterId?: number, limit?: number}} f
-   *   session：只取某一条会话的消息（轴 2）。不传 = 所有会话（老行为）。
+   *   session: take only one session's messages (axis 2). Omitted = all sessions (old behavior).
    */
   function listMessages(projectId, f = {}) {
     const limit = Math.min(Math.max(Number(f.limit) || 100, 1), 1000);
     const where = ['project_id = @projectId'];
     const params = { projectId, limit };
 
-    // 会话过滤：只认**精确等于**这条会话的。老消息（session_id IS NULL）不并入 ——
-    // 「没带会话标识」跟「属于这条会话」是两回事，混进来就分不清了。
+    // Session filter: only **exactly equal** to this session counts. Old messages (session_id IS NULL)
+    // are not folded in —— "carrying no session identifier" and "belonging to this session" are two
+    // different things, and mixing them makes them indistinguishable.
     if (f.session) {
       where.push('session_id = @session');
       params.session = String(f.session);
@@ -936,8 +976,8 @@ function createRepo(db) {
   }
 
   /**
-   * 删除（归档）某个工程的全部数据 —— 演示 secure_delete + TRUNCATE 的完整链路。
-   * 真实归档/保留策略在 M2 落地；此处保证"删了就真的抹掉"。
+   * Delete (archive) all data of a project —— demonstrates the full secure_delete + TRUNCATE chain.
+   * The real archiving / retention policy lands in M2; here it is guaranteed that "deleted means really wiped".
    * @param {string} projectId
    */
   function purgeProject(projectId) {
@@ -956,23 +996,26 @@ function createRepo(db) {
       db.prepare('DELETE FROM projects WHERE id = ?').run(id);
     });
     tx(projectId);
-    // secure_delete 只保证 freelist 页被覆写；WAL 里的旧页要靠 TRUNCATE 清掉
+    // secure_delete only guarantees freelist pages are overwritten; old pages in the WAL have to be cleared by TRUNCATE
     db.pragma('wal_checkpoint(TRUNCATE)');
   }
 
   /**
-   * 删掉一个成员及其附属行 —— 临时成员（幽灵）消失时用。
+   * Delete a member and its dependent rows —— used when a temporary member (ghost) disappears.
    *
-   * 两类"发生过什么"的历史不删：
-   *   · messages —— 一直如此；
-   *   · **幽灵的 tasks / artifacts**（keepHistory）—— 一次召唤的"干了什么 / 产出是什么 /
-   *     花了多久"全在这两行里，而 tasks.member_id 与 artifacts.member_id 都没有外键约束，
-   *     成员行删了它们照样站得住。
-   *     以前连它们一起删，于是：有小怪物的（susan）产出随幽灵蒸发；没小怪物的
-   *     （code-explorer / 内置专家直接 spawn 的实例）更是**查都没处查** ——
-   *     「这次用户任务用了几个 subagent」这条线就断在这儿。
-   *     产出留在产出者名下（不再过户），"谁干的"不被改写；小怪物卡片靠
-   *     bus.ghostArtifacts 借同名幽灵的产出来显示。
+   * Two kinds of "what happened" history are **not** deleted:
+   *   · messages —— always been this way;
+   *   · **the ghost's tasks / artifacts** (keepHistory) —— "what it did / what it produced / how long it
+   *     took" for one summoning all lives in those two rows, and neither tasks.member_id nor
+   *     artifacts.member_id has a foreign key constraint, so they stand on their own once the member row
+   *     is gone.
+   *     They used to be deleted along with it, and so: the output of a summoning with a gremlin (susan)
+   *     evaporated together with the ghost; one without a gremlin (code-explorer / built-in experts
+   *     spawned directly) could not even be **queried anywhere** —— the thread "how many subagents did
+   *     this user task use" broke right there.
+   *     Output stays under the producer's name (no transfer of ownership), "who did it" is not
+   *     rewritten; the gremlin card shows it by borrowing the same-named ghost's output through
+   *     bus.ghostArtifacts.
    *
    * @param {string} memberId
    * @param {{ keepHistory?: boolean }} [opts]
@@ -993,9 +1036,9 @@ function createRepo(db) {
   }
 
   /**
-   * 整条删掉一组顶层任务（含其 subagent 子任务），以及对应的台账/消息/产出。
-   * @param {string[]} topIds 顶层任务 id 列表
-   * @returns {number} 删除的顶层任务条数
+   * Delete a whole set of top-level tasks (with their subagent child tasks), and the corresponding ledger / messages / outputs.
+   * @param {string[]} topIds list of top-level task ids
+   * @returns {number} how many top-level tasks were deleted
    */
   function deleteByTopIds(topIds) {
     if (!topIds.length) return 0;
@@ -1016,18 +1059,18 @@ function createRepo(db) {
   }
 
   /**
-   * 删单条任务记录（二次确认在客户端做；这里只负责真删）。
-   * @param {string} id 顶层任务 id
+   * Delete a single task record (the second confirmation happens client-side; this only does the actual deletion).
+   * @param {string} id top-level task id
    */
   function deleteTaskRun(id) {
     return deleteByTopIds([id]);
   }
 
   /**
-   * 按一级检索（工程 + 楼层）删除；beforeTs 给定时只删早于该时刻的（保留最近 N 天）。
+   * Delete by the top-level filters (project + floor); when beforeTs is given, only delete older than that (keep the last N days).
    * @param {{ project?: string, client?: string, beforeTs?: number }} opt
-   *        client 可以是逗号分隔的一串（合并楼层 1F CodeBuddy = CLI + Plugin）
-   * @returns {number} 删除的顶层任务条数
+   *        client may be a comma-separated list (merged floor 1F CodeBuddy = CLI + Plugin)
+   * @returns {number} how many top-level tasks were deleted
    */
   function deleteTaskRunsByFilter(opt = {}) {
     // project / client may each be a comma-separated list (multi-select); normalize each to a
@@ -1056,19 +1099,20 @@ function createRepo(db) {
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `);
 
-  /** 读设置项（字符串），不存在返回 null */
+  /** Read a setting (string); null when it does not exist */
   function getSetting(key) {
     const row = getSettingStmt.get(key);
     return row ? row.value : null;
   }
-  /** 写设置项（值一律转字符串存） */
+  /** Write a setting (values are always stored as strings) */
   function setSetting(key, value) {
     setSettingStmt.run(key, String(value));
   }
   /**
-   * 记录保留天数（天）：缺省取 DEFAULTS.RETENTION_DAYS（90）；前端改过则优先用落库值，
-   * 并夹在 1~3650。服务端自动清理任务记录以它为准（见 server/src/index.js 的
-   * runRetentionCleanup）—— 这个数一变小，下次清理会**真删**更早的记录。
+   * Record retention days: defaults to DEFAULTS.RETENTION_DAYS (90); if the frontend changed it the
+   * stored value wins, clamped to 1~3650. Server-side automatic cleanup of task records follows this
+   * (see runRetentionCleanup in server/src/index.js) —— the moment this number shrinks, the next cleanup
+   * **really deletes** older records.
    */
   function getRetentionDays() {
     const raw = getSetting('retentionDays');
@@ -1077,16 +1121,19 @@ function createRepo(db) {
     return Math.min(n, 3650);
   }
 
-  /* ============================ 议事厅（Council Chamber） ============================
+  /* ============================ Council Chamber ============================
    *
-   * 自成一套，不掺进上面那张大 stmt 表：议事厅的表与办公室那套（members / tasks /
-   * task_runs / messages）没有任何外键或查询交集，混在一起只会让两边都难读。
-   * 取数一律**按 council_id 走**，没有"按工程 / 按楼层"的入口 —— 这是隔离要求的落点：
-   * 议事厅的数据出不了议事厅页面。
+   * A self-contained set, not mixed into that big stmt table above: the council tables share no foreign
+   * keys and no queries with the office ones (members / tasks / task_runs / messages), and mixing them
+   * would only make both harder to read.
+   * Reads always go **by council_id**, with no "by project / by floor" entry point —— that is where the
+   * isolation requirement lands: council data cannot leave the council page.
    *
-   * 写入顺序是编排器定的（见 server/src/council/orchestrator.js）：
-   *   建会 → 记出席/材料 → 每轮 upsertRound → 每人 insertUtterance → 收尾 finishCouncil。
-   * 这里全是平铺的薄封装，不含业务判断（判票在 council/consensus.js，跑进程在 council/runner.js）。
+   * The write order is the orchestrator's (see server/src/council/orchestrator.js):
+   *   create → record attendance / materials → upsertRound per round → insertUtterance per participant
+   *   → finishCouncil at wrap-up.
+   * Everything here is a thin flat wrapper with no business judgment (vote judging is in
+   * council/consensus.js, running processes is in council/runner.js).
    */
   const councilStmt = {
     insert: db.prepare(`
@@ -1094,7 +1141,7 @@ function createRepo(db) {
       VALUES (@id, @topic, @mode, @workspacePath, 'draft', @threshold, @maxRounds, @createdAt)
     `),
     get: db.prepare(`SELECT * FROM councils WHERE id = ?`),
-    /** 历史列表：按发起时间倒序。不带出席者，列表页要的话再单独取 */
+    /** History list: newest first by start time. Attendance is not included; the list page fetches it separately if needed */
     list: db.prepare(`SELECT * FROM councils ORDER BY created_at DESC LIMIT ?`),
     markRunning: db.prepare(`UPDATE councils SET status = 'running', started_at = ? WHERE id = ? AND status = 'draft'`),
     setRound: db.prepare(`UPDATE councils SET round_current = ? WHERE id = ?`),
@@ -1104,7 +1151,7 @@ function createRepo(db) {
              error = @error, ended_at = @endedAt
        WHERE id = @id
     `),
-    /** 启动对账：上次进程被硬杀时留下的 running 行 —— 如实标成 failed，不假装它还在跑 */
+    /** Startup reconciliation: `running` rows left behind when the last process was hard-killed —— mark them failed honestly, do not pretend they are still running */
     failStaleRunning: db.prepare(`
       UPDATE councils SET status = 'failed', verdict = 'failed', error = @error, ended_at = @at
        WHERE status = 'running'
@@ -1156,7 +1203,7 @@ function createRepo(db) {
     listUtterances: db.prepare(`SELECT * FROM council_utterances WHERE council_id = ? ORDER BY round_no, floor_id`),
   };
 
-  /** 级联删那几张子表（schema.sql 里没建外键，删除顺序就在这看着） */
+  /** Cascade delete of those child tables (no foreign keys in schema.sql, so the delete order is visible right here) */
   const councilChildDeletes = [
     'DELETE FROM council_utterances WHERE council_id = ?',
     'DELETE FROM council_rounds WHERE council_id = ?',
@@ -1167,8 +1214,9 @@ function createRepo(db) {
   /**
    * @param {{id:string, topic:string, threshold:string, maxRounds:number, createdAt:number,
    *          mode?:string, workspacePath?:string|null}} arg
-   *   mode / workspacePath 缺省就是老行为：表决 + 一次性临时目录。调用方（路由）已经把这两项
-   *   校验过了，这里只做"没给就按缺省"的兜底，不做取值判断 —— 那是路由的事。
+   *   mode / workspacePath defaulting is the old behavior: voting + a one-off temp directory. The caller
+   *   (the route) already validated both; this only falls back to the defaults, it makes no value
+   *   judgment —— that is the route's job.
    */
   function createCouncil(arg) {
     councilStmt.insert.run({
@@ -1185,17 +1233,18 @@ function createRepo(db) {
   const getCouncil = (id) => councilStmt.get.get(id) || null;
   /** @param {number} limit */
   const listCouncils = (limit) => councilStmt.list.all(Math.max(1, Math.min(Number(limit) || 50, 500)));
-  /** 把一场会置为 running；已经在跑的（或已结束的）不动，返回是否真的翻过来了 */
+  /** Put a meeting into running; one already running (or finished) is left alone, returns whether it really flipped */
   const markCouncilRunning = (id, at) => councilStmt.markRunning.run(at, id).changes > 0;
   const setCouncilRound = (id, roundNo) => councilStmt.setRound.run(roundNo, id);
   /** @param {{verdict:string, verdictRound?:number|null, error?:string|null, status?:string}} arg */
   function finishCouncil(id, arg) {
     const verdict = arg.verdict;
-    // verdict → status 的对照（三种收尾各归各的，别把"取消"混进"失败"）：
-    //   consensus / no_consensus / reported → done（**谈不拢、以及分析模式"跑完了"都是正常收场**，
-    //                                          不是错误）
+    // verdict → status mapping (each of the three endings goes its own way, do not mix "cancelled" into
+    // "failed"):
+    //   consensus / no_consensus / reported → done (**failing to agree, and analysis mode's "ran
+    //                                          through", are both normal endings**, not errors)
     //   cancelled                          → cancelled
-    //   其余（failed）                      → failed
+    //   anything else (failed)             → failed
     const status =
       arg.status ||
       (verdict === 'consensus' || verdict === 'no_consensus' || verdict === 'reported'
@@ -1213,7 +1262,7 @@ function createRepo(db) {
     });
     return councilStmt.get.get(id);
   }
-  /** 删一场会：连它自己的子表一起删。**返回是否删到了**，路由据此分 404 与 200 */
+  /** Delete a meeting: its own child tables go with it. **Returns whether anything was deleted**, the route distinguishes 404 from 200 on that */
   function deleteCouncil(id) {
     const del = db.transaction((cid) => {
       for (const st of councilChildDeletes) st.run(cid);
@@ -1224,9 +1273,10 @@ function createRepo(db) {
     return n > 0;
   }
   /**
-   * 服务启动时的对账：上一次进程被硬杀（或崩了）时，库里会留下 status='running' 的会，
-   * 那些会议的参与进程早就没了。**如实标成 failed** 并写明原因 —— 不留在那儿假装还在讨论。
-   * @returns {number} 被标掉的行数
+   * Reconciliation at server start: when the last process was hard-killed (or crashed), the DB keeps
+   * meetings with status='running' whose participant processes are long gone. **Mark them failed
+   * honestly** and state the reason —— do not leave them there pretending they are still discussing.
+   * @returns {number} how many rows were marked
    */
   function failStaleCouncils(reason, at) {
     return councilStmt.failStaleRunning.run({ error: reason, at: at != null ? at : Date.now() }).changes;
@@ -1243,7 +1293,7 @@ function createRepo(db) {
   const upsertRound = (r) => councilStmt.upsertRound.run(r);
   const listRounds = (councilId) => councilStmt.listRounds.all(councilId);
 
-  /** 一条发言/一票。取不到的字段一律给 null，别用 0 或空串顶替（0 词元和"读不到词元"不是一回事） */
+  /** One speech / one vote. Any field that cannot be read is given null, never 0 or an empty string (0 tokens and "tokens could not be read" are not the same thing) */
   function insertUtterance(u) {
     councilStmt.insertUtterance.run({
       councilId: u.councilId,
@@ -1255,8 +1305,9 @@ function createRepo(db) {
       voteReason: u.voteReason != null ? u.voteReason : null,
       proposalText: u.proposalText != null ? u.proposalText : null,
       secondFloor: u.secondFloor != null ? u.secondFloor : null,
-      // 分析模式那两列：**没解析出来就是 null**，不是 '{}' —— 界面上"没给要点"与
-      // "给了但三条都空"显示得不一样（见 schema.sql 里 findings_json 的注释）
+      // Those two analysis-mode columns: **nothing parsed means null**, not '{}' —— "gave no points" and
+      // "gave points but all three are empty" display differently (see the notes on findings_json in
+      // schema.sql)
       stance: u.stance != null ? u.stance : null,
       findingsJson: u.findingsJson != null ? u.findingsJson : null,
       status: u.status || 'ok',

@@ -1,56 +1,60 @@
 'use strict';
 
 /**
- * 7F Kilo Code 的数据源 —— 读 Kilo 自己落盘的 SQLite，不接 hook。
+ * 7F Kilo Code's data source — reads Kilo's own SQLite on-disk state; no hook involved.
  *
- * **Kilo Code 没有 hook 子系统**（实测 7.8.1）：`kilo --help` 只有 acp / mcp / session /
- * serve / plugin 等命令，既没有 `hooks.json` 这种配置文件，也没有任何可挂命令的事件点。
- * 所以 7F 与 1F~4F / 6F 的 hook 上报路线**在结构上就不同**：没有上报、没有心跳，
- * 只能由服务端**轮询**它的落盘。
+ * **Kilo Code has no hook subsystem** (measured on 7.8.1): `kilo --help` only offers acp / mcp / session /
+ * serve / plugin and so on — no `hooks.json` config file, and no event point where a command could be
+ * attached. So 7F is **structurally different** from the hook-reporting path of 1F~4F / 6F: no reporting,
+ * no heartbeat, only the server **polling** its on-disk state.
  *
- * 好在 Kilo 的落盘比 Qoder（6F）丰富得多 —— 它是一份 **event-sourced SQLite**
- * （`~/.local/share/kilo/kilo.db`，WAL 模式），而不是"只有文件 mtime"的 jsonl：
+ * Fortunately Kilo's on-disk state is far richer than Qoder's (6F) — it is an **event-sourced SQLite**
+ * (`~/.local/share/kilo/kilo.db`, WAL mode), not a jsonl of "file mtimes only":
  *
- *   session        id / project_id / directory（工程路径）/ title / agent / model
+ *   session        id / project_id / directory (project path) / title / agent / model
  *                  / time_updated / summary_additions|deletions|files / cost / tokens_*
- *   event          append-only 事件流，aggregate_id = 会话 id、seq 单调递增、data 存 JSON：
- *                  part.type ∈ tool|text|reasoning|step-start|step-finish|patch，
- *                  part.tool、part.state.status ∈ running|pending|completed|error、
- *                  part.time.start|end
- *   message        role ∈ user|assistant，data JSON 里带 path.cwd（工程路径）、
- *                  time.created|completed、finish ∈ stop|tool-calls|length|content-filter
- *   project        id / worktree（工程路径）；project_directory 另记了 worktree 子目录
+ *   event          append-only event stream, aggregate_id = session id, seq monotonically increasing,
+ *                  data holds JSON: part.type ∈ tool|text|reasoning|step-start|step-finish|patch,
+ *                  part.tool, part.state.status ∈ running|pending|completed|error, part.time.start|end
+ *   message        role ∈ user|assistant, data JSON carries path.cwd (project path),
+ *                  time.created|completed, finish ∈ stop|tool-calls|length|content-filter
+ *   project        id / worktree (project path); project_directory additionally records worktree subdirs
  *   todo           session_id / content / status / priority / position
  *
- * 因此 7F 的相位是**推导出来的真值**，不是像 5F TraeCode 那样拿文件时间瞎猜：
- *   最新事件 part.type=tool 且 state.status=running  → 调用工具（带 part.tool）
- *   最新事件 part.type=tool 且 state.status=pending  → 等待授权（工具还没放行）
- *   最新事件 part.type=tool 且 state.status=error    → 出错了
- *   最新事件 part.type=reasoning                    → 思考中
- *   最新事件 part.type=patch                        → 调用工具（正在落盘改动）
- *   最新事件 part.type=text                          → 待命（刚吐完一段文字）
- *   step-start / step-finish / 工具 completed         → **不是相位**，跳过继续往更旧处找
+ * So 7F's phase is **inferred truth**, not a blind guess from file times like 5F TraeCode:
+ *   newest event part.type=tool and state.status=running  → calling a tool (with part.tool)
+ *   newest event part.type=tool and state.status=pending  → awaiting authorization (tool not released yet)
+ *   newest event part.type=tool and state.status=error    → error
+ *   newest event part.type=reasoning                     → thinking
+ *   newest event part.type=patch                         → calling a tool (flushing changes to disk)
+ *   newest event part.type=text                           → idle (just emitted a chunk of text)
+ *   step-start / step-finish / a completed tool          → **not a phase**: skip and keep looking backwards
  *
- * 为什么 step-* 不映射成「规划中 / 汇总中」：实测一个会话里 step-start 363 次、
- * step-finish 361 次（对照 tool 2677 次、text 463 次），基本是每轮 assistant 输出前后各一条
- * —— 那是「一步」的边界**记账**，不是 agent 在规划或在收尾。硬套的后果是：每次工具刚跑完、
- * 最新事件恰好落在 step-finish 上时，控制台就一直卡在「汇总中」—— 而那恰恰是
- * "这一步跑完了、正要进入下一步"的时刻。推不出来就别推（见下方 step 分支的注释）。
+ * Why step-* is not mapped to "planning / summarizing": one measured session had step-start 363 times and
+ * step-finish 361 times (against tool 2677, text 463) — basically one of each around every assistant
+ * output. Those are **bookkeeping markers** for the boundary of "a step", not the agent planning or
+ * wrapping up. Hard-mapping them means: every time a tool has just finished and the newest event happens
+ * to be a step-finish, the console sticks on "summarizing" — which is exactly the moment "this step is
+ * done, about to enter the next". If it cannot be inferred, do not infer it (see the step branch below).
  *
- * **纪律（对齐 requirements.md §P0-6「绝不编造」）**：一切相位都带 `inferred: true`。
- * 我们是**轮询**读它的库，不是它主动上报的，所以"上一条事件长什么样"只能推断"现在大致在干嘛"，
- * 中间可能有轮询间隔内已经开始的新一轮。UI 按"推断"灰显，与 5F / CLI 落盘楼层同等待遇。
+ * **Discipline (aligned with requirements.md §P0-6 "never fabricate")**: every phase carries
+ * `inferred: true`. We **poll** its store; it does not report to us, so "what the last event looked like"
+ * can only suggest "roughly what it is doing now", and a new turn may have started inside the poll
+ * interval. The UI greys it out as "inferred", the same treatment as 5F / the CLI disk floors.
  *
- * 读法上三条纪律：
- *   1) **一律只读打开**（readonly + fileMustExist）。Kilo 的 daemon 正在写这个库，
- *      只读连接在 WAL 下不阻塞它、也不会被它写坏；读不到就当"没数据"，绝不写。
- *   2) **短超时**（3s）。被 Kilo 的 checkpoint / 迁移占住时立刻放弃 —— 宁可这轮
- *      没有相位，也不能把整个会话表（渲染层 1.5s 轮询一次）拖死。
- *   3) **扫表失败不许冒泡**。这个库是别的产品的私有存储，Kilo 改版换表名是迟早的事；
- *      读不出来就回空，让 7F 显示"没接上"，而不是把 /api/v1/sessions 打成 500。
+ * Three rules on how to read:
+ *   1) **Always open read-only** (readonly + fileMustExist). Kilo's daemon is writing this db; a read-only
+ *      connection does not block it under WAL and cannot be corrupted by it; unreadable means "no data",
+ *      never write.
+ *   2) **Short timeout** (3s). If Kilo's checkpoint / migration holds it, give up at once — better to lose
+ *      a phase this round than to stall the whole session table (the render layer polls every 1.5s).
+ *   3) **A failed scan must never bubble.** This db is another product's private store; Kilo renaming tables
+ *      is only a matter of time; unreadable → return empty and let 7F show "not connected", rather than
+ *      turning /api/v1/sessions into a 500.
  *
- * 缓存：会话表 5s（与 sessions.js / sessionRegistry 的 TTL 同量级）。
- * 相位与完成标记**不缓存** —— 渲染层 1.5s 拉一次，宁可每次多读一次库。
+ * Caching: session table 5s (same order as sessions.js / sessionRegistry's TTL).
+ * Phase and done markers are **not cached** — the render layer pulls every 1.5s, so rather read the db once
+ * more each time.
  */
 
 const os = require('node:os');
@@ -59,13 +63,15 @@ const { resolveProjectName } = require('./project');
 const { DEFAULTS, formToSource } = require('@workgremlin/shared');
 const { openReadonly, readOne } = require('./dbReadonly');
 const { isFile } = require('./roots');
-// 静态 subagent 目录（项目级 / 用户级）：本楼层私有知识，放这里而非中央 agentLevel
+// Static subagent dirs (project level / user level): private knowledge of this floor, kept here rather than
+// in the central agentLevel
 const { genericAgentDirs } = require('./ingest/agentLevel');
 
 /**
- * 7F 的静态 subagent 定义目录。Kilo Code 目前没有"用户级 / 项目级 agent 定义文件"这套机制
- * （其 agent 配置走别处，不在 <点目录>/agents 下），这里返回 []，不扫盘。若将来 Kilo 在某目录
- * 放 agent 定义，在这里显式给目录即可（与 CodeBuddy / Codex / Claude 同接口）。
+ * 7F's static subagent definition dirs. Kilo Code currently has no "user-level / project-level agent
+ * definition file" mechanism (its agent config lives elsewhere, not under <dot dir>/agents), so this
+ * returns [] and scans nothing. If Kilo ever puts agent definitions in a directory, just name that dir
+ * here (same interface as CodeBuddy / Codex / Claude).
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
 function agentDirs() {
@@ -76,7 +82,7 @@ const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const IS_WIN = process.platform === 'win32';
 
 /**
- * 7F Kilo Code 楼层元数据（原 products.js 的 7F 条目）。CLI 与 IDE 扩展合并楼层。
+ * 7F Kilo Code floor metadata (the old products.js 7F entry). CLI and IDE extension share one floor.
  */
 const meta = {
   id: '7F',
@@ -85,7 +91,7 @@ const meta = {
   cmd: 'kilo',
   agent: 'kilo',
   plugin: false,
-  // 同 3F/4F：VS Code 扩展 kilocode.kilo-code-* 也是这一层的安装证据。
+  // Same as 3F/4F: the VS Code extension kilocode.kilo-code-* is install evidence for this floor too.
   altPluginRe: /^kilocode\./i,
   sources: [
     {
@@ -95,33 +101,35 @@ const meta = {
       dirs: [kiloHome()],
       note: '这一路读的是数据根里的 kilo.db（SQLite），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
-    // hook 那一路：装了 WorkGremlin 插件时的真相位一路（client 恒为楼层基名 kilo，形态 form=vscode）
+    // The hook path: the truth path when the WorkGremlin plugin is installed (client is always the floor
+    // base name kilo, form=vscode)
     { kind: 'hook', form: 'vscode' },
   ],
   hookSource: true,
   dataKind: 'kilo',
-  // Kilo CLI 自己的安装目录（PATH 查不到时兜底）
+  // Kilo CLI's own install dir (fallback when PATH lookup fails)
   cliBinDirs: [path.join(HOME, '.kilo', 'bin')],
 };
 
-/** 打开只读连接的超时；被 Kilo 占住就放弃这一轮 */
+/** Timeout for opening a read-only connection; if Kilo holds the db, skip this round */
 const OPEN_TIMEOUT_MS = 3_000;
-/** 会话表缓存（会话变化比相位慢，5s 足够；与 sessionRegistry 的 TTL 同量级） */
+/** Session table cache (sessions change slower than phases, 5s is enough; same order as sessionRegistry's TTL) */
 const TTL = 5_000;
 
 let cache = { at: 0, key: '', value: null };
 
-/* ------------------------------ 定位落盘 ------------------------------ */
+/* ------------------------------ Locating the on-disk state ------------------------------ */
 
 /**
- * Kilo 的数据根（XDG 规范，Kilo 用的是平台标准目录，不是 ~/.kilo 那种隐藏目录）。
+ * Kilo's data root (XDG convention — Kilo uses the platform standard dir, not a hidden ~/.kilo).
  *
- * 认三个来源，优先级从高到低：
- *   1. `WORKGREMLIN_KILO_HOME` —— 显式指定（测试 / 非标准安装 / 用户自己挪过盘）
- *   2. `XDG_DATA_HOME/kilo`   —— XDG 标准位置
- *   3. 平台默认（见下）
- * `~/.kilo` **不**是数据根：实测那个目录只有安装期留下的 `bin/`（还常常是空的），
- * 会话、日志、快照、SQLite 全都在数据根下。把它当落盘会显示成"装了但 0 个会话"。
+ * Three sources, highest priority first:
+ *   1. `WORKGREMLIN_KILO_HOME` — explicit override (tests / non-standard installs / user moved the data)
+ *   2. `XDG_DATA_HOME/kilo`   — the XDG standard location
+ *   3. Platform default (see below)
+ * `~/.kilo` is **not** the data root: measured, that dir only holds `bin/` left by the installer (often
+ * empty); sessions, logs, snapshots and the SQLite all live under the data root. Treating it as the disk
+ * source shows "installed but 0 sessions".
  */
 function kiloHome() {
   const env = String(process.env.WORKGREMLIN_KILO_HOME || '').trim();
@@ -137,7 +145,7 @@ function kiloHome() {
   return path.join(HOME, '.local', 'share', 'kilo');
 }
 
-/** 事件库的绝对路径；文件不存在回空串（Kilo 没装 / 没跑过） */
+/** Absolute path of the event db; empty string when the file is missing (Kilo not installed / never run) */
 function kiloDbPath() {
   const explicit = String(process.env.WORKGREMLIN_KILO_DB || '').trim();
   const p = explicit ? path.resolve(explicit) : path.join(kiloHome(), 'kilo.db');
@@ -145,8 +153,8 @@ function kiloDbPath() {
 }
 
 /**
- * 会话标题（7F Kilo Code）：SQLite session.title。
- * 原 sessionTitle.js 的 kiloTitleOf 搬到这里 —— 调试 7F 标题不必碰中央文件。
+ * Session title (7F Kilo Code): SQLite session.title.
+ * Moved here from the old sessionTitle.js's kiloTitleOf — debugging 7F titles no longer touches a central file.
  * @param {string|null|undefined} sessionId
  * @returns {string}
  */
@@ -167,31 +175,33 @@ function sessionTitle(sessionId) {
   }
 }
 
-/** 把绝对路径缩成 ~ 开头（UI 里好读） */
+/** Shorten an absolute path to start with ~ (easier to read in the UI) */
 function shorten(p) {
   if (!p) return '';
   if (HOME && p.startsWith(HOME)) return `~${p.slice(HOME.length)}`;
   return p;
 }
 
-/* ------------------------------ 只读连接 ------------------------------ */
+/* ------------------------------ Read-only connection ------------------------------ */
 
 /**
- * 开一个**只读**连接；拿不到（Kilo 没跑过 / 库被锁 / 表结构变了）一律回 null。
+ * Open a **read-only** connection; anything that fails (Kilo never ran / db locked / schema changed)
+ * returns null.
  *
- * 只读是硬要求，不是省事：Kilo 的 daemon 正在写这个库，我们绝不能因为一个监控端
- * 去锁它、也绝不能把它写坏。WAL 模式下只读连接不阻塞写入方，两者可以并存。
+ * Read-only is a hard requirement, not a convenience: Kilo's daemon is writing this db, and a monitoring
+ * side must never lock it nor corrupt it. Under WAL a read-only connection does not block the writer; both
+ * can coexist.
  */
 function openDb() {
   const file = kiloDbPath();
   if (!file) return null;
   let Database;
   try {
-    // better-sqlite3 是 server 的既有依赖（见 server/src/db/index.js），走工作区那份，
-    // 不在适配器里自己编译一份原生模块。
+    // better-sqlite3 is an existing server dependency (see server/src/db/index.js); use the workspace copy
+    // rather than compiling another native module inside the adapter.
     Database = require('better-sqlite3');
   } catch {
-    return null; // 原生模块没编出来：7F 读不了，其余楼层照常
+    return null; // Native module not built: 7F cannot read, the other floors carry on
   }
   try {
     return new Database(file, { readonly: true, fileMustExist: true, timeout: OPEN_TIMEOUT_MS });
@@ -201,7 +211,7 @@ function openDb() {
 }
 
 /**
- * 在只读连接上跑一条查询；表不存在 / SQL 不对（Kilo 改版换表）都回 null。
+ * Run one query on a read-only connection; a missing table / bad SQL (Kilo renamed tables) returns null.
  * @param {(db: any) => any} fn
  * @returns {any|null}
  */
@@ -211,18 +221,19 @@ function query(fn) {
   try {
     return fn(db);
   } catch {
-    return null; // 读不出来就是"没数据"，不冒泡（见文件头纪律 3）
+    return null; // Unreadable means "no data"; never bubble (see file-header rule 3)
   } finally {
     try {
       db.close();
     } catch {
-      /* 关不掉无所谓，已经拿到结果 */
+      /* Failing to close is fine, the result is already in hand */
     }
   }
 }
 
 /**
- * 库里到底有没有这些表 —— 用来给前端一句"这一路读不出会话"的说明 */
+ * Whether these tables actually exist in the db — used to give the frontend one line saying
+ * "this path cannot read sessions" */
 function hasCoreTables() {
   return query((db) => {
     const names = db
@@ -234,10 +245,11 @@ function hasCoreTables() {
 }
 
 /**
- * part.text 的剥壳：实测 Kilo 存进去的值带一层 JSON 引号（`'"…"'`），
- * 先按 JSON 剥一层，剥不掉就用原文。
+ * Unwrapping part.text: measured, Kilo stores the value with an extra layer of JSON quoting (`'"…"'`);
+ * strip one JSON layer, and fall back to the raw text when that fails.
  *
- * 压空白与截断留给调用方 —— 各处上限不同（屏上那句 80 字，台账的收尾自述 4000 字）。
+ * Whitespace collapsing and truncation are left to the caller — limits differ (80 chars for the on-screen
+ * line, 4000 for the ledger's closing summary).
  * @param {string} raw
  * @returns {string}
  */
@@ -248,25 +260,27 @@ function unquoteText(raw) {
     const un = JSON.parse(s);
     if (typeof un === 'string') return un.trim();
   } catch {
-    /* 不是 JSON 包裹的，原样用 */
+    /* Not JSON-wrapped → use as is */
   }
   return s;
 }
 
 /**
- * 这一轮**用户说的话**（「思考中」时主控制台屏上显示的那句）。
+ * What **the user said** this turn (the line on the main console's "thinking" screen).
  *
- * 取法：event 里 role=user 的 text part，按 seq 倒序取最新一条 —— 用户原话就在
- * `part.text` 里（实测值带一层 JSON 引号，要剥掉），这与插件那一路
- * （plugin/index.js 的 role==='user' 分支）是同一个信号，只是这里从库里读而不是从事件流收。
+ * How: the event's text part with role=user, newest first by seq — the user's exact words sit in
+ * `part.text` (measured value carries an extra JSON quote layer, strip it). This is the same signal as the
+ * plugin path (the role==='user' branch in plugin/index.js), just read from the db instead of received from
+ * the event stream.
  *
- * 为什么轮询这一路也要有它：早先 `readKiloPhase` 每个分支都写死 `prompt: ''`，
- * 于是 7F 的「思考中」屏上**一个字都没有**。别的楼层不空，是因为它们的 hook 把
- * 用户原话以 `taskTitle` 写进状态文件，服务端 `readReporterPhase` 读出来当 prompt
- * （见 sessions.js 的 winPrompt）。7F 没装插件时没有那份状态文件，就只能自己从库里取 ——
- * 取的是用户自己的原话，不是编的。
+ * Why the polling path needs it too: `readKiloPhase` used to hardcode `prompt: ''` in every branch, so 7F's
+ * "thinking" screen showed **nothing at all**. Other floors are non-empty because their hook writes the
+ * user's words into the state file as `taskTitle` and the server's `readReporterPhase` reads it back as
+ * prompt (see winPrompt in sessions.js). With no plugin installed, 7F has no state file, so it must read
+ * from the db itself — and what it reads is the user's own words, not an invention.
  *
- * 取不到（表缺 / 没有用户消息 / JSON 坏了）一律回空串：宁可空屏，不拿会话标题顶替。
+ * Unavailable (missing table / no user message / broken JSON) → empty string: better a blank screen than
+ * substituting the session title.
  * @param {string} sessionId
  * @returns {string}
  */
@@ -296,27 +310,29 @@ function readRoundPrompt(sessionId) {
   }
 }
 
-/* ------------------------------ 逐轮清单（7F 台账用） ------------------------------ */
+/* ------------------------------ Per-turn listing (for 7F's ledger) ------------------------------ */
 
 /**
- * 一轮"算不算收工"的窗口。
+ * The window after which a turn "counts as finished".
  *
- * **不要和 `PHASE_FRESH_MS`（2 分钟）混用**：那个管"屏上现在显什么相位"，
- * 这个管"这一轮完了没有"。实测这条会话的同一轮里有过 **780 秒**的生成间隔
- * （慢速 free 模型：一条 assistant 消息 06:17:37 → 06:30:37 才写完），
- * 拿 2 分钟当收工窗口会把正在跑的轮判成"没干完就断了"。
- * 窗口短了会翻转（运行中↔已取消），长了会让中断的轮多挂一会儿 —— 取 10 分钟。
+ * **Do not confuse it with `PHASE_FRESH_MS` (2 minutes)**: that governs "what phase to show on screen now",
+ * this governs "is this turn over". Measured, one turn of this session had a **780-second** generation gap
+ * (a slow free model: one assistant message ran 06:17:37 → 06:30:37), so using 2 minutes as the finish
+ * window would judge a running turn as "dropped before finishing".
+ * A short window flips state (running ↔ cancelled), a long one keeps interrupted turns hanging a bit
+ * longer — 10 minutes it is.
  */
 const ROUND_IDLE_MS = 10 * 60_000;
 
-/** part.data.files 是 JSON 数组（Kilo 自己记的改动文件，实测绝对路径）；形状不对就当没有 */
+/** part.data.files is a JSON array (Kilo's own record of changed files, absolute paths measured);
+ *  a wrong shape counts as none */
 function filesOf(raw) {
   if (!raw) return [];
   let arr = null;
   try {
     arr = JSON.parse(String(raw));
   } catch {
-    return []; // 半截 / 非 JSON：不猜
+    return []; // Truncated / not JSON: do not guess
   }
   if (typeof arr === 'string') arr = [arr];
   if (!Array.isArray(arr)) return [];
@@ -324,39 +340,43 @@ function filesOf(raw) {
 }
 
 /**
- * 这条会话**逐轮**的用户任务清单（7F 台账按「每一轮一条」记账用，口径与 8F 的
- * `readOpencodeTurns` 对齐）。
+ * The per-turn list of user tasks for this session (7F's ledger books "one row per turn"; same rule as 8F's
+ * `readOpencodeTurns`).
  *
- * 轮的边界：`message` 表里 `role='user'` 的消息起一轮，`startedAt` 取它的 `time_created`
- * —— 这个值**不可变**，所以 9F Copilot 那条"起点被insertTask的 COALESCE 钉住、
- * 只好删行重建"的补丁 7F 不需要。
+ * Turn boundary: a `role='user'` message in the `message` table starts a turn; `startedAt` is its
+ * `time_created` — that value is **immutable**, so 7F does not need 9F Copilot's patch ("the start got pinned
+ * by insertTask's COALESCE, so delete and rebuild the row").
  *
- * 轮的收口：复用 `turnIsOver`（与 `readKiloDone` 判完成、插件判收工同一口径）。
- * 有终态 finish 的按 finish 映射（stop → done，length / content-filter → cancelled），
- * **没有终态又不是最后一轮**的按 cancelled 记 —— 那一轮要么是用户按了 ESC（插件那一路
- * 才写得出取消标记，见 NO_DONE 的说明），要么是进程没了，两种都是"没干完"。
+ * Turn close: reuse `turnIsOver` (the same rule `readKiloDone` uses to judge completion and the plugin uses
+ * to judge closing). A terminal finish maps by finish (stop → done, length / content-filter → cancelled);
+ * a turn with **no terminal state that is not the last one** is booked as cancelled — either the user hit
+ * ESC (only the plugin path can write a cancel marker, see NO_DONE) or the process is gone; both are
+ * "did not finish".
  *
- * 注意 **`session_message` 表在 Kilo 是空的**（实测 0 行）—— 8F OpenCode 的轮次从那张表读，
- * 7F 只能从 `message` + `part` 拼，别照抄。
+ * Note that **`session_message` is empty in Kilo** (measured 0 rows) — 8F OpenCode reads turns from that
+ * table, 7F can only assemble them from `message` + `part`; do not copy blindly.
  *
- * 读不出来（库没装 / 表被改 / JSON 坏了）一律回空数组 —— 绝不冒泡（文件头纪律 3）。
- * `message` 表缺了就真没有轮；`part` 表缺了只是 prompt / files / result 为空，轮还在。
+ * Unreadable (db missing / tables renamed / broken JSON) → empty array; never bubble (file-header rule 3).
+ * A missing `message` table means there truly are no turns; a missing `part` table only empties prompt /
+ * files / result while the turns remain.
  * @param {string} sessionId
  * @returns {Array<{index:number, prompt:string, startedAt:number, endedAt:number|null,
  *   outcome:'running'|'done'|'cancelled', files:string[], result:string}>}
  */
 /**
- * 把一条 assistant 消息的 `data.tokens` 折进本轮的累计。
+ * Fold one assistant message's `data.tokens` into this turn's running total.
  *
- * 库里那一项的形状是 `{total, input, output, reasoning, cache:{read,write}}`，语义**与 Claude 一致**
- * （`input` 不含缓存、`reasoning` 单列）：全库实测 `input+output+reasoning+read+write == total`
- * （590 条里 589 条精确成立，1 条差 26 —— Kilo 自己写的，不是我们算的）。
+ * That field's shape in the db is `{total, input, output, reasoning, cache:{read,write}}`, with **the same
+ * semantics as Claude** (`input` excludes cache, `reasoning` is separate): across the whole db,
+ * `input+output+reasoning+read+write == total` (exact in 589 of 590 rows, one off by 26 — Kilo wrote that,
+ * not us).
  *
- * 折法只有一处选择：**reasoning 并进 output**。因为对账的另一头 Claude 的 `output_tokens`
- * 本来就含思考（`output_tokens_details.thinking_tokens` 是它的明细），Codex 的 `output_tokens`
- * 同理（`reasoning_output_tokens` 含在里面）。留着单列，同一列在 7F/8F 会凭空少一截。
- * @param {{input:number,output:number,cacheRead:number,cacheWrite:number}} acc 本轮累计（原地改）
- * @param {any} t 一条消息的 data.tokens（形状不对就当没有）
+ * Only one folding choice: **reasoning goes into output**. The counterpart on the other side of the
+ * reconciliation, Claude's `output_tokens`, already includes thinking (`output_tokens_details.thinking_tokens`
+ * is its breakdown), and Codex's `output_tokens` likewise (`reasoning_output_tokens` is inside it). Keeping it
+ * separate would silently shorten that one column on 7F/8F.
+ * @param {{input:number,output:number,cacheRead:number,cacheWrite:number}} acc this turn's total (mutated in place)
+ * @param {any} t one message's data.tokens (a wrong shape counts as none)
  */
 function foldKiloTokens(acc, t) {
   if (!t || typeof t !== 'object') return acc;
@@ -368,13 +388,15 @@ function foldKiloTokens(acc, t) {
   return acc;
 }
 
-/** 非负数才认（与 reporter/src/usage.js 的 num 同口径：缺字段就是没有，不拿别的顶上） */
+/** Only non-negative numbers count (same rule as num in reporter/src/usage.js: a missing field means none,
+ *  never substitute something else) */
 function posNum(v) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/** 这份累计里真有数吗 —— 四项全 0 就是"没读到"，不是"消耗为零"（见调用处的 return） */
+/** Does this total hold real numbers — all four zero means "not read", not "consumed nothing"
+ *  (see the return at the call site) */
 function hasTokens(t) {
   return Boolean(t) && t.input + t.output + t.cacheRead + t.cacheWrite > 0;
 }
@@ -382,11 +404,12 @@ function hasTokens(t) {
 function readKiloRounds(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return [];
-  // 两条语句走**同一次** query()（只读连接开一次就够；part 表在 session_id 上没有索引，
-  // 整表扫一次约 5ms，别开第二条连接再扫一遍）。
+  // Both statements run inside **one** query() (one read-only connection is enough; the part table has no
+  // index on session_id and a full scan costs ~5ms, so do not open a second connection and scan again).
   const data = query((db) => {
     const out = { msgs: [], parts: [] };
-    // 各自 try/catch：part 表缺了轮还在，message 表缺了才是真没有
+    // Separate try/catch: without the part table turns still exist; without the message table there truly
+    // are none
     try {
       out.msgs = db
         .prepare(
@@ -398,7 +421,7 @@ function readKiloRounds(sessionId) {
       out.msgs = [];
     }
     try {
-      // 只 json_extract、不整行 parse：tool part 的 data 里塞着几 KB 的工具输出
+      // Only json_extract, never parse the whole row: a tool part's data holds several KB of tool output
       out.parts = db
         .prepare(
           `SELECT p.message_id AS messageId,
@@ -427,7 +450,8 @@ function readKiloRounds(sessionId) {
     partsByMsg.get(k).push(p);
   }
 
-  /** 这一轮里各条 part 的时间也要算进 lastAt（工具跑完的时刻比消息的 time_updated 更贴） */
+  /** Each part's time in this turn must also fold into lastAt (when a tool finished hugs reality closer
+   *  than the message's time_updated) */
   const foldAt = (round, own) => {
     for (const p of own) round.lastAt = Math.max(round.lastAt, Number(p.at) || 0);
   };
@@ -439,14 +463,14 @@ function readKiloRounds(sessionId) {
     try {
       md = JSON.parse(String(m.data || ''));
     } catch {
-      md = null; // 坏 JSON：这条消息的 role/finish 读不出，但它的 part 仍然算时间
+      md = null; // Broken JSON: this message's role/finish is unreadable, but its parts still count for time
     }
     if (!md || typeof md !== 'object') md = {};
     const own = partsByMsg.get(String(m.id)) || [];
     const at = Number(m.updatedAt) || Number(m.createdAt) || 0;
 
     if (String(md.role || '') === 'user') {
-      // 这一轮用户说的话：它的 text part（Kilo 可能拆成多条，取第一条非空的）
+      // What the user said this turn: its text part (Kilo may split it into several; take the first non-empty)
       let prompt = '';
       for (const p of own) {
         if (String(p.type || '') !== 'text') continue;
@@ -456,9 +480,10 @@ function readKiloRounds(sessionId) {
           break;
         }
       }
-      // **没有 text part 的 user 消息不是新任务**，是 Kilo 自己的 compaction 注入
-      // （全库实测只有一条，紧跟在被打断的那一轮之后）—— 折进当前轮，不新起 index。
-      // 真的连一轮都还没开始（会话头就是它）才拿它当一轮，免得这几条消息无处安放。
+      // A user message **without a text part is not a new task** — it is Kilo's own compaction injection
+      // (measured: exactly one in the whole db, right after an interrupted turn) → fold into the current
+      // turn, do not start a new index. Only when no turn has started yet (it sits at the head of the
+      // session) treat it as one, so those messages have somewhere to go.
       if (!prompt && cur) {
         cur.lastAt = Math.max(cur.lastAt, at);
         foldAt(cur, own);
@@ -480,10 +505,10 @@ function readKiloRounds(sessionId) {
       continue;
     }
 
-    if (!cur) continue; // 会话开头不是 user 消息的，不编一轮
+    if (!cur) continue; // A session not starting with a user message → do not invent a turn
     cur.lastAt = Math.max(cur.lastAt, at);
     foldAt(cur, own);
-    // 本轮的 token 消耗：assistant 消息的 data.tokens 逐条累加（user 消息没有这一项）
+    // This turn's token usage: accumulate data.tokens from assistant messages (user messages lack it)
     foldKiloTokens(cur.tokens, md.tokens);
     if (turnIsOver(m.data)) cur.over = true;
     const fin = String(md.finish || '');
@@ -491,13 +516,14 @@ function readKiloRounds(sessionId) {
     for (const p of own) {
       const t = String(p.type || '');
       if (t === 'text') {
-        // 这一轮的收尾自述：后面的消息会覆盖前面的，最终留下"最后那条消息说的话"
-        // （与 8F:opencode.js 和插件那一路同口径）
+        // This turn's closing summary: later messages overwrite earlier ones, so what remains is "what the
+        // last message said" (same rule as 8F:opencode.js and the plugin path)
         const said = unquoteText(p.text);
         if (said) cur.result = said.replace(/\s+/g, ' ').trim().slice(0, 4_000);
       } else if (t === 'patch') {
-        // 改动文件只认 patch part —— **不认工具入参**：read / grep 这些只读工具也带
-        // filePath，拿它当"改动"会把只读过的文件算进「本轮改动」
+        // Changed files come only from patch parts — **not from tool input**: read / grep and other read-only
+        // tools also carry filePath, so treating them as "changes" would count merely-read files as
+        // "changed this turn"
         for (const f of filesOf(p.files)) cur.files.add(f);
       }
     }
@@ -508,11 +534,12 @@ function readKiloRounds(sessionId) {
   return rounds.map((r, i) => {
     const next = rounds[i + 1];
     const isLast = i === rounds.length - 1;
-    // "还在飞" = 最后一轮 + 没有终态 finish + 窗口内还有动静。
-    // 非最后一轮的必然已收工（后面已经开了新的一轮），不看窗口。
+    // "Still in flight" = it is the last turn + no terminal finish + there was movement inside the window.
+    // A non-last turn is necessarily finished (a new turn has already started), so no window check.
     const running = isLast && !r.over && now - r.lastAt < ROUND_IDLE_MS;
     const outcome = running ? 'running' : r.over ? (r.finish === 'stop' ? 'done' : 'cancelled') : 'cancelled';
-    // 收工时刻夹一下：流式 assistant 消息的 time_updated 可能晚于下一条用户消息的时间
+    // Clamp the finish moment: a streaming assistant message's time_updated may be later than the next
+    // user message
     const endedAt =
       outcome === 'running'
         ? null
@@ -525,17 +552,17 @@ function readKiloRounds(sessionId) {
       outcome,
       files: [...r.files],
       result: r.result,
-      // 本轮消耗的 token（语义见 foldKiloTokens）。四项全 0 = 这一轮库里一条 tokens 都没有
-      // （Kilo 老版本不写这一项、或这一轮还没跑完一次请求）→ **null**，让台账留空，
-      // 而不是写 4 个 0 冒充"消耗为零"。
+      // This turn's token usage (semantics in foldKiloTokens). All four zero = the db has no tokens for this
+      // turn at all (old Kilo versions do not write it, or this turn has not completed a request yet) →
+      // **null**, leaving the ledger blank instead of writing four zeros that fake "consumed nothing".
       tokens: hasTokens(r.tokens) ? r.tokens : null,
     };
   });
 }
 
-/* ------------------------------ 会话清单 ------------------------------ */
+/* ------------------------------ Session listing ------------------------------ */
 
-/** 库里 model 字段是 JSON 字符串，取出 id 给人看（取不到就留空，不猜） */
+/** The model column in the db is a JSON string; extract the id for humans (empty when unreadable, no guessing) */
 function modelIdOf(raw) {
   try {
     const j = JSON.parse(String(raw || ''));
@@ -546,32 +573,35 @@ function modelIdOf(raw) {
 }
 
 /**
- * Kilo 的全部会话（未归档），按最近更新倒序。
+ * All of Kilo's sessions (not archived), newest update first.
  *
- * 过滤口径：`time_archived IS NULL` —— 归档掉的会话不算"在跑"（用户手动 `kilo session delete`
- * 之后 Kilo 会打这个时间戳）。归档列是 7.8.1 才有的，老版本没有这一列时 SQL 会报错，
- * 整条查询回 null（→ 7F 显示"没接上"），而不是悄悄按"全部会话"放行。
+ * Filter rule: `time_archived IS NULL` — archived sessions do not count as "running" (Kilo stamps this
+ * after the user runs `kilo session delete`). The archive column only exists since 7.8.1; on older versions
+ * the SQL errors and the whole query returns null (→ 7F shows "not connected") rather than silently
+ * releasing "all sessions".
  *
- * 字段映射（→ sessionRegistry 的会话行）：
- *   id → 会话 id（轴 2，Kilo 的 ses_xxx 就是 hook 意义上的 session_id）
- *   directory → 工程路径（Kilo 每条会话都记了自己的工作目录，比 project.worktree 更准 ——
- *               worktree 子会话跑在别处时 directory 才是真的）
- *   time_updated → 最后活动时间（Kilo 每写一条消息/事件都推进它，比翻文件时间准）
+ * Field mapping (→ sessionRegistry session row):
+ *   id → session id (axis 2; Kilo's ses_xxx is the hook sense of session_id)
+ *   directory → project path (Kilo records each session's own working dir, more accurate than
+ *               project.worktree — when a worktree sub-session runs elsewhere, directory is the real one)
+ *   time_updated → last activity (Kilo advances it on every message/event, more accurate than file times)
  *
- * **议事厅的参与者不进这张表**（`title = COUNCIL_SESSION_TITLE` 的直接跳过）：
- * 工程模式下参与者的 cwd 就是用户的工程，会话会带着真实工程路径落进这个库 ——
- * 不挡的话它当场变成办公室 7F 上多出来的一个"会话"，而 requirements.md §15.2 白纸黑字写着
- * 「一场会开完，办公室那页看不出任何痕迹」。挡的**依据是标题**（参与者是我们自己拉起来的，
- * 标题由 council/agents.js 指定），不改库、不必知道议事厅的状态，所以这条过滤在
- * "这一场会还在不在跑"之外也成立。
+ * **Council participants do not enter this table** (rows with `title = COUNCIL_SESSION_TITLE` are skipped
+ * outright): in project mode a participant's cwd is the user's project, so its session lands in this db
+ * carrying a real project path — unblocked, it instantly becomes an extra "session" on the office's 7F,
+ * while requirements.md §15.2 states in black and white that "once a meeting ends, the office page shows no
+ * trace of it". The filter's **basis is the title** (participants are spawned by us and the title is set by
+ * council/agents.js); it does not modify the db and needs no knowledge of the council's state, so this
+ * filter holds regardless of "whether that meeting is still running".
  *
  * @returns {Array<{id,title,directory,project,projectPath,lastEventAt,agent,model,fileCount}>}
  */
 function listKiloSessions() {
   const now = Date.now();
   const file = kiloDbPath();
-  // 缓存按**库文件路径**分键：换 KILO_HOME / 换库时不会把上一处的会话端上来。
-  // 读不出来（没装 / 被锁 / 表结构变了）时缓存空清单，别让每 1.5s 的轮询都去撞一次锁。
+  // Cache is keyed by **db file path**: switching KILO_HOME / db never serves the previous location's sessions.
+  // When unreadable (not installed / locked / schema changed) cache the empty list, so the 1.5s poll does not
+  // hit the lock every time.
   if (cache.value && cache.key === file && now - cache.at < TTL) return cache.value;
   const rows = query((db) =>
     db
@@ -605,43 +635,45 @@ function listKiloSessions() {
   return value;
 }
 
-/* ------------------------------ 相位推导 ------------------------------ */
+/* ------------------------------ Phase inference ------------------------------ */
 
 /**
- * 一条会话的**当前相位**。
+ * A session's **current phase**.
  *
- * 取这条会话最后几条事件（`event` 表按 (aggregate_id, seq) 有唯一索引，取尾部很便宜），
- * 从后往前找**第一条带 part 的**，按 part.type / part.state.status 归相位：
+ * Take the session's last few events (the `event` table has a unique index on (aggregate_id, seq), so the
+ * tail is cheap), walk backwards to the **first one carrying a part**, and map part.type /
+ * part.state.status to a phase:
  *
- *   tool + running   → 调用工具（Kilo 正在跑这个工具；工具名/命令从 part 里取）
- *   tool + pending   → 等待授权（工具排着队还没放行 —— Kilo 的 approval 就落在这个状态）
- *   tool + error     → 调用工具但报错了（显示工具名，UI 侧按失败灰显）
- *   reasoning        → 思考中
- *   patch            → 调用工具（正在落盘改动）
- *   text             → **看这条 text 属于哪条消息**（见下面那段，改过两次）
- *   step-finish/step-start/text 都对不上 → 待命
+ *   tool + running   → calling a tool (Kilo is running it; tool name / command taken from the part)
+ *   tool + pending   → awaiting authorization (the tool is queued, not released — Kilo's approval lands here)
+ *   tool + error     → called a tool but it errored (show the tool name; the UI greys it as failed)
+ *   reasoning        → thinking
+ *   patch            → calling a tool (flushing changes to disk)
+ *   text             → **depends on which message this text belongs to** (see the block below; changed twice)
+ *   step-finish/step-start/text all miss → idle
  *
- * **只认"新鲜"证据**：`session.turn` 结束之后那条 text 事件会一直躺在库里，不看新鲜度
- * 就会把三天前收工的那句回复永远显示成"刚刚在说话"。所以要求事件时间落在
- * `PHASE_FRESH_MS`（2 分钟，与 sessions.js 的 FRESH_MS 同量级）之内，超了就是待命。
- * 这是"轮询"相比 hook 的固有差距：轮询只能靠时间窗猜这一轮还在不在，
- * 所以**相位一律带 inferred: true**，UI 按推断灰显。
+ * **Only "fresh" evidence counts**: after `session.turn` ends, that text event stays in the db forever;
+ * without a freshness check a reply from three days ago would forever show as "just spoke". So the event time
+ * must fall inside `PHASE_FRESH_MS` (2 minutes, same order as sessions.js's FRESH_MS); past that it is idle.
+ * This is the inherent gap between polling and hooks: polling can only use a time window to guess whether
+ * this turn is still going, so **every phase carries inferred: true** and the UI greys it as inferred.
  *
  * @param {string} sessionId
  * @returns {{phase:string,action:string,target:string,tool:string,context:string[],prompt:string,model:string,inferred:boolean}|null}
  */
 const PHASE_FRESH_MS = 2 * 60_000;
-/** 往回看多少条事件够用（一轮对话末尾最多 tool→reasoning→text 几条，64 条极宽裕） */
+/** How many events to look back (a turn's tail is at most tool→reasoning→text; 64 is very generous) */
 const PHASE_LOOKBACK = 64;
 
 function readKiloPhase(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
-  // 这一轮用户说的话（「思考中」屏上第二/第三层显示的就是它）。
-  // 取一次就够：整个 readKiloPhase 里所有返回分支共用同一个值。
+  // What the user said this turn (the second/third layer on the "thinking" screen is exactly this).
+  // One read is enough: every return branch inside readKiloPhase shares the same value.
   const prompt = readRoundPrompt(id);
-  // 顺带把这条 part 归属的 message 一起带出来（LEFT JOIN）：判 text 是不是"这一轮的收尾"
-  // 要看那条消息的 finish，单独再查一次 message 表是多余的往返（见下面 text 分支的注释）。
+  // Also pull the message this part belongs to (LEFT JOIN): deciding whether text is "this turn's closing
+  // line" needs that message's finish, and querying the message table again would be a redundant round trip
+  // (see the text branch below).
   const events = query((db) =>
     db
       .prepare(
@@ -662,29 +694,29 @@ function readKiloPhase(sessionId) {
     try {
       const d = JSON.parse(String(ev.data || ''));
       part = d && typeof d === 'object' ? d.part || null : null;
-      // 信封上的 `time`（**每一条都有**，实测是一条 number，见下）
+      // The envelope's `time` (**present on every row**; measured, it is a number — see below)
       envTime = Number(d && d.time) || 0;
     } catch {
-      part = null; // 半截 / 非 JSON：跳过这一条，不猜
+      part = null; // Truncated / not JSON: skip this row, do not guess
     }
     if (!part || typeof part !== 'object') continue;
 
-    // 事件自身的时间。**三处都认，缺一不可**（实测统计见下面注释）：
-    //   part.time.end | part.time.start —— reasoning / 已完成的 text 有
-    //   信封 time（number）              —— **每一条都有**
-    // 早先只读 part.time，于是 tool / patch / step-start / 正在流式吐字的 text
-    // （part.time 为 undefined）算出 at=0，`if (at && ...)` 直接跳过新鲜度判定 ——
-    // 收工几小时的会话照样按"最新那条"给相位。这是个**早就存在的洞**，只是原先
-    // `text → 待命` 恰好把它盖住了：轮询把这类会话显示成待命，看上去"对"。
-    // 改成"轮中文字 → 思考中"之后，洞就露出来了：一个 50 分钟前收工、
-    // 最后一条是无 part.time 的 text 的会话，会永远显示「思考中」。
-    // 实测真机统计（一个真实会话最近 400 条 part 事件）：
-    //   text 26 条 / reasoning 38 条 / step-finish 30 条 有 part.time；
-    //   tool 270 条 / step-start 30 条 / patch 5 条 / 流式 text 1 条 **没有** part.time。
-    // 所以信封 time 才是可靠的兜底。
+    // The event's own time. **All three sources are needed** (measured stats in the comment below):
+    //   part.time.end | part.time.start — present on reasoning / completed text
+    //   envelope time (number)          — **present on every row**
+    // We used to read only part.time, so tool / patch / step-start / still-streaming text (part.time
+    // undefined) computed at=0 and `if (at && ...)` skipped the freshness check entirely — a session that
+    // finished hours ago still got a phase from "the newest row". This **hole existed all along**; it was
+    // simply hidden because `text → idle` happened to cover it: polling showed such sessions as idle, which
+    // "looked right". After changing to "mid-turn text → thinking", the hole surfaced: a session that
+    // finished 50 minutes ago whose last row is a text without part.time would show "thinking" forever.
+    // Measured stats from a real machine (the last 400 part events of a real session):
+    //   text 26 / reasoning 38 / step-finish 30 have part.time;
+    //   tool 270 / step-start 30 / patch 5 / streaming text 1 **do not**.
+    // So the envelope time is the reliable fallback.
     const tm = part.time && typeof part.time === 'object' ? part.time : {};
     const at = Number(tm.end) || Number(tm.start) || envTime;
-    if (at && now - at > PHASE_FRESH_MS) break; // 从新到旧，第一条过期的就说明这一轮早收工了
+    if (at && now - at > PHASE_FRESH_MS) break; // Newest to oldest: the first expired one means this turn long finished
 
     const type = String(part.type || '');
     const tool = String(part.tool || '');
@@ -728,7 +760,7 @@ function readKiloPhase(sessionId) {
           inferred: true,
         };
       }
-      continue; // completed：这一支跑完了，看上一条事件（可能还有下一个工具）
+      continue; // completed: this one finished, look at the previous event (the next tool may be coming)
     }
     if (type === 'patch') {
       const f = String(part.file || input.file || input.filePath || '');
@@ -746,39 +778,44 @@ function readKiloPhase(sessionId) {
     if (type === 'reasoning') {
       return { phase: 'thinking', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
     }
-    // step-start / step-finish **不是相位**，跳过继续往更旧的事件找。
+    // step-start / step-finish are **not a phase** — skip and keep looking at older events.
     //
-    // 它们是「一步」的边界标记：实测一个会话里 step-start 363 次 / step-finish 361 次
-    // （对照 tool 2677 次、text 463 次）—— 基本是每轮 assistant 输出前后各一条。
-    // 早先这里把 step-start 映射成「规划中」、step-finish 映射成「汇总中」，后果是：
-    // 每次工具刚跑完、最新事件恰好落在 step-finish 上时，控制台就一直卡在「汇总中」
-    // （恰恰是"这一步跑完了、正要进入下一步"的时刻）。「规划中 / 汇总中」在相位词汇表里
-    // 指的是 agent 真的在规划 / 真的在收尾汇总，从这两个记账标记里**推不出来** ——
-    // 硬套就是编造相位（见 requirements.md §P0-6）。
+    // They are the boundary markers of "a step": one measured session had step-start 363 times /
+    // step-finish 361 times (against tool 2677, text 463) — basically one of each around every assistant
+    // output. This used to map step-start to "planning" and step-finish to "summarizing", with this result:
+    // every time a tool had just finished and the newest event happened to be a step-finish, the console
+    // stuck on "summarizing" (exactly the moment "this step is done, about to enter the next"). In the phase
+    // vocabulary, "planning / summarizing" mean the agent is genuinely planning or genuinely wrapping up,
+    // and **neither can be inferred** from these two bookkeeping markers — hard-mapping them is fabricating
+    // a phase (see requirements.md §P0-6).
     //
-    // 跳过之后落到的那条才是真相位：下一条多半是 reasoning（思考中）或
-    // text（待命）；工具 completed 本身也走上面的 continue，同样往更旧处找。
+    // What we land on after skipping is the real phase: the next row is mostly reasoning (thinking) or text
+    // (idle); a completed tool also takes the `continue` above and likewise keeps looking backwards.
     if (type === 'step-start' || type === 'step-finish') {
       continue;
     }
     if (type === 'text') {
-      // **text 不等于"待命"** —— 这里改过一次，实测踩的坑记在下面。
+      // **text does not mean "idle"** — this changed once; the measured pitfall is recorded below.
       //
-      // 早先一律 `text → 待命`，理由是"刚吐完一段文字 = 这一轮的输出阶段"。
-      // 但 Kilo 在**一轮之内**会多次吐文字（每次工具调用前后都可能来一段），
-      // 而轮询只看得到"最新那条 part"：模型在两次工具调用之间说话时，最新 part 正是 text，
-      // 于是控制台在**任务明明还在跑**的时候闪回「待命中」，过几秒又被下一条 tool 事件
-      // 顶回「调用工具」。用户看到的现象就是"主 agent 状态在待命 / 调用工具之间来回跳"。
+      // It used to be `text → idle` unconditionally, on the grounds that "just emitted a chunk of text =
+      // this turn's output stage". But Kilo emits text **several times within one turn** (a chunk may come
+      // before and after each tool call), and polling only sees "the newest part": while the model speaks
+      // between two tool calls the newest part is a text, so the console flashed back to "idle" **while the
+      // task was still running**, only to be pushed back to "calling a tool" seconds later by the next tool
+      // event. What the user saw was "the main agent's state bouncing between idle and calling a tool".
       //
-      // 判据用**这条 text 归属的那条 message 的 finish**（message 表，part.messageID 对得上）：
-      //   finish='stop'（且 time.completed）→ 这一轮真的说完了 → 待命
-      //   finish='tool-calls'              → 到工具调用处断了，**整轮还没完** → 思考中
-      //   还没有 finish（正在流式吐字）      → 整轮还没完 → 思考中
-      // 实测分布（本机 Kilo 7.8.1 一个真实会话）：assistant 的 text part 里
-      // finish=stop 只有 2 条，finish=tool-calls 14 条，还在流式 2 条 —— 绝大多数是"轮中"。
+      // The test uses **the finish of the message this text belongs to** (message table, matched by
+      // part.messageID):
+      //   finish='stop' (and time.completed) → this turn really finished speaking → idle
+      //   finish='tool-calls'                → it broke off at a tool call, **the whole turn is not over** → thinking
+      //   no finish yet (still streaming)     → the whole turn is not over → thinking
+      // Measured distribution (real Kilo 7.8.1 session on this machine): among assistant text parts,
+      // finish=stop appeared 2 times, finish=tool-calls 14 times, still streaming 2 — the vast majority are
+      // "mid-turn".
       //
-      // 口径与 readKiloDone 判"完成"一致（那里也是 finish!=='tool-calls' 才算收工），
-      // 也与插件那一路同源（plugin/index.js 的 message.updated 分支同样按 finish 分流）。
+      // Same rule as readKiloDone judging "done" (there too, finish!=='tool-calls' is what counts as
+      // finished), and the same origin as the plugin path (plugin/index.js's message.updated branches on
+      // finish too).
       if (turnIsOver(ev.mdata)) {
         return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
       }
@@ -788,7 +825,7 @@ function readKiloPhase(sessionId) {
   return { phase: 'idle', action: '', target: '', tool: '', context: [], prompt, model: '', inferred: true };
 }
 
-/** 工具入参里的可读命令（bash 的 command / 其他工具的 description） */
+/** The readable command in a tool's input (bash's command / other tools' description) */
 function commandOf(input) {
   const c = String(input.command || '');
   if (c) return c.replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -796,22 +833,24 @@ function commandOf(input) {
   return d.replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
-/** 工具入参里的目标文件（write/edit/apply_patch 各家的字段名不统一，都认一遍） */
+/** The target file in a tool's input (write/edit/apply_patch each name it differently; accept them all) */
 function fileOf(input) {
   const p = input.file || input.filePath || input.file_path || input.path || input.target_file || '';
   return typeof p === 'string' ? p : '';
 }
 
 /**
- * 这条消息是不是"整轮说完了"（读 event 时 LEFT JOIN message 带出来的那一列 `mdata`）。
+ * Whether this message "finished the whole turn" (the `mdata` column carried out by the LEFT JOIN to
+ * message when reading events).
  *
- * 口径与 readKiloDone 判完成、插件 message.updated 分支判收工**完全一致**：
- * `finish` 存在、`time.completed` 存在、且 `finish !== 'tool-calls'`。
- * `tool-calls` 只是"这条消息到工具调用处断了"，整轮还在继续。
+ * Exactly the same rule as readKiloDone judging completion and the plugin's message.updated branch judging
+ * closing: `finish` present, `time.completed` present, and `finish !== 'tool-calls'`.
+ * `tool-calls` only means "this message broke off at a tool call"; the whole turn continues.
  *
- * 取不到 message 行（LEFT JOIN 落空 / JSON 坏了）时返回 false —— 也就是**偏向"还在想"**：
- * 宁可显示「思考中」也不要把一个还在跑的任务说成「待命中」（那是在把进行中报成空闲）。
- * @param {any} mdata message.data 那一列（原始 JSON 字符串）
+ * Returns false when the message row is unavailable (LEFT JOIN missed / broken JSON) — i.e. **leans towards
+ * "still thinking"**: rather show "thinking" than call a running task "idle" (that would report in-progress
+ * as free).
+ * @param {any} mdata the message.data column (raw JSON string)
  * @returns {boolean}
  */
 function turnIsOver(mdata) {
@@ -828,33 +867,38 @@ function turnIsOver(mdata) {
   return Boolean(m.time && m.time.completed);
 }
 
-/* ------------------------------ 完成标记 ------------------------------ */
+/* ------------------------------ Done marker ------------------------------ */
 
-/** 完成标记的新鲜期：只有这么久之内结束的才算"刚发生"，否则页面一开就重播上一轮 */
+/** Freshness window of the done marker: only a finish inside this window counts as "just happened",
+ *  otherwise opening the page replays the previous turn */
 const DONE_TTL_MS = 10 * 60_000;
-/** 完成标记缺省时统一返回（没有就是"没有"，不臆造）。
- *  doneCancelled：这一轮是被用户打断（ESC / 停止）收掉的 → 主控制台亮红色「任务取消」。
- *  Kilo 的**轮询**这一路读不出"被打断"（`message.finish` 只有 stop / tool-calls / length /
- *  content-filter，没有 interrupted），所以这里恒为 false —— 不臆造取消。装了 WorkGremlin
- *  插件时，由插件的 `session.idle` 那一路上报取消标记（见 packages/reporter/src/plugin）。 */
+/** Returned uniformly when there is no done marker (none means none, never invented).
+ *  doneCancelled: this turn was cut short by the user (ESC / stop) → the main console lights up red with
+ *  "task cancelled". Kilo's **polling** path cannot read "interrupted" (`message.finish` only offers
+ *  stop / tool-calls / length / content-filter, no interrupted), so this is always false — no invented
+ *  cancels. With the WorkGremlin plugin installed, the plugin's `session.idle` path reports the cancel
+ *  marker (see packages/reporter/src/plugin). */
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false };
 
 /**
- * 这条会话的"完成"标记 —— 对应 hook 那边 Stop 事件落下的 done。
+ * This session's "done" marker — the counterpart of the `done` that a Stop event leaves behind on the hook
+ * side.
  *
- * Kilo 没有 Stop 事件，但 `message` 表里有等价的东西：一条 `role='assistant'` 且
- * `finish` 不是 `tool-calls` 的消息（实测取值：stop / tool-calls / length / content-filter）。
- * 语义映射（Kilo 的 finish 与 OpenAI 风格一致）：
- *   finish=stop           → 正常说完，**这就是"任务完成"**
- *   finish=tool-calls      → 还要接着调工具，**不是**完成（跳过）
- *   finish=length         → 撞长度上限被截断（是结束，但语义上算"没说完"——当完成会误导）
- *   finish=content-filter → 被内容过滤拦下（同上，不当完成）
- *   finish 为空            → 还在流式输出中，不是完成
+ * Kilo has no Stop event, but the `message` table holds the equivalent: a `role='assistant'` message whose
+ * `finish` is not `tool-calls` (measured values: stop / tool-calls / length / content-filter).
+ * Semantic mapping (Kilo's finish follows the OpenAI style):
+ *   finish=stop           → spoke to completion, **this is "task done"**
+ *   finish=tool-calls     → more tool calls coming, **not** done (skip)
+ *   finish=length         → truncated by the length cap (it is an end, but semantically "did not finish
+ *                           speaking" — counting it as done would mislead)
+ *   finish=content-filter → blocked by content filtering (same; not done)
+ *   finish empty          → still streaming, not done
  *
- * 只认 `time.completed` 落过且在 DONE_TTL_MS 之内的；没有 completed 的（正在输出的那条）
- * 明确不算完成。标题取会话标题（Kilo 自己起的），文件数取 session.summary_files。
+ * Only rows whose `time.completed` landed and that are inside DONE_TTL_MS count; one without completed
+ * (the row currently being output) is explicitly not done. The title comes from the session title (Kilo's
+ * own), the file count from session.summary_files.
  * @param {string} sessionId
- * @param {{title?:string,fileCount?:number}} meta 会话自身的静态信息
+ * @param {{title?:string,fileCount?:number}} meta the session's own static info
  */
 function readKiloDone(sessionId, meta = {}) {
   const id = String(sessionId || '').trim();
@@ -880,7 +924,7 @@ function readKiloDone(sessionId, meta = {}) {
     data = {};
   }
   const finish = String((data && data.finish) || '');
-  // 撞长度 / 被内容过滤：算"这条消息结束了"但不该亮"任务完成"，退回空标记
+  // Length cap / content filter: this message ended, but "task done" should not light up → empty marker
   if (finish === 'length' || finish === 'content-filter') return NO_DONE;
   const at = Number(data && data.time && data.time.completed) || 0;
   if (!at || Date.now() - at > DONE_TTL_MS) return NO_DONE;
@@ -893,11 +937,12 @@ function readKiloDone(sessionId, meta = {}) {
   };
 }
 
-/* ------------------------------ 对外 ------------------------------ */
+/* ------------------------------ Public surface ------------------------------ */
 
 /**
- * 这条会话有没有"接上"（Kilo 库里真有它）。
- * 渲染层靠它区分"这个产品根本没在跑"与"在跑但此刻没动作"（同 reporter-phase 的 instrumented）。
+ * Whether this session is "connected" (it really exists in Kilo's db).
+ * The render layer uses it to tell "this product is not running at all" from "running but idle right now"
+ * (same as reporter-phase's instrumented).
  */
 function kiloInstrumented(sessionId) {
   const id = String(sessionId || '').trim();
@@ -906,18 +951,20 @@ function kiloInstrumented(sessionId) {
 }
 
 /**
- * 7F 的"上报相位"—— 与 reporterMainPhase 同一个形状，
- * 供 /api/v1/reporter-phase 在 client 是 kilo 时走这一路。
+ * 7F's "reported phase" — same shape as reporterMainPhase, used by /api/v1/reporter-phase when the client
+ * is kilo.
  *
- * 没有 client/session 参数时按"最近更新的那条会话"取（与 hook 那侧"同 client 里谁最新显示谁"
- * 的老行为对齐）；传了 session 就只认那一条。
+ * With no client/session argument, take "the most recently updated session" (aligned with the hook side's
+ * old behavior of "whoever is newest among the same client is shown"); with a session given, only that one
+ * counts.
  * @param {string} workspacePath
  * @param {string} session
  * @returns {{sessionId:string,phase:string,action:string,target:string,context:string[],tool:string,prompt:string,model:string}|null}
  */
 function kiloMainPhase(workspacePath, session = '') {
-  // 相位必须绑会话：不点名会话就没有相位（不再"取同工程最近更新那条"兜底 ——
-  // 那会让主控制台显示同层别的会话的相位，跟 reporter 那一路统一口径）。
+  // A phase must be tied to a session: without naming one there is no phase (no more falling back to
+  // "the newest session in the same project" — that would make the main console show another session's
+  // phase on the same floor; unified rule with the reporter path).
   if (!session) return null;
   const list = listKiloSessions();
   if (!list.length) return null;
@@ -926,7 +973,8 @@ function kiloMainPhase(workspacePath, session = '') {
   const ph = readKiloPhase(row.id);
   if (!ph) return null;
   return {
-    /** 这份相位属于哪条会话（渲染层拿它确认"我正在看的那条会话"是不是这份） */
+    /** Which session this phase belongs to (the render layer uses it to confirm "the session I am looking at
+     *  is this one") */
     sessionId: row.id,
     phase: ph.phase,
     action: ph.action,
@@ -934,48 +982,54 @@ function kiloMainPhase(workspacePath, session = '') {
     context: ph.context,
     tool: ph.tool,
     prompt: ph.prompt,
-    // 模型从 session 表取（真实值；取不到留空，不猜）
+    // Model comes from the session table (real value; empty when unreadable, no guessing)
     model: row.model || '',
   };
 }
 
-/* ===================== 任务同步器（原 kiloTasks.js，已合并进本楼层文件） ===================== */
+/* ===================== Task syncer (from the old kiloTasks.js, merged into this floor file) ===================== */
 const SYNC_INTERVAL_MS = 5_000;
 
 /**
- * 插件那一路"还活着"的两个时间参数（见下面的 yieldsOf / coveredBy）。
+ * The two timing parameters for "the plugin path is still alive" (see yieldsOf / coveredBy below).
  *
- * PLUGIN_GRACE_MS —— 一轮刚起的头几秒先不抢：插件收到用户消息就写台账（本地回环，实测
- *   30~90 毫秒就落库），所以"这一轮已经跑了几秒、插件还没为它写行"基本就等于它哑了。
- *   这个值**必须短**，因为它量的是"插件还没写上来"这段窗口，而这段窗口里轮询是**不写**的
- *   —— 窗口多长，用户的这一轮就在列表里消失多久。实测（2026-09-30 13:42）：一条 8 秒的
- *   任务（13:42:44 → 13:42:52），按 60 秒算的时候整轮都落在宽限期里，用户看着它跑完、
- *   又等了 52 秒才在列表里看到那行（报的是"输入 Prompt 后没看到任务，任务结束后一会才
- *   看到"）。3 秒是本地回环的宽裕余量，同时把消失窗口压到一次轮询（5s）以内。
- * PLUGIN_COVER_MS —— 判"这一轮插件报过没有"时，插件那行的 started_at 与轮次起点允许差
- *   多少。两边记的是同一个事件的两端：插件记它**看到消息**的时刻，轮次表记消息**落库**
- *   的时刻，实测差在 ±90ms 内且方向不定（+34 / -87 / -14ms 三例）。判漏了会与插件的行
- *   并排多写一条（孪生行，而且它自己好不了）；判重了会把"两秒内连开两轮"当成同一轮。
+ * PLUGIN_GRACE_MS — do not grab the first few seconds of a turn: the plugin writes to the ledger as soon as
+ *   it receives the user's message (local loopback, measured 30~90ms to land), so "this turn has been
+ *   running a few seconds and the plugin has not written a row for it" basically means it went mute.
+ *   This value **must be short**, because it measures the window in which "the plugin has not written yet",
+ *   and during that window polling **does not write** — however long the window is, the user's turn stays
+ *   missing from the list that long. Measured (2026-09-30 13:42): an 8-second task (13:42:44 → 13:42:52)
+ *   fell entirely inside the grace period when it was 60 seconds; the user watched it run and then waited
+ *   another 52 seconds before seeing the row (the report was "typed a prompt, saw no task, saw it a while
+ *   after the task ended"). 3 seconds is a generous margin for local loopback while squeezing the
+ *   disappearance window below one poll (5s).
+ * PLUGIN_COVER_MS — how far apart the plugin row's started_at and the turn's start may be when judging
+ *   "has the plugin reported this turn". Both record two ends of the same event: the plugin records when it
+ *   **saw the message**, the turn table when the message **landed in the db**; measured differences are
+ *   within ±90ms and go both ways (+34 / -87 / -14ms in three cases). Judging a miss writes an extra row
+ *   next to the plugin's (twin rows, and it cannot heal itself); judging an overlap treats "two turns
+ *   started within two seconds" as one turn.
  */
 const PLUGIN_GRACE_MS = 3_000;
 const PLUGIN_COVER_MS = 2_000;
 
-/** task id 前缀，避免跟 reporter hook 写的 task 撞 id */
+/** Task id prefix, so ids never collide with tasks written by the reporter hook */
 const TASK_ID_PREFIX = 'kilo:';
 
-/** 这一层的上报身份 = 楼层基名（7F 的 clients 现在就是 ["kilo"]，形态另走 form） */
+/** This layer's reported identity = the floor base name (7F's clients are now ["kilo"]; the form travels as form) */
 const CLIENT = 'kilo';
 
-/** 这个工程名（工程 id）—— 成员 / 台账都按它归组 */
+/** This project's name (project id) — members / the ledger are grouped by it */
 function projectIdOf(s) {
   const projectPath = s.projectPath || '';
   return s.project || (projectPath ? path.basename(projectPath) : 'Kilo Code');
 }
 
 /**
- * 写一条台账（tasks + task_runs 两行）。7F 是**每一轮一条**，口径照抄 opencodeTasks.js 的同名函数
- * （它接受显式 state 与 result —— Kilo 两样都要：分辨 done / cancelled，以及这一轮的收尾自述）。
- * @returns {string|null} 这条记录的 files_json（心跳里的 current_files 直接复用）
+ * Write one ledger row (a line in both tasks and task_runs). 7F is **one row per turn**; copies the rule of
+ * the same-named function in opencodeTasks.js (it accepts an explicit state and result — Kilo needs both: to
+ * tell done from cancelled, and this turn's closing summary).
+ * @returns {string|null} this record's files_json (the heartbeat's current_files reuses it directly)
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
@@ -1009,17 +1063,18 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     title,
     model: model || null,
     form: null,
-    // 产出摘要：这一轮最后一条 assistant 说的话（见 kilo.js 的 readKiloRounds）；
-    // 还没收工的那轮先不写（半截话不算产出），收工时再补。
+    // Output summary: the last thing the assistant said this turn (see readKiloRounds in kilo.js);
+    // an unfinished turn writes nothing yet (half a sentence is not output), it is filled in on close.
     result: result || null,
     fileCount: files ? files.length : 0,
     filesJson,
     endedAt: endedAt || null,
     durationMs: endedAt && startedAt ? endedAt - startedAt : null,
   });
-  /* 本轮消耗的 token（readKiloRounds 从 message.data.tokens 折出来，语义见 kilo.js）。
-     这条语句是**覆盖写**而不是 COALESCE：这一轮还在跑时每次轮询都会重算，数值是长出来的，
-     用 COALESCE 会把第一次读到的那个偏小的值钉死。tokens 为 null 时如实写 NULL。 */
+  /* This turn's token usage (readKiloRounds folds it out of message.data.tokens; semantics in kilo.js).
+     This statement **overwrites** rather than COALESCEs: while the turn is running every poll recomputes it
+     and the numbers grow, so COALESCE would pin the first (too small) value forever. When tokens is null,
+     write NULL honestly. */
   repo.setTaskRunTokens.run({
     id,
     inputTokens: tokens ? tokens.input : null,
@@ -1030,7 +1085,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
-/** 台账 id 里的轮序号（`kilo:<会话id>:<序号>`）；不是这个形状就回 null */
+/** The turn index inside a ledger id (`kilo:<session id>:<index>`); null when the shape does not match */
 function roundIndexOf(taskId, prefix) {
   const id = String(taskId || '');
   if (!id.startsWith(`${prefix}:`)) return null;
@@ -1040,22 +1095,23 @@ function roundIndexOf(taskId, prefix) {
 
 /**
  * @param {{bus: any, repo: any, now?: () => number}} ctx
- * @returns {number} 本次同步写/改了几条任务
+ * @returns {number} how many tasks this sync wrote/changed
  */
 function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
-  // 经 module.exports 解析数据源：测试把 listKiloSessions / readKiloRounds 换成熟数据桩，
-  // 这条同步器照样可端到端自检（见 test/taskSync.test.js）。生产里 module.exports 指向
-  // 读 Kilo 自己落盘的真函数，行为不变。
+  // Resolve the data source through module.exports: tests swap listKiloSessions / readKiloRounds for
+  // in-memory stubs and this syncer still self-checks end to end (see test/taskSync.test.js). In production
+  // module.exports points at the real functions reading Kilo's own disk state; behavior unchanged.
   const sessions = module.exports.listKiloSessions();
   if (!sessions.length) return 0;
 
   const now = nowFn();
   let count = 0;
 
-  // 每条会话的逐轮清单**和**它现有的台账行各只读一次：让位判定、owner 选择、写台账三处都复用
-  // （逐轮清单要扫 message/part 表，别读两遍）。
-  // "这一层现在算不算在跑"也直接由它推出（有没有 outcome==='running' 的轮）——
-  // 收工窗口只留在 kilo.js 一处（ROUND_IDLE_MS），这里不再自己算时间窗。
+  // Each session's per-turn list **and** its existing ledger rows are each read once: the yield decision,
+  // owner selection and ledger writing all reuse them (the per-turn list scans message/part; do not read
+  // twice).
+  // "Is this floor running right now" is derived from it too (is there a turn with outcome==='running') —
+  // the finish window lives only in kilo.js (ROUND_IDLE_MS); no time window is computed here.
   const roundsOf = new Map();
   const runsOf = new Map();
   for (const s of sessions) {
@@ -1064,31 +1120,39 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   }
   const isActiveOf = (s) => (roundsOf.get(s.id) || []).some((r) => r.outcome === 'running');
 
-  /** 插件给这条会话写的那些行（服务端发的 `k_*`）各自报的轮次起点；没写过 → [] */
+  /** The turn starts reported by the plugin's rows for this session (server-issued `k_*`); none written → [] */
   const pluginStartsOf = (s) =>
     runsOf.get(s.id).filter((r) => !String(r.id).startsWith(TASK_ID_PREFIX)).map((r) => Number(r.started_at || 0));
 
-  /** 插件**为这一轮**写过行没有：按轮次起点对齐（容许 PLUGIN_COVER_MS 的误差，理由见常量） */
+  /** Whether the plugin **has written a row for this turn**: align by turn start (tolerating PLUGIN_COVER_MS,
+   *  see the constant) */
   const coveredBy = (starts, at) => starts.some((p) => Math.abs(p - Number(at || 0)) <= PLUGIN_COVER_MS);
 
   /**
-   * 这条会话是不是已经有**插件写的**行了（插件写的是服务端发的 `k_*`，轮询写的是 `kilo:*`）——
-   * 有就整条让位。判据用 id 前缀而不是 client，因为这里要问的是"这行是不是我写的"（见下面循环）。
+   * Does this session already have **plugin-written** rows (the plugin writes server-issued `k_*`, polling
+   * writes `kilo:*`) — if so, yield the whole session. The test is the id prefix, not the client, because
+   * what is asked here is "did I write this row" (see the loop below).
    *
-   * **让位只在插件还在报的时候成立**（2026-09-30 修：用户实测一轮任务在列表里凭空消失）。
-   * "这条会话有插件行"只证明它**曾经**在报 —— 插件跟着 agent 进程活，通道断了它自己不知道，
-   * 也什么都发不出去。实测那一回：Kilo CLI 进程 11:00 起（那个进程里的插件还没有"重读
-   * server.json"那版），WorkGremlin 11:29 重启换了随机 token（server/src/config.js 每次启动
-   * 随机生成）→ 从那以后这个进程的每条上报都 401，而且**完全无声**：状态文件照写
-   * （所以相位/状态正常显示）、台账一条不来。于是 12:46 与 12:48 用户跑的两轮，
-   * 插件写不了、轮询又整条让位 → **两条任务都查不到**（用户报的"状态有，但看不到任务"）。
+   * **Yielding only holds while the plugin is still reporting** (fixed 2026-09-30: measured, a turn
+   * vanished from the list). "This session has plugin rows" only proves it **once** reported — the plugin
+   * lives and dies with the agent process, and when the channel breaks it neither knows nor can send
+   * anything. That measured case: the Kilo CLI process started at 11:00 (the plugin inside it predated the
+   * "re-read server.json" version), WorkGremlin restarted at 11:29 with a new random token (server/src/
+   * config.js generates one per start) → from then on every report from that process got a 401, and
+   * **completely silently**: the state file was still written (so phase/state displayed fine) while not a
+   * single ledger row arrived. So the two turns the user ran at 12:46 and 12:48 had no plugin write and
+   * polling yielded the whole session → **neither task was findable** (the report was "state shows, but no
+   * task visible").
    *
-   * 所以让位的判据改成"插件**这一轮**也写了没有"：它最新那一行落在源里最新这一轮起点之后
-   * （容许 PLUGIN_COVER_MS 的误差）→ 让位；否则这一轮刚起就再等 PLUGIN_GRACE_MS（本地回环，
-   * 正常 1 秒内落库），过了还不见它的行 → 认定通道断了，把这条会话收回来（补记见 ②b）。
-   * 插件活着时每轮开跑就写一条，所以正常情况下这条永远不命中；万一它只是慢了（注册重试中），
-   * 等它写上来那一刻让位又成立 —— 轮询自己写的行会被收掉（见下面循环里的让位分支），自愈。
-   * 宽限期**从这一轮的起点算**（不是"插件沉默多久"）：插件两轮之间本来就不写东西，沉默是常态。
+   * So the yield test became "did the plugin write **this turn** too": if its newest row lands after the
+   * newest turn's start in the source (tolerating PLUGIN_COVER_MS) → yield; otherwise wait PLUGIN_GRACE_MS
+   * from the turn's start (local loopback, normally lands within 1s), and if its row still has not appeared
+   * → the channel is considered dead and the session is taken back (backfill in ②b).
+   * While the plugin is alive it writes a row as soon as each turn starts, so this branch should never hit;
+   * if it is merely slow (retrying registration), yielding holds again the moment it writes — the rows
+   * polling wrote get retracted (see the yield branch in the loop below), self-healing.
+   * The grace period is measured **from this turn's start** (not "how long the plugin has been silent"):
+   * the plugin writes nothing between turns anyway, so silence is normal.
    */
   const yieldsOf = (s) => {
     const starts = pluginStartsOf(s);
@@ -1096,22 +1160,26 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     const rounds = roundsOf.get(s.id) || [];
     const last = rounds[rounds.length - 1];
     const roundStart = last ? Number(last.startedAt || 0) : 0;
-    // 比的是"最新那行是否落在这一轮起点之后"：插件那行可能比轮次起点早几十毫秒（实测 -87ms），
-    // 也可能晚（它自己取 Date.now()，agent 忙的时候迟一会儿）—— 两边都要容，所以减一个 COVER。
+    // The comparison is "does the newest row land after this turn's start": the plugin's row may be tens of
+    // milliseconds earlier than the turn start (measured -87ms) or later (it takes its own Date.now(), and
+    // lags when the agent is busy) — both must be tolerated, hence minus one COVER.
     const newestTheirs = starts.reduce((m, p) => Math.max(m, p), 0);
     if (newestTheirs >= roundStart - PLUGIN_COVER_MS) return true;
     return now - roundStart <= PLUGIN_GRACE_MS;
   };
 
   /**
-   * 让位给插件的那条会话，插件是不是**冒我们这个身份、而且现在正跑着**？
-   * client 恒为楼层基名（见 plugin/index.js 的 resolveClient）：CLI 形态的插件（`kilo run`，
-   * 没有 VS Code 环境变量）报的就是裸 `kilo`，与 VS Code 扩展起的同为一个成员 `kilo@<工程>`，
-   * 形态另由 form（cli / vscode）区分。
-   * 是的话这条工程的成员状态就先归插件写：轮询这一路连心跳都不碰 —— 否则 5s 一次轮询会把
-   * 插件刚写的相位覆盖成轮询视角下的旧状态（agent_status 谁最后写谁赢），现场就是相位来回跳。
-   * 只在那轮**还没收工**时让位（isActiveOf）：插件那条停下来了就把这一栏交回轮询，
-   * 否则同工程另一条（没装插件的老会话）真在跑时永远拿不到心跳，被判成「已取消」。
+   * For a session yielded to the plugin: is the plugin **impersonating our identity and running right now**?
+   * client is always the floor base name (see resolveClient in plugin/index.js): the CLI-form plugin
+   * (`kilo run`, no VS Code env vars) reports the bare `kilo`, the same member `kilo@<project>` as the one
+   * the VS Code extension raises; the form is told apart by `form` (cli / vscode).
+   * If so, this project's member state belongs to the plugin: the polling path does not even touch the
+   * heartbeat — otherwise the 5s poll would overwrite the phase the plugin just wrote with the polling
+   * view's older state (in agent_status, whoever writes last wins), and the symptom is a phase bouncing
+   * back and forth.
+   * Yield only while that turn has **not finished** (isActiveOf): once the plugin's turn stops, this slot
+   * returns to polling — otherwise another session in the same project (an old one without the plugin) that
+   * is genuinely running would never get a heartbeat and would be judged "cancelled".
    */
   const pluginOwnsMember = new Set();
   for (const s of sessions) {
@@ -1120,20 +1188,23 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   }
 
   /**
-   * 一个工程只写**一条**成员状态（agent_status 主键就是 member_id）。
-   * 同工程有多条会话时（Kilo 的工作树会话、历史会话都在），谁最后写谁赢 —— 结果是
-   * "正在跑的那条任务在 agent_status 里找不到对应心跳"，任务列表按 query.js 的 CASE
-   * 把它算成「已取消」，运行中的任务就不显示了（实测 2026-09-28 就是这个症状）。
-   * 所以先选出这个工程该报的那条：活跃里最新的；都不活跃就报最新那条（卡片挂住最后一条任务）。
+   * One project writes **one** member status (agent_status' primary key is member_id). With several sessions
+   * in one project (Kilo's worktree sessions and old sessions are all there), whoever writes last wins —
+   * the result is "the task that is running has no matching heartbeat in agent_status", and the task list's
+   * CASE in query.js counts it as "cancelled", so running tasks disappear (measured symptom on 2026-09-28).
+   * So first pick the session this project should report: the newest among active ones; if none is active,
+   * report the newest one (the card hangs on the last task).
    */
   const activeByProject = new Map();
   const newestByProject = new Map();
   for (const s of sessions) {
-    // 让位的会话**不参与** owner 选择：它这一路根本不写心跳（见下面那个 continue），
-    // 把它算进来就会让同工程另一条真在跑的会话永远选不上 owner ——
-    // 那条任务在 agent_status 里找不到心跳，又被 query.js 的 CASE 判成「已取消」。
-    // 实测 2026-09-30：插件那条会话一出现（它比老会话新），老会话的状态就冻在上一次
-    // 写下的那一行上再也不刷新（成员卡心跳过期灰显、老会话里再开一轮就显示「已取消」）。
+    // A yielded session does **not** take part in owner selection: it never writes a heartbeat on this path
+    // (see the `continue` below), so counting it in would keep another genuinely running session in the same
+    // project from ever being chosen as owner — that task then finds no heartbeat in agent_status and is
+    // again judged "cancelled" by query.js' CASE.
+    // Measured 2026-09-30: as soon as the plugin's session appeared (it is newer than the old one), the old
+    // session's state froze on the last row written and never refreshed again (the member card's heartbeat
+    // went stale and grey, and starting another turn in the old session showed "cancelled").
     if (yieldsOf(s)) continue;
     const pid = projectIdOf(s);
     const prevNew = newestByProject.get(pid);
@@ -1148,38 +1219,41 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     const projectId = projectIdOf(s);
     const prefix = `${TASK_ID_PREFIX}${s.id}`;
 
-    // 装了 WorkGremlin 插件时，plugin 那一路上报的是**真值**：每轮用户任务一条，
-    // 带 taskTitle（用户那句话）、form（形态）、result（收尾自述）、收工时间。
-    // 轮询这一路只是"没装插件"时的兜底，不能跟它抢同一条会话 —— 抢的结果是同一个
-    // 会话在任务列表里出现两行（轮询的会话级 + 插件的任务级），而且轮询那行每 5s
-    // 还会把插件写的相位/成员状态覆盖回 thinking（收工了还显示"思考中"）。
-    // 所以：这条会话已经有 plugin 行 → 整条跳过；自己上一轮抢在 plugin 前面写下的
-    // 兜底行 → 收掉（只删自己前缀的 id，插件的行一根汗毛都不动）。
-    // 判据是"这个会话已经有插件写的行了"，不是"有没有 client === kilo-plugin 的行"。
-    // 插件写的 id 是 `k_*`，轮询写的是 `kilo:*` —— 用 id 前缀认，比认身份稳：
-    // 身份是插件**上报**的，而这里要问的是"这行是不是我写的"。早先按 client 判，
-    // 而插件那份的身份在修好之前根本不是 kilo-plugin（判出的是 kilo）→ 从不让位 →
-    // 同一个会话轮询与插件各写各的，同一轮在任务列表里出现两行（2026-09-30 实测）。
-    // runsOf 是上面读的那一份（那时还没写这一轮，所以下面 ③ 定稿不会误伤 lastId）
+    // With the WorkGremlin plugin installed, the plugin path reports **truth**: one row per turn of user
+    // work, carrying taskTitle (the user's sentence), form, result (closing summary) and the finish time.
+    // The polling path is only the fallback for "no plugin installed" and must not fight the plugin over the
+    // same session — fighting shows two rows for one session in the task list (polling's session-level +
+    // the plugin's task-level), and worse, polling would overwrite the phase/member state the plugin wrote
+    // back to thinking every 5s ("thinking" even after the turn finished).
+    // So: a session that already has plugin rows → skip entirely; a fallback row this path wrote before the
+    // plugin did → retract it (delete only our own prefix; do not touch a single hair of the plugin's rows).
+    // The test is "this session already has plugin-written rows", not "is there a row with client ===
+    // kilo-plugin". The plugin writes ids `k_*` while polling writes `kilo:*` — recognizing by id prefix is
+    // steadier than by identity: identity is what the plugin **reports**, while what is asked here is "did
+    // I write this row". It used to judge by client, but before the fix the plugin's identity was not
+    // kilo-plugin at all (it resolved to kilo) → never yielded → polling and the plugin each wrote their own
+    // rows and one turn appeared twice in the task list (measured 2026-09-30).
+    // runsOf was read above (before this turn was written), so ③'s finalization below cannot hurt lastId
     const sessionRuns = runsOf.get(s.id);
     if (yieldsOf(s)) {
       for (const r of sessionRuns) if (String(r.id).startsWith(TASK_ID_PREFIX)) repo.deleteTaskRun(r.id);
       continue;
     }
 
-    // ① 过渡期清扫：早先是"一条会话一行"，id 就是 `kilo:<会话id>`（没有轮序号）。
-    // 让位那条路在上面自己就把这类行删了（它也带 `kilo:` 前缀）；走到这里的是没让位的会话，
-    // 所以这一步必须在这里做 —— 否则那些没有用户轮的会话（Kilo 一启动就落一条空会话）
-    // 会把自己那条旧台账永远留在列表里。
+    // ① Transitional cleanup: it used to be "one row per session" with id `kilo:<session id>` (no turn index).
+    // The yield path above deletes such rows itself (they carry the `kilo:` prefix too); what reaches here
+    // are sessions that did not yield, so this step must happen here — otherwise those sessions with no user
+    // turns (Kilo lands one empty session right at startup) keep their old ledger row in the list forever.
     if (repo.getTaskRun.get(prefix)) repo.deleteTaskRun(prefix);
 
     const rounds = roundsOf.get(s.id) || [];
-    if (!rounds.length) continue; // 没有用户轮（一句话都没说过）的会话不算任务，不落台账
-    // 轮序号 → 那一轮。**认 index 而不是数组下标**：id 里的序号是 kilo.js 落下的 `r.index`，
-    // 两者平时相等，但拿 index 问"源里还有没有这一轮"才是准的（见下面 ③b）。
+    if (!rounds.length) continue; // A session with no user turn (not a word spoken) is not a task; no ledger row
+    // Turn index → that turn. **Use index, not the array subscript**: the index in the id is the `r.index`
+    // kilo.js wrote; the two are normally equal, but asking "does the source still have this turn" by index
+    // is the accurate way (see ③b below).
     const byIndex = new Map(rounds.map((r) => [r.index, r]));
 
-    // 确保工程 & 成员存在（安静写入，不广播）
+    // Make sure the project & member exist (quiet write, no broadcast)
     bus.ensureProject(projectId, projectPath, null, 'report');
     const memberId = `kilo@${projectId}`;
     const existing = repo.getMember.get(memberId);
@@ -1197,7 +1271,8 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       client: CLIENT,
     });
 
-    // 改动文件：Kilo 存的是绝对路径，统一转工程相对；工程外的（`..`）不进这一栏
+    // Changed files: Kilo stores absolute paths; normalize to project-relative; files outside the project
+    // (`..`) do not enter this column
     const relFiles = (list) =>
       (list || [])
         .map((abs) => {
@@ -1208,10 +1283,11 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
         })
         .filter(Boolean);
 
-    // ② 只写**最后一轮**：正在飞的那轮（state=running、ended_at=null），
-    // 或它收工后留下的那轮。标题优先用**这一轮用户说的话**（和其它楼层「标题 = 用户那句话」
-    // 同一口径）；取不到才退回会话标题 —— Kilo 的会话标题只在一轮开始时定一次，
-    // 同一会话里再跑任务不会变，拿它当标题用户会以为"新任务没记上"。
+    // ② Write **only the last turn**: the one in flight (state=running, ended_at=null), or the one left
+    // behind once it finishes. The title prefers **what the user said this turn** (same rule as other
+    // floors: "title = the user's sentence"); only when unavailable fall back to the session title — Kilo
+    // sets the session title once at the start of a turn and never changes it, so using it as the title
+    // makes users think "the new task was not recorded".
     const last = rounds[rounds.length - 1];
     const running = last.outcome === 'running';
     const lastId = `${prefix}:${last.index}`;
@@ -1231,10 +1307,13 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     });
     count += 1;
 
-    // ②b 从插件手里收回来时（它的通道断了，见 yieldsOf），把它断线期间漏掉的轮次补上：
-    // 判据是"这一轮插件没报过"（按轮次起点对齐，见 coveredBy）—— 它报过的轮次轮询不回溯
-    // （见文件头"只记当前这一轮"）；只有这里补，因为这是"本该有行、却一直没等到"的那几轮。
-    // 已经写过行的（含上面刚写的最后一轮、以及插件亲手写的那几行）不动一根汗毛。
+    // ②b When taking the session back from the plugin (its channel died — see yieldsOf), backfill the turns
+    // it missed while disconnected: the test is "the plugin never reported this turn" (aligned by turn start,
+    // see coveredBy) — turns it did report are never backfilled by polling (see the file header's "only the
+    // current turn is recorded"); only here, because these are the turns that "should have had a row and
+    // never got one".
+    // Rows already written (including the last turn written just above, and the rows the plugin wrote itself)
+    // are left untouched.
     const starts = pluginStartsOf(s);
     if (starts.length) {
       for (const r of rounds.slice(0, -1)) {
@@ -1259,10 +1338,11 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       }
     }
 
-    // ③ 定稿上一轮：上一轮在我们这儿是 running，现在后面已经开了新的一轮 ——
-    // 用它的真实收工时刻/结果把那一行补成 done / cancelled。
-    // 不做这一步，它会永远停在 'running'，被 query.js 的 CASE 判成「已取消」。
-    // sessionRuns 是上面写最后一条**之前**读的，所以不含 lastId，不会误伤。
+    // ③ Finalize the previous turn: it is running on our side while a new turn has already started behind it
+    // — fill that row in as done / cancelled with its real finish time and result.
+    // Without this step it stays 'running' forever and query.js' CASE judges it "cancelled".
+    // sessionRuns was read **before** writing the last row above, so it does not contain lastId and cannot
+    // misfire.
     for (const r of sessionRuns) {
       const idx = roundIndexOf(r.id, prefix);
       if (idx === null || idx >= last.index) continue;
@@ -1285,26 +1365,31 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
-    // ③b 收掉"源里已经没有"的那几轮：轮次表缩短时（Kilo 清了消息 / 压过上下文），
-    // 那几行永远等不到自己的轮 —— 一直挂着 'running'，被 query.js 的 CASE 判成「已取消」，
-    // 在列表里当一条假任务躺着（老口径"一条会话一行"自己会盖掉，改成一轮一条之后不会了）。
-    // 判据是**这一轮还在不在源里**（byIndex），不是"序号比最后一轮小"—— 中间那几轮被删掉时
-    // 序号照样对得上，只有按 index 问才问得准。
-    // `rounds` 整个读空的情况上面已经 continue 了（不在这里删）：库改版读不出来时
-    // （见 kiloFloor 的 D1 用例）宁可留旧行，也不拿"读不出来"当"源里没有"把历史删掉。
+    // ③b Retract turns "no longer in the source": when the turn table shrinks (Kilo cleared messages /
+    // compacted context), those rows never meet their turn again — they hang on 'running', get judged
+    // "cancelled" by query.js' CASE, and lie in the list as a phantom task (the old "one row per session"
+    // rule overwrote itself, so this did not happen until the change to one row per turn).
+    // The test is **is this turn still in the source** (byIndex), not "is the index smaller than the last
+    // turn" — when middle turns are deleted the indices still line up; only asking by index is accurate.
+    // `rounds` reading completely empty already `continue`d above (nothing is deleted here): when a db
+    // change makes it unreadable (see kiloFloor's D1 case), rather keep old rows than treat "unreadable" as
+    // "not in the source" and delete history.
     for (const r of sessionRuns) {
       const idx = roundIndexOf(r.id, prefix);
       if (idx === null || byIndex.has(idx)) continue;
       repo.deleteTaskRun(r.id);
     }
 
-    // ④ 心跳：活跃 → thinking，停下 → idle；task_id 必须指向**最后一轮**那条，
-    // 否则 query.js 的 CASE 找不到心跳，会把正在跑的那条判成「已取消」。
-    // 和 copilot.js 同理：只在活跃时写 thinking，会话停掉后旧值会一直挂在库里，
-    // 成员卡永远「思考中」。非活跃时补一条 idle，让状态跟着会话走。
-    // 另外：**只由这个工程选中的那条会话写**（见上面 activeByProject 的说明），
-    // 否则同工程别的会话会把心跳指到自己的任务上，运行中的那条被判成「已取消」。
-    // 插件正冒我们这个身份在报、且那轮还没收工 → 这一栏整个让给它（见 pluginOwnsMember）。
+    // ④ Heartbeat: active → thinking, stopped → idle; task_id must point at **the last turn's** row,
+    // otherwise query.js' CASE finds no heartbeat and judges the running one "cancelled".
+    // Same reasoning as copilot.js: writing thinking only while active leaves the old value hanging in the
+    // db once the session stops, and the member card stays "thinking" forever. Write an idle row when
+    // inactive so the state follows the session.
+    // Also: **only the session selected for this project writes it** (see activeByProject above), otherwise
+    // another session in the same project points the heartbeat at its own task and the running one is judged
+    // "cancelled".
+    // If the plugin is reporting under our identity and that turn has not finished → yield this slot to it
+    // entirely (see pluginOwnsMember).
     const owner = pluginOwnsMember.has(projectId)
       ? null
       : activeByProject.get(projectId) || newestByProject.get(projectId);
@@ -1336,11 +1421,11 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
 }
 
 /**
- * kilo 来源分支（7F）：轮询 Kilo 自己的 event-sourced SQLite（kilo.db）。
- * 原 sessionRegistry.js 的 kilo 分支整体搬到这里，调试 7F 不再碰中央文件。
- * @param {object} p 楼层元数据
- * @param {object} src 来源规格（kind === 'kilo'）
- * @param {object} ctx 框架提供的共享工具
+ * The kilo source branch (7F): polls Kilo's own event-sourced SQLite (kilo.db).
+ * The whole kilo branch of the old sessionRegistry.js moved here — debugging 7F no longer touches a central file.
+ * @param {object} p floor metadata
+ * @param {object} src source spec (kind === 'kilo')
+ * @param {object} ctx shared utilities provided by the framework
  */
 function kiloHandler(p, src, ctx) {
   const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
@@ -1359,7 +1444,8 @@ function kiloHandler(p, src, ctx) {
       floor: p.id,
       id: s.id,
       sessionId: s.id,
-      // source = form→source（plugin / cli / ide）；这一行是不是插件形态由 truth（插件写过状态文件）判
+      // source = form→source (plugin / cli / ide); whether this row is the plugin form is decided by truth
+      // (the plugin wrote a state file)
       source: formToSource(truth ? 'vscode' : 'cli'),
       form: truth ? 'vscode' : 'cli',
       sourceKind: 'kilo',
@@ -1391,12 +1477,12 @@ module.exports = {
   listKiloSessions,
   readKiloPhase,
   readKiloDone,
-  readKiloRounds, // 逐轮清单（7F 台账按「每一轮一条」记账用，见本文件任务同步器）
-  readRoundPrompt, // 这一轮用户说的话（「思考中」屏上那句；比 readKiloRounds 便宜得多）
+  readKiloRounds, // Per-turn listing (7F's ledger books "one row per turn"; see this file's task syncer)
+  readRoundPrompt, // What the user said this turn (the line on the "thinking" screen; much cheaper than readKiloRounds)
   kiloInstrumented,
   kiloMainPhase,
   NO_DONE,
-  // ---- 7F 任务同步器（原 kiloTasks.js）----
+  // ---- 7F task syncer (from the old kiloTasks.js) ----
   syncKiloTasks,
   // Unified poll contract: the server calls syncTasks on this floor's pollMs (floors hold no timers — see poller.js)
   syncTasks: syncKiloTasks,
@@ -1404,6 +1490,6 @@ module.exports = {
   meta,
   kindHandlers,
   sessionTitle,
-  // 静态 subagent 目录（项目级 / 用户级）：floors.js 聚合用
+  // Static subagent dirs (project level / user level): aggregated by floors.js
   agentDirs,
 };

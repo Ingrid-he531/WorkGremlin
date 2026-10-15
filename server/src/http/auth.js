@@ -1,8 +1,10 @@
 'use strict';
 
 /**
- * 本地鉴权：只校验本机 token（每次启动随机生成，写在 ~/.workgremlin/server.json）。
- * 目的不是防攻击，而是防止同机其他进程伪造上报 / 订阅。
+ * Local authentication: only validates the local machine token (randomly generated on every
+ * start and written to ~/.workgremlin/server.json).
+ * The goal is not to defend against attacks, but to stop other processes on the same machine
+ * from forging reports / subscriptions.
  */
 
 const { ERROR_CODES } = require('@workgremlin/shared');

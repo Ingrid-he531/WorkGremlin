@@ -1,9 +1,10 @@
 'use strict';
 
 /**
- * 工程（workspace）查询与切换。
- *   GET  /api/v1/workspace          当前工程 + 最近打开 + subagent 清单路径
- *   POST /api/v1/workspace {path}   打开某个工程目录；path 为空或 'demo' 表示切回演示数据
+ * Project (workspace) query and switch.
+ *   GET  /api/v1/workspace          current project + recently opened + subagent manifest path
+ *   POST /api/v1/workspace {path}   open a project directory; an empty path or 'demo' means
+ *                                   switching back to the demo data
  */
 
 const express = require('express');
