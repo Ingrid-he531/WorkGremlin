@@ -507,6 +507,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('产出摘要（result）带上了', Boolean(oc0) && oc0.result === '第一轮的收尾自述', oc0 && oc0.result);
   ok('还在跑的那轮不写产出摘要（半截话不算）', Boolean(oc1) && !oc1.result, oc1 && oc1.result);
   ok('模型带上了（OpenCode 的 session.model）', Boolean(oc0) && oc0.model === 'longcat-2.5-preview-free', oc0 && oc0.model);
+  // 回归：轮询那一路是 CLI/Desktop 形态，任务详情的「客户端」必须显示「OpenCode CLI」而不是只显示「OpenCode」
+  ok('任务详情「客户端」= OpenCode CLI（轮询那一路不是插件形态）', Boolean(oc0) && oc0.client_label === 'OpenCode CLI', oc0 && oc0.client_label);
   ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf('opencode@p1') === 'thinking' && taskIdOf('opencode@p1') === 'opencode:oc-sid-1:1', `${stateOf('opencode@p1')} / ${taskIdOf('opencode@p1')}`);
   const opencodeSessionStatus = repo.getSessionStatus.get({ memberId: 'opencode@p1', sessionId: 'oc-sid-1' });
   ok('OpenCode 的在飞任务也记在该会话状态行上', opencodeSessionStatus && opencodeSessionStatus.task_id === 'opencode:oc-sid-1:1' && opencodeSessionStatus.state === 'thinking');

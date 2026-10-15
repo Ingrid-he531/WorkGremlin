@@ -932,7 +932,9 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     memberId,
     client: CLIENT,
     sessionId,
-    form: null,
+    // Form of the polling path = CLI/Desktop (same as opencodeHandler's `form: 'cli'`).
+    // Leaving it null made the task detail show just "OpenCode"; it must read "OpenCode CLI".
+    form: 'cli',
     model: model || null,
     title,
     startedAt,
@@ -943,7 +945,7 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     id,
     title,
     model: model || null,
-    form: null,
+    form: 'cli',
     // 产出摘要：OpenCode 那一轮最后说的话（见 opencode.js 的 readOpencodeTurns）；
     // 还没收工的那轮先不写（半截话不算产出），收工时再补。
     result: result || null,
