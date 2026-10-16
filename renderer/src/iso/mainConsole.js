@@ -1,17 +1,17 @@
 /**
- * mainConsole.js —— 主 Agent（Craft Agent）控制台。
+ * mainConsole.js —— main Agent (Craft Agent) console.
  *
- * 只负责画，不负责状态：阶段、动作、上下文都由外面传进来（现在传的是 mock，
- * 以后换成 hook 事件即可，见 stores/mainAgent.js）。
+ * Drawing only, no state: phase, action, and context are all passed in from outside (currently mock
+ * data; later swap in hook events, see stores/mainAgent.js).
  *
- * 三样东西：
- *   1. 控制台本体（矮柜 + 台面 + 指示灯）—— 暗色低多边形，跟屋里家具同一套画法
- *   2. 悬浮屏——贴在 gy 恒定的竖直面上，所以等距下是平行四边形，内容正对镜头
- *      只显示相位状态（思考中 / 调用工具 …）：具体 prompt、读写文件、工具细节都不上屏。
- *      远看是一块发光板（只留抽象光条），放大到能看清时才把相位名写出来
- *   3. 剪影——深色的一个坐着的影子，没有五官；手在滑 / 点 / 悬停，不敲键盘
+ * Three things:
+ *   1. The console body (low cabinet + tabletop + status lights) —— dark low-poly, same drawing style as the room's furniture
+ *   2. The floating screen —— mounted on a plane of constant gy, so it is a parallelogram in isometric; content faces the camera
+ *      Only shows the phase status (thinking / calling tools …): the actual prompt, file reads/writes, and tool details never go on screen.
+ *      From afar it is a glowing panel (just abstract light bars); only when zoomed in enough does it spell out the phase name
+ *   3. The silhouette —— a dark seated shadow with no features; the hand swipes / taps / hovers, never types
  *
- * 局部坐标：屏幕内容用 (u, v) 两个 tile 当单位，u 沿 +gx、v 向下（跟名牌同一套斜切）。
+ * Local coordinates: screen content uses two tiles (u, v) as units, u along +gx, v downward (same skew as the nameplate).
  */
 
 import {
@@ -28,45 +28,45 @@ import {
   rgba,
 } from './iso';
 import { CONSOLE } from './officeMap';
-// 相位文案走 i18n（屏上第一行与 tooltip 第一行同源，见 consolePhaseLabel）。显式写 /index.js：
-// 画布模块也可能被 node 脚本直接 import（HMR / 自检），Node 不补扩展名。
+// Phase labels go through i18n (the screen's first line and the tooltip's first line share one source, see consolePhaseLabel). Write /index.js explicitly:
+// canvas modules may also be imported directly by node scripts (HMR / self-check), and Node does not add extensions.
 import { t } from '../i18n/index.js';
 
 /**
- * 屏幕第一层：相位表。busy 决定有没有光标 / 加载动画。
+ * The screen's first layer: the phase table. busy decides whether there is a cursor / loading animation.
  *
- * 2026-10-01 去掉「规划中（plan）」与「汇总中（summarize）」两个相位：它们只活在演示脚本里，
- * 真机上不产生 —— upstream 要么是演示编排，要么是服务端两条几乎触发不到的推断分支
- * （IDE 插件的 awaitingSessionIdle / 排队消息，见 server/src/sessions.js），而 reporter hook、
- * Kilo、OpenCode 都明确不把 step-start / step-finish 映射成它们（一步边界太频繁，映射后
- * 每次工具跑完都会卡在「汇总中」）。留着会让人以为真有一种"规划 / 汇总"工作阶段。
- * 那两类信息改用「待命中 + 操作行说明」表达（见 mainAgent.enterPause / sessions.inferPhase）。
+ * 2026-10-01 removed the "plan" and "summarize" phases: they only lived in the demo script,
+ * never produced on a real machine —— upstream is either the demo choreography or the server's two inference
+ * branches that almost never fire (the IDE plugin's awaitingSessionIdle / queued messages, see server/src/sessions.js), while the reporter hook,
+ * Kilo, and OpenCode all explicitly do not map step-start / step-finish onto them (step boundaries are too frequent; once mapped,
+ * every tool completion would get stuck on "summarizing"). Keeping them would make people think there really is a "plan / summarize" work phase.
+ * Those two kinds of information are instead expressed as "idle + action line description" (see mainAgent.enterPause / sessions.inferPhase).
  */
 export const PHASES = {
   idle: { color: '#6b7c94', glow: 0.22, busy: false },
   /**
-   * 未上报：这一层的 CLI 还没接 hook，只有会话文件时间可看 —— 不推断动作，
-   * 也不假装它在调工具（以前会显示「调用工具 · 改 xxx.jsonl」，那是拿文件名编造）。
+   * Unreported: the CLI at this layer does not have the hook wired up yet, only session file times are visible —— do not infer actions,
+   * and do not pretend it is calling tools (it used to show "calling tools · edited xxx.jsonl", which was inventing things from the filename).
    */
   unreported: { color: '#6b7c94', glow: 0.18, busy: false },
   thinking: { color: '#ffcf5c', glow: 0.6, busy: true },
   tool: { color: '#4c8dff', glow: 0.85, busy: true },
   dispatch: { color: '#7fb0ff', glow: 1.0, busy: true },
-  /** 任务完成：屏上写"任务完成"，剪影回到静观；内容第三层显示本次改动概要 */
+  /** Task done: the screen says "task done", the silhouette returns to watching; the third content layer shows a summary of this change */
   done: { color: '#2fbf71', glow: 0.5, busy: false },
   /**
-   * 任务取消：用户按了 ESC / 停止，这一轮没干完就被掐掉 ——
-   * 与 done 的区别只有两个：**红色**（不是"完成"那种绿）+ 屏上 / tooltip 写「任务取消」。
-   * 第三层同样是"这一轮的产出"：动过文件就列文件，一个都没动就写「没有输出」
-   * （见 IsoOfficeView 里 enterCancelled 那一段）。
+   * Task cancelled: the user pressed ESC / stop, this round was cut off before finishing ——
+   * the only two differences from done: **red** (not the "done" green) + the screen / tooltip says "task cancelled".
+   * The third layer is likewise "this round's output": list the files if any were touched, or write "no output" if none were
+   * (see the enterCancelled section in IsoOfficeView).
    */
   cancelled: { color: '#ff5c5c', glow: 0.5, busy: false },
-  /** 等待用户授权：屏上写"等待授权"，剪影举起一块牌子（见 drawOperator 的 isAwait 分支） */
+  /** Waiting for user authorization: the screen says "waiting for authorization", the silhouette raises a sign (see the isAwait branch in drawOperator) */
   await: { color: '#f5a623', glow: 0.6, busy: false },
   /**
-   * 等待 subagent 汇报：主会话还没收到 Stop，但活已经派出去了 ——
-   * 既不是"待命中"（人还在这轮任务里），也不是自己正在干活，所以单开一个相位：
-   * 屏上写"等待中"，并写出在等谁（见 IsoOfficeView 的 consoleLive）。
+   * Waiting for a subagent report: the main session has not received Stop yet, but the work is already dispatched ——
+   * this is neither "idle" (the person is still in this round's task) nor doing the work itself, so it gets its own phase:
+   * the screen says "waiting", and spells out who it is waiting for (see consoleLive in IsoOfficeView).
    */
   waiting: { color: '#5aa9ff', glow: 0.42, busy: false },
 };
@@ -76,13 +76,13 @@ export const PHASE_LIST = Object.keys(PHASES);
 const FONT = 'ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
 
 /**
- * 屏上第一层 与 tooltip 第一行**共用的**相位文案（两处口径永远一致）。
+ * The phase label **shared** by the screen's first layer and the tooltip's first line (the two always agree).
  *
- * 文案按相位 key 取（`phase.idle` / `phase.tool` …），中英两套在 i18n 的词条表里；
- * 认不出的相位回落到「待命中」。一律按相位取词、**不按工具名换文案**：
- * 工具名只说明"上一支调的是什么"，不足以说明"正在等授权"——命令类工具（Bash / Shell）
- * 以前会被换成「调用工具，需要授权」，既串到「任务完成」这些相位上（tool 字段残留），
- * 也让人以为卡住了。真正的授权信号由 await 相位单独表示，不靠工具名猜。
+ * The label is keyed by phase (`phase.idle` / `phase.tool` …); the Chinese and English sets live in the i18n entry table;
+ * an unrecognized phase falls back to "idle". Always key by phase, **never swap the label by tool name**:
+ * the tool name only says "what the last call was", not enough to say "currently waiting for authorization" —— command tools (Bash / Shell)
+ * used to be swapped to "calling tools, authorization required", which both bled onto phases like "task done" (leftover tool field),
+ * and made people think it was stuck. The real authorization signal is represented solely by the await phase, not guessed from the tool name.
  * @param {{phase?:string}} state
  */
 export function consolePhaseLabel(state) {
@@ -90,11 +90,11 @@ export function consolePhaseLabel(state) {
   return t(`phase.${PHASES[key] ? key : 'idle'}`);
 }
 
-/** 剪影：跟精灵同一套局部单位（70 ≈ 1.55 tile 高），坐着所以整体矮一截 */
+/** Silhouette: same local units as the sprite (70 ≈ 1.55 tile tall), seated so it is shorter overall */
 const BODY_UNITS = 70;
 const BODY_H = 1.55;
 
-/** 量一段文字，超宽就截掉加省略号（省得挤出屏外） */
+/** Measure a run of text; if too wide, truncate and add an ellipsis (so it does not spill off screen) */
 function fit(c, text, maxW) {
   const s = String(text || '');
   if (!s) return '';
@@ -105,17 +105,17 @@ function fit(c, text, maxW) {
 }
 
 /* ------------------------------------------------------------------ *
- * 控制台本体
+ * Console body
  * ------------------------------------------------------------------ */
 
 /**
- * 矮柜 + 台面 + 正面指示灯带 + 两根托屏的光柱。
- * 指示灯是唯一会动的地方：跑马灯式地亮过去，暗示"一直在运转"。
+ * Low cabinet + tabletop + front status light strip + two light posts holding the screen.
+ * The status lights are the only moving part: they run past marquee-style, hinting that it is "always running".
  */
 export function drawConsoleDesk(c, now) {
   const { x, y, w, d, h } = CONSOLE.desk;
 
-  // 屏幕漏到台面和地上的光
+  // Light spilling from the screen onto the tabletop and floor
   const spill = groundEllipse(x + w / 2, y + d * 0.2, 2.1, 0.01);
   const sg = c.createRadialGradient(spill.x, spill.y, 0, spill.x, spill.y, spill.rx);
   sg.addColorStop(0, 'rgba(96,150,255,0.13)');
@@ -128,24 +128,24 @@ export function drawConsoleDesk(c, now) {
   c.fill();
   c.restore();
 
-  // 柜体：下半深、台面浅一档（低多边形就靠这两块面）
+  // Cabinet body: darker lower half, tabletop one shade lighter (low-poly relies on just these two faces)
   isoBox(c, { x, y, z: 0, w, d, h: h - 0.1, color: '#252c39' });
   isoBox(c, { x: x - 0.05, y: y - 0.05, z: h - 0.1, w: w + 0.1, d: d + 0.1, h: 0.1, color: '#39414f' });
 
-  // 正面（朝 +gy = 朝镜头）的指示灯带
+  // Status light strip on the front face (facing +gy = facing the camera)
   const face = y + d;
   const lights = 9;
   const lz = h * 0.42;
   for (let i = 0; i < lights; i += 1) {
     const u = x + 0.4 + i * ((w - 0.8) / (lights - 1));
-    // 跑马灯：亮的位置随时间往前推
+    // Marquee: the lit position advances over time
     const k = ((now / 900 + i * 0.12) % 1.6) / 1.6;
     const on = k < 0.34;
     const col = on ? '#6fa8ff' : i % 3 === 0 ? '#3d4c66' : '#2c3646';
     wallQuad(c, 'y', face + 0.002, u - 0.08, u + 0.08, lz, lz + 0.09, col);
   }
 
-  // 台面上斜放的一块操作板（一块薄板 + 两道凹槽，不画键盘——主 Agent 不敲键盘）
+  // An angled control board on the tabletop (a thin board + two grooves, no keyboard drawn —— the main Agent never types)
   isoBox(c, {
     x: x + 0.5,
     y: y + 0.18,
@@ -157,16 +157,16 @@ export function drawConsoleDesk(c, now) {
   });
   wallQuad(c, 'y', y + 0.18 + 0.36, x + 0.7, x + w - 0.7, h + 0.06, h + 0.09, 'rgba(111,168,255,0.35)');
 
-  // 托住悬浮屏的两根光柱
+  // Two light posts holding up the floating screen
   CONSOLE.posts.forEach((px) => {
     isoBox(c, { x: px - 0.045, y: y + 0.3, z: h, w: 0.09, d: 0.09, h: CONSOLE.screen.z0 - h, color: '#39414f' });
-    // 柱顶一小截发光，光柱才有"撑着屏幕"的感觉
+    // A short glowing segment at the top of each post, so the post feels like it is "propping up the screen"
     wallQuad(c, 'y', y + 0.3 + 0.09, px - 0.045, px + 0.045, CONSOLE.screen.z0 - 0.12, CONSOLE.screen.z0, 'rgba(111,168,255,0.5)');
   });
 }
 
 /* ------------------------------------------------------------------ *
- * 悬浮屏
+ * Floating screen
  * ------------------------------------------------------------------ */
 
 /**
@@ -181,12 +181,12 @@ export function drawConsoleScreen(c, o) {
   const H = s.z1 - s.z0;
   const face = s.y;
 
-  // 边框（比屏大一圈，当作屏幕的厚度）
+  // Border (a ring larger than the screen, treated as the screen's thickness)
   wallQuad(c, 'y', face - 0.012, s.x - 0.07, s.x + W + 0.07, s.z0 - 0.07, s.z1 + 0.07, '#1a2130');
-  // 屏底：几乎全黑，靠后面的辉光提亮
+  // Screen base: almost fully black, lit up by the glow behind it
   wallQuad(c, 'y', face, s.x, s.x + W, s.z0, s.z1, '#05080e');
 
-  // 整屏辉光：执行中亮、待命中几乎不亮
+  // Whole-screen glow: bright while running, barely lit when idle
   c.save();
   c.globalCompositeOperation = 'lighter';
   const top = project(s.x, face, s.z1);
@@ -201,7 +201,7 @@ export function drawConsoleScreen(c, o) {
   );
   c.restore();
 
-  // ---- 内容：切到屏面自己的局部坐标（u 沿 +gx、v 向下）----
+  // ---- Content: switch to the screen face's own local coordinates (u along +gx, v downward) ----
   const o0 = project(s.x, face, s.z1);
   c.save();
   c.transform(AX.x, AX.y, -AZ.x, -AZ.y, o0.x, o0.y);
@@ -213,11 +213,11 @@ export function drawConsoleScreen(c, o) {
   const padX = 0.2;
   const inner = W - padX * 2;
   const fs1 = H * 0.32;
-  /** 字号小于这个就不写了 —— 远看留一块发光板，凑近才出字 */
+  /** Below this font size, write nothing —— from afar leave a glowing panel, only close up do letters appear */
   const showL1 = fs1 * pxPerTile >= 9;
 
   if (!showL1) {
-    // 太小了：只留三条抽象光条（远看就是"屏上有东西在动"）
+    // Too small: keep only three abstract light bars (from afar it reads as "something moving on the screen")
     for (let k = 0; k < 3; k += 1) {
       const v = H * (0.22 + k * 0.24);
       const ww = inner * (0.35 + ((k * 7 + Math.floor(now / 700)) % 4) * 0.14);
@@ -228,16 +228,16 @@ export function drawConsoleScreen(c, o) {
     return;
   }
 
-  // 状态字居中显示（2026-09-30 用户要求）：水平居中于屏宽，垂直居中于"底部进度条以上"那块。
-  // 用 textBaseline='middle' 直接以中线定位 —— 字号自适应缩小（下面 lfs）时也不用再补偏移。
+  // Center the status text (2026-09-30 user request): horizontally centered on the screen width, vertically centered in the area "above the bottom progress bar".
+  // Use textBaseline='middle' to position by the midline directly —— so no offset is needed when the font size auto-shrinks (lfs below).
   c.textAlign = 'center';
   c.textBaseline = 'middle';
 
-  /* 唯一一层内容：相位状态（思考中 / 调用工具 …）。
-     只显示状态，不显示具体 prompt、读写文件、调用工具的细节 —— 那些留在 tooltip / 对话记录里。
-     文案与 tooltip 第一行走同一个 consolePhaseLabel()（调用工具就写「调用工具」）；
-     文案长就自动缩字号，别被 fit 截成省略号。
-     待命中缓慢呼吸，执行中常亮。文字按整宽排 —— 不跟闪烁光标（给它预留位置会把文案挤成省略号）。 */
+  /* The only content layer: the phase status (thinking / calling tools …).
+     Shows only the status, not the actual prompt, file reads/writes, or tool-call details —— those stay in the tooltip / conversation log.
+     The label comes from the same consolePhaseLabel() as the tooltip's first line (calling tools writes "calling tools");
+     if the label is long it auto-shrinks the font size, so it does not get truncated into an ellipsis by fit.
+     Idle breathes slowly, running stays lit. Text is laid out across the full width —— not alongside the blinking cursor (reserving space for it would squeeze the label into an ellipsis). */
   const blink = ph.busy ? 1 : 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(now / 700));
   const label = consolePhaseLabel(state);
   let lfs = fs1;
@@ -247,7 +247,7 @@ export function drawConsoleScreen(c, o) {
     lfs = Math.max(fs1 * 0.5, (fs1 * inner) / labelW);
     c.font = `700 ${lfs}px ${FONT}`;
   }
-  /** 底部那条不确定进度条的上沿；状态字在它以上的区域里居中 */
+  /** Top edge of the indeterminate progress bar at the bottom; the status text is centered in the area above it */
   const barTop = H * 0.93;
   const labelV = barTop / 2;
   const labelText = fit(c, label, inner);
@@ -256,7 +256,7 @@ export function drawConsoleScreen(c, o) {
   c.fillText(labelText, W / 2, labelV);
   c.globalAlpha = 1;
 
-  /* 底部：执行中走一条不确定的进度条 */
+  /* Bottom: while running, an indeterminate progress bar slides */
   c.fillStyle = 'rgba(255,255,255,0.07)';
   c.fillRect(padX, barTop, inner, H * 0.035);
   if (ph.busy) {
@@ -268,7 +268,7 @@ export function drawConsoleScreen(c, o) {
     c.globalAlpha = 1;
   }
 
-  // 玻璃反光：一道斜着的高光
+  // Glass reflection: a slanted highlight
   c.globalCompositeOperation = 'lighter';
   c.fillStyle = 'rgba(255,255,255,0.03)';
   c.beginPath();
@@ -283,13 +283,13 @@ export function drawConsoleScreen(c, o) {
 }
 
 /* ------------------------------------------------------------------ *
- * 主 Agent 剪影
+ * Main Agent silhouette
  * ------------------------------------------------------------------ */
 
 /**
- * 一个深色的、没有五官的影子：头 + 肩 + 前伸的手臂 + 屈着的腿。
- * 动作在 滑 / 点 / 静观 之间循环（待命时基本只静观 + 呼吸），
- * 手是往控制台那边伸的，不敲键盘 —— 它是在"监控和调度"。
+ * A dark shadow with no features: head + shoulders + forward arm + bent legs.
+ * The motion cycles among swipe / tap / watch (while idle it mostly just watches + breathes),
+ * the hand reaches toward the console, never types —— it is "monitoring and dispatching".
  */
 export function drawOperator(c, o) {
   const { state, now } = o;
@@ -303,7 +303,7 @@ export function drawOperator(c, o) {
   const s = (BODY_H * UNIT_Z) / BODY_UNITS;
   const t = now / 1000;
 
-  // 动作：待命 = 静观（只有呼吸）；忙起来才滑动 / 点击
+  // Motion: idle = watch (only breathing); only when busy does it swipe / tap
   const kinds = ['swipe', 'tap', 'watch'];
   const slot = Math.floor(t / 3.2);
   const k = (t / 3.2) % 1;
@@ -322,7 +322,7 @@ export function drawOperator(c, o) {
   const body = '#0a0f16';
   const rim = rgba(ph.color, 0.34);
 
-  // 腿：屈着坐（大腿向前、小腿向下），只露一点点
+  // Legs: seated with bent knees (thigh forward, shin down), only a little shows
   c.fillStyle = body;
   c.beginPath();
   c.moveTo(2, -28);
@@ -334,7 +334,7 @@ export function drawOperator(c, o) {
   c.closePath();
   c.fill();
 
-  // 躯干：微微前倾，随呼吸起伏
+  // Torso: leaning slightly forward, rising and falling with the breath
   c.save();
   c.translate(0, breathe);
   c.beginPath();
@@ -345,16 +345,16 @@ export function drawOperator(c, o) {
   c.closePath();
   c.fill();
 
-  // 头（没有五官，就是个圆）
+  // Head (no features, just a circle)
   c.beginPath();
   c.arc(2 + Math.sin(t * 0.8) * 0.7, -60, 9.6, 0, Math.PI * 2);
   c.fill();
   c.restore();
 
-  // 手臂：等待授权时举牌（一只手高高举起一块牌子），其余状态沿用 滑/点/静观
+  // Arms: while awaiting authorization it raises a sign (one hand holds a board high), other states reuse swipe/tap/watch
   const isAwait = state.phase === 'await';
   if (isAwait) {
-    // 举牌的胳膊：手抬到头部高度即可，别举过头顶去挡悬浮屏
+    // Sign-raising arm: raise the hand only to head height, do not go above the head and block the floating screen
     const bob = Math.sin(t * 2.2) * 2.4;
     const sh = { x: 8, y: -47 + breathe };
     const hand = { x: 28, y: -60 + bob + breathe };
@@ -368,25 +368,25 @@ export function drawOperator(c, o) {
     c.lineTo(el.x, el.y);
     c.lineTo(hand.x, hand.y);
     c.stroke();
-    // 另一只手搭在台沿上
+    // Other hand resting on the tabletop edge
     c.beginPath();
     c.moveTo(-10, -46 + breathe);
     c.lineTo(-16, -38 + breathe);
     c.lineTo(-6, -32 + breathe);
     c.stroke();
-    // 牌子：小一点，举在头部高度（牌底贴手，整体在头顶以下），不挡屏
+    // Sign: keep it small, held at head height (bottom touches the hand, entirely below the top of the head), does not block the screen
     const bw = 22;
     const bh = 12;
     const boardCx = hand.x + 1;
     const boardCy = hand.y - bh / 2 - 3;
-    // 牌立柱（手 → 牌底）
+    // Sign post (hand → sign bottom)
     c.strokeStyle = '#3a4252';
     c.lineWidth = 2.6;
     c.beginPath();
     c.moveTo(hand.x, hand.y);
     c.lineTo(boardCx, boardCy + bh / 2);
     c.stroke();
-    // 牌子淡光晕
+    // Soft halo on the sign
     c.save();
     c.globalCompositeOperation = 'lighter';
     const sg2 = c.createRadialGradient(boardCx, boardCy, 0, boardCx, boardCy, 16);
@@ -397,13 +397,13 @@ export function drawOperator(c, o) {
     c.arc(boardCx, boardCy, 16, 0, Math.PI * 2);
     c.fill();
     c.restore();
-    // 牌面：小、深灰底
+    // Sign face: small, dark gray base
     c.fillStyle = '#414a5a';
     c.fillRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
     c.strokeStyle = '#6b7686';
     c.lineWidth = 1.1;
     c.strokeRect(boardCx - bw / 2, boardCy - bh / 2, bw, bh);
-    // 牌上用一排两个白色点点示意有字（点4：原三排白点改成一排两个）
+    // On the sign, a row of two white dots suggests text (dot 4: the original three rows of white dots became one row of two)
     c.fillStyle = 'rgba(232,237,242,0.92)';
     const dotR = 1.25;
     const gap = 3.3;
@@ -414,7 +414,7 @@ export function drawOperator(c, o) {
       c.arc(sx + d * gap, boardCy, dotR, 0, Math.PI * 2);
       c.fill();
     }
-    // 举牌胳膊的轮廓光
+    // Rim light on the sign-raising arm
     c.strokeStyle = rim;
     c.lineWidth = 1.4;
     c.beginPath();
@@ -422,7 +422,7 @@ export function drawOperator(c, o) {
     c.lineTo(hand.x, hand.y);
     c.stroke();
   } else {
-  // 手臂：肩 → 肘 → 手，手往控制台那边伸（屏幕上在右下方）
+  // Arm: shoulder → elbow → hand, the hand reaches toward the console (down-right on screen)
   const sh = { x: 8, y: -47 + breathe };
   const hand = { x: 26 + handU, y: -34 + handV + breathe };
   const el = { x: (sh.x + hand.x) / 2 + 4, y: (sh.y + hand.y) / 2 + 5 };
@@ -435,14 +435,14 @@ export function drawOperator(c, o) {
   c.lineTo(el.x, el.y);
   c.lineTo(hand.x, hand.y);
   c.stroke();
-  // 另一只手搭在台沿上，几乎不动
+  // Other hand resting on the tabletop edge, barely moving
   c.beginPath();
   c.moveTo(-10, -46 + breathe);
   c.lineTo(-16, -38 + breathe);
   c.lineTo(-6, -32 + breathe);
   c.stroke();
 
-  // 轮廓光：屏在右下方，所以亮边压在右侧
+  // Rim light: the screen is down-right, so the bright edge is pressed onto the right side
   c.strokeStyle = rim;
   c.lineWidth = 1.4;
   c.beginPath();
@@ -457,7 +457,7 @@ export function drawOperator(c, o) {
   c.lineTo(hand.x, hand.y);
   c.stroke();
 
-  // 手上一点光：滑动 / 点击时才亮，像是在屏上操作
+  // A bit of light on the hand: lights up only on swipe / tap, as if operating on the screen
   if (kind !== 'watch') {
     c.save();
     c.globalCompositeOperation = 'lighter';

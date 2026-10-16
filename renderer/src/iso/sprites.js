@@ -1,17 +1,17 @@
 /**
- * sprites.js —— Canvas 版精灵（小怪物 / 幽灵）与头顶标签。
+ * sprites.js —— Canvas sprites (gremlin / ghost) and overhead tags.
  *
- * 都是"广告牌"画法：身体始终正对镜头，脚底对齐地面投影点，
- * 这样在等距场景里既有立体感又不会变形。
+ * All use a "billboard" style: the body always faces the camera, the soles align with the ground projection point,
+ * so they keep a solid look without warping in an isometric scene.
  *
- * 局部坐标：脚底中心 = (0, 0)，向上为 -y，整体高约 70 单位（由外部 scale 缩放）。
+ * Local coordinates: sole center = (0, 0), up is -y, total height about 70 units (scaled externally by scale).
  */
 
 import { hash, roundRectPath } from './iso';
 
 export const SPRITE_UNITS = 70;
 
-/** 身体配色（按 memberId 稳定哈希） */
+/** Body palette (stable hash by memberId) */
 const PALETTE = [
   '#ffd79a', '#8fd3f4', '#2fbf71', '#c084fc',
   '#ff8fa3', '#9aa7b8', '#f2a33c', '#5aa9e6',
@@ -21,7 +21,7 @@ export function colorOf(id) {
   return PALETTE[hash(id) % PALETTE.length];
 }
 
-/** 手里的道具：按名字猜职业，猜不到就给个小本子 */
+/** Prop in hand: guess the role from the name —— fall back to a small notepad */
 const PROPS = {
   leader: 'megaphone',
   researcher: 'magnifier',
@@ -39,7 +39,7 @@ export function propOf(id) {
 const FONT = '12px ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
 
 /* ------------------------------------------------------------------ *
- * 小怪物
+ * Gremlin
  * ------------------------------------------------------------------ */
 
 /**
@@ -59,7 +59,7 @@ export function drawGremlin(ctx, o) {
   ctx.scale(s * facing, s);
   if (alpha !== 1) ctx.globalAlpha *= alpha;
   if (state === 'offline') {
-    // 离线：整体变淡、脚下加一个虚线环，避免融入暗背景
+    // Offline: fade the whole sprite and add a dashed ring at the feet so it does not blend into the dark background
     ctx.globalAlpha *= 0.5;
     ctx.save();
     ctx.strokeStyle = '#9aa7b8';
@@ -74,11 +74,11 @@ export function drawGremlin(ctx, o) {
   }
 
   const bounce = walking ? Math.abs(Math.sin(phase * 2)) * 2.2 : 0;
-  const sink = sitting ? 5 : 0; // 坐着：整体下沉一点
+  const sink = sitting ? 5 : 0; // Sitting: sink down a little overall
   /**
-   * 坐着再抬升 8 单位：屁股落到椅面（z≈0.42）高度、小腿垂在座前。
-   * 不抬的话身体沉在地面高度，椅背（朝镜头那侧）一挡就只剩眼睛和角 —— 像陷进椅子里。
-   * 幅度压在头顶标签的 12px 间隙以内，角不会顶到标签。
+   * When sitting, lift another 8 units: the rear lands on the seat surface (z≈0.42) and the calves dangle in front.
+   * Without the lift the body sinks to ground level, and the chair back (the side facing the camera) leaves only the eyes and horns visible —— like being stuck down in the chair.
+   * Keep the amount within the 12px gap under the overhead tag so the horns do not poke the tag.
    */
   const lift = sitting ? 8 : 0;
   ctx.translate(0, -bounce + sink - lift);
@@ -86,7 +86,7 @@ export function drawGremlin(ctx, o) {
   const dark = mix(color, '#101720', 0.28);
   const belly = mix(color, '#ffffff', 0.42);
 
-  // 腿
+  // Legs
   const legH = sitting ? 4 : 13;
   roundRectPath(ctx, -10, -legH, 8, legH + 1, 3);
   ctx.fillStyle = dark;
@@ -94,7 +94,7 @@ export function drawGremlin(ctx, o) {
   roundRectPath(ctx, 2, -legH, 8, legH + 1, 3);
   ctx.fill();
 
-  // 身体
+  // Body
   const bodyTop = -40 + sink;
   roundRectPath(ctx, -15, bodyTop, 30, 31, 13);
   ctx.fillStyle = color;
@@ -103,13 +103,13 @@ export function drawGremlin(ctx, o) {
   ctx.lineWidth = 1.2;
   ctx.stroke();
 
-  // 肚皮
+  // Belly
   ctx.beginPath();
   ctx.ellipse(0, bodyTop + 20, 9.5, 8, 0, 0, Math.PI * 2);
   ctx.fillStyle = belly;
   ctx.fill();
 
-  // 手臂（走路时前后摆）
+  // Arms (swing back and forth while walking)
   const swing = walking ? Math.sin(phase * 2) * 5 : 0;
   ctx.strokeStyle = dark;
   ctx.lineWidth = 5;
@@ -123,7 +123,7 @@ export function drawGremlin(ctx, o) {
   ctx.lineTo(19, bodyTop + 18 - swing);
   ctx.stroke();
 
-  // 头
+  // Head
   const headY = -52 + sink;
   ctx.beginPath();
   ctx.arc(0, headY, 15.5, 0, Math.PI * 2);
@@ -131,7 +131,7 @@ export function drawGremlin(ctx, o) {
   ctx.fill();
   ctx.stroke();
 
-  // 两只角
+  // Two horns
   ctx.beginPath();
   ctx.moveTo(-11, headY - 11);
   ctx.lineTo(-14, headY - 22);
@@ -146,15 +146,15 @@ export function drawGremlin(ctx, o) {
 
   drawFace(ctx, headY, state);
 
-  // 手里的道具
+  // Prop in hand
   ctx.save();
   ctx.translate(17, bodyTop + 20);
   drawProp(ctx, o.prop || 'note', color);
   ctx.restore();
 
-  // 脖子上的工牌：颜色区分用户级 / 项目级（演示专家用中性灰），黑色首字母当"名字"
+  // Badge on the neck: color distinguishes user level / project level (demo experts use neutral gray), with the black initial as the "name"
   ctx.save();
-  if (facing < 0) ctx.scale(-1, 1); // 身体镜像时工牌上的字母不能跟着镜像
+  if (facing < 0) ctx.scale(-1, 1); // The letter on the badge must not mirror along with the body
   drawLevelBadge(ctx, level, String(o.name || '').trim().charAt(0).toUpperCase(), { nx: 0, ny: bodyTop + 2 }, { bx: 0, by: bodyTop + 10 });
   ctx.restore();
 
@@ -162,7 +162,7 @@ export function drawGremlin(ctx, o) {
 }
 
 /* ------------------------------------------------------------------ *
- * 幽灵（临时成员）
+ * Ghost (temporary member)
  * ------------------------------------------------------------------ */
 
 export function drawGhost(ctx, o) {
@@ -177,13 +177,13 @@ export function drawGhost(ctx, o) {
   ctx.globalAlpha *= alpha;
   if (state === 'offline') ctx.filter = 'grayscale(0.8)';
 
-  const bob = Math.sin(phase) * 2; // 飘：整体上下
+  const bob = Math.sin(phase) * 2; // Float: bob up and down overall
   ctx.translate(0, bob);
 
   const light = mix(color, '#ffffff', 0.35);
   const headY = -48;
 
-  // 身体：头顶半圆 + 两侧直下 + 波浪下摆
+  // Body: a half-circle on top + straight sides + a wavy hem
   ctx.beginPath();
   ctx.arc(0, headY, 15, Math.PI, 0);
   ctx.lineTo(15, -10);
@@ -205,7 +205,7 @@ export function drawGhost(ctx, o) {
   ctx.stroke();
   ctx.restore();
 
-  // 高光
+  // Highlight
   ctx.beginPath();
   ctx.ellipse(-6, headY + 2, 5, 7, -0.3, 0, Math.PI * 2);
   ctx.fillStyle = 'rgba(255,255,255,0.22)';
@@ -213,7 +213,7 @@ export function drawGhost(ctx, o) {
 
   drawFace(ctx, headY, state, true);
 
-  // 天线（远程接入）
+  // Antenna (remote access)
   ctx.strokeStyle = light;
   ctx.lineWidth = 1.6;
   ctx.beginPath();
@@ -229,26 +229,26 @@ export function drawGhost(ctx, o) {
 }
 
 /* ------------------------------------------------------------------ *
- * 工牌（脖子上的级别牌）—— 仅小怪物（drawGremlin）使用
+ * Badge (level card on the neck) —— used only by the gremlin (drawGremlin)
  * ------------------------------------------------------------------ */
 
 /**
- * 画一张挂在脖子上的小工牌。用明显的实色底色区分 subagent 级别：
- *   · user    -> 蓝（#3b82f6）
- *   · project -> 绿（#22c55e）
- *   · 其它（演示专家 / 普通成员）-> 中性灰（#7c8aa5）
- * 卡片中央用黑色写名字的首字母（中文名取第一个字）。
+ * Draw a small badge hanging on the neck. Distinguish subagent levels with a clearly solid background color:
+ *   · user    -> blue (#3b82f6)
+ *   · project -> green (#22c55e)
+ *   · other (demo expert / regular member) -> neutral gray (#7c8aa5)
+ * Write the name's initial in black at the center of the card (for Chinese names, take the first character).
  * @param {CanvasRenderingContext2D} ctx
- * @param {string} level 'user' | 'project' | 其它
- * @param {string} initial 名字首字母（空串则不画字）
- * @param {{nx:number, ny:number}} neck 挂绳在脖子上的锚点
- * @param {{bx:number, by:number}} anchor 卡片的水平中心 x 与上沿 y
+ * @param {string} level 'user' | 'project' | other
+ * @param {string} initial Name initial (draw no letter when empty string)
+ * @param {{nx:number, ny:number}} neck Neck anchor where the lanyard attaches
+ * @param {{bx:number, by:number}} anchor Card horizontal center x and top edge y
  */
 function drawLevelBadge(ctx, level, initial, neck, anchor) {
   const color =
     level === 'user' ? '#3b82f6' : level === 'project' ? '#22c55e' : '#7c8aa5';
   ctx.save();
-  // 挂绳：从脖子两侧拉到卡片上沿（锚点在头部下方、身体上方的脖子处）
+  // Lanyard: pull from both sides of the neck to the top edge of the card (the anchor is at the neck, below the head and above the body)
   ctx.strokeStyle = 'rgba(20,24,32,0.6)';
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -257,7 +257,7 @@ function drawLevelBadge(ctx, level, initial, neck, anchor) {
   ctx.moveTo(neck.nx + 3, neck.ny);
   ctx.lineTo(anchor.bx + 3, anchor.by);
   ctx.stroke();
-  // 竖长方形卡片：明显的实色底色 + 黑色边框
+  // Vertical rectangular card: a clearly solid background color + black border
   const cardW = 11;
   const cardH = 15;
   const left = anchor.bx - cardW / 2;
@@ -267,7 +267,7 @@ function drawLevelBadge(ctx, level, initial, neck, anchor) {
   ctx.strokeStyle = '#0f141b';
   ctx.lineWidth = 1.4;
   ctx.stroke();
-  // 名字首字母（黑色，居中）
+  // Name initial (black, centered)
   if (initial) {
     ctx.fillStyle = '#0f141b';
     ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
@@ -279,7 +279,7 @@ function drawLevelBadge(ctx, level, initial, neck, anchor) {
 }
 
 /* ------------------------------------------------------------------ *
- * 表情
+ * Expression
  * ------------------------------------------------------------------ */
 
 function drawFace(ctx, headY, state, ghost = false) {
@@ -292,7 +292,7 @@ function drawFace(ctx, headY, state, ghost = false) {
   ctx.lineCap = 'round';
 
   if (state === 'idle') {
-    // 闭眼：两条下弧
+    // Closed eyes: two downward arcs
     ctx.beginPath();
     ctx.arc(-eyeX, eyeY + 1, 3.4, Math.PI * 0.15, Math.PI * 0.85);
     ctx.stroke();
@@ -306,7 +306,7 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.font = 'italic 7px ui-sans-serif, sans-serif';
     ctx.fillText('z', 17, headY - 21);
   } else if (state === 'busy') {
-    // 专注：眯眼 + 皱眉
+    // Focused: squinted eyes + furrowed brows
     ctx.beginPath();
     ctx.moveTo(-eyeX - 3, eyeY);
     ctx.lineTo(-eyeX + 3, eyeY - 1.5);
@@ -321,7 +321,7 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.lineWidth = 1.3;
     ctx.stroke();
   } else if (state === 'blocked') {
-    // 卡住：眼睛是两个点 + 头顶感叹号
+    // Blocked: eyes are two dots + an exclamation mark overhead
     ctx.beginPath();
     ctx.arc(-eyeX, eyeY, 2.4, 0, Math.PI * 2);
     ctx.arc(eyeX, eyeY, 2.4, 0, Math.PI * 2);
@@ -337,7 +337,7 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.font = 'bold 15px ui-sans-serif, sans-serif';
     ctx.fillText('!', -2, headY - 20);
   } else if (state === 'offline') {
-    // 离线：一条横线
+    // Offline: a single horizontal line
     ctx.beginPath();
     ctx.moveTo(-eyeX - 3, eyeY);
     ctx.lineTo(-eyeX + 3, eyeY);
@@ -346,7 +346,7 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.lineWidth = 1.8;
     ctx.stroke();
   } else {
-    // online：亮眼睛 + 高光
+    // online: bright eyes + highlight
     ctx.beginPath();
     ctx.ellipse(-eyeX, eyeY, 3.2, 4, 0, 0, Math.PI * 2);
     ctx.ellipse(eyeX, eyeY, 3.2, 4, 0, 0, Math.PI * 2);
@@ -358,7 +358,7 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.fill();
   }
 
-  // 嘴（除离线）
+  // Mouth (except offline)
   if (state !== 'offline') {
     ctx.strokeStyle = '#1b2029';
     ctx.lineWidth = 1.4;
@@ -371,7 +371,7 @@ function drawFace(ctx, headY, state, ghost = false) {
 }
 
 /* ------------------------------------------------------------------ *
- * 道具
+ * Props
  * ------------------------------------------------------------------ */
 
 function drawProp(ctx, kind, color) {
@@ -446,12 +446,12 @@ function drawProp(ctx, kind, color) {
 }
 
 /* ------------------------------------------------------------------ *
- * 头顶标签
+ * Overhead tag
  * ------------------------------------------------------------------ */
 
 /**
- * 画一个胶囊标签（状态点 + 文字）。
- * @returns {{w:number,h:number}} 尺寸（供命中测试）
+ * Draw a capsule tag (status dot + text).
+ * @returns {{w:number,h:number}} Size (for hit testing)
  */
 export function drawTag(ctx, o) {
   const { x, y, text, color, dashed = false, alpha = 1 } = o;
@@ -484,7 +484,7 @@ export function drawTag(ctx, o) {
   return { w, h };
 }
 
-/** 测量标签宽度（命中测试用） */
+/** Measure tag width (for hit testing) */
 export function measureTag(ctx, text) {
   ctx.save();
   ctx.font = FONT;
@@ -494,7 +494,7 @@ export function measureTag(ctx, text) {
 }
 
 /* ------------------------------------------------------------------ *
- * 颜色工具
+ * Color helpers
  * ------------------------------------------------------------------ */
 
 function mix(a, b, t) {

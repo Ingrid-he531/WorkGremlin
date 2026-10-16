@@ -1,39 +1,39 @@
 /**
- * iso.js —— 等距（isometric）办公室的投影 + 基础几何绘制原语。
+ * iso.js —— projection + basic geometry drawing primitives for the isometric office.
  *
- * 全部用 Canvas 2D 现画，不依赖任何外部素材。
+ * Everything is drawn live with Canvas 2D, relying on no external assets.
  *
- * 坐标约定（世界坐标，单位 = tile，约等于 1 米）：
- *   gx 向右前（屏幕右下 30°）
- *   gy 向左前（屏幕左下 30°）
- *   gz 向上（屏幕竖直向上）
+ * Coordinate convention (world coordinates, unit = tile, roughly 1 meter):
+ *   gx toward front-right (30° to the screen bottom-right)
+ *   gy toward front-left (30° to the screen bottom-left)
+ *   gz upward (straight up on screen)
  *
- * 投影用的是**真等距**：三根轴在屏幕上两两成 120°、长度相等（经典 30° 等距）。
+ * The projection is **true isometric**: the three axes are 120° apart on screen and equal in length (classic 30° isometric).
  *   sx = gx*AX.x + gy*AY.x + gz*AZ.x
  *   sy = gx*AX.y + gy*AY.y + gz*AZ.y
- * 于是地面（x-y 平面）是标准菱形、房间围成一个规整的盒子，
- * 后墙 / 左墙 / 桌面 / 屏幕都是平行四边形的面 —— 没有任何一面是"正对镜头"的。
+ * So the ground (x-y plane) is a standard diamond and the room forms a tidy box,
+ * the back wall / left wall / desk top / screen are all parallelogram faces —— none of them faces the camera head-on.
  *
- * （不用真透视的"近大远小"：平行关系消失，排序和贴图都要重做。
- *  平行投影形状规整，遮挡仍可用一个 depth 键排出来。）
+ * (No true-perspective "near large, far small": parallel relationships vanish, and both sorting and texturing would have to be redone.
+ *  Parallel projection keeps shapes tidy, and occlusion can still be sorted with a single depth key.)
  *
- * 遮挡：相机在 +x +y +z 方向，depth 越大越靠近镜头，后画的压住先画的。
+ * Occlusion: the camera sits in the +x +y +z direction, so a larger depth is closer to the camera and later draws cover earlier ones.
  */
 
-/** 一个地砖在屏幕上的"轴长"（三轴等长 = 等距） */
+/** The "axis length" of one tile on screen (three equal axes = isometric) */
 export const TILE = 44;
 const COS30 = Math.cos(Math.PI / 6);
 const SIN30 = Math.sin(Math.PI / 6);
 
-/** 世界三根轴在屏幕上的向量（像素 / 1 tile） */
+/** Screen vectors for the three world axes (pixels / 1 tile) */
 export const AX = { x: TILE * COS30, y: TILE * SIN30 };
 export const AY = { x: -TILE * COS30, y: TILE * SIN30 };
 export const AZ = { x: 0, y: -TILE };
 
-/** 1 个高度单位对应的屏幕像素 */
+/** Screen pixels for one height unit */
 export const UNIT_Z = -AZ.y;
 
-/** 世界坐标 → 屏幕坐标（未乘相机缩放，缩放交给 ctx.transform） */
+/** World coordinates → screen coordinates (camera zoom not applied; zoom is left to ctx.transform) */
 export function project(gx, gy, gz = 0) {
   return {
     x: gx * AX.x + gy * AY.x + gz * AZ.x,
@@ -42,14 +42,14 @@ export function project(gx, gy, gz = 0) {
 }
 
 /**
- * 排序键：越大越靠前（后画）。
- * 等距下两根水平轴都是"离镜头越远越小"，所以 gx、gy 权重相同：depth = gx + gy。
+ * Depth key: larger means closer to the front (drawn later).
+ * Under isometric the two horizontal axes both "shrink with distance from the camera", so gx and gy carry equal weight: depth = gx + gy.
  */
 export const depthOf = (gx, gy) => gx + gy;
 
 /**
- * 地面（z = const 平面）上以 (x, y) 为心、世界半径 r 的圆，投影后是个**斜椭圆**。
- * 由两条共轭半径 u = r*AX、v = r*AY 解出半轴与倾角，直接喂给 ctx.ellipse。
+ * A circle on the ground (z = const plane) centered at (x, y) with world radius r projects to an **oblique ellipse**.
+ * Solve for the semi-axes and tilt from the two conjugate radii u = r*AX and v = r*AY, then feed them straight to ctx.ellipse.
  */
 export function groundEllipse(x, y, r, z = 0) {
   const c = project(x, y, z);
@@ -75,10 +75,10 @@ export function groundEllipse(x, y, r, z = 0) {
 }
 
 /* ------------------------------------------------------------------ *
- * 颜色
+ * Color
  * ------------------------------------------------------------------ */
 
-/** 颜色明暗：k < 1 变暗，k > 1 变亮 */
+/** Color shading: k < 1 darkens, k > 1 brightens */
 export function shade(hex, k) {
   const h = String(hex).replace('#', '');
   const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
@@ -102,10 +102,10 @@ export function rgba(hex, a) {
 }
 
 /* ------------------------------------------------------------------ *
- * 基础图元
+ * Basic primitives
  * ------------------------------------------------------------------ */
 
-/** 多边形：[{x,y}...] */
+/** Polygon: [{x,y}...] */
 export function poly(ctx, pts, fill, stroke, lw = 1) {
   ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
@@ -122,7 +122,7 @@ export function poly(ctx, pts, fill, stroke, lw = 1) {
   }
 }
 
-/** 地面上的菱形（地砖 / 地毯 / 区域底色） */
+/** Diamond on the ground (tile / carpet / zone base color) */
 export function isoDiamond(ctx, o) {
   const { x, y, w, d, z = 0, fill, stroke, alpha = 1, lw = 1 } = o;
   const pts = [project(x, y, z), project(x + w, y, z), project(x + w, y + d, z), project(x, y + d, z)];
@@ -133,8 +133,8 @@ export function isoDiamond(ctx, o) {
 }
 
 /**
- * 等距长方体：可见的顶面 + 两个侧面。
- * 顶面最亮、右后侧（+gy，屏幕左下）中等、右侧（+gx，屏幕右下）最暗。
+ * Isometric cuboid: the visible top face + two side faces.
+ * The top face is brightest, the rear-right side (+gy, screen bottom-left) is mid, and the right side (+gx, screen bottom-right) is darkest.
  */
 export function isoBox(ctx, o) {
   const { x, y, z = 0, w, d, h, color, alpha = 1, stroke, lw = 1, top, south, east } = o;
@@ -144,19 +144,19 @@ export function isoBox(ctx, o) {
 
   ctx.save();
   if (alpha !== 1) ctx.globalAlpha *= alpha;
-  // 朝 +gy 的面（屏幕左下）
+  // Face toward +gy (screen bottom-left)
   poly(ctx, [project(x, y + d, z + h), project(x + w, y + d, z + h), project(x + w, y + d, z), project(x, y + d, z)], cSouth, stroke, lw);
-  // 朝 +gx 的面（屏幕右下）
+  // Face toward +gx (screen bottom-right)
   poly(ctx, [project(x + w, y, z + h), project(x + w, y + d, z + h), project(x + w, y + d, z), project(x + w, y, z)], cEast, stroke, lw);
-  // 顶面
+  // Top face
   poly(ctx, [project(x, y, z + h), project(x + w, y, z + h), project(x + w, y + d, z + h), project(x, y + d, z + h)], cTop, stroke, lw);
   ctx.restore();
 }
 
 /**
- * 圆柱（杯子、水桶、绿植盆、椅子的中柱）。
- * 斜投影下地面圆是**斜椭圆**，没法用轴对齐的 ctx.ellipse 拼，
- * 所以直接把圆周离散成多边形逐点投影：侧面 = 圆周沿 z 轴扫出的带。
+ * Cylinder (cup, bucket, plant pot, chair center post).
+ * Under oblique projection a ground circle is an **oblique ellipse**, which cannot be assembled from axis-aligned ctx.ellipse calls,
+ * so the circumference is discretized into a polygon and projected point by point: the side = the band the circumference sweeps along the z axis.
  */
 export function isoCylinder(ctx, o) {
   const { x, y, z = 0, r, h, color, alpha = 1, stroke, lw = 1, seg = 20 } = o;
@@ -172,7 +172,7 @@ export function isoCylinder(ctx, o) {
 
   ctx.save();
   if (alpha !== 1) ctx.globalAlpha *= alpha;
-  // 侧面：底环正序 + 顶环逆序，nonzero 填充正好是"扫掠带"
+  // Side: bottom ring in forward order + top ring in reverse, so nonzero fill gives exactly the "swept band"
   ctx.beginPath();
   ctx.moveTo(bot[0].x, bot[0].y);
   for (let i = 1; i < seg; i += 1) ctx.lineTo(bot[i].x, bot[i].y);
@@ -185,7 +185,7 @@ export function isoCylinder(ctx, o) {
     ctx.lineWidth = lw;
     ctx.stroke();
   }
-  // 顶面
+  // Top face
   ctx.beginPath();
   ctx.moveTo(top[0].x, top[0].y);
   for (let i = 1; i < seg; i += 1) ctx.lineTo(top[i].x, top[i].y);
@@ -195,7 +195,7 @@ export function isoCylinder(ctx, o) {
   ctx.restore();
 }
 
-/** 落地投影 */
+/** Ground shadow */
 export function isoShadow(ctx, x, y, r = 0.42, alpha = 0.28) {
   const e = groundEllipse(x, y, r, 0);
   ctx.save();
@@ -208,9 +208,9 @@ export function isoShadow(ctx, x, y, r = 0.42, alpha = 0.28) {
 }
 
 /**
- * 墙面上的矩形（贴在后墙或左墙内侧）。
- * axis='y'：后墙（gy 固定），a0/a1 是 gx 范围
- * axis='x'：左墙（gx 固定），a0/a1 是 gy 范围
+ * Rectangle on a wall (applied to the inner side of the back wall or left wall).
+ * axis='y': back wall (gy fixed), a0/a1 is the gx range
+ * axis='x': left wall (gx fixed), a0/a1 is the gy range
  */
 export function wallQuad(ctx, axis, fixed, a0, a1, z0, z1, fill, stroke, lw = 1) {
   const p =
@@ -221,10 +221,10 @@ export function wallQuad(ctx, axis, fixed, a0, a1, z0, z1, fill, stroke, lw = 1)
 }
 
 /* ------------------------------------------------------------------ *
- * 杂项
+ * Misc
  * ------------------------------------------------------------------ */
 
-/** 圆角矩形路径（不依赖 ctx.roundRect 的兼容性） */
+/** Rounded rectangle path (independent of ctx.roundRect compatibility) */
 export function roundRectPath(ctx, x, y, w, h, r) {
   const rr = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
   ctx.beginPath();
@@ -240,7 +240,7 @@ export function roundRectPath(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-/** 字符串 → 稳定哈希（配色、屏幕内容抖动都用它） */
+/** String → stable hash (used for palette colors and screen-content jitter) */
 export function hash(s) {
   let h = 2166136261;
   const str = String(s || '');

@@ -1,11 +1,11 @@
 /**
- * engine.js —— 等距办公室的渲染与行为引擎（纯 Canvas 2D）。
+ * engine.js —— rendering and behavior engine for the isometric office (pure Canvas 2D).
  *
- * 一帧的流程：
- *   1. 背景（地板/地毯/墙/窗）→ 离屏缓存，只在相机变化时重画
- *   2. 把"静态家具"和"角色"混在一起，按 depth = x + y 排序后依次画
- *      —— 所以桌子会自然挡住坐在后面的人的下半身，这就是"2.5D"
- *   3. 头顶标签单独一层画在屏幕空间（不跟着缩放，永远清晰）
+ * One frame goes through:
+ *   1. Background (floor/carpet/wall/window) -> offscreen cache, redrawn only when the camera changes
+ *   2. "Static furniture" and "characters" mixed together, sorted by depth = x + y, then drawn in order
+ *      —— so a desk naturally hides the lower half of the person sitting behind it; that is the "2.5D"
+ *   3. Overhead tags drawn on a separate screen-space layer (not scaled, always crisp)
  */
 
 import {
@@ -43,7 +43,7 @@ import {
 } from './officeMap';
 import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from './sprites';
 import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator } from './mainConsole';
-// 画布上的文字（名牌、气泡、墙上标签）也走 i18n：每帧重绘，读到的是当前语言
+// Text on the canvas (nameplates, bubbles, wall signs) also goes through i18n: redrawn every frame, so it reads the current language
 import { t } from '../i18n/index.js';
 
 const STATE_COLOR = {
@@ -54,18 +54,18 @@ const STATE_COLOR = {
   thinking: '#ffcf5c',
   offline: '#4a5160',
 };
-/** 隔板便签上那颗磁吸固定器的金属色（金属件，不随楼层变）。
- *  便签纸色与墨色不在这里写死 —— 走本层配色 colors.note / colors.noteInk（见 officeMap 的 FLOOR_COLORS）。 */
+/** Metal color of the magnet pin on the divider sticky note (metal part, does not change per floor).
+ *  The note paper and ink colors are not hardcoded here —— they use this floor's palette colors.note / colors.noteInk (see officeMap's FLOOR_COLORS). */
 const MAGNET = '#c3ccda';
-/** 工牌级别色（与小怪物脖子上的工牌一致）：user=蓝, project=绿, 其它（演示/普通）=灰 */
+/** Badge level colors (matching the badge on the gremlin's neck): user=blue, project=green, others (demo/normal)=gray */
 const LEVEL_COLOR = { user: '#3b82f6', project: '#22c55e' };
 const levelColor = (level) => LEVEL_COLOR[level] || '#7c8aa5';
 /**
- * 对外状态牌分三档：阻塞 / 忙碌 / 空闲。
- * busy（含旧的 thinking 值）→ 忙碌；blocked → 阻塞（等外部依赖，老人需求 §5.6）；其余 → 空闲。
+ * Public status badge has three buckets: blocked / busy / idle.
+ * busy (including the old thinking value) -> busy; blocked -> blocked (waiting on an external dependency, old-man requirement §5.6); the rest -> idle.
  */
 const bucketOf = (s) => (s === 'blocked' ? 'blocked' : s === 'busy' || s === 'thinking' ? 'busy' : 'idle');
-/** 忙碌时具体在干的事（只决定走路/钉座位，头顶标签不再显示细节） */
+/** What it is actually doing while busy (only decides walking/pinning to seat; the overhead tag no longer shows details) */
 const WORK_KEYS = ['think', 'code', 'doc'];
 const hashOf = (s) => {
   let h = 0;
@@ -73,15 +73,15 @@ const hashOf = (s) => {
   for (let i = 0; i < str.length; i += 1) h = (h * 31 + str.charCodeAt(i)) >>> 0;
   return h;
 };
-/** 按 id 固定分配，避免每次刷新乱跳 */
+/** Assigned deterministically by id, so it does not jump around on every refresh */
 const workOf = (id) => WORK_KEYS[hashOf(id) % WORK_KEYS.length];
 
-/** 身高（tile）：人 ≈ 1.55 个地砖 */
+/** Height (tile): a person is ~1.55 floor tiles */
 const SPRITE_H = 1.55;
-/** 走路速度（tile/秒） */
+/** Walk speed (tile/s) */
 const SPEED = 2.1;
 
-/** 幽灵的悬浮锚点（世界坐标 + 高度） */
+/** Ghost hover anchors (world coordinates + height) */
 const GHOST_SPOTS = [
   { x: 3.5, y: 1.6, z: 2.05 },
   { x: 8.0, y: 1.5, z: 2.2 },
@@ -90,7 +90,7 @@ const GHOST_SPOTS = [
   { x: 10.4, y: 5.4, z: 1.9 },
   { x: 2.2, y: 9.4, z: 2.2 },
 ];
-// 幽灵"留在会议室里"的悬停点（跟右侧街区的整体右移一起挪 0.4，仍落在会议桌上方）
+// The ghost's "staying in the meeting room" hover spot (shifted 0.4 together with the whole right block's move, still above the meeting table)
 const GHOST_MEET = { x: 17.4, y: 3.6, z: 2.25 };
 
 /** Pick-up dialogue: the main console hands over the task and the gremlin answers, in place. Seconds. */
@@ -125,59 +125,59 @@ const GHOST_ENTRY_STAGGER = 420; // ms: same batch leaves one at a time, not pil
 const GHOST_ENTRY_SETTLE = 280; // ms: a beat after the gremlins are in, so the two rhythms read apart
 const GHOST_ENTRY_WAIT_MAX = 5000; // ms: fallback for waiting on gremlins (a summon interrupts entry; never lock a ghost outside forever)
 /**
- * 入场：小怪物不是凭空出现在工位上，而是一个个从大门进来、走到自己工位坐下。
- * @property {number} ENTER_DELAY 第一批露面前的等待（等画面先亮起来）
- * @property {number} ENTER_STAGGER 相邻两只之间隔多久（毫秒）
+ * Entry: gremlins do not pop onto their workstations out of thin air —— they come in one by one through the front door and walk to their seat.
+ * @property {number} ENTER_DELAY wait before the first one appears (let the scene light up first)
+ * @property {number} ENTER_STAGGER how long between two adjacent ones (ms)
  */
 const ENTER_DELAY = 400;
 const ENTER_STAGGER = 480;
 /**
- * 大门开合：小怪物露面之前先把门推开，最后一只进屋之后门再自己合上。
- * @property {number} DOOR_LEAD 提前多久开始开门（毫秒）—— 门先动、人后到
- * @property {number} DOOR_SWING 开 / 关一趟的时长（秒）
- * @property {number} DOOR_LINGER 最后一只进门后，门再撑多久才关（毫秒）
+ * Door open/close: push the door open before a gremlin appears, and it closes on its own after the last one is inside.
+ * @property {number} DOOR_LEAD how early to start opening the door (ms) —— door moves first, person arrives after
+ * @property {number} DOOR_SWING duration of one open / close swing (s)
+ * @property {number} DOOR_LINGER after the last one is in, how much longer the door holds before closing (ms)
  */
 const DOOR_LEAD = 420;
 const DOOR_SWING = 0.42;
 const DOOR_LINGER = 900;
-/** 门扇开到底的角度（度）：略过 90°，门才像"敞开抵在那儿"，而不是正好笔直戳出来 */
+/** Angle the door leaf opens to (degrees): just past 90°, so the door reads as "open and resting against it", not poking straight out */
 const DOOR_OPEN_DEG = 96;
-/** 开合缓动：两头慢、中间快（门有重量，不会匀速甩） */
+/** Open/close easing: slow at both ends, fast in the middle (the door has weight, it does not swing at constant speed) */
 const smooth = (t) => t * t * (3 - 2 * t);
-/** 走到这个 gx 就算"进屋了"：门洞在 gx=0，+0.55 时整个身子都在门里侧了 */
+/** Reaching this gx counts as "inside": the doorway is at gx=0, at +0.55 the whole body is past the inner side of the door */
 const DOOR_INSIDE_X = 0.55;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
-/** 标识位图缓存：同一文本只渲染一次（标签现在会被放进排序层重画，不能每帧新建 canvas） */
+/** Sign bitmap cache: the same text is rendered once (tags now get redrawn in the sort layer, cannot make a canvas every frame) */
 const WALL_TEXT_CACHE = new Map();
 
-/* ------------------------------ 跨实例持久化的召唤/汇报状态 ------------------------------
- * 办公室视图（IsoOfficeView）是路由级组件：切到"工位卡片"/"对话记录"再切回时会被
- * unmount/remount，createIsoOffice 会新建实例。如果下面这几组状态留在实例内部，
- * 切回后会认为"这只幽灵从来没召唤过"，于是已经派出去干活的小怪物会再次跑到主 agent
- * 面前重播一遍"领任务"的对话。
+/* ------------------------------ Summon/report state persisted across instances ------------------------------
+ * The office view (IsoOfficeView) is a route-level component: switching to "workstation card" / "conversation log" and back
+ * unmounts/remounts it, and createIsoOffice makes a new instance. If these groups of state lived inside the instance,
+ * on switching back it would think "this ghost was never summoned", so a gremlin already sent out to work would run up to the main agent
+ * again and replay the "pick up task" dialogue.
  *
- * 这些状态按幽灵 memberId 记录、并在幽灵从名单里消失时主动清空，所以不会无限增长，
- * 也不会让下一次全新的召唤被误判为"已经演过"。
+ * These states are recorded per ghost memberId and actively cleared when the ghost leaves the roster, so they do not grow forever,
+ * nor will they make a brand-new summon be misjudged as "already played".
  */
-/** 已注册为"被召唤"的幽灵 memberId */
+/** Ghost memberIds registered as "summoned" */
 const summonedGhostIds = new Set();
-/** 已经演过"跑到主 agent 面前领任务"的幽灵 memberId：一次召唤只演一次 */
+/** Ghost memberIds that have already played "run up to the main agent to pick up the task": one summon plays it once */
 const dispatchedGhostIds = new Set();
-/** 编排期间先隐藏的幽灵 memberId */
+/** Ghost memberIds hidden during orchestration first */
 const pendingGhostIds = new Set();
-/** 待显幽灵"至少看过一次"（用于等待任务名的兜底） */
+/** Pending ghosts "seen at least once" (fallback for waiting on the task name) */
 const pendingSeenOnce = new Set();
-/** 幽灵 memberId -> { agentId, name, color, task, result }：幽灵散了也能把汇报演完 */
+/** Ghost memberId -> { agentId, name, color, task, result }: the report can finish even after the ghost disperses */
 const ghostMeta = new Map();
-/** 同一轮召唤只汇报一次 */
+/** Report only once per summon round */
 const reportedGhostIds = new Set();
-/** 小怪物最近一次完成的结果：agent memberId -> { task, result, at }（tooltip / 工位卡片回看） */
+/** The gremlin's most recent completed result: agent memberId -> { task, result, at } (tooltip / workstation card look-back) */
 const lastResults = new Map();
 
 /**
- * 把"圆角牌底 + 文字"渲染到离屏画布（水平、高清），供斜贴到墙面。
- * 牌底+文字一起进同一张位图，斜贴后整块都随墙面平行四边形变形，像真挂在墙上。
+ * Render "rounded plate background + text" onto an offscreen canvas (horizontal, high-res), for skew-mounting onto a wall.
+ * Plate background + text go into the same bitmap; after the skew mount the whole thing deforms with the wall parallelogram, as if really hung on the wall.
  */
 
 function makeWallText(text) {
@@ -195,17 +195,17 @@ function makeWallText(text) {
   const h = fontPx + padY * 2;
   off.width = w;
   off.height = h;
-  // 改 width/height 会清空上下文，重取一次
+  // Changing width/height clears the context, so get it again
   g = off.getContext('2d');
   g.font = font;
-  // 牌底（圆角深色 + 蓝边）
+  // Plate background (rounded dark + blue border)
   roundRectPath(g, 0.75, 0.75, w - 1.5, h - 1.5, 10);
   g.fillStyle = 'rgba(18,24,34,0.82)';
   g.fill();
   g.lineWidth = 1.5;
   g.strokeStyle = 'rgba(127,176,255,0.55)';
   g.stroke();
-  // 文字：近白、加阴影保证在花背景上清晰
+  // Text: near-white, with shadow to stay legible over the busy backdrop
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   g.shadowColor = 'rgba(0,0,0,0.6)';
@@ -219,13 +219,13 @@ function makeWallText(text) {
 /**
  * @param {HTMLCanvasElement} canvas
  * @param {{onSelect?: (id: string) => void, floor?: string}} [opts]
- *   floor：当前楼层 id（如 '1F' / '3F' / '5F'）。用于挑这一层的材质配色（见 officeMap 的 colorsFor），
- *   之后可在运行时用 setFloor() 切换。
+ *   floor: current floor id (e.g. '1F' / '3F' / '5F'). Used to pick this floor's material palette (see officeMap's colorsFor),
+ *   and can later be switched at runtime with setFloor().
  */
 export function createIsoOffice(canvas, opts = {}) {
   const ctx = canvas.getContext('2d');
   const onSelect = opts.onSelect || (() => {});
-  /** 本层配色：随楼层变化的材质 token（隔断 / 金属 / 木件），其余沿用基准 */
+  /** This floor's palette: material tokens that change per floor (dividers / metal / wood), the rest follows the base */
   let colors = colorsFor(opts.floor);
   let floorId = opts.floor || '';
 
@@ -241,8 +241,8 @@ export function createIsoOffice(canvas, opts = {}) {
   /** @type {any[]} */
   let ghosts = [];
   /**
-   * 小幽灵的"开闸"时刻：所有小怪物进完屋的那一刻（见 stepGhosts）。
-   * 第一批幽灵从这一刻起一个接一个从大门飘进来；0 = 还没开闸。
+   * The ghost's "gate open" moment: the instant every gremlin has finished entering (see stepGhosts).
+   * The first batch of ghosts drifts in through the front door one by one from this moment; 0 = gate not open yet.
    */
   let ghostGateAt = 0;
   let selectedId = '';
@@ -272,15 +272,15 @@ export function createIsoOffice(canvas, opts = {}) {
   let last = 0;
   const t0 = performance.now();
 
-  /** 本帧可点击区域（屏幕坐标，CSS px） */
+  /** Clickable regions this frame (screen coordinates, CSS px) */
   let hits = [];
-  /** 本帧每个角色的屏幕坐标（脚底，CSS px） */
+  /** Screen coordinates of each character this frame (foot, CSS px) */
   const screenPos = new Map();
 
   const bg = document.createElement('canvas');
   let bgKey = '';
 
-  /* ------------------------------ 相机 ------------------------------ */
+  /* ------------------------------ Camera ------------------------------ */
 
   function roomBounds() {
     const pts = [
@@ -303,7 +303,7 @@ export function createIsoOffice(canvas, opts = {}) {
     };
   }
 
-  /** 让整个房间刚好装满画布 */
+  /** Fit the whole room to fill the canvas exactly */
   function fit() {
     if (!W || !H) return;
     const b = roomBounds();
@@ -328,21 +328,21 @@ export function createIsoOffice(canvas, opts = {}) {
     if (Math.abs(prevZoom - cam.zoom) > 0.0001) bgKey = '';
   }
 
-  /** 世界坐标 → CSS 像素坐标 */
+  /** World coordinates -> CSS pixel coordinates */
   function toScreen(gx, gy, gz = 0) {
     const p = project(gx, gy, gz);
     return { x: p.x * cam.zoom + cam.ox, y: p.y * cam.zoom + cam.oy };
   }
 
-  /* ------------------------------ 主 Agent 控制台 ------------------------------ */
+  /* ------------------------------ Main Agent console ------------------------------ */
 
   /**
-   * 主会话（Craft Agent）的状态：{ phase, action, context[], target }。
-   * 现在由 stores/mainAgent.js 的 mock 喂，以后换成 hook 事件即可，画法不变。
+   * Main session (Craft Agent) state: { phase, action, context[], target }.
+   * Currently fed by the mock in stores/mainAgent.js; later swapped for hook events, the drawing stays the same.
    */
   let mainAgent = { phase: 'idle', action: '', context: [], target: null };
 
-  /** 调度目标：可以写工位号（A0…B2），也可以写成员 id —— 都换算成脚下的坐标 */
+  /** Dispatch target: can be a workstation id (A0…B2) or a member id —— both are converted to foot coordinates */
   function targetSeat(id) {
     const u = DESK_UNITS.find((d) => d.id === id);
     if (u) return u.seat;
@@ -350,7 +350,7 @@ export function createIsoOffice(canvas, opts = {}) {
     return a ? { x: a.x, y: a.y } : null;
   }
 
-  /** 把工位号 / 成员 id 解析成对应的小怪物（坐工位那只） */
+  /** Resolve a workstation id / member id to its gremlin (the one sitting at the workstation) */
   function agentByTarget(id) {
     const direct = agents.find((x) => x.memberId === id);
     if (direct) return direct;
@@ -359,7 +359,7 @@ export function createIsoOffice(canvas, opts = {}) {
     return null;
   }
 
-  /** 主 Agent 对小怪物说的任务：从上下文里挑"委托 / 分配"那一行，没有就退回动作 */
+  /** Task the main Agent tells the gremlin: pick the "delegate / assign" line from the context, else fall back to the action */
   function delegationLine() {
     const lines = Array.isArray(mainAgent.context) ? mainAgent.context : [];
     const hit = lines.find((t) => /委托|分配|交给|让他|让她|去/.test(t));
@@ -487,8 +487,8 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function finishReport() {
     if (!report) return;
-    // 记一笔"这只小怪物最近一次干完什么"：汇报演完就算交付，之后 tooltip / 工位卡片
-    // 还能回看（幽灵这时已经散了，结果只存在这里）。
+    // Note down "what this gremlin last finished": the report counts as delivered once it plays, and tooltip / workstation card
+    // can look back at it later (the ghost has dispersed by then, the result only lives here).
     if (report.agentId) {
       lastResults.set(report.agentId, {
         task: String(report.task || ''),
@@ -527,16 +527,16 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 主 agent 进入 dispatch 相位（mock / 真实）时，也让对应小怪物走同一套编排。
+   * When the main agent enters the dispatch phase (mock / real), make the matching gremlin go through the same orchestration.
    *
-   * **只在"刚进入" dispatch 时演一次**：相位是 1.5s 轮询喂进来的，同一个 dispatch
-   * 相位会被反复送来（target 还不变），不判"刚进来"就会每来一次重排一次队 ——
-   * 表现就是点一下工位卡片（触发一次状态回流）又把同一段对话演一遍。
-   * @param {{phase?:string, target?:any}|null} prev 上一次的相位（null = 首次）
+   * **Only play it once on "just entered" dispatch**: the phase is fed by a 1.5s poll, and the same dispatch
+   * phase is sent again and again (target unchanged); without detecting "just entered", every send would requeue ——
+   * the symptom is that clicking a workstation card once (triggering one state round-trip) replays the same dialogue.
+   * @param {{phase?:string, target?:any}|null} prev the previous phase (null = first time)
    */
   function syncDispatch(prev) {
-    // 真召唤不在这里触发：幽灵出现的那一刻（setMembers）就已经把任务交代过一次了，
-    // 之后权限放行 / 相位回放再演一遍，就成了"同一个任务被交代两次"。
+    // Real summons are not triggered here: the moment the ghost appears (setMembers) the task has already been handed over once;
+    // playing it again on permission release / phase replay would mean "the same task handed over twice".
     if (mainAgent.phase === 'dispatch' && mainAgent.target) {
       const a = agentByTarget(mainAgent.target);
       const sameAsPrev = prev && prev.phase === 'dispatch' && String(prev.target) === String(mainAgent.target);
@@ -545,7 +545,7 @@ export function createIsoOffice(canvas, opts = {}) {
     pumpDispatch();
   }
 
-  /* ------------------------------ 成员 ------------------------------ */
+  /* ------------------------------ Members ------------------------------ */
 
   function makeAgent(member, index, spawnAt = 0) {
     const seat = DESK_UNITS[index].seat;
@@ -556,10 +556,10 @@ export function createIsoOffice(canvas, opts = {}) {
       seat,
       x: seat.x,
       y: seat.y,
-      /** 入场时刻（performance.now 毫秒）：到点之前还没进门 —— 不画、不动，到点才从门外走进来 */
+      /** Entry moment (performance.now ms): has not entered before it arrives —— not drawn, not moved; walks in from outside the door on time */
       spawnAt,
       entering: spawnAt > 0,
-      /** 正在门洞里（门外 → 门内侧这一段）：这段时间大门得敞着（见 stepDoor） */
+      /** In the doorway right now (outside door -> inner side of door): the front door must stay open during this (see stepDoor) */
       atDoor: false,
       facing: 1,
       mode: 'sit',
@@ -580,15 +580,15 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 造一只小幽灵。
+   * Create a ghost.
    *
-   * 不管演示还是真实场景，它都**从大门外起步**（gx < 0，被墙挡着 → 看不见），
-   * 等所有小怪物进了屋再飘向自己的悬浮点（见 stepGhosts 与 GHOST_ENTRY_*）。
-   * 对应坐工位小怪物的"头顶幽灵"（nearSeat 非空：被召唤的小怪物头顶那只）到位后围绕工位上方
-   * 小范围飘；其它临时成员飘在通用悬浮区。
+   * Whether in the demo or a real scene, it **starts from outside the front door** (gx < 0, hidden by the wall -> invisible),
+   * and drifts to its hover spot only after all gremlins are inside (see stepGhosts and GHOST_ENTRY_*).
+   * The "overhead ghost" of a seated gremlin (nearSeat non-null: the one above a summoned gremlin) drifts in a small
+   * range above its workstation once in place; other temporary members drift in the generic hover area.
    *
-   * @param {number} i 同批幽灵里的序号：决定它飘到哪个悬浮点，也决定它排在第几个进门
-   * @param {{x:number,y:number}|null} nearSeat 非空 = 头顶幽灵，围绕这个工位飘
+   * @param {number} i index within the same ghost batch: decides which hover spot it drifts to, and in what order it enters
+   * @param {{x:number,y:number}|null} nearSeat non-null = overhead ghost, drifts around this workstation
    */
   function makeGhost(member, i, nearSeat) {
     const center = nearSeat ? { x: nearSeat.x, y: nearSeat.y - 0.1, z: 2.15 } : null;
@@ -597,23 +597,23 @@ export function createIsoOffice(canvas, opts = {}) {
     return {
       memberId: member.memberId,
       name: member.name || member.memberId,
-      // 头顶幽灵：直接出现在小怪物头顶（waiting=false，从 anchor 起飘）；
-      // 独立幽灵：门外起点（gx < 0，被墙挡着），等窗户开闸再飘进来。
+      // Overhead ghost: appears directly above the gremlin's head (waiting=false, drifts from the anchor);
+      // standalone ghost: starts outside the door (gx < 0, hidden by the wall), drifts in once the window gate opens.
       x: nearSeat ? a.x : PLACES.doorOut.x,
       y: nearSeat ? a.y : PLACES.doorOut.y + (Math.random() - 0.5) * 0.36,
       z: nearSeat ? a.z : 1.45,
       anchor: a,
-      center, // 非空 = 头顶幽灵，围绕它小范围飘荡
+      center, // non-null = overhead ghost, drifts in a small range around it
       target: null,
-      /** 还候在门外（没出发）：画的时候裁在门洞里，等于看不见 */
+      /** Still waiting outside the door (not departed): clipped to the doorway when drawing, so invisible */
       waiting: !nearSeat,
-      /** 正在从门外飘向悬浮点（这一段速度更快） */
+      /** Currently drifting from outside the door to the hover spot (faster in this stretch) */
       entering: false,
-      /** 正在穿门洞：门得敞着（见 stepDoor） */
+      /** Passing through the doorway: the door must stay open (see stepDoor) */
       atDoor: false,
-      /** 在队伍里排第几（出发时刻 = 开闸时刻 + SETTLE + order × STAGGER，见 stepGhosts） */
+      /** Position in the queue (departure time = gate time + SETTLE + order × STAGGER, see stepGhosts) */
       order: i,
-      /** 等小怪物进屋的兜底：到点不管人在不在屋里都出发 */
+      /** Fallback for waiting on gremlins to enter: departs on time whether or not they are inside */
       enterDeadline: now + GHOST_ENTRY_WAIT_MAX,
       phase: Math.random() * 6.28,
       speed: center ? 0.35 : 0.5 + Math.random() * 0.35,
@@ -625,19 +625,19 @@ export function createIsoOffice(canvas, opts = {}) {
     };
   }
 
-  /** Vue 侧调用：members 是 [{memberId, name, state, degraded, ghost, project}] */
+  /** Called from Vue: members is [{memberId, name, state, degraded, ghost, project}] */
   function setMembers(list) {
     members = list || [];
     const seated = members.filter((m) => !m.ghost).slice(0, DESK_UNITS.length);
     const floating = members.filter((m) => !seated.includes(m));
 
     const seatIds = new Set(seated.map((m) => m.memberId));
-    /** 小怪物 memberId -> 工位坐标（脚底） */
+    /** Gremlin memberId -> workstation coordinates (foot) */
     const seatPos = {};
-    /** 小怪物名字 -> { seat, agentId }：被召唤的幽灵按名字对到它的小怪物 */
+    /** Gremlin name -> { seat, agentId }: match a summoned ghost to its gremlin by name */
     const byName = {};
     agents = agents.filter((a) => seatIds.has(a.memberId));
-    // 新来的小怪物排队入场：按收到顺序错开，一只只从大门走进来
+    // New gremlins enter in a queue: staggered in the order received, walking in one by one through the front door
     let enterSlot = 0;
     const nowMs = performance.now();
     seated.forEach((m, i) => {
@@ -649,8 +649,8 @@ export function createIsoOffice(canvas, opts = {}) {
       }
       a.home = i;
       a.seat = DESK_UNITS[i].seat;
-      // 已存在的小怪物也要刷新名字 / 级别：级别是随成员卡异步下发的，
-      // 首次建出来时可能还没有（会画成灰牌），后续收到必须更新，否则永远是灰的。
+      // Existing gremlins also need a name / level refresh: the level is delivered asynchronously with the member card,
+      // so on first creation it may not be there yet (would be drawn as a gray plate); later updates must apply, or it stays gray forever.
       a.name = m.name || a.name;
       a.level = m.level || null;
       seatPos[m.memberId] = DESK_UNITS[i].seat;
@@ -659,18 +659,18 @@ export function createIsoOffice(canvas, opts = {}) {
     });
     seatByName = byName;
     /**
-     * 这一轮新来了小怪物（正一个个从门口走进来）→ 把幽灵的门重新关上一档：
-     * 它得等这批人进完屋再飘进来（演示模式的开场就是"所有人先进屋、幽灵再飘进来"）。
-     * 没有新人的那几轮不动它 —— 已经在屋里飘着的幽灵不受影响。
+     * A new batch of gremlins arrived this round (walking in one by one through the door) -> close the ghost gate one notch again:
+     * they have to let this batch finish entering before drifting in (the demo's opening is "everyone goes in, then ghosts drift in").
+     * Rounds with no newcomers leave it alone —— ghosts already drifting inside are unaffected.
      */
     if (enterSlot) ghostGateAt = 0;
 
     const gIds = new Set(floating.map((m) => m.memberId));
     ghosts = ghosts.filter((g) => gIds.has(g.memberId));
-    // 幽灵已消失 -> 从待显 / 已触发集合里清掉，这样下次召唤能重新触发
+    // Ghost has disappeared -> clear it from the pending / triggered sets, so the next summon can trigger again
     for (const id of [...pendingGhostIds]) if (!gIds.has(id)) pendingGhostIds.delete(id);
     for (const id of [...summonedGhostIds]) if (!gIds.has(id)) summonedGhostIds.delete(id);
-    // 幽灵散了 -> 这只实例演过的账也销掉：下次召唤是新实例，编排可以再演一次
+    // Ghost dispersed -> clear this instance's played-has-been ledger too: the next summon is a new instance and can play the orchestration again
     for (const id of [...dispatchedGhostIds]) if (!gIds.has(id)) dispatchedGhostIds.delete(id);
     for (const id of [...pendingSeenOnce]) if (!gIds.has(id)) pendingSeenOnce.delete(id);
 
@@ -680,13 +680,13 @@ export function createIsoOffice(canvas, opts = {}) {
       if (gIds.has(id)) continue;
       ghostMeta.delete(id);
       if (!reportedGhostIds.has(id)) pushReport(id, meta);
-      reportedGhostIds.delete(id); // 下次再召唤得能再报一次
+      reportedGhostIds.delete(id); // the next summon must be able to report again
     }
     if (reportGhost && !gIds.has(reportGhost.id) && !reportQueue.some((r) => r.ghostId === reportGhost.id) && !(report && report.ghostId === reportGhost.id)) {
       reportGhost = null;
     }
 
-    // 当前正在被召唤的小怪物：这段时间钉在工位上（见 canWander）
+    // Gremlins currently being summoned: pinned to their workstation during this time (see canWander)
     summonedAgentIds.clear();
     for (const m of floating) {
       const info = m.ghost ? byName[m.name] : null;
@@ -694,7 +694,7 @@ export function createIsoOffice(canvas, opts = {}) {
     }
 
     floating.forEach((m, i) => {
-      // 幽灵名字若等于某个坐工位小怪物的名字，说明这是"某只小怪物被召唤"的实例幽灵。
+      // If a ghost's name equals some seated gremlin's name, this is the instance ghost of "some gremlin was summoned".
       const info = m.ghost ? byName[m.name] : null;
       if (info && !summonedGhostIds.has(m.memberId)) {
         // Summoned (including one already running on page refresh): hide this ghost first, then queue the
@@ -703,7 +703,7 @@ export function createIsoOffice(canvas, opts = {}) {
         pendingGhostIds.add(m.memberId);
       }
       if (info && pendingGhostIds.has(m.memberId)) {
-        // 幽灵先注册、任务名随后才写进成员卡：等任务到位再入队，免得显示成"新任务"。
+        // The ghost registers first, the task name is written into the member card later: queue only once the task is in, so it does not show as "new task".
         const queued = summonQueue.find((s) => s.ghostId === m.memberId);
         const running = !!(dispatch && dispatch.ghostId === m.memberId);
         if (!queued && !running && !dispatchedGhostIds.has(m.memberId)) {
@@ -721,8 +721,8 @@ export function createIsoOffice(canvas, opts = {}) {
         pendingSeenOnce.add(m.memberId);
       }
       if (info) {
-        // 记住这只召唤幽灵对应谁、在做什么、结果是什么：
-        // 幽灵被回收后（名单里没了）还要靠它把汇报演完。
+        // Remember which gremlin this summoned ghost maps to, what it is doing, and what the result is:
+        // after the ghost is recycled (gone from the roster) the report still relies on it to finish.
         const prev = ghostMeta.get(m.memberId) || {};
         ghostMeta.set(m.memberId, {
           agentId: info.agentId,
@@ -731,8 +731,8 @@ export function createIsoOffice(canvas, opts = {}) {
           task: m.task || prev.task || '',
           result: m.result || prev.result || '',
         });
-        // 写了 result = 收工：立刻去汇报（幽灵还在，等汇报演完服务端才回收它）
-        // 同时先记下结果：即使页面切走没演完汇报，tooltip / 工位卡片还能回看。
+        // result written = wrap up: report right away (the ghost is still there; the server only recycles it after the report plays)
+        // Also record the result first: even if the page switches away before the report finishes, tooltip / workstation card can still look back.
         if (m.result && info) {
           lastResults.set(info.agentId, {
             task: String(m.task || ghostMeta.get(m.memberId)?.task || ''),
@@ -745,7 +745,7 @@ export function createIsoOffice(canvas, opts = {}) {
           pushReport(m.memberId, ghostMeta.get(m.memberId));
         }
       }
-      if (pendingGhostIds.has(m.memberId)) return; // 还没到出现时机
+      if (pendingGhostIds.has(m.memberId)) return; // not time to appear yet
       if (!ghosts.some((g) => g.memberId === m.memberId)) {
         ghosts.push(makeGhost(m, i, info && info.seat));
       }
@@ -759,7 +759,7 @@ export function createIsoOffice(canvas, opts = {}) {
   const stateOf = (id) => (memberOf(id) || {}).state || 'offline';
   const degradedOf = (id) => Boolean((memberOf(id) || {}).degraded);
 
-  /* ------------------------------ 移动 ------------------------------ */
+  /* ------------------------------ Movement ------------------------------ */
 
   function goTo(a, to, mode, dwellMs = 0) {
     a.path = route({ x: a.x, y: a.y }, to);
@@ -796,7 +796,7 @@ export function createIsoOffice(canvas, opts = {}) {
     } else if (r < 0.76 && agents.length > 1) {
       const other = agents[(a.home + 1 + Math.floor(Math.random() * 2)) % agents.length];
       if (other && other !== a) {
-        // 站到对方工位里（隔板那一侧，别站过道上隔着挡板聊）
+        // Stand inside the other's workstation (the divider side, not in the corridor chatting over the partition)
         goTo(a, { x: other.seat.x + 0.85, y: other.seat.y }, 'chat', 5000 + Math.random() * 6000);
       }
     } else {
@@ -806,24 +806,24 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function stepAgents(dt, now) {
     for (const a of agents) {
-      // 还没进门：先在门外候着（不画不动），到点才从门外走进来（门同时推开，见 stepDoor）
+      // Not inside yet: wait outside the door first (not drawn, not moved), and only walk in from outside the door on time (the door pushes open at the same time, see stepDoor)
       if (a.entering) {
         if (now < a.spawnAt) continue;
         a.entering = false;
         if (dispatch && dispatch.agentId === a.memberId) {
-          // 刚建出来就被召唤了：别再走一遍入场，直接落座，交给召唤编排
+          // Summoned right after being created: skip the entry walk, sit down directly, hand over to the summon orchestration
           a.x = a.seat.x;
           a.y = a.seat.y;
         } else {
-          // 从**门外**起步（gx < 0 = 墙外的小走廊），穿过门洞再拐向工位 ——
-          // 门正是在这时候推开的（见 stepDoor），于是看着就是"门开了、人进来"。
-          // 随机错开一点：门洞沿 gy 有 1 格宽，前后两只不会精确地叠在一条线上。
-          // 只错 ±0.12（原来 ±0.25）：错太多会贴到门洞边上，被墙裁掉半边身子。
+          // Start from **outside the door** (gx < 0 = the small corridor outside the wall), pass through the doorway then turn toward the workstation ——
+          // the door is pushed open exactly then (see stepDoor), so it reads as "the door opens and the person walks in".
+          // Stagger a bit randomly: the doorway is 1 tile wide along gy, so two in a row do not overlap exactly on one line.
+          // Offset only ±0.12 (was ±0.25): too much and it hugs the doorway edge and the wall clips off half its body.
           a.x = PLACES.doorOut.x;
           a.y = PLACES.doorOut.y + (Math.random() - 0.5) * 0.24;
           a.atDoor = true;
           a.facing = 1;
-          a.mode = 'walk'; // 走的过程里得是"站着走"的姿态，到工位才坐下（pendingMode='sit'）
+          a.mode = 'walk'; // during the walk it must be in a "standing walk" pose, and only sit down at the workstation (pendingMode='sit')
           goTo(a, a.seat, 'sit');
         }
         a.nextThink = now + 4000 + Math.random() * 14000;
@@ -864,7 +864,7 @@ export function createIsoOffice(canvas, opts = {}) {
           goHome(a);
         }
       }
-      // 走进屋里了（整个身子过了门洞）→ 门不用再为它敞着
+      // Walked inside (whole body past the doorway) -> the door no longer needs to stay open for it
       if (a.atDoor && a.x >= DOOR_INSIDE_X) a.atDoor = false;
 
       if (a.mode === 'sit' && !a.path.length && !a.inMeeting && now >= a.nextThink) {
@@ -876,26 +876,26 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function stepGhosts(dt, now) {
     /**
-     * 小怪物都进屋了吗：没有还没露面的（entering），也没有还卡在门洞里的（atDoor）。
-     * 幽灵要等这个才出发 —— 演示模式的开场就是"人先进屋、幽灵再飘进来"。
+     * Are all gremlins inside: none still waiting to appear (entering), and none still stuck in the doorway (atDoor).
+     * Ghosts wait for this before departing —— the demo's opening is "people go in first, then ghosts drift in".
      */
     const gremlinsIn = !agents.some((a) => a.entering || a.atDoor);
-    // 开闸时刻只记一次：第一批幽灵按它排出发顺序；之后新来的幽灵（收工汇报 / 新召唤）
-    // 拿到的出发时刻早已过去，等于立刻从门口飘进来。
+    // The gate time is recorded once: the first batch of ghosts orders departures by it; ghosts that arrive later (finish report / new summon)
+    // get a departure time already past, so they drift in from the door immediately.
     if (gremlinsIn && !ghostGateAt) ghostGateAt = now;
     for (const g of ghosts) {
-      // 还在门外候场：到点了、并且屋里的人都进去了，才动身
+      // Still waiting outside the door: it departs only when its time comes and everyone is inside
       if (g.waiting) {
-        // 还没开闸（小怪物还在陆续进）就先在门外候着；
-        // 但 enterDeadline 是兜底 —— 召唤会打断小怪物的入场（直接落座 / 被叫去控制台），
-        // 不能因为有人永远不落座，就把幽灵永远关在门外。
+        // Gate not open yet (gremlins still entering) -> keep waiting outside the door;
+        // but enterDeadline is the fallback —— a summon interrupts a gremlin's entry (sits directly / called to the console),
+        // so do not keep a ghost locked outside the door forever just because someone never sits down.
         if (!ghostGateAt && now < g.enterDeadline) continue;
         const readyAt = ghostGateAt + GHOST_ENTRY_SETTLE + g.order * GHOST_ENTRY_STAGGER;
         if (ghostGateAt && now < readyAt && now < g.enterDeadline) continue;
         g.waiting = false;
         g.entering = true;
         g.atDoor = true;
-        // 开会期间飘进来的直接去会议室，别先绕回自己的悬浮点
+        // Ones drifting in during a meeting go straight to the meeting room, not first back to their own hover spot
         g.target = g.inMeeting ? GHOST_MEET : g.anchor;
       }
       if (g.target) {
@@ -903,7 +903,7 @@ export function createIsoOffice(canvas, opts = {}) {
         const dy = g.target.y - g.y;
         const dz = g.target.z - g.z;
         const d = Math.hypot(dx, dy, dz);
-        // 入场那一段走快一点：从门口飘到悬浮点是横跨半个屋子的距离
+        // The entry stretch moves faster: drifting from the door to the hover spot crosses half the room
         const step = (g.entering ? GHOST_ENTRY_SPEED : g.speed) * dt;
         if (d <= step || d < 0.02) {
           g.x = g.target.x;
@@ -919,11 +919,11 @@ export function createIsoOffice(canvas, opts = {}) {
         }
       } else if (now >= g.hold) {
         if (g.nearSeat && g.center) {
-          // 头顶幽灵：在整个工位附近随机飘（横向范围更大），别钉死、也别飘去别处
+          // Overhead ghost: drifts randomly around the whole workstation (wider horizontally), do not pin it, and do not drift elsewhere
           const rx = 1.4;
           const ry = 0.9;
           const ang = Math.random() * Math.PI * 2;
-          const rad = Math.sqrt(Math.random()); // 均匀落在椭圆内
+          const rad = Math.sqrt(Math.random()); // evenly distributed inside the ellipse
           g.target = {
             x: g.center.x + Math.cos(ang) * rad * rx,
             y: g.center.y + Math.sin(ang) * rad * ry,
@@ -935,24 +935,24 @@ export function createIsoOffice(canvas, opts = {}) {
           g.target = g.anchor;
         }
       }
-      // 整个人进到屋里了 → 门不用再为它敞着（同小怪物的 atDoor）
+      // Whole body is inside the room -> the door no longer needs to stay open for it (same as a gremlin's atDoor)
       if (g.atDoor && g.x >= DOOR_INSIDE_X) g.atDoor = false;
     }
   }
 
-  /* ------------------------------ 开会 ------------------------------ */
+  /* ------------------------------ Meeting ------------------------------ */
 
   function startMeeting(ids) {
     let k = 0;
     agents.forEach((a) => {
-      if (!ids.includes(a.memberId) || a.entering) return; // 还没进门的不去开会
+      if (!ids.includes(a.memberId) || a.entering) return; // those not inside yet do not go to the meeting
       a.inMeeting = true;
       a.dwell = 0;
       goTo(a, MEETING_SEATS[k % MEETING_SEATS.length], 'meet');
       k += 1;
     });
     ghosts.forEach((g) => {
-      if (g.nearSeat) return; // 留在小怪物身边，不进会议室
+      if (g.nearSeat) return; // stays by its gremlin, does not enter the meeting room
       g.inMeeting = true;
       g.target = GHOST_MEET;
     });
@@ -978,23 +978,23 @@ export function createIsoOffice(canvas, opts = {}) {
     else if (!manualMeeting) endMeeting();
   }
 
-  /* ------------------------------ 静态家具 ------------------------------ */
+  /* ------------------------------ Static furniture ------------------------------ */
 
   /**
-   * 屏上"打字"用的等宽字体：一个字符占一格，才能一格一格往外蹦。
-   * 字号用**屏幕局部单位**（tile）写 —— 跟 mainConsole 的屏面文字同一套，
-   * 靠 c.transform 把它斜切贴到屏面上，缩放时自动跟着变大变小。
+   * Monospace font used for the "typing" on screens: one character occupies one cell, so it can pop out cell by cell.
+   * The font size is written in **screen-local units** (tile) —— the same scheme as mainConsole's screen text,
+   * skew-mounted onto the screen via c.transform, so it scales up and down with zoom automatically.
    */
   const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
-  /** 敲出来的字符池：小写字母 + 数字 + 少量符号，凑近看像在敲代码 */
+  /** Character pool to type out: lowercase letters + digits + a few symbols, so up close it looks like typing code */
   const TYPE_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789_./:-=><()[]{}#$*';
 
-  /** 确定性伪随机 0~1：每台机器内容不同，但每帧同值 —— 不许用 Math.random（会闪成迪厅） */
+  /** Deterministic pseudo-random 0~1: each machine's content differs, but the value is the same every frame —— Math.random is forbidden (it would flash like a disco) */
   function screenRnd(a, b) {
     const s = Math.sin(a * 12.9898 + b * 78.233) * 43758.5453;
     return s - Math.floor(s);
   }
-  /** 第 i 个要打出来的字符：约 1/6 是空格，凑出"词 + 空格"的一行行代码感 */
+  /** The i-th character to type out: about 1/6 are spaces, to fake the "word + space" feel of code lines */
   function screenChar(seed, i) {
     if (screenRnd(seed, i * 1.37 + 0.11) < 0.17) return ' ';
     const n = TYPE_CHARS.length;
@@ -1002,17 +1002,17 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 屏幕上正在打的字：**一个字符一个字符往外蹦**，光标跟着走并闪烁，
-   * 写满整屏 → 停一下 → 清屏重来（无限循环）。
+   * The text being typed on screen: **pops out one character at a time**, the cursor follows and blinks,
+   * fills the whole screen -> pauses -> clears and starts over (infinite loop).
    *
-   * 节奏/内容全部由 (seed, now) 决定：每台显示器各自的字和快慢不同（不同步），
-   * 但每一帧结果稳定，不会抖。字符是**真的字**（不是白点/白横），
-   * 远看是"这块屏一直在输出"，滚轮放大后能认出是字。
+   * Rhythm/content is entirely decided by (seed, now): each monitor has its own text and speed (not synchronized),
+   * but the result is stable every frame, no jitter. The characters are **real letters** (not white dots/dashes),
+   * so from afar it reads as "this screen keeps outputting", and zooming in with the wheel you can make out letters.
    * @param {{x0:number,x1:number,z0:number,z1:number,face:number,seed:number,now:number}} o
    */
   function drawTyping(c, o) {
     const { x0, x1, z0, z1, face, seed, now } = o;
-    // 内容区：上让状态点、下让进度条，右边缘再收一点避开右上角那颗灯
+    // Content area: leave room at the top for the status dot, at the bottom for the progress bar, and pull the right edge in a bit to avoid the top-right light
     const left = x0 + 0.04;
     const right = x1 - 0.13;
     const top = z1 - 0.05;
@@ -1025,10 +1025,10 @@ export function createIsoOffice(canvas, opts = {}) {
     const ROWS = 3;
     const cw = w / COLS;
     const lh = h / ROWS;
-    const fs = Math.min(lh * 0.95, cw * 1.7); // 字高让行距管着，字宽不许挤进邻格
+    const fs = Math.min(lh * 0.95, cw * 1.7); // glyph height is governed by line spacing, glyph width must not spill into the neighboring cell
     const cap = COLS * ROWS;
 
-    // 节奏：打字速度 + 相位各台不同；写满后停顿 hold 秒再清屏重来
+    // Rhythm: typing speed + phase differ per machine; after filling it pauses `hold` seconds, then clears and starts over
     const cps = 9 + (seed % 5);
     const off = ((seed >> 3) % 40) / 10;
     const hold = 1.0;
@@ -1036,7 +1036,7 @@ export function createIsoOffice(canvas, opts = {}) {
     const typed = Math.min(cap, Math.floor(((now / 1000 + off) % cycle) * cps));
 
     c.save();
-    // 切到屏面自己的局部坐标：u 沿 +gx（贴着屏面的斜向），v 向下
+    // Switch to the screen face's own local coordinates: u along +gx (the slant hugging the screen), v downward
     const o0 = project(left, face, top);
     c.transform(AX.x, AX.y, -AZ.x, -AZ.y, o0.x, o0.y);
     c.beginPath();
@@ -1051,13 +1051,13 @@ export function createIsoOffice(canvas, opts = {}) {
       if (ch === ' ') continue;
       const col = i % COLS;
       const row = Math.floor(i / COLS);
-      // 刚打出来的那一行最亮，往上越沉 —— 像终端里往上滚的旧输出
+      // The line just typed is brightest, dimmer going up —— like old output scrolling up in a terminal
       const age = (typed - 1 - i) / COLS;
       c.fillStyle = age < 1 ? '#f4fff8' : age < 2 ? '#d0f4de' : '#a4e6bf';
       c.fillText(ch, col * cw, row * lh + (lh - fs) * 0.5);
     }
 
-    // 光标：落在下一个字符将要出现的位置；写满后压在末格闪，等清屏
+    // Cursor: lands where the next character will appear; after filling, it blinks on the last cell, waiting for the clear
     if (Math.floor(now / 500) % 2 === 0) {
       const ci = typed < cap ? typed : cap - 1;
       c.fillStyle = 'rgba(244,255,248,0.9)';
@@ -1067,18 +1067,18 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 显示器屏幕（南桌，朝镜头那一面）。
-   * on=false（没人的工位）：**待机** —— 铺暗蓝，屏面上透出一小团冷调微光，
-   * 读得出"通着电、只是没内容"，跟隔壁亮着的屏幕一眼分得开（不是死黑一块掉了电）。
-   * on=true：老显示器磷光绿 —— 黑边框（面板本体）里亮绿铺满，屏上是**打字动画**
-   * （字符一个个蹦出来 + 光标闪 + 写满清屏重来，见 drawTyping），不再画那些白色短横/白点。
-   * 全部用 seed 做确定性伪随机，不能 Math.random，否则每帧闪成迪厅。
+   * Monitor screen (south desk, the face toward the camera).
+   * on=false (empty workstation): **standby** —— laid in dark blue, with a small patch of cool glow showing through the screen,
+   * so it reads as "powered on, just no content", instantly distinct from the lit screen next door (not a dead black block that lost power).
+   * on=true: old monitor phosphor green —— bright green fills the black bezel (the panel body), and the screen shows the **typing animation**
+   * (characters popping out one by one + cursor blinking + clear-and-restart when full, see drawTyping), no longer drawing those white dashes/dots.
+   * Everything uses deterministic pseudo-random from seed; Math.random is not allowed, or it would flash like a disco every frame.
    *
-   * 底部那条走条**不接 task.progress**（2026-09-29 去掉）：那个字段没有真值 —— 开工写 0、
-   * 收工写 1，中间没人推进（本机库 489 条任务全落在 {0,1}，见 TaskRecordsView 里那一行
-   * 「进度」的注释）。按它画就是"空条"或"满条"，等于报告一个不存在的进度。改成**不确定走条**
-   * （与主控制台 mainConsole 的底部条同一口径、同一个 1800ms 周期）：只表达"这台机器在干活"，
-   * 不声称干到哪儿了。
+   * The bottom bar **does not read task.progress** (removed 2026-09-29): that field has no real value —— a task writes 0 at start and
+   * 1 at finish, with no one advancing it in between (all 489 tasks in the local DB land on {0,1}, see the comment on the
+   * "progress" line in TaskRecordsView). Drawing by it gives an "empty bar" or a "full bar", i.e. reports a progress that does not exist. Changed to an **indeterminate bar**
+   * (same convention as the main console mainConsole's bottom bar, the same 1800ms period): it only expresses "this machine is working",
+   * and does not claim how far it has gotten.
    */
   function drawScreen(c, m, color, seed, on, now = 0) {
     const face = m.y + m.d;
@@ -1087,7 +1087,7 @@ export function createIsoOffice(canvas, opts = {}) {
     const x0 = m.x + 0.07;
     const x1 = m.x + m.w - 0.07;
     if (!on) {
-      // 暗蓝底：上缘略亮、下缘沉下去，屏面才有"一块玻璃"的厚度感
+      // Dark blue base: top edge slightly brighter, bottom edge sinking, so the screen has the thickness of "a pane of glass"
       const pTop = project((x0 + x1) / 2, face, z1);
       const pBot = project((x0 + x1) / 2, face, z0);
       const gb = c.createLinearGradient(0, pTop.y, 0, pBot.y);
@@ -1095,7 +1095,7 @@ export function createIsoOffice(canvas, opts = {}) {
       gb.addColorStop(1, '#08142a');
       wallQuad(c, 'y', face, x0, x1, z0, z1, gb);
 
-      // 屏面中央的冷光：夹在多边形里画（clip），不许溢到边框上
+      // Cool light in the middle of the screen: drawn inside the polygon (clip), must not spill onto the bezel
       c.save();
       poly(c, [project(x0, face, z1), project(x1, face, z1), project(x1, face, z0), project(x0, face, z0)]);
       c.clip();
@@ -1110,18 +1110,18 @@ export function createIsoOffice(canvas, opts = {}) {
       c.fillRect(gp.x - r * 2, gp.y - r * 2, r * 4, r * 4);
       c.restore();
 
-      // 一道斜向反光（玻璃还在，只是没发光）
+      // A slanted reflection (the glass is still there, just not lit)
       wallQuad(c, 'y', face + 0.001, x0 + 0.12, x0 + 0.26, z0 + 0.04, z1 - 0.12, 'rgba(150,190,240,0.07)');
       return;
     }
-    // 墨绿铺满（老显示器的沉绿，不是荧光绿）
+    // Dark green fill (the muted green of an old monitor, not fluorescent green)
     wallQuad(c, 'y', face, x0, x1, z0, z1, '#1f5c40');
-    // 右上角状态点（沿用成员级别色）
+    // Top-right status dot (reuses the member level color)
     wallQuad(c, 'y', face + 0.001, x1 - 0.12, x1 - 0.07, z1 - 0.05, z1 - 0.01, color);
-    // 屏上正在打的字：字符一个个蹦，光标闪，写满清屏重来
+    // Text being typed on screen: characters pop one by one, cursor blinks, clear-and-restart when full
     drawTyping(c, { x0, x1, z0, z1, face, seed, now });
-    // 底部走条：深绿轨（不用纯黑，免得糊成一团黑）+ 亮绿的**不确定**走条
-    // （周期与主控制台一致，见上面那段说明：没有真进度就不画长度）。
+    // Bottom bar: dark green track (not pure black, so it does not smudge into one black blob) + a bright green **indeterminate** bar
+    // (period matches the main console, see the note above: no real progress, so no length is drawn).
     const pz = z0 + 0.04;
     wallQuad(c, 'y', face, x0 + 0.06, x1 - 0.06, pz, pz + 0.04, 'rgba(6,32,20,0.5)');
     {
@@ -1132,51 +1132,51 @@ export function createIsoOffice(canvas, opts = {}) {
     }
   }
 
-  /** 椅子底座：五星脚 + 中柱 + 座板（永远画在坐着的人之前） */
+  /** Chair base: five-star legs + center column + seat plate (always drawn before the seated person) */
   function drawChairBase(c, x, y) {
-    // 底座（五星脚 + 中柱）统一亮银色（只改椅子底座，不动全局 metal token：
-    // 复印机 / 饮水机 / 杂志架都在用 colors.metal）
+    // Base (five-star legs + center column) in a uniform bright silver (only the chair base changes; the global metal token stays:
+    // printer / water cooler / magazine rack all use colors.metal)
     const SILVER = '#2b2f36';
     isoCylinder(c, { x, y, z: 0.02, r: 0.26, h: 0.04, color: '#1d2025' });
     isoCylinder(c, { x, y, z: 0.06, r: 0.05, h: 0.34, color: SILVER });
     isoBox(c, { x: x - 0.24, y: y - 0.24, z: 0.4, w: 0.48, d: 0.48, h: 0.08, color: colors.chair });
   }
 
-  /** 椅背：backAtNorth=true 朝北（背对镜头），false 朝南（挡在人与镜头之间） */
+  /** Chair back: backAtNorth=true faces north (back to the camera), false faces south (between the person and the camera) */
   function drawChairBack(c, x, y, backAtNorth) {
     const by = backAtNorth ? y - 0.3 : y + 0.22;
     isoBox(c, { x: x - 0.22, y: by, z: 0.48, w: 0.44, d: 0.1, h: 0.5, color: colors.chair });
   }
 
   /**
-   * 复印机（会议室西北角）：一台落地式一体机。
+   * Printer (meeting room's northwest corner): a floor-standing all-in-one.
    *
-   * 为什么不能只画一个金属方盒 —— 等距下那跟"文件柜"一模一样。复印机的辨识点全在**分层**上：
-   *   1) 正面中段**凹进去一块**（出纸腔的后壁 / 内壁 / 腔底都压暗），腔里伸出一截浅色托盘，
-   *      托盘上还搭着两张刚吐出来的白纸 —— "出纸"是打印机最直白的语言；
-   *   2) 顶上是一块深色**稿台玻璃**（比机身窄一圈），上面压一块盖板 + 盖板上的进稿槽；
-   *      玻璃必须在盖板**之前**画，盖板只压住中间，露出的那道前边就是"扫描台"；
-   *   3) 控制面板装在稿台前沿（小蓝屏 + 一颗绿灯 + 两颗灰键）—— 柜门不会有这个；
-   *   4) 底柜是两格**纸盒抽屉**（带把手凹槽），通体一整块板就成了柜子；
-   *   5) 比例要敦实（矮胖），瘦高就又变回文件柜。
+   * Why not just draw a metal box —— in isometric it looks exactly like a "filing cabinet". The printer's giveaways are all in the **layering**:
+   *   1) The front's mid-section **recesses inward** (the output cavity's back wall / inner wall / cavity floor are all darkened), with a light tray sticking out,
+   *      and two freshly ejected white sheets on the tray —— "paper out" is the printer's most direct language;
+   *   2) On top is a dark **platen glass** (a ring narrower than the body), pressed by a lid + the document feeder slot on the lid;
+   *      the glass must be drawn **before** the lid, the lid only covers its middle, and the exposed front edge is the "scan bed";
+   *   3) The control panel is mounted on the platen's front edge (small blue screen + one green light + two gray keys) —— a cabinet door would not have this;
+   *   4) The base cabinet is two **paper cassette drawers** (with handle grooves); a single solid slab would just be a cabinet;
+   *   5) The proportions must be stocky (short and plump); tall and thin and it turns back into a filing cabinet.
    */
   function drawPrinter(c, pr) {
     const { x, y, w, d } = pr;
     const H = pr.h;
-    const xR = x + w;          // 朝 +gx 那面（屏幕右下）
-    const yF = y + d;          // 朝 +gy 那面（朝镜头）
-    const zBase = H * 0.44;    // 纸盒柜顶
-    const zBody = H * 0.76;    // 中段顶 / 稿台底
-    const zGlass = H * 0.83;   // 稿台玻璃面
-    const zLid = H * 0.9;      // 掀盖顶
-    const zAdf = H * 0.94;     // 进稿槽顶
+    const xR = x + w;          // the +gx face (screen lower-right)
+    const yF = y + d;          // the +gy face (toward the camera)
+    const zBase = H * 0.44;    // paper cassette cabinet top
+    const zBody = H * 0.76;    // mid-section top / platen bottom
+    const zGlass = H * 0.83;   // platen glass surface
+    const zLid = H * 0.9;      // lid top
+    const zAdf = H * 0.94;     // document feeder slot top
 
-    // ---- 机身：纸盒柜 → 中段（出纸腔所在）→ 稿台 ----
+    // ---- Body: cassette cabinet -> mid-section (where the output cavity is) -> platen ----
     isoBox(c, { x, y, z: 0, w, d, h: zBase, color: '#333c4b' });
     isoBox(c, { x, y, z: zBase, w, d, h: zBody - zBase, color: colors.metal });
     isoBox(c, { x, y, z: zBody, w, d, h: zGlass - zBody, color: '#2f3a4d' });
 
-    // 稿台玻璃（画在盖板之前：盖板待会儿只压住它中间，露出前面那道边）
+    // Platen glass (drawn before the lid: the lid will only cover its middle, exposing that front edge)
     poly(
       c,
       [
@@ -1190,26 +1190,26 @@ export function createIsoOffice(canvas, opts = {}) {
       0.8
     );
 
-    // ---- 掀盖 + 盖板上的进稿槽 ----
+    // ---- Lid + document feeder slot on the lid ----
     isoBox(c, { x: x + 0.02, y: y + 0.02, z: zGlass, w: w - 0.04, d: d - 0.04, h: zLid - zGlass, color: '#464f61' });
     isoBox(c, { x: x + 0.14, y: y + 0.06, z: zLid, w: w - 0.28, d: d - 0.12, h: zAdf - zLid, color: '#5b6577' });
 
-    // ---- 出纸腔：正面凹进去一块（凹腔是"一体机"最硬的辨识点）----
+    // ---- Output cavity: the front recesses inward (the recess is the all-in-one's hardest giveaway) ----
     const cz0 = H * 0.46;
     const cz1 = H * 0.65;
     const cx0 = x + 0.08;
     const cx1 = xR - 0.08;
-    const cyB = yF - 0.07;   // 腔的后壁（比机身正面往里）
-    wallQuad(c, 'y', cyB, cx0, cx1, cz0, cz1, '#141a24');                       // 后壁
-    wallQuad(c, 'x', cx0, cyB, yF, cz0, cz1, '#0f141c');                        // 西内壁
-    poly(c, [project(cx0, cyB, cz0), project(cx1, cyB, cz0), project(cx1, yF, cz0), project(cx0, yF, cz0)], '#1c2331'); // 腔底
+    const cyB = yF - 0.07;   // the cavity's back wall (further in than the body's front)
+    wallQuad(c, 'y', cyB, cx0, cx1, cz0, cz1, '#141a24');                       // back wall
+    wallQuad(c, 'x', cx0, cyB, yF, cz0, cz1, '#0f141c');                        // west inner wall
+    poly(c, [project(cx0, cyB, cz0), project(cx1, cyB, cz0), project(cx1, yF, cz0), project(cx0, yF, cz0)], '#1c2331'); // cavity floor
 
-    // 出纸托盘 + 上面两张刚吐出来的纸（探出机身外面）
+    // Output tray + the two freshly ejected sheets on it (poking out beyond the body)
     isoBox(c, { x: cx0 + 0.02, y: cyB + 0.01, z: cz0, w: cx1 - cx0 - 0.04, d: 0.22, h: 0.025, color: '#a7b2c2' });
     isoBox(c, { x: cx0 + 0.06, y: cyB + 0.02, z: cz0 + 0.026, w: cx1 - cx0 - 0.12, d: 0.18, h: 0.012, color: '#eef2f8' });
     isoBox(c, { x: cx0 + 0.09, y: cyB + 0.05, z: cz0 + 0.039, w: cx1 - cx0 - 0.18, d: 0.15, h: 0.012, color: '#f6f9fc' });
 
-    // ---- 控制面板：装在稿台前沿（小蓝屏 + 一颗绿灯 + 两颗灰键）----
+    // ---- Control panel: mounted on the platen's front edge (small blue screen + one green light + two gray keys) ----
     wallQuad(c, 'y', yF + 0.002, x + 0.1, xR - 0.1, H * 0.67, H * 0.745, '#1b2230', 'rgba(120,150,180,0.3)', 0.8);
     wallQuad(c, 'y', yF + 0.003, x + 0.13, x + 0.13 + w * 0.32, H * 0.685, H * 0.73, '#2f8fd8');
     for (let i = 0; i < 3; i += 1) {
@@ -1217,7 +1217,7 @@ export function createIsoOffice(canvas, opts = {}) {
       wallQuad(c, 'y', yF + 0.003, bx, bx + 0.06, H * 0.695, H * 0.72, i === 0 ? '#7fe0a0' : '#5a6474');
     }
 
-    // ---- 底柜：两格纸盒抽屉（分格 + 把手凹槽，才不是"一整块板"）----
+    // ---- Base cabinet: two paper cassette drawers (compartments + handle grooves, so it is not "one solid slab") ----
     [
       [H * 0.05, H * 0.22, H * 0.115],
       [H * 0.25, H * 0.4, H * 0.305],
@@ -1226,7 +1226,7 @@ export function createIsoOffice(canvas, opts = {}) {
       wallQuad(c, 'y', yF + 0.003, x + 0.3, xR - 0.3, hz, hz + H * 0.03, '#222a38');
     });
 
-    // ---- 东侧面：散热格栅（三条横线）----
+    // ---- East side: cooling vents (three horizontal lines) ----
     for (let i = 0; i < 3; i += 1) {
       const gz = H * 0.12 + i * H * 0.045;
       wallQuad(c, 'x', xR + 0.001, y + 0.12, yF - 0.12, gz, gz + H * 0.014, '#2b3341');
@@ -1234,38 +1234,38 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 饮水机：机身（正面冷/热两个出水嘴 + 接水盘）+ 倒扣在顶上的 5 加仑水桶。
+   * Water cooler: body (front cold/hot two spouts + drip tray) + a 5-gallon jug inverted on top.
    *
-   * 怎么才"看得出是个水桶"（而不是一根蓝色圆柱）：
-   *   1) 侧影按高度做剖面：颈在下（插进机器那截细）→ 外扩 → 直筒 → 收肩 → 顶颈，
-   *      再把每一层的"地面圆"投成椭圆，取长轴两端当左右侧影点，连成整个轮廓；
-   *   2) 桶身是**半透明**的塑料：能透出后面的墙 / 帘，才像桶而不是一颗蓝球（地球）；
-   *      桶里看得见水位：水面画一道椭圆（带亮边），水下面更蓝更沉，上面是空气，两截不同色；
-   *   3) 侧面一道竖高光 + 一道暗面 —— 直筒才有圆柱的体积感；
-   *   4) 几道环筋 + 底部蓝色颈圈 + 水里几个气泡，塑料桶的细节就齐了。
+   * How to make it "read as a water jug" (and not a blue cylinder):
+   *   1) Profile the silhouette by height: neck at the bottom (the thin part inserted into the machine) -> flare -> straight barrel -> shoulder -> top neck,
+   *      then project each level's "ground circle" as an ellipse and take the two ends of its major axis as the left/right silhouette points, joined into the whole outline;
+   *   2) The jug body is **semi-transparent** plastic: it shows the wall / curtain behind, so it looks like a jug and not a blue ball (the Earth);
+   *      the water level is visible inside: draw an ellipse for the surface (with a bright edge), below the water is bluer and heavier, above is air, the two sections a different color;
+   *   3) A vertical highlight + a dark side on the barrel —— only a straight barrel has cylindrical volume;
+   *   4) A few ribs + a blue neck ring at the bottom + a few bubbles in the water, and the plastic jug's details are complete.
    */
   function drawCooler(c, pc) {
-    const HW = 0.3;           // 机身半宽
-    const BH = 0.55;          // 水桶高
-    const bodyH = pc.h - BH;  // 机身高度（顶到桶底）
-    const faceY = pc.y + HW;  // 朝镜头那面（+gy）
+    const HW = 0.3;           // body half-width
+    const BH = 0.55;          // water jug height
+    const bodyH = pc.h - BH;  // body height (top to jug bottom)
+    const faceY = pc.y + HW;  // the face toward the camera (+gy)
 
-    // ---- 机身 ----
+    // ---- Body ----
     isoBox(c, { x: pc.x - HW, y: pc.y - HW, z: 0, w: HW * 2, d: HW * 2, h: bodyH, color: colors.metal });
-    // 正面：内凹的接水区（深色面板，出水嘴和接水盘都在这一块里）
+    // Front: recessed dispensing area (dark panel, both spouts and the drip tray are in this block)
     wallQuad(c, 'y', faceY, pc.x - 0.17, pc.x + 0.17, bodyH * 0.5, bodyH * 0.86, '#2a3340');
-    // 冷 / 热两个出水嘴：往 +gy 伸出来一点，蓝 / 红各一个
+    // Cold / hot two spouts: poke out a little toward +gy, one blue / one red
     isoBox(c, { x: pc.x - 0.13, y: faceY - 0.03, z: bodyH * 0.55, w: 0.08, d: 0.1, h: 0.05, color: '#4aa3f0' });
     isoBox(c, { x: pc.x + 0.05, y: faceY - 0.03, z: bodyH * 0.55, w: 0.08, d: 0.1, h: 0.05, color: '#e0603f' });
-    // 接水盘（格栅）：再往下、再往外一点
+    // Drip tray (grille): a bit lower and further out
     isoBox(c, { x: pc.x - 0.15, y: faceY - 0.03, z: bodyH * 0.34, w: 0.3, d: 0.12, h: 0.035, color: '#39445a' });
 
-    // ---- 水桶 ----
-    const BZ = bodyH;   // 桶底（= 机器顶面）
-    const R = 0.28;     // 桶身最大半径（比机身窄一圈）
-    const LEVEL = 0.74; // 水位（占桶高的比例）
+    // ---- Water jug ----
+    const BZ = bodyH;   // jug bottom (= machine top)
+    const R = 0.28;     // maximum jug body radius (a ring narrower than the body)
+    const LEVEL = 0.74; // water level (fraction of jug height)
 
-    /** 侧影半径：颈 0.13 → 外扩 → 直筒 R → 收肩 → 顶颈 0.10（s = smoothstep，接缝不生硬） */
+    /** Silhouette radius: neck 0.13 -> flare -> straight barrel R -> shoulder -> top neck 0.10 (s = smoothstep, so seams are not harsh) */
     const rAt = (t) => {
       const s = (u) => u * u * (3 - 2 * u);
       if (t < 0.3) return 0.13 + (R - 0.13) * s(t / 0.3);
@@ -1273,14 +1273,14 @@ export function createIsoOffice(canvas, opts = {}) {
       if (t < 0.94) return R + (0.14 - R) * s((t - 0.62) / 0.32);
       return 0.14 + (0.1 - 0.14) * ((t - 0.94) / 0.06);
     };
-    /** 某高度那一圈水/塑料投到屏幕上的椭圆 */
+    /** The ellipse a ring of water/plastic at some height projects onto the screen */
     const ell = (t, k = 1) => groundEllipse(pc.x, pc.y, rAt(t) * k, BZ + t * BH);
-    /** 椭圆上一点：th = 0 是屏幕最右，π/2 是最下（也就是离镜头最近的一圈） */
+    /** A point on the ellipse: th = 0 is the screen's far right, π/2 is the bottom (i.e. the ring closest to the camera) */
     const at = (e, th) => ({
       x: e.x + e.rx * Math.cos(th) * Math.cos(e.rot) - e.ry * Math.sin(th) * Math.sin(e.rot),
       y: e.y + e.rx * Math.cos(th) * Math.sin(e.rot) + e.ry * Math.sin(th) * Math.cos(e.rot),
     });
-    /** 轮廓：右侧影自下而上 + 左侧影自上而下 */
+    /** Outline: right silhouette bottom-to-top + left silhouette top-to-bottom */
     const outline = (t0, t1) => {
       const pts = [];
       const n = 18;
@@ -1291,21 +1291,21 @@ export function createIsoOffice(canvas, opts = {}) {
     const yTop = project(pc.x, pc.y, BZ + BH).y;
     const yBot = project(pc.x, pc.y, BZ).y;
 
-    // 桶身（塑料）：半透明，能透出后面的墙 / 帘 —— 实心蓝白看着就是一颗球（"地球"）。
-    // 白雾只留一丝（0.05）当塑料内壁的磨砂：铺厚了会把透明度抵消掉，看着跟没改一样。
+    // Jug body (plastic): semi-transparent, shows the wall / curtain behind —— solid blue-white just looks like a ball (the "Earth").
+    // Keep only a trace of white haze (0.05) as the plastic inner wall's frost: pile it on and the transparency cancels out, looking unchanged.
     poly(c, outline(0, 1), 'rgba(255,255,255,0.05)');
     const gb = c.createLinearGradient(0, yTop, 0, yBot);
     gb.addColorStop(0, 'rgba(230,244,252,0.20)');
     gb.addColorStop(1, 'rgba(183,216,238,0.30)');
     poly(c, outline(0, 1), gb, 'rgba(58,92,120,0.30)', 1);
 
-    // 水：下半截，跟着桶身一起透（更浅、更淡蓝，水底还是更沉一点，但不再糊成实心蓝）
+    // Water: the lower half, transparent along with the jug body (lighter, paler blue; the bottom is still a bit heavier, but no longer smears into solid blue)
     const gw = c.createLinearGradient(0, project(pc.x, pc.y, BZ + LEVEL * BH).y, 0, yBot);
     gw.addColorStop(0, 'rgba(150,208,240,0.40)');
     gw.addColorStop(1, 'rgba(70,148,196,0.52)');
     poly(c, outline(0, LEVEL), gw);
 
-    // 水面：一道椭圆 + 亮边（桶身透明了，水位线反而更要留住 —— 它是"装了水"的关键线索）
+    // Water surface: an ellipse + a bright edge (the body is transparent now, so the water line matters even more —— it is the key clue of "filled with water")
     const se = ell(LEVEL, 0.99);
     c.beginPath();
     c.ellipse(se.x, se.y, se.rx, se.ry, se.rot, 0, Math.PI * 2);
@@ -1315,7 +1315,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.lineWidth = 1;
     c.stroke();
 
-    // 环筋：桶身上那几道塑料箍（桶身透明了就别画太实）
+    // Ribs: those plastic hoops on the jug body (do not draw them too solid since the body is transparent)
     c.strokeStyle = 'rgba(70,110,145,0.18)';
     [0.34, 0.42, 0.5, 0.58].forEach((t) => {
       const e = ell(t, 0.995);
@@ -1324,7 +1324,7 @@ export function createIsoOffice(canvas, opts = {}) {
       c.stroke();
     });
 
-    // 竖条带（沿桶身一条高光 / 一条暗面）：直筒才有圆柱感
+    // Vertical bands (one highlight / one dark side along the jug body): only a straight barrel reads as a cylinder
     const band = (thA, thB, fill) => {
       const pts = [];
       const n = 10;
@@ -1336,15 +1336,15 @@ export function createIsoOffice(canvas, opts = {}) {
     gh.addColorStop(0, 'rgba(255,255,255,0.34)');
     gh.addColorStop(0.7, 'rgba(255,255,255,0.12)');
     gh.addColorStop(1, 'rgba(255,255,255,0.04)');
-    band(0.42, 0.95, gh);                                          // 高光在右前方（窗在那一侧）
-    band(Math.PI - 0.95, Math.PI - 0.42, 'rgba(40,78,110,0.10)');  // 暗面在左前方
-    // 透过前壁看到的**后壁**（远侧那半）：一道很淡的竖带，"透"的感觉大半来自它
+    band(0.42, 0.95, gh);                                          // highlight on the right-front (the window is on that side)
+    band(Math.PI - 0.95, Math.PI - 0.42, 'rgba(40,78,110,0.10)');  // dark side on the left-front
+    // The **back wall** seen through the front wall (the far half): a very faint vertical band; most of the "transparent" feel comes from it
     band(Math.PI * 1.5 - 0.3, Math.PI * 1.5 + 0.3, 'rgba(140,186,216,0.12)');
 
-    // 颈圈：桶口插进机器那截的蓝色塑料环（最后画，正好压住桶底的颈部）
+    // Neck ring: the blue plastic ring where the jug mouth is inserted into the machine (drawn last, exactly covering the neck at the jug bottom)
     isoCylinder(c, { x: pc.x, y: pc.y, z: BZ - 0.03, r: 0.17, h: 0.07, color: '#2f6ea8' });
 
-    // 桶顶小圆盖：也跟着透一点（实心白会把它压成一块"贴片"）
+    // Small round cap on top of the jug: also a bit transparent (solid white would flatten it into a "decal")
     const te = ell(1);
     c.beginPath();
     c.ellipse(te.x, te.y, te.rx, te.ry, te.rot, 0, Math.PI * 2);
@@ -1354,7 +1354,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.lineWidth = 0.8;
     c.stroke();
 
-    // 水里的几个气泡（桶身透亮，气泡就别抢戏）
+    // A few bubbles in the water (the jug body is translucent, so the bubbles should not steal the show)
     [[0.1, -0.06, 0.2], [-0.09, 0.08, 0.36], [0.06, 0.11, 0.5], [-0.05, -0.09, 0.62]].forEach(([dx, dy, t]) => {
       const b = project(pc.x + dx, pc.y + dy, BZ + t * BH);
       c.beginPath();
@@ -1365,45 +1365,45 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 杂志架（茶水间北墙东段，见 PANTRY.rack）：三层斜面展示架。
+   * Magazine rack (pantry north wall, east section, see PANTRY.rack): a three-tier slanted display rack.
    *
-   * 等距下怎么才"看得出是杂志架"，而不是个摆了几本书的小柜子 —— 每条都是为"封面能被看见"：
-   *   1) **架体沿 x 展开、封面朝 +gy**：镜头正对着 +gy 这一侧，一排封面彼此不遮挡。
-   *      第一版靠着西墙摆（架体沿 y），杂志沿 y 排成一队、后一本盖住前一本，
-   *      整排只剩几条 8px 宽的缝 —— 截图里看着像彩色木条，不像杂志封面；
-   *   2) **层板朝 +gy 倾斜**（后沿高、前沿低）：封面略微仰起，比平放更像"一张封面立着"；
-   *   3) 两端立板夹住层板 + 底下踢脚 + 背后背板：架子才落地，不然层板看着是悬空的。
+   * How to make it "read as a magazine rack" in isometric, and not a small cabinet with a few books —— every point is for "the cover can be seen":
+   *   1) **The rack runs along x, covers face +gy**: the camera looks straight at the +gy side, so a row of covers does not occlude each other.
+   *      The first version sat against the west wall (rack along y), magazines lined up along y with each one covering the one before,
+   *      leaving only a few 8px-wide slits —— in a screenshot it looked like colored wooden slats, not magazine covers;
+   *   2) **Tiers slant toward +gy** (back edge high, front edge low): the cover tilts up a bit, reading more like "a cover standing up" than laid flat;
+   *   3) End panels clamp the shelves + a kick plate below + a back panel behind: only then does the rack sit on the floor, otherwise the shelves look floating.
    *
-   * 一条硬规矩：**不能用 Math.random**。静态层每帧重画（见 buildStatics），随机色会闪成迪厅；
-   * 高矮 / 宽窄 / 配色一律用 index 取模算（和工位上的键盘、杯子同一种做法）。
+   * One hard rule: **Math.random is not allowed**. The static layer is redrawn every frame (see buildStatics), and random colors would flash like a disco;
+   * height / width / palette are all computed by index modulo (the same approach as the keyboards and cups on the workstations).
    */
   function drawMagRack(c, rk) {
     const X0 = rk.x;
     const X1 = rk.x + rk.w;
     const Y0 = rk.y;
     const Y1 = rk.y + rk.d;
-    const zBase = 0.16; // 踢脚顶面：最下层板从这里起
-    const zTop = rk.h - 0.1; // 顶层板的上限
+    const zBase = 0.16; // kick plate top: the lowest shelf starts here
+    const zTop = rk.h - 0.1; // upper limit of the top shelf
     const tiers = Math.max(1, rk.tiers || 3);
     const step = (zTop - zBase) / tiers;
     const lean = rk.lean == null ? 0.12 : rk.lean;
-    const T = 0.05; // 层板 / 立板厚度
-    const PT = 0.07; // 两端立板厚度
-    /** 层板面在某个 gy 处的高度：后沿（Y0，贴墙那侧）高、前沿（Y1）低 */
+    const T = 0.05; // shelf / panel thickness
+    const PT = 0.07; // end panel thickness
+    /** Shelf surface height at some gy: back edge (Y0, the wall side) high, front edge (Y1) low */
     const zAt = (zb, gy) => zb + lean * ((Y1 - gy) / rk.d);
-    /** 封面配色：偏亮但不荧光（夜里太跳会跟主控制台抢视线） */
+    /** Cover palette: on the bright side but not fluorescent (too loud at night and it competes with the main console for attention) */
     const COVERS = ['#e6ebf2', '#7fb0ff', '#d9744f', '#3fb950', '#f5a623', '#a98cf2', '#51c7c0'];
 
     isoShadow(c, (X0 + X1) / 2, (Y0 + Y1) / 2 + 0.1, rk.w * 0.46, 0.26);
 
-    // 架体：背板（贴墙）+ 踢脚 + 左端立板 —— 先把架子立起来，再往里塞层板和杂志
+    // Frame: back panel (against the wall) + kick plate + left end panel —— stand the rack up first, then fill in shelves and magazines
     isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: 0.05, h: rk.h, color: colors.metalDark });
     isoBox(c, { x: X0, y: Y0, z: 0, w: rk.w, d: rk.d, h: zBase, color: colors.metal });
     isoBox(c, { x: X0, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: colors.metal });
 
     for (let i = 0; i < tiers; i += 1) {
       const zb = zBase + i * step + 0.06;
-      // ---- 层板：斜面顶 + 前沿立面（等距下层板朝镜头的只有这两面）----
+      // ---- Shelf: slanted top + front face (in isometric only these two faces of a shelf face the camera) ----
       poly(
         c,
         [
@@ -1425,19 +1425,19 @@ export function createIsoOffice(canvas, opts = {}) {
         shade(colors.wood, 0.66)
       );
 
-      // ---- 一排杂志：沿 x 并排站、往后靠（顶边更靠 Y0，同时抬高 hj）----
-      const n = 5 + (i % 2); // 5~6 本
+      // ---- A row of magazines: standing side by side along x, leaning back (top edge closer to Y0, raising hj at the same time) ----
+      const n = 5 + (i % 2); // 5~6 issues
       const slot = (rk.w - 0.2) / n;
       for (let j = 0; j < n; j += 1) {
         const xA = X0 + 0.1 + j * slot + slot * 0.14;
         const xB = xA + slot * 0.72;
-        const hj = 0.2 + 0.035 * ((i * 7 + j * 5) % 3); // 高矮错开
-        const yBot = Y1 - 0.09; // 底边靠前沿
-        const yTp = Y0 + 0.11; // 顶边往后倒
+        const hj = 0.2 + 0.035 * ((i * 7 + j * 5) % 3); // stagger the heights
+        const yBot = Y1 - 0.09; // bottom edge near the front
+        const yTp = Y0 + 0.11; // top edge leans back
         const zB = zAt(zb, yBot) + T;
         const zT = zAt(zb, yTp) + T + hj;
         const cover = COVERS[(i * 3 + j * 2) % COVERS.length];
-        // 封面：朝 +gy 的那面 —— 镜头正对它，所以整排都看得见（和门楣屏、白板是同一类面）
+        // Cover: the face toward +gy —— the camera looks straight at it, so the whole row is visible (the same kind of face as the lintel screen and the whiteboard)
         poly(
           c,
           [project(xA, yBot, zB), project(xB, yBot, zB), project(xB, yTp, zT), project(xA, yTp, zT)],
@@ -1448,34 +1448,34 @@ export function createIsoOffice(canvas, opts = {}) {
       }
     }
 
-    // 右端立板最后画：相机在 +x 方向，它是最靠近镜头的那块，把层板与杂志的端头夹进架子
+    // Right end panel drawn last: the camera is on the +x side, so it is the piece closest to the camera, tucking the ends of the shelves and magazines into the rack
     isoBox(c, { x: X1 - PT, y: Y0, z: 0, w: PT, d: rk.d, h: rk.h, color: colors.metal });
   }
 
   /**
-   * 桌面名贴：平放在桌面上的小名牌（替代原来挂在隔板上的名牌），只写成员名字。
-   * 文字按桌面自己的两根轴（AX / AY）斜切，贴在桌面上；保留级别色条（user 蓝 / project 绿）。
-   * 字在屏幕上恒为 ~10px：先按相机反算世界字号，名字比贴宽长时再按比例收。
+   * Desk nameplate: a small nameplate laid flat on the desk (replacing the one that used to hang on the divider), writing only the member's name.
+   * The text is skew-mapped along the desk's own two axes (AX / AY) and laid on the desk; the level color strip is kept (user blue / project green).
+   * The text stays ~10px on screen: first back-compute the world font size from the camera, then shrink proportionally when the name is longer than the plate.
    */
   function drawDeskTag(c, { x, y, z, text, accent, maxW = 0.85, flip = false, alignRight = false }) {
     const fsPx = 10 / cam.zoom;
     c.font = `600 ${fsPx}px ui-sans-serif, system-ui, sans-serif`;
     const w = Math.max(0.5, Math.min(maxW, c.measureText(text).width / UNIT_Z + 0.22));
     const d = 0.3;
-    // alignRight：x 给的是贴子右沿（紧贴桌子侧边时，贴宽随名字变化也能对齐桌边）
+    // alignRight: x is the plate's right edge (when flush against the desk side, the plate width varying with the name still aligns to the desk edge)
     const tx = alignRight ? x - w : x;
-    // 级别色条：正常在西侧；flip（北桌）时随文字一起换到对面（东侧）——
-    // 从坐着的小怪物看，色条始终在文字的左手边
+    // Level color strip: normally on the west side; with flip (north desk) it moves to the opposite side (east) along with the text ——
+    // from the seated gremlin's view, the strip is always to the left of the text
     const stripX = flip ? tx + w - 0.07 : tx;
-    // 贴底（浅色）+ 一条级别色条
+    // Plate base (light) + a level color strip
     isoDiamond(c, { x: tx, y, w, d, z, fill: '#eef2f8', stroke: 'rgba(18,24,34,0.4)', lw: 0.8 });
     isoDiamond(c, { x: stripX, y, w: 0.07, d, z: z + 0.001, fill: accent });
-    // 名字：按桌面轴斜切（局部 u 沿 +gx、v 沿 +gy，单位 tile）。
-    // flip=true（北桌）：绕贴中心转 180°，字对镜头是倒的、对坐在北侧的小怪物是正的
+    // Name: skew-mapped along the desk axes (local u along +gx, v along +gy, unit tile).
+    // flip=true (north desk): rotate 180° about the plate center; the text is upside down to the camera, upright to the gremlin sitting on the north side
     let fsTile = fsPx / UNIT_Z;
     const tw = c.measureText(text).width / UNIT_Z;
     if (tw > w - 0.16) fsTile *= (w - 0.16) / tw;
-    const cx = flip ? (w - 0.09) / 2 : 0.09 + (w - 0.09) / 2; // 文字中心（让开色条那侧）
+    const cx = flip ? (w - 0.09) / 2 : 0.09 + (w - 0.09) / 2; // text center (leaving room on the strip side)
     const o = flip ? project(tx + w, y + d, z + 0.002) : project(tx, y, z + 0.002);
     c.save();
     if (flip) c.transform(-AX.x, -AX.y, -AY.x, -AY.y, o.x, o.y);
@@ -1509,15 +1509,15 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 百叶帘（半透光）：贴在玻璃迎镜头那一面上的横向叶片。
-   * 面取向与 wallQuad 一致：axis='x' 面 gx 固定（a0/a1 是 gy 范围）；axis='y' 面 gy 固定（a0/a1 是 gx 范围）。
+   * Blinds (translucent): horizontal slats on the glass face toward the camera.
+   * Face orientation matches wallQuad: axis='x' face has fixed gx (a0/a1 are the gy range); axis='y' face has fixed gy (a0/a1 are the gx range).
    *
-   * 观感要点（否则会像"贴上去的白色横条纹"）：
-   *   1) 每片叶片用**屏幕竖向渐变**：顶刃受光（细亮边）→ 叶面中灰 → 叶底背光（暗），有立体感，
-   *      而不是一整块平色；
-   *   2) 整帘再叠一层**上亮下暗**的衰减（越靠上越贴窗光），拉开上下层次；
-   *   3) 叶间留缝、缝隙透出玻璃，整层半透明 → 半透光，隔着帘子看得见屋里人影；
-   *   4) 顶部轨道 + 两侧拉绳 + 底部底杆，收住边，不再是均匀平铺的条带。
+   * Look-and-feel points (otherwise it looks like "white horizontal stripes stuck on"):
+   *   1) Each slat uses a **screen-vertical gradient**: top edge lit (thin bright rim) -> mid-gray face -> bottom edge in shadow (dark), giving volume,
+   *      instead of one flat color;
+   *   2) The whole blind adds another **bright-top dark-bottom** falloff (higher up is closer to the window light), separating the vertical layers;
+   *   3) Gaps between slats let the glass show through, the whole layer semi-transparent -> translucent, silhouettes visible through the blind;
+   *   4) Top rail + pull cords on both sides + bottom rail, finishing the edges, no longer a uniformly tiled band.
    */
   function drawBlinds(c, o) {
     const { axis, fixed, a0, a1, z0 = 0, z1, base = '#6f849c', alpha = 0.92, pitch = 0.155, slatH = 0.1 } = o;
@@ -1529,25 +1529,25 @@ export function createIsoOffice(canvas, opts = {}) {
     c.save();
     c.globalAlpha *= alpha;
 
-    // 叶片：自下而上；越靠上越亮（窗光自上方来），上下拉开更大的明暗对比
+    // Slats: bottom to top; higher up is brighter (window light comes from above), separating the vertical light-dark contrast more
     for (let z = z0 + baseGap; z + slatH <= z1 - railH + 1e-6; z += pitch) {
       const k = 0.5 + 0.62 * ((z + slatH / 2) / z1);
       const pT = pAt(a0, z + slatH);
       const pB = pAt(a0, z);
       const g = c.createLinearGradient(pT.x, pT.y, pB.x, pB.y);
-      g.addColorStop(0, shade(base, k * 1.42)); // 受光的顶刃
+      g.addColorStop(0, shade(base, k * 1.42)); // lit top edge
       g.addColorStop(0.14, shade(base, k * 1.02));
       g.addColorStop(0.6, shade(base, k * 0.74));
-      g.addColorStop(1, shade(base, k * 0.4)); // 背光的叶底
+      g.addColorStop(1, shade(base, k * 0.4)); // backlit slat bottom
       wallQuad(c, axis, fixed, a0, a1, z, z + slatH, g);
     }
 
-    // 顶部轨道（深色实心）+ 一条高光，压住最上一片
+    // Top rail (solid dark) + a highlight, covering the top slat
     wallQuad(c, axis, fixed, a0, a1, z1 - railH, z1, '#242d38');
     wallQuad(c, axis, fixed, a0, a1, z1 - railH * 0.36, z1, '#4b586a');
-    // 底部底杆
+    // Bottom rail
     wallQuad(c, axis, fixed, a0, a1, z0, z0 + baseGap - 0.01, shade(base, 0.7));
-    // 两侧拉绳
+    // Pull cords on both sides
     [a0 + span * 0.055, a1 - span * 0.075].forEach((a) => {
       wallQuad(c, axis, fixed, a, a + Math.min(0.028, span * 0.02), z0, z1 - railH, 'rgba(14,19,27,0.72)');
     });
@@ -1556,21 +1556,21 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 会议室 / 茶水间 标识：整块（牌底+文字）按墙面平行四边形斜贴，做到"平行墙面"
-   * （不是水平悬浮）。AX 斜 30°、AZ 竖直，故文字底边随墙斜、竖笔仍直。
-   * 用函数声明（提升）：buildStatics 在构造期就会调用它（茶水间标识要画在百叶帘之后）。
+   * Meeting room / pantry signs: the whole block (plate background + text) is skew-mounted along the wall parallelogram, achieving "parallel to the wall"
+   * (not floating horizontally). AX is slanted 30°, AZ is vertical, so the text's bottom edge follows the wall slant while vertical strokes stay upright.
+   * Uses a function declaration (hoisting): buildStatics calls it during construction (the pantry sign must be drawn after the blinds).
    */
   function drawWallLabel(c, text, gx, gy, gz) {
     const tc = makeWallText(text);
     const W = tc.width;
     const H = tc.height;
-    const halfH = 0.34; // 标牌半高（世界单位），需压在墙高内
-    const halfW = halfH * (W / H); // 与位图等比，文字不被拉伸
-    // 墙面四边形的三個角（gy 恒定）：sD=左上 sC=右上 sA=左下
+    const halfH = 0.34; // sign half-height (world units), must fit within the wall height
+    const halfW = halfH * (W / H); // proportional to the bitmap, so the text is not stretched
+    // The three corners of the wall quad (gy constant): sD=top-left sC=top-right sA=bottom-left
     const sD = project(gx - halfW, gy, gz + halfH);
     const sC = project(gx + halfW, gy, gz + halfH);
     const sA = project(gx - halfW, gy, gz - halfH);
-    // 仿射：把位图(0..W,0..H) 映射到墙面平行四边形（绕墙斜切）
+    // Affine: map the bitmap (0..W,0..H) onto the wall parallelogram (skew around the wall)
     const a = (sC.x - sD.x) / W;
     const b = (sC.y - sD.y) / W;
     const cc = (sA.x - sD.x) / H;
@@ -1582,25 +1582,25 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 金属竖直面（隔板铝框的南面 / 东面）：屏幕竖向渐变，从 (gx,gy,z1) 到 (gx,gy,z0)。
-   * 渐变必须贴着**实际那个面**取坐标 —— 只按 z 在原点处取一条竖线的话，
-   * 面的位置远在渐变范围之外，超出渐变的部分只能拿到末端色
-   * （南面变成一整块 0.5 暗色、和板体一个色，框就"没了"）。
-   * 拉丝铝的读法 —— 顶刃一条受光亮带（镜面高光）→ 快速回落到基调 → 底刃压暗；
-   * k 给背光面整体降档（东面 ≈ 南面的 0.72，与原先 shade 0.8 / 0.58 的比例一致）。
+   * Metal vertical face (the divider's aluminum frame south / east face): screen-vertical gradient, from (gx,gy,z1) to (gx,gy,z0).
+   * The gradient must take its coordinates hugging **the actual face** —— if you just take a vertical line at the origin by z,
+   * the face is far outside the gradient range, and the part beyond it only gets the end color
+   * (the south face becomes one block of 0.5 dark, the same color as the board, and the frame "disappears").
+   * How to read brushed aluminum —— top edge a lit bright band (specular highlight) -> quickly falls back to the base tone -> bottom edge darkened;
+   * k steps down the whole backlit face (east ≈ 0.72 of south, matching the original shade 0.8 / 0.58 ratio).
    */
   function metalFace(c, base, gx, gy, z0, z1, k = 1) {
     const pT = project(gx, gy, z1);
     const pB = project(gx, gy, z0);
     const g = c.createLinearGradient(pT.x, pT.y, pB.x, pB.y);
-    g.addColorStop(0, shade(base, 1.62 * k)); // 顶刃高光
+    g.addColorStop(0, shade(base, 1.62 * k)); // top edge highlight
     g.addColorStop(0.16, shade(base, 1.06 * k));
-    g.addColorStop(0.55, shade(base, 0.82 * k)); // 基调（≈ 原南面 0.8）
-    g.addColorStop(1, shade(base, 0.5 * k)); // 底刃暗边
+    g.addColorStop(0.55, shade(base, 0.82 * k)); // base tone (≈ original south 0.8)
+    g.addColorStop(1, shade(base, 0.5 * k)); // bottom edge darkened
     return g;
   }
 
-  /** 金属顶面：沿进深方向的提亮渐变 —— 北沿（远）更亮，像天光擦过框顶 */
+  /** Metal top face: brightening gradient along the depth direction —— north edge (far) brighter, like skylight grazing the frame top */
   function metalTop(c, base, y, d, z) {
     const pN = project(0, y, z);
     const pS = project(0, y + d, z);
@@ -1611,31 +1611,31 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 隔板上的便签纸：一张歪着的小方纸 + 压在纸上沿的一颗磁吸固定器。
+   * Sticky note on the divider: a small tilted square of paper + a magnet pin pressing on its top edge.
    *
-   * 纸与磁吸都贴在隔板**朝镜头那一面**（gy = 板南沿 + 0.002，抬一丝免得跟板面共面打架），
-   * 也就是都躺在 (gx, gz) 这张竖直面里。做法：先在面内绕纸心把四个角"转歪"，
-   * 再逐角 project —— 斜投影下正方形自然变成平行四边形，和板面严丝合缝，
-   * 而不是一张正对镜头、浮在板前的贴片。
+   * Both the paper and the magnet are stuck on the divider's **face toward the camera** (gy = board south edge + 0.002, lifted a hair so it does not fight the board face),
+   * i.e. both lie in the (gx, gz) vertical plane. Method: first rotate the four corners "askew" around the paper's center within the plane,
+   * then project each corner —— under the oblique projection the square naturally becomes a parallelogram, fitting the board face exactly,
+   * instead of a decal facing the camera and floating in front of the board.
    *
-   * 磁吸是个圆盘（圆面与板面平行），投影后是**斜椭圆**：面内两根轴 AX / AZ
-   * 投影后等长（44px）但夹角 120°；等长共轭半径成 120° 时，椭圆半轴为
-   * 44r·√1.5（长轴，沿屏幕 60°）与 44r·√0.5（短轴，沿 −30°），
-   * 直接喂给 ctx.ellipse 的 rotation 即可。
+   * The magnet is a disk (its face parallel to the board face), which projects to a **slanted ellipse**: the two in-plane axes AX / AZ
+   * project to equal length (44px) but at 120°; when equal conjugate radii form 120°, the ellipse's semi-axes are
+   * 44r·√1.5 (major, along screen 60°) and 44r·√0.5 (minor, along −30°),
+   * so just feed those to ctx.ellipse's rotation.
    *
-   * 纸色与墨色取自本层配色（colors.note / colors.noteInk）：基准层（1F/2F）是便签黄，3F 是冷紫罗兰，
-   * 换层时随 applyFloor() 一起变 —— 便签是静态家具，会被重建进 statics。
+   * Paper and ink colors come from this floor's palette (colors.note / colors.noteInk): the base floors (1F/2F) are sticky-note yellow, 3F is cool violet,
+   * and they change with applyFloor() when switching floors —— the note is static furniture and gets rebuilt into statics.
    */
   function drawDividerNote(c, p, note) {
     const y = p.y + p.d + 0.002;
     const th = (note.tilt * Math.PI) / 180;
     const co = Math.cos(th);
     const si = Math.sin(th);
-    /** 面内局部坐标（u 沿 gx、v 沿 gz，已绕纸心转过 tilt）→ 屏幕点 */
+    /** In-plane local coordinates (u along gx, v along gz, rotated by tilt about the paper center) -> screen point */
     const at = (u, v) => project(note.x + u * co - v * si, y, note.z + u * si + v * co);
     const hw = note.w / 2;
     const hh = note.h / 2;
-    /** 四个角（du/dv = 整张纸在面内的平移，用来画影子） */
+    /** Four corners (du/dv = translation of the whole paper within the plane, used to draw the shadow) */
     const quad = (du = 0, dv = 0) => [
       at(-hw + du, hh + dv),
       at(hw + du, hh + dv),
@@ -1643,10 +1643,10 @@ export function createIsoOffice(canvas, opts = {}) {
       at(-hw + du, -hh + dv),
     ];
 
-    // 影子：光从左上来，影子往板的右下方偏一点，纸才"浮"在板面上而不是印上去的
+    // Shadow: light comes from the upper left, the shadow shifts a bit to the board's lower-right, so the paper "floats" on the board face instead of being printed on it
     poly(c, quad(0.03, -0.03), 'rgba(8,11,16,0.35)');
 
-    // 纸面：上亮下暗（顶边受光）
+    // Paper face: bright top, dark bottom (top edge lit)
     const pT = at(0, hh);
     const pB = at(0, -hh);
     const gp = c.createLinearGradient(pT.x, pT.y, pB.x, pB.y);
@@ -1654,10 +1654,10 @@ export function createIsoOffice(canvas, opts = {}) {
     gp.addColorStop(1, shade(colors.note, 0.8));
     poly(c, quad(), gp, 'rgba(24,20,8,0.35)', 0.7);
 
-    // 下沿一道暗带：便签的下边微微翘起，这一道就是翘边落在纸上的影
+    // A dark band along the bottom edge: the note's bottom curls up slightly, and this band is the curl's shadow falling on the paper
     poly(c, [at(-hw, -hh), at(hw, -hh), at(hw, -hh + 0.055), at(-hw, -hh + 0.055)], 'rgba(20,16,4,0.16)');
 
-    // 两道手写笔迹（不到 1px，只为让它读起来是"写了字的便签"而不是一块色块）
+    // Two handwriting strokes (under 1px, just to make it read as a "note with writing" and not a color block)
     c.save();
     c.strokeStyle = rgba(colors.noteInk, 0.5);
     c.lineWidth = 0.7;
@@ -1672,7 +1672,7 @@ export function createIsoOffice(canvas, opts = {}) {
     });
     c.restore();
 
-    // 磁吸固定器：压在纸上沿正中 —— 外圈暗边（厚度）+ 金属面 + 一点高光
+    // Magnet pin: pressing on the top edge of the paper, centered —— dark outer ring (thickness) + metal face + a bit of highlight
     const r = note.magnet;
     const mj = UNIT_Z * r * Math.sqrt(1.5);
     const mn = UNIT_Z * r * Math.sqrt(0.5);
@@ -1696,17 +1696,17 @@ export function createIsoOffice(canvas, opts = {}) {
     c.fill();
   }
 
-  /** 预生成静态物件列表（每帧参与排序） */
+  /** Pre-generate the static object list (participates in sorting every frame) */
   function buildStatics() {
     /** @type {{depth:number,draw:(c:CanvasRenderingContext2D, now:number)=>void}[]} */
     const items = [];
     const push = (depth, draw) => items.push({ depth, draw });
 
     /**
-     * 一把椅子入队：底座与椅背分开排。
-     * 椅背朝北（背对镜头）时整把画在人之前 —— 椅背本就在人身后；
-     * 椅背朝南（挡在人与镜头之间，即"椅子朝向窗口"那排）时，椅背必须排在人**之后**：
-     * 坐着的人下半身被椅背压住才读作"坐在椅子里"，否则人像站在椅子前面。
+     * Enqueue one chair: the base and the back are sorted separately.
+     * When the back faces north (back to the camera) the whole chair is drawn before the person —— the back is behind the person anyway;
+     * when the back faces south (between the person and the camera, i.e. the "chair facing the window" row) the back must be sorted **after** the person:
+     * only when the seated person's lower half is pressed by the back does it read as "sitting in the chair", otherwise the person looks like standing in front of the chair.
      */
     const pushChair = (x, y, backAtNorth) => {
       push(depthOf(x, y) - 0.02, (c) => {
@@ -1716,35 +1716,35 @@ export function createIsoOffice(canvas, opts = {}) {
       if (!backAtNorth) push(depthOf(x, y + 0.24), (c) => drawChairBack(c, x, y, false));
     };
 
-    /* 工位（一）：隔断（铝合金边框）—— 6 组面对面双人桌各一道 */
+    /* Workstations (1): dividers (aluminum frame) —— one for each of the 6 face-to-face pair desks */
     DIVIDERS.forEach((p) => {
-      // 兜底：HMR 期间可能拿到"新 officeMap 的隔断对象 + 旧引擎"或半截数据 ——
-      // 那种情况下宁可少画一道隔断，也不要让整个办公室构建失败（白屏）。
+      // Fallback: during HMR we may get "a new officeMap divider object + old engine" or half data ——
+      // in that case, better to draw one divider fewer than to fail building the whole office (white screen).
       if (!p || !p.northDesk || !p.southDesk) return;
       /**
-       * 隔断是 3.2 宽的一整块，但整块只能拿一个 depth（= 中心 x+y）参与排序：
-       * 走道上的精灵 depth = x+y，走到板子后半段就会超过板子中心的 depth，
-       * 于是被画到板子**前面** —— 看着就是"从板子里穿出来"。
-       * 切成 4 段各排各的，遮挡判断就局部化了：板前的排后面、板后的排前面。
+       * The divider is one 3.2-wide block, but the whole block can only take one depth (= center x+y) for sorting:
+       * a sprite in the corridor has depth = x+y, and walking to the back half of the board exceeds the board's center depth,
+       * so it gets drawn **in front of** the board —— looking like "coming out through the board".
+       * Cutting it into 4 segments that sort separately localizes the occlusion: in front of the board sorts after, behind the board sorts before.
        */
       const SEG = 4;
       const segW = p.w / SEG;
       const natSegDepth = (s) => depthOf(p.x + (s + 0.5) * segW, p.y + p.d / 2);
       /**
-       * 每段深度夹在**本组两张桌子**之间：
-       *   下限 = 北桌（含桌上物）之后 → 隔断在它前面，要压住它；
-       *   上限 = 南桌**本身**之前（ds − 0.01）→ 南桌更靠近镜头，要能压住隔断（连桌腿一起）。
-       * 上限写大的后果：靠 x 大那几段的自然深度会超过南桌，哪怕 clamp 到 ds + 0.39 也仍在南桌
-       * **之后**绘制 —— 隔断东端盖住南桌的东沿与东腿，看着就是"右边看不到前桌腿、
-       * 板子突出了桌面、桌面爬到板子上"。所以上限必须严格小于南桌本身的深度。
+       * Each segment's depth is clamped between **this pair's two desks**:
+       *   floor = after the north desk (including items on it) -> the divider is in front of it and must press it;
+       *   ceil = before the south desk **itself** (ds − 0.01) -> the south desk is closer to the camera and must be able to press the divider (legs included).
+       * If ceil is too large: the natural depth of the segments with larger x exceeds the south desk, and even clamped to ds + 0.39 they are still drawn
+       * **after** the south desk —— the divider's east end covers the south desk's east edge and east legs, looking like "you cannot see the front desk legs on the right,
+       * the board sticks out past the desktop, the desktop climbs onto the board". So ceil must be strictly less than the south desk's own depth.
        */
       const dn = depthOf(p.northDesk.x + p.northDesk.w / 2, p.northDesk.y + p.northDesk.d / 2);
       const ds = depthOf(p.southDesk.x + p.southDesk.w / 2, p.southDesk.y + p.southDesk.d / 2);
       const floor = dn + 0.4 + 0.01;
       const ceil = ds - 0.01;
-      const segDepth = (s) => Math.min(ceil, Math.max(floor, natSegDepth(s))) + s * 0.0005; // 段间仍保持左→右的前后序
+      const segDepth = (s) => Math.min(ceil, Math.max(floor, natSegDepth(s))) + s * 0.0005; // segments still keep their left->right ordering
 
-      // 落地阴影：用自然深度，避免被 clamp 抬高后盖到后方桌子上
+      // Ground shadow: use the natural depth, so it is not clamped upward and covers the desks behind
       push(natSegDepth(0) - 0.5, (c) => {
         isoDiamond(c, {
           x: p.x - 0.06,
@@ -1758,34 +1758,34 @@ export function createIsoOffice(canvas, opts = {}) {
       });
 
       /**
-       * 深色金属边框：与板体**同厚**（FD = 0，不往外探），四条边一样宽。
-       * 亮铝色 + 比板厚会把边框读成一副独立于板子的浅色骨架；压暗、同厚之后，
-       * 整块隔断读起来是"一块带收边的板"。
+       * Dark metal frame: the **same thickness** as the board body (FD = 0, does not protrude), all four sides equally wide.
+       * Bright aluminum + thicker than the board would make the frame read as a light-colored skeleton independent of the board; darkened and equal-thickness,
+       * the whole divider reads as "a board with an edge trim".
        */
       const FR = p.frame || 0.05;
       const FD = 0;
       const ALU = colors.dividerFrame;
       /**
-       * 板体左右各让出 FR，把这两条让给竖框：
-       * 于是竖框**落在板边的那一条上、不压在板面上**（框外沿 = 板的总外沿 = 桌子左右沿）。
-       * 之前板体铺满全宽、竖框又后画，等于框整根骑在板面前面 —— 看着就是"板前立了根柱子"，
-       * 遮挡关系不对。
+       * The board body yields FR on each side, giving those two strips to the vertical frames:
+       * so the vertical frames **land on the strip at the board edge, not on the board face** (frame outer edge = board's total outer edge = desk left/right edges).
+       * Previously the body spanned the full width and the vertical frames were drawn later, so the frame straddled in front of the board face —— looking like "a post standing in front of the board",
+       * with the wrong occlusion.
        */
       const bodySegW = (p.w - 2 * FR) / SEG;
       for (let s = 0; s < SEG; s += 1) {
-        // 段间多画 0.01，压住接缝；多出来的部分被后一段盖住
+        // Draw 0.01 extra between segments to press the seam; the overflow is covered by the next segment
         push(segDepth(s), (c) => {
           /**
-           * 板体：不透明深灰，落地、无底座。
-           * 高度是被"突出桌面减半 + 北桌仍可读 + 名牌压得进板面"三个条件夹出来的
-           * （推导在 officeMap 的 DIVIDER_H 注释里）：再高北桌会被切剩一条边停在板顶
-           * （"桌面爬到隔板上"）；再矮名牌压不进板面。
+           * Board body: opaque dark gray, on the floor, no base.
+           * Its height is squeezed out of three conditions: "protrude past the desktop by half + the north desk stays readable + the nameplate presses into the board face"
+           * (derivation in officeMap's DIVIDER_H comment): any taller and the north desk is cut to a sliver stopping at the board top
+           * ("the desktop climbs onto the divider"); any shorter and the nameplate does not press into the board face.
            */
           isoBox(c, { x: p.x + FR + s * bodySegW, y: p.y, w: bodySegW + 0.01, d: p.d, h: p.h, color: colors.divider });
           /**
-           * 上横框：跟着段走（整条横框只拿一个深度会排错，被画到桌子前后不对的一侧）。
-           * 画在板体之后：顶面与板顶共面、后画的框条压出"收边"；南面在板正面压出顶部那条框；
-           * 朝东的端面被下一段板体盖住，接缝不露。
+           * Top horizontal frame: follows the segment (a single-depth whole strip would sort wrong and get drawn on the wrong side of the desk).
+           * Drawn after the board body: its top face is coplanar with the board top, and the later-drawn strip presses out the "edge trim"; the south face presses the top strip onto the board front;
+           * the east end face is covered by the next board segment, so the seam does not show.
            */
           isoBox(c, {
             x: p.x + FR + s * bodySegW, y: p.y, z: p.h - FR, w: bodySegW + 0.01, d: p.d, h: FR, color: ALU,
@@ -1794,19 +1794,19 @@ export function createIsoOffice(canvas, opts = {}) {
             top: metalTop(c, ALU, p.x + FR + s * bodySegW, p.y, p.d, p.h),
           });
           /**
-           * 下横框只画正面那一条（wallQuad），不画盒子：
-           * 盒子 z 0..FR 整段埋在板体脚下的体积里，顶面物理上就该被板体挡住 ——
-           * 画盒子的话顶面那条亮色会浮在板根前面，只能不漏的方式就是根本没有那个面。
-           * 正面这条比板面往外探 0.001，避免与板体南面共面打架。
+           * The bottom horizontal frame draws only the front strip (wallQuad), not a box:
+           * a box from z 0..FR is entirely buried in the volume at the board body's foot, and its top face should physically be blocked by the body ——
+           * drawing a box would make that bright top edge float in front of the board root; the only way not to leak it is to have no such face at all.
+           * This front strip pokes 0.001 past the board face, to avoid fighting the board's south face.
            */
           wallQuad(c, 'y', p.y + p.d + 0.001, p.x + FR + s * bodySegW, p.x + FR + (s + 1) * bodySegW + 0.01, 0, FR, metalFace(c, ALU, p.x + FR + s * bodySegW, p.y + p.d, 0, FR, 1));
         });
       }
       /**
-       * 左竖框：必须排在第 0 段板体**之前**画（同深度入队又靠后 = 画在板体之后，
-       * 朝东那条侧面就浮在板面上 —— 之前就是这么坏的）。它贴在板体西端，
-       * 朝东的侧面整面埋在板体体积里，后画的板体（顶面 + 南面）会把它正好盖没；
-       * 正面那条不与板体重叠（板体从 p.x+FR 起），仍然看得见。
+       * Left vertical frame: must be drawn **before** segment 0's board body (enqueued at the same depth but later = drawn after the body,
+       * and the east side face floats on the board face —— that is exactly how it broke before). It hugs the board body's west end,
+       * its east side face is entirely buried in the board body's volume, and the later-drawn body (top + south faces) covers it exactly;
+       * its front strip does not overlap the body (the body starts at p.x+FR), so it is still visible.
        */
       push(segDepth(0) - 0.0005, (c) => {
         isoBox(c, {
@@ -1816,8 +1816,8 @@ export function createIsoOffice(canvas, opts = {}) {
           top: metalTop(c, ALU, p.x, p.y - FD / 2, p.d + FD, p.h),
         });
       });
-      // 右竖框：朝东那面是隔断的外表面（该看见），排在最后一段板体之后，
-      // 顺便盖住板体段间接缝多画出来的 0.01。
+      // Right vertical frame: its east face is the divider's outer surface (should be visible), sorted after the last board segment,
+      // incidentally covering the 0.01 extra drawn at the body segment seams.
       push(segDepth(SEG - 1) + 0.0002, (c) => {
         isoBox(c, {
           x: p.x + p.w - FR, y: p.y - FD / 2, w: FR, d: p.d + FD, h: p.h, color: ALU,
@@ -1827,36 +1827,36 @@ export function createIsoOffice(canvas, opts = {}) {
         });
       });
       /**
-       * 便签纸（+ 磁吸固定器）：排在**最后一段板体与右竖框之后** —— 它贴在板面上，
-       * 必须压在板子之上；又严格小于南桌的 depth（上限 ceil = ds − 0.01），
-       * 所以纸的下沿万一压到桌面高度，仍会被后画的南桌正确切掉，不会浮在桌子前面。
+       * Sticky note (+ magnet pin): sorted **after the last board segment and the right vertical frame** —— it is stuck on the board face,
+       * so it must press on top of the board; and it is strictly less than the south desk's depth (ceil = ds − 0.01),
+       * so even if the paper's bottom edge reaches desktop height, it is still correctly cut by the later-drawn south desk and does not float in front of the desk.
        */
       if (p.note) push(segDepth(SEG - 1) + 0.0004, (c) => drawDividerNote(c, p, p.note));
 
-      // 名牌不再挂隔板：已挪到各桌桌面（见 DESK_UNITS 段的 drawDeskTag）
+      // Nameplates no longer hang on the divider: moved to each desk top (see drawDeskTag in the DESK_UNITS section)
     });
 
-    /* 工位（二）：椅子 / 桌子 / 桌上的东西（显示器、键盘、水杯） */
+    /* Workstations (2): chairs / desks / items on the desk (monitor, keyboard, cup) */
     DESK_UNITS.forEach((u, i) => {
       const deskDepth = depthOf(u.desk.x + u.desk.w / 2, u.desk.y + u.desk.d / 2);
 
-      // 椅子（底座在人之前画；椅背朝镜头那排由 pushChair 排到人之后）。
-      // 椅背朝向跟着"面对面"来：face='south'（北侧那排，面朝 +gy）椅背朝北 → true；南侧那排相反 → false
+      // Chair (the base is drawn before the person; the back on the camera-facing row is sorted after the person by pushChair).
+      // The back's facing follows "face-to-face": face='south' (north row, facing +gy) back faces north -> true; the south row is the opposite -> false
       pushChair(u.chair.x, u.chair.y, u.face === 'south');
 
-      // 桌子
+      // Desk
       push(deskDepth, (c) => {
         const { x, y, w, d, h } = u.desk;
-        // 四条腿
+        // Four legs
         isoBox(c, { x: x + 0.1, y: y + 0.1, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
         isoBox(c, { x: x + w - 0.2, y: y + 0.1, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
         isoBox(c, { x: x + 0.1, y: y + d - 0.2, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
         isoBox(c, { x: x + w - 0.2, y: y + d - 0.2, z: 0, w: 0.1, d: 0.1, h: h - 0.06, color: colors.deskLeg });
-        // 桌面
+        // Desk top
         isoBox(c, { x, y, z: h - 0.08, w, d, h: 0.08, color: colors.wood });
       });
 
-      // 桌上的东西（depth 比桌子大一点 → 压在桌面上）
+      // Items on the desk (depth a bit more than the desk -> pressed onto the desktop)
       push(deskDepth + 0.4, (c, now) => {
         const z = u.desk.h;
         const m = u.monitor;
@@ -1864,10 +1864,10 @@ export function createIsoOffice(canvas, opts = {}) {
         const a = agents.find((ag) => ag.home === i);
 
         /**
-         * 显示器：底座 + 支架 + 面板（薄盒子当边框）。
-         * 南桌（face='north'）：屏幕朝镜头（也朝使用者），drawScreen 画在面板正面；
-         * 北桌（face='south'）：使用者朝南坐，屏幕朝北 —— 镜头看见的是**背面**，
-         * 画两条散热横纹 + 中央 logo 牌，才读得出"显示器的背壳"而不是一块黑板。
+         * Monitor: base + stand + panel (a thin box as the bezel).
+         * South desk (face='north'): the screen faces the camera (and the user), drawScreen is drawn on the panel's front;
+         * North desk (face='south'): the user sits facing south, the screen faces north —— the camera sees the **back**,
+         * so draw two horizontal vent lines + a center logo plate, to read as "the monitor's back shell" and not a blackboard.
          */
         const drawMonitor = () => {
           isoBox(c, { x: m.x + m.w / 2 - 0.2, y: m.y + 0.01, z, w: 0.4, d: 0.15, h: 0.03, color: '#202735' });
@@ -1879,8 +1879,8 @@ export function createIsoOffice(canvas, opts = {}) {
               { x: m.x, y: m.y, z: z + 0.12, w: m.w, d: m.d, h: m.h },
               levelColor(a && a.level),
               i * 977 + 13,
-              Boolean(a), // 没人的工位：屏幕熄灭
-              now // 打字动画 + 底部走条的时间轴
+              Boolean(a), // empty workstation: screen off
+              now // timeline for the typing animation + bottom bar
             );
           } else {
             const backY = m.y + m.d + 0.001;
@@ -1889,11 +1889,11 @@ export function createIsoOffice(canvas, opts = {}) {
             wallQuad(c, 'y', backY, m.x + 0.12, m.x + m.w - 0.12, z0 + m.h * 0.42, z0 + m.h * 0.48, 'rgba(120,140,170,0.16)');
             wallQuad(c, 'y', backY + 0.001, m.x + m.w / 2 - 0.055, m.x + m.w / 2 + 0.055, z0 + m.h * 0.58, z0 + m.h * 0.58 + 0.09, '#31405a', 'rgba(140,170,210,0.35)', 0.8);
             /**
-             * 电源指示灯：背面下沿、比右下角往中间收一点（不正中 —— 正中像摄像头），
-             * 一条 3×1 的小横线（与显示器横边平行：gx 轴屏幕方向斜 30°，不是窗口水平）。
-             *   · 在座（通电运行中）：青蓝，透明度呼吸 0.3 → 1.0 → 0.3，周期 1.8s、各工位错相位；
-             *   · 空工位（待机）：换成**暗蓝微光**、恒亮不呼吸 —— 北排只看得见显示器背壳，
-             *     靠这颗灯传达"机器通着电、屏是暗蓝待机"，而不是这台坏了。
+             * Power indicator light: on the back's lower edge, pulled a bit toward center from the lower-right corner (not dead center —— center looks like a camera),
+             * a small 3×1 horizontal line (parallel to the monitor's horizontal edges: the gx axis is 30° on screen, not window-horizontal).
+             *   · Seated (powered and running): cyan-blue, opacity breathing 0.3 → 1.0 → 0.3, period 1.8s, staggered phase per workstation;
+             *   · Empty workstation (standby): switch to a **dim blue glow**, steady, no breathing —— the north row only shows the monitor's back shell,
+             *     and this light conveys "the machine is powered, the screen is dim-blue standby", not that this one is broken.
              */
             const breath = a
               ? 0.3 + 0.7 * (0.5 + 0.5 * Math.sin((now / 1000) * ((Math.PI * 2) / 1.8) + i * 0.9))
@@ -1917,9 +1917,9 @@ export function createIsoOffice(canvas, opts = {}) {
         };
 
         /**
-         * 键盘：薄底板 + 顶面三行键帽（浅色小菱形）。
-         * 键帽不画厚度（不到 3px 的盒子看不出体积，平的小格反而一眼是键盘）。
-         * 键盘右边一只鼠标：底影 + 亮面小拱 + 一道中线当滚轮。
+         * Keyboard: a thin base plate + three rows of keycaps on top (small light diamonds).
+         * Keycaps are not drawn with thickness (a box under 3px shows no volume; flat small cells read as a keyboard at a glance).
+         * A mouse to the keyboard's right: base shadow + a bright small hump + a center line as the scroll wheel.
          */
         const drawKeyboard = () => {
           isoBox(c, { x: kb.x, y: kb.y, z, w: kb.w, d: kb.d, h: 0.025, color: '#242c3a' });
@@ -1938,32 +1938,32 @@ export function createIsoOffice(canvas, opts = {}) {
             }
           }
           /**
-           * 鼠标：沿桌子前后（gy 轴屏幕方向）拉长的椭圆，颜色与键盘同系深灰蓝。
-           * 位置在使用者的**右手边**：南桌（背对镜头）右手在东（键盘 +x 侧），
-           * 北桌（面对镜头）右手在西（键盘 −x 侧）—— 两排不是同一个屏幕方向，不能镜像。
+           * Mouse: an ellipse elongated along the desk's front-back (the gy axis on screen), colored in the same dark gray-blue family as the keyboard.
+           * Positioned on the user's **right hand side**: south desk (back to the camera) right hand is east (the keyboard's +x side),
+           * north desk (facing the camera) right hand is west (the keyboard's −x side) —— the two rows are not the same screen direction, so they cannot be mirrored.
            *
-           * 底影的偏移方向是 local +y 的反方向：local +y 在屏上指向上左，
-           * 所以影子要往 local −y 走，才会落到**右下角**（符合光从左上方来）。
+           * The base shadow's offset direction is the opposite of local +y: local +y points up-left on screen,
+           * so the shadow must go toward local −y to land at the **lower-right** (matching light from the upper-left).
            */
           const mx = u.face === 'north' ? kb.x + kb.w + 0.1 : kb.x - 0.1;
           const my = kb.y + kb.d / 2;
           const pM = project(mx, my, z + 0.045);
-          const mAng = Math.atan2(AY.y, AY.x); // gy 轴在屏幕上的方向
+          const mAng = Math.atan2(AY.y, AY.x); // direction of the gy axis on screen
           c.save();
           c.translate(pM.x, pM.y);
           c.rotate(mAng);
           c.beginPath();
-          c.ellipse(0, -0.9, 4.7, 2.9, 0, 0, Math.PI * 2); // 底影 → 右下角
+          c.ellipse(0, -0.9, 4.7, 2.9, 0, 0, Math.PI * 2); // base shadow -> lower-right
           c.fillStyle = '#161c26';
           c.fill();
           c.beginPath();
-          c.ellipse(0, 0, 4.5, 2.75, 0, 0, Math.PI * 2); // 鼠身（键盘同色系）
+          c.ellipse(0, 0, 4.5, 2.75, 0, 0, Math.PI * 2); // mouse body (same color family as the keyboard)
           c.fillStyle = '#39424f';
           c.fill();
           c.strokeStyle = '#4b5666';
           c.lineWidth = 0.7;
           c.stroke();
-          c.beginPath(); // 前沿滚轮亮线
+          c.beginPath(); // front scroll-wheel bright line
           c.moveTo(-1.7, 0);
           c.lineTo(-3.6, 0);
           c.strokeStyle = '#5b6779';
@@ -1972,9 +1972,9 @@ export function createIsoOffice(canvas, opts = {}) {
         };
 
         /**
-         * 一前一后，谁靠镜头谁后画：
-         * 北桌显示器在键盘南边（靠镜头）→ 显示器后画，键盘被它压住
-         * （对面工位看见的就是显示器背壳挡着键盘）；南桌键盘在南边 → 键盘后画。
+         * One behind the other, whichever is closer to the camera is drawn later:
+         * North desk's monitor is south of the keyboard (closer to the camera) -> monitor drawn later, keyboard is pressed by it
+         * (the workstation opposite sees the monitor's back shell blocking the keyboard); south desk's keyboard is on the south -> keyboard drawn later.
          */
         if (u.face === 'south') {
           drawKeyboard();
@@ -1985,54 +1985,54 @@ export function createIsoOffice(canvas, opts = {}) {
         }
 
         /**
-         * 名字贴：平放在自己桌子"坐下后的左下角"（保留级别色条），紧贴桌子的左侧边。
-         * 北桌（面朝 +gy 坐）：左手边是东侧 → 紧贴桌子东沿、靠近自己的北沿，
-         *   字翻转 180°、色条换到对面 —— 对镜头是倒的，对坐在那儿的小怪物才是正的；
-         * 南桌（背对镜头坐）：左手边是西侧 → 紧贴桌子西沿、靠近自己的南沿，
-         *   字朝镜头方向，坐着的小怪物看已经是正的。
+         * Nameplate: laid flat at the "lower-left corner after sitting down" of one's own desk (keeping the level color strip), flush against the desk's left edge.
+         * North desk (sitting facing +gy): the left-hand side is the east -> flush against the desk's east edge, near one's own north edge,
+         *   the text flipped 180° and the strip moved to the opposite side —— upside down to the camera, upright to the gremlin sitting there;
+         * South desk (sitting with back to the camera): the left-hand side is the west -> flush against the desk's west edge, near one's own south edge,
+         *   the text toward the camera, already upright as seen by the seated gremlin.
          */
         if (a) {
           const common = { z: z + 0.002, text: a.name, accent: levelColor(a.level) };
           if (u.face === 'south') {
-            // 北桌：往隔板方向挪（y 0.22..0.52）。极限是贴子南沿离隔板 >0.47
-            // （隔板 1.21 高，藏住身后 1.21−Δ 以下的东西；贴面 z=0.74 → Δ>0.47 才完整露出），
-            // 0.52 离隔板 0.53，刚好仍在遮挡线之上、完整可见。
+            // North desk: shift toward the divider (y 0.22..0.52). The limit is the plate's south edge >0.47 from the divider
+            // (the divider is 1.21 tall, hiding things below 1.21−Δ behind it; plate face z=0.74 → needs Δ>0.47 to be fully exposed),
+            // 0.52 is 0.53 from the divider, just still above the occlusion line and fully visible.
             drawDeskTag(c, { ...common, x: u.desk.x + u.desk.w - 0.02, y: u.desk.y + 0.22, flip: true, alignRight: true });
           } else {
-            // 南桌：同样往隔板方向挪一小段（y 0.55..0.85）；隔板在它身后，不存在遮挡
+            // South desk: likewise shifted a small amount toward the divider (y 0.55..0.85); the divider is behind it, so no occlusion
             drawDeskTag(c, { ...common, x: u.desk.x + 0.02, y: u.desk.y + 0.55 });
           }
         }
       });
     });
 
-    /* 会议室 */
+    /* Meeting room */
     const mt = MEETING.table;
     push(depthOf(mt.x + mt.w / 2, mt.y + mt.d / 2), (c) => {
       isoBox(c, { x: mt.x + 0.15, y: mt.y + 0.2, z: 0, w: 0.18, d: 0.18, h: mt.h - 0.08, color: colors.deskLeg });
       isoBox(c, { x: mt.x + mt.w - 0.33, y: mt.y + mt.d - 0.38, z: 0, w: 0.18, d: 0.18, h: mt.h - 0.08, color: colors.deskLeg });
       isoBox(c, { x: mt.x, y: mt.y, z: mt.h - 0.1, w: mt.w, d: mt.d, h: 0.1, color: colors.wood });
-      // 桌上：一摞纸 + 投影仪
+      // On the table: a stack of papers + a projector
       isoBox(c, { x: mt.x + 1.1, y: mt.y + 0.55, z: mt.h, w: 0.5, d: 0.4, h: 0.04, color: '#e6ebf2' });
       isoBox(c, { x: mt.x + 1.9, y: mt.y + 0.6, z: mt.h, w: 0.42, d: 0.3, h: 0.12, color: '#2b3140' });
     });
 
-    // 前一半椅子在桌子北侧（椅背朝北），后一半在南侧（椅背朝镜头 → 排到人就座之后）
+    // The first half of the chairs are on the table's north side (back facing north), the second half on the south side (back facing the camera -> sorted after people sit)
     MEETING.chairs.forEach((ch, i) => pushChair(ch.x, ch.y, i < 4));
 
-    // 玻璃隔墙（半透明）+ 它迎镜头那一面的半透光百叶帘。
+    // Glass partition (semi-transparent) + the translucent blinds on its camera-facing side.
     //
-    // 为什么"玻璃面"和"帘子"都必须按面坐标**分段**入队：等距排序键是 gx+gy（一个标量），
-    // 而这几片玻璃横跨好几个 tile。整片只取一个中点键（再 +0.6 抬过屋里的人）时，靠它低坐标一侧、
-    // 又实际贴在玻璃**前面**的东西（茶水间北墙的饮水机、走到跟前接水的小怪物）会被算成在玻璃后面 ——
-    // 于是那层 16% 的半透明玻璃面就压在它们身上，看上去就是"饮水机被玻璃/帘子遮了一块"。
-    // 按面坐标切成小段、各段用自己的中点定 depth，前后关系就回到真实的局部顺序：
-    //   - 玻璃"后面"（屋里侧）的东西：键总小于对应段 → 先画，被玻璃 / 帘子盖住 ✓
-    //   - 玻璃"前面"的东西（饮水机 / 复印机 / 站在饮水机前的小怪物）：键总大于对应段 → 后画 ✓
-    // 玻璃面逐段用 wallQuad 画（而不是整块 isoBox、也不是拼多块 isoBox）：相邻段共边不重叠，
-    // 既不会露出 isoBox 的端面接缝，也不会把 0.16 的透明度在接缝处叠成一条深线。
+    // Why both the "glass face" and the "blinds" must be enqueued **in segments** by face coordinate: the isometric sort key is gx+gy (a scalar),
+    // while these glass panes span several tiles. If the whole pane took a single midpoint key (plus +0.6 to clear the people inside), things on its low-coordinate side
+    // that are actually stuck **in front of** the glass (the pantry north wall's water cooler, a gremlin walking up to it for water) would count as being behind the glass ——
+    // so that 16% translucent glass face would press on them, appearing as "the water cooler is partly hidden by the glass / blinds".
+    // Cutting by face coordinate into small segments, each with its own midpoint depth, restores the true local front-back order:
+    //   - Things "behind" the glass (room side): key always less than the matching segment -> drawn first, covered by the glass / blinds ✓
+    //   - Things "in front of" the glass (water cooler / printer / a gremlin standing at the cooler): key always greater than the matching segment -> drawn later ✓
+    // The glass face is drawn segment by segment with wallQuad (not one isoBox, nor several isoBoxes): adjacent segments share edges without overlapping,
+    // so it neither exposes isoBox end-face seams nor stacks the 0.16 alpha into a dark line at the seams.
     const gh = MEETING.glass.h;
-    /** 一面玻璃 +（可选）它迎镜头那面的百叶帘，按面坐标切成若干段分别入队：axis='x' 沿 gy 切，axis='y' 沿 gx 切 */
+    /** One glass face + (optionally) the blinds on its camera-facing side, cut into segments by face coordinate and enqueued separately: axis='x' cuts along gy, axis='y' along gx */
     const pushGlassFace = ({ axis, fixed, a0, a1, segW, h = gh, blinds = true }) => {
       const n = Math.max(1, Math.ceil((a1 - a0) / segW));
       const w = (a1 - a0) / n;
@@ -2045,79 +2045,79 @@ export function createIsoOffice(canvas, opts = {}) {
         if (blinds) push(d + 0.0005, (c) => drawBlinds(c, { axis, fixed, a0: s0, a1: s1, z0: 0, z1: h }));
       }
     };
-    // 西面：分两段，中间是门洞（帘子按片挂，门洞处自然留空）；大面是 +gx 面（x = 右沿）
+    // West face: two segments, with the doorway in the middle (blinds hang per panel, so the doorway is naturally empty); the big face is the +gx face (x = right edge)
     [MEETING.glass.westA, MEETING.glass.westB].forEach((g) => {
       pushGlassFace({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, segW: 0.8 });
     });
-    // 南面：一整条；大面是 +gy 面（y = 前沿）
+    // South face: one whole strip; the big face is the +gy face (y = front edge)
     const gs = MEETING.glass.south;
     pushGlassFace({ axis: 'y', fixed: gs.y + gs.d, a0: gs.x, a1: gs.x + gs.w, segW: 0.7 });
-    // 茶水间标识：贴在这片南面玻璃朝镜头那一面（= 茶水间的北墙）。
-    // 帘子分了段、各段 depth 不同，标识必须排在**所有帘段**之后：取这条玻璃最右端的 depth 再抬一点。
+    // Pantry sign: stuck on the camera-facing side of this south glass (= the pantry's north wall).
+    // The blinds are segmented with different depths, so the sign must be sorted **after all blind segments**: take the depth at this glass's far-right end and lift it a bit.
     push(depthOf(gs.x + gs.w, gs.y + gs.d) + 0.3, (c) => {
       drawWallLabel(c, t('wall.pantry'), PANTRY.x + PANTRY.w / 2, PANTRY.y, 1.7);
     });
 
-    /* 茶水间 */
+    /* Pantry */
     const pt = PANTRY.table;
     push(depthOf(pt.x + pt.w / 2, pt.y + pt.d / 2), (c) => {
       [[0.12, 0.1], [pt.w - 0.24, 0.1], [0.12, pt.d - 0.22], [pt.w - 0.24, pt.d - 0.22]].forEach(([dx, dy]) => {
         isoBox(c, { x: pt.x + dx, y: pt.y + dy, z: 0, w: 0.12, d: 0.12, h: pt.h - 0.08, color: colors.deskLeg });
       });
       isoBox(c, { x: pt.x, y: pt.y, z: pt.h - 0.08, w: pt.w, d: pt.d, h: 0.08, color: colors.wood });
-      // 桌上的杯子
+      // Cup on the table
       isoCylinder(c, { x: pt.x + 0.5, y: pt.y + 0.42, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
       isoCylinder(c, { x: pt.x + 1.45, y: pt.y + 0.6, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
     });
 
     PANTRY.chairs.forEach((ch, i) => pushChair(ch.x, ch.y, i < 3));
 
-    /* 杂志架（茶水间北墙东段），见 drawMagRack */
+    /* Magazine rack (pantry north wall, east section), see drawMagRack */
     const rk = PANTRY.rack;
-    // 键取"前右侧角"，再抬到"这面墙最东端"之上：北墙（会议室南面玻璃）是分段画的，
-    // 玻璃段的键会一路到 depthOf(20, 7.25) ≈ 27.25，架子只要比它浅，后画的玻璃就会切掉架子右角。
-    // 现在架子摆最东端时天然就够（角键 ≈ 27.37），这句保证的是"以后把 d 收窄也不会破"。
-    // 代价：站在它正东侧（x 更大）且更靠镜头的人可能被它压住 —— 那片是茶水间东北角，
-    // 走道（PDOOR_IN → COFFEE）在最西侧，实际不会撞上。
+    // The key takes the "front-right corner", then lifts above "the east end of this wall": the north wall (meeting room's south glass) is drawn in segments,
+    // and the glass segments' keys run all the way to depthOf(20, 7.25) ≈ 27.25; if the rack is any shallower, the later-drawn glass cuts off the rack's right corner.
+    // Now that the rack sits at the east end it is naturally enough (corner key ≈ 27.37); this line guarantees "narrowing d later will not break it".
+    // Cost: a person standing directly east of it (larger x) and closer to the camera may be pressed by it —— that patch is the pantry's northeast corner,
+    // and the corridor (PDOOR_IN → COFFEE) is at the far west, so it will not actually collide.
     const wallEastDepth = depthOf(MEETING.x + MEETING.w, MEETING.y);
     push(Math.max(depthOf(rk.x + rk.w, rk.y + rk.d), wallEastDepth + 0.1), (c) => drawMagRack(c, rk));
 
     const pc = PANTRY.cooler;
-    // 饮水机贴在茶水间北墙（= 会议室南面玻璃）跟前，属于"玻璃前面"的东西：
-    // 它必须排在这条北墙的**所有**玻璃段 / 帘段之后 —— 帘片 alpha 0.92 几乎不透明，
-    // 只要有一段排在它后面，就会从屏幕重叠处硬切掉它一块（实测被切的就是这个）。
-    // 单纯用 depthOf(pc.x, pc.y)（22.85）不够：分段后靠右那些段的键会高到 23.1~26.5。
-    // 上限卡死在"接水站位"（PLACES.coffee, 23.55）之下 —— 站在饮水机前接水的小怪物仍要能盖住它。
+    // The water cooler hugs the pantry north wall (= the meeting room's south glass), so it counts as being "in front of the glass":
+    // it must be sorted after **all** glass segments / blind segments of this north wall —— the blind slats' alpha 0.92 is nearly opaque,
+    // and any segment sorted after it would hard-cut a chunk off it where they overlap on screen (that is exactly what was observed being cut).
+    // depthOf(pc.x, pc.y) (22.85) alone is not enough: after segmenting, the right-side segments' keys go up to 23.1~26.5.
+    // The ceiling is pinned below the "water spot" (PLACES.coffee, 23.55) —— a gremlin standing at the cooler for water must still be able to cover it.
     const coolDepth = Math.max(depthOf(pc.x, pc.y), depthOf(PLACES.coffee.x, PLACES.coffee.y) - 0.05);
     push(coolDepth, (c) => drawCooler(c, pc));
 
-    // 茶水间玻璃隔断：只砌西面（门在中间，两片分开挂帘 → 门洞处自然留空）；
-    // 北面借会议室的南墙，南面直接贴房间最前面那道玻璃幕墙，不再多砌一道。
-    // 帘子与玻璃面一样按面坐标分段（见上面 pushGlassFace 的说明）：整块中点键会把这层 16% 的玻璃
-    // 压到贴在茶水间一侧的饮水机上，看上去就是饮水机左边被遮了一块。
-    // 这两片帘子不会盖住饮水机：与饮水机在屏幕上重叠的只有靠北的两段（depth 21.87 / 22.50，
-    // 都小于饮水机的 coolDepth 23.5，先画 → 被饮水机盖住）；靠南那几段在屏幕左下，根本不重叠。
-    // （帘片 alpha 0.92 几乎不透明，所以必须靠 depth 卡住，不能靠透明度兜底。）
+    // Pantry glass partition: only the west face is built (the door is in the middle, two panels hang blinds separately → the doorway is naturally empty);
+    // the north side borrows the meeting room's south wall, and the south side directly hugs the room's frontmost glass curtain wall, so no extra one is built.
+    // The blinds are segmented by face coordinate like the glass face (see pushGlassFace above): a single midpoint key would press this 16% glass
+    // onto the water cooler hugging the pantry side, appearing as the cooler's left part being hidden.
+    // These two blind panels do not cover the water cooler: the only ones overlapping the cooler on screen are the two northern segments (depth 21.87 / 22.50,
+    // both less than the cooler's coolDepth 23.5, drawn first -> covered by the cooler); the southern segments are at the screen's lower-left and do not overlap at all.
+    // (Blind slats' alpha 0.92 is nearly opaque, so it must be pinned by depth, not rescued by transparency.)
     const ph = PANTRY.glass.h;
     const pg = PANTRY.glass;
     [pg.westA, pg.westB].forEach((g) => {
       pushGlassFace({ axis: 'x', fixed: g.x + g.w, a0: g.y, a1: g.y + g.d, segW: 0.8, h: ph });
     });
 
-    /* 复印机（会议室西北角）：一台落地式一体机，见 drawPrinter */
+    /* Printer (meeting room's northwest corner): a floor-standing all-in-one, see drawPrinter */
     const pr = MEETING.printer;
-    // 西面帘子已按坐标分段（见上），复印机用正常 depth 就能排在对应帘段之后。
+    // The west blinds are already segmented by coordinate (see above), so the printer with a normal depth sorts after the matching blind segments.
     push(depthOf(pr.x + pr.w / 2, pr.y + pr.d / 2), (c) => drawPrinter(c, pr));
 
     PLANTS.forEach((p) => push(depthOf(p.x, p.y), (c) => drawPlant(c, p)));
 
-    /* 主 Agent 控制台：柜体 → 悬浮屏 → 剪影（depth 由小到大，正好是从里到外的顺序） */
+    /* Main Agent console: cabinet -> floating screen -> silhouette (depth increasing, exactly the inside-out order) */
     const cd = CONSOLE.desk;
     push(depthOf(cd.x + cd.w / 2, cd.y + cd.d / 2), (c, now) => drawConsoleDesk(c, now));
     const cs = CONSOLE.screen;
-    // 悬浮屏必须盖住它正后方（gy 更小）的工位内容：屏幕 depth 取 operator 深度 -0.1，
-    // operator 在屏前（depth = seat.x + seat.y）。屏正后方是中间列工位（x+y 远低于屏），
-    // 必然先画、被屏盖住；最右列工位虽 x+y 略高，但位于屏右侧、屏幕投影不重叠，不受影响。
+    // The floating screen must cover the workstation content directly behind it (smaller gy): the screen depth takes the operator depth -0.1,
+    // the operator is in front of the screen (depth = seat.x + seat.y). Directly behind the screen are the middle-column workstations (x+y far below the screen),
+    // so they are necessarily drawn first and covered by the screen; the rightmost column, though its x+y is slightly higher, is to the screen's right and its projection does not overlap, so it is unaffected.
     push(depthOf(CONSOLE.seat.x, CONSOLE.seat.y) - 0.1, (c, now) =>
       drawConsoleScreen(c, { state: mainAgent, now, zoom: cam.zoom })
     );
@@ -2126,10 +2126,10 @@ export function createIsoOffice(canvas, opts = {}) {
     return items;
   }
 
-  /** 静态家具的绘制清单（含每件的 depth）。配色随楼层变，切层时用 applyFloor() 重建 */
+  /** Static furniture draw list (with each item's depth). The palette changes per floor; switching floors rebuilds via applyFloor() */
   let statics = buildStatics();
 
-  /** 换楼层：重挑配色并重建受影响的缓存（家具清单 + 背景） */
+  /** Switch floor: re-pick the palette and rebuild the affected caches (furniture list + background) */
   function applyFloor(id) {
     const next = id || '';
     if (next === floorId) return;
@@ -2139,13 +2139,13 @@ export function createIsoOffice(canvas, opts = {}) {
     bgKey = '';
   }
 
-  /* ------------------------------ 背景（缓存） ------------------------------ */
+  /* ------------------------------ Background (cached) ------------------------------ */
 
   function drawFloor(c) {
-    // 地面是一块纯平的平行四边形：不要给它加板厚，
-    // 一旦露出侧面，整个外轮廓就变成六边形，看着就不像平行四边形了。
-    // 满铺菱形地毯砖：每格一块菱形，深浅两档交替 + 一道砖缝，整间屋子同一种材质
-    // （以前是几块颜色不一的大地毯盖在格子上，深浅打架，看着很花）。
+    // The floor is a flat parallelogram: do not give it plate thickness,
+    // once a side face shows, the whole outline becomes a hexagon and no longer looks like a parallelogram.
+    // Fully tiled diamond carpet tiles: one diamond per cell, two alternating shades + a tile seam, the same material for the whole room
+    // (previously several differently colored large rugs over the cells, whose shades fought each other and looked busy).
     for (let gy = 0; gy < ROOM.d; gy += 1) {
       for (let gx = 0; gx < ROOM.w; gx += 1) {
         isoDiamond(c, {
@@ -2159,31 +2159,31 @@ export function createIsoOffice(canvas, opts = {}) {
         });
       }
     }
-    // 房间地面边界：四条边就是四道墙脚，围成一个清晰的平行四边形
+    // Room floor boundary: the four sides are the four wall bases, enclosing a crisp parallelogram
     isoDiamond(c, {
       x: 0, y: 0, w: ROOM.w, d: ROOM.d,
       fill: null, stroke: colors.wallTop, lw: 2.8, alpha: 0.9,
     });
   }
 
-  /* ------------------------------ 大门（会开合） ------------------------------ */
+  /* ------------------------------ Door (opens and closes) ------------------------------ */
 
   /**
-   * 大门开度 0..1（0 = 关严，1 = 开到底）；holdUntil = 在这个时刻之前门都敞着。
-   * 门板**不进背景缓存**：缓存只在相机变化时重画，画进去就永远推不开了。
+   * Door opening 0..1 (0 = fully shut, 1 = fully open); holdUntil = the door stays open until this moment.
+   * The door leaf **does not go into the background cache**: the cache is only redrawn when the camera changes, and once drawn in it could never be pushed open.
    */
   const door = { a: 0, holdUntil: 0 };
 
   /**
-   * 门跟着"谁要进门"走：有人快露面了（提前 DOOR_LEAD）、或还在门洞里，门就一直敞着；
-   * 人走完再撑 DOOR_LINGER 一档才合上 —— 不然最后一只刚跨进来，门就拍在它身上。
+   * The door follows "whoever is about to enter": if someone is about to appear (DOOR_LEAD ahead) or is still in the doorway, the door stays open;
+   * after they are done it holds for DOOR_LINGER before closing —— otherwise the last one has just stepped in and the door slams on them.
    */
   function stepDoor(dt, now) {
     let busy = false;
     for (const a of agents) {
       if ((a.entering && now >= a.spawnAt - DOOR_LEAD) || a.atDoor) { busy = true; break; }
     }
-    // 小幽灵也走这道门：它正在门洞里时，门同样得敞着（不然门拍在幽灵身上）
+    // Ghosts use this door too: while one is in the doorway, the door must likewise stay open (otherwise the door slams on the ghost)
     if (!busy) {
       for (const g of ghosts) {
         if (g.atDoor) { busy = true; break; }
@@ -2195,7 +2195,7 @@ export function createIsoOffice(canvas, opts = {}) {
     door.a = want > door.a ? Math.min(1, door.a + step) : Math.max(0, door.a - step);
   }
 
-  /** 门扇自由边的落点：绕门轴（门洞靠钟那一侧 gy = y0）往屋里转 DOOR_OPEN_DEG */
+  /** Landing point of the door leaf's free edge: rotate DOOR_OPEN_DEG into the room around the hinge (on the doorway's clock side gy = y0) */
   function doorLeafEdge() {
     const d = WALL.door;
     const w = d.y1 - d.y0;
@@ -2203,7 +2203,7 @@ export function createIsoOffice(canvas, opts = {}) {
     return { d, fx: w * Math.sin(ang), fy: d.y0 + w * Math.cos(ang) };
   }
 
-  /** 门洞那块四边形：小怪物还在墙外时，只有洞里这一块该看得见（其余让墙挡住） */
+  /** The doorway quad: while a gremlin is still outside the wall, only this part of the opening should be visible (the rest is hidden by the wall) */
   function doorwayPath(c) {
     const d = WALL.door;
     const p = [project(0, d.y0, d.z1), project(0, d.y1, d.z1), project(0, d.y1, d.z0), project(0, d.y0, d.z0)];
@@ -2213,20 +2213,20 @@ export function createIsoOffice(canvas, opts = {}) {
     c.closePath();
   }
 
-  /** 门板：一块会绕门轴转开的板（凹板 + 上沿高光 + 把手），开合由 door.a 决定 */
+  /** Door leaf: a panel that swings open about the hinge (recessed panel + top-edge highlight + handle), open/close driven by door.a */
   function drawDoor(c) {
     const { d, fx, fy } = doorLeafEdge();
-    /** 门扇上参数 t（0 = 门轴那侧，1 = 自由边）处、高度 z 的点 */
+    /** Point on the door leaf at parameter t (0 = hinge side, 1 = free edge) and height z */
     const at = (t, z) => project(t * fx, d.y0 + t * (fy - d.y0), z);
     const z0 = d.z0 + 0.02;
     const z1 = d.z1 - 0.02;
     poly(c, [at(0, z1), at(1, z1), at(1, z0), at(0, z0)], '#2f3745');
-    // 上沿受光的一条窄边：门板才有厚度，不然看着是一张纸
+    // A narrow lit strip along the top edge: only then does the door leaf have thickness, otherwise it looks like a sheet of paper
     poly(c, [at(0, z1), at(1, z1), at(1, z1 - 0.06), at(0, z1 - 0.06)], shade('#2f3745', 1.45));
-    // 凹进去的板面 + 它上沿压下来的一道暗边（门才不是一整块平板）
+    // The recessed panel face + a dark strip its top edge casts down (so the door is not one flat slab)
     poly(c, [at(0.16, z1 - 0.14), at(0.84, z1 - 0.14), at(0.84, z0 + 0.18), at(0.16, z0 + 0.18)], '#242c38');
     poly(c, [at(0.16, z1 - 0.14), at(0.84, z1 - 0.14), at(0.84, z1 - 0.2), at(0.16, z1 - 0.2)], '#1a1f28');
-    // 把手：装在自由边那侧（门轴在 gy = y0 那头，把手永远在它的对侧）
+    // Handle: mounted on the free-edge side (the hinge is at gy = y0, so the handle is always on the opposite side)
     const k = at(0.86, 1.0);
     c.beginPath();
     c.arc(k.x, k.y, 2.2, 0, Math.PI * 2);
@@ -2234,7 +2234,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.fill();
   }
 
-  /** 门板在排序层里的位置：取门扇中线（关着时就等于门洞在墙面上那一格） */
+  /** The door leaf's position in the sort layer: take the leaf's midline (when shut it equals the doorway cell on the wall) */
   function doorDepth() {
     const { d, fx, fy } = doorLeafEdge();
     return depthOf(fx / 2, (d.y0 + fy) / 2);
@@ -2244,45 +2244,45 @@ export function createIsoOffice(canvas, opts = {}) {
     const th = WALL.thickness;
     const h = WALL.h;
 
-    // 地板先画，墙压在上面
+    // Floor first, walls press on top
     drawFloor(c);
 
-    // 后墙内表面（gy = 0）：等距下是沿 +gx 方向斜下去的平行四边形
+    // Back wall inner surface (gy = 0): in isometric it is a parallelogram slanting down along +gx
     wallQuad(c, 'y', 0, 0, ROOM.w, 0, h, colors.wall);
-    // 左墙内表面（gx = 0）：沿 +gy 方向斜下去的另一半
+    // Left wall inner surface (gx = 0): the other half slanting down along +gy
     wallQuad(c, 'x', 0, 0, ROOM.d, 0, h, shade(colors.wall, 0.82));
 
-    /* 靠近镜头的两面（右 gx = ROOM.w、前 gy = ROOM.d）**不砌墙**：这一侧朝镜头敞开，
-       屋里的一切（贴边走的精灵、靠前的家具）都不会被矮墙 / 玻璃框线切掉一块。
-       地面的那条边界线（见 drawFloor）仍然把房间收成一个完整的平行四边形。 */
+    /* The two faces near the camera (right gx = ROOM.w, front gy = ROOM.d) **get no wall**: this side is open toward the camera,
+       so nothing in the room (sprites walking near the edge, furniture in front) is cut by a low wall / glass frame line.
+       The floor's boundary line (see drawFloor) still closes the room into a complete parallelogram. */
 
-    // 墙顶：只有后（gy=0）、左（gx=0）两面是实心墙才有这道顶面；屋里的一切都在它们前面，
-    // 所以留在背景层（放到最后画会糊住站在墙前的角色）。
-    // 两端在房间的两个角上收口（x 到 ROOM.w、y 到 ROOM.d）：近侧那两面不砌墙，
-    // 墙顶就到角为止，不再需要跟玻璃上沿对齐。
+    // Wall top: only the back (gy=0) and left (gx=0) solid walls have this top face; everything in the room is in front of them,
+    // so it stays in the background layer (drawing it last would smear over characters standing in front of the wall).
+    // Both ends close off at the room's two corners (x to ROOM.w, y to ROOM.d): the near two faces have no wall,
+    // so the wall top stops at the corners and no longer needs to align with the glass tops.
     isoDiamond(c, { x: -th, y: -th, w: ROOM.w + th, d: th, z: h, fill: colors.wallTop });
     isoDiamond(c, { x: -th, y: -th, w: th, d: ROOM.d + th, z: h, fill: shade(colors.wallTop, 0.92) });
 
-    // 踢脚线
+    // Baseboard
     wallQuad(c, 'y', 0, 0, ROOM.w, 0, 0.12, shade(colors.wall, 0.75));
     wallQuad(c, 'x', 0, 0, ROOM.d, 0, 0.12, shade(colors.wall, 0.66));
 
-    // 窗（夜景）：外框 + 玻璃 + 窗台，外加漏进屋里的月光
+    // Window (night scene): outer frame + glass + sill, plus moonlight leaking into the room
     WALL.windows.forEach((w, wi) => {
       const gy = 0;
       const cxm = (w.x0 + w.x1) / 2;
       const czm = (w.z0 + w.z1) / 2;
-      const FW = 0.11;  // 窗框宽
-      const SD = 0.18;  // 窗台伸出墙面的深度
+      const FW = 0.11;  // frame width
+      const SD = 0.18;  // how far the sill sticks out from the wall
       const frame = '#3d4859';
-      const frameLit = shade(frame, 1.4);   // 上沿受天光
-      const frameDim = shade(frame, 0.6);   // 下沿背光
+      const frameLit = shade(frame, 1.4);   // top edge catches skylight
+      const frameDim = shade(frame, 0.6);   // bottom edge in shadow
 
-      /* 透光：先在墙面上晕一圈冷光，再往地上铺一片月光。都用 lighter 叠加，
-         才像"光"加在墙/地上，而不是一块灰补丁。 */
+      /* Light transmission: first a halo of cool light on the wall, then a patch of moonlight on the floor. Both added with lighter,
+         so it looks like "light" added onto the wall/floor, not a gray patch. */
       c.save();
       c.globalCompositeOperation = 'lighter';
-      // 墙上的光晕：拿墙自己的两根轴（gx、gz）当局部基底，圆才不会画成屏幕上正圆
+      // Wall halo: use the wall's own two axes (gx, gz) as the local basis, so the circle does not render as a screen-perfect circle
       const gc0 = project(cxm, gy, czm);
       c.save();
       c.transform(AX.x, AX.y, AZ.x, AZ.y, gc0.x, gc0.y);
@@ -2295,21 +2295,21 @@ export function createIsoOffice(canvas, opts = {}) {
       c.fillStyle = rg;
       c.fill();
       c.restore();
-      /* 地上的月光：不再用有棱有角的四边形（那看起来就是块地毯），
-         改成"地板坐标系里的软椭圆"，边缘全透明地化开，才像光洒进来。
-         做法：把画笔换成地板自己的两根轴（AX / AY）——在这个局部坐标里画圆，
-         等距投影出来就是贴地的斜椭圆；再叠两片（贴墙根的亮核 + 往屋里铺开的淡晕），
-         越往屋里越淡越散。 */
+      /* Moonlight on the floor: no more cornered quad (that just looks like a rug),
+         changed to a "soft ellipse in floor coordinates", with edges fading to fully transparent, so it looks like light spilling in.
+         Method: switch the brush to the floor's own two axes (AX / AY) —— draw a circle in this local space,
+         and the isometric projection gives a slanted ellipse hugging the ground; then layer two (a bright core at the wall base + a soft halo spreading into the room),
+         fainter and more diffuse the further into the room. */
       const o = project(cxm, gy, 0);
       const spill = (rx, ry, cy, a) => {
         c.save();
         c.transform(AX.x, AX.y, AY.x, AY.y, o.x, o.y);
-        // 只在墙内侧铺（gy >= 0）：不然光会爬到墙面上、把踢脚线照亮一圈
+        // Lay it only inside the wall (gy >= 0): otherwise the light climbs onto the wall face and lights a ring around the baseboard
         c.beginPath();
         c.rect(-rx - 1, 0, (rx + 1) * 2, cy + ry + 1);
         c.clip();
         c.translate(0, cy);
-        c.scale(rx, ry); // 圆 → 地面上的椭圆
+        c.scale(rx, ry); // circle -> ellipse on the ground
         const sg = c.createRadialGradient(0, 0, 0, 0, 0, 1);
         sg.addColorStop(0, `rgba(126,168,255,${a})`);
         sg.addColorStop(0.42, `rgba(126,168,255,${a * 0.5})`);
@@ -2321,19 +2321,19 @@ export function createIsoOffice(canvas, opts = {}) {
         c.restore();
       };
       const halfW = (w.x1 - w.x0) / 2 + 0.25;
-      spill(halfW * 1.18, 2.6, 0.95, 0.12);  // 往屋里铺开、边缘化掉的大片淡晕
-      spill(halfW * 0.92, 1.15, 0.42, 0.14); // 贴着窗根的亮核
+      spill(halfW * 1.18, 2.6, 0.95, 0.12);  // a large soft halo spreading into the room, edges faded out
+      spill(halfW * 0.92, 1.15, 0.42, 0.14); // bright core hugging the window base
       c.restore();
 
-      // 墙上的洞口：比玻璃大一圈的暗边，就是墙体厚度
+      // The opening in the wall: a dark edge a ring larger than the glass, i.e. the wall thickness
       wallQuad(c, 'y', gy, w.x0 - FW, w.x1 + FW, w.z0 - FW, w.z1 + FW, '#1a1f28');
-      // 外框：上沿亮、下沿暗，一眼能看出是"框"而不是一块黑
+      // Outer frame: top edge bright, bottom edge dark, so it reads as a "frame" at a glance, not a black block
       wallQuad(c, 'y', gy, w.x0 - FW, w.x1 + FW, w.z1, w.z1 + FW, frameLit);
       wallQuad(c, 'y', gy, w.x0 - FW, w.x1 + FW, w.z0 - FW, w.z0, frameDim);
       wallQuad(c, 'y', gy, w.x0 - FW, w.x0, w.z0, w.z1, frame);
       wallQuad(c, 'y', gy, w.x1, w.x1 + FW, w.z0, w.z1, frameDim);
 
-      // 玻璃：夜空渐变，上亮下暗
+      // Glass: night sky gradient, bright top, dark bottom
       const pTop = project(cxm, gy, w.z1);
       const pBot = project(cxm, gy, w.z0);
       const g = c.createLinearGradient(0, pTop.y, 0, pBot.y);
@@ -2347,7 +2347,7 @@ export function createIsoOffice(canvas, opts = {}) {
         project(w.x0, gy, w.z0),
       ], g);
 
-      // 月亮：右上角一团冷光
+      // Moon: a patch of cool light in the upper-right
       const moon = project(w.x1 - 0.6, gy, w.z1 - 0.45);
       const mg = c.createRadialGradient(moon.x, moon.y, 0, moon.x, moon.y, 14);
       mg.addColorStop(0, 'rgba(226,238,255,0.95)');
@@ -2358,7 +2358,7 @@ export function createIsoOffice(canvas, opts = {}) {
       c.fillStyle = mg;
       c.fill();
 
-      // 星星：每扇窗排布不同（用窗口序号当种子的确定性伪随机）
+      // Stars: each window has a different arrangement (deterministic pseudo-random seeded by the window index)
       const rnd = (i) => {
         const s = Math.sin((wi + 1) * 12.9898 + i * 78.233) * 43758.5453;
         return s - Math.floor(s);
@@ -2375,13 +2375,13 @@ export function createIsoOffice(canvas, opts = {}) {
         c.fill();
       }
 
-      // 窗棂：十字一根竖一根横，用比玻璃亮一档的框色才看得见
+      // Mullions: one vertical and one horizontal in a cross, using a frame color one notch brighter than the glass so it is visible
       const mull = shade(frame, 1.25);
       wallQuad(c, 'y', gy, cxm - 0.035, cxm + 0.035, w.z0, w.z1, mull);
       wallQuad(c, 'y', gy, w.x0, w.x1, czm - 0.03, czm + 0.03, mull);
       wallQuad(c, 'y', gy, w.x0, w.x1, czm + 0.03, czm + 0.05, frameLit);
 
-      // 窗台：从墙里伸出来一道窄台面，前沿压一条高光
+      // Sill: a narrow ledge sticking out of the wall, with a highlight pressed along its front edge
       const sill = '#394252';
       isoDiamond(c, { x: w.x0 - FW, y: gy, w: w.x1 - w.x0 + FW * 2, d: SD, z: w.z0 - FW, fill: sill });
       isoDiamond(c, {
@@ -2389,32 +2389,32 @@ export function createIsoOffice(canvas, opts = {}) {
       });
     });
 
-    /* 大门（左墙 gx = 0，挂在挂钟左侧。墙换了一面 → 用 'x' 面，a 轴变成 gy）：
-       这里只画**门套 + 门洞**，会动的那扇门板在排序层逐帧画（见 drawDoor）——
-       画进背景缓存就永远推不开了（缓存只在相机变化时重画）。
-       洞里是墙外的小走廊：往里退一层再压深一档，才有"透出去"的深度。 */
+    /* Door (left wall gx = 0, hanging to the left of the clock. The wall switched sides -> use the 'x' face, the a axis becomes gy):
+       here we draw only the **door casing + doorway**; the swinging leaf is drawn per frame in the sort layer (see drawDoor) ——
+       drawn into the background cache it could never be pushed open (the cache is only redrawn when the camera changes).
+       Inside the opening is the small corridor outside the wall: step back a layer and darken a notch to get the depth of "seeing through". */
     const d = WALL.door;
-    wallQuad(c, 'x', 0, d.y0 - 0.09, d.y1 + 0.09, d.z0, d.z1 + 0.09, '#39424f'); // 门套
-    wallQuad(c, 'x', 0, d.y0, d.y1, d.z0, d.z1, '#10151e');                       // 洞口
+    wallQuad(c, 'x', 0, d.y0 - 0.09, d.y1 + 0.09, d.z0, d.z1 + 0.09, '#39424f'); // door casing
+    wallQuad(c, 'x', 0, d.y0, d.y1, d.z0, d.z1, '#10151e');                       // opening
     c.save();
-    doorwayPath(c); // 退进去的那层比洞口大（往左上偏），得裁在洞里，不然会糊到墙上
+    doorwayPath(c); // the recessed layer is larger than the opening (offset up-left), so it must be clipped to the opening or it smears onto the wall
     c.clip();
     wallQuad(c, 'x', -0.32, d.y0, d.y1, d.z0, d.z1, '#070a10');
     c.restore();
-    // 会议室白板（贴在后墙内侧）：0.09 铝框 + 框下内阴影 + 笔托（白板笔/板擦）。
-    // 只画一块白板的的话太像一张纸 —— 边框的厚度、上亮下暗的框缘、凸出墙面的笔托才是"白板"。
+    // Meeting room whiteboard (on the back wall's inner side): 0.09 aluminum frame + inner shadow under the frame + pen tray (markers / eraser).
+    // A lone whiteboard looks too much like a sheet of paper —— the frame's thickness, the bright-top dark-bottom frame edge, and the pen tray protruding from the wall are what make it a "whiteboard".
     const wb = MEETING.whiteboard;
     const WFW = 0.09;
     const wframe = '#5a6478';
-    // 铝框四条边：上沿受光亮、下沿背光暗（与窗框同一套语言）
+    // The aluminum frame's four sides: top edge lit bright, bottom edge dark (the same language as the window frame)
     wallQuad(c, 'y', 0, wb.x0 - WFW, wb.x1 + WFW, wb.z1, wb.z1 + WFW, shade(wframe, 1.35));
     wallQuad(c, 'y', 0, wb.x0 - WFW, wb.x1 + WFW, wb.z0 - WFW, wb.z0, shade(wframe, 0.65));
     wallQuad(c, 'y', 0, wb.x0 - WFW, wb.x0, wb.z0, wb.z1, wframe);
     wallQuad(c, 'y', 0, wb.x1, wb.x1 + WFW, wb.z0, wb.z1, shade(wframe, 0.85));
-    // 板面 + 框压下来的内阴影（板面才像嵌在框里，不是贴在墙上）
+    // Panel face + inner shadow pressed down by the frame (so the panel reads as set into the frame, not stuck on the wall)
     wallQuad(c, 'y', 0, wb.x0, wb.x1, wb.z0, wb.z1, '#dfe6ef');
     wallQuad(c, 'y', 0, wb.x0, wb.x1, wb.z1 - 0.05, wb.z1, 'rgba(20,28,40,0.14)');
-    // 笔托：板下沿凸出墙面一小条（顶面 + 正面），上面两支白板笔 + 一个板擦
+    // Pen tray: a small strip protruding from the wall along the panel's bottom edge (top + front), holding two markers + an eraser
     const trayZ = wb.z0 - WFW - 0.02;
     isoDiamond(c, { x: wb.x0 + 0.3, y: 0, w: wb.x1 - wb.x0 - 0.6, d: 0.1, z: trayZ, fill: '#4a5468' });
     wallQuad(c, 'y', 0.1, wb.x0 + 0.3, wb.x1 - 0.3, trayZ - 0.04, trayZ, '#3a4354');
@@ -2427,34 +2427,34 @@ export function createIsoOffice(canvas, opts = {}) {
     }
     wallQuad(c, 'y', 0, wb.x0 + 1.9, wb.x0 + 2.5, wb.z0 + 0.16, wb.z1 - 0.16, 'rgba(76,141,255,0.18)');
 
-    // 会议室标识：贴在实心后墙（gy=0，与白板同面）上方，z 不超墙高 2.8。
-    // 茶水间标识不在这里画：它那面墙（= 会议室南面玻璃）挂了百叶帘，
-    // 而背景是先画的、帘子在排序层后画，会被压住 → 改到 buildStatics 里排到帘子之后。
+    // Meeting room sign: stuck above the solid back wall (gy=0, same plane as the whiteboard), z does not exceed the wall height 2.8.
+    // The pantry sign is not drawn here: its wall (= the meeting room's south glass) has blinds hung on it,
+    // and the background is drawn first while the blinds are drawn later in the sort layer, so it would be pressed -> moved to buildStatics, sorted after the blinds.
     drawWallLabel(c, t('wall.meeting_room'), MEETING.x + MEETING.w / 2, 0, 2.4);
   }
 
   /**
-   * 左墙挂钟（gx = 0 那面墙；大门也开在这面墙上，在钟的左侧 gy 更大的那头）。
-   * 秒针会动，所以每帧现画 —— 画进缓存的背景里就永远停在开局那一秒了。
-   * 墙面在等距下是斜的，跟名牌一样用墙面自己的两根轴当局部基底斜切。
-   * 挂得够高（cz > 1.4）屋里家具就盖不到它：等距下家具能挡住的墙高 = 物高 − 物到墙的距离。
+   * Left-wall clock (the gx = 0 wall; the door is also on this wall, to the left of the clock at the larger gy end).
+   * The second hand moves, so it is drawn every frame —— drawn into the cached background it would freeze at the first second.
+   * The wall is slanted in isometric, so like the nameplate it is skew-mapped using the wall's own two axes as the local basis.
+   * Hung high enough (cz > 1.4) that furniture cannot cover it: in isometric the wall height furniture can block = object height − object distance to the wall.
    */
   function drawClock(c) {
     const cy = 6.6;
     const cz = 2.15;
     const r = 0.45;
-    /** 局部坐标里 1 个屏幕像素有多长（单位 tile）—— 线宽才不会随缩放变粗 */
+    /** How long 1 screen pixel is in local coordinates (unit tile) —— so line width does not thicken with zoom */
     const px = 1 / (UNIT_Z * cam.zoom);
     const d = new Date();
     const turn = (v, unit) => ((v % unit) / unit) * Math.PI * 2;
 
     const o = project(0, cy, cz);
     c.save();
-    // 局部坐标：u 沿 -gy（站在这面墙前的"右手边"）、v 向下，单位 tile，圆心在 (0,0)。
-    // 注意不能沿 +gy：那会让整块表盘镜像（3 点跑到左边、秒针倒着转）。
-    // 后墙用的是 +gx = AX，是因为后墙的右手边恰好就是 +gx，不是"沿墙那根轴"都能照抄。
+    // Local coordinates: u along -gy (the "right hand side" when standing in front of this wall), v downward, unit tile, center at (0,0).
+    // Note it cannot be along +gy: that would mirror the whole dial (3 o'clock to the left, the second hand turning backwards).
+    // The back wall uses +gx = AX because the back wall's right hand side happens to be +gx; not every "axis along the wall" can be copied.
     c.transform(-AY.x, -AY.y, -AZ.x, -AZ.y, o.x, o.y);
-    /** 从 (tail) 到 (len) 画一根针，角度 a：0 = 12 点，顺时针 */
+    /** Draw a hand from (tail) to (len) at angle a: 0 = 12 o'clock, clockwise */
     const hand = (a, len, w, color, tail = 0) => {
       const s = Math.sin(a);
       const k = -Math.cos(a);
@@ -2467,17 +2467,17 @@ export function createIsoOffice(canvas, opts = {}) {
       c.stroke();
     };
 
-    // 落在墙上的影子（往右下偏一点，钟才有厚度）
+    // Shadow cast on the wall (offset a bit to the lower-right, so the clock has thickness)
     c.beginPath();
     c.arc(2 * px, 3 * px, r + 1 * px, 0, Math.PI * 2);
     c.fillStyle = 'rgba(0,0,0,0.35)';
     c.fill();
-    // 表框
+    // Bezel
     c.beginPath();
     c.arc(0, 0, r, 0, Math.PI * 2);
     c.fillStyle = '#12161d';
     c.fill();
-    // 表盘
+    // Dial
     c.beginPath();
     c.arc(0, 0, r - 3 * px, 0, Math.PI * 2);
     c.fillStyle = '#e8edf5';
@@ -2485,7 +2485,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.strokeStyle = '#9aa7b8';
     c.lineWidth = 1 * px;
     c.stroke();
-    // 12 个刻度，3/6/9/12 画长一点
+    // 12 tick marks, with 3/6/9/12 drawn a bit longer
     for (let i = 0; i < 12; i += 1) {
       const long = i % 3 === 0;
       hand(
@@ -2496,14 +2496,14 @@ export function createIsoOffice(canvas, opts = {}) {
         r - 9 * px
       );
     }
-    // 时针 / 分针 / 秒针：秒针连续走，带一截尾巴
+    // Hour / minute / second hands: the second hand moves continuously, with a tail segment
     const sec = d.getSeconds() + d.getMilliseconds() / 1000;
     const min = d.getMinutes() + sec / 60;
     const hour = (d.getHours() % 12) + min / 60;
     hand(turn(hour, 12), r * 0.5, 3.4, '#2c3442');
     hand(turn(min, 60), r * 0.72, 2.4, '#2c3442');
     hand(turn(sec, 60), r * 0.78, 1.3, '#e0574f', -r * 0.2);
-    // 中心轴
+    // Center pivot
     c.beginPath();
     c.arc(0, 0, 2.6 * px, 0, Math.PI * 2);
     c.fillStyle = '#2c3442';
@@ -2512,8 +2512,8 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 背景（地板 + 地毯 + 墙 + 窗）画到离屏位图上。
-   * 位图只跟 zoom 有关，跟相机平移无关 —— 所以拖动场景时不用重画。
+   * Background (floor + carpet + wall + window) drawn to an offscreen bitmap.
+   * The bitmap only depends on zoom, not on camera pan —— so dragging the scene does not require a redraw.
    */
   const bgAt = { x: 0, y: 0 };
 
@@ -2530,7 +2530,7 @@ export function createIsoOffice(canvas, opts = {}) {
     const c = bg.getContext('2d');
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.clearRect(0, 0, cw, ch);
-    // 世界包围盒左上角对齐到位图的 (PAD, PAD)
+    // Align the world bounding box's top-left corner to the bitmap's (PAD, PAD)
     bgAt.x = PAD - b.x0 * cam.zoom;
     bgAt.y = PAD - b.y0 * cam.zoom;
     c.translate(bgAt.x, bgAt.y);
@@ -2538,7 +2538,7 @@ export function createIsoOffice(canvas, opts = {}) {
     drawWalls(c);
   }
 
-  /* ------------------------------ 角色绘制 ------------------------------ */
+  /* ------------------------------ Character drawing ------------------------------ */
 
   const SPRITE_S = (SPRITE_H * UNIT_Z) / SPRITE_UNITS;
 
@@ -2586,7 +2586,7 @@ export function createIsoOffice(canvas, opts = {}) {
   function drawGhostSprite(c, g) {
     const st = stateOf(g.memberId);
     const p = project(g.x, g.y, g.z);
-    // 悬空：地面留一点虚影
+    // Floating: leave a faint shadow on the ground
     const ge = groundEllipse(g.x, g.y, 0.4, 0);
     c.save();
     c.globalAlpha *= 0.16;
@@ -2635,7 +2635,7 @@ export function createIsoOffice(canvas, opts = {}) {
     if (now - report.talkAt >= REPORT_TALK * 1000) finishReport();
   }
 
-  /** 临时小幽灵精灵（自带漂浮 + 状态点）：召唤时 / 汇报期间共用 */
+  /** Temporary ghost sprite (with its own float + status dot): shared by summons / during a report */
   function drawFloatingGhostSprite(c, g) {
     if (!g) return;
     const p = project(g.x, g.y, g.z);
@@ -2657,13 +2657,13 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
-  /** 对话气泡（屏幕空间，锚点在脚下，(x,y) 是其上方的落点） */
+  /** Speech bubble (screen space, anchored at the foot, (x,y) is the landing point above it) */
   function drawBubble(c, x, y, text, alpha, color) {
     c.save();
     c.globalAlpha = alpha;
     c.font = '600 13px ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif';
     const padX = 12;
-    // 结果摘要可能很长：按气泡宽度截断并加省略号，别让文字溢出到框外
+    // The result summary can be long: truncate to the bubble width and add an ellipsis, so the text does not spill outside the frame
     const maxW = 232;
     let t = String(text || '');
     if (c.measureText(t).width > maxW) {
@@ -2681,7 +2681,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.strokeStyle = color;
     c.lineWidth = 1.6;
     c.stroke();
-    // 尾巴指向下方中心
+    // Tail pointing down to the center
     c.beginPath();
     c.moveTo(x - 7, by + h - 0.5);
     c.lineTo(x + 7, by + h - 0.5);
@@ -2697,7 +2697,7 @@ export function createIsoOffice(canvas, opts = {}) {
     c.restore();
   }
 
-  /* ------------------------------ 主循环 ------------------------------ */
+  /* ------------------------------ Main loop ------------------------------ */
 
   function tick(now) {
     const dt = Math.min(0.05, (now - last) / 1000 || 0);
@@ -2730,16 +2730,16 @@ export function createIsoOffice(canvas, opts = {}) {
     ctx.translate(cam.ox, cam.oy);
     ctx.scale(cam.zoom, cam.zoom);
 
-    // 左墙挂钟：贴在 gx=0 那面墙上，挂得够高，屋里的家具都盖不到，所以先画
+    // Left-wall clock: stuck on the gx=0 wall, hung high enough that nothing in the room covers it, so drawn first
     drawClock(ctx);
 
-    // 排序：家具 + 角色混在一起，depth 大的后画（挡住前面的）
+    // Sorting: furniture + characters mixed together, larger depth drawn later (covers the ones in front)
     const items = statics.slice();
-    // 大门：门板会开合，所以也进排序层 —— 关着时正好盖住门洞，开着时挡在洞与过道之间
+    // Door: the leaf swings, so it also joins the sort layer —— shut it exactly covers the doorway, open it blocks between the opening and the corridor
     items.push({ depth: doorDepth(), draw: (c) => drawDoor(c) });
     for (const a of agents) {
-      if (a.entering) continue; // 还没进门
-      // 还在墙外（gx < 0）：墙挡着的部分不该看得见，只裁出门洞里那一块
+      if (a.entering) continue; // not inside yet
+      // Still outside the wall (gx < 0): the part hidden by the wall should not be visible; clip to just the doorway
       const outside = a.x < 0;
       items.push({
         depth: depthOf(a.x, a.y),
@@ -2754,13 +2754,13 @@ export function createIsoOffice(canvas, opts = {}) {
       });
     }
     for (const g of ghosts) {
-      // 还在门外（候场 / 正穿门洞）：同小怪物，只露门洞里那一块 —— 看着才是"从门口飘进来"
+      // Still outside the door (waiting / passing through the doorway): like a gremlin, only the doorway part shows —— so it reads as "drifting in through the door"
       const outside = g.x < 0;
       items.push({
         depth: depthOf(g.x, g.y) + 3,
         draw: (c) => {
-          // 还在门外候场：整只不画（墙外那点身子在等距投影里会从门缝里漏出来，
-          // 而门那会儿是关着的 —— 漏出来就是"门板前面贴了块幽灵"）
+          // Still waiting outside the door: draw none of it (the bit of body outside the wall leaks through the door gap under the isometric projection,
+          // and the door is shut at that time —— leaking out would look like "a ghost stuck in front of the door leaf")
           if (g.waiting) return;
           if (!outside) { drawGhostSprite(c, g); return; }
           c.save();
@@ -2775,7 +2775,7 @@ export function createIsoOffice(canvas, opts = {}) {
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
 
-    // 路网调试
+    // Path-network debug
     if (showPaths) {
       for (const n of NAV_NODES) {
         const p = project(n.x, n.y, 0.02);
@@ -2786,20 +2786,20 @@ export function createIsoOffice(canvas, opts = {}) {
       }
     }
 
-    // ---- 头顶标签：屏幕空间，不随缩放变形 ----
+    // ---- Overhead tags: screen space, not deformed by zoom ----
     hits = [];
     screenPos.clear();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // 命中盒要有宽度：原来只给了一条零宽竖线（x0 === x1 === s.x），鼠标得正好压在
-    // 身体中线上才算命中 —— 实际等于"身体点不到"。被召唤期间幽灵还飘在小怪物头顶，
-    // 于是看起来"幽灵和它对应的小怪物都没有 tooltip"。给身体一个真实宽度，
-    // 鼠标扫过身体就算命中（精灵局部宽约 44 单位，这里取半宽 24）。
-    // 顺序：幽灵先 push、小怪物后 push —— hitAt 从后往前找，重叠时小怪物赢。
-    // 幽灵本身仍然不给 tooltip（memberAt 里排除），但不能因为它挡在上面，
-    // 就让底下正在干活的那只小怪物也失去 tooltip。
+    // The hitbox needs width: it used to be a zero-width vertical line (x0 === x1 === s.x), so the mouse had to land exactly on
+    // the body's centerline to hit —— effectively "the body cannot be clicked". During a summon the ghost also floats above the gremlin,
+    // so it looked like "neither the ghost nor its gremlin has a tooltip". Give the body a real width,
+    // so the mouse brushing the body counts as a hit (the sprite is locally ~44 units wide; take half-width 24 here).
+    // Order: ghosts pushed first, gremlins after —— hitAt searches from back to front, so on overlap the gremlin wins.
+    // The ghost itself still gets no tooltip (excluded in memberAt), but because it blocks above,
+    // the gremlin working underneath should not lose its tooltip either.
     for (const g of ghosts) {
-      // 还在门外 / 门洞里（身子被墙挡着）：不进屏幕坐标表，标签与点选一并跟着不出现
+      // Still outside the door / in the doorway (body hidden by the wall): do not enter the screen-coordinate table; the tag and picking are likewise absent
       if (g.x < 0) continue;
       const s = toScreen(g.x, g.y, g.z);
       screenPos.set(g.memberId, s);
@@ -2808,7 +2808,7 @@ export function createIsoOffice(canvas, opts = {}) {
       pushHit(g.memberId, s.x - hw, s.y - h - 16, s.x + hw, s.y + 6);
     }
     for (const a of agents) {
-      // 还没进门 / 还在墙外（身子还被墙挡着）：不进屏幕坐标表，头顶标签和点选也就一并跟着不出现
+      // Not inside yet / still outside the wall (body still hidden by the wall): do not enter the screen-coordinate table, so the overhead tag and picking are likewise absent
       if (a.entering || a.x < 0) continue;
       const s = toScreen(a.x, a.y, 0);
       screenPos.set(a.memberId, s);
@@ -2817,7 +2817,7 @@ export function createIsoOffice(canvas, opts = {}) {
       pushHit(a.memberId, s.x - hw, s.y - h - 16, s.x + hw, s.y + 6);
     }
 
-    // 标签（角色在上、家具在下，所以后画）；同样幽灵先、小怪物后
+    // Tags (characters above, furniture below, hence drawn later); likewise ghosts first, gremlins after
     for (const g of ghosts) {
       const s = screenPos.get(g.memberId);
       if (!s) continue;
@@ -2843,7 +2843,7 @@ export function createIsoOffice(canvas, opts = {}) {
       pushHit(a.memberId, s.x - box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12 - box.h, s.x + box.w / 2, s.y - SPRITE_H * UNIT_Z * cam.zoom - 12);
     }
 
-    // 汇报期间补画的幽灵：名字 + "正在汇报"（结果摘要在气泡里说）
+    // Ghost drawn extra during a report: name + "reporting" (the result summary is said in the bubble)
     if (reportGhost) {
       const s = toScreen(reportGhost.x, reportGhost.y, reportGhost.z);
       const y = s.y - SPRITE_H * UNIT_Z * cam.zoom * 0.92 - 12;
@@ -2892,20 +2892,20 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 只有空闲的、或正在思考的人才会起身走动；写代码 / 写文档时钉在座位上。
-   * 被召唤期间（幽灵还飘着 / 正在汇报）一律钉住：它正替主 agent 干活，
-   * 头顶写着"忙碌"却在屋里溜达，看着像在摸鱼。
+   * Only idle or thinking people get up and walk; when coding / writing docs they are pinned to their seat.
+   * During a summon (ghost still floating / currently reporting) always pinned: it is working for the main agent,
+   * and walking around the room with "busy" written overhead looks like slacking off.
    */
   function canWander(a) {
     if (isSummoned(a.memberId)) return false;
     if (report && report.agentId === a.memberId) return false;
     const b = bucketOf(stateOf(a.memberId));
-    // 阻塞 = 卡在等外部依赖 → 钉在座位上（在屋里溜达看着像在摸鱼）
+    // blocked = stuck waiting on an external dependency -> pin to the seat (wandering the room looks like slacking off)
     if (b === 'blocked') return false;
     return b !== 'busy' || a.work === 'think';
   }
 
-  /** 头顶写状态：忙碌 / 阻塞 / 空闲；具体在做什么交给小幽灵 / tooltip 讲 */
+  /** Write the status overhead: busy / blocked / idle; what exactly it is doing is left to the ghost / tooltip */
   function tagText(a) {
     if (a.mode === 'meet') return t('tag.meeting');
     const b = bucketOf(stateOf(a.memberId));
@@ -2914,11 +2914,11 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 幽灵头顶：**只写名字**（就是 subagent 自己的名字，如 susan / simmon）。
+   * Ghost overhead tag: **name only** (the subagent's own name, e.g. susan / simmon).
    *
-   * 曾经写「名字 · 工程名」，而工程名多半只是当前工程，等于每个人头顶都挂同一串后缀，
-   * 反而把"是谁"挤掉了；任务内容本来就该由**小怪物**（工位那只）的 tooltip 讲，
-   * 幽灵只在收工汇报那几秒用气泡说结果（见 reportText）。
+   * It used to say "name · project name", but the project name is mostly just the current project, so everyone wore the same suffix overhead,
+   * squeezing out "who it is"; the task content should be told by the **gremlin** (the seated one) tooltip anyway,
+   * and the ghost only says the result in a bubble during the few seconds of the wrap-up report (see reportText).
    */
   function ghostTagText(g) {
     if (g.inMeeting) return t('tag.attending');
@@ -2927,7 +2927,7 @@ export function createIsoOffice(canvas, opts = {}) {
     return name || t('tag.temp_member');
   }
 
-  /* ------------------------------ 交互 ------------------------------ */
+  /* ------------------------------ Interaction ------------------------------ */
 
   function hitAt(px, py) {
     for (let i = hits.length - 1; i >= 0; i -= 1) {
@@ -2937,7 +2937,7 @@ export function createIsoOffice(canvas, opts = {}) {
     return null;
   }
 
-  /** 射线法判断屏幕坐标是否落在多边形内（CSS px） */
+  /** Ray casting to test whether a screen coordinate falls inside a polygon (CSS px) */
   function pointInPoly(px, py, pts) {
     let inside = false;
     for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
@@ -2952,9 +2952,9 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * 主 Agent 悬浮屏的命中检测（与 onMove 的 px/py 同一套 CSS 像素坐标）。
-   * 屏是贴在 gy 恒定竖直面上的一块 wallQuad，四个角投影成屏幕四边形后做 point-in-polygon。
-   * 比画出来的屏框再外扩一圈 padding，hover 好命中一点。
+   * Hit test for the main Agent's floating screen (the same CSS pixel coordinates as onMove's px/py).
+   * The screen is a wallQuad on the constant-gy vertical plane; point-in-polygon after projecting its four corners into a screen quad.
+   * Pad a ring beyond the drawn screen frame, so hover is easier to hit.
    */
   function hitMainConsole(px, py) {
     const s = CONSOLE.screen;
@@ -3044,7 +3044,7 @@ export function createIsoOffice(canvas, opts = {}) {
 
   return {
     setMembers,
-    /** 切换楼层：换这一层的材质配色（隔断 / 金属 / 木件），见 officeMap 的 FLOOR_COLORS */
+    /** Switch floor: change this floor's material palette (dividers / metal / wood), see officeMap's FLOOR_COLORS */
     setFloor(id) {
       applyFloor(id);
     },
@@ -3062,27 +3062,27 @@ export function createIsoOffice(canvas, opts = {}) {
       manualMeeting = false;
       endMeeting();
     },
-    /** 角色脚底的 CSS 像素坐标（给任务卡定位用） */
+    /** Character foot CSS pixel coordinates (used to position the task card) */
     screenOf(id) {
       return screenPos.get(id) || null;
     },
-    /** 主 Agent 悬浮屏命中检测（CSS px）：hover 该屏时给 Vue 侧弹 tooltip 用 */
+    /** Main Agent floating screen hit test (CSS px): used by the Vue side to pop a tooltip when hovering that screen */
     hitMainConsole(px, py) {
       return hitMainConsole(px, py);
     },
     /**
-     * 鼠标下是不是某个成员（CSS px），返回 memberId；空 = 没命中。
-     * `__xxx` 是内部精灵（召唤 / 汇报用的临时小幽灵），不算成员、不给 tooltip。
+     * Whether the mouse is over some member (CSS px), returns memberId; empty = no hit.
+     * `__xxx` are internal sprites (temporary ghosts for summon / report), not counted as members and given no tooltip.
      */
     memberAt(px, py) {
       const id = hitAt(px, py);
       if (!id || String(id).startsWith('__')) return '';
-      // 幽灵（临时成员）不给 tooltip：它头顶只写名字，任务由它对应的小怪物来讲
+      // Ghosts (temporary members) get no tooltip: their overhead tag shows only the name, the task is told by their matching gremlin
       const m = members.find((x) => x.memberId === id);
       if (m && m.ghost) return '';
       return String(id);
     },
-    /** 某只小怪物最近一次完成任务的结果：{ task, result, at }；没干过活则 null */
+    /** The gremlin's most recent completed task result: { task, result, at }; null if it never worked */
     lastResult(id) {
       return lastResults.get(id) || null;
     },
@@ -3090,7 +3090,7 @@ export function createIsoOffice(canvas, opts = {}) {
     flowPending,
     /** Call back once the beats drain (immediately when idle): defers the main console wrap-up until after the animation */
     whenFlowIdle,
-    /** 主 Agent 控制台：{ phase, action, context[], target }（现在由 mock 驱动，以后接 hook 事件） */
+    /** Main Agent console: { phase, action, context[], target } (currently mock-driven, later swapped for hook events) */
     setMainAgent(s) {
       const prev = mainAgent;
       mainAgent = { phase: 'idle', action: '', context: [], target: null, ...(s || {}) };

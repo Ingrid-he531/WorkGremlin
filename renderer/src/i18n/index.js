@@ -1,17 +1,21 @@
 /**
- * 极简 i18n：一个响应式 locale + 一个 t()。
+ * Minimal i18n: one reactive locale + one t().
  *
- * 为什么不上 vue-i18n：这里只需要"两套文案 + 一个切换开关"，不需要复数、日期格式、
- * 命名空间懒加载。自己写 60 行还能顺手让**画布**（iso/engine、mainConsole）直接用 ——
- * 那些模块不是组件，拿不到 inject/provide。
+ * Why not vue-i18n: all we need here is "two sets of copy + one toggle", not plurals, date
+ * formatting or namespace lazy-loading. Writing 60 lines ourselves also lets the **canvas**
+ * (iso/engine, mainConsole) use it directly —— those modules are not components and cannot get
+ * inject/provide.
  *
- * 用法：
- *   · 组件里 `const { t } = useI18n()`，模板写 `{{ t('nav.office') }}`。
- *     t() 在渲染期间读 locale.value，所以切换语言时组件会自己重渲染（不需要额外订阅）。
- *   · 纯 JS（画布）里 `import { t } from '../i18n'` 直接调；画布每帧重绘，读到的是最新值。
- *   · 带参数：`t('conn.count', { n: 3 })`，文案里写 `{n}`。
+ * Usage:
+ *   · In a component, `const { t } = useI18n()`, and the template writes `{{ t('nav.office') }}`.
+ *     t() reads locale.value during render, so a component re-renders by itself when the language
+ *     changes (no extra subscription needed).
+ *   · In plain JS (the canvas), `import { t } from '../i18n'` and call it directly; the canvas
+ *     repaints every frame and reads the latest value.
+ *   · With parameters: `t('conn.count', { n: 3 })`, with `{n}` in the copy.
  *
- * 语言存在 localStorage，下次启动沿用；没存过就按浏览器语言猜（zh 开头 → 中文，否则英文）。
+ * The language is stored in localStorage and reused on the next start; if it was never stored,
+ * guess from the browser language (starts with zh → Chinese, otherwise English).
  */
 import { computed, ref } from 'vue';
 
@@ -29,13 +33,13 @@ function detect() {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved && KEYS.includes(saved)) return saved;
   } catch {
-    /* 隐私模式 / 无 localStorage：按语言猜 */
+    /* private mode / no localStorage: guess from the language */
   }
   const nav = (typeof navigator !== 'undefined' && (navigator.language || navigator.userLanguage)) || 'zh';
   return String(nav).toLowerCase().startsWith('zh') ? 'zh' : 'en';
 }
 
-/** 当前语言（'zh' | 'en'）。响应式：组件模板里读它就会跟着重渲染 */
+/** Current language ('zh' | 'en'). Reactive: reading it in a component template re-renders along */
 export const locale = ref(detect());
 
 export function setLocale(key) {
@@ -44,18 +48,18 @@ export function setLocale(key) {
   try {
     localStorage.setItem(STORAGE_KEY, key);
   } catch {
-    /* 存不下就只在本次运行里生效 */
+    /* if it cannot be stored, it only applies to this run */
   }
-  // 读屏 / 无障碍要的是页面语言；没有真实 DOM（node 脚本里的假 document）就跳过
+  // Screen readers / a11y want the page language; skip when there is no real DOM (a fake document in node scripts)
   if (typeof document !== 'undefined' && document.documentElement) {
     document.documentElement.lang = key === 'zh' ? 'zh-CN' : 'en';
   }
 }
 
-/** 文案表。中文是真源（注释里的口径以中文为准），英文只求"意思对、术语统一" */
+/** Message table. Chinese is the source of truth (comments are worded against the Chinese); English only needs to be "right in meaning and consistent in terms" */
 const MESSAGES = {
   zh: {
-    // ---- 顶栏 / 页签 ----
+    // ---- top bar / tabs ----
     'nav.office': '办公室',
     'nav.workstation': '工位卡片',
     'nav.records': '任务记录',
@@ -76,7 +80,7 @@ const MESSAGES = {
     'settings.node': 'Node.js',
     'settings.quit': '退出 WorkGremlin',
 
-    // ---- 会话下拉 / 门楣 ----
+    // ---- session dropdown / lintel ----
     'session.demo_project': '演示工程',
     'session.demo_mode': '演示模式',
     'session.demo_session': '演示工程 · 演示会话',
@@ -87,7 +91,7 @@ const MESSAGES = {
     'session.active_sessions': '当前楼层活跃会话（{n} 个）',
     'lintel.project': '项目',
 
-    // ---- 左下角连接条 ----
+    // ---- bottom-left connection bar ----
     'conn.connected': '实时连接已建立',
     'conn.connecting': '连接中…',
     'conn.disconnected': '连接断开，重连中…',
@@ -99,7 +103,7 @@ const MESSAGES = {
     'status.title_inferred': '状态为推断值（非 agent 上报真值）',
     'status.tag_inferred': '推断',
 
-    // ---- 楼层井道 / 电梯 ----
+    // ---- floor shaft / elevator ----
     'floor.title': '楼层',
     'floor.not_installed': '未安装',
     'floor.active_sessions': '活跃会话：{n} 个',
@@ -117,7 +121,7 @@ const MESSAGES = {
     'floor.form_ide': 'IDE',
     'floor.kind_dir': '数据',
 
-    // ---- 门楣任务滚动屏（TaskTicker）----
+    // ---- lintel task ticker (TaskTicker) ----
     'ticker.task': '任务：{text}',
     'ticker.taskLabel': '任务：',
     'ticker.done': '任务完成',
@@ -129,7 +133,7 @@ const MESSAGES = {
     'ticker.no_task': '暂无活跃任务',
     'ticker.tag': '全楼层监控',
 
-    // ---- 办公室 HUD / 说明条 ----
+    // ---- office HUD / caption bar ----
     'office.demo': '演示模式',
     'office.demo_title': '切到演示工程：主控制台自动演一轮，小怪物用演示成员',
     'office.exit_demo': '退出演示',
@@ -150,7 +154,7 @@ const MESSAGES = {
     'office.tip.now': '此刻',
     'office.task_new': '新任务',
 
-    // ---- 主控制台相位（屏上第一行 / tooltip 第一行，两处同源）----
+    // ---- main console phases (first line on screen / first line of the tooltip, one source for both) ----
     'phase.idle': '待命中',
     'phase.unreported': '未上报',
     'phase.thinking': '思考中',
@@ -161,7 +165,7 @@ const MESSAGES = {
     'phase.done': '任务完成',
     'phase.cancelled': '任务取消',
 
-    // ---- 小怪物头顶 / 幽灵 ----
+    // ---- above a gremlin's head / ghost ----
     'tag.busy': '忙碌',
     'tag.blocked': '阻塞',
     'tag.idle': '空闲',
@@ -174,7 +178,7 @@ const MESSAGES = {
     'bubble.done_prefix': '已完成：{task}',
     'wall.meeting_room': '会议室',
     'wall.pantry': '茶水间',
-    // ---- 旧 2D 场景（?tab=flat）与设计台（?tab=lab）----
+    // ---- legacy 2D scene (?tab=flat) and the design bench (?tab=lab) ----
     'state.online': '在线',
     'state.busy': '忙碌',
     'state.idle': '空闲',
@@ -196,7 +200,7 @@ const MESSAGES = {
     'deskLab.demo_task': '实现工位视图与对话记录窗口',
     'office.no_members': '还没有成员。启动服务后会自动出现工位。',
 
-    // ---- 对话记录（旧页，保留在代码里）----
+    // ---- conversation log (old page, kept in the code) ----
     'chat.title': '沟通记录',
     'chat.search_placeholder': '搜索消息内容…',
     'chat.fold': '收起对话',
@@ -216,7 +220,7 @@ const MESSAGES = {
     'progress.unknown': '进度未知（未上报）',
     'sessions.unknown_project': '未知工程',
 
-    // ---- 主控制台的动态说明（"操作"那一行的兜底文案）----
+    // ---- main console dynamic caption (fallback copy for the "action" line) ----
     'console.waiting_subs': '等待 {names} 汇报',
     'console.sub_running': '{name} 执行中',
     'console.done': '任务完成',
@@ -235,7 +239,7 @@ const MESSAGES = {
     'deskLab.hint': '同一张工位的 5 种状态（大图用于看细节，下面一排是办公室里的真实尺寸）。有真实数据时最下方会显示线上成员。',
     'workspace.prompt': '工程目录（绝对路径）',
 
-    // ---- 工位卡片 ----
+    // ---- workstation card ----
     'card.role.agent': '主代理',
     'card.role.subagent_project': '项目子代理',
     'card.role.subagent_user': '用户子代理',
@@ -252,7 +256,7 @@ const MESSAGES = {
     'card.status.idle': '空闲',
     'workstation.empty': '本层暂无成员',
 
-    // ---- 任务记录 ----
+    // ---- task records ----
     'records.filter.project': '全部工程',
     'records.filter.floor': '全部楼层',
     'records.filter.state': '全部状态',
@@ -271,7 +275,7 @@ const MESSAGES = {
     'records.dim.default': '维度',
     'records.col.time': '时间',
     'records.col.task': '任务',
-    // 会话：这一轮所属的那条会话（会话级标题，同一会话的各轮共用同一个值）
+    // Session: the session this round belongs to (a session-level title; every round of the same session shares one value)
     'records.col.session': '会话',
     'records.col.client': '客户端',
     'records.col.model': '模型',
@@ -280,7 +284,7 @@ const MESSAGES = {
     'records.col.duration': '时长',
     'records.col.state': '状态',
     'records.col.task_count': '任务数',
-    // 会话数：这一组里有多少条**不同**的会话（不是任务数 —— 一条会话通常有多轮任务）
+    // Session count: how many **distinct** sessions are in this group (not the task count —— one session usually has several task rounds)
     'records.col.session_count': '会话数',
     'records.col.success_count': '成功数',
     'records.col.cancel_count': '取消数',
@@ -307,9 +311,11 @@ const MESSAGES = {
     'records.retention_save': '保存',
     'records.retention_failed': '保存保留天数失败',
     'records.n_files': '{n} 文件',
-    // 会话标题 = 会话级的名字（同一条会话的各轮任务共用同一个值，凭它认出哪些任务同属一会话）：
-    // 6F/7F/8F 用它们 SQLite 里的会话摘要，其余楼层兜底成这条会话第一轮的用户原话
-    // （见 server/src/sessionTitle.js）。详情里单列一行 —— 上面那行标题是这一轮自己的原话
+    // Session title = the session-level name (every task round of one session shares one value, which is
+    // how the rounds belonging to one session are told apart): 6F/7F/8F use the session summary in their
+    // SQLite, and the other floors fall back to the user's own words from this session's first round (see
+    // server/src/sessionTitle.js). Listed on its own line in the detail —— the title line above is this
+    // round's own words
     'records.detail.session_title': '会话',
     'records.detail.state': '状态',
     'records.detail.client': '客户端',
@@ -363,7 +369,7 @@ const MESSAGES = {
     'records.tokens_total': '{head}（前两项合计 = 输入总量 {n}）',
     'records.unfinished': '未收工',
     'records.total': '合计',
-    // 日期后面的星期几（数组，按 getDay() 取：0=周日）
+    // The weekday after the date (an array indexed by getDay(): 0=Sunday)
     'records.weekdays': ['周日', '周一', '周二', '周三', '周四', '周五', '周六'],
     'records.times': '{n} 次',
     'records.bulk_ops': '批量操作：',
@@ -387,9 +393,10 @@ const MESSAGES = {
     'records.board.untimed': '另有 {n} 条没有开始时间，画不进图',
     'records.board.hint': '只列这一天有任务的楼层 · 同一时间并行的那段会加深（一层就一行）· 点块跳到列表里那条任务',
 
-    // ---- 议事厅 ----
-    // 口径：这里的文案是要紧的，因为它决定"没答话"会被读成什么。凡是拿不到的
-    // （没表态 / 没读到词元 / 没谈成）都写成缺了什么，不写成一个看起来正常的结果。
+    // ---- council ----
+    // Wording matters here, because it decides what "no answer" is read as. Anything that is
+    // unavailable (no stance / no token read / no deal reached) is written as what is missing,
+    // never as a result that merely looks normal.
     'council.new': '发起一场会',
     'council.topic': '议题',
     'council.topic_ph': '要讨论的问题，写清楚背景和想达成的结果…',
@@ -947,8 +954,9 @@ const MESSAGES = {
 };
 
 /**
- * 取文案。缺 key 时**回落到中文原文**（开发时一眼能看出漏了哪个），
- * 参数用 `{name}` 占位替换；占位没给值就原样留着（不静默吞掉）。
+ * Get the copy. On a missing key it **falls back to the Chinese original** (so a missing one is
+ * obvious during development), and `{name}` placeholders are substituted; a placeholder that has no
+ * value is left as-is (not silently swallowed).
  */
 export function t(key, params) {
   const table = MESSAGES[locale.value] || MESSAGES.zh;
@@ -959,7 +967,7 @@ export function t(key, params) {
   return String(s).replace(/\{(\w+)\}/g, (m, name) => (params[name] == null ? m : String(params[name])));
 }
 
-/** 组件里用这个（拿到 t + 当前语言 + 切换函数） */
+/** Use this in components (gives you t + the current language + the switch function) */
 export function useI18n() {
   return { locale, t, setLocale, locales: LOCALES, isZh: computed(() => locale.value === 'zh') };
 }

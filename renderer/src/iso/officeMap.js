@@ -1,39 +1,39 @@
 /**
- * officeMap.js —— 等距办公室的"世界数据"。
+ * officeMap.js —— the "world data" of the isometric office.
  *
- * 只描述"东西在哪、有多大、人怎么走"，不含任何绘制代码（绘制在 engine.js）。
- * 坐标是世界坐标（tile），x 向右前、y 向左前，墙高 2.8。
+ * It only says "what is where, how big it is, how people walk" —— no drawing code at all (drawing lives in engine.js).
+ * Coordinates are world coordinates (tile): x toward the front-right, y toward the front-left, wall height 2.8.
  *
- * 平面（俯视，x 向右、y 向下=靠近镜头）：
+ * Floor plan (top-down; x to the right, y downward = toward the camera; the top edge is the back wall):
  *
- *   y=0    后墙 ┌──────────────────────────┬───────────┐
- *               │ 窗 窗 窗      大门        │  会议室    │
- *   y=1.5       │        后过道             │  白板     │
- *   y=2.6       │  人   人   人            │  会议桌    │
- *   y=2.9       │  桌   桌   桌            │           │
- *   y=3.95      │ ▬▬隔断（名牌钉上面）▬▬▬▬ │           │
- *   y=4.09      │  桌   桌   桌            │           │
- *   y=5.44      │  人   人   人            └─── 玻璃 ───┘
- *   y=6.1       │        中过道
- *   y=6.75      │  人   人   人
- *   y=7.05      │  桌   桌   桌
- *   y=8.1       │ ▬▬隔断（名牌钉上面）▬▬▬▬
- *   y=8.24      │  桌   桌   桌
- *   y=9.59      │  人   人   人
- *   y=10.55     │        前过道
- *   y=11.3      │        主 Agent 控制台
- *   y=11.8      │              └ 召唤站位（控制台右侧）
- *   y=13        └────────────────────────────────────────┘
+ *   y=0     ┌──────────────────────────┬───────────┐
+ *           │ win win win   door       │ meeting   │
+ *   y=1.5   │ rear aisle               │ whiteboard│
+ *   y=2.6   │ man man man              │ mtg table │
+ *   y=2.9   │ desk desk desk           │           │
+ *   y=3.95  │ ▬▬ nameplate divider ▬▬▬ │           │
+ *   y=4.09  │ desk desk desk           │           │
+ *   y=5.44  │ man man man              └── glass ──┘
+ *   y=6.1   │ mid aisle
+ *   y=6.75  │ man man man
+ *   y=7.05  │ desk desk desk
+ *   y=8.1   │ ▬▬ nameplate divider ▬▬▬
+ *   y=8.24  │ desk desk desk
+ *   y=9.59  │ man man man
+ *   y=10.55 │ front aisle
+ *   y=11.3  │ main Agent console
+ *   y=11.8  │      └ summon spot
+ *   y=13    └──────────────────────────────────────┘
  *
- * 工位是"面对面双人桌"：3 列 × 2 组 = 6 组 = 12 个工位。每组两人面对面
- * （各自坐在自己桌子外侧），中间只隔一道隔断。
+ * A workstation is a "face-to-face double desk": 3 columns × 2 groups = 6 groups = 12 workstations. In each group the two people face each other
+ * (each sits on the outer side of their own desk), with only a divider between them.
  */
 
 export const ROOM = { w: 20, d: 13 };
 
-/** 场景配色（暗色夜间办公室） */
+/** Scene palette (dark night office) */
 export const COLORS = {
-  /** 地面：满铺菱形地毯砖 —— 深浅两档交替 + 砖缝，整间屋子同一种材质 */
+  /** Floor: full-coverage diamond carpet tiles —— two alternating shades + tile seams, one material for the whole room */
   floor: '#2e3442',
   floorAlt: '#333b4a',
   floorSeam: '#28303d',
@@ -48,129 +48,129 @@ export const COLORS = {
   screen: '#0a0d13',
   plant: '#3f7f52',
   chair: '#333c4b',
-  /** 工位隔断：不透明板体 + 铝合金边框 */
+  /** Workstation divider: opaque panel body + aluminium frame */
   divider: '#2a3241',
   dividerFrame: '#5f6a7e',
-  /** 桌腿 / 桌架（深木） */
+  /** Desk legs / desk frame (dark wood) */
   deskLeg: '#3a2d21',
-  /** 隔板上的便签纸：纸色 + 纸上笔迹的墨色（逐层可覆盖，见 FLOOR_COLORS） */
+  /** Sticky note on the divider: paper colour + ink colour of the writing on it (overridable per floor, see FLOOR_COLORS) */
   note: '#f2c94c',
   noteInk: '#3a2e0e',
 };
 
 /**
- * 楼层配色覆盖：同一套办公室，允许个别楼层有自己的材质色。
- * 只覆盖需要区分的少数 token，其余沿用上面的 COLORS 基准。
+ * Floor palette overrides: the same office, but individual floors may have their own material colours.
+ * Only the few tokens that need distinguishing are overridden; the rest follow the COLORS baseline above.
  *
- * 用途：让不同楼层一眼能认出来。覆盖只动「金属件」「桌椅木件」这类**家具材质**
- * 与隔板上那张**便签纸**（note / noteInk），地面 / 墙体 / 玻璃 / 绿植沿用基准 ——
- * 换的是家具和便签，不是整层换皮。
+ * Purpose: tell floors apart at a glance. Overrides only touch **furniture materials** such as the metal parts and desk/chair wood,
+ * plus that **sticky note** on the divider (note / noteInk); floor / walls / glass / plants follow the baseline ——
+ * what changes is the furniture and the note, not a full re-skin of the floor.
  *
- * 注意：**工位隔断（divider 板体 + dividerFrame 铝合金边框）全楼层统一用基准 COLORS**，
- * 不在这里逐层覆盖 —— 各层只区分桌椅 / 金属家具与便签。
- *   - 5F（TraeCode，IDE 与插件合并）走暖琥珀色系，跟基准的冷蓝灰拉开；
- *   - 3F（Codex CLI）走冷紫罗兰色系，既不撞基准的蓝灰、也不撞 5F 的琥珀：
- *     家具是靛紫石墨，便签也跟着从「便签黄」换成冷紫罗兰（紫纸 + 紫墨）；
- *   - 4F（Claude Code）走赤陶砖红色系：家具是赤陶/砖红，便签换成珊瑚粉纸 + 砖红墨。
- *     色相刻意压到 10° 上下（品牌黏土色那一带），跟 5F 琥珀的 32° 拉开 ——
- *     两者都是暖色，但一个是「砖」，一个是「琥珀」，不并作一族；
- *   - 6F（Qoder CLI）走青翠玉色系：家具是青玉/翠石，便签换成薄荷纸 + 墨绿墨。
- *     色相压到 150° 上下（带一点冷调的绿），跟 3F 的紫、4F 的砖红、5F 的琥珀都明显拉开，
- *     单层一套材质色，不与任何已有楼层撞色。
- *   - 7F（Kilo Code）走黄铜苔色系：家具是橄榄黄铜，便签换成嫩苔纸 + 深苔墨。
- *     色相 84°（黄绿）。**它与 6F 都是"绿"，但刻意不做成一族** ——
- *     6F 是 157° 的青玉（冷调、带蓝），7F 是 84° 的黄铜苔（暖调、带黄），
- *     家具木件实测相隔 **73°**（色相由 `node` 算 HSL 得出，不是估的）。
- *     两层同源（Kilo Code CLI 就是 OpenCode 的 fork）却分配色，理由见下面 8F 那条。
- *     顺带一提：7F 离最近的一层（5F 琥珀 32°）也有 52°，比 4F↔5F 之间那 19° 宽裕得多。
- *   - 8F（OpenCode）走洋红紫檀色系：家具是洋红紫檀，便签换成玫瑰粉纸 + 梅紫墨。
- *     色相 ~335°，是现有几层里离得最远的一个（3F 265° 紫 / 4F 10° 砖红 / 5F 32° 琥珀 /
- *     6F 150° 青玉 / 7F 84° 黄铜苔），不与任何已有楼层撞色。
- *     7F Kilo Code 与它同源（见 server/src/products.js 的证据链），但两层各自的家具
- *     色相刻意分开 —— 楼层是"按产品认人"的，不是"按血统认人"。
+ * Note: **the workstation divider (divider panel + dividerFrame aluminium frame) uses the baseline COLORS on every floor**,
+ * and is not overridden per floor here —— each floor only distinguishes desks/chairs, metal furniture and the note.
+ *   - 5F (TraeCode, IDE and plugin merged) goes warm amber, pulling away from the baseline cool blue-grey;
+ *   - 3F (Codex CLI) goes cool violet, colliding with neither the baseline blue-grey nor 5F's amber:
+ *     the furniture is indigo-violet graphite, and the note likewise moves from "note yellow" to cool violet (violet paper + violet ink);
+ *   - 4F (Claude Code) goes terracotta brick red: furniture is terracotta / brick red, the note becomes coral pink paper + brick red ink.
+ *     The hue is deliberately held around 10° (the brand clay colour band), pulled apart from 5F amber's 32° ——
+ *     both are warm, but one is "brick" and the other "amber", so they are not lumped into one family;
+ *   - 6F (Qoder CLI) goes verdant jade: furniture is jade / emerald stone, the note becomes mint paper + dark green ink.
+ *     Hue held around 150° (a slightly cool green), clearly pulled apart from 3F's violet, 4F's brick red and 5F's amber,
+ *     one material set per floor, colliding with no existing floor.
+ *   - 7F (Kilo Code) goes brass moss: furniture is olive brass, the note becomes young moss paper + deep moss ink.
+ *     Hue 84° (yellow-green). **It and 6F are both "green", but are deliberately not made into one family** ——
+ *     6F is 157° jade (cool, blue-leaning), 7F is 84° brass moss (warm, yellow-leaning),
+ *     the furniture wood parts measured **73°** apart (hues computed as HSL from `node`, not estimated).
+ *     The two floors share an origin (Kilo Code CLI is a fork of OpenCode) yet get different palettes; the reason is in the 8F entry below.
+ *     Incidentally, 7F is still 52° from its nearest floor (5F amber 32°), much roomier than the 19° between 4F↔5F.
+ *   - 8F (OpenCode) goes magenta rosewood: furniture is magenta rosewood, the note becomes rose pink paper + plum purple ink.
+ *     Hue ~335°, the furthest of the existing floors (3F 265° violet / 4F 10° brick red / 5F 32° amber /
+ *     6F 150° jade / 7F 84° brass moss), colliding with no existing floor.
+ *     7F Kilo Code shares an origin with it (see the evidence chain in server/src/products.js), but the two floors'
+ *     furniture hues are deliberately separated —— floors are recognised "by product", not "by bloodline".
  *
- * 没列在这里的楼层 —— 1F CodeBuddy / 2F WorkBuddy —— 沿用基准 COLORS，观感与从前完全一致。
- * TraeCode 合并后只占 5F 一层，原 6F（IDE）的暖琥珀整套挪到 5F；
- * 原 6F 那份青绿铜锈（原 5F 插件）不再需要 —— 同一层只有一套材质色。
+ * Floors not listed here —— 1F CodeBuddy / 2F WorkBuddy —— use the baseline COLORS, visually identical to before.
+ * After the TraeCode merge it occupies only 5F, and the old 6F (IDE) warm amber set moved to 5F wholesale;
+ * the old 6F verdigris set (old 5F plugin) is no longer needed —— one floor gets exactly one material set.
  */
 export const FLOOR_COLORS = {
   '3F': {
-    // 桌椅木件：冷紫檀
+    // desk/chair wood: cool rosewood
     wood: '#634e74',
     woodDark: '#463653',
     deskLeg: '#382c44',
-    // 金属件：靛紫石墨（隔断统一用基准色，不在此覆盖）
+    // metal parts: indigo-violet graphite (dividers use the baseline colour everywhere, not overridden here)
     metal: '#403a5c',
     metalDark: '#2d2842',
     chair: '#3d3759',
-    // 隔板便签：冷紫罗兰纸 + 紫墨（基准是便签黄 #f2c94c，见 COLORS）
+    // divider note: cool violet paper + violet ink (baseline is note yellow #f2c94c, see COLORS)
     note: '#b3a4f0',
     noteInk: '#241d45',
   },
   '4F': {
-    // 桌椅木件：赤陶砖红
+    // desk/chair wood: terracotta brick red
     wood: '#7d4536',
     woodDark: '#583026',
     deskLeg: '#48271f',
-    // 金属件：暗赤陶（隔断统一用基准色，不在此覆盖）
+    // metal parts: dark terracotta (dividers use the baseline colour everywhere, not overridden here)
     metal: '#54352e',
     metalDark: '#3a2420',
     chair: '#3f2b27',
-    // 隔板便签：珊瑚粉纸 + 砖红墨（基准是便签黄 #f2c94c，见 COLORS）
+    // divider note: coral pink paper + brick red ink (baseline is note yellow #f2c94c, see COLORS)
     note: '#f0a68e',
     noteInk: '#4a1c14',
   },
   '5F': {
-    // 桌椅木件：暖橡木
+    // desk/chair wood: warm oak
     wood: '#8a6438',
     woodDark: '#5d452a',
     deskLeg: '#4a3a26',
-    // 金属件：暖青铜（隔断统一用基准色，不在此覆盖）
+    // metal parts: warm bronze (dividers use the baseline colour everywhere, not overridden here)
     metal: '#4a4033',
     metalDark: '#332e26',
     chair: '#3e382d',
   },
   '6F': {
-    // 桌椅木件：青翠玉
+    // desk/chair wood: verdant jade
     wood: '#3f7a63',
     woodDark: '#2c5747',
     deskLeg: '#234539',
-    // 金属件：青石石墨（隔断统一用基准色，不在此覆盖）
+    // metal parts: bluestone graphite (dividers use the baseline colour everywhere, not overridden here)
     metal: '#34574e',
     metalDark: '#233b35',
     chair: '#2c463d',
-    // 隔板便签：薄荷纸 + 墨绿墨（基准是便签黄 #f2c94c，见 COLORS）
+    // divider note: mint paper + dark green ink (baseline is note yellow #f2c94c, see COLORS)
     note: '#a8e6c8',
     noteInk: '#10301f',
   },
   '7F': {
-    // 桌椅木件：橄榄黄铜（色相 ~84°，黄绿）
+    // desk/chair wood: olive brass (hue ~84°, yellow-green)
     wood: '#557a1e',
     woodDark: '#3d5715',
     deskLeg: '#2e4210',
-    // 金属件：青铜苔（隔断统一用基准色，不在此覆盖）
+    // metal parts: bronze moss (dividers use the baseline colour everywhere, not overridden here)
     metal: '#4a5526',
     metalDark: '#333b1b',
     chair: '#3b4420',
-    // 隔板便签：嫩苔纸 + 深苔墨（基准是便签黄 #f2c94c，见 COLORS）
+    // divider note: young moss paper + deep moss ink (baseline is note yellow #f2c94c, see COLORS)
     note: '#d4e07a',
     noteInk: '#26330a',
   },
   '8F': {
-    // 桌椅木件：洋红紫檀（色相 ~335°）
+    // desk/chair wood: magenta rosewood (hue ~335°)
     wood: '#7a3a63',
     woodDark: '#552741',
     deskLeg: '#421e30',
-    // 金属件：紫晶石墨（隔断统一用基准色，不在此覆盖）
+    // metal parts: amethyst graphite (dividers use the baseline colour everywhere, not overridden here)
     metal: '#553a51',
     metalDark: '#3a2838',
     chair: '#452f42',
-    // 隔板便签：玫瑰粉纸 + 梅紫墨（基准是便签黄 #f2c94c，见 COLORS）
+    // divider note: rose pink paper + plum purple ink (baseline is note yellow #f2c94c, see COLORS)
     note: '#f2a8c8',
     noteInk: '#4a0f2e',
   },
   '9F': {
-    // 桌椅木件：GitHub Copilot 深蓝巡航（冷调蓝紫）
+    // desk/chair wood: GitHub Copilot deep-blue cruise (cool blue-violet)
     wood: '#3b6ea8',
     woodDark: '#254a79',
     deskLeg: '#173458',
@@ -182,7 +182,7 @@ export const FLOOR_COLORS = {
   },
 };
 
-/** 取某层用的配色（基准 COLORS + 该层覆盖；没覆盖的层直接返回基准，不做多余拷贝） */
+/** Palette for a given floor (baseline COLORS + that floor's overrides; floors with no override return the baseline directly, with no extra copy) */
 export function colorsFor(floorId) {
   const over = FLOOR_COLORS[floorId];
   return over ? { ...COLORS, ...over } : COLORS;
@@ -191,89 +191,89 @@ export function colorsFor(floorId) {
 export const WALL = {
   h: 2.8,
   thickness: 0.28,
-  /** 后墙上的窗（gx 范围 + 高度范围） */
+  /** Windows on the back wall (gx range + height range) */
   windows: [
     { x0: 1.2, x1: 4.2, z0: 1.1, z1: 2.2 },
     { x0: 5.2, x1: 8.2, z0: 1.1, z1: 2.2 },
     { x0: 9.2, x1: 12.2, z0: 1.1, z1: 2.2 },
   ],
   /**
-   * 大门：开在左墙（gx = 0 那面），不是后墙。
-   * 那面墙上还挂着钟（cy 6.6），门放在钟的左侧 —— 这面墙 gy 越大在屏幕上越靠左。
-   * @property {number} y0 门洞沿 gy 的起始位置
-   * @property {number} y1 门洞沿 gy 的结束位置
+   * Main door: cut into the left wall (the gx = 0 face), not the back wall.
+   * That wall also holds the clock (cy 6.6); the door sits to the clock's left —— on this wall, a larger gy is further left on screen.
+   * @property {number} y0 start of the doorway along gy
+   * @property {number} y1 end of the doorway along gy
    */
   door: { y0: 8.4, y1: 9.4, z0: 0, z1: 2.05 },
 };
 
 /* ------------------------------------------------------------------ *
- * 工位
+ * Workstations
  * ------------------------------------------------------------------ */
 
 const DESK_W = 3.0;
-/** 桌深：比原来的 1.25 浅一点 —— 一组"面对面双人桌"要塞下 桌+隔断+桌+两侧椅子，
- *  两组加三条过道正好落在后过道(1.5)与控制台(11.55)之间（1.05 深放显示器+键盘仍然宽松）。 */
+/** Desk depth: a touch shallower than the old 1.25 —— one "face-to-face double desk" group has to fit desk + divider + desk + chairs on both sides,
+ *  and two groups plus three aisles land exactly between the rear aisle (1.5) and the console (11.55) (1.05 deep still leaves room for a monitor + keyboard). */
 const DESK_D = 1.05;
 const DESK_H = 0.74;
-/** 椅子离自己桌子外沿的距离（= 人坐的位置） */
+/** Distance from a chair to the outer edge of its own desk (= where the person sits) */
 const SEAT_GAP = 0.3;
 /**
- * 中缝隔断：与桌子**同长**（w = DESK_W，含边框的外缘正好与桌子的左右沿齐平 ——
- * 边框不往外探，桌面两边都顶到竖框）、进深 0.14、四周包一圈**深色金属边框（与板同厚）**、
- * 落地、不带底座、**不透明深灰板体**。板子就压在两张桌子的接缝上（北桌南沿 = 板北沿，
- * 板南沿 = 南桌北沿），两边各贴一张桌 —— 即"两个桌面的中间"。
+ * Mid-seam divider: **as long as the desk** (w = DESK_W, so its outer edge including the frame lines up exactly with the desk's left/right edges ——
+ * the frame does not stick out and both sides of the desktop meet the vertical frame), depth 0.14, wrapped in a **dark metal frame (as thick as the panel)**,
+ * floor-standing, no base, **opaque dark grey panel body**. The panel sits right on the seam between the two desks (north desk's south edge = panel's north edge,
+ * panel's south edge = south desk's north edge), one desk pressed against each side —— that is, "the middle of the two desktops".
  *
- * 高度 1.21 的来历（要求"突出桌面的部分改矮一半"：1.68 那版突出 0.94 → 现在 0.47，正好一半），
- * 同时它也是三个硬约束的交点：
- *   · **北桌可读**：不透明的板子夹在两张桌子中间，等距下"高 h 的板会挡住身后 h 的地面"，
- *     北桌被切后露出的部分 = 1.93 − h。h = 1.21 时露 0.72（七成），显示器/键盘/水杯都在，
- *     读起来仍是"屏风后面的一张桌子"，而不是一条停在板顶的桌面（1.68 时只露 0.25，正是那个毛病）。
- *   · **名牌压得进板面**：牌挂在朝镜头那面，底边要在南桌压过来的可见线（0.75）之上、
- *     顶边要让开顶部铝框（1.21 − 0.05 = 1.16）→ 牌高压到 0.38、挂 z 0.77，正好卡进。
- *   · **突出桌面**：1.21 比桌面 0.74 高 0.47，比原 0.84 那版（高 0.16）明显一截，成立。
+ * Where the height 1.21 comes from (the ask was "cut the part sticking above the desktop in half": the 1.68 version stuck up 0.94 → now 0.47, exactly half),
+ * and it is also the meeting point of three hard constraints:
+ *   · **North desk stays readable**: an opaque panel sits between the two desks, and isometrically "a panel of height h hides h of the ground behind it",
+ *     so the visible part of the clipped north desk = 1.93 − h. At h = 1.21 that is 0.72 (seven tenths), keeping monitor/keyboard/cup,
+ *     so it still reads as "a desk behind a screen", not a desktop that stops at the panel's top edge (at 1.68 only 0.25 showed, which was exactly the problem).
+ *   · **The nameplate fits on the panel face**: the plate hangs on the camera-facing side; its bottom edge must be above the visible line where the south desk cuts in (0.75),
+ *     and its top edge must clear the top aluminium frame (1.21 − 0.05 = 1.16) → the plate height is squeezed to 0.38 and hung at z 0.77, fitting exactly.
+ *   · **Sticks above the desktop**: 1.21 is 0.47 above the 0.74 desktop, clearly more than the old 0.84 version (0.16 high) —— that holds up.
  */
 const DIVIDER_D = 0.14;
 const DIVIDER_H = 1.21;
-/** 铝合金边框的宽度（四条边都一样宽） */
+/** Width of the aluminium frame (all four edges the same width) */
 const DIVIDER_FRAME = 0.05;
 
-/* 隔板上的那张便签纸：歪着贴在**朝镜头那面**的左侧，纸的上沿压一颗磁吸固定器。
+/* The sticky note on the divider: pasted at a tilt on the left of the **camera-facing side**, with a magnetic holder pressing its top edge.
  *
- * 能贴的地方只有一条窄带 —— 南桌（桌面高 0.74）贴着隔板南沿摆在它前面，
- * 等距下"高 h 的东西挡住身后 h 高的画面"，所以板面只在 z 0.74 ~ 1.16（顶部铝框下沿）
- * 之间露出来，共 0.42 高。便签 0.30 见方、歪 8°，转歪后外接框 0.34；中心取 0.95，
- * 上下各留 0.04 —— 既不被南桌切掉下沿，也不顶到铝框。
+ * Only a narrow band is available to paste on —— the south desk (desktop height 0.74) sits in front of the divider along its south edge,
+ * and isometrically "a thing of height h hides h of the image behind it", so the panel face is only exposed between
+ * z 0.74 ~ 1.16 (the bottom edge of the top aluminium frame), 0.42 high in total. The note is 0.30 square and tilted 8°, giving a 0.34 bounding box; centred at 0.95
+ * it leaves 0.04 above and below —— neither clipped at the bottom by the south desk nor bumped into the aluminium frame.
  *
- * 横向取左端往里 0.38：南桌的显示器从 gx +1.15 起、整块在便签右侧，挡不到它
- * （再往右就会被显示器切掉一截）。 */
+ * Horizontally it takes 0.38 in from the left end: the south desk's monitor starts at gx +1.15 and sits entirely to the note's right, so it cannot hide the note
+ * (any further right would clip a chunk of it off). */
 const NOTE_SIDE = 0.3;
 const NOTE_Z = 0.95;
 const NOTE_DX = 0.38;
-/** 磁吸固定器的半径（tile）：约为便签边长的 1/5，压在纸上沿正中 */
+/** Radius of the magnetic holder (tile): about 1/5 of the note's side length, pressing the middle of the paper's top edge */
 const NOTE_MAGNET_R = 0.06;
-/** 三列的桌子左沿（沿用原布局的列距 4.4：桌宽 3.0 + 列间 1.4 走人） */
+/** Left edge of the desks in the three columns (keeping the old column pitch 4.4: desk width 3.0 + 1.4 between columns to walk through) */
 const COLS = [1.0, 5.4, 9.8];
-/** 两组"面对面双人桌"里，北侧那个人座位的 y */
+/** y of the north person's seat in the two "face-to-face double desk" groups */
 const BENCH_Y = [2.6, 6.75];
-/** 人坐的位置（gx 偏移）：桌子中间、正对键盘/显示器竖带（键盘中心 x+1.6） */
+/** Where the person sits (gx offset): middle of the desk, facing the keyboard/monitor vertical band (keyboard centre x+1.6) */
 const SEAT_DX = 1.6;
 
 /**
- * 一组"面对面双人桌"（= 1 列 × 1 组 = 2 个工位）。
+ * One "face-to-face double desk" group (= 1 column × 1 group = 2 workstations).
  *
- * 从北往南：北侧的人 → 北桌 → 隔断 → 南桌 → 南侧的人。
- * 两人各自坐在**自己桌子外侧**、面对面，中间只隔一道隔断。
- * 工位号沿用 A/B 命名：`A<row*3+col>`（北侧）、`B<row*3+col>`（南侧）——
- * 所以演示脚本里 `target: 'A1' / 'B1'` 那两处调度目标仍然有效。
+ * From north to south: north person → north desk → divider → south desk → south person.
+ * The two people each sit on the **outer side of their own desk**, facing each other, with only a divider between them.
+ * Workstation ids keep the A/B naming: `A<row*3+col>` (north side), `B<row*3+col>` (south side) ——
+ * so the two `target: 'A1' / 'B1'` dispatch targets in the demo script still work.
  *
- * 桌上东西的排布：人 → 键盘 → 显示器，从自己那侧的桌沿一路排到隔板（一前一后）；
- *   名字贴平放在桌面"坐下后的左下角"（北桌东北角 / 南桌西南角），
- *   与键盘、鼠标、显示器的位置都错开。
+ * Layout of the things on the desk: person → keyboard → monitor, from that side's desk edge all the way to the divider (one behind the other);
+ *   the name tag lies flat in the desktop's "bottom-left corner once you sit down" (north desk's north-east corner / south desk's south-west corner),
+ *   clear of the keyboard, mouse and monitor positions.
  *
- * @param {number} col 列号 0..2
- * @param {number} row 组号 0..1
- * @param {number} x 桌子左沿
- * @param {number} yN 北侧那个人的座位 y
+ * @param {number} col column index 0..2
+ * @param {number} row group index 0..1
+ * @param {number} x desk left edge
+ * @param {number} yN seat y of the north person
  */
 function bench(col, row, x, yN) {
   const northDesk = { x, y: yN + SEAT_GAP, w: DESK_W, d: DESK_D, h: DESK_H };
@@ -286,7 +286,7 @@ function bench(col, row, x, yN) {
 
   return {
     id: `${col}:${row}`,
-    /** 隔断：两张桌子中间那道板（同长、带铝框）；`seats` 是它两侧各属于哪个工位 */
+    /** Divider: the panel between the two desks (same length, with an aluminium frame); `seats` says which workstation each side belongs to */
     divider: {
       x,
       y: northDesk.y + DESK_D,
@@ -295,16 +295,16 @@ function bench(col, row, x, yN) {
       h: DIVIDER_H,
       frame: DIVIDER_FRAME,
       seats: [northId, southId],
-      /** 深度夹取的上下界（engine 用）：本组北桌 / 南桌的"桌面含桌上物"深度 */
+      /** Upper/lower bounds for depth clipping (used by engine): the "desktop including the things on it" depth of this group's north / south desk */
       northDesk,
       southDesk,
-      /** 便签纸：歪着贴在朝镜头那面（南面）的左侧（几何来历见上面的 NOTE_* 注释） */
+      /** Sticky note: pasted at a tilt on the left of the camera-facing side (south face) (geometry in the NOTE_* comment above) */
       note: {
         x: x + NOTE_DX,
         z: NOTE_Z,
         w: NOTE_SIDE,
         h: NOTE_SIDE,
-        /** 歪的角度（度，板面内绕纸心转）：负 = 顶边往西倒。按组号错开，六道隔板不是一个模子 */
+        /** Tilt angle (degrees, rotated about the paper centre within the panel face): negative = top edge leaning west. Staggered by group index so the six dividers are not clones */
         tilt: -8 + ((row * COLS.length + col) % 3) * 1.6,
         magnet: NOTE_MAGNET_R,
       },
@@ -312,12 +312,12 @@ function bench(col, row, x, yN) {
     north: {
       ...common,
       id: northId,
-      /** 'south' = 面朝 +gy（朝镜头坐）；'north' = 面朝 -gy（背对镜头坐） */
+      /** 'south' = faces +gy (sits facing the camera); 'north' = faces -gy (sits with its back to the camera) */
       face: 'south',
       seat: { x: x + SEAT_DX, y: yN },
       chair: { x: x + SEAT_DX, y: yN },
       desk: northDesk,
-      // 显示器与键盘一前一后：键盘在人前（北沿），显示器靠隔板（背对镜头，看见的是背面）
+      // monitor and keyboard one behind the other: keyboard in front of the person (north edge), monitor against the divider (back to the camera, so its back is what you see)
       monitor: { x: x + 1.15, y: northDesk.y + 0.5, w: 0.91, d: 0.12, h: 0.56 },
       keyboard: { x: x + 1.25, y: northDesk.y + 0.18, w: 0.7, d: 0.26 },
     },
@@ -328,76 +328,76 @@ function bench(col, row, x, yN) {
       seat: { x: x + SEAT_DX, y: yS },
       chair: { x: x + SEAT_DX, y: yS },
       desk: southDesk,
-      // 镜像：显示器在键盘北侧、基本挨着键盘（离隔板 0.36，屏幕朝镜头）
+      // mirrored: monitor north of the keyboard, basically touching it (0.36 from the divider, screen facing the camera)
       monitor: { x: x + 1.15, y: southDesk.y + 0.36, w: 0.91, d: 0.12, h: 0.56 },
       keyboard: { x: x + 1.25, y: southDesk.y + 0.56, w: 0.7, d: 0.26 },
     },
   };
 }
 
-/** 6 组面对面双人桌（3 列 × 2 组） */
+/** 6 face-to-face double desk groups (3 columns × 2 groups) */
 export const BENCHES = BENCH_Y.flatMap((y, row) => COLS.map((x, col) => bench(col, row, x, y)));
 
-/** 12 个工位：[A0,B0, A1,B1, A2,B2, A3,B3, A4,B4, A5,B5]（同一组里北侧在前） */
+/** 12 workstations: [A0,B0, A1,B1, A2,B2, A3,B3, A4,B4, A5,B5] (the north side comes first within a group) */
 export const DESK_UNITS = BENCHES.flatMap((b) => [b.north, b.south]);
 
-/** 6 道隔断（每道挂两块名牌） */
+/** 6 dividers (each carries two nameplates) */
 export const DIVIDERS = BENCHES.map((b) => b.divider);
 
 /* ------------------------------------------------------------------ *
- * 主 Agent 控制台（前玻璃墙下、靠左，落在"除茶水间以外的区域"正中）
+ * Main Agent console (under the front glass wall, left of centre, centred in "the area other than the pantry")
  *
- * 不占工位、不属于会议室，是主会话（Craft Agent）自己的位置。
- * gy 越大越靠近镜头，所以从镜头往外排是：玻璃幕墙(13) → 剪影(12.62) → 控制台(11.55~12.4)。
- * 剪影背对玻璃墙、面向所有工位；控制台和悬浮屏都在它前面（屋里那一侧），
- * 于是它一抬头既是看屏，也是看着整层工位。
- * 水平位置 x 中心≈7.1：右侧 x≥14.6 是会议室 / 茶水间（右沿齐 x=20，见 MEETING.x），控制台避开它们、
- * 落在开放工区正中靠前，从镜头看正对中间那列工位。
+ * It takes no workstation and belongs to no meeting room; it is the main session (Craft Agent)'s own spot.
+ * A larger gy is closer to the camera, so ordering outward from the camera: glass curtain wall (13) → silhouette (12.62) → console (11.55~12.4).
+ * The silhouette has its back to the glass wall and faces all the workstations; the console and the floating screen are both in front of it (on the room side),
+ * so when it looks up it is both watching the screen and watching the whole floor's workstations.
+ * Horizontal centre x ≈ 7.1: on the right x ≥ 14.6 is the meeting room / pantry (right edge at x = 20, see MEETING.x); the console avoids them
+ * and sits toward the front of the open work area, facing the middle column of workstations from the camera's view.
  * ------------------------------------------------------------------ */
 
 export const CONSOLE = {
-  /** 控制台主体：矮柜 + 台面，深色低多边形 */
+  /** Console body: low cabinet + countertop, dark low-poly */
   desk: { x: 5.0, y: 11.55, w: 4.2, d: 0.85, h: 0.95 },
   /**
-   * 悬浮屏：贴在 gy 恒定的竖直面上（朝 +gy = 朝镜头，所以内容看得见）。
-   * z0/z1 是上下沿；台面 0.95 起，离屏底留一截，看起来才像浮着的。
-   * 下沿不能太低的另一个原因：近处玻璃幕墙的上沿轨条（z 2.69~2.8，最后画）投到
-   * 屏面上（离墙 1.0）会盖住 z 1.69~1.8 一条 —— 屏再低，相位字的底边就被那条
-   * 玻璃上沿切掉（相位字底 ≈ 屏上沿 −0.77·屏高，抬高后 ≈1.82，刚好越过 1.8）。
+   * Floating screen: stuck to a vertical plane of constant gy (facing +gy = facing the camera, so its content is visible).
+   * z0/z1 are the top and bottom edges; the countertop starts at 0.95, leaving a gap to the screen's bottom so it looks like it floats.
+   * The other reason the bottom edge cannot be too low: the top rail of the nearby glass curtain wall (z 2.69~2.8, drawn last) projects onto
+   * the screen plane (1.0 from the wall) and would cover a strip at z 1.69~1.8 —— any lower and the bottom edge of the phase text gets
+   * cut by that glass top edge (phase text bottom ≈ screen top − 0.77·screen height, ≈1.82 after raising, just clearing 1.8).
    */
-  // x 原 5.25（center 7.1，与 desk/posts 同中心）；实测屏面看着偏左，右移 0.2 让屏落在底座正中
+  // x was 5.25 (center 7.1, same centre as desk/posts); in practice the screen face looked left, so shift right 0.2 to centre the screen on the base
   screen: { x: 5.45, y: 12.0, w: 3.7, z0: 1.49, z1: 2.59 },
-  /** 托住屏幕的两根光柱（gx 位置） */
+  /** The two light pillars holding the screen (gx positions) */
   posts: [5.6, 8.6],
-  /** 剪影坐的位置（脚底）：控制台与玻璃墙之间 */
+  /** Where the silhouette sits (foot position): between the console and the glass wall */
   seat: { x: 7.1, y: 12.62 },
-  /** 调度光束的起点（控制台朝屋里那一面的中点） */
+  /** Origin of the dispatch beam (midpoint of the console face toward the room) */
   beam: { x: 7.1, y: 11.5 },
 };
 
 /* ------------------------------------------------------------------ *
- * 会议室（右侧上半，玻璃房）
- * 与茶水间共用 x / w：两间上下咬合，正好把右侧 gy 0.35 ~ 12.5 占满
+ * Meeting room (upper right, glass room)
+ * Shares x / w with the pantry: the two interlock vertically and exactly fill the right side's gy 0.35 ~ 12.5
  * ------------------------------------------------------------------ */
 
 export const MEETING = {
-  // 右侧街区（会议室 + 茶水间）左沿 14.6：宽 5.4 → 右沿正好 20 = ROOM.w。
-  // 2026-09-30 用户实测：原来 14.2（右沿 19.6）离房间右沿差 0.4 —— 茶水间那条北墙玻璃
-  // 右边没顶到头，整个街区右移 0.4 让它齐平（街区内的家具 / 门 / 路网节点同步右移，相对布局不变）。
+  // Right-side block (meeting room + pantry) left edge 14.6: width 5.4 → right edge exactly 20 = ROOM.w.
+  // 2026-09-30 user measurement: the old 14.2 (right edge 19.6) was 0.4 short of the room's right edge —— the pantry's north-wall glass
+  // did not reach the end on the right, so the whole block shifted right 0.4 to line it up (furniture / doors / nav nodes in the block moved with it, relative layout unchanged).
   x: 14.6,
   y: 0.35,
   w: 5.4,
   d: 6.8,
-  /** 玻璃：门开在侧面（西面）中段，南面是一整条（兼作茶水间的北墙） */
+  /** Glass: the door is cut in the middle of the side (west face); the south face is one full strip (also serving as the pantry's north wall) */
   glass: {
-    /** 门洞在 y 3.6 ~ 5.0 */
+    /** Doorway at y 3.6 ~ 5.0 */
     westA: { x: 14.6, y: 0.35, w: 0.1, d: 3.25 },
     westB: { x: 14.6, y: 5.0, w: 0.1, d: 2.15 },
     south: { x: 14.6, y: 7.15, w: 5.4, d: 0.1 },
     h: 2.3,
   },
   table: { x: 16.1, y: 3.0, w: 3.2, d: 1.7, h: 0.74 },
-  /** 8 把椅子：前 4 把在桌子北侧，后 4 把在南侧 */
+  /** 8 chairs: the front 4 on the desk's north side, the back 4 on the south side */
   chairs: [
     { x: 16.4, y: 2.55 },
     { x: 17.3, y: 2.55 },
@@ -408,49 +408,49 @@ export const MEETING = {
     { x: 18.2, y: 5.15 },
     { x: 19.1, y: 5.15 },
   ],
-  /** 复印机：西北角，紧靠后侧实墙；敦实一点（矮胖才像一体机，瘦高就成了文件柜） */
+  /** Copier: north-west corner, tight against the rear solid wall; chunky (short and wide looks like an all-in-one, tall and thin turns into a filing cabinet) */
   printer: { x: 14.6, y: 0.35, w: 0.9, d: 0.6, h: 0.95 },
-  /** 白板贴在后墙内侧（跟着房间一起加宽了） */
+  /** Whiteboard against the inside of the back wall (widened along with the room) */
   whiteboard: { x0: 15.4, x1: 19.4, z0: 0.95, z1: 1.95 },
 };
 
-/** 会议室的座位点（= 椅子位置） */
+/** Seat points of the meeting room (= chair positions) */
 export const MEETING_SEATS = MEETING.chairs.map((c) => ({ ...c }));
 
 /* ------------------------------------------------------------------ *
- * 茶水间（会议室前面那间，玻璃隔断）
+ * Pantry (the room in front of the meeting room, glass partition)
  * ------------------------------------------------------------------ */
 
-/** 北面借会议室的南墙，南面直接贴房间最前面那道玻璃幕墙，都不另砌 */
+/** Borrows the meeting room's south wall on the north side and sits directly against the room's front glass curtain wall on the south side, so nothing extra is built */
 export const PANTRY = {
   x: 14.6,
   y: 7.25,
   w: 5.4,
   d: 5.75,
   glass: {
-    /** 门开在西面中段，门洞在 y 9.15 ~ 10.35 */
+    /** Door cut in the middle of the west face, doorway at y 9.15 ~ 10.35 */
     westA: { x: 14.6, y: 7.25, w: 0.1, d: 1.9 },
     westB: { x: 14.6, y: 10.35, w: 0.1, d: 2.65 },
     h: 2.3,
   },
-  /** 饮水机（靠北墙，进屋就能接水） */
+  /** Water cooler (against the north wall, so you can get water right after entering) */
   cooler: { x: 15.3, y: 7.95, r: 0.3, h: 1.35 },
-  /** 餐桌 */
+  /** Dining table */
   table: { x: 16.7, y: 9.6, w: 2.6, d: 1.2, h: 0.74 },
   /**
-   * 杂志架：贴茶水间**北墙东段**（= 会议室南面玻璃），封面朝 +gy 正对镜头。
+   * Magazine rack: against the pantry's **north wall east segment** (= the meeting room's south glass), covers facing +gy straight at the camera.
    *
-   * 为什么必须是这个朝向（第一版摆西墙，效果不对）：
-   *   · 封面朝 +gy、架体沿 x 展开 → 一排封面**互不遮挡**，镜头一眼看到"这是几本杂志"；
-   *   · 靠西墙摆（架体沿 y）时杂志沿 y 排队，后一本盖住前一本，整排只剩几道窄缝，像彩色木条。
-   * 为什么取北墙的**东端**：这条墙是玻璃分段画的、键随 x 递增，架子放在最东端时它的天然
-   * depth（≈27.4 = depthOf(19.6, 7.77)）已经大于所有段（最大 ≈27.3 = depthOf(20, 7.25)），
-   * 不必像饮水机那样手工抬键。
-   * tiers = 层数；lean = 层板后沿比前沿高多少（斜层，封面才略微仰起）。
-   * d 是"从墙里探出来的进深"：0.42（≈42cm）—— 杂志架是薄架子，早先 0.6 看着像个小柜子。
+   * Why this orientation is required (the first version sat on the west wall and looked wrong):
+   *   · covers facing +gy with the rack body running along x → the row of covers **does not occlude itself**, and the camera sees at a glance "this is a stack of magazines";
+   *   · placed against the west wall (body along y) the magazines queue along y, each hiding the one before, leaving only a few narrow slits that look like coloured slats.
+   * Why the **east end** of the north wall: this wall is drawn as glass segments with keys increasing in x, and at the east end the rack's natural
+   * depth (≈27.4 = depthOf(19.6, 7.77)) is already greater than every segment's (max ≈27.3 = depthOf(20, 7.25)),
+   * so no manual key lifting is needed like the water cooler.
+   * tiers = number of shelves; lean = how much higher a shelf's back edge is than its front edge (slanted shelves, so the covers tilt slightly upward).
+   * d is the "depth poking out of the wall": 0.42 (≈42cm) —— the rack is a thin affair; the earlier 0.6 looked like a small cabinet.
    */
   rack: { x: 18.1, y: 7.35, w: 1.5, d: 0.42, h: 1.45, tiers: 3, lean: 0.12 },
-  /** 6 把椅子：餐桌南北各三把 */
+  /** 6 chairs: three on each side of the dining table */
   chairs: [
     { x: 17.0, y: 9.15 },
     { x: 17.9, y: 9.15 },
@@ -462,10 +462,10 @@ export const PANTRY = {
 };
 
 /* ------------------------------------------------------------------ *
- * 绿植
+ * Plants
  * ------------------------------------------------------------------ */
 
-/** 绿植：贴着后墙墙根摆在三扇窗下面（盆沿几乎挨到墙面），彼此分开 */
+/** Plants: along the back wall's base under the three windows (pot rims almost touching the wall), spaced apart */
 export const PLANTS = [
   { x: 2.7, y: 0.33, s: 1 },
   { x: 6.0, y: 0.36, s: 0.95 },
@@ -473,31 +473,31 @@ export const PLANTS = [
   { x: 10.7, y: 0.35, s: 1.1 },
 ];
 
-/** 精灵会去的地点 */
+/** Places the sprites go to */
 export const PLACES = {
-  /** 接水：进茶水间屋里，站在饮水机前 */
+  /** Coffee: into the pantry, standing in front of the water cooler */
   coffee: { x: 15.4, y: 8.55 },
-  /** 文印：进会议室，站在复印机东侧（机器贴后墙，东侧留站位空间） */
+  /** Printing: into the meeting room, standing east of the copier (the machine is against the back wall, leaving standing space to the east) */
   printer: { x: 15.7, y: 0.6 },
-  /** 进出门：左墙那道大门，站在门内侧一步（x 离墙 0.9，免得贴着墙面） */
+  /** Entering / leaving: the main door in the left wall, standing one step inside it (x 0.9 from the wall, so it does not hug the surface) */
   door: { x: 0.9, y: 8.9 },
   /**
-   * 门外：门洞再往外半步（gx < 0 = 墙外的小走廊）。
-   * 小怪物从这里起步走进门洞 —— 门是这时候才推开的（见 engine 的 stepDoor），
-   * 所以看着就是"门开了、人进来"，而不是凭空冒在门口。
-   * 别再往外挪：gx 越小在屏幕上越往左上跑，会被墙挡得一点不剩（见 doorwayPath 的裁剪）。
+   * Outside the door: half a step further out from the doorway (gx < 0 = the small corridor outside the wall).
+   * The gremlin starts here and walks into the doorway —— the door is only pushed open at this moment (see stepDoor in engine),
+   * so it reads as "the door opened and someone came in" rather than popping into existence at the door.
+   * Do not move it further out: the smaller gx is, the further up-left it runs on screen, until the wall hides every last bit of it (see the clipping in doorwayPath).
    */
   doorOut: { x: -0.6, y: 8.9 },
 };
 
 /* ------------------------------------------------------------------ *
- * 路网：精灵只在节点之间走，不会穿桌子
+ * Nav graph: sprites only walk between nodes, never through desks
  * ------------------------------------------------------------------ */
 
 const N = {
-  /* 三条横向过道（y 与 officeMap 的工位几何对齐）：
-     后过道 1.5 ｜ 中过道 6.1（第一组南侧座位 5.44 与第二组北侧座位 6.75 之间）
-     ｜ 前过道 10.55（第二组南侧座位 9.59 以南）。 */
+  /* Three horizontal aisles (y aligned with the workstation geometry in officeMap):
+     rear aisle 1.5 ｜ mid aisle 6.1 (between group 1's south seats 5.44 and group 2's north seats 6.75)
+     ｜ front aisle 10.55 (south of group 2's south seats 9.59). */
   B06: { x: 0.6, y: 1.5 },
   B20: { x: 2.0, y: 1.5 },
   B64: { x: 6.4, y: 1.5 },
@@ -513,7 +513,7 @@ const N = {
   F06: { x: 0.6, y: 10.55 },
   F20: { x: 2.0, y: 10.55 },
   F64: { x: 6.4, y: 10.55 },
-  /** 前过道上正对控制台的点（控制台中心 x≈7.1） */
+  /** Point on the front aisle straight in front of the console (console centre x≈7.1) */
   F91: { x: 7.1, y: 10.55 },
   F108: { x: 10.8, y: 10.55 },
   F134: { x: 13.4, y: 10.55 },
@@ -523,31 +523,31 @@ const N = {
   PRINT: PLACES.printer,
 
   /**
-   * 工位进出：面对面双人桌的椅子在**各自那侧的外沿**，所以两侧的人分别从
-   * 自己这侧的过道直接走进去 —— 不再需要旧布局那种"从隔板缝隙绕进去"的转折点。
-   * 中过道两侧各有一排椅子（第一组南侧 / 第二组北侧），它们共用中过道节点。
+   * Workstation access: a face-to-face double desk's chairs are on the **outer edge of each side**, so the people on each side
+   * walk straight in from their own side's aisle —— no need for the old layout's turning point "winding in through the divider gap".
+   * There is a row of chairs on each side of the mid aisle (group 1's south side / group 2's north side), and they share the mid aisle nodes.
    */
   /**
-   * 主 Agent（控制台）右侧的站位：召唤 / 收工汇报时小怪物走到这里。
+   * Standing spot to the right of the main Agent (console): the gremlin walks here when summoned / for a wrap-up report.
    *
-   * **必须站在控制台右边，不能站在它正前方。** 等距投影里 gy 越大越靠近镜头，
-   * 控制台柜体占 gy 11.55~12.4、悬浮屏在 gy 12.0 —— 正前方那点（x 7.1 / y 11.3）
-   * 其实在柜体和屏幕的**后面**（gy 更小、depth 更小），小怪物一站到那儿就被桌子和
-   * 悬浮屏挡掉大半个身子（2026-10-01 用户实测）。
-   * 挪到柜体右沿（9.2）以东 0.9 格（x 10.1）之后：屏幕空间里人落在控制台右侧，
-   * 身子刚好让开柜体最东那个投影点（-89.5px，人左沿约 -87px），depth 21.9 也
-   * 大于悬浮屏的 19.6，不会再被压住；从路网节点 F108 斜插过来的末段仍在柜体右侧
-   * （gy=11.55 处 x≈10.24 > 9.2）。
+   * **It must stand to the right of the console, not directly in front of it.** In the isometric projection a larger gy is closer to the camera,
+   * the console cabinet occupies gy 11.55~12.4 and the floating screen is at gy 12.0 —— the point directly in front (x 7.1 / y 11.3)
+   * is actually **behind** the cabinet and screen (smaller gy, smaller depth), and the gremlin standing there has most of its body
+   * blocked by the desk and the floating screen (2026-10-01 user measurement).
+   * Moved to 0.9 cells east of the cabinet's right edge (9.2) → x 10.1: in screen space the person lands to the right of the console,
+   * the body just clears the cabinet's easternmost projected point (-89.5px, person's left edge about -87px), and depth 21.9 is
+   * also greater than the floating screen's 19.6, so it is no longer pressed down; the final segment slanting in from nav node F108 is still right of the cabinet
+   * (at gy=11.55, x≈10.24 > 9.2).
    */
   CFRONT: { x: 10.1, y: 11.8 },
 
-  /** 会议室：门在侧面（西墙）→ 门内 → 西侧的南北两条内走廊 */
+  /** Meeting room: door on the side (west wall) → inside the door → the two north / south inner corridors on the west side */
   MDOOR_OUT: { x: 13.6, y: 4.3 },
   MDOOR_IN: { x: 15.3, y: 4.3 },
   MSIDE_A: { x: 15.2, y: 5.9 },
   MSIDE_B: { x: 15.2, y: 2.3 },
 
-  /** 茶水间：门在西墙 → 门内 → 饮水机前 */
+  /** Pantry: door in the west wall → inside the door → in front of the water cooler */
   PDOOR_OUT: { x: 13.6, y: 9.75 },
   PDOOR_IN: { x: 15.2, y: 9.75 },
 };
@@ -560,31 +560,31 @@ MEETING_SEATS.forEach((s, i) => {
 });
 
 const EDGES = [
-  // 三条横向过道
+  // three horizontal aisles
   ['B06', 'B20'], ['B20', 'B64'], ['B64', 'B108'], ['B108', 'B134'],
   ['M06', 'M20'], ['M20', 'M64'], ['M64', 'M108'], ['M108', 'M134'],
   ['F06', 'F20'], ['F20', 'F64'], ['F64', 'F91'], ['F91', 'F108'], ['F108', 'F134'],
-  // 两侧竖向连接
+  // vertical connections on both sides
   ['B06', 'M06'], ['M06', 'F06'],
   ['B134', 'M134'], ['M134', 'F134'],
-  // 大门（左墙、挂钟左侧）→ 中 / 前过道（都在 x<1 的西侧走道上，不穿工位）
+  // Main door (left wall, left of the clock) → mid / front aisles (both on the west walkway at x<1, not crossing workstations)
   ['M06', 'DOOR'], ['F06', 'DOOR'],
-  // 工位：各自那侧的过道 → 座位。面对面双人桌的椅子都在**外侧**，
-  // 所以两侧的人分别从自己这侧的过道直接走进去（不再有"绕隔板缝"的转折点）。
+  // Workstations: each side's aisle → seat. A face-to-face double desk's chairs are all on the **outer side**,
+  // so the people on each side walk straight in from their own side's aisle (no more turning point "around the divider gap").
   ['B20', 'SEAT_A0'], ['B64', 'SEAT_A1'], ['B108', 'SEAT_A2'],
   ['M20', 'SEAT_B0'], ['M64', 'SEAT_B1'], ['M108', 'SEAT_B2'],
   ['M20', 'SEAT_A3'], ['M64', 'SEAT_A4'], ['M108', 'SEAT_A5'],
   ['F20', 'SEAT_B3'], ['F64', 'SEAT_B4'], ['F108', 'SEAT_B5'],
-  // 主 Agent 面前：前过道**东段**（F108）→ 控制台右侧的站位。
-  // 不能接 F91（控制台正前方那点）：F91 在中线上，斜插到右侧站位会横穿柜体
-  // （gy=11.55 处只到 x≈9.03 < 柜体右沿 9.2），小怪物看着从桌子里穿出来。
-  // 接 F108 后末段全程在柜体右侧（gy=11.55 处 x≈10.24），人从控制台右边绕进来。
+  // In front of the main Agent: the front aisle's **east segment** (F108) → the standing spot to the right of the console.
+  // Do not connect F91 (the point directly in front of the console): F91 is on the centre line, and slanting to the right-hand spot would cut across the cabinet
+  // (at gy=11.55 it only reaches x≈9.03 < the cabinet's right edge 9.2), so the gremlin would look like it emerges from inside the desk.
+  // Connected to F108, the final segment stays right of the cabinet the whole way (at gy=11.55, x≈10.24), so the person comes round the console's right side.
   ['F108', 'CFRONT'],
-  // 复印机在会议室西北角：门内 → 北侧内走廊(MSIDE_B) → 机器前
+  // Copier in the meeting room's north-west corner: inside the door → north inner corridor (MSIDE_B) → in front of the machine
   ['MSIDE_B', 'PRINT'],
-  // 茶水间：右侧过道 → 侧面门 → 门内 → 饮水机前接水
+  // Pantry: right-side aisle → side door → inside the door → water in front of the cooler
   ['M134', 'PDOOR_OUT'], ['F134', 'PDOOR_OUT'], ['PDOOR_OUT', 'PDOOR_IN'], ['PDOOR_IN', 'COFFEE'],
-  // 会议室：右侧过道 → 侧面门外 → 门内 → 经西侧内走廊绕到桌子北 / 南两侧（8 个座位）
+  // Meeting room: right-side aisle → outside the side door → inside the door → round the west inner corridor to the north / south sides of the table (8 seats)
   ['B134', 'MDOOR_OUT'], ['M134', 'MDOOR_OUT'], ['MDOOR_OUT', 'MDOOR_IN'],
   ['MDOOR_IN', 'MSIDE_A'], ['MDOOR_IN', 'MSIDE_B'],
   ['MSIDE_B', 'MSEAT_0'], ['MSIDE_B', 'MSEAT_1'], ['MSIDE_B', 'MSEAT_2'], ['MSIDE_B', 'MSEAT_3'],
@@ -602,13 +602,13 @@ const ADJ = (() => {
   return m;
 })();
 
-/** 调试：所有路网节点（画出来能看出路线合不合理） */
+/** Debug: all nav nodes (drawing them shows whether the routes make sense) */
 export const NAV_NODES = Object.values(N);
 
 /**
- * 召唤编排的落脚点：主 Agent（控制台）右侧，与路网节点 CFRONT 同坐标。
- * 最近的节点是 F108（前过道东段），末段从 F108 斜插过来，走的是柜体右侧的空地，
- * 不会穿桌；站定后 depth（21.9）大于悬浮屏（19.6），不再被屏幕遮挡。
+ * Landing point of the summon choreography: right of the main Agent (console), same coordinates as nav node CFRONT.
+ * The nearest node is F108 (front aisle east segment); the final segment slants in from F108 across the open floor right of the cabinet,
+ * never through a desk; once settled its depth (21.9) is greater than the floating screen's (19.6), so it is no longer hidden by the screen.
  */
 export const CONSOLE_FRONT = { x: 10.1, y: 11.8 };
 
@@ -652,8 +652,8 @@ function bfs(from, to) {
 }
 
 /**
- * 规划路径：从任意点走到任意点，返回途经点数组（含精确起终点）。
- * 先吸附到最近的路网节点走 BFS，再补上首尾真实坐标，避免瞬移。
+ * Plan a path: walk from any point to any point, returning the array of waypoints (including the exact start and end).
+ * First snap to the nearest nav nodes and run BFS, then append the real start/end coordinates to avoid teleporting.
  */
 export function route(from, to) {
   const a = nearestNode(from);
