@@ -1,14 +1,22 @@
 /**
- * sessions.js —— 全局活跃会话表（渲染层）。
+ * sessions.js —— the renderer's global table of active sessions.
  *
- * 服务端（server/src/sessionRegistry.js）维护一张表：所有智能体（楼层）× 所有工程
- * 的活跃会话，60 分钟没有事件就剔除。这里只负责把它搬进来 + 记住用户选了哪层哪个会话。
+ * The server (server/src/sessionRegistry.js) keeps a table of the active sessions across every
+ * agent (floor) × every project, dropping a session after 60 minutes without an event. This store
+ * only carries that table in and remembers which floor / session the user picked.
  *
- * 规则：
- *   - 按楼层分组渲染（左侧楼层 + 下拉 optgroup）；
- *   - 默认选中有活跃会话的楼层（用户选中的那层没活跃会话了，就跟到有的那层）；
- *   - 没有活跃会话的楼层照样显示办公室，只是下拉为空 + 状态点灰；
- *   - 选中的会话决定主 Agent 控制台显示什么（幽灵状态跟着它），办公室布局不动。
+ * Rules:
+ *   - group by floor (floor list on the left + optgroup in the dropdown);
+ *   - **the selected floor never moves on its own.** Only the user's own actions change it
+ *     (riding the elevator, picking a floor, picking a session). A task starting on some other
+ *     floor is not a reason to switch to it — that auto-follow was removed deliberately, so do not
+ *     reintroduce it here;
+ *   - the one exception is a floor that is gone: if the selected floor is no longer installed, fall
+ *     back to the server-suggested floor, otherwise the user is left staring at a missing floor;
+ *   - a floor with no active sessions still shows its office, just with an empty dropdown and a
+ *     grey status dot;
+ *   - the selected session decides what the main Agent console shows (the ghost state follows it);
+ *     the office layout does not move.
  */
 
 import { defineStore } from 'pinia';
@@ -20,20 +28,6 @@ import { useProjectStore } from './project';
 const POLL_MS = 5_000;
 /** 定时器放在 store 外面：它不是状态 */
 let timer = null;
-
-/**
- * 上一份快照里见过的会话（`楼层:id`）。放在 store 外面：只是记账，不参与渲染。
- * null = 还没接过第一份快照（那时一切都是"第一次见"，不算新来的）。
- */
-let seenKeys = null;
-const keyOf = (s) => `${s && s.floor ? s.floor : ''}:${s && s.id ? s.id : ''}`;
-
-/**
- * 当前这条会话算不算"没在跑"：待命 / 任务完成都算，可以放心跟到新会话上；
- * 等待授权（await）不算 —— 用户正等着给它放行，别把焦点抢走。
- */
-// unreported（没接 hook 的 CLI 楼层）也算"没在跑"：新会话出现时可以让它跟过去
-const isIdleish = (s) => !s || s.phase === 'idle' || s.phase === 'done' || s.phase === 'unreported';
 
 // 相位文案与主控制台同源（中英两套都在 i18n 词条表里），别在这里再维护一份
 const phaseLabel = (p) => consolePhaseLabel({ phase: p });
@@ -181,7 +175,10 @@ export const useSessionStore = defineStore('sessions', {
       if (Number(data.timeoutMs)) this.timeoutMs = Number(data.timeoutMs);
       this.loaded = true;
 
-      // 默认选中有活跃会话的楼层：用户选的那层没装 / 活跃会话掉光了，就跟到还行的那层
+      // The only floor move this store makes on its own: the selected floor is **gone** (never seen,
+      // or no longer installed) — without this the user is left staring at a floor that does not
+      // exist. An installed floor that merely has no active sessions is NOT a reason to move; the
+      // floor list still renders it and the user can stay there.
       const cur = this.floors.find((f) => f.id === this.selectedFloor);
       if (!cur || !cur.installed) {
         this.selectedFloor = this.defaultFloor || this.floors.find((f) => f.installed)?.id || '';
@@ -197,32 +194,6 @@ export const useSessionStore = defineStore('sessions', {
       }
       // 这层终于有会话了（刚才还是空的）→ 办公室恢复正常显示
       if (this.selectedId) this.floorEmpty = false;
-
-      // 新会话插队：当前这条"没在跑"时，自动跟到刚出现的会话上（见 followNewSessions）
-      this.followNewSessions();
-    },
-
-    /**
-     * 新会话插队：这一份快照里出现了上次没见过的会话，且当前选中那条"没在跑"
-     * （待命 / 任务完成），就自动切过去 —— 用户在 IDE 里开了新会话，办公室别还停在旧那条上发呆。
-     * 正在跑 / 等待授权的会话不抢：那是有主的状态。
-     * @returns {string} 切过去的会话 id；没切返回 ''
-     */
-    followNewSessions() {
-      const keys = this.sessions.map(keyOf);
-      if (!seenKeys) {
-        // 第一份快照只记账：否则一进页面就会被"第一次见"的第一条抢走
-        seenKeys = new Set(keys);
-        return '';
-      }
-      const fresh = this.sessions.filter((s) => !seenKeys.has(keyOf(s)));
-      seenKeys = new Set(keys);
-      if (!fresh.length) return '';
-      if (!isIdleish(this.selected)) return '';
-      // 同时冒出多条：先挑标了 current / fresh 的（真实在活动的那条），否则取最后一条（最新的）
-      const pick = fresh.find((x) => x.current || x.fresh) || fresh[fresh.length - 1];
-      this.select(pick.id);
-      return pick.id;
     },
 
     /** 选中某个会话：楼层跟着它走（会话本来就按楼层分组） */
