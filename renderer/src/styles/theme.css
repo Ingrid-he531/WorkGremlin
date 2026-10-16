@@ -5,9 +5,9 @@
   --bg-elevated: #161a21;
   --bg-panel: #1b2029;
   /**
-   * 办公室画布底色（IsoOfficeView 的 .scene-wrap）。
-   * 门楣（楼层屏所在那一片）也用它：上面那片和办公室是**同一块板**，
-   * 不是另一条色带 —— 这件事必须由同一个 token 保证，两处各写一份迟早会飘。
+   * Office canvas background (IsoOfficeView's .scene-wrap).
+   * The lintel (the strip holding the floor screen) uses it too: that strip and the office are **the same board**,
+   * not a separate color band —— this must be guaranteed by the same token; writing it in two places separately will drift sooner or later.
    */
   --iso-bg: #151a22;
   --border: #262c38;
@@ -30,35 +30,35 @@
   --gap: 12px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
 
-  /* 门楣那块屏（现在是 TaskTicker 的任务滚动条）：暗底 + 发光等宽字。零图片、零依赖。
-     --lcd-slot 是屏里一行的格子高（屏高 = 它 + 16px），改行高只改这一处，
-     别在组件里再写一份 px。 */
+  /* The lintel screen (currently the TaskTicker task marquee): dark background + glowing monospace text. Zero images, zero dependencies.
+     --lcd-slot is the cell height of one row on the screen (screen height = it + 16px); to change the row height, change only this one place,
+     don't write another px value in a component. */
   --lcd-bg: #05070a;
   --lcd-lit: #7fe6ff;
   --lcd-dim: #33414d;
   --lcd-slot: 26px;
-  --car-slot: 22px; /* 轿厢内层号带的一格高（= 胶囊 .fid 的行高，窗口压在它上面） */
+  --car-slot: 22px; /* Cell height of the car's floor-number strip (= line height of the .fid pill; the window sits on top of it) */
 
-  /* motion —— 楼层切换「电梯」过渡（design-elevator-transition.md §2 / §5.1）。
-     新动画一律引用这些 token，别再散写时长与 ease。
-     时长与 useElevator 的 DURATIONS 一一对应，改一边要同步另一边。 */
+  /* motion —— floor-switch "elevator" transition (design-elevator-transition.md §2 / §5.1).
+     All new animations reference these tokens; don't scatter durations and easings anymore.
+     The durations map one-to-one to useElevator's DURATIONS, so changing one side means syncing the other. */
   --dur-door-close: 180ms;
   --dur-door-open: 260ms;
   --dur-settle: 120ms;
-  --dur-shaft-move: 300ms; /* 运行时由 JS 按层数内联覆盖：clamp(240+130×N, 300, 700) */
-  --ease-door-close: cubic-bezier(0.45, 0, 0.55, 1); /* 先加速后贴合，尾段不过冲 */
-  --ease-shaft-move: cubic-bezier(0.52, 0, 0.28, 1); /* 起步缓→中段快→尾段滑行停靠 */
-  --ease-door-open: cubic-bezier(0.22, 0.8, 0.3, 1); /* 快起慢收，别让门拖着眼睛 */
+  --dur-shaft-move: 300ms; /* Overridden inline at runtime by JS based on floor count: clamp(240+130×N, 300, 700) */
+  --ease-door-close: cubic-bezier(0.45, 0, 0.55, 1); /* Accelerate first, then settle; no overshoot at the tail */
+  --ease-shaft-move: cubic-bezier(0.52, 0, 0.28, 1); /* Slow start → fast middle → gliding stop at the tail */
+  --ease-door-open: cubic-bezier(0.22, 0.8, 0.3, 1); /* Fast start, slow finish; don't let the door drag the eye */
   --ease-settle: cubic-bezier(0.2, 0, 0.2, 1);
-  --dur-lcd-fade: 140ms; /* 液晶屏：目的层数字与方向箭头 点亮/熄灭（数字滚动走 --ease-shaft-move） */
+  --dur-lcd-fade: 140ms; /* LCD: destination-floor digits and direction arrow light up/dim (digit rolling uses --ease-shaft-move) */
   --ease-lcd-fade: cubic-bezier(0.2, 0, 0.2, 1);
-  --dur-flash: 40ms; /* 降级档（系统「减弱动态效果」）的淡出/淡入各一段，与 useElevator 的 FLASH_MS 对应 */
+  --dur-flash: 40ms; /* One fade-out and one fade-in for the degraded tier (system "reduce motion"), matching useElevator's FLASH_MS */
 }
 
-/* 系统「减弱动态效果」：时长归零。
-   useElevator 读的是同一个偏好，会走 reduced 档 —— 不演电梯，只做一次 80ms 淡入淡出
-   （见 useElevator 的 FLASH_MS / request() 的 reduced 分支），所以这里的 token 是给
-   那些"万一还有别的动画在跑"的场景兜底的。 */
+/* System "reduce motion": durations go to zero.
+   useElevator reads the same preference and takes the reduced tier —— no elevator show, just one 80ms fade in and out
+   (see useElevator's FLASH_MS / the reduced branch of request()), so the tokens here are a
+   fallback for the case "what if some other animation is still running". */
 @media (prefers-reduced-motion: reduce) {
   :root {
     --dur-door-close: 0ms;
@@ -68,9 +68,9 @@
     --dur-lcd-fade: 0ms;
   }
 
-  /* 与已有组件（DeskScene / GremlinSprite / GhostSprite）一致的兜底写法：
-     光把 token 归零不够 —— 轿厢、轿厢层号带与门楣屏滚动条的 transition-duration
-     都是内联写的，会盖过 token */
+  /* Fallback written the same way as the existing components (DeskScene / GremlinSprite / GhostSprite):
+     zeroing the tokens alone is not enough —— the car, the car's floor-number strip and the lintel-screen marquee
+     all have their transition-duration written inline, which overrides the token */
   .door,
   .car,
   .car-odo-strip,
@@ -79,8 +79,8 @@
   }
 }
 
-/* 手动关：根上 data-motion='off' 一处切换即可清零。
-   全局选择器能命中 scoped 组件内部元素（scoped 只加属性，不阻断全局选择器） */
+/* Manual off: a single switch at data-motion='off' on the root zeroes it out.
+   A global selector can reach inside scoped components (scoping only adds attributes, it doesn't stop global selectors) */
 [data-motion='off'] .door,
 [data-motion='off'] .car,
 [data-motion='off'] .car-odo-strip,
@@ -88,15 +88,15 @@
   transition-duration: 0ms !important;
 }
 
-/* 门锁扣脉冲是 keyframes，不吃 token（归零时长只会让它"一瞬间闪完"，还是闪），必须点名停。
-   判 data-motion 而**不是** media query：off / 降级档都不该有这一下，
-   但用户显式设成 on 时要能盖过系统偏好（设计 §5.1 的 on 档语义）。 */
+/* The door latch pulse is keyframes and doesn't consume tokens (zeroing the duration just makes it "flash to the end in an instant", still a flash), so it must be stopped by name.
+   It checks data-motion and **not** the media query: neither the off nor the degraded tier should have this beat,
+   but an explicit on set by the user must be able to override the system preference (the on-tier semantics in design §5.1). */
 [data-motion='off'] .car::after,
 [data-motion='reduced'] .car::after {
   animation: none !important;
 }
 
-/* 液晶屏的点亮/熄灭只吃 token（没有内联时长），所以归零变量就够，不用再点名元素 */
+/* The LCD lighting/dimming only consumes tokens (there is no inline duration), so zeroing the variables is enough —— no need to name the elements */
 [data-motion='off'] {
   --dur-lcd-fade: 0ms;
 }
@@ -112,9 +112,9 @@ body,
   margin: 0;
 }
 
-/* 鼠标随手一拖不该把整屏文字拖成一片蓝（选中了也没处用，还要再点一下才消掉）。
-   整个应用默认不可选中，只有真要打字的控件还回来 —— 输入框里不选中就没法改字、没法复制。
-   user-select 是继承属性，写在 #app 上就能罩住所有组件内部（scoped 只加属性，不阻断继承）。 */
+/* A casual drag of the mouse shouldn't turn the whole screen of text into a slab of blue (the selection is useless anyway, and it takes another click to clear it).
+   The whole app is non-selectable by default, and only controls that really need typing get selection back —— without selection in an input you can't edit or copy text.
+   user-select is an inherited property, so putting it on #app covers everything inside all components (scoping only adds attributes, it doesn't stop inheritance). */
 #app {
   -webkit-user-select: none;
   user-select: none;
@@ -134,14 +134,14 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Roboto, sans-serif;
   font-size: 13px;
   line-height: 1.5;
-  /* 这是桌面应用（不是网页）：界面上的字默认**不可选** —— 拖一下、划过去不会再刷出
-     一片蓝色选区底色。要复制的地方在下面单独放开。 */
+  /* This is a desktop app (not a web page): text in the UI is **not selectable** by default —— dragging
+     or swiping across it no longer paints a swath of blue selection. The places that need copying are enabled individually below. */
   -webkit-user-select: none;
   user-select: none;
 }
 
-/* 该能选的还是能选：输入框 / 可编辑区，以及台账表格里的内容（任务原话要能复制走）。
-   将来还有要复制的区块，加 .selectable 一个类就行。 */
+/* What should be selectable still is: inputs / editable areas, and the contents of the ledger table (the task's original wording must be copyable).
+   If more copyable areas come later, just add the .selectable class. */
 input,
 textarea,
 [contenteditable='true'],

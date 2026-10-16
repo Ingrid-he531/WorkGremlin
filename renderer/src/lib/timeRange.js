@@ -1,21 +1,21 @@
 /**
- * 任务记录的「时间筛选」—— 把档位（今天 / 昨天 / 过去 7 天 / 这个月 / 自定义 …）算成一个时间窗。
+ * Task records' "time filter" —— turn a preset (today / yesterday / past 7 days / this month / custom …) into a time window.
  *
- * 为什么单独一层纯函数：这里全是**边界**，而边界只有拿固定时刻才测得出来 ——
- * 跨午夜、"过去 7 天"算不算今天、月末（1 月 31 日往前一个月是几号）、夏令时那天
- * 到底差几小时。跟 lib/dayBoard.js 同一个理由：SFC 里混着 DOM 与轮询，测不动。
+ * Why a separate pure layer: this is all **boundaries**, and boundaries can only be tested with fixed instants ——
+ * crossing midnight, whether "past 7 days" includes today, month-end (what date is one month before Jan 31), the day of daylight saving
+ * and exactly how many hours it shifts. Same reason as lib/dayBoard.js: SFCs mix in DOM and polling, so you can't test them.
  *
- * 口径（对齐 requirements.md §P0-6「绝不编造」）：
- *   · 筛的是任务的**开始时刻**（started_at），左闭右开 `[from, to)`。
- *   · 日期一律按**自然日**加减（setDate 走日历），不是拿毫秒硬减 —— 跨夏令时不会差一小时。
- *   · 每一端的 null 表示"这一端不设限"（全部时间 / 自定义只填了一边）。
- *   · 读不出的输入（空串、格式不对的日期、非有限的时间戳）一律当"不设限"或"不命中"，
- *     不拿"现在"之类的值顶上。
+ * Definition (aligned with requirements.md §P0-6 "never fabricate"):
+ *   · it filters on the task's **start time** (started_at), half-open `[from, to)`.
+ *   · dates are always added/subtracted by **calendar day** (setDate goes through the calendar), not by raw milliseconds —— crossing daylight saving won't be off by an hour.
+ *   · a null on either end means "no limit on that end" (all time / only one side of custom filled in).
+ *   · unreadable input (empty string, malformed date, non-finite timestamp) always counts as "no limit" or "no match",
+ *     never substituting a value like "now".
  */
 
 import { dayStartOf } from './dayBoard.js';
 
-/** 下拉里的档位（顺序 = 显示顺序）。key 与 timeWindowOf 的分支一一对应 */
+/** The presets in the dropdown (order = display order). key maps one-to-one to the branches of timeWindowOf */
 export const TIME_RANGES = [
   { key: 'all', label: '全部时间' },
   { key: 'today', label: '今天' },
@@ -27,7 +27,7 @@ export const TIME_RANGES = [
   { key: 'custom', label: '自定义' },
 ];
 
-/** 从某时刻所在的那一天起，往前 / 往后 n 个自然日，返回那天本地 00:00 的时间戳 */
+/** From the day an instant falls in, shift n calendar days forward / backward and return that day's local 00:00 timestamp */
 export function shiftDays(ts, n) {
   const d = new Date(ts);
   d.setDate(d.getDate() + n);
@@ -35,7 +35,7 @@ export function shiftDays(ts, n) {
   return d.getTime();
 }
 
-/** `YYYY-MM-DD`（<input type="date"> 的值）→ 那一天本地 00:00 的时间戳；空 / 格式不对 → null */
+/** `YYYY-MM-DD` (the value of <input type="date">) → that day's local 00:00 timestamp; empty / malformed → null */
 export function dayValueToTs(s) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || '').trim());
   if (!m) return null;
@@ -46,18 +46,18 @@ export function dayValueToTs(s) {
 }
 
 /**
- * 当前档位对应的时间窗 `{from, to}`（左闭右开；null = 那一端不设限）。
+ * The time window `{from, to}` for the current preset (half-open; null = no limit on that end).
  *
- * 「过去 7 天 / 30 天」**含今天**：从今天往前数 7（30）个自然日。不含今天的话，今天刚跑的
- * 任务会被自己筛掉，看着像坏了 —— 这类界面里的通常含义就是含今天。
- * 「这个月 / 上个月」的右端取**下月 1 日 00:00**（不是"此刻"）：时钟偏快的机器上落了个
- * 明天日期的任务，也不该被"这个月"切掉。
- * 「自定义」选中的那两天**整天都算**（右端 +1 天变右开）；只填一边 = 单边开放。
+ * "Past 7 / 30 days" **includes today**: count 7 (30) calendar days back from today. Without today, a
+ * task that just ran today would be filtered out by itself, looking broken —— the usual meaning in this kind of UI is to include today.
+ * "This month / last month" takes **the 1st of the next month 00:00** as the right end (not "now"): a task dated
+ * tomorrow on a machine with a fast clock shouldn't be cut off by "this month" either.
+ * The two days selected under "custom" **count as whole days** (right end +1 day becomes half-open); filling only one side = open on that side.
  *
- * @param {string} key 档位（TIME_RANGES 的 key）；认不出 → 不设限
- * @param {number} now 当前时刻（毫秒）
- * @param {string} [fromStr] 自定义的左端 `YYYY-MM-DD`
- * @param {string} [toStr] 自定义的右端 `YYYY-MM-DD`
+ * @param {string} key the preset (a TIME_RANGES key); unrecognized → no limit
+ * @param {number} now the current instant (ms)
+ * @param {string} [fromStr] the custom left end `YYYY-MM-DD`
+ * @param {string} [toStr] the custom right end `YYYY-MM-DD`
  */
 export function timeWindowOf(key, now, fromStr = '', toStr = '') {
   const at = Number(now);
@@ -85,11 +85,11 @@ export function timeWindowOf(key, now, fromStr = '', toStr = '') {
 }
 
 /**
- * 某个时刻落在时间窗里吗。
- * @param {number} at 任务的开始时刻（started_at）
+ * Whether an instant falls in the time window.
+ * @param {number} at the task's start time (started_at)
  * @param {{from: number|null, to: number|null}} win
- * @returns {boolean} 开始时刻读不出（老数据 / null）→ **只有"全部时间"才放行**：
- *   归不进任何一天的任务，不该硬塞进某一档。
+ * @returns {boolean} unreadable start time (old data / null) → **only "all time" lets it through**:
+ *   a task that fits into no day shouldn't be forced into one preset.
  */
 export function inTimeWindow(at, win) {
   const { from, to } = win || {};
@@ -102,16 +102,16 @@ export function inTimeWindow(at, win) {
 }
 
 /**
- * 时间窗 → 看板「能看哪几天」（按天粒度，两端都含）。
+ * Time window → which days the board "can show" (day granularity, both ends inclusive).
  *
- * 图形看板一格就是一天，而窗口是毫秒区间的 `[from, to)` —— 得落回"哪几天"：
- *   · 下界 = from 那天（窗口端点本来就落在本地 00:00）
- *   · 上界 = **to 的前一天**：to 是右开边界、本身不在窗内（今天的窗口是
- *     [今天 00:00, 明天 00:00)，能看的就只有今天）
- * 某一端为 null = 那一端不设限（全部时间 / 自定义只填了一边）。
+ * A graphical board's cell is one day, while the window is a millisecond interval `[from, to)` —— it has to fall back to "which days":
+ *   · lower bound = the day of from (the window endpoints already fall on local 00:00)
+ *   · upper bound = **the day before to**: to is the open-right boundary and isn't in the window itself (today's window is
+ *     [today 00:00, tomorrow 00:00), so only today can be shown)
+ * A null on either end = no limit on that end (all time / only one side of custom filled in).
  *
- * 反着的自定义区间（起始晚于结束）会得到 minDay > maxDay 的空区间 —— 如实是个空集，
- * 不交换两端凑一个出来：那时候列表本来也是空的。
+ * A reversed custom range (start later than end) yields an empty range with minDay > maxDay —— truthfully an empty set,
+ * don't swap the ends to conjure one up: the list is empty then anyway.
  *
  * @param {{from: number|null, to: number|null}} win
  * @returns {{minDay: number|null, maxDay: number|null}}
@@ -123,7 +123,7 @@ export function dayRangeOf(win) {
   return { minDay, maxDay };
 }
 
-/** 看板当前这天在可选区间里吗（区间那一端不设限就算在） */
+/** Whether the board's current day is in the selectable range (an unbounded end counts as in) */
 export function dayInRange(day, range) {
   const { minDay, maxDay } = range || {};
   const t = Number(day);
@@ -134,10 +134,10 @@ export function dayInRange(day, range) {
 }
 
 /**
- * 把某天夹进可选区间；已经在里面就原样返回。
+ * Clamp a day into the selectable range; returns it unchanged if it's already in.
  *
- * 越界时**挪到最近的那一端**，而不是保持不动：换了筛选条件（比如从"全部时间"切到"今天"）
- * 以后，原来停在的那天可能已经不在窗内了，硬画出来就是一片空白 —— 看着像坏了。
+ * When out of range, **move to the nearest end** rather than staying put: after changing the filter (say from "all time" to "today")
+ * the day it was parked on may already be outside the window, and drawing it anyway is just blank —— looking broken.
  */
 export function clampDay(day, range) {
   const { minDay, maxDay } = range || {};

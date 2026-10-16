@@ -1,40 +1,40 @@
 import { agentBase, AGENT_LABELS } from '@workgremlin/shared';
 
 /**
- * 客户端身份归一化（前端共用）。
+ * Client identity normalization (shared by the front end).
  *
- * 新合同（与 hook 的 eventClient 一致）：**agent 直接代表楼层**，client 只描述形态
- * （vscode / cli …）。isPluginClient(client) 判定 plugin 形态（vscode 系 IDE）。
- * 因此楼层与成员都按 agent 基名匹配与显示，不再用 `agent + '-plugin'` 这种合成字符串当身份。
+ * New contract (matching the hook's eventClient): **agent directly represents the floor**, client only describes the form
+ * (vscode / cli …). isPluginClient(client) decides the plugin form (vscode-family IDE).
+ * So floors and members are both matched and displayed by the agent base name, no longer using a synthesized string like `agent + '-plugin'` as the identity.
  *
- * 显示名 / clientLabel 已搬到 shared/index.js 并由后端 API 直接返回（client_label 字段），
- * 前端不再自己按 form 拼 —— 本文件只保留楼层匹配逻辑。
+ * The display name / clientLabel have moved to shared/index.js and are returned directly by the backend API (the client_label field),
+ * the front end no longer builds them from form —— this file only keeps the floor-matching logic.
  */
 
 /**
- * 某楼层（floorAgent）是否接纳某成员（memberAgent）。
+ * Whether a floor (floorAgent) accepts a member (memberAgent).
  *
- * 常驻小怪物（写在 agents 目录里）与"走 CLI 还是 Plugin"无关：同一产品的 CLI 与 Plugin
- * 同属一层（1F CodeBuddy 就是这么合并的）；codex 这种「CLI 与 IDE 合并成一层」同理。
- * 所以按 **agent 基名**匹配（剥掉残留的 -plugin 后缀与 @工程 后缀兜底）。
- * client 为空的（演示数据 / 老库没补上 client 的）视作通用，哪层都显示。
+ * Resident gremlins (written into the agents directory) have nothing to do with "CLI or Plugin": the CLI and Plugin of the same product
+ * belong to the same floor (1F CodeBuddy is merged like this); codex's "CLI and IDE merged into one floor" is the same.
+ * So match by **agent base name** (strip any leftover -plugin suffix and @project suffix as a fallback).
+ * An empty client (demo data / old DBs that never backfilled client) is treated as generic and shows on every floor.
  *
- * @param {string} floorAgent 楼层身份（floor.agent，如 codebuddy / kilo）
- * @param {string} memberAgent 成员身份（member.memberId，如 codebuddy / kilo）
+ * @param {string} floorAgent floor identity (floor.agent, e.g. codebuddy / kilo)
+ * @param {string} memberAgent member identity (member.memberId, e.g. codebuddy / kilo)
  */
 export function floorAcceptsClient(floorAgent, memberAgent) {
   if (!memberAgent || !floorAgent) return true;
   const fa = agentBase(floorAgent);
   const ma = agentBase(memberAgent);
-  // 空基名（异常兜底）不误吞：基名相同才认
+  // An empty base name (abnormal fallback) must not swallow: only identical base names are accepted
   if (!fa || !ma) return false;
   return fa === ma;
 }
 
 /**
- * 是否为"产品基名"（楼层主 agent）：leo / peter 这类子代理不在其中。
- * 用于区分某成员是不是它所在楼层的主 agent（与 floorAcceptsClient 无关——
- * 新模型下成员的 client 字段是形态，不能拿它和 name 比）。
+ * Whether it is a "product base name" (the floor's main agent): sub-agents like leo / peter are not included.
+ * Used to tell whether a member is the main agent of its floor (unrelated to floorAcceptsClient——
+ * under the new model a member's client field is the form, you can't compare it with name).
  * @param {string} id memberId / name
  */
 export function isBaseAgent(id) {

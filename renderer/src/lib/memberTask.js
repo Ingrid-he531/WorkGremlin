@@ -1,49 +1,49 @@
 /**
- * 工位卡 / 办公室小怪物共用的「当前任务」口径。
+ * The "current task" definition shared by the workstation card / office gremlins.
  *
- * 为什么需要它：`agent_status.task_id` 不会随收工清空 —— 成员空闲之后，那个槽位往往还指着
- * **上一条已经收工**的任务。照着显示就会「明明空闲，屏幕上却挂着当前任务、已耗时还在走」
- * （用户实测抓出来的：主代理状态空闲，卡片上仍是上一个任务的标题 + 一直在涨的已耗时）。
+ * Why it's needed: `agent_status.task_id` isn't cleared when work finishes —— after a member goes idle, that slot often still points at
+ * **the previous task that already finished**. Displaying it straight gives "clearly idle, yet a current task hangs on screen and the elapsed time keeps ticking"
+ * (caught by real user testing: the main agent is idle, yet the card still shows the previous task's title + an ever-increasing elapsed time).
  *
- * 所以「当前任务」= 任务还没收工（没有 endedAt）**且** 成员确实在干活（busy / blocked）。
- * idle / online / offline 一律算空闲 —— 那里显示的应该是「上一个任务在多久以前」（lastTaskAt）。
+ * So "current task" = the task hasn't finished (no endedAt) **and** the member is actually working (busy / blocked).
+ * idle / online / offline all count as idle —— what should be shown there is "how long ago the previous task was" (lastTaskAt).
  */
-// 显式写 /index.js：这个文件被 renderer/test 的 node 脚本直接 import，Node 不会补扩展名
+// Write /index.js explicitly: renderer/test node scripts import this file directly, and Node won't add the extension
 import { t } from '../i18n/index.js';
 import { isEphemeralMember } from './ephemeral.js';
 
 /**
- * 算在干活的相位：与主控制台"在不在跑"的口径一致（见 iso/mainConsole.js 的 PHASES.busy）。
- * 注意成员状态里**没有** `thinking` —— "思考中 / 等模型返回"属于 `busy`（见 shared 的 AGENT_STATES）；
- * 主控制台那个"思考中 vs 调用工具"是 **phase** 轴的事，不是成员状态。
+ * Phases counted as working: consistent with the main console's "is it running" definition (see PHASES.busy in iso/mainConsole.js).
+ * Note there is **no** `thinking` in member state —— "thinking / waiting for the model" counts as `busy` (see AGENT_STATES in shared);
+ * the main console's "thinking vs calling a tool" is a matter of the **phase** axis, not member state.
  */
 export const WORKING_STATES = ['busy', 'blocked'];
 
-/** 这个成员现在在不在干活 */
+/** Whether this member is working right now */
 export function isWorking(member) {
   return Boolean(member && WORKING_STATES.includes(member.state));
 }
 
 /**
- * 状态牌三档文案：阻塞 / 忙碌 / 空闲。
- * blocked → 阻塞（等外部依赖）；busy → 忙碌；其余（idle / online / offline / unreported）→ 空闲。
- * 5 种细分状态仍不逐一显示（用户 2026-09-30 只保留空闲/忙碌），但 blocked 单独一档 ——
- * 它承载的信息（"卡住了、在等谁"）和忙碌不是一回事（见 requirements §5.6）。
+ * Three levels of status-label text: blocked / busy / idle.
+ * blocked → blocked (waiting on an external dependency); busy → busy; the rest (idle / online / offline / unreported) → idle.
+ * The 5 fine-grained states still aren't shown one by one (the user kept only idle/busy on 2026-09-30), but blocked gets its own level ——
+ * the information it carries ("stuck, waiting on whom") is not the same as busy (see requirements §5.6).
  */
 export function statusLabel(state) {
   if (state === 'blocked') return t('card.status.blocked');
   return WORKING_STATES.includes(state) ? t('card.status.busy') : t('card.status.idle');
 }
 
-/** 状态牌的色调（那个小圆点）：与文案同源，避免出现"绿色点 + 空闲"这种自相矛盾 */
+/** The status label's tone (that little dot): same source as the text, to avoid contradictions like "green dot + idle" */
 export function statusTone(state) {
   if (state === 'blocked') return 'blocked';
   return WORKING_STATES.includes(state) ? 'busy' : 'idle';
 }
 
 /**
- * 当前任务；没有就回 null。
- * 幽灵（临时召唤）的 task 可能是清单里的字符串（`--task`），一并支持。
+ * The current task; null when there is none.
+ * A ghost's (temporary summon's) task may be a string from the checklist (`--task`), supported too.
  * @returns {{ title?: string, startedAt?: number }|string|null}
  */
 export function currentTaskOf(member) {
@@ -53,27 +53,27 @@ export function currentTaskOf(member) {
   return t.endedAt ? null : t;
 }
 
-/** 当前任务的标题文案；没有回空串（调用方自己决定显示「空闲」还是别的） */
+/** The current task's title text; empty string when there is none (the caller decides whether to show "idle" or something else) */
 export function currentTaskTitle(member) {
   const t = currentTaskOf(member);
   if (!t) return '';
   return typeof t === 'string' ? t : String(t.title || '');
 }
 
-/** 当前任务的开工时刻；拿不到回 0（调用方回落到 stateSince，不编造） */
+/** The current task's start time; 0 when unavailable (the caller falls back to stateSince, nothing fabricated) */
 export function currentTaskStartedAt(member) {
   const t = currentTaskOf(member);
   return t && typeof t === 'object' ? Number(t.startedAt) || 0 : 0;
 }
 
 /**
- * 「有效当前任务」：常驻小怪物自己槽位里没在跑的任务、但它**正被召唤**（同名幽灵在跑）时，
- * 借用那只幽灵的任务 —— 与办公室 tooltip 同一口径（见 IsoOfficeView 的 mtipTask）。
+ * "Effective current task": when a resident gremlin has no running task in its own slot but is **being summoned** (a ghost of the same name is running),
+ * borrow that ghost's task —— the same definition as the office tooltip (see IsoOfficeView's mtipTask).
  *
- * 为什么需要：召唤出去干活的实例是 `subagent-<名字>` 那只幽灵，任务挂在它身上；常驻小怪物
- * 的槽位里没有任务。只看成员自己的 task，工位卡片就会「状态忙碌、当前任务：空闲」。
- * @param {object} member 常驻成员（或任意成员）
- * @param {Array} allMembers 同一工程的全部成员（含幽灵）
+ * Why it's needed: the instance summoned out to work is the `subagent-<name>` ghost, the task hangs on it; the resident gremlin's
+ * slot has no task. Looking only at the member's own task, the workstation card would show "status busy, current task: idle".
+ * @param {object} member a resident member (or any member)
+ * @param {Array} allMembers every member of the same project (including ghosts)
  * @returns {object|string|null}
  */
 export function summonTaskOf(member, allMembers) {
@@ -86,14 +86,14 @@ export function summonTaskOf(member, allMembers) {
   return g ? currentTaskOf(g) : null;
 }
 
-/** 「有效当前任务」的标题；没有回空串（调用方显示「空闲」） */
+/** The "effective current task" title; empty string when there is none (the caller shows "idle") */
 export function summonTaskTitle(member, allMembers) {
   const task = summonTaskOf(member, allMembers);
   if (!task) return '';
   return typeof task === 'string' ? task : String(task.title || '');
 }
 
-/** 「有效当前任务」的开工时刻；拿不到回 0 */
+/** The "effective current task" start time; 0 when unavailable */
 export function summonTaskStartedAt(member, allMembers) {
   const task = summonTaskOf(member, allMembers);
   return task && typeof task === 'object' ? Number(task.startedAt) || 0 : 0;

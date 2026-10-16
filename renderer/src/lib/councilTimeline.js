@@ -1,45 +1,45 @@
 /**
- * 议事厅时间线的**纯逻辑** —— 不碰网络、不碰 Vue，好钉住。
+ * **Pure logic** for the council timeline —— no network, no Vue, so it's easy to pin down.
  *
- * 存在的理由：同一场会的发言有两个来源，形状**不一样**：
- *   · GET /councils/:id —— 数据库行（snake_case：round_no / vote_reason / duration_ms）；
- *   · WS council.update —— 服务端现推的增量（camelCase：roundNo / voteReason / durationMs）。
- * 界面上它们是同一条时间线，所以必须先归一成一种形状再合并，否则会出现
- * 「刷新前有理由、刷新后理由没了」这类只在某个路径上才看得见的怪事。
+ * Why it exists: the utterances of one council come from two sources whose shapes **differ**:
+ *   · GET /councils/:id —— database row (snake_case: round_no / vote_reason / duration_ms);
+ *   · WS council.update —— incremental push from the server (camelCase: roundNo / voteReason / durationMs).
+ * They are the same timeline on screen, so they must first be normalized to one shape before merging, otherwise you get
+ * oddities like "the reason is there before refresh, gone after refresh" that are only visible on one path.
  *
- * 另一件事是**去重**：WS 抖动 / 断线重连时同一条发言会再到一次。按 (轮次, 楼层)
- * 去重即可 —— 一轮里一层只发一次言，这个键是唯一的。
+ * The other thing is **deduplication**: when WS jitters / reconnects, the same utterance arrives again. Deduplicating by (round, floor)
+ * is enough —— in one round a floor speaks only once, so this key is unique.
  */
 
-/** 数字字段：取不到就是 null。**不写 0** —— 0 词元和"读不到词元"不是一回事 */
+/** Numeric field: unavailable means null. **Never write 0** —— 0 tokens and "tokens unreadable" are not the same thing */
 function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-/** 两种形状里挑一个值（camelCase 优先，其次 snake_case） */
+/** Pick one value from the two shapes (camelCase first, then snake_case) */
 function pick(camel, snake, src) {
   const v = src[camel] !== undefined ? src[camel] : src[snake];
   return v === undefined ? null : v;
 }
 
-/** 三个要点数组：不是数组一律当空 —— 里面每一项还必须是字符串，其余丢掉（不 toString 猜） */
+/** The three point arrays: anything not an array counts as empty —— each item must still be a string, the rest is dropped (no guessing via toString) */
 function listOf(v) {
   return Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean) : [];
 }
 
 /**
- * 分析模式的要点 → 统一形状。
+ * Analysis-mode findings → unified shape.
  *
- * **要同时吃两种输入**：详情接口给的是 DB 里的 JSON 字符串（`findings_json`），
- * WS 增量给的是服务端已经解析好的对象（`findings`）。不兼容的话就会出现
- * "刷新前有要点、刷新后没了"。
+ * **Must accept both inputs**: the detail API gives the JSON string from the DB (`findings_json`),
+ * the WS increment gives an object the server has already parsed (`findings`). If they aren't compatible you get
+ * "findings present before refresh, gone after refresh".
  *
- * 最关键的一条：`null` 与 `{}` **不是一回事**，不许合并：
- *   · null / '' / 坏 JSON → null —— 它没按约定给出要点（解析不出来），界面要说这句；
- *   · {} → 三个空数组 —— 它给出了要点，只是三条都空（问了，答的是"没有"）。
- * 前者是"没说"，后者是"说了没有"，界面上的话术不一样。
+ * The most critical point: `null` and `{}` **are not the same thing**, they must not be merged:
+ *   · null / '' / bad JSON → null —— it didn't give findings as agreed (unparseable), the UI must say so;
+ *   · {} → three empty arrays —— it did give findings, they're just all empty (asked, and the answer was "none").
+ * The former is "didn't say", the latter is "said there are none" —— the UI wording differs.
  *
- * @param {unknown} raw JSON 字符串 / 已解析对象 / null
+ * @param {unknown} raw JSON string / already-parsed object / null
  * @returns {{points:string[],risks:string[],questions:string[]}|null}
  */
 export function normFindings(raw) {
@@ -49,7 +49,7 @@ export function normFindings(raw) {
     try {
       obj = JSON.parse(raw);
     } catch {
-      return null; // 坏 JSON = 解析不出来 = null，绝不当成空数组
+      return null; // bad JSON = unparseable = null, never treat it as an empty array
     }
   }
   if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
@@ -57,8 +57,8 @@ export function normFindings(raw) {
 }
 
 /**
- * 一条发言 → 统一形状。
- * @param {object} raw DB 行或 WS 增量
+ * One utterance → unified shape.
+ * @param {object} raw DB row or WS increment
  */
 export function normUtterance(raw) {
   const u = raw || {};
@@ -67,11 +67,11 @@ export function normUtterance(raw) {
     floorId: pick('floorId', 'floor_id', u) || '',
     role: u.role || 'speaker',
     content: u.content == null ? null : String(u.content),
-    // 票：认得出的三种之外一律 null（未表态）。**不猜语气**
+    // Vote: anything outside the three recognized values is null (no stance). **Don't guess the sentiment**
     vote: u.vote === 'agree' || u.vote === 'disagree' || u.vote === 'abstain' ? u.vote : null,
-    // 分析模式的立场：同样只认白名单，其余一律 null（未表态）
+    // Analysis-mode stance: likewise only the whitelist, everything else is null (no stance)
     stance: u.stance === 'support' || u.stance === 'oppose' || u.stance === 'unsure' ? u.stance : null,
-    // 要点：详情给 JSON 字符串、WS 给对象，两边都吃；解析不出来是 null，不是空数组
+    // Findings: the detail gives a JSON string, WS gives an object, accept both; unparseable is null, not an empty array
     findings: normFindings(pick('findings', 'findings_json', u)),
     voteReason: pick('voteReason', 'vote_reason', u),
     proposal: pick('proposal', 'proposal_text', u),
@@ -86,16 +86,16 @@ export function normUtterance(raw) {
   };
 }
 
-/** 一条发言的身份：一轮里一层只发一次言 */
+/** An utterance's identity: in one round a floor speaks only once */
 export const utteranceKey = (u) => `${u.roundNo}#${u.floorId}`;
 
 /**
- * 把一条发言并进列表：同一个键就合并，新的键就追加。返回新数组（调用方是响应式
- * state，不原地改）。
+ * Merge one utterance into the list: same key merges, new key appends. Returns a new array (the caller is reactive
+ * state, so don't mutate in place).
  *
- * 合并的规矩是**非空覆盖、空则保留**，不是"后到的赢"：WS 是增量推送，一条发言可能
- * 分几次到（先正文、再票型），后到那条里没提到的字段是 null。按"后到的赢"合并，
- * 第二条就会把第一条的正文抹成 null —— 界面上表现为"刷新一下正文就没了"。
+ * The merge rule is **non-empty overwrites, empty preserves**, not "last one wins": WS pushes increments, so an utterance may
+ * arrive in several parts (content first, then vote), and fields the later one doesn't mention are null. Merging by "last one wins",
+ * the second would wipe the first one's content to null —— which shows in the UI as "refresh and the content is gone".
  */
 export function mergeUtterance(list, raw) {
   const u = normUtterance(raw);
@@ -115,16 +115,16 @@ export function mergeUtterance(list, raw) {
 }
 
 /**
- * 一轮里的票型汇总（从发言现算）。
- * 服务端也会给一份权威的（round）—— 界面上两个都显示：服务端那份是判定依据，
- * 这份是从发言数出来的，用来互相印证（对不上就是有问题，不该悄悄盖掉）。
+ * Vote tally for one round (computed from the utterances).
+ * The server also gives an authoritative one (round) —— the UI shows both: the server's is the basis for the verdict,
+ * this one is counted from the utterances and serves to cross-check (a mismatch means something is wrong, and it must not be silently overwritten).
  */
 export function tallyOf(utterances) {
   const list = Array.isArray(utterances) ? utterances : [];
   const t = { seats: list.length, agree: 0, disagree: 0, abstain: 0, invalid: 0 };
   for (const u of list) {
     if (u.role === 'chair') {
-      t.seats -= 1; // 主席是服务端的议题陈述，不占席位、不投票
+      t.seats -= 1; // the chair is the server's topic statement, takes no seat and doesn't vote
       continue;
     }
     if (u.status !== 'ok' || !u.vote) t.invalid += 1;
@@ -134,18 +134,18 @@ export function tallyOf(utterances) {
 }
 
 /**
- * 分析模式的立场汇总（从发言现算）。主席不占席位，与 tallyOf 同一套规矩 ——
- * 这样"表决时的未表态人数"和"分析时的未表态人数"口径一致，用户不必学两套。
+ * Analysis-mode stance tally (computed from the utterances). The chair takes no seat, the same rule set as tallyOf ——
+ * this way the "number of non-positions at vote time" and "at analysis time" use the same definition, so users don't have to learn two.
  *
- * `none` 这一档必须存在：超时 / 崩了 / 解析不出立场的都落在这里，界面写「未表态」
- * 并附上错误原文。**不许**把它们悄悄塞进某一方 —— 那是替它表态。
+ * The `none` bucket must exist: timeouts / crashes / unparseable stances all land here, the UI writes "no stance"
+ * and attaches the original error. **Never** quietly stuff them into one side —— that would be speaking on their behalf.
  */
 export function stanceCountsOf(utterances) {
   const list = Array.isArray(utterances) ? utterances : [];
   const t = { seats: list.length, support: 0, oppose: 0, unsure: 0, none: 0 };
   for (const u of list) {
     if (u.role === 'chair') {
-      t.seats -= 1; // 主席是服务端的议题陈述，不占席位、不表态
+      t.seats -= 1; // the chair is the server's topic statement, takes no seat and takes no stance
       continue;
     }
     if (u.status !== 'ok' || !u.stance) t.none += 1;
@@ -155,8 +155,8 @@ export function stanceCountsOf(utterances) {
 }
 
 /**
- * 按轮次分组，供时间线渲染。轮次升序；同一轮里主席排最前，其余按楼层号。
- * `stanceTally` 是**加出来的字段**，表决那条路的 `tally` 逐字未动。
+ * Group by round for the timeline to render. Rounds ascending; within a round the chair comes first, the rest by floor number.
+ * `stanceTally` is an **added field**, the `tally` of the vote path is untouched verbatim.
  * @returns {Array<{roundNo:number, utterances:Array, tally:object, stanceTally:object}>}
  */
 export function groupByRound(utterances) {
@@ -178,22 +178,22 @@ export function groupByRound(utterances) {
 }
 
 /**
- * 立场 → i18n 键后缀。认不出的（null / 没表态）单独一档，界面写「未表态」。
- * 这一层绝不把"没表态"显示成"同意"。
+ * Stance → i18n key suffix. Unrecognized ones (null / no stance) get their own bucket, the UI writes "no stance".
+ * This layer never displays "no stance" as "agree".
  */
 export function voteKey(vote) {
   return vote === 'agree' || vote === 'disagree' || vote === 'abstain' ? vote : 'none';
 }
 
-/** 分析模式的立场 → i18n 键后缀。与 voteKey 同一条规矩：认不出就是 'none' */
+/** Analysis-mode stance → i18n key suffix. Same rule as voteKey: unrecognized is 'none' */
 export function stanceKey(stance) {
   return stance === 'support' || stance === 'oppose' || stance === 'unsure' ? stance : 'none';
 }
 
-/** 发言状态 → 能不能算一句"有效的话"（失败 / 超时 / 没表态的不算） */
+/** Utterance status → whether it counts as a "valid statement" (failures / timeouts / no stance don't) */
 export const isSpoken = (u) => u && u.status === 'ok';
 
-/** 词元总数：四个字段**都**取不到时返回 null（界面显示「—」，不显示 0） */
+/** Token total: returns null when **all** four fields are unavailable (the UI shows "—", not 0) */
 export function tokenTotal(u) {
   const parts = [u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheWriteTokens];
   if (parts.every((v) => v == null)) return null;

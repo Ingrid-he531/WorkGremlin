@@ -1,16 +1,16 @@
 /**
- * 临时成员（幽灵）判定 —— 渲染层专用。
+ * Ephemeral-member (ghost) detection —— renderer-only.
  *
- * 专家团队是常驻成员，一人一个工位；为某个项目临时组队拉进来的成员
- * 没有工位，在场景里以"幽灵"形态飘在空中。
+ * The expert team are resident members, one workstation each; members pulled in to form a team temporarily for a project
+ * have no workstation and hover in the scene in "ghost" form.
  *
- * 为什么不放 shared：@workgremlin/shared 是 CJS 包，vite dev 会预打包它，
- * 新增具名导出时旧缓存不会自动失效（会报 isEphemeralMember is not a function）。
- * 这是纯展示规则（精灵 vs 幽灵），server 并不需要，所以留在渲染层。
+ * Why not put it in shared: @workgremlin/shared is a CJS package, vite dev pre-bundles it,
+ * so adding a named export doesn't invalidate the old cache (it throws isEphemeralMember is not a function).
+ * This is a pure display rule (sprite vs ghost), the server doesn't need it, so it stays in the renderer.
  *
- * 判定优先级：
- *   1. member.ephemeral === true（将来 server 可直接下发）
- *   2. memberId / name 以 ghost- ghost_ tmp- temp- 开头
+ * Detection priority:
+ *   1. member.ephemeral === true (the server can send this directly in the future)
+ *   2. memberId / name starts with ghost- ghost_ tmp- temp-
  *   3. role === 'ghost'
  */
 
@@ -24,7 +24,7 @@ const EPHEMERAL_PREFIXES = Object.freeze([
 ]);
 
 /**
- * 是否为临时成员（无工位、飘在空中）。
+ * Whether it is an ephemeral member (no workstation, hovering in the air).
  * @param {{memberId?: string, name?: string, role?: string|null, ephemeral?: boolean}} member
  */
 export function isEphemeralMember(member) {
@@ -37,7 +37,7 @@ export function isEphemeralMember(member) {
   return String(member.role || '').toLowerCase() === 'ghost';
 }
 
-/** 临时成员所属项目名（缺省回落到 role / name） */
+/** The project name an ephemeral member belongs to (falls back to role / name) */
 export function projectLabelOf(member) {
   if (!member) return '';
   const raw = String(member.projectLabel || member.role || member.name || '');

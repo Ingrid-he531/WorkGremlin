@@ -8,17 +8,17 @@ function authHeaders(info) {
 }
 
 /**
- * 议事厅：发起一场会、看它逐轮推进、看最后谈成没谈成。
+ * Council: start a session, watch it advance round by round, and see whether it ended in agreement.
  *
- * 数据来源两条，都要用：
- *   · HTTP —— 列表 / 详情（权威，刷新后仍对得上）；
- *   · WS `council.update` —— 增量（发言一条条推来，不用轮询）。
- * WS 只当"早知道一点"用：**收尾时一定回拉一次详情**，因为结论（verdict / 停在第几轮）
- * 是服务端落库时才算出来的，推送里只有一个摘要。断线期间漏掉的也能靠这次回拉补上。
+ * Two data sources, both used:
+ *   · HTTP —— list / detail (authoritative, still consistent after a refresh);
+ *   · WS `council.update` —— incremental (utterances arrive one by one, so no polling).
+ * WS is only for "knowing a little earlier": **always pull the detail once at wrap-up**, because the
+ * verdict (verdict / which round it stopped at) is computed only when the server writes to the DB, and the push carries just a summary. Anything missed while disconnected is recovered by that pull.
  */
 export const useCouncilStore = defineStore('council', {
   state: () => ({
-    /** 可选楼层（含没装 CLI 的那几层与原因） */
+    /** Selectable floors (including the ones with no CLI installed, and why) */
     floors: [],
     defaults: {
       maxRounds: 3,
@@ -30,46 +30,46 @@ export const useCouncilStore = defineStore('council', {
       materialMaxBytes: 0,
       materialTotalMaxBytes: 0,
     },
-    /** 历史列表 */
+    /** History list */
     list: [],
-    /** 当前打开的那场会 */
+    /** The session currently open */
     current: null,
-    /** 当前这轮的提案（WS 推来，界面上做成横幅） */
+    /** Proposal for the current round (pushed over WS, shown as a banner in the UI) */
     liveProposal: null,
     loading: false,
     submitting: false,
-    /** 操作失败的原文。**不加工** —— 用户要看到服务端到底说了什么 */
+    /** Raw failure text. **Untouched** —— the user must see exactly what the server said */
     error: '',
   }),
 
   getters: {
     readyFloors: (s) => s.floors.filter((f) => f.ready),
-    /** 一层都请不动才叫"开不起来"。还没探测到（floors 为空）时不拦，进页面会说清楚 */
+    /** Only when no floor can be summoned is it "can't start". Don't block before probing (floors empty) —— the page will make it clear */
     canStart: (s) => s.floors.length === 0 || s.floors.some((f) => f.ready),
-    /** 会还在推进吗（在页面上显示实时时间线；结束了就不必再等推送） */
+    /** Is the session still advancing (show the live timeline on the page; once it is over there is no need to wait for pushes) */
     live: (s) => Boolean(s.current && ['draft', 'running'].includes(s.current.council.status)),
     /**
-     * 当前这场会的谈法。老行没有 mode 列（迁移前建的会）→ 一律当 'vote'：
-     * 那时候只有这一种谈法，猜成别的会把界面引到一条它根本没走过的分支上。
+     * How the current session talks. Old rows have no mode column (sessions created before the
+     * migration) → always treat as 'vote': that was the only mode back then, and guessing anything else would route the UI down a branch it never walked.
      */
     mode: (s) => ((s.current && s.current.council.mode) === 'analysis' ? 'analysis' : 'vote'),
-    /** 当前这场会的工作目录（工程模式）；空 = 隔离模式 */
+    /** Working directory of the current session (project mode); empty = isolated mode */
     workspacePath: (s) => (s.current && s.current.council.workspace_path) || '',
-    /** 按轮次分好的时间线（含从发言现数的票型），见 lib/councilTimeline.js */
+    /** Timeline grouped by round (with vote tallies counted from the utterances), see lib/councilTimeline.js */
     timeline: (s) => (s.current ? groupByRound(s.current.utterances) : []),
 
     /**
-     * 现在桌上那份提案。两个来源各缺一半，**按轮次号取新的那份**：
-     *   · 详情接口给的是逐轮存档的轮次行 —— 刷新 / 重开之后仍然对得上，但它是一份快照，
-     *     页面开着的时候不会自己往前走；
-     *   · WS 的 debate 事件是刚上桌的那份 —— 最新，但只有连着的时候才有。
-     * 谁也不能无条件优先：库里那份在新一轮刚开谈时会落后一轮（轮次行先建、提案后推），
-     * WS 那份在断线重连之后就没了。轮次号大的是新的，两边都成立。
+     * The proposal now on the table. Each source is missing half, so **take the newer one by round number**:
+     *   · The detail endpoint gives the per-round archived round rows —— still consistent after a
+     *     refresh / reopen, but it is a snapshot and won't move on its own while the page is open;
+     *   · The WS debate event is the one just placed on the table —— freshest, but only while connected.
+     * Neither can win unconditionally: the DB copy lags a round when a new round has just opened (the
+     * round row is created first, the proposal pushed later), and the WS copy is gone after a reconnect. The larger round number is the newer one, and that holds on both sides.
      */
     currentProposal: (s) => {
       if (!s.current) return null;
       const rows = s.current.rounds.filter((r) => r.kind === 'debate' && r.proposal_text);
-      // rounds 按 round_no 升序来自 SQL，最后一行就是库里最新的一轮
+      // rounds come from SQL in ascending round_no order, so the last row is the newest round in the DB
       const fromDb = rows.length
         ? {
             roundNo: rows[rows.length - 1].round_no,
@@ -96,7 +96,7 @@ export const useCouncilStore = defineStore('council', {
           if (data.defaults) this.defaults = data.defaults;
         }
       } catch {
-        /* 拉不到就先空着：界面上按钮照常可点，发起时会给出服务端的原文 */
+        /* Leave it empty when unreachable: the buttons stay clickable, and starting surfaces the server's raw message */
       }
     },
 
@@ -108,11 +108,11 @@ export const useCouncilStore = defineStore('council', {
         const data = await res.json();
         if (data && data.ok) this.list = data.councils || [];
       } catch {
-        /* 同上 */
+        /* same as above */
       }
     },
 
-    /** 打开一场会：拉详情（轮次 + 发言 + 材料 + 出席者） */
+    /** Open a session: pull the detail (rounds + utterances + materials + attendees) */
     async open(id) {
       if (!id) {
         this.current = null;
@@ -120,7 +120,7 @@ export const useCouncilStore = defineStore('council', {
       }
       const project = useProjectStore();
       this.loading = true;
-      // 换了一场会，上一场的实时提案立刻作废（否则新会的横幅会挂着旧会的提案）
+      // Switched to another session, so the previous one's live proposal is void at once (otherwise the new session's banner would show the old proposal)
       this.liveProposal = null;
       try {
         const info = project.serverInfo || {};
@@ -132,7 +132,7 @@ export const useCouncilStore = defineStore('council', {
             participants: data.participants || [],
             materials: data.materials || [],
             rounds: data.rounds || [],
-            // 统一形状：DB 行是 snake_case，WS 增量是 camelCase，合并前必须先归一，见 lib/councilTimeline.js
+            // Normalize the shape: DB rows are snake_case, WS increments are camelCase, so unify before merging, see lib/councilTimeline.js
             utterances: (data.utterances || []).map(normUtterance),
             live: Boolean(data.live),
           };
@@ -147,16 +147,16 @@ export const useCouncilStore = defineStore('council', {
     },
 
     /**
-     * 发起一场会。
-     * @returns {Promise<string|null>} 新会的 id；失败返回 null 并把原因放进 error
+     * Start a session.
+     * @returns {Promise<string|null>} the new session id; on failure returns null and puts the reason in error
      */
     async create({ topic, floors, files, maxRounds, mode, workspacePath }) {
       const project = useProjectStore();
       this.submitting = true;
       this.error = '';
       const body = { topic, floors, files, maxRounds, mode: mode || 'vote' };
-      // 工作目录**留空就不发这个 key**：隔离模式是服务端的缺省行为，
-      // 发一个空串过去只是把"没填"翻译成"填了个空"，服务端要多一步才能认出它。
+      // **An empty working directory means this key is simply not sent**: isolated mode is the
+      // server's default, and an empty string would just translate "not filled in" into "filled in blank", costing the server an extra step.
       const ws = String(workspacePath == null ? '' : workspacePath).trim();
       if (ws) body.workspacePath = ws;
       try {
@@ -168,7 +168,7 @@ export const useCouncilStore = defineStore('council', {
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
-          // 服务端给的原因直接显示（"4F：没找到命令行可执行文件"这种），不翻译、不改写
+          // Show the server's reason as is (like "4F: no command-line executable found"), no translation, no rewriting
           this.error = (data && data.error && data.error.message) || `发起失败（HTTP ${res.status}）`;
           return null;
         }
@@ -224,8 +224,8 @@ export const useCouncilStore = defineStore('council', {
     },
 
     /**
-     * WS 增量。**只处理"当前打开的那场"**：别的会的动静只用来刷新列表。
-     * 收尾事件（带 status 的那种）一定回拉详情 —— 结论文本 / 停在第几轮只有库里有。
+     * WS increments. **Only handles "the session currently open"**: activity from other sessions is
+     * only used to refresh the list. A wrap-up event (the one carrying status) always pulls the detail —— the verdict text / which round it stopped at only exists in the DB.
      */
     applyEvent(payload) {
       const p = payload || {};
@@ -234,16 +234,16 @@ export const useCouncilStore = defineStore('council', {
       const isCurrent = cur && cur.council.id === p.councilId;
 
       if (isCurrent && p.utterance) {
-        // 增量合并（去重 + 非空覆盖），见 lib/councilTimeline.js
+        // Incremental merge (dedupe + non-empty overwrite), see lib/councilTimeline.js
         cur.utterances = mergeUtterance(cur.utterances, p.utterance);
       }
-      // 桌上真有一份提案才叫"当前提案"。分析模式的 debate 事件里 proposal 恒为 null
-      // （见 orchestrator.js）—— 认 null 当提案的话，界面上会挂起一条空横幅。
+      // "Current proposal" only when there really is one on the table. In analysis mode the debate
+      // event's proposal is always null (see orchestrator.js) —— treating null as a proposal would hang an empty banner in the UI.
       if (isCurrent && p.roundNo != null && p.phase === 'debate' && p.proposal) {
         this.liveProposal = { roundNo: p.roundNo, proposal: p.proposal, proposalFrom: p.proposalFrom };
       }
       if (isCurrent && p.round) {
-        // 服务端给的权威票型：挂到那一轮上（界面同时显示它和从发言数出来的那一份）
+        // The authoritative tally from the server: attach it to that round (the UI shows both it and the one counted from the utterances)
         const at = cur.rounds.findIndex((r) => r.round_no === p.roundNo);
         const merged = { ...(cur.rounds[at] || { council_id: p.councilId, round_no: p.roundNo }), ...p.round };
         if (at >= 0) cur.rounds.splice(at, 1, merged);
@@ -252,7 +252,7 @@ export const useCouncilStore = defineStore('council', {
 
       const terminal = p.status && ['done', 'failed', 'cancelled'].includes(p.status);
       if (terminal) {
-        // 会开完了，桌上那份提案不再是"当前的"：结论由详情接口的轮次行说了算
+        // The session is over, so the proposal on the table is no longer "current": the verdict is decided by the detail endpoint's round rows
         if (isCurrent) this.liveProposal = null;
         this.fetchList();
         if (isCurrent) this.open(p.councilId);
@@ -262,7 +262,7 @@ export const useCouncilStore = defineStore('council', {
       }
     },
 
-    /** 关掉当前这场（切走页签时用，别让 WS 继续往一个看不见的页面上写） */
+    /** Close the current one (used when switching tabs, so WS stops writing into an invisible page) */
     close() {
       this.current = null;
       this.liveProposal = null;

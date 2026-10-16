@@ -109,7 +109,7 @@ export const useTaskStore = defineStore('tasks', {
       }
     },
 
-    /** 删单条任务记录（含 subagent / 产出）；前端已做二次确认 */
+    /** Delete a single task record (including subagent / output); the frontend already asks for a second confirmation */
     async deleteTask(id) {
       const info = (useProjectStore().serverInfo) || {};
       try {
@@ -162,7 +162,7 @@ export const useTaskStore = defineStore('tasks', {
       return 0;
     },
 
-    /** 读取服务端记录保留天数（天）；拉不到回退 30 */
+    /** Read the server's record retention in days; falls back to 30 when the fetch fails */
     async fetchRetention() {
       const info = (useProjectStore().serverInfo) || {};
       try {
@@ -178,7 +178,7 @@ export const useTaskStore = defineStore('tasks', {
       }
       return 30;
     },
-    /** 修改记录保留天数：仅在用户点击「保存」时写回服务端（不轮询、不一直写） */
+    /** Change the record retention in days: write back to the server only when the user clicks "Save" (no polling, no continuous writes) */
     async saveRetention(days) {
       const info = (useProjectStore().serverInfo) || {};
       const d = Math.max(1, Math.min(Number(days) || 30, 3650));

@@ -4,41 +4,41 @@ import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { memberBelongsToProject } from '../lib/projectScope';
 
-/** 兜底对账间隔：WS 增量事件（尤其 member.remove）是一次性的，漏收就永久陈旧，靠它自愈 */
+/** Fallback reconcile interval: WS increment events (especially member.remove) are one-shot, so a missed one stays stale forever; this heals it */
 const RECONCILE_MS = 15_000;
 
-/** 工位视图 + 连接状态（当前工程的成员 / 幽灵 / 连接） */
+/** Workstation view + connection state (current project's members / ghosts / connection) */
 export const useProjectStore = defineStore('project', {
   state: () => ({
-    /** 全部工程（演示工程和真实工程并列） */
+    /** All projects (demo project and real projects side by side) */
     projects: [],
-    /** 当前工程 */
+    /** Current project */
     project: null,
     /**
-     * 当前工程 id（server 的 projects.id —— 等于 workspace 响应里的 project、成员卡上的 project）。
-     * 单独存一份是因为 workspace 响应只给 id 字符串、快照给的是整行对象，两处都要能参与过滤。
-     * 空串 = 还不知道（老服务端 / 还没拿到 workspace）→ 不过滤，见 lib/projectScope.js。
+     * Current project id (the server's projects.id —— equals the project in the workspace response
+     * and the project on a member card). Stored separately because the workspace response only gives the id string while the snapshot gives the whole row object, and both need to take part in filtering.
+     * Empty string = not known yet (old server / workspace not fetched yet) → no filtering, see lib/projectScope.js.
      */
     projectId: '',
     members: [],
-    /** 当前工程显示名（server 解析：package.json name > 目录名；演示工程为固定名） */
+    /** Current project display name (resolved by the server: package.json name > directory name; the demo project has a fixed name) */
     projectName: '',
-    /** 当前工程根目录（演示工程为空） */
+    /** Current project root directory (empty for the demo project) */
     workspacePath: '',
-    /** 最近打开过的工程 */
+    /** Recently opened projects */
     recent: [],
     connection: { state: 'connecting', source: 'ws' },
     serverInfo: null,
-    /** 当前停在演示工程（服务端 workspace 响应里的 demo，由「演示模式」按钮切换） */
+    /** Currently parked on the demo project (demo in the server's workspace response, toggled by the demo mode button) */
     demo: false,
-    /** 进演示前打开的是哪个工程：退出演示时回这里（演示工程自己没有目录） */
+    /** Which project was open before entering demo: return here when leaving demo (the demo project has no directory of its own) */
     demoReturnPath: '',
     _conn: null,
     _reconcileTimer: null,
   }),
 
   getters: {
-    /** 按状态聚合计数（供顶部概览） */
+    /** Counts aggregated by state (for the top overview) */
     stateCounts: (s) =>
       s.members.reduce((acc, m) => {
         acc[m.state] = (acc[m.state] || 0) + 1;
@@ -60,8 +60,8 @@ export const useProjectStore = defineStore('project', {
         url: wsUrl(info),
         token: info.token,
         project: null,
-        // 每轮（重）连前重新问一次 server 信息：server 重启会换 token / 端口，
-        // 拿旧的那份重连只会被 bad_token 一直踢（见 api/ws.js 的说明）。
+        // Re-ask the server info before every (re)connect: a server restart changes the token / port,
+        // and reconnecting with the stale copy only gets kicked with bad_token over and over (see the notes in api/ws.js).
         resolve: () => this.resolveServerAuth(),
         onEvent: (msg) => {
           switch (msg.type) {
@@ -80,26 +80,26 @@ export const useProjectStore = defineStore('project', {
         },
         onState: (st) => {
           this.connection = st;
-          // WS 一连上就主动订阅一次：注册 filters 并让服务端立刻回一份当前状态，
-          // 不必等下一次推送（roster 心跳最长 15s）才见得到成员/小怪物（HELLO 也会回快照，这里是显式再拉一次）。
-          // 必须在 HELLO 之后发 —— 顺序由 api/ws.js 的 open 回调保证，抢在 HELLO 前会被服务端当 bad token 踢掉。
+          // Subscribe once as soon as WS connects: registers filters and makes the server immediately
+          // return the current state, so there is no need to wait for the next push (roster heartbeat up to 15s) before seeing members/gremlins (HELLO also returns a snapshot; this is an explicit extra pull).
+          // Must be sent after HELLO —— the order is guaranteed by api/ws.js's open callback, and jumping ahead of HELLO gets kicked by the server as a bad token.
           if (st && st.state === 'open' && this._conn) this._conn.subscribe({});
         },
       });
 
-      // 兜底对账：member.remove 是一次性事件，漏收（WS 抖动 / 窗口失焦）后那条成员会永久挂在
-      // 办公室里（member.status 心跳只更新不删除）。周期性拉一次快照整体对齐，保证最终一致。
+      // Fallback reconcile: member.remove is a one-shot event, so after a missed one (WS jitter / window unfocused) that member
+      // hangs in the office forever (member.status heartbeats only update, never delete). Periodically pull a snapshot to realign everything, guaranteeing eventual consistency.
       this.stopReconcile();
       this._reconcileTimer = setInterval(() => this.reconcile(), RECONCILE_MS);
     },
 
     /**
-     * 每次（重）连前的鉴权解析。
+     * Auth resolution before every (re)connect.
      *
-     * Electron 主进程每次都会重读 ~/.workgremlin/server.json（见 desktop/src/main.js 的
-     * GET_SERVER_INFO），所以这里拿到的是"当前这个 server 实例"的端口与 token。
-     * 一旦和本地记的不一样（= server 重启过），就把 serverInfo 换成新的并把工程信息对齐一次；
-     * 各页面的 HTTP 轮询都读 project.serverInfo，因此也会跟着用上新 token（不再一路 401）。
+     * The Electron main process rereads ~/.workgremlin/server.json every time (see desktop/src/main.js's
+     * GET_SERVER_INFO), so what we get here is the port and token of "this current server instance".
+     * Once it differs from what is recorded locally (= the server restarted), swap serverInfo to the new one and realign the project info once;
+     * every page's HTTP polling reads project.serverInfo, so it picks up the new token too (no more 401 all the way down).
      * @returns {Promise<{url: string, token: string, project: null}>}
      */
     async resolveServerAuth() {
@@ -117,12 +117,12 @@ export const useProjectStore = defineStore('project', {
           }
         }
       } catch {
-        /* 读不到 server.json（或 IPC 不通）就用旧的那份继续试，别把连接卡死 */
+        /* If server.json can't be read (or IPC is down), keep trying with the old copy; don't jam the connection */
       }
       return { url: wsUrl(info), token: info.token, project: null };
     },
 
-    /** 拉一份当前快照，整体覆盖本地成员表（自愈：多出来的陈旧成员会被这次覆盖掉） */
+    /** Pull a current snapshot and overwrite the local member table wholesale (self-healing: extra stale members get wiped by this overwrite) */
     async reconcile() {
       try {
         const info = this.serverInfo || {};
@@ -133,7 +133,7 @@ export const useProjectStore = defineStore('project', {
         const data = await res.json();
         if (data && data.ok && data.snapshot) this.applySnapshot(data.snapshot);
       } catch {
-        /* 拉不到就留到下一轮，不影响增量推送 */
+        /* If unreachable, leave it for the next cycle; incremental pushes are unaffected */
       }
     },
 
@@ -146,7 +146,7 @@ export const useProjectStore = defineStore('project', {
       this.project = snapshot.project;
       if (snapshot.project && snapshot.project.id) this.projectId = String(snapshot.project.id);
       this.projects = snapshot.projects || [];
-      // 快照本身就是按当前工程切的，这里再滤一道只是防御（服务端换了 / 老快照混进来）
+      // The snapshot is already sliced by current project; filtering again here is just defensive (server swapped / an old snapshot slipped in)
       this.members = (snapshot.members || []).filter((m) => memberBelongsToProject(m, this.projectId));
       if (snapshot.projectName) this.projectName = snapshot.projectName;
     },
@@ -154,15 +154,15 @@ export const useProjectStore = defineStore('project', {
     /** @param {any} card */
     upsertMember(card) {
       if (!card) return;
-      // 别的工程的成员卡一律不收：WS 订阅不带 project，服务端会把所有工程的广播都发过来
-      // （退出演示后 __demo__ 的心跳超时扫描就是一例），塞进来就会在屋里闪一下又消失。
+      // Never accept a member card from another project: the WS subscription carries no project, so the server
+      // broadcasts every project's events here (the __demo__ heartbeat timeout sweep after leaving demo is one example), and letting one in makes it flash in the room and then vanish.
       if (!memberBelongsToProject(card, this.projectId)) return;
       const idx = this.members.findIndex((m) => m.memberId === card.memberId);
       if (idx >= 0) this.members.splice(idx, 1, { ...this.members[idx], ...card });
       else this.members.push(card);
     },
 
-    /** 临时成员（幽灵）退场：subagent 结束，屋里就不该再飘着它 */
+    /** Temporary member (ghost) leaves the stage: the subagent is done, so it shouldn't keep hovering in the room */
     removeMember(memberId) {
       if (!memberId) return;
       const idx = this.members.findIndex((m) => m.memberId === memberId);
@@ -175,10 +175,10 @@ export const useProjectStore = defineStore('project', {
       this.workspacePath = ws.workspacePath || '';
       this.recent = Array.isArray(ws.recent) ? ws.recent : [];
       this.demo = Boolean(ws.demo);
-      // 换工程要立刻把上一个工程的人从屋里撤掉：服务端的新快照是**异步**到的（同一次请求里广播），
-      // 不先滤一道，上一个工程的成员会在这段时间继续站在工位上 —— 退出演示时那 8 只演示小怪物
-      // 是最容易被看见的一例（2026-10-01 用户实测：退出演示、切楼层后它们又短暂出现）。
-      // 拿不到新工程 id 时（老服务端 / 响应缺字段）不换 projectId、也不过滤，维持原样。
+      // Switching projects must immediately clear the previous project's people from the room: the server's new snapshot arrives **asynchronously** (broadcast within the same request),
+      // and without filtering first the previous project's members keep standing at their workstations during that stretch —— the 8 demo gremlins when leaving demo
+      // are the most visible instance (2026-10-01 user test: after leaving demo and switching floors they briefly appeared again).
+      // When the new project id is unavailable (old server / response missing the field), don't swap projectId and don't filter, keep things as they are.
       if (ws.project) {
         this.projectId = String(ws.project);
         this.members = this.members.filter((m) => memberBelongsToProject(m, this.projectId));
@@ -186,8 +186,8 @@ export const useProjectStore = defineStore('project', {
     },
 
     /**
-     * 打开工程：屋里的成员/幽灵整体切到这个工程。path 为空 / 'demo' 切到演示工程。
-     * 服务端会广播新快照，这里不用自己拉。
+     * Open a project: the room's members/ghosts all switch to this project. An empty path / 'demo' switches to the demo project.
+     * The server broadcasts the new snapshot, so there is no need to pull it here.
      * @param {string} path
      */
     async openWorkspace(path) {
@@ -197,8 +197,8 @@ export const useProjectStore = defineStore('project', {
     },
 
     /**
-     * 退出演示时该回的目录：进演示前记下的那个 → 最近打开过的 → 服务启动时解析出来的。
-     * 演示工程自己没有目录（workspacePath 为空），所以它自己不能当"回去的地址"。
+     * Directory to return to when leaving demo: the one recorded before entering demo → the most recently opened → the one resolved at server start.
+     * The demo project has no directory of its own (workspacePath empty), so it can't be the "address to go back to".
      */
     realPath() {
       if (this.workspacePath) return this.workspacePath;
@@ -208,10 +208,10 @@ export const useProjectStore = defineStore('project', {
     },
 
     /**
-     * 进演示模式：切到「演示工程」（POST /api/v1/workspace 空路径 → 服务端 openDemo）。
-     * 服务端会顺手把演示数据备好并起心跳推进器（见 server/src/index.js 的 syncDemo）。
+     * Enter demo mode: switch to the "demo project" (POST /api/v1/workspace with an empty path → the server's openDemo).
+     * The server readies the demo data and starts the heartbeat pusher along the way (see server/src/index.js's syncDemo).
      *
-     * 先把"退出时回哪个工程"记下来 —— 必须**在切走之前**抓（切进演示后 workspacePath 就是空的了）。
+     * Record "which project to return to on exit" first —— it must be captured **before switching away** (after switching into demo workspacePath is empty).
      */
     async enterDemo() {
       if (this.demo) return null;
@@ -219,7 +219,7 @@ export const useProjectStore = defineStore('project', {
       return this.openWorkspace('demo');
     },
 
-    /** 退出演示：回到进演示前打开的那个真实工程；一个真实工程都没有就留在演示 */
+    /** Leave demo: return to the real project opened before entering demo; if there is not a single real project, stay in demo */
     async exitDemo() {
       if (!this.demo) return null;
       const back = this.demoReturnPath || this.realPath();

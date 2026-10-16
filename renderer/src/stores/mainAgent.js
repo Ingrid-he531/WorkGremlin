@@ -1,35 +1,37 @@
 /**
- * mainAgent.js —— 主 Agent（Craft Agent）的状态。
+ * mainAgent.js —— state of the main Agent (Craft Agent).
  *
- * 现在跑的是 mock：按 SCRIPT 一段一段往下演，好把控制台的三层信息和五种
- * 视觉状态先做出来。以后接真实 hook 时，把 advance/apply 换成按事件更新即可：
- *   待命   ← 一段时间没有活跃事件
- *   执行中 ← PreToolUse / PostToolUse（第二层写"正在读取 xxx.js"这类）
- *   调度中 ← 检测到 subagent 被调起（第三层写"已委托：xxx"，target 指到那个工位）
+ * Right now it runs a mock: it plays the SCRIPT step by step to get the console's three
+ * layers and five visual states built out first. When the real hook is wired up later,
+ * just swap advance/apply for event-driven updates:
+ *   standby     ← no active events for a while
+ *   running     ← PreToolUse / PostToolUse (the second layer writes things like "reading xxx.js")
+ *   dispatching ← a subagent is detected being summoned (the third layer writes "delegated: xxx", target points at that workstation)
  *
- * 阶段取值见 iso/mainConsole.js 的 PHASES。
+ * Phase values live in PHASES in iso/mainConsole.js.
  *
- * 今天微调：
- *   1) 思考中（thinking）时，屏幕第三层把收到的 prompt 原文顶到最前面显示；
- *   2) 调用工具若是 Bash/Shell 类：**不再**按 await（等待授权）处理 —— 插件既不发
- *      "等授权"通知也不发"授权结束"通知，命令类工具又不发 PostToolUse，一旦标成 await
- *      就再也没有事件能把它清掉（点了 run 还一直显示「等待授权」）。
- *      现在服务端一律报 tool（调用工具 + 实际命令），渲染层也不再按工具名换文案：
- *      屏上第一行与 tooltip 第一行统一写「调用工具」（见 iso/mainConsole.js 的
- *      consolePhaseLabel），操作仍是实际命令，互不串味；
- *   3) 会话停止（setLiveState/applySession 收到 null，或手动 stop）时，先亮出
- *      "任务完成 / 已暂停" 摘要持续 10s，期间无新事件则退回待命(idle)。
- *   4) 2026-10-01：演示脚本不再演「规划中」；`stop()` 亮出的「已暂停」也不再借用
- *      summarize（「汇总中」）相位 —— 这两个相位真机上不产生，已从 PHASES 里去掉
- *      （见 iso/mainConsole.js）。暂停现在就是"待命中 + 操作行写『已暂停』"。
+ * Today's tweaks:
+ *   1) While thinking, the screen's third layer pins the received prompt text to the very front;
+ *   2) If a tool call is Bash/Shell-like: **no longer** treated as await (waiting for authorization) —— the plugin sends
+ *      neither a "waiting for authorization" notification nor an "authorization finished" one, and command-like tools send
+ *      no PostToolUse either, so once marked await nothing can ever clear it (you hit run and it keeps showing "waiting for authorization").
+ *      Now the server always reports tool (tool call + actual command), and the render layer no longer swaps the wording by tool name:
+ *      the screen's first line and the tooltip's first line both say "tool call" (see
+ *      consolePhaseLabel in iso/mainConsole.js), the action stays the actual command, and the two never bleed into each other;
+ *   3) When the session stops (setLiveState/applySession receives null, or a manual stop), first show
+ *      a "task complete / paused" summary for 10s; if no new events arrive, fall back to standby (idle).
+ *   4) 2026-10-01: the demo script no longer plays "planning"; the "paused" that `stop()` shows no longer borrows
+ *      the summarize ("summarizing") phase —— those two phases never occur on the real thing, so they were removed
+ *      from PHASES (see iso/mainConsole.js). Pausing is now just "standby + the action line reading 'paused'".
  */
 
 import { defineStore, acceptHMRUpdate } from 'pinia';
-// 相位文案只有一份实现：屏上第一行与 tooltip 第一行都走 consolePhaseLabel()，改口径只需动那一处。
+// The phase wording has a single implementation: the screen's first line and the tooltip's first line both go through
+// consolePhaseLabel(), so changing the definition only touches that one place.
 import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 import { t } from '../i18n/index.js';
 
-/** 一轮主会话的演示脚本：阶段 / 第二层动作 / 第三层上下文 / 停留时长 / 调度目标工位 */
+/** Demo script for one main session round: phase / second-layer action / third-layer context / dwell time / dispatch target workstation */
 const SCRIPT = [
   { phase: 'idle', action: '', context: ['等待派单'], skill: '', tool: '', prompt: '', ms: 6000 },
   { phase: 'thinking', action: '正在分析你的请求', context: ['任务：重构用户登录模块', '思考：先理清登录链路'], skill: 'reasoning（推理）', tool: '', prompt: '请帮我重构用户登录模块，先理清登录链路', ms: 4200 },
@@ -43,24 +45,25 @@ const SCRIPT = [
   { phase: 'done', action: '任务完成', context: ['任务：重构用户登录模块', '已交付：登录链路重构', '改动 3 个文件'], skill: '', tool: '', prompt: '', ms: 5000 },
 ];
 
-// 命令类工具（Bash / Shell / 终端 …）不再额外提示"需要授权"：既不写进 context，也不改相位文案
-// （见 consolePhaseLabel）—— 写进 context 会顺着 enterDone 的"沿用最后上下文"漏到「任务完成」上。
+// Command-like tools (Bash / Shell / terminal …) no longer add a "needs authorization" hint: it goes neither into
+// context nor into the phase wording (see consolePhaseLabel) —— writing it into context would leak onto "task
+// complete" via enterDone's "reuse the last context".
 
-/** 定时器放在 store 外面：它不属于"状态"，也没必要进 devtools */
+/** The timer lives outside the store: it isn't "state", and there's no need to put it in devtools */
 let timer = null;
 let stopTimer = null;
 
 export const useMainAgentStore = defineStore('mainAgent', {
   state: () => ({
     idx: 0,
-    /** true = 演示脚本正在自动推进。**默认不开**：演示脚本只在演示模式下由视图显式 start()
-     *  （见 IsoOfficeView 的 startDemoScript）；真数据源首屏应当停在待命，等会话 / hook 接管。 */
+    /** true = the demo script is auto-advancing. **Off by default**: the demo script only runs when the view explicitly start()s it in demo mode
+     *  (see startDemoScript in IsoOfficeView); with a real data source the first screen should sit at standby and wait for the session / hook to take over. */
     auto: false,
-    /** true = 状态来自真实会话（插件落盘，阶段是推断的），mock 不推进 */
+    /** true = state comes from a real session (persisted by the plugin, phase is inferred), so the mock does not advance */
     live: false,
-    /** true = 当前由 hook 实时上报驱动（reporter 把 busy/idle/offline/blocked 发给服务端） */
+    /** true = currently driven by live hook reports (the reporter sends busy/idle/offline/blocked to the server) */
     hookLive: false,
-    /** 最近一次 hook 喂进来的成员卡（仅用于 HUD/调试，不直接驱动画法） */
+    /** The most recent member card fed in by the hook (used only for HUD/debugging, does not drive rendering directly) */
     liveMember: null,
     phase: 'idle',
     action: '',
@@ -68,20 +71,20 @@ export const useMainAgentStore = defineStore('mainAgent', {
     tool: '',
     context: [],
     target: null,
-    /** 主 Agent 收到的 prompt 原文（思考中时显示在屏幕） */
+    /** The raw prompt the main Agent received (shown on screen while thinking) */
     prompt: '',
   }),
 
   getters: {
-    /** 交给引擎的那一份：新对象，watch 才收得到变化 */
+    /** The copy handed to the engine: a new object, so watch can see the change */
     snapshot: (s) => ({ phase: s.phase, action: s.action, skill: s.skill, tool: s.tool, context: s.context, target: s.target, prompt: s.prompt }),
-    /** tooltip 第一行：与屏上第一行同源（consolePhaseLabel），调用工具一律显示「调用工具」 */
+    /** Tooltip's first line: same source as the screen's first line (consolePhaseLabel); a tool call always shows "tool call" */
     phaseLabel: (s) => consolePhaseLabel(s),
     phaseColor: (s) => (PHASES[s.phase] || PHASES.idle).color,
   },
 
   actions: {
-    /** 把脚本第 i 步搬到 state 上 */
+    /** Copy step i of the script onto state */
     apply(i = this.idx) {
       this.idx = ((i % SCRIPT.length) + SCRIPT.length) % SCRIPT.length;
       const step = SCRIPT[this.idx];
@@ -89,14 +92,14 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.action = step.action || '';
       this.skill = step.skill || '';
       this.tool = step.tool || '';
-      // 点2：mock 里工具若是 Bash/Shell 类（`bash: npm run build`），相位照旧是 tool，
-      // 文案也照旧是「调用工具」（不再按工具名换「需要授权」），context 保持原样。
+      // Point 2: in the mock, if a tool is Bash/Shell-like (`bash: npm run build`), the phase stays tool
+      // and the wording stays "tool call" (no more swapping in "needs authorization" by tool name); context stays as-is.
       this.context = step.context || [];
       this.target = step.target || null;
       this.prompt = step.prompt || '';
     },
 
-    /** 按当前步的时长排下一步（暂停时不排） */
+    /** Schedule the next step after the current step's dwell time (nothing scheduled while paused) */
     advance() {
       clearTimeout(timer);
       timer = null;
@@ -114,14 +117,14 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 演示模式：把控制台**抢回来**交给脚本。
+     * Demo mode: **take the console back** and hand it to the script.
      *
-     * 与 start() 的区别就在这里：必须先把 live / hookLive 清掉。那两个标志的意思是
-     * "真会话正在接管" —— 演示期间下拉里往往还选着一条真会话，快轮询每 1.5s 就会把它的
-     * 相位喂进来（演示时通常就是「待命中」），于是：
-     *   ① startDemoScript() 被 live 挡住，脚本根本起不来；
-     *   ② 就算起来了，下一步立刻被那条真会话的相位顶掉。
-     * 现象就是"点了演示模式，主 Agent 停在待命不动"。清干净之后由脚本一路演。
+     * This is where it differs from start(): live / hookLive must be cleared first. Those two flags mean
+     * "a real session is taking over" —— during a demo the dropdown usually still has a real session selected,
+     * and the fast poll feeds its phase in every 1.5s (during a demo that's usually "standby"), so:
+     *   ① startDemoScript() is blocked by live and the script never starts;
+     *   ② even if it starts, the next step is immediately overridden by that real session's phase.
+     * The symptom is "you click demo mode and the main Agent sits at standby without moving". Once things are cleared, the script plays all the way through.
      */
     startDemo() {
       this.live = false;
@@ -132,7 +135,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.start();
     },
 
-    /** 手动停止 mock：先亮出"已暂停"摘要，10s 后退回待命 */
+    /** Stop the mock manually: first show a "paused" summary, then fall back to standby after 10s */
     stop() {
       this.auto = false;
       clearTimeout(timer);
@@ -140,7 +143,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
       this.enterPause(t('console.paused'));
     },
 
-    /** 手动跳一步（暂停状态下也能点，用来一个个阶段对着看） */
+    /** Advance one step manually (clickable while paused too, to inspect the phases one by one) */
     next() {
       this.apply(this.idx + 1);
       if (this.auto) this.advance();
@@ -152,28 +155,30 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 用 reporter hook 实时上报的成员卡驱动主控制台。hook 不发事件时 s 传 null，
-     * 这时若之前是 hook 在驱动：先亮出"任务完成"摘要 10s，再退回待命（不直接回脚本）。
+     * Drive the main console from the member card reported live by the reporter hook. When the hook sends
+     * no event, s is null; if the hook was driving before, first show a "task complete" summary for 10s,
+     * then fall back to standby (not straight back to the script).
      *
-     * 阶段映射（hook 的 AGENT_STATES -> 主控制台 PHASES）：
-     *   busy    -> tool  （调用工具 / 干活中）
-     *             命令类工具（Bash/Shell）也一样是 tool：插件不发"等授权 / 授权结束"通知，
-     *             标成 await 就再没有事件能把它清掉。相位文案一律「调用工具」，不按工具名换
-     *             （见 iso/mainConsole.js 的 consolePhaseLabel），action（操作）仍是实际命令。
-     *   blocked -> await（等用户授权；工具与目标走会话落盘的 await 叠加）
-     *             注：await 相位仍然只认服务端给的真值（Notification 等授权 -> await，
-     *             授权结束 -> 回落其它相位），渲染层不自己推断。
-     *   idle / online / offline -> idle（offline 对应"关掉 VS Code 还显示规划中"的修复）
+     * Phase mapping (hook's AGENT_STATES -> main console PHASES):
+     *   busy    -> tool  (tool call / working)
+     *             Command-like tools (Bash/Shell) are tool too: the plugin sends no "waiting for authorization /
+     *             authorization finished" notification, so once marked await nothing can ever clear it. The phase
+     *             wording is always "tool call", never swapped by tool name (see consolePhaseLabel in
+     *             iso/mainConsole.js), and action stays the actual command.
+     *   blocked -> await (waiting for user authorization; the tool and target come from the session's persisted await overlay)
+     *             Note: the await phase still only trusts the true value from the server (an authorization Notification -> await,
+     *             authorization finished -> fall back to another phase); the render layer does not infer it itself.
+     *   idle / online / offline -> idle (offline corresponds to the fix for "close VS Code and it still shows planning")
      * @param {null|{phase:string, action?:string, context?:string[], target?:any, prompt?:string}} s
      */
     setLiveState(s) {
-      // 收尾概要（done「任务完成」/ cancelled「任务取消」）展示期间，忽略回落的
-      // idle/offline/null，等 10s 定时器退回待命；新的活跃事件（tool/thinking…）仍会覆盖它。
+      // While the wrap-up summary (done "task complete" / cancelled "task cancelled") is showing, ignore the falling-back
+      // idle/offline/null and wait for the 10s timer to return to standby; new active events (tool/thinking…) still override it.
       if ((this.phase === 'done' || this.phase === 'cancelled') && (!s || s.phase === 'idle' || s.phase === 'offline')) return;
       if (!s) {
         if (this.hookLive) {
           this.hookLive = false;
-          // 任务完成：亮出"任务完成"概要（沿用最后上下文：本次改动的文件等），10s 后退回待命
+          // Task complete: show the "task complete" summary (reusing the last context: files changed this round, etc.), then fall back to standby after 10s
           this.enterDone(t('console.done_wait'), this.context && this.context.length ? this.context.slice() : [t('console.this_task_done')]);
         }
         this.liveMember = null;
@@ -184,14 +189,14 @@ export const useMainAgentStore = defineStore('mainAgent', {
       timer = null;
       this.hookLive = true;
       this.liveMember = s;
-      // s.phase 已是 UI 相位（thinking / tool / await / idle …）或 hook 原始状态（busy / blocked）。
-      // 之前这里把 thinking / tool 等非 busy/blocked 一律归成 idle，导致：
-      //  - UserPromptSubmit 进入的「思考中」被吞成「待命」；
-      //  - 正在调工具时相位被压成「待命」，action 却还留着上一条工具命令
-      //    （图上"待命中却显示 Bash diff"就是这么来的）。
-      // 相位一律采用服务端映射好的真值：busy -> tool、blocked -> await。
-      // 命令类工具（Bash）不再在这里被改写成 await —— 插件没有"授权结束"通知，
-      // 改写后没有任何事件能把它清掉，主控制台会一直卡在「等待授权」。
+      // s.phase is already a UI phase (thinking / tool / await / idle …) or a raw hook state (busy / blocked).
+      // This used to lump thinking / tool and other non-busy/blocked states into idle, which caused:
+      //  - the "thinking" entered by UserPromptSubmit to be swallowed into "standby";
+      //  - the phase to be squashed to "standby" while a tool was running, while action still held the previous tool command
+      //    (that's where "shows standby but displays a Bash diff" on the map came from).
+      // The phase always takes the true value mapped by the server: busy -> tool, blocked -> await.
+      // Command-like tools (Bash) are no longer rewritten to await here —— the plugin has no "authorization finished" notification,
+      // so after rewriting nothing could clear it and the main console would stay stuck on "waiting for authorization".
       const hookPhase = s.phase || 'idle';
       let phase;
       if (hookPhase === 'busy') {
@@ -199,22 +204,22 @@ export const useMainAgentStore = defineStore('mainAgent', {
       } else if (hookPhase === 'blocked') {
         phase = 'await';
       } else if (PHASES[hookPhase] && hookPhase !== 'idle' && hookPhase !== 'online' && hookPhase !== 'offline' && hookPhase !== 'unreported' && hookPhase !== 'done' && hookPhase !== 'cancelled') {
-        // thinking / tool / await / dispatch / waiting：照单全收
-        // done / cancelled 不走 setLiveState —— 收尾由 watch 的 enterDone/enterCancelled 路径
-        // （带 10s stopTimer）管理，consoleBase 不该持续喂回 done 否则 stopTimer 到期又弹回来
+        // thinking / tool / await / dispatch / waiting: accept as-is
+        // done / cancelled do not go through setLiveState —— the wrap-up is managed by watch's
+        // enterDone/enterCancelled path (with the 10s stopTimer); consoleBase should not keep feeding done back, or it would pop up again when stopTimer expires
         phase = hookPhase;
       } else if (hookPhase === 'idle' || hookPhase === 'online' || hookPhase === 'done' || hookPhase === 'cancelled') {
-        // done/cancelled 从 consoleBase 喂来时当 idle 处理：stopTimer 已管了 10s 展示期，
-        // 到期后该回待命，不能被 consoleBase 的 taskState='done' 持续顶回「任务完成」。
-        // idle 是当前选中会话的明确状态；是否仍有任务在跑由该会话自己的 taskState 决定，
-        // 不能沿用此前的 thinking/tool，也不能借同楼层另一条会话的任务状态。
+        // done/cancelled fed in from consoleBase is treated as idle: stopTimer already owns the 10s display window,
+        // and once it expires the console should return to standby; consoleBase's taskState='done' must not keep pushing it back to "task complete".
+        // idle is the definite state of the currently selected session; whether a task is still running is decided by that session's own taskState,
+        // and it must not reuse the earlier thinking/tool, nor borrow another session's task state from the same floor.
         phase = 'idle';
       } else {
-        phase = 'idle'; // offline / unreported / 未知：确实没在干活
+        phase = 'idle'; // offline / unreported / unknown: genuinely not working
       }
       this.phase = phase;
-      // 回到「思考中」的那一口：保留上一口的状态文案（刚在调的工具 / 用户的 prompt），别清空成空白；
-      // 真正待命（idle）才清空。
+      // Coming back to "thinking": keep the previous status wording (the tool just being called / the user's prompt), don't blank it out;
+      // only genuine standby (idle) clears it.
       if (phase === 'thinking' && (hookPhase === 'idle' || hookPhase === 'online')) {
         this.action = s.action || this.action;
         this.context = Array.isArray(s.context) && s.context.length ? s.context : this.context;
@@ -230,17 +235,17 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 会话接管：下拉里选了某个会话，控制台就显示**这个会话**的状态。
-     * 真源是插件落盘，阶段是按 runtime + 待办 + 文件改动推出来的（inferred），
-     * 所以 mock 的自动推进要停下来，别跟真数据打架。会话取消（s=null）时：
-     * 先亮出"任务完成"摘要 10s，再退回待命。
-     * @param {null|{phase?:string, action?:string, context?:string[], prompt?:string}} s 会话；null = 交还给演示脚本
+     * Session takeover: once a session is selected in the dropdown, the console shows **that session's** state.
+     * The source of truth is the plugin's persisted data, and the phase is derived from runtime + todos + file changes (inferred),
+     * so the mock's auto-advance has to stop and not fight the real data. When the session is cancelled (s=null):
+     * first show a "task complete" summary for 10s, then fall back to standby.
+     * @param {null|{phase?:string, action?:string, context?:string[], prompt?:string}} s session; null = hand back to the demo script
      */
     applySession(s) {
       if (!s) {
-        if (!this.live) return; // 本来就在跑脚本，别打搅
+        if (!this.live) return; // the script is already running, don't interrupt
         this.live = false;
-        // 会话取消：亮出"任务完成"概要（沿用最后上下文），10s 后退回待命
+        // Session cancelled: show the "task complete" summary (reusing the last context), then fall back to standby after 10s
         this.enterDone(t('console.done_wait'), this.context && this.context.length ? this.context.slice() : [t('console.this_task_done')]);
         return;
       }
@@ -248,9 +253,9 @@ export const useMainAgentStore = defineStore('mainAgent', {
       clearTimeout(timer);
       timer = null;
       this.live = true;
-      // done/cancelled 不直接设：切会话回来时 consoleBase 从 sel.taskState='done'
-      // 喂回 {phase:'done'}，直接设会没有 stopTimer → 永远卡「任务完成」。
-      // 收尾展示由 watch 的 enterDone/enterCancelled 路径（带 stopTimer）独占。
+      // done/cancelled are not set directly: switching back to a session, consoleBase feeds back
+      // {phase:'done'} from sel.taskState='done', and setting it directly would skip stopTimer → stuck on "task complete" forever.
+      // The wrap-up display is owned solely by watch's enterDone/enterCancelled path (with stopTimer).
       const sp = s.phase;
       this.phase = (sp === 'done' || sp === 'cancelled') ? 'idle' : (sp || 'idle');
       this.action = s.action || '';
@@ -262,35 +267,35 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 任务完成：亮出"任务完成"状态（done 阶段）并带上完成概要（context），
-     * 持续 10s；期间若有新事件（setLiveState/applySession 收到非 null）会被覆盖，
-     * 否则 10s 后退回待命(idle)。
-     * @param {string} summary 第二层动作文案（默认"任务完成 · 等待下一步"）
-     * @param {string[]} [context] 第三层完成概要（如本次改动的文件、已交付的子任务）
+     * Task complete: show the "task complete" state (done phase) with a completion summary (context),
+     * for 10s; if a new event arrives (setLiveState/applySession receives non-null) it is overridden,
+     * otherwise it falls back to standby (idle) after 10s.
+     * @param {string} summary second-layer action wording (defaults to "task complete · waiting for the next step")
+     * @param {string[]} [context] third-layer completion summary (e.g. files changed this round, sub-tasks delivered)
      */
     enterDone(summary = t('console.done_wait'), context = []) {
       this.enterFinish('done', summary || t('console.done_wait'), context);
     },
 
     /**
-     * 任务取消：用户按了 ESC / 停止，这一轮没干完就被掐掉。
+     * Task cancelled: the user pressed ESC / stop, and this round was cut off before finishing.
      *
-     * 与 enterDone 唯一的区别是相位（cancelled，红色「任务取消」）——
-     * 同样亮 10s 再退回待命，期间的覆盖规则也完全一致（见 setLiveState 那一处守卫）。
-     * @param {string} summary 第二层动作文案
-     * @param {string[]} [context] 第三层概要：取消前改过的文件；一个都没动就写「没有输出」
+     * The only difference from enterDone is the phase (cancelled, red "task cancelled") ——
+     * it likewise shows for 10s then falls back to standby, with the exact same override rules (see that one guard in setLiveState).
+     * @param {string} summary second-layer action wording
+     * @param {string[]} [context] third-layer summary: files changed before the cancel; if none changed, writes "no output"
      */
     enterCancelled(summary = t('console.cancelled_wait'), context = []) {
       this.enterFinish('cancelled', summary || t('console.cancelled_wait'), context);
     },
 
     /**
-     * 收尾相位的共同部分（done / cancelled 都走这里）：停掉 mock、清掉工具名与 prompt、
-     * 亮 10s 再退回待命。
-     * 收尾相位把工具名与 prompt 一起清掉：这轮已经结束，别把上一轮的工具名留在状态里。
-     * @param {'done'|'cancelled'} phase 收尾相位
-     * @param {string} summary 第二层动作文案
-     * @param {string[]} context 第三层概要
+     * The common part of the wrap-up phases (both done / cancelled go here): stop the mock, clear the tool name and prompt,
+     * show for 10s then fall back to standby.
+     * The wrap-up phase clears the tool name along with the prompt: this round is over, so don't leave the previous round's tool name in state.
+     * @param {'done'|'cancelled'} phase wrap-up phase
+     * @param {string} summary second-layer action wording
+     * @param {string[]} context third-layer summary
      */
     enterFinish(phase, summary, context = []) {
       clearTimeout(stopTimer);
@@ -308,10 +313,10 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 没有会话（切到了一个没有活跃会话的楼层）：控制台回到待命。
-     * 与 applySession(null)（会话取消 → 亮"任务完成"摘要）分开：空楼层跟"上一层收工"
-     * 没关系，弹"任务完成"是拿别人的收尾信号冒充这层的状态。
-     * @param {string[]} [context] 待命时屏上第三层显示的话
+     * No session (switched to a floor with no active session): the console returns to standby.
+     * Kept separate from applySession(null) (session cancelled → show a "task complete" summary): an empty floor has
+     * nothing to do with "the previous floor wrapped up", and popping "task complete" would pass off someone else's wrap-up signal as this floor's state.
+     * @param {string[]} [context] the text shown on the screen's third layer while on standby
      */
     enterIdle(context = []) {
       this.auto = false;
@@ -332,11 +337,11 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * 手动暂停演示：亮出"已暂停"提示，持续 10s 后退回待命。
+     * Pause the demo manually: show a "paused" hint, then fall back to standby after 10s.
      *
-     * 相位用 idle（「待命中」）而不是另造一个：暂停就是"没在干活"，屏上第一行写「待命中」
-     * 是对的；"已暂停"这三个字写在 tooltip 的操作行上。以前借 summarize（「汇总中」）
-     * 当暂停的相位，看着像真有个"汇总"阶段（2026-10-01 去掉，见 iso/mainConsole.js 的 PHASES）。
+     * The phase is idle ("standby") rather than a new one of its own: pausing means "not working", so the screen's first line
+     * reading "standby" is right; the words "paused" go on the tooltip's action line. It used to borrow summarize ("summarizing")
+     * as the pause phase, which looked like there really was a "summarizing" stage (removed 2026-10-01, see PHASES in iso/mainConsole.js).
      */
     enterPause(summary = t('console.paused')) {
       clearTimeout(stopTimer);
@@ -357,8 +362,8 @@ export const useMainAgentStore = defineStore('mainAgent', {
 
 export { SCRIPT as MAIN_AGENT_SCRIPT };
 
-// 让 store 支持 HMR：改本文件时 Pinia 会热替换 store 实例的 actions/state，
-// 否则运行中的实例仍是旧版本（例如没有新加的 enterDone），调用即报错。
+// Let the store support HMR: when this file changes, Pinia hot-swaps the store instance's actions/state,
+// otherwise the running instance stays on the old version (e.g. missing the newly added enterDone) and calls error out.
 if (import.meta.hot) {
   acceptHMRUpdate(useMainAgentStore, import.meta.hot);
 }

@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { DEFAULTS } from '@workgremlin/shared';
 
-/** 对话记录窗口：全量消息流 + 过滤 + 关键字搜索 + 自动跟随滚动 */
+/** Conversation log window: full message stream + filters + keyword search + auto-follow scroll */
 export const useMessageStore = defineStore('messages', {
   state: () => ({
     messages: [],
@@ -12,7 +12,7 @@ export const useMessageStore = defineStore('messages', {
   }),
 
   getters: {
-    /** 按发送者 + 时间过滤 + 关键字搜索（M0 前端过滤；M2 切到服务端 FTS5 trigram） */
+    /** Filter by sender + time + keyword search (M0 filters on the frontend; M2 moves to server-side FTS5 trigram) */
     filtered() {
       const kw = this.keyword.trim().toLowerCase();
       const members = this.filters.members || [];
@@ -34,7 +34,7 @@ export const useMessageStore = defineStore('messages', {
 
   actions: {
     setSnapshot(list) {
-      // 服务端返回的是时间倒序，前端统一按时间正序渲染（新消息在底部，便于自动跟随）
+      // The server returns newest-first; the frontend always renders oldest-first (new messages at the bottom, for easy auto-follow)
       this.messages = (list || []).slice().sort((a, b) => a.tsMs - b.tsMs || a.id - b.id);
       if (this.messages.length > DEFAULTS.MESSAGE_WINDOW) {
         this.messages = this.messages.slice(-DEFAULTS.MESSAGE_WINDOW);

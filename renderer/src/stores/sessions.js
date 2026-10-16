@@ -26,45 +26,47 @@ import { t } from '../i18n/index.js';
 import { useProjectStore } from './project';
 
 const POLL_MS = 5_000;
-/** 定时器放在 store 外面：它不是状态 */
+/** The timer lives outside the store: it is not state */
 let timer = null;
 
-// 相位文案与主控制台同源（中英两套都在 i18n 词条表里），别在这里再维护一份
+// Phase labels share their source with the main console (both the zh and en sets live in the i18n table) — do not keep a second copy here
 const phaseLabel = (p) => consolePhaseLabel({ phase: p });
 /**
- * 下拉里的短 id：**会话 id 的前 8 位**。
- * 不再拿落盘定位符（`x.id`，CLI 楼层它是 transcript 的相对路径）去猜文件名 —— 3F Codex 的文件名是
- * `rollout-<时间戳>-<会话id>.jsonl`，取前 8 位永远得到 `rollout-`，分不出谁是谁。
- * 相位就是从**会话**来的，下拉显示的也该是会话 id。
+ * The short id in the dropdown: **the first 8 chars of the session id**.
+ * No longer guess a filename from the on-disk locator (`x.id`, which for CLI floors is the
+ * transcript's relative path) —— the 3F Codex filename is
+ * `rollout-<timestamp>-<session-id>.jsonl`, so the first 8 chars always yield `rollout-` and you
+ * cannot tell who is who. The phase comes from the **session**, so the dropdown should show the session id too.
  */
 const shortId = (sessionId) => String(sessionId || '').slice(0, 8);
 
 export const useSessionStore = defineStore('sessions', {
   state: () => ({
-    /** 楼层：[{ id, name, installed, activeCount, sessions: [...] }] */
+    /** Floors: [{ id, name, installed, activeCount, sessions: [...] }] */
     floors: [],
-    /** 所有楼层的活跃会话（扁平，按楼层顺序） */
+    /** Active sessions across all floors (flat, in floor order) */
     sessions: [],
     selectedFloor: '',
     selectedId: '',
     /**
-     * 用户切到了一个**没有活跃会话**的楼层。
-     * 这层没人在干活 → 办公室要跟着清空（屋里的人、主控制台、对话都不该再挂着上一层工程的）；
-     * 一旦这层出现会话（或用户选了某条会话）就自动置回 false。
-     * 只在用户主动切楼层时置位：初始加载 / 演示模式下没有会话也不该把办公室清掉。
+     * The user switched to a floor with **no active sessions**.
+     * No one is working on this floor → the office must clear along with it (the people in the room,
+     * the main console, and the conversation should not still be showing the previous project's);
+     * once a session appears on this floor (or the user picks one) it automatically resets to false.
+     * Only set on a user-initiated floor switch: on initial load / in demo mode, no sessions must not clear the office.
      */
     floorEmpty: false,
-    /** 服务端建议的楼层（第一个有活跃会话的层） */
+    /** The server-suggested floor (the first floor with active sessions) */
     defaultFloor: '',
-    /** 空表原因：no-storage / no-open-project */
+    /** Why the table is empty: no-storage / no-open-project */
     reason: '',
-    /** 会话多久没事件会被移除（ms） */
+    /** How long a session with no events survives before removal (ms) */
     timeoutMs: 60 * 60_000,
     loaded: false,
   }),
 
   getters: {
-    /** 当前楼层的会话 */
+    /** The current floor's sessions */
     floorSessions: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
       return f ? f.sessions : [];
@@ -91,8 +93,10 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * 当前楼层接纳的客户端（服务端 floors[].clients 原样透传；身份恒为楼层基名，如 1F 的 ['codebuddy']）。
-     * /reporter-phase 按它过滤相位；楼层 ↔ client 的对应关系以服务端 floors 为准，这里不重复列举。
+     * The clients the current floor accepts (the server's floors[].clients passed through as-is; the
+     * identity is always the floor base name, e.g. 1F's ['codebuddy']).
+     * /reporter-phase filters phases by it; the floor ↔ client mapping is authoritative in the server's
+     * floors, so it is not repeated here.
      */
     selectedClients: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
@@ -102,28 +106,30 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * 当前楼层的客户端（= clients[0]，楼层基名，如 codebuddy / kilo）。
-     * 办公室按它过滤成员/幽灵（成员卡上的 client 由服务端打，见 server 的 members.client）——按基名认。
+     * The current floor's client (= clients[0], the floor base name, e.g. codebuddy / kilo).
+     * The office filters members/ghosts by it (the client on a member card is stamped by the server,
+     * see the server's members.client) —— match by base name.
      */
     selectedClient: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
       return (f && f.client) || '';
     },
 
-    /** 下拉里没东西可挑时的占位文案（按当前楼层判定） */
+    /** Placeholder text when the dropdown has nothing to pick (decided by the current floor) */
     emptyLabel: (s) => (s.sessions.length === 0 ? t('session.empty_no_project') : t('session.empty_no_active')),
 
     /**
-     * 下拉选项：直接列出**当前选中楼层**的所有活跃会话（扁平，不显示楼层标题、
-     * 也不区分"别的工程"——现在没有"当前打开的工程"这个概念，所有会话一视同仁）。
-     * 切楼层时自然跟着换一批。
+     * Dropdown options: list all active sessions of the **currently selected floor** directly (flat,
+     * no floor headings, and no distinction of "another project" —— there is no concept of a "currently
+     * open project" now, all sessions are treated the same).
+     * Switching floors naturally swaps the set along with it.
      */
     options: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
       if (!f) return [];
       return f.sessions.map((x) => {
-        // 来源标识:后端 source 已按 form 派生好(plugin/cli/ide),前端直接用
-        // plugin → Plugin-,cli → CLI-,ide → IDE-,空 → 无前缀
+        // Source tag: the backend's source is already derived from form (plugin/cli/ide), use it as-is
+        // plugin → Plugin-, cli → CLI-, ide → IDE-, empty → no prefix
         const src = String(x.source || '').toLowerCase();
         const tag = src === 'plugin' ? 'Plugin' : src === 'cli' ? 'CLI' : src === 'ide' ? 'IDE' : '';
         const proj = x.project || t('sessions.unknown_project');
@@ -139,10 +145,10 @@ export const useSessionStore = defineStore('sessions', {
     total: (s) => s.sessions.length,
 
     /**
-     * 选中的会话值不值得"实时"对待。
-     * 只有**当前工程**里、**插件还认**（有 runtime）的会话才是实时的；
-     * 别的工程 / 只剩化石数据的会话，屋里的人一律按离线显示（不编造状态）。
-     * 一个会话都没选（下拉为空）→ 不动屋里现有的显示。
+     * Whether the selected session is worth treating as "live".
+     * Only sessions in the **current project** that the **plugin still recognizes** (has a runtime) are live;
+     * sessions from another project / with only fossil data show everyone in the room as offline (no invented state).
+     * No session selected (empty dropdown) → leave the room's current display untouched.
      */
     live: (s) => {
       const x = s.sessions.find((y) => y.id === s.selectedId);
@@ -161,11 +167,11 @@ export const useSessionStore = defineStore('sessions', {
         if (!data || !data.ok) return;
         this.applySnapshot(data);
       } catch {
-        /* 拉不到就留着上一次的列表，别把下拉闪成空 */
+        /* If the fetch fails, keep the previous list; do not flash the dropdown empty */
       }
     },
 
-    /** 应用一份会话快照（HTTP 轮询与 WS 实时推送共用），并修正当前楼层 / 会话选择 */
+    /** Apply a session snapshot (shared by the HTTP poll and the live WS push), and fix up the selected floor / session */
     applySnapshot(data) {
       if (!data || !data.ok) return;
       this.floors = data.floors || [];
@@ -184,19 +190,19 @@ export const useSessionStore = defineStore('sessions', {
         this.selectedFloor = this.defaultFloor || this.floors.find((f) => f.installed)?.id || '';
       }
 
-      // 选中的会话掉了（超时剔除 / 换楼层）就在当前层重新落一个
+      // The selected session dropped (timed out / floor changed): pick a new one on the current floor
       const list = this.floorSessions;
       if (this.selectedId && !list.some((x) => x.id === this.selectedId)) this.selectedId = '';
       if (!this.selectedId && list.length) {
-        // current 已是"全局唯一"的当前会话（仅当前真实活动工程里那条），优先选它
+        // current is already the "globally unique" current session (the one in the current truly active project), prefer it
         const pick = list.find((x) => x.current) || list[0];
         this.selectedId = pick.id;
       }
-      // 这层终于有会话了（刚才还是空的）→ 办公室恢复正常显示
+      // This floor finally has sessions (it was empty before) → the office returns to normal display
       if (this.selectedId) this.floorEmpty = false;
     },
 
-    /** 选中某个会话：楼层跟着它走（会话本来就按楼层分组） */
+    /** Select a session: the floor follows it (sessions are already grouped by floor) */
     select(id) {
       this.selectedId = id || '';
       this.floorEmpty = false;
@@ -205,9 +211,10 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * 切楼层：下拉跟着换一批；**这一层没有活跃会话时办公室一并清空** ——
-     * 那层没人在干活，屋里要是还站着上一层工程的小怪物、顶上还挂着上一个工程的名字，
-     * 看着就像没切换（会话 / 工程 / 对话都还是上一层的）。
+     * Switch floor: the dropdown swaps along with it; **when this floor has no active sessions the office
+     * clears as well** —— no one is working on that floor, and if the room still held the previous
+     * project's gremlins while the previous project's name hung on top, it would look like the switch
+     * never happened (session / project / conversation all still from the previous floor).
      */
     selectFloor(id) {
       this.selectedFloor = id || '';
@@ -218,11 +225,12 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * @param {{port?:number, token?:string, fallback?:boolean}} info 只当首轮兜底
+     * @param {{port?:number, token?:string, fallback?:boolean}} info only used as the first-round fallback
      *
-     * 不能把启动那一刻的 info **吃死在闭包里**：server 重启会换 token（见 api/ws.js），
-     * 吃死旧 token 的轮询从此一路 401，界面就停在旧数据上不再更新
-     * （实测：跑着的任务在任务/会话表里再也不出现）。所以每轮都取当前的 serverInfo。
+     * Do not **freeze the info captured at startup into the closure**: the server swaps its token on
+     * restart (see api/ws.js), and a poll frozen on the old token then 401s forever, leaving the UI
+     * stuck on stale data and no longer updating
+     * (observed: a running task never reappears in the task/session tables). So take the current serverInfo every round.
      */
     startPolling(info = {}) {
       this.stopPolling();

@@ -1,31 +1,31 @@
 /**
- * officeLayout —— 全屏办公室场景的几何与寻路。
+ * officeLayout —— geometry and pathfinding for the full-screen office scene.
  *
- * 坐标约定：场景 1600×900，屏幕上方 = 办公室北侧（离镜头远），下方 = 南侧（离镜头近）。
- * 因此 y 越大越"靠近镜头"，后画的压住先画的。
+ * Coordinate convention: scene is 1600×900, screen top = office north side (far from camera), bottom = south side (near camera).
+ * So a larger y is "closer to the camera", and whatever is drawn later covers what was drawn before.
  *
- * 分区：
- *   y 0..153     后墙 + 窗
- *   y 153..210   北过道（走道）
- *   y 210..345   A 排工位（人在北、桌子在南，桌子挡住下半身 = 坐着）
- *   y 345..500   中过道
- *   y 500..635   B 排工位
- *   y 635..900   前区：茶水台 / 文印区（前过道 y=830）
- *   x 1100..1560 会议室（玻璃房）
+ * Zones:
+ *   y 0..153     back wall + windows
+ *   y 153..210   north corridor (walkway)
+ *   y 210..345   row A workstations (person to the north, desk to the south; the desk covers the lower body = seated)
+ *   y 345..500   middle corridor
+ *   y 500..635   row B workstations
+ *   y 635..900   front area: pantry counter / print area (front corridor y=830)
+ *   x 1100..1560 meeting room (glass room)
  *
- * 精灵只在过道节点上移动（BFS 最短路），所以不会穿桌子。
+ * Sprites only move along corridor nodes (BFS shortest path), so they never walk through desks.
  */
 
 export const SCENE = { w: 1600, h: 900 };
 
-/** 两排工位的分区顶部 y（A 排在上） */
+/** Zone top y of both workstation rows (row A on top) */
 export const ROW = { A: 210, B: 500 };
-/** 每个工位单元左上角 x（单元宽 280） */
+/** x of each workstation cell's top-left corner (cell width 280) */
 export const DESK_X = [80, 380, 680];
-/** 精灵在场景里的尺寸（对应 GremlinSprite 64 坐标系放大约 2 倍） */
+/** Sprite size in the scene (roughly 2× the GremlinSprite 64 coordinate system) */
 export const SPRITE_SCALE = 2.05;
 
-/** 单个工位的所有几何（局部：x=单元左边，p=分区顶部） */
+/** All geometry for one workstation (local: x = cell left edge, p = zone top) */
 export function deskUnit(x, p) {
   return {
     rail: { x: x + 8, y: p - 6, w: 264, h: 7 },
@@ -58,13 +58,13 @@ export function deskUnit(x, p) {
   };
 }
 
-/** 6 个工位（前 3 个 A 排，后 3 个 B 排） */
+/** 6 workstations (first 3 in row A, last 3 in row B) */
 export const DESKS = [
   ...DESK_X.map((x, i) => ({ id: `A${i}`, row: 'A', index: i, ...deskUnit(x, ROW.A) })),
   ...DESK_X.map((x, i) => ({ id: `B${i}`, row: 'B', index: i + 3, ...deskUnit(x, ROW.B) })),
 ];
 
-/** 会议室 */
+/** Meeting room */
 export const MEETING = {
   x: 1100,
   y: 153,
@@ -77,7 +77,7 @@ export const MEETING = {
   table: { x: 1160, y: 360, w: 340, h: 110, rx: 55 },
   whiteboard: { x: 1215, y: 175, w: 250, h: 100 },
   clock: { cx: 1512, cy: 198, r: 18 },
-  /** 6 个座位：4 个在长桌北侧，2 个在两端 */
+  /** 6 seats: 4 on the north side of the long table, 2 at the two ends */
   seats: [
     { x: 1195, y: 380 },
     { x: 1290, y: 380 },
@@ -88,7 +88,7 @@ export const MEETING = {
   ],
 };
 
-/** 前区：茶水台 + 文印区 */
+/** Front area: pantry counter + print area */
 export const LOUNGE = {
   counter: { x: 40, y: 690, w: 260, h: 80 },
   counterTop: { x: 40, y: 682, w: 260, h: 10 },
@@ -108,14 +108,14 @@ export const LOUNGE = {
   ],
 };
 
-/** 后墙窗户 */
+/** Back wall windows */
 export const WINDOWS = [
   { x: 90, y: 40, w: 260, h: 80 },
   { x: 420, y: 40, w: 260, h: 80 },
   { x: 750, y: 40, w: 260, h: 80 },
 ];
 
-/** 精灵可以去的"地点"（不含工位，工位即 DESKS[i].seat） */
+/** "Places" a sprite can go to (workstations excluded —— those are DESKS[i].seat) */
 export const PLACES = {
   coffee: { x: 170, y: 800 },
   printer: { x: 935, y: 810 },
@@ -123,13 +123,13 @@ export const PLACES = {
 };
 
 /* ------------------------------------------------------------------ *
- * 临时成员（幽灵）的空域
+ * Airspace for temporary members (ghosts)
  *
- * 幽灵没有工位，也不走路网——它们飘在窗户下沿（y=120）与隔断顶（y=210）
- * 之间的那条空中带里，所以不会挡住坐着的人（人头顶 y≈183 在更下方）。
+ * Ghosts have no workstation and don't use the path network —— they drift in the air band between the window
+ * sill (y=120) and the partition top (y=210), so they never block seated people (head top y≈183 is lower down).
  * ------------------------------------------------------------------ */
 export const GHOST = {
-  /** 悬浮锚点：y 是"下摆"所在高度，头顶在 y - 51 * GHOST_SCALE */
+  /** Hover anchors: y is the height of the "hem", head top at y - 51 * GHOST_SCALE */
   anchors: [
     { x: 300, y: 240 },
     { x: 600, y: 240 },
@@ -138,15 +138,15 @@ export const GHOST = {
     { x: 750, y: 253 },
     { x: 150, y: 235 },
   ],
-  /** 会议室上空（集合开会时飘过来旁听） */
+  /** Above the meeting room (drift over to sit in when a meeting is called) */
   meeting: { x: 1200, y: 360 },
 };
 
-/** 幽灵比坐着的精灵略小，视觉上更轻、更远 */
+/** Ghosts are slightly smaller than seated sprites —— visually lighter and further away */
 export const GHOST_SCALE = 1.7;
 
 /* ------------------------------------------------------------------ *
- * 过道路网：精灵只在节点之间走，避免穿过桌子
+ * Corridor network: sprites only walk between nodes, so they never cut through desks
  * ------------------------------------------------------------------ */
 
 const N = {
@@ -191,19 +191,19 @@ MEETING.seats.forEach((s, i) => {
 });
 
 const EDGES = [
-  // 北过道 / 中过道 / 前过道
+  // North corridor / middle corridor / front corridor
   ['N30', 'N180'], ['N180', 'N370'], ['N370', 'N480'], ['N480', 'N670'], ['N670', 'N780'], ['N780', 'N1020'],
   ['M30', 'M180'], ['M180', 'M370'], ['M370', 'M480'], ['M480', 'M670'], ['M670', 'M780'], ['M780', 'M1020'],
   ['F30', 'F170'], ['F170', 'F370'], ['F370', 'F670'], ['F670', 'F935'], ['F935', 'F1020'], ['F1020', 'F1225'],
-  // 竖向连接（桌子之间的空档）
+  // Vertical links (the gaps between desks)
   ['N30', 'M30'], ['M30', 'F30'],
   ['N370', 'M370'], ['M370', 'F370'],
   ['N670', 'M670'], ['M670', 'F670'],
   ['N1020', 'M1020'], ['M1020', 'F1020'],
-  // 工位：从过道拐进座位
+  // Workstations: turn off the corridor into the seat
   ['N180', 'SA0'], ['N480', 'SA1'], ['N780', 'SA2'],
   ['M180', 'SB0'], ['M480', 'SB1'], ['M780', 'SB2'],
-  // 茶水台 / 打印机 / 会议室门口
+  // Pantry counter / printer / meeting room door
   ['F170', 'COFFEE'], ['F935', 'PRINTER'], ['F1225', 'DOOR'],
 ];
 MEETING.seats.forEach((_, i) => EDGES.push(['DOOR', `MS${i}`]));
@@ -218,12 +218,12 @@ const ADJ = (() => {
   return m;
 })();
 
-/** 调试用：所有路网节点坐标（画出来能看出精灵走的路线合不合理） */
+/** Debug use: all path-network node coordinates (draw them to see whether the routes sprites take make sense) */
 export const GRAPH_POINTS = Object.values(N);
 
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
-/** 离给定点最近的过道节点名 */
+/** Name of the corridor node nearest to a given point */
 export function nearestNode(pt) {
   let best = null;
   let bestD = Infinity;
@@ -237,7 +237,7 @@ export function nearestNode(pt) {
   return best;
 }
 
-/** 广度优先：返回节点名数组（含起点终点），找不到返回 null */
+/** Breadth-first: returns an array of node names (including start and end), or null if not found */
 function bfs(from, to) {
   if (from === to) return [from];
   const prev = new Map([[from, null]]);
@@ -263,15 +263,15 @@ function bfs(from, to) {
 }
 
 /**
- * 规划路径：从任意点走到任意点，返回途经点数组（含精确起终点）。
- * 先在路网上找最近节点，走最短路，再补上首尾的实际坐标。
+ * Plan a path: walk from any point to any point, return the waypoint array (with exact start and end).
+ * First find the nearest nodes on the network, take the shortest path, then fill in the real start and end coordinates.
  */
 export function route(from, to) {
   const a = nearestNode(from);
   const b = nearestNode(to);
   const path = bfs(a, b) || [];
   const pts = path.map((k) => ({ ...N[k] }));
-  // 起点/终点用真实坐标替换掉"最近节点"，避免瞬移
+  // Replace the "nearest node" with the real coordinates at the start/end to avoid teleporting
   if (pts.length) {
     if (dist(pts[0], from) > 1) pts.unshift({ ...from });
     else pts[0] = { ...from };
