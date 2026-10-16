@@ -30,7 +30,6 @@ const { createCouncilRouter } = require('./http/routes/council');
 const { createCouncilOrchestrator } = require('./council/orchestrator');
 const { requireToken } = require('./http/auth');
 const { createDemo } = require('./demo');
-const { createLifecycle } = require('./lifecycle');
 const { setBackend: setRegistryBackend } = require('./sessionRegistry');
 const { createPoller } = require('./poller');
 const config = require('./config');
@@ -90,6 +89,46 @@ function isLoopbackOrigin(origin) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Server lifecycle hooks: a tiny registry that replaces the hand-written chaining in start()/close()
+ * with explicit registration, run in registration order.
+ *   - onWorkspaceSwitch: fires after every project switch (restore / manual switch / demo switch all
+ *     go through workspace.setOnSwitch -> afterWorkspaceSwitch)
+ *   - onClose: fires before the server closes (for resources other than timers)
+ * An error inside a hook must not block the other hooks, hence the one-by-one try/catch.
+ */
+function createLifecycle() {
+  const switchHooks = [];
+  const closeHooks = [];
+
+  return {
+    onWorkspaceSwitch(fn) {
+      switchHooks.push(fn);
+    },
+    onClose(fn) {
+      closeHooks.push(fn);
+    },
+    afterWorkspaceSwitch() {
+      for (const fn of switchHooks) {
+        try {
+          fn();
+        } catch (err) {
+          log.warn('[workgremlin] afterWorkspaceSwitch 钩子失败：', err && err.message);
+        }
+      }
+    },
+    beforeClose() {
+      for (const fn of closeHooks) {
+        try {
+          fn();
+        } catch (err) {
+          log.warn('[workgremlin] beforeClose 钩子失败：', err && err.message);
+        }
+      }
+    },
+  };
 }
 
 /**
@@ -210,8 +249,7 @@ function createServer(opts = {}) {
   let info = null;
   let agentRoster = null;
 
-  // Lifecycle hooks + demo logic (split out of index.js, see server/src/lifecycle.js and
-  // server/src/demo/).
+  // Lifecycle hooks + demo logic (see createLifecycle above and server/src/demo/).
   const lifecycle = createLifecycle();
   const demo = createDemo({ bus, repo, getRoster: () => agentRoster });
 
