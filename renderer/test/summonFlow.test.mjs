@@ -178,5 +178,34 @@ console.log('\n[3] 幽灵先被回收：补画的幽灵也要把汇报演完');
   ok('收尾：flowPending 落回 false', office.flowPending() === false);
 }
 
+console.log('\n[4] 同一常驻小怪物召唤多只同名幽灵：头顶各自分道，不再叠成一只');
+// Regression (2026-10-16): every same-name overhead ghost shared the gremlin's one hover centre, so
+// several same-name subagents stacked into a single sprite. Each instance now gets its own lane
+// around the seat (see seatFanOffset / SEAT_FAN_*), and the whole overhead area grows with the group.
+{
+  clock = 0;
+  drawn.length = 0;
+  const office = createIsoOffice(fakeCanvas(), {});
+  office.setMembers([GREMLIN]);
+  advance(office, 12000);
+  // Freeze the drift direction so the lane separation is deterministic (the drift is random by design)
+  const realRandom = Math.random;
+  Math.random = () => 0.99999;
+  try {
+    const g1 = { ...ghostWith(), memberId: 'subagent-coder-1' };
+    const g2 = { ...ghostWith({ task: '第二个任务' }), memberId: 'subagent-coder-2' };
+    office.setMembers([GREMLIN, g1, g2]);
+    // Two pick-up beats run back to back (DISPATCH_TALK ≈3.6s each) before both ghosts are up
+    advance(office, 20000);
+    const p1 = office.screenOf('subagent-coder-1');
+    const p2 = office.screenOf('subagent-coder-2');
+    ok('两只同名幽灵都现身', Boolean(p1) && Boolean(p2));
+    const dist = p1 && p2 ? Math.hypot(p1.x - p2.x, p1.y - p2.y) : 0;
+    ok('头顶各自分道（不再叠在一起）', dist > 30, `间距 ${dist.toFixed(1)}px`);
+  } finally {
+    Math.random = realRandom;
+  }
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

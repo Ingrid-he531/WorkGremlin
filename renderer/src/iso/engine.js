@@ -93,6 +93,36 @@ const GHOST_SPOTS = [
 // The ghost's "staying in the meeting room" hover spot (shifted 0.4 together with the whole right block's move, still above the meeting table)
 const GHOST_MEET = { x: 17.4, y: 3.6, z: 2.25 };
 
+/**
+ * Overhead hover (a summoned instance whose name matches a seated gremlin) drifts around that
+ * gremlin's workstation. Same-name instances share a seat, so each instance is given its own lane
+ * around the seat (see seatFanOffset) — otherwise they would all sit on one point and read as a
+ * single ghost. The wander radii are the per-ghost activity range inside its lane (the whole
+ * overhead area grows with the group size).
+ */
+const SEAT_FAN_DX = 2.4; // tiles: lane spacing between same-name instances around one seat (world x)
+const SEAT_FAN_DY = 1.0; // tiles: depth stagger between neighbouring lanes (world y)
+const SEAT_WANDER_RX = 1.6; // tiles: per-ghost wander radius along world x
+const SEAT_WANDER_RY = 1.1; // tiles: per-ghost wander radius along world y
+const SEAT_WANDER_RZ = 0.5; // tiles: per-ghost vertical bob range
+
+/**
+ * Lane offset for the slot-th same-name overhead ghost of one gremlin.
+ * Slot 0 stays directly above the head; the rest alternate left/right in lanes of SEAT_FAN_DX, with a
+ * small depth stagger so neighbouring lanes do not sit on one line.
+ * @param {number} slot 0-based index within the same-name group
+ * @returns {{x:number, y:number}} world-space offset from the seat
+ */
+function seatFanOffset(slot) {
+  if (!slot) return { x: 0, y: 0 };
+  const dir = slot % 2 === 1 ? 1 : -1;
+  const lane = Math.ceil(slot / 2);
+  return {
+    x: dir * lane * SEAT_FAN_DX,
+    y: (slot % 2 === 1 ? -1 : 1) * SEAT_FAN_DY,
+  };
+}
+
 /** Pick-up dialogue: the main console hands over the task and the gremlin answers, in place. Seconds. */
 const DISPATCH_TALK = 3.6;
 /** Finish report: the gremlin says its result summary in place. Seconds. No walk back to the console. */
@@ -591,12 +621,17 @@ export function createIsoOffice(canvas, opts = {}) {
    * @param {{x:number,y:number}|null} nearSeat non-null = overhead ghost, drifts around this workstation
    */
   function makeGhost(member, i, nearSeat) {
-    const center = nearSeat ? { x: nearSeat.x, y: nearSeat.y - 0.1, z: 2.15 } : null;
+    const gname = member.name || member.memberId;
+    // Same-name instances of one gremlin share a seat: fan them into their own lanes so they do not
+    // stack into a single ghost (slot = how many same-name overhead ghosts already exist).
+    const slot = nearSeat ? ghosts.filter((g) => g.nearSeat && g.name === gname).length : 0;
+    const fan = nearSeat ? seatFanOffset(slot) : null;
+    const center = nearSeat ? { x: nearSeat.x + fan.x, y: nearSeat.y - 0.1 + fan.y, z: 2.15 } : null;
     const a = center || GHOST_SPOTS[i % GHOST_SPOTS.length];
     const now = performance.now();
     return {
       memberId: member.memberId,
-      name: member.name || member.memberId,
+      name: gname,
       // Overhead ghost: appears directly above the gremlin's head (waiting=false, drifts from the anchor);
       // standalone ghost: starts outside the door (gx < 0, hidden by the wall), drifts in once the window gate opens.
       x: nearSeat ? a.x : PLACES.doorOut.x,
@@ -919,15 +954,14 @@ export function createIsoOffice(canvas, opts = {}) {
         }
       } else if (now >= g.hold) {
         if (g.nearSeat && g.center) {
-          // Overhead ghost: drifts randomly around the whole workstation (wider horizontally), do not pin it, and do not drift elsewhere
-          const rx = 1.4;
-          const ry = 0.9;
+          // Overhead ghost: drifts randomly around its own lane above the workstation (wider
+          // horizontally), do not pin it, and do not drift elsewhere.
           const ang = Math.random() * Math.PI * 2;
           const rad = Math.sqrt(Math.random()); // evenly distributed inside the ellipse
           g.target = {
-            x: g.center.x + Math.cos(ang) * rad * rx,
-            y: g.center.y + Math.sin(ang) * rad * ry,
-            z: g.center.z + (Math.random() - 0.5) * 0.25,
+            x: g.center.x + Math.cos(ang) * rad * SEAT_WANDER_RX,
+            y: g.center.y + Math.sin(ang) * rad * SEAT_WANDER_RY,
+            z: g.center.z + (Math.random() - 0.5) * SEAT_WANDER_RZ,
           };
         } else if (!g.inMeeting) {
           const pool = GHOST_SPOTS.filter((p) => p !== g.anchor);
