@@ -26,6 +26,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useSessionStore } from '../stores/sessions';
 import { colorsFor } from '../iso/officeMap';
 import { shade } from '../iso/iso';
+import { PHASES } from '../iso/mainConsole';
 import { useI18n } from '../i18n';
 import { agentBase } from '@workgremlin/shared';
 import { httpBase, getServerInfo } from '../api/bridge';
@@ -65,9 +66,9 @@ const END_KEEP_MIN = 5;
 /** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
 const SPEED_PX_S = 70;
 /** Each task line occupies exactly one screen width. A long task is cut by the ellipsis on its
- *  **task text** (true width, so CJK/ASCII are both exact), while the trailing status word
- *  ("（完成）/（已取消）") is kept and a short task leaves the rest of its screen-wide box blank —
- *  every line is one screen long and the spacing is uniform. */
+ *  **task text** (true width, so CJK/ASCII are both exact), while the trailing phase suffix
+ *  ("（思考中）/（调用工具）/…/（任务完成）/（任务取消）") is kept and a short task leaves the rest of
+ *  its screen-wide box blank — every line is one screen long and the spacing is uniform. */
 
 /** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
 const announcedIds = new Set();
@@ -91,16 +92,53 @@ let segSeq = 0;
 const sessionStart = Date.now();
 
 /**
- * 结束任务 → 屏上那一行：复用**它原本滚动的那条文案**（时间 楼层 任务：原话），
- * 只在末尾追加状态字（绿=完成「（完成）」/ 红=取消·失败「（已取消）」），不再单独出一行"任务完成/取消"。
- * 整条只滚一遍即退场（见 pendingEnded → makeSeg 进段即清）。failed 归到取消的红色。
+ * A task line's trailing **phase suffix**: text = the main Agent's current phase (i18n `phase.*`),
+ * colour = the phase colour (`PHASES[phase].color`, the same map the console uses). The surrounding
+ * brackets come from i18n (`suffixOpen` / `suffixClose`) so zh/en punctuation stays right.
+ */
+const wrapSuffix = (label) => (label ? `${t('ticker.suffixOpen')}${label}${t('ticker.suffixClose')}` : '');
+const phaseColorOf = (ph) => (PHASES[ph] || PHASES.idle).color;
+
+/**
+ * A task's current main-Agent phase: join the feed row's `sessionId` against the sessions snapshot
+ * (the same truth the console / session dropdown use) and read its `phase`. Returns '' when it cannot
+ * be resolved (legacy rows without a session id, or the session has been dropped) — never guess a phase.
+ */
+function phaseOfTask(it) {
+  const sid = String((it && it.sessionId) || '');
+  if (!sid) return '';
+  const s = (sessions.sessions || []).find((x) => String((x && x.sessionId) || '') === sid);
+  const ph = String((s && s.phase) || '');
+  return PHASES[ph] ? ph : '';
+}
+
+/**
+ * Phases that mean "the main Agent is actively working". Anything else (idle / unreported / a stale
+ * done · cancelled / an unresolved session) is **not** shown for a running task.
+ */
+const WORKING_PHASES = new Set(['thinking', 'tool', 'await', 'dispatch', 'waiting']);
+
+/**
+ * The phase shown on a **running** task line. A task that is already on the track must never read
+ * "待命中" (nor "未上报" / a stale "任务完成") — it is visibly running, so the least it can be is 思考中.
+ * So: use the resolved session phase when it is an active-work phase, otherwise fall back to thinking.
+ */
+function runningPhaseOfTask(it) {
+  const ph = phaseOfTask(it);
+  return WORKING_PHASES.has(ph) ? ph : 'thinking';
+}
+
+/**
+ * An ended task's line: reuse the **same wording it scrolled with** (time floor task: prompt) and append
+ * the phase suffix "（任务完成）/（任务取消）" — same wording and colour as the phase scheme (done green,
+ * cancelled/failed red). It scrolls exactly once (see pendingEnded → makeSeg) and then leaves the track.
  */
 function endedText(it) {
   const floor = floorLabelForClient(it.client);
   const base = promptOf(it.title || '') || t('ticker.untitled');
-  // done 绿标完成；cancelled / failed 一律红标"已取消"
-  const suffixKind = it.state === 'done' ? 'done' : 'cancelled';
-  const suffix = suffixKind === 'done' ? t('ticker.doneSuffix') : t('ticker.cancelledSuffix');
+  const done = it.state === 'done';
+  const suffix = wrapSuffix(done ? t('ticker.done') : t('ticker.cancelled'));
+  const suffixColor = done ? PHASES.done.color : PHASES.cancelled.color;
   const taskLabel = t('ticker.taskLabel');
   const taskText = clip(base);
   const time = hhmm(it.ended_at);
@@ -114,7 +152,7 @@ function endedText(it) {
     floorColor: shade(colorsFor(floor).wood, 1.6),
     text: `${time} ${floor} ${taskLabel}${taskText}`,
     suffix,
-    suffixKind,
+    suffixColor,
   };
 }
 
@@ -207,6 +245,10 @@ const runningItems = computed(() => {
       const taskText = clip(text);
       // 时间用任务真正开始的时间（tasks.started_at），不再用"当前时间"
       const time = hhmm(it.started_at);
+      // 实时相位后缀：这条任务的主 Agent 现在在干什么（思考中 / 调用工具 / 等待授权 …），
+      // 颜色跟着相位色走（与主控制台同一份 PHASES）。**进行中的任务不显示"待命中"**：
+      // 它已经在屏上滚着，至少是"思考中"（见 runningPhaseOfTask）
+      const phase = runningPhaseOfTask(it);
       return {
         id: it.id,
         kind: 'running',
@@ -216,6 +258,8 @@ const runningItems = computed(() => {
         taskText,
         floorColor: shade(colorsFor(floor).wood, 1.6),
         text: `${time} ${floor} ${taskLabel}${taskText}`,
+        suffix: wrapSuffix(t(`phase.${phase}`)),
+        suffixColor: phaseColorOf(phase),
         startedAt: Number(it.started_at) || 0,
       };
     })
@@ -390,7 +434,7 @@ onBeforeUnmount(() => {
       >
         <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
-        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="it.suffix" class="suf" :class="`s-${it.suffixKind}`">{{ it.suffix }}</span></span>
+        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="it.suffix" class="suf" :style="{ color: it.suffixColor }">{{ it.suffix }}</span></span>
         </span>
       </div>
       <span class="scan" aria-hidden="true" />
@@ -490,9 +534,10 @@ onBeforeUnmount(() => {
   color: var(--floor-color, var(--accent, #4c8dff));
 }
 
-/* 前缀（时间 / 楼层号 / "任务："标签）与末尾状态字都按原样显示：只有**任务原话**可以被省略号
-   截断（flex-shrink + min-width:0 + ellipsis）。这样「（完成）/（已取消）」永远跟在原话后面看得见，
-   不会被长标题挤出屏外 —— 这正是"结束行只见 ...、不见状态字"那个 bug 的根因。 */
+/* The prefixes (time / floor / "task:" label) and the trailing phase suffix always render in full:
+   only the **task prompt** (.task-text) may be ellipsised (flex-shrink + min-width:0 + ellipsis). So the
+   suffix ("（思考中）/（任务完成）…") always stays visible right after the prompt and is never pushed off
+   screen by a long title — that was the root cause of the "ended line shows ... but no status word" bug. */
 .line .time,
 .line .floor,
 .line .task-label,
@@ -506,8 +551,8 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 
-/* 每条前面的圆点：颜色跟着这一条自己的颜色走（蓝=在跑 / 绿=完成 / 红=取消），
-   所以"看圆点就知道是哪一类"，不用读完那行字 */
+/* The leading dot takes the line's own colour (--floor-color, the floor's wood tone), so one glance
+   tells you which floor a line belongs to. The trailing phase suffix carries its own phase colour. */
 .line::before {
   content: '';
   display: inline-block;
@@ -533,17 +578,14 @@ onBeforeUnmount(() => {
   text-shadow: 0 0 6px currentColor;
 }
 
-/* 行本体颜色由 --floor-color 驱动（见 .line），k-* 类保留以备将来按状态整体上色。
-   任务原话（.task-text）用运行蓝，结束状态字（.suf）用绿/红，均独立于行本体色。 */
+/* The line body colour comes from --floor-color (see .line); the k-* classes are kept for future
+   whole-line status colouring. The trailing phase suffix (.suf) carries its own phase colour,
+   independent of the line body. */
 
-/* 结束行末尾的状态字：独立上色（绿=完成 / 红=取消·失败），主体仍沿用任务的蓝色 */
-.suf.s-done {
-  color: var(--state-online, #2ecc71);
-  text-shadow: 0 0 6px currentColor;
-}
-
-.suf.s-cancelled {
-  color: var(--state-blocked, #ff5c5c);
+/* 末尾相位后缀：颜色由 JS 按相位色内联写（`.suf` 的 color，见 PHASES），这里只管发光。
+   相位色与主控制台同一份：思考中黄 / 调用工具蓝 / 等待授权橙 / 任务完成绿 / 任务取消红。 */
+.suf {
+  flex: none;
   text-shadow: 0 0 6px currentColor;
 }
 

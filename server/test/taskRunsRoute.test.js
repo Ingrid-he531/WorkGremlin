@@ -311,6 +311,40 @@ app.use('/api/v1', createIngestRouter({ bus }));
     JSON.stringify([reRow.input_tokens, reRow.output_tokens, reRow.cache_write_tokens])
   );
 
+  console.log('[8] /task-feed 每行带 sessionId（滚动屏据此把任务对回会话、读主 Agent 相位）');
+  // The feed is the ticker's only source; it must carry the session id so the renderer can join it
+  // against the sessions snapshot and append the live phase suffix. A recently ended task is used here
+  // (a "running" one would additionally need a live heartbeat to pass taskAliveSql, which is the same SQL).
+  const feedNow = Date.now();
+  repo.insertTask.run({
+    id: 't-feed',
+    projectId: 'p1',
+    memberId: 'codex@p1',
+    parentTaskId: null,
+    title: 'feed task',
+    state: 'done',
+    progress: 1,
+    startedAt: feedNow - 1000,
+    endedAt: feedNow,
+  });
+  repo.upsertTaskRun.run({
+    id: 't-feed',
+    projectId: 'p1',
+    memberId: 'codex@p1',
+    client: 'codex',
+    sessionId: 's-feed',
+    form: 'cli',
+    model: null,
+    title: 'feed task',
+    startedAt: feedNow - 1000,
+    baselineCommit: null,
+  });
+  const feedRes = await fetch(`${base}/task-feed?minutes=5`);
+  const feed = await feedRes.json();
+  const frow = ((feed.items || []).find((t) => t.id === 't-feed')) || {};
+  ok('/task-feed 把刚收工的任务带回来', Boolean(frow.id), JSON.stringify((feed.items || []).map((t) => t.id)));
+  ok('每行带 sessionId（渲染层据此读相位后缀）', frow.sessionId === 's-feed', JSON.stringify(frow.sessionId));
+
   server.close();
   close();
   fs.rmSync(WG_HOME, { recursive: true, force: true });

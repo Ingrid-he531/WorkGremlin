@@ -366,6 +366,7 @@ function createQueryRouter({ bus, repo }) {
       .prepare(
         `SELECT t.id, t.project_id, t.member_id AS memberId, t.title, t.started_at, t.ended_at,
                 COALESCE(tr.client, m.client) AS client,
+                tr.session_id AS sessionId,
                 CASE WHEN t.state = 'running' AND NOT ${ALIVE} THEN 'cancelled' ELSE t.state END AS state
            FROM tasks t
            LEFT JOIN task_runs tr ON tr.id = t.id
