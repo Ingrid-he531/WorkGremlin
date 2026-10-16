@@ -110,9 +110,11 @@ const meta = {
       dirs: [opencodeHome()],
       note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
-    // The hook path: the true-phase path when the WorkGremlin plugin is installed (client is always the
-    // floor base name opencode, form=vscode)
-    { kind: 'hook', form: 'vscode' },
+    // The hook path: the true-phase path once the WorkGremlin plugin is installed. The client is
+    // always the floor base name opencode, and there is no separate "plugin form": OpenCode's VS
+    // Code extension only drives the same opencode binary against the same data root, so OpenCode
+    // stays cli (see packages/reporter/src/plugin/index.js's VSCODE_ENV).
+    { kind: 'hook' },
   ],
   hookSource: true,
   dataKind: 'opencode',
@@ -1114,11 +1116,11 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   /**
    * For a session that yielded to the plugin: is the plugin **impersonating our identity and running right
    * now**?
-   * A CLI-form plugin (no VS Code environment variables) reports a bare `opencode` —— the same member
-   * `opencode@<project>`, see resolveClient in plugin/index.js. If so, this project's member status is
-   * written by the plugin first: the polling path does not even touch the heartbeat, otherwise a 5s poll
-   * would overwrite the phase the plugin just wrote with the polling view's older state (in agent_status,
-   * last writer wins). Hand it back to polling once finished (same as kilo.js).
+   * A plugin (OpenCode has no separate plugin form — it always reports cli) reports a bare `opencode`
+   * —— the same member `opencode@<project>`, see resolveClient in plugin/index.js. If so, this project's
+   * member status is written by the plugin first: the polling path does not even touch the heartbeat,
+   * otherwise a 5s poll would overwrite the phase the plugin just wrote with the polling view's older
+   * state (in agent_status, last writer wins). Hand it back to polling once finished (same as kilo.js).
    */
   const pluginOwnsMember = new Set();
   for (const s of sessions) {

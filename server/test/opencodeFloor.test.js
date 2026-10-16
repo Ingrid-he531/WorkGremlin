@@ -216,11 +216,16 @@ head('[A] 楼层表：8F 只有一层 OpenCode');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '8F');
   ok('8F 存在且名叫 OpenCode', floor && floor.name === 'OpenCode', floor && floor.name);
-  ok('楼层身份恒为基名（opencode）；形态由 source.form 表达', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode']), floor && JSON.stringify(floor.clients));
+  ok('楼层身份恒为基名（opencode）；OpenCode 不分 plugin/cli（VS Code 扩展只是同一 CLI 的外壳）', floor && JSON.stringify(floor.clients) === JSON.stringify(['opencode']), floor && JSON.stringify(floor.clients));
   ok(
     '两路来源：opencode（轮询产会话 + 数据根落盘统计，标 CLI/Desktop）+ hook（收插件真相位）',
     floor && floor.sources.length === 2 && floor.sources.map((s) => s.kind).join(',') === 'opencode,hook' && floor.sources[0].label === 'CLI/Desktop',
     floor && floor.sources.map((s) => s.kind).join(',')
+  );
+  ok(
+    'hook 那一路不带 form：OpenCode 只有一个 CLI 形态，没有 plugin/cli 之分',
+    floor && floor.sources.every((s) => !s.form),
+    floor && JSON.stringify(floor.sources.map((s) => s.form))
   );
   ok(
     '装了就算装了 —— opencode **不在 PATH 里**，靠 ~/.opencode/bin 命中',

@@ -69,16 +69,17 @@ const { statePath, writeState, readServerInfo, isPidAlive } = require_('@workgre
  * 2026-09-30: `/proc/<pid>/environ` only had KILO_TREE_SITTER_WASM_DIR left by the install
  * shim), while `kilo serve` started by the VS Code extension has all three
  * (KILO_CLIENT=vscode / KILOCODE_FEATURE=vscode-extension / KILO_PLATFORM=vscode).
+ *
+ * OpenCode is deliberately **absent**: its VS Code extension is only a UI that drives the same
+ * `opencode` binary against the same data root (~/.local/share/opencode) — the extension even
+ * requires the CLI to be installed. There is no second product and no second on-disk layout, so
+ * there is no "editor form" to tell apart: OpenCode always reports form=cli (see resolveForm).
  */
 const VSCODE_ENV = {
   kilo: [
     ["KILO_CLIENT", "vscode"],
     ["KILOCODE_FEATURE", "vscode-extension"],
     ["KILO_PLATFORM", "vscode"],
-  ],
-  opencode: [
-    ["OPENCODE_CLIENT", "vscode"],
-    ["OPENCODE_FEATURE", "vscode-extension"],
   ],
 }
 
@@ -95,7 +96,8 @@ const VSCODE_ENV = {
  *     binary in a terminal and in the editor emits an identical event stream (see the file
  *     header); only env vars tell them apart — see VSCODE_ENV. On the server,
  *     `isPluginClient(form)` decides plugin-vs-not and `formToSource(form)` maps it to the
- *     frontend `source` (plugin / cli / ide).
+ *     frontend `source` (plugin / cli / ide). OpenCode has no editor form — its VS Code
+ *     extension drives the same CLI (see VSCODE_ENV) — so OpenCode is always cli.
  *
  * The explicit `client` option names the **product** only, never the form: that config is read by
  * both the CLI and the editor extension (Kilo ships the same binary and reads the same
