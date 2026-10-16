@@ -539,7 +539,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   // 装了 WorkGremlin 插件时让位（插件那一路上报的才是真值）
   repo.insertTask.run({ id: 't_oc_plugin', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件那一路', state: 'done', progress: 1, startedAt: o2, endedAt: o2 + 1000 });
-  repo.upsertTaskRun.run({ id: 't_oc_plugin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-1', form: 'vscode', model: 'x', title: '插件那一路', startedAt: o2, baselineCommit: null });
+  repo.upsertTaskRun.run({ id: 't_oc_plugin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-1', form: 'cli', model: 'x', title: '插件那一路', startedAt: o2, baselineCommit: null });
   syncOpencodeTasks({ bus, repo });
   const eight3 = await get(`project=p1&client=${F8.join(',')}&limit=50`);
   ok(
