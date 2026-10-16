@@ -3,20 +3,23 @@
  *
  * 跑法：`npm run test:plugin-ingest`
  *
- * 喂的是**实测**事件词汇表（2026-09-27，Kilo 7.8.1，探针跑出来的）：信封
- * `{ id, type, properties }`，事件只有 session.created / session.updated / message.updated /
- * message.part.updated / session.diff / session.status / session.idle / session.drained 这几个。
- * 早先按 `data` 信封与 `session.inbox.enqueued` / `session.tool.called` /
- * `session.execution.succeeded` / `permission.asked` 那套写，实测**一个都不出现** ——
- * 插件看着能装上，实际一条状态文件都不写。改口径后这里钉住真实形状。
+ * Two **measured** vocabularies are fed in:
+ *   · Kilo 7.8.1 / OpenCode v1 (2026-09-27): envelope `{ id, type, properties }`, events
+ *     session.created / session.updated / message.updated / message.part.updated / session.diff /
+ *     session.status / session.idle / session.drained.
+ *   · OpenCode v2 (2026-10-16, 2.0.30): envelope `{ id, created, type, location, data }`, vocabulary
+ *     `session.*` (session.inbox.enqueued / session.tool.called / session.execution.succeeded /
+ *     permission.asked …); none of the v1 names above are ever emitted. A plugin that knew only v1
+ *     therefore did nothing on v2 (no state file, no ledger, no tool usage); the plugin now handles
+ *     both, and this check pins down each.
  *
- * 覆盖：
- *   A. 台账上报      register(role:agent) / task.start / task.end / message / file.touch
- *   B. 相位          await(pending 工具) / tool(running) / thinking / idle / done
- *   C. 完成标记      finish=stop 才算 done；finish=tool-calls **不算**（整轮还没完）
- *   D. 状态文件      hb.pid（hasOtherLiveSession 判据 1）/ model
- *   E. subagent 幽灵  task 工具召唤 → 写条目；收工只动本会话本 client
- *   F. 边界          信封 properties vs data 都认；拿不到标题不编造自述
+ * Coverage:
+ *   A. ledger reports  register(role:agent) / task.start / task.end / message / file.touch
+ *   B. phase           await(pending tool) / tool(running) / thinking / idle / done
+ *   C. done marker     only finish=stop is done; finish=tool-calls is **not** (round not over)
+ *   D. state file      hb.pid (hasOtherLiveSession criterion 1) / model
+ *   E. subagent ghosts  `task` tool → entry; the sweep only touches this session's own client
+ *   F. edges           both generations accepted; no title → no fabricated summary
  */
 'use strict';
 
@@ -325,21 +328,43 @@ head('[D] 状态文件：hb.pid 与 model');
 
 /* ------------------------------ F. 边界 ------------------------------ */
 
-head('[F] 边界：信封两代都认 / 拿不到标题不编造自述');
+head('[F] 边界：两代信封都认 / OpenCode v2 事件词汇 / 拿不到标题不编造自述');
 {
-  // 老信封（data + location）也要能用 —— OpenCode 2.x 走那条
+  // OpenCode v2 (measured 2026-10-16, 2.0.30): envelope {id,created,type,location,data} and the
+  // `session.*` vocabulary — the v1 names (message.updated / message.part.updated) never appear.
+  // Regression: the plugin used to know only v1, so on v2 it produced nothing at all (no state file,
+  // no ledger, no tool usage).
   const ctx2 = makeCtx({ client: 'opencode' });
   const off2 = await plugin.setup(ctx2);
-  const q2 = [];
-  const wait2 = [];
-  const old = (type, data) => ({ type, data, location: { directory: WS } });
-  ctx2.emit(old('session.created', { sessionID: 'ses_oc_1', location: { directory: WS }, model: { id: 'opencode/x' } }));
-  ctx2.emit(old('message.updated', { sessionID: 'ses_oc_1', info: { id: 'm1', role: 'user', time: { created: Date.now() } } }));
-  ctx2.emit(old('message.part.updated', { sessionID: 'ses_oc_1', part: { id: 'p1', messageID: 'm1', type: 'text', text: '"老信封也能开任务"' } }));
-  for (let i = 0; i < 8; i += 1) await new Promise((r) => setTimeout(r, 10));
+  const v2 = (type, data) => ({ type, data: { sessionID: 'ses_oc_1', ...data }, location: { directory: WS }, created: Date.now() });
+  ctx2.emit(v2('session.created', { location: { directory: WS } }));
+  ctx2.emit(v2('session.renamed', { title: 'v2 会话标题' }));
+  ctx2.emit(v2('session.inbox.enqueued', { item: { type: 'user', payload: { text: '"v2 开任务"' } } }));
+  ctx2.emit(v2('session.execution.started', {}));
+  ctx2.emit(v2('session.step.started', { assistantMessageID: 'msg_v2_1', model: { id: 'opencode/z' } }));
+  ctx2.emit(v2('session.tool.input.started', { assistantMessageID: 'msg_v2_1', id: 'call_v2_1', name: 'shell' }));
+  ctx2.emit(v2('session.tool.called', { assistantMessageID: 'msg_v2_1', id: 'call_v2_1', input: { command: 'echo hi' } }));
+  ctx2.emit(
+    v2('session.step.ended', {
+      assistantMessageID: 'msg_v2_1',
+      finish: 'stop',
+      tokens: { input: 11, output: 2, reasoning: 3, cache: { read: 0, write: 0 } },
+      files: [],
+    })
+  );
+  ctx2.emit(v2('session.execution.succeeded', {}));
+  await settle();
   const t2 = [...seen].reverse().find((s) => s.route === '/api/v1/task/start' && s.body.sessionId === 'ses_oc_1');
-  ok('data 信封（OpenCode 2.x）同样能开任务', Boolean(t2), JSON.stringify(routes().slice(-4)));
-  ok('标题也剥了引号', t2 && t2.body.title === '老信封也能开任务', t2 && t2.body.title);
+  ok('v2 session.inbox.enqueued(user) 开任务', Boolean(t2), JSON.stringify(routes().slice(-6)));
+  ok('标题也剥了引号', t2 && t2.body.title === 'v2 开任务', t2 && t2.body.title);
+  const use2 = [...seen].reverse().find((s) => s.route === '/api/v1/tool/use' && s.body.sessionId === 'ses_oc_1');
+  ok('v2 session.tool.called 记了工具使用（名字取自 tool.input.started）', Boolean(use2) && use2.body.tool === 'shell', JSON.stringify(use2 && use2.body));
+  const end2 = [...seen].reverse().find((s) => s.route === '/api/v1/task/end' && s.body.sessionId === 'ses_oc_1');
+  ok(
+    'v2 session.execution.succeeded 收工（state=done，tokens 把 reasoning 并进 output）',
+    Boolean(end2) && end2.body.state === 'done' && end2.body.tokens && end2.body.tokens.input === 11 && end2.body.tokens.output === 5,
+    JSON.stringify(end2 && end2.body)
+  );
   if (typeof off2 === 'function') off2();
 }
 

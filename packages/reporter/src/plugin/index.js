@@ -25,12 +25,12 @@
  * It works without the plugin too — 8F falls back to polling, just with a greyed-out phase, no
  * "awaiting permission", and no file list on the completion marker.
  *
- * ## Event contract (measured 2026-09-27, Kilo 7.8.1, via an in-plugin probe)
+ * ## Event contract — **two generations** (both handled; the event sets are disjoint)
  *
- * The envelope is `{ id, type, properties }` — **not** `{ type, data, location }`.
- * Only these 10 event types are emitted; other vocabularies (`session.inbox.enqueued`,
- * `session.tool.called`, `session.execution.succeeded`, `permission.asked`, `session.step.ended`, …)
- * were measured and never appear.
+ * ### Kilo / OpenCode v1 (measured 2026-09-27, Kilo 7.8.1, via an in-plugin probe)
+ *
+ * The envelope is `{ id, type, properties }` (Kilo) — OpenCode's v2 envelope is in the section below.
+ * Only these 10 event types are emitted; other vocabularies were measured and never appear here.
  *
  *   session.created        info.directory=workspace path · info.model.id=model
  *   session.updated        info.title · info.model.id (the model often appears only here)
@@ -44,8 +44,27 @@
  *   session.diff           diff[] = delta against the **session** snapshot (not "this round", see steppedOf)
  *   session.next.tool.input.delta  tool-input delta — ignored
  *
- * Derivation rules are in the long comment above `handle()` (a task starts at a role=user text
- * part, ends at an assistant finish=stop; awaiting permission is tool state.status==='pending').
+ * ### OpenCode v2 (measured 2026-10-16, OpenCode 2.0.30, via an in-plugin probe)
+ *
+ * The envelope is `{ id, created, type, location, data }` and the vocabulary is `session.*` — the v1
+ * names above (`message.updated`, `message.part.updated`, `session.idle`, …) are **never emitted**.
+ * That is why a plugin that only knew v1 did **nothing at all** on OpenCode v2: no state file, no
+ * ledger, no tool usage (it silently fell through every event). The names handled for v2 are:
+ *
+ *   session.created / session.renamed        workspace path (location.directory) / title
+ *   session.inbox.enqueued                    item.type=user · item.payload.text → the user's sentence
+ *   session.execution.started/succeeded/failed/interrupted    round lifecycle
+ *   session.step.started/ended/failed         model · finish · tokens · files (this step's changed files)
+ *   session.reasoning.started/delta/ended     reasoning (→ thinking)
+ *   session.text.started/delta/ended          assistant text (→ thinking; `ended` keeps the summary)
+ *   session.tool.input.started                tool name (call id → name; `called`/`success` carry no name)
+ *   session.tool.called/success/failed        tool running / done / error (name from the map above)
+ *   session.usage.updated                     session-level usage (ignored: step tokens are per-round)
+ *   permission.asked / permission.replied     awaiting permission (the phase polling cannot produce)
+ *
+ * Derivation rules are in the long comment above `handle()` (a task starts at a role=user text part /
+ * `inbox.enqueued(user)`; it ends at finish=stop / `execution.succeeded`; awaiting permission is tool
+ * state.status==='pending' / `permission.asked`).
  */
 
 /* Node built-ins; the plugin runtime provides them, no extra dependency. */
@@ -405,6 +424,12 @@ function createIngestPlugin(options, { location, base } = {}) {
    * this process", no need to keep long.
    */
   let toolCallSeen = new Set()
+  /**
+   * call id → tool name. OpenCode 2.x's `session.tool.called` carries `{id, input}` but **no name**:
+   * the name arrives earlier on `session.tool.input.started`. Kilo (v1) puts it in the part, so this
+   * map is only used by the v2 branch.
+   */
+  const toolNames = new Map()
   const ingest = createIngest(client)
   /** This plugin instance's own workspace (the event stream is **whole-server**, not just this workspace — see wsOf below) */
   const ownDir = String((location && location.directory) || "")
@@ -692,14 +717,15 @@ function createIngestPlugin(options, { location, base } = {}) {
   /**
    * Handle one event.
    *
-   * ## Event contract (measured 2026-09-27, Kilo 7.8.1, real vocabulary from a probe)
+   * ## Event contract — two generations (see the file header; the sets are disjoint)
    *
-   * The envelope is `{ id, type, properties }` — **not** `{ type, data, location }`. Other
-   * vocabularies (`session.inbox.enqueued`, `session.tool.called`, `session.execution.succeeded`,
-   * `permission.asked`, `session.step.ended`, …) were measured and never appear (`kilo run` for two
-   * rounds emits only the 10 below). So the workspace path cannot come from `location.directory`
-   * either — it comes from `session.created`'s `info.directory` (or `message.updated`'s
-   * `info.path.cwd`), which is the authoritative value.
+   * **Kilo / OpenCode v1** (measured 2026-09-27, Kilo 7.8.1): envelope `{ id, type, properties }`.
+   * `kilo run` for two rounds emits only the 10 names below, so the workspace comes from
+   * `session.created`'s `info.directory` (or `message.updated`'s `info.path.cwd`).
+   *
+   * **OpenCode v2** (measured 2026-10-16, 2.0.30): envelope `{ id, created, type, location, data }`,
+   * vocabulary `session.*` (handled further down). The workspace is `location.directory`, and the
+   * user's sentence is `session.inbox.enqueued`'s `item.payload.text`.
    *
    *   session.created        info.directory=workspace path · info.model.id=model
    *   session.updated        info.title (session renamed)
@@ -746,7 +772,8 @@ function createIngestPlugin(options, { location, base } = {}) {
       /* ---- Session created: the authoritative source of workspace path and model ---- */
       case "session.created": {
         const info = p.info || {}
-        const ws = dirOf() || ownDir
+        // v2 carries the workspace in `location.directory` (the envelope); v1/Kilo in `info.directory`
+        const ws = dirOf() || String((event.location && event.location.directory) || "") || ownDir
         if (sid) dirs.set(sid, ws)
         const model = String((info.model && (info.model.id || info.model.modelID)) || info.modelID || "")
         if (sid && model) {
@@ -761,7 +788,9 @@ function createIngestPlugin(options, { location, base } = {}) {
       case "session.updated":
       case "session.renamed": {
         const info = p.info || {}
-        if (sid && info.title) titles.set(sid, String(info.title))
+        // v1/Kilo: info.title; v2: the title sits at the top level (`{sessionID, title}`)
+        const title = String(info.title || p.title || "")
+        if (sid && title) titles.set(sid, title)
         // The model **often is not present at session.created** (measured: created's info has no model,
         // it comes with the immediately following session.updated) — so accept it in both places;
         // missing one shows as "the main console shows no model".
@@ -1003,6 +1032,195 @@ function createIngestPlugin(options, { location, base } = {}) {
           break
         }
         report(event, "idle")
+        break
+      }
+
+      /* ================= OpenCode 2.x vocabulary (measured 2026-10-16, OpenCode 2.0.30) =================
+         v2 renamed the whole event stream: `message.updated` / `message.part.updated` are gone and the
+         stream is `session.*` (see the file header). The types are **disjoint** from v1/Kilo's, so both
+         branches coexist. Envelope: `{ id, created, type, location, data }` (already flattened into `p`).
+         Mapping: session.created→workspace · session.renamed→title · session.inbox.enqueued(user)→task start ·
+         session.execution.*→round lifecycle · session.step.*→model/finish/tokens/files ·
+         session.reasoning.* (thinking) · session.text.* (thinking) · session.tool.* → tool phase + usage ·
+         permission.*→awaiting permission. */
+
+      /* Task start: v2 has no role=user text part; the user's sentence is item.payload.text */
+      case "session.inbox.enqueued": {
+        const item = p.item || {}
+        if (String(item.type || "") === "user") {
+          const text = unquote((item.payload && item.payload.text) || "")
+          if (sid && !taskIds.has(sid)) startTask(event, sid, text)
+        }
+        break
+      }
+
+      /* Round lifecycle: started → thinking; succeeded/failed → done; interrupted → cancelled */
+      case "session.execution.started": {
+        report(event, "thinking")
+        break
+      }
+      case "session.execution.succeeded":
+      case "session.execution.failed": {
+        if (sid && taskIds.has(sid)) {
+          const result = String(assistantText.get(sid) || "")
+          const files = steppedOf(sid, wsOf(event))
+          endTask(event, sid, "done", result)
+          assistantText.delete(sid)
+          post("/ghost", { action: "sweep", all: false, workspacePath: wsOf(event), client: client, sessionId: sid })
+          report(event, "idle", {
+            done: {
+              at: Date.now(),
+              title: result || titles.get(sid) || "",
+              fileCount: files.length,
+              files: files.slice(0, 20).map((f) => ({ path: f, size: null })),
+              workspacePath: wsOf(event),
+              sessionId: sid,
+              cancelled: false,
+            },
+          })
+          break
+        }
+        report(event, "idle")
+        break
+      }
+      case "session.execution.interrupted": {
+        // Same shape as v1's session.idle cancel branch: interrupted rounds are cancelled, never "done"
+        if (sid && taskIds.has(sid)) {
+          const files = [...new Set([...steppedOf(sid, wsOf(event)), ...((roundFiles.get(sid)) || [])].map(String).filter(Boolean))]
+          const result = String(assistantText.get(sid) || "")
+          const ws = wsOf(event)
+          cancelledAt.set(sid, Date.now())
+          endTask(event, sid, "cancelled", result)
+          assistantText.delete(sid)
+          post("/ghost", { action: "sweep", all: true, workspacePath: ws, client: client, sessionId: sid })
+          report(event, "idle", {
+            done: {
+              at: Date.now(),
+              title: result || titles.get(sid) || "",
+              fileCount: files.length,
+              files: files.slice(0, 20).map((f) => ({ path: f, size: null })),
+              workspacePath: ws,
+              sessionId: sid,
+              said: result.replace(/\s+/g, " ").trim().slice(0, 160),
+              cancelled: true,
+            },
+          })
+          try { writeState(statePath(client, ws, sid), { taskId: null, taskWorkspacePath: '', taskStartedAt: 0 }) } catch {}
+          break
+        }
+        report(event, "idle")
+        break
+      }
+
+      /* One assistant "step" (LLM call): model / finish / tokens / changed files */
+      case "session.step.started": {
+        const model = String((p.model && (p.model.id || p.model.modelID)) || "")
+        if (sid && model) {
+          models.set(sid, model)
+          writeState(statePath(client, wsOf(event), sid), { model })
+        }
+        break
+      }
+      case "session.step.ended":
+      case "session.step.failed": {
+        if (sid) {
+          // Per-message usage (reported once per step); `reasoning` is folded into `output` like the other
+          // floors, and all-zero means "nothing read" (do not report 0 — the server shows "—").
+          const mid = String(p.assistantMessageID || "")
+          if (mid && p.tokens && typeof p.tokens === "object") {
+            const t = p.tokens
+            const cache = (t.cache && typeof t.cache === "object") ? t.cache : {}
+            const pos = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0)
+            const bucket = roundMsgTokens.get(sid) || new Map()
+            bucket.set(mid, {
+              input: pos(t.input),
+              output: pos(t.output) + pos(t.reasoning),
+              cacheRead: pos(cache.read),
+              cacheWrite: pos(cache.write),
+            })
+            roundMsgTokens.set(sid, bucket)
+          }
+          // This step's changed files (v2 gives them directly; v1's session.diff is gone). Union within
+          // the round — steppedOf filters by the round window, so older rounds drop out.
+          const files = Array.isArray(p.files) ? p.files.map(String).filter(Boolean) : []
+          if (files.length) lastFiles.set(sid, [...new Set([...(lastFiles.get(sid) || []), ...files])])
+        }
+        break
+      }
+
+      /* Reasoning / text: **thinking**, not idle — avoids the "flash idle between steps" trap (v1 note) */
+      case "session.reasoning.started":
+      case "session.reasoning.delta":
+      case "session.reasoning.ended":
+      case "session.text.started":
+      case "session.text.delta": {
+        report(event, "thinking")
+        break
+      }
+      case "session.text.ended": {
+        // The current full text is the round's closing summary (v2 sends the whole text, not a delta)
+        if (sid) assistantText.set(sid, unquote(p.text))
+        report(event, "thinking")
+        break
+      }
+
+      /* Tools */
+      case "session.tool.input.started": {
+        // The name is only here; session.tool.called has just {id, input}
+        const cid = String(p.id || "")
+        const name = String(p.name || "")
+        if (cid && name) toolNames.set(cid, name)
+        break
+      }
+      case "session.tool.called": {
+        const cid = String(p.id || "")
+        const name = String(toolNames.get(cid) || "")
+        const input = p.input && typeof p.input === "object" ? p.input : {}
+        // Tool usage ("task detail"): count each call id once (the event may repeat)
+        if (sid && cid && !toolCallSeen.has(cid)) {
+          toolCallSeen.add(cid)
+          if (toolCallSeen.size > 500) toolCallSeen = new Set([cid])
+          const taskId = taskIds.get(sid) || ""
+          if (name && taskId) {
+            post("/tool/use", { memberId: base, taskId, tool: name, sessionId: sid, client, workspacePath: wsOf(event), form })
+          }
+        }
+        if (sid && name && opOfTool(name) === "write") touchFile(sid, fileOf(input), wsOf(event))
+        if (sid && name && isSubagentTool(name)) {
+          const sa = subagentOf(input)
+          post("/ghost", {
+            action: "spawn",
+            workspacePath: wsOf(event),
+            name: sa.name,
+            task: sa.task,
+            id: cid,
+            parent: taskIds.get(sid) || "",
+            model: "",
+            client,
+            sessionId: sid,
+          })
+        }
+        report(event, "tool", { tool: name, cmd: commandOf(input), file: fileOf(input) })
+        break
+      }
+      case "session.tool.success": {
+        // Don't roll the phase back — the next reasoning/text/tool advances it (same as v1's completed tool)
+        break
+      }
+      case "session.tool.failed": {
+        const name = String(toolNames.get(String(p.id || "")) || "")
+        report(event, "tool", { tool: name, action: name ? `调用 ${name} 报错` : "调用工具报错" })
+        break
+      }
+
+      /* Awaiting permission: the phase polling cannot produce (v2 keeps it as its own event) */
+      case "permission.asked": {
+        const tool = String(p.tool || p.name || "")
+        report(event, "await", { tool, action: tool ? `申请执行 ${tool}` : "等待用户授权" })
+        break
+      }
+      case "permission.replied": {
+        report(event, "thinking")
         break
       }
 
