@@ -1,26 +1,42 @@
 <script setup>
 /**
- * TaskTicker —— 门楣上那块**长屏**：所有楼层当前任务的滚动条（2026-10-08 改版）。
+ * TaskTicker — the **long screen** on the lintel: a scrolling ticker of the current task on every
+ * floor (reworked 2026-10-08).
  *
- * 上一版（FloorLcd）是"层站指示器"：答"现在在哪层 / 要去哪层"。现在整块屏改成任务流：
- *   · **不再显示当前楼层** —— 楼层在左边胶囊（FloorSelector）与轿厢里都有，屏上重复一份没用；
- *   · 屏**尽可能长**：门楣上项目名占它自己那点宽，剩下全给这块屏（见 ElevatorDoors 的布局）；
- *   · 内容 = **所有楼层正在跑**的任务（running），依次无限滚动；任务收工/取消时，结果行
- *     **只滚一遍**就退场（不再循环），之后只剩进行中的任务；都没了居中显示「暂无活跃任务」。
- *     服务端回"还在跑的 + 最近几分钟收工的"，见 /api/v1/task-feed。
+ * The previous version (FloorLcd) was a "floor indicator": it answered "which floor are we on /
+ * which floor are we heading to". The whole screen is now a task stream instead:
+ *   · **the current floor is no longer shown** — the floor already appears in the capsule on the
+ *     left (FloorSelector) and inside the car, so repeating it on the screen is useless;
+ *   · the screen is **as long as possible**: the project name on the lintel takes only its own bit
+ *     of width, and the rest all goes to this screen (see the layout in ElevatorDoors);
+ *   · content = the tasks **running on every floor** (running), scrolling infinitely one after
+ *     another; when a task finishes / is cancelled, its result line **scrolls past once** and then
+ *     leaves (no looping), after which only the in-progress tasks remain; when there are none, "no
+ *     active tasks" is shown centered. The server returns "still running + finished in the last few
+ *     minutes", see /api/v1/task-feed.
  *
- * 三条硬约束（沿用 FloorLcd 那套）：
- *   1. 唯一真相源：条目全部来自服务端的 tasks 表（/api/v1/task-feed），本组件**不推断任务状态**；
- *      楼层号由 task.client 反查 sessions.floors 得到，不在这里另排一份楼层表；
- *   2. 只动 transform：滚动由 JS rAF 每帧写 `translateX(offset)`，offset 连续累加，
- *      不碰 width / left / top；这样增删内容（尤其是结束行）不会让已滚到一半的位置跳一下；
- *   3. 分段传送带：轨道是一串"段"（一遍内容的快照），从最右侧进、向左滚，滚出左边缘即回收、
- *      右端再补新段 —— 两遍之间只隔 5s 的行程（上一遍**最后一个字符进屏**起算 5s，下一遍
- *      头字符就进屏，见 GAP_MS），不是"整条滚出左边缘后再空等 5s"。
- *      结束行只进**一个**段（滚出去就没了，屏上绝不会同时摆好几遍）；段滚完且没有别的
- *      任务时，轨道空 → 屏上回到「暂无活跃任务」。段是快照，所以增删任务不会让屏上的字跳。
+ * Three hard constraints (carried over from FloorLcd):
+ *   1. Single source of truth: every entry comes from the server's tasks table
+ *      (/api/v1/task-feed), and this component **does not infer task state**;
+ *      the floor number is looked up by reverse-checking task.client against sessions.floors, not a
+ *      separate floor table built here;
+ *   2. Only transform is touched: the scroll is written by a JS rAF loop each frame as
+ *      `translateX(offset)`, with offset accumulating continuously; width / left / top are never
+ *      touched; this way adding or removing content (especially an ended line) does not make an
+ *      already half-scrolled position jump;
+ *   3. Segmented conveyor belt: the track is a series of "segments" (a snapshot of one pass of the
+ *      content), entering from the far right and scrolling left; a segment is recycled once it
+ *      scrolls off the left edge, and a new one is appended at the right end — between two passes
+ *      there is only a 5s run (5s counted from **the last character of the previous pass entering
+ *      the screen**, at which point the first character of the next pass enters the screen, see
+ *      GAP_MS), not "wait 5s after the whole thing has scrolled off the left edge".
+ *      An ended line enters **one** segment only (it is gone once scrolled off, and the screen
+ *      never shows several copies of it at once); once the segment has scrolled past and there are
+ *      no other tasks, the track is empty → the screen goes back to "no active tasks". A segment is
+ *      a snapshot, so adding or removing tasks does not make the text on screen jump.
  *
- * 无障碍：滚动的段码对读屏是噪音 → 屏幕本体 aria-hidden，另给一句 sr-only 的静态文本。
+ * Accessibility: the scrolling segment code is noise to a screen reader → the screen itself is
+ * aria-hidden, and a separate sr-only static text is provided.
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useSessionStore } from '../stores/sessions';
@@ -35,10 +51,12 @@ const { t } = useI18n();
 const sessions = useSessionStore();
 
 /**
- * 滚动屏的**唯一真相源**：服务端 /api/v1/task-feed（见 server/src/http/routes/query.js）。
- * 它直接按 taskId 列 tasks 表，返回每条任务的 { id, title, started_at, ended_at, client, state }，
- * state 用 taskAliveSql 归一（僵尸 running 会被判成 cancelled）—— 与楼层 / 会话**完全无关**，
- * 所以不再做楼层去重 / 会话聚合，每条活跃任务独立显示。client 反查楼层号（见 floorLabelForClient）。
+ * The **single source of truth** for the ticker: the server's /api/v1/task-feed (see
+ * server/src/http/routes/query.js). It lists the tasks table directly by taskId and returns each
+ * task's { id, title, started_at, ended_at, client, state }, with state normalized by taskAliveSql
+ * (a zombie running is judged cancelled) — **completely independent** of floors / sessions, so no
+ * floor dedup / session aggregation is done any more, and each active task is shown separately.
+ * client is reverse-looked up to a floor number (see floorLabelForClient).
  */
 const feed = ref([]);
 let feedTimer = null;
@@ -53,42 +71,49 @@ async function loadFeed() {
       detectEnded();
     }
   } catch {
-    /* 拉不到就留着上一份，别把屏闪空 */
+    /* If it cannot be fetched, keep the previous copy rather than flashing the screen empty */
   }
 }
 
 /**
- * 收工后还"看不看得见"的窗口（分钟）：服务端按这个窗口回"刚收工"的那几条，
- * 本组件据此挑出要播报的结束提示。播报只滚一遍（见 detectEnded：结束行滚出左边缘即删），
- * 窗口只决定能捕捉到哪些刚结束的任务，不影响"已结束就不再循环"。
+ * The window (minutes) during which a finished task is still "visible": the server returns the
+ * "just finished" ones within this window, and this component picks out the end notices to announce
+ * from them. An announcement scrolls only once (see detectEnded: an ended line is removed once it
+ * scrolls off the left edge); the window only decides which just-finished tasks can be caught, and
+ * does not affect "once ended, never looped again".
  */
 const END_KEEP_MIN = 5;
-/** 滚动速度（px/s）：一屏 1200px 大约 17s 走完一遍，读得完又不拖沓 */
+/** Scroll speed (px/s): a 1200px screen takes about 17s per pass, readable without dragging */
 const SPEED_PX_S = 70;
 /** Each task line occupies exactly one screen width. A long task is cut by the ellipsis on its
  *  **task text** (true width, so CJK/ASCII are both exact), while the trailing phase suffix
- *  ("（思考中）/（调用工具）/…/（任务完成）/（任务取消）") is kept and a short task leaves the rest of
+ *  ("(thinking)/(calling tools)/…/(task complete)/(task cancelled)") is kept and a short task leaves the rest of
  *  its screen-wide box blank — every line is one screen long and the spacing is uniform. */
 
-/** 已播报过的结束任务（本次会话内不重复滚）：done/cancelled/failed 只滚一遍 */
+/** Ended tasks already announced (not scrolled again within this session): done/cancelled/failed scroll only once */
 const announcedIds = new Set();
 /**
- * 轨道上的**段**（一遍内容）：段是生成时就定好的**快照**，滚出左边缘即回收、右端再补新段。
- * 这么改是因为"结束行只滚一遍"和"多份填满屏"会打架 —— 一份内容重复渲染 N 份时，
- * 同一个"任务完成"会同时在屏上摆着 N 份（实测滚出 4~5 遍）。改成分段快照后：
- *   · 结束行只进**一个段**（见 makeSeg），屏上从头到尾只有一遍，滚出去就没了；
- *   · 新开/收工的任务只影响**之后**生成的段，已在屏上的字不会被改掉、也不会跳。
+ * The **segments** on the track (one pass of content): a segment is a **snapshot** fixed at creation
+ * time; it is recycled once it scrolls off the left edge, and a new segment is appended at the right
+ * end. This change was made because "ended lines scroll only once" and "multiple copies filling the
+ * screen" conflict — when one pass of content is rendered N times, the same "task complete" would
+ * sit on screen N times at once (measured scrolling out 4~5 passes). After switching to segmented
+ * snapshots:
+ *   · an ended line enters **one segment** only (see makeSeg), so it appears exactly once from start
+ *     to finish and is gone once it scrolls off;
+ *   · newly started / finished tasks only affect segments generated **after** them; text already on
+ *     screen is neither changed nor made to jump.
  */
 const segs = ref([]);
-/** 待播报的结束行：下次补段时一起进那一段（只进一次），进完即清 */
+/** Ended lines waiting to be announced: they go into the next appended segment with it (once only), and are cleared as soon as they do */
 const pendingEnded = ref([]);
-/** 段宽/屏宽的测量脏标记：段增删、窗口或屏宽变化后要重测 */
+/** Dirty flag for segment-width / screen-width measurement: re-measure after segments change or the window or screen width changes */
 let segsDirty = true;
-/** 刚补的段还没测到宽度（有它就不继续补，免得一帧补出好几段） */
+/** The freshly appended segment has not been measured yet (while set, stop appending, so one frame does not append several segments) */
 let freshSeg = false;
-/** 段 id 序列 */
+/** Segment id sequence */
 let segSeq = 0;
-/** 本次会话启动时刻：只播报启动后才结束的任务，不回放历史（避免一启动就滚一堆"任务完成"） */
+/** This session's start time: only announce tasks finished after it, never replay history (to avoid a pile of "task complete" lines scrolling on startup) */
 const sessionStart = Date.now();
 
 /**
@@ -120,7 +145,8 @@ const WORKING_PHASES = new Set(['thinking', 'tool', 'await', 'dispatch', 'waitin
 
 /**
  * The phase shown on a **running** task line. A task that is already on the track must never read
- * "待命中" (nor "未上报" / a stale "任务完成") — it is visibly running, so the least it can be is 思考中.
+ * "(idle)" (nor "(unreported)" / a stale "(task complete)") — it is visibly running, so the least it
+ * can be is "(thinking)".
  * So: use the resolved session phase when it is an active-work phase, otherwise fall back to thinking.
  */
 function runningPhaseOfTask(it) {
@@ -137,7 +163,7 @@ function runningPhaseOfTask(it) {
  *
  * Why it cannot be baked into the line: a line only lives inside a scroll **segment**, and a segment is
  * an immutable snapshot (fixed at creation, not changed until it scrolls off). A screen-wide segment
- * lasts ~20-30s (screen width at 70px/s), so baking sampled the phase only once per segment —— a few
+ * lasts ~20-30s (screen width at 70px/s), so baking sampled the phase only once per segment — a few
  * seconds of "tool" was almost never caught and the line read "thinking" nearly always. The store poll
  * is 5s, so live is the only way it stays honest.
  */
@@ -147,7 +173,7 @@ const lineSuffixColor = (it) => (it.live ? phaseColorOf(runningPhaseOfTask(it)) 
 
 /**
  * An ended task's line: reuse the **same wording it scrolled with** (time floor task: prompt) and append
- * the phase suffix "（任务完成）/（任务取消）" — same wording and colour as the phase scheme (done green,
+ * the phase suffix "(task complete)/(task cancelled)" — same wording and colour as the phase scheme (done green,
  * cancelled/failed red). It scrolls exactly once (see pendingEnded → makeSeg) and then leaves the track.
  */
 function endedText(it) {
@@ -173,14 +199,17 @@ function endedText(it) {
   };
 }
 
-/** 从所有工程的所有会话里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded ——
- *  下次补段时跟着进那一段，**只滚一遍**。启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；
- *  announcedIds 防同一任务重复播报。结束判据用服务端统一合成的 taskState（见 server 的 sessionRegistry
- *  snapshot 里逐会话算出的 taskState），与门楣 / 主控制台同一个真相源，不再各算各的。 */
+/** Pick the tasks that "finished after this session started" from all sessions of all projects and
+ *  queue their ended lines into pendingEnded — they enter the next appended segment with it and
+ *  **scroll only once**. Tasks already finished before startup are not replayed (to avoid a pile of
+ *  "task complete" lines scrolling on startup); announcedIds prevents announcing the same task
+ *  twice. The end criterion uses the server-side unified taskState (see the per-session taskState
+ *  computed in the server's sessionRegistry snapshot), the same source of truth as the lintel and
+ *  main console, no longer computed separately. */
 function detectEnded() {
   let added = false;
   for (const it of feed.value) {
-    // 只播报"本次会话启动之后"才结束的任务，避免一启动就滚一堆"任务完成"
+    // Only announce tasks finished "after this session started", to avoid a pile of "task complete" lines scrolling on startup
     if ((it.state === 'done' || it.state === 'cancelled' || it.state === 'failed') && Number(it.ended_at) >= sessionStart) {
       if (announcedIds.has(it.id)) continue;
       announcedIds.add(it.id);
@@ -196,14 +225,14 @@ function detectEnded() {
       }
     }
   }
-  // 屏上已经空了（之前没任务）却有东西要播：立刻补一段，别等下一轮轮询才动
+  // The screen is already empty (there were no tasks) but there is something to announce: append a segment immediately, don't wait for the next poll
   if (added && segs.value.length === 0) pushSeg();
 }
 
-/** 结束行由 loadFeed（轮询 /api/v1/task-feed）触发 detectEnded 挑出，不再依赖会话快照 */
+/** Ended lines are picked out by detectEnded, triggered by loadFeed (polling /api/v1/task-feed); no longer dependent on the session snapshot */
 
 
-/** HH:mm（屏上是段码手感，只要时与分；日期交给任务记录页） */
+/** HH:mm (the screen wants a segment-display feel, only hours and minutes; the date belongs to the task records page) */
 function hhmm(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n <= 0) return '--:--';
@@ -213,9 +242,11 @@ function hhmm(ms) {
 }
 
 /**
- * 任务标题里的"用户原话"。
- * 与 TaskRecordsView 的 promptOf 同一套规则：老数据把 IDE 注入的 `# Context from my IDE setup`
- * 整段存成了标题，钩子已经不再这么存，但历史行还在库里 —— 不剥一次屏上滚的就是一屏 IDE 上下文。
+ * The "user's own words" inside a task title.
+ * Same rules as promptOf in TaskRecordsView: old data stored the whole IDE-injected
+ * `# Context from my IDE setup` block as the title, and the hook no longer stores it that way, but
+ * historical rows are still in the database — without stripping it once, what scrolls on screen is a
+ * whole screen of IDE context.
  */
 function promptOf(title) {
   const raw = String(title || '').replace(/\r\n?/g, '\n');
@@ -231,13 +262,14 @@ function promptOf(title) {
   return body.replace(/\s+/g, ' ').trim();
 }
 
-/** 不截断：保留 promptOf 取出的完整用户原话（见顶部 MAX_LEN 说明）。 */
+/** No truncation: keep the full user prompt extracted by promptOf (see the MAX_LEN note at the top). */
 const clip = (s) => s;
 
 /**
- * client（agent 基名，如 codebuddy / traecode）→ 楼层号（1F / 3F …）。
- * 与胶囊、轿厢同一份 floors 来源：拿 client 的 agent 基名去 floors[].clients 里反查，
- * 命中哪层就显示那层的 id（1F）。查不到（floors 还没加载 / 老库没 client）兜底用基名本身。
+ * client (agent base name, e.g. codebuddy / traecode) → floor number (1F / 3F …).
+ * Same floors source as the capsule and the car: take the client's agent base name and look it up in
+ * floors[].clients, and show the id (1F) of whichever floor matches. When it cannot be found (floors
+ * not loaded yet / an old database without client), fall back to the base name itself.
  */
 function floorLabelForClient(client) {
   const base = agentBase(client);
@@ -248,9 +280,10 @@ function floorLabelForClient(client) {
 }
 
 /**
- * 进行中的任务（feed 里 state === 'running'）：无限滚动循环的常驻内容。
- * 直接来自 /api/v1/task-feed，每条任务独立一行，**不再按楼层去重**——
- * 同一楼层同时跑多条（比如僵尸旧任务 + 新任务）会各自显示，互不串味。
+ * In-progress tasks (state === 'running' in the feed): the permanent content of the infinite scroll
+ * loop. Taken directly from /api/v1/task-feed, each task on its own line, **no longer deduplicated by
+ * floor** — several running at once on the same floor (say a zombie old task plus a new task) are
+ * each shown on their own, without mixing into each other.
  */
 const runningItems = computed(() => {
   return feed.value
@@ -260,11 +293,12 @@ const runningItems = computed(() => {
       const text = promptOf(it.title || '') || t('ticker.untitled');
       const taskLabel = t('ticker.taskLabel');
       const taskText = clip(text);
-      // 时间用任务真正开始的时间（tasks.started_at），不再用"当前时间"
+      // The time is the task's actual start time (tasks.started_at), no longer the "current time"
       const time = hhmm(it.started_at);
-      // 实时相位后缀：这条任务的主 Agent 现在在干什么（思考中 / 调用工具 / 等待授权 …），
-      // 颜色跟着相位色走（与主控制台同一份 PHASES）。**进行中的任务不显示"待命中"**：
-      // 它已经在屏上滚着，至少是"思考中"（见 runningPhaseOfTask）
+      // Live phase suffix: what this task's main Agent is doing right now (thinking / calling tools /
+      // waiting for authorization …), with the colour following the phase colour (the same PHASES as
+      // the main console). **A running task never shows "idle"**: it is already scrolling on screen,
+      // so the least it can be is "thinking" (see runningPhaseOfTask)
       const phase = runningPhaseOfTask(it);
       return {
         id: it.id,
@@ -289,52 +323,64 @@ const runningItems = computed(() => {
 });
 
 /**
- * 屏上摆静态居中那句话的条件：**轨道上一段都没有，且确实没东西可滚**（没有在跑的任务、
- * 也没有待播的结束行）。只按"轨道空"判断不行 —— 刚有新任务时轨道也是空的，
- * 那是要开始滚的（轨道得先渲染出来，tick 才能往里补段）。
+ * The condition for showing the static centered line: **there is no segment on the track at all, and
+ * there is truly nothing to scroll** (no running task and no ended line waiting to be announced).
+ * Judging by "track is empty" alone will not do — right when a new task appears the track is also
+ * empty, and that is when scrolling is about to start (the track must be rendered first so tick can
+ * append segments to it).
  */
 const idle = computed(
   () => segs.value.length === 0 && runningItems.value.length === 0 && pendingEnded.value.length === 0
 );
 
-/** 读屏文本：屏上那串滚动的段码对 AT 是噪音，这里给一句静态的 */
+/** Screen-reader text: the scrolling segment code on screen is noise to AT, so a static line is provided here */
 const srText = computed(() =>
   [...runningItems.value, ...pendingEnded.value].map((i) => `${i.text}${i.suffix || ''}`).join('；')
 );
 
-/* ------------------------------ 滚动（JS rAF · 分段传送带） ------------------------------
- * 轨道是一串**段**（一遍内容），段尾各带一份空档；段滚出左边缘就回收、右端随时补新段。
- *   · 段是快照：生成时定下内容，滚出去之前不改。所以新开/收工的任务只影响**之后**的段，
- *     屏上正在滚的字既不会被改掉、也不会跳位置。
- *   · 间隔 GAP_MS：段尾空档 = GAP_MS 的行程，所以"上一遍最后一个字进屏"起算 5s，
- *     下一遍的头一个字就从右边进屏 —— 屏一直在滚，没有空着不动的死等。
- *   · 结束行只滚一遍：它只随**一个段**生成（makeSeg 里 pendingEnded 进段即清），
- *     屏上不会同时摆着好几份，滚出去就没了；后面没别的任务时，轨道空 → 显示「暂无活跃任务」。 */
+/* ------------------------------ Scrolling (JS rAF · segmented conveyor belt) ------------------------------
+ * The track is a series of **segments** (one pass of content), each ending with a gap; a segment is
+ * recycled once it scrolls off the left edge, and a new segment is appended at the right end at any
+ * time.
+ *   · A segment is a snapshot: its content is fixed at creation and not changed until it scrolls
+ *     away. So newly started / finished tasks only affect segments generated **after** them, and the
+ *     text currently scrolling on screen is neither changed nor made to jump position.
+ *   · The interval GAP_MS: the gap at the end of a segment = the run of GAP_MS, so 5s counted from
+ *     "the last character of the previous pass entering the screen", at which point the first
+ *     character of the next pass enters from the right — the screen keeps scrolling and never sits
+ *     still waiting.
+ *   · An ended line scrolls only once: it is generated with **one segment** only (pendingEnded is
+ *     cleared as it enters the segment in makeSeg), so the screen never shows several copies at once
+ *     and it is gone once it scrolls off; when there are no other tasks after it, the track is empty
+ *     → "no active tasks" is shown. */
 
 const viewEl = ref(null);
 const trackEl = ref(null);
 /** Screen visible width (px) */
 const viewW = ref(0);
-/** 系统「减弱动态效果」：不滚，静态摆着 */
+/** System "reduce motion": no scrolling, laid out statically */
 const reduce = ref(false);
 let ro = null;
 let raf = null;
 let lastTs = 0;
 let offset = 0;
-/** 轨道上所有段的总宽（px，含段尾空档）：补段 / 回收的判断用它 */
+/** Total width of all segments on the track (px, including trailing gaps): used to decide appending / recycling */
 let trackW = 0;
 /**
- * 两遍之间的间隔（ms）：**从上一遍最后一个字符由右边进屏**起算，到下一遍头字符从右边进屏。
- * 不是"整条滚出后再静止等 5s" —— 那样实际间隔 = 滚出剩余行程 + 5s，读数的人会觉得等太久。
- * 屏是连续滚的，这个间隔只是"字与字之间空出的那一段行程"（gapPx），没有屏空着不动的停顿。
+ * The interval between two passes (ms): counted **from the last character of the previous pass
+ * entering from the right** until the first character of the next pass enters from the right.
+ * Not "wait still for 5s after the whole thing scrolls off" — that would make the real interval =
+ * remaining scroll distance + 5s, and a reader would feel it waits too long. The screen scrolls
+ * continuously, so this interval is just "the stretch of run left blank between characters" (gapPx),
+ * with no pause where the screen sits empty and still.
  */
 const GAP_MS = 5000;
-/** 行间距 = CSS .line 的 padding-right（48px），已算进每条实测宽度里；算段尾空档时要扣掉它，否则间隔会多出这一段 */
+/** Line spacing = the CSS .line padding-right (48px), already counted into each measured width; it must be subtracted when computing the trailing gap, otherwise the interval gains this extra stretch */
 const LINE_GAP_PX = 48;
-/** 段尾空档（px）：间隔时间 × 速度 − 行尾自带 padding，使"尾字进屏 → GAP_MS → 下一段进屏"精确成立 */
+/** Trailing gap (px): interval time × speed − the line's own trailing padding, making "last character enters screen → GAP_MS → next segment enters screen" hold exactly */
 const gapPx = () => Math.max(0, (GAP_MS / 1000) * SPEED_PX_S - LINE_GAP_PX);
 
-/** 生成一段：当前进行中的任务 + 待播报的结束行（结束行进段即清，所以它只属于这一段） */
+/** Build one segment: the currently running tasks + the ended lines waiting to be announced (an ended line is cleared as it enters, so it belongs to this segment only) */
 function makeSeg() {
   const lines = runningItems.value.map((it) => ({ ...it }));
   if (pendingEnded.value.length) {
@@ -344,15 +390,15 @@ function makeSeg() {
   return { id: `seg-${(segSeq += 1)}`, lines, w: 0 };
 }
 
-/** 右端补一段：只在该补的时候调（见 tick），补进来时它还在屏右外，看不见 */
+/** Append a segment at the right end: called only when it should be appended (see tick); when it is appended it is still off the right of the screen, invisible */
 function pushSeg() {
-  if (segs.value.length === 0) offset = viewW.value || 600; // 从空到非空：从最右进
+  if (segs.value.length === 0) offset = viewW.value || 600; // From empty to non-empty: enter from the far right
   segs.value.push(makeSeg());
   freshSeg = true;
   segsDirty = true;
 }
 
-/** 重测屏宽 + 各段宽度（写回 segs[i].w / viewW / trackW） */
+/** Re-measure the screen width + each segment's width (write back to segs[i].w / viewW / trackW) */
 function measureSegs() {
   if (viewEl.value) viewW.value = viewEl.value.clientWidth;
   const el = trackEl.value;
@@ -367,7 +413,7 @@ function measureSegs() {
     i += 1;
   }
   trackW = total;
-  if (i >= segs.value.length) freshSeg = false; // 段都量过了，可以继续补
+  if (i >= segs.value.length) freshSeg = false; // All segments measured, so appending may continue
   segsDirty = false;
 }
 
@@ -383,7 +429,7 @@ function tick(ts) {
   if (segsDirty) measureSegs();
   if (!reduce.value && segs.value.length) {
     offset -= SPEED_PX_S * dt;
-    // 回收：最左那段整个滚出左边缘就丢掉，offset 右移它的宽度 —— 后面的段原地不动，不跳
+    // Recycle: once the leftmost segment has fully scrolled off the left edge, drop it and move offset right by its width — the following segments stay put, no jump
     let head = segs.value[0];
     while (head && head.w > 0 && offset + head.w <= 0) {
       offset += head.w;
@@ -393,17 +439,19 @@ function tick(ts) {
       head = segs.value[0];
     }
   }
-  // 补段：轨道右端已经露进屏里就再补一段（补在屏右外，看不见）。
-  // 没内容可补（既没在跑的任务、也没待播的结束行）就不补 —— 剩下的段滚完，屏上回到「暂无活跃任务」。
+  // Append: once the right end of the track has come into the screen, append another segment
+  // (appended off the right of the screen, invisible). If there is no content to append (neither a
+  // running task nor an ended line waiting to be announced), do not append — the remaining segments
+  // scroll past and the screen goes back to "no active tasks".
   const hasContent = runningItems.value.length > 0 || pendingEnded.value.length > 0;
-  // +4 是提前量：赶在轨道右端露进屏**之前**补，新段就从屏外进，不会凭空冒在屏里
+  // +4 is a lead margin: append **before** the right end of the track comes into the screen, so the new segment enters from off-screen and does not pop into the screen out of nowhere
   if (!freshSeg && hasContent && offset + trackW <= viewW.value + 4) pushSeg();
   el.style.transform = `translateX(${offset}px)`;
   raf = requestAnimationFrame(tick);
 }
 
 onMounted(async () => {
-  // 滚动屏数据由自己的轮询拉取（见 loadFeed），与会话快照解耦
+  // The ticker's data is fetched by its own polling (see loadFeed), decoupled from the session snapshot
   loadFeed();
   feedTimer = setInterval(loadFeed, 3000);
   await nextTick();
@@ -421,7 +469,7 @@ onMounted(async () => {
       reduce.value = e.matches;
     };
     if (mq.addEventListener) mq.addEventListener('change', onChange);
-    else if (mq.addListener) mq.addListener(onChange); // 老 Safari
+    else if (mq.addListener) mq.addListener(onChange); // Old Safari
   }
   raf = requestAnimationFrame(tick);
 });
@@ -438,14 +486,16 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="ticker">
-    <!-- 屏左边的静态标签：说明这块屏滚的是什么（所有楼层的任务），它**不参与滚动** -->
+    <!-- Static label at the left of the screen: explains what this screen scrolls (tasks from all floors); it **does not take part in the scroll** -->
     <span class="tag">{{ t('ticker.tag') }}</span>
     <div ref="viewEl" class="screen" :style="{ '--screen-w': (viewW > 0 ? viewW : 100000) + 'px' }">
-      <!-- 没有任务：静态居中一句，不滚 -->
+      <!-- No tasks: a static centered line, no scrolling -->
       <span v-if="idle" class="idle-line">{{ t('ticker.no_task') }}</span>
-      <!-- 有内容：滚动的段码不进无障碍树，读屏听下面的 .sr。
-           轨道是一串段（一遍内容），段尾各带 --loop-gap 空档；滚出左边的段被回收、右端再补新段。
-           结束行只进其中一段，所以屏上从头到尾只有一遍「任务完成」，滚出去就没了。位移由 JS rAF 驱动。 -->
+      <!-- Has content: the scrolling segment code does not enter the accessibility tree; a screen reader
+           reads the .sr below. The track is a series of segments (one pass of content), each ending with a
+           --loop-gap gap; a segment scrolling off the left is recycled and a new one is appended at the
+           right. An ended line enters only one of the segments, so "task complete" appears exactly once
+           from start to finish and is gone once it scrolls off. The offset is driven by JS rAF. -->
       <div
         v-else
         ref="trackEl"
@@ -454,7 +504,7 @@ onBeforeUnmount(() => {
         :style="{ '--loop-gap': `${gapPx()}px` }"
         aria-hidden="true"
       >
-        <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
+        <!-- Under reduce motion it is laid out statically, showing only one segment (several segments just look like the same line repeating) -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
         <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="lineSuffix(it)" class="suf" :style="{ color: lineSuffixColor(it) }">{{ lineSuffix(it) }}</span></span>
         </span>
@@ -466,7 +516,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-/* 门楣里的一列：标签占自己那份宽，剩下**全给这块屏**（屏尽可能长，见 ElevatorDoors） */
+/* One column in the lintel: the label takes its own width and the rest **all goes to this screen** (the screen as long as possible, see ElevatorDoors) */
 .ticker {
   flex: 1 1 auto;
   min-width: 0;
@@ -475,13 +525,14 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
-/* 屏左边的静态标签：说清这块屏滚的是什么。它不滚、也不跟着内容变宽。
-   纯文字，别给它描边 / 底色 —— 有框+有底看着就是一枚不能点的按钮，那不是它。 */
+/* Static label at the left of the screen: it makes clear what this screen scrolls. It does not scroll
+   and does not widen with the content. Plain text only; do not give it an outline / background — a
+   border plus a background looks like a button that cannot be clicked, which it is not. */
 .tag {
   flex: none;
   display: flex;
   align-items: center;
-  height: calc(var(--lcd-slot, 26px) + 16px); /* 与屏等高，两个盒子顶底齐平 */
+  height: calc(var(--lcd-slot, 26px) + 16px); /* Same height as the screen, so the two boxes line up top and bottom */
   padding: 0 8px 0 2px;
   font-size: 12px;
   letter-spacing: 1px;
@@ -489,15 +540,17 @@ onBeforeUnmount(() => {
   color: var(--text-dim, #9aa3b2);
 }
 
-/* 屏壳：暗底 + 清晰字体，高度沿用液晶屏那一格（--lcd-slot） */
+/* Screen shell: dark background + crisp type, height reusing the LCD slot (--lcd-slot) */
 .screen {
   position: relative;
-  flex: 1 1 auto; /* 门楣剩下的宽度全给屏，标签只占它自己那点 */
+  flex: 1 1 auto; /* The rest of the lintel's width all goes to the screen; the label takes only its own bit */
   min-width: 0;
   display: flex;
   align-items: center;
-  /* 轨道锚定左边缘：translateX(offset) 从 viewW(最右进) 一路走到 -period(一份滚完回绕)，
-     内容比屏窄时也贴着左边缘滚到底、不居中停留（否则"短内容滚不到最左、卡在中间"） */
+  /* The track is anchored to the left edge: translateX(offset) runs from viewW (entering at the far
+     right) all the way to -period (one pass done and wrapped), so even content narrower than the screen
+     scrolls flush to the left edge instead of stopping centered (otherwise "short content never reaches
+     the far left and gets stuck in the middle") */
   justify-content: flex-start;
   height: calc(var(--lcd-slot, 26px) + 16px);
   overflow: hidden;
@@ -508,7 +561,7 @@ onBeforeUnmount(() => {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
 }
 
-/* 扫描线：静态背景（不参与动画），手感来自"有栅格"而不是"在闪" */
+/* Scanlines: a static background (not animated); the feel comes from "having a grid" rather than "flashing" */
 .scan {
   position: absolute;
   inset: 0;
@@ -520,14 +573,15 @@ onBeforeUnmount(() => {
   );
 }
 
-/* 轨道：传送带本体，若干份（.seg）横排；位移由 JS rAF 直接写 transform，不挂 CSS 动画 */
+/* Track: the conveyor belt itself, laid out with several .seg in a row; the offset is written directly as transform by JS rAF, with no CSS animation attached */
 .track {
   display: flex;
   flex: none;
 }
 
-/* 一段（一整遍内容）：段尾的空档 = --loop-gap（= GAP_MS 的行程 − 行尾自带的 padding），
-   它就是"上一遍最后一个字"到"下一遍第一个字"之间那段空白 —— 间隔时间由它决定，见 GAP_MS */
+/* One segment (a whole pass of content): its trailing gap = --loop-gap (= the run of GAP_MS − the
+   line's own trailing padding); that is the blank between "the last character of the previous pass"
+   and "the first character of the next pass" — the interval is determined by it, see GAP_MS */
 .seg {
   display: flex;
   flex: none;
@@ -541,24 +595,24 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   /* One task line occupies exactly one screen: `width` (not `max-width`) with no flex-grow leaves the
      rest of a short task's box blank, while a long task is cut by the ellipsis on `.task-text` only.
-     The trailing status word (`.suf`) is `flex: none`, so "（完成）/（已取消）" is never pushed out. */
+     The trailing status word (`.suf`) is `flex: none`, so "(done)/(cancelled)" is never pushed out. */
   width: var(--screen-w, 100%);
   overflow: hidden;
-  /* 条目之间的空档：一条滚完再接下一条，别让两条粘在一起 */
+  /* Gap between entries: one line finishes scrolling before the next follows, so two lines are not stuck together */
   padding-right: 48px;
   white-space: nowrap;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
   font-size: 15px;
   font-weight: 500;
   letter-spacing: 0.5px;
-  /* 行本体色 = 楼层桌面木件色（圆点、时间、楼层号、"任务："标签都继承它），
-     没设楼层色时兜底用运行蓝 */
+  /* Line body colour = the floor desktop's wood tone (the dot, time, floor number and "task:" label
+     all inherit it); when no floor colour is set, fall back to the running blue */
   color: var(--floor-color, var(--accent, #4c8dff));
 }
 
 /* The prefixes (time / floor / "task:" label) and the trailing phase suffix always render in full:
    only the **task prompt** (.task-text) may be ellipsised (flex-shrink + min-width:0 + ellipsis). So the
-   suffix ("（思考中）/（任务完成）…") always stays visible right after the prompt and is never pushed off
+   suffix ("(thinking)/(task complete)…") always stays visible right after the prompt and is never pushed off
    screen by a long title — that was the root cause of the "ended line shows ... but no status word" bug. */
 .line .time,
 .line .floor,
@@ -587,11 +641,11 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 6px currentColor;
 }
 
-/* 一行里分段上色：
-   · 圆点 / 时间 / 楼层号(xF) / "任务：" 标签 / 任务原话 → 全部用楼层桌面的木件色
-     （--floor-color，colorsFor(floor).wood），跟办公室里那一层的桌椅木件同色，
-     一眼能认出是哪层的任务；
-   · 结束行末尾的状态字（.suf）→ 绿/红，独立上色。 */
+/* Per-part colouring within a line:
+   · dot / time / floor number (xF) / "task:" label / task prompt → all use the floor desktop's wood
+     tone (--floor-color, colorsFor(floor).wood), the same colour as that floor's desks and chairs in
+     the office, so you can tell at a glance which floor a task belongs to;
+   · the status word at the end of an ended line (.suf) → green/red, coloured independently. */
 .line .time,
 .line .floor,
 .line .task-label,
@@ -604,14 +658,16 @@ onBeforeUnmount(() => {
    whole-line status colouring. The trailing phase suffix (.suf) carries its own phase colour,
    independent of the line body. */
 
-/* 末尾相位后缀：颜色由 JS 按相位色内联写（`.suf` 的 color，见 PHASES），这里只管发光。
-   相位色与主控制台同一份：思考中黄 / 调用工具蓝 / 等待授权橙 / 任务完成绿 / 任务取消红。 */
+/* Trailing phase suffix: the colour is written inline by JS from the phase colour (the `color` of
+   `.suf`, see PHASES); this rule only handles the glow. The phase colours are the same set as the main
+   console: thinking yellow / calling tools blue / waiting for authorization orange / task complete
+   green / task cancelled red. */
 .suf {
   flex: none;
   text-shadow: 0 0 6px currentColor;
 }
 
-/* 没有任务：静态居中（轨道用 flex-start 贴左，这句单独用 auto 居中），颜色比"暗段"亮一档 */
+/* No tasks: static centered (the track uses flex-start flush left; this line is centered alone with auto), one notch brighter than a "dim segment" */
 .idle-line {
   margin: 0 auto;
   padding: 0 12px;
@@ -623,10 +679,10 @@ onBeforeUnmount(() => {
   color: var(--text-dim, #9aa3b2);
 }
 
-/* 系统「减弱动态效果」：不滚，JS 那边把 offset 固定为 0（见 tick），
-   轨道本就没有 CSS 动画，这里无需再禁。 */
+/* System "reduce motion": no scrolling, and the JS side fixes offset at 0 (see tick); the track has no
+   CSS animation anyway, so there is nothing to disable here. */
 
-/* 屏上段码不进无障碍树（见模板 aria-hidden），这一句是给 AT 的替代文本 */
+/* The segment code on screen does not enter the accessibility tree (see aria-hidden in the template); this line is the alternative text for AT */
 .sr {
   position: absolute;
   width: 1px;

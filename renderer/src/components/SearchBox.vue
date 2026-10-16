@@ -15,7 +15,7 @@ let timer = null;
 
 watch(local, (v) => {
   if (timer) clearTimeout(timer);
-  timer = setTimeout(() => emit('update:modelValue', v), 200); // 防抖
+  timer = setTimeout(() => emit('update:modelValue', v), 200); // debounce
 });
 
 watch(

@@ -1,9 +1,9 @@
 <script setup>
 /**
- * 设置面板：把原来的「中文 / En」语言开关升级成一个「设置」按钮 + 弹出面板。
- * 面板里放：语言切换、版本号（含最近 commit 短 sha）、Electron / Node 运行时版本、
- * GitHub / 反馈外链、以及退出应用。
- * 语言切换即时生效并记住（见 i18n/index.js 的 setLocale），其余行走 Electron 桥接（bridge.js）。
+ * Settings panel: upgrades the old "Chinese / En" language toggle into a "Settings" button + popup panel.
+ * The panel holds: language switch, version number (with the latest commit short sha), Electron / Node runtime versions,
+ * GitHub / feedback external links, and quitting the app.
+ * The language switch takes effect immediately and is remembered (see setLocale in i18n/index.js); the rest go through the Electron bridge (bridge.js).
  */
 import { ref, computed } from 'vue';
 import { useI18n } from '../i18n';
@@ -12,9 +12,9 @@ import { getBuildInfo, openExternal, quitApp } from '../api/bridge';
 const { locale, setLocale, locales, t } = useI18n();
 
 const open = ref(false);
-// 构建信息：版本号 + commit 短 sha + 运行时版本；读取失败前显示占位，读取后替换
+// Build info: version number + commit short sha + runtime versions; shows placeholders until read succeeds, then replaces them
 const info = ref({ version: '—', commit: '', electron: '', node: '' });
-// 外链：项目仓库在 GitHub，反馈走 Issues 页（这两个地址在仓库里是确定的，改这里即可）
+// External links: the project repo is on GitHub, feedback goes through the Issues page (these two addresses are fixed in the repo, just change them here)
 const GITHUB_URL = 'https://github.com/Ingrid-he531/WorkGremlin';
 const FEEDBACK_URL = 'https://github.com/Ingrid-he531/WorkGremlin/issues';
 
@@ -30,11 +30,11 @@ async function loadInfo() {
       };
     }
   } catch {
-    /* 读不到就保留占位 */
+    /* If it cannot be read, keep the placeholder */
   }
 }
 
-// 应用版本展示格式：0.1.10(xxxxxxxx)，commit 取不到就只显示版本号
+// App version display format: 0.1.10(xxxxxxxx); if the commit is unavailable, show only the version number
 const appVersion = computed(() => {
   const v = info.value;
   return v.commit ? `${v.version}(${v.commit})` : v.version;
@@ -71,7 +71,7 @@ function onQuit() {
     >{{ t('nav.settings') }}</button>
 
     <template v-if="open">
-      <!-- 透明遮罩：点面板以外任意处关闭（按钮自身已 stop 冒泡，不会立即触发关闭） -->
+      <!-- Transparent overlay: clicking anywhere outside the panel closes it (the button itself already stops propagation, so it will not trigger close immediately) -->
       <div class="pop-mask" @click="close" />
       <div class="pop" role="menu" data-testid="settings-pop">
         <div class="pop-title">{{ t('settings.title') }}</div>
@@ -132,7 +132,7 @@ function onQuit() {
 .set-btn:hover { color: var(--text); }
 .set-btn.on { color: var(--accent); background: var(--accent-soft); }
 
-/* 遮罩：铺满视口、透明，专门用来「点外面关闭」；面板 z-index 更高，不会被它挡住 */
+/* Overlay: fills the viewport, transparent, dedicated to "click outside to close"; the panel has a higher z-index and is not blocked by it */
 .pop-mask { position: fixed; inset: 0; z-index: 900; }
 .pop {
   position: absolute;

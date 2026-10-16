@@ -20,6 +20,7 @@
  *   D. state file      hb.pid (hasOtherLiveSession criterion 1) / model
  *   E. subagent ghosts  `task` tool → entry; the sweep only touches this session's own client
  *   F. edges           both generations accepted; no title → no fabricated summary
+ *   G. v2 subagents    child session (parentID) → ghost spawn/finish, never an independent task
  */
 'use strict';
 
@@ -365,6 +366,39 @@ head('[F] 边界：两代信封都认 / OpenCode v2 事件词汇 / 拿不到标�
     Boolean(end2) && end2.body.state === 'done' && end2.body.tokens && end2.body.tokens.input === 11 && end2.body.tokens.output === 5,
     JSON.stringify(end2 && end2.body)
   );
+
+  /* [G] OpenCode v2 subagent = a child session (parentID) → a ghost, not an independent task.
+     Regression (measured 2026-10-16): the `subagent` tool spawned a child session whose
+     `session.inbox.enqueued(user)` opened its own ledger task, so a summoned subagent showed up as a
+     separate task in the list instead of a ghost floating over the summoned gremlin. */
+  const GPARENT = 'ses_oc_p2';
+  const GCHILD = 'ses_oc_c2';
+  ctx2.emit(v2('session.created', { sessionID: GPARENT }));
+  ctx2.emit(v2('session.inbox.enqueued', { sessionID: GPARENT, item: { type: 'user', payload: { text: '"派个子代理去查"' } } }));
+  await settle();
+  const pStart = [...seen].reverse().find((s) => s.route === '/api/v1/task/start' && s.body.sessionId === GPARENT);
+  ok('父会话照常开任务（子代理的 ghost 挂在它下面）', Boolean(pStart), JSON.stringify(routes().slice(-6)));
+  ctx2.emit(v2('session.created', { sessionID: GCHILD, parentID: GPARENT, agent: 'explore', title: '顺手查一下' }));
+  ctx2.emit(v2('session.inbox.enqueued', { sessionID: GCHILD, item: { type: 'user', payload: { text: '"子代理的提示词"' } } }));
+  ctx2.emit(v2('session.execution.started', { sessionID: GCHILD }));
+  ctx2.emit(v2('session.text.ended', { sessionID: GCHILD, text: '"查到了"' }));
+  ctx2.emit(v2('session.execution.succeeded', { sessionID: GCHILD }));
+  await settle();
+  const gSpawn = [...seen].reverse().find((s) => s.route === '/api/v1/ghost' && s.body.action === 'spawn' && s.body.id === GCHILD);
+  ok('子会话 session.created(parentID) → /ghost spawn（按子会话 id）', Boolean(gSpawn), JSON.stringify(seen.filter((s) => s.route === '/api/v1/ghost').map((s) => s.body)));
+  ok(
+    '幽灵名字取子会话 agent、任务取 title、sessionId 是父会话、parent 是父任务',
+    gSpawn && gSpawn.body.name === 'explore' && gSpawn.body.task === '顺手查一下' && gSpawn.body.sessionId === GPARENT && gSpawn.body.parent === (pStart && pStart.body.taskId),
+    gSpawn && JSON.stringify(gSpawn.body)
+  );
+  ok(
+    '子会话**不**新开任务（不再当独立任务显示）',
+    !seen.some((s) => s.route === '/api/v1/task/start' && s.body.sessionId === GCHILD),
+    JSON.stringify(routes().slice(-8))
+  );
+  const gEnd = [...seen].reverse().find((s) => s.route === '/api/v1/ghost' && s.body.action === 'finish' && s.body.id === GCHILD);
+  ok('子会话 execution.succeeded → /ghost finish（散场）', Boolean(gEnd) && gEnd.body.name === 'explore', JSON.stringify(gEnd && gEnd.body));
+  ok('散场带上子代理最后说的话', gEnd && gEnd.body.result === '查到了', gEnd && gEnd.body.result);
   if (typeof off2 === 'function') off2();
 }
 

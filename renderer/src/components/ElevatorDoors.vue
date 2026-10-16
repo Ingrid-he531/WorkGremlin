@@ -1,26 +1,26 @@
 <script setup>
 /**
- * ElevatorDoors —— 门楣（电梯门上方那块长屏）+ 主舞台的两扇门。
+ * ElevatorDoors —— the lintel (the long screen above the elevator doors) + the two doors of the main stage.
  *
- * 设计依据：design-elevator-transition.md §1（门做在主舞台而不是轿厢上）/ §7.2、
- *          design-elevator-effort.md §2.4（门楣液晶屏）。
+ * Design basis: design-elevator-transition.md §1 (the doors are built on the main stage rather than on the car) / §7.2,
+ *          design-elevator-effort.md §2.4 (the lintel LCD screen).
  *
- * 结构（一列两层，像真电梯的门套）：
+ * Structure (one column, two layers, like a real elevator door frame):
  *   .elevator-doors
- *     ├─ .lintel  ← 门楣：**不参与动画**的墙带，屏固定在这里（真实电梯的层站指示器位置）
- *     │              项目名已挪到顶栏（"设置"那一行）居中，这里只有任务滚动屏（吃掉整条宽度）
- *     └─ .portal  ← 门洞：主舞台内容 + 两扇门扇，门只在这个区域内开合
+ *     ├─ .lintel  ← lintel: a wall band that **does not participate in the animation**, the screen is fixed here (the landing indicator position of a real elevator)
+ *     │              the project name has moved to the top bar (the "settings" row) centered, here there is only the task ticker screen (which eats the whole width)
+ *     └─ .portal  ← door opening: the main stage content + the two door leaves, the doors only open and close within this area
  *
- * 屏上滚的是**所有楼层的当前任务**（TaskTicker），不再是"当前楼层"：
- * 楼层在左边胶囊与轿厢里都有，门楣这块最宽的地方留给"各层正在发生什么"更有用。
+ * What scrolls on the screen is the **current task of all floors** (TaskTicker), no longer "the current floor":
+ * the floor is available both in the left capsule and in the car, and this widest lintel area is better left for "what is happening on each floor".
  *
- * 要点：
- *   - 门是**装饰层**：`pointer-events: none` + `aria-hidden`，关门瞬间也不许吞点击；
- *   - 门扇只盖住 .portal，所以关门/滑行时不会压住门楣上的屏（屏在门上方，看得见）；
- *   - 位移只动 `transform`（`translateX(±100%)` ↔ 0），不碰 width / left / top；
- *   - 状态完全由 `data-phase` 属性驱动（不用 `<Transition>`、不上 WAAPI —— 设计已否决）；
- *   - `will-change` 只在非 idle 时挂，进 idle 立刻摘（常驻会长期占着合成层显存）；
- *   - 到层响一声"叮"：phase 进 `opening`（门开始开）那一刻触发，见 elevatorChime.js。
+ * Key points:
+ *   - the doors are a **decorative layer**: `pointer-events: none` + `aria-hidden`, they must not swallow clicks even at the moment of closing;
+ *   - the door leaves only cover .portal, so closing/sliding will not press on the screen on the lintel (the screen is above the doors and stays visible);
+ *   - displacement only moves `transform` (`translateX(±100%)` ↔ 0), never touches width / left / top;
+ *   - state is fully driven by the `data-phase` attribute (no `<Transition>`, no WAAPI —— the design already rejected them);
+ *   - `will-change` is attached only when not idle and removed immediately on entering idle (keeping it permanently would hold the compositing layer memory long-term);
+ *   - a "ding" sounds on arrival: triggered at the moment phase enters `opening` (the doors start to open), see elevatorChime.js.
  */
 import { watch } from 'vue';
 import TaskTicker from './TaskTicker.vue';
@@ -30,22 +30,22 @@ import { useI18n } from '../i18n';
 const { t } = useI18n();
 
 const props = defineProps({
-  /** idle | closing | moving | opening | settling —— 来自 useElevator 的 phase */
+  /** idle | closing | moving | opening | settling —— the phase from useElevator */
   phase: { type: String, default: 'idle' },
-  /** 降级档（系统「减弱动态效果」）的淡出/淡入开关，来自 useElevator 的 flash */
+  /** the fade-out/fade-in switch of the degraded mode (the system's "reduce motion"), from useElevator's flash */
   flash: { type: Boolean, default: false },
-  /** 门楣右边那块任务滚动屏是否显示。任务记录页等非电梯场景不需要它，
-   *  关掉门楣不会空出一块黑屏。默认开（办公室等页面仍然显示）。 */
+  /** whether the task ticker screen on the right of the lintel is shown. Non-elevator scenes such as the task records page do not need it,
+   *  turning off the lintel will not leave a blank black block. Default on (pages such as the office still show it). */
   showScreen: { type: Boolean, default: true },
-  /** 整条门楣（任务滚动屏）是否显示。任务记录页整页都不需要电梯门楣，关掉它，
-   *  内容直接顶到顶部。默认开（办公室等电梯场景保留门楣）。 */
+  /** whether the whole lintel (task ticker screen) is shown. The task records page does not need the elevator lintel at all, turning it off,
+   *  the content goes straight to the top. Default on (elevator scenes such as the office keep the lintel). */
   showLintel: { type: Boolean, default: true },
 });
 
 watch(
   () => props.phase,
   (p, prev) => {
-    // 到站：门开始开的那一刻"叮"。只在**进入** opening 时响一次（settling / idle 不重复响）
+    // arrival: a "ding" at the moment the doors start to open. It rings only once when **entering** opening (settling / idle do not ring again)
     if (p === 'opening' && prev !== 'opening') playArrivalChime();
   }
 );
@@ -53,14 +53,14 @@ watch(
 
 <template>
   <div class="elevator-doors" :data-phase="phase" :data-flash="flash ? 'on' : 'off'">
-    <!-- 门楣：墙带 + 任务滚动屏。门扇在下面的 .portal 里滑，够不到这里。
-         项目名已挪到顶栏（"设置"那一行）居中，这里只留滚动屏（吃掉整条宽度，
-         屏要尽可能长 —— 一行里得装得下"时刻 + 楼层 + 用户原话"） -->
+    <!-- lintel: wall band + task ticker screen. The door leaves slide in the .portal below and cannot reach here.
+         The project name has moved to the top bar (the "settings" row) centered, here only the ticker screen is left (it eats the whole width,
+         the screen must be as long as possible —— one row has to fit "time + floor + the user's own words") -->
     <div v-if="showLintel" class="lintel">
       <TaskTicker v-if="showScreen" class="lintel-screen" />
     </div>
     <div class="portal">
-      <!-- 内容外面再包一层：这是"内容就位"动效的作用对象（直接给 slot 内容的根元素写样式会落到子组件上） -->
+      <!-- wrap the content in one more layer: this is the target of the "content in place" animation (writing styles directly on the root element of the slot content would land on the child component) -->
       <div class="stage-wrap">
         <slot />
       </div>
@@ -72,22 +72,22 @@ watch(
 
 <style scoped>
 .elevator-doors {
-  /* 顶替原来 .stage 在 .body 里的角色：撑满主区；门是绝对定位的，所以自己要 relative */
+  /* takes over the role the old .stage had in .body: fill the main area; the doors are absolutely positioned, so this itself must be relative */
   position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
-  flex-direction: column; /* 上：门楣（屏）／下：门洞（舞台 + 门扇） */
+  flex-direction: column; /* above: the lintel (screen) / below: the door opening (stage + door leaves) */
   overflow: hidden;
 }
 
-/* 门楣：屏固定在这里。高度由内容（屏）撑，不写死 —— 改屏的字号不用回来改这里。
+/* lintel: the screen is fixed here. The height is driven by the content (the screen), not hardcoded —— changing the screen font size needs no change back here.
  *
- * 外观：和下面的办公室画布**同色、同框、同圆角**（--iso-bg / --border / --radius），
- * 外围再留出一圈（margin 12px，与 .stage 的 padding 对齐，所以门楣和画布的左右边是一条竖线）。
- * 也就是说它**不是**"贴着窗口顶边的一条色带"，而是和画布并排的同一块板 ——
- * 底色跟画布一样，屏才像装在那块板上，而不是浮在一条异色横条里。 */
+ * appearance: same color, same frame, same radius as the office canvas below (--iso-bg / --border / --radius),
+ * with one more ring left around it (margin 12px, aligned with .stage's padding, so the left and right edges of the lintel and the canvas form one vertical line).
+ * That is, it is **not** "a color band stuck to the top edge of the window", but the same board sitting side by side with the canvas ——
+ * the background is the same as the canvas, so the screen looks like it is mounted on that board rather than floating in a differently-colored bar. */
 .lintel {
   flex: none;
   display: flex;
@@ -100,15 +100,15 @@ watch(
   border-radius: var(--radius);
 }
 
-/* 任务滚动屏：吃掉门楣**整条**宽度（屏尽可能长）。
-   它是子组件（TaskTicker）的根元素 —— scoped 样式能命中子组件根元素，所以这里给宽度就够，
-   屏壳自己的样子（暗底 / 等宽字 / 扫描线）由组件内部管。 */
+/* task ticker screen: it eats the **entire** width of the lintel (the screen as long as possible).
+   It is the root element of the child component (TaskTicker) —— scoped styles can hit the child component root, so giving the width here is enough,
+   the screen shell's own look (dark background / monospace font / scanlines) is managed inside the component. */
 .lintel-screen {
   flex: 1 1 auto;
   min-width: 0;
 }
 
-/* 门洞：舞台内容与门扇的容器，门扇滑到 ±100% 时不撑出横向滚动条 */
+/* door opening: the container of the stage content and the door leaves, so that when the leaves slide to ±100% no horizontal scrollbar is pushed out */
 .portal {
   position: relative;
   flex: 1;
@@ -117,10 +117,10 @@ watch(
   overflow: hidden;
 }
 
-/* 内容就位（设计 §2 段 4）：换脸发生在关门 70% 处，所以"新内容"在 moving 段就已经在里面了 ——
-   先把整块内容藏起来（moving 全程门是关的，藏了也看不见），门一开始开就 120ms
-   opacity/scale 归位。藏的是内容、不是整个舞台：门开的时候不能让人看见一块空白板。
-   注意这里没用 [data-phase='closing'] 藏 —— 关门第一帧门还全开着，那一瞬间内容会闪没。 */
+/* content in place (design §2 paragraph 4): the swap happens at 70% of the closing, so the "new content" is already inside during the moving phase ——
+   first hide the whole block of content (the doors are closed throughout moving, so hiding it is invisible), and as soon as the doors start to open it returns in 120ms
+   via opacity/scale. What is hidden is the content, not the entire stage: when the doors open one must not see a blank board.
+   Note that [data-phase='closing'] is not used to hide here —— on the first frame of closing the doors are still fully open, and at that instant the content would flash away. */
 .stage-wrap {
   flex: 1;
   min-width: 0;
@@ -134,11 +134,11 @@ watch(
 [data-phase='moving'] .stage-wrap {
   opacity: 0;
   transform: scale(0.985);
-  transition: none; /* 这一段全程被门盖着，不需要过渡（等门开时再滑回来） */
+  transition: none; /* this whole stretch is covered by the doors, no transition needed (it slides back when the doors open) */
 }
 
-/* 降级档（系统「减弱动态效果」）：不演电梯，但也不硬切 —— 40ms 淡出、换脸、40ms 淡入。
-   时长走 --dur-flash，与 useElevator 的 FLASH_MS 一一对应。 */
+/* degraded mode (the system's "reduce motion"): no elevator performance, but no hard cut either —— 40ms fade out, swap, 40ms fade in.
+   The duration uses --dur-flash, one-to-one with useElevator's FLASH_MS. */
 [data-flash='on'] .stage-wrap {
   opacity: 0;
   transition-duration: var(--dur-flash);
@@ -153,11 +153,11 @@ watch(
   width: 50%;
   z-index: 5;
   background: var(--bg-panel, #1b2029);
-  pointer-events: none; /* 纯装饰：关门瞬间也不许吞点击 */
+  pointer-events: none; /* purely decorative: it must not swallow clicks even at the moment of closing */
   transition: transform var(--dur-door-open) var(--ease-door-open);
 }
 
-/* 门缝：两扇门合拢处留一条线，door-r 的缝在它自己左边 */
+/* door seam: a line is left where the two leaves meet, door-r's seam is on its own left */
 .door-l {
   transform: translateX(-100%);
   border-right: 1px solid var(--border-strong, #333b4a);
@@ -169,7 +169,7 @@ watch(
   border-left: 1px solid var(--border-strong, #333b4a);
 }
 
-/* idle：门开到底。写死在 idle 态，避免首帧闪一下全屏门（effort §2-2 踩坑点 ④） */
+/* idle: the doors are fully open. Hardcoded in the idle state to avoid a first frame flashing a full-screen door (effort §2-2 pitfall ④) */
 [data-phase='idle'] .door-l {
   transform: translateX(-100%);
 }
@@ -178,21 +178,21 @@ watch(
   transform: translateX(100%);
 }
 
-/* closing：合拢。曲线先加速后贴合、尾段不过冲（门撞门不好看） */
+/* closing: coming together. The curve accelerates first then seats, with no overshoot at the tail (doors bumping looks bad) */
 [data-phase='closing'] .door {
   transform: translateX(0);
   transition-duration: var(--dur-door-close);
   transition-timing-function: var(--ease-door-close);
 }
 
-/* moving：保持闭合。目标值没变 → 不会重新起 transition，只是把上面那条规则接住 */
+/* moving: keep closed. The target value is unchanged → no new transition is started, this just catches the rule above */
 [data-phase='moving'] .door {
   transform: translateX(0);
 }
 
-/* opening / settling 走 .door 的默认态（translateX(±100%) + 开门时长/曲线） */
+/* opening / settling use .door's default state (translateX(±100%) + open duration/curve) */
 
-/* will-change 只在动画期间挂，进 idle 立刻摘 —— 由 phase 驱动，不用 transitionend（会丢事件） */
+/* will-change is attached only during animation and removed immediately on entering idle —— driven by phase, not transitionend (which drops events) */
 .elevator-doors:not([data-phase='idle']) .door {
   will-change: transform;
 }

@@ -1,9 +1,9 @@
 <script setup>
 /**
- * ChatPanel —— 常驻右侧的沟通记录抽屉（360px，可折叠）。
+ * ChatPanel —— a communication-log drawer permanently on the right (360px, collapsible).
  *
- * 与办公室联动：选中工位后这里只显示该成员的往来消息；点气泡里的头像可反向选中工位。
- * 自动跟随滚动：用户手动上滚则暂停跟随并显示「N 条新消息」。
+ * Interlocked with the office: after selecting a workstation, only that member's exchanges are shown here; clicking the avatar in a bubble inversely selects the workstation.
+ * Auto-follow scrolling: when the user scrolls up manually, following is paused and "N new messages" is shown.
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import AgentAvatar from './AgentAvatar.vue';
@@ -54,7 +54,7 @@ watch(() => msgs.autoFollow, (v) => {
 });
 onMounted(toBottom);
 
-/** 点气泡 = 选中该成员的工位 */
+/** Clicking a bubble = selecting that member's workstation */
 function pick(id) {
   if (!id) return;
   emit('select', id);

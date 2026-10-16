@@ -124,6 +124,10 @@ function start() {
   timer = setInterval(() => {
     nowMs.value = Date.now();
     tasks.fetchTasks();
+    // Refresh the selected task's subagents too: a running task can summon **new** subagents after it
+    // was selected, so fetching only in selectTask left the detail pane stuck on "loading subagents"
+    // (subagentCount > 0 but the list never reloaded).
+    if (tasks.selectedTaskId) tasks.fetchSubagents(tasks.selectedTaskId);
   }, POLL_MS);
 }
 function stop() {

@@ -58,7 +58,8 @@ async function runHook(eventName, payload = {}, session = SESSION) {
 }
 
 const runCount = () => repo.raw.prepare('SELECT COUNT(*) AS c FROM subagent_runs').get().c;
-const member = (name) => repo.getMember.get(`subagent-${name}@${PROJECT_ID}`);
+/** Any live ghost member named `name` (each instance now has its own suffixed id, so look up by name) */
+const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_id = ? AND name = ? AND ephemeral = 1').get(PROJECT_ID, name);
 
 (async () => {
   console.log('并发 hook：召唤不丢 + 幽灵归属扫场');

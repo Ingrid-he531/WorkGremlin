@@ -1,9 +1,9 @@
 <script setup>
 /**
- * AgentAvatar —— 成员形象（头像用法）。
+ * AgentAvatar —— the member figure (avatar usage).
  *
- * 造型与状态动画都在 GremlinSprite 里，这里只负责：
- * 尺寸、容器、离线灰阶、degraded 虚线圈（提示"这是推断值"）。
+ * The shape and state animations live in GremlinSprite; this only handles:
+ * size, container, offline grayscale, degraded dashed circle (indicating "this is an inferred value").
  */
 import { computed } from 'vue';
 import GremlinSprite from './GremlinSprite.vue';
@@ -14,18 +14,18 @@ import { useI18n } from '../i18n';
 
 const { t } = useI18n();
 const props = defineProps({
-  /** 成员名或 memberId（coder@workgremlin） */
+  /** Member name or memberId (coder@workgremlin) */
   name: { type: String, required: true },
   state: { type: String, default: 'offline' },
   degraded: { type: Boolean, default: false },
-  /** 像素尺寸 */
+  /** Pixel size */
   size: { type: Number, default: 76 },
 });
 
 const agentId = computed(() => props.name.split('@')[0]);
 const skin = computed(() => avatarOf(props.name));
 const isOffline = computed(() => props.state === 'offline');
-/** 临时组队成员：用幽灵形象（没有工位，不占专家名额） */
+/** Temporary team member: uses the ghost form (no workstation, does not take an expert slot) */
 const ephemeral = computed(() => isEphemeralMember({ memberId: props.name }));
 </script>
 
@@ -64,7 +64,7 @@ svg {
   opacity: 0.5;
 }
 
-/* degraded：值为推断，非上报真值 */
+/* degraded: the value is inferred, not a reported true value */
 .avatar.degraded::after {
   content: '';
   position: absolute;

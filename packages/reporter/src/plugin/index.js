@@ -62,6 +62,16 @@
  *   session.usage.updated                     session-level usage (ignored: step tokens are per-round)
  *   permission.asked / permission.replied     awaiting permission (the phase polling cannot produce)
  *
+ * Subagent summons (v2): a `task` / `subagent` tool call runs the subagent in a **child session** —
+ * `session.created` carries `parentID` (the caller), `agent` (the subagent type) and `title` (the task
+ * description). That child session is floated as a **ghost** keyed by the child session id (spawn on
+ * `session.created`, retire on `session.execution.succeeded/failed/interrupted` / `session.idle` /
+ * `session.deleted`), and **none** of its events open a ledger task or move the main agent's phase. It is
+ * therefore never listed as an independent task (measured 2026-10-16: the tool is `subagent` on the
+ * OpenCode host and it created a child session). This replaces the old "float a ghost off the `task` tool
+ * call" for v2 — keeping both would double the ghost. (v1 / Kilo has no child sessions in the measured DB
+ * and keeps the tool-call ghost.)
+ *
  * Derivation rules are in the long comment above `handle()` (a task starts at a role=user text part /
  * `inbox.enqueued(user)`; it ends at finish=stop / `execution.succeeded`; awaiting permission is tool
  * state.status==='pending' / `permission.asked`).
@@ -547,6 +557,70 @@ function createIngestPlugin(options, { location, base } = {}) {
     }
   }
 
+  /* ------------------------------ Subagent ghosts (child sessions) ------------------------------ */
+
+  /**
+   * Child (subagent) sessions, keyed by the child session id → `{ parentSid, name }`.
+   *
+   * A subagent summoned on OpenCode v2 runs in its **own session** the server created for it:
+   * `session.created` carries `parentID` (the caller's session), `agent` (the subagent type) and
+   * `title` (the task description). Measured 2026-10-16: the tool is `subagent` on this host and it
+   * spawned a child session with `parentID` set (`agent: "explore"`, `title` = the `description`).
+   *
+   * Such a session is a **ghost**, not a task: the office floats it above the summoned gremlin and it
+   * must not take a card slot in the task list. So `handle()` treats every event of a child session as
+   * ghost lifecycle (spawn on `session.created`, retire on the round's end) and **never** opens a
+   * ledger task or moves the main agent's phase for it.
+   *
+   * Kilo's v1 envelope has no top-level `parentID` and no child sessions in the measured DB (25/25 rows
+   * have `parent_id = NULL`), so this only fires for OpenCode v2; the v1 path keeps floating its ghost
+   * off the `task` tool call (see `message.part.updated`).
+   */
+  const childSessions = new Map()
+  /** Child session id → its latest assistant text (used as the ghost's finish report) */
+  const childText = new Map()
+
+  /**
+   * Float a ghost for a summoned subagent's child session. The ghost id **is** the child session id,
+   * so spawn/retire always pair up (two same-type subagents running at once never collide).
+   * `sessionId` stays the **parent** session: the parent round's ghost sweep also clears a child that
+   * never reported its end.
+   */
+  function spawnChildGhost(event, childSid, parentSid, info) {
+    const name = String((info && info.agent) || "").trim() || "subagent"
+    const task = String((info && info.title) || "").replace(/\s+/g, " ").trim().slice(0, 80)
+    childSessions.set(childSid, { parentSid, name })
+    post("/ghost", {
+      action: "spawn",
+      workspacePath: wsOf(event),
+      name,
+      task,
+      id: childSid,
+      parent: taskIds.get(parentSid) || "",
+      model: "",
+      client,
+      sessionId: parentSid,
+    })
+  }
+
+  /** The subagent's child session ended → its ghost disperses (result = what the child last said). */
+  function retireChildGhost(event, childSid) {
+    const rec = childSessions.get(childSid)
+    if (!rec) return
+    childSessions.delete(childSid)
+    const result = String(childText.get(childSid) || "").replace(/\s+/g, " ").trim().slice(0, 200)
+    childText.delete(childSid)
+    post("/ghost", {
+      action: "finish",
+      workspacePath: wsOf(event),
+      name: rec.name,
+      id: childSid,
+      result,
+      client,
+      sessionId: rec.parentSid,
+    })
+  }
+
   /* ---- The three small ledger actions (none await; never hold up the event stream) ---- */
 
   /**
@@ -768,6 +842,23 @@ function createIngestPlugin(options, { location, base } = {}) {
     // boolean check, cheap even for the high-frequency `*.delta`.
     void ensureRegistered()
 
+    /* A subagent's child session (OpenCode v2) is a ghost, not an independent task: none of its events
+       may open a ledger task or move the main agent's phase. `session.created` below is what registers
+       the child and floats its ghost; after that only the round's end matters — it retires the ghost. */
+    if (sid && childSessions.has(sid)) {
+      if (type === "session.text.ended") childText.set(sid, unquote(p.text))
+      else if (
+        type === "session.execution.succeeded" ||
+        type === "session.execution.failed" ||
+        type === "session.execution.interrupted" ||
+        type === "session.idle" ||
+        type === "session.deleted"
+      ) {
+        retireChildGhost(event, sid)
+      }
+      return
+    }
+
     switch (type) {
       /* ---- Session created: the authoritative source of workspace path and model ---- */
       case "session.created": {
@@ -775,6 +866,14 @@ function createIngestPlugin(options, { location, base } = {}) {
         // v2 carries the workspace in `location.directory` (the envelope); v1/Kilo in `info.directory`
         const ws = dirOf() || String((event.location && event.location.directory) || "") || ownDir
         if (sid) dirs.set(sid, ws)
+        /* OpenCode v2: a summoned subagent gets its own session with `parentID` set — that is a ghost
+           (see the child-session note above `handle`), not an independent session. Floating the ghost
+           here (not off the `subagent`/`task` tool call) keys it to the child's real lifecycle. */
+        const parentSid = String(p.parentID || "")
+        if (sid && parentSid && !p.info) {
+          spawnChildGhost(event, sid, parentSid, p)
+          break
+        }
         const model = String((info.model && (info.model.id || info.model.modelID)) || info.modelID || "")
         if (sid && model) {
           models.set(sid, model)
@@ -1186,20 +1285,9 @@ function createIngestPlugin(options, { location, base } = {}) {
           }
         }
         if (sid && name && opOfTool(name) === "write") touchFile(sid, fileOf(input), wsOf(event))
-        if (sid && name && isSubagentTool(name)) {
-          const sa = subagentOf(input)
-          post("/ghost", {
-            action: "spawn",
-            workspacePath: wsOf(event),
-            name: sa.name,
-            task: sa.task,
-            id: cid,
-            parent: taskIds.get(sid) || "",
-            model: "",
-            client,
-            sessionId: sid,
-          })
-        }
+        /* Summoning a subagent (`task` / `subagent`) is **not** floated here: the child session's own
+           `session.created` (with `parentID`) is the accurate start, and its round end retires the ghost
+           (see the child-session note above `handle`). Floating here too would double the ghost. */
         report(event, "tool", { tool: name, cmd: commandOf(input), file: fileOf(input) })
         break
       }

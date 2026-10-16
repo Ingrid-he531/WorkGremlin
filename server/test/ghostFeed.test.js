@@ -46,7 +46,15 @@ bus.registerMember({ project: 'p1', memberId: 'codebuddy', name: 'codebuddy', ro
 const main = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '主任务', client: 'codebuddy' }).taskId;
 
 const runs = () => repo.raw.prepare('SELECT COUNT(*) AS c FROM subagent_runs').get().c;
-const member = (name) => repo.getMember.get(`${name}@p1`);
+/**
+ * Any live ghost member named `name`. Each summoned instance now has its own ephemeral member whose id
+ * carries a per-call suffix (see bus.ghostSpawn), so look up by (project, name, ephemeral) rather than
+ * by the old shared `subagent-<name>` id.
+ */
+const member = (name) => {
+  const nm = String(name).replace(/^subagent-/, '');
+  return repo.raw.prepare('SELECT * FROM members WHERE project_id = ? AND name = ? AND ephemeral = 1').get('p1', nm);
+};
 
 console.log('\n[1] 召唤 → 临时成员 + 一条 run（挂在会话与父任务上）');
 bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'Explore', task: '查代码', id: 'g1', parentTaskId: main });
@@ -118,6 +126,37 @@ console.log('\n[6] gcGhosts：父任务还在跑时，孤儿 TTL 不得把还在
   } finally {
     clock.__resetClock();
   }
+}
+
+console.log('\n[7] 同名并发 = 各自一条幽灵成员（办公室一只 subagent = 一个 sprite）');
+// Regression (measured 2026-10-16): five concurrent same-name subagents floated as **one** ghost,
+// because every instance was registered as the same `subagent-<name>@<project>` member. Each summon
+// now owns its ephemeral member (id carries the per-call suffix), so N concurrent = N members = N sprites.
+{
+  const m7 = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '并发同名', client: 'codebuddy' }).taskId;
+  const twins = () => repo.raw.prepare("SELECT COUNT(*) AS c FROM members WHERE project_id = 'p1' AND name = 'Twin' AND ephemeral = 1").get().c;
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 'sX', name: 'Twin', task: 'a', id: 't1', parentTaskId: m7 });
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 'sX', name: 'Twin', task: 'b', id: 't2', parentTaskId: m7 });
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 'sX', name: 'Twin', task: 'c', id: 't3', parentTaskId: m7 });
+  ok('3 只同名并发 → 3 个 ephemeral 成员（不再塌成 1 个）', twins() === 3, String(twins()));
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 'sX', name: 'Twin', id: 't1' });
+  ok('收 1 只 → 还剩 2 个成员', twins() === 2, String(twins()));
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 'sX', name: 'Twin', id: 't2' });
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 'sX', name: 'Twin', id: 't3' });
+  ok('全部收工 → 成员摘掉', twins() === 0 && !member('Twin'), String(twins()));
+}
+
+console.log('\n[8] 同名常驻小怪物借阅幽灵产出（按名字查，不再靠成员 id 公式）');
+// The resident card borrows the same-named summoned instance's output when it has none of its own.
+// Instance ids are no longer `subagent-<name>`, and the member row is deleted on retire, so the lookup
+// goes through subagent_runs by name (see bus.ghostArtifacts / repo.listGhostArtifactsByName).
+{
+  const m8 = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '借阅', client: 'codebuddy' }).taskId;
+  bus.registerMember({ project: 'p1', memberId: 'susan', name: 'susan', role: 'subagent:project', client: 'codebuddy' });
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 'sB', name: 'susan', task: '写点东西', id: 's1', parentTaskId: m8 });
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 'sB', name: 'susan', id: 's1', result: '写完了' });
+  const arts = repo.listGhostArtifactsByName.all({ projectId: 'p1', name: 'susan', limit: 3 });
+  ok('按名字查到已散场幽灵的产出（成员行已删，靠 subagent_runs 关联）', arts.length >= 1 && arts[0].path === 'workgremlin:summary', JSON.stringify(arts));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

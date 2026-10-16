@@ -12,9 +12,9 @@ const props = defineProps({
 });
 
 /**
- * 工位卡 / 桌牌上的状态三档：阻塞 / 忙碌 / 空闲。
- * 判据与卡片其它地方同一份（见 lib/memberTask.js）—— busy = 在干活 → 忙碌；blocked → 阻塞（等外部依赖）；
- * 其余 → 空闲。5 种细分状态不逐一显示，但 blocked 单独一档。
+ * Three status levels on the workstation card / desk sign: blocked / busy / idle.
+ * The criteria are the same as elsewhere on the card (see lib/memberTask.js) —— busy = working → busy; blocked → blocked (waiting on an external dependency);
+ * everything else → idle. The 5 fine-grained states are not shown one by one, but blocked gets its own level.
  */
 const label = computed(() => statusLabel(props.state));
 const tone = computed(() => statusTone(props.state));

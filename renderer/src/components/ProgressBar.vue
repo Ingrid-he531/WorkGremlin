@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 const { t } = useI18n();
 
 const props = defineProps({
-  /** null = 未知（agent 未上报）—— 显示"未知"而不是 0% */
+  /** null = unknown (the agent did not report it) —— shows "unknown" instead of 0% */
   value: { type: [Number, null], default: null },
   testid: { type: String, default: '' },
 });

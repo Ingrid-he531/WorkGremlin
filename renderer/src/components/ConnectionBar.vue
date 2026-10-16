@@ -6,13 +6,13 @@ const { t } = useI18n();
 
 const props = defineProps({
   connection: { type: Object, required: true },
-  /** 相位来源：'reported'（agent 上报真值）/ 'inferred'（服务端推断）/ 'demo'（演示脚本）/ ''（无会话） */
+  /** Phase source: 'reported' (agent-reported ground truth) / 'inferred' (server-side inference) / 'demo' (demo script) / '' (no session) */
   source: { type: String, default: '' },
-  /** 嵌进宿主条里（办公室左下角说明条）：不再自带底板与边框，跟着宿主走 */
+  /** Embedded in the host bar (the note bar at the bottom-left of the office): no longer carries its own backing and border, it follows the host */
   bare: { type: Boolean, default: false },
 });
 
-/** 相位来源文案（演示脚本不是"真值"也不是"推断"，单列一项） */
+/** Phase source text (the demo script is neither "ground truth" nor "inferred", so it gets its own entry) */
 const sourceText = computed(() =>
   props.source === 'demo'
     ? t('conn.source.demo')
@@ -38,12 +38,12 @@ const dotClass = computed(() => props.connection.state);
 </script>
 
 <template>
-  <!-- 连接 / 相位来源：常驻办公室场景**左下角**说明条（见 IsoOfficeView 的 .tip）。
-       项目名不在这里 —— 它跟着楼层屏走，见 ElevatorDoors 门楣最左边。 -->
+  <!-- Connection / phase source: the persistent note bar at the **bottom-left** of the office scene (see IsoOfficeView's .tip).
+       The project name is not here —— it follows the floor screen, see the far left of the ElevatorDoors lintel. -->
   <div class="bar" :class="{ bare }">
     <span class="conn" :class="dotClass"><i />{{ text }}</span>
 
-    <!-- 选中会话时给常驻的「相位来源」标识；没选会话时退回解释性图例 -->
+    <!-- When a session is selected, show the persistent "phase source" marker; with no session selected, fall back to the explanatory legend -->
     <span v-if="source" class="src">
       {{ t('conn.source_label') }}：
       <b
@@ -64,8 +64,8 @@ const dotClass = computed(() => props.connection.state);
 </template>
 
 <style scoped>
-/* 连接 / 相位来源一组。默认自带底板（跟 .hud 一套观感：半透明 + 圆角 + 细边）；
-   嵌进左下角说明条时宿主已经有底板了，用 .bare 摘掉自己这份（见 IsoOfficeView 的 .tip） */
+/* Connection / phase source as one group. It carries its own backing by default (same feel as .hud: semi-transparent + rounded + thin border);
+   when embedded in the bottom-left note bar the host already has a backing, so .bare removes its own (see IsoOfficeView's .tip) */
 .bar {
   display: inline-flex;
   align-items: center;
@@ -106,12 +106,12 @@ const dotClass = computed(() => props.connection.state);
 
 .legend { display: inline-flex; align-items: center; gap: 6px; }
 
-/* 相位来源常驻标识：真值绿、推断灰虚 */
+/* Persistent phase-source marker: ground truth in green, inferred in dashed gray */
 .src { display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim); }
 .src b { font-weight: 600; }
 .src-real { color: var(--state-online); }
 .src-infer { color: var(--text-dim); border-bottom: 1px dashed var(--text-faint); }
-/* 演示模式：这一路的相位既不是上报真值也不是推断，用 accent 单列，别跟前两者混 */
+/* Demo mode: this phase is neither reported ground truth nor inferred, so list it separately with accent, do not mix it with the other two */
 .src-demo { color: var(--accent, #4c8dff); }
 
 .sw {

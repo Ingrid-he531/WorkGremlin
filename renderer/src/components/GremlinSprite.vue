@@ -1,13 +1,13 @@
 <script setup>
 /**
- * GremlinSprite —— 纯 SVG 的 Gremlin 小怪兽（局部坐标 64×64，脚底在 y=51）。
+ * GremlinSprite —— a pure-SVG Gremlin creature (local coordinates 64×64, feet at y=51).
  *
- * 抽出来是为了能在两种容器里复用：
- *   - AgentAvatar：包一层 <svg viewBox="0 0 64 64"> 当头像用；
- *   - 办公室场景：外层 <g transform="translate(x,y) scale(s)"> 直接摆进大场景，可缩放/左右翻转。
+ * Extracted so it can be reused inside two containers:
+ *   - AgentAvatar: wrapped in an <svg viewBox="0 0 64 64"> and used as an avatar;
+ *   - office scene: an outer <g transform="translate(x,y) scale(s)"> places it directly in the big scene, scalable / flippable left-right.
  *
- * 状态表现：busy 敲手、idle 闭眼 Zzz、blocked 皱眉 + 红问号、offline 灰阶、degraded 半透明。
- * walking=true 时切成交替小跳（走路），并隐藏静态投影。
+ * State expression: busy taps hands, idle closes eyes with Zzz, blocked frowns + a red question mark, offline grayscale, degraded semi-transparent.
+ * When walking=true it switches to alternating little hops (walking) and hides the static shadow.
  */
 import { computed } from 'vue';
 import { avatarOf } from '@workgremlin/shared';
@@ -16,7 +16,7 @@ const props = defineProps({
   name: { type: String, required: true },
   state: { type: String, default: 'offline' },
   degraded: { type: Boolean, default: false },
-  /** 走动中：小跳 + 左右轻摆 */
+  /** Walking: little hops + slight side-to-side sway */
   walking: { type: Boolean, default: false },
 });
 
@@ -35,22 +35,22 @@ const isOffline = computed(() => props.state === 'offline');
     <ellipse class="shadow" cx="32" cy="56" rx="14" ry="3" />
 
     <g class="creature">
-      <!-- 角 -->
+      <!-- Horns -->
       <path class="horn" d="M19 21 L13.5 8 L26 15 Z" />
       <path class="horn" d="M45 21 L50.5 8 L38 15 Z" />
 
-      <!-- 身体 -->
+      <!-- Body -->
       <path
         class="body"
         d="M32 13c11 0 19 8.2 19 19.2 0 10.6-8.5 18.8-19 18.8S13 42.8 13 32.2C13 21.2 21 13 32 13z"
       />
       <ellipse class="belly" cx="32" cy="41" rx="10.5" ry="8" />
 
-      <!-- 手臂 -->
+      <!-- Arms -->
       <rect class="arm arm-l" x="11" y="34" width="7" height="10" rx="3.5" />
       <rect class="arm arm-r" x="46" y="34" width="7" height="10" rx="3.5" />
 
-      <!-- 眼睛 -->
+      <!-- Eyes -->
       <g class="eyes">
         <template v-if="state === 'idle'">
           <path class="eye-closed" d="M23 30h7" />
@@ -68,12 +68,12 @@ const isOffline = computed(() => props.state === 'offline');
         </template>
       </g>
 
-      <!-- 嘴 -->
+      <!-- Mouth -->
       <path v-if="state === 'blocked'" class="mouth" d="M27 41q5-3 10 0" />
       <path v-else-if="state === 'idle'" class="mouth" d="M28 41q4 2 8 0" />
       <path v-else class="mouth" d="M26 39q6 6 12 0" />
 
-      <!-- 配饰 -->
+      <!-- Prop -->
       <g v-if="skin.prop === 'megaphone'" class="prop">
         <path d="M44 26l13-7v18l-13-6z" fill="#ffd27a" />
         <rect x="40" y="31" width="6" height="5" rx="2" fill="#c98a2a" />
@@ -108,12 +108,12 @@ const isOffline = computed(() => props.state === 'offline');
       </g>
     </g>
 
-    <!-- 阻塞：头顶问号 -->
+    <!-- Blocked: question mark above the head -->
     <g v-if="state === 'blocked'" class="mark">
       <circle cx="49" cy="14" r="8.5" />
       <text x="49" y="18.5" text-anchor="middle">?</text>
     </g>
-    <!-- 空闲：Zzz -->
+    <!-- Idle: Zzz -->
     <g v-else-if="state === 'idle'" class="zzz">
       <text x="47" y="18">Z</text>
       <text x="53" y="12">z</text>
@@ -172,7 +172,7 @@ const isOffline = computed(() => props.state === 'offline');
   stroke-width: 2.2;
 }
 
-/* ---- 状态动画 ---- */
+/* ---- State animations ---- */
 .state-busy .arm-l {
   animation: tap-l 0.5s ease-in-out infinite;
 }
@@ -204,16 +204,16 @@ const isOffline = computed(() => props.state === 'offline');
   animation: float-up 2.6s ease-in-out infinite;
 }
 
-/* 离线：整体灰阶 */
+/* Offline: overall grayscale */
 .offline {
   opacity: 0.45;
 }
-/* degraded：值为推断，不是上报真值 */
+/* degraded: the value is inferred, not a reported true value */
 .degraded {
   opacity: 0.66;
 }
 
-/* 走路：交替小跳 + 轻微前倾 */
+/* Walking: alternating little hops + a slight forward lean */
 .walking .creature {
   animation: hop 0.42s ease-in-out infinite;
 }

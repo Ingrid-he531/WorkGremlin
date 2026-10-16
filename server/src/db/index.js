@@ -591,6 +591,17 @@ function createRepo(db) {
       INSERT INTO artifacts (member_id, task_id, kind, title, path, ts_ms) VALUES (?, ?, ?, ?, ?, ?)
     `),
     listArtifacts: db.prepare(`SELECT * FROM artifacts WHERE member_id = ? ORDER BY ts_ms DESC LIMIT ?`),
+    /**
+     * Output a resident gremlin borrows from its same-named summoned instances (see bus.ghostArtifacts).
+     * Ghost member rows are deleted when they disperse while their runs/artifacts stay (purgeMember's
+     * keepHistory), so the link goes through subagent_runs by name rather than by member id.
+     */
+    listGhostArtifactsByName: db.prepare(`
+      SELECT a.* FROM artifacts a
+        JOIN subagent_runs r ON r.task_id = a.task_id
+       WHERE r.project_id = @projectId AND r.name = @name
+       ORDER BY a.ts_ms DESC LIMIT @limit
+    `),
 
     /** The most recent finished task: gives the "files changed this round" window its boundaries (started_at..ended_at) */
     latestEndedTask: db.prepare(`

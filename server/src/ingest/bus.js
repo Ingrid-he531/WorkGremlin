@@ -219,8 +219,14 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    * straight into the DB (an ephemeral member + a subagent_run, tied to the session and the parent
    * task) instead of a manifest file that a separate poller read back. gcGhosts() (driven by the
    * unified poller) disperses any record whose parent task ended or that outlived the orphan TTL.
+   *
+   * Each **instance** gets its own ephemeral member (its id carries a per-call suffix, see
+   * ghostSpawn): the office draws one sprite per member, so N concurrent same-name subagents must be
+   * N members — a shared `subagent-<name>` id collapsed them into a single sprite.
    */
   const ghosts = new Map();
+  /** Fallback counter for a ghost instance whose floor reported no per-call id (see ghostSpawn) */
+  let ghostSeq = 0;
   /** Orphan TTL: a summon with no end signal is treated as gone after this long. */
   const GHOST_ORPHAN_MS = 5 * 60_000;
   /**
@@ -956,7 +962,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     return [project, client || '', sessionId || '', String(idOrName || '')].join('|');
   }
 
-  /** Concurrent same-name summons share one ephemeral member; drop the member only when the last record is gone. */
+  /** Concurrent same-name summons each own their member now; drop a member only when its instance is gone. */
   function removeGhostMemberIfUnused(rec) {
     for (const r of ghosts.values()) if (r.memberId === rec.memberId) return;
     try {
@@ -964,7 +970,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     } catch {
       /* ignore */
     }
-    // A roster "defined subagent": summon ended → its workstation goes back online (current project only)
+    // A roster "defined subagent": summon ended → its workstation goes back online. Each instance now
+    // has its own member, so "is a same-name instance still running" must be judged by **name**, not by
+    // the member instance —— otherwise the first of several concurrent summons would mark it idle.
+    for (const r of ghosts.values()) if (r.project === rec.project && r.name === rec.name) return;
     if (ghostRoster && rec.project === context.project && typeof ghostRoster.isDefined === 'function' && ghostRoster.isDefined(rec.name)) {
       try {
         ghostRoster.markIdle(rec.name);
@@ -1026,7 +1035,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const name = normText(p.name, 64) || 'subagent';
     const client = normClient(p.client);
     const sessionId = normSession(p.sessionId);
-    const memberName = `subagent-${name}`;
+    // One ephemeral member **per summoned instance**: the office draws one sprite per member, so a
+    // shared `subagent-<name>` id made N concurrent same-name subagents collapse into a single ghost.
+    // The display name stays the bare subagent name; the suffix only makes the primary key unique. The
+    // per-call id is the natural suffix, with a counter for floors that report no id (string content is
+    // whitelisted so it never smuggles an '@', which memberIdOf would read as "already qualified").
+    const inst = String(p.id || '').trim().replace(/[^A-Za-z0-9_-]/g, '') || `${now().toString(36)}${(ghostSeq += 1)}`;
+    const memberName = `subagent-${name}-${inst}`;
     const memberId = memberIdOf(project, memberName);
     const key = ghostKey(project, client, sessionId, p.id || name);
     const existing = ghosts.get(key);
@@ -1379,24 +1394,28 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
 
   /**
    * Output of a ghost (a summon instance). Borrowed by a resident gremlin only when it has **no
-   * output of its own**: the one actually summoned to work is the `subagent-<name>` instance, and
-   * its finish summary (the kind='text' output the ghost writes when it retires) is that gremlin's
-   * output for this run.
+   * output of its own**: the one actually summoned to work is the `subagent-<name>-<call>` instance,
+   * and its finish summary (the kind='text' output the ghost writes when it retires) is that
+   * gremlin's output for this run.
+   *
+   * Looked up **by name through subagent_runs**, not by a member-id formula: each instance has its own
+   * member id (see ghostSpawn) and the member row is deleted once it disperses, while the run and its
+   * artifacts stay behind (purgeMember's keepHistory).
    * @param {any} member resident member row (ephemeral=0)
    */
   function ghostArtifacts(member) {
     if (!member || member.ephemeral || !member.name) return [];
-    const ghostId = memberIdOf(member.project_id, `subagent-${member.name}`);
-    if (ghostId === member.id) return [];
-    return repo.listArtifacts.all(ghostId, 3).map((a) => ({
-      id: a.id,
-      memberId: a.member_id,
-      taskId: a.task_id,
-      kind: a.kind,
-      title: a.title,
-      path: a.path,
-      tsMs: a.ts_ms,
-    }));
+    return repo.listGhostArtifactsByName
+      .all({ projectId: member.project_id, name: member.name, limit: 3 })
+      .map((a) => ({
+        id: a.id,
+        memberId: a.member_id,
+        taskId: a.task_id,
+        kind: a.kind,
+        title: a.title,
+        path: a.path,
+        tsMs: a.ts_ms,
+      }));
   }
 
   /**

@@ -1,15 +1,15 @@
 <script setup>
 /**
- * GhostSprite —— 临时组队成员的"幽灵"形象（局部坐标 64×64，下摆底在 y=52）。
+ * GhostSprite —— the "ghost" form of a temporary team member (local coordinates 64×64, hem bottom at y=52).
  *
- * 与 GremlinSprite 的区别（一眼能分辨）：
- *   - 半透明 + 虚线描边（临时的、没有归属）
- *   - 下摆是波浪（没有腿、不着地）
- *   - 头顶一根天线（远程接入，不属于这间办公室）
- *   - 没有落地投影（飘在空中），场景层另外画一个悬浮光晕
+ * Differences from GremlinSprite (tellable at a glance):
+ *   - semi-transparent + dashed outline (temporary, unowned)
+ *   - the hem is wavy (no legs, does not touch the ground)
+ *   - an antenna on top of the head (remote access, not belonging to this office)
+ *   - no ground shadow (floats in the air); the scene layer draws a separate hovering halo
  *
- * 颜色按 memberId 哈希取柔和色（同一成员每次刷新颜色稳定），
- * 状态仍然靠表情 + 透明度表达：idle 闭眼、blocked 皱眉 + 问号、offline 灰阶。
+ * The color is a soft hue hashed from memberId (stable per member across refreshes),
+ * and the state is still expressed via expression + opacity: idle closes eyes, blocked frowns + a question mark, offline grayscale.
  */
 import { computed } from 'vue';
 
@@ -19,7 +19,7 @@ const props = defineProps({
   degraded: { type: Boolean, default: false },
 });
 
-/** 柔和色板：避开专家团队的饱和角色色，避免"像某个专家" */
+/** Soft palette: avoids the saturated role colors of the expert team, so it does not "look like a certain expert" */
 const PALETTE = ['#7fe3d4', '#9db8ff', '#c9a7ff', '#ffb3d1', '#ffd79a', '#a8e6a1', '#8fe0f5'];
 
 function hash(s) {
@@ -43,21 +43,21 @@ const isOffline = computed(() => props.state === 'offline');
     :style="{ '--body': body }"
     :data-agent="agentId"
   >
-    <!-- 柔光：让它在暗背景上"发光" -->
+    <!-- Soft glow: makes it "glow" against a dark background -->
     <ellipse class="aura" cx="32" cy="36" rx="21" ry="26" />
 
     <g class="creature">
-      <!-- 天线：远程临时成员 -->
+      <!-- Antenna: remote temporary member -->
       <path class="antenna-line" d="M32 15V7" />
       <circle class="antenna-tip" cx="32" cy="4.5" r="2.6" />
 
-      <!-- 身体：圆顶 + 波浪下摆 -->
+      <!-- Body: round dome + wavy hem -->
       <path
         class="body"
         d="M13 33 A19 19 0 0 1 51 33 V52 q-4.75 7 -9.5 0 q-4.75 -7 -9.5 0 q-4.75 7 -9.5 0 q-4.75 -7 -9.5 0 Z"
       />
 
-      <!-- 眼睛 -->
+      <!-- Eyes -->
       <g class="eyes">
         <template v-if="state === 'idle'">
           <path class="eye-closed" d="M22 31h8" />
@@ -73,18 +73,18 @@ const isOffline = computed(() => props.state === 'offline');
         </template>
       </g>
 
-      <!-- 嘴 -->
+      <!-- Mouth -->
       <path v-if="state === 'blocked'" class="mouth" d="M27 41q5-3 10 0" />
       <path v-else-if="state === 'idle'" class="mouth" d="M28 41q4 2 8 0" />
       <path v-else class="mouth" d="M26 39q6 6 12 0" />
     </g>
 
-    <!-- 阻塞：头顶问号 -->
+    <!-- Blocked: question mark above the head -->
     <g v-if="state === 'blocked'" class="mark">
       <circle cx="50" cy="14" r="8.5" />
       <text x="50" y="18.5" text-anchor="middle">?</text>
     </g>
-    <!-- 空闲：Zzz -->
+    <!-- Idle: Zzz -->
     <g v-else-if="state === 'idle'" class="zzz">
       <text x="48" y="18">Z</text>
       <text x="54" y="12">z</text>
@@ -145,7 +145,7 @@ const isOffline = computed(() => props.state === 'offline');
   opacity: 0.8;
 }
 
-/* 悬浮：轻微摆动（上下浮动由场景层按帧计算，好让标签跟着动） */
+/* Hovering: slight sway (the up/down bobbing is computed per frame by the scene layer, so the label follows) */
 .creature {
   animation: sway 3.8s ease-in-out infinite;
 }
@@ -171,12 +171,12 @@ const isOffline = computed(() => props.state === 'offline');
   animation: float-up 2.6s ease-in-out infinite;
 }
 
-/* offline：灰阶 + 更淡 */
+/* offline: grayscale + fainter */
 .offline {
   opacity: 0.4;
   filter: grayscale(1);
 }
-/* degraded：值是推断的，不是上报真值 */
+/* degraded: the value is inferred, not a reported true value */
 .degraded {
   opacity: 0.6;
 }

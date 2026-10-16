@@ -1,14 +1,14 @@
 <script setup>
 /**
- * DeskScene —— 单个"真实工位"（2.5D 斜俯视）。
+ * DeskScene —— a single "real workstation" (2.5D oblique top-down view).
  *
- * 图层自后向前：地毯 → 隔断挡板 → 座椅 → 精灵 → 桌面 → 桌上物件（键盘/鼠标/马克杯/台灯/绿植）
- *              → 显示器（屏幕为 HTML 叠层，显示真实任务/文件）→ 桌牌。
+ * Layers from back to front: carpet → partition panel → chair → sprite → desk top → items on the desk (keyboard/mouse/mug/lamp/plant)
+ *              → monitor (the screen is an HTML overlay showing the real task/file) → name plate.
  *
- * 之所以拆成 bg / fg 两层 SVG：精灵是 HTML 组件（AgentAvatar），
- * 必须夹在"椅子"和"桌子"之间，才能做出"坐在桌后、手搭在桌上"的层次。
+ * The reason it is split into bg / fg SVG layers: the sprite is an HTML component (AgentAvatar),
+ * it must be sandwiched between the "chair" and the "desk" to get the layering of "sitting behind the desk with hands on it".
  *
- * 动画全部走 CSS keyframes，用 --phase 按成员名哈希错开相位，避免全员同步。
+ * All animation goes through CSS keyframes, using --phase hashed by member name to stagger the phase and avoid everyone moving in sync.
  */
 import { computed } from 'vue';
 import AgentAvatar from './AgentAvatar.vue';
@@ -28,27 +28,27 @@ const skin = computed(() => avatarOf(props.member.memberId));
 const state = computed(() => props.member.state);
 const { t } = useI18n();
 
-// 「当前任务」口径与其他卡片一致（见 lib/memberTask.js）：空闲时槽位里那条是**上一个任务**，
-// 不能留在屏幕上冒充当前任务。
+// The "current task" definition is consistent with the other cards (see lib/memberTask.js): when idle, the entry in the slot is the **previous task**,
+// it must not stay on the screen impersonating the current task.
 const task = computed(() => currentTaskOf(props.member));
 const title = computed(() => currentTaskTitle(props.member) || t('card.idle'));
-// 屏幕上那条走条是**不确定**的（只在干活时爬，不表示完成度）——2026-09-29 之前它按
-// member.task.progress 画长度，但那个字段没有真值（全库只有 0 和 1，开工写 0、收工写 1，
-// 中间没人推进；详见 TaskRecordsView 里「进度」那一行的说明），画出来永远是空条或满条。
-// 所以这里只判断"在不在干活"，取值与主控制台一致（见 iso/mainConsole.js 的 PHASES.busy）。
+// The bar on the screen is **indeterminate** (it only crawls while working and does not represent completion) —— before 2026-09-29 it drew its length from
+// member.task.progress, but that field has no real values (across the whole DB there are only 0 and 1, 0 written at start and 1 written at finish,
+// nobody advances it in between; see the note on the "progress" row in TaskRecordsView), so it always drew an empty or full bar.
+// Therefore here it only checks "working or not", with the same value as the main console (see PHASES.busy in iso/mainConsole.js).
 const running = computed(() => state.value === 'busy');
 const fileText = computed(() =>
   props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : t('card.no_file')
 );
 /**
- * 两个时间点都用**绝对时刻**（MM-DD HH:mm）：开始 = 当前任务开工时刻，最近活跃 = 上一个任务收工时刻。
- * 不用"多久以前"的相对时长 —— 那要求每秒重算，重算断了就会出现"有的工位不动、有的还在涨"
- * （用户 2026-09-30 实测）。写死的时间点不需要定时器（父级的 now tick 也随之去掉了）。
+ * Both time points use an **absolute time** (MM-DD HH:mm): start = the start time of the current task, last active = the finish time of the previous task.
+ * No "how long ago" relative duration —— that requires recomputing every second, and if recomputation breaks you get "some workstations frozen, others still climbing"
+ * (measured by the user on 2026-09-30). A hardcoded time point needs no timer (the parent's now tick was removed along with it).
  */
 const startAt = computed(() => formatClock(currentTaskStartedAt(props.member) || props.member.stateSince));
 const lastActiveAt = computed(() => formatClock(props.member.lastTaskAt) || '—');
 
-/** 动画相位 0~1.6s，按成员名哈希：全员动作不会整齐划一 */
+/** animation phase 0~1.6s, hashed by member name: everyone's motion is not perfectly uniform */
 const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 16) / 10);
 </script>
 
@@ -61,7 +61,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
     @click="emit('select', member.memberId)"
   >
     <div class="stage">
-      <!-- ===== 后景：地毯 / 隔断 / 座椅 ===== -->
+      <!-- ===== background: carpet / partition / chair ===== -->
       <svg class="layer" viewBox="0 0 260 210" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
         <polygon class="carpet" points="130,160 242,188 130,216 18,188" />
         <polygon class="carpet-inner" points="130,169 228,188 130,207 32,188" />
@@ -84,14 +84,14 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
         </g>
       </svg>
 
-      <!-- ===== 精灵：夹在椅子与桌子之间 ===== -->
+      <!-- ===== sprite: sandwiched between the chair and the desk ===== -->
       <div class="gremlin">
         <AgentAvatar :name="member.memberId" :state="state" :degraded="member.degraded" :size="100" />
       </div>
 
-      <!-- ===== 前景：桌面 / 桌上物件 / 显示器 ===== -->
+      <!-- ===== foreground: desk top / items on the desk / monitor ===== -->
       <svg class="layer" viewBox="0 0 260 210" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-        <!-- 台灯（含光锥） -->
+        <!-- lamp (with light cone) -->
         <g class="lamp">
           <polygon class="lamp-light" points="59,122 75,122 98,170 36,170" />
           <path class="lamp-stem" d="M67 148 L67 122" />
@@ -99,13 +99,13 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
           <path class="lamp-shade" d="M56 122 L78 122 L73 111 L61 111 Z" />
         </g>
 
-        <!-- 桌子 -->
+        <!-- desk -->
         <polygon class="desk-top" points="58,146 202,146 218,170 42,170" />
         <polygon class="desk-front" points="42,170 218,170 218,181 42,181" />
         <polygon class="desk-leg" points="62,181 76,181 71,200 66,200" />
         <polygon class="desk-leg" points="184,181 198,181 194,200 189,200" />
 
-        <!-- 键盘 -->
+        <!-- keyboard -->
         <g class="keyboard">
           <polygon class="kb-body" points="72,149 152,149 158,164 66,164" />
           <g class="keys">
@@ -115,13 +115,13 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
           </g>
         </g>
 
-        <!-- 鼠标 -->
+        <!-- mouse -->
         <g class="mouse">
           <ellipse cx="184" cy="158" rx="6" ry="9" />
           <path d="M184 150 v6" />
         </g>
 
-        <!-- 马克杯 + 热气 -->
+        <!-- mug + steam -->
         <g class="mug">
           <path class="handle" d="M70 159h3.5a3.5 3.5 0 0 1 0 7H70" />
           <rect class="cup" x="56" y="155" width="14" height="16" rx="3" />
@@ -131,7 +131,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
           </g>
         </g>
 
-        <!-- 绿植 -->
+        <!-- plant -->
         <g class="plant">
           <polygon class="pot" points="196,150 214,150 211,164 199,164" />
           <g class="leaves">
@@ -141,7 +141,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
           </g>
         </g>
 
-        <!-- 显示器 -->
+        <!-- monitor -->
         <g class="monitor" transform="rotate(-3 170 103)">
           <ellipse class="mon-base" cx="170" cy="146" rx="24" ry="6" />
           <rect class="mon-neck" x="165" y="126" width="10" height="21" />
@@ -154,36 +154,36 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
         </g>
       </svg>
 
-      <!-- ===== 屏幕内容（HTML 叠层，保证文字可截断/可读） ===== -->
+      <!-- ===== screen content (HTML overlay, ensuring text can be truncated/readable) ===== -->
       <div class="screen-ui">
         <div class="scr-head">
           <span class="scr-dot" />
           <span class="scr-title">{{ title }}</span>
         </div>
-        <!-- 走条：不确定动画（轨道常显，光带只在干活时爬）。周期 1800ms 与主控制台一致，
-             见 iso/mainConsole.js 里 ph.busy 那一段。 -->
+        <!-- bar: indeterminate animation (the track is always visible, the light band only crawls while working). The 1800ms period matches the main console,
+             see the ph.busy section in iso/mainConsole.js. -->
         <div class="scr-bar"><i v-if="running" /></div>
         <div class="scr-file mono">{{ fileText }}</div>
         <div v-if="state === 'blocked'" class="scr-alert">{{ t('card.needs_help') }}</div>
       </div>
 
-      <!-- 悬停/选中时的详情卡（小屏看不全，用这个补全信息） -->
+      <!-- detail card on hover/selection (the small screen cannot show everything, this fills in the information) -->
       <div class="peek">
         <div class="peek-title">{{ title }}</div>
-        <!-- 「进度 x%」已去掉（2026-09-29）：那个百分比是假的，只有 0% 和 100% 两种取值。
-             时间点都写绝对时刻（不用相对时长，省掉每秒重算）：开始 / 最近活跃。 -->
+        <!-- "progress x%" was removed (2026-09-29): that percentage was fake, with only two possible values 0% and 100%.
+             The time points are all written as absolute times (no relative duration, avoiding per-second recomputation): start / last active. -->
         <div v-if="task" class="peek-row dim">{{ t('card.started', { time: startAt }) }}</div>
         <div v-else class="peek-row dim">{{ t('card.last_active', { time: lastActiveAt }) }}</div>
         <div v-if="member.currentFiles.length" class="peek-row mono">{{ member.currentFiles.join(' , ') }}</div>
       </div>
     </div>
 
-    <!-- ===== 桌牌 ===== -->
+    <!-- ===== name plate ===== -->
     <div class="plate">
       <span class="p-name">{{ member.name }}</span>
       <span class="p-role dim">{{ member.role || '—' }}</span>
       <StatusBadge :state="state" :degraded="member.degraded" :testid="`seat-status-${agentId}`" />
-      <!-- 桌牌上那个小数字也只在干活时才有意义（当前任务的开工时刻） -->
+      <!-- the small number on the name plate is also only meaningful while working (the start time of the current task) -->
       <span v-if="task" class="p-elapsed mono faint">{{ startAt }}</span>
     </div>
   </div>
@@ -227,7 +227,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   height: 100%;
 }
 
-/* ---------- 后景 ---------- */
+/* ---------- background ---------- */
 .carpet {
   fill: color-mix(in srgb, var(--body) 22%, #14181f);
 }
@@ -264,7 +264,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   fill: #3d4757;
 }
 
-/* ---------- 精灵 ---------- */
+/* ---------- sprite ---------- */
 .gremlin {
   position: absolute;
   left: 21.5%;
@@ -279,10 +279,10 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   height: 100%;
 }
 .gremlin :deep(.shadow) {
-  display: none; /* 坐在桌后，地面投影被桌子挡住 */
+  display: none; /* sitting behind the desk, the ground shadow is blocked by the desk */
 }
 .gremlin :deep(.prop) {
-  display: none; /* 桌上已有键盘/放大镜等物件，避免和手里配饰重复 */
+  display: none; /* the desk already has a keyboard/magnifier and other items, avoiding duplication with the prop in hand */
 }
 .state-busy .gremlin {
   transform: translateY(2px) rotate(-2deg);
@@ -295,10 +295,10 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   animation-delay: var(--phase);
 }
 .state-offline .gremlin {
-  opacity: 0; /* 人不在：椅子空着 */
+  opacity: 0; /* person absent: the chair is empty */
 }
 
-/* ---------- 前景：桌子 ---------- */
+/* ---------- foreground: desk ---------- */
 .desk-top {
   fill: #6d5540;
 }
@@ -309,7 +309,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   fill: #3a2d21;
 }
 
-/* ---------- 桌上物件 ---------- */
+/* ---------- items on the desk ---------- */
 .kb-body {
   fill: #2a3240;
   stroke: #3a4557;
@@ -366,7 +366,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   opacity: 0.1;
 }
 
-/* ---------- 显示器 ---------- */
+/* ---------- monitor ---------- */
 .mon-base {
   fill: #202735;
 }
@@ -389,7 +389,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   fill: var(--state-offline);
 }
 
-/* ---------- 屏幕内容 ---------- */
+/* ---------- screen content ---------- */
 .screen-ui {
   position: absolute;
   left: 50%;
@@ -433,8 +433,8 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   background: rgba(255, 255, 255, 0.12);
   overflow: hidden;
 }
-/* 不确定走条：光带固定占轨道 30%，从左滑到右循环（不表示完成度，表示"正在跑"）。
-   翻译量按光带自身宽度算：-100% = 完全滑出左边，333% ≒ 完全滑出右边（30% × 3.33 ≈ 100%）。 */
+/* indeterminate bar: the light band occupies a fixed 30% of the track and loops sliding from left to right (it does not represent completion, it represents "running").
+   The translation is computed from the light band's own width: -100% = fully slid out to the left, 333% ≒ fully slid out to the right (30% × 3.33 ≈ 100%). */
 .scr-bar i {
   display: block;
   height: 100%;
@@ -457,7 +457,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   padding-top: 1px;
 }
 
-/* ---------- 悬停详情卡 ---------- */
+/* ---------- hover detail card ---------- */
 .peek {
   position: absolute;
   left: 50%;
@@ -491,7 +491,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   white-space: nowrap;
 }
 
-/* ---------- 桌牌 ---------- */
+/* ---------- name plate ---------- */
 .plate {
   display: flex;
   align-items: center;
@@ -512,7 +512,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   font-size: 11px;
 }
 
-/* ================= 状态表现 ================= */
+/* ================= state presentation ================= */
 .state-online .scr-dot,
 .state-online .mon-led {
   background: var(--state-online);
@@ -534,7 +534,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   fill: var(--state-blocked);
 }
 
-/* busy：键帽交替发光 + 屏幕蓝光溢出 + LED 快闪 */
+/* busy: keycaps glow alternately + screen blue light spill + LED fast blink */
 .state-busy .kb-row {
   animation: key-tap 0.5s ease-in-out infinite;
   animation-delay: var(--phase);
@@ -554,7 +554,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   animation: led-blink 0.9s steps(1, end) infinite;
 }
 
-/* online / idle：咖啡冒热气、绿植轻摆 */
+/* online / idle: coffee steams, plant sways gently */
 .state-online .steam path,
 .state-idle .steam path,
 .state-busy .steam path {
@@ -574,7 +574,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   transform-origin: 205px 150px;
 }
 
-/* idle：屏幕变暗（屏保）+ 椅子后仰 + 热气更浓 */
+/* idle: screen dims (screensaver) + chair leans back + steam thicker */
 .state-idle .screen-ui {
   opacity: 0.45;
 }
@@ -584,7 +584,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   transition: transform 0.4s ease;
 }
 
-/* blocked：台灯转红 + 光锥变红 + LED 急闪 + 屏幕红边 */
+/* blocked: lamp turns red + light cone turns red + LED urgent blink + screen red border */
 .state-blocked .lamp-light {
   fill: #ff7b7b;
   opacity: 0.16;
@@ -600,7 +600,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   border-radius: 2px;
 }
 
-/* offline：人不在、灯灭、屏幕黑、整体褪色 */
+/* offline: person absent, lamp off, screen black, overall desaturated */
 .state-offline {
   filter: saturate(0.45) brightness(0.85);
 }
@@ -617,14 +617,14 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   fill: #373f4c;
 }
 
-/* busy 时椅子轻晃 */
+/* the chair sways slightly while busy */
 .state-busy .chair {
   animation: rock 2.2s ease-in-out infinite;
   animation-delay: var(--phase);
   transform-origin: 100px 148px;
 }
 
-/* 推断值：虚线圈住工位，提示"这不是上报真值" */
+/* inferred value: a dashed line circles the workstation, hinting "this is not a reported true value" */
 .is-degraded .stage::after {
   content: '';
   position: absolute;
@@ -634,7 +634,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   pointer-events: none;
 }
 
-/* ================= 关键帧 ================= */
+/* ================= keyframes ================= */
 @keyframes key-tap {
   0%,
   100% {
@@ -653,7 +653,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
     opacity: 0.18;
   }
 }
-/* 屏幕上那条走条：从左爬到右，1.8s 一圈（与主控制台 mainConsole 同周期） */
+/* the bar on the screen: crawls from left to right, 1.8s per cycle (same period as the main console mainConsole) */
 @keyframes scr-crawl {
   from {
     transform: translateX(-100%);
@@ -730,8 +730,8 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
     transition: none !important;
   }
 
-  /* 不确定走条是靠"动"表达"在跑"的：关掉动画它就只剩一段固定长度的光带，会被读成
-     “进度 30%”，等于又造了个假进度。所以这里直接不画光带，只留空轨道。 */
+  /* the indeterminate bar expresses "running" through "motion": with animation off it is left with only a fixed-length light band, which would be read as
+     "progress 30%", effectively creating another fake progress. So here the light band is simply not drawn and only the empty track is kept. */
   .scr-bar i {
     display: none;
   }
