@@ -1,6 +1,6 @@
 /**
- * preload 桥接。Electron 内运行时用 window.workgremlin（真实端口+token）；
- * 浏览器 dev 模式下降级为同源 /api、/ws（由 vite proxy 转发）。
+ * preload bridge. Inside Electron use window.workgremlin (real port + token);
+ * in browser dev mode fall back to same-origin /api, /ws (forwarded by the vite proxy).
  */
 import { t } from '../i18n/index.js';
 
@@ -15,7 +15,7 @@ export async function getServerInfo() {
       const info = await window.workgremlin.getServerInfo();
       if (info && info.port) return info;
     } catch {
-      /* 降级到同源 */
+      /* fall back to same-origin */
     }
   }
   const fallbackPort = Number(import.meta.env.VITE_SERVER_PORT || location.port || 21800);
@@ -23,17 +23,19 @@ export async function getServerInfo() {
 }
 
 /**
- * 原生（OS 级）全屏：true 时窗口占满整屏，标题栏 / 边框 / 菜单栏一起去掉。
- * 有 Electron bridge 走 IPC；纯浏览器 dev 退回 HTML5 Fullscreen API（同样没有窗口外壳）。
+ * Native (OS-level) fullscreen: when true the window fills the whole screen and the title bar /
+ * frame / menu bar all go away.
+ * Inside Electron this goes through IPC; in plain browser dev it falls back to the HTML5 Fullscreen
+ * API (which also has no window chrome).
  * @param {boolean} on
- * @returns {Promise<boolean>} 切换后的实际状态
+ * @returns {Promise<boolean>} the actual state after the toggle
  */
 export async function setFullScreen(on) {
   if (hasBridge() && typeof window.workgremlin.setFullScreen === 'function') {
     try {
       return Boolean(await window.workgremlin.setFullScreen(Boolean(on)));
     } catch {
-      /* 降级到 HTML5 全屏 */
+      /* fall back to HTML5 fullscreen */
     }
   }
   try {
@@ -44,15 +46,15 @@ export async function setFullScreen(on) {
     }
     return Boolean(document.fullscreenElement);
   } catch {
-    /* 没有 bridge 也没有 Fullscreen API（老 WebView）：应用内专注模式照旧生效 */
+    /* no bridge and no Fullscreen API (old WebView): the in-app focus mode still applies */
     return false;
   }
 }
 
 /**
- * 订阅原生全屏状态变化（F11 / 系统手势 / 菜单切换都会触发）。
+ * Subscribe to native fullscreen changes (F11 / system gesture / menu toggle all trigger it).
  * @param {(on: boolean) => void} cb
- * @returns {() => void} 取消订阅
+ * @returns {() => void} unsubscribe
  */
 export function onFullScreen(cb) {
   if (hasBridge() && typeof window.workgremlin.onFullScreen === 'function') {
@@ -64,7 +66,7 @@ export function onFullScreen(cb) {
 }
 
 /**
- * 当前工程 + 最近打开过的工程 + subagent 清单路径。
+ * Current project + recently opened projects + subagent manifest path.
  * @param {{port?:number, token?:string, fallback?:boolean}} info
  */
 export async function getWorkspace(info) {
@@ -80,7 +82,7 @@ export async function getWorkspace(info) {
 }
 
 /**
- * 打开工程。path 为空 / 'demo' 表示切回演示数据。
+ * Open a project. An empty path / 'demo' means switch back to the demo data.
  * @param {{port?:number, token?:string, fallback?:boolean}} info
  * @param {string} path
  */
@@ -99,7 +101,7 @@ export async function openWorkspace(info, path) {
 }
 
 /**
- * 弹出系统目录选择框（Electron）。浏览器 dev 模式下降级为 window.prompt。
+ * Pop up the system directory picker (Electron). In browser dev it falls back to window.prompt.
  * @returns {Promise<string|null>}
  */
 export async function chooseWorkspace() {
@@ -107,7 +109,7 @@ export async function chooseWorkspace() {
     try {
       return await window.workgremlin.chooseWorkspace();
     } catch {
-      /* 降级到 prompt */
+      /* fall back to prompt */
     }
   }
   const p = window.prompt(t('workspace.prompt'));
@@ -115,7 +117,7 @@ export async function chooseWorkspace() {
 }
 
 /**
- * WS 地址。有 bridge 时直连 127.0.0.1:<port>；否则走同源（vite proxy）。
+ * WS url. With a bridge, connect straight to 127.0.0.1:<port>; otherwise go same-origin (vite proxy).
  * @param {{port:number, token:string}} info
  */
 export function wsUrl(info) {
@@ -125,7 +127,7 @@ export function wsUrl(info) {
 }
 
 /**
- * HTTP 基址。
+ * HTTP base.
  * @param {{port:number, fallback?:boolean}} info
  */
 export function httpBase(info) {
@@ -134,22 +136,22 @@ export function httpBase(info) {
 }
 
 /**
- * 应用版本号（来自 package.json 的 version，主进程经 getAppVersion 读）。
- * @returns {Promise<string>} 读不到返回空串
+ * App version (package.json's version, read in the main process via getAppVersion).
+ * @returns {Promise<string>} empty string when it cannot be read
  */
 export async function getAppVersion() {
   if (hasBridge() && typeof window.workgremlin.getAppVersion === 'function') {
     try {
       return (await window.workgremlin.getAppVersion()) || '';
     } catch {
-      /* 降级到空串 */
+      /* fall back to an empty string */
     }
   }
   return '';
 }
 
 /**
- * 构建信息：应用版本 + 最近 commit 短 sha + Electron / Node 运行时版本。
+ * Build info: app version + short sha of the latest commit + Electron / Node runtime versions.
  * @returns {Promise<{version:string, commit:string, electron:string, node:string}>}
  */
 export async function getBuildInfo() {
@@ -158,33 +160,34 @@ export async function getBuildInfo() {
       const info = await window.workgremlin.getBuildInfo();
       if (info && typeof info === 'object') return info;
     } catch {
-      /* 降级到空对象 */
+      /* fall back to an empty object */
     }
   }
   return { version: '', commit: '', electron: '', node: '' };
 }
 
 /**
- * 退出整个应用。Electron 内走 IPC；浏览器 dev 模式下降级为关闭窗口。
+ * Quit the whole app. Inside Electron this goes through IPC; in browser dev it falls back to closing
+ * the window.
  */
 export async function quitApp() {
   if (hasBridge() && typeof window.workgremlin.quit === 'function') {
     try {
       return await window.workgremlin.quit();
     } catch {
-      /* 降级到关窗 */
+      /* fall back to closing the window */
     }
   }
   try {
     window.close();
   } catch {
-    /* 关不掉就随它（dev 下常有） */
+    /* if it cannot be closed, so be it (common in dev) */
   }
 }
 
 /**
- * 用系统默认程序打开外部链接（Electron 走 shell.openExternal，不会在应用内嵌网页）。
- * 浏览器 dev 模式下降级为 window.open。
+ * Open an external link with the system default program (Electron uses shell.openExternal, so no page
+ * is embedded in the app). In browser dev it falls back to window.open.
  * @param {string} url
  * @returns {Promise<boolean>}
  */
@@ -194,13 +197,13 @@ export async function openExternal(url) {
     try {
       return Boolean(await window.workgremlin.openExternal(url));
     } catch {
-      /* 降级到 window.open */
+      /* fall back to window.open */
     }
   }
   try {
     window.open(url, '_blank', 'noopener,noreferrer');
   } catch {
-    /* 忽略 */
+    /* ignore */
   }
   return true;
 }

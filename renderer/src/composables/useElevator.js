@@ -1,81 +1,90 @@
 /**
- * useElevator —— 楼层切换「电梯」过渡的状态机。
+ * useElevator —— the state machine for the floor-switch "elevator" transition.
  *
- * 依据：docs/design-elevator-transition.md §2 时序表 / §4 状态机（含 §4.3 打断策略）/ §5.1 降级 /
- *      §7.2 组织方式 / §8.1 风险缓解，docs/design-elevator-effort.md §2.3（待定目标层高亮）。
+ * Basis: docs/design-elevator-transition.md §2 timing table / §4 state machine (incl. §4.3 interrupt
+ * policy) / §5.1 degraded mode / §7.2 organization / §8.1 risk mitigation, and
+ * docs/design-elevator-effort.md §2.3 (highlighting the pending target floor).
  *
- * 四条定死的约定（改之前先看设计，别凭手感改）：
- *   1. 模块级单例 + ref，不进 Pinia —— 这是瞬时 UI 状态，进 store 会让每次动画
- *      广播一轮订阅（设计 §7.2）。App.vue、ElevatorDoors、FloorSelector 共用同一实例。
- *   2. **所有推进都必须过 `step()`**（内部先判 token + 挂 2s 兜底）。散着写 `await sleep`
- *      再各自判 token 是 T1 的写法，加打断逻辑后极易漏一处 —— 漏一处就是"上一趟的门开到
- *      一半、下一趟又关上"。
- *   3. 换脸（selectFloor）必须发生在关门 70% 之后 —— 内容突变要躲在门后。
- *   4. 不用 `transitionend`（多段编排里丢事件、会重复触发，设计已判定）。
+ * Four hard rules (read the design before changing; do not go by feel):
+ *   1. Module-level singleton + ref, not in Pinia —— this is transient UI state, and putting it into a
+ *      store would broadcast a subscription round on every animation (design §7.2). App.vue,
+ *      ElevatorDoors and FloorSelector share the same instance.
+ *   2. **Every advance must go through `step()`** (which checks the token and arms a 2s fallback). Spraying
+ *      `await sleep` and checking the token separately is the T1 style; once interrupt logic is added it is
+ *      very easy to miss a spot —— and one missed spot is "the previous trip's door is half open, the next
+ *      one closes it again".
+ *   3. The face change (selectFloor) must happen after the door is 70% closed —— a content jump has to hide
+ *      behind the door.
+ *   4. Do not use `transitionend` (events are lost in multi-segment choreography and it can fire twice; the
+ *      design already ruled this out).
  *
- * 纯逻辑、不碰 DOM（看门狗只挂一个 `visibilitychange`，见 settleElevator）、sleep 可注入：
- * `injectSleep(可控时钟)` 就能不起组件跑整套打断用例。
+ * Pure logic, no DOM (the watchdog only attaches one `visibilitychange`, see settleElevator), and sleep is
+ * injectable: `injectSleep(controllable clock)` runs the whole interrupt suite without mounting components.
  */
 
 import { computed, ref } from 'vue';
 import { useSessionStore } from '../stores/sessions';
 
-/** 各段时长（ms）—— 与 theme.css 里的 --dur-* token 一一对应，改一边要同步另一边 */
+/** Duration of each segment (ms) —— one-to-one with the --dur-* tokens in theme.css; change one and sync the other */
 export const DURATIONS = { close: 180, open: 260, settle: 120 };
 
-/** 关门进行到这个比例时提交 selectFloor：换脸必须发生在门后（设计 §2 段 1） */
+/** Commit selectFloor once the close reaches this ratio: the face change must happen behind the door (design §2 segment 1) */
 export const COMMIT_AT = 0.7;
 
 /**
- * 每段的兜底上限（设计 §8.1 第一条：**任何异常都不能把门永久关上**）。
- * 正常 `sleep` 一定会 resolve，这里防的是"注入的时钟不回调 / 主线程被卡住"这类极端情况：
- * 超过 `本段时长 + 2s` 仍没推进，就强制往下走。
+ * Fallback ceiling for each segment (design §8.1 first rule: **no exception may leave the door closed
+ * forever**). A normal `sleep` always resolves; this guards the extreme cases "the injected clock never
+ * calls back / the main thread is stuck": if `segment duration + 2s` passes with no advance, force the move.
  */
 export const SEG_TIMEOUT_MS = 2000;
 
 /**
- * 降级档（系统「减弱动态效果」）每半段淡入/淡出的时长（ms），与 theme.css 的 `--dur-flash` 一一对应。
- * 设计 §5.1 要求这个档总耗时 <100ms：40ms 淡出 + 换脸 + 40ms 淡入 = 80ms。
+ * Degraded tier (system "reduce motion"): the fade in/out duration per half segment (ms), one-to-one with
+ * the `--dur-flash` in theme.css. Design §5.1 requires this tier to total <100ms: 40ms fade out + face
+ * change + 40ms fade in = 80ms.
  */
 export const FLASH_MS = 40;
 
 /**
- * 井道运行时长：跨 N 层 = clamp(240 + 130 × N, 300, 700)
- *   N=1 → 300ms（全程 860ms）  N=2 → 500ms  N=3 → 630ms  N≥4 → 700ms 封顶
- * 封顶理由：4 层已是本产品最大跨度，再长用户会觉得「软件卡了在做特效」。
+ * Shaft travel duration: across N floors = clamp(240 + 130 × N, 300, 700)
+ *   N=1 → 300ms (860ms total)  N=2 → 500ms  N=3 → 630ms  N≥4 → 700ms cap
+ * Why the cap: 4 floors is already the largest span this product offers; any longer and the user feels "the
+ * software is lagging, doing effects".
  */
 export function moveMsFor(n) {
   return Math.min(700, Math.max(300, Math.round(240 + 130 * Math.abs(n))));
 }
 
-/** idle | closing | moving | opening | settling —— 唯一的动画真相，CSS 靠 data-phase 展开 */
+/** idle | closing | moving | opening | settling —— the single source of animation truth; CSS expands it via data-phase */
 const phase = ref('idle');
-/** 本趟的目的层（运行中改目的层时，改的是它） */
+/** This trip's destination floor (when the destination is changed mid-run, it is this that changes) */
 const targetFloor = ref('');
-/** 本趟的出发层：关门期间轿厢还停在这儿（见 carFloor） */
+/** This trip's origin floor: the car is still parked here while the door closes (see carFloor) */
 const fromFloor = ref('');
 /**
- * 「改目的层」的预约位（设计 §4.3）：运行中点别的层不会瞬移，先走完当前这一层
- * （到最近可达层），到站后不开门、折返去它。到了这一步才把它转正成 targetFloor。
+ * The "change destination" reservation slot (design §4.3): pressing another floor mid-run does not teleport;
+ * it first finishes this segment (to the nearest reachable floor), and on arrival does not open the door but
+ * reverses toward it. Only at that point does it become the real targetFloor.
  */
 const pendingTarget = ref('');
-/** 本趟的井道运行时长，供轿厢写内联 transition-duration */
+/** This trip's shaft travel duration, for the car to write an inline transition-duration */
 const moveMs = ref(moveMsFor(1));
 /**
- * on | reduced | off —— `auto` 档在这里归一：
- *   on      完整电梯动画
- *   reduced 系统开了「减弱动态效果」：不演电梯，但**不做硬切**，给一次 80ms 淡出淡入（设计 §5.1）
- *   off     用户明确关掉动画：真·硬切，连淡入淡出也不要
+ * on | reduced | off —— the `auto` tier is normalized here:
+ *   on      full elevator animation
+ *   reduced the system has "reduce motion" on: no elevator, but **not a hard cut** either; one 80ms
+ *           fade out/in (design §5.1)
+ *   off     the user explicitly turned animation off: a true hard cut, not even a fade
  */
 const motionMode = ref('on');
-/** 降级档的淡出/淡入开关：挂在 ElevatorDoors 的 data-flash 上，CSS 只做 opacity */
+/** Fade-out/in switch of the degraded tier: attached to ElevatorDoors' data-flash; CSS only does opacity */
 const flash = ref(false);
-/** 每次 request 自增：所有推进都靠它防串台 */
+/** Incremented on each request: every advance relies on it to avoid cross-talk */
 let token = 0;
-/** 本趟是否已经提交过 selectFloor（门后换脸那一下）。closing 段"点当前层 = 反悔"要靠它区分 */
+/** Whether this trip has already committed selectFloor (the face change behind the door). The closing segment's "press the current floor = undo" is told apart by it */
 let committed = false;
 
-/** sleep 可注入：单测换成可控时钟，不用真等 860ms */
+/** sleep is injectable: unit tests swap in a controllable clock instead of really waiting 860ms */
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let sleep = defaultSleep;
 
@@ -84,20 +93,21 @@ export function injectSleep(fn) {
 }
 
 /**
- * 三档开关归并：localStorage['wg.elevatorMotion']（on / off / auto，缺省 auto），
- * auto 档看系统 prefers-reduced-motion。开关 UI 入口不做（effort §2-7），
- * 手动在控制台写 localStorage 即可验证。
+ * Merge the three-position switch: localStorage['wg.elevatorMotion'] (on / off / auto, default auto);
+ * the auto tier looks at the system prefers-reduced-motion. There is no switch UI entry (effort §2-7);
+ * write localStorage in the console by hand to verify.
  *
- * 注意 auto + 系统偏好 → **`reduced` 而不是 `off`**：系统那只偏好说的是"少动"，
- * 不是"没有反馈"。直接落 off 就成了硬切，切楼层什么动静都没有（设计 §5.1 的原意是给
- * 60ms 淡入淡出，总耗时 <100ms）。用户自己在设置里关掉，才是真·零动画。
+ * Note auto + system preference → **`reduced`, not `off`**: the system preference says "move less", not
+ * "no feedback". Falling straight to off becomes a hard cut, and switching floors gives no motion at all
+ * (design §5.1 originally means a 60ms fade, total <100ms). Only the user turning it off in settings is a
+ * true zero-animation.
  */
 function readMode() {
   let v = 'auto';
   try {
     v = localStorage.getItem('wg.elevatorMotion') || 'auto';
   } catch {
-    /* 隐私模式 / 禁用存储：按 auto 走 */
+    /* private mode / storage disabled: go with auto */
   }
   if (v === 'on' || v === 'off') return v;
   try {
@@ -107,14 +117,16 @@ function readMode() {
   }
 }
 
-/** 当前层（store 里那个）。延迟到用的时候再取 store：app.use(pinia) 之后才有 activePinia */
+/** The current floor (the one in the store). The store is fetched lazily: activePinia only exists after app.use(pinia) */
 const currentFloor = computed(() => useSessionStore().selectedFloor);
 
 /**
- * 高亮用（effort §2.3 方案 A）：t=0 就要点亮目的层胶囊，但 store 的 selectedFloor
- * 要到关门 70% 才提交 —— 中间这一百多毫秒没有真相，由这里统一兜住。
- * 有预约位时（运行中改目的层）亮**用户最后点的那个**：按了就该亮，这在真电梯里也是常识
- * （车还在往上一层走，但你按的 5F 已经亮了）。
+ * For highlighting (effort §2.3 option A): the destination-floor pill must light up at t=0, but the store's
+ * selectedFloor is only committed at 70% of the close —— during those one-hundred-plus milliseconds there is
+ * no truth, and this covers it uniformly.
+ * With a reservation slot (destination changed mid-run) it lights **the one the user pressed last**: pressing
+ * should light it, which is also common sense in a real elevator (the car is still heading to the floor above,
+ * but the 5F you pressed is already lit).
  */
 const displayFloor = computed(() => {
   if (phase.value === 'idle') return currentFloor.value;
@@ -122,10 +134,12 @@ const displayFloor = computed(() => {
 });
 
 /**
- * 轿厢用。与 displayFloor 同源（同一份 phase / targetFloor / currentFloor），
- * 但轿厢要等门关上才起步（设计 §2 段 2 才轮到 moving）：门还开着就滑走没有电梯感，
- * 所以 closing 期间它停在出发层。不另开一套来源，避免「高亮在 4F、轿厢在 3F」。
- * 注意它**不看 pendingTarget**：车是物理地去当前这一趟的目的地，预约位只影响按钮高亮。
+ * For the car. Same source as displayFloor (the same phase / targetFloor / currentFloor), but the car only
+ * starts once the door is closed (design §2 segment 2 is when moving comes): sliding away while the door is
+ * still open has no elevator feel, so during closing it stays at the origin floor. Do not open a separate
+ * source, to avoid "the highlight is at 4F while the car is at 3F".
+ * Note it **ignores pendingTarget**: the car physically goes to this trip's destination; the reservation slot
+ * only affects button highlighting.
  */
 const carFloor = computed(() => {
   if (phase.value === 'idle') return currentFloor.value;
@@ -133,11 +147,14 @@ const carFloor = computed(() => {
 });
 
 /**
- * 本趟方向：'up' | 'down' | ''。液晶屏的 ▲▼ 用它 —— 只在**还没到站**（closing / moving）表态，
- * 与 pendingFloor 同一道闸：到站后方向就没有意义了，屏上不该留一支指着上的箭头（车已经停了）。
- * 注意判的是 fromFloor → targetFloor，**不是** carFloor → targetFloor：方向是「这一趟」的属性，
- * 关门时就要点亮，而 moving 段 carFloor 已经等于 target，按它判永远是空。
- * 楼层顺序取自 store.floors（与轿厢、高亮同一份来源），不在组件里另排一套。
+ * This trip's direction: 'up' | 'down' | ''. The LCD's ▲▼ uses it —— it only speaks while **not yet arrived**
+ * (closing / moving), the same gate as pendingFloor: once arrived, direction is meaningless and the screen
+ * should not keep an up arrow (the car has stopped).
+ * Note it compares fromFloor → targetFloor, **not** carFloor → targetFloor: direction is a property of "this
+ * trip" and must light up at close time, whereas in the moving segment carFloor already equals target, so
+ * judging by it would always be empty.
+ * Floor order comes from store.floors (the same source as the car and the highlight); do not lay out another
+ * set inside the component.
  */
 const facing = computed(() => phase.value === 'closing' || phase.value === 'moving');
 const direction = computed(() => {
@@ -150,23 +167,27 @@ const direction = computed(() => {
 });
 
 /**
- * 液晶屏「待到达层」：只在还没到站时（closing / moving）有值，到站（opening / settling）立刻熄灭。
- * 与 displayFloor 的分工：displayFloor 回答「按钮该亮在哪层」（用户按的，含预约位）；
- * 这里回答「车正在去哪层」（本趟目的地），到了就没了。
+ * LCD "pending floor": only has a value while not yet arrived (closing / moving); it goes dark as soon as we
+ * arrive (opening / settling).
+ * Division of labor with displayFloor: displayFloor answers "which floor should the button light up at" (the
+ * one the user pressed, including the reservation slot); this answers "which floor the car is heading to"
+ * (this trip's destination), and it is gone once arrived.
  */
 const pendingFloor = computed(() => (facing.value ? targetFloor.value : ''));
 
-/** 楼层在表里的下标（算跨几层、算方向都靠它；表里没有 → -1） */
+/** A floor's index in the list (used for the floor span and the direction; not in the list → -1) */
 function floorIndex(store, id) {
   return store.floors.findIndex((f) => f.id === id);
 }
 
 /**
- * **唯一**的段推进入口：等这一段的时长，然后回报"这一趟还是不是当前趟"。
+ * The **only** segment-advance entry point: wait out this segment's duration, then report back whether "this
+ * trip is still the current one".
  *
- * - 返回 `false` = 已经被作废（有人按了别的层 / 反悔 / 强制收尾），调用方必须整趟退出；
- * - 内置 2s 兜底：`sleep` 迟迟不 resolve 时也强制往下走（设计 §8.1）。
- *   `sleep` 抛错也算"过了这一段"，同样不能把门锁死。
+ * - Returns `false` = already invalidated (someone pressed another floor / undo / forced wrap-up); the caller
+ *   must exit the whole trip;
+ * - Built-in 2s fallback: forces the move even when `sleep` never resolves (design §8.1). A `sleep` throw also
+ *   counts as "this segment passed" and likewise must not lock the door.
  */
 function step(my, ms) {
   return new Promise((resolve) => {
@@ -190,17 +211,17 @@ function step(my, ms) {
   });
 }
 
-/** 作废在途那一趟，并清掉本趟临时状态（phase 由调用方决定） */
+/** Invalidate the in-flight trip and clear this trip's transient state (phase is decided by the caller) */
 function abortRun() {
   token += 1;
   committed = false;
   pendingTarget.value = '';
   targetFloor.value = '';
   fromFloor.value = '';
-  flash.value = false; // 别把降级档的"淡出中"留在半路（那就是一屏看不见的内容）
+  flash.value = false; // do not leave the degraded tier "fading out" mid-way (that is an invisible screen's worth of content)
 }
 
-/** 起一趟：关门 → 换脸 → 井道运行（含折返）→ 开门 → 就位 */
+/** Start a trip: close → face change → shaft travel (incl. reversal) → open → settle */
 function startRun(id, store) {
   const my = ++token;
   committed = false;
@@ -212,15 +233,16 @@ function startRun(id, store) {
 }
 
 async function run(my, store) {
-  // 段 1 关门：70% 处换脸（内容突变藏在门后）。目标层可能已在关门途中被改（§4.3），
-  // 所以提交的是**当时的** targetFloor，而不是入参 id。
+  // Segment 1 close: face change at 70% (the content jump hides behind the door). The target floor may have
+  // been changed mid-close (§4.3), so what is committed is the **current** targetFloor, not the input id.
   const commitAt = Math.round(DURATIONS.close * COMMIT_AT);
   if (!(await step(my, commitAt))) return;
   committed = true;
   store.selectFloor(targetFloor.value);
   if (!(await step(my, DURATIONS.close - commitAt))) return;
 
-  // 段 2 井道运行。可能走两段：运行中有人改了目的层 → 到站不开门、折返再走一段
+  // Segment 2 shaft travel. It may run twice: someone changes the destination mid-run → do not open on
+  // arrival, reverse and travel another segment.
   for (;;) {
     const n = floorIndex(store, targetFloor.value) - floorIndex(store, fromFloor.value);
     moveMs.value = moveMsFor(Number.isFinite(n) && n !== 0 ? n : 1);
@@ -229,22 +251,24 @@ async function run(my, store) {
 
     const next = pendingTarget.value;
     if (!next) break;
-    // 折返：这一层已经走完（**不瞬移**），门不开，换个目标再走一段 ——
-    // effort §4 的"朴素两段式"：不做路径重规划，多花一段 moveMs，换代码量减半
+    // Reversal: this floor is already done (**no teleport**), the door does not open, and we travel another
+    // segment with a new target —— effort §4's "naive two-stage": no path replanning, one extra moveMs,
+    // at half the code.
     fromFloor.value = targetFloor.value;
     targetFloor.value = next;
     pendingTarget.value = '';
   }
 
-  // 折返时 store 还停在"关门那一刻提交的目的地"（比如先提交了 3F）：门全程关着，
-  // 到这里补一次换脸，突变照样藏在门后（单测 [7] 就是漏了这一步 —— 车到了 5F、内容还是 3F）
+  // On reversal the store is still on "the destination committed at close time" (say 3F was committed first):
+  // the door is closed the whole time, so patch the face change here; the jump is still hidden behind the door
+  // (unit test [7] missed this step —— the car arrived at 5F while the content was still 3F)
   if (store.selectedFloor !== targetFloor.value) store.selectFloor(targetFloor.value);
 
-  // 段 3 开门
+  // Segment 3 open
   phase.value = 'opening';
   if (!(await step(my, DURATIONS.open))) return;
 
-  // 段 4 内容就位
+  // Segment 4 content settle
   phase.value = 'settling';
   if (!(await step(my, DURATIONS.settle))) return;
 
@@ -253,18 +277,19 @@ async function run(my, store) {
   fromFloor.value = '';
 }
 
-/** 反悔（关门途中点当前层）：作废这一趟；门的目标值回到 idle 态，浏览器会从"合到一半"的位置继续滑开 */
+/** Undo (pressing the current floor mid-close): invalidate this trip; the door's target returns to idle and the browser keeps sliding it open from "half closed" */
 function cancelRun() {
   abortRun();
   phase.value = 'idle';
 }
 
 /**
- * 强制收尾：把在途那一趟"走完"（该换的层换掉），门开、回 idle。
+ * Forced wrap-up: "finish" the in-flight trip (apply the floor change it owes), open the door, return to idle.
  *
- * 用在两处：页面被隐藏、App 卸载。**不是"取消回 idle"** —— 用户点了就该去，
- * 静默取消会变成"点了没反应"。触发条件是 `document.hidden`（最小化 / 切到别的页面），
- * **不看 `blur`**：点一下别的窗口就把动画掐掉太粗暴，而且 blur 并不触发定时器节流。
+ * Used in two places: the page is hidden, and App unmount. It is **not "cancel back to idle"** —— the user
+ * pressed, so it should go; a silent cancel becomes "pressed and nothing happened". The trigger is
+ * `document.hidden` (minimize / switch to another page), and it **does not look at `blur`**: cutting the
+ * animation off because another window was clicked is too brusque, and blur does not trigger timer throttling.
  */
 export function settleElevator() {
   if (phase.value === 'idle') return;
@@ -273,14 +298,14 @@ export function settleElevator() {
     try {
       useSessionStore().selectFloor(targetFloor.value);
     } catch {
-      /* store 还没就绪（极端时序）：忽略，不能因为收尾再抛一次 */
+      /* store not ready yet (extreme timing): ignore; the wrap-up must not throw again */
     }
   }
   abortRun();
   phase.value = 'idle';
 }
 
-/** 只在页面真的被隐藏时收尾：Chromium 会把隐藏页的定时器节流到分钟级，真等下去就是"门关着不动" */
+/** Wrap up only when the page is really hidden: Chromium throttles a hidden page's timers to the minute scale, and waiting really would be "the door closed and not moving" */
 let watchdogArmed = false;
 function armWatchdog() {
   if (watchdogArmed || typeof document === 'undefined') return;
@@ -291,38 +316,41 @@ function armWatchdog() {
 }
 
 /**
- * 呼梯 —— 全部打断策略都在这里（设计 §4.3 那张表就是下面这几段 if）：
+ * Call the elevator —— the whole interrupt policy lives here (the table in design §4.3 is the ifs below):
  *
- * | 时机 | 点哪层 | 行为 |
+ * | When | Which floor pressed | Behavior |
  * | --- | --- | --- |
- * | 任意 | 点未安装层 | 忽略（不可达） |
- * | 任意 | （`off` 档） | 真·硬切：作废在途那一趟后直接 selectFloor，不演也不淡 |
- * | 任意 | （`reduced` 档） | 40ms 淡出 → 换脸 → 40ms 淡入，不走电梯那五段 |
- * | idle | 其它层 | 起一趟 |
- * | idle | 250ms 内重复点同一层 | 走一趟，不是两趟（**不需要专门去重**，见下） |
- * | closing | 当前层 | 反悔：门重开，回 idle |
- * | closing | 其它层 | 改目的层，**不重启关门**（关门是不可撤销的进行时） |
- * | moving | 即将到达的那层 | 忽略（反正马上到） |
- * | moving | 其它层 | 记预约位，到站不开门、折返 |
- * | opening / settling | 任意层 | **抢占**：立即重新关门（唯一允许打断的边界） |
+ * | any | a floor not installed | ignore (unreachable) |
+ * | any | (`off` tier) | true hard cut: invalidate the in-flight trip then selectFloor directly, no animation or fade |
+ * | any | (`reduced` tier) | 40ms fade out → face change → 40ms fade in, not the elevator's five segments |
+ * | idle | another floor | start a trip |
+ * | idle | the same floor again within 250ms | one trip, not two (**no dedicated dedup needed**, see below) |
+ * | closing | the current floor | undo: the door reopens, back to idle |
+ * | closing | another floor | change the destination, **do not restart the close** (closing is an irrevocable work-in-progress) |
+ * | moving | the floor about to be reached | ignore (we are almost there anyway) |
+ * | moving | another floor | record a reservation; do not open on arrival, reverse instead |
+ * | opening / settling | any floor | **preempt**: close again immediately (the only interruptible boundary) |
  *
- * 设计 §4.3 说要给"250ms 内重复点同一层"做去重。**这里刻意不做**，理由有两条，
- * 都是实现时才看清的：
- *   ① 不需要：`startRun` 是同步把 phase 切到 closing 的，第二次点击落在 `closing` 分支，
- *      目标层相同 → 天然幂等，本来就只走一趟（有单测钉住这条）；
- *   ② 有害：做去重就得记"上次点的层 + 时刻"，而下面这个序列会踩到它 ——
- *      点 4F（起一趟）→ 50ms 后点 1F 反悔（回 idle）→ 100ms 后再点 4F：
- *      落在 250ms 窗口内，去重会把这次**真实的复按**吞掉，用户会觉得"按了没反应"。
+ * Design §4.3 says to dedup "the same floor pressed again within 250ms". **This deliberately does not**,
+ * for two reasons that only became clear during implementation:
+ *   ① Not needed: `startRun` synchronously switches phase to closing, so the second click lands in the
+ *      `closing` branch with the same target floor → naturally idempotent and only one trip anyway (a unit
+ *      test pins this down);
+ *   ② Harmful: dedup would have to remember "last pressed floor + time", and the sequence below would hit
+ *      it —— press 4F (starts a trip) → 50ms later press 1F to undo (back to idle) → 100ms later press 4F
+ *      again: it lands inside the 250ms window, and dedup would swallow this **genuine re-press**, making
+ *      the user feel "pressed and nothing happened".
  */
 export async function request(id) {
   const store = useSessionStore();
   motionMode.value = readMode();
 
-  // 未安装层（置灰 / :disabled）不可达，电梯不去点不动的层
+  // A floor not installed (greyed out / :disabled) is unreachable; the elevator does not go to a floor that cannot be pressed
   const floor = store.floors.find((f) => f.id === id);
   if (!floor || !floor.installed) return;
 
-  // 零动画档：不演，直接换（effort §4-5）。在途那一趟要作废 —— 否则它回来还会再改一次楼层
+  // Zero-animation tier: no animation, switch directly (effort §4-5). The in-flight trip must be invalidated ——
+  // otherwise it comes back and changes the floor once more
   if (motionMode.value === 'off') {
     abortRun();
     store.selectFloor(id);
@@ -332,13 +360,15 @@ export async function request(id) {
   armWatchdog();
 
   if (id === currentFloor.value) {
-    // 关门途中点当前层 = 反悔。换脸还没发生（committed=false），所以内容不用回滚
+    // Pressing the current floor mid-close = undo. The face change has not happened yet (committed=false), so
+    // the content does not need rolling back
     if (phase.value === 'closing' && !committed) return cancelRun();
-    return; // 已经在这层 / 正要去这层：无事发生
+    return; // already on this floor / already heading to it: nothing happens
   }
 
-  // 降级档：不演电梯，只做一次 40ms 淡出 → 换脸 → 40ms 淡入（总 80ms，设计 §5.1 要求 <100ms）。
-  // 不落 off 是有意的：系统那只偏好说的是"少动"，不是"没有反馈"，硬切是另一种难看。
+  // Degraded tier: no elevator, just one 40ms fade out → face change → 40ms fade in (80ms total; design §5.1
+  // requires <100ms). Not falling to off is intentional: the system preference says "move less", not "no
+  // feedback", and a hard cut is ugly in another way.
   if (motionMode.value === 'reduced') {
     abortRun();
     const my = ++token;
@@ -354,27 +384,28 @@ export async function request(id) {
 
   if (phase.value === 'idle') return startRun(id, store);
 
-  /* 这一段以下是 phase !== 'idle' 时的打断策略 */
+  /* Everything below is the interrupt policy for phase !== 'idle' */
 
   if (phase.value === 'closing') {
-    targetFloor.value = id; // 门继续关，只是把目的层改掉（重启关门会闪）
+    targetFloor.value = id; // the door keeps closing, only the destination changes (restarting the close would flicker)
     return;
   }
 
   if (phase.value === 'moving') {
-    if (id === targetFloor.value) return; // 点即将到达的那层：忽略
-    pendingTarget.value = id; // 预约：到站后折返（真电梯也得过了这层才能反向）
+    if (id === targetFloor.value) return; // pressing the floor about to be reached: ignore
+    pendingTarget.value = id; // reservation: reverse on arrival (a real elevator also has to pass this floor before it can go back)
     return;
   }
 
-  // opening / settling：唯一允许抢占的边界 —— 门还没全开就重新关上，比排队等 380ms 干脆
+  // opening / settling: the only preemptible boundary —— close again before the door is fully open, crisper than queuing ~380ms
   return startRun(id, store);
 }
 
 /**
- * 单例出口。返回的都是同一个 ref —— 每次调用不会新建状态。
- * （App.vue 拿 phase / motionMode / request，FloorSelector 拿 carFloor / displayFloor / moveMs，
- *   门楣那块屏（TaskTicker）不取楼层 —— 它滚的是各层的任务，自己不管在哪层。）
+ * Singleton exit. Everything returned is the same ref —— each call does not create new state.
+ * (App.vue takes phase / motionMode / request; FloorSelector takes carFloor / displayFloor / moveMs; the
+ *  lintel screen (TaskTicker) does not take floors —— it scrolls each floor's tasks and does not care which
+ *  floor it is on.)
  */
 export function useElevator() {
   return {
@@ -388,7 +419,7 @@ export function useElevator() {
     direction,
     moveMs,
     motionMode,
-    /** 降级档的淡出/淡入开关（ElevatorDoors 挂到 data-flash 上） */
+    /** The degraded tier's fade-out/in switch (ElevatorDoors attaches it to data-flash) */
     flash,
     request,
     settleElevator,
