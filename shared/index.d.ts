@@ -185,8 +185,8 @@ export declare function formatDuration(ms: number): string;
 export declare function formatClock(ms: number): string;
 /** Member avatar config by name (before `@`); unmatched → AVATAR_FALLBACK. */
 export declare function avatarOf(name: string): { label: string; body: string; horn: string; prop: string };
-/** form → source: vscode-like → 'plugin', 'ide' → 'ide', everything else → 'cli'. */
-export declare function formToSource(form: string): 'plugin' | 'cli' | 'ide';
+/** form → source: vscode-like → 'plugin', 'ide' → 'ide', 'desktop' → 'desktop', everything else → 'cli'. */
+export declare function formToSource(form: string): 'plugin' | 'cli' | 'ide' | 'desktop';
 /** agent base name → product display name table. */
 export declare const AGENT_LABELS: Record<string, string>;
 /** Identity → agent base name (strips an `@<project>` suffix; plugin-vs-not is decided by `form`). */

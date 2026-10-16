@@ -260,10 +260,10 @@ const consoleBase = computed(() => {
   // `<project dir>/<session>.jsonl`), and substring matching can both miss and mismatch. Now with real session ids on both sides it is a direct equality check.
   // If either side lacks a session id (Codex rollout file names have no session_id, old state files) → lenient pass-through, keeping the old behavior.
   const sameSession = Boolean(fp) && (!fp.sessionId || !selSessionId || fp.sessionId === selSessionId);
-  // All three hook-source forms (plugin/cli/ide) should pass the fast poll phase; cli/ide are no longer hardcoded into two branches.
+  // All four hook-source forms (plugin/cli/ide/desktop) should pass the fast poll phase; cli/ide/desktop are no longer hardcoded into two branches.
   // plugin has a fresh flag (set by handlePlugin), cli/ide are the two paths that write the hook to disk (handleCliHook),
   // and both share "the reporter hook is wired up, the realtime phase comes from the /reporter-phase fast poll".
-  const isHookSource = Boolean(sel.fresh) || ['cli', 'ide', 'plugin'].includes(sel.source);
+  const isHookSource = Boolean(sel.fresh) || ['cli', 'ide', 'plugin', 'desktop'].includes(sel.source);
   const canUseFast = isHookSource && Boolean(sel.projectPath);
   if (canUseFast && sameWs && sameSession && fp.phase) {
     if (fp.phase === 'await') {

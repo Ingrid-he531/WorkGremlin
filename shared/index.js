@@ -349,20 +349,22 @@ function isPluginClient(form) {
 }
 
 /**
- * form → source derivation: one rule for the three forms.
- *   isPluginClient(form) → 'plugin' (vscode-family IDE extensions)
- *   form === 'ide'        → 'ide' (standalone IDE products, e.g. TraeCode IDE)
+ * form → source derivation: one rule for the four forms.
+ *   isPluginClient(form) → 'plugin'  (vscode-family IDE extensions)
+ *   form === 'ide'        → 'ide'    (standalone IDE products, e.g. TraeCode IDE)
+ *   form === 'desktop'    → 'desktop' (a desktop app, e.g. the Codex desktop app)
  *   form === 'cli'        → 'cli'
  *   other (empty / unknown) → 'cli' (fallback: if the form can't be told, treat it as CLI)
  *
  * Both frontend and backend use this function, so the form→source mapping exists in exactly one place.
  * @param {string} form form
- * @returns {'plugin'|'cli'|'ide'}
+ * @returns {'plugin'|'cli'|'ide'|'desktop'}
  */
 function formToSource(form) {
   const f = String(form || '').toLowerCase();
   if (isPluginClient(f)) return 'plugin';
   if (f === 'ide') return 'ide';
+  if (f === 'desktop') return 'desktop';
   return 'cli';
 }
 
@@ -401,12 +403,13 @@ function agentBase(id) {
  *
  * Rules:
  *   isPluginClient(form)      → `${base} Plugin`
- *   form === 'cli'             → `${base} CLI` (not appended if base already contains CLI/IDE)
+ *   form === 'cli'             → `${base} CLI` (not appended if base already carries the form)
  *   form === 'ide'             → `${base} IDE` (same)
+ *   form === 'desktop'         → `${base} Desktop` (same)
  *   other (empty / form already carries the form) → base name
  *
  * @param {string} agent floor identity (client / memberId etc.)
- * @param {string} form  form (vscode / cli / ide / '')
+ * @param {string} form  form (vscode / cli / ide / desktop / '')
  * @returns {string} display name, e.g. "TraeCode IDE" / "CodeBuddy Plugin" / "Kilo Code CLI" / "Codex"
  */
 function clientLabel(agent, form) {
@@ -414,8 +417,10 @@ function clientLabel(agent, form) {
   const base = AGENT_LABELS[a] || a || '—';
   const f = String(form || '').toLowerCase();
   if (isPluginClient(f)) return `${base} Plugin`;
-  if (f === 'cli' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} CLI`;
-  if (f === 'ide' && !/(?:^|\s)(?:CLI|IDE)$/i.test(base)) return `${base} IDE`;
+  if (/(?:^|\s)(?:CLI|IDE|Desktop)$/i.test(base)) return base;
+  if (f === 'cli') return `${base} CLI`;
+  if (f === 'ide') return `${base} IDE`;
+  if (f === 'desktop') return `${base} Desktop`;
   return base;
 }
 

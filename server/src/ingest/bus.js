@@ -44,15 +44,15 @@ function normClient(v) {
 }
 
 /**
- * The **form** of this run: 'cli' / 'plugin' (IDE extension).
+ * The **form** of this run: 'cli' / 'vscode' (IDE extension) / 'ide' / 'desktop' (a desktop app).
  * Products that can't be distinguished (Claude / Qoder...) and old data stay NULL -- the task list falls back to the product name only (e.g. "Codex").
  */
 function normForm(v) {
   const s = String(v || '').trim().toLowerCase();
-  // form stores the **form** (cli / vscode / ide). Old data / some reports pass the "source name" plugin as form;
+  // form stores the **form** (cli / vscode / ide / desktop). Old data / some reports pass the "source name" plugin as form;
   // normalize it to its corresponding form vscode -- otherwise isPluginClient won't recognize it and the task list's "... Plugin" label is lost.
   if (s === 'plugin') return 'vscode';
-  if (s === 'cli' || s === 'ide' || isPluginClient(s)) return s;
+  if (s === 'cli' || s === 'ide' || s === 'desktop' || isPluginClient(s)) return s;
   return null;
 }
 

@@ -57,15 +57,24 @@ const meta = {
 
 const { runHookEvent, sharedHookImpl, jsonlReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
 
-/** Codex form (cli / plugin): the source/originator of the session_meta first line of a rollout.
- * Moved here from hookCommon (it is part of "the floor's own interface"); fields not overridden
- * fall back to sharedHookImpl. */
+/** Codex form (cli / desktop / vscode): the source/originator of the session_meta first line of a
+ * rollout. Moved here from hookCommon (it is part of "the floor's own interface"); fields not
+ * overridden fall back to sharedHookImpl.
+ *
+ * The Codex desktop app reports `source: "vscode"` together with `originator: "Codex Desktop"`,
+ * while the VS Code extension reports `originator: "codex_vscode"` -- the two share `source`, so
+ * only the originator can tell them apart. "desktop" is therefore matched against `originator`
+ * alone (never the source), and checked before the vscode-family match; otherwise the desktop app
+ * is mistaken for the VS Code extension and shown as "Codex Plugin". */
 function codexForm(transcriptPath) {
   for (const obj of headJsonLines(transcriptPath)) {
     const p = obj && obj.payload;
     if (!p || typeof p !== 'object') continue;
     if (obj.type !== 'session_meta' && !p.source && !p.originator) continue;
-    const who = `${String(p.source || '')} ${String(p.originator || '')}`.toLowerCase();
+    const source = String(p.source || '').toLowerCase();
+    const originator = String(p.originator || '').toLowerCase();
+    const who = `${source} ${originator}`;
+    if (/desktop/.test(originator)) return 'desktop';
     if (/jetbrains/.test(who)) return 'jetbrains';
     if (/vscode|visual studio|extension|plugin/.test(who)) return 'vscode';
     if (who.trim()) return 'cli';

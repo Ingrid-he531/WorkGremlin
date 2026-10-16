@@ -12,7 +12,7 @@
  *
  * Run: `npm run test:task-client` (node runs it directly; renderer .js is treated as ESM by node's syntax check)
  */
-const { clientLabel } = await import('@workgremlin/shared');
+const { clientLabel, formToSource } = await import('@workgremlin/shared');
 
 let pass = 0;
 let fail = 0;
@@ -29,8 +29,16 @@ function ok(label, cond, extra = '') {
 console.log('\n[1] Codex：client 分不出两种形态，靠 form 补');
 ok('form=cli → Codex CLI', clientLabel('codex', 'cli') === 'Codex CLI', clientLabel('codex', 'cli'));
 ok('form=vscode → Codex Plugin', clientLabel('codex', 'vscode') === 'Codex Plugin', clientLabel('codex', 'vscode'));
+// The Codex desktop app reports source=vscode; it must show as "Codex Desktop", never "Codex Plugin".
+ok('form=desktop → Codex Desktop', clientLabel('codex', 'desktop') === 'Codex Desktop', clientLabel('codex', 'desktop'));
+ok('form=DESKTOP 大小写不敏感 → Codex Desktop', clientLabel('codex', 'DESKTOP') === 'Codex Desktop', clientLabel('codex', 'DESKTOP'));
 ok('没有 form（老数据 / 读不到 rollout）→ 还是 Codex', clientLabel('codex') === 'Codex', clientLabel('codex'));
 ok('form 大小写不敏感', clientLabel('codex', 'VSCODE') === 'Codex Plugin', clientLabel('codex', 'VSCODE'));
+
+console.log('\n[1b] form → source 映射：desktop 单独一档，不当 plugin');
+ok("form=vscode → source=plugin", formToSource('vscode') === 'plugin', formToSource('vscode'));
+ok("form=desktop → source=desktop", formToSource('desktop') === 'desktop', formToSource('desktop'));
+ok("form=cli → source=cli", formToSource('cli') === 'cli', formToSource('cli'));
 
 console.log('\n[2] Claude Code：同理，靠 form 补（CLI 与 VS Code 扩展共用同一个 client）');
 ok('form=cli → Claude Code CLI', clientLabel('claude', 'cli') === 'Claude Code CLI', clientLabel('claude', 'cli'));

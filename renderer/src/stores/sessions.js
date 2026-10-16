@@ -129,9 +129,10 @@ export const useSessionStore = defineStore('sessions', {
       if (!f) return [];
       return f.sessions.map((x) => {
         // Source tag: the backend's source is already derived from form (plugin/cli/ide), use it as-is
-        // plugin → Plugin-, cli → CLI-, ide → IDE-, empty → no prefix
+        // plugin → Plugin-, cli → CLI-, ide → IDE-, desktop → Desktop-, empty → no prefix
         const src = String(x.source || '').toLowerCase();
-        const tag = src === 'plugin' ? 'Plugin' : src === 'cli' ? 'CLI' : src === 'ide' ? 'IDE' : '';
+        const tag =
+          src === 'plugin' ? 'Plugin' : src === 'cli' ? 'CLI' : src === 'ide' ? 'IDE' : src === 'desktop' ? 'Desktop' : '';
         const proj = x.project || t('sessions.unknown_project');
         const body = tag ? `${tag}-${proj}` : proj;
         return {

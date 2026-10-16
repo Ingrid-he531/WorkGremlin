@@ -195,6 +195,12 @@ async function main() {
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform2', cwd: WS, prompt: '终端里的一轮', transcript_path: TS_TUI });
   ok('终端 CLI 起的会话 → form=cli', starts[starts.length - 1].form === 'cli', JSON.stringify(starts[starts.length - 1]));
 
+  // The Codex desktop app reports source=vscode + originator="Codex Desktop": it must not be
+  // mistaken for the VS Code extension (that would show "Codex Plugin").
+  const TS_DESKTOP = mkRollout('rollout-desktop.jsonl', { session_id: 'ideform4', source: 'vscode', originator: 'Codex Desktop' });
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform4', cwd: WS, prompt: '桌面应用里的一轮', transcript_path: TS_DESKTOP });
+  ok('Codex 桌面应用起的会话 → form=desktop', starts[starts.length - 1].form === 'desktop', JSON.stringify(starts[starts.length - 1]));
+
   await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'ideform3', cwd: WS, prompt: '读不到 rollout 的一轮' });
   ok('读不到 rollout 就不猜（form 为空）', !starts[starts.length - 1].form, JSON.stringify(starts[starts.length - 1]));
 

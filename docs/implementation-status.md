@@ -117,9 +117,11 @@ hook 以前把 `workspacePath` 取成 `/api/v1/workspace`（办公室当前工�
 （`dist/` 等）不算，非 git 工程这一路自动退空。
 ③ 客户端标签分 CLI / 插件：Codex（3F）与 Claude Code（4F）的 CLI 与自家 IDE 扩展都共用一份落盘、
 同一个 client（`codex` / `claude`），光看 client 只能显示「Codex」/「Claude Code」。hook 从**会话自己
-落的记录**里认出形态（`form = 'cli' | 'plugin'`）随任务一起上报，落 `task_runs.form`，任务列表按
-「产品名 + 形态」显示（Codex CLI / Codex Plugin、Claude Code CLI / Claude Code Plugin）：
-Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm()`）；Claude 看 transcript
+落的记录**里认出形态（`form = 'cli' | 'vscode' | 'ide' | 'desktop'`）随任务一起上报，落 `task_runs.form`，
+任务列表按「产品名 + 形态」显示（Codex CLI / Codex Plugin / Codex Desktop、
+Claude Code CLI / Claude Code Plugin）：
+Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm()`；桌面应用是
+`source=vscode` + `originator='Codex Desktop'`，比 VS Code 扩展先判，避免误标成 Plugin）；Claude 看 transcript
 第 3~5 行的 `entrypoint`（终端 `cli` / VS Code 扩展 `claude-vscode`，见 `claudeForm()`）—— Claude 的
 两个调用点（开轮 / 收工）同口径，认不出（老版本没有这一位、`sdk-cli` 这类别的形态、落盘读不到）
 一律留空，绝不猜。已带形态的标签（CodeBuddy CLI / Plugin）不重复追加，读不到形态的老数据退回只写

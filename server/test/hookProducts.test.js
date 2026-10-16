@@ -115,6 +115,19 @@ const CB_TP = path.join(CB_DIR, 'index.json');
   const st = calls.find((c) => c[0] === 'startTask');
   ok('Codex 形态被识别为 cli', st && st[1].form === 'cli', st && JSON.stringify(st[1]));
 
+  // Codex desktop app: source=vscode + originator="Codex Desktop" → desktop, not plugin.
+  const CODEX_DESKTOP_TP = path.join(TMP, 'codex-desktop-rollout.jsonl');
+  writeJsonl(CODEX_DESKTOP_TP, [
+    { type: 'session_meta', payload: { source: 'vscode', originator: 'Codex Desktop' } },
+    { type: 'user', message: { role: 'user', content: '桌面跑一轮' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'output_text', text: '桌面干成了' }] } },
+  ]);
+  calls.length = 0;
+  // No ev.client here, matching real Codex hook events: the form falls back to codexForm(rollout).
+  await d.dispatch({ hook_event_name: 'UserPromptSubmit', session_id: 's_codex_desktop', prompt: '再', agent: 'codex', cwd: TMP, transcript_path: CODEX_DESKTOP_TP }, ctx);
+  const stD = calls.find((c) => c[0] === 'startTask');
+  ok('Codex 桌面应用被识别为 desktop（不是 plugin）', stD && stD[1].form === 'desktop', stD && JSON.stringify(stD[1]));
+
   // 形态判定优先看 ev.client：vscode 壳装的 codex（agent 仍是 codex）应标 plugin，且路由仍落到 codex 楼层
   calls.length = 0;
   await d.dispatch({ hook_event_name: 'UserPromptSubmit', session_id: 's_codex_vsc', client: 'vscode', prompt: '再', agent: 'codex', cwd: TMP, transcript_path: CODEX_TP }, ctx);
