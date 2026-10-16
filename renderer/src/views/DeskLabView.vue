@@ -1,9 +1,9 @@
 <script setup>
 /**
- * DeskLabView —— 工位设计台（调造型/动效用）。
+ * DeskLabView —— the workstation design bench (for tuning shape/animation).
  *
- * 不依赖真实数据：把 5 种状态各渲染一个大工位 + 一排实际尺寸的工位，
- * 方便对照着改配色、比例、动画，而不用等服务里正好出现某个状态。
+ * No dependency on real data: render each of the 5 states as one large workstation + a row of actual-size workstations,
+ * so you can tweak palette, proportions and animation side by side without waiting for a state to happen to appear in the service.
  */
 import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';

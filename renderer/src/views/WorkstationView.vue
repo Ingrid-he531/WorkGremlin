@@ -11,29 +11,29 @@ const project = useProjectStore();
 const sessions = useSessionStore();
 const { t } = useI18n();
 
-// 主 agent：成员名（剥 -plugin）等于其 client 基名（codebuddy / qoder / codex …），
-// 对应 hook 注册的那只"本层主 agent"；子代理（leo / peter / software-architect…）名与基名不同。
+// Main agent: the member name (with -plugin stripped) equals its client base name (codebuddy / qoder / codex …),
+// matching the "main agent of this floor" registered by a hook; sub-agents (leo / peter / software-architect…) have names that differ from the base name.
 function isMainAgent(m) {
-  // 主 agent = 成员身份（memberId / name）是产品基名（codebuddy / kilo …），
-  // 子代理（leo / peter …）不是产品基名，据此排到主 agent 之后。
-  // 新模型下成员的 client 是形态（vscode / cli），不能拿它和 name 比基名。
+  // Main agent = the member identity (memberId / name) is a product base name (codebuddy / kilo …),
+  // sub-agents (leo / peter …) are not product base names, so they sort after the main agent.
+  // Under the new model a member's client is the form (vscode / cli), so it cannot be compared against name for the base name.
   return isBaseAgent(m.memberId || m.name);
 }
 
 const sorted = computed(() => {
   const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
-  // 与办公室同一口径：按当前楼层的客户端过滤（client 为空的视作通用）
+  // Same rule as the office: filter by the current floor's client (an empty client counts as generic)
   const want = sessions.selectedClient;
-  // 所有楼层的 client 都认一遍：合并楼层（1F CodeBuddy = CLI + Plugin）要把两种变体都收进来，
-  // 单楼层（3F Codex 这种 CLI 与 IDE 合并的）同理。
+  // Recognize every floor's client: merged floors (1F CodeBuddy = CLI + Plugin) must include both variants,
+  // and single floors (3F Codex, where CLI and IDE are merged) likewise.
   const allClients = (sessions.floors || []).map((f) => f.client);
   return project.members
-    // 工位卡片只显示常住小怪物；临时召唤出来的幽灵（subagent-xxx）不在这张表里占位，
-    // 避免"召唤后卡片列表里多出同名小怪物"的误会。
+    // Workstation cards only show resident gremlins; ghosts summoned temporarily (subagent-xxx) do not take a slot in this list,
+    // avoiding the misunderstanding of "a same-named gremlin appearing in the card list after a summon".
     .filter((m) => !isEphemeralMember(m))
     .filter((m) => floorAcceptsClient(want, m.client))
     .slice()
-    // 主 agent 卡片固定排最前（其余仍按相位顺序），不再随机
+    // The main agent card is always pinned first (the rest still follow phase order), no longer random
     .sort((a, b) => {
       const am = isMainAgent(a) ? 0 : 1;
       const bm = isMainAgent(b) ? 0 : 1;
@@ -43,12 +43,12 @@ const sorted = computed(() => {
 });
 
 /**
- * 主 agent 卡片兜底：6F Qoder / 7F Kilo / 9F GitHub Copilot 这类楼层，
- * 主 agent 走轮询 / 落盘探测（kilo.db / session-store.db），不经由 hook 注册成 roster 成员，
- * 工位视图原本就空着、没有主代理卡片；但办公室控制台（同层主 agent 相位）明明有显示，
- * 两边不一致。这里按楼层产品定义（client 基名）合成一张主代理卡片，相位取自当前选中会话
- * 的真实推导值（与办公室控制台同一来源，绝不编造活动：没有会话就显示待命）。
- * 楼层自己已注册了 role='agent' 成员时（1F/3F/4F/8F 等）不重复合成。
+ * Main agent card fallback: for floors like 6F Qoder / 7F Kilo / 9F GitHub Copilot,
+ * the main agent is discovered by polling / on-disk probing (kilo.db / session-store.db) and is not registered as a roster member by a hook,
+ * so the workstation view stays empty with no main agent card; yet the office console (main agent phase for that floor) clearly shows one,
+ * and the two disagree. Here we synthesize a main agent card from the floor's product definition (client base name), with the phase taken from
+ * the real derived value of the currently selected session (the same source as the office console —— never fabricate activity: no session means standby).
+ * Floors that already registered a role='agent' member (1F/3F/4F/8F etc.) are not synthesized again.
  */
 const MAIN_STATE_OF_PHASE = {
   tool: 'busy',
@@ -66,7 +66,7 @@ const floorAgentBase = computed(() => {
   return f && f.client ? String(f.client).toLowerCase() : '';
 });
 const mainAgentCard = computed(() => {
-  // 已有真实主 agent 成员：直接用，不合成
+  // A real main agent member already exists: use it directly, do not synthesize
   if (sorted.value.some((m) => m.role === 'agent' || isMainAgent(m))) return null;
   const base = floorAgentBase.value;
   if (!base) return null;
@@ -77,7 +77,7 @@ const mainAgentCard = computed(() => {
     name: base,
     role: 'agent',
     state: MAIN_STATE_OF_PHASE[phase] || 'idle',
-    // 轮询 / 落盘推导的相位是推断值（不标真值），如实标灰；没有会话则状态未知
+    // A phase derived from polling / on-disk probing is inferred (not a reported value), so mark it grey truthfully; without a session the state is unknown
     degraded: !sel || Boolean(sel.inferred),
     stateSince: Date.now(),
     lastSeenAt: Date.now(),

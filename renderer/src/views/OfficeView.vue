@@ -1,9 +1,9 @@
 <script setup>
 /**
- * OfficeView —— 办公室俯视图（每个成员一张真实工位）。
+ * OfficeView —— top-down view of the office (a real workstation per member).
  *
- * 排序把异常成员顶到前面：blocked > busy > online > idle > offline。
- * 点击工位 = 选中该成员（与右侧对话抽屉联动）。
+ * Sorting pushes anomalous members to the front: blocked > busy > online > idle > offline.
+ * Clicking a workstation = selecting that member (wired to the conversation drawer on the right).
  */
 import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
@@ -16,7 +16,7 @@ const emit = defineEmits(['select']);
 
 const project = useProjectStore();
 
-/** 异常优先：保证阻塞/忙碌的成员一定在首屏 */
+/** Anomalous first: makes sure blocked/busy members are always on the first screen */
 const desks = computed(() => {
   const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
   return project.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
@@ -55,7 +55,7 @@ const desks = computed(() => {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background-color: var(--bg-elevated);
-  /* 地板格纹 */
+  /* Floor grid pattern */
   background-image:
     linear-gradient(rgba(255, 255, 255, 0.022) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px);

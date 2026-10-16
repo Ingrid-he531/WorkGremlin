@@ -1,13 +1,13 @@
 <script setup>
 /**
- * 议事厅：选几层 agent，就一个问题开一场会，看它们谈成没谈成。
+ * Council: pick a few floors of agents, hold a meeting on one topic, and see whether they reach agreement.
  *
- * 这个页面的责任是**如实呈现**，不是给一个好看的结论。所以：
- *   · 谁没答话就写「未表态」，红字摆上错误原文 —— 不画成一个立场；
- *   · 票型分两份显示：服务端判定的那份（依据）+ 从发言数出来的那份（印证），
- *     两份对不上时人一眼能看出来；
- *   · 材料截断了就在材料清单里写明"原文多少字节、只给了多少"；
- *   · 没谈成就大大方方写「未达成一致」并列出各自最后的立场，不合成一份"结论"。
+ * This page's job is to **present faithfully**, not to hand over a nice-looking conclusion. So:
+ *   · Whoever did not answer is written as "no stance", with the raw error in red —— not painted as a position;
+ *   · Vote tallies are shown in two parts: the one the server determined (evidence) + the one counted from the utterances (cross-check),
+ *     so a mismatch between the two is obvious at a glance;
+ *   · When material was truncated, the material list says how many bytes the original had and how many were included;
+ *   · When there is no consensus, plainly write "no consensus" and list each side's final position, without synthesizing a "conclusion".
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useCouncilStore } from '../stores/council';
@@ -18,9 +18,9 @@ const store = useCouncilStore();
 const { t } = useI18n();
 
 /**
- * 角色分配：主持人、主答各一人，参会者可多选。
- * 向后兼容：提交时把三种角色的楼层合并成 floors 数组发给服务端，
- * 服务端暂时不区分角色（等后续再改 orchestrator）。
+ * Role assignment: one chair and one main answerer, participants can be multi-selected.
+ * Backward compatible: on submit, merge the floors of the three roles into a floors array and send it to the server;
+ * the server does not distinguish roles for now (until the orchestrator is changed later).
  */
 const form = reactive({
   topic: '',
@@ -47,11 +47,11 @@ const floorName = (id) => {
 };
 
 const readyFloors = computed(() => store.readyFloors);
-/** 参会者候选项：除主持人和主答之外的可用楼层 */
+/** Participant options: the available floors other than the chair and main answerer */
 const participantOptions = computed(() =>
   readyFloors.value.filter((f) => f.floorId !== form.chair && f.floorId !== form.mainAnswerer),
 );
-/** 请不动的楼层（装了插件但没装 CLI 等），列出来并写明原因 */
+/** Floors that cannot be summoned (plugin installed but CLI missing, etc.); list them and state the reason */
 const notReadyFloors = computed(() => store.floors.filter((f) => !f.ready));
 
 const files = () => form.files.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -75,9 +75,9 @@ async function submit() {
     formError.value = t('council.need_two_floors');
     return;
   }
-  // 工作目录前端只拦一件事：**必须写绝对路径**。存在不存在、是不是目录，交给服务端 ——
-  // 它在发起的那一刻校验，比前端猜准，而且它说的话原样显示给用户。
-  // 前端自己判一句的原因只是"让用户少等一趟往返"，不是为了替他做判断。
+  // The frontend only blocks on one thing for the workspace: **an absolute path is required**. Whether it exists or is a directory is left to the server ——
+  // it validates at the moment of start, which is more accurate than the frontend guessing, and its message is shown to the user verbatim.
+  // The frontend checks this one rule only to "save the user a round trip", not to make the judgment for them.
   const ws = form.workspace.trim();
   if (ws && !/^(~\/|\/|[A-Za-z]:[\\/]|\\\\)/.test(ws)) {
     formError.value = t('council.workspace_abs');
@@ -94,17 +94,17 @@ async function submit() {
   if (id) form.topic = '';
 }
 
-/* ---------------------------------------------------------------- 结果 */
+/* ---------------------------------------------------------------- result */
 
 const council = computed(() => (store.current ? store.current.council : null));
 
-/** 达成一致的那一轮 —— 结论就是它桌上那份提案原文，原样显示，不由前端改写 */
+/** The round where consensus was reached —— the conclusion is the proposal text on its table, shown as-is, not rewritten by the frontend */
 const consensusRound = computed(() => {
   if (!store.current) return null;
   return store.current.rounds.find((r) => r.consensus === 1) || null;
 });
 
-/** 服务端判定的票型（按轮次索引），与从发言数出来的那份并存 */
+/** The vote tally determined by the server (indexed by round), coexisting with the one counted from utterances */
 const serverTally = (roundNo) => (store.current ? store.current.rounds.find((r) => r.round_no === roundNo) : null) || null;
 
 const lastDebate = computed(() => {
@@ -117,13 +117,13 @@ const verdictKey = (v) =>
   ['consensus', 'no_consensus', 'reported', 'cancelled', 'failed'].includes(v) ? v : 'failed';
 
 /**
- * 分析模式的简报分组 —— **服务端不合成结论，我们也不合成**。
- * 只做一件事：把最后一轮各人的最终判断按立场摆到一起，`points` / `risks` / `questions`
- * 原样列出。顺序固定四档（支持 → 反对 → 不确定 → 未表态），空组不渲染。
+ * Analysis-mode report grouping —— **the server does not synthesize a conclusion, and neither do we**.
+ * It does one thing only: place each person's final judgment from the last round together by stance, listing `points` / `risks` / `questions`
+ * as-is. The order is fixed at four levels (support → oppose → unsure → none); empty groups are not rendered.
  *
- * 为什么以**最后一轮**为准：提示词里明写了最后那轮要给最终判断，而中间轮次是过程 ——
- * 把每一轮的立场都堆上来，读的人反而看不出他们最后到底站哪儿。过程在下面的时间线里，
- * 一条都没丢。
+ * Why the **last round** is authoritative: the prompt explicitly says the last round must give the final judgment, while the middle rounds are process ——
+ * stacking every round's stance on top of each other makes it harder for the reader to see where they finally stand. The process is in the timeline below,
+ * nothing is lost.
  */
 const STANCE_ORDER = ['support', 'oppose', 'unsure', 'none'];
 const report = computed(() => {
@@ -135,13 +135,13 @@ const report = computed(() => {
   })).filter((g) => g.items.length);
 });
 
-/** 简报里的立场计数（从发言现数）。chair 不占席位，与表决那套口径一致 */
+/** Stance counts in the report (counted from utterances). chair does not take a seat, consistent with the vote definition */
 const stanceTally = computed(() => (lastDebate.value ? lastDebate.value.stanceTally : null));
 
 /**
- * 一条发言的要点 → 「标题键 + 该列的条目」两两一组，空列不出现。
- * findings 为 null（没解析出来）时返回空数组 —— 那是另一句话（findings_unparsed），
- * 调用方按 `!u.findings` 分开走，不靠这个空数组来区分。
+ * An utterance's key points → grouped in pairs of "heading key + that column's entries"; empty columns do not appear.
+ * When findings is null (unparsed), returns an empty array —— that is a different statement (findings_unparsed);
+ * the caller branches on `!u.findings` and does not rely on this empty array to tell them apart.
  */
 const findingRows = (u) => {
   const f = u && u.findings;
@@ -155,15 +155,15 @@ const findingRows = (u) => {
     .map(([k, v]) => ({ k, v }));
 };
 
-/* ------------------------------------------------------- 一轮里看谁的发言 */
+/* ------------------------------------------------------- whose utterance to view in a round */
 
 /**
- * 一轮里可能有好几层各说了一大段，全摊开就是一屏接一屏的正文，"谁说了什么"反而找不着。
- * 所以一轮**一次只摊开一个人的**，上面一排圆点选是谁 —— 收起来的是正文，不是事实：
- * 票型（表决模式）与"这轮没能发言"照旧留在那一行上，谁也不许被折叠掉。
+ * A round may have several floors each saying a long passage; spreading them all out is screen after screen of text, and "who said what" becomes impossible to find.
+ * So a round **expands only one person at a time**, with a row of dots above to pick who —— what is collapsed is the body text, not the facts:
+ * the vote tally (vote mode) and "could not speak this round" stay on that row; nothing is allowed to be folded away.
  *
- * 键是轮次号，值是楼层。没选过、或选的那一层在这一轮里没了 → 退回本轮第一位，
- * **绝不空着**：一轮里一个人都不显示，看起来就像这轮没人说话。
+ * The key is the round number, the value is the floor. If nothing was picked, or the picked floor is gone in this round → fall back to the first in the round,
+ * **never leave it empty**: showing no one in a round looks like no one spoke in it.
  */
 const picked = reactive({});
 const shownId = (g) => {
@@ -171,10 +171,10 @@ const shownId = (g) => {
   return g.utterances.some((u) => u.floorId === want) ? want : g.utterances[0] && g.utterances[0].floorId;
 };
 const shown = (g) => g.utterances.filter((u) => u.floorId === shownId(g));
-/** 第 0 轮只有主席在陈述议题，没有"选谁"这回事，就别摆一排只有一个选项的圆点 */
+/** Round 0 has only the chair stating the topic; there is no "pick who", so do not show a row of dots with a single option */
 const hasPicks = (g) => g.utterances.length > 1 || (g.utterances.length === 1 && g.utterances[0].role !== 'chair');
 
-/** 换一场会就把选择清空：上一场选的 7F 不该管到这一场 */
+/** Clear the selection when switching councils: the 7F picked in the previous council should not carry over to this one */
 watch(
   () => (store.current ? store.current.council.id : null),
   () => Object.keys(picked).forEach((k) => delete picked[k]),
@@ -182,7 +182,7 @@ watch(
 
 const fmtBytes = (n) => (n == null ? '—' : `${n.toLocaleString()}`);
 
-/** 只显示拿得到的数字：耗时为 0 秒和"读不到耗时"不是一回事 */
+/** Show only the numbers we have: a duration of 0 seconds and "duration unavailable" are not the same thing */
 const metaOf = (u) => {
   const parts = [];
   const tk = tokenTotal(u);
@@ -191,12 +191,12 @@ const metaOf = (u) => {
   return parts.join(' · ');
 };
 
-/** 删除不可撤销，先问一句；文案里写清"记录一并删掉" */
+/** Deletion is irreversible, so ask first; the copy states that the record is deleted along with it */
 function confirmRemove(id) {
   if (window.confirm(t('council.delete_confirm'))) store.remove(id);
 }
 
-/** 历史列表里的时间：紧凑显示，今天的只看时分，更早的看月日+时分 */
+/** Timestamps in the history list: compact display; today shows only hour:minute, earlier shows month/day + hour:minute */
 function fmtTime(ms) {
   if (!ms) return '';
   const d = new Date(ms);
@@ -210,7 +210,7 @@ function fmtTime(ms) {
 
 <template>
   <div class="view">
-    <!-- ------------------------------------------------------------ 左栏：发起 + 历史 -->
+    <!-- ------------------------------------------------------------ left column: start + history -->
     <aside class="side">
       <form class="compose" @submit.prevent="submit">
         <label class="lbl" for="cv-topic">{{ t('council.topic') }}</label>
@@ -356,7 +356,7 @@ function fmtTime(ms) {
       </div>
     </aside>
 
-    <!-- ------------------------------------------------------------ 右栏：这场会 -->
+    <!-- ------------------------------------------------------------ right column: this council -->
     <section class="main">
       <p v-if="!store.current" class="empty">{{ t('council.pick_one') }}</p>
 
@@ -366,7 +366,7 @@ function fmtTime(ms) {
             <span class="badge" :class="'v-' + verdictKey(council.verdict || 'failed')">
               {{ council.verdict ? t('council.verdict.' + verdictKey(council.verdict)) : t('council.status.' + statusKey(council.status)) }}
             </span>
-            <!-- 谈法与工作目录都摆在这儿：事后来看，"他们在哪儿谈的"是理解这场会的前提 -->
+            <!-- Both the mode and the workspace are shown here: in hindsight, "where they talked" is a prerequisite for understanding this council -->
             <span class="badge m" :class="'m-' + store.mode" data-testid="cv-mode-badge">
               {{ t('council.mode.' + store.mode) }}
             </span>
@@ -385,9 +385,9 @@ function fmtTime(ms) {
         <p v-if="store.error" class="why bad" data-testid="cv-op-error">{{ store.error }}</p>
 
         <!--
-          分析模式的简报。**必须排在下面那个通用 verdict 分支之前** ——
-          否则 verdict='reported' 会掉进最后那个"中断"框，看起来像这场会出事了。
-          这里同样不合成结论：只按立场分组，各自说了什么照原样列。
+          The analysis-mode report. **It must come before the generic verdict branch below** ——
+          otherwise verdict='reported' would fall into the last "aborted" box and look like this council went wrong.
+          Here too no conclusion is synthesized: it only groups by stance and lists what each side said as-is.
         -->
         <div
           v-if="store.mode === 'analysis' && council.verdict === 'reported'"
@@ -425,13 +425,13 @@ function fmtTime(ms) {
                   </span>
                 </div>
 
-                <!-- 未表态的：它要么没答上来、要么没按约定给尾块。错误原文照摆，别拿别的凑 -->
+                <!-- No stance: either it did not answer, or it did not give the trailing block as agreed. Show the raw error as-is; do not fill in with something else -->
                 <p v-if="g.key === 'none'" class="why bad">
                   {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
                   <span v-if="u.error"> —— {{ u.error }}</span>
                 </p>
 
-                <!-- 表了态却没给要点：这是"没按约定给"，不是"它说没有风险"，两句话不一样 -->
+                <!-- Took a stance but gave no key points: this is "did not give as agreed", not "it said there are no risks"; the two are different statements -->
                 <p v-else-if="!u.findings" class="why dim" :data-testid="'cv-nofindings-' + u.floorId">
                   {{ t('council.findings_unparsed') }}
                 </p>
@@ -443,7 +443,7 @@ function fmtTime(ms) {
                       <li v-for="(x, i) in row.v" :key="i">{{ x }}</li>
                     </ul>
                   </div>
-                  <!-- 三条数组都空：它答了，答的是"没有"。这跟上面"没给"要分得开 -->
+                  <!-- All three arrays are empty: it answered, and the answer was "none". This must be kept distinct from the "gave none" above -->
                   <p v-if="!findingRows(u).length" class="why dim">{{ t('council.findings_empty') }}</p>
                 </template>
               </li>
@@ -451,7 +451,7 @@ function fmtTime(ms) {
           </section>
         </div>
 
-        <!-- 结论：谈成了就原样引用那一轮的提案；没谈成就说没谈成 -->
+        <!-- Conclusion: on consensus, quote that round's proposal as-is; on no consensus, say no consensus -->
         <div v-else-if="council.verdict === 'consensus' && consensusRound" class="result win" data-testid="cv-conclusion">
           <h3 class="h3">{{ t('council.conclusion') }}</h3>
           <p class="hint">{{ t('council.conclusion_from_round', { n: consensusRound.round_no }) }}</p>
@@ -465,14 +465,14 @@ function fmtTime(ms) {
             <li v-for="u in lastDebate.utterances.filter((x) => x.role !== 'chair')" :key="u.floorId">
               <span class="v" :class="'v-' + voteKey(u.vote)">{{ t('council.vote.' + voteKey(u.vote)) }}</span>
               <span class="fid">{{ u.floorId }}</span>
-              <!-- 没表态的（超时 / 崩 / 解析不出）不补一句"没说理由"：它压根没答话，
-                   理由栏空着才是实情，立场由上面那个「未表态」标签说清 -->
+              <!-- Those with no stance (timeout / crash / unparsed) do not get a "gave no reason" note: they never answered at all,
+                   so leaving the reason column empty is the truth, and the stance is made clear by the "no stance" tag above -->
               <span v-if="u.voteReason" class="reason">{{ u.voteReason }}</span>
               <span v-else-if="u.status !== 'ok'" class="dim">{{ u.error }}</span>
             </li>
           </ul>
-          <!-- 最后一轮桌上那份也要摆出来（可追溯），但**标明它没通过** ——
-               不能长得跟上面那个「结论」区块一样，否则会被当成谈成了什么 -->
+          <!-- The one on the table in the last round must also be shown (for traceability), but **marked as not passed** ——
+               it must not look like the "conclusion" block above, or it would be taken as something agreed -->
           <div v-if="store.currentProposal" class="last-proposal" data-testid="cv-last-proposal">
             <p class="hint">{{ t('council.last_proposal', { round: store.currentProposal.roundNo }) }}</p>
             <blockquote class="quote notpassed">{{ store.currentProposal.proposal }}</blockquote>
@@ -484,7 +484,7 @@ function fmtTime(ms) {
           <p v-if="council.error" class="why bad">{{ council.error }}</p>
         </div>
 
-        <!-- 现在桌上的是哪份提案（只有表决模式有"桌上那份提案"这回事） -->
+        <!-- Which proposal is currently on the table (only vote mode has the notion of "the proposal on the table") -->
         <div v-if="store.mode === 'vote' && store.live && store.currentProposal" class="proposal" data-testid="cv-proposal">
           <span class="tag">{{ t('council.current_proposal') }}</span>
           <span class="p-round">{{ t('council.round_of', { n: store.currentProposal.roundNo, total: council.max_rounds }) }}</span>
@@ -499,7 +499,7 @@ function fmtTime(ms) {
           <p class="hint">{{ t('council.tie_rule') }}</p>
         </div>
 
-        <!-- 逐轮时间线 -->
+        <!-- Round-by-round timeline -->
         <ol class="timeline">
           <li v-for="g in store.timeline" :key="g.roundNo" class="round">
             <div class="round-head">
@@ -507,7 +507,7 @@ function fmtTime(ms) {
               <span v-if="g.roundNo > 0 && store.mode === 'vote'" class="tally">
                 {{ t('council.tally', { agree: g.tally.agree, disagree: g.tally.disagree, abstain: g.tally.abstain, invalid: g.tally.invalid }) }}
               </span>
-              <!-- 分析模式不数票：这一行给的是"这轮各人的倾向"，口径与未表态人数都写清 -->
+              <!-- Analysis mode does not count votes: this line gives "each person's leaning this round", with the definition and the no-stance count spelled out -->
               <span v-else-if="g.roundNo > 0" class="tally">
                 {{
                   t('council.stance_tally', {
@@ -523,7 +523,7 @@ function fmtTime(ms) {
               </span>
             </div>
 
-            <!-- 一轮里选看谁的发言。收起来的只是正文，票型与"没答上来"照旧挂在行上 -->
+            <!-- Pick whose utterance to view in a round. Only the body text is collapsed; the vote tally and "did not answer" still hang on the row -->
             <div
               v-if="hasPicks(g)"
               class="picks"
@@ -547,14 +547,14 @@ function fmtTime(ms) {
                 />
                 <span class="fid">{{ u.floorId }}</span>
                 <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
-                <!-- 票型只标在表决模式。分析模式的立场在上面那份简报里按组写着 ——
-                     把「支持/反对」贴在楼层名字右边，会让人以为分析也是在投票 -->
+                <!-- The vote tally is marked only in vote mode. Analysis-mode stances are written by group in the report above ——
+                     putting "support/oppose" to the right of the floor name would make people think the analysis is also voting -->
                 <span v-if="store.mode === 'vote' && u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
                   {{ t('council.vote.' + voteKey(u.vote)) }}
                 </span>
                 <span v-if="store.mode === 'vote' && u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
-                <!-- 没能发言的那一层：正文收起来了，这件事也不能跟着看不见。
-                     原因（error 原文）挂在 title 上就地可取；出席那一栏里也照旧列着全文 -->
+                <!-- The floor that could not speak: the body text is collapsed, but this must not become invisible too.
+                     The reason (raw error) is on the title attribute, available in place; the full text is still listed in the attendance column -->
                 <span v-if="u.status !== 'ok'" class="bad" :title="u.error || ''">
                   {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
                 </span>
@@ -562,11 +562,11 @@ function fmtTime(ms) {
             </div>
 
             <article v-for="u in shown(g)" :key="u.floorId" class="said" :class="[u.status, u.role]">
-              <!-- 只有一处发言时（第 0 轮的主席陈述）没有上面那排圆点，署名就得自己写在这儿 -->
+              <!-- When there is only one utterance (the chair's statement in round 0) there is no row of dots above, so the byline must be written here itself -->
               <div v-if="!hasPicks(g)" class="line">
                 <span class="fid">{{ u.floorId }}</span>
                 <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
-                <!-- 同上：分析模式不在楼层右边贴立场 -->
+                <!-- Same as above: analysis mode does not put a stance to the right of the floor -->
                 <span v-if="store.mode === 'vote' && u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
                   {{ t('council.vote.' + voteKey(u.vote)) }}
                 </span>
@@ -575,7 +575,7 @@ function fmtTime(ms) {
                 <span v-if="metaOf(u)" class="meta dim">{{ metaOf(u) }}</span>
               </div>
 
-              <!-- 没答上来 / 没按约定表态：如实说，把错误原文摆出来 -->
+              <!-- Did not answer / did not take a stance as agreed: say so faithfully and show the raw error -->
               <p v-if="u.status !== 'ok'" class="why bad" :data-testid="'cv-notice-' + u.floorId">
                 {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
                 <span v-if="u.error"> —— {{ u.error }}</span>
@@ -586,7 +586,7 @@ function fmtTime(ms) {
               <p v-if="u.voteReason" class="sub"><span class="k">{{ t('council.reason') }}</span>{{ u.voteReason }}</p>
               <p v-if="u.proposal" class="sub"><span class="k">{{ t('council.proposal') }}</span>{{ u.proposal }}</p>
 
-              <!-- 分析模式：把解析出的三条单列一遍（正文里那截 JSON 也还在上面，那是原文） -->
+              <!-- Analysis mode: list the three parsed columns once (the JSON snippet in the body is still above; that is the raw text) -->
               <div v-for="row in findingRows(u)" :key="row.k" class="fl">
                 <span class="fk">{{ t(row.k) }}</span>
                 <ul class="fv">
@@ -597,7 +597,7 @@ function fmtTime(ms) {
           </li>
         </ol>
 
-        <!-- 出席者与材料 -->
+        <!-- Attendees and materials -->
         <div class="foot">
           <div class="box">
             <h3 class="h3">{{ t('council.participants') }}</h3>
@@ -637,7 +637,7 @@ function fmtTime(ms) {
   min-height: 0;
 }
 
-/* ------------------------------------------------------------ 左栏 */
+/* ------------------------------------------------------------ left column */
 .side {
   display: flex;
   flex-direction: column;
@@ -701,7 +701,7 @@ input.ta { padding: 6px 8px; }
 .why { font-size: 11px; margin: 2px 0 0 22px; }
 .why.bad { color: var(--state-blocked); }
 
-/* ---- 角色分配 ---- */
+/* ---- role assignment ---- */
 .role-row { margin-top: 8px; }
 .role-lbl {
   display: block;
@@ -717,7 +717,7 @@ input.ta { padding: 6px 8px; }
 .role-row .plist li { margin: 3px 0; }
 .role-row .plist label { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
 
-/* ---- 手风琴折叠 ---- */
+/* ---- accordion collapse ---- */
 .accordion {
   margin-top: 12px;
   border: 1px solid var(--border-strong);
@@ -800,13 +800,13 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 历史列表里的谈法角标：短、不抢眼，只是为了把两种会分开 */
+/* Mode badge in the history list: short and unobtrusive, only to separate the two kinds of councils */
 .m { font-size: 10px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 .badge.m-analysis { color: var(--accent); border-color: var(--accent); }
 .ws { font-size: 11px; color: var(--text-faint); margin: 0; word-break: break-all; }
 .ws-path { color: var(--text-dim); margin-left: 4px; }
 
-/* ------------------------------------------------------------ 右栏 */
+/* ------------------------------------------------------------ right column */
 .main {
   min-height: 0;
   overflow: auto;
@@ -864,12 +864,12 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 }
 .result.win { border-color: var(--state-online); }
 .result.lose { border-color: var(--state-busy); }
-/* 简报：不着色 —— 它不是一个判定，只是把各方说的话摆到一起 */
+/* Report: no color —— it is not a verdict, just the parties' words placed side by side */
 .result.report { border-color: var(--border-strong); }
 
 .rgroup { margin-top: 10px; }
 .rgroup .gh { font-size: 12px; margin: 0 0 6px; color: var(--text-dim); }
-/* 左边一道色条，四档一眼分得开（未表态那档是灰的，不假装它有立场） */
+/* A color bar on the left so the four levels are distinguishable at a glance (the no-stance level is gray; it does not pretend to have a position) */
 .rgroup { border-left: 3px solid var(--border-strong); padding-left: 10px; }
 .rgroup.v-support { border-left-color: var(--state-online); }
 .rgroup.v-oppose { border-left-color: var(--state-blocked); }
@@ -879,7 +879,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .rlist > li { margin: 0 0 8px; }
 .rlist > li:last-child { margin-bottom: 0; }
 
-/* 要点三行：结论 / 风险 / 存疑。原样列，不重写、不排序 */
+/* Three key-point rows: conclusion / risks / questions. Listed as-is, not rewritten or reordered */
 .fl { display: flex; gap: 8px; margin: 4px 0 0; font-size: 12px; }
 .fk { color: var(--text-faint); flex: 0 0 auto; min-width: 32px; }
 .fv { list-style: none; margin: 0; padding: 0; color: var(--text); line-height: 1.5; }
@@ -894,7 +894,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
   font-size: 12px;
   line-height: 1.6;
 }
-/* 没通过的那份：虚线 + 灰——一眼能和"结论"分开 */
+/* The one that did not pass: dashed border + gray —— distinguishable from the "conclusion" at a glance */
 .quote.notpassed {
   border-left-style: dashed;
   border-left-color: var(--state-busy);
@@ -922,7 +922,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .tally { font-size: 11px; color: var(--text-faint); }
 .won { font-size: 11px; color: var(--state-online); }
 
-/* 一轮里选看谁的发言：一排圆点，选中的那个在下面摊开正文 */
+/* Pick whose utterance to view in a round: a row of dots, with the selected one's body text expanded below */
 .picks { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-bottom: 6px; }
 .pick {
   display: inline-flex;

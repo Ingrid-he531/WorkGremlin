@@ -1,10 +1,10 @@
 <script setup>
 /**
- * IsoOfficeView —— 2.5D 等距办公室。
+ * IsoOfficeView —— 2.5D isometric office.
  *
- * 场景全部由 Canvas 现画（见 iso/），这里只负责：
- *   - 把 store 里的成员翻译成场景里的演员（专家坐工位 / 临时成员飘在空中）
- *   - HUD、任务卡、交互提示
+ * The whole scene is drawn live on Canvas (see iso/); this view only:
+ *   - translates store members into scene actors (experts seated at workstations / ephemeral members floating in the air)
+ *   - HUD, task cards, interaction hints
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
@@ -21,11 +21,11 @@ import { useI18n } from '../i18n';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
-  /** 连接状态与相位来源（由 App.vue 统一算好传下来），显示在左下角说明条里。
-      项目名不归这里管 —— 它挂在门楣最左边，见 ElevatorDoors 的 projectLabel */
+  /** Connection state and phase source (computed and passed down by App.vue), shown in the bottom-left caption bar.
+      The project name is not handled here —— it hangs at the far left of the lintel, see projectLabel in ElevatorDoors */
   connection: { type: Object, default: () => ({ state: '' }) },
   source: { type: String, default: '' },
-  /** 是否全屏（App.vue 传下）：决定全屏按钮显示「全屏」还是「退出全屏」 */
+  /** Whether fullscreen (passed down by App.vue): decides whether the fullscreen button shows "Fullscreen" or "Exit fullscreen" */
   fullscreen: { type: Boolean, default: false },
 });
 const emit = defineEmits(['select', 'toggle-fullscreen']);
@@ -37,11 +37,11 @@ const { t } = useI18n();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
 
-/* ------------------------------ 主 Agent 相位快轮询（1.5s） ------------------------------
- * 服务端 /api/v1/reporter-phase 直接回 reporter hook 的上报相位（已映射成 UI 字段），
- * 比 /sessions 的 10s 轮询新鲜，专供主控制台"操作"实时显示（调用工具 / 等待授权）。
- * 渲染层是沙箱的（contextIsolation + nodeIntegration:false），读不到本地状态文件，
- * 所以一律走服务端，复用 readReporterPhase 的容错读，不碰 fs。
+/* ------------------------------ Main Agent phase fast poll (1.5s) ------------------------------
+ * The server's /api/v1/reporter-phase returns the phase reported by the reporter hook (already mapped to UI fields),
+ * fresher than the 10s poll of /sessions, and is used solely for the main console's "action" realtime display (tool call / waiting for authorization).
+ * The renderer is sandboxed (contextIsolation + nodeIntegration:false) and cannot read local state files,
+ * so it always goes through the server, reusing the tolerant read of readReporterPhase, never touching fs.
  */
 const fastPhase = ref(null);
 let phaseTimer = null;
@@ -51,18 +51,18 @@ async function startPhasePoll() {
   if (!info0 || !info0.port) return;
   const tick = async () => {
     try {
-      // server 重启会换 token：每轮都取**当前**的 serverInfo（project store 在 WS 重连时
-      // 已经用 server.json 的新值刷新过它），不能把启动那一刻的 token 吃死在闭包里 ——
-      // 吃死就是 1.5s 一路 401、相位与"操作"永远停在旧值上（同 api/ws.js 那条回归）。
+      // A server restart changes the token: fetch the **current** serverInfo every round (the project store
+      // already refreshed it from server.json on WS reconnect), never hard-bake the startup token into the closure ——
+      // baking it in means a 401 every 1.5s and the phase and "action" stuck on old values forever (same as the api/ws.js regression).
       const info = project.serverInfo || info0;
-      // 带上当前楼层的客户端：同一工程里 Codex 与 CodeBuddy 同时在跑时，各取各的相位
-      // 合并楼层（1F CodeBuddy = CLI + Plugin）会带一串（逗号分隔），服务端任一路命中即算本层
+      // Pass the current floor's clients: when Codex and CodeBuddy run in the same project at once, each takes its own phase
+      // A merged floor (1F CodeBuddy = CLI + Plugin) carries a list (comma-separated); the server counts the floor as hit if any one matches
       const want = sessions.selectedClients.join(',');
       const params = [];
       if (want) params.push(`client=${encodeURIComponent(want)}`);
-      // 再带上选中会话的会话 id（轴 2）：同一个 client 下可以同时开多条会话
-      // （比如同一层的 Claude Code 开两个终端），只按 client 取会"谁最新显示谁"、来回串味。
-      // 拿不到会话 id 的产品（Codex / 插件）这里就没有这个参数 → 服务端退回老行为。
+      // Also pass the selected session's session id (axis 2): several sessions can be open under one client
+      // (e.g. two Claude Code terminals on the same floor); keying only on client shows "whoever is newest" and cross-contaminates.
+      // Products with no session id (Codex / plugins) simply have no such param here → the server falls back to the old behavior.
       const wantSession = sessions.selectedSessionId;
       if (wantSession) params.push(`session=${encodeURIComponent(wantSession)}`);
       const qs = params.length ? `?${params.join('&')}` : '';
@@ -72,8 +72,8 @@ async function startPhasePoll() {
       if (res.ok) {
         const d = await res.json();
         if (d && d.ok) {
-          // 相位可能为空（这一轮结束 / 当前没动作），但 instrumented 要留住：
-          // 渲染层靠它区分"这个工程根本没接 hook"和"接了、只是现在没事干"。
+          // The phase may be empty (round ended / no action right now), but instrumented must be kept:
+          // the renderer uses it to tell "this project has no hook at all" from "it has one, it is just idle right now".
           fastPhase.value = {
             phase: d.phase && d.phase !== 'idle' ? d.phase : null,
             action: d.action || '',
@@ -83,17 +83,17 @@ async function startPhasePoll() {
             prompt: d.prompt || '',
             workspacePath: d.workspacePath || '',
             instrumented: Boolean(d.instrumented),
-            // 这份状态属于哪条会话（hook 是会话级加载的，见 consoleBase 的 sameSession）
+            // Which session this state belongs to (the hook is loaded per session, see sameSession in consoleBase)
             sessionId: d.sessionId || '',
-            // 这份相位的写入时刻：与收尾标记比先后（见下面 consoleLive 那处守卫）
+            // When this phase was written: compared against the wrap-up marker for ordering (see the guard in consoleLive below)
             phaseTs: Number(d.ts) || 0,
-            // 上一轮的完成标记（CLI 楼层靠它亮「任务完成」；Codex 还带收尾自述）
+            // The previous round's done marker (CLI floors light "Task done" with it; Codex also carries a wrap-up note)
             done: d.done || null,
           };
         }
       }
     } catch {
-      /* 拉不到就留着上一次的相位，别闪回空闲 */
+      /* If the fetch fails, keep the previous phase and never flash back to idle */
     }
   };
   await tick();
@@ -106,17 +106,17 @@ function stopPhasePoll() {
   fastPhase.value = null;
 }
 
-/* ------------------------------ 主 Agent 控制台 tooltip ------------------------------
- * 鼠标停在悬浮屏上（hover 命中）超过 TIP_DELAY 才弹，避免拖拽 / 扫过也闪。
- * 内容取自主 Agent store：具体在做什么 + 技能名 + MCP 工具信息（都是 setMainAgent 喂进来的）。
+/* ------------------------------ Main Agent console tooltip ------------------------------
+ * Only pops after the mouse rests on the floating screen (hover hit) longer than TIP_DELAY, so dragging / sweeping past does not flash it.
+ * Content comes from the main Agent store: what it is doing + skill name + MCP tool info (all fed in by setMainAgent).
  */
 const TIP_DELAY = 400;
 const tip = ref({ show: false, x: 0, y: 0 });
 let tipTimer = null;
 
-/* ------------------------------ 小怪物 tooltip ------------------------------
- * 鼠标停在小怪物（或它头顶的幽灵）上 400ms 才弹：写**它在做的任务**，
- * 以及最近一次完成的结果 —— 幽灵头顶只留名字，任务与结果都在这里讲。
+/* ------------------------------ Gremlin tooltip ------------------------------
+ * Only pops after the mouse rests on a gremlin (or the ghost above its head) for 400ms: shows **the task it is doing**
+ * plus the most recent completed result —— a ghost keeps only its name overhead; task and result are both told here.
  */
 const mtip = ref({ show: false, x: 0, y: 0, id: '' });
 let mtipTimer = null;
@@ -134,20 +134,20 @@ const mtipMember = computed(() =>
   mtip.value.id ? project.members.find((m) => m.memberId === mtip.value.id) : null
 );
 /**
- * 任务文案：临时成员（幽灵）是字符串，工位小怪物是 { title }。
+ * Task text: an ephemeral member (ghost) is a string, a workstation gremlin is { title }.
  *
- * 被召唤期间任务只写在**幽灵**身上（服务端把任务派给 subagent-xxx，工位那只 resident
- * 自己没有 task）。所以这里回落到同名幽灵：鼠标停在**小怪物**身上就能看到它正替主 agent
- * 干什么。幽灵本身仍然不给 tooltip（见引擎 memberAt），它头顶只留名字。
+ * While summoned the task is written only on the **ghost** (the server assigns the task to subagent-xxx; the resident
+ * gremlin at the workstation has no task of its own). So this falls back to the same-named ghost: hovering a **gremlin**
+ * shows what it is doing for the main agent. The ghost itself still gets no tooltip (see memberAt in the engine); only its name stays overhead.
  */
 const mtipTask = computed(() => {
   const m = mtipMember.value;
   if (!m) return '';
-  // 「当前任务」口径与工位卡一致（见 lib/memberTask.summonTaskTitle）：小怪物自己没在跑的任务时，
-  // 借用本次召唤派下来的那只同名幽灵（只在它确实在跑的时候）—— 与工位卡片同一处实现。
+  // The "current task" definition matches the workstation card (see lib/memberTask.summonTaskTitle): when the gremlin itself has no running task,
+  // borrow the same-named ghost dispatched by this summon (only while it really is running) —— the same implementation as the workstation card.
   return summonTaskTitle(m, project.members);
 });
-/** 最近一次完成的结果（汇报演完时引擎记下的那笔） */
+/** The most recent completed result (recorded by the engine when the report animation finishes) */
 const mtipResult = computed(() => (mtip.value.id && office ? office.lastResult(mtip.value.id) : null));
 
 function clearTip() {
@@ -160,7 +160,7 @@ function clearTip() {
 
 function onConsoleMove(e) {
   if (!office || !canvasRef.value) return;
-  // 按住拖拽时不弹（那是平移视角，不是看信息）
+  // No tooltip while a button is held dragging (that pans the view, not inspecting info)
   if (e.buttons) {
     clearTip();
     clearMTip();
@@ -169,7 +169,7 @@ function onConsoleMove(e) {
   const r = canvasRef.value.getBoundingClientRect();
   const px = e.clientX - r.left;
   const py = e.clientY - r.top;
-  // 先看有没有停在某个成员身上：有就弹"它"的 tooltip，主控制台那份让位
+  // First check whether it rests on some member: if so pop "its" tooltip and yield the main console one
   const hit = office.memberAt(px, py);
   if (hit) {
     clearTip();
@@ -194,13 +194,13 @@ function onConsoleLeave() {
   clearMTip();
 }
 
-/** 主 Agent 控制台：现在喂的是 mock 的阶段性状态，换成 hook 事件后这里不用动 */
+/** Main Agent console: currently fed mock stage state; switching to hook events needs no change here */
 const mainAgentState = computed(() => mainAgent.snapshot);
 
-/** 收尾相位（任务完成 / 任务取消）：tooltip 里改列"产出概要"而不是 action */
+/** Wrap-up phase (task done / task cancelled): the tooltip lists "output summary" instead of action */
 const isFinishPhase = computed(() => mainAgent.phase === 'done' || mainAgent.phase === 'cancelled');
 
-/** 字节数 -> 人类可读（B / KB / MB），与任务记录页同一套显示 */
+/** Byte count -> human readable (B / KB / MB), the same display as the task records page */
 function fmtSize(n) {
   if (n == null) return '';
   if (n < 1024) return `${n}B`;
@@ -208,7 +208,7 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
-/** 两个工程路径是否同一个（去尾斜杠比较；任一为空视为"不限定"，返回 true） */
+/** Whether two project paths are the same (compare after trimming trailing slashes; either empty means "unrestricted", returns true) */
 function sameWorkspace(a, b) {
   const na = String(a || '').replace(/\/+$/, '');
   const nb = String(b || '').replace(/\/+$/, '');
@@ -216,8 +216,8 @@ function sameWorkspace(a, b) {
 }
 
 /**
- * 选中会话本身是否"正在跑"（服务端统一合成的 taskState：本层实时相位新鲜 = running）。
- * 门楣滚动屏与主控制台读的是**同一个**字段，所以两者不会再不一致。
+ * Whether the selected session itself is "running" (the taskState synthesized uniformly by the server: a fresh realtime phase on this floor = running).
+ * The lintel scroll screen and the main console read the **same** field, so the two can no longer disagree.
  */
 const floorTaskActive = computed(() => {
   const sel = sessions.selected;
@@ -225,44 +225,44 @@ const floorTaskActive = computed(() => {
 });
 
 /**
- * 主控制台严格跟随下拉选中的会话：显示"这条会话自己"的相位
- * （它自己工程 reporter 上报的真值，或落盘推断值），绝不拿别的工程的实时相位冒充。
- * 这样多个工程同时开着时，下拉切到哪条就显示哪条，与所选会话一一对应。
+ * The main console strictly follows the session selected in the dropdown: it shows "this session's own" phase
+ * (the real value reported by its own project's reporter, or the value inferred from disk), never impersonating with another project's realtime phase.
+ * So with several projects open at once, switching the dropdown to a session shows that one, matching the selected session one-to-one.
  */
 const consoleBase = computed(() => {
   const sel = sessions.selected;
   if (!sel) return null;
-  // 已结束（取消 / 完成）的任务：优先亮结束态，绝不被快轮询里残留的"调用工具"盖掉。
-  // 现象：用户按停止后 reporter 还没落 Stop、或实时相位仍停在 tool，若放行 fastPhase 就会从
-  // 「任务取消」跳回「调用工具」并卡住；而 taskState 已是 cancelled / done（本层无在飞任务），
-  // 就该稳定显示结束态。新开一轮后本层重新 running，taskState 变回 running，这里不再拦截。
+  // For a finished (cancelled / done) task: light the end state first, never let a leftover "tool call" from the fast poll cover it.
+  // Observed: after the user hits stop the reporter has not written Stop yet, or the realtime phase still sits on tool; if fastPhase is allowed through it would
+  // jump from "task cancelled" back to "tool call" and stick; but taskState is already cancelled / done (no in-flight task on this floor),
+  // so the end state should show steadily. Once a new round starts and this floor is running again, taskState returns to running and this no longer intercepts.
   if (sel.taskState === 'cancelled' || sel.taskState === 'done' || sel.phase === 'cancelled' || sel.phase === 'done') {
     const finished = sel.taskState === 'done' || sel.phase === 'done' ? 'done' : 'cancelled';
     return { phase: finished, action: '', context: [], target: null, tool: '', prompt: '' };
   }
-  // 选中的恰好是"全局当前在敲"的那条（fresh）：叠加 1.5s 快轮询的实时相位，
-  // 让"调用工具 / 等待授权"更跟手（比 10s 会话轮询新鲜）。其余会话（哪怕是各自工程的
-  // current=true）只用自己会话轮询的数据，绝不借全局实时相位冒充——否则切回旧会话会误显新工程的"调用工具"。
-  // 再加一道"工程归属"校验：快轮询相位带回了它所属工程（workspacePath），只有选中会话正好
-  // 属于那个工程才叠加。否则切工程后旧会话的 fresh 还来不及翻新（会话快照滞后），新工程的
-  // "思考中"会短暂盖到旧会话上——现象就是旧会话闪一下"思考中"、随后回落"待命中"。
+  // The selected one is exactly the "globally typing right now" session (fresh): layer on the 1.5s fast poll's realtime phase,
+  // making "tool call / waiting for authorization" more responsive (fresher than the 10s session poll). Other sessions (even their own project's
+  // current=true) use only their own session poll data, never borrowed global realtime phase —— otherwise switching back to an old session would wrongly show the new project's "tool call".
+  // Plus a "project ownership" check: the fast poll phase carries back its project (workspacePath); only layer it on when the selected session
+  // belongs to exactly that project. Otherwise, after a project switch, the old session's fresh has not been refreshed yet (session snapshot lags)
+  // and the new project's "thinking" briefly covers the old session —— the symptom is the old session flashing "thinking" then falling back to "idle".
   const fp = fastPhase.value;
   const sameWs = Boolean(fp) && sameWorkspace(fp.workspacePath, sel.projectPath);
-  // 选中这条会话的**会话 id**（轴 2）：下面两处"这份上报属不属于你看的这条会话"都用它精确比对。
-  // 拿不到（Codex / 插件）就是空串 → 相关判定放行，退回老行为。
+  // The **session id** of the selected session (axis 2): both "does this report belong to the session you are viewing" checks below compare against it exactly.
+  // If unavailable (Codex / plugins) it is an empty string → the related checks pass, falling back to the old behavior.
   const selSessionId = sel.sessionId || '';
-  // hook 状态文件属于**某一条会话**（hook 在会话启动时加载）。工程相同还不够 ——
-  // 实测：13:40 开的旧会话没有 hook，但同工程里跑过 codex exec，状态文件存在，
-  // 于是这条会话被显示成「待命」，看起来像"整轮对话完全没有状态变化"。
-  // 所以还要确认"上报的那条会话 == 你正在看的这条"。
-  // 用会话 id **精确比对**（服务端回的是状态文件里的 sessionId，也就是 hook payload 的 session_id）。
-  // 以前是拿 sel.id 去 includes(fp.sessionId)：sel.id 是**落盘定位符**（CLI 是 `<工程目录>/<会话>.jsonl`
-  // 的相对路径），子串匹配既可能漏判也可能误判。现在两边都有真会话 id 就直接相等判定。
-  // 任何一边拿不到会话 id（Codex 的 rollout 文件名不含 session_id、老状态文件）→ 宽松放行，维持老行为。
+  // The hook state file belongs to **one particular session** (the hook is loaded when the session starts). Sharing a project is not enough ——
+  // observed: an old session opened at 13:40 has no hook, but codex exec ran in the same project so the state file exists,
+  // and this session ended up shown as "standby", looking like "a whole conversation with no state change".
+  // So it must also confirm "the reported session == the one you are viewing".
+  // Compare session ids **exactly** (the server returns the sessionId from the state file, i.e. the hook payload's session_id).
+  // Previously it took sel.id and did includes(fp.sessionId): sel.id is a **disk locator** (for CLI it is the relative path
+  // `<project dir>/<session>.jsonl`), and substring matching can both miss and mismatch. Now with real session ids on both sides it is a direct equality check.
+  // If either side lacks a session id (Codex rollout file names have no session_id, old state files) → lenient pass-through, keeping the old behavior.
   const sameSession = Boolean(fp) && (!fp.sessionId || !selSessionId || fp.sessionId === selSessionId);
-  // hook 来源的三种形态(plugin/cli/ide)都该放行快轮询相位,不再把 cli/ide 硬编码成两分支。
-  // plugin 有 fresh 标记(handlePlugin 设的),cli/ide 是 hook 落盘那两路(handleCliHook),
-  // 共同点都是"接了 reporter hook,实时相位来自 /reporter-phase 快轮询"。
+  // All three hook-source forms (plugin/cli/ide) should pass the fast poll phase; cli/ide are no longer hardcoded into two branches.
+  // plugin has a fresh flag (set by handlePlugin), cli/ide are the two paths that write the hook to disk (handleCliHook),
+  // and both share "the reporter hook is wired up, the realtime phase comes from the /reporter-phase fast poll".
   const isHookSource = Boolean(sel.fresh) || ['cli', 'ide', 'plugin'].includes(sel.source);
   const canUseFast = isHookSource && Boolean(sel.projectPath);
   if (canUseFast && sameWs && sameSession && fp.phase) {
@@ -272,18 +272,18 @@ const consoleBase = computed(() => {
     if (fp.phase === 'tool') {
       return { phase: 'tool', action: fp.action || t('console.tool_action'), context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, tool: fp.tool || '', prompt: fp.prompt || '' };
     }
-    // 思考中：把用户那句话（prompt）同时放到第二层（action）和第三层。
-    // 屏上第三层有"字号够大才画"的门槛（mainConsole 的 showL3），放大不够时不出字；
-    // 第二层门槛低，所以放一份在第二层，保证"思考中"下面任何时候都看得到你问的那句话。
-    // 注意：这里只用快轮询（1.5s，新鲜）的字段，**不再回落到 sel**——会话快照可能还是上一轮的，
-    // 一旦用 sel.action / sel.context 兜底，就会出现"思考中却显示上一轮的操作"，几秒后才更正。
+    // Thinking: put the user's sentence (prompt) into both the second layer (action) and the third layer.
+    // The third layer on screen has a "only draw when the font is large enough" threshold (showL3 in mainConsole); when not zoomed in enough nothing shows;
+    // the second layer has a lower threshold, so keeping a copy there guarantees the question you asked is always visible under "thinking".
+    // Note: this uses only fields from the fast poll (1.5s, fresh), **never falling back to sel** —— the session snapshot may still be the previous round's,
+    // and falling back to sel.action / sel.context would show "thinking but displaying the previous round's action" until corrected seconds later.
     if (fp.phase === 'thinking') {
       const p = fp.prompt || '';
       return { phase: 'thinking', action: fp.action || p, context: fp.context && fp.context.length ? fp.context : [], target: fp.target || null, prompt: p };
     }
   }
-  // 接了 hook 的工程(plugin/cli/ide):本层有在飞任务（floorTaskActive）但当前没有实时相位 =
-  // 这一轮还在跑、只是暂时没产生新事件（思考/等待中），显示「思考中」而非「待命」。
+  // A project with the hook wired up (plugin/cli/ide): this floor has an in-flight task (floorTaskActive) but no realtime phase right now =
+  // the round is still running, just temporarily producing no new event (thinking / waiting); show "thinking" rather than "standby".
   if (isHookSource && sameWs && sameSession && fp.instrumented) {
     if (floorTaskActive.value) {
       return { phase: 'thinking', action: '', context: [], target: null, tool: '', prompt: '' };
@@ -292,9 +292,9 @@ const consoleBase = computed(() => {
   }
   const selPrompt = sel.phase === 'thinking' ? sel.prompt || '' : '';
   const phase = sel.phase || 'idle';
-  // 会话自身是 idle / unreported（没有实时相位、推断也回落待命）：只要这一层确实还有 running 任务
-  // （门楣滚动屏同口径），就显示「思考中」——人还在这轮任务里，只是暂时没产生新事件；
-  // 没有任何活跃任务（已收工 / 空楼层）才回落「待命」。
+  // The session itself is idle / unreported (no realtime phase, inference also falls back to standby): as long as this floor really still has a running task
+  // (same definition as the lintel scroll screen), show "thinking" —— the person is still in this round, just temporarily producing no new event;
+  // only when there is no active task at all (wrapped up / empty floor) does it fall back to "standby".
   if ((phase === 'idle' || phase === 'unreported') && floorTaskActive.value) {
     return {
       phase: 'thinking',
@@ -305,8 +305,8 @@ const consoleBase = computed(() => {
       prompt: sel.prompt || '',
     };
   }
-  // 否则直接用选中会话自身的相位（reporter 真值 if 它正活跃，否则推断），
-  // 下拉切到旧工程会话就显示旧会话自己的状态，不再被新工程的实时相位覆盖。
+  // Otherwise use the selected session's own phase directly (the reporter's real value if it is active, otherwise inferred),
+  // so switching the dropdown to an old project's session shows that session's own state, no longer covered by the new project's realtime phase.
   return {
     phase,
     action: sel.action || selPrompt,
@@ -318,11 +318,11 @@ const consoleBase = computed(() => {
 });
 
 /**
- * 正在替主 agent 干活的 subagent（屋里飘着的幽灵）。
+ * Subagents currently doing work for the main agent (the ghosts floating in the office).
  *
- * 这里直接读 project.members、**不复用下面的 sceneMembers** ——
- * consoleLive 的 watch 在 setup 阶段就会求值一次，那时 sceneMembers 还没初始化（TDZ）。
- * 筛选口径与 sceneMembers 保持一致：只算临时成员（幽灵）。
+ * This reads project.members directly and **does not reuse sceneMembers below** ——
+ * the consoleLive watch evaluates once during setup, when sceneMembers is not initialized yet (TDZ).
+ * The filter definition stays consistent with sceneMembers: only ephemeral members (ghosts) count.
  */
 const busySubagents = computed(() => {
   if (sessions.floorEmpty || !sessions.live) return [];
@@ -332,11 +332,11 @@ const busySubagents = computed(() => {
 });
 
 /**
- * 主控制台最终喂给 store 的相位 = 会话自己的相位 + "在等 subagent"这一层。
+ * The phase the main console finally feeds to the store = the session's own phase + the "waiting on subagents" layer.
  *
- * 主会话还没收到 Stop（相位仍是 idle）而屋里已经有 subagent 在跑 —— 这时写"待命中"
- * 是错的：人明明还在这一轮任务里，只是在等小怪物交活。单独给"等待中"，并写出在等谁。
- * 收到 Stop 后相位变 done，不再被这里覆盖，"任务完成 → 待命中"照旧。
+ * The main session has not received Stop yet (phase still idle) while subagents are already running in the office —— writing "standby"
+ * here would be wrong: the person is clearly still in this round, just waiting for the gremlins to hand in. Give "waiting" separately, and say who it is waiting for.
+ * After Stop arrives the phase becomes done and is no longer overridden here, so "task done → standby" still holds.
  */
 const consoleLive = computed(() => {
   const v = consoleBase.value;
@@ -356,14 +356,14 @@ const consoleLive = computed(() => {
 });
 
 /**
- * "任务完成"唯一真源 = reporter 在 Stop 时落盘的 doneAt（服务端按工程透传）。
- * 绝不靠"相位回落到空闲"来猜——那样会被轮询间隙 / 跨工程串味误触发，
- * 导致任务中途也弹出"任务完成"。而且只有 doneAt 真正变化（收到新 Stop）时才弹，
- * 切到一条早已收工的旧会话不会误报。
+ * The sole source of truth for "task done" = the doneAt the reporter writes to disk on Stop (the server passes it through per project).
+ * Never guess from "phase fell back to idle" —— polling gaps / cross-project contamination would trigger it falsely,
+ * popping "task done" mid-task. And it only pops when doneAt truly changes (a new Stop arrives),
+ * so switching to a long-finished old session does not misfire.
  */
 let lastConsoleSessionId = undefined;
 let lastDoneAt = undefined;
-/** 是否已经见过"快轮询带回的完成标记"：首次只当基线，不弹摘要（见下面的注释） */
+/** Whether the "done marker brought back by the fast poll" has been seen: the first time it is only a baseline, no summary pops (see the comment below) */
 let seenFastDone = false;
 /**
  * A deferred wrap-up: the task is done (real data reported Stop first) but the office still has a
@@ -382,42 +382,42 @@ const FLOW_WAIT_MAX = 15000;
  * @type {ReturnType<typeof createIsoOffice> | null}
  */
 let office = null;
-/** 页面（本视图）打开时刻 = 下面 trackSince 的初始值 */
+/** When the page (this view) opened = the initial value of trackSince below */
 const PAGE_OPEN_AT = Date.now();
 /**
- * 我们**开始盯住当前这条会话**的时刻：页面打开时 = PAGE_OPEN_AT，切会话 / 切楼层时刷新。
- *   · 完成标记早于它 = 开始盯之前就收的工 → 只当基线，不弹摘要；
- *   · 晚于它 = 盯着的时候真实收到的 Stop → 必须弹「任务完成」。
+ * When we **started watching the current session**: on page open = PAGE_OPEN_AT, refreshed on session / floor switch.
+ *   · A done marker earlier than it = wrapped up before we started watching → only a baseline, no summary pops;
+ *   · later than it = a Stop truly received while watching → "Task done" must pop.
  *
- * 为什么不能用页面打开那一刻的常量当尺子：切楼层时快轮询里装的还是**上一层**的数据
- * （1.5s 才刷一次），所以"首次见到新楼层的完成标记"必然发生在切换之后，而那个标记
- * 通常晚于页面打开 —— 拿打开时刻去量，必然判成"刚发生的新 Stop"。
- * 现象：1F 切 3F 一进去就弹「任务完成」，几秒后回「待命中」，每次切都复现。
+ * Why the constant from page open cannot be the ruler: when switching floors the fast poll still holds the **previous floor's** data
+ * (it only refreshes every 1.5s), so "first seeing the new floor's done marker" necessarily happens after the switch, and that marker is
+ * usually later than page open —— measuring against the open time would always judge it a "newly occurred Stop".
+ * Observed: switching 1F to 3F pops "Task done" immediately on entry, falling back to "standby" seconds later, reproduced on every switch.
  */
 let trackSince = PAGE_OPEN_AT;
 watch(
   consoleLive,
   (v) => {
-    // 演示模式：控制台**归演示脚本独占**，真会话一律不参与。
-    // 不拦的话，下拉里选着的那条真会话每 1.5s 都会把它的相位喂进来（演示时通常就是「待命中」），
-    // 于是脚本刚演一步就被顶回去 —— 现象正是"点了演示模式，主 Agent 状态不变"。
+    // Demo mode: the console is **owned exclusively by the demo script**; real sessions never take part.
+    // Without this guard, the real session selected in the dropdown feeds its phase in every 1.5s (usually "standby" during a demo),
+    // and the script is pushed back right after one step —— the very symptom of "clicked demo mode, main Agent state does not change".
     if (project.demo) {
       if (!mainAgent.auto) startDemoScript();
       return;
     }
     const sel = sessions.selected;
     const selId = sel ? sel.id : null;
-    // 完成标记有两条来源，取**较新**的那份：① 会话快照的 doneAt（10s 一条，各楼层都有；
-    // plugin 楼层是插件落盘算出来的，CLI / hookSource 楼层由服务端从同一份 hook 状态取）；
-    // ② hook 快轮询的 done（1.5s 一条）。用 max 而不用 `||`：快照那份最多能旧 10 秒，
-    // 拿它盖住刚收到的 Stop 会让「任务完成」晚到；反过来快轮询缺这条会话时也不至于丢标记。
+    // The done marker has two sources; take the **newer** one: ① the session snapshot's doneAt (one per 10s, present on every floor;
+    // plugin floors compute it from plugin disk writes, CLI / hookSource floors take it from the server reading the same hook state);
+    // ② the hook fast poll's done (one per 1.5s). Use max rather than `||`: the snapshot one can be up to 10 seconds old,
+    // letting it cover a freshly received Stop would delay "Task done"; conversely, when the fast poll lacks this session the marker is not lost.
     //
-    // 两条纪律（都是踩过的坑）：
-    //   ① 它是"某条会话上一轮结束"的**持久状态**，不是一次性事件 —— 页面刚打开 / 刚切楼层时
-    //      首次拿到它只能当基线，否则会把上一次的完成摘要当成刚发生的事重播一遍
-    //      （现象：一开 3F 就弹「任务完成」，10 秒后才回待命）；
-    //   ② 同一楼层可以同时开多条会话，所以它是按"工程 + 客户端 + 会话"存的，显示时是针对
-    //      **选中的会话**，还要确认这份完成属于当前这条会话（会话 id 精确比对，同上）。
+    // Two rules (both learned the hard way):
+    //   ① It is the **persistent state** of "some session's previous round ending", not a one-off event —— on just opening the page / just switching floors
+    //      the first read can only be a baseline, otherwise the previous completion summary is replayed as if it just happened
+    //      (observed: opening 3F pops "Task done", falling back to standby 10 seconds later);
+    //   ② A floor can have several sessions open at once, so it is stored per "project + client + session", and the display targets the
+    //      **selected session**; it must also confirm this completion belongs to the current session (exact session id comparison, as above).
     const fpDone = fastPhase.value && fastPhase.value.done;
     const doneSessionId = (sel && sel.sessionId) || '';
     const sameSession = !fpDone || !fpDone.sessionId || !doneSessionId || fpDone.sessionId === doneSessionId;
@@ -425,27 +425,27 @@ watch(
     const firstFastDone = fastDoneAt > 0 && !seenFastDone;
     if (fastDoneAt > 0) seenFastDone = true;
     const doneAt = Math.max(Number(sel && sel.doneAt) || 0, fastDoneAt);
-    // 切换了会话（或首次）：直接把控制台切到这条会话当前的状态，重置完成标记，不弹"任务完成"。
-    // 办公室的工位小怪物也跟着选中的会话走：切到别的工程会话，就切到那个工程的成员清单，
-    // 这样"主 Agent + 小怪物"整组都跟随下拉选中的那条，不再停在之前打开的工程。
+    // Session switched (or first time): switch the console straight to this session's current state, reset the done marker, no "task done" pop.
+    // The office's workstation gremlins also follow the selected session: switching to another project's session switches to that project's member list,
+    // so the whole "main Agent + gremlins" group follows the one selected in the dropdown, no longer stuck on the previously opened project.
     if (selId !== lastConsoleSessionId) {
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
-      seenFastDone = fastDoneAt > 0; // 切会话时重新以这条会话的标记为基线
-      trackSince = Date.now(); // "完成标记是新的还是旧的"这把尺子也跟着换到这条会话
+      seenFastDone = fastDoneAt > 0; // On session switch, re-baseline on this session's marker
+      trackSince = Date.now(); // The "is the done marker new or old" ruler also switches to this session
       // Session switch = the previous round's wrap-up has nothing to do with this one: drop it
       pendingDone = null;
       clearTimeout(pendingDoneTimer);
-      // 空楼层（一条会话都没有）：控制台待命；屋里只留常驻小怪物、清掉幽灵
-      // （见 sceneMembers），但**不走 applySession(null)** —— 那是"会话收工"，
-      // 会弹「任务完成」，跟这层没关系。
+      // Empty floor (no session at all): console standby; the office keeps only resident gremlins and clears ghosts
+      // (see sceneMembers), but **does not go through applySession(null)** —— that is "session wrapped up" and
+      // would pop "Task done", which has nothing to do with this floor.
       if (!sel && sessions.floorEmpty) {
         mainAgent.enterIdle([t('console.floor_empty')]);
         return;
       }
       mainAgent.applySession(v);
-      // 演示期间不让会话把工程拽走：演示是用户显式进出的（HUD 的按钮），而"新会话自动跟随"
-      // 很可能在看演示时正好插进来一条真会话 —— 一拽就走了，演示当场断掉。
+      // During a demo, do not let a session drag the project away: a demo is entered and exited explicitly by the user (the HUD button), while "auto-follow new session"
+      // could well insert a real session right while watching a demo —— it would drag away and the demo would break on the spot.
       if (!project.demo && sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
         project.openWorkspace(sel.projectPath);
       }
@@ -469,19 +469,19 @@ watch(
         return;
       }
     }
-    // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
-    // 这一轮明明还在跑（taskState==='running'，服务端按在飞任务判定，会盖过上一轮残留的 doneAt）：
-    // 不弹取消/完成摘要，避免新开一轮先闪一下"任务取消"。
-    // （本次改动的文件），而不是最后那段相位上下文、更不拿用户的 prompt 当概要。
-    // 首次拿到标记：早于 trackSince（= 开始盯这条会话）的只记基线（上一轮的收工，不重播）；
-    // 之后发生的不能当基线 —— 那是盯着的时候真实收到的 Stop，走下面正常判断弹摘要
+    // Same session: a Stop is received (doneAt added / changed) → light "task done", with the real completion content as the summary
+    // This round is clearly still running (taskState==='running', judged by the server from in-flight tasks, which overrides the previous round's leftover doneAt):
+    // do not pop a cancel/done summary, to avoid a new round flashing "task cancelled" first.
+    // (the files changed this time), not the last phase context, and certainly not the user's prompt as the summary.
+    // First read of the marker: earlier than trackSince (= started watching this session) only records a baseline (the previous round's wrap-up, not replayed);
+    // anything later cannot be a baseline —— that is a Stop truly received while watching, so fall through to the normal summary-pop judgment below
     if (firstFastDone && doneAt < trackSince) lastDoneAt = doneAt;
     if (doneAt && doneAt !== lastDoneAt && !(sel && sel.taskState === 'running')) {
       lastDoneAt = doneAt;
-      // 改动清单：优先用会话快照的 doneFiles（plugin/IDE 楼层这份，带 +/- 行数 + size），
-      // 没有则退回 reporter 落盘的 done.files（CLI 这一路，只有 size）。插件 / IDE 的
-      // file-changes 落盘自带 addedLines / removedLines，所以这里把 +/- 也显示出来；
-      // 体积（size）由服务端现 stat（落盘不给），能拿到就显示。
+      // Change list: prefer the session snapshot's doneFiles (the plugin/IDE floor one, with +/- line counts + size),
+      // falling back to the reporter's on-disk done.files (the CLI path, size only). Plugin / IDE
+      // file-changes on disk carry addedLines / removedLines, so +/- is shown here too;
+      // the size is stat'ed live by the server (disk writes do not provide it) and shown when available.
       const snapFiles = (sel && sel.doneFiles) || [];
       const hookFiles = (fpDone && Array.isArray(fpDone.files) ? fpDone.files : []).map((p) => ({
         name: typeof p === 'string' ? p : (p && p.path) || '',
@@ -490,16 +490,16 @@ watch(
       const files = snapFiles.length ? snapFiles : hookFiles;
       const count = (sel && Number(sel.doneCount)) || (fpDone && Number(fpDone.fileCount)) || files.length;
       const said = (fpDone && fpDone.said) || '';
-      /* 这一轮是"干完了"还是"被掐掉了"：唯一凭证是 reporter 在 Interrupt 时落的那枚
-         取消标记（done.cancelled），会话快照那份由服务端透传成 doneCancelled。
-         两份取或：快轮询 1.5s 到、会话快照 10s 到，谁先到都算数 ——
-         少了快照这份，取消标记还没被快轮询带回来时就会先弹成「任务完成」。 */
+      /* Whether this round "finished" or was "cut off": the sole proof is the cancel marker the reporter
+         writes on Interrupt (done.cancelled), with the session snapshot one passed through by the server as doneCancelled.
+         OR the two: the fast poll arrives in 1.5s, the session snapshot in 10s, whichever comes first counts ——
+         without the snapshot one, the round would pop "Task done" before the cancel marker was brought back by the fast poll. */
       const cancelled = Boolean((fpDone && fpDone.cancelled) || (sel && sel.doneCancelled));
-      // 能拿到 +/- 行数（插件 / IDE 路）就显示 +X/-Y；能拿到 size 就显示体积（B/KB/MB）
-      // 有输出（这一轮动过文件）→ 列出改动了哪些文件；没动文件但有话（这一轮吐出来的文字）
-      // → 照「任务完成」那样把那句话显示出来；**两样都没有**才写「没有输出」。
-      // 取消与完成在这里同口径：取消只是"没干完"，不是"没产出"——被掐掉的那一轮常常还是
-      // 吐了半句、改了几个文件，照记；真一点产出都没有时，写"本次任务已完成"才是假的。
+      // Show +X/-Y when +/- line counts are available (plugin / IDE path); show the volume (B/KB/MB) when size is available
+      // Has output (this round touched files) → list which files changed; no file changes but has words (text emitted this round)
+      // → show that sentence the way "Task done" does; write "no output" only when **neither** is present.
+      // Cancel and done share the same definition here: cancelled just means "not finished", not "no output" —— a cut-off round often still
+      // emits half a sentence and changes a few files, so record it; only when there is truly no output at all is "this task is complete" a lie.
       const ctx = files.length
         ? [
             t('console.files_changed', { n: count }),
@@ -544,23 +544,23 @@ watch(
       finish();
       return;
     }
-    // 「任务取消 / 任务完成」刚亮起，不许被同一轮的残留相位盖掉：
-    // Stop / Interrupt 之后 hook 会把实时相位清掉（fastPhase.phase 为 null），但 10s 会话快照
-    // 还停在收尾前的「调用工具」——晚到几秒就把红色/绿色那一下冲掉（顺序倒成 任务完成→调用工具→待命）。
-    // 只在"没有实时相位"或"取消标记还在"时拦：新一轮（UserPromptSubmit 后实时相位恢复、done 被清掉）
-    // 仍正常覆盖 —— 那是用户又发任务了。
-    // CodeBuddy IDE 这类不打断事件的产品，取消后相位仍停在「调用工具」、取消标记靠 ≥TASK_RUN_MS
-    // 的兜底才合成 —— 这期间 fastPhase.phase 一直是 tool，必须用"done.cancelled 还在"这道闸护住红色，
-    // 否则「任务取消」一闪就被「调用工具」盖回去了（现象正是：取消后状态卡在「调用工具」、任务仍「进行中」）。
+    // "Task cancelled / Task done" has just lit up; it must not be covered by the same round's leftover phase:
+    // after Stop / Interrupt the hook clears the realtime phase (fastPhase.phase is null), but the 10s session snapshot
+    // still sits on the pre-wrap-up "tool call" —— arriving a few seconds late it washes out the red/green flash (the order flipping to task done→tool call→standby).
+    // Only intercept when "there is no realtime phase" or "the cancel marker is still there": a new round (after UserPromptSubmit the realtime phase is restored and done is cleared)
+    // still overrides normally —— the user sent another task.
+    // For products that do not interrupt events, like CodeBuddy IDE, after a cancel the phase still sits on "tool call" and the cancel marker is only
+    // synthesized by the ≥TASK_RUN_MS fallback —— during this window fastPhase.phase stays tool, so the "done.cancelled still present" gate must shield the red,
+    // otherwise "Task cancelled" flashes and is covered right back by "tool call" (the very symptom: after cancel the state sticks on "tool call" and the task stays "in progress").
     if (mainAgent.phase === 'done' || mainAgent.phase === 'cancelled') {
       const fp = fastPhase.value;
-      // 没有实时相位（收尾后 hook 把相位落成 idle）→ 拦住，收尾那一下稳亮
+      // No realtime phase (after wrap-up the hook writes the phase as idle) → intercept, so the wrap-up flash stays lit
       if (!fp || !fp.phase) return;
-      // 有实时相位：只有**比收尾标记更新的**才算"用户又发了一轮"（UserPromptSubmit 写的 ts 更晚）。
-      // 收尾/取消之前那一口 stale 的「思考中 / 调用工具」ts 更早 → 一律拦住 —— 这正是
-      // "Claude Code 按停止一个事件都不发、红色「任务取消」刚亮就被 stale 相位顶回去、一直思考中"
-      // 的根因（取消标记来自服务端兜底合成，状态文件里的相位没人清）。
-      // 拿不到相位时间戳的路径（7F/8F 轮询那份不带 ts）退回老行为：允许覆盖。
+      // Has a realtime phase: only one **newer than the wrap-up marker** counts as "the user sent another round" (the ts written by UserPromptSubmit is later).
+      // The stale "thinking / tool call" from before the wrap-up / cancel has an earlier ts → always intercept —— this is exactly the root cause of
+      // "Claude Code emits not a single event on stop, the red 'task cancelled' is pushed back by a stale phase right after lighting, stuck thinking forever"
+      // (the cancel marker comes from server-side fallback synthesis; nobody clears the phase in the state file).
+      // Paths with no phase timestamp (the 7F/8F poll one carries no ts) fall back to the old behavior: override allowed.
       const phaseTs = Number(fp.phaseTs) || 0;
       if (phaseTs && phaseTs <= doneAt) return;
     }
@@ -572,46 +572,46 @@ watch(
 let cardRaf = 0;
 
 /**
- * 场景演员：专家（有工位）+ 临时成员（幽灵，飘着）。
+ * Scene actors: experts (with a workstation) + ephemeral members (ghosts, floating).
  *
- * 选中的会话不是"当前工程里正在跑的那个"时（别的工程的会话 / 只剩化石数据），
- * 这份成员清单跟那个会话对不上 —— 一律按离线 + 推断显示，绝不拿 A 工程的人
- * 冒充 B 工程的状态。办公室布局不受影响，还是这份清单摆出来的样子。
+ * When the selected session is not "the one running in the current project" (another project's session / only fossil data left),
+ * this member list does not match that session —— everything is shown as offline + inferred, never using project A's people
+ * to impersonate project B's state. The office layout is unaffected, still laid out as this list presents it.
  */
-// 主 Agent（role=agent）不占工位：它自己的实时状态由主控制台剪影单独吃
-// （setMainAgent），在工位区再摆一个就是重复。所以从工位名单里剔掉，
-// 只让真正的 subagent 小怪物（含扫描器注册的常驻成员）坐工位。
+// The main Agent (role=agent) takes no workstation: its own realtime state is consumed separately by the main console silhouette
+// (setMainAgent), so placing another one in the workstation area would be a duplicate. So it is excluded from the workstation roster,
+// leaving only true subagent gremlins (including resident members registered by the scanner) at workstations.
 const sceneMembers = computed(() => {
-  // 演示模式压过楼层 / 会话这两层过滤：演示成员的活跃状态由服务端推进器维持
-  // （每 5s 刷心跳、推进度），跟"下拉里选中哪条真会话"没关系。不特判的话，
-  // 演示里 8 只小怪物会整片转灰 + 标"推断"，楼层恰好没有活跃会话时（floorEmpty）
-  // 屋里还会一个人都不剩 —— 那就不叫演示了。
+  // Demo mode overrides both the floor / session filters: demo members' active state is maintained by the server's driver
+  // (heartbeat every 5s, advancing progress) and has nothing to do with "which real session is selected in the dropdown". Without this special case,
+  // the 8 demo gremlins would all go grey + marked "inferred", and when the floor happens to have no active session (floorEmpty)
+  // not a single person would be left in the office —— that would not be a demo.
   const demo = project.demo;
   /**
-   * 空楼层（这层一条活跃会话都没有）的取舍 —— 分两类：
-   *   · 幽灵（`subagent-<name>`）不留：它是会话级的临时成员，"这轮召唤"的产物，
-   *     没有会话就不该存在（留着就是上一层的残影）。
-   *   · **常驻小怪物要留**：用户级 / 工程级小怪物是写在 agents 目录里已定义的 subagent，
-   *     由服务端 agentRoster 注册并持续心跳，"即使当下没被召唤也在" —— 跟这层有没有会话无关。
-   *     切过去看不见他们会让人以为这层压根没人（1F 没会话时用户级/工程级专家应照常在工位）。
+   * How to handle an empty floor (no active session on this floor) —— two categories:
+   *   · Ghosts (`subagent-<name>`) are not kept: they are session-level ephemeral members, the product of "this round's summon",
+   *     and should not exist without a session (keeping them is the previous floor's afterimage).
+   *   · **Resident gremlins are kept**: user-level / project-level gremlins are subagents already defined in the agents directory,
+   *     registered by the server's agentRoster with a continuous heartbeat, "present even when not currently summoned" —— unrelated to whether this floor has a session.
+   *     Not seeing them after switching would make people think this floor has nobody at all (with no session on 1F, user-level/project-level experts should still be at their workstations).
    */
   const emptyFloor = sessions.floorEmpty && !demo;
   const want = demo ? '' : sessions.selectedClient;
   const wantSession = demo ? '' : sessions.selectedSessionId;
-  // 小怪物按 agent 基名归层：CLI 与 plugin 两种形态同属一层（1F CodeBuddy 就是这么合并的），
-  // 所以常驻小怪物只要基名对得上就摆。floorAcceptsClient 内部剥 -plugin 后比基名。
+  // Gremlins are assigned to floors by agent base name: the CLI and plugin forms belong to the same floor (1F CodeBuddy is merged this way),
+  // so a resident gremlin is placed as long as its base name matches. floorAcceptsClient strips -plugin internally before comparing base names.
   const live = demo || sessions.live;
   return project.members
     .filter((m) => m.role !== 'agent')
-    .filter((m) => !(emptyFloor && isEphemeralMember(m))) // 空楼层：只留常驻的
-    // 按 client（产品 / 楼层标识）过滤来源：3F 只看 Codex、1F 只看 CodeBuddy。
-    // client 才代表"属于哪一层"——常驻小怪物写在 agents 目录里，memberId 是 peter/leo 这种
-    // 给人起的名字，跟产品无关，绝不拿它去比楼层。client 为空（老库 / 演示数据 /
-    // 手工 scripts 写的）视作通用、哪层都显示（floorAcceptsClient 的语义）。
+    .filter((m) => !(emptyFloor && isEphemeralMember(m))) // Empty floor: keep only resident ones
+    // Filter the source by client (product / floor identifier): 3F sees only Codex, 1F only CodeBuddy.
+    // client alone represents "which floor this belongs to" —— resident gremlins are written in the agents directory, and memberId is a
+    // human-given name like peter/leo unrelated to the product, so it is never used to match floors. An empty client (old store / demo data /
+    // written by manual scripts) is treated as generic and shown on every floor (the semantics of floorAcceptsClient).
     .filter((m) => floorAcceptsClient(want, m.client))
-    // 幽灵（subagent- 前缀）带 sessionId —— 只显示当前选中会话的幽灵。
-    // 常驻小怪物（role=subagent 但不是 ephemeral）没 sessionId，全层共享，不该被这条过滤掉。
-    // sessionId 为空的幽灵（老库 / 手工 scripts）也放过——退化行为，总比全滤掉好。
+    // Ghosts (subagent- prefix) carry a sessionId —— only the selected session's ghosts are shown.
+    // Resident gremlins (role=subagent but not ephemeral) have no sessionId and are shared floor-wide, so they must not be filtered out by this.
+    // Ghosts with an empty sessionId (old store / manual scripts) are passed through too —— a degraded behavior is better than filtering everything out.
     .filter((m) => !isEphemeralMember(m) || !wantSession || !m.sessionId || m.sessionId === wantSession)
     .map((m) => ({
       memberId: m.memberId,
@@ -621,9 +621,9 @@ const sceneMembers = computed(() => {
       degraded: live ? Boolean(m.degraded) : true,
       ghost: isEphemeralMember(m),
       project: projectLabelOf(m),
-      // taskProgress 已删（2026-09-29）：3D 办公室显示器上那条进度条改成"不确定走条"了，
-      // 不再消费这个字段；而 task.progress 本身没有真值（只有 0/1 两个取值，见
-      // TaskRecordsView 里「进度」那一行的说明），留着只会误导下一个人再去接它。
+      // taskProgress was removed (2026-09-29): the progress bar on the 3D office monitor became an "indeterminate bar",
+      // so this field is no longer consumed; and task.progress itself has no real value (only 0/1, see
+      // the note on the "progress" row in TaskRecordsView), so keeping it would only mislead the next person into wiring it up again.
       // Current task name of a summoned subagent: the main agent hands it to the gremlin via a bubble
       task: m.task && m.task.title ? m.task.title : '',
       // Finish summary: the server delivers the subagent's result as an artifact on the member card
@@ -634,7 +634,7 @@ const sceneMembers = computed(() => {
 });
 
 watch(sceneMembers, (v) => {
-  // 人没了（切到空楼层）：开着的工位卡片也一起收掉，别挂着上一层某个成员的任务卡
+  // Everyone is gone (switched to an empty floor): take down the open workstation card too, do not leave a previous floor member's task card hanging
   if (!v.length) card.value = null;
   if (office) office.setMembers(v);
 });
@@ -642,15 +642,15 @@ watch(
   () => props.selectedId,
   (v) => office && office.setSelected(v)
 );
-// 切楼层时换这一层的材质配色（隔断 / 金属件 / 木件逐层不同，见 iso/officeMap 的 FLOOR_COLORS）。
-// 换脸发生在电梯关门后，这里跟着 store 走即可。
+// On floor switch, swap in this floor's material palette (partitions / metal parts / wood parts differ per floor, see FLOOR_COLORS in iso/officeMap).
+// The changeover happens after the elevator doors close; here it just follows the store.
 watch(
   () => sessions.selectedFloor,
   (v) => office && office.setFloor(v)
 );
 watch(mainAgentState, (v) => office && office.setMainAgent(v));
 
-/* ------------------------------ 任务卡 ------------------------------ */
+/* ------------------------------ Task card ------------------------------ */
 
 const card = ref(null);
 let lastOpen = 0;
@@ -674,7 +674,7 @@ function openCard(id) {
 }
 
 function onCanvasClick() {
-  // engine 命中角色时会先调 openCard，这里只处理"点空白"
+  // The engine calls openCard first when a character is hit; here only "clicking empty space" is handled
   if (Date.now() - lastOpen < 150) return;
   card.value = null;
 }
@@ -683,22 +683,22 @@ function closeCard() {
   card.value = null;
 }
 
-/* ------------------------------ 演示脚本的启动时机 ------------------------------
- * 主控制台那份 SCRIPT（见 stores/mainAgent.js）是**演示数据**，只能演示模式下跑。
- * 真数据源（默认）首屏就该是待命：一条会话都没有、hook 也没接上时，没有任何非 null 的
- * applySession / setLiveState 来接管，脚本会自己循环播放「重构用户登录模块」，
- * 假状态永远没人顶掉 —— 新设备首次启动就撞上这个（屋里是空的，屏上却在演）。
+/* ------------------------------ When the demo script starts ------------------------------
+ * The main console's SCRIPT (see stores/mainAgent.js) is **demo data** and must only run in demo mode.
+ * With the real data source (the default) the first screen should be standby: with no session and no hook wired up, there is no non-null
+ * applySession / setLiveState to take over, so the script loops "refactor the user login module" on its own
+ * and the fake state is never replaced —— a new device hits this on first launch (the office is empty, yet the screen performs).
  *
- * 两个细节：
- *   1) project.demo 是**异步**拿的（App.vue 在父组件 onMounted 里 project.init()，
- *      子组件先挂载），所以 onMounted 里读到的常常还是 false —— 真正的启动交给下面的 watch；
- *   2) 真数据已经在驱动时不抢方向盘（live / hookLive）。
+ * Two details:
+ *   1) project.demo is **fetched asynchronously** (App.vue calls project.init() in the parent's onMounted,
+ *      while the child mounts first), so what onMounted reads is often still false —— the real start is left to the watch below;
+ *   2) When real data is already driving, do not grab the wheel (live / hookLive).
  */
 function startDemoScript() {
-  if (mainAgent.auto) return; // 已经在演了，别把进度拨回第一步
-  // 演示期间控制台归脚本：必须先把 live / hookLive 清掉，否则脚本起不来 / 起步就被真会话顶掉。
-  // 优先走 store 的 startDemo()；热更时页面里可能还是改之前的 store 实例（没有这个 action），
-  // 那就地清标志再 start() —— 不能让"HMR 没换掉 action"变成控制台每 1.5s 抛一次错。
+  if (mainAgent.auto) return; // Already performing; do not wind progress back to step one
+  // During a demo the console belongs to the script: live / hookLive must be cleared first, otherwise the script cannot start / is pushed back by a real session right away.
+  // Prefer the store's startDemo(); during hot reload the page may still hold the pre-change store instance (without that action),
+  // so clear the flags in place then start() —— "HMR did not swap in the action" must not turn into the console throwing once every 1.5s.
   if (typeof mainAgent.startDemo === 'function') {
     mainAgent.startDemo();
     return;
@@ -709,8 +709,8 @@ function startDemoScript() {
   mainAgent.start();
 }
 
-/** 服务端确认当前停在演示工程后（含"上次停在演示工程"被 restore 回来的情况）才开演；
- *  退出演示时收掉脚本，控制台交回真会话（真实相位由上面那个 watch 立刻接管）。 */
+/** Only start performing after the server confirms it is currently on the demo project (including the case where "was last on the demo project" is restored);
+ *  on exiting the demo, take down the script and hand the console back to real sessions (the real phase is taken over immediately by the watch above). */
 watch(
   () => project.demo,
   (v) => {
@@ -721,13 +721,13 @@ watch(
 
 /* ------------------------------ HUD ------------------------------ */
 
-/** 演示模式开关（HUD 里、集合开会前面那个按钮）：切进 / 切出演示工程 */
+/** Demo mode toggle (the button in the HUD, before the meeting call): switch into / out of the demo project */
 async function toggleDemo() {
   try {
     if (project.demo) await project.exitDemo();
     else await project.enterDemo();
   } catch (err) {
-    // 切不过去（目录没了 / 服务端拒绝）不能把视图带崩：保持原样，只报一行
+    // If the switch fails (directory gone / server refused), the view must not crash: stay as-is, just log one line
     console.warn('[workgremlin] 切换演示模式失败：', err && err.message);
   }
 }
@@ -752,7 +752,7 @@ onMounted(() => {
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);
-  // 非演示模式不 start()：保持待命，等真会话 / hook 相位接管（见 startDemoScript 的注释）
+  // Do not start() outside demo mode: stay on standby, waiting for real sessions / hook phases to take over (see the comment on startDemoScript)
   if (project.demo) startDemoScript();
   startPhasePoll();
 
@@ -786,7 +786,7 @@ onBeforeUnmount(() => {
       @mouseleave="onConsoleLeave"
     />
 
-    <!-- 主 Agent 控制台 tooltip：鼠标停在悬浮屏上 400ms 后弹出 -->
+    <!-- Main Agent console tooltip: pops 400ms after the mouse rests on the floating screen -->
     <div
       v-if="tip.show"
       class="console-tip"
@@ -794,11 +794,11 @@ onBeforeUnmount(() => {
     >
       <div class="ct-head">
         <i class="dot" :style="{ background: mainAgent.phaseColor }" />
-        <!-- 「任务取消」那三个字也跟着相位色走（红）—— 只在这一相染色，别的相位维持原样 -->
+        <!-- The "task cancelled" text also follows the phase color (red) —— only this phase is tinted; other phases stay as-is -->
         <span class="ct-phase" :style="mainAgent.phase === 'cancelled' ? { color: mainAgent.phaseColor } : null">{{ mainAgent.phaseLabel }}</span>
       </div>
-      <!-- 收尾相位（任务完成 / 任务取消）：第三层那几句"产出概要"才是要看的东西，
-           所以它们压过 action —— 取消时这里是"改动了哪些文件"，一个都没动就是「没有输出」。 -->
+      <!-- Wrap-up phase (task done / task cancelled): those "output summary" lines in the third layer are what matters,
+            so they override action —— on cancel this is "which files changed", and none changed means "no output". -->
       <div
         class="ct-row"
         v-if="mainAgent.action || (isFinishPhase && mainAgent.context.length)"
@@ -815,7 +815,7 @@ onBeforeUnmount(() => {
       <div v-if="mainAgent.skill" class="ct-row"><b>{{ t('office.tip.skill') }}</b><span class="ct-val">{{ mainAgent.skill }}</span></div>
     </div>
 
-    <!-- 小怪物 tooltip：当前任务 + 最近一次完成的结果 -->
+    <!-- Gremlin tooltip: current task + most recent completed result -->
     <div
       v-if="mtip.show && mtipMember"
       class="console-tip member-tip"
@@ -834,7 +834,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 任务卡（跟着角色走） -->
+    <!-- Task card (follows the character) -->
     <div
       v-if="card && cardMember"
       class="card-layer"
@@ -847,9 +847,9 @@ onBeforeUnmount(() => {
 
     <!-- HUD -->
     <div class="hud" @click.stop>
-      <!-- 演示模式：切到演示工程（主控制台自动演一轮、小怪物换成演示成员）。
-           放在办公室自己的操作条上、集合开会之前 —— 它切的是"屋里这台机器"，
-           和 集合开会 / 全员回工位 是一类动作，不占顶栏页签。 -->
+      <!-- Demo mode: switch to the demo project (the main console performs a round automatically, gremlins become demo members).
+           Placed on the office's own action bar, before the meeting call —— it switches "this machine in the office",
+           the same class of action as meeting call / everyone back to desk, and takes no top-bar tab. -->
       <button
         class="demo-btn"
         :class="{ on: project.demo }"
@@ -861,8 +861,8 @@ onBeforeUnmount(() => {
       <button @click="callAll">{{ t('office.meeting') }}</button>
       <button @click="dismiss">{{ t('office.back_to_desk') }}</button>
       <button @click="resetView">{{ t('office.reset_view') }}</button>
-      <!-- 全屏切换：放在「演示模式」这一行末尾，收掉顶栏后也在此处，
-           不会落到滚动屏右边；标签在「全屏」/「退出全屏」间切换，按钮固定宽、不跳位 -->
+      <!-- Fullscreen toggle: placed at the end of the "demo mode" row, still here after the top bar is hidden,
+           and never landing to the right of the scroll screen; the label switches between "Fullscreen" / "Exit fullscreen", the button is fixed width and does not jump -->
       <button
         class="fs-hud-btn"
         :title="fullscreen ? t('nav.exit_fullscreen_title') : t('nav.fullscreen_title')"
@@ -872,13 +872,13 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <!-- 左下角说明条：连接状态 + 相位来源（原来在左上角那枚小徽标里）与操作说明**并列**一条。
-         项目名不在这里 —— 它挪到了门楣（楼层液晶屏那块板）的最左边，见 ElevatorDoors。 -->
+    <!-- Bottom-left caption bar: connection state + phase source (previously in the small badge at the top-left) **side by side with** the operation hint in one bar.
+         The project name is not here —— it moved to the far left of the lintel (the floor LCD panel), see ElevatorDoors. -->
     <div class="tip">
       <ConnectionBar bare class="status-hud" :connection="connection" :source="source" />
       <span class="sep" />
       {{ t('office.tip.pan') }}
-      <!-- 与前面操作说明之间也来一条竖线（和"相位来源"后面那条同一规格的 .sep） -->
+      <!-- Another vertical line between it and the preceding operation hint (the same spec .sep as the one after the "phase source") -->
       <span class="sep" />
       <span class="legend"><i class="dot green" />{{ t('office.legend.project_expert') }}</span>
       <span class="legend"><i class="dot blue" />{{ t('office.legend.user_expert') }}</span>
@@ -894,7 +894,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
-  /* 底色走 token：门楣（楼层屏那片）用的是同一个色，见 theme.css 的 --iso-bg */
+  /* The background uses a token: the lintel (the floor screen area) uses the same color, see --iso-bg in theme.css */
   background: var(--iso-bg, #151a22);
 }
 
@@ -919,7 +919,7 @@ onBeforeUnmount(() => {
   width: 100%;
 }
 
-/* 连接 / 相位来源：已并入左下角说明条（.tip 里），不吃鼠标事件，免得挡住场景拖拽 */
+/* Connection / phase source: merged into the bottom-left caption bar (inside .tip); it swallows no mouse events, so it does not block scene dragging */
 .status-hud {
   flex: none;
   pointer-events: none;
@@ -947,7 +947,7 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
 }
 
-/* 全屏按钮：固定宽度，标签在「全屏」(2字) / 「退出全屏」(4字) 间切换时不跳位 */
+/* Fullscreen button: fixed width, so it does not jump when the label switches between "Fullscreen" (2 chars) / "Exit fullscreen" (4 chars) */
 .fs-hud-btn {
   min-width: 76px;
   text-align: center;
@@ -979,7 +979,7 @@ onBeforeUnmount(() => {
   background: var(--border-strong);
 }
 
-/* 左下角说明条：连接 / 相位来源 / 操作说明 / 专家级别图例 —— 一行并列 */
+/* Bottom-left caption bar: connection / phase source / operation hint / expert level legend —— side by side on one row */
 .tip {
   position: absolute;
   left: 10px;
@@ -1028,7 +1028,7 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 8px;
   color: var(--text-dim, #a8bdd6);
-  /* 长内容（超长文件路径等）与标签顶部对齐，而不是撑破盒子 */
+  /* Long content (very long file paths etc.) aligns to the label's top rather than bursting the box */
   align-items: flex-start;
 }
 
@@ -1038,7 +1038,7 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
-/* 值文本：可收缩，长串（文件路径 / 工具名）断词换行 */
+/* Value text: shrinkable; long strings (file paths / tool names) wrap mid-word */
 .ct-val {
   flex: 1 1 auto;
   min-width: 0;
@@ -1046,7 +1046,7 @@ onBeforeUnmount(() => {
   word-break: break-word;
 }
 
-/* 完成/暂停时的「改动」明细：每个文件单独一行 */
+/* The "changes" detail on done/paused: each file on its own line */
 .ct-files .ct-file {
   display: block;
 }
@@ -1055,7 +1055,7 @@ onBeforeUnmount(() => {
   color: var(--text-faint);
 }
 
-/* 专家级别图例：与工牌/名牌的级别色一致（project 绿 / user 蓝） */
+/* Expert level legend: colors match the badge/nameplate levels (project green / user blue) */
 .legend {
   display: inline-flex;
   align-items: center;

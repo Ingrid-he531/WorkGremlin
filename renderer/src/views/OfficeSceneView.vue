@@ -1,17 +1,17 @@
 <script setup>
 /**
- * OfficeSceneView —— 全屏真实办公室场景。
+ * OfficeSceneView —— full-screen immersive office scene.
  *
- * 图层（后 → 前，y 越大越靠近镜头）：
- *   1 bg      后墙/窗/地板/地毯/隔断/椅子/会议室内部/茶水台/文印区
- *   2 seated  坐在工位或会议室的精灵（被桌子挡住下半身 = 坐着的效果）
- *   3 fg      桌子/显示器/会议桌/玻璃（压住 seated 层）
- *   4 walkers 走动中的精灵（永远在最前）
- *   5 tags    头顶状态贴片 + 选中光环
+ * Layers (back → front, larger y is closer to the camera):
+ *   1 bg      back wall / windows / floor / carpet / partitions / chairs / meeting room interior / coffee counter / print area
+ *   2 seated  sprites sitting at a workstation or in the meeting room (the desk covers the lower body = the "seated" effect)
+ *   3 fg      desks / monitors / meeting table / glass (drawn over the seated layer)
+ *   4 walkers walking sprites (always frontmost)
+ *   5 tags    overhead status tags + selection ring
  *
- * 行为：默认坐自己工位，随机起身去茶水间/文印/串门/溜达；
- * 2 个以上成员 blocked 自动去会议室开会（恢复后回工位）；也可手动集合开会。
- * 移动走 officeLayout 的过道路网（BFS 最短路），不会穿桌子。
+ * Behavior: by default each gremlin sits at its own workstation, then randomly gets up to go to the coffee room / print / visit a neighbor / wander;
+ * when 2 or more members are blocked they automatically go to the meeting room (and return to their workstation after recovering); meetings can also be called manually.
+ * Movement follows the officeLayout corridor graph (BFS shortest path) and never walks through desks.
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GremlinSprite from '../components/GremlinSprite.vue';
@@ -54,7 +54,7 @@ const STATE_COLOR = {
   thinking: '#ffcf5c',
   offline: '#4a5160',
 };
-/** 五个主状态 → i18n 词条（图例与头顶贴片共用） */
+/** Five main states → i18n keys (shared by the legend and the overhead tags) */
 const STATE_KEY = {
   online: 'state.online',
   busy: 'state.busy',
@@ -65,12 +65,12 @@ const STATE_KEY = {
 };
 const stateText = (s) => t(STATE_KEY[s] || 'state.idle');
 
-/* ------------------------------ 成员 → 工位 ------------------------------ */
+/* ------------------------------ Members → Workstations ------------------------------ */
 
-/** 专家团队：常驻成员，一人一个工位（临时成员不占工位）。
- *  主 Agent（role=agent）只在主控制台剪影出现，不占工位，所以从名单剔掉。 */
+/** Expert team: resident members, one workstation each (ephemeral members take no workstation).
+ *  The main Agent (role=agent) only shows up as a silhouette at the main console and takes no workstation, so it is dropped from the roster. */
 const roster = computed(() => project.members.filter((m) => !isEphemeralMember(m) && m.role !== 'agent').slice(0, DESKS.length));
-/** 临时组队成员 + 工位坐不下的成员：没有工位，飘在空中 */
+/** Ephemeral team members + members that do not fit at a workstation: no workstation, they float in mid-air */
 const ghostRoster = computed(() => {
   const seated = new Set(roster.value.map((m) => m.memberId));
   return project.members.filter((m) => !seated.has(m.memberId));
@@ -122,7 +122,7 @@ watch(
   { immediate: true }
 );
 
-/* ------------------------------ 临时成员（幽灵） ------------------------------ */
+/* ------------------------------ Ephemeral members (ghosts) ------------------------------ */
 
 const ghosts = ref([]);
 
@@ -134,7 +134,7 @@ function makeGhost(member, i) {
     x: anchor.x,
     y: anchor.y,
     baseY: anchor.y,
-    /** 浮动相位：错开，避免整齐划一地上下 */
+    /** Float phase: offset each one so they do not bob up and down in unison */
     phase: Math.random() * Math.PI * 2,
     speed: 46 + Math.random() * 26,
     target: null,
@@ -158,9 +158,9 @@ watch(
 const stateOf = (a) => (memberOf.value.get(a.memberId) || {}).state || 'offline';
 const degradedOf = (a) => Boolean((memberOf.value.get(a.memberId) || {}).degraded);
 
-/* ------------------------------ 移动 ------------------------------ */
+/* ------------------------------ Movement ------------------------------ */
 
-const SPEED = 240; // 场景单位/秒
+const SPEED = 240; // scene units per second
 
 function goTo(a, to, mode, dwellMs = 0) {
   a.path = route({ x: a.x, y: a.y }, to);
@@ -181,7 +181,7 @@ const WANDER = [
   { x: 1020, y: 195 },
 ];
 
-/** 随机起个身：茶水间 / 文印 / 串门 / 溜达 */
+/** Randomly get up: coffee room / print / visit a neighbor / wander */
 function pickActivity(a) {
   const r = Math.random();
   if (r < 0.32) {
@@ -248,7 +248,7 @@ function frame(t) {
     }
   }
 
-  // 幽灵：不走路网，在两个悬浮锚点之间慢慢飘，并一直上下浮动
+  // Ghosts: skip the corridor graph, drift slowly between two hover anchors and bob up and down the whole time
   for (const g of ghosts.value) {
     if (g.target) {
       const dx = g.target.x - g.x;
@@ -276,7 +276,7 @@ function frame(t) {
   raf = requestAnimationFrame(frame);
 }
 
-/* ------------------------------ 开会 ------------------------------ */
+/* ------------------------------ Meeting ------------------------------ */
 
 const manualMeeting = ref(false);
 const blockedIds = computed(() => project.members.filter((m) => m.state === 'blocked').map((m) => m.memberId));
@@ -290,7 +290,7 @@ function startMeeting(ids) {
     goTo(a, MEETING.seats[k % MEETING.seats.length], 'meet');
     k += 1;
   });
-  // 临时成员没有座位，飘到会议室上空旁听
+  // Ephemeral members have no seat, so they hover above the meeting room to listen in
   ghosts.value.forEach((g) => {
     g.inMeeting = true;
     g.target = GHOST.meeting;
@@ -328,7 +328,7 @@ function dismiss() {
 
 const meetingCount = computed(() => agents.value.filter((a) => a.inMeeting).length);
 
-/* ------------------------------ 头顶状态贴片 ------------------------------ */
+/* ------------------------------ Overhead status tags ------------------------------ */
 
 const ACTIVITY_KEY = {
   coffee: 'scene.activity.coffee',
@@ -346,7 +346,7 @@ function tagText(a) {
   return stateText(stateOf(a)) + (degradedOf(a) ? '?' : '');
 }
 
-/** 幽灵头顶：项目名优先（临时成员是为某个项目临时拉进来的） */
+/** Above a ghost: the project name takes priority (ephemeral members are pulled in for a specific project) */
 function ghostTagText(g) {
   if (g.inMeeting) return t('tag.attending');
   const proj = projectLabelOf(memberOf.value.get(g.memberId));
@@ -361,7 +361,7 @@ function tagWidth(text) {
 
 const tagY = (a) => a.y - 92;
 
-/* ------------------------------ 点击 → 任务卡 ------------------------------ */
+/* ------------------------------ Click → Task card ------------------------------ */
 
 const card = ref(null);
 
@@ -379,7 +379,7 @@ function toPixels(x, y) {
   return { x: sp.x - r.left, y: sp.y - r.top };
 }
 
-/** 卡片跟着精灵/幽灵走 */
+/** The card follows the sprite/ghost */
 function updateCardPos() {
   if (!card.value || !wrapRef.value) return;
   const a = agents.value.concat(ghosts.value).find((x) => x.memberId === card.value.memberId);
@@ -402,7 +402,7 @@ function closeCard() {
   card.value = null;
 }
 
-/* ------------------------------ 桌面屏幕（抽象 UI） ------------------------------ */
+/* ------------------------------ Desk screens (abstract UI) ------------------------------ */
 
 function hash(s) {
   let h = 2166136261;
@@ -420,9 +420,9 @@ const deskScreens = computed(() =>
     return {
       color: STATE_COLOR[m ? m.state : 'offline'],
       lines: [0, 1, 2].map((k) => 30 + ((seed >> (k * 3)) % 55)),
-      // 屏幕上那条走条**不画完成度**（2026-09-29 去掉 progress）：task.progress 只有 0/1
-      // 两个取值（开工写 0、收工写 1，中间没人推进，见 TaskRecordsView「进度」那行），
-      // 画长度等于永远空条或满条。这里只判断"在不在干活"，让光带自己爬（见模板里的 .scr-crawl）。
+      // The crawl bar on the screen does **not** draw progress (progress was dropped on 2026-09-29): task.progress only has 0/1
+      // two values (0 when work starts, 1 when it ends, and nobody advances it in between — see the "progress" row in TaskRecordsView),
+      // so a length drawn from it would forever be an empty or full bar. Here we only check whether work is in progress and let the light band crawl by itself (see .scr-crawl in the template).
       running: Boolean(m && m.state === 'busy'),
     };
   })
@@ -452,7 +452,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         </linearGradient>
       </defs>
 
-      <!-- ============ 1. 背景 ============ -->
+      <!-- ============ 1. Background ============ -->
       <g class="bg">
         <rect x="0" y="0" :width="SCENE.w" height="153" fill="#1b2029" />
         <g v-for="(w, i) in WINDOWS" :key="`win${i}`">
@@ -471,7 +471,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         <rect x="40" y="186" width="1020" height="474" rx="14" fill="#262c37" />
         <rect x="40" y="186" width="1020" height="474" rx="14" fill="none" stroke="#2f3745" stroke-width="2" />
 
-        <!-- 隔断 + 椅子（精灵压在它们之上） -->
+        <!-- Partitions + chairs (sprites are drawn on top of them) -->
         <g v-for="d in DESKS" :key="`p${d.id}`">
           <rect :x="d.rail.x" :y="d.rail.y" :width="d.rail.w" :height="d.rail.h" rx="3.5" fill="#3c4658" />
           <rect :x="d.partition.x" :y="d.partition.y" :width="d.partition.w" :height="d.partition.h" rx="4" fill="#2a3241" />
@@ -483,7 +483,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           <rect :x="d.chairInner.x" :y="d.chairInner.y" :width="d.chairInner.w" :height="d.chairInner.h" rx="12" fill="#3d4757" />
         </g>
 
-        <!-- 会议室内部 -->
+        <!-- Meeting room interior -->
         <g class="room">
           <rect :x="MEETING.x" :y="MEETING.y" :width="MEETING.w" :height="MEETING.h" fill="#1e242e" />
           <rect :x="MEETING.x" :y="MEETING.y" :width="MEETING.w" height="6" fill="#2b3341" />
@@ -506,7 +506,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           </g>
         </g>
 
-        <!-- 前区：茶水台 / 文印 / 饮水机 / 绿植 -->
+        <!-- Front area: coffee counter / print / water cooler / plants -->
         <g class="lounge">
           <rect :x="LOUNGE.counter.x" :y="LOUNGE.counter.y" :width="LOUNGE.counter.w" :height="LOUNGE.counter.h" fill="#39414f" />
           <rect :x="LOUNGE.counterTop.x" :y="LOUNGE.counterTop.y" :width="LOUNGE.counterTop.w" :height="LOUNGE.counterTop.h" rx="3" fill="#4d5768" />
@@ -531,7 +531,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         </g>
       </g>
 
-      <!-- ============ 2. 坐着的精灵（下半身被桌子挡住） ============ -->
+      <!-- ============ 2. Seated sprites (lower body hidden behind the desk) ============ -->
       <g class="seated">
         <g
           v-for="a in agents.filter((x) => !x.moving)"
@@ -545,7 +545,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         </g>
       </g>
 
-      <!-- ============ 3. 前景家具 ============ -->
+      <!-- ============ 3. Foreground furniture ============ -->
       <g class="fg">
         <g
           v-for="(d, i) in DESKS"
@@ -574,8 +574,8 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
             opacity="0.9"
           />
           <rect :x="d.monitor.screen.x + 8" :y="d.monitor.screen.y + 32" :width="d.monitor.screen.w - 16" height="3" rx="1.5" fill="#232c3a" />
-          <!-- 底部走条：光带固定占轨道 30%，从左爬到右循环（不确定，不表示完成度）。
-               周期 1.8s 与主控制台一致，见 iso/mainConsole.js 里 ph.busy 那一段。 -->
+          <!-- Bottom crawl bar: the light band always takes up 30% of the track and crawls from left to right in a loop (indeterminate, it does not mean progress).
+               The 1.8s period matches the main console, see the ph.busy part in iso/mainConsole.js. -->
           <rect
             v-if="deskScreens[i].running"
             class="scr-crawl"
@@ -594,12 +594,12 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           <rect :x="d.mug.x" :y="d.mug.y" :width="d.mug.w" :height="d.mug.h" rx="3" fill="#e6ebf2" />
         </g>
 
-        <!-- 会议桌 -->
+        <!-- Meeting table -->
         <rect :x="MEETING.table.x" :y="MEETING.table.y" :width="MEETING.table.w" :height="MEETING.table.h" :rx="MEETING.table.rx" fill="#6d5540" />
         <rect :x="MEETING.table.x + 14" :y="MEETING.table.y + 14" :width="MEETING.table.w - 28" :height="MEETING.table.h - 28" :rx="MEETING.table.rx - 14" fill="none" stroke="#5a4534" stroke-width="3" />
         <ellipse :cx="MEETING.table.x + MEETING.table.w / 2" :cy="MEETING.table.y + MEETING.table.h / 2" rx="30" ry="12" fill="#5a4534" opacity="0.6" />
 
-        <!-- 玻璃（压在精灵之上 → 隔着玻璃看进去） -->
+        <!-- Glass (drawn over the sprites → you see into the room through the glass) -->
         <g class="glass">
           <rect :x="MEETING.glassLeft.x" :y="MEETING.glassLeft.y" :width="MEETING.glassLeft.w" :height="MEETING.glassLeft.h" fill="#7fb0ff" opacity="0.13" />
           <rect :x="MEETING.wallRight.x" :y="MEETING.wallRight.y" :width="MEETING.wallRight.w" :height="MEETING.wallRight.h" fill="#39414f" />
@@ -617,7 +617,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         <text :x="MEETING.x + MEETING.w / 2" :y="MEETING.glassFront.y - 14" class="room-label" text-anchor="middle">{{ t('wall.meeting_room') }}</text>
       </g>
 
-      <!-- ============ 4. 走动中的精灵 ============ -->
+      <!-- ============ 4. Walking sprites ============ -->
       <g class="walkers">
         <g
           v-for="a in agents.filter((x) => x.moving)"
@@ -631,7 +631,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         </g>
       </g>
 
-      <!-- ============ 4.5 临时成员（幽灵）：没有工位，飘在空中 ============ -->
+      <!-- ============ 4.5 Ephemeral members (ghosts): no workstation, they float in mid-air ============ -->
       <g class="ghosts">
         <g v-for="g in ghosts" :key="`g${g.memberId}`">
           <ellipse class="hover-glow" :cx="g.x" :cy="g.y + 44" rx="27" ry="7" />
@@ -646,7 +646,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
         </g>
       </g>
 
-      <!-- ============ 5. 头顶状态 + 选中光环 ============ -->
+      <!-- ============ 5. Overhead status + selection ring ============ -->
       <g class="tags">
         <g v-for="a in agents" :key="`t${a.memberId}`">
           <ellipse v-if="selectedId === a.memberId" :cx="a.x" :cy="a.y" rx="38" ry="10" class="sel-ring" />
@@ -657,7 +657,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           </g>
         </g>
 
-        <!-- 幽灵：虚线标签，写明所属项目 -->
+        <!-- Ghosts: dashed tags that name the owning project -->
         <g v-for="g in ghosts" :key="`gt${g.memberId}`">
           <ellipse v-if="selectedId === g.memberId" :cx="g.x" :cy="g.y" rx="34" ry="9" class="sel-ring" />
           <g :transform="`translate(${g.x} ${g.y - 92})`" class="tag" @click.stop="openCard(g, $event)">
@@ -682,7 +682,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
       </g>
     </svg>
 
-    <!-- 任务卡（跟着精灵走） -->
+    <!-- Task card (follows the sprite) -->
     <div
       v-if="card && cardMember"
       class="card-layer"
@@ -756,7 +756,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
   cursor: pointer;
 }
 
-/* 任务卡 */
+/* Task card */
 .card-layer {
   position: absolute;
   transform: translate(-50%, -100%);
@@ -802,13 +802,13 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
   display: inline-block;
 }
 
-/* 临时成员：空心虚线圈（对应幽灵的虚线描边） */
+/* Ephemeral members: hollow dashed circle (mirrors the dashed outline of the ghost) */
 .ghost-dot {
   background: transparent;
   border: 1px dashed #8fe0f5;
 }
 
-/* 幽灵悬停光晕：飘在空中，所以只在下方留一点虚影 */
+/* Ghost hover glow: it floats in mid-air, so only a faint shadow is left below */
 .hover-glow {
   fill: #9fe8ff;
   opacity: 0.07;
@@ -824,11 +824,11 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
   color: var(--accent);
 }
 
-/* 显示器上那条走条：光带从左爬到右，1.8s 一圈（与主控制台 mainConsole 同周期）。
-   翻译量按光带自身宽度算：-100% = 完全滑出左边，333% ≈ 完全滑出右边（30% × 3.33 ≈ 100%）。 */
+/* The crawl bar on the monitor: the light band crawls from left to right, one loop every 1.8s (same period as the main console mainConsole).
+   The translate amount is measured against the width of the light band: -100% = fully slid off the left, 333% ≈ fully slid off the right (30% × 3.33 ≈ 100%). */
 .scr-crawl {
-  /* transform-box: fill-box —— 必须显式写：SVG 元素的初始值是 view-box，
-     那样 translateX(-100%) 会按整个画布宽度算，光带直接飞到屏幕外。*/
+  /* transform-box: fill-box —— must be set explicitly: the initial value for SVG elements is view-box,
+     which would make translateX(-100%) use the whole canvas width and send the light band right off-screen. */
   transform-box: fill-box;
   animation: scr-crawl-x 1.8s linear infinite;
 }
@@ -841,8 +841,8 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
   }
 }
 
-/* 靠"动"表达"在跑"的光带，关掉动画就只剩一段固定长度，会被读成"进度 30%" ——
-   宁可什么都不画，也不给个假的完成度。 */
+/* A light band that signals "running" through motion alone would, with the animation off, be left as a fixed-length segment read as "30% progress" ——
+   better to draw nothing at all than to show fake progress. */
 @media (prefers-reduced-motion: reduce) {
   .scr-crawl {
     display: none;
