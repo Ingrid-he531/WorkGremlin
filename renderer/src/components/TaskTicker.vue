@@ -129,6 +129,23 @@ function runningPhaseOfTask(it) {
 }
 
 /**
+ * A line's trailing suffix, resolved **at render time**.
+ *
+ * Ended lines keep the suffix baked when they entered the track (done / cancelled is terminal and must
+ * never change). **Live** running lines are resolved from the session snapshot on every render, so the
+ * phase tracks the agent within the store's poll window.
+ *
+ * Why it cannot be baked into the line: a line only lives inside a scroll **segment**, and a segment is
+ * an immutable snapshot (fixed at creation, not changed until it scrolls off). A screen-wide segment
+ * lasts ~20-30s (screen width at 70px/s), so baking sampled the phase only once per segment —— a few
+ * seconds of "tool" was almost never caught and the line read "thinking" nearly always. The store poll
+ * is 5s, so live is the only way it stays honest.
+ */
+const lineSuffix = (it) =>
+  it.live ? wrapSuffix(t(`phase.${runningPhaseOfTask(it)}`)) : it.suffix || '';
+const lineSuffixColor = (it) => (it.live ? phaseColorOf(runningPhaseOfTask(it)) : it.suffixColor);
+
+/**
  * An ended task's line: reuse the **same wording it scrolled with** (time floor task: prompt) and append
  * the phase suffix "（任务完成）/（任务取消）" — same wording and colour as the phase scheme (done green,
  * cancelled/failed red). It scrolls exactly once (see pendingEnded → makeSeg) and then leaves the track.
@@ -252,6 +269,11 @@ const runningItems = computed(() => {
       return {
         id: it.id,
         kind: 'running',
+        // Marks a **live** running line (ended lines also use kind:'running', see endedText). The render
+        // layer resolves its suffix from the session snapshot on every render (see lineSuffix) instead of
+        // freezing it into the scroll segment at creation time.
+        live: true,
+        sessionId: it.sessionId,
         time,
         floor,
         taskLabel,
@@ -434,7 +456,7 @@ onBeforeUnmount(() => {
       >
         <!-- 减弱动态效果时静态摆着，只摆一段（多段看着就是同一句在重复） -->
         <span v-for="s in (reduce ? segs.slice(0, 1) : segs)" :key="s.id" class="seg">
-        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="it.suffix" class="suf" :style="{ color: it.suffixColor }">{{ it.suffix }}</span></span>
+        <span v-for="it in s.lines" :key="it.id" class="line" :class="`k-${it.kind}`" :style="{ '--floor-color': it.floorColor }"><span class="time">{{ it.time }}</span>&nbsp;<span class="floor">{{ it.floor }}</span>&nbsp;<span class="task-label">{{ it.taskLabel }}</span><span class="task-text">{{ it.taskText }}</span><span v-if="lineSuffix(it)" class="suf" :style="{ color: lineSuffixColor(it) }">{{ lineSuffix(it) }}</span></span>
         </span>
       </div>
       <span class="scan" aria-hidden="true" />
