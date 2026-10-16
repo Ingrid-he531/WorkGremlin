@@ -47,7 +47,7 @@ const RE_PLUGIN = [/codebuddy/i, /tencent/i, /ingram/i, /code-?buddy/i];
  * message-queue is **unique to the CodeBuddy** (Tencent Coding Copilot) plugin; other plugin floors
  * each have their own on-disk shape (9F Copilot is session-store.db, see floorCopilot.js). So it belongs
  * to this floor —— sessions.js's listSessions dispatches by client to pluginStore below, and the generic
- * plugin reader (plugin.js) no longer meddles with any product's internal directory structure.
+ * plugin reader (roots.js's findPluginStorage) no longer meddles with any product's internal directory structure.
  */
 
 /** File mtime (ms); returns 0 when unreadable ("never touched", never fabricated) */
@@ -449,7 +449,7 @@ const meta = {
   pluginRe: RE_PLUGIN,
   // Marker for "what this floor's plugin structured on-disk data looks like": a directory matching
   // pluginRe counts as its plugin storage root only if it holds any one of these
-  // (see findPluginStorage in plugin.js). Kept in meta so the generic locator hardcodes no product
+  // (see findPluginStorage in roots.js). Kept in meta so the generic locator hardcodes no product
   // directory names.
   pluginStorageMarks: ['genie-history', 'todos', 'file-changes', 'message-queue'],
   // Merged floor: all three paths belong to it; when the same session is seen by two paths at once it is

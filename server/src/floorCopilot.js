@@ -9,9 +9,10 @@
  *   · VS Code's state.vscdb chat index (readCopilotChatIndex, the only side evidence of "a turn is in flight")
  *   · VS Code's chatSessions/<session>.jsonl session log (readCopilotLiveRequest: user prompt / start-end / in-flight)
  *
- * This file depends only on plugin.js (findPluginStorage / globalStorageRoots / flush-window constants) to read
- * its own on-disk state; it no longer requires sessions.js back (kills the sessions ↔ copilot cycle). The
- * readers (readCopilotX) are called by plugin.js's readCopilotSessions / sessions.js's listSessions.
+ * This file depends only on generic modules (roots.js for findPluginStorage / globalStorageRoots /
+ * workspaceStorageRoots and tolerant file reads) to read its own on-disk state; it no longer requires
+ * sessions.js back (kills the sessions ↔ copilot cycle). The readers (readCopilotX) are called by
+ * sessions.js's listSessions.
  *
  * Unified contract (see FLOOR_CONTRACT in floors.js):
  *   id / client   floor identity
@@ -24,15 +25,18 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-// Plugin on-disk reads (findPluginStorage / globalStorageRoots / workspaceStorageRoots / flush-window constants)
-// live in plugin.js; this file depends only on it and no longer requires sessions.js back (kills the
-// sessions ↔ copilot cycle).
-const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, IDLE_MS, LISTED_MS, DONE_TTL_MS } = require('./plugin');
-// Tolerant file reads (readJson / readDir) come from roots so they are not redefined everywhere
-const { readJson, readDir, isFile, isDir } = require('./roots');
+// Generic plugin on-disk resolution (findPluginStorage / globalStorageRoots / workspaceStorageRoots) and
+// tolerant file reads (readJson / readDir) all come from roots.js; this file depends only on generic
+// modules and never requires floors.js/sessions.js back (kills the sessions ↔ copilot cycle).
+const { findPluginStorage, globalStorageRoots, workspaceStorageRoots, readJson, readDir, isFile, isDir } = require('./roots');
 const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
+
+// 9F's own on-disk windows (same order as the CLI floors; 7F/8F define their own too)
+const IDLE_MS = 10 * 60_000; // how long without activity counts as "inactive" (no heartbeat, so only file times)
+const LISTED_MS = 60 * 60_000; // window in which a session is "still in the dropdown"
+const DONE_TTL_MS = 10 * 60_000; // "freshness" window of the done marker
 
 // 9F-only: this floor's pluginRe (products.js's findDataPath copilot branch needs it too); kept here to avoid a cycle.
 const RE_GITHUB_COPILOT = [/^github\.copilot/i, /^github-copilot/i, /^github\.copilot-chat/i, /^copilot/i];

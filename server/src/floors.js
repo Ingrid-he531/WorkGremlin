@@ -8,8 +8,9 @@
  * `sessionRegistry.js` / `sessions.js` or other central files, which is exactly where past
  * regressions came from.
  *
- * This file does **only two things**: ① the registry (`floors` / `floorOf`); ② detection orchestration
- * (`detectProducts` aggregates each floor's `meta` into detect results). Anything about "what a
+ * This file does **three things**: ① the registry (`floors` / `floorOf`); ② detection orchestration
+ * (`detectProducts` aggregates each floor's `meta` into detect results); ③ the on-disk window constants
+ * shared by plugin-kind sources (IDLE_MS / … / DONE_TTL_MS, read by sessions.js). Anything about "what a
  * product is called, where it is installed, what names match it" lives in each floor's meta
  * (`matchRe` / `homeDirs` / `homeDirsPlugin` / `pluginRe` / `altPluginRe` / `cliBinDirs` …); this file
  * contains no product-specific content. Generic "OS/editor directory enumeration, directory size"
@@ -113,6 +114,19 @@ for (const f of Object.values(floors)) {
 function floorOf(id) {
   return floors[String(id)] || null;
 }
+
+/* ============================================================== Plugin source on-disk windows */
+
+/**
+ * On-disk windows shared by the plugin-kind sources (aligned with the CLI floors; sessionRegistry's
+ * TIMEOUT_MS = 60 minutes). sessions.js reads plugin data with them, so the single copy lives here
+ * rather than in each consumer.
+ */
+const IDLE_MS = 10 * 60_000; // how long without activity counts as "inactive" (the plugin runtime has no heartbeat, so only file times can be used)
+const BUSY_MS = 90_000; // a file changed within this long → considered to be actively working
+const FRESH_MS = 2 * 60_000; // on-disk writes within this long → this round of conversation is still advancing (covers cases like pure reasoning or read-only tools that leave no file/todo evidence)
+const LISTED_MS = 60 * 60_000; // window in which a session is "still in the dropdown" (see the notes in sessions.js)
+const DONE_TTL_MS = 10 * 60_000; // "freshness" window of the done marker: only something that finished within this long counts as "just happened"
 
 /* ============================================================== CLI install directories (generic fallback) */
 
@@ -431,3 +445,10 @@ module.exports.taskSyncerFloors = taskSyncerFloors;
 module.exports.agentSyncerFloors = agentSyncerFloors;
 module.exports.detectLevel = detectLevel;
 module.exports.agentDescription = agentDescription;
+
+// Plugin source on-disk windows (shared with sessions.js)
+module.exports.IDLE_MS = IDLE_MS;
+module.exports.BUSY_MS = BUSY_MS;
+module.exports.FRESH_MS = FRESH_MS;
+module.exports.LISTED_MS = LISTED_MS;
+module.exports.DONE_TTL_MS = DONE_TTL_MS;

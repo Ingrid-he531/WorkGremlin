@@ -8,7 +8,10 @@
  * "where the CLI is installed", "what pluginRe is" —— is pushed down into each floor's meta
  * (see the floors.js registry + each <product>.js file). This module answers only:
  *   · Where the platform-level application data roots are (dataRoots)
- *   · Where editor extensions/plugins are installed (extensionRoots / globalStorageRoots)
+ *   · Where editor extensions/plugins are installed (extensionRoots / globalStorageRoots) and where
+ *     per-workspace editor state lives (workspaceStorageRoots)
+ *   · How to find one product's plugin storage root by a caller-supplied regex + on-disk marker
+ *     (findPluginStorage —— all matching rules come from the floor, never from here)
  *   · How to measure the size of a directory (scanDataDir)
  *   · How to find a matching child under a root by regex (matchIn / firstMatch / firstExisting)
  * That way floors.js only does "registry + detection orchestration", floor modules like trae.js
@@ -238,6 +241,47 @@ function globalStorageRoots() {
   return out;
 }
 
+/** Editor workspaceStorage (where VS Code keeps per-workspace state.vscdb) */
+function workspaceStorageRoots() {
+  const out = [];
+  for (const r of dataRoots()) {
+    for (const ed of ['Code', 'Code - Insiders', 'Cursor', 'Trae', 'Windsurf', 'VSCodium']) {
+      const p = path.join(r, ed, 'User', 'workspaceStorage');
+      if (isDir(p)) out.push(p);
+    }
+  }
+  const srv = path.join(HOME, '.vscode-server', 'data', 'User', 'workspaceStorage');
+  if (isDir(srv)) out.push(srv);
+  return out;
+}
+
+/**
+ * Find **one floor's** plugin directory inside globalStorage using the caller-supplied directory-name
+ * regex. Callers always pass **their own floor's** meta.pluginRe (never a union across "all products")
+ * and may additionally use marks to confirm this is "the one with session data on disk" (for instance,
+ * when `github.copilot` and `github.copilot-chat` share a prefix, pass ['session-store.db'] to filter
+ * out the one without a session store).
+ * @param {RegExp|RegExp[]} re directory-name matcher for this product; iterates the directory list
+ *   **in the given order** and takes the first hit. Omitted = no matching.
+ * @param {string[]} [marks] subdirectory / file names that must exist inside a hit directory (any one
+ *   suffices). Empty = no validation.
+ * @returns {string} absolute path of the matching storage root; '' when not found
+ */
+function findPluginStorage(re, marks = []) {
+  const list = (Array.isArray(re) ? re : re ? [re] : []).filter(Boolean);
+  if (!list.length) return '';
+  const need = Array.isArray(marks) ? marks.filter(Boolean) : [];
+  for (const root of globalStorageRoots()) {
+    for (const name of readDir(root)) {
+      if (!list.some((rx) => rx.test(name))) continue;
+      const dir = path.join(root, name);
+      if (need.length && !need.some((m) => isDir(path.join(dir, m)) || isFile(path.join(dir, m)))) continue;
+      return dir;
+    }
+  }
+  return '';
+}
+
 /** nvm's bin: <HOME>/.nvm/versions/node/<version>/bin */
 function nvmBinDirs() {
   const root = path.join(HOME, '.nvm', 'versions', 'node');
@@ -297,6 +341,8 @@ module.exports = {
   dataRoots,
   extensionRoots,
   globalStorageRoots,
+  workspaceStorageRoots,
+  findPluginStorage,
   nvmBinDirs,
   extraDirs,
   matchIn,

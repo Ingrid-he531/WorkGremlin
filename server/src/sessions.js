@@ -41,8 +41,8 @@ const path = require('path');
 // WorkGremlin's own storage locations (the state-file dir) come from shared/paths.js.
 const { hooksDir } = require('@workgremlin/shared/paths');
 // Generic on-disk scanning infrastructure (dir conventions + tolerant file reads); readJson / readDir come
-// from roots so they are not redefined everywhere
-const { readJson, readDir } = require('./roots');
+// from roots so they are not redefined everywhere. findPluginStorage finds a product's plugin storage root.
+const { readJson, readDir, findPluginStorage } = require('./roots');
 // Floor module registry (floors.js): needed when dispatching session titles by client to the registry's
 // sessionTitle
 const { floors: floorRegistry } = require('./floors');
@@ -62,18 +62,18 @@ const claude = require('./floorClaude');
 const codebuddy = require('./floorCodebuddy');
 const copilot = require('./floorCopilot');
 // Plugin structured on-disk readers (genie-history / todos / message-queue / file-changes / Copilot SQLite):
-// every plugin-kind read is funneled into plugin.js; this file only combines that on-disk state with the
-// reporter state files into session rows and no longer meddles with the plugin's internal dir layout.
-const plugin = require('./plugin');
+// every plugin-kind read is dispatched to a floor module's pluginStore; this file only combines that on-disk
+// state with the reporter state files into session rows and never meddles with a plugin's internal dir
+// layout. Locating a product's plugin storage root is generic (roots.js's findPluginStorage).
 
 // qoder and claude share the same transcript interrupt detection (see claude.synthMarks), so alias it
 // straight to the claude module and the generic dispatcher needs no special case for it.
 const qoder = claude;
 const FLOORS = { trae, claude, codebuddy, copilot, qoder };
 
-// The flush-window constants (aligned with the CLI floors) live in plugin.js and are shared by sessions.js /
-// copilot.js so they are not defined twice
-const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = plugin;
+// The flush-window constants (aligned with the CLI floors) live in floors.js and are shared with the
+// plugin-kind floors so they are not defined twice.
+const { IDLE_MS, BUSY_MS, FRESH_MS, LISTED_MS, DONE_TTL_MS } = require('./floors');
 
 /**
  * Find a floor module by client (floor base name). A floor's "plugin structured readers / disk markers" hang
@@ -133,9 +133,8 @@ let cache = { at: 0, key: '', value: null };
  */
 const SERVER_STARTED_AT = Date.now();
 
-// The flush-window constants (IDLE_MS / BUSY_MS / FRESH_MS / LISTED_MS / DONE_TTL_MS) are shared with
-// Copilot and defined centrally in plugin.js, so sessions.js / copilot.js do not each write their own copy.
-// They are already imported above via `const { ... } = plugin`.
+// The flush-window constants (IDLE_MS / BUSY_MS / FRESH_MS / LISTED_MS / DONE_TTL_MS) are defined centrally
+// in floors.js, so sessions.js / copilot.js do not each write their own copy. They are imported above.
 
 /* ------------------------------ Session data ------------------------------ */
 /** Each session's todos / changed files / message-queue runtime are dispatched by client to the floor's
@@ -1176,7 +1175,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const key = `${client}@@${ws}@@${currentOnly ? 'current-only' : 'all'}@@${activeKey}@@${String(Array.isArray(re) ? re.map((r) => (r && r.source) || String(r)).join('|') : re instanceof RegExp ? re.source : String(re || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
-  const storage = plugin.findPluginStorage(re, storageMarks);
+  const storage = findPluginStorage(re, storageMarks);
   if (!storage) {
     cache = {
       at: now,
