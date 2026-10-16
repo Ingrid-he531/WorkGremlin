@@ -59,6 +59,7 @@
     "test:day-board": "node renderer/test/dayBoard.test.mjs",
     "test:i18n": "node renderer/test/i18n.test.mjs",
     "test:canvas-scene": "node renderer/test/canvasScene.test.mjs",
+    "test:summon-flow": "node renderer/test/summonFlow.test.mjs",
     "test:render-smoke": "node renderer/test/renderSmoke.test.mjs",
     "test:time-range": "node renderer/test/timeRange.test.mjs",
     "test:agent-desc": "node server/test/agentDescription.test.js",

@@ -365,6 +365,23 @@ let lastConsoleSessionId = undefined;
 let lastDoneAt = undefined;
 /** 是否已经见过"快轮询带回的完成标记"：首次只当基线，不弹摘要（见下面的注释） */
 let seenFastDone = false;
+/**
+ * A deferred wrap-up: the task is done (real data reported Stop first) but the office still has a
+ * summon / report animation to finish. Stash it here and only light up "Task done / Task cancelled"
+ * once the beats drain (engine.whenFlowIdle). If a new task comes in meanwhile, drop it (the previous
+ * round's wrap-up must not smother the new task).
+ */
+let pendingDone = null;
+let pendingDoneTimer = 0;
+/** Safety cap for waiting on the office animation (ms): never leave the main phase stuck on "waiting" */
+const FLOW_WAIT_MAX = 15000;
+/**
+ * The office engine instance. Must be declared before the consoleLive watch below (immediate): that
+ * callback references it (to defer the wrap-up until after the animation), and accessing it in the
+ * TDZ would throw.
+ * @type {ReturnType<typeof createIsoOffice> | null}
+ */
+let office = null;
 /** 页面（本视图）打开时刻 = 下面 trackSince 的初始值 */
 const PAGE_OPEN_AT = Date.now();
 /**
@@ -416,6 +433,9 @@ watch(
       lastDoneAt = doneAt;
       seenFastDone = fastDoneAt > 0; // 切会话时重新以这条会话的标记为基线
       trackSince = Date.now(); // "完成标记是新的还是旧的"这把尺子也跟着换到这条会话
+      // Session switch = the previous round's wrap-up has nothing to do with this one: drop it
+      pendingDone = null;
+      clearTimeout(pendingDoneTimer);
       // 空楼层（一条会话都没有）：控制台待命；屋里只留常驻小怪物、清掉幽灵
       // （见 sceneMembers），但**不走 applySession(null)** —— 那是"会话收工"，
       // 会弹「任务完成」，跟这层没关系。
@@ -430,6 +450,24 @@ watch(
         project.openWorkspace(sel.projectPath);
       }
       return;
+    }
+    // Waiting on wrap-up (the office is still playing this round's summon / report):
+    //   - a genuinely new round (a phase newer than the Stop, or taskState running again) -> drop the
+    //     wait and follow the new task;
+    //   - everything else (stale pre-Stop phase, idle / waiting / offline fallback) -> ignore, so the
+    //     pending wrap-up is not overridden.
+    if (pendingDone) {
+      const fp = fastPhase.value;
+      const phaseTs = Number(fp && fp.phaseTs) || 0;
+      const active = v && ['thinking', 'tool', 'await', 'dispatch'].includes(v.phase);
+      const newer = Boolean(phaseTs && phaseTs > lastDoneAt);
+      const runningAgain = Boolean(sel && sel.taskState === 'running');
+      if (active && (newer || runningAgain)) {
+        pendingDone = null;
+        clearTimeout(pendingDoneTimer);
+      } else {
+        return;
+      }
     }
     // 同一条会话：收到 Stop（doneAt 新增 / 变化）→ 亮"任务完成"，概要用真实完成内容
     // 这一轮明明还在跑（taskState==='running'，服务端按在飞任务判定，会盖过上一轮残留的 doneAt）：
@@ -477,8 +515,33 @@ watch(
             }),
           ]
         : [said || (cancelled ? t('console.no_output') : t('console.this_task_done'))];
-      if (cancelled) mainAgent.enterCancelled(t('console.cancelled'), ctx);
-      else mainAgent.enterDone(t('console.done'), ctx);
+      const finish = () => {
+        if (cancelled) mainAgent.enterCancelled(t('console.cancelled'), ctx);
+        else mainAgent.enterDone(t('console.done'), ctx);
+      };
+      // When the task is fast, real data has already reported Stop but the office is still playing
+      // "pick up task -> ghost appears -> report". Wait for the whole animation before lighting
+      // "Task done / Task cancelled" so the arc is not swallowed (as long as no new task arrives).
+      if (office && office.flowPending && office.flowPending()) {
+        pendingDone = finish;
+        clearTimeout(pendingDoneTimer);
+        // Safety net: if the animation stalls, never leave the main phase stuck on "waiting"
+        pendingDoneTimer = setTimeout(() => {
+          const f = pendingDone;
+          pendingDone = null;
+          if (f) f();
+        }, FLOW_WAIT_MAX);
+        office.whenFlowIdle(() => {
+          if (pendingDone !== finish) return; // dropped by a new task / session switch
+          pendingDone = null;
+          clearTimeout(pendingDoneTimer);
+          finish();
+        });
+        return;
+      }
+      pendingDone = null;
+      clearTimeout(pendingDoneTimer);
+      finish();
       return;
     }
     // 「任务取消 / 任务完成」刚亮起，不许被同一轮的残留相位盖掉：
@@ -506,8 +569,6 @@ watch(
   { immediate: true }
 );
 
-/** @type {ReturnType<typeof createIsoOffice> | null} */
-let office = null;
 let cardRaf = 0;
 
 /**
@@ -704,11 +765,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(cardRaf);
-  // 只有演示脚本在跑时才 stop()：stop() 会亮「已暂停」摘要，非演示模式下没在演就别弹
+  // Only stop() when the demo script is running: stop() lights a "paused" summary, so don't fire it otherwise
   if (mainAgent.auto) mainAgent.stop();
   stopPhasePoll();
   if (office) office.destroy();
   office = null;
+  // Leaving the view: drop the deferred wrap-up so it never fires on the store after we are gone
+  pendingDone = null;
+  clearTimeout(pendingDoneTimer);
 });
 </script>
 

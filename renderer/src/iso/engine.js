@@ -39,7 +39,6 @@ import {
   PLACES,
   NAV_NODES,
   CONSOLE,
-  CONSOLE_FRONT,
   route,
 } from './officeMap';
 import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from './sprites';
@@ -94,24 +93,37 @@ const GHOST_SPOTS = [
 // 幽灵"留在会议室里"的悬停点（跟右侧街区的整体右移一起挪 0.4，仍落在会议桌上方）
 const GHOST_MEET = { x: 17.4, y: 3.6, z: 2.25 };
 
-/** 小怪物跑到前面后停留 / 对话的时长（秒），之后回工位忙碌 */
+/** Pick-up dialogue: the main console hands over the task and the gremlin answers, in place. Seconds. */
 const DISPATCH_TALK = 3.6;
-/** 收工汇报：小怪物跑到主 agent 面前说出结果摘要的停留时长（秒） */
+/** Finish report: the gremlin says its result summary in place. Seconds. No walk back to the console. */
 const REPORT_TALK = 3.4;
 /**
- * 小幽灵入场：
- *   · **有小怪物对应的**（被召唤实例，name 命中坐工位的小怪物）→ **直接从那只小怪物头顶出现**，
- *     不从大门绕——召唤的看点是"小怪物领了任务回工位、幽灵同时出现在它头顶"，绕门会晚一拍。
- *   · **独立幽灵**（没有同名小怪物，如演示模式的临时成员）→ 从大门外飘进来。门外那一段（gx < 0）
- *     被墙挡着，只有穿过门洞时才看得见，所以"飘进来"是真的从门口出现，不是凭空出现在悬浮点上。
+ * How long the ghost "works" after it appears, before the report plays (ms).
  *
- * 独立幽灵的出发时机：先等**所有小怪物都进了屋**（没有还没露面的、也没有还卡在门洞里的），
- * 再一个接一个出发 —— 演示模式的开场因此是"小怪物一个个走进来坐下，幽灵随后从门口飘进来"。
+ * When the task is very fast (the subagent finishes almost as soon as it is summoned), pick-up and
+ * report would land on the same instant — the viewer never sees the ghost appear and be busy, it
+ * just pops up and reports. A short hold keeps one summon a complete arc:
+ * pick up task -> ghost appears (busy) -> report -> wrap up.
  */
-const GHOST_ENTRY_SPEED = 1.9; // tile/s：从门外飘到悬浮点这一段（比平时溜达快，不然要飘十几秒）
-const GHOST_ENTRY_STAGGER = 420; // 毫秒：同批幽灵一只一只出发，不在门口叠成一坨
-const GHOST_ENTRY_SETTLE = 280; // 毫秒：等了小怪物进屋之后再缓这半拍，两段节奏才分得开
-const GHOST_ENTRY_WAIT_MAX = 5000; // 毫秒：等小怪物的兜底（召唤会打断入场，别把幽灵永远关在门外）
+const REPORT_MIN_WORK = 1500;
+/**
+ * Ghost entry:
+ *   - **Belongs to a gremlin** (a summoned instance whose name matches a seated gremlin) -> **appears
+ *     directly above that gremlin's head**; it does not detour through the door. The point of a summon
+ *     is "the gremlin picks up the task in place and the ghost appears on its head at the same time";
+ *     going through the door would lag by a beat.
+ *   - **Standalone ghost** (no matching gremlin, e.g. the demo's temporary members) -> drifts in from
+ *     outside the door. That stretch (gx < 0) is hidden by the wall and only visible through the door
+ *     opening, so "drifts in" really means it appears at the doorway, not out of thin air on its spot.
+ *
+ * Standalone ghosts start one by one only after **every gremlin is inside** (nobody still waiting to
+ * appear, nobody stuck in the doorway) — so the demo's opening is "gremlins walk in and sit, then
+ * ghosts drift in through the door".
+ */
+const GHOST_ENTRY_SPEED = 1.9; // tile/s: outside-door -> hover spot (faster than idle drift, or it takes ages)
+const GHOST_ENTRY_STAGGER = 420; // ms: same batch leaves one at a time, not piled up at the door
+const GHOST_ENTRY_SETTLE = 280; // ms: a beat after the gremlins are in, so the two rhythms read apart
+const GHOST_ENTRY_WAIT_MAX = 5000; // ms: fallback for waiting on gremlins (a summon interrupts entry; never lock a ghost outside forever)
 /**
  * 入场：小怪物不是凭空出现在工位上，而是一个个从大门进来、走到自己工位坐下。
  * @property {number} ENTER_DELAY 第一批露面前的等待（等画面先亮起来）
@@ -237,19 +249,23 @@ export function createIsoOffice(canvas, opts = {}) {
   let hoverId = '';
   let showPaths = false;
   let manualMeeting = false;
-  /** 召唤编排状态：{ agentId, start, back, task, ghostId, reply } */
+  /** Dispatch state: { agentId, start, talkAt, task, ghostId } (the gremlin talks to the console in place) */
   let dispatch = null;
-  /** 召唤队列：收到召唤 -> 排队走"跑到主 agent 面前领任务"的编排 */
+  /** Dispatch queue: a summon -> queue the "pick up task" beat (dialogue in place, no walking) */
   const summonQueue = [];
-  /** 坐工位小怪物名字 -> { seat, agentId }：把"被召唤的幽灵"对到它的小怪物 */
+  /** Seated gremlin name -> { seat, agentId }: maps a summoned ghost to its gremlin */
   let seatByName = {};
-  /** 汇报编排：subagent 收工 -> 走到主 agent 面前说出结果摘要 -> 回工位，幽灵随后散掉 */
+  /** Report beat: subagent finished -> say the result summary in place, then the ghost disperses */
   let report = null;
-  /** 汇报队列：召唤幽灵写了 result（收工）或直接从名单里消失时入队，一只一只汇报 */
+  /** Report queue: queued when a summoned ghost writes a result (finished) or vanishes from the roster; one at a time */
   const reportQueue = [];
-  /** 汇报期间补画的幽灵：幽灵已从名单里消失、但汇报还没演完时用 */
+  /** Extra ghost drawn during a report, when the real ghost already left the roster */
   let reportGhost = null;
-  /** 正被召唤（幽灵还飘着）的小怪物 agentId：这段时间钉在工位上，不许起身溜达 */
+  /** The ghost "works" until this moment (performance.now ms) before the report may start; see REPORT_MIN_WORK */
+  let reportHoldUntil = 0;
+  /** One-shot callback fired when the whole summon/report arc drains (flowPending() turns false); see whenFlowIdle */
+  let flowIdleCb = null;
+  /** agentId of a gremlin currently being summoned (ghost still floating): pinned to its seat, no wandering */
   const summonedAgentIds = new Set();
 
   let raf = 0;
@@ -350,7 +366,7 @@ export function createIsoOffice(canvas, opts = {}) {
     return String(hit || lines[0] || mainAgent.action || t('office.task_new'));
   }
 
-  /** 入队一次召唤编排（小怪物跑去主 agent 面前领任务）。同一只不重复入队。 */
+  /** Queue a summon beat (the gremlin picks up its task in place). Never queue the same gremlin twice. */
   function enqueueDispatch(agentId, task, ghostId = null) {
     if (!agentId) return;
     if (dispatch && dispatch.agentId === agentId) return;
@@ -358,7 +374,7 @@ export function createIsoOffice(canvas, opts = {}) {
     summonQueue.push({ agentId, task: task || t('office.task_new'), ghostId });
   }
 
-  /** 启动队列里的下一段编排（当前空闲时） */
+  /** Start the next queued beat (when idle) */
   function pumpDispatch() {
     if (dispatch || !summonQueue.length) return;
     const s = summonQueue.shift();
@@ -367,31 +383,32 @@ export function createIsoOffice(canvas, opts = {}) {
     dispatch = {
       agentId: a.memberId,
       start: performance.now(),
-      // sent：是否已出发（等它进门 / 等手上动作收尾再发，别在门口就开走）
-      sent: false,
-      // talkAt：**走到控制台跟前**的时刻，对话从这时才开始计时。
-      // 之前按"出发"计时，走得慢的小怪物还没到就被叫回去了 ——
-      // 于是"走到主 agent 控制台前"这段根本看不见，气泡也在半路上就消失。
+      // talkAt: when it starts talking. The gremlin talks to the main console **in place**, no walk;
+      // wait until it is inside (still entering) so the dialogue does not overlap the entrance.
       talkAt: 0,
-      back: false,
       task: s.task,
       ghostId: s.ghostId || null,
     };
   }
 
-  /** 收尾当前编排：回工位后让"召唤幽灵"出现在头顶，并推进队列 */
+  /** Wrap up the current beat: make the summoned ghost appear above the gremlin and advance the queue */
   function finishDispatch() {
     if (!dispatch) return;
     const ghostId = dispatch.ghostId;
     dispatch = null;
     if (ghostId) revealGhost(ghostId);
     pumpDispatch();
-    // 领到任务、幽灵也现身之后，才轮到"收工汇报"（见 pumpReport 的 dispatch 守卫）——
-    // 这样即便 subagent 收得很快，汇报也会等小怪物回到工位、幽灵现身之后再演，幽灵一定看得见。
+    // Only after the task is picked up and the ghost has appeared does the report come (see pumpReport's
+    // dispatch guard) — so even a very fast subagent still reports while the ghost is visible.
+    // The ghost gets a short "working" beat first (REPORT_MIN_WORK): a fast task still reads as a full arc.
+    if (ghostId) {
+      ensureReportGhost(ghostId);
+      reportHoldUntil = performance.now() + REPORT_MIN_WORK;
+    }
     pumpReport();
   }
 
-  /** 小怪物回到工位：显示之前被隐藏的召唤幽灵（跟别的幽灵一样从大门飘进来，再落到它头顶） */
+  /** Task picked up: show the previously hidden summoned ghost (directly above the gremlin's head) */
   function revealGhost(ghostId) {
     pendingGhostIds.delete(ghostId);
     if (ghosts.some((g) => g.memberId === ghostId)) return;
@@ -401,13 +418,43 @@ export function createIsoOffice(canvas, opts = {}) {
     ghosts.push(makeGhost(m, ghosts.length, info && info.seat));
   }
 
-  /* ------------------------------ 收工汇报 ------------------------------
-   * subagent 干完活：走到主 agent 控制台前说出**结果摘要**（清单里写的 result，
-   * 没写就退回"已完成：<任务名>"），说完回工位坐下，这时幽灵才散掉 ——
-   * 顺序必须是 汇报 → 空闲 → 幽灵消失，不能"主 agent 一收到 stop 就复位"。
+  /**
+   * Draw an extra ghost during a report: this summon's ghost already left the roster (recycled without a
+   * result, or finished faster than the pick-up), but the report is still playing. Draw one above its
+   * gremlin's head and let it disperse after the report, otherwise "the worker vanished first, then
+   * reports itself" looks like a glitch.
+   *
+   * Only when there really is a report for it (queued / playing): when the ghost simply floated and left
+   * without a report, we do not add a lingering ghost out of nowhere.
+   */
+  function ensureReportGhost(ghostId) {
+    if (!ghostId) return;
+    if (reportGhost && reportGhost.id === ghostId) return;
+    if (ghosts.some((g) => g.memberId === ghostId)) return;
+    const hasReport = reportQueue.some((r) => r.ghostId === ghostId) || (report && report.ghostId === ghostId);
+    if (!hasReport) return;
+    const meta = ghostMeta.get(ghostId);
+    if (!meta || !meta.agentId) return;
+    const a = agents.find((x) => x.memberId === meta.agentId);
+    if (!a) return;
+    reportGhost = {
+      id: ghostId,
+      x: a.seat.x + 0.25,
+      y: a.seat.y - 0.15,
+      z: 1.7,
+      color: meta.color || a.color,
+      phase: Math.random() * 6.28,
+      name: meta.name || a.name,
+    };
+  }
+
+  /* ------------------------------ Finish report ------------------------------
+   * The subagent finished: the gremlin says the **result summary** in place (the roster's result,
+   * or "Done: <task>" when missing). No walk back to the console.
+   * Order must be report -> idle -> ghost disperses; never "reset as soon as the main agent sees stop".
    */
 
-  /** 汇报文案：优先结果摘要，没有就退回"已完成：<任务名>" */
+  /** Report text: prefer the result summary, fall back to "Done: <task>" */
   function reportText(r) {
     const res = String((r && r.result) || '').trim();
     if (res) return res;
@@ -415,40 +462,27 @@ export function createIsoOffice(canvas, opts = {}) {
     return task ? t('bubble.done_prefix', { task }) : t('bubble.done');
   }
 
-  /** 入队一次收工汇报（同一轮召唤只报一次） */
+  /** Queue one finish report (only once per summon) */
   function pushReport(ghostId, meta) {
     if (!meta || !meta.agentId) return;
     if (reportQueue.some((r) => r.ghostId === ghostId)) return;
     if (report && report.ghostId === ghostId) return;
     reportQueue.push({ agentId: meta.agentId, ghostId, task: meta.task, result: meta.result });
-    // 幽灵已经不在名单里（没写 result 就被 rm 了）：补一只在工位上方，
-    // 等这轮汇报演完再散，否则"干活的人先没了、再自己汇报"看着像穿帮。
-    if (!reportGhost && !ghosts.some((g) => g.memberId === ghostId)) {
-      const a = agents.find((x) => x.memberId === meta.agentId);
-      if (a) {
-        reportGhost = {
-          id: ghostId,
-          x: a.seat.x + 0.25,
-          y: a.seat.y - 0.15,
-          z: 1.7,
-          color: meta.color || a.color,
-          phase: Math.random() * 6.28,
-          name: meta.name || a.name,
-        };
-      }
-    }
     pumpReport();
   }
 
   function pumpReport() {
-    // 「领任务」编排还没走完就先不汇报：subagent 可能收得比小怪物走到控制台还快，
-    // 这时若立刻开演汇报，小怪物会一边往控制台走去领任务、一边又去汇报（同一只被两段编排抢）。
-    // 等 finishDispatch（回工位 + 幽灵现身）再开演，幽灵也才一定看得见。
+    // Do not report while the "pick up task" beat is still running: a subagent can finish faster than the
+    // gremlin picks up its task, and reporting then would speak before the ghost has even appeared.
+    // Wait for finishDispatch (ghost appears).
     if (report || dispatch || !reportQueue.length) return;
+    // The ghost just appeared; let it "work" this short beat (see REPORT_MIN_WORK in finishDispatch)
+    if (performance.now() < reportHoldUntil) return;
     const r = reportQueue.shift();
     const a = agents.find((x) => x.memberId === r.agentId);
     if (!a) return;
-    report = { ...r, start: performance.now(), sent: false, talkAt: 0, back: false };
+    report = { ...r, start: performance.now(), talkAt: 0 };
+    ensureReportGhost(r.ghostId);
   }
 
   function finishReport() {
@@ -467,8 +501,30 @@ export function createIsoOffice(canvas, opts = {}) {
     pumpReport();
   }
 
-  /** 这只小怪物此刻是否正被召唤（清单里有它的实例幽灵） */
+  /** Is this gremlin currently being summoned (its instance ghost is on the roster)? */
   const isSummoned = (agentId) => summonedAgentIds.has(agentId);
+
+  /**
+   * Should the main console's "Task done" wait? True while a summon / report beat is running or queued.
+   *
+   * When the task is fast, real data reports "finished" first while the office still has to play
+   * "pick up task -> ghost appears -> report". If the main phase jumped to "Task done" immediately the
+   * whole animation would be swallowed. The view defers the wrap-up to the whenFlowIdle() callback
+   * (see IsoOfficeView).
+   */
+  function flowPending() {
+    return Boolean(dispatch || report || summonQueue.length || reportQueue.length || pendingGhostIds.size);
+  }
+
+  /**
+   * Run cb once the beats drain: fire immediately when nothing is running, otherwise remember it and
+   * call it when flowPending() turns false (see tick). Only one callback is kept; a later one replaces it.
+   */
+  function whenFlowIdle(cb) {
+    if (typeof cb !== 'function') return;
+    if (!flowPending()) { cb(); return; }
+    flowIdleCb = cb;
+  }
 
   /**
    * 主 agent 进入 dispatch 相位（mock / 真实）时，也让对应小怪物走同一套编排。
@@ -618,8 +674,8 @@ export function createIsoOffice(canvas, opts = {}) {
     for (const id of [...dispatchedGhostIds]) if (!gIds.has(id)) dispatchedGhostIds.delete(id);
     for (const id of [...pendingSeenOnce]) if (!gIds.has(id)) pendingSeenOnce.delete(id);
 
-    // 召唤幽灵从名单里消失 = 这次召唤结束。之前没汇报过（清单里没写 result 就被 rm）
-    // 的，补一次"回主 agent 面前汇报"，免得它无声无息地没了。
+    // A summoned ghost vanishing from the roster = this summon is over. If it never reported
+    // (recycled with no result written), queue one last in-place report so it does not just disappear.
     for (const [id, meta] of [...ghostMeta]) {
       if (gIds.has(id)) continue;
       ghostMeta.delete(id);
@@ -641,8 +697,8 @@ export function createIsoOffice(canvas, opts = {}) {
       // 幽灵名字若等于某个坐工位小怪物的名字，说明这是"某只小怪物被召唤"的实例幽灵。
       const info = m.ghost ? byName[m.name] : null;
       if (info && !summonedGhostIds.has(m.memberId)) {
-        // 收到召唤（含页面刷新时已在跑的）：先隐藏这只幽灵，稍后入队走
-        // "跑到主 agent 面前领任务 -> 回工位"的编排。
+        // Summoned (including one already running on page refresh): hide this ghost first, then queue the
+        // "pick up task in place -> ghost appears" beat.
         summonedGhostIds.add(m.memberId);
         pendingGhostIds.add(m.memberId);
       }
@@ -713,6 +769,15 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   const goHome = (a) => goTo(a, a.seat, 'sit');
+
+  /**
+   * Turn a speaking-in-place gremlin toward the main console (by x: console center is x≈7.1, see
+   * officeMap's CONSOLE). An iso sprite only faces left or right, so this is the best approximation
+   * of "facing the console side".
+   */
+  function faceConsole(a) {
+    a.facing = a.x < CONSOLE.seat.x ? 1 : -1;
+  }
 
   const WANDER = [
     { x: 6.9, y: 5.4 },
@@ -2541,60 +2606,33 @@ export function createIsoOffice(canvas, opts = {}) {
     });
   }
 
-  /** 召唤编排推进：出发 -> 走到控制台跟前 -> 对话 -> 回工位，回到工位后收尾 */
+  /**
+   * Dispatch beat: the gremlin talks to the main console **in place** (picks up its task) — no walk
+   * over and no walk back. Wrap up when the dialogue ends (ghost appears). Wait until it is inside so
+   * the dialogue does not overlap the entrance.
+   */
   function stepDispatch(now) {
     if (!dispatch) return;
     const a = agents.find((x) => x.memberId === dispatch.agentId);
     if (!a) { finishDispatch(); return; }
-    // 还没进门 / 还没落座：等它出现再往控制台走（在门口就开走会瞬移）
-    if (!dispatch.sent) {
-      if (a.entering) return;
-      goTo(a, CONSOLE_FRONT, 'stand');
-      dispatch.sent = true;
-      return;
-    }
-    if (!dispatch.back) {
-      if (!a.moving && !a.path.length) {
-        // 到了控制台跟前才开始对话：走得远的小怪物也能把"走过去"演完整
-        if (!dispatch.talkAt) dispatch.talkAt = now;
-        else if (now - dispatch.talkAt >= DISPATCH_TALK * 1000) {
-          dispatch.back = true;
-          goHome(a);
-        }
-      }
-      a.facing = -1; // 站位在控制台右侧（见 officeMap 的 CONSOLE_FRONT），翻转过来即面向左边那台控制台
-    } else if (!a.moving && !a.path.length && Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
-      // 已回到工位：让召唤幽灵出现在头顶，收尾本次编排
-      finishDispatch();
-      return;
-    }
+    if (a.entering) return; // still walking in from outside: wait until it is visible
+    if (!dispatch.talkAt) { dispatch.talkAt = now; return; } // start talking this frame
+    faceConsole(a);
+    if (now - dispatch.talkAt >= DISPATCH_TALK * 1000) finishDispatch();
   }
 
-  /** 收工汇报推进：走到控制台跟前 -> 说出结果摘要 -> 回工位 -> 幽灵散掉 */
+  /** Report beat: the gremlin says the result summary **in place**, then the ghost disperses. No walk back. */
   function stepReport(now) {
-    if (!report) return;
+    // Try every frame even when no report is playing: after the REPORT_MIN_WORK hold expires nothing else
+    // wakes pumpReport, so this is what releases a queued report (see finishDispatch).
+    if (!report) { pumpReport(); return; }
     const a = agents.find((x) => x.memberId === report.agentId);
     if (!a) { finishReport(); return; }
-    if (!report.sent) {
-      if (a.entering) return;
-      goTo(a, CONSOLE_FRONT, 'stand');
-      report.sent = true;
-      return;
-    }
-    if (!report.back) {
-      if (!a.moving && !a.path.length) {
-        if (!report.talkAt) report.talkAt = now;
-        else if (now - report.talkAt >= REPORT_TALK * 1000) {
-          report.back = true;
-          goHome(a);
-        }
-      }
-      a.facing = -1; // 同 stepDispatch：站在控制台右侧，面向左边的控制台
-    } else if (!a.moving && !a.path.length && Math.hypot(a.x - a.seat.x, a.y - a.seat.y) < 0.15) {
-      finishReport();
-      return;
-    }
+    if (a.entering) return;
+    if (!report.talkAt) { report.talkAt = now; return; }
+    faceConsole(a);
     if (reportGhost) reportGhost.phase = (now - t0) / 780;
+    if (now - report.talkAt >= REPORT_TALK * 1000) finishReport();
   }
 
   /** 临时小幽灵精灵（自带漂浮 + 状态点）：召唤时 / 汇报期间共用 */
@@ -2670,6 +2708,13 @@ export function createIsoOffice(canvas, opts = {}) {
     stepGhosts(dt, now);
     stepDispatch(now);
     stepReport(now);
+    // The whole summon/report arc drained -> fire the waiting callback once (the main console's
+    // "Task done" is deferred until after the animation; see IsoOfficeView).
+    if (flowIdleCb && !flowPending()) {
+      const cb = flowIdleCb;
+      flowIdleCb = null;
+      cb();
+    }
     draw(now);
     raf = requestAnimationFrame(tick);
   }
@@ -2812,8 +2857,8 @@ export function createIsoOffice(canvas, opts = {}) {
       pushHit('__report_ghost', s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);
     }
 
-    // 召唤对话气泡（屏幕空间，压在最上面）：主 agent 交代任务 -> 小怪物答"收到"
-    // 计时从**走到控制台跟前**（talkAt）开始，没到之前一个字都别说。
+    // Summon dialogue bubbles (screen space, on top): the main console hands over the task, the gremlin
+    // answers "Got it" in place. Timing starts at **talkAt** (when it opens its mouth); nothing before.
     if (dispatch) {
       const a = agents.find((x) => x.memberId === dispatch.agentId);
       const el = dispatch.talkAt ? (now - dispatch.talkAt) / 1000 : -1;
@@ -2830,7 +2875,7 @@ export function createIsoOffice(canvas, opts = {}) {
       }
     }
 
-    // 收工汇报气泡：小怪物站在主 agent 面前说结果摘要
+    // Finish report bubble: the gremlin says the result summary in place (at its desk)
     if (report) {
       const a = agents.find((x) => x.memberId === report.agentId);
       const el = report.talkAt ? (now - report.talkAt) / 1000 : -1;
@@ -3041,6 +3086,10 @@ export function createIsoOffice(canvas, opts = {}) {
     lastResult(id) {
       return lastResults.get(id) || null;
     },
+    /** Office still has a summon / report beat running or queued: the main console's "Task done" defers; see whenFlowIdle */
+    flowPending,
+    /** Call back once the beats drain (immediately when idle): defers the main console wrap-up until after the animation */
+    whenFlowIdle,
     /** 主 Agent 控制台：{ phase, action, context[], target }（现在由 mock 驱动，以后接 hook 事件） */
     setMainAgent(s) {
       const prev = mainAgent;
