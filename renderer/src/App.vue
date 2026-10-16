@@ -27,12 +27,14 @@ const council = useCouncilStore();
 const { t } = useI18n();
 
 /**
- * 电梯过渡：状态机是模块级单例，主舞台（门）与左栏（轿厢 / 高亮）共用同一个实例。
- * 切楼层改走 request()：换脸（selectFloor）由它在关门 70% 处提交（设计 §2 段 1）。
+ * Elevator transition: the state machine is a module-level singleton, shared by the main stage
+ * (the door) and the left column (car / highlight).
+ * Floor switching goes through request(): the face change (selectFloor) is committed by it at 70%
+ * of the door close (design §2 segment 1).
  */
 const { phase, motionMode, flash, request: requestFloor, settleElevator } = useElevator();
 
-/** 支持 ?tab=lab 直接进入工位设计台（调造型时用） */
+/** Supports ?tab=lab to jump straight into the workstation design bench (for tuning shapes) */
 const initialTab = (() => {
   try {
     return new URLSearchParams(location.search).get('tab') || 'office';
@@ -44,37 +46,43 @@ const tab = ref(initialTab);
 const selectedId = ref('');
 
 /**
- * 「不是电梯场景」的那几页（任务记录、议事厅）：左边楼层胶囊、右上会话下拉与全屏都收掉。
- * 收到这里是因为这几个条件本来散在四处（楼层胶囊 / 会话下拉 / 全屏按钮 / 门楣液晶屏），
- * 每加一个页面就要记得改四遍，漏一处就会出现"页面收干净了、门楣还挂着一层楼"。
- * 工位卡片**不**算：它还要切楼层看，所以保留楼层胶囊和会话下拉。
+ * The pages that are "not an elevator scene" (task records, council): the left floor pills, the
+ * top-right session dropdown and fullscreen are all hidden.
+ * They are collected here because these conditions used to be scattered in four places (floor
+ * pills / session dropdown / fullscreen button / lintel LCD), so every new page meant remembering
+ * to change all four —— miss one and you get "the page is tidy but the lintel still hangs a floor".
+ * The workstation card **does not** count: it still switches floors to look at, so it keeps the
+ * floor pills and the session dropdown.
  */
 const bareTab = computed(() => tab.value === 'conversation' || tab.value === 'council');
 
 /**
- * 全屏（专注）模式：只留主舞台（办公室场景，也就是主 Agent 控制台那块屏），
- * 收掉左边楼层胶囊和顶栏所有控件（连接条 + 页签 + 会话下拉）；
- * 同时切**原生**全屏，把窗口标题栏 / 边框 / 菜单栏一起去掉（见 api/bridge 的 setFullScreen）。
+ * Fullscreen (focus) mode: keep only the main stage (the office scene, i.e. the main Agent console
+ * screen), hide the left floor pills and every top-bar control (connection bar + tabs + session
+ * dropdown); also switch the **native** fullscreen, dropping the window title bar / frame / menu
+ * bar together (see setFullScreen in api/bridge).
  *
- * 出口三条，保证任何时候都能回来：右上角那个半透明浮起按钮、Esc、再按一次 F
- *（系统自己退出全屏 —— F11 / 手势 / macOS 菜单 —— 也会被同步回来）。
- * 从非办公室页签进全屏时先切回办公室（要的就是主屏幕），退出再还回原来那个页签。
+ * Three exits, so you can always get back: the translucent floating button in the top-right
+ * corner, Esc, and pressing F again (the system leaving fullscreen on its own —— F11 / a gesture /
+ * the macOS menu —— is synced back too).
+ * Entering fullscreen from a non-office tab first returns to the office (that is the screen you
+ * want), and leaving it restores the previous tab.
  */
 const fullscreen = ref(false);
-/** 进全屏前的页签（见 enterFullscreen） */
+/** The tab from before entering fullscreen (see enterFullscreen) */
 let tabBeforeFs = '';
-/** 原生全屏订阅的退订函数 */
+/** Unsubscribe function for the native-fullscreen subscription */
 let stopNativeFs = null;
-/** true = 这次切换是我们自己发起的，原生事件回灌时别再处理一次 */
+/** true = this switch was initiated by us, so do not handle it again when the native event comes back */
 let fsSyncing = false;
 
-/** 连带切换原生全屏：拿不到（纯浏览器 dev 无 Electron）也不影响应用内专注模式 */
+/** Also switch native fullscreen: not getting it (plain browser dev, no Electron) does not affect the in-app focus mode */
 async function applyNativeFullscreen(on) {
   fsSyncing = true;
   try {
     await setFullScreen(on);
   } catch {
-    /* 忽略：窗口外壳还在，界面已经全屏了 */
+    /* ignore: the window chrome is still there, but the UI is already fullscreen */
   } finally {
     fsSyncing = false;
   }
@@ -105,7 +113,7 @@ function toggleFullscreen() {
   else enterFullscreen();
 }
 
-/** 键盘：F 进/出全屏，Esc 只出。输入框里打字时不抢键 */
+/** Keyboard: F toggles fullscreen, Esc only exits. Do not steal keys while typing in an input */
 function onKeydown(e) {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const t = e.target;
@@ -134,21 +142,23 @@ async function refreshMessages() {
     const data = await res.json();
     if (data && data.ok && data.snapshot) msgs.setSnapshot(data.snapshot.recentMessages || []);
   } catch {
-    /* 忽略：WS 重连后会重新推 snapshot */
+    /* ignore: the snapshot is pushed again after the WS reconnects */
   }
 }
 
-/** 选中/取消选中工位：同步把对话抽屉过滤到该成员 */
+/** Select/deselect a workstation: filter the conversation drawer to that member at the same time */
 function selectDesk(id) {
   selectedId.value = selectedId.value === id ? '' : id;
   msgs.setFilters({ members: selectedId.value ? [selectedId.value] : [] });
 }
 
 /**
- * 会话下拉的内容：演示模式下换成**唯一一项**「演示工程 · 演示会话」。
+ * The session dropdown's contents: in demo mode it is replaced by the **single** entry "demo
+ * project · demo session".
  *
- * 为什么不把真会话继续列着：演示不是任何一条真会话 —— 列着既点不动（演示期间不切工程，
- * 见 IsoOfficeView 的演示保护），又和"项目：演示工程"打架。要退出演示走 HUD 的「退出演示」。
+ * Why not keep listing real sessions: a demo is not any real session —— listing them makes them
+ * unclickable (the project does not switch during a demo, see IsoOfficeView's demo guard) and
+ * clashes with "project: demo project". To leave the demo, use the HUD's "exit demo".
  */
 const DEMO_SESSION_ID = '__demo__';
 const sessionItems = computed(() =>
@@ -165,13 +175,13 @@ const sessionItems = computed(() =>
 const sessionValue = computed(() => (project.demo ? DEMO_SESSION_ID : sessions.selectedId));
 const sessionEmptyLabel = computed(() => (project.demo ? t('session.demo_session') : sessions.emptyLabel));
 
-/** 选中会话：演示期间不切（要退出演示请走 HUD 的按钮） */
+/** Select a session: not switched during a demo (to leave the demo use the HUD button) */
 function selectSession(id) {
   if (project.demo) return;
   sessions.select(id);
 }
 
-/** 相位来源徽标：演示时说"演示脚本"，别拿真会话的"上报真值 / 推断值"冒充 */
+/** Phase-source badge: say "demo script" during a demo; do not pass off a real session's "reported / inferred" */
 const phaseSource = computed(() => {
   if (project.demo) return 'demo';
   const sel = sessions.selected;
@@ -180,9 +190,10 @@ const phaseSource = computed(() => {
 });
 
 /**
- * 对话记录跟着"当前在看哪一层"走：
- *   - 空楼层 → 清空（这层没会话，也不该留着上一层的对话）；
- *   - 切到有会话的楼层 / 会话换了工程 → 按新工程重新拉一批。
+ * The conversation log follows "which floor you are currently viewing":
+ *   - empty floor -> clear (this floor has no session, and the previous floor's conversation
+ *     should not linger);
+ *   - switching to a floor with sessions / the session changing project -> refetch a batch for the new project.
  */
 watch(
   () => (sessions.floorEmpty ? '' : (project.project && project.project.name) || ''),
@@ -192,12 +203,13 @@ watch(
   }
 );
 
-/** 选中的会话变了 → 由 IsoOfficeView 的主控制台负责（严格跟随所选会话，办公室布局不动） */
+/** The selected session changed -> handled by IsoOfficeView's main console (strictly follows the selected session; the office layout does not move) */
 
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown);
-  // 系统自己改了原生全屏（F11 / 手势 / macOS 菜单）→ 应用内同步，
-  // 否则会停在"窗口已经不是全屏，界面却还挂着没有出口按钮的专注态"。
+  // The system changed native fullscreen itself (F11 / gesture / macOS menu) -> sync it in-app,
+  // otherwise you get stuck in "the window is no longer fullscreen but the UI still hangs a focus
+  // state with no exit button".
   stopNativeFs = onFullScreen((on) => {
     if (fsSyncing) return;
     if (on) enterFullscreen();
@@ -205,21 +217,21 @@ onMounted(async () => {
   });
   await project.init((msg) => {
     if (msg.type === WS_EVENTS.MESSAGE_NEW) msgs.push(msg.payload);
-    // 空楼层不收快照：否则服务端推来的那份（还是上一个工程的）会把刚清空的对话又填回去
+    // An empty floor accepts no snapshot: otherwise the server-pushed one (still from the previous project) would refill the conversation just cleared
     if (msg.type === WS_EVENTS.SNAPSHOT && !sessions.floorEmpty) msgs.setSnapshot(msg.payload.recentMessages || []);
-    // 会话（开/关工程·会话）实时推送：立即刷新楼层与下拉，不等 10s 轮询
+    // Sessions (project/session open-close) are pushed live: refresh the floors and dropdown immediately instead of waiting for the 10s poll
     if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
-    // 议事厅：发起 / 逐轮发言 / 判票 / 收尾。project 传 null 广播，与工程无关
+    // Council: start / round-by-round speech / vote count / wrap up. project is null to broadcast, independent of the project
     if (msg.type === WS_EVENTS.COUNCIL) council.applyEvent(msg.payload);
   });
   await refreshMessages();
   await sessions.refresh(project.serverInfo || {});
   sessions.startPolling(project.serverInfo || {});
-  // 议事厅入口要知道"有没有楼层请得动"才好决定按钮点不点得动（拉不到就照常可点，页面里说原因）
+  // The council entry needs to know "whether any floor can be summoned" to decide if the button is clickable (if it cannot be fetched, keep it clickable and explain on the page)
   await council.fetchFloors();
 });
 
-// 切过去时拉一次历史：这期间在别处开的会不该等页面刷新才出现
+// Fetch history once when switching over: a council started elsewhere meanwhile must not wait for a page refresh to appear
 watch(tab, (v) => {
   if (v === 'council') council.fetchList();
 });
@@ -227,7 +239,7 @@ watch(tab, (v) => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown);
   if (stopNativeFs) stopNativeFs();
-  // 卸载时把在途那一趟收尾（设计 §8.1：不允许留下"门关到一半"的状态）
+  // Finish the in-flight trip on unmount (design §8.1: a "door closed halfway" state must not be left behind)
   settleElevator();
   sessions.stopPolling();
   project.dispose();
@@ -235,17 +247,18 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- data-motion 挂在根部：它要同时罩住左栏（轿厢）和主舞台（门）—— 挂 .stage 就罩不到左栏 -->
+  <!-- data-motion sits on the root: it has to cover both the left column (car) and the main stage (door) —— on .stage it would not cover the left column -->
   <div class="app" :class="{ fullscreen }" :data-motion="motionMode">
-    <!-- 全屏：顶栏整条收掉（页签 + 会话下拉）。全屏切换按钮在办公室 HUD 的「演示模式」那一行
-         （IsoOfficeView 的 .hud），收掉顶栏也不会丢出口，且不会落到滚动屏右边。
-         连接 / 相位来源 在办公室左下角说明条里（IsoOfficeView 的 .tip）。 -->
+    <!-- Fullscreen: the whole top bar is hidden (tabs + session dropdown). The fullscreen toggle
+         button is on the office HUD's "demo mode" row (IsoOfficeView's .hud), so hiding the top bar
+         loses no exit and does not fall to the right of the marquee screen.
+         Connection / phase source live in the office's bottom-left caption bar (IsoOfficeView's .tip). -->
     <nav v-if="!fullscreen" class="tabs">
       <div class="tabs-group">
         <button :class="{ on: tab === 'office' }" @click="tab = 'office'">{{ t('nav.office') }}</button>
         <button :class="{ on: tab === 'workstation' }" @click="tab = 'workstation'">{{ t('nav.workstation') }}</button>
         <button :class="{ on: tab === 'conversation' }" @click="tab = 'conversation'">{{ t('nav.records') }}</button>
-        <!-- 议事厅：一层 CLI 都没装时不留死入口 —— 按钮禁用，title 里说清为什么 -->
+        <!-- Council: no dead entry when no CLI is installed on any floor —— the button is disabled, and the title explains why -->
         <button
           :class="{ on: tab === 'council' }"
           :disabled="!council.canStart"
@@ -266,8 +279,8 @@ onUnmounted(() => {
     </nav>
 
     <main class="body">
-      <!-- 楼层：一层一个受监控的智能体；状态点绿 = 这一层有活跃会话。
-           任务记录页不需要井道（不是电梯场景），去掉左边胶囊楼层 -->
+      <!-- Floors: one monitored agent per floor; a green status dot = this floor has an active session.
+           The task-records page needs no shaft (it is not an elevator scene), so the left floor pills are dropped -->
       <FloorSelector
         v-if="!fullscreen && !bareTab"
         :products="sessions.floors"
@@ -291,7 +304,7 @@ onUnmounted(() => {
             @select="selectDesk"
             @toggle-fullscreen="toggleFullscreen"
           />
-          <!-- 旧的 2D 正视场景，?tab=flat 还能进，用来和新场景对比 -->
+          <!-- The old 2D front view; ?tab=flat still enters it, for comparing with the new scene -->
           <OfficeSceneView
             v-else-if="tab === 'flat'"
             :selected-id="selectedId"
@@ -329,13 +342,13 @@ onUnmounted(() => {
   border-color: var(--accent);
 }
 
-/* 禁用态要看得出来还是"点不动"，不是"坏了"：压暗 + 问号光标 + title 说明原因 */
+/* The disabled state should read as "not clickable", not "broken": dim it + a not-allowed cursor + a title explaining why */
 .tabs button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
 
-/* 顶栏左右两组：页签在左、设置等在右，各占自己内容宽（不撑开） */
+/* The top bar's two groups: tabs on the left, settings etc. on the right; each takes its own content width (no stretching) */
 .tabs-group {
   display: flex;
   align-items: center;
@@ -360,9 +373,10 @@ onUnmounted(() => {
   padding: 12px;
 }
 
-/* ------------------------------ 全屏（专注）模式 ------------------------------
- * 主舞台吃满整窗：去掉舞台留白，连场景自己的边框/圆角一起收掉（那是子组件的根元素，
- * 用 :deep 才够得着）。左栏与顶栏是 v-if 收的，这里不用管。
+/* ------------------------------ Fullscreen (focus) mode ------------------------------
+ * The main stage fills the whole window: drop the stage padding and the scene's own border /
+ * radius too (that is the child component's root element, reachable only with :deep). The left
+ * column and top bar are removed by v-if, so no need to touch them here.
  */
 .app.fullscreen .stage {
   padding: 0;
@@ -373,8 +387,9 @@ onUnmounted(() => {
   border-radius: 0;
 }
 
-/* 门楣（楼层屏那片）与画布是同一块板的上下两段：全屏时画布顶满，
-   它也得跟着去掉外圈留白与边框，否则画布贴边了、上面还悬着一块圆角板。 */
+/* The lintel (the floor-screen strip) and the canvas are the top and bottom halves of the same
+   board: in fullscreen the canvas fills the edge, so it must drop its outer padding and border too,
+   otherwise the canvas is flush while a rounded board still hangs above. */
 .app.fullscreen :deep(.lintel) {
   margin: 0;
   border: 0;
