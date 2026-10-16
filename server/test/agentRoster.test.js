@@ -101,6 +101,21 @@ ok('markActive 后 isDefined 仍为真（只是不再心跳）', roster.isDefine
 roster.markIdle('leo');
 ok('markIdle 后仍定义', roster.isDefined('leo'));
 
+console.log('\n[4] 召唤 → 工位忙碌；收工 → 回到在线（回归：被召唤的小怪物状态仍是空闲）');
+{
+  // The ghost is the one doing the work, but the resident workstation must mirror its state
+  // (busy while the summon runs, back to online once it ends) -- otherwise the office card shows
+  // "idle" while a gremlin is out on a task.
+  const leoId = (repo.getMember.get('leo@p1') || {}).id;
+  const leoState = () => (leoId ? (repo.getStatus.get(leoId) || {}).state : null);
+  bus.setGhostRoster(roster);
+  ok('召唤前 leo 在线', leoState() === 'online', String(leoState()));
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', task: '写文档', id: 'gl1' });
+  ok('召唤后 leo 忙碌（幽灵在干活的镜像）', leoState() === 'busy', String(leoState()));
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', id: 'gl1', result: '写完' });
+  ok('收工后 leo 回到在线（幽灵散场复位）', leoState() === 'online', String(leoState()));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 close();
 fs.rmSync(TMP, { recursive: true, force: true });

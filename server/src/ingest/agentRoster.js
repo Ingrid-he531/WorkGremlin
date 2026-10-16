@@ -142,10 +142,22 @@ function createAgentRoster(opts) {
     act.delete(name);
   }
 
-  /** Summoned: the roster stops heartbeating this workstation (a summon sets it busy). */
+  /**
+   * Summoned: mark the workstation **busy** (the ghost is the one working) and stop the roster
+   * heartbeat from overwriting it back to online. The busy/idle mirror must be symmetric with
+   * markIdle: without the busy write the resident would show idle while a summoned ghost runs.
+   */
   function markActive(name) {
-    const { act } = state(getProject());
-    act.set(String(name || '').trim(), Date.now());
+    name = String(name || '').trim();
+    if (!name) return;
+    const project = getProject();
+    const { act } = state(project);
+    act.set(name, Date.now());
+    try {
+      bus.heartbeat({ project, memberId: name, state: 'busy', progress: null, files: [] });
+    } catch {
+      /* ignore */
+    }
   }
 
   /** Summon finished: reset the workstation to online and stop tracking the name as active. */
