@@ -73,7 +73,7 @@ function ok(label, cond, extra = '') {
     const st = calls.find((c) => c[0] === 'setStatus');
     ok('[2] UserPromptSubmit 落到 startTask', !!start);
     ok('[2] 任务标题取用户原话', start && start[1].title === '帮我写个函数', start && start[1].title);
-    ok('[2] 相位 thinking', st && st[1].state === 'thinking');
+    ok('[2] 成员状态 busy（"思考中"属于 busy，细分在相位）', st && st[1].state === 'busy');
     ok('[2] 本轮 taskId 记入会话状态', d.sessionGet('11111111-1111-4111-8111-111111111111') && d.sessionGet('11111111-1111-4111-8111-111111111111').taskId === 't_generated');
     ok('[2] 返回 handled: UserPromptSubmit', r && r.handled === 'UserPromptSubmit');
   }

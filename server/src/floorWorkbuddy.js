@@ -57,4 +57,4 @@ async function handleHookEvent(ev, ctx) {
   return runHookEvent(ev, ctx, workbuddyImpl);
 }
 
-module.exports = { id: '2F', meta, handleHookEvent, agentDirs, syncAgents: makeAgentSync(agentDirs, meta.agent) };
+module.exports = { meta, handleHookEvent, agentDirs, syncAgents: makeAgentSync(agentDirs, meta.agent) };

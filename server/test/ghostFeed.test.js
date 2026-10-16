@@ -21,6 +21,14 @@ const { createIngestBus } = require('../src/ingest/bus');
 
 let pass = 0;
 let fail = 0;
+/** Busy-wait until the wall clock reaches the next millisecond: makes "ended before/after the summon"
+ *  deterministic instead of depending on whether two calls landed in the same ms. */
+function nextMs() {
+  const t = Date.now();
+  while (Date.now() === t) {
+    /* spin */
+  }
+}
 function ok(label, cond, extra = '') {
   if (cond) {
     pass += 1;
@@ -76,6 +84,7 @@ console.log('\n[5] gcGhosts：父任务收工才散；召唤前就已收工的�
   // (a) 父任务先收工、再召唤（模拟"被顶掉的孪生任务 / 陈旧 parentTaskId"）→ 不该被误散
   const deadMain = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '旧的一轮', client: 'codebuddy' }).taskId;
   bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: deadMain, state: 'cancelled' });
+  nextMs(); // the summon must land strictly after the parent's end (not in the same ms)
   bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's4', name: 'D', id: 'd1', parentTaskId: deadMain });
   bus.gcGhosts();
   ok('父任务在召唤前就已取消 → 幽灵留着（别把还在跑的 subagent 误散）', !!member('subagent-D'));
@@ -84,6 +93,7 @@ console.log('\n[5] gcGhosts：父任务收工才散；召唤前就已收工的�
   // (b) 父任务还在跑 → 留着；随后收工 → 散
   bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's3', name: 'C', id: 'c1', parentTaskId: main });
   ok('父任务还在跑时不散', bus.gcGhosts() === 0 && !!member('subagent-C'));
+  nextMs(); // the parent must end strictly after the summon started (not in the same ms)
   bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: main, state: 'cancelled' });
   ok('父任务在召唤后收工 → 散场', bus.gcGhosts() >= 1 && !member('subagent-C'));
 }

@@ -18,7 +18,7 @@ const project = useProjectStore();
 
 /** 异常优先：保证阻塞/忙碌的成员一定在首屏 */
 const desks = computed(() => {
-  const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
+  const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
   return project.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
 });
 </script>

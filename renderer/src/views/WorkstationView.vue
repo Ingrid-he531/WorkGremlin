@@ -21,7 +21,7 @@ function isMainAgent(m) {
 }
 
 const sorted = computed(() => {
-  const order = ['blocked', 'busy', 'thinking', 'online', 'idle', 'offline'];
+  const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
   // 与办公室同一口径：按当前楼层的客户端过滤（client 为空的视作通用）
   const want = sessions.selectedClient;
   // 所有楼层的 client 都认一遍：合并楼层（1F CodeBuddy = CLI + Plugin）要把两种变体都收进来，
@@ -52,8 +52,10 @@ const sorted = computed(() => {
  */
 const MAIN_STATE_OF_PHASE = {
   tool: 'busy',
-  await: 'busy',
-  thinking: 'thinking',
+  // awaiting permission → the member is blocked (waiting on an external subject), see requirements §5.6
+  await: 'blocked',
+  // the phase axis distinguishes "thinking" from "calling a tool"; both are the member state `busy`
+  thinking: 'busy',
   blocked: 'blocked',
   idle: 'idle',
   done: 'idle',

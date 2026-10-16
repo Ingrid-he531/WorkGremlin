@@ -5,15 +5,19 @@
  * **上一条已经收工**的任务。照着显示就会「明明空闲，屏幕上却挂着当前任务、已耗时还在走」
  * （用户实测抓出来的：主代理状态空闲，卡片上仍是上一个任务的标题 + 一直在涨的已耗时）。
  *
- * 所以「当前任务」= 任务还没收工（没有 endedAt）**且** 成员确实在干活（busy / thinking / blocked）。
+ * 所以「当前任务」= 任务还没收工（没有 endedAt）**且** 成员确实在干活（busy / blocked）。
  * idle / online / offline 一律算空闲 —— 那里显示的应该是「上一个任务在多久以前」（lastTaskAt）。
  */
 // 显式写 /index.js：这个文件被 renderer/test 的 node 脚本直接 import，Node 不会补扩展名
 import { t } from '../i18n/index.js';
 import { isEphemeralMember } from './ephemeral.js';
 
-/** 算在干活的相位：与主控制台"在不在跑"的口径一致（见 iso/mainConsole.js 的 PHASES.busy） */
-export const WORKING_STATES = ['busy', 'thinking', 'blocked'];
+/**
+ * 算在干活的相位：与主控制台"在不在跑"的口径一致（见 iso/mainConsole.js 的 PHASES.busy）。
+ * 注意成员状态里**没有** `thinking` —— "思考中 / 等模型返回"属于 `busy`（见 shared 的 AGENT_STATES）；
+ * 主控制台那个"思考中 vs 调用工具"是 **phase** 轴的事，不是成员状态。
+ */
+export const WORKING_STATES = ['busy', 'blocked'];
 
 /** 这个成员现在在不在干活 */
 export function isWorking(member) {
@@ -21,15 +25,19 @@ export function isWorking(member) {
 }
 
 /**
- * 状态牌只有两档文案：在干活 → 忙碌，其余 → 空闲。
- * 用户 2026-09-30 的要求：主代理 / 子代理卡片右上角只显示「空闲 / 忙碌」，不要 5 种细分状态。
+ * 状态牌三档文案：阻塞 / 忙碌 / 空闲。
+ * blocked → 阻塞（等外部依赖）；busy → 忙碌；其余（idle / online / offline / unreported）→ 空闲。
+ * 5 种细分状态仍不逐一显示（用户 2026-09-30 只保留空闲/忙碌），但 blocked 单独一档 ——
+ * 它承载的信息（"卡住了、在等谁"）和忙碌不是一回事（见 requirements §5.6）。
  */
 export function statusLabel(state) {
+  if (state === 'blocked') return t('card.status.blocked');
   return WORKING_STATES.includes(state) ? t('card.status.busy') : t('card.status.idle');
 }
 
 /** 状态牌的色调（那个小圆点）：与文案同源，避免出现"绿色点 + 空闲"这种自相矛盾 */
 export function statusTone(state) {
+  if (state === 'blocked') return 'blocked';
   return WORKING_STATES.includes(state) ? 'busy' : 'idle';
 }
 

@@ -1258,7 +1258,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       project: projectId,
       memberId: 'opencode',
       sessionId: s.id,
-      state: running ? 'thinking' : 'idle',
+      state: running ? 'busy' : 'idle',
       taskId: running ? hbId : null,
       ts: now,
     });
@@ -1266,7 +1266,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       const last = turns[turns.length - 1] || {};
       repo.upsertStatus.run({
         memberId,
-        state: running ? 'thinking' : 'idle',
+        state: running ? 'busy' : 'idle',
         stateSince: running ? last.startedAt || now : now,
         taskId: hbId,
         progress: null,

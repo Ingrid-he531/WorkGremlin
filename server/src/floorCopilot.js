@@ -1245,7 +1245,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     if (owner === s && hbId) {
       repo.upsertStatus.run({
         memberId,
-        state: isActive ? 'thinking' : 'idle',
+        state: isActive ? 'busy' : 'idle',
         stateSince: isActive ? (s.liveStartedAt || now) : now,
         taskId: hbId,
         progress: null,
@@ -1261,7 +1261,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       project: projectId,
       memberId: 'copilot',
       sessionId: s.id,
-      state: isActive ? 'thinking' : 'idle',
+      state: isActive ? 'busy' : 'idle',
       taskId: isActive ? runningId : null,
       ts: now,
     });
@@ -1275,7 +1275,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
 }
 
 /* ── Unified contract aliases + exports (via mutation, so the C reference held while sessions.js cycles stays stable) ── */
-module.exports.id = '9F';
 module.exports.client = 'copilot';
 module.exports.RE_GITHUB_COPILOT = RE_GITHUB_COPILOT;
 // Product detection metadata (the old products.js 9F entry): 9F has only the plugin form.

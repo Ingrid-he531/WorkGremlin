@@ -423,7 +423,7 @@ const deskScreens = computed(() =>
       // 屏幕上那条走条**不画完成度**（2026-09-29 去掉 progress）：task.progress 只有 0/1
       // 两个取值（开工写 0、收工写 1，中间没人推进，见 TaskRecordsView「进度」那行），
       // 画长度等于永远空条或满条。这里只判断"在不在干活"，让光带自己爬（见模板里的 .scr-crawl）。
-      running: Boolean(m && (m.state === 'busy' || m.state === 'thinking')),
+      running: Boolean(m && m.state === 'busy'),
     };
   })
 );

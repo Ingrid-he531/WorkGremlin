@@ -78,7 +78,7 @@ const bus = {
   const start = calls.find((c) => c[0] === 'startTask');
   ok('UserPromptSubmit → startTask', !!start, JSON.stringify(calls.map((c) => c[0])));
   ok('UserPromptSubmit → 标题取原话', start && start[1].title === '写个函数');
-  ok('UserPromptSubmit → thinking', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'thinking'));
+  ok('UserPromptSubmit → busy', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'busy'));
 
   // PreToolUse: the Agent tool summons a subagent → record a ghost (busy) + toolUse
   calls.length = 0;

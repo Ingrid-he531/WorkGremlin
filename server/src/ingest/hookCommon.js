@@ -1006,7 +1006,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
       }
       set(patch);
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-      await status('thinking');
+      await status('busy');
       return { ok: true, handled: event };
     }
     await register();
@@ -1037,7 +1037,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     set(patch);
     await backfillPrevTokens(prevDone, tp());
     set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-    await status('thinking');
+    await status('busy');
     if (process.env.WORKGREMLIN_HOOK_MESSAGES === '1') {
       await bus.recordMessage({
         project,
@@ -1120,7 +1120,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
       }
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-      await status('thinking');
+      await status('busy');
     }
     return { ok: true, handled: event };
   }

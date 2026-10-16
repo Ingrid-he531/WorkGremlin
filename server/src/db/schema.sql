@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_members_project ON members(project_id, name);
 -- One row of latest state per member (UPSERT). Route B is the only truth; route A / timeout only write degraded=1
 CREATE TABLE IF NOT EXISTS agent_status (
   member_id          TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
-  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline', 'thinking')),
+  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline')),
   state_since        INTEGER NOT NULL,
   task_id            TEXT,
   progress           REAL,                   -- 0~1; NULL = unknown (never fabricated)
@@ -73,7 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_status_hist_member_ts ON agent_status_history(mem
 CREATE TABLE IF NOT EXISTS session_status (
   member_id          TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
   session_id         TEXT NOT NULL,
-  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline', 'thinking')),
+  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline')),
   state_since        INTEGER NOT NULL,
   task_id            TEXT,
   last_heartbeat_at  INTEGER,

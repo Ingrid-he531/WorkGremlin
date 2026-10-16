@@ -46,24 +46,28 @@ const path = require('node:path');
 const log = require('./log');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
 const { detectProducts } = require('./floors');
-const { floorOf, floors, floorByAgent } = require('./floors');
-const { formToSource, agentBase } = require('@workgremlin/shared');
+const { floorOf, floorByAgent } = require('./floors');
+const { formToSource } = require('@workgremlin/shared');
+
+/**
+ * The floor's id ("1F" / "8F" …). The single source is the floor module's `meta.id` — reading a
+ * top-level `.id` instead made the floors that only expose `meta.id` (7F Kilo / 8F OpenCode) invisible
+ * to the session table (taskState stayed null, so the main console showed "standby" between events).
+ */
+const floorIdOf = (f) => (f && f.meta && f.meta.id) || '';
 
 // Process start moment: "end states" like doneAt only count when they happened **after this process
 // started**, so old end states do not resurrect after a restart.
 const SINCE_BOOT = Date.now();
 
 /**
- * agent name → floor meta (built once). Each floor's "which subtree session files land in / how to get
- * the sessionId out of a file name" has been pushed down into meta.sessionSubtree / meta.sessionIdOfFile;
- * this file only does generic dispatch by meta and writes no product-specific parsing rules anymore (see
- * each <product>.js).
+ * agent name → floor meta. Single source: floors.js's `floorByAgent` (agent → module) already indexes
+ * every floor by its base name, so read `meta` off that module instead of building a second agent→meta
+ * map here. Each floor's "which subtree session files land in / how to get the sessionId out of a file
+ * name" lives in meta.sessionSubtree / meta.sessionIdOfFile; this file only dispatches by meta and keeps
+ * no product-specific parsing rules (see each <product>.js).
  */
-const metaByAgent = {};
-for (const id of Object.keys(floors)) {
-  const m = floors[id] && floors[id].meta;
-  if (m && m.agent) metaByAgent[String(m.agent)] = m;
-}
+const metaOfAgent = (agent) => (floorByAgent[String(agent || '').toLowerCase()] || {}).meta || null;
 const { resolveProjectName } = require('./project');
 
 /** No events for longer than this → removed from the table */
@@ -319,7 +323,7 @@ function isDir(p) {
  * @returns {string} session id; empty string when it cannot be had
  */
 function sessionIdOfFile(name, kind) {
-  const m = metaByAgent[String(kind)];
+  const m = metaOfAgent(kind);
   return m && typeof m.sessionIdOfFile === 'function' ? m.sessionIdOfFile(name) : '';
 }
 
@@ -340,7 +344,7 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
   // pure noise if scanned in (and it avoids walking those big cache / plugins directories as a bonus).
   // When the directory does not exist it falls back to the whole tree (the isDir check below), so old
   // installs behave unchanged.
-  const meta = metaByAgent[String(kind)] || {};
+  const meta = metaOfAgent(kind) || {};
   const sub = meta.sessionSubtree ? path.join(dataPath, meta.sessionSubtree) : '';
   const root = sub && isDir(sub) ? sub : dataPath;
   // When the transcript has no first conversation yet (the session just started), cwd can only be found in
@@ -906,48 +910,6 @@ function flushSupersededTasks(doneScans) {
   }
 }
 
-/**
- * A session's "unified task state" —— the **single source of truth** for the lintel ticker and the main
- * console judging "does this floor have a task running".
- *   - 'running': this floor (grouped by agent base name) still has a "living" in-flight task in this
- *     project —— the main console shows "thinking" accordingly.
- *     **Takes precedence over** the previous round's leftover doneAt: when a new round starts the old
- *     doneAt is still there, and judging by doneAt first would flash "task cancelled/finished" once, so a
- *     living task wins. Grouping uses the agent base name (stripping the @<project/instance> suffix), same
- *     criterion as the frontend's floorAcceptsClient.
- *   - 'cancelled' / 'done': the done marker (doneAt) the reporter drops at Stop / interrupt is the most
- *     reliable signal of "has ended"
- *     (the CodeBuddy plugin does not even emit a hook when stopping, and task_runs is not necessarily
- *     flipped to cancelled, see the notes in flushSynthesizedCancels), so when nothing is running the
- *     reporter is the authority;
- *   - null: this session has neither a running task nor an end marker (pure idle / fossil data).
- * Both screens read this field, so one can no longer show "task cancelled" while the other still lights up
- * "thinking".
- * @param {object} session a session row from table (with floor / client / projectPath / doneAt / doneCancelled)
- * @param {object} repo db handle
- * @param {(projectId:number)=>string[]} runningClientsFor the client list of all in-flight tasks in a project (0 = any)
- */
-function taskStateOf(session, repo, runningClientsFor) {
-  // 1) First check whether this floor (by **floor**, no longer relying on session.client —— the registry's
-  //    session.client is often empty, and comparing it against the ledger client necessarily misses) has a
-  //    "living" in-flight task —— **full cross-project comparison**:
-  //    the lintel ticker monitors all floors and does no project isolation. It takes precedence over a
-  //    leftover doneAt, avoiding a flash of "task cancelled/finished" when a new round starts.
-  //    Every in-flight task's client in the ledger is grouped to a floor by agent base name (floorByAgent),
-  //    and hitting session.floor counts as running.
-  if (repo && runningClientsFor) {
-    const runningFloors = new Set();
-    for (const c of runningClientsFor(0)) {
-      const f = floorByAgent[agentBase(c)];
-      if (f && f.id) runningFloors.add(f.id);
-    }
-    if (runningFloors.has(session.floor)) return 'running';
-  }
-  // 2) Nothing running → the reporter's done marker (doneAt) is the most reliable "has ended" signal
-  if (session.doneAt) return session.doneCancelled ? 'cancelled' : 'done';
-  return null;
-}
-
 function snapshot({ workspacePath = '', force = false } = {}) {
   refresh({ workspacePath, force });
   const now = Date.now();
@@ -989,17 +951,19 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       log.debug('账本查询异常（不影响会话表构建）：', e);
     }
     for (const r of titleRows) {
-      const f = floorByAgent[agentBase(r.client)];
+      const f = floorByAgent[String(r.client || '').toLowerCase()];
       const sessionId = String(r.sessionId || '');
-      if (!f || !f.id || !sessionId) continue;
-      const key = `${f.id}:${sessionId}`;
+      const fid = floorIdOf(f);
+      if (!fid || !sessionId) continue;
+      const key = `${fid}:${sessionId}`;
       if (r.title && !runningTitleBySession.has(key)) runningTitleBySession.set(key, r.title);
       if (r.startedAt && !runningStartedBySession.has(key)) runningStartedBySession.set(key, Number(r.startedAt));
     }
     for (const r of detectRows) {
-      const f = floorByAgent[agentBase(r.client)];
+      const f = floorByAgent[String(r.client || '').toLowerCase()];
       const sessionId = String(r.sessionId || '');
-      if (f && f.id && sessionId) ledgerAliveSessions.add(`${f.id}:${sessionId}`);
+      const fid = floorIdOf(f);
+      if (fid && sessionId) ledgerAliveSessions.add(`${fid}:${sessionId}`);
     }
   } else {
     /* skip the ledger signal when repo/activeRunningByProject is missing (old behavior) */

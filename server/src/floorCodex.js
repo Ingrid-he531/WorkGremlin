@@ -99,4 +99,4 @@ function agentDirs(workspacePath) {
   return genericAgentDirs([home], workspacePath);
 }
 
-module.exports = { id: '3F', meta, RE_CODEX_HOST, handleHookEvent, codexForm, agentDirs, syncAgents: makeAgentSync(agentDirs, meta.agent) };
+module.exports = { meta, RE_CODEX_HOST, handleHookEvent, codexForm, agentDirs, syncAgents: makeAgentSync(agentDirs, meta.agent) };

@@ -39,7 +39,7 @@ const running = { state: 'busy', task: { id: 't1', title: '正在跑的任务', 
 ok('busy + 未收工 → 当前任务', currentTaskOf(running) === running.task);
 ok('标题取任务的 title', currentTaskTitle(running) === '正在跑的任务', currentTaskTitle(running));
 ok('已耗时从任务开工时刻算', currentTaskStartedAt(running) === T, String(currentTaskStartedAt(running)));
-ok('thinking / blocked 同样算在干活', isWorking({ state: 'thinking' }) && isWorking({ state: 'blocked' }));
+ok('busy / blocked 同样算在干活（成员状态里没有 thinking —— 它属于 busy）', isWorking({ state: 'busy' }) && isWorking({ state: 'blocked' }));
 
 console.log('\n[2] 空闲 → 槽位里那条是**上一个任务**，不算当前任务（回归：空闲还挂着旧任务 + 已耗时在走）');
 const idle = { state: 'idle', task: { id: 't0', title: '上一个任务', startedAt: T - 600_000, endedAt: T - 540_000 } };
@@ -55,11 +55,12 @@ ok('成员为空不炸', currentTaskOf(null) === null && currentTaskTitle(undefi
 ok('幽灵的字符串任务（在跑）照样认', currentTaskTitle({ state: 'busy', task: '审查这段 diff' }) === '审查这段 diff');
 ok('幽灵的字符串任务 + 空闲 → 不认', currentTaskOf({ state: 'idle', task: '审查这段 diff' }) === null);
 
-console.log('\n[4] 卡片右上角的状态牌只有两档：忙碌 / 空闲（用户 2026-09-30 要求）');
-ok('busy / thinking / blocked → 忙碌', ['busy', 'thinking', 'blocked'].every((s) => statusLabel(s) === '忙碌'));
+console.log('\n[4] 卡片右上角的状态牌分三档：阻塞 / 忙碌 / 空闲');
+ok('busy → 忙碌', statusLabel('busy') === '忙碌', statusLabel('busy'));
+ok('blocked → 阻塞（等外部依赖，单独一档）', statusLabel('blocked') === '阻塞', statusLabel('blocked'));
 ok('online / idle / offline → 空闲', ['online', 'idle', 'offline'].every((s) => statusLabel(s) === '空闲'));
 ok('未知状态按空闲处理（不把原始 state 直接怼给用户）', statusLabel('weird') === '空闲', statusLabel('weird'));
-ok('色调与文案同源（忙碌=busy 点，其余=idle 点）', statusTone('thinking') === 'busy' && statusTone('online') === 'idle' && statusTone('offline') === 'idle');
+ok('色调与文案同源（blocked=blocked 点，busy=busy 点，其余=idle 点）', statusTone('blocked') === 'blocked' && statusTone('busy') === 'busy' && statusTone('online') === 'idle' && statusTone('offline') === 'idle');
 
 console.log('\n[5] 时间点用绝对时刻（formatClock），不用需要每秒重算的相对时长');
 // 用户 2026-09-30 实测：1F 的「最近活跃」（相对时长）看着不动、3F 的「已耗时」一直在涨 ——

@@ -543,8 +543,7 @@ async function handleHookEvent(ev, ctx) {
   return runHookEvent(ev, ctx, claudeImpl);
 }
 
-module.exports = { 
-  id: '4F', 
+module.exports = {
   meta, 
   RE_CLAUDE_HOST,
   claudeHome,

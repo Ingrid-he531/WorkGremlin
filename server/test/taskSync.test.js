@@ -169,9 +169,9 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('改动文件按轮挂（第 1 轮那条带 highlight.ts）', Boolean(row1) && row1.file_count === 1 && String(row1.files_json).includes('src/highlight.ts'), row1 && `${row1.file_count} ${row1.files_json}`);
   ok('没改文件的那轮不许报文件（读过的文件不算改动）', Boolean(row0) && row0.file_count === 0 && row0.files_json === null, row0 && `${row0.file_count} ${row0.files_json}`);
   ok('模型带上了（Copilot 的来自 VS Code state.vscdb）', Boolean(row1) && row1.model === 'GPT-5 mini', row1 && row1.model);
-  ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf('copilot@p1') === 'thinking' && taskIdOf('copilot@p1') === 'copilot:cop-sid-1:2', `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1')}`);
+  ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('copilot@p1') === 'busy' && taskIdOf('copilot@p1') === 'copilot:cop-sid-1:2', `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1')}`);
   const copilotSessionStatus = repo.getSessionStatus.get({ memberId: 'copilot@p1', sessionId: 'cop-sid-1' });
-  ok('Copilot 的在飞任务也记在该会话状态行上', copilotSessionStatus && copilotSessionStatus.task_id === 'copilot:cop-sid-1:2' && copilotSessionStatus.state === 'thinking');
+  ok('Copilot 的在飞任务也记在该会话状态行上', copilotSessionStatus && copilotSessionStatus.task_id === 'copilot:cop-sid-1:2' && copilotSessionStatus.state === 'busy');
 
   console.log('[2] 9F Copilot：在飞那轮收工 → 变 done + 成员卡回落 idle');
   copilotRows = [
@@ -231,9 +231,9 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   // 起点必须是**那一轮**的起点，不是"第一次见到这条会话"的时刻 —— 这就是 2026-09-30 报的
   // 那个故障（老会话里跑新任务，行还是几天前那条、时间戳被 insertTask 的 COALESCE 钉死）。
   ok('台账起点 = 这一轮的起点（不是会话第一次被看见的时刻）', Boolean(row7) && Number(row7.started_at) === round7Start, row7 && String(row7.started_at));
-  ok('活跃会话 → 成员卡 thinking', stateOf('kilo@p1') === 'thinking', stateOf('kilo@p1'));
+  ok('活跃会话 → 成员卡 busy', stateOf('kilo@p1') === 'busy', stateOf('kilo@p1'));
   const kiloSessionStatus = repo.getSessionStatus.get({ memberId: 'kilo@p1', sessionId: 'kilo-sid-1' });
-  ok('Kilo 的在飞任务也记在该会话状态行上', kiloSessionStatus && kiloSessionStatus.task_id === 'kilo:kilo-sid-1:3' && kiloSessionStatus.state === 'thinking');
+  ok('Kilo 的在飞任务也记在该会话状态行上', kiloSessionStatus && kiloSessionStatus.task_id === 'kilo:kilo-sid-1:3' && kiloSessionStatus.state === 'busy');
 
   console.log('[4] 7F Kilo Code：一轮收工 → 成员卡回落 idle，时长是真的');
   const round7End = Date.now() - 30 * 60_000;
@@ -460,7 +460,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const live9 = nine2.find((t) => t.id === 'copilot:cop-sid-live:1') || null;
   ok('老轮躺成 done', Boolean(old9) && old9.state === 'done', old9 && old9.state);
   ok('在飞那轮 running（lastUpdated 半小时前也不影响）', Boolean(live9) && live9.state === 'running', live9 && live9.state);
-  ok('成员卡 thinking', stateOf('copilot@p1') === 'thinking', stateOf('copilot@p1'));
+  ok('成员卡 busy', stateOf('copilot@p1') === 'busy', stateOf('copilot@p1'));
   ok('心跳指着在跑的那条任务', taskIdOf('copilot@p1') === 'copilot:cop-sid-live:1', taskIdOf('copilot@p1'));
 
   copilotRows = [
@@ -509,9 +509,9 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('模型带上了（OpenCode 的 session.model）', Boolean(oc0) && oc0.model === 'longcat-2.5-preview-free', oc0 && oc0.model);
   // 回归：轮询那一路是 CLI/Desktop 形态，任务详情的「客户端」必须显示「OpenCode CLI」而不是只显示「OpenCode」
   ok('任务详情「客户端」= OpenCode CLI（轮询那一路不是插件形态）', Boolean(oc0) && oc0.client_label === 'OpenCode CLI', oc0 && oc0.client_label);
-  ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf('opencode@p1') === 'thinking' && taskIdOf('opencode@p1') === 'opencode:oc-sid-1:1', `${stateOf('opencode@p1')} / ${taskIdOf('opencode@p1')}`);
+  ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('opencode@p1') === 'busy' && taskIdOf('opencode@p1') === 'opencode:oc-sid-1:1', `${stateOf('opencode@p1')} / ${taskIdOf('opencode@p1')}`);
   const opencodeSessionStatus = repo.getSessionStatus.get({ memberId: 'opencode@p1', sessionId: 'oc-sid-1' });
-  ok('OpenCode 的在飞任务也记在该会话状态行上', opencodeSessionStatus && opencodeSessionStatus.task_id === 'opencode:oc-sid-1:1' && opencodeSessionStatus.state === 'thinking');
+  ok('OpenCode 的在飞任务也记在该会话状态行上', opencodeSessionStatus && opencodeSessionStatus.task_id === 'opencode:oc-sid-1:1' && opencodeSessionStatus.state === 'busy');
 
   opencodeRows = [
     {
@@ -711,7 +711,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const staleAt = Date.now() - 5 * 60_000;
   repo.insertTask.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: '(Copilot 会话)', state: 'running', progress: null, startedAt: staleAt, endedAt: null });
   repo.upsertTaskRun.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'gone', form: null, model: null, title: '(Copilot 会话)', startedAt: staleAt, baselineCommit: null });
-  repo.upsertStatus.run({ memberId: 'copilot@p1', state: 'thinking', stateSince: staleAt, taskId: 'copilot:gone:0', progress: null, currentFiles: null, lastHeartbeatAt: staleAt, degraded: 1, source: 'timeout', updatedAt: staleAt });
+  repo.upsertStatus.run({ memberId: 'copilot@p1', state: 'busy', stateSince: staleAt, taskId: 'copilot:gone:0', progress: null, currentFiles: null, lastHeartbeatAt: staleAt, degraded: 1, source: 'timeout', updatedAt: staleAt });
   copilotRows = [];
   syncCopilotTasks({ bus, repo });
   const settled = repo.getStatus.get('copilot@p1');
@@ -736,7 +736,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     },
   ];
   syncCopilotTasks({ bus, repo });
-  ok('按会话写了 thinking 的成员不被收工覆盖', stateOf('copilot@p1') === 'thinking', stateOf('copilot@p1'));
+  ok('按会话写了 busy 的成员不被收工覆盖', stateOf('copilot@p1') === 'busy', stateOf('copilot@p1'));
   ok('心跳指着在跑的那条任务', taskIdOf('copilot@p1') === 'copilot:cop-sid-keep:0', taskIdOf('copilot@p1'));
   copilotRows = [];
   syncCopilotTasks({ bus, repo });

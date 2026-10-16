@@ -9,8 +9,13 @@
 /** v2: unified the team concept into project (envelope field team -> project). */
 const PROTOCOL_VERSION = 2;
 
-/** @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'|'thinking'>} */
-const AGENT_STATES = Object.freeze(['online', 'busy', 'idle', 'blocked', 'offline', 'thinking']);
+/**
+ * Member states. "Thinking / waiting for the model" is **not** a separate state — it is part of `busy`
+ * (see requirements §5.5: "thinking / waiting for the LLM → busy"); the main console's finer
+ * "thinking vs calling a tool" distinction lives on the **phase** axis (sessionPhase.phase), not here.
+ * @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'>}
+ */
+const AGENT_STATES = Object.freeze(['online', 'busy', 'idle', 'blocked', 'offline']);
 
 /** @type {ReadonlyArray<'pending'|'running'|'done'|'failed'|'cancelled'>} */
 const TASK_STATES = Object.freeze(['pending', 'running', 'done', 'failed', 'cancelled']);

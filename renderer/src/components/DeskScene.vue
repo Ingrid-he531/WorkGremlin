@@ -36,7 +36,7 @@ const title = computed(() => currentTaskTitle(props.member) || t('card.idle'));
 // member.task.progress 画长度，但那个字段没有真值（全库只有 0 和 1，开工写 0、收工写 1，
 // 中间没人推进；详见 TaskRecordsView 里「进度」那一行的说明），画出来永远是空条或满条。
 // 所以这里只判断"在不在干活"，取值与主控制台一致（见 iso/mainConsole.js 的 PHASES.busy）。
-const running = computed(() => state.value === 'busy' || state.value === 'thinking');
+const running = computed(() => state.value === 'busy');
 const fileText = computed(() =>
   props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : t('card.no_file')
 );

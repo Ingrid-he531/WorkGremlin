@@ -686,14 +686,14 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
       project: projectId,
       memberId: CLIENT,
       sessionId: s.id,
-      state: running ? 'thinking' : 'idle',
+      state: running ? 'busy' : 'idle',
       taskId: running ? hbId : null,
       ts: now,
     });
     if (owner === s && hbId && !hookOwnsMember(repo, memberId, now)) {
       repo.upsertStatus.run({
         memberId,
-        state: running ? 'thinking' : 'idle',
+        state: running ? 'busy' : 'idle',
         stateSince: running ? rounds[rounds.length - 1].startedAt || now : now,
         taskId: hbId,
         progress: null,
@@ -783,7 +783,6 @@ async function handleHookEvent(ev, ctx) {
 
 module.exports = {
   // 6F Qoder
-  id: '6F',
   client: 'qoder',
   meta,
   kindHandlers,

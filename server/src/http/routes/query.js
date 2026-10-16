@@ -59,7 +59,7 @@ function taskAliveSql() {
        WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
          AND ss.task_id = t.id
          AND (ss.last_heartbeat_at > @cutoff
-              OR (ss.state IN ('busy', 'thinking', 'blocked') AND ss.state_since > @grace_cutoff))
+              OR (ss.state IN ('busy', 'blocked') AND ss.state_since > @grace_cutoff))
     ) OR (
       (tr.session_id IS NULL OR NOT EXISTS (
         SELECT 1 FROM session_status ss
@@ -68,7 +68,7 @@ function taskAliveSql() {
         SELECT 1 FROM agent_status s
          WHERE s.task_id = t.id
            AND (s.last_heartbeat_at > @cutoff
-                OR (s.state IN ('busy', 'thinking', 'blocked') AND s.state_since > @grace_cutoff))
+                OR (s.state IN ('busy', 'blocked') AND s.state_since > @grace_cutoff))
       )
     )
   )`;

@@ -14,7 +14,7 @@ const project = useProjectStore();
 const { t } = useI18n();
 
 const ROLES = ['leader', 'coder', 'researcher', 'tester', 'reviewer', 'ops'];
-const STATES = ['online', 'busy', 'idle', 'blocked', 'thinking', 'offline'];
+const STATES = ['online', 'busy', 'idle', 'blocked', 'offline'];
 
 /** @param {number} i @param {string} state */
 function makeMember(i, state) {
@@ -30,10 +30,10 @@ function makeMember(i, state) {
     lastSeenAt: Date.now() - (state === 'offline' ? 300 : 5) * 1000,
     messageCount: 0,
     task:
-      state === 'busy' || state === 'blocked' || state === 'thinking'
+      state === 'busy' || state === 'blocked'
         ? { id: role, title: t('deskLab.demo_task'), progress: state === 'blocked' ? 0.34 : 0.62 }
         : null,
-    currentFiles: state === 'busy' || state === 'thinking' ? ['renderer/src/components/DeskScene.vue', 'server/src/ingest/bus.js'] : [],
+    currentFiles: state === 'busy' ? ['renderer/src/components/DeskScene.vue', 'server/src/ingest/bus.js'] : [],
     artifacts: [],
   };
 }

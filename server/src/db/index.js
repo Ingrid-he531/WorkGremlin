@@ -89,7 +89,7 @@ function migrate(db) {
   ensureColumn(db, 'councils', 'workspace_path', 'workspace_path TEXT');
   ensureColumn(db, 'council_utterances', 'stance', 'stance TEXT');
   ensureColumn(db, 'council_utterances', 'findings_json', 'findings_json TEXT');
-  ensureAgentStatusThinking(db);
+  normalizeThinkingState(db);
   ensureCouncilVerdictReported(db);
   // Backfill: products once missing from CLIENT_BASES have their main agent member's client written as
   // NULL, and an empty client is treated on the frontend as "generic, show it on every floor" —— so
@@ -103,42 +103,20 @@ function migrate(db) {
 }
 
 /**
- * An old DB's agent_status.state carries the old CHECK constraint (no thinking in it),
- * and CREATE TABLE IF NOT EXISTS does not change an existing table's constraints.
- * It is a runtime state table whose content is disposable (the next report / heartbeat fills it in
- * again), so rebuild the table and relax it to include thinking.
+ * One-time data cleanup: member state `thinking` was folded back into `busy` (it is part of busy — see
+ * AGENT_STATES in shared). Rewrite any leftover rows so the liveness checks (which no longer list
+ * `thinking`) keep seeing them. The tables' CHECK constraints still permit `busy`, so this is a plain
+ * UPDATE (no table rebuild).
  * @param {import('better-sqlite3').Database} db
  */
-function ensureAgentStatusThinking(db) {
-  let sql = '';
-  try {
-    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_status'").get();
-    sql = (row && row.sql) || '';
-  } catch {
-    return;
+function normalizeThinkingState(db) {
+  for (const table of ['agent_status', 'session_status']) {
+    try {
+      db.exec(`UPDATE ${table} SET state = 'busy' WHERE state = 'thinking'`);
+    } catch {
+      /* table missing on a very old db: nothing to clean */
+    }
   }
-  if (!sql || /thinking/.test(sql)) return; // already the new constraint, or the table does not exist
-  db.exec(`
-    ALTER TABLE agent_status RENAME TO _agent_status_old;
-    CREATE TABLE agent_status (
-      member_id          TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
-      state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline', 'thinking')),
-      state_since        INTEGER NOT NULL,
-      task_id            TEXT,
-      progress           REAL,
-      current_files      TEXT,
-      last_heartbeat_at  INTEGER,
-      degraded           INTEGER NOT NULL DEFAULT 0,
-      source             TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch', 'timeout')),
-      updated_at         INTEGER NOT NULL
-    );
-    INSERT INTO agent_status
-      (member_id, state, state_since, task_id, progress, current_files, last_heartbeat_at, degraded, source, updated_at)
-    SELECT member_id, state, state_since, task_id, progress, current_files, last_heartbeat_at, degraded, source, updated_at
-    FROM _agent_status_old;
-    DROP TABLE _agent_status_old;
-    CREATE INDEX IF NOT EXISTS idx_status_state ON agent_status(state);
-  `);
 }
 
 /**
@@ -734,12 +712,12 @@ function createRepo(db) {
             SELECT 1 FROM session_status ss
              WHERE ss.member_id = t.member_id AND ss.session_id = r.session_id AND ss.task_id = t.id
                AND (ss.last_heartbeat_at > @cutoff
-                    OR (ss.state IN ('busy', 'thinking', 'blocked') AND ss.state_since > @grace))
+                    OR (ss.state IN ('busy', 'blocked') AND ss.state_since > @grace))
           ) OR EXISTS (
             SELECT 1 FROM agent_status s
              WHERE s.task_id = t.id
                AND (s.last_heartbeat_at > @cutoff
-                    OR (s.state IN ('busy', 'thinking', 'blocked') AND s.state_since > @grace))
+                    OR (s.state IN ('busy', 'blocked') AND s.state_since > @grace))
           )
         )
     `),

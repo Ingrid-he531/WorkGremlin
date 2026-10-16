@@ -1397,14 +1397,14 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       project: projectId,
       memberId: 'kilo',
       sessionId: s.id,
-      state: isActiveOf(s) ? 'thinking' : 'idle',
+      state: isActiveOf(s) ? 'busy' : 'idle',
       taskId: isActiveOf(s) ? lastId : null,
       ts: now,
     });
     if (owner === s) {
       repo.upsertStatus.run({
         memberId,
-        state: running ? 'thinking' : 'idle',
+        state: running ? 'busy' : 'idle',
         stateSince: running ? last.startedAt || now : now,
         taskId: lastId,
         progress: null,

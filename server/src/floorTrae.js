@@ -1120,7 +1120,6 @@ async function handleHookEvent(ev, ctx) {
 
 module.exports = {
   // 5F TraeCode
-  id: '5F',
   client: 'trae',
   meta,
   flushBackend,

@@ -56,6 +56,20 @@ function normForm(v) {
   return null;
 }
 
+/**
+ * Member state from a report. `thinking` is the **legacy spelling of `busy`** (it was folded back into
+ * `busy`: "thinking / waiting for the model" is part of busy, see AGENT_STATES in shared). Old callers /
+ * old data may still say `thinking` — map it to `busy` so it never falls through to the unknown fallback
+ * (which would show the member as idle).
+ * @param {unknown} v
+ * @param {string} fallback used when the value is not a known state
+ */
+function normState(v, fallback) {
+  const s = String(v || '').trim().toLowerCase();
+  if (s === 'thinking') return 'busy';
+  return AGENT_STATES.includes(s) ? s : fallback;
+}
+
 /** Model name: NULL when unavailable (never guessed), truncated when too long */
 function normModel(v) {
   const s = String(v == null ? '' : v).trim();
@@ -335,7 +349,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!member) return { ok: false, error: 'unknown_member' };
     if (!normSession(p.sessionId)) return { ok: true, skipped: 'missing_session' };
     const ts = Number(p.ts) || now();
-    const state = AGENT_STATES.includes(p.state) ? p.state : 'idle';
+    const state = normState(p.state, 'idle');
     writeSessionStatus(member.id, p.sessionId, state, p.taskId, ts);
     return { ok: true };
   }
@@ -362,15 +376,12 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     * the member card up to date with the most recently active session, but does not replace session-level state.
      */
     const mine = liveTaskOf(project, id, p.sessionId);
-    const state = AGENT_STATES.includes(p.state)
-      ? p.state
-      : // Claimed an in-flight task but the slot still sits at idle/offline = "task running, member idle", so the liveness check
-        // can't see it either (its criteria require busy/thinking/blocked) -> lift both to busy. Only these two are lifted; everything else stays as-is.
-        mine && prev && (prev.state === 'idle' || prev.state === 'offline')
-        ? 'busy'
-        : prev
-          ? prev.state
-          : 'online';
+    const state = normState(
+      p.state,
+      // Claimed an in-flight task but the slot still sits at idle/offline = "task running, member idle", so the liveness check
+      // can't see it either (its criteria require busy/blocked) -> lift both to busy. Only these two are lifted; everything else stays as-is.
+      mine && prev && (prev.state === 'idle' || prev.state === 'offline') ? 'busy' : prev ? prev.state : 'online'
+    );
 
     repo.upsertStatus.run({
       memberId: id,
@@ -386,13 +397,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     });
     if (sessionId) {
       const sessionTaskId = normTaskId(p.taskId) || mine || (sessionPrev && sessionPrev.task_id) || null;
-      const sessionState = AGENT_STATES.includes(p.state)
-        ? p.state
-        : sessionPrev
-          ? sessionPrev.state
-          : sessionTaskId
-            ? 'busy'
-            : 'online';
+      const sessionState = normState(
+        p.state,
+        sessionPrev ? sessionPrev.state : sessionTaskId ? 'busy' : 'online'
+      );
       writeSessionStatus(id, sessionId, sessionState, sessionTaskId, ts);
     }
     repo.touchMember.run(ts, id);
@@ -523,7 +531,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!member) return { ok: false, error: 'unknown_member' };
     const id = member.id;
     const ts = Number(p.ts) || now();
-    const state = AGENT_STATES.includes(p.state) ? p.state : 'idle';
+    const state = normState(p.state, 'idle');
     const prev = repo.getStatus.get(id);
     const sessionId = normSession(p.sessionId);
     const sessionPrev = sessionId ? repo.getSessionStatus.get({ memberId: id, sessionId }) : null;

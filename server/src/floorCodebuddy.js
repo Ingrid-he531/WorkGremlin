@@ -848,7 +848,6 @@ async function handleHookEvent(ev, ctx) {
 }
 
 module.exports = {
-  id: '1F',
   meta,
   // For findPluginDir / findPluginStorageDir default regex reuse
   RE_PLUGIN,

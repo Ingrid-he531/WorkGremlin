@@ -120,8 +120,8 @@ function endedText(it) {
 
 /** 从所有工程的所有会话里挑出"本次会话启动后才结束"的任务，把结束行排进 pendingEnded ——
  *  下次补段时跟着进那一段，**只滚一遍**。启动前就已结束的不回放（避免一启动就滚一堆"任务完成"）；
- *  announcedIds 防同一任务重复播报。结束判据用服务端统一合成的 taskState（见 server 的 taskStateOf），
- *  与门楣 / 主控制台同一个真相源，不再各算各的。 */
+ *  announcedIds 防同一任务重复播报。结束判据用服务端统一合成的 taskState（见 server 的 sessionRegistry
+ *  snapshot 里逐会话算出的 taskState），与门楣 / 主控制台同一个真相源，不再各算各的。 */
 function detectEnded() {
   let added = false;
   for (const it of feed.value) {

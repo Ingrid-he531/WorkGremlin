@@ -163,6 +163,7 @@ const MESSAGES = {
 
     // ---- 小怪物头顶 / 幽灵 ----
     'tag.busy': '忙碌',
+    'tag.blocked': '阻塞',
     'tag.idle': '空闲',
     'tag.meeting': '会议中',
     'tag.attending': '旁听会议',
@@ -247,6 +248,7 @@ const MESSAGES = {
     'card.no_file': '未上报文件',
     'card.needs_help': '需要协助',
     'card.status.busy': '忙碌',
+    'card.status.blocked': '阻塞',
     'card.status.idle': '空闲',
     'workstation.empty': '本层暂无成员',
 
@@ -606,6 +608,7 @@ const MESSAGES = {
 
     // ---- gremlins / ghosts ----
     'tag.busy': 'Busy',
+    'tag.blocked': 'Blocked',
     'tag.idle': 'Idle',
     'tag.meeting': 'In meeting',
     'tag.attending': 'Attending',
@@ -690,6 +693,7 @@ const MESSAGES = {
     'card.no_file': 'no file reported',
     'card.needs_help': 'needs help',
     'card.status.busy': 'Busy',
+    'card.status.blocked': 'Blocked',
     'card.status.idle': 'Idle',
     'workstation.empty': 'No member on this floor',
 

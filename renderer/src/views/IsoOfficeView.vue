@@ -327,7 +327,7 @@ const consoleBase = computed(() => {
 const busySubagents = computed(() => {
   if (sessions.floorEmpty || !sessions.live) return [];
   return project.members.filter(
-    (m) => isEphemeralMember(m) && (m.state === 'busy' || m.state === 'blocked' || m.state === 'thinking')
+    (m) => isEphemeralMember(m) && (m.state === 'busy' || m.state === 'blocked')
   );
 });
 

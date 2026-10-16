@@ -61,9 +61,11 @@ const MAGNET = '#c3ccda';
 /** 工牌级别色（与小怪物脖子上的工牌一致）：user=蓝, project=绿, 其它（演示/普通）=灰 */
 const LEVEL_COLOR = { user: '#3b82f6', project: '#22c55e' };
 const levelColor = (level) => LEVEL_COLOR[level] || '#7c8aa5';
-/** 对外只保留两档状态：忙碌 / 空闲 */
-/** 后端的五种（+thinking）状态归并到这两档（busy / blocked / thinking 都算忙） */
-const bucketOf = (s) => (s === 'busy' || s === 'blocked' || s === 'thinking' ? 'busy' : 'idle');
+/**
+ * 对外状态牌分三档：阻塞 / 忙碌 / 空闲。
+ * busy（含旧的 thinking 值）→ 忙碌；blocked → 阻塞（等外部依赖，老人需求 §5.6）；其余 → 空闲。
+ */
+const bucketOf = (s) => (s === 'blocked' ? 'blocked' : s === 'busy' || s === 'thinking' ? 'busy' : 'idle');
 /** 忙碌时具体在干的事（只决定走路/钉座位，头顶标签不再显示细节） */
 const WORK_KEYS = ['think', 'code', 'doc'];
 const hashOf = (s) => {
@@ -2852,13 +2854,18 @@ export function createIsoOffice(canvas, opts = {}) {
   function canWander(a) {
     if (isSummoned(a.memberId)) return false;
     if (report && report.agentId === a.memberId) return false;
-    return bucketOf(stateOf(a.memberId)) !== 'busy' || a.work === 'think';
+    const b = bucketOf(stateOf(a.memberId));
+    // 阻塞 = 卡在等外部依赖 → 钉在座位上（在屋里溜达看着像在摸鱼）
+    if (b === 'blocked') return false;
+    return b !== 'busy' || a.work === 'think';
   }
 
-  /** 头顶只写状态：小怪物（被召唤的专家）只显示"忙碌"，具体在做什么交给小幽灵讲 */
+  /** 头顶写状态：忙碌 / 阻塞 / 空闲；具体在做什么交给小幽灵 / tooltip 讲 */
   function tagText(a) {
     if (a.mode === 'meet') return t('tag.meeting');
-    return bucketOf(stateOf(a.memberId)) === 'busy' ? t('tag.busy') : t('tag.idle');
+    const b = bucketOf(stateOf(a.memberId));
+    if (b === 'blocked') return t('tag.blocked');
+    return b === 'busy' ? t('tag.busy') : t('tag.idle');
   }
 
   /**

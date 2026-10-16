@@ -12,8 +12,9 @@ const props = defineProps({
 });
 
 /**
- * 工位卡 / 桌牌上的状态只分两档：忙碌 / 空闲（用户 2026-09-30 的要求）。
- * 判据与卡片其它地方同一份（见 lib/memberTask.js）—— busy/thinking/blocked = 在干活 → 忙碌。
+ * 工位卡 / 桌牌上的状态三档：阻塞 / 忙碌 / 空闲。
+ * 判据与卡片其它地方同一份（见 lib/memberTask.js）—— busy = 在干活 → 忙碌；blocked → 阻塞（等外部依赖）；
+ * 其余 → 空闲。5 种细分状态不逐一显示，但 blocked 单独一档。
  */
 const label = computed(() => statusLabel(props.state));
 const tone = computed(() => statusTone(props.state));
@@ -52,7 +53,13 @@ const tone = computed(() => statusTone(props.state));
 }
 
 .state-busy .dot { background: var(--state-busy); }
+.state-blocked .dot { background: var(--state-blocked); }
 .state-idle .dot { background: var(--state-idle); }
+
+.state-blocked {
+  color: var(--state-blocked);
+  border-color: var(--state-blocked);
+}
 
 .badge.degraded {
   opacity: 0.62;

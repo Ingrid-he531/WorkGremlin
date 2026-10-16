@@ -70,7 +70,6 @@ const HOME = os.homedir();
 
 /** Contract export names (docs / self-check only; not enforced) */
 const FLOOR_CONTRACT = [
-  'id',
   'meta',
   'kindHandlers',
   'sessionTitle',
@@ -83,18 +82,25 @@ const FLOOR_CONTRACT = [
 
 /* ============================================================== Registry */
 
-/** Floor id → floor module (one file per floor; adding a floor is one line here) */
-const floors = {
-  '1F': require('./floorCodebuddy'),
-  '2F': require('./floorWorkbuddy'),
-  '3F': require('./floorCodex'),
-  '4F': require('./floorClaude'),
-  '5F': require('./floorTrae'),
-  '6F': require('./floorQoder'),
-  '7F': require('./floorKilo'),
-  '8F': require('./floorOpencode'),
-  '9F': require('./floorCopilot'),
-};
+/**
+ * Floor modules in floor order (1F…9F). Adding a floor = one `require` line here; the id lives in
+ * **`meta.id` only** (the single source — it is not repeated as this object's key nor as a top-level
+ * `module.exports.id`).
+ */
+const FLOOR_MODULES = [
+  require('./floorCodebuddy'),
+  require('./floorWorkbuddy'),
+  require('./floorCodex'),
+  require('./floorClaude'),
+  require('./floorTrae'),
+  require('./floorQoder'),
+  require('./floorKilo'),
+  require('./floorOpencode'),
+  require('./floorCopilot'),
+];
+
+/** Floor id → floor module (keyed by `meta.id`) */
+const floors = Object.fromEntries(FLOOR_MODULES.map((m) => [m.meta.id, m]));
 
 /** agent (floor base name, e.g. 'codebuddy') → floor module; hookDispatch uses this to send events to that floor's handleHookEvent */
 const floorByAgent = {};
