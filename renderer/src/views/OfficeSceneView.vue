@@ -689,7 +689,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
       :style="{ left: `${card.left}px`, top: `${card.top}px` }"
       @click.stop
     >
-      <WorkstationCard :member="cardMember" />
+      <WorkstationCard :member="cardMember" :members="project.members" />
       <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 

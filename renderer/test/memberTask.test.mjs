@@ -85,5 +85,38 @@ console.log('\n[6] 被召唤的小怪物：借用同名幽灵的任务（回归�
   ok('名字不同的幽灵 → 不借', summonTaskTitle(susan, [susan, { ...ghost, name: 'leo' }]) === '');
 }
 
+console.log('\n[7] 每处 <WorkstationCard> 都要把 members 传进去（回归：办公室卡片只拿到 member，借不到召唤幽灵的任务 → 状态忙碌、当前任务却写「空闲」）');
+{
+  // Why a source scan: the borrowing above only works when the card is handed the sibling members.
+  // A view that renders <WorkstationCard :member="..."> without :members silently falls back to the
+  // empty default, so the failure is invisible to the lib-level checks in [6] — it only shows up on
+  // screen. Scan every .vue under src so a future view cannot reintroduce it.
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../src', import.meta.url));
+  const files = [];
+  (function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.vue')) files.push(p);
+    }
+  })(root);
+  const usages = [];
+  const missing = [];
+  for (const f of files) {
+    const src = fs.readFileSync(f, 'utf8');
+    const re = /<WorkstationCard\b[\s\S]*?\/?>/g;
+    let m;
+    while ((m = re.exec(src))) {
+      usages.push(path.relative(root, f));
+      if (!/:members\b/.test(m[0])) missing.push(path.relative(root, f));
+    }
+  }
+  ok('至少扫到 3 处 WorkstationCard（办公室 / 旧 2D 场景 / 工位卡片）', usages.length >= 3, usages.join(', '));
+  ok('每一处都传了 :members', missing.length === 0, missing.join(', '));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
