@@ -35,6 +35,7 @@ import {
   MEETING,
   MEETING_SEATS,
   PANTRY,
+  PANTRY_SEATS,
   PLANTS,
   PLACES,
   NAV_NODES,
@@ -824,16 +825,19 @@ export function createIsoOffice(canvas, opts = {}) {
 
   function pickActivity(a) {
     const r = Math.random();
-    if (r < 0.3) {
+    if (r < 0.24) {
       goTo(a, PLACES.coffee, 'coffee', 6000 + Math.random() * 8000);
-    } else if (r < 0.5) {
+    } else if (r < 0.4) {
       goTo(a, PLACES.printer, 'print', 4000 + Math.random() * 6000);
-    } else if (r < 0.76 && agents.length > 1) {
+    } else if (r < 0.62 && agents.length > 1) {
       const other = agents[(a.home + 1 + Math.floor(Math.random() * 2)) % agents.length];
       if (other && other !== a) {
         // Stand inside the other's workstation (the divider side, not in the corridor chatting over the partition)
         goTo(a, { x: other.seat.x + 0.85, y: other.seat.y }, 'chat', 5000 + Math.random() * 6000);
       }
+    } else if (r < 0.84) {
+      // Break room: go sit on one of the pantry chairs for a while (idle gremlins rest here)
+      goTo(a, PANTRY_SEATS[Math.floor(Math.random() * PANTRY_SEATS.length)], 'sit', 9000 + Math.random() * 12000);
     } else {
       goTo(a, WANDER[Math.floor(Math.random() * WANDER.length)], 'walk', 3000 + Math.random() * 4000);
     }

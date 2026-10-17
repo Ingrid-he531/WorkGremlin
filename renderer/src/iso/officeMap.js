@@ -478,6 +478,9 @@ export const PANTRY = {
   ],
 };
 
+/** Seat points of the pantry (= the break-room chairs): idle gremlins may come here to sit (see pickActivity) */
+export const PANTRY_SEATS = PANTRY.chairs.map((c) => ({ ...c }));
+
 /* ------------------------------------------------------------------ *
  * Plants
  * ------------------------------------------------------------------ */
@@ -567,6 +570,9 @@ const N = {
   /** Pantry: door in the west wall → inside the door → in front of the water cooler */
   PDOOR_OUT: { x: 13.6, y: 9.75 },
   PDOOR_IN: { x: 15.2, y: 9.75 },
+  /** Pantry inner aisles (break room): north / south of the dining table, so gremlins can sit at its chairs */
+  PAISLE_N: { x: 15.6, y: 8.55 },
+  PAISLE_S: { x: 15.6, y: 11.6 },
 };
 
 DESK_UNITS.forEach((d, i) => {
@@ -574,6 +580,9 @@ DESK_UNITS.forEach((d, i) => {
 });
 MEETING_SEATS.forEach((s, i) => {
   N[`MSEAT_${i}`] = { ...s };
+});
+PANTRY_SEATS.forEach((s, i) => {
+  N[`PSEAT_${i}`] = { ...s };
 });
 
 const EDGES = [
@@ -601,6 +610,10 @@ const EDGES = [
   ['MSIDE_B', 'PRINT'],
   // Pantry: right-side aisle → side door → inside the door → water in front of the cooler
   ['M134', 'PDOOR_OUT'], ['F134', 'PDOOR_OUT'], ['PDOOR_OUT', 'PDOOR_IN'], ['PDOOR_IN', 'COFFEE'],
+  // Pantry break-room chairs: inside the door → the inner aisle north / south of the table → each chair
+  ['PDOOR_IN', 'PAISLE_N'], ['PDOOR_IN', 'PAISLE_S'],
+  ['PAISLE_N', 'PSEAT_0'], ['PAISLE_N', 'PSEAT_1'], ['PAISLE_N', 'PSEAT_2'],
+  ['PAISLE_S', 'PSEAT_3'], ['PAISLE_S', 'PSEAT_4'], ['PAISLE_S', 'PSEAT_5'],
   // Meeting room: right-side aisle → outside the side door → inside the door → round the west inner corridor to the north / south sides of the table (8 seats)
   ['B134', 'MDOOR_OUT'], ['M134', 'MDOOR_OUT'], ['MDOOR_OUT', 'MDOOR_IN'],
   ['MDOOR_IN', 'MSIDE_A'], ['MDOOR_IN', 'MSIDE_B'],
