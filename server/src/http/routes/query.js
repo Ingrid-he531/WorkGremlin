@@ -164,7 +164,7 @@ function createQueryRouter({ bus, repo }) {
    *
    * Top-level filters (server-side):
    *   - project: a project id, or a comma-separated list of ids (multi-select); absent / 'all' = all projects.
-   *   - client : floor = the member client that ran the task (codebuddy/codex/workbuddy/claude…);
+   *   - client : floor = the member client that ran the task (codebuddy/codex/cline/claude…);
    *              may be a comma-separated string (merged floor 1F CodeBuddy = codebuddy + codebuddy-plugin);
    *              absent / 'all' = all floors.
    * The second-level filter (state) is applied by the frontend on the fetched rows (see the state

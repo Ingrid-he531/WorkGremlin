@@ -85,7 +85,7 @@ One monitored product per floor (the left capsules are ordered this way); **a fl
 | Floor | Product | Form |
 | --- | --- | --- |
 | 1F | CodeBuddy | CLI (terminal) and IDE plugin, merged into one floor |
-| 2F | WorkBuddy | CLI |
+| 2F | Cline | CLI and VS Code extension (same on-disk store, merged into one floor) |
 | 3F | Codex | CLI and IDE plugin (same on-disk store, merged into one floor) |
 | 4F | Claude Code | CLI and IDE plugin (same on-disk store, merged into one floor) |
 | 5F | TraeCode | IDE proper and plugin |

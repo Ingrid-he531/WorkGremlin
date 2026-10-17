@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * Hook entry point for the monitored products (codebuddy / codex / workbuddy / trae / claude / qoder …).
+ * Hook entry point for the monitored products (codebuddy / codex / trae / claude / qoder …).
  *
  * Refactor 2026-10: the hook became a pure forwarder — "read a stdin event → POST /api/v1/hook → exit".
  * All on-disk parsing / session state / ledger writes / token reading / subagent ghosts happen on the
@@ -106,7 +106,7 @@ async function main() {
   // Main agent identity: the installer injects it via --agent; required, error out if missing.
   const agent = flag(argv, '--agent');
   if (!agent) {
-    console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / workbuddy / trae / claude / qoder）');
+    console.error('[workgremlin-hook] 缺少必需参数 --agent（主 agent 名字，如 codebuddy / codex / trae / claude / qoder）');
     process.exit(1);
   }
 

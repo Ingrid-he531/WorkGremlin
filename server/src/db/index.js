@@ -97,7 +97,7 @@ function migrate(db) {
   // 1F's workstation card exactly this way). Backfill by "the name equals a known product base name":
   // demo members' generic NULLs (names are not base names) are unaffected. New members are already
   // normalized correctly by normClient; this clears historical residue.
-  const BASES = ['codebuddy', 'workbuddy', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
+  const BASES = ['codebuddy', 'cline', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
   const tagBase = db.prepare(`UPDATE members SET client = ? WHERE client IS NULL AND name = ?`);
   for (const b of BASES) tagBase.run(b, b);
 }

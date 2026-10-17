@@ -143,7 +143,7 @@ If you encounter limitations not documented here, please:
 | Qoder | Plugin | ✅ Supported | ❌ No | Token data unavailable from source |
 | Kilo | CLI | ✅ Supported | ✅ Yes | Full functionality |
 | OpenCode | CLI | ✅ Supported | ✅ Yes | Full functionality |
-| WorkBuddy | CLI | ✅ Supported | ✅ Yes | Full functionality |
+| Cline | CLI/Plugin | ✅ Supported | ✅ Yes | Full functionality (phase inferred by polling the on-disk store) |
 | TraeCode | Plugin | ❌ Not Supported | N/A | Integration not available |
 | GitHub Copilot | CLI | ❌ Not Supported | N/A | Integration not available |
 

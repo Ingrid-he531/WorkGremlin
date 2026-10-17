@@ -28,7 +28,7 @@ head('[1] 楼层不持有定时器，只靠 syncTasks + pollMs 参与轮询');
 {
   const list = taskSyncerFloors();
   const ids = list.map((f) => f.meta.id).sort();
-  ok('恰好 4 层参与任务轮询（6F/7F/8F/9F）', JSON.stringify(ids) === JSON.stringify(['6F', '7F', '8F', '9F']), JSON.stringify(ids));
+  ok('恰好 5 层参与任务轮询（2F/6F/7F/8F/9F）', JSON.stringify(ids) === JSON.stringify(['2F', '6F', '7F', '8F', '9F']), JSON.stringify(ids));
   ok('每层都导出了 syncTasks 函数', list.every((f) => typeof f.syncTasks === 'function'));
   ok('每层都声明了 pollMs', list.every((f) => Number(f.pollMs) > 0));
 
@@ -147,8 +147,8 @@ head('[5] 楼层注册表：agentSyncerFloors 是"导出了 syncAgents"的楼层
 {
   const list = agentSyncerFloors();
   const ids = list.map((f) => f.meta.id).sort();
-  ok('有 agent 目录的楼层都参与（1F~6F/8F；7F/9F 目录为空不参与）',
-    JSON.stringify(ids) === JSON.stringify(['1F', '2F', '3F', '4F', '5F', '6F', '8F']), JSON.stringify(ids));
+  ok('有 agent 目录的楼层都参与（1F~6F/8F；2F/7F/9F 目录为空不参与）',
+    JSON.stringify(ids) === JSON.stringify(['1F', '3F', '4F', '5F', '6F', '8F']), JSON.stringify(ids));
   ok('每层都有 syncAgents 函数', list.every((f) => typeof f.syncAgents === 'function'));
 }
 

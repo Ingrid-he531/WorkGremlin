@@ -90,7 +90,7 @@ const FLOOR_CONTRACT = [
  */
 const FLOOR_MODULES = [
   require('./floorCodebuddy'),
-  require('./floorWorkbuddy'),
+  require('./floorCline'),
   require('./floorCodex'),
   require('./floorClaude'),
   require('./floorTrae'),

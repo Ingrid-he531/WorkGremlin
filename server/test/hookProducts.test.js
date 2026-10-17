@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 多产品 hook 转发冒烟测试（Codex / CodeBuddy / Qoder / WorkBuddy）。
+ * 多产品 hook 转发冒烟测试（Codex / CodeBuddy / Qoder）。
  *
  * 验证各家 floor 的 impl 接线正确：repliesOf / formOf / interruptedSince 能跑、事件能路由到
  * startTask / endTask，且产出文本被正确读到。落盘解析全在服务端。
@@ -69,14 +69,7 @@ writeJsonl(QODER_TP, [
   { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'qoder 干成了' }] } },
 ]);
 
-// WorkBuddy jsonl
-const WB_TP = path.join(TMP, 'workbuddy.jsonl');
-writeJsonl(WB_TP, [
-  { type: 'user', message: { role: 'user', content: 'workbuddy 干啥' } },
-  { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'workbuddy 干成了' }] } },
-]);
-
-// CodeBuddy index.json + messages/<id>.json（同 Qoder/WorkBuddy 插件）
+// CodeBuddy index.json + messages/<id>.json（同 Qoder 插件）
 const CB_DIR = path.join(TMP, 'cb-history', 'sess1');
 fs.mkdirSync(path.join(CB_DIR, 'messages'), { recursive: true });
 fs.writeFileSync(path.join(CB_DIR, 'index.json'), JSON.stringify({
@@ -106,7 +99,6 @@ const CB_TP = path.join(CB_DIR, 'index.json');
 
   await run('codex', CODEX_TP, 'codex 干成了');
   await run('qoder', QODER_TP, 'qoder 干成了');
-  await run('workbuddy', WB_TP, 'workbuddy 干成了');
   await run('codebuddy', CB_TP, 'codebuddy 干成了');
 
   // Codex 形态判定应标 cli（通过 formOf 间接验证：起任务时带 form）

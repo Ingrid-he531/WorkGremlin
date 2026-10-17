@@ -14,7 +14,7 @@
  *                        the CLI path is ~/.codebuddy's session jsonl + reporter state file.
  *                        Sessions on both paths at once = two sessions in this floor (distinguished by
  *                        session_id), not two floors.
- *   2F WorkBuddy,
+ *   2F Cline,
  *   3F Codex CLI,
  *   4F Claude Code CLI —— *.jsonl session files in the on-disk directory, only file times are reliable;
  *                        the project name comes from finding cwd in the file's **first few lines** (see
@@ -309,7 +309,7 @@ function isDir(p) {
  *     exact (see doneFieldsOf), and the render layer's fast polling starts carrying ?session= too (the
  *     phase benefits likewise).
  *     Failure is safe: a shape mismatch returns empty → falls back to the old behavior, no mix-ups.
- *   - Other products (WorkBuddy CLI): the file name carries no session id, leave empty.
+ *   - Other products whose file name carries no session id: leave empty.
  * @param {string} name file name (with extension)
  * @param {string} kind product base name (products' agent: claude / codex / codebuddy …)
  * @returns {string} session id; empty string when it cannot be had
@@ -575,14 +575,14 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // enter the floor tooltip, not the session table.
       if (src.sessions === false) continue;
 
-      // ---- the kilo / opencode / lingma paths (7F / 8F / 6F-plugin) ----
-      // These are not "scan files" but polling each product's own on-disk store (kilo.db / opencode.db /
-      // Lingma local.db), with a shape different from cli/hook (they carry a true phase and a model).
-      // Their implementations have moved into each floor's file (kindHandlers in kilo.js / opencode.js /
-      // qoder.js), called by the generic dispatch below via src.kind, so debugging 6F/7F/8F no longer
-      // requires touching this file.
+      // ---- the cline / kilo / opencode / lingma paths (2F / 7F / 8F / 6F-plugin) ----
+      // These are not "scan files" but polling each product's own on-disk store (~/.cline/data, kilo.db /
+      // opencode.db / Lingma local.db), with a shape different from cli/hook (they carry a true phase and a model).
+      // Their implementations have moved into each floor's file (kindHandlers in cline.js / kilo.js /
+      // opencode.js / qoder.js), called by the generic dispatch below via src.kind, so debugging 2F/6F/7F/8F
+      // no longer requires touching this file.
 
-      // Generic dispatch: a floor's own source branch (kilo / opencode / lingma) takes precedence over the
+      // Generic dispatch: a floor's own source branch (cline / kilo / opencode / lingma) takes precedence over the
       // framework's built-in standard handler (plugin / cli / hook). This line is "each floor's stuff is
       // confined to its own file" landed —— adding / adjusting a floor touches only its file + floors.js,
       // this file stays unchanged.
@@ -1059,7 +1059,7 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       id: p.id,
       name: p.name,
       kind: p.kind,
-      // Which client this floor monitors (codebuddy / workbuddy / codex / claude) ——
+      // Which client this floor monitors (codebuddy / cline / codex / claude) ——
       // the office filters members by it, so switching to 3F should not show CodeBuddy's gremlins anymore
       // (member filtering recognizes by **agent base name**, see floorAcceptsClient in
       // renderer/src/lib/clientMatch.js)

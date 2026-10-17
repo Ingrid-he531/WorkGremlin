@@ -292,7 +292,7 @@ function tip(p) {
   // Whether this floor has a "plugin" form: a plugin route is attached among the sources (kind is
   // plugin, or the label contains Plugin — e.g. 3F/4F/6F/7F's 'CLI/Plugin', 5F's 'plugin'), or the
   // install list already has a plugin entry.
-  // A pure-CLI floor (2F WorkBuddy, label only cli) does not force a "not found" row.
+  // A pure-CLI floor (a source label with no "plugin") does not force a "not found" row.
   // (p.pluginRe is ignored: it's a RegExp and becomes {} through JSON, so the frontend can't get it.)
   const hasPluginForm =
     sources.some((src) => src.kind === 'plugin' || /plugin/i.test(src.label || '')) ||

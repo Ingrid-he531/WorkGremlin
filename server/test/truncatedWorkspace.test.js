@@ -71,7 +71,7 @@ function head(t) {
 /* ------------------------------ fixtures ------------------------------ */
 
 /** Real project path: deliberately long (> 48 bytes) to reproduce the 64-char cut. */
-const WS = path.join(TMP, 'Users', 'yingh', 'WorkBuddy', '2026-09-14-19-28-26', 'WorkGremlin');
+const WS = path.join(TMP, 'Users', 'yingh', 'Cline', '2026-09-14-19-28-26', 'WorkGremlin');
 fs.mkdirSync(WS, { recursive: true });
 fs.writeFileSync(path.join(WS, 'package.json'), JSON.stringify({ name: 'workgremlin' }));
 

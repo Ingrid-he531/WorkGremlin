@@ -374,7 +374,7 @@ function formToSource(form) {
  */
 const AGENT_LABELS = {
   codebuddy: 'CodeBuddy',
-  workbuddy: 'WorkBuddy',
+  cline: 'Cline',
   codex: 'Codex',
   claude: 'Claude Code',
   trae: 'TraeCode',

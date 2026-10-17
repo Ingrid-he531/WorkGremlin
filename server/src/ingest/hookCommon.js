@@ -366,7 +366,7 @@ function jsonlReplies(file) {
 }
 
 /**
- * Conversation body parsing for the IDE plugin form (the index.json format) -- shared by CodeBuddy / Qoder / WorkBuddy.
+ * Conversation body parsing for the IDE plugin form (the index.json format) -- shared by CodeBuddy / Qoder.
  * Format: the index history/<sessionId>/index.json (indented multi-line JSON, not JSONL), with bodies in messages/<id>.json
  * ({role, message:"<JSON string>"}) in the same directory. One round of replies is split into several assistant
  * fragments in the index; the fragments are joined into one by the last request, with the dedupe key using the request id.
@@ -766,7 +766,7 @@ function fixedFormOf(ev) {
  * The refactor moved session state into the dispatcher's in-memory Map (see hookDispatch.js),
  * but `/reporter-phase` and `freshestReporterWs` / listSessions(current/fresh) still read the
  * `<floor>@<workspace>@<session>.json` file. The plugin path (IDE extensions writing directly)
- * writes that file; the hook path (CodeBuddy / Codex / WorkBuddy / Trae / Qoder …) used to only
+ * writes that file; the hook path (CodeBuddy / Codex / Trae / Qoder …) used to only
  * `set` in memory — so those floors' real-time phase was never readable and the main console's
  * phase hung. Every `set` now syncs the same state to disk, matching the plugin path.
  *

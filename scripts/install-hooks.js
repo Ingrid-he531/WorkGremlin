@@ -3,15 +3,15 @@
 
 /**
  * Install WorkGremlin's reporting hook into each monitored product's user-level config
- * (CodeBuddy CLI+Plugin / WorkBuddy / Codex / Claude Code / TraeCode / Qoder).
+ * (CodeBuddy CLI+Plugin / Codex / Claude Code / TraeCode / Qoder).
  *
  * By default it installs **everything**: without --targets it walks every non-optional target in `all`
  * below, each doing "write only if installed, skip if not" (the check is looksInstalled). To add a new
  * product, add one entry to `all`.
  *
  * Usage:
- *   node scripts/install-hooks.js                       install (user-level: ~/.codebuddy + ~/.workbuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json)
- *   node scripts/install-hooks.js --targets=workbuddy    install only some (codebuddy / workbuddy / codex / claude / trae / qoder / qoder-cn / project)
+ *   node scripts/install-hooks.js                       install (user-level: ~/.codebuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json)
+ *   node scripts/install-hooks.js --targets=codex        install only some (codebuddy / codex / claude / trae / qoder / qoder-cn / project)
  *   node scripts/install-hooks.js --project              also write a project-level <repo>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            remove (only the entries we added; others' config untouched)
  *   node scripts/install-hooks.js --dry-run              only print what would be written, no disk writes
@@ -124,7 +124,7 @@ const EVENTS = [
 ];
 
 /**
- * CodeBuddy / WorkBuddy event table = EVENTS + `FinalStop`.
+ * CodeBuddy event table = EVENTS + `FinalStop`.
  *
  * `FinalStop` is the CodeBuddy family's **round end-state** event; the payload carries
  * `final_stop_reason ∈ completed | cancelled | failed | interrupted`
@@ -160,7 +160,7 @@ function parseArgs(argv) {
 /**
  * Hook command: `node <hook.js> --agent <name>` — one line per product, differing only in the --agent name.
  *
- * `name` is the **product family base name** (codebuddy / workbuddy / codex / claude / trae / qoder), not
+ * `name` is the **product family base name** (codebuddy / codex / claude / trae / qoder), not
  * a throwaway label:
  *   · the hook uses it to pick the event/tool vocabulary (the server dispatches by --agent; see
  *     server/src/ingest/hookCommon.js), and the default workstation name too — each floor gets its own
@@ -410,7 +410,6 @@ const CLI_BIN_DIRS = [
   path.join(HOME, '.local', 'bin'),
   path.join(HOME, 'bin'),
   path.join(HOME, '.codebuddy', 'bin'),
-  path.join(HOME, '.workbuddy', 'bin'),
   path.join(HOME, '.npm-global', 'bin'),
   '/usr/local/bin',
   '/opt/homebrew/bin',
@@ -495,7 +494,6 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
   };
   const codebuddyOurs = buildOurs(CODEBUDDY_EVENTS, 'codebuddy');
   const codexOurs = buildOurs(CODEX_EVENTS, 'codex');
-  const workbuddyOurs = buildOurs(CODEBUDDY_EVENTS, 'workbuddy');
   const traeOurs = buildOurs(EVENTS, 'trae');
   const claudeOurs = buildOurs(CLAUDE_EVENTS, 'claude');
   const qoderOurs = buildOurs(QODER_EVENTS, 'qoder');
@@ -509,14 +507,6 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       dir: path.join(os.homedir(), '.codebuddy'),
       plugin: true,
       ours: codebuddyOurs,
-    },
-    {
-      id: 'workbuddy',
-      label: 'WorkBuddy CLI',
-      file: path.join(os.homedir(), '.workbuddy', 'settings.json'),
-      cmd: 'workbuddy',
-      dir: path.join(os.homedir(), '.workbuddy'),
-      ours: workbuddyOurs,
     },
     {
       id: 'codex',
@@ -683,10 +673,10 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('[workgremlin] How it takes effect:');
     console.log('  · TraeCode: first confirm the global hooks.json is enabled in Settings > Hooks (external writes have a security gate), then reopen the session');
     console.log('  · CodeBuddy Plugin: reopen the session');
-    console.log('  · CodeBuddy / WorkBuddy CLI: changes do not take effect immediately; run /hooks to review them (external changes need approval)');
+    console.log('  · CodeBuddy CLI: changes do not take effect immediately; run /hooks to review them (external changes need approval)');
     console.log('  · Claude Code: a newly started session after writing takes effect directly (measured with claude --print, no approval);');
     console.log('                if it looks like "installed but nothing happens", review it once in the /hooks panel');
-    console.log('  · The main agent identity comes from the install target (codebuddy / codex / workbuddy / trae / claude / qoder), already written into the hook command\'s --agent; it cannot and need not be specified again');
+    console.log('  · The main agent identity comes from the install target (codebuddy / codex / trae / claude / qoder), already written into the hook command\'s --agent; it cannot and need not be specified again');
     console.log('  · 7F Kilo Code: **no hook** (measured 7.8.1: no hook subcommand / hooks.json), so we install the plugin;');
     console.log('                changes to kilo.jsonc need a **Kilo session reopen** to load. Without the plugin there is still a task ledger —');
     console.log('                the server\'s poller writes one row per round (read-only inference: phase greyed out, no closing summary);');

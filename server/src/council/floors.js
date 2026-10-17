@@ -8,7 +8,7 @@
  * for these two properties (see the notes on each recipe in server/src/council/agents.js):
  *   1F CodeBuddy / 4F Claude Code —— `--tools ""`
  *   7F Kilo Code  / 8F OpenCode   —— inject a permission config that denies everything
- * The remaining floors (2F WorkBuddy, 3F Codex, 5F TraeCode, 6F Qoder, 9F Copilot) either lack
+ * The remaining floors (2F Cline, 3F Codex, 5F TraeCode, 6F Qoder, 9F Copilot) either lack
  * a usable headless entry point on this machine or cannot have their tools disabled — so they
  * **do not appear in the council room**, rather than being invited first and excused later.
  * Whether read-only is achievable is the **threshold** for entering this whitelist, not a

@@ -89,7 +89,7 @@ export const COLORS = {
  *     7F Kilo Code shares an origin with it (see the evidence chain in server/src/products.js), but the two floors'
  *     furniture hues are deliberately separated —— floors are recognised "by product", not "by bloodline".
  *
- * Floors not listed here —— 1F CodeBuddy / 2F WorkBuddy —— use the baseline COLORS, visually identical to before.
+ * Floors not listed here —— 1F CodeBuddy / 2F Cline —— use the baseline COLORS, visually identical to before.
  * After the TraeCode merge it occupies only 5F, and the old 6F (IDE) warm amber set moved to 5F wholesale;
  * the old 6F verdigris set (old 5F plugin) is no longer needed —— one floor gets exactly one material set.
  */

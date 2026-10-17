@@ -16,7 +16,7 @@
  *      (taskId / taskStartedAt / taskTitle …), indexed by sessionId; when it cannot be found,
  *      the floor fishes it back out of the bus itself (currentTaskFor).
  *
- * Floors without a `handleHookEvent` (Kilo / Copilot / OpenCode / Trae and other poll-driven
+ * Floors without a `handleHookEvent` (Cline / Kilo / Copilot / OpenCode / Trae and other poll-driven
  * ones) simply ignore events; their ledgers are covered by their own synchronizers and do not
  * go through this hook path.
  *

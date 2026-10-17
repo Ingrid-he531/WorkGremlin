@@ -52,7 +52,7 @@ renderer/               Vue 3 + Vite + Pinia
   src/iso/              手写 Canvas 等距办公室引擎（engine 2000+ 行、officeMap、sprites、mainConsole）
   src/views/            IsoOfficeView（主）/ OfficeSceneView（旧 2D，保留对比）/ Workstation / Conversation / DeskLab
   src/stores/           project（成员+连接）/ sessions（楼层+会话）/ messages / mainAgent（相位状态机）
-packages/reporter/      agent 侧上报 SDK + CLI + hook（CodeBuddy 插件/CLI、WorkBuddy CLI）
+packages/reporter/      agent 侧上报 SDK + CLI + hook（CodeBuddy 插件/CLI、Codex / Claude Code / Qoder CLI）
 scripts/                dev / build / postinstall(electron-rebuild) / install-hooks / subagents
 docs/                   需求、技术方案、排期、测试策略、runbook、楼层电梯设计、本文
 ```
@@ -62,7 +62,7 @@ docs/                   需求、技术方案、排期、测试策略、runbook�
 ## 2. 运行时数据流
 
 ```
-CodeBuddy 插件/CLI、WorkBuddy CLI 的 hook ─┐
+CodeBuddy 插件/CLI、Codex / Claude Code 的 hook ─┐
 reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartbeat,status,task/*,message,file/touch}
                                           │        │
 .codebuddy/agents/*.md（名册）────────────┤        v
@@ -135,7 +135,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | 实体 | 关键字段 | 与文档的差异 |
 | --- | --- | --- |
 | `projects` | `id`、`name`、`workspace_path`、`main_conversation_id` | 原 `teams` 表；演示工程用保留 id `__demo__` |
-| `members` | `ephemeral`、`project_label`、`role`、`reported`、**`client`** | 新增临时成员（幽灵）与所属项目名；工牌级别不下库（运行时判定）；**`client` = 来源客户端（codebuddy / workbuddy / codex / claude，NULL = 通用），办公室按当前楼层过滤就靠它** |
+| `members` | `ephemeral`、`project_label`、`role`、`reported`、**`client`** | 新增临时成员（幽灵）与所属项目名；工牌级别不下库（运行时判定）；**`client` = 来源客户端（codebuddy / cline / codex / claude，NULL = 通用），办公室按当前楼层过滤就靠它** |
 | `agent_status` | `state`、`progress`、`current_files`、`degraded`、`source` | 无 `degraded_reasons[]` |
 | `tasks` | `state`、`progress`、`started_at`、`ended_at` | **无** `progress_source` / `blocked_reason` / `waiting_on` / `error_type` |
 | `messages` | `dedupe_key` 唯一、`archived_at`、`content_truncated` | **无** `redacted` / `redaction_hits` / `ingested_at_ms` / `reply_to` |
@@ -154,7 +154,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | 楼层 | 产品 | 落盘形态 |
 | --- | --- | --- |
 | 1F | CodeBuddy（**CLI 与 Plugin 合并成一层**） | CLI：`~/.codebuddy` 下的 `*.jsonl` + reporter 状态文件；Plugin：编辑器 globalStorage 的结构化目录（genie-history / todos / message-queue / file-changes，唯一能拿到运行态的那一路）。两路都在这一层，同时开着两种形态 = 这一层里的**两条会话**（按 `session_id` 区分），不是两个楼层 |
-| 2F | WorkBuddy | `~/.workbuddy` 下 `*.jsonl`（只有 CLI 一个形态，上报身份 client=workbuddy） |
+| 2F | Cline（**CLI 与 VS Code 扩展合并成一层**） | 数据根 `~/.cline/data`（`$CLINE_DATA_DIR` → `$CLINE_DIR/data` → `~/.cline/data`，扩展与 CLI **共用同一份落盘**；VS Code 的 `globalStorage/saoudrizwan.claude-dev` 只是迁移前的旧布局，扩展自己标为 `LegacyStateReader`）。会话索引 = `db/sessions.db`（SQLite `sessions` 表：`session_id` / `source`（vscode / cli）/ `model` / `cwd` / `workspace_root` / `updated_at` / `metadata_json`）；对话 = `sessions/<id>/<id>.messages.json`（`{ messages: [{ role, content:[…], ts }] }`，content 项 ∈ `text | thinking | tool_use | tool_result`）、元数据 = `sessions/<id>/<id>.json`（标题 / token / 费用 / model）。Cline **自带 hook 子系统**（`preToolUse` / `postToolUse` / `userPromptSubmit` / `taskStart` / `taskResume` / `taskCancel` / `taskComplete` / `preCompact` / `notification`），但是 opt-in 且 WorkGremlin **暂未接入** → 2F 是**轮询楼层**（同 7F/8F）：相位由**消息尾巴**推导（assistant 尾巴 `tool_use`→调用工具、`thinking`→思考中、`text`→待命；user 尾巴 `tool_result`/提示词→思考中），相位一律 `inferred:true`。形态（CLI / 扩展）取会话行的 `source`，两者并存在这一层里的**两条会话**。子代理行（`is_subagent=1`）不单列。自检见 `npm run test:cline` |
 | 3F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
 | 4F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分；这一轮走的形态（终端 / VS Code 扩展）也落在同一条 `user` 记录上（`entrypoint`，见上页 ③） |
 | 5F | TraeCode（**IDE 与 Plugin 合并成一层**） | 会话来源是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值）：两个形态都没有可扫的**会话**落盘 —— IDE `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与 `project_memory.md` 是记忆文件（文件名带 session_id，但不是对话记录、也没有工程路径）；插件 `~/.marscode` 实测只有 ai-chat 二进制、日志与 `ai-agent/database.db` / `snapshot/<链 id>/v2/.git` 文件快照（前者是**加密数据、非可读 sqlite**，后者是逐轮改动的 git 快照）—— **所以插件这一形态目前不支持会话记录**。**两处落盘都在楼层胶囊的 tooltip 里逐路列出**（IDE / plugin 两行，**不带 `sources[].note`**，只列目录与落盘统计）。形态靠上报身份（`client`）区分，任务列表按 `CLIENT_LABELS` 显示 **TraeCode IDE** / **TraeCode Plugin**，不按楼层特判 |
@@ -196,7 +196,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | 楼层 | 产品 | 取消信号（落盘真值） | 落地位置 |
 | --- | --- | --- | --- |
 | 1F | CodeBuddy（CLI + Plugin） | ① CLI 走 `Interrupt`（有则用）；② **`FinalStop`**（家族的"一轮终态"事件）：payload 带 `final_stop_reason ∈ completed | cancelled | failed | interrupted` —— 取到 cancelled/interrupted 就按取消收尾（`hook.js` 的 `finishCancelled`），completed/failed 不动（交给 `Stop`，免重复收工）。已由安装器写进 `~/.codebuddy/settings.json`（`CODEBUDDY_EVENTS`，Trae 不并进来）。③ **插件（IDE 扩展）**：取消时**一个 hook 事件都不发**（扩展日志只有 `AgentState.cancelled`，没有任何 `HookExecutor` 跑 Stop/FinalStop）→ 服务端读它自己那份落盘 `message-queue/*.json` 的 `conversations[<会话>].runtime`：`paused:true + pauseReason:'cancel'` 且 `updatedAt ≥ 本轮开始` ⇒ 合成取消（`sessions.js` 的 `codebuddyPauseCancelAt`，会话 id 与状态文件一字不差）。④ 曾有"taskId 占着 + 空闲超 `TASK_RUN_MS` + transcript 末轮 `state='running'` ⇒ 判被打断"的兜底，**2026-09-29 去掉**（分不清"还在慢慢想"和"被打断"） | `hook.js`（`--agent codebuddy`）+ `scripts/install-hooks.js` + `sessions.js`；回归 `test:final-stop`（11 例）、`test:codebuddy-cancel`（12 例：不再合成 + pause 信号 + 相位作废） |
-| 2F | WorkBuddy | 同 1F 家族（同一条 hook，`--agent workbuddy`） | `hook.js` |
+| 2F | Cline | 无（WorkGremlin 未接入 Cline 的 hook）→ 不亮「任务取消」，收尾按「任务完成」 | —— |
 | 3F | Codex | ① 显式 `Interrupt` 事件；② 交互式会话常**不发** `Interrupt`，Stop 时读 rollout 里的 `event_msg/turn_aborted`（reason=interrupted）兜底 | `hook.js` 的 `runInterrupted`/`turnInterrupted`，回归 `test:stop-interrupt` |
 | 4F | Claude Code | Claude 不发 `Interrupt`，且实测（2026-09-29）按"停止"后**一个 hook 事件都不发**（Stop / SessionEnd / Notification 全无）→ hook 侧够不着，改由**服务端轮询**自己认，两个信号：① transcript 尾部那条 `[Request interrupted by user]`（模型已输出 / 正在跑工具时打断）；② **早打断**（刚提交、模型一个字都没吐就 ESC，CLI 连 transcript 一行都不写）看 Claude 自己的会话状态文件 `<claudeHome>/sessions/<pid>.json` 的 `status='idle'` + `statusUpdatedAt`（**未公开内部文件**，用户明确同意用；开轮 3s 宽限 + idle 时间戳必须晚于本轮开始，防误伤正常一轮） | `sessions.js` 的 `claudeInterruptTail` / `claudeSessionStatus` / `claudeInterruptOf`（+ `hook.js` 的 `turnInterrupted`），回归 `test:claude-cancel` / `test:stop-interrupt` |
 | 5F | TraeCode | **没有可读的取消信号**（无 transcript 可写、hook 只到 Stop/SessionEnd）→ 不亮「任务取消」，收尾仍按「任务完成」 | —— |
@@ -373,7 +373,7 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 | 楼层 | 产品 | 实时相位来源 | 写入 / 读取路径 |
 | --- | --- | --- | --- |
 | 1F | CodeBuddy | **hook** | `hook.js` 写状态文件，`readReporterPhase` 读 |
-| 2F | WorkBuddy | **hook** | 同上 |
+| 2F | Cline | **落盘** | `FLOORS.cline.readPhase = clineMainPhase`（读 `~/.cline/data` 的 `sessions.db` + 会话 JSON，`inferred`） |
 | 3F | Codex | **hook** | 同上 |
 | 4F | Claude Code | **hook** | 同上 |
 | 5F | TraeCode | **hook** | 同上（会话本身也只来自状态文件） |

@@ -40,6 +40,7 @@ const { RE_GITHUB_COPILOT } = require('../src/floorCopilot');
 const sessionsMod = require('../src/sessions');
 const kiloMod = require('../src/floorKilo');
 const opencodeMod = require('../src/floorOpencode');
+const clineMod = require('../src/floorCline');
 
 /* 固定数据打桩：只把"厂商落盘"那一层换掉，repo / 路由 / 同步器全是真的。
  * [9] 那一节要跑**真实的扫盘**证明别的产品的会话不会被写进 9F —— 用一个开关切过去：
@@ -50,6 +51,7 @@ let lastScanOpts = null;
 let copilotRows = [];
 let kiloRows = [];
 let opencodeRows = [];
+let clineRows = [];
 sessionsMod.listSessions = (opts = {}) => {
   lastScanOpts = opts;
   return scanReal ? realListSessions(opts) : { sessions: copilotRows };
@@ -59,6 +61,9 @@ kiloMod.listKiloSessions = () => kiloRows;
 kiloMod.readKiloRounds = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).rounds || []);
 opencodeMod.listOpencodeSessions = () => opencodeRows;
 opencodeMod.readOpencodeTurns = (sid) => ((opencodeRows.find((r) => r.id === sid) || {}).turns || []);
+// 2F 同样是「每一轮一条」：会话行上挂 `rounds`（形状同 floorCline 的 readClineRounds）
+clineMod.listClineSessions = () => clineRows;
+clineMod.readClineRounds = (sid) => ((clineRows.find((r) => r.id === sid) || {}).rounds || []);
 
 const copilotMod = require('../src/floorCopilot');
 const { syncCopilotTasks } = copilotMod;
@@ -66,6 +71,7 @@ const { syncKiloTasks } = require('../src/floorKilo');
 // Copilot 的模型来自 VS Code state.vscdb，测试把它换成熟桩（见 copilot.js 的 syncCopilotTasks）
 copilotMod.copilotCurrentModel = () => 'GPT-5 mini';
 const { syncOpencodeTasks } = require('../src/floorOpencode');
+const { syncClineTasks } = require('../src/floorCline');
 
 let pass = 0;
 let fail = 0;
@@ -95,6 +101,7 @@ const products = detectProducts();
 const clientsOf = (id) => ((products.find((p) => p.id === id) || {}).clients) || [];
 const F9 = clientsOf('9F');
 const F7 = clientsOf('7F');
+const F2 = clientsOf('2F');
 
 /** 成员卡状态（工位上那只小怪物显示的相位） */
 function stateOf(memberId) {
@@ -803,6 +810,58 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   );
   srv2.close();
   srvPhase.close();
+
+  console.log('[8] 2F Cline：每一轮一条台账（收工的一轮 + 在飞那一轮）');
+  ok('2F 接纳 cline', F2.includes('cline'), F2.join(','));
+  const c0 = Date.now() - 6 * 60_000;
+  const cRun = Date.now() - 2_000;
+  clineRows = [
+    {
+      id: 'cline-sid-1',
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      lastEventAt: Date.now(),
+      title: '把 2F 接上台账',
+      model: 'cline-free/nemotron',
+      tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 },
+      rounds: [
+        { index: 0, prompt: '第一轮用户任务', startedAt: c0, endedAt: c0 + 20_000, outcome: 'done', files: ['/tmp/p1/src/x.js'], result: '' },
+        { index: 1, prompt: '在飞这一轮', startedAt: cRun, endedAt: 0, outcome: 'running', files: [], result: '', tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } },
+      ],
+    },
+  ];
+  ok('同步器写 2 条（收工一轮 + 在飞一轮）', syncClineTasks({ bus, repo }) === 2);
+  const runC = repo.getTaskRun.get('cline:cline-sid-1:1');
+  ok('台账行的 client 是楼层接纳的身份', Boolean(runC) && F2.includes(runC.client), runC && runC.client);
+  const itemsC = await get(`project=p1&client=${F2.join(',')}&limit=50`);
+  const rowC0 = itemsC.find((t) => t.id === 'cline:cline-sid-1:0') || null;
+  const rowC1 = itemsC.find((t) => t.id === 'cline:cline-sid-1:1') || null;
+  ok('按 2F 楼层筛选能取到这两条', Boolean(rowC0) && Boolean(rowC1), JSON.stringify(itemsC.map((t) => t.id)));
+  ok('标题 = 那一轮用户说的话', Boolean(rowC0) && rowC0.title === '第一轮用户任务', rowC0 && rowC0.title);
+  ok('在飞那轮是 running', Boolean(rowC1) && rowC1.state === 'running', rowC1 && rowC1.state);
+  ok('模型信息带上了（Cline 的 session.model）', Boolean(rowC0) && rowC0.model === 'cline-free/nemotron', rowC0 && rowC0.model);
+  ok('改动文件按工程相对路径落库', Boolean(rowC0) && String(rowC0.files_json) === JSON.stringify(['src/x.js']), rowC0 && rowC0.files_json);
+  ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('cline@p1') === 'busy' && taskIdOf('cline@p1') === 'cline:cline-sid-1:1', `${stateOf('cline@p1')} / ${taskIdOf('cline@p1')}`);
+
+  console.log('[8b] 2F Cline：在飞那轮收工 → done + 成员卡回落 idle + token 真值');
+  clineRows = [
+    {
+      ...clineRows[0],
+      rounds: [clineRows[0].rounds[0], { ...clineRows[0].rounds[1], endedAt: Date.now(), outcome: 'done' }],
+    },
+  ];
+  syncClineTasks({ bus, repo });
+  const doneC = repo.getTask.get('cline:cline-sid-1:1');
+  ok('那一轮落成 done', Boolean(doneC) && doneC.state === 'done', doneC && doneC.state);
+  ok('成员卡回落 idle', stateOf('cline@p1') === 'idle', stateOf('cline@p1'));
+  const tokensC = repo.getTaskRun.get('cline:cline-sid-1:1');
+  ok('token 真值带上（input/output）', Boolean(tokensC) && tokensC.input_tokens === 100 && tokensC.output_tokens === 20, JSON.stringify(tokensC));
+
+  console.log('[8c] 2F Cline：源里已经没有的那几轮被收掉（别挂在 running 上冒充「已取消」）');
+  clineRows = [{ ...clineRows[0], rounds: [{ ...clineRows[0].rounds[1] }] }];
+  syncClineTasks({ bus, repo });
+  ok('源里没有的第 0 轮被收掉', !repo.getTaskRun.get('cline:cline-sid-1:0'), JSON.stringify(repo.getTaskRun.get('cline:cline-sid-1:0')));
+  ok('仍在源里的第 1 轮保留', Boolean(repo.getTaskRun.get('cline:cline-sid-1:1')));
 
   server.close();
   close();

@@ -8,6 +8,9 @@ const { kiloMainPhase, readKiloDone, kiloInstrumented } = require('../../floorKi
 // reporter state file; without it (or before it ever wrote) we fall back to deriving it by polling
 // opencode.db. The shape differs from 7F, see the notes below.
 const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('../../floorOpencode');
+// 2F Cline: Cline has no WorkGremlin hook installed (its own hooks are opt-in and unused here), so
+// phase / done markers are derived by polling its own store (`~/.cline/data`).
+const { clineMainPhase, readClineDone, clineInstrumented } = require('../../floorCline');
 
 
 /**
@@ -130,6 +133,34 @@ function createSessionsRouter({ workspace }) {
       // "Is it hooked up": the plugin is installed (state file exists) **or** this session is in the
       // store —— either one counts as true.
       const instrumented = Boolean(metaTruth.instrumented || kiloInstrumented(phaseSessionId));
+      return res.json({
+        ok: true,
+        workspacePath: useTruth ? ws || fallbackWs : fallbackWs,
+        instrumented,
+        session: session || phaseSessionId,
+        sessionId: phaseSessionId,
+        done: done || null,
+        ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
+      });
+    }
+
+    // ---- 2F Cline: pure polling (no WorkGremlin hook installed for it) ----
+    // Same shape as 7F: the render layer cannot and need not tell the two paths apart. Cline's own
+    // hooks are opt-in and WorkGremlin does not install into them, so phase / done markers come from
+    // polling its store (`~/.cline/data`), always flagged inferred.
+    if (clientListHas(client, 'cline')) {
+      const fallbackWs = ws || cur.workspacePath || '';
+      const rpTruth = reporterMainPhase(ws, client, session);
+      const metaTruth = reporterStateMeta(ws, client, session);
+      const useTruth = Boolean(rpTruth && rpTruth.phase);
+      const rpPoll = useTruth ? null : clineMainPhase(fallbackWs, session);
+      const rp = rpTruth && rpTruth.phase ? rpTruth : rpPoll;
+      const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
+      const doneTruth = readReporterDone(ws, client, phaseSessionId);
+      const done = doneTruth && doneTruth.at
+        ? doneTruth
+        : toReporterDone(phaseSessionId ? readClineDone(phaseSessionId, { title: '', fileCount: 0 }) : null, phaseSessionId, fallbackWs);
+      const instrumented = Boolean(metaTruth.instrumented || clineInstrumented(phaseSessionId));
       return res.json({
         ok: true,
         workspacePath: useTruth ? ws || fallbackWs : fallbackWs,

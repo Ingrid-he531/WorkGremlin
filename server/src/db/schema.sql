@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS members (
   ephemeral      INTEGER NOT NULL DEFAULT 0,
   -- The project name the ephemeral member belongs to (the UI falls back to role when absent)
   project_label  TEXT,
-  -- Source client: codebuddy / workbuddy / codex / claude; NULL = unknown (demo data, manual scripts).
+  -- Source client: codebuddy / cline / codex / claude; NULL = unknown (demo data, manual scripts).
   -- This is what the office filters on by "the current floor's client" (NULL counts as generic, shown on
   -- every floor).
   client         TEXT
@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   id                  TEXT PRIMARY KEY,   -- = tasks.id
   project_id          TEXT NOT NULL,
   member_id           TEXT NOT NULL,      -- main agent: codebuddy@<project> / codex@<project>
-  client              TEXT,               -- codebuddy / workbuddy / codex / claude
+  client              TEXT,               -- codebuddy / cline / codex / claude
   -- Axis 2 (session): which session this turn of user work belongs to. When one agent has two sessions open at
   -- once, the report must be able to tell "which session made these changes". NULL = old data / a report with
   -- no session identifier.
