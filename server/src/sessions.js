@@ -576,6 +576,31 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
 }
 
 /**
+ * Snapshot backfill (rolling ticker's phase): CLI / Hook session rows are listed with
+ * `phase: 'unreported'` because that path never fabricates a phase (see sessionRegistry.handleCliHook,
+ * the "never fabricate" discipline). The reporter state file, however, holds the live phase of **every**
+ * session — one file per session, see shared/paths.statePath — it is just that nothing read it for a
+ * **non-selected** session (the main console asks /reporter-phase for the selected one only).
+ *
+ * Resolve it here through the same dispatcher the console uses (reporterMainPhase), so the session
+ * snapshot — and everything that reads it, e.g. the ticker's phase suffix — gets the reported truth
+ * too (including "awaiting authorization", which a hook floor produces but a phase-less row never showed).
+ *
+ * Floors that already carry their own phase in the snapshot row (a `readPhase` override: 6F Qoder reads
+ * the Lingma DB, 9F Copilot reads its own SQLite) are left untouched — their own handler already wrote
+ * the inferred phase there, and readPhase's contract is not the generic (workspacePath, client, session).
+ *
+ * @returns {object|null} a reporterMainPhase-shaped phase, or null when there is nothing to fill
+ */
+function reporterSnapshotPhase(workspacePath, client, session) {
+  if (!session) return null;
+  const base = String(client || '').trim().toLowerCase();
+  const floor = FLOORS[base];
+  if (floor && typeof floor.readPhase === 'function') return null;
+  return reporterMainPhase(workspacePath, client, session);
+}
+
+/**
  * The reporter hook's "active window": UserPromptSubmit sets taskId, Stop clears it.
  * Only inside this window (the user submitted a task and the agent has not finished) does it count as "alive";
  * a session that exists but has no events is always idle — the main console uses this to decide whether to
@@ -1472,6 +1497,7 @@ module.exports = {
   sessionModel,       // Which model this session uses (TraeCode reads globalStorage; others stay empty)
   listSessions,
   reporterMainPhase,
+  reporterSnapshotPhase,
   freshestReporterWs,
   readReporterPhase, // The live phase on the main console (the invalidation-after-interrupt logic lives here; regression tests watch it directly)
 };

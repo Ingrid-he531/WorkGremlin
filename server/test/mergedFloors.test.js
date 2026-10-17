@@ -17,6 +17,8 @@
  *     [A4] **陈旧 jsonl 不算数**：mtime 三小时前的 jsonl 在，正在跑（只有 hook 状态文件）的
  *          会话照样要进表 —— jsonl 优先的判据必须是"扫到了还活着的会话"，不是"扫到了任何行"
  *     [A5] jsonl 那一路优先：CLI 落盘扫得到**活**会话时，hook 那一路整层让位（同一条会话不列两遍）
+ *     [A7] 快照回填真相位（方案 A）：CLI / hook 行的 `phase` 不再恒为 `unreported`，而是回填
+ *          reporter 状态文件里的真相位（滚动屏 ticker 靠它出「等待授权」）；没有真相位就保持 unreported
  *   B. 5F TraeCode（IDE + 插件合并，会话只能靠 hook 状态文件）
  *     [B1] 一层：client 恒为基名 trae；三路来源（IDE 落盘 + 插件落盘 + hook）
  *     [B2] **两个形态的落盘目录都要列出来**（~/.trae-cn 与 ~/.marscode）；这两路只作展示、
@@ -377,6 +379,34 @@ head('[A6] CLI 收到 SessionEnd 后重开：旧 JSONL 不能挡住新 SessionSt
   ok('新 SessionStart 会话在尚未输入时就已列出', Boolean(reopened), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
   ok('新会话无需等 JSONL 首条记录就归属当前工程', reopened && reopened.projectPath === WS && reopened.mine, reopened && `${reopened.projectPath} mine=${reopened.mine}`);
   ok('SessionEnd 的旧会话不再作为活跃会话列出', !floor.sessions.some((s) => s.sessionId === CLI_SID), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
+}
+
+/* [A7] 会话快照回填 reporter 真相位（方案 A，滚动屏 ticker 靠它出「等待授权」） */
+head('[A7] 快照回填真相位：CLI / hook 那一路的会话行不再恒为 unreported');
+{
+  // A hook floor produces "awaiting authorization" (PreToolUse with no PostToolUse → pending), but a
+  // phase-less snapshot row could only ever fall back to "thinking" in the ticker. The state file does
+  // hold this session's live phase — the snapshot backfill (sessions.reporterSnapshotPhase) reads it.
+  const SID7 = 'eeee1111-2222-3333-4444-555566667777';
+  writeState('codebuddy', SID7, {
+    client: 'codebuddy',
+    hb: { pid: process.pid, lastEventAt: Date.now() },
+    sessionPhase: { phase: 'await', ts: Date.now(), workspacePath: WS, tool: 'Bash', cmd: 'rm -rf build', file: '' },
+    pending: { tool: 'Bash', cmd: 'rm -rf build', at: Date.now() },
+  });
+  const snap = snapshot({ force: true, workspacePath: WS });
+  const floor = snap.floors.find((f) => f.id === '1F');
+  const row = floor.sessions.find((s) => s.sessionId === SID7);
+  ok('CLI / hook 行的快照相位被回填成真相位（await，而不是 unreported）', Boolean(row) && row.phase === 'await', row && row.phase);
+  ok('回填的相位带出「等待授权」的动作', Boolean(row) && /Bash/.test(row.action || ''), row && JSON.stringify({ action: row.action, tool: row.tool }));
+  ok('回填后不再标为推断（reporter 上报的是真值）', Boolean(row) && row.inferred === false, row && String(row.inferred));
+
+  // 没有真相位的会话（本层没接 hook）保持 unreported —— 绝不臆造
+  const SID7b = 'eeee9999-2222-3333-4444-555566667777';
+  writeState('codebuddy', SID7b, { client: 'codebuddy', hb: { pid: process.pid, lastEventAt: Date.now() }, sessionPhase: null });
+  const snap2 = snapshot({ force: true, workspacePath: WS });
+  const row2 = snap2.floors.find((f) => f.id === '1F').sessions.find((s) => s.sessionId === SID7b);
+  ok('没有真相位的会话保持 unreported（不臆造）', Boolean(row2) && row2.phase === 'unreported', row2 && row2.phase);
 }
 
 /* [B1] 5F TraeCode：IDE 与插件也是一层 */

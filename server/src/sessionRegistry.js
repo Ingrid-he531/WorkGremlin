@@ -44,7 +44,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const log = require('./log');
-const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase } = require('./sessions');
+const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase, reporterSnapshotPhase, freshestReporterWs } = require('./sessions');
 const { detectProducts } = require('./floors');
 const { floorOf, floorByAgent } = require('./floors');
 const { formToSource } = require('@workgremlin/shared');
@@ -1004,7 +1004,29 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         // rather than "now".
         const taskTitle = taskState === 'running' ? runningTitleBySession.get(sessionKey) || '' : '';
         const taskStartedAt = taskState === 'running' ? Number(runningStartedBySession.get(sessionKey) || 0) : 0;
-        return { ...s, taskState, taskTitle, taskStartedAt };
+        const row = { ...s, taskState, taskTitle, taskStartedAt };
+        // Snapshot backfill (see sessions.reporterSnapshotPhase): a CLI / Hook row is listed with
+        // phase 'unreported' — that path never fabricates a phase — but the reporter state file does hold
+        // this session's live phase. Fill it here so a **non-selected** session shows the truth too; the
+        // rolling ticker resolves its phase suffix from this snapshot (TaskTicker's phaseOfTask), and
+        // without this it could only ever fall back to "thinking" for hook floors (never "awaiting
+        // authorization"). Unresolvable (no hook installed / stale phase / no session id) stays
+        // 'unreported' — never fabricate.
+        if (row.phase === 'unreported' && row.sessionId) {
+          const client = String((p.clients && p.clients[0]) || p.dataKind || '');
+          const ws = freshestReporterWs(row.projectPath || workspacePath || '', client, row.sessionId);
+          const rp = reporterSnapshotPhase(ws, client, row.sessionId);
+          if (rp && rp.phase) {
+            row.phase = rp.phase;
+            row.action = rp.action || '';
+            row.target = rp.target || '';
+            row.context = Array.isArray(rp.context) ? rp.context : [];
+            row.tool = rp.tool || '';
+            row.prompt = rp.prompt || '';
+            row.inferred = false; // the reporter hook / plugin wrote it: reported truth, not an inference
+          }
+        }
+        return row;
       });
     return {
       id: p.id,

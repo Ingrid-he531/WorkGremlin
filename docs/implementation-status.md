@@ -362,6 +362,56 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 
 ---
 
+### 4.3 实时相位的来源与滚动屏 ticker 的相位取法（2026-10-17）
+
+**先分清两条轴**：`sources[].kind`（`cli` / `hook` / `plugin` / `dir` / `kilo` / `opencode` / `lingma`）
+说的是「这个会话从哪儿被**列出来**」，与相位无关；相位走的是另一套 `reporterMainPhase`。
+
+统一入口 `reporterMainPhase(workspacePath, client, session)`（`server/src/sessions.js`）
+= `FLOORS[client].readPhase || readReporterPhase`。**谁提供真实相位**按楼层分三类：
+
+| 楼层 | 产品 | 实时相位来源 | 写入 / 读取路径 |
+| --- | --- | --- | --- |
+| 1F | CodeBuddy | **hook** | `hook.js` 写状态文件，`readReporterPhase` 读 |
+| 2F | WorkBuddy | **hook** | 同上 |
+| 3F | Codex | **hook** | 同上 |
+| 4F | Claude Code | **hook** | 同上 |
+| 5F | TraeCode | **hook** | 同上（会话本身也只来自状态文件） |
+| 6F | Qoder | **落盘** | `FLOORS.qoder.readPhase = readLingmaPhase`（读 Lingma `local.db`，`inferred`） |
+| 7F | Kilo Code | **plugin** | 装了 WorkGremlin 插件 → 状态文件（真值，含「等待授权」）；没装 → 轮询 `kilo.db`（`inferred`） |
+| 8F | OpenCode | **plugin** | 装了插件 → 状态文件（真值，含「等待授权」）；没装 → 轮询 `session_message`（`inferred`） |
+| 9F | GitHub Copilot | **落盘** | `FLOORS.copilot.readPhase = readCopilotPhaseFromSqlite`（`inferred`） |
+
+hook 与 plugin 写的是**同一个**状态文件 `~/.workgremlin/hooks/<client>@<工程>@<会话>.json`
+（`shared/paths.js` 的 `statePath`），**每个会话一份** —— 所以盘上每个会话都有实时相位，一条不少。
+
+**消费者谁能读到**：
+
+| 通道 | 粒度 | 谁能拿到 |
+| --- | --- | --- |
+| `GET /api/v1/reporter-phase`（1.5s 快轮询） | **一次一个会话** | 只有「选中楼层 + 选中会话」：前端只带 `?client=&session=`（`IsoOfficeView.vue`）；服务端 `if (!session) return null`，遍历状态文件时只留点名那条（`sameSession`）—— **故意如此**，早先「同 client 取最新」会让控制台显示别的会话的相位 |
+| `GET /api/v1/sessions`（会话快照，5s） | 每个会话都有 `phase` | `cli`/`hook` 行恒为 `'unreported'`（该路径不臆造相位）；plugin 行由该路 handler 写入（当前会话叠 reporter 真值，其余按落盘推断） |
+
+滚动屏 ticker 用的是第二层：`/api/v1/task-feed` 每行带 `client` + `sessionId`
+（`server/src/http/routes/query.js`），ticker 拿 `sessionId` 去 join 快照的 `phase`
+（`TaskTicker.vue` 的 `phaseOfTask`）。于是 hook 楼层的 ticker 后缀永远只能兜底成「思考中」
+（`runningPhaseOfTask`）—— **这就是「Codex 控制台能亮等待授权、滚动屏却不会」的根因**。
+
+**方案 A（本次落地）：会话快照构建时回填真相位。** 数据都在状态文件里，只是没人为**非选中**会话读。
+在 `sessionRegistry.js` 的 `snapshot()` 里，对 `phase === 'unreported'` 的会话行调一次
+`reporterSnapshotPhase(ws, client, sessionId)`（`sessions.js`，内部即 `reporterMainPhase`；
+只对**没有自己 `readPhase` 覆盖**的楼层，即 hook / plugin 楼层；6F/9F 的行已由各自 handler 带推断相位，
+不动），命中就覆盖 `phase / action / target / context / tool / prompt` 并把 `inferred` 置假。范围与取舍：
+
+- ticker **一行不改**：它本来就 join 快照，回填后直接读到真值（能出「等待授权」）；
+- `/reporter-phase` 保持「必须点名」的防串扰设计，不动；
+- 每轮快照多的开销 =「每个未上报会话 1~2 次状态文件目录扫描」（`hooksDir` 只有几个文件）；
+- 拿不到（未装 hook / 相位过期 / 会话无 id）就照旧 `unreported`，ticker 兜底「思考中」—— 绝不臆造。
+
+自检：`npm run test:floors` 的 [A7]（回填成 `await`、带动作、`inferred=false`；无真相位仍 `unreported`）。
+
+---
+
 ## 5. 文档 ↔ 实现 差异清单
 
 | # | 条目 | 文档说法 | 实现现状 | 证据 |
