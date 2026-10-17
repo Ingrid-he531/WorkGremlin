@@ -26,7 +26,7 @@
  *     [C2] tail is tool_use -> not done
  *     [C3] an expired done marker (beyond DONE_TTL_MS) -> treated as absent
  *   D. Per-turn list: the source of the ledger's "one row per turn"
- *     [D1] turn boundary = <user_input>; the user's words / changed files / finish test
+ *     [D1] turn boundary = <user_input>; the user's words / finish test (no changed files: Cline cannot see them)
  *     [D2] the last turn carries the real token values
  *   E. Unreadable must not bubble
  *     [E1] the db lacks the sessions table (Cline changes its schema) -> floor still listed, sessions empty, no throw
@@ -258,7 +258,7 @@ head('[D] 逐轮清单');
   const r0 = rounds[0] || {};
   const r1 = rounds[1] || {};
   ok('[D1] 第一轮：原话 + 收工', r0.prompt === '第一轮任务' && r0.outcome === 'done' && Number(r0.endedAt) > 0, JSON.stringify(r0));
-  ok('[D1] 第一轮改动文件只留工具碰过的路径', Array.isArray(r0.files) && r0.files.includes('/tmp/proj/src/a.js'), JSON.stringify(r0.files));
+  ok('[D1] 不记改动文件（Cline 只看得到工具调用，看不到改了哪些文件）', !('files' in r0), JSON.stringify(r0.files));
   ok('[D1] 在飞那轮：running', r1.prompt === '在飞这一轮' && r1.outcome === 'running' && !r1.endedAt, JSON.stringify(r1));
   ok('[D2] 最后一轮带 token 真值', r1.tokens && r1.tokens.input === 100 && r1.tokens.output === 20, JSON.stringify(r1.tokens));
 }

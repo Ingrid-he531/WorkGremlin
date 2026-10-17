@@ -633,6 +633,12 @@ function createRepo(db) {
       WHERE id = @id
     `),
     /**
+     * Clear a run's changed-file info (both columns to NULL). For a floor that cannot read which files a
+     * turn changed (2F Cline): endTaskRun's COALESCE treats NULL as "not reported, keep the old value",
+     * so an explicit clear is needed to avoid pinning a previously-written guess. NULL = unknown.
+     */
+    clearTaskRunFiles: db.prepare(`UPDATE task_runs SET file_count = NULL, files_json = NULL WHERE id = ?`),
+    /**
      * The tokens consumed by one round (four columns, semantics in the comments of schema.sql).
      *
      * Why a separate statement rather than folding it into endTaskRun: every field of endTaskRun is

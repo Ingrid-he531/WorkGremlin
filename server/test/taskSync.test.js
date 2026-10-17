@@ -823,10 +823,12 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       lastEventAt: Date.now(),
       title: '把 2F 接上台账',
       model: 'cline-free/nemotron',
+      // VS Code 扩展 → 插件形态；任务列表据此把客户端显示成 "Cline Plugin"
+      form: 'vscode',
       tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 },
       rounds: [
-        { index: 0, prompt: '第一轮用户任务', startedAt: c0, endedAt: c0 + 20_000, outcome: 'done', files: ['/tmp/p1/src/x.js'], result: '' },
-        { index: 1, prompt: '在飞这一轮', startedAt: cRun, endedAt: 0, outcome: 'running', files: [], result: '', tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } },
+        { index: 0, prompt: '第一轮用户任务', startedAt: c0, endedAt: c0 + 20_000, outcome: 'done', result: '' },
+        { index: 1, prompt: '在飞这一轮', startedAt: cRun, endedAt: 0, outcome: 'running', result: '', tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } },
       ],
     },
   ];
@@ -840,7 +842,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('标题 = 那一轮用户说的话', Boolean(rowC0) && rowC0.title === '第一轮用户任务', rowC0 && rowC0.title);
   ok('在飞那轮是 running', Boolean(rowC1) && rowC1.state === 'running', rowC1 && rowC1.state);
   ok('模型信息带上了（Cline 的 session.model）', Boolean(rowC0) && rowC0.model === 'cline-free/nemotron', rowC0 && rowC0.model);
-  ok('改动文件按工程相对路径落库', Boolean(rowC0) && String(rowC0.files_json) === JSON.stringify(['src/x.js']), rowC0 && rowC0.files_json);
+  ok('客户端带上形态：vscode 扩展 → Cline Plugin', Boolean(rowC0) && rowC0.client_label === 'Cline Plugin', rowC0 && rowC0.client_label);
+  ok('改动文件落 NULL（Cline 取不到，不许拿工具调用当改动）', Boolean(rowC0) && rowC0.files_json == null && rowC0.file_count == null, rowC0 && `${rowC0.file_count} ${rowC0.files_json}`);
   ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('cline@p1') === 'busy' && taskIdOf('cline@p1') === 'cline:cline-sid-1:1', `${stateOf('cline@p1')} / ${taskIdOf('cline@p1')}`);
 
   console.log('[8b] 2F Cline：在飞那轮收工 → done + 成员卡回落 idle + token 真值');

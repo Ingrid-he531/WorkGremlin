@@ -398,9 +398,13 @@ function clineMainPhase(workspacePath, session = '') {
 
 /**
  * Per-turn listing: one entry per user turn (`<user_input …>` boundary) in a session, carrying the turn's
- * prompt, start / end, outcome and the files its tool calls touched. The last turn gets the session's token
- * totals (Cline only stores session-level usage).
- * @returns {Array<{index,prompt,startedAt,endedAt,outcome,files,tokens}>}
+ * prompt, start / end and outcome. The last turn gets the session's token totals (Cline only stores
+ * session-level usage).
+ *
+ * There is deliberately no `files` here: Cline's transcript records **tool calls**, not which files they
+ * changed — reading a path (`read_files`, `search_codebase`) is not an edit, so counting tool targets would
+ * show files the turn never touched. The changed-file list is therefore left unknown (see writeTurnRun).
+ * @returns {Array<{index,prompt,startedAt,endedAt,outcome,tokens}>}
  */
 function readClineRounds(sessionId) {
   const id = String(sessionId || '').trim();
@@ -411,10 +415,6 @@ function readClineRounds(sessionId) {
   if (!convo) return [];
   const rounds = [];
   let cur = null;
-  const addFile = (p) => {
-    const v = String(p || '');
-    if (v && cur && !cur.files.includes(v)) cur.files.push(v);
-  };
   for (const m of convo.messages) {
     if (!m) continue;
     const content = Array.isArray(m.content) ? m.content : [];
@@ -422,18 +422,12 @@ function readClineRounds(sessionId) {
     if (m.role === 'user') {
       const promptItem = content.find((c) => c && c.type === 'text' && /<user_input/i.test(String(c.text || '')));
       if (promptItem) {
-        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', files: [], tokens: null };
+        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', tokens: null };
         rounds.push(cur);
       }
       continue;
     }
     if (m.role !== 'assistant' || !cur) continue;
-    for (const c of content) {
-      if (!c || c.type !== 'tool_use') continue;
-      addFile(toolTarget(c));
-      const input = c.input && typeof c.input === 'object' ? c.input : {};
-      if (Array.isArray(input.files)) for (const f of input.files) addFile(f && f.path);
-    }
     const tail = content[content.length - 1];
     if (tail && tail.type === 'text') {
       cur.endedAt = ts || cur.endedAt;
@@ -459,7 +453,7 @@ function projectIdOf(s) {
 }
 
 /** Write one ledger row (a line in both tasks and task_runs); one row per turn. */
-function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
+function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, form, title, startedAt, endedAt, state, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
   const running = st === 'running';
   repo.insertTask.run({
@@ -479,24 +473,27 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     memberId,
     client: CLIENT,
     sessionId,
-    form: null,
+    form: form || null,
     model: model || null,
     title,
     startedAt,
     baselineCommit: null,
   });
-  const filesJson = files && files.length ? JSON.stringify(files) : null;
+  // Cline's transcript records tool calls, not which files they changed (see readClineRounds), so the
+  // changed-file list is **unknown** — leave it NULL and explicitly clear anything a previous build wrote.
+  // endTaskRun's COALESCE would otherwise keep a stale guess; NULL = unknown per schema.sql, never a guess.
   repo.endTaskRun.run({
     id,
     title,
     model: model || null,
-    form: null,
+    form: form || null,
     result: result || null,
-    fileCount: files ? files.length : 0,
-    filesJson,
+    fileCount: null,
+    filesJson: null,
     endedAt: endedAt || null,
     durationMs: endedAt && startedAt ? endedAt - startedAt : null,
   });
+  repo.clearTaskRunFiles.run(id);
   repo.setTaskRunTokens.run({
     id,
     inputTokens: tokens ? tokens.input : null,
@@ -504,7 +501,6 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     cacheReadTokens: tokens ? tokens.cacheRead : null,
     cacheWriteTokens: tokens ? tokens.cacheWrite : null,
   });
-  return filesJson;
 }
 
 /** The turn index inside a ledger id (`cline:<session id>:<index>`); null when the shape does not match. */
@@ -578,36 +574,27 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
       client: CLIENT,
     });
 
-    const relFiles = (list) =>
-      (list || [])
-        .map((abs) => {
-          const p = String(abs || '');
-          if (!p || !projectPath) return p;
-          const r = path.relative(projectPath, p);
-          return r && !r.startsWith('..') ? r : '';
-        })
-        .filter(Boolean);
-
     // One ledger row per turn (same rule as 8F OpenCode / 9F Copilot): the conversation carries the full
-    // history, so every user turn is written, not only the current one. `hbId` / `running` / `filesJson`
-    // keep the last turn's row, which the heartbeat hangs on.
+    // history, so every user turn is written, not only the current one. `hbId` / `running` keep the last
+    // turn's row, which the heartbeat hangs on.
     let hbId = '';
-    let filesJson = null;
     let running = false;
     for (const r of rounds) {
       const id = `${prefix}:${r.index}`;
       const state = r.endedAt ? 'done' : 'running';
-      filesJson = writeTurnRun(repo, {
+      writeTurnRun(repo, {
         id,
         projectId,
         memberId,
         sessionId: s.id || null,
         model: s.model || '',
+        // The form of this session (vscode extension → plugin, CLI → cli): the task list labels the
+        // client "Cline Plugin" / "Cline CLI" from it (see clientLabel in shared/index.js).
+        form: s.form || '',
         title: r.prompt || s.title || '(Cline 会话)',
         startedAt: r.startedAt || now,
         endedAt: r.endedAt || null,
         state,
-        files: relFiles(r.files),
         result: r.endedAt ? r.result || '' : '',
         tokens: r.tokens,
       });
@@ -642,7 +629,8 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
         stateSince: running ? rounds[rounds.length - 1].startedAt || now : now,
         taskId: hbId,
         progress: null,
-        currentFiles: filesJson,
+        // The changed-file list is unknown for Cline (see writeTurnRun) — never carry a guess here either.
+        currentFiles: null,
         lastHeartbeatAt: now,
         degraded: 0,
         source: 'report',
