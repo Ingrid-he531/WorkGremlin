@@ -827,7 +827,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
       form: 'vscode',
       tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 },
       rounds: [
-        { index: 0, prompt: '第一轮用户任务', startedAt: c0, endedAt: c0 + 20_000, outcome: 'done', result: '' },
+        { index: 0, prompt: '第一轮用户任务', startedAt: c0, endedAt: c0 + 20_000, outcome: 'done', result: '第一轮收尾报告' },
         { index: 1, prompt: '在飞这一轮', startedAt: cRun, endedAt: 0, outcome: 'running', result: '', tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } },
       ],
     },
@@ -844,6 +844,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('模型信息带上了（Cline 的 session.model）', Boolean(rowC0) && rowC0.model === 'cline-free/nemotron', rowC0 && rowC0.model);
   ok('客户端带上形态：vscode 扩展 → Cline Plugin', Boolean(rowC0) && rowC0.client_label === 'Cline Plugin', rowC0 && rowC0.client_label);
   ok('改动文件落 NULL（Cline 取不到，不许拿工具调用当改动）', Boolean(rowC0) && rowC0.files_json == null && rowC0.file_count == null, rowC0 && `${rowC0.file_count} ${rowC0.files_json}`);
+  ok('输出 = 那一轮的收尾自述（任务详情「输出」栏）', Boolean(rowC0) && rowC0.result === '第一轮收尾报告', rowC0 && rowC0.result);
   ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('cline@p1') === 'busy' && taskIdOf('cline@p1') === 'cline:cline-sid-1:1', `${stateOf('cline@p1')} / ${taskIdOf('cline@p1')}`);
 
   console.log('[8b] 2F Cline：在飞那轮收工 → done + 成员卡回落 idle + token 真值');

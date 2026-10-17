@@ -404,7 +404,7 @@ function clineMainPhase(workspacePath, session = '') {
  * There is deliberately no `files` here: Cline's transcript records **tool calls**, not which files they
  * changed — reading a path (`read_files`, `search_codebase`) is not an edit, so counting tool targets would
  * show files the turn never touched. The changed-file list is therefore left unknown (see writeTurnRun).
- * @returns {Array<{index,prompt,startedAt,endedAt,outcome,tokens}>}
+ * @returns {Array<{index,prompt,startedAt,endedAt,outcome,result,tokens}>}
  */
 function readClineRounds(sessionId) {
   const id = String(sessionId || '').trim();
@@ -422,7 +422,7 @@ function readClineRounds(sessionId) {
     if (m.role === 'user') {
       const promptItem = content.find((c) => c && c.type === 'text' && /<user_input/i.test(String(c.text || '')));
       if (promptItem) {
-        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', tokens: null };
+        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', result: '', tokens: null };
         rounds.push(cur);
       }
       continue;
@@ -430,6 +430,15 @@ function readClineRounds(sessionId) {
     if (m.role !== 'assistant' || !cur) continue;
     const tail = content[content.length - 1];
     if (tail && tail.type === 'text') {
+      // The turn's closing reply = the task detail's "output". A turn can emit assistant text a few times;
+      // what remains is the last (the wrap-up), so later messages overwrite earlier ones. Markdown is kept
+      // as-is (headings / tables / code), capped like 7F/8F's ledger summary.
+      const said = content
+        .filter((c) => c && c.type === 'text')
+        .map((c) => String(c.text || ''))
+        .join('\n')
+        .trim();
+      if (said) cur.result = said.slice(0, 4_000);
       cur.endedAt = ts || cur.endedAt;
       cur.outcome = 'done';
     } else {
