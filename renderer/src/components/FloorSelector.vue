@@ -5,10 +5,7 @@
  * server/src/products.js for the definition).
  * Merged floors (two forms of one product combined into one floor) scan **multiple disk sources**;
  * with both forms open at once they appear as multiple sessions inside this one floor rather than
- * multiple floors; when a source **cannot read its sessions**, the server supplies an explanation
- * in sources[].note, and the hover tooltip displays it as-is — so "this source can't be read" is
- * distinguishable from "this floor isn't running" (if a floor wants no note, the server simply
- * doesn't send one).
+ * multiple floors.
  * The exception is the hook source: it still participates in session collection (the server relies
  * on it as a fallback to list sessions, see refresh in sessionRegistry), but it has no disk
  * directory of its own, so listing it would only be a bare "no separate disk directory"; hence it
@@ -221,19 +218,18 @@ function cliFormLabel(p) {
 const TIP_INDENT = '  ';
 
 /**
- * Normalize one source into { label, detail, note }:
+ * Normalize one source into { label, detail }:
  *   label  form name (CLI / plugin / server-provided label, e.g. IDE)
  *   detail data directory + stats — both `dataPathLabel` and `stats` are supplied
  *          by the server; the renderer only displays them and never reads the
  *          agent's local storage directly.
- *   note   explanation shown when this source has no sessions
  */
 function sourceInfo(src) {
   const raw = src.label || sourceLabelOf(src);
   // If the server-sent label contains the English "Plugin", swap it for the localized plugin label
   // — covering 5F TraeCode's 'plugin' and 3F Codex / 7F Kilo's 'CLI/Plugin'.
   const label = raw.replace(/plugin/gi, t('floor.form_plugin'));
-  if (!src.dataPathLabel) return { label, detail: t('floor.no_data_dir'), note: src.note || '' };
+  if (!src.dataPathLabel) return { label, detail: t('floor.no_data_dir') };
   const s = src.stats || {};
   const bits = [];
   if (s.sessions) bits.push(t('floor.sessions_files', { n: s.sessions }));
@@ -243,13 +239,11 @@ function sourceInfo(src) {
   return {
     label,
     detail: `${src.dataPathLabel}${bits.length ? `（${bits.join(' · ')}）` : ''}`,
-    note: src.note || '',
   };
 }
 
 /**
- * Append a section: the header takes its own line and each sub-item line is uniformly indented
- * (`row = { text, note? }`, note one level deeper).
+ * Append a section: the header takes its own line and each sub-item line is uniformly indented.
  * All sub-lines share the same indent prefix — this is the key to "CLI / plugin rows starting at
  * the same position".
  */
@@ -257,7 +251,6 @@ function pushSection(lines, title, rows) {
   lines.push(`${title}：`);
   for (const row of rows) {
     lines.push(`${TIP_INDENT}${row.text}`);
-    if (row.note) lines.push(`${TIP_INDENT}${TIP_INDENT}· ${row.note}`);
   }
 }
 
@@ -269,7 +262,7 @@ function pushSection(lines, title, rows) {
  * reads the agent's local storage directly. The "Installed" paths and the "Data"
  * directory (`dataPathLabel`) together with its `stats` (session/file counts,
  * size, last write) are resolved server-side; the renderer only displays
- * `src.dataPathLabel`, `src.stats` and `src.note`. Shape:
+ * `src.dataPathLabel` and `src.stats`. Shape:
  *   CodeBuddy
  *   Active sessions: 1
  *   Installed:
@@ -314,34 +307,24 @@ function tip(p) {
   }
 
   // ---- Storage: list each route's data directory and stats ----
-  // A route whose sessions cannot be read carries an explanatory line (note). The hook route is not
-  // listed: it has no separate storage directory (sourceDirs returns an empty array for it), so
-  // listing it carries no information.
+  // The hook route is not listed: it has no separate storage directory (sourceDirs returns an empty
+  // array for it), so listing it carries no information.
   // Presentation-layer filter only: the server still sends that hook source, and sessionRegistry's
   // refresh relies on it to decide whether to fall back to the reporter state file for listing
   // sessions (cliLandingSeen); touching it would make 5F / 6F's sessions disappear.
-  //
-  // The note for the SQLite-polling sources — 7F Kilo / 8F OpenCode / 6F Qoder's Plugin route ("this
-  // route reads the xxx.db (SQLite) under the data root, not a scannable session file") — is not shown
-  // in the hover tooltip: those sessions are polled from a SQLite database by nature, a design fact
-  // rather than a failure note saying "this route can't be read" — so keeping it in the tooltip would
-  // only repeat the path info the "Storage:" header already gave.
-  // (The note field is still sent/passed through: sessionRegistry and the server's self-check use
-  // it; here it is only hidden in the render layer.)
-  const isPollingDb = (src) => src.kind === 'kilo' || src.kind === 'opencode' || src.kind === 'lingma';
   if (sources.length) {
     pushSection(
       lines,
       t('floor.storage'),
       sources.map((src) => {
         const info = sourceInfo(src);
-        return { text: `${info.label} - ${info.detail}`, note: isPollingDb(src) ? '' : info.note };
+        return { text: `${info.label} - ${info.detail}` };
       })
     );
   } else if (p.dataPathLabel) {
     // Fallback for the old server (no sources field)
     const info = sourceInfo({ kind: '', dataPathLabel: p.dataPathLabel, stats: p.stats });
-    pushSection(lines, t('floor.storage'), [{ text: `${t('floor.kind_dir')} - ${info.detail}`, note: info.note }]);
+    pushSection(lines, t('floor.storage'), [{ text: `${t('floor.kind_dir')} - ${info.detail}` }]);
   } else {
     lines.push(t('floor.storage_not_found'));
   }

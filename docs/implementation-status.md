@@ -177,8 +177,8 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 （Kilo 读 `event` 表、OpenCode 读 `session_message`，因为后者 `event` 表是空的，见上表）；
 `kind: 'hook'` 在 8F 是**叠加**在轮询之上的那一路，不是替代：装插件时它给真值，
 没装时它空着、轮询照常兜底（两者都按 `session_id` 精确去重，见 `sessionRegistry` 的 `claim`）；
-`kind: 'plugin'` 那一路读不出会话时（没有 `genie-history` 这类索引），服务端在 `sources[].note` 里给一句说明，
-楼层胶囊的 tooltip 照它显示；`kind: 'dir'` 的展示路不带 `note`。
+楼层胶囊的 tooltip 里「落盘」只列**目录 + 文件数/体积/最后写入**，不再带任何一路的说明文案
+（原先 `kind: 'plugin'` 读不出会话时那句「没有 genie-history 这类索引」的 `sources[].note` 已整体去掉）。
 自检见 `server/test/mergedFloors.test.js`（`npm run test:floors`）与
 `server/test/kiloFloor.test.js`（`npm run test:kilo`）。
 

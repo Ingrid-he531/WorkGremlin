@@ -22,7 +22,7 @@
  *   B. 5F TraeCode（IDE + 插件合并，会话只能靠 hook 状态文件）
  *     [B1] 一层：client 恒为基名 trae；三路来源（IDE 落盘 + 插件落盘 + hook）
  *     [B2] **两个形态的落盘目录都要列出来**（~/.trae-cn 与 ~/.marscode）；这两路只作展示、
- *          取不到会话 → 各带一句说明（楼层胶囊 tooltip 显示它们）
+ *          取不到会话（tooltip 只列目录 + 落盘统计）
  *     [B3] 两个形态的 hook 状态文件（form=ide / form=vscode）都归这一层
  *   C. 6F Qoder（CLI 与插件合并：同 ~/.qoder、同 hook、同 transcript，分不出，合并单楼层，类 4F）
  *     [C] 一层：只接纳 qoder 一种身份（CLI 与插件共用同一 client）；三路来源（cli 扫 transcript 产会话 + lingma 轮询插件的 local.db + hook 实时相位兜底）；只装了 qoder 就算"装了"
@@ -462,7 +462,7 @@ head('[B2] 5F 的两路落盘：IDE 的 ~/.trae-cn 与插件的 ~/.marscode 都�
   ok('IDE 那一路扫的是 ~/.trae-cn（国内版）', Boolean(ideSrc) && String(ideSrc.dataPathLabel).endsWith('.trae-cn'), ideSrc && ideSrc.dataPathLabel);
   ok('插件那一路扫的是 ~/.marscode', Boolean(pluginSrc) && String(pluginSrc.dataPathLabel).endsWith('.marscode'), pluginSrc && pluginSrc.dataPathLabel);
   // tooltip 只列目录与落盘统计，不带 sources[].note（形态靠上报身份区分，见 clientMatch 的 CLIENT_LABELS）
-  ok('两路都不带说明（tooltip 只列目录与落盘统计）', !ideSrc.note && !pluginSrc.note, `${ideSrc.note} | ${pluginSrc.note}`);
+  ok('两路都不带说明（tooltip 只列目录与落盘统计）', !('note' in ideSrc) && !('note' in pluginSrc), `${ideSrc.note} | ${pluginSrc.note}`);
   // 明确没有 genie-history 这类会话索引（否则本该由 listSessions 读出来，而不是只作展示）
   ok('两路都没有 genie-history 这类会话索引', !fs.existsSync(path.join(ideSrc.dataPath, 'genie-history')) && !fs.existsSync(path.join(pluginSrc.dataPath, 'genie-history')));
 

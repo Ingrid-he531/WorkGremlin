@@ -99,7 +99,6 @@ const meta = {
       label: 'CLI/Plugin',
       client: 'kilo',
       dirs: [kiloHome()],
-      note: '这一路读的是数据根里的 kilo.db（SQLite），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
     // The hook path: the truth path when the WorkGremlin plugin is installed (client is always the floor
     // base name kilo, form=vscode)

@@ -70,7 +70,6 @@ const meta = {
       // without this the floor tooltip's storage row has no path and reads "no data directory found",
       // even though this route does read the extension's local.db (see lingmaDataDir).
       dirs: [lingmaDataDir()],
-      note: '这一路读的是 Qoder CN 编辑器插件自己的 local.db（SQLite，chat_session / chat_record）：扩展没有 hook 子系统、也不写 ~/.qoder 的 transcript，所以会话与相位只能由服务端轮询它这份落盘（相位是推断值）',
     },
     { kind: 'hook' },
   ],

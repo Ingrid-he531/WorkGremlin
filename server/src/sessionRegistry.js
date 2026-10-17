@@ -1084,16 +1084,11 @@ function snapshot({ workspacePath = '', force = false } = {}) {
         kind: s.kind,
         // Display name ('IDE' / 'plugin' …): two paths can share a kind (5F's IDE and plugin are both 'dir')
         label: s.label || '',
-        // Whether this path produces sessions: false = on-disk display only (the tooltip explains "no
-        // sessions can be read")
+        // Whether this path produces sessions: false = on-disk display only
         sessions: s.sessions !== false,
         client: s.client,
         dataPathLabel: s.dataPathLabel || '',
         stats: s.stats || null,
-        // Explanation when this path cannot read sessions (e.g. TraeCode's plugin on-disk data has no
-        // session index) ——
-        // the frontend tooltip shows it so "no data" and "cannot read" stay distinguishable
-        note: s.note || '',
       })),
       /** How many active sessions this floor has —— the left status dot's green/gray follows it */
       activeCount: sessions.length,

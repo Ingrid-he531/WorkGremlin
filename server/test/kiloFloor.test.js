@@ -11,7 +11,7 @@
  *   A. 楼层表：7F 只有一层 Kilo Code
  *     [A1] 一层：clients = kilo（只有 CLI/TUI 一个形态）；两路来源（dir 只作展示 + kilo 产会话）
  *     [A2] 装了 kilo 可执行文件就算"装了"；数据根是 XDG 位置（~/.local/share/kilo）
- *     [A3] 那一路 dir 读不出会话 → 如实带一句说明（楼层胶囊 tooltip 显示）
+ *     [A3] 那一路产会话，并把数据根挂在同一行（tooltip 只显示目录 + 落盘统计）
  *   B. 会话与相位：从 session + event 推导
  *     [B1] 会话列出来：工程路径取 session.directory（不是 project.worktree）
  *     [B2] 相位：最新事件是 tool/running → 调用工具（带工具名与命令）
@@ -220,13 +220,13 @@ head('[A2] 装了 kilo 可执行文件就算"装了"；数据根是 XDG 位置')
   ok('kiloHome 与楼层认的是同一个根', kilo.kiloHome() === KILO_HOME, kilo.kiloHome());
 }
 
-head('[A3] kilo 那一路：产会话，同时把数据根与"会话是 SQLite"的说明挂在同一行');
+head('[A3] kilo 那一路：产会话，同时把数据根挂在同一行（tooltip 只显示目录 + 落盘统计）');
 {
   const floor = detectProducts({ force: true }).find((p) => p.id === '7F');
   const src = floor.sources.find((s) => s.kind === 'kilo');
   ok('kilo 那一路产会话', src && src.sessions !== false, src && String(src.sessions));
   ok('kilo 那一路带着数据根（tooltip 据此显示落盘统计）', Boolean(src && src.dataPathLabel), src && src.dataPathLabel);
-  ok('kilo 那一路说明"会话是 SQLite、不是可扫的文件"', /SQLite/.test((src && src.note) || ''), src && src.note);
+  ok('那一路不再带说明（tooltip 不显示 sources[].note）', src && !('note' in src), src && JSON.stringify(src.note));
 }
 
 /* ------------------------------ B. 会话与相位 ------------------------------ */

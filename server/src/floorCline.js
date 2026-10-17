@@ -60,7 +60,6 @@ const meta = {
       label: 'CLI/Plugin',
       client: 'cline',
       dirs: [clineDataDir()],
-      note: '这一路读的是数据根里的 sessions.db（SQLite）与会话 JSON；文件数/体积是数据根的落盘统计，不是会话数',
     },
   ],
   dataKind: 'cline',

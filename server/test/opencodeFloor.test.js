@@ -18,7 +18,7 @@
  *   A. 楼层表：8F 只有一层 OpenCode
  *     [A1] 一层：clients = opencode；三路来源（dir 只作展示 + opencode 产会话 + hook 收插件真相位）
  *     [A2] `opencode` 不在 PATH 也能判"装了"（认 ~/.opencode/bin，官方安装脚本就装在那儿）
- *     [A3] 那一路 dir 读不出会话 → 如实带一句说明（楼层胶囊 tooltip 显示）
+ *     [A3] 那一路产会话，并把数据根挂在同一行（tooltip 只显示目录 + 落盘统计）
  *   B. 会话与相位：从 session_v2 + session_message 推导
  *     [B1] 会话列出来：工程路径取 session_v2.directory；子代理会话（parent_id 非空）不算独立会话
  *     [B2] 相位：最新消息里 tool/running → 调用工具（带工具名与实际命令）
@@ -235,10 +235,11 @@ head('[A] 楼层表：8F 只有一层 OpenCode');
   ok('数据根是 XDG 位置（~/.local/share/opencode）', floor && String(floor.sources[0].dataPathLabel).endsWith('.local/share/opencode'), floor && floor.sources[0].dataPathLabel);
   ok('安装位置认出 ~/.opencode/bin/opencode', floor && String(floor.installPathLabel).endsWith('.opencode/bin/opencode'), floor && floor.installPathLabel);
   ok(
-    'opencode 那一路带着数据根，并说明"会话是 SQLite、不是可扫的文件"',
-    Boolean(floor && floor.sources[0].dataPathLabel) && floor.sources[0].sessions !== false && /SQLite/.test(floor.sources[0].note || ''),
-    floor && `${floor.sources[0].sessions} ${floor.sources[0].note}`
+    'opencode 那一路带着数据根（tooltip 据此显示落盘统计）',
+    Boolean(floor && floor.sources[0].dataPathLabel) && floor.sources[0].sessions !== false,
+    floor && `${floor.sources[0].sessions} ${floor.sources[0].dataPathLabel}`
   );
+  ok('那一路不再带说明（tooltip 不显示 sources[].note）', floor && !('note' in floor.sources[0]), floor && JSON.stringify(floor.sources[0].note));
   ok('核心表齐了（session_v2 + session_message）', opencode.hasCoreTables() === true);
   ok('数据根/库路径函数可解析', opencode.opencodeHome() === OC_HOME && opencode.opencodeDbPath() === DB, `${opencode.opencodeHome()} | ${opencode.opencodeDbPath()}`);
 }

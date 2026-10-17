@@ -108,7 +108,6 @@ const meta = {
       label: 'CLI/Desktop',
       client: 'opencode',
       dirs: [opencodeHome()],
-      note: '这一路读的是数据根里的 opencode.db（SQLite，session_message 表），不是可扫的会话文件；文件数/体积是数据根的落盘统计，不是会话数',
     },
     // The hook path: the true-phase path once the WorkGremlin plugin is installed. The client is
     // always the floor base name opencode, and there is no separate "plugin form": OpenCode's VS

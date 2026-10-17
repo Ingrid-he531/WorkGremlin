@@ -209,7 +209,7 @@ function findPluginStorageDir(res) {
 /**
  * Which session / on-disk sources this floor consumes.
  * Entries are either **strings** (kind only) or **objects** (needed by merged floors).
- * @returns {Array<{kind: string, label?: string, client?: string, dirs?: string[], note?: string}>}
+ * @returns {Array<{kind: string, label?: string, client?: string, dirs?: string[]}>}
  */
 function sourceSpecs(p) {
   const raw = p.sources && p.sources.length ? p.sources : p.hookSource ? ['hook'] : p.plugin ? ['plugin'] : ['cli'];
@@ -250,16 +250,6 @@ function sourceDirs(p, spec) {
 const NO_STATS = { files: 0, sessions: 0, bytes: 0, sizeLabel: '0 B', lastModifiedAt: null };
 
 /**
- * Whether sessions can actually be **read out** of this path's on-disk data —— say so plainly when not.
- * @returns {string} explanatory copy; empty string when no explanation is needed
- */
-function sourceNote(kind, dataPath) {
-  if (kind !== 'plugin' || !dataPath) return '';
-  if (isDir(path.join(dataPath, 'genie-history'))) return '';
-  return `${shorten(dataPath)} 里没有 genie-history 这类会话索引，只有产品自己的运行时文件 —— 这一路取不到会话（会话 id、运行态都读不到）`;
-}
-
-/**
  * Description of one source: kind + client + on-disk directory + on-disk stats (the hook source has
  * no on-disk directory of its own).
  */
@@ -284,7 +274,6 @@ function detectSource(p, spec, clients) {
     dataPaths,
     dataPathLabel: shorten(dataPath),
     stats: dataPath ? scanDataDir(dataPath) : { ...NO_STATS },
-    note: spec.note || (dataPath ? sourceNote(spec.kind, dataPath) : ''),
   };
 }
 

@@ -8,7 +8,7 @@
  *
  * The tooltip is not mounted in these node-only suites and the regression is invisible at the lib level
  * (it only shows on hover), so scan the SFC — same approach as taskTicker.test.mjs — to keep the server
- * half (a real dataPath) and the render half (display it, hide the "design fact" note) wired up.
+ * half (a real dataPath) and the render half (display it) wired up.
  *
  * Run: `npm run test:floor-tooltip`
  */
@@ -35,16 +35,11 @@ ok('sourceInfo only falls back to floor.no_data_dir when dataPathLabel is empty'
 ok('the fallback is floor.no_data_dir', /floor\.no_data_dir/.test(src));
 ok('otherwise the row detail is built from dataPathLabel', /detail:\s*`\$\{src\.dataPathLabel\}/.test(src));
 
-console.log('\n[2] SQLite-polling sources (7F/8F/6F) hide their "design fact" note');
-// One shared predicate: the note explains "this route reads a db, not a scannable session file",
-// which the Storage row's path already implies — hidden in the render layer for kilo/opencode/lingma.
-const m = src.match(/const\s+isPollingDb\s*=\s*\(src\)\s*=>\s*([^;]+);/);
-ok('isPollingDb predicate exists', Boolean(m), String(m && m[0]));
-const body = m ? m[1] : '';
-for (const kind of ['kilo', 'opencode', 'lingma']) {
-  ok(`isPollingDb includes '${kind}'`, new RegExp(`['"]${kind}['"]`).test(body), body);
-}
-ok('the note is suppressed for polling-db sources only', /note:\s*isPollingDb\(src\)\s*\?\s*''\s*:\s*info\.note/.test(src));
+console.log('\n[2] Storage rows carry only the directory + on-disk stats — never an explanatory note');
+ok('sourceInfo no longer returns a note field', !/note:\s*src\.note/.test(src));
+ok('pushSection no longer renders a note line', !/row\.note/.test(src));
+ok('tip no longer has a per-kind polling-db predicate', !/isPollingDb/.test(src));
+ok('tip passes no note into the storage rows', !/info\.note/.test(src));
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
