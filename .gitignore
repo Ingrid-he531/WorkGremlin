@@ -18,3 +18,5 @@ recordings/
 
 # Kilo Code 的本地运行态（工作树 / 插件缓存 / agent-manager.json，都在各人机器上）
 .kilo/
+
+.qoder/
