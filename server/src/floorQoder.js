@@ -6,7 +6,9 @@
  *
  * 6F has only one reporting identity, qoder (the CLI and the plugin cannot be told apart, they share
  * the same client), and three sources:
- *   · cli    —— scan ~/.qoder/projects transcripts to produce sessions (same as 4F Claude)
+ *   · cli    —— scan the CLI transcripts under <root>/projects to produce sessions (same as 4F Claude).
+ *              Both roots are scanned: ~/.qoder for the global CLI and ~/.qoder-cn for the CN CLI
+ *              (same transcript format, different roots)
  *   · lingma —— poll Qoder CN's own SQLite (local.db), plugin form only
  *   · hook   —— real-time phase fallback
  *

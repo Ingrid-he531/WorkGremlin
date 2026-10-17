@@ -264,7 +264,12 @@ function sourceNote(kind, dataPath) {
  * no on-disk directory of its own).
  */
 function detectSource(p, spec, clients) {
-  const dataPath = sourceDirs(p, spec).find((d) => d && isDir(d)) || '';
+  // Every declared dir that actually exists. A single route can legitimately have more than one on-disk
+  // root (6F Qoder's CLI: ~/.qoder for the global CLI and ~/.qoder-cn for the CN CLI —— same transcript
+  // format, different roots). The session scan reads all of them (sessionRegistry.scanCliSessionsAll);
+  // the tooltip label and the stats describe the primary (first existing) one.
+  const dataPaths = sourceDirs(p, spec).filter((d) => d && isDir(d));
+  const dataPath = dataPaths[0] || '';
   return {
     kind: spec.kind,
     label: spec.label || '',
@@ -274,6 +279,9 @@ function detectSource(p, spec, clients) {
     form: sourceForm(spec),
     sessions: spec.kind !== 'dir',
     dataPath,
+    // All existing roots of this route (see above). Only the session scan reads it — the session snapshot
+    // whitelists the source fields it sends to the renderer, so this never leaks into the UI payload.
+    dataPaths,
     dataPathLabel: shorten(dataPath),
     stats: dataPath ? scanDataDir(dataPath) : { ...NO_STATS },
     note: spec.note || (dataPath ? sourceNote(spec.kind, dataPath) : ''),

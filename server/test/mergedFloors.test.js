@@ -28,6 +28,7 @@
  *     [C] 一层：只接纳 qoder 一种身份（CLI 与插件共用同一 client）；三路来源（cli 扫 transcript 产会话 + lingma 轮询插件的 local.db + hook 实时相位兜底）；只装了 qoder 就算"装了"
  *     [C2] 会话来自 hook 状态文件兜底：qoder 状态文件归这一层、相位按整层 client 取得到
  *     [C3] 会话也来自落盘 transcript：~/.qoder/projects/<工程>/<会话>.jsonl（Claude Code 同款格式）被 cli 那一路扫出，工程从 cwd 解析
+ *     [C4] CLI 有两处落盘根：国际版 ~/.qoder 与中国版 ~/.qoder-cn（同一条路线，两处根都要扫，别只认第一处）
  */
 'use strict';
 
@@ -556,6 +557,36 @@ head('[C3] 6F 也吃落盘 transcript：~/.qoder/projects/<工程>/<会话>.json
   ok('落盘 transcript 那条会话被 cli 那一路扫出', Boolean(row) && row.sourceKind === 'cli', floor.sessions.map((s) => `${s.sourceKind}:${s.sessionId}`).join(' '));
   ok('会话 id 从文件名取到（与 Claude 同款）', Boolean(row) && row.sessionId === Q_TSID, row && row.sessionId);
   ok('工程路径从 cwd 解析到', Boolean(row) && row.projectPath === Q_PROJ, row && row.projectPath);
+}
+
+/* [C4] 6F 的 CLI 有两处落盘根：国际版 ~/.qoder 与中国版 ~/.qoder-cn（同一条路线，两处根都要扫） */
+head('[C4] 6F 的 CN CLI 落盘根 ~/.qoder-cn 也被同一条 cli 路线扫出（国际版 + 国内版两处根）');
+{
+  const CN_PROJ = '/tmp/ProjQCn';
+  const CN_SID = 'cnc0ffee-1234-5678-9abc-def012345678';
+  const cnDir = path.join(HOME, '.qoder-cn', 'projects', '-tmp-ProjQCn');
+  fs.mkdirSync(cnDir, { recursive: true });
+  // 国内版 CLI 的落盘格式与国际版一致（同一份 Claude Code 同款 transcript）
+  const lines = [
+    JSON.stringify({ type: 'workspace-directories', sessionId: CN_SID, directories: [CN_PROJ] }),
+    JSON.stringify({ type: 'user', sessionId: CN_SID, cwd: CN_PROJ, message: { role: 'user', content: 'hi' } }),
+  ];
+  fs.writeFileSync(path.join(cnDir, `${CN_SID}.jsonl`), lines.join('\n') + '\n');
+
+  // The product cache (detectProducts, 60s) captured the source dirs before ~/.qoder-cn existed; snapshot()
+  // reads that cache, so force a re-detect first to let the new root show up (the real server re-detects on TTL).
+  detectProducts({ force: true });
+  const snap = snapshot({ force: true, workspacePath: CN_PROJ });
+  const floor = snap.floors.find((f) => f.id === '6F');
+  const row = floor.sessions.find((s) => s.sessionId === CN_SID);
+  ok('CN 版 CLI 的落盘（~/.qoder-cn）被同一条 cli 路线扫出', Boolean(row) && row.sourceKind === 'cli', floor.sessions.map((s) => `${s.sourceKind}:${s.sessionId}`).join(' '));
+  ok('工程路径从 cwd 解析到', Boolean(row) && row.projectPath === CN_PROJ, row && row.projectPath);
+  // [C3] writes the global-CLI transcript into ~/.qoder: both roots must be scanned, not just the first existing one
+  ok(
+    '两处根都扫：国际版 ~/.qoder 那条（[C3] 写入的）仍在',
+    Boolean(floor.sessions.find((s) => s.sessionId === 'c0ffee00-1234-5678-9abc-def012345678')),
+    floor.sessions.map((s) => `${s.sourceKind}:${s.sessionId}`).join(' ')
+  );
 }
 
 /* [D] 9F GitHub Copilot：插件扩展一层，视觉上可展示且可点 */

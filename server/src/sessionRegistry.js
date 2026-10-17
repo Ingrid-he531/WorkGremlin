@@ -711,6 +711,33 @@ function handlePlugin(p, src, ctx) {
   }
 }
 
+/**
+ * Scan every on-disk root a cli source declares. Most floors declare one root, but a single route can
+ * legitimately have several (6F Qoder: ~/.qoder for the global CLI + ~/.qoder-cn for the CN CLI —— same
+ * transcript format, different roots). src.dataPaths comes from floors.detectSource (all existing roots);
+ * fall back to the single src.dataPath for older shapes. Dedup by sessionId (keep the freshest row) so a
+ * file that somehow lives in two roots never lists twice.
+ */
+function scanCliSessionsAll(src, kind) {
+  const paths = (src.dataPaths && src.dataPaths.length ? src.dataPaths : [src.dataPath]).filter(Boolean);
+  if (paths.length <= 1) return paths.length ? scanCliSessions(paths[0], { kind }) : [];
+  const seen = new Map();
+  const out = [];
+  for (const p of paths) {
+    for (const row of scanCliSessions(p, { kind })) {
+      const key = row.sessionId || row.id;
+      const prev = seen.get(key);
+      if (!prev) {
+        seen.set(key, row);
+        out.push(row);
+        continue;
+      }
+      if ((Number(row.lastEventAt) || 0) > (Number(prev.lastEventAt) || 0)) Object.assign(prev, row);
+    }
+  }
+  return out;
+}
+
 // Shared by the cli / hook paths: scan jsonl or read the reporter state file, distinguished by src.kind.
 // The cli/hook sources of 1F~5F and 9F all go through here (standard shape: only file times / heartbeat
 // times, no runtime state).
@@ -732,7 +759,7 @@ function handleCliHook(p, src, ctx) {
   }
   const rows =
     src.kind === 'cli'
-      ? scanCliSessions(src.dataPath, { kind: p.agent }).filter((s) => !s.sessionId || !endedSessionIds.has(s.sessionId))
+      ? scanCliSessionsAll(src, p.agent).filter((s) => !s.sessionId || !endedSessionIds.has(s.sessionId))
       : listReporterSessions(src.client).map((s) => ({
           id: s.sessionId,
           sessionId: s.sessionId,
