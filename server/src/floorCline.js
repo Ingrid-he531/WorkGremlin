@@ -300,7 +300,7 @@ function toolTarget(tu) {
  * Cline's message stream is `assistant(content: thinking / text / tool_use…)` interleaved with
  * `user(text=<user_input…> | tool_result)`; the last content item of the last message therefore tells
  * which end of the loop the session is on:
- *   assistant + tool_use   → 调用工具 (the tool name / command is carried up)
+ *   assistant + tool_use   → calling a tool (the tool name / command is carried up)
  *   assistant + thinking   → thinking
  *   assistant + text       → idle (the turn finished speaking)
  *   user + tool_result     → thinking (a tool just returned, the model is about to continue)

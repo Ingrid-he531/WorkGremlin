@@ -61,7 +61,7 @@ kiloMod.listKiloSessions = () => kiloRows;
 kiloMod.readKiloRounds = (sid) => ((kiloRows.find((r) => r.id === sid) || {}).rounds || []);
 opencodeMod.listOpencodeSessions = () => opencodeRows;
 opencodeMod.readOpencodeTurns = (sid) => ((opencodeRows.find((r) => r.id === sid) || {}).turns || []);
-// 2F 同样是「每一轮一条」：会话行上挂 `rounds`（形状同 floorCline 的 readClineRounds）
+// 2F is also "one row per turn": the session row carries `rounds` (same shape as floorCline's readClineRounds)
 clineMod.listClineSessions = () => clineRows;
 clineMod.readClineRounds = (sid) => ((clineRows.find((r) => r.id === sid) || {}).rounds || []);
 

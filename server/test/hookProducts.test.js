@@ -1,11 +1,11 @@
 'use strict';
 /**
- * 多产品 hook 转发冒烟测试（Codex / CodeBuddy / Qoder）。
+ * Multi-product hook forwarding smoke test (Codex / CodeBuddy / Qoder).
  *
- * 验证各家 floor 的 impl 接线正确：repliesOf / formOf / interruptedSince 能跑、事件能路由到
- * startTask / endTask，且产出文本被正确读到。落盘解析全在服务端。
+ * Verifies each floor's impl wiring is correct: repliesOf / formOf / interruptedSince run, events route to
+ * startTask / endTask, and the produced text is read back correctly. All on-disk parsing is server-side.
  *
- * 跑法：`npm run test:hook-products`
+ * Run: `npm run test:hook-products`
  */
 const fs = require('node:fs');
 const os = require('node:os');
@@ -69,7 +69,7 @@ writeJsonl(QODER_TP, [
   { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'qoder 干成了' }] } },
 ]);
 
-// CodeBuddy index.json + messages/<id>.json（同 Qoder 插件）
+// CodeBuddy index.json + messages/<id>.json (same as the Qoder plugin)
 const CB_DIR = path.join(TMP, 'cb-history', 'sess1');
 fs.mkdirSync(path.join(CB_DIR, 'messages'), { recursive: true });
 fs.writeFileSync(path.join(CB_DIR, 'index.json'), JSON.stringify({

@@ -1,33 +1,35 @@
 /**
- * 2F Cline 自检 —— 纯轮询楼层（Cline 没有装 WorkGremlin 的 hook，靠读它自己的落盘）。
+ * 2F Cline self-test — a pure poll floor (WorkGremlin does not install into Cline's hooks; it reads
+ * Cline's own on-disk store).
  *
- * 跑法：`npm run test:cline`（= node 直接跑；better-sqlite3 走工程里已装好的那份）。
- * 为什么要有它：2F 的每条结论都对应"只有真的摆一份 Cline 4.x 的落盘进去才现形"的行为 ——
- * 数据根是不是 ~/.cline/data、会话怎么列、相位从消息尾巴怎么推、完成标记、逐轮清单、
- * 以及**表结构变了不许把接口打挂**。所以不 mock，把 HOME / CLINE_DATA_DIR 指到临时目录，
- * 现造一个与 Cline 4.1.25 同构的 sessions.db + 会话 JSON，让真实的 floors / floorCline 跑一遍。
+ * Run: `npm run test:cline` (= node directly; better-sqlite3 uses the copy already installed in the repo).
+ * Why it exists: every 2F conclusion corresponds to behavior that only shows up with a *real* Cline 4.x
+ * store in place — is the data root ~/.cline/data, how sessions are listed, how the phase is derived from
+ * the message tail, the done marker, the per-turn list, and **a schema change must not take the endpoint
+ * down**. So nothing is mocked: HOME / CLINE_DATA_DIR point at a temp dir, and a sessions.db + session
+ * JSON isomorphic to Cline 4.1.25 are built, then the real floors / floorCline run over them.
  *
- * 覆盖：
- *   A. 楼层表：2F 只有一层 Cline
- *     [A1] 一层：clients = cline；一路来源（kind = cline，读数据根）
- *     [A2] 装了 VS Code 扩展（saoudrizwan.claude-dev-*）就算"装了"；数据根是 ~/.cline/data
- *   B. 会话与相位：从消息尾巴推导
- *     [B1] 会话列出来：工程路径取 workspace_root；子代理行不列
- *     [B2] 相位：assistant 尾巴是 tool_use → 调用工具（带工具名）
- *     [B3] 相位：assistant 尾巴是 thinking → 思考中
- *     [B4] 相位：assistant 尾巴是 text → 待命（这一轮说完了）
- *     [B5] 相位一律 inferred（轮询来的，不是上报的）
- *     [B6] 陈旧消息不算"正在说话"：几分钟前那条 tool_use 让相位回到待命
- *     [B7] 「思考中」带上这一轮用户说的话；模型取会话行
- *   C. 完成标记：assistant 尾巴是 text 才算
- *     [C1] 新鲜的收尾 text → 有完成标记
- *     [C2] 尾巴是 tool_use → 不算完成
- *     [C3] 过期的完成标记（DONE_TTL_MS 之外）→ 当没有
- *   D. 逐轮清单：台账「每一轮一条」的真源
- *     [D1] 轮边界 = <user_input>；用户原话 / 改动文件 / 收工判据
- *     [D2] 最后一轮带 token 真值
- *   E. 读不出来不许冒泡
- *     [E1] 库缺 sessions 表（Cline 改版换表）→ 楼层仍在、会话为空、不抛
+ * Coverage:
+ *   A. Floor table: 2F is one floor, Cline
+ *     [A1] one floor: clients = cline; one source (kind = cline, reading the data root)
+ *     [A2] the VS Code extension (saoudrizwan.claude-dev-*) counts as "installed"; data root is ~/.cline/data
+ *   B. Sessions and phase: derived from the message tail
+ *     [B1] sessions are listed: project path from workspace_root; subagent rows are not listed
+ *     [B2] phase: assistant tail is tool_use -> calling a tool (with the tool name)
+ *     [B3] phase: assistant tail is thinking -> thinking
+ *     [B4] phase: assistant tail is text -> idle (the turn finished speaking)
+ *     [B5] every phase is inferred (polled, not reported)
+ *     [B6] a stale message is not "still speaking": the tool_use from minutes ago falls back to idle
+ *     [B7] "thinking" carries what the user said this turn; the model comes from the session row
+ *   C. Done marker: only an assistant tail of text counts
+ *     [C1] a fresh closing text -> a done marker
+ *     [C2] tail is tool_use -> not done
+ *     [C3] an expired done marker (beyond DONE_TTL_MS) -> treated as absent
+ *   D. Per-turn list: the source of the ledger's "one row per turn"
+ *     [D1] turn boundary = <user_input>; the user's words / changed files / finish test
+ *     [D2] the last turn carries the real token values
+ *   E. Unreadable must not bubble
+ *     [E1] the db lacks the sessions table (Cline changes its schema) -> floor still listed, sessions empty, no throw
  */
 'use strict';
 
@@ -35,18 +37,18 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-/* ------------------------------ 沙箱 ------------------------------ */
+/* ------------------------------ Sandbox ------------------------------ */
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-cline-'));
 const HOME = path.join(TMP, 'home');
 const WG = path.join(TMP, 'wg');
 const DATA = path.join(HOME, '.cline', 'data');
 for (const d of [HOME, WG, DATA, path.join(DATA, 'db'), path.join(DATA, 'sessions')]) fs.mkdirSync(d, { recursive: true });
-// 2F 的"装了"判定认 VS Code 扩展目录（沙箱里放一个 saoudrizwan.claude-dev-* 替身）
+// 2F's "installed" test recognizes the VS Code extension dir (put a stand-in saoudrizwan.claude-dev-* in the sandbox)
 fs.mkdirSync(path.join(HOME, '.vscode', 'extensions', 'saoudrizwan.claude-dev-4.1.25'), { recursive: true });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
-// 指向沙箱数据根（显式写出来，免得受调用环境影响）
+// Point at the sandbox data root (written explicitly so the calling environment cannot shift it)
 process.env.CLINE_DATA_DIR = DATA;
 
 const { detectProducts } = require('../src/floors');
@@ -75,12 +77,12 @@ try {
   process.exit(0);
 }
 
-/* ------------------------------ 造 Cline 的库与会话文件 ------------------------------ */
+/* ------------------------------ Build Cline's db and conversation files ------------------------------ */
 
 const MIN = 60_000;
 const ISO = (t) => new Date(t).toISOString();
 
-/** 建一个与 Cline 4.1.25 同构的 sessions.db（只建 2F 真正读到的列）。 */
+/** Build a sessions.db isomorphic to Cline 4.1.25 (only the columns 2F actually reads). */
 function makeClineDb(file, rows) {
   for (const f of [file, `${file}-wal`, `${file}-shm`]) fs.rmSync(f, { force: true });
   const db = new Database(file);
@@ -105,7 +107,7 @@ function makeClineDb(file, rows) {
   return file;
 }
 
-/** 写一份会话消息文件（Cline 的形状），返回它的绝对路径。 */
+/** Write one conversation file (Cline's shape) and return its absolute path. */
 function writeConvo(id, messages, updatedAt) {
   const dir = path.join(DATA, 'sessions', id);
   fs.mkdirSync(dir, { recursive: true });
@@ -126,7 +128,7 @@ const toolResult = () => ({ type: 'tool_result', tool_use_id: 'x', name: 'read_f
 const userInput = (t) => ({ type: 'text', text: `<user_input mode="act">${t}</user_input>` });
 const msg = (role, content, ts) => ({ id: `msg_${Math.random().toString(36).slice(2)}`, role, content, ts });
 
-/** 一行 sessions 表记录（默认近 1 秒内更新）。 */
+/** One sessions-table record (updated ~1 second ago by default). */
 function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath } = {}) {
   const md = { title };
   if (tokens) md.aggregateUsage = { inputTokens: tokens.input, outputTokens: tokens.output, cacheReadTokens: tokens.cacheRead, cacheWriteTokens: tokens.cacheWrite };
@@ -149,7 +151,7 @@ function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp
 const NOW = Date.now();
 const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
 
-// main：覆盖相位 / 完成 / 逐轮
+// main: covers phase / done / per-turn
 {
   const recent = NOW - 1_000;
   const stale = NOW - 5 * MIN;
@@ -195,7 +197,7 @@ const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
   ]);
 }
 
-/* ------------------------------ 跑 ------------------------------ */
+/* ------------------------------ Run ------------------------------ */
 
 console.log('2F Cline 自检（纯轮询：读 ~/.cline/data）');
 
@@ -263,7 +265,7 @@ head('[D] 逐轮清单');
 
 head('[E] 读不出来不许冒泡');
 {
-  // 换一个只有别名的库：Cline 改版换表时，2F 得"读不出会话"而不是崩
+  // Swap in a db with only an unrelated table: when Cline changes its schema, 2F must "read no sessions" and not crash
   const BAD = path.join(DATA, 'db', 'bad.db');
   const db = new Database(BAD);
   db.exec('CREATE TABLE other (x TEXT)');
