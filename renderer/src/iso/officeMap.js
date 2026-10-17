@@ -88,12 +88,29 @@ export const COLORS = {
  *     6F 150° jade / 7F 84° brass moss), colliding with no existing floor.
  *     7F Kilo Code shares an origin with it (see the evidence chain in server/src/products.js), but the two floors'
  *     furniture hues are deliberately separated —— floors are recognised "by product", not "by bloodline".
+ *   - 2F (Cline) goes cool teal: furniture is teal, the note becomes cyan paper + deep teal ink.
+ *     Hue ~187°. Cline's own brand colour is violet (#9663F1), but 3F already owns violet (273°) —— using it
+ *     would make two floors look alike —— so 2F takes the roomiest remaining band, between 6F jade 157° and
+ *     9F blue 212° (30° / 25° away, roomier than the 19° between 4F↔5F).
  *
- * Floors not listed here —— 1F CodeBuddy / 2F Cline —— use the baseline COLORS, visually identical to before.
+ * Floors not listed here —— 1F CodeBuddy —— use the baseline COLORS, visually identical to before.
  * After the TraeCode merge it occupies only 5F, and the old 6F (IDE) warm amber set moved to 5F wholesale;
  * the old 6F verdigris set (old 5F plugin) is no longer needed —— one floor gets exactly one material set.
  */
 export const FLOOR_COLORS = {
+  '2F': {
+    // desk/chair wood: cool teal (hue ~187°, between 6F jade 157° and 9F blue 212°)
+    wood: '#2f7d8a',
+    woodDark: '#1f5a66',
+    deskLeg: '#17444d',
+    // metal parts: deep teal graphite (dividers use the baseline colour everywhere, not overridden here)
+    metal: '#32565f',
+    metalDark: '#213a41',
+    chair: '#2a4950',
+    // divider note: cyan paper + deep teal ink (baseline is note yellow #f2c94c, see COLORS)
+    note: '#8fe6ea',
+    noteInk: '#0b3b41',
+  },
   '3F': {
     // desk/chair wood: cool rosewood
     wood: '#634e74',
