@@ -64,6 +64,10 @@ const meta = {
       kind: 'lingma',
       label: 'Plugin',
       client: 'qoder',
+      // Give the data dir like 7F/8F's SQLite source does: sourceDirs returns [] for kind 'lingma', so
+      // without this the floor tooltip's storage row has no path and reads "no data directory found",
+      // even though this route does read the extension's local.db (see lingmaDataDir).
+      dirs: [lingmaDataDir()],
       note: '这一路读的是 Qoder CN 编辑器插件自己的 local.db（SQLite，chat_session / chat_record）：扩展没有 hook 子系统、也不写 ~/.qoder 的 transcript，所以会话与相位只能由服务端轮询它这份落盘（相位是推断值）',
     },
     { kind: 'hook' },
@@ -89,12 +93,24 @@ const TTL = 5_000;
 /** How many sessions to bring out at most (newest first, descending; the rest falls back to the "recent" criterion) */
 const SESSION_LIMIT = 50;
 
+/**
+ * The directory that holds the extension's local.db —— the on-disk data this source reads. It is published
+ * to the floor tooltip (the source's `dirs`) so 6F's "Plugin" row shows the real path + stats instead of
+ * "no data directory found": sourceDirs returns [] for kind 'lingma' (same as kilo/opencode), so without
+ * this the storage row has nothing to display even though the DB is really there.
+ * Honors WORKGREMLIN_LINGMA_DB the same way lingmaDbPath() does (self-tests point it at a temp db).
+ */
+function lingmaDataDir() {
+  const explicit = String(process.env.WORKGREMLIN_LINGMA_DB || '').trim();
+  return explicit
+    ? path.dirname(path.resolve(explicit))
+    : path.join(HOME, '.lingma', 'vscode', 'sharedClientCache', 'cache', 'db');
+}
+
 /** The extension's DB file; WORKGREMLIN_LINGMA_DB is for self-tests (pointing at a DB built in a temp directory) */
 function lingmaDbPath() {
   const explicit = String(process.env.WORKGREMLIN_LINGMA_DB || '').trim();
-  const p = explicit
-    ? path.resolve(explicit)
-    : path.join(HOME, '.lingma', 'vscode', 'sharedClientCache', 'cache', 'db', 'local.db');
+  const p = explicit ? path.resolve(explicit) : path.join(lingmaDataDir(), 'local.db');
   return isFile(p) ? p : '';
 }
 

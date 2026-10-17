@@ -55,6 +55,11 @@ fs.writeFileSync(path.join(BIN, 'trae-cn'), '#!/bin/sh\nexit 0\n', { mode: 0o755
 fs.writeFileSync(path.join(BIN, 'qoder'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 fs.mkdirSync(path.join(HOME, '.qoder'), { recursive: true });
 fs.mkdirSync(path.join(HOME, '.vscode', 'extensions', 'alibaba-cloud.tongyi-lingma-2.6.10'), { recursive: true });
+// 6F's Plugin route really does read the extension's own local.db: create the dir so the floor tooltip's
+// storage row has a real path to show (otherwise sourceDirs returns [] for kind 'lingma' → "no data
+// directory found").
+fs.mkdirSync(path.join(HOME, '.lingma', 'vscode', 'sharedClientCache', 'cache', 'db'), { recursive: true });
+fs.writeFileSync(path.join(HOME, '.lingma', 'vscode', 'sharedClientCache', 'cache', 'db', 'local.db'), 'not a sqlite\n');
 // 插件那一路的落盘根：故意**不放** genie-history —— 复现"这一路读不出会话"
 fs.mkdirSync(path.join(HOME, '.marscode', 'ai-chat', 'AppData', 'vscode', 'ai-agent'), { recursive: true });
 fs.writeFileSync(path.join(HOME, '.marscode', 'ai-chat', 'AppData', 'vscode', 'ai-agent', 'database.db'), 'not a sqlite\n');
@@ -502,6 +507,19 @@ head('[C] 楼层表：6F 只有一层 Qoder（CLI 与插件合并，cli 扫 tran
   ok('装了 qoder（沙箱里放了可执行文件）就算装了', floor && floor.installed === true, floor && String(floor.installPath));
   ok('Qoder CN 编辑器插件（tongyi-lingma）算插件安装证据', floor && String(floor.pluginInstallPath || '').includes('tongyi-lingma'), floor && String(floor.pluginInstallPath));
   ok('cli 那一路扫的是 ~/.qoder（子树 projects）', Boolean(floor.sources.find((s) => s.kind === 'cli')) && String(floor.sources.find((s) => s.kind === 'cli').dataPathLabel).endsWith('.qoder'));
+  const pluginSrc = floor.sources.find((s) => s.kind === 'lingma');
+  // 6F's Plugin route publishes its data dir (the extension's local.db) so the tooltip shows a real path
+  // instead of "no data directory found"; 7F/8F do the same for their SQLite sources.
+  ok(
+    '插件那一路的落盘目录 = 扩展的 local.db 目录（tooltip 落盘行不再写「没有找到数据目录」）',
+    Boolean(pluginSrc) && pluginSrc.dataPath === path.join(HOME, '.lingma', 'vscode', 'sharedClientCache', 'cache', 'db'),
+    pluginSrc && pluginSrc.dataPath
+  );
+  ok(
+    '插件那一路的落盘统计指向 local.db（文件数 ≥ 1）',
+    Boolean(pluginSrc) && pluginSrc.stats && pluginSrc.stats.files >= 1,
+    pluginSrc && JSON.stringify(pluginSrc.stats)
+  );
 }
 
 /* [C2] 会话来自 hook 状态文件兜底；qoder 状态文件归这一层 */

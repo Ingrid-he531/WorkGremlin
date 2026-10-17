@@ -321,14 +321,14 @@ function tip(p) {
   // refresh relies on it to decide whether to fall back to the reporter state file for listing
   // sessions (cliLandingSeen); touching it would make 5F / 6F's sessions disappear.
   //
-  // The note for 7F Kilo / 8F OpenCode ("this route reads the xxx.db (SQLite) under the data root,
-  // not a scannable session file") is not shown in the hover tooltip: those two floors' sessions
-  // are polled from a SQLite database by nature — that's a design fact, not a failure note saying
-  // "this route can't be read" — so putting it in the tooltip would just repeat the path info the
-  // "Storage:" header already gave.
+  // The note for the SQLite-polling sources — 7F Kilo / 8F OpenCode / 6F Qoder's Plugin route ("this
+  // route reads the xxx.db (SQLite) under the data root, not a scannable session file") — is not shown
+  // in the hover tooltip: those sessions are polled from a SQLite database by nature, a design fact
+  // rather than a failure note saying "this route can't be read" — so keeping it in the tooltip would
+  // only repeat the path info the "Storage:" header already gave.
   // (The note field is still sent/passed through: sessionRegistry and the server's self-check use
   // it; here it is only hidden in the render layer.)
-  const isPollingDb = (src) => src.kind === 'kilo' || src.kind === 'opencode';
+  const isPollingDb = (src) => src.kind === 'kilo' || src.kind === 'opencode' || src.kind === 'lingma';
   if (sources.length) {
     pushSection(
       lines,

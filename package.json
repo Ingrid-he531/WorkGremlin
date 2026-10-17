@@ -56,6 +56,7 @@
     "test:task-client": "node renderer/test/taskClientLabel.test.mjs",
     "test:member-task": "node renderer/test/memberTask.test.mjs",
     "test:ticker": "node renderer/test/taskTicker.test.mjs",
+    "test:floor-tooltip": "node renderer/test/floorTooltip.test.mjs",
     "test:project-scope": "node renderer/test/projectScope.test.mjs",
     "test:day-board": "node renderer/test/dayBoard.test.mjs",
     "test:i18n": "node renderer/test/i18n.test.mjs",
