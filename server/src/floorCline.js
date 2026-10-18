@@ -478,7 +478,7 @@ function readClineRounds(sessionId) {
       cur.outcome = 'running';
     }
   }
-  if (rounds.length && s.tokens) for (const r of rounds) r.tokens = s.tokens;
+  if (rounds.length && s.tokens) rounds[rounds.length - 1].tokens = s.tokens;
   return rounds;
 }
 
