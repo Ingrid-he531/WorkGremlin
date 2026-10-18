@@ -258,10 +258,10 @@ head('[D] 逐轮清单');
   const r0 = rounds[0] || {};
   const r1 = rounds[1] || {};
   ok('[D1] 第一轮：原话 + 收工', r0.prompt === '第一轮任务' && r0.outcome === 'done' && Number(r0.endedAt) > 0, JSON.stringify(r0));
-  ok('[D1] 不记改动文件（Cline 只看得到工具调用，看不到改了哪些文件）', !('files' in r0), JSON.stringify(r0.files));
+  ok('[D1] 改动文件字段存在且为数组（无写工具则为空数组）', Array.isArray(r0.files) && r0.files.length === 0, JSON.stringify(r0.files));
   ok('[D1] 收尾文字作为任务详情的「输出」', r0.result === '第一轮收尾', JSON.stringify(r0.result));
   ok('[D1] 在飞那轮：running', r1.prompt === '在飞这一轮' && r1.outcome === 'running' && !r1.endedAt, JSON.stringify(r1));
-  ok('[D2] 最后一轮带 token 真值', r1.tokens && r1.tokens.input === 100 && r1.tokens.output === 20, JSON.stringify(r1.tokens));
+  ok('[D2] 每轮都带 session-level token 真值', r0.tokens && r0.tokens.input === 100 && r0.tokens.output === 20 && r1.tokens && r1.tokens.input === 100 && r1.tokens.output === 20, JSON.stringify({ r0: r0.tokens, r1: r1.tokens }));
 }
 
 head('[E] 读不出来不许冒泡');

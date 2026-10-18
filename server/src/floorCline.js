@@ -244,6 +244,34 @@ const PHASE_FRESH_MS = 2 * 60_000;
 const DONE_TTL_MS = 10 * 60_000;
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false, doneSaid: '' };
 
+/** Cline tool names that actually write/modify a file. Read-only tools (read_files, grep, glob, run_commands …) never count. */
+const WRITE_TOOLS = new Set(['write', 'edit', 'str_replace_editor', 'insert', 'apply_diff']);
+
+/** File paths this assistant message actually wrote/edited, normalized to project-relative when possible. */
+function toolFilePaths(m, projectPath) {
+  const content = Array.isArray(m.content) ? m.content : [];
+  const out = [];
+  const seen = new Set();
+  const add = (p) => {
+    if (!p) return;
+    let rel = p;
+    if (projectPath) {
+      try { rel = path.relative(projectPath, p); } catch { /* keep absolute */ }
+      if (rel.startsWith('..') || path.isAbsolute(rel)) rel = p; // outside the project: keep as-is
+    }
+    if (rel && !seen.has(rel)) { seen.add(rel); out.push(rel); }
+  };
+  for (const c of content) {
+    if (!c || c.type !== 'tool_use') continue;
+    if (!WRITE_TOOLS.has(String(c.name || ''))) continue;
+    const input = c.input && typeof c.input === 'object' ? c.input : {};
+    const arr = Array.isArray(input.files) ? input.files : [];
+    for (const f of arr) add(String((f && f.path) || ''));
+    for (const key of ['file_path', 'path', 'filePath', 'target_file']) add(String(input[key] || ''));
+  }
+  return out;
+}
+
 /** The parsed conversation for a session, or null when unreadable. */
 function readConversation(session) {
   const p = (session && session.messagesPath) || '';
@@ -413,6 +441,7 @@ function readClineRounds(sessionId) {
   if (!s) return [];
   const convo = readConversation(s);
   if (!convo) return [];
+  const projectPath = s.projectPath || '';
   const rounds = [];
   let cur = null;
   for (const m of convo.messages) {
@@ -422,12 +451,15 @@ function readClineRounds(sessionId) {
     if (m.role === 'user') {
       const promptItem = content.find((c) => c && c.type === 'text' && /<user_input/i.test(String(c.text || '')));
       if (promptItem) {
-        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', result: '', tokens: null };
+        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', result: '', tokens: null, files: [] };
         rounds.push(cur);
       }
       continue;
     }
     if (m.role !== 'assistant' || !cur) continue;
+    // Collect files this turn actually wrote/edited; read-only tools never count as changes.
+    const written = toolFilePaths(m, projectPath);
+    for (const f of written) if (!cur.files.includes(f)) cur.files.push(f);
     const tail = content[content.length - 1];
     if (tail && tail.type === 'text') {
       // The turn's closing reply = the task detail's "output". A turn can emit assistant text a few times;
@@ -446,7 +478,7 @@ function readClineRounds(sessionId) {
       cur.outcome = 'running';
     }
   }
-  if (rounds.length && s.tokens) rounds[rounds.length - 1].tokens = s.tokens;
+  if (rounds.length && s.tokens) for (const r of rounds) r.tokens = s.tokens;
   return rounds;
 }
 
@@ -462,7 +494,7 @@ function projectIdOf(s) {
 }
 
 /** Write one ledger row (a line in both tasks and task_runs); one row per turn. */
-function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, form, title, startedAt, endedAt, state, result, tokens }) {
+function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, form, title, startedAt, endedAt, state, result, tokens, files }) {
   const st = state || (endedAt ? 'done' : 'running');
   const running = st === 'running';
   repo.insertTask.run({
@@ -488,21 +520,23 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, form, t
     startedAt,
     baselineCommit: null,
   });
-  // Cline's transcript records tool calls, not which files they changed (see readClineRounds), so the
-  // changed-file list is **unknown** — leave it NULL and explicitly clear anything a previous build wrote.
-  // endTaskRun's COALESCE would otherwise keep a stale guess; NULL = unknown per schema.sql, never a guess.
+  const fileCount = files == null ? null : files.length;
+  const filesJson = files && files.length ? JSON.stringify(files) : null;
   repo.endTaskRun.run({
     id,
     title,
     model: model || null,
     form: form || null,
     result: result || null,
-    fileCount: null,
-    filesJson: null,
+    fileCount: fileCount,
+    filesJson: filesJson,
     endedAt: endedAt || null,
     durationMs: endedAt && startedAt ? endedAt - startedAt : null,
   });
-  repo.clearTaskRunFiles.run(id);
+  // Only explicitly clear when we genuinely don't know the files (files == null). When files is []
+  // (no changes) or a real list, keep what endTaskRun wrote — clearTaskRunFiles would otherwise wipe
+  // it right back to NULL on every poll.
+  if (files == null) repo.clearTaskRunFiles.run(id);
   repo.setTaskRunTokens.run({
     id,
     inputTokens: tokens ? tokens.input : null,
@@ -606,6 +640,7 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
         state,
         result: r.endedAt ? r.result || '' : '',
         tokens: r.tokens,
+        files: r.files,
       });
       hbId = id;
       running = !r.endedAt;
