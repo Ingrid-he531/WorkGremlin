@@ -46,26 +46,34 @@ for (const f of ['1F', '4F', '7F', '8F']) {
 }
 
 // -------------------------------------------------- 只读保证：这是功能的前提
-head('只读保证：关工具的参数必须在');
+// 议事厅一律只读：每个配方都只放行读类工具，写类/执行/联网全 deny。
+head('只读保证：参与者只有读类工具');
 {
   const c1 = RECIPES['1F'].build({ bin: '/usr/bin/codebuddy', prompt: '问题' });
   const c4 = RECIPES['4F'].build({ bin: '/usr/bin/claude', prompt: '问题' });
   for (const [name, inv] of [['1F CodeBuddy', c1], ['4F Claude', c4]]) {
     const i = inv.args.indexOf('--tools');
-    ok(`${name} 带 --tools 且值为空串（关掉全部内置工具）`, i >= 0 && inv.args[i + 1] === '', JSON.stringify(inv.args));
+    ok(`${name} 的 --tools 是只读白名单（${READ_TOOLS}）`, i >= 0 && inv.args[i + 1] === READ_TOOLS, JSON.stringify(inv.args));
+    // -p 是非交互的：只给 --tools 不给 --allowedTools，读文件时没人应答权限询问会被直接拒，
+    // 参与者就变成"干瞪眼"。这一条钉的是"它是只读，不是读不了"。
+    ok(`${name} 同时给了 --allowedTools 同一份（否则读文件会被权限询问拦下）`,
+      inv.args[inv.args.indexOf('--allowedTools') + 1] === READ_TOOLS, JSON.stringify(inv.args));
   }
-  // 空串这个值很容易被"顺手清理"掉（看起来像没填），所以专门钉一次
-  ok('1F 的 --tools 后面跟的确实是空字符串而不是被吞掉', c1.args[c1.args.indexOf('--tools') + 1] === '');
-  ok('4F 同理', c4.args[c4.args.indexOf('--tools') + 1] === '');
+  // --allowedTools 收的是变长参数，排在它后面的开关会被吃掉 → --permission-prompts 必须在前面
+  ok('4F 的 --permission-prompts none 排在 --allowedTools 前面（否则会被变长参数吃掉）',
+    c4.args.indexOf('--permission-prompts') < c4.args.indexOf('--allowedTools'), JSON.stringify(c4.args));
+  ok('4F 明说"没人应答就拒"（不是挂在那儿等）', c4.args[c4.args.indexOf('--permission-prompts') + 1] === 'none');
 }
 {
   const c7 = RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: '问题' });
   const cfg = JSON.parse(c7.env.KILO_CONFIG_CONTENT);
   ok('7F 注入了 KILO_CONFIG_CONTENT', Boolean(c7.env.KILO_CONFIG_CONTENT));
-  ok('7F 权限全 deny', cfg.permission['*'] === 'deny');
-  ok('7F 逐项也 deny（bash / edit / write / read）',
-    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' &&
-    cfg.permission.write === 'deny' && cfg.permission.read === 'deny');
+  ok('7F 兜底是 deny（没在表里的工具一个都别想用）', cfg.permission['*'] === 'deny');
+  ok('7F 只放行读类（read / glob / grep / list）',
+    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
+    cfg.permission.grep === 'allow' && cfg.permission.list === 'allow');
+  ok('7F 的写类全 deny（bash / edit / write）',
+    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' && cfg.permission.write === 'deny');
   ok('7F 连 webfetch / task / skill 都 deny',
     cfg.permission.webfetch === 'deny' && cfg.permission.task === 'deny' && cfg.permission.skill === 'deny');
 
@@ -77,7 +85,9 @@ head('只读保证：关工具的参数必须在');
   const c8 = RECIPES['8F'].build({ bin: '/usr/bin/opencode', prompt: '问题' });
   const cfg = JSON.parse(c8.env.OPENCODE_CONFIG_CONTENT);
   ok('8F 注入了 OPENCODE_CONFIG_CONTENT', Boolean(c8.env.OPENCODE_CONFIG_CONTENT));
-  ok('8F 权限全 deny', cfg.permission['*'] === 'deny' && cfg.permission.bash === 'deny' && cfg.permission.read === 'deny');
+  ok('8F 只放行读类，写类 / bash 全 deny',
+    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
+    cfg.permission.bash === 'deny' && cfg.permission.write === 'deny');
   ok('8F 也挡了 external_directory', cfg.permission.external_directory === 'deny');
 }
 {
@@ -295,71 +305,13 @@ ok('disagree / 反对 归成 disagree', normalizeVoteToken('反对') === 'disagr
 ok('abstain / 弃权 归成 abstain', normalizeVoteToken('弃权') === 'abstain');
 ok('认不出返回 null', normalizeVoteToken('随便') === null && normalizeVoteToken(null) === null);
 
-// ==================================================== 工程模式：只读，不是"能读能写"
-// 这一组与上面那组是**同一件事的两档**：allow='none' 是"什么都没有"，allow='read' 是
-// "只有读类工具"。第二种情况更容易出事 —— 多放行一个 write/edit/bash，参与者就能改用户的
-// 代码、在用户机器上跑命令。所以这里逐项断言放行了什么、没放行什么，而不是只看它"有没有工具"。
-head('只读保证（工程模式）：放行的只有读类工具，写类一律 deny');
-{
-  const i1 = RECIPES['1F'].build({ bin: '/usr/bin/codebuddy', prompt: '问题', allow: 'read' });
-  const a1 = i1.args;
-  ok('1F 的 --tools 不再是空串（隔离模式是空串，工程模式是白名单）', a1[a1.indexOf('--tools') + 1] !== '');
-  ok(`1F 的 --tools 就是那份白名单（${READ_TOOLS}）`, a1[a1.indexOf('--tools') + 1] === READ_TOOLS, JSON.stringify(a1));
-  // -p 是非交互的：只给 --tools 不给 --allowedTools，读文件时没人应答权限询问会被直接拒，
-  // 参与者就变成"干瞪眼"。这一条钉的是"它是只读，不是读不了"。
-  ok('1F 同时给了 --allowedTools 同一份（否则读文件会被权限询问拦下）',
-    a1[a1.indexOf('--allowedTools') + 1] === READ_TOOLS, JSON.stringify(a1));
-
-  const a4 = RECIPES['4F'].build({ bin: '/usr/bin/claude', prompt: '问题', allow: 'read' }).args;
-  ok('4F 的 --tools 也是那份白名单', a4[a4.indexOf('--tools') + 1] === READ_TOOLS, JSON.stringify(a4));
-  ok('4F 同样给了 --allowedTools', a4[a4.indexOf('--allowedTools') + 1] === READ_TOOLS, JSON.stringify(a4));
-  // --allowedTools 收的是变长参数，排在它后面的开关会被吃掉 → --permission-prompts 必须在前面
-  ok('4F 的 --permission-prompts none 排在 --allowedTools 前面（否则会被变长参数吃掉）',
-    a4.indexOf('--permission-prompts') < a4.indexOf('--allowedTools'), JSON.stringify(a4));
-  ok('4F 明说"没人应答就拒"（不是挂在那儿等）', a4[a4.indexOf('--permission-prompts') + 1] === 'none');
-}
-{
-  const cfg = JSON.parse(RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: 'p', allow: 'read' }).env.KILO_CONFIG_CONTENT);
-  ok('7F 放行 read / glob / grep / list',
-    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
-    cfg.permission.grep === 'allow' && cfg.permission.list === 'allow', JSON.stringify(cfg.permission));
-  ok('7F 的兜底仍然是 deny（没在表里的工具一个都别想用）', cfg.permission['*'] === 'deny');
-  ok('7F 的写类照旧全 deny（bash / edit / write）',
-    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' && cfg.permission.write === 'deny');
-  ok('7F 仍然摘掉上报插件（工程模式同样不许上报）', Array.isArray(cfg.plugin) && cfg.plugin.length === 0);
-}
-{
-  const cfg = JSON.parse(RECIPES['8F'].build({ bin: '/usr/bin/opencode', prompt: 'p', allow: 'read' }).env.OPENCODE_CONFIG_CONTENT);
-  ok('8F 放行 read / glob / grep / list',
-    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
-    cfg.permission.grep === 'allow' && cfg.permission.list === 'allow', JSON.stringify(cfg.permission));
-  ok('8F 的写类照旧全 deny（bash / edit / write）',
-    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' && cfg.permission.write === 'deny');
-  // 命门：工程模式只许看工程里。这条松了，参与者能顺着 ~ 读到用户所有的东西
-  ok('8F 仍然挡住 external_directory（只许看工程里，不许看 ~）', cfg.permission.external_directory === 'deny');
-  ok('8F 也仍然挡 webfetch / task / skill',
-    cfg.permission.webfetch === 'deny' && cfg.permission.task === 'deny' && cfg.permission.skill === 'deny');
-}
-{
-  // 隔离模式（allow 缺省 / 'none'）必须与改动前逐字相同 —— 这条是回归对照
-  for (const f of ['1F', '4F', '7F', '8F']) {
-    const withDefault = RECIPES[f].build({ bin: '/x', prompt: 'p' });
-    const withNone = RECIPES[f].build({ bin: '/x', prompt: 'p', allow: 'none' });
-    ok(`${f} 不传 allow 与传 'none' 逐字相同`, JSON.stringify(withDefault) === JSON.stringify(withNone));
-  }
-  ok('不传 allow 时 1F/4F 依然是空串 --tools',
-    RECIPES['1F'].build({ bin: '/x', prompt: 'p' }).args[RECIPES['1F'].build({ bin: '/x', prompt: 'p' }).args.indexOf('--tools') + 1] === '');
-}
-
 // ================================================== 不上报：工程模式隔离的命门
 // cwd 是用户的真实工程时，装了 WorkGremlin 上报 hook/插件的机器会把参与者**按真实工程
 // 路径**上报 —— 参与者就变成"你工程里的一个成员"。cwd 挡不住这件事，只有显式关掉上报。
 head('所有配方都关掉了 WorkGremlin 自己的上报');
 for (const f of ['1F', '4F', '7F', '8F']) {
-  for (const allow of ['none', 'read']) {
-    const env = RECIPES[f].build({ bin: '/x', prompt: 'p', allow }).env;
-    ok(`${f}（allow=${allow}）注入了 WORKGREMLIN_DISABLE=1`, env.WORKGREMLIN_DISABLE === '1', JSON.stringify(env));
-  }
+  const env = RECIPES[f].build({ bin: '/x', prompt: 'p' }).env;
+  ok(`${f} 注入了 WORKGREMLIN_DISABLE=1`, env.WORKGREMLIN_DISABLE === '1', JSON.stringify(env));
 }
 ok('QUIET_ENV 只有这一条（别顺手塞别的东西进去）', Object.keys(QUIET_ENV).length === 1 && QUIET_ENV.WORKGREMLIN_DISABLE === '1');
 
@@ -371,11 +323,11 @@ ok('QUIET_ENV 只有这一条（别顺手塞别的东西进去）', Object.keys(
 // 这里只钉"发出去的确实是那个标题"；"跳过了"由 kiloFloor / opencodeFloor 那两个用例钉。
 head('7F/8F 发送固定的会话标题（办公室据此把参与者挡在外面）');
 for (const f of ['7F', '8F']) {
-  for (const allow of ['none', 'read']) {
-    const args = RECIPES[f].build({ bin: '/x', prompt: 'p', allow }).args;
+  {
+    const args = RECIPES[f].build({ bin: '/x', prompt: 'p' }).args;
     const at = args.indexOf('--title');
-    ok(`${f}（allow=${allow}）带了 --title`, at >= 0, JSON.stringify(args));
-    ok(`${f}（allow=${allow}）标题就是 DEFAULTS.COUNCIL_SESSION_TITLE`,
+    ok(`${f} 带了 --title`, at >= 0, JSON.stringify(args));
+    ok(`${f} 标题就是 DEFAULTS.COUNCIL_SESSION_TITLE`,
       args[at + 1] === DEFAULTS.COUNCIL_SESSION_TITLE, JSON.stringify(args));
   }
   // 只给这两家加：1F/4F 靠 --no-session-persistence 根本不产生记录，标题对它们是多余的

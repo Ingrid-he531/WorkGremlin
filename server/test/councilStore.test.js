@@ -269,7 +269,7 @@ head('老库迁移：没有 mode / workspace_path 的库升级后照常能用');
   ok('老会还在，内容没在重建里丢', row !== null && row.topic === '昨天那场没谈成的会', JSON.stringify(row && row.topic));
   // 这是最关键的一条：老行必须落到"与改动前逐字相同"的那一档
   ok('老会读出来是表决模式（不是别的猜法）', row.mode === 'vote', String(row.mode));
-  ok('老会读出来是隔离模式（workspace_path 为 NULL）', row.workspace_path === null, String(row.workspace_path));
+  ok('老会读出来没有工作目录（workspace_path 为 NULL → 临时目录）', row.workspace_path === null, String(row.workspace_path));
   ok('老会原来的结论没丢', row.verdict === 'no_consensus' && row.status === 'done', `${row.verdict}/${row.status}`);
 
   const uc = r2.raw.prepare('PRAGMA table_info(council_utterances)').all().map((c) => c.name);

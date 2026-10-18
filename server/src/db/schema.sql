@@ -315,8 +315,8 @@ CREATE TABLE IF NOT EXISTS councils (
   mode          TEXT NOT NULL DEFAULT 'vote'
                 CHECK (mode IN ('vote','analysis')),
   -- The participants' working directory (absolute path, validated on creation to exist and be a directory).
-  -- NULL = isolated mode: the server creates a one-off temp directory right away and deletes it when done
-  -- (see council/orchestrator.js).
+  -- NULL = no workspace given: the server creates a one-off temp directory right away and deletes it when
+  -- done (see council/orchestrator.js). Participants are read-only either way.
   -- **When it is not NULL that directory belongs to the user; it must never be deleted on cleanup** — a test in
   -- the orchestrator pins this rule.
   workspace_path TEXT,

@@ -53,7 +53,7 @@ export const useCouncilStore = defineStore('council', {
      * migration) → always treat as 'vote': that was the only mode back then, and guessing anything else would route the UI down a branch it never walked.
      */
     mode: (s) => ((s.current && s.current.council.mode) === 'analysis' ? 'analysis' : 'vote'),
-    /** Working directory of the current session (project mode); empty = isolated mode */
+    /** Working directory the session read (the user's project); empty = the server used a temp directory */
     workspacePath: (s) => (s.current && s.current.council.workspace_path) || '',
     /** Timeline grouped by round (with vote tallies counted from the utterances), see lib/councilTimeline.js */
     timeline: (s) => (s.current ? groupByRound(s.current.utterances) : []),
@@ -155,8 +155,8 @@ export const useCouncilStore = defineStore('council', {
       this.submitting = true;
       this.error = '';
       const body = { topic, floors, files, maxRounds, mode: mode || 'vote' };
-      // **An empty working directory means this key is simply not sent**: isolated mode is the
-      // server's default, and an empty string would just translate "not filled in" into "filled in blank", costing the server an extra step.
+      // **An empty working directory means this key is simply not sent**: the server then uses a
+      // throwaway temp directory, and an empty string would just translate "not filled in" into "filled in blank", costing the server an extra step.
       const ws = String(workspacePath == null ? '' : workspacePath).trim();
       if (ws) body.workspacePath = ws;
       try {

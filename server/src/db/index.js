@@ -81,10 +81,9 @@ function migrate(db) {
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
-  // Council room: expanding from "voting only" to "vote / analysis × isolated directory / project
-  // directory".
+  // Council room: expanding from "voting only" to "vote / analysis × temp directory / project directory".
   // After an old DB gets the columns, behavior is **verbatim identical** to before the change:
-  // mode='vote', workspace_path=NULL (= temp directory + no tools).
+  // mode='vote', workspace_path=NULL (= server-created temp directory; participants are read-only).
   ensureColumn(db, 'councils', 'mode', "mode TEXT NOT NULL DEFAULT 'vote'");
   ensureColumn(db, 'councils', 'workspace_path', 'workspace_path TEXT');
   ensureColumn(db, 'council_utterances', 'stance', 'stance TEXT');

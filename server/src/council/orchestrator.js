@@ -18,9 +18,8 @@
  *
  * Two orthogonal switches (both read from the councils row, fixed at kick-off, never changed midway):
  *   · mode            —— 'vote' / 'analysis'
- *   · workspace_path  —— a value = project mode (cwd = the user's real project + read-only tools);
- *                        NULL = isolated mode (cwd = a freshly created throwaway temp directory + all
- *                        tools disabled)
+ *   · workspace_path  —— which directory the participants read. A value = the user's real project;
+ *                        NULL = a freshly created throwaway temp directory (read-only either way)
  *
  * Three rules running all the way through:
  *   1. **Never fabricate**. Somebody timing out / crashing / producing unparseable output → record the
@@ -121,14 +120,14 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   /**
    * Run one participant's round.
    *
-   * @param {{ctx:object, floor:object, prompt:string, allow:'none'|'read',
+   * @param {{ctx:object, floor:object, prompt:string,
    *          mode:'vote'|'analysis', timeoutMs:number}} arg
    * @returns {Promise<{floorId:string, status:string, content:string|null, vote:string|null,
    *   voteReason:string|null, proposal:string|null, second:string|null,
    *   stance:string|null, findings:object|null, error:string|null,
    *   tokens:object|null, startedAt:number, endedAt:number, durationMs:number}>}
    */
-  async function askOne({ ctx, floor, prompt, allow, mode, timeoutMs: perTurnMs }) {
+  async function askOne({ ctx, floor, prompt, mode, timeoutMs: perTurnMs }) {
     const startedAt = now();
     const recipe = RECIPES[floor.floor_id];
     const bin = floor.cli_path || cliPath(floor.floor_id);
@@ -161,7 +160,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       };
     }
 
-    const inv = recipe.build({ bin, prompt, allow });
+    const inv = recipe.build({ bin, prompt });
     const r = await runTurn({
       ...inv,
       cwd: ctx.workDir,
@@ -328,14 +327,15 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       return repo.getCouncil(councilId);
     }
 
-    // Where to talk (orthogonal to how, see the notes on councils in schema.sql):
-    //   · project mode —— use **the user's** directory. Note ctx.tmpDir stays null: that is why the
-    //     "delete directory" branch during wrap-up never touches it (see the two locks in closeCouncil).
-    //   · isolated mode —— create a throwaway temp directory now, delete it at wrap-up. Verbatim as
-    //     before the change.
+    // Where to talk (orthogonal to how, see the notes on councils in schema.sql). The council is always
+    // **read-only**, so it always needs a directory to read:
+    //   · user gave a workspace —— use **the user's** directory. Note ctx.tmpDir stays null: that is why
+    //     the "delete directory" branch during wrap-up never touches it (see the two locks in closeCouncil).
+    //   · no workspace —— create a throwaway temp directory now, delete it at wrap-up, and treat it just
+    //     like a workspace directory (read-only tools; it is empty, so the participant really does go by
+    //     the material on the table).
     const workspace = council.workspace_path ? String(council.workspace_path) : '';
     const mode = council.mode === 'analysis' ? 'analysis' : 'vote';
-    const allow = workspace ? 'read' : 'none';
     const perTurnMs = workspace ? workspaceTimeoutMs : timeoutMs;
 
     let tmpDir = null;
@@ -443,12 +443,14 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
             proposalFrom: analysis ? '' : proposalFrom,
             roundNo, maxRounds, history,
             floorId: floor.floor_id, floorName: floorName(floor.floor_id),
-            mode, workspace: workspace || null,
+            // The directory the participant actually reads: the user's workspace, or the throwaway temp
+            // directory when none was given (both get the read-only role block).
+            mode, workspace: ctx.workDir || null,
           }),
         }));
         for (const floor of participants) repo.setParticipantStatus(councilId, floor.floor_id, 'running', null);
         const answers = await Promise.all(
-          prompts.map((p) => askOneSafe({ ctx, ...p, allow, mode, timeoutMs: perTurnMs }))
+          prompts.map((p) => askOneSafe({ ctx, ...p, mode, timeoutMs: perTurnMs }))
         );
 
         if (ctx.cancelled) break;

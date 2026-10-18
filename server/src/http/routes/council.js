@@ -58,13 +58,13 @@ const MODES = Object.freeze(['vote', 'analysis']);
  * cause (a mistyped directory).
  *
  * @param {unknown} raw workspacePath from the request body
- * @returns {{path:string}|{error:string}} an empty path = the user left it blank (isolated mode)
+ * @returns {{path:string}|{error:string}} an empty path = the user left it blank (the server then uses a temp directory)
  */
 function resolveWorkspaceDir(raw) {
   let s = String(raw == null ? '' : raw).trim();
   if (!s) return { path: '' };
   if (s === '~' || s.startsWith('~/')) s = path.join(os.homedir(), s.slice(s === '~' ? 1 : 2));
-  if (!path.isAbsolute(s)) return { error: `工作目录要写绝对路径（留空 = 隔离模式）：${s}` };
+  if (!path.isAbsolute(s)) return { error: `工作目录要写绝对路径（留空则用一个临时目录）：${s}` };
   const resolved = path.resolve(s);
   let st;
   try {
@@ -125,8 +125,8 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const mode = body.mode == null || body.mode === '' ? DEFAULTS.COUNCIL_MODE_DEFAULT : String(body.mode);
     if (!MODES.includes(mode)) return bad(res, `模式只能是 ${MODES.join(' / ')}：${mode}`);
 
-    // Where to talk: blank = isolated mode (verbatim as before the change); if filled in it must be
-    // an existing, readable directory
+    // Where to read: blank = the server creates a temp directory; if filled in it must be an existing,
+    // readable directory
     const ws = resolveWorkspaceDir(body.workspacePath);
     if (ws.error) return bad(res, ws.error);
 

@@ -1,18 +1,18 @@
 'use strict';
 
 /**
- * Which floors the council room may invite — a **whitelist**, not "installed means eligible".
+ * Which floors the council room may invite — a **whitelist** of floors we have a verified recipe for,
+ * not "installed means eligible".
  *
- * Why a whitelist: the council needs agents that "can be launched headlessly from the command
- * line and can have all their tools turned off". Only four of the nine floors were verified
- * for these two properties (see the notes on each recipe in server/src/council/agents.js):
- *   1F CodeBuddy / 4F Claude Code —— `--tools ""`
- *   7F Kilo Code  / 8F OpenCode   —— inject a permission config that denies everything
- * The remaining floors (2F Cline, 3F Codex, 5F TraeCode, 6F Qoder, 9F Copilot) either lack
- * a usable headless entry point on this machine or cannot have their tools disabled — so they
- * **do not appear in the council room**, rather than being invited first and excused later.
- * Whether read-only is achievable is the **threshold** for entering this whitelist, not a
- * bonus you can add afterwards.
+ * The council is **always read-only** (see agents.js): the participant gets read-type tools only, and
+ * when no workspace is given it is pointed at a throwaway temp directory. So a floor qualifies when it
+ * can be launched headlessly from the command line **and** narrowed to read-type tools. The four below
+ * were verified (see the notes on each recipe in server/src/council/agents.js):
+ *   1F CodeBuddy / 4F Claude Code —— `--tools Read,Grep,Glob`
+ *   7F Kilo Code  / 8F OpenCode   —— a permission config that allows only read-type tools
+ * Other floors are simply **not wired up yet** (no recipe written); that is a scope decision, not a
+ * claim that they can never qualify. Floors we have no recipe for do not appear in the council room at
+ * all, rather than being invited first and excused later.
  *
  * `ready` here looks only at "does the executable exist" (the cliInstallPath found by products
  * detection). Note that `installed` must not be used: for a merged floor (1F) that has the IDE

@@ -406,10 +406,10 @@ const MESSAGES = {
     'council.mode_vote_note': '就一份提案多轮表决，数票判有没有达成一致。',
     'council.mode_analysis_note': '不投票：各人自己分析、给风险点和存疑处，跑满轮数后出一份分组简报。没有「谈成没谈成」这回事。',
     'council.workspace': '工作目录（可选）',
-    'council.workspace_ph': '留空 = 隔离模式；或填工程的绝对路径，例如 /home/me/proj',
+    'council.workspace_ph': '工程的绝对路径，例如 /home/me/proj；留空则用一个临时目录',
     'council.workspace_hint':
-      '留空 = 隔离模式：现建一个临时目录，参与者没有工具，只能照着上面的材料谈。填一个绝对路径 = 工程模式：就以它为工作目录，参与者拿到只读工具（读文件、搜代码），能自己去翻这个工程 —— 不能改文件、不能执行命令。它们不会出现在办公室和任务记录里。',
-    'council.workspace_abs': '工作目录要写绝对路径（留空 = 隔离模式）',
+      '填一个绝对路径：就以它为工作目录，参与者拿到只读工具（读文件、搜代码），能自己去翻这个工程 —— 不能改文件、不能执行命令。留空：现建一个临时目录当工作目录，同样只读（目录是空的，参与者只能照着上面的材料谈）。它们不会出现在办公室和任务记录里。',
+    'council.workspace_abs': '工作目录要写绝对路径（留空则用一个临时目录）',
     'council.workspace_line': '工作目录',
     'council.workspace_timeout': '工程模式下单轮最长等 {min} 分钟（它们要自己翻代码）。',
     'council.floors': '请哪些楼层',
@@ -427,7 +427,7 @@ const MESSAGES = {
     'council.files': '背景材料（可选）',
     'council.files_ph': '一行一个绝对路径，例如 /home/me/spec.md',
     'council.files_hint':
-      '服务端读文件原文嵌进提示词；参与者没有工具，看不到文件本身。单文件超过 {kb}KB 会截断，截断多少会写在下面的材料清单里。',
+      '服务端把文件原文读出来嵌进提示词（所以工作目录里没有这些文件时，参与者也看得到）。单文件超过 {kb}KB 会截断，截断多少会写在下面的材料清单里。',
     'council.rounds': '最多讨论几轮',
     'council.rounds_note': '到轮数还没谈成，就如实写「未达成一致」——不硬凑一个结论。',
     'council.rounds_note_analysis': '分析模式跑满这个轮数就收场，不会提前结束——没有「达成一致」可以提前撞上。',
@@ -847,10 +847,10 @@ const MESSAGES = {
     'council.mode_analysis_note':
       'No voting: each writes their own analysis with risks and open questions, and after the full number of rounds you get a grouped briefing. There is no "agreed or not".',
     'council.workspace': 'Working directory (optional)',
-    'council.workspace_ph': 'blank = isolated mode; or an absolute path, e.g. /home/me/proj',
+    'council.workspace_ph': 'absolute path to a project, e.g. /home/me/proj; blank = a throwaway temp directory',
     'council.workspace_hint':
-      'Blank = isolated mode: a throwaway temp directory, no tools at all, so participants can only go by the material above. An absolute path = workspace mode: that directory becomes their working directory and they get read-only tools (read files, search code) so they can look things up themselves — they cannot edit files or run commands. Either way they never show up in the office or task records.',
-    'council.workspace_abs': 'The working directory must be an absolute path (blank = isolated mode)',
+      'An absolute path: that directory becomes the participants\u2019 working directory and they get read-only tools (read files, search code) so they can look things up themselves — they cannot edit files or run commands. Blank: the server creates a throwaway temp directory as the working directory, also read-only (it is empty, so they go by the material above). Either way they never show up in the office or task records.',
+    'council.workspace_abs': 'The working directory must be an absolute path (blank = a temp directory)',
     'council.workspace_line': 'Working directory',
     'council.workspace_timeout': 'In workspace mode each turn waits up to {min} minutes — they read code themselves.',
     'council.floors': 'Who to invite',
@@ -870,7 +870,7 @@ const MESSAGES = {
     'council.files': 'Background material (optional)',
     'council.files_ph': 'one absolute path per line, e.g. /home/me/spec.md',
     'council.files_hint':
-      'The server reads the files and inlines the text into the prompt; participants have no tools, so they never see the files themselves. Files over {kb}KB are truncated — how much went in is listed under the materials below.',
+      'The server reads the files and inlines the text into the prompt (so participants still see them when the files are not inside the working directory). Files over {kb}KB are truncated — how much went in is listed under the materials below.',
     'council.rounds': 'Max rounds',
     'council.rounds_note': 'If they have not agreed by then, the result says "no agreement" — no conclusion is manufactured.',
     'council.rounds_note_analysis': 'Analysis mode runs exactly this many rounds and then stops — there is no early finish, because there is no agreement to hit.',

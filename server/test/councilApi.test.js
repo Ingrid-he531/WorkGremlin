@@ -188,7 +188,7 @@ let server = null;
     ok('判定口径落在这一场上（不被后续全局改动影响）', r.council.threshold === 'unanimous', String(r.council.threshold));
     // 没填 mode / workspacePath = 与改动前逐字相同的行为（老前端不发这两个字段也必须照常能用）
     ok('不填谈法就是表决（缺省没变）', r.council.mode === 'vote', String(r.council.mode));
-    ok('不填工作目录就是隔离模式（NULL，不是空串）', r.council.workspace_path === null, String(r.council.workspace_path));
+    ok('不填工作目录就存 NULL（不是空串）—— 服务端据此建临时目录', r.council.workspace_path === null, String(r.council.workspace_path));
 
     ok('编排器被叫起来跑这一场', orch.started.includes(id), JSON.stringify(orch.started));
     const ps = repo.listParticipants(id);

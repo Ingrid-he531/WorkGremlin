@@ -4,16 +4,14 @@
  * The council room's prompts —— pure functions, no IO (material content is read by the caller and
  * passed in).
  *
- * What a participant can do depends on **where it is talking** (see agents.js):
- *   · Isolated mode (working directory = a throwaway temp directory created by the server) —— it has
- *     no tools, cannot read files, cannot run commands, cannot reach the network. So the background
- *     material must be **stuffed into the prompt as-is by the server**, otherwise it has no idea
- *     what is being discussed;
- *   · Project mode (working directory = the user's real project) —— it has a **read-only** tool set
- *     and can go dig through the code itself.
+ * Every participant is **read-only** (see agents.js): it can read and search the working directory
+ * (the user's project, or a throwaway temp directory the server creates when none was given), but
+ * cannot write, run commands or reach the network. The background material is still **stuffed into
+ * the prompt as-is by the server**, so the discussion stands on its own even when the directory is
+ * empty.
  *
- * In both cases "what you do not know" has to be spelled out, so it does not pass off impressions
- * from its training data as facts.
+ * "What you do not know" has to be spelled out, so nobody passes off impressions from its training
+ * data as facts.
  *
  * Also, a meeting can run in two ways (councils.mode): 'vote' (proposal + count votes to decide
  * consensus) and 'analysis' (no voting, each writes its own analysis and risks, and the server does
@@ -94,29 +92,22 @@ function renderFindings(f) {
  * The "who you are and what you cannot do" block shared by every participant. Carried every round
  * so it cannot forget over multiple rounds.
  *
- * Two tiers (depending on whether `workspace` has a value), and **the capability boundary must be
- * accurate**: say "you can read code" and it will read; say "you have nothing" and it can only
- * speak from the material. Get it wrong and its behavior goes wrong with it.
+ * The council is always **read-only**: the participant can read the workspace and search it, but not
+ * write, run commands or reach the network. **The capability boundary must be accurate** —— say "you
+ * can read code" and it will read; get it wrong and its behavior goes wrong with it.
  * @param {string} floorId
  * @param {string} floorName
- * @param {string|null} [workspace] working directory; empty = isolated mode (no tools)
+ * @param {string} [workspace] working directory the participant reads (the user's project, or the
+ *   server's throwaway temp directory when none was given)
  */
 function roleBlock(floorId, floorName, workspace) {
   const head = `你是 WorkGremlin 议事厅里【${floorId} ${floorName}】这一层的代表，正在参加一场多方讨论。`;
-  if (workspace) {
-    return [
-      head,
-      '',
-      `你正在 \`${workspace}\` 这个工程目录里，可以用**只读**工具自己去翻代码（读文件、按名字或内容搜索）。`,
-      '除此之外你什么都做不了：**不能修改任何文件、不能执行命令、不能上网、看不到对方的机器**。',
-      '你看到的就是这个工程真实的当前代码 —— 拿不准的事就去读，别凭印象编造；读了仍然不确定，就直说不确定。',
-    ].join('\n');
-  }
   return [
     head,
     '',
-    '你能做的只有一件事：**说话**。你没有文件读写、不能执行命令、不能上网、看不到对方的机器。',
-    '下面给出的材料就是你能知道的全部信息 —— 材料里没有的，不要凭印象编造；不确定就直说不确定。',
+    `你正在 \`${workspace}\` 这个工程目录里，可以用**只读**工具自己去翻代码（读文件、按名字或内容搜索）。`,
+    '除此之外你什么都做不了：**不能修改任何文件、不能执行命令、不能上网、看不到对方的机器**。',
+    '你看到的就是这个工程真实的当前代码 —— 拿不准的事就去读，别凭印象编造；读了仍然不确定，就直说不确定。',
   ].join('\n');
 }
 

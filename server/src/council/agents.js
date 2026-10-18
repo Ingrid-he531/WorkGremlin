@@ -37,27 +37,25 @@
 const { DEFAULTS } = require('@workgremlin/shared');
 
 /**
- * Turn off WorkGremlin's **own** reporting —— injected by every recipe, in both modes.
+ * Turn off WorkGremlin's **own** reporting —— injected by every recipe.
  *
- * Why it is mandatory: isolated mode gets by with cwd in /tmp (the project path a participant
- * reports is that temp directory, invisible to the office). **In project mode cwd is the user's real
- * project**, and the reporting hooks installed in `~/.claude/settings.json` /
- * `~/.codebuddy/settings.json` would report with the real project path —— the participant would turn
- * into "one of the members in your project", a direct violation of "visible only in the council
- * room". So stop relying on cwd and explicitly disable reporting instead: the hook
- * (packages/reporter/src/hook.js) and the plugin (packages/reporter/src/plugin/index.js) both honor
- * this flag and exit in place when they see it.
+ * Why it is mandatory: when the user supplies a workspace, cwd is the user's real project, and the
+ * reporting hooks installed in `~/.claude/settings.json` / `~/.codebuddy/settings.json` would report
+ * with the real project path —— the participant would turn into "one of the members in your project",
+ * a direct violation of "visible only in the council room". When no workspace is given, cwd falls back
+ * to a throwaway temp directory (the office filters that out by project), but the flag is still injected
+ * uniformly. The hook (packages/reporter/src/hook.js) and the plugin
+ * (packages/reporter/src/plugin/index.js) both honor this flag and exit in place when they see it.
  */
 const QUIET_ENV = Object.freeze({ WORKGREMLIN_DISABLE: '1' });
 
 /**
  * Fixed session title for 7F / 8F participants —— unlike 1F/4F these two have no "do not persist"
  * switch, so sessions are always recorded in their **global** SQLite (`session.directory` = the cwd
- * at the time). In isolated mode cwd is under /tmp and the office filters it out by project; in
- * project mode cwd is the user's project, and unguarded participants would show up directly on the
- * office's 7F/8F. The guard is "give it a fixed title", which server/src/kilo.js and
- * server/src/opencode.js skip when listing sessions —— reasoning and trade-offs are written on
- * COUNCIL_SESSION_TITLE in shared/index.js.
+ * at the time). When the user supplies a workspace, cwd is the user's project, and unguarded
+ * participants would show up directly on the office's 7F/8F. The guard is "give it a fixed title",
+ * which server/src/kilo.js and server/src/opencode.js skip when listing sessions —— reasoning and
+ * trade-offs are written on COUNCIL_SESSION_TITLE in shared/index.js.
  */
 const SESSION_TITLE = DEFAULTS.COUNCIL_SESSION_TITLE;
 
@@ -67,13 +65,8 @@ const PERMISSION_KEYS = Object.freeze([
   'webfetch', 'websearch', 'task', 'skill', 'todowrite', 'external_directory',
 ]);
 
-/** Permission lockdown shared by 7F / 8F: deny every tool category —— used by isolated mode */
-const DENY_ALL_PERMISSION = Object.freeze(
-  Object.fromEntries([['*', 'deny'], ...PERMISSION_KEYS.map((k) => [k, 'deny'])])
-);
-
 /**
- * Permission table handed to 7F / 8F in project mode (allow='read'): **only** read-type tools are
+ * Permission table handed to 7F / 8F (the council is always read-only): **only** read-type tools are
  * allowed, everything else stays denied.
  *
  * 7F Kilo / 8F OpenCode have no `--tools` switch like 1F/4F (`kilo --pure` only disables external
@@ -81,9 +74,9 @@ const DENY_ALL_PERMISSION = Object.freeze(
  * Two entries **must** stay denied:
  *   · `bash` / `write` / `edit` —— participants may not modify the user's code nor run commands on
  *     his machine;
- *   · `external_directory` —— project mode allows looking inside the project only. Its default is
- *     ask, and since nobody answers council participants' permission prompts, ask turns into "stuck
- *     until timeout"; writing deny explicitly is deterministic behavior.
+ *   · `external_directory` —— participants may look inside the workspace only. Its default is ask,
+ *     and since nobody answers council participants' permission prompts, ask turns into "stuck until
+ *     timeout"; writing deny explicitly is deterministic behavior.
  */
 const READ_PERMISSION = Object.freeze(
   Object.fromEntries([
@@ -91,11 +84,6 @@ const READ_PERMISSION = Object.freeze(
     ...PERMISSION_KEYS.map((k) => [k, ['read', 'glob', 'grep', 'list'].includes(k) ? 'allow' : 'deny']),
   ])
 );
-
-/** @param {string} allow 'none' (default, isolated mode's "no tools") or 'read' (project mode's read-only tools) */
-function permissionFor(allow) {
-  return allow === 'read' ? READ_PERMISSION : DENY_ALL_PERMISSION;
-}
 
 /**
  * Read-only tool whitelist for 1F / 4F. The **same list** goes to `--tools` and `--allowedTools`:
@@ -110,37 +98,34 @@ const READ_TOOLS = 'Read,Grep,Glob';
 /**
  * One recipe per floor.
  *
- * build({ bin, prompt, allow }) → { bin, args, env, stdin }
- *   · `allow` = 'none' (default) | 'read' —— see READ_TOOLS / READ_PERMISSION above.
- *     **Both values must either block tools entirely or narrow them to read-only**; there is no
- *     halfway state.
+ * build({ bin, prompt }) → { bin, args, env, stdin }
+ *   · The council is **always read-only**: every recipe narrows the participant to read-type tools
+ *     (see READ_TOOLS / READ_PERMISSION above) —— no writes, no command execution, no network.
  *   · env is **layered on top of** process.env (not a replacement) —— each CLI's login credentials
  *     live in ~/.claude, ~/.config/kilo, etc. and are found via HOME. Blocking HOME blocks the login,
- *     so isolation relies on cwd + tool narrowing + QUIET_ENV, not on rewriting environment variables.
+ *     so isolation relies on cwd + read-only narrowing + QUIET_ENV, not on rewriting environment
+ *     variables.
  *   · When stdin is not null the prompt travels through a pipe (not argv): long text never hits
  *     ARG_MAX and never shows up in `ps` output for other processes on the machine.
  *
  * Both 1F and 4F carry `--no-session-persistence` (documented in both help texts, valid under
- * `--print` only): participant conversations are **not persisted**. In project mode this flag is an
- * isolation necessity —— persisted, each CLI records participants under **the user's real project
- * path** into its own history (`~/.claude/projects/<project>/`), and the global session list grows a
- * few "active sessions in your project". Isolated mode benefits too: no more `tmp-wg-council-*`
- * one-off project leftovers.
+ * `--print` only): participant conversations are **not persisted**. That matters when cwd is the
+ * user's real project —— persisted, each CLI records participants under **that project path** into
+ * its own history (`~/.claude/projects/<project>/`), and the global session list grows a few "active
+ * sessions in your project".
  *
  * `--strict-mcp-config` without `--mcp-config`: do not load MCP servers from the user config.
- * `--tools ""` governs the **built-in** tool set, and MCP tools are not part of it —— leaving that
- * open makes "a participant with no tools" a false statement (for context: this tightens existing
- * behavior, it is not a newly opened hole).
+ * `--tools` limits the **built-in** tool set, and MCP tools are not part of it —— leaving that open
+ * would let a participant use a tool we never whitelisted.
  */
 const RECIPES = {
   '1F': {
     agent: 'codebuddy',
     name: 'CodeBuddy',
     // Measured: `-p` with no message reads the pipe (help text: "useful for pipes")
-    build({ bin, prompt, allow }) {
+    build({ bin, prompt }) {
       const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
-      if (allow === 'read') args.push('--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
-      else args.push('--tools', '');
+      args.push('--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
       return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
   },
@@ -148,16 +133,12 @@ const RECIPES = {
   '4F': {
     agent: 'claude',
     name: 'Claude Code',
-    build({ bin, prompt, allow }) {
+    build({ bin, prompt }) {
       const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
-      if (allow === 'read') {
-        // `--permission-prompts none` = refuse when nobody answers (rather than "hang and wait"). It
-        // goes **before** `--allowedTools`: that switch takes variadic arguments and would swallow it
-        // if placed later.
-        args.push('--permission-prompts', 'none', '--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
-      } else {
-        args.push('--tools', '');
-      }
+      // `--permission-prompts none` = refuse when nobody answers (rather than "hang and wait"). It
+      // goes **before** `--allowedTools`: that switch takes variadic arguments and would swallow it
+      // if placed later.
+      args.push('--permission-prompts', 'none', '--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
       return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
   },
@@ -169,14 +150,14 @@ const RECIPES = {
     // Our prompt always starts with our own template block and never begins with '-', so there is no
     // need to add a '--' separator (adding it risks yargs eating it as a separator, doing more harm
     // than good).
-    build({ bin, prompt, allow }) {
+    build({ bin, prompt }) {
       return {
         bin,
         args: ['run', prompt, '--format', 'json', '--title', SESSION_TITLE],
         env: {
           KILO_CONFIG_CONTENT: JSON.stringify({
             plugin: [], // strip WorkGremlin's own reporting plugin (otherwise participants get reported into the office)
-            permission: permissionFor(allow),
+            permission: READ_PERMISSION,
           }),
           ...QUIET_ENV,
         },
@@ -188,7 +169,7 @@ const RECIPES = {
   '8F': {
     agent: 'opencode',
     name: 'OpenCode',
-    build({ bin, prompt, allow }) {
+    build({ bin, prompt }) {
       return {
         bin,
         /**
@@ -205,7 +186,7 @@ const RECIPES = {
          */
         args: ['run', prompt, '--format', 'json', '--standalone', '--title', SESSION_TITLE],
         env: {
-          OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: permissionFor(allow) }),
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: READ_PERMISSION }),
           ...QUIET_ENV,
         },
         stdin: null,
@@ -556,7 +537,6 @@ function extractBalanced(s, from) {
 
 module.exports = {
   RECIPES,
-  DENY_ALL_PERMISSION,
   READ_PERMISSION,
   READ_TOOLS,
   QUIET_ENV,
