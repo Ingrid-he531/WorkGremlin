@@ -101,6 +101,10 @@ head('调用形态：长文本优先走管道，不进 argv');
   ok('7F 要 json 输出', c7.args.includes('--format') && c7.args.includes('json'));
   const c8 = RECIPES['8F'].build({ bin: '/usr/bin/opencode', prompt: '提示词' });
   ok('8F 走位置参数', c8.args[0] === 'run' && c8.args[1] === '提示词' && c8.stdin === null);
+  // 命门：不带 --standalone 时 `opencode run` 走用户那个常驻 serve，插件带着用户 env 早加载好了，
+  // WORKGREMLIN_DISABLE 到不了它 —— 参与者会被当成真的 8F 会话/任务上报（2026-10-18 实测）。
+  ok('8F 带 --standalone（私有 server，QUIET_ENV 才真正生效）', c8.args.includes('--standalone'), JSON.stringify(c8.args));
+  ok('7F 不需要 --standalone（它靠 config 里的 plugin: [] 摘插件）', !RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: '提示词' }).args.includes('--standalone'));
 }
 
 // ---------------------------------------------------------------- 输出解析

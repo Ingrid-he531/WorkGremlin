@@ -23,6 +23,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
+const { DEFAULTS } = require('@workgremlin/shared');
 
 let pass = 0;
 let fail = 0;
@@ -124,6 +125,41 @@ function installSpy() {
     await hooks.event({ event: { type: 'session.created', properties: { sessionID: 'q1' } } });
     for (let i = 0; i < 50 && calls.length === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
     ok('确实发起了请求（说明挡住的确实是我们那行早退）', calls.length > 0, String(calls.length));
+  }
+
+  head('议事厅会话按**固定标题**闭嘴 —— 共享 server 下 WORKGREMLIN_DISABLE 到不了插件（2026-10-18 实测漏网）');
+  {
+    // Reproduces the real failure: OpenCode's `opencode run` normally talks to a long-lived `opencode serve`
+    // that loaded this plugin with the user's own env hours earlier, so the child's WORKGREMLIN_DISABLE=1
+    // never reaches it and council participants got reported as normal 8F sessions/tasks/phases. The plugin
+    // must refuse them by the fixed session title instead.
+    delete process.env.WORKGREMLIN_DISABLE;
+    const feed = async (sid, title, extra) => {
+      // Flush any in-flight request left by an earlier group (reporting is fire-and-forget, so the control
+      // group's /register can still land a tick later) before we start counting.
+      await new Promise((r) => setTimeout(r, 60));
+      calls.length = 0;
+      const events = [
+        { type: 'session.created', data: { sessionID: sid, info: { title, directory: '/home/somebody/real-project', model: { id: 'm' } } } },
+        ...extra,
+      ];
+      const dispose = await plugin.setup({
+        event: { subscribe: async function* () { for (const e of events) yield e; } },
+        options: {},
+        location: { directory: '/home/somebody/real-project' },
+      });
+      // Reporting is fire-and-forget (ensureRegistered awaits the workspace first), so yield a few beats.
+      for (let i = 0; i < 40 && calls.length === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
+      dispose();
+      return calls.length;
+    };
+    const userTurn = (sid, prompt) => [{ type: 'session.inbox.enqueued', data: { sessionID: sid, item: { type: 'user', payload: { text: prompt } } } }];
+
+    const councilCount = await feed('council-1', DEFAULTS.COUNCIL_SESSION_TITLE, userTurn('council-1', '议题'));
+    ok('议事厅会话：一个请求都没发出去', councilCount === 0, `${councilCount} ${JSON.stringify(calls.map((c) => c.url))}`);
+
+    const normalCount = await feed('normal-1', '正常任务', userTurn('normal-1', '你好'));
+    ok('普通会话照常上报（说明挡住的确实是标题那道闸）', normalCount > 0, String(normalCount));
   }
 
   restore();

@@ -191,7 +191,19 @@ const RECIPES = {
     build({ bin, prompt, allow }) {
       return {
         bin,
-        args: ['run', prompt, '--format', 'json', '--title', SESSION_TITLE],
+        /**
+         * `--standalone` runs with a **private server** instead of the user's long-lived
+         * `opencode serve` daemon, and it is mandatory here for two reasons:
+         *   1. the private server is a child of this process, so it inherits QUIET_ENV and the reporting
+         *      plugin's `WORKGREMLIN_DISABLE` early-return actually fires. Without it the participant runs
+         *      inside the shared daemon, where the plugin was loaded with the **user's own env** hours
+         *      earlier —— the flag never reaches it and participants leak in as real 8F sessions / tasks /
+         *      phases (measured 2026-10-18: exactly that happened).
+         *   2. it also keeps the participant from touching (or being polluted by) the user's server.
+         * OpenCode has no `plugin: []`-style config switch that would help here (unlike 7F Kilo): the shared
+         * daemon ignores per-run config for plugins it already loaded.
+         */
+        args: ['run', prompt, '--format', 'json', '--standalone', '--title', SESSION_TITLE],
         env: {
           OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: permissionFor(allow) }),
           ...QUIET_ENV,

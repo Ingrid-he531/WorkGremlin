@@ -89,6 +89,14 @@ import path from "node:path"
 import { createRequire } from "node:module"
 const require_ = createRequire(import.meta.url)
 const { statePath, writeState, readServerInfo, isPidAlive } = require_('@workgremlin/shared/paths')
+const { DEFAULTS } = require_('@workgremlin/shared')
+
+/**
+ * Council participants' sessions carry this fixed title (set via `--title`, see
+ * server/src/council/agents.js SESSION_TITLE). Such a session is never reported —— see the guard at the
+ * top of handle() for why the title, not just WORKGREMLIN_DISABLE, has to be the backstop.
+ */
+const COUNCIL_SESSION_TITLE = String((DEFAULTS && DEFAULTS.COUNCIL_SESSION_TITLE) || "")
 
 /* ------------------------------ Report identity ------------------------------ */
 
@@ -836,6 +844,23 @@ function createIngestPlugin(options, { location, base } = {}) {
     // Workspace path: the envelope has no location (Kilo side), fall back to ownDir
     const dirOf = () => String((p.info && p.info.directory) || (p.info && p.info.path && p.info.path.cwd) || "")
 
+    // Learn the session title as early as possible. OpenCode v2's session.created already carries it (and a
+    // rename arrives as session.updated/renamed); the council guard right below must fire on a participant's
+    // very first event, or a task/phase would open before the title is known.
+    if ((type === "session.created" || type === "session.updated" || type === "session.renamed") && sid) {
+      const t = String((p.info && p.info.title) || p.title || "")
+      if (t) titles.set(sid, t)
+    }
+    /**
+     * Council participants are never reported into the office (see server/src/council/agents.js). The
+     * intended switch is WORKGREMLIN_DISABLE=1 on the participant child, but 8F's `opencode run` normally
+     * talks to a **long-lived shared server** (`opencode serve`) that loaded this plugin with the user's
+     * own env long before the council started —— the flag never reaches it, so participants leak in as
+     * regular 8F sessions / tasks / phases (measured 2026-10-18, fixing exactly that). The fixed session
+     * title is set at creation, so it is the reliable signal here regardless of which server loaded us.
+     */
+    if (sid && titles.get(sid) === COUNCIL_SESSION_TITLE) return
+
     // Member registration: **ensure on every event**, not only on `session.created`. Must: reopening the
     // Kilo VS Code window restarts kilo serve while the session already exists, so a new process never
     // sees session.created and would never register if only that branch did. Once registered this is a
@@ -883,13 +908,11 @@ function createIngestPlugin(options, { location, base } = {}) {
         break
       }
 
-      /* ---- Session renamed = title (used as the task title fallback at round end) ---- */
+      /* ---- Session renamed: the title was already captured at the top of handle() (used as the task title
+         fallback at round end); only the model is taken here ---- */
       case "session.updated":
       case "session.renamed": {
         const info = p.info || {}
-        // v1/Kilo: info.title; v2: the title sits at the top level (`{sessionID, title}`)
-        const title = String(info.title || p.title || "")
-        if (sid && title) titles.set(sid, title)
         // The model **often is not present at session.created** (measured: created's info has no model,
         // it comes with the immediately following session.updated) — so accept it in both places;
         // missing one shows as "the main console shows no model".
