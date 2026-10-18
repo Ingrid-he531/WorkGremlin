@@ -1429,8 +1429,10 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
 function kiloHandler(p, src, ctx) {
   const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
   for (const s of listKiloSessions()) {
-    if (!claim(p.id, s.id)) continue;
+    // Freshness before claiming: the separate hook source (plugin) owns the same session id, and claiming a
+    // stale DB row here would shadow the fresher hook row —— see the same note in opencodeHandler.
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
+    if (!claim(p.id, s.id)) continue;
     const ph = readKiloPhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;
     const truth =

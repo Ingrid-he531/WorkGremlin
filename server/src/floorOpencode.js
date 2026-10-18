@@ -37,6 +37,15 @@
  * back to the polling derivation below, at the cost of a grayed-out inferred phase and no "awaiting
  * permission".
  *
+ * **Do not be misled by OpenCode's `permission` table** (checked in the shipped binary, 2026-10-18): its
+ * shape is `permission(id, project_id, action, resource, time_created, time_updated)` with a UNIQUE index on
+ * `(project_id, action, resource)`, and it backs the `permission.saved.list` / `/api/permission/saved` API ——
+ * i.e. it stores the **allow rules the user has already granted** (measured: the 3 rows matched exactly the
+ * 3 paths the user approved), not pending requests. A pending request is an in-memory `Map` entry published
+ * as `permission.asked` and listed by `permission.request.list` / `/api/permission/request`; it has no row
+ * anywhere (the persisted `event` table is empty —— only `event_sequence` counters exist). So this table is
+ * **not** a way to derive "awaiting permission" by polling.
+ *
  * Phase derivation (look back from the newest message's content[] for the first part carrying a signal):
  *   tool + running   → calling a tool (tool name / command from part.state.input)
  *   tool + error     → called a tool but it errored
@@ -327,7 +336,9 @@ function modelIdOf(raw) {
  *   id → session id (axis 2, `ses_xxx` is the session_id in the hook sense)
  *   directory → project path (each session records its own working directory, more accurate than
  *               project.worktree —— when a worktree sub-session runs elsewhere, directory is the truth)
- *   time_updated → last activity time (it advances on every message written, more accurate than file times)
+ *   max(time_updated, newest session_message time) → last activity time. Measured 2026-10-18:
+ *   `time_updated` alone is unreliable (it is NOT bumped on every message and freezes while the session
+ *   waits on a permission prompt), see the note on `hasMsgTime` below.
  *
  * Columns are assembled by **probing** (pickSessionColumns below): a missing column must neither fail the
  * whole query nor turn the whole floor into a 500.
@@ -363,6 +374,21 @@ function listOpencodeSessionsUncached() {
     const want = ['id', 'title', 'directory', 'agent', 'model', 'time_updated', 'summary_files', 'summary_additions', 'summary_deletions'];
     const sel = want.filter((c) => cols.has(c)).map((c) => `"${c}"`).join(', ');
 
+    /**
+     * Last activity must not rely on `session_v2.time_updated` alone.
+     * Measured 2026-10-18: `time_updated` is **not** bumped on every message —— during an active turn
+     * it lagged the newest `session_message` by minutes, and while the session sat on a permission
+     * prompt it stopped moving entirely. A long "awaiting authorization" wait therefore crossed the
+     * registry's 60-minute TIMEOUT_MS and the session dropped out of the dropdown ("No project open").
+     * `session_message.time_updated` advances with every message / streaming update and is the real
+     * "this session is still alive" signal, so take whichever is newer.
+     */
+    const hasMsgTime =
+      tableExists(db, 'session_message') && pickSessionColumns(db, 'session_message').has('time_updated');
+    const lastMsgCol = hasMsgTime
+      ? `, (SELECT MAX("time_updated") FROM "session_message" m WHERE m."session_id" = "${table}"."id") AS "last_message_at"`
+      : '';
+
     const where = [];
     if (cols.has('time_archived')) where.push('"time_archived" IS NULL');
     if (cols.has('parent_id')) where.push('"parent_id" IS NULL');
@@ -375,7 +401,7 @@ function listOpencodeSessionsUncached() {
     const order = cols.has('time_updated') ? '"time_updated" DESC' : 'rowid DESC';
 
     return db
-      .prepare(`SELECT ${sel} FROM "${table}"${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order}`)
+      .prepare(`SELECT ${sel}${lastMsgCol} FROM "${table}"${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order}`)
       .all(...params);
   });
 
@@ -387,7 +413,7 @@ function listOpencodeSessionsUncached() {
       directory: dir,
       project: dir ? resolveProjectName(dir) || path.basename(dir) : '',
       projectPath: dir,
-      lastEventAt: Number(r.time_updated) || 0,
+      lastEventAt: Math.max(Number(r.time_updated) || 0, Number(r.last_message_at) || 0),
       agent: String(r.agent || ''),
       model: modelIdOf(r.model),
       fileCount: Number(r.summary_files) || 0,
@@ -395,6 +421,15 @@ function listOpencodeSessionsUncached() {
       deletions: Number(r.summary_deletions) || 0,
     };
   });
+}
+
+/** Whether a table exists —— probing columns must not fail the whole query when a table is absent (old DBs) */
+function tableExists(db, name) {
+  try {
+    return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?").get(String(name)));
+  } catch {
+    return false;
+  }
 }
 
 /** Which columns this session table really has (a missing column must not turn the whole floor into a 500, see the function note) */
@@ -1294,8 +1329,12 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
 function opencodeHandler(p, src, ctx) {
   const { claim, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, doneFieldsFromReporter } = ctx;
   for (const s of listOpencodeSessions()) {
-    if (!claim(p.id, s.id)) continue;
+    // Freshness is checked **before claiming**: this poll path and the plugin hook path describe the same
+    // session id, and `claim` is first-come-first-served. Claiming a stale DB row here would block the
+    // fresher hook row (the plugin keeps handwriting heartbeats while the DB's time_updated is frozen on a
+    // permission prompt), dropping a live session out of the registry.
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
+    if (!claim(p.id, s.id)) continue;
     const ph = readOpencodePhase(s.id) || null;
     const doneTruth =
       readReporterDone(s.projectPath || workspacePath, 'opencode', s.id);

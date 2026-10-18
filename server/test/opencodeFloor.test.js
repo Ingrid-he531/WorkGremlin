@@ -664,6 +664,153 @@ head('[E] 插件写的状态文件能被认出来（真相位优先于轮询）'
   ok('完成标记用 reporter 形状（渲染层读 fpDone.at / fpDone.sessionId）', done && typeof done.at === 'number' && done.sessionId === sid, JSON.stringify(done && Object.keys(done)));
 }
 
+/* ------------------------------ F. 会话新鲜度：time_updated 会冻住 ------------------------------ */
+
+head('[F] 请求授权久等 / time_updated 冻住时，会话不许从下拉里消失');
+{
+  // Reproduces the measurable 2026-10-18 finding: OpenCode does NOT bump session_v2.time_updated on every
+  // message —— while the session sat on a permission prompt it froze, while session_message.time_updated
+  // kept moving. Reading only time_updated lets the 60-minute registry timeout drop a still-live session
+  // (the frontend then shows an empty dropdown, "No project open").
+  //
+  // A separate DB path is used on purpose: listOpencodeSessions caches by DB file path for 5s and the whole
+  // test runs in well under that, so reusing DB would keep serving the previous section's cached value.
+  const DB2 = path.join(OC_HOME, 'opencode-freshness.db');
+  process.env.WORKGREMLIN_OPENCODE_DB = DB2;
+  fs.rmSync(DB2, { force: true });
+  const db = new Database(DB2);
+  db.exec(`
+    CREATE TABLE session_v2 (
+      id text PRIMARY KEY, project_id text NOT NULL, parent_id text, slug text NOT NULL,
+      directory text NOT NULL, title text, version text NOT NULL, agent text, model text,
+      cost real DEFAULT 0 NOT NULL,
+      summary_additions integer, summary_deletions integer, summary_files integer,
+      time_created integer NOT NULL, time_updated integer NOT NULL,
+      time_idle integer, idle_outcome text, time_archived integer, time_suspended integer
+    );
+    CREATE TABLE session_message (
+      id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
+      time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
+    );
+  `);
+  const at = Date.now();
+  const staleSid = 'ses_stale000000000000000000001';
+  const permSid = 'ses_perm0000000000000000000001';
+  const ins = db.prepare(
+    `INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, agent, model,
+                             cost, time_created, time_updated, time_archived)
+     VALUES (?, 'proj', NULL, 'slug', '/tmp/ProjO', ?, '2.0.18', 'build', '{"id":"m"}', 0, ?, ?, NULL)`
+  );
+  // Both rows have session_v2.time_updated frozen two hours back (well past the 60-minute yardstick)
+  ins.run(staleSid, '冻住的行，消息还新', now - 3 * HOUR, now - 2 * HOUR);
+  ins.run(permSid, '等授权', now - 3 * HOUR, now - 2 * HOUR);
+  // staleSid still carries brand-new messages (the model is thinking / a tool is running)
+  db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)').run(
+    `${staleSid}#1`,
+    staleSid,
+    'assistant',
+    1,
+    at - 5_000,
+    at - 5_000,
+    JSON.stringify({ content: [{ type: 'reasoning', text: 'still thinking' }] })
+  );
+  db.close();
+
+  const list = opencode.listOpencodeSessions();
+  const stale = list.find((s) => s.id === staleSid);
+  ok('会话列得出来：冻住的 time_updated 没把它藏起来', Boolean(stale), list.map((s) => s.id).join(' '));
+  ok(
+    'lastEventAt 取会话消息的新时间（不是冻住的 session_v2.time_updated）',
+    Boolean(stale) && at - stale.lastEventAt < 30_000,
+    stale && `age=${Math.round((at - stale.lastEventAt) / 1000)}s`
+  );
+
+  // The plugin writes a FRESH state file for permSid while the polled row stays frozen
+  const key = ['opencode', '/tmp/ProjO', permSid].join('@').replace(/[^a-zA-Z0-9._-]/g, '_');
+  fs.mkdirSync(path.join(WG, 'hooks'), { recursive: true });
+  fs.writeFileSync(
+    path.join(WG, 'hooks', `${key}.json`),
+    JSON.stringify({
+      client: 'opencode',
+      sessionId: permSid,
+      hb: { lastEventAt: at },
+      sessionPhase: { phase: 'await', ts: at, workspacePath: '/tmp/ProjO' },
+    })
+  );
+
+  refresh({ workspacePath: '/tmp/ProjO', force: true });
+  const snap = snapshot({ workspacePath: '/tmp/ProjO' });
+  const f8 = snap.floors.find((f) => f.id === '8F');
+  const ids = f8 ? f8.sessions.map((s) => s.id) : [];
+  ok('轮询那条（消息新）在 8F 会话表里', ids.includes(staleSid), ids.join(' '));
+  // Key regression: permSid's polled row is frozen 2h back and the poll path's own timeout would skip it.
+  // If it claimed the session id BEFORE that check, the fresh hook path could never register it and the
+  // session would vanish from the dropdown. Fixing the order lets the hook path win.
+  ok('插件心跳新鲜时，冻住的轮询行不许抢走 sessionId（会话仍在）', ids.includes(permSid), ids.join(' '));
+  const row = f8 && f8.sessions.find((s) => s.id === permSid);
+  ok('登记来源是 hook（插件那路），不是被挡下的轮询行', Boolean(row) && row.sourceKind === 'hook', row && row.sourceKind);
+}
+
+/* ------------------------------ G. 超时之后：新事件一到就回来 ------------------------------ */
+
+head('[G] 60 分钟超时被剔除后，一有新事件，会话与相位都能回来');
+{
+  // Answers "does it recover once activity resumes?" directly. Same session id throughout: the question is
+  // whether a session that once crossed the 60-minute yardstick is readmitted, not whether a new one is.
+  //
+  // The stale read and the fresh read use two DB paths on purpose: listOpencodeSessions caches by DB file
+  // path for 5s, and the whole test runs in well under that. In production the two reads are just
+  // consecutive 5s polls on one path; the second path here reproduces exactly that "next poll" moment
+  // (the registry only ever looks at session id + lastEventAt, never at the DB path).
+  const sid = 'ses_recover00000000000000000001';
+  const writeDb = (file, msgAt) => {
+    process.env.WORKGREMLIN_OPENCODE_DB = file;
+    fs.rmSync(file, { force: true });
+    const db = new Database(file);
+    db.exec(`
+      CREATE TABLE session_v2 (
+        id text PRIMARY KEY, project_id text NOT NULL, parent_id text, slug text NOT NULL,
+        directory text NOT NULL, title text, version text NOT NULL, agent text, model text,
+        cost real DEFAULT 0 NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL,
+        time_archived integer
+      );
+      CREATE TABLE session_message (
+        id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
+        time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
+      );
+    `);
+    db.prepare(
+      `INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, agent, model,
+                               cost, time_created, time_updated, time_archived)
+       VALUES (?, 'proj', NULL, 'slug', '/tmp/ProjO', '超时后回来', '2.0.18', 'build', '{"id":"m"}', 0, ?, ?, NULL)`
+    ).run(sid, msgAt - 60_000, msgAt);
+    db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)').run(
+      `${sid}#1`,
+      sid,
+      'assistant',
+      1,
+      msgAt,
+      msgAt,
+      JSON.stringify({ content: [{ type: 'reasoning', text: '还在想' }] })
+    );
+    db.close();
+  };
+  const idsOf = () => {
+    refresh({ workspacePath: '/tmp/ProjO', force: true });
+    const snap = snapshot({ workspacePath: '/tmp/ProjO' });
+    const f8 = snap.floors.find((f) => f.id === '8F');
+    return f8 ? f8.sessions.map((s) => s.id) : [];
+  };
+
+  writeDb(path.join(OC_HOME, 'opencode-recover-stale.db'), now - 2 * HOUR);
+  ok('静默两小时：会话已被 60 分钟超时剔除', !idsOf().includes(sid));
+
+  writeDb(path.join(OC_HOME, 'opencode-recover-fresh.db'), now - 5_000);
+  ok('新消息一到（下一次轮询），会话立即重新登记', idsOf().includes(sid));
+  const ph = opencode.opencodeMainPhase('/tmp/ProjO', sid);
+  ok('相位同时回来（读出新消息 → thinking）', Boolean(ph && ph.phase === 'thinking'), ph && ph.phase);
+}
+
 /* ------------------------------ 收尾 ------------------------------ */
 
 fs.rmSync(TMP, { recursive: true, force: true });
