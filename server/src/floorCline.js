@@ -196,8 +196,12 @@ function messagesPathOf(row) {
  *   workspace_root / cwd → project path
  *   source        → form (vscode / cli)
  *   updated_at    → last activity
+ *   status / ended_at → **terminal state of the session**, the only source that says "the last turn was
+ *                       cut short" (see readClineRounds): a cancelled turn leaves the conversation ending on
+ *                       a user prompt with no closing assistant text, so the transcript alone cannot tell
+ *                       "still working" from "user pressed stop".
  *
- * @returns {Array<{id,title,project,projectPath,model,form,status,lastEventAt,messagesPath,tokens}>}
+ * @returns {Array<{id,title,project,projectPath,model,form,status,endedAt,lastEventAt,messagesPath,tokens}>}
  */
 function listClineSessions() {
   const now = Date.now();
@@ -208,7 +212,7 @@ function listClineSessions() {
     db
       .prepare(
         `SELECT session_id, source, status, provider, model, cwd, workspace_root, prompt,
-                started_at, updated_at, messages_path, metadata_json, is_subagent
+                started_at, updated_at, ended_at, messages_path, metadata_json, is_subagent
            FROM sessions
           WHERE is_subagent IS NULL OR is_subagent = 0
           ORDER BY updated_at DESC`
@@ -228,6 +232,7 @@ function listClineSessions() {
         model: String(r.model || md.modelId || ''),
         form: String(r.source || '').toLowerCase() === 'vscode' ? 'vscode' : 'cli',
         status: String(r.status || ''),
+        endedAt: timeOf(r.ended_at) || 0,
         lastEventAt: timeOf(r.updated_at) || 0,
         messagesPath: messagesPathOf(r),
         tokens: tokenOf(md),
@@ -377,20 +382,39 @@ function readClineDone(sessionId, meta = {}) {
   const convo = readConversation(s);
   if (!convo || !convo.messages.length) return NO_DONE;
   const last = convo.messages[convo.messages.length - 1];
-  if (!last || last.role !== 'assistant') return NO_DONE;
-  const content = Array.isArray(last.content) ? last.content : [];
+  const content = Array.isArray(last && last.content) ? last.content : [];
   const tail = content[content.length - 1];
-  if (!tail || tail.type !== 'text') return NO_DONE;
-  const at = Number(last.ts) || 0;
-  if (!at || Date.now() - at > DONE_TTL_MS) return NO_DONE;
-  return {
-    doneAt: at,
-    doneTitle: String(meta.title || s.title || ''),
-    doneCount: 0,
-    doneFiles: [],
-    doneCancelled: false,
-    doneSaid: String(tail.text || '').slice(0, 500),
-  };
+  const at = Number(last && last.ts) || 0;
+  if (last && last.role === 'assistant' && tail && tail.type === 'text' && at && Date.now() - at <= DONE_TTL_MS) {
+    return {
+      doneAt: at,
+      doneTitle: String(meta.title || s.title || ''),
+      doneCount: 0,
+      doneFiles: [],
+      doneCancelled: false,
+      doneSaid: String(tail.text || '').slice(0, 500),
+    };
+  }
+  /**
+   * A round cut short by the user (ESC / stop) has no closing assistant text, so the check above cannot see
+   * it. Take the newest round from the per-round list: cancelled and just ended (within TTL) → drop a cancel
+   * marker, so the main console lights the red "task cancelled" and still carries whatever text the round
+   * emitted. Same criterion as the ledger synchronizer below: never treat a cancelled round as finished,
+   * never fabricate a cancel that did not happen.
+   */
+  const rounds = readClineRounds(id);
+  const r = rounds[rounds.length - 1];
+  if (r && r.endedAt && r.outcome === 'cancelled' && Date.now() - Number(r.endedAt) <= DONE_TTL_MS) {
+    return {
+      doneAt: Number(r.endedAt) || 0,
+      doneTitle: String(meta.title || s.title || ''),
+      doneCount: 0,
+      doneFiles: [],
+      doneCancelled: true,
+      doneSaid: String(r.result || '').slice(0, 500),
+    };
+  }
+  return NO_DONE;
 }
 
 /** Whether this session really exists in Cline's store (tells "not running" from "running but idle"). */
@@ -444,6 +468,16 @@ function readClineRounds(sessionId) {
   const projectPath = s.projectPath || '';
   const rounds = [];
   let cur = null;
+  /**
+   * Close a turn that never produced a closing assistant text: it was **cut short** (the user pressed stop,
+   * or a new prompt opened the next turn while it was still open). Its end time is the last activity it had,
+   * and its outcome is `cancelled` —— never left `running`, or the ledger keeps it "running" forever.
+   */
+  const closeOpen = (at) => {
+    if (!cur || cur.endedAt) return;
+    cur.endedAt = Number(at || cur.lastAt || 0) || cur.startedAt;
+    cur.outcome = 'cancelled';
+  };
   for (const m of convo.messages) {
     if (!m) continue;
     const content = Array.isArray(m.content) ? m.content : [];
@@ -451,12 +485,18 @@ function readClineRounds(sessionId) {
     if (m.role === 'user') {
       const promptItem = content.find((c) => c && c.type === 'text' && /<user_input/i.test(String(c.text || '')));
       if (promptItem) {
-        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', result: '', tokens: null, files: [] };
+        // A new prompt while the previous turn is still open means that turn was interrupted (Cline never
+        // opened a new turn until the running one stopped).
+        closeOpen(ts);
+        cur = { index: rounds.length, prompt: stripUserInput(promptItem.text), startedAt: ts, endedAt: 0, outcome: 'running', result: '', tokens: null, files: [], lastAt: ts };
         rounds.push(cur);
+      } else if (cur) {
+        cur.lastAt = Math.max(cur.lastAt || 0, ts);
       }
       continue;
     }
     if (m.role !== 'assistant' || !cur) continue;
+    cur.lastAt = Math.max(cur.lastAt || 0, ts);
     // Collect files this turn actually wrote/edited; read-only tools never count as changes.
     const written = toolFilePaths(m, projectPath);
     for (const f of written) if (!cur.files.includes(f)) cur.files.push(f);
@@ -478,8 +518,22 @@ function readClineRounds(sessionId) {
       cur.outcome = 'running';
     }
   }
+  // The trailing turn is still open. While the session itself is running that is genuine; once Cline marks
+  // the session terminal (status completed/cancelled/failed/error, or an ended_at stamp), an open turn was
+  // cancelled —— the transcript ends on a user prompt with no closing assistant text.
+  if (cur && !cur.endedAt && sessionTerminal(s)) closeOpen(s.endedAt || cur.lastAt);
   if (rounds.length && s.tokens) rounds[rounds.length - 1].tokens = s.tokens;
   return rounds;
+}
+
+/** Cline's own terminal session statuses (from @cline/core): the session is over, no further turn will run. */
+const TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'failed', 'error']);
+
+/** Whether Cline has marked this session terminal (an ended_at stamp, or a terminal status). */
+function sessionTerminal(s) {
+  if (!s) return false;
+  if (Number(s.endedAt) > 0) return true;
+  return TERMINAL_STATUSES.has(String(s.status || '').toLowerCase());
 }
 
 /* ===================== Task syncer (one ledger row per turn) ===================== */
@@ -624,7 +678,10 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
     let running = false;
     for (const r of rounds) {
       const id = `${prefix}:${r.index}`;
-      const state = r.endedAt ? 'done' : 'running';
+      // The round's own outcome is authoritative: running | done | cancelled. A cancelled round has an
+      // endedAt but must be written as 'cancelled', not 'done' —— otherwise the ticker lights "task
+      // completed" on a stop, and the list hides that it was cut short.
+      const state = r.outcome || (r.endedAt ? 'done' : 'running');
       writeTurnRun(repo, {
         id,
         projectId,

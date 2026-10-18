@@ -867,6 +867,20 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('源里没有的第 0 轮被收掉', !repo.getTaskRun.get('cline:cline-sid-1:0'), JSON.stringify(repo.getTaskRun.get('cline:cline-sid-1:0')));
   ok('仍在源里的第 1 轮保留', Boolean(repo.getTaskRun.get('cline:cline-sid-1:1')));
 
+  console.log('[8d] 2F Cline：用户取消的一轮 → 台账落 cancelled（不再永远 running）');
+  clineRows = [
+    {
+      ...clineRows[0],
+      rounds: [{ index: 2, prompt: '被取消的那轮', startedAt: Date.now() - 30_000, endedAt: Date.now() - 5_000, outcome: 'cancelled', result: '', files: [] }],
+    },
+  ];
+  syncClineTasks({ bus, repo });
+  const cancelC = repo.getTask.get('cline:cline-sid-1:2');
+  ok('取消那轮落 cancelled（不是 running，也不是 done）', Boolean(cancelC) && cancelC.state === 'cancelled', cancelC && cancelC.state);
+  const cancelRunC = repo.getTaskRun.get('cline:cline-sid-1:2');
+  ok('取消的台账行带 ended_at（不挂在 running 上）', Boolean(cancelRunC) && Number(cancelRunC.ended_at) > 0, cancelRunC && cancelRunC.ended_at);
+  ok('取消 → 成员卡回落 idle', stateOf('cline@p1') === 'idle', stateOf('cline@p1'));
+
   server.close();
   close();
   fs.rmSync(TMP, { recursive: true, force: true });

@@ -97,9 +97,9 @@ function makeClineDb(file, rows) {
     )
   `);
   const ins = db.prepare(`
-    INSERT INTO sessions (session_id, source, status, provider, model, cwd, workspace_root, prompt,
+    INSERT INTO sessions (session_id, source, status, ended_at, provider, model, cwd, workspace_root, prompt,
                           metadata_json, is_subagent, messages_path, updated_at)
-    VALUES (@session_id, @source, @status, @provider, @model, @cwd, @workspace_root, @prompt,
+    VALUES (@session_id, @source, @status, @ended_at, @provider, @model, @cwd, @workspace_root, @prompt,
             @metadata_json, @is_subagent, @messages_path, @updated_at)
   `);
   for (const r of rows) ins.run(r);
@@ -129,13 +129,15 @@ const userInput = (t) => ({ type: 'text', text: `<user_input mode="act">${t}</us
 const msg = (role, content, ts) => ({ id: `msg_${Math.random().toString(36).slice(2)}`, role, content, ts });
 
 /** One sessions-table record (updated ~1 second ago by default). */
-function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath } = {}) {
+function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath, status = 'idle', endedAt = 0 } = {}) {
   const md = { title };
   if (tokens) md.aggregateUsage = { inputTokens: tokens.input, outputTokens: tokens.output, cacheReadTokens: tokens.cacheRead, cacheWriteTokens: tokens.cacheWrite };
   return {
     session_id: id,
     source,
-    status: 'idle',
+    status,
+    // Cline stamps ended_at when the session finishes; a cancelled session carries it too.
+    ended_at: endedAt ? ISO(endedAt) : null,
     provider: 'cline',
     model,
     cwd,
@@ -185,6 +187,20 @@ const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
     msg('user', [userInput('在飞这一轮')], NOW - 20_000),
     msg('assistant', [thinking(), toolUse('run_commands', { command: 'npm run build' })], NOW - 5_000),
   ], NOW - 5_000);
+  // Cancelled: the conversation ends on a user prompt (no closing assistant text), and Cline stamped the
+  // session terminal. The transcript alone cannot tell "still working" from "user pressed stop".
+  const pCancelEnd = writeConvo('cli-cancel-end', [
+    msg('user', [userInput('帮我改一下配置')], NOW - 4 * MIN),
+    msg('assistant', [thinking(), toolUse('run_commands', { command: 'npm test' })], NOW - 3 * MIN),
+    msg('user', [toolResult()], NOW - 3 * MIN + 1_000),
+  ], NOW - 90_000);
+  // Cancelled then retried: a new prompt opened while the previous turn never closed.
+  const pCancelNext = writeConvo('cli-cancel-next', [
+    msg('user', [userInput('第一轮')], NOW - 5 * MIN),
+    msg('assistant', [thinking(), toolUse('read_files', { files: [{ path: '/tmp/proj/a.js' }] })], NOW - 4 * MIN),
+    msg('user', [userInput('第二轮')], NOW - 3 * MIN),
+    msg('assistant', [thinking(), text('第二轮完成')], NOW - 2 * MIN),
+  ], NOW - 2 * MIN);
 
   makeClineDb(MAIN_DB, [
     row('cli-tool', { messagesPath: pTool, title: '跑测试', model: 'cline-free/nemotron' }),
@@ -193,6 +209,8 @@ const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
     row('cli-stale', { messagesPath: pStale, title: '很久以前' }),
     row('cli-old', { messagesPath: pOld, title: '老会话' }),
     row('cli-hist', { messagesPath: pHist, title: '两轮会话', tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } }),
+    row('cli-cancel-end', { messagesPath: pCancelEnd, title: '被取消那轮', status: 'cancelled', endedAt: NOW - 90_000 }),
+    row('cli-cancel-next', { messagesPath: pCancelNext, title: '取消后重试' }),
     row('cli-sub', { messagesPath: pTool, title: '子代理', isSubagent: 1 }),
   ]);
 }
@@ -262,6 +280,27 @@ head('[D] 逐轮清单');
   ok('[D1] 收尾文字作为任务详情的「输出」', r0.result === '第一轮收尾', JSON.stringify(r0.result));
   ok('[D1] 在飞那轮：running', r1.prompt === '在飞这一轮' && r1.outcome === 'running' && !r1.endedAt, JSON.stringify(r1));
   ok('[D2] 最后一轮带 session-level token 真值', !r0.tokens && r1.tokens && r1.tokens.input === 100 && r1.tokens.output === 20, JSON.stringify({ r0: r0.tokens, r1: r1.tokens }));
+}
+
+head('[F] 取消检测：以 Cline 自己的会话终态为准');
+{
+  // The transcript ends on a user prompt with no closing assistant text. Cline's sessions.status /
+  // ended_at is the only signal that says "this was a stop, not work in progress".
+  const roundsEnd = cline.readClineRounds('cli-cancel-end');
+  const rEnd = roundsEnd[roundsEnd.length - 1] || {};
+  ok('[F1] 会话终态 cancelled → 尾巴那轮判 cancelled（不再永远 running）', rEnd.outcome === 'cancelled' && Number(rEnd.endedAt) > 0, JSON.stringify(rEnd));
+
+  const dEnd = cline.readClineDone('cli-cancel-end', {});
+  ok('[F2] 新鲜取消 → 完成标记带 doneCancelled（主控台亮"任务取消"）', dEnd.doneCancelled === true && Number(dEnd.doneAt) > 0, JSON.stringify(dEnd));
+
+  // A new prompt while the previous turn is still open = that turn was interrupted.
+  const roundsNext = cline.readClineRounds('cli-cancel-next');
+  ok('[F3] 新一轮 prompt 顶掉没收尾的上一轮 → 上一轮 cancelled', roundsNext[0] && roundsNext[0].outcome === 'cancelled' && Number(roundsNext[0].endedAt) > 0, JSON.stringify(roundsNext[0]));
+  ok('[F3] 正常收尾的那轮仍是 done', roundsNext[1] && roundsNext[1].outcome === 'done', JSON.stringify(roundsNext[1]));
+
+  // Guard the other direction: while the session is running, an open trailing turn is genuinely running.
+  const roundsLive = cline.readClineRounds('cli-hist');
+  ok('[F4] 会话仍在跑 → 开着的轮保持 running（不误判取消）', roundsLive[1] && roundsLive[1].outcome === 'running' && !roundsLive[1].endedAt, JSON.stringify(roundsLive[1]));
 }
 
 head('[E] 读不出来不许冒泡');
