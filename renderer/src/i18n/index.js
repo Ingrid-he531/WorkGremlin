@@ -572,7 +572,7 @@ const MESSAGES = {
     // ---- lintel task ticker (TaskTicker) ----
     'ticker.task': 'Task: {text}',
     'ticker.taskLabel': 'Task: ',
-    'ticker.done': 'Task completed',
+    'ticker.done': 'Task done',
     'ticker.cancelled': 'Task cancelled',
     'ticker.failed': 'Task failed',
     'ticker.untitled': 'Untitled task',
