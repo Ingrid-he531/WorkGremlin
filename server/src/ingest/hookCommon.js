@@ -890,8 +890,48 @@ async function runHookEvent(ev, ctx, floorImpl) {
   // (some products' hook events carry no transcript_path, so it has to be reverse-derived from sessionId+workspacePath).
   const tp = () => String(impl.transcriptPathOf(ev, get(), sessionId, workspacePath) || get().transcriptPath || '');
 
+  /**
+   * The in-flight taskId of this round, self-healing when the in-memory state lost it (a server
+   * restart, or a compaction handled before the SessionStart fix below).
+   *
+   * Why it matters: `bus.setStatus` writes this value into `session_status.task_id`, and that
+   * column is what `/task-runs` uses to decide whether a `running` task is still alive
+   * (taskAliveSql: `ss.task_id = t.id`). Reporting null there makes a live task show up as
+   * "cancelled" even though it is still working.
+   *
+   * The ledger is the authority; when memory is empty, fish the round back out of it and remember
+   * it (memory + state file), so the rest of the round keeps its tool attribution too.
+   * Only used for active states: recovering the id while reporting idle would re-attach a stale
+   * ledger row and make a dead task look alive.
+   * @returns {string|null}
+   */
+  function taskIdOf() {
+    const known = String(get().taskId || '');
+    if (known) return known;
+    let cur = null;
+    try {
+      cur = typeof bus.currentTaskFor === 'function' ? bus.currentTaskFor(stableProject, memberId, sessionId) : null;
+    } catch {
+      cur = null; // a read failure must not break the report
+    }
+    const id = String((cur && cur.taskId) || '');
+    if (!id) return null;
+    set({
+      taskId: id,
+      taskWorkspacePath: get().taskWorkspacePath || workspacePath,
+      taskStartedAt: Number(cur.startedAt) || 0,
+      ...(cur.title ? { taskTitle: cur.title } : {}),
+    });
+    return id;
+  }
+
   const status = (state, reason) =>
-    bus.setStatus({ ...base, state, taskId: get().taskId || null, ...(reason ? { reason } : {}) });
+    bus.setStatus({
+      ...base,
+      state,
+      taskId: state === 'busy' || state === 'blocked' ? taskIdOf() : get().taskId || null,
+      ...(reason ? { reason } : {}),
+    });
   const beat = () => bus.heartbeat({ ...base, memberId });
   // The main agent's floor identity is put into client: memberId's base name (= ev.agent) and client are both the product base name,
   // unified with static gremlins / ghosts under the convention "client = the floor (product base name), memberId only as primary key".
@@ -986,6 +1026,45 @@ async function runHookEvent(ev, ctx, floorImpl) {
 
   if (event === 'SessionStart') {
     const st = get();
+    /**
+     * Context compaction is **not** a new session.
+     *
+     * Codex / Claude re-fire SessionStart with `source: 'compact'` every time the context is
+     * auto-compacted, and that happens **in the middle of a running turn** (measured 2026-10-19,
+     * 3F Codex: 20+ compactions inside one 25-minute task). The reset below is for a genuinely new
+     * session; applied to a compaction it wiped taskId / taskStartedAt from the state file and
+     * pushed the session to idle, so `session_status.task_id` became NULL while the task row was
+     * still `running`. `/task-runs` judges liveness by `ss.task_id = t.id` (see taskAliveSql in
+     * http/routes/query.js), found nothing to match, and normalized the still-running task to
+     * "cancelled" —— exactly the "it says cancelled but it is still running" report. It also lost
+     * the round's tool attribution, since later events no longer knew the taskId.
+     *
+     * Keep the round intact: just refresh the heartbeat and stay busy. When no round is in flight
+     * (a compaction with nothing running), fall through to the normal reset.
+     */
+    if (String((ev && ev.source) || '').toLowerCase() === 'compact') {
+      const cur = st.taskId
+        ? { taskId: st.taskId, startedAt: Number(st.taskStartedAt) || 0 }
+        : typeof bus.currentTaskFor === 'function'
+        ? bus.currentTaskFor(stableProject, memberId, sessionId)
+        : null;
+      if (cur && cur.taskId) {
+        // Recover taskId into memory when the server restarted and only the state file still knows it
+        if (!st.taskId) {
+          set({
+            taskId: cur.taskId,
+            taskWorkspacePath: st.taskWorkspacePath || workspacePath,
+            taskStartedAt: Number(cur.startedAt) || 0,
+            ...(cur.title ? { taskTitle: cur.title } : {}),
+          });
+        }
+        set({ sessionEndedAt: null, sessionWorkspacePath: workspacePath });
+        await register();
+        await beat();
+        await status('busy');
+        return { ok: true, handled: event, kept: 'compact' };
+      }
+    }
     set({
       sessionEndedAt: null,
       sessionWorkspacePath: workspacePath,
