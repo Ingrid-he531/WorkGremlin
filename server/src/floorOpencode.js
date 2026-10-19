@@ -85,21 +85,53 @@ const { isFile } = require('./roots');
 const { resolveProjectName } = require('./project');
 // Static subagent directories (project-level / user-level): private knowledge of this floor, kept here
 // rather than in the central agentLevel
-const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
-
-/**
- * 8F's static subagent definition directories. OpenCode has no "user-level / project-level agent
- * definition file" mechanism yet, so this goes through the generic derivation (meta.homeDirs is empty →
- * returns [], no disk scan). If OpenCode ever puts agent definitions in some directory, just give the
- * explicit directories here (same interface as CodeBuddy / Codex / Claude).
- * @returns {Array<{dir:string, level:'project'|'user'}>}
- */
-function agentDirs(workspacePath) {
-  return genericAgentDirs((meta && meta.homeDirs) || [], workspacePath);
-}
+const { makeAgentSync } = require('./ingest/agentLevel');
 
 const HOME = os.homedir();
 const IS_WIN = process.platform === 'win32';
+
+/**
+ * OpenCode's global config root. `OPENCODE_CONFIG_DIR` is OpenCode's own override and wins over the
+ * XDG location; otherwise V2 documents `~/.config/opencode` (the same location `opencode debug
+ * paths` reports as `config`), so honor XDG_CONFIG_HOME when the user moved it.
+ */
+function opencodeConfigDir() {
+  const explicit = String(process.env.OPENCODE_CONFIG_DIR || '').trim();
+  if (explicit) return path.resolve(explicit);
+  const xdg = String(process.env.XDG_CONFIG_HOME || '').trim();
+  if (xdg) return path.join(path.resolve(xdg), 'opencode');
+  return path.join(HOME, '.config', 'opencode');
+}
+
+/**
+ * 8F's static subagent definition directories.
+ *
+ * OpenCode discovers definitions in both the plural and singular directories, at project
+ * (`<workspace>/.opencode/...`) and user (`<config>/...`) level. The shipped V2 binary reads:
+ *   · `agents/` and `agent/` (recursive); a file without `mode` is a primary agent
+ *   · legacy `modes/` and `mode/` (non-recursive); every definition there is forced to primary
+ * The list below is first-wins, so it is ordered the reverse of OpenCode's override order:
+ * `modes/` > `mode/` > `agents/` > `agent/`.
+ * Only subagent-capable definitions (`mode: subagent` / `all`) belong in the gremlin roster; a
+ * `mode: primary` file is the product's main agent, not a workstation gremlin. Nested paths keep
+ * OpenCode's path-derived ID (`agents/team/reviewer.md` → `team/reviewer`).
+ * @returns {Array<{dir:string, level:'project'|'user'}>}
+ */
+function agentDirs(workspacePath) {
+  const ws = String(workspacePath || '').trim();
+  const root = ws ? path.resolve(ws) : '';
+  const out = [];
+  const addBase = (base, level) => {
+    // Legacy primary-only directories: they shadow same-name subagent files below them.
+    out.push({ dir: path.join(base, 'modes'), level, primaryOnly: true });
+    out.push({ dir: path.join(base, 'mode'), level, primaryOnly: true });
+    out.push({ dir: path.join(base, 'agents'), level, recursive: true, onlySubagents: true, defaultMode: 'primary' });
+    out.push({ dir: path.join(base, 'agent'), level, recursive: true, onlySubagents: true, defaultMode: 'primary' });
+  };
+  if (root) addBase(path.join(root, '.opencode'), 'project');
+  addBase(opencodeConfigDir(), 'user');
+  return out;
+}
 
 /**
  * 8F OpenCode floor metadata (formerly the 8F entry in products.js). CLI and desktop/web merged floor.

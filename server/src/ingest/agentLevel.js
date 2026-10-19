@@ -19,19 +19,31 @@
  * subagent" from the central agentLevel down into the floors (same thinking as floor-ifying
  * refresh: the center does generic dispatch + aggregation, product knowledge lives in floor files).
  *
+ * A directory entry may carry per-floor options:
+ *   · `recursive`     — nested definitions are allowed; the agent ID keeps the relative path
+ *                       (`agents/team/reviewer.md` → `team/reviewer`)
+ *   · `onlySubagents` — read the definition's `mode` and skip `mode: primary` agents
+ *   · `defaultMode`   — the mode to assume when the file has no `mode` (e.g. OpenCode V2 treats
+ *                       both `agents/` and `agent/` as primary unless a definition says otherwise)
+ *   · `primaryOnly`   — claim the name (shadowing lower-priority dirs) but never expose the agent
+ *
  * The functional description is **static data** from the agent definition file ("what this
  * subagent is for"), not runtime state —— that is what belongs on the card, rather than state
  * phrasing like "project subagent · idle".
  *
- * Results are cached by "name + workspacePath" / file mtime (agent definitions rarely change
- * within a session).
+ * Results are cached by "name + workspacePath + candidate dirs" / file mtime (agent definitions
+ * rarely change within a session).
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { isFile } = require('../roots');
 
-/** Filename case tolerance: the docs ask for lowercase hyphenated names, but try both just in case */
+/**
+ * Resolve an agent definition file. The direct candidates cover the documented lowercase names; the
+ * final directory scan keeps the lookup consistent with `listAgentFiles`, whose extension match is
+ * case-insensitive (a file such as `NAME.MD` must still yield its `mode` on case-sensitive systems).
+ */
 function fileOf(dir, name) {
   const base = String(name || '').trim();
   if (!base) return '';
@@ -53,6 +65,18 @@ function fileOf(dir, name) {
       /* try the next candidate */
     }
   }
+  const nested = path.dirname(base);
+  const leaf = path.basename(base);
+  const scanDir = nested === '.' ? dir : path.join(dir, nested);
+  try {
+    const hit = fs.readdirSync(scanDir).find((f) => {
+      if (!/\.(md|toml|ya?ml)$/i.test(f)) return false;
+      return f.slice(0, f.lastIndexOf('.')).toLowerCase() === leaf.toLowerCase();
+    });
+    if (hit) return path.join(scanDir, hit);
+  } catch {
+    /* directory unreadable -> no definition */
+  }
   return '';
 }
 
@@ -71,16 +95,104 @@ function findAgentFile(name, dirs) {
   return null;
 }
 
-/** List the agent file names in a directory (stripping the definition suffix); empty when the directory cannot be read */
-function listAgentFiles(dir) {
+/**
+ * List the agent file names in a directory (stripping the definition suffix); empty when the directory
+ * cannot be read. With `opts.recursive`, nested definitions are returned as relative IDs with
+ * forward slashes (`team/reviewer`), matching the path-derived agent ID convention.
+ * @param {string} dir
+ * @param {{recursive?: boolean}} [opts]
+ * @returns {string[]}
+ */
+function listAgentFiles(dir, opts) {
+  const out = [];
+  const seen = new Set();
+  const visitedDirs = new Set();
+  const recursive = Boolean(opts && opts.recursive);
+  const walk = (base, prefix) => {
+    // OpenCode scans with `symlink: true`, so directory symlinks are part of the agent tree. Resolve
+    // the real path and walk each real directory once; this follows links without looping on cycles.
+    let real;
+    try {
+      real = fs.realpathSync(base);
+    } catch {
+      return;
+    }
+    if (visitedDirs.has(real)) return;
+    visitedDirs.add(real);
+    let entries;
+    try {
+      entries = fs.readdirSync(base, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const full = path.join(base, ent.name);
+      let isDir = ent.isDirectory();
+      let isFile = ent.isFile();
+      if (ent.isSymbolicLink()) {
+        try {
+          const st = fs.statSync(full);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue; // dangling link
+        }
+      }
+      if (isDir) {
+        if (recursive) walk(full, `${prefix}${ent.name}/`);
+        continue;
+      }
+      if (!isFile) continue;
+      if (!/\.(md|toml|ya?ml)$/i.test(ent.name)) continue;
+      const name = `${prefix}${ent.name.replace(/\.(md|toml|ya?ml)$/i, '')}`;
+      if (!seen.has(name)) {
+        seen.add(name);
+        out.push(name);
+      }
+    }
+  };
+  walk(dir, '');
+  return out;
+}
+
+const modeCache = new Map(); // file path -> { mtimeMs, size, value }
+
+/**
+ * Read an agent definition's `mode` (`subagent` / `all` / `primary`); empty string when the file has
+ * no mode or cannot be read. TOML reads `mode = "…"`; Markdown only reads its frontmatter; YAML reads
+ * the whole document because it has no frontmatter fence.
+ * @param {string} file
+ * @returns {'primary'|'subagent'|'all'|''}
+ */
+function readAgentMode(file) {
+  let st;
   try {
-    return fs
-      .readdirSync(dir)
-      .filter((f) => /\.(md|toml|ya?ml)$/i.test(f))
-      .map((f) => f.replace(/\.(md|toml|ya?ml)$/i, ''));
+    st = fs.statSync(file);
   } catch {
-    return [];
+    return '';
   }
+  const prev = modeCache.get(file);
+  if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) return prev.value;
+  let txt = '';
+  try {
+    txt = fs.readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+  let mode = '';
+  if (/\.toml$/i.test(file)) {
+    const m = txt.match(/^\s*mode\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/m);
+    mode = String(m ? m[1] ?? m[2] ?? m[3] ?? '' : '').trim().toLowerCase();
+  } else {
+    const fm = txt.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---/);
+    // A Markdown body is prose: a `mode:` line in it is not configuration. Only the frontmatter counts.
+    const head = fm ? fm[1] : /\.md$/i.test(file) ? '' : txt;
+    const m = head.match(/^\s*mode\s*:\s*['"]?([A-Za-z-]+)['"]?\s*(?:#.*)?$/m);
+    mode = String(m ? m[1] : '').trim().toLowerCase();
+  }
+  const value = mode === 'primary' || mode === 'subagent' || mode === 'all' ? mode : '';
+  modeCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, value });
+  return value;
 }
 
 /**
@@ -148,7 +260,8 @@ const levelCache = new Map(); // "name workspacePath" -> level
  */
 function detectLevelInDirs(name, workspacePath, dirs) {
   const ws = String(workspacePath || '').trim();
-  const key = `${name} ${ws}`;
+  // Include the candidate dirs: two floors (or two config roots) may define the same agent name.
+  const key = `${name} ${ws} ${(dirs || []).map((d) => d.dir).join('|')}`;
   if (levelCache.has(key)) return levelCache.get(key);
   const hit = findAgentFile(name, dirs);
   const level = hit ? hit.level : null;
@@ -208,17 +321,35 @@ function genericAgentDirs(homeDirs, workspacePath) {
 /**
  * List the agents defined in a set of candidate dirs (project dirs first — the caller's `agentDirs`
  * already orders them that way). Cross-dir duplicates keep the first hit (project beats user).
- * @param {Array<{dir: string, level: 'project'|'user'}>} dirs
+ * Entries with `onlySubagents` skip definitions whose effective mode is `primary`; `defaultMode`
+ * supplies the mode for files that do not declare one. Entries with `primaryOnly` claim their names
+ * but are never returned.
+ * @param {Array<{dir: string, level: 'project'|'user', recursive?: boolean,
+ *                onlySubagents?: boolean, defaultMode?: 'primary'|'subagent'|'all',
+ *                primaryOnly?: boolean}>} dirs
  * @returns {Array<{name: string, level: 'project'|'user'}>}
  */
 function listAgentsInDirs(dirs) {
-  const seen = new Map();
-  for (const { dir, level } of dirs || []) {
-    for (const n of listAgentFiles(dir)) {
-      if (!seen.has(n)) seen.set(n, { name: n, level });
+  const claimed = new Set();
+  const out = [];
+  for (const entry of dirs || []) {
+    const { dir, level } = entry;
+    for (const n of listAgentFiles(dir, entry)) {
+      // Decide ownership before looking at `mode`: a higher-priority definition shadows lower-priority
+      // ones even when it is a primary agent. Otherwise a lower-priority subagent would resurrect an
+      // agent that the winner (and its description / level lookup) says is not a subagent at all.
+      if (claimed.has(n)) continue;
+      claimed.add(n);
+      if (entry.primaryOnly) continue;
+      if (entry.onlySubagents) {
+        const file = fileOf(dir, n);
+        const mode = (file && readAgentMode(file)) || entry.defaultMode || 'subagent';
+        if (mode === 'primary') continue;
+      }
+      out.push({ name: n, level });
     }
   }
-  return [...seen.values()];
+  return out;
 }
 
 /**
@@ -252,6 +383,7 @@ function makeAgentSync(agentDirs, client) {
 function clearCache() {
   levelCache.clear();
   descCache.clear();
+  modeCache.clear();
 }
 
 module.exports = {
@@ -260,6 +392,7 @@ module.exports = {
   listAgentFiles,
   readDescription,
   cleanDescription,
+  readAgentMode,
   detectLevelInDirs,
   descriptionInDirs,
   genericAgentDirs,

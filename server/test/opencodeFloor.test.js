@@ -41,6 +41,12 @@
  *   E. 两路合起来：插件写的状态文件能被认出来（真相位优先于轮询）
  *     [E1] 装上插件的状态文件后，这一层会话的相位来自状态文件、instrumented 为真
  *     [E2] 插件那份完成标记带**改动文件清单**（轮询给不出这一项）
+ *   H. Static subagent definitions: project/user × agents/agent/ and legacy mode dirs
+ *     [H1] All definition directories are scanned; only explicit subagent/all definitions enter the roster
+ *     [H2] Nested definitions keep their path-derived ID; mode: primary is excluded
+ *     [H3] Description and level come from the winning definition in 8F's own directories
+ *     [H4] Same-name definitions are decided by directory priority before the mode filter
+ *     [H5] Symlinked directories are followed without loops; mode is read from frontmatter only
  */
 'use strict';
 
@@ -61,13 +67,16 @@ fs.mkdirSync(path.join(HOME, '.opencode', 'bin'), { recursive: true });
 fs.writeFileSync(path.join(HOME, '.opencode', 'bin', 'opencode'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_HOME = WG;
+// Pin the 8F user-level agent directory to the sandbox so the test never reads the developer's config.
+process.env.XDG_CONFIG_HOME = path.join(HOME, '.config');
+delete process.env.OPENCODE_CONFIG_DIR;
 // 沙箱 PATH 里**故意不放** opencode：验证 CLI_BIN_DIRS 那一路，而不是碰巧在 PATH 里
 process.env.PATH = BIN;
 process.env.WORKGREMLIN_OPENCODE_HOME = OC_HOME;
 
 const Database = require('better-sqlite3');
 
-const { detectProducts } = require('../src/floors');
+const { detectProducts, detectLevel, agentDescription } = require('../src/floors');
 const { DEFAULTS } = require('@workgremlin/shared');
 const opencode = require('../src/floorOpencode');
 // sessions / sessionRegistry **必须在取任何时间戳之前**加载：它们在模块加载那一刻记下
@@ -809,6 +818,175 @@ head('[G] 60 分钟超时被剔除后，一有新事件，会话与相位都能�
   ok('新消息一到（下一次轮询），会话立即重新登记', idsOf().includes(sid));
   const ph = opencode.opencodeMainPhase('/tmp/ProjO', sid);
   ok('相位同时回来（读出新消息 → thinking）', Boolean(ph && ph.phase === 'thinking'), ph && ph.phase);
+}
+
+/* ------------- H. Static subagent dirs (agents/agent plus legacy mode dirs) ------------- */
+
+head('[H] 静态子代理目录：project/user × agents/agent/ 与旧 mode 目录，primary 不进名册');
+{
+  const WS8 = path.join(TMP, 'proj8');
+  const writeAgent = (file, description, mode, body = 'test agent') => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const front = ['---', `description: ${description}`];
+    if (mode) front.push(`mode: ${mode}`);
+    front.push('---', '', body);
+    fs.writeFileSync(file, front.join('\n'));
+  };
+
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'proj-plural.md'), '项目级复数目录子代理', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'proj-primary.md'), '项目级主代理（不该出现）', 'primary');
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'team', 'nested.md'), '嵌套路径子代理', 'subagent');
+  // V2 treats a definition without `mode` as primary in both directories, so it is not a subagent.
+  writeAgent(path.join(WS8, '.opencode', 'agent', 'proj-legacy.md'), '项目级旧目录无 mode');
+  writeAgent(path.join(WS8, '.opencode', 'agent', 'proj-legacy-sub.md'), '项目级旧目录子代理', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'agent', 'proj-legacy-all.md'), '项目级旧目录 all', 'all');
+  writeAgent(path.join(HOME, '.config', 'opencode', 'agents', 'user-plural.md'), '用户级复数目录子代理', 'subagent');
+  writeAgent(path.join(HOME, '.config', 'opencode', 'agent', 'user-legacy.md'), '用户级旧目录子代理', 'all');
+  writeAgent(path.join(HOME, '.config', 'opencode', 'agent', 'user-nomode.md'), '用户级旧目录无 mode');
+
+  // The plural directory wins a same-name conflict inside one base; project beats user across levels.
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'shadow-plural.md'), '项目复数主代理', 'primary');
+  writeAgent(path.join(WS8, '.opencode', 'agent', 'shadow-plural.md'), '项目旧目录子代理', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'shadow-cross.md'), '项目复数主代理', 'primary');
+  writeAgent(path.join(HOME, '.config', 'opencode', 'agent', 'shadow-cross.md'), '用户旧目录子代理', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'agent', 'shadow-revive.md'), '项目旧目录子代理', 'subagent');
+  writeAgent(path.join(HOME, '.config', 'opencode', 'agents', 'shadow-revive.md'), '用户复数主代理', 'primary');
+  // Legacy mode dirs are primary-only: they shadow subagents with the same name even when the file
+  // itself says `mode: subagent` (OpenCode forces the directory's mode).
+  writeAgent(path.join(WS8, '.opencode', 'mode', 'legacy-mode-only.md'), '旧 mode 目录（强制 primary）', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'modes', 'legacy-modes-only.md'), '旧 modes 目录（强制 primary）', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'shadow-mode.md'), '普通目录子代理', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'mode', 'shadow-mode.md'), '旧 mode 目录主代理', 'primary');
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'shadow-modes.md'), '普通目录子代理', 'subagent');
+  writeAgent(path.join(WS8, '.opencode', 'modes', 'shadow-modes.md'), '旧 modes 目录主代理', 'primary');
+
+  // Mode is configuration in the frontmatter only; an uppercase extension still resolves its file.
+  writeAgent(path.join(WS8, '.opencode', 'agents', 'UPPER.MD'), '大写扩展名子代理', 'subagent');
+  const bodyOnly = path.join(WS8, '.opencode', 'agents', 'body-mode.md');
+  fs.writeFileSync(bodyOnly, 'description: body only\nmode: primary\n');
+
+  // A directory symlink outside the agent tree is followed; a self-link must not loop.
+  const shared = path.join(WS8, 'shared-agents');
+  writeAgent(path.join(shared, 'remote.md'), '符号链接目录子代理', 'subagent');
+  const agentsDir = path.join(WS8, '.opencode', 'agents');
+  let linked = false;
+  try {
+    fs.symlinkSync(path.relative(agentsDir, shared), path.join(agentsDir, 'linked'), 'dir');
+    linked = true;
+  } catch {
+    /* symlinks unavailable on this platform */
+  }
+  try {
+    fs.symlinkSync('.', path.join(agentsDir, 'loop'), 'dir');
+  } catch {
+    /* symlinks unavailable on this platform */
+  }
+
+  const levels = opencode.agentDirs(WS8).map((d) => `${d.level}:${path.basename(d.dir)}`).join(',');
+  ok(
+    '定义目录都扫：project/user × modes/mode/agents/agent',
+    levels ===
+      'project:modes,project:mode,project:agents,project:agent,user:modes,user:mode,user:agents,user:agent',
+    levels
+  );
+
+  const got = [];
+  opencode.syncAgents({
+    project: 'p8',
+    workspacePath: WS8,
+    registerAgent: (a) => got.push(a),
+    unregisterAgent: () => {},
+  });
+  const names = got.map((a) => `${a.name}@${a.level}`).sort();
+  ok(
+    'agents/ 的 subagent 被注册（项目级 + 用户级）',
+    names.includes('proj-plural@project') && names.includes('user-plural@user'),
+    names.join(' ')
+  );
+  ok(
+    'agent/ 只注册显式 subagent/all（无 mode 不注册）',
+    names.includes('proj-legacy-sub@project') &&
+      names.includes('proj-legacy-all@project') &&
+      names.includes('user-legacy@user') &&
+      !names.includes('proj-legacy@project') &&
+      !names.includes('user-nomode@user'),
+    names.join(' ')
+  );
+  ok('嵌套定义保留路径 ID（team/nested）', names.includes('team/nested@project'), names.join(' '));
+  ok('mode: primary 不进名册', !names.some((n) => n.startsWith('proj-primary@')), names.join(' '));
+  ok('大写扩展名的定义仍能读到 mode', names.includes('UPPER@project'), names.join(' '));
+  ok(
+    '同名裁决：plural primary 挡住 singular subagent',
+    !names.includes('shadow-plural@project'),
+    names.join(' ')
+  );
+  ok(
+    '跨级同名：project primary 挡住 user subagent',
+    !names.includes('shadow-cross@user') && !names.includes('shadow-cross@project'),
+    names.join(' ')
+  );
+  ok(
+    '跨级同名：project subagent 胜过 user primary',
+    names.includes('shadow-revive@project') && !names.includes('shadow-revive@user'),
+    names.join(' ')
+  );
+  ok(
+    '旧 mode/modes 目录强制 primary：不注册',
+    !names.includes('legacy-mode-only@project') && !names.includes('legacy-modes-only@project'),
+    names.join(' ')
+  );
+  ok(
+    '同名裁决：旧 mode 目录挡住普通目录子代理',
+    !names.includes('shadow-mode@project') && !names.includes('shadow-modes@project'),
+    names.join(' ')
+  );
+  ok('目录符号链接被跟随', !linked || names.includes('linked/remote@project'), names.join(' '));
+  const { readAgentMode } = require('../src/ingest/agentLevel');
+  ok('Markdown 正文里的 mode 不算配置', readAgentMode(bodyOnly) === '', readAgentMode(bodyOnly));
+
+  ok(
+    '描述从 8F 自己的目录里读到',
+    agentDescription('proj-plural', WS8, 'opencode') === '项目级复数目录子代理',
+    agentDescription('proj-plural', WS8, 'opencode')
+  );
+  ok(
+    'level 判定走 8F 自己的目录',
+    detectLevel('user-plural', WS8, 'opencode') === 'user' &&
+      detectLevel('proj-legacy-sub', WS8, 'opencode') === 'project'
+  );
+  ok(
+    '同名定义被挡住时，描述仍来自胜出的定义',
+    agentDescription('shadow-plural', WS8, 'opencode') === '项目复数主代理',
+    agentDescription('shadow-plural', WS8, 'opencode')
+  );
+  ok(
+    '旧 mode 目录胜出时，描述也来自它',
+    agentDescription('shadow-mode', WS8, 'opencode') === '旧 mode 目录主代理',
+    agentDescription('shadow-mode', WS8, 'opencode')
+  );
+
+  const CUSTOM_CFG = path.join(TMP, 'custom-config');
+  writeAgent(path.join(CUSTOM_CFG, 'agents', 'custom-user.md'), '自定义配置目录子代理', 'subagent');
+  process.env.OPENCODE_CONFIG_DIR = CUSTOM_CFG;
+  const customDirs = opencode.agentDirs(WS8);
+  ok(
+    'OPENCODE_CONFIG_DIR 覆盖 XDG 用户级目录',
+    customDirs.some((d) => d.level === 'user' && d.dir === path.join(CUSTOM_CFG, 'agents')),
+    customDirs.map((d) => d.dir).join(',')
+  );
+  const customGot = [];
+  opencode.syncAgents({
+    project: 'p8-custom',
+    workspacePath: WS8,
+    registerAgent: (a) => customGot.push(a),
+    unregisterAgent: () => {},
+  });
+  ok(
+    '自定义配置目录下的用户级子代理被注册',
+    customGot.some((a) => a.name === 'custom-user' && a.level === 'user'),
+    customGot.map((a) => `${a.name}@${a.level}`).join(' ')
+  );
+  delete process.env.OPENCODE_CONFIG_DIR;
 }
 
 /* ------------------------------ 收尾 ------------------------------ */
