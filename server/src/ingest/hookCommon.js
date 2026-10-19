@@ -623,6 +623,22 @@ function agentIdOf(ev) {
   return String((ev && (ev.agent_id || ev.agentId)) || '').trim();
 }
 
+/**
+ * Whether a hook event was emitted from inside a subagent.
+ *
+ * Codex subagent threads reuse the **parent's** `session_id` and put their own thread id in
+ * `agent_id` (the rollout's `session_meta` has `session_id` = parent, `id` = the subagent thread).
+ * Such events describe the subagent's own turn, not a new round of the main agent. SubagentStart /
+ * SubagentStop are the lifecycle events that *report* a subagent and are handled on purpose, so
+ * callers must apply this gate to the main-round events only.
+ */
+function isSubagentEvent(ev) {
+  const aid = agentIdOf(ev);
+  if (!aid) return false;
+  const sid = String((ev && ev.session_id) || '').trim();
+  return aid !== sid;
+}
+
 function subagentKeys(ev, name, task) {
   const out = [];
   const push = (k) => {
@@ -646,7 +662,9 @@ function subagentKeys(ev, name, task) {
 }
 
 function resultOfResponse(ev) {
-  const r = ev && ev.tool_response;
+  // PostToolUse carries the tool output in tool_response; SubagentStop carries the subagent's
+  // closing summary in last_assistant_message (required by Codex's schema).
+  const r = ev && (ev.tool_response != null ? ev.tool_response : ev.last_assistant_message);
   if (r == null) return '';
   let s = '';
   if (typeof r === 'string') s = r;
@@ -808,6 +826,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
   const { bus, project, workspacePath, sessionGet, sessionSet } = ctx;
   const event = ev && ev.hook_event_name;
   if (!event) return { ok: false, error: 'missing hook_event_name' };
+  // Only floors that emit SubagentStart/SubagentStop (currently Codex) are known to identify a
+  // subagent event this way; do not gate other products' events on an agent_id they may use for
+  // their main agent too.
+  const fromSubagent = Boolean(impl.hasSubagentStart) && isSubagentEvent(ev);
 
   const memberId = String(ev.agent);
   const client = String(ev.agent || '').trim().toLowerCase();
@@ -884,8 +906,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
     }
   };
 
-  // Cache the transcript path (later events take it from the session state; for the hook's original logic see the SessionStart section)
-  if (ev.transcript_path) set({ transcriptPath: String(ev.transcript_path) });
+  // Cache the transcript path (later events take it from the session state; for the hook's original logic see the SessionStart section).
+  // Subagent hooks share the parent session id but their transcript_path points at the subagent
+  // rollout; caching it would make the parent's Stop read the subagent's replies and tokens.
+  if (ev.transcript_path && !fromSubagent) set({ transcriptPath: String(ev.transcript_path) });
   // tp() goes through impl.transcriptPathOf: by default only the event payload is recognized; floors can override it to derive the path
   // (some products' hook events carry no transcript_path, so it has to be reverse-derived from sessionId+workspacePath).
   const tp = () => String(impl.transcriptPathOf(ev, get(), sessionId, workspacePath) || get().transcriptPath || '');
@@ -1095,6 +1119,12 @@ async function runHookEvent(ev, ctx, floorImpl) {
   }
 
   if (event === 'UserPromptSubmit') {
+    if (fromSubagent) {
+      // The subagent's own prompt shares the parent session_id; only agent_id differs. Starting a
+      // task here would call startTask -> endStaleTasksOfSession and cancel the parent's live
+      // round, and sweeping would drop the ghost that SubagentStart just opened.
+      return { ok: true, ignored: 'subagent_prompt' };
+    }
     if (INJECTED_PROMPT_RE.test(String((ev && ev.prompt) || ''))) return { ok: true, ignored: 'injected' };
     const prevDone = get().done || null;
     sweepGhosts(bus, stableProject, client, {}, sessionId, get());
@@ -1138,24 +1168,28 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const toolName = ev.tool_name || ev.tool || '';
     if (event === 'PreToolUse') {
       const tool = toolName;
-      const f = relFile(fileOf(ev.tool_input, toolName), cwd);
-      const input = ev.tool_input || {};
-      const toolLabel = tool.replace(/^collaboration/, '');
-      const cmdText = /^apply_patch$/.test(tool) ? '' : input.command || input.cmd || '';
-      const desc = cmdText
-        ? `${toolLabel} ${cmdText}`
-        : input.pattern || input.regex || input.query
-        ? `${toolLabel} ${input.pattern || input.regex || input.query}${f ? ' ' + f : ''}`
-        : f
-        ? `${toolLabel} ${f}`
-        : toolLabel;
-      const probe = !impl.hasPermissionEvent && PROBE_TOOLS.has(tool);
-      set({
-        lastTool: tool,
-        lastInput: ev.tool_input || '',
-        pending: probe ? { tool, file: f, cmd: desc, at: Date.now(), workspacePath } : null,
-        sessionPhase: { phase: 'tool', tool, file: f, cmd: desc, ts: Date.now(), workspacePath },
-      });
+      // A subagent's tools run in its own turn: keep the main console's phase / pending state
+      // intact. A nested summon still registers its ghost below.
+      if (!fromSubagent) {
+        const f = relFile(fileOf(ev.tool_input, toolName), cwd);
+        const input = ev.tool_input || {};
+        const toolLabel = tool.replace(/^collaboration/, '');
+        const cmdText = /^apply_patch$/.test(tool) ? '' : input.command || input.cmd || '';
+        const desc = cmdText
+          ? `${toolLabel} ${cmdText}`
+          : input.pattern || input.regex || input.query
+          ? `${toolLabel} ${input.pattern || input.regex || input.query}${f ? ' ' + f : ''}`
+          : f
+          ? `${toolLabel} ${f}`
+          : toolLabel;
+        const probe = !impl.hasPermissionEvent && PROBE_TOOLS.has(tool);
+        set({
+          lastTool: tool,
+          lastInput: ev.tool_input || '',
+          pending: probe ? { tool, file: f, cmd: desc, at: Date.now(), workspacePath } : null,
+          sessionPhase: { phase: 'tool', tool, file: f, cmd: desc, ts: Date.now(), workspacePath },
+        });
+      }
       if (isSubagentTool(tool)) {
         const nm = agentName(ev.tool_input);
         const task = agentTask(ev.tool_input);
@@ -1171,12 +1205,22 @@ async function runHookEvent(ev, ctx, floorImpl) {
           addGhost(bus, stableProject, stableWs, nm, task, id, String(get().taskId || ''), String(ev.model || ''), client, sessionId);
         }
       }
-      const toolTaskId = String(get().taskId || '');
-      if (tool && toolTaskId) {
-        await bus.toolUse({ ...base, taskId: toolTaskId, tool });
+      if (!fromSubagent) {
+        const toolTaskId = String(get().taskId || '');
+        if (tool && toolTaskId) {
+          await bus.toolUse({ ...base, taskId: toolTaskId, tool });
+        }
+        await status('busy');
       }
-      await status('busy');
     } else {
+      if (fromSubagent) {
+        // Only a nested summon that finished inside a subagent retires its ghost on floors without
+        // SubagentStop events; the rest of the event belongs to the subagent's own turn.
+        if (isSubagentTool(toolName) && !impl.hasSubagentStart) {
+          finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
+        }
+        return { ok: true, ignored: 'subagent_tool' };
+      }
       const touched = filesOf(ev.tool_input, toolName)
         .map((x) => ({ abs: path.resolve(x), path: relFile(x, cwd), op: opOf(toolName) }))
         .filter((t) => t.path);
