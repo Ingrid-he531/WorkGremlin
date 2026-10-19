@@ -79,6 +79,16 @@ function logsDir() {
   return path.join(home(), 'logs');
 }
 
+/**
+ * Export dir for one council: `~/.workgremlin/councils/<id>/`.
+ * The id is sanitized so a malformed id can never escape the councils dir.
+ * @param {string} councilId
+ */
+function councilReportDir(councilId) {
+  const safe = String(councilId || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(home(), 'councils', safe);
+}
+
 /** Reporter event timeline (hook.js appends, log.js prunes by age): `~/.workgremlin/hooks/events.log` */
 function eventsLogPath() {
   return path.join(hooksDir(), 'events.log');
@@ -214,6 +224,7 @@ module.exports = {
   dbPath,
   workspacesPath,
   logsDir,
+  councilReportDir,
   eventsLogPath,
   productsOverridesPath,
   // state files

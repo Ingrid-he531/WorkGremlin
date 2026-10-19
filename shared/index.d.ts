@@ -144,18 +144,27 @@ export declare const DEFAULTS: {
   readonly WAL_AUTOCHECKPOINT_PAGES: number;
   readonly WAL_CHECKPOINT_INTERVAL_MS: number;
   readonly RETENTION_DAYS: number;
-  /** Council: default round cap / hard cap / turn timeout / material byte caps (see shared/index.js for the comments) */
-  /** 'vote' (voting; the server counts votes for consensus) or 'analysis' (analysis; no voting, a briefing after the full rounds) */
-  readonly COUNCIL_MODE_DEFAULT: string;
+  /** Council: roles / severities / convergence-score weights / round caps / turn timeout / material byte caps (see shared/index.js for the comments) */
+  readonly COUNCIL_ROLES: readonly string[];
+  readonly COUNCIL_SEVERITIES: readonly string[];
+  readonly COUNCIL_STANCES: readonly string[];
+  /** Severity -> point deduction in the server-computed convergence score; `nit` is 0 */
+  readonly COUNCIL_SEVERITY_WEIGHTS: Readonly<Record<string, number>>;
+  /** Deduction per unresolved conflict */
+  readonly COUNCIL_CONFLICT_WEIGHT: number;
+  /** Convergence score ceiling (the raw formula may go negative and is clamped to 0..100) */
+  readonly COUNCIL_SCORE_MAX: number;
+  /** Suggested review dimensions offered by the UI */
+  readonly COUNCIL_DIMENSIONS: readonly string[];
   readonly COUNCIL_ROUNDS_DEFAULT: number;
   readonly COUNCIL_ROUNDS_MAX: number;
-  /** 'unanimous' (no objections + majority) or 'majority' (simple majority) */
-  readonly COUNCIL_THRESHOLD_DEFAULT: string;
   readonly COUNCIL_TURN_TIMEOUT_MS: number;
   /** Turn timeout in workspace mode (participants use read-only tools to dig through code themselves), wider than the one above */
   readonly COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: number;
   /** Fixed title for 7F/8F participant sessions: floorKilo.js / floorOpencode.js use it to keep participants off the floor */
   readonly COUNCIL_SESSION_TITLE: string;
+  /** Marker at the start of every council prompt: floorCline.js uses it to keep 2F participants off the floor */
+  readonly COUNCIL_PROMPT_MARKER: string;
   readonly COUNCIL_MATERIAL_MAX_BYTES: number;
   readonly COUNCIL_MATERIAL_TOTAL_MAX_BYTES: number;
 };

@@ -1,16 +1,16 @@
 /**
- * 议事厅接口自检 —— 真 express 路由 + 真 repo + 临时库，**只有编排器是假的**。
+ * Council HTTP API self-check — real Express router + real repo + a temp DB; only the orchestrator is
+ * fake (starting it really would spawn CLIs).
  *
- * 假编排器不是偷懒：这里要验的是"接口收什么、拒什么、返回什么"，而真编排器会去拉外部 CLI。
- * 假的记下 start / cancel 被怎么调了，就能断言"发起成功之后确实开跑了""删除在跑的会被拦住"。
- * 状态机本身在 councilOrchestrator.test.js 里用假参与者整条跑过。
+ * This file pins the request contract and the "never fabricate / never silently degrade" rules:
+ *   · unknown floors or a floor whose CLI is missing → reject the whole request, listing why;
+ *   · roles must be exactly one moderator, one main, at least one reviewer, all distinct floors;
+ *   · unreadable material → reject and name the file (silently skipping makes the user believe it was
+ *     read);
+ *   · a running meeting cannot be deleted;
+ *   · detail returns assembled RoundResults, the plan, and the report without mixing them up.
  *
- * 盯的是接口层的几条"不编造"：
- *   · 楼层没装 CLI / 不在白名单 → 拒掉整条请求（**降级成三个人开会是编造**）；
- *   · 材料读不到 → 拒掉并列明是哪几个（静默跳过会让用户以为参与者看过那个文件）；
- *   · 在跑的会不许删（删了之后在飞的发言会写成孤儿行 —— 这几张表没有外键）。
- *
- * 跑法：`npm run test:council-api`
+ * Run: `npm run test:council-api`
  */
 'use strict';
 
@@ -39,7 +39,7 @@ const head = (t) => console.log(`\n${t}`);
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-council-api-'));
 const { repo, close } = openDatabase(path.join(TMP, 'test.db'));
 
-/** 四个楼层，前三个装了 CLI、8F 没装（用来验"请不动"的拒绝与理由） */
+/** Four floors; 8F has no CLI so the "cannot start it" rejection has a real target. */
 const FLOORS = [
   { floorId: '1F', name: 'CodeBuddy', agent: 'codebuddy', ready: true, cliPath: '/usr/bin/codebuddy', reason: '' },
   { floorId: '4F', name: 'Claude Code', agent: 'claude', ready: true, cliPath: '/usr/bin/claude', reason: '' },
@@ -47,11 +47,10 @@ const FLOORS = [
   { floorId: '8F', name: 'OpenCode', agent: 'opencode', ready: false, cliPath: null, reason: '没找到命令行可执行文件' },
 ];
 
-/** 假编排器：只记调用，不真开会 */
 const orch = {
   started: [],
   active: new Set(),
-  startedWith: [],
+  cancelled: [],
   start(id) {
     this.started.push(id);
     return Promise.resolve(null);
@@ -59,11 +58,16 @@ const orch = {
   cancel(id) {
     if (!this.active.has(id)) return false;
     this.active.delete(id);
-    this.startedWith.push(id);
+    this.cancelled.push(id);
     return true;
   },
   activeIds() {
     return [...this.active];
+  },
+  /** Set by the tests that exercise the working indicator; null means nothing is in flight. */
+  progress: new Map(),
+  progressOf(id) {
+    return this.progress.get(id) || null;
   },
 };
 
@@ -79,241 +83,334 @@ const del = (p) => fetch(`${base}${p}`, { method: 'DELETE' });
 let base = '';
 let server = null;
 
+const valid = (over = {}) => ({
+  topic: '要不要把 A 方案换成 B 方案？',
+  moderator: '4F',
+  main: '1F',
+  reviewers: ['7F'],
+  ...over,
+});
+
 (async () => {
   server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}/api/v1`;
 
-  /* ------------------------------------------------------------ 楼层 */
-  head('可选楼层：不只是白名单，还要说清哪层请不动、为什么');
+  /* ------------------------------------------------------------ floors */
+  head('available floors and the shared vocabulary');
   {
     const res = await get('/councils/floors');
     const body = await res.json();
     ok('200', res.status === 200, String(res.status));
-    ok('四层都在（两层以上才能开会）', body.floors.length === 4, String(body.floors.length));
-    ok('没装 CLI 的那层 ready=false', body.floors.find((f) => f.floorId === '8F').ready === false);
-    ok('并给了原因（界面要显示给用户，不能只说"不可用"）', Boolean(body.floors.find((f) => f.floorId === '8F').reason));
-    ok('带上了缺省轮数（前端不用再写死一份）', body.defaults.maxRounds >= 1 && body.defaults.maxRoundsLimit >= body.defaults.maxRounds);
-    ok('带上了材料字节上限（界面要拿它标注"已截断"）', body.defaults.materialMaxBytes > 0);
-    ok('带上了两种谈法（前端别自己再写死一份白名单）',
-      Array.isArray(body.defaults.modes) && body.defaults.modes.includes('vote') && body.defaults.modes.includes('analysis'),
-      JSON.stringify(body.defaults.modes));
-    ok('带上了缺省谈法', body.defaults.mode === 'vote', String(body.defaults.mode));
-    ok('带上了工程模式的单轮超时（界面要写明"最长等多久"）', body.defaults.workspaceTurnTimeoutMs >= 60_000, String(body.defaults.workspaceTurnTimeoutMs));
+    ok('four floors are listed', body.floors.length === 4, String(body.floors.length));
+    ok('a floor without its CLI is ready=false', body.floors.find((f) => f.floorId === '8F').ready === false);
+    ok('and says why (the UI must show a reason, not just "unavailable")',
+      Boolean(body.floors.find((f) => f.floorId === '8F').reason));
+    ok('roles are published', body.defaults.roles.join(',') === 'moderator,main,reviewer', JSON.stringify(body.defaults.roles));
+    ok('severities / stances are published',
+      body.defaults.severities.join(',') === 'blocker,major,minor,nit' &&
+        body.defaults.stances.join(',') === 'reject,revise,accept');
+    ok('the score weights are published (the UI must not hard-code another copy)',
+      body.defaults.severityWeights.blocker === 25 && body.defaults.conflictWeight === 10 && body.defaults.scoreMax === 100);
+    ok('round defaults are published',
+      body.defaults.maxRounds >= 1 && body.defaults.maxRoundsLimit >= body.defaults.maxRounds);
+    ok('material byte limits are published', body.defaults.materialMaxBytes > 0 && body.defaults.materialTotalMaxBytes > 0);
+    ok('turn timeouts are published', body.defaults.turnTimeoutMs > 0 && body.defaults.workspaceTurnTimeoutMs >= 60_000);
   }
 
-  /* ------------------------------------------------------------ 发起：拒绝 */
-  head('发起：这些请求必须被拒掉');
+  /* ------------------------------------------------------------ rejection */
+  head('start: these requests must be rejected');
   {
     const cases = [
-      [{ floors: ['1F', '4F'] }, '没有议题'],
-      [{ topic: '   ', floors: ['1F', '4F'] }, '议题只有空白'],
-      [{ topic: '要不要上 X', floors: ['1F'] }, '只请了一个人'],
-      [{ topic: '要不要上 X', floors: [] }, '一个人都没请'],
-      [{ topic: '要不要上 X', floors: ['1F', '9F'] }, '楼层不在白名单'],
-      [{ topic: '要不要上 X', floors: ['1F', '8F'] }, '有一层请不动（没装 CLI）'],
+      [{ moderator: '4F', main: '1F', reviewers: ['7F'] }, 'no topic', '议题不能是空的'],
+      [valid({ topic: '   ' }), 'blank topic', '议题不能是空的'],
+      [{ topic: 'X', main: '1F', reviewers: ['7F'] }, 'no moderator', '必须指定主持人'],
+      [{ topic: 'X', moderator: '4F', reviewers: ['7F'] }, 'no main', '必须指定主答'],
+      [valid({ reviewers: [] }), 'no reviewer', '至少需要一位评审'],
+      [valid({ main: '4F' }), 'moderator and main are the same floor', '主持人和主答不能是同一个楼层'],
+      [valid({ reviewers: ['4F'] }), 'the moderator doubles as reviewer', '主持人不能再兼任评审'],
+      [valid({ reviewers: ['1F'] }), 'the main doubles as reviewer', '主答不能再兼任评审'],
+      [valid({ reviewers: ['9F'] }), 'floor not on the whitelist', '请不了'],
+      [valid({ reviewers: ['8F'] }), 'floor whose CLI is missing', '请不动'],
     ];
-    for (const [body, why] of cases) {
+    for (const [body, why, needle] of cases) {
       const res = await post('/councils', body);
       const r = await res.json();
-      ok(`拒绝：${why}`, res.status === 400 && r.ok === false && Boolean(r.error.message), `${res.status} ${JSON.stringify(r).slice(0, 120)}`);
+      ok(`reject: ${why}`, res.status === 400 && r.ok === false && String(r.error.message).includes(needle),
+        `${res.status} ${JSON.stringify(r).slice(0, 140)}`);
     }
-    ok('一层都没建成（拒掉就是拒掉，不留半场会）', repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
-    ok('也没让编排器开跑', orch.started.length === 0);
+    ok('no half-built meeting was left behind', repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
+    ok('the orchestrator was never started', orch.started.length === 0);
   }
 
-  head('发起：谈法认不出来就拒（不静默降级成表决）');
+  head('start: duplicate reviewers are collapsed, not counted twice');
   {
-    for (const mode of ['投票', 'VOTE', 'debate', 'analysis ']) {
-      const res = await post('/councils', { topic: '议题', floors: ['1F', '4F'], mode });
-      const r = await res.json();
-      // 'analysis ' 带尾巴空格也算认不出：白名单是逐字比对，不替它 trim 成别的意思
-      ok(`拒绝不认识的谈法：${JSON.stringify(mode)}`, res.status === 400 && /模式/.test(String(r.error.message)), `${res.status} ${JSON.stringify(r).slice(0, 100)}`);
-    }
-    ok('一场都没建成（选了"分析"却跑成"表决"是最坏的一种错，不能悄悄发生）',
-      repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
+    const res = await post('/councils', valid({ reviewers: ['7F', '7F'], maxRounds: 1 }));
+    ok('201', res.status === 201, String(res.status));
+    const r = await res.json();
+    const reviewers = repo.listParticipants(r.council.id).filter((p) => p.role === 'reviewer');
+    ok('one reviewer row, not two', reviewers.length === 1, String(reviewers.length));
+    await del(`/councils/${r.council.id}`);
   }
 
-  head('发起：工作目录写错就拒，并说清哪儿不对');
+  head('start: workspace validation');
   {
     const doc = path.join(TMP, 'not-a-dir.txt');
     fs.writeFileSync(doc, 'x');
     const cases = [
-      ['相对路径', 'relative/path'],
-      ['不存在的目录', path.join(TMP, 'no-such-dir-xyz')],
-      ['是个文件不是目录', doc],
+      ['relative path', 'relative/path'],
+      ['nonexistent directory', path.join(TMP, 'no-such-dir-xyz')],
+      ['a file, not a directory', doc],
     ];
     for (const [why, workspacePath] of cases) {
-      const res = await post('/councils', { topic: '议题', floors: ['1F', '4F'], workspacePath });
+      const res = await post('/councils', valid({ workspacePath }));
       const r = await res.json();
-      ok(`拒绝：工作目录${why}`, res.status === 400 && /工作目录/.test(String(r.error.message)), `${res.status} ${JSON.stringify(r).slice(0, 100)}`);
-      // 错误里带上用户写的那个路径 —— 否则他不知道自己写的哪个字错了
-      ok(`并原样带回那个路径（${why}）`, String(r.error.message).includes(workspacePath), String(r.error.message));
+      ok(`reject: workspace ${why}`, res.status === 400 && String(r.error.message).includes('工作目录'));
+      ok(`the error echoes the path (${why})`, String(r.error.message).includes(workspacePath));
     }
-    ok('还是没建成半场会', repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
+    const tilde = await post('/councils', valid({ workspacePath: '~/绝对不存在的工程目录-xyz' }));
+    const tr = await tilde.json();
+    ok('~ is expanded to the home directory',
+      tilde.status === 400 && String(tr.error.message).includes(os.homedir()) && !String(tr.error.message).includes('~'),
+      String(tr.error.message));
+    ok('still no meeting was built', repo.listCouncils(50).length === 0);
   }
 
-  head('发起：材料文件读不到 → 整条拒掉，并点明是哪个文件');
+  head('start: an unreadable material file rejects the whole request');
   {
-    const res = await post('/councils', {
-      topic: '要不要上 X',
-      floors: ['1F', '4F'],
-      files: ['/tmp/这个文件肯定不存在-9f3a.txt'],
-    });
+    const res = await post('/councils', valid({ files: ['/tmp/这个文件肯定不存在-9f3a.txt'] }));
     const r = await res.json();
     ok('400', res.status === 400, String(res.status));
-    ok('错误里点名了那个文件（用户才知道该换哪个）', String(r.error.message).includes('这个文件肯定不存在'), String(r.error.message));
-    ok('没有静默跳过、也没有建成半场会', repo.listCouncils(50).length === 0, String(repo.listCouncils(50).length));
+    ok('the file is named', String(r.error.message).includes('这个文件肯定不存在'), String(r.error.message));
+    ok('nothing was silently skipped', repo.listCouncils(50).length === 0);
   }
 
-  /* ------------------------------------------------------------ 发起：成功 */
-  head('发起：落库 + 立刻开跑');
+  /* ------------------------------------------------------------ success */
+  head('start: persist, then launch');
   let id = null;
   {
     const doc = path.join(TMP, '说明.txt');
     fs.writeFileSync(doc, '这是背景材料的正文。');
-    const res = await post('/councils', {
-      topic: '要不要把 A 方案换成 B 方案？',
-      floors: ['1F', '4F', '7F'],
-      files: [doc],
-      maxRounds: 2,
-    });
+    const res = await post('/councils', valid({ files: [doc], maxRounds: 2, reviewers: ['7F', '1F', '7F'] }));
+    // Note: the main floor in reviewers is rejected; use the clean shape below instead.
+    ok('a reviewer that is also the main is rejected before anything is stored', res.status === 400);
+  }
+  {
+    const doc = path.join(TMP, '说明.txt');
+    const res = await post('/councils', valid({ files: [doc], maxRounds: 2 }));
     const r = await res.json();
     id = r.council && r.council.id;
     ok('201', res.status === 201, String(res.status));
-    ok('回了这场会', Boolean(id), JSON.stringify(r).slice(0, 150));
-    ok('初始是 draft（编排器才开始跑）', r.council.status === 'draft', r.council.status);
-    ok('议题按用户原话存着', r.council.topic === '要不要把 A 方案换成 B 方案？');
-    ok('轮数按请求存（不是写死的缺省）', r.council.max_rounds === 2, String(r.council.max_rounds));
-    ok('判定口径落在这一场上（不被后续全局改动影响）', r.council.threshold === 'unanimous', String(r.council.threshold));
-    // 没填 mode / workspacePath = 与改动前逐字相同的行为（老前端不发这两个字段也必须照常能用）
-    ok('不填谈法就是表决（缺省没变）', r.council.mode === 'vote', String(r.council.mode));
-    ok('不填工作目录就存 NULL（不是空串）—— 服务端据此建临时目录', r.council.workspace_path === null, String(r.council.workspace_path));
+    ok('the meeting is returned', Boolean(id), JSON.stringify(r).slice(0, 140));
+    ok('status starts as draft (the orchestrator has only just been called)', r.council.status === 'draft', r.council.status);
+    ok('the topic is stored verbatim', r.council.topic === '要不要把 A 方案换成 B 方案？');
+    ok('max_rounds follows the request', r.council.max_rounds === 2, String(r.council.max_rounds));
+    ok('no workspace -> NULL, not an empty string', r.council.workspace_path === null, String(r.council.workspace_path));
+    ok('the orchestrator was started', orch.started.includes(id));
 
-    ok('编排器被叫起来跑这一场', orch.started.includes(id), JSON.stringify(orch.started));
     const ps = repo.listParticipants(id);
-    ok('三个出席者都落了库', ps.length === 3 && ps.map((p) => p.floor_id).join() === '1F,4F,7F', JSON.stringify(ps.map((p) => p.floor_id)));
-    ok('记下了当时用的可执行文件（排查要知道是哪个）', ps[0].cli_path === '/usr/bin/codebuddy', String(ps[0].cli_path));
+    ok('three participants with the right roles',
+      ps.length === 3 &&
+        ps.map((p) => `${p.floor_id}:${p.role}`).join(',') === '4F:moderator,1F:main,7F:reviewer',
+      JSON.stringify(ps.map((p) => `${p.floor_id}:${p.role}`)));
+    ok('the CLI path used at creation is recorded', ps[2].cli_path === '/usr/bin/kilo', String(ps[2].cli_path));
+    ok('the agent name is recorded', ps[0].agent === 'claude' && ps[1].agent === 'codebuddy');
+
     const ms = repo.listMaterials(id);
-    ok('材料正文落库了（可追溯"到底喂进去了什么"）', ms.length === 1 && ms[0].content === '这是背景材料的正文。', JSON.stringify(ms));
-    ok('材料带上了字节数', ms[0].bytes_included === Buffer.byteLength('这是背景材料的正文。', 'utf8'));
+    ok('the material is stored in full (what was fed in stays auditable)',
+      ms.length === 1 && ms[0].content === '这是背景材料的正文。');
+    ok('material byte count recorded', ms[0].bytes_included === Buffer.byteLength('这是背景材料的正文。', 'utf8'));
   }
 
-  head('发起：分析模式 + 工程目录，两个开关都如实落库');
+  head('start: workspace mode and maxRounds clamping');
   {
-    const wsDir = path.join(TMP, 'real-project');
-    fs.mkdirSync(wsDir, { recursive: true });
-    const res = await post('/councils', {
-      topic: '这个改法会不会引入回归？',
-      floors: ['1F', '4F'],
-      mode: 'analysis',
-      workspacePath: wsDir,
-    });
+    const ws = path.join(TMP, 'real-project');
+    fs.mkdirSync(ws, { recursive: true });
+    const res = await post('/councils', valid({ workspacePath: ws, maxRounds: 999 }));
     const r = await res.json();
     ok('201', res.status === 201, `${res.status} ${JSON.stringify(r).slice(0, 120)}`);
-    ok('谈法落库', r.council.mode === 'analysis', String(r.council.mode));
-    ok('工作目录落库（解析后的绝对路径）', r.council.workspace_path === wsDir, String(r.council.workspace_path));
-    ok('详情接口把这两个开关带回来（界面要据此切分支）',
-      (await (await get(`/councils/${r.council.id}`)).json()).council.mode === 'analysis');
-    // 收拾干净：这一场只是来验两个开关的，后面几组按"列表里有几场会"数数，
-    // 留着它会让那些断言变成"因为多了个夹具才失败"，看不出真正的原因
+    ok('the absolute workspace is stored', r.council.workspace_path === ws, String(r.council.workspace_path));
+    ok('maxRounds is clamped to the published limit', r.council.max_rounds === 8, String(r.council.max_rounds));
+    const detail = await (await get(`/councils/${r.council.id}`)).json();
+    ok('detail returns the same workspace', detail.council.workspace_path === ws);
+    await del(`/councils/${r.council.id}`);
+  }
+  {
+    const res = await post('/councils', valid({ maxRounds: 0 }));
+    const r = await res.json();
+    ok('an invalid maxRounds falls back to the default (not 0)', r.council.max_rounds === 3, String(r.council.max_rounds));
     await del(`/councils/${r.council.id}`);
   }
 
-  head('发起：~ 开头的路径按用户的家目录展开');
-  {
-    // 输入框里最常被敲的就是 `~` 开头这一种。展开出来的目录存不存在是另一回事 ——
-    // 这一条只钉"它确实被当成家目录，而不是被当成一个字面量目录名"。
-    const res = await post('/councils', { topic: '议题', floors: ['1F', '4F'], workspacePath: '~/绝对不存在的工程目录-xyz' });
-    const r = await res.json();
-    ok('400（那个目录确实不存在）', res.status === 400, String(res.status));
-    ok('错误里是展开后的路径（说明 ~ 被展开了，不是被当字面量）',
-      String(r.error.message).includes(os.homedir()) && !String(r.error.message).includes('~'), String(r.error.message));
-  }
-
-  head('发起：超上限的材料会被截断，且截断的事实一起落库');
+  head('start: oversized materials are truncated, and the fact is stored');
   {
     const big = path.join(TMP, '大文件.txt');
     fs.writeFileSync(big, 'x'.repeat(200 * 1024));
-    const res = await post('/councils', { topic: '长材料', floors: ['1F', '4F'], files: [big] });
+    const res = await post('/councils', valid({ files: [big] }));
     const r = await res.json();
     const m = repo.listMaterials(r.council.id)[0];
-    ok('201 建起来了（截断不是错误）', res.status === 201, String(res.status));
+    ok('201 (truncation is not an error)', res.status === 201, String(res.status));
     ok('truncated=1', m.truncated === 1);
-    ok('bytesTotal 是真实大小 204800', m.bytes_total === 200 * 1024, String(m.bytes_total));
-    ok('实际只给了 64KB', m.bytes_included === 64 * 1024, String(m.bytes_included));
-    ok('正文长度与 bytes_included 对得上', Buffer.byteLength(m.content, 'utf8') === m.bytes_included);
+    ok('bytesTotal is the real size', m.bytes_total === 200 * 1024, String(m.bytes_total));
+    ok('only 64KB is included', m.bytes_included === 64 * 1024, String(m.bytes_included));
+    ok('content length matches bytes_included', Buffer.byteLength(m.content, 'utf8') === m.bytes_included);
+    await del(`/councils/${r.council.id}`);
   }
 
-  /* ------------------------------------------------------------ 读 */
-  head('详情：一次给全（轮次 / 发言 / 材料 / 是否还在跑）');
+  /* ------------------------------------------------------------ detail */
+  head('detail: rounds, RoundResults, plan, report, materials, participants, live');
   {
     repo.upsertRound({
-      councilId: id, roundNo: 0, kind: 'brief', proposalText: '要不要把 A 方案换成 B 方案？', proposalFrom: 'chair',
-      agree: 0, disagree: 0, abstain: 0, invalid: 0, consensus: 0, startedAt: 1, endedAt: 2,
+      councilId: id,
+      roundNo: 0,
+      kind: 'plan',
+      version: null,
+      proposalText: null,
+      diffFromPrev: null,
+      proposalFrom: '4F',
+      moderatorJson: JSON.stringify({ parsed: true, breakdown: ['拆解 A'], assignments: [], reviewFocus: [] }),
+      statsJson: null,
+      startedAt: 1,
+      endedAt: 2,
     });
-    repo.insertUtterance({ councilId: id, roundNo: 0, floorId: 'chair', role: 'chair', content: '议题原文', status: 'ok' });
-    repo.insertUtterance({ councilId: id, roundNo: 1, floorId: '4F', role: 'speaker', content: '我觉得可以', vote: 'agree', status: 'ok' });
+    repo.upsertRound({
+      councilId: id,
+      roundNo: 1,
+      kind: 'debate',
+      version: 'v1',
+      proposalText: '方案正文',
+      diffFromPrev: null,
+      proposalFrom: '1F',
+      moderatorJson: JSON.stringify({
+        consensus: ['一致'],
+        openIssues: [],
+        conflicts: [],
+        revisionDirectives: ['【针对 X】必须改；验收标准：有。'],
+        convergenceScore: 75,
+      }),
+      statsJson: JSON.stringify({ total: 1, score: 75, bySeverity: { blocker: 1, major: 0, minor: 0, nit: 0 }, conflicts: 0 }),
+      startedAt: 3,
+      endedAt: 4,
+    });
+    repo.insertReviews(id, 1, [
+      { reviewer: '7F', severity: 'blocker', dimension: '安全', issue: '缺鉴权', evidence: null, suggestion: '加中间件', stance: 'reject' },
+    ], 5);
+    repo.insertUtterance({ councilId: id, roundNo: 0, floorId: 'system', phase: 'brief', content: '议题原文', status: 'ok' });
+    repo.insertUtterance({ councilId: id, roundNo: 1, floorId: '1F', phase: 'proposal', content: '方案正文', status: 'ok', model: 'm1', inputTokens: 10, outputTokens: 2 });
+    repo.insertReport({
+      councilId: id,
+      adjudicationJson: JSON.stringify({ decision: 'approve_with_changes' }),
+      adjudicationText: '裁决原文',
+      finalDraftText: '最终稿',
+      changeNotes: '说明',
+      reportJson: JSON.stringify({ schema: 'workgremlin.council.report/v1', summary: { warnings: [] } }),
+      filesJson: JSON.stringify(['/tmp/report.json']),
+      createdAt: 6,
+    });
 
     const res = await get(`/councils/${id}`);
     const r = await res.json();
     ok('200', res.status === 200, String(res.status));
-    ok('带上轮次（含第 0 轮议题陈述）', r.rounds.length === 1 && r.rounds[0].round_no === 0);
-    ok('带上发言（含主席那条）', r.utterances.length === 2 && r.utterances.some((u) => u.role === 'chair'));
-    ok('带上票', r.utterances.find((u) => u.round_no === 1).vote === 'agree');
-    ok('带上材料正文', r.materials.length === 1 && Boolean(r.materials[0].content));
-    ok('带上出席者', r.participants.length === 3);
-    ok('live=false（假编排器没把它标成在跑）', r.live === false);
+    ok('raw rounds include the plan and the debate', r.rounds.length === 2 && r.rounds[0].kind === 'plan' && r.rounds[1].kind === 'debate');
+    ok('roundResults contain only debate rounds', r.roundResults.length === 1 && r.roundResults[0].round === 1);
+    ok('RoundResult proposal comes from the round row',
+      r.roundResults[0].proposal.version === 'v1' && r.roundResults[0].proposal.content === '方案正文');
+    ok('RoundResult reviews come from council_reviews (reviewer assigned by the server)',
+      r.roundResults[0].reviews.length === 1 && r.roundResults[0].reviews[0].reviewer === '7F');
+    ok('RoundResult moderator.convergenceScore is the archived server score',
+      r.roundResults[0].moderator.convergenceScore === 75);
+    ok('the plan is returned separately (parsed JSON)', r.plan && r.plan.parsed === true && r.plan.breakdown[0] === '拆解 A');
+    ok('the report and its files are returned', r.report.schema === 'workgremlin.council.report/v1' && r.reportFiles[0] === '/tmp/report.json');
+    ok('utterances include the brief and the proposal', r.utterances.length === 2 && r.utterances[0].phase === 'brief');
+    ok('materials still carry their content', r.materials.length === 1 && Boolean(r.materials[0].content));
+    ok('participants come back with roles', r.participants.length === 3);
+    ok('live=false while not active', r.live === false);
+    ok('progress=null while nothing is in flight', r.progress === null);
+    ok('no vote-era columns survive on the council row', !('threshold' in r.council) && !('mode' in r.council));
 
     orch.active.add(id);
-    const r2 = await (await get(`/councils/${id}`)).json();
-    ok('在飞时 live=true（界面据此显示"讨论中"）', r2.live === true);
+    orch.progress.set(id, { roundNo: 1, phase: 'review', floors: ['7F'], startedAt: 10 });
+    const live = await (await get(`/councils/${id}`)).json();
+    ok('live=true while the orchestrator says it is active', live.live === true);
+    ok('detail returns the in-flight progress (round/phase/floors)',
+      live.progress.roundNo === 1 && live.progress.phase === 'review' && live.progress.floors[0] === '7F',
+      JSON.stringify(live.progress));
+    orch.progress.delete(id);
   }
 
-  head('列表与 404');
+  head('report endpoint');
+  {
+    const res = await get(`/councils/${id}/report`);
+    const r = await res.json();
+    ok('200', res.status === 200, String(res.status));
+    ok('parsed adjudication', r.adjudication.decision === 'approve_with_changes');
+    ok('final draft and change notes', r.finalDraft === '最终稿' && r.changeNotes === '说明');
+    ok('files', r.files.length === 1 && r.files[0] === '/tmp/report.json');
+    ok('the report body is returned', r.report.schema === 'workgremlin.council.report/v1');
+    ok('createdAt is the stored timestamp, not the request time', r.createdAt === 6, String(r.createdAt));
+    ok('no vote-era fields were resurrected', !('threshold' in r) && !('tally' in r));
+    const missing = await get('/councils/nope/report');
+    ok('unknown council -> 404', missing.status === 404, String(missing.status));
+  }
+  {
+    const noReport = await post('/councils', valid({ maxRounds: 1 }));
+    const noReportId = (await noReport.json()).council.id;
+    const res = await get(`/councils/${noReportId}/report`);
+    ok('a meeting without a report -> 404 "还没有报告"', res.status === 404);
+    const body = await res.json();
+    ok('the message distinguishes it from a missing meeting', String(body.error.message).includes('报告'));
+    orch.active.delete(noReportId);
+    await del(`/councils/${noReportId}`);
+  }
+
+  head('list and 404');
   {
     const r = await (await get('/councils')).json();
-    ok('列表按发起时间倒序给出全部会', r.councils.length === 2 && r.councils[0].created_at >= r.councils[1].created_at);
+    ok('the list has the remaining meeting', r.councils.length === 1 && r.councils[0].id === id, String(r.councils.length));
     const nf = await get('/councils/查无此会');
-    ok('不存在的会 → 404', nf.status === 404, String(nf.status));
-    ok('404 也带 { ok:false, error.message }', (await nf.json()).error.message === '没有这场会');
+    ok('unknown council -> 404', nf.status === 404, String(nf.status));
+    ok('404 body shape', (await nf.json()).error.message === '没有这场会');
   }
 
-  /* ------------------------------------------------------------ 取消 / 删除 */
-  head('取消');
+  /* ------------------------------------------------------------ cancel / delete */
+  head('cancel');
   {
+    orch.active.add(id);
     const r = await (await post(`/councils/${id}/cancel`)).json();
-    ok('在跑 → cancelled=true', r.cancelled === true, JSON.stringify(r.cancelled));
-    ok('编排器收到了取消', orch.startedWith.includes(id));
-    const r2 = await (await post(`/councils/${id}/cancel`)).json();
-    ok('再取消一次 → cancelled=false（不抛错，如实说没取消到）', r2.cancelled === false);
-    const nf = await post('/councils/查无此会/cancel');
-    ok('取消不存在的会 → 404', nf.status === 404, String(nf.status));
+    ok('active -> cancelled=true', r.cancelled === true);
+    ok('the orchestrator received the cancel', orch.cancelled.includes(id));
+    const again = await (await post(`/councils/${id}/cancel`)).json();
+    ok('cancelling again -> cancelled=false (not an error)', again.cancelled === false);
+    ok('unknown council -> 404', (await post('/councils/查无此会/cancel')).status === 404);
   }
 
-  head('删除：在跑的会先取消再删（否则在飞的发言会写成孤儿行）');
+  head('delete: a running meeting must be cancelled first');
   {
     orch.active.add(id);
     const res = await del(`/councils/${id}`);
     const r = await res.json();
-    ok('在跑时删除 → 409', res.status === 409, String(res.status));
-    ok('并告诉用户先取消', /先取消/.test(String(r.error.message)), String(r.error.message));
-    ok('会还在（没被删掉）', repo.getCouncil(id) !== null);
+    ok('active -> 409', res.status === 409, String(res.status));
+    ok('the message tells the user to cancel first', /先取消/.test(String(r.error.message)), String(r.error.message));
+    ok('the meeting still exists', repo.getCouncil(id) !== null);
 
     orch.active.delete(id);
     const res2 = await del(`/councils/${id}`);
-    ok('停了之后删除 → 200', res2.status === 200, String(res2.status));
-    ok('这场会没了', repo.getCouncil(id) === null);
-    ok('子表也清干净了（不留孤儿）', repo.listUtterances(id).length === 0 && repo.listRounds(id).length === 0 && repo.listMaterials(id).length === 0 && repo.listParticipants(id).length === 0);
-
-    const nf = await del('/councils/查无此会');
-    ok('删不存在的会 → 404', nf.status === 404, String(nf.status));
-    ok('删完之后列表里只剩另一场', repo.listCouncils(50).length === 1, String(repo.listCouncils(50).length));
+    ok('after it stops -> 200', res2.status === 200, String(res2.status));
+    ok('the meeting is gone', repo.getCouncil(id) === null);
+    ok('child rows are gone too',
+      repo.listUtterances(id).length === 0 &&
+        repo.listRounds(id).length === 0 &&
+        repo.listReviews(id).length === 0 &&
+        repo.listMaterials(id).length === 0 &&
+        repo.listParticipants(id).length === 0 &&
+        repo.getReport(id) === null);
+    ok('deleting an unknown council -> 404', (await del('/councils/查无此会')).status === 404);
+    ok('the list is empty', repo.listCouncils(50).length === 0);
   }
 
   server.close();
   close();
   fs.rmSync(TMP, { recursive: true, force: true });
-  console.log(`\n${fail ? '✗' : '✓'} council-api: ${pass} 通过 / ${fail} 失败`);
+  console.log(`\n${fail ? '✗' : '✓'} council-api: ${pass} passed / ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

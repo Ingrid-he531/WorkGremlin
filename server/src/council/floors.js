@@ -6,9 +6,13 @@
  *
  * The council is **always read-only** (see agents.js): the participant gets read-type tools only, and
  * when no workspace is given it is pointed at a throwaway temp directory. So a floor qualifies when it
- * can be launched headlessly from the command line **and** narrowed to read-type tools. The four below
- * were verified (see the notes on each recipe in server/src/council/agents.js):
+ * can be launched headlessly from the command line **and** narrowed to read-type tools. The seven below
+ * qualify (see the notes on each recipe in server/src/council/agents.js; 6F Qoder is written from its
+ * official docs but not yet verified on a real device):
  *   1F CodeBuddy / 4F Claude Code —— `--tools Read,Grep,Glob`
+ *   2F Cline                      —— `--plan` (its own read-only plan mode)
+ *   3F Codex                      —— `codex exec --sandbox read-only`
+ *   6F Qoder                      —— headless `--print` (anything needing confirmation is denied)
  *   7F Kilo Code  / 8F OpenCode   —— a permission config that allows only read-type tools
  * Other floors are simply **not wired up yet** (no recipe written); that is a scope decision, not a
  * claim that they can never qualify. Floors we have no recipe for do not appear in the council room at
@@ -23,8 +27,8 @@
 const { detectProducts } = require('../floors');
 const { RECIPES } = require('./agents');
 
-/** The four floors available in the first version. Order = the order they appear in the UI */
-const COUNCIL_FLOORS = Object.freeze(['1F', '4F', '7F', '8F']);
+/** The floors available in the council. Order = the order they appear in the UI */
+const COUNCIL_FLOORS = Object.freeze(['1F', '2F', '3F', '4F', '6F', '7F', '8F']);
 
 /**
  * Current availability of each floor. Used by the UI to pick participants.

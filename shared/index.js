@@ -62,35 +62,44 @@ const DEFAULTS = Object.freeze({
   RETENTION_DAYS: 90,
 
   /**
-   * Council Chamber — pick agents from several floors to discuss one topic to agreement.
+   * Council Chamber — a moderated review loop over one topic.
    *
-   * Only **global defaults** live here; each council's own settings (rounds / decision rule) are stored on
-   * the councils row, filled from these defaults at launch and not affected by later global changes (a
-   * council that already ran should not have its rule changed).
+   * There is no vote and no vote tally. Each council has one moderator, one main answerer, and one or
+   * more reviewers. Round 0 is the moderator's plan; rounds 1..N each produce a proposal, independent
+   * reviews, and a moderator convergence result; the final phase is the moderator's adjudication plus the
+   * main answerer's final draft.
+   *
+   * Only **global defaults** live here; each council's own settings are stored on the councils row and
+   * are not affected by later global changes (a council that already ran keeps the settings it used).
    */
+  /** The three roles a participant can hold. Exactly one moderator and one main answerer per council. */
+  COUNCIL_ROLES: Object.freeze(['moderator', 'main', 'reviewer']),
+  /** Review severities, most severe first. */
+  COUNCIL_SEVERITIES: Object.freeze(['blocker', 'major', 'minor', 'nit']),
+  /** A reviewer's stance toward the current proposal. */
+  COUNCIL_STANCES: Object.freeze(['reject', 'revise', 'accept']),
   /**
-   * The council's two modes (councils.mode):
-   *   'vote'     — several rounds of voting on one proposal; the server mechanically counts votes (see council/consensus.js)
-   *   'analysis' — no voting, no consensus: free analysis each round, then a grouped briefing after the full round count
-   * Orthogonal to "where to talk" (whether councils.workspace_path has a value) — two independent switches.
+   * Severity weights used by the **server-computed** convergence score. The score is never model-reported:
+   * `clamp(100 - (blocker*25 + major*8 + minor*2 + nit*0 + conflicts*10), 0, 100)`.
+   * `nit` deliberately carries no weight — it must not move the number.
    */
-  COUNCIL_MODE_DEFAULT: 'vote',
-  /** Default discussion-round cap (excluding round 0, the topic statement) */
+  COUNCIL_SEVERITY_WEIGHTS: Object.freeze({ blocker: 25, major: 8, minor: 2, nit: 0 }),
+  /** Each unresolved conflict costs this much, in addition to the severity points of the points involved. */
+  COUNCIL_CONFLICT_WEIGHT: 10,
+  /** The convergence score is capped at this value; the formula can produce a negative raw number. */
+  COUNCIL_SCORE_MAX: 100,
+  /** Suggested review dimensions. Free-form dimensions are accepted but this is the vocabulary the UI offers. */
+  COUNCIL_DIMENSIONS: Object.freeze([
+    '架构', '性能', '安全', '可维护性', '成本', '兼容性', '测试', '文档', '体验', '其他',
+  ]),
+  /** Default discussion-round cap (excluding round 0, the moderator's plan) */
   COUNCIL_ROUNDS_DEFAULT: 3,
   /** Hard cap on discussion rounds (the user cannot raise it in the UI) */
   COUNCIL_ROUNDS_MAX: 8,
   /**
-   * Default decision rule. Values in server/src/council/consensus.js THRESHOLDS:
-   *   'unanimous' — no objections + majority yes (default, most conservative: any single objection means no agreement)
-   *   'majority'  — simple majority (yes > no)
-   * Both require **no one abstaining**: we do not know an absent member's stance, and treating unknown as
-   * tacit consent is inventing.
-   */
-  COUNCIL_THRESHOLD_DEFAULT: 'unanimous',
-  /**
-   * Timeout for a single participant's turn. On expiry we **kill the process** and record "no stance"
-   * honestly — the timeout here is not "wait a bit longer", it is "we definitely cannot get this vote". So
-   * it leaves ample margin for the slowest floor (one answer runs a whole model call).
+   * Timeout for a single participant's turn. On expiry we **kill the process** and record the failure
+   * honestly — the timeout is not "wait a bit longer", it is "we definitely cannot get this turn". It
+   * leaves ample margin for the slowest floor (one answer runs a whole model call).
    */
   COUNCIL_TURN_TIMEOUT_MS: 120_000,
   /**
@@ -121,6 +130,20 @@ const DEFAULTS = Object.freeze({
    * The title contains WorkGremlin so the user can tell, in Kilo / OpenCode's own session history, who left it.
    */
   COUNCIL_SESSION_TITLE: '议事厅参与者（WorkGremlin）',
+  /**
+   * A fixed marker at the very start of every council prompt —— the second isolation lock for floors that
+   * can neither turn off session persistence nor set a session title.
+   *
+   * 2F Cline is the reason: its CLI has no `--no-session-persistence` (1F/4F) and no `--title` (7F/8F), and
+   * it derives the stored session title from the **prompt itself**. In workspace mode the cwd is the user's
+   * project, so the participant would otherwise land on the office's 2F as an extra "session". It gets a
+   * marker by making the prompt's own opening sentence carry this phrase; floorCline.js **skips sessions
+   * whose title contains it** when listing sessions.
+   *
+   * It must stay in sync with the first sentence of council/prompt.js's roleBlock —— a self-check asserts
+   * that roleBlock contains it.
+   */
+  COUNCIL_PROMPT_MARKER: 'WorkGremlin 议事厅',
   /** Byte cap for a single inlined material file; the excess is truncated and the UI marks it "truncated" */
   COUNCIL_MATERIAL_MAX_BYTES: 64 * 1024,
   /** Byte cap for all inlined material (the prompt must fit into argv / stdin; it cannot grow without bound) */

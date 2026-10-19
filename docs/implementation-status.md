@@ -18,10 +18,11 @@
 - 领域模型由 **team** 改为 **工程（project）**（commit `def3fee`）；
 - 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~7F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
 - 成员来源从「roster（`config.json`）+ A 路线目录监听」改为 **hook 上报 / `.codebuddy/agents` 名册 / `.workgremlin/subagents.json` 清单**三路；
-- 多了一个 **议事厅**：选定几个楼层就一个议题开一场多轮讨论，服务端数票判定是否达成一致；
-  参与者是服务端拉起的一次性无工具进程，跑在临时目录里，**不进办公室、不进任务记录**（§4.2）；
+- 多了一个 **议事厅**：选定几个楼层（一名主持人 / 一名主答 / 若干评审）就一个议题开一场多轮评审，
+  没有投票与阈值；每轮落一个 `RoundResult`，收敛度由服务端按严重度与冲突数机械计算；
+  参与者是服务端拉起的一次性只读进程，跑在临时目录或指定工程目录里，**不进办公室、不进任务记录**（§4.2）；
 - 承诺的 **A 路线（`chokidar`）、消息脱敏、FTS5 查询、双连接存储、TS 迁移、自动化测试** 均未落地
-  （最后一条现在只对**旧**功能成立：`test:*` 已有 49 个脚本 / 49 个测试文件，但都是普通 node 脚本，不是文档里写的 Vitest + Playwright）。
+  （最后一条现在只对**旧**功能成立：`test:*` 已有 69 个脚本 / 69 个测试文件，但都是普通 node 脚本，不是文档里写的 Vitest + Playwright）。
 
 ---
 
@@ -44,7 +45,7 @@ server/                 Express + ws + better-sqlite3，可内嵌 Electron 也�
   src/workspace.js      「打开工程」：切换 + 落盘 workspaces.json + 最近 8 个
   src/products.js       楼层 = 受监控产品（安装位置 + 落盘目录探测）
   src/sessions.js       插件结构化落盘解析（genie-history / todos / message-queue / file-changes）
-  src/sessionRegistry.js 全局活跃会话表（60 分钟无事件剔除）
+  src/sessionRegistry.js 全局活跃会话表（60 分钟无事件剔除；2F 的终态会话由 floorCline 当场回收，不等窗口）
   src/ws/hub.js         WS 连接管理、订阅过滤、广播
   src/http/routes/*     健康检查 / 查询 / 上报 / 工程 / 会话 / 产品
 desktop/                Electron 主进程（内嵌 server，单实例锁）、preload（受限桥）、window、menu
@@ -143,7 +144,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | `file_activity` | `op` CHECK 仅 `('read','write')` | 缺 `edit` |
 | `tool_usage` | `task_id` + `tool` 主键、`count`、`first_at` / `last_at` | **新表**（任务详情「工具使用」）：按 `(任务, 工具)` 累加次数，不给每次调用落一行。上报见 `POST /api/v1/tool/use`（hook 的 PreToolUse / 插件的 tool part 各报一条，插件按 `callID` 去重、`pending` 不算）；`/task-runs` 每行带 `tools: [{tool,count}]`，删除任务时随 `deleteByTopIds` 一起清 |
 | `artifacts` / `events` | 产出与审计 | `events` 表已建但**无写入方** |
-| `councils` / `council_participants` / `council_materials` / `council_rounds` / `council_utterances` | 议事厅五张表（见 §4.2） | **新表**，文档里没有。与 `members` / `task_runs` **完全无交集**：议事厅的参与者不是楼层成员，不进办公室、不进任务记录。收尾字段叫 `verdict`（`consensus` / `no_consensus` / `cancelled` / `failed`，**`no_consensus` 是合法结果不是错误**）；`council_rounds` 逐轮存档 `proposal_text` / `proposal_from`（那一轮投票针对的是哪份提案，全程可追溯），票数是 `consensus.js` 现算后落库、不是模型自报；`council_utterances.vote` 取不到就是 NULL（界面「未表态」），**不补默认票** |
+| `councils` / `council_participants` / `council_materials` / `council_rounds` / `council_reviews` / `council_utterances` / `council_reports` | 议事厅七张表（见 §4.2） | **新表**，文档里没有。与 `members` / `task_runs` **完全无交集**：议事厅的参与者不是楼层成员，不进办公室、不进任务记录。`verdict` 取值 `completed` / `partial` / `cancelled` / `failed`（`partial` 是合法结果不是错误）；`council_participants.role` 只有 `moderator` / `main` / `reviewer` 三种；`council_rounds` 第 0 轮是主持人的拆题（`kind='plan'`），1..N 轮各存一个 `RoundResult`（提案原文、与上一版的 diff、主持人汇总 JSON、服务端算出的 `stats_json`）；`council_reviews` 每条 `ReviewPoint` 一行；收敛度**不落模型自报的分数**，由 `council/convergence.js` 从评审与冲突重算；`council_utterances` 保留每次发言的原文、模型与四路词元（取不到即 NULL，**不补 0**）；报告落 `council_reports` 并在收尾时导出 JSON / CSV / Markdown。
 
 ---
 
@@ -154,7 +155,7 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 | 楼层 | 产品 | 落盘形态 |
 | --- | --- | --- |
 | 1F | CodeBuddy（**CLI 与 Plugin 合并成一层**） | CLI：`~/.codebuddy` 下的 `*.jsonl` + reporter 状态文件；Plugin：编辑器 globalStorage 的结构化目录（genie-history / todos / message-queue / file-changes，唯一能拿到运行态的那一路）。两路都在这一层，同时开着两种形态 = 这一层里的**两条会话**（按 `session_id` 区分），不是两个楼层 |
-| 2F | Cline（**CLI 与 VS Code 扩展合并成一层**） | 数据根 `~/.cline/data`（`$CLINE_DATA_DIR` → `$CLINE_DIR/data` → `~/.cline/data`，扩展与 CLI **共用同一份落盘**；VS Code 的 `globalStorage/saoudrizwan.claude-dev` 只是迁移前的旧布局，扩展自己标为 `LegacyStateReader`）。会话索引 = `db/sessions.db`（SQLite `sessions` 表：`session_id` / `source`（vscode / cli）/ `model` / `cwd` / `workspace_root` / `updated_at` / `metadata_json`）；对话 = `sessions/<id>/<id>.messages.json`（`{ messages: [{ role, content:[…], ts }] }`，content 项 ∈ `text | thinking | tool_use | tool_result`）、元数据 = `sessions/<id>/<id>.json`（标题 / token / 费用 / model）。Cline **自带 hook 子系统**（`preToolUse` / `postToolUse` / `userPromptSubmit` / `taskStart` / `taskResume` / `taskCancel` / `taskComplete` / `preCompact` / `notification`），但是 opt-in 且 WorkGremlin **暂未接入** → 2F 是**轮询楼层**（同 7F/8F）：相位由**消息尾巴**推导（assistant 尾巴 `tool_use`→调用工具、`thinking`→思考中、`text`→待命；user 尾巴 `tool_result`/提示词→思考中），相位一律 `inferred:true`。形态（CLI / 扩展）取会话行的 `source`，两者并存在这一层里的**两条会话**。子代理行（`is_subagent=1`）不单列。**改动文件恒为未知**：Cline 的对话只留工具调用、不留「改了哪些文件」（`read_files` / `search_codebase` 是读，不是编辑），所以台账的 `file_count` / `files_json` 一律落 `NULL`（绝不拿工具目标冒充改动）。**输出 = 该轮收尾那条 assistant 文字**（`attempt_completion` 的自述，markdown 原样保留、截 4000 字），任务详情「输出」栏与主控制台收尾都取它。形态取自会话行的 `source`，任务列表客户端因此显示 **Cline Plugin**（vscode）/ **Cline CLI**（cli）。自检见 `npm run test:cline` |
+| 2F | Cline（**CLI 与 VS Code 扩展合并成一层**） | 数据根 `~/.cline/data`（`$CLINE_DATA_DIR` → `$CLINE_DIR/data` → `~/.cline/data`，扩展与 CLI **共用同一份落盘**；VS Code 的 `globalStorage/saoudrizwan.claude-dev` 只是迁移前的旧布局，扩展自己标为 `LegacyStateReader`）。会话索引 = `db/sessions.db`（SQLite `sessions` 表：`session_id` / `source`（vscode / cli）/ `model` / `cwd` / `workspace_root` / `updated_at` / `metadata_json`）；对话 = `sessions/<id>/<id>.messages.json`（`{ messages: [{ role, content:[…], ts }] }`，content 项 ∈ `text | thinking | tool_use | tool_result`）、元数据 = `sessions/<id>/<id>.json`（标题 / token / 费用 / model）。Cline **自带 hook 子系统**（`preToolUse` / `postToolUse` / `userPromptSubmit` / `taskStart` / `taskResume` / `taskCancel` / `taskComplete` / `preCompact` / `notification`），但是 opt-in 且 WorkGremlin **暂未接入** → 2F 是**轮询楼层**（同 7F/8F）：相位由**消息尾巴**推导（assistant 尾巴 `tool_use`→调用工具、`thinking`→思考中、`text`→待命；user 尾巴 `tool_result`/提示词→思考中），相位一律 `inferred:true`。形态（CLI / 扩展）取会话行的 `source`，两者并存在这一层里的**两条会话**。子代理行（`is_subagent=1`）不单列。**改动文件恒为未知**：Cline 的对话只留工具调用、不留「改了哪些文件」（`read_files` / `search_codebase` 是读，不是编辑），所以台账的 `file_count` / `files_json` 一律落 `NULL`（绝不拿工具目标冒充改动）。**输出 = 该轮收尾那条 assistant 文字**（`attempt_completion` 的自述，markdown 原样保留、截 4000 字），任务详情「输出」栏与主控制台收尾都取它。形态取自会话行的 `source`，任务列表客户端因此显示 **Cline Plugin**（vscode）/ **Cline CLI**（cli）。**终态会话当场回收**：Cline 自己写了 `ended_at` / 终态 `status`（completed / cancelled / failed / error）就说明这场会话结束了，`floorCline.clineHandler` 立刻把它的会话行从下拉里撤掉，不再等 60 分钟窗口（改前：跑完或已删的会话仍显示 `active:true`）。任务台账不受影响（`syncTasks` 仍逐轮写），所以「任务取消」照旧在任务记录里看得到；7F/8F 的库里没有终态概念，维持时间窗口。自检见 `npm run test:cline`（[H] 段） |
 | 3F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
 | 4F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分；这一轮走的形态（终端 / VS Code 扩展）也落在同一条 `user` 记录上（`entrypoint`，见上页 ③） |
 | 5F | TraeCode（**IDE 与 Plugin 合并成一层**） | 会话来源是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值）：两个形态都没有可扫的**会话**落盘 —— IDE `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与 `project_memory.md` 是记忆文件（文件名带 session_id，但不是对话记录、也没有工程路径）；插件 `~/.marscode` 实测只有 ai-chat 二进制、日志与 `ai-agent/database.db` / `snapshot/<链 id>/v2/.git` 文件快照（前者是**加密数据、非可读 sqlite**，后者是逐轮改动的 git 快照）—— **所以插件这一形态目前不支持会话记录**。**两处落盘都在楼层胶囊的 tooltip 里逐路列出**（IDE / plugin 两行，**不带 `sources[].note`**，只列目录与落盘统计）。形态靠上报身份（`client`）区分，任务列表按 `CLIENT_LABELS` 显示 **TraeCode IDE** / **TraeCode Plugin**，不按楼层特判 |
@@ -183,6 +184,11 @@ Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm(
 `server/test/kiloFloor.test.js`（`npm run test:kilo`）。
 
 选中的会话决定主 Agent 控制台的相位（幽灵状态跟着走），办公室布局不受影响；切到没有活跃会话的楼层时整屋清空。
+
+**会话下拉**（`renderer/src/stores/sessions.js` + `server/src/sessionRegistry.js`）是**当前楼层的活跃会话**扁平列表，每条显示 `CLI-<工程名> <短 id>`。两条与会话列表有关的规矩：
+
+- **回收**:缺省是**60 分钟无事件剔除**;但**能表达终态的轮询楼层当场回收** —— 目前只有 2F Cline(它自己写 `ended_at` / 终态 `status`),见上表 2F 格。7F/8F 的库里没有终态概念,维持时间窗口。
+- **短 id 必须唯一**:短 id 是**这一层会话里最短的唯一前缀**(不是写死 8 位)。Cline 的 id 是 `<毫秒时间戳>_<随机>`,同一秒附近新建的两条会话前 8 位相同,早先下拉会渲染出两条一模一样的 `CLI-wg-cx 17923740`(用户会当成重复)。自检见 `npm run test:session-options`。
 
 ### 4.1 「任务取消」逐楼层来源（红色「任务取消」，不是绿色「任务完成」）
 
@@ -254,25 +260,27 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 | | 被监控的会话（§4） | 议事厅的参与者（本节） |
 | --- | --- | --- |
 | 谁起的进程 | 用户 / 编辑器插件 | **服务端**（`child_process.spawn`） |
-| 进不进会话注册表 | 进（`sessionRegistry`，出现在楼层与主控制台） | **不进**。只活在 `council_*` 五张表里 |
-| 有没有工具 | 有，照各 CLI 自己的配置 | **看模式**（见下）：隔离模式**没有**（`--tools ""` 或注入权限全 deny 的配置）；工程模式**只读**（`Read,Grep,Glob`） |
-| 工作目录 | 用户自己的工程目录 | **看模式**（见下）：隔离模式是 `/tmp` 下现建的**一次性目录**，一场一个、收尾即删；工程模式是用户填的那个绝对路径，**我们一行都不改它、收尾也不删** |
+| 进不进会话注册表 | 进（`sessionRegistry`，出现在楼层与主控制台） | **不进**。只活在 `council_*` 七张表里 |
+| 有没有工具 | 有，照各 CLI 自己的配置 | **一律只读**：1F/4F 给 `Read,Grep,Glob`；7F/8F 只放行 `read/glob/grep/list`；2F 用 `--plan`、3F 用 `--sandbox read-only`。写文件与联网一律没有 |
+| 工作目录 | 用户自己的工程目录 | **看 `workspace_path`**：NULL 时是 `/tmp` 下现建的**一次性目录**，一场一个、收尾即删；填了绝对路径时就是那个目录，**我们一行都不改它、收尾也不删** |
 | 会不会写台账 | 会（`task_runs` / `messages` / `file_activity`） | **不会**。办公室与任务记录页看不到任何痕迹 |
 | 相位 | 上报或轮询推导 | 无相位概念（它不是"在干活的 agent"，是"正在发言的与会者"） |
 
-**两个正交的开关（2026-10-02 加）**：`councils.mode`（`vote` 表决 / `analysis` 分析）×
-`councils.workspace_path`（NULL 隔离 / 绝对路径 工程），四种组合都成立。
-下面这张表是"两个开关各自打开时，上面那两行变成什么"：
+**唯一的开关：`councils.workspace_path`**（NULL 隔离 / 绝对路径 工程）。2026-10-02 曾与谈法
+`mode`（`vote` / `analysis`）正交存在，2026-10-19 的重构把 `mode`、计票、阈值与 `consensus.js`
+一起删掉了 —— 现在是固定的角色流程，两种工作目录下完全一样。
 
-| | 谈法：`vote`（缺省） | 谈法：`analysis` |
+| | 隔离（`workspace_path` 为 NULL，缺省） | 工程（填了绝对路径） |
 | --- | --- | --- |
-| **在哪儿谈：隔离**（缺省） | 首版的样子：临时目录 + 无工具，多轮表决 | 临时目录 + 无工具，各轮分析、跑满轮数出一份简报 |
-| **在哪儿谈：工程**（填了绝对路径） | 参与者**看着真实代码**对一个提案表决 —— 评估回归风险要的就是这个形态 | 看着真实代码分析一个做法（例如某个 bug fix 的思路），跑满轮数出简报 |
+| 工作目录 | `/tmp` 下现建的一次性目录，收尾即删 | 用户的工程目录，收尾不删、内容不动 |
+| 能看到什么 | 只有内联进提示词的议题与材料 | **真实代码**（只读工具可自行查阅） |
+| 流程 | 拆题 → 提案 → 评审 → 主持人汇总，跑满轮数后裁决 | **完全相同** |
 
-工程模式下 `cwd` 就是用户的工程，**工具只读到工程里**：1F/4F 给 `--tools Read,Grep,Glob`
-（同一份也给 `--allowedTools`，否则 `-p` 无人应答权限询问会直接拒掉；4F 另加
-`--permission-prompts none`）；7F/8F 沿用注入配置那一套，把全 deny 的权限表换成只放行
-`read/glob/grep/list`，`bash/edit/write/webfetch` 与 **`external_directory`** 照旧 deny
+工具在所有场合都只读：1F/4F 给 `--tools Read,Grep,Glob`（同一份也给 `--allowedTools`，否则 `-p`
+无人应答权限询问会直接拒掉；4F 另加 `--permission-prompts none`）；2F 用 `--plan`（Cline 自己的
+只读计划模式）；3F 用 `codex exec --sandbox read-only`（OS 沙箱）；6F 用无头 `-p`（需要确认的操作
+默认拒绝）；7F/8F 沿用注入配置那一套，把全 deny 的权限表换成只放行 `read/glob/grep/list`，
+`bash/edit/write/webfetch` 与 **`external_directory`** 照旧 deny
 （最后那条是命门：放行它等于让参与者顺着 `~` 读用户所有的东西）。
 
 这是仓库里第一次由服务端**长驻托管**子进程。现成的边界因此有三条硬约束，都写在
@@ -281,8 +289,10 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 1. **关工具不是可选项，是功能的前提。** 1F CodeBuddy / 4F Claude Code 用 `--tools ""`
    （两家 help 都写着 `Use "" to disable all tools`）；7F Kilo / 8F OpenCode **没有关工具的开关**
    （`kilo --pure` 只关外部插件，跟工具无关，名字容易骗人），只能注入一份 `permission` 全 deny 的
-   配置（`KILO_CONFIG_CONTENT` / `OPENCODE_CONFIG_CONTENT`）。自检第一条就钉这个：
-   `npm run test:council-agents`。
+   配置（`KILO_CONFIG_CONTENT` / `OPENCODE_CONFIG_CONTENT`）；2F Cline 用 `--plan`（它自己的只读
+   计划模式，写文件被拒 —— 但仍允许只读命令）；3F Codex 用 `--sandbox read-only`（OS 沙箱，写盘与
+   联网都被挡住，只读命令仍可跑）；6F Qoder 用无头 `-p`（需要确认的操作默认拒绝）。
+   自检第一条就钉这个：`npm run test:council-agents`。
 2. **环境变量是叠加不是替换。** 各 CLI 的登录凭据在 `~/.claude` / `~/.codebuddy` 这些目录里，
    靠 `HOME` 找 —— 挡掉 `HOME` 等于挡掉登录。隔离只靠 **cwd（一次性临时目录）+ 关工具**，
    不动 env（`agents.js` 的 `env` 里没有 `HOME`，且有一条测试专门钉这件事）。
@@ -293,24 +303,30 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
    这两道锁都建立在 **cwd 是那个一次性目录** 之上：参与者上报出来的工程名是临时目录，
    办公室按工程过滤就看不见它。工程模式下这套全失效 —— cwd 是你自己的工程，
    `~/.claude/settings.json` / `~/.codebuddy/settings.json` 里装着的上报 hook 会带着
-   **真实工程路径**上报，参与者当场变成"你工程里的一个成员"。所以四条配方一律注入
+   **真实工程路径**上报，参与者当场变成"你工程里的一个成员"。所以**所有**配方一律注入
    `WORKGREMLIN_DISABLE=1`，由**我们自己的代码**（`packages/reporter/src/hook.js` 的 `main()`
    开头、`packages/reporter/src/plugin/index.js` 的两个入口）认到就原地退出。
    放在自己的代码里而不是某家的配置里，是因为各 CLI 的配置优先级我们并不都握得住，
    而这两处是我们说关就能关的。自检：`npm run test:claude-hook`（hook 那条路）
    + `npm run test:council-quiet-plugin`（7F/8F 插件那两条入口）。
-5. **7F/8F 的会话落盘挡不住，只能给它打个标记**（2026-10-02 补，真机验过）。
-   `kilo run` / `opencode run` 没有 `--no-session-persistence` 这种开关，会话一律记进
-   **全局** SQLite，`session.directory` 记的是**当时的 cwd** —— 工程模式下它就是你工程的名字，
-   办公室按工程过滤，于是 7F/8F 上会多出一个"正在开工的会话"，而 requirement §15.2 写着
+5. **2F/6F/7F/8F 的会话落盘挡不住，只能给它打个标记**（2026-10-02 补 7F/8F，真机验过；
+   2026-10-19 补 2F/6F）。这几家没有 `--no-session-persistence` 这种开关，会话一律记进
+   **全局**落盘，`session.directory` / `cwd` 记的是**当时的 cwd** —— 工程模式下它就是你工程的名字，
+   办公室按工程过滤，于是楼层上会多出一个"正在开工的会话"，而 requirement §15.2 写着
    "那两页看不出任何痕迹"。数据目录也不能挪：实测 `XDG_DATA_HOME` 确实能把库挪走
    （kilo 的 `kilo.db` 会落到新目录下），但**登录态跟着一起没了**（挪完再跑，Kilo 回
-   401「You need to sign in」、OpenCode 直接挂住），参与者会连话都说不出来。
-   兜底办法是"照常落盘 + 打固定标题"：`--title '议事厅参与者（WorkGremlin）'`
-   （`DEFAULTS.COUNCIL_SESSION_TITLE`），`server/src/kilo.js` 与 `server/src/opencode.js`
-   在**列出会话时跳过这个标题**。自检：`npm run test:kilo` / `test:opencode` 各有一段
+   401「You need to sign in」、OpenCode 直接挂住；Cline 换 `--data-dir` 后直接 `Unauthorized`），
+   参与者会连话都说不出来。
+   兜底办法是"照常落盘 + 打标记"：
+   - 7F/8F：`--title '议事厅参与者（WorkGremlin）'`（`DEFAULTS.COUNCIL_SESSION_TITLE`），
+     `floorKilo.js` / `floorOpencode.js` 在**列出会话时跳过这个标题**；
+   - 2F Cline：它没有标题开关，把**提示词本身**存成标题 —— 所以议事厅提示词开头固定带
+     `DEFAULTS.COUNCIL_PROMPT_MARKER`，`floorCline.js` 按标题里的这个标记跳过；
+   - 6F Qoder：`--name` 打同一个标题；其 CLI transcript 是否也带这个名字**尚未真机验证**。
+   3F Codex 不需要标记：`--ephemeral` 根本不写会话。
+   自检：`npm run test:kilo` / `test:opencode` / `test:cline` 各有一段
    "同库同工程的用户会话照常列出、只有参与者那条被挡住"，另有
-   `test:council-agents` 钉住"配方发的标题 = 过滤的标题"（两头不一致 = 过滤白写）。
+   `test:council-agents` 钉住"配方发的标记 = 过滤的标记"（两头不一致 = 过滤白写）。
 
 **与实施计划的两处出入**（计划写在 `~/.claude/plans/`，不进仓库；此处留档以免后来者按计划找表）：
 
@@ -319,9 +335,45 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 - 计划里的字段名与落库的实际名字对不上：`councils.topic_text` → **`topic`**、`materials_json` →
   **`council_materials` 表**（材料要逐份记 `bytes_total` / `bytes_included`，塞一个 JSON 列里没法查）、
   `outcome` → **`verdict`**；参与者表的两列是 `floor_id` / `agent`（不是 `floor` / `client`）。
-  另多出三样计划没写的：`threshold`（判定口径，`unanimous` / `majority`）、
-  `round_current`（推进到第几轮）、`error`（整场级别的失败原因，单人的失败记在参与者/发言行上）。
+  另多出两样计划没写的：`round_current`（推进到第几轮）、`error`（整场级别的失败原因，
+  单人的失败记在参与者/发言行上）。原计划的 `threshold`（判定口径）随投票一起删除。
   以 `schema.sql` 为准。
+
+**2026-10-19 的实现形态（角色化流程）**：编排在 `orchestrator.js`，一次会依次跑
+`plan → (proposal → review → moderation) × max_rounds → adjudication → final`，**不因高分提前停**；
+但**任何必需回合返回 `failed` / `timeout`，或输出解析不出结构化结果时立即收场**（fail-fast）：
+不再跑后续轮次，已产出的轮次与报告照常归档，完成过一轮记 `partial`、一轮都没完成记 `failed`，
+`error` 写明轮次 / 阶段 / 楼层与 CLI 原文，`closeCouncil` 把仍在 `running` / `pending` 的参与者
+落成 `failed`。每一轮在 `council_rounds` 落一行 `RoundResult`（`proposal_text` /
+`diff_from_prev` / `moderator_json` / `stats_json`），每条意见在 `council_reviews` 落一行。
+模型输出由 `parse.js` 解析：只取**最后一个**围栏 JSON 块，缺字段的条目丢弃并计数，解析失败时
+正文照存（`status='unparsed'`），**绝不替它补一条意见**。收敛度由 `convergence.js` 从评审与冲突
+重算（权重来自 `shared`），模型自报的分数被忽略；同一模块还产出"硬指令是否可执行 / blocker 是否
+有对应指令 / 立场分裂是否登记冲突"等一致性 warnings。收尾由 `report.js` 组装报告并落盘
+（JSON + CSV + Markdown，原子写、不覆盖），文件清单写回 `council_reports.files_json`。旧议事厅
+表结构不做兼容：`db/index.js` 检测到旧的 `mode` / `threshold` / `vote` 列时，把整组表删掉重建。
+
+**「工作中」标识（2026-10-19）**：一次调用可能几分钟没有任何输出，页面原本发起后长时间空白。
+`markProgress(ctx, roundNo, phase, floors)` 在每个阶段开始时记下当前进度并随 WS 推送
+（`status='running'` + `roundNo` / `phase` / `floors` / `startedAt`）；详情接口通过
+`orchestrator.progressOf(id)` 返回同一份数据，所以刷新后标识还在。前端 store 的 `working` getter
+读它，`CouncilView` 顶部显示「正在工作中 · 楼层 · 阶段 · 第 N 轮」；`closeCouncil` 清空进度，
+终端事件一到标识立即消失。评审阶段会一次列出所有评审楼层。
+
+**每轮原始输出（2026-10-19）**：会议结束或 fail-fast 中止后，`roundResults` 只能描述
+**成功解析**的轮次，失败 / 超时 / 未解析的发言原本在界面上无处可看。`CouncilRawTurns.vue`
+按轮展示 `council_utterances` 原文（楼层、阶段、状态、耗时；失败时显示 `error` 原文），
+`CouncilView` 在 `cv-process` 的第 0 轮、每个已完成轮次末尾各挂一块；没有 `RoundResult`、
+但确有拆解 / 提案 / 评审 / 汇总发言的轮次作为「未完成」单独成块（`DEBATE_PHASES` 排除
+裁决 / 交付轮）。数据全部来自库里的发言行，不推断、不补写。
+
+**真机故障记录（2026-10-19，1F 第 0 轮）**：用户发起一场会后，1F CodeBuddy 在主持人拆题阶段
+（`plan`）失败，`council_utterances` 记 `status='failed'`、耗时 220s、`content=NULL`，错误是
+「输出解析不出内容」且尾部停在 `"reasoning"` 字段中间。CLI 退出码为 0 —— 即 **CLI 自己把
+transcript 截断后正常退出**：不是超时（上限 300s）、不是 64MB 溢出，重跑同一提示词与同一配方
+可以正常返回完整 `result` 事件。编排当时仍继续跑了第 1 轮，这正是本次加 fail-fast 的原因。
+`runner.js` 的解析失败错误现在同时带 stdout / stderr 字节数与退出码，便于下次判断
+「没输出」还是「写到一半被截断」。
 
 **真机烟测（2026-10-01，4 层里跑通了 1F / 4F / 8F，7F 未跑）** —— 这一步抓出两个单测全绿的真 bug，
 根因是同一个，值得记下来：
@@ -336,6 +388,20 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 - **教训（已写进 `agents.js` 与 `councilAgents.test.js` 的注释）**：两个 bug 单测都是全绿的，
   因为**单测是照着猜的线格式写的**——照着同一个猜测写测试等于没测。现在真机抓下来的原样输出
   已经钉进 `councilAgents.test.js`（两行 opencode 事件流、五条一组的 CodeBuddy 记录），别再改回猜的。
+
+**真机烟测（2026-10-19，新增 2F / 3F / 6F 配方）**：
+
+- **2F Cline 整条跑通**（CLI 4.1.25，免费 `cline` provider）：`cline --plan --json <prompt>` 真的读了
+  临时目录里的 marker 文件、正文与结构化评审块都解析出来、词元也归到了（20307 / 81 / cache 0 / 0）。
+  两个真机结论钉进了配方：① JSON 模式**不读 stdin**（只认位置参数 prompt）；② 它把**提示词本身**
+  存成会话标题 —— 这正是 `COUNCIL_PROMPT_MARKER` 那道锁的依据（跑完一场后 2F 会话清单里看不到参与者）。
+  也实测到 `--plan` 仍会跑**只读**命令（`whoami`），写文件则被拒 —— 这一点如实写进了 §15.3。
+- **3F Codex 只验到参数这一层**：把 `codex exec --json --sandbox read-only --ephemeral
+  --skip-git-repo-check --ignore-user-config -c web_search="disabled" -` 喂给真机 `codex`，
+  它认了这串参数并进入 `turn.started`，但模型那一步因**本机 Codex 登录态无效**（`plan type is
+  required`）没走完 —— 事件流形状（`item.completed` / `agent_message` / `turn.completed.usage` 的字段名）
+  按它打印出来的 JSONL 对齐。
+- **6F Qoder 未真机验证**：本机没装 Qoder CLI，配方按官方文档（`-p --output-format json --name`）写。
 
 另外两条如实记录的观察：
 

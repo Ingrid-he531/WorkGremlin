@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
-import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM } from '../lib/dayBoard';
+import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM, isBoardTask } from '../lib/dayBoard';
 import {
   TIME_RANGES,
   clampDay,
@@ -715,6 +715,8 @@ function exportCsv() {
  *   · Split by floor? No — the board is divided by floor by definition; the filter bar above still
  *     applies (project / floor / state / keyword all act on list), so filtering to one floor leaves
  *     only that row on the chart;
+ *   · States drawn: only running / done / cancelled —— failed and pending are dropped (isBoardTask in
+ *     lib/dayBoard.js, user request 2026-10-19), so red on the chart means one thing: cancelled;
  *   · Cross-day / no end time / start time only — these boundaries are all in lib/dayBoard.js (pure
  *     functions with regression tests).
  */
@@ -823,7 +825,9 @@ const boardBaseRows = computed(() => {
 });
 
 const boardGantt = computed(() =>
-  buildFloorGantt(list.value, boardDay.value, nowMs.value, rowOfTask, boardBaseRows.value)
+  // The board hides failed / pending rounds (isBoardTask, user request 2026-10-19): a timeline only
+  // keeps running / done / cancelled, everything else would just crowd the chart.
+  buildFloorGantt(list.value.filter(isBoardTask), boardDay.value, nowMs.value, rowOfTask, boardBaseRows.value)
 );
 const boardRows = computed(() => boardGantt.value.rows);
 /** The position of "now" on the x-axis (%); returns -1 when not viewing today (so the line isn't drawn) */
@@ -1370,9 +1374,7 @@ async function saveRetention() {
         <span class="legend">
           <i class="dot st-running" />{{ tr('records.board.legend_running') }}
           <i class="dot st-done" />{{ tr('records.board.legend_done') }}
-          <i class="dot st-failed" />{{ tr('records.board.legend_failed') }}
           <i class="dot st-cancelled" />{{ tr('records.board.legend_cancelled') }}
-          <i class="dot st-pending" />{{ tr('records.board.legend_pending') }}
         </span>
       </div>
 
@@ -1531,14 +1533,13 @@ async function saveRetention() {
   font-family: var(--mono);
 }
 .day-input:hover { border-color: var(--accent); }
-/* Legend: the swatches match the block / left-edge state colors (values come from the list view's .st-* set) */
+/* Legend: the swatches match the block / left-edge state colors. Only the three states the board
+   draws are listed —— failed / pending never reach the chart (isBoardTask), cancelled is the red one. */
 .legend { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); }
 .legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
 .legend .dot.st-running { background: var(--accent); }
 .legend .dot.st-done { background: #7ee787; }
-.legend .dot.st-failed { background: #ff7b72; }
-.legend .dot.st-cancelled { background: var(--state-offline, #4a5160); }
-.legend .dot.st-pending { background: var(--state-idle, #7f8c9b); }
+.legend .dot.st-cancelled { background: #ff7b72; }
 .board-scroll {
   flex: 1;
   min-height: 0;
@@ -1614,9 +1615,8 @@ async function saveRetention() {
 .block:hover { filter: brightness(1.18); }
 .block.st-running { background: var(--accent); }
 .block.st-done { background: #7ee787; }
-.block.st-failed { background: #ff7b72; }
-.block.st-cancelled { background: var(--state-offline, #4a5160); }
-.block.st-pending { background: var(--state-idle, #7f8c9b); }
+/* cancelled is the red one (failed / pending never reach the board, see BOARD_HIDDEN_STATES) */
+.block.st-cancelled { background: #ff7b72; }
 /**
  * The span where tasks run in parallel: lay down a dark layer (not another row). Capped at 0.6 so it
  * doesn't smear into a black blob. It doesn't take mouse events — hover still lands on the task block
@@ -1700,11 +1700,12 @@ async function saveRetention() {
 .report-table td.td-task { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Session column: same width limit + ellipsis as the task column, so it doesn't squeeze out client / model on the right */
 .report-table td.td-session { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* State colors: `.report-table td`'s color is more specific than .st-*, so without writing these the states would all be white */
+/* State colors: `.report-table td`'s color is more specific than .st-*, so without writing these the states would all be white.
+   Same palette as the list / board: red means cancelled, failed is amber (user request 2026-10-19). */
 .report-table td.st-running { color: var(--accent); }
 .report-table td.st-done { color: #7ee787; }
-.report-table td.st-failed { color: #ff7b72; }
-.report-table td.st-cancelled { color: var(--text-faint); }
+.report-table td.st-failed { color: var(--state-busy, #f5a623); }
+.report-table td.st-cancelled { color: #ff7b72; }
 .report-table td.st-pending { color: var(--text-dim); }
 .report-row { cursor: pointer; transition: background 0.12s; }
 .report-row:hover { background: var(--bg-elevated); }
@@ -1799,8 +1800,9 @@ async function saveRetention() {
 .st { padding: 0 6px; border-radius: 999px; border: 1px solid var(--border); }
 .st-running { color: var(--accent); border-color: var(--accent); }
 .st-done { color: #7ee787; border-color: #7ee787; }
-.st-failed { color: #ff7b72; border-color: #ff7b72; }
-.st-cancelled { color: var(--text-faint); }
+/* red = cancelled, failed is amber (same rule as the board / summary, user request 2026-10-19) */
+.st-failed { color: var(--state-busy, #f5a623); border-color: var(--state-busy, #f5a623); }
+.st-cancelled { color: #ff7b72; }
 .st-pending { color: var(--text-dim); }
 .empty-hint { padding: 20px; text-align: center; color: var(--text-dim); }
 

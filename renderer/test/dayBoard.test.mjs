@@ -10,7 +10,7 @@
  *
  * 跑法：`npm run test:day-board`
  */
-const { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM, spanOf } = await import(
+const { HOUR_COLS, MIN_PER_DAY, BOARD_HIDDEN_STATES, buildFloorGantt, dayStartOf, fmtHM, isBoardTask, spanOf } = await import(
   '../src/lib/dayBoard.js'
 );
 
@@ -186,6 +186,17 @@ console.log('\n[8] 刻度文案');
 ok('0 → 00:00', fmtHM(0) === '00:00');
 ok('570 → 09:30', fmtHM(570) === '09:30');
 ok('1440 → 24:00', fmtHM(1440) === '24:00');
+
+console.log('\n[9] 看板只画 运行中 / 完成 / 已取消（失败、待命不画 —— 用户 2026-10-19 要求）');
+{
+  ok('运行中 / 完成 / 已取消 都进看板', ['running', 'done', 'cancelled'].every((s) => isBoardTask({ state: s })));
+  ok(
+    '失败 / 待命 不进看板',
+    BOARD_HIDDEN_STATES.join(',') === 'failed,pending' && !isBoardTask({ state: 'failed' }) && !isBoardTask({ state: 'pending' })
+  );
+  ok('没有 state 的按待命算（也不画）', !isBoardTask({}) && !isBoardTask({ state: null }));
+  ok('认不出的状态照画（当灰块兜底，不悄悄吞掉）', isBoardTask({ state: 'weird' }));
+}
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -81,15 +81,10 @@ function migrate(db) {
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
-  // Council room: expanding from "voting only" to "vote / analysis × temp directory / project directory".
-  // After an old DB gets the columns, behavior is **verbatim identical** to before the change:
-  // mode='vote', workspace_path=NULL (= server-created temp directory; participants are read-only).
-  ensureColumn(db, 'councils', 'mode', "mode TEXT NOT NULL DEFAULT 'vote'");
-  ensureColumn(db, 'councils', 'workspace_path', 'workspace_path TEXT');
-  ensureColumn(db, 'council_utterances', 'stance', 'stance TEXT');
-  ensureColumn(db, 'council_utterances', 'findings_json', 'findings_json TEXT');
+  // Council room: the old vote/analysis schema is intentionally not migrated (the refactor shipped before
+  // any real council data existed). resetLegacyCouncilSchema already dropped and recreated those tables
+  // before schema.sql ran, so nothing needs adding here.
   normalizeThinkingState(db);
-  ensureCouncilVerdictReported(db);
   // Backfill: products once missing from CLIENT_BASES have their main agent member's client written as
   // NULL, and an empty client is treated on the frontend as "generic, show it on every floor" —— so
   // that product's members drift into every floor (measured: the qoder main agent row drifted into
@@ -119,63 +114,40 @@ function normalizeThinkingState(db) {
 }
 
 /**
- * An old DB's councils.verdict carries the old CHECK (no analysis mode's 'reported'),
- * and CREATE TABLE IF NOT EXISTS does not change an existing table's constraints.
+ * Council schema epoch break.
  *
- * Unlike the agent_status case, the council room's **history must not be lost** (those are meetings
- * the user actually held), so rows are carried over as-is rather than rebuilding an empty table. Two
- * preconditions make that safe, and both hold:
- *   · These council tables **deliberately have no foreign keys** in schema.sql (reconciliation relies
- *     on deleteCouncil's manual cascade), so RENAME drags no other table with it;
- *   · councils is only **referenced by** child tables like council_rounds / council_utterances (also
- *     without foreign keys), so rows of the child tables stay keyed by council_id during the rebuild
- *     and are still queryable once the same-named table reappears.
+ * The council feature was rewritten from a vote/analysis model to a moderator/main/reviewer loop before
+ * any council data existed in the wild, so old rows are **not migrated**. `CREATE TABLE IF NOT EXISTS`
+ * does not alter existing tables, which means the old `mode` / `threshold` / `vote` columns would silently
+ * survive and every query would fail against the new shape. This drops the whole council group so
+ * schema.sql can recreate it.
  *
- * Note the CREATE must spell out **every column of the current schema** (including the mode /
- * workspace_path just added by ensureColumn) and that idx_councils_created —— missing one column means
- * one migration silently deletes a newly added column.
+ * It must run **before** `db.exec(schema.sql)`, otherwise the old tables win.
+ *
  * @param {import('better-sqlite3').Database} db
+ * @returns {boolean} true when an old council schema was found and dropped
  */
-function ensureCouncilVerdictReported(db) {
-  let sql = '';
-  try {
-    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='councils'").get();
-    sql = (row && row.sql) || '';
-  } catch {
-    return;
+function resetLegacyCouncilSchema(db) {
+  if (!tableExists(db, 'councils')) return false;
+  const isLegacy =
+    hasColumn(db, 'councils', 'mode') ||
+    hasColumn(db, 'councils', 'threshold') ||
+    hasColumn(db, 'council_utterances', 'vote');
+  if (!isLegacy) return false;
+
+  // Children first, even though these tables deliberately carry no foreign keys.
+  for (const table of [
+    'council_reviews',
+    'council_reports',
+    'council_utterances',
+    'council_rounds',
+    'council_materials',
+    'council_participants',
+    'councils',
+  ]) {
+    db.exec(`DROP TABLE IF EXISTS ${table}`);
   }
-  if (!sql || /reported/.test(sql)) return; // already the new constraint, or the table does not exist
-  db.exec(`
-    ALTER TABLE councils RENAME TO _councils_old;
-    CREATE TABLE councils (
-      id            TEXT PRIMARY KEY,
-      topic         TEXT NOT NULL,
-      mode          TEXT NOT NULL DEFAULT 'vote'
-                    CHECK (mode IN ('vote','analysis')),
-      workspace_path TEXT,
-      status        TEXT NOT NULL DEFAULT 'draft'
-                    CHECK (status IN ('draft','running','done','failed','cancelled')),
-      threshold     TEXT NOT NULL DEFAULT 'unanimous'
-                    CHECK (threshold IN ('unanimous','majority')),
-      max_rounds    INTEGER NOT NULL,
-      round_current INTEGER NOT NULL DEFAULT 0,
-      verdict       TEXT
-                    CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','reported','cancelled','failed')),
-      verdict_round INTEGER,
-      error         TEXT,
-      created_at    INTEGER NOT NULL,
-      started_at    INTEGER,
-      ended_at      INTEGER
-    );
-    INSERT INTO councils
-      (id, topic, mode, workspace_path, status, threshold, max_rounds, round_current,
-       verdict, verdict_round, error, created_at, started_at, ended_at)
-    SELECT id, topic, mode, workspace_path, status, threshold, max_rounds, round_current,
-           verdict, verdict_round, error, created_at, started_at, ended_at
-    FROM _councils_old;
-    DROP TABLE _councils_old;
-    CREATE INDEX IF NOT EXISTS idx_councils_created ON councils(created_at DESC);
-  `);
+  return true;
 }
 
 /** Old tables carrying team_id (the schema version from before project was renamed from project) */
@@ -387,6 +359,11 @@ function openDatabase(dbPath) {
     log.warn(
       `[workgremlin] 检测到 team 时代的老库，已迁移到 project 时代${backup ? `（备份：${backup}）` : ''}`
     );
+  }
+
+  const droppedCouncil = resetLegacyCouncilSchema(db);
+  if (droppedCouncil) {
+    log.warn('[workgremlin] 检测到旧版议事厅表结构，已按新的评审流程重建（旧数据不再兼容）');
   }
 
   applyPragmas(db);
@@ -1124,28 +1101,28 @@ function createRepo(db) {
    * isolation requirement lands: council data cannot leave the council page.
    *
    * The write order is the orchestrator's (see server/src/council/orchestrator.js):
-   *   create → record attendance / materials → upsertRound per round → insertUtterance per participant
-   *   → finishCouncil at wrap-up.
-   * Everything here is a thin flat wrapper with no business judgment (vote judging is in
-   * council/consensus.js, running processes is in council/runner.js).
+   *   create → record attendance / materials → plan round → per debate round: proposal utterance,
+   *   review utterances + review rows, moderation utterance + round row → final phase utterances →
+   *   report → finishCouncil.
+   * Everything here is a thin flat wrapper with no business judgment (the convergence score is computed
+   * in council/convergence.js; process handling is in council/agents.js).
    */
   const councilStmt = {
     insert: db.prepare(`
-      INSERT INTO councils (id, topic, mode, workspace_path, status, threshold, max_rounds, created_at)
-      VALUES (@id, @topic, @mode, @workspacePath, 'draft', @threshold, @maxRounds, @createdAt)
+      INSERT INTO councils (id, topic, workspace_path, status, max_rounds, created_at)
+      VALUES (@id, @topic, @workspacePath, 'draft', @maxRounds, @createdAt)
     `),
     get: db.prepare(`SELECT * FROM councils WHERE id = ?`),
-    /** History list: newest first by start time. Attendance is not included; the list page fetches it separately if needed */
+    /** History list: newest first by creation time. Attendance is not included; the detail view fetches it */
     list: db.prepare(`SELECT * FROM councils ORDER BY created_at DESC LIMIT ?`),
     markRunning: db.prepare(`UPDATE councils SET status = 'running', started_at = ? WHERE id = ? AND status = 'draft'`),
-    setRound: db.prepare(`UPDATE councils SET round_current = ? WHERE id = ?`),
+    setRound: db.prepare(`UPDATE councils SET round_current = @roundNo WHERE id = @id`),
     finish: db.prepare(`
       UPDATE councils
-         SET status = @status, verdict = @verdict, verdict_round = @verdictRound,
-             error = @error, ended_at = @endedAt
+         SET status = @status, verdict = @verdict, error = @error, ended_at = @endedAt
        WHERE id = @id
     `),
-    /** Startup reconciliation: `running` rows left behind when the last process was hard-killed —— mark them failed honestly, do not pretend they are still running */
+    /** Startup reconciliation: `running` rows left behind by a hard-killed process are marked failed */
     failStaleRunning: db.prepare(`
       UPDATE councils SET status = 'failed', verdict = 'failed', error = @error, ended_at = @at
        WHERE status = 'running'
@@ -1153,14 +1130,18 @@ function createRepo(db) {
     del: db.prepare(`DELETE FROM councils WHERE id = ?`),
 
     insertParticipant: db.prepare(`
-      INSERT INTO council_participants (council_id, floor_id, agent, cli_path, status)
-      VALUES (@councilId, @floorId, @agent, @cliPath, 'pending')
+      INSERT INTO council_participants (council_id, floor_id, role, agent, cli_path, status)
+      VALUES (@councilId, @floorId, @role, @agent, @cliPath, 'pending')
     `),
     setParticipantStatus: db.prepare(`
       UPDATE council_participants SET status = @status, error = @error
        WHERE council_id = @councilId AND floor_id = @floorId
     `),
-    listParticipants: db.prepare(`SELECT * FROM council_participants WHERE council_id = ? ORDER BY floor_id`),
+    listParticipants: db.prepare(`
+      SELECT * FROM council_participants
+       WHERE council_id = ?
+       ORDER BY CASE role WHEN 'moderator' THEN 0 WHEN 'main' THEN 1 ELSE 2 END, floor_id
+    `),
 
     insertMaterial: db.prepare(`
       INSERT INTO council_materials (council_id, ord, path, bytes_total, bytes_included, truncated, content)
@@ -1170,35 +1151,71 @@ function createRepo(db) {
 
     upsertRound: db.prepare(`
       INSERT INTO council_rounds
-        (council_id, round_no, kind, proposal_text, proposal_from, agree, disagree, abstain, invalid, consensus, started_at, ended_at)
+        (council_id, round_no, kind, version, proposal_text, diff_from_prev, proposal_from,
+         moderator_json, stats_json, started_at, ended_at)
       VALUES
-        (@councilId, @roundNo, @kind, @proposalText, @proposalFrom, @agree, @disagree, @abstain, @invalid, @consensus, @startedAt, @endedAt)
+        (@councilId, @roundNo, @kind, @version, @proposalText, @diffFromPrev, @proposalFrom,
+         @moderatorJson, @statsJson, @startedAt, @endedAt)
       ON CONFLICT(council_id, round_no) DO UPDATE SET
-        proposal_text = excluded.proposal_text, proposal_from = excluded.proposal_from,
-        agree = excluded.agree, disagree = excluded.disagree, abstain = excluded.abstain,
-        invalid = excluded.invalid, consensus = excluded.consensus,
+        kind = excluded.kind,
+        version = excluded.version,
+        proposal_text = excluded.proposal_text,
+        diff_from_prev = excluded.diff_from_prev,
+        proposal_from = excluded.proposal_from,
+        moderator_json = excluded.moderator_json,
+        stats_json = excluded.stats_json,
         started_at = COALESCE(council_rounds.started_at, excluded.started_at),
         ended_at = excluded.ended_at
     `),
     listRounds: db.prepare(`SELECT * FROM council_rounds WHERE council_id = ? ORDER BY round_no`),
 
+    /** Re-running a round (or a retry) must not leave duplicate review rows behind. */
+    delReviewsFromRound: db.prepare(`DELETE FROM council_reviews WHERE council_id = ? AND round_no = ?`),
+    insertReview: db.prepare(`
+      INSERT INTO council_reviews
+        (council_id, round_no, reviewer, severity, dimension, issue, evidence, suggestion, stance, ord, created_at)
+      VALUES
+        (@councilId, @roundNo, @reviewer, @severity, @dimension, @issue, @evidence, @suggestion, @stance, @ord, @createdAt)
+    `),
+    listReviews: db.prepare(`
+      SELECT * FROM council_reviews WHERE council_id = ? ORDER BY round_no, reviewer, ord, id
+    `),
+
     insertUtterance: db.prepare(`
       INSERT INTO council_utterances
-        (council_id, round_no, floor_id, role, content, vote, vote_reason, proposal_text, second_floor,
-         stance, findings_json,
-         status, error, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-         started_at, ended_at, duration_ms)
+        (council_id, round_no, floor_id, phase, content, model, status, error,
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+         parse_dropped, started_at, ended_at, duration_ms)
       VALUES
-        (@councilId, @roundNo, @floorId, @role, @content, @vote, @voteReason, @proposalText, @secondFloor,
-         @stance, @findingsJson,
-         @status, @error, @inputTokens, @outputTokens, @cacheReadTokens, @cacheWriteTokens,
-         @startedAt, @endedAt, @durationMs)
+        (@councilId, @roundNo, @floorId, @phase, @content, @model, @status, @error,
+         @inputTokens, @outputTokens, @cacheReadTokens, @cacheWriteTokens,
+         @parseDropped, @startedAt, @endedAt, @durationMs)
     `),
-    listUtterances: db.prepare(`SELECT * FROM council_utterances WHERE council_id = ? ORDER BY round_no, floor_id`),
+    listUtterances: db.prepare(`SELECT * FROM council_utterances WHERE council_id = ? ORDER BY round_no, id`),
+
+    upsertReport: db.prepare(`
+      INSERT INTO council_reports
+        (council_id, adjudication_json, adjudication_text, final_draft_text, change_notes,
+         report_json, files_json, created_at)
+      VALUES
+        (@councilId, @adjudicationJson, @adjudicationText, @finalDraftText, @changeNotes,
+         @reportJson, @filesJson, @createdAt)
+      ON CONFLICT(council_id) DO UPDATE SET
+        adjudication_json = excluded.adjudication_json,
+        adjudication_text = excluded.adjudication_text,
+        final_draft_text = excluded.final_draft_text,
+        change_notes = excluded.change_notes,
+        report_json = excluded.report_json,
+        files_json = excluded.files_json,
+        created_at = excluded.created_at
+    `),
+    getReport: db.prepare(`SELECT * FROM council_reports WHERE council_id = ?`),
   };
 
-  /** Cascade delete of those child tables (no foreign keys in schema.sql, so the delete order is visible right here) */
+  /** Cascade delete of child tables (no foreign keys in schema.sql, so the delete order is visible here) */
   const councilChildDeletes = [
+    'DELETE FROM council_reviews WHERE council_id = ?',
+    'DELETE FROM council_reports WHERE council_id = ?',
     'DELETE FROM council_utterances WHERE council_id = ?',
     'DELETE FROM council_rounds WHERE council_id = ?',
     'DELETE FROM council_materials WHERE council_id = ?',
@@ -1206,19 +1223,15 @@ function createRepo(db) {
   ].map((sql) => db.prepare(sql));
 
   /**
-   * @param {{id:string, topic:string, threshold:string, maxRounds:number, createdAt:number,
-   *          mode?:string, workspacePath?:string|null}} arg
-   *   mode / workspacePath defaulting is the old behavior: voting + a one-off temp directory. The caller
-   *   (the route) already validated both; this only falls back to the defaults, it makes no value
-   *   judgment —— that is the route's job.
+   * @param {{id:string, topic:string, maxRounds:number, createdAt:number,
+   *          workspacePath?:string|null}} arg
+   *   The caller (the route) validated the input; this only normalizes an empty workspace to NULL.
    */
   function createCouncil(arg) {
     councilStmt.insert.run({
       id: arg.id,
       topic: arg.topic,
-      mode: arg.mode != null && arg.mode !== '' ? arg.mode : 'vote',
       workspacePath: arg.workspacePath != null && arg.workspacePath !== '' ? arg.workspacePath : null,
-      threshold: arg.threshold,
       maxRounds: arg.maxRounds,
       createdAt: arg.createdAt,
     });
@@ -1229,19 +1242,17 @@ function createRepo(db) {
   const listCouncils = (limit) => councilStmt.list.all(Math.max(1, Math.min(Number(limit) || 50, 500)));
   /** Put a meeting into running; one already running (or finished) is left alone, returns whether it really flipped */
   const markCouncilRunning = (id, at) => councilStmt.markRunning.run(at, id).changes > 0;
-  const setCouncilRound = (id, roundNo) => councilStmt.setRound.run(roundNo, id);
-  /** @param {{verdict:string, verdictRound?:number|null, error?:string|null, status?:string}} arg */
+  const setCouncilRound = (id, roundNo) => councilStmt.setRound.run({ id, roundNo });
+  /**
+   * @param {{verdict:'completed'|'partial'|'cancelled'|'failed', error?:string|null, status?:string, endedAt?:number}} arg
+   *   completed / partial are normal endings (the meeting ran, maybe with a failed final turn); only
+   *   cancelled and failed are abnormal.
+   */
   function finishCouncil(id, arg) {
     const verdict = arg.verdict;
-    // verdict → status mapping (each of the three endings goes its own way, do not mix "cancelled" into
-    // "failed"):
-    //   consensus / no_consensus / reported → done (**failing to agree, and analysis mode's "ran
-    //                                          through", are both normal endings**, not errors)
-    //   cancelled                          → cancelled
-    //   anything else (failed)             → failed
     const status =
       arg.status ||
-      (verdict === 'consensus' || verdict === 'no_consensus' || verdict === 'reported'
+      (verdict === 'completed' || verdict === 'partial'
         ? 'done'
         : verdict === 'cancelled'
           ? 'cancelled'
@@ -1250,13 +1261,12 @@ function createRepo(db) {
       id,
       status,
       verdict,
-      verdictRound: arg.verdictRound != null ? arg.verdictRound : null,
       error: arg.error != null ? arg.error : null,
       endedAt: arg.endedAt != null ? arg.endedAt : Date.now(),
     });
     return councilStmt.get.get(id);
   }
-  /** Delete a meeting: its own child tables go with it. **Returns whether anything was deleted**, the route distinguishes 404 from 200 on that */
+  /** Delete a meeting: its child tables go with it. Returns whether anything was deleted */
   function deleteCouncil(id) {
     const del = db.transaction((cid) => {
       for (const st of councilChildDeletes) st.run(cid);
@@ -1267,9 +1277,8 @@ function createRepo(db) {
     return n > 0;
   }
   /**
-   * Reconciliation at server start: when the last process was hard-killed (or crashed), the DB keeps
-   * meetings with status='running' whose participant processes are long gone. **Mark them failed
-   * honestly** and state the reason —— do not leave them there pretending they are still discussing.
+   * Reconciliation at server start: a hard-killed process leaves status='running' rows whose child
+   * processes are gone. Mark them failed honestly instead of pretending the meeting is still live.
    * @returns {number} how many rows were marked
    */
   function failStaleCouncils(reason, at) {
@@ -1287,35 +1296,81 @@ function createRepo(db) {
   const upsertRound = (r) => councilStmt.upsertRound.run(r);
   const listRounds = (councilId) => councilStmt.listRounds.all(councilId);
 
-  /** One speech / one vote. Any field that cannot be read is given null, never 0 or an empty string (0 tokens and "tokens could not be read" are not the same thing) */
+  const delReviewsFromRound = (councilId, roundNo) =>
+    councilStmt.delReviewsFromRound.run(councilId, roundNo).changes;
+
+  /**
+   * Insert every ReviewPoint of one reviewer for one round, then return how many landed. Missing fields
+   * are normalized to NULL by the caller; this layer never invents values.
+   * @param {string} councilId
+   * @param {number} roundNo
+   * @param {Array<{reviewer:string,severity:string,dimension:string,issue:string,evidence?:string,
+   *                suggestion:string,stance:string}>} reviews
+   * @param {number} createdAt
+   */
+  const insertReviews = db.transaction((councilId, roundNo, reviews, createdAt) => {
+    for (let i = 0; i < reviews.length; i += 1) {
+      const r = reviews[i];
+      councilStmt.insertReview.run({
+        councilId,
+        roundNo,
+        reviewer: r.reviewer,
+        severity: r.severity,
+        dimension: r.dimension,
+        issue: r.issue,
+        evidence: r.evidence != null ? r.evidence : null,
+        suggestion: r.suggestion,
+        stance: r.stance,
+        ord: i,
+        createdAt,
+      });
+    }
+    return reviews.length;
+  });
+  const listReviews = (councilId) => councilStmt.listReviews.all(councilId);
+
+  /** One spoken turn. Anything unreadable is NULL, never 0 or an empty string (0 tokens != unreadable) */
   function insertUtterance(u) {
-    councilStmt.insertUtterance.run({
+    return councilStmt.insertUtterance.run({
       councilId: u.councilId,
       roundNo: u.roundNo,
       floorId: u.floorId,
-      role: u.role || 'speaker',
+      phase: u.phase,
       content: u.content != null ? u.content : null,
-      vote: u.vote != null ? u.vote : null,
-      voteReason: u.voteReason != null ? u.voteReason : null,
-      proposalText: u.proposalText != null ? u.proposalText : null,
-      secondFloor: u.secondFloor != null ? u.secondFloor : null,
-      // Those two analysis-mode columns: **nothing parsed means null**, not '{}' —— "gave no points" and
-      // "gave points but all three are empty" display differently (see the notes on findings_json in
-      // schema.sql)
-      stance: u.stance != null ? u.stance : null,
-      findingsJson: u.findingsJson != null ? u.findingsJson : null,
+      model: u.model != null ? u.model : null,
       status: u.status || 'ok',
       error: u.error != null ? u.error : null,
       inputTokens: u.inputTokens != null ? u.inputTokens : null,
       outputTokens: u.outputTokens != null ? u.outputTokens : null,
       cacheReadTokens: u.cacheReadTokens != null ? u.cacheReadTokens : null,
       cacheWriteTokens: u.cacheWriteTokens != null ? u.cacheWriteTokens : null,
+      parseDropped: u.parseDropped != null ? u.parseDropped : 0,
       startedAt: u.startedAt != null ? u.startedAt : null,
       endedAt: u.endedAt != null ? u.endedAt : null,
       durationMs: u.durationMs != null ? u.durationMs : null,
     });
   }
   const listUtterances = (councilId) => councilStmt.listUtterances.all(councilId);
+
+  /**
+   * @param {{councilId:string, adjudicationJson?:string|null, adjudicationText?:string|null,
+   *          finalDraftText?:string|null, changeNotes?:string|null, reportJson?:string|null,
+   *          filesJson?:string|null, createdAt?:number}} r
+   */
+  function insertReport(r) {
+    councilStmt.upsertReport.run({
+      councilId: r.councilId,
+      adjudicationJson: r.adjudicationJson != null ? r.adjudicationJson : null,
+      adjudicationText: r.adjudicationText != null ? r.adjudicationText : null,
+      finalDraftText: r.finalDraftText != null ? r.finalDraftText : null,
+      changeNotes: r.changeNotes != null ? r.changeNotes : null,
+      reportJson: r.reportJson != null ? r.reportJson : null,
+      filesJson: r.filesJson != null ? r.filesJson : null,
+      createdAt: r.createdAt != null ? r.createdAt : Date.now(),
+    });
+    return councilStmt.getReport.get(r.councilId);
+  }
+  const getReport = (councilId) => councilStmt.getReport.get(councilId) || null;
 
   return {
     ...stmt,
@@ -1326,7 +1381,9 @@ function createRepo(db) {
     insertParticipant, setParticipantStatus, listParticipants,
     insertMaterial, listMaterials,
     upsertRound, listRounds,
+    delReviewsFromRound, insertReviews, listReviews,
     insertUtterance, listUtterances,
+    insertReport, getReport,
     raw: db,
   };
 }

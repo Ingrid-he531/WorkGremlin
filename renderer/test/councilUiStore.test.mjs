@@ -1,17 +1,18 @@
 /**
- * 议事厅 store 的自检 —— 两条数据来源合到一起之后，界面上看到的到底是哪一份。
+ * Council store self-check — with two data sources merged, which one does the UI actually show?
  *
- * 为什么值得单独钉：这个 store 同时吃 **HTTP 详情**（一份快照）和 **WS 增量**（一条条推）。
- * 出错的形态都很隐蔽，而且只在某一条路径上出现：
- *   · 增量把已有正文抹掉 → "刷新一下，正文就没了"；
- *   · 断线重连后 WS 那份没了，横幅还挂着上一轮的提案 → "明明进了第 3 轮，桌上还写着第 2 轮"；
- *   · 收尾事件只带一个摘要（verdict / status），**结论文本和停在第几轮只有库里有** ——
- *     不回拉详情的话，页面会停在一个没有结论的"已结束"上；
- *   · 删除撞上 409（会还在跑）被当成成功 → 从列表里消失、其实还在。
+ * Worth pinning because this store consumes both an **HTTP detail snapshot** and **WS increments**.
+ * The failure modes are subtle and appear on only one path:
+ *   · an increment wipes existing content → "the proposal disappeared after a refresh";
+ *   · after a reconnect the WS copy is gone and the banner still shows the previous round;
+ *   · the terminal event carries only a summary (verdict / status) — the report lives in the DB, so
+ *     not re-pulling the detail leaves the page "finished" with no conclusion;
+ *   · a delete that hits 409 (still running) is treated as success → it vanishes from the list but
+ *     still exists.
  *
- * fetch 整个换成假的：这里要验的是"拿到响应之后怎么处理"，不是网络本身。
+ * `fetch` is fully faked: this tests "what happens with the response", not the network.
  *
- * 跑法：`npm run test:council-ui-store`
+ * Run: `npm run test:council-ui-store`
  */
 import { createServer } from 'vite';
 import { createPinia, setActivePinia } from 'pinia';
@@ -39,7 +40,7 @@ const server = await createServer({
 const { useCouncilStore } = await server.ssrLoadModule('/src/stores/council.js');
 const { useProjectStore } = await server.ssrLoadModule('/src/stores/project.js');
 
-/* ------------------------------------------------------------------ 假服务端 */
+/* ------------------------------------------------------------------ fake server */
 
 const calls = [];
 let routes = {};
@@ -47,8 +48,6 @@ const json = (body, status = 200) => ({ status, ok: status < 400, json: async ()
 
 globalThis.fetch = async (url, opts) => {
   const path = String(url).replace(/^https?:\/\/[^/]+/, '');
-  // body 也记下来：发起那一段要断言的是"发出去的到底是什么"（mode / workspacePath 有没有带、
-  // 空路径有没有被硬塞成一个 key）
   let body = null;
   try {
     body = opts && opts.body ? JSON.parse(opts.body) : null;
@@ -61,7 +60,7 @@ globalThis.fetch = async (url, opts) => {
   return routes[hit]();
 };
 
-/** 每个用例都从干净的 pinia + 干净的路由表开始 */
+/** Each case starts from a clean pinia + clean route table */
 function fresh() {
   setActivePinia(createPinia());
   const project = useProjectStore();
@@ -72,122 +71,201 @@ function fresh() {
   return council;
 }
 
-/** 一场两层的会，第 1 轮还没结束 */
+/** One three-seat meeting, round 1 complete and archived. */
 const DETAIL = {
   ok: true,
-  council: { id: 'c1', topic: '议题', status: 'running', verdict: null, max_rounds: 3 },
-  participants: [{ floor_id: '1F', status: 'ok', error: null }],
-  materials: [{ ord: 0, path: '/tmp/a.md', bytes_total: 10, bytes_included: 10, truncated: 0 }],
+  council: { id: 'c1', topic: '议题', status: 'running', verdict: null, max_rounds: 3, workspace_path: null },
+  participants: [
+    { floor_id: '4F', role: 'moderator', agent: 'claude', status: 'ok', error: null },
+    { floor_id: '1F', role: 'main', agent: 'codebuddy', status: 'ok', error: null },
+    { floor_id: '7F', role: 'reviewer', agent: 'kilo', status: 'ok', error: null },
+  ],
+  materials: [{ ord: 0, path: '/tmp/a.md', bytes_total: 10, bytes_included: 10, truncated: 0, content: '材料' }],
   rounds: [
-    { round_no: 0, kind: 'brief', proposal_text: '议题', proposal_from: 'chair' },
-    { round_no: 1, kind: 'debate', proposal_text: '初版', proposal_from: 'chair' },
+    { round_no: 0, kind: 'plan', proposal_from: '4F', moderator_json: '{"parsed":true,"breakdown":["拆解 A"]}' },
+    { round_no: 1, kind: 'debate', version: 'v1', proposal_text: '初版', proposal_from: '1F', moderator_json: '{"consensus":["一致"],"openIssues":[],"conflicts":[],"revisionDirectives":["改"],"convergenceScore":57}', stats_json: '{"score":57,"bySeverity":{"blocker":1,"major":0,"minor":0,"nit":0},"conflicts":0}' },
+  ],
+  reviews: [{ round_no: 1, reviewer: '7F', severity: 'blocker', dimension: '安全', issue: '缺鉴权', suggestion: '加中间件', stance: 'reject' }],
+  roundResults: [
+    {
+      round: 1,
+      proposal: { version: 'v1', content: '初版', diffFromPrev: null },
+      reviews: [{ reviewer: '7F', severity: 'blocker', dimension: '安全', issue: '缺鉴权', suggestion: '加中间件', stance: 'reject' }],
+      moderator: { consensus: ['一致'], openIssues: [], conflicts: [], revisionDirectives: ['改'], convergenceScore: 57 },
+      stats: { score: 57, bySeverity: { blocker: 1, major: 0, minor: 0, nit: 0 }, conflicts: 0 },
+      warnings: [],
+    },
   ],
   utterances: [
-    // 第 0 轮的主席陈述也是**一条发言**（服务端落库的，不是前端凭空加的）
-    { round_no: 0, floor_id: 'chair', role: 'chair', content: '议题', status: 'ok' },
-    { round_no: 1, floor_id: '1F', role: 'speaker', content: '原文正文', vote: 'agree', vote_reason: '可以', status: 'ok' },
+    { round_no: 0, floor_id: '4F', phase: 'plan', content: '拆解', status: 'ok', model: 'sonnet', input_tokens: 100, output_tokens: 20 },
+    { round_no: 1, floor_id: '1F', phase: 'proposal', content: '原文正文', status: 'ok', model: 'cb', input_tokens: 200, output_tokens: 50 },
+    { round_no: 1, floor_id: '7F', phase: 'review', content: '评审原文', status: 'ok', model: 'kilo', input_tokens: 50, output_tokens: 10 },
   ],
+  plan: { parsed: true, breakdown: ['拆解 A'], assignments: [], reviewFocus: [] },
+  report: null,
+  reportFiles: [],
   live: true,
+  progress: { roundNo: 1, phase: 'review', floors: ['7F'], startedAt: 9 },
 };
 
-head('打开一场会：SQL 行归一之后才进 state');
+head('open: rows are normalized before they enter state');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
   await s.open('c1');
-  ok('详情进来了', Boolean(s.current) && s.current.council.id === 'c1');
-  const u1 = s.current.utterances.find((x) => x.floorId === '1F');
-  ok('发言按统一形状存（roundNo / voteReason）', u1.roundNo === 1 && u1.voteReason === '可以');
-  ok(
-    '时间线分好组（第 0 轮陈述 + 第 1 轮讨论），票型从发言数出来、主席不占席位',
-    s.timeline.length === 2 && s.timeline[1].tally.agree === 1 && s.timeline[0].tally.seats === 0,
-    JSON.stringify(s.timeline.map((g) => g.tally))
-  );
-  ok('带上了鉴权头', calls[0] !== undefined);
+  ok('the detail lands', Boolean(s.current) && s.current.council.id === 'c1');
+  const review = s.current.utterances.find((u) => u.floorId === '7F');
+  ok('utterances use one shape (roundNo / phase / tokens)', review.roundNo === 1 && review.phase === 'review' && review.outputTokens === 10);
+  ok('timeline groups by round', s.timeline.length === 2 && s.timeline[0].roundNo === 0 && s.timeline[1].roundNo === 1);
+  ok('RoundResult is normalized (version + reviews + server score)',
+    s.current.roundResults[0].proposal.version === 'v1' && s.current.roundResults[0].stats.score === 57);
+  ok('the plan is kept separately', s.current.plan.breakdown[0] === '拆解 A');
+  ok('live comes from the server', s.current.live === true && s.live === true);
+  ok('the in-flight progress comes from the server (a reload shows who is working)',
+    s.working.roundNo === 1 && s.working.phase === 'review' && s.working.floors[0] === '7F');
+  ok('auth headers were sent', calls[0] !== undefined);
 }
 
-head('WS 增量：补齐字段，但**不许**把已有的正文抹掉');
+head('right-side summary: score, N opinions, N blockers, roles / models / tokens');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
   await s.open('c1');
-  // 服务端补推一条更"完整"的记录，但没带正文（增量里没有的字段就是 null）
-  s.applyEvent({ councilId: 'c1', utterance: { roundNo: 1, floorId: '1F', vote: 'agree', durationMs: 1200 } });
-  const u = s.current.utterances.find((x) => x.floorId === '1F');
-  ok('耗时补上了', u.durationMs === 1200);
-  ok('正文还在（没有被 null 覆盖）', u.content === '原文正文', String(u.content));
-  ok('理由还在', u.voteReason === '可以');
-  ok(
-    '没造出重复的一层（1F 仍然只有一条）',
-    s.current.utterances.filter((x) => x.floorId === '1F').length === 1,
-    String(s.current.utterances.filter((x) => x.floorId === '1F').length)
-  );
+  const sum = s.summary;
+  ok('score is the server-computed one', sum.score === 57);
+  ok('the breakdown is present (the score is explainable)', sum.breakdown.formula.includes('blocker 1×25'));
+  ok('N opinions', sum.reviewCount === 1);
+  ok('N blockers', sum.severityCounts.blocker === 1);
+  ok('roles are moderator, main, reviewer', sum.roles.map((r) => r.role).join(',') === 'moderator,main,reviewer');
+  ok('each role has its model', sum.roles.map((r) => r.model).join(',') === 'sonnet,cb,kilo');
+  ok('each role has its token total', sum.roles.map((r) => r.tokens.total).join(',') === '120,250,60');
+  ok('an unopened council has no summary', fresh().summary === null);
 }
 
-head('换一场会：上一场的实时提案立刻作废');
+head('WS utterance increment: fills fields, never wipes content');
+{
+  const s = fresh();
+  routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
+  await s.open('c1');
+  s.applyEvent({ councilId: 'c1', utterance: { roundNo: 1, floorId: '1F', phase: 'proposal', durationMs: 1200, outputTokens: 60 } });
+  const u = s.current.utterances.find((x) => x.floorId === '1F' && x.phase === 'proposal');
+  ok('duration is filled in', u.durationMs === 1200);
+  ok('the content is still there', u.content === '原文正文', String(u.content));
+  ok('the token update is applied', u.outputTokens === 60);
+  ok('no duplicate row was created',
+    s.current.utterances.filter((x) => x.floorId === '1F' && x.phase === 'proposal').length === 1);
+  s.applyEvent({ councilId: 'c1', utterance: { roundNo: 1, floorId: '1F', phase: 'final', content: '最终稿' } });
+  ok('the same floor may speak again in another phase', s.current.utterances.filter((x) => x.floorId === '1F').length === 2);
+}
+
+head('WS round + adjudication + final draft updates reach the view');
+{
+  const s = fresh();
+  routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
+  await s.open('c1');
+  s.applyEvent({
+    councilId: 'c1',
+    round: {
+      round: 2,
+      proposal: { version: 'v2', content: '修订稿', diffFromPrev: '- 旧\n+ 新' },
+      reviews: [{ reviewer: '7F', severity: 'major', dimension: '性能', issue: '慢', suggestion: '缓存', stance: 'revise' }],
+      moderator: { consensus: [], openIssues: ['慢'], conflicts: [], revisionDirectives: ['【针对 慢】必须加缓存；验收标准：p99<100ms。'], convergenceScore: 82 },
+      stats: { score: 82, bySeverity: { blocker: 0, major: 1, minor: 0, nit: 0 }, conflicts: 0 },
+    },
+  });
+  ok('round 2 is merged', s.current.roundResults.length === 2 && s.lastRound.round === 2);
+  ok('the diff is kept for the collapsed process view', s.lastRound.proposal.diffFromPrev === '- 旧\n+ 新');
+  ok('the summary follows the latest round', s.summary.score === 82 && s.summary.reviewCount === 1);
+  s.applyEvent({ councilId: 'c1', adjudication: { decision: 'approve_with_changes' }, finalDraft: '最终稿' });
+  ok('adjudication is kept', s.current.adjudication.decision === 'approve_with_changes');
+  ok('final draft is kept', s.current.finalDraft === '最终稿');
+}
+
+head('switching councils invalidates the previous run\'s live proposal');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
   routes['GET /api/v1/councils/c2'] = () =>
-    json({ ...DETAIL, council: { ...DETAIL.council, id: 'c2' }, rounds: [DETAIL.rounds[0]], utterances: [] });
+    json({ ...DETAIL, council: { ...DETAIL.council, id: 'c2' }, roundResults: [], utterances: [], rounds: [] });
   await s.open('c1');
-  s.applyEvent({ councilId: 'c1', roundNo: 1, phase: 'debate', proposal: '初版', proposalFrom: 'chair' });
-  ok('第 1 轮的提案挂上了', s.currentProposal && s.currentProposal.proposal === '初版');
+  s.applyEvent({ councilId: 'c1', roundNo: 2, phase: 'proposal', proposal: { version: 'v2', content: '实时修订稿' } });
+  ok('the proposal banner is set', s.currentProposal && s.currentProposal.version === 'v2');
   await s.open('c2');
-  ok('打开新的一场后，旧提案不再显示', s.currentProposal === null, JSON.stringify(s.currentProposal));
+  ok('opening another meeting clears it', s.currentProposal === null, JSON.stringify(s.currentProposal));
 }
 
-head('当前提案：库里的快照与 WS 的增量，按轮次号取新的那份');
+head('current proposal: DB snapshot vs WS increment, newest round wins');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
   await s.open('c1');
-  ok('库里只有第 1 轮 → 就是它', s.currentProposal.roundNo === 1 && s.currentProposal.proposal === '初版');
+  ok('without WS the archived proposal is used', s.currentProposal.version === 'v1' && s.currentProposal.content === '初版');
 
-  // 进第 2 轮：WS 先推，详情那份还是打开时的快照（停在第 1 轮）
-  s.applyEvent({ councilId: 'c1', roundNo: 2, phase: 'debate', proposal: '4F 的修订案', proposalFrom: '4F' });
-  ok('WS 更新的那份赢（界面不会停在第 1 轮）', s.currentProposal.roundNo === 2 && s.currentProposal.proposal === '4F 的修订案');
+  s.applyEvent({ councilId: 'c1', roundNo: 2, phase: 'proposal', proposal: { version: 'v2', content: '4F 的修订案' } });
+  ok('a newer live round wins', s.currentProposal.version === 'v2' && s.currentProposal.roundNo === 2);
 
-  // 断线重连后 WS 那份没了：回落到库里最新的一轮，而不是空着
+  // A stale increment for an older round must not override the archived latest round.
   const s2 = fresh();
-  s2.current = { ...s.current, rounds: [...DETAIL.rounds, { round_no: 2, kind: 'debate', proposal_text: '4F 的修订案', proposal_from: '4F' }], utterances: [] };
-  ok('没有 WS 增量时用库里最新的那份', s2.currentProposal.roundNo === 2 && s2.currentProposal.proposal === '4F 的修订案');
+  routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
+  await s2.open('c1');
+  s2.applyEvent({ councilId: 'c1', roundNo: 0, phase: 'proposal', proposal: { version: 'v0', content: '过期' } });
+  ok('an older live round loses to the archived one', s2.currentProposal.version === 'v1');
 }
 
-head('收尾：推送只有摘要，结论必须回拉一次详情');
+head('terminal event: only the summary is pushed, so the detail must be re-pulled');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
-  routes['GET /api/v1/councils?limit=50'] = () => json({ ok: true, councils: [{ id: 'c1', topic: '议题', status: 'done', verdict: 'consensus', max_rounds: 3 }] });
+  routes['GET /api/v1/councils?limit=50'] = () =>
+    json({ ok: true, councils: [{ id: 'c1', topic: '议题', status: 'done', verdict: 'completed', max_rounds: 3 }] });
   await s.open('c1');
   calls.length = 0;
 
-  const DONE = { ...DETAIL, council: { ...DETAIL.council, status: 'done', verdict: 'consensus', verdict_round: 1 }, live: false };
-  let detail = DETAIL;
-  routes['GET /api/v1/councils/c1'] = () => json(detail);
-  detail = DONE;
+  const done = { ...DETAIL, council: { ...DETAIL.council, status: 'done', verdict: 'completed' }, live: false };
+  routes['GET /api/v1/councils/c1'] = () => json(done);
 
-  s.applyEvent({ councilId: 'c1', status: 'done', verdict: 'consensus', verdictRound: 1 });
-  await new Promise((r) => setTimeout(r, 10)); // fetchList / open 是 await 出去的
-  ok('回拉了详情', calls.some((c) => c.path === '/api/v1/councils/c1'), JSON.stringify(calls));
-  ok('也刷了历史列表', calls.some((c) => c.path.startsWith('/api/v1/councils?')), JSON.stringify(calls));
-  ok('结论落进 state（不是停在"已结束但没有结论"）', s.current.council.verdict === 'consensus');
-  ok('已结束的会不再是 live', s.live === false);
-  ok('实时提案清掉了（结论由轮次行说了算）', s.liveProposal === null);
+  s.applyEvent({ councilId: 'c1', status: 'done', verdict: 'completed' });
+  await new Promise((r) => setTimeout(r, 10)); // fetchList / open are awaited internally
+  ok('the detail was re-pulled', calls.some((c) => c.path === '/api/v1/councils/c1'), JSON.stringify(calls));
+  ok('the history list was refreshed', calls.some((c) => c.path.startsWith('/api/v1/councils?')), JSON.stringify(calls));
+  ok('the verdict lands in state (not "finished with no conclusion")', s.current.council.verdict === 'completed');
+  ok('a finished meeting is no longer live', s.live === false);
+  ok('the live proposal is cleared (the archived rounds are authoritative)', s.liveProposal === null);
 }
 
-head('别的会的动静：刷新列表，但不许搅乱当前这场');
+head('WS progress: who is working now, and it never outlives the meeting');
+{
+  const s = fresh();
+  routes['GET /api/v1/councils/c1'] = () => json({ ...DETAIL, progress: null });
+  await s.open('c1');
+  ok('no progress in the detail -> no working indicator', s.working === null);
+
+  s.applyEvent({ councilId: 'c1', status: 'running', roundNo: 2, phase: 'proposal', floors: ['1F'], startedAt: 11 });
+  ok('a progress event fills the indicator',
+    s.working.roundNo === 2 && s.working.phase === 'proposal' && s.working.floors[0] === '1F',
+    JSON.stringify(s.working));
+
+  s.applyEvent({ councilId: 'c1', status: 'running' });
+  ok('a bare "running" event does not wipe it', s.working && s.working.phase === 'proposal');
+
+  const done = { ...DETAIL, council: { ...DETAIL.council, status: 'done', verdict: 'completed' }, live: false, progress: null };
+  routes['GET /api/v1/councils/c1'] = () => json(done);
+  s.applyEvent({ councilId: 'c1', status: 'done', verdict: 'completed' });
+  ok('the indicator is cleared when the meeting ends', s.working === null);
+}
+
+head('events from another council: refresh nothing into the current one');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
   await s.open('c1');
   const before = s.current.utterances.length;
-  s.applyEvent({ councilId: 'c-别的', utterance: { roundNo: 1, floorId: '8F', content: '不该出现在这里' } });
-  ok('当前这场没被写进别人的发言', s.current.utterances.length === before);
-  ok('也没有凭空冒出一条', !s.current.utterances.some((u) => u.floorId === '8F'));
+  s.applyEvent({ councilId: 'c-别的', utterance: { roundNo: 1, floorId: '8F', phase: 'review', content: '不该出现在这里' } });
+  ok('the current meeting does not gain another meeting\'s utterance', s.current.utterances.length === before);
+  ok('no phantom row appeared', !s.current.utterances.some((u) => u.floorId === '8F'));
 }
 
-head('删除：409（还在讨论）要如实报错，不能当成功');
+head('delete: 409 (still discussing) is reported honestly, not as success');
 {
   const s = fresh();
   routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
@@ -196,111 +274,105 @@ head('删除：409（还在讨论）要如实报错，不能当成功');
   routes['DELETE /api/v1/councils/c1'] = () =>
     json({ ok: false, error: { code: 'conflict', message: '这场会还在讨论，先取消再删' } }, 409);
   const done = await s.remove('c1');
-  ok('返回失败', done === false);
-  ok('服务端的原话照搬出来', s.error === '这场会还在讨论，先取消再删', s.error);
-  ok('这场会还开在页面上（没有假装删掉了）', Boolean(s.current));
+  ok('returns failure', done === false);
+  ok('the server message is carried through verbatim', s.error === '这场会还在讨论，先取消再删', s.error);
+  ok('the meeting stays on screen (no pretending it was deleted)', Boolean(s.current));
 
   routes['DELETE /api/v1/councils/c1'] = () => json({ ok: true });
   const done2 = await s.remove('c1');
-  ok('真删掉了才算成功', done2 === true);
-  ok('删掉后当前这场清空', s.current === null);
+  ok('a real delete returns true', done2 === true);
+  ok('the current meeting is cleared', s.current === null);
 }
 
-head('发起：服务端拒绝时原因原样带出来，不自己编一句');
+head('start: the server\'s rejection reason is passed through, not rewritten');
 {
   const s = fresh();
   routes['POST /api/v1/councils'] = () =>
-    json({ ok: false, error: { code: 'bad_request', message: '4F：没找到命令行可执行文件' } }, 400);
-  const id = await s.create({ topic: 'x', floors: ['1F', '4F'], files: [], maxRounds: 2 });
-  ok('没有返回 id', id === null);
-  ok('原因就是服务端那句', s.error === '4F：没找到命令行可执行文件', s.error);
-  ok('没有留下半场会', s.current === null);
+    json({ ok: false, error: { code: 'bad_payload', message: '这些楼层现在请不动 —— 8F：没找到命令行可执行文件' } }, 400);
+  const id = await s.create({ topic: 'x', moderator: '4F', main: '1F', reviewers: ['8F'], files: [], maxRounds: 2 });
+  ok('no id returned', id === null);
+  ok('the reason is the server sentence', s.error === '这些楼层现在请不动 —— 8F：没找到命令行可执行文件', s.error);
+  ok('no half-built meeting is left behind', s.current === null);
 }
 
-head('发起：两个新开关原样进 body，留空的不发这个 key');
+head('start: roles go into the body; a blank workspace omits the key');
 {
   const s = fresh();
-  routes['POST /api/v1/councils'] = () => json({ ok: true, council: { id: 'c9', topic: 'x', status: 'draft', mode: 'analysis', max_rounds: 2 } });
-  routes['GET /api/v1/councils'] = () => json({ ok: true, councils: [] });
+  routes['POST /api/v1/councils'] = () =>
+    json({ ok: true, council: { id: 'c9', topic: 'x', status: 'draft', max_rounds: 2, workspace_path: '/home/me/proj' } });
+  routes['GET /api/v1/councils?limit=50'] = () => json({ ok: true, councils: [] });
   routes['GET /api/v1/councils/c9'] = () =>
-    json({ ok: true, council: { id: 'c9', topic: 'x', status: 'draft', mode: 'analysis', workspace_path: '/home/me/proj', max_rounds: 2 }, participants: [], materials: [], rounds: [], utterances: [], live: false });
+    json({
+      ok: true,
+      council: { id: 'c9', topic: 'x', status: 'draft', max_rounds: 2, workspace_path: '/home/me/proj' },
+      participants: [], materials: [], rounds: [], roundResults: [], reviews: [], utterances: [],
+      plan: null, report: null, reportFiles: [], live: false,
+    });
 
-  await s.create({ topic: 'x', floors: ['1F', '4F'], files: [], maxRounds: 2, mode: 'analysis', workspacePath: '/home/me/proj' });
+  await s.create({
+    topic: 'x',
+    moderator: '4F',
+    main: '1F',
+    reviewers: ['7F', '8F'],
+    files: ['/tmp/a.md'],
+    maxRounds: 2,
+    workspacePath: '/home/me/proj',
+  });
   const sent = calls.find((c) => c.method === 'POST');
-  ok('谈法原样进 body', sent.body.mode === 'analysis', JSON.stringify(sent.body));
-  ok('工作目录原样进 body', sent.body.workspacePath === '/home/me/proj', JSON.stringify(sent.body));
+  ok('moderator in the body', sent.body.moderator === '4F', JSON.stringify(sent.body));
+  ok('main in the body', sent.body.main === '1F');
+  ok('reviewers in the body', JSON.stringify(sent.body.reviewers) === JSON.stringify(['7F', '8F']));
+  ok('files in the body', JSON.stringify(sent.body.files) === JSON.stringify(['/tmp/a.md']));
+  ok('no vote-era "mode" key', !('mode' in sent.body), JSON.stringify(sent.body));
+  ok('workspace in the body when given', sent.body.workspacePath === '/home/me/proj');
 }
 {
   const s = fresh();
-  routes['POST /api/v1/councils'] = () => json({ ok: true, council: { id: 'c10', topic: 'x', status: 'draft', mode: 'vote', max_rounds: 2 } });
-  routes['GET /api/v1/councils'] = () => json({ ok: true, councils: [] });
+  routes['POST /api/v1/councils'] = () => json({ ok: true, council: { id: 'c10', topic: 'x', status: 'draft', max_rounds: 2 } });
+  routes['GET /api/v1/councils?limit=50'] = () => json({ ok: true, councils: [] });
   routes['GET /api/v1/councils/c10'] = () =>
-    json({ ok: true, council: { id: 'c10', topic: 'x', status: 'draft', mode: 'vote', workspace_path: null, max_rounds: 2 }, participants: [], materials: [], rounds: [], utterances: [], live: false });
+    json({
+      ok: true,
+      council: { id: 'c10', topic: 'x', status: 'draft', max_rounds: 2, workspace_path: null },
+      participants: [], materials: [], rounds: [], roundResults: [], reviews: [], utterances: [],
+      plan: null, report: null, reportFiles: [], live: false,
+    });
 
-  await s.create({ topic: 'x', floors: ['1F', '4F'], files: [], maxRounds: 2, mode: 'vote', workspacePath: '   ' });
+  await s.create({ topic: 'x', moderator: '4F', main: '1F', reviewers: ['7F'], files: [], maxRounds: 2, workspacePath: '   ' });
   const sent = calls.find((c) => c.method === 'POST');
-  // 空路径**不发这个 key**：隔离模式是服务端的缺省行为，发一个空串过去只是把
-  // "没填"翻译成"填了个空"，服务端要多一步才能认出它。老前端本来就不发它。
-  ok('留空的工作目录不进 body（不发这个 key，不是发空串）', !('workspacePath' in sent.body), JSON.stringify(sent.body));
-  ok('谈法照发（缺省也要显式说清）', sent.body.mode === 'vote', JSON.stringify(sent.body));
+  // A blank path is NOT sent as an empty string: isolated mode is the server default, and an empty
+  // string would be a different thing to normalize. The old frontend never sent it either.
+  ok('a blank workspace omits the key entirely', !('workspacePath' in sent.body), JSON.stringify(sent.body));
 }
 
-head('谈法 getter：老行没有 mode → 当表决（那时候只有这一种谈法）');
+head('workspacePath getter: null means isolated mode, shown as an empty string');
 {
   const s = fresh();
-  s.current = { council: { id: 'c1', mode: 'analysis' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
-  ok('新行读得出分析', s.mode === 'analysis', s.mode);
-  s.current = { council: { id: 'c0' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
-  ok('没有 mode 的老行 → vote', s.mode === 'vote', s.mode);
-  s.current = { council: { id: 'cx', mode: '看不懂的值' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
-  ok('认不出的值也回落到 vote（不把界面引到一条没走过的分支上）', s.mode === 'vote', s.mode);
+  s.current = { council: { id: 'c1', workspace_path: '/home/me/proj' }, participants: [], materials: [], rounds: [], roundResults: [], utterances: [], live: false };
+  ok('a value is passed through', s.workspacePath === '/home/me/proj');
+  s.current = { council: { id: 'c2', workspace_path: null }, participants: [], materials: [], rounds: [], roundResults: [], utterances: [], live: false };
+  ok('NULL -> empty string', s.workspacePath === '');
   s.current = null;
-  ok('没有当前会时是 vote，不炸', s.mode === 'vote');
+  ok('no current council -> empty string, no crash', s.workspacePath === '');
 }
 
-head('谈法 getter：workspacePath 取不到就是空串（隔离模式）');
+head('report fetch: lands in the current council');
 {
   const s = fresh();
-  s.current = { council: { id: 'c1', workspace_path: '/home/me/proj' }, participants: [], materials: [], rounds: [], utterances: [], live: false };
-  ok('有值就照给', s.workspacePath === '/home/me/proj', s.workspacePath);
-  s.current = { council: { id: 'c2', workspace_path: null }, participants: [], materials: [], rounds: [], utterances: [], live: false };
-  ok('NULL → 空串（界面据此知道是隔离模式）', s.workspacePath === '', JSON.stringify(s.workspacePath));
-}
+  routes['GET /api/v1/councils/c1'] = () => json(DETAIL);
+  await s.open('c1');
+  routes['GET /api/v1/councils/c1/report'] = () =>
+    json({ ok: true, report: { schema: 'workgremlin.council.report/v1' }, adjudication: { decision: 'approve' }, finalDraft: '稿', changeNotes: '说明', files: ['/tmp/report.json'], createdAt: 1 });
+  const r = await s.fetchReport('c1');
+  ok('the report is returned', r.report.schema === 'workgremlin.council.report/v1');
+  ok('it is stored on the current council', s.current.report.schema === 'workgremlin.council.report/v1');
+  ok('the file list is stored too', s.current.reportFiles[0] === '/tmp/report.json');
 
-head('收尾：reported 也是一场会开完了，照旧回拉详情');
-{
-  const s = fresh();
-  s.current = { council: { id: 'c1', topic: 'x', status: 'running', mode: 'analysis' }, participants: [], materials: [], rounds: [], utterances: [], live: true };
-  let detailHits = 0;
-  routes['GET /api/v1/councils/c1'] = () => {
-    detailHits += 1;
-    return json({ ok: true, council: { id: 'c1', topic: 'x', status: 'done', verdict: 'reported', mode: 'analysis', max_rounds: 2 }, participants: [], materials: [], rounds: [], utterances: [], live: false });
-  };
-  routes['GET /api/v1/councils'] = () => json({ ok: true, councils: [] });
-
-  s.applyEvent({ councilId: 'c1', status: 'done', verdict: 'reported' });
-  ok('回拉了详情（结论只在库里有，WS 那个摘要带不出来）', detailHits === 1, String(detailHits));
-  await new Promise((r) => setTimeout(r, 20));
-  ok('收尾后 status 落到详情那一份上', s.current.council.status === 'done' && s.current.council.verdict === 'reported', JSON.stringify(s.current.council));
-  ok('不再是"在跑"（界面据此停掉实时提示）', s.live === false);
-}
-
-head('分析模式的 WS 增量：只带立场与要点，也不许把正文抹掉');
-{
-  const s = fresh();
-  s.current = {
-    council: { id: 'c1', topic: 'x', status: 'running', mode: 'analysis' },
-    participants: [], materials: [], rounds: [],
-    utterances: [{ roundNo: 1, floorId: '1F', role: 'speaker', content: '分析正文', vote: null, voteReason: null, proposal: null, second: null, stance: null, findings: null, status: 'ok', error: null, durationMs: null, inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null }],
-    live: true,
-  };
-  s.applyEvent({ councilId: 'c1', utterance: { roundNo: 1, floorId: '1F', stance: 'support', findings: { points: ['结论 A'], risks: [], questions: [] } } });
-  const u = s.current.utterances[0];
-  ok('正文没被抹掉', u.content === '分析正文', String(u.content));
-  ok('立场补上了', u.stance === 'support', String(u.stance));
-  ok('要点补上了', u.findings && u.findings.points[0] === '结论 A', JSON.stringify(u.findings));
+  routes['GET /api/v1/councils/c1/report'] = () => json({ ok: false, error: { message: '这场会还没有报告' } }, 404);
+  const none = await s.fetchReport('c1');
+  ok('a missing report returns null and shows the server message', none === null && s.error === '这场会还没有报告');
 }
 
 await server.close();
-console.log(`\n${fail ? '✗' : '✓'} council-ui-store: ${pass} 通过 / ${fail} 失败`);
+console.log(`\n${fail ? '✗' : '✓'} council-ui-store: ${pass} passed / ${fail} failed`);
 process.exit(fail ? 1 : 0);

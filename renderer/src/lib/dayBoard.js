@@ -24,6 +24,24 @@ export const MIN_PER_DAY = 24 * 60;
 /** Number of hours on the x-axis (one vertical line per hour) */
 export const HOUR_COLS = 24;
 
+/**
+ * States the daily board does **not** draw (user request 2026-10-19): `failed` and `pending`.
+ * A failed round is already told by its own record, and a pending one never really ran, so on a
+ * timeline they only add noise. The board keeps `running` / `done` / `cancelled`.
+ * Unknown states stay visible (the block falls back to a grey swatch) so nothing silently vanishes.
+ */
+export const BOARD_HIDDEN_STATES = ['failed', 'pending'];
+
+/**
+ * Whether a task belongs on the board. A task with no state is treated as `pending` — the same
+ * fallback the block's CSS class uses — so it is hidden too.
+ * @param {{state?:string}} t
+ */
+export function isBoardTask(t) {
+  const s = (t && t.state) || 'pending';
+  return !BOARD_HIDDEN_STATES.includes(s);
+}
+
 /** 00:00 of the day an instant falls in, in the local timezone */
 export function dayStartOf(ts) {
   const d = new Date(ts);

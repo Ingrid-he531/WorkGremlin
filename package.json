@@ -86,7 +86,9 @@
     "test:install-hooks": "node server/test/installHooks.test.js",
     "test:agent-roster": "node server/test/agentRoster.test.js",
     "test:superseded-sweep": "node server/test/supersededSweep.test.js",
-    "test:council-consensus": "node server/test/councilConsensus.test.js",
+    "test:council-parse": "node server/test/councilParse.test.js",
+    "test:council-convergence": "node server/test/councilConvergence.test.js",
+    "test:council-report": "node server/test/councilReport.test.js",
     "test:council-store": "node server/test/councilStore.test.js",
     "test:council-agents": "node server/test/councilAgents.test.js",
     "test:council-runner": "node server/test/councilRunner.test.js",
@@ -96,6 +98,7 @@
     "test:council-quiet-plugin": "node server/test/councilPluginQuiet.test.js",
     "test:council-timeline": "node renderer/test/councilTimeline.test.mjs",
     "test:council-ui-store": "node renderer/test/councilUiStore.test.mjs",
+    "test:session-options": "node renderer/test/sessionOptions.test.mjs",
     "test:all": "node scripts/run-tests.js",
     "test:token-backfill": "node server/test/tokenBackfill.test.js"
   },

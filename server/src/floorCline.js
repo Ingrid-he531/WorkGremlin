@@ -32,7 +32,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { resolveProjectName } = require('./project');
-const { formToSource } = require('@workgremlin/shared');
+const { formToSource, DEFAULTS } = require('@workgremlin/shared');
 const { openReadonly } = require('./dbReadonly');
 const { isFile } = require('./roots');
 
@@ -201,6 +201,14 @@ function messagesPathOf(row) {
  *                       a user prompt with no closing assistant text, so the transcript alone cannot tell
  *                       "still working" from "user pressed stop".
  *
+ * **Council participants do not enter this table** (sessions whose title contains COUNCIL_PROMPT_MARKER are
+ * skipped outright): Cline has no `--no-session-persistence` (1F/4F) and no `--title` (7F/8F), and stores
+ * the **prompt itself** as the session title. In workspace mode the cwd is the user's project, so an
+ * unguarded participant would instantly become an extra "session" on the office's 2F, while
+ * requirements.md §15.2 states "once a meeting ends, the office page shows no trace of it". The marker
+ * rides on the council prompt's own opening sentence (see council/prompt.js roleBlock), so the filter needs
+ * no knowledge of the council's state and holds regardless of whether the meeting is still running.
+ *
  * @returns {Array<{id,title,project,projectPath,model,form,status,endedAt,lastEventAt,messagesPath,tokens}>}
  */
 function listClineSessions() {
@@ -238,7 +246,10 @@ function listClineSessions() {
         tokens: tokenOf(md),
       };
     })
-    .filter((s) => s.id);
+    .filter((s) => s.id)
+    // Council participants: Cline stamps the prompt as the session title, and the council prompt always
+    // opens with COUNCIL_PROMPT_MARKER (see the note above).
+    .filter((s) => !String(s.title || '').includes(DEFAULTS.COUNCIL_PROMPT_MARKER));
   cache = { at: now, key: file, value };
   return value;
 }
@@ -750,8 +761,21 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function clineHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
+  const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter, table } = ctx;
   for (const s of listClineSessions()) {
+    // A **terminal** session (Cline stamped ended_at, or wrote a terminal status) is over: drop its
+    // registry row right away instead of keeping it for the whole 60-minute window. The dropdown lists
+    // "sessions you can watch"; a finished one is no longer watchable, and the time window meant a
+    // finished — or since deleted — session still showed as active. `sessionTerminal` is the same yardstick
+    // the cancel detection uses (never invent a second one).
+    //
+    // The task ledger is untouched: syncTasks still walks listClineSessions (not this registry path) and
+    // writes every round, so "task cancelled" stays visible in the task records. Only 2F has this signal;
+    // 7F/8F have no terminal concept in their store and keep the time window.
+    if (sessionTerminal(s)) {
+      table.delete(`${p.id}:${s.id}`);
+      continue;
+    }
     if (!claim(p.id, s.id)) continue;
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const ph = readClinePhase(s.id) || null;

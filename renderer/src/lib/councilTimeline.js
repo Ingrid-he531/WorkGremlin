@@ -1,84 +1,164 @@
 /**
- * **Pure logic** for the council timeline —— no network, no Vue, so it's easy to pin down.
+ * **Pure logic** for the council view — no network, no Vue, so it is easy to pin down.
  *
- * Why it exists: the utterances of one council come from two sources whose shapes **differ**:
- *   · GET /councils/:id —— database row (snake_case: round_no / vote_reason / duration_ms);
- *   · WS council.update —— incremental push from the server (camelCase: roundNo / voteReason / durationMs).
- * They are the same timeline on screen, so they must first be normalized to one shape before merging, otherwise you get
- * oddities like "the reason is there before refresh, gone after refresh" that are only visible on one path.
+ * The detail API and the WS increment describe the same meeting in slightly different shapes
+ * (snake_case DB rows vs camelCase events). Everything is normalized here before it reaches reactive
+ * state, otherwise a field is present before a refresh and gone after it.
  *
- * The other thing is **deduplication**: when WS jitters / reconnects, the same utterance arrives again. Deduplicating by (round, floor)
- * is enough —— in one round a floor speaks only once, so this key is unique.
+ * The no-fabrication rule applies on the client too: missing numbers stay `null` (rendered as "—"),
+ * unknown severity/stance values are never mapped to a guessed one, and a participant with no reported
+ * usage is not shown as 0 tokens.
  */
 
-/** Numeric field: unavailable means null. **Never write 0** —— 0 tokens and "tokens unreadable" are not the same thing */
+import { DEFAULTS } from '@workgremlin/shared';
+
 function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-/** Pick one value from the two shapes (camelCase first, then snake_case) */
 function pick(camel, snake, src) {
   const v = src[camel] !== undefined ? src[camel] : src[snake];
   return v === undefined ? null : v;
 }
 
-/** The three point arrays: anything not an array counts as empty —— each item must still be a string, the rest is dropped (no guessing via toString) */
+function str(v) {
+  return v == null ? '' : String(v);
+}
+
 function listOf(v) {
   return Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean) : [];
 }
 
-/**
- * Analysis-mode findings → unified shape.
- *
- * **Must accept both inputs**: the detail API gives the JSON string from the DB (`findings_json`),
- * the WS increment gives an object the server has already parsed (`findings`). If they aren't compatible you get
- * "findings present before refresh, gone after refresh".
- *
- * The most critical point: `null` and `{}` **are not the same thing**, they must not be merged:
- *   · null / '' / bad JSON → null —— it didn't give findings as agreed (unparseable), the UI must say so;
- *   · {} → three empty arrays —— it did give findings, they're just all empty (asked, and the answer was "none").
- * The former is "didn't say", the latter is "said there are none" —— the UI wording differs.
- *
- * @param {unknown} raw JSON string / already-parsed object / null
- * @returns {{points:string[],risks:string[],questions:string[]}|null}
- */
-export function normFindings(raw) {
-  if (raw == null || raw === '') return null;
-  let obj = raw;
-  if (typeof raw === 'string') {
-    try {
-      obj = JSON.parse(raw);
-    } catch {
-      return null; // bad JSON = unparseable = null, never treat it as an empty array
-    }
-  }
-  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
-  return { points: listOf(obj.points), risks: listOf(obj.risks), questions: listOf(obj.questions) };
-}
+const SEVERITIES = ['blocker', 'major', 'minor', 'nit'];
+const STANCES = ['reject', 'revise', 'accept'];
+
+/* ---------------------------------- review points ---------------------------------- */
 
 /**
- * One utterance → unified shape.
+ * @param {object} raw DB row or parsed ReviewPoint
+ * @returns {{reviewer:string, severity:string, dimension:string, issue:string, evidence:string|null,
+ *            suggestion:string, stance:string}}
+ */
+export function normReviewPoint(raw) {
+  const r = raw || {};
+  return {
+    reviewer: str(pick('reviewer', 'reviewer', r)),
+    severity: SEVERITIES.includes(r.severity) ? r.severity : 'minor',
+    dimension: str(r.dimension) || '其他',
+    issue: str(r.issue),
+    evidence: r.evidence == null || r.evidence === '' ? null : String(r.evidence),
+    suggestion: str(r.suggestion),
+    stance: STANCES.includes(r.stance) ? r.stance : 'revise',
+  };
+}
+
+/* ---------------------------------- rounds ---------------------------------- */
+
+/**
+ * One RoundResult → one stable client shape.
+ * Accepts the API's assembled object and the WS push (which uses the same shape).
+ *
+ * @param {object} raw
+ * @returns {{round:number, proposal:{version:string|null, content:string, diffFromPrev:string|null},
+ *            reviews:Array, moderator:{consensus:string[], openIssues:string[],
+ *              conflicts:Array<{topic:string, sides:Array<{reviewer:string, view:string}>}>,
+ *              revisionDirectives:string[], convergenceScore:number|null},
+ *            stats:object|null, warnings:Array<{code:string, message:string}>}}
+ */
+export function normRoundResult(raw) {
+  const r = raw || {};
+  const p = r.proposal || {};
+  const m = r.moderator || {};
+  const stats = r.stats && typeof r.stats === 'object' ? r.stats : null;
+  const conflicts = Array.isArray(m.conflicts)
+    ? m.conflicts
+        .map((c) => ({
+          topic: str(c && c.topic),
+          sides: Array.isArray(c && c.sides)
+            ? c.sides.map((s) => ({ reviewer: str(s && s.reviewer), view: str(s && s.view) }))
+            : [],
+        }))
+        .filter((c) => c.topic)
+    : [];
+  return {
+    round: num(pick('round', 'round_no', r)) || 0,
+    proposal: {
+      version: p.version == null ? null : String(p.version),
+      content: str(p.content),
+      diffFromPrev: p.diffFromPrev == null || p.diffFromPrev === '' ? null : String(p.diffFromPrev),
+    },
+    reviews: Array.isArray(r.reviews) ? r.reviews.map(normReviewPoint) : [],
+    moderator: {
+      consensus: listOf(m.consensus),
+      openIssues: listOf(m.openIssues),
+      conflicts,
+      revisionDirectives: listOf(m.revisionDirectives),
+      convergenceScore: num(m.convergenceScore),
+    },
+    stats,
+    warnings: Array.isArray(r.warnings)
+      ? r.warnings.map((w) => ({ code: str(w && w.code), message: str(w && w.message) }))
+      : [],
+  };
+}
+
+export function normRoundResults(list) {
+  const out = (Array.isArray(list) ? list : []).map(normRoundResult).filter((r) => r.round > 0);
+  out.sort((a, b) => a.round - b.round);
+  return out;
+}
+
+/** Merge one round result into the list (WS may resend it as phases complete). */
+export function mergeRoundResult(list, raw) {
+  const r = normRoundResult(raw);
+  if (!r.round) return Array.isArray(list) ? list : [];
+  const out = (Array.isArray(list) ? list : []).slice();
+  const at = out.findIndex((x) => x.round === r.round);
+  if (at < 0) {
+    out.push(r);
+  } else {
+    // Non-empty wins: a later increment normally carries the full round, but if a partial event
+    // arrives, do not wipe what is already on screen.
+    const merged = { ...out[at] };
+    if (r.proposal.content) merged.proposal = r.proposal;
+    if (r.reviews.length) merged.reviews = r.reviews;
+    if (
+      r.moderator.consensus.length ||
+      r.moderator.openIssues.length ||
+      r.moderator.conflicts.length ||
+      r.moderator.revisionDirectives.length
+    ) {
+      merged.moderator = r.moderator;
+    }
+    if (r.stats) merged.stats = r.stats;
+    if (r.warnings.length) merged.warnings = r.warnings;
+    out[at] = merged;
+  }
+  out.sort((a, b) => a.round - b.round);
+  return out;
+}
+
+/* ---------------------------------- utterances ---------------------------------- */
+
+/**
  * @param {object} raw DB row or WS increment
+ * @returns {{roundNo:number, floorId:string, phase:string, content:string|null, model:string|null,
+ *            status:string, error:string|null, durationMs:number|null, parseDropped:number,
+ *            inputTokens:number|null, outputTokens:number|null,
+ *            cacheReadTokens:number|null, cacheWriteTokens:number|null}}
  */
 export function normUtterance(raw) {
   const u = raw || {};
   return {
     roundNo: num(pick('roundNo', 'round_no', u)) || 0,
-    floorId: pick('floorId', 'floor_id', u) || '',
-    role: u.role || 'speaker',
+    floorId: str(pick('floorId', 'floor_id', u)),
+    phase: str(u.phase) || 'brief',
     content: u.content == null ? null : String(u.content),
-    // Vote: anything outside the three recognized values is null (no stance). **Don't guess the sentiment**
-    vote: u.vote === 'agree' || u.vote === 'disagree' || u.vote === 'abstain' ? u.vote : null,
-    // Analysis-mode stance: likewise only the whitelist, everything else is null (no stance)
-    stance: u.stance === 'support' || u.stance === 'oppose' || u.stance === 'unsure' ? u.stance : null,
-    // Findings: the detail gives a JSON string, WS gives an object, accept both; unparseable is null, not an empty array
-    findings: normFindings(pick('findings', 'findings_json', u)),
-    voteReason: pick('voteReason', 'vote_reason', u),
-    proposal: pick('proposal', 'proposal_text', u),
-    second: pick('second', 'second_floor', u),
+    model: u.model == null || u.model === '' ? null : String(u.model),
     status: u.status || 'ok',
     error: pick('error', 'error', u),
     durationMs: num(pick('durationMs', 'duration_ms', u)),
+    parseDropped: num(pick('parseDropped', 'parse_dropped', u)) || 0,
     inputTokens: num(pick('inputTokens', 'input_tokens', u)),
     outputTokens: num(pick('outputTokens', 'output_tokens', u)),
     cacheReadTokens: num(pick('cacheReadTokens', 'cache_read_tokens', u)),
@@ -86,17 +166,9 @@ export function normUtterance(raw) {
   };
 }
 
-/** An utterance's identity: in one round a floor speaks only once */
-export const utteranceKey = (u) => `${u.roundNo}#${u.floorId}`;
+/** A floor can speak several phases in one round, so the phase is part of the identity. */
+export const utteranceKey = (u) => `${u.roundNo}#${u.floorId}#${u.phase}`;
 
-/**
- * Merge one utterance into the list: same key merges, new key appends. Returns a new array (the caller is reactive
- * state, so don't mutate in place).
- *
- * The merge rule is **non-empty overwrites, empty preserves**, not "last one wins": WS pushes increments, so an utterance may
- * arrive in several parts (content first, then vote), and fields the later one doesn't mention are null. Merging by "last one wins",
- * the second would wipe the first one's content to null —— which shows in the UI as "refresh and the content is gone".
- */
 export function mergeUtterance(list, raw) {
   const u = normUtterance(raw);
   const key = utteranceKey(u);
@@ -114,88 +186,176 @@ export function mergeUtterance(list, raw) {
   return out;
 }
 
-/**
- * Vote tally for one round (computed from the utterances).
- * The server also gives an authoritative one (round) —— the UI shows both: the server's is the basis for the verdict,
- * this one is counted from the utterances and serves to cross-check (a mismatch means something is wrong, and it must not be silently overwritten).
- */
-export function tallyOf(utterances) {
+/** Group utterances by round, preserving the server's insertion order. */
+export function groupUtterances(utterances) {
   const list = Array.isArray(utterances) ? utterances : [];
-  const t = { seats: list.length, agree: 0, disagree: 0, abstain: 0, invalid: 0 };
+  const map = new Map();
   for (const u of list) {
-    if (u.role === 'chair') {
-      t.seats -= 1; // the chair is the server's topic statement, takes no seat and doesn't vote
-      continue;
-    }
-    if (u.status !== 'ok' || !u.vote) t.invalid += 1;
-    else t[u.vote] += 1;
+    if (!map.has(u.roundNo)) map.set(u.roundNo, []);
+    map.get(u.roundNo).push(u);
   }
-  return t;
-}
-
-/**
- * Analysis-mode stance tally (computed from the utterances). The chair takes no seat, the same rule set as tallyOf ——
- * this way the "number of non-positions at vote time" and "at analysis time" use the same definition, so users don't have to learn two.
- *
- * The `none` bucket must exist: timeouts / crashes / unparseable stances all land here, the UI writes "no stance"
- * and attaches the original error. **Never** quietly stuff them into one side —— that would be speaking on their behalf.
- */
-export function stanceCountsOf(utterances) {
-  const list = Array.isArray(utterances) ? utterances : [];
-  const t = { seats: list.length, support: 0, oppose: 0, unsure: 0, none: 0 };
-  for (const u of list) {
-    if (u.role === 'chair') {
-      t.seats -= 1; // the chair is the server's topic statement, takes no seat and takes no stance
-      continue;
-    }
-    if (u.status !== 'ok' || !u.stance) t.none += 1;
-    else t[u.stance] += 1;
-  }
-  return t;
-}
-
-/**
- * Group by round for the timeline to render. Rounds ascending; within a round the chair comes first, the rest by floor number.
- * `stanceTally` is an **added field**, the `tally` of the vote path is untouched verbatim.
- * @returns {Array<{roundNo:number, utterances:Array, tally:object, stanceTally:object}>}
- */
-export function groupByRound(utterances) {
-  const list = Array.isArray(utterances) ? utterances : [];
-  const byRound = new Map();
-  for (const u of list) {
-    if (!byRound.has(u.roundNo)) byRound.set(u.roundNo, []);
-    byRound.get(u.roundNo).push(u);
-  }
-  return [...byRound.keys()]
+  return [...map.keys()]
     .sort((a, b) => a - b)
-    .map((roundNo) => {
-      const items = byRound.get(roundNo).slice().sort((a, b) => {
-        if (a.role !== b.role) return a.role === 'chair' ? -1 : 1;
-        return String(a.floorId).localeCompare(String(b.floorId), 'en', { numeric: true });
-      });
-      return { roundNo, utterances: items, tally: tallyOf(items), stanceTally: stanceCountsOf(items) };
-    });
+    .map((roundNo) => ({ roundNo, utterances: map.get(roundNo) }));
+}
+
+/* ---------------------------------- aggregation ---------------------------------- */
+
+/**
+ * Token usage per floor, with the same semantics as the server:
+ *   · all turns missing usage      → all null, total null (UI shows "—")
+ *   · some turns missing usage     → sum of known values, `exact: false` (UI shows "≥ N")
+ *   · every turn reported usage    → exact sum
+ */
+export function tokenUsageOf(utterances) {
+  const list = Array.isArray(utterances) ? utterances : [];
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let cacheWrite = 0;
+  let seen = 0;
+  let missing = 0;
+  for (const u of list) {
+    const hasInput = u.inputTokens != null;
+    const hasOutput = u.outputTokens != null;
+    if (!hasInput && !hasOutput) {
+      missing += 1;
+      continue;
+    }
+    seen += 1;
+    input += u.inputTokens || 0;
+    output += u.outputTokens || 0;
+    cacheRead += u.cacheReadTokens || 0;
+    cacheWrite += u.cacheWriteTokens || 0;
+    // One half missing still makes the total a lower bound: the unknown half contributes an
+    // unknown amount, and claiming an exact sum would overstate what was measured.
+    if (!hasInput || !hasOutput) missing += 1;
+  }
+  if (!seen) {
+    return { input: null, output: null, cacheRead: null, cacheWrite: null, total: null, exact: false };
+  }
+  return { input, output, cacheRead, cacheWrite, total: input + output, exact: missing === 0 };
+}
+
+export function modelOfUtterances(utterances) {
+  const list = Array.isArray(utterances) ? utterances : [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (list[i] && list[i].model) return list[i].model;
+  }
+  return null;
+}
+
+/** Participant rows → one object per role, with model and token usage derived from the utterances. */
+export function roleSummary(participants, utterances) {
+  const list = Array.isArray(utterances) ? utterances : [];
+  return (Array.isArray(participants) ? participants : []).map((p) => {
+    const mine = list.filter((u) => u.floorId === p.floor_id);
+    return {
+      floorId: p.floor_id,
+      role: p.role,
+      agent: p.agent,
+      status: p.status,
+      error: p.error || null,
+      model: modelOfUtterances(mine),
+      tokens: tokenUsageOf(mine),
+    };
+  });
+}
+
+export function severityCountsOf(reviews) {
+  const out = { blocker: 0, major: 0, minor: 0, nit: 0 };
+  for (const r of Array.isArray(reviews) ? reviews : []) {
+    if (out[r.severity] != null) out[r.severity] += 1;
+  }
+  return out;
+}
+
+export function stanceCountsOf(reviews) {
+  const out = { reject: 0, revise: 0, accept: 0 };
+  for (const r of Array.isArray(reviews) ? reviews : []) {
+    if (out[r.stance] != null) out[r.stance] += 1;
+  }
+  return out;
+}
+
+/** Last round's server-computed score; null when no round has completed. */
+export function scoreOf(roundResults) {
+  const list = Array.isArray(roundResults) ? roundResults : [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const r = list[i];
+    if (r.stats && typeof r.stats.score === 'number') return r.stats.score;
+    if (r.moderator && typeof r.moderator.convergenceScore === 'number') {
+      return r.moderator.convergenceScore;
+    }
+  }
+  return null;
 }
 
 /**
- * Stance → i18n key suffix. Unrecognized ones (null / no stance) get their own bucket, the UI writes "no stance".
- * This layer never displays "no stance" as "agree".
+ * Explainable score breakdown. Uses the server's stats when present; otherwise recomputes from the
+ * reviews with the shared weights (still deterministic, never model-supplied).
  */
-export function voteKey(vote) {
-  return vote === 'agree' || vote === 'disagree' || vote === 'abstain' ? vote : 'none';
+export function scoreBreakdownOf(roundResults) {
+  const list = Array.isArray(roundResults) ? roundResults : [];
+  const last = list.length ? list[list.length - 1] : null;
+  if (!last) return null;
+  const weights = DEFAULTS.COUNCIL_SEVERITY_WEIGHTS;
+  const conflictWeight = DEFAULTS.COUNCIL_CONFLICT_WEIGHT;
+  const max = DEFAULTS.COUNCIL_SCORE_MAX;
+  const counts = (last.stats && last.stats.bySeverity) || severityCountsOf(last.reviews);
+  const conflicts =
+    last.stats && typeof last.stats.conflicts === 'number'
+      ? last.stats.conflicts
+      : (last.moderator.conflicts || []).length;
+  const deduction = SEVERITIES.reduce((n, s) => n + (counts[s] || 0) * (weights[s] || 0), 0) +
+    conflicts * conflictWeight;
+  const score =
+    last.stats && typeof last.stats.score === 'number'
+      ? last.stats.score
+      : Math.min(max, Math.max(0, max - deduction));
+  const parts = SEVERITIES.map((s) => `${s} ${counts[s] || 0}×${weights[s] || 0}`);
+  parts.push(`冲突 ${conflicts}×${conflictWeight}`);
+  return {
+    score,
+    max,
+    counts: { ...counts },
+    conflicts,
+    deduction,
+    formula: `${max} - (${parts.join(' + ')})`,
+  };
 }
 
-/** Analysis-mode stance → i18n key suffix. Same rule as voteKey: unrecognized is 'none' */
-export function stanceKey(stance) {
-  return stance === 'support' || stance === 'oppose' || stance === 'unsure' ? stance : 'none';
+/**
+ * Everything the right-side summary card needs.
+ * @param {{participants:Array, utterances:Array, roundResults:Array}} arg
+ */
+export function summarizeCouncil(arg) {
+  const rounds = Array.isArray(arg.roundResults) ? arg.roundResults : [];
+  const last = rounds.length ? rounds[rounds.length - 1] : null;
+  const reviews = last ? last.reviews : [];
+  const breakdown = scoreBreakdownOf(rounds);
+  return {
+    rounds: rounds.length,
+    score: breakdown ? breakdown.score : null,
+    breakdown,
+    reviewCount: reviews.length,
+    severityCounts: severityCountsOf(reviews),
+    stanceCounts: stanceCountsOf(reviews),
+    conflictCount: last ? last.moderator.conflicts.length : 0,
+    roles: roleSummary(arg.participants, arg.utterances),
+    trend: rounds
+      .filter((r) => r.stats && typeof r.stats.score === 'number')
+      .map((r) => ({ round: r.round, score: r.stats.score })),
+  };
 }
 
-/** Utterance status → whether it counts as a "valid statement" (failures / timeouts / no stance don't) */
-export const isSpoken = (u) => u && u.status === 'ok';
+/** Clause for a phase heading: "第 2 轮 · 评审" */
+export function phaseLabelKey(phase) {
+  return `council.phase.${phase}`;
+}
 
-/** Token total: returns null when **all** four fields are unavailable (the UI shows "—", not 0) */
-export function tokenTotal(u) {
-  const parts = [u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheWriteTokens];
-  if (parts.every((v) => v == null)) return null;
-  return parts.reduce((n, v) => n + (v || 0), 0);
+/** Format a token usage object for display ("—", "≥ 1234", "1234"). */
+export function formatTokens(tokens) {
+  if (!tokens || tokens.total == null) return '—';
+  return `${tokens.exact ? '' : '≥ '}${tokens.total}`;
 }

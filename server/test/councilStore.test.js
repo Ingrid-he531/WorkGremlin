@@ -1,13 +1,14 @@
 /**
- * 议事厅落库自检 —— 真 SQLite（临时库）+ 真 repo，不 mock。
+ * Council persistence self-check — real SQLite (a temp DB) + the real repo, no mocks.
  *
- * 盯三件事：
- *   1. 5 张表建得起来、字段名对得上（schema.sql 是新写的，写错名字在这里最先炸）；
- *   2. **取不到的字段留 NULL 而不是 0** —— 词元读不到就写 NULL，界面才知道该显示「—」；
- *      写成 0 会被当成"消耗为零"，那是编造（docs/requirements.md §1 的铁律）。
- *   3. 隔离：一场会的数据能整体删干净，不留孤儿行；上次被硬杀留下的 running 会被如实标掉。
+ * Three things are pinned here:
+ *   1. The new tables build and the column names line up (schema.sql is hand-written; a typo blows up here first).
+ *   2. **Unavailable values stay NULL, never 0** — unreadable tokens are NULL so the UI can show "—";
+ *      writing 0 would claim "used nothing", which is fabrication.
+ *   3. Isolation: deleting one council removes every child row; a hard-killed run is honestly marked
+ *      failed at startup; a legacy (vote-era) DB is dropped wholesale rather than half-read.
  *
- * 跑法：`npm run test:council-store`
+ * Run: `npm run test:council-store`
  */
 'use strict';
 
@@ -37,261 +38,293 @@ const { repo, close } = openDatabase(path.join(TMP, 'test.db'));
 
 const AT = 1_700_000_000_000;
 const mk = (id, extra = {}) =>
-  repo.createCouncil({ id, topic: `议题 ${id}`, threshold: 'unanimous', maxRounds: 3, createdAt: AT, ...extra });
+  repo.createCouncil({ id, topic: `topic ${id}`, maxRounds: 3, createdAt: AT, ...extra });
 
-// ------------------------------------------------------------ 建表 / 建会
-head('建会与读回');
+/* ------------------------------------------------------------ create / read */
+head('create and read back');
 {
   const c = mk('c1');
-  ok('createCouncil 返回落库后的行', c && c.id === 'c1');
-  ok('默认是 draft', c.status === 'draft', c.status);
-  ok('默认 round_current = 0（只有议题陈述轮）', c.round_current === 0);
-  ok('verdict / ended_at 一开始是空的', c.verdict === null && c.ended_at === null);
-  ok('getCouncil 读得回来', repo.getCouncil('c1').topic === '议题 c1');
-  ok('读不存在的会返回 null（不是抛错）', repo.getCouncil('nope') === null);
+  ok('createCouncil returns the stored row', c && c.id === 'c1');
+  ok('starts as draft', c.status === 'draft', c.status);
+  ok('round_current starts at 0', c.round_current === 0);
+  ok('verdict / ended_at start NULL', c.verdict === null && c.ended_at === null);
+  ok('workspace_path defaults to NULL (temp dir), not an empty string', c.workspace_path === null, String(c.workspace_path));
+  ok('getCouncil reads it back', repo.getCouncil('c1').topic === 'topic c1');
+  ok('unknown id returns null (does not throw)', repo.getCouncil('nope') === null);
 }
 {
-  mk('c2');
+  mk('c2', { workspacePath: '/home/me/proj' });
+  ok('workspace_path is stored when given', repo.getCouncil('c2').workspace_path === '/home/me/proj');
+  mk('c3', { workspacePath: '' });
+  ok('an empty workspace is normalized to NULL', repo.getCouncil('c3').workspace_path === null);
   const list = repo.listCouncils(10);
-  ok('列表按发起时间倒序、只认 limit', list.length === 2 && list.every((r) => r.id));
-  ok('limit 会被夹到合理范围（0 / -1 / 巨值都不炸）', repo.listCouncils(0).length >= 1 && repo.listCouncils(1e9).length === 2);
+  ok('list returns every council, newest first', list.length === 3 && list.every((r) => r.id));
+  ok('limit is clamped to a sane range', repo.listCouncils(0).length >= 1 && repo.listCouncils(1e9).length === 3);
 }
 
-// -------------------------------------------------------------- 出席者
-head('出席者');
+/* ------------------------------------------------------------ participants */
+head('participants and roles');
 {
-  repo.insertParticipant({ councilId: 'c1', floorId: '4F', agent: 'claude', cliPath: '/usr/bin/claude' });
-  repo.insertParticipant({ councilId: 'c1', floorId: '1F', agent: 'codebuddy', cliPath: '/usr/bin/codebuddy' });
+  repo.insertParticipant({ councilId: 'c1', floorId: '4F', role: 'moderator', agent: 'claude', cliPath: '/usr/bin/claude' });
+  repo.insertParticipant({ councilId: 'c1', floorId: '1F', role: 'main', agent: 'codebuddy', cliPath: '/usr/bin/codebuddy' });
+  repo.insertParticipant({ councilId: 'c1', floorId: '7F', role: 'reviewer', agent: 'kilo', cliPath: null });
   const ps = repo.listParticipants('c1');
-  ok('按楼层号升序取回', ps.length === 2 && ps[0].floor_id === '1F' && ps[1].floor_id === '4F', JSON.stringify(ps.map((p) => p.floor_id)));
-  ok('cli_path 原样存着（排查时要知道当时用的哪个可执行文件）', ps[1].cli_path === '/usr/bin/claude');
-  ok('初始 status = pending', ps[0].status === 'pending');
+  ok(
+    'display order is seat order (moderator, main, then reviewers by floor)',
+    ps.length === 3 && ps.map((p) => `${p.floor_id}:${p.role}`).join(',') === '4F:moderator,1F:main,7F:reviewer',
+    JSON.stringify(ps.map((p) => `${p.floor_id}:${p.role}`)),
+  );
+  ok('cli_path is preserved for troubleshooting', ps[0].cli_path === '/usr/bin/claude');
+  ok('initial status = pending', ps[1].status === 'pending');
   repo.setParticipantStatus('c1', '1F', 'failed', 'spawn ENOENT');
-  const one = repo.listParticipants('c1')[0];
-  ok('失败原因如实落库', one.status === 'failed' && one.error === 'spawn ENOENT');
+  const one = repo.listParticipants('c1')[1];
+  ok('raw failure text is stored verbatim', one.status === 'failed' && one.error === 'spawn ENOENT');
 }
 
-// -------------------------------------------------------------- 材料
-head('内联材料');
+/* ------------------------------------------------------------ materials */
+head('inlined materials');
 {
-  repo.insertMaterial({ councilId: 'c1', ord: 0, path: '/tmp/a.txt', bytesTotal: 100, bytesIncluded: 100, truncated: 0, content: 'A 的内容' });
-  repo.insertMaterial({ councilId: 'c1', ord: 1, path: '/tmp/big.txt', bytesTotal: 999999, bytesIncluded: 65536, truncated: 1, content: 'B 的前 64KB' });
+  repo.insertMaterial({ councilId: 'c1', ord: 0, path: '/tmp/a.txt', bytesTotal: 100, bytesIncluded: 100, truncated: 0, content: 'A' });
+  repo.insertMaterial({ councilId: 'c1', ord: 1, path: '/tmp/big.txt', bytesTotal: 999999, bytesIncluded: 65536, truncated: 1, content: 'B' });
   const ms = repo.listMaterials('c1');
-  ok('按 ord 升序', ms.length === 2 && ms[0].path === '/tmp/a.txt' && ms[1].path === '/tmp/big.txt');
-  ok('截断事实记着（原始大小 ≠ 实际内联大小）', ms[1].truncated === 1 && ms[1].bytes_total === 999999 && ms[1].bytes_included === 65536);
+  ok('sorted by ord', ms.length === 2 && ms[0].path === '/tmp/a.txt' && ms[1].path === '/tmp/big.txt');
+  ok('truncation is recorded (original size != inlined size)', ms[1].truncated === 1 && ms[1].bytes_total === 999999 && ms[1].bytes_included === 65536);
 }
 {
   repo.insertMaterial({ councilId: 'c1', ord: 2, path: '/tmp/gone.txt', bytesTotal: null, bytesIncluded: 0, truncated: 0, content: null });
   const m = repo.listMaterials('c1')[2];
-  ok('读不到的文件：bytes_total 留 NULL，**不写 0**', m.bytes_total === null, String(m.bytes_total));
+  ok('unreadable file: bytes_total stays NULL, **not 0**', m.bytes_total === null, String(m.bytes_total));
 }
 
-// ---------------------------------------------------------------- 轮次
-head('轮次：同一轮 upsert，started_at 不被后来者覆盖');
+/* ------------------------------------------------------------ rounds */
+head('rounds: upsert per round, started_at is not overwritten');
 {
-  repo.upsertRound({ councilId: 'c1', roundNo: 0, kind: 'brief', proposalText: '议题原文', proposalFrom: 'chair', agree: 0, disagree: 0, abstain: 0, invalid: 0, consensus: 0, startedAt: AT, endedAt: AT + 10 });
-  repo.upsertRound({ councilId: 'c1', roundNo: 1, kind: 'debate', proposalText: '议题原文', proposalFrom: 'chair', agree: 2, disagree: 1, abstain: 0, invalid: 0, consensus: 0, startedAt: AT + 100, endedAt: null });
+  repo.upsertRound({
+    councilId: 'c1', roundNo: 0, kind: 'plan', version: null, proposalText: null,
+    diffFromPrev: null, proposalFrom: '4F', moderatorJson: '{"parsed":true}', statsJson: null,
+    startedAt: AT, endedAt: AT + 10,
+  });
+  repo.upsertRound({
+    councilId: 'c1', roundNo: 1, kind: 'debate', version: 'v1', proposalText: 'proposal one',
+    diffFromPrev: null, proposalFrom: '1F', moderatorJson: null, statsJson: null,
+    startedAt: AT + 100, endedAt: null,
+  });
   const rs = repo.listRounds('c1');
-  ok('两轮按序号取回', rs.length === 2 && rs[0].round_no === 0 && rs[1].round_no === 1);
-  ok('第 0 轮是 chair 的议题陈述', rs[0].kind === 'brief' && rs[0].proposal_from === 'chair');
-  ok('票数原样落库', rs[1].agree === 2 && rs[1].disagree === 1);
+  ok('two rounds come back in order', rs.length === 2 && rs[0].round_no === 0 && rs[1].round_no === 1);
+  ok('round 0 is the moderator plan', rs[0].kind === 'plan' && rs[0].proposal_from === '4F');
+  ok('the debate round keeps its version', rs[1].version === 'v1' && rs[1].proposal_text === 'proposal one');
 
-  // 收工时补写同一轮（ended_at / consensus 才知道）
-  repo.upsertRound({ councilId: 'c1', roundNo: 1, kind: 'debate', proposalText: '议题原文', proposalFrom: 'chair', agree: 2, disagree: 1, abstain: 0, invalid: 0, consensus: 0, startedAt: AT + 999, endedAt: AT + 200 });
+  repo.upsertRound({
+    councilId: 'c1', roundNo: 1, kind: 'debate', version: 'v1', proposalText: 'proposal one',
+    diffFromPrev: 'changed X', proposalFrom: '1F',
+    moderatorJson: '{"consensus":[]}', statsJson: '{"score":80}',
+    startedAt: AT + 999, endedAt: AT + 200,
+  });
   const again = repo.listRounds('c1')[1];
-  ok('started_at 保持第一次写的（不被后来的 999 覆盖）', again.started_at === AT + 100, String(again.started_at));
-  ok('ended_at 补上了', again.ended_at === AT + 200);
-  ok('轮数没有变成 3（是 upsert 不是 insert）', repo.listRounds('c1').length === 2);
+  ok('started_at keeps the first write (999 does not overwrite)', again.started_at === AT + 100, String(again.started_at));
+  ok('ended_at is filled in later', again.ended_at === AT + 200);
+  ok('moderator_json / stats_json / diff land', again.moderator_json === '{"consensus":[]}' && again.stats_json === '{"score":80}' && again.diff_from_prev === 'changed X');
+  ok('still two rounds (upsert, not insert)', repo.listRounds('c1').length === 2);
 }
 
-// ---------------------------------------------------------------- 发言
-head('发言与投票：拿不到的字段一律留 NULL');
+/* ------------------------------------------------------------ reviews */
+head('review points');
+{
+  repo.delReviewsFromRound('c1', 1);
+  const n = repo.insertReviews('c1', 1, [
+    { reviewer: '7F', severity: 'blocker', dimension: '安全', issue: 'no auth', evidence: 'line 4', suggestion: 'add auth', stance: 'reject' },
+    { reviewer: '8F', severity: 'nit', dimension: '文档', issue: 'typo', evidence: null, suggestion: 'fix it', stance: 'accept' },
+  ], AT + 300);
+  ok('insertReviews reports how many landed', n === 2);
+  const rs = repo.listReviews('c1');
+  ok('ordered by round, reviewer, ord', rs.length === 2 && rs[0].reviewer === '7F' && rs[1].reviewer === '8F');
+  ok('severity / stance / dimension survive', rs[0].severity === 'blocker' && rs[0].stance === 'reject' && rs[0].dimension === '安全');
+  ok('missing evidence stays NULL (not an empty string)', rs[1].evidence === null, String(rs[1].evidence));
+  repo.delReviewsFromRound('c1', 1);
+  ok('a round can be cleared before re-inserting', repo.listReviews('c1').length === 0);
+}
+
+/* ------------------------------------------------------------ utterances */
+head('utterances: unavailable values stay NULL');
 {
   repo.insertUtterance({
-    councilId: 'c1', roundNo: 1, floorId: '1F', content: '我同意', vote: 'agree', voteReason: '成本可控',
-    proposalText: null, secondFloor: null, status: 'ok',
-    inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null,
-    startedAt: AT + 100, endedAt: AT + 150, durationMs: 50,
+    councilId: 'c1', roundNo: 0, floorId: 'system', phase: 'brief', content: 'topic text', status: 'ok',
   });
   repo.insertUtterance({
-    councilId: 'c1', roundNo: 1, floorId: '4F', content: null, vote: null, voteReason: null,
-    proposalText: null, secondFloor: null, status: 'timeout', error: '120s 未返回，已杀进程',
+    councilId: 'c1', roundNo: 1, floorId: '7F', phase: 'review', content: 'looks risky',
+    model: 'gpt-5.1', status: 'ok',
+    inputTokens: 100, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null,
+    parseDropped: 2, startedAt: AT + 100, endedAt: AT + 150, durationMs: 50,
+  });
+  repo.insertUtterance({
+    councilId: 'c1', roundNo: 1, floorId: '8F', phase: 'review', content: null, model: null,
+    status: 'timeout', error: '120s 未返回，已杀进程',
     startedAt: AT + 100, endedAt: AT + 220, durationMs: 120000,
   });
   const us = repo.listUtterances('c1');
-  ok('按 (轮次, 楼层) 升序', us.length === 2 && us[0].floor_id === '1F' && us[1].floor_id === '4F');
-  ok('未表态的那条 vote 是 NULL（不是 agree / abstain）', us[1].vote === null, String(us[1].vote));
-  ok('失败原因原文留着', us[1].status === 'timeout' && String(us[1].error).includes('120s'));
-  ok('词元取不到 → NULL，**不是 0**', us[0].input_tokens === null && us[0].output_tokens === null);
-  ok('耗时是真的就记着', us[0].duration_ms === 50);
-  ok('role 缺省是 speaker', us[0].role === 'speaker');
-}
-{
-  repo.insertUtterance({ councilId: 'c1', roundNo: 0, floorId: '1F', role: 'chair', content: '议题陈述', status: 'ok' });
-  const chair = repo.listUtterances('c1').find((x) => x.role === 'chair');
-  ok('chair 角色落得进去（第 0 轮的服务端陈述）', chair && chair.round_no === 0);
-  ok('没给的字段不会变成空串', chair.vote === null && chair.vote_reason === null && chair.error === null);
+  ok('ordered by round then insertion id', us.length === 3 && us[0].phase === 'brief' && us[2].floor_id === '8F');
+  ok('phase, model, parse_dropped round-trip', us[1].phase === 'review' && us[1].model === 'gpt-5.1' && us[1].parse_dropped === 2);
+  ok('a missing token count is NULL, **not 0**', us[1].output_tokens === null, String(us[1].output_tokens));
+  ok('failure text is kept verbatim', us[2].status === 'timeout' && String(us[2].error).includes('120s'));
+  ok('duration is recorded when known', us[1].duration_ms === 50);
 }
 
-// ---------------------------------------------------------------- 收尾
-head('收尾：达成 / 未达成 / 取消 三种都有对应的 status');
+/* ------------------------------------------------------------ report */
+head('report row');
 {
-  ok('markCouncilRunning 第一次成功', repo.markCouncilRunning('c1', AT) === true);
-  ok('再标一次不生效（状态守卫：不能把跑着的会拉回起点）', repo.markCouncilRunning('c1', AT) === false);
-  const c = repo.finishCouncil('c1', { verdict: 'consensus', verdictRound: 2, endedAt: AT + 500 });
-  ok('consensus → status=done 且记下是第几轮谈成的', c.status === 'done' && c.verdict === 'consensus' && c.verdict_round === 2);
-  ok('ended_at 落上', c.ended_at === AT + 500);
+  const saved = repo.insertReport({
+    councilId: 'c1',
+    adjudicationJson: '{"decision":"approve_with_changes"}',
+    adjudicationText: 'raw adjudication text',
+    finalDraftText: 'final draft',
+    changeNotes: 'notes',
+    reportJson: '{"schema":"workgremlin.council.report/v1"}',
+    filesJson: '["/tmp/report.json"]',
+    createdAt: AT + 400,
+  });
+  ok('insertReport returns the stored row', saved && saved.council_id === 'c1');
+  const got = repo.getReport('c1');
+  ok('every field round-trips', got.final_draft_text === 'final draft' && got.change_notes === 'notes' && got.created_at === AT + 400);
+  repo.insertReport({ councilId: 'c1', reportJson: '{"schema":"v2"}' });
+  ok('a second save upserts (one row per council)', repo.getReport('c1').report_json === '{"schema":"v2"}' && repo.raw.prepare("SELECT COUNT(*) AS c FROM council_reports WHERE council_id='c1'").get().c === 1);
+  ok('unknown council has no report', repo.getReport('nope') === null);
 }
+
+/* ------------------------------------------------------------ wrap-up */
+head('wrap-up: completed / partial are normal, cancelled / failed are not');
 {
-  mk('c3');
-  repo.markCouncilRunning('c3', AT);
-  const c = repo.finishCouncil('c3', { verdict: 'no_consensus', endedAt: AT + 1 });
-  ok('no_consensus 也是 done（**谈不拢是合法结果，不是错误**）', c.status === 'done' && c.verdict === 'no_consensus');
-  ok('没谈成时 verdict_round 留 NULL', c.verdict_round === null);
+  ok('markCouncilRunning flips draft once', repo.markCouncilRunning('c1', AT) === true);
+  ok('a second flip is refused (cannot pull a running meeting back)', repo.markCouncilRunning('c1', AT) === false);
+  const c = repo.finishCouncil('c1', { verdict: 'completed', endedAt: AT + 500 });
+  ok('completed -> status=done', c.status === 'done' && c.verdict === 'completed');
+  ok('ended_at is stored', c.ended_at === AT + 500);
 }
 {
   mk('c4');
-  const c = repo.finishCouncil('c4', { verdict: 'cancelled', endedAt: AT + 1 });
-  ok('取消 → status=cancelled', c.status === 'cancelled' && c.verdict === 'cancelled');
+  repo.markCouncilRunning('c4', AT);
+  const c = repo.finishCouncil('c4', { verdict: 'partial', error: 'final phase missing', endedAt: AT + 1 });
+  ok('partial is also a normal ending (done, not failed)', c.status === 'done' && c.verdict === 'partial');
 }
-
-// ------------------------------------------------------------ 启动对账
-head('启动对账：上次被硬杀留下的 running 会被如实标成 failed');
 {
   mk('c5');
-  repo.markCouncilRunning('c5', AT);
-  const n = repo.failStaleCouncils('服务上次被中断，这场会没有跑完', AT + 9999);
-  ok('扫到 1 条', n === 1, String(n));
-  const c = repo.getCouncil('c5');
-  ok('标成 failed 并写明原因（不假装还在讨论）', c.status === 'failed' && c.verdict === 'failed' && String(c.error).includes('被中断'));
-  ok('已结束的会不会被误伤', repo.getCouncil('c1').status === 'done' && repo.getCouncil('c3').status === 'done');
-  ok('再跑一次扫不到东西（幂等）', repo.failStaleCouncils('x', AT) === 0);
+  const c = repo.finishCouncil('c5', { verdict: 'cancelled', endedAt: AT + 1 });
+  ok('cancelled -> status=cancelled', c.status === 'cancelled' && c.verdict === 'cancelled');
+}
+{
+  mk('c6');
+  const c = repo.finishCouncil('c6', { verdict: 'failed', error: 'boom', endedAt: AT + 1 });
+  ok('failed -> status=failed and keeps the reason', c.status === 'failed' && c.error === 'boom');
 }
 
-// ---------------------------------------------------------------- 隔离
-head('隔离：一场会能连子表删干净，不留孤儿');
+/* ------------------------------------------------------------ startup sweep */
+head('startup sweep: a hard-killed run is marked failed honestly');
+{
+  mk('c7');
+  repo.markCouncilRunning('c7', AT);
+  const n = repo.failStaleCouncils('server was interrupted; this meeting did not finish', AT + 9999);
+  ok('exactly one stale row is swept', n === 1, String(n));
+  const c = repo.getCouncil('c7');
+  ok('marked failed with the reason (does not pretend to still be live)', c.status === 'failed' && c.verdict === 'failed' && String(c.error).includes('interrupted'));
+  ok('finished meetings are untouched', repo.getCouncil('c1').status === 'done' && repo.getCouncil('c5').status === 'cancelled');
+  ok('a second sweep finds nothing (idempotent)', repo.failStaleCouncils('x', AT) === 0);
+}
+
+/* ------------------------------------------------------------ isolation */
+head('isolation: one council deletes cleanly, no orphan rows');
 {
   const before = {
     utt: repo.listUtterances('c1').length,
     rounds: repo.listRounds('c1').length,
     mats: repo.listMaterials('c1').length,
     ps: repo.listParticipants('c1').length,
+    reviews: repo.listReviews('c1').length,
+    report: repo.getReport('c1') !== null,
   };
-  ok('删之前确实有子表数据', before.utt > 0 && before.rounds > 0 && before.mats > 0 && before.ps > 0, JSON.stringify(before));
-  ok('deleteCouncil 报成功', repo.deleteCouncil('c1') === true);
-  ok('会本体没了', repo.getCouncil('c1') === null);
-  ok('发言清空', repo.listUtterances('c1').length === 0);
-  ok('轮次清空', repo.listRounds('c1').length === 0);
-  ok('材料清空', repo.listMaterials('c1').length === 0);
-  ok('出席者清空', repo.listParticipants('c1').length === 0);
-  ok('删不存在的会返回 false（路由据此给 404）', repo.deleteCouncil('c1') === false);
-  ok('别的会没被牵连', repo.getCouncil('c2') !== null && repo.getCouncil('c3') !== null);
-  // 跨表扫一遍：议事厅的子表里不该再有任何 c1 的行
-  const orphans = ['council_utterances', 'council_rounds', 'council_materials', 'council_participants']
+  ok('child rows exist before the delete', before.utt > 0 && before.rounds > 0 && before.mats > 0 && before.ps > 0 && before.report, JSON.stringify(before));
+  ok('deleteCouncil reports success', repo.deleteCouncil('c1') === true);
+  ok('the council itself is gone', repo.getCouncil('c1') === null);
+  ok('utterances cleared', repo.listUtterances('c1').length === 0);
+  ok('rounds cleared', repo.listRounds('c1').length === 0);
+  ok('materials cleared', repo.listMaterials('c1').length === 0);
+  ok('participants cleared', repo.listParticipants('c1').length === 0);
+  ok('reviews cleared', repo.listReviews('c1').length === 0);
+  ok('report cleared', repo.getReport('c1') === null);
+  ok('deleting a missing council returns false (route maps it to 404)', repo.deleteCouncil('c1') === false);
+  ok('other councils are untouched', repo.getCouncil('c2') !== null && repo.getCouncil('c4') !== null);
+  const orphans = [
+    'council_utterances',
+    'council_rounds',
+    'council_materials',
+    'council_participants',
+    'council_reviews',
+    'council_reports',
+  ]
     .map((t) => repo.raw.prepare(`SELECT COUNT(*) AS c FROM ${t} WHERE council_id = 'c1'`).get().c)
     .reduce((a, b) => a + b, 0);
-  ok('四张子表一行不剩', orphans === 0, String(orphans));
+  ok('six child tables keep zero rows', orphans === 0, String(orphans));
 }
 
 close();
 
-// ------------------------------------------------------------ 老库迁移
-// 用户机器上已经跑着改动前建的库。schema.sql 的 CREATE TABLE IF NOT EXISTS **改不动**
-// 已有的表和已有的 CHECK 约束，所以这一组是"升级到新版本之后，昨天那几场会还在不在、
-// 还读不读得出来"的机器证据 —— 顺便钉住 `reported` 这个新 verdict 真的能写进去
-// （SQLite 改不了 CHECK，只能整表重建，而重建是会把数据搬来搬去的那类操作）。
-head('老库迁移：没有 mode / workspace_path 的库升级后照常能用');
+/* ------------------------------------------------------------ legacy reset */
+// The council feature changed shape before any real data existed. An old DB must be reset wholesale:
+// CREATE TABLE IF NOT EXISTS cannot change columns or CHECK constraints, so leaving the old tables
+// would make every new query fail.
+head('legacy schema: vote-era tables are dropped and rebuilt, not half-read');
 {
   const oldPath = path.join(TMP, 'old.db');
   const old = new Database(oldPath);
-  // 改动前的 councils：没有 mode、没有 workspace_path，verdict 的 CHECK 里没有 reported
   old.exec(`
     CREATE TABLE councils (
       id            TEXT PRIMARY KEY,
       topic         TEXT NOT NULL,
       status        TEXT NOT NULL DEFAULT 'draft'
                     CHECK (status IN ('draft','running','done','failed','cancelled')),
-      threshold     TEXT NOT NULL DEFAULT 'unanimous'
-                    CHECK (threshold IN ('unanimous','majority')),
+      threshold     TEXT NOT NULL DEFAULT 'unanimous',
       max_rounds    INTEGER NOT NULL,
       round_current INTEGER NOT NULL DEFAULT 0,
-      verdict       TEXT
-                    CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','cancelled','failed')),
-      verdict_round INTEGER,
+      verdict       TEXT,
       error         TEXT,
       created_at    INTEGER NOT NULL,
-      started_at    INTEGER,
       ended_at      INTEGER
     );
-    CREATE INDEX idx_councils_created ON councils(created_at DESC);
-    -- 改动前的发言表：没有 stance / findings_json
     CREATE TABLE council_utterances (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      council_id    TEXT NOT NULL,
-      round_no      INTEGER NOT NULL,
-      floor_id      TEXT NOT NULL,
-      role          TEXT NOT NULL DEFAULT 'speaker' CHECK (role IN ('chair','speaker')),
-      content       TEXT,
-      vote          TEXT CHECK (vote IS NULL OR vote IN ('agree','disagree','abstain')),
-      vote_reason   TEXT,
-      proposal_text TEXT,
-      second_floor  TEXT,
-      status        TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','failed','timeout','unparsed')),
-      error         TEXT,
-      input_tokens       INTEGER,
-      output_tokens      INTEGER,
-      cache_read_tokens  INTEGER,
-      cache_write_tokens INTEGER,
-      started_at    INTEGER,
-      ended_at      INTEGER,
-      duration_ms   INTEGER
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      council_id  TEXT NOT NULL,
+      round_no    INTEGER NOT NULL,
+      floor_id    TEXT NOT NULL,
+      vote        TEXT,
+      content     TEXT,
+      status      TEXT NOT NULL DEFAULT 'ok'
     );
   `);
-  old.prepare(
-    `INSERT INTO councils (id, topic, status, threshold, max_rounds, verdict, created_at, ended_at)
-     VALUES ('c_old', '昨天那场没谈成的会', 'done', 'unanimous', 2, 'no_consensus', ?, ?)`
-  ).run(AT, AT + 1);
-  old.prepare(
-    `INSERT INTO council_utterances (council_id, round_no, floor_id, role, content, vote, status)
-     VALUES ('c_old', 1, '4F', 'speaker', '我反对', 'disagree', 'ok')`
-  ).run();
+  old.prepare("INSERT INTO councils (id, topic, max_rounds, created_at) VALUES ('c_old', 'old topic', 2, ?)").run(AT);
+  old.prepare("INSERT INTO council_utterances (council_id, round_no, floor_id, vote) VALUES ('c_old', 1, '4F', 'disagree')").run();
   old.close();
 
-  // 升级：就是用新代码打开这个老库
+  // Upgrade = opening the old DB with the new code.
   const up = openDatabase(oldPath);
   const r2 = up.repo;
 
   const cols = r2.raw.prepare('PRAGMA table_info(councils)').all().map((c) => c.name);
-  ok('补上了 mode 列', cols.includes('mode'), cols.join(','));
-  ok('补上了 workspace_path 列', cols.includes('workspace_path'));
-
-  const row = r2.getCouncil('c_old');
-  ok('老会还在，内容没在重建里丢', row !== null && row.topic === '昨天那场没谈成的会', JSON.stringify(row && row.topic));
-  // 这是最关键的一条：老行必须落到"与改动前逐字相同"的那一档
-  ok('老会读出来是表决模式（不是别的猜法）', row.mode === 'vote', String(row.mode));
-  ok('老会读出来没有工作目录（workspace_path 为 NULL → 临时目录）', row.workspace_path === null, String(row.workspace_path));
-  ok('老会原来的结论没丢', row.verdict === 'no_consensus' && row.status === 'done', `${row.verdict}/${row.status}`);
+  ok('old mode/threshold columns are gone', !cols.includes('mode') && !cols.includes('threshold'), cols.join(','));
+  ok('new workspace_path column exists', cols.includes('workspace_path'));
+  ok('the old council row is gone (no partial migration)', r2.getCouncil('c_old') === null);
 
   const uc = r2.raw.prepare('PRAGMA table_info(council_utterances)').all().map((c) => c.name);
-  ok('发言表补上了 stance / findings_json', uc.includes('stance') && uc.includes('findings_json'));
-  const u = r2.listUtterances('c_old')[0];
-  ok('老发言还在，票也没丢', u && u.vote === 'disagree' && u.content === '我反对', JSON.stringify(u && u.vote));
-  ok('老发言的 stance 是 NULL（当时没这个字段，不是"未表态"以外的任何东西）', u.stance === null);
+  ok('the old vote column is gone', !uc.includes('vote'), uc.join(','));
+  ok('the new phase/model columns are present', uc.includes('phase') && uc.includes('model'));
 
-  // verdict 的 CHECK 重建之后必须能收下新值 —— 收不下的话分析模式会在收尾那一刻炸
-  const created = r2.createCouncil({ id: 'c_new', topic: '新的一场', mode: 'analysis', threshold: 'unanimous', maxRounds: 2, createdAt: AT + 100 });
-  ok('新库这一侧照样能建分析模式的会', created.mode === 'analysis');
-  const fin = r2.finishCouncil('c_new', { verdict: 'reported', endedAt: AT + 200 });
-  ok('reported 能写进去（老库的 CHECK 确实被重建了）', fin.verdict === 'reported', String(fin.verdict));
-  ok('reported 归到 status=done（跑完是正常收场，不是失败）', fin.status === 'done', String(fin.status));
-
-  // 老行 + 新行并存时列表仍按时间倒序、两行都能读
-  const list = r2.listCouncils(10);
-  ok('老会和新会都在列表里', list.length === 2, String(list.length));
+  const created = r2.createCouncil({ id: 'c_new', topic: 'new topic', maxRounds: 2, createdAt: AT + 100 });
+  ok('a new council can be created after the reset', created && created.id === 'c_new');
+  r2.insertParticipant({ councilId: 'c_new', floorId: '4F', role: 'moderator', agent: 'claude', cliPath: null });
+  ok('a participant with the new role column lands', r2.listParticipants('c_new')[0].role === 'moderator');
+  const fin = r2.finishCouncil('c_new', { verdict: 'completed', endedAt: AT + 200 });
+  ok('the new verdict value is accepted by the rebuilt CHECK', fin.verdict === 'completed' && fin.status === 'done');
   up.close();
 }
 
-console.log(`\n${fail ? '✗' : '✓'} council-store: ${pass} 通过 / ${fail} 失败`);
-// 临时库连目录一起拆掉（同 councilRunner：自己搭的台子自己拆，失败时也拆）
+console.log(`\n${fail ? '✗' : '✓'} council-store: ${pass} passed / ${fail} failed`);
+// Tear down the temp DB (and its directory) even when the run failed.
 fs.rmSync(TMP, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

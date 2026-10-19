@@ -1,15 +1,16 @@
 'use strict';
 
 /**
- * The **command-line recipes** for the four agents —— the only place in the council room that
+ * The **command-line recipes** for each council floor —— the only place in the council room that
  * touches each CLI's details.
  *
- * Every recipe records three things: how to hand the prompt over, **how to guarantee it has no
- * tools**, and how to read what it spits out as "speech + vote". The first two are the focus here,
- * and each floor below documents how that was verified (measured locally on 2026-10-01).
+ * Every recipe records three things: how to hand the prompt over, **how to guarantee it is read-only**,
+ * and how to read what it spits out (the body plus best-effort model/token metadata). The first two
+ * are the focus here, and each floor below documents how that was verified (1F/4F/7F/8F measured
+ * locally on 2026-10-01; 2F/3F/6F measured on 2026-10-19 where noted, otherwise per the CLI's own
+ * documentation).
  *
- * About "read-only, no tools" (the criterion the user set, and the prerequisite for entering the
- * council room):
+ * About "read-only" (the criterion the user set, and the prerequisite for entering the council room):
  *   · 1F CodeBuddy / 4F Claude Code —— `--tools ""` disables all built-in tools (both help texts say
  *     `Use "" to disable all tools`).
  *   · 7F Kilo / 8F OpenCode —— neither has a tool switch (`kilo --pure` only disables **external
@@ -22,6 +23,16 @@
  *         marker file could not be read.
  *   · 8F additionally keeps directories outside HOME out via `external_directory` (its default is
  *     ask, not allow, so stacking deny makes sure nothing escapes).
+ *   · 2F Cline —— no tool switch; `--plan` is Cline's own read-only mode (measured 2026-10-19: a write
+ *     was refused while `read_files` worked). Its guarantee is weaker than `--tools`: read-only shell
+ *     commands may still run.
+ *   · 3F Codex —— `codex exec` runs non-interactively without approval and defaults to a **read-only
+ *     sandbox**; `--sandbox read-only` pins it (commands may run, but cannot write to disk or reach
+ *     the network).
+ *   · 6F Qoder —— headless `--print` mode has nobody to answer a permission prompt, and Qoder's docs
+ *     state anything requiring confirmation is **denied by default**; no `--permission-mode` is passed
+ *     on purpose (the default deny is the read-only posture we want). Not yet verified on a real device
+ *     (the CLI is not installed on the dev machine) —— see the note on the 6F recipe.
  *
  * One more **mandatory** step: 7F needs `"plugin": []` to strip plugins. Kilo's global config carries
  * WorkGremlin's own reporting plugin (`packages/reporter/src/plugin/index.js`); leaving it in means
@@ -50,12 +61,16 @@ const { DEFAULTS } = require('@workgremlin/shared');
 const QUIET_ENV = Object.freeze({ WORKGREMLIN_DISABLE: '1' });
 
 /**
- * Fixed session title for 7F / 8F participants —— unlike 1F/4F these two have no "do not persist"
- * switch, so sessions are always recorded in their **global** SQLite (`session.directory` = the cwd
- * at the time). When the user supplies a workspace, cwd is the user's project, and unguarded
- * participants would show up directly on the office's 7F/8F. The guard is "give it a fixed title",
- * which server/src/kilo.js and server/src/opencode.js skip when listing sessions —— reasoning and
+ * Fixed session title for 7F / 8F / 6F participants —— unlike 1F/4F these have no "do not persist"
+ * switch, so sessions are always recorded in their **global** store (`session.directory` = the cwd at
+ * the time). When the user supplies a workspace, cwd is the user's project, and unguarded participants
+ * would show up directly on the office's 7F/8F/6F. The guard is "give it a fixed title", which
+ * server/src/floorKilo.js and server/src/floorOpencode.js skip when listing sessions —— reasoning and
  * trade-offs are written on COUNCIL_SESSION_TITLE in shared/index.js.
+ *
+ * 6F Qoder takes this title via `--name`; whether its CLI transcript also carries it (and thus whether
+ * the office filters it out) is not yet verified on a real device —— see the 6F recipe below.
+ * 3F Codex does not need a title at all: `--ephemeral` writes no session.
  */
 const SESSION_TITLE = DEFAULTS.COUNCIL_SESSION_TITLE;
 
@@ -100,19 +115,24 @@ const READ_TOOLS = 'Read,Grep,Glob';
  *
  * build({ bin, prompt }) → { bin, args, env, stdin }
  *   · The council is **always read-only**: every recipe narrows the participant to read-type tools
- *     (see READ_TOOLS / READ_PERMISSION above) —— no writes, no command execution, no network.
+ *     (see READ_TOOLS / READ_PERMISSION and each recipe's own note above) —— no writes, no network, and
+ *     command execution only where a CLI cannot turn it off (see 2F / 3F).
  *   · env is **layered on top of** process.env (not a replacement) —— each CLI's login credentials
  *     live in ~/.claude, ~/.config/kilo, etc. and are found via HOME. Blocking HOME blocks the login,
  *     so isolation relies on cwd + read-only narrowing + QUIET_ENV, not on rewriting environment
  *     variables.
  *   · When stdin is not null the prompt travels through a pipe (not argv): long text never hits
- *     ARG_MAX and never shows up in `ps` output for other processes on the machine.
+ *     ARG_MAX and never shows up in `ps` output for other processes on the machine. 2F Cline refuses to
+ *     read the prompt from stdin, so it is the one recipe that passes the prompt as a positional
+ *     argument (bounded by COUNCIL_MATERIAL_TOTAL_MAX_BYTES).
  *
  * Both 1F and 4F carry `--no-session-persistence` (documented in both help texts, valid under
- * `--print` only): participant conversations are **not persisted**. That matters when cwd is the
- * user's real project —— persisted, each CLI records participants under **that project path** into
- * its own history (`~/.claude/projects/<project>/`), and the global session list grows a few "active
- * sessions in your project".
+ * `--print` only): participant conversations are **not persisted**. 3F Codex uses `--ephemeral` for the
+ * same effect. That matters when cwd is the user's real project —— persisted, each CLI records
+ * participants under **that project path** into its own history (`~/.claude/projects/<project>/`), and
+ * the global session list grows a few "active sessions in your project". 2F Cline and 6F Qoder have no
+ * such switch: their guards are the prompt marker / `--name` (see shared/index.js COUNCIL_PROMPT_MARKER
+ * and COUNCIL_SESSION_TITLE).
  *
  * `--strict-mcp-config` without `--mcp-config`: do not load MCP servers from the user config.
  * `--tools` limits the **built-in** tool set, and MCP tools are not part of it —— leaving that open
@@ -130,6 +150,63 @@ const RECIPES = {
     },
   },
 
+  '2F': {
+    agent: 'cline',
+    name: 'Cline',
+    /**
+     * Cline's CLI has no `--tools` whitelist and no `--no-session-persistence`. `--plan` is its **own
+     * read-only plan mode** (measured 2026-10-19: asking it to create a file was refused while
+     * `read_files` on the same directory worked), which is the closest thing it offers.
+     *
+     * Unlike 1F/4F, the guarantee is weaker: plan mode still allows read-only shell commands
+     * (measured: `whoami` ran). It cannot write files, which is the property the council actually needs.
+     *
+     * The prompt goes as a **positional argument**: `cline --plan --json` refuses to read stdin
+     * (measured: "JSON output mode requires a prompt argument or piped stdin" even when stdin was piped).
+     * The council prompt is bounded by COUNCIL_MATERIAL_TOTAL_MAX_BYTES, so ARG_MAX is not a concern.
+     *
+     * Session persistence cannot be turned off (`--data-dir` would move the store but takes the login
+     * with it —— measured: `Unauthorized` with an isolated data dir), so the participant's session lands
+     * in `~/.cline/data`. The office lock is therefore the **prompt marker**: Cline stores the prompt
+     * itself as the session title, and floorCline.js skips titles containing COUNCIL_PROMPT_MARKER.
+     */
+    build({ bin, prompt }) {
+      return { bin, args: ['--plan', '--json', prompt], env: { ...QUIET_ENV }, stdin: null };
+    },
+  },
+
+  '3F': {
+    agent: 'codex',
+    name: 'Codex',
+    /**
+     * `codex exec` is non-interactive and, per its own docs, runs in read-only mode by default with no
+     * approval prompt; `--sandbox read-only` pins that (it uses the OS sandbox: commands may run, but
+     * cannot write to disk or reach the network).
+     *
+     * `--ephemeral` is the exact equivalent of 1F/4F's `--no-session-persistence`: the participant's
+     * rollout is **not** written under `~/.codex/sessions`, so it can never surface on the office's 3F.
+     * That is why 3F, unlike 2F/7F/8F, needs no title marker.
+     *
+     * `--skip-git-repo-check` — isolated mode's cwd is a throwaway temp dir, which is not a git repo.
+     * `--ignore-user-config` — do not load the user's `config.toml` (its MCP servers would hand the
+     * participant extra tools); auth still comes from CODEX_HOME, so login survives.
+     * `-c web_search="disabled"` — no web search.
+     * `-` reads the prompt from stdin (the pipe the runner sets up).
+     */
+    build({ bin, prompt }) {
+      return {
+        bin,
+        args: [
+          'exec', '--json', '--sandbox', 'read-only', '--ephemeral',
+          '--skip-git-repo-check', '--ignore-user-config',
+          '-c', 'web_search="disabled"', '-',
+        ],
+        env: { ...QUIET_ENV },
+        stdin: prompt,
+      };
+    },
+  },
+
   '4F': {
     agent: 'claude',
     name: 'Claude Code',
@@ -140,6 +217,33 @@ const RECIPES = {
       // if placed later.
       args.push('--permission-prompts', 'none', '--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
       return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
+    },
+  },
+
+  '6F': {
+    agent: 'qoder',
+    name: 'Qoder',
+    /**
+     * Qoder's headless `--print` mode: nobody is there to answer a permission prompt, and per Qoder's
+     * docs any operation that would normally need a confirmation is **denied by default**. No
+     * `--permission-mode` is passed on purpose —— the default (deny) is exactly the read-only posture the
+     * council wants; passing `accept_edits` / `--yolo` would let the participant write.
+     *
+     * `--name SESSION_TITLE` stamps the same fixed title 7F/8F use, so the participant is recognizable in
+     * Qoder's own session history. **Not yet verified on a real device** (the Qoder CLI is not installed
+     * on the dev machine): whether its CLI transcript (scanned by 6F) also carries this name, and thus
+     * whether the office keeps the participant out in workspace mode, still has to be confirmed on a
+     * machine with Qoder installed. See docs/requirements.md §15.3.
+     *
+     * The prompt arrives over stdin (Qoder reads it when `-p` gets no argument).
+     */
+    build({ bin, prompt }) {
+      return {
+        bin,
+        args: ['-p', '--output-format', 'json', '--name', SESSION_TITLE],
+        env: { ...QUIET_ENV },
+        stdin: prompt,
+      };
     },
   },
 
@@ -205,6 +309,16 @@ function textOf(obj) {
     return obj.map(textOf).filter(Boolean).join('\n');
   }
   if (typeof obj !== 'object') return '';
+  // Codex `exec --json` wraps each event's payload in `item`. Only the agent's closing message is speech;
+  // reading `item` generically would mistake reasoning / command_execution / error items (all of which
+  // carry a text-ish field) for the answer, so recognize exactly the one shape that is the answer.
+  if (obj.type === 'item.completed' && obj.item && typeof obj.item === 'object') {
+    return obj.item.type === 'agent_message' && typeof obj.item.text === 'string' ? obj.item.text : '';
+  }
+  // Top-level error events (`{"type":"error","message":…}`) are logs, not speech: Codex and Cline both
+  // emit them (reconnect notices, config warnings, auth failures) and the `message` field must never be
+  // read as the answer. (Genuine results carry `type:'result'` / `type:'run_result'` / no `type` at all.)
+  if (obj.type === 'error') return '';
   // Try keys in the order "most likely to be the body". `result` is claude/codebuddy's closing text;
   // `text` / `content` are fragments in kilo/opencode's event streams.
   //
@@ -237,13 +351,41 @@ function tokensOf(obj) {
     return null;
   };
   const out = {
-    input: num('input_tokens', 'prompt_tokens', 'input'),
-    output: num('output_tokens', 'completion_tokens', 'output'),
-    cacheRead: num('cache_read_input_tokens', 'cache_read_tokens', 'cached_tokens'),
-    cacheWrite: num('cache_creation_input_tokens', 'cache_write_tokens'),
+    input: num('input_tokens', 'prompt_tokens', 'input', 'inputTokens'),
+    output: num('output_tokens', 'completion_tokens', 'output', 'outputTokens'),
+    cacheRead: num('cache_read_input_tokens', 'cache_read_tokens', 'cached_tokens', 'cached_input_tokens', 'cacheReadTokens'),
+    cacheWrite: num('cache_creation_input_tokens', 'cache_write_tokens', 'cacheWriteTokens'),
   };
   // All four unavailable = this product gave no usage at all, so return null rather than an all-zero object
   return Object.values(out).some((v) => v != null) ? out : null;
+}
+
+/**
+ * Best-effort model id. Each CLI uses a different field name; anything unrecognized stays null so the UI
+ * shows "—" rather than a guessed model. This is display metadata only — never used for routing.
+ */
+function modelOf(obj) {
+  if (obj == null) return null;
+  if (Array.isArray(obj)) {
+    for (let i = obj.length - 1; i >= 0; i -= 1) {
+      const m = modelOf(obj[i]);
+      if (m) return m;
+    }
+    return null;
+  }
+  if (typeof obj !== 'object') return null;
+  for (const key of ['model', 'model_id', 'modelId', 'modelID', 'modelName', 'model_name']) {
+    const v = obj[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  for (const key of ['message', 'part', 'item', 'metadata', 'session']) {
+    const v = obj[key];
+    if (v && typeof v === 'object') {
+      const m = modelOf(v);
+      if (m) return m;
+    }
+  }
+  return null;
 }
 
 /** Is this event an echo from "the user side" (the question itself / a system prompt). The body must never pick it up */
@@ -294,21 +436,22 @@ function pickFromTranscript(list) {
  * Parse the stdout of one invocation.
  *
  * Both shapes have to be consumed:
- *   · **A single JSON** (1F/4F's `--output-format json`) —— the whole stdout is one object;
- *   · **A JSONL event stream** (7F/8F's `--format json`) —— one event per line, the body assembled
- *     from several lines.
+ *   · **A single JSON** (1F/4F's `--output-format json`, 6F Qoder's `--output-format json`) —— the whole
+ *     stdout is one object (or one transcript array, see pickFromTranscript);
+ *   · **A JSONL event stream** (7F/8F's `--format json`, 2F Cline's `--json`, 3F Codex's `exec --json`) ——
+ *     one event per line, the body assembled from the lines that carry it.
  *
  * Approach: try it as one block of JSON first, then line by line. **Both failing = cannot parse**, in
  * which case the text stays empty and the raw stdout is carried back untouched (troubleshooting needs
  * it), never pretending that content was read.
  *
  * @param {string} stdout
- * @returns {{ok:boolean, text:string, tokens:object|null, events:number}}
+ * @returns {{ok:boolean, text:string, tokens:object|null, model:string|null, events:number}}
  */
 function parseOutput(stdout) {
   const raw = String(stdout == null ? '' : stdout);
   const trimmed = raw.trim();
-  if (!trimmed) return { ok: false, text: '', tokens: null, events: 0 };
+  if (!trimmed) return { ok: false, text: '', tokens: null, model: null, events: 0 };
 
   // First as one block of JSON
   try {
@@ -316,11 +459,12 @@ function parseOutput(stdout) {
     if (Array.isArray(one)) {
       // A whole array = a full transcript; take only the part it said (see pickFromTranscript)
       const got = pickFromTranscript(one);
-      if (got) return { ok: true, text: got.text, tokens: got.tokens, events: one.length };
-      return { ok: false, text: '', tokens: null, events: one.length };
+      const model = modelOf(one);
+      if (got) return { ok: true, text: got.text, tokens: got.tokens, model, events: one.length };
+      return { ok: false, text: '', tokens: null, model, events: one.length };
     }
     const text = textOf(one);
-    if (text) return { ok: true, text, tokens: tokensOf(one), events: 1 };
+    if (text) return { ok: true, text, tokens: tokensOf(one), model: modelOf(one), events: 1 };
   } catch {
     /* not a single JSON, fall through to JSONL */
   }
@@ -331,6 +475,7 @@ function parseOutput(stdout) {
   let events = 0;
   const parts = [];
   let tokens = null;
+  let model = null;
   for (const line of trimmed.split(/\r?\n/)) {
     const s = line.trim();
     if (!s || (s[0] !== '{' && s[0] !== '[')) continue;
@@ -347,192 +492,13 @@ function parseOutput(stdout) {
     if (t) parts.push(t);
     const tk = tokensOf(obj);
     if (tk) tokens = tk;
+    const m = modelOf(obj);
+    if (m) model = m;
   }
-  if (events > 0 && parts.length) return { ok: true, text: parts.join('\n'), tokens, events };
+  if (events > 0 && parts.length) return { ok: true, text: parts.join('\n'), tokens, model, events };
   // Events present but not a single line of body read —— that also counts as "cannot parse" (maybe all
   // status events, or the field names changed again)
-  return { ok: false, text: '', tokens: tokens || null, events };
-}
-
-/* ---------------------------------- Vote parsing ---------------------------------- */
-
-/**
- * Participants must attach a structured vote at the end of their speech. Agreed shape (pinned down in
- * the prompt):
- *
- * ```json
- * {"vote":"agree|disagree|abstain","reason":"one sentence","proposal":"(a revision when voting disagree)","second":"4F"}
- * ```
- *
- * Parsing strategy (lenient in, strict out):
- *   1. Find the **last** ```json fenced block (models love giving examples mid-text; the last block is
- *      their conclusion);
- *   2. With no fence, look for the last {...} fragment containing `"vote"` in the whole text;
- *   3. Failing that, accept a line like `VOTE: agree`;
- *   4. Nothing recognizable → return vote=null (**no position expressed**), never guess from tone.
- *
- * @param {string} text
- * @returns {{vote:string|null, reason:string|null, proposal:string|null, second:string|null}}
- */
-function parseVoteBlock(text) {
-  const empty = { vote: null, reason: null, proposal: null, second: null };
-  const s = String(text == null ? '' : text);
-  if (!s.trim()) return empty;
-
-  const obj = lastJsonBlock(s, (o) => 'vote' in o);
-  if (obj) {
-    const vote = normalizeVoteToken(obj.vote);
-    if (vote) {
-      return {
-        vote,
-        reason: strOrNull(obj.reason),
-        // Revisions are accepted as-is (the prompt only requires disagreeing votes to include one, but
-        // agreeing while attaching a version keeps it too —— picking next round's proposal follows
-        // consensus.js's rules, no selection is made here)
-        proposal: strOrNull(obj.proposal),
-        second: strOrNull(obj.second || obj.second_floor || obj.endorse),
-      };
-    }
-  }
-
-  // Fallback: a line like `VOTE: agree` / `立场：反对`
-  const line = s.match(/(?:^|\n)\s*(?:VOTE|立场|投票)\s*[:：]\s*([^\n]{1,40})/i);
-  if (line) {
-    const vote = normalizeVoteToken(line[1]);
-    if (vote) return { vote, reason: null, proposal: null, second: null };
-  }
-  return empty;
-}
-
-/** The vote vocabulary stays in one set with council/consensus.js (that is the authority; this only normalizes the same way) */
-function normalizeVoteToken(raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim().toLowerCase();
-  if (!s) return null;
-  if (/^(abstain|neutral|none|弃权|中立|不表态|无所谓)$/.test(s)) return 'abstain';
-  if (/^(agree|yes|approve|accept|同意|赞成|支持|通过)$/.test(s)) return 'agree';
-  if (/^(disagree|no|reject|oppose|反对|不同意|否决)$/.test(s)) return 'disagree';
-  return null;
-}
-
-function strOrNull(v) {
-  if (typeof v !== 'string') return null;
-  const t = v.trim();
-  return t ? t : null;
-}
-
-/* ---------------------------------- Analysis parsing ---------------------------------- */
-
-/**
- * The structured tail block for analysis mode. Agreed shape (pinned down in the prompt, see
- * ANALYSIS_PROTOCOL in prompt.js):
- *
- * ```json
- * {"stance":"support|oppose|unsure","points":[…],"risks":[…],"questions":[…]}
- * ```
- *
- * Two rules shared with vote parsing:
- *   · Leave null when unrecognized —— a `stance` that cannot be read after all is "no position
- *     expressed", never guessed from tone;
- *   · `findings` being null and being an empty object are **not the same thing**: null = the whole
- *     tail block failed to parse, `{points:[],risks:[],questions:[]}` = it answered, just with all
- *     three empty. The UI renders those two differently.
- *
- * @param {string} text
- * @returns {{stance:string|null, findings:{points:string[],risks:string[],questions:string[]}|null}}
- */
-function parseAnalysisBlock(text) {
-  const empty = { stance: null, findings: null };
-  const s = String(text == null ? '' : text);
-  if (!s.trim()) return empty;
-  const obj = lastJsonBlock(
-    s,
-    (o) => 'stance' in o || 'points' in o || 'risks' in o || 'questions' in o
-  );
-  if (!obj) return empty;
-  return { stance: normalizeStanceToken(obj.stance), findings: findingsOf(obj) };
-}
-
-/** Stance vocabulary. Same normalization approach as normalizeVoteToken: recognized ones normalize, unknown ones return null */
-function normalizeStanceToken(raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim().toLowerCase();
-  if (!s) return null;
-  if (/^(support|yes|pro|for|agree|赞成|支持|可行|同意)$/.test(s)) return 'support';
-  if (/^(oppose|no|against|con|disagree|反对|不可行|不同意)$/.test(s)) return 'oppose';
-  if (/^(unsure|unknown|maybe|unclear|不确定|存疑|拿不准|说不准|待定)$/.test(s)) return 'unsure';
-  return null;
-}
-
-/**
- * The three list fields. **None provided** (or not arrays) → null (= failed to parse); once any one of
- * them is an array, return an object with all three keys (the missing ones being empty arrays).
- * Only non-empty strings are accepted as elements —— models occasionally slip in a `{"point":"…"}`,
- * which is not the shape we want, so drop it.
- */
-function findingsOf(obj) {
-  const listOf = (v) =>
-    Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean) : [];
-  if (!['points', 'risks', 'questions'].some((k) => Array.isArray(obj[k]))) return null;
-  return { points: listOf(obj.points), risks: listOf(obj.risks), questions: listOf(obj.questions) };
-}
-
-/**
- * Find the **last** JSON object satisfying the predicate in a piece of text.
- * Try ```json fences first (from the back), then fall back to scanning the whole text for balanced
- * braces. Vote blocks and analysis blocks share this machinery (different predicates: one recognizes
- * `vote`, the other `stance`/`points`).
- *
- * @param {string} s
- * @param {(obj:object)=>boolean} ok
- */
-function lastJsonBlock(s, ok) {
-  const fenced = [...s.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1]);
-  for (let i = fenced.length - 1; i >= 0; i -= 1) {
-    const obj = tryParseJsonObject(fenced[i], ok);
-    if (obj) return obj;
-  }
-  // No fence: walk back from every '{' with brace matching, take the last one satisfying the predicate
-  for (let i = s.lastIndexOf('{'); i >= 0; i = s.lastIndexOf('{', i - 1)) {
-    const obj = tryParseJsonObject(extractBalanced(s, i), ok);
-    if (obj) return obj;
-    if (i === 0) break;
-  }
-  return null;
-}
-
-function tryParseJsonObject(chunk, ok) {
-  if (!chunk) return null;
-  try {
-    const obj = JSON.parse(chunk.trim());
-    if (obj && typeof obj === 'object' && !Array.isArray(obj) && ok(obj)) return obj;
-  } catch {
-    /* cannot parse it, try the next candidate */
-  }
-  return null;
-}
-
-/** From s[from]=='{', take a brace-balanced slice (braces inside strings are skipped) */
-function extractBalanced(s, from) {
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = from; i < s.length; i += 1) {
-    const ch = s[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === '\\') esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return s.slice(from, i + 1);
-    }
-  }
-  return '';
+  return { ok: false, text: '', tokens: tokens || null, model, events };
 }
 
 module.exports = {
@@ -541,8 +507,4 @@ module.exports = {
   READ_TOOLS,
   QUIET_ENV,
   parseOutput,
-  parseVoteBlock,
-  normalizeVoteToken,
-  parseAnalysisBlock,
-  normalizeStanceToken,
 };

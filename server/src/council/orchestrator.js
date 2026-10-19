@@ -1,50 +1,33 @@
 'use strict';
 
 /**
- * The council room's state machine —— turns "hold a meeting" from one HTTP request into a sequence of
- * actions that has to run to completion with nobody watching.
+ * The council room's state machine — turns one HTTP request into a moderated review loop that runs to
+ * completion with nobody watching.
  *
- *   draft ──start()──▶ running ──┬─ round 0: topic presentation (the server puts the question on the
- *                                │  table, no model call)
- *                                ├─ rounds 1..N: ask everyone concurrently → collect (or time out)
- *                                │    · vote mode: mechanical vote counting. Reached → consensus (with
- *                                │      **the verbatim proposal text that was on the table that round**
- *                                │      as the conclusion); not reached → take an objector's revision
- *                                │      as next round's proposal, continue; hitting the cap →
- *                                │      no_consensus (a legitimate outcome)
- *                                │    · analysis mode: no vote judging, no proposal swapping, run all
- *                                │      N rounds → reported
- *                                └─ wrap-up (persist verdict, clean the temp directory, broadcast)
+ *   draft ──start()──▶ running
+ *     round 0          moderator: topic decomposition + review assignment
+ *     round 1..N       proposal → independent reviews → moderator convergence
+ *                      (every round is persisted as a RoundResult)
+ *     final phase      moderator adjudication → main answerer final draft + change notes
+ *     wrap-up          write report files → persist verdict → clean a temp dir we own → broadcast
  *
- * Two orthogonal switches (both read from the councils row, fixed at kick-off, never changed midway):
- *   · mode            —— 'vote' / 'analysis'
- *   · workspace_path  —— which directory the participants read. A value = the user's real project;
- *                        NULL = a freshly created throwaway temp directory (read-only either way)
+ * There is **no vote, no vote tally, and no threshold**. A high convergence score never ends a
+ * meeting early; a **failed turn does** — see `abortOnTurnFailure`. Otherwise rounds run to
+ * `max_rounds`, and the user's cancel can stop one at any point.
  *
- * Three rules running all the way through:
- *   1. **Never fabricate**. Somebody timing out / crashing / producing unparseable output → record the
- *      status and the raw error honestly, leave the position NULL. The absent vote **does not
- *      participate** in consensus judging (see consensus.js: any non-position voids the round).
- *      Failure to agree is failure to agree —— do not synthesize a "conclusion" just to have something
- *      to show.
- *   2. **Isolation**. Isolated mode runs in a throwaway temp directory with all tools disabled; in
- *      project mode cwd is **the user's** directory with read-only tools only, and reporting is turned
- *      off via WORKGREMLIN_DISABLE (see agents.js). In both modes their data goes only into the
- *      council room's own tables and never touches members / tasks.
- *      **The project-mode directory is not ours; never delete it during wrap-up** —— see the two locks
- *      in closeCouncil.
- *   3. **Processes must be reaped cleanly**. In-flight child processes are registered in active —— both
- *      "cancel" and "shutdown" kill them together with their own children, leaving no orphans.
+ * Four invariants:
+ *   1. **Never fabricate**. A timed-out / crashed / unparseable turn is recorded with its real status
+ *      and raw error; its contribution stays empty. No opinion is supplied on its behalf.
+ *   2. **The convergence score is server-computed** from the reviews and the moderator's conflict list
+ *      (see convergence.js). A model-reported score is never read, let alone trusted.
+ *   3. **Isolation**. Participants are read-only. A user-supplied workspace is never written to and
+ *      never deleted; only a temp directory this orchestrator created is removed at wrap-up. Report
+ *      files go only into `~/.workgremlin/councils/<id>/`.
+ *   4. **Processes are reaped**. In-flight children are kept in `ctx.children`; cancel and shutdown
+ *      kill each process group.
  *
- *      This only holds **when going through the shutdown flow** (`lifecycle.onClose` → `shutdown()`).
- *      When the process is taken away by `kill -9` or `process.exit()` directly, no code gets a chance
- *      to kill them and those few in-flight CLIs live until they finish answering the current round
- *      (they are one-shot invocations and exit by themselves afterwards). The cost is bounded but
- *      real —— **do not** wrap things up with process.exit on the server, that skips shutdown.
- *
- * Every dependency is injectable (runTurn / detect / mkdtemp / now), so the state machine can be run
- * end-to-end with **fake participants** without really calling models (see
- * server/test/councilOrchestrator.test.js).
+ * Dependencies are injectable (`runTurn` / `cliPathOf` / `mkdtemp` / `now`), so the flow can be tested
+ * end-to-end with fake participants.
  */
 
 const fs = require('node:fs');
@@ -54,15 +37,43 @@ const path = require('node:path');
 const { DEFAULTS, WS_EVENTS } = require('@workgremlin/shared');
 
 const { runOnce, killTree } = require('./runner');
-const { RECIPES, parseVoteBlock, parseAnalysisBlock } = require('./agents');
-const { buildSpeechPrompt, buildBriefText } = require('./prompt');
-const { decideRound } = require('./consensus');
+const { RECIPES } = require('./agents');
+const {
+  buildPlanPrompt,
+  buildProposalPrompt,
+  buildReviewPrompt,
+  buildModerationPrompt,
+  buildAdjudicationPrompt,
+  buildFinalDraftPrompt,
+  buildBriefText,
+} = require('./prompt');
+const {
+  parsePlanBlock,
+  parseProposalBlock,
+  parseReviewBlock,
+  parseModerationBlock,
+  parseAdjudicationBlock,
+  parseFinalBlock,
+} = require('./parse');
+const { computeStats, consistencyWarnings, finalWarnings } = require('./convergence');
+const { buildReportJson, writeCouncilReports } = require('./report');
 const { cliPathOf } = require('./floors');
 
 /** Temp directory prefix: recognizable at a glance in the process list as left by the council room */
 const TMP_PREFIX = 'wg-council-';
 
-/** DB snake_case → camelCase used by prompts / decisions. Only converts fields of the council room's own tables */
+/** Phase names used in error messages (the UI has its own translations; this is for the stored text) */
+const PHASE_ZH = {
+  brief: '议题陈述',
+  plan: '议题拆解',
+  proposal: '主答提案',
+  review: '评审',
+  moderation: '主持人汇总',
+  adjudication: '最终裁决',
+  final: '最终交付',
+};
+
+/** DB snake_case → camelCase used by prompts */
 function materialOf(row) {
   return {
     path: row.path,
@@ -73,90 +84,137 @@ function materialOf(row) {
   };
 }
 
+function parseJson(value, fallback) {
+  if (value == null || value === '') return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+/** Assemble the RoundResult exposed to the API/prompts from a council_rounds row + review rows. */
+function roundResultOf(row, reviewRows) {
+  const moderator = parseJson(row.moderator_json, null);
+  const stats = parseJson(row.stats_json, null);
+  return {
+    round: row.round_no,
+    proposal: {
+      version: row.version != null ? row.version : null,
+      content: row.proposal_text != null ? row.proposal_text : '',
+      diffFromPrev: row.diff_from_prev != null ? row.diff_from_prev : null,
+    },
+    reviews: (reviewRows || []).map((r) => ({
+      reviewer: r.reviewer,
+      severity: r.severity,
+      dimension: r.dimension,
+      issue: r.issue,
+      evidence: r.evidence != null ? r.evidence : undefined,
+      suggestion: r.suggestion,
+      stance: r.stance,
+    })),
+    moderator: {
+      consensus: (moderator && moderator.consensus) || [],
+      openIssues: (moderator && moderator.openIssues) || [],
+      conflicts: (moderator && moderator.conflicts) || [],
+      revisionDirectives: (moderator && moderator.revisionDirectives) || [],
+      convergenceScore: stats && typeof stats.score === 'number' ? stats.score : null,
+    },
+    stats,
+    warnings: (moderator && moderator.warnings) || [],
+  };
+}
+
 /**
  * @param {{repo:object, broadcast?:Function, deps?:object}} arg
- *   broadcast(project, type, payload) —— the council room has nothing to do with projects, pass null.
- *   deps is injectable: runTurn / detect / mkdtemp / now / timeoutMs, for tests.
+ *   broadcast(project, type, payload) — the council room is independent of projects, so project is null.
  */
 function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   const runTurn = deps.runTurn || runOnce;
   const now = deps.now || (() => Date.now());
-  /** Takes a **prefix**, returns a directory path (same semantics as fs.mkdtempSync, easy to swap in tests) */
   const mkdtemp = deps.mkdtemp || ((prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const timeoutMs = deps.timeoutMs || DEFAULTS.COUNCIL_TURN_TIMEOUT_MS;
-  /** Per-round timeout in project mode: participants dig through code themselves, much wider than the
-   *  "just talking" kind (see shared/index.js) */
   const workspaceTimeoutMs = deps.workspaceTimeoutMs || DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS;
   const removeDir = deps.removeDir || ((dir) => fs.rmSync(dir, { recursive: true, force: true }));
-  /** Whether the directory still exists (confirmed once more before kick-off in project mode, injectable) */
-  const isDir = deps.isDir || ((p) => {
-    try {
-      return fs.statSync(p).isDirectory();
-    } catch {
-      return false;
-    }
-  });
-  /** Floor → executable path. Defaults to products detection; tests inject fakes */
+  const isDir =
+    deps.isDir ||
+    ((p) => {
+      try {
+        return fs.statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    });
   const cliPath = deps.cliPathOf || ((floorId) => cliPathOf(floorId));
 
-  /** In-flight meetings: councilId → { cancelled:boolean, children:Set, tmpDir:string } */
+  /** In-flight meetings: councilId → { cancelled, closed, children, tmpDir, ownsTmpDir, workDir } */
   const active = new Map();
 
-  const emit = (type, payload) => {
+  const emit = (payload) => {
     if (typeof broadcast !== 'function') return;
     try {
-      broadcast(null, type, payload);
+      broadcast(null, WS_EVENTS.COUNCIL, payload);
     } catch {
-      /* a failed broadcast must not affect the meeting —— the frontend polls to catch up anyway */
+      /* a failed broadcast must not affect the meeting — the frontend polls to catch up */
     }
   };
 
-  /** Display name of a floor (the prompt needs it, so it knows whom it is facing) */
   function floorName(floorId) {
     const r = RECIPES[floorId];
     return (r && r.name) || floorId;
   }
 
   /**
-   * Run one participant's round.
+   * Mark and broadcast "who is working on what right now".
    *
-   * @param {{ctx:object, floor:object, prompt:string,
-   *          mode:'vote'|'analysis', timeoutMs:number}} arg
-   * @returns {Promise<{floorId:string, status:string, content:string|null, vote:string|null,
-   *   voteReason:string|null, proposal:string|null, second:string|null,
-   *   stance:string|null, findings:object|null, error:string|null,
-   *   tokens:object|null, startedAt:number, endedAt:number, durationMs:number}>}
+   * A turn can take minutes and produces no utterance until it ends, so without this the page has
+   * nothing to show after creation. It is also kept on the active context so a page reload can
+   * recover it (`progressOf`) — broadcast alone would only cover clients that were already open.
    */
-  async function askOne({ ctx, floor, prompt, mode, timeoutMs: perTurnMs }) {
+  function markProgress(ctx, roundNo, phase, floors) {
+    ctx.progress = {
+      roundNo,
+      phase,
+      floors: Array.isArray(floors) ? floors : [],
+      startedAt: now(),
+    };
+    emit({ councilId: ctx.councilId, status: 'running', ...ctx.progress });
+  }
+
+  /**
+   * Run one participant once and return its raw output. Parsing is deliberately **not** done here:
+   * each phase has its own parser, and "spoke but did not follow the protocol" must stay distinct from
+   * "did not speak at all".
+   */
+  async function askOne({ ctx, floor, prompt, perTurnMs }) {
     const startedAt = now();
     const recipe = RECIPES[floor.floor_id];
     const bin = floor.cli_path || cliPath(floor.floor_id);
 
-    // Spawn nothing for calls that surface after wrap-up. **Nothing can get here today**: spawning and
-    // registering the handle happen inside the same synchronous stretch (this function runs
-    // synchronously all the way to `await runTurn`, and spawn inside runOnce is synchronous), so a
-    // shutdown cannot slip in. It stays as an **invariant** ("never spawn during wrap-up") so that if
-    // an await is ever added ahead of runTurn, this cannot quietly leak a CLI nobody kills.
     if (ctx.cancelled || ctx.closed) {
       return {
         floorId: floor.floor_id,
         status: 'failed',
-        content: null, vote: null, voteReason: null, proposal: null, second: null,
-        stance: null, findings: null,
+        content: null,
+        model: null,
         error: '这一轮还没发问，这场会就已经在收尾了',
-        tokens: null, startedAt, endedAt: now(), durationMs: 0,
+        tokens: null,
+        startedAt,
+        endedAt: now(),
+        durationMs: 0,
       };
     }
-
-    // Not installed (or not detected at the time) —— no guessing, no skipping, record it honestly
     if (!recipe || !bin) {
       return {
         floorId: floor.floor_id,
         status: 'failed',
-        content: null, vote: null, voteReason: null, proposal: null, second: null,
-        stance: null, findings: null,
+        content: null,
+        model: null,
         error: recipe ? '没有可用的命令行可执行文件' : `议事厅不支持 ${floor.floor_id} 这一层`,
-        tokens: null, startedAt, endedAt: now(), durationMs: 0,
+        tokens: null,
+        startedAt,
+        endedAt: now(),
+        durationMs: 0,
       };
     }
 
@@ -167,8 +225,6 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       timeoutMs: perTurnMs,
       agent: recipe.agent,
       onChild: (child) => {
-        // Kill a late handle outright instead of hanging it on a registry nobody will walk again
-        // (same reason as above, unreachable today)
         if (ctx.cancelled || ctx.closed) {
           killTree(child);
           return;
@@ -178,50 +234,20 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       },
     });
 
-    const endedAt = now();
-    const base = {
-      floorId: floor.floor_id,
-      content: null, vote: null, voteReason: null, proposal: null, second: null,
-      stance: null, findings: null,
-      tokens: r.tokens || null, startedAt, endedAt, durationMs: r.durationMs,
-      error: r.error || null,
-      status: r.status === 'ok' ? 'ok' : r.status,
-    };
-    if (r.status !== 'ok') return base; // failed / timed out: both the body and the tail block stay empty
-
-    // Ran fine but **no parseable tail block** —— kept apart from "did not run": it did speak, it just
-    // did not take a position as agreed. The body is stored as-is, the position stays empty, and the
-    // status records 'unparsed'.
-    // Each mode parses its own (vote recognizes vote, analysis recognizes stance), and **unrecognized
-    // means unrecognized** —— never guess from tone.
-    if (mode === 'analysis') {
-      const a = parseAnalysisBlock(r.text);
-      return {
-        ...base,
-        content: r.text,
-        stance: a.stance,
-        findings: a.findings,
-        status: a.stance ? 'ok' : 'unparsed',
-      };
-    }
-    const vote = parseVoteBlock(r.text);
     return {
-      ...base,
-      content: r.text,
-      vote: vote.vote,
-      voteReason: vote.reason,
-      proposal: vote.proposal,
-      second: vote.second,
-      status: vote.vote ? 'ok' : 'unparsed',
+      floorId: floor.floor_id,
+      status: r.status, // ok / failed / timeout
+      content: r.status === 'ok' ? r.text : null,
+      model: r.model || null,
+      tokens: r.tokens || null,
+      error: r.error || null,
+      startedAt,
+      endedAt: now(),
+      durationMs: r.durationMs,
     };
   }
 
-  /**
-   * A wrapper around askOne: one participant blowing itself up must not take the **whole meeting**
-   * down with it. Record it as "no position expressed this round" (that invalid vote) and let everyone
-   * else be counted normally —— an absence voids the round, which is exactly what we want: one vote
-   * short is one vote short, do not pass three people's opinions off as a four-person consensus.
-   */
+  /** A participant blowing up must not take the whole meeting down; record it honestly instead. */
   async function askOneSafe(arg) {
     try {
       return await askOne(arg);
@@ -230,157 +256,309 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       return {
         floorId: arg.floor.floor_id,
         status: 'failed',
-        content: null, vote: null, voteReason: null, proposal: null, second: null,
-        stance: null, findings: null,
-        tokens: null, error: `调用参与者时出错：${err && err.message}`,
-        startedAt: at, endedAt: at, durationMs: 0,
+        content: null,
+        model: null,
+        tokens: null,
+        error: `调用参与者时出错：${err && err.message}`,
+        startedAt: at,
+        endedAt: at,
+        durationMs: 0,
       };
     }
   }
 
-  /** Persist one round's results + broadcast */
-  function recordUtterance(councilId, roundNo, u) {
+  /**
+   * Persist one turn and broadcast it.
+   *
+   * @param {string} councilId
+   * @param {number} roundNo
+   * @param {string} floorId
+   * @param {string} phase
+   * @param {{status:string, content:string|null, model:string|null, tokens:object|null,
+   *          error:string|null, startedAt:number, endedAt:number, durationMs:number}} turn
+   * @param {{status?:string, content?:string|null, parseDropped?:number}} [override]
+   */
+  function recordUtterance(councilId, roundNo, floorId, phase, turn, override = {}) {
+    const status = override.status || turn.status || 'ok';
+    const content = override.content !== undefined ? override.content : turn.content;
     repo.insertUtterance({
-      councilId, roundNo, floorId: u.floorId, role: 'speaker',
-      content: u.content, vote: u.vote, voteReason: u.voteReason,
-      proposalText: u.proposal, secondFloor: u.second,
-      stance: u.stance,
-      // Structured points are **serialized** to text when persisted: that DB column is TEXT, and
-      // querying / reproducing needs the verbatim original, so no table is built for them (these three
-      // are display-only and take part in no decision). null stays null rather than becoming '{}'.
-      findingsJson: u.findings ? JSON.stringify(u.findings) : null,
-      status: u.status, error: u.error,
-      inputTokens: u.tokens ? u.tokens.input : null,
-      outputTokens: u.tokens ? u.tokens.output : null,
-      cacheReadTokens: u.tokens ? u.tokens.cacheRead : null,
-      cacheWriteTokens: u.tokens ? u.tokens.cacheWrite : null,
-      startedAt: u.startedAt, endedAt: u.endedAt, durationMs: u.durationMs,
-    });
-    emit(WS_EVENTS.COUNCIL, {
       councilId,
+      roundNo,
+      floorId,
+      phase,
+      content,
+      model: turn.model,
+      status,
+      error: turn.error,
+      inputTokens: turn.tokens ? turn.tokens.input : null,
+      outputTokens: turn.tokens ? turn.tokens.output : null,
+      cacheReadTokens: turn.tokens ? turn.tokens.cacheRead : null,
+      cacheWriteTokens: turn.tokens ? turn.tokens.cacheWrite : null,
+      parseDropped: override.parseDropped != null ? override.parseDropped : 0,
+      startedAt: turn.startedAt,
+      endedAt: turn.endedAt,
+      durationMs: turn.durationMs,
+    });
+    emit({
+      councilId,
+      roundNo,
+      phase,
       utterance: {
-        roundNo, floorId: u.floorId, content: u.content, vote: u.vote,
-        voteReason: u.voteReason, proposal: u.proposal, second: u.second,
-        // Those two analysis-mode fields travel over WS as an **already parsed object** (the HTTP path
-        // hands back TEXT) —— the frontend's normalizer has to accept both, see normFindings in
-        // renderer/src/lib/councilTimeline.js
-        stance: u.stance, findings: u.findings,
-        status: u.status, error: u.error, durationMs: u.durationMs,
+        roundNo,
+        floorId,
+        phase,
+        content,
+        model: turn.model || null,
+        status,
+        error: turn.error || null,
+        durationMs: turn.durationMs,
       },
     });
   }
 
+  function markParticipant(councilId, floorId, ok, error) {
+    try {
+      repo.setParticipantStatus(councilId, floorId, ok ? 'ok' : 'failed', error || null);
+    } catch {
+      /* participant status is display-only; a write failure must not abort the meeting */
+    }
+  }
+
   /**
-   * Wrap-up: persist verdict, clean the temp directory, broadcast, drop it from the in-flight table.
+   * Wrap-up: persist verdict, write the report archive, clean a temp dir we own, broadcast.
    *
-   * Note that it does **not patch up** a round interrupted halfway: when cancelled, the last round
-   * row's ended_at stays NULL and is left that way —— that round genuinely did not finish, and adding
-   * an end time would be fabrication. Which round it stopped on is recorded by
-   * councils.round_current, and the UI states plainly "cancelled while discussing round N".
+   * `report` is optional. When present it is already the built report model; writing it is best-effort
+   * but every failure is recorded, never swallowed silently.
    */
-  function closeCouncil(ctx, { verdict, verdictRound = null, error = null }) {
-    // Idempotent: on the shutdown path shutdown() already wrapped it up; writing again here would
-    // overwrite its conclusion
+  function closeCouncil(ctx, { verdict, error = null, report = null, reportFiles = null }) {
     if (ctx.closed) return repo.getCouncil(ctx.councilId);
     ctx.closed = true;
-    // Reap anything still in flight (normally empty on the clean-wrap-up path; only the cancel /
-    // exception paths have any)
+    ctx.progress = null;
     for (const child of ctx.children) killTree(child);
     ctx.children.clear();
-    const c = repo.finishCouncil(ctx.councilId, { verdict, verdictRound, error, endedAt: now() });
-    // **Only delete the temp directory we created ourselves.**
-    // In project mode cwd is the user's real project (ctx.tmpDir is null, ownsTmpDir is false) ——
-    // missing either lock turns this into `rm -rf the user's project`. `ownsTmpDir` looks redundant
-    // (a non-empty tmpDir already means "we created it"); it is there for whoever comes next: read this
-    // note before changing this code.
+
+    // A meeting can stop while someone is mid-turn (fail-fast or cancel). Their participant row would
+    // otherwise stay "running" forever and the page would claim they are still working.
+    try {
+      for (const p of repo.listParticipants(ctx.councilId)) {
+        if (p.status === 'running' || p.status === 'pending') {
+          repo.setParticipantStatus(
+            ctx.councilId,
+            p.floor_id,
+            'failed',
+            error || (verdict === 'cancelled' ? '会议已取消' : '会议提前结束')
+          );
+        }
+      }
+    } catch {
+      /* participant status is display-only; never let it block the close */
+    }
+
+    let c = repo.getCouncil(ctx.councilId);
+    try {
+      c = repo.finishCouncil(ctx.councilId, { verdict, error, endedAt: now() });
+    } catch (err) {
+      /* finish must not throw out of the fire-and-forget start(); the startup sweep is the fallback */
+      if (!c) throw err;
+    }
+
+    // Delete **only** the temp directory this orchestrator created. A user workspace is never touched.
     if (ctx.ownsTmpDir && ctx.tmpDir) {
       try {
         removeDir(ctx.tmpDir);
       } catch {
-        /* leave it if it cannot be removed; never call the whole meeting failed over a cleanup failure */
+        /* a cleanup failure must not mark the meeting failed */
       }
     }
     active.delete(ctx.councilId);
-    emit(WS_EVENTS.COUNCIL, {
+    emit({
       councilId: ctx.councilId,
-      status: c ? c.status : 'done',
+      status: c ? c.status : verdict === 'cancelled' ? 'cancelled' : verdict === 'failed' ? 'failed' : 'done',
       verdict,
-      verdictRound,
       error,
+      reportFiles,
     });
     return c;
   }
 
   /**
-   * Start a meeting. It only resolves once the whole meeting has run —— the route does **not await**
-   * it (the start endpoint must return immediately), so this **throws nothing**: the route calls it
-   * fire-and-forget, and a throw would become an unhandled rejection nobody catches (Node's default
-   * behavior takes the whole service down). Missing meetings / wrong states return quietly.
-   * @returns {Promise<object|null>} the councils row after wrap-up
+   * Decide the final verdict from what the final phase actually produced.
+   *   completed — adjudication parsed and the final draft exists
+   *   partial   — at least one round ran, but a final-phase turn is missing
+   *   failed    — no usable round at all
+   */
+  function finalVerdict(rounds, adjudication, finalDraft) {
+    if (!rounds.length) return 'failed';
+    if (adjudication && adjudication.parsed && adjudication.decision && finalDraft && finalDraft.content.trim()) {
+      return 'completed';
+    }
+    return 'partial';
+  }
+
+  /** Same mapping repo.finishCouncil applies, so the archived report agrees with the row. */
+  function statusOfVerdict(verdict) {
+    if (verdict === 'completed' || verdict === 'partial') return 'done';
+    if (verdict === 'cancelled') return 'cancelled';
+    return 'failed';
+  }
+
+  /**
+   * Build, write and persist the report. Shared by the normal wrap-up and by the early/failure
+   * paths so an interrupted meeting still leaves whatever evidence exists on disk.
+   *
+   * Every step is best-effort but never silent: a failure is appended to `warnings`, which the
+   * report itself carries.
+   *
+   * @returns {{report:object|null, files:string[]}}
+   */
+  function archiveReport(arg) {
+    const warnings = Array.isArray(arg.warnings) ? arg.warnings : [];
+    let reportModel;
+    try {
+      const councilRow = repo.getCouncil(arg.councilId) || {};
+      reportModel = buildReportJson({
+        // The archive is built before closeCouncil writes the verdict, so stamp the outcome here.
+        // Otherwise report.json would forever say status=running / verdict=null.
+        council: {
+          ...councilRow,
+          status: arg.verdict ? statusOfVerdict(arg.verdict) : councilRow.status,
+          verdict: arg.verdict != null ? arg.verdict : councilRow.verdict,
+          ended_at: now(),
+        },
+        participants: arg.participants || repo.listParticipants(arg.councilId),
+        utterances: arg.utterances || repo.listUtterances(arg.councilId),
+        rounds: arg.rounds || [],
+        reviews: repo.listReviews(arg.councilId),
+        plan: arg.plan ? { ...arg.plan, text: arg.planText } : null,
+        adjudication: arg.adjudication
+          ? { ...arg.adjudication, text: arg.adjudicationText }
+          : arg.adjudicationText
+            ? { parsed: false, text: arg.adjudicationText }
+            : null,
+        finalDraft: arg.finalDraft || null,
+        finalScore: arg.finalScore || null,
+        warnings,
+      });
+    } catch (err) {
+      warnings.push({
+        code: 'report_build_failed',
+        message: `生成报告失败：${err && err.message ? err.message : String(err)}`,
+      });
+      return { report: null, files: [] };
+    }
+
+    let written = { files: [] };
+    try {
+      written = writeCouncilReports({ councilId: arg.councilId, report: reportModel });
+    } catch (err) {
+      warnings.push({
+        code: 'report_write_failed',
+        message: `写入报告失败：${err && err.message ? err.message : String(err)}`,
+      });
+    }
+
+    const allFiles = written.files;
+    reportModel.files = allFiles;
+    reportModel.summary.warnings = warnings;
+
+    try {
+      repo.insertReport({
+        councilId: arg.councilId,
+        adjudicationJson: arg.adjudication ? JSON.stringify(arg.adjudication) : null,
+        adjudicationText: arg.adjudicationText || null,
+        finalDraftText: arg.finalDraft ? arg.finalDraft.content : null,
+        changeNotes: arg.finalDraft ? arg.finalDraft.changeNotes : null,
+        reportJson: JSON.stringify(reportModel),
+        filesJson: JSON.stringify(allFiles),
+        createdAt: now(),
+      });
+    } catch (err) {
+      warnings.push({
+        code: 'report_persist_failed',
+        message: `保存报告记录失败：${err && err.message ? err.message : String(err)}`,
+      });
+    }
+    return { report: reportModel, files: allFiles };
+  }
+
+  /**
+   * Start a meeting. It resolves only when the whole meeting has run. The route calls it
+   * fire-and-forget, so it **throws nothing**: a throw would become an unhandled rejection and take
+   * the service down.
    */
   async function start(councilId) {
     const council = repo.getCouncil(councilId);
     if (!council) return null;
-    if (!repo.markCouncilRunning(councilId, now())) {
-      // Not in draft (already running / already finished) —— do nothing, do not drag a running meeting
-      // back to the starting line
-      return repo.getCouncil(councilId);
-    }
+    if (!repo.markCouncilRunning(councilId, now())) return repo.getCouncil(councilId);
 
-    // Where to talk (orthogonal to how, see the notes on councils in schema.sql). The council is always
-    // **read-only**, so it always needs a directory to read:
-    //   · user gave a workspace —— use **the user's** directory. Note ctx.tmpDir stays null: that is why
-    //     the "delete directory" branch during wrap-up never touches it (see the two locks in closeCouncil).
-    //   · no workspace —— create a throwaway temp directory now, delete it at wrap-up, and treat it just
-    //     like a workspace directory (read-only tools; it is empty, so the participant really does go by
-    //     the material on the table).
     const workspace = council.workspace_path ? String(council.workspace_path) : '';
-    const mode = council.mode === 'analysis' ? 'analysis' : 'vote';
     const perTurnMs = workspace ? workspaceTimeoutMs : timeoutMs;
 
     let tmpDir = null;
     let workDir = workspace;
     if (workspace) {
-      // It was validated once at creation, but the user may have deleted it between those two steps ——
-      // confirm once more before kick-off. Without confirming, the four participants each fail once and
-      // the meeting ends up reported as "nobody expressed a position", hiding the real cause.
       if (!isDir(workspace)) {
         return repo.finishCouncil(councilId, {
-          verdict: 'failed', error: `工作目录不存在或不是目录：${workspace}`, endedAt: now(),
+          verdict: 'failed',
+          error: `工作目录不存在或不是目录：${workspace}`,
+          endedAt: now(),
         });
       }
     } else {
-      // Stop right here if the temp directory cannot be created —— it is already marked running, so it
-      // must be given an ending, otherwise a zombie meeting nobody can cancel stays in the DB (only
-      // next startup's reconciliation would clean it up)
       try {
         tmpDir = mkdtemp(TMP_PREFIX);
       } catch (err) {
         return repo.finishCouncil(councilId, {
-          verdict: 'failed', error: `建不出隔离目录：${err && err.message}`, endedAt: now(),
+          verdict: 'failed',
+          error: `建不出隔离目录：${err && err.message}`,
+          endedAt: now(),
         });
       }
       workDir = tmpDir;
     }
 
     const ctx = {
-      councilId, cancelled: false, closed: false, children: new Set(),
-      tmpDir, ownsTmpDir: Boolean(tmpDir), workDir,
+      councilId,
+      cancelled: false,
+      closed: false,
+      children: new Set(),
+      tmpDir,
+      ownsTmpDir: Boolean(tmpDir),
+      workDir,
     };
     active.set(councilId, ctx);
-    emit(WS_EVENTS.COUNCIL, { councilId, status: 'running', mode, workspace: workspace || null });
+    emit({ councilId, status: 'running', workspace: workspace || null });
+    markProgress(ctx, 0, 'brief', []);
+
+    const rounds = [];
+    let plan = null;
+    let planText = null;
+    let adjudication = null;
+    let adjudicationText = null;
+    let finalDraft = null;
+    const globalWarnings = [];
+    // Declared outside the try so the catch-all path can still archive attendance when something
+    // unexpected interrupts the meeting.
+    let participants = [];
 
     try {
-      const participants = repo.listParticipants(councilId);
-      // A meeting with nobody in it is not "failed to agree", it never started —— do not let it run
-      // N rounds and report no_consensus, that looks like it discussed something. The route validates
-      // once more (at least two floors); this is the fallback.
-      if (!participants.length) {
-        return closeCouncil(ctx, { verdict: 'failed', error: '这场会没有出席者' });
+      participants = repo.listParticipants(councilId);
+      const moderator = participants.find((p) => p.role === 'moderator');
+      const main = participants.find((p) => p.role === 'main');
+      const reviewers = participants.filter((p) => p.role === 'reviewer');
+
+      const missingRole = !moderator
+        ? '缺少主持人'
+        : !main
+          ? '缺少主答'
+          : !reviewers.length
+            ? '至少需要一位评审'
+            : null;
+      if (missingRole) {
+        return closeCouncil(ctx, { verdict: 'failed', error: `出席角色不完整：${missingRole}` });
       }
 
       const materials = repo.listMaterials(councilId).map(materialOf);
-      const threshold = council.threshold;
       const maxRounds = Math.max(
         1,
         Math.min(
@@ -389,141 +567,608 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         )
       );
 
-      // ---- Round 0: topic presentation. No model call: put the topic + materials on the table and
-      //      record it as a chair speech, so the timeline starts from "what the question is" rather
-      //      than popping into existence at round 1.
+      /**
+       * Fail fast. One participant not answering ends the meeting right here instead of running
+       * minutes of later turns that can no longer produce a usable round. Whatever was already
+       * produced is archived and the real reason is kept.
+       */
+      function abortOnTurnFailure({ turn, floor, phase, roundNo, message, code = 'turn_failed' }) {
+        const detail = turn.error || (turn.status === 'ok' ? '输出无法解析' : turn.status);
+        const reason =
+          message ||
+          `第 ${roundNo} 轮${PHASE_ZH[phase] || phase}（${floor.floor_id} ${floorName(
+            floor.floor_id
+          )}）没有答上来：${detail}`;
+        globalWarnings.push({ code, message: reason, round: roundNo });
+        const verdict = rounds.length ? 'partial' : 'failed';
+        const archived = archiveReport({
+          councilId,
+          workspace,
+          participants,
+          rounds,
+          plan,
+          planText,
+          adjudication,
+          adjudicationText,
+          finalDraft,
+          finalScore: rounds.length ? rounds[rounds.length - 1].stats : null,
+          warnings: globalWarnings,
+          verdict,
+        });
+        return closeCouncil(ctx, {
+          verdict,
+          error: reason,
+          report: archived.report,
+          reportFiles: archived.files,
+        });
+      }
+
+      // ---- Round 0: the server puts the topic on the table (no model call), then the moderator plans.
+      repo.setCouncilRound(councilId, 0);
       const briefText = buildBriefText(council.topic, materials);
-      repo.upsertRound({
-        councilId, roundNo: 0, kind: 'brief', proposalText: council.topic,
-        proposalFrom: 'chair', agree: 0, disagree: 0, abstain: 0, invalid: 0, consensus: 0,
-        startedAt: now(), endedAt: now(),
-      });
+      const briefAt = now();
       repo.insertUtterance({
-        councilId, roundNo: 0, floorId: 'chair', role: 'chair',
-        content: briefText, status: 'ok', startedAt: now(), endedAt: now(), durationMs: 0,
+        councilId,
+        roundNo: 0,
+        floorId: 'system',
+        phase: 'brief',
+        content: briefText,
+        status: 'ok',
+        startedAt: briefAt,
+        endedAt: briefAt,
+        durationMs: 0,
       });
-      emit(WS_EVENTS.COUNCIL, {
-        councilId, roundNo: 0, phase: 'brief',
-        utterance: { roundNo: 0, floorId: 'chair', role: 'chair', content: briefText, status: 'ok' },
+      emit({
+        councilId,
+        roundNo: 0,
+        phase: 'brief',
+        utterance: { roundNo: 0, floorId: 'system', phase: 'brief', content: briefText, status: 'ok' },
       });
 
-      // ---- Rounds 1..N
-      const analysis = mode === 'analysis';
-      let proposal = council.topic;
-      let proposalFrom = 'chair';
-      let history = [];
-      let verdict = null;
-      let verdictRound = null;
+      const planStarted = now();
+      markProgress(ctx, 0, 'plan', [moderator.floor_id]);
+      const planTurn = await askOneSafe({
+        ctx,
+        floor: moderator,
+        perTurnMs,
+        prompt: buildPlanPrompt({
+          topic: council.topic,
+          materials,
+          workspace: ctx.workDir || null,
+          floorId: moderator.floor_id,
+          floorName: floorName(moderator.floor_id),
+          reviewers: reviewers.map((r) => ({
+            floorId: r.floor_id,
+            floorName: floorName(r.floor_id),
+          })),
+        }),
+      });
+
+      if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
+
+      if (planTurn.status === 'ok') {
+        plan = parsePlanBlock(planTurn.content);
+        planText = planTurn.content;
+      }
+      recordUtterance(councilId, 0, moderator.floor_id, 'plan', planTurn, {
+        status: planTurn.status === 'ok' ? (plan && plan.parsed ? 'ok' : 'unparsed') : planTurn.status,
+      });
+      markParticipant(councilId, moderator.floor_id, planTurn.status === 'ok', planTurn.error);
+      // No warning here: an unusable plan aborts below, and abortOnTurnFailure records the reason
+      // (with code 'plan_unparsed' for a reply that parsed to nothing).
+      repo.upsertRound({
+        councilId,
+        roundNo: 0,
+        kind: 'plan',
+        version: null,
+        proposalText: null,
+        diffFromPrev: null,
+        proposalFrom: moderator.floor_id,
+        moderatorJson: plan ? JSON.stringify(plan) : JSON.stringify({ parsed: false }),
+        statsJson: null,
+        startedAt: planStarted,
+        endedAt: now(),
+      });
+      emit({
+        councilId,
+        roundNo: 0,
+        phase: 'plan',
+        plan,
+        status: planTurn.status,
+      });
+
+      if (planTurn.status !== 'ok' || !plan || !plan.parsed) {
+        return abortOnTurnFailure({
+          turn: planTurn,
+          floor: moderator,
+          phase: 'plan',
+          roundNo: 0,
+          code: planTurn.status === 'ok' ? 'plan_unparsed' : 'turn_failed',
+        });
+      }
+
+      let previousProposal = null;
+      let previousDirectives = [];
 
       for (let roundNo = 1; roundNo <= maxRounds; roundNo += 1) {
         if (ctx.cancelled) break;
-
         repo.setCouncilRound(councilId, roundNo);
-        // Analysis mode has no "proposal on the table" —— leave proposal_* empty rather than passing the
-        // topic off as a proposal somebody voted on
-        repo.upsertRound({
-          councilId, roundNo, kind: 'debate',
-          proposalText: analysis ? null : proposal,
-          proposalFrom: analysis ? null : proposalFrom,
-          agree: 0, disagree: 0, abstain: 0, invalid: 0, consensus: 0, startedAt: now(), endedAt: null,
-        });
-        emit(WS_EVENTS.COUNCIL, {
-          councilId, roundNo, phase: 'debate', mode,
-          proposal: analysis ? null : proposal,
-          proposalFrom: analysis ? null : proposalFrom,
-        });
 
-        // Ask everyone concurrently —— participants in a round are independent of each other; going
-        // serial only multiplies the waiting for nothing
-        const prompts = participants.map((floor) => ({
-          floor,
-          prompt: buildSpeechPrompt({
-            topic: council.topic, materials,
-            proposal: analysis ? '' : proposal,
-            proposalFrom: analysis ? '' : proposalFrom,
-            roundNo, maxRounds, history,
-            floorId: floor.floor_id, floorName: floorName(floor.floor_id),
-            // The directory the participant actually reads: the user's workspace, or the throwaway temp
-            // directory when none was given (both get the read-only role block).
-            mode, workspace: ctx.workDir || null,
+        // ---------- proposal ----------
+        markProgress(ctx, roundNo, 'proposal', [main.floor_id]);
+        const proposalTurn = await askOneSafe({
+          ctx,
+          floor: main,
+          perTurnMs,
+          prompt: buildProposalPrompt({
+            topic: council.topic,
+            materials,
+            workspace: ctx.workDir || null,
+            floorId: main.floor_id,
+            floorName: floorName(main.floor_id),
+            roundNo,
+            maxRounds,
+            plan,
+            previousRounds: rounds,
+            directives: previousDirectives,
+            priorProposal: previousProposal,
           }),
-        }));
-        for (const floor of participants) repo.setParticipantStatus(councilId, floor.floor_id, 'running', null);
-        const answers = await Promise.all(
-          prompts.map((p) => askOneSafe({ ctx, ...p, mode, timeoutMs: perTurnMs }))
+        });
+        if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
+
+        const proposalParsed =
+          proposalTurn.status === 'ok' ? parseProposalBlock(proposalTurn.content) : null;
+        const proposalContent = proposalParsed ? proposalParsed.content.trim() : '';
+        const proposalOk = proposalTurn.status === 'ok' && Boolean(proposalContent);
+        const proposalStatus = !proposalOk
+          ? proposalTurn.status === 'ok'
+            ? 'unparsed'
+            : proposalTurn.status
+          : proposalParsed.parsed
+            ? 'ok'
+            : 'unparsed';
+
+        recordUtterance(councilId, roundNo, main.floor_id, 'proposal', proposalTurn, {
+          status: proposalStatus,
+          parseDropped: proposalParsed ? proposalParsed.dropped : 0,
+        });
+        markParticipant(councilId, main.floor_id, proposalOk, proposalTurn.error);
+
+        if (!proposalOk) {
+          // No proposal = nothing to review. Do not recycle the previous version as if it were new.
+          return abortOnTurnFailure({
+            turn: proposalTurn,
+            floor: main,
+            phase: 'proposal',
+            roundNo,
+            message: `第 ${roundNo} 轮主答没有产出可用方案（${proposalStatus}）`,
+            code: 'proposal_missing',
+          });
+        }
+
+        const version = `v${roundNo}`;
+        const diffFromPrev =
+          roundNo === 1
+            ? null
+            : proposalParsed.diffFromPrev
+              ? proposalParsed.diffFromPrev
+              : null;
+        if (roundNo > 1 && !diffFromPrev) {
+          globalWarnings.push({
+            code: 'missing_diff',
+            message: `第 ${roundNo} 轮主答没有给出 diffFromPrev，无法核对相对上一版改了什么`,
+          });
+        }
+        if (proposalParsed.parsed === false) {
+          globalWarnings.push({
+            code: 'proposal_unparsed',
+            message: `第 ${roundNo} 轮主答没有给出可解析的提案 JSON 尾块`,
+          });
+        }
+
+        const proposal = {
+          version,
+          content: proposalContent,
+          diffFromPrev,
+          addressed: proposalParsed.addressed,
+        };
+        repo.upsertRound({
+          councilId,
+          roundNo,
+          kind: 'debate',
+          version,
+          proposalText: proposal.content,
+          diffFromPrev,
+          proposalFrom: main.floor_id,
+          moderatorJson: null,
+          statsJson: null,
+          startedAt: now(),
+          endedAt: null,
+        });
+        emit({ councilId, roundNo, phase: 'proposal', proposal });
+
+        // ---------- reviews (parallel, independent) ----------
+        repo.delReviewsFromRound(councilId, roundNo);
+        for (const r of reviewers) repo.setParticipantStatus(councilId, r.floor_id, 'running', null);
+        markProgress(
+          ctx,
+          roundNo,
+          'review',
+          reviewers.map((r) => r.floor_id)
         );
 
-        if (ctx.cancelled) break;
+        const reviewTurns = await Promise.all(
+          reviewers.map((r) =>
+            askOneSafe({
+              ctx,
+              floor: r,
+              perTurnMs,
+              prompt: buildReviewPrompt({
+                topic: council.topic,
+                materials,
+                workspace: ctx.workDir || null,
+                floorId: r.floor_id,
+                floorName: floorName(r.floor_id),
+                roundNo,
+                maxRounds,
+                plan,
+                proposal,
+                previousDirectives,
+                previousProposal,
+              }),
+            })
+          )
+        );
+        if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
 
-        for (const a of answers) {
-          recordUtterance(councilId, roundNo, a);
-          // A participant's overall state = its **latest round's** result (per-round detail lives in
-          // utterances, do not smear it in here)
-          repo.setParticipantStatus(councilId, a.floorId, a.status === 'ok' ? 'ok' : 'failed', a.error);
-        }
-
-        // Speeches entering the history carry round and floor name —— renderHistory groups by round and
-        // addresses by name, while answers only hold floorId
-        history = [
-          ...history,
-          ...answers.map((a) => ({ ...a, roundNo, floorName: floorName(a.floorId) })),
-        ];
-
-        if (analysis) {
-          // Analysis mode does **no vote judging, no proposal swapping, no early stop**: it runs the
-          // configured number of rounds. The three vote-type columns record 0 (this meeting really had
-          // nobody voting, not "0 votes were cast"), and only "how many failed to give a position this
-          // round" goes into invalid —— that criterion means the same thing in both modes.
-          const invalid = answers.filter((a) => a.status !== 'ok').length;
-          repo.upsertRound({
-            councilId, roundNo, kind: 'debate', proposalText: null, proposalFrom: null,
-            agree: 0, disagree: 0, abstain: 0, invalid, consensus: 0,
-            startedAt: null, endedAt: now(),
+        const reviews = [];
+        const submittedReviewers = [];
+        for (let i = 0; i < reviewers.length; i += 1) {
+          const reviewer = reviewers[i];
+          const turn = reviewTurns[i];
+          const parsed = turn.status === 'ok' ? parseReviewBlock(turn.content) : null;
+          const mine = parsed ? parsed.reviews : [];
+          const status = turn.status === 'ok' ? (parsed && parsed.parsed ? 'ok' : 'unparsed') : turn.status;
+          recordUtterance(councilId, roundNo, reviewer.floor_id, 'review', turn, {
+            status,
+            parseDropped: parsed ? parsed.dropped : 0,
           });
-          emit(WS_EVENTS.COUNCIL, { councilId, roundNo, mode, round: { agree: 0, disagree: 0, abstain: 0, invalid, consensus: 0 } });
-          continue;
+          // A reviewer that produced a valid block (even with zero items) counts as submitted.
+          if (status === 'ok') submittedReviewers.push(reviewer.floor_id);
+          markParticipant(councilId, reviewer.floor_id, status === 'ok', turn.error);
+          for (const rv of mine) reviews.push({ ...rv, reviewer: reviewer.floor_id });
+          emit({
+            councilId,
+            roundNo,
+            phase: 'review',
+            reviewer: reviewer.floor_id,
+            reviews: mine,
+            status,
+            parseDropped: parsed ? parsed.dropped : 0,
+          });
+        }
+        // Persist the points themselves (not just the raw utterance): the report, the CSV export,
+        // and a reloaded page all read from council_reviews.
+        repo.insertReviews(councilId, roundNo, reviews, now());
+
+        // Every reviewer is required: an unanswered or unparseable one leaves the round without the
+        // independent opinions the score depends on, so the meeting stops instead of pretending.
+        const failedReviewers = reviewers.filter((r) => !submittedReviewers.includes(r.floor_id));
+        if (failedReviewers.length) {
+          const first = failedReviewers[0];
+          const firstTurn = reviewTurns[reviewers.indexOf(first)];
+          const detailOf = (turn) =>
+            turn.error || (turn.status === 'ok' ? '输出无法解析' : turn.status);
+          return abortOnTurnFailure({
+            turn: firstTurn,
+            floor: first,
+            phase: 'review',
+            roundNo,
+            message: `第 ${roundNo} 轮评审没有答上来：${failedReviewers
+              .map((r) => `${r.floor_id} ${floorName(r.floor_id)}（${detailOf(reviewTurns[reviewers.indexOf(r)])}）`)
+              .join('、')}`,
+            code: 'turn_failed',
+          });
         }
 
-        const decision = decideRound({ utterances: answers, threshold, maxRounds, roundNo });
-        repo.upsertRound({
-          councilId, roundNo, kind: 'debate', proposalText: proposal, proposalFrom,
-          agree: decision.tally.agree, disagree: decision.tally.disagree,
-          abstain: decision.tally.abstain, invalid: decision.tally.invalid,
-          consensus: decision.consensus ? 1 : 0, startedAt: null, endedAt: now(),
+        // ---------- moderator convergence ----------
+        markProgress(ctx, roundNo, 'moderation', [moderator.floor_id]);
+        repo.setParticipantStatus(councilId, moderator.floor_id, 'running', null);
+        const moderationTurn = await askOneSafe({
+          ctx,
+          floor: moderator,
+          perTurnMs,
+          prompt: buildModerationPrompt({
+            topic: council.topic,
+            materials,
+            workspace: ctx.workDir || null,
+            floorId: moderator.floor_id,
+            floorName: floorName(moderator.floor_id),
+            roundNo,
+            maxRounds,
+            plan,
+            proposal,
+            reviews,
+            previousDirectives,
+          }),
         });
-        emit(WS_EVENTS.COUNCIL, { councilId, roundNo, mode, round: { ...decision.tally, consensus: decision.consensus } });
+        if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
 
-        if (decision.done) {
-          verdict = decision.outcome;
-          verdictRound = decision.consensus ? roundNo : null;
-          break;
+        const moderation =
+          moderationTurn.status === 'ok' ? parseModerationBlock(moderationTurn.content) : null;
+        const moderationStatus =
+          moderationTurn.status === 'ok'
+            ? moderation && moderation.parsed
+              ? 'ok'
+              : 'unparsed'
+            : moderationTurn.status;
+        recordUtterance(councilId, roundNo, moderator.floor_id, 'moderation', moderationTurn, {
+          status: moderationStatus,
+          parseDropped: moderation ? moderation.dropped : 0,
+        });
+        markParticipant(councilId, moderator.floor_id, moderationStatus === 'ok', moderationTurn.error);
+
+        if (moderationTurn.status !== 'ok' || !moderation || !moderation.parsed) {
+          return abortOnTurnFailure({
+            turn: moderationTurn,
+            floor: moderator,
+            phase: 'moderation',
+            roundNo,
+            code: moderationTurn.status === 'ok' ? 'moderation_unparsed' : 'turn_failed',
+          });
         }
-        // Next round: swap the proposal on the table for an objector's revision; with no revision
-        // submitted, keep this one (this is not "the server picking a better one" —— that would mean
-        // writing proposals for the participants, see the notes in consensus.js)
-        if (decision.nextProposal) {
-          proposal = decision.nextProposal.text;
-          proposalFrom = decision.nextProposal.floorId;
-        }
+
+        const moderatorResult = {
+          consensus: moderation ? moderation.consensus : [],
+          openIssues: moderation ? moderation.openIssues : [],
+          conflicts: moderation ? moderation.conflicts : [],
+          revisionDirectives: moderation ? moderation.revisionDirectives : [],
+        };
+        const stats = computeStats(reviews, moderatorResult.conflicts);
+        const warnings = consistencyWarnings({
+          round: roundNo,
+          reviews,
+          moderator: moderatorResult,
+          expectedReviewers: reviewers.map((r) => r.floor_id),
+          submittedReviewers,
+        });
+        for (const w of warnings) globalWarnings.push({ ...w, round: roundNo });
+
+        // The RoundResult contract includes convergenceScore on the moderator; the value is the
+        // **server-computed** score, never the model's own number.
+        moderatorResult.convergenceScore = stats.score;
+        const moderatorStored = {
+          ...moderatorResult,
+          warnings,
+        };
+        const roundResult = {
+          round: roundNo,
+          proposal: {
+            version,
+            content: proposal.content,
+            diffFromPrev,
+          },
+          reviews,
+          moderator: moderatorResult,
+          stats,
+          warnings,
+        };
+        rounds.push(roundResult);
+
+        repo.upsertRound({
+          councilId,
+          roundNo,
+          kind: 'debate',
+          version,
+          proposalText: proposal.content,
+          diffFromPrev,
+          proposalFrom: main.floor_id,
+          moderatorJson: JSON.stringify(moderatorStored),
+          statsJson: JSON.stringify(stats),
+          startedAt: null,
+          endedAt: now(),
+        });
+        emit({ councilId, roundNo, phase: 'moderation', round: roundResult });
+
+        previousProposal = { version, content: proposal.content, diffFromPrev };
+        previousDirectives = moderatorResult.revisionDirectives;
       }
 
       if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
 
-      // Running all rounds in analysis mode is a normal ending: there is **no "reached agreement or
-      // not"**, so the verdict is 'reported' (reported), not a judgment —— the UI draws a briefing from
-      // this record and synthesizes no conclusion. Fallback for vote mode: the loop ran out without
-      // breaking (theoretically impossible, the last round's decision.done is always true)
-      if (!verdict) verdict = analysis ? 'reported' : 'no_consensus';
-      return closeCouncil(ctx, { verdict, verdictRound });
+      if (!rounds.length) {
+        return closeCouncil(ctx, { verdict: 'failed', error: '没有完成任何一轮评审' });
+      }
+
+      // ---- Final phase: adjudication → final draft ----
+      const lastRound = rounds[rounds.length - 1];
+      const lastReviews = lastRound.reviews;
+
+      markProgress(ctx, lastRound.round, 'adjudication', [moderator.floor_id]);
+      repo.setParticipantStatus(councilId, moderator.floor_id, 'running', null);
+      const adjudicationTurn = await askOneSafe({
+        ctx,
+        floor: moderator,
+        perTurnMs,
+        prompt: buildAdjudicationPrompt({
+          topic: council.topic,
+          materials,
+          workspace: ctx.workDir || null,
+          floorId: moderator.floor_id,
+          floorName: floorName(moderator.floor_id),
+          maxRounds,
+          rounds,
+          proposal: lastRound.proposal,
+          reviews: lastReviews,
+          lastModeration: lastRound.moderator,
+        }),
+      });
+      if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
+      adjudication =
+        adjudicationTurn.status === 'ok' ? parseAdjudicationBlock(adjudicationTurn.content) : null;
+      adjudicationText = adjudicationTurn.content;
+      recordUtterance(councilId, lastRound.round, moderator.floor_id, 'adjudication', adjudicationTurn, {
+        status:
+          adjudicationTurn.status === 'ok'
+            ? adjudication && adjudication.parsed
+              ? 'ok'
+              : 'unparsed'
+            : adjudicationTurn.status,
+      });
+      markParticipant(
+        councilId,
+        moderator.floor_id,
+        adjudicationTurn.status === 'ok' && Boolean(adjudication && adjudication.parsed),
+        adjudicationTurn.error
+      );
+      for (const w of finalWarnings({
+        decision: adjudication ? adjudication.decision : null,
+        lastRoundReviews: lastReviews,
+      })) {
+        globalWarnings.push(w);
+      }
+      emit({
+        councilId,
+        roundNo: lastRound.round,
+        phase: 'adjudication',
+        adjudication,
+        status: adjudicationTurn.status,
+      });
+
+      if (adjudicationTurn.status !== 'ok' || !adjudication || !adjudication.parsed) {
+        return abortOnTurnFailure({
+          turn: adjudicationTurn,
+          floor: moderator,
+          phase: 'adjudication',
+          roundNo: lastRound.round,
+          message: '主持人最终裁决没有给出可解析的 JSON，报告按部分完成记录',
+          code: 'adjudication_unparsed',
+        });
+      }
+
+      markProgress(ctx, lastRound.round, 'final', [main.floor_id]);
+      repo.setParticipantStatus(councilId, main.floor_id, 'running', null);
+      const finalTurn = await askOneSafe({
+        ctx,
+        floor: main,
+        perTurnMs,
+        prompt: buildFinalDraftPrompt({
+          topic: council.topic,
+          materials,
+          workspace: ctx.workDir || null,
+          floorId: main.floor_id,
+          floorName: floorName(main.floor_id),
+          proposal: lastRound.proposal,
+          adjudication,
+          lastReviews,
+          rounds,
+        }),
+      });
+      if (ctx.cancelled) return closeCouncil(ctx, { verdict: 'cancelled' });
+      const finalParsed = finalTurn.status === 'ok' ? parseFinalBlock(finalTurn.content) : null;
+      const finalContent = finalParsed ? finalParsed.content.trim() : '';
+      finalDraft = finalContent
+        ? {
+            content: finalContent,
+            changeNotes: finalParsed.changeNotes,
+            addressed: finalParsed.addressed,
+          }
+        : null;
+      recordUtterance(councilId, lastRound.round, main.floor_id, 'final', finalTurn, {
+        status:
+          finalTurn.status === 'ok'
+            ? finalContent
+              ? finalParsed.parsed
+                ? 'ok'
+                : 'unparsed'
+              : 'unparsed'
+            : finalTurn.status,
+        parseDropped: finalParsed ? finalParsed.dropped : 0,
+      });
+      markParticipant(councilId, main.floor_id, Boolean(finalContent), finalTurn.error);
+      emit({
+        councilId,
+        roundNo: lastRound.round,
+        phase: 'final',
+        finalDraft,
+        status: finalTurn.status,
+      });
+
+      if (finalTurn.status !== 'ok' || !finalContent || !finalParsed || !finalParsed.parsed) {
+        return abortOnTurnFailure({
+          turn: finalTurn,
+          floor: main,
+          phase: 'final',
+          roundNo: lastRound.round,
+          message: '主答没有产出最终交付稿，报告按部分完成记录',
+          code: 'final_draft_missing',
+        });
+      }
+
+      const verdict = finalVerdict(rounds, adjudication, finalDraft);
+      if (verdict === 'partial') {
+        globalWarnings.push({
+          code: 'partial_run',
+          message: '评审轮次已完成，但最终裁决或最终交付稿缺失',
+        });
+      }
+
+      // ---- archive ----
+      const archived = archiveReport({
+        councilId,
+        workspace,
+        participants,
+        rounds,
+        plan,
+        planText,
+        adjudication,
+        adjudicationText,
+        finalDraft,
+        finalScore: lastRound.stats,
+        warnings: globalWarnings,
+        verdict,
+      });
+
+      return closeCouncil(ctx, {
+        verdict,
+        error: verdict === 'partial' ? '最终阶段未完整完成，报告按部分完成保存' : null,
+        report: archived.report,
+        reportFiles: archived.files,
+      });
     } catch (err) {
-      // A meeting-level surprise (a failed persist, etc.) —— record failed honestly and keep the raw error
-      return closeCouncil(ctx, { verdict: 'failed', error: `议事中断：${err && err.message}` });
+      // A meeting-level surprise: record it honestly, keep whatever was produced, and archive what
+      // we can. This path must never throw — start() is called fire-and-forget.
+      let archived = { report: null, files: [] };
+      try {
+        archived = archiveReport({
+          councilId,
+          workspace,
+          participants,
+          rounds,
+          plan,
+          planText,
+          adjudication,
+          adjudicationText,
+          finalDraft,
+          finalScore: rounds.length ? rounds[rounds.length - 1].stats : null,
+          warnings: globalWarnings,
+          verdict: 'failed',
+        });
+      } catch {
+        /* archiving is best-effort here; the meeting outcome below must still be recorded */
+      }
+      return closeCouncil(ctx, {
+        verdict: 'failed',
+        error: `议事中断：${err && err.message}`,
+        report: archived.report,
+        reportFiles: archived.files,
+      });
     }
   }
 
   /**
-   * Cancel a running meeting: kill every in-flight participant process and wrap up.
-   * Processes run inside awaits; the ctx.cancelled flag makes the main loop exit at its next checkpoint.
+   * Cancel a running meeting: kill every in-flight process and let the main loop wrap up at its next
+   * checkpoint.
    * @returns {boolean} whether a running meeting was really cancelled
    */
   function cancel(councilId) {
@@ -537,15 +1182,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
   /**
    * Server shutdown: kill every in-flight participant and give each in-flight meeting a definite ending.
-   *
-   * The order matters —— **wrap up our own first, then sweep the rest**:
-   *   · Meetings we handled ourselves get "interrupted by shutdown" = cancelled (with a reason), which
-   *     is more accurate than a blanket failed;
-   *   · The sweep step (failStaleCouncils) is left for `running` rows left behind by **another process's
-   *     previous crash** —— their processes are long gone, so they can only honestly be marked failed.
-   *     This is the same method startup reconciliation uses.
-   * Reversing it (sweeping first, wrapping up after) lets the start() coroutine that wakes up later
-   * rewrite the conclusion —— last writer wins.
+   * Wrap up our own meetings first, then sweep rows left by a previous crash.
    */
   function shutdown() {
     for (const ctx of [...active.values()]) {
@@ -560,10 +1197,18 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     }
   }
 
-  /** In-flight meetings (for tests and troubleshooting) */
   const activeIds = () => [...active.keys()];
 
-  return { start, cancel, shutdown, activeIds };
+  /**
+   * What a running meeting is doing right now. The detail endpoint returns it so a page reload still
+   * shows the working indicator; `null` means nothing is in flight.
+   */
+  function progressOf(councilId) {
+    const ctx = active.get(councilId);
+    return ctx && ctx.progress ? { ...ctx.progress } : null;
+  }
+
+  return { start, cancel, shutdown, activeIds, progressOf };
 }
 
-module.exports = { createCouncilOrchestrator, materialOf, TMP_PREFIX };
+module.exports = { createCouncilOrchestrator, materialOf, roundResultOf, TMP_PREFIX };

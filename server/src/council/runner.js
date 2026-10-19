@@ -15,9 +15,8 @@
  *   · **Cap the output**. A misbehaving CLI can spew hundreds of MB; without a cap we are betting
  *     the server's memory. It gets killed on overflow and recorded honestly as "failed" —— not
  *     cut in half and pretended to have finished.
- *   · **Timeout means "this vote is unavailable", not "wait a bit more"**: kill the process when
- *     the time comes and return status='timeout', so the caller records "no position expressed".
- *     Never return a half answer.
+ *   · **Timeout means "this turn did not answer", not "wait a bit more"**: kill the process when
+ *     the time comes and return status='timeout'. Never return a half answer.
  *
  * There are exactly three statuses in the return value: ok / failed / timeout.
  *   · ok       —— the process exited normally **and** the output parses into body text. Only then
@@ -25,9 +24,9 @@
  *   · failed   —— could not start (ENOENT), non-zero exit, unreadable output. error carries the
  *                 **raw text**, do not dress it up.
  *   · timeout  —— killed when the time came.
- * Body parsed but **no** vote block is not decided here: that is the caller's job (record
- * status='unparsed'), because "spoke but did not vote" has to stay distinguishable from "did not
- * speak at all".
+ * Body parsed but **no** structured block is not decided here: that is the caller's job (record
+ * status='unparsed'), because "spoke but gave no plan/review" has to stay distinguishable from
+ * "did not speak at all".
  */
 
 const { spawn } = require('node:child_process');
@@ -81,7 +80,7 @@ function killTree(child) {
  *   has to be able to kill in-flight processes when the user hits "cancel" or the server closes;
  *   a timeout alone would never get there in time.
  * @returns {Promise<{status:'ok'|'failed'|'timeout', text:string, tokens:object|null,
- *                    error:string|null, durationMs:number, exitCode:number|null}>}
+ *                    model:string|null, error:string|null, durationMs:number, exitCode:number|null}>}
  */
 function runOnce(arg) {
   const startedAt = Date.now();
@@ -127,6 +126,7 @@ function runOnce(arg) {
         status,
         text: extra.text != null ? extra.text : '',
         tokens: extra.tokens != null ? extra.tokens : null,
+        model: extra.model != null ? extra.model : null,
         error: extra.error != null ? extra.error : null,
         durationMs: Date.now() - startedAt,
         exitCode: extra.exitCode != null ? extra.exitCode : null,
@@ -181,10 +181,21 @@ function runOnce(arg) {
       const parsed = parseOutput(stdout);
       if (!parsed.ok) {
         const tail = (stdout.trim() || stderr.trim()).split(/\r?\n/).slice(-4).join('\n');
-        finish('failed', { error: `输出解析不出内容${tail ? `：${tail}` : '（stdout 是空的）'}`, exitCode: code, tokens: parsed.tokens });
+        // Sizes and exit code are the difference between "the CLI printed nothing" and "the CLI was
+        // cut off mid-write while still exiting 0" — the latter is what a truncated transcript looks like.
+        const size = `stdout ${Buffer.byteLength(stdout, 'utf8')} 字节，stderr ${Buffer.byteLength(
+          stderr,
+          'utf8'
+        )} 字节，退出码 ${code}`;
+        finish('failed', {
+          error: `输出解析不出内容（${size}）${tail ? `：${tail}` : '（stdout 是空的）'}`,
+          exitCode: code,
+          tokens: parsed.tokens,
+          model: parsed.model,
+        });
         return;
       }
-      finish('ok', { text: parsed.text, tokens: parsed.tokens, exitCode: code });
+      finish('ok', { text: parsed.text, tokens: parsed.tokens, model: parsed.model, exitCode: code });
     });
 
     if (arg.stdin != null && child.stdin) {

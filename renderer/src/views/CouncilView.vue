@@ -1,35 +1,35 @@
 <script setup>
 /**
- * Council: pick a few floors of agents, hold a meeting on one topic, and see whether they reach agreement.
+ * Council: one moderator, one main answerer, one or more reviewers, and a topic.
  *
- * This page's job is to **present faithfully**, not to hand over a nice-looking conclusion. So:
- *   · Whoever did not answer is written as "no stance", with the raw error in red —— not painted as a position;
- *   · Vote tallies are shown in two parts: the one the server determined (evidence) + the one counted from the utterances (cross-check),
- *     so a mismatch between the two is obvious at a glance;
- *   · When material was truncated, the material list says how many bytes the original had and how many were included;
- *   · When there is no consensus, plainly write "no consensus" and list each side's final position, without synthesizing a "conclusion".
+ * The page is deliberately split into "summary" and "process":
+ *   · the right side shows **summary only** — convergence score and how it was computed, opinion
+ *     counts, and each role's floor / model / token usage;
+ *   · the complete process (plan, every round's proposal + diff + reviews + moderator output,
+ *     adjudication, final draft) lives inside collapsed sections.
+ *
+ * Faithfulness rules that survive from the previous design:
+ *   · a participant that did not answer is shown with its raw error, never as an opinion;
+ *   · a round without a diff says so, instead of implying nothing changed;
+ *   · the convergence score comes from the server (derived from the reviews); the model's own
+ *     number is never displayed.
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useCouncilStore } from '../stores/council';
 import { useI18n } from '../i18n';
-import { voteKey, stanceKey, tokenTotal } from '../lib/councilTimeline';
+import { formatTokens } from '../lib/councilTimeline';
+import CouncilRawTurns from '../components/CouncilRawTurns.vue';
 
 const store = useCouncilStore();
 const { t } = useI18n();
 
-/**
- * Role assignment: one chair and one main answerer, participants can be multi-selected.
- * Backward compatible: on submit, merge the floors of the three roles into a floors array and send it to the server;
- * the server does not distinguish roles for now (until the orchestrator is changed later).
- */
 const form = reactive({
   topic: '',
-  chair: '',
-  mainAnswerer: '',
-  participants: [],
+  moderator: '',
+  main: '',
+  reviewers: [],
   files: '',
   maxRounds: 3,
-  mode: 'vote',
   workspace: '',
 });
 const formError = ref('');
@@ -47,12 +47,16 @@ const floorName = (id) => {
 };
 
 const readyFloors = computed(() => store.readyFloors);
-/** Participant options: the available floors other than the chair and main answerer */
-const participantOptions = computed(() =>
-  readyFloors.value.filter((f) => f.floorId !== form.chair && f.floorId !== form.mainAnswerer),
-);
-/** Floors that cannot be summoned (plugin installed but CLI missing, etc.); list them and state the reason */
 const notReadyFloors = computed(() => store.floors.filter((f) => !f.ready));
+/** Reviewers may be any ready floor except the two single-role seats. */
+const reviewerOptions = computed(() =>
+  readyFloors.value.filter((f) => f.floorId !== form.moderator && f.floorId !== form.main),
+);
+
+/** The same floor cannot hold two roles. Changing a single-role seat drops it from the reviewer list. */
+watch([() => form.moderator, () => form.main], () => {
+  form.reviewers = form.reviewers.filter((id) => id !== form.moderator && id !== form.main);
+});
 
 const files = () => form.files.split('\n').map((s) => s.trim()).filter(Boolean);
 
@@ -62,22 +66,24 @@ async function submit() {
     formError.value = t('council.need_topic');
     return;
   }
-  if (!form.chair) {
-    formError.value = t('council.need_chair');
+  if (!form.moderator) {
+    formError.value = t('council.need_moderator');
     return;
   }
-  if (!form.mainAnswerer) {
+  if (!form.main) {
     formError.value = t('council.need_main_answerer');
     return;
   }
-  const floors = [...new Set([form.chair, form.mainAnswerer, ...form.participants].filter(Boolean))];
-  if (floors.length < 2) {
-    formError.value = t('council.need_two_floors');
+  if (!form.reviewers.length) {
+    formError.value = t('council.need_reviewer');
     return;
   }
-  // The frontend only blocks on one thing for the workspace: **an absolute path is required**. Whether it exists or is a directory is left to the server ——
-  // it validates at the moment of start, which is more accurate than the frontend guessing, and its message is shown to the user verbatim.
-  // The frontend checks this one rule only to "save the user a round trip", not to make the judgment for them.
+  if (new Set([form.moderator, form.main, ...form.reviewers]).size !== 2 + form.reviewers.length) {
+    formError.value = t('council.need_distinct');
+    return;
+  }
+  // Absolute path only: whether it exists / is a directory is the server's call, and its message is
+  // shown verbatim. This check just saves a round trip.
   const ws = form.workspace.trim();
   if (ws && !/^(~\/|\/|[A-Za-z]:[\\/]|\\\\)/.test(ws)) {
     formError.value = t('council.workspace_abs');
@@ -85,10 +91,11 @@ async function submit() {
   }
   const id = await store.create({
     topic: form.topic.trim(),
-    floors,
+    moderator: form.moderator,
+    main: form.main,
+    reviewers: form.reviewers,
     files: files(),
     maxRounds: Number(form.maxRounds) || store.defaults.maxRounds,
-    mode: form.mode,
     workspacePath: ws,
   });
   if (id) form.topic = '';
@@ -97,114 +104,163 @@ async function submit() {
 /* ---------------------------------------------------------------- result */
 
 const council = computed(() => (store.current ? store.current.council : null));
-
-/** The round where consensus was reached —— the conclusion is the proposal text on its table, shown as-is, not rewritten by the frontend */
-const consensusRound = computed(() => {
-  if (!store.current) return null;
-  return store.current.rounds.find((r) => r.consensus === 1) || null;
-});
-
-/** The vote tally determined by the server (indexed by round), coexisting with the one counted from utterances */
-const serverTally = (roundNo) => (store.current ? store.current.rounds.find((r) => r.round_no === roundNo) : null) || null;
-
-const lastDebate = computed(() => {
-  const rounds = store.timeline.filter((g) => g.roundNo > 0);
-  return rounds.length ? rounds[rounds.length - 1] : null;
-});
-
-const statusKey = (s) => (['draft', 'running', 'done', 'failed', 'cancelled'].includes(s) ? s : 'done');
-const verdictKey = (v) =>
-  ['consensus', 'no_consensus', 'reported', 'cancelled', 'failed'].includes(v) ? v : 'failed';
+const summary = computed(() => store.summary);
+const rounds = computed(() => (store.current ? store.current.roundResults : []));
+const plan = computed(() => (store.current ? store.current.plan : null));
+const report = computed(() => (store.current ? store.current.report : null));
+const reportFiles = computed(() => (store.current ? store.current.reportFiles : []));
 
 /**
- * Analysis-mode report grouping —— **the server does not synthesize a conclusion, and neither do we**.
- * It does one thing only: place each person's final judgment from the last round together by stance, listing `points` / `risks` / `questions`
- * as-is. The order is fixed at four levels (support → oppose → unsure → none); empty groups are not rendered.
- *
- * Why the **last round** is authoritative: the prompt explicitly says the last round must give the final judgment, while the middle rounds are process ——
- * stacking every round's stance on top of each other makes it harder for the reader to see where they finally stand. The process is in the timeline below,
- * nothing is lost.
+ * Final-phase output. The authoritative copy is inside the persisted report (it survives a refresh);
+ * the WS-only copy is used while the meeting is still wrapping up.
  */
-const STANCE_ORDER = ['support', 'oppose', 'unsure', 'none'];
-const report = computed(() => {
-  if (!lastDebate.value) return [];
-  const seats = lastDebate.value.utterances.filter((u) => u.role !== 'chair');
-  return STANCE_ORDER.map((key) => ({
-    key,
-    items: seats.filter((u) => stanceKey(u.stance) === key),
-  })).filter((g) => g.items.length);
+const adjudication = computed(() => {
+  if (report.value && report.value.adjudication) return report.value.adjudication;
+  return (store.current && store.current.adjudication) || null;
+});
+const finalDraft = computed(() => {
+  if (report.value && report.value.finalDraft) return report.value.finalDraft;
+  return (store.current && store.current.finalDraft) || null;
+});
+const warnings = computed(() => {
+  const fromReport = report.value && report.value.summary && report.value.summary.warnings;
+  const list = Array.isArray(fromReport) ? fromReport : [];
+  if (list.length) return list;
+  const out = [];
+  for (const r of rounds.value) for (const w of r.warnings) out.push(w);
+  return out;
 });
 
-/** Stance counts in the report (counted from utterances). chair does not take a seat, consistent with the vote definition */
-const stanceTally = computed(() => (lastDebate.value ? lastDebate.value.stanceTally : null));
+const verdictKey = (v) => (['completed', 'partial', 'cancelled', 'failed'].includes(v) ? v : 'failed');
+const DECISIONS = ['approve', 'approve_with_changes', 'reject'];
+const decisionKey = (d) => (DECISIONS.includes(d) ? d : null);
+
+/** The phase the meeting is currently in, derived from the latest utterance. */
+const livePhase = computed(() => {
+  const list = store.current ? store.current.utterances : [];
+  const last = list.length ? list[list.length - 1] : null;
+  return last ? last.phase : null;
+});
 
 /**
- * An utterance's key points → grouped in pairs of "heading key + that column's entries"; empty columns do not appear.
- * When findings is null (unparsed), returns an empty array —— that is a different statement (findings_unparsed);
- * the caller branches on `!u.findings` and does not rely on this empty array to tell them apart.
+ * Who is working on what right now. A turn can take minutes and speaks only when it ends, so this
+ * strip is the honest answer to "is it stuck?" between utterances. Falls back to the latest
+ * utterance's phase for older payloads that carry no progress.
  */
-const findingRows = (u) => {
-  const f = u && u.findings;
-  if (!f) return [];
-  return [
-    ['council.points', f.points],
-    ['council.risks', f.risks],
-    ['council.questions', f.questions],
-  ]
-    .filter(([, v]) => Array.isArray(v) && v.length)
-    .map(([k, v]) => ({ k, v }));
-};
-
-/* ------------------------------------------------------- whose utterance to view in a round */
+const working = computed(() => {
+  if (!store.live) return null;
+  const w = store.working;
+  const phase = (w && w.phase) || livePhase.value || null;
+  return {
+    phase,
+    roundNo: w && typeof w.roundNo === 'number' ? w.roundNo : 0,
+    floors: ((w && w.floors) || []).map(floorName),
+  };
+});
 
 /**
- * A round may have several floors each saying a long passage; spreading them all out is screen after screen of text, and "who said what" becomes impossible to find.
- * So a round **expands only one person at a time**, with a row of dots above to pick who —— what is collapsed is the body text, not the facts:
- * the vote tally (vote mode) and "could not speak this round" stay on that row; nothing is allowed to be folded away.
- *
- * The key is the round number, the value is the floor. If nothing was picked, or the picked floor is gone in this round → fall back to the first in the round,
- * **never leave it empty**: showing no one in a round looks like no one spoke in it.
+ * Every recorded turn per round, including turns that failed or only half-parsed. `system` is the
+ * server's brief (the topic is already on screen), so it is not repeated here.
  */
-const picked = reactive({});
-const shownId = (g) => {
-  const want = picked[g.roundNo];
-  return g.utterances.some((u) => u.floorId === want) ? want : g.utterances[0] && g.utterances[0].floorId;
-};
-const shown = (g) => g.utterances.filter((u) => u.floorId === shownId(g));
-/** Round 0 has only the chair stating the topic; there is no "pick who", so do not show a row of dots with a single option */
-const hasPicks = (g) => g.utterances.length > 1 || (g.utterances.length === 1 && g.utterances[0].role !== 'chair');
+const turnsByRound = computed(() => {
+  const map = new Map();
+  for (const g of store.timeline) {
+    map.set(
+      g.roundNo,
+      g.utterances.filter((u) => u.floorId !== 'system')
+    );
+  }
+  return map;
+});
+const turnsOf = (roundNo) => turnsByRound.value.get(roundNo) || [];
 
-/** Clear the selection when switching councils: the 7F picked in the previous council should not carry over to this one */
-watch(
-  () => (store.current ? store.current.council.id : null),
-  () => Object.keys(picked).forEach((k) => delete picked[k]),
+/** Phases that only exist in a debate round (the adjudication/final round is shown elsewhere). */
+const DEBATE_PHASES = new Set(['plan', 'proposal', 'review', 'moderation']);
+
+/**
+ * Rounds that have raw turns but no completed RoundResult — fail-fast, cancel, or a round whose
+ * later phases never ran. They still happened and must be visible after the meeting ends.
+ */
+const incompleteRounds = computed(() =>
+  store.timeline
+    .filter((g) => !rounds.value.some((r) => r.round === g.roundNo))
+    .filter((g) => !(g.roundNo === 0 && plan.value))
+    .map((g) => ({ roundNo: g.roundNo, utterances: turnsOf(g.roundNo) }))
+    .filter((g) => g.utterances.some((u) => DEBATE_PHASES.has(u.phase)))
 );
 
-const fmtBytes = (n) => (n == null ? '—' : `${n.toLocaleString()}`);
+const SEVERITIES = ['blocker', 'major', 'minor', 'nit'];
+const ROLE_ORDER = { moderator: 0, main: 1, reviewer: 2 };
+const roles = computed(() =>
+  [...((summary.value && summary.value.roles) || [])].sort(
+    (a, b) => (ROLE_ORDER[a.role] ?? 9) - (ROLE_ORDER[b.role] ?? 9),
+  ),
+);
 
-/** Show only the numbers we have: a duration of 0 seconds and "duration unavailable" are not the same thing */
-const metaOf = (u) => {
-  const parts = [];
-  const tk = tokenTotal(u);
-  if (tk != null) parts.push(t('council.tokens', { n: tk }));
-  if (u.durationMs != null) parts.push(t('council.seconds', { n: (u.durationMs / 1000).toFixed(1) }));
-  return parts.join(' · ');
+const scoreMax = computed(() => store.defaults.scoreMax || 100);
+
+/** Explainable formula for one round, built from the server's stats (never from the model). */
+function formulaFor(round) {
+  if (!round || !round.stats) return '';
+  const weights = store.defaults.severityWeights || {};
+  const conflictWeight = store.defaults.conflictWeight != null ? store.defaults.conflictWeight : 10;
+  const by = round.stats.bySeverity || {};
+  const parts = SEVERITIES.map((s) => `${s} ${by[s] || 0}×${weights[s] || 0}`);
+  parts.push(`${t('council.conflicts')} ${round.stats.conflicts || 0}×${conflictWeight}`);
+  return `${scoreMax.value} - (${parts.join(' + ')})`;
+}
+
+const lastRound = computed(() => {
+  const list = rounds.value;
+  return list.length ? list[list.length - 1] : null;
+});
+const summaryFormula = computed(() => formulaFor(lastRound.value));
+
+const blockerCountOf = (round) => {
+  if (!round) return 0;
+  if (round.stats && round.stats.bySeverity && round.stats.bySeverity.blocker != null) {
+    return round.stats.bySeverity.blocker;
+  }
+  return round.reviews.filter((r) => r.severity === 'blocker').length;
 };
 
-/** Deletion is irreversible, so ask first; the copy states that the record is deleted along with it */
+const severityLabel = (s) => t(`council.severity.${s}`);
+const stanceLabel = (s) => t(`council.stance.${s}`);
+const roleLabel = (r) => t(`council.role.${r}`);
+
+/** Client-side JSON download; the server's CSV/Markdown files are listed separately. */
+function downloadReport() {
+  if (!report.value || !council.value) return;
+  const blob = new Blob([`${JSON.stringify(report.value, null, 2)}\n`], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `council-${council.value.id}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Deletion is irreversible, so ask first. */
 function confirmRemove(id) {
   if (window.confirm(t('council.delete_confirm'))) store.remove(id);
 }
 
-/** Timestamps in the history list: compact display; today shows only hour:minute, earlier shows month/day + hour:minute */
+/** History index timestamps always carry the date as well as the clock — "13:57" alone is ambiguous. */
 function fmtTime(ms) {
   if (!ms) return '';
   const d = new Date(ms);
   const pad = (n) => String(n).padStart(2, '0');
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  return sameDay ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+const fmtBytes = (n) => (n == null ? '—' : `${n.toLocaleString()}`);
+
+function toggleReviewer(id) {
+  const at = form.reviewers.indexOf(id);
+  if (at >= 0) form.reviewers.splice(at, 1);
+  else form.reviewers.push(id);
 }
 </script>
 
@@ -224,25 +280,23 @@ function fmtTime(ms) {
 
         <p v-if="!store.canStart" class="why bad" data-testid="cv-no-floors">{{ t('council.empty_floors') }}</p>
 
-        <div class="role-row">
-          <label class="role-lbl" for="cv-chair">{{ t('council.role.chair') }}</label>
-          <select id="cv-chair" v-model="form.chair" class="sel" data-testid="cv-chair" :disabled="!readyFloors.length">
-            <option value="">{{ t('council.role.please_select') }}</option>
-            <option v-for="f in readyFloors" :key="f.floorId" :value="f.floorId">
-              {{ f.floorId }} · {{ f.name }}
-            </option>
-          </select>
-        </div>
+        <p class="lbl">{{ t('council.roles') }}</p>
 
         <div class="role-row">
-          <label class="role-lbl" for="cv-main">{{ t('council.role.main_answerer') }}</label>
-          <select id="cv-main" v-model="form.mainAnswerer" class="sel" data-testid="cv-main" :disabled="!readyFloors.length">
+          <label class="role-lbl" for="cv-moderator">{{ t('council.role.moderator') }}</label>
+          <select
+            id="cv-moderator"
+            v-model="form.moderator"
+            class="sel"
+            data-testid="cv-moderator"
+            :disabled="!readyFloors.length"
+          >
             <option value="">{{ t('council.role.please_select') }}</option>
             <option
               v-for="f in readyFloors"
               :key="f.floorId"
               :value="f.floorId"
-              :disabled="f.floorId === form.chair"
+              :disabled="f.floorId === form.main"
             >
               {{ f.floorId }} · {{ f.name }}
             </option>
@@ -250,17 +304,44 @@ function fmtTime(ms) {
         </div>
 
         <div class="role-row">
-          <span class="role-lbl">{{ t('council.role.participants') }}</span>
-          <ul class="plist">
-            <li v-for="f in participantOptions" :key="f.floorId">
+          <label class="role-lbl" for="cv-main">{{ t('council.role.main') }}</label>
+          <select
+            id="cv-main"
+            v-model="form.main"
+            class="sel"
+            data-testid="cv-main"
+            :disabled="!readyFloors.length"
+          >
+            <option value="">{{ t('council.role.please_select') }}</option>
+            <option
+              v-for="f in readyFloors"
+              :key="f.floorId"
+              :value="f.floorId"
+              :disabled="f.floorId === form.moderator"
+            >
+              {{ f.floorId }} · {{ f.name }}
+            </option>
+          </select>
+        </div>
+
+        <div class="role-row">
+          <span class="role-lbl">{{ t('council.role.reviewer') }}</span>
+          <ul class="plist" data-testid="cv-reviewers">
+            <li v-for="f in reviewerOptions" :key="f.floorId">
               <label>
-                <input type="checkbox" :value="f.floorId" v-model="form.participants" />
+                <input
+                  type="checkbox"
+                  :value="f.floorId"
+                  :checked="form.reviewers.includes(f.floorId)"
+                  @change="toggleReviewer(f.floorId)"
+                />
                 <span class="fid">{{ f.floorId }}</span>
                 <span class="fname">{{ f.name }}</span>
               </label>
             </li>
-            <li v-if="!participantOptions.length" class="hint">{{ t('council.role.no_participants') }}</li>
+            <li v-if="!reviewerOptions.length" class="hint">{{ t('council.role.no_reviewers') }}</li>
           </ul>
+          <p class="hint">{{ t('council.role.reviewer_hint') }}</p>
         </div>
 
         <ul v-if="notReadyFloors.length" class="floors">
@@ -321,13 +402,7 @@ function fmtTime(ms) {
                 :max="store.defaults.maxRoundsLimit || 8"
               />
             </div>
-            <p class="hint">{{ form.mode === 'analysis' ? t('council.rounds_note_analysis') : t('council.rounds_note') }}</p>
-
-            <p v-if="form.mode === 'vote'" class="hint">
-              {{ t('council.threshold') }}：{{
-                store.defaults.threshold === 'majority' ? t('council.threshold.majority') : t('council.threshold.unanimous')
-              }} —— {{ t('council.threshold_note') }}
-            </p>
+            <p class="hint">{{ t('council.rounds_note') }}</p>
           </div>
         </div>
 
@@ -356,21 +431,19 @@ function fmtTime(ms) {
       </div>
     </aside>
 
-    <!-- ------------------------------------------------------------ right column: this council -->
+    <!-- ------------------------------------------------------------ right column: summary + collapsed process -->
     <section class="main">
       <p v-if="!store.current" class="empty">{{ t('council.pick_one') }}</p>
 
       <template v-else>
         <header class="head">
-          <div class="who">
-            <span class="badge" :class="'v-' + verdictKey(council.verdict || 'failed')">
-              {{ council.verdict ? t('council.verdict.' + verdictKey(council.verdict)) : t('council.status.' + statusKey(council.status)) }}
+          <!-- A running meeting is already described by the work strip below; repeating the state
+               here adds nothing. The verdict badge stays for a finished meeting, where it is the
+               only summary of how the meeting ended. -->
+          <div v-if="council.verdict" class="who">
+            <span class="badge" :class="'v-' + verdictKey(council.verdict)">
+              {{ t('council.verdict.' + verdictKey(council.verdict)) }}
             </span>
-            <!-- Both the mode and the workspace are shown here: in hindsight, "where they talked" is a prerequisite for understanding this council -->
-            <span class="badge m" :class="'m-' + store.mode" data-testid="cv-mode-badge">
-              {{ t('council.mode.' + store.mode) }}
-            </span>
-            <span v-if="store.live" class="live" data-testid="cv-live">● {{ t('council.live') }}</span>
           </div>
           <h2 class="topic-h">{{ council.topic }}</h2>
           <p v-if="store.workspacePath" class="ws mono" data-testid="cv-workspace-show">
@@ -379,249 +452,307 @@ function fmtTime(ms) {
           <div class="acts">
             <button v-if="store.live" class="ghost" @click="store.cancel(council.id)">{{ t('council.cancel') }}</button>
             <button v-else class="ghost danger" @click="confirmRemove(council.id)">{{ t('council.delete') }}</button>
+            <button v-if="report" class="ghost" data-testid="cv-download" @click="downloadReport">
+              {{ t('council.download_json') }}
+            </button>
           </div>
         </header>
 
+        <!-- ------------------------------------------------- live work strip -->
+        <div v-if="working" class="working" data-testid="cv-working" role="status" aria-live="polite">
+          <span class="pulse" aria-hidden="true"></span>
+          <strong class="working-hd">{{ t('council.working_now') }}</strong>
+          <template v-if="working.floors.length">
+            <span class="sep">·</span>
+            <span class="working-floors">{{ working.floors.join('、') }}</span>
+          </template>
+          <template v-if="working.phase">
+            <span class="sep">·</span>
+            <span>{{ t('council.phase.' + working.phase) }}</span>
+          </template>
+          <span class="sep">·</span>
+          <span class="dim">{{ t('council.round_n', { n: working.roundNo }) }}</span>
+        </div>
+
         <p v-if="store.error" class="why bad" data-testid="cv-op-error">{{ store.error }}</p>
 
-        <!--
-          The analysis-mode report. **It must come before the generic verdict branch below** ——
-          otherwise verdict='reported' would fall into the last "aborted" box and look like this council went wrong.
-          Here too no conclusion is synthesized: it only groups by stance and lists what each side said as-is.
-        -->
-        <div
-          v-if="store.mode === 'analysis' && council.verdict === 'reported'"
-          class="result report"
-          data-testid="cv-report"
-        >
-          <h3 class="h3">{{ t('council.report') }}</h3>
-          <p class="hint">{{ t('council.report_hint', { n: council.max_rounds }) }}</p>
-          <p v-if="stanceTally" class="tally" data-testid="cv-report-tally">
-            {{
-              t('council.stance_tally', {
-                support: stanceTally.support,
-                oppose: stanceTally.oppose,
-                unsure: stanceTally.unsure,
-                none: stanceTally.none,
-              })
-            }}
-          </p>
-
-          <section
-            v-for="g in report"
-            :key="g.key"
-            class="rgroup"
-            :class="'v-' + g.key"
-            :data-testid="'cv-group-' + g.key"
-          >
-            <h4 class="gh">{{ t('council.stance.' + g.key) }}（{{ g.items.length }}）</h4>
-            <ul class="rlist">
-              <li v-for="u in g.items" :key="u.floorId">
-                <div class="line">
-                  <span class="fid">{{ u.floorId }}</span>
-                  <span class="fname">{{ floorName(u.floorId) }}</span>
-                  <span v-if="u.stance" class="v" :class="'v-' + stanceKey(u.stance)">
-                    {{ t('council.stance.' + stanceKey(u.stance)) }}
-                  </span>
-                </div>
-
-                <!-- No stance: either it did not answer, or it did not give the trailing block as agreed. Show the raw error as-is; do not fill in with something else -->
-                <p v-if="g.key === 'none'" class="why bad">
-                  {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
-                  <span v-if="u.error"> —— {{ u.error }}</span>
-                </p>
-
-                <!-- Took a stance but gave no key points: this is "did not give as agreed", not "it said there are no risks"; the two are different statements -->
-                <p v-else-if="!u.findings" class="why dim" :data-testid="'cv-nofindings-' + u.floorId">
-                  {{ t('council.findings_unparsed') }}
-                </p>
-
-                <template v-else>
-                  <div v-for="row in findingRows(u)" :key="row.k" class="fl">
-                    <span class="fk">{{ t(row.k) }}</span>
-                    <ul class="fv">
-                      <li v-for="(x, i) in row.v" :key="i">{{ x }}</li>
-                    </ul>
-                  </div>
-                  <!-- All three arrays are empty: it answered, and the answer was "none". This must be kept distinct from the "gave none" above -->
-                  <p v-if="!findingRows(u).length" class="why dim">{{ t('council.findings_empty') }}</p>
-                </template>
-              </li>
-            </ul>
-          </section>
-        </div>
-
-        <!-- Conclusion: on consensus, quote that round's proposal as-is; on no consensus, say no consensus -->
-        <div v-else-if="council.verdict === 'consensus' && consensusRound" class="result win" data-testid="cv-conclusion">
-          <h3 class="h3">{{ t('council.conclusion') }}</h3>
-          <p class="hint">{{ t('council.conclusion_from_round', { n: consensusRound.round_no }) }}</p>
-          <blockquote class="quote">{{ consensusRound.proposal_text }}</blockquote>
-        </div>
-
-        <div v-else-if="council.verdict === 'no_consensus'" class="result lose" data-testid="cv-no-conclusion">
-          <h3 class="h3">{{ t('council.no_conclusion', { n: council.max_rounds }) }}</h3>
-          <p class="hint">{{ t('council.no_conclusion_hint') }}</p>
-          <ul v-if="lastDebate" class="stances">
-            <li v-for="u in lastDebate.utterances.filter((x) => x.role !== 'chair')" :key="u.floorId">
-              <span class="v" :class="'v-' + voteKey(u.vote)">{{ t('council.vote.' + voteKey(u.vote)) }}</span>
-              <span class="fid">{{ u.floorId }}</span>
-              <!-- Those with no stance (timeout / crash / unparsed) do not get a "gave no reason" note: they never answered at all,
-                   so leaving the reason column empty is the truth, and the stance is made clear by the "no stance" tag above -->
-              <span v-if="u.voteReason" class="reason">{{ u.voteReason }}</span>
-              <span v-else-if="u.status !== 'ok'" class="dim">{{ u.error }}</span>
-            </li>
-          </ul>
-          <!-- The one on the table in the last round must also be shown (for traceability), but **marked as not passed** ——
-               it must not look like the "conclusion" block above, or it would be taken as something agreed -->
-          <div v-if="store.currentProposal" class="last-proposal" data-testid="cv-last-proposal">
-            <p class="hint">{{ t('council.last_proposal', { round: store.currentProposal.roundNo }) }}</p>
-            <blockquote class="quote notpassed">{{ store.currentProposal.proposal }}</blockquote>
+        <!-- ------------------------------------------------ summary card -->
+        <section class="card summary" data-testid="cv-summary">
+          <div class="scoreline">
+            <div class="score-num" data-testid="cv-score">
+              {{ summary && summary.score != null ? summary.score : '—' }}
+              <span class="score-max">/ {{ scoreMax }}</span>
+            </div>
+            <div class="score-meta">
+              <span class="k">{{ t('council.convergence') }}</span>
+              <span v-if="summaryFormula" class="mono formula" data-testid="cv-score-formula">{{ summaryFormula }}</span>
+              <span class="hint">{{ t('council.score_formula_note') }}</span>
+              <span class="hint">{{ t('council.rounds_done', { n: summary ? summary.rounds : 0 }) }}</span>
+            </div>
           </div>
-        </div>
 
-        <div v-else-if="council.verdict" class="result" data-testid="cv-aborted">
-          <h3 class="h3">{{ t('council.verdict.' + verdictKey(council.verdict)) }}</h3>
-          <p v-if="council.error" class="why bad">{{ council.error }}</p>
-        </div>
+          <div class="chips">
+            <span class="chip" data-testid="cv-review-count">
+              {{ t('council.reviews_n', { n: summary ? summary.reviewCount : 0 }) }}
+            </span>
+            <span class="chip sev-blocker" data-testid="cv-blocker-count">
+              {{ t('council.blockers_n', { n: summary ? summary.severityCounts.blocker : 0 }) }}
+            </span>
+            <span class="chip" data-testid="cv-conflict-count">
+              {{ t('council.conflicts_n', { n: summary ? summary.conflictCount : 0 }) }}
+            </span>
+            <span
+              v-for="s in SEVERITIES"
+              :key="s"
+              class="chip sm dim"
+              :data-testid="'cv-sev-' + s"
+            >{{ severityLabel(s) }} {{ summary ? summary.severityCounts[s] : 0 }}</span>
+          </div>
 
-        <!-- Which proposal is currently on the table (only vote mode has the notion of "the proposal on the table") -->
-        <div v-if="store.mode === 'vote' && store.live && store.currentProposal" class="proposal" data-testid="cv-proposal">
-          <span class="tag">{{ t('council.current_proposal') }}</span>
-          <span class="p-round">{{ t('council.round_of', { n: store.currentProposal.roundNo, total: council.max_rounds }) }}</span>
-          <p class="p-text">{{ store.currentProposal.proposal }}</p>
-          <p class="hint">
-            {{
-              store.currentProposal.proposalFrom === 'chair'
-                ? t('council.proposal_from_chair')
-                : t('council.proposal_from', { floor: store.currentProposal.proposalFrom })
-            }}
-          </p>
-          <p class="hint">{{ t('council.tie_rule') }}</p>
-        </div>
+          <table class="roles" data-testid="cv-roles">
+            <thead>
+              <tr>
+                <th>{{ t('council.col.role') }}</th>
+                <th>{{ t('council.col.floor') }}</th>
+                <th>{{ t('council.col.model') }}</th>
+                <th>{{ t('council.col.tokens') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in roles" :key="r.floorId" :data-testid="'cv-role-' + r.role">
+                <td><span class="role" :class="'role-' + r.role">{{ roleLabel(r.role) }}</span></td>
+                <td>
+                  <span class="fid">{{ r.floorId }}</span>
+                  <span class="fname">{{ floorName(r.floorId) }}</span>
+                  <span v-if="r.status === 'failed'" class="bad" :title="r.error || ''">
+                    {{ t('council.pstatus.failed') }}
+                  </span>
+                </td>
+                <td class="mono">{{ r.model || '—' }}</td>
+                <td class="mono">{{ formatTokens(r.tokens) }}</td>
+              </tr>
+            </tbody>
+          </table>
 
-        <!-- Round-by-round timeline -->
-        <ol class="timeline">
-          <li v-for="g in store.timeline" :key="g.roundNo" class="round">
-            <div class="round-head">
-              <span class="rno">{{ g.roundNo === 0 ? t('council.round_brief') : t('council.round_n', { n: g.roundNo }) }}</span>
-              <span v-if="g.roundNo > 0 && store.mode === 'vote'" class="tally">
-                {{ t('council.tally', { agree: g.tally.agree, disagree: g.tally.disagree, abstain: g.tally.abstain, invalid: g.tally.invalid }) }}
-              </span>
-              <!-- Analysis mode does not count votes: this line gives "each person's leaning this round", with the definition and the no-stance count spelled out -->
-              <span v-else-if="g.roundNo > 0" class="tally">
-                {{
-                  t('council.stance_tally', {
-                    support: g.stanceTally.support,
-                    oppose: g.stanceTally.oppose,
-                    unsure: g.stanceTally.unsure,
-                    none: g.stanceTally.none,
-                  })
-                }}
-              </span>
-              <span v-if="store.mode === 'vote' && serverTally(g.roundNo) && serverTally(g.roundNo).consensus === 1" class="won">
-                {{ t('council.consensus_reached') }}
-              </span>
+          <div v-if="warnings.length" class="warn" data-testid="cv-warnings">
+            <h4 class="wh">{{ t('council.warnings') }}</h4>
+            <p class="hint">{{ t('council.warnings_hint') }}</p>
+            <ul>
+              <li v-for="(w, i) in warnings" :key="i">{{ w.message }}</li>
+            </ul>
+          </div>
+        </section>
+
+        <!-- ------------------------------------------------ final result -->
+        <section v-if="adjudication || finalDraft" class="card result" data-testid="cv-result">
+          <h3 class="h3">{{ t('council.adjudication') }}</h3>
+          <template v-if="adjudication">
+            <p class="decision-line">
+              <span
+                v-if="decisionKey(adjudication.decision)"
+                class="badge"
+                :class="'d-' + decisionKey(adjudication.decision)"
+                data-testid="cv-decision"
+              >{{ t('council.decision.' + decisionKey(adjudication.decision)) }}</span>
+              <span v-else class="dim">{{ adjudication.decision || '—' }}</span>
+            </p>
+            <p v-if="adjudication.summary" class="para">
+              <span class="k">{{ t('council.adjudication_reason') }}</span>{{ adjudication.summary }}
+            </p>
+            <div v-if="adjudication.remainingRisks && adjudication.remainingRisks.length" class="block">
+              <h4 class="bh">{{ t('council.remaining_risks') }}</h4>
+              <ul class="list">
+                <li v-for="(x, i) in adjudication.remainingRisks" :key="i">{{ x }}</li>
+              </ul>
             </div>
-
-            <!-- Pick whose utterance to view in a round. Only the body text is collapsed; the vote tally and "did not answer" still hang on the row -->
-            <div
-              v-if="hasPicks(g)"
-              class="picks"
-              role="radiogroup"
-              :aria-label="t('council.pick_speaker')"
-              :data-testid="'cv-picks-' + g.roundNo"
-            >
-              <label
-                v-for="u in g.utterances"
-                :key="u.floorId"
-                class="pick"
-                :class="[{ on: shownId(g) === u.floorId }, u.status]"
-                :data-testid="'cv-pick-' + g.roundNo + '-' + u.floorId"
-              >
-                <input
-                  type="radio"
-                  :name="'cv-pick-' + g.roundNo"
-                  :value="u.floorId"
-                  :checked="shownId(g) === u.floorId"
-                  @change="picked[g.roundNo] = u.floorId"
-                />
-                <span class="fid">{{ u.floorId }}</span>
-                <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
-                <!-- The vote tally is marked only in vote mode. Analysis-mode stances are written by group in the report above ——
-                     putting "support/oppose" to the right of the floor name would make people think the analysis is also voting -->
-                <span v-if="store.mode === 'vote' && u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
-                  {{ t('council.vote.' + voteKey(u.vote)) }}
-                </span>
-                <span v-if="store.mode === 'vote' && u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
-                <!-- The floor that could not speak: the body text is collapsed, but this must not become invisible too.
-                     The reason (raw error) is on the title attribute, available in place; the full text is still listed in the attendance column -->
-                <span v-if="u.status !== 'ok'" class="bad" :title="u.error || ''">
-                  {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
-                </span>
-              </label>
+            <div v-if="adjudication.finalDirectives && adjudication.finalDirectives.length" class="block">
+              <h4 class="bh">{{ t('council.final_directives') }}</h4>
+              <ul class="list">
+                <li v-for="(x, i) in adjudication.finalDirectives" :key="i">{{ x }}</li>
+              </ul>
             </div>
+          </template>
+          <p v-else class="why dim">{{ t('council.adjudication_unparsed') }}</p>
 
-            <article v-for="u in shown(g)" :key="u.floorId" class="said" :class="[u.status, u.role]">
-              <!-- When there is only one utterance (the chair's statement in round 0) there is no row of dots above, so the byline must be written here itself -->
-              <div v-if="!hasPicks(g)" class="line">
-                <span class="fid">{{ u.floorId }}</span>
-                <span class="fname">{{ u.role === 'chair' ? t('council.chair') : floorName(u.floorId) }}</span>
-                <!-- Same as above: analysis mode does not put a stance to the right of the floor -->
-                <span v-if="store.mode === 'vote' && u.role !== 'chair'" class="v" :class="'v-' + voteKey(u.vote)">
-                  {{ t('council.vote.' + voteKey(u.vote)) }}
-                </span>
-                <span v-if="store.mode === 'vote' && u.second" class="dim">{{ t('council.second', { floor: u.second }) }}</span>
-                <span class="spacer" />
-                <span v-if="metaOf(u)" class="meta dim">{{ metaOf(u) }}</span>
-              </div>
+          <template v-if="finalDraft">
+            <h3 class="h3 gap-top">{{ t('council.final_draft') }}</h3>
+            <pre class="body" data-testid="cv-final-draft">{{ finalDraft.content }}</pre>
+            <p v-if="finalDraft.changeNotes" class="sub">
+              <span class="k">{{ t('council.change_notes') }}</span>{{ finalDraft.changeNotes }}
+            </p>
+          </template>
+        </section>
 
-              <!-- Did not answer / did not take a stance as agreed: say so faithfully and show the raw error -->
-              <p v-if="u.status !== 'ok'" class="why bad" :data-testid="'cv-notice-' + u.floorId">
-                {{ u.status === 'unparsed' ? t('council.unparsed') : t('council.failed') }}
-                <span v-if="u.error"> —— {{ u.error }}</span>
-              </p>
+        <!-- ------------------------------------------------ exported files -->
+        <section v-if="reportFiles.length" class="card export" data-testid="cv-report-files">
+          <h3 class="h3">{{ t('council.report_files') }}</h3>
+          <p class="hint">{{ t('council.report_files_hint') }}</p>
+          <ul class="files">
+            <li v-for="f in reportFiles" :key="f" class="mono">{{ f }}</li>
+          </ul>
+        </section>
 
-              <pre v-if="u.content" class="body">{{ u.content }}</pre>
+        <!-- ------------------------------------------------ complete process (collapsed) -->
+        <details v-if="plan || rounds.length || incompleteRounds.length" class="process" data-testid="cv-process">
+          <summary class="process-hd">
+            {{ t('council.process') }}
+            <span class="dim">（{{ t('council.rounds_done', { n: summary ? summary.rounds : 0 }) }}）</span>
+          </summary>
+          <p class="hint">{{ t('council.process_hint') }}</p>
 
-              <p v-if="u.voteReason" class="sub"><span class="k">{{ t('council.reason') }}</span>{{ u.voteReason }}</p>
-              <p v-if="u.proposal" class="sub"><span class="k">{{ t('council.proposal') }}</span>{{ u.proposal }}</p>
-
-              <!-- Analysis mode: list the three parsed columns once (the JSON snippet in the body is still above; that is the raw text) -->
-              <div v-for="row in findingRows(u)" :key="row.k" class="fl">
-                <span class="fk">{{ t(row.k) }}</span>
-                <ul class="fv">
-                  <li v-for="(x, i) in row.v" :key="i">{{ x }}</li>
+          <details v-if="plan" class="round" data-testid="cv-plan">
+            <summary class="round-hd">
+              <span class="rno">{{ t('council.round0_plan') }}</span>
+            </summary>
+            <div class="rbody">
+              <p v-if="!plan.parsed" class="why dim">{{ t('council.plan_unparsed') }}</p>
+              <div v-if="plan.breakdown && plan.breakdown.length" class="block">
+                <h4 class="bh">{{ t('council.breakdown') }}</h4>
+                <ul class="list">
+                  <li v-for="(x, i) in plan.breakdown" :key="i">{{ x }}</li>
                 </ul>
               </div>
-            </article>
-          </li>
-        </ol>
+              <div v-if="plan.assignments && plan.assignments.length" class="block">
+                <h4 class="bh">{{ t('council.assignments') }}</h4>
+                <ul class="list">
+                  <li v-for="(a, i) in plan.assignments" :key="i">
+                    <span class="fid">{{ a.reviewer }}</span>
+                    <span class="fname">{{ floorName(a.reviewer) }}</span>
+                    <span v-if="a.focus" class="dim"> — {{ a.focus }}</span>
+                  </li>
+                </ul>
+              </div>
+              <p v-if="plan.reviewFocus" class="para dim">{{ plan.reviewFocus }}</p>
+              <div class="block">
+                <h4 class="bh">{{ t('council.raw_output') }}</h4>
+                <CouncilRawTurns :utterances="turnsOf(0)" />
+              </div>
+            </div>
+          </details>
 
-        <!-- Attendees and materials -->
-        <div class="foot">
-          <div class="box">
-            <h3 class="h3">{{ t('council.participants') }}</h3>
-            <ul class="plist">
-              <li v-for="p in store.current.participants" :key="p.floor_id">
-                <span class="fid">{{ p.floor_id }}</span>
-                <span class="fname">{{ floorName(p.floor_id) }}</span>
-                <span class="st" :class="p.status">{{ t('council.pstatus.' + p.status) }}</span>
-                <span v-if="p.error" class="dim">{{ p.error }}</span>
-              </li>
-            </ul>
-          </div>
-          <div v-if="store.current.materials.length" class="box">
-            <h3 class="h3">{{ t('council.materials') }}</h3>
-            <ul class="mlist">
-              <li v-for="m in store.current.materials" :key="m.ord">
-                <span class="mono path">{{ m.path }}</span>
-                <span v-if="m.truncated" class="bad">
-                  {{ t('council.material_truncated', { total: fmtBytes(m.bytes_total), included: fmtBytes(m.bytes_included) }) }}
-                </span>
-                <span v-else class="dim">{{ t('council.material_full', { n: fmtBytes(m.bytes_included) }) }}</span>
-              </li>
-            </ul>
-          </div>
+          <details v-for="r in rounds" :key="r.round" class="round" :data-testid="'cv-round-' + r.round">
+            <summary class="round-hd">
+              <span class="rno">{{ t('council.round_n', { n: r.round }) }}</span>
+              <span v-if="r.proposal.version" class="rver mono">{{ r.proposal.version }}</span>
+              <span v-if="r.stats" class="chip sm">{{ t('council.score_short', { n: r.stats.score }) }}</span>
+              <span class="dim counts">
+                {{ t('council.reviews_n', { n: r.reviews.length }) }} · {{ t('council.blockers_n', { n: blockerCountOf(r) }) }}
+              </span>
+            </summary>
+
+            <div class="rbody">
+              <div class="block">
+                <h4 class="bh">{{ t('council.diff') }}</h4>
+                <pre v-if="r.proposal.diffFromPrev" class="diff" :data-testid="'cv-diff-' + r.round">{{ r.proposal.diffFromPrev }}</pre>
+                <p v-else class="why dim" :data-testid="'cv-nodiff-' + r.round">{{ t('council.no_diff') }}</p>
+              </div>
+
+              <div class="block">
+                <h4 class="bh">{{ t('council.proposal') }}</h4>
+                <pre class="body">{{ r.proposal.content }}</pre>
+              </div>
+
+              <div class="block">
+                <h4 class="bh">{{ t('council.reviews') }}</h4>
+                <p v-if="!r.reviews.length" class="why dim">{{ t('council.no_reviews') }}</p>
+                <article v-for="(rv, i) in r.reviews" :key="i" class="review">
+                  <div class="rline">
+                    <span class="sev" :class="'sev-' + rv.severity">{{ severityLabel(rv.severity) }}</span>
+                    <span class="fid">{{ rv.reviewer }}</span>
+                    <span class="fname">{{ floorName(rv.reviewer) }}</span>
+                    <span class="dim">· {{ rv.dimension }}</span>
+                    <span class="spacer" />
+                    <span class="stance" :class="'st-' + rv.stance">{{ stanceLabel(rv.stance) }}</span>
+                  </div>
+                  <p class="para">{{ rv.issue }}</p>
+                  <p v-if="rv.evidence" class="sub"><span class="k">{{ t('council.evidence') }}</span>{{ rv.evidence }}</p>
+                  <p v-if="rv.suggestion" class="sub"><span class="k">{{ t('council.suggestion') }}</span>{{ rv.suggestion }}</p>
+                </article>
+              </div>
+
+              <div class="block">
+                <h4 class="bh">
+                  {{ t('council.moderator_summary') }}
+                  <span v-if="r.stats" class="chip sm">{{ t('council.score_short', { n: r.stats.score }) }}</span>
+                </h4>
+                <p v-if="formulaFor(r)" class="mono hint">{{ formulaFor(r) }}</p>
+                <div class="msec">
+                  <span class="mk">{{ t('council.consensus_items') }}</span>
+                  <ul v-if="r.moderator.consensus.length" class="list">
+                    <li v-for="(x, i) in r.moderator.consensus" :key="i">{{ x }}</li>
+                  </ul>
+                  <span v-else class="dim">{{ t('council.none') }}</span>
+                </div>
+                <div class="msec">
+                  <span class="mk">{{ t('council.open_issues') }}</span>
+                  <ul v-if="r.moderator.openIssues.length" class="list">
+                    <li v-for="(x, i) in r.moderator.openIssues" :key="i">{{ x }}</li>
+                  </ul>
+                  <span v-else class="dim">{{ t('council.none') }}</span>
+                </div>
+                <div v-if="r.moderator.conflicts.length" class="msec">
+                  <span class="mk">{{ t('council.conflicts') }}</span>
+                  <ul class="list">
+                    <li v-for="(c, i) in r.moderator.conflicts" :key="i">
+                      <strong>{{ c.topic }}</strong>
+                      <span v-for="(s, j) in c.sides" :key="j" class="side">
+                        <span class="fid">{{ s.reviewer }}</span>{{ s.view }}
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+                <div class="msec">
+                  <span class="mk">{{ t('council.directives') }}</span>
+                  <ul v-if="r.moderator.revisionDirectives.length" class="list directives">
+                    <li v-for="(x, i) in r.moderator.revisionDirectives" :key="i">{{ x }}</li>
+                  </ul>
+                  <span v-else class="dim">{{ t('council.none') }}</span>
+                </div>
+                <ul v-if="r.warnings.length" class="list round-warn">
+                  <li v-for="(w, i) in r.warnings" :key="i" class="bad">{{ w.message }}</li>
+                </ul>
+              </div>
+
+              <div class="block">
+                <h4 class="bh">{{ t('council.raw_output') }}</h4>
+                <CouncilRawTurns :utterances="turnsOf(r.round)" />
+              </div>
+            </div>
+          </details>
+
+          <details
+            v-for="g in incompleteRounds"
+            :key="'incomplete-' + g.roundNo"
+            class="round"
+            open
+            :data-testid="'cv-round-incomplete-' + g.roundNo"
+          >
+            <summary class="round-hd">
+              <span class="rno">{{ t('council.round_n', { n: g.roundNo }) }}</span>
+              <span class="bad">{{ t('council.round_incomplete') }}</span>
+            </summary>
+            <div class="rbody">
+              <p class="why dim">{{ t('council.round_incomplete_hint') }}</p>
+              <div class="block">
+                <h4 class="bh">{{ t('council.raw_output') }}</h4>
+                <CouncilRawTurns :utterances="g.utterances" />
+              </div>
+            </div>
+          </details>
+        </details>
+
+        <!-- materials -->
+        <div v-if="store.current.materials.length" class="card">
+          <h3 class="h3">{{ t('council.materials') }}</h3>
+          <ul class="mlist">
+            <li v-for="m in store.current.materials" :key="m.ord">
+              <span class="mono path">{{ m.path }}</span>
+              <span v-if="m.truncated" class="bad">
+                {{ t('council.material_truncated', { total: fmtBytes(m.bytes_total), included: fmtBytes(m.bytes_included) }) }}
+              </span>
+              <span v-else class="dim">{{ t('council.material_full', { n: fmtBytes(m.bytes_included) }) }}</span>
+            </li>
+          </ul>
         </div>
       </template>
     </section>
@@ -654,8 +785,8 @@ function fmtTime(ms) {
   padding: 12px;
 }
 
-.h2 { font-size: 14px; margin: 0 0 10px; }
 .h3 { font-size: 13px; margin: 0 0 8px; color: var(--text-dim); }
+.h3.gap-top { margin-top: 14px; }
 .lbl { display: block; font-size: 12px; color: var(--text-dim); margin: 10px 0 4px; }
 .lbl.inline { margin: 0; }
 .hint { font-size: 11px; color: var(--text-faint); margin: 6px 0 0; line-height: 1.5; }
@@ -800,11 +931,6 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* Mode badge in the history list: short and unobtrusive, only to separate the two kinds of councils */
-.m { font-size: 10px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
-.badge.m-analysis { color: var(--accent); border-color: var(--accent); }
-.ws { font-size: 11px; color: var(--text-faint); margin: 0; word-break: break-all; }
-.ws-path { color: var(--text-dim); margin-left: 4px; }
 
 /* ------------------------------------------------------------ right column */
 .main {
@@ -818,9 +944,44 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .head { display: flex; flex-direction: column; gap: 6px; }
 .who { display: flex; align-items: center; gap: 8px; }
+
 .topic-h { font-size: 15px; margin: 0; line-height: 1.4; }
-.live { font-size: 11px; color: var(--state-busy); }
+
+/* Live work strip: a long turn says nothing until it ends, so this is the only visible sign it is
+   still moving. Deliberately plain — it reports who/phase/round, not a fake percentage. */
+.working {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--state-busy) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--state-busy) 30%, transparent);
+  border-radius: 8px;
+}
+.working-hd { color: var(--state-busy); font-weight: 600; }
+.working .sep { color: var(--text-faint); }
+.pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--state-busy);
+  flex: none;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse { animation: none; }
+}
 .acts { display: flex; gap: 8px; }
+.ws { font-size: 11px; color: var(--text-faint); margin: 0; word-break: break-all; }
+.ws-path { color: var(--text-dim); margin-left: 4px; }
 
 button.ghost {
   padding: 3px 10px;
@@ -835,125 +996,83 @@ button.ghost {
 button.ghost:hover { color: var(--text); border-color: var(--accent); }
 button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--state-blocked); }
 
-.badge,
-.v {
+.badge {
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 10px;
   border: 1px solid var(--border-strong);
   white-space: nowrap;
 }
-.v-agree,
-.v-support { color: var(--state-online); border-color: var(--state-online); }
-.v-disagree,
-.v-oppose { color: var(--state-blocked); border-color: var(--state-blocked); }
-.v-abstain,
-.v-unsure { color: var(--state-idle); }
-.v-none { color: var(--text-faint); }
-.v-consensus { color: var(--state-online); border-color: var(--state-online); }
-.v-no_consensus { color: var(--state-busy); border-color: var(--state-busy); }
-.v-reported { color: var(--accent); border-color: var(--accent); }
+.v-completed { color: var(--state-online); border-color: var(--state-online); }
+.v-partial { color: var(--state-busy); border-color: var(--state-busy); }
 .v-cancelled,
 .v-failed { color: var(--text-dim); }
 
-.result {
+.card {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   padding: 10px 12px;
   background: var(--bg-panel);
 }
-.result.win { border-color: var(--state-online); }
-.result.lose { border-color: var(--state-busy); }
-/* Report: no color —— it is not a verdict, just the parties' words placed side by side */
-.result.report { border-color: var(--border-strong); }
+.card.result { border-color: var(--border-strong); }
 
-.rgroup { margin-top: 10px; }
-.rgroup .gh { font-size: 12px; margin: 0 0 6px; color: var(--text-dim); }
-/* A color bar on the left so the four levels are distinguishable at a glance (the no-stance level is gray; it does not pretend to have a position) */
-.rgroup { border-left: 3px solid var(--border-strong); padding-left: 10px; }
-.rgroup.v-support { border-left-color: var(--state-online); }
-.rgroup.v-oppose { border-left-color: var(--state-blocked); }
-.rgroup.v-unsure { border-left-color: var(--state-idle); }
-.rgroup.v-none { border-left-color: var(--text-faint); }
-.rlist { list-style: none; margin: 0; padding: 0; }
-.rlist > li { margin: 0 0 8px; }
-.rlist > li:last-child { margin-bottom: 0; }
-
-/* Three key-point rows: conclusion / risks / questions. Listed as-is, not rewritten or reordered */
-.fl { display: flex; gap: 8px; margin: 4px 0 0; font-size: 12px; }
-.fk { color: var(--text-faint); flex: 0 0 auto; min-width: 32px; }
-.fv { list-style: none; margin: 0; padding: 0; color: var(--text); line-height: 1.5; }
-.fv li::before { content: '· '; color: var(--text-faint); }
-.quote {
-  margin: 6px 0 0;
-  padding: 8px 10px;
-  border-left: 3px solid var(--state-online);
-  background: var(--bg-elevated);
-  border-radius: 0 8px 8px 0;
-  white-space: pre-wrap;
-  font-size: 12px;
-  line-height: 1.6;
+/* ---- summary ---- */
+.scoreline { display: flex; align-items: baseline; gap: 14px; }
+.score-num {
+  font-family: var(--mono);
+  font-size: 34px;
+  line-height: 1;
+  color: var(--text);
+  white-space: nowrap;
 }
-/* The one that did not pass: dashed border + gray —— distinguishable from the "conclusion" at a glance */
-.quote.notpassed {
-  border-left-style: dashed;
-  border-left-color: var(--state-busy);
-  color: var(--text-dim);
-}
-.last-proposal { margin-top: 10px; }
-.stances { list-style: none; margin: 6px 0 0; padding: 0; }
-.stances li { display: flex; gap: 8px; align-items: baseline; font-size: 12px; margin: 4px 0; }
-.reason { color: var(--text-dim); }
+.score-max { font-size: 13px; color: var(--text-faint); }
+.score-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.score-meta .k { font-size: 12px; color: var(--text-dim); }
+.formula { font-size: 11px; color: var(--text-faint); word-break: break-word; }
 
-.proposal {
-  border: 1px dashed var(--accent);
-  border-radius: var(--radius);
-  padding: 8px 12px;
-  background: var(--bg-elevated);
-}
-.tag { font-size: 11px; color: var(--accent); }
-.p-round { font-size: 11px; color: var(--text-faint); margin-left: 8px; }
-.p-text { margin: 6px 0 0; white-space: pre-wrap; font-size: 12px; line-height: 1.6; }
-
-.timeline { list-style: none; margin: 0; padding: 0; }
-.round { margin-bottom: 12px; }
-.round-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
-.rno { font-size: 12px; color: var(--text-dim); font-weight: 600; }
-.tally { font-size: 11px; color: var(--text-faint); }
-.won { font-size: 11px; color: var(--state-online); }
-
-/* Pick whose utterance to view in a round: a row of dots, with the selected one's body text expanded below */
-.picks { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-bottom: 6px; }
-.pick {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
-  border: 1px solid transparent;
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip {
+  font-size: 11px;
+  padding: 1px 8px;
   border-radius: 999px;
-  font-size: 12px;
+  border: 1px solid var(--border-strong);
   color: var(--text-dim);
-  cursor: pointer;
+  white-space: nowrap;
 }
-.pick:hover { background: var(--bg-elevated); }
-.pick.on { background: var(--accent-soft); border-color: var(--border-strong); color: var(--text); }
-.pick input { margin: 0; accent-color: var(--accent); }
-.pick.failed,
-.pick.timeout { color: var(--state-blocked); }
+.chip.sm { font-size: 10px; padding: 0 6px; }
+.chip.sev-blocker { color: var(--state-blocked); border-color: var(--state-blocked); }
 
-.said {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-panel);
-  padding: 8px 10px;
-  margin-bottom: 6px;
+.roles { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+.roles th {
+  text-align: left;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 0 8px 4px 0;
 }
-.said.chair { background: var(--bg-elevated); }
-.said.failed,
-.said.timeout { border-color: var(--state-blocked); }
-.line { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.spacer { flex: 1; }
-.meta { font-size: 11px; }
+.roles td { padding: 4px 8px 4px 0; vertical-align: baseline; }
+.roles .role { font-size: 11px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border-strong); }
+.roles .role-moderator { color: var(--accent); border-color: var(--accent); }
+.roles .role-main { color: var(--state-online); border-color: var(--state-online); }
+.roles .bad { font-size: 11px; margin-left: 6px; }
+
+.warn { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 8px; }
+.warn .wh { font-size: 12px; margin: 0 0 4px; color: var(--text-dim); }
+.warn ul { margin: 4px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: var(--state-busy); }
+
+/* ---- final result ---- */
+.decision-line { margin: 0 0 6px; }
+.d-approve { color: var(--state-online); border-color: var(--state-online); }
+.d-approve_with_changes { color: var(--state-busy); border-color: var(--state-busy); }
+.d-reject { color: var(--state-blocked); border-color: var(--state-blocked); }
+.para { margin: 4px 0 0; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.para .k { color: var(--text-faint); margin-right: 6px; }
+.block { margin-top: 10px; }
+.bh { font-size: 12px; margin: 0 0 4px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; }
+.list { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.6; }
+.list li { margin: 2px 0; }
+.list.directives { color: var(--text); }
+
 .body {
   margin: 6px 0 0;
   white-space: pre-wrap;
@@ -962,27 +1081,106 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
   font-size: 12px;
   line-height: 1.6;
   color: var(--text);
-  max-height: 320px;
+  max-height: 360px;
+  overflow: auto;
+  background: var(--bg-elevated);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.diff {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg-elevated);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  padding: 8px 10px;
+  max-height: 280px;
   overflow: auto;
 }
-.sub { margin: 4px 0 0; font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+.sub { margin: 4px 0 0; font-size: 12px; color: var(--text-dim); line-height: 1.5; white-space: pre-wrap; }
 .sub .k { color: var(--text-faint); margin-right: 6px; }
 
-.foot { display: flex; gap: var(--gap); flex-wrap: wrap; margin-top: 4px; }
-.box {
-  flex: 1 1 260px;
-  background: var(--bg-panel);
+/* ---- exported files ---- */
+.files { list-style: none; margin: 6px 0 0; padding: 0; }
+.files li { font-size: 11px; word-break: break-all; margin: 2px 0; color: var(--text-dim); }
+
+/* ---- complete process (collapsed) ---- */
+.process {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 10px 12px;
+  background: var(--bg-panel);
+  padding: 8px 12px;
 }
-.plist,
+.process-hd {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-dim);
+  list-style: none;
+  user-select: none;
+}
+.process-hd::-webkit-details-marker { display: none; }
+.process-hd::before { content: '▸ '; color: var(--text-faint); }
+.process[open] > .process-hd::before { content: '▾ '; }
+.process > .hint { margin: 6px 0 8px; }
+
+.round {
+  margin-top: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  padding: 6px 10px;
+}
+.round-hd {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  list-style: none;
+  user-select: none;
+}
+.round-hd::-webkit-details-marker { display: none; }
+.round-hd::before { content: '▸'; font-size: 10px; color: var(--text-faint); }
+.round[open] > .round-hd::before { content: '▾'; }
+.rno { color: var(--text); font-weight: 600; }
+.rver { color: var(--text-faint); font-size: 11px; }
+.counts { font-size: 11px; color: var(--text-faint); }
+.rbody { padding: 4px 0 8px 14px; }
+
+.review { border-top: 1px solid var(--border); padding: 6px 0; }
+.review:first-of-type { border-top: none; }
+.rline { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.spacer { flex: 1; }
+.sev,
+.stance {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+.sev-blocker { color: var(--state-blocked); border-color: var(--state-blocked); }
+.sev-major { color: var(--state-busy); border-color: var(--state-busy); }
+.sev-minor { color: var(--text-dim); }
+.sev-nit { color: var(--text-faint); }
+.st-reject { color: var(--state-blocked); border-color: var(--state-blocked); }
+.st-revise { color: var(--state-busy); border-color: var(--state-busy); }
+.st-accept { color: var(--state-online); border-color: var(--state-online); }
+
+.msec { display: flex; gap: 8px; margin-top: 6px; font-size: 12px; }
+.mk { color: var(--text-faint); flex: 0 0 68px; }
+.side { display: block; color: var(--text-dim); }
+.side .fid { margin-right: 4px; }
+.round-warn { margin-top: 8px; }
+
+/* ---- materials ---- */
 .mlist { list-style: none; margin: 0; padding: 0; }
-.plist li,
 .mlist li { display: flex; gap: 8px; align-items: baseline; font-size: 12px; margin: 3px 0; }
-.plist .st { font-size: 11px; color: var(--text-faint); }
-.plist .st.ok { color: var(--state-online); }
-.plist .st.failed { color: var(--state-blocked); }
 .mlist .path { font-size: 11px; word-break: break-all; }
 .dim { color: var(--text-faint); }
 .bad { color: var(--state-blocked); }

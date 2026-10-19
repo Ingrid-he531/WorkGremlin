@@ -1,29 +1,29 @@
 /**
- * 议事厅「四层配方」自检 —— 纯函数，不起进程。
+ * Council CLI recipes + output parsing self-check — pure data, no processes.
  *
- * 盯三件事，每件都对应一条会真出事的后果：
- *   1. **参数里必须真的关掉了工具**。四层里有两层（7F/8F）没有关工具的开关，只能靠注入
- *      一份 permission 全 deny 的配置。这条要是回归了，议事厅就不再是"只读"，
- *      参与者能读工作区文件、能跑命令 —— 这是整个功能的前提，不是可选行为。
- *   2. **7F 必须摘掉 WorkGremlin 自己的上报插件**（kilo 全局配置里挂着它）。不摘的话
- *      议事厅的参与者会被上报进办公室，违反"隔离，只在议事厅看"。
- *   3. **解析不出来就说解析不出来**。输出格式变了要落到 ok=false / vote=null，
- *      绝不能猜一个立场出来。这里用几种真实的输出形态和几种残缺输出来钉。
+ * Three properties are load-bearing and pinned separately:
+ *   1. **Read-only is real.** The council room accepts participants only if every recipe removes the
+ *      ability to write: 1F/4F via `--tools`, 7F/8F via a deny-by-default permission table, 2F via
+ *      `--plan`, 3F via `--sandbox read-only`. If this regresses, the feature is not "a meeting", it is
+ *      an agent editing the user's project.
+ *   2. **No office leakage.** WorkGremlin's own reporting is disabled in the environment, plugins are
+ *      stripped (7F), a private server is used (8F), and the session title/prompt marker is stamped
+ *      where the CLI supports one.
+ *   3. **Cannot parse means cannot parse.** Unknown output yields `ok:false`; the prompt echo and error
+ *      events must never be served as the participant's speech.
  *
- * 跑法：`npm run test:council-agents`
+ * Run: `npm run test:council-agents`
  */
 'use strict';
 
 const {
   RECIPES,
-  parseOutput,
-  parseVoteBlock,
-  normalizeVoteToken,
-  parseAnalysisBlock,
-  normalizeStanceToken,
+  READ_PERMISSION,
   READ_TOOLS,
   QUIET_ENV,
+  parseOutput,
 } = require('../src/council/agents');
+const { roleBlock } = require('../src/council/prompt');
 const { DEFAULTS } = require('@workgremlin/shared');
 
 let pass = 0;
@@ -39,358 +39,284 @@ function ok(label, cond, extra = '') {
 }
 const head = (t) => console.log(`\n${t}`);
 
-// ------------------------------------------------------------ 四层都在
-head('配方齐全');
-for (const f of ['1F', '4F', '7F', '8F']) {
-  ok(`${f} 有配方`, Boolean(RECIPES[f] && RECIPES[f].build));
-}
+const FLOORS = ['1F', '2F', '3F', '4F', '6F', '7F', '8F'];
+const build = (floor, prompt = '问题') => RECIPES[floor].build({ bin: `/usr/bin/${floor}`, prompt });
 
-// -------------------------------------------------- 只读保证：这是功能的前提
-// 议事厅一律只读：每个配方都只放行读类工具，写类/执行/联网全 deny。
-head('只读保证：参与者只有读类工具');
+/* ------------------------------------------------------------ recipes present */
+head('every floor has a recipe');
+for (const f of FLOORS) ok(`${f} has build()`, Boolean(RECIPES[f] && typeof RECIPES[f].build === 'function'));
+ok('no unexpected floors', Object.keys(RECIPES).length === FLOORS.length, Object.keys(RECIPES).join(','));
+
+/* ------------------------------------------------------------ read-only */
+head('read-only: 1F / 4F whitelist read tools only');
 {
-  const c1 = RECIPES['1F'].build({ bin: '/usr/bin/codebuddy', prompt: '问题' });
-  const c4 = RECIPES['4F'].build({ bin: '/usr/bin/claude', prompt: '问题' });
-  for (const [name, inv] of [['1F CodeBuddy', c1], ['4F Claude', c4]]) {
-    const i = inv.args.indexOf('--tools');
-    ok(`${name} 的 --tools 是只读白名单（${READ_TOOLS}）`, i >= 0 && inv.args[i + 1] === READ_TOOLS, JSON.stringify(inv.args));
-    // -p 是非交互的：只给 --tools 不给 --allowedTools，读文件时没人应答权限询问会被直接拒，
-    // 参与者就变成"干瞪眼"。这一条钉的是"它是只读，不是读不了"。
-    ok(`${name} 同时给了 --allowedTools 同一份（否则读文件会被权限询问拦下）`,
+  for (const floor of ['1F', '4F']) {
+    const inv = build(floor);
+    const toolsAt = inv.args.indexOf('--tools');
+    ok(`${floor} --tools is the read-only list (${READ_TOOLS})`,
+      toolsAt >= 0 && inv.args[toolsAt + 1] === READ_TOOLS, JSON.stringify(inv.args));
+    ok(`${floor} also allows those tools without a prompt (otherwise it can read nothing)`,
       inv.args[inv.args.indexOf('--allowedTools') + 1] === READ_TOOLS, JSON.stringify(inv.args));
+    ok(`${floor} does not contain Write/Edit/Bash in the whitelist`,
+      !/Write|Edit|Bash/.test(inv.args[toolsAt + 1]), inv.args[toolsAt + 1]);
   }
-  // --allowedTools 收的是变长参数，排在它后面的开关会被吃掉 → --permission-prompts 必须在前面
-  ok('4F 的 --permission-prompts none 排在 --allowedTools 前面（否则会被变长参数吃掉）',
+  const c4 = build('4F');
+  ok('4F --permission-prompts comes before the variadic --allowedTools',
     c4.args.indexOf('--permission-prompts') < c4.args.indexOf('--allowedTools'), JSON.stringify(c4.args));
-  ok('4F 明说"没人应答就拒"（不是挂在那儿等）', c4.args[c4.args.indexOf('--permission-prompts') + 1] === 'none');
+  ok('4F refuses rather than waiting when nobody answers', c4.args[c4.args.indexOf('--permission-prompts') + 1] === 'none');
+  ok('4F does not load MCP servers from user config', c4.args.includes('--strict-mcp-config'));
 }
 {
-  const c7 = RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: '问题' });
-  const cfg = JSON.parse(c7.env.KILO_CONFIG_CONTENT);
-  ok('7F 注入了 KILO_CONFIG_CONTENT', Boolean(c7.env.KILO_CONFIG_CONTENT));
-  ok('7F 兜底是 deny（没在表里的工具一个都别想用）', cfg.permission['*'] === 'deny');
-  ok('7F 只放行读类（read / glob / grep / list）',
-    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
-    cfg.permission.grep === 'allow' && cfg.permission.list === 'allow');
-  ok('7F 的写类全 deny（bash / edit / write）',
-    cfg.permission.bash === 'deny' && cfg.permission.edit === 'deny' && cfg.permission.write === 'deny');
-  ok('7F 连 webfetch / task / skill 都 deny',
-    cfg.permission.webfetch === 'deny' && cfg.permission.task === 'deny' && cfg.permission.skill === 'deny');
-
-  // 这条是隔离的命门：kilo 全局配置里挂着 WorkGremlin 的上报插件
-  ok('7F 摘掉了插件列表（否则参与者会被上报进办公室）',
+  const inv = build('7F');
+  const cfg = JSON.parse(inv.env.KILO_CONFIG_CONTENT);
+  ok('7F injects KILO_CONFIG_CONTENT', Boolean(inv.env.KILO_CONFIG_CONTENT));
+  ok('7F catch-all is deny', cfg.permission['*'] === 'deny');
+  ok('7F allows only read/glob/grep/list',
+    ['read', 'glob', 'grep', 'list'].every((k) => cfg.permission[k] === 'allow'));
+  ok('7F denies bash/edit/write',
+    ['bash', 'edit', 'write'].every((k) => cfg.permission[k] === 'deny'));
+  ok('7F denies web/task/skill', ['webfetch', 'websearch', 'task', 'skill'].every((k) => cfg.permission[k] === 'deny'));
+  ok('7F strips the plugin list (otherwise participants are reported into the office)',
     Array.isArray(cfg.plugin) && cfg.plugin.length === 0, JSON.stringify(cfg.plugin));
 }
 {
-  const c8 = RECIPES['8F'].build({ bin: '/usr/bin/opencode', prompt: '问题' });
-  const cfg = JSON.parse(c8.env.OPENCODE_CONFIG_CONTENT);
-  ok('8F 注入了 OPENCODE_CONFIG_CONTENT', Boolean(c8.env.OPENCODE_CONFIG_CONTENT));
-  ok('8F 只放行读类，写类 / bash 全 deny',
-    cfg.permission.read === 'allow' && cfg.permission.glob === 'allow' &&
-    cfg.permission.bash === 'deny' && cfg.permission.write === 'deny');
-  ok('8F 也挡了 external_directory', cfg.permission.external_directory === 'deny');
+  const inv = build('8F');
+  const cfg = JSON.parse(inv.env.OPENCODE_CONFIG_CONTENT);
+  ok('8F injects OPENCODE_CONFIG_CONTENT', Boolean(inv.env.OPENCODE_CONFIG_CONTENT));
+  ok('8F allows read/glob/grep/list and denies bash/write',
+    ['read', 'glob', 'grep', 'list'].every((k) => cfg.permission[k] === 'allow') &&
+      cfg.permission.bash === 'deny' && cfg.permission.write === 'deny');
+  ok('8F blocks external_directory too', cfg.permission.external_directory === 'deny');
+  ok('8F runs --standalone so QUIET_ENV reaches a private server', inv.args.includes('--standalone'));
 }
 {
-  // 环境变量是**叠加**不是替换：登录凭据靠 HOME 找，挡掉 HOME 等于挡掉登录
-  for (const f of ['1F', '4F', '7F', '8F']) {
+  ok('the shared permission table only allows read-type tools',
+    Object.entries(READ_PERMISSION).every(([k, v]) =>
+      k === '*' ? v === 'deny' : (['read', 'glob', 'grep', 'list'].includes(k) ? v === 'allow' : v === 'deny')));
+}
+{
+  const c2 = build('2F');
+  ok('2F uses --plan (Cline\'s own read-only mode)', c2.args.includes('--plan'), JSON.stringify(c2.args));
+  ok('2F asks for JSON output', c2.args.includes('--json'));
+  ok('2F passes the prompt positionally (its JSON mode refuses stdin)', c2.args.includes('问题') && c2.stdin === null);
+}
+{
+  const c3 = build('3F');
+  ok('3F runs codex exec', c3.args[0] === 'exec', JSON.stringify(c3.args));
+  ok('3F pins --sandbox read-only', c3.args[c3.args.indexOf('--sandbox') + 1] === 'read-only');
+  ok('3F is ephemeral (no session lands on the office 3F)', c3.args.includes('--ephemeral'));
+  ok('3F ignores the user config (no user MCP servers)', c3.args.includes('--ignore-user-config'));
+  ok('3F disables web search', c3.args.includes('web_search="disabled"'));
+  ok('3F reads the prompt from stdin', c3.stdin === '问题' && c3.args[c3.args.length - 1] === '-');
+}
+{
+  const c6 = build('6F');
+  ok('6F uses -p headless mode', c6.args.includes('-p'));
+  ok('6F asks for JSON output', c6.args[c6.args.indexOf('--output-format') + 1] === 'json');
+  ok('6F stamps the fixed session title with --name',
+    c6.args[c6.args.indexOf('--name') + 1] === DEFAULTS.COUNCIL_SESSION_TITLE);
+  ok('6F reads the prompt from stdin', c6.stdin === '问题' && !c6.args.includes('问题'));
+}
+
+/* ------------------------------------------------------------ invocation shape */
+head('invocation shape');
+{
+  for (const floor of ['1F', '4F', '3F', '6F']) {
+    const inv = RECIPES[floor].build({ bin: '/x', prompt: 'a long prompt' });
+    ok(`${floor} sends the prompt over stdin, not argv`, inv.stdin === 'a long prompt' && !inv.args.includes('a long prompt'));
+  }
+  const c7 = build('7F', '提示词');
+  ok('7F sends the prompt positionally', c7.args[0] === 'run' && c7.args[1] === '提示词' && c7.stdin === null);
+  ok('7F asks for JSON output', c7.args.includes('--format') && c7.args.includes('json'));
+  const c8 = build('8F', '提示词');
+  ok('8F sends the prompt positionally', c8.args[0] === 'run' && c8.args[1] === '提示词' && c8.stdin === null);
+  ok('7F does not need --standalone (it strips plugins via config)',
+    !build('7F').args.includes('--standalone'));
+}
+{
+  // Environment is layered on top of process.env, never a replacement: login credentials are found via HOME.
+  for (const f of FLOORS) {
     const env = RECIPES[f].build({ bin: '/x', prompt: 'p' }).env;
-    ok(`${f} 的 env 里没有 HOME（不能挡住登录凭据）`, !('HOME' in env));
+    ok(`${f} does not override HOME`, !('HOME' in env));
   }
 }
 
-// ---------------------------------------------------------------- 调用形态
-head('调用形态：长文本优先走管道，不进 argv');
+/* ------------------------------------------------------------ office isolation */
+head('office isolation');
+for (const f of FLOORS) {
+  const env = RECIPES[f].build({ bin: '/x', prompt: 'p' }).env;
+  ok(`${f} injects WORKGREMLIN_DISABLE=1`, env.WORKGREMLIN_DISABLE === '1', JSON.stringify(env));
+}
+ok('QUIET_ENV contains exactly that one flag',
+  Object.keys(QUIET_ENV).length === 1 && QUIET_ENV.WORKGREMLIN_DISABLE === '1');
+for (const f of ['7F', '8F']) {
+  const args = build(f).args;
+  const at = args.indexOf('--title');
+  ok(`${f} stamps the fixed session title`, at >= 0 && args[at + 1] === DEFAULTS.COUNCIL_SESSION_TITLE, JSON.stringify(args));
+  ok(`${f} does not pass --title twice`, args.filter((a) => a === '--title').length === 1);
+}
+for (const f of ['1F', '4F']) {
+  ok(`${f} does not need --title (it does not persist a session)`, !build(f).args.includes('--title'));
+  ok(`${f} uses --no-session-persistence`, build(f).args.includes('--no-session-persistence'));
+}
+ok('2F has no title switch (the marker rides in the prompt)',
+  !build('2F').args.includes('--title'));
+ok('the role block starts with COUNCIL_PROMPT_MARKER (the 2F lock depends on this exact phrase)',
+  roleBlock('2F', 'Cline', 'reviewer').includes(DEFAULTS.COUNCIL_PROMPT_MARKER));
+ok('the role block names the role and forbids writes',
+  roleBlock('2F', 'Cline', 'reviewer').includes('评审') && roleBlock('2F', 'Cline', 'reviewer').includes('不能修改任何文件'));
+
+/* ------------------------------------------------------------ single JSON */
+head('parse: single JSON (1F/4F/6F shape)');
 {
-  const c1 = RECIPES['1F'].build({ bin: '/usr/bin/codebuddy', prompt: '很长的提示词' });
-  ok('1F 提示词走 stdin', c1.stdin === '很长的提示词' && !c1.args.includes('很长的提示词'));
-  ok('1F 带 -p 和 json 输出', c1.args.includes('-p') && c1.args.includes('json'));
-  const c4 = RECIPES['4F'].build({ bin: '/usr/bin/claude', prompt: '很长的提示词' });
-  ok('4F 提示词走 stdin', c4.stdin === '很长的提示词' && !c4.args.includes('很长的提示词'));
-  const c7 = RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: '提示词' });
-  ok('7F 走位置参数（这家不读 stdin）', c7.args[0] === 'run' && c7.args[1] === '提示词' && c7.stdin === null);
-  ok('7F 要 json 输出', c7.args.includes('--format') && c7.args.includes('json'));
-  const c8 = RECIPES['8F'].build({ bin: '/usr/bin/opencode', prompt: '提示词' });
-  ok('8F 走位置参数', c8.args[0] === 'run' && c8.args[1] === '提示词' && c8.stdin === null);
-  // 命门：不带 --standalone 时 `opencode run` 走用户那个常驻 serve，插件带着用户 env 早加载好了，
-  // WORKGREMLIN_DISABLE 到不了它 —— 参与者会被当成真的 8F 会话/任务上报（2026-10-18 实测）。
-  ok('8F 带 --standalone（私有 server，QUIET_ENV 才真正生效）', c8.args.includes('--standalone'), JSON.stringify(c8.args));
-  ok('7F 不需要 --standalone（它靠 config 里的 plugin: [] 摘插件）', !RECIPES['7F'].build({ bin: '/usr/bin/kilo', prompt: '提示词' }).args.includes('--standalone'));
+  const r = parseOutput(JSON.stringify({
+    type: 'result',
+    result: '我的意见是……\n\n{"reviews":[]}',
+    model: 'claude-opus',
+    usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 900, cache_creation_input_tokens: 5 },
+  }));
+  ok('body read', r.ok === true && r.text.startsWith('我的意见是'));
+  ok('all four token fields normalized',
+    r.tokens && r.tokens.input === 120 && r.tokens.output === 30 && r.tokens.cacheRead === 900 && r.tokens.cacheWrite === 5,
+    JSON.stringify(r.tokens));
+  ok('model read', r.model === 'claude-opus');
+  ok('single event counted', r.events === 1);
+}
+{
+  const r = parseOutput(JSON.stringify({ result: 'only body, no usage' }));
+  ok('no usage -> tokens null (never an all-zero object)', r.ok === true && r.tokens === null);
+  ok('no model -> null', r.model === null);
+}
+{
+  // camelCase usage (Cline) and prompt/completion aliases
+  const r = parseOutput(JSON.stringify({ result: 'x', usage: { prompt_tokens: 3, completion_tokens: 4, cached_tokens: 5 } }));
+  ok('prompt_tokens / completion_tokens / cached_tokens aliases',
+    r.tokens.input === 3 && r.tokens.output === 4 && r.tokens.cacheRead === 5, JSON.stringify(r.tokens));
 }
 
-// ---------------------------------------------------------------- 输出解析
-head('输出解析：单个 JSON（1F/4F 的形态）');
+/* ------------------------------------------------------------ transcript */
+head('parse: full transcript array (1F CodeBuddy)');
 {
-  const r = parseOutput(JSON.stringify({ type: 'result', result: '我觉得应该这样做。', usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 900, cache_creation_input_tokens: 5 } }));
-  ok('读到正文', r.ok === true && r.text === '我觉得应该这样做。', r.text);
-  ok('词元四项都归出来了', r.tokens && r.tokens.input === 120 && r.tokens.output === 30 && r.tokens.cacheRead === 900 && r.tokens.cacheWrite === 5, JSON.stringify(r.tokens));
-}
-{
-  const r = parseOutput(JSON.stringify({ result: '只给正文，没有 usage' }));
-  ok('没有 usage 时 tokens=null（不编一个全 0 出来）', r.ok === true && r.tokens === null, JSON.stringify(r.tokens));
-}
-
-head('输出解析：JSONL 事件流（7F/8F 的形态）');
-{
-  // 真机踩到的坑：1F CodeBuddy `--output-format json` 给的是**一整个数组** ——
-  // 一份完整对话记录（user → snapshot → reasoning → assistant → result），不是单个对象。
-  // 按"把每条的 content 拼起来"解析，结果是**提问原文被当成它的发言**（连 CLI 自己塞的
-  // memory 系统提示一起，16KB），末尾答复再重复一遍。这里用真形状钉住：
-  // 只能取 result 事件里那段，用户消息与 assistant 消息都不许漏进来。
   const transcript = [
     {
       type: 'message',
       role: 'user',
-      content: [{ type: 'input_text', text: '<system-reminder data-role="memory">你是……</system-reminder>\n【议题】要不要补测试？' }],
+      content: [{ type: 'input_text', text: '<system-reminder>memory</system-reminder>\n【议题】要不要补测试？' }],
     },
-    { type: 'file-history-snapshot', messageId: 'm1', snapshot: { big: '这里有一大坨快照，不该进正文' } },
-    { type: 'reasoning', content: [], rawContent: '心里想了想，这段也不是发言' },
+    { type: 'file-history-snapshot', messageId: 'm1', snapshot: { big: 'a large snapshot that must not become speech' } },
+    { type: 'reasoning', content: [], rawContent: 'private reasoning that must not become speech' },
     {
       type: 'message',
       role: 'assistant',
-      content: [{ type: 'output_text', text: '我先说说看法。\n\n```json\n{"vote":"abstain","reason":"还没想好"}\n```' }],
+      content: [{ type: 'output_text', text: 'draft answer\n\n```json\n{"reviews":[]}\n```' }],
     },
     {
       type: 'result',
       subtype: 'success',
-      is_error: false,
-      result: '作为 1F 的代表，我弃权。\n\n```json\n{"vote":"abstain","reason":"信息不足"}\n```',
-      duration_ms: 1234,
+      result: 'final answer\n\n```json\n{"reviews":[{"severity":"minor","issue":"x","suggestion":"y","stance":"accept"}]}\n```',
       usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 5 },
     },
   ];
   const r = parseOutput(JSON.stringify(transcript, null, 2));
-  ok('对话记录数组：取的是 result 那段', r.ok === true && r.text.startsWith('作为 1F 的代表'), JSON.stringify(r.text).slice(0, 60));
-  ok('对话记录数组：**提问原文没被当成它的发言**', !r.text.includes('system-reminder') && !r.text.includes('要不要补测试'), r.text.slice(0, 60));
-  ok('对话记录数组：快照 / reasoning 没混进来', !r.text.includes('一大坨快照') && !r.text.includes('心里想了想'));
-  ok('对话记录数组：答复只出现一次（不重复拼接）', r.text.split('我弃权').length === 2, String(r.text.split('我弃权').length));
-  ok('对话记录数组：词元从收尾事件里读到了', r.tokens && r.tokens.input === 100 && r.tokens.output === 20 && r.tokens.cacheRead === 5, JSON.stringify(r.tokens));
-  ok('对话记录数组：事件数如实记着', r.events === 5, String(r.events));
-  const v = parseVoteBlock(r.text);
-  ok('对话记录数组：投票解析到的是最后那块（弃权 + 信息不足）', v.vote === 'abstain' && v.reason === '信息不足', JSON.stringify(v));
+  ok('the result event is the speech', r.ok === true && r.text.startsWith('final answer'), JSON.stringify(r.text).slice(0, 60));
+  ok('the question is not served as the answer', !r.text.includes('要不要补测试') && !r.text.includes('system-reminder'));
+  ok('snapshot / reasoning do not leak into the body', !r.text.includes('large snapshot') && !r.text.includes('private reasoning'));
+  ok('the answer is not repeated', r.text.split('final answer').length === 2, String(r.text.split('final answer').length));
+  ok('tokens come from the closing event', r.tokens && r.tokens.input === 100 && r.tokens.output === 20);
+  ok('every transcript entry is counted', r.events === 5, String(r.events));
 }
 {
-  // 只有一问一答、没有 result 事件的记录：退回最后一条 assistant 消息
   const t = [
-    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '提问原文' }] },
-    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '我的回答' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'question' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
   ];
-  const r = parseOutput(JSON.stringify(t));
-  ok('没有 result 事件时退回最后一条 assistant 消息', r.ok === true && r.text === '我的回答', JSON.stringify(r.text));
+  ok('without a result event, the last assistant message is used', parseOutput(JSON.stringify(t)).text === 'answer');
+  ok('a transcript with only the question cannot be parsed',
+    parseOutput(JSON.stringify([t[0]])).ok === false);
 }
-{
-  // 光有用户消息、没有任何答复 → 解析不出（不许把提问端出来当发言）
-  const t = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '提问原文' }] }];
-  ok('记录里只有提问 → ok=false（不拿提问充数）', parseOutput(JSON.stringify(t)).ok === false);
-}
-{
-  // 事件流里混着用户消息同样要跳过
-  const lines = [
-    JSON.stringify({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '提问原文' }] }),
-    JSON.stringify({ type: 'text', text: '我的回答' }),
-  ].join('\n');
-  const r = parseOutput(lines);
-  ok('事件流里的用户消息被跳过', r.ok === true && r.text === '我的回答', JSON.stringify(r.text));
-}
-{
-  // **真机抓下来的原样两行**（2026-10-01，opencode run --format json）。
-  // 上面那条 `{type:'text', text:...}` 是照猜测写的，猜错了：正文在 part 里。
-  // 这条用真形状，别再改回猜的。
-  const real = [
-    '{"type":"step_start","timestamp":1790868016288,"sessionID":"ses_f07f2c05","part":{"id":"prt_0f80","sessionID":"ses_f07f2c05","messageID":"msg_0f80","type":"step-start","snapshot":"6227b344"}}',
-    '{"type":"text","timestamp":1790868034373,"sessionID":"ses_f07f2c05","part":{"id":"prt_0f80d731","sessionID":"ses_f07f2c05","messageID":"msg_0f80","type":"text","text":"作为 8F 的代表，我**不同意**。\\n\\n```json\\n{\\"vote\\":\\"disagree\\",\\"reason\\":\\"成本远超收益\\",\\"proposal\\":\\"加 DRY_RUN 先跑一遍\\"}\\n```"},"time":{"start":1,"end":2}}',
-  ].join('\n');
-  const r = parseOutput(real);
-  ok('opencode 真形状：正文从 part.text 里取到', r.ok === true && r.text.startsWith('作为 8F 的代表'), JSON.stringify(r.text).slice(0, 80));
-  ok('opencode 真形状：状态事件（step_start）不贡献正文', r.events === 2 && !r.text.includes('6227b344'));
-  const v = parseVoteBlock(r.text);
-  ok('opencode 真形状：投票尾块解析得出来', v.vote === 'disagree' && v.proposal === '加 DRY_RUN 先跑一遍', JSON.stringify(v));
-}
+
+/* ------------------------------------------------------------ JSONL */
+head('parse: JSONL event streams');
 {
   const lines = [
-    JSON.stringify({ type: 'step_start', sessionID: 's1' }),
-    JSON.stringify({ type: 'text', text: '第一段。' }),
-    JSON.stringify({ type: 'text', text: '第二段。' }),
+    JSON.stringify({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'question' }] }),
+    JSON.stringify({ type: 'text', text: 'first' }),
+    JSON.stringify({ type: 'text', text: 'second' }),
     JSON.stringify({ type: 'step_finish', usage: { input_tokens: 10, output_tokens: 2 } }),
   ].join('\n');
   const r = parseOutput(lines);
-  ok('多行正文按顺序拼起来', r.ok === true && r.text === '第一段。\n第二段。', JSON.stringify(r.text));
-  ok('词元从收尾那条事件里取到', r.tokens && r.tokens.input === 10 && r.tokens.output === 2, JSON.stringify(r.tokens));
-  ok('认得出这是事件流', r.events === 4, String(r.events));
+  ok('user echoes are skipped', r.ok === true && r.text === 'first\nsecond', JSON.stringify(r.text));
+  ok('tokens come from the closing event', r.tokens.input === 10 && r.tokens.output === 2);
+  ok('all events counted', r.events === 4, String(r.events));
 }
 {
-  // CLI 常往 stdout 混日志行，坏行不该毁掉整条流
-  const mixed = ['这不是 JSON 的一行日志', JSON.stringify({ text: '正文在坏行后面' }), '还有一行日志'].join('\n');
-  const r = parseOutput(mixed);
-  ok('夹着非 JSON 日志行也照样解析出正文', r.ok === true && r.text === '正文在坏行后面', JSON.stringify(r));
+  // Real opencode shape captured on 2026-10-01: the body lives in `part.text`, not at the top level.
+  const real = [
+    '{"type":"step_start","timestamp":1790868016288,"sessionID":"ses_f07f2c05","part":{"id":"prt_0f80","sessionID":"ses_f07f2c05","messageID":"msg_0f80","type":"step-start","snapshot":"6227b344"}}',
+    '{"type":"text","timestamp":1790868034373,"sessionID":"ses_f07f2c05","part":{"id":"prt_0f80d731","sessionID":"ses_f07f2c05","messageID":"msg_0f80","type":"text","text":"作为 8F 的代表，我的评审意见如下。","modelID":"claude-sonnet"},"time":{"start":1,"end":2}}',
+  ].join('\n');
+  const r = parseOutput(real);
+  ok('opencode real shape: body comes from part.text', r.ok === true && r.text.startsWith('作为 8F 的代表'));
+  ok('opencode real shape: status events contribute nothing', r.events === 2 && !r.text.includes('6227b344'));
+  ok('opencode modelID alias is read', r.model === 'claude-sonnet', String(r.model));
 }
 {
-  // usage 挂多条时取最后一条（累加会在重试时重复计费）
+  const mixed = ['this line is not JSON', JSON.stringify({ text: 'body after a bad line' }), 'another log line'].join('\n');
+  ok('non-JSON log lines do not destroy the stream', parseOutput(mixed).text === 'body after a bad line');
+}
+{
   const stream = [
     JSON.stringify({ text: 'a', usage: { input_tokens: 1, output_tokens: 1 } }),
     JSON.stringify({ text: 'b', usage: { input_tokens: 99, output_tokens: 9 } }),
   ].join('\n');
-  const r = parseOutput(stream);
-  ok('usage 取最后一条而不是累加', r.tokens.input === 99, JSON.stringify(r.tokens));
+  ok('usage takes the last occurrence instead of summing retries', parseOutput(stream).tokens.input === 99);
 }
 
-head('输出解析：读不出就是读不出（绝不猜）');
-ok('空 stdout → ok=false', parseOutput('').ok === false);
-ok('null / undefined 不炸', parseOutput(null).ok === false && parseOutput(undefined).ok === false);
-ok('纯日志文本 → ok=false（不算读到正文）', parseOutput('Segmentation fault').ok === false);
-ok('事件流里只有状态事件、没有正文 → ok=false', parseOutput(JSON.stringify({ type: 'step_start' })).ok === false);
+/* ------------------------------------------------------------ Codex / Cline */
+head('parse: Codex and Cline real shapes');
 {
-  const r = parseOutput('{坏掉的 json');
-  ok('坏 JSON → ok=false 且不抛错', r.ok === false && r.text === '');
+  const lines = [
+    JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+    JSON.stringify({ type: 'item.completed', item: { id: 'i0', type: 'reasoning', text: 'private reasoning' } }),
+    JSON.stringify({ type: 'error', message: 'Reconnecting... (plan type is required)' }),
+    JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'error', message: 'ignoring 2 unrecognized settings' } }),
+    JSON.stringify({ type: 'item.completed', item: { id: 'i2', type: 'agent_message', text: 'my review\n\n{"reviews":[]}' } }),
+    JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 20 } }),
+  ].join('\n');
+  const r = parseOutput(lines);
+  ok('codex: only agent_message is speech', r.ok === true && r.text.startsWith('my review'));
+  ok('codex: reasoning and error events never become speech',
+    !r.text.includes('private reasoning') && !r.text.includes('Reconnecting') && !r.text.includes('unrecognized'));
+  ok('codex: cached_input_tokens alias normalized',
+    r.tokens.input === 100 && r.tokens.output === 20 && r.tokens.cacheRead === 40, JSON.stringify(r.tokens));
+}
+{
+  const body = '看完了。\n\n{"reviews":[]}';
+  const lines = [
+    JSON.stringify({ ts: '1', type: 'agent_event', event: { type: 'content_start', contentType: 'reasoning', reasoning: 'let me read files' } }),
+    JSON.stringify({ ts: '2', type: 'agent_event', event: { type: 'content_end', contentType: 'text', text: body } }),
+    JSON.stringify({ ts: '3', type: 'run_result', finishReason: 'completed', usage: { inputTokens: 20, outputTokens: 5, cacheReadTokens: 3 }, text: body }),
+  ].join('\n');
+  const r = parseOutput(lines);
+  ok('cline: body comes from run_result', r.ok === true && r.text === body);
+  ok('cline: the body appears once (reasoning is not text)', r.text.split('看完了').length === 2);
+  ok('cline: camelCase usage normalized', r.tokens.input === 20 && r.tokens.output === 5 && r.tokens.cacheRead === 3);
 }
 
-// ---------------------------------------------------------------- 投票解析
-head('投票解析：约定的结构化尾块');
+/* ------------------------------------------------------------ unparseable */
+head('cannot parse means cannot parse');
+ok('empty stdout -> ok=false', parseOutput('').ok === false);
+ok('null / undefined do not throw', parseOutput(null).ok === false && parseOutput(undefined).ok === false);
+ok('plain log text -> ok=false', parseOutput('Segmentation fault').ok === false);
+ok('only status events, no body -> ok=false', parseOutput(JSON.stringify({ type: 'step_start' })).ok === false);
 {
-  const r = parseVoteBlock('我的分析是成本可控、能按期交付。\n\n```json\n{"vote":"agree","reason":"成本可控"}\n```');
-  ok('同意票 + 理由', r.vote === 'agree' && r.reason === '成本可控', JSON.stringify(r));
+  const r = parseOutput('{broken json');
+  ok('broken JSON -> ok=false with empty text', r.ok === false && r.text === '');
 }
 {
-  const r = parseVoteBlock('这条路线我不同意，风险太大。\n\n```json\n{"vote":"disagree","reason":"风险太大","proposal":"改成先做小范围灰度"}\n```');
-  ok('反对票带上修订案', r.vote === 'disagree' && r.proposal === '改成先做小范围灰度', JSON.stringify(r));
-}
-{
-  const r = parseVoteBlock('```json\n{"vote":"abstain","reason":"我不懂这块","second":"4F"}\n```');
-  ok('弃权 + 附议别人', r.vote === 'abstain' && r.second === '4F', JSON.stringify(r));
-}
-{
-  // 模型爱在中间举例，最后一块才是结论 —— 必须取最后一个
-  const text = '比如可以这样写：\n```json\n{"vote":"agree","reason":"示例"}\n```\n但我的结论是：\n```json\n{"vote":"disagree","reason":"真实结论"}\n```';
-  const r = parseVoteBlock(text);
-  ok('取**最后一个**围栏块（中间的例子不算）', r.vote === 'disagree' && r.reason === '真实结论', JSON.stringify(r));
-}
-{
-  const r = parseVoteBlock('没有围栏，直接给了对象 {"vote":"agree","reason":"就这样"} 收尾。');
-  ok('没有围栏时也能从正文里认出来', r.vote === 'agree' && r.reason === '就这样', JSON.stringify(r));
-}
-{
-  const r = parseVoteBlock('我的看法如下。\n\nVOTE: 反对');
-  ok('兜底认「VOTE: 反对」这种一行', r.vote === 'disagree', JSON.stringify(r));
-  const r2 = parseVoteBlock('立场：弃权');
-  ok('也认「立场：弃权」', r2.vote === 'abstain', JSON.stringify(r2));
-}
-{
-  // 正文里带花括号（代码片段）不能把括号配对搞崩
-  const r = parseVoteBlock('伪代码是 if (x) { y(); } 这样。\n```json\n{"vote":"agree","reason":"没问题"}\n```');
-  ok('正文里的花括号不影响解析', r.vote === 'agree', JSON.stringify(r));
+  const r = parseOutput(JSON.stringify({ type: 'error', message: 'auth failed' }));
+  ok('a top-level error event is not speech', r.ok === false && r.text === '');
 }
 
-head('投票解析：认不出来就是"未表态"，不是默认同意');
-ok('空文本 → vote=null', parseVoteBlock('').vote === null);
-ok('null / undefined 不炸', parseVoteBlock(null).vote === null && parseVoteBlock(undefined).vote === null);
-{
-  const r = parseVoteBlock('我觉得这个方案还行吧，大家看着办。');
-  ok('只有模糊表态、没有结构化块 → vote=null', r.vote === null, JSON.stringify(r));
-}
-{
-  const r = parseVoteBlock('```json\n{"vote":"maybe","reason":"看情况"}\n```');
-  ok('票型是没见过的词 → vote=null（不硬塞成同意）', r.vote === null, JSON.stringify(r));
-}
-{
-  const r = parseVoteBlock('```json\n{"reason":"忘了写 vote"}\n```');
-  ok('缺 vote 字段 → vote=null', r.vote === null);
-}
-{
-  const r = parseVoteBlock('```json\n{"vote":"agree"}\n```');
-  ok('没有理由也认（理由是补充信息，不是投票的前提）', r.vote === 'agree' && r.reason === null);
-}
-
-head('票型词表与 consensus.js 保持一套');
-ok('agree / 同意 / AGREE 都归成 agree', normalizeVoteToken('agree') === 'agree' && normalizeVoteToken('同意') === 'agree' && normalizeVoteToken('AGREE') === 'agree');
-ok('disagree / 反对 归成 disagree', normalizeVoteToken('反对') === 'disagree' && normalizeVoteToken('no') === 'disagree');
-ok('abstain / 弃权 归成 abstain', normalizeVoteToken('弃权') === 'abstain');
-ok('认不出返回 null', normalizeVoteToken('随便') === null && normalizeVoteToken(null) === null);
-
-// ================================================== 不上报：工程模式隔离的命门
-// cwd 是用户的真实工程时，装了 WorkGremlin 上报 hook/插件的机器会把参与者**按真实工程
-// 路径**上报 —— 参与者就变成"你工程里的一个成员"。cwd 挡不住这件事，只有显式关掉上报。
-head('所有配方都关掉了 WorkGremlin 自己的上报');
-for (const f of ['1F', '4F', '7F', '8F']) {
-  const env = RECIPES[f].build({ bin: '/x', prompt: 'p' }).env;
-  ok(`${f} 注入了 WORKGREMLIN_DISABLE=1`, env.WORKGREMLIN_DISABLE === '1', JSON.stringify(env));
-}
-ok('QUIET_ENV 只有这一条（别顺手塞别的东西进去）', Object.keys(QUIET_ENV).length === 1 && QUIET_ENV.WORKGREMLIN_DISABLE === '1');
-
-// ============================================== 7F/8F 的会话标记（第二道隔离）
-// 这两家没有 1F/4F 那种 `--no-session-persistence`，会话一定落进它们**全局**的 SQLite，
-// 而 session.directory 记的是当时的 cwd。工程模式下 cwd 就是用户的工程 —— 不标记的话，
-// 参与者会当场出现在办公室的 7F/8F 上（办公室按工程过滤，它正好落在那个工程里）。
-// 挡法是固定标题 + server/src/kilo.js / opencode.js 列出会话时跳过它。
-// 这里只钉"发出去的确实是那个标题"；"跳过了"由 kiloFloor / opencodeFloor 那两个用例钉。
-head('7F/8F 发送固定的会话标题（办公室据此把参与者挡在外面）');
-for (const f of ['7F', '8F']) {
-  {
-    const args = RECIPES[f].build({ bin: '/x', prompt: 'p' }).args;
-    const at = args.indexOf('--title');
-    ok(`${f} 带了 --title`, at >= 0, JSON.stringify(args));
-    ok(`${f} 标题就是 DEFAULTS.COUNCIL_SESSION_TITLE`,
-      args[at + 1] === DEFAULTS.COUNCIL_SESSION_TITLE, JSON.stringify(args));
-  }
-  // 只给这两家加：1F/4F 靠 --no-session-persistence 根本不产生记录，标题对它们是多余的
-  ok(`${f} 的标题在参数里只出现一次`, RECIPES[f].build({ bin: '/x', prompt: 'p' }).args.filter((a) => a === '--title').length === 1);
-}
-for (const f of ['1F', '4F']) {
-  ok(`${f} 不带 --title（它靠 --no-session-persistence，压根不落盘）`,
-    !RECIPES[f].build({ bin: '/x', prompt: 'p' }).args.includes('--title'), JSON.stringify(RECIPES[f].build({ bin: '/x', prompt: 'p' }).args));
-}
-ok('标记里带 WorkGremlin（用户在 Kilo / OpenCode 自己的会话历史里认得出这是谁留下的）',
-  DEFAULTS.COUNCIL_SESSION_TITLE.includes('WorkGremlin'), DEFAULTS.COUNCIL_SESSION_TITLE);
-
-// ============================================================ 分析解析
-head('分析解析：约定的结构化尾块');
-{
-  const r = parseAnalysisBlock('我的分析……\n\n```json\n' +
-    JSON.stringify({ stance: 'support', points: ['A', 'B'], risks: ['C'], questions: ['D'] }) + '\n```\n');
-  ok('stance 解析出来', r.stance === 'support', JSON.stringify(r));
-  ok('三条要点都在', r.findings.points.length === 2 && r.findings.risks[0] === 'C' && r.findings.questions[0] === 'D', JSON.stringify(r.findings));
-}
-{
-  const r = parseAnalysisBlock('```json\n{"stance":"oppose","points":[],"risks":[],"questions":[]}\n```');
-  ok('空数组是合法的（"答了，答的是没有"）', r.stance === 'oppose' && Array.isArray(r.findings.points) && r.findings.points.length === 0);
-  ok('findings 不是 null —— 与"整个尾块没解析出来"是两回事', r.findings !== null);
-}
-{
-  const r = parseAnalysisBlock('```json\n{"stance":"unsure"}\n```');
-  ok('只给了 stance、一条要点都没有 → findings=null（"没说" ≠ "说没有"）', r.stance === 'unsure' && r.findings === null, JSON.stringify(r));
-}
-{
-  const r = parseAnalysisBlock('```json\n{"points":["有结论没立场"]}\n```');
-  ok('有要点但没给 stance → stance=null（立场这东西不许替它定）', r.stance === null);
-  ok('要点照收（它说了的话不因为缺立场就丢掉）', r.findings && r.findings.points[0] === '有结论没立场');
-}
-{
-  // 注意"看情况""maybe"这类**模糊词**是归到 unsure 的 —— unsure 本来就是"没拿定主意"
-  // 那一档，收下它不算替它表态（与表决里 neutral → abstain 同一个路子）。
-  // 真正认不出的词（下面这个）才必须是 null。
-  const r = parseAnalysisBlock('```json\n{"stance":"banana","points":["x"]}\n```');
-  ok('立场是个没见过的词 → null，不硬塞成 support', r.stance === null, JSON.stringify(r));
-  ok('模糊词归到 unsure（它就是"没拿定主意"那一档）', parseAnalysisBlock('```json\n{"stance":"maybe"}\n```').stance === 'unsure');
-}
-{
-  ok('整个没有 JSON 块 → 两样都是 null', JSON.stringify(parseAnalysisBlock('就说了一段话，没给尾块')) === JSON.stringify({ stance: null, findings: null }));
-  ok('空文本 → 全 null', parseAnalysisBlock('').stance === null && parseAnalysisBlock(null).stance === null);
-}
-{
-  // 模型爱在中间举例：取**最后**一个块才是它的结论（与表决解析同一条规矩）
-  const r = parseAnalysisBlock('例如可以这样写：\n```json\n{"stance":"oppose"}\n```\n而我最后判断是：\n```json\n{"stance":"support","points":["最后说的算"]}\n```');
-  ok('中间举例的块不会被误当结论（取最后一个）', r.stance === 'support', JSON.stringify(r));
-}
-{
-  // 元素不是字符串的（模型偶尔塞对象进来）丢掉，不当成一条要点
-  const r = parseAnalysisBlock('```json\n{"stance":"support","points":["好的",{"point":"坏的"},"  "],"risks":[]}\n```');
-  ok('非字符串元素与空串被丢掉，不硬转成字符串', r.findings.points.length === 1 && r.findings.points[0] === '好的', JSON.stringify(r.findings));
-}
-
-head('立场词表：认识的归一，不认识的一律 null');
-ok('support / 支持 / 赞成 / 可行 归成 support',
-  ['support', '支持', '赞成', '可行', 'agree'].every((s) => normalizeStanceToken(s) === 'support'));
-ok('oppose / 反对 / 不可行 归成 oppose', ['oppose', '反对', 'no', 'disagree'].every((s) => normalizeStanceToken(s) === 'oppose'));
-ok('unsure / 不确定 / 存疑 归成 unsure', ['unsure', '不确定', '存疑', 'maybe'].every((s) => normalizeStanceToken(s) === 'unsure'));
-ok('认不出返回 null', normalizeStanceToken('随便') === null && normalizeStanceToken(null) === null && normalizeStanceToken('') === null);
-
-console.log(`\n${fail ? '✗' : '✓'} council-agents: ${pass} 通过 / ${fail} 失败`);
+console.log(`\n${fail ? '✗' : '✓'} council-agents: ${pass} passed / ${fail} failed`);
 process.exit(fail ? 1 : 0);

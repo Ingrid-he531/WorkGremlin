@@ -30,6 +30,10 @@
  *     [D2] the last turn carries the real token values
  *   E. Unreadable must not bubble
  *     [E1] the db lacks the sessions table (Cline changes its schema) -> floor still listed, sessions empty, no throw
+ *   G. Council isolation
+ *     [G1] a session whose title carries COUNCIL_PROMPT_MARKER is skipped; a mere mention is not
+ *   H. Terminal sessions
+ *     [H1] a finished (terminal) session is not listed; [H2] its existing registry row is retracted; [H3] in-flight ones stay
  */
 'use strict';
 
@@ -53,6 +57,7 @@ process.env.CLINE_DATA_DIR = DATA;
 
 const { detectProducts } = require('../src/floors');
 const cline = require('../src/floorCline');
+const { DEFAULTS } = require('@workgremlin/shared');
 
 let pass = 0;
 let fail = 0;
@@ -212,6 +217,13 @@ const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
     row('cli-cancel-end', { messagesPath: pCancelEnd, title: '被取消那轮', status: 'cancelled', endedAt: NOW - 90_000 }),
     row('cli-cancel-next', { messagesPath: pCancelNext, title: '取消后重试' }),
     row('cli-sub', { messagesPath: pTool, title: '子代理', isSubagent: 1 }),
+    // A council participant: Cline stores the prompt itself as the session title, and the council prompt
+    // always opens with COUNCIL_PROMPT_MARKER. 2F must skip it (else in workspace mode it would surface on
+    // the office's 2F, violating requirements.md §15.2).
+    row('cli-council', { messagesPath: pIdle, title: `你是 ${DEFAULTS.COUNCIL_PROMPT_MARKER}里【2F Cline】这一层的代表` }),
+    // The other direction: a title that merely mentions the word must NOT be filtered (the marker is the
+    // exact phrase, not a loose keyword).
+    row('cli-mentions', { messagesPath: pIdle, title: '讨论议事厅要不要加楼层' }),
   ]);
 }
 
@@ -303,8 +315,42 @@ head('[F] 取消检测：以 Cline 自己的会话终态为准');
   ok('[F4] 会话仍在跑 → 开着的轮保持 running（不误判取消）', roundsLive[1] && roundsLive[1].outcome === 'running' && !roundsLive[1].endedAt, JSON.stringify(roundsLive[1]));
 }
 
-head('[E] 读不出来不许冒泡');
+head('[G] 议事厅参与者不进 2F（标题带 COUNCIL_PROMPT_MARKER）');
 {
+  const list = cline.listClineSessions();
+  ok('[G1] 标题带标记的参与者会话被跳过', !list.some((s) => s.id === 'cli-council'), JSON.stringify(list.map((s) => s.id)));
+  // Exact phrase, not a loose keyword: an ordinary session that merely mentions it stays listed.
+  ok('[G2] 普通会话只是提到这个词 → 照常列出', list.some((s) => s.id === 'cli-mentions'), JSON.stringify(list.map((s) => s.id)));
+}
+
+head('[H] 终态会话立刻回收（源里标了结束就不进下拉）');
+{
+  // Fake registry context: `table` is a Map, claim/upsert record what the handler did.
+  const table = new Map();
+  const upserts = [];
+  const ctx = {
+    claim: () => true,
+    upsert: (e) => {
+      upserts.push(e);
+      table.set(`${e.floor}:${e.id}`, e);
+    },
+    now: Date.now(),
+    workspacePath: '',
+    TIMEOUT_MS: 60 * 60_000,
+    reporterMainPhase: () => null,
+    readReporterDone: () => null,
+    doneFieldsFromReporter: () => ({}),
+    table,
+  };
+  // cli-cancel-end is status=cancelled + ended_at (terminal); cli-hist is still in flight.
+  table.set('2F:cli-cancel-end', { floor: '2F', id: 'cli-cancel-end' });
+  cline.kindHandlers.cline({ id: '2F' }, { kind: 'cline', client: 'cline' }, ctx);
+  ok('[H1] 终态会话不进下拉', !upserts.some((e) => e.id === 'cli-cancel-end'), JSON.stringify(upserts.map((e) => e.id)));
+  ok('[H2] 已存在的终态行被撤回', !table.has('2F:cli-cancel-end'));
+  ok('[H3] 在飞的会话照常列出（不误伤）', upserts.some((e) => e.id === 'cli-hist'), JSON.stringify(upserts.map((e) => e.id)));
+}
+
+head('[E] 读不出来不许冒泡');{
   // Swap in a db with only an unrelated table: when Cline changes its schema, 2F must "read no sessions" and not crash
   const BAD = path.join(DATA, 'db', 'bad.db');
   const db = new Database(BAD);

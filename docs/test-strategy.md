@@ -621,38 +621,39 @@ CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
 范围与能力边界见 `requirements.md` §15，实现形态见 `implementation-status.md` §4.2。
 **落地方式与本文其它用例不同**：不是 Vitest / Playwright，而是**普通 node 脚本**，
 挂在根 `package.json` 的 `test:council-*` 上（`ok(标签, 条件)` 计数器，失败即非零退出）。
-理由与仓库其余 40 多个 `test:*` 一致：零依赖、`node 文件` 直接跑、CI 与本地同一套。
+理由与仓库其余 60 多个 `test:*` 一致：零依赖、`node 文件` 直接跑、CI 与本地同一套。
 
 ### 3.16.1 必测断言（按"错了会真出什么事"排）
 
 | 编号 | 用例 | 断言 | 落在哪 |
 | --- | --- | --- | --- |
-| **COUNCIL-01** | **只读保证** | 1F/4F 的参数里有 `--tools` 且值为**空串**（空串最容易被"顺手清理"成没填，单独钉一次）；7F/8F 注入的配置里 `permission['*']` 及逐项都是 `deny`；7F 的 `plugin` 被摘成空数组 | `test:council-agents` |
-| **COUNCIL-02** | **隔离** | 四层的 `env` 里都**没有 `HOME`**（挡掉 HOME = 挡掉登录凭据）；提示词走 stdin 时不出现在 `argv` 里 | `test:council-agents` |
-| **COUNCIL-03** | **不猜立场** | 解析不出正文 / 没有 vote 字段 / 票型是没见过的词 / 进程超时或崩掉 → `vote` 一律 **null**，界面写「未表态」，**绝不能按语气猜、也不能默认同意或弃权** | `test:council-consensus`、`test:council-agents` |
-| **COUNCIL-04** | **真线格式** | 用**真机抓下来的原样输出**（opencode 的两行事件流、CodeBuddy 的五条记录数组）断言：正文取到、**提问原文与快照/reasoning 不许混进来**、答复只出现一次、词元读得到 | `test:council-agents` |
-| **COUNCIL-05** | 判票规则 | 无反对 + 同意 ≥ 半数 → 一致；有反对 → 不一致；**弃权不计入分母**；反对者的多份修订案取附议最多者、并列取楼层号最小（确定性） | `test:council-consensus` |
-| **COUNCIL-06** | 谈不拢就如实说 | 到 `max_rounds` 仍分歧 → `verdict='no_consensus'`，**不是错误、也不硬凑一个结论**；界面展示最后一轮提案原文并标注"未通过" | `test:council-consensus`、`test:render-smoke` |
-| **COUNCIL-07** | 单次调用 | 用临时目录里的 `#!/bin/sh` stub 当 CLI：JSON 解析、**超时杀进程**（含子进程组）、非零退出如实记 error、缺 `vote` 不编造 | `test:council-runner` |
-| **COUNCIL-08** | 编排 | 端到端跑一场（stub 参与者）：轮次推进、提案**逐轮存档**、WS 事件、`verdict` 正确、**临时目录被清理** | `test:council-orchestrator` |
-| **COUNCIL-09** | 接口 | 真实 express + 真实 repo + 临时 DB：发起 / 列表 / 详情 / 取消 / 删除；**409（还在跑）不许当成功**，服务端原话照搬给界面 | `test:council-api`、`test:council-ui-store` |
-| **COUNCIL-10** | 材料截断 | 超限文件按上限截断，`bytes_total` / `bytes_included` 落真值，界面显示「原文 N 字节，只嵌了前 M 字节」；文件读不到 → NULL（**不是 0**） | `test:council-materials`、`test:render-smoke` |
-| **COUNCIL-11** | 界面数据合并 | HTTP 详情（快照）与 WS 增量（最新）按**轮次号**取新的那份；增量不许抹掉已有的正文；收尾推送只有摘要 → 必须**回拉详情**，否则页面停在没有结论的"已结束"上 | `test:council-ui-store` |
-| **COUNCIL-12** | 不进办公室 | 跑完一场会，`members` / `task_runs` 里**一条都不许多**；办公室与任务记录页看不到任何痕迹（工程模式下还要加上 7F/8F 的会话清单，见 COUNCIL-18） | `test:council-orchestrator`（断言表未被动） |
+| **COUNCIL-01** | **只读保证** | 1F/4F 的 `--tools` 是 `Read,Grep,Glob` 且 `--allowedTools` 同一份、4F 的 `--permission-prompts none` 排在变参**前面**；7F/8F 注入的配置里只放行 `read/glob/grep/list`，`bash/edit/write/webfetch` 与 **`external_directory`** 全 deny；7F 的 `plugin` 被摘成空数组 | `test:council-agents` |
+| **COUNCIL-02** | **隔离** | 各层配方的 `env` 里都**没有 `HOME`**（挡掉 HOME = 挡掉登录凭据）；提示词走 stdin 时不出现在 `argv` 里（**2F Cline 是例外**：它的 JSON 模式不读 stdin，提示词只能走位置参数） | `test:council-agents` |
+| **COUNCIL-03** | **角色校验** | 必须恰好一名 `moderator`、一名 `main`、至少一名 `reviewer`，且**同一楼层不能兼任**：缺角色 / 主持人兼主答 / 评审与主持人或主答同层 → 400 且一个进程都不起；重复评审折叠成一条；楼层未安装或未就绪 → 400 并带上**原因原话** | `test:council-api` |
+| **COUNCIL-04** | **真线格式** | 用**真机抓下来的原样输出**（opencode 的两行事件流、CodeBuddy 的五条记录数组、Cline 的 `run_result`、Codex 的 `agent_message`）断言：正文取到、**提问原文与快照/reasoning 不许混进来**、答复只出现一次、词元读得到；空 stdout / 坏 JSON / 只有状态事件 → `ok=false`，不编造正文 | `test:council-agents` |
+| **COUNCIL-05** | **结构化解析（ReviewPoint）** | 取**最后一个**围栏 JSON 块（正文中段的示例不算），字符串里的花括号不许提前截断；没有块 → `parsed=false` 但正文照存（绝不丢）；缺 `suggestion` 的条目**丢弃并计数**（`parse_dropped`），不补写；缺 `dimension` 归「其他」、缺 `evidence` 是 NULL；逐条 `stance` 缺省继承整轮立场，两者都缺 → 该条**不可用**（绝不默认 `accept`）；`reviews: []` 是合法结果（`parsed=true`），与解析失败必须分开；评审人身份由服务端按楼层赋予，模型不能自报 | `test:council-parse` |
+| **COUNCIL-06** | **收敛度可解释** | `raw = 100 − (blocker×25 + major×8 + minor×2 + nit×0 + 冲突×10)`，clamp 到 0..100；每一项扣分与权重都随分值一起返回；模型自报的 `convergenceScore` **不进入解析结果**（被服务端算出的数值覆盖）；未知严重度计入总数但不进任何严重度桶；`nit` 不扣分；冲突表缺失按空处理 | `test:council-convergence`、`test:council-orchestrator` |
+| **COUNCIL-07** | **主持人硬指令与一致性** | 指令缺「必须」、缺验收标准、命中含糊词（建议 / 可以考虑 / 酌情 / 尽量 / maybe / consider）→ 记 warning；有 blocker 却没有对应指令 / 没进 `openIssues` → 记 warning；`reject` 立场却没有登记冲突 → 记 warning；没产出任何意见的评审被点名；最终 `approve` 而最后一轮仍有 blocker → 记 warning。warnings **不改变流程与 verdict**，只如实展示 | `test:council-convergence`、`test:council-orchestrator`、`test:council-report` |
+| **COUNCIL-08** | 单次调用 | 用临时目录里的 `#!/bin/sh` stub 当 CLI：JSON 解析、**超时杀进程**（含子进程组）、非零退出如实记 error、解析不出正文不编造 | `test:council-runner` |
+| **COUNCIL-09** | 编排 | 端到端跑一场（stub 参与者）：第 0 轮拆题只跑一次；1..N 轮各落一个 `RoundResult`（提案、diff、评审、主持人汇总）；**高分也不提前停**；轮末裁决与最终稿各一次；`verdict='completed'`、`status='done'`；WS 事件带 `project=null`；**临时目录被清理** | `test:council-orchestrator` |
+| **COUNCIL-10** | 接口 | 真实 express + 真实 repo + 临时 DB：发起 / 列表 / 详情 / 取消 / 删除；`/floors` 发布权重、角色、严重度、立场与轮数默认值（界面不许再抄一份）；详情带回 `roundResults` / `utterances` / `materials` / `participants` / `report`；**409（还在跑）不许当成功**，服务端原话照搬给界面 | `test:council-api`、`test:council-ui-store` |
+| **COUNCIL-11** | 材料截断 | 超限文件按上限截断，`bytes_total` / `bytes_included` 落真值，界面显示「原文 N 字节，只嵌了前 M 字节」；文件读不到 / 是目录 / 是二进制 → **整个请求 400 并点名那个文件**（不静默跳过）；落库层 `bytes_total` 取不到时是 NULL（**不是 0**） | `test:council-materials`、`test:render-smoke`、`test:council-api` |
+| **COUNCIL-12** | 界面数据合并 | HTTP 详情（快照）与 WS 增量（最新）按**轮次号**取新的那份；增量不许抹掉已有的正文；同一楼层不同 phase 的发言不许互相覆盖；收尾推送只有摘要 → 必须**回拉详情**，否则页面停在没有结论的"已结束"上 | `test:council-ui-store` |
+| **COUNCIL-13** | 不进办公室 | 跑完一场会，`members` / `task_runs` 里**一条都不许多**；办公室与任务记录页看不到任何痕迹（工程模式下还要加上 2F/6F/7F/8F 的会话清单，见 COUNCIL-17） | `test:council-orchestrator`（断言表未被动） |
 
-**2026-10-02 加的两个开关（`mode` 谈法 / `workspace_path` 在哪儿谈）补的用例**：
+**2026-10-02 的工程目录 / 2026-10-19 的角色化重构补的用例**：
 
 | 编号 | 用例 | 断言 | 落在哪 |
 | --- | --- | --- | --- |
-| **COUNCIL-13** | **只读工具那一档** | `allow='read'`：1F/4F 的 `--tools` 是 `Read,Grep,Glob`（**不再是空串**）且给 `--allowedTools` 同一份、4F 的 `--permission-prompts none` 排在它**前面**；7F/8F 放行 `read/glob/grep/list`，`bash/edit/write/webfetch` 与 **`external_directory`** 全 deny。`allow` 缺省 / `'none'` 时与改动前**逐字相同**（回归对照） | `test:council-agents` |
-| **COUNCIL-14** | **分析模式怎么收场** | 跑满 `max_rounds`、`verdict='reported'`、`status='done'`；**不判票**（票型列全 0、无提案、提示词里没有"现在要表决的提案"那段）；逐轮落库与广播照旧；最后一轮的提示词里有"最后一轮" | `test:council-orchestrator` |
-| **COUNCIL-15** | **分析模式也不猜** | `parseAnalysisBlock`：没有尾块 / 怪词 / 缺 `stance` → `stance=null`（正文照存、`status='unparsed'`）；`maybe` 归 `unsure`（它本就是"拿不准"那一档）。**`points:[]`（答了，答的是没有）与 `null`（没说）必须分开** | `test:council-agents`、`test:council-timeline` |
-| **COUNCIL-16** | **工程目录不许被动** | 注入 `removeDir` / `isDir` stub：工程模式下**不建也不删**临时目录、断言用户的目录没被删；提示词里带上工程路径与"不能修改任何文件"；目录在发起后被删掉 → `verdict='failed'` + 原话落库，**一个进程都不起** | `test:council-orchestrator` |
-| **COUNCIL-17** | 两个新入参的校验 | `mode` 不在白名单（`投票` / `VOTE` / `debate` / 带尾空格）→ 400，**不静默降级**；`workspacePath` 是相对路径 / 不存在 / 是个文件 → 400 且**原话里带上那个路径**；`~` 展开成 home 再判 | `test:council-api` |
-| **COUNCIL-18** | **工程模式的两道隔离锁** | ①四层配方（两种 allow）的 `env` 都带 `WORKGREMLIN_DISABLE=1`；hook 认到就**原地退出**（不连服务端、不写状态文件、退出码 0），插件两条入口都认（返回的形状不许变，否则 7F 会当成"插件加载失败"）；②7F/8F 配方发的 `--title` = 会话清单过滤的那个标题 —— 同库同工程里**用户会话照常列出、只有参与者那条被挡住** | `test:council-agents`、`test:claude-hook`、`test:council-quiet-plugin`、`test:kilo`、`test:opencode` |
-| **COUNCIL-19** | 老库迁移 | 没有 `mode` / `workspace_path` 的老库 → 补列且行为**不变**（`vote` / NULL），老行原样读得出来；`verdict` 的 CHECK 重建之后 `reported` 写得进去 | `test:council-store` |
-| **COUNCIL-20** | 分析模式的界面 | 分组按 `支持 → 反对 → 不确定 → 未表态` 固定顺序、只渲染非空组、`points/risks/questions` 原文照录；**有立场但没给要点**单独标一句；**不出现共识横幅与票型**；老 fixture（没有 `mode`）不许被新分支命中 | `test:render-smoke`、`test:council-timeline` |
-| **COUNCIL-21** | **一轮只摊开一个人的发言**（2026-10-02） | 一轮的发言摆成一排 radio **单选** —— 同一轮同一组、不同轮各成一组（选这轮不许把上轮的选择踢掉）；**只渲染选中那一位的正文**，没选的那几层正文一个字都不出现；但**收起来的是正文不是事实**：表决模式的票型、附议、"这轮没能发言"照旧挂在那一行上（超时那层收起来也得看得见）；**分析模式的这一排上不许出现「支持 / 反对 / 不确定」**，立场只在简报里分组说 | `test:render-smoke` |
+| **COUNCIL-14** | **工程目录不许被动** | 注入 `removeDir` / `isDir` stub：工程模式下**不建也不删**临时目录、断言用户的目录没被删；提示词里带上工程路径与"不能修改任何文件"；目录在发起后被删掉 → `verdict='failed'` + 原话落库，**一个进程都不起** | `test:council-orchestrator` |
+| **COUNCIL-15** | 入参校验 | `workspacePath` 是相对路径 / 不存在 / 是个文件 → 400 且**原话里带上那个路径**；`~` 展开成 home 再判；`maxRounds` 超上限按上限、非法值回落到缺省**而不是 0**；重复评审折叠；空/全空白议题 → 400 | `test:council-api` |
+| **COUNCIL-16** | **工程模式的两道隔离锁** | ①所有配方的 `env` 都带 `WORKGREMLIN_DISABLE=1`；hook 认到就**原地退出**（不连服务端、不写状态文件、退出码 0），插件两条入口都认（返回的形状不许变，否则 7F 会当成"插件加载失败"）；②7F/8F 配方发的 `--title`、6F 的 `--name` 都等于会话清单过滤的那个标题；2F 没有标题开关，它把提示词存成标题，所以提示词开头固定带 `COUNCIL_PROMPT_MARKER` —— 同库同工程里**用户会话照常列出、只有参与者那条被挡住** | `test:council-agents`、`test:claude-hook`、`test:council-quiet-plugin`、`test:kilo`、`test:opencode`、`test:cline` |
+| **COUNCIL-17** | **报告落盘** | 收尾后**只**在 `~/.workgremlin/councils/<id>/` 下写出 `report.json` / `reviews.csv` / `rounds.csv` / `report.md`；即使发起时填了工程目录，也**不往工程里写任何文件**（工程只读写、不写）；CSV 带 UTF-8 BOM、逗号/引号/换行按 CSV 规则转义、CRLF 行尾；**已存在的文件绝不被覆盖**（同名加时间戳）；报告 schema 固定（含 plan / 每轮 `RoundResult` / 裁决 / 最终稿 / 改动说明 / warnings / files）；词元取不到写「—」、只报一半写「≥ N」，**绝不补 0** | `test:council-report`、`test:council-orchestrator` |
+| **COUNCIL-18** | **新表结构与无投票** | 全新库直接建七张 `council_*` 表；`verdict` 的 CHECK 只认 `completed/partial/cancelled/failed`；**没有** `mode` / `threshold` / `vote` / 票数列；`completed` 与 `partial` → `done`、`cancelled` → `cancelled`、其余 `failed`；删除会清掉全部子行，进行中的会删除返回 409 | `test:council-store`、`test:council-api` |
+| **COUNCIL-19** | **fail-fast 与「工作中」标识** | 第 0 轮主持人答不上来（模拟 CLI 退出码 0 但 transcript 截断）→ 立即 `failed`，**不再发起提案 / 评审**，错误写明轮次 / 阶段 / 楼层与原始错误，报告照常归档，参与者不留 `running`；评审失败 / 未解析 → 不进入主持人汇总，`turn_failed` 进报告；完成过一轮后再失败 → `partial`；`progressOf` 在调用进行中返回 `{roundNo, phase, floors}` 并随 WS 推送，会议结束后为 `null`；详情接口同样返回 `progress`，刷新后可见 | `test:council-orchestrator`、`test:council-api`、`test:council-ui-store`、`test:render-smoke` |
+| **COUNCIL-19** | **右侧只显示汇总** | 收敛度取**最后一轮**的服务端分值并同时展示公式；n 条意见 / n 条 blocker / n 处冲突；三名角色的楼层、模型、词元各一行，没有用量写「—」；**页面上不出现任何投票痕迹** | `test:render-smoke`、`test:council-timeline` |
+| **COUNCIL-20** | **完整过程折叠 + 每轮 diff** | 过程区是 `<details>` 且**默认不展开**（不带 `open`）；第 0 轮展示拆题与分工；首版提案不写 diff（明确占位），后续每轮展示与上一版的 diff；每轮评审（严重度 + 立场 + 证据 + 建议）与主持人汇总（共识 / 未决 / 冲突双方 / 硬指令 / warnings）原文照录；失败 / 未解析的发言展示原话与原因，**不替它编一条意见**；**每轮（含第 0 轮）末尾保留全部发言的原始输出**（楼层 / 阶段 / 状态 / 耗时 / 错误原文）；fail-fast 中止后没有 `RoundResult` 的轮次标为「未完成」并列出已发生的发言，裁决 / 交付轮**不得**被误标为未完成；`partial` 没有裁决块与报告文件块，但仍显示谁没答；运行中显示实时标记与已有汇总 | `test:render-smoke` |
+
 
 ### 3.16.2 人工烟测（自动化覆盖不到的部分）
 
@@ -662,13 +663,13 @@ CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
 
 | 项 | 怎么做 | 期望 |
 | --- | --- | --- |
-| 四层命令 | 各开一场一人小会（`WORKGREMLIN_HOME` 指向临时目录，**别碰用户自己的库**） | 各自的正文能读出来、票型解析得到 |
-| 关工具真的有效 | 在临时目录里放一个标记文件，让它去读 | 读不到（8F 实测：不锁时能读到，锁上后工具调用被拒） |
+| 各层命令 | 各开一场「主答 + 主持人 + 一个评审」的小会（`WORKGREMLIN_HOME` 指向临时目录，**别碰用户自己的库**） | 各自的正文能读出来、结构化评审块解析得到、模型与词元能归到对应角色 |
+| 关工具真的有效 | 在临时目录里放一个标记文件，让它去读 | 读不到（8F 实测：不锁时能读到，锁上后工具调用被拒；2F 实测：写文件被拒、`read_files` 正常） |
 | 无孤儿进程 | 会开完（或被取消）后 `ps` 查这帮 CLI | 一个都不剩；`/tmp` 下的一次性目录被清掉 |
 | 拿不到就留空 | 看 8F 的词元 | 显示「—」而不是 0（OpenCode 确实不发 usage） |
 | **真读到代码了吗**（工程模式） | 拿一个真实工程目录发起，问一个**只有看代码才知道**的问题（例如"这个函数在哪儿被调用"） | 回答里出现**真实的文件名 / 符号**，不是在复述材料 |
 | **工程目录原封不动**（工程模式） | 跑完一场后看那个目录 | `git status` 干净、没有新增文件、目录还在（这条**单独手验一遍再合**） |
-| **办公室还是干净的**（工程模式） | 跑完一场后看办公室、任务记录、7F/8F 的会话清单 | 都看不到参与者（Kilo / OpenCode **自己的**界面里还会留着那几条"议事厅参与者"，那是 CLI 的历史，我们只读不写） |
+| **办公室还是干净的**（工程模式） | 跑完一场后看办公室、任务记录、2F/6F/7F/8F 的会话清单 | 都看不到参与者（各家 CLI **自己的**界面里还会留着那几条"议事厅参与者"，那是 CLI 的历史，我们只读不写）。**6F 这条待装好 Qoder CLI 的机器上确认** —— `--name` 是否进 transcript 还没真机验过 |
 
 **取样纪律**：烟测产出的原始 stdout 要**原样存进单测**（见 COUNCIL-04）——
 照着猜的线格式写测试等于没测，这是那次两个 bug 的共同根因。

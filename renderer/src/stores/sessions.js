@@ -32,13 +32,30 @@ let timer = null;
 // Phase labels share their source with the main console (both the zh and en sets live in the i18n table) — do not keep a second copy here
 const phaseLabel = (p) => consolePhaseLabel({ phase: p });
 /**
- * The short id in the dropdown: **the first 8 chars of the session id**.
+ * The short id in the dropdown: **the shortest id prefix that stays unique within one floor's session
+ * batch**.
+ *
  * No longer guess a filename from the on-disk locator (`x.id`, which for CLI floors is the
  * transcript's relative path) —— the 3F Codex filename is
  * `rollout-<timestamp>-<session-id>.jsonl`, so the first 8 chars always yield `rollout-` and you
  * cannot tell who is who. The phase comes from the **session**, so the dropdown should show the session id too.
+ *
+ * A fixed 8-char prefix is not enough either: 2F Cline's session ids are `<epoch-ms>_<rand>`, so two
+ * sessions created in the same ~10 seconds share their first 8 digits and the dropdown rendered two
+ * identical rows (`CLI-wg-cx 17923740`) for genuinely different sessions. Growing the prefix until
+ * every id in the batch differs keeps labels short while guaranteeing they can be told apart.
+ * @param {Array<string>} ids
+ * @returns {Array<string>} one short id per input, in the same order
  */
-const shortId = (sessionId) => String(sessionId || '').slice(0, 8);
+function uniqueShortIds(ids) {
+  const all = ids.map((id) => String(id || ''));
+  const max = Math.max(8, ...all.map((s) => s.length));
+  for (let len = 8; len <= max; len += 1) {
+    const prefixes = all.map((s) => s.slice(0, len));
+    if (new Set(prefixes).size === prefixes.length) return prefixes;
+  }
+  return all;
+}
 
 export const useSessionStore = defineStore('sessions', {
   state: () => ({
@@ -127,7 +144,8 @@ export const useSessionStore = defineStore('sessions', {
     options: (s) => {
       const f = s.floors.find((x) => x.id === s.selectedFloor);
       if (!f) return [];
-      return f.sessions.map((x) => {
+      const ids = uniqueShortIds(f.sessions.map((x) => x.sessionId));
+      return f.sessions.map((x, i) => {
         // Source tag: the backend's source is already derived from form (plugin/cli/ide), use it as-is
         // plugin → Plugin-, cli → CLI-, ide → IDE-, desktop → Desktop-, empty → no prefix
         const src = String(x.source || '').toLowerCase();
@@ -137,7 +155,7 @@ export const useSessionStore = defineStore('sessions', {
         const body = tag ? `${tag}-${proj}` : proj;
         return {
           value: x.id,
-          label: [body, shortId(x.sessionId)].filter(Boolean).join(' '),
+          label: [body, ids[i]].filter(Boolean).join(' '),
           title: [x.projectPath || x.project || '', x.sessionId].filter(Boolean).join(' · '),
         };
       });

@@ -43,23 +43,33 @@ const { useProjectStore } = await server.ssrLoadModule('/src/stores/project.js')
 const { useCouncilStore } = await server.ssrLoadModule('/src/stores/council.js');
 const { normUtterance } = await server.ssrLoadModule('/src/lib/councilTimeline.js');
 
-/** 每个语言里几个"一眼能认出这一页在说什么"的词 */
+/** A few words per language that prove the page really rendered in that language */
 const WORDS = {
   zh: {
-    agreed: '达成一致', noStance: '未表态', truncated: '已截断', noAgreement: '到第 2 轮上限仍未达成一致', notPassed: '没通过',
-    reported: '已呈报', report: '分析简报', support: '支持', oppose: '反对', unsure: '不确定',
-    points: '要点', risks: '风险', questions: '存疑', noFindings: '没按约定给出要点',
-    voteAgree: '同意', voteObject: '反对', couldNotSpeak: '这一轮没能发言', pickSpeaker: '选看哪一层的发言',
-    // "本轮达成一致"这一句只在**结果区**出现（'达成一致' 本身会撞上发起表单的提示文案，
-    // 拿它当判据会把静态文案也算进去）
-    reached: '本轮达成一致',
+    completed: '已完成', partial: '部分完成', running: '讨论中',
+    convergence: '收敛度', opinions: '1 条意见', blockers: '0 条 blocker', conflicts: '1 处冲突',
+    roleModerator: '主持人', roleMain: '主答', roleReviewer: '评审',
+    noAnswer: '没答上来', approveChanges: '修改后通过',
+    remainingRisks: '剩余风险', finalDirectives: '最终要求', finalDraft: '最终交付稿', changeNotes: '变更说明',
+    warnings: '一致性提示', truncated: '已截断', noDiff: '这一轮没有给出 diff',
+    process: '完整过程', plan: '第 0 轮 · 议题拆解与评审分工', breakdown: '议题拆解', assignments: '评审分工',
+    moderatorSummary: '主持人汇总', consensus: '共识', openIssues: '未决问题', directives: '修改指令',
+    working: '正在工作中', phaseReview: '评审', round1: '第 1 轮',
+    rawOutput: '原始输出', incomplete: '未完成', incompleteHint: '这一轮没有走完',
+    timedOut: '超时', noTurns: '没有留下任何发言记录',
   },
   en: {
-    agreed: 'agreed', noStance: 'no stance', truncated: 'truncated', noAgreement: 'No agreement within 2 rounds', notPassed: 'did not pass',
-    reported: 'reported', report: 'Analysis briefing', support: 'support', oppose: 'oppose', unsure: 'unsure',
-    points: 'Points', risks: 'Risks', questions: 'Open questions', noFindings: 'no points/risks/questions',
-    voteAgree: 'agree', voteObject: 'object', couldNotSpeak: 'could not speak this round', pickSpeaker: 'Choose whose reply to show',
-    reached: 'agreed this round',
+    completed: 'completed', partial: 'partially completed', running: 'in session',
+    convergence: 'Convergence', opinions: '1 opinion(s)', blockers: '0 blocker(s)', conflicts: '1 conflict(s)',
+    roleModerator: 'Moderator', roleMain: 'Main answerer', roleReviewer: 'Reviewer',
+    noAnswer: 'no answer', approveChanges: 'approve with changes',
+    remainingRisks: 'Remaining risks', finalDirectives: 'Final directives', finalDraft: 'Final draft', changeNotes: 'Change notes',
+    warnings: 'Consistency warnings', truncated: 'truncated', noDiff: 'No diff was given for this round',
+    process: 'Full process', plan: 'Round 0 · topic breakdown and review assignments', breakdown: 'Topic breakdown', assignments: 'Review assignments',
+    moderatorSummary: 'Moderator summary', consensus: 'Consensus', openIssues: 'Open issues', directives: 'Revision directives',
+    working: 'Working', phaseReview: 'review', round1: 'Round 1',
+    rawOutput: 'Raw output', incomplete: 'Incomplete', incompleteHint: 'This round did not finish',
+    timedOut: 'timed out', noTurns: 'No turns were recorded',
   },
 };
 
@@ -109,98 +119,162 @@ const TASK = {
 };
 
 /**
- * 议事厅的两种收场，摆成真形状喂给页面。
+ * A finished council in its real shape.
  *
- * 这里刻意塞了三种"不好看但必须如实"的东西：**没答上来的那一层**（7F 超时）、
- * **没表态的那一条**、**被截断的材料**。这三样只要有一样被渲染成正常结果
- * （超时 →「弃权」、截断 → 不提），这一页就失去了它存在的意义。
+ * It deliberately contains three "ugly but must stay honest" things: a floor that **did not answer**
+ * (8F timed out), a round **without a diff** (round 1), and **truncated material**. If any of them is
+ * rendered as a normal result (timeout → silence, truncation → unmentioned), the page loses its point.
  */
 const COUNCIL = {
   council: {
     id: 'c1',
     topic: '把重试上限从 3 提到 5 吗',
     status: 'done',
-    verdict: 'consensus',
-    verdict_round: 2,
-    max_rounds: 3,
+    verdict: 'completed',
+    max_rounds: 2,
+    workspace_path: '/home/me/proj',
     error: null,
   },
+  // One older meeting in the history rail. The local-time constructor keeps the expected string
+  // stable regardless of the machine's timezone.
+  list: [
+    { id: 'c0', topic: '上一次会议', created_at: new Date(2024, 0, 2, 3, 4).getTime() },
+  ],
   participants: [
-    { floor_id: '1F', status: 'ok', error: null },
-    { floor_id: '4F', status: 'ok', error: null },
-    { floor_id: '7F', status: 'failed', error: '进程超时（120s）' },
+    { floor_id: '4F', role: 'moderator', agent: 'claude', status: 'ok', error: null },
+    { floor_id: '1F', role: 'main', agent: 'codebuddy', status: 'ok', error: null },
+    { floor_id: '7F', role: 'reviewer', agent: 'kilo', status: 'ok', error: null },
+    { floor_id: '8F', role: 'reviewer', agent: 'opencode', status: 'failed', error: '进程超时（300s）' },
   ],
   materials: [
     { ord: 0, path: '/tmp/spec.md', bytes_total: 204800, bytes_included: 65536, truncated: 1 },
   ],
   rounds: [
-    { round_no: 0, kind: 'brief', proposal_text: '把重试上限从 3 提到 5 吗', proposal_from: 'chair', consensus: 0 },
-    { round_no: 1, kind: 'debate', proposal_text: '把重试上限从 3 提到 5 吗', proposal_from: 'chair', agree: 1, disagree: 1, abstain: 0, invalid: 1, consensus: 0 },
-    { round_no: 2, kind: 'debate', proposal_text: '上限提到 5，但只对幂等操作生效', proposal_from: '4F', agree: 2, disagree: 0, abstain: 0, invalid: 1, consensus: 1 },
+    { round_no: 0, kind: 'plan', proposal_from: '4F' },
+    { round_no: 1, kind: 'debate', version: 'v1', proposal_text: '上限提到 5', proposal_from: '1F' },
+    { round_no: 2, kind: 'debate', version: 'v2', proposal_text: '上限提到 5，但只对幂等操作生效', proposal_from: '1F' },
+  ],
+  reviews: [
+    { round_no: 1, reviewer: '7F', severity: 'blocker', dimension: '安全', issue: '支付路径会重复扣款', suggestion: '只对幂等操作重试', stance: 'reject' },
+    { round_no: 1, reviewer: '7F', severity: 'major', dimension: '兼容性', issue: '老客户端没有幂等键', suggestion: '保留旧上限', stance: 'revise' },
+    { round_no: 2, reviewer: '7F', severity: 'major', dimension: '测试', issue: '幂等边界仍需测试覆盖', evidence: 'spec.md 第 3 节', suggestion: '补三个并发用例', stance: 'revise' },
+  ],
+  roundResults: [
+    {
+      round: 1,
+      proposal: { version: 'v1', content: '上限提到 5', diffFromPrev: null },
+      reviews: [
+        { reviewer: '7F', severity: 'blocker', dimension: '安全', issue: '支付路径会重复扣款', suggestion: '只对幂等操作重试', stance: 'reject' },
+        { reviewer: '7F', severity: 'major', dimension: '兼容性', issue: '老客户端没有幂等键', suggestion: '保留旧上限', stance: 'revise' },
+      ],
+      moderator: {
+        consensus: [],
+        openIssues: ['幂等边界'],
+        conflicts: [{ topic: '重试范围', sides: [{ reviewer: '1F', view: '所有请求' }, { reviewer: '7F', view: '仅幂等操作' }] }],
+        revisionDirectives: ['【针对 重复扣款】必须只对幂等操作重试；验收标准：支付路径有测试覆盖。'],
+        convergenceScore: 57,
+      },
+      stats: { score: 57, bySeverity: { blocker: 1, major: 1, minor: 0, nit: 0 }, conflicts: 1 },
+      warnings: [{ code: 'vague_directive', message: '第 1 轮的修改指令缺少验收标准。' }],
+    },
+    {
+      round: 2,
+      proposal: {
+        version: 'v2',
+        content: '上限提到 5，但只对幂等操作生效',
+        diffFromPrev: '- 所有请求重试\n+ 仅幂等操作重试',
+      },
+      reviews: [
+        { reviewer: '7F', severity: 'major', dimension: '测试', issue: '幂等边界仍需测试覆盖', evidence: 'spec.md 第 3 节', suggestion: '补三个并发用例', stance: 'revise' },
+      ],
+      moderator: {
+        consensus: ['只对幂等操作重试'],
+        openIssues: [],
+        conflicts: [{ topic: '测试范围', sides: [{ reviewer: '1F', view: '三个用例' }, { reviewer: '7F', view: '五个用例' }] }],
+        revisionDirectives: ['【针对 幂等边界】必须补三个并发用例；验收标准：CI 全绿。'],
+        convergenceScore: 82,
+      },
+      stats: { score: 82, bySeverity: { blocker: 0, major: 1, minor: 0, nit: 0 }, conflicts: 1 },
+      warnings: [],
+    },
   ],
   utterances: [
-    { round_no: 0, floor_id: 'chair', role: 'chair', content: '把重试上限从 3 提到 5 吗', status: 'ok' },
-    { round_no: 1, floor_id: '1F', role: 'speaker', content: '我觉得可以', vote: 'agree', vote_reason: '机器扛得住', status: 'ok', output_tokens: 12, duration_ms: 3000 },
-    { round_no: 1, floor_id: '4F', role: 'speaker', content: '不行，得限定幂等', vote: 'disagree', vote_reason: '支付重试会重复扣款', proposal_text: '上限提到 5，但只对幂等操作生效', status: 'ok' },
-    // 超时的那一层：**没有票**。它不能变成"弃权"，更不能变成"同意"
-    { round_no: 1, floor_id: '7F', role: 'speaker', content: null, vote: null, status: 'timeout', error: '进程超时（120s）' },
-    { round_no: 2, floor_id: '1F', role: 'speaker', content: '同意这个限定', vote: 'agree', vote_reason: '把面收窄是对的', second: '4F', status: 'ok' },
-    { round_no: 2, floor_id: '4F', role: 'speaker', content: '那就这样', vote: 'agree', vote_reason: '我的提案', status: 'ok' },
-    { round_no: 2, floor_id: '7F', role: 'speaker', content: null, vote: null, status: 'timeout', error: '进程超时（120s）' },
+    { round_no: 0, floor_id: '4F', phase: 'plan', content: '拆解议题', status: 'ok', model: 'claude-sonnet-5-5', input_tokens: 100, output_tokens: 20 },
+    { round_no: 1, floor_id: '1F', phase: 'proposal', content: '上限提到 5', status: 'ok', model: 'codebuddy-x', input_tokens: 200, output_tokens: 50 },
+    { round_no: 1, floor_id: '7F', phase: 'review', content: '支付路径会重复扣款', status: 'ok', model: 'kilo-latest', input_tokens: 50, output_tokens: 10 },
+    // The floor that timed out: no content. It must not turn into an opinion or an "abstain".
+    { round_no: 1, floor_id: '8F', phase: 'review', content: null, status: 'failed', error: '进程超时（300s）' },
+    { round_no: 1, floor_id: '4F', phase: 'moderation', content: '汇总', status: 'ok', model: 'claude-sonnet-5-5', input_tokens: 60, output_tokens: 15 },
+    { round_no: 2, floor_id: '1F', phase: 'proposal', content: '上限提到 5，但只对幂等操作生效', status: 'ok', model: 'codebuddy-x', input_tokens: 210, output_tokens: 55 },
+    { round_no: 2, floor_id: '7F', phase: 'review', content: '幂等边界仍需测试覆盖', status: 'ok', model: 'kilo-latest', input_tokens: 55, output_tokens: 12 },
+    { round_no: 2, floor_id: '8F', phase: 'review', content: null, status: 'failed', error: '进程超时（300s）' },
+    { round_no: 2, floor_id: '4F', phase: 'moderation', content: '汇总', status: 'ok', model: 'claude-sonnet-5-5', input_tokens: 70, output_tokens: 18 },
+    { round_no: 3, floor_id: '4F', phase: 'adjudication', content: '裁决', status: 'ok', model: 'claude-sonnet-5-5', input_tokens: 30, output_tokens: 9 },
+    { round_no: 3, floor_id: '1F', phase: 'final', content: '最终稿正文', status: 'ok', model: 'codebuddy-x', input_tokens: 40, output_tokens: 11 },
   ],
+  plan: {
+    parsed: true,
+    breakdown: ['拆解 A：重试上限', '拆解 B：幂等边界'],
+    assignments: [{ reviewer: '7F', focus: '安全与兼容性' }],
+    reviewFocus: '重点核对支付路径。',
+  },
+  report: {
+    schema: 'workgremlin.council.report/v1',
+    summary: { warnings: [{ code: 'vague_directive', message: '主持人给出的修改指令缺少验收标准。' }] },
+    adjudication: {
+      decision: 'approve_with_changes',
+      summary: '方向可行，但必须先解决幂等边界问题。',
+      remainingRisks: ['并发下仍可能重复写'],
+      finalDirectives: ['补三个并发用例后再上线'],
+    },
+    finalDraft: { content: '最终交付稿正文', changeNotes: '只对幂等操作重试' },
+  },
+  reportFiles: [
+    '/home/me/.workgremlin/councils/c1/report.json',
+    '/home/me/.workgremlin/councils/c1/reviews.csv',
+  ],
+  live: false,
 };
 
-const NO_CONSENSUS = {
+/** A council that could not finish: verdict=partial, no report, no final result. */
+const PARTIAL = {
   ...COUNCIL,
-  council: { ...COUNCIL.council, verdict: 'no_consensus', verdict_round: null, max_rounds: 2 },
-  rounds: COUNCIL.rounds.slice(0, 2),
-  utterances: COUNCIL.utterances.filter((u) => u.round_no <= 1),
+  council: { ...COUNCIL.council, verdict: 'partial', error: '最终交付稿没有解析出来' },
+  report: null,
+  reportFiles: [],
 };
 
 /**
- * 分析模式的收场。**故意塞了四种"不好看但必须如实"的形态**：
- *   · 表了态、要点齐全（1F）；
- *   · 表了态但**没给要点**（7F，findings 是 NULL）—— 必须和"给了三条空数组"分开写；
- *   · 表了态、要点三条都空（4F）；—— 这是"答了，答的是没有"
- *   · 压根没表态（8F 超时）—— 必须带错误原文，不许并进某一方。
- * 再加一条：`mode='analysis'` 却**没有** consensus 轮次 —— 界面不许凭空长出共识横幅。
+ * A meeting that died mid-round: round 1 completed, round 2's proposal timed out and the server
+ * stopped the meeting. Round 2 has no RoundResult, so the structured view cannot describe it —
+ * but its turns still happened and must stay readable.
  */
-const ANALYSIS = {
+const INCOMPLETE = {
   ...COUNCIL,
   council: {
     ...COUNCIL.council,
-    topic: '这个 bug fix 会不会引入回归',
-    mode: 'analysis',
-    workspace_path: '/home/me/proj',
-    status: 'done',
-    verdict: 'reported',
-    verdict_round: null,
-    max_rounds: 2,
+    status: 'failed',
+    verdict: 'partial',
+    error: '第 2 轮主答没有产出可用方案（timeout）',
   },
-  participants: [
-    { floor_id: '1F', status: 'ok', error: null },
-    { floor_id: '4F', status: 'ok', error: null },
-    { floor_id: '7F', status: 'ok', error: null },
-    { floor_id: '8F', status: 'timeout', error: '进程超时（300s）' },
-  ],
-  rounds: [
-    { round_no: 0, kind: 'brief', proposal_text: '这个 bug fix 会不会引入回归', proposal_from: 'chair', consensus: 0 },
-    // 分析模式没有"桌上那份提案"：proposal_* 是 NULL，票型三个列全是 0
-    { round_no: 1, kind: 'debate', proposal_text: null, proposal_from: null, agree: 0, disagree: 0, abstain: 0, invalid: 1, consensus: 0 },
-    { round_no: 2, kind: 'debate', proposal_text: null, proposal_from: null, agree: 0, disagree: 0, abstain: 0, invalid: 1, consensus: 0 },
-  ],
+  roundResults: COUNCIL.roundResults.slice(0, 1),
   utterances: [
-    { round_no: 0, floor_id: 'chair', role: 'chair', content: '这个 bug fix 会不会引入回归', status: 'ok' },
-    { round_no: 1, floor_id: '1F', role: 'speaker', content: '我看了一遍调用方', stance: 'support', findings_json: '{"points":["影响面只有一处"],"risks":[],"questions":[]}', status: 'ok' },
-    { round_no: 1, floor_id: '4F', role: 'speaker', content: '我觉得还得看测试', stance: 'unsure', findings_json: '{"points":[],"risks":[],"questions":[]}', status: 'ok' },
-    { round_no: 1, floor_id: '7F', role: 'speaker', content: '我反对这么改', stance: 'oppose', findings_json: null, status: 'ok' },
-    { round_no: 1, floor_id: '8F', role: 'speaker', content: null, stance: null, status: 'timeout', error: '进程超时（300s）' },
-    // 最后一轮才是简报的依据 —— 4F 从"不确定"改成了"反对"
-    { round_no: 2, floor_id: '1F', role: 'speaker', content: '结论不变', stance: 'support', findings_json: '{"points":["影响面只有一处"],"risks":["并发下可能重复写"],"questions":[]}', status: 'ok' },
-    { round_no: 2, floor_id: '4F', role: 'speaker', content: '看完测试我改反对', stance: 'oppose', findings_json: '{"points":[],"risks":["没有覆盖并发路径"],"questions":["谁来补测试"]}', status: 'ok' },
-    { round_no: 2, floor_id: '7F', role: 'speaker', content: '我还是反对', stance: 'oppose', findings_json: null, status: 'ok' },
-    { round_no: 2, floor_id: '8F', role: 'speaker', content: null, stance: null, status: 'timeout', error: '进程超时（300s）' },
+    ...COUNCIL.utterances.filter((u) => u.round_no <= 1),
+    { round_no: 2, floor_id: '1F', phase: 'proposal', content: null, status: 'timeout', error: '进程超时（300s）' },
   ],
+  report: null,
+  reportFiles: [],
+};
+
+/** A council still in session: status=running, no report yet, live indicator on. */
+const LIVE = {
+  ...COUNCIL,
+  council: { ...COUNCIL.council, status: 'running', verdict: null, max_rounds: 3 },
+  roundResults: COUNCIL.roundResults.slice(0, 1),
+  report: null,
+  reportFiles: [],
+  live: true,
+  progress: { roundNo: 1, phase: 'review', floors: ['7F'], startedAt: 1 },
 };
 
 for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
@@ -259,9 +333,9 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
   const conv = await render('/src/views/ConversationView.vue');
   ok('对话记录（旧页）：渲染没抛错', typeof conv === 'string', conv && conv.error);
 
-  // ---- 议事厅 ----
-  // 喂进去的是**归一之后**的形状（跟 open() 走的是同一条路），所以这也顺带钉住
-  // "GET 回来的 snake_case 行能渲染出来"这件事。
+  // ---- council ----
+  // The fixtures are already in the normalized shape (the same path as open()), so this also pins
+  // "snake_case rows from GET can be rendered".
   const W = WORDS[loc];
   const seedCouncil = (data) => () => {
     const council = useCouncilStore();
@@ -271,87 +345,163 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
       { floorId: '7F', name: 'Kilo Code', ready: true, cliPath: '/usr/bin/kilo', reason: null },
       { floorId: '8F', name: 'OpenCode', ready: false, cliPath: null, reason: '没找到可执行文件' },
     ];
+    council.defaults = {
+      ...council.defaults,
+      severityWeights: { blocker: 25, major: 8, minor: 2, nit: 0 },
+      conflictWeight: 10,
+      scoreMax: 100,
+    };
     council.current = { ...data, utterances: data.utterances.map(normUtterance) };
+    council.list = data.list || [];
+  };
+  /** Opening tag of the element carrying a testid (works for details/section/div). */
+  const openingTagOf = (html, testid) => {
+    const at = html.indexOf(`data-testid="${testid}"`);
+    if (at < 0) return '';
+    const start = html.lastIndexOf('<', at);
+    const end = html.indexOf('>', at);
+    return html.slice(start, end + 1);
+  };
+  /** The element's content up to its first closing div (enough for a small summary block). */
+  const chunkOf = (html, testid) => {
+    const at = html.indexOf(`data-testid="${testid}"`);
+    if (at < 0) return '';
+    const end = html.indexOf('</div>', at);
+    return html.slice(at, end < 0 ? html.length : end);
+  };
+  /** Everything from one testid up to the next one (for a section with nested blocks). */
+  const between = (html, fromId, toId) => {
+    const at = html.indexOf(`data-testid="${fromId}"`);
+    if (at < 0) return '';
+    const end = html.indexOf(`data-testid="${toId}"`, at);
+    return html.slice(at, end < 0 ? html.length : end);
   };
 
   const won = await render('/src/views/CouncilView.vue', seedCouncil(COUNCIL));
-  ok('议事厅 · 达成一致：渲染没抛错', typeof won === 'string', won && won.error);
+  ok('council · completed: renders without throwing', typeof won === 'string', won && won.error);
   if (typeof won === 'string') {
-    ok('议事厅：结论引的是那轮提案原文（一字不改）', won.includes('上限提到 5，但只对幂等操作生效'));
-    ok(`议事厅：结论区块在（${W.agreed}）`, won.includes('cv-conclusion') && won.includes(W.agreed));
-    ok('议事厅：超时那层的错误原文摆出来了', won.includes('进程超时（120s）'));
-    ok(`议事厅：超时算作未表态（${W.noStance} 1），没有变成同意`, won.includes(`${W.noStance} 1`));
-    ok(`议事厅：材料截断有标注（${W.truncated}）`, won.includes(W.truncated));
-    ok('议事厅：请不动的楼层写着原因', won.includes('没找到可执行文件'));
+    ok(`council: verdict badge (${W.completed})`, won.includes(W.completed));
+    ok('council: workspace is shown (where they talked is part of understanding the result)',
+      won.includes('cv-workspace-show') && won.includes('/home/me/proj'));
 
-    // 一轮里好几层各说一大段，全摊开是一屏接一屏的正文，"谁说了什么"反而找不着 ——
-    // 所以一轮只摊开一个人的，上面一排圆点选是谁。**收起来的是正文，不是事实**：
-    // 票型与"这轮没能发言"必须留在那一行上，否则折叠就成了掩盖。
-    const picks1 = regionOf(won, 'cv-picks-1');
-    const picks2 = regionOf(won, 'cv-picks-2');
-    ok('议事厅：一轮里的人摆成一排，可单选（radio）',
-      picks1.includes('type="radio"') && picks1.includes(W.pickSpeaker));
-    ok('议事厅：选中的那位在下面摊开，没选的那层正文不出现',
-      won.includes('我觉得可以') && !won.includes('不行，得限定幂等'));
-    ok('议事厅：收起来的那几层，票型照旧挂在那一行上',
-      picks1.includes(W.voteAgree) && picks1.includes(W.voteObject));
-    ok('议事厅：没能发言的那层，收起来也看得见（不是收起来就当没发生）', picks1.includes(W.couldNotSpeak));
-    ok('议事厅：每一轮的圆点各自成组（同一轮单选，不同轮不互相踢）',
-      picks2.includes('type="radio"') && picks1.includes('name="cv-pick-1"') && picks2.includes('name="cv-pick-2"'));
+    // ---------------------------------------------------- summary only
+    const score = chunkOf(won, 'cv-score');
+    ok('council: the summary score is the last round\'s server score', score.includes('82'), score.slice(0, 160));
+    const formula = chunkOf(won, 'cv-score-formula');
+    ok('council: the score formula is shown (explainable, not a bare number)',
+      formula.includes('100 - (') && formula.includes('blocker 0×25') && formula.includes('1×10'), formula.slice(0, 200));
+    ok(`council: N opinions (${W.opinions})`, won.includes(W.opinions));
+    ok(`council: N blockers (${W.blockers})`, won.includes(W.blockers));
+    ok(`council: N conflicts (${W.conflicts})`, won.includes(W.conflicts));
+
+    ok('council: the role table shows all three roles',
+      won.includes(W.roleModerator) && won.includes(W.roleMain) && won.includes(W.roleReviewer));
+    ok('council: every role shows its model',
+      won.includes('claude-sonnet-5-5') && won.includes('codebuddy-x') && won.includes('kilo-latest'));
+    ok('council: token totals are per role (4F 322, 1F 566, 7F 127)',
+      won.includes('>322<') && won.includes('>566<') && won.includes('>127<'));
+    ok('council: a role with no reported usage shows "—", not 0', won.includes('>—<'));
+    ok(`council: a failed role is marked (${W.noAnswer})`, won.includes(W.noAnswer));
+
+    const warn = chunkOf(won, 'cv-warnings');
+    ok(`council: mechanical consistency warnings are shown (${W.warnings})`,
+      warn.includes(W.warnings) && warn.includes('主持人给出的修改指令缺少验收标准。'));
+
+    // ---------------------------------------------------- final result
+    const result = between(won, 'cv-result', 'cv-report-files');
+    ok(`council: the adjudication decision is shown (${W.approveChanges})`,
+      result.includes('cv-decision') && result.includes(W.approveChanges));
+    ok('council: the adjudication reason is shown', result.includes('方向可行，但必须先解决幂等边界问题。'));
+    ok(`council: remaining risks (${W.remainingRisks})`,
+      result.includes(W.remainingRisks) && result.includes('并发下仍可能重复写'));
+    ok(`council: final directives (${W.finalDirectives})`,
+      result.includes(W.finalDirectives) && result.includes('补三个并发用例后再上线'));
+    ok(`council: the final draft and change notes (${W.finalDraft})`,
+      result.includes(W.finalDraft) && result.includes('最终交付稿正文') && result.includes(W.changeNotes) && result.includes('只对幂等操作重试'));
+
+    ok('council: report files are listed (written at wrap-up)', won.includes('cv-report-files') && won.includes('report.json'));
+
+    // ---------------------------------------------------- history rail
+    ok('council: history entries show the date as well as the time (never a bare clock)',
+      won.includes('01-02 03:04') && won.includes('上一次会议'));
+
+    // ---------------------------------------------------- collapsed full process
+    const processTag = openingTagOf(won, 'cv-process');
+    ok(`council: the full process is a collapsed section (${W.process})`,
+      processTag.startsWith('<details') && won.includes(W.process) && !/\sopen(?=[\s>])/.test(processTag), processTag);
+    ok('council: the plan (round 0) is inside the process',
+      openingTagOf(won, 'cv-plan').startsWith('<details') && won.includes(W.plan));
+    ok('council: the plan shows the breakdown, assignments and review focus',
+      won.includes(W.breakdown) && won.includes('拆解 A：重试上限') &&
+        won.includes(W.assignments) && won.includes('安全与兼容性') && won.includes('重点核对支付路径。'));
+
+    ok('council: round 1 exists', openingTagOf(won, 'cv-round-1').startsWith('<details'));
+    ok(`council: a round with no diff says so (${W.noDiff})`,
+      won.includes('cv-nodiff-1') && won.includes(W.noDiff));
+    ok('council: round 1 keeps its proposal text', won.includes('上限提到 5'));
+    ok('council: round 1 reviews are shown with severity + stance',
+      won.includes('支付路径会重复扣款') && won.includes('只对幂等操作重试') && won.includes('blocker') && won.includes('reject'));
+    ok('council: round 1 moderator output is shown (open issues, conflicts, directives)',
+      won.includes(W.openIssues) && won.includes('幂等边界') && won.includes('重试范围') &&
+        won.includes('所有请求') && won.includes('仅幂等操作') && won.includes(W.directives));
+    ok('council: round 1 warnings are shown', won.includes('第 1 轮的修改指令缺少验收标准。'));
+
+    ok('council: round 2 shows its diff against the previous version',
+      won.includes('cv-diff-2') && won.includes('- 所有请求重试') && won.includes('+ 仅幂等操作重试'));
+    ok('council: round 2 shows the revised proposal', won.includes('上限提到 5，但只对幂等操作生效'));
+    ok('council: round 2 reviews keep evidence and suggestion',
+      won.includes('spec.md 第 3 节') && won.includes('补三个并发用例'));
+    ok(`council: round 2 moderator summary (${W.moderatorSummary})`,
+      won.includes(W.moderatorSummary) && won.includes(W.consensus) && won.includes('只对幂等操作重试'));
+    ok('council: conflicts list both sides', won.includes('测试范围') && won.includes('三个用例') && won.includes('五个用例'));
+
+    // ---------------------------------------------------- raw output survives the meeting
+    ok(`council: every round keeps its raw participant output (${W.rawOutput})`,
+      won.includes(W.rawOutput) && won.includes('cv-raw-turns') && won.includes('拆解议题'));
+    ok('council: the wrap-up round is not mislabelled as an incomplete debate round',
+      !won.includes('cv-round-incomplete-3'));
+
+    // ---------------------------------------------------- not a vote
+    ok('council: there is no vote UI at all', !won.includes('cv-vote') && !won.includes('cv-tally') && !won.includes('cv-vote-count'));
+    ok(`council: truncated material is labelled (${W.truncated})`, won.includes(W.truncated) && won.includes('/tmp/spec.md'));
   }
 
-  const lost = await render('/src/views/CouncilView.vue', seedCouncil(NO_CONSENSUS));
-  ok('议事厅 · 未达成一致：渲染没抛错', typeof lost === 'string', lost && lost.error);
-  if (typeof lost === 'string') {
-    ok(`议事厅：没谈成就写没谈成（${W.noAgreement}）`, lost.includes('cv-no-conclusion') && lost.includes(W.noAgreement));
-    ok('议事厅：没谈成时**不**出现结论区块', !lost.includes('cv-conclusion'));
-    // 桌上最后是这份、没通过 —— 这一块来自服务端的轮次记录，不受"一轮只摊开一个人"影响
-    const lastProposal = regionOf(lost, 'cv-last-proposal');
-    ok(`议事厅：最后一轮那份提案照样摆出来，但标明${W.notPassed}`,
-      lastProposal.includes(W.notPassed) && lastProposal.includes('把重试上限从 3 提到 5 吗'));
-    ok(`议事厅：各方最后立场列出来了（${W.noStance}）`, lost.includes(W.noStance));
+  const partial = await render('/src/views/CouncilView.vue', seedCouncil(PARTIAL));
+  ok('council · partial: renders without throwing', typeof partial === 'string', partial && partial.error);
+  if (typeof partial === 'string') {
+    ok(`council: a partial meeting says so (${W.partial})`, partial.includes(W.partial));
+    ok('council: partial still shows the summary and the process',
+      partial.includes('cv-summary') && partial.includes('cv-process'));
+    ok('council: partial has no adjudication/final result block', !partial.includes('cv-result'));
+    ok('council: partial has no report files block', !partial.includes('cv-report-files'));
+    ok('council: partial still shows which floor did not answer', partial.includes(W.noAnswer));
   }
 
-  // ---- 议事厅 · 分析模式 ----
-  const rep = await render('/src/views/CouncilView.vue', seedCouncil(ANALYSIS));
-  ok('议事厅 · 分析模式：渲染没抛错', typeof rep === 'string', rep && rep.error);
-  if (typeof rep === 'string') {
-    ok(`议事厅：出的是简报（${W.report}）`, rep.includes('cv-report') && rep.includes(W.report));
-    ok(`议事厅：verdict 写的是${W.reported}`, rep.includes(W.reported));
-    // 这一条是顺序问题的机器证据：reported 要是掉进下面那个"中断"框，这座号就没了
-    ok('议事厅：reported 没掉进通用的"中断"框（简报分支在它前面）', !rep.includes('cv-aborted'));
-    ok('议事厅：分析模式不出现共识横幅', !rep.includes('cv-conclusion') && !rep.includes(W.reached));
-    // 分析模式没有可对照的服务端票型，界面不许假装有
-    ok('议事厅：分析模式不渲染"同意 N · 反对 N"那套票型', !rep.includes('同意 0 · 反对 0'));
+  const incomplete = await render('/src/views/CouncilView.vue', seedCouncil(INCOMPLETE));
+  ok('council · unfinished round: renders without throwing', typeof incomplete === 'string', incomplete && incomplete.error);
+  if (typeof incomplete === 'string') {
+    ok('council: a round that never finished still shows up after the meeting ended',
+      incomplete.includes('cv-round-incomplete-2'));
+    ok(`council: the unfinished round says it did not finish (${W.incomplete})`,
+      incomplete.includes(W.incomplete) && incomplete.includes(W.incompleteHint));
+    ok('council: the unfinished round keeps its raw turns and the real error',
+      incomplete.includes(W.rawOutput) && incomplete.includes('进程超时（300s）') && incomplete.includes(W.timedOut));
+    ok('council: a completed round keeps its raw output too',
+      incomplete.includes('cv-round-1') && incomplete.includes('上限提到 5'));
+  }
 
-    ok(`议事厅：按立场分了组（${W.support} / ${W.oppose}）`, rep.includes('cv-group-support') && rep.includes('cv-group-oppose'));
-    ok(`议事厅：未表态单列一组（${W.noStance}）`, rep.includes('cv-group-none'));
-    ok(`议事厅：未表态那组附了错误原文`, rep.includes('进程超时（300s）'));
-
-    // "说了没有"与"没说"必须分开写 —— 这两句混起来，读的人会以为它看过风险
-    ok(`议事厅：答了三条都空的那一层写成"${W.questions}"而不是沉默`, rep.includes(W.points) && rep.includes(W.risks));
-    ok(`议事厅：没给出要点的那一层单独标一句（${W.noFindings}）`,
-      rep.includes('cv-nofindings-7F') && rep.includes(W.noFindings));
-
-    // 原文照录：不摘要、不改写
-    ok('议事厅：要点原文照录（风险那条）', rep.includes('并发下可能重复写') && rep.includes('没有覆盖并发路径'));
-    ok('议事厅：存疑原文照录', rep.includes('谁来补测试'));
-    // 简报依据的是**最后一轮**：4F 在第 1 轮是不确定、第 2 轮改成反对，简报里它得在反对那组
-    ok('议事厅：以最后一轮为准（4F 改口后的立场进的是反对组）',
-      rep.indexOf('cv-group-oppose') < rep.indexOf('cv-group-none') && rep.includes('没有覆盖并发路径'));
-    // 工作目录要摆出来：事后来看"他们在哪儿谈的"是理解这场会的前提
-    ok('议事厅：标题区显示了工作目录', rep.includes('cv-workspace-show') && rep.includes('/home/me/proj'));
-    ok('议事厅：历史/标题上有谈法角标', rep.includes('cv-mode-badge'));
-
-    // 分析议题里**不许**在楼层名字右边贴「支持/反对」：那会让分析看起来像在投票
-    // （立场归上面那份简报按组说，轮次标题上的那句合计也还在）。
-    const aPicks = regionOf(rep, 'cv-picks-2');
-    if (process.env.DBG) console.log('DBG aPicks 支持?', aPicks.includes('支持'), '反对?', aPicks.includes('反对'), 'len', aPicks.length, 'tail', JSON.stringify(aPicks.slice(-400)));
-    ok('议事厅：分析模式的圆点行上不出现「支持/反对」',
-      aPicks.includes('type="radio"') && !aPicks.includes(W.support) && !aPicks.includes(W.oppose) && !aPicks.includes(W.unsure));
-    ok('议事厅：分析模式的简报里立场照旧分组写着（不是整页都不许提）',
-      rep.includes('cv-group-support') && rep.includes(W.support));
-    ok('议事厅：分析模式没能发言的那层也没被折叠掉', aPicks.includes(W.couldNotSpeak));
+  const live = await render('/src/views/CouncilView.vue', seedCouncil(LIVE));
+  ok('council · live: renders without throwing', typeof live === 'string', live && live.error);
+  if (typeof live === 'string') {
+    ok('council: a running meeting is described by the work strip, not a repeated header status',
+      !live.includes(W.running) && !live.includes('v-running') && !live.includes('cv-live'));
+    ok('council: a finished meeting has no working strip', !won.includes('cv-working'));
+    const working = chunkOf(live, 'cv-working');
+    ok('council: the working strip names who, the phase and the round',
+      working.includes(W.working) && working.includes('Kilo Code') &&
+        working.includes(W.phaseReview) && working.includes(W.round1), working.slice(0, 220));
+    ok('council: no result yet', !live.includes('cv-result'));
+    ok('council: the summary is already visible while it runs', live.includes('cv-summary'));
   }
 }
 

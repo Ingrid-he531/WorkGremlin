@@ -285,71 +285,58 @@ CREATE TABLE IF NOT EXISTS settings (
 
 -- ============================ Council Chamber ============================
 --
--- Pick agents from several floors and hold one meeting on one question, discussing until they agree. This is
--- the only place in the repo where **the server spawns external agent processes** (everywhere else the user
--- starts the agent process themselves), so this group of tables is deliberately kept completely separate from
--- the office set:
+-- A moderated review loop over one topic. This is the only place in the repo where **the server spawns
+-- external agent processes** (everywhere else the user starts the agent process themselves), so this group
+-- of tables is deliberately kept separate from the office set:
 --   · No project_id, and nothing is written into members / tasks / task_runs — participants do not enter the
 --     office, do not occupy a station, and are not counted in the task ledger or the token totals; they are
 --     visible only on the council page.
---   · Participants run inside a one-off temp directory the server creates, with **all tools disabled**
---     (see server/src/council/agents.js), so they cannot touch the workspace.
---   · The same iron rule applies: if a process crashes / times out / its output cannot be parsed, record
---     status='failed'/'timeout'/'unparsed' honestly and keep the raw error — **never supply a stance on its
---     behalf** (see the note on council_utterances.vote).
-
--- One meeting. The verdict is **not a newly generated summary** but "the verbatim proposal that was on the
--- table in the round where agreement was reached" — so only verdict and verdict_round are stored here, and the
--- body is fetched from council_rounds by round_no.
+--   · Participants are **read-only** in every phase: no write/edit tool is enabled (see
+--     server/src/council/agents.js). The server writes the final report only into the WorkGremlin home
+--     directory — never into the user's workspace, even when one was supplied for the participants.
+--   · The same iron rule applies: if a process crashes / times out / its output cannot be parsed, record the
+--     real status and keep the raw error — **never supply an opinion on its behalf**.
 --
--- Two **orthogonal** switches (all four combinations are valid):
---   · mode           — how it ends: 'vote' counts votes to judge consensus / 'analysis' judges no consensus
---                      and runs the full round count to produce a briefing
---   · workspace_path — where it talks: a value = participants use it as their working directory and get
---                      read-only tools; NULL = runs in a one-off temp directory as today, with no tools
+-- Flow:
+--   round 0            kind='plan'    moderator: topic decomposition + review assignment
+--   round 1..N         kind='debate'  proposal -> independent reviews -> moderator convergence (a RoundResult)
+--   final phase        moderator adjudication -> main answerer final draft + change notes -> report files
+--
+-- There is no vote, no vote tally, no threshold, and no consensus-by-vote. Rounds run to max_rounds, but a
+-- failed / timed-out / unparseable required turn stops the meeting immediately (fail-fast), as does cancel.
+
+-- One meeting.
 CREATE TABLE IF NOT EXISTS councils (
   id            TEXT PRIMARY KEY,          -- c_<timestamp>_<random>
   topic         TEXT NOT NULL,             -- Topic body (the text the user pasted)
-  -- 'vote' (default, the server counts votes mechanically) / 'analysis' (no voting: see ANALYSIS_PROTOCOL in
-  -- council/prompt.js)
-  mode          TEXT NOT NULL DEFAULT 'vote'
-                CHECK (mode IN ('vote','analysis')),
   -- The participants' working directory (absolute path, validated on creation to exist and be a directory).
-  -- NULL = no workspace given: the server creates a one-off temp directory right away and deletes it when
-  -- done (see council/orchestrator.js). Participants are read-only either way.
-  -- **When it is not NULL that directory belongs to the user; it must never be deleted on cleanup** — a test in
-  -- the orchestrator pins this rule.
+  -- NULL = no workspace given: the server creates a one-off temp directory and deletes it when done.
+  -- When it is not NULL that directory belongs to the user and is never written to or deleted by a meeting.
   workspace_path TEXT,
   status        TEXT NOT NULL DEFAULT 'draft'
                 CHECK (status IN ('draft','running','done','failed','cancelled')),
-  -- Decision rule: unanimous (default, no objections and enough agreements) / majority (agree > disagree).
-  -- See council/consensus.js
-  threshold     TEXT NOT NULL DEFAULT 'unanimous'
-                CHECK (threshold IN ('unanimous','majority')),
-  max_rounds    INTEGER NOT NULL,          -- Upper bound on discussion rounds (excluding round 0, the topic statement)
-  round_current INTEGER NOT NULL DEFAULT 0,-- Which round it has advanced to (0 = only the topic statement round)
-  -- Ending: consensus / no_consensus / cancelled / failed, plus reported for analysis mode.
-  -- **no_consensus is a legitimate outcome**, not an error — if they cannot agree, say so honestly rather than
-  -- forcing a conclusion together.
-  -- **reported is a legitimate outcome too**: analysis mode has no "did they agree" question at all; it only
-  -- guarantees "everyone finished and every utterance is in the db", so what is recorded here is "reported",
-  -- not a verdict (see councils.mode).
+  max_rounds    INTEGER NOT NULL,          -- Upper bound on debate rounds (excluding round 0, the plan)
+  round_current INTEGER NOT NULL DEFAULT 0,-- Highest round reached; 0 = only the plan has run
+  -- completed  — adjudication and final draft were both produced
+  -- partial    — the flow stopped after at least one round, but some final-phase turn failed
+  -- cancelled  — the user cancelled
+  -- failed     — nothing usable was produced
   verdict       TEXT
-                CHECK (verdict IS NULL OR verdict IN ('consensus','no_consensus','reported','cancelled','failed')),
-  verdict_round INTEGER,                   -- Which round reached agreement (NULL when there was no consensus)
-  error         TEXT,                      -- Meeting-level failure reason (individual failures are recorded in participants/utterances)
+                CHECK (verdict IS NULL OR verdict IN ('completed','partial','cancelled','failed')),
+  error         TEXT,                      -- Meeting-level failure reason (per-turn failures live in utterances)
   created_at    INTEGER NOT NULL,
   started_at    INTEGER,
   ended_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_councils_created ON councils(created_at DESC);
 
--- Attendees = one seat per floor selected at creation. cli_path is the detected absolute path of the
--- executable (it cannot be selected unless detected, see council/floors.js); the truth is kept even on failure
--- to make troubleshooting easy.
+-- Attendees = one seat per floor selected at creation. Exactly one row has role='moderator' and exactly one
+-- has role='main'; every other seat is role='reviewer'. cli_path is the detected absolute executable path.
 CREATE TABLE IF NOT EXISTS council_participants (
   council_id TEXT NOT NULL,
   floor_id   TEXT NOT NULL,                -- '1F' / '4F' / '7F' / '8F'
+  role       TEXT NOT NULL
+             CHECK (role IN ('moderator','main','reviewer')),
   agent      TEXT NOT NULL,                -- codebuddy / claude / kilo / opencode
   cli_path   TEXT,                         -- cliInstallPath; NULL = not detected at the time
   status     TEXT NOT NULL DEFAULT 'pending'
@@ -359,79 +346,99 @@ CREATE TABLE IF NOT EXISTS council_participants (
 );
 
 -- Inlined background material. content holds **the text that was actually sent** (already truncated to the
--- limit); it is kept so "what it was shown at the time" can be reproduced; bytes_total is the file's original
--- size (NULL when unreadable, not 0).
+-- limit); bytes_total is the file's original size (NULL when unreadable, not 0).
 CREATE TABLE IF NOT EXISTS council_materials (
   council_id     TEXT NOT NULL,
-  ord            INTEGER NOT NULL,         -- Which file it is (decides the order they are concatenated into the prompt)
-  path           TEXT NOT NULL,            -- The absolute path the user gave
-  bytes_total    INTEGER,                  -- Original file size; NULL when unreadable
-  bytes_included INTEGER,                  -- Bytes actually inlined
+  ord            INTEGER NOT NULL,
+  path           TEXT NOT NULL,
+  bytes_total    INTEGER,
+  bytes_included INTEGER,
   truncated      INTEGER NOT NULL DEFAULT 0,
-  content        TEXT,                     -- Verbatim content (after truncation)
+  content        TEXT,
   PRIMARY KEY (council_id, ord)
 );
 
--- One row per round. round_no = 0 is the **topic statement round** (the server puts the topic + material on
--- the table; no voting); 1..N are discussion rounds. proposal_* is **the proposal this round's vote targets**,
--- archived round by round → the whole process is traceable
--- ("the round-3 conclusion was voted from the version someone proposed in round 2" must be reconstructable).
--- Vote counts are computed live by council/consensus.js and then persisted; they are not self-reported by the
--- model.
+-- One row per round. round_no = 0 is the moderator's plan (kind='plan'); 1..N are debate rounds
+-- (kind='debate'). Every debate row is a complete RoundResult:
+--   proposal_*    — the proposal under review this round (version, verbatim text, diff from the previous one)
+--   moderator_json — the moderator's convergence result: consensus / openIssues / conflicts /
+--                    revisionDirectives. The convergence score is **not** stored here: it is computed by the
+--                    server from the reviews and the conflict list (council/convergence.js), so a model
+--                    cannot inflate it.
+--   stats_json    — server-computed review counts and score breakdown for this round.
 CREATE TABLE IF NOT EXISTS council_rounds (
-  council_id     TEXT NOT NULL,
-  round_no       INTEGER NOT NULL,         -- 0 = topic statement round
-  kind           TEXT NOT NULL CHECK (kind IN ('brief','debate')),
-  proposal_text  TEXT,                     -- Verbatim proposal on the table this round
-  proposal_from  TEXT,                     -- Who proposed it: a floor id; 'chair' = the server's initial proposal from the topic
-  agree          INTEGER NOT NULL DEFAULT 0,
-  disagree       INTEGER NOT NULL DEFAULT 0,
-  abstain        INTEGER NOT NULL DEFAULT 0,
-  invalid        INTEGER NOT NULL DEFAULT 0,  -- How many did not state a position (timeout / crash / unparsable)
-  consensus      INTEGER NOT NULL DEFAULT 0,
-  started_at     INTEGER,
-  ended_at       INTEGER,
+  council_id    TEXT NOT NULL,
+  round_no      INTEGER NOT NULL,          -- 0 = plan
+  kind          TEXT NOT NULL CHECK (kind IN ('plan','debate')),
+  version       TEXT,                      -- 'v1', 'v2', ... only for debate rounds
+  proposal_text TEXT,                      -- Verbatim proposal under review
+  diff_from_prev TEXT,                     -- What changed versus the previous round (NULL for v1)
+  proposal_from TEXT,                      -- Floor id of the main answerer
+  moderator_json TEXT,                     -- Plan JSON (round 0) or convergence JSON (debate rounds)
+  stats_json    TEXT,                      -- Server-computed counts + score breakdown
+  started_at    INTEGER,
+  ended_at      INTEGER,
   PRIMARY KEY (council_id, round_no)
 );
 
--- One row per person per round: the utterance + the structured tail block.
+-- One row per ReviewPoint. Reviewers submit structured points, not free text.
+CREATE TABLE IF NOT EXISTS council_reviews (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  council_id  TEXT NOT NULL,
+  round_no    INTEGER NOT NULL,
+  reviewer    TEXT NOT NULL,               -- Reviewer floor id
+  severity    TEXT NOT NULL
+              CHECK (severity IN ('blocker','major','minor','nit')),
+  dimension   TEXT NOT NULL,               -- e.g. 架构 / 性能 / 安全; free-form but normalized server-side
+  issue       TEXT NOT NULL,
+  evidence    TEXT,                        -- Quoted proposal text / code line / material
+  suggestion  TEXT NOT NULL,
+  stance      TEXT NOT NULL
+              CHECK (stance IN ('reject','revise','accept')),
+  ord         INTEGER NOT NULL DEFAULT 0,  -- Preserves the order the reviewer submitted them
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_council_reviews ON council_reviews(council_id, round_no, reviewer, ord);
+
+-- One row per spoken turn, including the system-rendered topic statement. This is the raw audit trail: the
+-- parsed structured blocks also live in council_rounds / council_reviews, but the original text is kept here.
 --
--- Voting mode uses vote/vote_reason/proposal_text/second_floor; analysis mode uses stance/findings_json.
--- The two sets of fields **never overwrite each other**; each writes its own (one row never has both, but the
--- schema adds no constraint — a meeting's mode is a row-level fact, and which set to read is decided by
--- councils.mode).
---
--- **NULL = did not state a position** (process timed out / crashed / output unparsable): in that case status
--- records the real reason, and the UI writes "did not state a position" and shows the raw error — never default
--- it to agree / abstain / "no opinion" just because "it did not answer".
+-- **status='unparsed' means the turn produced text but no usable structured block.** That is different from
+-- `parse_dropped` (how many malformed review items were discarded) and from a failed process. The UI shows
+-- the real reason and the raw error; it never treats missing output as acceptance.
 CREATE TABLE IF NOT EXISTS council_utterances (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   council_id    TEXT NOT NULL,
   round_no      INTEGER NOT NULL,
-  floor_id      TEXT NOT NULL,
-  role          TEXT NOT NULL DEFAULT 'speaker'
-                CHECK (role IN ('chair','speaker')),  -- chair = the server's topic statement
-  content       TEXT,                      -- Utterance body
-  vote          TEXT CHECK (vote IS NULL OR vote IN ('agree','disagree','abstain')),
-  vote_reason   TEXT,                      -- One-line reason
-  proposal_text TEXT,                      -- The revision submitted by whoever voted against (candidate for the next round)
-  second_floor  TEXT,                      -- Whose proposal was seconded (used to pick the next round's proposal)
-  -- Analysis mode's stance (only set when councils.mode='analysis'). NULL = did not state a position; no guessing.
-  stance        TEXT CHECK (stance IS NULL OR stance IN ('support','oppose','unsure')),
-  -- Analysis mode's structured points: {"points":[…],"risks":[…],"questions":[…]}.
-  -- **NULL = the whole tail block failed to parse, not "all three are empty"** (the latter is
-  -- {"points":[],"risks":[],"questions":[]}) — the UI shows these two differently
-  -- ("did not provide points as agreed" vs "provided them, and they are empty").
-  findings_json TEXT,
+  floor_id      TEXT NOT NULL,             -- 'system' for the topic statement
+  phase         TEXT NOT NULL
+                CHECK (phase IN ('brief','plan','proposal','review','moderation','adjudication','final')),
+  content       TEXT,
+  model         TEXT,                      -- Best-effort model id parsed from CLI output; NULL = unknown
   status        TEXT NOT NULL DEFAULT 'ok'
                 CHECK (status IN ('ok','failed','timeout','unparsed')),
-  error         TEXT,                      -- Raw failure text (stderr summary / timeout note)
+  error         TEXT,
   input_tokens       INTEGER,
   output_tokens      INTEGER,
   cache_read_tokens  INTEGER,
   cache_write_tokens INTEGER,
+  parse_dropped INTEGER NOT NULL DEFAULT 0,
   started_at    INTEGER,
   ended_at      INTEGER,
   duration_ms   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_council_utt ON council_utterances(council_id, round_no, floor_id);
+CREATE INDEX IF NOT EXISTS idx_council_utt_floor ON council_utterances(council_id, floor_id);
+
+-- Final output of a meeting. Written once when the run ends (or fails part-way, with whatever exists).
+-- report_json is the complete machine-readable archive; files_json lists where the exported files landed.
+CREATE TABLE IF NOT EXISTS council_reports (
+  council_id         TEXT PRIMARY KEY,
+  adjudication_json  TEXT,                 -- Moderator's final adjudication
+  adjudication_text  TEXT,
+  final_draft_text   TEXT,                 -- Main answerer's final draft
+  change_notes       TEXT,                 -- What changed from the last debated proposal
+  report_json        TEXT,
+  files_json         TEXT,
+  created_at         INTEGER NOT NULL
+);

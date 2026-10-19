@@ -1,26 +1,19 @@
 'use strict';
 
 /**
- * The council room's HTTP API —— start / view / cancel / delete.
+ * The council room's HTTP API — start / view / cancel / delete / read the report.
  *
  * Every check here is "do not fabricate" expressed at the API layer:
- *   · A floor not on the whitelist, or without its CLI → **reject**, no downgrading (holding the
- *     meeting one participant short should not be quietly accepted);
+ *   · A floor not on the whitelist, or without its CLI → **reject**, no downgrading;
  *   · A material file that cannot be read / is binary → **reject the whole request and name the
- *     files**, no silent skipping (if a file the user picked did not make it in, he has to know,
- *     otherwise he will believe the participants read it);
- *   · A running meeting cannot be deleted (cancel first) —— deleting it lets in-flight speeches keep
- *     writing into a meeting that no longer exists, and with no foreign keys on these tables those
- *     rows become orphans;
- *   · Both the mode (vote / analysis) and the working directory (project mode) are validated
- *     **here**: an unrecognized mode is rejected, and the directory must exist, be readable and be
- *     **absolute**. Letting it through means the mistake only surfaces after all four participants
- *     have each failed once.
+ *     files**, no silent skipping;
+ *   · A running meeting cannot be deleted (cancel first) — deleting it lets in-flight turns write into
+ *     a council that no longer exists;
+ *   · Roles are validated here: exactly one moderator, exactly one main, at least one reviewer, and
+ *     the same floor cannot hold two roles.
  *
- * The start endpoint does **not await the whole meeting**: a meeting takes minutes to run, HTTP
- * should have returned long before that. `POST /councils` persists it and returns immediately,
- * progress goes out over WS (WS_EVENTS.COUNCIL), and on reconnect the frontend pulls
- * `GET /councils/:id` to catch up.
+ * The start endpoint does **not await the whole meeting**: meetings take minutes, HTTP returns first.
+ * Progress goes out over WS (WS_EVENTS.COUNCIL); on reconnect the frontend pulls `GET /councils/:id`.
  */
 
 const express = require('express');
@@ -33,32 +26,21 @@ const { DEFAULTS } = require('@workgremlin/shared');
 
 const { listCouncilFloors, isCouncilFloor } = require('../../council/floors');
 const { readMaterials } = require('../../council/materials');
-const { THRESHOLDS } = require('../../council/consensus');
+const { roundResultOf } = require('../../council/orchestrator');
 
-/** Default decision criterion: honor the global default, falling back to the most conservative one */
-const defaultThreshold = () =>
-  Object.values(THRESHOLDS).includes(DEFAULTS.COUNCIL_THRESHOLD_DEFAULT)
-    ? DEFAULTS.COUNCIL_THRESHOLD_DEFAULT
-    : THRESHOLDS.UNANIMOUS;
-
-/** A meeting's id. Not auto-increment: these tables have to be deletable wholesale, so keep order information out of ids */
+/** A meeting's id. Not auto-increment: these tables may be deleted wholesale, so keep order out of ids */
 const newId = () => `c_${crypto.randomBytes(12).toString('hex')}`;
 
-/** The two ways of talking. See COUNCIL_MODE_DEFAULT in shared and the branches in council/orchestrator.js */
-const MODES = Object.freeze(['vote', 'analysis']);
-
 /**
- * Validation of the working directory (project mode). **Absolute paths only** —— a relative path
- * resolved against the server's cwd is often not the directory the user had in mind; rather than
- * guessing for him, make him write it out in full.
+ * Validation of the working directory. **Absolute paths only** — a relative path resolved against the
+ * server's cwd is often not the directory the user had in mind.
  *
- * A leading `~` is expanded (that is what users type most in the input box), and then it **must
- * exist and be a directory**: letting a nonexistent path through would make the four participants
- * each fail once and finally report a meeting where "nobody expressed a position", hiding the real
- * cause (a mistyped directory).
+ * A leading `~` is expanded, then the path **must exist and be a directory**: letting a nonexistent
+ * path through would make every participant fail once and finally report "nobody could review",
+ * hiding the real cause.
  *
  * @param {unknown} raw workspacePath from the request body
- * @returns {{path:string}|{error:string}} an empty path = the user left it blank (the server then uses a temp directory)
+ * @returns {{path:string}|{error:string}} an empty path = no workspace (the server uses a temp dir)
  */
 function resolveWorkspaceDir(raw) {
   let s = String(raw == null ? '' : raw).trim();
@@ -79,6 +61,15 @@ function resolveWorkspaceDir(raw) {
 const bad = (res, message) => res.status(400).json({ ok: false, error: { code: 'bad_payload', message } });
 const notFound = (res) => res.status(404).json({ ok: false, error: { code: 'not_found', message: '没有这场会' } });
 
+function parseJson(value, fallback) {
+  if (value == null || value === '') return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 /**
  * @param {{repo:object, orchestrator:object, deps?:object}} arg
  *   deps.listFloors is injectable (tests swap out the real CLI detection)
@@ -87,26 +78,24 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
   const router = express.Router();
   const listFloors = deps.listFloors || (() => listCouncilFloors());
 
-  /** Can this floor be invited right now (only counts when its CLI is installed) */
   const floorsById = () => new Map(listFloors().map((f) => [f.floorId, f]));
 
   /* ------------------------------------------------------------------ Available floors */
-  // Note: this route goes before /councils/:id, otherwise 'floors' would be taken as an id
   router.get('/councils/floors', (req, res) => {
     res.json({
       ok: true,
       floors: listFloors(),
-      // The UI shows "at most how many rounds"; defaults and the hard cap come from here, do not
-      // hardcode a second copy on the frontend
       defaults: {
         maxRounds: DEFAULTS.COUNCIL_ROUNDS_DEFAULT,
         maxRoundsLimit: DEFAULTS.COUNCIL_ROUNDS_MAX,
-        threshold: defaultThreshold(),
-        modes: [...MODES],
-        mode: DEFAULTS.COUNCIL_MODE_DEFAULT,
+        roles: [...DEFAULTS.COUNCIL_ROLES],
+        severities: [...DEFAULTS.COUNCIL_SEVERITIES],
+        stances: [...DEFAULTS.COUNCIL_STANCES],
+        dimensions: [...DEFAULTS.COUNCIL_DIMENSIONS],
+        severityWeights: { ...DEFAULTS.COUNCIL_SEVERITY_WEIGHTS },
+        conflictWeight: DEFAULTS.COUNCIL_CONFLICT_WEIGHT,
+        scoreMax: DEFAULTS.COUNCIL_SCORE_MAX,
         turnTimeoutMs: DEFAULTS.COUNCIL_TURN_TIMEOUT_MS,
-        // Per-round timeout in project mode (participants dig through code themselves, so it is
-        // wider than the one above) —— the UI has to state "how long at most"
         workspaceTurnTimeoutMs: DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS,
         materialMaxBytes: DEFAULTS.COUNCIL_MATERIAL_MAX_BYTES,
         materialTotalMaxBytes: DEFAULTS.COUNCIL_MATERIAL_TOTAL_MAX_BYTES,
@@ -120,39 +109,38 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const topic = String(body.topic == null ? '' : body.topic).trim();
     if (!topic) return bad(res, '议题不能是空的');
 
-    // How to talk: reject an unrecognized value rather than silently downgrading to vote (the user
-    // picking "analysis" and getting it run as "vote" is the worst kind of mistake)
-    const mode = body.mode == null || body.mode === '' ? DEFAULTS.COUNCIL_MODE_DEFAULT : String(body.mode);
-    if (!MODES.includes(mode)) return bad(res, `模式只能是 ${MODES.join(' / ')}：${mode}`);
-
-    // Where to read: blank = the server creates a temp directory; if filled in it must be an existing,
-    // readable directory
     const ws = resolveWorkspaceDir(body.workspacePath);
     if (ws.error) return bad(res, ws.error);
 
-    const wanted = Array.isArray(body.floors) ? [...new Set(body.floors.map((f) => String(f)))] : [];
-    if (wanted.length < 2) return bad(res, '至少要请两个楼层 —— 一个人不叫讨论');
+    const moderator = String(body.moderator == null ? '' : body.moderator).trim();
+    const main = String(body.main == null ? '' : body.main).trim();
+    const reviewers = Array.isArray(body.reviewers)
+      ? [...new Set(body.reviewers.map((x) => String(x == null ? '' : x).trim()).filter(Boolean))]
+      : [];
 
+    if (!moderator) return bad(res, '必须指定主持人');
+    if (!main) return bad(res, '必须指定主答');
+    if (!reviewers.length) return bad(res, '至少需要一位评审');
+    if (moderator === main) return bad(res, '主持人和主答不能是同一个楼层');
+    if (reviewers.includes(moderator)) return bad(res, '主持人不能再兼任评审');
+    if (reviewers.includes(main)) return bad(res, '主答不能再兼任评审');
+
+    const all = [moderator, main, ...reviewers];
     const known = floorsById();
-    const unknown = wanted.filter((f) => !isCouncilFloor(f));
+    const unknown = all.filter((f) => !isCouncilFloor(f));
     if (unknown.length) return bad(res, `这几个楼层议事厅请不了：${unknown.join('、')}`);
-    const asleep = wanted.filter((f) => !(known.get(f) || {}).ready);
+    const asleep = all.filter((f) => !(known.get(f) || {}).ready);
     if (asleep.length) {
-      // Spell out why each floor is unavailable —— with the plugin installed but no CLI, the user
-      // has to know exactly what is missing
       const why = asleep.map((f) => `${f}：${(known.get(f) || {}).reason || '不可用'}`).join('；');
       return bad(res, `这些楼层现在请不动 —— ${why}`);
     }
 
     const wantedRounds = Number(body.maxRounds);
-    const maxRounds = Number.isFinite(wantedRounds) && wantedRounds > 0
-      ? Math.min(Math.floor(wantedRounds), DEFAULTS.COUNCIL_ROUNDS_MAX)
-      : DEFAULTS.COUNCIL_ROUNDS_DEFAULT;
+    const maxRounds =
+      Number.isFinite(wantedRounds) && wantedRounds > 0
+        ? Math.min(Math.floor(wantedRounds), DEFAULTS.COUNCIL_ROUNDS_MAX)
+        : DEFAULTS.COUNCIL_ROUNDS_DEFAULT;
 
-    const threshold = Object.values(THRESHOLDS).includes(body.threshold) ? body.threshold : defaultThreshold();
-
-    // Materials: reject the whole request and name the files when one cannot be read (no silent
-    // skipping)
     const files = Array.isArray(body.files) ? body.files.map((f) => String(f || '')).filter(Boolean) : [];
     const materials = readMaterials(files);
     const broken = materials.filter((m) => m.error);
@@ -164,9 +152,19 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const createdAt = Date.now();
     const floorOf = (f) => known.get(f) || {};
     try {
-      repo.createCouncil({ id, topic, mode, workspacePath: ws.path || null, threshold, maxRounds, createdAt });
-      for (const f of wanted) {
-        repo.insertParticipant({ councilId: id, floorId: f, agent: floorOf(f).agent || '', cliPath: floorOf(f).cliPath || null });
+      repo.createCouncil({ id, topic, workspacePath: ws.path || null, maxRounds, createdAt });
+      for (const [floorId, role] of [
+        [moderator, 'moderator'],
+        [main, 'main'],
+        ...reviewers.map((f) => [f, 'reviewer']),
+      ]) {
+        repo.insertParticipant({
+          councilId: id,
+          floorId,
+          role,
+          agent: floorOf(floorId).agent || '',
+          cliPath: floorOf(floorId).cliPath || null,
+        });
       }
       materials.forEach((m, ord) => {
         repo.insertMaterial({
@@ -180,12 +178,13 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
         });
       });
     } catch (err) {
-      return res.status(500).json({ ok: false, error: { code: 'internal', message: `建这场会失败：${(err && err.message) || '未知原因'}` } });
+      return res.status(500).json({
+        ok: false,
+        error: { code: 'internal', message: `建这场会失败：${(err && err.message) || '未知原因'}` },
+      });
     }
 
-    // Start running only once it is persisted. **No await**: the start endpoint returns immediately,
-    // progress goes out over WS. start() guarantees it never throws (see orchestrator.js), so no
-    // catch is needed here.
+    // Start only once persisted. **No await**: progress goes out over WS. start() never throws.
     orchestrator.start(id);
 
     res.status(201).json({ ok: true, council: repo.getCouncil(id) });
@@ -196,22 +195,62 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     res.json({ ok: true, councils: repo.listCouncils(Number(req.query.limit) || 50) });
   });
 
+  /* ------------------------------------------------------------------ Report */
+  router.get('/councils/:id/report', (req, res) => {
+    const council = repo.getCouncil(req.params.id);
+    if (!council) return notFound(res);
+    const row = repo.getReport(council.id);
+    if (!row) return res.status(404).json({ ok: false, error: { code: 'not_found', message: '这场会还没有报告' } });
+    res.json({
+      ok: true,
+      report: parseJson(row.report_json, null),
+      adjudication: parseJson(row.adjudication_json, null),
+      finalDraft: row.final_draft_text,
+      changeNotes: row.change_notes,
+      files: parseJson(row.files_json, []),
+      createdAt: row.created_at,
+    });
+  });
+
   /* ------------------------------------------------------------------ Detail */
   router.get('/councils/:id', (req, res) => {
     const council = repo.getCouncil(req.params.id);
     if (!council) return notFound(res);
+
+    const rounds = repo.listRounds(council.id);
+    const reviews = repo.listReviews(council.id);
+    const reportRow = repo.getReport(council.id);
+    const reviewsByRound = new Map();
+    for (const r of reviews) {
+      if (!reviewsByRound.has(r.round_no)) reviewsByRound.set(r.round_no, []);
+      reviewsByRound.get(r.round_no).push(r);
+    }
+    const roundResults = rounds
+      .filter((r) => r.kind === 'debate')
+      .map((r) => roundResultOf(r, reviewsByRound.get(r.round_no)));
+    const planRow = rounds.find((r) => r.kind === 'plan');
+
     res.json({
       ok: true,
       council,
       participants: repo.listParticipants(council.id),
-      // Materials come with their content: the UI has to let people verify "what was actually fed
-      // in", which is part of traceability
       materials: repo.listMaterials(council.id),
-      rounds: repo.listRounds(council.id),
+      // Every spoken turn, with model and token columns. The store derives the timeline and the
+      // per-role token summary from these, so a page reload must get them here — WS only covers
+      // live updates.
       utterances: repo.listUtterances(council.id),
-      // Still running? (only the server knows whether the process is alive; the status in the DB may
-      // have just been marked but not pushed out yet)
+      // Raw archive rows stay available for troubleshooting.
+      rounds,
+      reviews,
+      // Assembled RoundResults are what the UI renders.
+      roundResults,
+      plan: planRow ? parseJson(planRow.moderator_json, null) : null,
+      report: reportRow ? parseJson(reportRow.report_json, null) : null,
+      reportFiles: reportRow ? parseJson(reportRow.files_json, []) : [],
       live: orchestrator.activeIds().includes(council.id),
+      // Who is working on which phase right now; null when nothing is in flight. This is what lets
+      // a freshly opened page show the working indicator during a long turn.
+      progress: orchestrator.progressOf(council.id),
     });
   });
 
@@ -219,8 +258,6 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
   router.post('/councils/:id/cancel', (req, res) => {
     const council = repo.getCouncil(req.params.id);
     if (!council) return notFound(res);
-    // cancel only works on meetings "still running in the server's memory"; a finished one cannot be
-    // cancelled, and that comes back as false, honestly
     const cancelled = orchestrator.cancel(council.id);
     res.json({ ok: true, cancelled, council: repo.getCouncil(council.id) });
   });
@@ -230,10 +267,10 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const council = repo.getCouncil(req.params.id);
     if (!council) return notFound(res);
     if (orchestrator.activeIds().includes(council.id)) {
-      // Cancel a running meeting before deleting it: deleting outright leaves in-flight speeches
-      // writing into a meeting that no longer exists, and with no foreign keys on these tables those
-      // rows linger as orphans
-      return res.status(409).json({ ok: false, error: { code: 'conflict', message: '这场会还在讨论，先取消再删' } });
+      return res.status(409).json({
+        ok: false,
+        error: { code: 'conflict', message: '这场会还在讨论，先取消再删' },
+      });
     }
     repo.deleteCouncil(council.id);
     res.json({ ok: true });
