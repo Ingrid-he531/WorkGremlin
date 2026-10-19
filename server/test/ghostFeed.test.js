@@ -60,6 +60,12 @@ console.log('\n[1] 召唤 → 临时成员 + 一条 run（挂在会话与父任�
 bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'Explore', task: '查代码', id: 'g1', parentTaskId: main });
 ok('幽灵成员是 ephemeral', member('subagent-Explore') && member('subagent-Explore').ephemeral === 1);
 ok('开了一条 subagent_run', runs() === 1, String(runs()));
+const ghostCard = bus.buildSnapshot('p1').members.find((m) => m.name === 'Explore' && m.ephemeral);
+ok(
+  '成员卡片带 sessionId（渲染层据此只显示当前会话的幽灵）',
+  ghostCard && ghostCard.sessionId === 's1',
+  JSON.stringify(ghostCard && ghostCard.sessionId)
+);
 const run1 = repo.raw.prepare('SELECT * FROM subagent_runs ORDER BY id').get();
 ok('run 挂在父任务上、记了名字', run1.parent_task_id === main && run1.name === 'Explore');
 ok('幽灵自己那一轮任务也开了（办公室显示当前任务 + 收工汇报都靠它）', !!run1.task_id);

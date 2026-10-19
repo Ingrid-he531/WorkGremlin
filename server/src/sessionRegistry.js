@@ -382,6 +382,10 @@ function scanCliSessions(dataPath, { limit = 200, kind = '' } = {}) {
       // It still has an mtime and still falls into the 60-minute active window, so the dropdown grows a
       // phantom "unknown project" entry.
       if (!sizeOf(p)) continue;
+      // A floor may know that some of its transcript files are not independent sessions even though
+      // they live in the session tree (Codex: subagent rollouts). The rule belongs to that floor's
+      // meta (see floorCodex.js); the generic scanner only dispatches.
+      if (typeof meta.isSessionFile === 'function' && !meta.isSessionFile(p)) continue;
       const at = mtime(p);
       const sid = typeof meta.sessionIdOfFile === 'function' ? meta.sessionIdOfFile(e.name) : sessionIdOfFile(e.name, kind);
       // Project path: first look at cwd in the transcript head (parsing rules under cwdOfHead); when the

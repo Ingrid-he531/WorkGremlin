@@ -14,6 +14,7 @@ import { useSessionStore } from '../stores/sessions';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
+import { busySubagentsOf } from '../lib/liveSubagents';
 import { summonTaskTitle } from '../lib/memberTask';
 import { httpBase, getServerInfo } from '../api/bridge';
 import { createIsoOffice } from '../iso/engine';
@@ -322,13 +323,16 @@ const consoleBase = computed(() => {
  *
  * This reads project.members directly and **does not reuse sceneMembers below** ——
  * the consoleLive watch evaluates once during setup, when sceneMembers is not initialized yet (TDZ).
- * The filter definition stays consistent with sceneMembers: only ephemeral members (ghosts) count.
+ * The filter definition stays consistent with sceneMembers (see liveSubagents): only ephemeral
+ * members (ghosts) count, and they are scoped to the selected floor and session. Without the
+ * floor scope a Codex ghost on 3F makes 8F (OpenCode, no task) report "waiting for subagent".
  */
 const busySubagents = computed(() => {
   if (sessions.floorEmpty || !sessions.live) return [];
-  return project.members.filter(
-    (m) => isEphemeralMember(m) && (m.state === 'busy' || m.state === 'blocked')
-  );
+  return busySubagentsOf(project.members, {
+    client: sessions.selectedClient,
+    sessionId: sessions.selectedSessionId,
+  });
 });
 
 /**

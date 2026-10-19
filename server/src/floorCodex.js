@@ -12,6 +12,7 @@
 
 const os = require('node:os');
 const path = require('node:path');
+const fs = require('node:fs');
 // Static subagent directories (project-level / user-level): private knowledge of this floor,
 // kept here rather than in the central agentLevel
 const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
@@ -52,6 +53,60 @@ const meta = {
       /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
     );
     return m ? m[1] : '';
+  },
+  /**
+   * Whether a file under sessions/ is a real user session.
+   *
+   * Codex writes subagent rollouts into the ordinary sessions tree with the same
+   * rollout-<timestamp>-<uuid>.jsonl name as a user session, so only the content tells them apart:
+   * the first line's session_meta carries thread_source "subagent" (newer versions also carry
+   * source.subagent / parent_thread_id). Such a rollout is the child transcript of the parent
+   * conversation, not an independent session. Listing it makes the dropdown show a second entry
+   * with no task and phase "unreported"; because that file is often fresher than the parent's, the
+   * renderer can auto-select it and the main console falls back to idle while the parent's ghosts
+   * are still running.
+   *
+   * Reads only the first line (session_meta), capped at 512 KB because that line carries the base
+   * instructions. If the head cannot be read, keep the file: showing one extra session beats hiding
+   * a real one.
+   * @param {string} file absolute rollout path
+   * @returns {boolean}
+   */
+  isSessionFile: (file) => {
+    const CAP = 512 * 1024;
+    let head = Buffer.alloc(0);
+    try {
+      const fd = fs.openSync(file, 'r');
+      try {
+        const chunk = Buffer.alloc(8192);
+        while (head.length < CAP) {
+          const n = fs.readSync(fd, chunk, 0, chunk.length, head.length);
+          if (n <= 0) break;
+          head = Buffer.concat([head, chunk.subarray(0, n)]);
+          if (head.indexOf(0x0a) >= 0) break;
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return true;
+    }
+    const nl = head.indexOf(0x0a);
+    const firstLine = (nl >= 0 ? head.subarray(0, nl) : head).toString('utf8');
+    let meta;
+    try {
+      meta = JSON.parse(firstLine);
+    } catch {
+      // A truncated / unparseable head: do not hide the session on a guess.
+      return true;
+    }
+    const payload = meta && meta.payload;
+    if (!payload || typeof payload !== 'object') return true;
+    if (String(payload.thread_source || '').toLowerCase() === 'subagent') return false;
+    const source = payload.source;
+    if (source && typeof source === 'object' && source.subagent) return false;
+    if (payload.parent_thread_id) return false;
+    return true;
   },
 };
 

@@ -52,9 +52,9 @@ const { repo, close } = openDatabase(path.join(TMP, 'test.db'));
 repo.upsertProject.run({ id: 'p1', name: 'Proj One', workspacePath: WS, mainConversationId: null, source: 'report', createdAt: 1 });
 const bus = createIngestBus({ repo, hub: { broadcast() {} }, projectName: 'Proj One', project: 'p1' });
 
-const roster = createAgentRoster({ bus, getProject: () => 'p1', getWorkspacePath: () => WS });
-
 let t = 1_000_000;
+const roster = createAgentRoster({ bus, getProject: () => 'p1', getWorkspacePath: () => WS, now: () => t });
+
 const poller = createPoller({
   bus,
   repo,
@@ -114,6 +114,30 @@ console.log('\n[4] 召唤 → 工位忙碌；收工 → 回到在线（回归：
   ok('召唤后 leo 忙碌（幽灵在干活的镜像）', leoState() === 'busy', String(leoState()));
   bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', id: 'gl1', result: '写完' });
   ok('收工后 leo 回到在线（幽灵散场复位）', leoState() === 'online', String(leoState()));
+}
+
+console.log('\n[5] 忙碌租约：幽灵还活着就续期，幽灵没了才让 TTL 兜底');
+{
+  const leoId = (repo.getMember.get('leo@p1') || {}).id;
+  const leoState = () => (leoId ? (repo.getStatus.get(leoId) || {}).state : null);
+  // Live ghost past the TTL: the roster must renew the lease instead of resetting the card to online.
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', task: '长任务', id: 'gl-ttl' });
+  ok('召唤后 leo 忙碌', leoState() === 'busy', String(leoState()));
+  t += 11 * 60_000;
+  poller.syncAgentsNow();
+  ok('超过 10 分钟但幽灵仍存活 → 工位保持忙碌', leoState() === 'busy', String(leoState()));
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', id: 'gl-ttl' });
+  ok('收工后回到在线', leoState() === 'online', String(leoState()));
+
+  // No ghost at all: the TTL must still clear a leaked marker (lost end event).
+  roster.markActive('architect');
+  ok('architect 标记忙碌', (repo.getStatus.get((repo.getMember.get('architect@p1') || {}).id) || {}).state === 'busy');
+  t += 11 * 60_000;
+  poller.syncAgentsNow();
+  ok(
+    '没有幽灵且超过 TTL → 兜底回到在线（不会永久卡忙碌）',
+    (repo.getStatus.get((repo.getMember.get('architect@p1') || {}).id) || {}).state === 'online'
+  );
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -31,6 +31,7 @@ function createAgentRoster(opts) {
    */
   const getProject = typeof opts.getProject === 'function' ? opts.getProject : () => opts.project || config.DEMO_PROJECT;
   const getWorkspacePath = typeof opts.getWorkspacePath === 'function' ? opts.getWorkspacePath : () => '';
+  const now = typeof opts.now === 'function' ? opts.now : Date.now;
 
   /** project -> Set(name) this roster registered there */
   const registered = new Map();
@@ -40,9 +41,10 @@ function createAgentRoster(opts) {
   const active = new Map();
 
   /**
-   * Summoned bookkeeping expires on its own: markIdle is the only reset entry point and it is only
-   * called when a summon ends, so a ghost that disappears for another reason would otherwise leave
-   * the name stuck "busy" (and un-heartbeated) forever.
+   * Summoned bookkeeping has a TTL as a safety net for lost end events. A live ghost renews the
+   * lease (see sweep), so a long-running subagent keeps its workstation busy for as long as it
+   * actually exists; without the renewal a task over 10 minutes made the card fall back to idle
+   * while the ghost was still floating.
    */
   const ACTIVE_TTL_MS = 10 * 60_000;
 
@@ -65,9 +67,20 @@ function createAgentRoster(opts) {
     return { mine, own, act };
   }
 
-  function sweep(act, nowTs) {
+  function sweep(project, act, nowTs) {
     for (const [name, at] of [...act]) {
-      if (nowTs - Number(at || 0) > ACTIVE_TTL_MS) act.delete(name);
+      if (nowTs - Number(at || 0) <= ACTIVE_TTL_MS) continue;
+      let alive = false;
+      try {
+        alive = typeof bus.isGhostAlive === 'function' && bus.isGhostAlive({ project, name });
+      } catch {
+        alive = false;
+      }
+      if (alive) {
+        act.set(name, nowTs);
+        continue;
+      }
+      act.delete(name);
     }
   }
 
@@ -95,7 +108,7 @@ function createAgentRoster(opts) {
     const floorId = (floor && floor.meta && floor.meta.id) || '';
     const client = (a && a.client) || (floor && floor.meta && floor.meta.agent) || '';
     const { mine, own, act } = state(project);
-    sweep(act, Date.now());
+    sweep(project, act, now());
     if (mine.has(name)) {
       // Already registered (by some floor). Keep the first owner's client/level; just keep it online.
       heartbeat(project, name, act);
@@ -152,7 +165,7 @@ function createAgentRoster(opts) {
     if (!name) return;
     const project = getProject();
     const { act } = state(project);
-    act.set(name, Date.now());
+    act.set(name, now());
     try {
       bus.heartbeat({ project, memberId: name, state: 'busy', progress: null, files: [] });
     } catch {

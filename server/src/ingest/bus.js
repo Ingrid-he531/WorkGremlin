@@ -1149,6 +1149,26 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * Whether a summoned instance with this name is still alive in the project.
+   *
+   * The agent roster uses it to renew its busy lease: a subagent may legitimately run longer than
+   * the roster's fixed TTL, and its workstation must stay busy for as long as the ghost is real.
+   * @param {{project?: string, name?: string}} p
+   * @returns {boolean}
+   */
+  function isGhostAlive(p = {}) {
+    const project = projectIdOf(p.project);
+    const name = normText(p.name, 64);
+    if (!name) return false;
+    for (const rec of ghosts.values()) {
+      if (rec.project !== project) continue;
+      if (rec.endedAt) continue;
+      if (rec.name === name) return true;
+    }
+    return false;
+  }
+
+  /**
    * Ghost fallback (driven by the unified poller): disperse any summon whose parent task ended or
    * that outlived the orphan TTL — no longer depends on any hook event arriving. The parent truth
    * comes from tasks.state; the summon link from the record's parentTaskId.
@@ -1488,6 +1508,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       project: m.project_id,
       // Source client: the office filters by floor accordingly (NULL = unknown, shown on every floor)
       client: m.client || null,
+      // Session this member belongs to (ghosts carry their parent session's id; resident gremlins
+      // have none). The renderer uses it to keep another session's ghosts out of the selected
+      // session's scene / "waiting for subagents" phase.
+      sessionId: m.session_id || null,
       // subagent level (user-level / project-level): drives the badge color on the gremlin's neck
       level: levels.get(memberId) || null,
       // The **function description** of a resident subagent (static data from the agent definition file): shown on the card as "what it does",
@@ -1642,6 +1666,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     ghostSpawn,
     ghostRetire,
     ghostSweep,
+    isGhostAlive,
     gcGhosts,
     setGhostRoster,
     heartbeat,
