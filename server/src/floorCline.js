@@ -35,6 +35,7 @@ const { resolveProjectName } = require('./project');
 const { formToSource, DEFAULTS } = require('@workgremlin/shared');
 const { openReadonly } = require('./dbReadonly');
 const { isFile } = require('./roots');
+const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 
@@ -209,8 +210,31 @@ function messagesPathOf(row) {
  * rides on the council prompt's own opening sentence (see council/prompt.js roleBlock), so the filter needs
  * no knowledge of the council's state and holds regardless of whether the meeting is still running.
  *
- * @returns {Array<{id,title,project,projectPath,model,form,status,endedAt,lastEventAt,messagesPath,tokens}>}
+ * @returns {Array<{id,parentSessionId,title,project,projectPath,model,form,status,startedAt,endedAt,lastEventAt,messagesPath,tokens}>}
  */
+function sessionFromRow(r) {
+  const md = parseJson(r.metadata_json) || {};
+  const dir = String(r.workspace_root || r.cwd || '');
+  return {
+    id: String(r.session_id || ''),
+    parentSessionId: String(r.parent_session_id || ''),
+    isSubagent: Boolean(Number(r.is_subagent)),
+    title: String(md.title || r.prompt || ''),
+    prompt: String(r.prompt || ''),
+    directory: dir,
+    project: dir ? resolveProjectName(dir) || path.basename(dir) : '',
+    projectPath: dir,
+    model: String(r.model || md.modelId || ''),
+    form: String(r.source || '').toLowerCase() === 'vscode' ? 'vscode' : 'cli',
+    status: String(r.status || ''),
+    startedAt: timeOf(r.started_at) || 0,
+    endedAt: timeOf(r.ended_at) || 0,
+    lastEventAt: timeOf(r.updated_at) || 0,
+    messagesPath: messagesPathOf(r),
+    tokens: tokenOf(md),
+  };
+}
+
 function listClineSessions() {
   const now = Date.now();
   const file = clineDbPath();
@@ -220,7 +244,8 @@ function listClineSessions() {
     db
       .prepare(
         `SELECT session_id, source, status, provider, model, cwd, workspace_root, prompt,
-                started_at, updated_at, ended_at, messages_path, metadata_json, is_subagent
+                started_at, updated_at, ended_at, messages_path, metadata_json, is_subagent,
+                parent_session_id
            FROM sessions
           WHERE is_subagent IS NULL OR is_subagent = 0
           ORDER BY updated_at DESC`
@@ -228,30 +253,56 @@ function listClineSessions() {
       .all()
   );
   const value = (Array.isArray(rows) ? rows : [])
-    .map((r) => {
-      const md = parseJson(r.metadata_json) || {};
-      const dir = String(r.workspace_root || r.cwd || '');
-      return {
-        id: String(r.session_id || ''),
-        title: String(md.title || r.prompt || ''),
-        directory: dir,
-        project: dir ? resolveProjectName(dir) || path.basename(dir) : '',
-        projectPath: dir,
-        model: String(r.model || md.modelId || ''),
-        form: String(r.source || '').toLowerCase() === 'vscode' ? 'vscode' : 'cli',
-        status: String(r.status || ''),
-        endedAt: timeOf(r.ended_at) || 0,
-        lastEventAt: timeOf(r.updated_at) || 0,
-        messagesPath: messagesPathOf(r),
-        tokens: tokenOf(md),
-      };
-    })
+    .map(sessionFromRow)
     .filter((s) => s.id)
     // Council participants: Cline stamps the prompt as the session title, and the council prompt always
     // opens with COUNCIL_PROMPT_MARKER (see the note above).
     .filter((s) => !String(s.title || '').includes(DEFAULTS.COUNCIL_PROMPT_MARKER));
   cache = { at: now, key: file, value };
   return value;
+}
+
+/** One session row by id, including subagent rows (parent lookups for ghost attribution). */
+function clineSessionById(id) {
+  const sid = String(id || '').trim();
+  if (!sid) return null;
+  const row = query((db) =>
+    db
+      .prepare(
+        `SELECT session_id, source, status, provider, model, cwd, workspace_root, prompt,
+                started_at, updated_at, ended_at, messages_path, metadata_json, is_subagent,
+                parent_session_id
+           FROM sessions
+          WHERE session_id = ?`
+      )
+      .get(sid)
+  );
+  return row ? sessionFromRow(row) : null;
+}
+
+/**
+ * Cline child sessions (`is_subagent = 1`), oldest first. They are not sessions of their own, but
+ * each one is a spawned subagent, so the poll floor turns them into ghosts. Unreadable data means
+ * an empty list, never an exception.
+ */
+function listClineSubagents() {
+  const rows = query((db) =>
+    db
+      .prepare(
+        `SELECT session_id, source, status, provider, model, cwd, workspace_root, prompt,
+                started_at, updated_at, ended_at, messages_path, metadata_json, is_subagent,
+                parent_session_id
+           FROM sessions
+          WHERE is_subagent = 1
+            AND parent_session_id IS NOT NULL
+            AND parent_session_id <> ''
+          ORDER BY started_at ASC, updated_at ASC`
+      )
+      .all()
+  );
+  return (Array.isArray(rows) ? rows : [])
+    .map(sessionFromRow)
+    .filter((s) => s.id && s.parentSessionId);
 }
 
 /* ------------------------------ Message reading ------------------------------ */
@@ -294,6 +345,22 @@ function readConversation(session) {
   if (!p || !isFile(p)) return null;
   const j = readJsonFile(p);
   return j && Array.isArray(j.messages) ? j : null;
+}
+
+/** The child's final visible reply (the ghost's close-out result). */
+function lastAssistantText(convo) {
+  const messages = convo && Array.isArray(convo.messages) ? convo.messages : [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    const text = m.content
+      .filter((c) => c && c.type === 'text')
+      .map((c) => String(c.text || ''))
+      .join('\n')
+      .trim();
+    if (text) return text.slice(0, 500);
+  }
+  return '';
 }
 
 /** Extract the visible text of a `<user_input …>…</user_input>` wrapper (fallback: the raw text). */
@@ -547,6 +614,124 @@ function sessionTerminal(s) {
   return TERMINAL_STATUSES.has(String(s.status || '').toLowerCase());
 }
 
+const SUBAGENT_TOOL_PREFIX = 'subagent_';
+
+/** Normalize a prompt for matching the child row against the parent's tool-call input. */
+function normTask(t) {
+  return String(t || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The parent conversation's subagent tool calls, in order. Named agents use `subagent_<sanitized-name>`;
+ * the generic spawn tool is `spawn_agent` and its task lives in `task`.
+ */
+function subagentToolCalls(convo) {
+  const out = [];
+  const messages = convo && Array.isArray(convo.messages) ? convo.messages : [];
+  for (const m of messages) {
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    for (const c of m.content) {
+      if (!c || c.type !== 'tool_use') continue;
+      const tool = String(c.name || '');
+      let name = '';
+      if (tool.startsWith(SUBAGENT_TOOL_PREFIX)) name = tool.slice(SUBAGENT_TOOL_PREFIX.length);
+      else if (tool === 'spawn_agent') name = 'subagent';
+      else continue;
+      const input = c.input && typeof c.input === 'object' ? c.input : {};
+      out.push({
+        name: name || 'subagent',
+        task: String(input.prompt || input.task || '').trim(),
+        used: false,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Match each child row to the parent's tool call that spawned it. The child's `agent_id` is a runtime
+ * UUID, so the tool name is the only stable display name; the prompt disambiguates concurrent calls.
+ */
+function resolveSubagentNames(subs) {
+  const names = new Map();
+  const byParent = new Map();
+  for (const s of subs) {
+    if (!byParent.has(s.parentSessionId)) byParent.set(s.parentSessionId, []);
+    byParent.get(s.parentSessionId).push(s);
+  }
+  for (const [parentId, children] of byParent) {
+    const parent = clineSessionById(parentId);
+    if (!parent) continue;
+    const calls = subagentToolCalls(readConversation(parent));
+    const ordered = children
+      .slice()
+      .sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0) || String(a.id).localeCompare(String(b.id)));
+    for (const child of ordered) {
+      const task = normTask(child.prompt);
+      let hit = calls.find((c) => !c.used && task && normTask(c.task) === task);
+      // A compacted or rewritten parent transcript may no longer hold the exact prompt. Preserve the
+      // spawn order fallback so the ghost still appears, with the tool call's name when available.
+      if (!hit) hit = calls.find((c) => !c.used);
+      if (!hit) continue;
+      hit.used = true;
+      names.set(child.id, hit.name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Turn Cline child sessions into ghosts (2F has no hook, so the db is the only signal).
+ * Active children keep their ghost alive; terminal children close it with the child's final text.
+ * @param {{bus: any}} ctx
+ * @returns {number} child rows considered
+ */
+function syncClineSubagents({ bus } = {}) {
+  if (!bus || typeof bus.ghostSpawn !== 'function' || typeof bus.ghostRetire !== 'function') return 0;
+  let subs = [];
+  try {
+    subs = module.exports.listClineSubagents();
+  } catch {
+    return 0;
+  }
+  if (!subs.length) return 0;
+  const names = resolveSubagentNames(subs);
+  let count = 0;
+  for (const s of subs) {
+    const parent = clineSessionById(s.parentSessionId);
+    // Council participants must leave no trace on 2F, including their subagents.
+    if (parent && String(parent.title || '').includes(DEFAULTS.COUNCIL_PROMPT_MARKER)) continue;
+    const dir = s.projectPath || (parent && parent.projectPath) || '';
+    const project = dir ? resolveProjectName(dir) || path.basename(dir) : 'Cline';
+    const name = names.get(s.id) || 'subagent';
+    if (sessionTerminal(s)) {
+      bus.ghostRetire({
+        project,
+        client: CLIENT,
+        sessionId: s.parentSessionId,
+        name,
+        id: s.id,
+        result: lastAssistantText(readConversation(s)),
+        model: s.model || '',
+      });
+    } else {
+      bus.ghostSpawn({
+        project,
+        client: CLIENT,
+        sessionId: s.parentSessionId,
+        name,
+        id: s.id,
+        task: s.prompt || '',
+        model: s.model || '',
+        startedAt: s.startedAt || 0,
+        workspacePath: s.projectPath || (parent && parent.projectPath) || '',
+      });
+    }
+    count += 1;
+  }
+  return count;
+}
+
 /* ===================== Task syncer (one ledger row per turn) ===================== */
 const SYNC_INTERVAL_MS = 5_000;
 const TASK_ID_PREFIX = 'cline:';
@@ -626,6 +811,9 @@ function roundIndexOf(taskId, prefix) {
 function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
   // Resolved through module.exports so tests can swap listClineSessions / readClineRounds for stubs.
   const sessions = module.exports.listClineSessions();
+  // Child rows never appear in the top-level session list. Sync them before the early return so a
+  // directory containing only subagent rows (or a filtered parent) still gets its ghosts.
+  module.exports.syncClineSubagents({ bus });
   if (!sessions.length) return 0;
 
   const now = nowFn();
@@ -822,12 +1010,12 @@ function sessionTitle(sessionId) {
 }
 
 /**
- * 2F's static subagent definition dirs. Cline has no project-level / user-level agent definition
- * directory, so this returns [] and scans nothing (same interface as the other floors).
+ * 2F's static subagent definition dirs: project-level <workspacePath>/.cline/agents and user-level
+ * <clineDir>/agents. Project level wins over user level.
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
-function agentDirs() {
-  return [];
+function agentDirs(workspacePath) {
+  return genericAgentDirs([clineDir()], workspacePath);
 }
 
 const kindHandlers = { cline: clineHandler };
@@ -842,9 +1030,11 @@ module.exports = {
   clineSessionsDir,
   shorten,
   listClineSessions,
+  listClineSubagents,
   readClinePhase,
   readClineDone,
   readClineRounds,
+  syncClineSubagents,
   clineInstrumented,
   clineMainPhase,
   NO_DONE,
@@ -857,4 +1047,5 @@ module.exports = {
   kindHandlers,
   sessionTitle,
   agentDirs,
+  syncAgents: makeAgentSync(agentDirs, meta.agent),
 };

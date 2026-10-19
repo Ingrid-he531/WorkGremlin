@@ -147,8 +147,8 @@ head('[5] 楼层注册表：agentSyncerFloors 是"导出了 syncAgents"的楼层
 {
   const list = agentSyncerFloors();
   const ids = list.map((f) => f.meta.id).sort();
-  ok('有 agent 目录的楼层都参与（1F~6F/8F；2F/7F/9F 目录为空不参与）',
-    JSON.stringify(ids) === JSON.stringify(['1F', '3F', '4F', '5F', '6F', '8F']), JSON.stringify(ids));
+  ok('有 agent 目录的楼层都参与（1F~6F/8F；7F/9F 目录为空不参与）',
+    JSON.stringify(ids) === JSON.stringify(['1F', '2F', '3F', '4F', '5F', '6F', '8F']), JSON.stringify(ids));
   ok('每层都有 syncAgents 函数', list.every((f) => typeof f.syncAgents === 'function'));
 }
 

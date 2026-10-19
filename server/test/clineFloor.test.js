@@ -55,7 +55,7 @@ process.env.WORKGREMLIN_HOME = WG;
 // Point at the sandbox data root (written explicitly so the calling environment cannot shift it)
 process.env.CLINE_DATA_DIR = DATA;
 
-const { detectProducts } = require('../src/floors');
+const { detectProducts, agentDescription, detectLevel } = require('../src/floors');
 const cline = require('../src/floorCline');
 const { DEFAULTS } = require('@workgremlin/shared');
 
@@ -103,9 +103,9 @@ function makeClineDb(file, rows) {
   `);
   const ins = db.prepare(`
     INSERT INTO sessions (session_id, source, status, ended_at, provider, model, cwd, workspace_root, prompt,
-                          metadata_json, is_subagent, messages_path, updated_at)
+                          metadata_json, is_subagent, messages_path, updated_at, parent_session_id, started_at)
     VALUES (@session_id, @source, @status, @ended_at, @provider, @model, @cwd, @workspace_root, @prompt,
-            @metadata_json, @is_subagent, @messages_path, @updated_at)
+            @metadata_json, @is_subagent, @messages_path, @updated_at, @parent_session_id, @started_at)
   `);
   for (const r of rows) ins.run(r);
   db.close();
@@ -134,7 +134,7 @@ const userInput = (t) => ({ type: 'text', text: `<user_input mode="act">${t}</us
 const msg = (role, content, ts) => ({ id: `msg_${Math.random().toString(36).slice(2)}`, role, content, ts });
 
 /** One sessions-table record (updated ~1 second ago by default). */
-function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath, status = 'idle', endedAt = 0 } = {}) {
+function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath, status = 'idle', endedAt = 0, parentSessionId = null, prompt = '', startedAt = 0 } = {}) {
   const md = { title };
   if (tokens) md.aggregateUsage = { inputTokens: tokens.input, outputTokens: tokens.output, cacheReadTokens: tokens.cacheRead, cacheWriteTokens: tokens.cacheWrite };
   return {
@@ -147,11 +147,13 @@ function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp
     model,
     cwd,
     workspace_root: cwd,
-    prompt: '',
+    prompt,
     metadata_json: JSON.stringify(md),
     is_subagent: isSubagent,
     messages_path: messagesPath || '',
     updated_at: ISO(at),
+    parent_session_id: parentSessionId,
+    started_at: startedAt ? ISO(startedAt) : null,
   };
 }
 
@@ -348,6 +350,150 @@ head('[H] 终态会话立刻回收（源里标了结束就不进下拉）');
   ok('[H1] 终态会话不进下拉', !upserts.some((e) => e.id === 'cli-cancel-end'), JSON.stringify(upserts.map((e) => e.id)));
   ok('[H2] 已存在的终态行被撤回', !table.has('2F:cli-cancel-end'));
   ok('[H3] 在飞的会话照常列出（不误伤）', upserts.some((e) => e.id === 'cli-hist'), JSON.stringify(upserts.map((e) => e.id)));
+}
+
+head('[I] 静态子代理：Cline 的 YAML / YML 定义进入名册');
+{
+  const PROJ = path.join(TMP, 'yaml-project');
+  const userAgents = path.join(HOME, '.cline', 'agents');
+  const projectAgents = path.join(PROJ, '.cline', 'agents');
+  fs.mkdirSync(userAgents, { recursive: true });
+  fs.mkdirSync(projectAgents, { recursive: true });
+  fs.writeFileSync(
+    path.join(userAgents, 'ingrid.yaml'),
+    [
+      '---',
+      'name: Ingrid',
+      'description: "资深编程专家：负责复杂代码库的设计、实现、调试、重构与审查。"',
+      '---',
+      '',
+      'You are Ingrid.',
+    ].join('\n'),
+    'utf8'
+  );
+  fs.writeFileSync(
+    path.join(projectAgents, 'reviewer.yml'),
+    ['name: Reviewer', 'description: Reviews changes for regressions.', ''].join('\n'),
+    'utf8'
+  );
+
+  const dirs = cline.agentDirs(PROJ);
+  ok(
+    '[I1] 项目级 <ws>/.cline/agents + 用户级 ~/.cline/agents 都在候选里',
+    dirs.some((d) => d.level === 'project' && d.dir === projectAgents) &&
+      dirs.some((d) => d.level === 'user' && d.dir === userAgents),
+    JSON.stringify(dirs)
+  );
+
+  const registered = [];
+  const removed = [];
+  cline.syncAgents({
+    project: 'p1',
+    workspacePath: PROJ,
+    registerAgent: (a) => registered.push(a),
+    unregisterAgent: (n) => removed.push(n),
+  });
+  const byName = Object.fromEntries(registered.map((a) => [a.name, a]));
+  ok('[I2] ingrid.yaml 注册为用户级 cline 子代理', byName.ingrid && byName.ingrid.level === 'user' && byName.ingrid.client === 'cline', JSON.stringify(registered));
+  ok('[I2] reviewer.yml 注册为项目级 cline 子代理', byName.reviewer && byName.reviewer.level === 'project' && byName.reviewer.client === 'cline', JSON.stringify(registered));
+  ok('[I2] 第一次同步没有误删', removed.length === 0, JSON.stringify(removed));
+  ok('[I3] YAML 的 description 读得到', agentDescription('ingrid', PROJ, 'cline').startsWith('资深编程专家'), agentDescription('ingrid', PROJ, 'cline'));
+  ok('[I3] 级别判定按目录', detectLevel('ingrid', PROJ, 'cline') === 'user' && detectLevel('reviewer', PROJ, 'cline') === 'project');
+}
+
+head('[J] 子代理会话 → 2F 幽灵（spawn / retire）');
+{
+  const SUB_DB = path.join(DATA, 'db', 'subagents.db');
+  const pParent = writeConvo('cli-parent', [
+    msg('user', [userInput('让两个子代理干活')], NOW - 20_000),
+    msg('assistant', [thinking(), toolUse('subagent_ingrid', { prompt: '审查这个改动' })], NOW - 19_000),
+    msg('assistant', [toolUse('subagent_reviewer', { prompt: '检查测试' })], NOW - 18_000),
+  ], NOW - 18_000);
+  const pActive = writeConvo('cli-child-active', [
+    msg('user', [text('审查这个改动')], NOW - 17_000),
+    msg('assistant', [thinking()], NOW - 1_000),
+  ], NOW - 1_000);
+  const pDone = writeConvo('cli-child-done', [
+    msg('user', [text('检查测试')], NOW - 17_500),
+    msg('assistant', [text('检查完成，没有回归。')], NOW - 16_000),
+  ], NOW - 16_000);
+  makeClineDb(SUB_DB, [
+    row('cli-parent', { messagesPath: pParent, title: '父会话' }),
+    row('cli-child-active', {
+      messagesPath: pActive,
+      status: 'running',
+      at: NOW - 1_000,
+      isSubagent: 1,
+      parentSessionId: 'cli-parent',
+      prompt: '审查这个改动',
+      startedAt: NOW - 17_000,
+    }),
+    row('cli-child-done', {
+      messagesPath: pDone,
+      status: 'completed',
+      endedAt: NOW - 16_000,
+      at: NOW - 16_000,
+      isSubagent: 1,
+      parentSessionId: 'cli-parent',
+      prompt: '检查测试',
+      startedAt: NOW - 17_500,
+    }),
+  ]);
+  process.env.WORKGREMLIN_CLINE_DB = SUB_DB;
+
+  const calls = [];
+  const bus = {
+    ghostSpawn: (p) => {
+      calls.push(['spawn', p]);
+      return { memberId: `subagent-${p.name}`, runId: 1 };
+    },
+    ghostRetire: (p) => {
+      calls.push(['retire', p]);
+      return true;
+    },
+  };
+  const n = cline.syncClineSubagents({ bus });
+  const spawn = calls.find((c) => c[0] === 'spawn' && c[1].id === 'cli-child-active');
+  const retire = calls.find((c) => c[0] === 'retire' && c[1].id === 'cli-child-done');
+  ok('[J1] 两条子代理行都同步了', n === 2, String(n));
+  ok(
+    '[J1] 在飞的子代理 → spawn（子会话 id / 父会话 id / 工具名）',
+    Boolean(spawn) && spawn[1].sessionId === 'cli-parent' && spawn[1].name === 'ingrid' && spawn[1].task === '审查这个改动',
+    JSON.stringify(spawn)
+  );
+  ok(
+    '[J1] 终态子代理 → retire（工具名 + 子代理最后的文字）',
+    Boolean(retire) && retire[1].sessionId === 'cli-parent' && retire[1].name === 'reviewer' && retire[1].result === '检查完成，没有回归。',
+    JSON.stringify(retire)
+  );
+
+  // No top-level sessions (the parent row is gone): syncTasks must still reach the child sync before
+  // its early return, and an orphaned child keeps its own project attribution from its row.
+  const ORPHAN_DB = path.join(DATA, 'db', 'orphan-subagent.db');
+  makeClineDb(ORPHAN_DB, [
+    row('cli-orphan', {
+      status: 'running',
+      isSubagent: 1,
+      parentSessionId: 'gone-parent',
+      prompt: '孤儿任务',
+      startedAt: NOW - 5_000,
+    }),
+  ]);
+  process.env.WORKGREMLIN_CLINE_DB = ORPHAN_DB;
+  const orphanCalls = [];
+  const orphanBus = {
+    ghostSpawn: (p) => {
+      orphanCalls.push(p);
+      return { memberId: 'subagent-subagent', runId: 1 };
+    },
+    ghostRetire: () => true,
+  };
+  const tasks = cline.syncClineTasks({ bus: orphanBus, repo: null });
+  ok(
+    '[J2] 顶层会话为空时仍同步子代理（早退之前）',
+    tasks === 0 && orphanCalls.length === 1 && orphanCalls[0].id === 'cli-orphan' && orphanCalls[0].sessionId === 'gone-parent',
+    JSON.stringify({ tasks, orphanCalls })
+  );
 }
 
 head('[E] 读不出来不许冒泡');{

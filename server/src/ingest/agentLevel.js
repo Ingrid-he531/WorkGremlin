@@ -5,9 +5,9 @@
  *
  * The render layer is a sandbox (it cannot read the file system), so both "is this member a
  * user-level or a project-level subagent" and "what does it do" have to be read by the server and
- * shipped with the member card. The criteria match CodeBuddy / Codex / Claude:
- *   · project level: <workspacePath>/<dot directory>/agents/<name>.(md|toml)
- *   · user level:    <home directory>/<dot directory>/agents/<name>.(md|toml)
+ * shipped with the member card. The criteria match CodeBuddy / Codex / Claude / Cline:
+ *   · project level: <workspacePath>/<dot directory>/agents/<name>.(md|toml|yaml|yml)
+ *   · user level:    <home directory>/<dot directory>/agents/<name>.(md|toml|yaml|yml)
  * In neither place -> level null (an ordinary member / demo data, wearing no level badge) and an
  * empty description.
  *
@@ -35,7 +35,16 @@ const { isFile } = require('../roots');
 function fileOf(dir, name) {
   const base = String(name || '').trim();
   if (!base) return '';
-  const cands = [`${base}.md`, `${base.toLowerCase()}.md`, `${base}.toml`, `${base.toLowerCase()}.toml`];
+  const cands = [
+    `${base}.md`,
+    `${base.toLowerCase()}.md`,
+    `${base}.toml`,
+    `${base.toLowerCase()}.toml`,
+    `${base}.yaml`,
+    `${base.toLowerCase()}.yaml`,
+    `${base}.yml`,
+    `${base.toLowerCase()}.yml`,
+  ];
   for (const f of cands) {
     const p = path.join(dir, f);
     try {
@@ -62,13 +71,13 @@ function findAgentFile(name, dirs) {
   return null;
 }
 
-/** List the agent file names in a directory (stripping the .md/.toml suffix); empty when the directory cannot be read */
+/** List the agent file names in a directory (stripping the definition suffix); empty when the directory cannot be read */
 function listAgentFiles(dir) {
   try {
     return fs
       .readdirSync(dir)
-      .filter((f) => /\.(md|toml)$/i.test(f))
-      .map((f) => f.replace(/\.(md|toml)$/i, ''));
+      .filter((f) => /\.(md|toml|ya?ml)$/i.test(f))
+      .map((f) => f.replace(/\.(md|toml|ya?ml)$/i, ''));
   } catch {
     return [];
   }
@@ -88,7 +97,10 @@ function cleanDescription(raw) {
   return s;
 }
 
-/** Read the description from an agent definition file (.md reads YAML frontmatter, .toml reads `description = …`) */
+/**
+ * Read the description from an agent definition file. Markdown reads its YAML frontmatter, TOML reads
+ * `description = …`, and YAML/YML use the same `description:` line (with or without frontmatter fences).
+ */
 function readDescription(file) {
   let txt = '';
   try {
