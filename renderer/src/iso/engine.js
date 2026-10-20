@@ -156,7 +156,8 @@ const GHOST_ENTRY_STAGGER = 420; // ms: same batch leaves one at a time, not pil
 const GHOST_ENTRY_SETTLE = 280; // ms: a beat after the gremlins are in, so the two rhythms read apart
 const GHOST_ENTRY_WAIT_MAX = 5000; // ms: fallback for waiting on gremlins (a summon interrupts entry; never lock a ghost outside forever)
 /**
- * Entry: gremlins do not pop onto their workstations out of thin air —— they come in one by one through the front door and walk to their seat.
+ * Entry: available gremlins come in one by one through the front door and walk to their seat.
+ * Busy gremlins are already working, so they appear seated when the floor is opened.
  * @property {number} ENTER_DELAY wait before the first one appears (let the scene light up first)
  * @property {number} ENTER_STAGGER how long between two adjacent ones (ms)
  */
@@ -683,8 +684,11 @@ export function createIsoOffice(canvas, opts = {}) {
     seated.forEach((m, i) => {
       let a = agents.find((x) => x.memberId === m.memberId);
       if (!a) {
-        a = makeAgent(m, i, nowMs + ENTER_DELAY + enterSlot * ENTER_STAGGER);
-        enterSlot += 1;
+        // A busy workstation gremlin is already working, so switching to this floor should
+        // reveal it seated instead of replaying an entrance it did not just perform.
+        const startsAtDesk = bucketOf(m.state) === 'busy';
+        a = makeAgent(m, i, startsAtDesk ? 0 : nowMs + ENTER_DELAY + enterSlot * ENTER_STAGGER);
+        if (!startsAtDesk) enterSlot += 1;
         agents.push(a);
       }
       a.home = i;

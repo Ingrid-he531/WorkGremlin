@@ -115,6 +115,35 @@ const ghostWith = (extra = {}) => ({
   ...extra,
 });
 
+console.log('\n[0] 忙碌成员切到楼层时直接坐好，空闲成员仍从门口进入');
+{
+  clock = 0;
+  const seatedOffice = createIsoOffice(fakeCanvas(), {});
+  // Blocked members still use the entrance walk but never wander afterward, so this gives a
+  // stable reference for the same workstation without depending on random idle behavior.
+  seatedOffice.setMembers([{ ...GREMLIN, state: 'blocked' }]);
+  advance(seatedOffice, 8000);
+  const seated = seatedOffice.screenOf(GREMLIN.memberId);
+
+  clock = 0;
+  const busyOffice = createIsoOffice(fakeCanvas(), {});
+  busyOffice.setMembers([GREMLIN]);
+  advance(busyOffice, 16);
+  const busy = busyOffice.screenOf(GREMLIN.memberId);
+  const distance = seated && busy ? Math.hypot(busy.x - seated.x, busy.y - seated.y) : Infinity;
+  ok('忙碌成员第一帧已经出现在座位', distance < 0.1, `distance=${distance}`);
+  advance(busyOffice, 2000);
+  const settled = busyOffice.screenOf(GREMLIN.memberId);
+  const drift = busy && settled ? Math.hypot(settled.x - busy.x, settled.y - busy.y) : Infinity;
+  ok('忙碌成员没有补走门口到工位的入场路径', drift < 0.1, `distance=${drift}`);
+
+  clock = 0;
+  const idleOffice = createIsoOffice(fakeCanvas(), {});
+  idleOffice.setMembers([{ ...GREMLIN, state: 'idle' }]);
+  advance(idleOffice, 16);
+  ok('空闲成员仍保留门口入场动画', idleOffice.screenOf(GREMLIN.memberId) === null);
+}
+
 console.log('\n[1] 原地领任务：不走动、领完才现身幽灵');
 {
   clock = 0;
