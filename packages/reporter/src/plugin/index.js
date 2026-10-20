@@ -327,7 +327,7 @@ function fileOf(input) {
  * leave no "change" trace, so reporting them would just fill the "editing" column with noise.
  * When undecidable, treat it as **read** (don't report) — better to under-report than to call
  * "read a file" an edit (that would be inventing).
- * The list matches the hook path's PROBE_TOOLS / opOf (case-insensitive).
+ * Same rule as the hook path's WRITE_TOOLS / opOf (case-insensitive here, exact names there).
  */
 function opOfTool(name) {
   const t = String(name || "").trim().toLowerCase()

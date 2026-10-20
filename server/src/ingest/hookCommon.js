@@ -35,7 +35,16 @@ const PENDING_SPAWN_MS = 2 * 60_000;
 // CodeBuddy-specific constants (CB_REQ_GRACE_MS / CB_FLUSH_WAIT_MS / CB_FLUSH_STEP_MS) have moved to floorCodebuddy.js
 // -- they are consumed only by the CodeBuddy floor, and no longer pollute the framework layer
 
-const PROBE_TOOLS = new Set([
+/**
+ * Tool names that actually write/modify a file. Read-only tools (Read, Grep, Glob, ReadLints, LS …)
+ * never count: collecting every tool that carries a file_path put files the turn only read into the
+ * task detail's changed-file list. The same set decides whether PreToolUse waits for a permission
+ * round-trip, since only a write prompts for one.
+ *
+ * Measured against the tools the hook-path floors (Claude / CodeBuddy / Codex / Qoder / Trae) really
+ * emit, so a new product's write tool has to be added here.
+ */
+const WRITE_TOOLS = new Set([
   'Edit', 'MultiEdit', 'NotebookEdit', 'Write', 'Delete',
   'replace_in_file', 'write_to_file', 'delete_file',
   'apply_patch',
@@ -1218,7 +1227,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
           : f
           ? `${toolLabel} ${f}`
           : toolLabel;
-        const probe = !impl.hasPermissionEvent && PROBE_TOOLS.has(tool);
+        const probe = !impl.hasPermissionEvent && WRITE_TOOLS.has(tool);
         set({
           lastTool: tool,
           lastInput: ev.tool_input || '',
@@ -1261,9 +1270,13 @@ async function runHookEvent(ev, ctx, floorImpl) {
         }
         return { ok: true, ignored: 'subagent_tool' };
       }
-      const touched = filesOf(ev.tool_input, toolName)
-        .map((x) => ({ abs: path.resolve(x), path: relFile(x, cwd), op: opOf(toolName) }))
-        .filter((t) => t.path);
+      // Only write-class tools name a changed file: `Read` / `Grep` / `Glob` / `ReadLints` carry a
+      // file_path too, so taking every tool that does listed files the turn merely read as changed ones.
+      const touched = WRITE_TOOLS.has(toolName)
+        ? filesOf(ev.tool_input, toolName)
+            .map((x) => ({ abs: path.resolve(x), path: relFile(x, cwd), op: opOf(toolName) }))
+            .filter((t) => t.path)
+        : [];
       if (touched.length) {
         await bus.fileTouch({ ...base, files: touched.map((t) => t.path), op: opOf(toolName) });
         const ledger = ((get().roundFiles) || []).slice();
@@ -1548,7 +1561,7 @@ module.exports = {
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
   transcriptRoundFiles, stopReasonCancelled, isSubagentTool, isSubagentEvent, readTokens,
   addGhost, retireGhost, bindGhostIdentity, sweepGhosts, agentName, agentTask, subagentKeys,
-  resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
+  resultOfResponse, INJECTED_PROMPT_RE, WRITE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS,
   // token normalization primitives (product-agnostic)
   normOpenAI, normAnthropic, tokenFinish,

@@ -176,6 +176,22 @@ async function main() {
   ok('done.files 含取消前改过的文件', st5.done && Array.isArray(st5.done.files) && st5.done.files.some((f) => String(f.path || f) === 'src/foo.js'), JSON.stringify(st5.done && st5.done.files));
   ok('done.fileCount >= 1（不是「没有输出」）', st5.done && st5.done.fileCount >= 1, JSON.stringify(st5.done && st5.done.fileCount));
 
+  /* [5b] Reading a file is not changing it: a read-class tool carries a file_path too, and collecting
+     it listed files the turn only read as changed ones (Read showed up as an added file in the task
+     detail). Only write-class tools may reach the round's file list. */
+  head('[5b] 读文件不算改动：Read / Grep 不进 done.files，同轮真写过的文件照进');
+  const ts5 = mkTranscript('cancel-e.jsonl');
+  await runHook({ hook_event_name: 'UserPromptSubmit', session_id: 'cancel-e', cwd: WS, prompt: '看一眼再改', transcript_path: ts5 });
+  await runHook({ hook_event_name: 'PostToolUse', session_id: 'cancel-e', cwd: WS, tool_name: 'Read', tool_input: { file_path: 'src/read-only.js' }, transcript_path: ts5 });
+  await runHook({ hook_event_name: 'PostToolUse', session_id: 'cancel-e', cwd: WS, tool_name: 'Grep', tool_input: { pattern: 'foo', path: 'src/grepped.js' }, transcript_path: ts5 });
+  await runHook({ hook_event_name: 'PostToolUse', session_id: 'cancel-e', cwd: WS, tool_name: 'Write', tool_input: { file_path: 'src/written.js' }, transcript_path: ts5 });
+  await runHook({ hook_event_name: 'Interrupt', session_id: 'cancel-e', cwd: WS, transcript_path: ts5 });
+  const st5b = stateOf('cancel-e');
+  const names5b = ((st5b && st5b.done && st5b.done.files) || []).map((f) => String(f.path || f));
+  ok('只读过的文件不在 done.files 里', !names5b.includes('src/read-only.js'), JSON.stringify(names5b));
+  ok('只搜过的路径不在 done.files 里', !names5b.includes('src/grepped.js'), JSON.stringify(names5b));
+  ok('同一轮真写过的文件仍在', names5b.includes('src/written.js'), JSON.stringify(names5b));
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);
