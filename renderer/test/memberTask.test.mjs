@@ -1,21 +1,28 @@
 /**
- * 工位卡 / 办公室小怪物「当前任务」口径自检。
+ * Workstation-card task and state scoping.
  *
- * 背景（2026-09-30 用户实测）：主代理已经空闲，卡片上却还挂着上一个任务的标题、已耗时还在走。
- * 根因是 `agent_status.task_id` 不随收工清空 —— 空闲之后槽位仍指着**上一条已完成**的任务，
- * 渲染层照着显示就把它当成了当前任务。这一层只做一件事：把「当前任务」的判据固定下来
- * （未收工 + 成员在干活），空闲时留给调用方显示「空闲 / 最近活跃」。
+ * The regression this locks down: one member can have several sessions at once. A card must
+ * select its running task, blocked state, and last-active time by the selected session instead
+ * of showing whichever session happened to write last.
  *
- * 跑法：`npm run test:member-task`（node 直接跑；renderer 的 .js 由 node 的语法检测当 ESM）
+ * Run: `npm run test:member-task`
  */
-const { currentTaskOf, currentTaskTitle, currentTaskStartedAt, isWorking, statusLabel, statusTone, summonTaskOf, summonTaskTitle } = await import(
-  '../src/lib/memberTask.js'
-);
+const {
+  currentTaskOf,
+  currentTaskTitle,
+  currentTaskStartedAt,
+  isWorking,
+  memberForSession,
+  normalizeState,
+  statusLabel,
+  statusTone,
+  summonTaskOf,
+  summonTaskTitle,
+} = await import('../src/lib/memberTask.js');
 
 /**
- * 状态牌文案走 i18n（2026-10-01 加了中/英切换）：这里锁**中文那一套**。
- * 必须显式设一次 —— i18n 默认按浏览器语言猜，Node 的 navigator.language 是 en-US，
- * 不设的话断言"忙碌/空闲"就会随环境挂掉（英文那套由 i18n 的词条表保证完整）。
+ * Status labels come from i18n. Pin Chinese here because Node guesses en-US by default;
+ * the English table is covered by the i18n completeness test.
  */
 const { setLocale } = await import('../src/i18n/index.js');
 setLocale('zh');
@@ -33,64 +40,112 @@ function ok(label, cond, extra = '') {
 }
 
 const T = 1_700_000_000_000;
+const task = (id, sessionId, title, startedAt = T, endedAt = null) => ({
+  id,
+  sessionId,
+  title,
+  startedAt,
+  endedAt,
+});
 
-console.log('\n[1] 在干活 → 槽位里那条就是当前任务');
-const running = { state: 'busy', task: { id: 't1', title: '正在跑的任务', startedAt: T, endedAt: null } };
-ok('busy + 未收工 → 当前任务', currentTaskOf(running) === running.task);
-ok('标题取任务的 title', currentTaskTitle(running) === '正在跑的任务', currentTaskTitle(running));
-ok('已耗时从任务开工时刻算', currentTaskStartedAt(running) === T, String(currentTaskStartedAt(running)));
-ok('busy / blocked 同样算在干活（成员状态里没有 thinking —— 它属于 busy）', isWorking({ state: 'busy' }) && isWorking({ state: 'blocked' }));
+console.log('\n[1] Running tasks are selected by session');
+const member = {
+  memberId: 'codex@p',
+  name: 'codex',
+  role: 'agent',
+  state: 'busy',
+  stateSince: T,
+  tasks: [task('t1', 'session-a', 'task A'), task('t2', 'session-b', 'task B', T + 1)],
+  sessionStatuses: [],
+  lastTaskAtBySession: [
+    { sessionId: 'session-a', at: T + 100 },
+    { sessionId: 'session-b', at: T + 200 },
+  ],
+  currentFiles: [],
+};
+ok('session A gets its own task', currentTaskOf(member, 'session-a').id === 't1');
+ok('session B gets its own task', currentTaskOf(member, 'session-b').id === 't2');
+ok('unknown session gets no task', currentTaskOf(member, 'session-c') === null);
+ok('title follows the selected task', currentTaskTitle(member, 'session-a') === 'task A');
+ok('start time follows the selected task', currentTaskStartedAt(member, 'session-a') === T);
+ok('no session keeps the newest task for demo / legacy display', currentTaskOf(member).id === 't1');
 
-console.log('\n[2] 空闲 → 槽位里那条是**上一个任务**，不算当前任务（回归：空闲还挂着旧任务 + 已耗时在走）');
-const idle = { state: 'idle', task: { id: 't0', title: '上一个任务', startedAt: T - 600_000, endedAt: T - 540_000 } };
-ok('idle + 已收工 → 没有当前任务（卡片显示「空闲」）', currentTaskOf(idle) === null, JSON.stringify(currentTaskOf(idle)));
-ok('标题回空串（调用方显示「空闲」）', currentTaskTitle(idle) === '', currentTaskTitle(idle));
-ok('已收工的任务即使在 busy 相位也不算当前任务', currentTaskOf({ state: 'busy', task: idle.task }) === null);
-ok('online（只注册没干活）也算空闲', currentTaskOf({ state: 'online', task: running.task }) === null);
-ok('offline 同理', currentTaskOf({ state: 'offline', task: running.task }) === null);
+console.log('\n[2] State is derived per session');
+const blockedMember = {
+  ...member,
+  sessionStatuses: [{ sessionId: 'session-b', state: 'blocked', stateSince: T + 50 }],
+};
+const a = memberForSession(member, 'session-a', [member]);
+const b = memberForSession(blockedMember, 'session-b', [blockedMember]);
+const c = memberForSession(member, 'session-c', [member]);
+ok('session A is busy', a.state === 'busy' && a.task.id === 't1');
+ok('session B blocked wins over its running task', b.state === 'blocked' && b.task.id === 't2');
+ok('session C is idle even while another session is busy', c.state === 'idle' && c.task === null);
+ok('blocked state keeps that session timestamp', memberForSession(blockedMember, 'session-b').stateSince === T + 50);
+ok('last active is filtered by session', a.lastTaskAt === T + 100 && b.lastTaskAt === T + 200);
+ok('session C has no last-active value', c.lastTaskAt === null);
 
-console.log('\n[3] 兜底：没有任务 / 幽灵的字符串任务');
-ok('没有 task → null', currentTaskOf({ state: 'busy', task: null }) === null);
-ok('成员为空不炸', currentTaskOf(null) === null && currentTaskTitle(undefined) === '');
-ok('幽灵的字符串任务（在跑）照样认', currentTaskTitle({ state: 'busy', task: '审查这段 diff' }) === '审查这段 diff');
-ok('幽灵的字符串任务 + 空闲 → 不认', currentTaskOf({ state: 'idle', task: '审查这段 diff' }) === null);
+console.log('\n[3] Finished tasks are history, not current tasks');
+const ended = { ...member, tasks: [task('old', 'session-a', 'old task', T, T + 10)] };
+ok('ended task is not current', currentTaskOf(ended, 'session-a') === null);
+ok('ended task title is empty', currentTaskTitle(ended, 'session-a') === '');
+ok('missing tasks are safe', currentTaskOf({}, 'session-a') === null && currentTaskOf(null) === null);
+ok('busy is the only working member state', isWorking({ state: 'busy' }) && !isWorking({ state: 'blocked' }) && !isWorking({ state: 'idle' }));
+ok('unknown states normalize to idle', normalizeState('online') === 'idle' && normalizeState('offline') === 'idle');
 
-console.log('\n[4] 卡片右上角的状态牌分三档：阻塞 / 忙碌 / 空闲');
-ok('busy → 忙碌', statusLabel('busy') === '忙碌', statusLabel('busy'));
-ok('blocked → 阻塞（等外部依赖，单独一档）', statusLabel('blocked') === '阻塞', statusLabel('blocked'));
-ok('online / idle / offline → 空闲', ['online', 'idle', 'offline'].every((s) => statusLabel(s) === '空闲'));
-ok('未知状态按空闲处理（不把原始 state 直接怼给用户）', statusLabel('weird') === '空闲', statusLabel('weird'));
-ok('色调与文案同源（blocked=blocked 点，busy=busy 点，其余=idle 点）', statusTone('blocked') === 'blocked' && statusTone('busy') === 'busy' && statusTone('online') === 'idle' && statusTone('offline') === 'idle');
+console.log('\n[4] Resident gremlins borrow only a same-session summon');
+const resident = {
+  memberId: 'susan@p',
+  name: 'susan',
+  role: 'subagent:project',
+  state: 'busy',
+  agentState: 'busy',
+  tasks: [],
+  sessionStatuses: [],
+  sessionId: null,
+};
+const ghost = {
+  memberId: 'subagent-susan-1@p',
+  name: 'susan',
+  role: 'subagent',
+  ephemeral: true,
+  sessionId: 'session-a',
+  state: 'busy',
+  tasks: [task('g1', 'session-a', 'write docs')],
+  sessionStatuses: [],
+};
+ok('same-name ghost task is borrowed', summonTaskTitle(resident, [resident, ghost], 'session-a') === 'write docs');
+ok('summonTaskOf returns the ghost task', summonTaskOf(resident, [resident, ghost], 'session-a') === ghost.tasks[0]);
+ok('another session does not borrow it', summonTaskTitle(resident, [resident, ghost], 'session-b') === '');
+ok('ended ghost task is not borrowed', summonTaskTitle(resident, [resident, { ...ghost, tasks: [task('g1', 'session-a', 'write docs', T, T + 1)] }], 'session-a') === '');
+ok('idle resident does not borrow', summonTaskTitle({ ...resident, agentState: 'idle' }, [resident, ghost], 'session-a') === '');
+ok('resident own task wins', summonTaskTitle({ ...resident, tasks: [task('own', 'session-a', 'own work')] }, [resident, ghost], 'session-a') === 'own work');
+ok(
+  'a non-ghost same-name member is not borrowed',
+  summonTaskTitle(
+    resident,
+    [resident, { ...ghost, memberId: 'susan-copy@p', ephemeral: false, role: 'subagent' }],
+    'session-a'
+  ) === ''
+);
 
-console.log('\n[5] 时间点用绝对时刻（formatClock），不用需要每秒重算的相对时长');
-// 用户 2026-09-30 实测：1F 的「最近活跃」（相对时长）看着不动、3F 的「已耗时」一直在涨 ——
-// 同一屏两种行为。改成绝对时间后两者都是写死的字符串，不依赖任何定时器。
+console.log('\n[5] Status labels stay three-state');
+ok('busy -> working', statusLabel('busy') === '忙碌', statusLabel('busy'));
+ok('blocked -> blocked', statusLabel('blocked') === '阻塞', statusLabel('blocked'));
+ok('idle -> idle', statusLabel('idle') === '空闲', statusLabel('idle'));
+ok('legacy online/offline values render as idle', statusLabel('online') === '空闲' && statusLabel('offline') === '空闲');
+ok('unknown values render as idle', statusLabel('weird') === '空闲');
+ok('tone and label share the normalized state', statusTone('blocked') === 'blocked' && statusTone('busy') === 'busy' && statusTone('online') === 'idle');
+
+console.log('\n[6] Absolute clock formatting');
 const { formatClock } = await import('@workgremlin/shared');
 const at = new Date(2026, 8, 30, 21, 5, 42).getTime();
-ok('格式是 MM-DD HH:mm', formatClock(at) === '09-30 21:05', formatClock(at));
-ok('没有值 / 非法值回空串（卡片自己写「—」）', formatClock(0) === '' && formatClock(NaN) === '' && formatClock(null) === '');
-ok('同一时刻永远是同一个字符串（不随"现在几点"变化 = 不需要 tick）', formatClock(at) === formatClock(at));
-ok('不带秒、不带"前"（那些是相对时长的写法）', !/前|:\d\d:\d\d/.test(formatClock(at)), formatClock(at));
+ok('format is MM-DD HH:mm', formatClock(at) === '09-30 21:05', formatClock(at));
+ok('empty / invalid values return an empty string', formatClock(0) === '' && formatClock(NaN) === '' && formatClock(null) === '');
+ok('the same timestamp is stable without a clock tick', formatClock(at) === formatClock(at));
 
-console.log('\n[6] 被召唤的小怪物：借用同名幽灵的任务（回归：状态忙碌、当前任务却写「空闲」）');
+console.log('\n[7] Every WorkstationCard gets its siblings and selected session');
 {
-  const susan = { memberId: 'susan@p', name: 'susan', role: 'subagent:project', state: 'busy', task: null };
-  const ghost = { memberId: 'subagent-susan@p', name: 'susan', ephemeral: true, state: 'busy', task: { id: 'g1', title: '写文档', startedAt: T, endedAt: null } };
-  ok('自己没任务 + 同名幽灵在跑 → 借它的任务', summonTaskTitle(susan, [susan, ghost]) === '写文档', summonTaskTitle(susan, [susan, ghost]));
-  ok('summonTaskOf 拿到的是幽灵那条', summonTaskOf(susan, [susan, ghost]) === ghost.task);
-  ok('幽灵已收工 → 不借（卡片回「空闲」）', summonTaskTitle(susan, [susan, { ...ghost, task: { ...ghost.task, endedAt: T } }]) === '');
-  ok('自己有在跑的任务 → 用自己的', summonTaskTitle({ ...susan, task: { id: 't', title: '自己的', endedAt: null } }, [susan, ghost]) === '自己的');
-  ok('成员不在干活（idle）→ 不借', summonTaskTitle({ ...susan, state: 'idle' }, [susan, ghost]) === '');
-  ok('同名但不是幽灵（另一个常驻成员）→ 不借', summonTaskTitle(susan, [susan, { ...ghost, ephemeral: false, memberId: 'susan2@p' }]) === '');
-  ok('名字不同的幽灵 → 不借', summonTaskTitle(susan, [susan, { ...ghost, name: 'leo' }]) === '');
-}
-
-console.log('\n[7] 每处 <WorkstationCard> 都要把 members 传进去（回归：办公室卡片只拿到 member，借不到召唤幽灵的任务 → 状态忙碌、当前任务却写「空闲」）');
-{
-  // Why a source scan: the borrowing above only works when the card is handed the sibling members.
-  // A view that renders <WorkstationCard :member="..."> without :members silently falls back to the
-  // empty default, so the failure is invisible to the lib-level checks in [6] — it only shows up on
-  // screen. Scan every .vue under src so a future view cannot reintroduce it.
   const fs = await import('node:fs');
   const path = await import('node:path');
   const { fileURLToPath } = await import('node:url');
@@ -104,19 +159,22 @@ console.log('\n[7] 每处 <WorkstationCard> 都要把 members 传进去（回归
     }
   })(root);
   const usages = [];
-  const missing = [];
+  const missingMembers = [];
+  const missingSession = [];
   for (const f of files) {
     const src = fs.readFileSync(f, 'utf8');
     const re = /<WorkstationCard\b[\s\S]*?\/?>/g;
     let m;
     while ((m = re.exec(src))) {
       usages.push(path.relative(root, f));
-      if (!/:members\b/.test(m[0])) missing.push(path.relative(root, f));
+      if (!/:members\b/.test(m[0])) missingMembers.push(path.relative(root, f));
+      if (!/:session-id\b/.test(m[0])) missingSession.push(path.relative(root, f));
     }
   }
-  ok('至少扫到 3 处 WorkstationCard（办公室 / 旧 2D 场景 / 工位卡片）', usages.length >= 3, usages.join(', '));
-  ok('每一处都传了 :members', missing.length === 0, missing.join(', '));
+  ok('at least three WorkstationCard call sites are covered', usages.length >= 3, usages.join(', '));
+  ok('all call sites pass :members', missingMembers.length === 0, missingMembers.join(', '));
+  ok('all call sites pass :session-id', missingSession.length === 0, missingSession.join(', '));
 }
 
-console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
+console.log(`\nResult: ${pass} passed / ${fail} failed`);
 process.exit(fail ? 1 : 0);

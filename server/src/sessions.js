@@ -140,16 +140,15 @@ const SERVER_STARTED_AT = Date.now();
 /** Each session's todos / changed files / message-queue runtime are dispatched by client to the floor's
  *  pluginStore (see floorCodebuddy.js). */
 
-const AWAIT_TTL_MS = 5 * 60_000;
+const REPORTER_WS_FRESH_MS = 5 * 60_000;
 /**
  * The window that decides whether a task "is still running": only a **recent hook event**
- * (UserPromptSubmit / PreToolUse / PostToolUse / Notification …) means this turn is generating. The heartbeat
- * daemon's `hb.lastEventAt` does not count — it only proves the IDE session is still open, not that the agent
- * is working.
+ * (UserPromptSubmit / PreToolUse / PostToolUse / Notification …) means this turn is generating.
+ * Reporter-state metadata (`hb.lastEventAt`) only proves that the session wrote state; it is not task liveness.
  *
  * Why it is needed: pressing ESC in CodeBuddy IDE while it is "thinking / calling a tool" cancels the turn
  * and sends neither Stop nor Interrupt (measured: no such event in events.log), yet the IDE session stays open
- * and the heartbeat daemon keeps ticking, so taskId stays occupied and sessionPhase freezes on its last value
+ * and its state file remains present, so taskId stays occupied and sessionPhase freezes on its last value
  * (tool / thinking). The old logic used hb.lastEventAt as freshness, so inWindow / sessionPhase could never
  * fall back → the main console kept showing "calling a tool / thinking" although that turn had long been cut.
  * Now only hook event times count: after a cancel there are no new events, so past this window the turn counts
@@ -244,11 +243,11 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     // A phase older than this process's start is residue from the previous run (a closed project); do not
     // trust it — after a restart wait for a new event before lighting up
     if (sp.ts < SERVER_STARTED_AT) continue;
-    // IDE / plugin form: the heartbeat pid is dead = the project / window was closed (no Stop, phase frozen
+    // IDE / plugin form: the state-file owner pid is dead = the project / window was closed (no Stop, phase frozen
     // on its last breath). Use this reliable "the process is gone" signal to void the phase, so the main
     // console does not stay stuck on thinking / calling a tool after a window closes abruptly.
-    // Only use pid death to judge "gone", never a live heartbeat to judge "busy" (on ESC cancel the heartbeat
-    // keeps ticking; that must be voided by phaseSuperseded / done.cancelled, see below).
+    // Only use pid death to judge "gone", never a live pid to judge "busy". A cancelled turn is voided by
+    // phaseSuperseded / done.cancelled instead (see below).
     if (j.hb && Number.isInteger(j.hb.pid) && !pidAlive(j.hb.pid)) continue;
     if (workspacePath && sp.workspacePath && path.resolve(sp.workspacePath) !== path.resolve(workspacePath)) continue;
     // Is this "running" phase voided by that floor's cancel / interrupt marker: interrupt detection is floor
@@ -343,60 +342,6 @@ function pidAlive(pid) {
     // EPERM = the process exists but is not ours; ESRCH = truly gone
     return Boolean(e && e.code === 'EPERM');
   }
-}
-
-/**
- * Does this member still have **another session running** (axis 2)?
- *
- * Why it is needed: `agent_status` stores **one row per member** (`member_id` is the primary key) and has no
- * session dimension. When one Claude Code has sessions A and B open at once, A finishing (Stop → idle) or
- * exiting (SessionEnd → offline) writes that **single row**, so while B is still working the station card
- * already shows "idle / offline". So before demoting, ask "is another session of this member still alive";
- * if yes, do not demote.
- *
- * "Alive" tests (either one):
- *   - That state file's **heartbeat daemon process is still there** (`hb.pid` alive) — the main test: while
- *     the session has not exited, the daemon has not exited;
- *   - Or it still has **a phase / task in flight** (`sessionPhase` or `taskId` is fresh) — covers "the daemon
- *     never started / was just killed". Note SessionEnd clears both, so a cleanly exited session is never
- *     misjudged as alive by this.
- *
- * **Never use `hb.lastEventAt` as the test**: it stays fresh after a clean session exit (it records "the last
- * event", not "the last heartbeat"), and judging by it treats finished sessions as still running — the
- * measured symptom: after A exited and B exited too, the station card stayed on "thinking" and never fell.
- *
- * Only state files under **the same client + the same project** with **a different session id** count; old
- * naming files (no session) do not count as "another session" (they have no session dimension at all;
- * counting them would block the single-session case too).
- * @param {{workspacePath?: string, client?: string, session?: string, now?: number}} o
- * @returns {boolean}
- */
-function hasOtherLiveSession({ workspacePath = '', client = '', session = '', now = Date.now() } = {}) {
-  const ws = String(workspacePath || '').trim();
-  // Without a session identifier there is no "another session" to speak of (old hook / other product) → never block
-  if (!ws || !session) return false;
-  const m = stateFileWs(ws);
-  const dir = hooksDir();
-  for (const name of readDir(dir)) {
-    const fileSession = stateFileSession(name, m, dir);
-    if (fileSession === null || !fileSession || fileSession === session) continue;
-    const j = readJson(path.join(dir, name));
-    if (!j) continue;
-    if (!clientHit(client, j.client)) continue;
-    // Test 1: the heartbeat daemon is alive (most reliable)
-    if (j.hb && pidAlive(j.hb.pid)) return true;
-    // Test 2: a phase / task still in flight (see the function note: **never** use hb.lastEventAt).
-    // **An idle phase does not count as in flight**: finishing (Stop / Interrupt / idle_prompt) now writes an
-    // explicit idle, which only means "this turn is over, waiting for the next sentence"; treating it as
-    // "another session is still running" keeps the member card from ever returning to idle (especially
-    // visible when CLI and plugin run side by side on the same floor).
-    const spPhase = String((j.sessionPhase && j.sessionPhase.phase) || '');
-    const phaseTs = Number(j.sessionPhase && j.sessionPhase.ts) || 0;
-    if (spPhase && spPhase !== 'idle' && phaseTs && now - phaseTs <= AWAIT_TTL_MS) return true;
-    const startedAt = Number(j.taskStartedAt) || 0;
-    if (j.taskId && startedAt && now - startedAt <= AWAIT_TTL_MS) return true;
-  }
-  return false;
 }
 
 /** The canonical shape of a session id: a UUID (measured, that is what Claude Code uses). */
@@ -630,11 +575,8 @@ function readReporterActiveTask(workspacePath, client = '', session = '') {
     if (!clientHit(client, j.client)) continue;
     const ws = j.taskWorkspacePath || '';
     if (workspacePath && ws && path.resolve(ws) !== path.resolve(workspacePath)) continue;
-    // The heartbeat time **cannot** count as "the task is running": it only proves the IDE session is open
-    // (same discipline as hasOtherLiveSession) — on cancel the heartbeat keeps ticking, which would keep
-    // taskId forever fresh and freeze the phase on thinking / calling a tool. Only hook event times count
-    // (taskStartedAt starts the turn, sessionPhase.ts refreshes on every event): after a cancel there are no
-    // new events, so past TASK_RUN_MS the turn counts as finished and inWindow falls back to idle.
+    // Only hook event times count. `hb.lastEventAt` identifies state-file metadata, not task liveness.
+    // After a cancel there are no new events, so past TASK_RUN_MS the turn falls back to idle.
     const lastAt = Math.max(
       Number(j.taskStartedAt) || 0,
       Number(j.sessionPhase && j.sessionPhase.ts) || 0
@@ -970,7 +912,7 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
  * task into. The reporter stamps phases on REAL_WS (the project it actually runs in), not on whatever office
  * manually recorded as "opened project", so this judges by the newest activity, avoiding phases being
  * attributed to the old project when a new one is opened directly in the IDE (the main console would not match
- * the dropdown). Past the freshness window (AWAIT_TTL_MS) it counts as stale and falls back to the passed-in
+ * the dropdown). Past the freshness window (REPORTER_WS_FRESH_MS) it counts as stale and falls back to the passed-in
  * fallback (usually office's currently opened project).
  * @param {string} fallback fallback value
  * @returns {string}
@@ -989,7 +931,7 @@ function freshestReporterWs(fallback, client = '', session = '') {
     const sp = j.sessionPhase;
     const ts = (sp && sp.ts) || (j.taskId ? j.taskStartedAt || 0 : 0);
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
-    if (!ws || !ts || now - ts > AWAIT_TTL_MS) continue;
+    if (!ws || !ts || now - ts > REPORTER_WS_FRESH_MS) continue;
     // As above: only trust phases written after this process started, so residue from the previous run does
     // not decide "the current project"
     if (ts < SERVER_STARTED_AT) continue;
@@ -1490,7 +1432,6 @@ module.exports = {
   sessionFirstPrompts, // Fallback: each session's first-turn user words (taken from the tasks table, earliest turn)
   hasReporterState,
   reporterStateMeta,
-  hasOtherLiveSession,// Guard before demoting a member state: this session stopped, is another session of the same product still running (see the function note)
   readReporterDone,   // Done marker (including Codex's closing summary): CLI floors light "task done" from it
   readReporterDones,  // Same, but fetches every session under that (project, client) at once — for the session-table scan
   listReporterSessions, // Floors whose sessions can only come from hooks (5F TraeCode / 1F CodeBuddy CLI)

@@ -5,6 +5,7 @@ import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { isEphemeralMember } from '../lib/ephemeral';
 import { floorAcceptsClient, isBaseAgent } from '../lib/clientMatch';
+import { memberForSession, normalizeState } from '../lib/memberTask';
 import { useI18n } from '../i18n';
 
 const project = useProjectStore();
@@ -21,24 +22,25 @@ function isMainAgent(m) {
 }
 
 const sorted = computed(() => {
-  const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
+  const order = ['blocked', 'busy', 'idle'];
   // Same rule as the office: filter by the current floor's client (an empty client counts as generic)
   const want = sessions.selectedClient;
   // Recognize every floor's client: merged floors (1F CodeBuddy = CLI + Plugin) must include both variants,
   // and single floors (3F Codex, where CLI and IDE are merged) likewise.
   const allClients = (sessions.floors || []).map((f) => f.client);
   return project.members
-    // Workstation cards only show resident gremlins; ghosts summoned temporarily (subagent-xxx) do not take a slot in this list,
+    // Workstation cards only show resident gremlins; ghosts summoned temporarily (subagent-xxx) are not listed,
     // avoiding the misunderstanding of "a same-named gremlin appearing in the card list after a summon".
     .filter((m) => !isEphemeralMember(m))
     .filter((m) => floorAcceptsClient(want, m.client))
     .slice()
+    .map((m) => memberForSession(m, sessions.selectedSessionId, project.members))
     // The main agent card is always pinned first (the rest still follow phase order), no longer random
     .sort((a, b) => {
       const am = isMainAgent(a) ? 0 : 1;
       const bm = isMainAgent(b) ? 0 : 1;
       if (am !== bm) return am - bm;
-      return order.indexOf(a.state) - order.indexOf(b.state);
+      return order.indexOf(normalizeState(a.state)) - order.indexOf(normalizeState(b.state));
     });
 });
 
@@ -77,12 +79,10 @@ const mainAgentCard = computed(() => {
     name: base,
     role: 'agent',
     state: MAIN_STATE_OF_PHASE[phase] || 'idle',
-    // A phase derived from polling / on-disk probing is inferred (not a reported value), so mark it grey truthfully; without a session the state is unknown
-    degraded: !sel || Boolean(sel.inferred),
     stateSince: Date.now(),
-    lastSeenAt: Date.now(),
     reported: Boolean(sel && !sel.inferred),
-    task: null,
+    tasks: [],
+    sessionStatuses: [],
     artifacts: [],
     messageCount: 0,
   };
@@ -92,8 +92,20 @@ const mainAgentCard = computed(() => {
 <template>
   <div class="view">
     <div class="grid">
-      <WorkstationCard v-if="mainAgentCard" :key="mainAgentCard.memberId" :member="mainAgentCard" :members="project.members" />
-      <WorkstationCard v-for="m in sorted" :key="m.memberId" :member="m" :members="project.members" />
+      <WorkstationCard
+        v-if="mainAgentCard"
+        :key="mainAgentCard.memberId"
+        :member="mainAgentCard"
+        :members="project.members"
+        :session-id="sessions.selectedSessionId"
+      />
+      <WorkstationCard
+        v-for="m in sorted"
+        :key="m.memberId"
+        :member="m"
+        :members="project.members"
+        :session-id="sessions.selectedSessionId"
+      />
     </div>
 
     <p v-if="!mainAgentCard && !sorted.length" class="empty dim">{{ t('workstation.empty') }}</p>

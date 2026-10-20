@@ -9,14 +9,14 @@
  *   - no ground shadow (floats in the air); the scene layer draws a separate hovering halo
  *
  * The color is a soft hue hashed from memberId (stable per member across refreshes),
- * and the state is still expressed via expression + opacity: idle closes eyes, blocked frowns + a question mark, offline grayscale.
+ * and the state is still expressed via expression + opacity: idle closes eyes, blocked frowns + a question mark.
  */
 import { computed } from 'vue';
+import { normalizeState } from '../lib/memberTask';
 
 const props = defineProps({
   name: { type: String, required: true },
-  state: { type: String, default: 'offline' },
-  degraded: { type: Boolean, default: false },
+  state: { type: String, default: 'idle' },
 });
 
 /** Soft palette: avoids the saturated role colors of the expert team, so it does not "look like a certain expert" */
@@ -33,13 +33,13 @@ function hash(s) {
 
 const agentId = computed(() => props.name.split('@')[0]);
 const body = computed(() => PALETTE[hash(props.name) % PALETTE.length]);
-const isOffline = computed(() => props.state === 'offline');
+const normalizedState = computed(() => normalizeState(props.state));
 </script>
 
 <template>
   <g
     class="ghost"
-    :class="[`state-${state}`, { degraded, offline: isOffline }]"
+    :class="`state-${normalizedState}`"
     :style="{ '--body': body }"
     :data-agent="agentId"
   >
@@ -59,7 +59,7 @@ const isOffline = computed(() => props.state === 'offline');
 
       <!-- Eyes -->
       <g class="eyes">
-        <template v-if="state === 'idle'">
+        <template v-if="normalizedState === 'idle'">
           <path class="eye-closed" d="M22 31h8" />
           <path class="eye-closed" d="M34 31h8" />
         </template>
@@ -67,25 +67,25 @@ const isOffline = computed(() => props.state === 'offline');
           <ellipse class="eye" cx="26" cy="31" rx="3.4" ry="4.4" />
           <ellipse class="eye" cx="38" cy="31" rx="3.4" ry="4.4" />
         </template>
-        <template v-if="state === 'blocked'">
+        <template v-if="normalizedState === 'blocked'">
           <path class="brow" d="M21 25l8 4" />
           <path class="brow" d="M43 25l-8 4" />
         </template>
       </g>
 
       <!-- Mouth -->
-      <path v-if="state === 'blocked'" class="mouth" d="M27 41q5-3 10 0" />
-      <path v-else-if="state === 'idle'" class="mouth" d="M28 41q4 2 8 0" />
+      <path v-if="normalizedState === 'blocked'" class="mouth" d="M27 41q5-3 10 0" />
+      <path v-else-if="normalizedState === 'idle'" class="mouth" d="M28 41q4 2 8 0" />
       <path v-else class="mouth" d="M26 39q6 6 12 0" />
     </g>
 
     <!-- Blocked: question mark above the head -->
-    <g v-if="state === 'blocked'" class="mark">
+    <g v-if="normalizedState === 'blocked'" class="mark">
       <circle cx="50" cy="14" r="8.5" />
       <text x="50" y="18.5" text-anchor="middle">?</text>
     </g>
     <!-- Idle: Zzz -->
-    <g v-else-if="state === 'idle'" class="zzz">
+    <g v-else-if="normalizedState === 'idle'" class="zzz">
       <text x="48" y="18">Z</text>
       <text x="54" y="12">z</text>
     </g>
@@ -169,16 +169,6 @@ const isOffline = computed(() => props.state === 'offline');
 }
 .zzz {
   animation: float-up 2.6s ease-in-out infinite;
-}
-
-/* offline: grayscale + fainter */
-.offline {
-  opacity: 0.4;
-  filter: grayscale(1);
-}
-/* degraded: the value is inferred, not a reported true value */
-.degraded {
-  opacity: 0.6;
 }
 
 @keyframes sway {

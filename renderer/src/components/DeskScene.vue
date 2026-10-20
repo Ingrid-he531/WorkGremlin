@@ -14,39 +14,40 @@ import { computed } from 'vue';
 import AgentAvatar from './AgentAvatar.vue';
 import StatusBadge from './StatusBadge.vue';
 import { avatarOf, formatClock } from '@workgremlin/shared';
-import { currentTaskOf, currentTaskTitle, currentTaskStartedAt } from '../lib/memberTask';
+import { currentTaskTitle, currentTaskStartedAt, memberForSession, normalizeState } from '../lib/memberTask';
 import { useI18n } from '../i18n';
 
 const props = defineProps({
   member: { type: Object, required: true },
+  sessionId: { type: String, default: '' },
   selected: { type: Boolean, default: false },
 });
 const emit = defineEmits(['select']);
 
 const agentId = computed(() => props.member.memberId.split('@')[0]);
 const skin = computed(() => avatarOf(props.member.memberId));
-const state = computed(() => props.member.state);
+const scopedMember = computed(() => memberForSession(props.member, props.sessionId));
+const state = computed(() => normalizeState(scopedMember.value.state));
 const { t } = useI18n();
 
-// The "current task" definition is consistent with the other cards (see lib/memberTask.js): when idle, the entry in the slot is the **previous task**,
-// it must not stay on the screen impersonating the current task.
-const task = computed(() => currentTaskOf(props.member));
-const title = computed(() => currentTaskTitle(props.member) || t('card.idle'));
+// The current task is the running task supplied by the server; finished tasks remain history.
+const task = computed(() => scopedMember.value.task);
+const title = computed(() => currentTaskTitle(props.member, props.sessionId) || t('card.idle'));
 // The bar on the screen is **indeterminate** (it only crawls while working and does not represent completion) —— before 2026-09-29 it drew its length from
-// member.task.progress, but that field has no real values (across the whole DB there are only 0 and 1, 0 written at start and 1 written at finish,
+// task.progress, but that field has no real values (across the whole DB there are only 0 and 1, 0 written at start and 1 written at finish,
 // nobody advances it in between; see the note on the "progress" row in TaskRecordsView), so it always drew an empty or full bar.
 // Therefore here it only checks "working or not", with the same value as the main console (see PHASES.busy in iso/mainConsole.js).
 const running = computed(() => state.value === 'busy');
 const fileText = computed(() =>
-  props.member.currentFiles && props.member.currentFiles.length ? props.member.currentFiles[0] : t('card.no_file')
+  scopedMember.value.currentFiles && scopedMember.value.currentFiles.length ? scopedMember.value.currentFiles[0] : t('card.no_file')
 );
 /**
  * Both time points use an **absolute time** (MM-DD HH:mm): start = the start time of the current task, last active = the finish time of the previous task.
  * No "how long ago" relative duration —— that requires recomputing every second, and if recomputation breaks you get "some workstations frozen, others still climbing"
  * (measured by the user on 2026-09-30). A hardcoded time point needs no timer (the parent's now tick was removed along with it).
  */
-const startAt = computed(() => formatClock(currentTaskStartedAt(props.member) || props.member.stateSince));
-const lastActiveAt = computed(() => formatClock(props.member.lastTaskAt) || '—');
+const startAt = computed(() => formatClock(currentTaskStartedAt(props.member, props.sessionId) || scopedMember.value.stateSince));
+const lastActiveAt = computed(() => formatClock(scopedMember.value.lastTaskAt) || '—');
 
 /** animation phase 0~1.6s, hashed by member name: everyone's motion is not perfectly uniform */
 const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 16) / 10);
@@ -55,7 +56,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
 <template>
   <div
     class="desk-scene"
-    :class="[`state-${state}`, { selected, 'is-degraded': member.degraded }]"
+    :class="[`state-${state}`, { selected }]"
     :style="{ '--body': skin.body, '--horn': skin.horn, '--phase': `${phase}s` }"
     :data-testid="`desk-${agentId}`"
     @click="emit('select', member.memberId)"
@@ -86,7 +87,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
 
       <!-- ===== sprite: sandwiched between the chair and the desk ===== -->
       <div class="gremlin">
-        <AgentAvatar :name="member.memberId" :state="state" :degraded="member.degraded" :size="100" />
+        <AgentAvatar :name="member.memberId" :state="state" :size="100" />
       </div>
 
       <!-- ===== foreground: desk top / items on the desk / monitor ===== -->
@@ -174,7 +175,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
              The time points are all written as absolute times (no relative duration, avoiding per-second recomputation): start / last active. -->
         <div v-if="task" class="peek-row dim">{{ t('card.started', { time: startAt }) }}</div>
         <div v-else class="peek-row dim">{{ t('card.last_active', { time: lastActiveAt }) }}</div>
-        <div v-if="member.currentFiles.length" class="peek-row mono">{{ member.currentFiles.join(' , ') }}</div>
+        <div v-if="scopedMember.currentFiles && scopedMember.currentFiles.length" class="peek-row mono">{{ scopedMember.currentFiles.join(' , ') }}</div>
       </div>
     </div>
 
@@ -182,7 +183,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
     <div class="plate">
       <span class="p-name">{{ member.name }}</span>
       <span class="p-role dim">{{ member.role || '—' }}</span>
-      <StatusBadge :state="state" :degraded="member.degraded" :testid="`seat-status-${agentId}`" />
+      <StatusBadge :state="state" :testid="`seat-status-${agentId}`" />
       <!-- the small number on the name plate is also only meaningful while working (the start time of the current task) -->
       <span v-if="task" class="p-elapsed mono faint">{{ startAt }}</span>
     </div>
@@ -210,10 +211,6 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent-soft), 0 6px 18px rgba(0, 0, 0, 0.35);
 }
-.desk-scene.is-degraded {
-  border-style: dashed;
-}
-
 .stage {
   position: relative;
   width: 100%;
@@ -294,10 +291,6 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   animation: head-shake 2.4s ease-in-out infinite;
   animation-delay: var(--phase);
 }
-.state-offline .gremlin {
-  opacity: 0; /* person absent: the chair is empty */
-}
-
 /* ---------- foreground: desk ---------- */
 .desk-top {
   fill: #6d5540;
@@ -386,7 +379,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   opacity: 0;
 }
 .mon-led {
-  fill: var(--state-offline);
+  fill: var(--state-idle);
 }
 
 /* ---------- screen content ---------- */
@@ -415,7 +408,7 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: var(--state-offline);
+  background: var(--state-idle);
   flex: none;
 }
 .scr-title {
@@ -513,11 +506,6 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
 }
 
 /* ================= state presentation ================= */
-.state-online .scr-dot,
-.state-online .mon-led {
-  background: var(--state-online);
-  fill: var(--state-online);
-}
 .state-busy .scr-dot,
 .state-busy .mon-led {
   background: var(--state-busy);
@@ -554,19 +542,16 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   animation: led-blink 0.9s steps(1, end) infinite;
 }
 
-/* online / idle: coffee steams, plant sways gently */
-.state-online .steam path,
+/* idle: coffee steams, plant sways gently */
 .state-idle .steam path,
 .state-busy .steam path {
   animation: steam 3.2s ease-in-out infinite;
   animation-delay: var(--phase);
 }
-.state-online .steam path:nth-child(2),
 .state-idle .steam path:nth-child(2),
 .state-busy .steam path:nth-child(2) {
   animation-delay: calc(var(--phase) + 1.1s);
 }
-.state-online .leaves,
 .state-idle .leaves,
 .state-busy .leaves {
   animation: sway 4.5s ease-in-out infinite;
@@ -600,38 +585,11 @@ const phase = computed(() => (agentId.value.split('').reduce((a, c) => a + c.cha
   border-radius: 2px;
 }
 
-/* offline: person absent, lamp off, screen black, overall desaturated */
-.state-offline {
-  filter: saturate(0.45) brightness(0.85);
-}
-.state-offline .lamp-light {
-  opacity: 0;
-}
-.state-offline .screen-ui {
-  opacity: 0.25;
-}
-.state-offline .leaves ellipse {
-  fill: #5a6b57;
-}
-.state-offline .chair-inner {
-  fill: #373f4c;
-}
-
 /* the chair sways slightly while busy */
 .state-busy .chair {
   animation: rock 2.2s ease-in-out infinite;
   animation-delay: var(--phase);
   transform-origin: 100px 148px;
-}
-
-/* inferred value: a dashed line circles the workstation, hinting "this is not a reported true value" */
-.is-degraded .stage::after {
-  content: '';
-  position: absolute;
-  inset: 2px;
-  border: 1px dashed var(--text-faint);
-  border-radius: 8px;
-  pointer-events: none;
 }
 
 /* ================= keyframes ================= */

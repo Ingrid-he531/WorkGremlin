@@ -4,8 +4,8 @@
  *
  * 盯三件事：
  *   [1] Stop 事件派给 floorClaude 后，服务端**自己读 transcript** 取最后一句话当产出（result），
- *       并 endTask(done) + setStatus(idle) —— 证明"解析在服务器、不在 hook"。
- *   [2] UserPromptSubmit 派给 floorClaude 后，startTask(title) + setStatus(thinking)，本轮 taskId 入会话状态。
+ *       并 endTask(done) —— 证明"解析在服务器、不在 hook"。
+ *   [2] UserPromptSubmit 派给 floorClaude 后，startTask(title)，本轮 taskId 入会话状态。
  *   [3] 没有 handleHookEvent 的楼层（如 kilo，靠轮询）收到事件应被忽略，不清不掉任何东西。
  *
  * 跑法：`npm run test:hook-dispatch`（零依赖，假 bus + 合成 transcript）。
@@ -51,10 +51,10 @@ function ok(label, cond, extra = '') {
   const calls = [];
   const bus = {
     registerMember: (b) => { calls.push(['registerMember', b]); return b.memberId; },
-    setStatus: (b) => { calls.push(['setStatus', b]); return { ok: true }; },
+    setBlocked: (b) => { calls.push(['setBlocked', b]); return { ok: true }; },
+    clearBlocked: (b) => { calls.push(['clearBlocked', b]); return { ok: true }; },
     startTask: (b) => { calls.push(['startTask', b]); return { taskId: 't_generated' }; },
     endTask: (b) => { calls.push(['endTask', b]); return { ok: true }; },
-    heartbeat: (b) => { calls.push(['heartbeat', b]); return { ok: true }; },
     recordMessage: (b) => { calls.push(['recordMessage', b]); return { ok: true }; },
     currentTaskFor: () => null,
     projectForReport: (_project, workspacePath) => workspacePath || 'P',
@@ -62,7 +62,7 @@ function ok(label, cond, extra = '') {
   const ctx = { project: 'P', workspacePath: TMP, bus, repo: {} };
   const d = createHookDispatch();
 
-  // [2] UserPromptSubmit → 起任务 + 思考中（先跑，给后面 Stop 建好会话状态）
+  // [2] UserPromptSubmit → 起任务（先跑，给后面 Stop 建好会话状态）
   {
     calls.length = 0;
     const r = await d.dispatch(
@@ -70,10 +70,9 @@ function ok(label, cond, extra = '') {
       ctx
     );
     const start = calls.find((c) => c[0] === 'startTask');
-    const st = calls.find((c) => c[0] === 'setStatus');
     ok('[2] UserPromptSubmit 落到 startTask', !!start);
     ok('[2] 任务标题取用户原话', start && start[1].title === '帮我写个函数', start && start[1].title);
-    ok('[2] 成员状态 busy（"思考中"属于 busy，细分在相位）', st && st[1].state === 'busy');
+    ok('[2] 不额外写 blocked 状态行（忙碌由 running task 推导）', !calls.some((c) => c[0] === 'setBlocked'));
     ok('[2] 本轮 taskId 记入会话状态', d.sessionGet('11111111-1111-4111-8111-111111111111') && d.sessionGet('11111111-1111-4111-8111-111111111111').taskId === 't_generated');
     ok('[2] 返回 handled: UserPromptSubmit', r && r.handled === 'UserPromptSubmit');
   }
@@ -86,11 +85,10 @@ function ok(label, cond, extra = '') {
       ctx
     );
     const end = calls.find((c) => c[0] === 'endTask');
-    const st = calls.find((c) => c[0] === 'setStatus');
     ok('[1] Stop 落到 floorClaude.endTask', !!end, JSON.stringify(calls.map((c) => c[0])));
     ok('[1] 服务端读 transcript 把最后一句话当产出(result)', end && end[1].result === '好的，已写好 add 函数。', end && end[1].result);
     ok('[1] 状态收尾为 done', end && end[1].state === 'done');
-    ok('[1] 收尾相位 idle', st && st[1].state === 'idle' && st[1].taskId === null);
+    ok('[1] 收尾只清阻塞状态，不持久化 idle', calls.some((c) => c[0] === 'clearBlocked'));
     ok('[1] 返回 handled: Stop', r && r.handled === 'Stop');
   }
 

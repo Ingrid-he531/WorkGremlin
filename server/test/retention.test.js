@@ -47,7 +47,7 @@ repo.upsertProject.run({ id: 'p1', name: 'p1', workspacePath: '/tmp/p1', mainCon
 // tasks.member_id 是 NOT NULL：造个成员挂着（记录保留跟成员无关，只是表约束）
 repo.upsertMember.run({
   id: 'm@p1', projectId: 'p1', name: 'm', role: 'agent', sessionId: null, reported: 1,
-  createdAt: 1, lastSeenAt: 1, ephemeral: 0, projectLabel: null, client: 'claude-code',
+  createdAt: 1, ephemeral: 0, projectLabel: null, client: 'claude-code',
 });
 
 /** 一条任务记录，开始时刻 = now 往前 ageDays 天（清理按 started_at 比） */

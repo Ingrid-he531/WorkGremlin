@@ -209,8 +209,8 @@ async function main() {
   const fa = all("SELECT * FROM file_activity WHERE member_id LIKE 'kilo%'")
   ok('file_activity 记上了改过的文件', fa.length >= 1, JSON.stringify(fa))
   ok('文件路径正确', fa.some((x) => String(x.path).endsWith('a.ts')), JSON.stringify(fa))
-  const st = all("SELECT * FROM agent_status WHERE member_id LIKE 'kilo%'")[0]
-  ok('agent_status 有这只成员（收工后回落 idle）', Boolean(st) && st.state === 'idle', st && st.state)
+  const statusRows = all("SELECT * FROM agent_status WHERE member_id LIKE 'kilo%'")
+  ok('收工后 agent_status 不保留 idle 行', statusRows.length === 0, JSON.stringify(statusRows))
 
   console.log('\n[4] 7F 楼层在 /sessions 里能列出会话 + 相位')
   const snap = await get(`${base}/api/v1/sessions?refresh=1`, info.token)

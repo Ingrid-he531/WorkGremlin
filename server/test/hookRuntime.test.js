@@ -45,13 +45,13 @@ const calls = [];
 const bus = {
   projectForReport: () => 'P',
   registerMember: (b) => { calls.push(['registerMember', b]); return b.memberId; },
-  setStatus: (b) => { calls.push(['setStatus', b]); return { ok: true }; },
+  setBlocked: (b) => { calls.push(['setBlocked', b]); return { ok: true }; },
+  clearBlocked: (b) => { calls.push(['clearBlocked', b]); return { ok: true }; },
   startTask: (b) => { calls.push(['startTask', b]); return { taskId: 't_gen' }; },
   endTask: (b) => { calls.push(['endTask', b]); return { ok: true }; },
   toolUse: (b) => { calls.push(['toolUse', b]); return { ok: true }; },
   fileTouch: (b) => { calls.push(['fileTouch', b]); return { ok: true }; },
   taskProgress: (b) => { calls.push(['taskProgress', b]); return { ok: true }; },
-  heartbeat: (b) => { calls.push(['heartbeat', b]); return { ok: true }; },
   recordMessage: (b) => { calls.push(['recordMessage', b]); return { ok: true }; },
   backfillTaskTokens: (b) => { calls.push(['backfillTaskTokens', b]); return { ok: true }; },
   currentTaskFor: () => null,
@@ -72,7 +72,7 @@ const bus = {
   calls.length = 0;
   await d.dispatch(ev('SessionStart'), ctx);
   ok('SessionStart → registerMember', calls.some((c) => c[0] === 'registerMember'));
-  ok('SessionStart → idle', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'idle'));
+  ok('SessionStart → clearBlocked', calls.some((c) => c[0] === 'clearBlocked'));
 
   // UserPromptSubmit → 起任务
   calls.length = 0;
@@ -80,7 +80,7 @@ const bus = {
   const start = calls.find((c) => c[0] === 'startTask');
   ok('UserPromptSubmit → startTask', !!start, JSON.stringify(calls.map((c) => c[0])));
   ok('UserPromptSubmit → 标题取原话', start && start[1].title === '写个函数');
-  ok('UserPromptSubmit → busy', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'busy'));
+  ok('UserPromptSubmit 不写 blocked 状态行', !calls.some((c) => c[0] === 'setBlocked'));
 
   // PreToolUse: the Agent tool summons a subagent → record a ghost (busy) + toolUse
   calls.length = 0;
@@ -100,7 +100,7 @@ const bus = {
   ok('Stop → endTask', !!end);
   ok('Stop → 服务端读产出(result)', end && /已写好 add/.test(end[1].result || ''), end && end[1].result);
   ok('Stop → 状态 done', end && end[1].state === 'done');
-  ok('Stop → 收尾 idle', calls.some((c) => c[0] === 'setStatus' && c[1].state === 'idle'));
+  ok('Stop → clearBlocked', calls.some((c) => c[0] === 'clearBlocked'));
 
   // Summoned but not finished (orphan) → swept along with the next UserPromptSubmit
   calls.length = 0;
@@ -154,10 +154,10 @@ const bus = {
     ctx
   );
   const afterSubagentTool = JSON.stringify(d.sessionGet('s2') || {});
-  ok('子代理工具事件仍发心跳', calls.some((c) => c[0] === 'heartbeat'));
+  ok('子代理工具事件不发业务心跳', !calls.some((c) => c[0] === 'heartbeat'));
   ok(
     '子代理工具事件不刷新父任务相位或工具归因',
-    beforeSubagentTool === afterSubagentTool && !calls.some((c) => c[0] === 'toolUse' || c[0] === 'fileTouch' || c[0] === 'setStatus'),
+    beforeSubagentTool === afterSubagentTool && !calls.some((c) => c[0] === 'toolUse' || c[0] === 'fileTouch' || c[0] === 'setBlocked'),
     `${beforeSubagentTool} -> ${afterSubagentTool}`
   );
 

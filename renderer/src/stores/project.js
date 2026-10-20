@@ -3,6 +3,7 @@ import { getServerInfo, getWorkspace, openWorkspace, wsUrl, httpBase } from '../
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { memberBelongsToProject } from '../lib/projectScope';
+import { normalizeState } from '../lib/memberTask';
 
 /** Fallback reconcile interval: WS increment events (especially member.remove) are one-shot, so a missed one stays stale forever; this heals it */
 const RECONCILE_MS = 15_000;
@@ -41,10 +42,10 @@ export const useProjectStore = defineStore('project', {
     /** Counts aggregated by state (for the top overview) */
     stateCounts: (s) =>
       s.members.reduce((acc, m) => {
-        acc[m.state] = (acc[m.state] || 0) + 1;
+        const state = normalizeState(m.state);
+        acc[state] = (acc[state] || 0) + 1;
         return acc;
       }, {}),
-    degradedCount: (s) => s.members.filter((m) => m.degraded).length,
   },
 
   actions: {
@@ -81,14 +82,16 @@ export const useProjectStore = defineStore('project', {
         onState: (st) => {
           this.connection = st;
           // Subscribe once as soon as WS connects: registers filters and makes the server immediately
-          // return the current state, so there is no need to wait for the next push (roster heartbeat up to 15s) before seeing members/gremlins (HELLO also returns a snapshot; this is an explicit extra pull).
+          // return the current state, so there is no need to wait for the next incremental push
+          // before seeing members/gremlins (HELLO also returns a snapshot; this is an explicit extra pull).
           // Must be sent after HELLO —— the order is guaranteed by api/ws.js's open callback, and jumping ahead of HELLO gets kicked by the server as a bad token.
           if (st && st.state === 'open' && this._conn) this._conn.subscribe({});
         },
       });
 
       // Fallback reconcile: member.remove is a one-shot event, so after a missed one (WS jitter / window unfocused) that member
-      // hangs in the office forever (member.status heartbeats only update, never delete). Periodically pull a snapshot to realign everything, guaranteeing eventual consistency.
+      // hangs in the office forever (member.status updates never delete). Periodically pull a snapshot
+      // to realign everything, guaranteeing eventual consistency.
       this.stopReconcile();
       this._reconcileTimer = setInterval(() => this.reconcile(), RECONCILE_MS);
     },
@@ -155,7 +158,7 @@ export const useProjectStore = defineStore('project', {
     upsertMember(card) {
       if (!card) return;
       // Never accept a member card from another project: the WS subscription carries no project, so the server
-      // broadcasts every project's events here (the __demo__ heartbeat timeout sweep after leaving demo is one example), and letting one in makes it flash in the room and then vanish.
+      // may broadcast other projects' events here, and letting one in makes it flash in the room and then vanish.
       if (!memberBelongsToProject(card, this.projectId)) return;
       const idx = this.members.findIndex((m) => m.memberId === card.memberId);
       if (idx >= 0) this.members.splice(idx, 1, { ...this.members[idx], ...card });
@@ -209,7 +212,7 @@ export const useProjectStore = defineStore('project', {
 
     /**
      * Enter demo mode: switch to the "demo project" (POST /api/v1/workspace with an empty path → the server's openDemo).
-     * The server readies the demo data and starts the heartbeat pusher along the way (see server/src/index.js's syncDemo).
+     * The server readies the demo data and starts the demo task driver along the way (see server/src/index.js's syncDemo).
      *
      * Record "which project to return to on exit" first —— it must be captured **before switching away** (after switching into demo workspacePath is empty).
      */

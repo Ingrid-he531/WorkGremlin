@@ -166,7 +166,7 @@ export const useSessionStore = defineStore('sessions', {
     /**
      * Whether the selected session is worth treating as "live".
      * Only sessions in the **current project** that the **plugin still recognizes** (has a runtime) are live;
-     * sessions from another project / with only fossil data show everyone in the room as offline (no invented state).
+     * sessions from another project / with only fossil data show no active status (no invented state).
      * No session selected (empty dropdown) → leave the room's current display untouched.
      */
     live: (s) => {

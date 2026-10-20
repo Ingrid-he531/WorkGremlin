@@ -814,9 +814,29 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
   // Child rows never appear in the top-level session list. Sync them before the early return so a
   // directory containing only subagent rows (or a filtered parent) still gets its ghosts.
   module.exports.syncClineSubagents({ bus });
-  if (!sessions.length) return 0;
 
   const now = nowFn();
+  const reconcileSessionStatuses = () => {
+    if (typeof bus.pruneSessionStatuses !== 'function' || !repo.listMembersByClient) return;
+    const liveByProject = new Map();
+    for (const s of sessions) {
+      const projectId = projectIdOf(s);
+      if (!liveByProject.has(projectId)) liveByProject.set(projectId, []);
+      if (s.id) liveByProject.get(projectId).push(s.id);
+    }
+    for (const member of repo.listMembersByClient.all(CLIENT)) {
+      bus.pruneSessionStatuses({
+        project: member.project_id,
+        memberId: member.id,
+        sessionIds: liveByProject.get(member.project_id) || [],
+        ts: now,
+      });
+    }
+  };
+  if (!sessions.length) {
+    reconcileSessionStatuses();
+    return 0;
+  }
   let count = 0;
   const roundsOf = new Map();
   const runsOf = new Map();
@@ -824,20 +844,6 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
     roundsOf.set(s.id, module.exports.readClineRounds(s.id));
     runsOf.set(s.id, repo.taskRunsOfSession.all(s.id || ''));
   }
-  const isActiveOf = (s) => (roundsOf.get(s.id) || []).some((r) => r.outcome === 'running');
-
-  // One project writes one member status: pick the newest active session; otherwise the newest one.
-  const activeByProject = new Map();
-  const newestByProject = new Map();
-  for (const s of sessions) {
-    const pid = projectIdOf(s);
-    const prevNew = newestByProject.get(pid);
-    if (!prevNew || Number(s.lastEventAt || 0) > Number(prevNew.lastEventAt || 0)) newestByProject.set(pid, s);
-    if (!isActiveOf(s)) continue;
-    const prevAct = activeByProject.get(pid);
-    if (!prevAct || Number(s.lastEventAt || 0) > Number(prevAct.lastEventAt || 0)) activeByProject.set(pid, s);
-  }
-
   for (const s of sessions) {
     const projectPath = s.projectPath || '';
     const projectId = projectIdOf(s);
@@ -848,11 +854,7 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
     if (repo.getTaskRun.get(prefix)) repo.deleteTaskRun(prefix);
 
     const rounds = roundsOf.get(s.id) || [];
-    if (!rounds.length) {
-      // A session with no user turn is not a task, but a stale heartbeat must not linger.
-      bus.setSessionStatus({ project: projectId, memberId: CLIENT, sessionId: s.id, state: 'idle', taskId: null, ts: now });
-      continue;
-    }
+    if (!rounds.length) continue;
     bus.ensureProject(projectId, projectPath, null, 'report');
     const memberId = `cline@${projectId}`;
     const existing = repo.getMember.get(memberId);
@@ -864,17 +866,13 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
       sessionId: s.id || null,
       reported: existing ? existing.reported : 1,
       createdAt: existing ? existing.created_at : now,
-      lastSeenAt: now,
       ephemeral: 0,
       projectLabel: null,
       client: CLIENT,
     });
 
-    // One ledger row per turn (same rule as 8F OpenCode / 9F Copilot): the conversation carries the full
-    // history, so every user turn is written, not only the current one. `hbId` / `running` keep the last
-    // turn's row, which the heartbeat hangs on.
-    let hbId = '';
-    let running = false;
+    // One ledger row per turn: the conversation carries the full history, so every user turn is written.
+    // `running` records whether this session's latest turn is still running.
     for (const r of rounds) {
       const id = `${prefix}:${r.index}`;
       // The round's own outcome is authoritative: running | done | cancelled. A cancelled round has an
@@ -898,8 +896,6 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
         tokens: r.tokens,
         files: r.files,
       });
-      hbId = id;
-      running = !r.endedAt;
       count += 1;
     }
 
@@ -912,33 +908,9 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
       repo.deleteTaskRun(r.id);
     }
 
-    // Heartbeat: only the project's owner session writes it, pointing at the last turn's row.
-    const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
-    bus.setSessionStatus({
-      project: projectId,
-      memberId: CLIENT,
-      sessionId: s.id,
-      state: running ? 'busy' : 'idle',
-      taskId: running ? hbId : null,
-      ts: now,
-    });
-    if (owner === s) {
-      repo.upsertStatus.run({
-        memberId,
-        state: running ? 'busy' : 'idle',
-        stateSince: running ? rounds[rounds.length - 1].startedAt || now : now,
-        taskId: hbId,
-        progress: null,
-        // The changed-file list is unknown for Cline (see writeTurnRun) — never carry a guess here either.
-        currentFiles: null,
-        lastHeartbeatAt: now,
-        degraded: 0,
-        source: 'report',
-        updatedAt: now,
-      });
-    }
   }
 
+  reconcileSessionStatuses();
   return count;
 }
 
@@ -949,7 +921,7 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function clineHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter, table } = ctx;
+  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter, table } = ctx;
   for (const s of listClineSessions()) {
     // A **terminal** session (Cline stamped ended_at, or wrote a terminal status) is over: drop its
     // registry row right away instead of keeping it for the whole 60-minute window. The dropdown lists
@@ -964,7 +936,7 @@ function clineHandler(p, src, ctx) {
       table.delete(`${p.id}:${s.id}`);
       continue;
     }
-    if (!claim(p.id, s.id)) continue;
+    if (!claimSession(p.id, s.id)) continue;
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const ph = readClinePhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;

@@ -6,29 +6,29 @@
  *   - AgentAvatar: wrapped in an <svg viewBox="0 0 64 64"> and used as an avatar;
  *   - office scene: an outer <g transform="translate(x,y) scale(s)"> places it directly in the big scene, scalable / flippable left-right.
  *
- * State expression: busy taps hands, idle closes eyes with Zzz, blocked frowns + a red question mark, offline grayscale, degraded semi-transparent.
+ * State expression: busy taps hands, idle closes eyes with Zzz, blocked frowns + a red question mark.
  * When walking=true it switches to alternating little hops (walking) and hides the static shadow.
  */
 import { computed } from 'vue';
 import { avatarOf } from '@workgremlin/shared';
+import { normalizeState } from '../lib/memberTask';
 
 const props = defineProps({
   name: { type: String, required: true },
-  state: { type: String, default: 'offline' },
-  degraded: { type: Boolean, default: false },
+  state: { type: String, default: 'idle' },
   /** Walking: little hops + slight side-to-side sway */
   walking: { type: Boolean, default: false },
 });
 
 const agentId = computed(() => props.name.split('@')[0]);
 const skin = computed(() => avatarOf(props.name));
-const isOffline = computed(() => props.state === 'offline');
+const normalizedState = computed(() => normalizeState(props.state));
 </script>
 
 <template>
   <g
     class="gremlin"
-    :class="[`state-${state}`, { degraded, walking, offline: isOffline }]"
+    :class="[`state-${normalizedState}`, { walking }]"
     :style="{ '--body': skin.body, '--horn': skin.horn }"
     :data-agent="agentId"
   >
@@ -52,7 +52,7 @@ const isOffline = computed(() => props.state === 'offline');
 
       <!-- Eyes -->
       <g class="eyes">
-        <template v-if="state === 'idle'">
+        <template v-if="normalizedState === 'idle'">
           <path class="eye-closed" d="M23 30h7" />
           <path class="eye-closed" d="M34 30h7" />
         </template>
@@ -62,15 +62,15 @@ const isOffline = computed(() => props.state === 'offline');
           <circle class="pupil" cx="26" cy="31" r="1.5" />
           <circle class="pupil" cx="38" cy="31" r="1.5" />
         </template>
-        <template v-if="state === 'blocked'">
+        <template v-if="normalizedState === 'blocked'">
           <path class="brow" d="M21 25l8 3" />
           <path class="brow" d="M43 25l-8 3" />
         </template>
       </g>
 
       <!-- Mouth -->
-      <path v-if="state === 'blocked'" class="mouth" d="M27 41q5-3 10 0" />
-      <path v-else-if="state === 'idle'" class="mouth" d="M28 41q4 2 8 0" />
+      <path v-if="normalizedState === 'blocked'" class="mouth" d="M27 41q5-3 10 0" />
+      <path v-else-if="normalizedState === 'idle'" class="mouth" d="M28 41q4 2 8 0" />
       <path v-else class="mouth" d="M26 39q6 6 12 0" />
 
       <!-- Prop -->
@@ -109,12 +109,12 @@ const isOffline = computed(() => props.state === 'offline');
     </g>
 
     <!-- Blocked: question mark above the head -->
-    <g v-if="state === 'blocked'" class="mark">
+    <g v-if="normalizedState === 'blocked'" class="mark">
       <circle cx="49" cy="14" r="8.5" />
       <text x="49" y="18.5" text-anchor="middle">?</text>
     </g>
     <!-- Idle: Zzz -->
-    <g v-else-if="state === 'idle'" class="zzz">
+    <g v-else-if="normalizedState === 'idle'" class="zzz">
       <text x="47" y="18">Z</text>
       <text x="53" y="12">z</text>
     </g>
@@ -179,7 +179,7 @@ const isOffline = computed(() => props.state === 'offline');
 .state-busy .arm-r {
   animation: tap-r 0.5s ease-in-out infinite;
 }
-.state-online .creature {
+.state-idle .creature {
   animation: breathe 3s ease-in-out infinite;
 }
 
@@ -202,15 +202,6 @@ const isOffline = computed(() => props.state === 'offline');
 }
 .zzz {
   animation: float-up 2.6s ease-in-out infinite;
-}
-
-/* Offline: overall grayscale */
-.offline {
-  opacity: 0.45;
-}
-/* degraded: the value is inferred, not a reported true value */
-.degraded {
-  opacity: 0.66;
 }
 
 /* Walking: alternating little hops + a slight forward lean */

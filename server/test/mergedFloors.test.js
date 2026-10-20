@@ -326,10 +326,11 @@ head('[A4] 陈旧 jsonl 在，也不该让 hook 那一路的正在跑会话从 1
   ok('正在跑的 CLI 会话（hook 那一路）仍然在表里', Boolean(running), floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' '));
   ok('陈旧 jsonl 那条没被当成活会话列出来', !floor.sessions.some((s) => String(s.id).includes('old.jsonl')));
   // 顺带钉住一个实现细节：陈旧行**不登记**（不是"登记了但筛掉"）—— 登记进来的话，它会拿
-  // 会话 id 去 claim，同名 id 的活会话会在那一步被顶掉（jsonl 那一路排在 hook 之前）。
+  // Session-id dedup happens at registration; the live hook row would lose if the stale jsonl row claimed it
+  // first (the jsonl path runs before the hook path).
   // 上面那条"仍然在表里"才是这个 bug 的判据；这条防的是以后把过滤退回成"登记后再筛"。
   ok(
-    '陈旧 jsonl 连表都没进（不拿它去 claim 会话 id）',
+    'stale jsonl never enters the table (it cannot claim the session id)',
     ![...table.values()].some((s) => s.floor === '1F' && String(s.id).includes('old.jsonl')),
     [...table.values()].filter((s) => s.floor === '1F').map((s) => String(s.id)).join(' ')
   );

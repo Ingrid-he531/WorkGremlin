@@ -5,9 +5,7 @@ const { createDemoTicker } = require('../mock/generator');
 /**
  * The demo ticker starts and stops with "is the current project the demo project".
  *   - Entering the demo: first reconcile leftovers by roster criteria (purgeStragglers),
- *     then seed if needed, and finally start the ticker; without it, after 60s every member
- *     goes degraded from heartbeat timeout and the UI turns all gray — yet the demo is
- *     precisely meant to look "alive".
+ *     then seed if needed, and finally start the progress ticker for seeded running tasks.
  *   - Leaving the demo: stop the ticker instead of idling against the demo project
  *     (members of real projects are driven by hooks / the roster).
  */

@@ -20,11 +20,10 @@
   --accent: #4c8dff;
   --accent-soft: rgba(76, 141, 255, 0.14);
 
-  --state-online: #2ecc71;
+  --state-success: #2ecc71;
   --state-busy: #f5a623;
   --state-idle: #7f8c9b;
   --state-blocked: #ff5c5c;
-  --state-offline: #4a5160;
 
   --radius: 10px;
   --gap: 12px;

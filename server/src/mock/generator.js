@@ -12,13 +12,12 @@
  * Hard requirements (tester DEMO-01~07):
  *   - **Deterministic**: the same seed must produce exactly identical data (timestamps included),
  *     otherwise DOM snapshots go flaky;
- *   - cover 5 main states, with at least 1 degraded, 1 blocked, and 1 error-level message;
+ *   - cover all three workstation states (busy / idle / blocked) and include an error-level message;
  *   - message count >= 200.
  *
  * Time base: by default it is **anchored to the current time** (each event at a fixed relative
- * offset), otherwise "elapsed time" shows — and heartbeat timeouts never trigger degraded. When an
- * absolutely reproducible time is needed (DOM snapshot tests), set `WORKGREMLIN_DEMO_FIXED_TS=1`
- * to fall back to the fixed UTC base.
+ * offset), so relative activity labels remain useful. When an absolutely reproducible time is needed
+ * (DOM snapshot tests), set `WORKGREMLIN_DEMO_FIXED_TS=1` to use the fixed UTC base.
  */
 
 const { MESSAGE_TYPES } = require('@workgremlin/shared');
@@ -37,12 +36,12 @@ function makeRng(seed) {
 }
 
 const ROSTER = [
-  { name: 'leader', role: '任务拆解与派发', state: 'online', progress: null, reported: 1 },
+  { name: 'leader', role: '任务拆解与派发', state: 'idle', progress: null, reported: 1 },
   { name: 'researcher', role: '需求与技术调研', state: 'busy', progress: 0.62, reported: 1 },
   { name: 'coder', role: '编码实现', state: 'busy', progress: 0.38, reported: 1 },
   { name: 'tester', role: '测试与验收', state: 'idle', progress: null, reported: 1 },
   { name: 'reviewer', role: '代码评审', state: 'blocked', progress: 0.2, reported: 1 },
-  { name: 'ops', role: '构建与部署', state: 'offline', progress: null, reported: 0 }, // no reporter attached -> degraded
+  { name: 'ops', role: '构建与部署', state: 'idle', progress: null, reported: 0 },
 ];
 
 /**
@@ -57,7 +56,7 @@ const GUESTS = [
   { name: 'ghost-i18n', role: '临时项目 · 多语言文案', state: 'idle', progress: null, reported: 1 },
 ];
 
-/** Experts + temporary members: registration / heartbeat / tasks all follow this list */
+/** Experts + temporary members: registration and task seeding follow this list. */
 const ALL_MEMBERS = ROSTER.concat(GUESTS);
 
 /**
@@ -133,32 +132,17 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
   bus.ensureProject(project, workspacePath, 'demo-conversation', 'report');
 
   for (const r of ALL_MEMBERS) {
-    const memberId = bus.registerMember({ project, name: r.name, role: r.role });
-    const files = FILES[r.name] || [];
-    if (r.reported) {
-      bus.heartbeat({
-        project,
-        memberId,
-        state: r.state,
-        progress: r.progress,
-        files,
-        ts: t0 - Math.floor(rng() * 60_000),
-      });
-    } else {
-      // No reporter attached: the state row is flagged degraded, and the UI must gray it out and
-      // label it "inferred"
-      bus.heartbeat({ project, memberId, state: r.state, ts: t0 - 3 * 60_000 });
-      bus.raw && bus.raw;
-    }
+    bus.registerMember({ project, name: r.name, role: r.role, reported: r.reported });
   }
 
-  // Create one task for each busy member
-  let leaderTaskId = null;
+  // Running tasks create busy state. Blocked is an explicit state overlay on its running task.
+  let anchorTaskId = null;
   for (const r of ALL_MEMBERS) {
-    if (r.state !== 'busy') continue;
+    if (r.state === 'idle') continue;
     const started = bus.startTask({
       project,
       memberId: r.name,
+      sessionId: `demo:${r.name}`,
       title: TASK_TITLES[r.name],
       progress: r.progress,
       files: FILES[r.name] || [],
@@ -169,15 +153,16 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
         project,
         memberId: r.name,
         taskId: started.taskId,
+        sessionId: `demo:${r.name}`,
         progress: r.progress,
         ts: t0 - Math.floor(rng() * 300_000),
       });
-      if (r.name === 'leader') leaderTaskId = started.taskId;
+      if (!anchorTaskId) anchorTaskId = started.taskId;
     }
   }
 
-  // Attach a few subagents to the leader's round, to demo "multiple subagent calls → click to see one"
-  if (leaderTaskId) {
+  // Attach a few completed subagent calls to a running parent task.
+  if (anchorTaskId) {
     const subs = [
       { name: 'researcher', title: '调研 .codebuddy/projects 数据格式', result: '产出调研报告一份，字段与 schema 对齐', model: 'claude-opus-4' },
       { name: 'coder', title: '实现工位视图与对话记录窗口', result: '落地 WorkstationCard.vue 与列表渲染', model: 'claude-sonnet-4' },
@@ -188,8 +173,8 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
         project,
         memberId: `subagent-${s.name}@${project}`,
         name: s.name,
-        parentTaskId: leaderTaskId,
-        taskId: leaderTaskId,
+        parentTaskId: anchorTaskId,
+        taskId: anchorTaskId,
         title: s.title,
         model: s.model,
         client: 'codebuddy',
@@ -208,10 +193,10 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
   }
 
   // Write an extra reason line for the blocked member
-  bus.setStatus({
+  bus.setBlocked({
     project,
     memberId: 'reviewer',
-    state: 'blocked',
+    sessionId: 'demo:reviewer',
     reason: '等待 FTS 分词器决策（trigram vs unicode61）',
     ts: t0 - 120_000,
   });
@@ -249,29 +234,21 @@ function seedDemoData({ bus, seed = 1, project = config.DEMO_PROJECT, workspaceP
     source: 'report',
   });
 
-  // ops is the "no reporter attached" member: mark its state degraded (simulating heartbeat timeout)
-  bus.sweepDegraded && bus.sweepDegraded();
   return { project, seed, members: ALL_MEMBERS.length, messages: count + 1, baseTs: t0 };
 }
 
 /**
- * Demo heartbeat ticker: keeps the demo team "alive".
- *
- * Seeding heartbeats only once would leave every member marked degraded after 60s of timeout and
- * the UI would go all gray —— you cannot watch state flow while debugging the visualization. So in
- * demo mode, at a fixed interval:
- *   - Members with a reporter attached: refresh the heartbeat (stay degraded-free) and slowly push
- *     progress forward;
- *   - Members without one (ops): **deliberately not refreshed**, to keep demonstrating grayed-out
- *     degraded state.
+ * Demo progress ticker: advances the running tasks of members whose seeded state is busy.
+ * It writes task progress only; workstation state stays derived from persisted tasks and explicit
+ * session events, with no heartbeat or liveness refresh.
  *
  * @param {{bus: any, repo?: any, project?: string, intervalMs?: number, seed?: number}} opts
  */
 function createDemoTicker({ bus, repo, project = config.DEMO_PROJECT, intervalMs = 5_000, seed = 1 }) {
   const rng = makeRng((Number(seed) || 1) ^ 0x9e3779b9);
-  const reported = ALL_MEMBERS.filter((r) => r.reported);
+  const active = ALL_MEMBERS.filter((r) => r.state === 'busy');
   const progress = new Map(
-    ALL_MEMBERS.filter((r) => Number.isFinite(r.progress)).map((r) => [r.name, r.progress])
+    active.filter((r) => Number.isFinite(r.progress)).map((r) => [r.name, r.progress])
   );
   let timer = null;
 
@@ -284,21 +261,19 @@ function createDemoTicker({ bus, repo, project = config.DEMO_PROJECT, intervalMs
   }
 
   function tick() {
-    for (const r of reported) {
+    for (const r of active) {
       const ts = Date.now();
       const memberId = `${r.name}@${project}`;
       const cur = progress.get(r.name);
 
-      if (r.state === 'busy' && cur != null) {
+      if (cur != null && cur < 0.99) {
         const next = Math.min(0.99, cur + rng() * 0.012);
         progress.set(r.name, next);
         const taskId = runningTaskId(memberId);
         if (taskId) {
           bus.taskProgress({ project, memberId: r.name, taskId, progress: next, files: FILES[r.name] || [], ts });
-          continue;
         }
       }
-      bus.heartbeat({ project, memberId: r.name, state: r.state, files: FILES[r.name] || [], ts });
     }
   }
 

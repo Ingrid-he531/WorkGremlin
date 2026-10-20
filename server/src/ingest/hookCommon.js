@@ -959,49 +959,12 @@ async function runHookEvent(ev, ctx, floorImpl) {
   // (some products' hook events carry no transcript_path, so it has to be reverse-derived from sessionId+workspacePath).
   const tp = () => String(impl.transcriptPathOf(ev, get(), sessionId, workspacePath) || get().transcriptPath || '');
 
-  /**
-   * The in-flight taskId of this round, self-healing when the in-memory state lost it (a server
-   * restart, or a compaction handled before the SessionStart fix below).
-   *
-   * Why it matters: `bus.setStatus` writes this value into `session_status.task_id`, and that
-   * column is what `/task-runs` uses to decide whether a `running` task is still alive
-   * (taskAliveSql: `ss.task_id = t.id`). Reporting null there makes a live task show up as
-   * "cancelled" even though it is still working.
-   *
-   * The ledger is the authority; when memory is empty, fish the round back out of it and remember
-   * it (memory + state file), so the rest of the round keeps its tool attribution too.
-   * Only used for active states: recovering the id while reporting idle would re-attach a stale
-   * ledger row and make a dead task look alive.
-   * @returns {string|null}
-   */
-  function taskIdOf() {
-    const known = String(get().taskId || '');
-    if (known) return known;
-    let cur = null;
-    try {
-      cur = typeof bus.currentTaskFor === 'function' ? bus.currentTaskFor(stableProject, memberId, sessionId) : null;
-    } catch {
-      cur = null; // a read failure must not break the report
-    }
-    const id = String((cur && cur.taskId) || '');
-    if (!id) return null;
-    set({
-      taskId: id,
-      taskWorkspacePath: get().taskWorkspacePath || workspacePath,
-      taskStartedAt: Number(cur.startedAt) || 0,
-      ...(cur.title ? { taskTitle: cur.title } : {}),
-    });
-    return id;
-  }
-
-  const status = (state, reason) =>
-    bus.setStatus({
+  const setBlocked = (reason) =>
+    bus.setBlocked({
       ...base,
-      state,
-      taskId: state === 'busy' || state === 'blocked' ? taskIdOf() : get().taskId || null,
       ...(reason ? { reason } : {}),
     });
-  const beat = () => bus.heartbeat({ ...base, memberId });
+  const clearBlocked = () => bus.clearBlocked({ ...base });
   // The main agent's floor identity is put into client: memberId's base name (= ev.agent) and client are both the product base name,
   // unified with static gremlins / ghosts under the convention "client = the floor (product base name), memberId only as primary key".
   const register = () => bus.registerMember({ ...base, name: memberId, role: 'agent', client });
@@ -1091,8 +1054,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         cancelled: true,
       },
     });
-    await beat();
-    await status('idle');
+    await clearBlocked();
   }
 
   if (event === 'SessionStart') {
@@ -1104,14 +1066,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
      * auto-compacted, and that happens **in the middle of a running turn** (measured 2026-10-19,
      * 3F Codex: 20+ compactions inside one 25-minute task). The reset below is for a genuinely new
      * session; applied to a compaction it wiped taskId / taskStartedAt from the state file and
-     * pushed the session to idle, so `session_status.task_id` became NULL while the task row was
-     * still `running`. `/task-runs` judges liveness by `ss.task_id = t.id` (see taskAliveSql in
-     * http/routes/query.js), found nothing to match, and normalized the still-running task to
-     * "cancelled" —— exactly the "it says cancelled but it is still running" report. It also lost
-     * the round's tool attribution, since later events no longer knew the taskId.
+     * pushed the session to idle and lost the round's tool attribution. A compaction must keep the
+     * existing running task intact because task liveness comes only from `tasks.state`.
      *
-     * Keep the round intact: just refresh the heartbeat and stay busy. When no round is in flight
-     * (a compaction with nothing running), fall through to the normal reset.
+     * Keep the round intact and stay busy. When no round is in flight, fall through to the normal reset.
      */
     if (String((ev && ev.source) || '').toLowerCase() === 'compact') {
       const cur = st.taskId
@@ -1131,8 +1089,6 @@ async function runHookEvent(ev, ctx, floorImpl) {
         }
         set({ sessionEndedAt: null, sessionWorkspacePath: workspacePath });
         await register();
-        await beat();
-        await status('busy');
         return { ok: true, handled: event, kept: 'compact' };
       }
     }
@@ -1156,12 +1112,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
       }
       set(patch);
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-      await status('busy');
       return { ok: true, handled: event };
     }
     await register();
-    await beat();
-    await status('idle');
+    await clearBlocked();
     return { ok: true, handled: event };
   }
 
@@ -1210,7 +1164,6 @@ async function runHookEvent(ev, ctx, floorImpl) {
       set(patch);
       await backfillPrevTokens(prevDone, tp());
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-      await status('busy');
       return { ok: true, handled: event, continued: true };
     }
     if (fromSubagent) {
@@ -1240,7 +1193,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     set(patch);
     await backfillPrevTokens(prevDone, tp());
     set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-    await status('busy');
+    await clearBlocked();
     if (process.env.WORKGREMLIN_HOOK_MESSAGES === '1') {
       await bus.recordMessage({
         project,
@@ -1257,7 +1210,6 @@ async function runHookEvent(ev, ctx, floorImpl) {
   }
 
   if (event === 'PreToolUse' || event === 'PostToolUse') {
-    await beat();
     // The tool name field in the hook event may be tool_name (native upstream) or tool (mapped by some reporting layers)
     const toolName = ev.tool_name || ev.tool || '';
     if (event === 'PreToolUse') {
@@ -1304,7 +1256,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         if (tool && toolTaskId) {
           await bus.toolUse({ ...base, taskId: toolTaskId, tool });
         }
-        await status('busy');
+        await clearBlocked();
       }
     } else {
       const launch = isSubagentTool(toolName) && typeof impl.subagentLaunchOf === 'function'
@@ -1346,7 +1298,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         else finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
       }
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
-      await status('busy');
+      await clearBlocked();
     }
     return { ok: true, handled: event };
   }
@@ -1354,7 +1306,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
   if (event === 'Notification') {
     if (ev.notification_type === 'idle_prompt') {
       set({ await: null, pending: null, sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath } });
-      await status('idle');
+      await clearBlocked();
     } else if (impl.awaitingPermission && !impl.awaitingPermission(ev)) {
       return { ok: true, ignored: event }; // non-permission types (such as Claude's auth_success) don't touch state
     } else {
@@ -1365,7 +1317,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
         await: { tool, file: ff, ts: Date.now(), workspacePath },
         sessionPhase: { phase: 'await', tool, file: ff, ts: Date.now(), workspacePath },
       });
-      await status('blocked', 'awaiting_permission');
+      await setBlocked('awaiting_permission');
     }
     return { ok: true, handled: event };
   }
@@ -1378,7 +1330,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
       await: { tool, file: ff, ts: Date.now(), workspacePath },
       sessionPhase: { phase: 'await', tool, file: ff, ts: Date.now(), workspacePath },
     });
-    await status('blocked', 'awaiting_permission');
+    await setBlocked('awaiting_permission');
     return { ok: true, handled: event };
   }
 
@@ -1408,7 +1360,6 @@ async function runHookEvent(ev, ctx, floorImpl) {
       sessionId,
       { agentId, background: launch ? launch.background : undefined }
     );
-    await beat();
     return { ok: true, handled: event };
   }
 
@@ -1417,7 +1368,6 @@ async function runHookEvent(ev, ctx, floorImpl) {
     : Boolean(impl.subagentStopMatchesSpawn);
   if (event === 'SubagentStop' && subagentStopMatchesSpawn) {
     finishGhostServer(bus, stableProject, sessionId, get(), { ...ev, last_assistant_message: ev.last_assistant_message }, client, set);
-    await beat();
     return { ok: true, handled: event };
   }
 
@@ -1487,8 +1437,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
             ...(cancelledRound ? { cancelled: true } : {}),
           },
     });
-    await beat();
-    await status('idle');
+    await clearBlocked();
     await reportReplies(ctx, memberId, taskId, replies, sessionId, client);
     return { ok: true, handled: event };
   }
@@ -1522,6 +1471,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
           files: [],
           fileCount: 0,
           form: qFormEnd,
+          sessionId,
         });
       }
     }
@@ -1533,7 +1483,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     });
     sweepGhosts(bus, stableProject, client, { all: true }, sessionId, get());
     set({ taskId: null, taskWorkspacePath: '', taskStartedAt: 0, subagents: [] });
-    await status('offline');
+    await clearBlocked();
     return { ok: true, handled: event };
   }
 

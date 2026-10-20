@@ -8,6 +8,7 @@
  */
 
 import { hash, roundRectPath } from './iso';
+import { normalizeState } from '../lib/memberTask';
 
 export const SPRITE_UNITS = 70;
 
@@ -45,33 +46,20 @@ const FONT = '12px ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Noto
 /**
  * @param {CanvasRenderingContext2D} ctx
  * @param {{x:number,y:number,s:number,color:string,state:string,facing?:number,
- *          walking?:boolean,phase?:number,sitting?:boolean,degraded?:boolean,alpha?:number}} o
+ *          walking?:boolean,phase?:number,sitting?:boolean,alpha?:number}} o
  */
 export function drawGremlin(ctx, o) {
   const {
-    x, y, s, color, state = 'online',
+    x, y, s, color, state = 'idle',
     facing = 1, walking = false, phase = 0,
-    sitting = false, degraded = false, alpha = 1, level,
+    sitting = false, alpha = 1, level,
   } = o;
 
   ctx.save();
   ctx.translate(x, y);
   ctx.scale(s * facing, s);
   if (alpha !== 1) ctx.globalAlpha *= alpha;
-  if (state === 'offline') {
-    // Offline: fade the whole sprite and add a dashed ring at the feet so it does not blend into the dark background
-    ctx.globalAlpha *= 0.5;
-    ctx.save();
-    ctx.strokeStyle = '#9aa7b8';
-    ctx.setLineDash([5, 4]);
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.ellipse(0, 2, 18, 9, 0, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-  } else if (degraded) {
-    ctx.filter = 'grayscale(0.85)';
-  }
+  const normalizedState = normalizeState(state);
 
   const bounce = walking ? Math.abs(Math.sin(phase * 2)) * 2.2 : 0;
   const sink = sitting ? 5 : 0; // Sitting: sink down a little overall
@@ -144,7 +132,7 @@ export function drawGremlin(ctx, o) {
   ctx.fillStyle = dark;
   ctx.fill();
 
-  drawFace(ctx, headY, state);
+  drawFace(ctx, headY, normalizedState);
 
   // Prop in hand
   ctx.save();
@@ -167,7 +155,7 @@ export function drawGremlin(ctx, o) {
 
 export function drawGhost(ctx, o) {
   const {
-    x, y, s, color, state = 'online',
+    x, y, s, color, state = 'idle',
     facing = 1, phase = 0, alpha = 0.72,
   } = o;
 
@@ -175,7 +163,7 @@ export function drawGhost(ctx, o) {
   ctx.translate(x, y);
   ctx.scale(s * facing, s);
   ctx.globalAlpha *= alpha;
-  if (state === 'offline') ctx.filter = 'grayscale(0.8)';
+  const normalizedState = normalizeState(state);
 
   const bob = Math.sin(phase) * 2; // Float: bob up and down overall
   ctx.translate(0, bob);
@@ -211,7 +199,7 @@ export function drawGhost(ctx, o) {
   ctx.fillStyle = 'rgba(255,255,255,0.22)';
   ctx.fill();
 
-  drawFace(ctx, headY, state, true);
+  drawFace(ctx, headY, normalizedState, true);
 
   // Antenna (remote access)
   ctx.strokeStyle = light;
@@ -336,17 +324,8 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.fillStyle = '#ff5c5c';
     ctx.font = 'bold 15px ui-sans-serif, sans-serif';
     ctx.fillText('!', -2, headY - 20);
-  } else if (state === 'offline') {
-    // Offline: a single horizontal line
-    ctx.beginPath();
-    ctx.moveTo(-eyeX - 3, eyeY);
-    ctx.lineTo(-eyeX + 3, eyeY);
-    ctx.moveTo(eyeX - 3, eyeY);
-    ctx.lineTo(eyeX + 3, eyeY);
-    ctx.lineWidth = 1.8;
-    ctx.stroke();
   } else {
-    // online: bright eyes + highlight
+    // Fallback: bright eyes + highlight
     ctx.beginPath();
     ctx.ellipse(-eyeX, eyeY, 3.2, 4, 0, 0, Math.PI * 2);
     ctx.ellipse(eyeX, eyeY, 3.2, 4, 0, 0, Math.PI * 2);
@@ -358,15 +337,12 @@ function drawFace(ctx, headY, state, ghost = false) {
     ctx.fill();
   }
 
-  // Mouth (except offline)
-  if (state !== 'offline') {
-    ctx.strokeStyle = '#1b2029';
-    ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    if (state === 'blocked') ctx.arc(0, headY + 12, 3.5, Math.PI * 1.15, Math.PI * 1.85);
-    else ctx.arc(0, headY + 7, 4, Math.PI * 0.15, Math.PI * 0.85);
-    ctx.stroke();
-  }
+  ctx.strokeStyle = '#1b2029';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  if (state === 'blocked') ctx.arc(0, headY + 12, 3.5, Math.PI * 1.15, Math.PI * 1.85);
+  else ctx.arc(0, headY + 7, 4, Math.PI * 0.15, Math.PI * 0.85);
+  ctx.stroke();
   ctx.restore();
 }
 

@@ -1,23 +1,21 @@
 /**
  * The "current task" definition shared by the workstation card / office gremlins.
  *
- * Why it's needed: `agent_status.task_id` isn't cleared when work finishes —— after a member goes idle, that slot often still points at
- * **the previous task that already finished**. Displaying it straight gives "clearly idle, yet a current task hangs on screen and the elapsed time keeps ticking"
- * (caught by real user testing: the main agent is idle, yet the card still shows the previous task's title + an ever-increasing elapsed time).
- *
- * So "current task" = the task hasn't finished (no endedAt) **and** the member is actually working (busy / blocked).
- * idle / online / offline all count as idle —— what should be shown there is "how long ago the previous task was" (lastTaskAt).
+ * The server sends every running task for a member, each tagged with its session. The UI
+ * chooses one using the selected session. Task liveness is tasks.state, not a heartbeat.
  */
 // Write /index.js explicitly: renderer/test node scripts import this file directly, and Node won't add the extension
 import { t } from '../i18n/index.js';
 import { isEphemeralMember } from './ephemeral.js';
 
-/**
- * Phases counted as working: consistent with the main console's "is it running" definition (see PHASES.busy in iso/mainConsole.js).
- * Note there is **no** `thinking` in member state —— "thinking / waiting for the model" counts as `busy` (see AGENT_STATES in shared);
- * the main console's "thinking vs calling a tool" is a matter of the **phase** axis, not member state.
- */
-export const WORKING_STATES = ['busy', 'blocked'];
+/** Workstation states are busy / idle / blocked. Unknown values normalize to idle. */
+export const WORKING_STATES = ['busy'];
+
+export function normalizeState(state) {
+  if (state === 'blocked') return 'blocked';
+  if (state === 'busy') return 'busy';
+  return 'idle';
+}
 
 /** Whether this member is working right now */
 export function isWorking(member) {
@@ -26,75 +24,126 @@ export function isWorking(member) {
 
 /**
  * Three levels of status-label text: blocked / busy / idle.
- * blocked → blocked (waiting on an external dependency); busy → busy; the rest (idle / online / offline / unreported) → idle.
- * The 5 fine-grained states still aren't shown one by one (the user kept only idle/busy on 2026-09-30), but blocked gets its own level ——
- * the information it carries ("stuck, waiting on whom") is not the same as busy (see requirements §5.6).
+ * blocked -> blocked (waiting on an external dependency); busy -> busy; everything else -> idle.
  */
 export function statusLabel(state) {
-  if (state === 'blocked') return t('card.status.blocked');
-  return WORKING_STATES.includes(state) ? t('card.status.busy') : t('card.status.idle');
+  const normalized = normalizeState(state);
+  if (normalized === 'blocked') return t('card.status.blocked');
+  return normalized === 'busy' ? t('card.status.busy') : t('card.status.idle');
 }
 
 /** The status label's tone (that little dot): same source as the text, to avoid contradictions like "green dot + idle" */
 export function statusTone(state) {
-  if (state === 'blocked') return 'blocked';
-  return WORKING_STATES.includes(state) ? 'busy' : 'idle';
+  return normalizeState(state);
 }
 
 /**
- * The current task; null when there is none.
- * A ghost's (temporary summon's) task may be a string from the checklist (`--task`), supported too.
- * @returns {{ title?: string, startedAt?: number }|string|null}
+ * Running tasks that belong to the requested session.
+ * No session id means "use the newest running task" (demo / a floor without an active session).
  */
-export function currentTaskOf(member) {
-  const t = member && member.task;
-  if (!t || !isWorking(member)) return null;
-  if (typeof t === 'string') return t;
-  return t.endedAt ? null : t;
+export function currentTaskOf(member, sessionId = '') {
+  const tasks = member && Array.isArray(member.tasks) ? member.tasks : [];
+  const sid = String(sessionId || '');
+  return tasks.find((task) => {
+    if (!task || task.endedAt) return false;
+    if (!sid) return true;
+    const taskSession = String(task.sessionId || (isEphemeralMember(member) ? member.sessionId || '' : ''));
+    return taskSession === sid;
+  }) || null;
 }
 
 /** The current task's title text; empty string when there is none (the caller decides whether to show "idle" or something else) */
-export function currentTaskTitle(member) {
-  const t = currentTaskOf(member);
+export function currentTaskTitle(member, sessionId = '') {
+  const t = currentTaskOf(member, sessionId);
   if (!t) return '';
-  return typeof t === 'string' ? t : String(t.title || '');
+  return String(t.title || '');
 }
 
 /** The current task's start time; 0 when unavailable (the caller falls back to stateSince, nothing fabricated) */
-export function currentTaskStartedAt(member) {
-  const t = currentTaskOf(member);
-  return t && typeof t === 'object' ? Number(t.startedAt) || 0 : 0;
+export function currentTaskStartedAt(member, sessionId = '') {
+  const t = currentTaskOf(member, sessionId);
+  return Number(t && t.startedAt) || 0;
 }
 
 /**
- * "Effective current task": when a resident gremlin has no running task in its own slot but is **being summoned** (a ghost of the same name is running),
- * borrow that ghost's task —— the same definition as the office tooltip (see IsoOfficeView's mtipTask).
- *
- * Why it's needed: the instance summoned out to work is the `subagent-<name>` ghost, the task hangs on it; the resident gremlin's
- * slot has no task. Looking only at the member's own task, the workstation card would show "status busy, current task: idle".
- * @param {object} member a resident member (or any member)
- * @param {Array} allMembers every member of the same project (including ghosts)
- * @returns {object|string|null}
+ * Borrowed summon task for a resident gremlin. The server records borrowed busy in agentState;
+ * the task itself lives on the same-named ephemeral member.
  */
-export function summonTaskOf(member, allMembers) {
-  if (!member || !isWorking(member)) return null;
-  const own = currentTaskOf(member);
-  if (own) return own;
-  const g = (Array.isArray(allMembers) ? allMembers : []).find(
-    (x) => isEphemeralMember(x) && x.name === member.name && currentTaskOf(x)
+export function summonTaskOf(member, allMembers, sessionId = '') {
+  if (!member || member.ephemeral || normalizeState(member.agentState) !== 'busy') return null;
+  const sid = String(sessionId || '');
+  const ghost = (Array.isArray(allMembers) ? allMembers : []).find((candidate) => {
+    if (!candidate || !isEphemeralMember(candidate) || candidate.name !== member.name) return false;
+    if (sid && candidate.sessionId && String(candidate.sessionId) !== sid) return false;
+    return Boolean(currentTaskOf(candidate, sid));
+  });
+  return ghost ? currentTaskOf(ghost, sid) : null;
+}
+
+/**
+ * Resolve a member card against one selected session.
+ *
+ * This is the single renderer-side state rule:
+ *   blocked (same session) > running task (same session) > borrowed summon busy > idle.
+ * A resident gremlin stays visible across sessions, but its dynamic state never leaks between them.
+ */
+export function memberForSession(member, sessionId = '', allMembers = []) {
+  if (!member) return null;
+  const sid = String(sessionId || '');
+  const own = currentTaskOf(member, sid);
+  const borrowed = own ? null : summonTaskOf(member, allMembers, sid);
+  const task = own || borrowed;
+  const lastBySession = Array.isArray(member.lastTaskAtBySession) ? member.lastTaskAtBySession : [];
+  const selectedLast = sid
+    ? lastBySession.find((row) => row && String(row.sessionId || '') === sid)
+    : null;
+
+  if (!sid) {
+    return {
+      ...member,
+      task,
+      currentFiles: task && Array.isArray(task.files) ? task.files : member.currentFiles || [],
+    };
+  }
+
+  const blocked = (Array.isArray(member.sessionStatuses) ? member.sessionStatuses : []).find(
+    (row) => row && String(row.sessionId || '') === sid && row.state === 'blocked'
   );
-  return g ? currentTaskOf(g) : null;
+  let state = 'idle';
+  let stateSince = Number(member.createdAt) || Number(member.stateSince) || Date.now();
+  if (blocked) {
+    state = 'blocked';
+    stateSince = Number(blocked.stateSince) || stateSince;
+  } else if (task) {
+    state = 'busy';
+    stateSince = Number(task.startedAt) || stateSince;
+  }
+
+  return {
+    ...member,
+    state,
+    stateSince,
+    task,
+    currentFiles: task && Array.isArray(task.files) ? task.files : [],
+    lastTaskAt: selectedLast ? selectedLast.at : null,
+  };
 }
 
-/** The "effective current task" title; empty string when there is none (the caller shows "idle") */
-export function summonTaskTitle(member, allMembers) {
-  const task = summonTaskOf(member, allMembers);
-  if (!task) return '';
-  return typeof task === 'string' ? task : String(task.title || '');
+/** The effective current task, including a same-session summon borrowed by a resident gremlin. */
+export function summonTaskOfMember(member, allMembers, sessionId = '') {
+  const own = currentTaskOf(member, sessionId);
+  if (own) return own;
+  return summonTaskOf(member, allMembers, sessionId);
 }
 
-/** The "effective current task" start time; 0 when unavailable */
-export function summonTaskStartedAt(member, allMembers) {
-  const task = summonTaskOf(member, allMembers);
-  return task && typeof task === 'object' ? Number(task.startedAt) || 0 : 0;
+/** The effective current task's title. */
+export function summonTaskTitle(member, allMembers, sessionId = '') {
+  const task = summonTaskOfMember(member, allMembers, sessionId);
+  return task ? String(task.title || '') : '';
+}
+
+/** The effective current task's start time; 0 when unavailable. */
+export function summonTaskStartedAt(member, allMembers, sessionId = '') {
+  const task = summonTaskOfMember(member, allMembers, sessionId);
+  return Number(task && task.startedAt) || 0;
 }

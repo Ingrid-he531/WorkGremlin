@@ -83,7 +83,6 @@ async function selfTest() {
     sessionId: null,
     reported: 1,
     createdAt: 1,
-    lastSeenAt: 1,
     ephemeral: 0,
     // Columns were renamed: the old schema's project is now project_label, and a client column was
     // added. The self-test fills them in per bus.js's reporting criteria, otherwise better-sqlite3

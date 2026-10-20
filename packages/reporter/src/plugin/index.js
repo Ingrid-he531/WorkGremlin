@@ -173,7 +173,6 @@ function resolveForm(client) {
  * same field shapes:
  *   register    member registration (**must carry role:'agent'** — bus.endTask only writes
  *               task_runs for role=agent members; omit it and the task opens but no ledger row)
- *   heartbeat   keep-alive (no heartbeat for >60s and the server marks the member degraded)
  *   task/start  a new user turn = a task; the title is the user's sentence
  *   task/end    round end (succeeded→done / failed·interrupted→cancelled), with result and files
  *   message     this round's closing summary into the conversation (type=result)
@@ -531,14 +530,12 @@ function createIngestPlugin(options, { location, base } = {}) {
   }
 
   /**
-   * Write the phase + a heartbeat.
+   * Write the phase.
    * Keys in `phaseFields` go into sessionPhase; `done` goes into the separate done field (the state
    * file keeps them as two fields; done should not be nested inside the phase object).
    *
-   * `hb.pid` = this process's pid: this is `sessions.js` `hasOtherLiveSession()`'s criterion 1
-   * ("is the session that owns this state file still alive" looks at `pidAlive(j.hb.pid)`). This
-   * plugin runs inside the Kilo / OpenCode server process — once that process dies no further event
-   * lands on this file, so it is a valid "alive" signal.
+   * `hb.pid` identifies the process that owns this state file. `hb.lastEventAt` records the last
+   * event written to it; neither value is a workstation state or task-liveness input.
    */
   const report = (event, phase, { done = null, ...phaseFields } = {}) => {
     try {
@@ -556,10 +553,6 @@ function createIngestPlugin(options, { location, base } = {}) {
       }
       if (done) patch.done = done
       writeState(statePath(client, ws, sid), patch)
-      // The heartbeat goes out with the phase: no heartbeat for >60s and the server marks the member degraded
-      // Send the real workspace path: the server uses it to resolve the workspace (see bus.projectForReport) —
-      // without it the report lands on "the workspace open in the office", so working in B while A is open misattributes.
-      post("/heartbeat", { memberId: base, sessionId: sid, ts: now, workspacePath: ws })
     } catch {
       /* a failed report must not affect the agent */
     }

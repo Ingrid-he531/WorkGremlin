@@ -219,8 +219,144 @@ function migrateCouncilStatusChecks(db) {
   return true;
 }
 
+const STATUS_TABLES = {
+  agent_status: {
+    create: `
+      CREATE TABLE agent_status (
+        member_id   TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+        state       TEXT NOT NULL CHECK (state = 'busy'),
+        state_since INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL
+      )
+    `,
+    columns: ['member_id', 'state', 'state_since', 'updated_at'],
+    indexes: ['CREATE INDEX IF NOT EXISTS idx_status_state ON agent_status(state)'],
+  },
+  session_status: {
+    create: `
+      CREATE TABLE session_status (
+        member_id   TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        session_id  TEXT NOT NULL,
+        state       TEXT NOT NULL CHECK (state = 'blocked'),
+        state_since INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        PRIMARY KEY (member_id, session_id)
+      )
+    `,
+    columns: ['member_id', 'session_id', 'state', 'state_since', 'updated_at'],
+    indexes: [],
+  },
+};
+
+/**
+ * Rebuild the state tables from the heartbeat-era shape. Idle and task activity are derived from tasks,
+ * so only the resident gremlin's borrowed busy state and explicit blocked waits are carried over.
+ * @param {import('better-sqlite3').Database} db
+ */
+function migrateStatusTables(db) {
+  for (const [table, spec] of Object.entries(STATUS_TABLES)) {
+    if (!tableExists(db, table)) continue;
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+    const sql = String((row && row.sql) || '');
+    const legacy = ['task_id', 'last_heartbeat_at', 'degraded', 'source'].some((c) => hasColumn(db, table, c));
+    const currentCheck =
+      table === 'agent_status'
+        ? sql.includes("state = 'busy'")
+        : sql.includes("state = 'blocked'");
+    if (!legacy && currentCheck) continue;
+
+    const old = `${table}__legacy`;
+    const tx = db.transaction(() => {
+      db.exec(`DROP TABLE IF EXISTS ${old}`);
+      if (table === 'agent_status') db.exec('DROP INDEX IF EXISTS idx_status_state');
+      if (table === 'session_status') db.exec('DROP INDEX IF EXISTS idx_session_status_task');
+      db.exec(`ALTER TABLE ${table} RENAME TO ${old}`);
+      db.exec(spec.create);
+      const hasState = hasColumn(db, old, 'state');
+      const hasSince = hasColumn(db, old, 'state_since');
+      const hasUpdated = hasColumn(db, old, 'updated_at');
+      const sinceExpr = hasSince ? 'COALESCE(state_since, updated_at, 0)' : hasUpdated ? 'COALESCE(updated_at, 0)' : '0';
+      const updatedExpr = hasUpdated ? 'COALESCE(updated_at, state_since, 0)' : sinceExpr;
+      if (hasState) {
+        const allowedStates = table === 'agent_status' ? "('busy')" : "('blocked')";
+        db.exec(`
+          INSERT INTO ${table} (${spec.columns.join(', ')})
+          SELECT
+            member_id,
+            ${table === 'session_status' ? 'session_id,' : ''}
+            lower(state),
+            ${sinceExpr},
+            ${updatedExpr}
+          FROM ${old}
+          WHERE lower(state) IN ${allowedStates}
+        `);
+      }
+      db.exec(`DROP TABLE ${old}`);
+      for (const index of spec.indexes) db.exec(index);
+    });
+    tx();
+  }
+  // Status history is not a product concept; task timestamps are the workstation activity truth.
+  db.exec('DROP TABLE IF EXISTS agent_status_history');
+}
+
+/**
+ * Remove the retired `projects.source = 'timeout'` value.
+ *
+ * SQLite cannot alter a CHECK constraint in place. Child tables reference `projects`, so the table is
+ * rebuilt with foreign keys temporarily disabled: create the replacement, copy rows with the legacy
+ * value mapped to `watch`, drop the old table, then rename the replacement into place. The operation is
+ * idempotent and leaves child foreign-key definitions pointing at `projects`.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @returns {boolean} true when the projects table was rebuilt
+ */
+function migrateProjectSources(db) {
+  if (!tableExists(db, 'projects')) return false;
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'").get();
+  const sql = String((row && row.sql) || '');
+  const hasTimeout = /['"]timeout['"]/i.test(sql);
+  const staleRow = db.prepare("SELECT 1 FROM projects WHERE source = 'timeout' LIMIT 1").get();
+  if (!hasTimeout && !staleRow) return false;
+
+  const foreignKeys = Number(db.pragma('foreign_keys', { simple: true })) === 1;
+  if (foreignKeys) db.pragma('foreign_keys = OFF');
+  try {
+    const tx = db.transaction(() => {
+      db.exec(`
+        DROP TABLE IF EXISTS projects__source_new;
+        CREATE TABLE projects__source_new (
+          id                    TEXT PRIMARY KEY,
+          name                  TEXT NOT NULL,
+          workspace_path        TEXT NOT NULL,
+          main_conversation_id  TEXT,
+          source                TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch')),
+          created_at            INTEGER NOT NULL
+        );
+        INSERT INTO projects__source_new
+          (id, name, workspace_path, main_conversation_id, source, created_at)
+        SELECT
+          id, name, workspace_path, main_conversation_id,
+          CASE WHEN source = 'timeout' THEN 'watch' ELSE source END,
+          created_at
+        FROM projects;
+        DROP TABLE projects;
+        ALTER TABLE projects__source_new RENAME TO projects;
+        CREATE INDEX IF NOT EXISTS idx_projects_ws ON projects(workspace_path);
+      `);
+    });
+    tx();
+  } finally {
+    if (foreignKeys) db.pragma('foreign_keys = ON');
+  }
+  return true;
+}
+
 /** @param {import('better-sqlite3').Database} db */
 function migrate(db) {
+  if (hasColumn(db, 'members', 'last_seen_at')) {
+    db.exec('ALTER TABLE members DROP COLUMN last_seen_at');
+  }
   ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'members', 'project_label', 'project_label TEXT');
   ensureColumn(db, 'members', 'client', 'client TEXT');
@@ -247,7 +383,6 @@ function migrate(db) {
   // Council room: the old vote/analysis schema is intentionally not migrated (the refactor shipped before
   // any real council data existed). resetLegacyCouncilSchema already dropped and recreated those tables
   // before schema.sql ran, so nothing needs adding here.
-  normalizeThinkingState(db);
   // Backfill: products once missing from CLIENT_BASES have their main agent member's client written as
   // NULL, and an empty client is treated on the frontend as "generic, show it on every floor" —— so
   // that product's members drift into every floor (measured: the qoder main agent row drifted into
@@ -257,23 +392,6 @@ function migrate(db) {
   const BASES = ['codebuddy', 'cline', 'codex', 'claude', 'trae', 'qoder', 'kilo', 'opencode'];
   const tagBase = db.prepare(`UPDATE members SET client = ? WHERE client IS NULL AND name = ?`);
   for (const b of BASES) tagBase.run(b, b);
-}
-
-/**
- * One-time data cleanup: member state `thinking` was folded back into `busy` (it is part of busy — see
- * AGENT_STATES in shared). Rewrite any leftover rows so the liveness checks (which no longer list
- * `thinking`) keep seeing them. The tables' CHECK constraints still permit `busy`, so this is a plain
- * UPDATE (no table rebuild).
- * @param {import('better-sqlite3').Database} db
- */
-function normalizeThinkingState(db) {
-  for (const table of ['agent_status', 'session_status']) {
-    try {
-      db.exec(`UPDATE ${table} SET state = 'busy' WHERE state = 'thinking'`);
-    } catch {
-      /* table missing on a very old db: nothing to clean */
-    }
-  }
 }
 
 /**
@@ -396,9 +514,9 @@ function restoreLegacyRows(db, snap) {
 
   const members = db.prepare(`
     INSERT OR IGNORE INTO members
-      (id, project_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project_label, client)
+      (id, project_id, name, role, session_id, reported, created_at, ephemeral, project_label, client)
     VALUES
-      (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @projectLabel, @client)
+      (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @ephemeral, @projectLabel, @client)
   `);
   const tasks = db.prepare(`
     INSERT OR IGNORE INTO tasks
@@ -435,7 +553,6 @@ function restoreLegacyRows(db, snap) {
       sessionId: r.session_id ?? null,
       reported: r.reported ?? 0,
       createdAt: r.created_at ?? now,
-      lastSeenAt: r.last_seen_at ?? null,
       ephemeral: r.ephemeral ?? 0,
       // The old DB's members.project (the project name a temporary member belongs to) was renamed to project_label
       projectLabel: r.project ?? null,
@@ -532,6 +649,8 @@ function openDatabase(dbPath) {
   applyPragmas(db);
   db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
   migrateCouncilStatusChecks(db);
+  migrateStatusTables(db);
+  migrateProjectSources(db);
   migrate(db);
   const restored = restoreLegacyRows(db, legacy);
   if (restored) log.warn(`[workgremlin] 老库迁移完成，回填 ${restored} 行历史数据`);
@@ -596,16 +715,15 @@ function createRepo(db) {
     getProjectByWorkspace: db.prepare(`SELECT * FROM projects WHERE workspace_path = ?`),
 
     upsertMember: db.prepare(`
-      INSERT INTO members (id, project_id, name, role, session_id, reported, created_at, last_seen_at, ephemeral, project_label, client)
-      VALUES (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @lastSeenAt, @ephemeral, @projectLabel, @client)
+      INSERT INTO members (id, project_id, name, role, session_id, reported, created_at, ephemeral, project_label, client)
+      VALUES (@id, @projectId, @name, @role, @sessionId, @reported, @createdAt, @ephemeral, @projectLabel, @client)
       ON CONFLICT(id) DO UPDATE SET
         role = COALESCE(excluded.role, members.role),
         session_id = COALESCE(excluded.session_id, members.session_id),
         reported = MAX(members.reported, excluded.reported),
-        last_seen_at = MAX(COALESCE(members.last_seen_at, 0), COALESCE(excluded.last_seen_at, 0)),
         ephemeral = MAX(members.ephemeral, excluded.ephemeral),
         project_label = COALESCE(excluded.project_label, members.project_label),
-        -- overwrite when the source client is known (old DBs are NULL, filled in by the first report / roster heartbeat)
+        -- overwrite when the source client is known (old DBs are NULL, filled in by the first report or roster scan)
         client = COALESCE(excluded.client, members.client)
     `),
     tagMemberClient: db.prepare(`
@@ -614,55 +732,38 @@ function createRepo(db) {
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
     listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),
-    /** Members by reporting identity (9F's synchronizer wraps up with it: even with no session it has to put the status back to idle, see copilot.js) */
+    /** Members by reporting identity (polling reconcilers use it to clear vanished sessions). */
     listMembersByClient: db.prepare(`SELECT * FROM members WHERE client = ? ORDER BY name`),
     listEphemeral: db.prepare(`SELECT * FROM members WHERE project_id = ? AND ephemeral = 1`),
-    touchMember: db.prepare(`UPDATE members SET last_seen_at = ? WHERE id = ?`),
 
     upsertStatus: db.prepare(`
-      INSERT INTO agent_status
-        (member_id, state, state_since, task_id, progress, current_files, last_heartbeat_at, degraded, source, updated_at)
-      VALUES
-        (@memberId, @state, @stateSince, @taskId, @progress, @currentFiles, @lastHeartbeatAt, @degraded, @source, @updatedAt)
+      INSERT INTO agent_status (member_id, state, state_since, updated_at)
+      VALUES (@memberId, @state, @stateSince, @updatedAt)
       ON CONFLICT(member_id) DO UPDATE SET
         state = excluded.state,
         state_since = CASE WHEN agent_status.state = excluded.state THEN agent_status.state_since ELSE excluded.state_since END,
-        task_id = COALESCE(excluded.task_id, agent_status.task_id),
-        progress = COALESCE(excluded.progress, agent_status.progress),
-        current_files = COALESCE(excluded.current_files, agent_status.current_files),
-        last_heartbeat_at = COALESCE(excluded.last_heartbeat_at, agent_status.last_heartbeat_at),
-        degraded = excluded.degraded,
-        source = excluded.source,
         updated_at = excluded.updated_at
     `),
     getStatus: db.prepare(`SELECT * FROM agent_status WHERE member_id = ?`),
+    deleteStatus: db.prepare(`DELETE FROM agent_status WHERE member_id = ?`),
     upsertSessionStatus: db.prepare(`
-      INSERT INTO session_status
-        (member_id, session_id, state, state_since, task_id, last_heartbeat_at, updated_at)
-      VALUES
-        (@memberId, @sessionId, @state, @stateSince, @taskId, @lastHeartbeatAt, @updatedAt)
+      INSERT INTO session_status (member_id, session_id, state, state_since, updated_at)
+      VALUES (@memberId, @sessionId, @state, @stateSince, @updatedAt)
       ON CONFLICT(member_id, session_id) DO UPDATE SET
         state = excluded.state,
         state_since = CASE WHEN session_status.state = excluded.state THEN session_status.state_since ELSE excluded.state_since END,
-        task_id = excluded.task_id,
-        last_heartbeat_at = excluded.last_heartbeat_at,
         updated_at = excluded.updated_at
     `),
     getSessionStatus: db.prepare(`SELECT * FROM session_status WHERE member_id = @memberId AND session_id = @sessionId`),
-    /**
-     * Clear the task slot in the member status (upsertStatus's task_id is COALESCE, passing null cannot clear it).
-     * Used when 9F wraps up: the session is gone, so the task in that slot (which may no longer exist) should not hang there either.
-     */
-    clearStatusTask: db.prepare(`UPDATE agent_status SET task_id = NULL, progress = NULL, current_files = NULL WHERE member_id = ?`),
-    listStatuses: db.prepare(`
-      SELECT s.* FROM agent_status s
-      JOIN members m ON m.id = s.member_id
-      WHERE m.project_id = ?
+    deleteSessionStatus: db.prepare(`
+      DELETE FROM session_status WHERE member_id = @memberId AND session_id = @sessionId
     `),
-    insertStatusHistory: db.prepare(`
-      INSERT INTO agent_status_history (member_id, state, ts_ms, reason, source) VALUES (?, ?, ?, ?, ?)
+    listSessionStatuses: db.prepare(`SELECT * FROM session_status WHERE member_id = ?`),
+    pruneSessionStatuses: db.prepare(`
+      DELETE FROM session_status
+      WHERE member_id = @memberId
+        AND session_id NOT IN (SELECT value FROM json_each(@sessionIds))
     `),
-
     insertTask: db.prepare(`
       INSERT INTO tasks (id, project_id, member_id, parent_task_id, title, state, progress, started_at, ended_at)
       VALUES (@id, @projectId, @memberId, @parentTaskId, @title, @state, @progress, @startedAt, @endedAt)
@@ -681,11 +782,39 @@ function createRepo(db) {
     `),
     getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
     listTasks: db.prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY started_at DESC`),
-    /**
-     * The finish time of a member's most recent **finished** task (the workstation card's "last active" uses it: how long ago the previous task was).
-     * Looked up by the member's own id (tasks.member_id is the full "name@project" id), hitting idx_tasks_member_state.
-     */
-    lastTaskEndOfMember: db.prepare(`SELECT MAX(ended_at) AS at FROM tasks WHERE member_id = ? AND ended_at IS NOT NULL`),
+    /** Latest task start or end per session: the workstation's last-active timestamp. */
+    lastTaskAtOfMemberBySession: db.prepare(`
+      SELECT
+        tr.session_id,
+        MAX(
+          CASE
+            WHEN COALESCE(t.ended_at, 0) > COALESCE(t.started_at, 0) THEN t.ended_at
+            ELSE t.started_at
+          END
+        ) AS at
+      FROM tasks t
+      LEFT JOIN task_runs tr ON tr.id = t.id
+      WHERE t.member_id = ?
+      GROUP BY tr.session_id
+    `),
+    /** Running tasks are facts, not status slots. One member may have several sessions. */
+    currentTasksOfMember: db.prepare(`
+      SELECT t.*, tr.session_id, tr.files_json
+      FROM tasks t
+      LEFT JOIN task_runs tr ON tr.id = t.id
+      WHERE t.member_id = ? AND t.state = 'running'
+      ORDER BY t.started_at DESC
+    `),
+    /** Running tasks with a session id, used to reconcile vanished polling sessions. */
+    listRunningTaskRunsForMember: db.prepare(`
+      SELECT t.id, tr.session_id
+      FROM tasks t
+      JOIN task_runs tr ON tr.id = t.id
+      WHERE t.member_id = @memberId
+        AND t.state = 'running'
+        AND tr.session_id IS NOT NULL
+      ORDER BY t.started_at DESC
+    `),
 
     insertMessage: db.prepare(`
       INSERT INTO messages (dedupe_key, project_id, ts_ms, from_member, to_member, type, subject, content, task_id, session_id, source, raw_json)
@@ -772,6 +901,11 @@ function createRepo(db) {
         duration_ms = COALESCE(@durationMs, duration_ms)
       WHERE id = @id
     `),
+    setTaskRunFiles: db.prepare(`
+      UPDATE task_runs
+      SET file_count = @fileCount, files_json = @filesJson
+      WHERE id = @id
+    `),
     /**
      * Clear a run's changed-file info (both columns to NULL). For a floor that cannot read which files a
      * turn changed (2F Cline): endTaskRun's COALESCE treats NULL as "not reported, keep the old value",
@@ -841,42 +975,18 @@ function createRepo(db) {
       ORDER BY r.started_at ASC
     `),
 
-    /**
-     * All "still running" top-level tasks in a project (projectId, pass 0 for any project), returning their client.
-     * The **single criterion** for the lintel ticker / main console judging "this floor has a task running",
-     * grouped by agent base name in JS (stripping -plugin / @project suffixes) —— same criterion as the
-     * frontend's floorAcceptsClient, avoiding a miss where a plugin session's client is codebuddy-plugin
-     * while the ledger's task_runs.client is bare codebuddy ("same base name, different string").
-     *
-     * "Running" = tasks.state='running' and (a heartbeat is alive OR it was newly started recently).
-     * **Key point**: 1F CodeBuddy plugin tasks never write a session_status / agent_status heartbeat
-     * (handlePlugin's comments confirm task_runs stays running), so a heartbeat-only ALIVE judgment
-     * misses them entirely → the ticker shows nothing while running and pops up only after cancellation.
-     * So besides the heartbeat, a fallback of "started_at within the @fresh window" is added —— plugin
-     * tasks claim themselves through it; CLI / Codex and others that have heartbeats go through ALIVE as
-     * before. @fresh is generous (3h by default) only to keep out zombies whose "process died long ago
-     * but the ledger stays running"; normal tasks never exceed it.
-     */
+    /** Running top-level tasks are the sole source for floor activity. */
     activeRunningByProject: db.prepare(`
-      SELECT COALESCE(r.client, m.client) AS client, r.session_id AS sessionId, t.title AS title, t.started_at AS startedAt FROM tasks t
+      SELECT COALESCE(r.client, m.client) AS client,
+             r.session_id AS sessionId,
+             t.title AS title,
+             t.started_at AS startedAt
+      FROM tasks t
       LEFT JOIN task_runs r ON r.id = t.id
       LEFT JOIN members m ON m.id = t.member_id
       WHERE t.parent_task_id IS NULL AND t.state = 'running'
         AND (@projectId = 0 OR t.project_id = @projectId)
-        AND (
-          t.started_at > @fresh
-          OR EXISTS (
-            SELECT 1 FROM session_status ss
-             WHERE ss.member_id = t.member_id AND ss.session_id = r.session_id AND ss.task_id = t.id
-               AND (ss.last_heartbeat_at > @cutoff
-                    OR (ss.state IN ('busy', 'blocked') AND ss.state_since > @grace))
-          ) OR EXISTS (
-            SELECT 1 FROM agent_status s
-             WHERE s.task_id = t.id
-               AND (s.last_heartbeat_at > @cutoff
-                    OR (s.state IN ('busy', 'blocked') AND s.state_since > @grace))
-          )
-        )
+      ORDER BY t.started_at DESC
     `),
     runAwaitingTokens: db.prepare(`
       SELECT id FROM task_runs
@@ -918,28 +1028,6 @@ function createRepo(db) {
       SELECT tr.id AS id, tr.session_id AS session_id FROM task_runs tr
         JOIN tasks t ON t.id = tr.id
        WHERE tr.client = ? AND t.state = 'running' AND t.ended_at IS NULL
-    `),
-    /**
-     * The one task in the ledger that **has not wrapped up** (`tasks.state = 'running'` and no ended_at).
-     *
-     * There is exactly one use: who `agent_status.task_id` (one row per member, one slot only) should
-     * point at —— see bus.js's heartbeat (claimed by session) and endTask (handing the slot over at
-     * wrap-up). `ended_at IS NULL` is a redundant criterion, written here to guard against old data
-     * where "state was changed back to running elsewhere"; both go by project + member through the
-     * idx_task_runs_session prefix, and the session one adds session_id.
-     */
-    liveTaskOfSession: db.prepare(`
-      SELECT t.id AS id FROM task_runs tr JOIN tasks t ON t.id = tr.id
-       WHERE tr.project_id = @projectId AND tr.member_id = @memberId AND tr.session_id = @sessionId
-         AND t.state = 'running' AND t.ended_at IS NULL
-       ORDER BY tr.started_at DESC LIMIT 1
-    `),
-    /** Same as above, without a session: this member's **newest** in-flight task (for handing the slot over at wrap-up) */
-    liveTaskOfMember: db.prepare(`
-      SELECT t.id AS id FROM task_runs tr JOIN tasks t ON t.id = tr.id
-       WHERE tr.project_id = @projectId AND tr.member_id = @memberId
-         AND t.state = 'running' AND t.ended_at IS NULL
-       ORDER BY tr.started_at DESC LIMIT 1
     `),
     insertSubagentRun: db.prepare(`
       INSERT INTO subagent_runs
@@ -1062,10 +1150,11 @@ function createRepo(db) {
      * the main agent must be running some user task.
      */
     mainRunningTask: db.prepare(`
-      SELECT s.task_id AS taskId
-      FROM agent_status s JOIN members m ON m.id = s.member_id
-      WHERE m.project_id = ? AND m.role = 'agent' AND s.task_id IS NOT NULL
-      ORDER BY COALESCE(s.last_heartbeat_at, s.updated_at) DESC
+      SELECT t.id AS taskId
+      FROM tasks t JOIN members m ON m.id = t.member_id
+      WHERE m.project_id = ? AND m.role = 'agent'
+        AND t.parent_task_id IS NULL AND t.state = 'running'
+      ORDER BY t.started_at DESC
       LIMIT 1
     `),
     /**
@@ -1081,6 +1170,16 @@ function createRepo(db) {
       WHERE t.member_id = ? AND t.state = 'running'
       ORDER BY t.started_at DESC
       LIMIT 5
+    `),
+    /** A non-Qoder-plugin task proves the hook path still owns this member. */
+    hasHookRunningTaskForMember: db.prepare(`
+      SELECT 1 AS found
+      FROM tasks t
+      LEFT JOIN task_runs tr ON tr.id = t.id
+      WHERE t.member_id = @memberId
+        AND t.state = 'running'
+        AND t.id NOT LIKE 'qoder:%'
+      LIMIT 1
     `),
     /**
      * Files changed by this member within the time window: deduped by path (repeated changes to the same file count as one output), taking the latest time.
@@ -1169,9 +1268,6 @@ function createRepo(db) {
       db.prepare('DELETE FROM tool_usage WHERE project_id = ?').run(id);
       db.prepare('DELETE FROM artifacts WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
       db.prepare('DELETE FROM agent_status WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(id);
-      db.prepare('DELETE FROM agent_status_history WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)').run(
-        id
-      );
       db.prepare('DELETE FROM members WHERE project_id = ?').run(id);
       db.prepare('DELETE FROM events WHERE project_id = ?').run(id);
       db.prepare('DELETE FROM projects WHERE id = ?').run(id);
@@ -1209,7 +1305,6 @@ function createRepo(db) {
         db.prepare('DELETE FROM artifacts WHERE member_id = ?').run(id);
         db.prepare('DELETE FROM tasks WHERE member_id = ?').run(id);
       }
-      db.prepare('DELETE FROM agent_status_history WHERE member_id = ?').run(id);
       db.prepare('DELETE FROM agent_status WHERE member_id = ?').run(id);
       db.prepare('DELETE FROM members WHERE id = ?').run(id);
     });

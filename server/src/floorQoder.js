@@ -490,8 +490,7 @@ const CLIENT = 'qoder';
 const FORM = 'vscode';
 /** Cap on the length of the output summary (same order of magnitude as RESULT_MAX in hook.js) */
 const RESULT_MAX = 4_000;
-/** How fresh a heartbeat has to be for the hook (CLI) path to count as "alive" —— while it is alive it takes precedence and the status bar is left alone */
-const HOOK_FRESH_MS = 60_000;
+/** How fresh reporter metadata has to be for the hook (CLI) path to take precedence while it is active. */
 
 /** Project name (project id): resolved the same way as the CLI path (the hook reports the name from package.json, measured as `qoder@workgremlin`), otherwise the plugin and the CLI each create their own member and this floor ends up with two workstations */
 function projectIdOf(s) {
@@ -502,7 +501,7 @@ function projectIdOf(s) {
 
 /**
  * Write one ledger entry (two rows, tasks + task_runs). 6F's plugin path is **one entry per round**.
- * @returns {string|null} this record's files_json (reused directly by current_files in the heartbeat)
+ * @returns {string|null} this record's files_json, reused directly by the workstation card
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result }) {
   const st = state || (endedAt ? 'done' : 'running');
@@ -556,13 +555,10 @@ function turnIndexOf(taskId, prefix) {
   return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
-/** Is the hook (CLI) path currently occupying this member: the status bar hangs off a task **we did not write**, with a fresh heartbeat */
-function hookOwnsMember(repo, memberId, now) {
+/** Whether the hook path currently owns a running task for this member. */
+function hookOwnsMember(repo, memberId) {
   try {
-    const st = repo.getStatus.get(memberId);
-    if (!st || !st.task_id) return false;
-    if (String(st.task_id).startsWith(TASK_ID_PREFIX)) return false;
-    return now - Number(st.last_heartbeat_at || 0) <= HOOK_FRESH_MS;
+    return Boolean(repo.hasHookRunningTaskForMember.get({ memberId }));
   } catch {
     return false;
   }
@@ -574,9 +570,29 @@ function hookOwnsMember(repo, memberId, now) {
  */
 function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
   const sessions = listLingmaSessions();
-  if (!sessions.length) return 0;
-
   const now = nowFn();
+  const reconcileSessionStatuses = () => {
+    if (typeof bus.pruneSessionStatuses !== 'function' || !repo.listMembersByClient) return;
+    const liveByProject = new Map();
+    for (const s of sessions) {
+      const projectId = projectIdOf(s);
+      if (!liveByProject.has(projectId)) liveByProject.set(projectId, []);
+      if (s.id) liveByProject.get(projectId).push(s.id);
+    }
+    for (const member of repo.listMembersByClient.all(CLIENT)) {
+      if (hookOwnsMember(repo, member.id)) continue;
+      bus.pruneSessionStatuses({
+        project: member.project_id,
+        memberId: member.id,
+        sessionIds: liveByProject.get(member.project_id) || [],
+        ts: now,
+      });
+    }
+  };
+  if (!sessions.length) {
+    reconcileSessionStatuses();
+    return 0;
+  }
   let count = 0;
 
   const roundsOf = new Map();
@@ -592,26 +608,6 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
     if (!rounds.length || rounds[rounds.length - 1] !== round) return false;
     return now - Math.max(Number(round.updatedAt || 0), Number(s.lastEventAt || 0)) <= LIVE_MS;
   };
-
-  /**
-   * One project writes **one** member status row (agent_status's primary key is member_id).
-   * With several plugin sessions in one project, whoever writes last wins, so first choose "which
-   * session should represent this project": the newest among the active ones; if none are active, report
-   * the newest one (the card hangs off the last task). Same as 7F/8F.
-   */
-  const activeByProject = new Map();
-  const newestByProject = new Map();
-  for (const s of sessions) {
-    if (!(roundsOf.get(s.id) || []).length) continue;
-    const pid = projectIdOf(s);
-    if (!pid) continue;
-    const prevNew = newestByProject.get(pid);
-    if (!prevNew || Number(s.lastEventAt || 0) > Number(prevNew.lastEventAt || 0)) newestByProject.set(pid, s);
-    const live = (roundsOf.get(s.id) || []).some((r) => isLive(s, r));
-    if (!live) continue;
-    const prevAct = activeByProject.get(pid);
-    if (!prevAct || Number(s.lastEventAt || 0) > Number(prevAct.lastEventAt || 0)) activeByProject.set(pid, s);
-  }
 
   for (const s of sessions) {
     const projectPath = s.projectPath || '';
@@ -640,15 +636,11 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
       sessionId: s.id || null,
       reported: existing ? existing.reported : 1,
       createdAt: existing ? existing.created_at : now,
-      lastSeenAt: now,
       ephemeral: 0,
       projectLabel: null,
       client: CLIENT,
     });
 
-    let hbId = '';
-    let hbFilesJson = null;
-    let running = false;
     for (const t of rounds) {
       const id = `${prefix}:${t.index}`;
       // Changed files: the extension records absolute paths, uniformly converted to project-relative
@@ -664,7 +656,7 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
         .filter(Boolean);
       const live = isLive(s, t);
       const title = t.prompt.replace(/\s+/g, ' ').trim() || s.title || '(Qoder 插件会话)';
-      hbFilesJson = writeTurnRun(repo, {
+      writeTurnRun(repo, {
         id,
         projectId,
         memberId,
@@ -680,8 +672,6 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
         // the next round starts, then it gets filled in)
         result: live ? '' : String(t.summary || '').slice(0, RESULT_MAX),
       });
-      hbId = id;
-      running = live;
       count += 1;
     }
 
@@ -695,34 +685,9 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
       repo.deleteTaskRun(r.id);
     }
 
-    // Status bar: written only when "this project should be reported by this session" and the CLI path
-    // is not holding it. Running = thinking (inferred), finished = idle; the slot points at the running
-    // one (or the newest when there is none).
-    const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
-    bus.setSessionStatus({
-      project: projectId,
-      memberId: CLIENT,
-      sessionId: s.id,
-      state: running ? 'busy' : 'idle',
-      taskId: running ? hbId : null,
-      ts: now,
-    });
-    if (owner === s && hbId && !hookOwnsMember(repo, memberId, now)) {
-      repo.upsertStatus.run({
-        memberId,
-        state: running ? 'busy' : 'idle',
-        stateSince: running ? rounds[rounds.length - 1].startedAt || now : now,
-        taskId: hbId,
-        progress: null,
-        currentFiles: hbFilesJson,
-        lastHeartbeatAt: now,
-        degraded: 0,
-        source: 'report',
-        updatedAt: now,
-      });
-    }
   }
 
+  reconcileSessionStatuses();
   return count;
 }
 
@@ -732,12 +697,12 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
  * a central file.
  * @param {object} p floor metadata
  * @param {object} src source spec (kind === 'lingma')
- * @param {object} ctx shared utilities provided by the framework (claim / upsert / now / workspacePath / TIMEOUT_MS …)
+ * @param {object} ctx shared utilities provided by the framework (claimSession / upsert / now / workspacePath / TIMEOUT_MS …)
  */
 function lingmaHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS } = ctx;
+  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS } = ctx;
   for (const s of listLingmaSessions()) {
-    if (!claim(p.id, s.id)) continue;
+    if (!claimSession(p.id, s.id)) continue;
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const rounds = readLingmaRounds(s.id);
     if (!rounds.length) continue;

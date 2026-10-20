@@ -1035,7 +1035,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
   border: 1px solid var(--border-strong);
   white-space: nowrap;
 }
-.v-completed { color: var(--state-online); border-color: var(--state-online); }
+.v-completed { color: var(--state-success); border-color: var(--state-success); }
 .v-partial { color: var(--state-busy); border-color: var(--state-busy); }
 .v-needs_clarification,
 .v-cancelled,
@@ -1090,7 +1090,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .roles td { padding: 4px 8px 4px 0; vertical-align: baseline; }
 .roles .role { font-size: 11px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border-strong); }
 .roles .role-moderator { color: var(--accent); border-color: var(--accent); }
-.roles .role-main { color: var(--state-online); border-color: var(--state-online); }
+.roles .role-main { color: var(--state-success); border-color: var(--state-success); }
 .roles .pstatus { font-size: 11px; margin-left: 6px; color: var(--text-dim); }
 .roles .pstatus.bad { color: var(--state-blocked); }
 
@@ -1100,7 +1100,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 
 /* ---- final result ---- */
 .decision-line { margin: 0 0 6px; }
-.d-approve { color: var(--state-online); border-color: var(--state-online); }
+.d-approve { color: var(--state-success); border-color: var(--state-success); }
 .d-approve_with_changes { color: var(--state-busy); border-color: var(--state-busy); }
 .d-reject { color: var(--state-blocked); border-color: var(--state-blocked); }
 .para { margin: 4px 0 0; font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
@@ -1208,7 +1208,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .sev-nit { color: var(--text-faint); }
 .st-reject { color: var(--state-blocked); border-color: var(--state-blocked); }
 .st-revise { color: var(--state-busy); border-color: var(--state-busy); }
-.st-accept { color: var(--state-online); border-color: var(--state-online); }
+.st-accept { color: var(--state-success); border-color: var(--state-success); }
 
 .msec { display: flex; gap: 8px; margin-top: 6px; font-size: 12px; }
 .mk { color: var(--text-faint); flex: 0 0 68px; }

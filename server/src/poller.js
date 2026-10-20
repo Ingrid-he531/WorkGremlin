@@ -12,8 +12,7 @@
  *                              `syncAgents(ctx)`; the floor scans its OWN agent dirs and registers the
  *                              changes through the upper layer's register / unregister callbacks;
  *   · ghost GC (2s)          — bus.gcGhosts(): disperse subagent ghosts whose parent task ended, or
- *                              that outlived the orphan TTL while no running parent vouches for them;
- *   · degraded sweep (10s)   — bus.sweepDegraded(): drop stale heartbeats.
+ *                              that outlived the orphan TTL while no running parent vouches for them.
  *
  * Everything floor-specific (store schemas, "yield to the plugin" rules, phase inference, which dirs
  * hold agents) stays inside the floor functions — this file contains no floor knowledge, and the
@@ -28,7 +27,6 @@ const { taskSyncerFloors, agentSyncerFloors } = require('./floors');
 /** Base tick. Duty cadences below are throttled against `now`, so this only bounds latency. */
 const TICK_MS = 1_000;
 const SESSION_SCAN_MS = 2_000;
-const SWEEP_DEGRADED_MS = 10_000;
 /** Default task-sync cadence when a floor does not declare `pollMs`. */
 const DEFAULT_POLL_MS = 5_000;
 /** Default agent-sync cadence when the caller does not declare `agents.pollMs`. */
@@ -65,7 +63,6 @@ function createPoller({
   const lastTaskAt = new Map();
   const lastAgentsAt = new Map();
   let lastSessionAt = 0;
-  let lastSweepAt = 0;
   let lastGhostAt = 0;
   let lastSessionSig = '';
   let timer = null;
@@ -153,14 +150,6 @@ function createPoller({
         /* ignore */
       }
     }
-    if (at - lastSweepAt >= SWEEP_DEGRADED_MS) {
-      lastSweepAt = at;
-      try {
-        bus.sweepDegraded();
-      } catch {
-        /* ignore */
-      }
-    }
   }
 
   /** Run one tick immediately, then keep ticking; returns the (unref'ed) timer. */
@@ -179,4 +168,4 @@ function createPoller({
   return { start, stop, tick, syncAgentsNow };
 }
 
-module.exports = { createPoller, TICK_MS, SESSION_SCAN_MS, SWEEP_DEGRADED_MS, DEFAULT_POLL_MS, DEFAULT_AGENT_POLL_MS };
+module.exports = { createPoller, TICK_MS, SESSION_SCAN_MS, DEFAULT_POLL_MS, DEFAULT_AGENT_POLL_MS };

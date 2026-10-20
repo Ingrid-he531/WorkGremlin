@@ -78,9 +78,8 @@ function createHub({ server, token, bus, repo }) {
           conn.project = msg.project || conn.project;
           conn.filters = msg.filters || conn.filters;
           // Send a snapshot even when no project is specified (buildSnapshot(null) uses the team
-          // of "the currently open project"): otherwise the client receives not a single frame
-          // after connecting and has to wait for later pushes (the roster heartbeat can take up
-          // to 15s) —— which shows up as members / gremlins "appearing only after a long while".
+          // of "the currently open project"). Otherwise the client receives no frame after
+          // connecting and has to wait for a later status broadcast.
           send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.project));
           break;
         case CLIENT_EVENTS.SUBSCRIBE:
@@ -118,7 +117,7 @@ function createHub({ server, token, bus, repo }) {
 
     const hb = setInterval(() => {
       if (ws.readyState === 1) ws.ping();
-    }, DEFAULTS.HEARTBEAT_TIMEOUT_MS / 2);
+    }, DEFAULTS.WS_HEARTBEAT_TIMEOUT_MS / 2);
     ws.on('close', () => clearInterval(hb));
   });
 

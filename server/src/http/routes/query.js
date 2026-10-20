@@ -9,18 +9,6 @@ const { resolveProjectName } = require('../../project');
 const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessions');
 
 /**
- * Grace window (ms) during which a task counts as "still running": during pure thinking (the model
- * is generating and has not called a tool yet) the agent emits no hook event and therefore no
- * heartbeat, so the heartbeat expires after 10 minutes and misjudges the task as cancelled → the
- * main console / ticker drops back to "standby" at random during long thinking stretches. Give tasks
- * "whose last state is still active" a longer grace: as long as the latest active state (state_since)
- * is no older than this window, it still counts as running. Long thinking is continuous thinking, so
- * state_since is never stale; only a genuinely dead process (an active state stuck way in the past)
- * exceeds the grace and gets judged dead normally.
- */
-const TASK_ALIVE_GRACE_MS = 30 * 60 * 1000;
-
-/**
  * Floor filter param → client list.
  * A single client ('codebuddy') or a comma-separated string ('codebuddy,codebuddy-plugin', used by
  * merged floors); 'all' / empty = no filter.
@@ -46,32 +34,6 @@ function projectFilter(raw) {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s && s !== 'all');
-}
-
-/** Prefer exact session activity; retain member-slot fallback for legacy and untracked rows.
- *  An active heartbeat inside the heartbeat window (@cutoff, 10min) = really running; but the
- *  heartbeat expires during pure thinking, so tasks "whose last state is still active" get a longer
- *  grace: state_since no older than @grace_cutoff still counts as alive. */
-function taskAliveSql() {
-  return `(
-    EXISTS (
-      SELECT 1 FROM session_status ss
-       WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
-         AND ss.task_id = t.id
-         AND (ss.last_heartbeat_at > @cutoff
-              OR (ss.state IN ('busy', 'blocked') AND ss.state_since > @grace_cutoff))
-    ) OR (
-      (tr.session_id IS NULL OR NOT EXISTS (
-        SELECT 1 FROM session_status ss
-         WHERE ss.member_id = t.member_id AND ss.session_id = tr.session_id
-      )) AND EXISTS (
-        SELECT 1 FROM agent_status s
-         WHERE s.task_id = t.id
-           AND (s.last_heartbeat_at > @cutoff
-                OR (s.state IN ('busy', 'blocked') AND s.state_since > @grace_cutoff))
-      )
-    )
-  )`;
 }
 
 /**
@@ -174,12 +136,8 @@ function createQueryRouter({ bus, repo }) {
    *   - client / model / file_count / files_json / result come from the report layer task_runs
    *     (LEFT JOIN, may be empty); client falls back to members.client so old tasks still show a floor.
    *   - duration_ms = ended_at - started_at (computed); subagentCount = subagent_runs count.
-   *   - state normalization: stale 'running' tasks (process no longer alive) are treated as
-   *     'cancelled'; when session_status is present, liveness is judged by that session's task_id /
-   *     heartbeat; only old records fall back to the member-level agent_status. Note blocked must
-   *     count as "still running": while waiting for permission the hook reports blocked
-   *     (awaiting_permission), and dropping it would show the task as "cancelled" the moment a
-   *     permission dialog appears and jump back to "running" after approval — a pure false alarm.
+   *   - state is read directly from tasks.state. There is no heartbeat-based liveness inference:
+   *     a task is running exactly while its row says running.
    */
   router.get('/task-runs', (req, res) => {
     const projects = projectFilter(req.query.project);
@@ -187,15 +145,8 @@ function createQueryRouter({ bus, repo }) {
     // CLI + Plugin) maps to two member clients, and selecting it must fetch both (see products.js).
     const clients = clientFilter(req.query.client);
     const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
-    // Liveness window: only active states with a heartbeat in the last 10 minutes count as really
-    // running (during pure thinking there is no heartbeat, so the TASK_ALIVE_GRACE_MS state_since
-    // grace below covers it — see taskAliveSql)
-    const cutoff = Date.now() - 10 * 60 * 1000;
-    const graceCutoff = Date.now() - TASK_ALIVE_GRACE_MS;
-    const ALIVE = taskAliveSql();
-
     const conds = ['t.parent_task_id IS NULL'];
-    const args = { limit, cutoff, grace_cutoff: graceCutoff };
+    const args = { limit };
     if (projects.length) {
       const names = projects.map((_, i) => `@proj${i}`);
       conds.push(`t.project_id IN (${names.join(', ')})`);
@@ -249,12 +200,7 @@ function createQueryRouter({ bus, repo }) {
            -- input/output_tokens breakdown, only the amount. Non-Trae floors have NULL here and the
            -- frontend shows "—" (same criterion as the token columns).
            tr.usage_yuan AS usage_yuan,
-           CASE
-             WHEN t.state = 'running'
-                  AND NOT ${ALIVE}
-             THEN 'cancelled'
-             ELSE t.state
-           END AS state
+           t.state
          FROM tasks t
          LEFT JOIN task_runs tr ON tr.id = t.id
          LEFT JOIN members m ON m.id = t.member_id
@@ -333,30 +279,18 @@ function createQueryRouter({ bus, repo }) {
    *   · Order: running first (by ascending start time), then finished (by ascending end time), and
    *     the frontend just scrolls in the order it receives.
    *
-   * State normalization follows the same criterion as /task-runs (legacy running tasks are judged by
-   * heartbeat; when there is no heartbeat during pure thinking the TASK_ALIVE_GRACE_MS state_since
-   * grace catches it, so long thinking is not misjudged as cancelled) —— otherwise a task that is
-   * "forever in progress" would scroll by as a zombie.
+   * State follows /task-runs: tasks.state is the only truth.
    */
   router.get('/task-feed', (req, res) => {
     const minutes = Math.min(Math.max(Number(req.query.minutes) || 5, 1), 120);
     const since = Date.now() - minutes * 60_000;
-    // "Still going" window: only an active state with a heartbeat within the last 10 minutes counts as
-    // really running (with no heartbeat during pure thinking, the TASK_ALIVE_GRACE_MS state_since
-    // grace catches it, see taskAliveSql)
-    const cutoff = Date.now() - 10 * 60_000;
-    const graceCutoff = Date.now() - TASK_ALIVE_GRACE_MS;
     const project = req.query.project;
-
-    // Task records look up session state by task_runs.session_id; agent_status is only a fallback for
-    // legacy data.
-    const ALIVE = taskAliveSql();
 
     const conds = [
       't.parent_task_id IS NULL',
-      `((t.state = 'running' AND ${ALIVE}) OR (t.state IN ('done', 'failed', 'cancelled') AND t.ended_at >= @since))`,
+      `(t.state = 'running' OR (t.state IN ('done', 'failed', 'cancelled') AND t.ended_at >= @since))`,
     ];
-    const args = { since, cutoff, grace_cutoff: graceCutoff, limit: 100 };
+    const args = { since, limit: 100 };
     if (project && project !== 'all') {
       conds.push('t.project_id = @project');
       args.project = project;
@@ -367,12 +301,12 @@ function createQueryRouter({ bus, repo }) {
         `SELECT t.id, t.project_id, t.member_id AS memberId, t.title, t.started_at, t.ended_at,
                 COALESCE(tr.client, m.client) AS client,
                 tr.session_id AS sessionId,
-                CASE WHEN t.state = 'running' AND NOT ${ALIVE} THEN 'cancelled' ELSE t.state END AS state
+                t.state
            FROM tasks t
            LEFT JOIN task_runs tr ON tr.id = t.id
            LEFT JOIN members m ON m.id = t.member_id
           WHERE ${conds.join(' AND ')}
-          ORDER BY CASE WHEN t.state = 'running' AND ${ALIVE} THEN 0 ELSE 1 END,
+          ORDER BY CASE WHEN t.state = 'running' THEN 0 ELSE 1 END,
                    COALESCE(t.ended_at, t.started_at) ASC
           LIMIT @limit`
       )

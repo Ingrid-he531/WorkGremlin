@@ -103,15 +103,17 @@ const F9 = clientsOf('9F');
 const F7 = clientsOf('7F');
 const F2 = clientsOf('2F');
 
-/** 成员卡状态（工位上那只小怪物显示的相位） */
-function stateOf(memberId) {
-  const m = bus.buildSnapshot('p1').members.find((x) => x.memberId === memberId);
+/** Workstation state shown for a member. */
+function stateOf(memberId, project = 'p1') {
+  const m = bus.buildSnapshot(project).members.find((x) => x.memberId === memberId);
   return m && m.state;
 }
-/** 成员卡上挂着的那条任务 id（任务列表判「已取消」时对的就是它） */
-function taskIdOf(memberId) {
-  const m = bus.buildSnapshot('p1').members.find((x) => x.memberId === memberId);
-  return (m && m.task && m.task.id) || '';
+
+/** The running task for one member/session. Busy is derived from tasks, never from a heartbeat. */
+function taskIdOf(memberId, sessionId, project = 'p1') {
+  const m = bus.buildSnapshot(project).members.find((x) => x.memberId === memberId);
+  const task = ((m && m.tasks) || []).find((row) => !sessionId || row.sessionId === sessionId);
+  return (task && task.id) || '';
 }
 
 const app = express();
@@ -176,9 +178,15 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('改动文件按轮挂（第 1 轮那条带 highlight.ts）', Boolean(row1) && row1.file_count === 1 && String(row1.files_json).includes('src/highlight.ts'), row1 && `${row1.file_count} ${row1.files_json}`);
   ok('没改文件的那轮不许报文件（读过的文件不算改动）', Boolean(row0) && row0.file_count === 0 && row0.files_json === null, row0 && `${row0.file_count} ${row0.files_json}`);
   ok('模型带上了（Copilot 的来自 VS Code state.vscdb）', Boolean(row1) && row1.model === 'GPT-5 mini', row1 && row1.model);
-  ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('copilot@p1') === 'busy' && taskIdOf('copilot@p1') === 'copilot:cop-sid-1:2', `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1')}`);
-  const copilotSessionStatus = repo.getSessionStatus.get({ memberId: 'copilot@p1', sessionId: 'cop-sid-1' });
-  ok('Copilot 的在飞任务也记在该会话状态行上', copilotSessionStatus && copilotSessionStatus.task_id === 'copilot:cop-sid-1:2' && copilotSessionStatus.state === 'busy');
+  ok(
+    '在飞 → 成员卡 busy，任务按会话选中',
+    stateOf('copilot@p1') === 'busy' && taskIdOf('copilot@p1', 'cop-sid-1') === 'copilot:cop-sid-1:2',
+    `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1', 'cop-sid-1')}`
+  );
+  ok(
+    'busy 不写 session_status（只有 blocked 才需要显式行）',
+    !repo.getSessionStatus.get({ memberId: 'copilot@p1', sessionId: 'cop-sid-1' })
+  );
 
   console.log('[2] 9F Copilot：在飞那轮收工 → 变 done + 成员卡回落 idle');
   copilotRows = [
@@ -239,8 +247,10 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   // 那个故障（老会话里跑新任务，行还是几天前那条、时间戳被 insertTask 的 COALESCE 钉死）。
   ok('台账起点 = 这一轮的起点（不是会话第一次被看见的时刻）', Boolean(row7) && Number(row7.started_at) === round7Start, row7 && String(row7.started_at));
   ok('活跃会话 → 成员卡 busy', stateOf('kilo@p1') === 'busy', stateOf('kilo@p1'));
-  const kiloSessionStatus = repo.getSessionStatus.get({ memberId: 'kilo@p1', sessionId: 'kilo-sid-1' });
-  ok('Kilo 的在飞任务也记在该会话状态行上', kiloSessionStatus && kiloSessionStatus.task_id === 'kilo:kilo-sid-1:3' && kiloSessionStatus.state === 'busy');
+  ok(
+    'Kilo 的 busy 不写 session_status',
+    !repo.getSessionStatus.get({ memberId: 'kilo@p1', sessionId: 'kilo-sid-1' })
+  );
 
   console.log('[4] 7F Kilo Code：一轮收工 → 成员卡回落 idle，时长是真的');
   const round7End = Date.now() - 30 * 60_000;
@@ -292,7 +302,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const seven2 = await get(`project=p1&client=${F7.join(',')}&limit=50`);
   const active7 = seven2.find((t) => t.id === 'kilo:kilo-sid-active:0') || null;
   ok('7F 运行中的任务是 running（不是 cancelled）', Boolean(active7) && active7.state === 'running', active7 && active7.state);
-  ok('心跳指着在跑的那条任务', taskIdOf('kilo@p1') === 'kilo:kilo-sid-active:0', taskIdOf('kilo@p1'));
+  ok('在跑的那条任务按会话可见', taskIdOf('kilo@p1', 'kilo-sid-active') === 'kilo:kilo-sid-active:0', taskIdOf('kilo@p1', 'kilo-sid-active'));
 
   console.log('[5b] 7F：下一轮开始时，上一轮被定稿（不许永远挂在 running）');
   // 只记"当前这一轮"，所以上一轮的状态是**下一条用户任务来了以后**才补上的。
@@ -304,7 +314,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('上一轮被定稿成 done', Boolean(prev7) && prev7.state === 'done', prev7 && prev7.state);
   const now7 = repo.getTask.get('kilo:kilo-sid-active:1');
   ok('当前这一轮是 running', Boolean(now7) && now7.state === 'running', now7 && now7.state);
-  ok('心跳改指新的一轮', taskIdOf('kilo@p1') === 'kilo:kilo-sid-active:1', taskIdOf('kilo@p1'));
+  ok('同一会话切到新的一轮', taskIdOf('kilo@p1', 'kilo-sid-active') === 'kilo:kilo-sid-active:1', taskIdOf('kilo@p1', 'kilo-sid-active'));
 
   console.log('[5c] 7F：插件在场就整条让位（会话里已有插件写的行 → 轮询不写自己的行）');
   // 回归（2026-09-30 实测）：判据原先是「这个会话有没有 client === 'kilo-plugin' 的行」，
@@ -337,11 +347,13 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   bus.ensureProject('p2', '/tmp/p2', null, 'report'); // 台账行有工程外键，先让工程存在
   repo.insertTask.run({ id: 'k_plugin_d', projectId: 'p2', memberId: 'kilo-plugin@p2', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: dPlug.startedAt, endedAt: null });
   repo.upsertTaskRun.run({ id: 'k_plugin_d', projectId: 'p2', memberId: 'kilo-plugin@p2', client: 'kilo-plugin', sessionId: 'kilo-sid-d-plugin', form: 'plugin', model: null, title: '插件那条', startedAt: dPlug.startedAt, baselineCommit: null });
-  // stateOf / taskIdOf 那两个小工具是给 p1 写死的，这里问的是 p2 的成员卡
   const cardP2 = () => (bus.buildSnapshot('p2').members.find((x) => x.memberId === 'kilo@p2') || {});
-  const hbP2 = () => (cardP2().task && cardP2().task.id) || '';
   ok('让位那条不写轮询行，同工程另一条照写', syncKiloTasks({ bus, repo }) === 1);
-  ok('同工程在跑的那条照样拿得到心跳', hbP2() === 'kilo:kilo-sid-d-run:0', hbP2());
+  ok(
+    '同工程在跑的那条照样按会话可见',
+    taskIdOf('kilo@p2', 'kilo-sid-d-run', 'p2') === 'kilo:kilo-sid-d-run:0',
+    taskIdOf('kilo@p2', 'kilo-sid-d-run', 'p2')
+  );
   const two2 = await get(`project=p2&client=${F7.join(',')}&limit=50`);
   const runD = two2.find((t) => t.id === 'kilo:kilo-sid-d-run:0') || null;
   ok('它在任务列表里是 running（没被判成「已取消」）', Boolean(runD) && runD.state === 'running', runD && runD.state);
@@ -351,14 +363,20 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   // resolveClient）—— 插件与轮询写的是同一条 agent_status，谁最后写谁赢。轮询 5s 一次，
   // 不让开就会把插件刚写的相位覆盖成自己那份旧状态（现场：相位在两个值之间来回跳）。
   repo.upsertTaskRun.run({ id: 'k_plugin_d', projectId: 'p2', memberId: 'kilo@p2', client: 'kilo', sessionId: 'kilo-sid-d-plugin', form: 'cli', model: null, title: '插件那条', startedAt: dPlug.startedAt, baselineCommit: null });
-  repo.upsertStatus.run({ memberId: 'kilo@p2', state: 'blocked', stateSince: 1, taskId: 'k_plugin_d', progress: null, currentFiles: null, lastHeartbeatAt: Date.now(), degraded: 0, source: 'report', updatedAt: Date.now() });
+  bus.setBlocked({ project: 'p2', memberId: 'kilo@p2', sessionId: 'kilo-sid-d-plugin', ts: 1 });
   syncKiloTasks({ bus, repo });
   ok('插件那份状态没被轮询覆盖', cardP2().state === 'blocked', cardP2().state);
-  // 插件那条收工后（不再有在飞的轮）这一栏交回轮询 —— 否则同工程别的会话永远没有心跳
+  // The plugin finishes and clears its own explicit blocked row. The polling session remains visible.
   dPlug.endedAt = dPlug.startedAt + 1_000;
   dPlug.outcome = 'done';
+  repo.updateTask.run({ id: 'k_plugin_d', state: 'done', progress: 1, endedAt: dPlug.endedAt });
+  bus.clearBlocked({ project: 'p2', memberId: 'kilo@p2', sessionId: 'kilo-sid-d-plugin' });
   syncKiloTasks({ bus, repo });
-  ok('插件那轮收工后，心跳交回轮询', hbP2() === 'kilo:kilo-sid-d-run:0', hbP2());
+  ok(
+    '插件那轮收工后，轮询会话的任务仍然可见',
+    taskIdOf('kilo@p2', 'kilo-sid-d-run', 'p2') === 'kilo:kilo-sid-d-run:0',
+    taskIdOf('kilo@p2', 'kilo-sid-d-run', 'p2')
+  );
 
   console.log('[5e] 7F：源里已经没有的那几轮被收掉（别再挂在 running 上冒充「已取消」）');
   // 轮次表缩短时（Kilo 清了消息 / 压过上下文），比最后一轮靠后的行永远等不到自己的轮，
@@ -468,7 +486,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('老轮躺成 done', Boolean(old9) && old9.state === 'done', old9 && old9.state);
   ok('在飞那轮 running（lastUpdated 半小时前也不影响）', Boolean(live9) && live9.state === 'running', live9 && live9.state);
   ok('成员卡 busy', stateOf('copilot@p1') === 'busy', stateOf('copilot@p1'));
-  ok('心跳指着在跑的那条任务', taskIdOf('copilot@p1') === 'copilot:cop-sid-live:1', taskIdOf('copilot@p1'));
+  ok('在跑的那条任务按会话可见', taskIdOf('copilot@p1', 'cop-sid-live') === 'copilot:cop-sid-live:1', taskIdOf('copilot@p1', 'cop-sid-live'));
 
   copilotRows = [
     {
@@ -516,9 +534,15 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('模型带上了（OpenCode 的 session.model）', Boolean(oc0) && oc0.model === 'longcat-2.5-preview-free', oc0 && oc0.model);
   // 回归：轮询那一路是 CLI/Desktop 形态，任务详情的「客户端」必须显示「OpenCode CLI」而不是只显示「OpenCode」
   ok('任务详情「客户端」= OpenCode CLI（轮询那一路不是插件形态）', Boolean(oc0) && oc0.client_label === 'OpenCode CLI', oc0 && oc0.client_label);
-  ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('opencode@p1') === 'busy' && taskIdOf('opencode@p1') === 'opencode:oc-sid-1:1', `${stateOf('opencode@p1')} / ${taskIdOf('opencode@p1')}`);
-  const opencodeSessionStatus = repo.getSessionStatus.get({ memberId: 'opencode@p1', sessionId: 'oc-sid-1' });
-  ok('OpenCode 的在飞任务也记在该会话状态行上', opencodeSessionStatus && opencodeSessionStatus.task_id === 'opencode:oc-sid-1:1' && opencodeSessionStatus.state === 'busy');
+  ok(
+    '在飞 → 成员卡 busy，任务按会话选中',
+    stateOf('opencode@p1') === 'busy' && taskIdOf('opencode@p1', 'oc-sid-1') === 'opencode:oc-sid-1:1',
+    `${stateOf('opencode@p1')} / ${taskIdOf('opencode@p1', 'oc-sid-1')}`
+  );
+  ok(
+    'OpenCode 的 busy 不写 session_status',
+    !repo.getSessionStatus.get({ memberId: 'opencode@p1', sessionId: 'oc-sid-1' })
+  );
 
   opencodeRows = [
     {
@@ -568,7 +592,11 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   repo.insertTask.run({ id: 't_oc_held', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '插件那条', state: 'running', progress: null, startedAt: yhTurn.startedAt, endedAt: null });
   repo.upsertTaskRun.run({ id: 't_oc_held', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode-plugin', sessionId: 'oc-sid-y-held', form: 'plugin', model: null, title: '插件那条', startedAt: yhTurn.startedAt, baselineCommit: null });
   ok('让位那条不写轮询行，同工程另一条照写', syncOpencodeTasks({ bus, repo }) === 1);
-  ok('同工程在跑的那条照样拿得到心跳', taskIdOf('opencode@p1') === 'opencode:oc-sid-y-run:0', taskIdOf('opencode@p1'));
+  ok(
+    '同工程在跑的那条照样按会话可见',
+    taskIdOf('opencode@p1', 'oc-sid-y-run') === 'opencode:oc-sid-y-run:0',
+    taskIdOf('opencode@p1', 'oc-sid-y-run')
+  );
   const eightB = await get(`project=p1&client=${F8.join(',')}&limit=50`);
   const runY = eightB.find((t) => t.id === 'opencode:oc-sid-y-run:0') || null;
   ok('它在任务列表里是 running（没被判成「已取消」）', Boolean(runY) && runY.state === 'running', runY && runY.state);
@@ -713,19 +741,17 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   copilotRows = [];
 
   console.log('\n[8b] 9F：没有会话时要把「思考中」落回空闲（否则卡片一直显示忙碌，却没有任务）');
-  // 用户实测（2026-09-30）：GitHub Copilot 楼层一直「忙碌」，可库里那条占位任务早被收掉了 ——
-  // agent_status 还停在最后一次上报的 thinking（task_id 指向一条已经不在的任务）。
-  // 9F 没有 hook / 插件上报，这条状态行只有同步器会写；不在的会话就必须落回 idle。
+  // A stale running task without a live session must be closed. Busy is derived from tasks, so no
+  // separate agent_status row is involved.
   const staleAt = Date.now() - 5 * 60_000;
   repo.insertTask.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: '(Copilot 会话)', state: 'running', progress: null, startedAt: staleAt, endedAt: null });
   repo.upsertTaskRun.run({ id: 'copilot:gone:0', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'gone', form: null, model: null, title: '(Copilot 会话)', startedAt: staleAt, baselineCommit: null });
-  repo.upsertStatus.run({ memberId: 'copilot@p1', state: 'busy', stateSince: staleAt, taskId: 'copilot:gone:0', progress: null, currentFiles: null, lastHeartbeatAt: staleAt, degraded: 1, source: 'timeout', updatedAt: staleAt });
   copilotRows = [];
   syncCopilotTasks({ bus, repo });
-  const settled = repo.getStatus.get('copilot@p1');
-  ok('状态落回 idle（卡片显示「空闲」而不是「忙碌」）', settled && settled.state === 'idle', settled && settled.state);
-  ok('悬空的 task_id 一起清掉（卡片不会再挂一个不存在的任务）', settled && settled.task_id === null, settled && String(settled.task_id));
-  ok('成员卡上也没有任务了', stateOf('copilot@p1') === 'idle' && taskIdOf('copilot@p1') === '', `${stateOf('copilot@p1')} / ${taskIdOf('copilot@p1')}`);
+  const settledTask = repo.getTask.get('copilot:gone:0');
+  ok('状态落回 idle（卡片显示「空闲」而不是「忙碌」）', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
+  ok('悬空任务被关闭', Boolean(settledTask) && settledTask.state === 'cancelled', settledTask && settledTask.state);
+  ok('成员卡上也没有任务了', taskIdOf('copilot@p1', 'gone') === '', taskIdOf('copilot@p1', 'gone'));
 
   console.log('\n[8c] 9F：有会话在跑时，收工那一手不许碰它（真值优先）');
   copilotRows = [
@@ -745,7 +771,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ];
   syncCopilotTasks({ bus, repo });
   ok('按会话写了 busy 的成员不被收工覆盖', stateOf('copilot@p1') === 'busy', stateOf('copilot@p1'));
-  ok('心跳指着在跑的那条任务', taskIdOf('copilot@p1') === 'copilot:cop-sid-keep:0', taskIdOf('copilot@p1'));
+  ok('在跑的那条任务按会话可见', taskIdOf('copilot@p1', 'cop-sid-keep') === 'copilot:cop-sid-keep:0', taskIdOf('copilot@p1', 'cop-sid-keep'));
   copilotRows = [];
   syncCopilotTasks({ bus, repo });
   ok('会话停掉后再跑一轮 → 落回 idle', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
@@ -845,7 +871,11 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('客户端带上形态：vscode 扩展 → Cline Plugin', Boolean(rowC0) && rowC0.client_label === 'Cline Plugin', rowC0 && rowC0.client_label);
   ok('改动文件落 0（这轮没写文件工具：file_count=0、files_json=null）', Boolean(rowC0) && rowC0.files_json == null && rowC0.file_count === 0, rowC0 && `${rowC0.file_count} ${rowC0.files_json}`);
   ok('输出 = 那一轮的收尾自述（任务详情「输出」栏）', Boolean(rowC0) && rowC0.result === '第一轮收尾报告', rowC0 && rowC0.result);
-  ok('在飞 → 成员卡 busy，心跳指着在飞那条', stateOf('cline@p1') === 'busy' && taskIdOf('cline@p1') === 'cline:cline-sid-1:1', `${stateOf('cline@p1')} / ${taskIdOf('cline@p1')}`);
+  ok(
+    '在飞 → 成员卡 busy，任务按会话选中',
+    stateOf('cline@p1') === 'busy' && taskIdOf('cline@p1', 'cline-sid-1') === 'cline:cline-sid-1:1',
+    `${stateOf('cline@p1')} / ${taskIdOf('cline@p1', 'cline-sid-1')}`
+  );
 
   console.log('[8b] 2F Cline：在飞那轮收工 → done + 成员卡回落 idle + token 真值');
   clineRows = [

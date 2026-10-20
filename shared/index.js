@@ -10,12 +10,11 @@
 const PROTOCOL_VERSION = 2;
 
 /**
- * Member states. "Thinking / waiting for the model" is **not** a separate state — it is part of `busy`
- * (see requirements §5.5: "thinking / waiting for the LLM → busy"); the main console's finer
- * "thinking vs calling a tool" distinction lives on the **phase** axis (sessionPhase.phase), not here.
- * @type {ReadonlyArray<'online'|'busy'|'idle'|'blocked'|'offline'>}
+ * Workstation states. "Thinking / waiting for the model" is part of `busy`; connection liveness and
+ * inferred session phases belong to other axes and are not workstation states.
+ * @type {ReadonlyArray<'busy'|'idle'|'blocked'>}
  */
-const AGENT_STATES = Object.freeze(['online', 'busy', 'idle', 'blocked', 'offline']);
+const AGENT_STATES = Object.freeze(['busy', 'idle', 'blocked']);
 
 /** @type {ReadonlyArray<'pending'|'running'|'done'|'failed'|'cancelled'>} */
 const TASK_STATES = Object.freeze(['pending', 'running', 'done', 'failed', 'cancelled']);
@@ -30,20 +29,17 @@ const MESSAGE_TYPES = Object.freeze([
   'review',
   'error',
   'shutdown',
-  'heartbeat',
   'system',
 ]);
 
-/** Data source: report = the agent reports it (truth); watch = dir-watch fallback (inferred); timeout = heartbeat timeout (inferred) */
-const SOURCES = Object.freeze(['report', 'watch', 'timeout']);
+/** Data source: report = the agent reports it (truth); watch = directory polling fallback (inferred). */
+const SOURCES = Object.freeze(['report', 'watch']);
 
 const DEFAULTS = Object.freeze({
   PORT_START: 21800,
   PORT_END: 21820,
-  /** No reported heartbeat for longer than this -> degraded (greyed out + marked "inferred") */
-  HEARTBEAT_TIMEOUT_MS: 60_000,
-  /** HTTP poll interval after the WS drops */
-  DEGRADED_POLL_MS: 2_000,
+  /** WebSocket transport ping timeout. This is not a workstation or task-liveness signal. */
+  WS_HEARTBEAT_TIMEOUT_MS: 60_000,
   /** member.status broadcast merge window */
   STATUS_MERGE_MS: 200,
   /** M0 message window cap (M2 swaps in virtual scrolling) */
@@ -187,7 +183,6 @@ const HTTP_ROUTES = Object.freeze({
   MESSAGES: '/api/v1/messages',
   PROJECTS: '/api/v1/projects',
   REGISTER: '/api/v1/register',
-  HEARTBEAT: '/api/v1/heartbeat',
   TASK_START: '/api/v1/task/start',
   TASK_PROGRESS: '/api/v1/task/progress',
   TASK_END: '/api/v1/task/end',
@@ -198,7 +193,6 @@ const HTTP_ROUTES = Object.freeze({
   // so it is unreadable at round end → wait for it to land and backfill, writing only the four token columns and
   // not touching any other field of the row.
   TASK_TOKENS: '/api/v1/task/tokens',
-  STATUS: '/api/v1/status',
   MESSAGE: '/api/v1/message',
   FILE_TOUCH: '/api/v1/file/touch',
   // Tool-usage count: a tool was used again within a task round (task detail's "tool usage")
@@ -283,20 +277,16 @@ function formatClock(ms) {
 
 /** State -> label (user-facing UI text, kept in Chinese) */
 const STATE_LABELS = Object.freeze({
-  online: '在线',
   busy: '忙碌',
   idle: '空闲',
   blocked: '阻塞',
-  offline: '离线',
 });
 
 /** State -> theme color (kept in sync with renderer/src/styles/theme.css) */
 const STATE_COLORS = Object.freeze({
-  online: 'var(--state-online)',
   busy: 'var(--state-busy)',
   idle: 'var(--state-idle)',
   blocked: 'var(--state-blocked)',
-  offline: 'var(--state-offline)',
 });
 
 /**

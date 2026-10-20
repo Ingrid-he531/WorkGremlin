@@ -54,7 +54,6 @@ repo.upsertMember.run({
   sessionId: null,
   reported: 1,
   createdAt: 1,
-  lastSeenAt: 1,
   ephemeral: 0,
   projectLabel: null,
   client: 'codebuddy',

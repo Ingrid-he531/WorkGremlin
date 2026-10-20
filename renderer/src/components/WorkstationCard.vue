@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import StatusBadge from './StatusBadge.vue';
 import { formatClock } from '@workgremlin/shared';
-import { summonTaskOf, summonTaskStartedAt, summonTaskTitle } from '../lib/memberTask';
+import { memberForSession, summonTaskStartedAt, summonTaskTitle } from '../lib/memberTask';
 import { useI18n } from '../i18n';
 
 const { t } = useI18n();
@@ -11,18 +11,21 @@ const props = defineProps({
   member: { type: Object, required: true },
   /** All members of the same project (including summon ghosts): when a minion is summoned, its current task borrows the entry from the ghost with the same name */
   members: { type: Array, default: () => [] },
+  /** Selected session: tasks and blocked state must never leak from another session */
+  sessionId: { type: String, default: '' },
 });
 
 /** The main agent and subagents each show their own task description on the workstation card; this switch tells them apart */
 const isSubagent = computed(() => props.member.role && props.member.role.startsWith('subagent'));
 
-/** Current task: for the definition see lib/memberTask.js (when idle, the slot entry is the **previous task** and does not count as the current one).
- *  A minion does not hold a task itself (the task lives on the `subagent-<name>` ghost) → borrow the running ghost with the same name. */
-const currentTask = computed(() => summonTaskOf(props.member, props.members));
+/** Current task: for the definition see lib/memberTask.js. A resident minion may borrow
+ *  the running task from its summoned ghost with the same name. */
+const scopedMember = computed(() => memberForSession(props.member, props.sessionId, props.members));
+const currentTask = computed(() => scopedMember.value.task);
 /** Whether the current task is in progress (drives the mutually exclusive "elapsed / last active" display) */
 const hasTask = computed(() => Boolean(currentTask.value));
-/** This slot is always present: it honestly shows "Idle" when there is no current task, so the previous task is not left on the card */
-const taskTitle = computed(() => summonTaskTitle(props.member, props.members) || t('card.idle'));
+/** This field is always present: it shows "Idle" when there is no current task, so history is not left on the card */
+const taskTitle = computed(() => summonTaskTitle(props.member, props.members, props.sessionId) || t('card.idle'));
 
 /** Short id: coder@workgremlin -> coder (used for data-testid to keep selectors stable) */
 const agentId = computed(() => props.member.memberId.split('@')[0]);
@@ -33,8 +36,8 @@ const agentId = computed(() => props.member.memberId.split('@')[0]);
  * Relative durations need the UI to recompute every second; once that recomputation breaks you get "1F's last active frozen while 3F's elapsed keeps climbing",
  * these two behaviors on the same screen (measured by the user on 2026-09-30). Hard-coded time points need no timer and never miss a refresh.
  */
-const startAt = computed(() => formatClock(summonTaskStartedAt(props.member, props.members) || props.member.stateSince));
-const lastActiveAt = computed(() => formatClock(props.member.lastTaskAt) || '—');
+const startAt = computed(() => formatClock(summonTaskStartedAt(props.member, props.members, props.sessionId) || scopedMember.value.stateSince));
+const lastActiveAt = computed(() => formatClock(scopedMember.value.lastTaskAt) || '—');
 
 /** Role text: on the workstation card the main agent and subagents are shown in Chinese; project-level / user-level subagents are labeled separately. */
 const roleLabel = computed(() => {
@@ -48,15 +51,14 @@ const roleLabel = computed(() => {
 </script>
 
 <template>
-  <section class="card" :data-testid="`seat-card-${agentId}`" :class="{ 'is-degraded': member.degraded }">
+  <section class="card" :data-testid="`seat-card-${agentId}`">
     <header>
       <div class="who">
         <h3>{{ member.name }}</h3>
         <span class="role dim">{{ roleLabel }}</span>
       </div>
       <StatusBadge
-        :state="member.state"
-        :degraded="member.degraded"
+        :state="scopedMember.state"
         :testid="`seat-status-${agentId}`"
       />
     </header>
@@ -70,7 +72,7 @@ const roleLabel = computed(() => {
            nothing advances it in between (all 489 tasks in the local store fall in {0,1}, see the "progress" row of TaskRecordsView),
            so drawing it would only show two states, "empty bar" and "full bar", which is reporting a progress that does not exist.
            Once real progress exists, hook ProgressBar back up (it itself renders null as "progress unknown (not reported)"). -->
-      <!-- <ProgressBar :value="member.task ? member.task.progress : null" :testid="`seat-progress-${agentId}`" /> -->
+      <!-- <ProgressBar :value="currentTask ? currentTask.progress : null" :testid="`seat-progress-${agentId}`" /> -->
     </div>
 
     <div v-if="isSubagent && member.description" class="subagent-desc" :data-testid="`seat-desc-${agentId}`">
@@ -95,10 +97,6 @@ const roleLabel = computed(() => {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-}
-
-.card.is-degraded {
-  border-style: dashed;
 }
 
 header {

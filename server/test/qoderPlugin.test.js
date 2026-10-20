@@ -144,10 +144,13 @@ bus.ensureProject('p1', PROJ, null, 'report');
 const products = detectProducts();
 const F6 = ((products.find((p) => p.id === '6F') || {}).clients) || [];
 
-/** 成员卡状态（工位上那只小怪物显示的相位）/ 卡上挂着的那条任务 */
+/** Member-card phase and the running task for one session. */
 const cardOf = (memberId) => bus.buildSnapshot('p1').members.find((x) => x.memberId === memberId) || {};
 const stateOf = (memberId) => cardOf(memberId).state;
-const taskIdOf = (memberId) => (cardOf(memberId).task && cardOf(memberId).task.id) || '';
+const taskIdOf = (memberId, sessionId) => {
+  const task = (cardOf(memberId).tasks || []).find((row) => String(row.sessionId || '') === sessionId);
+  return (task && task.id) || '';
+};
 const MEMBER = 'qoder@p1';
 
 const app = express();
@@ -268,9 +271,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('还在飞的那轮不写产出（半截话不算）', Boolean(row1) && !row1.result, row1 && row1.result);
   ok('改动文件转成工程相对路径', Boolean(row0) && row0.file_count === 1 && String(row0.files_json) === JSON.stringify(['server/test/pluginReply.test.js']), row0 && `${row0.file_count} ${row0.files_json}`);
   ok('形态标成 vscode（isPluginClient 认它 → 任务列表显示「Qoder Plugin」而不是 CLI）', Boolean(row1) && row1.form === 'vscode', row1 && row1.form);
-  ok('在飞 → 成员卡 thinking，心跳指着在飞那条', stateOf(MEMBER) === 'busy' && taskIdOf(MEMBER) === `${TASK_ID_PREFIX}s-live:1`, `${stateOf(MEMBER)} / ${taskIdOf(MEMBER)}`);
-  const sessionStatus = repo.getSessionStatus.get({ memberId: MEMBER, sessionId: 's-live' });
-  ok('Qoder 插件的在飞任务也记在该会话状态行上', sessionStatus && sessionStatus.task_id === `${TASK_ID_PREFIX}s-live:1` && sessionStatus.state === 'busy');
+  ok('在飞任务直接推导 busy，并按会话选中那一条', stateOf(MEMBER) === 'busy' && taskIdOf(MEMBER, 's-live') === `${TASK_ID_PREFIX}s-live:1`, `${stateOf(MEMBER)} / ${taskIdOf(MEMBER, 's-live')}`);
+  ok('running task 不额外持久化 busy 状态行', repo.getSessionStatus.get({ memberId: MEMBER, sessionId: 's-live' }) === undefined);
   ok('成员与 CLI 那一路是同一个（qoder@p1，同一层同一个工位），插件先来的话名字叫 Qoder', (repo.getMember.get(MEMBER) || {}).name === 'Qoder', JSON.stringify(repo.getMember.get(MEMBER)));
 
   head('[B1b] 幂等：连跑两次不会插重、不会把起点推走');
@@ -296,16 +298,16 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('成员卡回落 idle（不再永远"思考中"）', stateOf(MEMBER) === 'idle', stateOf(MEMBER));
   ok('LIVE_MS 是 90 秒（判据见该常量处）', LIVE_MS === 90_000, String(LIVE_MS));
 
-  head('[B3] CLI 那一路在跑 → 插件这一路只写台账，不许压掉 CLI 的相位');
-  // 回归口径（同 7F 的 [5d-2]）：qoder@p1 是 CLI 与插件**共用**的成员，agent_status 一行一成员、
-  // 只有一个 task_id 槽位。插件这一路 5 秒硬写一次，会让 CLI 刚上报的相位来回跳。
+  head('[B3] CLI and plugin sessions stay isolated');
+  // qoder@p1 is shared by the CLI and plugin forms. Each session owns its own blocked row and running
+  // task, so the plugin sync must not overwrite the CLI session's explicit authorization wait.
   writeDb({
     sessions: [{ id: 's-cli', title: '插件会话', lastEventAt: NOW }],
     records: [{ requestId: 'c0', sessionId: 's-cli', prompt: '插件这一轮在跑', startedAt: NOW - 3_000, updatedAt: NOW - 1_000 }],
   });
   repo.insertTask.run({ id: 't_cli_1', projectId: 'p1', memberId: MEMBER, parentTaskId: null, title: 'CLI 那一轮', state: 'running', progress: null, startedAt: NOW - 8_000, endedAt: null });
   repo.upsertTaskRun.run({ id: 't_cli_1', projectId: 'p1', memberId: MEMBER, client: 'qoder', sessionId: 'cli-session-1', form: 'cli', model: null, title: 'CLI 那一轮', startedAt: NOW - 8_000, baselineCommit: null });
-  repo.upsertStatus.run({ memberId: MEMBER, state: 'blocked', stateSince: NOW - 8_000, taskId: 't_cli_1', progress: null, currentFiles: null, lastHeartbeatAt: Date.now(), degraded: 0, source: 'report', updatedAt: Date.now() });
+  bus.setBlocked({ project: 'p1', memberId: MEMBER, sessionId: 'cli-session-1', ts: NOW - 8_000 });
   const nameBefore = repo.getMember.get(MEMBER).name;
   ok('同步器照样写台账（一行都不少）', syncQoderPluginTasks({ bus, repo }) === 1);
   // 名字由第一次落库的那一路定（repo.upsertMember 的 ON CONFLICT 不更新 name）：
@@ -313,15 +315,16 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   // 这一路每 5 秒写一次，绝不能把名字改来改去。
   ok('这一路不改已有成员的名字', repo.getMember.get(MEMBER).name === nameBefore, `${nameBefore} → ${repo.getMember.get(MEMBER).name}`);
   ok('CLI 那份相位没被覆盖（还是 blocked）', stateOf(MEMBER) === 'blocked', stateOf(MEMBER));
-  ok('心跳还指着 CLI 那条任务', taskIdOf(MEMBER) === 't_cli_1', taskIdOf(MEMBER));
+  ok('CLI 与会话各自的 running task 都保留', taskIdOf(MEMBER, 'cli-session-1') === 't_cli_1' && taskIdOf(MEMBER, 's-cli') === `${TASK_ID_PREFIX}s-cli:0`, `${taskIdOf(MEMBER, 'cli-session-1')} / ${taskIdOf(MEMBER, 's-cli')}`);
 
-  head('[B3b] CLI 的心跳过期了（进程没了/断了）→ 这一栏收回来，别冻在旧状态上');
-  repo.upsertStatus.run({ memberId: MEMBER, state: 'blocked', stateSince: NOW - 30 * MIN, taskId: 't_cli_1', progress: null, currentFiles: null, lastHeartbeatAt: Date.now() - 30 * MIN, degraded: 0, source: 'report', updatedAt: Date.now() - 30 * MIN });
+  head('[B3b] Blocked has no heartbeat expiry');
   syncQoderPluginTasks({ bus, repo });
-  ok('心跳交回插件这一路', taskIdOf(MEMBER) === `${TASK_ID_PREFIX}s-cli:0`, taskIdOf(MEMBER));
-  ok('状态跟着变成 busy（这一轮在跑）', stateOf(MEMBER) === 'busy', stateOf(MEMBER));
+  ok('后续同步不会按时间清掉 blocked', stateOf(MEMBER) === 'blocked', stateOf(MEMBER));
+  bus.clearBlocked({ project: 'p1', memberId: MEMBER, sessionId: 'cli-session-1' });
+  ok('只有 clearBlocked 才解除阻塞', stateOf(MEMBER) === 'busy', stateOf(MEMBER));
+  ok('解除阻塞不影响插件会话自己的 running task', taskIdOf(MEMBER, 's-cli') === `${TASK_ID_PREFIX}s-cli:0`, taskIdOf(MEMBER, 's-cli'));
 
-  head('[B4] 同工程两条会话：在跑的那条拿心跳（旧的那条不许抢）');
+  head('[B4] Two sessions in one project keep their own running tasks');
   writeDb({
     sessions: [
       { id: 's-held', title: '插件那条', lastEventAt: NOW },
@@ -333,7 +336,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     ],
   });
   ok('两条会话各写自己那一轮（共 2 条）', syncQoderPluginTasks({ bus, repo }) === 2);
-  ok('心跳指着在跑的那条', taskIdOf(MEMBER) === `${TASK_ID_PREFIX}s-held:0`, taskIdOf(MEMBER));
+  ok('在跑会话读取自己的 running task', taskIdOf(MEMBER, 's-held') === `${TASK_ID_PREFIX}s-held:0`, taskIdOf(MEMBER, 's-held'));
   const items4 = await get(`project=p1&client=${F6.join(',')}&limit=50`);
   const held = items4.find((t) => t.id === `${TASK_ID_PREFIX}s-held:0`) || null;
   const old = items4.find((t) => t.id === `${TASK_ID_PREFIX}s-old:0`) || null;

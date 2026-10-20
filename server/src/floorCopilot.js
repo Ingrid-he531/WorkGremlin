@@ -931,7 +931,7 @@ function isSessionActive(s, now) {
 /**
  * Write one ledger row (a line in both tasks and task_runs). 9F is **one row per turn**, see
  * syncCopilotTasks' notes.
- * @returns {string|null} this record's files_json (the heartbeat's current_files reuses it directly)
+ * @returns {string|null} this record's files_json, reused directly by the workstation card
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, files }) {
   const running = !endedAt;
@@ -1009,54 +1009,6 @@ function pruneForeignRunningRuns(repo, copilotIds) {
   return removed;
 }
 
-/**
- * Closing time: put 9F members with **no session** this round back to "idle".
- *
- * agent_status is one row per member, written exclusively by this syncer (GitHub Copilot has neither a hook
- * nor plugin reporting). Once a session disappears (the session store was cleared / that session actually
- * belonged to another floor and was retracted / Copilot is not in use at all), the last "thinking" stays in
- * the db forever — the card then **shows busy forever with no task** (measured by the user on 2026-09-30:
- * 9F GitHub Copilot stayed busy although its placeholder task had long been retracted).
- * Same rule as 7F/8F's syncers: write an idle row when inactive so the state follows the session instead of
- * rotting there.
- *
- * Restraint:
- *   · Only members with client=CLIENT — nothing else writes 9F at this layer, so there is no contention;
- *   · Members already written from a session this round (`touched`) are never touched — user-level truth wins;
- *   · Already idle / offline rows are not rewritten;
- *   · Members with no status row are ignored (no inventing an "idle" out of thin air).
- *
- * @param {any} repo
- * @param {number} now
- * @param {Set<string>} touched member ids already written this round
- * @returns {number} how many were settled
- */
-function settleIdleMembers(repo, now, touched) {
-  let settled = 0;
-  for (const m of repo.listMembersByClient.all(CLIENT)) {
-    if (touched.has(m.id)) continue;
-    const s = repo.getStatus.get(m.id);
-    if (!s || s.state === 'idle' || s.state === 'offline') continue;
-    repo.upsertStatus.run({
-      memberId: m.id,
-      state: 'idle',
-      stateSince: now,
-      // Also clear the dangling task_id: the task it points at may be gone (a side effect of the cleanup above)
-      taskId: null,
-      progress: null,
-      currentFiles: null,
-      lastHeartbeatAt: now,
-      degraded: 0,
-      source: 'report',
-      updatedAt: now,
-    });
-    // upsertStatus' task_id is COALESCE (passing null cannot clear it), so the dangling slot needs its own clear
-    repo.clearStatusTask.run(m.id);
-    settled += 1;
-  }
-  return settled;
-}
-
 function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   const now = nowFn();
   /*
@@ -1079,12 +1031,29 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     client: 'copilot',
     pluginRe: RE_GITHUB_COPILOT,
   }).sessions || []).filter((s) => s.copilot === true);
+  const liveByProject = new Map();
+  for (const s of sessions) {
+    const projectId = s.project || (s.projectPath ? path.basename(s.projectPath) : 'GitHub Copilot');
+    if (!liveByProject.has(projectId)) liveByProject.set(projectId, []);
+    if (s.id) liveByProject.get(projectId).push(s.id);
+  }
+  const reconcileSessionStatuses = () => {
+    if (typeof bus.pruneSessionStatuses === 'function' && repo.listMembersByClient) {
+      for (const member of repo.listMembersByClient.all(CLIENT)) {
+        bus.pruneSessionStatuses({
+          project: member.project_id,
+          memberId: member.id,
+          sessionIds: liveByProject.get(member.project_id) || [],
+          ts: now,
+        });
+      }
+    }
+  };
   // Run even when there is not a single Copilot session: the misattributed row above appeared on exactly
   // such a machine (only other products' on-disk state present).
   pruneForeignRunningRuns(repo, new Set(sessions.map((s) => String(s.id || '')).filter(Boolean)));
   if (!sessions.length) {
-    // Not one session — still settle the previous round's "thinking" back to idle, or the card stays busy
-    settleIdleMembers(repo, now, new Set());
+    reconcileSessionStatuses();
     return 0;
   }
 
@@ -1094,28 +1063,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
   // without changing behavior.
   const model = module.exports.copilotCurrentModel();
   let count = 0;
-  /** Members whose status was written from a session this round (only the owner writes heartbeats) — the
-   *  settle step must skip them */
-  const statusWritten = new Set();
-
-  /**
-   * One project writes **one** member status (agent_status' primary key is member_id). With several sessions
-   * open in the same project, whoever writes last wins — the result is "the task that is running has no
-   * matching heartbeat in agent_status", and the task list's CASE in query.js counts it as "cancelled", so
-   * running tasks disappear. So first pick the session this project should report: the newest among active
-   * ones; if none is active, report the newest one (the card hangs on the last task).
-   */
-  const activeByProject = new Map();
-  const newestByProject = new Map();
-  for (const s of sessions) {
-    const pid = projectIdOf(s);
-    const prevNew = newestByProject.get(pid);
-    if (!prevNew || Number(s.lastUpdated || 0) > Number(prevNew.lastUpdated || 0)) newestByProject.set(pid, s);
-    if (!isSessionActive(s, now)) continue;
-    const prevAct = activeByProject.get(pid);
-    if (!prevAct || Number(s.lastUpdated || 0) > Number(prevAct.lastUpdated || 0)) activeByProject.set(pid, s);
-  }
-
   for (const s of sessions) {
     const projectPath = s.projectPath || '';
     const projectName = s.project || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
@@ -1133,7 +1080,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       sessionId: s.id || null,
       reported: existing ? existing.reported : 1,
       createdAt: existing ? existing.created_at : now,
-      lastSeenAt: now,
       ephemeral: 0,
       projectLabel: null,
       client: CLIENT,
@@ -1177,9 +1123,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       (Array.isArray(s.liveReqs) ? s.liveReqs : []).map((r) => [r.index, r])
     );
 
-    let hbId = '';
-    let hbFilesJson = null;
-
     // ① Every finished turn: one record (the title is that turn's exact user text)
     for (const t of turns) {
       const id = `${TASK_ID_PREFIX}${s.id}:${t.index}`;
@@ -1193,7 +1136,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       // 17:17:45 → 17:17:44).
       const prev = repo.getTask.get(id);
       if (prev && known && known.startedAt && prev.started_at !== startedAt) repo.deleteTaskRun(id);
-      hbFilesJson = writeTurnRun(repo, {
+      writeTurnRun(repo, {
         id,
         projectId,
         memberId,
@@ -1204,7 +1147,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         endedAt,
         files: filesFor(t.index),
       });
-      hbId = id;
       count += 1;
     }
 
@@ -1220,7 +1162,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       const idx = Math.max(logIdx, lastDone + 1);
       runningId = `${TASK_ID_PREFIX}${s.id}:${idx}`;
       const title = s.livePrompt || s.prompt || s.doneTitle || '(Copilot 会话)';
-      hbFilesJson = writeTurnRun(repo, {
+      writeTurnRun(repo, {
         id: runningId,
         projectId,
         memberId,
@@ -1231,7 +1173,6 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         endedAt: null,
         files: filesFor(idx),
       });
-      hbId = runningId;
       count += 1;
     }
 
@@ -1239,42 +1180,9 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     const legacyId = `${TASK_ID_PREFIX}${s.id}`;
     if (repo.getTaskRun.get(legacyId)) repo.deleteTaskRun(legacyId);
 
-    // Heartbeat: active → thinking, stopped → idle.
-    // **It must be written when inactive too**: writing only thinking leaves this agent_status row hanging in
-    // the db once the session stops, and the member card shows "thinking" forever (exactly 9F's symptom: the
-    // session stopped long ago, the station still shows thinking). Fall back to idle honestly instead of
-    // letting the old value rot.
-    // Only the session selected for this project writes the heartbeat (see activeByProject above)
-    const owner = activeByProject.get(projectId) || newestByProject.get(projectId);
-    if (owner === s && hbId) {
-      repo.upsertStatus.run({
-        memberId,
-        state: isActive ? 'busy' : 'idle',
-        stateSince: isActive ? (s.liveStartedAt || now) : now,
-        taskId: hbId,
-        progress: null,
-        currentFiles: hbFilesJson,
-        lastHeartbeatAt: now,
-        degraded: 0,
-        source: 'report',
-        updatedAt: now,
-      });
-      statusWritten.add(memberId);
-    }
-    bus.setSessionStatus({
-      project: projectId,
-      memberId: 'copilot',
-      sessionId: s.id,
-      state: isActive ? 'busy' : 'idle',
-      taskId: isActive ? runningId : null,
-      ts: now,
-    });
   }
 
-  // Closing time: members that did not get a status write this round (no session at all in the project) also
-  // go back to idle — do not let "thinking" rot in the db
-  settleIdleMembers(repo, now, statusWritten);
-
+  reconcileSessionStatuses();
   return count;
 }
 

@@ -20,8 +20,7 @@ export function busySubagentsOf(members, scope = {}) {
       isEphemeralMember(m) &&
       (m.state === 'busy' || m.state === 'blocked') &&
       floorAcceptsClient(client, m.client) &&
-      // Ghosts with no session id (old store / manual scripts) stay visible, same degraded rule
-      // as the scene roster: showing an extra ghost beats hiding every ghost.
+      // Ghosts with no session id (old store / manual scripts) stay visible rather than hiding every ghost.
       (!sessionId || !m.sessionId || m.sessionId === sessionId)
   );
 }

@@ -48,13 +48,11 @@ import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator } from './main
 import { t } from '../i18n/index.js';
 
 const STATE_COLOR = {
-  online: '#2ecc71',
   busy: '#f5a623',
   idle: '#7f8c9b',
   blocked: '#ff5c5c',
-  thinking: '#ffcf5c',
-  offline: '#4a5160',
 };
+const STATE_SUCCESS = '#2ecc71';
 /** Metal color of the magnet pin on the divider sticky note (metal part, does not change per floor).
  *  The note paper and ink colors are not hardcoded here —— they use this floor's palette colors.note / colors.noteInk (see officeMap's FLOOR_COLORS). */
 const MAGNET = '#c3ccda';
@@ -62,10 +60,9 @@ const MAGNET = '#c3ccda';
 const LEVEL_COLOR = { user: '#3b82f6', project: '#22c55e' };
 const levelColor = (level) => LEVEL_COLOR[level] || '#7c8aa5';
 /**
- * Public status badge has three buckets: blocked / busy / idle.
- * busy (including the old thinking value) -> busy; blocked -> blocked (waiting on an external dependency, old-man requirement §5.6); the rest -> idle.
+ * Public status badge has three buckets: blocked / busy / idle. Unknown values normalize to idle.
  */
-const bucketOf = (s) => (s === 'blocked' ? 'blocked' : s === 'busy' || s === 'thinking' ? 'busy' : 'idle');
+const bucketOf = (s) => (s === 'blocked' ? 'blocked' : s === 'busy' ? 'busy' : 'idle');
 /** What it is actually doing while busy (only decides walking/pinning to seat; the overhead tag no longer shows details) */
 const WORK_KEYS = ['think', 'code', 'doc'];
 const hashOf = (s) => {
@@ -270,7 +267,7 @@ export function createIsoOffice(canvas, opts = {}) {
   let dpr = 1;
   const cam = { zoom: 1, ox: 0, oy: 0 };
 
-  /** @type {Array<{memberId:string,state:string,degraded:boolean,ghost:boolean,project:string,name:string}>} */
+  /** @type {Array<{memberId:string,state:string,ghost:boolean,project:string,name:string}>} */
   let members = [];
   /** @type {any[]} */
   let agents = [];
@@ -666,7 +663,7 @@ export function createIsoOffice(canvas, opts = {}) {
     };
   }
 
-  /** Called from Vue: members is [{memberId, name, state, degraded, ghost, project, task, taskKey}] */
+  /** Called from Vue: members is [{memberId, name, state, ghost, project, task, taskKey}] */
   function setMembers(list) {
     members = list || [];
     const seated = members.filter((m) => !m.ghost).slice(0, DESK_UNITS.length);
@@ -815,8 +812,7 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   const memberOf = (id) => members.find((m) => m.memberId === id) || null;
-  const stateOf = (id) => (memberOf(id) || {}).state || 'offline';
-  const degradedOf = (id) => Boolean((memberOf(id) || {}).degraded);
+  const stateOf = (id) => (memberOf(id) || {}).state || 'idle';
 
   /* ------------------------------ Movement ------------------------------ */
 
@@ -2639,7 +2635,6 @@ export function createIsoOffice(canvas, opts = {}) {
       walking: a.moving,
       phase: a.phase,
       sitting: a.mode === 'sit' || a.mode === 'meet',
-      degraded: degradedOf(a.memberId),
       level: a.level,
     });
   }
@@ -2912,7 +2907,7 @@ export function createIsoOffice(canvas, opts = {}) {
         x: s.x,
         y,
         text: reportGhost.name,
-        color: STATE_COLOR.online,
+        color: STATE_SUCCESS,
         dashed: true,
       });
       pushHit('__report_ghost', s.x - box.w / 2, y - box.h, s.x + box.w / 2, y);

@@ -15,10 +15,7 @@ const path = require('node:path');
 
 /* ------------------------------ 沙箱 ------------------------------ */
 
-// **必须在 require 业务模块之前**改环境（与 doneAttribution.test.js 同款）：sessions.js 的
-// reporterHookHome / products.js 的 HOME 都在模块期取值。[6] 那段要靠 hook 状态文件复现
-// "同产品两条会话同时在跑"，不换的话读的是**真实 home** 的 hooks/ —— 自检结果会随机上
-// 正跑着什么而变。
+// Keep the reporter home isolated before loading modules that capture HOME at require time.
 const WG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-task-runs-home-'));
 process.env.WORKGREMLIN_HOME = WG_HOME;
 
@@ -56,7 +53,6 @@ repo.upsertMember.run({
   sessionId: null,
   reported: 1,
   createdAt: 1,
-  lastSeenAt: 1,
   ephemeral: 0,
   projectLabel: null,
   client: 'codex',
@@ -195,77 +191,60 @@ app.use('/api/v1', createIngestRouter({ bus }));
   ok('project_label = 目录里 package.json 的 name（stb-dashboard）', stb.project_label === 'stb-dashboard', JSON.stringify(stb.project_label));
   ok('库里那行 name 仍是带后缀的 id（只改显示，不动数据）', stb.project_name === 'stb-dashboard-2', JSON.stringify(stb.project_name));
 
-  console.log('[6] 同产品两条会话同时在跑：槽位要跟着还在跑的那条（否则它显示「已取消」）');
+  console.log('[6] 同产品两条会话同时在跑：任务各自独立，互不结束对方');
   /**
-   * 实测 2026-09-30 14:03（Kilo CLI）：会话 A 13:58:46 起的那一轮一直在跑，会话 B 14:03:26 起、
-   * 14:03:27 被用户打断收工。B 的 `/task/end` 命中 keepStateForOtherSession（A 还活着）→ 整块
-   * 跳过状态写入，槽位（agent_status 一行一成员、只有一个 task_id）于是停在**B 自己那条已经结束
-   * 的**任务上，A 那一轮在存活判定里找不到匹配行 → 任务列表里一直显示「已取消」。
-   *
-   * 这里照真实顺序走路由复现：两条 start → B end（B 的收工状态别被吞掉）→ 查列表里 A 是什么。
-   * 让 A "活着"的那份 hook 状态文件照 hook.js 的 statePath 命名写（`<agent>@<工程>@<会话>` 整体
-   * sanitize 成 `_`；判据 1 看 hb.pid 还活着，所以 pid 就给本进程）。
+   * `tasks.state` is the only liveness source. Starting B and ending B must leave A's running
+   * row untouched, without any per-member task slot or heartbeat handoff.
    */
-  const HOOKS_P1 = path.join(WG_HOME, 'hooks');
-  fs.mkdirSync(HOOKS_P1, { recursive: true });
-  fs.writeFileSync(
-    path.join(HOOKS_P1, 'codex___tmp_p1_s-cli-a.json'),
-    JSON.stringify({ client: 'codex', sessionId: 's-cli-a', hb: { pid: process.pid, lastEventAt: Date.now() } })
-  );
   await post('/task/start', { taskId: 't-cli-a', sessionId: 's-cli-a', title: 'A' });
   await post('/task/start', { taskId: 't-cli-b', sessionId: 's-cli-b', title: 'B' });
+  await post('/task/start', { taskId: 't-cli-c', sessionId: 's-cli-c', title: 'C' });
   await post('/task/end', { taskId: 't-cli-b', sessionId: 's-cli-b', state: 'cancelled', workspacePath: '/tmp/p1' });
   const afterEnd = await get('limit=50');
   const stateOf = (body, id) => ((body.items || []).find((t) => t.id === id) || {}).state;
-  ok('B 收工后 A 仍显示「进行中」（槽位交接给还没收工的那条）', stateOf(afterEnd.body, 't-cli-a') === 'running', JSON.stringify(stateOf(afterEnd.body, 't-cli-a')));
+  ok('B 收工后 A 仍显示「进行中」', stateOf(afterEnd.body, 't-cli-a') === 'running', JSON.stringify(stateOf(afterEnd.body, 't-cli-a')));
   ok('B 自己的「已取消」没被交接带走', stateOf(afterEnd.body, 't-cli-b') === 'cancelled', JSON.stringify(stateOf(afterEnd.body, 't-cli-b')));
+  ok('busy 不写 session_status', (repo.getSessionStatus.get({ memberId: 'codex@p1', sessionId: 's-cli-a' }) || null) === null);
 
-  // 收工那条会话的心跳**不许**把槽位抢回来（它台账里已经没有在飞的任务了）
-  await post('/heartbeat', { sessionId: 's-cli-b', workspacePath: '/tmp/p1' });
-  const afterBHb = await get('limit=50');
-  ok('收工那条会话的心跳不动槽位', stateOf(afterBHb.body, 't-cli-a') === 'running', JSON.stringify(stateOf(afterBHb.body, 't-cli-a')));
+  bus.setBlocked({ project: 'p1', memberId: 'codex', sessionId: 's-cli-a' });
+  ok(
+    '阻塞只写本会话的显式状态行',
+    repo.getSessionStatus.get({ memberId: 'codex@p1', sessionId: 's-cli-a' }).state === 'blocked' &&
+      (repo.getSessionStatus.get({ memberId: 'codex@p1', sessionId: 's-cli-b' }) || null) === null
+  );
+  const afterBlocked = repo.currentTasksOfMember.all('codex@p1');
+  ok(
+    'one blocked session does not rewrite any session task',
+    afterBlocked.length === 2 &&
+      afterBlocked.some((task) => task.id === 't-cli-a' && task.state === 'running') &&
+      afterBlocked.some((task) => task.id === 't-cli-c' && task.state === 'running') &&
+      repo.getTask.get('t-cli-b').state === 'cancelled',
+    JSON.stringify(afterBlocked.map((task) => [task.id, task.state]))
+  );
+  bus.clearBlocked({ project: 'p1', memberId: 'codex', sessionId: 's-cli-a' });
+  ok('clearBlocked 只清指定会话', (repo.getSessionStatus.get({ memberId: 'codex@p1', sessionId: 's-cli-a' }) || null) === null);
 
-  // 自愈：槽位因为任何原因指歪了（这里手工摆成"指着一条已完成的任务 + 挂在 idle 上"），
-  // 那条会话的下一次心跳要把它认领回来，并把 idle 抬成 busy（存活判定要求 busy/thinking/blocked）
-  repo.upsertStatus.run({
-    memberId: 'codex@p1',
-    state: 'idle',
-    stateSince: 1,
-    taskId: 't-plugin',
-    progress: null,
-    currentFiles: null,
-    lastHeartbeatAt: 1,
-    degraded: 0,
-    source: 'report',
-    updatedAt: 1,
-  });
-  await post('/heartbeat', { sessionId: 's-cli-a', workspacePath: '/tmp/p1' });
-  const st = repo.getStatus.get('codex@p1');
-  ok('心跳认领回本会话在飞的那条 + idle 抬成 busy', st.task_id === 't-cli-a' && st.state === 'busy', `${st.task_id}/${st.state}`);
-  const healed = await get('limit=50');
-  ok('列表里 A 跟着变回「进行中」', stateOf(healed.body, 't-cli-a') === 'running', JSON.stringify(stateOf(healed.body, 't-cli-a')));
-
-  console.log('[6b] CodeBuddy CLI 与 Plugin 是两个会话：后开的任务不能把先开的会话判成已取消');
-  bus.registerMember({ project: 'p1', memberId: 'codebuddy', name: 'CodeBuddy', role: 'agent', client: 'codebuddy-plugin' });
+  console.log('[6b] CodeBuddy CLI 与 Plugin 共用一个 floor 身份，但会话和形态独立');
+  bus.registerMember({ project: 'p1', memberId: 'codebuddy', name: 'CodeBuddy', role: 'agent', client: 'codebuddy' });
   await post('/task/start', {
     memberId: 'codebuddy', taskId: 't-cb-plugin', sessionId: 'cb-plugin-session',
-    client: 'codebuddy-plugin', title: 'Plugin 任务',
+    client: 'codebuddy', form: 'vscode', title: 'Plugin 任务',
   });
   bus.registerMember({ project: 'p1', memberId: 'codebuddy', name: 'CodeBuddy', role: 'agent', client: 'codebuddy' });
   await post('/task/start', {
     memberId: 'codebuddy', taskId: 't-cb-cli', sessionId: 'cb-cli-session',
-    client: 'codebuddy', title: 'CLI 任务',
+    client: 'codebuddy', form: 'cli', title: 'CLI 任务',
   });
-  const bothCodeBuddy = await get('limit=50&client=codebuddy,codebuddy-plugin');
+  const bothCodeBuddy = await get('limit=50&client=codebuddy');
   ok('Plugin 会话任务仍显示 running', stateOf(bothCodeBuddy.body, 't-cb-plugin') === 'running', JSON.stringify(stateOf(bothCodeBuddy.body, 't-cb-plugin')));
   ok('CLI 会话任务也显示 running', stateOf(bothCodeBuddy.body, 't-cb-cli') === 'running', JSON.stringify(stateOf(bothCodeBuddy.body, 't-cb-cli')));
   const pluginSessionStatus = repo.getSessionStatus.get({ memberId: 'codebuddy@p1', sessionId: 'cb-plugin-session' });
   const cliSessionStatus = repo.getSessionStatus.get({ memberId: 'codebuddy@p1', sessionId: 'cb-cli-session' });
-  ok('Plugin 与 CLI 各自有独立 task 状态行', pluginSessionStatus && pluginSessionStatus.task_id === 't-cb-plugin' && cliSessionStatus && cliSessionStatus.task_id === 't-cb-cli');
+  ok('Plugin 与 CLI 的 running task 都不写状态行', pluginSessionStatus == null && cliSessionStatus == null);
   await post('/task/end', {
     memberId: 'codebuddy', taskId: 't-cb-plugin', sessionId: 'cb-plugin-session', state: 'cancelled',
   });
-  const afterPluginEnd = await get('limit=50&client=codebuddy,codebuddy-plugin');
+  const afterPluginEnd = await get('limit=50&client=codebuddy');
   ok('Plugin 收工后只结束自己的任务', stateOf(afterPluginEnd.body, 't-cb-plugin') === 'cancelled', JSON.stringify(stateOf(afterPluginEnd.body, 't-cb-plugin')));
   ok('Plugin 收工不影响 CLI 会话继续 running', stateOf(afterPluginEnd.body, 't-cb-cli') === 'running', JSON.stringify(stateOf(afterPluginEnd.body, 't-cb-cli')));
 
@@ -313,8 +292,7 @@ app.use('/api/v1', createIngestRouter({ bus }));
 
   console.log('[8] /task-feed 每行带 sessionId（滚动屏据此把任务对回会话、读主 Agent 相位）');
   // The feed is the ticker's only source; it must carry the session id so the renderer can join it
-  // against the sessions snapshot and append the live phase suffix. A recently ended task is used here
-  // (a "running" one would additionally need a live heartbeat to pass taskAliveSql, which is the same SQL).
+  // against the sessions snapshot and append the live phase suffix.
   const feedNow = Date.now();
   repo.insertTask.run({
     id: 't-feed',

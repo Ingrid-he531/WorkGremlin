@@ -4,7 +4,6 @@
 /**
  * Command-line reporting (for shell hooks, or when you do not want to modify agent code):
  *
- *   node packages/reporter/src/cli.js --project my-project --member coder --state busy
  *   node packages/reporter/src/cli.js --member coder --task "implement the workstation view" --progress 0.4 --file a.vue b.vue
  *   node packages/reporter/src/cli.js --member coder --task-end done --artifact "file:docs/tech-design.md"
  *   node packages/reporter/src/cli.js --member coder --message --to leader --type result --subject "output" --content "submitted"
@@ -46,8 +45,6 @@ async function main() {
   const rep = await createReporter({ project, member, silent: false });
 
   try {
-    if (flags.state) await rep.status(flags.state, typeof flags.reason === 'string' ? flags.reason : undefined);
-
     if (flags.task) {
       const t = rep.task(flags.task);
       await t.start();
@@ -72,8 +69,6 @@ async function main() {
     }
 
     if (files.length && !flags.task) await rep.file(files, 'write');
-
-    if (!flags.state && !flags.task && !flags.message && !files.length) await rep.heartbeat();
   } finally {
     rep.close();
   }

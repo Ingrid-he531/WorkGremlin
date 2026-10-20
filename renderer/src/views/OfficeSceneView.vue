@@ -18,7 +18,10 @@ import GremlinSprite from '../components/GremlinSprite.vue';
 import GhostSprite from '../components/GhostSprite.vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
+import { useSessionStore } from '../stores/sessions';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
+import { floorAcceptsClient } from '../lib/clientMatch';
+import { memberForSession, normalizeState } from '../lib/memberTask';
 import { useI18n } from '../i18n';
 
 const { t } = useI18n();
@@ -42,42 +45,46 @@ const props = defineProps({
 const emit = defineEmits(['select']);
 
 const project = useProjectStore();
+const sessions = useSessionStore();
 
 const wrapRef = ref(null);
 const svgRef = ref(null);
 
 const STATE_COLOR = {
-  online: '#2ecc71',
   busy: '#f5a623',
   idle: '#7f8c9b',
   blocked: '#ff5c5c',
-  thinking: '#ffcf5c',
-  offline: '#4a5160',
 };
-/** Five main states → i18n keys (shared by the legend and the overhead tags) */
+/** Three workstation states -> i18n keys (shared by the legend and the overhead tags) */
 const STATE_KEY = {
-  online: 'state.online',
   busy: 'state.busy',
   idle: 'state.idle',
   blocked: 'state.blocked',
-  thinking: 'state.thinking',
-  offline: 'state.offline',
 };
-const stateText = (s) => t(STATE_KEY[s] || 'state.idle');
+const stateText = (s) => t(STATE_KEY[normalizeState(s)]);
 
 /* ------------------------------ Members → Workstations ------------------------------ */
 
 /** Expert team: resident members, one workstation each (ephemeral members take no workstation).
  *  The main Agent (role=agent) only shows up as a silhouette at the main console and takes no workstation, so it is dropped from the roster. */
-const roster = computed(() => project.members.filter((m) => !isEphemeralMember(m) && m.role !== 'agent').slice(0, DESKS.length));
+const roster = computed(() =>
+  project.members
+    .filter((m) => !isEphemeralMember(m) && m.role !== 'agent')
+    .filter((m) => floorAcceptsClient(sessions.selectedClient, m.client))
+    .slice(0, DESKS.length)
+);
 /** Ephemeral team members + members that do not fit at a workstation: no workstation, they float in mid-air */
 const ghostRoster = computed(() => {
   const seated = new Set(roster.value.map((m) => m.memberId));
-  return project.members.filter((m) => !seated.has(m.memberId));
+  const sid = sessions.selectedSessionId;
+  return project.members
+    .filter((m) => !seated.has(m.memberId))
+    .filter((m) => floorAcceptsClient(sessions.selectedClient, m.client))
+    .filter((m) => !isEphemeralMember(m) || !sid || !m.sessionId || m.sessionId === sid);
 });
 const memberOf = computed(() => {
   const m = new Map();
-  project.members.forEach((x) => m.set(x.memberId, x));
+  project.members.forEach((x) => m.set(x.memberId, memberForSession(x, sessions.selectedSessionId, project.members)));
   return m;
 });
 
@@ -155,8 +162,7 @@ watch(
   { immediate: true }
 );
 
-const stateOf = (a) => (memberOf.value.get(a.memberId) || {}).state || 'offline';
-const degradedOf = (a) => Boolean((memberOf.value.get(a.memberId) || {}).degraded);
+const stateOf = (a) => normalizeState((memberOf.value.get(a.memberId) || {}).state);
 
 /* ------------------------------ Movement ------------------------------ */
 
@@ -279,7 +285,9 @@ function frame(t) {
 /* ------------------------------ Meeting ------------------------------ */
 
 const manualMeeting = ref(false);
-const blockedIds = computed(() => project.members.filter((m) => m.state === 'blocked').map((m) => m.memberId));
+const blockedIds = computed(() =>
+  [...memberOf.value.values()].filter((m) => m.state === 'blocked' && !isEphemeralMember(m)).map((m) => m.memberId)
+);
 
 function startMeeting(ids) {
   let k = 0;
@@ -343,7 +351,7 @@ function tagText(a) {
   if (a.mode === 'meet') return t('tag.meeting');
   if (a.moving) return a.pendingMode && activityText(a.pendingMode) ? t('scene.going', { place: activityText(a.pendingMode) }) : t('scene.walking');
   if (a.dwell && activityText(a.mode)) return activityText(a.mode);
-  return stateText(stateOf(a)) + (degradedOf(a) ? '?' : '');
+  return stateText(stateOf(a));
 }
 
 /** Above a ghost: the project name takes priority (ephemeral members are pulled in for a specific project) */
@@ -418,7 +426,7 @@ const deskScreens = computed(() =>
     const m = roster.value[i];
     const seed = hash(m ? m.memberId : d.id);
     return {
-      color: STATE_COLOR[m ? m.state : 'offline'],
+      color: STATE_COLOR[normalizeState(m && m.state)],
       lines: [0, 1, 2].map((k) => 30 + ((seed >> (k * 3)) % 55)),
       // The crawl bar on the screen does **not** draw progress (progress was dropped on 2026-09-29): task.progress only has 0/1
       // two values (0 when work starts, 1 when it ends, and nobody advances it in between — see the "progress" row in TaskRecordsView),
@@ -541,7 +549,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           @click.stop="openCard(a, $event)"
         >
           <rect x="-32" y="-46" width="64" height="54" fill="transparent" />
-          <GremlinSprite :name="a.memberId" :state="stateOf(a)" :degraded="degradedOf(a)" :walking="false" />
+          <GremlinSprite :name="a.memberId" :state="stateOf(a)" :walking="false" />
         </g>
       </g>
 
@@ -627,7 +635,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
           @click.stop="openCard(a, $event)"
         >
           <rect x="-32" y="-46" width="64" height="54" fill="transparent" />
-          <GremlinSprite :name="a.memberId" :state="stateOf(a)" :degraded="degradedOf(a)" :walking="true" />
+          <GremlinSprite :name="a.memberId" :state="stateOf(a)" :walking="true" />
         </g>
       </g>
 
@@ -641,7 +649,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
             @click.stop="openCard(g, $event)"
           >
             <rect x="-32" y="-50" width="64" height="62" fill="transparent" />
-            <GhostSprite :name="g.memberId" :state="stateOf(g)" :degraded="degradedOf(g)" />
+            <GhostSprite :name="g.memberId" :state="stateOf(g)" />
           </g>
         </g>
       </g>
@@ -689,7 +697,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
       :style="{ left: `${card.left}px`, top: `${card.top}px` }"
       @click.stop
     >
-      <WorkstationCard :member="cardMember" :members="project.members" />
+      <WorkstationCard :member="cardMember" :members="project.members" :session-id="sessions.selectedSessionId" />
       <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 

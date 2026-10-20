@@ -2,7 +2,7 @@
 /**
  * DeskLabView —— the workstation design bench (for tuning shape/animation).
  *
- * No dependency on real data: render each of the 5 states as one large workstation + a row of actual-size workstations,
+ * No dependency on real data: render each of the 3 states as one large workstation + a row of actual-size workstations,
  * so you can tweak palette, proportions and animation side by side without waiting for a state to happen to appear in the service.
  */
 import { computed } from 'vue';
@@ -14,7 +14,7 @@ const project = useProjectStore();
 const { t } = useI18n();
 
 const ROLES = ['leader', 'coder', 'researcher', 'tester', 'reviewer', 'ops'];
-const STATES = ['online', 'busy', 'idle', 'blocked', 'offline'];
+const STATES = ['busy', 'idle', 'blocked'];
 
 /** @param {number} i @param {string} state */
 function makeMember(i, state) {
@@ -24,15 +24,13 @@ function makeMember(i, state) {
     name: role,
     role,
     state,
-    degraded: state === 'offline',
-    reported: state !== 'offline',
     stateSince: Date.now() - (90 + i * 37) * 1000,
-    lastSeenAt: Date.now() - (state === 'offline' ? 300 : 5) * 1000,
     messageCount: 0,
-    task:
+    tasks:
       state === 'busy' || state === 'blocked'
-        ? { id: role, title: t('deskLab.demo_task'), progress: state === 'blocked' ? 0.34 : 0.62 }
-        : null,
+        ? [{ id: role, title: t('deskLab.demo_task'), progress: state === 'blocked' ? 0.34 : 0.62 }]
+        : [],
+    sessionStatuses: [],
     currentFiles: state === 'busy' ? ['renderer/src/components/DeskScene.vue', 'server/src/ingest/bus.js'] : [],
     artifacts: [],
   };
@@ -60,7 +58,7 @@ const live = computed(() => project.members);
     </div>
 
     <template v-if="live.length">
-      <h3 class="sec">{{ t('deskLab.online_members') }}</h3>
+      <h3 class="sec">{{ t('deskLab.live_members') }}</h3>
       <div class="grid">
         <DeskScene v-for="m in live" :key="m.memberId" :member="m" />
       </div>

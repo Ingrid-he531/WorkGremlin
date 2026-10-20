@@ -30,7 +30,6 @@ const { createIngestBus } = require('../src/ingest/bus');
 const { createAgentRoster } = require('../src/ingest/agentRoster');
 const { createPoller } = require('../src/poller');
 const { floorByAgent } = require('../src/floors');
-const clock = require('../src/clock');
 
 let pass = 0;
 let fail = 0;
@@ -49,7 +48,7 @@ const archFile = path.join(HOME, '.codebuddy', 'agents', 'architect.md');
 fs.writeFileSync(leoFile, ['---', 'name: leo', 'description: PM subagent', '---', ''].join('\n'));
 fs.writeFileSync(archFile, ['---', 'name: architect', 'description: Architect', '---', ''].join('\n'));
 
-const { repo, close } = openDatabase(path.join(TMP, 'test.db'));
+const { db, repo, close } = openDatabase(path.join(TMP, 'test.db'));
 repo.upsertProject.run({ id: 'p1', name: 'Proj One', workspacePath: WS, mainConversationId: null, source: 'report', createdAt: 1 });
 const bus = createIngestBus({ repo, hub: { broadcast() {} }, projectName: 'Proj One', project: 'p1' });
 
@@ -90,111 +89,90 @@ poller.tick();
 ok('leo 被摘掉，只剩用户级 architect', JSON.stringify(members()) === JSON.stringify(['architect:subagent:user:codebuddy']), JSON.stringify(members()));
 ok('isDefined 跟着变', !roster.isDefined('leo') && roster.isDefined('architect'));
 
-console.log('\n[3] 召唤中的名字：名册心跳不覆盖它的工位状态');
+console.log('\n[3] 注册本身不代表在线：没有显式状态行就是空闲');
 fs.writeFileSync(leoFile, ['---', 'name: leo', '---', ''].join('\n'));
 t += 15_000;
 poller.tick();
 ok('leo 重新注册回来', members().includes('leo:subagent:project:codebuddy'), JSON.stringify(members()));
+const cardOf = (memberId) => bus.buildMemberCard(memberId) || {};
+ok('新注册的 leo 没有 agent_status 行', (repo.getStatus.get('leo@p1') || null) === null);
+ok('没有状态行时工位卡显示空闲', cardOf('leo@p1').state === 'idle', String(cardOf('leo@p1').state));
+
 roster.markActive('leo');
-// After markActive, the per-round registerAgent (heartbeat) must not reset leo back to online
-poller.syncAgentsNow();
-ok('markActive 后 isDefined 仍为真（只是不再心跳）', roster.isDefined('leo'));
+ok('markActive 写入借用忙碌', cardOf('leo@p1').state === 'busy', String(cardOf('leo@p1').state));
 roster.markIdle('leo');
-ok('markIdle 后仍定义', roster.isDefined('leo'));
+ok('markIdle 删除状态行而不是写 idle', (repo.getStatus.get('leo@p1') || null) === null);
+ok('markIdle 后工位回到空闲且仍被定义', cardOf('leo@p1').state === 'idle' && roster.isDefined('leo'));
 
 console.log('\n[3a] 重启恢复顺序：幽灵先恢复、agent 定义后注册时仍显示忙碌');
 {
   const lateFloor = { meta: { id: 'restart-test', agent: 'codebuddy' } };
   const lateId = 'late@p1';
-  const lateState = () => (repo.getStatus.get(lateId) || {}).state;
+  const lateState = () => cardOf(lateId).state;
   bus.setGhostRoster(roster);
   const spawned = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-late', name: 'late', task: '重启后继续', id: 'late-1' });
-  ok('幽灵恢复时同名 agent 还未定义', !roster.isDefined('late') && lateState() == null, String(lateState()));
+  ok('幽灵恢复时同名 agent 还未定义', !roster.isDefined('late') && lateState() === undefined, String(lateState()));
   roster.registerAgent(lateFloor, { name: 'late', level: 'project', client: 'codebuddy' });
   ok('agent 定义出现后立即镜像活幽灵为忙碌', lateState() === 'busy', String(lateState()));
   bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-late', name: 'late', id: 'late-1', result: '完成' });
   ok(
-    '幽灵结束后工位回到在线',
-    lateState() === 'online' && !bus.isGhostAlive({ project: 'p1', name: 'late' }),
+    '幽灵结束后工位回到空闲',
+    lateState() === 'idle' && (repo.getStatus.get(lateId) || null) === null && !bus.isGhostAlive({ project: 'p1', name: 'late' }),
     `${String(lateState())} / ${String(bus.isGhostAlive({ project: 'p1', name: 'late' }))} / ${String(roster.isDefined('late'))}`
   );
   ok('晚注册的幽灵仍复用原 run', spawned && spawned.runId > 0);
 }
 
-console.log('\n[4] 召唤 → 工位忙碌；收工 → 回到在线（回归：被召唤的小怪物状态仍是空闲）');
+console.log('\n[4] 召唤 → 工位忙碌；收工 → 回到空闲');
 {
-  // The ghost is the one doing the work, but the resident workstation must mirror its state
-  // (busy while the summon runs, back to online once it ends) -- otherwise the office card shows
-  // "idle" while a gremlin is out on a task.
-  const leoId = (repo.getMember.get('leo@p1') || {}).id;
-  const leoState = () => (leoId ? (repo.getStatus.get(leoId) || {}).state : null);
+  const leoState = () => cardOf('leo@p1').state;
   bus.setGhostRoster(roster);
-  ok('召唤前 leo 在线', leoState() === 'online', String(leoState()));
+  ok('召唤前 leo 空闲', leoState() === 'idle', String(leoState()));
   bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', task: '写文档', id: 'gl1' });
   ok('召唤后 leo 忙碌（幽灵在干活的镜像）', leoState() === 'busy', String(leoState()));
   bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', id: 'gl1', result: '写完' });
-  ok('收工后 leo 回到在线（幽灵散场复位）', leoState() === 'online', String(leoState()));
+  ok('收工后 leo 回到空闲（幽灵散场复位）', leoState() === 'idle', String(leoState()));
 }
 
-console.log('\n[5] 忙碌租约：幽灵还活着就续期，幽灵没了才让 TTL 兜底');
+console.log('\n[5] 借用忙碌没有 TTL：以幽灵是否仍存活为准');
 {
-  const leoId = (repo.getMember.get('leo@p1') || {}).id;
-  const leoState = () => (leoId ? (repo.getStatus.get(leoId) || {}).state : null);
-  // Live ghost past the TTL: the roster must renew the lease instead of resetting the card to online.
+  const leoState = () => cardOf('leo@p1').state;
   bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', task: '长任务', id: 'gl-ttl' });
   ok('召唤后 leo 忙碌', leoState() === 'busy', String(leoState()));
   t += 11 * 60_000;
   poller.syncAgentsNow();
   ok('超过 10 分钟但幽灵仍存活 → 工位保持忙碌', leoState() === 'busy', String(leoState()));
   bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'leo', id: 'gl-ttl' });
-  ok('收工后回到在线', leoState() === 'online', String(leoState()));
-
-  // No ghost at all: the TTL must still clear a leaked marker (lost end event).
-  roster.markActive('architect');
-  ok('architect 标记忙碌', (repo.getStatus.get((repo.getMember.get('architect@p1') || {}).id) || {}).state === 'busy');
+  ok('收工后回到空闲', leoState() === 'idle', String(leoState()));
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'architect', task: '另一个长任务', id: 'arch-ttl' });
+  ok('architect 的幽灵在跑时工位忙碌', cardOf('architect@p1').state === 'busy');
   t += 11 * 60_000;
   poller.syncAgentsNow();
-  ok(
-    '没有幽灵且超过 TTL → 兜底回到在线（不会永久卡忙碌）',
-    (repo.getStatus.get((repo.getMember.get('architect@p1') || {}).id) || {}).state === 'online'
-  );
+  ok('时间流逝不会自动改写借用状态', cardOf('architect@p1').state === 'busy', String(cardOf('architect@p1').state));
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's1', name: 'architect', id: 'arch-ttl', result: '跑完了' });
+  ok('只有明确的收工路径才清掉借用忙碌', cardOf('architect@p1').state === 'idle');
 }
 
-console.log('\n[6] 心跳超时只表示「失联」：活着的小精灵 / 小幽灵都不许被标成「推断值」');
+console.log('\n[6] 状态模型没有 online / offline / degraded / 状态历史');
 {
-  // A summon can outlive HEARTBEAT_TIMEOUT_MS (60s). Nothing renewed either heartbeat, so a gremlin
-  // mid-summon wore the dashed ring + grey "inferred" badge and a ghost mid-flight dimmed to 60% --
-  // both while they were demonstrably working. `degraded` must mean "we lost contact", nothing else.
-  // The bus reads clock.now(), so putting the bus on the injected clock makes the 60s cutoff exact.
-  clock.__setClock({ now: () => t, monotonic: () => t });
-  const statusOf = (memberId) => repo.getStatus.get(memberId) || {};
-  const leoId = 'leo@p1';
-
-  bus.setGhostRoster(roster);
-  const ghost = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's6', name: 'leo', task: '跑过一分钟', id: 'gl-hb' });
-  ok('召唤后 leo 忙碌、未降级', statusOf(leoId).state === 'busy' && statusOf(leoId).degraded === 0, JSON.stringify(statusOf(leoId)));
-
-  t += 61_000;
-  poller.syncAgentsNow(); // the agent poll renews the gremlin while its ghost is alive
-  bus.gcGhosts(); // the ghost GC renews the ghost while its record is open
-  bus.sweepDegraded();
-  ok('超过 60s：小精灵仍是忙碌且未降级（不再挂虚线环 + 灰牌）', statusOf(leoId).state === 'busy' && statusOf(leoId).degraded === 0, JSON.stringify(statusOf(leoId)));
-  ok('超过 60s：小幽灵未降级（不再半透明）', ghost && statusOf(ghost.memberId).degraded === 0, JSON.stringify(ghost && statusOf(ghost.memberId)));
-
-  // Control: the renewal must not blanket-suppress the flag -- a member with no ghost and no
-  // heartbeat for over 60s still greys out. sweepDegraded is called directly so nothing renews it.
-  roster.markActive('architect');
-  t += 61_000;
-  bus.sweepDegraded();
-  ok(
-    '对照：没有幽灵也没人续心跳的成员，60s 后照样降级',
-    statusOf('architect@p1').degraded === 1,
-    JSON.stringify(statusOf('architect@p1'))
-  );
-
-  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's6', name: 'leo', id: 'gl-hb', result: '跑完了' });
-  ok('收工后 leo 在线且未降级', statusOf(leoId).state === 'online' && statusOf(leoId).degraded === 0, JSON.stringify(statusOf(leoId)));
-  clock.__resetClock();
+  const statusColumns = db.prepare('PRAGMA table_info(agent_status)').all().map((c) => c.name);
+  ok('agent_status 只有显式状态字段', JSON.stringify(statusColumns) === JSON.stringify(['member_id', 'state', 'state_since', 'updated_at']), JSON.stringify(statusColumns));
+  ok('agent_status_history 已删除', db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_status_history'").get() == null);
+  ok('shared 状态集合只有 busy / idle / blocked', JSON.stringify(require('@workgremlin/shared').AGENT_STATES) === JSON.stringify(['busy', 'idle', 'blocked']));
+  let rejected = false;
+  try {
+    repo.upsertStatus.run({ memberId: 'leo@p1', state: 'blocked', stateSince: t, updatedAt: t });
+  } catch {
+    rejected = true;
+  }
+  ok('agent_status rejects blocked (blocked is session-scoped)', rejected);
+  const missingSession = bus.setBlocked({ project: 'p1', memberId: 'leo' });
+  ok('setBlocked requires a session id', missingSession.ok === false && missingSession.error === 'missing_session', JSON.stringify(missingSession));
+  bus.setBorrowedBusy({ project: 'p1', memberId: 'leo', ts: t });
+  const borrowed = repo.getStatus.get('leo@p1');
+  bus.clearBorrowedBusy({ project: 'p1', memberId: 'leo' });
+  const clearAgain = bus.clearBorrowedBusy({ project: 'p1', memberId: 'leo' });
+  ok('borrowed busy has one writer and is idempotently cleared', borrowed && borrowed.state === 'busy' && clearAgain.ok && (repo.getStatus.get('leo@p1') || null) === null);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

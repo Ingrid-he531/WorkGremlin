@@ -1046,7 +1046,7 @@ function projectIdOf(s) {
 
 /**
  * Write one ledger entry (tasks + task_runs, two rows). 8F is **one per round**.
- * @returns {string|null} this record's files_json (reused directly by current_files in the heartbeat)
+ * @returns {string|null} this record's files_json, reused directly by the workstation card
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
@@ -1124,9 +1124,28 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   // and this synchronizer still self-checks end to end (see test/taskSync.test.js). In production it points
   // at the real functions reading OpenCode's on-disk data, behavior unchanged.
   const sessions = module.exports.listOpencodeSessions();
-  if (!sessions.length) return 0;
-
   const now = nowFn();
+  const reconcileSessionStatuses = () => {
+    if (typeof bus.pruneSessionStatuses !== 'function' || !repo.listMembersByClient) return;
+    const liveByProject = new Map();
+    for (const s of sessions) {
+      const projectId = projectIdOf(s);
+      if (!liveByProject.has(projectId)) liveByProject.set(projectId, []);
+      if (s.id) liveByProject.get(projectId).push(s.id);
+    }
+    for (const member of repo.listMembersByClient.all(CLIENT)) {
+      bus.pruneSessionStatuses({
+        project: member.project_id,
+        memberId: member.id,
+        sessionIds: liveByProject.get(member.project_id) || [],
+        ts: now,
+      });
+    }
+  };
+  if (!sessions.length) {
+    reconcileSessionStatuses();
+    return 0;
+  }
   let count = 0;
 
   // Each session's per-round list **and** its existing ledger rows are each read once: the yield judgment,
@@ -1182,39 +1201,15 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
   /**
    * For a session that yielded to the plugin: is the plugin **impersonating our identity and running right
    * now**?
-   * A plugin (OpenCode has no separate plugin form — it always reports cli) reports a bare `opencode`
-   * —— the same member `opencode@<project>`, see resolveClient in plugin/index.js. If so, this project's
-   * member status is written by the plugin first: the polling path does not even touch the heartbeat,
-   * otherwise a 5s poll would overwrite the phase the plugin just wrote with the polling view's older
-   * state (in agent_status, last writer wins). Hand it back to polling once finished (same as kilo.js).
+   * A plugin (OpenCode has no separate plugin form; it always reports cli) reports a bare `opencode`,
+   * the same member `opencode@<project>`, see resolveClient in plugin/index.js. If so, this project's
+   * task status is written by the plugin first; otherwise a 5s poll could overwrite the plugin's newer
+   * view with older polling data. Hand it back to polling once finished (same as kilo.js).
    */
   const pluginOwnsMember = new Set();
   for (const s of sessions) {
     if (!yieldsOf(s) || !isActiveOf(s)) continue;
     if (runsOf.get(s.id).some((r) => String(r.client) === CLIENT)) pluginOwnsMember.add(projectIdOf(s));
-  }
-
-  /**
-   * One project writes only **one** member status row (agent_status's primary key is member_id).
-   * With several sessions in one project, whoever writes last wins —— which leaves "the task that is
-   * running" without a heartbeat in agent_status,
-   * and the task list's CASE in query.js computes it as "cancelled". So first pick which session this
-   * project should report: the newest among the active ones; if none are active, report the newest one (the
-   * card holds the last task) —— same as kilo.js.
-   */
-  const activeByProject = new Map();
-  const newestByProject = new Map();
-  for (const s of sessions) {
-    // A yielded session does **not** take part in owner selection: this path writes no heartbeat at all,
-    // and counting it in would keep another session in the same project that really is running from ever
-    // being picked as owner —— that task finds no heartbeat in agent_status and gets judged "cancelled".
-    if (yieldsOf(s)) continue;
-    const pid = projectIdOf(s);
-    const prevNew = newestByProject.get(pid);
-    if (!prevNew || Number(s.lastEventAt || 0) > Number(prevNew.lastEventAt || 0)) newestByProject.set(pid, s);
-    if (!isActiveOf(s)) continue;
-    const prevAct = activeByProject.get(pid);
-    if (!prevAct || Number(s.lastEventAt || 0) > Number(prevAct.lastEventAt || 0)) activeByProject.set(pid, s);
   }
 
   for (const s of sessions) {
@@ -1255,15 +1250,11 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       sessionId: s.id || null,
       reported: existing ? existing.reported : 1,
       createdAt: existing ? existing.created_at : now,
-      lastSeenAt: now,
       ephemeral: 0,
       projectLabel: null,
       client: CLIENT,
     });
 
-    let hbId = '';
-    let hbFilesJson = null;
-    let running = false;
     for (const t of turns) {
       if (coveredBy(starts, t.startedAt)) continue; // rounds the plugin reported are not written twice
       const id = `${prefix}:${t.index}`;
@@ -1282,7 +1273,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       // interrupted is recorded as "cancelled", not "finished" (measured 2026-09-28: the user terminated a
       // round yet the ledger reported finished).
       const state = t.endedAt ? (t.outcome === 'interrupted' ? 'cancelled' : 'done') : 'running';
-      hbFilesJson = writeTurnRun(repo, {
+      writeTurnRun(repo, {
         id,
         projectId,
         memberId,
@@ -1296,8 +1287,6 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
         result: t.endedAt ? t.result || '' : '',
         tokens: t.tokens,
       });
-      hbId = id;
-      running = !t.endedAt;
       count += 1;
     }
 
@@ -1314,39 +1303,9 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
       repo.deleteTaskRun(r.id);
     }
 
-    // Heartbeat: running = thinking, finished = idle; points at the running one (or the newest when there is
-    // none).
-    // **Only the session selected for this project writes it** (see activeByProject above);
-    // if the plugin is reporting while impersonating our identity and that round has not finished → this
-    // slot yields to it entirely (see pluginOwnsMember).
-    const owner = pluginOwnsMember.has(projectId)
-      ? null
-      : activeByProject.get(projectId) || newestByProject.get(projectId);
-    bus.setSessionStatus({
-      project: projectId,
-      memberId: 'opencode',
-      sessionId: s.id,
-      state: running ? 'busy' : 'idle',
-      taskId: running ? hbId : null,
-      ts: now,
-    });
-    if (owner === s && hbId) {
-      const last = turns[turns.length - 1] || {};
-      repo.upsertStatus.run({
-        memberId,
-        state: running ? 'busy' : 'idle',
-        stateSince: running ? last.startedAt || now : now,
-        taskId: hbId,
-        progress: null,
-        currentFiles: hbFilesJson,
-        lastHeartbeatAt: now,
-        degraded: 0,
-        source: 'report',
-        updatedAt: now,
-      });
-    }
   }
 
+  reconcileSessionStatuses();
   return count;
 }
 
@@ -1359,14 +1318,14 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function opencodeHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, doneFieldsFromReporter } = ctx;
+  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, doneFieldsFromReporter } = ctx;
   for (const s of listOpencodeSessions()) {
     // Freshness is checked **before claiming**: this poll path and the plugin hook path describe the same
-    // session id, and `claim` is first-come-first-served. Claiming a stale DB row here would block the
-    // fresher hook row (the plugin keeps handwriting heartbeats while the DB's time_updated is frozen on a
+    // session id, and `claimSession` is first-come-first-served. Claiming a stale DB row here would block the
+    // fresher hook row (reporter metadata stays current while the DB's time_updated is frozen on a
     // permission prompt), dropping a live session out of the registry.
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
-    if (!claim(p.id, s.id)) continue;
+    if (!claimSession(p.id, s.id)) continue;
     const ph = readOpencodePhase(s.id) || null;
     const doneTruth =
       readReporterDone(s.projectPath || workspacePath, 'opencode', s.id);

@@ -90,7 +90,7 @@ function pick(id) {
           :data-testid="`msg-row-${m.id}`"
         >
           <button class="ava" :title="short(m.fromMember)" @click="pick(m.fromMember)">
-            <AgentAvatar :name="m.fromMember" state="online" :size="26" />
+            <AgentAvatar :name="m.fromMember" state="idle" :size="26" />
           </button>
           <div class="body">
             <div class="meta">

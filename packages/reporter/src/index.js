@@ -32,7 +32,7 @@ function readServerInfo() {
 }
 
 /**
- * @param {{project: string, member: string, endpoint?: string, token?: string, heartbeatMs?: number, silent?: boolean}} opts
+ * @param {{project: string, member: string, endpoint?: string, token?: string, silent?: boolean}} opts
  */
 async function createReporter(opts) {
   const info = readServerInfo();
@@ -58,8 +58,6 @@ async function createReporter(opts) {
     }
   }
 
-  let closed = false;
-
   async function post(route, body) {
     const payload = { project, ...body };
     try {
@@ -77,12 +75,6 @@ async function createReporter(opts) {
   }
 
   await post(HTTP_ROUTES.REGISTER, { memberId: member, name: member });
-
-  const heartbeatMs = opts.heartbeatMs || 5_000;
-  const timer = setInterval(() => {
-    if (!closed) post(HTTP_ROUTES.HEARTBEAT, { memberId: member });
-  }, heartbeatMs);
-  if (timer.unref) timer.unref();
 
   /** @param {string} title @param {{parentTaskId?: string, files?: string[]}} [extra] */
   function task(title, extra = {}) {
@@ -111,16 +103,11 @@ async function createReporter(opts) {
     project,
     member,
     register: (extra = {}) => post(HTTP_ROUTES.REGISTER, { memberId: member, name: member, ...extra }),
-    heartbeat: (extra = {}) => post(HTTP_ROUTES.HEARTBEAT, { memberId: member, ...extra }),
-    status: (state, reason) => post(HTTP_ROUTES.STATUS, { memberId: member, state, reason }),
     message: (to, type, subject, content) =>
       post(HTTP_ROUTES.MESSAGE, { memberId: member, from: member, to, type, subject, content }),
     file: (files, op = 'write') => post(HTTP_ROUTES.FILE_TOUCH, { memberId: member, files, op }),
     task,
-    close() {
-      closed = true;
-      clearInterval(timer);
-    },
+    close() {},
   };
 }
 

@@ -1,17 +1,15 @@
 'use strict';
 /**
- * 成员卡上的「子代理功能描述」自检。
+ * Member-card agent-description self-test.
  *
- * 背景（2026-09-30 用户实测）：子代理卡片那一栏显示的是「项目子代理 · 空闲」——那是**状态话术**，
- * 不是子代理的功能。要显示的是 agent 定义文件里的 `description`（静态数据）：.md 在 YAML
- * frontmatter，Codex 的 .toml 是 `description = "…"`；尾巴上那句给模型看的
- * "（use PROACTIVELY …）"是噪声，要裁掉。
+ * The card must show the static `description` from the agent definition file, not status text.
+ * Markdown files keep it in YAML frontmatter; Codex TOML files use `description = "..."`.
+ * The model-facing "(use PROACTIVELY ...)" suffix is noise and must be removed.
  *
- * 顺带锁住同一张卡上另外两件事：任务行带 endedAt（渲染层据此区分"当前任务"与"上一个任务"，
- * 空闲时不把上一条挂在卡片上），以及 lastTaskAt（「最近活跃」= 上一个任务在多久以前，
- * 不是最后一次心跳）。
+ * The same card also locks two state rules: running tasks carry their real session/timestamps,
+ * and last-active time comes from task start/end timestamps rather than any heartbeat.
  *
- * 跑法：`npm run test:agent-desc`
+ * Run: `npm run test:agent-desc`
  */
 
 const fs = require('node:fs');
@@ -70,7 +68,7 @@ try {
 }
 ok('工程路径不存在时不炸，回空串（项目级 agent 没地方找）', noWs === '', noWs);
 
-console.log('\n[2] 成员卡：描述随卡下发，任务行带 endedAt，最近活跃来自上一个任务的收工时刻');
+console.log('\n[2] Member card: description, no idle-row residue, and task-derived last-active time');
 const { repo, close } = openDatabase(path.join(TMP, 'test.db'));
 const bus = createIngestBus({ repo, hub: { broadcast() {} }, projectName: 'p1', project: 'p1' });
 const now = Date.now();
@@ -78,14 +76,15 @@ repo.upsertProject.run({ id: 'p1', name: 'p1', workspacePath: WS, mainConversati
 bus.registerMember({ project: 'p1', memberId: 'leo', name: 'leo', role: 'subagent:project', workspacePath: WS, client: 'codebuddy' });
 bus.registerMember({ project: 'p1', memberId: 'codex', name: 'codex', role: 'agent', workspacePath: WS, client: 'codex' });
 repo.insertTask.run({ id: 't_done', projectId: 'p1', memberId: 'codex@p1', parentTaskId: null, title: '上一个任务', state: 'done', progress: 1, startedAt: now - 600_000, endedAt: now - 540_000 });
-repo.upsertStatus.run({ memberId: 'codex@p1', state: 'idle', stateSince: now - 540_000, taskId: 't_done', progress: 1, currentFiles: null, lastHeartbeatAt: now, degraded: 0, source: 'report', updatedAt: now });
 
 const snap = bus.buildSnapshot('p1');
 const leo = snap.members.find((m) => m.memberId === 'leo@p1');
 const codex = snap.members.find((m) => m.memberId === 'codex@p1');
 ok('子代理卡带功能描述（不是"项目子代理 · 空闲"）', leo && leo.description.startsWith('产品经理子代理 Leo。'), leo && leo.description);
 ok('级别照旧下发（工牌配色用）', leo && leo.level === 'project', leo && String(leo.level));
-ok('任务行带 endedAt（渲染层据此判"已收工 = 上一个任务"）', Boolean(codex && codex.task && codex.task.endedAt === now - 540_000), codex && JSON.stringify(codex.task));
+ok('已结束任务不挂成当前任务', Boolean(codex && Array.isArray(codex.tasks) && codex.tasks.length === 0), codex && JSON.stringify(codex.tasks));
+ok('没有显式状态行时，成员按任务推断为空闲', Boolean(codex && codex.state === 'idle'), codex && codex.state);
+ok('收工后不保留 agent_status 行', repo.getStatus.get('codex@p1') === undefined);
 ok('lastTaskAt = 上一个任务的收工时刻（「最近活跃」的数据源）', Boolean(codex && codex.lastTaskAt === now - 540_000), codex && String(codex.lastTaskAt));
 ok('没跑过任务的成员 lastTaskAt 为空（卡片显示 —，不编造）', Boolean(leo && leo.lastTaskAt === null), leo && String(leo.lastTaskAt));
 

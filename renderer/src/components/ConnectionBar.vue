@@ -100,7 +100,7 @@ const dotClass = computed(() => props.connection.state);
   background: var(--state-idle);
 }
 
-.conn.open i { background: var(--state-online); }
+.conn.open i { background: var(--state-success); }
 .conn.connecting i { background: var(--state-busy); }
 .conn.closed i { background: var(--state-blocked); }
 
@@ -109,7 +109,7 @@ const dotClass = computed(() => props.connection.state);
 /* Persistent phase-source marker: ground truth in green, inferred in dashed gray */
 .src { display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim); }
 .src b { font-weight: 600; }
-.src-real { color: var(--state-online); }
+.src-real { color: var(--state-success); }
 .src-infer { color: var(--text-dim); border-bottom: 1px dashed var(--text-faint); }
 /* Demo mode: this phase is neither reported ground truth nor inferred, so list it separately with accent, do not mix it with the other two */
 .src-demo { color: var(--accent, #4c8dff); }
@@ -121,6 +121,6 @@ const dotClass = computed(() => props.connection.state);
   display: inline-block;
 }
 
-.sw.real { background: var(--state-online); }
+.sw.real { background: var(--state-success); }
 .sw.infer { background: var(--state-idle); border: 1px dashed var(--text-faint); }
 </style>

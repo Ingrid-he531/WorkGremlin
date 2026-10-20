@@ -1,4 +1,4 @@
-export type AgentState = 'online' | 'busy' | 'idle' | 'blocked' | 'offline';
+export type AgentState = 'busy' | 'idle' | 'blocked';
 export type TaskState = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type MessageType =
   | 'task_assign'
@@ -7,9 +7,8 @@ export type MessageType =
   | 'question'
   | 'block'
   | 'shutdown'
-  | 'heartbeat'
   | 'system';
-export type Source = 'report' | 'watch' | 'timeout';
+export type Source = 'report' | 'watch';
 
 export interface Envelope<T = unknown> {
   v: number;
@@ -30,17 +29,27 @@ export interface Member {
   /** Whether it does active reporting (route B). false = passively observed only (route A) */
   reported: boolean;
   createdAt: number;
-  lastSeenAt: number;
 }
 
 export interface MemberTaskRef {
   id: string;
   title: string;
   progress: number | null;
-  startedAt: number;
-  /** End time; null = still running. The card uses this to tell "current task" from "previous task" (the slot is not cleared on finish) */
+  startedAt: number | null;
+  /** End time; null = still running. */
   endedAt?: number | null;
   state?: TaskState;
+  /** Session that owns this running task. */
+  sessionId?: string | null;
+  /** Files observed for this task; empty when unavailable. */
+  files?: string[];
+}
+
+export interface MemberSessionStatus {
+  sessionId: string;
+  /** Only authorization waits are persisted per session. */
+  state: 'blocked';
+  stateSince: number;
 }
 
 export interface Artifact {
@@ -63,14 +72,19 @@ export interface MemberCard {
   state: AgentState;
   /** When it entered the current state, for computing "elapsed" */
   stateSince: number;
-  task: MemberTaskRef | null;
+  /** Explicit non-task state. Busy is only the resident gremlin's borrowed summon state. */
+  agentState?: AgentState;
+  agentStateSince?: number | null;
+  /** All running tasks for this member. The UI selects one by session id. */
+  tasks: MemberTaskRef[];
+  /** Explicit authorization waits, already scoped by session. */
+  sessionStatuses: MemberSessionStatus[];
   currentFiles: string[];
   artifacts: Artifact[];
-  lastSeenAt: number;
-  /** End time of the most recent **finished** task: "last active" = how long ago (not the last heartbeat) */
+  /** Latest task start or end time: the workstation's "last active" timestamp */
   lastTaskAt?: number | null;
-  /** true = the state is inferred (route-A fallback / heartbeat timeout), not reported truth */
-  degraded: boolean;
+  /** Latest task start or end time per session. */
+  lastTaskAtBySession?: Array<{ sessionId: string | null; at: number | null }>;
   reported: boolean;
   messageCount: number;
   /** The resident subagent's functional description (static data from the agent definition file, not runtime state); empty string if none */
@@ -137,8 +151,7 @@ export declare const SOURCES: readonly Source[];
 export declare const DEFAULTS: {
   readonly PORT_START: number;
   readonly PORT_END: number;
-  readonly HEARTBEAT_TIMEOUT_MS: number;
-  readonly DEGRADED_POLL_MS: number;
+  readonly WS_HEARTBEAT_TIMEOUT_MS: number;
   readonly STATUS_MERGE_MS: number;
   readonly MESSAGE_WINDOW: number;
   readonly WAL_AUTOCHECKPOINT_PAGES: number;

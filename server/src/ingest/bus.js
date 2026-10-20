@@ -1,26 +1,22 @@
 'use strict';
 
 /**
- * Ingest event bus: sources A/B both land here -> write to DB -> broadcast.
+ * Ingest event bus: reports and directory-watch data land here, are persisted, then broadcast.
  *
- * Principles (approved by leader/main, must not be violated):
- *   - B (agent self-report) is the single source of truth;
- *   - A (directory watch) only backfills the roster and messages; its state is always marked degraded=1;
- *   - heartbeat timeout 60s -> degraded=1, state is never fabricated (keep the last reported value, only flag degraded);
- *   - progress/files/duration are NULL when unavailable, never filled with 0 or random values.
+ * Workstation state is only busy / idle / blocked. Task liveness comes from tasks.state, current
+ * files from the running task's task_runs row, and recent activity from task start / end times.
+ * Progress, files and duration stay NULL when unavailable; they are never fabricated.
  */
 
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync } = require('node:child_process');
-const { AGENT_STATES, MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey, isPluginClient } = require('@workgremlin/shared');
+const { MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey, isPluginClient } = require('@workgremlin/shared');
 const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
 const { detectLevel, agentDescription } = require('../floors');
-// Guard before degrading member state: don't push it to idle/offline while another session is still running (see keepStateForOtherSession).
-// One-way dependency only (sessions.js does not require ingest/), no cycle.
-const { hasOtherLiveSession, sessionModel } = require('../sessions');
+const { sessionModel } = require('../sessions');
 
 function projectIdOf(name) {
   return name;
@@ -54,20 +50,6 @@ function normForm(v) {
   if (s === 'plugin') return 'vscode';
   if (s === 'cli' || s === 'ide' || s === 'desktop' || isPluginClient(s)) return s;
   return null;
-}
-
-/**
- * Member state from a report. `thinking` is the **legacy spelling of `busy`** (it was folded back into
- * `busy`: "thinking / waiting for the model" is part of busy, see AGENT_STATES in shared). Old callers /
- * old data may still say `thinking` — map it to `busy` so it never falls through to the unknown fallback
- * (which would show the member as idle).
- * @param {unknown} v
- * @param {string} fallback used when the value is not a known state
- */
-function normState(v, fallback) {
-  const s = String(v || '').trim().toLowerCase();
-  if (s === 'thinking') return 'busy';
-  return AGENT_STATES.includes(s) ? s : fallback;
 }
 
 /** Model name: NULL when unavailable (never guessed), truncated when too long */
@@ -231,8 +213,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   const GHOST_ORPHAN_MS = 5 * 60_000;
   /** Background subagents outlive their parent round by design, so they get their own longer TTL. */
   const GHOST_BACKGROUND_ORPHAN_MS = 60 * 60_000;
-  /** How often a live ghost renews its own heartbeat; well under HEARTBEAT_TIMEOUT_MS (60s). */
-  const GHOST_HEARTBEAT_MS = 30_000;
   /**
    * Where the finish summary lands: artifacts.kind is limited to file/doc/pr/text (CHECK), so the
    * summary is stored as kind='text' plus this path marker, which the renderer reads as the "report".
@@ -317,7 +297,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // reported=0 means "passively observed only" (a member discovered by route A), it does not actively report truth
       reported: p.reported === 0 ? 0 : 1,
       createdAt: existing ? existing.created_at : now(),
-      lastSeenAt: now(),
       // Ephemeral member (no workstation / a ghost in the scene). An existing member's ephemeral only goes up, never down (see upsertMember's MAX)
       ephemeral: p.ephemeral ? 1 : 0,
       projectLabel: p.projectLabel ?? null,
@@ -339,238 +318,131 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!m) return null;
     return m;
   }
-  function writeSessionStatus(memberId, sessionId, state, taskId, ts) {
-    const sid = normSession(sessionId);
-    if (!sid) return;
-    repo.upsertSessionStatus.run({
-      memberId,
-      sessionId: sid,
-      state,
-      stateSince: ts,
-      taskId: normTaskId(taskId),
-      lastHeartbeatAt: ts,
-      updatedAt: ts,
-    });
-  }
 
-  function setSessionStatus(p) {
-    const project = projectIdOf(p.project);
-    const member = requireMember(project, p.memberId);
-    if (!member) return { ok: false, error: 'unknown_member' };
-    if (!normSession(p.sessionId)) return { ok: true, skipped: 'missing_session' };
-    const ts = Number(p.ts) || now();
-    const state = normState(p.state, 'idle');
-    writeSessionStatus(member.id, p.sessionId, state, p.taskId, ts);
-    return { ok: true };
+  /** Clear only the explicit blocked row for one session. Task activity never touches borrowed busy. */
+  function clearSessionBlocked(memberId, sessionId = null) {
+    const sid = normSession(sessionId);
+    if (!sid) return 0;
+    return repo.deleteSessionStatus.run({ memberId, sessionId: sid }).changes;
   }
 
   /**
-   * Heartbeat / lightweight state update.
-   * @param {{project: string, memberId: string, state?: string, progress?: number, taskId?: string, files?: string[], ts?: number}} p
+   * Clear only this session's explicit authorization wait. A session ending or finishing a round must
+   * never affect another session's blocked state or running task.
    */
-  function heartbeat(p) {
+  function clearBlocked(p) {
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    const sessionId = normSession(p.sessionId);
+    if (!sessionId) return { ok: true, card: buildMemberCard(member.id) };
+    const before = buildMemberCard(member.id);
+    repo.deleteSessionStatus.run({ memberId: member.id, sessionId });
+    const card = buildMemberCard(member.id);
+    if (!cardsEqual(before, card)) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
+    return { ok: true, card };
+  }
+
+  function cardsEqual(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  /**
+   * Reconcile sessions that no longer exist in the polling source.
+   * Explicit blocked rows are removed and running tasks from vanished sessions are closed as cancelled.
+   * The card is rebuilt once after all changes so a sweep cannot emit a burst of intermediate states.
+   */
+  function pruneSessionStatuses(p) {
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    const sessionIds = [...new Set((Array.isArray(p.sessionIds) ? p.sessionIds : [])
+      .map((v) => normSession(v))
+      .filter(Boolean))];
+    const ts = Number(p.ts) || now();
+    const before = buildMemberCard(member.id);
+    const running = typeof repo.listRunningTaskRunsForMember?.all === 'function'
+      ? repo.listRunningTaskRunsForMember.all({ memberId: member.id })
+      : [];
+    const live = new Set(sessionIds);
+    let ended = 0;
+    for (const task of running) {
+      if (live.has(normSession(task.session_id))) continue;
+      endTask(
+        {
+          project,
+          memberId: member.id,
+          taskId: task.id,
+          sessionId: task.session_id,
+          state: 'cancelled',
+          ts,
+        },
+        { broadcastCard: false }
+      );
+      ended += 1;
+    }
+    const result = repo.pruneSessionStatuses.run({
+      memberId: member.id,
+      sessionIds: JSON.stringify(sessionIds),
+    });
+    if (!result.changes && !ended) return { ok: true, removed: 0, ended: 0 };
+    const card = buildMemberCard(member.id);
+    if (!cardsEqual(before, card)) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
+    return { ok: true, removed: result.changes, ended, card };
+  }
+
+  /**
+   * Record an explicit authorization wait for one session. Blocked is session-scoped and has no
+   * standalone member-level row; a live task always remains the busy source of truth.
+   */
+  function setBlocked(p) {
     const project = projectIdOf(p.project);
     const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const id = member.id;
     const ts = Number(p.ts) || now();
-
-    const prev = repo.getStatus.get(id);
     const sessionId = normSession(p.sessionId);
-    const sessionPrev = sessionId ? repo.getSessionStatus.get({ memberId: id, sessionId }) : null;
-    /**
-     * The task of **this session** itself that hasn't finished yet (null when there is none).
-     *
-    * `agent_status.task_id` remains a single-slot aggregate value on the member card; the precise liveness of
-    * task records is written separately to `session_status`. The heartbeat still claims the member slot, keeping
-    * the member card up to date with the most recently active session, but does not replace session-level state.
-     */
-    const mine = liveTaskOf(project, id, p.sessionId);
-    const state = normState(
-      p.state,
-      // Claimed an in-flight task but the slot still sits at idle/offline = "task running, member idle", so the liveness check
-      // can't see it either (its criteria require busy/blocked) -> lift both to busy. Only these two are lifted; everything else stays as-is.
-      mine && prev && (prev.state === 'idle' || prev.state === 'offline') ? 'busy' : prev ? prev.state : 'online'
-    );
-
-    repo.upsertStatus.run({
-      memberId: id,
-      state,
-      stateSince: ts,
-      taskId: p.taskId ?? mine ?? (prev ? prev.task_id : null),
-      progress: Number.isFinite(p.progress) ? p.progress : prev ? prev.progress : null,
-      currentFiles: p.files ? jsonOrNull(p.files) : prev ? prev.current_files : null,
-      lastHeartbeatAt: ts,
-      degraded: 0,
-      source: 'report',
-      updatedAt: ts,
-    });
-    if (sessionId) {
-      const sessionTaskId = normTaskId(p.taskId) || mine || (sessionPrev && sessionPrev.task_id) || null;
-      const sessionState = normState(
-        p.state,
-        sessionPrev ? sessionPrev.state : sessionTaskId ? 'busy' : 'online'
-      );
-      writeSessionStatus(id, sessionId, sessionState, sessionTaskId, ts);
+    if (!sessionId) return { ok: false, error: 'missing_session' };
+    const before = buildMemberCard(id);
+    const current = repo.getSessionStatus.get({ memberId: id, sessionId });
+    if (!current || current.state !== 'blocked') {
+      repo.upsertSessionStatus.run({ memberId: id, sessionId, state: 'blocked', stateSince: ts, updatedAt: ts });
     }
-    repo.touchMember.run(ts, id);
-    if (!prev || prev.state !== state) {
-      repo.insertStatusHistory.run(id, state, ts, 'heartbeat', 'report');
-    }
-
-    if (p.files && p.files.length) {
-      for (const f of p.files) repo.insertFileActivity.run(id, f, 'write', ts);
-      repo.trimFileActivity.run(id, id, 200);
-    }
-
     const card = buildMemberCard(id);
-    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
+    if (!cardsEqual(before, card)) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
     return { ok: true, card };
   }
 
   /**
-   * When this session wants to push the member state down (idle / offline), is another session of the
-   * same product still running?
-   *
-   * `agent_status` stores one row per member with no session dimension: with the same Claude Code running
-   * sessions A and B, A finishing (Stop -> idle) or exiting (SessionEnd -> offline) writes that single row,
-   * so B is still working but shows "offline". So before degrading, ask sessions.js's hasOtherLiveSession:
-   * if another session is still alive, **skip this state write entirely** (leaving taskId / currentFiles
-   * intact -- they belong to the still-running session, and clearing them would wipe its card too).
-   *
-   * **Upgrades** (busy / thinking / blocked / online) are not blocked: they can't cause "still working but showing offline".
-   * Reports with no session identifier (old hooks / other products) aren't blocked either -> behavior is exactly as before the change.
-   * @param {string} state the state this call wants to write
-   * @param {any} member the server-side member row (client is taken from it)
-   * @param {any} p the report body
+   * Mark a resident gremlin busy because a same-name ghost is working. This is the only writer of
+   * agent_status; it is a borrowed display state, not task liveness.
    */
-  function keepStateForOtherSession(state, member, p) {
-    if (state !== 'idle' && state !== 'offline') return false;
-    if (!p.sessionId) return false;
-    try {
-      return hasOtherLiveSession({
-        workspacePath: p.workspacePath || '',
-        client: member.client || '',
-        session: String(p.sessionId),
-      });
-    } catch {
-      return false; // treat a read failure as none -- better to degrade than to have the guard's error freeze the state
-    }
-  }
-
-  /**
-   * Is the task hanging on the member row owned by **the session in this report** (axis 2)?
-   *
-  * Purpose: the member card in `agent_status` has a single task_id slot; task records are now judged live
-  * independently by `session_status`. Ownership still has to be checked here, so one session's idle / finish
-  * state doesn't clear another session's task pointer on the member card.
-   *
-   * Ownership comes from `task_runs.session_id` (a column newly added for axis 2).
-   * @returns {boolean|null} true=it is theirs / false=it is not theirs / null=cannot tell (that row isn't found, or one side has no session identifier)
-   */
-  function taskOwnedBy(taskId, sessionId) {
-    const sid = normSession(sessionId);
-    if (!taskId || !sid) return null;
-    try {
-      const run = repo.getTaskRun.get(taskId);
-      const owner = run && normSession(run.session_id);
-      if (!owner) return null; // old data (tasks from before session_id was added) -> cannot tell, keep the old behavior
-      return owner === sid;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Decide who the member row's task_id slot should hold after this `/status`.
-   *
-   * Priority:
-   *   1. The report body **carries a real taskId** (the new hook always sends it while working) -> it wins.
-  *      This session thereby claims the member card slot; the proof that the task is alive is written to that session's own session_status row.
-   *   2. **Explicit null** (sent by the new hook on finish) = "I have no task anymore" -> clear only the slot **we** hold:
-   *      the slot is empty, or was already ours, or ownership cannot be determined -> clear it;
-   *      the slot is held by **another session** -> leave it, don't wipe someone else's still-running task (A finishing must not erase B's task).
-   *   3. The field isn't sent at all (old hook / mock / other products) -> keep prev; but if **prev's task belongs to another
-   *      session** clear it -- that session no longer writes state here, and leaving it on the member row would let a long-finished
-   *      task be judged "in progress" just because "the heartbeat keeps coming".
-   *   4. Ownership cannot be determined (old data from before session_id was added) -> keep prev, exactly as before the change.
-   *
-   * Note this checks `hasOwnProperty` rather than truthiness: omission and an explicit `null` are two different things.
-   * @param {any} prev the existing row in agent_status (may not exist)
-   * @param {any} p the report body
-   * @returns {string|null}
-   */
-  /**
-   * Which task in the ledger is **not yet finished** -- the heartbeat and finish paths use this to decide
-   * the member row's task_id slot.
-   *
-   * With a `sessionId` given, only that session's tasks are considered (used by the heartbeat: a session's own
-   * in-flight task is the most accurate, see heartbeat); without it, the member's latest task (used to hand the
-   * slot over outward on finish, see endTask). Not found / a DB error both return null:
-   * better to leave the slot untouched than to have the report die from an error here.
-   */
-  function liveTaskOf(project, memberId, sessionId) {
-    try {
-      const args = { projectId: project, memberId };
-      const sid = normSession(sessionId);
-      const row = sid ? repo.liveTaskOfSession.get({ ...args, sessionId: sid }) : repo.liveTaskOfMember.get(args);
-      return row ? row.id : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function nextTaskSlot(prev, p) {
-    const prevTask = prev ? prev.task_id : null;
-    const own = prevTask ? taskOwnedBy(prevTask, p.sessionId) : null;
-    if (!Object.prototype.hasOwnProperty.call(p, 'taskId')) {
-      return own === false ? null : prevTask;
-    }
-    const want = normTaskId(p.taskId);
-    if (want) return want;
-    if (!prevTask) return null;
-    return own === false ? prevTask : null;
-  }
-
-  /**
-   * Explicit state transition (including blocked + reason).
-   */
-  function setStatus(p) {
+  function setBorrowedBusy(p) {
     const project = projectIdOf(p.project);
     const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
     const id = member.id;
     const ts = Number(p.ts) || now();
-    const state = normState(p.state, 'idle');
-    const prev = repo.getStatus.get(id);
-    const sessionId = normSession(p.sessionId);
-    const sessionPrev = sessionId ? repo.getSessionStatus.get({ memberId: id, sessionId }) : null;
-    if (sessionId) {
-      const sessionTaskId = Object.prototype.hasOwnProperty.call(p, 'taskId')
-        ? normTaskId(p.taskId)
-        : sessionPrev && sessionPrev.task_id;
-      writeSessionStatus(id, sessionId, state, sessionTaskId, ts);
+    const before = buildMemberCard(id);
+    const current = repo.getStatus.get(id);
+    if (!current || current.state !== 'busy') {
+      repo.upsertStatus.run({ memberId: id, state: 'busy', stateSince: ts, updatedAt: ts });
     }
-    // Another session is still running -> don't push the whole member down to idle/offline
-    if (keepStateForOtherSession(state, member, p)) {
-      return { ok: true, skipped: 'other_session_live', card: buildMemberCard(id) };
-    }
-
-    repo.upsertStatus.run({
-      memberId: id,
-      state,
-      stateSince: ts,
-      taskId: nextTaskSlot(prev, p),
-      progress: prev ? prev.progress : null,
-      currentFiles: prev ? prev.current_files : null,
-      lastHeartbeatAt: ts,
-      degraded: 0,
-      source: 'report',
-      updatedAt: ts,
-    });
-    repo.insertStatusHistory.run(id, state, ts, p.reason ?? null, 'report');
     const card = buildMemberCard(id);
-    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
+    if (!cardsEqual(before, card)) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
+    return { ok: true, card };
+  }
+
+  /** Clear a resident gremlin's borrowed busy state. Idempotent: no row means already idle. */
+  function clearBorrowedBusy(p) {
+    const project = projectIdOf(p.project);
+    const member = requireMember(project, p.memberId);
+    if (!member) return { ok: false, error: 'unknown_member' };
+    const id = member.id;
+    const before = buildMemberCard(id);
+    repo.deleteStatus.run(id);
+    const card = buildMemberCard(id);
+    if (!cardsEqual(before, card)) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
     return { ok: true, card };
   }
 
@@ -583,7 +455,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
 
     // Before opening a new round, close out the previous one (a session can't run two rounds at once), see endStaleTasksOfSession.
     // Passes client: a new CLI round only collects the old tasks of the same CLI session, and won't cut off tasks the IDE plugin is still running.
-    endStaleTasksOfSession({ project, sessionId: p.sessionId, ts, excludeTaskId: id, client: normClient(p.client) });
+    endStaleTasksOfSession({
+      project,
+      sessionId: p.sessionId,
+      ts,
+      excludeTaskId: id,
+      client: normClient(p.client),
+    });
 
     repo.insertTask.run({
       id,
@@ -596,19 +474,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       startedAt: ts,
       endedAt: null,
     });
-    repo.upsertStatus.run({
-      memberId: member.id,
-      state: 'busy',
-      stateSince: ts,
-      taskId: id,
-      progress: Number.isFinite(p.progress) ? p.progress : 0,
-      currentFiles: p.files ? jsonOrNull(p.files) : null,
-      lastHeartbeatAt: ts,
-      degraded: 0,
-      source: 'report',
-      updatedAt: ts,
-    });
-    writeSessionStatus(member.id, p.sessionId, 'busy', id, ts);
+    // The running task is the busy source of truth.
+    clearSessionBlocked(member.id, p.sessionId);
     // Ledger: one round of tasks for the **main agent** = one user task (the input is the user's own words).
     // subagent instances don't take this path (they record subagent_runs), so the criterion is "is the reporter a main agent".
     if (String(member.role || '') === 'agent') {
@@ -631,6 +498,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         startedAt: ts,
         baselineCommit: baseline,
       });
+      if (p.files && p.files.length) {
+        repo.setTaskRunFiles.run({ id, fileCount: p.files.length, filesJson: jsonOrNull(p.files) });
+      }
     }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(id));
     hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
@@ -643,19 +513,15 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!member) return { ok: false, error: 'unknown_member' };
     const ts = Number(p.ts) || now();
     repo.updateTask.run({ id: p.taskId, state: 'running', progress: p.progress ?? null, endedAt: null });
-    repo.upsertStatus.run({
-      memberId: member.id,
-      state: 'busy',
-      stateSince: ts,
-      taskId: p.taskId ?? null,
-      progress: Number.isFinite(p.progress) ? p.progress : null,
-      currentFiles: p.files ? jsonOrNull(p.files) : null,
-      lastHeartbeatAt: ts,
-      degraded: 0,
-      source: 'report',
-      updatedAt: ts,
-    });
-    writeSessionStatus(member.id, p.sessionId, 'busy', p.taskId, ts);
+    // Progress proves the task is active, so any prior blocked state for this session is no longer current.
+    clearSessionBlocked(member.id, p.sessionId);
+    if (Array.isArray(p.files) && p.files.length) {
+      repo.setTaskRunFiles.run({
+        id: p.taskId,
+        fileCount: p.files.length,
+        filesJson: jsonOrNull(p.files),
+      });
+    }
     if (p.files && p.files.length) {
       for (const f of p.files) repo.insertFileActivity.run(member.id, f, 'write', ts);
       repo.trimFileActivity.run(member.id, member.id, 200);
@@ -709,13 +575,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       if (Number(old.startedAt) && Number(old.startedAt) >= ts) continue;
       const oc = normClient(old.client);
       if (want && oc && oc !== want) continue; // different forms never cut each other off
-      endTask({ project, memberId: old.memberId, taskId: old.id, state: 'cancelled', ts });
+      endTask({ project, memberId: old.memberId, taskId: old.id, sessionId: sid, state: 'cancelled', ts });
       n += 1;
     }
     return n;
   }
 
-  function endTask(p) {
+  function endTask(p, options = {}) {
     const project = projectIdOf(p.project);
     const member = requireMember(project, p.memberId);
     if (!member) return { ok: false, error: 'unknown_member' };
@@ -723,54 +589,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const state = ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done';
 
     repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
-    const prev = repo.getStatus.get(member.id);
-    const nextSessionTask = liveTaskOf(project, member.id, p.sessionId);
-    writeSessionStatus(member.id, p.sessionId, nextSessionTask ? 'busy' : 'idle', nextSessionTask, ts);
-    // Finishing pushes the member back to idle; but it must not be pushed while another session of the same
-    // product is still running (otherwise B is working while the card shows idle, and taskId / currentFiles
-    // get cleared, wiping B's task card too). See keepStateForOtherSession.
-    if (!keepStateForOtherSession('idle', member, p)) {
-      repo.upsertStatus.run({
-        memberId: member.id,
-        state: 'idle',
-        stateSince: ts,
-        taskId: null,
-        progress: null,
-        currentFiles: null,
-        lastHeartbeatAt: ts,
-        degraded: 0,
-        source: 'report',
-        updatedAt: ts,
-      });
-    } else {
-      /**
-       * Another session is still running -> don't push to idle, but the slot **can't just be left as is**.
-       *
-      * There is only one slot, owned by "the session of the last `/task/start`". If the finishing session happens to be it,
-      * the member card pointer would sit on a finished task; the task list is unaffected because it judges liveness by
-      * session_status. The slot still has to be handed over here, to avoid the member card showing an old task or idle.
-       *
-       * So hand the slot **over** per the ledger to the member's latest unfinished task; when the ledger has none at all
-       * (the other session only lives in the hook state file and hasn't written to the ledger yet) -> clear the slot,
-       * preferring empty over pointing at the wrong thing.
-       *
-      * state usually stays as is (that session's phase is written by its own heartbeat, we don't overstep here); only when
-      * the handover succeeds and the slot sits at idle/offline is it lifted to busy, keeping the member card consistent with its task pointer.
-       */
-      const next = liveTaskOf(project, member.id, '');
-      repo.upsertStatus.run({
-        memberId: member.id,
-        state: next && prev && (prev.state === 'idle' || prev.state === 'offline') ? 'busy' : prev ? prev.state : 'busy',
-        stateSince: prev ? prev.state_since : ts,
-        taskId: next,
-        progress: prev ? prev.progress : null,
-        currentFiles: prev ? prev.current_files : null,
-        lastHeartbeatAt: ts,
-        degraded: 0,
-        source: 'report',
-        updatedAt: ts,
-      });
-    }
+    const sessionId = normSession(p.sessionId);
+    // A finished task supplies history only. Remaining running tasks (if any) keep the member busy.
+    clearSessionBlocked(member.id, sessionId);
     for (const a of p.artifacts || []) {
       repo.insertArtifact.run(member.id, p.taskId ?? null, a.kind || 'file', a.title || a.path || '(产出)', a.path ?? null, ts);
       hub.broadcast(project, WS_EVENTS.ARTIFACT_NEW, {
@@ -872,10 +693,12 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       }
     }
     hub.broadcast(project, WS_EVENTS.TASK_UPDATE, repo.getTask.get(p.taskId));
-    hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
-    // On a ghost's finish, also refresh the same-named resident gremlin's card: its output this round is borrowed for display on that card (see ghostArtifacts)
-    const heir = heirOf(member);
-    if (heir) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(heir));
+    if (options.broadcastCard !== false) {
+      hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(member.id));
+      // On a ghost's finish, also refresh the same-named resident gremlin's card: its output this round is borrowed for display on that card (see ghostArtifacts)
+      const heir = heirOf(member);
+      if (heir) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, buildMemberCard(heir));
+    }
     return { ok: true };
   }
 
@@ -978,7 +801,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     } catch {
       /* ignore */
     }
-    // A roster "defined subagent": summon ended → its workstation goes back online. Each instance now
+    // A roster "defined subagent": summon ended → its workstation goes back to idle. Each instance now
     // has its own member, so "is a same-name instance still running" must be judged by **name**, not by
     // the member instance —— otherwise the first of several concurrent summons would mark it idle.
     for (const r of ghosts.values()) if (r.project === rec.project && r.name === rec.name) return;
@@ -1073,7 +896,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       at: Number(at) || Number(row.started_at) || now(),
     };
     ghosts.set(key, rec);
-    heartbeat({ project, memberId: memberName, state: 'busy', taskId, progress: null, files: [] });
     markGhostActive(project, name);
     return rec;
   }
@@ -1160,7 +982,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const key = ghostKey(project, client, sessionId, p.id || name);
     const existing = ghosts.get(key);
     if (existing && !existing.endedAt) {
-      heartbeat({ project, memberId: memberName, state: 'busy', progress: null, files: [] });
       return { memberId, runId: existing.runId };
     }
     registerMember({
@@ -1217,7 +1038,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       endedAt: 0,
       at: now(),
     });
-    heartbeat({ project, memberId: memberName, state: 'busy', progress: null, files: [] });
     markGhostActive(project, name);
     return { memberId, runId };
   }
@@ -1325,9 +1145,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
 
   /**
    * Whether a summoned instance with this name is still alive in the project.
-   *
-   * The agent roster uses it to renew its busy lease: a subagent may legitimately run longer than
-   * the roster's fixed TTL, and its workstation must stay busy for as long as the ghost is real.
    * @param {{project?: string, name?: string}} p
    * @returns {boolean}
    */
@@ -1346,8 +1163,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   /**
    * Ghost fallback (driven by the unified poller): disperse any summon whose parent task ended or
    * that outlived the orphan TTL — no longer depends on any hook event arriving. The parent truth
-   * comes from tasks.state; the summon link from the record's parentTaskId. It also renews a still-live
-   * ghost's heartbeat, so a long summon is not flagged degraded merely for outliving the heartbeat timeout.
+   * comes from tasks.state; the summon link from the record's parentTaskId.
    *
    * The orphan TTL is only a fallback for a summon **no running parent vouches for**: a parent task that
    * is still running is positive evidence the round (and its subagent) is still active, so it must not be
@@ -1389,21 +1205,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         ghosts.delete(rec.key);
         removeGhostMemberIfUnused(rec);
         n += 1;
-        continue;
-      }
-      // Still alive: renew its heartbeat, or a summon that outlives HEARTBEAT_TIMEOUT_MS is flagged
-      // degraded for being long-running — a live ghost dimmed to 60% opacity while it is working. A
-      // ghost's liveness is this record, not a reported heartbeat, so silence here means "no end signal
-      // yet", not "lost contact". Throttled, since the poller ticks every 2s. Lazy init keeps the rec
-      // literals untouched: the spawn heartbeat counts as the first beat.
-      const lastBeat = Number(rec.lastBeatAt) || Number(rec.at) || t;
-      if (t - lastBeat >= GHOST_HEARTBEAT_MS) {
-        rec.lastBeatAt = t;
-        try {
-          heartbeat({ project: rec.project, memberId: rec.memberName, state: 'busy', progress: null, files: [] });
-        } catch {
-          /* ignore */
-        }
       }
     }
     return n;
@@ -1431,7 +1232,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    * the same millisecond they overwrite each other, taskId gets flushed out -> Stop sends no task/end ->
    * the output summary / changed files / end time are all lost, and the task stays running forever (measured
    * 2026-09-27: all three codebuddy tasks at 13:14 / 13:18 / 13:29 were like this). This lets the hook come
-   * back and ask once by "this member + this session" -- the truth is in the server's agent_status / tasks.
+   * back and ask once by "this member + this session" -- task truth is in the server's tasks table.
    *
    * Conservative rule: prefer **this session's** one; when this session doesn't match, only accept when
    * "the whole table has exactly one row and it has no session identifier" (old data / session-less reports)
@@ -1683,51 +1484,79 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   function buildMemberCard(memberId) {
     const m = repo.getMember.get(memberId);
     if (!m) return null;
-    const s = repo.getStatus.get(memberId);
-    const files = s && s.current_files ? safeJson(s.current_files, []) : [];
-    const task = s && s.task_id ? repo.getTask.get(s.task_id) : null;
-    let artifacts = recentArtifacts(memberId, task);
+    const sessionStatuses = repo.listSessionStatuses.all(memberId);
+    const currentTasks = repo.currentTasksOfMember.all(memberId);
+    const tasks = currentTasks.map((task) => ({
+      id: task.id,
+      title: task.title,
+      progress: task.progress,
+      startedAt: task.started_at,
+      endedAt: task.ended_at ?? null,
+      state: task.state,
+      // Ephemeral tasks do not have task_runs rows, so their member session is the session fallback.
+      sessionId: task.session_id || (m.ephemeral ? m.session_id : null),
+      files: task.files_json ? safeJson(task.files_json, []) : [],
+    }));
+    const priorities = { blocked: 2, busy: 1 };
+    const candidates = sessionStatuses.map((row) => ({
+      state: 'blocked',
+      stateSince: Number(row.state_since) || m.created_at,
+    }));
+    const agentStatus = repo.getStatus.get(memberId);
+    const agentState = agentStatus && agentStatus.state === 'busy' ? 'busy' : 'idle';
+    if (agentState === 'busy') {
+      candidates.push({ state: agentState, stateSince: Number(agentStatus.state_since) || m.created_at });
+    }
+    for (const task of tasks) {
+      candidates.push({ state: 'busy', stateSince: Number(task.startedAt) || m.created_at });
+    }
+    const active = candidates.reduce((best, row) => {
+      if (!best) return row;
+      const diff = priorities[row.state] - priorities[best.state];
+      if (diff > 0) return row;
+      if (diff === 0 && row.stateSince < best.stateSince) return row;
+      return best;
+    }, null);
+    const state = active ? active.state : 'idle';
+    const stateSince = active ? active.stateSince : m.created_at;
+    const latestTask = tasks[0] || null;
+    const files = latestTask ? latestTask.files : [];
+    let artifacts = recentArtifacts(memberId, currentTasks[0]);
     // A resident gremlin with no output of its own -> borrow from the same-named ghost instance (borrowed while the ghost is alive; on dispersion, inherited via removeMember)
     if (!artifacts.length) artifacts = ghostArtifacts(m);
     const cnt = repo.countMessagesFor.get(m.project_id, memberId, memberId);
-    // How long ago the previous task was: the finish moment of the most recent **finished** task (the renderer's "recently active" uses it).
-    // lastSeenAt can't stand in for it -- that's the heartbeat moment, which keeps refreshing for as long as the member is online, so it would always show "active just now".
-    const lastEnd = repo.lastTaskEndOfMember.get(memberId);
+    const lastTaskBySession = repo.lastTaskAtOfMemberBySession.all(memberId);
+    const lastTaskAt = lastTaskBySession.reduce((max, row) => Math.max(max, Number(row.at) || 0), 0) || null;
 
     return {
       memberId: m.id,
       name: m.name,
       role: m.role,
-      // No reports received and no status row -> offline; has a status row but degraded -> keep the state and mark it as inferred
-      state: s ? s.state : 'offline',
-      stateSince: s ? s.state_since : m.created_at,
-      // Carry ended_at / state together: the renderer uses them to tell "current task" (not yet finished) from "previous task" (finished,
-      // since the slot agent_status.task_id isn't cleared on finish, not distinguishing them would leave an old task + the old task's elapsed time hanging there while idle)
-      task: task
-        ? {
-            id: task.id,
-            title: task.title,
-            progress: task.progress,
-            startedAt: task.started_at,
-            endedAt: task.ended_at ?? null,
-            state: task.state,
-          }
-        : null,
+      state,
+      stateSince,
+      agentState,
+      agentStateSince: agentStatus ? Number(agentStatus.state_since) || m.created_at : null,
+      tasks,
+      sessionStatuses: sessionStatuses.map((row) => ({
+        sessionId: row.session_id,
+        state: 'blocked',
+        stateSince: Number(row.state_since) || m.created_at,
+      })),
       currentFiles: files,
       artifacts,
-      lastSeenAt: m.last_seen_at ?? m.created_at,
-      lastTaskAt: lastEnd ? lastEnd.at : null,
-      degraded: s ? Boolean(s.degraded) : true,
+      lastTaskAt,
+      lastTaskAtBySession: lastTaskBySession.map((row) => ({
+        sessionId: row.session_id ?? null,
+        at: Number(row.at) || null,
+      })),
       reported: Boolean(m.reported),
       messageCount: cnt ? cnt.c : 0,
       // Ephemeral member (no workstation -> a ghost drifting in the scene) + the project name it belongs to
       ephemeral: Boolean(m.ephemeral),
       projectLabel: m.project_label ?? null,
       // The project id it belongs to: the client uses it to keep "member cards of other projects" out.
-      // When a WS subscription carries no project (which is what the renderer does, since it only shows the "currently open project"),
-      // the server sends broadcasts from **all** projects -- after leaving the demo, the heartbeat timeout scan still pushes those
-      // __demo__ members' cards, and a client accepting them all would let the demo gremlins flash back into a real project
-      // (user-observed 2026-10-01). The renderer filters by the project on this card, see renderer/src/lib/projectScope.js.
+      // The renderer filters member cards by this project id so broadcasts from other projects cannot
+      // leak into the currently open room.
       project: m.project_id,
       // Source client: the office filters by floor accordingly (NULL = unknown, shown on every floor)
       client: m.client || null,
@@ -1852,26 +1681,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     };
   }
 
-  /**
-   * Heartbeat timeout sweep: no report for longer than HEARTBEAT_TIMEOUT_MS -> degraded=1 (state is not modified, nothing fabricated).
-   */
-  function sweepDegraded() {
-    const cutoff = now() - DEFAULTS.HEARTBEAT_TIMEOUT_MS;
-    const rows = repo.raw
-      .prepare('SELECT * FROM agent_status WHERE degraded = 0 AND last_heartbeat_at < ?')
-      .all(cutoff);
-    for (const s of rows) {
-      repo.raw.prepare('UPDATE agent_status SET degraded = 1, source = ?, updated_at = ? WHERE member_id = ?').run(
-        'timeout',
-        now(),
-        s.member_id
-      );
-      const m = repo.getMember.get(s.member_id);
-      if (m) hub.broadcast(m.project_id, WS_EVENTS.MEMBER_STATUS, buildMemberCard(s.member_id));
-    }
-    return rows.length;
-  }
-
   return {
     projectIdOf,
     memberIdOf,
@@ -1895,9 +1704,11 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     isGhostAlive,
     gcGhosts,
     setGhostRoster,
-    heartbeat,
-    setStatus,
-    setSessionStatus,
+    setBlocked,
+    setBorrowedBusy,
+    clearBorrowedBusy,
+    clearBlocked,
+    pruneSessionStatuses,
     startTask,
     taskProgress,
     endTask,
@@ -1909,7 +1720,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     buildMemberCard,
     buildSnapshot,
     listProjectSummaries,
-    sweepDegraded,
     toMessage,
   };
 }

@@ -99,9 +99,6 @@ const MESSAGES = {
     'conn.source.reported': '上报真值',
     'conn.source.inferred': '推断值',
     'conn.source.demo': '演示脚本',
-    'status.title_reported': 'agent 上报真值',
-    'status.title_inferred': '状态为推断值（非 agent 上报真值）',
-    'status.tag_inferred': '推断',
 
     // ---- floor shaft / elevator ----
     'floor.title': '楼层',
@@ -179,12 +176,9 @@ const MESSAGES = {
     'wall.meeting_room': '会议室',
     'wall.pantry': '茶水间',
     // ---- legacy 2D scene (?tab=flat) and the design bench (?tab=lab) ----
-    'state.online': '在线',
     'state.busy': '忙碌',
     'state.idle': '空闲',
     'state.blocked': '阻塞',
-    'state.thinking': '思考中',
-    'state.offline': '离线',
     'scene.going': '去{place}',
     'scene.walking': '走动中',
     'scene.temp': '临时 · {x}',
@@ -196,7 +190,7 @@ const MESSAGES = {
     'scene.meeting_count': '会议室 {n} 人',
     'office.graph': '路网',
     'deskLab.real_size': '实际尺寸（办公室网格）',
-    'deskLab.online_members': '线上成员（真实数据）',
+    'deskLab.live_members': '当前成员（真实数据）',
     'deskLab.demo_task': '实现工位视图与对话记录窗口',
     'office.no_members': '还没有成员。启动服务后会自动出现工位。',
 
@@ -566,9 +560,6 @@ const MESSAGES = {
     'conn.source.reported': 'Reported',
     'conn.source.inferred': 'Inferred',
     'conn.source.demo': 'Demo script',
-    'status.title_reported': 'reported by the agent',
-    'status.title_inferred': 'inferred state (not reported by the agent)',
-    'status.tag_inferred': 'inferred',
 
     // ---- floor rail / lift ----
     'floor.title': 'Floors',
@@ -646,12 +637,9 @@ const MESSAGES = {
     'wall.meeting_room': 'Meeting room',
     'wall.pantry': 'Pantry',
     // ---- legacy 2D scene (?tab=flat) and desk lab (?tab=lab) ----
-    'state.online': 'Online',
     'state.busy': 'Busy',
     'state.idle': 'Idle',
     'state.blocked': 'Blocked',
-    'state.thinking': 'Thinking',
-    'state.offline': 'Offline',
     'scene.going': 'To {place}',
     'scene.walking': 'Walking',
     'scene.temp': 'Temp · {x}',
@@ -663,7 +651,7 @@ const MESSAGES = {
     'scene.meeting_count': '{n} in the meeting room',
     'office.graph': 'Nav graph',
     'deskLab.real_size': 'Real size (office grid)',
-    'deskLab.online_members': 'Online members (live data)',
+    'deskLab.live_members': 'Current members (live data)',
     'deskLab.demo_task': 'Build the workstation view and the chat log',
     'office.no_members': 'No members yet. They show up once the service is running.',
 

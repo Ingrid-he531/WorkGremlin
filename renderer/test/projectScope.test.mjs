@@ -6,8 +6,7 @@
  *
  * 根因不是渲染帧，而是**事件串工程**：渲染层的 WS 订阅不带 project（见 stores/project.js 的
  * init），服务端于是把**所有**工程的 member.status 广播都发过来，而 upsertMember 只看事件类型、
- * 不看工程，有卡就往 members 里塞。退出演示后，__demo__ 那批成员的心跳不再刷新，
- * 服务端每 10s 一次的心跳超时扫描（阈值 60s）在把它们标成 degraded 时**逐个广播了成员卡** →
+ * 不看工程，有卡就往 members 里塞。离开演示工程后，来自 __demo__ 的成员卡广播仍可能到达客户端，
  * 客户端照单收下 → 屋里闪回 8 只 → 下一次对账（15s，整份快照覆盖）又清掉。
  *
  * 所以把判据固定成一个小函数，三处共用（applyWorkspace / applySnapshot / upsertMember）：

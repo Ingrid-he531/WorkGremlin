@@ -1028,7 +1028,7 @@ function projectIdOf(s) {
  * Write one ledger row (a line in both tasks and task_runs). 7F is **one row per turn**; copies the rule of
  * the same-named function in opencodeTasks.js (it accepts an explicit state and result — Kilo needs both: to
  * tell done from cancelled, and this turn's closing summary).
- * @returns {string|null} this record's files_json (the heartbeat's current_files reuses it directly)
+ * @returns {string|null} this record's files_json, reused directly by the workstation card
  */
 function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, tokens }) {
   const st = state || (endedAt ? 'done' : 'running');
@@ -1101,9 +1101,28 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
   // in-memory stubs and this syncer still self-checks end to end (see test/taskSync.test.js). In production
   // module.exports points at the real functions reading Kilo's own disk state; behavior unchanged.
   const sessions = module.exports.listKiloSessions();
-  if (!sessions.length) return 0;
-
   const now = nowFn();
+  const reconcileSessionStatuses = () => {
+    if (typeof bus.pruneSessionStatuses !== 'function' || !repo.listMembersByClient) return;
+    const liveByProject = new Map();
+    for (const s of sessions) {
+      const projectId = projectIdOf(s);
+      if (!liveByProject.has(projectId)) liveByProject.set(projectId, []);
+      if (s.id) liveByProject.get(projectId).push(s.id);
+    }
+    for (const member of repo.listMembersByClient.all(CLIENT)) {
+      bus.pruneSessionStatuses({
+        project: member.project_id,
+        memberId: member.id,
+        sessionIds: liveByProject.get(member.project_id) || [],
+        ts: now,
+      });
+    }
+  };
+  if (!sessions.length) {
+    reconcileSessionStatuses();
+    return 0;
+  }
   let count = 0;
 
   // Each session's per-turn list **and** its existing ledger rows are each read once: the yield decision,
@@ -1172,45 +1191,15 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
    * client is always the floor base name (see resolveClient in plugin/index.js): the CLI-form plugin
    * (`kilo run`, no VS Code env vars) reports the bare `kilo`, the same member `kilo@<project>` as the one
    * the VS Code extension raises; the form is told apart by `form` (cli / vscode).
-   * If so, this project's member state belongs to the plugin: the polling path does not even touch the
-   * heartbeat — otherwise the 5s poll would overwrite the phase the plugin just wrote with the polling
-   * view's older state (in agent_status, whoever writes last wins), and the symptom is a phase bouncing
-   * back and forth.
-   * Yield only while that turn has **not finished** (isActiveOf): once the plugin's turn stops, this slot
-   * returns to polling — otherwise another session in the same project (an old one without the plugin) that
-   * is genuinely running would never get a heartbeat and would be judged "cancelled".
+   * If so, this project's member state belongs to the plugin: the polling path leaves task status to it;
+   * otherwise the 5s poll could overwrite the plugin's newer view with older polling data.
+   * Yield only while that turn has not finished (isActiveOf). Once the plugin's turn stops, the session
+   * returns to polling.
    */
   const pluginOwnsMember = new Set();
   for (const s of sessions) {
     if (!yieldsOf(s) || !isActiveOf(s)) continue;
     if (runsOf.get(s.id).some((r) => String(r.client) === CLIENT)) pluginOwnsMember.add(projectIdOf(s));
-  }
-
-  /**
-   * One project writes **one** member status (agent_status' primary key is member_id). With several sessions
-   * in one project (Kilo's worktree sessions and old sessions are all there), whoever writes last wins —
-   * the result is "the task that is running has no matching heartbeat in agent_status", and the task list's
-   * CASE in query.js counts it as "cancelled", so running tasks disappear (measured symptom on 2026-09-28).
-   * So first pick the session this project should report: the newest among active ones; if none is active,
-   * report the newest one (the card hangs on the last task).
-   */
-  const activeByProject = new Map();
-  const newestByProject = new Map();
-  for (const s of sessions) {
-    // A yielded session does **not** take part in owner selection: it never writes a heartbeat on this path
-    // (see the `continue` below), so counting it in would keep another genuinely running session in the same
-    // project from ever being chosen as owner — that task then finds no heartbeat in agent_status and is
-    // again judged "cancelled" by query.js' CASE.
-    // Measured 2026-09-30: as soon as the plugin's session appeared (it is newer than the old one), the old
-    // session's state froze on the last row written and never refreshed again (the member card's heartbeat
-    // went stale and grey, and starting another turn in the old session showed "cancelled").
-    if (yieldsOf(s)) continue;
-    const pid = projectIdOf(s);
-    const prevNew = newestByProject.get(pid);
-    if (!prevNew || Number(s.lastEventAt || 0) > Number(prevNew.lastEventAt || 0)) newestByProject.set(pid, s);
-    if (!isActiveOf(s)) continue;
-    const prevAct = activeByProject.get(pid);
-    if (!prevAct || Number(s.lastEventAt || 0) > Number(prevAct.lastEventAt || 0)) activeByProject.set(pid, s);
   }
 
   for (const s of sessions) {
@@ -1264,7 +1253,6 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       sessionId: s.id || null,
       reported: existing ? existing.reported : 1,
       createdAt: existing ? existing.created_at : now,
-      lastSeenAt: now,
       ephemeral: 0,
       projectLabel: null,
       client: CLIENT,
@@ -1288,9 +1276,8 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     // sets the session title once at the start of a turn and never changes it, so using it as the title
     // makes users think "the new task was not recorded".
     const last = rounds[rounds.length - 1];
-    const running = last.outcome === 'running';
     const lastId = `${prefix}:${last.index}`;
-    const filesJson = writeTurnRun(repo, {
+    writeTurnRun(repo, {
       id: lastId,
       projectId,
       memberId,
@@ -1379,43 +1366,9 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
       repo.deleteTaskRun(r.id);
     }
 
-    // ④ Heartbeat: active → thinking, stopped → idle; task_id must point at **the last turn's** row,
-    // otherwise query.js' CASE finds no heartbeat and judges the running one "cancelled".
-    // Same reasoning as copilot.js: writing thinking only while active leaves the old value hanging in the
-    // db once the session stops, and the member card stays "thinking" forever. Write an idle row when
-    // inactive so the state follows the session.
-    // Also: **only the session selected for this project writes it** (see activeByProject above), otherwise
-    // another session in the same project points the heartbeat at its own task and the running one is judged
-    // "cancelled".
-    // If the plugin is reporting under our identity and that turn has not finished → yield this slot to it
-    // entirely (see pluginOwnsMember).
-    const owner = pluginOwnsMember.has(projectId)
-      ? null
-      : activeByProject.get(projectId) || newestByProject.get(projectId);
-    bus.setSessionStatus({
-      project: projectId,
-      memberId: 'kilo',
-      sessionId: s.id,
-      state: isActiveOf(s) ? 'busy' : 'idle',
-      taskId: isActiveOf(s) ? lastId : null,
-      ts: now,
-    });
-    if (owner === s) {
-      repo.upsertStatus.run({
-        memberId,
-        state: running ? 'busy' : 'idle',
-        stateSince: running ? last.startedAt || now : now,
-        taskId: lastId,
-        progress: null,
-        currentFiles: filesJson,
-        lastHeartbeatAt: now,
-        degraded: 0,
-        source: 'report',
-        updatedAt: now,
-      });
-    }
   }
 
+  reconcileSessionStatuses();
   return count;
 }
 
@@ -1427,12 +1380,12 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function kiloHandler(p, src, ctx) {
-  const { claim, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
+  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
   for (const s of listKiloSessions()) {
     // Freshness before claiming: the separate hook source (plugin) owns the same session id, and claiming a
     // stale DB row here would shadow the fresher hook row —— see the same note in opencodeHandler.
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
-    if (!claim(p.id, s.id)) continue;
+    if (!claimSession(p.id, s.id)) continue;
     const ph = readKiloPhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;
     const truth =

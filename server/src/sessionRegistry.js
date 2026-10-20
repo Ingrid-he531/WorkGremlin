@@ -550,7 +550,11 @@ function refresh({ workspacePath = '', force = false } = {}) {
   const products = detectProducts({});
   const seen = new Set();
   const cliLandingSessions = new Map();
-  const claim = (floor, sessionId) => {
+  /**
+   * One-scan dedup lock only: the first source that reports a session in this refresh writes it. This is
+   * not a task slot, liveness lease, or persisted ownership.
+   */
+  const claimSession = (floor, sessionId) => {
     if (!sessionId) return true;
     const k = `${floor}:${sessionId}`;
     if (seen.has(k)) return false;
@@ -563,7 +567,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
   const ctx = {
     now, workspacePath, force,
     table, backend, TIMEOUT_MS,
-    seen, claim, cliLandingSessions, doneScans,
+    seen, claimSession, cliLandingSessions, doneScans,
     resolveProjectName, formatAge,
     upsert, doneFieldsOf, doneFieldsFromReporter,
     scanCliSessions, liveSessionCwds, listReporterSessions,
@@ -620,7 +624,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
 // 1F/9F's plugin sources go through here; the logic is preserved as-is, just pulled out of refresh's giant
 // switch.
 function handlePlugin(p, src, ctx) {
-  const { workspacePath, force, table, claim, upsert, listSessions, listReporterSessions, doneFieldsOf, doneScans } = ctx;
+  const { workspacePath, force, table, claimSession, upsert, listSessions, listReporterSessions, doneFieldsOf, doneScans } = ctx;
   /**
    * This path needs a doneScan too: some floors' plugins **emit not a single hook event when cancelling**,
    * so only the floor's own synthMarks can recognize it from the on-disk data and synthesize a cancel /
@@ -671,7 +675,7 @@ function handlePlugin(p, src, ctx) {
   }
   if (!pluginSessions.length) return;
   for (const s of pluginSessions) {
-    if (!claim(p.id, s.id)) continue;
+    if (!claimSession(p.id, s.id)) continue;
     upsert({
       floor: p.id,
       id: s.id,
@@ -743,11 +747,10 @@ function scanCliSessionsAll(src, kind) {
 }
 
 // Shared by the cli / hook paths: scan jsonl or read the reporter state file, distinguished by src.kind.
-// The cli/hook sources of 1F~5F and 9F all go through here (standard shape: only file times / heartbeat
-// times, no runtime state).
+// The cli/hook sources go through here using file times and reporter-state metadata, not workstation liveness.
 function handleCliHook(p, src, ctx) {
   const {
-    workspacePath, table, claim, upsert, now, TIMEOUT_MS,
+    workspacePath, table, claimSession, upsert, now, TIMEOUT_MS,
     scanCliSessions, listReporterSessions, doneFieldsOf, formatAge, resolveProjectName, cliLandingSessions,
   } = ctx;
   const reporterSessions = src.kind === 'cli' ? listReporterSessions(src.client, { includeEnded: true }) : [];
@@ -795,7 +798,7 @@ function handleCliHook(p, src, ctx) {
   for (const s of live) {
     const sessionId = s.sessionId || '';
     if (src.kind === 'hook' && sessionId && cliLandingSessions.get(p.id)?.has(sessionId)) continue;
-    if (!claim(p.id, sessionId)) continue;
+    if (!claimSession(p.id, sessionId)) continue;
     const lastEventAt = s.lastEventAt;
     const form = s.form || formBySession.get(sessionId) || '';
     upsert({
@@ -953,35 +956,18 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   // that rather than "now".
   const runningTitleBySession = new Map();
   const runningStartedBySession = new Map();
-  // Detection uses "living" floors: state='running' in the ledger and **heartbeat/agent_status alive**
-  // (non-sticky judgment).
-  // Key point: @fresh is set into the future here, turning off the started_at fallback window in the query
-  // entirely ——
-  // that window is the root of "hangs for 3h / resurrects on restart" (a stopped plugin task stays running
-  // in the ledger, and started_at being recent gets it claimed again).
-  // With it off only the heartbeat-alive judgment remains, so stopped tasks (no heartbeat) drop out at once
-  // and do not resurrect on restart.
-  // Plugin tasks write no heartbeat → claimed as a fallback by the "live phase is fresh" signal below; the
-  // two are unioned so neither misses.
+  // A running task row is the only liveness signal. There is no heartbeat freshness fallback.
   const ledgerAliveSessions = new Set();
   if (repo && repo.activeRunningByProject) {
-    const cutoff = now - 10 * 60 * 1000;
-    const grace = now - 30 * 60 * 1000;
-    let titleRows = [];
-    let detectRows = [];
+    let rows = [];
     try {
-      // Title / start time: taken for all running tasks (wide window, copy and timestamp only, not part of
-      // the "running" judgment)
-      titleRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now - 3 * 60 * 60 * 1000, cutoff, grace }) || [];
-      // Detection: @fresh into the future → the started_at clause is always false, leaving only the
-      // non-sticky "heartbeat/agent_status alive" judgment
-      detectRows = repo.activeRunningByProject.all({ projectId: 0, fresh: now + 1e15, cutoff, grace }) || [];
+      rows = repo.activeRunningByProject.all({ projectId: 0 }) || [];
     } catch (e) {
       // A ledger query exception does not affect building the session table, but it must leave a trace ——
       // otherwise "no data in the task table / ticker" can only be guessed at
       log.debug('账本查询异常（不影响会话表构建）：', e);
     }
-    for (const r of titleRows) {
+    for (const r of rows) {
       const f = floorByAgent[String(r.client || '').toLowerCase()];
       const sessionId = String(r.sessionId || '');
       const fid = floorIdOf(f);
@@ -989,23 +975,13 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       const key = `${fid}:${sessionId}`;
       if (r.title && !runningTitleBySession.has(key)) runningTitleBySession.set(key, r.title);
       if (r.startedAt && !runningStartedBySession.has(key)) runningStartedBySession.set(key, Number(r.startedAt));
-    }
-    for (const r of detectRows) {
-      const f = floorByAgent[String(r.client || '').toLowerCase()];
-      const sessionId = String(r.sessionId || '');
-      const fid = floorIdOf(f);
-      if (fid && sessionId) ledgerAliveSessions.add(`${fid}:${sessionId}`);
+      ledgerAliveSessions.add(key);
     }
   } else {
     /* skip the ledger signal when repo/activeRunningByProject is missing (old behavior) */
   }
-  // "Running" only recognizes the ledger's ALIVE (the same yardstick as the task table's taskAliveSql:
-  // state='running' with a recent heartbeat / active state).
-  // "Session live phase is fresh" was once counted as a running signal too, but measured behavior shows the
-  // plugin replays the previous task's phase as thinking on reconnect/restart and refreshes its timestamp,
-  // so an already cancelled old task was misjudged as running and fought with the task table (which judges
-  // by ALIVE). Removing it aligns both criteria —— whatever the task table shows as "cancelled", the
-  // ticker / main console will never show as "in progress" again.
+  // "Running" only recognizes tasks.state = 'running'. Session phase freshness is not a task-liveness
+  // signal.
   const floors = products.map((p) => {
     const sessions = [...table.values()]
       .filter((s) => s.floor === p.id && s.active)

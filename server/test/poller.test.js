@@ -57,7 +57,7 @@ head('[2] 一个循环按注册表遍历，各层按自己的 pollMs 节流');
   const list = [mk('A', 5000), mk('B', 1000), mk('C', 5000, { throw: true })];
   let t = 1_000_000;
   const poller = createPoller({
-    bus: { sweepDegraded() {} },
+    bus: {},
     repo: {},
     getWorkspace: () => ({ workspacePath: '' }),
     broadcast: () => {},
@@ -84,7 +84,7 @@ head('[3] 没声明 pollMs 的楼层按缺省 5000 节流');
   const list = [{ meta: { id: 'X' }, syncTasks: () => { n += 1; } }];
   let t = 2_000_000;
   const poller = createPoller({
-    bus: { sweepDegraded() {} },
+    bus: {},
     repo: {},
     getWorkspace: () => ({ workspacePath: '' }),
     now: () => t,
@@ -111,7 +111,7 @@ head('[4] 楼层自己扫 agent，经上层注册；当前工程名随 ctx 传�
   };
   let t = 3_000_000;
   const poller = createPoller({
-    bus: { sweepDegraded() {} },
+    bus: {},
     repo: {},
     getWorkspace: () => ({ workspacePath: '/ws', project: 'p1', projectName: 'Demo Project' }),
     now: () => t,

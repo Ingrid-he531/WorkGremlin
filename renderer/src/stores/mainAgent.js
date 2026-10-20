@@ -61,7 +61,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
     auto: false,
     /** true = state comes from a real session (persisted by the plugin, phase is inferred), so the mock does not advance */
     live: false,
-    /** true = currently driven by live hook reports (the reporter sends busy/idle/offline/blocked to the server) */
+    /** true = currently driven by live hook reports (the reporter sends busy/idle/blocked to the server) */
     hookLive: false,
     /** The most recent member card fed in by the hook (used only for HUD/debugging, does not drive rendering directly) */
     liveMember: null,
@@ -168,13 +168,13 @@ export const useMainAgentStore = defineStore('mainAgent', {
      *   blocked -> await (waiting for user authorization; the tool and target come from the session's persisted await overlay)
      *             Note: the await phase still only trusts the true value from the server (an authorization Notification -> await,
      *             authorization finished -> fall back to another phase); the render layer does not infer it itself.
-     *   idle / online / offline -> idle (offline corresponds to the fix for "close VS Code and it still shows planning")
+     *   idle / unreported / unknown -> idle
      * @param {null|{phase:string, action?:string, context?:string[], target?:any, prompt?:string}} s
      */
     setLiveState(s) {
       // While the wrap-up summary (done "task complete" / cancelled "task cancelled") is showing, ignore the falling-back
-      // idle/offline/null and wait for the 10s timer to return to standby; new active events (tool/thinking…) still override it.
-      if ((this.phase === 'done' || this.phase === 'cancelled') && (!s || s.phase === 'idle' || s.phase === 'offline')) return;
+      // idle/null and wait for the 10s timer to return to standby; new active events still override it.
+      if ((this.phase === 'done' || this.phase === 'cancelled') && (!s || s.phase === 'idle')) return;
       if (!s) {
         if (this.hookLive) {
           this.hookLive = false;
@@ -203,24 +203,24 @@ export const useMainAgentStore = defineStore('mainAgent', {
         phase = 'tool';
       } else if (hookPhase === 'blocked') {
         phase = 'await';
-      } else if (PHASES[hookPhase] && hookPhase !== 'idle' && hookPhase !== 'online' && hookPhase !== 'offline' && hookPhase !== 'unreported' && hookPhase !== 'done' && hookPhase !== 'cancelled') {
+      } else if (PHASES[hookPhase] && !['idle', 'unreported', 'done', 'cancelled'].includes(hookPhase)) {
         // thinking / tool / await / dispatch / waiting: accept as-is
         // done / cancelled do not go through setLiveState —— the wrap-up is managed by watch's
         // enterDone/enterCancelled path (with the 10s stopTimer); consoleBase should not keep feeding done back, or it would pop up again when stopTimer expires
         phase = hookPhase;
-      } else if (hookPhase === 'idle' || hookPhase === 'online' || hookPhase === 'done' || hookPhase === 'cancelled') {
+      } else if (hookPhase === 'idle' || hookPhase === 'done' || hookPhase === 'cancelled') {
         // done/cancelled fed in from consoleBase is treated as idle: stopTimer already owns the 10s display window,
         // and once it expires the console should return to standby; consoleBase's taskState='done' must not keep pushing it back to "task complete".
         // idle is the definite state of the currently selected session; whether a task is still running is decided by that session's own taskState,
         // and it must not reuse the earlier thinking/tool, nor borrow another session's task state from the same floor.
         phase = 'idle';
       } else {
-        phase = 'idle'; // offline / unreported / unknown: genuinely not working
+        phase = 'idle'; // unreported / unknown: no active state to display
       }
       this.phase = phase;
       // Coming back to "thinking": keep the previous status wording (the tool just being called / the user's prompt), don't blank it out;
       // only genuine standby (idle) clears it.
-      if (phase === 'thinking' && (hookPhase === 'idle' || hookPhase === 'online')) {
+      if (phase === 'thinking' && hookPhase === 'idle') {
         this.action = s.action || this.action;
         this.context = Array.isArray(s.context) && s.context.length ? s.context : this.context;
         this.prompt = s.prompt || this.prompt;

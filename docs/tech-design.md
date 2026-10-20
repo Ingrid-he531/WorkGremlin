@@ -69,9 +69,9 @@
 ### B) 主动上报 + 推送（HTTP 上报 → SQLite → WebSocket）
 
 - 做法：提供零依赖 SDK `packages/reporter`（Node，仅用 `fetch`），agent runner / hook 在关键节点调用：
-  `register` → `heartbeat` → `task.start/progress/end` → `message` → `file.touch`。
+  `register` → `task.start/progress/end` → `message` → `file.touch`。
   本地服务落 SQLite，`ws` 推给渲染层。
-- 优点：字段完备（状态、进度、文件、耗时、产出），语义准确；可扩展（以后加 token 消耗、成本、工具调用、artifact 都只是加字段）；对状态做**真值源**，UI 直接绑定；崩溃可用心跳超时判定。
+- 优点：字段完备（任务、进度、文件、耗时、产出），语义准确；可扩展（以后加 token 消耗、成本、工具调用、artifact 都只是加字段）；任务表是工位忙碌与最近活跃的唯一真值源。
 - 缺点：需要 agent 侧配合（hook / runner 改造成本）；若某个 agent 没接上报，就完全看不到（需要 A 兜底）；引入本地端口与生命周期管理。
 
 ### 结论：**推荐 A + B 混合，以 B 为主、A 为兜底与补充**
@@ -89,7 +89,7 @@
 
 1. **成员（roster）**：A 提供的名单作为「已发现成员」，B 的 `register` 覆盖/补全其 `role/session_id`；只被 A 发现的成员标记 `reported = false`，UI 上打「被动观测」角标。
 2. **消息**：A 解析出的收件箱消息 `source='watch'`，`dedupe_key = sha1(memberId|ts|from|sha1(content))`；B 上报的消息 `source='report'`。同 key 只入库一次（B 优先）。
-3. **状态**：**B 的状态是唯一真值**。成员若 60s 内无 B 心跳，则退化为 A 推断态，并置 `degraded=true`（UI 灰显 + 提示「状态为推断值」）。
+3. **工位状态**：只有 `busy / idle / blocked`。`busy` 来自当前会话 `tasks.state='running'`；`blocked` 来自按会话保存的授权等待；没有显式行就是 `idle`。服务端常驻时不存在 `offline`，也不用心跳续租状态。
 4. **进度/文件/耗时**：仅 B 提供；A 模式下该卡片区域显示「—（未接入上报）」，**不编造数据**。
 
 **风险与应对**
@@ -227,52 +227,43 @@
 | role | TEXT | 角色描述 |
 | session_id | TEXT | 来自 config.json |
 | reported | INTEGER DEFAULT 0 | 是否接了 B 上报 |
-| created_at / last_seen_at | INTEGER | |
+| created_at | INTEGER | |
 
 索引：`idx_members_team(team_id, name)`
 
-### 4.3 `agent_status`（每个成员**一行最新快照**，UPSERT）
+### 4.3 `agent_status`（仅常驻小精灵的同名幽灵借用忙碌）
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | member_id | TEXT PK FK | |
-| state | TEXT NOT NULL | `online / busy / idle / blocked / offline` |
-| state_since | INTEGER | 进入该状态的时刻（算「已耗时」） |
-| task_id | TEXT NULL | 当前任务 |
-| progress | REAL | 0–1，NULL 表示未知 |
-| current_files | TEXT | JSON `["src/a.ts", ...]` |
-| last_heartbeat_at | INTEGER | |
-| degraded | INTEGER DEFAULT 0 | 1=由 A 路线推断 |
-| source | TEXT | `report` / `watch` / `timeout` |
+| state | TEXT NOT NULL | 固定为 `busy` |
+| state_since | INTEGER | 借用忙碌开始时刻 |
 | updated_at | INTEGER | |
 
-索引：`idx_status_team_state(state)`（便于「谁阻塞了」查询）
+没有行就是 `idle`。主 Agent 的忙碌不写这里，始终从 `tasks.state` 推导。
 
 ### 4.3.1 `session_status`（每个成员 / 会话一行）
-`member_id, session_id, state, state_since, task_id, last_heartbeat_at, updated_at`
+`member_id, session_id, state, state_since, updated_at`
 
-`agent_status` 是成员卡的聚合快照；任务记录的运行状态按 `task_runs.session_id` 对应到此表，
-因此同一成员下并行会话的任务不会因成员卡只显示一个 `task_id` 而互相误判为取消。旧任务或
-没有会话 ID 的上报仍可回退到 `agent_status`。
+`state` 固定为 `blocked`。主 Agent 按 `floor + sessionId` 定位，小精灵再叠加 `memberId`；
+没有行就是该会话没有阻塞。不同会话的等待授权互不影响。
 
-### 4.4 `agent_status_history`（状态变更流水，供时间线/耗时统计）
-`id INTEGER PK AUTOINCREMENT, member_id, state, ts_ms, reason, source`
-索引：`idx_status_hist_member_ts(member_id, ts_ms)`
-
-### 4.5 `tasks`
+### 4.4 `tasks`
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | id | TEXT PK | `t_<ulid>` |
-| team_id / member_id | TEXT NOT NULL | |
+| project_id / member_id | TEXT NOT NULL | |
 | parent_task_id | TEXT NULL | 支持 leader 拆解子任务 |
 | title | TEXT NOT NULL | |
 | state | TEXT | `pending / running / done / failed / cancelled` |
 | progress | REAL | |
 | started_at / ended_at | INTEGER | |
-| source | TEXT | |
 
-索引：`idx_tasks_member_state(member_id, state)`、`idx_tasks_team_started(team_id, started_at)`
+索引：`idx_tasks_member_state(member_id, state)`、`idx_tasks_project_started(project_id, started_at)`
 
-### 4.6 `messages`（核心表）
+工位“最近活跃”取该会话所有任务的 `MAX(started_at, ended_at)`。任务开始 / 结束已经足够，
+不需要额外的业务心跳或 TTL 续租。
+
+### 4.5 `messages`（核心表）
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | id | INTEGER PK AUTOINCREMENT | 单调序号，用于游标与虚拟滚动 |
@@ -295,15 +286,15 @@
 - `idx_messages_type(team_id, type, ts_ms DESC)`
 - `messages_fts` —— FTS5 虚表（`content, subject`），M2 用于关键字搜索；M0/M1 先用 `LIKE '%kw%'` 顶上
 
-### 4.7 `file_activity`
+### 4.6 `file_activity`
 `id PK, member_id, path, op('read'|'write'), ts_ms`
 索引：`idx_files_member_ts(member_id, ts_ms DESC)`；写入时按 member 保留最近 N=200 条（滚动清理）
 
-### 4.8 `artifacts`（「最近产出」）
+### 4.7 `artifacts`（「最近产出」）
 `id PK, member_id, task_id, kind('file'|'doc'|'pr'|'text'), title, path, ts_ms`
 索引：`idx_artifacts_member_ts(member_id, ts_ms DESC)`
 
-### 4.9 `events`（通用审计/回放，M2 启用）
+### 4.8 `events`（通用审计/回放，M2 启用）
 `id PK, team_id, ts_ms, kind, payload_json`
 
 ---
@@ -335,11 +326,9 @@ export interface Envelope<T = unknown> {
 | 路径 | payload | 语义 |
 | --- | --- | --- |
 | `/register` | `{memberId, name, role, sessionId?}` | 注册/更新成员，置 `reported=1` |
-| `/heartbeat` | `{memberId, state?, progress?, taskId?, files?: string[], ts?}` | 心跳，建议 5s；同时作为「在线」与轻量状态更新。服务端 UPSERT `agent_status`，60s 未收到则按 `watch`/`timeout` 退化 |
-| `/task/start` | `{memberId, taskId?, title, parentTaskId?}` | 建任务并置该成员 `busy` |
+| `/task/start` | `{memberId, taskId?, title, sessionId?, parentTaskId?}` | 建任务；该会话进入 `busy` |
 | `/task/progress` | `{memberId, taskId, progress, note?, files?}` | 0–1 |
-| `/task/end` | `{memberId, taskId, state:'done'\|'failed'\|'cancelled', artifacts?: [{kind,title,path}]}` | 收尾 + 写 artifacts，成员回 `idle` |
-| `/status` | `{memberId, state, reason?}` | 显式状态切换（如 `blocked` + 原因） |
+| `/task/end` | `{memberId, taskId, state:'done'\|'failed'\|'cancelled', artifacts?: [{kind,title,path}]}` | 收尾 + 写 artifacts；没有其他运行任务时该会话回到 `idle` |
 | `/message` | `{from, to?, type, subject?, content, taskId?, ts?}` | 上报一条消息（补齐 A 路线缺失的「发件」侧） |
 | `/file/touch` | `{memberId, path, op}` | 文件读写活动（可选，批量） |
 
@@ -350,15 +339,15 @@ export interface Envelope<T = unknown> {
 
 ```ts
 import { createReporter } from '@workgremlin/reporter';
-const rep = await createReporter({ team: 'workgremlin', member: 'coder' });
+const rep = await createReporter({ project: 'workgremlin', member: 'coder' });
 const task = rep.task('实现工位视图');      // 自动 start
 await task.progress(0.4, { files: ['renderer/src/components/WorkstationCard.vue'] });
 await task.end('done', { artifacts: [{ kind: 'file', title: 'WorkstationCard.vue', path: '...' }] });
-rep.close();                              // 停止心跳
+rep.close();                              // 释放 reporter
 ```
 
 同时提供 CLI，便于 shell hook 调用（不改造 agent 也能用）：
-`workgremlin-report --member coder --state busy --task "..." --progress 0.3`
+`workgremlin-report --member coder --task "..." --progress 0.3`
 
 ### 5.3 前端订阅消息格式（WebSocket）
 
@@ -376,14 +365,14 @@ rep.close();                              // 停止心跳
 **服务端 → 客户端**
 
 ```ts
-{ type: 'snapshot',  ts, payload: { team, members: MemberCard[], recentMessages: Message[], serverTime } }
-{ type: 'member.status', ts, payload: { memberId, state, stateSince, taskId, progress, currentFiles, degraded, source } }
+{ type: 'snapshot',  ts, payload: { project, members: MemberCard[], recentMessages: Message[], serverTime } }
+{ type: 'member.status', ts, payload: MemberCard }
 { type: 'task.update',   ts, payload: { taskId, memberId, title, state, progress, startedAt, endedAt } }
 { type: 'message.new',   ts, payload: Message }                 // 增量，带自增 id 做游标
 { type: 'messages.page', ts, payload: { beforeId, items: Message[], hasMore } }
 { type: 'file.activity', ts, payload: { memberId, path, op, tsMs } }
 { type: 'artifact.new',  ts, payload: Artifact }
-{ type: 'connection',    ts, payload: { state: 'open'|'closed'|'degraded', source: 'ws'|'poll' } }
+{ type: 'connection',    ts, payload: { state: 'open'|'closed', source: 'ws'|'poll' } }
 { type: 'error',         ts, payload: { code, message } }
 ```
 
@@ -391,13 +380,15 @@ rep.close();                              // 停止心跳
 ```ts
 interface MemberCard {
   memberId: string; name: string; role: string;
-  state: 'online'|'busy'|'idle'|'blocked'|'offline';
+  state: 'busy'|'idle'|'blocked';
   stateSince: number;                 // 算「已耗时」
-  task?: { id: string; title: string; progress?: number; startedAt: number };
+  tasks: Array<{ id: string; title: string; progress: number|null; startedAt: number|null;
+                 endedAt: number|null; sessionId: string|null }>;
+  sessionStatuses: Array<{ sessionId: string; state: 'blocked'; stateSince: number }>;
   currentFiles: string[];
   artifacts: Artifact[];              // 最近产出 top3
-  lastSeenAt: number;
-  degraded: boolean;                  // 状态为推断值
+  lastTaskAt: number|null;             // 当前会话最近一次任务开始或结束
+  lastTaskAtBySession: Array<{ sessionId: string|null; at: number|null }>;
   reported: boolean;                  // 是否接了主动上报
   messageCount: number;               // 会话计数
 }

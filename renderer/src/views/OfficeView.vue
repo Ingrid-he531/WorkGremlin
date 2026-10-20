@@ -2,12 +2,15 @@
 /**
  * OfficeView —— top-down view of the office (a real workstation per member).
  *
- * Sorting pushes anomalous members to the front: blocked > busy > online > idle > offline.
+ * Sorting pushes anomalous members to the front: blocked > busy > idle.
  * Clicking a workstation = selecting that member (wired to the conversation drawer on the right).
  */
 import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
 import { useProjectStore } from '../stores/project';
+import { useSessionStore } from '../stores/sessions';
+import { floorAcceptsClient } from '../lib/clientMatch';
+import { memberForSession, normalizeState } from '../lib/memberTask';
 
 const props = defineProps({
   selectedId: { type: String, default: '' },
@@ -15,11 +18,16 @@ const props = defineProps({
 const emit = defineEmits(['select']);
 
 const project = useProjectStore();
+const sessions = useSessionStore();
 
 /** Anomalous first: makes sure blocked/busy members are always on the first screen */
 const desks = computed(() => {
-  const order = ['blocked', 'busy', 'online', 'idle', 'offline'];
-  return project.members.slice().sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
+  const order = ['blocked', 'busy', 'idle'];
+  return project.members
+    .filter((m) => floorAcceptsClient(sessions.selectedClient, m.client))
+    .slice()
+    .map((m) => memberForSession(m, sessions.selectedSessionId, project.members))
+    .sort((a, b) => order.indexOf(normalizeState(a.state)) - order.indexOf(normalizeState(b.state)));
 });
 </script>
 
@@ -33,6 +41,7 @@ const desks = computed(() => {
           v-for="m in desks"
           :key="m.memberId"
           :member="m"
+          :session-id="sessions.selectedSessionId"
           :selected="selectedId === m.memberId"
           @select="emit('select', $event)"
         />

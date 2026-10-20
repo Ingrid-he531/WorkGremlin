@@ -348,8 +348,8 @@ function createServer(opts = {}) {
       log.info(`[workgremlin] 恢复 ${restoredGhosts} 个仍在运行的子代理幽灵`);
     }
 
-    /* The one clock: session scan + per-floor task-ledger sync + per-floor agent sync + heartbeat
-       sweep all live in this single unified poller, so floor modules hold no timers (see poller.js).
+    /* The one clock: session scans, per-floor task-ledger sync, agent sync and ghost GC all live in
+       this single unified poller, so floor modules hold no timers (see poller.js).
        It starts here — after workspace.restore() — so the first tick scans the restored project and
        replaces the roster's old boot-time sync. */
     const poller = createPoller({

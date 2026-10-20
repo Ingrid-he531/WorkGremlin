@@ -53,7 +53,7 @@ const sessions = useSessionStore();
 /**
  * The **single source of truth** for the ticker: the server's /api/v1/task-feed (see
  * server/src/http/routes/query.js). It lists the tasks table directly by taskId and returns each
- * task's { id, title, started_at, ended_at, client, state }, with state normalized by taskAliveSql
+ * task's { id, title, started_at, ended_at, client, state }
  * (a zombie running is judged cancelled) — **completely independent** of floors / sessions, so no
  * floor dedup / session aggregation is done any more, and each active task is shown separately.
  * client is reverse-looked up to a floor number (see floorLabelForClient).

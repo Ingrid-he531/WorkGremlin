@@ -61,8 +61,8 @@ const bus = {
   endTask: async (args) => { seen.push({ path: '/api/v1/task/end', body: args }); },
   toolUse: async (args) => { seen.push({ path: '/api/v1/tool/use', body: args }); },
   registerMember: async (args) => { seen.push({ path: '/api/v1/register', body: args }); },
-  heartbeat: async (args) => { seen.push({ path: '/api/v1/heartbeat', body: args }); },
-  setStatus: async (args) => { seen.push({ path: '/api/v1/status', body: args }); },
+  setBlocked: async (args) => { seen.push({ path: '/api/v1/blocked', body: args }); },
+  clearBlocked: async () => ({ ok: true }),
   projectForReport: () => '',
   backfillTaskTokens: async () => {},
   currentTaskFor: () => null,
@@ -99,12 +99,12 @@ function killHeartbeat() {}
 (async () => {
   console.log('Qoder：细粒度产品 —— 会话边界不补任务、不补相位，相位交给 UserPromptSubmit / Stop');
 
-  /* [1] SessionStart：只注册 / 心跳 / 状态，**不许**发 /task/start */
+  /* [1] SessionStart：只注册，**不许**发 /task/start */
   let mark = seen.length;
   await runHook('qoder', 'SessionStart', 'qtest-qoder-1');
   let got = since(mark);
   let st = stateFile('qtest-qoder-1');
-  ok('SessionStart 照常注册（发了 /register 与 /heartbeat）', pathsOf(got).includes('/api/v1/register') && pathsOf(got).includes('/api/v1/heartbeat'), pathsOf(got).join(' '));
+  ok('SessionStart 照常注册（发了 /register）', pathsOf(got).includes('/api/v1/register'), pathsOf(got).join(' '));
   ok('SessionStart **没有**发会话级任务（/task/start 一条都没有）', startOf(got).length === 0, JSON.stringify(startOf(got)));
   ok('SessionStart 不编造任务相位（只落 idle，留给 UserPromptSubmit 推进）', Boolean(st && st.sessionPhase && st.sessionPhase.phase === 'idle'), st && JSON.stringify(st.sessionPhase));
   ok('状态文件里没有会话级 taskId', Boolean(st && !st.taskId), st && JSON.stringify(st.taskId));

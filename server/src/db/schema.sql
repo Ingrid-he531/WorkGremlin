@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS projects (
   name                  TEXT NOT NULL,
   workspace_path        TEXT NOT NULL,
   main_conversation_id  TEXT,
-  source                TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch', 'timeout')),
+  source                TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch')),
   created_at            INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_projects_ws ON projects(workspace_path);
@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS members (
   session_id     TEXT,
   reported       INTEGER NOT NULL DEFAULT 0, -- 1 = connected to active reporting (route B)
   created_at     INTEGER NOT NULL,
-  last_seen_at   INTEGER,
   -- Ephemeral member (no station; a ghost in the scene): members who "team up temporarily per project",
   -- such as subagents
   ephemeral      INTEGER NOT NULL DEFAULT 0,
@@ -44,43 +43,25 @@ CREATE TABLE IF NOT EXISTS members (
 );
 CREATE INDEX IF NOT EXISTS idx_members_project ON members(project_id, name);
 
--- One row of latest state per member (UPSERT). Route B is the only truth; route A / timeout only write degraded=1
+-- Explicit non-task state. Busy here is only the resident gremlin's borrowed state while a summon runs;
+-- idle is represented by no row. Main-agent busy is always derived from tasks.state.
 CREATE TABLE IF NOT EXISTS agent_status (
   member_id          TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
-  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline')),
+  state              TEXT NOT NULL CHECK (state = 'busy'),
   state_since        INTEGER NOT NULL,
-  task_id            TEXT,
-  progress           REAL,                   -- 0~1; NULL = unknown (never fabricated)
-  current_files      TEXT,                   -- JSON array
-  last_heartbeat_at  INTEGER,
-  degraded           INTEGER NOT NULL DEFAULT 0,
-  source             TEXT NOT NULL DEFAULT 'report' CHECK (source IN ('report', 'watch', 'timeout')),
   updated_at         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_status_state ON agent_status(state);
 
-CREATE TABLE IF NOT EXISTS agent_status_history (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  member_id  TEXT NOT NULL,
-  state      TEXT NOT NULL,
-  ts_ms      INTEGER NOT NULL,
-  reason     TEXT,
-  source     TEXT NOT NULL DEFAULT 'report'
-);
-CREATE INDEX IF NOT EXISTS idx_status_hist_member_ts ON agent_status_history(member_id, ts_ms);
-
--- Each member/session pair tracks its own task; agent_status remains the member-card aggregate.
+-- Explicit authorization waits. A row exists only while that session is blocked.
 CREATE TABLE IF NOT EXISTS session_status (
   member_id          TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
   session_id         TEXT NOT NULL,
-  state              TEXT NOT NULL CHECK (state IN ('online', 'busy', 'idle', 'blocked', 'offline')),
+  state              TEXT NOT NULL CHECK (state = 'blocked'),
   state_since        INTEGER NOT NULL,
-  task_id            TEXT,
-  last_heartbeat_at  INTEGER,
   updated_at         INTEGER NOT NULL,
   PRIMARY KEY (member_id, session_id)
 );
-CREATE INDEX IF NOT EXISTS idx_session_status_task ON session_status(task_id, last_heartbeat_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id              TEXT PRIMARY KEY,

@@ -15,7 +15,7 @@ import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
 import { busySubagentsOf } from '../lib/liveSubagents';
-import { summonTaskTitle } from '../lib/memberTask';
+import { memberForSession, normalizeState, summonTaskTitle } from '../lib/memberTask';
 import { httpBase, getServerInfo } from '../api/bridge';
 import { createIsoOffice } from '../iso/engine';
 import { useI18n } from '../i18n';
@@ -146,7 +146,7 @@ const mtipTask = computed(() => {
   if (!m) return '';
   // The "current task" definition matches the workstation card (see lib/memberTask.summonTaskTitle): when the gremlin itself has no running task,
   // borrow the same-named ghost dispatched by this summon (only while it really is running) —— the same implementation as the workstation card.
-  return summonTaskTitle(m, project.members);
+  return summonTaskTitle(m, project.members, sessions.selectedSessionId);
 });
 /** The most recent completed result (recorded by the engine when the report animation finishes) */
 const mtipResult = computed(() => (mtip.value.id && office ? office.lastResult(mtip.value.id) : null));
@@ -350,7 +350,10 @@ const consoleLive = computed(() => {
     return {
       phase: 'waiting',
       action: t('console.waiting_subs', { names }),
-      context: subs.slice(0, 3).map((m) => (m.task ? `${m.name}：${m.task}` : t('console.sub_running', { name: m.name }))),
+      context: subs.slice(0, 3).map((m) => {
+        const task = summonTaskTitle(m, project.members, sessions.selectedSessionId);
+        return task ? `${m.name}：${task}` : t('console.sub_running', { name: m.name });
+      }),
       target: null,
       tool: '',
       prompt: '',
@@ -458,7 +461,7 @@ watch(
     // Waiting on wrap-up (the office is still playing this round's summon / report):
     //   - a genuinely new round (a phase newer than the Stop, or taskState running again) -> drop the
     //     wait and follow the new task;
-    //   - everything else (stale pre-Stop phase, idle / waiting / offline fallback) -> ignore, so the
+    //   - everything else (stale pre-Stop phase or an inactive fallback) -> ignore, so the
     //     pending wrap-up is not overridden.
     if (pendingDone) {
       const fp = fastPhase.value;
@@ -579,24 +582,23 @@ let cardRaf = 0;
  * Scene actors: experts (with a workstation) + ephemeral members (ghosts, floating).
  *
  * When the selected session is not "the one running in the current project" (another project's session / only fossil data left),
- * this member list does not match that session —— everything is shown as offline + inferred, never using project A's people
- * to impersonate project B's state. The office layout is unaffected, still laid out as this list presents it.
+ * this member list does not match that session. The actors then fall back to idle, never using project A's people
+ * to impersonate project B's state. The office layout is unaffected.
  */
 // The main Agent (role=agent) takes no workstation: its own realtime state is consumed separately by the main console silhouette
 // (setMainAgent), so placing another one in the workstation area would be a duplicate. So it is excluded from the workstation roster,
 // leaving only true subagent gremlins (including resident members registered by the scanner) at workstations.
 const sceneMembers = computed(() => {
   // Demo mode overrides both the floor / session filters: demo members' active state is maintained by the server's driver
-  // (heartbeat every 5s, advancing progress) and has nothing to do with "which real session is selected in the dropdown". Without this special case,
-  // the 8 demo gremlins would all go grey + marked "inferred", and when the floor happens to have no active session (floorEmpty)
-  // not a single person would be left in the office —— that would not be a demo.
+  // and has nothing to do with "which real session is selected in the dropdown". Without this special case,
+  // the demo gremlins would lose their active states whenever the selected floor had no real session.
   const demo = project.demo;
   /**
    * How to handle an empty floor (no active session on this floor) —— two categories:
    *   · Ghosts (`subagent-<name>`) are not kept: they are session-level ephemeral members, the product of "this round's summon",
    *     and should not exist without a session (keeping them is the previous floor's afterimage).
-   *   · **Resident gremlins are kept**: user-level / project-level gremlins are subagents already defined in the agents directory,
-   *     registered by the server's agentRoster with a continuous heartbeat, "present even when not currently summoned" —— unrelated to whether this floor has a session.
+   *   · **Resident gremlins are kept**: user-level / project-level gremlins are static workstations already defined in the agents directory,
+   *     "present even when not currently summoned", unrelated to whether this floor has a session.
    *     Not seeing them after switching would make people think this floor has nobody at all (with no session on 1F, user-level/project-level experts should still be at their workstations).
    */
   const emptyFloor = sessions.floorEmpty && !demo;
@@ -615,14 +617,14 @@ const sceneMembers = computed(() => {
     .filter((m) => floorAcceptsClient(want, m.client))
     // Ghosts (subagent- prefix) carry a sessionId —— only the selected session's ghosts are shown.
     // Resident gremlins (role=subagent but not ephemeral) have no sessionId and are shared floor-wide, so they must not be filtered out by this.
-    // Ghosts with an empty sessionId (old store / manual scripts) are passed through too —— a degraded behavior is better than filtering everything out.
+    // Ghosts with an empty sessionId (old store / manual scripts) are passed through too, rather than hiding every ghost.
     .filter((m) => !isEphemeralMember(m) || !wantSession || !m.sessionId || m.sessionId === wantSession)
+    .map((m) => (live ? memberForSession(m, wantSession, project.members) : { ...m, state: 'idle', tasks: [], sessionStatuses: [] }))
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],
       level: m.level || null,
-      state: live ? m.state || 'offline' : 'offline',
-      degraded: live ? Boolean(m.degraded) : true,
+      state: live ? normalizeState(m.state) : 'idle',
       ghost: isEphemeralMember(m),
       project: projectLabelOf(m),
       // taskProgress was removed (2026-09-29): the progress bar on the 3D office monitor became an "indeterminate bar",
@@ -850,7 +852,7 @@ onBeforeUnmount(() => {
       :style="{ left: `${card.left}px`, top: `${card.top}px` }"
       @click.stop
     >
-      <WorkstationCard :member="cardMember" :members="project.members" />
+      <WorkstationCard :member="cardMember" :members="project.members" :session-id="sessions.selectedSessionId" />
       <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 

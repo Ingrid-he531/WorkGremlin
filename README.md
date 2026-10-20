@@ -1,6 +1,6 @@
 # WorkGremlin
 
-Turn the AI coding agents running on your machine into a **visible office**: who is online, what they are busy with, which floor is working — all at a glance. You can also invite agents from several floors into a **council** to review one proposal through several moderated rounds (a moderator, a main answerer and independent reviewers — no voting).
+Turn the AI coding agents running on your machine into a **visible office**: who is busy, which session is working, and which floor is active — all at a glance. You can also invite agents from several floors into a **council** to review one proposal through several moderated rounds (a moderator, a main answerer and independent reviewers — no voting).
 
 ## Demo
 
@@ -45,11 +45,11 @@ An isometric (2.5D) office that draws "which agent is doing what":
 One card per member on the current floor (the main agent is always the first):
 
 - **Role**: main agent / project subagent / user subagent;
-- **State**: only two levels — busy / idle (the status dot and the text share the same color; you never get a "green dot + idle");
+- **State**: only three levels — busy / idle / blocked (the status dot and the text share the same color; there is no offline or inferred state while the server is running);
 - **Current task**: the one in progress; when idle it honestly says "idle" and does not leave the previous task on the card;
 - **Description**: the "what it does" written in the subagent definition (static information, not state);
 - **Time**: in progress shows "started MM-DD HH:mm", idle shows "last active MM-DD HH:mm";
-- members that do not report are marked "passively observed" and their state is greyed out as inferred.
+- members that do not report are marked "passively observed"; unavailable fields stay empty instead of being inferred.
 
 Only resident gremlins are listed; ghosts summoned temporarily do not take a card slot (avoiding the "summon once, one more in the list" confusion).
 
@@ -106,8 +106,8 @@ Among them, **1F / 2F / 3F / 4F / 6F / 7F / 8F can also join the council** (thes
 
 - **Only truths**: state, tasks, files and duration all come from the agent's own reports or its local on-disk data; if it cannot get them it writes "unreported / —" rather than making up a number.
 - **No fake progress**: the progress bar is gone — when there is no real per-round progress to advance, drawing one would only deceive.
-- **Two state levels**: busy / idle (the office nameplate and the cards use the same rule); finer phases are written only on the main console screen.
-- **Grey when the heartbeat stops**: a member with no heartbeat for over 60s is marked degraded (an inferred value) and greyed out with a label.
+- **Three workstation states**: busy / idle / blocked. Busy comes from a running task, blocked comes from an explicit authorization wait, and no explicit state means idle.
+- **No business heartbeat**: task start / end times drive "last active". WebSocket ping only checks the network connection and never changes a workstation state.
 
 ## Data and configuration
 

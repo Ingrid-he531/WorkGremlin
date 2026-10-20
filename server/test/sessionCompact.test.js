@@ -6,20 +6,18 @@
  * context compaction, and that happens **in the middle of a running turn** (20+ times inside one
  * 25-minute task in the measured case). The SessionStart handler treated every SessionStart as a
  * brand-new session: it cleared `taskId` / `taskStartedAt` from the state file and pushed the
- * session to idle. `session_status.task_id` therefore became NULL while the task row was still
- * `running`, `/task-runs`' liveness check (`ss.task_id = t.id`, see taskAliveSql) had nothing to
- * match, and the still-running task was normalized to "cancelled". Later tool events also lost
- * their task attribution.
+ * taskId / taskStartedAt from the state file and pushed the session to idle. The session then
+ * lost its task attribution even though the task row was still `running`; later tool events could
+ * no longer be attached to that round.
  *
  * What this file pins down:
- *   [1] SessionStart(source=compact) mid-round -> taskId kept, status stays busy with that taskId,
- *       no task/end is sent;
- *   [2] SessionStart(source=startup) -> the normal reset still happens (taskId cleared, idle);
+ *   [1] SessionStart(source=compact) mid-round -> taskId kept and no task/end is sent;
+ *   [2] SessionStart(source=startup) -> the normal reset still happens (taskId cleared);
  *   [3] SessionStart(source=compact) with no round in flight -> falls through to the normal reset;
  *   [4] server restarted (in-memory state gone, only the state file knows the round) + compact ->
- *       taskId is recovered from the ledger and the round stays busy;
- *   [5] a busy status after a restart re-attaches the round (task_id is what liveness reads), and
- *       the round still closes normally afterwards (Stop -> done), so keeping it is not a leak.
+ *       taskId is recovered from the ledger;
+ *   [5] after a restart, a tool event re-attaches the round through the state file, and the round
+ *       still closes normally afterwards (Stop -> done). No busy/idle status row is written.
  *
  * Run: `node server/test/sessionCompact.test.js` (no dependencies: temp dirs + fake bus)
  */
@@ -58,7 +56,7 @@ function head(t) {
 let taskSeq = 0;
 const starts = [];
 const ends = [];
-const statuses = [];
+const blockedWrites = [];
 /** Ledger view the fake bus exposes to `currentTaskFor` (used to emulate a server restart) */
 let ledgerTask = null;
 
@@ -74,8 +72,8 @@ const bus = {
     ledgerTask = null;
   },
   toolUse: async () => {},
-  setStatus: async (args) => { statuses.push(args); },
-  heartbeat: async () => {},
+  setBlocked: async (args) => { blockedWrites.push(args); },
+  clearBlocked: async () => ({ ok: true }),
   registerMember: async () => {},
   projectForReport: () => '',
   backfillTaskTokens: async () => {},
@@ -111,7 +109,6 @@ function stateOf(sid) {
     return null;
   }
 }
-const lastStatus = () => statuses[statuses.length - 1] || {};
 
 async function main() {
   head('[1] SessionStart(source=compact) mid-round keeps the round alive');
@@ -122,7 +119,7 @@ async function main() {
     const taskId = String((stateOf(sid) || {}).taskId || '');
     ok('the round opened (taskId on disk)', Boolean(taskId), JSON.stringify(stateOf(sid)));
     const endsBefore = ends.length;
-    statuses.length = 0;
+    blockedWrites.length = 0;
 
     await run(d, { hook_event_name: 'SessionStart', session_id: sid, cwd: WS, source: 'compact' });
 
@@ -130,8 +127,7 @@ async function main() {
     ok('taskId survives the compaction', Boolean(st && st.taskId === taskId), st && JSON.stringify(st.taskId));
     ok('taskStartedAt survives (the round keeps its start time)', Boolean(st && Number(st.taskStartedAt) > 0), st && JSON.stringify(st.taskStartedAt));
     ok('no task/end is sent', ends.length === endsBefore, `${endsBefore} → ${ends.length}`);
-    ok('status stays busy', lastStatus().state === 'busy', JSON.stringify(lastStatus()));
-    ok('status still carries this taskId (liveness keeps matching)', lastStatus().taskId === taskId, JSON.stringify(lastStatus()));
+    ok('no blocked row is written', blockedWrites.length === 0, JSON.stringify(blockedWrites));
     ok('phase is not pushed to idle', Boolean(st && st.sessionPhase && st.sessionPhase.phase !== 'idle'), st && JSON.stringify(st.sessionPhase));
   }
 
@@ -141,12 +137,12 @@ async function main() {
     const d = newDispatch();
     await run(d, { hook_event_name: 'UserPromptSubmit', session_id: sid, cwd: WS, prompt: '再来一轮' });
     const taskId = String((stateOf(sid) || {}).taskId || '');
-    statuses.length = 0;
+    blockedWrites.length = 0;
     await run(d, { hook_event_name: 'SessionStart', session_id: sid, cwd: WS, source: 'startup' });
     const st = stateOf(sid);
     ok('taskId cleared on a real new session', Boolean(st && !st.taskId), st && JSON.stringify(st.taskId));
     ok('phase is idle', Boolean(st && st.sessionPhase && st.sessionPhase.phase === 'idle'), st && JSON.stringify(st.sessionPhase));
-    ok('status is idle', lastStatus().state === 'idle', JSON.stringify(lastStatus()));
+    ok('no blocked row is written', blockedWrites.length === 0, JSON.stringify(blockedWrites));
     ok('the previous round was not closed by the reset itself', !ends.some((e) => e.taskId === taskId), JSON.stringify(ends.map((e) => [e.taskId, e.state])));
   }
 
@@ -155,12 +151,12 @@ async function main() {
     const sid = 'codex-compact-3';
     const d = newDispatch();
     ledgerTask = null;
-    statuses.length = 0;
+    blockedWrites.length = 0;
     await run(d, { hook_event_name: 'SessionStart', session_id: sid, cwd: WS, source: 'compact' });
     const st = stateOf(sid);
     ok('no taskId to keep', Boolean(st && !st.taskId), st && JSON.stringify(st.taskId));
     ok('phase is idle', Boolean(st && st.sessionPhase && st.sessionPhase.phase === 'idle'), st && JSON.stringify(st.sessionPhase));
-    ok('status is idle', lastStatus().state === 'idle', JSON.stringify(lastStatus()));
+    ok('no blocked row is written', blockedWrites.length === 0, JSON.stringify(blockedWrites));
   }
 
   head('[4] after a server restart (memory lost) a compaction recovers the round from the ledger');
@@ -172,15 +168,15 @@ async function main() {
     ok('round opened before the restart', Boolean(taskId), JSON.stringify(stateOf(sid)));
 
     const d2 = newDispatch(); // restart: the in-memory Map is gone, the state file is still there
-    statuses.length = 0;
+    blockedWrites.length = 0;
     await run(d2, { hook_event_name: 'SessionStart', session_id: sid, cwd: WS, source: 'compact' });
     const st = stateOf(sid);
     ok('taskId recovered into the state file', Boolean(st && st.taskId === taskId), st && JSON.stringify(st.taskId));
-    ok('status busy with the recovered taskId', lastStatus().state === 'busy' && lastStatus().taskId === taskId, JSON.stringify(lastStatus()));
+    ok('recovery does not write a blocked row', blockedWrites.length === 0, JSON.stringify(blockedWrites));
     ok('no task/end is sent', !ends.some((e) => e.taskId === taskId), JSON.stringify(ends.map((e) => [e.taskId, e.state])));
   }
 
-  head('[5] a busy status after a restart re-attaches the round (task_id is what liveness reads)');
+  head('[5] a tool event after a restart re-attaches the running round');
   {
     const sid = 'codex-compact-6';
     const d1 = newDispatch();
@@ -188,16 +184,16 @@ async function main() {
     const taskId = String((stateOf(sid) || {}).taskId || '');
 
     const d2 = newDispatch(); // restart: only the ledger knows the round
-    statuses.length = 0;
+    blockedWrites.length = 0;
     await run(d2, { hook_event_name: 'PreToolUse', session_id: sid, cwd: WS, tool_name: 'Bash', tool_input: { command: 'ls' } });
-    ok('busy status carries the recovered taskId', lastStatus().state === 'busy' && lastStatus().taskId === taskId, JSON.stringify(lastStatus()));
     const st = stateOf(sid);
     ok('the recovered taskId is written back to the state file', Boolean(st && st.taskId === taskId), st && JSON.stringify(st.taskId));
+    ok('task activity does not write a blocked row', blockedWrites.length === 0, JSON.stringify(blockedWrites));
 
-    // An idle status must NOT resurrect a stale ledger row: it reports the empty slot as-is.
-    statuses.length = 0;
+    blockedWrites.length = 0;
     await run(d2, { hook_event_name: 'Stop', session_id: sid, cwd: WS });
     ok('Stop still closes the recovered round', (ends.find((e) => e.taskId === taskId) || {}).state === 'done', JSON.stringify(ends.filter((e) => e.taskId === taskId)));
+    ok('Stop writes no blocked row', blockedWrites.length === 0, JSON.stringify(blockedWrites));
   }
 
   head('[6] the kept round still closes normally on Stop');

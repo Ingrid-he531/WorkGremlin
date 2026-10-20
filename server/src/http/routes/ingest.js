@@ -51,17 +51,6 @@ function createIngestRouter({ bus, repo }) {
 
   router.post('/register', projectFirst((b) => ({ ok: true, memberId: bus.registerMember(b) })));
 
-  router.post(
-    '/heartbeat',
-    projectFirst((b) =>
-      b.memberId
-        ? bus.heartbeat(b)
-        : { ok: false, error: 'missing memberId' }
-    )
-  );
-
-  router.post('/status', projectFirst((b) => (b.memberId ? bus.setStatus(b) : { ok: false, error: 'missing memberId' })));
-
   router.post('/task/start', projectFirst((b) => (b.memberId ? bus.startTask(b) : { ok: false, error: 'missing memberId' })));
 
   router.post(

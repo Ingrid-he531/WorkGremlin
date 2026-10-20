@@ -327,11 +327,11 @@ head('[G] 议事厅参与者不进 2F（标题带 COUNCIL_PROMPT_MARKER）');
 
 head('[H] 终态会话立刻回收（源里标了结束就不进下拉）');
 {
-  // Fake registry context: `table` is a Map, claim/upsert record what the handler did.
+  // Fake registry context: `table` is a Map, claimSession/upsert record what the handler did.
   const table = new Map();
   const upserts = [];
   const ctx = {
-    claim: () => true,
+    claimSession: () => true,
     upsert: (e) => {
       upserts.push(e);
       table.set(`${e.floor}:${e.id}`, e);
