@@ -231,6 +231,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   const GHOST_ORPHAN_MS = 5 * 60_000;
   /** Background subagents outlive their parent round by design, so they get their own longer TTL. */
   const GHOST_BACKGROUND_ORPHAN_MS = 60 * 60_000;
+  /** How often a live ghost renews its own heartbeat; well under HEARTBEAT_TIMEOUT_MS (60s). */
+  const GHOST_HEARTBEAT_MS = 30_000;
   /**
    * Where the finish summary lands: artifacts.kind is limited to file/doc/pr/text (CHECK), so the
    * summary is stored as kind='text' plus this path marker, which the renderer reads as the "report".
@@ -1344,7 +1346,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   /**
    * Ghost fallback (driven by the unified poller): disperse any summon whose parent task ended or
    * that outlived the orphan TTL — no longer depends on any hook event arriving. The parent truth
-   * comes from tasks.state; the summon link from the record's parentTaskId.
+   * comes from tasks.state; the summon link from the record's parentTaskId. It also renews a still-live
+   * ghost's heartbeat, so a long summon is not flagged degraded merely for outliving the heartbeat timeout.
    *
    * The orphan TTL is only a fallback for a summon **no running parent vouches for**: a parent task that
    * is still running is positive evidence the round (and its subagent) is still active, so it must not be
@@ -1381,11 +1384,27 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         const ttl = rec.background ? GHOST_BACKGROUND_ORPHAN_MS : GHOST_ORPHAN_MS;
         if (t - rec.at > ttl) drop = true;
       }
-      if (!drop) continue;
-      closeGhost(rec);
-      ghosts.delete(rec.key);
-      removeGhostMemberIfUnused(rec);
-      n += 1;
+      if (drop) {
+        closeGhost(rec);
+        ghosts.delete(rec.key);
+        removeGhostMemberIfUnused(rec);
+        n += 1;
+        continue;
+      }
+      // Still alive: renew its heartbeat, or a summon that outlives HEARTBEAT_TIMEOUT_MS is flagged
+      // degraded for being long-running — a live ghost dimmed to 60% opacity while it is working. A
+      // ghost's liveness is this record, not a reported heartbeat, so silence here means "no end signal
+      // yet", not "lost contact". Throttled, since the poller ticks every 2s. Lazy init keeps the rec
+      // literals untouched: the spawn heartbeat counts as the first beat.
+      const lastBeat = Number(rec.lastBeatAt) || Number(rec.at) || t;
+      if (t - lastBeat >= GHOST_HEARTBEAT_MS) {
+        rec.lastBeatAt = t;
+        try {
+          heartbeat({ project: rec.project, memberId: rec.memberName, state: 'busy', progress: null, files: [] });
+        } catch {
+          /* ignore */
+        }
+      }
     }
     return n;
   }

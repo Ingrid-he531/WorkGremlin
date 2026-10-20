@@ -84,9 +84,30 @@ function createAgentRoster(opts) {
     }
   }
 
-  /** Keep the gremlin online; skip while it is summoned (the ghost path owns the workstation state then). */
+  /**
+   * Keep the gremlin online. While it is summoned the ghost path owns its state, so the plain online
+   * heartbeat is skipped. But a summon can outlive HEARTBEAT_TIMEOUT_MS, and with nothing renewing it the
+   * workstation would be flagged degraded ("lost contact") while a live ghost proves it is working — the
+   * user saw a dashed ring and a grey "inferred" badge on a gremlin that was mid-summon. So while a
+   * same-name ghost is alive, renew with the busy state the summon set; `degraded` stays what it means,
+   * "we lost contact", instead of "this value is mirrored".
+   */
   function heartbeat(project, name, act) {
-    if (act.has(name)) return;
+    if (act.has(name)) {
+      let alive = false;
+      try {
+        alive = typeof bus.isGhostAlive === 'function' && bus.isGhostAlive({ project, name });
+      } catch {
+        alive = false;
+      }
+      if (!alive) return;
+      try {
+        bus.heartbeat({ project, memberId: name, state: 'busy', progress: null, files: [] });
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     try {
       bus.heartbeat({ project, memberId: name, state: 'online', progress: null, files: [] });
     } catch {

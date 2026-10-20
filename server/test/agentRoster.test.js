@@ -30,6 +30,7 @@ const { createIngestBus } = require('../src/ingest/bus');
 const { createAgentRoster } = require('../src/ingest/agentRoster');
 const { createPoller } = require('../src/poller');
 const { floorByAgent } = require('../src/floors');
+const clock = require('../src/clock');
 
 let pass = 0;
 let fail = 0;
@@ -157,6 +158,43 @@ console.log('\n[5] 忙碌租约：幽灵还活着就续期，幽灵没了才让 
     '没有幽灵且超过 TTL → 兜底回到在线（不会永久卡忙碌）',
     (repo.getStatus.get((repo.getMember.get('architect@p1') || {}).id) || {}).state === 'online'
   );
+}
+
+console.log('\n[6] 心跳超时只表示「失联」：活着的小精灵 / 小幽灵都不许被标成「推断值」');
+{
+  // A summon can outlive HEARTBEAT_TIMEOUT_MS (60s). Nothing renewed either heartbeat, so a gremlin
+  // mid-summon wore the dashed ring + grey "inferred" badge and a ghost mid-flight dimmed to 60% --
+  // both while they were demonstrably working. `degraded` must mean "we lost contact", nothing else.
+  // The bus reads clock.now(), so putting the bus on the injected clock makes the 60s cutoff exact.
+  clock.__setClock({ now: () => t, monotonic: () => t });
+  const statusOf = (memberId) => repo.getStatus.get(memberId) || {};
+  const leoId = 'leo@p1';
+
+  bus.setGhostRoster(roster);
+  const ghost = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's6', name: 'leo', task: '跑过一分钟', id: 'gl-hb' });
+  ok('召唤后 leo 忙碌、未降级', statusOf(leoId).state === 'busy' && statusOf(leoId).degraded === 0, JSON.stringify(statusOf(leoId)));
+
+  t += 61_000;
+  poller.syncAgentsNow(); // the agent poll renews the gremlin while its ghost is alive
+  bus.gcGhosts(); // the ghost GC renews the ghost while its record is open
+  bus.sweepDegraded();
+  ok('超过 60s：小精灵仍是忙碌且未降级（不再挂虚线环 + 灰牌）', statusOf(leoId).state === 'busy' && statusOf(leoId).degraded === 0, JSON.stringify(statusOf(leoId)));
+  ok('超过 60s：小幽灵未降级（不再半透明）', ghost && statusOf(ghost.memberId).degraded === 0, JSON.stringify(ghost && statusOf(ghost.memberId)));
+
+  // Control: the renewal must not blanket-suppress the flag -- a member with no ghost and no
+  // heartbeat for over 60s still greys out. sweepDegraded is called directly so nothing renews it.
+  roster.markActive('architect');
+  t += 61_000;
+  bus.sweepDegraded();
+  ok(
+    '对照：没有幽灵也没人续心跳的成员，60s 后照样降级',
+    statusOf('architect@p1').degraded === 1,
+    JSON.stringify(statusOf('architect@p1'))
+  );
+
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's6', name: 'leo', id: 'gl-hb', result: '跑完了' });
+  ok('收工后 leo 在线且未降级', statusOf(leoId).state === 'online' && statusOf(leoId).degraded === 0, JSON.stringify(statusOf(leoId)));
+  clock.__resetClock();
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
