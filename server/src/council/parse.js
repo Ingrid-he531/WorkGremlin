@@ -176,13 +176,28 @@ function bodyWithoutChunk(s, chunk) {
  *
  * @param {string} text
  * @returns {{parsed:boolean, breakdown:string[], assignments:Array<{reviewer:string, focus:string|null}>,
- *            reviewFocus:string[]}}
+ *            reviewFocus:string[], needsClarification:string[]}}
  */
 function parsePlanBlock(text) {
   const s = String(text == null ? '' : text);
-  const empty = { parsed: false, breakdown: [], assignments: [], reviewFocus: [] };
+  const empty = {
+    parsed: false,
+    breakdown: [],
+    assignments: [],
+    reviewFocus: [],
+    needsClarification: [],
+  };
   if (!s.trim()) return empty;
-  const obj = lastJsonBlock(s, (o) => 'breakdown' in o || 'assignments' in o || 'reviewFocus' in o);
+  const obj = lastJsonBlock(
+    s,
+    (o) =>
+      'breakdown' in o ||
+      'assignments' in o ||
+      'reviewFocus' in o ||
+      'needsClarification' in o ||
+      'clarifications' in o ||
+      'questions' in o
+  );
   if (!obj) return empty;
 
   const assignments = [];
@@ -198,6 +213,9 @@ function parsePlanBlock(text) {
     breakdown: strList(obj.breakdown),
     assignments,
     reviewFocus: strList(obj.reviewFocus || obj.focus),
+    needsClarification: strList(
+      obj.needsClarification || obj.clarifications || obj.questions
+    ),
   };
 }
 

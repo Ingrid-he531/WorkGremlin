@@ -18,12 +18,14 @@
  *   · **Timeout means "this turn did not answer", not "wait a bit more"**: kill the process when
  *     the time comes and return status='timeout'. Never return a half answer.
  *
- * There are exactly three statuses in the return value: ok / failed / timeout.
+ * There are four statuses in the return value: ok / failed / timeout / unparsed.
  *   · ok       —— the process exited normally **and** the output parses into body text. Only then
  *                 do text / tokens mean anything.
- *   · failed   —— could not start (ENOENT), non-zero exit, unreadable output. error carries the
+ *   · failed   —— could not start (ENOENT), non-zero exit, or output overflow. error carries the
  *                 **raw text**, do not dress it up.
  *   · timeout  —— killed when the time came.
+ *   · unparsed —— exited normally, but stdout did not contain a parseable body. The raw tail is
+ *                 retained so a truncated transcript can be diagnosed without guessing.
  * Body parsed but **no** structured block is not decided here: that is the caller's job (record
  * status='unparsed'), because "spoke but gave no plan/review" has to stay distinguishable from
  * "did not speak at all".
@@ -37,8 +39,20 @@ const { parseOutput } = require('./agents');
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 /** Grace period after SIGTERM before SIGKILL */
 const KILL_GRACE_MS = 3_000;
+/** Raw stdout retained for an unparsed or failed turn */
+const RAW_TAIL_BYTES = 64 * 1024;
 
 const IS_WIN = process.platform === 'win32';
+
+/** Keep the last N UTF-8 bytes without starting in the middle of a code point. */
+function utf8Tail(value, maxBytes = RAW_TAIL_BYTES) {
+  const text = String(value == null ? '' : value);
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= maxBytes) return text;
+  let start = buf.length - maxBytes;
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start += 1;
+  return buf.subarray(start).toString('utf8');
+}
 
 /**
  * Kill the **whole group**. On POSIX the child was started detached (its own process group), so use
@@ -79,8 +93,9 @@ function killTree(child) {
  *   onChild is called once when the process is up, handing the handle to the caller —— the council
  *   has to be able to kill in-flight processes when the user hits "cancel" or the server closes;
  *   a timeout alone would never get there in time.
- * @returns {Promise<{status:'ok'|'failed'|'timeout', text:string, tokens:object|null,
- *                    model:string|null, error:string|null, durationMs:number, exitCode:number|null}>}
+ * @returns {Promise<{status:'ok'|'failed'|'timeout'|'unparsed', text:string, tokens:object|null,
+ *                    model:string|null, error:string|null, raw:string, durationMs:number,
+ *                    exitCode:number|null}>}
  */
 function runOnce(arg) {
   const startedAt = Date.now();
@@ -98,7 +113,16 @@ function runOnce(arg) {
       });
     } catch (err) {
       // spawn throws synchronously (invalid arguments, etc.) —— record it honestly, do not swallow
-      resolve({ status: 'failed', text: '', tokens: null, error: `起进程失败：${err && err.message}`, durationMs: Date.now() - startedAt, exitCode: null });
+      resolve({
+        status: 'failed',
+        text: '',
+        tokens: null,
+        model: null,
+        error: `起进程失败：${err && err.message}`,
+        raw: '',
+        durationMs: Date.now() - startedAt,
+        exitCode: null,
+      });
       return;
     }
 
@@ -128,6 +152,7 @@ function runOnce(arg) {
         tokens: extra.tokens != null ? extra.tokens : null,
         model: extra.model != null ? extra.model : null,
         error: extra.error != null ? extra.error : null,
+        raw: extra.raw != null ? extra.raw : utf8Tail(stdout),
         durationMs: Date.now() - startedAt,
         exitCode: extra.exitCode != null ? extra.exitCode : null,
       });
@@ -187,11 +212,12 @@ function runOnce(arg) {
           stderr,
           'utf8'
         )} 字节，退出码 ${code}`;
-        finish('failed', {
+        finish('unparsed', {
           error: `输出解析不出内容（${size}）${tail ? `：${tail}` : '（stdout 是空的）'}`,
           exitCode: code,
           tokens: parsed.tokens,
           model: parsed.model,
+          raw: utf8Tail(stdout || stderr),
         });
         return;
       }
@@ -207,4 +233,4 @@ function runOnce(arg) {
   });
 }
 
-module.exports = { runOnce, killTree, MAX_OUTPUT_BYTES };
+module.exports = { runOnce, killTree, MAX_OUTPUT_BYTES, RAW_TAIL_BYTES };

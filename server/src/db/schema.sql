@@ -319,10 +319,11 @@ CREATE TABLE IF NOT EXISTS councils (
   round_current INTEGER NOT NULL DEFAULT 0,-- Highest round reached; 0 = only the plan has run
   -- completed  — adjudication and final draft were both produced
   -- partial    — the flow stopped after at least one round, but some final-phase turn failed
+  -- needs_clarification — the moderator stopped before review to ask for a precise topic/path/material
   -- cancelled  — the user cancelled
   -- failed     — nothing usable was produced
   verdict       TEXT
-                CHECK (verdict IS NULL OR verdict IN ('completed','partial','cancelled','failed')),
+                CHECK (verdict IS NULL OR verdict IN ('completed','partial','needs_clarification','cancelled','failed')),
   error         TEXT,                      -- Meeting-level failure reason (per-turn failures live in utterances)
   created_at    INTEGER NOT NULL,
   started_at    INTEGER,
@@ -340,7 +341,7 @@ CREATE TABLE IF NOT EXISTS council_participants (
   agent      TEXT NOT NULL,                -- codebuddy / claude / kilo / opencode
   cli_path   TEXT,                         -- cliInstallPath; NULL = not detected at the time
   status     TEXT NOT NULL DEFAULT 'pending'
-             CHECK (status IN ('pending','running','ok','failed')),
+             CHECK (status IN ('pending','running','ok','failed','unparsed','needs_clarification','skipped','cancelled')),
   error      TEXT,
   PRIMARY KEY (council_id, floor_id)
 );

@@ -268,8 +268,8 @@ head('Markdown: the human-readable evidence');
   ok('title carries the topic', md.startsWith('# 议事厅报告：重构议事厅'));
   ok('score and formula are visible', md.includes('收敛度：**65 / 100**') && md.includes('100 - ('));
   ok('severity summary', md.includes('blocker 1、major 0、minor 0、nit 0'));
-  ok('token cell is exact when known', md.includes('| 4F | moderator | claude | m1 | 10 （输入 7 / 输出 3） |'));
-  ok('a role with no usage prints —, not 0', md.includes('| 1F | main | codebuddy | — | — |'));
+  ok('token cell is exact when known', md.includes('| 4F | moderator | claude | — | m1 | 10 （输入 7 / 输出 3） |'));
+  ok('a role with no usage prints —, not 0', md.includes('| 1F | main | codebuddy | — | — | — |'));
   ok('warnings section', md.includes('## 一致性提示') && md.includes('有 1 条模糊指令'));
   ok('round, proposal, diff placeholder, review, moderator summary are present',
     md.includes('## 第 1 轮（v1）') && md.includes('方案正文') && md.includes('缺鉴权') && md.includes('## 主持人汇总'));
@@ -283,6 +283,37 @@ head('Markdown: the human-readable evidence');
   const md = reportMarkdown(buildReportJson({ council: { id: 'x', topic: 't', max_rounds: 1 } }));
   ok('an empty archive degrades gracefully', md.includes('收敛度：**— / 100**') && md.includes('- 评审意见：0 条'));
   ok('no rounds: no round sections are fabricated', !md.includes('## 第 1 轮'));
+}
+{
+  const report = buildReportJson({
+    council: {
+      id: 'c-clarify',
+      topic: '检查一个还没给出路径的项目',
+      status: 'done',
+      verdict: 'needs_clarification',
+      max_rounds: 2,
+    },
+    participants: [
+      { floor_id: '4F', role: 'moderator', agent: 'claude', status: 'needs_clarification' },
+      { floor_id: '1F', role: 'main', agent: 'codebuddy', status: 'skipped' },
+      { floor_id: '7F', role: 'reviewer', agent: 'kilo', status: 'skipped' },
+    ],
+    utterances: [],
+    rounds: [],
+    plan: {
+      parsed: true,
+      breakdown: [],
+      assignments: [],
+      reviewFocus: [],
+      needsClarification: ['请给出需要评审的项目绝对路径'],
+    },
+  });
+  const md = reportMarkdown(report);
+  ok('a clarification meeting is archived with its questions',
+    md.includes('## 需要补充信息') && md.includes('- 请给出需要评审的项目绝对路径'));
+  ok('roles that never ran are marked skipped in the report',
+    md.includes('| 1F | main | codebuddy | skipped |') &&
+      md.includes('| 7F | reviewer | kilo | skipped |'));
 }
 
 /* ------------------------------------------------------------ writing */

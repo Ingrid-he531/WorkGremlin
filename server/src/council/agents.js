@@ -433,6 +433,64 @@ function pickFromTranscript(list) {
 }
 
 /**
+ * Parse the complete object prefix of a truncated transcript array.
+ *
+ * CodeBuddy occasionally exits 0 with a transcript such as `[{...},{...},{...` and no closing
+ * bracket. The complete entries are still valid evidence, so parse those individually and ignore the
+ * unfinished tail. A malformed complete entry stops the scan; later text is not trusted.
+ *
+ * @param {string} text
+ * @returns {Array<object>|null}
+ */
+function parseTranscriptPrefix(text) {
+  const s = String(text == null ? '' : text).trim();
+  if (!s.startsWith('[')) return null;
+
+  const out = [];
+  let i = 1;
+  while (i < s.length) {
+    while (i < s.length && /[\s,]/.test(s[i])) i += 1;
+    if (i >= s.length || s[i] === ']') break;
+    if (s[i] !== '{') return out.length ? out : null;
+
+    const start = i;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let closed = false;
+    for (; i < s.length; i += 1) {
+      const ch = s[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          i += 1;
+          closed = true;
+          break;
+        }
+      }
+    }
+    if (!closed) break; // The trailing event was cut off; it is not usable evidence.
+
+    try {
+      const event = JSON.parse(s.slice(start, i));
+      if (event && typeof event === 'object' && !Array.isArray(event)) out.push(event);
+      else break;
+    } catch {
+      break;
+    }
+  }
+  return out.length ? out : null;
+}
+
+/**
  * Parse the stdout of one invocation.
  *
  * Both shapes have to be consumed:
@@ -446,12 +504,15 @@ function pickFromTranscript(list) {
  * it), never pretending that content was read.
  *
  * @param {string} stdout
- * @returns {{ok:boolean, text:string, tokens:object|null, model:string|null, events:number}}
+ * @returns {{ok:boolean, text:string, tokens:object|null, model:string|null, events:number,
+ *            truncated:boolean}}
  */
 function parseOutput(stdout) {
   const raw = String(stdout == null ? '' : stdout);
   const trimmed = raw.trim();
-  if (!trimmed) return { ok: false, text: '', tokens: null, model: null, events: 0 };
+  if (!trimmed) {
+    return { ok: false, text: '', tokens: null, model: null, events: 0, truncated: false };
+  }
 
   // First as one block of JSON
   try {
@@ -460,13 +521,56 @@ function parseOutput(stdout) {
       // A whole array = a full transcript; take only the part it said (see pickFromTranscript)
       const got = pickFromTranscript(one);
       const model = modelOf(one);
-      if (got) return { ok: true, text: got.text, tokens: got.tokens, model, events: one.length };
-      return { ok: false, text: '', tokens: null, model, events: one.length };
+      if (got) {
+        return {
+          ok: true,
+          text: got.text,
+          tokens: got.tokens,
+          model,
+          events: one.length,
+          truncated: false,
+        };
+      }
+      return { ok: false, text: '', tokens: null, model, events: one.length, truncated: false };
     }
     const text = textOf(one);
-    if (text) return { ok: true, text, tokens: tokensOf(one), model: modelOf(one), events: 1 };
+    if (text) {
+      return {
+        ok: true,
+        text,
+        tokens: tokensOf(one),
+        model: modelOf(one),
+        events: 1,
+        truncated: false,
+      };
+    }
   } catch {
     /* not a single JSON, fall through to JSONL */
+  }
+
+  // A transcript cut off before its closing `]` is still usable up to the last complete event.
+  const prefix = parseTranscriptPrefix(trimmed);
+  if (prefix) {
+    const got = pickFromTranscript(prefix);
+    const model = modelOf(prefix);
+    if (got) {
+      return {
+        ok: true,
+        text: got.text,
+        tokens: got.tokens,
+        model,
+        events: prefix.length,
+        truncated: true,
+      };
+    }
+    return {
+      ok: false,
+      text: '',
+      tokens: null,
+      model,
+      events: prefix.length,
+      truncated: true,
+    };
   }
 
   // Then as JSONL: parse line by line, concatenate body pieces in order of appearance, take usage from
@@ -495,10 +599,12 @@ function parseOutput(stdout) {
     const m = modelOf(obj);
     if (m) model = m;
   }
-  if (events > 0 && parts.length) return { ok: true, text: parts.join('\n'), tokens, model, events };
+  if (events > 0 && parts.length) {
+    return { ok: true, text: parts.join('\n'), tokens, model, events, truncated: false };
+  }
   // Events present but not a single line of body read —— that also counts as "cannot parse" (maybe all
   // status events, or the field names changed again)
-  return { ok: false, text: '', tokens: tokens || null, model, events };
+  return { ok: false, text: '', tokens: tokens || null, model, events, truncated: false };
 }
 
 module.exports = {

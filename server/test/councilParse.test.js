@@ -111,6 +111,20 @@ head('round 0: moderator plan');
   const loose = parsePlanBlock('{"assignments":[null,"x",{"reviewer":"  "},{"reviewer":"9F","focus":" "}]}');
   ok('malformed assignment rows are skipped, not invented', loose.assignments.length === 1 && loose.assignments[0].reviewer === '9F' && loose.assignments[0].focus === null);
 }
+{
+  for (const key of ['needsClarification', 'clarifications', 'questions']) {
+    const p = parsePlanBlock(`需要先确认。\n{"${key}":["请给出项目绝对路径","目标平台是什么？"]}`);
+    eq(`${key} accepts a clarification request`, p.needsClarification, [
+      '请给出项目绝对路径',
+      '目标平台是什么？',
+    ]);
+    ok(`${key} still counts as a parsed plan`, p.parsed === true);
+  }
+  const malformed = parsePlanBlock('{"needsClarification":"please provide a path"}');
+  ok('a non-array clarification value is ignored instead of throwing', malformed.parsed === true && malformed.needsClarification.length === 0);
+  const empty = parsePlanBlock('{"needsClarification":[null,"  ",42,{"question":"x"}]}');
+  eq('empty or malformed clarification entries are dropped', empty.needsClarification, []);
+}
 
 /* ------------------------------------------------------------ proposal */
 head('proposal');

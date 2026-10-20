@@ -59,22 +59,34 @@ function renderMaterials(materials) {
  * @param {string} floorName
  * @param {'moderator'|'main'|'reviewer'} role
  * @param {string} [workspace]
+ * @param {boolean} [workspaceProvided]
  */
-function roleBlock(floorId, floorName, role, workspace) {
+function roleBlock(floorId, floorName, role, workspace, workspaceProvided) {
   const roleZh = ROLE_ZH[role] || '参与者';
+  const hasWorkspace = workspaceProvided !== false && Boolean(String(workspace || '').trim());
+  const workspaceLines = hasWorkspace
+    ? [
+        `你正在 \`${workspace}\` 这个用户提供的项目目录里，可以用**只读**工具自己去翻代码（读文件、按名字或内容搜索）。`,
+        '你看到的就是这个项目真实的当前代码 —— 拿不准的事就去读；读了仍然不确定，就直说不确定，不要凭印象编造。',
+      ]
+    : [
+        '本次没有提供用户工程目录，你是在一个临时隔离目录中运行；这个临时目录不是用户项目，里面的内容不能作为项目证据。',
+        '纯文字议题可以直接作答。只有议题必须检查代码、而现有材料又不足以回答时，才需要要求用户补充项目绝对路径。',
+      ];
   return [
     `你是 ${DEFAULTS.COUNCIL_PROMPT_MARKER}里【${floorId} ${floorName}】这一层的代表，角色是${roleZh}，正在参加一场有主持、有主答、有评审的多轮评审。`,
     '',
-    `你正在 \`${workspace}\` 这个工程目录里，可以用**只读**工具自己去翻代码（读文件、按名字或内容搜索）。`,
+    ...workspaceLines,
     '除此之外你什么都做不了：**不能修改任何文件、不能执行命令、不能上网、看不到对方的机器**。',
-    '你看到的就是这个工程真实的当前代码 —— 拿不准的事就去读；读了仍然不确定，就直说不确定，不要凭印象编造。',
   ].join('\n');
 }
 
 /** Shared context: topic, working directory, materials. */
 function contextBlock(arg) {
   const parts = ['【议题】', String(arg.topic || '').trim()];
-  if (arg.workspace) parts.push('', '【工作目录】', String(arg.workspace));
+  if (arg.workspaceProvided !== false && arg.workspace) {
+    parts.push('', '【用户提供的项目目录】', String(arg.workspace));
+  }
   const mats = renderMaterials(arg.materials);
   if (mats) parts.push('', '【背景材料】', mats);
   return parts.join('\n');
@@ -172,7 +184,15 @@ function renderPreviousRounds(rounds) {
 
 const PLAN_PROTOCOL = [
   '【本轮怎么回】',
-  '1. 先把议题拆成 3~6 个可独立回答的子问题，并给每位评评审分配审查重点。',
+  '0. 如果现有信息不足以拆解议题（例如必须检查代码但未提供项目路径、关键材料缺失、目标有歧义），不要猜路径，也不要假装能开始评审。只返回下面这个 JSON 代码块：',
+  '',
+  '```json',
+  '{"needsClarification":["具体、可以直接回答的补充信息问题"]}',
+  '```',
+  '',
+  '问题必须具体到用户能直接回答，例如“请给出需要评审的项目绝对路径”或“请说明要兼容的 Node.js 最低版本”；不要写“请提供更多信息”这种空泛问题。纯文字议题不需要项目目录，不要仅因为未提供目录而索要路径。',
+  '',
+  '1. 先把议题拆成 3~6 个可独立回答的子问题，并给每位评审分配审查重点。',
   '2. 然后在**最后**附一个 JSON 代码块，格式必须是这样：',
   '',
   '```json',
@@ -264,12 +284,13 @@ const FINAL_PROTOCOL = [
 
 /**
  * Round 0 — moderator decomposes the topic and assigns review focus.
- * @param {{topic:string, materials:Array, workspace?:string|null, floorId:string, floorName:string,
+ * @param {{topic:string, materials:Array, workspace?:string|null, workspaceProvided?:boolean,
+ *          floorId:string, floorName:string,
  *          reviewers:Array<{floorId:string, floorName?:string}>}} arg
  */
 function buildPlanPrompt(arg) {
   return [
-    roleBlock(arg.floorId, arg.floorName, 'moderator', arg.workspace),
+    roleBlock(arg.floorId, arg.floorName, 'moderator', arg.workspace, arg.workspaceProvided),
     '',
     contextBlock(arg),
     '',
@@ -285,14 +306,15 @@ function buildPlanPrompt(arg) {
 
 /**
  * Proposal turn for the main answerer.
- * @param {{topic:string, materials:Array, workspace?:string|null, floorId:string, floorName:string,
+ * @param {{topic:string, materials:Array, workspace?:string|null, workspaceProvided?:boolean,
+ *          floorId:string, floorName:string,
  *          roundNo:number, maxRounds:number, plan:object|null, previousRounds:Array,
  *          directives:string[], priorProposal?:{version:string, diffFromPrev?:string}|null}} arg
  */
 function buildProposalPrompt(arg) {
   const first = arg.roundNo === 1;
   const parts = [
-    roleBlock(arg.floorId, arg.floorName, 'main', arg.workspace),
+    roleBlock(arg.floorId, arg.floorName, 'main', arg.workspace, arg.workspaceProvided),
     '',
     contextBlock(arg),
     '',
@@ -328,14 +350,15 @@ function buildProposalPrompt(arg) {
 
 /**
  * Review turn for one reviewer.
- * @param {{topic:string, materials:Array, workspace?:string|null, floorId:string, floorName:string,
+ * @param {{topic:string, materials:Array, workspace?:string|null, workspaceProvided?:boolean,
+ *          floorId:string, floorName:string,
  *          roundNo:number, maxRounds:number, plan:object|null,
  *          proposal:{version:string, content:string, diffFromPrev?:string},
  *          previousDirectives:string[], previousProposal?:object|null}} arg
  */
 function buildReviewPrompt(arg) {
   const parts = [
-    roleBlock(arg.floorId, arg.floorName, 'reviewer', arg.workspace),
+    roleBlock(arg.floorId, arg.floorName, 'reviewer', arg.workspace, arg.workspaceProvided),
     '',
     contextBlock(arg),
     '',
@@ -380,14 +403,15 @@ function buildReviewPrompt(arg) {
 
 /**
  * Convergence turn for the moderator.
- * @param {{topic:string, materials:Array, workspace?:string|null, floorId:string, floorName:string,
+ * @param {{topic:string, materials:Array, workspace?:string|null, workspaceProvided?:boolean,
+ *          floorId:string, floorName:string,
  *          roundNo:number, maxRounds:number, plan:object|null,
  *          proposal:{version:string, content:string, diffFromPrev?:string},
  *          reviews:Array, previousDirectives:string[]}} arg
  */
 function buildModerationPrompt(arg) {
   return [
-    roleBlock(arg.floorId, arg.floorName, 'moderator', arg.workspace),
+    roleBlock(arg.floorId, arg.floorName, 'moderator', arg.workspace, arg.workspaceProvided),
     '',
     contextBlock(arg),
     '',
@@ -413,13 +437,14 @@ function buildModerationPrompt(arg) {
 
 /**
  * Final adjudication by the moderator.
- * @param {{topic:string, materials:Array, workspace?:string|null, floorId:string, floorName:string,
+ * @param {{topic:string, materials:Array, workspace?:string|null, workspaceProvided?:boolean,
+ *          floorId:string, floorName:string,
  *          maxRounds:number, rounds:Array, proposal:{version:string, content:string},
  *          reviews:Array, lastModeration:object|null}} arg
  */
 function buildAdjudicationPrompt(arg) {
   return [
-    roleBlock(arg.floorId, arg.floorName, 'moderator', arg.workspace),
+    roleBlock(arg.floorId, arg.floorName, 'moderator', arg.workspace, arg.workspaceProvided),
     '',
     contextBlock(arg),
     '',
@@ -448,14 +473,15 @@ function buildAdjudicationPrompt(arg) {
 
 /**
  * Final draft by the main answerer.
- * @param {{topic:string, materials:Array, workspace?:string|null, floorId:string, floorName:string,
+ * @param {{topic:string, materials:Array, workspace?:string|null, workspaceProvided?:boolean,
+ *          floorId:string, floorName:string,
  *          proposal:{version:string, content:string}, adjudication:object|null,
  *          lastReviews:Array, rounds:Array}} arg
  */
 function buildFinalDraftPrompt(arg) {
   const adj = arg.adjudication || {};
   return [
-    roleBlock(arg.floorId, arg.floorName, 'main', arg.workspace),
+    roleBlock(arg.floorId, arg.floorName, 'main', arg.workspace, arg.workspaceProvided),
     '',
     contextBlock(arg),
     '',

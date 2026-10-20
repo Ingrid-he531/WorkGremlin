@@ -402,6 +402,55 @@ const reportOf = (id) => {
     ok('no participant is left "running"',
       repo.listParticipants(id).every((p) => p.status !== 'running' && p.status !== 'pending'));
   }
+  head('a moderator asking for a missing path ends normally as needs_clarification');
+  {
+    const h = makeHarness();
+    h.set('4F:plan', () =>
+      OK(`需要路径。\n${jsonBlock({ needsClarification: ['请给出需要评审的项目绝对路径'] })}`)
+    );
+    const id = newCouncil('cNeedsInfo', { maxRounds: 2 });
+    const orch = mkOrchestrator(h);
+    const row = await orch.start(id);
+
+    ok('verdict=needs_clarification and status=done',
+      row.verdict === 'needs_clarification' && row.status === 'done', `${row.verdict}/${row.status}`);
+    ok('the meeting-level error carries the exact question',
+      String(row.error).includes('请给出需要评审的项目绝对路径'), String(row.error));
+    ok('only the plan was attempted',
+      h.countOf('4F', 'plan') === 1 && h.callsOf('proposal').length === 0 &&
+        h.callsOf('review').length === 0 && h.callsOf('moderation').length === 0,
+      h.seen.map((x) => `${x.floor}:${x.phase}`).join(','));
+    ok('the moderator is needs_clarification; roles that never ran are skipped',
+      repo.listParticipants(id).map((p) => `${p.floor_id}:${p.status}`).join(',') ===
+        '4F:needs_clarification,1F:skipped,7F:skipped',
+      repo.listParticipants(id).map((p) => `${p.floor_id}:${p.status}`).join(','));
+
+    const planUtterance = repo.listUtterances(id).find((u) => u.floor_id === '4F' && u.phase === 'plan');
+    ok('the clarification reply is recorded as a normal moderator turn',
+      planUtterance && planUtterance.status === 'ok' && planUtterance.content.includes('需要路径'));
+
+    const report = reportOf(id);
+    ok('the report keeps the clarification verdict and question',
+      report && report.council.verdict === 'needs_clarification' &&
+        report.plan.needsClarification[0] === '请给出需要评审的项目绝对路径',
+      report && JSON.stringify(report.plan));
+    ok('the report says the review never started',
+      report.roles.length === 3 &&
+        report.roles.find((r) => r.floor === '4F').status === 'needs_clarification' &&
+        report.roles.filter((r) => r.status === 'skipped').length === 2);
+    ok('report files are still archived',
+      JSON.parse(repo.getReport(id).files_json).every((f) => fs.existsSync(f)));
+
+    const planPrompt = h.callsOf('plan')[0].prompt;
+    ok('the prompt says the temporary directory is not project evidence',
+      planPrompt.includes('临时目录不是用户项目') && planPrompt.includes('不能作为项目证据'));
+    ok('the temporary cwd is not presented as a user-provided project directory',
+      planPrompt.includes('【用户提供的项目目录】') === false &&
+        planPrompt.includes(h.callsOf('plan')[0].cwd) === false,
+      planPrompt.slice(0, 700));
+    ok('the temporary directory is removed after the early normal ending',
+      !fs.existsSync(h.callsOf('plan')[0].cwd));
+  }
   head('a reviewer that crashes stops the meeting, not replaced by a guessed opinion');
   {
     const h = makeHarness();

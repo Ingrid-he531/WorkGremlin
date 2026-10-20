@@ -215,6 +215,17 @@ head('wrap-up: completed / partial are normal, cancelled / failed are not');
   const c = repo.finishCouncil('c6', { verdict: 'failed', error: 'boom', endedAt: AT + 1 });
   ok('failed -> status=failed and keeps the reason', c.status === 'failed' && c.error === 'boom');
 }
+{
+  mk('cClarify');
+  repo.markCouncilRunning('cClarify', AT);
+  const c = repo.finishCouncil('cClarify', {
+    verdict: 'needs_clarification',
+    error: '请给出项目路径',
+    endedAt: AT + 1,
+  });
+  ok('needs_clarification is a normal ending (done)',
+    c.status === 'done' && c.verdict === 'needs_clarification');
+}
 
 /* ------------------------------------------------------------ startup sweep */
 head('startup sweep: a hard-killed run is marked failed honestly');
@@ -265,6 +276,113 @@ head('isolation: one council deletes cleanly, no orphan rows');
 }
 
 close();
+
+/* ------------------------------------------------------------ status check migration */
+head('status checks: an existing council database is rebuilt without losing evidence');
+{
+  const statusPath = path.join(TMP, 'status-check.db');
+  const old = new Database(statusPath);
+  old.exec(`
+    CREATE TABLE councils (
+      id             TEXT PRIMARY KEY,
+      topic          TEXT NOT NULL,
+      workspace_path TEXT,
+      status         TEXT NOT NULL DEFAULT 'draft'
+                     CHECK (status IN ('draft','running','done','failed','cancelled')),
+      max_rounds     INTEGER NOT NULL,
+      round_current  INTEGER NOT NULL DEFAULT 0,
+      verdict        TEXT
+                     CHECK (verdict IS NULL OR verdict IN ('completed','partial','cancelled','failed')),
+      error          TEXT,
+      created_at     INTEGER NOT NULL,
+      started_at     INTEGER,
+      ended_at       INTEGER
+    );
+    CREATE TABLE council_participants (
+      council_id TEXT NOT NULL,
+      floor_id   TEXT NOT NULL,
+      role       TEXT NOT NULL CHECK (role IN ('moderator','main','reviewer')),
+      agent      TEXT NOT NULL,
+      cli_path   TEXT,
+      status     TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','running','ok','failed')),
+      error      TEXT,
+      PRIMARY KEY (council_id, floor_id)
+    );
+    CREATE TABLE council_utterances (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      council_id    TEXT NOT NULL,
+      round_no      INTEGER NOT NULL,
+      floor_id      TEXT NOT NULL,
+      phase         TEXT NOT NULL
+                    CHECK (phase IN ('brief','plan','proposal','review','moderation','adjudication','final')),
+      content       TEXT,
+      model         TEXT,
+      status        TEXT NOT NULL DEFAULT 'ok'
+                    CHECK (status IN ('ok','failed','timeout','unparsed')),
+      error         TEXT,
+      input_tokens       INTEGER,
+      output_tokens      INTEGER,
+      cache_read_tokens  INTEGER,
+      cache_write_tokens INTEGER,
+      parse_dropped INTEGER NOT NULL DEFAULT 0,
+      started_at    INTEGER,
+      ended_at      INTEGER,
+      duration_ms   INTEGER
+    );
+    CREATE INDEX idx_council_utt ON council_utterances(council_id, round_no, floor_id);
+    CREATE INDEX idx_council_utt_floor ON council_utterances(council_id, floor_id);
+  `);
+  old.prepare(`
+    INSERT INTO councils
+      (id, topic, workspace_path, status, max_rounds, round_current, verdict, error, created_at, started_at, ended_at)
+    VALUES
+      ('c_keep', 'history that must survive', '/tmp/project', 'done', 2, 1, 'partial', 'final turn missing', ?, ?, ?)
+  `).run(AT, AT + 1, AT + 2);
+  old.prepare(`
+    INSERT INTO council_participants (council_id, floor_id, role, agent, cli_path, status, error)
+    VALUES ('c_keep', '4F', 'moderator', 'claude', '/usr/bin/claude', 'ok', NULL)
+  `).run();
+  old.prepare(`
+    INSERT INTO council_utterances
+      (council_id, round_no, floor_id, phase, content, status, started_at, ended_at)
+    VALUES ('c_keep', 0, '4F', 'plan', 'old plan text', 'ok', ?, ?)
+  `).run(AT + 10, AT + 20);
+  old.close();
+
+  const up = openDatabase(statusPath);
+  const r2 = up.repo;
+  const kept = r2.getCouncil('c_keep');
+  ok('the council row survives the CHECK rebuild',
+    kept && kept.topic === 'history that must survive' && kept.verdict === 'partial');
+  ok('participant and utterance evidence survive',
+    r2.listParticipants('c_keep')[0].status === 'ok' &&
+      r2.listUtterances('c_keep')[0].content === 'old plan text');
+
+  r2.setParticipantStatus('c_keep', '4F', 'needs_clarification', 'ask for a path');
+  r2.insertParticipant({
+    councilId: 'c_keep',
+    floorId: '1F',
+    role: 'main',
+    agent: 'codebuddy',
+    cliPath: null,
+  });
+  r2.setParticipantStatus('c_keep', '1F', 'skipped', 'never reached');
+  ok('new participant states are accepted after the rebuild',
+    r2.listParticipants('c_keep').map((p) => p.status).join(',') === 'needs_clarification,skipped');
+
+  r2.insertUtterance({
+    councilId: 'c_keep',
+    roundNo: 0,
+    floorId: '4F',
+    phase: 'plan',
+    content: 'new evidence',
+    status: 'unparsed',
+  });
+  ok('the utterance sequence was preserved and AUTOINCREMENT continues',
+    r2.listUtterances('c_keep').length === 2 && r2.listUtterances('c_keep')[1].id > 1);
+  up.close();
+}
 
 /* ------------------------------------------------------------ legacy reset */
 // The council feature changed shape before any real data existed. An old DB must be reset wholesale:

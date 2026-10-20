@@ -234,6 +234,46 @@ head('parse: full transcript array (1F CodeBuddy)');
   ok('a transcript with only the question cannot be parsed',
     parseOutput(JSON.stringify([t[0]])).ok === false);
 }
+{
+  const complete = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'question' }] },
+    {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'intermediate draft' }],
+    },
+    {
+      type: 'result',
+      result: 'recovered final answer\n\n{"reviews":[]}',
+      model: 'codebuddy-model',
+      usage: { input_tokens: 101, output_tokens: 23 },
+    },
+  ];
+  const cut = `${JSON.stringify(complete, null, 2).slice(0, -2)},\n  {"type":"progress","message":"still writing`;
+  const r = parseOutput(cut);
+  ok('a truncated transcript recovers the last complete result event',
+    r.ok === true && r.text.startsWith('recovered final answer'), JSON.stringify(r.text).slice(0, 80));
+  ok('recovered result keeps usage and model', r.tokens.input === 101 && r.tokens.output === 23 && r.model === 'codebuddy-model');
+  ok('only complete prefix events are counted', r.events === 3, String(r.events));
+  ok('the truncated prefix is labelled', r.truncated === true);
+}
+{
+  const complete = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'question' }] },
+    {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'answer from assistant\n\n{"reviews":[]}' }],
+      usage: { input_tokens: 7, output_tokens: 5 },
+    },
+  ];
+  const cut = `${JSON.stringify(complete, null, 2).slice(0, -2)},\n  {"type":"result","result":"cut off`;
+  const r = parseOutput(cut);
+  ok('without a result event, a truncated transcript falls back to the last complete assistant message',
+    r.ok === true && r.text.startsWith('answer from assistant'));
+  ok('assistant fallback tokens survive truncation', r.tokens.input === 7 && r.tokens.output === 5);
+  ok('the fallback is marked truncated with two complete events', r.truncated === true && r.events === 2);
+}
 
 /* ------------------------------------------------------------ JSONL */
 head('parse: JSONL event streams');

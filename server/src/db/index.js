@@ -63,6 +63,162 @@ function ensureColumn(db, table, column, ddl) {
   return true;
 }
 
+const COUNCIL_STATUS_TABLES = {
+  councils: {
+    marker: "'needs_clarification'",
+    columns: [
+      'id',
+      'topic',
+      'workspace_path',
+      'status',
+      'max_rounds',
+      'round_current',
+      'verdict',
+      'error',
+      'created_at',
+      'started_at',
+      'ended_at',
+    ],
+    create: `
+      CREATE TABLE councils (
+        id            TEXT PRIMARY KEY,
+        topic         TEXT NOT NULL,
+        workspace_path TEXT,
+        status        TEXT NOT NULL DEFAULT 'draft'
+                      CHECK (status IN ('draft','running','done','failed','cancelled')),
+        max_rounds    INTEGER NOT NULL,
+        round_current INTEGER NOT NULL DEFAULT 0,
+        verdict       TEXT
+                      CHECK (verdict IS NULL OR verdict IN ('completed','partial','needs_clarification','cancelled','failed')),
+        error         TEXT,
+        created_at    INTEGER NOT NULL,
+        started_at    INTEGER,
+        ended_at      INTEGER
+      )
+    `,
+    indexes: ['CREATE INDEX IF NOT EXISTS idx_councils_created ON councils(created_at DESC)'],
+  },
+  council_participants: {
+    marker: "'needs_clarification'",
+    columns: ['council_id', 'floor_id', 'role', 'agent', 'cli_path', 'status', 'error'],
+    create: `
+      CREATE TABLE council_participants (
+        council_id TEXT NOT NULL,
+        floor_id   TEXT NOT NULL,
+        role       TEXT NOT NULL CHECK (role IN ('moderator','main','reviewer')),
+        agent      TEXT NOT NULL,
+        cli_path   TEXT,
+        status     TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending','running','ok','failed','unparsed','needs_clarification','skipped','cancelled')),
+        error      TEXT,
+        PRIMARY KEY (council_id, floor_id)
+      )
+    `,
+    indexes: [],
+  },
+  council_utterances: {
+    marker: "'unparsed'",
+    columns: [
+      'id',
+      'council_id',
+      'round_no',
+      'floor_id',
+      'phase',
+      'content',
+      'model',
+      'status',
+      'error',
+      'input_tokens',
+      'output_tokens',
+      'cache_read_tokens',
+      'cache_write_tokens',
+      'parse_dropped',
+      'started_at',
+      'ended_at',
+      'duration_ms',
+    ],
+    create: `
+      CREATE TABLE council_utterances (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        council_id    TEXT NOT NULL,
+        round_no      INTEGER NOT NULL,
+        floor_id      TEXT NOT NULL,
+        phase         TEXT NOT NULL
+                      CHECK (phase IN ('brief','plan','proposal','review','moderation','adjudication','final')),
+        content       TEXT,
+        model         TEXT,
+        status        TEXT NOT NULL DEFAULT 'ok'
+                      CHECK (status IN ('ok','failed','timeout','unparsed')),
+        error         TEXT,
+        input_tokens       INTEGER,
+        output_tokens      INTEGER,
+        cache_read_tokens  INTEGER,
+        cache_write_tokens INTEGER,
+        parse_dropped INTEGER NOT NULL DEFAULT 0,
+        started_at    INTEGER,
+        ended_at      INTEGER,
+        duration_ms   INTEGER
+      )
+    `,
+    indexes: [
+      'CREATE INDEX IF NOT EXISTS idx_council_utt ON council_utterances(council_id, round_no, floor_id)',
+      'CREATE INDEX IF NOT EXISTS idx_council_utt_floor ON council_utterances(council_id, floor_id)',
+    ],
+  },
+};
+
+/**
+ * SQLite cannot alter a CHECK constraint in place. Older council databases reject the new
+ * participant and verdict states even though schema.sql declares them, so rebuild only the tables
+ * whose status check lacks the new marker. Rows and AUTOINCREMENT sequences are preserved.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @returns {boolean} true when at least one table was rebuilt
+ */
+function migrateCouncilStatusChecks(db) {
+  const pending = [];
+  for (const [table, spec] of Object.entries(COUNCIL_STATUS_TABLES)) {
+    if (!tableExists(db, table)) continue;
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+    if (row && !String(row.sql || '').includes(spec.marker)) pending.push([table, spec]);
+  }
+  if (!pending.length) return false;
+
+  const run = db.transaction(() => {
+    for (const [table, spec] of pending) {
+      const old = `${table}__status_old`;
+      const sequence = tableExists(db, 'sqlite_sequence')
+        ? db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?').get(table)
+        : null;
+      db.exec(`DROP TABLE IF EXISTS ${old}`);
+      db.exec(`ALTER TABLE ${table} RENAME TO ${old}`);
+      db.exec(spec.create);
+      const cols = spec.columns.join(', ');
+      db.exec(`INSERT INTO ${table} (${cols}) SELECT ${cols} FROM ${old}`);
+      db.exec(`DROP TABLE ${old}`);
+      for (const sql of spec.indexes) db.exec(sql);
+
+      if (sequence && Number.isFinite(Number(sequence.seq))) {
+        const seq = Number(sequence.seq);
+        const current = db
+          .prepare('SELECT seq FROM sqlite_sequence WHERE name = ?')
+          .get(table);
+        if (current) {
+          db.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?').run(
+            seq,
+            table,
+            seq
+          );
+        } else {
+          db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(table, seq);
+        }
+      }
+    }
+  });
+  run();
+  return true;
+}
+
 /** @param {import('better-sqlite3').Database} db */
 function migrate(db) {
   ensureColumn(db, 'members', 'ephemeral', 'ephemeral INTEGER NOT NULL DEFAULT 0');
@@ -368,6 +524,7 @@ function openDatabase(dbPath) {
 
   applyPragmas(db);
   db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+  migrateCouncilStatusChecks(db);
   migrate(db);
   const restored = restoreLegacyRows(db, legacy);
   if (restored) log.warn(`[workgremlin] 老库迁移完成，回填 ${restored} 行历史数据`);
@@ -1244,15 +1401,16 @@ function createRepo(db) {
   const markCouncilRunning = (id, at) => councilStmt.markRunning.run(at, id).changes > 0;
   const setCouncilRound = (id, roundNo) => councilStmt.setRound.run({ id, roundNo });
   /**
-   * @param {{verdict:'completed'|'partial'|'cancelled'|'failed', error?:string|null, status?:string, endedAt?:number}} arg
-   *   completed / partial are normal endings (the meeting ran, maybe with a failed final turn); only
-   *   cancelled and failed are abnormal.
+   * @param {{verdict:'completed'|'partial'|'needs_clarification'|'cancelled'|'failed',
+   *          error?:string|null, status?:string, endedAt?:number}} arg
+   *   completed / partial / needs_clarification are normal endings; only cancelled and failed are
+   *   abnormal.
    */
   function finishCouncil(id, arg) {
     const verdict = arg.verdict;
     const status =
       arg.status ||
-      (verdict === 'completed' || verdict === 'partial'
+      (verdict === 'completed' || verdict === 'partial' || verdict === 'needs_clarification'
         ? 'done'
         : verdict === 'cancelled'
           ? 'cancelled'

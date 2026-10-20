@@ -126,13 +126,13 @@ function alive(pid) {
     ok('stderr 原文带回来了（用户要知道它为什么没答上来）', String(r.error).includes('认证失败：token 过期'), String(r.error));
     ok('text 是空的，不编内容', r.text === '');
   }
-  head('输出读不出：记失败，不假装它答了');
+  head('输出读不出：记 unparsed，不假装它答了');
   {
     const bin = stub('garbage.sh', 'echo "这不是 JSON，是一段日志"');
     const r = await runOnce({ bin, args: [], cwd: TMP, timeoutMs: 10_000, agent: 'x' });
-    ok('status=failed', r.status === 'failed', r.status);
+    ok('status=unparsed (the process exited 0 but produced no answer)', r.status === 'unparsed', r.status);
     ok('错误里点明是解析不出', /解析不出/.test(String(r.error)), String(r.error));
-    ok('原文尾巴留着便于排障', String(r.error).includes('这不是 JSON'), String(r.error));
+    ok('raw keeps the original output for troubleshooting', r.raw.includes('这不是 JSON'), String(r.raw));
   }
   head('起不来：记失败，不抛异常');
   {

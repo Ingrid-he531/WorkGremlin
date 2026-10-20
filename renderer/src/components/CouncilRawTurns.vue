@@ -20,6 +20,9 @@ const floorName = (id) => {
   const f = store.floors.find((x) => x.floorId === id);
   return f ? f.name : '';
 };
+
+const ERROR_STATUSES = new Set(['failed', 'timeout', 'unparsed']);
+const isErrorStatus = (status) => ERROR_STATUSES.has(status);
 </script>
 
 <template>
@@ -30,7 +33,9 @@ const floorName = (id) => {
         <span class="fid">{{ u.floorId }}</span>
         <span v-if="floorName(u.floorId)" class="fname">{{ floorName(u.floorId) }}</span>
         <span class="chip">{{ t('council.phase.' + u.phase) }}</span>
-        <span class="chip" :class="{ bad: u.status !== 'ok' }">{{ t('council.pstatus.' + u.status) }}</span>
+        <span class="chip" :class="{ bad: isErrorStatus(u.status) }">
+          {{ t('council.pstatus.' + u.status) }}
+        </span>
         <span v-if="u.durationMs" class="dim ms">{{ (u.durationMs / 1000).toFixed(1) }}s</span>
       </header>
       <pre v-if="u.content" class="text">{{ u.content }}</pre>

@@ -109,6 +109,10 @@ const rounds = computed(() => (store.current ? store.current.roundResults : []))
 const plan = computed(() => (store.current ? store.current.plan : null));
 const report = computed(() => (store.current ? store.current.report : null));
 const reportFiles = computed(() => (store.current ? store.current.reportFiles : []));
+const clarifications = computed(() => {
+  if (!plan.value || !Array.isArray(plan.value.needsClarification)) return [];
+  return plan.value.needsClarification.filter(Boolean);
+});
 
 /**
  * Final-phase output. The authoritative copy is inside the persisted report (it survives a refresh);
@@ -131,7 +135,23 @@ const warnings = computed(() => {
   return out;
 });
 
-const verdictKey = (v) => (['completed', 'partial', 'cancelled', 'failed'].includes(v) ? v : 'failed');
+const verdictKey = (v) =>
+  ['completed', 'partial', 'needs_clarification', 'cancelled', 'failed'].includes(v) ? v : 'failed';
+const PARTICIPANT_STATUSES = new Set([
+  'ok',
+  'failed',
+  'unparsed',
+  'timeout',
+  'needs_clarification',
+  'skipped',
+  'cancelled',
+  'pending',
+  'running',
+]);
+const ERROR_STATUSES = new Set(['failed', 'timeout', 'unparsed']);
+const participantStatusLabel = (status) =>
+  PARTICIPANT_STATUSES.has(status) ? t('council.pstatus.' + status) : status;
+const participantStatusIsError = (status) => ERROR_STATUSES.has(status);
 const DECISIONS = ['approve', 'approve_with_changes', 'reject'];
 const decisionKey = (d) => (DECISIONS.includes(d) ? d : null);
 
@@ -509,6 +529,13 @@ function toggleReviewer(id) {
             >{{ severityLabel(s) }} {{ summary ? summary.severityCounts[s] : 0 }}</span>
           </div>
 
+          <div v-if="clarifications.length" class="clarify" data-testid="cv-clarification">
+            <h4 class="wh">{{ t('council.needs_clarification') }}</h4>
+            <ul>
+              <li v-for="(question, i) in clarifications" :key="i">{{ question }}</li>
+            </ul>
+          </div>
+
           <table class="roles" data-testid="cv-roles">
             <thead>
               <tr>
@@ -524,8 +551,13 @@ function toggleReviewer(id) {
                 <td>
                   <span class="fid">{{ r.floorId }}</span>
                   <span class="fname">{{ floorName(r.floorId) }}</span>
-                  <span v-if="r.status === 'failed'" class="bad" :title="r.error || ''">
-                    {{ t('council.pstatus.failed') }}
+                  <span
+                    v-if="r.status && r.status !== 'ok'"
+                    class="pstatus"
+                    :class="{ bad: participantStatusIsError(r.status) }"
+                    :title="r.error || ''"
+                  >
+                    {{ participantStatusLabel(r.status) }}
                   </span>
                 </td>
                 <td class="mono">{{ r.model || '—' }}</td>
@@ -1005,6 +1037,7 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 }
 .v-completed { color: var(--state-online); border-color: var(--state-online); }
 .v-partial { color: var(--state-busy); border-color: var(--state-busy); }
+.v-needs_clarification,
 .v-cancelled,
 .v-failed { color: var(--text-dim); }
 
@@ -1042,6 +1075,10 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .chip.sm { font-size: 10px; padding: 0 6px; }
 .chip.sev-blocker { color: var(--state-blocked); border-color: var(--state-blocked); }
 
+.clarify { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 8px; }
+.clarify .wh { font-size: 12px; margin: 0 0 4px; color: var(--text-dim); }
+.clarify ul { margin: 4px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.55; }
+
 .roles { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
 .roles th {
   text-align: left;
@@ -1054,7 +1091,8 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
 .roles .role { font-size: 11px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border-strong); }
 .roles .role-moderator { color: var(--accent); border-color: var(--accent); }
 .roles .role-main { color: var(--state-online); border-color: var(--state-online); }
-.roles .bad { font-size: 11px; margin-left: 6px; }
+.roles .pstatus { font-size: 11px; margin-left: 6px; color: var(--text-dim); }
+.roles .pstatus.bad { color: var(--state-blocked); }
 
 .warn { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 8px; }
 .warn .wh { font-size: 12px; margin: 0 0 4px; color: var(--text-dim); }

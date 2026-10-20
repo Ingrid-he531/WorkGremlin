@@ -194,10 +194,11 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     if (ctx.cancelled || ctx.closed) {
       return {
         floorId: floor.floor_id,
-        status: 'failed',
+        status: 'skipped',
         content: null,
         model: null,
         error: '这一轮还没发问，这场会就已经在收尾了',
+        raw: '',
         tokens: null,
         startedAt,
         endedAt: now(),
@@ -211,6 +212,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         content: null,
         model: null,
         error: recipe ? '没有可用的命令行可执行文件' : `议事厅不支持 ${floor.floor_id} 这一层`,
+        raw: '',
         tokens: null,
         startedAt,
         endedAt: now(),
@@ -236,11 +238,12 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
     return {
       floorId: floor.floor_id,
-      status: r.status, // ok / failed / timeout
+      status: r.status, // ok / failed / timeout / unparsed
       content: r.status === 'ok' ? r.text : null,
       model: r.model || null,
       tokens: r.tokens || null,
       error: r.error || null,
+      raw: r.raw || '',
       startedAt,
       endedAt: now(),
       durationMs: r.durationMs,
@@ -260,6 +263,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         model: null,
         tokens: null,
         error: `调用参与者时出错：${err && err.message}`,
+        raw: '',
         startedAt: at,
         endedAt: at,
         durationMs: 0,
@@ -275,12 +279,17 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
    * @param {string} floorId
    * @param {string} phase
    * @param {{status:string, content:string|null, model:string|null, tokens:object|null,
-   *          error:string|null, startedAt:number, endedAt:number, durationMs:number}} turn
+   *          error:string|null, raw:string, startedAt:number, endedAt:number,
+   *          durationMs:number}} turn
    * @param {{status?:string, content?:string|null, parseDropped?:number}} [override]
    */
   function recordUtterance(councilId, roundNo, floorId, phase, turn, override = {}) {
     const status = override.status || turn.status || 'ok';
     const content = override.content !== undefined ? override.content : turn.content;
+    const error =
+      status === 'unparsed' && turn.raw
+        ? `${turn.error || '输出解析不出内容'}\n\n原始输出尾部：\n${turn.raw}`
+        : turn.error;
     repo.insertUtterance({
       councilId,
       roundNo,
@@ -289,7 +298,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       content,
       model: turn.model,
       status,
-      error: turn.error,
+      error,
       inputTokens: turn.tokens ? turn.tokens.input : null,
       outputTokens: turn.tokens ? turn.tokens.output : null,
       cacheReadTokens: turn.tokens ? turn.tokens.cacheRead : null,
@@ -310,17 +319,39 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         content,
         model: turn.model || null,
         status,
-        error: turn.error || null,
+        error: error || null,
         durationMs: turn.durationMs,
       },
     });
   }
 
-  function markParticipant(councilId, floorId, ok, error) {
+  function markParticipant(councilId, floorId, status, error) {
+    const normalized = status === true ? 'ok' : status === false ? 'failed' : String(status || 'failed');
     try {
-      repo.setParticipantStatus(councilId, floorId, ok ? 'ok' : 'failed', error || null);
+      repo.setParticipantStatus(councilId, floorId, normalized, error || null);
     } catch {
       /* participant status is display-only; a write failure must not abort the meeting */
+    }
+  }
+
+  /**
+   * Give every participant a terminal status before the report is built.
+   *
+   * Pending roles never got their turn, while an in-flight role either lost the meeting to a
+   * cancellation or to an earlier failure. Terminal statuses are evidence and are never overwritten.
+   */
+  function settleParticipants(ctx, verdict, error = null) {
+    for (const p of repo.listParticipants(ctx.councilId)) {
+      if (p.status === 'pending') {
+        repo.setParticipantStatus(ctx.councilId, p.floor_id, 'skipped', '这一角色没有轮到发言');
+      } else if (p.status === 'running') {
+        repo.setParticipantStatus(
+          ctx.councilId,
+          p.floor_id,
+          verdict === 'cancelled' ? 'cancelled' : 'failed',
+          error || (verdict === 'cancelled' ? '会议已取消' : '会议提前结束')
+        );
+      }
     }
   }
 
@@ -337,19 +368,8 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     for (const child of ctx.children) killTree(child);
     ctx.children.clear();
 
-    // A meeting can stop while someone is mid-turn (fail-fast or cancel). Their participant row would
-    // otherwise stay "running" forever and the page would claim they are still working.
     try {
-      for (const p of repo.listParticipants(ctx.councilId)) {
-        if (p.status === 'running' || p.status === 'pending') {
-          repo.setParticipantStatus(
-            ctx.councilId,
-            p.floor_id,
-            'failed',
-            error || (verdict === 'cancelled' ? '会议已取消' : '会议提前结束')
-          );
-        }
-      }
+      settleParticipants(ctx, verdict, error);
     } catch {
       /* participant status is display-only; never let it block the close */
     }
@@ -397,7 +417,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
 
   /** Same mapping repo.finishCouncil applies, so the archived report agrees with the row. */
   function statusOfVerdict(verdict) {
-    if (verdict === 'completed' || verdict === 'partial') return 'done';
+    if (verdict === 'completed' || verdict === 'partial' || verdict === 'needs_clarification') return 'done';
     if (verdict === 'cancelled') return 'cancelled';
     return 'failed';
   }
@@ -415,6 +435,15 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
     const warnings = Array.isArray(arg.warnings) ? arg.warnings : [];
     let reportModel;
     try {
+      try {
+        settleParticipants(
+          { councilId: arg.councilId },
+          arg.verdict,
+          arg.error || (arg.warnings && arg.warnings.length ? arg.warnings[0].message : null)
+        );
+      } catch {
+        /* participant status is display-only; the archive must still be written */
+      }
       const councilRow = repo.getCouncil(arg.councilId) || {};
       reportModel = buildReportJson({
         // The archive is built before closeCouncil writes the verdict, so stamp the outcome here.
@@ -425,7 +454,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           verdict: arg.verdict != null ? arg.verdict : councilRow.verdict,
           ended_at: now(),
         },
-        participants: arg.participants || repo.listParticipants(arg.councilId),
+        participants: repo.listParticipants(arg.councilId),
         utterances: arg.utterances || repo.listUtterances(arg.councilId),
         rounds: arg.rounds || [],
         reviews: repo.listReviews(arg.councilId),
@@ -525,6 +554,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       tmpDir,
       ownsTmpDir: Boolean(tmpDir),
       workDir,
+      workspaceProvided: Boolean(workspace),
     };
     active.set(councilId, ctx);
     emit({ councilId, status: 'running', workspace: workspace || null });
@@ -574,11 +604,19 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
        */
       function abortOnTurnFailure({ turn, floor, phase, roundNo, message, code = 'turn_failed' }) {
         const detail = turn.error || (turn.status === 'ok' ? '输出无法解析' : turn.status);
+        const statusText =
+          turn.status === 'unparsed'
+            ? '输出未能解析（unparsed）'
+            : turn.status === 'timeout'
+              ? '超时（timeout）'
+              : turn.status === 'failed'
+                ? '调用失败（failed）'
+                : turn.status;
         const reason =
           message ||
           `第 ${roundNo} 轮${PHASE_ZH[phase] || phase}（${floor.floor_id} ${floorName(
             floor.floor_id
-          )}）没有答上来：${detail}`;
+          )}）${statusText}：${detail}`;
         globalWarnings.push({ code, message: reason, round: roundNo });
         const verdict = rounds.length ? 'partial' : 'failed';
         const archived = archiveReport({
@@ -635,6 +673,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           topic: council.topic,
           materials,
           workspace: ctx.workDir || null,
+          workspaceProvided: ctx.workspaceProvided,
           floorId: moderator.floor_id,
           floorName: floorName(moderator.floor_id),
           reviewers: reviewers.map((r) => ({
@@ -653,7 +692,15 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       recordUtterance(councilId, 0, moderator.floor_id, 'plan', planTurn, {
         status: planTurn.status === 'ok' ? (plan && plan.parsed ? 'ok' : 'unparsed') : planTurn.status,
       });
-      markParticipant(councilId, moderator.floor_id, planTurn.status === 'ok', planTurn.error);
+      const planStatus =
+        planTurn.status === 'ok'
+          ? plan && plan.parsed
+            ? plan.needsClarification.length
+              ? 'needs_clarification'
+              : 'ok'
+            : 'unparsed'
+          : planTurn.status;
+      markParticipant(councilId, moderator.floor_id, planStatus, planTurn.error);
       // No warning here: an unusable plan aborts below, and abortOnTurnFailure records the reason
       // (with code 'plan_unparsed' for a reply that parsed to nothing).
       repo.upsertRound({
@@ -687,6 +734,30 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         });
       }
 
+      if (plan.needsClarification.length) {
+        const verdict = 'needs_clarification';
+        const archived = archiveReport({
+          councilId,
+          workspace,
+          participants,
+          rounds,
+          plan,
+          planText,
+          adjudication,
+          adjudicationText,
+          finalDraft,
+          finalScore: null,
+          warnings: globalWarnings,
+          verdict,
+        });
+        return closeCouncil(ctx, {
+          verdict,
+          error: `主持人需要补充信息：${plan.needsClarification.join('；')}`,
+          report: archived.report,
+          reportFiles: archived.files,
+        });
+      }
+
       let previousProposal = null;
       let previousDirectives = [];
 
@@ -704,6 +775,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
             topic: council.topic,
             materials,
             workspace: ctx.workDir || null,
+            workspaceProvided: ctx.workspaceProvided,
             floorId: main.floor_id,
             floorName: floorName(main.floor_id),
             roundNo,
@@ -732,7 +804,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           status: proposalStatus,
           parseDropped: proposalParsed ? proposalParsed.dropped : 0,
         });
-        markParticipant(councilId, main.floor_id, proposalOk, proposalTurn.error);
+        markParticipant(councilId, main.floor_id, proposalStatus, proposalTurn.error);
 
         if (!proposalOk) {
           // No proposal = nothing to review. Do not recycle the previous version as if it were new.
@@ -807,6 +879,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
                 topic: council.topic,
                 materials,
                 workspace: ctx.workDir || null,
+                workspaceProvided: ctx.workspaceProvided,
                 floorId: r.floor_id,
                 floorName: floorName(r.floor_id),
                 roundNo,
@@ -835,7 +908,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           });
           // A reviewer that produced a valid block (even with zero items) counts as submitted.
           if (status === 'ok') submittedReviewers.push(reviewer.floor_id);
-          markParticipant(councilId, reviewer.floor_id, status === 'ok', turn.error);
+          markParticipant(councilId, reviewer.floor_id, status, turn.error);
           for (const rv of mine) reviews.push({ ...rv, reviewer: reviewer.floor_id });
           emit({
             councilId,
@@ -882,6 +955,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
             topic: council.topic,
             materials,
             workspace: ctx.workDir || null,
+            workspaceProvided: ctx.workspaceProvided,
             floorId: moderator.floor_id,
             floorName: floorName(moderator.floor_id),
             roundNo,
@@ -906,7 +980,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           status: moderationStatus,
           parseDropped: moderation ? moderation.dropped : 0,
         });
-        markParticipant(councilId, moderator.floor_id, moderationStatus === 'ok', moderationTurn.error);
+        markParticipant(councilId, moderator.floor_id, moderationStatus, moderationTurn.error);
 
         if (moderationTurn.status !== 'ok' || !moderation || !moderation.parsed) {
           return abortOnTurnFailure({
@@ -994,6 +1068,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           topic: council.topic,
           materials,
           workspace: ctx.workDir || null,
+          workspaceProvided: ctx.workspaceProvided,
           floorId: moderator.floor_id,
           floorName: floorName(moderator.floor_id),
           maxRounds,
@@ -1018,7 +1093,11 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       markParticipant(
         councilId,
         moderator.floor_id,
-        adjudicationTurn.status === 'ok' && Boolean(adjudication && adjudication.parsed),
+        adjudicationTurn.status === 'ok'
+          ? adjudication && adjudication.parsed
+            ? 'ok'
+            : 'unparsed'
+          : adjudicationTurn.status,
         adjudicationTurn.error
       );
       for (const w of finalWarnings({
@@ -1056,6 +1135,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
           topic: council.topic,
           materials,
           workspace: ctx.workDir || null,
+          workspaceProvided: ctx.workspaceProvided,
           floorId: main.floor_id,
           floorName: floorName(main.floor_id),
           proposal: lastRound.proposal,
@@ -1085,7 +1165,18 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
             : finalTurn.status,
         parseDropped: finalParsed ? finalParsed.dropped : 0,
       });
-      markParticipant(councilId, main.floor_id, Boolean(finalContent), finalTurn.error);
+      markParticipant(
+        councilId,
+        main.floor_id,
+        finalTurn.status === 'ok'
+          ? finalContent
+            ? finalParsed.parsed
+              ? 'ok'
+              : 'unparsed'
+            : 'unparsed'
+          : finalTurn.status,
+        finalTurn.error
+      );
       emit({
         councilId,
         roundNo: lastRound.round,

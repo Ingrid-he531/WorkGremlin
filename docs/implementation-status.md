@@ -341,10 +341,13 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 
 **2026-10-19 的实现形态（角色化流程）**：编排在 `orchestrator.js`，一次会依次跑
 `plan → (proposal → review → moderation) × max_rounds → adjudication → final`，**不因高分提前停**；
-但**任何必需回合返回 `failed` / `timeout`，或输出解析不出结构化结果时立即收场**（fail-fast）：
+但**任何必需回合返回 `failed` / `timeout` / `unparsed`，或输出解析不出结构化结果时立即收场**（fail-fast）：
 不再跑后续轮次，已产出的轮次与报告照常归档，完成过一轮记 `partial`、一轮都没完成记 `failed`，
 `error` 写明轮次 / 阶段 / 楼层与 CLI 原文，`closeCouncil` 把仍在 `running` / `pending` 的参与者
-落成 `failed`。每一轮在 `council_rounds` 落一行 `RoundResult`（`proposal_text` /
+按取消 / 失败落成终态，未轮到的角色记 `skipped`。例外是主持人在第 0 轮明确返回
+`needsClarification`：这是正常结束，记 `verdict='needs_clarification'` / `status='done'`，
+主持人记 `needs_clarification`，其余角色记 `skipped`，报告照常归档。
+每一轮在 `council_rounds` 落一行 `RoundResult`（`proposal_text` /
 `diff_from_prev` / `moderator_json` / `stats_json`），每条意见在 `council_reviews` 落一行。
 模型输出由 `parse.js` 解析：只取**最后一个**围栏 JSON 块，缺字段的条目丢弃并计数，解析失败时
 正文照存（`status='unparsed'`），**绝不替它补一条意见**。收敛度由 `convergence.js` 从评审与冲突
@@ -367,13 +370,18 @@ consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"�
 但确有拆解 / 提案 / 评审 / 汇总发言的轮次作为「未完成」单独成块（`DEBATE_PHASES` 排除
 裁决 / 交付轮）。数据全部来自库里的发言行，不推断、不补写。
 
-**真机故障记录（2026-10-19，1F 第 0 轮）**：用户发起一场会后，1F CodeBuddy 在主持人拆题阶段
-（`plan`）失败，`council_utterances` 记 `status='failed'`、耗时 220s、`content=NULL`，错误是
-「输出解析不出内容」且尾部停在 `"reasoning"` 字段中间。CLI 退出码为 0 —— 即 **CLI 自己把
-transcript 截断后正常退出**：不是超时（上限 300s）、不是 64MB 溢出，重跑同一提示词与同一配方
-可以正常返回完整 `result` 事件。编排当时仍继续跑了第 1 轮，这正是本次加 fail-fast 的原因。
-`runner.js` 的解析失败错误现在同时带 stdout / stderr 字节数与退出码，便于下次判断
-「没输出」还是「写到一半被截断」。
+**真机故障记录（2026-10-19，1F 第 0 轮，已定位并修复）**：历史会议
+`c_f66f8f9f86185744a29a16c0` 不是超时。1F CodeBuddy 的退出码是 **0**，耗时约 **297s**
+（低于 300s 上限），stdout **146176 字节**、stderr 为空；但 transcript 数组缺少最后的 `]`。
+旧解析器把整段 stdout 当成一个 JSON 数组做 `JSON.parse`，因为这一个字符失败，随后把整场会误记为
+`failed` / 「没答上来」。实际上数组里最后一个完整 `result` 事件仍在，可以恢复正文与用量。
+现在的 `agents.js` 会先从完整的对象前缀恢复事件，`parseOutput()` 返回 `truncated`；
+`runner.js` 只有在完全没有可用正文时才记 `unparsed`，并把原始输出尾部保留在 `error` 里用于排障。
+主持人缺少必要信息时还可返回 `needsClarification`，服务端按正常结束处理；无工作目录时提示词明确
+说明临时目录不是用户项目，不能拿它当项目证据。
+
+设置工作目录不会重跑或改写已经结束的历史会议：`workspace_path` 是发起时的输入，历史发言、状态和
+报告是当时的证据，**有意保持不变**。修复只影响新会议；要观察新行为，请新建一场会。
 
 **真机烟测（2026-10-01，4 层里跑通了 1F / 4F / 8F，7F 未跑）** —— 这一步抓出两个单测全绿的真 bug，
 根因是同一个，值得记下来：

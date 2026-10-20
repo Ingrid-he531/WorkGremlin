@@ -267,16 +267,28 @@ function reportMarkdown(report) {
   lines.push('');
 
   lines.push('## 参与角色', '');
-  lines.push('| 楼层 | 角色 | Agent | 模型 | Token |');
-  lines.push('| --- | --- | --- | --- | --- |');
+  lines.push('| 楼层 | 角色 | Agent | 状态 | 模型 | Token |');
+  lines.push('| --- | --- | --- | --- | --- | --- |');
   for (const r of report.roles) {
-    lines.push(`| ${r.floor} | ${r.role} | ${r.agent} | ${r.model || '—'} | ${tokenLine(r.tokens)} |`);
+    lines.push(
+      `| ${r.floor} | ${r.role} | ${r.agent} | ${r.status || '—'} | ${r.model || '—'} | ${tokenLine(r.tokens)} |`
+    );
   }
   lines.push('');
 
   if (report.summary.warnings.length) {
     lines.push('## 一致性提示', '');
     for (const w of report.summary.warnings) lines.push(`- ${w.message}`);
+    lines.push('');
+  }
+
+  const clarifications =
+    report.plan && Array.isArray(report.plan.needsClarification)
+      ? report.plan.needsClarification.filter(Boolean)
+      : [];
+  if (clarifications.length) {
+    lines.push('## 需要补充信息', '');
+    for (const question of clarifications) lines.push(`- ${question}`);
     lines.push('');
   }
 

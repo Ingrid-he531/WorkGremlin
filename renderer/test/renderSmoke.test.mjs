@@ -49,7 +49,8 @@ const WORDS = {
     completed: '已完成', partial: '部分完成', running: '讨论中',
     convergence: '收敛度', opinions: '1 条意见', blockers: '0 条 blocker', conflicts: '1 处冲突',
     roleModerator: '主持人', roleMain: '主答', roleReviewer: '评审',
-    noAnswer: '没答上来', approveChanges: '修改后通过',
+    noAnswer: '没答上来', needClarification: '需要补充信息', notReached: '未轮到',
+    approveChanges: '修改后通过',
     remainingRisks: '剩余风险', finalDirectives: '最终要求', finalDraft: '最终交付稿', changeNotes: '变更说明',
     warnings: '一致性提示', truncated: '已截断', noDiff: '这一轮没有给出 diff',
     process: '完整过程', plan: '第 0 轮 · 议题拆解与评审分工', breakdown: '议题拆解', assignments: '评审分工',
@@ -62,7 +63,8 @@ const WORDS = {
     completed: 'completed', partial: 'partially completed', running: 'in session',
     convergence: 'Convergence', opinions: '1 opinion(s)', blockers: '0 blocker(s)', conflicts: '1 conflict(s)',
     roleModerator: 'Moderator', roleMain: 'Main answerer', roleReviewer: 'Reviewer',
-    noAnswer: 'no answer', approveChanges: 'approve with changes',
+    noAnswer: 'no answer', needClarification: 'needs clarification', notReached: 'not reached',
+    approveChanges: 'approve with changes',
     remainingRisks: 'Remaining risks', finalDirectives: 'Final directives', finalDraft: 'Final draft', changeNotes: 'Change notes',
     warnings: 'Consistency warnings', truncated: 'truncated', noDiff: 'No diff was given for this round',
     process: 'Full process', plan: 'Round 0 · topic breakdown and review assignments', breakdown: 'Topic breakdown', assignments: 'Review assignments',
@@ -277,6 +279,54 @@ const LIVE = {
   progress: { roundNo: 1, phase: 'review', floors: ['7F'], startedAt: 1 },
 };
 
+/**
+ * The moderator needs a project path before it can break down the topic. This is a normal ending:
+ * the moderator did answer, and the roles that were never called are not failures.
+ */
+const CLARIFICATION = {
+  council: {
+    id: 'c3',
+    topic: '评审这个改动会不会导致回归',
+    status: 'done',
+    verdict: 'needs_clarification',
+    max_rounds: 3,
+    workspace_path: null,
+    error: '主持人需要补充信息：请给出需要评审的项目绝对路径',
+  },
+  list: [],
+  participants: [
+    { floor_id: '1F', role: 'moderator', agent: 'codebuddy', status: 'needs_clarification', error: null },
+    { floor_id: '4F', role: 'main', agent: 'claude', status: 'skipped', error: '这一角色没有轮到发言' },
+    { floor_id: '7F', role: 'reviewer', agent: 'kilo', status: 'skipped', error: '这一角色没有轮到发言' },
+  ],
+  materials: [],
+  rounds: [],
+  reviews: [],
+  roundResults: [],
+  utterances: [
+    {
+      round_no: 0,
+      floor_id: '1F',
+      phase: 'plan',
+      content: '需要项目路径才能检查真实代码。',
+      status: 'ok',
+      model: 'codebuddy-x',
+      input_tokens: 80,
+      output_tokens: 20,
+    },
+  ],
+  plan: {
+    parsed: true,
+    breakdown: [],
+    assignments: [],
+    reviewFocus: [],
+    needsClarification: ['请给出需要评审的项目绝对路径'],
+  },
+  report: { schema: 'workgremlin.council.report/v1', summary: { warnings: [] } },
+  reportFiles: ['/home/me/.workgremlin/councils/c3/report.json'],
+  live: false,
+};
+
 for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
   ['zh', '完成', '演示模式', '当前任务', '数据总览'],
   ['en', 'Done', 'Demo mode', 'Current task', 'Overview'],
@@ -488,6 +538,28 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
       incomplete.includes(W.rawOutput) && incomplete.includes('进程超时（300s）') && incomplete.includes(W.timedOut));
     ok('council: a completed round keeps its raw output too',
       incomplete.includes('cv-round-1') && incomplete.includes('上限提到 5'));
+  }
+
+  const clarification = await render('/src/views/CouncilView.vue', seedCouncil(CLARIFICATION));
+  ok('council · clarification: renders without throwing',
+    typeof clarification === 'string', clarification && clarification.error);
+  if (typeof clarification === 'string') {
+    ok(`council: a clarification request is a normal verdict (${W.needClarification})`,
+      clarification.includes(W.needClarification) && clarification.includes('v-needs_clarification'));
+    const ask = chunkOf(clarification, 'cv-clarification');
+    ok('council: the exact question the moderator needs is shown',
+      ask.includes('请给出需要评审的项目绝对路径'), ask);
+    ok(`council: roles that never ran are marked not reached (${W.notReached})`,
+      clarification.includes(W.notReached));
+    const roleTableAt = clarification.indexOf('data-testid="cv-roles"');
+    const roleTableEnd = clarification.indexOf('</table>', roleTableAt);
+    const roleTable = roleTableAt < 0 ? '' : clarification.slice(roleTableAt, roleTableEnd);
+    ok('council: asking for information is not shown as a moderator failure',
+      roleTable.includes(W.needClarification) && !roleTable.includes(W.noAnswer), roleTable);
+    ok('council: no adjudication is fabricated for a clarification request',
+      !clarification.includes('cv-result'));
+    ok('council: the clarification report is still archived',
+      clarification.includes('cv-report-files') && clarification.includes('c3/report.json'));
   }
 
   const live = await render('/src/views/CouncilView.vue', seedCouncil(LIVE));
