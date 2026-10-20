@@ -95,8 +95,18 @@ const CODEX_EVENTS = [
  *   - the subagent tool is called **Agent** (not Task); the hook's isSubagentTool matches it case-insensitively.
  *
  * Deliberately **does not register SubagentStart**: PreToolUse(Agent) already gets the real tool_use_id and
- * registers the ghost; registering SubagentStart too would register two ghosts for one subagent. SubagentStop
- * is still registered as the second end signal when "PostToolUse did not arrive".
+ * registers the ghost; registering SubagentStart too would register two ghosts for one subagent.
+ *
+ * SubagentStop is still registered, but for Claude it is **no longer an end signal** — the server ignores it
+ * (`floorClaude`'s `subagentStopMatchesSpawn: false`). Claude's SubagentStop names only the child `agent_id`
+ * and sends an empty `tool_use_id`, while the ghost is keyed by the spawning PreToolUse's tool_use_id, so the
+ * two can never be matched: retiring on it meant guessing which instance had finished, and with two
+ * concurrent same-name summons it retired the wrong one (measured 2026-10-20). A PostToolUse(Agent) that never
+ * arrives is caught by the session sweeps instead (Stop / UserPromptSubmit / SessionEnd), and failing those by
+ * the poller's gcGhosts.
+ *
+ * Do **not** delete the SubagentStop entry to tidy this up: QODER_EVENTS below is this same table, and Qoder
+ * keeps the default `subagentStopMatchesSpawn: true`, so it still needs the event.
  */
 const CLAUDE_EVENTS = [
   ['SessionStart', ''],

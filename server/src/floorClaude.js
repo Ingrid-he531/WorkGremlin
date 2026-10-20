@@ -534,6 +534,9 @@ const claudeImpl = {
   hasPermissionEvent: true,
   awaitingPermission: (ev) => String((ev && ev.notification_type) || '') === 'permission_prompt',
   hasSubagentStart: false,
+  // SubagentStop names only the child agent_id, while the ghost is keyed by the spawning
+  // PostToolUse tool_use_id. Let PostToolUse retire it instead of guessing from the stop event.
+  subagentStopMatchesSpawn: false,
   repliesOf: readClaudeReplies,
   filesSince: () => [],
   interruptedSince: (tp, since) => claudeInterruptTail(tp, since || 0).interrupted,

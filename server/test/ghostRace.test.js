@@ -99,9 +99,8 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
   ok('并发收工把三只都收掉了', openAfter === openBefore - 3, `${openBefore} → ${openAfter}`);
 
   // [3b] A finish event that names an instance but matches no ledger row must retire nothing.
-  // Measured 2026-10-20 (4F Claude Code): the ghost is keyed by tool_use_id, while SubagentStop
-  // carries only agent_id — the two never match, and resolving it by guessing `arr[0]` retired the
-  // *other*, still-running summon and wrote this event's result onto its run.
+  // Resolving it by guessing `arr[0]` retired the *other*, still-running summon and wrote this
+  // event's result onto its run.
   const IA = 'call_00_aaa';
   const IB = 'call_00_bbb';
   const spawnSame = (inst, prompt) =>
@@ -124,6 +123,16 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
   );
   await runHook('PostToolUse', {
     tool_name: 'Agent',
+    tool_use_id: 'call_00_ccc',
+    tool_input: { subagent_type: 'SameName', prompt: '同名 C' },
+  });
+  ok(
+    '带不匹配的 tool_use_id 和同名类型 → 仍然一只都不收',
+    openSame() === 2 && endedSame().length === 0,
+    `open=${openSame()} ended=${JSON.stringify(endedSame())}`
+  );
+  await runHook('PostToolUse', {
+    tool_name: 'Agent',
     tool_use_id: IA,
     tool_input: { subagent_type: 'SameName', prompt: '同名 A' },
   });
@@ -132,6 +141,48 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
     openSame() === 1 && endedSame().length === 1 && endedSame()[0].includes(IA),
     `open=${openSame()} ended=${JSON.stringify(endedSame())}`
   );
+
+  // [3c] Claude Code sends SubagentStop with the child agent_id, then PostToolUse(Agent) with the
+  // spawning tool_use_id 74ms later. Only the latter identifies the ghost row created at spawn.
+  const CLAUDE_SESSION = 'sess-claude-ghost';
+  const CLAUDE_CALL = 'call_00_claude_guide';
+  bus.registerMember({ project: PROJECT_ID, memberId: 'claude', name: 'claude', role: 'agent', client: 'claude' });
+  const runClaude = (eventName, payload = {}) =>
+    d.dispatch(
+      {
+        hook_event_name: eventName,
+        session_id: CLAUDE_SESSION,
+        cwd: PROJECT,
+        client: 'cli',
+        agent: 'claude',
+        ...payload,
+      },
+      ctx
+    );
+  const openClaude = () =>
+    repo.raw
+      .prepare("SELECT COUNT(*) AS c FROM subagent_runs WHERE ended_at IS NULL AND name = 'ClaudeGuide'")
+      .get().c;
+  await runClaude('UserPromptSubmit', { prompt: '召唤 Claude 子代理' });
+  await runClaude('PreToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: CLAUDE_CALL,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档' },
+  });
+  ok('Claude 召唤后幽灵在跑', openClaude() === 1, String(openClaude()));
+  await runClaude('SubagentStop', {
+    agent_id: 'agent-child-guide',
+    agent_type: 'ClaudeGuide',
+    last_assistant_message: '查完了',
+  });
+  ok('Claude 的 SubagentStop 不再误走匹配分支', openClaude() === 1, String(openClaude()));
+  await runClaude('PostToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: CLAUDE_CALL,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档' },
+    tool_response: '查完了',
+  });
+  ok('Claude 的 PostToolUse 按 tool_use_id 收掉幽灵', openClaude() === 0, String(openClaude()));
 
   // [4] fslock primitive: concurrent read-modify-write must not lose an update (the state file still uses it)
   const COUNTER = path.join(TMP, 'counter.json');

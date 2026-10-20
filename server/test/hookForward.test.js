@@ -78,6 +78,7 @@ async function run() {
         ...process.env,
         WORKGREMLIN_HOME: TMP,
         CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'codex_vscode',
+        UNLISTED_TEST_SECRET: 'do-not-forward',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -92,7 +93,17 @@ async function run() {
   ok('转发 body 带 hook_event_name', received && received.hook_event_name === 'UserPromptSubmit');
   ok('转发 body 带 agent', received && received.agent === 'codex');
   ok('转发 body 带 client', received && received.client === 'codex');
-  ok('Codex 扩展进程的 form=vscode 被转发', received && received.form === 'vscode', received && received.form);
+  ok(
+    '白名单内的 Codex host 环境变量被转发',
+    received && received.hookEnv && received.hookEnv.CODEX_INTERNAL_ORIGINATOR_OVERRIDE === 'codex_vscode',
+    received && JSON.stringify(received.hookEnv)
+  );
+  ok(
+    '白名单外的环境变量不被转发',
+    received && received.hookEnv && !Object.prototype.hasOwnProperty.call(received.hookEnv, 'UNLISTED_TEST_SECRET'),
+    received && JSON.stringify(received.hookEnv)
+  );
+  ok('hook 不替楼层解释 form', received && received.form === undefined, received && received.form);
   ok('转发 body 带 workspacePath(=cwd)', received && received.workspacePath === '/home/u/proj');
   ok('转发 body 透传 transcript_path', received && received.transcript_path === '/tmp/rollout.jsonl');
   ok('hook 进程退出码为 0', exitCode === 0, `exitCode=${exitCode}`);

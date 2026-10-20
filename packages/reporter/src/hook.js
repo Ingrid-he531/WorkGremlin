@@ -28,10 +28,11 @@ const path = require('node:path');
 // Only readServerInfo is needed (to find the local server's port / token for the forwarding POST);
 // the route constants are owned by the server.
 const { readServerInfo } = require('./index');
-const { home, isPluginClient } = require('@workgremlin/shared');
+const { home } = require('@workgremlin/shared');
 
 const REQ_TIMEOUT_MS = 2_000;
 const STDIN_TIMEOUT_MS = 1_500;
+const HOOK_ENV_KEYS = ['CODEX_INTERNAL_ORIGINATOR_OVERRIDE'];
 
 const DEBUG = process.env.WORKGREMLIN_HOOK_DEBUG === '1';
 const debug = (...args) => { if (DEBUG) console.error('[workgremlin-hook]', ...args); };
@@ -51,57 +52,12 @@ function flag(argv, name) {
   return i >= 0 ? argv[i + 1] || '' : '';
 }
 
-/**
- * Resolve the shell form from the hook process environment before forwarding.
- * Codex extension sessions can still write `originator=codex-tui` into the rollout header,
- * so the server cannot reliably infer the extension form from disk. The hook process is
- * started by the actual shell and carries the extension override, making it authoritative.
- */
-function resolveForm(agent, ev) {
-  const base = String(agent || '').split('@')[0].toLowerCase();
-  if (base === 'codex') {
-    const originator = String(process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || '').toLowerCase();
-    if (/vscode|visual studio|extension|plugin/.test(originator)) return 'vscode';
-    if (/desktop/.test(originator)) return 'desktop';
-  }
-  const explicit = String((ev && ev.form) || '').trim().toLowerCase();
-  if (explicit) return explicit;
-  // Older reporters used ev.client as the form. Keep accepting that shape, but never
-  // rewrite the floor identity when ev.client is already the bare agent name.
-  const legacy = String((ev && ev.client) || '').trim().toLowerCase();
-  if (!legacy || legacy === base) return '';
-  return isPluginClient(legacy) ? legacy : 'cli';
-}
-
-/** The server's subagent-tool list (hookCommon.isSubagentTool); kept in sync by hand */
-const SUBAGENT_TOOL_RE = /^(task|agent|spawn_agent|collaborationspawn_agent)$/i;
-
-/**
- * Identity fields that decide how a subagent event is attributed, for the event timeline only.
- *
- * The hook never branches on these — the server does (hookCommon's isSubagentEvent / subagentKeys).
- * They are traced because they cannot be recovered after the fact:
- *   - `agent_id`: whether a floor's subagent events can be told apart from the main round at all.
- *     The server's `fromSubagent` gate needs `agent_id !== session_id`.
- *   - `tool_use_id`: whether an end event (SubagentStop / PostToolUse) can be matched back to the
- *     instance its PreToolUse opened, which is what keeps concurrent same-name summons apart.
- *   - `has_last_message`: SubagentStop carries the closing summary in `last_assistant_message`;
- *     whether a given SubagentStop has one tells a real finish apart from a mid-life one.
- *
- * Deliberately shallow: `tool_input` is mined only for the subagent tool's type, never dumped
- * (it carries the whole prompt).
- */
-function identityOf(ev) {
-  const out = {
-    agent_id: ev.agent_id || ev.agentId || '',
-    tool_use_id: ev.tool_use_id || ev.toolUseId || ev.call_id || ev.tool_call_id || '',
-    has_last_message: ev.last_assistant_message != null,
-  };
-  if (ev.agent_type) out.agent_type = ev.agent_type;
-  if (SUBAGENT_TOOL_RE.test(String(ev.tool_name || ev.tool || ''))) {
-    const input = ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : {};
-    out.subagent_type =
-      input.subagent_type || input.subagent_name || input.task_name || input.name || input.agent || '';
+/** Snapshot only host-process signals that a floor is allowed to interpret. */
+function hookEnv() {
+  const out = {};
+  for (const key of HOOK_ENV_KEYS) {
+    const value = process.env[key];
+    if (value != null && value !== '') out[key] = value;
   }
   return out;
 }
@@ -180,25 +136,14 @@ async function main() {
     debug('stdin 不是 JSON —— 跳过');
     return;
   }
-  /**
-   * Which client this event's ev.client came from (vscode / null / cli …).
-   */
-  const form = resolveForm(agent, ev);
-  trace(ev.hook_event_name, {
-    agent: ev.agent || agent,
-    client: ev.client,
-    form,
-    session: ev.session_id,
-    tool: ev.tool_name,
-    notification_type: ev.notification_type,
-    ...identityOf(ev),
-  });
+  const env = hookEnv();
+  trace(ev.hook_event_name, { agent: ev.agent || agent, client: ev.client, hookEnv: env, session: ev.session_id, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // Pure forwarding: on-disk parsing / session state / ledger / tokens / subagent ghosts all happen on
-  // the server (server/src/ingest/hookCommon.js). Pass agent / form / workspacePath along; the server
-  // routes them to the right floor and resolves the project.
-  await request(info, '/api/v1/hook', { ...ev, ...(form ? { form } : {}), agent, workspacePath: cwd });
+  // the server (server/src/ingest/hookCommon.js). The allowlisted host environment is raw evidence;
+  // the routed floor, not this forwarder, decides what it means.
+  await request(info, '/api/v1/hook', { ...ev, hookEnv: env, agent, workspacePath: cwd });
 }
 
 main().catch((err) => {

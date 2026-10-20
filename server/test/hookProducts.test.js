@@ -146,6 +146,24 @@ const CB_TP = path.join(CB_DIR, 'index.json');
   const vscState = JSON.parse(fs.readFileSync(statePath('codex', TMP, 's_codex_vsc_form'), 'utf8'));
   ok('会话状态也记录 form=vscode（下拉不再显示 CLI）', vscState.form === 'vscode', vscState.form);
 
+  // The hook host signal must beat both a stale rollout header and an event-level fallback form.
+  calls.length = 0;
+  await d.dispatch({
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 's_codex_vsc_hook_env',
+    form: 'cli',
+    hookEnv: { CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'codex_vscode' },
+    prompt: '再',
+    agent: 'codex',
+    client: 'codex',
+    cwd: TMP,
+    transcript_path: CODEX_TP,
+  }, ctx);
+  const stVEnv = calls.find((c) => c[0] === 'startTask');
+  ok('Codex host 环境信号被楼层解释为 form=vscode', stVEnv && stVEnv[1].form === 'vscode', stVEnv && JSON.stringify(stVEnv[1]));
+  const vscHookEnvState = JSON.parse(fs.readFileSync(statePath('codex', TMP, 's_codex_vsc_hook_env'), 'utf8'));
+  ok('Codex host 环境信号写入会话状态', vscHookEnvState.form === 'vscode', vscHookEnvState.form);
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);

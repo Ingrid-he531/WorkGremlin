@@ -813,6 +813,7 @@ const sharedHookImpl = {
   coarseTitle: '',
   hasPermissionEvent: false,
   hasSubagentStart: false,
+  subagentStopMatchesSpawn: true,
   awaitingPermission: null,
   repliesOf: (tp) => jsonlReplies(tp),
   interruptedSince: (tp, since, sessionId) => turnInterrupted(tp, since),
@@ -1303,7 +1304,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     return { ok: true, handled: event };
   }
 
-  if (event === 'SubagentStop') {
+  if (event === 'SubagentStop' && impl.subagentStopMatchesSpawn) {
     finishGhostServer(bus, stableProject, sessionId, get(), { ...ev, last_assistant_message: ev.last_assistant_message }, client, set);
     await beat();
     return { ok: true, handled: event };
@@ -1436,20 +1437,18 @@ function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
   const keys = subagentKeys(ev, nm, task);
   const aid = agentIdOf(ev);
   const callId = callIdsOf(ev)[0] || '';
+  const hasInstanceId = Boolean(aid || callId);
   const list = st.subagents || [];
   const pick = (arr) => {
     let r = aid ? arr.find((x) => x.id === aid) : null;
     if (!r && keys.length) r = arr.find((x) => x.id && keys.includes(x.id)) || null;
-    if (!r && nm && nm !== 'subagent') r = arr.find((x) => x.name === nm) || null;
+    if (!r && !hasInstanceId && nm && nm !== 'subagent') r = arr.find((x) => x.name === nm) || null;
     if (r) return r;
     // `arr[0]` is only for an event that names **no instance at all** (older reporters, tests).
-    // An event that does name one — agent_id, or a per-call tool id — but matches no ledger row
-    // must not be resolved by guessing: with two concurrent same-name summons `arr[0]` is the
-    // *other*, still-running one, so the guess retires the wrong ghost **and** writes this event's
-    // result onto that run. Measured 2026-10-20 on 4F (Claude Code): the ghost is keyed by
-    // tool_use_id while SubagentStop carries only agent_id, so the two never match and every
-    // SubagentStop fell through to `arr[0]`.
-    if (aid || callId) return null;
+    // An event that names one — agent_id, or a per-call tool id — but matches no ledger row must
+    // not be resolved by guessing: with two concurrent same-name summons `arr[0]` is the *other*,
+    // still-running one, so the guess retires the wrong ghost and writes this result onto its run.
+    if (hasInstanceId) return null;
     return arr[0] || null;
   };
   const hit = pick(list);

@@ -112,6 +112,15 @@ const meta = {
 
 const { runHookEvent, sharedHookImpl, jsonlReplies, turnInterrupted, headJsonLines } = require('./ingest/hookCommon');
 
+/** Interpret the raw host signal forwarded by hook.js. The environment belongs to the process
+ * that launched the hook, so it is more authoritative than a stale rollout header. */
+function codexFormFromHookEnv(hookEnv) {
+  const originator = String((hookEnv && hookEnv.CODEX_INTERNAL_ORIGINATOR_OVERRIDE) || '').toLowerCase();
+  if (/desktop/.test(originator)) return 'desktop';
+  if (/vscode|visual studio|extension|plugin/.test(originator)) return 'vscode';
+  return '';
+}
+
 /** Codex form (cli / desktop / vscode): the source/originator of the session_meta first line of a
  * rollout. Moved here from hookCommon (it is part of "the floor's own interface"); fields not
  * overridden fall back to sharedHookImpl.
@@ -150,7 +159,8 @@ const codexImpl = {
 };
 
 async function handleHookEvent(ev, ctx) {
-  return runHookEvent(ev, ctx, codexImpl);
+  const hookForm = codexFormFromHookEnv(ev && ev.hookEnv);
+  return runHookEvent(hookForm ? { ...ev, form: hookForm } : ev, ctx, codexImpl);
 }
 
 /**
