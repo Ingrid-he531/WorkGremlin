@@ -555,6 +555,16 @@ function claudeLaunchOf(ev) {
   return { agentId: String(directId || (match && match[1]) || '').trim(), background: true };
 }
 
+/** Parse the queued background-child handback envelope emitted as UserPromptSubmit. */
+function claudeSubagentHandbackOf(ev) {
+  const prompt = String((ev && ev.prompt) || '').trim();
+  const envelope = prompt.match(/^<agent-message\b([^>]*)>[\s\S]*<\/agent-message>$/i);
+  if (!envelope) return null;
+  const from = envelope[1].match(/\bfrom\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/i);
+  const agentId = String((from && (from[1] || from[2] || from[3])) || '').trim();
+  return agentId ? { agentId } : null;
+}
+
 /** Claude differs only in how it reads its on-disk data: everything else lives in hookCommon.runHookEvent; only interfaces differing from the shared default are overridden, the rest falls back to sharedHookImpl */
 const claudeImpl = {
   ...sharedHookImpl,
@@ -564,6 +574,7 @@ const claudeImpl = {
   // Claude subagent events carry the child agent_id while session_id remains the parent's.
   subagentEventOf: isSubagentEvent,
   subagentLaunchOf: claudeLaunchOf,
+  subagentHandbackOf: claudeSubagentHandbackOf,
   // A Claude SubagentStop names the child id, never the spawning tool call. Only accept stops that
   // carry that identity; an old or malformed stop without it must not guess the first ledger row.
   subagentStopMatchesSpawn: (ev) => Boolean(String((ev && (ev.agent_id || ev.agentId)) || '').trim()),

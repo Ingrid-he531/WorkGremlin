@@ -70,6 +70,7 @@
     "test:agent-desc": "node server/test/agentDescription.test.js",
     "test:ws-reconnect": "node renderer/test/wsReconnect.test.mjs",
     "test:claude-hook": "node server/test/claudeHook.test.js",
+    "test:claude-continuation": "node server/test/claudeContinuation.test.js",
     "test:hook-dispatch": "node server/test/hookDispatch.test.js",
     "test:hook-runtime": "node server/test/hookRuntime.test.js",
     "test:codex-subagent": "node server/test/codexSubagentRound.test.js",

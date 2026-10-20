@@ -845,6 +845,8 @@ const sharedHookImpl = {
   subagentEventOf: null,
   /** Optional product parser for an asynchronous subagent launch receipt: { agentId, background }. */
   subagentLaunchOf: () => null,
+  /** Optional product parser for a background-child handback prompt: { agentId }. */
+  subagentHandbackOf: () => null,
   awaitingPermission: null,
   repliesOf: (tp) => jsonlReplies(tp),
   interruptedSince: (tp, since, sessionId) => turnInterrupted(tp, since),
@@ -1164,6 +1166,53 @@ async function runHookEvent(ev, ctx, floorImpl) {
   }
 
   if (event === 'UserPromptSubmit') {
+    const handback = typeof impl.subagentHandbackOf === 'function' ? impl.subagentHandbackOf(ev) : null;
+    if (handback) {
+      const promptId = String((ev && ev.prompt_id) || '').trim();
+      const continuation =
+        promptId && typeof bus.backgroundSubagentFor === 'function'
+          ? bus.backgroundSubagentFor({
+              project: stableProject,
+              client,
+              sessionId,
+              agentId: handback.agentId,
+            })
+          : null;
+      if (!continuation) return { ok: true, ignored: 'unknown_subagent_handback' };
+
+      const st = get();
+      const seen = Array.isArray(st.continuationPromptIds) ? st.continuationPromptIds : [];
+      if (seen.includes(promptId)) return { ok: true, ignored: 'duplicate_subagent_handback' };
+      const cur = typeof bus.currentTaskFor === 'function'
+        ? bus.currentTaskFor(stableProject, memberId, sessionId)
+        : null;
+      if (cur && cur.taskId) {
+        set({ continuationPromptIds: [...seen, promptId].slice(-20) });
+        return { ok: true, ignored: 'continuation_task_active' };
+      }
+
+      const prevDone = st.done || null;
+      sweepGhosts(bus, stableProject, client, {}, sessionId, get());
+      // Reserve the prompt id before awaiting so concurrent duplicate delivery cannot open two tasks.
+      set({ continuationPromptIds: [...seen, promptId].slice(-20), await: null, pending: null, done: null });
+      const name = String(continuation.name || '子代理').replace(/\s+/g, ' ').trim();
+      const title = `${name || '子代理'} 返回后续作`;
+      const form = formOf() || st.form || '';
+      await register();
+      const started = await bus.startTask({ ...base, title, model: String(ev.model || ''), form });
+      const patch = { taskTitle: title, done: null, roundFiles: [] };
+      if (form) patch.form = form;
+      if (started && started.taskId) {
+        patch.taskId = started.taskId;
+        patch.taskWorkspacePath = workspacePath;
+        patch.taskStartedAt = Date.now();
+      }
+      set(patch);
+      await backfillPrevTokens(prevDone, tp());
+      set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
+      await status('busy');
+      return { ok: true, handled: event, continued: true };
+    }
     if (fromSubagent) {
       // The subagent's own prompt shares the parent session_id; only agent_id differs. Starting a
       // task here would call startTask -> endStaleTasksOfSession and cancel the parent's live

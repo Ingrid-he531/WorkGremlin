@@ -974,6 +974,17 @@ function createRepo(db) {
        ORDER BY ended_at DESC, id DESC
        LIMIT 1
     `),
+    /** Find the background child a Claude handback message names, whether its stop arrived yet or not. */
+    backgroundSubagentRunByAgent: db.prepare(`
+      SELECT * FROM subagent_runs
+       WHERE project_id = @projectId
+         AND client IS @client
+         AND session_id = @sessionId
+         AND agent_id = @agentId
+         AND background = 1
+       ORDER BY started_at DESC, id DESC
+       LIMIT 1
+    `),
     getSubagentRun: db.prepare(`SELECT * FROM subagent_runs WHERE id = ?`),
     reopenSubagentRun: db.prepare(`
       UPDATE subagent_runs SET

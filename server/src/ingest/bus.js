@@ -1456,6 +1456,33 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * Resolve a Claude background handback by the child identity it names.
+   * The handback can arrive just before SubagentStop, so both open and ended runs are valid.
+   */
+  function backgroundSubagentFor(p = {}) {
+    const project = projectIdOf(p.project);
+    const client = normClient(p.client);
+    const sessionId = normSession(p.sessionId);
+    const agentId = normText(p.agentId, 200);
+    if (!client || !sessionId || !agentId) return null;
+    const row = repo.backgroundSubagentRunByAgent.get({
+      projectId: project,
+      client,
+      sessionId,
+      agentId,
+    });
+    if (!row) return null;
+    return {
+      runId: Number(row.id),
+      name: row.name || 'subagent',
+      agentId: row.agent_id,
+      parentTaskId: row.parent_task_id || null,
+      taskId: row.task_id || null,
+      endedAt: row.ended_at == null ? null : Number(row.ended_at),
+    };
+  }
+
+  /**
    * Record a message. source='report' is reported truth; source='watch' is the directory-watch fallback.
    */
   function recordMessage(p) {
@@ -1857,6 +1884,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     projectForReport,
     currentMainTaskId,
     currentTaskFor,
+    backgroundSubagentFor,
     startSubagentRun,
     endSubagentRun,
     ghostSpawn,
