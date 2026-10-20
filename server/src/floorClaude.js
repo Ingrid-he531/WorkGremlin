@@ -515,7 +515,14 @@ function readClaudeReplies(transcriptPath) {
  * file/token/ghost logic are delegated to hookCommon.runHookEvent. Session state is held by the
  * dispatcher keyed by sessionId (replacing the hook's state file).
  */
-const { runHookEvent, sharedHookImpl, jsonlReplies, headJsonLines } = require('./ingest/hookCommon');
+const {
+  runHookEvent,
+  sharedHookImpl,
+  jsonlReplies,
+  headJsonLines,
+  isSubagentEvent,
+  resultOfResponse,
+} = require('./ingest/hookCommon');
 
 /** Claude's form this round (cli / plugin): read the entrypoint at the head of the transcript */
 function claudeForm(transcriptPath) {
@@ -528,15 +535,38 @@ function claudeForm(transcriptPath) {
   return '';
 }
 
+/**
+ * Detect Claude's asynchronous Agent launch receipt. Async subagents keep running after the spawning
+ * tool call returns, so this receipt binds the child id instead of closing the ghost.
+ */
+function claudeLaunchOf(ev) {
+  const response = ev && ev.tool_response;
+  const candidates = response && typeof response === 'object'
+    ? [response, response.toolUseResult, response.result, response.tool_result]
+    : [];
+  const receipt = candidates.find(
+    (r) => r && typeof r === 'object' && (r.isAsync === true || r.is_async === true || r.status === 'async_launched')
+  );
+  const text = resultOfResponse(ev);
+  const asyncLaunch = Boolean(receipt) || /\bAsync agent launched\b/i.test(text) || /async_launched/i.test(text);
+  if (!asyncLaunch) return null;
+  const directId = receipt && (receipt.agentId || receipt.agent_id);
+  const match = text.match(/agentId\s*:\s*([A-Za-z0-9_-]+)/i);
+  return { agentId: String(directId || (match && match[1]) || '').trim(), background: true };
+}
+
 /** Claude differs only in how it reads its on-disk data: everything else lives in hookCommon.runHookEvent; only interfaces differing from the shared default are overridden, the rest falls back to sharedHookImpl */
 const claudeImpl = {
   ...sharedHookImpl,
   hasPermissionEvent: true,
   awaitingPermission: (ev) => String((ev && ev.notification_type) || '') === 'permission_prompt',
   hasSubagentStart: false,
-  // Claude's SubagentStop identifies the child, not the spawning tool call. Only PostToolUse may
-  // retire the ghost; a stop event without identity must not fall back to the first ledger row.
-  subagentStopMatchesSpawn: false,
+  // Claude subagent events carry the child agent_id while session_id remains the parent's.
+  subagentEventOf: isSubagentEvent,
+  subagentLaunchOf: claudeLaunchOf,
+  // A Claude SubagentStop names the child id, never the spawning tool call. Only accept stops that
+  // carry that identity; an old or malformed stop without it must not guess the first ledger row.
+  subagentStopMatchesSpawn: (ev) => Boolean(String((ev && (ev.agent_id || ev.agentId)) || '').trim()),
   repliesOf: readClaudeReplies,
   filesSince: () => [],
   interruptedSince: (tp, since) => claudeInterruptTail(tp, since || 0).interrupted,

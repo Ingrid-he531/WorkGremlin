@@ -229,6 +229,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   let ghostSeq = 0;
   /** Orphan TTL: a summon with no end signal is treated as gone after this long. */
   const GHOST_ORPHAN_MS = 5 * 60_000;
+  /** Background subagents outlive their parent round by design, so they get their own longer TTL. */
+  const GHOST_BACKGROUND_ORPHAN_MS = 60 * 60_000;
   /**
    * Where the finish summary lands: artifacts.kind is limited to file/doc/pr/text (CHECK), so the
    * summary is stored as kind='text' plus this path marker, which the renderer reads as the "report".
@@ -930,6 +932,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       client: normClient(p.client),
       model: normModel(p.model),
       title: normText(p.title, 200),
+      agentId: normText(p.agentId, 200) || null,
       // If no task row was given at summon time, the start moment is "unknown" -- leave NULL (elapsed time can't be computed either), never filled with "now" as a stand-in
       startedAt: p.startedAt === null ? null : Number(p.startedAt) || now(),
     });
@@ -983,22 +986,26 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     }
   }
 
-  /** Pick a live record: by per-call id first, then by name (limited to this project + floor/session) */
-  function pickGhost(project, client, sessionId, name, id) {
+  /**
+   * Pick a live record by an exact instance identity, then by name only when the event carries no
+   * identity at all. Guessing by name after a supplied id failed would retire another same-name summon.
+   */
+  function pickGhost(project, client, sessionId, name, id, agentId) {
     const list = [...ghosts.values()];
+    const inScope = (r) =>
+      r.project === project &&
+      (!client || r.client === client) &&
+      (!sessionId || !r.sessionId || r.sessionId === sessionId);
     if (id) {
-      const byId = list.find((r) => r.project === project && r.id && r.id === id);
+      const byId = list.find((r) => inScope(r) && r.id && r.id === id);
       if (byId) return byId;
     }
-    return (
-      list.find(
-        (r) =>
-          r.project === project &&
-          (!client || r.client === client) &&
-          (!sessionId || !r.sessionId || r.sessionId === sessionId) &&
-          (!name || r.name === name)
-      ) || null
-    );
+    if (agentId) {
+      const byAgent = list.find((r) => inScope(r) && r.agentId && r.agentId === agentId);
+      if (byAgent) return byAgent;
+    }
+    if (id || agentId) return null;
+    return list.find((r) => inScope(r) && (!name || r.name === name)) || null;
   }
 
   /** Close a ghost: end its own task + its subagent run (result is only given on the finish path) */
@@ -1027,7 +1034,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    * reuses the still-open run instead of double-booking.
    * @param {{project:string, workspacePath?:string, client:string, sessionId?:string, name:string,
    *          task?:string, id?:string, parentTaskId?:string, taskId?:string, model?:string,
-   *          progress?:number, files?:string[], startedAt?:number}} p
+   *          agentId?:string, background?:boolean, progress?:number, files?:string[], startedAt?:number}} p
    * @returns {{memberId:string, runId:number|null}}
    */
   function ghostSpawn(p) {
@@ -1080,6 +1087,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       title: p.task || '',
       parentTaskId,
       taskId,
+      agentId: p.agentId,
       startedAt: Number.isFinite(Number(p.startedAt)) ? Number(p.startedAt) : now(),
     });
     ghosts.set(key, {
@@ -1091,6 +1099,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       client,
       sessionId,
       id: p.id || '',
+      agentId: String(p.agentId || ''),
+      background: Boolean(p.background),
       taskId,
       runId,
       parentTaskId,
@@ -1109,14 +1119,42 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * Fill in the child identity once an asynchronous launch receipt arrives. The ghost was opened by
+   * the spawning call id, so this only attaches metadata; it deliberately does not close the run.
+   * @param {{project:string, client?:string, sessionId?:string, name?:string, id?:string,
+   *          agentId?:string, background?:boolean}} p
+   * @returns {boolean} whether a live ghost was found
+   */
+  function ghostBindIdentity(p) {
+    if (!p) return false;
+    const project = projectIdOf(p.project);
+    const agentId = String(p.agentId || '').trim();
+    const rec = pickGhost(
+      project,
+      normClient(p.client),
+      normSession(p.sessionId),
+      p.name,
+      p.id,
+      agentId
+    );
+    if (!rec) return false;
+    if (agentId) {
+      rec.agentId = agentId;
+      if (rec.runId) repo.setSubagentRunAgentId.run({ id: rec.runId, agentId });
+    }
+    if (p.background !== undefined) rec.background = Boolean(p.background);
+    return true;
+  }
+
+  /**
    * A subagent finished: close its run; the ghost **disperses immediately** (no report-animation
    * linger for now).
-   * @param {{project:string, client?:string, sessionId?:string, name?:string, id?:string,
+   * @param {{project:string, client?:string, sessionId?:string, name?:string, id?:string, agentId?:string,
    *          result?:string, model?:string, files?:string[]}} p
    */
   function ghostRetire(p) {
     const project = projectIdOf(p.project);
-    const rec = pickGhost(project, normClient(p.client), normSession(p.sessionId), p.name, p.id);
+    const rec = pickGhost(project, normClient(p.client), normSession(p.sessionId), p.name, p.id, p.agentId);
     if (!rec) return false;
     closeGhost(rec, { result: p.result, model: p.model, files: p.files });
     ghosts.delete(rec.key);
@@ -1139,7 +1177,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       if (rec.project !== project) continue;
       if (client && rec.client !== client) continue;
       if (sessionId && rec.sessionId !== sessionId) continue;
-      if (!p.all && rec.endedAt) continue;
+      if (!p.all && (rec.endedAt || rec.background)) continue;
       closeGhost(rec);
       ghosts.delete(rec.key);
       removeGhostMemberIfUnused(rec);
@@ -1199,11 +1237,18 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
             parentRunning = true;
           } else {
             const endAt = Number(task.ended_at) || 0;
-            if (!endAt || endAt >= Number(rec.at || 0)) drop = true;
+            const endedAfterSpawn = !endAt || endAt >= Number(rec.at || 0);
+            if (endedAfterSpawn && !rec.background) drop = true;
+            if (endedAfterSpawn && rec.background && (task.state === 'cancelled' || task.state === 'failed')) {
+              drop = true;
+            }
           }
         }
       }
-      if (!drop && !parentRunning && rec.at && t - rec.at > GHOST_ORPHAN_MS) drop = true;
+      if (!drop && !parentRunning && rec.at) {
+        const ttl = rec.background ? GHOST_BACKGROUND_ORPHAN_MS : GHOST_ORPHAN_MS;
+        if (t - rec.at > ttl) drop = true;
+      }
       if (!drop) continue;
       closeGhost(rec);
       ghosts.delete(rec.key);
@@ -1664,6 +1709,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     startSubagentRun,
     endSubagentRun,
     ghostSpawn,
+    ghostBindIdentity,
     ghostRetire,
     ghostSweep,
     isGhostAlive,

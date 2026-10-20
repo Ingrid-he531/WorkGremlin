@@ -721,9 +721,23 @@ function retireGhost(bus, project, name, id, result, client, session = '') {
   return bus.ghostRetire({ project, client, sessionId: session, name, id, result });
 }
 
+/** Attach a product-reported child identity to an already-open summon without closing it. */
+function bindGhostIdentity(bus, project, name, id, agentId, background, client, session = '') {
+  if (!bus || typeof bus.ghostBindIdentity !== 'function') return false;
+  return bus.ghostBindIdentity({
+    project,
+    client,
+    sessionId: session,
+    name,
+    id,
+    agentId,
+    background: Boolean(background),
+  });
+}
+
 /**
  * Sweep one session's (or one floor's) ghosts: close their runs, drop the ephemeral members; also
- * clear the session ledger's summon records (they can no longer be retired after a sweep).
+ * retain background summons in the session ledger until their exact completion signal or cancellation.
  * @param {{all?: boolean}} opts
  */
 function sweepGhosts(bus, project, client, opts = {}, session = '', sessionState = null) {
@@ -731,7 +745,9 @@ function sweepGhosts(bus, project, client, opts = {}, session = '', sessionState
     bus && typeof bus.ghostSweep === 'function'
       ? bus.ghostSweep({ project, client, sessionId: session, all: Boolean(opts && opts.all) })
       : 0;
-  if (sessionState && Array.isArray(sessionState.subagents)) sessionState.subagents = [];
+  if (sessionState && Array.isArray(sessionState.subagents)) {
+    sessionState.subagents = opts && opts.all ? [] : sessionState.subagents.filter((r) => r && r.background);
+  }
   return n;
 }
 
@@ -814,6 +830,10 @@ const sharedHookImpl = {
   hasPermissionEvent: false,
   hasSubagentStart: false,
   subagentStopMatchesSpawn: true,
+  /** Optional product override for identifying events emitted inside a subagent turn. */
+  subagentEventOf: null,
+  /** Optional product parser for an asynchronous subagent launch receipt: { agentId, background }. */
+  subagentLaunchOf: () => null,
   awaitingPermission: null,
   repliesOf: (tp) => jsonlReplies(tp),
   interruptedSince: (tp, since, sessionId) => turnInterrupted(tp, since),
@@ -837,10 +857,11 @@ async function runHookEvent(ev, ctx, floorImpl) {
   const { bus, project, workspacePath, sessionGet, sessionSet } = ctx;
   const event = ev && ev.hook_event_name;
   if (!event) return { ok: false, error: 'missing hook_event_name' };
-  // Only floors that emit SubagentStart/SubagentStop (currently Codex) are known to identify a
-  // subagent event this way; do not gate other products' events on an agent_id they may use for
-  // their main agent too.
-  const fromSubagent = Boolean(impl.hasSubagentStart) && isSubagentEvent(ev);
+  // Floors opt in explicitly. The default keeps the original Codex-only behavior, while Claude can
+  // use agent_id without pretending it emits SubagentStart.
+  const fromSubagent = typeof impl.subagentEventOf === 'function'
+    ? Boolean(impl.subagentEventOf(ev))
+    : Boolean(impl.hasSubagentStart && isSubagentEvent(ev));
 
   const memberId = String(ev.agent);
   const client = String(ev.agent || '').trim().toLowerCase();
@@ -1016,7 +1037,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     }
     const replies0 = impl.repliesOf(tp());
     await reportReplies(ctx, memberId, taskId0, replies0, sessionId, client);
-    sweepGhosts(bus, stableProject, client, {}, sessionId, st0);
+    sweepGhosts(bus, stableProject, client, { all: true }, sessionId, st0);
     const files0 = collectRoundFiles(st0, ev0, cwd, startedAt0, workspacePath);
     const last0 = replies0.length ? replies0[replies0.length - 1].text : '';
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -1224,11 +1245,15 @@ async function runHookEvent(ev, ctx, floorImpl) {
         await status('busy');
       }
     } else {
+      const launch = isSubagentTool(toolName) && typeof impl.subagentLaunchOf === 'function'
+        ? impl.subagentLaunchOf(ev)
+        : null;
       if (fromSubagent) {
-        // Only a nested summon that finished inside a subagent retires its ghost on floors without
-        // SubagentStop events; the rest of the event belongs to the subagent's own turn.
+        // A nested summon can still bind/retire its own ghost; the rest of the event belongs to the
+        // subagent's turn and must not touch the parent's phase or task attribution.
         if (isSubagentTool(toolName) && !impl.hasSubagentStart) {
-          finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
+          if (launch) bindGhostFromLaunch(bus, stableProject, sessionId, get(), ev, launch, client, set);
+          else finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
         }
         return { ok: true, ignored: 'subagent_tool' };
       }
@@ -1251,7 +1276,8 @@ async function runHookEvent(ev, ctx, floorImpl) {
         if (tid) await bus.taskProgress({ ...base, taskId: tid, progress: prog });
       }
       if (isSubagentTool(toolName) && !impl.hasSubagentStart) {
-        finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
+        if (launch) bindGhostFromLaunch(bus, stableProject, sessionId, get(), ev, launch, client, set);
+        else finishGhostServer(bus, stableProject, sessionId, get(), ev, client, set);
       }
       set({ sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
       await status('busy');
@@ -1304,7 +1330,10 @@ async function runHookEvent(ev, ctx, floorImpl) {
     return { ok: true, handled: event };
   }
 
-  if (event === 'SubagentStop' && impl.subagentStopMatchesSpawn) {
+  const subagentStopMatchesSpawn = typeof impl.subagentStopMatchesSpawn === 'function'
+    ? Boolean(impl.subagentStopMatchesSpawn(ev))
+    : Boolean(impl.subagentStopMatchesSpawn);
+  if (event === 'SubagentStop' && subagentStopMatchesSpawn) {
     finishGhostServer(bus, stableProject, sessionId, get(), { ...ev, last_assistant_message: ev.last_assistant_message }, client, set);
     await beat();
     return { ok: true, handled: event };
@@ -1317,7 +1346,6 @@ async function runHookEvent(ev, ctx, floorImpl) {
     );
     // Clear "awaiting permission / pending" (done was already read first)
     set({ await: null, pending: null, done: null });
-    sweepGhosts(bus, stableProject, client, {}, sessionId, get());
     const st = get();
     let taskId = st.taskId;
     let title = st.taskTitle || '';
@@ -1339,6 +1367,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const roundFileDetails = collectRoundFiles(st, ev, cwd, startedAt, workspacePath);
     const justCancelled = prevCancelledDone && !taskId;
     const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
+    sweepGhosts(bus, stableProject, client, { all: cancelledRound }, sessionId, get());
     if (taskId) {
       const form = formOf() || st.form || '';
       const transcriptPath = tp();
@@ -1440,7 +1469,7 @@ function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
   const hasInstanceId = Boolean(aid || callId);
   const list = st.subagents || [];
   const pick = (arr) => {
-    let r = aid ? arr.find((x) => x.id === aid) : null;
+    let r = aid ? arr.find((x) => x.id === aid || x.agentId === aid) : null;
     if (!r && keys.length) r = arr.find((x) => x.id && keys.includes(x.id)) || null;
     if (!r && !hasInstanceId && nm && nm !== 'subagent') r = arr.find((x) => x.name === nm) || null;
     if (r) return r;
@@ -1458,12 +1487,41 @@ function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
   retireGhost(bus, project, hit.name, hit.id, resultOfResponse(ev), floor, sessionId);
 }
 
+/** Bind Claude's asynchronous launch receipt to the ledger row opened by the spawning tool call. */
+function bindGhostFromLaunch(bus, project, sessionId, st, ev, launch, floor, set) {
+  const ti = ev && ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : null;
+  const name = ti ? agentName(ti) : 'subagent';
+  const task = ti ? agentTask(ti) : '';
+  const keys = subagentKeys(ev, name, task);
+  const callId = callIdsOf(ev)[0] || '';
+  const list = st.subagents || [];
+  const hit =
+    (callId && list.find((x) => x.id === callId)) ||
+    (keys.length && list.find((x) => x.id && keys.includes(x.id))) ||
+    null;
+  if (hit) {
+    hit.agentId = launch.agentId || '';
+    hit.background = Boolean(launch.background);
+    if (set) set({ subagents: list });
+  }
+  bindGhostIdentity(
+    bus,
+    project,
+    name,
+    (hit && hit.id) || callId || keys[0] || '',
+    launch.agentId,
+    launch.background,
+    floor,
+    sessionId
+  );
+}
+
 module.exports = {
   runHookEvent,
   // product-agnostic helpers (exported for unit tests and reuse)
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
-  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, readTokens,
-  addGhost, retireGhost, sweepGhosts, agentName, agentTask, subagentKeys,
+  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, isSubagentEvent, readTokens,
+  addGhost, retireGhost, bindGhostIdentity, sweepGhosts, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, PROBE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS,
   // token normalization primitives (product-agnostic)

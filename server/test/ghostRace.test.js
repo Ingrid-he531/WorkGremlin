@@ -142,10 +142,15 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
     `open=${openSame()} ended=${JSON.stringify(endedSame())}`
   );
 
-  // [3c] Claude Code sends SubagentStop with the child agent_id, then PostToolUse(Agent) with the
-  // spawning tool_use_id 74ms later. Only the latter identifies the ghost row created at spawn.
+  // [3c] Claude opens the ghost from PreToolUse(Agent), binds the asynchronous launch receipt from
+  // PostToolUse(Agent), and finally names the same child in SubagentStop. The three events must line
+  // up without retiring a same-name sibling by guesswork.
   const CLAUDE_SESSION = 'sess-claude-ghost';
-  const CLAUDE_CALL = 'call_00_claude_guide';
+  const CLAUDE_CALL_A = 'call_00_claude_guide_a';
+  const CLAUDE_CALL_B = 'call_00_claude_guide_b';
+  const CLAUDE_CALL_C = 'call_00_claude_guide_c';
+  const CLAUDE_AGENT_A = 'agent-child-guide-a';
+  const CLAUDE_AGENT_B = 'agent-child-guide-b';
   bus.registerMember({ project: PROJECT_ID, memberId: 'claude', name: 'claude', role: 'agent', client: 'claude' });
   const runClaude = (eventName, payload = {}) =>
     d.dispatch(
@@ -163,28 +168,83 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
     repo.raw
       .prepare("SELECT COUNT(*) AS c FROM subagent_runs WHERE ended_at IS NULL AND name = 'ClaudeGuide'")
       .get().c;
+  const claudeRuns = () =>
+    repo.raw
+      .prepare("SELECT * FROM subagent_runs WHERE name = 'ClaudeGuide' ORDER BY id")
+      .all();
   await runClaude('UserPromptSubmit', { prompt: '召唤 Claude 子代理' });
   await runClaude('PreToolUse', {
     tool_name: 'Agent',
-    tool_use_id: CLAUDE_CALL,
-    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档' },
+    tool_use_id: CLAUDE_CALL_A,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档 A' },
   });
-  ok('Claude 召唤后幽灵在跑', openClaude() === 1, String(openClaude()));
-  await runClaude('SubagentStop', {
-    agent_id: 'agent-child-guide',
-    agent_type: 'ClaudeGuide',
-    last_assistant_message: '查完了',
+  await runClaude('PreToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: CLAUDE_CALL_B,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档 B' },
   });
-  ok('Claude 的 SubagentStop 不再误走匹配分支', openClaude() === 1, String(openClaude()));
-  await runClaude('SubagentStop', { last_assistant_message: '旧事件没有实例身份' });
-  ok('Claude 的无身份 SubagentStop 不猜 arr[0]', openClaude() === 1, String(openClaude()));
+  ok('Claude 两只同名幽灵同时在跑', openClaude() === 2, String(openClaude()));
   await runClaude('PostToolUse', {
     tool_name: 'Agent',
-    tool_use_id: CLAUDE_CALL,
-    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档' },
-    tool_response: '查完了',
+    tool_use_id: CLAUDE_CALL_A,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档 A' },
+    tool_response: { isAsync: true, status: 'async_launched', agentId: CLAUDE_AGENT_A },
   });
-  ok('Claude 的 PostToolUse 按 tool_use_id 收掉幽灵', openClaude() === 0, String(openClaude()));
+  await runClaude('PostToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: CLAUDE_CALL_B,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '查一下 hook 文档 B' },
+    tool_response: `Async agent launched successfully.\nagentId: ${CLAUDE_AGENT_B}`,
+  });
+  const boundRuns = claudeRuns();
+  ok(
+    '异步回执不收工，并把结构化/文本 agentId 写入台账',
+    openClaude() === 2 && boundRuns.some((r) => r.agent_id === CLAUDE_AGENT_A) && boundRuns.some((r) => r.agent_id === CLAUDE_AGENT_B),
+    JSON.stringify(boundRuns.map((r) => ({ id: r.id, agent_id: r.agent_id, ended_at: r.ended_at })))
+  );
+  await runClaude('SubagentStop', {
+    agent_id: 'agent-child-unknown',
+    agent_type: 'ClaudeGuide',
+    last_assistant_message: '不属于这里',
+  });
+  ok('未知 agentId 的 SubagentStop 不收任何幽灵', openClaude() === 2, String(openClaude()));
+  await runClaude('SubagentStop', { last_assistant_message: '旧事件没有实例身份' });
+  ok('无身份 SubagentStop 不猜 arr[0]', openClaude() === 2, String(openClaude()));
+  await runClaude('SubagentStop', {
+    agent_id: CLAUDE_AGENT_A,
+    agent_type: 'ClaudeGuide',
+    last_assistant_message: 'A 查完了',
+  });
+  const afterA = claudeRuns();
+  const endedA = afterA.find((r) => r.agent_id === CLAUDE_AGENT_A);
+  ok(
+    '已知 agentId 的 SubagentStop 只收 A',
+    openClaude() === 1 && endedA && endedA.result === 'A 查完了',
+    JSON.stringify(afterA.map((r) => ({ agent_id: r.agent_id, ended_at: r.ended_at, result: r.result })))
+  );
+  await runClaude('Stop', { last_assistant_message: '主任务先完成' });
+  ok('父任务正常完成不会收掉后台幽灵', openClaude() === 1, String(openClaude()));
+  await runClaude('SubagentStop', {
+    agent_id: CLAUDE_AGENT_B,
+    agent_type: 'ClaudeGuide',
+    last_assistant_message: 'B 也查完了',
+  });
+  ok('父任务结束后，后台幽灵仍按 agentId 精确收工', openClaude() === 0, String(openClaude()));
+
+  // A synchronous Claude Agent call has no async receipt and still retires by its spawning call id.
+  await runClaude('UserPromptSubmit', { prompt: '同步召唤 Claude 子代理' });
+  await runClaude('PreToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: CLAUDE_CALL_C,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '同步查询' },
+  });
+  await runClaude('PostToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: CLAUDE_CALL_C,
+    tool_input: { subagent_type: 'ClaudeGuide', prompt: '同步查询' },
+    tool_response: '同步查完了',
+  });
+  ok('同步 PostToolUse 仍按 tool_use_id 收掉幽灵', openClaude() === 0, String(openClaude()));
 
   // [4] fslock primitive: concurrent read-modify-write must not lose an update (the state file still uses it)
   const COUNTER = path.join(TMP, 'counter.json');

@@ -225,6 +225,7 @@ function migrate(db) {
   ensureColumn(db, 'members', 'project_label', 'project_label TEXT');
   ensureColumn(db, 'members', 'client', 'client TEXT');
   ensureColumn(db, 'subagent_runs', 'files_json', 'files_json TEXT');
+  ensureColumn(db, 'subagent_runs', 'agent_id', 'agent_id TEXT');
   ensureColumn(db, 'task_runs', 'baseline_commit', 'baseline_commit TEXT');
   // Axis 2 (session): old DBs lack these two columns, add them; old rows keep NULL (that is not "no
   // session", it is "nothing was recorded back then")
@@ -936,10 +937,11 @@ function createRepo(db) {
     `),
     insertSubagentRun: db.prepare(`
       INSERT INTO subagent_runs
-        (project_id, parent_task_id, task_id, member_id, name, client, model, title, started_at)
+        (project_id, parent_task_id, task_id, member_id, name, client, model, title, agent_id, started_at)
       VALUES
-        (@projectId, @parentTaskId, @taskId, @memberId, @name, @client, @model, @title, @startedAt)
+        (@projectId, @parentTaskId, @taskId, @memberId, @name, @client, @model, @title, @agentId, @startedAt)
     `),
+    setSubagentRunAgentId: db.prepare(`UPDATE subagent_runs SET agent_id = @agentId WHERE id = @id`),
     endSubagentRun: db.prepare(`
       UPDATE subagent_runs SET
         model    = COALESCE(@model, model),

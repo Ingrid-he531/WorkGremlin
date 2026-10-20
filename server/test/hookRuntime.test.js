@@ -3,8 +3,9 @@
  * Server-side generic hook runner integration test (the full Claude event chain).
  *
  * Covers: SessionStart / UserPromptSubmit / PreToolUse(Agent summons a ghost) /
- * PostToolUse(ghost retires) / Stop(output + finish) / Interrupt(cancelled finish), and checks the
- * server bus calls (ghosts go through ghostSpawn/ghostRetire/ghostSweep).
+ * PostToolUse(ghost retires or binds an async child) / Claude subagent attribution /
+ * SubagentStop(identity match) / Stop(output + finish) / Interrupt(cancelled finish), and checks the
+ * server bus calls (ghosts go through ghostSpawn/ghostBindIdentity/ghostRetire/ghostSweep).
  * Run: `npm run test:hook-runtime`
  */
 const fs = require('node:fs');
@@ -56,6 +57,7 @@ const bus = {
   currentTaskFor: () => null,
   currentMainTaskId: () => 't_main',
   ghostSpawn: (b) => { calls.push(['ghostSpawn', b]); return { memberId: `subagent-${b.name}@P`, runId: 1 }; },
+  ghostBindIdentity: (b) => { calls.push(['ghostBindIdentity', b]); return true; },
   ghostRetire: (b) => { calls.push(['ghostRetire', b]); return true; },
   ghostSweep: (b) => { calls.push(['ghostSweep', b]); return 0; },
 };
@@ -107,6 +109,81 @@ const bus = {
   calls.length = 0;
   await d.dispatch(ev('UserPromptSubmit', { prompt: '再写个测试' }), ctx);
   ok('新轮 UserPromptSubmit → 扫场 ghostSweep', calls.some((c) => c[0] === 'ghostSweep' && c[1].sessionId === 's1'), JSON.stringify(calls.map((x) => x[0])));
+
+  /* Claude emits subagent tool events with the parent's session_id plus the child's agent_id. */
+  const ev2 = (name, extra = {}) => ({ ...ev(name, extra), session_id: 's2' });
+  await d.dispatch(ev2('UserPromptSubmit', { prompt: '异步召唤子代理' }), ctx);
+  calls.length = 0;
+  await d.dispatch(
+    ev2('PreToolUse', {
+      tool_name: 'Agent',
+      tool_use_id: 'call_async',
+      tool_input: { subagent_type: 'Explore', description: '后台查代码' },
+    }),
+    ctx
+  );
+  ok('异步召唤先按 tool_use_id 开幽灵', calls.some((c) => c[0] === 'ghostSpawn' && c[1].id === 'call_async'));
+
+  calls.length = 0;
+  await d.dispatch(
+    ev2('PostToolUse', {
+      tool_name: 'Agent',
+      tool_use_id: 'call_async',
+      tool_input: { subagent_type: 'Explore', description: '后台查代码' },
+      tool_response: { isAsync: true, status: 'async_launched', agentId: 'child-async' },
+    }),
+    ctx
+  );
+  ok(
+    '异步回执绑定 agentId 但不收工',
+    calls.some((c) => c[0] === 'ghostBindIdentity' && c[1].id === 'call_async' && c[1].agentId === 'child-async' && c[1].background === true) &&
+      !calls.some((c) => c[0] === 'ghostRetire'),
+    JSON.stringify(calls)
+  );
+
+  const beforeSubagentTool = JSON.stringify(d.sessionGet('s2') || {});
+  calls.length = 0;
+  await d.dispatch(
+    ev2('PreToolUse', {
+      agent_id: 'child-async',
+      transcript_path: path.join(TMP, 'child.jsonl'),
+      tool_name: 'Bash',
+      tool_use_id: 'child-call',
+      tool_input: { command: 'rg hookCommon' },
+    }),
+    ctx
+  );
+  const afterSubagentTool = JSON.stringify(d.sessionGet('s2') || {});
+  ok('子代理工具事件仍发心跳', calls.some((c) => c[0] === 'heartbeat'));
+  ok(
+    '子代理工具事件不刷新父任务相位或工具归因',
+    beforeSubagentTool === afterSubagentTool && !calls.some((c) => c[0] === 'toolUse' || c[0] === 'fileTouch' || c[0] === 'setStatus'),
+    `${beforeSubagentTool} -> ${afterSubagentTool}`
+  );
+
+  calls.length = 0;
+  await d.dispatch(ev2('SubagentStop', { last_assistant_message: '缺少身份' }), ctx);
+  ok('无身份 SubagentStop 不收工', !calls.some((c) => c[0] === 'ghostRetire'), JSON.stringify(calls));
+  calls.length = 0;
+  await d.dispatch(ev2('SubagentStop', { agent_id: 'child-unknown', last_assistant_message: '身份不匹配' }), ctx);
+  ok('未知身份 SubagentStop 不收工', !calls.some((c) => c[0] === 'ghostRetire'), JSON.stringify(calls));
+
+  calls.length = 0;
+  await d.dispatch(ev2('Stop', { last_assistant_message: '父任务正常完成' }), ctx);
+  ok(
+    '父任务正常完成保留后台子代理台账',
+    calls.some((c) => c[0] === 'ghostSweep' && c[1].all === false) &&
+      (d.sessionGet('s2').subagents || []).some((r) => r.id === 'call_async' && r.agentId === 'child-async'),
+    JSON.stringify(d.sessionGet('s2'))
+  );
+
+  calls.length = 0;
+  await d.dispatch(ev2('SubagentStop', { agent_id: 'child-async', last_assistant_message: '子代理完成' }), ctx);
+  ok(
+    '已知身份 SubagentStop 在父任务结束后仍精确收工',
+    calls.some((c) => c[0] === 'ghostRetire' && c[1].id === 'call_async') && (d.sessionGet('s2').subagents || []).length === 0,
+    JSON.stringify(calls)
+  );
 
   // Interrupt → 取消收尾
   calls.length = 0;

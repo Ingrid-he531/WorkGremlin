@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
   client         TEXT,
   model          TEXT,
   title          TEXT,                    -- Its task for this job
+  agent_id       TEXT,                    -- Product-reported child identity (Claude/Codex agent_id)
   result         TEXT,                    -- Closing summary (output)
   files_json     TEXT,                    -- Files changed this turn (JSON array of {path,added,removed}, at most 10 entries)
   started_at     INTEGER,

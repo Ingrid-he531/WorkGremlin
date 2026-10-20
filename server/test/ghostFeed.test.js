@@ -93,6 +93,25 @@ ok('s1 的没了', !member('subagent-A'));
 ok('s2 的还在', !!member('subagent-B'));
 bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's2' });
 
+console.log('\n[3a] 异步身份绑定后按 agentId 精确回收');
+{
+  const a = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-id', name: 'Identified', id: 'iA', parentTaskId: main });
+  const b = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-id', name: 'Identified', id: 'iB', parentTaskId: main });
+  ok('绑定前台账没有子代理身份', repo.raw.prepare('SELECT agent_id FROM subagent_runs WHERE id = ?').get(a.runId).agent_id == null);
+  ok('异步回执绑定到 spawning call', bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-id', id: 'iA', agentId: 'child-A', background: true }));
+  ok('agentId 已写进台账', repo.raw.prepare('SELECT agent_id FROM subagent_runs WHERE id = ?').get(a.runId).agent_id === 'child-A');
+  ok(
+    '不同 session 的同 agentId 不能误收',
+    bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 'other-session', agentId: 'child-A' }) === false
+  );
+  ok('未知 agentId 不能误收', bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-id', agentId: 'child-unknown' }) === false);
+  ok('精确 agentId 只收 A', bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-id', agentId: 'child-A', result: 'A done' }));
+  const rowA = repo.raw.prepare('SELECT ended_at, result FROM subagent_runs WHERE id = ?').get(a.runId);
+  const rowB = repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(b.runId);
+  ok('A 已结束、B 仍在跑', Boolean(rowA.ended_at) && rowA.result === 'A done' && !rowB.ended_at, JSON.stringify({ rowA, rowB }));
+  bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's-id', all: true });
+}
+
 console.log('\n[5] gcGhosts：父任务收工才散；召唤前就已收工的父任务不误伤');
 {
   // (a) 父任务先收工、再召唤（模拟"被顶掉的孪生任务 / 陈旧 parentTaskId"）→ 不该被误散
@@ -129,6 +148,31 @@ console.log('\n[6] gcGhosts：父任务还在跑时，孤儿 TTL 不得把还在
     ok('父任务仍在跑 → 过了孤儿 TTL 幽灵还在', bus.gcGhosts() === 0 && !!member('subagent-Long'));
     bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: longMain, state: 'done' });
     ok('父任务收工后 → 散场（TTL 之外仍靠父任务收尾）', bus.gcGhosts() >= 1 && !member('subagent-Long'));
+  } finally {
+    clock.__resetClock();
+  }
+}
+
+console.log('\n[6a] 后台幽灵：父任务正常完成后仍保留，取消/失败时才回收');
+{
+  const clock = require('../src/clock');
+  let fake = 2_000_000;
+  clock.__setClock({ now: () => fake, monotonic: () => fake });
+  try {
+    const bgMain = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '后台子代理', client: 'codebuddy', sessionId: 's-bg' }).taskId;
+    bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-bg', name: 'Background', id: 'bg1', parentTaskId: bgMain });
+    bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-bg', id: 'bg1', agentId: 'agent-bg', background: true });
+    bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: bgMain, state: 'done' });
+    fake += 10 * 60_000;
+    ok('普通扫场不提前收后台幽灵', bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's-bg' }) === 0 && !!member('subagent-Background'));
+    ok('父任务正常结束后的 GC 也保留后台幽灵', bus.gcGhosts() === 0 && !!member('subagent-Background'));
+
+    const cancelMain = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '取消后台子代理', client: 'codebuddy', sessionId: 's-bg-cancel' }).taskId;
+    bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-bg-cancel', name: 'CancelledChild', id: 'bg2', parentTaskId: cancelMain });
+    bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-bg-cancel', id: 'bg2', agentId: 'agent-bg-cancel', background: true });
+    bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: cancelMain, state: 'cancelled' });
+    ok('父任务取消后 GC 回收后台幽灵', bus.gcGhosts() >= 1 && !member('subagent-CancelledChild'));
+    bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's-bg', all: true });
   } finally {
     clock.__resetClock();
   }
