@@ -97,13 +97,12 @@ const CODEX_EVENTS = [
  * Deliberately **does not register SubagentStart**: PreToolUse(Agent) already gets the real tool_use_id and
  * registers the ghost; registering SubagentStart too would register two ghosts for one subagent.
  *
- * SubagentStop is still registered, but for Claude it is **no longer an end signal** — the server ignores it
- * (`floorClaude`'s `subagentStopMatchesSpawn: false`). Claude's SubagentStop names only the child `agent_id`
- * and sends an empty `tool_use_id`, while the ghost is keyed by the spawning PreToolUse's tool_use_id, so the
- * two can never be matched: retiring on it meant guessing which instance had finished, and with two
- * concurrent same-name summons it retired the wrong one (measured 2026-10-20). A PostToolUse(Agent) that never
- * arrives is caught by the session sweeps instead (Stop / UserPromptSubmit / SessionEnd), and failing those by
- * the poller's gcGhosts.
+ * SubagentStop is still registered, but Claude treats it as a non-finish signal
+ * (`subagentStopMatchesSpawn: false`). Claude's real event names only the child `agent_id` and sends an empty
+ * `tool_use_id`, while the ghost is keyed by the spawning PreToolUse's tool_use_id. PostToolUse(Agent) retires
+ * it by the spawn id instead. The flag also prevents an old or malformed stop event with no instance identity
+ * from falling back to `arr[0]` and retiring the wrong concurrent ghost. If PostToolUse never arrives, the
+ * session sweeps catch the ghost (Stop / UserPromptSubmit / SessionEnd), followed by the poller's gcGhosts.
  *
  * Do **not** delete the SubagentStop entry to tidy this up: QODER_EVENTS below is this same table, and Qoder
  * keeps the default `subagentStopMatchesSpawn: true`, so it still needs the event.

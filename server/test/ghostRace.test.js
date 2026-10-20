@@ -176,6 +176,8 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
     last_assistant_message: '查完了',
   });
   ok('Claude 的 SubagentStop 不再误走匹配分支', openClaude() === 1, String(openClaude()));
+  await runClaude('SubagentStop', { last_assistant_message: '旧事件没有实例身份' });
+  ok('Claude 的无身份 SubagentStop 不猜 arr[0]', openClaude() === 1, String(openClaude()));
   await runClaude('PostToolUse', {
     tool_name: 'Agent',
     tool_use_id: CLAUDE_CALL,
