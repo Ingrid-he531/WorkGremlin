@@ -715,10 +715,10 @@ function addGhost(bus, project, workspacePath, name, task, id, parent, model, cl
   });
 }
 
-/** A subagent finished → close its run; the ghost disperses (no linger for now — see bus.ghostRetire). */
-function retireGhost(bus, project, name, id, result, client, session = '') {
+/** Forward a subagent stop; the bus owns exact matching, retirement and background wake-up recovery. */
+function retireGhost(bus, project, name, id, result, client, session = '', agentId = '') {
   if (!bus || typeof bus.ghostRetire !== 'function') return false;
-  return bus.ghostRetire({ project, client, sessionId: session, name, id, result });
+  return bus.ghostRetire({ project, client, sessionId: session, name, id, agentId, result });
 }
 
 /** Attach a product-reported child identity to an already-open summon without closing it. */
@@ -1481,10 +1481,16 @@ function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
     return arr[0] || null;
   };
   const hit = pick(list);
-  if (!hit) return;
+  if (!hit) {
+    // The state ledger drops an instance after its first stop. A later stop carrying the exact
+    // child identity is how a resumed background agent returns; the bus decides from its ledger
+    // whether that identity is a genuine wake-up or an unknown/stale event.
+    if (hasInstanceId) retireGhost(bus, project, nm, callId, resultOfResponse(ev), floor, sessionId, aid);
+    return;
+  }
   st.subagents = list.filter((x) => x !== hit);
   if (set) set({ subagents: st.subagents });
-  retireGhost(bus, project, hit.name, hit.id, resultOfResponse(ev), floor, sessionId);
+  retireGhost(bus, project, hit.name, hit.id, resultOfResponse(ev), floor, sessionId, aid);
 }
 
 /** Bind Claude's asynchronous launch receipt to the ledger row opened by the spawning tool call. */

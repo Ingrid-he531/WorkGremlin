@@ -340,6 +340,14 @@ function createServer(opts = {}) {
     // (the ghost path marks it active / idle)
     bus.setGhostRoster(agentRoster);
 
+    // Live ghosts are a hot in-memory map; restore them from open ledger rows before the poller
+    // starts so an asynchronous child remains visible across a server restart.
+    const restoredGhosts = bus.restoreGhosts();
+    bus.gcGhosts();
+    if (restoredGhosts > 0 && !opts.silent) {
+      log.info(`[workgremlin] 恢复 ${restoredGhosts} 个仍在运行的子代理幽灵`);
+    }
+
     /* The one clock: session scan + per-floor task-ledger sync + per-floor agent sync + heartbeat
        sweep all live in this single unified poller, so floor modules hold no timers (see poller.js).
        It starts here — after workspace.restore() — so the first tick scans the restored project and

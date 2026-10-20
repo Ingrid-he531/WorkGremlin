@@ -226,6 +226,12 @@ function migrate(db) {
   ensureColumn(db, 'members', 'client', 'client TEXT');
   ensureColumn(db, 'subagent_runs', 'files_json', 'files_json TEXT');
   ensureColumn(db, 'subagent_runs', 'agent_id', 'agent_id TEXT');
+  ensureColumn(db, 'subagent_runs', 'session_id', 'session_id TEXT');
+  ensureColumn(db, 'subagent_runs', 'call_id', 'call_id TEXT');
+  ensureColumn(db, 'subagent_runs', 'background', 'background INTEGER');
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_subagent_runs_open ON subagent_runs(ended_at, session_id, started_at)'
+  );
   ensureColumn(db, 'task_runs', 'baseline_commit', 'baseline_commit TEXT');
   // Axis 2 (session): old DBs lack these two columns, add them; old rows keep NULL (that is not "no
   // session", it is "nothing was recorded back then")
@@ -937,11 +943,45 @@ function createRepo(db) {
     `),
     insertSubagentRun: db.prepare(`
       INSERT INTO subagent_runs
-        (project_id, parent_task_id, task_id, member_id, name, client, model, title, agent_id, started_at)
+        (project_id, parent_task_id, task_id, member_id, name, client, model, title, agent_id,
+         session_id, call_id, background, started_at)
       VALUES
-        (@projectId, @parentTaskId, @taskId, @memberId, @name, @client, @model, @title, @agentId, @startedAt)
+        (@projectId, @parentTaskId, @taskId, @memberId, @name, @client, @model, @title, @agentId,
+         @sessionId, @callId, @background, @startedAt)
     `),
-    setSubagentRunAgentId: db.prepare(`UPDATE subagent_runs SET agent_id = @agentId WHERE id = @id`),
+    bindSubagentRunIdentity: db.prepare(`
+      UPDATE subagent_runs SET
+        agent_id = COALESCE(@agentId, agent_id),
+        background = COALESCE(@background, background)
+      WHERE id = @id
+    `),
+    /** Open runs with enough identity to reconstruct their in-memory ghosts after a server restart. */
+    listRestorableSubagentRuns: db.prepare(`
+      SELECT * FROM subagent_runs
+       WHERE ended_at IS NULL AND session_id IS NOT NULL
+       ORDER BY started_at, id
+    `),
+    /** Find an ended background child for a later SubagentStop (wake / resume signal). */
+    latestEndedBackgroundSubagentRun: db.prepare(`
+      SELECT * FROM subagent_runs
+       WHERE project_id = @projectId
+         AND client IS @client
+         AND session_id = @sessionId
+         AND agent_id = @agentId
+         AND background = 1
+         AND ended_at IS NOT NULL
+         AND ended_at >= @since
+       ORDER BY ended_at DESC, id DESC
+       LIMIT 1
+    `),
+    getSubagentRun: db.prepare(`SELECT * FROM subagent_runs WHERE id = ?`),
+    reopenSubagentRun: db.prepare(`
+      UPDATE subagent_runs SET
+        ended_at = NULL,
+        duration_ms = NULL,
+        result = NULL
+      WHERE id = @id AND ended_at IS NOT NULL AND background = 1
+    `),
     endSubagentRun: db.prepare(`
       UPDATE subagent_runs SET
         model    = COALESCE(@model, model),

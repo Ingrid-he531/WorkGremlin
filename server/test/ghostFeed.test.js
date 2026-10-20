@@ -209,6 +209,67 @@ console.log('\n[8] 同名常驻小怪物借阅幽灵产出（按名字查，不�
   ok('按名字查到已散场幽灵的产出（成员行已删，靠 subagent_runs 关联）', arts.length >= 1 && arts[0].path === 'workgremlin:summary', JSON.stringify(arts));
 }
 
+console.log('\n[9] 后台 agent 多次 SubagentStop：先收工，再复活，下一次停止再收工');
+{
+  const parent = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '后台续跑', client: 'codebuddy', sessionId: 's-revive' }).taskId;
+  const child = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', name: 'Revive', id: 'rev1', parentTaskId: parent });
+  const sibling = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', name: 'Sibling', id: 'sib1', parentTaskId: parent });
+  bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', id: 'rev1', agentId: 'agent-revive', background: true });
+  bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', id: 'sib1', agentId: 'agent-sibling', background: true });
+  const openRevive = () =>
+    repo.raw.prepare("SELECT COUNT(*) AS c FROM subagent_runs WHERE ended_at IS NULL AND project_id = 'p1' AND session_id = 's-revive'").get().c;
+  const row = () => repo.raw.prepare('SELECT * FROM subagent_runs WHERE id = ?').get(child.runId);
+
+  ok('后台身份与调用、会话一起落库', row().agent_id === 'agent-revive' && row().call_id === 'rev1' && row().session_id === 's-revive' && row().background === 1);
+  ok('第一次停止只收目标子代理', bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', agentId: 'agent-revive', result: '第一阶段' }) && openRevive() === 1);
+  ok('第二次停止把已结束的后台 run 复活', bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', agentId: 'agent-revive' }) && openRevive() === 2 && !row().ended_at);
+  ok('复活的是原 run，不新增台账', repo.raw.prepare("SELECT COUNT(*) AS c FROM subagent_runs WHERE name = 'Revive'").get().c === 1);
+  ok('第三次停止再次收工，兄弟不受影响', bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', agentId: 'agent-revive' }) && openRevive() === 1 && !!sibling.runId);
+  ok('未知后台身份不会复活', !bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', agentId: 'agent-unknown' }));
+
+  const normal = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', name: 'Foreground', id: 'fg1', parentTaskId: parent });
+  bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', id: 'fg1', agentId: 'agent-foreground', background: false });
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', agentId: 'agent-foreground' });
+  ok(
+    '非后台 run 不会因迟到停止复活',
+    !bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', agentId: 'agent-foreground' }) &&
+      !!repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(normal.runId).ended_at
+  );
+
+  const cancelParent = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '取消后台子代理', client: 'codebuddy', sessionId: 's-cancel' }).taskId;
+  const cancelled = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-cancel', name: 'Cancelled', id: 'cancel1', parentTaskId: cancelParent });
+  bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-cancel', id: 'cancel1', agentId: 'agent-cancelled', background: true });
+  bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: cancelParent, state: 'cancelled' });
+  bus.gcGhosts();
+  ok(
+    '父任务取消时后台幽灵立即回收',
+    !!repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(cancelled.runId).ended_at && !member('subagent-Cancelled')
+  );
+  ok(
+    '取消后的迟到停止不会复活幽灵',
+    !bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-cancel', agentId: 'agent-cancelled' }) &&
+      !!repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(cancelled.runId).ended_at
+  );
+  bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', all: true });
+}
+
+console.log('\n[10] 重启恢复：从打开的台账重建幽灵，不重复开 run');
+{
+  const parent = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '重启仍存活', client: 'codebuddy', sessionId: 's-restart' }).taskId;
+  const child = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-restart', name: 'Restart', id: 'rest1', parentTaskId: parent });
+  bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-restart', id: 'rest1', agentId: 'agent-restart', background: true });
+  bus.removeMember({ project: 'p1', memberId: child.memberId });
+
+  const restarted = createIngestBus({ repo, hub: { broadcast() {} }, projectName: 'p1', project: 'p1' });
+  const restored = restarted.restoreGhosts();
+  const restoredRun = repo.raw.prepare('SELECT * FROM subagent_runs WHERE id = ?').get(child.runId);
+  const restoredTask = repo.getTask.get(restoredRun.task_id);
+  ok('新 bus 从打开台账恢复幽灵', restored >= 1 && !!member('subagent-Restart'));
+  ok('恢复复用原 run 与 task', !restoredRun.ended_at && restoredTask && restoredTask.state === 'running' && restoredTask.id === restoredRun.task_id);
+  ok('恢复不重复记台账', repo.raw.prepare("SELECT COUNT(*) AS c FROM subagent_runs WHERE agent_id = 'agent-restart'").get().c === 1);
+  ok('恢复后仍可按精确 agentId 收工', restarted.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-restart', agentId: 'agent-restart' }) && !!repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(child.runId).ended_at);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 close();
 fs.rmSync(TMP, { recursive: true, force: true });

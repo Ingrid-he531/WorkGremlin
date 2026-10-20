@@ -258,6 +258,9 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
   model          TEXT,
   title          TEXT,                    -- Its task for this job
   agent_id       TEXT,                    -- Product-reported child identity (Claude/Codex agent_id)
+  session_id     TEXT,                    -- Session scope used to restore and revive a ghost
+  call_id        TEXT,                    -- Per-call identity that opened the ghost (tool_use_id / call id)
+  background     INTEGER,                 -- 1 = asynchronous child that may outlive its parent turn
   result         TEXT,                    -- Closing summary (output)
   files_json     TEXT,                    -- Files changed this turn (JSON array of {path,added,removed}, at most 10 entries)
   started_at     INTEGER,

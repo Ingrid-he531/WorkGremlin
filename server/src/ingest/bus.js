@@ -933,6 +933,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       model: normModel(p.model),
       title: normText(p.title, 200),
       agentId: normText(p.agentId, 200) || null,
+      sessionId: normSession(p.sessionId),
+      callId: normText(p.callId, 200) || null,
+      background: p.background === undefined ? null : p.background ? 1 : 0,
       // If no task row was given at summon time, the start moment is "unknown" -- leave NULL (elapsed time can't be computed either), never filled with "now" as a stand-in
       startedAt: p.startedAt === null ? null : Number(p.startedAt) || now(),
     });
@@ -984,6 +987,108 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         /* ignore */
       }
     }
+  }
+
+  /** Restore the display/member name from the persisted full member id. */
+  function ghostMemberNameOfRun(row) {
+    const memberId = String(row.member_id || '');
+    const at = memberId.lastIndexOf('@');
+    if (at > 0) return memberId.slice(0, at);
+    const name = normText(row.name, 64) || 'subagent';
+    return `subagent-${name}-${row.id}`;
+  }
+
+  function markGhostActive(project, name) {
+    if (ghostRoster && project === context.project && typeof ghostRoster.isDefined === 'function' && ghostRoster.isDefined(name)) {
+      try {
+        ghostRoster.markActive(name);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /**
+   * Rebuild one in-memory ghost from its persisted run without inserting a second ledger row.
+   * The original task is reused when possible; a finished or missing task is reopened under the
+   * same id, preserving its original started_at through repo.insertTask's conflict update.
+   */
+  function attachPersistedGhost(row, at = null) {
+    if (!row) return null;
+    const project = projectIdOf(row.project_id);
+    const client = normClient(row.client);
+    const sessionId = normSession(row.session_id);
+    if (!sessionId) return null;
+    const name = normText(row.name, 64) || 'subagent';
+    const callId = normText(row.call_id, 200) || '';
+    const key = ghostKey(project, client, sessionId, callId || name);
+    const existing = ghosts.get(key);
+    if (existing && !existing.endedAt) return existing.runId === Number(row.id) ? existing : null;
+
+    const memberName = ghostMemberNameOfRun(row);
+    const memberId = memberIdOf(project, memberName);
+    const projectRow = repo.getProject.get(project);
+    registerMember({
+      project,
+      memberId: memberName,
+      name,
+      role: 'subagent',
+      sessionId,
+      ephemeral: true,
+      workspacePath: projectRow ? projectRow.workspace_path || '' : '',
+      client,
+    });
+
+    let taskId = normTaskId(row.task_id);
+    const task = taskId ? repo.getTask.get(taskId) : null;
+    if (!task || task.state !== 'running' || task.ended_at) {
+      const taskRes = startTask({
+        project,
+        memberId: memberName,
+        taskId: taskId || undefined,
+        title: row.title || '',
+        parentTaskId: row.parent_task_id ?? null,
+        ts: Number(row.started_at) || now(),
+      });
+      taskId = taskRes && taskRes.taskId ? taskRes.taskId : taskId;
+    }
+
+    const rec = {
+      key,
+      project,
+      memberId,
+      memberName,
+      name,
+      client,
+      sessionId,
+      id: callId,
+      agentId: String(row.agent_id || ''),
+      background: Boolean(row.background),
+      taskId,
+      runId: Number(row.id),
+      parentTaskId: row.parent_task_id || null,
+      endedAt: 0,
+      at: Number(at) || Number(row.started_at) || now(),
+    };
+    ghosts.set(key, rec);
+    heartbeat({ project, memberId: memberName, state: 'busy', taskId, progress: null, files: [] });
+    markGhostActive(project, name);
+    return rec;
+  }
+
+  /**
+   * Rehydrate open ghosts after a server restart. Only runs with the identity columns added for
+   * restart recovery are eligible; historical rows without a session remain untouched.
+   * @returns {number} how many ghosts were restored
+   */
+  function restoreGhosts() {
+    let restored = 0;
+    for (const row of repo.listRestorableSubagentRuns.all()) {
+      const before = ghosts.size;
+      attachPersistedGhost(row, Number(row.started_at) || now());
+      if (ghosts.size > before) restored += 1;
+    }
+    return restored;
   }
 
   /**
@@ -1088,6 +1193,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       parentTaskId,
       taskId,
       agentId: p.agentId,
+      sessionId,
+      callId: p.id || null,
+      background: p.background,
       startedAt: Number.isFinite(Number(p.startedAt)) ? Number(p.startedAt) : now(),
     });
     ghosts.set(key, {
@@ -1108,13 +1216,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       at: now(),
     });
     heartbeat({ project, memberId: memberName, state: 'busy', progress: null, files: [] });
-    if (ghostRoster && project === context.project && typeof ghostRoster.isDefined === 'function' && ghostRoster.isDefined(name)) {
-      try {
-        ghostRoster.markActive(name);
-      } catch {
-        /* ignore */
-      }
-    }
+    markGhostActive(project, name);
     return { memberId, runId };
   }
 
@@ -1140,10 +1242,41 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!rec) return false;
     if (agentId) {
       rec.agentId = agentId;
-      if (rec.runId) repo.setSubagentRunAgentId.run({ id: rec.runId, agentId });
     }
     if (p.background !== undefined) rec.background = Boolean(p.background);
+    if (rec.runId) {
+      repo.bindSubagentRunIdentity.run({
+        id: rec.runId,
+        agentId: agentId || null,
+        background: p.background === undefined ? null : rec.background ? 1 : 0,
+      });
+    }
     return true;
+  }
+
+  /** A later stop for the same background agent means it was woken and finished another phase. */
+  function reviveRetiredGhost(p, project, client, sessionId) {
+    const agentId = normText(p.agentId, 200);
+    if (!agentId || !client || !sessionId) return false;
+    const row = repo.latestEndedBackgroundSubagentRun.get({
+      projectId: project,
+      client,
+      sessionId,
+      agentId,
+      since: now() - GHOST_BACKGROUND_ORPHAN_MS,
+    });
+    if (!row) return false;
+    if (row.parent_task_id) {
+      const parent = repo.getTask.get(row.parent_task_id);
+      if (parent && (parent.state === 'cancelled' || parent.state === 'failed')) return false;
+    }
+    const changed = repo.reopenSubagentRun.run({ id: row.id }).changes;
+    if (!changed) return false;
+    const fresh = repo.getSubagentRun.get(row.id);
+    const rec = attachPersistedGhost(fresh, now());
+    if (rec) return true;
+    endSubagentRun({ id: row.id, project, endedAt: now() });
+    return false;
   }
 
   /**
@@ -1154,8 +1287,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    */
   function ghostRetire(p) {
     const project = projectIdOf(p.project);
-    const rec = pickGhost(project, normClient(p.client), normSession(p.sessionId), p.name, p.id, p.agentId);
-    if (!rec) return false;
+    const client = normClient(p.client);
+    const sessionId = normSession(p.sessionId);
+    const rec = pickGhost(project, client, sessionId, p.name, p.id, p.agentId);
+    if (!rec) return reviveRetiredGhost(p, project, client, sessionId);
     closeGhost(rec, { result: p.result, model: p.model, files: p.files });
     ghosts.delete(rec.key);
     removeGhostMemberIfUnused(rec);
@@ -1712,6 +1847,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     ghostBindIdentity,
     ghostRetire,
     ghostSweep,
+    restoreGhosts,
     isGhostAlive,
     gcGhosts,
     setGhostRoster,

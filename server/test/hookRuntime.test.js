@@ -166,7 +166,11 @@ const bus = {
   ok('无身份 SubagentStop 不收工', !calls.some((c) => c[0] === 'ghostRetire'), JSON.stringify(calls));
   calls.length = 0;
   await d.dispatch(ev2('SubagentStop', { agent_id: 'child-unknown', last_assistant_message: '身份不匹配' }), ctx);
-  ok('未知身份 SubagentStop 不收工', !calls.some((c) => c[0] === 'ghostRetire'), JSON.stringify(calls));
+  ok(
+    '未知身份 SubagentStop 只把精确 agentId 交给 bus 判定',
+    calls.some((c) => c[0] === 'ghostRetire' && c[1].agentId === 'child-unknown' && !c[1].id),
+    JSON.stringify(calls)
+  );
 
   calls.length = 0;
   await d.dispatch(ev2('Stop', { last_assistant_message: '父任务正常完成' }), ctx);
@@ -181,7 +185,16 @@ const bus = {
   await d.dispatch(ev2('SubagentStop', { agent_id: 'child-async', last_assistant_message: '子代理完成' }), ctx);
   ok(
     '已知身份 SubagentStop 在父任务结束后仍精确收工',
-    calls.some((c) => c[0] === 'ghostRetire' && c[1].id === 'call_async') && (d.sessionGet('s2').subagents || []).length === 0,
+    calls.some((c) => c[0] === 'ghostRetire' && c[1].id === 'call_async' && c[1].agentId === 'child-async') &&
+      (d.sessionGet('s2').subagents || []).length === 0,
+    JSON.stringify(calls)
+  );
+
+  calls.length = 0;
+  await d.dispatch(ev2('SubagentStop', { agent_id: 'child-async', last_assistant_message: '子代理再次完成' }), ctx);
+  ok(
+    '台账移除后，同一 agentId 的再次停止仍转发给 bus 复活判定',
+    calls.some((c) => c[0] === 'ghostRetire' && c[1].agentId === 'child-async' && !c[1].id),
     JSON.stringify(calls)
   );
 

@@ -222,6 +222,28 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
     openClaude() === 1 && endedA && endedA.result === 'A 查完了',
     JSON.stringify(afterA.map((r) => ({ agent_id: r.agent_id, ended_at: r.ended_at, result: r.result })))
   );
+  await runClaude('SubagentStop', {
+    agent_id: CLAUDE_AGENT_A,
+    agent_type: 'ClaudeGuide',
+    last_assistant_message: 'A 被唤醒后继续',
+  });
+  const reopenedA = claudeRuns().find((r) => r.agent_id === CLAUDE_AGENT_A);
+  ok(
+    '同一 agentId 的再次停止复活已收工的后台子代理',
+    openClaude() === 2 && reopenedA && !reopenedA.ended_at,
+    JSON.stringify(claudeRuns().map((r) => ({ agent_id: r.agent_id, ended_at: r.ended_at, result: r.result })))
+  );
+  await runClaude('SubagentStop', {
+    agent_id: CLAUDE_AGENT_A,
+    agent_type: 'ClaudeGuide',
+    last_assistant_message: 'A 最终完成',
+  });
+  const finalA = claudeRuns().filter((r) => r.agent_id === CLAUDE_AGENT_A);
+  ok(
+    '复活后再次停止收工，且始终复用同一台账行',
+    openClaude() === 1 && finalA.length === 1 && finalA[0].ended_at && finalA[0].result === 'A 最终完成',
+    JSON.stringify(finalA.map((r) => ({ id: r.id, ended_at: r.ended_at, result: r.result })))
+  );
   await runClaude('Stop', { last_assistant_message: '主任务先完成' });
   ok('父任务正常完成不会收掉后台幽灵', openClaude() === 1, String(openClaude()));
   await runClaude('SubagentStop', {

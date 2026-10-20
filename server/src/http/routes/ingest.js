@@ -116,7 +116,16 @@ function createIngestRouter({ bus, repo }) {
       return { ok: true, action: 'spawn' };
     }
     if (action === 'finish') {
-      retireGhost(bus, b.project, String(b.name || ''), String(b.id || ''), String(b.result || ''), client, session);
+      retireGhost(
+        bus,
+        b.project,
+        String(b.name || ''),
+        String(b.id || ''),
+        String(b.result || ''),
+        client,
+        session,
+        String(b.agentId || b.agent_id || '')
+      );
       return { ok: true, action: 'finish' };
     }
     if (action === 'sweep') {
