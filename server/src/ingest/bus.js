@@ -1374,9 +1374,6 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
             const endAt = Number(task.ended_at) || 0;
             const endedAfterSpawn = !endAt || endAt >= Number(rec.at || 0);
             if (endedAfterSpawn && !rec.background) drop = true;
-            if (endedAfterSpawn && rec.background && (task.state === 'cancelled' || task.state === 'failed')) {
-              drop = true;
-            }
           }
         }
       }

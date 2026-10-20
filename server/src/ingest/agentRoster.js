@@ -129,7 +129,17 @@ function createAgentRoster(opts) {
       // The floor already knows the level; pass it so bus does not re-scan the disk by name.
       level: a.level,
     });
-    heartbeat(project, name, act);
+    // Ghosts can be restored before the poller has scanned the floor's agent definitions. Once that
+    // definition appears, mirror the already-live ghost instead of immediately heartbeating the
+    // workstation back to online.
+    let ghostAlive = false;
+    try {
+      ghostAlive = typeof bus.isGhostAlive === 'function' && bus.isGhostAlive({ project, name });
+    } catch {
+      ghostAlive = false;
+    }
+    if (ghostAlive) markActive(name);
+    else heartbeat(project, name, act);
   }
 
   /**

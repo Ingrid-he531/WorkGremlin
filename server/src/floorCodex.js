@@ -146,6 +146,17 @@ function codexForm(transcriptPath) {
   return '';
 }
 
+/**
+ * Codex `spawn_agent` is detached from the spawning turn. Mirror that lifecycle on SubagentStart
+ * so a parent Stop/Interrupt does not sweep the child while it is still running.
+ */
+function codexLaunchOf(ev) {
+  if (!ev || ev.hook_event_name !== 'SubagentStart') return null;
+  const agentId = String(ev.agent_id || ev.agentId || '').trim();
+  if (!agentId) return null;
+  return { agentId, background: true };
+}
+
 /** Codex differs only in how it reads its on-disk data: event gating and the common
  * file/token/ghost logic all live in hookCommon.runHookEvent */
 const codexImpl = {
@@ -153,6 +164,7 @@ const codexImpl = {
   hasPermissionEvent: true, // Codex has its own dedicated PermissionRequest event
   awaitingPermission: () => true, // any non-idle Notification counts as "awaiting permission" (idle is already handled earlier)
   hasSubagentStart: true, // Codex emits SubagentStart / SubagentStop
+  subagentLaunchOf: codexLaunchOf,
   repliesOf: jsonlReplies,
   interruptedSince: (tp, since) => turnInterrupted(tp, since),
   formOf: (tp) => codexForm(tp),

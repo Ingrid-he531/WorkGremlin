@@ -153,7 +153,7 @@ console.log('\n[6] gcGhosts：父任务还在跑时，孤儿 TTL 不得把还在
   }
 }
 
-console.log('\n[6a] 后台幽灵：父任务正常完成后仍保留，取消/失败时才回收');
+console.log('\n[6a] 后台幽灵：父任务完成或取消后仍保留，接收真实结束信号时回收');
 {
   const clock = require('../src/clock');
   let fake = 2_000_000;
@@ -171,7 +171,12 @@ console.log('\n[6a] 后台幽灵：父任务正常完成后仍保留，取消/�
     bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-bg-cancel', name: 'CancelledChild', id: 'bg2', parentTaskId: cancelMain });
     bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-bg-cancel', id: 'bg2', agentId: 'agent-bg-cancel', background: true });
     bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: cancelMain, state: 'cancelled' });
-    ok('父任务取消后 GC 回收后台幽灵', bus.gcGhosts() >= 1 && !member('subagent-CancelledChild'));
+    ok('父任务取消后 GC 仍保留后台幽灵', bus.gcGhosts() === 0 && !!member('subagent-CancelledChild'));
+    ok(
+      '后台幽灵由精确结束信号回收',
+      bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-bg-cancel', agentId: 'agent-bg-cancel', result: '完成' }) &&
+        !member('subagent-CancelledChild')
+    );
     bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's-bg', all: true });
   } finally {
     clock.__resetClock();
@@ -241,13 +246,14 @@ console.log('\n[9] 后台 agent 多次 SubagentStop：先收工，再复活，�
   bus.ghostBindIdentity({ project: 'p1', client: 'codebuddy', sessionId: 's-cancel', id: 'cancel1', agentId: 'agent-cancelled', background: true });
   bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: cancelParent, state: 'cancelled' });
   bus.gcGhosts();
+  bus.gcGhosts();
   ok(
-    '父任务取消时后台幽灵立即回收',
-    !!repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(cancelled.runId).ended_at && !member('subagent-Cancelled')
+    '父任务取消后后台幽灵仍存活',
+    !repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(cancelled.runId).ended_at && !!member('subagent-Cancelled')
   );
   ok(
-    '取消后的迟到停止不会复活幽灵',
-    !bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-cancel', agentId: 'agent-cancelled' }) &&
+    '取消父任务后仍可由精确停止收工',
+    bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-cancel', agentId: 'agent-cancelled' }) &&
       !!repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(cancelled.runId).ended_at
   );
   bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's-revive', all: true });

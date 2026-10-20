@@ -700,7 +700,7 @@ function resultOfResponse(ev) {
  * @param {any} bus
  * @param {string} project project id
  */
-function addGhost(bus, project, workspacePath, name, task, id, parent, model, client, session = '') {
+function addGhost(bus, project, workspacePath, name, task, id, parent, model, client, session = '', identity = {}) {
   if (!bus || typeof bus.ghostSpawn !== 'function') return null;
   return bus.ghostSpawn({
     project,
@@ -712,6 +712,8 @@ function addGhost(bus, project, workspacePath, name, task, id, parent, model, cl
     id,
     parentTaskId: parent,
     model,
+    agentId: identity.agentId,
+    background: identity.background,
   });
 }
 
@@ -1037,7 +1039,9 @@ async function runHookEvent(ev, ctx, floorImpl) {
     }
     const replies0 = impl.repliesOf(tp());
     await reportReplies(ctx, memberId, taskId0, replies0, sessionId, client);
-    sweepGhosts(bus, stableProject, client, { all: true }, sessionId, st0);
+    // A parent turn may end while a detached background child keeps working. Only explicit
+    // session teardown may sweep those children.
+    sweepGhosts(bus, stableProject, client, {}, sessionId, st0);
     const files0 = collectRoundFiles(st0, ev0, cwd, startedAt0, workspacePath);
     const last0 = replies0.length ? replies0[replies0.length - 1].text : '';
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -1319,13 +1323,29 @@ async function runHookEvent(ev, ctx, floorImpl) {
   if (event === 'SubagentStart' && impl.hasSubagentStart) {
     const st = get();
     const pend = st.pendingSpawn && Date.now() - Number(st.pendingSpawn.at || 0) < PENDING_SPAWN_MS ? st.pendingSpawn : null;
+    const launch = typeof impl.subagentLaunchOf === 'function' ? impl.subagentLaunchOf(ev) : null;
     const type = String(ev.agent_type || '').trim();
     const name = (type && type !== 'default' ? type : '') || (pend && pend.name) || 'subagent';
-    const id = agentIdOf(ev) || subagentKeys(ev, name, (pend && pend.task) || '')[0] || '';
+    const agentId = String((launch && launch.agentId) || agentIdOf(ev) || '').trim();
+    const id = agentId || subagentKeys(ev, name, (pend && pend.task) || '')[0] || '';
     const ledger = ((st.subagents) || []).slice(-8);
-    if (id && !ledger.some((r) => r.id === id)) ledger.push({ id, name, at: Date.now() });
+    if (id && !ledger.some((r) => r.id === id)) {
+      ledger.push({ id, name, at: Date.now(), agentId, background: Boolean(launch && launch.background) });
+    }
     set({ subagents: ledger, pendingSpawn: null });
-    addGhost(bus, stableProject, stableWs, name, (pend && pend.task) || '', id, String(st.taskId || ''), String(ev.model || ''), client, sessionId);
+    addGhost(
+      bus,
+      stableProject,
+      stableWs,
+      name,
+      (pend && pend.task) || '',
+      id,
+      String(st.taskId || ''),
+      String(ev.model || ''),
+      client,
+      sessionId,
+      { agentId, background: launch ? launch.background : undefined }
+    );
     await beat();
     return { ok: true, handled: event };
   }
@@ -1367,7 +1387,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const roundFileDetails = collectRoundFiles(st, ev, cwd, startedAt, workspacePath);
     const justCancelled = prevCancelledDone && !taskId;
     const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
-    sweepGhosts(bus, stableProject, client, { all: cancelledRound }, sessionId, get());
+    sweepGhosts(bus, stableProject, client, {}, sessionId, get());
     if (taskId) {
       const form = formOf() || st.form || '';
       const transcriptPath = tp();

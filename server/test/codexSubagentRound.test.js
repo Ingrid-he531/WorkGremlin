@@ -106,6 +106,11 @@ function ev(name, extra = {}) {
   await d.dispatch(ev('SubagentStart', { agent_id: SUB_AGENT, agent_type: 'software-architect', transcript_path: SUB_TP }), ctx);
   ok('召唤后有一条活着的幽灵', openGhosts().length === 1, JSON.stringify(ghostRows()));
   ok('幽灵挂在主任务下', openGhosts()[0] && openGhosts()[0].parent_task_id === mainTask.id, JSON.stringify(openGhosts()[0]));
+  ok(
+    'Codex SubagentStart 记录子线程身份并标记为后台',
+    openGhosts()[0] && openGhosts()[0].agent_id === SUB_AGENT && openGhosts()[0].background === 1,
+    JSON.stringify(openGhosts()[0])
+  );
   ok('子代理的 transcript 没顶掉主轮的', state().transcriptPath === MAIN_TP, String(state().transcriptPath));
 
   await sleep(10);
@@ -158,6 +163,39 @@ function ev(name, extra = {}) {
   ok('主 Stop 把任务收成 done', done && done.state === 'done', JSON.stringify(done));
   ok('不是 cancelled', done && done.state !== 'cancelled', String(done && done.state));
   ok('全程只有一条顶层任务', topTasks().length === 1 && taskRuns().length === 1, JSON.stringify(taskRuns()));
+
+  // [6] A detached Codex child can outlive the parent turn. Interrupting that turn must cancel the
+  // parent task without sweeping the still-running background ghost.
+  const interruptSession = 'sess-codex-interrupt';
+  const interruptEv = (name, extra = {}) => ev(name, { session_id: interruptSession, ...extra });
+  await d.dispatch(interruptEv('UserPromptSubmit', { prompt: '后台跑完再回来', model: 'gpt-5', transcript_path: MAIN_TP }), ctx);
+  const interruptParent = tasks().find((t) => t.state === 'running' && t.parent_task_id == null);
+  await sleep(10);
+  await d.dispatch(
+    interruptEv('PreToolUse', {
+      tool_name: 'spawn_agent',
+      tool_input: { subagent_type: 'peter', prompt: '审查这个改动' },
+      tool_use_id: 'call-spawn-interrupt',
+    }),
+    ctx
+  );
+  await d.dispatch(interruptEv('SubagentStart', { agent_id: 'sub-thread-interrupt', agent_type: 'peter', transcript_path: SUB_TP }), ctx);
+  await d.dispatch(interruptEv('Interrupt'), ctx);
+
+  const cancelledParent = repo.getTask.get(interruptParent.id);
+  const interruptGhost = repo.raw.prepare("SELECT * FROM subagent_runs WHERE session_id = ? AND ended_at IS NULL").get(interruptSession);
+  ok('父轮 Interrupt 把父任务收成 cancelled', cancelledParent && cancelledParent.state === 'cancelled', JSON.stringify(cancelledParent));
+  ok('后台幽灵在父轮被打断后仍活着', Boolean(interruptGhost) && interruptGhost.background === 1, JSON.stringify(interruptGhost));
+  ok(
+    '后台子任务仍在 running',
+    interruptGhost && repo.getTask.get(interruptGhost.task_id) && repo.getTask.get(interruptGhost.task_id).state === 'running',
+    JSON.stringify(interruptGhost && repo.getTask.get(interruptGhost.task_id))
+  );
+  bus.gcGhosts();
+  ok('GC 不会因父任务取消而提前收掉后台幽灵', Boolean(repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(interruptGhost.id).ended_at === null));
+
+  await d.dispatch(interruptEv('SubagentStop', { agent_id: 'sub-thread-interrupt', agent_type: 'peter', last_assistant_message: '审查完成' }), ctx);
+  ok('最终 SubagentStop 正常收掉后台幽灵', Boolean(repo.raw.prepare('SELECT ended_at FROM subagent_runs WHERE id = ?').get(interruptGhost.id).ended_at));
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   close();

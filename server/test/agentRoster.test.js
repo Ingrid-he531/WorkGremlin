@@ -101,6 +101,25 @@ ok('markActive 后 isDefined 仍为真（只是不再心跳）', roster.isDefine
 roster.markIdle('leo');
 ok('markIdle 后仍定义', roster.isDefined('leo'));
 
+console.log('\n[3a] 重启恢复顺序：幽灵先恢复、agent 定义后注册时仍显示忙碌');
+{
+  const lateFloor = { meta: { id: 'restart-test', agent: 'codebuddy' } };
+  const lateId = 'late@p1';
+  const lateState = () => (repo.getStatus.get(lateId) || {}).state;
+  bus.setGhostRoster(roster);
+  const spawned = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-late', name: 'late', task: '重启后继续', id: 'late-1' });
+  ok('幽灵恢复时同名 agent 还未定义', !roster.isDefined('late') && lateState() == null, String(lateState()));
+  roster.registerAgent(lateFloor, { name: 'late', level: 'project', client: 'codebuddy' });
+  ok('agent 定义出现后立即镜像活幽灵为忙碌', lateState() === 'busy', String(lateState()));
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-late', name: 'late', id: 'late-1', result: '完成' });
+  ok(
+    '幽灵结束后工位回到在线',
+    lateState() === 'online' && !bus.isGhostAlive({ project: 'p1', name: 'late' }),
+    `${String(lateState())} / ${String(bus.isGhostAlive({ project: 'p1', name: 'late' }))} / ${String(roster.isDefined('late'))}`
+  );
+  ok('晚注册的幽灵仍复用原 run', spawned && spawned.runId > 0);
+}
+
 console.log('\n[4] 召唤 → 工位忙碌；收工 → 回到在线（回归：被召唤的小怪物状态仍是空闲）');
 {
   // The ghost is the one doing the work, but the resident workstation must mirror its state
