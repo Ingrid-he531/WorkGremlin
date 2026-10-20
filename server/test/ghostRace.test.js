@@ -98,6 +98,41 @@ const member = (name) => repo.raw.prepare('SELECT * FROM members WHERE project_i
   const openAfter = repo.raw.prepare('SELECT COUNT(*) AS c FROM subagent_runs WHERE ended_at IS NULL').get().c;
   ok('并发收工把三只都收掉了', openAfter === openBefore - 3, `${openBefore} → ${openAfter}`);
 
+  // [3b] A finish event that names an instance but matches no ledger row must retire nothing.
+  // Measured 2026-10-20 (4F Claude Code): the ghost is keyed by tool_use_id, while SubagentStop
+  // carries only agent_id — the two never match, and resolving it by guessing `arr[0]` retired the
+  // *other*, still-running summon and wrote this event's result onto its run.
+  const IA = 'call_00_aaa';
+  const IB = 'call_00_bbb';
+  const spawnSame = (inst, prompt) =>
+    runHook('PreToolUse', { tool_name: 'Agent', tool_use_id: inst, tool_input: { subagent_type: 'SameName', prompt } });
+  const openSame = () =>
+    repo.raw.prepare("SELECT COUNT(*) AS c FROM subagent_runs WHERE ended_at IS NULL AND name = 'SameName'").get().c;
+  const endedSame = () =>
+    repo.raw
+      .prepare("SELECT member_id FROM subagent_runs WHERE ended_at IS NOT NULL AND name = 'SameName'")
+      .all()
+      .map((r) => r.member_id);
+  await spawnSame(IA, '同名 A');
+  await spawnSame(IB, '同名 B');
+  ok('两只同名幽灵同时在跑', openSame() === 2, String(openSame()));
+  await runHook('SubagentStop', { agent_id: 'agent-of-B' });
+  ok(
+    'SubagentStop 只带对不上的 agent_id → 一只都不收（不再猜 arr[0]）',
+    openSame() === 2 && endedSame().length === 0,
+    `open=${openSame()} ended=${JSON.stringify(endedSame())}`
+  );
+  await runHook('PostToolUse', {
+    tool_name: 'Agent',
+    tool_use_id: IA,
+    tool_input: { subagent_type: 'SameName', prompt: '同名 A' },
+  });
+  ok(
+    'PostToolUse 按 tool_use_id 精确收掉 A、留下 B',
+    openSame() === 1 && endedSame().length === 1 && endedSame()[0].includes(IA),
+    `open=${openSame()} ended=${JSON.stringify(endedSame())}`
+  );
+
   // [4] fslock primitive: concurrent read-modify-write must not lose an update (the state file still uses it)
   const COUNTER = path.join(TMP, 'counter.json');
   const FLOCK = path.resolve(__dirname, '..', '..', 'shared', 'fslock.js');

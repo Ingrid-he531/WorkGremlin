@@ -639,15 +639,25 @@ function isSubagentEvent(ev) {
   return aid !== sid;
 }
 
+/**
+ * The event's **per-call** ids, in priority order — the ids that name one summoned instance.
+ * The raw half of subagentKeys, factored out so the two cannot drift apart: a caller that needs to
+ * know "did this event name an instance?" must agree with the caller that composes the keys.
+ * @param {any} ev
+ * @returns {string[]}
+ */
+function callIdsOf(ev) {
+  return [ev && ev.tool_use_id, ev && ev.toolUseId, ev && ev.call_id, ev && ev.tool_call_id]
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+}
+
 function subagentKeys(ev, name, task) {
   const out = [];
   const push = (k) => {
     if (k && !out.includes(k)) out.push(k);
   };
-  for (const v of [ev && ev.tool_use_id, ev && ev.toolUseId, ev && ev.call_id, ev && ev.tool_call_id]) {
-    const s = String(v || '').trim();
-    if (s) push(s);
-  }
+  for (const s of callIdsOf(ev)) push(s);
   const mk = (fields) => {
     const parts = fields.map((v) => String(v == null ? '' : v).trim());
     return parts.join('').replace(/\|/g, '') ? `k${fnv1a32(parts.join('|'))}` : '';
@@ -1425,12 +1435,22 @@ function finishGhostServer(bus, project, sessionId, st, ev, floor, set) {
   const task = ti ? agentTask(ti) : '';
   const keys = subagentKeys(ev, nm, task);
   const aid = agentIdOf(ev);
+  const callId = callIdsOf(ev)[0] || '';
   const list = st.subagents || [];
   const pick = (arr) => {
     let r = aid ? arr.find((x) => x.id === aid) : null;
     if (!r && keys.length) r = arr.find((x) => x.id && keys.includes(x.id)) || null;
     if (!r && nm && nm !== 'subagent') r = arr.find((x) => x.name === nm) || null;
-    return r || arr[0] || null;
+    if (r) return r;
+    // `arr[0]` is only for an event that names **no instance at all** (older reporters, tests).
+    // An event that does name one — agent_id, or a per-call tool id — but matches no ledger row
+    // must not be resolved by guessing: with two concurrent same-name summons `arr[0]` is the
+    // *other*, still-running one, so the guess retires the wrong ghost **and** writes this event's
+    // result onto that run. Measured 2026-10-20 on 4F (Claude Code): the ghost is keyed by
+    // tool_use_id while SubagentStop carries only agent_id, so the two never match and every
+    // SubagentStop fell through to `arr[0]`.
+    if (aid || callId) return null;
+    return arr[0] || null;
   };
   const hit = pick(list);
   if (!hit) return;
