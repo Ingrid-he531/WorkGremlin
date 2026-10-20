@@ -73,6 +73,39 @@ function resolveForm(agent, ev) {
   return isPluginClient(legacy) ? legacy : 'cli';
 }
 
+/** The server's subagent-tool list (hookCommon.isSubagentTool); kept in sync by hand */
+const SUBAGENT_TOOL_RE = /^(task|agent|spawn_agent|collaborationspawn_agent)$/i;
+
+/**
+ * Identity fields that decide how a subagent event is attributed, for the event timeline only.
+ *
+ * The hook never branches on these — the server does (hookCommon's isSubagentEvent / subagentKeys).
+ * They are traced because they cannot be recovered after the fact:
+ *   - `agent_id`: whether a floor's subagent events can be told apart from the main round at all.
+ *     The server's `fromSubagent` gate needs `agent_id !== session_id`.
+ *   - `tool_use_id`: whether an end event (SubagentStop / PostToolUse) can be matched back to the
+ *     instance its PreToolUse opened, which is what keeps concurrent same-name summons apart.
+ *   - `has_last_message`: SubagentStop carries the closing summary in `last_assistant_message`;
+ *     whether a given SubagentStop has one tells a real finish apart from a mid-life one.
+ *
+ * Deliberately shallow: `tool_input` is mined only for the subagent tool's type, never dumped
+ * (it carries the whole prompt).
+ */
+function identityOf(ev) {
+  const out = {
+    agent_id: ev.agent_id || ev.agentId || '',
+    tool_use_id: ev.tool_use_id || ev.toolUseId || ev.call_id || ev.tool_call_id || '',
+    has_last_message: ev.last_assistant_message != null,
+  };
+  if (ev.agent_type) out.agent_type = ev.agent_type;
+  if (SUBAGENT_TOOL_RE.test(String(ev.tool_name || ev.tool || ''))) {
+    const input = ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : {};
+    out.subagent_type =
+      input.subagent_type || input.subagent_name || input.task_name || input.name || input.agent || '';
+  }
+  return out;
+}
+
 /** Read all of stdin (with a timeout fallback; never block the agent) */
 function readStdin() {
   return new Promise((resolve) => {
@@ -151,7 +184,15 @@ async function main() {
    * Which client this event's ev.client came from (vscode / null / cli …).
    */
   const form = resolveForm(agent, ev);
-  trace(ev.hook_event_name, { agent: ev.agent || agent, client: ev.client, form, session: ev.session_id, tool: ev.tool_name, notification_type: ev.notification_type });
+  trace(ev.hook_event_name, {
+    agent: ev.agent || agent,
+    client: ev.client,
+    form,
+    session: ev.session_id,
+    tool: ev.tool_name,
+    notification_type: ev.notification_type,
+    ...identityOf(ev),
+  });
 
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // Pure forwarding: on-disk parsing / session state / ledger / tokens / subagent ghosts all happen on
