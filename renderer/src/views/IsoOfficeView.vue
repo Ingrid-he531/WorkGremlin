@@ -630,6 +630,11 @@ const sceneMembers = computed(() => {
       // the note on the "progress" row in TaskRecordsView), so keeping it would only mislead the next person into wiring it up again.
       // Current task name of a summoned subagent: the main agent hands it to the gremlin via a bubble
       task: m.task && m.task.title ? m.task.title : '',
+      // Stable identity for replay suppression across floor switches; title is only a legacy fallback.
+      taskKey: m.task
+        ? String(m.task.id || '') ||
+          (Number(m.task.startedAt) ? `at:${Number(m.task.startedAt)}` : `title:${m.task.title || ''}`)
+        : '',
       // Finish summary: the server delivers the subagent's result as an artifact on the member card
       // (kind is only file/doc/pr/text, so it is stored as kind='text' + a path marker — see bus's
       // GHOST_SUMMARY_PATH); the gremlin says it to the main agent when it finishes (see iso/engine's stepReport).

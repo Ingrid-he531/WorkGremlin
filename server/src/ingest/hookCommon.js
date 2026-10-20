@@ -758,15 +758,15 @@ async function reportReplies(ctx, memberId, taskId, replies, sessionId, floor) {
 /* ============================== form (cli / plugin) detection ============================== */
 
 /**
- * Take the **form** from the form field the event self-reports. form has only two semantics: plugin / non-plugin (cli).
- * Whether it is a plugin is decided solely by `isPluginClient` (currently only vscode, extendable to jetbrains/cursor... in future);
- * the plugin form is kept as is for on-disk distinction, everything else is treated as 'cli' (non-plugin); empty returns null.
- * agent (ev.agent) directly represents the floor, and form only describes the form -- consistent with the hook event's semantics.
+ * Take the event's explicit form when present. Legacy events reported the shell form in
+ * `client`; keep accepting that shape, but agent identity remains `ev.agent`.
  */
 function fixedFormOf(ev) {
-  const c = String((ev && ev.client) || '').toLowerCase();
-  if (!c) return null;
-  return isPluginClient(c) ? c : 'cli';
+  const form = String((ev && ev.form) || '').toLowerCase();
+  if (form) return form;
+  const legacy = String((ev && ev.client) || '').toLowerCase();
+  if (!legacy) return null;
+  return isPluginClient(legacy) ? legacy : 'cli';
 }
 
 /* ============================== generic event switch (faithfully ported from hook.js main) ============================== */

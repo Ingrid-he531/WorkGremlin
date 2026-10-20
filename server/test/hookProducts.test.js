@@ -10,6 +10,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { statePath } = require('@workgremlin/shared/paths');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-hook-prod-'));
 // 隔离状态文件：不设 WORKGREMLIN_HOME 的话，hookCommon 会把相位/会话状态写进**真实的**
@@ -126,6 +127,24 @@ const CB_TP = path.join(CB_DIR, 'index.json');
   const stV = calls.find((c) => c[0] === 'startTask');
   ok('Codex + client=vscode 路由仍落到 codex 楼层', !!stV, stV && JSON.stringify(stV[1]));
   ok('Codex + client=vscode 被识别为 vscode（plugin 形态）', stV && stV[1].form === 'vscode', stV && JSON.stringify(stV[1]));
+
+  // New reporters send the shell form separately while keeping client=codex.
+  calls.length = 0;
+  await d.dispatch({
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 's_codex_vsc_form',
+    form: 'vscode',
+    prompt: '再',
+    agent: 'codex',
+    client: 'codex',
+    cwd: TMP,
+    transcript_path: CODEX_TP,
+  }, ctx);
+  const stVForm = calls.find((c) => c[0] === 'startTask');
+  ok('Codex 显式 form=vscode 被识别为 plugin 形态', stVForm && stVForm[1].form === 'vscode', stVForm && JSON.stringify(stVForm[1]));
+  ok('显式 form 不会改写楼层身份', stVForm && stVForm[1].memberId === 'codex', stVForm && JSON.stringify(stVForm[1]));
+  const vscState = JSON.parse(fs.readFileSync(statePath('codex', TMP, 's_codex_vsc_form'), 'utf8'));
+  ok('会话状态也记录 form=vscode（下拉不再显示 CLI）', vscState.form === 'vscode', vscState.form);
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   fs.rmSync(TMP, { recursive: true, force: true });

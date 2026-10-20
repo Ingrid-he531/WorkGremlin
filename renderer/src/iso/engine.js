@@ -188,13 +188,17 @@ const WALL_TEXT_CACHE = new Map();
  * on switching back it would think "this ghost was never summoned", so a gremlin already sent out to work would run up to the main agent
  * again and replay the "pick up task" dialogue.
  *
- * These states are recorded per ghost memberId and actively cleared when the ghost leaves the roster, so they do not grow forever,
- * nor will they make a brand-new summon be misjudged as "already played".
+ * These states are recorded per ghost memberId. Transient orchestration state is cleared when the ghost leaves
+ * the roster; the dispatched-task ledger survives cross-floor roster changes and uses the task identity to
+ * recognize a genuinely new summon.
  */
 /** Ghost memberIds registered as "summoned" */
 const summonedGhostIds = new Set();
-/** Ghost memberIds that have already played "run up to the main agent to pick up the task": one summon plays it once */
-const dispatchedGhostIds = new Set();
+/**
+ * Ghost memberId -> dispatched task identity. This must survive a floor switch: leaving
+ * the floor hides the ghost from this engine's roster, but it does not start a new summon.
+ */
+const dispatchedGhostTasks = new Map();
 /** Ghost memberIds hidden during orchestration first */
 const pendingGhostIds = new Set();
 /** Pending ghosts "seen at least once" (fallback for waiting on the task name) */
@@ -661,7 +665,7 @@ export function createIsoOffice(canvas, opts = {}) {
     };
   }
 
-  /** Called from Vue: members is [{memberId, name, state, degraded, ghost, project}] */
+  /** Called from Vue: members is [{memberId, name, state, degraded, ghost, project, task, taskKey}] */
   function setMembers(list) {
     members = list || [];
     const seated = members.filter((m) => !m.ghost).slice(0, DESK_UNITS.length);
@@ -706,8 +710,8 @@ export function createIsoOffice(canvas, opts = {}) {
     // Ghost has disappeared -> clear it from the pending / triggered sets, so the next summon can trigger again
     for (const id of [...pendingGhostIds]) if (!gIds.has(id)) pendingGhostIds.delete(id);
     for (const id of [...summonedGhostIds]) if (!gIds.has(id)) summonedGhostIds.delete(id);
-    // Ghost dispersed -> clear this instance's played-has-been ledger too: the next summon is a new instance and can play the orchestration again
-    for (const id of [...dispatchedGhostIds]) if (!gIds.has(id)) dispatchedGhostIds.delete(id);
+    // The dispatched-task ledger intentionally survives roster changes. A floor switch removes
+    // the current floor's ghosts from this roster, but returning must not replay their dispatch.
     for (const id of [...pendingSeenOnce]) if (!gIds.has(id)) pendingSeenOnce.delete(id);
 
     // A summoned ghost vanishing from the roster = this summon is over. If it never reported
@@ -730,29 +734,44 @@ export function createIsoOffice(canvas, opts = {}) {
     }
 
     floating.forEach((m, i) => {
+      const taskKey = String(m.taskKey || '');
       // If a ghost's name equals some seated gremlin's name, this is the instance ghost of "some gremlin was summoned".
       const info = m.ghost ? byName[m.name] : null;
+      const queued = summonQueue.find((s) => s.ghostId === m.memberId);
+      const running = !!(dispatch && dispatch.ghostId === m.memberId);
+      const dispatched = dispatchedGhostTasks.has(m.memberId);
+      const dispatchedKey = dispatchedGhostTasks.get(m.memberId);
+      // A stable task key changing while the ghost still owns the same memberId means an actual
+      // new summon, not a floor switch. Hide the old sprite and play the new pick-up beat.
+      const taskChanged = Boolean(dispatched && dispatchedKey && taskKey && dispatchedKey !== taskKey);
+      if (info && taskChanged && !queued && !running) {
+        pendingGhostIds.add(m.memberId);
+        ghosts = ghosts.filter((g) => g.memberId !== m.memberId);
+      }
       if (info && !summonedGhostIds.has(m.memberId)) {
         // Summoned (including one already running on page refresh): hide this ghost first, then queue the
         // "pick up task in place -> ghost appears" beat.
         summonedGhostIds.add(m.memberId);
-        pendingGhostIds.add(m.memberId);
+        if (!dispatched) pendingGhostIds.add(m.memberId);
       }
       if (info && pendingGhostIds.has(m.memberId)) {
         // The ghost registers first, the task name is written into the member card later: queue only once the task is in, so it does not show as "new task".
-        const queued = summonQueue.find((s) => s.ghostId === m.memberId);
-        const running = !!(dispatch && dispatch.ghostId === m.memberId);
-        if (!queued && !running && !dispatchedGhostIds.has(m.memberId)) {
-          if (m.task) {
+        if (!queued && !running) {
+          if (dispatched && !taskChanged) {
+            // The dispatch already happened in another engine instance (for example after a
+            // route remount). Reveal it without replaying the dialogue.
+            pendingGhostIds.delete(m.memberId);
+          } else if (m.task) {
             summonQueue.push({ agentId: info.agentId, task: m.task, ghostId: m.memberId });
-            dispatchedGhostIds.add(m.memberId);
-          } else if (pendingSeenOnce.has(m.memberId)) {
+            dispatchedGhostTasks.set(m.memberId, taskKey);
+          } else if (pendingSeenOnce.has(m.memberId) && !dispatched) {
             summonQueue.push({ agentId: info.agentId, task: t('bubble.working'), ghostId: m.memberId });
-            dispatchedGhostIds.add(m.memberId);
+            dispatchedGhostTasks.set(m.memberId, taskKey);
           }
         } else if (m.task) {
           if (queued) queued.task = m.task;
           else if (running) dispatch.task = m.task;
+          dispatchedGhostTasks.set(m.memberId, taskKey);
         }
         pendingSeenOnce.add(m.memberId);
       }

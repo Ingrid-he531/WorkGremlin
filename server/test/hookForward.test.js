@@ -74,7 +74,11 @@ async function run() {
 
   await new Promise((resolve) => {
     const child = spawn(process.execPath, [HOOK, '--agent', 'codex'], {
-      env: { ...process.env, WORKGREMLIN_HOME: TMP },
+      env: {
+        ...process.env,
+        WORKGREMLIN_HOME: TMP,
+        CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'codex_vscode',
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.stdin.write(JSON.stringify(ev));
@@ -88,6 +92,7 @@ async function run() {
   ok('转发 body 带 hook_event_name', received && received.hook_event_name === 'UserPromptSubmit');
   ok('转发 body 带 agent', received && received.agent === 'codex');
   ok('转发 body 带 client', received && received.client === 'codex');
+  ok('Codex 扩展进程的 form=vscode 被转发', received && received.form === 'vscode', received && received.form);
   ok('转发 body 带 workspacePath(=cwd)', received && received.workspacePath === '/home/u/proj');
   ok('转发 body 透传 transcript_path', received && received.transcript_path === '/tmp/rollout.jsonl');
   ok('hook 进程退出码为 0', exitCode === 0, `exitCode=${exitCode}`);

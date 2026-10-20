@@ -149,11 +149,12 @@ console.log('\n[2] 任务再快也要汇报：先现身、再汇报，然后才�
   office.setMembers([GREMLIN]);
   advance(office, 12000);
   // Summon the ghost with a task, then it "finishes" right away (result arrives) — a very fast task
-  office.setMembers([GREMLIN, ghostWith()]);
+  const ghost = ghostWith({ memberId: 'subagent-coder-report' });
+  office.setMembers([GREMLIN, ghost]);
   advance(office, 500);
-  office.setMembers([GREMLIN, ghostWith({ result: '登录链路已重构' })]);
+  office.setMembers([GREMLIN, { ...ghost, result: '登录链路已重构' }]);
   advance(office, 4000); // pick-up (3.6s) runs out, ghost appears
-  const g = office.screenOf('subagent-coder');
+  const g = office.screenOf(ghost.memberId);
   ok('收工很早，幽灵仍按节奏现身', Boolean(g));
   // Wait out REPORT_MIN_WORK (1.5s) + REPORT_TALK (3.4s); the report is spoken
   advance(office, 6000);
@@ -168,7 +169,8 @@ console.log('\n[3] 幽灵先被回收：补画的幽灵也要把汇报演完');
   const office = createIsoOffice(fakeCanvas(), {});
   office.setMembers([GREMLIN]);
   advance(office, 12000);
-  office.setMembers([GREMLIN, ghostWith()]);
+  const ghost = ghostWith({ memberId: 'subagent-coder-recycled' });
+  office.setMembers([GREMLIN, ghost]);
   advance(office, 500); // pick-up in progress
   // The ghost vanishes from the roster directly (no result written) — the extreme "very fast task" case
   office.setMembers([GREMLIN]);
@@ -205,6 +207,42 @@ console.log('\n[4] 同一常驻小怪物召唤多只同名幽灵：头顶各自�
   } finally {
     Math.random = realRandom;
   }
+}
+
+console.log('\n[5] 切换楼层再回来：同一个任务不重播派单');
+{
+  clock = 0;
+  drawn.length = 0;
+  const office = createIsoOffice(fakeCanvas(), {});
+  office.setMembers([GREMLIN]);
+  advance(office, 12000);
+  const ghost = ghostWith({ memberId: 'subagent-coder-floor-switch', taskKey: 'task-old' });
+  office.setMembers([GREMLIN, ghost]);
+  advance(office, 5000);
+  ok('首次派单正常播放布置和收到', drawn.includes('写文档') && drawn.includes('收到'));
+
+  // Leaving the floor removes the ghost from this engine's visible roster; it must not erase
+  // the module-level dispatched-task ledger.
+  drawn.length = 0;
+  office.setMembers([]);
+  advance(office, 100);
+  office.setMembers([GREMLIN, ghost]);
+  advance(office, 5000);
+  ok('切回后小幽灵仍在工作', Boolean(office.screenOf(ghost.memberId)));
+  ok('切回后不重播任务布置', !drawn.includes('写文档'), drawn.filter((s) => s === '写文档').length);
+  ok('切回后不重播「收到」', !drawn.includes('收到'), drawn.filter((s) => s === '收到').length);
+  ok('切回后没有残留编排', office.flowPending() === false);
+
+  // The same memberId receiving a different task is a real new summon and must still play.
+  drawn.length = 0;
+  office.setMembers([GREMLIN, ghostWith({
+    memberId: ghost.memberId,
+    task: '写新文档',
+    taskKey: 'task-new',
+  })]);
+  advance(office, 5000);
+  ok('同一小幽灵的新任务仍会播放布置', drawn.includes('写新文档'));
+  ok('同一小幽灵的新任务仍会回复收到', drawn.includes('收到'));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

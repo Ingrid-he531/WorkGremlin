@@ -28,7 +28,7 @@ const path = require('node:path');
 // Only readServerInfo is needed (to find the local server's port / token for the forwarding POST);
 // the route constants are owned by the server.
 const { readServerInfo } = require('./index');
-const { home } = require('@workgremlin/shared');
+const { home, isPluginClient } = require('@workgremlin/shared');
 
 const REQ_TIMEOUT_MS = 2_000;
 const STDIN_TIMEOUT_MS = 1_500;
@@ -49,6 +49,28 @@ function trace(event, extra) {
 function flag(argv, name) {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] || '' : '';
+}
+
+/**
+ * Resolve the shell form from the hook process environment before forwarding.
+ * Codex extension sessions can still write `originator=codex-tui` into the rollout header,
+ * so the server cannot reliably infer the extension form from disk. The hook process is
+ * started by the actual shell and carries the extension override, making it authoritative.
+ */
+function resolveForm(agent, ev) {
+  const base = String(agent || '').split('@')[0].toLowerCase();
+  if (base === 'codex') {
+    const originator = String(process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || '').toLowerCase();
+    if (/vscode|visual studio|extension|plugin/.test(originator)) return 'vscode';
+    if (/desktop/.test(originator)) return 'desktop';
+  }
+  const explicit = String((ev && ev.form) || '').trim().toLowerCase();
+  if (explicit) return explicit;
+  // Older reporters used ev.client as the form. Keep accepting that shape, but never
+  // rewrite the floor identity when ev.client is already the bare agent name.
+  const legacy = String((ev && ev.client) || '').trim().toLowerCase();
+  if (!legacy || legacy === base) return '';
+  return isPluginClient(legacy) ? legacy : 'cli';
 }
 
 /** Read all of stdin (with a timeout fallback; never block the agent) */
@@ -128,13 +150,14 @@ async function main() {
   /**
    * Which client this event's ev.client came from (vscode / null / cli …).
    */
-  trace(ev.hook_event_name, { agent: ev.agent || agent, client:ev.client, session: ev.session_id, tool: ev.tool_name, notification_type: ev.notification_type });
+  const form = resolveForm(agent, ev);
+  trace(ev.hook_event_name, { agent: ev.agent || agent, client: ev.client, form, session: ev.session_id, tool: ev.tool_name, notification_type: ev.notification_type });
 
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : '';
   // Pure forwarding: on-disk parsing / session state / ledger / tokens / subagent ghosts all happen on
   // the server (server/src/ingest/hookCommon.js). Pass agent / form / workspacePath along; the server
   // routes them to the right floor and resolves the project.
-  await request(info, '/api/v1/hook', { ...ev, agent, workspacePath: cwd });
+  await request(info, '/api/v1/hook', { ...ev, ...(form ? { form } : {}), agent, workspacePath: cwd });
 }
 
 main().catch((err) => {
