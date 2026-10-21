@@ -609,6 +609,8 @@ export function createIsoOffice(canvas, opts = {}) {
       prop: propOf(member.memberId),
       work: workOf(member.memberId),
       level: member.level || null,
+      /** Last public state bucket; a transition away from idle interrupts any lounge activity. */
+      stateBucket: bucketOf(member.state),
     };
   }
 
@@ -694,6 +696,15 @@ export function createIsoOffice(canvas, opts = {}) {
       // so on first creation it may not be there yet (would be drawn as a gray plate); later updates must apply, or it stays gray forever.
       a.name = m.name || a.name;
       a.level = m.level || null;
+      const stateBucket = bucketOf(m.state);
+      const becameActive = a.stateBucket === 'idle' && stateBucket !== 'idle';
+      a.stateBucket = stateBucket;
+      // An idle lounge/coffee trip can outlive the state update that made the member busy or blocked.
+      // Interrupt it immediately so a working gremlin does not keep sitting in the pantry.
+      if (becameActive && !a.entering && !a.inMeeting) {
+        a.dwell = 0;
+        goHome(a);
+      }
       seatPos[m.memberId] = DESK_UNITS[i].seat;
       const nm = m.name || String(m.memberId).split('@')[0];
       if (nm) byName[nm] = { seat: DESK_UNITS[i].seat, agentId: m.memberId };

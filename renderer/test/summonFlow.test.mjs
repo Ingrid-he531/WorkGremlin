@@ -274,5 +274,37 @@ console.log('\n[5] 切换楼层再回来：同一个任务不重播派单');
   ok('同一小幽灵的新任务仍会回复收到', drawn.includes('收到'));
 }
 
+console.log('\n[6] 忙碌状态打断空闲活动：从茶水间回到自己的工位');
+{
+  clock = 0;
+  const reference = createIsoOffice(fakeCanvas(), {});
+  reference.setMembers([{ ...GREMLIN, state: 'busy' }]);
+  advance(reference, 16);
+  const home = reference.screenOf(GREMLIN.memberId);
+
+  clock = 0;
+  const office = createIsoOffice(fakeCanvas(), {});
+  const realRandom = Math.random;
+  // The first four values cover agent creation and entry. The following values force the idle
+  // member to choose a pantry chair and keep the chair dwell long enough to expose the bug.
+  const randomValues = [0, 0, 0, 0, 0.99, 0.5, 0.7, 0.7, 0.99];
+  Math.random = () => (randomValues.length ? randomValues.shift() : 0.99);
+  try {
+    office.setMembers([{ ...GREMLIN, state: 'idle' }]);
+    advance(office, 16000);
+    const lounge = office.screenOf(GREMLIN.memberId);
+    const away = home && lounge ? Math.hypot(lounge.x - home.x, lounge.y - home.y) : 0;
+    ok('空闲成员已走到茶水间', away > 50, `距工位 ${away.toFixed(1)}px`);
+
+    office.setMembers([{ ...GREMLIN, state: 'busy' }]);
+    advance(office, 12000);
+    const returned = office.screenOf(GREMLIN.memberId);
+    const distance = home && returned ? Math.hypot(returned.x - home.x, returned.y - home.y) : Infinity;
+    ok('变为忙碌后立即回工位，不再留在茶水间', distance < 3, `距工位 ${distance.toFixed(1)}px`);
+  } finally {
+    Math.random = realRandom;
+  }
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
