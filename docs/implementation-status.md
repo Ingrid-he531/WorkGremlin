@@ -1,659 +1,774 @@
-# WorkGremlin 实现现状（文档对齐记录）
+# WorkGremlin Implementation Status (doc ↔ code alignment record)
 
-| 项 | 内容 |
+| Item | Content |
 | --- | --- |
-| 生成日期 | 2026-09-20 |
-| 对照基准 | 工作区 `HEAD = 27022c9` + 当日未提交改动（见 §9） |
-| 用途 | 记录**代码实际怎么做的**，以及它与 `requirements*.md` / `tech-design.md` / `roadmap.md` / `test-strategy.md` / `runbook.md` 的差异 |
-| 维护约定 | 改代码导致领域模型 / 数据源 / 接口变化时，同步更新本文；需求变更更新 `requirements.md`。**本文只描述已实现的事实，不表达需求倾向，也不代替规格。** |
+| Generated | 2026-10-21 |
+| Baseline | Workspace `HEAD = e2ad323` ("refactor: simplify workstation state to busy idle blocked"), clean tree |
+| State-model baseline | 2026-10-21: the workstation state machine was reduced to **busy / idle / blocked**. The heartbeat, `offline`, task liveness inference, retention windows on state, and the `degraded` flag were removed. See §5 row 22. |
+| Purpose | Record **what the code actually does**, and where it differs from `requirements*.md` / `tech-design.md` / `roadmap.md` / `test-strategy.md` / `runbook.md` |
+| Maintenance | When a change to the domain model / data sources / API lands, update this file. Requirement changes go to `requirements.md`. **This file describes implemented facts only; it expresses no product preference and is not a specification.** |
 
-> 规格以 `docs/requirements.md` 为准。本文负责回答「规格与实现哪里对不上」，逐条登记差异，避免后来者按过时文档去理解代码。
-
----
-
-## 0. 一句话现状
-
-产品定位没变（本地只读的多 agent 协作可视化终端），但**实现形态已经离开 v0.1 设计**：
-
-- 领域模型由 **team** 改为 **工程（project）**（commit `def3fee`）；
-- 界面从「工位视图 + 对话记录两个 Tab」扩展为 **楼层（1F~7F 受监控产品）+ 等距 Canvas 办公室 + 主 Agent 控制台**；
-- 成员来源从「roster（`config.json`）+ A 路线目录监听」改为 **hook 上报 / `.codebuddy/agents` 名册 / `.workgremlin/subagents.json` 清单**三路；
-- 多了一个 **议事厅**：选定几个楼层（一名主持人 / 一名主答 / 若干评审）就一个议题开一场多轮评审，
-  没有投票与阈值；每轮落一个 `RoundResult`，收敛度由服务端按严重度与冲突数机械计算；
-  参与者是服务端拉起的一次性只读进程，跑在临时目录或指定工程目录里，**不进办公室、不进任务记录**（§4.2）；
-- 承诺的 **A 路线（`chokidar`）、消息脱敏、FTS5 查询、双连接存储、TS 迁移、自动化测试** 均未落地
-  （最后一条现在只对**旧**功能成立：`test:*` 已有 69 个脚本 / 69 个测试文件，但都是普通 node 脚本，不是文档里写的 Vitest + Playwright）。
+> The specification is `docs/requirements.md`. This document answers "where do the spec and the implementation disagree", one line per difference, so nobody has to infer current behavior from stale prose.
 
 ---
 
-## 1. 分层与目录职责
+## 0. One-line status
 
-```
-shared/                 协议真源（CJS，零依赖，Node 与浏览器同构）
-  index.js              常量 / 信封 / dedupeKey / 状态与角色配色  ← PROTOCOL_VERSION = 2
-server/                 Express + ws + better-sqlite3，可内嵌 Electron 也可独立启动
-  src/index.js          createServer()：装配 DB / bus / hub / 路由 / 工程管理 / 名册 / 清单
-  src/cli.js            独立启动 + --self-test（建表 → 写入 → 读回 → checkpoint）
-  src/config.js         端口探测（21800-21820）、每次启动随机 token、~/.workgremlin/server.json
-  src/clock.js          时钟抽象（测试契约 7.1）
-  src/db/{schema.sql,index.js}   建表 + 预编译语句 + PRAGMA
-  src/ingest/bus.js     唯一写入口：落库 → 广播 → 组装成员卡 / 首屏快照
-  src/ingest/agentRoster.js      .codebuddy/agents 名册 → 常驻小怪物（坐工位、带工牌）
-  src/ingest/agentLevel.js       用户级 / 项目级判定（工牌颜色）+ 功能描述（agent 定义的 description，静态数据）
-  src/ingest/subagentFeed.js     subagents.json 清单 → 临时成员（头顶幽灵）
-  src/project.js        工程名解析（package.json name > 目录名）
-  src/workspace.js      「打开工程」：切换 + 落盘 workspaces.json + 最近 8 个
-  src/products.js       楼层 = 受监控产品（安装位置 + 落盘目录探测）
-  src/sessions.js       插件结构化落盘解析（genie-history / todos / message-queue / file-changes）
-  src/sessionRegistry.js 全局活跃会话表（60 分钟无事件剔除；2F 的终态会话由 floorCline 当场回收，不等窗口）
-  src/ws/hub.js         WS 连接管理、订阅过滤、广播
-  src/http/routes/*     健康检查 / 查询 / 上报 / 工程 / 会话 / 产品
-desktop/                Electron 主进程（内嵌 server，单实例锁）、preload（受限桥）、window、menu
-renderer/               Vue 3 + Vite + Pinia
-  src/iso/              手写 Canvas 等距办公室引擎（engine 2000+ 行、officeMap、sprites、mainConsole）
-  src/views/            IsoOfficeView（主）/ OfficeSceneView（旧 2D，保留对比）/ Workstation / Conversation / DeskLab
-  src/stores/           project（成员+连接）/ sessions（楼层+会话）/ messages / mainAgent（相位状态机）
-packages/reporter/      agent 侧上报 SDK + CLI + hook（CodeBuddy 插件/CLI、Codex / Claude Code / Qoder CLI）
-scripts/                dev / build / postinstall(electron-rebuild) / install-hooks / subagents
-docs/                   需求、技术方案、排期、测试策略、runbook、楼层电梯设计、本文
-```
+The product positioning is unchanged (a local, read-only visual terminal for multi-agent collaboration), but the implementation has left the v0.1 design:
+
+- The domain unit is a **project**, not a **team** (commit `def3fee`).
+- The UI grew from "workstation view + conversation log, two tabs" into **floors (1F–9F, one per monitored product) + an isometric Canvas office + a main-agent console**.
+- Members come from **hook reporting / the `.codebuddy/agents` roster / the ghost lifecycle / on-disk scanning**, not from a `config.json` roster plus an A-route directory watcher.
+- A **council chamber** exists: pick floors (one moderator, one main answerer, several reviewers), give it one topic, and it runs a multi-round review. There is no vote and no threshold; every round stores one `RoundResult`, and the server computes convergence mechanically from severities and conflicts. Participants are one-off, read-only processes started by the server, running in a temp directory or a supplied project directory; **they never enter the office or the task ledger** (§4.2).
+- The promised **A route (`chokidar`), message redaction, FTS5 query wiring, dual-connection storage, TypeScript migration, and Playwright E2E** are still missing. Automated tests do exist now, but they are **73 plain Node suites**, not the Vitest + Playwright setup the test strategy describes.
+- A workstation has exactly three states: **`busy` / `idle` / `blocked`**. State is derived from running tasks, explicit authorization waits, and borrowed summon busy — **never from a heartbeat, elapsed time, or message silence**.
 
 ---
 
-## 2. 运行时数据流
+## 1. Layering and directory responsibilities
 
 ```
-CodeBuddy 插件/CLI、Codex / Claude Code 的 hook ─┐
-reporter SDK / CLI（workgremlin-report）  ─┤ POST /api/v1/{register,heartbeat,status,task/*,message,file/touch}
-                                          │        │
-.codebuddy/agents/*.md（名册）────────────┤        v
-.workgremlin/subagents.json（清单）───────┤   ingest bus ──> SQLite + WS Hub ──> renderer(Pinia)
-各产品落盘目录（插件/CLI 会话）───────────┘        │
-                                                  └─> buildMemberCard() / buildSnapshot()
+shared/                  protocol source of truth (CJS, zero dependencies, Node + browser isomorphic)
+  index.js               constants / envelope / dedupeKey / state + role colors   ← PROTOCOL_VERSION = 2
+                         AGENT_STATES = ['busy','idle','blocked']; WS_HEARTBEAT_TIMEOUT_MS is transport-only
+  index.d.ts             type declarations
+server/                  Express + ws + better-sqlite3; embeddable in Electron or standalone
+  src/index.js           createServer(): DB / bus / hub / routes / project management / roster
+  src/cli.js             standalone start + --self-test (create tables → write → read back → checkpoint)
+  src/config.js          port probe (21800-21820), random token per start, ~/.workgremlin/server.json
+  src/clock.js           clock abstraction (test contract 7.1)
+  src/db/{schema.sql,index.js}   tables + prepared statements + PRAGMA + migrations
+  src/ingest/bus.js      the single write entry: persist → broadcast → build member card / snapshot
+  src/ingest/agentRoster.js     .codebuddy/agents roster → resident gremlins (seated, with a badge)
+  src/ingest/agentLevel.js      user-level / project-level decision (badge color) + description (static)
+  src/ingest/hookCommon.js      shared hook-event semantics: registration, tasks, file activity,
+                                tool usage, ghost lifecycle, blocked / clear-blocked
+  src/ingest/hookDispatch.js    raw hook event → the owning floor's handleHookEvent
+  src/project.js         project name resolution (package.json name > directory name)
+  src/workspace.js       "open project": switch + persist workspaces.json + recent 8
+  src/products.js        floors = monitored products (install location + on-disk detection)
+  src/floors.js          floor registry + generic session/disk readers + per-floor dispatch
+  src/sessions.js        structured on-disk plugin parsing (genie-history / todos / message-queue /
+                         file-changes) + the reporter phase reader
+  src/sessionRegistry.js global active-session table (sessions with no event for 60 min are dropped)
+  src/ws/hub.js          WS connection management, subscription filters, broadcast
+  src/http/routes/*      health / query / ingest / workspace / floors (products) / sessions / council
+  src/council/*          orchestrator, agents (spawn recipes), parse, convergence, report
+desktop/                 Electron main process (embeds the server, single-instance lock), preload, window, menu
+renderer/                Vue 3 + Vite + Pinia
+  src/iso/               hand-written Canvas isometric office engine (engine, officeMap, sprites, mainConsole)
+  src/views/             IsoOfficeView (main) / OfficeSceneView (old 2D, kept for comparison) / Workstation /
+                         Conversation / DeskLab / TaskRecordsView / CouncilView
+  src/stores/            project (members + connection) / sessions (floors + sessions) / messages / mainAgent
+  src/lib/memberTask.js  the renderer's single state rule (blocked > busy > idle, session-scoped)
+packages/reporter/       agent-side reporting SDK + CLI + hook (CodeBuddy plugin/CLI, Codex / Claude Code /
+                         Qoder CLI) + the OpenCode/Kilo plugin
+scripts/                 dev / build / postinstall(electron-rebuild) / install-hooks
+docs/                    requirements, tech design, roadmap, test strategy, runbook, floor design, this file
 ```
 
-**五条成员/数据来源（全部已实现）**
+The 60-minute window in `sessionRegistry` is **session-list activity**, not a member state and not a liveness signal. A running task is the only task-liveness signal.
 
-| 来源 | 触发 | 产出 | 证据 |
+---
+
+## 2. Runtime data flow
+
+```
+CodeBuddy plugin/CLI, Codex / Claude Code / Qoder hooks ─┐
+reporter SDK / CLI (workgremlin-report) ────────────────┤ POST /api/v1/{register,
+                                                        │   task/start|progress|end|tokens|current,
+                                                        │   message, file/touch, tool/use, ghost, hook}
+.codebuddy/agents/*.md (roster) ────────────────────────┤        │
+product on-disk session stores ─────────────────────────┘        v
+                                                          ingest bus ──> SQLite + WS Hub ──> renderer (Pinia)
+                                                                 │
+                                                                 └─> buildMemberCard() / buildSnapshot()
+```
+
+There is **no** `/api/v1/heartbeat` and **no** `/api/v1/status`. The real ingest surface is listed below.
+
+| Method | Route | Body (abridged) | Effect |
 | --- | --- | --- | --- |
-| hook 上报 | CodeBuddy 系发 `SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Notification / Stop / SessionEnd` | 成员注册、任务、状态、文件改动、心跳守护（15s） | `packages/reporter/src/hook.js` |
-| 常驻名册 | 扫 `<workspace>/.codebuddy/agents/*.md` 与 `~/.codebuddy/agents/*.md` | `role=subagent`、`ephemeral=false` 的坐工位小怪物（15s 心跳） | `server/src/ingest/agentRoster.js` |
-| 临时清单 | 轮询 + `fs.watch` `.workgremlin/subagents.json` | `ephemeral=true` 的头顶幽灵；清单删除即散场 | `server/src/ingest/subagentFeed.js` |
-| 落盘扫描 | 扫各产品数据目录 | 楼层活跃会话、待办、改动文件、相位（`inferred`） | `server/src/products.js`、`server/src/sessions.js` |
-| Codex CLI hook | Codex 原生 hook（`~/.codex/hooks.json`，10 个事件） | 成员注册、任务、状态、相位、文件活动、子代理幽灵 | `packages/reporter/src/hook.js`（`WORKGREMLIN_CLIENT=codex`）、`scripts/install-hooks.js` |
+| POST | `/api/v1/register` | `{memberId,name,role?,sessionId?,client?,workspacePath?}` | Register/update a member, `reported=1` |
+| POST | `/api/v1/task/start` | `{memberId,taskId?,title,sessionId?,parentTaskId?,workspacePath?}` | Create a task; that session becomes busy |
+| POST | `/api/v1/task/progress` | `{memberId,taskId,progress,note?,files?,sessionId?}` | Store 0..1 progress; also clears that session's blocked |
+| POST | `/api/v1/task/end` | `{memberId,taskId,state:'done'\|'failed'\|'cancelled',artifacts?,sessionId?}` | Finish the task; idle unless another task in that session is running |
+| POST | `/api/v1/task/tokens` | `{memberId,tokens}` | Backfill the four token columns only; retry-safe |
+| POST | `/api/v1/task/current` | `{memberId,sessionId?}` | Wrap-up fallback: find the member's current task |
+| POST | `/api/v1/message` | `{from,to?,type,subject?,content,taskId?,ts?}` | Message stream (deduped by `dedupe_key`) |
+| POST | `/api/v1/file/touch` | `{memberId,files\|path,op:'read'\|'write'}` | File activity |
+| POST | `/api/v1/tool/use` | `{memberId,taskId,tool,...}` | Increment the tool-usage counter for a task |
+| POST | `/api/v1/ghost` | `{action:'spawn'\|'finish'\|'sweep',...}` | Ephemeral subagent ghost lifecycle |
+| POST | `/api/v1/hook` | raw hook event + `workspacePath` | Forwarded to the server-side hook dispatcher; the floor reads disk and writes the ledger |
 
-**纪律（代码里反复强调，且已被实现遵守）**：拿不到就是空 —— 无心跳 60s 标 `degraded` 而不改状态；进度拿不到显示「进度未知（未上报）」而不是 0%。
+Query routes: `GET /api/v1/snapshot`, `projects`, `project-sizes`, `messages`, `task-runs`, `task-feed`,
+`subagent-runs`, `sessions`, `reporter-phase`, `workspace`, `products`, `settings/retention`, `health`;
+`DELETE /api/v1/task-runs/:id`, `DELETE /api/v1/task-runs`, `PUT /api/v1/settings/retention`; council routes
+under `/api/v1/councils`. `/task-runs` and `/task-feed` return `tasks.state` directly — there is no
+heartbeat-based or elapsed-time normalization, and `blocked` is not a task state.
 
-**上报归属以 `workspacePath` 为准，不是"办公室当前打开的那个工程"**（2026-09-29 修）：
-hook 以前把 `workspacePath` 取成 `/api/v1/workspace`（办公室当前工程）的路径，服务端又拿
-`body.project` 当归宿 —— "办公室开着 A、我在 B 里跑 CLI"时，这一轮的任务 / 成员 / 文件活动
-全被记到 A 名下（实测：在 `/home/yinghui/work/stb-insight` 里跑的 codex 任务，任务列表里挂在
-`workgremlin` 下；办公室视图那条会话的工程名却是对的，因为会话走的是 rollout 的 `cwd`）。
-现在 hook 的 `resolveCtx` 一律上报 `REAL_WS`（agent 启动 hook 时的 cwd），插件各条上报也都带
-自己事件里的目录；服务端在 `http/routes/ingest.js` 的 `projectFirst` 用
-`bus.projectForReport()` **按 workspacePath 反查工程**（按 `projects.workspace_path` 命中已有
-工程 → 找不到再按 `package.json name > 目录名` 建一条），没带 `workspacePath` 的老上报退回
-`body.project`（行为不变）。回归见 `npm run test:project-attribution`。
+### 2.1 The five member/data sources (all implemented)
 
-任务详情里的「工程」显示的是**按目录现算**的名字（`/task-runs` 的 `project_label` =
-`resolveProjectName(project.workspace_path)`，与"打开工程"同一口径），不是库里那行
-`projects.name` —— 同名不同目录时办公室会给新工程的 id / name 加冲突后缀（实测：
-`/home/yinghui/work/stb-insight` 的 `package.json name` 是 `stb-dashboard`，但那个 id 早被
-一行历史脏数据占了，于是库里叫 `stb-dashboard-2`），显示时要用目录算出来的那个名字。
-读不到目录才退回 `projects.name`。
-
-**IDE 形态（Codex 的 VS Code 扩展 / app-server）的两个坑（2026-09-27 修）**：
-① 提交的 prompt 是**拼好的** —— IDE 在前面注入 `# Context from my IDE setup:` / `## Active file:` /
-`## Open tabs:`，用户那句话在 `## My request:` 之后。hook 按 `userRequestText()` 只取请求正文：
-整段（含被截断的）注入块当标题，任务列表里就只剩一堆 IDE 上下文、用户的话一个字看不见；
-老数据在渲染层按同一套规则（`TaskRecordsView.vue` 的 `promptOf()`）再剥一次。
-② 改动文件三路取：PostToolUse 从 `tool_input` 解析 apply_patch 的 patch 文本（`command` / `input`
-键都认），收工时再按 transcript 里 apply_patch 的权威清单（`Success. Updated the following files:`
-+ `M/A/D <路径>`）按**本轮开始时刻**补一遍 —— IDE 形态的 PostToolUse 常常不带 patch 文本，
-只靠前者就会"任务结束没有改动文件列表"。自检见 `npm run test:ide-hook`
-（`server/test/ideHook.test.js`）。
-第三路是**兜底**：按 mtime 扫 `git ls-files`（受版本控制的 + 未跟踪但非忽略的）里**本轮开始后**
-动过的文件 —— agent 用 shell 改文件（`sed -i` / `patch` / python 写文件 / 重定向）时前两路都看不到，
-实测 2026-09-27 有一轮真改了 3 个文件、任务里却显示"文件变化 0"；被 .gitignore 忽略的构建产物
-（`dist/` 等）不算，非 git 工程这一路自动退空。
-③ 客户端标签分 CLI / 插件：Codex（3F）与 Claude Code（4F）的 CLI 与自家 IDE 扩展都共用一份落盘、
-同一个 client（`codex` / `claude`），光看 client 只能显示「Codex」/「Claude Code」。hook 从**会话自己
-落的记录**里认出形态（`form = 'cli' | 'vscode' | 'ide' | 'desktop'`）随任务一起上报，落 `task_runs.form`，
-任务列表按「产品名 + 形态」显示（Codex CLI / Codex Plugin / Codex Desktop、
-Claude Code CLI / Claude Code Plugin）：
-Codex 看 rollout 的 `session_meta`（`source` / `originator`，见 `codexForm()`；桌面应用是
-`source=vscode` + `originator='Codex Desktop'`，比 VS Code 扩展先判，避免误标成 Plugin）；Claude 看 transcript
-第 3~5 行的 `entrypoint`（终端 `cli` / VS Code 扩展 `claude-vscode`，见 `claudeForm()`）—— Claude 的
-两个调用点（开轮 / 收工）同口径，认不出（老版本没有这一位、`sdk-cli` 这类别的形态、落盘读不到）
-一律留空，绝不猜。已带形态的标签（CodeBuddy CLI / Plugin）不重复追加，读不到形态的老数据退回只写
-产品名。自检见 `npm run test:task-client`（`renderer/test/taskClientLabel.test.mjs`）、
-`npm run test:ide-hook` 的 [7]（Codex）与 `npm run test:claude-hook`（`server/test/claudeHook.test.js`）。
-
----
-
-## 3. 领域模型（以 `server/src/db/schema.sql` 为准）
-
-| 实体 | 关键字段 | 与文档的差异 |
-| --- | --- | --- |
-| `projects` | `id`、`name`、`workspace_path`、`main_conversation_id` | 原 `teams` 表；演示工程用保留 id `__demo__` |
-| `members` | `ephemeral`、`project_label`、`role`、`reported`、**`client`** | 新增临时成员（幽灵）与所属项目名；工牌级别不下库（运行时判定）；**`client` = 来源客户端（codebuddy / cline / codex / claude，NULL = 通用），办公室按当前楼层过滤就靠它** |
-| `agent_status` | `state`、`progress`、`current_files`、`degraded`、`source` | 无 `degraded_reasons[]` |
-| `tasks` | `state`、`progress`、`started_at`、`ended_at` | **无** `progress_source` / `blocked_reason` / `waiting_on` / `error_type` |
-| `messages` | `dedupe_key` 唯一、`archived_at`、`content_truncated` | **无** `redacted` / `redaction_hits` / `ingested_at_ms` / `reply_to` |
-| `messages_fts` | FTS5 `tokenize='trigram'` + 三个同步触发器 | 表已建，但**查询未使用**（见 §5） |
-| `file_activity` | `op` CHECK 仅 `('read','write')` | 缺 `edit` |
-| `tool_usage` | `task_id` + `tool` 主键、`count`、`first_at` / `last_at` | **新表**（任务详情「工具使用」）：按 `(任务, 工具)` 累加次数，不给每次调用落一行。上报见 `POST /api/v1/tool/use`（hook 的 PreToolUse / 插件的 tool part 各报一条，插件按 `callID` 去重、`pending` 不算）；`/task-runs` 每行带 `tools: [{tool,count}]`，删除任务时随 `deleteByTopIds` 一起清 |
-| `artifacts` / `events` | 产出与审计 | `events` 表已建但**无写入方** |
-| `councils` / `council_participants` / `council_materials` / `council_rounds` / `council_reviews` / `council_utterances` / `council_reports` | 议事厅七张表（见 §4.2） | **新表**，文档里没有。与 `members` / `task_runs` **完全无交集**：议事厅的参与者不是楼层成员，不进办公室、不进任务记录。`verdict` 取值 `completed` / `partial` / `cancelled` / `failed`（`partial` 是合法结果不是错误）；`council_participants.role` 只有 `moderator` / `main` / `reviewer` 三种；`council_rounds` 第 0 轮是主持人的拆题（`kind='plan'`），1..N 轮各存一个 `RoundResult`（提案原文、与上一版的 diff、主持人汇总 JSON、服务端算出的 `stats_json`）；`council_reviews` 每条 `ReviewPoint` 一行；收敛度**不落模型自报的分数**，由 `council/convergence.js` 从评审与冲突重算；`council_utterances` 保留每次发言的原文、模型与四路词元（取不到即 NULL，**不补 0**）；报告落 `council_reports` 并在收尾时导出 JSON / CSV / Markdown。
-
----
-
-## 4. 楼层与会话模型（文档里没有的新概念）
-
-左侧「楼层」= 受监控的智能体产品，**只有安装位置命中才算 `installed`**（落盘目录不算证据，避免自己写的 `settings.json` 自我欺骗）：
-
-| 楼层 | 产品 | 落盘形态 |
-| --- | --- | --- |
-| 1F | CodeBuddy（**CLI 与 Plugin 合并成一层**） | CLI：`~/.codebuddy` 下的 `*.jsonl` + reporter 状态文件；Plugin：编辑器 globalStorage 的结构化目录（genie-history / todos / message-queue / file-changes，唯一能拿到运行态的那一路）。两路都在这一层，同时开着两种形态 = 这一层里的**两条会话**（按 `session_id` 区分），不是两个楼层 |
-| 2F | Cline（**CLI 与 VS Code 扩展合并成一层**） | 数据根 `~/.cline/data`（`$CLINE_DATA_DIR` → `$CLINE_DIR/data` → `~/.cline/data`，扩展与 CLI **共用同一份落盘**；VS Code 的 `globalStorage/saoudrizwan.claude-dev` 只是迁移前的旧布局，扩展自己标为 `LegacyStateReader`）。会话索引 = `db/sessions.db`（SQLite `sessions` 表：`session_id` / `source`（vscode / cli）/ `model` / `cwd` / `workspace_root` / `updated_at` / `metadata_json`）；对话 = `sessions/<id>/<id>.messages.json`（`{ messages: [{ role, content:[…], ts }] }`，content 项 ∈ `text | thinking | tool_use | tool_result`）、元数据 = `sessions/<id>/<id>.json`（标题 / token / 费用 / model）。Cline **自带 hook 子系统**（`preToolUse` / `postToolUse` / `userPromptSubmit` / `taskStart` / `taskResume` / `taskCancel` / `taskComplete` / `preCompact` / `notification`），但是 opt-in 且 WorkGremlin **暂未接入** → 2F 是**轮询楼层**（同 7F/8F）：相位由**消息尾巴**推导（assistant 尾巴 `tool_use`→调用工具、`thinking`→思考中、`text`→待命；user 尾巴 `tool_result`/提示词→思考中），相位一律 `inferred:true`。形态（CLI / 扩展）取会话行的 `source`，两者并存在这一层里的**两条会话**。子代理行（`is_subagent=1`）不单列。**改动文件恒为未知**：Cline 的对话只留工具调用、不留「改了哪些文件」（`read_files` / `search_codebase` 是读，不是编辑），所以台账的 `file_count` / `files_json` 一律落 `NULL`（绝不拿工具目标冒充改动）。**输出 = 该轮收尾那条 assistant 文字**（`attempt_completion` 的自述，markdown 原样保留、截 4000 字），任务详情「输出」栏与主控制台收尾都取它。形态取自会话行的 `source`，任务列表客户端因此显示 **Cline Plugin**（vscode）/ **Cline CLI**（cli）。**终态会话当场回收**：Cline 自己写了 `ended_at` / 终态 `status`（completed / cancelled / failed / error）就说明这场会话结束了，`floorCline.clineHandler` 立刻把它的会话行从下拉里撤掉，不再等 60 分钟窗口（改前：跑完或已删的会话仍显示 `active:true`）。任务台账不受影响（`syncTasks` 仍逐轮写），所以「任务取消」照旧在任务记录里看得到；7F/8F 的库里没有终态概念，维持时间窗口。自检见 `npm run test:cline`（[H] 段） |
-| 3F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`（cwd 在首行 `payload.cwd`） |
-| 4F | Claude Code CLI | `~/.claude/projects/<工程目录>/*.jsonl`（cwd 从第 3 行 `user` 记录起才有，**首行没有**；见 `sessionRegistry.js` 的 `cwdOfHead`）。同一层多会话靠 `session_id` 区分；这一轮走的形态（终端 / VS Code 扩展）也落在同一条 `user` 记录上（`entrypoint`，见上页 ③） |
-| 5F | TraeCode（**IDE 与 Plugin 合并成一层**） | 会话来源是 reporter 状态文件（`sessionId` / `workspacePath` 都是 hook payload 实测值）：两个形态都没有可扫的**会话**落盘 —— IDE `~/.trae-cn/memory/projects/<工程>/<日期>/session_memory_<会话>.jsonl` 与 `project_memory.md` 是记忆文件（文件名带 session_id，但不是对话记录、也没有工程路径）；插件 `~/.marscode` 实测只有 ai-chat 二进制、日志与 `ai-agent/database.db` / `snapshot/<链 id>/v2/.git` 文件快照（前者是**加密数据、非可读 sqlite**，后者是逐轮改动的 git 快照）—— **所以插件这一形态目前不支持会话记录**。**两处落盘都在楼层胶囊的 tooltip 里逐路列出**（IDE / plugin 两行，**不带 `sources[].note`**，只列目录与落盘统计）。形态靠上报身份（`client`）区分，任务列表按 `CLIENT_LABELS` 显示 **TraeCode IDE** / **TraeCode Plugin**，不按楼层特判 |
-| 6F | Qoder（**CLI 与插件合并成一层**，与 4F Claude 同理） | 会话两路来源：① 落盘 transcript `<CLI 根>/projects/<工程目录>/<会话>.jsonl`（**国际版 `~/.qoder` 与国内版 `~/.qoder-cn` 两处根都扫**，同一路线合并后按 `session_id` 去重；Claude Code 同款格式：文件名即 `session_id`、每行带 `cwd`，工程路径从 `cwd` 解析，见 `sessionRegistry.js` 的 `SUBTREE`/`sessionIdOfFile`/`cwdOfHead`）；② reporter 状态文件兜底（JSONL 还没写/读不出时，hook 那一路照常列会话并提供实时相位）；③ **插件形态**（VS Code / Trae CN 里的「Qoder CN (Formerly Lingma)」扩展）**没有 hook 子系统**、也不写 `~/.qoder` 的 transcript，会话与相位只能由服务端轮询它自己的 `local.db`（`chat_session` / `chat_record`，见 `server/src/lingma.js`）—— 没有这一路，插件里跑的任务在任务记录里看得到、主控制台却一条会话都没有（主控制台严格跟随所选会话）。三路按 `session_id` 去重（cli 有活会话就撤掉 hook 行；插件的 `chat_session.session_id` 与 CLI 的 transcript 名不可能撞，两形态并存就是这一层里的两条会话）。`~/.qoder` 这一路只列落盘（文件数 / 体积 / 最后写入）。hook 写入 `~/.qoder/settings.json`（与 Claude / CodeBuddy 同构），由 `--agent qoder` 分流；事件表暂默认采用最宽的 Claude 风格（`scripts/install-hooks.js` 的 `QODER_EVENTS`），待确认 Qoder 真实事件名后再收紧。**Qoder 实测只发 `SessionStart` / `SessionEnd`、没有细粒度事件**，故 `hook.js` 对 qoder 补「思考中 / 已完成」粗粒度相位——6F 不会一直「未上报」，但相位精度比 Claude 粗（待 Qoder 开放细粒度事件后自动变细） |
-| 7F | Kilo Code（**轮询 + 插件双路**） | **Kilo 没有 hook 子系统**（实测 7.8.1：`kilo --help` 里没有 hook 子命令，也没有任何 `hooks.json` / 可挂命令的事件点），所以既没有 hook 上报、也没有可扫的会话 jsonl —— 7F 由服务端**轮询**它自己的落盘。会话 / 相位 / 完成标记全部来自 `server/src/kilo.js` 读它那份 **event-sourced SQLite**（`~/.local/share/kilo/kilo.db`，WAL 模式，只读打开不阻塞 Kilo 的 daemon）：`session`（id / directory=工程路径 / title / agent / model / time_updated / summary_*）＋ `event`（append-only，aggregate_id=会话、seq 单调、data 里 `part.type ∈ tool|text|reasoning|step-start|step-finish|patch`、`part.state.status ∈ running|pending|completed|error`）＋ `message`（role、path.cwd、`finish ∈ stop|tool-calls|length|content-filter`）。相位由**最新事件推导**（tool+running→调用工具、tool+pending→等待授权、reasoning→思考中），**不是**像 5F 那样拿文件时间猜；**`text` 不等于待命**（实测 2026-09-28 修的坑）：Kilo 在**一轮之内**会多次吐 assistant 文字（每次工具调用前后都可能来一段），而轮询只看最新那条 part —— 模型在两次工具调用之间说话时最新 part 正是 text，早先一律 `text→待命` 于是任务还在跑、主 agent 却闪回「待命中」，几秒后又被下一条 tool 事件顶回「调用工具」（相位在两个值之间来回跳）。改判这条 text 归属 message 的 `finish`（`part.messageID` join 回 `message` 表）：只有 `finish=stop`（且 `time.completed`）才是整轮说完了 → 待命；`finish=tool-calls` / 还没有 finish（正在流式吐字）→ **思考中**，与其它楼层在工具间隙回落思考中的口径一致（hook.js 的 PostToolUse）。插件那一路同一个坑也修了（`message.part.updated` 的 assistant text 原先报 idle，现报 thinking；真正收尾仍由 `message.updated` 的 finish / `session.idle` 负责）。**「思考中」要带内容**：轮询这一路原本每个分支都写死 `prompt:''`，屏上一个字都没有；现由 `readRoundPrompt()` 取这一轮 role=user 的 text part（剥外层 JSON 引号、截 80 字）经 `sessionRegistry` 透传，插件那一路则由 `startTask` 把用户原话写进状态文件的 `taskTitle`（服务端 `readReporterPhase` 读成 `prompt`）—— 与 hook 那一路 `hook.js` 的做法一致，两条路都能在屏上显示用户问的是什么。完成标记取 `finish=stop` 那条 assistant 消息（`tool-calls` / `length` / `content-filter` 都不算"完成"）。数据根按 XDG 位置认（`kiloHome()`），**不是** `~/.kilo`（那个目录实测只有安装期留下的 `bin/`）。来源只有 `kind:'kilo'` 一路（读 SQLite，与 cli 扫 jsonl 完全不同，故单开一个 kind）：落盘统计与"会话是 SQLite、不是可扫的文件"那句说明都挂在同一路（不再单列 `kind:'dir'` 展示路，胶囊 tooltip 也就不会再多打一行"没有找到落盘目录"）。因是轮询而非上报，**相位一律 `inferred:true`**（UI 按推断灰显）；自检见 `npm run test:kilo`（楼层 / 相位 / 逐轮清单）与 `npm run test:task-sync`（台账落库 + 按 7F 楼层筛得回来） |；**任务台账两路都有**：轮询那一路**只读**（监控端伪造上报违背「绝不编造」），但它自己按**每一轮一条**写台账（`kiloTasks.js`，id = `kilo:<会话id>:<轮序号>`，起点取那一轮 `message.time_created`）——CLI / TUI 不装插件时任务列表照样有记录（相位与完成标记也有；**对话记录**仍为空，事件流不在库里）。轮询这一路只记每条会话**最后一轮**，不回溯历史轮次；那一轮收工后由下一轮开始时定稿。**2026-09-30 前是一条会话一行**（id 固定 `kilo:<会话id>`）：在一条老会话里跑新任务时，`tasks.started_at` 被 `insertTask` 的 `COALESCE` 钉在"第一次见到这条会话"的时刻，记录显示「运行中」却排在几天前的位置、`duration_ms` 恒为 0 —— 改成一轮一条才修掉。**插件注册键名是 `plugin`（单数）、条目形如 `[绝对路径, {options}]`**（实测 2026-09-28 修的坑：早先写成 `plugins: [{package, options}]`，Kilo 7.8.1 降级到 V1 配置时对 `plugins` 报一条 `Omitted native setting that cannot be represented in V1` 的 WARN 并**整段丢弃** —— 插件看着装上了却一条状态文件都不写、7F 任务台账永远空，且除那条 WARN 外无任何报错，WARN 只在 `~/.local/share/kilo/log/opencode.log` 里；改正键名后 `kilo debug config` 能看到该条被规范成 `file://` URL，探针插件实测收到 `session.created` / `message.part.updated` 等真实事件）。装了 WorkGremlin 插件（`packages/reporter/src/plugin/index.js`，8F 共用）后，插件会往台账上报 `register`（**必须带 `role:agent`**，否则 `bus.endTask` 不写 `task_runs`）、`task/start`、`task/end`（带 result 与本轮改动文件）、`message`（收尾自述）、`file/touch`（**只报写类工具**，读类不报），以及 subagent 幽灵（`task` 工具召唤时写 `.workgremlin/subagents.json`，格式与 hook.js 共用 `packages/reporter/src/ghostFeed.js` 那一份实现）。拿不到会话标题就不传 `result` —— 事件流里没有「最后一段 assistant 文本」这个信号，拿文件清单拼一句「完成了 N 个文件」属于编造自述，不做。真相位压过轮询推导**不靠 sources 顺序**（claim 先到先得，hook 那一支沿用老约定只报 `unreported`），而是 `sessionRegistry` 的 kilo 那一支自己去问 `reporterMainPhase`（`kilo` 与 `kilo-plugin` 两个身份都试）。**插件上报的身份 = 入口给的产品基名 + 环境判出的形态**（`plugin/index.js` 的 `resolveClient`）：走 `server(input, options)` 这个入口的就是 Kilo（`setup(ctx)` 才是 OpenCode），配置里那条 `{client:"kilo"}` 只钉**产品**，形态由进程环境判 —— VS Code 扩展起的 Kilo 带 `KILO_CLIENT=vscode` / `KILOCODE_FEATURE=vscode-extension` / `KILO_PLATFORM=vscode`（实测 `/proc/<pid>/environ`）→ `kilo-plugin`，终端 CLI 一个 `KILO_*` 都没有 → `kilo`。**选项里写死形态是错的**：那条条目写在 `kilo.jsonc` 里，而 CLI 与扩展读的是**同一份配置**，写死哪一个都会把另一半弄反 —— 早先 `resolveClient` 开头就是 `if (explicit) return explicit`，加上入口那个 `options || {client:"kilo"}` 的假默认，环境判定整段被遮死，于是 VS Code 里也报 `kilo` / `form=cli`、任务列表永远显示「Kilo Code CLI」（2026-09-30 修；`form` 现在只在一处算，`task/start` 与 `tool/use` 共用）。**注册只能有一处**：Kilo 的插件来源有两路（每个配置目录下 `{plugin,plugins}/*.{ts,js}` ＋ 配置文件里的 `plugin` 数组），两路都在就是同一个 server 进程里**两个插件实例**，同一轮上报两遍（实测孪生台账行同 session、同标题、`started_at` 只差 5 毫秒；它按 spec 字符串去重，绝对路径与工程里 shim 的相对路径算两条）—— 本仓库自己那份 `.kilo/plugins/workgremlin.js` 已删（`.opencode/plugins/` 那份留着：那是 8F 的正路，Kilo 明确不读 `.opencode/`），安装器也加了探测：工程里还留着零配置入口就打一条警告（只报不删，那是用户的文件）。**连接信息惰性重读**（`createIngest` 的 `connect()`：TTL 5s ＋ 与 `config.js` 同口径的 `isPidAlive`）：早先在插件加载那一刻读一次 `server.json` 就把 base 定死，Kilo 的 server 比 WorkGremlin 早起的场景（实测 09:04 vs 10:42）里那个实例的 HTTP 层**永久停摆** —— 状态文件照写本地磁盘、台账一条不来，且完全无声；现在应用晚起 / 重启换端口，下一个事件就接得上，崩掉那次留下的 `server.json` 也不会再被当成有效连接。**轮询让位按 id 前缀认**（这个会话已经有不是 `kilo:` 前缀的行就让位）：早先按 `client === 'kilo-plugin'` 判，而插件那份判出来的正是 `kilo` → 从不让位 → 同一轮轮询与插件各写一行。自检：`npm run test:plugin-ingest`（打假服务端验上报）、`npm run test:plugin-e2e`（真起服务端跑通整条链，沙箱 HOME；**走生产形状**：`server()` 入口 ＋ `{client:'kilo'}`，一组带 `KILO_CLIENT=vscode` 验 `kilo-plugin`/`form=plugin`、一组不带验 `kilo`/`form=cli`，另有一轮只许落一行、状态文件按身份命名、应用晚起接得上）、`npm run test:task-sync`（含「插件在场轮询整条让位」）、`npm run test:ghost`
-| 8F | OpenCode（**轮询 + 插件双路**） | 与 7F 同源（Kilo Code CLI 就是 OpenCode 的 fork，落盘结构同源：`<数据根>/{kilo,opencode}.db` + `storage/session_diff/` + `repos/` + `shell/` + `snapshot/`），但**V2 schema 已分叉，照抄 7F 的取法会读到空数据**：实测 Kilo 7.8.1 的 `event` 表有 2288 行（落盘），OpenCode 2.0.18 的 `event` 表**是 0 行**（事件只在内存流里推、不落盘）。所以 8F 改读 `session_v2`（id / directory=工程路径 / title / agent / model / time_updated / summary_*）＋ `session_message`（`type ∈ assistant|user|idle|synthetic`，`data.content[]` 里 `part.type ∈ tool|reasoning|text`、工具块是 `{type:'tool',name,state:{status,input}}`）。相位由**最新消息的 content[]** 推导（tool+running→调用工具、tool+error→调用工具但报错、reasoning→思考中、`type:'idle'` 行→待命），一律 `inferred:true`；完成标记取 `finish=stop` 且 `time.completed` 落过的那条（`tool-calls` / `error` 都不算"完成"）。表名与列名都**探测**着来（`session_v2` → `session`、`pragma table_info` 取交集），OpenCode 改版换表不会把接口打挂。**关键能力差：轮询给不出「等待授权」** —— 全库 114 条 assistant 消息实测 `tool.state.status` 只出现过 `completed / error / running`，**没有 `pending`**（Kilo 有），授权在 OpenCode 是独立事件（`permission.asked`）且只在内存流里。所以 8F 额外挂 `kind:'hook'` 一路：装了 WorkGremlin 插件（`packages/reporter/src/plugin/`，实现 OpenCode/Kilo 的 `ctx.event.subscribe` 事件流，状态文件格式与 `hook.js` 完全一致、服务端零改动）时，相位是**上报真值**（不标 inferred、UI 不灰显）、多出「等待授权」、完成标记还带**改动文件清单**（`session.step.ended` 事件的 `data.files`）；没装插件就自动退回轮询推导。**2026-10-16 修（v2 词汇）**：OpenCode 2.0.30 把事件词汇整套换了 —— v1 的 `message.updated` / `message.part.updated` 一个都不发，改成 `session.inbox.enqueued`（用户原话）/ `session.tool.called`（工具，名字在 `session.tool.input.started`）/ `session.execution.*`（整轮起止）/ `session.step.ended`（finish + tokens + `files`）/ `permission.asked`（等待授权）；信封也从 `{properties}` 换成 `{id,created,type,location,data}`（`location.directory` 给工程路径）。旧插件只认 v1，所以在 v2 上**一条都不写**（状态文件 / 台账 / 工具使用全空，8F 实际一直只有轮询）；现插件两代都认，实测 v2 能出状态文件、`k_*` 台账行与工具使用计数（自检见 `test:plugin-ingest` 的 [F]）。数据根按 XDG 位置认（`opencodeHome()`）；`opencode` 可执行文件实测在 `~/.opencode/bin` 且**不在 PATH**，`CLI_BIN_DIRS` 已显式认这一条否则永远判成"没装"。自检见 `npm run test:opencode`。**上报身份与 7F 同一套规矩**（见上格）：走 `setup(ctx)` 入口的基名恒为 `opencode`，形态**恒为 `cli`** —— OpenCode 的 VS Code 扩展只是驱动同一个 `opencode` CLI、同一个数据根（`~/.local/share/opencode`）的外壳（连 CLI 都得先装好），不产生第二个产品、第二份落盘，所以没有 `vscode` 形态可判：`packages/reporter/src/plugin/index.js` 的 `VSCODE_ENV` **故意不含 opencode**，`resolveForm()` 对它恒返回 `cli`（`KILO_*` 之类不会把 8F 判成插件形态）。轮询让位同样按 id 前缀认（会话里已有非 `opencode:` 前缀的行就让位） |
-
-合并楼层在 `products.js` 里由 `sources` 声明（1F 是 `['cli', 'plugin', 'hook']`，5F 是
-两个 `dir` 落盘 + `hook`，7F 是一个 `kilo`（自带数据根落盘统计），8F 是 `opencode`（自带数据根）
-轮询 + `hook` 收插件真相位）：一个楼层可以吃多路落盘，
-每一路带自己的 client（`codebuddy` / `codebuddy-plugin`、`trae` / `trae-plugin`），
-相位与完成标记按会话各认各的。
-条目可以是 `{ kind, label?, client?, dirs?, note? }`：`kind: 'dir'` = 只作落盘展示、不产会话
-（`sessions: false`），两份 `dir` 靠 `label` 在 tooltip 里区分（IDE / plugin）；5F 这两路
-**不带 `note`**（不想带说明时，服务端不下发即可，前端不按楼层特判）；
-`label` 还用来给"一路抵两形态"的合并楼层起显示名 —— 3F/4F/6F/7F 标 `CLI/Plugin`（CLI 与 IDE 插件共用同一份落盘，分不出），8F 标 `CLI/Desktop`（CLI 与桌面端/网页端同一个二进制、同一个数据根）；
-`kind: 'kilo'` = 7F 专用，读 Kilo 的 SQLite（与 `kind: 'cli'` 扫 jsonl 是两套取法，
-所以单开一个 kind，别让 `sessionRegistry` 里两条分支互相误认）；
-`kind: 'opencode'` = 8F 专用，读 OpenCode 的 SQLite —— **与 `kind: 'kilo'` 也是两套取法**
-（Kilo 读 `event` 表、OpenCode 读 `session_message`，因为后者 `event` 表是空的，见上表）；
-`kind: 'hook'` 在 8F 是**叠加**在轮询之上的那一路，不是替代：装插件时它给真值，
-没装时它空着、轮询照常兜底（两者都按 `session_id` 精确去重，见 `sessionRegistry` 的 `claim`）；
-楼层胶囊的 tooltip 里「落盘」只列**目录 + 文件数/体积/最后写入**，不再带任何一路的说明文案
-（原先 `kind: 'plugin'` 读不出会话时那句「没有 genie-history 这类索引」的 `sources[].note` 已整体去掉）。
-自检见 `server/test/mergedFloors.test.js`（`npm run test:floors`）与
-`server/test/kiloFloor.test.js`（`npm run test:kilo`）。
-
-选中的会话决定主 Agent 控制台的相位（幽灵状态跟着走），办公室布局不受影响；切到没有活跃会话的楼层时整屋清空。
-
-**会话下拉**（`renderer/src/stores/sessions.js` + `server/src/sessionRegistry.js`）是**当前楼层的活跃会话**扁平列表，每条显示 `CLI-<工程名> <短 id>`。两条与会话列表有关的规矩：
-
-- **回收**:缺省是**60 分钟无事件剔除**;但**能表达终态的轮询楼层当场回收** —— 目前只有 2F Cline(它自己写 `ended_at` / 终态 `status`),见上表 2F 格。7F/8F 的库里没有终态概念,维持时间窗口。
-- **短 id 必须唯一**:短 id 是**这一层会话里最短的唯一前缀**(不是写死 8 位)。Cline 的 id 是 `<毫秒时间戳>_<随机>`,同一秒附近新建的两条会话前 8 位相同,早先下拉会渲染出两条一模一样的 `CLI-wg-cx 17923740`(用户会当成重复)。自检见 `npm run test:session-options`。
-
-### 4.1 「任务取消」逐楼层来源（红色「任务取消」，不是绿色「任务完成」）
-
-主控制台在收尾时只问一件事：**这一轮是干完了，还是被用户掐掉了**。唯一真源是 reporter /
-各产品落盘里的那枚 **完成标记**（`done`），`done.cancelled` 为真即亮红色「任务取消」，第三层照
-「改动文件清单 / 没有输出」显示。渲染层读两路：① `/reporter-phase` 快轮询的 `done.cancelled`；
-② `/sessions` 会话快照的 `doneCancelled`，取或（见 `IsoOfficeView.vue`）。
-
-「被掐掉」的信号各家不一样，逐楼层如下（**知道"被打断"就亮红，不知道就老实当没有取消、绝不臆造**）：
-
-| 楼层 | 产品 | 取消信号（落盘真值） | 落地位置 |
+| Source | Trigger | Output | Evidence |
 | --- | --- | --- | --- |
-| 1F | CodeBuddy（CLI + Plugin） | ① CLI 走 `Interrupt`（有则用）；② **`FinalStop`**（家族的"一轮终态"事件）：payload 带 `final_stop_reason ∈ completed | cancelled | failed | interrupted` —— 取到 cancelled/interrupted 就按取消收尾（`hook.js` 的 `finishCancelled`），completed/failed 不动（交给 `Stop`，免重复收工）。已由安装器写进 `~/.codebuddy/settings.json`（`CODEBUDDY_EVENTS`，Trae 不并进来）。③ **插件（IDE 扩展）**：取消时**一个 hook 事件都不发**（扩展日志只有 `AgentState.cancelled`，没有任何 `HookExecutor` 跑 Stop/FinalStop）→ 服务端读它自己那份落盘 `message-queue/*.json` 的 `conversations[<会话>].runtime`：`paused:true + pauseReason:'cancel'` 且 `updatedAt ≥ 本轮开始` ⇒ 合成取消（`sessions.js` 的 `codebuddyPauseCancelAt`，会话 id 与状态文件一字不差）。④ 曾有"taskId 占着 + 空闲超 `TASK_RUN_MS` + transcript 末轮 `state='running'` ⇒ 判被打断"的兜底，**2026-09-29 去掉**（分不清"还在慢慢想"和"被打断"） | `hook.js`（`--agent codebuddy`）+ `scripts/install-hooks.js` + `sessions.js`；回归 `test:final-stop`（11 例）、`test:codebuddy-cancel`（12 例：不再合成 + pause 信号 + 相位作废） |
-| 2F | Cline | 无（WorkGremlin 未接入 Cline 的 hook）→ 不亮「任务取消」，收尾按「任务完成」 | —— |
-| 3F | Codex | ① 显式 `Interrupt` 事件；② 交互式会话常**不发** `Interrupt`，Stop 时读 rollout 里的 `event_msg/turn_aborted`（reason=interrupted）兜底 | `hook.js` 的 `runInterrupted`/`turnInterrupted`，回归 `test:stop-interrupt` |
-| 4F | Claude Code | Claude 不发 `Interrupt`，且实测（2026-09-29）按"停止"后**一个 hook 事件都不发**（Stop / SessionEnd / Notification 全无）→ hook 侧够不着，改由**服务端轮询**自己认，两个信号：① transcript 尾部那条 `[Request interrupted by user]`（模型已输出 / 正在跑工具时打断）；② **早打断**（刚提交、模型一个字都没吐就 ESC，CLI 连 transcript 一行都不写）看 Claude 自己的会话状态文件 `<claudeHome>/sessions/<pid>.json` 的 `status='idle'` + `statusUpdatedAt`（**未公开内部文件**，用户明确同意用；开轮 3s 宽限 + idle 时间戳必须晚于本轮开始，防误伤正常一轮） | `sessions.js` 的 `claudeInterruptTail` / `claudeSessionStatus` / `claudeInterruptOf`（+ `hook.js` 的 `turnInterrupted`），回归 `test:claude-cancel` / `test:stop-interrupt` |
-| 5F | TraeCode | **没有可读的取消信号**（无 transcript 可写、hook 只到 Stop/SessionEnd）→ 不亮「任务取消」，收尾仍按「任务完成」 | —— |
-| 6F | Qoder | 与 4F 同款（Claude 转写格式）：服务端轮询读 transcript 尾部的打断标记（按 `claude` / `qoder` 两个 client 基名一起认）—— Qoder 目前只发粗粒度事件，实际多半拿不到；早打断那条兜底（会话状态文件）按 sessionId 精确匹配，Qoder 只要也写同款文件就同样生效 | `sessions.js` 的 `claudeInterruptTail` / `claudeInterruptOf` |
-| 7F | Kilo Code | ① 装了插件：`session.idle` 时若这一轮还开着 → 落一枚 `done.cancelled`（与 hook.js 的 `Interrupt` 同形）+ 台账 `task/end(state=cancelled)`。**VS Code 扩展里这份现在才真的拿得到**：上报身份由环境判（`KILO_CLIENT=vscode` → `kilo-plugin`），写出的状态文件也才是服务端去读的那份（`sessions.js` 的 `clientHit` 按文件内容里的 `client` 匹配）；修之前那个实例报的是裸 `kilo`、而且 HTTP 层因 `server.json` 晚写到而永久停摆，取消标记根本落不到盘上；② 纯轮询这一路读不出**「用户按了停止」这个动作**（`message.finish` 没有 interrupted）→ 主控制台那颗「任务取消」红标不臆造。但**台账**里没干完的轮照样记 `cancelled`（有终态 finish 才算 `done`；`length` / `content-filter` 也记 cancelled），那是"这一轮没干完"，不是"用户取消了" | `packages/reporter/src/plugin/index.js` 的 `session.idle` 分支、`server/src/kilo.js` 的 `readKiloRounds` |
-| 8F | OpenCode | ① 插件那一路同 7F（`session.idle`）；② 轮询那一路按 `session_message` 的 `type='idle'` / `data.outcome='interrupted'` 判取消 | `plugin/index.js`、`server/src/opencode.js` 的 `readOpencodeDone` |
-| 9F | GitHub Copilot | **没有可读的取消信号**（没有 hook，会话日志里没有"被打断"字段）→ 不亮「任务取消」 | —— |
+| Hook reporting | CodeBuddy-family hooks send `SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Notification / PermissionRequest / Stop / SessionEnd` (plus family-specific events) | Member registration, task start/progress/end, file activity, tool usage, ghost spawn/finish/sweep, and **blocked only when that session is waiting for authorization** (`reason='awaiting_permission'`), cleared by task progress, task end, session end, or an idle notification. No heartbeat, no periodic state write. | `packages/reporter/src/hook.js`, `server/src/ingest/hookCommon.js`, `server/src/ingest/hookDispatch.js` |
+| Resident roster | Scans `<workspace>/.codebuddy/agents/*.md` and `~/.codebuddy/agents/*.md` | Seated gremlins with `role=subagent`, `ephemeral=false`. Their own state is idle unless a same-named ghost is working, in which case the server records **borrowed busy** in `agent_status` (display only, not task liveness). | `server/src/ingest/agentRoster.js` |
+| Ghost feed | `POST /api/v1/ghost` from hook/plugin events; open ghosts are rehydrated from `subagent_runs` after a restart | `ephemeral=true` members that hover above the floor, each with its own task and `subagent_runs` row; the ghost disperses when the parent task ends or the orphan cleanup window passes. There is no manifest file and no feed poller anymore. | `server/src/ingest/bus.js` (`ghostSpawn` / `restoreGhosts` / `gcGhosts`), `server/src/ingest/hookCommon.js` |
+| Disk scan | Polls each product's data directory | Floor sessions, todos, changed files, completion marker, and a session activity phase marked `inferred` | `server/src/products.js`, `server/src/sessions.js`, per-floor modules (`floorCline.js`, `floorKilo.js`, `floorOpenCode.js`, `floorCopilot.js`, `lingma.js`, …) |
+| Codex CLI hook | Codex native hooks (`~/.codex/hooks.json`, 10 events) | Member registration, tasks, file activity, phase, subagent ghosts — same pipeline as CodeBuddy | `packages/reporter/src/hook.js` (`WORKGREMLIN_CLIENT=codex`), `scripts/install-hooks.js` |
 
-服务端透传一侧：CLI / hook 楼层的快轮询直接透传 reporter 的 `done.cancelled`；7F/8F 走
-`toReporterDone`（把会话行形状的 `doneCancelled` 翻回快轮询的 `done.cancelled`）；会话快照按
-`sessionInfo.doneCancelled` / 会话行的 `doneCancelled` 下发（7F/8F 那两支以前把原始 `done`
-直接摊进会话行，字段名对不上，现统一经 `doneFieldsFromReporter` 归一）。
+### 2.2 Discipline: if it cannot be read, it stays empty
 
-**取消信号的判定一律按结构，不全文搜字符串**（`hook.js` 的 `isInterruptLine`）：agent 自己的
-工具输出 / 思考里经常出现 `turn_aborted` / `Request interrupted by user` 这些词（实测：跑一句
-`rg 'turn_aborted'`、或讨论打断逻辑，输出被原样写进 rollout），全文匹配会把**没被打断**的一轮
-误判成取消 —— 控制台报红色「任务取消」、产出摘要还被一并清空。所以逐行 `JSON.parse` 后只认
-Codex 的 `event_msg/turn_aborted` 事件行与 Claude 家族 `user` 消息里的正文文本，工具结果 /
-思考 / 普通消息里带同名字符串一律不算。回归见 `npm run test:stop-interrupt` 的 [4]。
+- No running task means **idle**, not "offline" or "stale". There is no timeout that flips a member's state.
+- A `pending` task is not busy. A task is running exactly while `tasks.state = 'running'`.
+- Progress that was never reported renders "进度未知（未上报）" (`progress.unknown`), never 0%.
+- File counts, token counts, model names, and durations stay `NULL` when the floor cannot provide them; the UI shows "—".
+- A session's activity phase may be inferred from file mtimes (for example `IDLE_MS = 10 min` in `server/src/floors.js`), and the UI greys it as inferred. That is a **session phase**, not a workstation state.
 
-**收尾那一下必须把实时相位一起清掉**（`hook.js` 的 Stop / Interrupt）：以前只清 `taskId`，
-`sessionPhase` 原样留着（还是 `thinking` / `tool`，ts 停在最后一个事件那一刻），服务端的新鲜期
-（taskId 没了还有 `AWAIT_TTL_MS`=5 分钟）一直认它新鲜 —— 现象就是「任务完成 / 任务取消亮过之后，
-控制台一直停在『思考中』」，且渲染层那条"刚亮的收尾相位不许被实时相位盖掉"的守卫也因
-`fastPhase.phase` 非空而失效，红色「任务取消」刚亮就被旧相位顶回去。现在两个收尾分支都把
-`sessionPhase` 落成 `null`（= 这一轮真的没在动），控制台按"接了 hook、此刻没动作"落「待命中」。
+### 2.3 Report ownership follows `workspacePath`, not the office's open project
 
-**`Notification idle_prompt` 不许清掉 `done`**：CodeBuddy CLI 每轮结束后约 60s 会发一条
-`idle_prompt`（实测 events.log）。这一支以前走 `clearAwait()`，而它会把 `done` 一并写 null ——
-`done` 是「任务完成 / 任务取消」唯一的凭据，抹掉之后标记与控制台实时状态一起消失。现在
-idle_prompt 只撤 `await` / `pending` 并把相位清掉，`done` 原样保留（新的 `UserPromptSubmit`
-仍照常把它清掉）。回归见 `npm run test:stop-interrupt` 的 [1]/[5]。
+Fixed on 2026-09-29. The hook used to take `workspacePath` from `/api/v1/workspace` (the project open in the
+office) and the server used `body.project` as the destination, so "office is showing A while I run the CLI in B"
+recorded the task / member / file activity under A. Now `resolveCtx` always reports `REAL_WS` (the cwd where the
+agent started the hook), and `projectFirst` in `server/src/http/routes/ingest.js` calls
+`bus.projectForReport()` to resolve the project **by `workspacePath`**: match `projects.workspace_path`, otherwise
+create one using `package.json name > directory name`. Old reports with no `workspacePath` fall back to
+`body.project`, unchanged. Regression: `npm run test:project-attribution`.
 
-**收尾守卫按"相位比收尾标记新不新"判，而不是"有没有实时相位"**（`IsoOfficeView.vue` 的
-consoleLive 守卫 + `readReporterPhase` 多回一个 `ts`）：Claude 那种"服务端兜底合成的取消 +
-状态文件里没人清的 stale 相位"的组合下，`fastPhase.phase` 一直是「思考中」，旧判据
-（`!fastPhase.phase` 才拦）形同虚设 —— 红色「任务取消」刚亮就被顶回「思考中」，看起来就是
-"取消看不见、一直思考中"。现在只有**相位 ts 晚于收尾标记**（= 用户又发了一轮，UserPromptSubmit
-写的新相位）才允许覆盖收尾；拿不到 ts 的路径（7F/8F 轮询）退回老行为。
+The "project" shown in task details is computed **from the directory at read time**
+(`/task-runs.project_label = resolveProjectName(project.workspace_path)`), not the stored `projects.name`. When two
+different directories share a name, the office suffixes the new project's id/name to avoid a collision (measured:
+`/home/yinghui/work/stb-insight` has `package.json name = stb-dashboard`, but that id was already taken by a stale
+row, so the database row is `stb-dashboard-2`). Display uses the directory-derived name and only falls back to
+`projects.name` when the directory cannot be read.
 
-**取消照「任务完成」一样记录：取消只是"没干完"，不是"没产出"。** 被打断的那一轮
-已经吐出来的文字（`task_runs.result` + 对话记录 `type=result`）与改过的文件
-（`task/end.files`）照常入账；主控制台第三层按「改动文件 → 那一轮说的话 → 没有输出」
-择优显示（`IsoOfficeView.vue` 一处决定），真的一点产出都没有才写「没有输出」。
-（早先取消一律把 `said` / `result` 清空，理由"别拿上一轮冒充"——现在 `turnReplies`
-按本轮 user 起算、且跳过 `[Request interrupted by user]` 那条标记行，本轮输出不会串到上一轮。）
+### 2.4 IDE-form pitfalls (fixed 2026-09-27)
 
----
-
-### 4.2 议事厅：一种**新的进程形态**（2026-10-01）
-
-上面 §4 那一整表说的都是**被监控**的会话：别人（你的终端、编辑器）把 agent 跑起来，我们只读它
-落在磁盘上的痕迹。议事厅是**反过来**的那一种 —— 外部 CLI 由**我们**拉起、托管到结束，然后什么都不留：
-
-| | 被监控的会话（§4） | 议事厅的参与者（本节） |
-| --- | --- | --- |
-| 谁起的进程 | 用户 / 编辑器插件 | **服务端**（`child_process.spawn`） |
-| 进不进会话注册表 | 进（`sessionRegistry`，出现在楼层与主控制台） | **不进**。只活在 `council_*` 七张表里 |
-| 有没有工具 | 有，照各 CLI 自己的配置 | **一律只读**：1F/4F 给 `Read,Grep,Glob`；7F/8F 只放行 `read/glob/grep/list`；2F 用 `--plan`、3F 用 `--sandbox read-only`。写文件与联网一律没有 |
-| 工作目录 | 用户自己的工程目录 | **看 `workspace_path`**：NULL 时是 `/tmp` 下现建的**一次性目录**，一场一个、收尾即删；填了绝对路径时就是那个目录，**我们一行都不改它、收尾也不删** |
-| 会不会写台账 | 会（`task_runs` / `messages` / `file_activity`） | **不会**。办公室与任务记录页看不到任何痕迹 |
-| 相位 | 上报或轮询推导 | 无相位概念（它不是"在干活的 agent"，是"正在发言的与会者"） |
-
-**唯一的开关：`councils.workspace_path`**（NULL 隔离 / 绝对路径 工程）。2026-10-02 曾与谈法
-`mode`（`vote` / `analysis`）正交存在，2026-10-19 的重构把 `mode`、计票、阈值与 `consensus.js`
-一起删掉了 —— 现在是固定的角色流程，两种工作目录下完全一样。
-
-| | 隔离（`workspace_path` 为 NULL，缺省） | 工程（填了绝对路径） |
-| --- | --- | --- |
-| 工作目录 | `/tmp` 下现建的一次性目录，收尾即删 | 用户的工程目录，收尾不删、内容不动 |
-| 能看到什么 | 只有内联进提示词的议题与材料 | **真实代码**（只读工具可自行查阅） |
-| 流程 | 拆题 → 提案 → 评审 → 主持人汇总，跑满轮数后裁决 | **完全相同** |
-
-工具在所有场合都只读：1F/4F 给 `--tools Read,Grep,Glob`（同一份也给 `--allowedTools`，否则 `-p`
-无人应答权限询问会直接拒掉；4F 另加 `--permission-prompts none`）；2F 用 `--plan`（Cline 自己的
-只读计划模式）；3F 用 `codex exec --sandbox read-only`（OS 沙箱）；6F 用无头 `-p`（需要确认的操作
-默认拒绝）；7F/8F 沿用注入配置那一套，把全 deny 的权限表换成只放行 `read/glob/grep/list`，
-`bash/edit/write/webfetch` 与 **`external_directory`** 照旧 deny
-（最后那条是命门：放行它等于让参与者顺着 `~` 读用户所有的东西）。
-
-这是仓库里第一次由服务端**长驻托管**子进程。现成的边界因此有三条硬约束，都写在
-`server/src/council/agents.js` 的注释里：
-
-1. **关工具不是可选项，是功能的前提。** 1F CodeBuddy / 4F Claude Code 用 `--tools ""`
-   （两家 help 都写着 `Use "" to disable all tools`）；7F Kilo / 8F OpenCode **没有关工具的开关**
-   （`kilo --pure` 只关外部插件，跟工具无关，名字容易骗人），只能注入一份 `permission` 全 deny 的
-   配置（`KILO_CONFIG_CONTENT` / `OPENCODE_CONFIG_CONTENT`）；2F Cline 用 `--plan`（它自己的只读
-   计划模式，写文件被拒 —— 但仍允许只读命令）；3F Codex 用 `--sandbox read-only`（OS 沙箱，写盘与
-   联网都被挡住，只读命令仍可跑）；6F Qoder 用无头 `-p`（需要确认的操作默认拒绝）。
-   自检第一条就钉这个：`npm run test:council-agents`。
-2. **环境变量是叠加不是替换。** 各 CLI 的登录凭据在 `~/.claude` / `~/.codebuddy` 这些目录里，
-   靠 `HOME` 找 —— 挡掉 `HOME` 等于挡掉登录。隔离只靠 **cwd（一次性临时目录）+ 关工具**，
-   不动 env（`agents.js` 的 `env` 里没有 `HOME`，且有一条测试专门钉这件事）。
-3. **7F 必须摘掉 WorkGremlin 自己的上报插件**（`plugin: []`）。kilo 的全局配置里挂着的正是
-   `packages/reporter/src/plugin/index.js`，不摘的话议事厅的参与者会被上报进办公室，
-   直接违反"隔离，只在议事厅看"。
-4. **工程模式下"不上报"不能靠 cwd，得显式关**（2026-10-02 补）。上面第 3 条与"临时目录"
-   这两道锁都建立在 **cwd 是那个一次性目录** 之上：参与者上报出来的工程名是临时目录，
-   办公室按工程过滤就看不见它。工程模式下这套全失效 —— cwd 是你自己的工程，
-   `~/.claude/settings.json` / `~/.codebuddy/settings.json` 里装着的上报 hook 会带着
-   **真实工程路径**上报，参与者当场变成"你工程里的一个成员"。所以**所有**配方一律注入
-   `WORKGREMLIN_DISABLE=1`，由**我们自己的代码**（`packages/reporter/src/hook.js` 的 `main()`
-   开头、`packages/reporter/src/plugin/index.js` 的两个入口）认到就原地退出。
-   放在自己的代码里而不是某家的配置里，是因为各 CLI 的配置优先级我们并不都握得住，
-   而这两处是我们说关就能关的。自检：`npm run test:claude-hook`（hook 那条路）
-   + `npm run test:council-quiet-plugin`（7F/8F 插件那两条入口）。
-5. **2F/6F/7F/8F 的会话落盘挡不住，只能给它打个标记**（2026-10-02 补 7F/8F，真机验过；
-   2026-10-19 补 2F/6F）。这几家没有 `--no-session-persistence` 这种开关，会话一律记进
-   **全局**落盘，`session.directory` / `cwd` 记的是**当时的 cwd** —— 工程模式下它就是你工程的名字，
-   办公室按工程过滤，于是楼层上会多出一个"正在开工的会话"，而 requirement §15.2 写着
-   "那两页看不出任何痕迹"。数据目录也不能挪：实测 `XDG_DATA_HOME` 确实能把库挪走
-   （kilo 的 `kilo.db` 会落到新目录下），但**登录态跟着一起没了**（挪完再跑，Kilo 回
-   401「You need to sign in」、OpenCode 直接挂住；Cline 换 `--data-dir` 后直接 `Unauthorized`），
-   参与者会连话都说不出来。
-   兜底办法是"照常落盘 + 打标记"：
-   - 7F/8F：`--title '议事厅参与者（WorkGremlin）'`（`DEFAULTS.COUNCIL_SESSION_TITLE`），
-     `floorKilo.js` / `floorOpencode.js` 在**列出会话时跳过这个标题**；
-   - 2F Cline：它没有标题开关，把**提示词本身**存成标题 —— 所以议事厅提示词开头固定带
-     `DEFAULTS.COUNCIL_PROMPT_MARKER`，`floorCline.js` 按标题里的这个标记跳过；
-   - 6F Qoder：`--name` 打同一个标题；其 CLI transcript 是否也带这个名字**尚未真机验证**。
-   3F Codex 不需要标记：`--ephemeral` 根本不写会话。
-   自检：`npm run test:kilo` / `test:opencode` / `test:cline` 各有一段
-   "同库同工程的用户会话照常列出、只有参与者那条被挡住"，另有
-   `test:council-agents` 钉住"配方发的标记 = 过滤的标记"（两头不一致 = 过滤白写）。
-
-**与实施计划的两处出入**（计划写在 `~/.claude/plans/`，不进仓库；此处留档以免后来者按计划找表）：
-
-- 计划里的 `council_events` 表**没有建**。时间线由 `council_rounds`（每轮一行）+
-  `council_utterances`（每人每轮一行）当场拼出来即可，另开一张 append-only 事件表是重复记账。
-- 计划里的字段名与落库的实际名字对不上：`councils.topic_text` → **`topic`**、`materials_json` →
-  **`council_materials` 表**（材料要逐份记 `bytes_total` / `bytes_included`，塞一个 JSON 列里没法查）、
-  `outcome` → **`verdict`**；参与者表的两列是 `floor_id` / `agent`（不是 `floor` / `client`）。
-  另多出两样计划没写的：`round_current`（推进到第几轮）、`error`（整场级别的失败原因，
-  单人的失败记在参与者/发言行上）。原计划的 `threshold`（判定口径）随投票一起删除。
-  以 `schema.sql` 为准。
-
-**2026-10-19 的实现形态（角色化流程）**：编排在 `orchestrator.js`，一次会依次跑
-`plan → (proposal → review → moderation) × max_rounds → adjudication → final`，**不因高分提前停**；
-但**任何必需回合返回 `failed` / `timeout` / `unparsed`，或输出解析不出结构化结果时立即收场**（fail-fast）：
-不再跑后续轮次，已产出的轮次与报告照常归档，完成过一轮记 `partial`、一轮都没完成记 `failed`，
-`error` 写明轮次 / 阶段 / 楼层与 CLI 原文，`closeCouncil` 把仍在 `running` / `pending` 的参与者
-按取消 / 失败落成终态，未轮到的角色记 `skipped`。例外是主持人在第 0 轮明确返回
-`needsClarification`：这是正常结束，记 `verdict='needs_clarification'` / `status='done'`，
-主持人记 `needs_clarification`，其余角色记 `skipped`，报告照常归档。
-每一轮在 `council_rounds` 落一行 `RoundResult`（`proposal_text` /
-`diff_from_prev` / `moderator_json` / `stats_json`），每条意见在 `council_reviews` 落一行。
-模型输出由 `parse.js` 解析：只取**最后一个**围栏 JSON 块，缺字段的条目丢弃并计数，解析失败时
-正文照存（`status='unparsed'`），**绝不替它补一条意见**。收敛度由 `convergence.js` 从评审与冲突
-重算（权重来自 `shared`），模型自报的分数被忽略；同一模块还产出"硬指令是否可执行 / blocker 是否
-有对应指令 / 立场分裂是否登记冲突"等一致性 warnings。收尾由 `report.js` 组装报告并落盘
-（JSON + CSV + Markdown，原子写、不覆盖），文件清单写回 `council_reports.files_json`。旧议事厅
-表结构不做兼容：`db/index.js` 检测到旧的 `mode` / `threshold` / `vote` 列时，把整组表删掉重建。
-
-**「工作中」标识（2026-10-19）**：一次调用可能几分钟没有任何输出，页面原本发起后长时间空白。
-`markProgress(ctx, roundNo, phase, floors)` 在每个阶段开始时记下当前进度并随 WS 推送
-（`status='running'` + `roundNo` / `phase` / `floors` / `startedAt`）；详情接口通过
-`orchestrator.progressOf(id)` 返回同一份数据，所以刷新后标识还在。前端 store 的 `working` getter
-读它，`CouncilView` 顶部显示「正在工作中 · 楼层 · 阶段 · 第 N 轮」；`closeCouncil` 清空进度，
-终端事件一到标识立即消失。评审阶段会一次列出所有评审楼层。
-
-**每轮原始输出（2026-10-19）**：会议结束或 fail-fast 中止后，`roundResults` 只能描述
-**成功解析**的轮次，失败 / 超时 / 未解析的发言原本在界面上无处可看。`CouncilRawTurns.vue`
-按轮展示 `council_utterances` 原文（楼层、阶段、状态、耗时；失败时显示 `error` 原文），
-`CouncilView` 在 `cv-process` 的第 0 轮、每个已完成轮次末尾各挂一块；没有 `RoundResult`、
-但确有拆解 / 提案 / 评审 / 汇总发言的轮次作为「未完成」单独成块（`DEBATE_PHASES` 排除
-裁决 / 交付轮）。数据全部来自库里的发言行，不推断、不补写。
-
-**真机故障记录（2026-10-19，1F 第 0 轮，已定位并修复）**：历史会议
-`c_f66f8f9f86185744a29a16c0` 不是超时。1F CodeBuddy 的退出码是 **0**，耗时约 **297s**
-（低于 300s 上限），stdout **146176 字节**、stderr 为空；但 transcript 数组缺少最后的 `]`。
-旧解析器把整段 stdout 当成一个 JSON 数组做 `JSON.parse`，因为这一个字符失败，随后把整场会误记为
-`failed` / 「没答上来」。实际上数组里最后一个完整 `result` 事件仍在，可以恢复正文与用量。
-现在的 `agents.js` 会先从完整的对象前缀恢复事件，`parseOutput()` 返回 `truncated`；
-`runner.js` 只有在完全没有可用正文时才记 `unparsed`，并把原始输出尾部保留在 `error` 里用于排障。
-主持人缺少必要信息时还可返回 `needsClarification`，服务端按正常结束处理；无工作目录时提示词明确
-说明临时目录不是用户项目，不能拿它当项目证据。
-
-设置工作目录不会重跑或改写已经结束的历史会议：`workspace_path` 是发起时的输入，历史发言、状态和
-报告是当时的证据，**有意保持不变**。修复只影响新会议；要观察新行为，请新建一场会。
-
-**真机烟测（2026-10-01，4 层里跑通了 1F / 4F / 8F，7F 未跑）** —— 这一步抓出两个单测全绿的真 bug，
-根因是同一个，值得记下来：
-
-- **8F OpenCode 每一轮都判成"输出解析不出内容"**，尽管回答完全正常。`opencode run --format json`
-  的正文在 `part.text` 里（**单数** `part`，不是 `parts`），而 `textOf` 的候选键里只有照猜写的 `parts`。
-- **1F CodeBuddy 的正文有 16397 个字符**，里面是 CLI 自己塞的 `<system-reminder data-role="memory">`
-  开场白 + **提问原文** + 答复，答复还出现两遍。`codebuddy -p --output-format json` 给的
-  **是一整个数组**（一份完整对话记录：`user → file-history-snapshot → reasoning → assistant → result`），
-  按"把每条 content 拼起来"读就会把提问当成它的发言。现在只认收尾事件的 `result`（退一步认最后一条
-  assistant 消息），改完正文 849 字符、干净、词元也读到了（6677/985/512/6165）。
-- **教训（已写进 `agents.js` 与 `councilAgents.test.js` 的注释）**：两个 bug 单测都是全绿的，
-  因为**单测是照着猜的线格式写的**——照着同一个猜测写测试等于没测。现在真机抓下来的原样输出
-  已经钉进 `councilAgents.test.js`（两行 opencode 事件流、五条一组的 CodeBuddy 记录），别再改回猜的。
-
-**真机烟测（2026-10-19，新增 2F / 3F / 6F 配方）**：
-
-- **2F Cline 整条跑通**（CLI 4.1.25，免费 `cline` provider）：`cline --plan --json <prompt>` 真的读了
-  临时目录里的 marker 文件、正文与结构化评审块都解析出来、词元也归到了（20307 / 81 / cache 0 / 0）。
-  两个真机结论钉进了配方：① JSON 模式**不读 stdin**（只认位置参数 prompt）；② 它把**提示词本身**
-  存成会话标题 —— 这正是 `COUNCIL_PROMPT_MARKER` 那道锁的依据（跑完一场后 2F 会话清单里看不到参与者）。
-  也实测到 `--plan` 仍会跑**只读**命令（`whoami`），写文件则被拒 —— 这一点如实写进了 §15.3。
-- **3F Codex 只验到参数这一层**：把 `codex exec --json --sandbox read-only --ephemeral
-  --skip-git-repo-check --ignore-user-config -c web_search="disabled" -` 喂给真机 `codex`，
-  它认了这串参数并进入 `turn.started`，但模型那一步因**本机 Codex 登录态无效**（`plan type is
-  required`）没走完 —— 事件流形状（`item.completed` / `agent_message` / `turn.completed.usage` 的字段名）
-  按它打印出来的 JSONL 对齐。
-- **6F Qoder 未真机验证**：本机没装 Qoder CLI，配方按官方文档（`-p --output-format json --name`）写。
-
-另外两条如实记录的观察：
-
-- **8F OpenCode 不给用量**：它的事件流里只有 `step_start` / `text`，没有 usage —— 于是 8F 的词元
-  一律 NULL、界面显示「—」。这是**服务端拿不到，不是解析漏了**，符合"取不到就留空、绝不补 0"。
-- **CodeBuddy 会把一次性目录登记成项目**：每跑一场，它就在 `~/.codebuddy/projects/tmp-wg-council-*/`
-  下留一个目录（一条 session `.jsonl`）。这是 CLI 自己的行为，我们没动它，也没有去清理
-  ——**清理别人的历史记录比留着更危险**。要清的话请你自己删。
-  （2026-10-02 起 1F/4F 都加了 `--no-session-persistence`，新跑的场次不再产生这种记录；
-  以前跑出来的那几条还躺在那里。）
-
-**真机验证（2026-10-02，为工程模式补的）** —— 单测全绿之后仍要真机验一遍的原因与上面那次一样：
-
-- **工程模式下参与者的 cwd 就是你的工程，但工程目录**没有被它写过：用一个临时工程目录跑
-  `kilo run`（带上议事厅那套 env）之后，`find` 出来的还是只有那个目录本身 —— 没有
-  `.workgremlin/`、没有任何新文件。`.workgremlin/subagents.json` 是 **WorkGremlin 自己的插件**
-  写的，配方里的 `plugin: []` 把它摘掉了；kilo 自己不在 cwd 里落东西。
-  （这条只验到"跑起来那一步"：那次调用本身因为没登录态被模型拒绝，见下条。）
-- **`--title` 真的会落进库里**：`kilo run ... --title '议事厅参与者（WorkGremlin）'` 跑完，
-  `kilo.db` 的 `session` 表里那一行 `title` 就是原文、`directory` 就是 cwd。第 5 条那条过滤
-  靠的就是这个事实。
-- **`XDG_DATA_HOME` 挪不动（登录态一起挪走）**：见上面第 5 条。这一条是**失败经验**，写下来
-  是为了别有人再试一遍：数据目录这条路看着最干净，实际上会把参与者变成"能跑但说不出话"。
+1. **The submitted prompt is composed.** The IDE injects `# Context from my IDE setup:` / `## Active file:` /
+   `## Open tabs:` before the user's sentence, which sits after `## My request:`. The hook's `userRequestText()`
+   keeps only the request body; otherwise task titles are all IDE context and the user's words never appear. Old
+   data is stripped again in the renderer by `TaskRecordsView.vue`'s `promptOf()`.
+2. **Changed files come from three routes.** (a) `PostToolUse` parses the `apply_patch` patch text from
+   `tool_input` (both `command` and `input` keys are accepted); (b) at wrap-up, the authoritative list in the
+   transcript (`Success. Updated the following files:` + `M/A/D <path>`) is replayed from the start of the turn,
+   because the IDE form often sends no patch text in `PostToolUse`; (c) a fallback scans `git ls-files` (tracked +
+   untracked-but-not-ignored) for files with an mtime after the turn started, catching shell edits (`sed -i`,
+   `patch`, python writes, redirection). Ignored build output such as `dist/` is skipped, and non-git projects
+   return empty. Self-test: `npm run test:ide-hook`.
+3. **Client vs form.** CLI and IDE extension of Codex (3F) and Claude Code (4F) share one on-disk store and one
+   `client` (`codex` / `claude`), so `client` alone cannot show "Codex CLI" vs "Codex Plugin". The hook derives
+   the **form** from that session's own records (`form = 'cli' | 'vscode' | 'ide' | 'desktop'`), reports it with
+   the task, and it lands in `task_runs.form`; the task list labels "product + form". Codex reads the rollout's
+   `session_meta` (`source` / `originator`, `codexForm()`; the desktop app is `source=vscode` +
+   `originator='Codex Desktop'`, checked before the VS Code extension so it is not mislabeled as Plugin). Claude
+   reads the `entrypoint` in lines 3–5 of the transcript (`cli` terminal / `claude-vscode` extension,
+   `claudeForm()`), using the same rule at both call sites (turn start and wrap-up). Anything unrecognized (old
+   version without the field, another form such as `sdk-cli`, unreadable disk) stays empty — never guessed. Labels
+   that already carry a form (CodeBuddy CLI / Plugin) are not appended twice. Self-tests:
+   `npm run test:task-client` (`renderer/test/taskClientLabel.test.mjs`), `npm run test:ide-hook` section [7]
+   (Codex), `npm run test:claude-hook` (`server/test/claudeHook.test.js`).
 
 ---
 
-### 4.3 实时相位的来源与滚动屏 ticker 的相位取法（2026-10-17）
+## 3. Domain model (`server/src/db/schema.sql` is authoritative)
 
-**先分清两条轴**：`sources[].kind`（`cli` / `hook` / `plugin` / `dir` / `kilo` / `opencode` / `lingma`）
-说的是「这个会话从哪儿被**列出来**」，与相位无关；相位走的是另一套 `reporterMainPhase`。
+The ownership unit is the **project** (`projects`). There is no `team` table and no `agent_status_history`.
 
-统一入口 `reporterMainPhase(workspacePath, client, session)`（`server/src/sessions.js`）
-= `FLOORS[client].readPhase || readReporterPhase`。**谁提供真实相位**按楼层分三类：
+| Entity | Key fields | Difference from the docs |
+| --- | --- | --- |
+| `projects` | `id`, `name`, `workspace_path`, `main_conversation_id`, `source CHECK IN ('report','watch')` | Formerly `teams`; the demo project uses the reserved id `__demo__`; retired `source='timeout'` values are migrated to `'watch'` |
+| `members` | `id`, `project_id`, `name`, `role`, `session_id`, `reported`, `created_at`, `ephemeral`, `project_label`, **`client`** | **No `last_seen_at`** (dropped by migration). Adds ephemeral ghosts and their project label. Badge level is not stored (computed at runtime). `client` is the product base name (`codebuddy` / `cline` / `codex` / `claude`, NULL = generic); the office filters by the current floor's client |
+| `agent_status` | `member_id` PK, `state CHECK (state = 'busy')`, `state_since`, `updated_at` | **Only borrowed busy** for a resident gremlin whose same-named ghost is working. Idle is "no row". Main-agent busy is always derived from `tasks.state`. No `progress`, `current_files`, `task_id`, `last_heartbeat_at`, `degraded`, or `source` |
+| `session_status` | `member_id`, `session_id`, `state CHECK (state = 'blocked')`, `state_since`, `updated_at`, PK `(member_id, session_id)` | **Only explicit authorization waits.** No row = not blocked. Blocked is session-scoped: two sessions of one member do not affect each other. Cleared by task progress / task end / session end / idle notification |
+| `tasks` | `id`, `project_id`, `member_id`, `parent_task_id`, `title`, `state CHECK IN ('pending','running','done','failed','cancelled')`, `progress`, `started_at`, `ended_at` | **No** `progress_source` / `blocked_reason` / `waiting_on` / `error_type`. A task is live exactly while `state='running'`; there is no timeout that cancels it. Stale cleanup only happens on explicit session reconciliation (`pruneSessionStatuses` closes running tasks of vanished sessions as `cancelled`) |
+| `messages` | `dedupe_key` unique, `archived_at`, `content_truncated`, `session_id`, `source` | **No** `redacted` / `redaction_hits` / `ingested_at_ms` / `reply_to` |
+| `messages_fts` | FTS5 `tokenize='trigram'` + three sync triggers | Table exists, but **queries do not use it** (see §5) |
+| `file_activity` | `op CHECK IN ('read','write')` | `edit` was retired, not a gap |
+| `tool_usage` | PK `(task_id, tool)`, `count`, `first_at` / `last_at`, plus project/member/client/session | **New table** (task detail → "tool usage"): accumulates one row per (task, tool) instead of one row per call. Written by `POST /api/v1/tool/use`; `/task-runs` returns `tools: [{tool,count}]`; cleared with `deleteByTopIds` |
+| `artifacts` | `member_id`, `task_id`, `kind CHECK IN ('file','doc','pr','text')`, `title`, `path` | Output artifacts |
+| `task_runs` | PK `tasks.id`; `client`, `form`, `model`, `title`, `result`, `file_count`, `files_json`, four token columns, `started_at` / `ended_at` / `duration_ms` | The per-turn user-work ledger; the four token semantics are normalized (input excludes cache, output includes thinking). Peer turns count every API request, not the last request's context |
+| `subagent_runs` | `parent_task_id`, `task_id`, `member_id`, `name`, `agent_id`, `call_id`, `background`, `result`, `files_json`, tokens | One row per summoned ghost instance; kept after dispersal as the ledger of "how many subagents this turn used" |
+| `councils` + `council_participants` / `council_materials` / `council_rounds` / `council_reviews` / `council_utterances` / `council_reports` | Seven council tables (see §4.2) | **New tables**, absent from the spec. No intersection with `members` / `task_runs`: participants are not floor members and never enter the office or task records |
+| `events` | `project_id`, `ts_ms`, `kind`, `payload_json` | Table exists but **has no writer** |
+| `settings` | key/value (currently retention days) | Server-written; read/written through `/api/v1/settings/retention` |
 
-| 楼层 | 产品 | 实时相位来源 | 写入 / 读取路径 |
+**Migration (`server/src/db/index.js`).** A migration rebuilds legacy heartbeat-era `agent_status` and
+`session_status` tables (dropping `task_id`, `last_heartbeat_at`, `degraded`, `source`), drops
+`members.last_seen_at`, drops `agent_status_history`, and rewrites retired `projects.source='timeout'` to
+`'watch'`. Old council tables with `mode` / `threshold` / vote columns are dropped and rebuilt.
+
+---
+
+## 4. Floors and session model (concepts absent from the spec)
+
+The left-hand "floors" are monitored agent products. A floor counts as `installed` only when an **install
+location** is found; an on-disk data directory alone is not evidence (otherwise a hand-written `settings.json`
+could fool the detector).
+
+| Floor | Product | On-disk form and notable behavior |
+| --- | --- | --- |
+| 1F | CodeBuddy (**CLI and Plugin merged into one floor**) | CLI: `*.jsonl` under `~/.codebuddy` + the reporter state file. Plugin: structured directories in the editor's globalStorage (genie-history / todos / message-queue / file-changes — the only route that yields runtime state). Both forms open at once are **two sessions** in this floor (separated by `session_id`), not two floors. |
+| 2F | Cline (**CLI and VS Code extension merged**) | Data root `~/.cline/data` (`$CLINE_DATA_DIR` → `$CLINE_DIR/data` → `~/.cline/data`); extension and CLI **share one store**. The VS Code `globalStorage/saoudrizwan.claude-dev` layout is pre-migration legacy (`LegacyStateReader`). Session index = `db/sessions.db` (`session_id` / `source` (`vscode` / `cli`) / `model` / `cwd` / `workspace_root` / `updated_at` / `metadata_json`); conversation = `sessions/<id>/<id>.messages.json`; metadata = `sessions/<id>/<id>.json`. Cline has a hook subsystem but it is opt-in and **not wired**, so 2F is a **polling floor**: phase is inferred from the message tail (assistant `tool_use` → tool, `thinking` → thinking, `text` → idle; user `tool_result` / prompt → thinking), always `inferred:true`. The form comes from the session row's `source`. Subagent rows (`is_subagent=1`) are not listed separately. **Changed files are always unknown**: the conversation keeps tool calls but not "which files were edited" (`read_files` / `search_codebase` are reads), so `file_count` / `files_json` stay `NULL`. Output = the closing assistant text of the turn (`attempt_completion`, markdown preserved, 4000-char cap). A **terminal session is reclaimed immediately** when Cline wrote `ended_at` / a terminal `status` (`completed` / `cancelled` / `failed` / `error`); 7F/8F have no terminal concept and keep the time window. The task ledger is unaffected (`syncTasks` still writes every turn), so "任务取消" still appears in task records. Self-test: `npm run test:cline` section [H]. |
+| 3F | Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl`; `cwd` is in the first line's `payload.cwd`. |
+| 4F | Claude Code CLI | `~/.claude/projects/<project-dir>/*.jsonl`; `cwd` starts at the line-3 `user` record (the first line has none; see `sessionRegistry.js` `cwdOfHead`). Several sessions on this floor are distinguished by `session_id`; the form (terminal / VS Code extension) is on the same `user` record (`entrypoint`, see §2.4 item 3). |
+| 5F | TraeCode (**IDE and Plugin merged into one floor**) | Session source is the reporter state file (`sessionId` / `workspacePath` are measured hook payload values). Neither form has a scannable **session** store: the IDE's `~/.trae-cn/memory/projects/<project>/<date>/session_memory_<session>.jsonl` and `project_memory.md` are memory files (the name contains a session id, but there is no conversation or project path); the plugin's `~/.marscode` holds an encrypted ai-chat binary, logs, `ai-agent/database.db`, and `snapshot/<chain-id>/v2/.git` snapshots (the first is encrypted, not readable SQLite; the second is a per-turn git snapshot) — so **the plugin form does not support session records today**. Both directories are listed in the floor capsule tooltip (two lines, no `sources[].note`, only directory + on-disk stats). The form is distinguished by the reported identity (`client`); the task list uses `CLIENT_LABELS` to show **TraeCode IDE** / **TraeCode Plugin**, with no floor-specific branch. |
+| 6F | Qoder (**CLI and plugin merged**, same rationale as 4F) | Three session routes: (1) transcript `<CLI root>/projects/<project-dir>/<session>.jsonl` — both the international `~/.qoder` and China `~/.qoder-cn` roots are scanned and deduped by `session_id`; the format matches Claude Code (file name = `session_id`, each line carries `cwd`, resolved by `sessionRegistry.js` `SUBTREE` / `sessionIdOfFile` / `cwdOfHead`); (2) reporter state file as a fallback when the JSONL has not been written or read yet; (3) the **plugin form** (VS Code / Trae CN "Qoder CN (Formerly Lingma)") has no hook subsystem and does not write `~/.qoder` transcripts, so its sessions and phase come from polling its own `local.db` (`chat_session` / `chat_record`, `server/src/lingma.js`). Without that route, plugin tasks appear in task records while the main console has no session (the console strictly follows the selected session). The three routes dedupe by `session_id` (a live CLI session retires the hook row; plugin `chat_session.session_id` cannot collide with transcript names, so both forms can coexist as two sessions). The `~/.qoder` route is display-only (file count / size / last write). Hooks are installed into `~/.qoder/settings.json` (same shape as Claude / CodeBuddy) via `--agent qoder`; the event table defaults to the widest Claude-style set (`QODER_EVENTS`) until the real names are confirmed. **Qoder only emits `SessionStart` / `SessionEnd`, with no fine-grained events**, so `hook.js` adds coarse "thinking / done" phases; 6F never stays "未上报", but phase precision is lower than Claude (it will improve automatically if Qoder ships finer events). |
+| 7F | Kilo Code (**polling + plugin**) | Kilo has **no hook subsystem** (measured on 7.8.1: no hook subcommand, no `hooks.json`, no event points), so there is no hook reporting and no session JSONL. 7F is polled from Kilo's **event-sourced SQLite** (`~/.local/share/kilo/kilo.db`, WAL mode, opened read-only so Kilo's daemon is not blocked): `session` (id / directory / title / agent / model / time_updated / summary_*), `event` (append-only, `aggregate_id` = session, monotonic `seq`, `part.type ∈ tool\|text\|reasoning\|step-start\|step-finish\|patch`, `part.state.status ∈ running\|pending\|completed\|error`), `message` (role, `path.cwd`, `finish ∈ stop\|tool-calls\|length\|content-filter`). Phase is derived from the **latest event** (tool+running → tool, tool+pending → awaiting authorization, reasoning → thinking), not guessed from file times. **`text` does not mean idle**: within one turn Kilo emits assistant text several times, so the rule joins `part.messageID` back to `message`: only `finish=stop` with `time.completed` means the turn is over → idle; `finish=tool-calls` or no finish yet → thinking. The plugin route fixed the same issue (assistant text used to report idle; now thinking, with `message.updated` finish / `session.idle` still closing the turn). **"Thinking" must carry content**: polling used to hard-code `prompt:''`; `readRoundPrompt()` now takes the current turn's `role=user` text part (strips outer JSON quotes, 80-char cap) and passes it through `sessionRegistry`; the plugin route writes the user's words into `taskTitle`, which `readReporterPhase` reads as `prompt`. Completion marker = the assistant message with `finish=stop` (`tool-calls` / `length` / `content-filter` do not count). The data root follows XDG (`kiloHome()`), **not** `~/.kilo` (that directory only holds an install-time `bin/`). There is a single `kind:'kilo'` source (SQLite, wholly different from scanning JSONL). Because it is polling, phase is always `inferred:true`. Self-tests: `npm run test:kilo` and `npm run test:task-sync`. **Task ledger exists on both routes**: polling is read-only plus per-turn sync; the plugin writes live. |
+| 8F | OpenCode (**polling + plugin**) | Same origin as 7F (Kilo Code CLI is an OpenCode fork: data root `{kilo,opencode}.db` + `storage/session_diff/` + `repos/` + `shell/` + `snapshot/`), but the **V2 schema has diverged; copying 7F's readers yields empty data**: measured Kilo 7.8.1 has 2288 rows in `event`, OpenCode 2.0.18 has **0** (events are streamed in memory, not persisted). So 8F reads `session_v2` (id / directory / title / agent / model / time_updated / summary_*) + `session_message` (`type ∈ assistant\|user\|idle\|synthetic`; `data.content[]` with `part.type ∈ tool\|reasoning\|text`; tool blocks are `{type:'tool',name,state:{status,input}}`). Phase comes from the latest message's `content[]` (tool+running → tool, tool+error → tool with error, reasoning → thinking, `type:'idle'` row → idle), always `inferred:true`; the completion marker is the row with `finish=stop` and `time.completed` (`tool-calls` / `error` do not count). Table and column names are **probed** (`session_v2` → `session`, `pragma table_info` intersection), so an OpenCode rename cannot break the endpoint. **Key capability gap: polling cannot express "awaiting authorization"** — across 114 assistant messages, `tool.state.status` only ever held `completed / error / running`, never `pending` (Kilo has pending); authorization is a separate `permission.asked` event that only exists in the memory stream. 8F therefore adds a `kind:'hook'` route: with the WorkGremlin plugin installed (`packages/reporter/src/plugin/`, implementing OpenCode/Kilo's `ctx.event.subscribe`; state-file format identical to `hook.js`, zero server changes), phase is **reported truth** (not inferred, not greyed), "awaiting authorization" appears, and the completion marker carries a **changed-file list** (`session.step.ended` `data.files`). Without the plugin it falls back to polling. **2026-10-16 (v2 vocabulary)**: OpenCode 2.0.30 changed the event set — no `message.updated` / `message.part.updated`; instead `session.inbox.enqueued` (user words), `session.tool.called` (tool name in `session.tool.input.started`), `session.execution.*` (turn start/end), `session.step.ended` (finish + tokens + `files`), `permission.asked`; the envelope changed from `{properties}` to `{id,created,type,location,data}` (`location.directory` = project path). The old plugin only understood v1, so on v2 it wrote nothing (no state file / ledger / tool usage, leaving only polling). The plugin now understands both generations; on v2 it produces a state file, `k_*` ledger rows, and tool counts (self-test `test:plugin-ingest` section [F]). Data root follows XDG (`opencodeHome()`); the `opencode` binary is at `~/.opencode/bin` and **not on PATH**, so `CLI_BIN_DIRS` explicitly includes it. Self-test: `npm run test:opencode`. Identity follows the 7F rules: the base name from the `setup(ctx)` entry is always `opencode`, and the form is always `cli` unless the desktop app is detected. |
+| 9F | GitHub Copilot | No hook and no reporter, so tasks can only come from polling: `session-store.db` (turns / files), VS Code's `state.vscdb` chat index (the only side evidence that a turn is in flight), and `chatSessions/<session>.jsonl` (user prompt / start-end / in-flight). Phase is inferred from file times and chat state (`readCopilotPhaseFromSqlite`, `inferred:true`); no cancellation signal exists. |
+
+Merged floors declare their `sources` in `products.js` (1F is `['cli','plugin','hook']`, 5F is two `dir` sources +
+`hook`, 7F is one `kilo` source with its own data-root stats, 8F is one `opencode` source with its own data root
+plus `hook` for plugin truth). A floor can consume several on-disk routes, each with its own client
+(`codebuddy` / `codebuddy-plugin`, `trae` / `trae-plugin`), and phase / completion are accepted per session.
+
+An entry is `{ kind, label?, client?, dirs?, note? }`:
+
+- `kind: 'dir'` = display-only on-disk stats, no sessions (`sessions: false`); two `dir` entries use `label` to
+  distinguish IDE / plugin in the tooltip. 5F's two routes deliberately carry no `note`.
+- `label` also supplies display names for floors where one route covers two forms — 3F/4F/6F/7F are labeled
+  `CLI/Plugin` (CLI and IDE plugin share one store and cannot be told apart), 8F is labeled `CLI/Desktop`.
+- `kind: 'kilo'` = 7F only (reads Kilo's SQLite; a separate kind from `kind:'cli'` JSONL scanning).
+- `kind: 'opencode'` = 8F only (reads OpenCode's SQLite; distinct from `kind:'kilo'` because it reads
+  `session_message` while Kilo reads `event`).
+- `kind: 'hook'` on 8F is **layered on top of** polling, not a replacement: when the plugin is installed it
+  supplies truth; otherwise it stays empty and polling covers. Both dedupe by `session_id` in
+  `sessionRegistry.claim`.
+
+The floor capsule tooltip lists only **directory + file count / size / last write** for on-disk routes, with no
+explanatory prose. Continuity tests: `server/test/mergedFloors.test.js` (`npm run test:floors`) and
+`server/test/kiloFloor.test.js` (`npm run test:kilo`).
+
+The selected session decides the main console's phase (ghosts follow it); the office layout is unaffected.
+Selecting a floor with no active session clears the room.
+
+**Session dropdown** (`renderer/src/stores/sessions.js` + `server/src/sessionRegistry.js`) is a flat list of the
+current floor's active sessions, each shown as `CLI-<project> <short id>`. Two rules:
+
+- **Reclaim**: default is "drop after 60 minutes without an event"; a polling floor that can express a terminal
+  state reclaims immediately — currently only 2F Cline (it writes `ended_at` / a terminal `status`). 7F/8F have
+  no terminal concept and keep the time window.
+- **Short ids must be unique**: the short id is the shortest unique prefix **within that floor** (not a fixed 8
+  characters). Cline ids are `<ms timestamp>_<random>`, so two sessions created in the same second share the
+  first 8 characters; the dropdown used to render two identical `CLI-wg-cx 17923740` rows. Self-test:
+  `npm run test:session-options`.
+
+### 4.1 "Task cancelled" per floor (red "任务取消", not green "任务完成")
+
+At wrap-up the main console asks one question: **did this turn finish, or was it stopped by the user?** The only
+source of truth is the completion marker written by the reporter / each product's on-disk record (`done`);
+`done.cancelled = true` turns the marker red. The third layer then shows "changed files / no output". The
+renderer reads two paths: (1) `done.cancelled` from the fast `/reporter-phase` poll; (2) `doneCancelled` from the
+`/sessions` snapshot; it ORs them (`IsoOfficeView.vue`).
+
+The "was stopped" signal differs per floor. The rule: **if we know it was interrupted, show red; if we cannot
+know, report no cancellation — never invent one.**
+
+| Floor | Product | Cancellation signal (on-disk truth) | Where it lands |
 | --- | --- | --- | --- |
-| 1F | CodeBuddy | **hook** | `hook.js` 写状态文件，`readReporterPhase` 读 |
-| 2F | Cline | **落盘** | `FLOORS.cline.readPhase = clineMainPhase`（读 `~/.cline/data` 的 `sessions.db` + 会话 JSON，`inferred`） |
-| 3F | Codex | **hook** | 同上 |
-| 4F | Claude Code | **hook** | 同上 |
-| 5F | TraeCode | **hook** | 同上（会话本身也只来自状态文件） |
-| 6F | Qoder | **落盘** | `FLOORS.qoder.readPhase = readLingmaPhase`（读 Lingma `local.db`，`inferred`） |
-| 7F | Kilo Code | **plugin** | 装了 WorkGremlin 插件 → 状态文件（真值，含「等待授权」）；没装 → 轮询 `kilo.db`（`inferred`） |
-| 8F | OpenCode | **plugin** | 装了插件 → 状态文件（真值，含「等待授权」）；没装 → 轮询 `session_message`（`inferred`） |
-| 9F | GitHub Copilot | **落盘** | `FLOORS.copilot.readPhase = readCopilotPhaseFromSqlite`（`inferred`） |
+| 1F | CodeBuddy (CLI + Plugin) | (1) CLI uses `Interrupt` when present. (2) **`FinalStop`** (the family's "end of turn" event): `final_stop_reason ∈ completed \| cancelled \| failed \| interrupted`; cancelled/interrupted closes as cancelled (`hook.js` `finishCancelled`), completed/failed is left to `Stop`. The installer writes `CODEBUDDY_EVENTS` into `~/.codebuddy/settings.json` (Trae is not merged in). (3) **Plugin (IDE extension)** emits no hook event on cancel (the extension log only has `AgentState.cancelled`, no `HookExecutor`); the server reads its own `message-queue/*.json` store: `conversations[<session>].runtime` with `paused:true + pauseReason:'cancel'` and `updatedAt ≥` turn start synthesizes a cancellation (`sessions.js` `codebuddyPauseCancelAt`). (4) An older fallback ("taskId present + idle longer than `TASK_RUN_MS` + transcript last turn still `running` ⇒ interrupted") was **removed on 2026-09-29** because it could not distinguish "still thinking" from "interrupted". | `hook.js` (`--agent codebuddy`) + `scripts/install-hooks.js` + `sessions.js`; regressions `test:final-stop` (11 cases), `test:codebuddy-cancel` (12 cases) |
+| 2F | Cline | None (Cline's hooks are not wired) → no "任务取消"; the turn closes as "任务完成" | — |
+| 3F | Codex | (1) Explicit `Interrupt`; (2) interactive sessions often do **not** send `Interrupt`, so `Stop` falls back to `event_msg/turn_aborted` (`reason=interrupted`) in the rollout | `hook.js` `runInterrupted` / `turnInterrupted`; regression `test:stop-interrupt` |
+| 4F | Claude Code | Claude sends no `Interrupt`, and on 2026-09-29 it was measured to send **no hook event at all** after pressing stop (no `Stop` / `SessionEnd` / `Notification`), so the server polls instead, with two signals: (1) the transcript tail line `[Request interrupted by user]` (interrupt while the model was speaking or a tool was running); (2) **early interrupt** (ESC before the model emits a token; the CLI writes no transcript line), detected from Claude's own session state file `<claudeHome>/sessions/<pid>.json` with `status='idle'` + `statusUpdatedAt` (an **undocumented internal file**, used with explicit user consent; 3-second grace at turn start and the idle timestamp must be later than turn start to avoid false positives on a normal turn) | `sessions.js` `claudeInterruptTail` / `claudeSessionStatus` / `claudeInterruptOf` (+ `hook.js` `turnInterrupted`); regressions `test:claude-cancel`, `test:stop-interrupt` |
+| 5F | TraeCode | **No readable cancellation signal** (no transcript, hooks only `Stop`/`SessionEnd`) → no "任务取消"; closes as "任务完成" | — |
+| 6F | Qoder | Same as 4F (Claude transcript format): the server polls the transcript tail for the interrupt marker, recognizing both `claude` / `qoder` client base names. Qoder currently emits only coarse events, so this is often unavailable; the early-interrupt fallback (session state file) matches by `sessionId` and works if Qoder writes the same file | `sessions.js` `claudeInterruptTail` / `claudeInterruptOf` |
+| 7F | Kilo Code | (1) With the plugin: if a turn is still open at `session.idle`, write `done.cancelled` (same shape as `hook.js` `Interrupt`) + a ledger `task/end(state=cancelled)`. In the VS Code extension this only works now: the reported identity comes from the environment (`KILO_CLIENT=vscode` → `kilo-plugin`), and the state file matches the one the server reads (`sessions.js` `clientHit` matches the `client` in the file content); before the fix the instance reported bare `kilo` and the HTTP layer stalled permanently because `server.json` was written late, so no cancellation marker reached disk. (2) **Pure polling cannot read "the user pressed stop"** (`message.finish` has no `interrupted`) → the red marker is not invented. The ledger still records unfinished turns as `cancelled` (only a terminal `finish` counts as `done`; `length` / `content-filter` also count as cancelled) — that means "this turn did not finish", not "the user cancelled" | `packages/reporter/src/plugin/index.js` (`session.idle` branch), `server/src/kilo.js` `readKiloRounds` |
+| 8F | OpenCode | (1) Plugin route same as 7F (`session.idle`); (2) polling reads `session_message.type='idle'` / `data.outcome='interrupted'` | `plugin/index.js`, `server/src/opencode.js` `readOpencodeDone` |
+| 9F | GitHub Copilot | **No readable cancellation signal** (no hook, no "interrupted" field in the session log) → no "任务取消" | — |
 
-hook 与 plugin 写的是**同一个**状态文件 `~/.workgremlin/hooks/<client>@<工程>@<会话>.json`
-（`shared/paths.js` 的 `statePath`），**每个会话一份** —— 所以盘上每个会话都有实时相位，一条不少。
+Server passthrough: CLI / hook floors pass the reporter's `done.cancelled` straight through the fast poll; 7F/8F go
+through `toReporterDone` (mapping the session-row shape's `doneCancelled` back to `done.cancelled`). The session
+snapshot sends `sessionInfo.doneCancelled` / the row's `doneCancelled`; the 7F/8F branches used to spread the raw
+`done` into the session row with mismatched field names, and now all go through `doneFieldsFromReporter`.
 
-**消费者谁能读到**：
+**Cancellation detection is structural, never a full-text string search** (`hook.js` `isInterruptLine`). Agent tool
+output and reasoning frequently contain `turn_aborted` / `Request interrupted by user` (measured: running
+`rg 'turn_aborted'`, or discussing interrupt logic, writes those words into the rollout). A text match would mark
+an uninterrupted turn as cancelled, paint the console red, and wipe the result summary. The hook therefore parses
+each line and only accepts Codex's `event_msg/turn_aborted` event line and the body text of a Claude-family `user`
+message; tool results, thinking, and ordinary messages carrying the same strings do not count. Regression:
+`npm run test:stop-interrupt` section [4].
 
-| 通道 | 粒度 | 谁能拿到 |
-| --- | --- | --- |
-| `GET /api/v1/reporter-phase`（1.5s 快轮询） | **一次一个会话** | 只有「选中楼层 + 选中会话」：前端只带 `?client=&session=`（`IsoOfficeView.vue`）；服务端 `if (!session) return null`，遍历状态文件时只留点名那条（`sameSession`）—— **故意如此**，早先「同 client 取最新」会让控制台显示别的会话的相位 |
-| `GET /api/v1/sessions`（会话快照，5s） | 每个会话都有 `phase` | `cli`/`hook` 行恒为 `'unreported'`（该路径不臆造相位）；plugin 行由该路 handler 写入（当前会话叠 reporter 真值，其余按落盘推断） |
+**Wrap-up must also clear the live phase** (`hook.js` `Stop` / `Interrupt`). It used to clear only `taskId` and
+leave `sessionPhase` (`thinking` / `tool`, with its timestamp frozen at the last event), while the server's
+freshness window (about 5 minutes even after `taskId` was gone) kept treating it as fresh. The symptom: after
+"任务完成 / 任务取消" flashed, the console stayed on "思考中", and the renderer guard ("a freshly lit wrap-up marker
+must not be overwritten by a live phase") failed because `fastPhase.phase` was non-empty. Both wrap-up branches
+now set `sessionPhase = null` (meaning: this turn is genuinely not moving), and the console shows idle for "hook
+connected, nothing happening now".
 
-滚动屏 ticker 用的是第二层：`/api/v1/task-feed` 每行带 `client` + `sessionId`
-（`server/src/http/routes/query.js`），ticker 拿 `sessionId` 去 join 快照的 `phase`
-（`TaskTicker.vue` 的 `phaseOfTask`）。于是 hook 楼层的 ticker 后缀永远只能兜底成「思考中」
-（`runningPhaseOfTask`）—— **这就是「Codex 控制台能亮等待授权、滚动屏却不会」的根因**。
+**`Notification idle_prompt` must not clear `done`.** CodeBuddy CLI emits an `idle_prompt` about 60 seconds after
+each turn (measured in `events.log`). That branch used to run `clearAwait()`, which also wrote `done = null`; since
+`done` is the only evidence for "任务完成 / 任务取消", both the marker and the console's live state disappeared. Now
+`idle_prompt` only clears `await` / `pending` and the phase, preserving `done` (a new `UserPromptSubmit` still
+clears it normally). Regression: `npm run test:stop-interrupt` sections [1]/[5].
 
-**方案 A（本次落地）：会话快照构建时回填真相位。** 数据都在状态文件里，只是没人为**非选中**会话读。
-在 `sessionRegistry.js` 的 `snapshot()` 里，对 `phase === 'unreported'` 的会话行调一次
-`reporterSnapshotPhase(ws, client, sessionId)`（`sessions.js`，内部即 `reporterMainPhase`；
-只对**没有自己 `readPhase` 覆盖**的楼层，即 hook / plugin 楼层；6F/9F 的行已由各自 handler 带推断相位，
-不动），命中就覆盖 `phase / action / target / context / tool / prompt` 并把 `inferred` 置假。范围与取舍：
+**The wrap-up guard compares timestamps, not "is there a live phase?"** (`IsoOfficeView.vue` consoleLive guard +
+`readReporterPhase` returning `ts`). With Claude's server-synthesized cancellation plus a stale phase that nobody
+cleared, `fastPhase.phase` stayed "思考中" and the old test (`!fastPhase.phase`) was useless: the red marker was
+immediately overwritten. Now the marker may only be overwritten when the phase timestamp is **later than** the
+wrap-up marker (a new `UserPromptSubmit` phase); paths without a timestamp (7F/8F polling) keep the old behavior.
 
-- ticker **一行不改**：它本来就 join 快照，回填后直接读到真值（能出「等待授权」）；
-- `/reporter-phase` 保持「必须点名」的防串扰设计，不动；
-- 每轮快照多的开销 =「每个未上报会话 1~2 次状态文件目录扫描」（`hooksDir` 只有几个文件）；
-- 拿不到（未装 hook / 相位过期 / 会话无 id）就照旧 `unreported`，ticker 兜底「思考中」—— 绝不臆造。
-
-自检：`npm run test:floors` 的 [A7]（回填成 `await`、带动作、`inferred=false`；无真相位仍 `unreported`）。
+**Cancellation is recorded like completion: cancelled means "did not finish", not "produced nothing".** Text already
+emitted in the interrupted turn (`task_runs.result` + conversation `type=result`) and changed files
+(`task/end.files`) are still recorded. The console's third layer picks "changed files → what it said → no output",
+and only writes "没有输出" when there really is nothing. (Earlier code cleared `said` / `result` on cancellation to
+avoid passing off the previous turn; now `turnReplies` starts from the current turn's user message and skips the
+`[Request interrupted by user]` marker, so the current output cannot bleed into the previous turn.)
 
 ---
 
-## 5. 文档 ↔ 实现 差异清单
+### 4.2 The council chamber: a second process shape (2026-10-01)
 
-| # | 条目 | 文档说法 | 实现现状 | 证据 |
+Everything in §4 monitors sessions **someone else** started: your terminal or editor runs the agent, and we only
+read the traces it leaves on disk. The council is the opposite — **we** spawn an external CLI, host it to
+completion, and leave nothing behind.
+
+| | Monitored sessions (§4) | Council participants (this section) |
+| --- | --- | --- |
+| Who starts the process | The user / editor plugin | **The server** (`child_process.spawn`) |
+| Enters the session registry | Yes (`sessionRegistry`, visible on floors and the main console) | **No.** Lives only in the seven `council_*` tables |
+| Tools | Yes, per each CLI's own config | **Always read-only**: 1F/4F get `Read,Grep,Glob`; 7F/8F allow only `read/glob/grep/list`; 2F uses `--plan`; 3F uses `--sandbox read-only`. No file writes, no network |
+| Working directory | The user's own project | **Depends on `workspace_path`**: NULL means a one-off directory under `/tmp`, created per meeting and deleted at the end; an absolute path means that directory, which **we never modify and never delete** |
+| Writes the ledger | Yes (`task_runs` / `messages` / `file_activity`) | **No.** Nothing appears in the office or task records |
+| Phase | Reported or inferred by polling | No phase concept (it is not a working agent; it is a participant speaking) |
+
+**The only switch is `councils.workspace_path`** (NULL = isolated / absolute path = project). From 2026-10-02 to
+2026-10-19 a `mode` (`vote` / `analysis`) existed orthogonally; the 2026-10-19 refactor deleted `mode`, vote
+tallying, thresholds, and `consensus.js`. The flow is now fixed roles and identical in both working-directory
+modes.
+
+| | Isolated (`workspace_path` NULL, default) | Project (absolute path) |
+| --- | --- | --- |
+| Working directory | One-off `/tmp` directory, deleted at the end | The user's project directory, not deleted, contents untouched |
+| What it can see | Only the topic and materials inlined into the prompt | **Real code** (read-only tools can inspect it) |
+| Flow | Plan → proposal → reviews → moderator convergence, run to max rounds, then adjudicate | **Identical** |
+
+Tools are read-only everywhere: 1F/4F get `--tools Read,Grep,Glob` (the same list is passed to `--allowedTools`,
+otherwise `-p` with nobody to answer the permission prompt refuses outright; 4F additionally gets
+`--permission-prompts none`); 2F uses `--plan`; 3F uses `codex exec --sandbox read-only` (OS sandbox); 6F uses
+headless `-p` (operations needing confirmation are denied by default); 7F/8F inject a config that replaces the
+all-deny permission table with `read/glob/grep/list`, while `bash/edit/write/webfetch` and **`external_directory`**
+stay denied (the last one is critical: allowing it lets a participant read everything under `~`).
+
+This is the first long-lived, server-hosted child process in the repository, so five hard constraints are
+documented in `server/src/council/agents.js`:
+
+1. **Disabling tools is a precondition, not an option.** 1F CodeBuddy / 4F Claude Code use `--tools ""` (both
+   help texts say `Use "" to disable all tools`); 7F Kilo / 8F OpenCode have no tool switch (`kilo --pure` only
+   disables external plugins — a misleading name), so a fully denied `permission` config is injected
+   (`KILO_CONFIG_CONTENT` / `OPENCODE_CONFIG_CONTENT`); 2F Cline uses `--plan` (read-only plan mode; writes are
+   rejected but read-only commands still run); 3F Codex uses `--sandbox read-only` (writes and network blocked,
+   read-only commands allowed); 6F Qoder uses headless `-p`. Self-test: `npm run test:council-agents`.
+2. **Environment variables are additive, not replaced.** Login credentials live in `~/.claude` / `~/.codebuddy`
+   and are found through `HOME`; blocking `HOME` means blocking login. Isolation relies only on **cwd (a one-off
+   temp directory) + disabled tools**, never on env changes (`agents.js` does not set `HOME`, and a test pins
+   this).
+3. **7F must remove WorkGremlin's own reporting plugin** (`plugin: []`). Kilo's global config points at
+   `packages/reporter/src/plugin/index.js`; leaving it in would report council participants into the office,
+   violating "isolated, visible only in the council".
+4. **In project mode, "no reporting" cannot rely on cwd; it must be explicit** (added 2026-10-02). Constraints 3
+   and "one-off temp directory" both assume cwd is the temp directory, so the reported project name is the temp
+   directory and the office filters it out. In project mode both fail: cwd is your project, and the reporting hooks
+   installed in `~/.claude/settings.json` / `~/.codebuddy/settings.json` report the **real project path**, turning
+   a participant into a member of your project. Therefore **every** recipe injects `WORKGREMLIN_DISABLE=1`, and
+   **our own code** exits immediately when it sees it (`packages/reporter/src/hook.js` at the top of `main()`, and
+   both entry points of `packages/reporter/src/plugin/index.js`). It lives in our code rather than someone's config
+   because we do not control every CLI's config precedence, while these two points we can always turn off.
+   Self-tests: `npm run test:claude-hook` (hook route) + `npm run test:council-quiet-plugin` (7F/8F plugin entry
+   points).
+5. **The session store of 2F/6F/7F/8F cannot be prevented; it can only be tagged** (7F/8F 2026-10-02, verified on
+   real machines; 2F/6F 2026-10-19). These products have no `--no-session-persistence`, so sessions are always
+   written to a **global** store and `session.directory` / `cwd` records the current cwd — in project mode that is
+   your project name, and the office's project filter would show "a session working" on the floor, while
+   requirement §15.2 says those two pages must show no trace. The data directory cannot be moved either: measured,
+   `XDG_DATA_HOME` does move the database (Kilo's `kilo.db` lands in the new directory), but **the login state
+   moves with it** (Kilo returns 401 "You need to sign in", OpenCode hangs; Cline with `--data-dir` returns
+   `Unauthorized`), leaving participants unable to speak. The fallback is "write as usual + tag":
+   - 7F/8F: `--title '议事厅参与者（WorkGremlin）'` (`DEFAULTS.COUNCIL_SESSION_TITLE`); `floorKilo.js` /
+     `floorOpencode.js` skip this title when listing sessions.
+   - 2F Cline: it has no title switch and stores **the prompt itself** as the title, so council prompts start with
+     `DEFAULTS.COUNCIL_PROMPT_MARKER` and `floorCline.js` skips titles containing it.
+   - 6F Qoder: `--name` uses the same title; whether its CLI transcript carries the name has **not been verified on
+     a real machine**.
+   - 3F Codex needs no marker: `--ephemeral` writes no session at all.
+   - Self-tests: `npm run test:kilo` / `test:opencode` / `test:cline` each assert "a user session in the same
+     database and project is still listed; only the participant row is hidden"; `test:council-agents` pins "the
+     marker in the recipe equals the marker used for filtering" (mismatch means the filter is useless).
+
+**Two deviations from the implementation plan** (the plan lives in `~/.claude/plans/`, outside the repo, recorded
+here so nobody looks for tables that do not exist):
+
+- The planned `council_events` table was **not created**. The timeline is assembled on the fly from
+  `council_rounds` (one row per round) + `council_utterances` (one row per speaker per round); a separate
+  append-only event table would duplicate the ledger.
+- Planned field names do not match what was stored: `councils.topic_text` → **`topic`**, `materials_json` →
+  the **`council_materials` table** (each material records `bytes_total` / `bytes_included`; a JSON column cannot
+  be queried), `outcome` → **`verdict`**; participant columns are `floor_id` / `agent` (not `floor` / `client`).
+  Two additions the plan did not mention: `round_current` (which round is current) and `error` (meeting-level
+  failure; per-speaker failures live on the participant / utterance row). The planned `threshold` was deleted with
+  voting. `schema.sql` is authoritative.
+
+**The 2026-10-19 shape (role-based flow).** Orchestration lives in `orchestrator.js`. A meeting runs
+`plan → (proposal → review → moderation) × max_rounds → adjudication → final` and **does not stop early on a high
+score**. However, **any required turn returning `failed` / `timeout` / `unparsed`, or output that cannot be parsed
+into a structured result, ends the meeting immediately** (fail-fast): no later rounds run; completed rounds and the
+report are still archived; at least one completed round → `partial`, none → `failed`; `error` records the round /
+phase / floor and the CLI's raw text; `closeCouncil` closes still-`running` / `pending` participants as cancelled /
+failed, and roles that never ran as `skipped`. The exception is a moderator returning `needsClarification` in round
+0: that is a normal ending with `verdict='needs_clarification'` / `status='done'`, the moderator recorded as
+`needs_clarification`, other roles `skipped`, and the report archived as usual. Each round stores one
+`RoundResult` in `council_rounds` (`proposal_text` / `diff_from_prev` / `moderator_json` / `stats_json`), and each
+review point stores one `council_reviews` row.
+
+Model output is parsed by `parse.js`: only the **last** fenced JSON block is taken, entries missing fields are
+dropped and counted, and if parsing fails the raw text is still stored (`status='unparsed'`) — **never invent a
+review point for it**. Convergence is recomputed by `convergence.js` from reviews and conflicts (weights from
+`shared`); model-reported scores are ignored. The same module emits consistency warnings ("are hard directives
+executable / does every blocker have a directive / is a stance split registered as a conflict"). `report.js`
+assembles the report and writes JSON + CSV + Markdown (atomic, never overwriting), then writes the file list back
+to `council_reports.files_json`. There is no compatibility with old council tables: `db/index.js` detects old
+`mode` / `threshold` / `vote` columns and drops/rebuilds the whole group.
+
+**"Working" indicator (2026-10-19).** A single call can run for minutes with no output, leaving the page blank.
+`markProgress(ctx, roundNo, phase, floors)` records progress at each phase and pushes it over WS (`status='running'`
++ `roundNo` / `phase` / `floors` / `startedAt`); the detail endpoint returns the same data through
+`orchestrator.progressOf(id)`, so a refresh keeps the indicator. The frontend store's `working` getter reads it,
+and `CouncilView` shows "正在工作中 · floor · phase · round N" at the top; `closeCouncil` clears progress and the
+indicator disappears as soon as the terminal event arrives. The review phase lists every reviewer floor at once.
+
+**Raw output per round (2026-10-19).** After a meeting ends or fail-fast aborts, `roundResults` can only describe
+**successfully parsed** rounds; failed / timed-out / unparsed turns had nowhere to appear. `CouncilRawTurns.vue`
+shows the `council_utterances` text by round (floor, phase, status, duration; raw `error` on failure), and
+`CouncilView` mounts one block after round 0 and after each completed round. Rounds that have utterances (plan,
+proposal, review, moderation) but no `RoundResult` appear separately as "incomplete" (`DEBATE_PHASES` excludes
+adjudication / final). All data comes from stored utterance rows; nothing is inferred or backfilled.
+
+**Real-machine failure (2026-10-19, 1F round 0, located and fixed).** Historical meeting
+`c_f66f8f9f86185744a29a16c0` was not a timeout. 1F CodeBuddy exited with code **0** in about **297 s** (under the
+300 s cap), wrote **146176 bytes** to stdout and nothing to stderr, but the transcript array was missing its final
+`]`. The old parser parsed the whole stdout as one JSON array, failed on that single character, and recorded the
+meeting as `failed` / "no answer". In fact the last complete `result` event was still in the array and could
+recover the text and usage. `agents.js` now recovers events from the longest complete object prefix and
+`parseOutput()` returns `truncated`; `runner.js` only records `unparsed` when there is no usable body at all, and
+keeps the tail of the raw output in `error` for diagnosis. A moderator missing required information may also
+return `needsClarification`, which the server treats as a normal ending; when no workspace is given, the prompt
+states explicitly that the temp directory is not the user's project and must not be used as project evidence.
+
+Setting a workspace does not rerun or rewrite a finished meeting: `workspace_path` is an input captured at start,
+and historical utterances, status, and reports are evidence from that time — **intentionally unchanged**. Fixes
+only affect new meetings; create a new one to observe new behavior.
+
+**Real-machine smoke test (2026-10-01, 1F / 4F / 8F passed, 7F not run).** This step caught two bugs that unit
+tests missed, both from the same root cause:
+
+- **8F OpenCode was judged "no parseable output" every round** even though the answer was fine.
+  `opencode run --format json` puts the body in `part.text` (**singular** `part`, not `parts`), and `textOf`'s
+  candidate keys only had the guessed `parts`.
+- **1F CodeBuddy's body had 16397 characters**, including the CLI's own `<system-reminder data-role="memory">`
+  preamble + the question + the answer, with the answer appearing twice. `codebuddy -p --output-format json`
+  returns **one array** (a complete conversation: `user → file-history-snapshot → reasoning → assistant →
+  result`); concatenating every `content` would read the question as its speech. Now only the closing `result`
+  event is used (falling back to the last assistant message), giving a clean 849-character body with tokens read
+  (6677/985/512/6165).
+- **Lesson (now in comments in `agents.js` and `councilAgents.test.js`):** both bugs had green unit tests because
+  the tests were written against the same guessed wire format. Verbatim real-machine output is now pinned in
+  `councilAgents.test.js` (two OpenCode event-stream lines, a five-record CodeBuddy group); do not go back to
+  guesses.
+
+**Real-machine smoke test (2026-10-19, new 2F / 3F / 6F recipes):**
+
+- **2F Cline passed end to end** (CLI 4.1.25, free `cline` provider): `cline --plan --json <prompt>` really read a
+  marker file in the temp directory, the body and structured review block parsed, and tokens were attributed
+  (20307 / 81 / cache 0 / 0). Two real-machine conclusions are pinned in the recipe: JSON mode **does not read
+  stdin** (prompt must be a positional argument), and it stores **the prompt itself** as the session title — which
+  is the basis for `COUNCIL_PROMPT_MARKER` (after a meeting, the participant is not visible in 2F's session list).
+  It was also measured that `--plan` still runs **read-only** commands (`whoami`) while writes are rejected; this
+  is recorded in §15.3 of the requirements.
+- **3F Codex was verified only at the argument layer:** the real `codex` accepted
+  `codex exec --json --sandbox read-only --ephemeral --skip-git-repo-check --ignore-user-config
+  -c web_search="disabled" -` and entered `turn.started`, but the model step did not finish because the local
+  Codex login was invalid (`plan type is required`). The event-stream shape (`item.completed` / `agent_message` /
+  `turn.completed.usage` field names) is aligned with the JSONL it printed.
+- **6F Qoder was not verified on a real machine:** the Qoder CLI is not installed here; the recipe follows the
+  official docs (`-p --output-format json --name`).
+
+Two more observations recorded as-is:
+
+- **8F OpenCode provides no usage**: its event stream has only `step_start` / `text`, no usage — so 8F tokens are
+  always `NULL` and the UI shows "—". This is **the server not having the data, not a parser gap**, consistent with
+  "leave empty, never fill in 0".
+- **CodeBuddy registers one-off directories as projects**: every meeting leaves a directory under
+  `~/.codebuddy/projects/tmp-wg-council-*/` (one session `.jsonl`). That is the CLI's own behavior; we did not touch
+  it and do not clean it up — **deleting someone else's history is more dangerous than leaving it**. Delete it
+  yourself if you want it gone. (Since 2026-10-02, 1F/4F pass `--no-session-persistence`, so new meetings no longer
+  produce these; older ones remain.)
+
+**Real-machine verification (2026-10-02, added for project mode).** Unit tests being green is not enough, for the
+same reason as above:
+
+- **In project mode a participant's cwd is your project, but the project directory was not written to**: after
+  running `kilo run` with the council env in a temporary project directory, `find` showed only the directory
+  itself — no `.workgremlin/`, no new files. `.workgremlin/subagents.json` is written by **WorkGremlin's own
+  plugin**, which `plugin: []` removes; Kilo writes nothing into cwd. (This only verified "it starts": the call
+  itself was rejected by the model because there was no login state, see below.)
+- **`--title` really lands in the database**: after
+  `kilo run ... --title '议事厅参与者（WorkGremlin）'`, the `title` column in `kilo.db`'s `session` table is the
+  verbatim string and `directory` is the cwd. Constraint 5's filter depends on this fact.
+- **`XDG_DATA_HOME` does not work (it moves the login too)**: see constraint 5. This is a **failure note**,
+  written down so nobody tries it again: the data-directory route looks cleanest, but it turns participants into
+  "can run but cannot speak".
+
+---
+
+### 4.3 Live phase sources and how the ticker reads phase (2026-10-17)
+
+**Separate the two axes.** `sources[].kind` (`cli` / `hook` / `plugin` / `dir` / `kilo` / `opencode` / `lingma`)
+says where a session is **listed** and has nothing to do with phase; phase goes through `reporterMainPhase`.
+
+The unified entry is `reporterMainPhase(workspacePath, client, session)` (`server/src/sessions.js`)
+= `FLOORS[client].readPhase || readReporterPhase`. Who supplies real phase:
+
+| Floor | Product | Live phase source | Write / read path |
+| --- | --- | --- | --- |
+| 1F | CodeBuddy | **hook** | `hook.js` writes the state file, `readReporterPhase` reads it |
+| 2F | Cline | **on-disk** | `FLOORS.cline.readPhase = clineMainPhase` (reads `~/.cline/data` `sessions.db` + session JSON, `inferred`) |
+| 3F | Codex | **hook** | Same as 1F |
+| 4F | Claude Code | **hook** | Same as 1F |
+| 5F | TraeCode | **hook** | Same (sessions themselves also come only from the state file) |
+| 6F | Qoder | **on-disk** | `FLOORS.qoder.readPhase = readLingmaPhase` (Lingma `local.db`, `inferred`) |
+| 7F | Kilo Code | **plugin** | Plugin installed → state file (truth, includes "awaiting authorization"); otherwise poll `kilo.db` (`inferred`) |
+| 8F | OpenCode | **plugin** | Plugin installed → state file (truth, includes "awaiting authorization"); otherwise poll `session_message` (`inferred`) |
+| 9F | GitHub Copilot | **on-disk** | `FLOORS.copilot.readPhase = readCopilotPhaseFromSqlite` (`inferred`) |
+
+Hook and plugin write the **same** state file `~/.workgremlin/hooks/<client>@<project>@<session>.json`
+(`shared/paths.js` `statePath`), **one per session** — so every session on disk has a live phase, none missing.
+
+Who can read it:
+
+| Channel | Granularity | Who gets it |
+| --- | --- | --- |
+| `GET /api/v1/reporter-phase` (1.5 s fast poll) | **one session per call** | Only "selected floor + selected session": the frontend sends only `?client=&session=` (`IsoOfficeView.vue`); the server does `if (!session) return null` and keeps only the named file (`sameSession`) — deliberately, because an earlier "latest for the client" showed another session's phase |
+| `GET /api/v1/sessions` (snapshot, 5 s) | every session has a `phase` | `cli` / `hook` rows stay `'unreported'` (that path does not invent phase); plugin rows are written by their handler (the current session overlays reporter truth, others are inferred from disk) |
+
+The scrolling ticker uses the second channel: `/api/v1/task-feed` returns `client` + `sessionId` per row
+(`server/src/http/routes/query.js`), and the ticker joins `sessionId` against the snapshot's `phase`
+(`TaskTicker.vue` `phaseOfTask`). That is why hook floors' ticker suffix could only fall back to "思考中"
+(`runningPhaseOfTask`) — **the root cause of "Codex's console shows awaiting authorization but the ticker does
+not"**.
+
+**Plan A (landed): backfill real phase while building the session snapshot.** The data is already in the state
+files; nobody read it for **non-selected** sessions. In `sessionRegistry.js` `snapshot()`, for rows with
+`phase === 'unreported'`, call `reporterSnapshotPhase(ws, client, sessionId)` (`sessions.js`, internally
+`reporterMainPhase`); only for floors **without their own `readPhase`** (hook / plugin floors; 6F/9F rows already
+carry inferred phase from their handler and are left alone). On a hit, overwrite `phase / action / target /
+context / tool / prompt` and set `inferred = false`. Scope and trade-offs:
+
+- The ticker changes **not at all**: it already joins the snapshot, so it reads the truth (including "awaiting
+  authorization") after the backfill.
+- `/reporter-phase` keeps its "must name the session" anti-crosstalk design, unchanged.
+- Extra cost per snapshot = "one or two state-file directory scans per unreported session" (`hooksDir` holds only
+  a few files).
+- If unavailable (no hook installed / phase stale / session has no id), it stays `unreported` and the ticker falls
+  back to "思考中" — never invented.
+
+Self-test: `npm run test:floors` section [A7] (backfills `await` with action and `inferred=false`; no truth stays
+`unreported`).
+
+---
+
+## 5. Document ↔ implementation differences
+
+| # | Item | What the docs say | What the code does | Evidence |
 | --- | --- | --- | --- | --- |
-| 1 | 协议版本与信封 | `PROTOCOL_VERSION = 1`，信封字段 `team` | **v2**，信封字段 `project` | `shared/index.js` |
-| 2 | 领域模型 | team 为一等字段、UI 支持 team 切换 | **工程（project）** 为一等字段，无 team | `def3fee`、`schema.sql` |
-| 3 | 数据源 A（目录监听） | `chokidar` 监听 `.codebuddy/teams/**`，M1 实现 | **未实现**；`chokidar` 只在 `server/package.json` 声明，源码零引用 | `server/package.json` |
-| 4 | 成员来源 | `config.json` roster + 上报 | hook / `.codebuddy/agents` 名册 / `subagents.json` 清单 / 落盘扫描 | §2 表 |
-| 5 | 主体状态枚举 | 5 主状态 `offline/idle/busy/blocked/error` + `degraded` | shared 为 `online/busy/idle/blocked/offline/thinking`；**无 `error`**，多 `online`/`thinking`；办公室只显示「忙碌 / 空闲」两档 | `shared/index.js`、`renderer/src/iso/engine.js` |
-| 6 | 消息类型 | 10 类（含 `review`/`error`） | `MESSAGE_TYPES` 已含 10 类 | `shared/index.js` |
-| 7 | 心跳节拍 | 15s 上报 / 60s 超时 | 一致：`HEARTBEAT_TIMEOUT_MS=60s`、hook 守护 15s、SDK 默认 5s | `shared/index.js`、`hook.js` |
-| 8 | 消息脱敏（P0-7） | 入库前正则替换为 `***`，原文不入库 | **未实现**（无 `redact` 相关代码），境内目前可能落明文 | 全仓检索无命中 |
-| 9 | 中文搜索 | FTS5 `trigram`，1~2 字降级 `LIKE`，FTS/LIKE 不混排 | 虚表与触发器已建；`listMessages` **一律 `LIKE`**，未接 FTS 与降级分支 | `schema.sql`、`server/src/db/index.js` |
-| 10 | 存储安全基线 | 双连接（写连接 `secure_delete=OFF` / 删除归档连接 `ON`） | **单连接**，全部 `secure_delete=ON` | `server/src/db/index.js` |
-| 11 | 文件活动三值 | `read / write / edit` | CHECK 仅 `read / write` | `schema.sql` |
-| 12 | 归档保留 | 90 天 / 单工程 10 万条，超限导出 JSONL | 只有 `archived_at` / `content_truncated` 字段与手动 `purgeProject`，**无自动归档** | `server/src/db/index.js` |
-| 13 | 进度三层降级 | 上报 → 子任务推导 → 条纹不确定条 | 只有「上报值」与「未知文案」两态，无条纹动效、无推导 | `renderer/src/components/ProgressBar.vue` |
-| 14 | 告警与通知 | 站内 S1 提示（M1）+ 系统通知（M3） | **未实现** | 全仓检索无命中 |
-| 15 | 语言栈 | TypeScript（main 拍板，含 1 天上限与切 B 条件） | **CommonJS JavaScript** + `jsconfig.json` | `package.json` |
-| 16 | 测试 | Vitest + Playwright，15 条可测性契约，L1 覆盖 ≥80% | **无任何测试文件**（只有 `docs/test-strategy.md`）；契约中仅时钟抽象等少数落地 | 仓库 |
-| 17 | 界面 | 工位视图 + 对话记录两个 Tab | **办公室（等距 Canvas，默认）/ 工位卡片 / 对话记录 / 议事厅**，另有 `?tab=flat`、`?tab=lab` | `renderer/src/App.vue`、`views/CouncilView.vue` |
-| 18 | 反向控制（M4） | 派活 + 中断，需二次确认 | 未实现（办公室里的「集合开会 / 全员回工位」是纯本地动画，不是向 agent 下发指令） | `renderer/src/iso/engine.js` |
-| 19 | 打包 | electron-builder，x64 三平台 | 未接入（`build` 只构建 renderer） | `package.json`、`scripts/build.js` |
-| 20 | 编排 | 「不是」列写明不做 agent 调度器 / 编排引擎，差分表也写「编排一律不做」 | **议事厅是唯一的例外**（`requirements.md` §15）：服务端确实会拉起外部 CLI —— 但拉的是**全新、一次性、无工具**的进程，不碰任何被监控的会话，也不写 `members` / `task_runs`。差分那段的口径已改为「编排**被监控的团队**不做」，P2-1 原文一字未动 | `requirements.md` §15、`server/src/council/` |
-| 21 | 反向控制（M4） | 对正在被监控的会话派活 / 中断 | 仍**不做**。议事厅不在这个范畴：它不往任何已有会话里塞话，参与者与被监控会话之间没有任何通道（见 §4.2 对照表）。别把议事厅当 P2-1 的起步 | `requirements.md` §15.2 |
+| 1 | Protocol version and envelope | `PROTOCOL_VERSION = 1`, envelope field `team` | **v2**, envelope field `project` | `shared/index.js` |
+| 2 | Domain model | `team` is a first-class field; UI supports switching teams | **Project** is first-class; no team | `def3fee`, `schema.sql` |
+| 3 | Data source A (directory watch) | `chokidar` watches `.codebuddy/teams/**`, implemented in M1 | **Not implemented**; `chokidar` is declared in `server/package.json` but has zero references in source | `server/package.json` |
+| 4 | Member sources | `config.json` roster + reporting | Hook / `.codebuddy/agents` roster / ghost lifecycle / disk scan | §2.1 |
+| 5 | Workstation state enum | 5 main states `offline/idle/busy/blocked/error` + a `degraded` flag | **3 states: `busy` / `idle` / `blocked`**. No `online`, `offline`, `error`, `thinking`, `unknown`, and no `degraded`. Unknown values normalize to `idle` | `shared/index.js`, `renderer/src/lib/memberTask.js` |
+| 6 | Message types | 10 types including `review` / `error` | `MESSAGE_TYPES` has **9**: `task_assign`, `task_update`, `result`, `question`, `block`, `review`, `error`, `shutdown`, `system` | `shared/index.js` |
+| 7 | Workstation state derivation | Heartbeat every 15 s, 60 s timeout, degraded after loss, task liveness inferred from heartbeat/TTL | **Derived only from data**: `busy` = a running task (or borrowed busy for a resident gremlin while a same-named ghost works); `blocked` = a `session_status` row for that session (authorization wait only); `idle` = neither. Priority `blocked > busy > idle`, earliest `stateSince` wins at equal priority. Last active = latest task start/end (`lastTaskAt`, `lastTaskAtBySession`), not a heartbeat | `server/src/ingest/bus.js` `buildMemberCard`, `hookCommon.js`, `schema.sql` |
+| 8 | Message redaction (P0-7) | Regex-replace with `***` before persisting; raw text never stored | **Not implemented** (no `redact` code); plaintext can land in the database | No hits repository-wide |
+| 9 | Chinese search | FTS5 `trigram`, 1–2 character queries downgraded to `LIKE`, FTS/LIKE not mixed | Virtual table and triggers exist; `listMessages` **always uses `LIKE`**; FTS and the downgrade branch are not wired | `schema.sql`, `server/src/db/index.js` |
+| 10 | Storage security baseline | Dual connection (write `secure_delete=OFF` / deletion-archive `ON`) | **Single connection**, `secure_delete=ON` everywhere | `server/src/db/index.js` |
+| 11 | File activity values | `read` / `write`; older drafts also listed `edit` | CHECK allows `read` / `write` only; `edit` was never implemented and is retired | `schema.sql` |
+| 12 | Archive retention | 90 days / 100k messages per project, export JSONL when exceeded | Only `archived_at` / `content_truncated` columns and manual `purgeProject`; **no automatic archive**; retention days are a setting | `server/src/db/index.js` |
+| 13 | Progress three-level fallback | Reported → sub-task inference → striped indeterminate bar | Only "reported value" and "unknown text"; no striped animation, no inference | `renderer/src/components/ProgressBar.vue` |
+| 14 | Alerts and notifications | In-app S1 notice (M1) + system notifications (M3) | **Not implemented** | No hits repository-wide |
+| 15 | Language stack | TypeScript (decision with a one-day cap and a switch-to-B trigger) | **CommonJS JavaScript** + `jsconfig.json` | `package.json` |
+| 16 | Tests | Vitest + Playwright, 15 testability contracts, L1 coverage ≥ 80% | **73 suites**, all plain Node scripts with a local `ok()` helper: 57 server test files + 17 renderer test files (73 `test:*` scripts; `pluginReply.test.js` has no alias). No Playwright E2E, no coverage gate; only a few contracts (clock abstraction, etc.) landed. `renderer/test/renderSmoke.test.mjs` is a render smoke test, not E2E | Repository, `scripts/run-tests.js` |
+| 17 | UI | Workstation view + conversation log, two tabs | **Office (isometric Canvas, default) / desk cards / conversation log / task records / council**, plus `?tab=flat`, `?tab=lab` | `renderer/src/App.vue`, `views/CouncilView.vue` |
+| 18 | Reverse control (M4) | Assign work + interrupt, with confirmation | Not implemented (the office's "gather for a meeting / everyone back to the desk" is a local animation, not a command to an agent) | `renderer/src/iso/engine.js` |
+| 19 | Packaging | electron-builder, x64 on three platforms | Not wired (`build` only builds the renderer) | `package.json`, `scripts/build.js` |
+| 20 | Orchestration | The "not doing" list says no agent scheduler / orchestration engine | **The council is the single exception** (requirements §15): the server does spawn external CLIs — but always brand-new, one-off, tool-less processes that touch no monitored session and write no `members` / `task_runs`. The difference note now reads "orchestrating the **monitored team** is out of scope"; the P2-1 text is unchanged | `requirements.md` §15, `server/src/council/` |
+| 21 | Reverse control (M4) | Assign work to / interrupt a monitored session | Still **not done**. The council is out of scope: it never injects speech into an existing session, and there is no channel between participants and monitored sessions (see §4.2) | `requirements.md` §15.2 |
+| 22 | Workstation state model | Older docs and older code: heartbeat-driven state, `offline`, `degraded`, task liveness inferred from elapsed time / heartbeat loss, `/heartbeat` and `/status` endpoints, per-member last-seen timestamps | **Refactored in `e2ad323` (2026-10-21)**: the heartbeat was removed entirely (no `/api/v1/heartbeat`, no `/api/v1/status`, no `members.last_seen_at`, no `agent_status_history`); `agent_status` can only hold borrowed `busy`; `session_status` can only hold `blocked`; a task is live only while `tasks.state='running'`; last active comes from task start/end; WS ping (60 s timeout, ping every 30 s) is transport-only and never changes state | `shared/index.js`, `schema.sql`, `db/index.js` migration, `server/src/ingest/bus.js`, `renderer/src/lib/memberTask.js` |
+| 23 | Message window / virtual scrolling | Virtual scrolling in M2 | Capped at `DEFAULTS.MESSAGE_WINDOW = 500`; no virtual scroller | `shared/index.js`, renderer message list |
 
 ---
 
-## 6. 「已承诺但未实现」清单（按对产品价值的影响排序）
+## 6. "Promised but not implemented" list (ordered by product impact)
 
-1. **消息脱敏（P0-7）** —— 唯一一条被文档标为「硬要求 / P0 缺陷」却完全没写的功能，且当前没有任何拦截点，落库即明文。
-2. **A 路线兜底** —— 没有它，未接 hook 的 agent 完全不可见；`reporter` 的接入是唯一入口。
-3. **FTS5 查询与短词降级** —— 数据量上来后 `LIKE %kw%` 会随消息数线性变慢。
-4. **自动归档与保留策略** —— 库会无限增长。
-5. **自动化测试与可测性契约** —— 回归只能靠人工跑 `npm run dev`；`docs/test-strategy.md` 的用例全部处于"设计完成、未落地"状态。
-6. **TypeScript 迁移** —— 协议密集型代码目前靠注释与 reviewer 保证字段正确。
-7. **告警 / 通知、打包分发、导出** —— M1/M3 项，未开工。
+1. **Message redaction (P0-7)** — the only item the docs label a hard requirement / P0 defect while nothing is
+   written, and there is no interception point: content is stored in plaintext.
+2. **A-route fallback (directory watcher)** — without it, agents that have no hook and no reporter are invisible;
+   reporter integration is the only entry point.
+3. **FTS5 query wiring and short-query downgrade** — `LIKE %kw%` becomes linear in message count as data grows.
+4. **Virtual scrolling** — the message window is a hard 500-row cap, not a scrolling implementation.
+5. **Automatic archive and retention enforcement** — the database grows without bound; only manual purge exists.
+6. **System notifications** — no in-app alert pipeline and no OS notification integration.
+7. **TypeScript migration** — protocol-heavy code still relies on comments and reviewers for field correctness.
+8. **Playwright E2E and packaging tests** — no browser E2E and no automated Electron packaging test; the 73 suites
+   are unit/integration scripts only.
 
 ---
 
-## 7. 文档维护约定
+## 7. Documentation maintenance rules
 
-| 你想改什么 | 改哪份 |
+| If you want to change… | Change… |
 | --- | --- |
-| 产品要什么、验收标准、状态语义 | `docs/requirements.md`（编号权威在 `requirements-outline.md`） |
-| 技术选型、数据结构、协议 | `docs/tech-design.md` |
-| 里程碑与责任 | `docs/roadmap.md` |
-| 用例设计 | `docs/test-strategy.md` |
-| 跑起来 / 排障 | `docs/runbook.md` |
-| **代码现在的真实形态、与上述文档的差异** | **本文** |
+| What the product should do, acceptance criteria, state semantics | `docs/requirements.md` (numbering authority: `requirements-outline.md`) |
+| Technology choices, data structures, protocol | `docs/tech-design.md` |
+| Milestones and ownership | `docs/roadmap.md` |
+| Test-case design | `docs/test-strategy.md` |
+| Running it / troubleshooting | `docs/runbook.md` |
+| **What the code actually looks like now, and how it differs from the docs above** | **This file** |
 
-改代码时如果动了 §1~§5 中的任何一条事实，请顺手更新本文对应行；新增差异请追加到 §5 表格而不是散落在别处。
+When a code change touches any fact in §1–§5, update the corresponding row here. Add new differences to the §5
+table rather than scattering them elsewhere.
 
 ---
 
-## 8. Codex CLI 支持矩阵（2026-09-20，实测 Codex 0.151.0）
+## 8. Codex CLI support matrix (2026-09-20, measured on Codex 0.151.0)
 
-协议：Codex 有原生 hook 子系统（`hooks` 是默认开启的 stable feature），文件是
-`$CODEX_HOME/hooks.json`，结构与 CodeBuddy / Claude Code **同源**（`{matcher, hooks:[{type:'command',…}]}`）。
-**hook 需要信任**：交互式会话要在 TUI 里用 `/hooks` 批准一次；自动化用 `--dangerously-bypass-hook-trust`。
-`~/.codex/agents` 目前还不存在，Codex 侧的具名 agent 定义仍待实证。
+Protocol: Codex has a native hook subsystem (`hooks` is a stable, default-on feature). The file is
+`$CODEX_HOME/hooks.json`, with the **same shape** as CodeBuddy / Claude Code (`{matcher, hooks:[{type:'command',…}]}`).
+**Hooks need trust**: approve once with `/hooks` in the TUI for interactive sessions, or use
+`--dangerously-bypass-hook-trust` for automation. `~/.codex/agents` does not exist yet; named agent definitions on
+the Codex side still need verification.
 
-| 能力 | 状态 | 说明 |
+| Capability | Status | Notes |
 | --- | --- | --- |
-| 成员注册 / 心跳 / 状态（busy·idle·offline） | ✅ 实测 | SessionStart / Pre·PostToolUse / Stop / SessionEnd |
-| 任务开始 / 结束 / 完成标记 | ✅ 实测 | UserPromptSubmit → `task/start`；Stop → `task/end(done)` |
-| 相位（思考中 / 调用工具 / 等待授权 / 待命） | ✅ 实测 | Pre/PostToolUse → tool/thinking；空闲时「待命」；不再退回"按 jsonl 时间猜" |
-| 文件活动（正在读写） | ✅ 实测 | `apply_patch` 没有 `file_path`，路径从 patch 文本的 `*** Update/Add/Delete File:` 解析 |
-| 子代理幽灵（出现 / 收工汇报） | ✅ 实测 | SubagentStart/Stop；名字取 `spawn_agent` 的 `task_name`，汇报文案取 `last_assistant_message` |
-| 打断收场（收掉孤儿幽灵） | 🟡 仅离线验证 | `Interrupt` 事件已接，真实会话里还没出现过 |
-| 打断 → 主控制台「任务取消」（红色，不是「任务完成」） | 🟡 仅离线验证 | `Interrupt` 落 `done.cancelled`（与 Stop 的 done 同形）；另外 Stop 时读 rollout 里的 `turn_aborted` 兜底（交互式会话里 `Interrupt` 不一定发）；回归见 `npm run test:cancel`、`npm run test:stop-interrupt` |
-| 等授权（blocked·awaiting_permission） | 🟡 仅离线验证 | 本机 `permission_mode=bypassPermissions`，从不弹权限框；Codex 走显式 `PermissionRequest`（不再用 CodeBuddy 的 pending 推断） |
-| 坐工位小怪物名册（Codex 侧 agent 定义） | 🟡 未实证 | 按 `$CODEX_HOME/agents`、`<工程>/.codex/agents` 的 `.md`/`.toml` 扫；本机还没有这类文件 |
-| 楼层 / 会话列表（3F） | ✅ 已有 | `products.js` 探测 codex 可执行文件；`sessionRegistry.js` 扫 `~/.codex/sessions/**/rollout-*.jsonl`，用 `cwdOfHead` 从头部若干行取 `payload.cwd` |
-| 按客户端隔离（3F 不显示 CodeBuddy 的成员与相位） | ✅ 实测 | `members.client` + `/api/v1/reporter-phase?client=`（合并楼层可传逗号分隔的一串） |
-| PreCompact / PostCompact | ❌ 未处理 | 与 CodeBuddy 一致（没有对应的 UI 语义） |
-| `Stop.last_assistant_message` | ❌ 未使用 | 完成摘要仍取"本轮改动过的文件" |
-| `turn_id` / `agent_id` 归因 | ❌ 未使用 | 子代理自己的工具调用带 `agent_id`，本可把文件活动归到那只幽灵身上（现在仍算主成员） |
-| 工具名归一 | ✅ 实测 | Codex 报的是 `Bash`（不是 shell）、`apply_patch`、`collaborationspawn_agent`（展示去掉前缀） |
+| Member registration / state (`busy` · `idle` · `blocked`) | ✅ Measured | `SessionStart` / Pre·PostToolUse / `Stop` / `SessionEnd`; no heartbeat. `blocked` comes only from an explicit `PermissionRequest` authorization wait |
+| Task start / end / completion marker | ✅ Measured | `UserPromptSubmit` → `task/start`; `Stop` → `task/end(done)` |
+| Phase (thinking / tool / awaiting authorization / idle) | ✅ Measured | Pre/PostToolUse → tool/thinking; idle when nothing happens; no fallback to "guess from jsonl timestamps" |
+| File activity (reading / writing now) | ✅ Measured | `apply_patch` has no `file_path`; paths are parsed from the patch text's `*** Update/Add/Delete File:` lines |
+| Subagent ghosts (appear / report back) | ✅ Measured | `SubagentStart`/`Stop`; the name comes from `spawn_agent`'s `task_name`, the report text from `last_assistant_message` |
+| Interrupt wrap-up (dispersing orphan ghosts) | 🟡 Verified without a live session | The `Interrupt` event is wired, but has not occurred in a real session yet |
+| Interrupt → console "任务取消" (red, not green) | 🟡 Verified without a live session | `Interrupt` writes `done.cancelled` (same shape as `Stop`'s done); `Stop` also falls back to `turn_aborted` in the rollout (interactive sessions do not always send `Interrupt`); regressions `npm run test:cancel`, `npm run test:stop-interrupt` |
+| Awaiting authorization (`blocked` · `awaiting_permission`) | 🟡 Verified without a live session | This machine runs `permission_mode=bypassPermissions` and never shows a permission dialog; Codex uses an explicit `PermissionRequest` (no longer inferred from CodeBuddy's pending state) |
+| Seated gremlin roster (Codex-side agent definitions) | 🟡 Not verified | Scans `.md` / `.toml` under `$CODEX_HOME/agents` and `<project>/.codex/agents`; this machine has no such files yet |
+| Floor / session list (3F) | ✅ Exists | `products.js` detects the codex executable; `sessionRegistry.js` scans `~/.codex/sessions/**/rollout-*.jsonl` and uses `cwdOfHead` to read `payload.cwd` from the first lines |
+| Client isolation (3F does not show CodeBuddy members or phases) | ✅ Measured | `members.client` + `/api/v1/reporter-phase?client=` (merged floors may pass a comma-separated list) |
+| PreCompact / PostCompact | ❌ Unhandled | Same as CodeBuddy (no UI semantics) |
+| `Stop.last_assistant_message` | ❌ Unused | The completion summary still comes from "files changed this turn" |
+| `turn_id` / `agent_id` attribution | ❌ Unused | A subagent's tool calls carry `agent_id`, which could attribute file activity to that ghost (currently still credited to the main member) |
+| Tool name normalization | ✅ Measured | Codex reports `Bash` (not shell), `apply_patch`, `collaborationspawn_agent` (prefix stripped for display) |
 
-## 9. 工作区内的已知杂物（非工程结构）
+## 9. Known workspace clutter (not project structure)
 
-| 路径 | 现象 | 说明 |
+| Path | Symptom | Explanation |
 | --- | --- | --- |
-| `work/WorkGremlin/` | ~~一份未被 git 跟踪的嵌套副本~~ | **已于 2026-09-21 删除**（内容核实为 hook 状态文件的测试残留，非工程代码） |
-| `.workgremlin/workspaces.json` | 内容却是 hook 的相位状态（`lastTool` / `sessionPhase`），不是工程管理该写的 `{current, recent}` | 该目录本应只放 `subagents.json`；疑似历史误写产物 |
+| `work/WorkGremlin/` | ~~An untracked nested copy~~ | **Deleted on 2026-09-21** (verified as test residue from hook state files, not project code) |
+| `.workgremlin/workspaces.json` | Contains hook phase state (`lastTool` / `sessionPhase`) instead of the `{current, recent}` that project management writes | This directory should only ever hold ghost working data. The old `subagents.json` manifest was removed with the ghost feed; `workspaces.json` belongs in `~/.workgremlin/`. The stray file is likely a historical mis-write |
 
-## 10. 演示模式：入口从「启动参数」改为「界面按钮」（2026-09-21）
+## 10. Demo mode: entry moved from a launch flag to a UI button (2026-09-21)
 
-**需求没变**（仍是"一套确定性的假数据、与真实数据隔离"），变的只是**怎么进**：
+**The requirement did not change** (still "one deterministic fake dataset, isolated from real data"); only **how
+you enter it** changed:
 
-| 项 | 之前 | 现在 |
+| Item | Before | Now |
 | --- | --- | --- |
-| 进入方式 | `npm run dev -- --demo` / `--demo-seed N` / `WORKGREMLIN_DEMO=1` / `MOCK=1` | 办公室 HUD 上的「演示模式」按钮（在「集合开会」左边）→ `POST /api/v1/workspace`（空路径）→ `openDemo()` |
-| 数据播种 | 启动时按 `shouldSeedDemo()` 判定（`WORKGREMLIN_DEMO_REFRESH=1` 可重灌） | 切进演示工程时**按需播种**（`__demo__` 里没有消息才灌），见 `server/src/index.js` 的 `syncDemo` / `ensureDemoData` |
-| 心跳推进器 | 启动时按 `isDemoMode()` 起，进程活着就一直跑 | 随工程切换起停：进演示起、切走停（`workspace.setOnSwitch`） |
-| 退出 | 重启且不带 `--demo` | 再点一次按钮（「退出演示」）→ 回进演示前打开的工程（`project.demoReturnPath`） |
-| 启动恢复 | `WORKGREMLIN_NO_DEMO=1` 专用来"别把我带回演示工程" | 落盘 `current.demo` 是用户自己点的结果 → 恢复进演示；该变量已删除 |
+| Entry | `npm run dev -- --demo` / `--demo-seed N` / `WORKGREMLIN_DEMO=1` / `MOCK=1` | The "演示模式" button on the office HUD (left of "集合开会") → `POST /api/v1/workspace` (empty path) → `openDemo()` |
+| Seeding | Decided at startup by `shouldSeedDemo()` (`WORKGREMLIN_DEMO_REFRESH=1` forces reseed) | Seeded on demand when switching into the demo project (only when `__demo__` has no messages), via `server/src/demo/` (`seeder`, `cleanup`, `ticker`) called from `syncDemo` / `ensureDemoData` |
+| Demo ticker | Started by `isDemoMode()` at startup and ran for the life of the process | Started/stopped with the project switch: starts on entry, stops on exit (`workspace.setOnSwitch` → `createDemo` `onSwitch`) |
+| Exit | Restart without `--demo` | Click the button again ("退出演示") → return to the project that was open before (`project.demoReturnPath`) |
+| Startup restore | `WORKGREMLIN_NO_DEMO=1` existed solely to "not take me back to the demo project" | The persisted `current.demo` is the user's own click, so restore does enter the demo; that variable was deleted |
 
-连同删掉的开关：`desktop/src/main.js` 的 `flags` 与 `workgremlin:get-flags` IPC（`preload.js` / `api/bridge.js` / `stores/project.js` 的 `flags` 一并移除）、`server/src/cli.js` 的 `--demo` / `--demo-seed`、`scripts/dev.js` 的 `WORKGREMLIN_DEMO*` 注入、`createServer({demo, seed})` 两个入参、`workspace.js` 的 `preferDemo`。
-保留：`config.DEMO_PROJECT`（`__demo__`）与 `workspace.openDemo()`（切工程本来就有）、`generator.js` 的 `seedDemoData/createDemoTicker`（改为按需调用）、`WORKGREMLIN_DEMO_FIXED_TS`（生成器的时间基准开关，与"怎么进演示"无关）。
+Removed with it: `desktop/src/main.js` `flags` and the `workgremlin:get-flags` IPC (and `flags` in `preload.js` /
+`api/bridge.js` / `stores/project.js`), `server/src/cli.js` `--demo` / `--demo-seed`, `scripts/dev.js`
+`WORKGREMLIN_DEMO*` injection, the `createServer({demo, seed})` parameters, and `workspace.js` `preferDemo`.
+Kept: `config.DEMO_PROJECT` (`__demo__`) and `workspace.openDemo()` (project switching already existed), the
+generator's `seedDemoData` / `createDemoTicker` (now called on demand), and `WORKGREMLIN_DEMO_FIXED_TS` (the
+generator's time base, unrelated to "how you enter the demo").
 
-演示期间的五处前端特判，都是为了让"点了按钮就真在演示"：
-① `sceneMembers` 里演示压过楼层/会话过滤（`floorEmpty` 不清场、`sessions.live` 不把成员压成灰）；
-② 会话下拉的"新会话自动跟随"在演示期间不切工程（否则一条真会话冒出来就把演示拽走）；
-③ 退出演示时收掉脚本：`mainAgent.enterIdle()`（**不是** `stop()` ——那会亮「已暂停」把演示味留在真数据上），真会话相位随即接管；
-④ **控制台归演示脚本独占**：`consoleLive` 的 watch 在演示时提前 return，并保证脚本在跑；
-   起脚本走 `mainAgent.startDemo()`（先清 `live` / `hookLive` 再 `start()`）
-   —— 不清的话，下拉里那条真会话每 1.5s 就会把它的「待命中」喂进来，脚本起不来 / 刚演一步就被顶掉，
-   现象就是"点了演示模式，主 Agent 不动"；
-⑤ 顶栏与状态徽标同步：项目徽标显示「演示工程 · 演示模式」（原来优先跟"选中的会话"走，会显示真工程名）、
-   会话下拉换成唯一一项「演示工程 · 演示会话」（演示期间不响应切换）、相位来源标成「演示脚本」
-   （`ConnectionBar` 的 `source='demo'`，与"上报真值 / 推断值"并列但分开着色）。
+Five frontend special cases exist so that "clicking the button really means demo mode":
 
-> 注：`startDemoScript()` 的守卫从"`live`/`hookLive` 为真就不起"改成"`auto` 为真就不重复起" ——
-> 旧守卫在演示里恒为真（真会话总在喂相位），等于永远不起脚本。
+1. `sceneMembers` lets the demo override floor/session filtering (`floorEmpty` does not clear the room,
+   `sessions.live` does not grey out members).
+2. The session dropdown's "follow new sessions" does not switch projects during the demo (otherwise one real
+   session would drag the view away).
+3. On exit, the script is stopped with `mainAgent.enterIdle()` (**not** `stop()`, which would show "已暂停" and
+   leave a demo flavor on real data); the real session phase takes over immediately.
+4. **The console belongs to the demo script**: the `consoleLive` watch returns early during the demo and ensures
+   the script is running; starting uses `mainAgent.startDemo()` (clears `live` / `hookLive` before `start()`).
+   Without clearing, a real session in the dropdown feeds its "待命中" every 1.5 s, so the script never starts or
+   is overwritten after one step — the symptom was "I clicked demo mode and the main agent does not move".
+5. The top bar and status badge stay in sync: the project badge shows "演示工程 · 演示模式" (it used to follow the
+   selected session and show the real project name), the dropdown shows the single "演示工程 · 演示会话" entry
+   (switching is ignored during the demo), and the phase source is labeled "演示脚本" (`ConnectionBar`'s
+   `source='demo'`, colored separately from reported truth / inferred value).
 
-**演示工程里的小怪物只留用户级**（2026-09-21）：`createAgentRoster` 的 `getWorkspacePath` 不再回退到
-"服务启动时解析出来的工程"，只认当前工程路径 —— 演示工程没有目录（`workspacePath === ''`），
-`listDefinedAgents('')` 只列用户级 agent（`~/.codebuddy/agents`、`$CODEX_HOME/agents`），
-于是切进演示后**项目级**小怪物（`<工程>/.codebuddy/agents`，如本工程的 leo / susan）会被 `sync()`
-从演示工程上摘掉，切回真实工程再自动补回；用户级的（如 simmon）照常留在屋里。
-实测：真实工程 3 只（leo:project / simmon:user / susan:project）→ 演示工程 9 只
-（8 个演示成员 + simmon:user，无 leo/susan）→ 切回真实工程又回到 3 只。
+> Note: the `startDemoScript()` guard changed from "do not start if `live` / `hookLive` is true" to "do not start
+> twice if `auto` is true" — the old guard was always true in the demo (a real session always fed a phase), so the
+> script never started.
 
-**名册残留的对账清理**（2026-09-21，紧接上一条）：只改 `getWorkspacePath` 还不够 ——
-名册摘人靠**进程内记账**（`registered` / `mine`），服务一重启那笔账就空了，于是**上一轮**注册进
-演示工程的项目级成员（leo / susan）再没人认领、也没人心跳，60s 后被 sweep 标成 degraded，
-在屋里就是"还在，但灰了"。所以新增 `purgeDemoStragglers()`（`server/src/index.js`）：
-进演示（含"启动时落盘就是演示"）时按名册自己的口径对账 —— 演示工程里 `role='subagent'` 且
-`agentRoster.isDefined(name)` 为假的成员行摘掉；三类不碰：演示种子成员（leader / coder …）、
-主 agent 成员（`role='agent'`，hook 上报）、临时成员（ephemeral）。
-配套：`syncDemo()` 的调用点从"restore 之后"挪到 `agentRoster.start()` 之后（对账要用名册的
-"已定义"，名册没起来时 `isDefined` 恒假，会把用户级小怪物一起误摘；函数里也加了 `if (!agentRoster) return 0` 兜底）。
-实测：手工往 `__demo__` 塞 `role='subagent'` 的 leo（复现"灰着的残留"）→ 切出再切回演示即清掉、
-用户级 simmon 保留；再塞 susan 后**重启服务**（落盘仍停在演示工程）也在启动期清掉。
-（`ops[灰]` 是演示数据里**故意**留的 degraded 样本，不是残留。）
+**Only user-level gremlins remain in the demo project** (2026-09-21): `createAgentRoster`'s `getWorkspacePath` no
+longer falls back to "the project resolved at server start" and only accepts the current project path. The demo
+project has no directory (`workspacePath === ''`), so `listDefinedAgents('')` lists only user-level agents
+(`~/.codebuddy/agents`, `$CODEX_HOME/agents`). Project-level gremlins (`<project>/.codebuddy/agents`, such as this
+repo's leo / susan) are therefore removed from the demo project by `sync()` and re-added when switching back;
+user-level ones (such as simmon) stay. Measured: real project 3 (leo:project / simmon:user / susan:project) → demo
+project 9 (8 demo members + simmon:user, no leo/susan) → back to 3.
 
-**演示模式两处收尾**（2026-10-01，用户实测提的两条）：
+**Roster reconciliation cleanup** (2026-09-21, immediately after the above): changing `getWorkspacePath` was not
+enough. Roster removal relies on **in-process bookkeeping** (`registered` / `mine`), which is empty after a server
+restart, so project-level members registered into the demo project in a previous round (leo / susan) were
+unclaimed and never reconciled. The old code swept them as `degraded` after 60 seconds, leaving "still there but
+grey". The current fix is `createDemoCleaner(...).purgeStragglers(agentRoster)` (`server/src/demo/cleanup.js`): on
+entering the demo (including "the persisted project at startup is the demo"), reconcile by the roster's own
+criteria — remove members in the demo project with `role='subagent'` for which `agentRoster.isDefined(name)` is
+false. Three kinds are left alone: demo seed members (leader / coder …), main-agent members (`role='agent'`,
+reported by hooks), and ephemeral members. `purgeStragglers` is called from the demo ticker manager after the
+roster starts (`if (!agentRoster) return 0` guards the case where the roster is not up, because `isDefined` would
+be false for everything and remove user-level gremlins too). Measured: manually inserting a `role='subagent'` leo
+into `__demo__` (reproducing the "grey leftover") → switching out and back clears it while simmon stays; inserting
+susan and **restarting the server** (persisted project still the demo) clears it at startup too. With the state
+model refactor there is no `degraded` sample in demo data anymore; `ops` is simply an idle member.
 
-① **去掉「规划中（plan）/ 汇总中（summarize）」两个相位**。它们只活在演示脚本里，真机上不产生：
-   reporter hook 只写 `await/idle/thinking/tool/done`；Kilo / OpenCode 明确不把 `step-start` /
-   `step-finish` 映射成它们（一步边界太频繁，映射后每次工具跑完都卡在「汇总中」，见 `kilo.js`）；
-   服务端 `inferPhase` 那两条推断分支（IDE 插件的 `awaitingSessionIdle` / 排队消息）没有实测样本。
-   改动：`iso/mainConsole.js` 的 `PHASES` 删掉两项；演示 `SCRIPT` 删掉 plan 那一站；
-   `mainAgent.enterPause()`（`stop()` 亮「已暂停」用的）改成"待命中 + 操作行写已暂停"，不再借 summarize；
-   `sessions.inferPhase` 那两条分支同样落回 `idle + action`（信息没丢，只是不再冒充一个工作阶段）。
+**Two demo-mode fixes** (2026-10-01, from user testing):
 
-② **退出演示后，演示小怪物在真实工程里"闪回来"**。根因在**事件串工程**，不在渲染帧：
-   渲染层的 WS 订阅不带 `project`（它显示的是"服务端当前打开的那个工程"），服务端于是把
-   **所有**工程的 `member.status` 都送过来，而 `upsertMember` 只看事件类型、不看工程。
-   退出演示后 `__demo__` 那 8 只不再有心跳，60s 后 `bus.sweepDegraded()`（每 10s 扫一次）
-   在把它们标成 degraded 的同时**逐个广播了成员卡** → 客户端照单收下 → 屋里闪回 8 只 →
-   下一次对账（15s，整份快照覆盖）又清掉。**改法**：成员卡带上 `project`（`bus.buildMemberCard`），
-   渲染层用 `lib/projectScope.js` 的 `memberBelongsToProject()` 在 `applyWorkspace` /
-   `applySnapshot` / `upsertMember` 三处过滤（缺字段一律放行，老服务端 / 老事件不受影响）；
-   `applyWorkspace` 那一道还顺手把"换工程之后、新快照到达之前"的旧工程成员立刻撤掉。
-   回归：`npm run test:project-scope`（判据）+ 真服务端复现脚本（退出演示 → 强制扫一次超时 → 屋里仍为 0 人）。
+1. **Remove the "规划中 (plan)" / "汇总中 (summarize)" phases.** They existed only in the demo script and never
+   occur on real machines: reporter hooks write only `await/idle/thinking/tool/done`; Kilo / OpenCode explicitly do
+   not map `step-start` / `step-finish` to them (step boundaries are too frequent — every finished tool would stick
+   at "汇总中", see `kilo.js`); the server's `inferPhase` branches for them (IDE-plugin `awaitingSessionIdle` /
+   queued messages) have no measured samples. Changes: `iso/mainConsole.js` `PHASES` lost both entries; the demo
+   `SCRIPT` lost the plan stop; `mainAgent.enterPause()` (used by `stop()` to show "已暂停") now means "idle + an
+   action line saying paused" and no longer borrows summarize; the two `sessions.inferPhase` branches also fall
+   back to `idle + action` (the information is kept, it just no longer pretends to be a work phase).
+2. **Demo gremlins "flashed back" into the real project after exiting the demo.** The root cause was **events
+   crossing projects**, not a render frame: the renderer's WS subscription carries no `project` (it shows "the
+   project the server currently has open"), so the server sent `member.status` for **all** projects, and
+   `upsertMember` looked only at the event type, not the project. Under the heartbeat model, the 8 demo members
+   stopped heartbeating, and the periodic degradation sweep broadcast each member card as it marked them degraded;
+   the client accepted all of them, so 8 gremlins flashed back until the next full-snapshot reconciliation. The
+   heartbeat and that sweep are gone, but the fix is still required because foreign-project cards can be broadcast
+   for other reasons: the member card carries `project` (`bus.buildMemberCard`), and the renderer filters with
+   `lib/projectScope.js` `memberBelongsToProject()` in `applyWorkspace` / `applySnapshot` / `upsertMember` (a
+   missing field passes, so old servers / old events are unaffected). `applyWorkspace` also immediately removes the
+   previous project's members during "project switched, new snapshot not yet arrived". Regression:
+   `npm run test:project-scope` (predicate) plus a real-server reproduction script.
 
-**小幽灵一律从大门飘进来**（2026-10-01）：演示模式那两只临时成员和真实场景里被召唤的
-subagent 实例走的是同一套（`engine.js` 的 `makeGhost` / `stepGhosts`）。以前幽灵是**凭空出现在
-悬浮点**上的，现在：① 先在门外候场（`gx < 0`，整只不画 —— 等距投影下墙外那点身子会从门缝里
-漏到关着的门板上）；② 等**所有小怪物都进了屋**（`entering` / `atDoor` 全清，开闸时刻记在
-`ghostGateAt`）再一个接一个出发（间隔 `GHOST_ENTRY_STAGGER` 420ms，名次取同批序号）；
-③ 从门外飘向自己的悬浮点，这一段用更快的 `GHOST_ENTRY_SPEED`，且 `gx < 0` 时同小怪物一样
-裁在门洞里 —— 看着就是"从门口飘进来"；穿越门洞期间 `atDoor` 让 `stepDoor` 把门敞着。
-兜底：`GHOST_ENTRY_WAIT_MAX`（5s）—— 召唤会打断小怪物的入场（直接落座 / 被叫去控制台），
-不能因为有人一直没落座就把幽灵永远关在门外；`setMembers` 里只要有**新**小怪物进来就把闸门
-重新关上一档（`if (enterSlot) ghostGateAt = 0`），已经在屋里飘着的幽灵不受影响。
-实测（无头驱动引擎、演示那份 6 人 + 2 幽灵的名单）：小怪物 676→3092ms 依次进屋，
-两只幽灵 4254ms / 4466ms 才从门口出现。
+**Ghosts always float in through the door** (2026-10-01): the demo's two ephemeral members and the subagent
+instances summoned in real scenarios use the same path (`engine.js` `makeGhost` / `stepGhosts`). Ghosts used to
+appear out of thin air at their hover point; now: (1) they wait outside the door (`gx < 0`, not drawn at all —
+under isometric projection a body outside the wall leaks through the closed door); (2) once **all gremlins are
+inside** (`entering` / `atDoor` cleared, the gate time recorded in `ghostGateAt`), they leave one by one
+(`GHOST_ENTRY_STAGGER` 420 ms, order taken from the batch index); (3) they float from outside toward their hover
+point at the faster `GHOST_ENTRY_SPEED`, clipped at the doorway like gremlins while `gx < 0`, so it reads as
+"floating in through the door"; `atDoor` keeps the door open while they cross. Fallback: `GHOST_ENTRY_WAIT_MAX`
+(5 s) — a summon can interrupt a gremlin's entrance (it sits immediately / is called to the console), and a ghost
+must not be locked outside forever because someone never sat down; `setMembers` closes the gate one notch again
+whenever a **new** gremlin arrives (`if (enterSlot) ghostGateAt = 0`), without affecting ghosts already floating
+inside. Measured (headless engine, the demo's 6 members + 2 ghosts): gremlins entered from 676 ms to 3092 ms, and
+the two ghosts appeared at the door at 4254 ms / 4466 ms.

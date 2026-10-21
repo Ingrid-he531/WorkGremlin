@@ -1,1182 +1,858 @@
-# WorkGremlin 需求规格说明书（requirements.md）
+# WorkGremlin — Requirements Specification
 
-| 项 | 内容 |
+| Item | Value |
 | --- | --- |
-| 产品名 | WorkGremlin —— 多 Agent 协作可视化桌面端（工位视图 + 对话记录） |
-| 版本 | **v0.3**（并入 Q1/Q2/Q3/Q5/Q8~Q11 全部拍板结论；替代 v0.2 相关章节） |
-| 编写人 | researcher（WorkGremlin 团队） |
-| 关联文档 | `docs/requirements-outline.md`（大纲，编号权威来源）、`docs/roadmap.md`（排期）、`docs/tech-design.md`（coder 技术方案）、`docs/test-strategy.md`（tester 策略）、`docs/implementation-status.md`（**实现现状**，与本文的差异总表） |
-| 工作目录 | `/home/yinghui/work/WorkGremlin` |
-| 状态 | 待评审；**《§5 状态语义定义》为 M1 阻塞依赖，优先评审** |
+| Product | WorkGremlin — a visual, local desktop app for observing multi-agent coding work (workstation view + conversation record) |
+| Version | **v0.4** (state model refactor) |
+| Owner | Product / research |
+| Related | `docs/requirements-outline.md` (feature numbering), `docs/tech-design.md`, `docs/test-strategy.md`, `docs/implementation-status.md`, `docs/roadmap.md` |
+| Working directory | `/home/yinghui/work/WorkGremlin` |
 
-> **编号权威**：功能编号一律沿用 `requirements-outline.md` 的 `P0-1 ~ P0-6 / P1-1 ~ P1-6 / P2-1 ~ P2-6`；开放问题一律沿用其 §6 的 `Q1 ~ Q7`（派生问题用 `Q3-1` 这类子编号）。本文档不再另立编号体系。
-> 与 `tech-design.md` 的字段级差异统一登记在 **§13**，供 coder 对齐。
+> **2026-10-21 — workstation state refactor.** The product now has exactly three workstation states:
+> **`busy` / `idle` / `blocked`**. The business heartbeat, heartbeat timeout, per-member TTL/lease,
+> `offline`, `error` and the orthogonal `degraded` flag were removed. Busy comes from a running task;
+> blocked comes from an explicit per-session authorization wait; idle means neither. "Last active" is
+> derived from task start/end timestamps. The WebSocket ping is transport-only. This document uses that
+> model everywhere; older 5-state text is obsolete.
 
-> **[2026-09-20 实现对齐]** 本文的**编号与验收标准仍然有效**，但下列事实性描述已被实现超越 —— 读代码时以 `docs/implementation-status.md` 为准：
-> - **`team_id` → `project_id`**：代码已无 team 概念，改为「工程（project）」（commit `def3fee`）；§3、§4、§7.1 里所有 `team_id` 按 `project_id` 理解。
-> - **A 路线（`chokidar` 监听 `.codebuddy/teams`）未实现**：`chokidar` 只在 `server/package.json` 声明，源码零引用。
-> - **§5 的 `error` 主状态未落地**：`shared/index.js` 的 `AGENT_STATES` 是 `online/busy/idle/blocked/offline/thinking`，没有 `error`；办公室只渲染「忙碌 / 空闲」两档。
-> - **§8 消息脱敏、§7.5 FTS5 查询、§13 的各项字段新增**均未实现（`listMessages` 目前一律 `LIKE`，没有 `redact()`）。
-> - 本文假设的 `PROTOCOL_VERSION = 1` / 信封字段 `team` 也已变为 **v2 / `project`**。
+> **Numbering authority.** Feature IDs follow `requirements-outline.md` (`P0-1 … P0-7`, `P1-1 … P1-6`,
+> `P2-1 … P2-6`); open questions keep `Q1 … Q11`. This document does not invent a second numbering scheme.
+
+> **Scope note.** This is a requirements document, not a status report. Where a requirement is not yet
+> implemented, the text says so. `docs/implementation-status.md` is the authoritative description of what
+> the code does today.
 
 ---
 
-## 1. 产品定位与边界
+## 1. Product positioning and boundaries
 
-本地单机、**只读为主**的桌面应用，把一个多 Agent 团队（leader / researcher / coder / tester …）的运行过程变成：
+A local, single-machine, **read-mostly** desktop app that turns the work of multiple coding agents into:
 
-1. **一块看得见的工位**（Workstation View）——一眼看清谁在干、干到哪、卡在哪、卡了多久；
-2. **一份查得到的对话记录**（Conversation View）——全量消息流水，可过滤、可搜索、可追溯、可导出。
+1. **A visible office** — who is busy, on which session, on which floor, and what is currently running.
+2. **A searchable conversation record** — the full message stream, filterable, searchable, traceable and exportable.
 
-| 是 | 不是 |
+| It is | It is not |
 | --- | --- |
-| 本地单机只读监控终端 | 云端 SaaS / 多人协作平台 |
-| 团队运行过程的仪表盘 | agent 调度器 / 编排引擎（不替 runner 派活）· **唯一例外见 §15 议事厅** |
-| 对现有团队目录的「观测 + 上报接入」 | 替换 CodeBuddy 团队机制本身 |
-| 面向「正在带一支 agent 团队干活的人」 | 面向 agent 本身 |
+| A local read-only monitoring terminal | A cloud SaaS or multi-user collaboration platform |
+| A dashboard for work in progress | An agent scheduler or orchestration engine · **the council chamber (§15) is the single exception** |
+| An observer plus a reporting endpoint for existing agent products | A replacement for any product's own team/session mechanism |
+| A tool for the person running several agents | A tool for the agents themselves |
 
-**一句话铁律：不允许编造。** 任何观测不到的字段一律显示占位（`—` / 不确定进度条），绝不用 0%、猜测值、上次旧值伪装成实时值。
+**The iron rule: never fabricate.** Any field that cannot be observed is shown as a placeholder (`—`),
+never as 0%, a guess, or a stale value pretending to be current.
 
 ---
 
-## 2. 用户画像与场景
+## 2. Users and scenarios
 
-> **P1 是唯一设计靶心**；P2/P3 的需求只在「不增加 P1 复杂度」的前提下顺带满足。
+P1 is the only design target. P2/P3 needs are satisfied only when they do not add complexity for P1.
 
-| 画像 | 特征 | 核心诉求 | 关键场景 |
+| Persona | Traits | Primary need | Key scenario |
 | --- | --- | --- | --- |
-| **P1 主力：AI 团队操盘手**（开发者 / Tech Lead，正用 multi-agent 跑真实项目） | 同时挂 3~8 个 agent；自己也在写代码；讨厌切窗口看日志 | 「一眼看清谁在干嘛、谁卡住了，卡在哪」 | 并行开发时盯盘；某 agent 阻塞 10 分钟立刻介入 |
-| P2：Agent 工程调优者（prompt / 工作流调优） | 反复跑同一批任务对比效果；关心耗时分布与消息往返 | 「复盘一次完整协作：谁等了多久、往返多少次、产出在哪」 | 跑完一轮后回看时间线，定位协作瓶颈 |
-| P3：团队负责人 / 旁观者 | 不亲自下场，想知道时间花在哪 | 「不看日志也能汇报进展」 | 开会投屏工位视图；导出会话纪要 |
+| **P1: AI-team operator** (developer / tech lead running a real project with several agents) | 3–8 agents in parallel; also writes code; hates switching windows to read logs | "See at a glance who is working, who is blocked, and where" | Watch a parallel run; intervene when an agent has been blocked for 10 minutes |
+| P2: Agent-workflow tuner (prompt/workflow optimization) | Runs the same batch repeatedly; cares about duration and message round-trips | "Review one collaboration: who waited how long, how many messages, where the output is" | Replay the timeline after a run to find bottlenecks |
+| P3: Team lead / observer | Does not operate the agents; wants to know where time goes | "Report progress without reading logs" | Put the workstation view on a meeting screen; export a session summary |
 
-### 2.1 P1 的六个验收级场景
+### 2.1 Six acceptance-level scenarios for P1
 
-| ID | 场景 | 描述 | 成功判据 |
+| ID | Scenario | Description | Success criterion |
 | --- | --- | --- | --- |
-| **SC-A 挂机盯盘** | 派完活去写自己的代码，程序常驻副屏 | 3 秒内判断：几人在干、谁空闲、谁异常，**无需点击任何按钮** |
-| **SC-B 长任务盯梢** | coder 在做预计 10 分钟的重构 | 知道「在动」还是「假死」；超过同类任务历史中位数 1.5 倍时卡片给出「慢于预期」角标（不改变状态色） |
-| **SC-C 卡壳排查** | tester 等 coder 产物已 5 分钟无动作 | **1 次点击**定位到：阻塞成员 + 阻塞原因/依赖对象 + 卡住的起始时刻 + 该成员最近消息 |
-| **SC-D 失败复盘** | 某 agent 刚才报错了 | 对话窗口按 `type=error` 过滤 + 时间轴回溯，看到完整错误链路 |
-| **SC-E 冷启动接管** | 团队已跑 20 分钟后用户才打开本程序 | 打开后 ≤10s 还原各成员真实状态与最近消息（**不许空面板**，也不许用旧值冒充实时值） |
-| **SC-F 演示 / E2E** | 向他人演示、或跑确定性自动化测试 | `--demo` / `MOCK=1` 产出**确定性**假数据，与真实数据视觉隔离 |
+| **SC-A Watch while working** | Dispatch work, then write your own code with the app on a second screen | Decide within 3 seconds who is busy, who is idle and who is blocked, **without clicking anything** |
+| **SC-B Long-task watch** | An agent is doing a 10-minute refactor | Know whether it is working; if it exceeds 1.5× the historical median for similar tasks, show a "slower than expected" badge without changing the state color |
+| **SC-C Blocked investigation** | A tester has waited 5 minutes for an artifact | **One click** to find the blocked member, the reason/awaiting object when known, when the block started, and the member's recent messages |
+| **SC-D Failure review** | An agent just failed | Filter the conversation by `type=error` and the task list by `failed`, then walk the full error chain |
+| **SC-E Cold-start takeover** | The user opens the app after the team has run for 20 minutes | Restore current states and recent messages within 10 seconds; never show an empty panel and never fake freshness |
+| **SC-F Demo / E2E** | Demonstrate the product or run deterministic automated tests | The demo project produces deterministic data and is visually isolated from real projects |
 
 ---
 
-## 3. 范围与数据坐标系
+## 3. Scope and data coordinates
 
-| 维度 | 决策 |
+| Dimension | Decision |
 | --- | --- |
-| workspace | **单 workspace**（当前工作区）；多 workspace 仅架构预留，M0~M3 不实现 |
-| ~~team~~ → **工程（project）** | ⚠️ **已被实现取代（2026-09-20）**：代码无 team 概念，改为**工程（project）**一等字段 —— `project_id` 出现在 `members / agent_status / tasks / messages / file_activity / artifacts` 全部核心表；`members` 另增 `ephemeral`（临时成员/幽灵）与 `project_label`。切换入口是**左侧楼层 + 顶部会话下拉 + 「打开工程」**，不是 team 切换；P0-4 的原始意图由「打开工程 + 楼层」承接 |
-| 成员规模 | 上限 **16 人**；≥5 自动切紧凑模式；>16 按**工程**分页折叠（原文写「按 team」，代码已无 team 概念，详见 §6.4） |
-| 平台 | 仅 **x64**（Linux AppImage/deb、Windows nsis、macOS-x64 dmg）；不出 ARM，脚本参数化不硬编码架构 |
-| 网络盘 / WSL | M0~M2 **不支持**：网络盘 / EMFILE 时降级 5s 轮询并置 `degraded`；WSL 与时钟跳变登记 M3 评估 |
-| 离线演示 | `--demo` / `MOCK=1` **提前到 M0**，与 mock 静态渲染、E2E 确定性数据源三合一 |
-| 反向控制 | **不做**（P2-1，待 runner 能力评估后再启动）。议事厅**不是**反向控制，边界见 §15 |
+| workspace | **One workspace** (the open project). Multi-workspace is an architectural reservation only |
+| ~~team~~ → **project** | The code has no team concept. `project_id` is the ownership key for `members`, `tasks`, `messages`, `file_activity`, `artifacts` and `task_runs`. Switching is via the floor list, the session dropdown and "Open project" |
+| Workstation states | **Exactly three: `busy` / `idle` / `blocked`.** No `offline`, `online`, `error`, `thinking`, `unknown` or `degraded` |
+| Liveness | **No business heartbeat and no TTL.** A task is running exactly while `tasks.state='running'`; no elapsed-time or heartbeat heuristic may change a state |
+| Member scale | Target 16 members. Compact mode (≥5 members) and pagination (>16) are **not implemented**; the target remains a requirement |
+| Floors | Nine monitored products: 1F CodeBuddy, 2F Cline, 3F Codex, 4F Claude Code, 5F TraeCode, 6F Qoder, 7F Kilo Code, 8F OpenCode, 9F GitHub Copilot |
+| Platform | x64 only (Linux AppImage/deb, Windows NSIS, macOS-x64 dmg). ARM is not shipped; packaging scripts are parameterized rather than hardcoding an architecture |
+| Network drives / WSL | Not supported. Floor readers use short SQLite timeouts and degrade to empty data on lock/EMFILE; there is no `degraded` flag and no state change |
+| Demo | A UI action that switches to an isolated demo project. The old `--demo` / `MOCK=1` startup flags are retired |
+| Reverse control | Not implemented. The council chamber (§15) is not reverse control: it starts its own one-off processes |
+| Notifications | Not implemented. With only three states, the old trigger set (`blocked / error / offline > 60 s`) is obsolete; the only candidate event is `blocked` |
 
 ---
 
-## 4. 数据来源、融合与降级（对齐 `tech-design.md` §4）
+## 4. Data sources and fusion
 
-### 4.1 两条路线
+### 4.1 Route B — active reporting (implemented, truth source)
 
-| 路线 | 内容 | 地位 |
-| --- | --- | --- |
-| **B（主动上报，真值）** | agent 经 `packages/reporter` SDK / CLI 上报 → HTTP ingest → SQLite → WS 推送 | **唯一真值源**。状态、进度、文件、耗时、产出均由 B 提供 |
-| **A（目录监听，兜底）** ⚠️ **至今未实现** | 原计划：`chokidar` 监听 `{workspace}/.codebuddy/teams/{team}/`，解析 `config.json`（roster）与各成员 mailbox | 设计上的**兜底**：仅能拿到名单与**收件**。**实现状态：零代码**（`chokidar` 仅在 `server/package.json` 声明，源码无引用） |
+Agent hooks and the `packages/reporter` SDK/CLI report to the local server (`POST /api/v1/...`).
+Reports are persisted in SQLite and pushed to the renderer over WebSocket.
 
-> ⚠️ **A 路线未实现（2026-09-20）**：`.codebuddy/teams` 没有任何解析器，本节的「融合」目前只有 B 一路。
-> 实际在跑的四个成员来源是：CodeBuddy 系 hook 上报 / `.codebuddy/agents` 名册（常驻小怪物）/ `.workgremlin/subagents.json` 清单（临时幽灵）/ 各产品落盘扫描 —— 见 `docs/implementation-status.md` §2。
+| Report | Purpose |
+| --- | --- |
+| `register` | Create/update a member and mark `reported=1` |
+| `task/start`, `task/progress`, `task/end` | Task lifecycle; the only source of `busy` |
+| `task/tokens`, `task/current` | Token backfill and wrap-up fallback |
+| `message` | Message stream |
+| `file/touch` | File read/write activity |
+| `tool/use` | Tool-usage counters |
+| `ghost` | Summoned subagent lifecycle |
+| `hook` | Raw product hook event; the server dispatches it to a floor adapter |
 
-### 4.2 融合规则（写入同一张表，`source` 区分，`dedupe_key` 去重）
+There is **no `/heartbeat` endpoint** and **no `/status` endpoint**. `blocked` is produced by the hook
+dispatcher when a product asks for permission (`PermissionRequest` / permission `Notification`).
 
-1. **成员 roster**：A 发现的名单作为「已发现成员」，B 的 `register` 覆盖/补全 `role/session_id`；只被 A 发现的成员 `reported=0`，UI 打「被动观测」角标。
-2. **消息**：A 侧 `source='watch'`（`dedupe_key = sha1(memberId|ts|from|sha1(content))`），B 侧 `source='report'`；同 key 只入库一次，**B 优先保留并补齐非空字段**。
-3. **状态**：**B 的状态是唯一真值**；成员 60s 内无 B 心跳 → 退化为 A 推断态并置 `degraded=1`。
-4. **进度 / 当前文件 / 已耗时 / 最近产出**：**仅 B 提供**；A 模式下这些区域显示 `—（未接入上报）`，**绝不推断、绝不编造**。
+### 4.2 On-disk floor readers (implemented, supplementary)
 
-### 4.3 三条不可协商的约束
+Each floor module reads its product's local store (SQLite, JSONL/rollout files, checkpoints, session
+indexes) and normalizes sessions, task runs, tokens and phases. These readers supply data a hook cannot
+carry; they are **not** a workstation-state authority.
 
-- **只读**：WorkGremlin **不修改**任何被观测的数据源（不回写、不标记已读进源文件）。
-- **不编造**：观测不到的字段显示占位；禁止用历史值、猜测值、0% 填充。
-- **幂等**：所有写入以 `dedupe_key` 唯一索引保证重放、重启、A/B 双写均不产生重复（验收见 §7.4）。
+The old route A (a `chokidar` watcher over `.codebuddy/teams`) was designed but **never implemented**.
+Nothing in the current server depends on it.
+
+### 4.3 Fusion rules
+
+1. **Members.** Reports/hooks register members; the agent roster (`.codebuddy/agents/*.md` at project and
+   user level) registers resident gremlins; ghost records represent summoned subagents; floor scans add
+   sessions. A member with no active reporting has `reported=false` and is shown as "passively observed".
+2. **Messages.** `source='report'` for reported messages, `source='watch'` for legacy directory-derived
+   messages. `dedupe_key` makes replay idempotent; report wins.
+3. **State.** Only `busy` / `idle` / `blocked` (see §5). No heartbeat or inferred liveness participates.
+4. **Fields.** Progress, files, elapsed time and artifacts come only from reports/floor readers. When
+   unavailable the UI shows `—`; it never invents a value.
+
+### 4.4 Three non-negotiable constraints
+
+- **Read-only:** WorkGremlin never modifies an observed product's data or source files.
+- **No fabrication:** unobservable fields are placeholders; no historical value may impersonate a live one.
+- **Idempotent:** every write is deduplicated or keyed, so replay, restart and mixed sources cannot create
+  duplicate messages or tasks.
 
 ---
 
-## 5. 状态语义定义（专章 · M1 阻塞依赖）
+## 5. Workstation state semantics
 
-> **【交付状态】** 本章已单独交付 leader / coder，可作为 **M1 状态机与 DB schema 的定稿依据**。后续变更需走版本记录并在消息中同步 coder，避免 M1 实现漂移。
-> **【coder 取用顺序】** §5.1 枚举 → §5.2 输入量 → §5.3 判定算法 → §5.4 逐状态定义 → §5.5 idle/busy 边界 → §5.6 blocked → §5.7 degraded → §5.8 迁移图 → §5.9 进度三值 → §5.10 展示矩阵 → §13 schema 差异清单。
-
-### 5.1 状态模型总览
-
-**5 个互斥主状态**：`offline` · `idle` · `busy` · `blocked` · `error`
-**1 个正交标志**：`degraded`（可与任一主状态组合，如 `busy + degraded`）
+### 5.1 Model overview
 
 ```
-任意时刻：每个成员有且仅有 1 个主状态 + 0/1 个 degraded 标志
-主状态回答：「此刻这个工位有没有在产出，为什么没有」
-degraded 回答：「这个结论的可信度是否下降」
+Any moment: each member has exactly one state: busy | idle | blocked
+
+busy    := the selected session has a running task
+blocked := the selected session has an explicit authorization wait
+idle    := neither of the above
 ```
 
-> **已废弃**：`unknown` 不再作为第 6 个平级状态。无法判定时，按 §5.3 的判定链落到 `offline` 或保留旧值 + `degraded`，二者必有其一。
-> **`online` 不是主状态**：接了上报但无任务的成员一律归入 `idle`（主状态已隐含在线），避免 `online/idle` 语义重叠。
+- **`busy`** includes tool calls, file reads/writes, patch generation, tests, **and "thinking / waiting
+  for the model"** inside a running task.
+- **`blocked`** is an explicit wait on an external actor. Today the hook dispatcher writes it only for
+  permission/authorization requests (`reason = awaiting_permission`).
+- **`idle`** means no running task and no explicit wait. It does not mean "the process is alive"; liveness
+  is not modeled.
 
-### 5.2 判定输入量
+**States that do not exist:** `offline`, `online`, `error`, `thinking`, `unknown`, `degraded`.
+Adding one requires a design change, not a local tweak.
 
-**B 侧上报字段（`tech-design.md` §5.2）→ 可用于判定**
+### 5.2 Inputs
 
-| 上报路径 | 关键字段 | 对判定提供什么 |
+| Source | Fields | What it provides |
 | --- | --- | --- |
-| `/register` | `memberId, name, role, sessionId?` | 存在性、roster |
-| `/heartbeat` | `memberId, state?, progress?, taskId?, files?, ts?` | **活性信号**（建议 5s 一次）+ 轻量状态 |
-| `/task/start` | `memberId, taskId?, title, parentTaskId?` | 活跃任务开始 → `busy` |
-| `/task/progress` | `memberId, taskId, progress, note?, files?` | 活跃任务推进（0–1） |
-| `/task/end` | `memberId, taskId, state: done\|failed\|cancelled, artifacts?` | 任务结束 → `idle` / `error` |
-| `/status` | `memberId, state, reason?` | 显式状态切换（`blocked` / `error` / `idle`） |
-| `/message` | `from, to?, type, subject?, content, taskId?, ts?` | 消息流水；可用于识别等待语义（见 §5.6） |
+| `register` | `memberId, name, role?, sessionId?, client?` | Existence and identity |
+| `task/start` | `memberId, taskId?, title, sessionId?, parentTaskId?` | Opens a running task → busy for that session |
+| `task/progress` | `memberId, taskId, progress, files?, sessionId?` | Keeps the task running; clears that session's blocked row |
+| `task/end` | `memberId, taskId, state: done \| failed \| cancelled` | Ends the task; idle when no other task runs in that session |
+| `message` | `from, to?, type, subject?, content` | Conversation stream; **not** a state input |
+| `file/touch` | `memberId, path, op: read \| write` | File activity for the task details/office tooltip |
+| `hook` | Raw product event | Tasks, files, tool usage, ghosts, blocked/unblocked |
+| Floor readers | Sessions, transcripts, tokens, phase | Supplementary detail; not a workstation state |
 
-**A 侧可观测证据 → 只能推断「有没有活性」**
+`task.progress` is optional data. Reporting it does not gate or prolong any state; not reporting it is
+normal.
 
-| 证据 | 可推断 | 不可推断 |
+### 5.3 Derivation algorithm
+
+```
+input: member, selected session, tasks, session_status
+
+if session_status[member, session].state == 'blocked':
+    return BLOCKED with state_since = session_status.state_since
+if exists task in session with task.state == 'running':
+    return BUSY with state_since = task.started_at
+return IDLE with state_since = member.created_at
+```
+
+- **`pending` tasks are not running** and therefore do not make a member busy.
+- **`done` / `failed` / `cancelled` tasks** do not make a member busy.
+- **`failed` is a task outcome, not a workstation state.** The task record shows it; the member simply
+  returns to idle/busy based on remaining running tasks.
+- **Priority on the member card** (`buildMemberCard`): `blocked > busy > idle`; within the same priority
+  the earliest `stateSince` wins. A card is an aggregate across sessions.
+- **Renderer priority for the selected session**: `blocked (same session) > running task (same session) >
+  borrowed summon busy > idle`. State never leaks between sessions.
+- **Borrowed busy**: a resident gremlin may borrow busy from a same-named ephemeral ghost while that
+  ghost works. This is a display state stored in `agent_status`, not task liveness.
+
+**No timeout is a state input.** There is no elapsed-time threshold, no heartbeat timeout, no TTL and no
+automatic offline/error transition. A running task remains busy until an explicit end event or an explicit
+session reconciliation closes it.
+
+### 5.4 State definitions
+
+#### `idle`
+
+- **Derivation:** no running task and no blocked row for the selected session.
+- **Entered:** after `task/end`; after registration with no task; after a blocked row is cleared with no
+  running task.
+- **Exited:** a task starts running, or an authorization wait is recorded.
+- **Card text:** `Idle`; when a task just finished, the footer shows "last active MM-DD HH:mm".
+- **Color:** green (`#22C55E`); icon `○`; static status bar.
+
+#### `busy`
+
+- **Derivation:** a task in the selected session has `state='running'`.
+- **Entered:** `task/start`, or a `task/progress` for a running task.
+- **Exited:** `task/end` with `done` / `failed` / `cancelled`; if either result leaves no other running
+  task in the session, the member returns to idle.
+- **Includes:** thinking and waiting for the model, tool gaps, long tool runs with no events.
+- **Card text:** `Busy · {current action}` when an action is known, otherwise `Busy`.
+- **Color:** blue (`#3B82F6`); icon `◐`; animated left status bar when motion is allowed.
+
+#### `blocked`
+
+- **Derivation:** a `session_status` row with `state='blocked'` for the selected session.
+- **Entered:** the hook dispatcher sees a permission/authorization request
+  (`PermissionRequest` / permission `Notification`), with `state_since` set at that moment.
+- **Exited (cleared):** task progress; task end; session end; idle notification. Clearing affects **only
+  that session**.
+- **Scope:** per session. Another session of the same member continues busy/idle independently.
+- **Card text:** `Blocked`; when the hook phase reports the awaiting tool/file, the office tooltip may show
+  it. If no reason is known, show `Blocked` and **do not invent a reason**.
+- **Color:** amber (`#F59E0B`); icon `⚠`; amber card edge while blocked.
+
+### 5.5 Boundary decisions
+
+| Scenario | Decision | Reason |
 | --- | --- | --- |
-| `.codebuddy/teams/{team}/config.json` 中存在该成员 | roster 存在性 | 角色以外的一切 |
-| 该成员 mailbox 文件 `mtime` 在最近窗口内有变化 | 有活动迹象 → 可推断 `busy` | 具体任务、进度、文件、耗时 |
-| 该成员 mailbox 文件存在但长时间无变化 | 无活动迹象 → 可推断 `idle` | 为何无活动（不得推断 blocked/error） |
+| Task dispatched but not started (`pending`) | **idle** | Nothing is producing yet |
+| Task running, model thinking / waiting for an LLM reply | **busy** | Thinking is part of the running task |
+| Gap between two tool calls | **busy** | The task is still running; no flicker to idle |
+| No tool calls for a long time, task still running | **busy** | The task row is the truth; this is not evidence of blocking |
+| Waiting for permission / hook confirmation | **blocked** (`awaiting_permission`) | A real external actor must act |
+| Running a tool while also waiting for a reply | **busy** | Production has priority; the wait is secondary |
+| No events for 60 s / 5 min / 1 h | **state unchanged** | There is no heartbeat or TTL; silence is not a state transition |
+| A member's task process died | **state unchanged until an explicit end/reconciliation** | No timeout-based inference and no fabricated `offline` |
+| Member never reported | **idle** + passive-observation badge | `reported=false`; fields that are unavailable stay empty |
 
-**判不了怎么办（硬规则）**：A-only 场景下 **禁止推断 `blocked` 与 `error`**（二者都需要显式语义证据，观测行为无法区分"在等依赖"与"在思考"）。推测不出来就保持上一有效主状态并置 `degraded=1`。
+### 5.6 `blocked`: establishment and clearing
 
-### 5.3 判定算法（唯一入口，伪代码）
+**Establishment.** Blocked is explicit and session-scoped. The hook dispatcher writes it when a product
+asks for permission (for example Claude/Codex permission requests, Kilo pending tool states). It is not
+inferred from "no activity".
 
-```
-输入：member, now, B_events(<=60s), A_evidence(<=300s), last_known
-输出：{ state, degraded, reason, since }
+**Reason.** `reason` is not persisted: `session_status` stores only `state`, `state_since` and
+`updated_at`. The only conceptual reason today is `awaiting_permission`; the UI may show the awaiting
+tool or file from the hook phase. If it is unknown, show no reason rather than guessing.
 
-// 第 0 步：时钟健康度（见 §5.7 D3）
-if (时钟跳变或回退) -> degraded += CLOCK_SKEW
+**Clearing (any of):**
 
-// 第 1 步：活性闸门（Liveness Gate）——只回答"还活着吗"
-alive_by_B = (now - last_heartbeat_at <= HEARTBEAT_TIMEOUT)   // 默认 60s
-alive_by_A = (存在 A 侧活动证据 && now - A_last_seen <= A_SILENT_TIMEOUT)  // 默认 300s
+1. `task/progress` for that session (progress proves the task is active again);
+2. `task/end` for that session's task;
+3. session end / session-list reconciliation;
+4. an idle notification from the product.
 
-if (!alive_by_B && !alive_by_A) -> return OFFLINE, degraded=0
-if (!alive_by_B &&  alive_by_A) -> degraded += INFERRED   // A 推断，允许继续参与仲裁
-else                            -> degraded = 无（B 真值）
+**Rules:**
 
-// 第 2 步：证据仲裁（活着的前提下，固定优先级）
-//         error > busy > blocked > idle
-if (存在显式 error 证据：/task/end failed  或 /status{state:'error'}
-     或 ERROR_WINDOW(默认 300s) 内失败计数 >= ERROR_THRESHOLD(默认 3))
-        -> ERROR
-else if (存在活跃任务 running：/task/start 未 end，或 /heartbeat 携带 taskId，
-     或 显式 /status{state:'busy'})
-        -> BUSY
-else if (存在阻塞证据：显式 /status{state:'blocked', reason}
-     或 已发出请求类消息且 over BLOCK_GRACE(默认 45s) 无本地推进 且 依赖未满足)
-        -> BLOCKED
-else if (有活性信号，无活跃任务，无失败，无未满足依赖)
-        -> IDLE
+- Clearing a session's block never changes another session's block or running task.
+- There is no state stack. After clearing, the derivation simply re-evaluates: running task → busy,
+  otherwise idle.
+- There is no "manual unblock" button; that would be reverse control (P2-1).
+- No duration-based auto-clear exists. A long block stays blocked until an explicit event clears it.
+- Deadlocks between members are display-only; the app does not intervene.
 
-// 第 3 步：offline 兜底（第 1 步已覆盖，此处仅处理从 roster 中消失）
-if (成员不在 roster 且从未上报) -> OFFLINE + "从未上报"
-```
+### 5.7 Retired axes
 
-**阈值（建议值，写入设置面板，可覆盖）**
+The following concepts were removed and must not appear in UI, protocol or tests:
 
-| 常量 | 默认 | 含义 |
-| --- | --- | --- |
-| `HEARTBEAT_INTERVAL` | **15s**（**上报侧约定，非 App 设置项**） | agent/reporter 侧参数；服务端只校验 `interval ≤ HEARTBEAT_TIMEOUT/3`（=20s）。**以本文为准，`tech-design.md` §5.2 的 5s 作废**（见 §13-11）；tester 用例按 15s 编写，**无需配置覆盖用例** |
-| `HEARTBEAT_TIMEOUT` | **60s** | 超期无 B 心跳 → 置 `degraded`（拍板值，不讨论） |
-| `A_SILENT_TIMEOUT` | 300s | A-only 下无活动迹象多久 → `offline` |
-| `BLOCK_GRACE` | 45s | 发出请求后多久无推进 → 判 `blocked` |
-| `ERROR_WINDOW` / `ERROR_THRESHOLD` | 300s / 3 次 | 失败计数窗口与阈值 |
-| `CLOCK_SKEW_TOL` | 5s | 上报 `ts` 与服务端接收时刻的允许偏差 |
-| `SLOW_FACTOR` | 1.5× | 超过同类任务历史中位数 1.5 倍 → 「慢于预期」角标 |
+| Retired | Why / replacement |
+| --- | --- |
+| Business heartbeat (`/heartbeat`, `last_heartbeat_at`) | Task start/end is enough for state and last-active. No lease to renew |
+| Heartbeat timeout / liveness gate | Silence cannot distinguish thinking, a dead process and a long tool run. No timeout may change state |
+| Member TTL / lease renewal | Same reason; state is derived from persisted task rows |
+| `offline` | The server is expected to be running while it observes; members are idle or busy. A member that disappears from a session list has its running tasks explicitly closed as cancelled by reconciliation |
+| `online` | Redundant with idle |
+| `error` as a member state | A failed task is `tasks.state='failed'`; the member returns to idle/busy. Errors remain visible in task records and messages |
+| `unknown` | Unavailable data is an empty field, not a state |
+| `degraded` flag / grey inferred state | Passive members are marked `reported=false`; unavailable fields stay empty. There is no inferred state to warn about |
+| `source='timeout'` | Data source is only `report` or `watch` |
+| Message type `heartbeat` | Removed from the enum; no heartbeat messages are stored |
 
-### 5.4 五主状态逐一定义
+**Consequence for "the agent died".** If a process dies without reporting an end, the task row remains
+`running` until the product or the session reconciliation ends it. WorkGremlin deliberately does not guess.
+This is the price of never fabricating a state.
 
-#### `offline` —— 离线
-- **判定**：既无 B 心跳（>60s）又无 A 活动证据（>300s）；或成员已从 roster 移除 / 显式 deregister / shutdown 事件。
-- **进入**：上述任意一条成立即刻进入。
-- **退出**：任意 B 上报到达，或 A 侧出现新活动证据。
-- **仅 A 可用时**：可判定（无 A 活动超 300s 即 offline）。
-- **数据缺失展示**：`—`，文案 `离线 · 最后活跃 {相对时间}`；从未上报者 `离线 · 从未上报`。
-- **展示**：主色 `#6B7280` 灰 · 图标 `•` · 整卡不透明度 60% · 进度条冻结为灰化 `—`。
+### 5.8 Transitions
 
-#### `idle` —— 空闲（在线但无任务在执行）
-- **判定**：有活性信号，且**无活跃 running 任务**、无未恢复失败、无未满足依赖。
-- **进入**：`/task/end` 成功后；或 `/register`/首个心跳且未带 task；或 `/status{state:'idle'}`。
-- **退出**：出现 `running` 任务 / 显式 blocked / error / 活性丢失。
-- **边界**：**`pending`（已派单但未开始）算 `idle`**，并在卡片上加辅助徽标 `待办 N 项`（详见 §5.5）。
-- **仅 A 可用时**：可推断（有 roster 且无近期活动）→ `idle + degraded`。
-- **展示**：`#22C55E` 绿 · `○` 空心圆 · 状态条静态 · 文案 `空闲 · 等待派单` / `空闲 · 已完成 N 项`。
+Because states are derived, every transition is just a re-evaluation after an event:
 
-#### `busy` —— 忙碌（正在执行任务）
-- **判定**：存在活跃任务（`task.state='running'`），**或** heartbeat 携带 `taskId`，**或** 显式 `busy`。
-- **包含**：工具调用/读写文件/生成补丁/跑测试；**以及「思考中 / 等 LLM 返回」**——只要心跳未断，一律 `busy`（详见 §5.5）。
-- **进入**：`/task/start`、`/task/progress`、带 taskId 的心跳、显式 `busy`。
-- **退出**：任务 `done`（→`idle`）/ `failed`（→`error`）/ 停止推进且等待依赖（→`blocked`）/ 活性丢失（→`offline`）。
-- **仅 A 可用时**：可推断（有近期活动迹象）→ `busy + degraded`，但任务标题显示 `—（未接入上报）`。
-- **展示**：`#3B82F6` 蓝 · `◐` 半填充（缓慢旋转）· 左侧状态条流光 · 文案 `忙碌 · {当前动作}`（动作来自 `note` / 最近 `file_activity.op+path`；无则 `忙碌`）。
-
-#### `blocked` —— 阻塞（任务无法推进，在等外部依赖）
-- **判定**：见 §5.6。**必须**有显式或强语义证据；**A-only 场景禁止推断**。
-- **进入**：`/status{state:'blocked', reason}`；或发出请求类消息后超过 `BLOCK_GRACE` 仍无任何本地推进动作且依赖未满足。
-- **退出（解除）**：依赖满足（收到目标回复 / 产物就绪 / 子任务完成 / 权限获批）→ `busy`；或主动放弃该等待（→`idle`）；或等待失败（→`error`）；或活性丢失（→`offline`）。
-- **卡片必须显示**：`waiting_on`（等待对象）+ 已阻塞时长 `mm:ss`；原因缺失时显示 `等待 —（未上报原因）`，**不得留空、不得编造原因**。
-- **展示**：`#F59E0B` 琥珀 · `⚠` · 卡片描边琥珀 + 顶部「已阻塞 mm:ss」· 进度条冻结（灰化保留最后已知值）· 文案 `阻塞 · 等待 {依赖方/依赖物}`。
-
-#### `error` —— 出错
-- **判定**：`/task/end{state:'failed'}`、`/status{state:'error'}`、或 `ERROR_WINDOW` 内失败次数 ≥ `ERROR_THRESHOLD`；进程异常退出（heartbeat 中断且进程消失可与 offline 区分时）。
-- **携带字段（schema 需支持）**：`error_type`（受控词表 `tool_error / api_error / timeout / permission / resource / validation / other`）、`retryable`（`0/1/null` 未知）、`error_summary`（≤120 字符）。三者缺失时分别显示 `other` / `未知` / `原因未上报`。
-- **恢复语义**：**允许 `error → busy` 直接跳转**（重试中、开始新任务），**不强制先回 idle**；也允许 `error → idle`（错误被确认且放弃/收尾）。
-- **通知/聚合粒度**（配合 Q8）：按 `member + error_type` 聚合；`retryable` 只作为文案附加（`可重试` / `不可重试` / `未标注`），不参与聚合分桶。
-- **注意**：`error → blocked` 为**非法迁移**（见 §5.8）。若错误后需要等待用户处理，保持 `error` 并叠加辅助徽标 `等待用户处理`，不改变主状态。
-- **仅 A 可用时**：**禁止推断** → 保持 `busy/idle + degraded`，绝不自动置 `error`。
-- **展示**：`#EF4444` 红 · `✕` · 卡片描边红色 + 错误摘要首行（≤60 字符，可点开）+ 失败计数徽标 `✕3` · 文案 `出错 · {错误摘要}`。
-
-### 5.5 `idle` 与 `busy` 的边界裁定（易争议场景裁决表）
-
-| 场景 | 裁定 | 理由 |
-| --- | --- | --- |
-| 任务已派单但尚未开始（`pending`） | **`idle`** + 徽标 `待办 N 项` | 主状态描述「此刻有没有在产出」；未被领取的任务不构成产出 |
-| 任务 `running`，正在思考 / 等 LLM 返回（无工具调用） | **`busy`** | 心跳未断且在任务上下文中；思考就是工作的一部分 |
-| 工具调用间隙（两次调用间隔 < 心跳间隔） | **`busy`** | 禁止因工具间隙闪烁；只有 `task.end` 才结束 busy |
-| 长时间无工具调用但心跳正常（>5min 无边缘动作） | **`busy` + 「慢于预期」角标** | 仍在任务中，不构成 blocked（无法区分思考与等待） |
-| 等待权限审批 / hook 确认 | **`blocked`**（`reason='awaiting_permission'`） | 明确在等一个外部主体的动作 |
-| 等待他人回复 / 等子任务完成 | **`blocked`**（`reason='waiting_reply:<member>'` / `'waiting_task:<id>'`） | 同上 |
-| 一边跑工具一边等回复 | **`busy`**，并在卡片副信息显示 `（等待 X）` 琥珀小标记 | 有产出优先；等待信息降为次要提示 |
-| 心跳断了 60s 但任务未结束 | **保持 `busy` + `degraded`** | 不得降级为 idle/offline（60s 不是死亡判决），灰显并标注推断 |
-| 心跳断了 >300s 且无 A 活动 | **`offline`** | 活性闸门兜底 |
-
-> 由此确定仲裁优先级常量：**`error > busy > blocked > idle`**，且活性闸门优先级最高（不活着一律 `offline`）。
-
-### 5.6 `blocked` 的成立与解除
-
-**成立条件（满足任一）**
-1. **显式**：`/status{memberId, state:'blocked', reason}`
-2. **语义推导**（仅 B 侧，需同时满足 a+b+c）：
-   a. 该成员发出一条**请求类消息**（`type ∈ {question, block, review}` 或 `to` 指向具体成员的 `task_assign`）；
-   b. 自该消息起超过 `BLOCK_GRACE`（45s）；
-   c. 期间**无任何本地推进证据**（无 `/task/progress`、无 `file_activity`、无工具调用）。
-
-**原因字段策略**
-- `reason` **必填**：上报缺失时服务端写入 `reason='unspecified'` 并记录一条 `events`，UI 显示 `等待 —（未上报原因）`。
-- `reason` 建议取值（受控词表，UI 可翻译）：`waiting_reply:<memberId>`、`waiting_artifact:<path>`、`waiting_permission`、`waiting_resource:<name>`、`awaiting_user`、`dependency_failed:<taskId>`、`other:<free text>`。
-- **`waiting_on`（等待对象）是 UI 一等字段**：阻塞卡片**必须**渲染它；缺则显示 `—`。
-
-**解除条件（满足任一）**
-1. 目标成员产出回复消息（按 `reply_to` 或 `to/from` 配对判定）；
-2. 等待的产物出现（`file_activity` 命中 path，或对应任务 `done`）；
-3. 显式 `/status{state:'idle'|'busy'}` 或 `/task/start` / `/task/progress`；
-4. 该成员任务被取消/结束；
-5. 活性丢失 → `offline`。
-6. **超时兜底**：阻塞超过 `BLOCK_ALERT`（默认 10min）**不改变主状态**，仅叠加「长期阻塞」角标（配合 P2-6 告警）。
-
-**五条补充裁决**
-1. **不做状态栈**：解除后由 §5.3 仲裁裁决目标，不回滚到 blocked 之前的状态（详见 §5.11 Q-T2）。
-2. **嵌套 blocked**：以最近一次等待为准；每一层进 `agent_status_history` 可回溯；UI 只展示当前层的 `waiting_on`。
-3. **UI 不得提供「手动解除阻塞」**：那是反向控制（P2-1）。用户只能看、导出、pin。
-4. **多人互等的死锁**：本阶段只做**展示**（两个成员同时在等对方时，各自卡片显示 `等待 X`，并在对话窗口提供 `互等` 交叉标记），**不做自动干预**。
-5. **A-only 场景**：只能由 B 显式判定；无 B 时**禁止推断 blocked**（§5.4），成员保持 `busy/idle + degraded`。
-
-### 5.7 正交标志 `degraded` 的触发与恢复
-
-`degraded` 是**数据可信度**标志，不是状态。触发一次记因一行（`events`，便于回溯）：
-
-| ID | 触发条件 | 恢复条件 |
-| --- | --- | --- |
-| **D1** 心跳超时 | `now - last_heartbeat_at > 60s` 且仍有 A 活性证据或仍在 roster | 收到任意一条 B 上报（`/heartbeat` 或其他）即刻清除 |
-| **D2** 来源为推断 | 该成员从未接 B 上报（`reported=0`），值全部来自 A 推断 | 首次成功 registro/上报后清除，并同时补算真实状态 |
-| **D3** 时钟跳变 | `|上报 ts − 服务端接收时刻| > 5s`；或同一成员出现 `ts` 小于上一条 `ts`（回退） | 连续 2 条上报的 skew 回到容差内；回退时用 `ingested_at` 补齐排序并保留标记 60s |
-| **D4** 观测通道降级 | 网络盘 / `EMFILE` / chokidar 失败 → 降级 5s 轮询 | watcher 恢复正常且完成一次全量重扫比对 |
-| **D5** 数据缺陷 | 上报缺少必需字段（如任务存在但无 title / 无 taskId）导致该字段只能留空 | 后续上报补齐该字段 |
-
-**`degraded` 期间的 UI 行为（必须一致）**
-- 主状态**保持不变**（沿用最后一次有效判定），卡片整体**灰显：不透明度 55% + 虚线描边 + 右上角 `推断` 角标**；
-- 「最后同步」改为显示相对时间并与正常的 conn bar 联动；
-- 数值类字段（进度/任务/文件/产出）**冻结不刷新**；「已耗时」**继续走**但后缀 `*` 并在恢复后按服务端时钟校准（回拨时明确提示 `已校准：实际 mm:ss`）；
-- `degraded` **不改变状态色**（避免用户把「数据不可信」误读为「成员出错」）。
-
-### 5.8 状态迁移图与非法迁移处理
-
-```mermaid
-stateDiagram-v2
-    [*] --> OFFLINE
-    OFFLINE --> IDLE   : register / 首个心跳（无任务）
-    OFFLINE --> BUSY   : register + 携带 taskId（或 task.start 同时到达）
-    OFFLINE --> BLOCKED: 【合法·需合成中间态】先落 BUSY/IDLE 再 BLOCKED
-    OFFLINE --> ERROR  : 【禁止】拒绝迁移，证据暂存
-    IDLE --> BUSY      : task.start / 带 task 的心跳
-    IDLE --> BLOCKED   : status=blocked + reason（如 awaiting_permission）
-    IDLE --> ERROR     : status=error / 失败阈值达成
-    IDLE --> OFFLINE   : 活性丢失
-    BUSY --> IDLE      : task.end(done|cancelled) 且无其他 running 任务
-    BUSY --> BLOCKED   : 停止推进且依赖未满足
-    BUSY --> ERROR     : task.end(failed) / 显式 error
-    BUSY --> OFFLINE   : 活性丢失
-    BLOCKED --> BUSY   : 依赖满足（收到回复/产物/权限）
-    BLOCKED --> IDLE   : 放弃等待 / 任务取消
-    BLOCKED --> ERROR  : 依赖失败
-    BLOCKED --> OFFLINE: 活性丢失
-    ERROR --> BUSY     : 重试进行中（新 task.start）
-    ERROR --> IDLE     : 错误已确认且放弃/任务收尾
-    ERROR --> OFFLINE  : 活性丢失（唯一通往 offline 的路径）
-    note right of ERROR
-      error 后等待用户处理，
-      保持 error + 徽标「等待用户处理」，
-      不做 ERROR→BLOCKED
-    end note
-```
-
-**迁移矩阵（行=from，列=to）——本矩阵为唯一权威版本，tester / coder 以此为准**
-
-| from \ to | offline | idle | busy | blocked | error |
-| --- | --- | --- | --- | --- | --- |
-| **offline** | 非迁移 | ✅ | ✅ | ✅ *需合成中间态 | ❌ **禁止** |
-| **idle** | ✅ | 非迁移 | ✅ | ✅ | ✅ |
-| **busy** | ✅ | ✅ | 非迁移 | ✅ | ✅ |
-| **blocked** | ✅ | ✅ | ✅ | 非迁移 | ✅ |
-| **error** | ✅ | ✅ | ✅ | ❌ **禁止** | 非迁移 |
-
-> 合计：**合法 18 条，非法 2 条**（`offline→error`、`error→blocked`）。
-
-**不变式 INV-1：通往 `offline` 的路径只有两条** —— ① **心跳超时**（活性闸门，§5.3 第 1 步）；② **显式断开**（`shutdown` / `deregister`）。**任何业务事件（`task.end` / `error` / `block`）都不得直接把成员置为 `offline`**；它们只能改变状态的仲裁输入，由活性闸门裁决。
-
-**非法迁移处理策略：拒绝（adopt tester 口径）**
-1. **拒绝并保留原状态**：目标态非法时，**不迁移**，成员维持原主状态（不猜测、不静默改写）；
-2. **证据不丢**：记一条 `events{kind:'state.transition.rejected', from, to, evidence_type, ts}`；metrics 计数 `state_transition_rejected_total + 1`；打 `warn` 级日志；
-3. **延迟生效**：若被拒绝的证据落在 `ERROR_WINDOW` 内且该成员随后重新上线（心跳恢复），则立即按 §5.3 仲裁进入正确状态（如 `error`）——即「证据暂存，恢复后兑现」；
-4. **绝不崩溃、绝不静默**：三条行为都必须可在日志/metrics 中被观察到。
-
-**`offline → blocked`（合法但缺中间态）的合成规则**
-- 该迁移在真实时序中不可能一步发生（能上报就说明已在线），因此出现时必须补写中间态：`OFFLINE → BUSY → BLOCKED`（证据携带 `taskId`）或 `OFFLINE → IDLE → BLOCKED`（无 taskId）；
-- 中间态写入 `agent_status_history` 并标记 `synthetic=1`；**最终态 `state_since` 取触发事件的 `ts`**，而非中间态生成时刻，保证「已耗时」正确。
-
-**去抖与合并（注意：不得违反 P95≤300ms）**
-
-**去抖与合并（注意：不得违反 P95≤300ms）**
-- 同一 tick（同一批 HTTP 上报）内的多次状态变化**只在 UI 推送一次**，以仲裁后的最终态为准；
-- 渲染侧允许 100~200ms 的批量合并重绘，但**端到端 P95 仍须 ≤300ms**（测量口径见 §10）；
-- `X → X`（同状态）**不更新 `state_since`**，仅刷新 `last_heartbeat_at` / `updated_at`。
-
-### 5.9 进度百分比：`progress_source` 三值语义
-
-```
-progress_source = 'reported' | 'derived' | 'unknown'
-```
-
-| 层 | 来源 | 取值方式 | UI 表现 |
+| From \ To | idle | busy | blocked |
 | --- | --- | --- | --- |
-| ① **`reported`** | B 路线上报的 `task.progress`（0–1） | 直接采用，钳制 [0,1] | **实线进度条 + 数字**，如 `62%` |
-| ② **`derived`** | 无上报值，且存在子任务清单：按「已完成子项 / 总子项」推导 | `round(done/total×100)`；分母为 0 时降级到 ③ | **斜纹进度条 + 数字 + 「推导」角标** |
-| ③ **`unknown`** | 以上都没有 | 不产生任何数值 | **条纹动画（indeterminate）+ `—`**，无数字 |
+| **idle** | no-op | `task/start` | authorization wait recorded |
+| **busy** | `task/end` with no other running task | no-op (another task starts) | authorization wait recorded; the task stays running |
+| **blocked** | block cleared, no running task | block cleared, running task exists / task starts | no-op |
 
-**绝对禁止（AC 硬条款）**
-1. ③ 层**绝不显示 0% 或 100%**，也不回填任何历史值；
-2. 同一任务内 `reported/derived` 值**单调不减**（任务显式重置/重做除外，此时归零并记一条 `events`）；
-3. 任务 `done` 时由 `task.end` 给出确定值 → 强制 `100%` 且 `progress_source='reported'`；
-4. ① 与 ② 同时可得时取 ①；② 跨越多个 tick 时取较大值并保持来源标记为其**实际采用层**；
-5. **`derived` 值必须可追溯**：tooltip 显示 `推导：已完成 3/5 个子任务`（列出子任务清单入口）。
+- Any state may move to any other state; there are no "illegal transitions" and no synthetic intermediate
+  states.
+- `X → X` does not change `state_since`.
+- Multiple events in one tick produce one UI push with the final derived state.
+- The renderer may batch updates in a 100–200 ms window, but end-to-end P95 must stay ≤ 300 ms.
 
-### 5.9.1 三层的验收标准（每层都要能单独被 tester 打）
+### 5.9 Progress display
 
-| ID | 层 | Given / When / Then |
-| --- | --- | --- |
-| **AC-PR1** | ① `reported` | Given B 上报 `task.progress=0.42`；When 渲染；Then 显示实线进度条 + `42%`，无「推导」角标；Given 随后上报 `0.37`（回退）；Then **UI 仍显示 42%**（同一任务内单调不减），并记录一条 `events{kind:'progress.regress'}` |
-| **AC-PR2** | ①→`reported` 完成态 | Given `task.end{state:'done'}` 到达；Then 立即显示 `100%` 且 `progress_source='reported'`，保持 ≥1.5s |
-| **AC-PR3** | ② `derived` | Given 无 `task.progress`，且该任务有子任务清单 5 项其中 3 项 done；Then 显示 `60%` + **斜纹** + `推导` 角标；hover/tooltip 展示 `推导：已完成 3/5 个子任务` 且可点开子任务清单 |
-| **AC-PR4** | ② 边界 | Given 子任务清单为空或总数=0；Then **降级到 ③**，不得显示 `0%`，也不得显示 NaN/空字符串 |
-| **AC-PR5** | ③ `unknown` 空态判据 | Given 既无 `task.progress` 又无可用子任务清单；Then 渲染条纹动画（indeterminate）+ 文本 `—`，且 `progress_source='unknown'`；**DOM 断言：该卡片不存在 "0%" / "100%" / 任何整数百分比文本**（这是第③层的核心判据，自动化直接断言） |
-| **AC-PR6** | ③ 与任务无关时 | Given 成员处于 `idle`/`offline`（无当前任务）；Then 进度区域显示 `—` 且不显示任何进度条动画（避免"看起来在动"的误导） |
-| **AC-PR7** | 来源切换 | Given 先是 `derived=60%` 后收到 `reported=0.42`；Then 显示 `60%`？——**不允许**。裁决：出现更高优先级的 `reported` 后，**以 `reported` 为准显示 42%** 并移除「推导」角标（真值优先于推导，单调不减规则在跨源切换时不适用；记一条 `events`） |
+- The workstation card **does not draw a progress bar**. `task.progress` usually only holds 0 at start and
+  1 at end, so a bar would invent a middle that does not exist.
+- Progress values may still be stored and shown in task details when a real value exists. A missing value
+  is shown as `—` or omitted, never as 0%/100%.
+- The card never animates an indeterminate progress bar.
 
-### 5.10 展示速查矩阵
+### 5.10 Display matrix
 
-| 主状态 | 主色 | 图标 | 文案模板 | `degraded` 叠加 | 数据缺失时（该字段未上报） |
-| --- | --- | --- | --- | --- | --- |
-| `idle` | `#22C55E` | `○` | `空闲 · 等待派单` / `空闲 · 已完成 N 项` | 不透明度 55% + 虚线描边 + `推断` 角标；数值冻结；耗时带 `*` | 任务→`—`；进度→`unknown` 条纹；文件/产出→`—（未接入上报）` |
-| `busy` | `#3B82F6` | `◐`（旋转） | `忙碌 · {当前动作}` | 同上 | 任务无 title→`（未命名任务）`；进度→`unknown` 条纹；文件→`—` |
-| `blocked` | `#F59E0B` | `⚠` | `阻塞 · 等待 {waiting_on}`（缺则 `等待 —（未上报原因）`）+ `已阻塞 mm:ss` | 同上 | 进度→冻结灰化保留最后已知值；未知则 `unknown` 条纹 |
-| `error` | `#EF4444` | `✕` | `出错 · {错误摘要}` + `✕{失败数}` | 同上 | 摘要缺失→`出错 · 原因未上报`；进度→冻结最后已知值或 `—` |
-| `offline` | `#6B7280` | `•` | `离线 · 最后活跃 {相对时间}` / `离线 · 从未上报` | 通常不适用（自身已是终态），若组合则以 remark 显示 | 全字段 `—` |
-
-**辅助徽标（不参与互斥）**：`待办 N 项` · `慢于预期` · `长期阻塞` · `等待 X` · `被动观测`（`reported=0`）· `推断`（degraded）。
-**无障碍**：颜色 + 图标形状 + 文案三重可区分；提供色盲模式（deuteranopia/protanopia 调色板）、高对比、减少动效三个开关（旋转/流光关闭后退回静态图标）。
-
----
-
-### 5.11 裁决 FAQ（coder / tester 对齐口径）
-
-> 针对 `test-strategy.md` §3.2.2 的四个提问，此处给出唯一答案；与本文冲突处以本文为准。
-
-**Q-T1｜什么算 `busy`？空闲多久从 `busy` 回落 `idle`？**
-- **`busy` 的充要条件**：存在 `task.state='running'` 的任务 **或** 心跳携带 `taskId` **或** 显式 `/status{state:'busy'}`。**不要求**有实际读写/输出活动（思考中、等 LLM 返回都算 busy，见 §5.5）。
-- **`busy → idle` 只有一条路径：`task.end`**（`done`/`cancelled`）且无其它 running 任务。**不存在「空闲 N 秒自动回落 idle」的规则**——静默不结束任务。
-- 静默期间的三种去向：**≤60s** 无心跳 → `busy + degraded`；**>60s 且有 A 活动证据** → 由 A 推断 `busy + degraded`；**>300s 且无任何活性证据** → `offline`。
-
-**Q-T2｜`blocked` 由谁解除、解除后回到哪里？是否要状态栈？**
-- **解除主体只能是证据，不是人**：见 §5.6 的 6 条解除条件（收到回复 / 产物就绪 / 权限获批 / 显式 status / 任务取消 / 活性丢失）。UI 不做「手动解除阻塞」按钮（那是反向控制，P2-1）。
-- **不做状态栈**。解除后由 §5.3 仲裁重新裁决目标（通常有 running task → `busy`，否则 → `idle`），**不回滚到 blocked 之前的状态**。
-- **嵌套 blocked**：以**最近一次**阻塞为准（`waiting_on` 显示最近依赖）；历史每一层都留在 `agent_status_history` 供回溯；卡片同时显示最外层等待的起始时刻（即当前 `state_since`）。
-
-**Q-T3｜非法迁移怎么处理？**
-- **拒绝**（§5.8）：保留原状态 + `events` 记录 + metrics 计数 + warn 日志 + 恢复后延迟兑现。**不是归一化、也不是接受**。
-
-**Q-T4｜`error` 的语义与恢复？**
-- 携带 `error_type`（受控词表）+ `retryable`（`0/1/null`）+ `error_summary`（≤120 字符）。
-- **允许 `error → busy` 直接跳转**（重试/新任务），**允许 `error → idle`**（放弃），**禁止 `error → blocked`**（改挂徽标「等待用户处理」）。
-- 通知聚合粒度 = `member + error_type`。
-
----
-
-## 6. 工位视图（Workstation View）规格
-
-### 6.1 卡片字段（P0-1）
-
-| 字段 | 数据源 | 缺失表现 |
-| --- | --- | --- |
-| 成员名 / 角色 | roster + B `register` | 未知时显示 id，角色 `—` |
-| 状态徽标 | B 上报（A 推断 + degraded） | `offline` + `从未上报` |
-| 当前任务 | `task.title` | `—（未接入上报）` |
-| 进度 | §5.9 三值 | `unknown` 条纹 + `—` |
-| 当前文件 | `file_activity`（最近 N=3） | `—（未接入上报）` |
-| 最近产出 | `artifacts` top3 | `—（未接入上报）` |
-| 已耗时 | `state_since` → 前端时钟走动 | `—` |
-| 数据源标记 | `source`/`degraded` | 图例常驻（右上角），hover 解释三种来源 |
-
-### 6.2 文件活动语义（Q1 已拍板）
-
-**取值**：`file_activity.op ∈ { read, write, edit }`（对齐 `tech-design.md` §4.7，需**新增 `edit`**）。
-
-**三值判定口径（可验收）**
-
-| op | 定义 | 判定依据（按优先级） | 典型触发 |
-| --- | --- | --- | --- |
-| `read` | 只读访问，未产生任何字节变更 | 工具语义为只读（Read / Grep / Glob / LSP findReferences 等），未触发写路径 | 读 `server/db.js` |
-| `edit` | **对已存在文件的就地修改**（文件在本次操作前已存在，操作后 size 或内容变化） | 上报显式带 `op='edit'`；缺 `op` 时由服务端按「**写前该文件已存在 + 同 member 近 N 秒内有同一路径的 read**」推导 | Edit / str_replace / apply_patch 到已有文件 |
-| `write` | **新建文件**，或整文件覆写/替换（文件此前不存在，或无法判断其是否已存在） | 上报显式带 `op='write'`；缺 `op` 且判定不了「该文件是否已存在」时，**一律保守归 `write`** | Write 新文件、整文件重写、无法判定的写入 |
-
-**边界裁定（避免各执一词）**
-1. **编辑 ≠ 先读后写**：一次 Edit 调用只产生 **1 条** `op='edit'` 记录，不得同时生成 read+write 两条（「先读后写」是实现细节，对用户无意义）；
-2. **新建算 `write`**，不是 `edit`（用户要区分的是"改了老文件"还是"造了新文件"）；
-3. **`op` 缺失时**：服务端按上表推导；推导不了 → 保守记 `write`（**不得记 read**，因为写事件的漏报比误报更严重，且 `write` 是高亮显示的强信号）；
-4. **同一路径短时间重复 op** → 折叠为一条，计数 `hits+1`，展示 `最近 {op}`（避免刷屏）；
-5. **删除类操作**本阶段不上报（`op` 不含 delete），如需在 M3 后评估再加。
-
-**UI 语义**：`read` → **弱化灰**（灰色小图标 + 仅文件名 + 字重降一级）；`write` / `edit` → **高亮**（主题强调色 + 左侧竖条 + `op + 路径`）。
-
-**仅 A 路线（目录监听）时用 iron law**：**不可判定**。原因是 A 只能看到 team 目录内的 mailbox 文件变化，**看不到成员对项目源码的读写**，且无法把文件变更归因到某个成员。因此：
-- A-only 成员的「当前文件」区域固定显示 `—（未接入上报）`；
-- **禁止**用「项目源码最近改动了哪些文件」去填充任何成员的当前文件（那必然是编造归因）；
-- 若将来要做「workspace 级文件变更侧栏」，必须作为**独立面板**呈现且归属为「整个 workspace」，不得出现在任何成员卡片上。
-
-**保留策略**：按 member 滚动清理最近 200 条（沿用技术方案）。
-
-**AC-F1**：Given 上报 5 次 read（`src/a.ts`）+ 1 次 write（`src/new.ts`）；Then `src/new.ts` 那条带强调色左侧竖条且位于列表首位，`read` 条目为灰色弱化样式，顺序为「最近发生在上」。
-**AC-F2**：Given 一次 Edit 操作修改已存在文件 `src/a.ts`；Then 只生成 1 条记录且 `op='edit'`（不允许出现 read+write 两条）。
-**AC-F3**：Given 上报写操作但未带 `op` 且无法判定文件是否已存在；Then 落库 `op='write'`（`read` 为非法兜底值）。
-**AC-F4**：Given 成员为 A-only（`reported=0`）；Then 其卡片当前文件区域显示 `—（未接入上报）`，且 DOM 中不出现任何文件路径。
-
-### 6.3 自动刷新（禁止手动刷新按钮）
-
-- AC：Given 成员状态变更事件被服务收到；When 计时到 300ms；Then **95% 的样本**UI 已完成徽标/进度/任务的 DOM 更新（端到端口径，含 ingest→DB→WS→渲染）。
-- AC：UI 顶部常驻「最近更新 {n}s 前」；>10s 未更新显示降级提示（不改状态色）。
-
-### 6.4 成员规模与紧凑模式（Q3 已拍板）
-
-| 条件 | 布局 |
-| --- | --- |
-| ≤4 人 | 舒适模式（默认网格，全部字段可见） |
-| **≥5 人** | 自动切**紧凑模式**（阈值 `compactThreshold` 可在设置覆盖，默认 5） |
-| ≤16 人 | 单页全部渲染（网格自适应换行） |
-| **>16 人** | **按 team 分页折叠**，每页 16 张，页脚提供分页器与「跳转到异常成员」快捷入口 |
-
-**紧凑模式（≥5 人）信息取舍**
-
-| 必须保留 | 折叠（hover / 右键详情 / 点击展开） |
-| --- | --- |
-| 成员名（缩写或首字 + tooltip 全称） | 任务描述（一句话） |
-| 角色（色带或 1 字符） | `type` 消息类型等次要 meta |
-| **状态点（颜色 + 图标 + degraded 虚线）** | 完整文件路径 —— 仅显示最后 1 个 + `+N` |
-| **当前任务标题单行**（截断 ≤28 字符 + tooltip 全文） | 最近产出列表 —— 仅显示 1 条 + `+N` |
-| **进度**（改为卡片底部 3px mini bar；`unknown` 仍为条纹） | 已耗时 —— 缩为 `2m` 紧凑格式，hover 显示精确值 |
-| **已耗时（紧凑格式）** | 数据源图例 —— 收进 hover |
-| **阻塞时必须额外显示 `waiting_on`**（紧凑模式唯一允许占第二行的信息） | — |
-
-**排序规则（任何模式）**：`error > blocked > busy > idle > offline`，同级按 `state_since` 升序（卡最久的在前）。**保证异常成员永远在首屏**，这是 P1 用户最需要的。
-
-### 6.5 工位视图验收清单
-
-| ID | AC |
-| --- | --- |
-| AC-W1 | Given 16 个成员并发上报且字段同名；When 渲染；Then 每个 `data-testid=card-{memberId}` 的值与其成员一一对应，**无任何串台**（自动化逐字段比对） |
-| AC-W2 | Given 某成员 60s 无心跳；Then 卡片置 `degraded`：不透明度 55% + 虚线 + `推断` 角标，**且主状态色不变** |
-| AC-W3 | Given 无 any B 上报（仅 A）；Then 任务/进度/文件/产出/耗时全部为 `—` 或 `unknown`，**不出现任何数字型猜测值** |
-| AC-W4 | Given `task.progress` 缺失且有子任务清单 3/5；Then 显示 `60%` + 斜纹 + `推导` 角标，tooltip 列出子任务 |
-| AC-W5 | Given `task.progress` 缺失且无子任务清单；Then 显示条纹动画 + `—`，**DOM 中不存在 "0%" 或 "100%" 文本** |
-| AC-W6 | Given 5 个成员；Then 自动进入紧凑模式，每张卡仍可读到「名字 / 状态 / 任务 / 进度 / 耗时」 |
-| AC-W7 | Given 成员为 `blocked`；Then 卡片必须渲染 `waiting_on`，缺失时渲染 `等待 —（未上报原因）` |
-
----
-
-## 7. 对话记录（Conversation View）规格
-
-### 7.1 消息字段（对齐 `tech-design.md` §4.6，差异见 §13）
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `id` | INTEGER PK AUTOINCREMENT | ✅ | 单调游标，虚拟滚动与 `beforeId` 分页依据 |
-| `dedupe_key` | TEXT UNIQUE | ✅ | `report` 侧由上报方提供或服务端生成；`watch` 侧 `sha1(memberId|ts|from|sha1(content))` |
-| `team_id` | TEXT | ✅ | 一等字段 |
-| `ts_ms` | INTEGER | ✅ | 事件发生时间（上报方时钟） |
-| `ingested_at_ms` | INTEGER | ✅ | 服务端接收时间（判 skew、回填排序）— **新增** |
-| `from_member` | TEXT | ✅ | 成员 id 或 `system` / `user` |
-| `to_member` | TEXT | — | NULL = 广播 |
-| `type` | TEXT | ✅ | 枚举见 §7.2 |
-| `subject` | TEXT | — | send_message 的 summary，列表折叠态主文本 |
-| `content` | TEXT | — | 正文（**已脱敏**，见 §8） |
-| `task_id` | TEXT | — | 关联任务 |
-| `reply_to` | INTEGER FK messages.id | — | 消息链 — **新增** |
-| `source` | TEXT | ✅ | `report` / `watch` |
-| `redacted` | INTEGER DEFAULT 0 | ✅ | 是否命脱敏 — **新增** |
-| `redaction_version` | INTEGER | — | 脱敏规则版本，便于规则升级后重扫 — **新增** |
-| `content_truncated` | INTEGER DEFAULT 0 | ✅ | 正文是否超长被折叠显示 — **新增** |
-| `raw_json` | TEXT | — | **脱敏后**的原始负载（原文不入库，见 §8） |
-
-**索引沿用技术方案**：`idx_messages_team_ts(team_id, ts_ms DESC, id DESC)`、`idx_messages_from/to/type`、FTS5（`content, subject`，M2）。
-**展示排序**：`(ts_ms ASC, id ASC)`；当时钟跳变导致 `ts_ms` 回退时，按 `D3` 规则改用 `ingested_at_ms` 补排并在相应消息行标注 `时间异常`。
-
-### 7.2 消息类型枚举（对齐 coder，需新增 `review` / `error`）
-
-| type | 语义 | UI 标签 / 颜色 | 是否进入流水 | 默认可见 |
+| State | Color | Icon | Text template | Missing data |
 | --- | --- | --- | --- | --- |
-| `task_assign` | 派单 / 下达任务 | `派单` 蓝 | ✅ | ✅ |
-| `task_update` | 进度更新（含部分产出） | `进度` 浅蓝 | ✅ | ✅ |
-| `result` | 交付结果 / 产出完成 | `产出` 绿 | ✅ | ✅ |
-| `question` | 提问 / 请求信息 | `提问` 紫 | ✅ | ✅ |
-| `review` | 评审 / 反馈意见 | `评审` 青 —— **新增** | ✅ | ✅ |
-| `block` | 声明阻塞 / 依赖未满足 | `阻塞` 琥珀 | ✅ | ✅ |
-| `error` | 错误 / 失败 —— **新增** | `错误` 红 | ✅ | ✅ |
-| `shutdown` | 成员停止 / 退出信号 | `停止` 灰 | ✅ | ✅ |
-| `system` | 系统 / 工具 / 环境消息 | `系统` 灰 | ✅ | ❌（可一键显示） |
-| `heartbeat` | 保活心跳 | — | ❌ **不入流水**（仅更新 `last_heartbeat_at`） | ❌ |
+| `idle` | `#22C55E` | `○` | `Idle`; footer: last active | Task → not shown; time → `—` |
+| `busy` | `#3B82F6` | `◐` | `Busy` / `Busy · action` | Task title missing → `(unnamed task)`; time → `—` |
+| `blocked` | `#F59E0B` | `⚠` | `Blocked` | Reason unknown → no invented reason |
 
-**AC-T1**：Given 上报 `type=heartbeat`；Then `messages` 表不产生该行，且 `agent_status.last_heartbeat_at` 被刷新。
+**Auxiliary badges (not states):** `Passive observation` (`reported=false`) · `Slower than expected` ·
+`Long block`.
+**Accessibility:** state is distinguishable by color, icon shape and text. Provide color-blind palettes,
+high contrast and reduced motion. When motion is reduced, spinning/flowing effects become static.
 
-### 7.3 「不丢不重」的可验收判定
+### 5.11 FAQ
 
-| ID | AC |
-| --- | --- |
-| **AC-M1 幂等** | Given 同一批 1000 条消息被重复投递 2 次（含 A/B 双写同 key）；Then `SELECT COUNT(*), COUNT(DISTINCT dedupe_key) FROM messages WHERE team_id=?` 两者相等且 =1000 |
-| **AC-M2 A/B 融合** | Given 同一条消息先由 A 入库（`source='watch'`）后由 B 上报（`source='report'`）；Then 只保留 1 行，`source='report'`，且其非空字段补齐到该行 |
-| **AC-M3 崩溃恢复** | Given 进程被 `kill -9`；When 重启并重新 tail 同一批文件；Then 无重复行（AC-M1 成立），丢失窗口 ≤1s（缺失部分以最后一次 checkpoint 为准补拉） |
-| **AC-M4 文件轮转** | Given 被监听文件 size 小于上次 offset（truncate/rotate）；Then 触发全量重扫，依赖 `dedupe_key` 不产生重复，并写一条 `events` |
-| **AC-M5 有序** | Given 任意 10 万条数据；Then UI 展示顺序严格 `(ts_ms, id)` 升序，无跳跃错位 |
-| **AC-M6 乱序容错** | Given 上报 `seq` 乱序到达；Then 落库顺序按 `ingested_at`，展示按 `ts_ms` 重排，记一条 `events{kind:'out_of_order'}` |
+**Q: What makes a member busy, and when does it return to idle?**
+Busy means a running task in the selected session. The only path back to idle is the end of the last
+running task (or a session reconciliation closing it). There is no "silent for N seconds → idle" rule.
 
-### 7.4 过滤语义（边界必须严格）
+**Q: Who clears blocked?**
+An explicit event: progress, task end, session end, or an idle notification. The UI never offers a manual
+unblock.
 
-**成员过滤**
-- 多选为 **OR**（`sender ∈ Sel OR recipient ∈ Sel`），语义为「**涉及**这些成员的消息」；
-- 额外提供方向三态：`全部`（默认） / `仅发出（Sel→*）` / `仅接收（*→Sel）`；
-- 广播消息（`to_member IS NULL`）在「涉及」语义下 **只要 sender 命中即计入**，并提供开关 `包含广播`（默认开）。
+**Q: What if a process dies?**
+The state does not change by itself. The task row stays running until an explicit end/reconciliation; no
+timeout guesses. This is intentional.
 
-**时间范围**
-- 采用**闭区间 `[start, end]`**（含端点），毫秒精度：今日 = `[00:00:00.000, 23:59:59.999]`；
-- 相对预设（`最近15分钟` / `最近1小时` / `今天` / `全部`）在**打开时刻求值后固定**，不随时间滚动（避免"边看边变"）；提供「刷新区间」按钮重新求值；
-- 时间过滤基于 **`ts_ms`**（非 `ingested_at`）；仅当时钟异常标记存在时回退到 `ingested_at`。
-
-**消息类型**
-- 多选 **OR**；`system` 与 `heartbeat` 默认排除（heartbeat 恒不入库），UI 提供 `显示系统消息` 开关。
-
-**维度之间一律 AND**（成员 AND 类型 AND 时间 AND 关键字）。
-
-### 7.5 搜索语义
-
-| 项 | 规则 |
-| --- | --- |
-| 大小写 | **不区分**（FTS5 使用 `case_sensitive 0`；降级 LIKE 时用 `LOWER()` 比较） |
-| 作用域 | `content` + `subject` + 任务标题（join `tasks.title`）+ 文件路径（join `file_activity.path`）；**不含**成员名（请用成员过滤） |
-| 多词 | 空格分隔 = **AND**；`"短语"` = 精确短语匹配 |
-| 最小长度 | 中文 ≥1 字；英文/数字 ≥2 字符（短词不触发查询，输入即提示） |
-| 去抖 | 200ms |
-| 高亮 | 命中词 `<mark>`；单条最多高亮 200 处以防卡顿；超出部分不高亮但条数仍计入 |
-| 结果计数 | 显示 `x / y`：`y` = **当前基线总数**（已应用「显示系统消息」开关后的结果，即用户心智中的全量），`x` = 应用全部条件后条数 |
-| 排序 | 搜索结果默认 `ts_ms DESC`（最新在上），可在结果头切换升序；切换不改变已输入的任何条件 |
-| 与滚动交互 | 触发搜索时**暂停自动跟随**；清空搜索框或切回 IA 时恢复 |
-| 分词方案 | **FTS5 + `trigram`**（Q10 已拍板）；1~2 字查询降级 `LIKE`（详见 §7.5.1） |
-
-**token 语法（P1）**：`from:<id>`、`to:<id>`、`type:<t>`、`task:<id>`、`has:file|error`、`since:-30m|ISO`、`is:redacted`。非法 token 行内提示 `未知条件：xxx`，**不静默返回空**。
-
-### 7.5.1 短词（1~2 字）降级语义（Q10 已拍板）
-
-> 背景：FTS5 `trigram` 对 1~2 字查询召回差；需 `LIKE %q%` 兜底。本节给出**降级触发、排序、文案、性能护栏**四件事的统一口径，避免 coder/tester 各执一词。
-
-#### ① 降级策略：何时走 `LIKE`
-
-| 查询长度 | 策略 | 说明 |
-| --- | --- | --- |
-| **0 字**（空） | 不查询，视为无关键字 | 保留其它过滤条件 |
-| **1 字** | **`LIKE %q%`**（自动触发，无需用户选择） | 结果数通常很大，走护栏 |
-| **2 字** | **`LIKE %q%`**（自动触发） | 同上 |
-| **≥3 字** | **FTS5 trigram**（相关度排序） | 正常路径 |
-| FTS5 不可用（降级环境） | 任意长度走 `LIKE`，且搜索框常驻「降级匹配模式」角标 | **不得静默降级** |
-
-- **自动触发，不给用户开关**：理由是绝大多数用户不理解 tokenizer；但必须给**可理解的解释 + 可选加严**（见 ③）。
-- 「1 字」的统计口径：按 **Unicode 码点**计（中文 1 字 = 1），英数按**连续串**计（`abc` = 3）。
-
-#### ② 混排排序规则（这是最容易实现错的坑）
-
-**FTS 结果有相关度、LIKE 结果没有。两者永不混排在同一查询里**——同一个查询单元只能走一条路径，因此不存在合并排序问题。需要排序对齐的是以下两种情况：
-
-| 情况 | 排序规则 |
-| --- | --- |
-| **FTS 路径（≥3 字）** | 默认 **`ts_ms DESC`**（最新在前）。提供排序切换：「**相关度**」（`bm25()` 升序） ⇄ 「**时间**」（默认）。切换是纯展示层行为，**不改变结果集成员** |
-| **LIKE 路径（1~2 字）** | **仅按 `ts_ms DESC`**；因为包含关系无相关度可言，**禁止**伪造 score。UI 明示「按时间排序」 |
-| 用户从 2 字补到 3 字 | 路径切换（LIKE→FTS），结果集**允许变化**（这是预期行为，见 ③），当前滚动位置重置到顶部，自动跟随暂停状态保持 |
-
-#### ③ UI 提示文案（正式文案，直接交付前端）
-
-| 触发条件 | 展示位置 | 文案（原样） |
-| --- | --- | --- |
-| 1 字查询 | 搜索框下方提示条（`data-testid=search-mode-hint`） | `「{q}」只有 1 个字，已按包含匹配（非分词），命中可能较多。输入 3 个字以上可获得按相关度排序的结果。` |
-| 2 字查询 | 同上 | `「{q}」是短词，已按包含匹配，结果可能较多；继续输入可获得更精确的结果。` |
-| LIKE 路径有结果 | 结果计数旁 | `已匹配 {x} 条 · 按时间排序` |
-| LIKE 路径结果 ≥ `SOFT_CAP`（默认 500） | 结果计数下方 | `匹配较多，仅显示最近 {N} 条。请用更多关键字或叠加过滤条件缩小范围。` |
-| FTS 不可用 | 搜索框右侧常驻角标 | `降级匹配模式` |
-| 搜索与过滤同时生效 | 过滤 chip 区右侧 | `搜索 + {n} 个过滤条件同时生效` |
-
-> **统一原则**：结果集随查询长度变化**必须被明示**，不允许用户产生「同一个词两种答案」的困惑。上述提示条一律**非阻断**（不弹窗、不拦截），且不自动消失，直到关键字长度或路径改变。
-
-#### ④ 性能护栏（`LIKE %q%` 在 10 万条上是全表扫）
-
-| 护栏 | 规则 |
-| --- | --- |
-| **必须有 `LIMIT`** | `LIMIT = max(SOFT_CAP, 已加载条数 + PAGE)`，`SOFT_CAP` 默认 **500**；分页 `LIMIT 200 OFFSET n` 加载更多 |
-| **限定时间范围** | LIKE 路径强制带时间窗：优先使用用户已选的时间范围；未选则**默认最近 7 天**，并在提示条末尾追加 `（范围：最近 7 天）`；提供「扩大到全部」按钮（显式用户动作） |
-| **超时兜底** | 单条查询 **>800ms 未完成 → 中止并在 UI 显示** `查询超时，已显示部分结果，请缩小范围`；同时写一条 `events{kind:'search.timeout'}`。**不得无限等待、不得卡死 UI 线程**（查询在独立协程/线程，UI 保持可交互） |
-| **最短触发长度** | ≥1 字即触发（配合去抖 200ms）；**空串不触发** |
-| **索引兜底** | 若 `LIKE` 目标列无可用索引，必须在 `messages(team_id, ts_ms)` 上先做分区裁剪再扫 |
-
-#### ⑤ 空结果与超大结果集
-
-| 场景 | 表现 |
-| --- | --- |
-| 命中 0 条 | 空态：`没有匹配的消息` + 二级说明 `共 {y} 条消息，当前 {n} 个条件过滤掉了全部结果` + 「清空条件」按钮。**不得显示空白面板** |
-| LIKE 命中 ≥ SOFT_CAP | 见 ③；显示部分 + 「加载更多」按钮（每页 200） |
-| FTS 命中 ≥ SOFT_CAP | 同样按 200/页分页；**不限缩显示总数**（计数仍显示真实 x） |
-
-#### ⑥ AC（给 tester 直接用）
-
-| ID | Given / When / Then |
-| --- | --- |
-| **AC-Q1** | Given 库内含中文 10 万条；When 输入 1 字「的」回车；Then 走 `LIKE` 路径（断言 `events`/日志中出现 `search.mode=like`），结果按 `ts_ms DESC`，且提示条文案与 §7.5.1 ③ 完全一致 |
-| **AC-Q2** | Given 同上；When 追加到 3 字「的错误」；Then 路径切换为 FTS（`search.mode=fts`），**结果集允许与 2 字时不同**，滚动位置回到顶部，提示条切换为 FTS 版文案 |
-| **AC-Q3** | Given LIKE 路径；Then 返回结果 ≤500 条且显示计数；点击「加载更多」每次 +200；总数与实际匹配数在允许额外一页查询后一致 |
-| **AC-Q4** | Given LIKE 路径且未选时间范围；Then 实际 SQL 带最近 7 天条件，UI 明示范围；点击「扩大到全部」后重查 |
-| **AC-Q5** | Given 构造使查询 >800ms 的数据量；When 搜索；Then UI 保持可交互，800ms 后显示「查询超时」文案且已显示部分结果，并写 `search.timeout` 事件 |
-| **AC-Q6** | Given 搜索 0 结果；Then 空态含原因说明与「清空条件」按钮，点击后恢复全部消息并保持滚动在顶部 |
-| **AC-Q7** | Given 用户在 LIKE 结果上切换排序到「相关度」；Then 按钮不可选（disabled）并 tooltip 说明 `包含匹配无相关度` |
-
-### 7.6 滚动行为
-
-- 默认**自动跟随**最新消息（窗口处于底部时）；
-- 用户**向上滚动超过 1 屏** → 立即暂停跟随，底部浮出 `N 条新消息 ↓`；点击 → 回到底部并恢复跟随；
-- `AC-S1`：Given 用户在底部持续追加消息；Then 视口始终贴底；When 用户上滚 2 屏；Then 出现计数徽标且**不再自动跳动**；When 点击徽标；Then 回到底部并恢复跟随。
-
-### 7.7 容量、滚动与保留（Q：90 天 / 10 万条）
-
-| 层 | 策略 |
-| --- | --- |
-| 渲染 | **虚拟滚动**，`messages.page` 按 `beforeId` 分页；M0 临时 `v-for` 上限 500 行（仅 mock） |
-| **AC-P1 滚动性能** | Given 单 team 10 万条已入库；When 连续滚动；Then DOM 消息节点 ≤80、滚动 ≥55fps、内存增量 ≤200MB |
-| **AC-P2 查询响应** | 1 万条数据下任意「过滤/搜索」组合响应 <200ms |
-| 保留策略 | **90 天 或 单 team 10 万条**（先到先触发） |
-| 超限处理 | **先导出 JSONL 归档 → 校验归档行数 = 待删行数 → 再删除**，任一环节失败则中止并告警（绝不先删） |
-| `archived_at` | M0 预留字段与索引；归档落地 M1 |
-| 背压 | 单次突发 >1000 条时批量入库 + 合并推送（节流 100ms），UI 显示 `正在追平 +N 条` |
-| 单条截断 | 正文 >800 字符折叠，`content_truncated=1`，点开抽屉看全文；工具输出类默认头尾各 200 字符 + 中间省略 |
-
-### 7.8 pin / 详情 / 导出（P1）
-
-- **置顶**：消息可 pin 到顶部「置顶区」，可填本地备注；**pin 项豁免一切淘汰与隐藏**；导出时默认一并导出（可取消勾选）。
-- **详情抽屉**：完整正文、原始（脱敏后）JSON 折叠区、`meta`（工具/耗时/token）、关联文件可点击定位。
-- **导出**：范围 = **当前过滤结果**（对话框明示：条数、时间区间、生效条件）；格式 Markdown / JSONL；单次上限 50,000 条，超出提示分批；Markdown 结构：参与者 + 时间线 + 关联任务。
+**Q: Where did `error` / `offline` / `degraded` go?**
+They were removed with the heartbeat model. A failed task is a task outcome; a vanished member is a member
+whose tasks were explicitly closed; passive observation is marked by `reported=false`. Nothing is inferred.
 
 ---
 
-## 8. 消息脱敏规格（**Q5 = P0-7 硬要求**）
+## 6. Workstation view
 
-> **定性**：脱敏不是 UI 隐藏，而是**写入 SQLite 之前的不可逆处理**；**原文（含 `raw_json` 中的敏感片段）一律不入库**。未经脱敏的内容禁止进入 `content` / `subject` / `raw_json` 任何一列。
-> **范围**：`messages.content`、`messages.subject`、`messages.raw_json`；将来任何承载正文的新字段默认同样适用（无需再走一次评审）。
+### 6.1 Card fields
 
-### 8.1 规则清单（命中替换为 `***`）
+| Field | Source | Missing behavior |
+| --- | --- | --- |
+| Name / role | roster + `register` | Fall back to the member id; role `—` |
+| State badge | derived (§5.3) | Always one of busy/idle/blocked |
+| Current task | `task.title` of the selected session's running task | `Idle` |
+| Description (subagents) | Agent definition file | Hidden |
+| Time | Running: task start ("Started MM-DD HH:mm"); idle: latest task start/end ("Last active MM-DD HH:mm") | `—` |
+| Passive badge | `reported=false` | Hidden |
 
-命中即用 **`***`**（三个星号）替换；**不在正文中内联任何类型提示**（原因：类型串本身也会污染搜索与展示，且给用户「还能看出是什么」的错觉）。类型与命中次数记在独立字段 `redaction_hits`（JSON，如 `[{"rule":"openai_key","count":1}]`），不进入正文。
+Ghosts do not take a card slot; only resident members are listed.
 
-| # | 规则 | 正则要点 | 优先级 |
+### 6.2 File activity semantics
+
+`file_activity.op` has two values: **`read`** and **`write`**. (The planned `edit` value was not
+implemented; do not document or expect it.)
+
+| op | Meaning | UI |
+| --- | --- | --- |
+| `read` | A read-only access | Muted grey icon |
+| `write` | A create, edit or full overwrite | Highlighted accent bar |
+
+Rules: one tool call yields one record; a create counts as `write`; a missing `op` from a writer defaults to
+`write` (never `read`); repeated same-path operations within a short window collapse to one row; delete is
+not reported. File activity is retention-limited to the latest 200 rows per member.
+
+### 6.3 Auto-refresh
+
+- State/task changes are pushed over WebSocket; `member.status` is merged over a 200 ms window.
+- Target: P95 ≤ 300 ms from ingest receipt to DOM update; P99 ≤ 800 ms.
+- Show "last updated N s ago" in the connection bar. A stale connection is shown as a connection problem,
+  never as a changed member state.
+- There is no manual refresh button.
+
+### 6.4 Member scale and layout
+
+| Condition | Layout |
+| --- | --- |
+| ≤ 4 | Comfortable grid, all fields visible |
+| ≥ 5 | Compact cards (name, state, single-line task, time) — **planned, not implemented** |
+| ≤ 16 | Single page, responsive grid |
+| > 16 | Pagination / collapse by project — **planned, not implemented** |
+
+Sorting: `blocked > busy > idle`, then by `stateSince` ascending, so blocked members are always visible first.
+
+### 6.5 Acceptance checklist
+
+| ID | Acceptance |
+| --- | --- |
+| AC-W1 | With 16 concurrent members, every `data-testid=seat-card-{memberId}` field belongs to that member (no cross-talk) |
+| AC-W2 | A member with no task shows `Idle`; a member with a running task shows `Busy`; no state changes when no event arrives |
+| AC-W3 | A member that never reports shows the passive badge and `—`/empty fields, never guessed numbers |
+| AC-W4 | Passing another member's session does not leak its task or blocked state (session-scoped selection) |
+| AC-W5 | A permission wait shows `Blocked`; clearing it with progress or task end returns to busy/idle immediately |
+| AC-W6 | 5 members trigger compact mode (when implemented), preserving name/state/task/time |
+| AC-W7 | No progress bar or fake percentage is rendered on a card |
+
+---
+
+## 7. Conversation view
+
+### 7.1 Message fields (current schema)
+
+| Field | Type | Required | Notes |
 | --- | --- | --- | --- |
-| 1 | OpenAI / 通用 `sk-` key | `sk-[A-Za-z0-9_-]{16,}` | 高 |
-| 2 | AWS Access Key ID | `AKIA[0-9A-Z]{16}` | 高 |
-| 3 | GitHub token | `gh[pousr]_[A-Za-z0-9]{16,}` | 高 |
-| 4 | JWT | `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+` | 高 |
-| 5 | 私钥块 | `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----` | 最高（先于其它规则执行） |
-| 6 | 键值泄漏 | `(password\|passwd\|pwd\|token\|secret\|api_key\|apikey\|access_key\|authorization)\s*[:=]\s*["']?\S+["']?` | 中（值部分替换，key 名保留以便排障） |
-| 7 | URL 内嵌凭据 | `\w+://[^/\s:@]+:[^/\s@]+@` | 中（仅替换 `user:pass@`，保留 host） |
+| `id` | INTEGER PK AUTOINCREMENT | yes | Monotonic cursor for pagination |
+| `dedupe_key` | TEXT UNIQUE | yes | Idempotency; `watch` uses `sha1(memberId|ts|from|sha1(content))` |
+| `project_id` | TEXT | yes | Ownership key |
+| `ts_ms` | INTEGER | yes | Event time from the reporting side |
+| `from_member` | TEXT | yes | Member id, `system` or `user` |
+| `to_member` | TEXT | no | `NULL` = broadcast |
+| `type` | TEXT | yes | See §7.2 |
+| `subject` | TEXT | no | Short title / summary |
+| `content` | TEXT | no | Body (redaction is planned, see §8) |
+| `task_id` | TEXT | no | Related task |
+| `session_id` | TEXT | no | Session that produced the message |
+| `source` | TEXT | yes | `report` / `watch` |
+| `raw_json` | TEXT | no | Original payload (also subject to redaction when implemented) |
+| `archived_at` | INTEGER | no | Archive marker (archive logic not implemented) |
+| `content_truncated` | INTEGER | yes | 1 = body stored truncated |
 
-**执行顺序**：私钥 → key/token 类（1~4）→ URL 凭据 → 键值泄漏；同一片段被多条命中只替换一次，`redaction_hits` 记实际命中的规则列表。
+**Not present today:** `ingested_at_ms`, `reply_to`, `redacted`, `redaction_version`, `redaction_hits`,
+`hit_count`. These belong to planned work (§8, §13), not to the current schema.
 
-### 8.2 误伤判定（可否接受的标准）
+Display order: `(ts_ms ASC, id ASC)`. If a clock jump makes `ts_ms` go backwards, keep insertion
+order as the tiebreaker and mark the row as a time anomaly.
 
-**原则：宁可误杀，不可漏放**——漏放一次密钥的代价远高于误伤一段日志。但误伤必须**可发现、可豁免、可重扫**。
+### 7.2 Message types
 
-| 边界 | 判定 |
+| type | Meaning | UI label | In stream | Default visible |
+| --- | --- | --- | --- | --- |
+| `task_assign` | Assignment / task request | Assign (blue) | yes | yes |
+| `task_update` | Progress update / partial output | Progress (light blue) | yes | yes |
+| `result` | Result / delivered output | Result (green) | yes | yes |
+| `question` | Question / request for information | Question (purple) | yes | yes |
+| `review` | Review feedback | Review (teal) | yes | yes |
+| `block` | Declared block / unmet dependency | Blocked (amber) | yes | yes |
+| `error` | Error / failure report | Error (red) | yes | yes |
+| `shutdown` | Stop/exit signal | Stop (grey) | yes | yes |
+| `system` | System/tool/environment message | System (grey) | yes | no (toggle) |
+
+`heartbeat` is **not** a message type. There is no heartbeat row to filter.
+
+### 7.3 "No loss, no duplicates" acceptance
+
+| ID | Acceptance |
 | --- | --- |
-| **可接受误伤** | 疑似密钥的随机串被 `***`；含 `token=`/`password=` 字样的**日志行、错误信息、测试 fixture** 被 `***`；Base64 长串被 JWT/私钥规则命中。**这些不需要人工修复**，用户应能通过豁免名单处理 |
-| **不可接受误伤** | ① **整条消息被清空**（说明正则写成贪婪跨行，属于 bug，必须有防护：`content` 保留率需 ≥20%，否则跳过该规则并告警）；② **代码结构被破坏**（如把变量名改掉导致代码不可读——键值规则只替换 `=` 右侧的值，绝不替换左侧标识符）；③ 正常短词/常见词被命中（如 `token` 单词本身不得被脱敏，必须要求其后出现 `:` `=` 等分隔） |
-| **发现机制** | 每条被脱敏的消息**必须**留下标记，用户无需对比就知道「这里被改过」（见 §8.4） |
-| **豁免机制** | `ignored_patterns` 白名单，维度：team / member / 文件路径；豁免生效后该规则对命中片段**不替换**且 `redacted=0`（即按原文入库——需用户确认，因为这等于放弃保护） |
-| **重扫** | 规则版本升级后可对全量历史重扫并更新 `redaction_version`；**注意：属于单向操作（原文不可逆），不可回滚到未脱敏状态** |
+| AC-M1 | The same batch of 1000 messages delivered twice (including both sources with the same key) yields `COUNT(*) = COUNT(DISTINCT dedupe_key) = 1000` |
+| AC-M2 | A message first stored from `watch` then reported from `report` keeps one row, `source='report'`, with non-empty fields filled |
+| AC-M3 | After `kill -9` and restart, replaying the same data creates no duplicate; no half-written row |
+| AC-M4 | A truncated/rotated source file triggers a full rescan; dedupe prevents duplicates and an event is recorded |
+| AC-M5 | 100,000 messages display in strict `(ts_ms, id)` order |
+| AC-M6 | Out-of-order arrivals are stored by ingestion order and displayed by `ts_ms`; an out-of-order event is recorded |
 
-**AC-R0 保真**：Given 一条 1000 字符的日志含 1 个 `sk-`；Then 脱敏后保留 ≥980 字符，只有该 key 变为 `***`，其余文本逐字一致。
+### 7.4 Filter semantics
 
-### 8.3 脱敏后的搜索语义（**直接影响 M2 搜索验收，务必对齐**）
+- **Member filter:** multi-select is OR over "involved" (sender or recipient). Provide direction:
+  all / sent only / received only. Broadcast messages count when the sender matches; a "include broadcast"
+  toggle defaults on.
+- **Time range:** closed interval `[start, end]`, millisecond precision. Relative presets are fixed at the
+  moment the view opens; a refresh button re-evaluates. Filtering uses `ts_ms` (fallback to ingestion order
+  only for a flagged clock anomaly).
+- **Type filter:** multi-select OR. `system` is excluded by default with a "show system messages" toggle.
+- **Combination:** member AND type AND time AND keyword.
 
-**核心规则：搜索只在「脱敏后文本」上匹配。** 因为原文从未入库，不存在"绕过脱敏去搜原文"的可能。
+### 7.5 Search
 
-| 场景 | 用户预期（UI 必须这样表达） | 验收 |
-| --- | --- | --- |
-| 用户搜索一段恰好是密钥的字符串 | **搜不到**，属预期行为。搜索框下方常驻说明：`搜索仅匹配已脱敏文本（敏感片段以 *** 呈现）` | **AC-RS1**：插入含 `sk-test1234567890abcdef` 的消息；搜 `test1234` → 结果 0 条且显示该说明文案 |
-| 用户搜索密钥周围上下文（如 `api call failed`） | **能命中**（周边文本未被改动） | **AC-RS2**：同上消息搜 `failed` → 命中 1 条 |
-| 用户搜索 `***` | 命中所有含脱敏片段的消息；本产品将其定义为合法的"找敏感消息"用法 | **AC-RS3**：搜 `***` → 命中数 = `redacted=1` 的消息数（注意 FTS trigram 对符号的处理，需保证 tokenizer 不吞 `*`） |
-| 被豁免的消息 | 按原文可搜（用户知情） | **AC-RS4**：命中数一致 |
-
-> **给 tester 的提醒**：M2 搜索用例必须以**脱敏后落库的文本**为期望值，不能用原始上报文本的期望值（这是最常见的验收分歧点）。
-
-### 8.4 「本条已脱敏」的展示时机与计数
-
-| 项 | 规格 |
+| Item | Rule |
 | --- | --- |
-| **展示时机** | ① 消息列表行：`redacted=1` 时行首显示小盾牌/星标徽标（**不需要展开、不需要 hover**，列表态即可见）；② 详情抽屉顶部：横幅 `本条已脱敏 · 命中 N 处`；③ 导出文件：每条消息头部标注 `[已脱敏 N 处]`，避免导出者误以为是完整记录 |
-| **是否计数** | **必须计数**。`redaction_hits` 累加得到消息级 `hit_count`，UI 显示「命中 N 处」，但**不显示具体是哪条规则命中**（减少信息泄漏）。规则的精确列表仅进入 `events` 审计（本地） |
-| **零命中** | `redacted=0` 的消息**不显示任何脱敏徽标**（避免全屏都是标记导致的"狼来了"） |
-| **AC-R5** | Given 一条含 3 处命中的消息；Then 列表行有徽标、抽屉显示 `本条已脱敏 · 命中 3 处`、导出文本含 `[已脱敏 3 处]`；同一 team 中 `redacted=0` 的消息无徽标 |
+| Case | Case-insensitive |
+| Scope | `content` + `subject`; task title and file paths are planned. Member names are not searched (use the member filter) |
+| Multi-word | Space-separated = AND; quoted phrase = exact |
+| Minimum length | Any non-empty query; short queries use a different path |
+| Debounce | 200 ms |
+| Highlight | `<mark>`; cap highlights per row to avoid jank |
+| Count | Show `matched / baseline` |
+| Sort | Newest first by default, with an ascending toggle when supported |
+| Tokenizer | FTS5 `trigram` is planned. **Current query layer uses `LIKE`; FTS is not wired** |
+| Short queries | 1–2 characters must use a time-bounded `LIKE` scan when FTS is enabled; otherwise use `LIKE` for all lengths |
 
-### 8.5 「原文通道」与风险确认文案（Q9 已拍板 · 归 M3）
+**Current status:** only `LIKE %q%` is implemented. The `messages_fts` table and triggers exist, but no query
+uses them. The short-query fallback, ranking toggle and prompt copy described below are requirements for the
+search work, not shipped behavior.
 
-> Q9 结论：**默认关闭（不存原文）**；开启需显式确认风险；OS 钥匙串优先、口令派生降级；**每次会话重新授权、不记住解锁状态**；每次查看写 `events` 日志。
+When search is implemented:
 
-#### 8.5.1 默认行为（不开启时）
-1. UI 中「查看原文」入口**存在但置灰**，点击后给出解释：`本产品默认不保存未脱敏的原文，因此无法还原。若需要，请在「设置 › 安全 › 原文通道」开启（需显式确认风险）。`
-2. **绝不提供「假装还原」**：不得对 `***` 做任何猜测性填充或部分展示（如 `sk-***abc` 这类"半掩码"也在禁止之列，因为它会误导用户以为能猜出原文）。
-3. **AC-R6**：Given 未开启原文通道；Then 「查看原文」入口不可点击（或有 `cursor:not-allowed` + 上述说明），且无任何路径可将未脱敏文本写入 DB。
+- 1–2 characters: automatic `LIKE`, newest first, never a fake relevance score.
+- ≥ 3 characters: FTS trigram with optional relevance (`bm25`) / time sort.
+- Results must state the active mode ("contains-match mode", "by time").
+- `LIKE` must be bounded by a `LIMIT` and a default 7-day window unless the user explicitly widens it.
+- A query taking > 800 ms aborts with "query timed out, partial results shown" and records an event.
+- An empty result shows "No messages match" plus a "clear filters" action, never a blank panel.
 
-#### 8.5.2 开启流程与确认交互（**可直接验收**）
-开启必须走**三步确认**，缺一不可（自动化用 `data-testid` 断言三个元素均存在且全部完成才生效）：
+### 7.6 Scrolling
 
-**步骤 1｜风险告知弹窗（必须原样展示以下文案）**
+- Auto-follow the newest message while the view is at the bottom.
+- Scrolling up more than one screen pauses follow and shows `N new messages ↓`.
+- Clicking the badge returns to the bottom and resumes follow.
+- AC-S1: appended messages keep the viewport pinned; after scrolling up two screens no automatic jump occurs;
+  clicking the badge restores follow.
 
-> **开启「原文通道」？**
-> 开启后，WorkGremlin 会在本机的加密容器中**额外保存一份未经脱敏的消息原文**，用于「查看原文」。开启后你将承担以下风险：
-> 1. **密钥泄漏面扩大**：若该加密容器或你的设备被他人访问，其中的密钥、令牌、私钥将以明文形式存在。
-> 2. **保护不再是单向**：关闭通道并清理后不可恢复，但在清理之前，原文始终可被读取。
-> 3. **导出与备份可能带走原文**：任何包含原文通道数据的导出、备份、云同步行为，都不会再被脱敏保护。
-> 适用建议：仅在你需要排查被误伤的内容、且确信本地环境安全时开启；排查完成后请立即关闭并清理。
-> 说明：即使不开启，你仍然可以查看脱敏后的全部内容与关联的任务、时间和文件。
+### 7.7 Capacity and retention
 
-**步骤 2｜勾选两项（必须都勾）**
-- ☐ `我已阅读上述风险，理解原文将以未脱敏形式保存在本机`
-- ☐ `我会在排查完成后及时关闭原文通道并清理已保存的原文`
-
-**步骤 3｜输入确认关键词（``type-to-confirm``）**
-- 输入框上方：`请输入「启用原文通道」以确认`；**输入必须完全一致**（全角/半角、空格差异均判失败）；
-- 输入错误时行内提示 `输入不匹配，请重试`，**不允许绕过按钮**；
-- 100% 完成后「启用」按钮才可点击（`data-testid=raw-channel-enable` 的 disabled 状态由三条件共同决定）。
-
-#### 8.5.3 开启后的运行时规则
-| 项 | 规则 |
+| Layer | Rule |
 | --- | --- |
-| 密钥保护 | **OS 钥匙串优先**（Keychain / Credential Manager / Secret Service）；不可用时降级**口令派生（PBKDF2/Argon2）**，口令**永不落盘、永不出网** |
-| 授权生命周期 | **每次会话（App 冷启动）必须重新解锁**；**不记住解锁状态**；空闲 15 分钟自动锁定，再次查看需重新解锁 |
-| 审计 | 每次「查看原文」写一条 `events{kind:'raw.view', messageId, ts, actor}`，保留 30 天；UI 提供「查看记录」列表 |
-| 存储上限 | 独立容器，建议上限 ≤200MB，超限按最旧淘汰（**淘汰即不可逆删除**），不进入主库保留策略 |
-| 关闭与清理 | 关闭时提供「立即清理已保存原文」，执行后 UI 明确显示 `已清理 N 条原文`；清理前需二次确认 |
-| AC-R7 | Given 已开启并完成授权；When App 重启；Then 再次查看原文时**必须重新解锁**（无持久化解锁态） |
-| AC-R8 | Given 完成查看 3 条原文；Then `events` 中存在 3 条 `raw.view`，且其 `messageId` 与查看对象一致 |
+| Rendering | A 500-message in-memory window today; virtual scrolling is planned |
+| AC-P1 | With 100,000 stored messages, DOM message nodes ≤ 80, scroll ≥ 55 fps, memory growth ≤ 200 MB |
+| AC-P2 | With 10,000 messages, any filter/search combination responds in < 200 ms |
+| Message retention | 90 days or 100,000 messages per project (first threshold wins) — archive logic is not implemented |
+| Over-limit | Export JSONL → verify row counts → delete; never delete first |
+| Backpressure | A burst > 1000 messages is batched and pushed with a 100 ms throttle; show "catching up +N" |
+| Truncation | A body > 800 characters is stored truncated (`content_truncated=1`) and can be expanded |
 
-#### 8.5.4 「显示原文」确认弹窗（**正式文案，直接交付前端**）
+### 7.8 Pin / detail / export (planned, P1)
 
-**标题**：`确认要显示未脱敏的原文？`
-
-**正文**：
-> 这条消息中有 **{N} 处**内容在入库前已被替换为 ***。现在将显示**未经脱敏的原文**。
->
-> 原文可能包含：API 密钥、访问令牌、私钥、带密码的连接串等凭据。
->
-> 一旦显示，原文可能通过以下途径离开你的本机，且 WorkGremlin 无法追回：
-> 1. **截图 / 录屏 / 投屏 / 屏幕共享**会被原样记录；
-> 2. 你对原文执行**复制**、或他人使用取色/取词类工具时，会进入**剪贴板**；
-> 3. 协作工具、录屏字幕、屏幕 oriented OCR 等第三方软件可能读取屏幕内容；
-> 4. 若你开启了把界面内容写入**日志 / issue / 聊天**的插件或工作流，原文会被带出去。
->
-> 确认后原文将以**遮罩形式**展示：默认不可见，**按住鼠标（或按空格）才明文显示**，松开即恢复遮罩。
-
-**按钮**：`取消`（次级，默认聚焦）· `我已知风险，显示原文`（主按钮，`data-testid=raw-view-confirm`）
-**脚注**：`每次查看都会记录一条本地审计日志（不含原文内容）。`
-
-**交互要求**
-- 弹窗为**模态**，符合 NF-11 `data-testid` 约定；
-- 主按钮在用户勾选 `我已理解上述泄漏途径` 之前为 **disabled**（勾选 + 点击，两步）；
-- 每会话首次必弹；后续规则见 §8.5.6。
-
-#### 8.5.5 确认后的展示形态与遮罩
-
-| 项 | 规格 |
-| --- | --- |
-| **形态** | **抽屉内原地展开**（不新开窗口、不脱离当前消息上下文）；原文区域替换原本显示 `***` 的位置，上方常驻橙色警示条 `原文模式 · 未脱敏` |
-| **默认遮罩** | **默认遮罩**（黑条覆盖 / `filter: blur(5px)`），**明文需按住鼠标左键或按住空格键**才显示；松开立即恢复 |
-| **遮罩切换** | 提供「临时固定显示」开关（默认关），开启后 60s 无操作自动回到遮罩；**该状态不跨消息、不跨会话记忆** |
-| **自动重新遮罩时机**（任一触发） | ① 松开鼠标/空格；② 抽屉关闭或切到别的消息；③ 窗口失焦；④ 系统锁屏 / 休眠；⑤ 「临时固定」满 60s；⑥ 应用进入后台 5s |
-| **复制行为** | 选中复制的是**遮罩后内容还是原文**必须明确：默认复制**脱敏后文本**；仅当用户显式点击「复制原文」时才复制原文，并弹 toast `原文已复制到剪贴板，{N}s 后自动清除剪贴板`（建议 30s，尽力而为，不支持则提示风险） |
-| **不得做的事** | 禁止自动朗读、禁止生成原文缩略图作为缓存、禁止把原文写入 DB / 日志 / 崩溃报告 / 遥测 |
-
-#### 8.5.6 二次确认的触发条件（**researcher 裁定**）
-
-采用 **「会话首次 + 频次阈值 + 批量动作」三段式**（理由：既避免每次点击都拦一道导致用户直接放弃使用，也避免一次确认后无限查看造成大批量泄漏）：
-
-| 触发场景 | 是否需要确认 |
-| --- | --- |
-| **每个会话首次**查看任一原文 | ✅ 必须完整确认（勾选 + 主按钮） |
-| 同会话内第 2~10 条 | ❌ 无需再次确认，但每次仍是**默认遮罩**，且顶部橙色警示条常驻，每次计入审计 |
-| **同会话第 11 条起** | ✅ **再次完整确认**，文案追加 `本会话你已查看 {n} 条原文，请确认是否需要继续。`（阈值 `RAW_VIEW_RECONFIRM_AT = 10`，可配置） |
-| **批量导出含原文** | ✅ **必须单独确认**，且**不支持**与单条查看共用同意；文案：`即将导出 {n} 条消息的未脱敏原文到文件，文件将不受任何保护` |
-| 复制原文 | ✅ 每次均需一次轻量确认（单按钮「复制原文」即可，不再复述全文风险） |
-| 会话（App 冷启动）结束再进入 | ✅ 视为新会话，回到首次规则 |
-
-> **排除项**：`raw.view` 审计、开关原文通道等操作**不计入**上述计数；只有真正让原文出现在屏幕上的行为才计数。
-
-#### 8.5.7 取消 / 关闭后的降级表现
-
-| 用户动作 | 表现 |
-| --- | --- |
-| 点 `取消` / 按 `ESC` 关闭确认弹窗 | 停留在**脱敏视图**，消息行维持 §8.4 的「本条已脱敏 · 命中 N 处」标记；**不 Toast 说教、不弹第二次**；抽屉保持打开以继续查看脱敏内容 |
-| 在原文模式下按 `ESC` | **先退出原文模式（回到遮罩/脱敏视图），再按一次 ESC 才关闭抽屉**（两级 ESC，避免误关丢失上下文） |
-| 查看过程中数据源断开/原文件不可得 | 显示 `原文不可得（来源不可用或已被清理）`，**不做任何猜测性还原**，并保持脱敏视图可用 |
-| 原文通道被锁定（空闲 15 分钟） | 遮罩显示 `已锁定，请重新解锁后查看` + 「解锁」按钮；**不自动携带上次的解锁态** |
-
-#### 8.5.8 审计要求（硬约束）
-
-**每次让原文出现在屏幕上的行为**都写一条 `events`：
-
-```
-events {
-  kind: 'raw.view' | 'raw.copy' | 'raw.export' | 'raw.channel.enable' | 'raw.channel.disable' | 'raw.unlock',
-  ts_ms, actor(本机用户标识), team_id, message_id,
-  display: 'masked_reveal' | 'temporary_pin' | 'clipboard' | 'file',
-  reconfirm_seq: <该会话内第几次>,
-  duration_ms         // 明文累计可见时长
-}
-```
-- **绝对禁止**：审计日志中**不得出现原文内容、原文片段、长度以外的任何特征**（不记录 char_count 之外的哈希）；`redacted=1` 的消息与其路由信息可记。
-- 审计保留 30 天，UI 提供「原文查看记录」列表（时间、消息 id、动作、可见时长），不含内容。
-- **AC-R9**：Given 查看 3 条原文并复制 1 次；Then `events` 中存在 3 条 `raw.view` + 1 条 `raw.copy`，且**序列化后的 events 表内容中不含任一密钥原文**（对 DB 文件 `grep -F` 断言）。
-
-#### 8.5.9 键盘可达性与 ESC 行为
-
-| 要求 | 规格 |
-| --- | --- |
-| 可达性 | 全部控件可 Tab 到达；焦点顺序：警示条 → 遮罩原文区 → 「临时固定显示」开关 → 「复制原文」 → 「退出原文模式」 → 关闭抽屉；焦点环可见（对比度 ≥3:1） |
-| 明文触发 | 键盘：**按住空格**明文，松开恢复；**不得**要求必须使用鼠标（键鼠双通道等价） |
-| ESC 两级 | 见 §8.5.7：第一次退出原文模式，第二次关闭抽屉；均在 `document` 级捕获且阻止冒泡到全局路由 |
-| Enter | 在确认弹窗中 Enter = 「我已知风险，显示原文」；但该按钮在未勾选期间 disabled，Enter 无效（**不得**用 Enter 绕过勾选） |
-| 减少动效 | 「减少动效」开启时不使用 blur 动画，改为纯色遮罩块（无障碍，见 §5.10） |
-| AC-R10 | Given 焦点在抽屉内；When 仅使用键盘（Tab / 空格 / Enter / ESC）操作；Then 可完整完成「确认 → 明文查看 → 退出 → 关闭」，无鼠标依赖 |
-
-### 8.6 脱敏验收清单汇总
-
-| ID | 断言 |
-| --- | --- |
-| AC-R1 | 含 7 类样本的消息，脱敏后库中**不含任何原串**（对 DB 文件级 `grep -F` 断言，覆盖 `content`/`subject`/`raw_json` 全部列） |
-| AC-R1b | 对同一批样本，`./data/*.db` 文件中不出现任一密钥原串（**落盘级验证，不是内存级**） |
-| AC-R2 | 白名单命中的片段不脱敏，且该行 `redacted=0` |
-| AC-R3 | 规则升级后全量重扫可更新 `redaction_version`，且重扫是幂等的（二次重扫结果一致） |
-| AC-R4 | 同一消息被多条规则命中时只替换一次，`redaction_hits` 正确记录规则列表 |
-| AC-R5 | §8.4 的三处展示（列表徽标 / 抽屉「命中 N 处」/ 导出标注）均生效；`redacted=0` 的消息无徽标 |
-| AC-R6~R8 | §8.5 默认行为与运行时规则 |
-| AC-RS1~RS4 | §8.3 搜索语义（**直接作为 M2 搜索验收的输入**） |
-| AC-R0 | §8.2 保真度：`content` 保留率 ≥20%，正常文本逐字不变 |
+- Pin messages to a top area with a local note; pinned items are exempt from retention/hiding; export includes
+  them by default.
+- Detail drawer: full body, redacted raw JSON, meta (tool/duration/tokens), clickable related files.
+- Export: current filtered result only; dialog states count, range and active filters; Markdown / JSONL;
+  limit 50,000 rows per export.
 
 ---
 
-## 9. 功能清单与验收（编号沿用 outline）
+## 8. Message redaction (P0-7, **not implemented**)
+
+> This section is a requirement, not a description of current behavior. Today messages are stored as
+> reported; there is no `redact()` step, no redaction columns and no "view original" channel.
+
+**Definition.** Redaction is an irreversible transformation **before** the row and its FTS index are
+written. Original text must never enter `content`, `subject` or `raw_json`.
+
+### 8.1 Rules (replace with `***`)
+
+| # | Rule | Regex sketch | Priority |
+| --- | --- | --- | --- |
+| 1 | OpenAI / generic `sk-` key | `sk-[A-Za-z0-9_-]{16,}` | high |
+| 2 | AWS access key id | `AKIA[0-9A-Z]{16}` | high |
+| 3 | GitHub token | `gh[pousr]_[A-Za-z0-9]{16,}` | high |
+| 4 | JWT | `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+` | high |
+| 5 | Private key block | `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----` | highest (run first) |
+| 6 | Key/value leak | `(password\|passwd\|pwd\|token\|secret\|api_key\|apikey\|access_key\|authorization)\s*[:=]\s*["']?\S+["']?` | medium (replace the value, keep the key name) |
+| 7 | URL credentials | `\w+://[^/\s:@]+:[^/\s@]+@` | medium (replace `user:pass@`, keep host) |
+
+Execution order: private key → key/token rules → URL credentials → key/value. A fragment matched by several
+rules is replaced once. Hit metadata is stored separately (`redaction_hits`), never in the body.
+
+### 8.2 False positives
+
+Prefer over-redaction to leakage, but make it discoverable and reversible via an allowlist. A rule must
+never empty the whole message (content retention ≥ 20%; otherwise skip that rule and warn), never rewrite
+code identifiers on the left side of `=`, and never redact the bare word `token` without a separator.
+Every redacted message carries a visible marker; rule versions support a one-way rescan.
+
+### 8.3 Search on redacted text
+
+Search matches only the redacted text. Searching for a secret returns nothing (and the UI explains why);
+searching surrounding context still works; searching `***` finds redacted messages. Exempted messages are
+searched as stored. Tests must assert against redacted text, not the original report.
+
+### 8.4 Display and count
+
+- List row: shield/star badge when `redacted=1`.
+- Drawer: banner `Redacted · N hits`.
+- Export: each row header `[redacted N]`.
+- `redacted=0`: no badge.
+- Show the hit count, never the matching rule names (avoid leaking the rule set); rule details go to the local
+  audit event log.
+
+### 8.5 "View original" channel (planned, M3)
+
+- Default **off**: no original is stored; the entry is disabled with an explanation; never render a
+  half-mask such as `sk-***abc`.
+- Enabling takes three steps: risk dialog (leak paths: screenshots, clipboard, screen sharing/OCR,
+  logs/issues), two explicit checkboxes, and typing `Enable original channel` exactly.
+- Key handling: OS keychain first, passphrase-derived key as fallback; the passphrase never touches disk or
+  the network. Unlock is required on every app cold start and after 15 idle minutes.
+- Viewing uses a mask that reveals only while the mouse is held or space is pressed; re-mask on release,
+  drawer close, window blur, lock/sleep, 60 s temporary pin, or 5 s in background.
+- Copy defaults to redacted text; copying the original needs a separate confirmation and clears the clipboard
+  after ~30 s when possible.
+- Every reveal/copy/export/unlock/enable/disable writes an audit event without content. Audit retention: 30 days.
+
+### 8.6 Acceptance summary
+
+| ID | Assertion |
+| --- | --- |
+| AC-R0 | A 1000-character log with one key keeps ≥ 980 characters and changes only the key |
+| AC-R1 | After storing all seven rule samples, a file-level `grep -F` on the DB finds no original secret |
+| AC-R2 | Allowlisted fragments stay unchanged and the row has `redacted=0` |
+| AC-R3 | A rule-version rescan is idempotent |
+| AC-R4 | Multiple matching rules replace one fragment once and record the rule list |
+| AC-R5 | Row badge, drawer count and export marker all appear; `redacted=0` has none |
+| AC-R6–R10 | The view-original flow follows §8.5 (default off, three-step enable, re-unlock, keyboard-only, ESC levels) |
+| AC-RS1–RS4 | Search semantics in §8.3 |
+
+---
+
+## 9. Feature list and acceptance
 
 ### 9.1 P0
 
-| ID | 功能 | 验收标准（Given/When/Then 或量化指标） |
+| ID | Feature | Acceptance |
 | --- | --- | --- |
-| **P0-1** | 工位视图 | 见 §6.5 AC-W1~W7；自动刷新，**无手动刷新按钮**；≥16 成员不串台不错位 |
-| **P0-2** | 对话记录窗口 | 展示**全部**成员消息流（非单成员收件箱）；每条含 时间 / 发送方→接收方 / 类型 / 内容（可展开）；见 AC-M1~M6、AC-S1；10 万条滚动流畅（AC-P1） |
-| **P0-3** | 数据接入与落盘 | A/B 双路线 + 融合规则（§4.2）；无心跳 60s → `degraded`；SQLite（better-sqlite3 + rebuild）；保留 90 天 / 10 万条，M0 预留 `archived_at` 与索引 |
-| **P0-4** | 单 workspace 多 team | `team_id` 进入全部核心表；UI 支持 team 切换；切换后仅显示该 team 数据（跨 team 数据零串台，自动化断言） |
-| **P0-5** | 连接与自解释 | 顶部连接条：WS 状态 / 数据源（`上报`\|`推断`\|`degraded`）/ 最近同步时间；断线指数退避重连；休眠恢复自动补齐（依赖 AC-M3） |
-| **P0-6** | 离线演示 `--demo` / `MOCK=1` | 确定性假数据源（含 5 主状态 × degraded、10 种消息类型、≥1000 条消息、1 个 16 成员样例用于压测，且两次同参数启动输出完全一致）；同参数两次启动产出**完全一致**；UI 常驻 `DEMO 数据` 角标与真实数据视觉隔离 |
-| **P0-7** | **消息脱敏（硬要求）** | 写库**前**正则脱敏为 `***`，**原文不入库**（含 `raw_json`）；7 类规则见 §8.1；命中行必须有呈现；详见 §8.6 的 AC-R0 ~ AC-RS4。**验收口径**：对 DB 文件做 `grep -F`，不得出现任一密钥原串 |
+| **P0-1** | Workstation view | Three states, automatic refresh, no manual refresh button, 16-member no-cross-talk target; see §6.5 |
+| **P0-2** | Conversation view | Full message stream (not one member's inbox); time / sender → recipient / type / content; see AC-M1–M6, AC-S1, AC-P1 |
+| **P0-3** | Ingest and persistence | Route B reporting + floor readers; SQLite; 90-day / 100k retention target. No heartbeat and no liveness inference |
+| **P0-4** | Project scope | `project_id` in every core table; switching shows only that project's data, with zero cross-project leakage |
+| **P0-5** | Connection and self-explanation | WS status and polling fallback; last sync time; exponential reconnect. A connection problem never changes a member state |
+| **P0-6** | Demo mode | A UI action creates an isolated demo project with deterministic data, visually marked as demo |
+| **P0-7** | Message redaction | Requirements in §8; **not implemented** |
 
-### 9.2 P1（M3）
+### 9.2 P1 (M3)
 
-| ID | 功能 | 验收标准 |
+| ID | Feature | Acceptance |
 | --- | --- | --- |
-| P1-1 | 桌面打包（AppImage/deb/nsis/dmg，仅 x64） | 三平台 x64 均可安装启动；脚本参数化不硬编码架构；静默安装/升级/卸载有自动化覆盖 |
-| P1-2 | 团队时间线与吞吐图（ECharts） | 展示一天的任务分布、成员吞吐、消息量；10 万条数据下首屏 <2s |
-| P1-3 | 会话导出 Markdown / JSONL | 导出范围 = 当前过滤结果且对话框明示；Markdown 含参与者 + 时间线 + 关联任务；5k 条 ≤3s |
-| P1-4 | 归档保留策略落地 | 超限**先导出 JSONL 校验再删除**；删除前后总数可核对；失败即中止 |
-| P1-5 | 暗色主题 | 跟随系统切换；满足 §5.10 对比度要求 |
-| P1-6 | 只读 + 轻量动作 | 标记已读、导出、**复制（仅脱敏后文本；复制原文走 §8.5.6 的独立确认）**、pin（P1）；**不得下发任何指令**（架构与 UI 双重保证） |
+| P1-1 | Desktop packaging (AppImage/deb/NSIS/dmg, x64 only) | Install/launch on all three platforms; parameterized scripts; automated install/upgrade/uninstall where practical |
+| P1-2 | Timeline and throughput charts | Task distribution, member throughput, message volume; first paint < 2 s at 100k messages |
+| P1-3 | Session export (Markdown / JSONL) | Export the current filter; dialog states scope; Markdown contains participants, timeline and related tasks |
+| P1-4 | Archiving and retention | Export JSONL, verify counts, then delete; abort on any failure |
+| P1-5 | Dark theme | Follows the system; meets the contrast requirements |
+| P1-6 | Read-only light actions | Mark read, export, copy redacted text, pin. Copying original follows §8.5.6. **No commands are sent to agents** |
 
-### 9.3 P2（延后）
+### 9.3 P2 (deferred)
 
-| ID | 功能 | 备注 |
+| ID | Feature | Note |
 | --- | --- | --- |
-| P2-1 | 反向控制（派活 / 中断 / 重试） | 已拍板：本阶段不做，待 runner 能力评估；UI 不留死入口 |
-| P2-2 | 多 workspace | 架构预留即可 |
-| P2-3 | 崩溃回放 / 事件时间旅行 | 依赖 `events` 全量 |
-| P2-4 | Tauri 迁移评估 | Electron ~100MB 暂接受 |
-| P2-5 | 网络盘 / WSL 生产化 | 当前降级 5s 轮询 + `degraded`（D4） |
-| P2-6 | 告警规则（阻塞超时、报错） | 依赖状态语义稳定后再做；规则见 §9.4 |
+| P2-1 | Reverse control (assign/interrupt/retry) | Not in this stage; requires a runner capability review; no dead UI entry points |
+| P2-2 | Multiple workspaces | Architectural reservation only |
+| P2-3 | Crash replay / event time travel | Depends on a fully populated `events` table |
+| P2-4 | Tauri migration evaluation | Electron ~100 MB is accepted for now |
+| P2-5 | Network drive / WSL production support | Readers degrade to empty data; no degraded flag |
+| P2-6 | Alerting rules | Requires a notification design; see §9.4 |
 
-### 9.4 通知规格（Q4 / Q8 已拍板，归 P2-6，M3+）
+### 9.4 Notifications (not implemented)
 
-| 项 | 规格 |
+| Item | Requirement |
 | --- | --- |
-| **形态** | **仅系统通知（本地Notification），永远不做声音**、不做角标之外的打扰手段 |
-| **默认状态** | **默认关闭**（`notifications.enabled=false`）；用户需在设置显式开启 |
-| **免打扰** | **默认关闭**（`quietHours.enabled=false`），**不预设任何时段**；提供 `22:00–08:00` 模板一键启用（值预填但开关关） |
-| **触发最小集（S1 级）** | ① 成员进入 `error`；② 成员 `blocked` 超过 **10 分钟**；③ **曾在线**成员变为 `offline` |
-| **聚合规则** | `member + error_type` 为聚合键；**同成员同故障类型 5 分钟内只发 1 条**；成员离线期间不重复发送，恢复上线后合并为一条 `离线期间发生 N 次` |
-| **弹出条件** | **仅当窗口失焦时**才弹系统通知（聚焦时用应用内提示条替代）；首次弹出需系统授权，用户拒绝后**不再重复申请**，改为应用内角标 |
-| **点击行为** | 点击通知 → 聚焦窗口 + 定位到该成员卡片并滚动到可见区域 |
-| AC-N1 | Given 通知已开启、窗口失焦、成员 X 连续触发 3 次同 `error_type`；When 5 分钟窗口内；Then 系统通知**恰好 1 条** |
-| AC-N2 | Given 成员 Y 离线期间发生 5 次同故障；When 其恢复上线；Then 收到 1 条 `离线期间发生 5 次` 的合并通知，离线期间未收到任何单独通知 |
-| AC-N3 | Given 窗口聚焦；When 触发 S1 事件；Then **不弹系统通知**，改为应用内提示条 |
-| AC-N4 | Given 免打扰启用 `22:00–08:00`；When 23:00 触发 S1；Then 不弹窗且计入未读角标；When 09:00 触发；Then 正常弹出 |
+| Form | System notifications only; never sound. App-internal badges when unfocused is unavailable |
+| Default | Off (`notifications.enabled=false`); user opts in |
+| Quiet hours | Off by default; no preset period; offer a `22:00–08:00` template that is disabled until enabled |
+| Trigger set | With three states, the old `error` / `offline > 60 s` triggers are invalid. The only candidate event is **`blocked` lasting longer than 10 minutes**. The final trigger policy must be redesigned before implementation |
+| Aggregation | Per member + event type, at most one notification per 5 minutes; no repeats while unfocused beyond the window |
+| Popup | Only when the window is unfocused; otherwise use an in-app banner. Request OS permission once, never repeatedly |
+| Click | Focus the window and scroll to the member card |
+| AC-N1 | With notifications on and the window unfocused, three blocks within 5 minutes yield exactly one notification |
+| AC-N2 | The old "offline period" aggregation is retired with the offline state |
+| AC-N3 | When focused, no system notification is shown; an in-app banner is used |
+| AC-N4 | Quiet hours suppress popups while still updating the unread badge |
 
 ---
 
-## 10. 非功能需求
+## 10. Non-functional requirements
 
-| ID | 需求 | 指标 / 验收 |
+| ID | Requirement | Metric / acceptance |
 | --- | --- | --- |
-| **NF-1** | **实时性** | 状态变更端到端（ ingest 收到 → DOM 更新）**P95 ≤ 300ms**，P99 ≤ 800ms；测量口径：服务端在 ingest 时打 `t0`，渲染层更新完成后读 `performance.now()` 回传，取差值分布 |
-| **NF-2** | **16 成员不串台** | 16 成员并发同名字段注入；逐 `data-testid` 断言一一对应（SC-10 / AC-W1） |
-| **NF-3** | **10 万条滚动** | DOM ≤80 节点，≥55fps，内存增量 ≤200MB；1 万条过滤/搜索 <200ms |
-| NF-4 | 冷启动回填 | ≤10s 完成状态还原 + 最近 200 条/人（SC-E） |
-| NF-5 | 本地优先 / 隐私 | 全本地存储；零外发请求（可核验无可疑出站）；遥测默认关闭，如需开启必须显式勾选 |
-| NF-6 | 数据安全 | DB 文件权限最小化（仅当前用户）；导出行为写本地审计日志（30 天）；脱敏见 §8 |
-| NF-7 | 离线可用 | 断网 + 数据源断开时仍可浏览、搜索、导出历史；降级为只读历史模式并有明确提示 |
-| NF-8 | 健壮性 | 畸形输入（截断 JSON / 非 UTF-8 / 单行 ≥10MB / 非法字符 / 深层嵌套）不得崩溃，跳过并计数提示；`kill -9` 10 次后数据仍完整无半写 |
-| NF-9 | 资源占用 | 空闲态 CPU ≤2%（均值）、RSS ≤300MB；满载 ≤400MB |
-| NF-10 | 跨平台 | 见 §3（仅 x64）；快捷键遵循平台约定（Ctrl/Cmd） |
-| NF-11 | 可测性 | 时间源可注入、`createTestApp()` 工厂、core 与 Electron 解耦（lint 强制）、关键 `data-testid`、确定性 ID —— 5 条契约（M0） |
-| NF-12 | 自解释 | 首屏空态引导「未检测到数据源？点此配置路径」；状态图例 hover 可查；3 分钟内无需文档看懂工位视图 |
+| **NF-1** | Real-time | State change from ingest to DOM: P95 ≤ 300 ms, P99 ≤ 800 ms |
+| **NF-2** | 16 members without cross-talk | 16 concurrent same-named fields map one-to-one per `data-testid` |
+| **NF-3** | 100k messages | DOM ≤ 80 nodes, ≥ 55 fps, memory growth ≤ 200 MB; 10k-message filter/search < 200 ms |
+| NF-4 | Cold start | Restore state and recent 200 messages/member within 10 s |
+| NF-5 | Local-first / privacy | All data local; no outbound requests; telemetry off by default |
+| NF-6 | Data safety | DB file permissions limited to the current user; export audits kept 30 days; redaction per §8 |
+| NF-7 | Offline usable | With no network and disconnected sources, history remains browsable/searchable/exportable in read-only mode |
+| NF-8 | Robustness | Malformed input (truncated JSON, invalid UTF-8, a 10 MB line, deep nesting) is skipped and counted, never crashes; survives 10 `kill -9` cycles without half-written rows |
+| NF-9 | Resource use | Idle CPU ≤ 2% average, RSS ≤ 300 MB; under load ≤ 400 MB |
+| NF-10 | Cross-platform | x64 only; platform-native shortcuts (Ctrl/Cmd) |
+| NF-11 | Testability | Injectable clock, `createServer()` factory, core independent of Electron, stable `data-testid`s, deterministic IDs |
+| NF-12 | Self-explanation | Empty-state guidance ("no data source detected? configure a path"), hover legends, understandable without docs within 3 minutes |
 
 ---
 
-## 11. 竞品参考与取舍
+## 11. Competitor reference
 
-| 竞品 | 观察 | **借鉴** | **明确不做** |
+| Product | Observation | What we borrow | What we deliberately do not do |
 | --- | --- | --- | --- |
-| **Claude Code Agent Monitor**（hook→HTTP→SQLite→WS；Kanban / Activity Feed / agent 状态机 / 历史导入冷启动 / 2min 兜底清扫） | 事件驱动 + WS 推送；明确状态机；**历史导入解决冷启动空面板**；定时清扫孤儿会话 | 状态机写法、冷启动回填（SC-E）、超时兜底清扫（我们的 D1/活性闸门）、导出与清理运维面板 | 面向「会话」的 5 列 Kanban（我们是常驻工位卡片）；成本/计费 |
-| claude-view（Rust，"Mission Control"）、AgentMonitor（多实例管理） | 轻量本地进程；实例生命周期视角 | 「从未出现」与「曾在线后消失」要能区分（我们的 `offline` 两种文案）；紧凑态势视图调性 | 终端化表达；拉起/创建 agent（P2-1） |
-| n8n（Executions 列表 + 节点输入输出钻取 + PIN 数据 + 失败重跑） | 列表过滤、逐节点输入输出、Pin 用于复现 | 消息抽屉钻取、置顶 Pin 语义、任务串联 | 编排画布 / 节点画布 |
-| Node-RED（Debug 侧边栏 + Status 节点） | 节点状态色点 + **自定义状态文本**、Debug 侧边栏 | `忙碌 · {当前动作}` 的「颜色+文本」范式；高信息密度工程美学 | 流式编程 UI |
-| Dify（Workflow tracing / 标注 / 逐步耗时） | 每步耗时与 token、tracing 时间线 | `meta.duration_ms`、「慢于预期」角标、P2 时间线泳道 | 云端协作与账号体系 |
-| tmux（status line、activity/silence 告警） | 一行式常驻摘要、`monitor-silence` 静默告警 | 「静默超时」即我们的活性闸门 + `HEARTBEAT_TIMEOUT/A_SILENT_TIMEOUT`；P2 悬浮迷你条 | 终端内 UI |
+| Claude Code Agent Monitor | Hook → HTTP → SQLite → WS; state machine; history import; periodic orphan sweep | Event-driven push, explicit state machine, cold-start backfill, operational cleanup | Session-based 5-column Kanban; cost/billing |
+| claude-view, AgentMonitor | Lightweight local process; instance lifecycle view | Compact situational view; distinguish "never appeared" from "was active" | Terminal-style presentation; starting agents (P2-1) |
+| n8n | Execution list, node I/O drill-down, PIN data, retry | Message drawer, pin semantics, task chaining | Workflow canvas |
+| Node-RED | Status dots with custom text, debug sidebar | Color + text status pattern; high information density | Flow programming UI |
+| Dify | Per-step duration and tokens, tracing timeline | Duration meta, "slower than expected" badge, timeline lanes | Cloud collaboration and accounts |
+| tmux | One-line summary, silence alerts | Silence is visible, but **not** a state transition (no heartbeat/TTL) | Terminal UI |
 
-**差异化**：把「常驻工位卡片 + 5 主状态/degraded 清晰语义 + 10 万条可追溯流水」三件事做扎实，其余（计费、**编排被监控的团队**、云端、终端 UI、反向控制）一律不做。
-
-> 这里的「编排」指**替 runner 给被监控的团队派活**，一律不做；**议事厅（§15）是唯一例外**，且它编排的是自己拉起的、一次性的进程（一律只读工具，见 §15.3），与被监控的团队无关。
+**Differentiation:** resident workstation cards with an unambiguous three-state model, plus a traceable
+message and task record. We do not do billing, orchestration of monitored teams, cloud, terminal UI or
+reverse control. The council chamber (§15) is the only capacity exception, and it orchestrates its own
+one-off read-only processes.
 
 ---
 
-## 12. 开放问题（沿用 outline §6 / §6.1 的 Q1~Q11，派生用子编号）
+## 12. Open questions
 
-| # | 问题 | 状态 | 结论 / 待拍板点 |
+| # | Question | Status | Conclusion |
 | --- | --- | --- | --- |
-| **Q1** | 「正在读写的文件」是否要精确到读/写动作？ | **已决策** | `op ∈ {read, write, edit}`；UI：`read` 弱化灰、`write/edit` 高亮（§6.2）。需 coder 在 `file_activity` schema 增加 `edit` |
-| **Q2** | 进度百分比由自报还是推导？ | **已决策** | 三层降级 `reported → derived → unknown`，UI 分别为 实线+数字 / 斜纹+数字+`推导` / 条纹动画+`—`；**禁止显示 0%/100%**（§5.9） |
-| **Q3** | 成员数量上限与紧凑模式阈值？ | **已决策** | 上限 16；≥5 自动紧凑（阈值可覆盖）；>16 按 team 分页折叠（§6.4） |
-| **Q3-1** | 紧凑模式下的信息取舍（保留/折叠什么） | **本文档已给出**（§6.4），待 leader/coder 确认无异议 | 必须保留：名字、角色、**状态点**、任务单行、进度 mini bar、耗时；阻塞时额外保留 `waiting_on` |
-| **Q3-2** | 卡片排序是否允许用户在「异常优先」之外选「按角色固定顺序」 | **待拍板** | 建议：默认异常优先，提供设置项切回「角色固定顺序」（leader/researcher/coder/tester）以稳定空间记忆 |
-| **Q4** | 是否需要声音 / 系统通知（阻塞超时、报错）？ | **已决策**（Q8 在同题下拍板） | **仅系统通知、不做声音**；默认关闭 / **免打扰默认关闭且不预设时段**，提供 `22:00–08:00` 模板一键启用；完整聚合与触发规则见 **§9.4**（归 P2-6，M3+） |
-| **Q4-1** | 通知的触发最小集与聚合粒度 | **已决策**（同 §9.4） | 最小集：成员进入 `error`、`blocked` 超过 10 分钟、曾在线成员变 `offline`；聚合粒度 = `member + error_type`；仅 S1 级故障、**同成员同故障类型 5 分钟聚合 1 条**、离线期间不重复、上线合并为「离线期间发生 N 次」、**失焦才弹系统通知** |
-| **Q5** | 敏感信息是否需要脱敏/加密存储？ | **已决策（升为 P0-7 硬要求）**：写库前正则脱敏为 `***`，**原文不入库** | 规格与文案：**§8**（§8.1 规则 / §8.2 误伤边界 / §8.3 搜索语义 / §8.4 展示与计数 / §8.5 原文通道 / §8.6 AC） |
-| **Q5-1** | 是否要对 SQLite 文件本身做加密（at-rest）？ | **待拍板** | 建议 **不加密**（本地 trusted、加密会破坏 FTS5 与排障能力），改用文件权限 + §8 脱敏兜底；若用户坚持可在 M3 评估 SQLCipher |
-| **Q6** | 是否接受 Electron ~100MB 包体？ | 已暂批（待用户最终确认） | 保持不变，M3 后再评估 Tauri（P2-4） |
-| **Q7** | 反向控制做不做？ | **已决策：本阶段不做**（P2-1） | 架构预留指令通道但 UI 不留死入口 |
-| **Q7-1** | 若将来做反向控制，本地强认证是否需要？ | 待拍板（可与 Q7 一并延后） | 建议届时再做（令牌 + 二次确认 + 全量审计） |
-| **Q8** | 通知：免打扰默认时段与聚合规则？ | **已决策** | 落点：**§9.4**；默认关闭免打扰（理由：默认静默会让新用户误以为「没通知」），提供 `22:00–08:00` 模板一键启用 |
-| **Q9** | 原文通道：是否存原文？怎么解锁？ | **已决策**（归 M3） | 默认关闭不存原文；三步确认开启；OS 钥匙串优先、口令派生降级；每次会话重新解锁；审计写 `events`。落点：**§8.5** |
-| **Q10** | 中文 FTS5 分词与短词语义？ | **已决策** | FTS5 `trigram`；1~2 字自动降级 `LIKE`（限定时间范围、必有 LIMIT、800ms 超时兜底）；**FTS 与 LIKE 不混排**；UI 明示提示文案。落点：**§7.5.1** |
-| **Q11** | macOS 公证怎么办？ | **已决策** | 书面豁免：ad-hoc 签名 + 四处明示未公证说明（README / 安装包命名 / 首次启动弹窗 / 关于页） |
-
-> **未列之外的需求一律不做。** 本表之外若出现新诉求，先补进本表再排期，避免文档与实现漂移。
-
-### 12.1 researcher 对「免打扰默认值」的意见（Q8 补充）
-
-main 点名让 tester 出默认值建议，这里补一条**产品侧**判断，供 tester 取值时参考：
-- **默认「关闭免打扰」我认同**，理由与 main 一致（默认静默会被误读为"功能坏了/没通知"）。但请 tester 在用例里覆盖「从未启用 → 之后开启模板」的迁移路径，别只测两态。
-- **不建议预设任何时段**：用户作息差异极大（有人凌晨干活），预设时段会把"应该响"的场景吃掉。
-- **建议 tester 默认值**：`quietHours.enabled=false`、`quietHours.start=22:00`、`quietHours.end=08:00`（**值预填但开关默认关**），`aggregateWindowSec=300`、`focusOnly=true`、`sound=false`（声音永久 false，无设置项）。
+| **Q1** | Distinguish read/write file operations? | Decided | `op ∈ {read, write}`. The planned `edit` value was not implemented and is retired. Read is muted, write is highlighted (§6.2) |
+| **Q2** | Progress from reports or derivation? | Decided | The workstation card has **no progress bar**. Store progress when reported; show `—` when missing; never fabricate |
+| **Q3** | Member limit and compact mode? | Decided / planned | Target 16; compact ≥ 5 and pagination > 16 are requirements not yet implemented (§6.4) |
+| Q3-1 | What compact mode keeps | Specified | Name, role, state, single-line task, time; blocked reason when known |
+| Q3-2 | Sorting alternative | Open | Default abnormality-first; a "role order" setting is possible |
+| **Q4** | Sound / system notifications? | Revised | Not implemented. Only `blocked` is a plausible trigger; no sound; default off; see §9.4 |
+| Q4-1 | Trigger set and aggregation | Revised | Old `error` / `offline` triggers removed. Redesign around `blocked` before implementation |
+| **Q5** | Redaction / encryption at rest? | Decided | Redact before persistence (§8); not implemented. Do not encrypt SQLite (planned); use file permissions |
+| Q5-1 | Encrypt the SQLite file? | Open | Recommendation: no; local trusted environment, FTS and debugging matter. Revisit SQLCipher if requested |
+| **Q6** | Accept a ~100 MB Electron package? | Accepted | Yes; revisit Tauri after M3 |
+| **Q7** | Reverse control? | Decided: no | Architectural reservation only; no dead UI |
+| Q7-1 | Local strong auth later? | Deferred | Token + confirmation + audit if reverse control happens |
+| **Q8** | Quiet hours default? | Decided | Off by default; `22:00–08:00` template prefilled but disabled |
+| **Q9** | Store originals behind an encrypted channel? | Decided / planned | Default off; three-step enable; OS keychain; re-unlock per session; audit (§8.5) |
+| **Q10** | Chinese FTS tokenizer and short queries? | Decided / planned | FTS5 trigram; 1–2 characters fall back to time-bounded `LIKE`; never mix rankings |
+| **Q11** | macOS notarization? | Decided | Ad-hoc signing plus four explicit "not notarized" notices |
 
 ---
 
-## 13. 与 `tech-design.md` 的差异与对齐清单（供 coder）
+## 13. Alignment checklist with the implementation
 
-| # | 位置 | 现状 | 需求侧要求 | 影响面 |
+This table records what the documents promise versus what the code does **now**. It replaces the old
+"team vs project / heartbeat" delta list.
+
+| # | Area | Current code | Requirement | Status |
 | --- | --- | --- | --- | --- |
-| 1 | `agent_status.state` | `online / busy / idle / blocked / offline` | 改为 **`offline / idle / busy / blocked / error`**；删除 `online`（语义并入 `idle`），**新增 `error`** | DB schema、shared 类型、UI 枚举、影子/M0 mock 数据 |
-| 2 | `messages.type` | 缺 `review`、`error` | 补 **`review`**、**`error`**（完整 10 类见 §7.2） | schema 注释、过滤器选项、UI 标签映射 |
-| 3 | `file_activity.op` | `read \| write` | 补 **`edit`**（§6.2） | schema、UI 渲染权重 |
-| 4 | `messages` 字段 | 缺 `ingested_at_ms` / `reply_to` / `redacted` / `redaction_version` / `content_truncated` | 全部**新增**（§7.1） | schema + 迁移脚本 |
-| 5 | `tasks` | 无 `progress_source`、无 `blocked_reason` | 新增 `progress_source('reported'\|'derived'\|'unknown')`、`blocked_reason`、`waiting_on`、`error_type`（受控词表，见 §5.4）、`retryable`（0/1/null） | §5.4 / §5.6 / §5.9 依赖 |
-| 5b | `messages` | 无脱敏计数 | 新增 `redaction_hits`（JSON 规则+计数，见 §8.1）、`hit_count`（聚合值），**不把类型写回正文** | §8.4 展示与计数 |
-| 6 | `agent_status` | `progress REAL NULL` 表示未知 | 保留 NULL 语义，并与 `tasks.progress_source` 联动（`NULL` ⇒ `unknown`） | UI 三态渲染 |
-| 7 | 状态来源 | `source: report/watch/timeout` | 保留；新增 **`timeout` 与 `degraded` 的联动**：`source='timeout'` ⇒ 必须 `degraded=1`（D1） | 一致性断言 |
-| 8 | `state_since` | 已有 | 需遵循 §5.8：同状态不更新；非法迁移合成中间态时 `state_since` 取触发事件 `ts` | 耗时正确性 |
-| 9 | WS `member.status` | 已有 | payload 需含 `degraded`、`degraded_reasons[]`、`progress_source`、`waiting_on`、`last_heartbeat_at` | UI 渲染与 AC-W2 |
-| 10 | `--demo` 假数据 | M0 骨架 | 需覆盖 5 主状态 × degraded、10 种消息类型、1000+ 条消息、含 1 个 ≥16 成员样例用于压测 | E2E 确定性（NF-11） |
-| **11** | **`/heartbeat` 上报周期** | `tech-design.md` §5.2 建议 **5s**（`建议在 flush 侧……`） | **作废，以本文 §5.3 的 `HEARTBEAT_INTERVAL=15s` 为准**。理由：15s ≤ `HEARTBEAT_TIMEOUT/3`（20s），可容忍连续丢 3 包；上报频率降为 1/3，本机资源与 IO 更省。约束：上报侧只要满足 `interval ≤ HEARTBEAT_TIMEOUT/3` 即可被服务端接受，服务端**不强制**具体值 | 心跳测试用例、reporter 默认参数、demo 数据源节拍 |
-| 12 | `HEARTBEAT_INTERVAL` 是否可配 | 文档未明确 | **不是本机 App 的可配项**：它是**上报侧约定**（agent/reporter 侧参数），服务端只做上界校验。`HEARTBEAT_TIMEOUT`（60s）、`A_SILENT_TIMEOUT`、`BLOCK_GRACE`、`ERROR_*`、`CLOCK_SKEW_TOL`、`SLOW_FACTOR` 才是**设置面板可覆盖项**（见 §5.3 阈值表） | **避免 tester 为 `HEARTBEAT_INTERVAL` 加配置覆盖用例** |
+| 1 | Workstation states | `busy / idle / blocked` | Same | **Aligned (2026-10-21)** |
+| 2 | Liveness | `tasks.state` only; WS ping is transport-only | No heartbeat/TTL | **Aligned** |
+| 3 | `agent_status` | Only borrowed busy; `state='busy'` CHECK | Display-only borrowed busy | **Aligned** |
+| 4 | `session_status` | Only blocked; per session | Per-session authorization wait | **Aligned** |
+| 5 | `members.last_seen_at` | Dropped by migration | No last-seen | **Aligned** |
+| 6 | `agent_status_history` | Dropped | No history table | **Aligned** |
+| 7 | `source` | `report / watch` | No `timeout` | **Aligned** |
+| 8 | `/heartbeat`, `/status` | Removed | No business heartbeat | **Aligned** |
+| 9 | Message type `heartbeat` | Removed | Not a message type | **Aligned** |
+| 10 | `file_activity.op` | `read / write` | `read / write` | **Aligned** |
+| 11 | Progress bar on cards | Removed | No fabricated progress | **Aligned** |
+| 12 | Redaction | Not implemented | §8 required | **Gap** |
+| 13 | FTS query wiring | Table/triggers exist; queries use `LIKE` | Trigram + short-query fallback | **Gap** |
+| 14 | A-route watcher | Not implemented | Optional; not a current dependency | **Not planned** |
+| 15 | Virtual scrolling | 500-row window | 100k smooth scroll | **Gap** |
+| 16 | Message archiving | Columns exist; no archive job | Export-then-delete | **Gap** |
+| 17 | Notifications | Not implemented | Redesign around `blocked` | **Gap** |
+| 18 | Compact mode / pagination | Not implemented | §6.4 | **Gap** |
+| 19 | `reply_to`, `ingested_at_ms`, redaction columns | Absent | Planned | **Gap** |
+| 20 | Playwright / Electron E2E | Not present | Optional future layer | **Gap** |
 
 ---
 
-## 14. 变更记录
+## 14. Change log
 
-| 版本 | 日期 | 变更 |
+| Version | Date | Changes |
 | --- | --- | --- |
-| **v0.10** | 2026-10-19 | **§15 议事厅：区分「输出被截断但可恢复」「真的解析不出」「需要补充信息」**。CodeBuddy 以退出码 0 返回缺少结尾 `]` 的 transcript 时，服务端从完整的对象前缀恢复最后一个完整 `result` / assistant 事件，不再把整场会误判为失败；只有没有任何可用事件时才记 `unparsed`，并保留原始输出尾部。主持人发现议题必须检查代码但缺少项目路径、关键材料或必要约束时，可返回 `needsClarification`，会议以 `verdict='needs_clarification'` / `status='done'` 正常结束，未运行的后续角色记 `skipped`，报告仍归档。临时工作目录不再被描述成用户项目；已完成会议不会因事后补设工作目录而重跑或改写。§15.3 / §15.4 / §15.5 / §15.6 同步更新 |
-| **v0.9** | 2026-10-19 | **§15 议事厅：任何必需回合答不上来就立即结束（fail-fast），并增加「工作中」标识**。调用返回 `failed` / `timeout` 或结构化输出解析不出时，不再继续后续轮次：已产出的轮次、失败原文与报告照常归档；完成过一轮记 `partial`，否则记 `failed`，`error` 写明轮次 / 阶段 / 楼层与 CLI 原始错误；仍在飞的参与者全部落为 `failed`。界面在发起后立即显示「正在工作中 · 楼层 · 阶段 · 第 N 轮」，服务端随 WS 推送并在详情接口返回，刷新不丢，结束即消失。§15.4 第 5 条改为「不因收敛度高而提前结束」，并新增 fail-fast 条目；§15.5 / §15.6 同步更新 |
-| **v0.8** | 2026-10-19 | **§15 议事厅重构为固定角色的评审流程，取消投票**：主持人 / 主答 / 评审三个角色，同一楼层不能兼任。第 0 轮主持人拆题与分工，第 1 轮主答提案，之后每轮「主答修订 → 评审独立结构化意见 → 主持人汇总与硬指令」，跑满轮数后主持人裁决、主答交付最终稿。删除 `mode`（`vote` / `analysis`）、阈值与计票；§15.4 改为轮次流程、`ReviewPoint` / `RoundResult` 契约与**服务端计算的收敛度** `clamp(100 − (25b + 8m + 2n + 10c), 0, 100)`（模型自报分数一律忽略）。旧库不兼容：检测到旧议事厅表结构直接重建。右侧只显示汇总，完整过程默认折叠并逐轮显示 diff；报告落盘 JSON / CSV / Markdown |
-| **v0.7** | 2026-10-19 | **§15 议事厅楼层从 4 层扩到 7 层**：新增 2F Cline / 3F Codex / 6F Qoder。三家的只读形态各不相同（2F `--plan` 计划模式、3F `codex exec --sandbox read-only`、6F 无头 `-p` 默认拒绝），全都写进 §15.3 的「工具」行；命令执行这一条如实登记：2F/3F 的 CLI 无法完全关掉执行，只读命令仍可能跑。隔离沿用「标记 + 会话清单跳过」：3F 原生用 `--ephemeral` 不落会话；2F 没有标题开关、把提示词存成标题，故议事厅提示词开头固定带 `COUNCIL_PROMPT_MARKER`；6F 用 `--name`（其 CLI transcript 是否带此名待真机确认）。§15.3 的「已知不完美」第 2/3/5 条同步更新 |
-| **v0.6** | 2026-10-02 | **§15 议事厅加两个正交开关**：谈法 `mode`（`vote` 表决 / **`analysis` 分析**）× 在哪儿谈 `workspace_path`（NULL 隔离 / **绝对路径 = 用户的真实工程目录**）。工程模式下参与者拿到**只读工具**（1F/4F `--tools Read,Grep,Glob`；7F/8F 权限表只放行 read/glob/grep/list，`external_directory` 始终 deny），可以自己翻代码回答"这样改会不会回归"这类问题；服务端**一行都不改**用户的工程目录、收尾也不删它（只删自己建的临时目录）。分析模式**不判共识**：跑满轮数、`verdict='reported'`，界面按立场分组、原文照录，解析不出就是 NULL（"没说" ≠ "说了没有"）。隔离因为 cwd 不再是临时目录而多出两道锁，都写进 §15.3 的"已知不完美"：**显式关掉我们自己的上报**（`WORKGREMLIN_DISABLE=1`）+ **7F/8F 参与者会话打固定标题**（办公室的会话清单跳过它）。§15.4 / §15.6 同步补收场规则与新验收点 |
-| **v0.5** | 2026-10-01 | **新增 §15 议事厅（能力边界例外）**：本应用第一次、也是唯一一次由自己拉起 agent 进程。要点：参与者**只读、不给工具**；跑在一次性临时目录里；**不碰被监控的会话**、不写 `members` / `task_runs`，产出只在议事厅页可见；共识由服务端**机械计票**（结论原样引用提案，不由服务端合成）；取不到的字段一律留空。同时：§1「不是」列与 §3 反向控制行、§11 差异化的「编排」各加一处指向 §15 的限定说明。**P2-1 原文不动** —— 对**被监控会话**下发指令这条继续不做 |
-| **v0.4** | 2026-09-20 | **实现对齐（只加事实标注，不改验收标准）**：顶部新增对齐提示；§3 与 §4.1 的 `team` / A 路线标注为已被实现取代或未实现；§4.2 前补充实际成员来源。差异总表见新增的 `docs/implementation-status.md` |
-| v0.1 | 2026-09-14 | 初版（画像、P0/P1/P2、状态语义、消息字段、非功能、竞品、14 条开放问题） |
-| **v0.2** | 2026-09-14 | 对齐 `requirements-outline.md` v0.1 与四项拍板决策：**重写**状态语义（5 主状态 + `degraded`、判定算法、优先序 `error>busy>blocked>idle`、迁移矩阵与非法迁移处理、`progress_source` 三值）、补齐 `file_activity.op`、成员规模/紧凑模式取舍、脱敏与原文查看流程、明确 A-only「禁止推断 blocked/error」、开放问题并入 Q1~Q7、新增与 `tech-design.md` 的差异清单；移除 v0.1 中与之冲突的自有编号与 `unknown` 状态 |
-| **v0.3** | 2026-09-14 | 并入全部拍板结论：① **§5 状态语义定稿**（§5.3 加 `HEARTBEAT_INTERVAL=15s` 并声明 `tech-design` 5s 作废；§5.4 `error` 增 `error_type/retryable/summary` 与「不强制先回 idle」；**§5.8 迁移矩阵改为 18 合法 / 2 非法：`offline→error`、`error→blocked` 为非法并采用「拒绝 + 保留原状态 + events + metrics + warn + 恢复后延迟兑现」**，新增不变式 INV-1「→offline 只能由心跳超时或显式断开触发」，`offline→blocked` 需合成中间态；新增 **§5.11 裁决 FAQ** 回答 tester 四问：busy 充要条件与「无空闲回落、只认 task.end」、blocked 不做状态栈、`error` 语义与恢复）；② **§5.9.1** 三层进度 AC-PR1~PR7（含 main 背书的 AC-PR5 第③层 DOM 判据）；③ **§6.2** `file_activity.op` 三值判定口径（编辑≠先读后写、新建算 write、缺 op 保守归 write）+ **A-only 不可判定**的标注规则 + AC-F1~F4；④ **§7.5.1** Q10 短词搜索语义（trigram + 1/2 字自动降级 LIKE、**FTS 与 LIKE 不混排**的排序规则、正式 UI 文案、LIMIT/时间窗/800ms 超时护栏、AC-Q1~Q7）；⑤ **§8** 脱敏升为 **P0-7 硬要求**（`***` 替换、`redaction_hits` 独立记录、**原文不入库、不得半掩码**）、新增 §8.2 误伤边界、§8.3 搜索命中语义（AC-RS1~4）、§8.4 展示时机与计数、**§8.5 Q9 原文通道**（三步开启确认 + type-to-confirm、`显示原文` 弹窗正式文案（含截图/剪贴板/录屏/日志风险）、默认遮罩与 6 种重新遮罩时机、「会话首次 + 第 11 条起 + 批量导出」三段式二次确认、取消降级、两级 ESC、审计字段禁止含原文）；⑥ **§9.4** 通知规格 Q4/Q8（含 researcher 对免打扰默认值的产品意见 §12.1）；⑦ §12 补齐 Q4-1~Q11 状态与落点章节；⑧ §13 新增 5b / 11 / 12 三条对齐项 |
+| v0.1 | 2026-09-14 | Initial draft: personas, P0/P1/P2, state semantics, message fields, non-functional requirements, competitors, 14 open questions |
+| v0.2 | 2026-09-14 | Aligned with the outline and four decisions; introduced the old 5-state + degraded model (now retired) |
+| v0.3 | 2026-09-14 | Finalized the old state machine, progress tiers, file op values, redaction requirements and short-query semantics |
+| v0.4 | 2026-09-20 | Implementation alignment: `team` → `project`; A route marked unimplemented; protocol v2 |
+| v0.5–v0.10 | 2026-10-01 – 2026-10-19 | Council chamber added and iterated: fixed roles, no voting, fail-fast, workspace mode, truncation recovery, `needs_clarification` |
+| **v0.11** | **2026-10-21** | **Workstation state refactor: only `busy / idle / blocked`; heartbeat, TTL, `offline`, `error`, `degraded`, `lastSeenAt`, `/heartbeat`, `/status` and the `heartbeat` message type removed. Busy from running tasks; blocked from per-session authorization waits; last-active from task start/end. Requirements updated throughout, including tests, notifications, progress and the alignment checklist** |
 
 ---
 
-## 15. 议事厅（Council Chamber）—— 唯一的能力边界例外
+## 15. Council chamber — the only capacity exception
 
-> 本节是 §1「不是」列里那条「agent 调度器 / 编排引擎」的**边界明确的例外**。除此之外，本文档
-> 其余「不做」结论一条都没有松动。
+> This is the boundary-limited exception to the "not an orchestrator" rule in §1. No other "we do not do
+> this" conclusion is relaxed.
 
-### 15.1 是什么
+### 15.1 What it is
 
-选几个楼层的 agent，就一个问题开一场会。参与者**分工固定**：一名**主持人**（拆题、分工、每轮汇总与
-硬指令、最终裁决）、一名**主答**（提案与逐轮修订、最终交付稿）和一名或多名**评审**（独立给出结构化
-评审意见）。全程**没有投票**：不数票、不设阈值、不靠"多数同意"收场。跑满轮数后由主持人裁决，主答
-交付最终稿，报告落盘。
+Select agents from several floors and hold a meeting on one topic. Roles are fixed: one **moderator**
+(decomposes the topic, assigns review focus, writes convergence summaries and hard directives, adjudicates),
+one **main answerer** (proposal, revisions, final draft) and one or more **reviewers** (independent structured
+reviews). There is **no voting** at any point: no tally, no threshold, no "majority agrees". The configured
+rounds run; then the moderator adjudicates and the main answerer delivers the final draft; the report is
+archived.
 
-用户能看到：右侧的**汇总**（收敛度、意见数、blocker 数、冲突数、各角色的楼层 / 模型 / 词元），
-以及默认折叠的**完整过程**（第 0 轮拆解、每轮提案及其相对上一版的 diff、每人的评审意见、
-主持人的汇总与修改指令、最终裁决与交付稿）。
+The user sees a summary (convergence score, opinion/blocker/conflict counts, each role's floor/model/tokens)
+and a collapsed full record (round 0 plan, every proposal and its diff, every review, the moderator's
+directives, adjudication and final draft).
 
-它存在的理由：WorkGremlin 此前**只会看** —— 把本机在跑的 9 个 agent 楼层画成一间办公室，从不启动
-任何 agent 进程。议事厅是「看」到「用」的第一步。
+**Where the meeting runs** (orthogonal to roles):
 
-**在哪儿谈**（与角色分配正交）：
-
-| 开关 | 取值 | 决定什么 |
+| Switch | Value | Decides |
 | --- | --- | --- |
-| `workspace_path` | 绝对路径 / NULL（缺省） | 用户的真实工程目录 + 只读工具，还是一次性临时目录 + 只读工具 |
+| `workspace_path` | absolute path / `NULL` | The user's real project directory + read-only tools, or a one-off temp directory + read-only tools |
 
-"工程目录 + 评审"就是"看着真实代码评审一个方案" —— 评估"这样改会不会导致回归"要的正是这个形态，
-光有材料是答不出来的。
+### 15.2 Difference from reverse control (P2-1)
 
-### 15.2 与 P2-1 反向控制的区别（这条必须分清）
-
-| | P2-1 反向控制 | 议事厅 |
+| | P2-1 reverse control | Council |
 | --- | --- | --- |
-| 作用对象 | **正在被监控的那些会话** | 自己拉起的、**全新的**一次性进程 |
-| 做什么 | 往用户的 Codex / Claude 会话里塞话、中断、重试 | 只是问它们一个问题，收一段文本 |
-| 本阶段 | **不做**（原文不动） | 做（本节） |
+| Target | The **monitored sessions** | A brand-new one-off process started by the council |
+| Action | Inject messages, interrupt, retry | Ask a question, collect text |
+| This stage | Not done | Implemented (this section) |
 
-议事厅**一行都不碰**被监控的会话：它不写 `members` / `task_runs` / `messages` / `file_activity`，
-数据全在自己的表里，**只在议事厅页可见**。办公室与任务记录照旧只画真值 —— 一场会开完，那两页
-看不出任何痕迹。（cwd 可能是用户的真实工程，这条保证要多花两道锁才守得住，
-见 §15.3「已知不完美」的第 4、5 条。）
+The council touches **none** of the monitored sessions: it writes no `members`, `tasks`, `task_runs`,
+`messages` or `file_activity` rows. Its data lives in its own tables and is visible only on the council page.
+The office and task records remain truth-only; after a meeting they show no trace.
 
-### 15.3 能力边界（参与者能干什么、不能干什么）
+### 15.3 Capability boundary
 
-议事厅**一律只读**：参与者拿到读类工具，能自己翻目录里的代码，但改不了文件、跑不了命令、上不了网。
-`workspace_path` 只决定"读哪个目录"，两种取值一视同仁：
+The council is **always read-only**: participants get read tools, can inspect code, but cannot modify files,
+run commands or access the network. `workspace_path` only selects which directory is readable.
 
-| 项 | 说明 |
+| Item | Rule |
 | --- | --- |
-| 工作目录 | 填了绝对路径 = 用户那个工程目录（**服务端一行都不改它、会后也不删**）；留空 = 服务端建的一次性临时目录（`/tmp/wg-council-XXXXXX`），会后删除。提示词必须明确说明**临时目录不是用户项目，里面的内容不能作为项目证据** |
-| 工具 | **只读**。1F/4F 给 `--tools Read,Grep,Glob`（同一份也给 `--allowedTools`）；7F/8F 没有这个开关，注入一份 `permission`：只放行 `read/glob/grep/list`，其余全 `deny`（kilo 走 `KILO_CONFIG_CONTENT`，opencode 走 `OPENCODE_CONFIG_CONTENT`）；2F 用 Cline 自己的只读计划模式 `--plan`；3F 用 `codex exec --sandbox read-only`（OS 沙箱）；6F 用无头 `-p`（任何需要确认的操作默认拒绝） |
-| 文件 | **只能读**。参与者可以自己翻目录里的代码（读文件、按名字/内容搜）—— 拿不准就去读，别猜；**改不了**任何文件（写类工具的 deny 一字未松） |
-| 命令 / 网络 | 不行。1F/4F 的工具白名单里没有执行；7F/8F 的 permission 把 `bash` 钉成 deny；3F 的只读沙箱允许只读命令但写盘与联网都被 OS 挡住。**如实登记**：2F 的 `--plan` 仍可能跑只读命令，3F 的沙箱也允许只读命令 —— 这是这两家 CLI 能做到的最强保证，强度低于 1F/4F 的「不给执行工具」 |
-| 背景材料 | 仍由**服务端**读取后原样内联进提示词 —— 目录为空（临时目录）时，参与者就靠这份材料谈 |
-| 环境变量 | **原样继承**。各 CLI 的登录凭据在 `~/.claude`、`~/.codebuddy` 等目录里，挡掉 `HOME` 等于挡掉登录 —— 隔离靠 cwd + 只读，**不靠**改环境变量。所有配方都**额外注入 `WORKGREMLIN_DISABLE=1`**（见下面第 4 条） |
-| 可选楼层 | 1F CodeBuddy / 2F Cline / 3F Codex / 4F Claude Code / 6F Qoder / 7F Kilo Code / 8F OpenCode。其余楼层即使装了 CLI 也不出现在议事厅 |
+| Working directory | An absolute path means the user's project (the server never modifies or deletes it); empty means a one-off temp directory that is deleted afterwards. The prompt states that a temp directory is not the user's project and cannot be used as project evidence |
+| Tools | Read-only. 1F/4F use `--tools Read,Grep,Glob`; 7F/8F get an injected permission config allowing only `read/glob/grep/list`; 2F uses Cline's `--plan`; 3F uses `codex exec --sandbox read-only`; 6F uses headless `-p` (confirmation-required actions are denied) |
+| Files | Read-only. Participants may read code; write tools stay denied |
+| Commands / network | Not allowed. 1F/4F expose no execution tool; 7F/8F deny `bash`; the 3F sandbox blocks writes and network. **Honest limitation:** 2F `--plan` and the 3F sandbox may still run read-only commands |
+| Background material | Read by the server and inlined verbatim into the prompt; when the directory is empty, the participants rely on this material |
+| Environment | Inherited as-is (login state lives in each CLI's home). Isolation relies on cwd + read-only mode, not on moving `HOME`. All recipes inject `WORKGREMLIN_DISABLE=1` |
+| Eligible floors | 1F CodeBuddy / 2F Cline / 3F Codex / 4F Claude Code / 6F Qoder / 7F Kilo Code / 8F OpenCode. Other floors do not appear even if their CLI is installed |
 
-**已知不完美，如实登记**（不是"以后再说"，是现在就承认的代价）：
+**Known imperfections (accepted):**
 
-1. 进程被 `kill -9` 或硬 `process.exit()` 带走时，留空那档建的一次性临时目录不会被清理，在飞的
-   那几个 CLI 会活到把这一轮答完（它们是一次性调用，答完自己退出）。走正常关服流程（`shutdown()`）
-   才会全部回收。
-2. 各 CLI 会把参与者的会话记进**它自己**的历史里（例如 CodeBuddy 会建
-   `~/.codebuddy/projects/<临时目录名>/`）。1F/4F 带 `--no-session-persistence`、3F Codex 带
-   `--ephemeral`，都不产生这种记录；**2F Cline / 6F Qoder / 7F Kilo / 8F OpenCode 没有这个开关**，
-   会话照样落进它们自己的落盘。服务端控制不了这件事（把数据目录挪开会连登录态一起挪走，
-   实测 Cline 换 `--data-dir` 后直接 `Unauthorized`）。
-3. 3F/6F/7F/8F 的"只读"是各家 CLI 的原生模式（3F 的只读沙箱、6F 的无头默认拒绝、7F/8F 注入的
-   permission 配置），不是 1F/4F 那种 `--tools Read,Grep,Glob`。实测有效（不锁时 opencode 能读出目录里的标记文件，
-   锁上后工具调用直接被拒；2F 的 `--plan` 里写文件被拒、`read_files` 正常），但保证强度低于
-   「不给执行工具」—— 3F 沙箱与 2F 计划模式都仍允许**只读**命令。
-4. **cwd 可能是用户的真实工程**，所以"靠 cwd 在临时目录来隔离"这道锁不成立，要显式关掉上报：
-   参与者一律带 `WORKGREMLIN_DISABLE=1`，我们自己的上报 hook 与插件都认这一条（7F 的注入配置里
-   另外摘掉了 WorkGremlin 插件），认到就原地退出。否则装了 WorkGremlin 的机器上，参与者会带着
-   **你的真实工程路径**被上报，当场变成"你工程里的一个成员"。这是**我们自己的代码**里挡住的，
-   不是靠某家的配置。
-5. **2F / 6F / 7F / 8F 参与者的会话记录会留在它们自己的历史里**（第 2 条），且 cwd 是用户的工程时那几条会挂在
-   **你的工程名下**。挡法是给参与者一个标记 + 各楼层会话清单跳过它：7F/8F 用固定标题（`--title`），
-   2F Cline 没有标题开关、它把**提示词本身**存成标题，所以标记落在提示词开头（`COUNCIL_PROMPT_MARKER`），
-   `floorCline.js` 按标题里的这个标记跳过（已真机验证：跑完一场后 2F 会话清单里看不到参与者）。
-   6F Qoder 用 `--name` 打同一个标题，但**尚未真机验证**其 CLI transcript 是否也带这个名字
-   （本机没装 Qoder CLI）—— 工程模式下 6F 的隔离待装好 CLI 的机器上确认。
-   但 Kilo / OpenCode / Cline / Qoder **自己的**界面里还会看到那几条"议事厅参与者"，
-   那是 CLI 的历史，我们只读不写、也不去删（清理别人的历史记录比留着更危险）。
-   数据目录挪不开：实测 `XDG_DATA_HOME` 能把库挪走，但登录态一并挪走，参与者会连话都说不出来。
+1. A `kill -9` or hard `process.exit()` can leave a temp directory and in-flight CLI processes until they
+   finish their one-off call. Normal `shutdown()` reclaims everything.
+2. Participating CLIs may record their own session history. 1F/4F use `--no-session-persistence`; 3F uses
+   `--ephemeral`. 2F/6F/7F/8F have no such switch, so records remain in their own history. Moving their data
+   directory also moves login state, so it is not an option.
+3. 3F/6F/7F/8F "read-only" is each CLI's native mode, not the 1F/4F tool whitelist. It is effective but
+   weaker: 3F's sandbox and 2F's plan mode still allow read-only commands.
+4. Because cwd may be the real project, isolation must explicitly disable our own reporting
+   (`WORKGREMLIN_DISABLE=1`). Otherwise participants would appear as members of the user's project.
+5. Council sessions may remain in the products' own history under the user's project. A fixed marker and a
+   session-list skip keep them out of the office: 7F/8F use `--title`, 2F stores the prompt as the title and
+   is filtered by `COUNCIL_PROMPT_MARKER`, 6F uses `--name` (not yet verified on a machine with the CLI).
+   Kilo/OpenCode/Cline/Qoder's own UIs may still show the sessions; we do not delete another product's history.
 
-### 15.4 流程（固定角色，全程不投票）
+### 15.4 Flow (fixed roles, no voting)
 
-**角色**（一场会恰好这些角色，同一楼层不能兼任两个）：
-
-| 角色 | 数量 | 做什么 |
+| Role | Count | Responsibility |
 | --- | --- | --- |
-| `moderator` 主持人 | 1 | 第 0 轮拆题与分工；每轮收敛汇总 + 给主答的硬修改指令；最后裁决 |
-| `main` 主答 | 1 | 第 1 轮提案；之后每轮按指令修订；最终交付稿 + 变更说明 |
-| `reviewer` 评审 | ≥ 1 | 每轮**独立**给出结构化评审意见（互相看不到） |
+| `moderator` | 1 | Round 0 decomposition and assignment; per-round convergence and hard directives; final adjudication |
+| `main` | 1 | Round 1 proposal; revisions; final draft and change notes |
+| `reviewer` | ≥ 1 | Independent structured review each round (reviewers do not see each other) |
 
-**轮次**
-
-1. **第 0 轮 —— 拆解与分工（`plan`）**：主持人把议题拆成子问题和评审要点，并为每位评审指定关注点。
-   如果现有信息不足以开始评审（例如必须检查真实代码但未提供项目路径、关键材料缺失、目标有歧义），
-   主持人返回 `{"needsClarification":["具体问题"]}` 而不是猜路径。服务端以
-   `verdict='needs_clarification'` / `status='done'` 正常结束，后续角色记 `skipped`，报告照常归档。
-   纯文字议题不因缺少工作目录而索要路径。
-2. **第 1 轮 —— 主答提案（`proposal`）**：主答写出第一版方案；之后每轮是上一版的修订，并给出
-   `diffFromPrev`（相对上一版改了什么）。
-3. **评审（`review`）**：每位评审独立输出若干 `ReviewPoint`：
+1. **Round 0 — plan.** The moderator decomposes the topic, assigns review focus, and returns
+   `{"needsClarification":[...]}` if essential information is missing. The server then ends normally with
+   `verdict='needs_clarification'` / `status='done'`, marks later roles `skipped`, and archives the report.
+   A pure-text topic is not asked for a path.
+2. **Round 1 — proposal.** The main answerer writes the first proposal; later rounds revise it and provide
+   `diffFromPrev`.
+3. **Review.** Each reviewer returns `ReviewPoint`s:
 
    ```ts
    interface ReviewPoint {
-     reviewer: string;      // 服务端按席位写入，不采用模型自报的身份
+     reviewer: string;      // written by the server from the seat, never trusted from the model
      severity: "blocker" | "major" | "minor" | "nit";
      dimension: string;
      issue: string;
@@ -1186,13 +862,13 @@ main 点名让 tester 出默认值建议，这里补一条**产品侧**判断，
    }
    ```
 
-4. **主持人汇总（`moderation`）**：产出 `consensus[]`、`openIssues[]`、`conflicts[]`（每项写明议题与
-   各方观点）、`revisionDirectives[]`。**不许和稀泥**：每条指令必须写成
-   `【针对 <问题>】必须 <具体改动>；验收标准：<可核对的条件>。`，禁止"建议 / 可以考虑 / 酌情 /
-   视情况 / 进一步优化 / 尽量 / 最好 / 或许 / maybe / consider"这类空泛措辞。服务端会机械核对：
-   有 blocker 却没有对应指令 / 未决问题、立场分裂却没有记录冲突、指令空泛或缺验收标准、最终批准
-   却仍留 blocker —— 都会产生**一致性提示**并在界面展示。提示只是如实展示，**不改变流程与 `verdict`**。
-5. **不因收敛度高而提前结束**：正常情况下跑满 `max_rounds`（缺省 3，硬顶 8）。每一轮都落一个 `RoundResult`：
+4. **Moderation.** The moderator produces `consensus[]`, `openIssues[]`, `conflicts[]` and
+   `revisionDirectives[]`. Directives must be actionable:
+   `[issue] must <change>; acceptance: <checkable condition>`. Vague wording is rejected. The server checks
+   for missing directives, missing acceptance criteria, unrecorded conflicts, and a final approval that still
+   has blockers; it shows consistency warnings without changing the flow or `verdict`.
+5. **No early stop for a high score.** Rounds run to `max_rounds` (default 3, hard cap 8). Each round stores a
+   `RoundResult`:
 
    ```ts
    interface RoundResult {
@@ -1204,100 +880,98 @@ main 点名让 tester 出默认值建议，这里补一条**产品侧**判断，
        openIssues: string[];
        conflicts: { topic: string; sides: { reviewer: string; view: string }[] }[];
        revisionDirectives: string[];
-       convergenceScore: number;   // 服务端算的，见下
+       convergenceScore: number;   // server-computed
      };
    }
    ```
 
-6. **最终裁决（`adjudication`）**：主持人给出 `decision`（`approve` / `approve_with_changes` /
-   `reject`）、理由、`remainingRisks[]`、`finalDirectives[]`。
-7. **最终交付（`final`）**：主答交出最终稿正文 + 变更说明。然后归档报告：
-   `~/.workgremlin/councils/<id>/` 下写 `report.json` / `reviews.csv` / `rounds.csv` / `report.md`
-   （UTF-8 with BOM；原子写；同名不覆盖，加时间戳）。**只写这里**：工作目录只供参与者只读，
-   任何情况下都不往工程里写报告副本。
-8. **`verdict`**：`completed` / `partial` / `needs_clarification` / `cancelled` / `failed`。
-   `partial`（例如最终轮失败，但前面几轮的记录与报告仍然完整）和 `needs_clarification`
-   都是合法结果，不是错误。
-9. **答不上来就立刻结束（fail-fast）**：任何必需角色的一次调用返回 `failed` / `timeout`，或输出
-   没有任何可用事件，或输出无法解析出结构化结果（第 0 轮拆解、任一评审、每轮汇总、最终裁决、
-   最终交付稿），服务端**不再继续
-   后面任何阶段**，当场收场：已经产出的轮次、失败原文与报告照常归档；至少完成过一轮记为
-   `partial`，一轮都没完成记为 `failed`；`council.error` 写明第几轮 / 什么阶段 / 哪个楼层以及
-   CLI 的原始错误。仍在飞的参与者全部标记为 `failed`，界面的「工作中」标识随之消失。缺少某一角色
-   （第 0 轮之前）同样立即失败，且一次模型调用都不发。若 transcript 数组被截断但结尾之前仍有完整
-   的 `result` / assistant 事件，服务端按完整前缀恢复，不把截断本身当成失败。
+6. **Adjudication.** The moderator gives a decision (`approve` / `approve_with_changes` / `reject`), reasons,
+   `remainingRisks[]` and `finalDirectives[]`.
+7. **Final delivery.** The main answerer delivers the final text and change notes. The report is written under
+   `~/.workgremlin/councils/<id>/` (`report.json`, `reviews.csv`, `rounds.csv`, `report.md`; UTF-8 with BOM;
+   atomic writes; never overwrite an existing file). **Only there** — never into the user's project.
+8. **Verdict:** `completed` / `partial` / `needs_clarification` / `cancelled` / `failed`. `partial` and
+   `needs_clarification` are legitimate outcomes, not errors.
+9. **Fail-fast.** If any required turn returns `failed` / `timeout`, has no usable event, or cannot be parsed,
+   the server stops immediately. Produced rounds, raw failures and the report are still archived; one completed
+   round → `partial`, none → `failed`; `council.error` names the round, phase, floor and raw CLI error.
+   In-flight participants are marked `failed`; the "working" indicator disappears. A missing role fails before
+   any model call. A truncated transcript with a complete prefix is recovered rather than treated as a failure.
 
-**收敛度（服务端计算，模型自报的一律忽略）**
+**Convergence (server-computed; model-reported scores are ignored):**
 
 ```
-raw = 100 − (blocker × 25 + major × 8 + minor × 2 + nit × 0 + 冲突数 × 10)
+raw = 100 − (blocker × 25 + major × 8 + minor × 2 + nit × 0 + conflicts × 10)
 score = clamp(raw, 0, 100)
 ```
 
-- 权重来自 `shared` 的公开常量，前端公式行直接读同一份，不在页面里另抄一套数字。
-- `nit` 不计分；冲突数取主持人汇总里 `conflicts` 的条数。
-- 分数必须**可解释**：界面同时显示公式与本轮各档计数；没有完成任何一轮时显示「—」，**不显示 100**。
+Weights come from shared constants. `nit` carries no weight; the conflict count is the length of the
+moderator's `conflicts`. The score must be explainable: the UI shows the formula and per-severity counts.
+With no completed round, show `—`, never 100.
 
-**界面**
+**UI:**
 
-- **右侧只放汇总**：收敛度及公式、N 条意见、N 条 blocker、N 处冲突、各角色的楼层 / 模型 / 词元用量；
-  主持人 / 主答 / 评审按席位排序。
-- **完整过程默认折叠**：第 0 轮拆解与分工、每轮的提案与 **diff**、逐条评审（严重度 / 维度 / 证据 /
-  建议 / 立场）、主持人的共识 / 未决 / 冲突 / 硬指令、最终裁决与交付稿。每轮没有 diff 时**明说**，
-  不让人误以为"什么都没改"。
-- **会议结束后每一轮的原始输出仍可查看**：每轮（含第 0 轮）末尾列出该轮全部参与者发言原文，
-  带楼层、阶段、状态与耗时；失败 / 超时 / 解析失败的发言显示 CLI 原始错误，正文为空时明说，
-  **不留空白**。fail-fast 中止或取消导致**没有 `RoundResult` 的轮次**单独成块标为「未完成」，
-  照常列出已经发生的发言；裁决 / 最终交付那一轮不算未完成轮次。结构化视图只展示解析成功的内容，
-  原始输出是它背后的证据，两者都不能因会议结束而消失。
-- **「工作中」标识**：发起后立即出现（不等到第一句话说完）：一个跳动的点 + `正在工作中` + 当前
-  参与的楼层 + 阶段（拆解 / 提案 / 评审 / 汇总 / 裁决 / 交付）+ 第几轮。一次调用可能几分钟没有输出，
-  这段空白必须让人看出"还在跑"而不是"卡死了"。服务端在阶段开始时写入进度并随 WS 推送；刷新页面后
-  详情接口同样返回它。会议结束（完成 / 失败 / 取消）时标识立即消失，不残留。
+- The right panel holds the summary: score and formula, opinion/blocker/conflict counts, each role's
+  floor/model/tokens, ordered by seat.
+- The full record is collapsed by default: plan, every proposal and diff, every review (severity, dimension,
+  evidence, suggestion, stance), the moderator's summary and directives, adjudication and final draft. A round
+  with no diff says so explicitly.
+- Every round's raw output remains viewable after the meeting, including floor, phase, status and duration.
+  Failed/timeout/unparsed turns show the raw error and an explicit "no text" rather than a blank. Rounds with
+  no `RoundResult` (fail-fast/cancel) are shown as "incomplete" with the utterances that did happen.
+- The "working" indicator appears immediately: pulsing dot, `Working`, active floors, phase (plan / proposal /
+  review / moderation / adjudication / final) and round number. A turn may be silent for minutes; the UI must
+  still show that it is running. The server stores and pushes it; a refresh restores it. It disappears on
+  complete/failed/cancel.
 
-### 15.5 铁律在这个功能上的落法
+### 15.5 How the iron rule applies
 
-§1 的「不允许编造」在议事厅里落到这些地方，都是硬要求：
-
-| 情况 | 落库 | 界面 |
+| Situation | Stored | UI |
 | --- | --- | --- |
-| 进程超时 / 崩了 / 输出解析不出 | `status` 记真实原因 + `error` 存原文；**不生成**任何评审条目；**会议立即结束**，已产出的轮次照常归档 | 该角色标红并显示错误原文；「工作中」标识消失；会议状态与原因写明第几轮 / 阶段 / 楼层；没有假意见、没有后续轮次 |
-| 主持人需要补充信息 | `verdict='needs_clarification'`、`status='done'`；主持人记 `needs_clarification`，未运行角色记 `skipped`；报告照常归档 | 显示「需要补充信息」和逐条问题；不显示“没答上来”，不伪造裁决 |
-| transcript 被截断但含完整前缀 | 从最后一个完整 `result` / assistant 事件恢复正文与用量；原始尾部保留用于排障 | 正常展示已恢复的发言，不把“数组缺一个 `]`”误报成参与者失败 |
-| 评审尾块里只有部分条目可解析 | 只存解析成功的条目，丢弃数记在 `parse_dropped` | 不补齐、不猜测缺失的严重度或立场 |
-| 模型自报的 `convergenceScore` | **忽略**；`council_rounds.stats_json.score` 只存服务端算出的值 | 只显示服务端分数 |
-| 词元 / 耗时读不到 | 留 **NULL**（不是 0） | 显示「—」；某角色只有部分回合报了用量时显示下界「≥ N」 |
-| 某轮没有 diff | `diff_from_prev` 留 **NULL** | 明写"这一轮没有给出 diff —— 无法核对相对上一版改了什么" |
-| 材料超限截断 | 记 `bytes_total` 与 `bytes_included` | 材料清单里写明"原文多少字节、只嵌了多少" |
-| 最终轮失败 | `verdict='partial'`，已完成的轮次与报告照常归档 | 标明"部分完成"，不伪造交付稿 |
+| Timeout / crash / unparseable output | Real status + raw error; no review is invented; the meeting stops immediately and produced rounds are archived | The role is marked red with the raw error; the working indicator disappears; the round/phase/floor are named |
+| Moderator needs more information | `verdict='needs_clarification'`, `status='done'`; the role records it, later roles are `skipped`; the report is archived | Shows "more information needed" and each question; no fake adjudication |
+| Truncated transcript with a complete prefix | Recover from the last complete `result`/assistant event; keep the raw tail | Show the recovered utterance, not a false failure |
+| Only some review points parse | Store only parsed points; record `parse_dropped` | Never fill in missing severity or stance |
+| Model-reported `convergenceScore` | Ignored; `council_rounds.stats_json.score` holds only the server value | Show the server score only |
+| Tokens / duration unavailable | `NULL`, not 0 | Show `—`; a partially reported role shows `≥ N` |
+| A round has no diff | `diff_from_prev = NULL` | Say "no diff was provided", do not imply nothing changed |
+| Material truncated | Store `bytes_total` and `bytes_included` | State the original and inlined byte counts |
+| Final round failed | `verdict='partial'`; completed rounds and the report are archived | Mark "partially completed"; do not fabricate a final draft |
 
-### 15.6 验收要点
+### 15.6 Acceptance points
 
-1. 没装 CLI 的楼层置灰并写明原因；一层都装不上时入口禁用（不留死入口）。
-2. **角色校验**：缺主持人 / 缺主答 / 没有评审 / 同一楼层担任两个角色 / 选了白名单外的楼层 /
-   选了没有 CLI 的楼层 → 请求整体拒绝并说明原因，不静默降级，也不留下半场会。
-3. 第 0 轮拆解与分工可见；第 1 轮是主答提案；每轮都有评审意见与主持人汇总。
-4. **收敛度**严格等于 `clamp(100 − (25b + 8m + 2n + 10c), 0, 100)`；模型自报的高分不生效（测试里
-   用 98 vs 99 这类差异钉住）。界面显示公式；没跑完一轮时是「—」。
-5. **没有投票**：数据库没有 `threshold` / `vote` 列，界面没有票型或"同意 / 反对"计数；也不会因为
-   "没人反对"提前结束。
-6. 主持人指令是硬指令：含问题、具体改动与验收标准；空泛措辞与缺验收标准会产生一致性提示。
-7. 跑满轮次后一定有裁决与最终交付（或明确 `partial`）；报告只写进 WorkGremlin 自己的
-   `~/.workgremlin/councils/<id>/`，同名文件不覆盖；工作目录里不留任何副本。
-8. 每轮有 `diffFromPrev` 时界面显示 diff；没有时明说没有，而不是留空。
-9. 参与者失败时显示错误原文；不生成假评审；词元缺失显示「—」，部分缺失显示「≥ N」。
-9a. **fail-fast**：第 0 轮主持人答不上来时，会议立即结束（`failed`），不再发起提案 / 评审；
-   已完成过一轮时记为 `partial`，报告仍归档；仍在飞的参与者不再是 `running`。
-9b. **「工作中」标识**：发起后到第一次发言之间就能看到；刷新页面仍在；结束后立即消失。
-9c. **需要补充信息不是失败**：主持人在第 0 轮返回具体问题时，会议以
-   `needs_clarification` / `done` 结束；主持人显示「需要补充信息」，其余角色显示「未轮到」，
-   报告仍归档。事后设置工作目录不会重跑或改写已经结束的会议；新会议才会使用新目录。
-10. 材料超限有截断标注。
-11. 服务关掉时子进程全部回收（`ps` 里不留孤儿）、临时目录清掉。
-12. 办公室与任务记录页**看不到**任何议事厅痕迹。
-13. **真实工程目录模式**：问一个只有看代码才知道的问题（例如"这个函数在哪儿被调用"），回答里要
-    出现**真实的文件名 / 符号** —— 证明它真读了代码，而不是在复述材料。
-14. **工作目录不许被动**：工程模式跑完，工程目录 `git status` 干净、文件原封不动
-    （`rm -rf` 用户目录是最危险的一处，服务端只删**自己建的**临时目录）。
-15. **工程模式下办公室仍然干净**：跑完一场后，办公室、任务记录、7F/8F 的会话清单里都**看不到**
-    参与者（第 15.3 节的第 4、5 条是它的两道锁）。
+1. Floors without a CLI are greyed out with a reason; when none is available, the entry is disabled.
+2. **Role validation:** missing moderator / missing main / no reviewer / one floor in two roles / a floor
+   outside the allowlist / a floor without a CLI → the whole request is rejected with a reason; no silent
+   degradation and no half-started meeting.
+3. Round 0 plan is visible; round 1 is the main answerer's proposal; every round has reviews and a moderator
+   summary.
+4. **Convergence** equals `clamp(100 − (25b + 8m + 2n + 10c), 0, 100)`; a model-reported high score has no
+   effect (pin this with a 98 vs 99 test). The formula is shown; no completed round shows `—`.
+5. **No voting:** no `threshold` or `vote` columns, no vote/agree counts, and no early stop for "nobody
+   objected".
+6. Directives are hard: issue + concrete change + acceptance criterion; vague wording or missing acceptance
+   produces a consistency warning.
+7. After the configured rounds there is an adjudication and final delivery (or an explicit `partial`); the
+   report is written only under `~/.workgremlin/councils/<id>/`, never overwriting and never copying into the
+   working directory.
+8. When `diffFromPrev` exists the UI shows the diff; when absent it says so.
+9. Participant failures show the raw error; no fake reviews; missing tokens show `—`, partial tokens `≥ N`.
+9a. **Fail-fast:** if round 0 cannot be answered, the meeting ends immediately (`failed`) without starting
+    proposals/reviews; if one round completed, `partial` and the report is archived; in-flight participants
+    are no longer `running`.
+9b. **Working indicator:** visible between the start and the first utterance, survives a refresh, disappears
+    when the meeting ends.
+9c. **Needs-more-information is not failure:** a round-0 clarification request ends with
+    `needs_clarification` / `done`; the moderator shows "more information needed", other roles show "not
+    reached", and the report is archived. Setting a workspace later does not rerun or rewrite a finished
+    meeting.
+10. Material truncation is labelled.
+11. On server shutdown all child processes are reaped (no orphans) and temp directories are removed.
+12. The office and task records show **no trace** of a council.
+13. **Real-project mode:** a question that requires reading code (for example "where is this function
+    called?") produces real file names/symbols, proving the participant read the project.
+14. **The working directory is never modified:** after a project-mode run, `git status` is clean and files are
+    untouched. The server deletes only its own temp directories.
+15. **The office stays clean in project mode:** after a run, the office, task records and the 7F/8F session
+    lists show no participant.

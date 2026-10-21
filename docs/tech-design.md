@@ -1,490 +1,508 @@
-# WorkGremlin 技术设计方案（v0.1，待评审）
+# WorkGremlin — Technical Design
 
-> 目标产品：可视化桌面程序，用于**可视化管理 / 监控多 agent 协作团队**（leader / researcher / coder / tester）。
-> 两个核心界面：① **工位视图**（每成员一张工位卡片，实时状态/任务/进度/读写文件/最近产出/已耗时，自动刷新）；② **对话记录窗口**（全量消息流，按成员/时间过滤、关键字搜索、自动跟随滚动）。
->
-> 本文只做方案与取舍说明，**未经批准不写业务代码**。
+| Item | Value |
+| --- | --- |
+| Status | Living design document (v0.2) |
+| Last aligned with code | 2026-10-21 · `HEAD = e2ad323` |
+| Audience | Engineers working on the server, reporter/hooks, Electron shell and renderer |
+| Baseline | `docs/requirements.md` (what the product must do), `docs/implementation-status.md` (what the code actually does) |
 
-> **[2026-09-20 实现对齐]** 本文是 v0.1 技术方案，**取舍理由仍然成立**（Electron / A+B 混合 / SQLite / WS / 零依赖 reporter），但下列结论已被实现取代 —— 现状见 `docs/implementation-status.md`：
-> - **领域模型 team → 工程（project）**（commit `def3fee`）：§4 的 `teams` 表即今天的 `projects`，`team_id` 一律为 `project_id`；
-> - **A 路线（`chokidar`）未实现**：`server/src/watcher/` 从未创建，§7 文件清单里的 watcher 条目不存在；
-> - **协议版本为 2**：§5.1 的 `PROTOCOL_VERSION = 1` 与信封字段 `team` 已改为 `2` / `project`；
-> - **实现是 CommonJS JavaScript**（`jsconfig.json`），§2 的 TypeScript 选型尚未执行；
-> - 新增了本文未设计的东西：楼层（受监控产品探测）、全局活跃会话表、`.codebuddy/agents` 名册、`subagents.json` 幽灵清单、等距 Canvas 办公室与主 Agent 控制台。
+> **2026-10-21 state-model refactor.** Workstation state is now only **`busy` / `idle` / `blocked`**.
+> The business heartbeat, heartbeat timeouts, per-member TTL/lease renewal, the `offline` state, the
+> `error` state and the orthogonal `degraded` flag were removed. Busy comes from a running task;
+> blocked comes from an explicit per-session authorization wait; idle means neither. "Last active" is
+> derived from task start/end timestamps. The WebSocket ping is transport-only and never changes a
+> workstation state. Sections below describe the current design; older heartbeat-era text has been
+> removed rather than kept for history.
 
 ---
 
-## 0. 现状调研（已确认的事实）
+## 0. Context: what agent-side data can and cannot provide
 
-> ⚠️ **本节是 2026-09-14 的实测快照，目录结构描述已过时**：无法从 `.codebuddy/teams` 拿到状态这一结论仍然成立（它正是必须走 B 路线的原因），但代码后来没有实现该目录的监听，成员改由 hook / 名册 / 清单 / 落盘扫描四路提供。
+WorkGremlin observes coding-agent products that already run on the user's machine. No agent has to be
+modified by WorkGremlin, but the amount of truth available differs by product.
 
-当前 agent 团队运行数据落盘位置（实测）：
+A typical multi-agent on-disk layout (measured in September 2026) looks like this:
 
-```
+```text
 {workspace}/.codebuddy/teams/{mainConversationId}/{team_name}/
-├── config.json      # 团队配置 + 成员名单
-│   {
-│     "name": "workgremlin",
-│     "mainConversationId": "848af9d6...",
-│     "workspacePath": "/home/yinghui/work/...",
-│     "createdAt": "2026-09-14T07:14:45.923Z",
-│     "members": [
-│       { "memberId": "leader@workgremlin", "name": "leader",
-│         "role": "组建 WorkGremlin 团队 leader",
-│         "sessionId": "5ceff238..." }
-│     ]
-│   }
-├── leader.json      # 该成员的 mailbox（收件箱），当前为 `[]`
+├── config.json      # roster: member names, roles, session ids
+├── leader.json      # that member's mailbox (currently only received messages)
 ├── researcher.json
 ├── coder.json
-├── team-lead.json
 └── tester.json
 ```
 
-**关键结论（决定了路线选择）：**
+The important conclusions still hold:
 
-| 事实 | 影响 |
+| Fact | Consequence |
 | --- | --- |
-| 落盘数据**只有 roster + 收件箱消息**，**没有任何状态字段** | 纯监听（路线 A）**永远拿不到**真正的 `busy/blocked`、进度、正在读写的文件、耗时 |
-| 目录路径含 `mainConversationId` 哈希，且是**私有未文档化格式** | A 路线必须做多根目录扫描 + 容错解析，格式一变就失效 |
-| 成员 json 是**数组**（收件箱，只增不改） | 可用「长度增长 + 内容 diff」做增量解析；mtime 可做粗粒度活跃度 |
-| 同一 workspace 可能同时存在多个 team | 数据模型必须 `team_id` 维度隔离 |
-| 我们**能控制 agent 的启动方式**（runner / hook） | 路线 B（主动上报）在本团队场景下**可行** |
+| The team directory contains a roster and inboxes, but **no state fields** | Watching it alone can never produce `busy` / `blocked`, the current task, files or elapsed time |
+| The path embeds a private, undocumented `mainConversationId` hash | A watcher would need multi-root scanning and would break on format changes |
+| Mailboxes are append-only **receiving** arrays | Only the recipient side of a conversation is visible; the sender side is missing |
+| Many products do not use this layout at all | A single `.codebuddy/teams` reader cannot cover the nine supported floors |
+| We can control how hooks/reporters are installed | Active reporting (route B) is feasible and is the only source of semantic truth |
+
+**Design consequence.** Route B (active reporting plus the server-side hook dispatcher) is the only
+truth source for workstation state and tasks. Per-floor on-disk readers are a *supplement* for data a
+report cannot carry (tokens, transcripts, session lists, phases) and for products that expose no hook.
+The old route A (`chokidar` over `.codebuddy/teams`) was designed but **never implemented**; nothing in
+the current server depends on it.
 
 ---
 
-## 1. 数据源路线评估：A vs B
+## 1. Data sources
 
-### A) 目录监听 + 解析（chokidar）
+### 1.1 Route B — active reporting (implemented, truth)
 
-- 做法：`chokidar.watch('**/.codebuddy/teams/**/*.json')`，解析 `config.json` 得到 roster，解析 `{member}.json` 数组 diff 得到新消息；用「收件箱增长速率 + mtime」推断状态。
-- 优点：零侵入，agent 完全无感知；对**已经存在的第三方/外部团队**也能看见消息流；实现快（M1 当天可出）。
-- 缺点：
-  1. **状态只能猜**（idle/active 二值），无法得到 busy/blocked、进度、当前文件、耗时 —— 而这三个恰恰是「工位视图」的核心卖点；
-  2. 依赖私有目录格式与哈希路径，版本升级即碎；
-  3. 只能看到**收件箱**（别人发给我的），**看不到我发出的**消息，消息流天然残缺；
-  4. 大 JSON 全量重写时 diff 抖动，需去重与游标；
-  5. 无法获知 agent 崩溃/退出（只能靠超时兜底，误判率高）。
-
-### B) 主动上报 + 推送（HTTP 上报 → SQLite → WebSocket）
-
-- 做法：提供零依赖 SDK `packages/reporter`（Node，仅用 `fetch`），agent runner / hook 在关键节点调用：
-  `register` → `task.start/progress/end` → `message` → `file.touch`。
-  本地服务落 SQLite，`ws` 推给渲染层。
-- 优点：字段完备（任务、进度、文件、耗时、产出），语义准确；可扩展（以后加 token 消耗、成本、工具调用、artifact 都只是加字段）；任务表是工位忙碌与最近活跃的唯一真值源。
-- 缺点：需要 agent 侧配合（hook / runner 改造成本）；若某个 agent 没接上报，就完全看不到（需要 A 兜底）；引入本地端口与生命周期管理。
-
-### 结论：**推荐 A + B 混合，以 B 为主、A 为兜底与补充**
-
-```
-                 ┌──────────────── B：主动上报（主）──────────────┐
- agent runner ──▶│ POST /api/v1/*  ──▶ Ingest ──▶ SQLite ──▶ WS Hub│──▶ Renderer
-                 └────────────────────────────────────────────────┘
-                 ┌──────────────── A：目录监听（兜底）────────────┐
- .codebuddy/ ───▶│ chokidar ──▶ Parser ──▶ 同一 Ingest（source=A）│──▶ Renderer
-                 └────────────────────────────────────────────────┘
+```text
+agent hook / reporter ──POST /api/v1/*──▶ ingest bus ──▶ SQLite ──▶ WS hub ──▶ renderer (Pinia)
+                                             │
+                                             └──▶ buildMemberCard() / buildSnapshot()
 ```
 
-**融合规则（写入同一张表，用 `source` 字段区分，靠 `dedupe_key` 去重）：**
+- `packages/reporter` is a zero-dependency (Node `fetch`) SDK and CLI. Hooks forward raw product events
+  to `/api/v1/hook`; the server dispatches them per floor and writes tasks, files, tool usage, ghosts
+  and blocked state.
+- Advantages: fields are semantically exact (task start/end, per-session identity, token usage, files,
+  output); the design is extensible (new fields do not change the protocol shape); a task row is the
+  single source of truth for "busy" and "last active".
+- Cost: each floor needs an adapter; a product with no hook/report shows less data; the app must manage
+  a local port and a server lifecycle.
 
-1. **成员（roster）**：A 提供的名单作为「已发现成员」，B 的 `register` 覆盖/补全其 `role/session_id`；只被 A 发现的成员标记 `reported = false`，UI 上打「被动观测」角标。
-2. **消息**：A 解析出的收件箱消息 `source='watch'`，`dedupe_key = sha1(memberId|ts|from|sha1(content))`；B 上报的消息 `source='report'`。同 key 只入库一次（B 优先）。
-3. **工位状态**：只有 `busy / idle / blocked`。`busy` 来自当前会话 `tasks.state='running'`；`blocked` 来自按会话保存的授权等待；没有显式行就是 `idle`。服务端常驻时不存在 `offline`，也不用心跳续租状态。
-4. **进度/文件/耗时**：仅 B 提供；A 模式下该卡片区域显示「—（未接入上报）」，**不编造数据**。
+### 1.2 On-disk floor readers (implemented, supplementary)
 
-**风险与应对**
+Nine floors are monitored: CodeBuddy, Cline, Codex, Claude Code, TraeCode, Qoder, Kilo Code,
+OpenCode and GitHub Copilot. Each floor module reads its own product's data directory (SQLite,
+JSONL/rollout files, checkpoint databases, transcripts and session indexes) and normalizes that into
+sessions, task runs, token counts and phases.
 
-| 风险 | 应对 |
+These readers are **not** a workstation-state authority. They may infer a *session phase* (for example
+"no file activity for 10 minutes" on a floor with no hook). A phase is shown on the main-agent console;
+it is not a member state and does not imply `offline`.
+
+### 1.3 Rules for combining sources
+
+1. **Members.** Registration comes from reports/hooks, the agent roster
+   (`.codebuddy/agents/*.md` at project and user level), ghost records for summoned subagents, and
+   floor session scans. A member that never reports is marked `reported = false` and shown as
+   "passively observed"; unavailable fields stay empty.
+2. **Messages.** Reported messages use `source='report'`. A legacy directory-derived message uses
+   `source='watch'`. `dedupe_key` makes replay and mixed sources idempotent; report wins.
+3. **Workstation state.** Only `busy` / `idle` / `blocked` (see §4.3). Busy comes from
+   `tasks.state='running'`; blocked comes from a per-session `session_status` row; no row means idle.
+   There is no heartbeat or TTL to renew.
+4. **Progress / files / elapsed / artifacts.** Only reports and floor readers provide them. When they
+   are unavailable the UI shows `—`; it never fabricates a number.
+
+### 1.4 Risks and mitigations
+
+| Risk | Mitigation |
 | --- | --- |
-| `.codebuddy` 格式变更导致 A 失效 | A 完全隔离在 `server/src/watcher/`；解析失败只告警不崩溃，B 不受影响 |
-| better-sqlite3 原生模块与 Electron ABI 不匹配 | 优先 `node:sqlite`（Electron ≥30 / Node ≥22）；否则 `better-sqlite3` + `electron-rebuild`；最坏退化 `sql.js`/JSON 落盘（接口不变） |
-| 本地端口被占用 / 多实例 | 端口从 21800 起探测，成功后写 `~/.workgremlin/server.json`（含 port/token/pid）；启动前校验 pid 存活 |
-| 本地服务被其他进程滥用 | 每次启动生成随机 `token`，上报与 WS 订阅均需携带；只监听 `127.0.0.1` |
-| agent 未接上报 → 数据空洞 | A 兜底 + UI 明确区分「上报值 / 推断值」，避免误导 |
-| mailbox 数组 diff 抖动 | 以「数组长度 + 元素内容 hash 前缀」做单调游标，只取新增尾部；异常回退则整表重算并重建 dedupe 集合 |
+| A product changes its private on-disk format | Each floor module is isolated; a parse failure logs a warning and returns empty data, and never crashes the server or other floors |
+| A native SQLite module does not match Electron's ABI | `better-sqlite3` is rebuilt for Electron by `postinstall`; `npm run db:check` verifies open → write → read → checkpoint |
+| Local port already in use / multiple instances | Probe ports 21800–21820; write `port`/`token`/`pid` to `~/.workgremlin/server.json`; verify the recorded pid is alive before reusing |
+| Another local process abuses the API | A random token is generated on every start; HTTP and WS require it; the server binds `127.0.0.1` only |
+| A floor has no hook → data gaps | Floor readers supply sessions/tasks/tokens; the UI labels passive members and empty fields honestly |
+| A running task's process dies | No timeout/TTL heuristic guesses. A running task stays running until an explicit end/reconciliation event; liveness is not fabricated |
 
 ---
 
-## 2. 技术选型
+## 2. Technology choices
 
-| 维度 | 选型 | 取舍说明 |
+| Area | Choice | Rationale |
 | --- | --- | --- |
-| **桌面外壳** | **Electron 38 + Vue 3 + Vite 6 + TypeScript** | 选 Electron 而非 Tauri：① 本项目强依赖 Node 生态（`chokidar`、`ws`、SQLite 驱动、后续可能的 agent SDK 复用），Tauri 需 Rust 侧实现或 sidecar，成本翻倍；② 团队无 Rust 积累，出问题难定位；③ Tauri 需系统 WebView2/WebKitGTK，Linux 目标机兼容性差于自带 Chromium。代价：包体 ~80–120MB、内存占用高，对内部工具可接受。 |
-| **语言** | TypeScript 全栈（shared 复用类型） | 协议即类型，前后端不会漂移 |
-| **UI** | Vue 3 `<script setup>` + Pinia + **原生 CSS（CSS 变量主题）** | 不引入 UI 组件库，工位卡片是高度定制的信息密度型组件，组件库反而碍事；主题用 CSS 变量，M3 再补暗色 |
-| **状态层** | **SQLite（主）+ 内存快照（渲染层）** | 消息/事件量大、要按成员+时间+关键字过滤并分页，SQL 明显优于内存数组；服务端内存只保留「每个成员最新状态」快照用于秒开首屏；落盘保证重启后历史不丢 |
-| **实时通道** | **WebSocket（`ws`）**，HTTP 轮询为降级 | 需要双向（前端要发订阅变更/指令/回执），且单连接多路复用；SSE 仅单向，后续加「给 agent 下指令/注入任务」会返工。降级：WS 断线时 2s 轮询 `/api/v1/snapshot` |
-| **文件监听** | `chokidar` 4 | 跨平台、支持 `awaitWriteFinish`，对 JSON 重写友好 |
-| **消息列表** | 自研轻量虚拟滚动（定高估算 + 动态测量）或 `vue-virtual-scroller` | M0 先用「分页 + 上限 500 条窗口」；M2 再上虚拟滚动，避免过早优化 |
-| **图表** | ECharts（**M3 可选**） | M0–M2 不需要；M3 用于「团队时间线甘特 / 吞吐趋势」 |
-| **打包** | `electron-builder`（M3） | 产出 AppImage / deb / dmg |
-| **测试** | Vitest（server 单测 + parser 快照）+ Playwright（M3 e2e） | parser 必须有用真实 `.codebuddy` 样本的快照测试 |
+| Desktop shell | **Electron 38** | Strong Node ecosystem (SQLite, `ws`, child processes for councils), one bundled Chromium across targets. Package size (~100 MB) is accepted for an internal desktop tool |
+| Server | **Node.js + Express 4 + `ws` 8** | Same process as Electron by default, standalone with `npm run server` for headless/debug/tests |
+| Language | **CommonJS JavaScript** (`jsconfig.json` for editor checks) | The repository is JS today; the earlier TypeScript plan was not executed. `shared/index.d.ts` still publishes types to consumers |
+| UI | **Vue 3 `<script setup>` + Pinia + plain CSS variables** | The office is a custom canvas scene; a component library would not help. CSS variables carry the theme |
+| Storage | **better-sqlite3 13**, one database at `~/.workgremlin/workgremlin.db` | WAL, synchronous writes, prepared statements, no extra service. In-memory snapshot only for the first paint |
+| Realtime | **WebSocket** (`ws`) with HTTP polling fallback | One multiplexed connection for status, tasks, messages and ghosts. A dropped WS falls back to polling; reconnects use exponential backoff |
+| On-disk readers | Per-floor modules (`server/src/floor*.js`), one unified poller | One timer loop instead of a timer per floor; short SQLite open timeouts so a locked product DB cannot stall the server |
+| Tests | Plain Node scripts (`server/test/*.test.js`, `renderer/test/*.test.mjs`) driven by `scripts/run-tests.js` | Zero test-framework dependency and deterministic sandbox tests. Vitest/Playwright remain possible future upgrades, not current tooling |
+| Packaging | `electron-builder` (x64 Linux/Windows/macOS) | AppImage/deb, NSIS, dmg; macOS is ad-hoc signed (no notarization account) |
+
+**Security baseline.** SQLite connections use `secure_delete=ON`, WAL auto-checkpointing, `synchronous=NORMAL`,
+`foreign_keys=ON` and file mode `0600`. The server binds loopback only and requires a per-start token.
+Message redaction is **not implemented yet**; when it lands it must happen before persistence and before
+FTS indexing, so plaintext never enters the database.
 
 ---
 
-## 3. 目录结构（推荐方案）
+## 3. Directory layout (actual)
 
-**推荐：`npm workspaces` 轻量 monorepo + 单进程内嵌服务**（不是多进程微服务，也不是完全扁平的单应用）。
-
-理由：`shared/` 的类型必须被前后端同时引用 → 需要 workspace；但**本地服务不单独起进程**，而是由 Electron 主进程 `require` 后同进程启动（免端口/子进程生命周期管理、零 IPC 序列化开销），同时保留 `server/src/cli.ts` 可独立 `node` 启动，用于 headless 模式与单测。
-
-```
-/home/yinghui/work/WorkGremlin/
-├── package.json                  # npm workspaces: shared, server, desktop, renderer, packages/reporter
-├── tsconfig.base.json
-├── README.md
-├── .gitignore
-│
-├── docs/
-│   ├── tech-design.md            # 本文
-│   ├── protocol.md               # 协议细节（M1 前补全）
-│   └── runbook.md                # 开发/打包/排障
-│
-├── shared/                       # 纯类型与协议，零运行时依赖
-│   └── src/
-│       ├── types.ts              # Member, AgentStatus, Task, Message, Envelope
-│       ├── protocol.ts           # HTTP 路径常量、WS 事件名、payload 校验函数
-│       └── index.ts
-│
-├── server/                       # 本地 API + WS + 采集（可被 electron 内嵌或独立启动）
-│   └── src/
-│       ├── index.ts              # createServer({port, dbPath, watchRoots}) -> {app, wss, start, close}
-│       ├── cli.ts                # 独立启动（headless / 调试）
-│       ├── config.ts             # 端口探测、token、~/.workgremlin/server.json
-│       ├── db/
-│       │   ├── schema.sql
-│       │   ├── migrate.ts
-│       │   └── repo/{members,tasks,messages,status}.ts
-│       ├── http/
-│       │   ├── routes/{ingest,query,health}.ts
-│       │   └── auth.ts           # 本地 token 校验
-│       ├── ws/
-│       │   ├── hub.ts            # 连接管理、订阅过滤、广播、背压
-│       │   └── snapshot.ts       # 首屏快照构造
-│       ├── ingest/
-│       │   ├── normalizer.ts     # A/B 两条来源统一成内部事件（含 dedupe）
-│       │   └── bus.ts            # 事件总线：落库 + 广播 + 更新内存快照
-│       └── watcher/
-│           ├── codebuddyWatcher.ts   # chokidar
-│           └── parser.ts             # roster / mailbox 解析（容错 + 快照测试）
-│
-├── desktop/                      # Electron 主进程
-│   └── src/
-│       ├── main.ts               # app 生命周期：启动 createServer -> 建窗
-│       ├── preload.ts            # contextBridge 暴露受限 API
-│       ├── window.ts
-│       └── menu.ts
-│
-├── renderer/                     # Vue 3 + Vite
-│   ├── index.html
-│   ├── vite.config.ts            # dev: 5173；build: dist/ 供 main 加载
-│   └── src/
-│       ├── main.ts  App.vue
-│       ├── api/{ws.ts, http.ts, bridge.ts}   # 优先 preload bridge，降级直连 WS
-│       ├── stores/{team.ts, messages.ts, connection.ts}
-│       ├── views/{WorkstationView.vue, ConversationView.vue}
-│       └── components/
-│           ├── WorkstationCard.vue      # 工位卡片
-│           ├── StatusBadge.vue  ProgressBar.vue
-│           ├── FileActivityList.vue  ArtifactList.vue
-│           ├── MessageList.vue  MessageRow.vue
-│           ├── MessageFilters.vue  SearchBox.vue
-│           └── ConnectionBar.vue
-│
-├── packages/reporter/            # agent 侧上报 SDK（零依赖）+ CLI
-│   └── src/{index.ts, cli.ts}    # workgremlin-report heartbeat/task/...
-│
-├── fixtures/                     # 真实 .codebuddy 样本（脱敏），供 parser 单测
-└── scripts/{dev.sh, build.sh}
+```text
+WorkGremlin/
+├── package.json                  # npm workspaces + scripts (dev/build/test/server)
+├── jsconfig.json                 # editor/type hints for CommonJS JS
+├── shared/                       # zero-runtime-dependency protocol + shared paths + types
+│   ├── index.js                  # constants, envelope, state labels/colors, dedupeKey
+│   ├── index.d.ts                # public types (AgentState, MemberCard, ...)
+│   └── paths.js                  # ~/.workgremlin paths, state file, server.json, pid checks
+├── server/
+│   ├── src/
+│   │   ├── index.js              # createServer(): DB + bus + hub + routers + poller + demo
+│   │   ├── cli.js                # standalone server + --self-test
+│   │   ├── config.js             # port probe, random token, server.json
+│   │   ├── clock.js              # injectable clock
+│   │   ├── db/{schema.sql,index.js}   # schema, migrations, prepared statements
+│   │   ├── ingest/
+│   │   │   ├── bus.js            # the single write path → SQLite → broadcast → cards
+│   │   │   ├── agentRoster.js    # resident gremlins from agent definition files
+│   │   │   ├── agentLevel.js     # project/user level + description
+│   │   │   ├── hookDispatch.js   # raw hook event → floor adapter
+│   │   │   └── hookCommon.js     # shared hook state machine (tasks, ghosts, blocked, files)
+│   │   ├── floor*.js             # per-floor on-disk readers
+│   │   ├── floors.js             # floor registry, identity normalization, labels
+│   │   ├── poller.js             # one polling loop for all floors
+│   │   ├── sessionRegistry.js    # global live-session index
+│   │   ├── sessions.js           # plugin on-disk session parsing
+│   │   ├── http/routes/          # health, query, ingest, workspace, floors, sessions, council
+│   │   ├── ws/hub.js             # connections, filters, broadcasts
+│   │   ├── council/              # moderator/reviewer orchestration and reporting
+│   │   └── demo/                 # deterministic demo project and ticker
+│   └── test/                     # 57 regression suites
+├── desktop/src/                  # Electron main, launcher, preload, window, menu
+├── renderer/
+│   ├── src/
+│   │   ├── iso/                  # hand-written isometric canvas engine, map, sprites, console
+│   │   ├── components/           # cards, badges, elevator, sprites, message list
+│   │   ├── views/                # Office, Desk, Task records, Council, Workstation
+│   │   ├── stores/               # project, sessions, tasks, messages, mainAgent, council
+│   │   ├── lib/                  # memberTask, projectScope, timeRange, dayBoard, ...
+│   │   └── i18n/                 # zh/en UI strings
+│   └── test/                     # 17 regression suites
+├── packages/reporter/src/        # SDK, CLI, hook, Kilo/OpenCode plugin
+├── scripts/                      # dev/build/postinstall/install-hooks/run-tests
+└── docs/                         # requirements, tech design, status, test strategy, roadmap, runbook
 ```
 
-**渲染层加载策略**：dev 下 `win.loadURL('http://localhost:5173')`；prod 下 `win.loadFile('renderer/dist/index.html')`。服务地址通过 preload 注入，渲染层不硬编码端口。
+The server runs in the Electron main process in production (`createServer()` + `start()`), and as a
+standalone Node process for headless use and tests. The renderer never hardcodes the port: it discovers
+the server through the preload bridge or `~/.workgremlin/server.json`.
 
 ---
 
-## 4. 数据模型（SQLite）
+## 4. Data model (SQLite)
 
-约定：所有时间存 **UTC 毫秒 INTEGER**（`ts_ms`），展示层转本地；枚举用 TEXT + CHECK；JSON 字段存 TEXT。
+Conventions: all timestamps are UTC milliseconds (`INTEGER`); enums are `TEXT + CHECK`; JSON fields are
+`TEXT`. The ownership unit is the **project**, not a team.
 
-### 4.1 `teams`
-| 字段 | 类型 | 说明 |
+### 4.1 `projects`
+
+| Column | Type | Notes |
 | --- | --- | --- |
-| id | TEXT PK | `{workspaceHash}:{teamName}` |
-| name | TEXT NOT NULL | workgremlin |
-| workspace_path | TEXT NOT NULL | 监听根 |
-| main_conversation_id | TEXT | .codebuddy 哈希目录名 |
-| source | TEXT | `watch` / `report` |
-| created_at | INTEGER | |
+| `id` | TEXT PK | Slug derived from the project directory (collision suffix when needed) |
+| `name` | TEXT NOT NULL | Display name (`package.json name` > directory name) |
+| `workspace_path` | TEXT NOT NULL | Absolute project directory |
+| `main_conversation_id` | TEXT | Product-specific conversation hash when known |
+| `source` | TEXT | `report` or `watch` (the retired `timeout` value is migrated to `watch`) |
+| `created_at` | INTEGER | |
 
-索引：`idx_teams_ws(workspace_path)`
+Index: `idx_projects_ws(workspace_path)`.
 
 ### 4.2 `members`
-| 字段 | 类型 | 说明 |
+
+| Column | Type | Notes |
 | --- | --- | --- |
-| id | TEXT PK | `leader@workgremlin` |
-| team_id | TEXT NOT NULL FK | |
-| name | TEXT NOT NULL | leader / researcher / coder / tester |
-| role | TEXT | 角色描述 |
-| session_id | TEXT | 来自 config.json |
-| reported | INTEGER DEFAULT 0 | 是否接了 B 上报 |
-| created_at | INTEGER | |
+| `id` | TEXT PK | `<name>@<project>` |
+| `project_id` | TEXT FK | |
+| `name` | TEXT | Member name |
+| `role` | TEXT | Static role description |
+| `session_id` | TEXT | Primary session, when known |
+| `reported` | INTEGER | `1` = active reporting has been seen |
+| `created_at` | INTEGER | |
+| `ephemeral` | INTEGER | `1` = summoned ghost, no station |
+| `project_label` | TEXT | Project label carried by a ghost |
+| `client` | TEXT | Product base name (`codebuddy`, `codex`, ...); `NULL` = generic |
 
-索引：`idx_members_team(team_id, name)`
+Index: `idx_members_project(project_id, name)`. There is **no `last_seen_at`** column.
 
-### 4.3 `agent_status`（仅常驻小精灵的同名幽灵借用忙碌）
-| 字段 | 类型 | 说明 |
+### 4.3 State tables
+
+`agent_status` — the only explicit member-level state, and only for the **borrowed busy** of a resident
+gremlin while a same-named ghost works:
+
+| Column | Type | Notes |
 | --- | --- | --- |
-| member_id | TEXT PK FK | |
-| state | TEXT NOT NULL | 固定为 `busy` |
-| state_since | INTEGER | 借用忙碌开始时刻 |
-| updated_at | INTEGER | |
+| `member_id` | TEXT PK FK | |
+| `state` | TEXT NOT NULL, CHECK = `'busy'` | Fixed; no other value is legal |
+| `state_since` | INTEGER | When the borrow started |
+| `updated_at` | INTEGER | |
 
-没有行就是 `idle`。主 Agent 的忙碌不写这里，始终从 `tasks.state` 推导。
+No row means idle on this axis. The main agent's busy state is never stored here; it is always derived
+from `tasks.state`.
 
-### 4.3.1 `session_status`（每个成员 / 会话一行）
-`member_id, session_id, state, state_since, updated_at`
+`session_status` — explicit authorization waits, one row per blocked session:
 
-`state` 固定为 `blocked`。主 Agent 按 `floor + sessionId` 定位，小精灵再叠加 `memberId`；
-没有行就是该会话没有阻塞。不同会话的等待授权互不影响。
+| Column | Type | Notes |
+| --- | --- | --- |
+| `member_id` | TEXT FK | |
+| `session_id` | TEXT | |
+| `state` | TEXT CHECK = `'blocked'` | Fixed |
+| `state_since` | INTEGER | When the wait started |
+| `updated_at` | INTEGER | |
+| PRIMARY KEY | `(member_id, session_id)` | Different sessions never share a block |
+
+No row means that session is not blocked. Blocked rows are written for permission requests
+(`awaiting_permission`) and cleared by task progress, task end, session end or an idle notification.
+
+There is **no `agent_status_history` table**; the old heartbeat-era columns (`task_id`,
+`last_heartbeat_at`, `degraded`, `source`) were removed by a migration that rebuilds both tables.
+
+**State derivation (`buildMemberCard`).** A member card merges three candidate sources:
+`session_status` rows (blocked), the borrowed busy row (busy), and running tasks (busy). Priority is
+`blocked > busy > idle`; within the same priority the earliest `stateSince` wins. For a selected
+session the renderer applies `blocked (same session) > running task (same session) > borrowed busy >
+idle`. Unknown values normalize to idle.
 
 ### 4.4 `tasks`
-| 字段 | 类型 | 说明 |
+
+| Column | Type | Notes |
 | --- | --- | --- |
-| id | TEXT PK | `t_<ulid>` |
-| project_id / member_id | TEXT NOT NULL | |
-| parent_task_id | TEXT NULL | 支持 leader 拆解子任务 |
-| title | TEXT NOT NULL | |
-| state | TEXT | `pending / running / done / failed / cancelled` |
-| progress | REAL | |
-| started_at / ended_at | INTEGER | |
+| `id` | TEXT PK | `t_<timestamp>_<random>` |
+| `project_id`, `member_id` | TEXT NOT NULL | |
+| `parent_task_id` | TEXT NULL | Subagent/child work |
+| `title` | TEXT NOT NULL | The user's request or the subagent's assignment |
+| `state` | TEXT | `pending / running / done / failed / cancelled` |
+| `progress` | REAL | `NULL` = unknown (never fabricated) |
+| `started_at`, `ended_at` | INTEGER | |
 
-索引：`idx_tasks_member_state(member_id, state)`、`idx_tasks_project_started(project_id, started_at)`
+Indexes: `idx_tasks_member_state(member_id, state)`, `idx_tasks_project_started(project_id, started_at)`.
 
-工位“最近活跃”取该会话所有任务的 `MAX(started_at, ended_at)`。任务开始 / 结束已经足够，
-不需要额外的业务心跳或 TTL 续租。
+A task is running **exactly while its row says `running`**. There is no elapsed-time, heartbeat or TTL
+inference. "Last active" for a member/session is `MAX(started_at, ended_at)` over its tasks. Task
+start/end is sufficient; no additional business heartbeat is needed.
 
-### 4.5 `messages`（核心表）
-| 字段 | 类型 | 说明 |
+### 4.5 `messages`
+
+| Column | Type | Notes |
 | --- | --- | --- |
-| id | INTEGER PK AUTOINCREMENT | 单调序号，用于游标与虚拟滚动 |
-| dedupe_key | TEXT UNIQUE | A/B 去重 |
-| team_id | TEXT NOT NULL | |
-| ts_ms | INTEGER NOT NULL | 消息时间 |
-| from_member | TEXT NOT NULL | 成员 id 或 `system`/`user` |
-| to_member | TEXT | NULL=广播 |
-| type | TEXT NOT NULL | `task_assign / task_update / result / question / block / shutdown / heartbeat / system` |
-| subject | TEXT | 短标题（send_message 的 summary） |
-| content | TEXT | 正文 |
-| task_id | TEXT NULL | 关联任务 |
-| source | TEXT | `report` / `watch` |
-| raw_json | TEXT | 原始负载，便于回溯与格式迁移 |
+| `id` | INTEGER PK AUTOINCREMENT | Monotonic cursor for pagination |
+| `dedupe_key` | TEXT UNIQUE | Idempotency across replay/sources |
+| `project_id` | TEXT NOT NULL | |
+| `ts_ms` | INTEGER NOT NULL | |
+| `from_member` | TEXT NOT NULL | Member id or `system` / `user` |
+| `to_member` | TEXT | `NULL` = broadcast |
+| `type` | TEXT | `task_assign / task_update / result / question / block / review / error / shutdown / system` |
+| `subject`, `content` | TEXT | Short title / body |
+| `task_id` | TEXT | Related task |
+| `session_id` | TEXT | Session that produced the message |
+| `source` | TEXT | `report` / `watch` |
+| `raw_json` | TEXT | Original payload for debugging/migration |
+| `archived_at` | INTEGER | Archive marker (archive logic not implemented) |
+| `content_truncated` | INTEGER | `1` = body was stored truncated |
 
-索引：
-- `idx_messages_team_ts(team_id, ts_ms DESC, id DESC)` —— 主查询路径（时间倒序分页）
-- `idx_messages_from(team_id, from_member, ts_ms DESC)`
-- `idx_messages_to(team_id, to_member, ts_ms DESC)`
-- `idx_messages_type(team_id, type, ts_ms DESC)`
-- `messages_fts` —— FTS5 虚表（`content, subject`），M2 用于关键字搜索；M0/M1 先用 `LIKE '%kw%'` 顶上
+Indexes cover `(project_id, ts_ms, id)`, sender, recipient and type. `messages_fts` is an FTS5 table with
+`tokenize='trigram'` and insert/update/delete triggers; the query layer currently still uses `LIKE`, so
+FTS search wiring remains future work. The message type `heartbeat` was removed from the enum.
 
-### 4.6 `file_activity`
-`id PK, member_id, path, op('read'|'write'), ts_ms`
-索引：`idx_files_member_ts(member_id, ts_ms DESC)`；写入时按 member 保留最近 N=200 条（滚动清理）
+### 4.6 Other reporting tables
 
-### 4.7 `artifacts`（「最近产出」）
-`id PK, member_id, task_id, kind('file'|'doc'|'pr'|'text'), title, path, ts_ms`
-索引：`idx_artifacts_member_ts(member_id, ts_ms DESC)`
+- `task_runs` — one row per user-work turn: client, form, model, title, result, changed files, four token
+  columns, duration, session. Token semantics are normalized per floor: `input_tokens` is the part that
+  missed the cache; `cache_read_tokens` and `cache_write_tokens` are separate; `output_tokens` includes
+  thinking. Unavailable values stay `NULL` (shown as `—`, not 0).
+- `subagent_runs` — one row per summoned ghost: parent task, name, client/model, title, agent/call id,
+  background flag, result, files, duration, tokens.
+- `file_activity` — `id, member_id, path, op('read'|'write'), ts_ms`; keeps the latest 200 rows per member.
+- `tool_usage` — accumulated count per `(task_id, tool)` with project/member/client/session and first/last
+  timestamps.
+- `artifacts` — `id, member_id, task_id, kind('file'|'doc'|'pr'|'text'), title, path, ts_ms`.
+- `events` — generic audit/event row (`project_id, ts_ms, kind, payload_json`).
+- `settings` — key/value server-persisted settings (currently retention days).
 
-### 4.8 `events`（通用审计/回放，M2 启用）
-`id PK, team_id, ts_ms, kind, payload_json`
+Council tables (`councils`, `council_participants`, `council_materials`, `council_rounds`,
+`council_utterances`) are deliberately separate from the office tables: council participants never enter
+the office, task ledger or token totals.
 
 ---
 
-## 5. 协议定义（v1）
+## 5. Protocol (v2)
 
-### 5.1 通用信封
-所有 HTTP body 与 WS 帧统一：
+### 5.1 Envelope
+
+`PROTOCOL_VERSION = 2`. The envelope field is `project` (the old `team` field was renamed).
 
 ```ts
-// shared/src/protocol.ts
-export const PROTOCOL_VERSION = 1;   // ⚠️ 实现已升为 2：信封字段 team → project（见 docs/implementation-status.md §5-1）
-
 export interface Envelope<T = unknown> {
-  v: 1;              // 协议版本
-  type: string;      // 事件/请求类型
-  ts: number;        // 客户端产生时间（ms）
-  seq?: number;      // 上报方单调序号，用于乱序检测
-  team: string;      // team name，如 "workgremlin"
-  actor: string;     // memberId 或 "runner"
+  v: 2;
+  type: string;
+  ts: number;
+  seq?: number;
+  project: string;
+  actor: string;
   payload: T;
 }
 ```
 
-鉴权：`Authorization: Bearer <token>`（HTTP）；WS 首帧 `{type:'hello', token, team, filters}`。`token` 从 `~/.workgremlin/server.json` 读取。
+Authentication: HTTP uses `Authorization: Bearer <token>`; WebSocket uses `?token=` and/or a `hello`
+frame. The token is read from `~/.workgremlin/server.json`.
 
-### 5.2 Agent 上报接口（HTTP，全部 `POST /api/v1/...`，幂等）
+### 5.2 Reporting API (HTTP, `POST /api/v1/...`)
 
-| 路径 | payload | 语义 |
+| Path | Payload | Semantics |
 | --- | --- | --- |
-| `/register` | `{memberId, name, role, sessionId?}` | 注册/更新成员，置 `reported=1` |
-| `/task/start` | `{memberId, taskId?, title, sessionId?, parentTaskId?}` | 建任务；该会话进入 `busy` |
-| `/task/progress` | `{memberId, taskId, progress, note?, files?}` | 0–1 |
-| `/task/end` | `{memberId, taskId, state:'done'\|'failed'\|'cancelled', artifacts?: [{kind,title,path}]}` | 收尾 + 写 artifacts；没有其他运行任务时该会话回到 `idle` |
-| `/message` | `{from, to?, type, subject?, content, taskId?, ts?}` | 上报一条消息（补齐 A 路线缺失的「发件」侧） |
-| `/file/touch` | `{memberId, path, op}` | 文件读写活动（可选，批量） |
+| `/register` | `{memberId, name, role?, sessionId?, client?, workspacePath?}` | Register/update a member; `reported=1` |
+| `/task/start` | `{memberId, taskId?, title, sessionId?, parentTaskId?, workspacePath?}` | Create a task; the session becomes busy |
+| `/task/progress` | `{memberId, taskId, progress, note?, files?, sessionId?}` | 0–1 progress; also clears that session's blocked row |
+| `/task/end` | `{memberId, taskId, state:'done'\|'failed'\|'cancelled', artifacts?, sessionId?}` | Finish and write artifacts; idle if no other running task in the session |
+| `/task/tokens` | `{memberId, taskId, tokens}` | Backfill only the four token columns; safe to retry |
+| `/task/current` | `{memberId, sessionId?}` | Wrap-up fallback: find the member's current task |
+| `/message` | `{from, to?, type, subject?, content, taskId?, ts?}` | Record one message |
+| `/file/touch` | `{memberId, files\|path, op:'read'\|'write'}` | File read/write activity |
+| `/tool/use` | `{memberId, taskId, tool, sessionId?}` | Increment tool-usage count |
+| `/ghost` | `{action:'spawn'\|'finish'\|'sweep', ...}` | Summon/retire/clear ephemeral subagent ghosts |
+| `/hook` | Raw product hook event + `workspacePath` | Server-side dispatch; the floor reads disk and writes the ledger |
 
-统一响应：`{ok:true, id?}` / `{ok:false, error:{code,message}}`。
-错误码：`400 bad_payload / 401 bad_token / 404 unknown_member / 409 duplicate / 500 internal`。
+There is **no `/heartbeat` endpoint** and **no `/status` endpoint**. Blocked state is produced by the hook
+dispatcher, not by a client-side status call.
 
-**reporter SDK（packages/reporter）** 形态（agent/runner 侧）：
+Ownership: `projectFirst` resolves the project from `workspacePath` (the reporter's actual cwd), falling
+back to the request's `project`. This prevents "office shows project A, CLI runs in project B" from
+recording B's work under A.
 
-```ts
-import { createReporter } from '@workgremlin/reporter';
+Responses: `{ok:true, ...}` or `{ok:false, error:{code,message}}` with
+`400 bad_payload / 401 bad_token / 404 unknown_member / 500 internal`.
+
+**Reporter SDK.**
+
+```js
+const { createReporter } = require('@workgremlin/reporter');
 const rep = await createReporter({ project: 'workgremlin', member: 'coder' });
-const task = rep.task('实现工位视图');      // 自动 start
+const task = rep.task('implement the desk cards');   // start is implicit
 await task.progress(0.4, { files: ['renderer/src/components/WorkstationCard.vue'] });
 await task.end('done', { artifacts: [{ kind: 'file', title: 'WorkstationCard.vue', path: '...' }] });
-rep.close();                              // 释放 reporter
+rep.close();
 ```
 
-同时提供 CLI，便于 shell hook 调用（不改造 agent 也能用）：
-`workgremlin-report --member coder --task "..." --progress 0.3`
+There is no heartbeat method: the SDK reports task lifecycle and messages only. The CLI exposes
+`--project --member --task --progress --file --task-end --artifact --message --to --type --subject
+--content`; it has no `--state` flag.
 
-### 5.3 前端订阅消息格式（WebSocket）
+### 5.3 WebSocket protocol
 
-连接：`ws://127.0.0.1:<port>/ws?token=<token>`
+Connection: `ws://127.0.0.1:<port>/ws?token=<token>`.
 
-**客户端 → 服务端**
+Client → server: `hello`, `subscribe`, `ping`, `backfill`.
 
-```ts
-{ type: 'hello',   token, team, filters?: { members?: string[]; types?: string[]; since?: number } }
-{ type: 'subscribe', filters: { members?, types?, since?, until?, keyword? } }  // 变更订阅条件
-{ type: 'ping',    ts }
-{ type: 'backfill', beforeId?: number, limit?: number }   // 历史分页上拉
-```
-
-**服务端 → 客户端**
+Server → client:
 
 ```ts
-{ type: 'snapshot',  ts, payload: { project, members: MemberCard[], recentMessages: Message[], serverTime } }
+{ type: 'snapshot',      ts, payload: { project, members: MemberCard[], recentMessages: Message[], serverTime } }
 { type: 'member.status', ts, payload: MemberCard }
-{ type: 'task.update',   ts, payload: { taskId, memberId, title, state, progress, startedAt, endedAt } }
-{ type: 'message.new',   ts, payload: Message }                 // 增量，带自增 id 做游标
+{ type: 'task.update',   ts, payload: Task }
+{ type: 'message.new',   ts, payload: Message }
 { type: 'messages.page', ts, payload: { beforeId, items: Message[], hasMore } }
 { type: 'file.activity', ts, payload: { memberId, path, op, tsMs } }
 { type: 'artifact.new',  ts, payload: Artifact }
 { type: 'connection',    ts, payload: { state: 'open'|'closed', source: 'ws'|'poll' } }
 { type: 'error',         ts, payload: { code, message } }
+{ type: 'pong',          ts, payload: { ts } }
 ```
 
-`MemberCard`（工位视图直接绑定）：
+`MemberCard` (bound directly by desk cards and the office):
+
 ```ts
 interface MemberCard {
-  memberId: string; name: string; role: string;
-  state: 'busy'|'idle'|'blocked';
-  stateSince: number;                 // 算「已耗时」
-  tasks: Array<{ id: string; title: string; progress: number|null; startedAt: number|null;
-                 endedAt: number|null; sessionId: string|null }>;
+  memberId: string;
+  name: string;
+  role: string;
+  /** busy | idle | blocked */
+  state: 'busy' | 'idle' | 'blocked';
+  stateSince: number;
+  /** Borrowed display state for a resident gremlin: busy when a same-named ghost works, otherwise idle */
+  agentState?: 'busy' | 'idle';
+  agentStateSince?: number | null;
+  /** Every running task; the UI selects one by session id */
+  tasks: Array<{
+    id: string; title: string; progress: number | null;
+    startedAt: number | null; endedAt: number | null;
+    state?: TaskState; sessionId?: string | null; files?: string[];
+  }>;
+  /** Explicit authorization waits, scoped by session */
   sessionStatuses: Array<{ sessionId: string; state: 'blocked'; stateSince: number }>;
   currentFiles: string[];
-  artifacts: Artifact[];              // 最近产出 top3
-  lastTaskAt: number|null;             // 当前会话最近一次任务开始或结束
-  lastTaskAtBySession: Array<{ sessionId: string|null; at: number|null }>;
-  reported: boolean;                  // 是否接了主动上报
-  messageCount: number;               // 会话计数
+  artifacts: Artifact[];
+  /** Latest task start or end across the member */
+  lastTaskAt: number | null;
+  /** Latest task start or end per session */
+  lastTaskAtBySession?: Array<{ sessionId: string | null; at: number | null }>;
+  reported: boolean;
+  messageCount: number;
+  ephemeral: boolean;
+  projectLabel: string | null;
+  project: string;
+  client: string | null;
+  sessionId?: string | null;
+  /** Subagent level (user / project); drives the neck badge color */
+  level?: string | null;
+  /** Static function description; empty string when unavailable */
+  description?: string;
 }
 ```
 
-**广播策略**：`member.status` 做 200ms 合并（同一成员只发最新）；`message.new` 立即发；WS 发送缓冲区 >1MB 时降级为「只发计数 + 客户端自行刷新」。
+Broadcast policy: `member.status` is merged over a 200 ms window per member; `message.new` is sent
+immediately; a slow client degrades rather than blocking the hub. The WS ping interval (30 s, with a 60 s
+transport timeout) only detects a dead socket — it is not a member or task signal.
 
 ---
 
-## 6. 里程碑
-
-| 里程碑 | 目标 | 交付物 | 验收标准 |
-| --- | --- | --- | --- |
-| **M0** | 空壳跑起来，**两个界面静态渲染** | 工程骨架 + Electron 窗口 + 工位视图（4 张卡片，mock 数据）+ 对话记录窗口（mock 20 条，含过滤器与搜索框 UI）+ WS 连通（echo） | `npm run dev` 一键起；窗口出现两个 Tab；mock 数据可通过 WS 推送更新到 UI；`npm run build` 能产出可运行包（可不做安装包） |
-| **M1** | **真实状态接入** | A 路线 watcher + parser；B 路线 ingest HTTP + reporter SDK；SQLite 落库；`snapshot` + `member.status` 推送；连接状态条 | 打开一个真实 `.codebuddy/teams` 工作区，roster 与消息真实入库；用 `reporter` CLI 模拟 agent，卡片状态/进度/文件实时变化；UI 区分「上报值/推断值」 |
-| **M2** | **对话记录接入 + 过滤搜索** | 消息全量入库与增量推送；按成员/时间/类型过滤；关键字搜索（FTS5）；自动跟随滚动 + 上拉加载历史；消息详情与原文 JSON 查看 | 1 万条消息下滚动流畅；过滤/搜索响应 <200ms；新消息自动滚到底、用户手动上滚时暂停跟随并提示「N 条新消息」 |
-| **M3** | **打包分发 + 增强** | electron-builder（AppImage/deb/dmg）；多工作区/多团队切换；ECharts 团队时间线与吞吐图；暗色主题；导出会话为 Markdown/JSON | 目标机一键安装并运行；可切换观察多个 workspace；时间线能还原一天的任务分布 |
-
-（可选 M4：反向指令 —— 从 UI 给 agent 下任务/中断，依赖 runner 能力。）
-
----
-
-## 7. M0 最小可运行骨架（文件级清单）
+## 6. State model (authoritative summary)
 
 ```
-WorkGremlin/
-├── package.json                      # workspaces + scripts(dev/build/typecheck)
-├── tsconfig.base.json
-├── .gitignore
-├── README.md                         # 一键启动说明
-├── docs/tech-design.md               # 本文
-│
-├── shared/
-│   ├── package.json                  # name: @workgremlin/shared, type: module
-│   └── src/index.ts                  # types.ts + protocol.ts（M0 只放 MemberCard/Message/Envelope）
-│
-├── server/
-│   ├── package.json                  # 依赖：express, ws, chokidar, better-sqlite3|node:sqlite
-│   └── src/
-│       ├── index.ts                  # createServer()：express + ws + 静态兜底
-│       ├── cli.ts                    # 独立启动：node server/src/cli.ts
-│       ├── config.ts                 # 端口探测 + token + 写 ~/.workgremlin/server.json
-│       ├── db/schema.sql             # 4.1–4.8 建表（M0 先建 members/messages/agent_status）
-│       ├── db/index.ts               # 打开/迁移/关闭
-│       ├── ws/hub.ts                 # 连接管理 + broadcast()
-│       ├── http/routes/health.ts     # /api/v1/health
-│       ├── http/routes/query.ts      # /api/v1/snapshot（M0 返回 mock 生成器）
-│       └── mock/generator.ts         # 4 个成员的假状态 + 20 条假消息（M0 专用，M1 删除）
-│
-├── desktop/
-│   ├── package.json                  # 依赖：electron, electron-builder
-│   └── src/
-│       ├── main.ts                   # 启动 createServer(内嵌) → createWindow → 关闭时 close server
-│       ├── preload.ts                # contextBridge: getServerInfo / onEvent / send
-│       └── window.ts                 # dev 走 5173，prod 走 renderer/dist
-│
-├── renderer/
-│   ├── package.json                  # vue, pinia, vite, @vitejs/plugin-vue, TS
-│   ├── vite.config.ts                # proxy /api→server, proxy /ws→ws
-│   ├── index.html
-│   └── src/
-│       ├── main.ts                   # createApp + Pinia
-│       ├── App.vue                   # 顶部 ConnectionBar + Tab(工位/对话)
-│       ├── api/bridge.ts             # 优先 window.workgremlin，降级 http/ws
-│       ├── api/ws.ts                 # 重连（指数退避）+ 断线降级轮询
-│       ├── stores/team.ts            # members、subscribe(member.status)
-│       ├── stores/messages.ts        # messages、filters、keyword、autoFollow
-│       ├── views/WorkstationView.vue       # 卡片网格（M0 mock）
-│       ├── views/ConversationView.vue      # 列表 + 过滤 + 搜索（M0 mock）
-│       └── components/
-│           ├── WorkstationCard.vue   # 状态徽标/任务/进度条/文件/产出/耗时
-│           ├── StatusBadge.vue
-│           ├── ProgressBar.vue
-│           ├── MessageList.vue       # M0：简单 v-for + 上限 500；M2 换虚拟滚动
-│           ├── MessageRow.vue
-│           ├── MessageFilters.vue    # 成员多选 + 时间范围 + 类型（UI 先上）
-│           ├── SearchBox.vue         # 输入防抖（UI 先上）
-│           └── ConnectionBar.vue     # 连接状态 + 数据源(上报/推断)图例
-│
-├── packages/reporter/
-│   ├── package.json                  # 零运行时依赖
-│   └── src/index.ts                  # createReporter()（M0 只留接口骨架，M1 实现）
-│
-└── scripts/dev.sh                    # 并行起 vite + electron
+busy    := the selected session has a task with state='running'
+           (thinking / waiting for the model inside a running task is still busy)
+blocked := the selected session has an explicit session_status row (state='blocked')
+           reason: awaiting permission
+idle    := neither of the above
+precedence: blocked > busy > idle
 ```
 
-**M0 依赖清单（锁定大版本）**：`electron@^38` `vue@^3.5` `vite@^6` `pinia@^2` `express@^5` `ws@^8` `chokidar@^4` `typescript@^5`；DB 二选一：`node:sqlite`（Electron ≥30 原生）或 `better-sqlite3@^11` + `electron-rebuild`。
-
-**M0 不做**：真实 watcher、SQLite 写入、FTS、虚拟滚动、ECharts、打包成安装包、reporter 实现。
+- A `pending` task is **not** busy.
+- A `failed` / `cancelled` / `done` task is not busy.
+- A session ending clears its blocked row; it does not touch another session.
+- A resident gremlin borrowing a ghost's work shows busy while the ghost runs; when the ghost disperses the
+  borrow ends.
+- Server restarts reconstruct the same state from `tasks` and `session_status`; there is no lease to expire.
+- Supported states are exactly three. `offline`, `online`, `error`, `thinking`, `unknown` and `degraded`
+  are not states and must not be added without a design change.
 
 ---
 
-## 8. 待决问题（请 leader / main 拍板）
+## 7. Milestones and current status
 
-1. **A/B 混合是否批准？** 若不批准 B（不改造 agent），则「进度/当前文件/阻塞原因/已耗时」只能显示占位符，工位视图价值大幅下降 —— 请确认。
-2. **Electron 是否可接受**（~100MB 包体）？若坚持 Tauri，M0 工期 +3～5 天（Rust 侧文件监听 + sidecar）。
-3. **SQLite 驱动**：目标机 Electron 版本是否 ≥30？决定用 `node:sqlite` 还是 `better-sqlite3` + rebuild。
-4. **观察范围**：只观察当前工作区，还是需要同时观察多个 workspace / 多个 team？（影响 M3 工作量与 `teams` 表设计，模型已预留）
-5. **M0 交付节奏**：是否按上表一次性交付 M0 全部骨架（约 30 个文件）？
+The product has shipped beyond the original M0–M3 outline. The current shape:
+
+| Area | Status |
+| --- | --- |
+| Electron shell + embedded/standalone server + SQLite + WS | Done |
+| Reporting SDK/CLI, hooks for CodeBuddy/Codex/Claude/Qoder/Kilo/OpenCode/Copilot | Done |
+| Nine floors with on-disk session/task/token readers | Done |
+| Isometric office, elevator, main console, desk cards, ghosts | Done |
+| Task records: list, summary aggregates, daily Gantt, retention, CSV export | Done |
+| Council chamber: fixed roles, multi-round review, convergence, reports | Done |
+| Three-state workstation model, no heartbeat/TTL | Done (2026-10-21) |
+| Message redaction, FTS query wiring, virtual scrolling | Not implemented |
+| A-route `.codebuddy/teams` watcher | Not implemented (not required by the current design) |
+| System notifications / do-not-disturb | Not implemented |
+| TypeScript migration, Playwright E2E, packaging CI | Not implemented |
+
+Detailed divergence tracking lives in `docs/implementation-status.md`.
+
+---
+
+## 8. Open questions
+
+1. **Notifications.** With only three states, the old "blocked / error / offline > 60 s" trigger set no
+   longer applies. The only candidate S1 event is `blocked` (authorization wait). Its urgency, aggregation
+   window and default on/off behavior must be redesigned before notifications ship.
+2. **Search.** `messages_fts` exists but queries still use `LIKE`. Decide when to wire FTS and how to handle
+   1–2 character queries (trigram recall is poor; use a time-bounded `LIKE` fallback).
+3. **Redaction.** Not implemented. The hard requirement remains: redact before the row and its FTS index are
+   written; plaintext must never reach the database.
+4. **Retention/archiving.** The retention setting and task deletion paths exist; message archiving to JSONL
+   is not implemented.
+5. **Multi-workspace.** One open project at a time; multi-workspace observation remains an architectural
+   reservation, not a feature.
+6. **Renderer test tooling.** Plain Node suites cover logic; a browser/Electron E2E layer is still missing.

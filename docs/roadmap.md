@@ -1,250 +1,444 @@
-# WorkGremlin 整体排期与责任矩阵（v0.1）
+# WorkGremlin Roadmap and Responsibility Matrix (v0.2)
 
-- 维护人：leader
-- 版本：v0.1（2026-09-14）
-- 关联：`docs/requirements-outline.md`（需求）、`docs/tech-design.md`（coder 技术方案）、`docs/test-strategy.md`（tester 测试策略）
+- Maintainer: leader
+- Version: v0.2 (2026-10-21); previous version v0.1 (2026-09-14)
+- Related documents: `docs/requirements.md` (requirements), `docs/tech-design.md` (technical design), `docs/test-strategy.md` (test strategy), `docs/implementation-status.md` (code reality and document drift)
+
+> **2026-10-21 — workstation state model simplified (commit `e2ad323`).**
+> The old model of five primary states plus a liveness flag is gone. A workstation now has exactly
+> **three** mutually exclusive states: `busy`, `idle`, `blocked`.
+>
+> - `busy`: a task belonging to that member/session has `tasks.state = 'running'`. "Thinking" or
+>   "waiting for the model" inside a running task is still busy. A `pending` task is **not** busy.
+> - `blocked`: an explicit authorization wait for one session, stored in `session_status`
+>   (`state = 'blocked'`, `reason = 'awaiting_permission'`). It is written from `PermissionRequest` /
+>   permission `Notification` hook events and cleared by task progress, task end, session end, or an idle
+>   notification. It is session-scoped: two sessions of the same member do not affect each other.
+> - `idle`: no running task and no blocked row for that session. Absence of a row means idle.
+>
+> Removed in the same refactor, and no longer part of the product: the business heartbeat and its
+> `/api/v1/heartbeat` + `/api/v1/status` endpoints; `offline` / `online` / `error` / `thinking` as
+> workstation states; the `degraded` flag; TTL / lease renewal and timeout inference; `source = 'timeout'`;
+> `members.last_seen_at`; and the `agent_status_history` table. "Last active" now comes only from task
+> start/end timestamps (`lastTaskAt`, `lastTaskAtBySession`). The WebSocket ping (30 s interval, 60 s
+> timeout) is transport-only and never changes a workstation state.
+>
+> Consequences for this document: the M1 deliverables and acceptance criteria were rewritten around the
+> three-state model; every acceptance item for heartbeat, degraded, offline and error was deleted; the
+> council section no longer references them. This file was also fully rewritten in English, preserving the
+> original milestone structure, responsibility matrix and dependency chain.
 
 ---
 
-## 0. 里程碑编号对齐说明
+## 0. Milestone numbering alignment
 
-coder 与 tester 的里程碑编号不一致，本文档以 **coder 的 M0~M3 为主编号**，tester 文档中的编号按下表映射，**后续沟通一律使用主编号**：
+The coder and tester documents used different milestone numbers. This document uses the **coder's M0–M3 as
+the primary numbering**, except that reverse control and watcher productionization were split out as **M4**.
+The mapping is:
 
-| 主编号（本文档） | coder `tech-design.md` | tester `test-strategy.md` | 目标 |
+| Primary number (this document) | coder `tech-design.md` | tester `test-strategy.md` | Goal |
 | --- | --- | --- | --- |
-| **M0** | M0 | M0 | 骨架 + 可测性地基 + demo 模式 |
-| **M1** | M1 | M1 | 真实状态接入，工位视图上线 |
-| **M2** | M2 | M2 + **M3**（持久化与恢复） | 对话记录窗口 + 落盘与恢复 |
-| **M3** | M3 | **M4**（桌面端打包与发布） | 打包分发与增强 |
-| **M4** | 可选 M4（反向控制） | **M5**（目录监听生产化） | 反向控制（**已确定：仅派活 + 中断**）/ 监听生产化 |
+| **M0** | M0 | M0 | Skeleton + testability foundation + demo mode |
+| **M1** | M1 | M1 | Real state ingestion, workstation view online |
+| **M2** | M2 | M2 + **M3** (persistence and recovery) | Conversation window + persistence and recovery |
+| **M3** | M3 | **M4** (desktop packaging and release) | Packaging, distribution, enhancements |
+| **M4** | optional M4 (reverse control) | **M5** (watcher productionization) | Reverse control (**decided: dispatch + interrupt only**) / watcher productionization |
 
 ---
 
-## 0.1 实际进度（2026-09-20 对齐）
+## 0.1 Actual progress (aligned 2026-10-21)
 
-> 代码实际走到哪一步，逐条差异登记在 `docs/implementation-status.md` §5；这里是排期视角的摘要。
+> Where the code actually stands. The detailed per-item drift log is in `docs/implementation-status.md` §5;
+> this table is the schedule-level summary. "Delivered" means it ships and is used; "not delivered" means
+> the code does not exist yet, not merely that it is untested.
 
-| 里程碑 | 已交付 | 未交付 |
+| Milestone | Delivered | Not delivered |
 | --- | --- | --- |
-| **M0** ✅ 基本达成 | monorepo 骨架、Electron 窗口、`better-sqlite3` + `electron-rebuild`、`--demo` 确定性数据、reporter SDK/CLI、WS 推送与断线重连 | 6 条可测性契约只有「时间源可注入」（`server/src/clock.js`）等少数落地；`data-testid` 只覆盖部分组件；**仓库里没有任何测试文件** |
-| **M1** 🟡 部分达成 | hook 上报链路（CodeBuddy 插件/CLI、Codex / Claude Code）、工程切换、常驻名册 + 临时清单、楼层/会话表、`degraded` 60s 灰显 | **A 路线（`chokidar`）零代码**；**消息脱敏零代码**；双连接存储未做；`file_activity.op` 缺 `edit`；告警/通知未做 |
-| **M2** 🟡 部分达成 | 消息落库 + `dedupe_key` 幂等、按成员/类型/时间过滤 + 关键字（`LIKE`）、对话记录界面 | **FTS5 查询与 1~2 字降级未接**（虚表已建）；虚拟滚动未做；归档保留策略未做；`events` 表无写入方 |
-| **M3** ❌ 未开工 | — | electron-builder 打包、时间线图、会话导出、暗色主题、系统通知与免打扰、原文加密通道 |
-| **M4** ❌ 未开工 | — | 派活 / 中断、目录监听生产化 |
-| **议事厅** ✅ 已交付（排期外，见 §5.1） | 固定角色（主持人 / 主答 / 评审）+ 多轮评审 + 服务端收敛度 + 七层配方 + 独立页面与表；1F / 2F / 4F / 8F 真机跑通；**另有"在真实工程目录里评审"（2026-10-02）**；**2026-10-19 取消投票并改为角色化流程** | 3F / 6F / 7F 未跑完整一场会；轮数上限是初值；工程模式的真机验收待做 |
+| **M0** ✅ substantially met | npm workspaces monorepo; Electron window (Vite in dev, `renderer/dist` in prod); `better-sqlite3` + `@electron/rebuild` (verified by `npm run db:check`); demo mode as an isolated demo project opened from the UI action bar; reporter SDK + CLI; WS push and reconnect. **73 test suites** run via `npm run test:all` (57 server test files + 17 renderer test files; 73 `test:*` scripts, `pluginReply.test.js` has no alias), all plain Node scripts with a local `ok()` helper — **not Vitest or Playwright**. | Most of the six testability contracts: only the injectable clock (`server/src/clock.js`) and a partial fake source landed; `packages/core` was never split out; no lint-enforced core/Electron boundary; `data-testid` covers only part of the UI; no IPC contract tests. The original "repository has no test files" claim is obsolete and corrected here. |
+| **M1** 🟡 partially met | hook ingest chain (CodeBuddy plugin/CLI, Cline, Codex, Claude Code, Qoder); project switching; resident roster + ephemeral ghost list; floor/session tables; **three-state model** `busy / idle / blocked` with session-scoped blocked; member-card aggregation; last-active from task start/end. | **A-route (`chokidar`) watcher: zero code** (`chokidar` is declared in `server/package.json` but referenced nowhere in source); **message redaction: zero code**, no interception point; dual-connection storage (currently one connection with `secure_delete=ON`); `file_activity.op` has only `read` / `write` (`edit` retired); in-app alerts; layout thresholds (compact at ≥5, pagination at >16); automatic archive before delete. |
+| **M2** 🟡 partially met | Message persistence with `dedupe_key` idempotency; filtering by member/type/time + keyword (`LIKE`); conversation page. | **FTS5 query and the 1–2 character `LIKE` fallback are not wired** (virtual table and triggers exist; `listMessages` always uses `LIKE`); virtual scrolling; automatic archive/retention-to-JSONL flow (only a retention-days setting and manual `purgeProject` exist); the `events` table exists but has **no writer callers** (only a prepared statement), so audit/replay is not live. |
+| **M3** ❌ not started | An `electron-builder.yml` exists, but no packaging pipeline or release artifact is produced. | electron-builder packaging, timeline charts, session export, dark theme, system notifications and do-not-disturb, encrypted original-text channel. |
+| **M4** ❌ not started | — | Dispatch / interrupt, watcher productionization. |
+| **Council** ✅ delivered (outside the original schedule, see §5.1) | Fixed roles (one moderator, one main answerer, one or more reviewers) + multiple review rounds + server-computed convergence + seven-floor recipes + dedicated page and tables; on-machine runs completed on 1F / 2F / 4F / 8F; **workspace-directory mode (2026-10-02)**; **voting removed in favour of the role-based flow (2026-10-19)**; fail-fast on a failed turn; live "working" strip. | 3F / 6F / 7F have not completed a full meeting on a real machine (3F parameters verified, model call limited by local login state; 6F/7F not run); round limits are initial values; workspace-mode on-machine acceptance still pending. |
 
-**排期之外已额外交付**（本文原先未规划）：等距 Canvas 办公室引擎与主 Agent 控制台（`renderer/src/iso/`）、左侧楼层与产品安装探测（1F~8F）、全局活跃会话表（60 分钟超时剔除）、工程级/用户级 subagent 工牌名册、`docs/design-elevator-transition.md` 的楼层切换设计、**议事厅（见 §5.1）**。
+**Delivered beyond the original plan** (not scheduled in v0.1): the isometric Canvas office engine and main-agent console (`renderer/src/iso/`), floor/product installation detection (1F–9F), the global active-session table (60-minute eviction window), project-level and user-level subagent rosters, the elevator-transition design in `docs/design-elevator-transition.md`, and the **council (§5.1)**.
 
-**语言栈**：本文 §7「风险 7」裁决的 TypeScript 迁移**未执行** —— 当前仍是 CommonJS JavaScript（`jsconfig.json`），硬前提「V1 先过」已满足，迁移本身未启动。
+**Language stack**: the TypeScript migration decided in §7 risk 7 **has not been executed**. The code is
+still CommonJS JavaScript checked by `jsconfig.json`. The hard prerequisite (get V1 green first) was met long
+ago; the migration itself never started.
 
-## 1. M0 — 骨架、可测性地基、离线演示
+**State-model status**: the three-state model is implemented end to end (shared constants, DB schema,
+aggregation, renderer). The migration in `server/src/db/index.js` rebuilds the pre-refactor
+`agent_status` / `session_status` tables and drops `members.last_seen_at`, so existing databases are
+upgraded in place.
 
-**目标**：工程能一键跑起来，两个核心界面用 mock 数据静态渲染，所有高险技术项（原生模块构建）验证掉。
+---
 
-| 项 | 内容 |
+## 1. M0 — Skeleton, testability foundation, demo mode
+
+**Goal**: the project starts with one command, both core screens render statically from mock data, and every
+high-risk technical item (native module build) is proven before UI work expands.
+
+| Item | Content |
 | --- | --- |
-| **责任人** | coder（主），tester（契约验收 + 冒烟），leader（排期与阻塞升级） |
-| **依赖** | 无（起始里程碑） |
-| **交付物** | 按 `tech-design.md` 第 7 节约 30 个文件清单交付：<br>1. npm workspaces monorepo 骨架：`shared/` `server/` `desktop/` `renderer/` `packages/reporter/` `scripts/dev.sh`<br>2. Electron 空壳能起窗口（dev 走 Vite 5173，prod 走 renderer/dist）<br>3. **工位视图** mock 静态渲染（4 张卡片，含状态徽标/任务/进度条/文件/产出/耗时）<br>4. **对话记录窗口** mock 静态渲染（20 条消息 + 过滤器 UI + 搜索框 UI）<br>5. `better-sqlite3` + `@electron/rebuild` 跑通（**M0 最高风险项，先跑通再写界面**）<br>6. `packages/reporter` CLI 可手动调用的上报示例<br>7. **离线演示模式 `--demo` / `MOCK=1`**（确定性假数据源，与 mock 渲染、E2E 数据源三合一）<br>8. 5 条可测性契约落地（见 §1.1）<br>9. WS 连通（echo）+ 重连骨架<br>10. **建表预留以下字段/钩子（本期不实现逻辑）**：`file_activity.op`（read/write/edit）、`task.progress` + `progress_source`（reported/derived/unknown）、`notifications`（告警配置）、`redaction` 脱敏钩子（可替换的 `redact(content)` 中间件点）、`archived_at` 与索引<br>11. **双连接存储方案（安全与吞吐不二选一）**：**写入连接** `secure_delete=OFF` 承担 1000 事件/s 稳态；**删除/归档连接** `secure_delete=ON` 仅用于归档与手动删除。`secure_delete` 是**连接级** PRAGMA，不能按表开关，故必须双连接。WAL 显式设 `wal_autocheckpoint`，删除后执行 `wal_checkpoint(TRUNCATE)`；`.db`/`.db-wal`/`.db-shm` 权限 `0600`。**禁止为吞吐关闭 secure_delete**<br>12. **FTS5 建表直接用 `tokenize='trigram'`**（Q10 已定，避免后期重建索引迁移） |
-| **明确不做** | 真实 watcher、SQLite 业务写入、FTS5 查询逻辑、虚拟滚动、ECharts、安装包、reporter 完整实现、归档逻辑、脱敏实现（只留钩子）、系统通知（只留配置项）、原文加密通道（M3） |
+| **Owner** | coder (primary), tester (contract acceptance + smoke), leader (schedule and blocker escalation) |
+| **Dependency** | none (starting milestone) |
+| **Deliverables** | 1. npm workspaces monorepo skeleton: `shared/` `server/` `desktop/` `renderer/` `packages/reporter/` `scripts/dev.sh`<br>2. Electron shell opens a window (dev via Vite 5173, prod via `renderer/dist`)<br>3. **Workstation view** rendered statically from mock data (4 cards with state badge, task, progress, files, artifacts, elapsed time)<br>4. **Conversation window** rendered statically from mock data (20 messages + filter UI + search box UI)<br>5. `better-sqlite3` + `@electron/rebuild` working (**the highest-risk M0 item; prove it before writing more UI**)<br>6. `packages/reporter` CLI with a manually callable reporting example<br>7. **Demo mode**: a deterministic fake data source. Since 2026-09-21 it is a **UI action**, not a `--demo` / `MOCK=1` startup flag: it opens an isolated demo project and restores the previous project on exit. It doubles as the fixture source for component tests and manual walkthroughs<br>8. Six testability contracts landed (see §1.1)<br>9. WS connectivity (echo) + reconnect skeleton<br>10. **Schema placeholders for later milestones (no logic this phase)**: `file_activity.op` (the planned `edit` value was later retired; only `read`/`write` shipped), `tasks.progress`, a replaceable `redact(content)` middleware point, `archived_at` and `content_truncated` with indexes, the `events` audit table<br>11. **Dual-connection storage plan (security and throughput without a trade-off)**: a **write connection** with `secure_delete=OFF` for the steady-state event load, and a **delete/archive connection** with `secure_delete=ON` for archive and manual deletion. `secure_delete` is per connection, so two connections are required. WAL with an explicit `wal_autocheckpoint`, `wal_checkpoint(TRUNCATE)` after deletion, and `0600` permissions on `.db` / `.db-wal` / `.db-shm`. **Never disable `secure_delete` for throughput.** Status: planned, not implemented (today is a single connection with `secure_delete=ON`)<br>12. **FTS5 table created directly with `tokenize='trigram'`** (decision Q10, avoiding a later index rebuild). Status: table and triggers exist; the query layer is not wired |
+| **Explicitly not doing** | A real watcher, SQLite business writes beyond the self-test, FTS5 query logic, virtual scrolling, ECharts, installers, full reporter, archive logic, redaction implementation (hook point only), system notifications (configuration placeholder only), encrypted original-text channel (M3) |
 
-### 1.1 M0 必须落地的 6 条可测性契约（hard block）
-> 编号对齐 `test-strategy.md` §7；tester v0.3 将 7.2 升为硬阻塞（demo 模式即 `FakeEventSource`），7.5 并入 7.1。
+### 1.1 Six testability contracts that must land in M0 (hard block)
 
-| # | 契约 | 说明 |
+> Numbering follows `test-strategy.md` §7. Tester v0.3 promoted 7.2 to a hard blocker (demo mode is the
+> `FakeEventSource`) and merged 7.5 into 7.1.
+
+| # | Contract | Notes |
 | --- | --- | --- |
-| 7.1 | **时间源可注入**（Clock 接口 + FakeClock，含单调/墙钟分离） | 耗时/心跳/超时用例可确定性断言 |
-| 7.2 | **EventSource + Fake 实现** | demo 模式即 `FakeEventSource` + fixture，M0 必需 |
-| 7.4 | **确定性 ID**（`msgId` / `seq` / 唯一索引可注入） | 保证 E2E 可重复 |
-| 7.6 | **core 与 Electron 解耦**（`packages/core` 纯实现，依赖注入 source/repository/clock）+ lint 强制 | L1/L2 无头运行、demo 可复用 |
-| 7.7 | **`createTestApp()` 工厂** | 1 秒内跑通「注入事件 → 断言 store 状态」 |
-| 7.9 | **稳定选择器 `data-testid`** | 命名约定：`seat-card-<agentId>`、`seat-status-<agentId>`、`seat-degraded-<agentId>`、`seat-progress-<agentId>`、`msg-row-<msgId>`、`conv-list`、`filter-agent`、`search-input`、`watcher-banner`、`archive-notice` |
+| 7.1 | **Injectable time source** (Clock interface + FakeClock, with monotonic and wall-clock separated) | Elapsed-time, timeout and recovery cases can assert deterministically. Implemented as `server/src/clock.js` |
+| 7.2 | **EventSource + fake implementation** | Demo mode is the `FakeEventSource` plus fixtures; required by M0 |
+| 7.4 | **Deterministic IDs** (`msgId` / `seq` / unique indexes injectable) | Makes E2E repeatable |
+| 7.6 | **Core decoupled from Electron** (`packages/core` pure implementation, dependency-injected source/repository/clock) + lint enforcement | L1/L2 headless runs; demo reuses it. Not delivered: no `packages/core` |
+| 7.7 | **`createTestApp()` factory** | Inject an event and assert store state within one second |
+| 7.9 | **Stable `data-testid` selectors** | Naming: `seat-card-<agentId>`, `seat-status-<agentId>`, `msg-row-<msgId>`, `conv-list`, `filter-agent`, `search-input`, `archive-notice`. The old `seat-degraded-<agentId>`, `seat-progress-<agentId>` and `watcher-banner` selectors are retired |
 
-> 7.15（`--user-data-dir=` / `WORKGREMLIN_HOME` 数据目录可覆盖）为 **M0 强建议**（E2E 隔离并行、demo 隔离）。
+> 7.15 (`--user-data-dir=` / `WORKGREMLIN_HOME` data-directory override) is a **strong M0 recommendation**
+> for isolated E2E runs and isolated demo projects. `WORKGREMLIN_HOME` and `WORKGREMLIN_DB` exist.
 
-### 1.2 DoD（对齐 `test-strategy.md` v0.3 §6 M0）
-- [ ] `npm run dev` 一键启动（至少 Linux 验证通过）。
-- [ ] **6 条可测性契约全部落地**（7.1 / 7.2 / 7.4 / 7.6 / 7.7 / 7.9）。
-- [ ] **demo 模式交付：`DEMO-01~07` 全通过**，并成为 L2 组件测试与 L4 E2E 的默认数据源（`--demo-seed=N` 确定性输出，覆盖 5 主状态 + ≥1 degraded + ≥200 条消息）。
-- [ ] **原生模块验证 `N1`（Linux x64）5 条判据全过**：依赖装好、`@electron/rebuild` 成功、Node 侧 require 建表读写成功、**打包产物内 require 成功**、`asarUnpack` 正确 + `integrity_check ok`。`native:check` 进 CI L0 门禁。
-- [ ] `check:arch-param` 静态检查通过（打包配置无硬编码架构，DS-14 前置）。
-- [ ] `archived_at` 与 `content_truncated` 字段及索引存在（归档逻辑 M1 验）。
-- [ ] IPC 通道有契约测试骨架 ≥1 条通过。
-- [ ] 通用 DoD（tester 文档 §6 通用项）：L1 行覆盖 ≥80%、无 S1、测试可重复 5 次 flaky=0。
+### 1.2 Definition of Done (aligned with `test-strategy.md` v0.3 §6 M0)
 
-### 1.3 coder 开工后的验证节点（每完成一个即上报 main，附命令与结果）
-| # | 节点 | 验证方式 |
+- [x] `npm run dev` starts with one command (verified on Linux).
+- [ ] **All six testability contracts landed** (7.1 / 7.2 / 7.4 / 7.6 / 7.7 / 7.9). Partial only.
+- [x] **Demo mode delivered**: deterministic isolated demo project, 6 resident experts + 2 temporary members, ≥200 messages. The seed covers `busy / idle / blocked` and **does not fabricate any other state**.
+- [x] **Native module check `N1` (Linux x64)**: dependencies installed, `@electron/rebuild` succeeds, and `npm run db:check` creates tables and reads/writes back. The "require from the packaged app" criterion is **not covered by an automated test** (there is no packaging test yet; see M3).
+- [ ] `check:arch-param` static check (no hard-coded architecture in packaging config). Not delivered.
+- [x] `archived_at` and `content_truncated` fields and indexes exist (archive logic is still M2 work).
+- [ ] IPC contract test skeleton (≥1 passing). Not delivered.
+- [ ] General DoD (tester document §6): L1 line coverage ≥80%, no S1, repeatable 5× with flaky=0. Not measurable yet: there is no coverage-instrumented runner.
+
+### 1.3 Verification checkpoints after coder starts (report to main with command and result)
+
+| # | Checkpoint | How to verify | Status 2026-10-21 |
+| --- | --- | --- | --- |
+| V1 | Dependencies installed + **electron-rebuild native module build succeeds** | After `npm i`, `npx @electron/rebuild` succeeds; Node-side `require('better-sqlite3')` creates a table, inserts and queries | ✅ passed |
+| V2 | Electron window opens | `npm run dev` shows the main window | ✅ passed |
+| V3 | Both screens render from mock data | Screenshot/assertion: 4 desk cards + 20 messages render correctly | ✅ passed (desk cards and conversation view ship) |
+| V4 | DB read/write succeeds | Write one message via the server API and read it back | ✅ passed |
+| V5 | Demo mode | Demo project opens from the UI action bar, data is deterministic and matches the fixtures | ✅ passed |
+| V6 | WS push updates the UI | Push one `member.status` frame; the card state changes | ✅ passed |
+
+> Any checkpoint that blocks (especially V1) must be escalated to main immediately. **Silent degradation of
+> the plan is forbidden.**
+
+---
+
+## 2. M1 — Real state ingestion, workstation view online
+
+| Item | Content |
+| --- | --- |
+| **Owner** | coder (primary), tester (real-time and state-correctness focus), researcher (state-semantics acceptance criteria), leader (integration) |
+| **Dependency** | M0 complete; researcher's state-semantics definition signed off (blocking rules for `busy` / `blocked`) |
+| **Deliverables** | See §2.2. The state contract is in §2.1 |
+
+### 2.1 The three-state contract (implemented)
+
+`AGENT_STATES = ['busy', 'idle', 'blocked']` in `shared/index.js` and `shared/index.d.ts`.
+
+| State | Source of truth | Cleared by |
 | --- | --- | --- |
-| V1 | 依赖装好 + **electron-rebuild 原生模块构建成功** | `npm i` 后 `npx @electron/rebuild` 成功；Node 侧 `require('better-sqlite3')` 建表插入查询成功 |
-| V2 | Electron 窗口起来 | `npm run dev` 出现主窗口，两个 Tab 可见 |
-| V3 | 两个界面 mock 渲染 | 截图/断言：4 张工位卡片 + 20 条对话记录渲染正确 |
-| V4 | DB 读写成功 | 通过 server API 写入并读回一条消息 |
-| V5 | demo 模式 | `npm run dev -- --demo` 或 `MOCK=1` 启动，数据与 mock 一致且确定 |
-| V6 | WS 推送更新 UI | 手动推一条 `member.status`，卡片状态变化 |
+| `busy` | a task for that member/session has `tasks.state = 'running'` | task end (`done` / `failed` / `cancelled`), or session reconciliation closing an orphaned running task as `cancelled` |
+| `blocked` | a row in `session_status` with `state = 'blocked'` (explicit authorization wait) | task progress, task end, session end, or an idle notification |
+| `idle` | no running task and no blocked row for that session (no row at all) | — |
 
-> 任一节点阻塞（尤其 V1 electron-rebuild 失败）**立即上报 main，不得静默降级方案**。
+Derivation and display rules, as implemented:
+
+1. A `pending` task does not make anyone busy. A member with only pending work is `idle`.
+2. "Thinking" and "waiting for the model" are part of a running task; there is no separate state for them.
+3. Member-card aggregation in `buildMemberCard` uses priority `blocked > busy > idle`; for equal priority the
+   earliest `stateSince` wins. `stateSince` drives the elapsed-time display.
+4. The renderer (`renderer/src/lib/memberTask.js`, `memberForSession`) follows a session-scoped rule for the
+   selected session: `blocked (same session) > running task (same session) > borrowed summon busy > idle`.
+   Unknown state values normalize to `idle`.
+5. A resident gremlin may borrow `busy` from a same-named ephemeral ghost while that ghost is working. This is
+   the **only** row allowed in `agent_status` (`state CHECK = 'busy'`). It is a display state, not task
+   liveness.
+6. Blocked is session-scoped: a blocked session does not block the member's other sessions.
+7. "Last active" comes from task start/end timestamps: `lastTaskAt` is the latest `MAX(started_at, ended_at)`
+   for the member; `lastTaskAtBySession` holds the per-session values. There is no heartbeat-based
+   "last seen".
+8. The server does **not** infer or cancel tasks from elapsed time, heartbeat loss or TTL. The only cleanup is
+   an explicit session-list reconciliation (`pruneSessionStatuses` closes running tasks of sessions that no
+   longer exist as `cancelled`).
+9. The WebSocket ping (30 s interval, `DEFAULTS.WS_HEARTBEAT_TIMEOUT_MS = 60 s`) is **transport-only**. HTTP
+   polling after a WS drop is a connection fallback and likewise not a state signal.
+10. On-disk floor readers may use file mtimes and idle windows (e.g. `IDLE_MS = 10 min` in
+    `server/src/floors.js`) to describe a **session's** activity phase on the main console. That is inferred
+    session activity, not a workstation state and not a member heartbeat.
+
+### 2.2 Deliverables and honest status
+
+1. **A-route**: `chokidar` watcher + parser (roster + mailbox). **Not implemented** — zero source references;
+   `chokidar` is only declared as a dependency.
+2. **B-route**: HTTP ingest + `packages/reporter` SDK/CLI. **Implemented**: `/api/v1/register`, `task/start`,
+   `task/progress`, `task/end`, `task/tokens`, `task/current`, `message`, `file/touch`, `tool/use`, `ghost`,
+   `hook`. There is no heartbeat or status endpoint, by design.
+3. **SQLite persistence** (members / agent_status / session_status / tasks / messages / file_activity /
+   artifacts). **Implemented.** `agent_status` and `session_status` are deliberately narrow: busy-only and
+   blocked-only respectively.
+4. **`snapshot` + `member.status` WebSocket push** (200 ms merge window). **Implemented**; the envelope is
+   protocol v2 with a `project` field.
+5. **Three-state shared types and DB schema** — `busy / idle / blocked` only. **Implemented**, including the
+   in-place migration that rebuilds legacy tables and drops `members.last_seen_at`.
+6. **State derivation + aggregation** (session-scoped blocked, priority, `stateSince`, borrowed busy).
+   **Implemented** and covered by state-related suites (`renderer/test/memberTask.test.mjs`,
+   `server/test/agentRoster.test.js`, `server/test/sessionCompact.test.js`, among others).
+7. **Connection strip** distinguishing transport source (`ws` vs `poll`) and per-field provenance
+   (reported / inferred / demo). **Implemented**; there is no third "degraded" value to display.
+8. **Archive retention** (90 days / 100k messages per project, export to JSONL before deleting).
+   **Not implemented**; only a retention-days setting and manual purge exist.
+9. **Message redaction**: regex redaction to `***` before insert, with the original never stored (7 rule
+   classes, requirements §P0-7), and a "this message was redacted" UI marker. **Not implemented**; no
+   interception point exists, so messages are stored in plain text today.
+10. **Progress honesty**: `tasks.progress` is stored and returned, but no progress bar is rendered. The old
+    three-layer derivation (reported → subtask-derived → striped indeterminate bar) was **dropped**, matching
+    the product decision that no fake progress is allowed.
+11. **File read/write distinction**: `file_activity.op` supports `read` and `write` only; the planned `edit`
+    value was retired. UI icons/colour bars for `read`/`write` exist.
+12. **Layout thresholds**: automatic compact mode at ≥5 members, pagination/collapse at >16 members,
+    overridable thresholds. **Not implemented**.
+13. **In-app alerts**: not implemented. Any acceptance wording that tied alerts to the removed states is
+    deleted with them.
+
+### 2.3 Acceptance criteria
+
+- **State rendering**: only `busy / idle / blocked` render; unknown values normalize to `idle`; no fifth
+  state, no synthetic secondary flag. The desk card labels map to "忙碌" / "空闲" / "阻塞".
+- **Busy correctness**: busy appears only when a task in that session is `running`; a `pending` task leaves the
+  member idle; "thinking" does not produce a separate state.
+- **Blocked correctness**: blocked appears only for an explicit authorization wait in the same session, and
+  clears on progress, task end, session end or an idle notification.
+- **Session isolation**: 16 concurrent members/sessions with no cross-talk (SC-07 / SC-23); switching the top-bar
+  session changes the console phase without bleeding into another session.
+- **Aggregation**: priority `blocked > busy > idle`; ties broken by earliest `stateSince`.
+- **Borrowed busy**: only a same-named ephemeral ghost can lend `busy`; the resident returns to idle when the
+  ghost finishes.
+- **Last active**: derived from task start/end only; no heartbeat-driven value anywhere in cards or APIs.
+- **Real-time**: RT-01 propagation P95 ≤ 300 ms; RT-03 / RT-04 pass; RT-05 high-frequency jitter has a
+  before/after comparison.
+- **Tests**: DB-01–DB-10 pass; `kill -9` recovery loses at most 1 s; the state suites above stay green under
+  `npm run test:all` (73/73 suites, ~58 s).
+- **Redaction (blocked until implemented; three layers, UI hiding does not count)**:
+  a) no plaintext exists on the **write connection** path — construct a secret-bearing message and grep the
+  table, `.db` and `.db-wal`;
+  b) after deleting through the **delete connection**, grep again — no recognizable fragment may remain in
+  the freelist or WAL;
+  c) throughput and latency still hold under load, proving the dual-connection design;
+  d) **negative control**: deliberately turn `secure_delete` off and confirm step (b) fails, proving the
+  assertion has detection power. SEC-01–SEC-07 and SEC-12 must pass when this lands.
+- **Virtual-list spike** (`SPIKE-01–08`, first week of M1): DOM ≤ 80 nodes, scroll ≥ 55 fps with a 40 fps
+  floor, first render ≤ 500 ms, memory growth ≤ 200 MB, 100 appends/s at the tail still ≥ 50 fps, 100k-row
+  search ≤ 300 ms, filter switch ≤ 200 ms, a 1 MB message does not freeze the UI. **Not started.**
+- **Chinese tokenization spike** (`SPIKE-09–12`, end of M1): trigram conclusion recorded, Chinese corpus
+  search < 200 ms, 1–2 character fallback to `LIKE` behaves correctly, and the FTS tokenizer is configurable
+  (contract 7.19). **Not started**; FTS is not wired at all.
+- **Manual smoke** (there is no Playwright E2E): with a real agent running, state refresh is visible and
+  matches the desk card.
+
+### 2.4 Risks
+
+1. Reporter instrumentation needs cooperation from the agent side; if an agent cannot be changed, its
+   progress/files/elapsed time remain placeholders.
+2. High-frequency state flapping can cause UI flicker and performance problems (mitigated by the 200 ms
+   merge window; still a tester focus).
+3. Redaction regexes may damage normal code/logs (needs a false-positive baseline and an off switch).
+4. Session-scoped state is correct only if every hook carries a session id; a missing session id collapses
+   several sessions into one display slot.
 
 ---
 
-## 2. M1 — 真实状态接入，工位视图上线
+## 3. M2 — Conversation window + persistence and recovery
 
-| 项 | 内容 |
+| Item | Content |
 | --- | --- |
-| **责任人** | coder（主），tester（实时性/状态正确性专项），researcher（状态语义验收标准），leader（整合） |
-| **依赖** | M0 完成；researcher《状态语义定义》定稿（阻塞 `busy/blocked` 判定规则） |
-| **交付物** | 1. A 路线：`chokidar` watcher + parser（roster + mailbox 收件）<br>2. B 路线：HTTP ingest + `packages/reporter` SDK/CLI 实现<br>3. SQLite 落库（members / agent_status / tasks / messages / file_activity / artifacts）<br>4. `snapshot` + `member.status` WebSocket 推送<br>5. 5 主状态 + `degraded` 正交标志的 shared 类型与 DB schema 落地<br>6. 连接状态条：区分「上报值 / 推断值 / degraded」<br>7. 无心跳 60s → degraded 灰显<br>8. 消息归档保留策略落地（90 天 / 单 team 10 万条，超限先导出 JSONL 再删）<br>9. **消息脱敏启用**：入库前正则脱敏为 `***`，原文不入库（7 类规则，见需求 §P0-7），UI 标「本条已脱敏」<br>10. **进度三层降级**落地：上报 → 子任务推导（标「推导」）→ 条纹不确定进度条（禁止显示 0%/100%）<br>11. **文件读写区分**：`file_activity.op` 三值 + UI 图标/色条<br>12. **布局阈值**：≥5 人自动紧凑模式、>16 人按 team 分页/折叠、阈值可设置覆盖<br>13. **站内告警提示**（S1 级：阻塞 / 出错 / 离线 >60s）走连接条 + 卡片红点 |
-| **DoD** | 引用 `test-strategy.md` §6 **M1 + M3**：<br>- 5 主状态 + degraded 全覆盖渲染；SC-01~SC-10 通过<br>- **RT-01 实时性 P95 ≤ 300ms**；RT-03/RT-04 通过；RT-05 高频抖动专项（附前后对比）<br>- 16 成员并发无串台（SC-10）；≥5 人紧凑模式、>16 分页正确<br>- **脱敏用例全通过：7 类规则命中且原文不落库；误伤率与漏判率有量化结果**
-- **脱敏必须通过「绕过 UI」的三层断言**（**只验 UI 隐藏不算通过**）：
-  a) **写入连接**路径下**不存在明文** —— 构造含密钥的消息，直查表 + grep `.db` + grep `.db-wal` 均不得命中；
-  b) 走**删除连接**删掉该消息后再次 grep `.db` 与 `.db-wal`，freelist 与 WAL 中**不得残留可识别片段**；
-  c) 压测期间（1000 事件/s）吞吐与延迟仍达标，证明**双连接方案生效**（安全与吞吐不互相牺牲）；
-  d) **反向用例（必须有）**：故意关闭 `secure_delete` 跑一遍，确认 b) 的 grep 会**失败** —— 证明该断言真有检出能力，不是假阳性
-- **虚拟列表 spike 必须在 M1 第一周完成**：`SPIKE-01~08` 全过（DOM ≤80、滚动均 ≥55fps/最低 ≥40fps、首次渲染 ≤500ms、内存增量 ≤200MB、尾部 100 条/秒追加仍 ≥50fps、10 万条搜索 ≤300ms、过滤切换 ≤200ms、1MB 大消息不卡死），**选型结论入库，早于对话窗口开发**
-- **中文分词 spike（SPIKE-09~12）在 M1 末完成**：trigram 结论入库、中文语料搜索 <200ms、1~2 字降级 `LIKE` 行为正确（要求 coder 提供 **FTS tokenizer 可配置**（契约 7.19），否则无法做对照与后续迁移）
-- **进度三态 `PRG-01~08` 全过**，其中 **`PRG-02`「不伪造 0%/100%」为硬阻塞**
-- **通知 `NOT-*` 全过**，其中 **`NOT-02`（S2 事件不得弹通知，逐条负向断言）进 M1 硬阻塞**；`NOT-11`（静音/免打扰期间状态仍刷新）
-- **脱敏 `SEC-01~07、SEC-12` + 三层验证为 M1 硬阻塞**；要求 coder 提供 `Redactor` 纯函数模块 + 规则集可注入 + **关闭开关**（契约见 tester 附录 C）<br>- **进度三层降级三种来源均正确渲染，无上报时不出现 0%/100%**<br>- DB-01~DB-10 通过，`kill -9` 恢复丢失窗口 ≤1s<br>- L4 冒烟：真实启动下状态实时刷新可见 |
-| **风险** | ① reporter 埋点需 agent 端配合，若 agent 端不可改则进度/文件/耗时仍需占位符；② 高频状态抖动导致 UI 闪烁与性能问题；③ **脱敏正则误伤正常代码/日志**（需误伤率基线与可关闭开关） |
+| **Owner** | coder (primary), tester (message integrity + 100k-row load test), leader (integration) |
+| **Dependency** | M1 complete |
+| **Deliverables** | 1. Full message persistence and incremental push (`dedupe_key` idempotency, no loss, no duplication). **Implemented**<br>2. Filtering: member multi-select + time range + message type. **Implemented**<br>3. Keyword search via SQLite **FTS5 + `trigram`** tokenizer, with **1–2 character queries falling back to `LIKE`** limited to a time range. **Not implemented** (virtual table exists; `listMessages` always uses `LIKE`)<br>4. Virtual scrolling + pull-up history. **Not implemented**<br>5. Auto-follow scrolling + pause on manual scroll-up + "N new messages" notice. **Partially implemented** (conversation view exists; explicit pause/notice behaviour unverified)<br>6. Message detail and raw JSON view. **Implemented**<br>7. `events` table live (audit/replay foundation). **Table exists, no writer callers**<br>8. **M2 spike (at milestone start)**: trigram Chinese recall measurement + 100k-row virtual-scroll load test; evaluate jieba pre-tokenization only if recall is insufficient. **Not started** |
+| **Acceptance** | - MS-01–MS-04, MS-06–MS-12 pass (MS-05 under the virtual-scroll scope below)<br>- **MS-05: at 100k rows, DOM ≤ 80 nodes, scroll ≥ 55 fps, memory growth ≤ 200 MB**<br>- Filter/search combinations match the specification (boundary semantics documented)<br>- Filter/search response < 200 ms at 10k rows<br>- Real send/receive smoke of 1000 messages with no loss and no duplicates (manual, no Playwright)<br>- DB-01–DB-10 pass; crash recovery has an automated test; migration scripts have forward-compatibility tests<br>- Retention: the days setting and manual deletion work; the export-to-JSONL-before-delete archive flow is still open |
+| **Risks** | Virtual scrolling and Chinese FTS5 tokenization (may fall back to `LIKE` or bigram); message volume growth without automatic archiving |
 
 ---
 
-## 3. M2 — 对话记录窗口 + 持久化与恢复
+## 4. M3 — Packaging, distribution and enhancements
 
-| 项 | 内容 |
+| Item | Content |
 | --- | --- |
-| **责任人** | coder（主），tester（消息完整性专项 + 10 万条压测），leader（整合） |
-| **依赖** | M1 完成 |
-| **交付物** | 1. 消息全量入库与增量推送（`dedupe_key` 幂等，不丢不重）<br>2. 过滤：成员多选 + 时间范围 + 消息类型<br>3. 关键字搜索（SQLite **FTS5 + `trigram` 分词器**；**1~2 字短查询自动降级 `LIKE`** 并限定时间范围控开销）<br>4. 虚拟滚动 + 上拉加载历史<br>5. 自动跟随滚动 + 手动上滚暂停 + 「N 条新消息」提示<br>6. 消息详情与原文 JSON 查看<br>7. `events` 表启用（审计/回放基础）<br>8. **M2 spike（里程碑启动时就做）**：trigram 中文召回实测 + 10 万条虚拟滚动压测，召回不足再评估 jieba 预分词 |
-| **DoD** | 引用 `test-strategy.md` §6 **M2 + M3**：<br>- MS-01~MS-04、MS-06~MS-12 通过<br>- **MS-05：10 万条下 DOM 节点 ≤80、滚动 ≥55fps、内存增量 ≤200MB**<br>- 过滤/搜索组合行为与规格一致（边界语义已文档化）<br>- 1 万条下过滤/搜索响应 <200ms<br>- L4：真实收发 1000 条消息不丢不重<br>- DB-01~DB-10 通过；崩溃恢复有 L4 自动化用例；迁移脚本有向前兼容测试 |
-| **风险** | 虚拟滚动与 FTS5 中文分词（需确认分词方案，可能退化为 LIKE 或 bigram） |
+| **Owner** | coder (primary), tester (three-platform matrix + long-run stability), leader (integration) |
+| **Dependency** | M2 complete |
+| **Deliverables** | 1. `electron-builder`: Linux **AppImage/deb**, Windows **nsis**, macOS **dmg** (**x64 only**, script parameters without hard-coded architecture). **Not integrated**: `electron-builder.yml` exists, but `npm run build` only builds the renderer<br>2. Multi-project switching within one workspace. **Implemented ahead of schedule** (project is the domain unit; recent projects persisted)<br>3. ECharts project timeline and throughput charts. **Not implemented**<br>4. Session export to Markdown / JSONL. **Not implemented**<br>5. Dark theme. **Not implemented**<br>6. Lightweight actions: mark read, export, copy original text. **Not implemented**<br>7. **System notifications and do-not-disturb**: S1-level events only; system notifications on by default, sound off by default; **do-not-disturb off by default** + a `22:00–08:00` template; aggregate same-member + same-fault-type events into one notification per 5 minutes; events that occurred while the app was not running are merged into "N events while you were away"; **notify only when unfocused, in-app only when focused**. **Not implemented**<br>8. **Redacted original-text viewing channel (off by default)**: OS keychain (`keytar`) holds the data key, with passphrase-derived (scrypt/argon2) fallback; original and body **in separate tables with independent encryption**; **re-authorize every session, never remember unlock state**; views are recorded in the event log. **Not implemented** |
+| **Acceptance** | - DS-01–DS-13 pass; three-platform x64 matrix green<br>- Silent install/upgrade/uninstall automation covered<br>- **macOS: written waiver Q11 accepted** — reduced to **ad-hoc signing**; the release page / README / release notes / in-app "About" page all state "not notarized; on first launch right-click → Open / System Settings → Privacy & Security → Open Anyway". A written waiver record is enough to ship<br>- **8-hour stability run**: RSS growth < 20%, no handle leaks, no crashes<br>- Release checklist signed |
+| **Risks** | ~~macOS notarization needs a developer account~~ → **Q11 written waiver, not blocking**; residual risk is first-launch friction, covered by the four disclosure locations. Notification acceptance must not reintroduce removed state triggers: only real faults and prolonged `blocked` waits are eligible, never a liveness timeout. |
 
 ---
 
-## 4. M3 — 打包分发与增强
+## 5. M4 — Reverse control (conservative) and watcher productionization
 
-| 项 | 内容 |
-| --- | --- |
-| **责任人** | coder（主），tester（三平台 matrix + 长稳），leader（整合） |
-| **依赖** | M2 完成 |
-| **交付物** | 1. `electron-builder`：Linux **AppImage/deb**、Windows **nsis**、macOS **dmg**（**仅 x64**，脚本参数化不硬编码架构）<br>2. 多 team 切换（单 workspace 内）<br>3. ECharts 团队时间线与吞吐图<br>4. 会话导出 Markdown / JSONL<br>5. 暗色主题<br>6. 轻量动作：标记已读、导出、复制原文<br>7. **系统通知与免打扰**：仅 S1 级触发；系统通知默认开、声音默认关；**免打扰默认关闭** + `22:00–08:00` 模板一键启用；同成员+同故障类型 5 分钟聚合 1 条；离线期间不重复、上线合并为「离线期间发生 N 次」；**失焦才弹系统通知，聚焦只走站内**<br>8. **脱敏原文查看通道（默认关闭）**：OS 钥匙串（keytar）保管数据密钥，口令派生（scrypt/argon2）降级；原文与正文**分表 + 独立加密**；**每次会话重新授权、不记住解锁状态**；查看记事件日志 |
-| **DoD** | 引用 `test-strategy.md` §6 **M4**：<br>- DS-01~DS-13 通过；三平台 x64 matrix 绿<br>- 静默安装/升级/卸载自动化覆盖<br>- **macOS：Q11 书面豁免已接受** —— 降级为 **ad-hoc 签名**，发布页 / README / release notes / 应用内「关于」页**四处均明示**「未公证，首次启动需右键 → 打开 / 系统设置 → 隐私与安全性 → 仍要打开」，有书面豁免记录即可放行<br>- **8 小时长稳**：RSS 增长 <20%、无句柄泄漏、无崩溃<br>- 发布 checklist 签字完成 |
-| **风险** | ~~macOS 公证需开发者账号~~ → **Q11 已书面豁免，不阻塞**；残余风险为用户首次启动摩擦，已由四处明示文案兜底 |
+> Decided: **do it, but only the most conservative layer**.
 
----
+**Reverse-control scope (two items only)**
 
-## 5. M4 — 反向控制（保守版）与目录监听生产化
+1. **Deliver a task message** to a specified member (dispatch);
+2. **Interrupt the current task** (send an interrupt signal).
 
-> 已拍板：**做，但只做最保守一层**。
+**Explicitly not doing**: code-level intervention, breakpoints/prompt rewriting, retry policy, direct
+manipulation of user files.
 
-**反向控制范围（仅两项）**
-1. 向指定成员**投递任务消息**（派活）；
-2. **中断当前任务**（发中断信号）。
+**Constraints**: every reverse operation requires **UI confirmation** and is recorded in the event log
+(`events` table; the table exists but no writer is wired yet). Not implemented in M0–M3; the architecture
+reserves a command channel (bidirectional WS is already in place).
 
-**明确不做**：代码级干预、断点/改 prompt、重试策略、直接操作用户文件。
+**Remaining content**
 
-**约束**：所有反向操作必须 **UI 二次确认** + **记入事件日志**（`events` 表）。M0~M3 不实现，架构上预留指令通道（WS 双向已在选型中预留）。
-
-**其余内容**
-- **目录监听生产化**：`FW-01~FW-12` 通过（Linux + Windows + macOS 各跑 FW-01/03/05/08）；降级轮询模式有 UI 提示与自动化验证。
-- **多 workspace**：架构预留，未排期。
+- **Watcher productionization**: `FW-01–FW-12` pass (run FW-01/03/05/08 on Linux + Windows + macOS); the
+  polling fallback has a UI notice and automated verification. Depends on the A-route watcher, which has zero
+  code today.
+- **Multi-workspace**: architecture reserved, not scheduled.
 
 ---
 
-## 5.1 议事厅 —— 已交付的**独立一片**（2026-10-01）
+## 5.1 Council — a delivered **independent slice** (2026-10-01)
 
-> **它不是 M4 的第一片**。放在这里只是因为它同样涉及"服务端主动起进程"，容易被顺手归到 M4 里去 ——
-> 归属错了，后面排期就会按 M4 的验收标准来要求它。能力边界以 `requirements.md` §15 为准。
+> **It is not the first slice of M4.** It is placed here only because it also involves "the server starts
+> processes", which makes it easy to file under M4 by mistake — and a wrong home would later hold it to M4's
+> acceptance criteria. The capability boundary is defined by `requirements.md` §15.
 
-**是什么**：选定几个楼层，就一个议题开一场多轮**评审**。角色固定：一名主持人、一名主答、若干评审
-（同一楼层不能兼任）。第 0 轮主持人拆题与分工，第 1 轮主答提案，之后每轮「主答修订 → 评审独立给出
-结构化意见 → 主持人汇总并给出硬修改指令」，跑满轮数后主持人裁决、主答交付最终稿。**没有投票、没有
-阈值、不靠多数同意**；收敛度由服务端按严重度与冲突数机械计算，模型自报的分数一律忽略。
+**What it is**: pick a few floors and run a multi-round **review** of one topic. Roles are fixed: one
+moderator, one main answerer, and one or more reviewers (a floor cannot play two roles). Round 0 has the
+moderator break down the topic and assign focus; round 1 has the main answerer propose; after that each round
+is "main answerer revises → reviewers give independent structured opinions → moderator summarises and issues
+hard revision directives". After the configured rounds the moderator adjudicates and the main answerer
+delivers the final draft. **No voting, no threshold, no majority agreement**; the convergence score is
+computed mechanically by the server from severity and conflict counts, and model-reported scores are ignored.
 
-| | 议事厅 | M4 / P2-1 反向控制 |
+| | Council | M4 / P2-1 reverse control |
 | --- | --- | --- |
-| 对谁下手 | 新起的、一次性的进程（**一律只读工具**） | **正在被监控的会话**（你的 Codex / Claude 会话） |
-| 做什么 | 只讨论，产出文本 | 派活 / 中断那些人正在用的会话 |
-| 状态 | ✅ 已交付（7 层：真机跑通 1F / 2F / 4F / 8F；3F 参数已验、模型调用受本机登录态限制；6F / 7F 待验） | ❌ 未开工，本文 §5 的范围一字未改 |
+| Target | New, one-off processes (**read-only tools only**) | **Sessions being monitored** (your Codex / Claude sessions) |
+| Action | Discuss only, produce text | Dispatch / interrupt sessions people are using |
+| Status | ✅ Delivered (verified on-machine: 1F / 2F / 4F / 8F; 3F parameters verified, model call limited by local login state; 6F / 7F pending) | ❌ Not started; §5 scope unchanged |
 
-**交付物**：`server/src/council/`（`agents.js` 七层命令行配方 / `floors.js` 可选楼层探测 /
-`runner.js` 单次调用与超时 / `parse.js` 结构化输出解析 / `convergence.js` 收敛度与一致性核对 /
-`prompt.js` 拼提示词 / `materials.js` 内联材料 / `report.js` 报告与 CSV/Markdown /
-`orchestrator.js` 状态机）+ `http/routes/council.js`、
-`renderer/src/views/CouncilView.vue` + `stores/council.js` + `lib/councilTimeline.js`、
-七张 `council_*` 表、12 个 `test:council-*` 脚本（解析 / 收敛度 / 报告 / 存储 / 配方 / 单次调用 /
-编排 / 材料 / 路由 / 插件静默 / 时间线 / 界面 store）。实现细节与真机观察见
-`implementation-status.md` §4.2。
+**Deliverables**: `server/src/council/` (`agents.js` seven-floor command recipes / `floors.js` optional floor
+detection / `runner.js` single call and timeout / `parse.js` structured-output parsing / `convergence.js`
+convergence and consistency checks / `prompt.js` prompt assembly / `materials.js` inline materials /
+`report.js` report plus CSV/Markdown / `orchestrator.js` state machine) + `http/routes/council.js`, `renderer/src/views/CouncilView.vue` + `stores/council.js` + `lib/councilTimeline.js`, seven `council_*` tables, and 12 `test:council-*` scripts (parsing / convergence / report / storage / recipes / single call / orchestration / materials / routes / plugin silence / timeline / UI store). Implementation details and on-machine observations are in `implementation-status.md` §4.2.
 
-**2026-10-02 补的"在哪儿谈"**（排期外，用户提出"要能在同一个工程目录下讨论"）：
-`workspace_path`（隔离临时目录 / **真实工程目录 + 只读工具**）。边界、隔离上的两道锁、真机验证结论
-都写在 `requirements.md` §15.3 与 `implementation-status.md` §4.2；用例见 `test-strategy.md` §3.16。
+**2026-10-02 addition — "where to talk"** (outside the original schedule; the user asked to discuss inside
+the same project directory): `workspace_path` (isolated temp directory / **real project directory + read-only
+tools**). Boundaries, the two isolation locks, and on-machine verification results are in
+`requirements.md` §15.3 and `implementation-status.md` §4.2; cases are in `test-strategy.md` §3.16.
 
-**2026-10-19 重构**：用户要求取消投票、改为主持人 / 主答 / 评审的评审流程。原来的 `mode`
-（`vote` / `analysis`）与计票、阈值一并删除；旧议事厅表结构不做兼容，启动时直接重建。收敛度改为
-`clamp(100 − (25b + 8m + 2n + 10c), 0, 100)`，每轮落一个 `RoundResult`，报告落盘 JSON / CSV / Markdown。
-同一轮真机故障（1F 第 0 轮 CLI 截断输出）之后补了两件事：**任何必需回合答不上来立即结束**
-（不再空跑后续轮次，已产出的照常归档），以及发起后即可见的**「工作中」标识**
-（楼层 / 阶段 / 轮次，WS + 详情接口，刷新不丢）。
+**2026-10-19 refactor**: the user asked to remove voting and move to a moderator / main answerer / reviewer
+flow. The old `mode` (`vote` / `analysis`), vote counting and thresholds were deleted; old council tables are
+not migrated and are rebuilt at startup. Convergence became
+`clamp(100 − (25b + 8m + 2n + 10c), 0, 100)`, each round stores one `RoundResult`, and reports are written as
+JSON / CSV / Markdown. After an on-machine failure in the same round (1F round 0 CLI truncated output), two
+things were added: **any required turn that cannot answer ends the meeting immediately** (later rounds are
+not burned; what was produced is archived), and a **"working" indicator** visible right after start (floor /
+phase / round, over WS + the detail endpoint, surviving refresh).
 
-**遗留（不阻塞，等实际用几场再定）**：
+**2026-10-21 note**: the council's "working" strip is **not** a workstation state. Council participants are
+one-off read-only processes and never appear in the office, member cards or task records; the council is
+unaffected by the three-state refactor. The live strip keeps its own floor/phase/round fields.
 
-- `max_rounds`（缺省 3、硬顶 8）是初值，可能要开几场才知道合不合适；每轮是否该要求评审给出
-  最少 N 条意见**目前没有下限**（只把"一条都没给"记成 warning），先保持宽松；
-- 议事厅的词元**不进 `task_runs` 的词元汇总**（只存在自己的表里）—— 要不要计入，未定；
-- 7F Kilo Code / 6F Qoder 尚未真机跑过**一场完整的会**（1F / 2F / 4F / 8F 已跑通；3F 的参数已按真机
-  `codex --help` 对齐，模型那一步因本机 Codex 登录态无效没走完）。6F 本机没装 CLI，配方按官方文档写；
-  工程模式下 6F 的办公室隔离（`--name` 标题是否也进 transcript）待装好 CLI 的机器上确认；
-- **工程模式的真机验收还没做**（"回答里出现真实文件名"、"跑完 `git status` 干净"、
-  "办公室看不到参与者"三条见 `test-strategy.md` §3.16.2）。
+**Open items (non-blocking; decide after a few real meetings)**
+
+- `max_rounds` (default 3, hard cap 8) is an initial value; whether each reviewer must produce at least N
+  comments **has no lower bound yet** (only "no comments at all" is recorded as a warning) — deliberately
+  loose for now.
+- Council tokens **do not enter the `task_runs` token totals** (they live only in council tables); whether
+  they should count is undecided.
+- 7F Kilo Code / 6F Qoder have not run **a full meeting** on a real machine (1F / 2F / 4F / 8F have; 3F
+  parameters were aligned with the local `codex --help`, but the model step did not complete because the
+  machine's Codex login state was invalid). 6F's CLI is not installed on this machine; its recipe follows the
+  official documentation. In workspace mode, 6F's office isolation (whether the `--name` title also enters
+  the transcript) must be confirmed on a machine with the CLI installed.
+- **Workspace-mode on-machine acceptance is still pending** (the three checks "real file names appear in the
+  answer", "`git status` is clean afterwards", "participants are invisible in the office" are in
+  `test-strategy.md` §3.16.2).
 
 ---
 
-## 6. 责任人矩阵
+## 6. Responsibility matrix
 
-| 里程碑 | coder | tester | researcher | leader |
+| Milestone | coder | tester | researcher | leader |
 | --- | --- | --- | --- | --- |
-| M0 | 主（全部骨架 + demo + 5 条契约） | 契约验收、冒烟、L1 骨架 | 状态语义定稿（M1 依赖，可并行） | 排期、阻塞升级、整合上报 |
-| M1 | 主（A/B 接入 + SQLite + 推送） | 实时性、状态机、DB 恢复专项 | 验收标准与状态语义验收 | 整合方案 |
-| M2 | 主（消息全量 + 过滤搜索 + 虚拟滚动） | 消息完整性、10 万条压测 | 过滤/搜索语义验收 | 整合方案 |
-| M3 | 主（打包 + 增强） | 三平台 matrix、长稳 | — | 发布协调 |
+| M0 | Primary (full skeleton + demo + six contracts) | Contract acceptance, smoke, L1 skeleton | State semantics sign-off (M1 dependency, can run in parallel) | Schedule, blocker escalation, integration reporting |
+| M1 | Primary (B-route ingest + SQLite + push + three-state derivation) | Real-time, state correctness, DB recovery focus | Acceptance criteria and state-semantics acceptance | Integration plan |
+| M2 | Primary (full messages + filter/search + virtual scrolling) | Message integrity, 100k-row load test | Filter/search semantics acceptance | Integration plan |
+| M3 | Primary (packaging + enhancements) | Three-platform matrix, long-run stability | — | Release coordination |
+| M4 | Primary (dispatch/interrupt + watcher productionization) | Reverse-operation safety and audit checks | — | Scope control: keep it to the conservative layer |
+| Council (delivered) | Primary (server orchestration + UI) | Recipe/parse/convergence/timeline cases | Review-quality rubric | Kept out of M4 sequencing |
 
 ---
 
-## 7. 关键依赖链
+## 7. Dependency chain
 
 ```
-researcher《状态语义定义》──┐
-                            ├──> coder M1（状态机 + DB schema）
-M0 electron-rebuild 跑通 ───┘         │
-                                      v
-                            tester M1 实时性/状态正确性专项
-                                      │
-                                      v
-                            coder M2 对话记录 ──> tester M2 压测
-                                      │
-                                      v
-                            coder M3 打包 ──> tester M3 三平台 matrix
+researcher state-semantics definition ──┐
+                                        ├──> coder M1 (three-state model + DB schema)
+M0 electron-rebuild green ──────────────┘         │
+                                                  v
+                                        tester M1 real-time/state-correctness focus
+                                                  │
+                                                  v
+                                        coder M2 conversation records ──> tester M2 load test
+                                                  │
+                                                  v
+                                        coder M3 packaging ──> tester M3 three-platform matrix
 ```
 
-**最高风险项（按优先级）**：
-1. **`better-sqlite3` + `@electron/rebuild` 构建失败（M0-V1）—— 当前最高风险，且 V1 尚未产出结果**。V1 阻塞 M0~M3 全链路（DB 是唯一存储层）。
-   - **备选降级路径（按顺序，须 main 书面批准，禁止静默降级）**：
-     ① **`node:sqlite`**（Node 内置，免编译原生模块）—— 需验证 Electron 38 内置 Node 版本是否启用该模块、以及功能是否够用（FTS5 trigram 是硬需求，`node:sqlite` 的 FTS5 支持需实测）；
-     ② **server 层移出 Electron 主进程**（改为独立 Node 子进程，主进程通过 HTTP/IPC 与之通信）—— 彻底绕开原生模块重建，代价是进程模型与打包形态变复杂（需随应用分发一个 Node 运行时或要求系统 Node）。
-   - 触发条件：V1 在本机（Linux x64）连续失败且无可行修复方案时启用。
-2. reporter 埋点需要 agent 端配合，若不可改则「进度/当前文件/已耗时」退化为占位符（影响 M1 核心价值）。
-3. 10 万条虚拟滚动性能；中文 FTS5 采用 `trigram` 后**短词（1~2 字）召回差**，需 `LIKE` 降级兜底（M2，spike 前置验证）。
-4. ~~macOS 公证~~ → **Q11 已书面豁免，风险关闭**。
-5. ~~`secure_delete` 拖垮写入吞吐~~ → **已裁决：双连接方案，两个指标都不放宽**（写入连接 OFF / 删除归档连接 ON）。残余风险：归档删除若高频，删除连接的 `TRUNCATE` checkpoint 可能造成瞬时卡顿 —— 届时走「归档批量化 + 降频（同步改异步批处理）」，**不削弱安全项**。
-6. 脱敏正则**误伤正常代码/日志**（M1，需误伤率基线与可关闭开关）。
-7. **语言栈偏差 —— 已裁决：方案 A（切回 TypeScript），带硬前提与安全阀**（main 2026-09-14）。coder 当前以 CommonJS **JavaScript** 实现（`jsconfig.json`），拍板选型为 **TypeScript**（§7 决策 2）。
-   - **决策理由**（三条实质依据，非沉没成本）：① 本项目是**协议密集型**（Envelope / 十几种 message type / agent 上报接口 / 前端订阅格式），字段名写错只能运行时发现，而这类 bug 在「实时状态流」下极难复现定位，类型化契约是**随规模放大收益**的设计点；② 现在 6 个文件，迁移成本最低，等 30 个文件铺开就是重写，**不允许既成事实绑架决策**；③ tester 评估约 80% 用例与语言无关、测试侧改回 TS 成本 ≈0，成本全在 coder 侧，性价比高。
-   - **硬前提：语言栈优先级严格低于 V1**。V1（依赖安装 + `electron-rebuild`）出结果前，**禁止投入任何时间做 TS 迁移**——V1 不过则 Electron 方案本身可能变更（`node:sqlite` / server 独立进程），届时 TS 讨论作废。**顺序：V1 先过 → 再切 TS**。
-   - **安全阀：TS 迁移总耗时上限 1 天**（`tsconfig` + `vite` 配置 + 现有 6 文件改 `.ts` + 类型化契约）。超时或 TS 工具链与 `electron-rebuild` 冲突 → **立即上报**并切方案 B。
-   - **触发切 B 的条件**：coder 判断迁移 > 1 天；或 TS 工具链与 `electron-rebuild` 产生冲突。切 B 后须带 tester 的三个前置：`checkJs: true` 且**至少开 `strictNullChecks`**；引入运行时 schema 校验库做 IPC 契约；eslint 补 `no-undef` / `eqeqeq` / 异步相关规则。
-   - 无论 A/B，**硬底线不变：不为语言问题让 M0 阻塞超过 1 天**。
+The M1 state contract is already implemented and is the base every later milestone reads from. M2 and M3 do
+not depend on the unfinished A-route watcher; M4 watcher productionization does.
 
-**待关闭跟踪项（main 指定）**
-| ID | 事项 | 责任人 | 关闭条件 |
-| --- | --- | --- | --- |
-| **T-01** | `server/src/db/index.js` 为 **0 字节**（疑似漏写内容） | coder | 文件写入真实实现，且 V1（`better-sqlite3` + `electron-rebuild`）在本机跑通 |
+**Highest risks (by priority)**
+
+1. **`better-sqlite3` + `@electron/rebuild` build failure (M0-V1) — closed.** V1 passed and the shipped app
+   uses the native module; `npm run db:check` is the regression check. The documented fallbacks (`node:sqlite`,
+   or moving the server out of the Electron main process) remain as contingency only and are not active
+   blockers.
+2. Reporter instrumentation needs agent-side cooperation; without it, "progress / current files / elapsed
+   time" degrade to placeholders (affects M1's core value). Existing hooks cover CodeBuddy, Cline, Codex,
+   Claude Code and Qoder; other floors rely on on-disk readers.
+3. Virtual scrolling at 100k rows; Chinese FTS5 with `trigram` has **poor short-query recall (1–2 characters)**
+   and needs the `LIKE` fallback (M2, validate in a spike first).
+4. ~~macOS notarization~~ → **Q11 written waiver, risk closed**.
+5. ~~`secure_delete` killing write throughput~~ → **decided: dual-connection design, neither metric relaxed**
+   (write connection OFF / delete-archive connection ON). Status: not implemented; today there is a single
+   connection with `secure_delete=ON`. Residual risk: frequent archive deletes plus a `TRUNCATE` checkpoint can
+   cause a momentary stall — batch and lower the frequency of archiving rather than weakening security.
+6. Redaction regexes may damage normal code/logs (M1, needs a false-positive baseline and an off switch).
+   Currently not implemented at all.
+7. **Language-stack deviation — decided: option A (move back to TypeScript), with a hard prerequisite and a
+   safety valve** (main, 2026-09-14). The code is still CommonJS **JavaScript** (`jsconfig.json`); the decision
+   stands but the migration was never executed.
+   - **Rationale** (three substantive reasons, not sunk cost): ① this project is **protocol-heavy** (envelope,
+     a dozen message types, agent reporting API, renderer subscription shapes); a wrong field name is only
+     found at runtime, and such bugs are very hard to reproduce in a live state stream — typed contracts pay
+     off as the codebase grows; ② the migration is cheapest now, and "the code already looks like this" must
+     not dictate the decision; ③ tester estimates ~80% of cases are language-agnostic, so nearly all cost sits
+     on the coder side.
+   - **Hard prerequisite: language-stack work ranks strictly below V1.** That prerequisite is now satisfied,
+     but no migration budget has been spent.
+   - **Safety valve: total migration time cap of 1 day** (`tsconfig` + Vite config + converting files +
+     typed contracts). If exceeded, or if the TS toolchain conflicts with `electron-rebuild`, escalate
+     immediately and switch to option B.
+   - **Conditions for switching to B**: the coder estimates > 1 day, or the TS toolchain conflicts with
+     `electron-rebuild`. Option B requires three tester prerequisites: `checkJs: true` with at least
+     `strictNullChecks`; a runtime schema-validation library for IPC contracts; eslint rules for `no-undef`,
+     `eqeqeq` and async correctness.
+   - Either way, **the hard floor is unchanged: language work must never block M0 for more than one day.**
+
+**Tracking items (main-assigned)**
+
+| ID | Item | Owner | Closure condition | Status |
+| --- | --- | --- | --- | --- |
+| **T-01** | `server/src/db/index.js` was 0 bytes (content apparently missing) | coder | Real implementation written and V1 (`better-sqlite3` + `electron-rebuild`) green on the local machine | ✅ Closed — file is ~76 KB and `npm run db:check` passes |
+| **T-02** | A-route `chokidar` watcher has zero code; floors without hooks are invisible | coder | Watcher + parser run and feed roster/mailbox without a reporter | Open |
+| **T-03** | Message redaction (P0-7) has zero code; messages are stored in plain text | coder | 7 rule classes pass the three-layer assertions in §2.3, with an off switch | Open |
+| **T-04** | FTS5 query is not wired; `listMessages` always uses `LIKE` | coder | Trigram query wired with the 1–2 character `LIKE` fallback, measured < 200 ms | Open |

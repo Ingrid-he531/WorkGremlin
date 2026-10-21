@@ -44,7 +44,7 @@ npm run build        # 构建 renderer 到 renderer/dist
 
 ```bash
 S=workgremlin   # 工程 id；参数名是 --project（代码里已无 team 概念）
-node packages/reporter/src/cli.js --project $S --member coder --state busy
+# 状态不单独上报：`task/start` 使该 session 变 busy，`task/end` 后回到 idle
 node packages/reporter/src/cli.js --project $S --member coder --task "实现工位视图" --progress 0.4 \
   --file renderer/src/components/WorkstationCard.vue
 node packages/reporter/src/cli.js --project $S --member coder --task-end done \
@@ -53,7 +53,7 @@ node packages/reporter/src/cli.js --project $S --member coder --message --to lea
   --type result --subject "产出已提交" --content "工位视图卡片完成"
 ```
 
-上报后工位卡片应实时变化（状态/进度/文件/最近产出）。
+上报后工位卡片应实时变化（状态/文件/最近产出）。
 
 > 不传 `--project` 时，reporter 会跟随服务端「当前打开的工程」（`GET /api/v1/workspace`）；`WORKGREMLIN_PROJECT` 也可覆盖。
 
@@ -72,5 +72,4 @@ node packages/reporter/src/cli.js --project $S --member coder --message --to lea
 
 ## data-testid 约定（tester 选择器依赖，禁止随意改名）
 
-`seat-card-<agentId>`、`seat-status-<agentId>`、`seat-degraded-<agentId>`、`seat-progress-<agentId>`、
-`msg-row-<msgId>`、`conv-list`、`filter-agent`、`search-input`、`watcher-banner`、`archive-notice`。
+`seat-card-<agentId>`、`seat-status-<agentId>`、`msg-row-<msgId>`、`conv-list`、`filter-agent`、`search-input`。

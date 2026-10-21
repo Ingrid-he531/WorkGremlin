@@ -1,980 +1,991 @@
-# WorkGremlin 测试策略
+# WorkGremlin Test Strategy
 
-| 项 | 内容 |
+| Item | Content |
 | --- | --- |
-| 版本 | **v0.4**（状态机与进度用例对齐 `docs/requirements.md` §5 定稿；语言栈待 coder 迁移后再一次性调整） |
-| 编写 | tester |
-| 适用产品 | WorkGremlin —— 多 agent 协作团队的桌面可视化管理/监控程序 |
-| 技术基线 | Electron（main / preload / renderer）+ Vue 3 渲染层 + SQLite 本地落盘 |
-| 里程碑编号 | 统一采用 **coder 主编号 M0–M4**，见 §0 映射说明 |
-| 状态 | 本轮只产出策略与约定，**不写测试代码**；M0 骨架就绪后按本策略落地 |
+| Version | **v0.5** (2026-10-21) — rewritten against the three-state workstation model and the current plain-Node test stack |
+| Author | tester |
+| Product | WorkGremlin — desktop visualization / monitoring app for multi-agent teams |
+| Tech baseline | Electron 38 (main / preload) + Vue 3 + Vite + Pinia renderer; Express + `ws` + better-sqlite3 server; SQLite on disk under `~/.workgremlin/` |
+| Milestones | coder main numbering **M0–M4**, see §0 |
+| Status | Strategy and conventions only. Automated coverage today is **73 plain-Node suites**; sections marked **Planned / Not implemented** are design only and must not be reported as passing |
 
-> **[2026-09-20 实现对齐]** 用例设计与断言仍然有效（尚未执行），先记下两处差异：
-> - **`team_id` → `project_id`**：代码已无 team 概念，凡涉及 `team_id` 的断言按「工程（project）」理解；
-> - **仓库当前没有任何测试文件**，§7 的可测性契约只有「时间源可注入」等少数落地；本策略里待测的脱敏（SEC-*）、FTS 搜索（SPIKE-09~12）、归档（MS-13~16）、通知（NOT-*）等功能**本身也未实现**（见 `docs/implementation-status.md` §6）—— 执行对应章节前请先确认功能已开工。
+## Implementation alignment (2026-10-21)
 
-### v0.2 变更摘要
+- Commit `e2ad323` ("refactor: simplify workstation state to busy idle blocked") replaced the previous model. A workstation now has exactly three mutually exclusive states: `busy`, `idle`, `blocked`. State is **derived**, never polled: busy comes from a running task, blocked from an explicit per-session authorization wait, idle from the absence of both.
+- The liveness machinery is gone. No timer, lease, ping or elapsed time can change a workstation state. The transport-level WebSocket ping and the HTTP polling fallback only keep the connection alive; they are not state signals.
+- The repository now has an automated suite: `npm run test:all` runs every `test:*` script serially through `scripts/run-tests.js`; the latest full run on this checkout was **73/73 suites passed in ~58 s**. Suites are plain Node scripts (`server/test/*.test.js`, `renderer/test/*.test.mjs`). There is no Vitest, no Playwright, no browser E2E and no Electron packaging E2E.
+- Several features described in earlier versions are still not implemented and are marked as such throughout: the A-route directory watcher (chokidar), message redaction, FTS query wiring, virtual scrolling, system notifications, compact mode, reverse control, and CI pipelines.
+- **Retired concepts (explicitly removed, do not reintroduce):** the five-state model, `offline` / `online` / `error` as workstation states, the `degraded` flag, heartbeat timeouts, TTL / lease expiry, `lastSeenAt`, `last_heartbeat_at`, `agent_status_history`, the 5×5 transition matrix and the "10 combinations" display matrix.
 
-| # | 变更 | 影响章节 |
+### v0.5 change summary
+
+| # | Change | Affected sections |
 | --- | --- | --- |
-| 1 | 状态模型改为 **5 主状态（offline/idle/busy/blocked/error）+ 1 正交标志 degraded**，新增 10 组合矩阵与 illegal transition 负向用例 | §3.2、§6-M1、附录 A |
-| 2 | 消息保留 **90 天 / 单 team 10 万条**，超限先导出 JSONL 归档再删；单条 > 64 KB 截断。M0 只验 `archived_at` 字段与索引，归档逻辑验收在 M1 | §3.3 MS-13~16、§3.4 DB-11、§6 |
-| 3 | 网络盘/WSL **M0~M2 不支持**，保留降级（5 s 轮询 + degraded）；WSL 与时序跳变归入 M4 评估 | §3.6、§6-M4 |
-| 4 | **仅出 x64**（Linux/Windows/macOS-x64）；打包脚本参数化，禁止硬编码 arch，新增静态检查 | §3.5 DS-06/DS-14、§6-M3 |
-| 5 | **离线演示模式 `--demo` / `MOCK=1` 提前到 M0**，三合一（M0 静态渲染 / L2 组件默认数据源 / L4 E2E 确定性数据源） | §3.7、§6-M0、§8 |
-| 6 | 新增 **M0 原生模块（@electron/rebuild + better-sqlite3）构建验证矩阵**，含失败升级路径，禁止静默降级 | §3.8 |
-| 7 | 新增 **M1 开工即做的 10 万条虚拟列表 spike**（最小用例集 + 通过门槛） | §3.9 |
-| 8 | 里程碑重编号，与 coder 主编号对齐 | §0、§6 |
-| 9 | **Q5 消息脱敏升为 P0 安全底线**：新增 SEC-01~14，「原文不入库」三层验证（API / 直查 SQLite / cat 二进制+WAL）、7 类规则正例与边界、误伤率基线、与 FTS 搜索交互结论 | §3.12、§6-M1 |
-| 10 | **Q4 通知**：新增 NOT-01~14，仅 S1 触发（含 S2 及以下负向用例）、默认开/声音默认关、免打扰边界、按成员静音与状态解耦、洪泛限流 | §3.11、§6-M1 |
-| 11 | **Q2 进度三态** `progress_source = reported \| derived \| unknown`：新增 PRG-01~08，硬断言「不伪造 0%/100%」 | §3.10、§6-M1 |
-| 12 | **Q1 读写区分**、**Q3 紧凑模式阈值**：新增 RW-01~07、CPT-01~06（阈值待确认，已给建议值） | §3.13、§3.14 |
-| 13 | **Q7 反向控制归 M4**（只做派活 + 中断 + 二次确认 + 事件日志），M0~M3 不测：新增 CTRL-01~06 | §3.15、§1.3、§6-M4 |
-| 14 | **Q6 包体 ~100 MB 用户已接受**：E2E 不再断言体积，仅记录实测值 | §3.5 DS-15 |
-| 15 | **Q10 中文 FTS5 分词并入 M2 spike**：SPIKE-09~12（bigram / unicode61+自定义 / 退化 LIKE），中文语料搜索 < 200 ms 实测 | §3.9 |
-| 16 | **Q8 免打扰与静音默认值建议** | §11 |
-| **17** | **状态矩阵对齐 requirements.md §5 定稿**：摘掉「暂定」标注；非法迁移改为 **`offline→blocked` + `offline→error`**（`error→blocked` 合法）；处理策略由「拒绝+保留原状态」改为**合成中间态三原则** | §3.2.2、SC-02~04 |
-| **18** | **新增判定链与阈值边界用例**：`error>busy>blocked>idle` + 活性闸门最高；`HEARTBEAT_TIMEOUT`/`A_SILENT_TIMEOUT`/`BLOCK_GRACE`/`ERROR_WINDOW`/`CLOCK_SKEW_TOL` 逐个边界 | SC-05/SC-17~19 |
-| **19** | **A-only 硬规则 + idle/busy 易错边界** 转为用例（pending=idle、思考中=busy、工具间隙不闪、心跳断 60s 仍 busy、边跑边等=busy） | SC-20~SC-27 |
-| **20** | **blocked 规则用例**：reason 受控词表、`waiting_on` 必渲染且缺失不编造、五条解除路径、`BLOCK_ALERT` 不改主状态 | SC-26/SC-28~30 |
-| **21** | **degraded 改为 D1~D5 逐条**（原为自拟 4 条）+ degraded 期间 UI 一致性负向断言（不改变状态色） | SC-08/SC-09 |
-| **22** | **进度用例重写对齐 AC-PR1~7**：新增 PRG-02 单调不减、PRG-03 完成态、PRG-08 真值优先；**PRG-06 = AC-PR5 进 M1 硬阻塞**；澄清进度三态不触发 degraded（PRG-11） | §3.10 |
+| 1 | State model replaced by **`busy` / `idle` / `blocked`**, derived from tasks and `session_status`; the transition matrix and the illegal-transition rules are deleted | §3.2, §6-M1, Appendix A |
+| 2 | All liveness test cases and thresholds removed; time, ping and reconnect are asserted **not** to change state | §3.1, §3.2, §3.11, Appendix A |
+| 3 | Test layers rewritten around the real stack (plain Node, serial runner, `ok()` helper, Chinese summary line); Vitest / Playwright listed as planned | §2, §5, §9 |
+| 4 | Retention corrected to **N days (default 90)** with no message-count cap; JSONL archive export is planned, not implemented | §3.3, §3.4 |
+| 5 | Progress section rewritten: the progress bar is gone; `tasks.progress` is optional report data and the UI does not fabricate a value | §3.10, §7.18 |
+| 6 | Notifications: not implemented; the only candidate S1 state is `blocked`, and the trigger must be redesigned before M3 | §3.11, §11 |
+| 7 | Unimplemented features marked **Planned**: A-route watcher, redaction, FTS query wiring, virtual scrolling, Electron E2E, compact mode, reverse control | §3.6, §3.9, §3.12–§3.15 |
+| 8 | Demo mode corrected: it is a UI action creating an isolated demo project, **not** a `--demo` / `MOCK=1` flag | §3.7 |
+| 9 | Added a migration case for the liveness-era SQLite schema (drops `task_id`, `last_heartbeat_at`, `degraded`, `source`, `members.last_seen_at`; rewrites `source='timeout'` to `'watch'`) | §3.4 DB-16 |
+| 10 | CI corrected to "local gate today, pipeline planned"; no workflow files exist in the repository | §9 |
 
-> **语言栈说明**：main 裁决走 **方案 A（切回 TypeScript）**。按 leader 指示，**L0 门禁与相关文档条目暂不改动**，等 coder 迁移完成（或触发切 B）后一次性调整；测试侧改造工作量预估仍为 A≈0 / B≈0.5 天。
+> Case IDs (`SC-`, `MS-`, `DB-`, `DS-`, `FW-`, `RT-`, `DEMO-`, `SPIKE-`, `PRG-`, `NOT-`, `SEC-`, `RW-`, `CPT-`, `CTRL-`, `COUNCIL-`) are stable and are referenced from `docs/implementation-status.md` and the release checklist.
 
 ---
 
-## 0. 里程碑编号映射（统一用主编号）
+## 0. Milestone numbering (single main sequence)
 
-| 主编号（coder，后续一律用此） | tester v0.1 旧编号 | 内容 |
+| Main ID (coder; use everywhere) | tester v0.1 old ID | Content |
 | --- | --- | --- |
-| **M0** | M0 | 骨架 + 可测性地基 + **demo 模式** + **原生模块构建验证** |
-| **M1** | M1 | 工位视图 + **消息归档逻辑** + **虚拟列表 spike（开工即做）** |
-| **M2** | M2 + M3 | 对话记录窗口 + 持久化与恢复（两项合并） |
-| **M3** | M4 | 打包与发布（三平台 x64） |
-| **M4（可选）** | M5 | 目录监听生产化 + WSL / 高精度计时器跳变评估 |
+| **M0** | M0 | Skeleton + testability baseline + demo project + native-module build |
+| **M1** | M1 | Workstation / office state + message integrity + progress honesty |
+| **M2** | M2 + M3 | Task records and conversation data + persistence and recovery |
+| **M3** | M4 | Packaging and release (three platforms, x64) |
+| **M4 (optional)** | M5 | Directory-watch productionization + WSL / clock-jump evaluation |
 
-> 映射以 `docs/roadmap.md §0` 为准；本文档内所有用例编号（SC-/MS-/DB-/DS-/FW-/RT-/DEMO-/SPIKE-）保持不变，仅在「适用里程碑」列标注主编号。
+> The mapping follows `docs/roadmap.md §0`. Case IDs do not change; only the "applicable milestone" column uses the main numbering.
 
-### 平台范围（M0~M3）
+### Platform scope (M0–M3)
 
-- **支持**：Linux x64（开发机，Ubuntu 22.04/24.04）、Windows x64（10/11）、macOS x64（13+）。
-- **不支持**：ARM（Apple Silicon / Windows ARM）暂不出构建；但**打包脚本必须参数化**，不得硬编码架构（DS-14）。
-- **不支持（M0~M2）**：网络盘、WSL 场景（降级路径保留，见 §3.6）。
+- **Supported target:** Linux x64 (development, Ubuntu 22.04/24.04), Windows x64 (10/11), macOS x64 (13+).
+- **Not built:** ARM (Apple Silicon / Windows ARM). Packaging scripts must still be architecture-parameterized; no hardcoded arch (DS-14).
+- **Not supported (M0–M2):** network drives and WSL scenarios; evaluation is deferred to M4 (FW-09/FW-10).
 
 ---
 
-## 1. 被测对象与质量目标
+## 1. Objects under test and quality goals
 
-### 1.1 两大核心界面（用户明确要求）
+### 1.1 Core surfaces
 
-| 界面 | 关键行为 | 质量目标 |
+| Surface | Key behavior | Quality goal |
 | --- | --- | --- |
-| **工位视图** | 每成员一张工位卡片，实时展示：主状态（offline/idle/busy/blocked/error）+ degraded 标志、当前任务、进度、正在读写的文件、最近产出、已耗时；自动刷新 | 状态**准**、刷新**快**、高频上报下**不抖不卡** |
-| **对话记录窗口** | 全量消息流（谁→谁、时间、类型、内容）；按成员/时间过滤、关键字搜索、自动跟随滚动 | 消息**不丢不重**、时间线**有序**、万级消息**滚动流畅、内存可控** |
+| **Office** (isometric 2.5D canvas) | Nine floors, elevator, resident gremlins at desks, ephemeral ghosts, main-agent console | State **accurate**, updates **fast**, no jitter or frame drops under high event rates |
+| **Workstation / Desk cards** | Per member: one of `busy` / `idle` / `blocked`, current task, files touched, artifacts, start or last-active time | Correct state for the **selected session**; no leakage between sessions; missing data never invented |
+| **Task records** | Task list, summary, daily Gantt, per-round client / model / tokens / files / result | Nothing lost or duplicated; deterministic ordering; honest empty values |
+| **Council** | Fixed-role, multi-round review with a server-computed convergence score | Read-only participants, no office pollution, faithful reporting of failures |
 
-### 1.2 全局质量目标（可量化）
+### 1.2 Global quality goals (measurable)
 
-1. **实时性**：本地回环下，一次状态上报 → 卡片可见变化，P95 ≤ 300 ms。
-2. **稳定性**：1000 事件/秒持续 60 s（含 5000 事件/秒 × 5 s 突发）不卡死、不白屏、不掉帧到 < 30 fps。
-3. **正确性**：消息零丢失、零重复；状态机转换与心跳判定 100% 符合规格（含 illegal transition 被正确拒绝）。
-4. **可恢复性**：`kill -9` / 进程崩溃后重启，丢失窗口 ≤ 1 s 或 ≤ 500 条消息，且状态可重建。
-5. **跨平台**：Windows 10/11 **x64**、macOS 13+ **x64**、Ubuntu 22.04/24.04 **x64** 行为一致。
-6. **可演示性**：`--demo` 模式下无需真实 agent 即可完整演示两个界面，且输出确定性可快照。
+1. **Real-time:** one report → visible card change, P95 ≤ 300 ms on loopback.
+2. **Stability:** 1,000 events/s for 60 s (with a 5,000 events/s × 5 s burst) without freeze, white screen, or frame rate below 30 fps.
+3. **Correctness:** message loss and duplication are zero; the workstation state is exactly the derivation in §3.2 for every member and session.
+4. **Recoverability:** after `kill -9` or a crash, the loss window is ≤ 1 s or ≤ 500 messages, and state is rebuilt from persisted tasks and `session_status`.
+5. **Cross-platform:** Windows 10/11 x64, macOS 13+ x64 and Ubuntu 22.04/24.04 x64 behave identically.
+6. **Demonstrability:** demo mode needs no real agent, renders both office and records surfaces, and is deterministic under a fixed seed.
 
-### 1.3 非目标（本阶段不做）
+### 1.3 Non-goals (this phase)
 
-- 不测 agent 自身（leader/researcher/coder/tester）的业务智能与产出质量。
-- 不做多机分布式压测（仅本机多 agent 进程）。
-- 不做 ARM 构建与验证（M0~M3）。
-- 不做无障碍（a11y）完整审计，仅保证键盘可达与语义标签不缺失（S3 级别）。
-- **不测反向控制（Q7：派活 / 中断）**，归 M4；M0~M3 不覆盖（§3.15）。
-- **不断言安装包体积**（Q6：~100 MB 用户已接受），仅记录实测值到发布说明。
+- Agent intelligence and output quality (leader / researcher / coder / tester) are not tested.
+- No multi-machine distributed load testing; only local multi-agent processes.
+- No ARM build or verification (M0–M3).
+- No full accessibility audit; only keyboard reachability and semantic labels (S3-level).
+- Reverse control (Q7: dispatch / interrupt) is not tested before M4 (§3.15).
+- No assertion on installer size (Q6: ~100 MB accepted); record the measured value only.
+- No claim that unimplemented features pass. Sections that describe planned features are specifications for future work.
 
 ---
 
-## 2. 测试分层与工具链
+## 2. Test layers and toolchain
 
-采用「倒三角偏中」策略：**大量纯逻辑单测 + 中量组件/契约测试 + 少量 E2E + 专项非功能测试**。Electron 相关逻辑必须下沉到可无头运行的纯 TS 层，否则测试成本会爆炸。
+Strategy: **many pure-logic tests + a medium number of route/contract tests + a small number of end-to-end tests + targeted non-functional checks**. The current implementation is deliberately headless-testable: the server is a plain Express app over a temporary SQLite file, and renderer logic that matters for state lives in pure ES modules under `renderer/src/lib/`.
 
-| 层 | 名称 | 范围 | 工具 | 运行位置 | 占比目标 |
+Status legend used in this document:
+
+- **Automated** — covered by an existing suite listed in §2.3.
+- **Specified** — behavior exists, but has no dedicated automated case yet.
+- **Planned** — the feature or the tooling does not exist; the case is design only.
+
+| Layer | Name | Scope | Current tooling | Runs in | Share target |
 | --- | --- | --- | --- | --- | --- |
-| L0 | 静态与类型 | 类型、lint、依赖与许可、Electron 安全配置、**打包配置无硬编码 arch**、**原生模块 ABI 校验** | TypeScript `strict`、`eslint`、`vue-tsc`、`knip`、自定义 `check:arch-param`、`native:check` | CI | 门禁 |
-| L1 | 单元测试 | 状态机（含 illegal transition）、心跳超时判定、degraded 置位/清除、消息去重/排序/合并、时间线规整、虚拟滚动计算、进度钳制、归档触发条件、SQLite repository 逻辑 | **Vitest**（`environment: node`）、`better-sqlite3`（`:memory:`）、`vite-node` | Node，无 UI | ~60% |
-| L2 | 组件测试 | 工位卡片（5 状态 × degraded）、状态徽章、进度条、消息行、虚拟列表、过滤器、搜索高亮、空/加载/错误态、自动跟随滚动 | **Vitest + Vue Test Utils + happy-dom**、`@pinia/testing`、fake timers、**默认数据源 = demo mock** | Node + DOM 模拟 | ~25% |
-| L3 | 集成 / 契约测试 | preload ↔ main 的 IPC 契约（类型化通道）、WS 握手与重连、事件源 → store 端到端数据流、SQLite 落盘与迁移、`--demo` 装配 | Vitest + **自研 `createTestApp()` 夹具**（内存事件源 + 内存 repository + fake clock） | Node，无窗口 | ~10% |
-| L4 | E2E（桌面） | 真实启动 Electron：冷启动、窗口生命周期、真实 IPC、真实 SQLite、崩溃恢复、`--demo` 全链路、托盘/菜单、安装升级 | **Playwright `_electron`**、`electron-builder` 产物 | xvfb 无头 / 有头 | ~5%（关键路径） |
-| L5 | 非功能专项 | 性能与实时性、长稳/内存泄漏、三平台矩阵、安装升级、休眠重连、目录监听健壮性、**原生模块三平台验证** | Playwright `_electron` + CDP trace + `node:perf_hooks` + 内置 metrics + CI matrix | CI + 本地专项 | 门禁式 |
+| L0 | Static and type checks | Syntax, build, security config, packaging config, native ABI | `npm run build` (Vite), `npm run rebuild:native`, ad-hoc `node --check`; **no lint or type-check gate exists today** | Local / CI (planned) | Gate |
+| L1 | Unit tests | State derivation, session scoping, message dedupe/order, time formatting, floor parsing, task-shape normalization | **Plain Node scripts** with a local `ok(label, cond)` helper | Node, no UI | ~60% |
+| L2 | Component / renderer logic | Three-state badges, per-session task selection, borrowed summon busy, Gantt/time math, i18n coverage, render smoke | **Plain Node ESM scripts** importing `renderer/src/lib/*` and Vue SFC source assertions | Node, no browser | ~25% |
+| L3 | Integration / contract | Real Express routes + real SQLite temp DB, hook dispatch, WS envelopes, reconnect, council API | **Plain Node scripts**, temporary `WORKGREMLIN_HOME` | Node, no window | ~10% |
+| L4 | Desktop E2E | Real Electron launch, window lifecycle, real IPC, real SQLite, packaging | **Planned** — Playwright `_electron` is not present | xvfb / headed (planned) | ~5% |
+| L5 | Non-functional | Latency, long-run memory, platform matrix, sleep/reconnect, watcher robustness, native modules | Manual + Node scripts + planned CI matrix | Local / CI | Gate |
 
-### 2.1 为什么 E2E 用 Playwright `_electron`
+### 2.1 Why L4 is planned rather than implemented
 
-- 官方维护、与 Electron 版本解耦较好，支持 `electron.launch({ args: [appPath] })`。
-- 可用 `electronApp.evaluate()` 访问主进程、`firstWindow()` 操作渲染进程，便于断言「IPC → 渲染」全链路，也便于在**主进程内校验原生模块 ABI**（§3.8）。
-- 与 L2/L3 共用断言风格与 `data-testid` 选择器。
+There is no browser automation in the repository today. `renderer/test/renderSmoke.test.mjs` is a **source-level render smoke test**, not an E2E test: it asserts component structure and selector presence without launching Electron. Real E2E arrives with the packaging milestone; when it does, Playwright `_electron` remains the chosen tool because `electronApp.evaluate()` can reach the main process and `firstWindow()` can drive the renderer with the same `data-testid` selectors used by L2/L3.
 
-### 2.2 关键约定：核心逻辑不得依赖 Electron API
+### 2.2 Architecture and the testability boundary
 
-`packages/core`（纯 TS，零 electron 依赖）承载：状态机、时钟、事件归一化、消息去重排序、虚拟滚动计算、repository 接口。
-`apps/main`（Electron 主进程）只做：窗口、IPC 适配、真实文件监听、真实 WS 服务、SQLite 实现注入。
-`apps/renderer`（Vue）只做：渲染与交互。
-
-> 这是**可测性与 demo 模式的共同地基**。若 core 里出现 `import { ipcRenderer } from 'electron'`，L1/L2 与 `--demo` 全部失效。
-
-### 2.3 目录与命名
-
-```
-tests/
-  unit/           *.spec.ts          # L1
-  component/      *.spec.ts          # L2，同目录 __snapshots__
-  integration/    *.itest.ts         # L3
-  e2e/            *.e2e.ts           # L4
-  perf/           *.perf.ts          # L5 性能 / 长稳 / spike
-  native/         *.native.ts        # L5 原生模块 ABI 验证
-  fixtures/       events/*.jsonl     # 可回放事件流（含 demo 种子）
-  fixtures/generators/               # 合成数据生成器
-  helpers/        testApp.ts, fakeClock.ts, fakeEventSource.ts, demoSource.ts, wsMock.ts
+```text
+shared/      protocol source of truth (CJS, zero dependencies, Node + browser)
+server/      Express + ws + better-sqlite3; headless, embedded in Electron or standalone
+desktop/     Electron main process, preload bridge, window, menu, single-instance lock
+renderer/    Vue 3 + Vite + Pinia; pure state/task rules in renderer/src/lib/
+packages/    reporter SDK + CLI + hooks (agent side)
 ```
 
-脚本：`pnpm test`（L0+L1+L2，秒级）、`pnpm test:it`、`pnpm test:e2e`、`pnpm test:native`、`pnpm test:perf`、`pnpm test:ci`。
+Rules that keep the suite cheap:
 
----
+- **State logic is a pure function of rows.** `buildMemberCard` in `server/src/ingest/bus.js` and `memberForSession` in `renderer/src/lib/memberTask.js` can be exercised without a window or a timer.
+- **Business code uses the clock abstraction** (`server/src/clock.js`) rather than bare `Date.now()` for timeouts and elapsed-time decisions.
+- **Renderer pure modules never import Electron.** `renderer/src/lib/memberTask.js` imports only i18n and the ephemeral helper, so Node can import it directly.
+- **No browser is required** for the current 73 suites; that is why `npm run test:all` finishes in about a minute.
 
-## 3. 重点测试点
+### 2.3 Directories and commands (actual)
 
-> 编号后缀含义：**[M0]** 该里程碑准出必过；**[M4]** 延后到可选里程碑；无标注为所属功能里程碑内必过。
-
-### 3.1 实时性（Real-time）
-
-| 编号 | 用例 | 断言 / 阈值 |
-| --- | --- | --- |
-| RT-01 | 单次状态上报端到端延迟 | P50 ≤ 120 ms，**P95 ≤ 300 ms**，P99 ≤ 800 ms（本机回环，4 成员空闲态） |
-| RT-02 | 分段延迟埋点 | ingest→IPC ≤ 30 ms；IPC→主进程 fanout ≤ 50 ms；WS→renderer store ≤ 50 ms；store→paint ≤ 1 帧（16.7 ms），最差 ≤ 50 ms |
-| RT-03 | 高频上报：1000 事件/秒 × 60 s | 主线程阻塞 > 50 ms 的长任务次数 = 0；平均帧率 ≥ 50 fps；DOM 更新按窗口合并 |
-| RT-04 | 突发：5000 事件/秒 × 5 s | 不崩溃、不 OOM；背压生效（丢弃冗余中间态而非堆积）；结束 ≤ 1 s 收敛到最新状态 |
-| RT-05 | UI 不抖动 | 布局偏移量累计低于阈值；进度条不回跳（除非显式回退事件）；同一状态 1 s 内重复渲染 ≤ 2 次 |
-| RT-06 | 自动刷新节流 | 相同状态重复上报不触发重渲染（浅比较 / 版本号比对生效） |
-| RT-07 | 后台节流正确 | 失焦降频（如 1 Hz）；重新聚焦 ≤ 300 ms 恢复到最新状态 |
-| RT-08 | degraded 标志切换不抖动 | degraded 置位/清除不应触发整卡片重挂载（仅徽章层更新），不导致进度条重置 |
-
-**测量方法**：事件自带 `ingestTs`，主进程打 `fanoutTs`，渲染进程在 `requestAnimationFrame` 回调记录 `paintTs`，统一 `performance.now()` 时间基；E2E 通过 `electronApp.evaluate()` 读取内置 metrics 直方图（见 §7.8）。
-
-### 3.2 状态正确性（Status Correctness）—— 5 主状态 + degraded
-
-#### 3.2.1 状态模型定义
-
-| 类型 | 取值 | 语义 | 视觉 |
-| --- | --- | --- | --- |
-| **主状态**（互斥，5 种） | `offline` | 无心跳 / 已断开 | 灰 |
-| | `idle` | 在线空闲 | 绿 |
-| | `busy` | 工作中 | 蓝 |
-| | `blocked` | 阻塞等待输入 | 橙 |
-| | `error` | 出错 | 红 |
-| **正交标志** | `degraded` | 数据来自**兜底推断**而非上报，可信度低 | 黄灰边框 / 斜纹，叠加在任意主状态上 |
-
-> `degraded` 是「数据可信度」维度，与工作状态正交，不参与互斥。
-
-#### 3.2.2 迁移矩阵（5×5）—— 以 `docs/requirements.md` §5.8 定稿为准
-
-> **基准已锁定**：状态语义 owner = researcher，定稿为 `docs/requirements.md` §5（§5.8 迁移矩阵 / 非法处理三原则）。本表与定稿逐格一致，**如后续定稿变更须走版本记录并同步 tester/coder，不允许存在两套矩阵**。
-
-**不随判定规则变动的冻结部分（M0 必须照此实现）**：
-- **主状态枚举固定 5 个**：`offline` / `idle` / `busy` / `blocked` / `error`（**无 `unknown` 主状态**；判不了时按 §5.3 落 `offline` 或「保留上一有效主状态 + `degraded`」，二者必有其一）。
-- **`degraded` 为独立布尔字段**，与主状态正交，不参与互斥。
-- **`online` 不是主状态**：接了上报但无任务一律归 `idle`（避免 online/idle 语义重叠）。
-- 状态机**判定规则**属 M1；M0 只冻结枚举与字段。
-
-| from ↓ \ to → | offline | idle | busy | blocked | error |
-| --- | --- | --- | --- | --- | --- |
-| **offline** | 非迁移 | ✅ register / 首个心跳（无任务） | ✅ register + 携带 `taskId`（或 `task.start` 同时到达） | ❌ **禁止**（合成中间态） | ❌ **禁止**（合成中间态） |
-| **idle** | ✅ 活性丢失 | 非迁移 | ✅ `task.start` / 带 task 的心跳 | ✅ `status=blocked` + reason | ✅ `status=error` / 失败阈值达成 |
-| **busy** | ✅ 活性丢失 | ✅ `task.end(done\|cancelled)` 且无其他 running | 非迁移 | ✅ 停止推进且依赖未满足 | ✅ `task.end(failed)` / 显式 error |
-| **blocked** | ✅ 活性丢失 | ✅ 放弃等待 / 任务取消 | ✅ 依赖满足（收到回复/产物/权限） | 非迁移 | ✅ 依赖失败 |
-| **error** | ✅ 活性丢失 | ✅ 错误已确认且放弃 / 任务收尾 | ✅ 重试进行中（新 `task.start`） | ✅ **等待用户处理**（`reason='awaiting_user'`） | 非迁移 |
-
-**合法迁移 18 个 / 非法 2 个**：非法为 **`offline→blocked`** 与 **`offline→error`**（`error→blocked` 是合法的：需人工处理并等待用户）。
-
-**非法迁移处理三原则（定稿）**
-1. **不丢弃、不崩溃**：记一条 `events{kind:'state.transition.rejected', from, to, evidence}`，**UI 无感**；
-2. **合成中间态**：`OFFLINE→BLOCKED` 修正为 `OFFLINE→IDLE→BLOCKED`（证据携带 `taskId` 时走 `OFFLINE→BUSY→BLOCKED`）；中间态写入 `agent_status_history` 并标 `synthetic=1`；
-3. **`state_since` 取「触发事件的 ts」**，而非合成时刻 —— 否则「已耗时」算错。
-
-**其他约束**：`X→X`（同状态）不更新 `state_since`，仅刷新 `last_heartbeat_at` / `updated_at`；同一 tick 内多次状态变化**只在 UI 推送一次**（以仲裁后最终态为准），渲染侧允许 100~200 ms 批量合并，但端到端 P95 仍 ≤ 300 ms。
-
-#### 3.2.3 组合覆盖（10 组合）
-
-| # | 主状态 | degraded | 是否可渲染 | 说明 |
-| --- | --- | --- | --- | --- |
-| 1–5 | offline / idle / busy / blocked / error | 无 | ✅ | 基础 5 态 |
-| 6–9 | idle / busy / blocked / error | 有 | ✅ | 兜底推断态，显示斜纹边框 |
-| 10 | offline | 有 | ⚠️ 特殊 | 按 §5.10：offline 自身已是终态，**degraded 通常不适用**；若确实组合出现，**以 remark 形式显示**（不改变状态色、不显示「推断」角标的标准位置）。上报侧不得主动产生该组合 |
-
-> 因此 UI 断言覆盖 **9 个标准可见组合 + 1 个 offline+degraded 的 remark 断言**。
-
-#### 3.2.4 用例
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| SC-01 | **合法转换矩阵全覆盖** | 上表 18 个合法转换逐一验证；`X→X` **不更新** `state_since`（仅刷新 `last_heartbeat_at`） |
-| SC-02 | **非法迁移 `offline→blocked`（三原则）** | ① 产生 `events{kind:'state.transition.rejected', from:'offline', to:'blocked', evidence}` 且 **UI 无感**（不弹错、不闪烁）；② 合成 `OFFLINE→IDLE→BLOCKED`，`agent_status_history` 中该中间态 `synthetic=1`；③ **`state_since` == 触发事件 ts**（非合成时刻），据此断言卡片「已耗时」正确 |
-| SC-03 | **非法迁移 `offline→error`（三原则）** | 同上；修正路径 `OFFLINE→BUSY→ERROR`（或 `IDLE→ERROR`）；`state_since` 取触发事件 ts |
-| SC-04 | **非法迁移的 taskId 分支** | `offline→blocked` 且证据携带 `taskId` → 合成路径为 `OFFLINE→**BUSY**→BLOCKED`（而非 IDLE）；`synthetic=1`；`state_since` 正确 |
-| SC-05 | **判定链固定优先级** | `error > busy > blocked > idle`，**活性闸门最高**（不活着一律 `offline`）。同时构造 error+busy+blocked 证据 → `error`；busy+blocked → `busy` |
-| SC-06 | 忙碌判定 | `task.start` / 带 `taskId` 心跳 / `task.progress` / 显式 `busy` → `busy`；`task.end(done\|cancelled)` 且无其他 running → `idle`；`task.end(failed)` → `error` |
-| SC-07 | **心跳超时边界（双常量）** | `HEARTBEAT_INTERVAL=15s`（上报侧）/`HEARTBEAT_TIMEOUT=60s`（判定侧，可配），二者满足 **interval ≤ timeout/3**（连续丢 3 包才判超时）：59.9 s 不判离线、60.0 s 判离线、60.1 s 判离线；**有 A 侧活性证据时不置 offline 而置 `degraded`(D1)**；无 A 证据且 `A_SILENT_TIMEOUT` 亦超时才 `offline`；边界前后各 3 个采样点。**附带断言**：把 interval 改为 > 20 s（违反 interval ≤ timeout/3）时，配置校验应拒绝或告警 |
-| SC-08 | **degraded 置位/清除（D1~D5 逐条）** | **D1** 心跳超 60 s 但仍有 A 活性/仍在 roster → 置位，收到任意 B 上报**即刻清除**；**D2** 从未接 B 上报（`reported=0`）→ 置位，首次成功上报后清除并补算真实状态；**D3** `\|上报ts − 接收时刻\| > 5s` 或 `ts` 回退 → 置位，连续 2 条 skew 回容差内清除（回退按 `ingested_at` 补齐排序 + 保留标记 60 s）；**D4** 观测通道降级（网络盘/EMFILE/chokidar 失败 → 5 s 轮询）→ 置位，watcher 恢复并完成全量重扫比对后清除；**D5** 必需字段缺失（任务存在但无 title/taskId）→ 置位，补齐后清除 |
-| SC-09 | **degraded 期间 UI 一致性** | 主状态**不变**；不透明度 55% + 虚线描边 + 右上「推断」角标；数值字段（进度/任务/文件/产出）**冻结**；「已耗时」**继续走**并带 `*`，恢复后校准（回拨提示「已校准：实际 mm:ss」）；**degraded 不改变状态色**（负向：不得渲染成红色/error 样式） |
-| SC-10 | **offline + degraded 组合** | 按 §5.10：offline 自身已终态，degraded 通常不适用；若组合出现以 **remark** 显示，不上「推断」角标的标准位置；上报侧不得主动产生 |
-| SC-11 | 时钟跳变 / 系统休眠 | 超时判定用**单调时钟**；休眠 30 min 后唤醒不得误判「连续丢失 N 次」导致状态雪崩；`CLOCK_SKEW_TOL=5s` 内不置 D3，超出置 D3；唤醒后 backfill，不产生「幽灵离线」 |
-| SC-12 | 乱序状态消息 | 携带单调 `seq`；后到旧 `seq` 丢弃（last-write-wins by seq，非 wall clock）；`seq` 回退超窗口触发 resync |
-| SC-13 | 并发写同一成员 | 文件监听 + WS 双源同时上报，按 seq + 事件时间仲裁，结果收敛一致 |
-| SC-14 | 边界值 | 进度越界 → 钳制（见 PRG-*）；任务名为空/超长 → 不撑破布局；无 title → `（未命名任务）` |
-| SC-15 | 已耗时计算 | 基于 `state_since`（触发事件 ts）；跨休眠不出现「已耗时 100 小时」；任务切换后归零 |
-| SC-16 | 多成员隔离 | 16 成员并发上报互不串台（按 agentId 强断言 DOM） |
-| **SC-17** | **`A_SILENT_TIMEOUT` 300 s 边界**（仅 A 可用） | 299 s 仍 `degraded` 保留上一有效主状态、300 s 判 `offline`；边界三点采样 |
-| **SC-18** | **`BLOCK_GRACE` 45 s 边界** | 发出请求类消息后：44 s 不判 blocked、45 s 判 blocked；期间出现任意本地推进（`/task/progress`、`file_activity`、工具调用）→ **不判 blocked**；请求类消息类型限定 `question`/`block`/`review`/指向具体成员的 `task_assign` |
-| **SC-19** | **`ERROR_WINDOW`/`ERROR_THRESHOLD`（300 s / 3 次）** | 窗口内第 3 次失败 → `error`；第 3 次落在窗口**外**（第 301 s）→ 不判 error（计数重置）；失败计数徽标 `✕3` 显示正确 |
-| **SC-20** | **A-only 硬规则（重点负向）** | **禁止推断 `blocked` 与 `error`**：仅 A 证据时，无论 mailbox 静默多久都不得产生 `blocked`/`error`；判不了则保留上一有效主状态 + `degraded=1`。这是**最容易实现错的地方**，须逐状态断言（blocked ✗、error ✗、busy ✓、idle ✓） |
-| **SC-21** | **`pending`（已派单未开始）= `idle`** | 判 `idle` + 徽标 `待办 N 项`；**负向：不得判 busy** |
-| **SC-22** | **思考中 / 等 LLM 返回 = `busy`** | 心跳未断且在任务上下文中 → `busy`；**负向：不得判 blocked**（无法区分思考与等待） |
-| **SC-23** | **工具调用间隙不闪烁** | 两次调用间隔 < 心跳间隔 → 保持 `busy`，不出现 busy↔idle 抖动（1 min 内主状态切换次数 = 0） |
-| **SC-24** | **长时间无边缘动作 >5 min** | `busy` + 「慢于预期」角标（`SLOW_FACTOR=1.5×`）；**负向：不得判 blocked** |
-| **SC-25** | **心跳断 60 s 但任务未结束** | 保持 `busy + degraded`；**负向：不得降级为 idle/offline**（60 s 不是死亡判决） |
-| **SC-26** | **等待权限审批 / 他人回复 / 子任务** | → `blocked`，`reason` 分别 `awaiting_permission` / `waiting_reply:<member>` / `waiting_task:<id>` |
-| **SC-27** | **一边跑工具一边等回复** | 判 `busy`，副信息显示「（等待 X）」琥珀小标记；**负向：不得判 blocked** |
-| **SC-28** | **blocked 卡片必备字段** | 必须渲染 `waiting_on` + 已阻塞时长 `mm:ss`；**原因缺失时显示 `等待 —（未上报原因）`，不得留空、不得编造原因**（服务端写 `reason='unspecified'` 并记事件） |
-| **SC-29** | **blocked 解除五条路径** | ① 目标回复（按 `reply_to`/`to-from` 配对）② 产物出现 ③ 显式 `status=idle\|busy` 或 `task.start`/`task.progress` ④ 任务取消/结束 ⑤ 活性丢失 → `offline`；逐条验证 |
-| **SC-30** | **长期阻塞角标不改主状态** | 阻塞超 `BLOCK_ALERT`（10 min）→ **仅**叠加「长期阻塞」角标，主状态仍 `blocked`（负向：不得改 error） |
-| **SC-31** | **去抖与合并** | 同一 tick 内多次状态变化**只在 UI 推送一次**（以仲裁后最终态为准）；批量合并 100~200 ms 但端到端 P95 仍 ≤ 300 ms（与 RT-01 交叉验证） |
-| **SC-32** | **展示矩阵一致性（§5.10）** | 5 主状态的主色/图标/文案模板逐项断言；`offline` 整卡不透明度 60%；数据缺失时各字段按矩阵显示 `—` / `—（未接入上报）` / `（未命名任务）` / `出错 · 原因未上报`，**不得留空或编造** |
-| **SC-33** | **无障碍三重可区分** | 颜色 + 图标形状 + 文案三者可区分；色盲模式 / 高对比 / 减少动效三开关生效（旋转/流光关闭后退回静态图标） |
-
-### 3.3 消息完整性（Conversation Integrity）
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| MS-01 | 不丢 | 注入 10,000 条唯一消息，唯一 `msgId` 数 == 10,000 |
-| MS-02 | 不重 | 同一 `msgId` 重复投递 3 次（含跨重连），最终仅 1 条；DB 唯一索引约束生效 |
-| MS-03 | 乱序时间线 | 乱序窗口 ±5 s 内按 `occurredAt` 稳定排序；同时间戳按 `msgId` 字典序二次排序（**保证排序确定性**，否则快照必 flaky） |
-| MS-04 | 流式消息 | token 合并正确，`stream_end` 后完整；缺失 `stream_end` 时 5 s 超时标记 `truncated`（不是一直「正在输入」） |
-| MS-05 | 万级消息虚拟滚动 | 100,000 条下：DOM 节点 ≤ 80；首次渲染 ≤ 500 ms；滚动平均帧率 ≥ 55 fps；内存增量 ≤ 200 MB |
-| MS-06 | 自动跟随滚动 | 在底部时自动滚到底；用户上滚查看历史时**暂停跟随**并显示「N 条新消息」；回到底部恢复跟随 |
-| MS-07 | 过滤：按成员 | 单/多成员（含「全部」）过滤结果与未过滤集合做集合运算校验 |
-| MS-08 | 过滤：按时间 | 边界语义明确（建议左闭右开）；UTC 存储、本地展示 |
-| MS-09 | 关键字搜索 | 命中内容/发送者/接收者；大小写不敏感；正则元字符 `* ( ) [ \` 不报错；中文子串匹配；10 万条响应 ≤ 300 ms |
-| MS-10 | 过滤 + 搜索 + 实时新消息组合 | 新消息正确插入当前过滤视图，不破坏滚动位置 |
-| MS-11 | 超大单条消息 | 单条 1 MB：不卡死，默认折叠/截断，展开可复制 |
-| MS-12 | 消息版本兼容 | 旧 schema 消息可渲染或明确标记「不可识别类型」，不崩溃 |
-| **MS-13** | **归档触发条件** | 90 天 / 单 team 10 万条，**先到者为准**：89d23h59m 不触发、90d 整触发；100,000 条不触发、100,001 条触发；阈值可配置 |
-| **MS-14** | **归档过程不丢消息** | 归档进行中持续写入：归档前 ∪ 归档后 = 全量，不丢不重；**导出未成功则不删原记录**；导出失败可重试，重试幂等 |
-| **MS-15** | **归档后搜索提示** | UI 明确提示「命中范围：热数据（近 90 天 / 最近 10 万条）」；显示「已归档 N 条，点击查看/导出」；归档 JSONL 可被导入查看 |
-| **MS-16** | **64 KB 截断** | content > 64 KB 截断存储并置 `truncated: true`，UI 标注「内容已截断」；边界 65536 / 65537 字节；截断后搜索不报错、不误命中被截部分 |
-
-> MS-13~16 的**归档逻辑验收在 M1**；M0 仅验证 `archived_at` 字段与索引存在（DB-11）。
-
-### 3.4 数据落盘与恢复（SQLite + Crash Recovery）
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| DB-01 | 基本读写 | WAL 开启；批量写入走事务；读不阻塞写 |
-| DB-02 | Schema 迁移 | v0→v1→v2 迁移幂等不丢数据；只允许向前 + 备份策略明确 |
-| DB-03 | 异常退出：kill -9 | 重启后丢失窗口 ≤ 1 s 或 ≤ 500 条；数据完整；`PRAGMA integrity_check` ok |
-| DB-04 | 异常退出：渲染进程崩溃 | 主进程存活、自动重建窗口、状态从 DB 恢复，≤ 2 s |
-| DB-05 | 异常退出：主进程崩溃 | 冷启动后从事件日志/快照恢复到一致状态；无半写记录 |
-| DB-06 | 磁盘满 / 只读 | 降级为内存模式 + 明确告警，不崩溃；空间恢复后自动回刷 |
-| DB-07 | 多实例 | 单实例锁；第二实例聚焦已有窗口而非打开第二个写者 |
-| DB-08 | 历史清理 | 保留策略生效；清理后查询与 UI 正常 |
-| DB-09 | 并发读写 | 高频写入时 UI 查询不阻塞（读走内存副本 + 异步落盘） |
-| DB-10 | 状态恢复一致性 | 重启后状态 == 崩溃前最后一致状态（事件重放 == 快照，可交叉验证） |
-| **DB-11** | **归档字段与索引（M0）** | `messages` 表存在 `archived_at` 列（默认 NULL）与索引；`content_truncated` 标志位存在；写入新消息时 `archived_at` 为 NULL；字段可被查询与更新 |
-| DB-12 | 归档落盘（M1） | 导出 JSONL 与库内删除在同一事务语义下（先导出成功再删）；归档文件可重新导入校验条数一致 |
-| **DB-13** | **`secure_delete` / WAL checkpoint 对写入吞吐的影响（实测）** | **1000 事件/s 稳态压测期间**，吞吐 ≥ 1000 事件/s 且端到端 P95 仍 ≤ 300 ms（RT-01/RT-03 不被拖垮）；分别记录 `secure_delete=OFF`、`ON`、`ON + wal_checkpoint(TRUNCATE)` 三组的吞吐与 P95 对比数据并归档。**若开启后 P95 退化 > 20%，立即上报 leader** |
-| **DB-14** | **双连接方案验证（若采用）** | 写入连接 `secure_delete=OFF`、删除/归档连接 `secure_delete=ON + wal_checkpoint(TRUNCATE)`：① 写入路径无额外开销（DB-13 达标）；② 删除后 freelist 与 WAL 无残留（SEC 三层验证 L3 通过）；③ 两连接并发不死锁（`SQLITE_BUSY` 有退避重试且不丢写） |
-| **DB-15** | **安全断言的反向有效性验证（防假阳性）** | 故意关闭 `secure_delete`（或关闭脱敏开关）重跑 SEC 的 L3 残留断言，**断言必须失败**；若关掉也能通过，说明该断言无检出能力，必须重写。**所有安全类断言均需此反向验证步骤** |
-
-### 3.5 桌面端特有（Desktop-specific）
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| DS-01 | 冷启动时间 | 首窗口可见 ≤ 3 s（warm）/ ≤ 5 s（cold） |
-| DS-02 | 安装 | 三平台静默安装（Win `/S`、macOS dmg/pkg、Linux AppImage/deb/rpm）后首次启动成功 |
-| DS-03 | 升级 | 旧→新：配置、DB、窗口位置保留；迁移成功；失败可回滚 |
-| DS-04 | 代码签名 / 公证 | macOS 公证通过；Windows SmartScreen 不误报（记录为已知问题亦可） |
-| DS-05 | 跨平台一致性 | 三平台跑同一套 L4；重点校验路径分隔符、监听后端（inotify/FSEvents/ReadDirectoryChangesW）、托盘、菜单栏、快捷键（Cmd vs Ctrl） |
-| **DS-06** | **架构范围（更新）** | **仅出 x64**；不产出 ARM 构建；但 `--arch` 可传入且不报错（参数化生效，产物可构建性不在 M0~M3 验收） |
-| DS-07 | 窗口失焦/最小化 | 失焦降频（RT-07）；恢复焦点立即同步最新 |
-| DS-08 | 系统休眠 / 锁屏 | 休眠 30 min → 唤醒：重连 ≤ 5 s（指数退避 + jitter），离线消息 backfill 补齐且不重复 |
-| DS-09 | 网络切换 / 断网 | 断网 60 s → 恢复：重连成功；UI 明确显示「已断开/重连中/已连接」三态，不静默失败 |
-| DS-10 | 多显示器 / DPI | 缩放 150%/200% 布局不破；跨屏移动记忆位置有效 |
-| DS-11 | 高对比度 / 深色模式 | 系统主题切换后可读（对比度 ≥ 4.5:1） |
-| DS-12 | 安全配置 | `contextIsolation: true`、`nodeIntegration: false`、preload 白名单；`webSecurity` 不关闭（lint 守护） |
-| DS-13 | 卸载 | 用户数据处理策略明确，不残留导致重装失败 |
-| **DS-14** | **打包配置无硬编码 arch（静态检查）** | `package.json` / `electron-builder` 配置 / CI workflow / 构建脚本中**不得出现**硬编码 `x64`/`ia32`/`arm64`/`universal` 字面量；架构必须来自参数（env `ARCH` 或 CLI `--arch`），默认值可配置；检查脚本 `pnpm check:arch-param` 纳入 L0 门禁，失败即 M3 不准出 |
-| **DS-15** | **包体体积（仅记录，不作门禁）** | Q6 已确认 ~100 MB 可接受；E2E **不设体积断言**，仅把三平台实测体积写入发布说明；超过 200 MB 时提 S4 提示（不阻塞） |
-
-### 3.6 目录监听路线的健壮性（File Watching Robustness）
-
-> **M0~M2 不支持网络盘 / WSL**；相关用例标记 **[M4]**，不进 M0~M2 准出。降级路径（5 s 轮询 + degraded）M0~M2 必须可用。
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| FW-01 | 写入中途读取（partial write） | 采用「size + mtime 稳定窗口」（默认 100 ms 无变化再读，可配）或 tmp+atomic rename；读到半截 JSON → **保留上次良好状态 + 重试**，绝不写入脏状态、绝不崩溃 |
-| FW-02 | 原子写入 | 生产侧 `write tmp → rename`；监听侧单次事件读到完整内容 |
-| FW-03 | 目录被删除 | ENOENT → 不崩溃；退避重连（1→2→4→…→30 s 上限，带 jitter）；UI 显示「监听中断」横幅，同时**主状态保持、置 `degraded`** |
-| FW-04 | 目录被重建 | 重建后自动恢复（≤ 30 s 或下个轮询窗口内），补齐期间变更，degraded 清除 |
-| FW-05 | 权限变更 | `chmod 000` / 文件不可读 → 捕获 EACCES/EPERM，降级 + 提示 + degraded；权限恢复后自动恢复 |
-| FW-06 | 大量文件 / 深目录 | 10,000 文件不触发 EMFILE（限流打开或提升 ulimit）；初始全量扫描异步分页，不阻塞首屏 |
-| FW-07 | 事件洪泛 | 1 秒内 10,000 次变更：合并/去抖（50–100 ms trailing，可注入），CPU 不飙高 |
-| FW-08 | **降级为 5 s 轮询（M0~M2 必测）** | 触发条件（EMFILE / 网络盘 / 半写重试超限 / 监听后端不可用）：自动切轮询，周期 5 s（可配），置 `degraded`，UI 标注「轮询模式（数据可能有延迟）」；恢复后切回监听并清除 degraded |
-| FW-09 | 网络盘 / 挂载点 **[M4]** | NFS/SMB 下 inotify 不可靠 → 检测并降级为 5 s 轮询（同 FW-08） |
-| FW-10 | WSL 场景 **[M4]** | WSL1/2 下监听与路径语义差异评估；不进 M0~M2 准出 |
-| FW-11 | 符号链接 / 大小写冲突 | 软链循环不死循环；大小写不敏感文件系统下路径归一化一致 |
-| FW-12 | 长路径 / 特殊字符 | 空格、中文、emoji、超长路径（Windows > 260）不解析失败 |
-| FW-13 | watcher 资源泄漏 | 反复切换监听目录 100 次，句柄数不持续增长（`lsof` 计数断言） |
-| FW-14 | 与 WS 源共存 | 文件源与 WS 源同报一成员：按 seq 仲裁，结果一致（同 SC-12） |
-| FW-15 | 高精度计时器跳变 **[M4]** | WSL / 虚拟机的计时器跳变对心跳与超时判定的影响评估 |
-
-### 3.7 离线演示模式（Demo Mode）—— M0 交付项
-
-`--demo` 与 `MOCK=1` 等价，**三合一**：M0 静态渲染数据源 / L2 组件测试默认数据源 / L4 E2E 确定性数据源。
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| DEMO-01 | 两种启动方式等价 | `app --demo` 与 `MOCK=1 app` 行为一致（同一 fixture、同一 seed） |
-| DEMO-02 | 零外部依赖 | 无真实 agent、无网络、无监听目录亦可完整渲染两个界面；启动 ≤ 3 s |
-| DEMO-03 | **确定性** | 同一 `--demo-seed=N` 输出完全一致（事件序列、时间戳、消息顺序），可用于 DOM 快照；不同 seed 产生不同但合法的数据 |
-| DEMO-04 | 数据隔离 | demo 模式使用独立 user-data-dir / 内存 DB；退出后不留脏数据，不影响真实数据目录 |
-| DEMO-05 | 结构一致 | demo 与真实源走**同一套组件与 `data-testid`**；切换数据源不改变 DOM 结构（L2/L4 选择器复用） |
-| DEMO-06 | 覆盖度 | demo 数据须覆盖：5 主状态全覆盖、至少 1 个 degraded、1 个 blocked、1 个 error、≥ 200 条消息（含流式/长消息/多成员） |
-| DEMO-07 | 明确标识 | UI 上标注「演示模式」，避免与真实数据混淆（S3 若缺失） |
-
-### 3.8 原生模块构建验证（electron-rebuild / better-sqlite3）—— M0 最高风险项
-
-> **硬约束**：失败时**禁止静默降级**到 `node:sqlite`、sql.js 或纯内存实现。任何降级必须经 leader 书面批准，并同步修订本文档与持久化设计（WAL / 并发 / 性能特性会变）。
-
-#### 3.8.1 验证矩阵
-
-| # | 平台 | 架构 | 目标 Electron 版本 | 里程碑 | 优先级 |
-| --- | --- | --- | --- | --- | --- |
-| N1 | **Linux x64**（Ubuntu 22.04 / 24.04，开发机） | x64 | 项目锁定版本（写入 `.nvmrc` + `electron.version`） | **M0 必过** | P0 |
-| N2 | Windows x64（10/11） | x64 | 同 N1 | **M3 matrix**（建议 M1 早期跑一次 smoke） | P1 |
-| N3 | macOS x64（13+） | x64 | 同 N1 | **M3 matrix**（建议 M1 早期跑一次 smoke） | P1 |
-
-> ARM 不在范围内（§0）。后续补 ARM 时只需扩展本矩阵，不改流程。
-
-#### 3.8.2 验证命令
+```text
+server/test/       *.test.js    # 57 CJS files (56 wired): routes, db, ingest, hooks, floors, council
+renderer/test/     *.test.mjs   # 17 ESM suites: pure renderer logic + render smoke
+                                # pluginReply.test.js exists but has no test:* alias, so 73 suites run
+scripts/run-tests.js            # serial runner: every test:* script, summary table
+scripts/postinstall.js          # electron-rebuild for better-sqlite3
+```
 
 ```bash
-# 1) 环境基线
-node -v && npx electron --version
-
-# 2) 针对目标 Electron 版本重建原生模块
-npx @electron/rebuild -f -w better-sqlite3 -v <electronVersion> --arch x64
-
-# 3) 在 Electron 主进程上下文中验证（不是 node 里！）
-#    走 L4：electronApp.evaluate(() => { ... })
-node -e "console.log(process.versions.modules)"            # ABI
-#   electron 内：require('better-sqlite3') 成功 + new Database() 可用
-
-# 4) 打包后产物验证（asar 场景）
-npx electron-builder --dir --x64 && ./dist/linux-unpacked/workgremlin --selftest-native
-
-# 5) 落盘功能冒烟
-pnpm test:it -- db        # 建表 / 写 1 万条 / 读回 / integrity_check
+npm run test:all                  # all 73 suites, serial
+node scripts/run-tests.js qoder   # run suites whose names contain "qoder"
+node scripts/run-tests.js --fail-fast
+npm run test:member-task          # a single suite (state/session rules)
+npm run test:agent-roster         # borrowed busy for resident gremlins
+npm run db:check                  # server CLI self-test: create tables, write, read, checkpoint
 ```
 
-#### 3.8.3 成功判据（全部满足才算过）
+Suite conventions:
 
-1. **在打包后的 Electron 主进程中**（非 node CLI）`require('better-sqlite3')` 成功。
-2. `process.versions.modules`（ABI）与 `better-sqlite3` 编译目标一致；无 `was compiled against a different Node.js version` 报错。
-3. 真实功能冒烟通过：建表 → 写 10,000 条 → 读回条数一致 → `PRAGMA integrity_check` = ok。
-4. **`electron-builder --dir` 产物**启动后 DB 可用（验证 `asarUnpack` 已正确解包 `.node`，避免只在 dev 模式可用）。
-5. 冷启动无原生模块相关的 error 级日志；DB-01 用例在 L3/L4 下均通过。
-
-#### 3.8.4 失败时的升级路径（按序尝试，禁止跳到降级）
-
-| 步 | 动作 | 说明 |
-| --- | --- | --- |
-| 1 | `npx @electron/rebuild -f -w better-sqlite3 -v <electronVer> --arch x64` | 先重建，多半是 ABI 未对齐 |
-| 2 | 指定 `prebuild-install` 镜像重试（网络问题常见于 CI） | `--build-from-source` 作为兜底 |
-| 3 | 调整 `better-sqlite3` 版本到官方支持该 Electron 大版本的区间 | 记录版本约束到 `package.json` 注释 |
-| 4 | 锁定 Node / Electron 版本组合，使 ABI 一致，并在 CI 固定 | 写入 `.nvmrc` 与 CI 镜像 |
-| 5 | **上报 leader，走书面审批**后才可考虑 `node:sqlite`（Node 22+）或 `sql.js` | **禁止静默执行**；降级须同步更新本文档 §3.4 与持久化设计 |
-
-#### 3.8.5 CI 门禁
-
-- L0 增加 `pnpm native:check`：在 Electron 主进程内 require 全部原生模块并打印 ABI 与版本，**失败即 M0 不准出**。
-- `pnpm check:arch-param`（DS-14）与 `native:check` 同属 L0，任何 PR 必跑。
-
-### 3.9 Spike（两轮）—— M1 虚拟列表 / M2 中文 FTS5 分词
-
-#### 3.9.1 轮次 A：10 万条虚拟列表（**M1 开工即做**）
-
-**目的**：在对话窗口业务开发前锁定虚拟列表方案，避免 M2 返工。
-**时机**：M1 第一周，先于工位视图收尾；产出结论写回 `docs/` 并据此微调 MS-05 阈值。
-
-| 编号 | 最小用例 | 通过门槛 |
-| --- | --- | --- |
-| SPIKE-01 | 10 万条首次渲染 | ≤ 500 ms |
-| SPIKE-02 | 连续滚动帧率 | 平均 ≥ 55 fps，最低 ≥ 40 fps |
-| SPIKE-03 | DOM 节点数 | ≤ 80（可视 + buffer） |
-| SPIKE-04 | 内存增量（相对空列表） | ≤ 200 MB，且滚动 5 min 后无持续增长 |
-| SPIKE-05 | 实时追加（尾部 100 条/秒） | 帧率仍 ≥ 50 fps；自动跟随滚动正确 |
-| SPIKE-06 | 10 万条关键字搜索响应 | ≤ 300 ms |
-| SPIKE-07 | 过滤切换（成员 / 时间） | ≤ 200 ms，滚动位置与视图正确 |
-| SPIKE-08 | 单条 1 MB 大消息 | 不卡死，折叠/截断正常（对应 MS-11） |
-
-**交付物**（不只跑分）：
-1. 选型结论：定高 vs 不定高、自研 vs 库（`vue-virtual-scroller` 等）、回收与 buffer 策略。
-2. 性能基线数据（供后续 CI 对比，超 20% 退化即告警）。
-3. 若某门槛不达标，给出方案调整建议（如消息行定高、内容懒展开、搜索走索引）并同步更新 MS-05。
-
-#### 3.9.2 轮次 B：中文 FTS5 分词（Q10，**M2 开工即做**）
-
-**目的**：中文无空格分词，分词方案直接决定 M2 搜索验收能否达标。
-**语料**：中文为主（≥ 70%），混排英文/代码/路径；10 万条消息；含被脱敏内容。
-
-| 编号 | 对照方案 | 通过门槛（中文语料，10 万条） |
-| --- | --- | --- |
-| SPIKE-09 | **A：FTS5 `unicode61` + 自定义分词器（bigram）** | 搜索响应 < 200 ms；中文双字以上关键词召回率 ≥ 95% |
-| SPIKE-10 | **B：FTS5 `trigram`** | 响应 < 200 ms；召回率 ≥ 95%；关注索引体积（记录增量） |
-| SPIKE-11 | **C：退化方案 `LIKE '%kw%'`**（无 FTS） | 响应实测；作为 A/B 均不可行时的兜底基线 |
-| SPIKE-12 | **索引维护成本** | 10 万条建索引耗时 ≤ 30 s；实时追加 100 条/秒时索引更新不阻塞写入（帧率 ≥ 50 fps）；索引体积增量 ≤ 库体积 50% |
-
-**必须同时验证的交互**（这三条直接决定 M2 搜索验收口径）：
-- **脱敏与搜索**：搜索「凭据原文」必须 **0 命中**（SEC-12），且 UI 需给出「部分内容已脱敏，可能搜不到」的提示，而不是静默空结果。
-- **排序正确性**：FTS 命中后仍须按 MS-03 的确定性时间线排序（搜索结果顺序在重复执行下一致）。
-- **大小写/中英混排**：中文关键词不区分全半角；英文关键词大小写不敏感。
-
-**交付物**：选型结论（A/B/C）+ 中文实测响应数据 + 召回率数据 + 索引体积/建索引耗时；结论回写 MS-09 阈值（把「≤ 300 ms」替换为实测约定值，中文语料建议 < 200 ms）。
+- A suite is a plain script. It prints `✓` / `✗` per assertion and ends with the literal summary line `结果：N 通过 / M 失败`; a non-zero exit code means failure.
+- Suites are **serial by design**. Many change `HOME` / `WORKGREMLIN_HOME` or create temp on-disk data, so parallel execution causes unreproducible failures.
+- Assertions use `ok(label, condition, extra)`. Labels are English in new suites; legacy Chinese labels are acceptable where the suite already ships them.
+- Planned: `tests/unit`, `tests/component`, `tests/integration`, `tests/e2e` with Vitest / Vue Test Utils / Playwright. Do not describe these as existing.
 
 ---
 
-## 3.10 进度展示三态（Q2，progress_source）
+## 3. Key test areas
 
-**模型**：`progress_source = reported`（agent 上报的真实进度）/ `derived`（由步骤数、文件数等推算）/ `unknown`（无法得知）。
+> Suffix meaning: **[M0]** required for that milestone exit; **[M4]** deferred to the optional milestone; no suffix means required within the owning feature milestone.
 
-> **硬断言（贯穿全节）**：`unknown` 必须渲染**不确定进度条**（indeterminate，无具体数值）；**任何情况下不得出现伪造的 0% 或 100%**（包括缺省值、NaN 兜底、数据缺失、乱序回退）。
+### 3.1 Real-time behavior
 
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-> 编号与定稿 `§5.9.1` 的 AC-PR1~7 一一对应，可直接作为 M1 自动化用例。
-
-| 编号 | 对应 AC | 用例 | 断言 |
+| ID | Case | Assertion | Status |
 | --- | --- | --- | --- |
-| PRG-01 | AC-PR1 | ① `reported` 基本渲染 | 上报 `task.progress=0.42` → 实线进度条 + `42%`，**无**「推导」角标 |
-| PRG-02 | AC-PR1 | **同任务内单调不减** | 随后上报 `0.37`（回退）→ **UI 仍显示 42%**，且记一条 `events{kind:'progress.regress'}`；任务显式重置/重做时归零并记事件 |
-| PRG-03 | AC-PR2 | 完成态 | `task.end{state:'done'}` → 立即 `100%` 且 `progress_source='reported'`，**保持 ≥ 1.5 s**（防一闪而过） |
-| PRG-04 | AC-PR3 | ② `derived` | 无 `task.progress`、子任务 5 项完成 3 项 → `60%` + **斜纹** + `推导` 角标；tooltip `推导：已完成 3/5 个子任务` 且可点开子任务清单（可追溯性） |
-| PRG-05 | AC-PR4 | ② 边界降级 | 子任务清单为空或 total=0 → **降级到 ③**；**不得显示 `0%`、NaN、空字符串** |
-| PRG-06 | AC-PR5 | **③ `unknown` 核心判据（M1 硬阻塞）** | 既无 `task.progress` 又无子任务清单 → 条纹动画（indeterminate）+ 文本 `—`，`progress_source='unknown'`；**DOM 断言：该卡片不存在 `0%` / `100%` / 任何整数百分比文本**（正则 `/\d+%/` 全卡片匹配应为 0 命中） |
-| PRG-07 | AC-PR6 | ③ 与任务无关时 | 成员处于 `idle`/`offline`（无当前任务）→ 进度区域显示 `—` 且**不显示任何进度条动画**（避免「看起来在动」的误导） |
-| PRG-08 | AC-PR7 | **来源切换（真值优先）** | 先 `derived=60%` 后收到 `reported=0.42` → **显示 42%** 并移除「推导」角标（**不得**因单调不减而停留在 60%；跨源切换不适用单调规则）；记一条 `events` |
-| PRG-09 | §5.9 硬条款 4 | ① 与 ② 同时可得 | 取 ① `reported`；② 跨多 tick 取较大值且来源标记为其**实际采用层** |
-| PRG-10 | §5.9 硬条款 1 | 越界与异常值 | 上报值钳制到 [0,1]；`null/undefined/NaN/""` → 一律 `unknown`，**不回填任何历史值、不显示 0%/100%** |
-| PRG-11 | — | **与 degraded 的关系（已澄清）** | 进度三态**不触发** `degraded`：`degraded` 仅由 D1~D5（§5.7）触发，二者正交；`unknown` 渲染条纹动画，不被 degraded 的「数值冻结/55% 灰显」覆盖成错误样式 |
-| PRG-12 | — | 抖动 | `unknown → reported → unknown` 快速切换时进度条不闪烁（1 s 内 ≤ 2 次渲染，同 RT-08） |
+| RT-01 | Single report end-to-end latency | P50 ≤ 120 ms, **P95 ≤ 300 ms**, P99 ≤ 800 ms (loopback, 4 idle members) | Specified |
+| RT-02 | Segmented latency | ingest→bus ≤ 30 ms; bus→WS fanout ≤ 50 ms; WS→store ≤ 50 ms; store→paint ≤ 1 frame (16.7 ms, worst 50 ms) | Planned (needs metrics) |
+| RT-03 | Sustained load: 1,000 events/s × 60 s | No main-thread task > 50 ms; average frame rate ≥ 50 fps; DOM updates merged per window | Planned |
+| RT-04 | Burst: 5,000 events/s × 5 s | No crash or OOM; `member.status` merge window collapses redundant cards; convergence to the latest state ≤ 1 s | Planned |
+| RT-05 | No UI jitter | No progress bar exists to jump; task text and badges do not reflow on repeated updates | Specified |
+| RT-06 | Auto-refresh throttle | Repeated identical `member.status` payloads do not trigger re-render (shallow compare / card identity) | Specified |
+| RT-07 | Background throttling | Unfocused window lowers refresh rate; refocus restores the latest state ≤ 300 ms | Specified |
+| RT-08 | Badge update does not remount the card | A state change updates only the badge and task area; the card component instance and its displayed timestamp are preserved | Specified |
 
-**可测性要求**：进度值对象须为 `{ value: number\|null, source: 'reported'\|'derived'\|'unknown' }`，禁止裸 number（否则无法区分「真的是 0%」与「不知道」）。
+**Measurement method:** the ingest request carries its own `ts`; the server records the broadcast time; the renderer records `paintTs` in a `requestAnimationFrame` callback, all on the same `performance.now()` base. E2E reads the built-in histogram once the metrics contract (§7.8) exists.
 
----
+### 3.2 State correctness — three states: `busy`, `idle`, `blocked`
 
-## 3.11 通知（Q4）
+#### 3.2.1 Model definition
 
-**触发范围（严格）**：仅 **S1 级**事件触发 —— `blocked`、`error`、`offline > 60 s`。其余一切事件（含 S2 级、普通状态变化、新消息、任务完成）**不得触发通知**。
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| NOT-01 | **仅 S1 触发（正向）** | `blocked` / `error` / `offline>60s` 三类事件各触发 1 次系统通知 |
-| NOT-02 | **S2 及以下不触发（负向，易回归）** | 以下事件**通知计数必须为 0**：`idle`↔`busy` 切换、任务开始/完成、新消息到达、进度变化、`degraded` 置位/清除、`offline ≤ 60 s`（如心跳逾期 30 s）、目录监听降级、归档完成。**逐条独立断言**（不要只跑总集） |
-| NOT-03 | **离线 60 s 边界** | 59.9 s 不通知、60.0 s 通知、60.1 s 通知（与 SC-05 同边界三点） |
-| NOT-04 | **默认值断言** | 全新用户数据目录下：系统通知 **默认开**、声音 **默认关**；配置项存在且默认值可被测试读取（禁止只靠 UI 观察） |
-| NOT-05 | 通知内容 | 含成员名、事件类型、时间；不含敏感信息（**不得包含被脱敏前的原文**，见 SEC-13） |
-| NOT-06 | 免打扰：生效 | 时段内 S1 事件**不弹**通知 |
-| NOT-07 | **免打扰：跨天边界**（如 22:00–08:00） | 21:59:59 弹、22:00:00 不弹、07:59:59 不弹、08:00:00 弹；跨天时段不会被算成「起 < 止」的反向区间 |
-| NOT-08 | **免打扰：跨时区** | 切换系统时区（或 `--simulate-tz=`）后时段按**本地时间**判定；UTC+8 → UTC-5 边界正确 |
-| NOT-09 | **免打扰：休眠唤醒** | 时段中休眠、时段结束后唤醒：不补发时段内事件（见 NOT-10） |
-| NOT-10 | **免打扰：是否补发（结论）** | **不补发**。时段内事件写入事件日志与 UI 未读计数，恢复后**只在工位视图/HUD 体现**，不追溯弹窗（避免唤醒后通知轰炸） |
-| NOT-11 | **按成员静音** | 静音成员的 S1 事件不通知；**但工位视图状态仍须正确刷新**（通知与状态解耦，强断言 DOM 状态徽章） |
-| NOT-12 | 静音与免打扰叠加 | 静音成员在免打扰时段外同样不通知；取消静音后恢复通知；静音配置持久化（重启后仍生效） |
-| NOT-13 | **洪泛限流** | 见下方限流阈值；短时大量 S1 事件须合并，不得刷屏 |
-| NOT-14 | 通知权限（macOS/Windows） | 系统通知权限被拒时：降级为应用内提示 + 明确引导，不崩溃、不反复弹权限请求 |
-
-**限流阈值建议（供 coder 实现、tester 断言）**
-
-| 维度 | 建议阈值 | 说明 |
-| --- | --- | --- |
-| 同一成员 + 同一事件类型 | **60 s 内最多 1 条**（聚合窗口 60 s，期间重复仅更新计数） | 与用户给的「60 s 内重复故障不刷屏」一致 |
-| 全局 | **60 s 内最多 5 条**，超出部分合并 | 单条聚合文案：「N 个成员出现 M 个问题，点击查看」 |
-| 突发保护 | 60 s 内 > 20 条 S1 → **只发 1 条汇总** + HUD 红点计数 | 防止 agent 集体掉线时通知风暴 |
-| 恢复通知 | `error`/`blocked` 恢复后**不发**「已恢复」通知（仅 UI 状态变化） | 减少噪音；如需可在设置中开启 |
-
----
-
-## 3.12 消息脱敏（Q5，P0 安全底线）
-
-**硬约束**：**原文不入库**。这不是 UI 隐藏，而是落盘前正则脱敏；明文凭据**不得出现在库文件、索引、FTS 影子表、WAL、归档 JSONL 的任何位置**。
-
-### 3.12.1 三层验证（缺一不可）
-
-| 层 | 方法 | 断言 |
-| --- | --- | --- |
-| **L1 API 层** | 通过 Repository 读回消息 | 返回的 `content` 中凭据已被替换为掩码（如 `sk-***MASKED***`），且 `redacted: true` |
-| **L2 直查 SQLite 层** | 绕过应用，用 `sqlite3` CLI / 只读连接 `SELECT` 全表 + 全部索引 + FTS 影子表（`*_content`、`*_data`、`*_idx`、`*_docsize`） | 明文 0 命中 |
-| **L3 二进制层** | `cat` / `strings` / `grep -a` 直接扫描 `.db` 文件、**`-wal` 文件**、`-shm`、备份与归档 JSONL | 明文 0 命中 |
-
-**L3 的坑（必须覆盖）**：
-- SQLite 删除/更新后旧数据可能残留在 **freelist** 页 → 要求 `PRAGMA secure_delete = ON`（或 `secure_delete=FAST`），并在 `VACUUM` 后复验。
-- **WAL 文件**可能含未 checkpoint 的明文 → 断言前先不 checkpoint 直接扫 WAL；再 checkpoint 后扫主库；两者都 0 命中。
-- 归档导出（MS-14）的 JSONL 同样扫描（SEC-11）。
-- 内存中的临时缓存/日志：debug 日志不得打印原文（SEC-14）。
-
-### 3.12.2 七类规则与用例
-
-每类 **≥ 2 条正例 + 边界例**（长度刚好差一位、大小写变化、跨行、嵌在代码块里、出现在 JSON 转义串里）。
-
-| 编号 | 规则类别 | 正例/边界要点 |
-| --- | --- | --- |
-| SEC-01 | `sk-` 前缀密钥（OpenAI 类） | 标准长度命中；**长度少一位不命中**；`SK-` 大写变体命中；嵌在 ``` 代码块中命中；JSON 转义串 `"sk-xxx\u0000"` 命中；跨行截断不漏 |
-| SEC-02 | `AKIA`（AWS Access Key ID） | 20 位标准命中；19 位不命中；小写 `akia` 变体（**按规则决定是否命中，须有明确结论**）；出现在 URL query 中命中 |
-| SEC-03 | `ghp_`（GitHub Token） | 标准 36 位命中；长度差一位边界；后跟中文/换行/引号的截断正确 |
-| SEC-04 | JWT（`eyJ...`） | 三段完整命中；**只有两段不命中**；换行包裹的 JWT 命中；超长 JWT（>2 KB）不漏不卡 |
-| SEC-05 | `PRIVATE KEY` PEM 块 | 完整 `-----BEGIN ... PRIVATE KEY-----` 块命中；**跨行 PEM 必须整块命中**（不能只脱首行）；首行缺失时不漏中间内容 |
-| SEC-06 | 键值型 `password` / `token` / `secret` / `api_key` | `password: "x"`、`"token"="x"`、`apiKey=x`、`PASSWORD=` 大小写变体命中；`passwords`（复数）、`tokenizer`、`secretary` **不得误伤**（纳入误伤样本集）；值为空串时行为明确 |
-| SEC-07 | URL 内嵌凭据（`https://user:pass@host`） | 标准命中；无凭据 URL 不误伤；含 IPv6、端口号、中文域名 IDN 的 URL 处理正确 |
-
-### 3.12.3 误伤率基线与开关
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| SEC-08 | **误伤率量化** | 使用固定「正常样本集」（建议 200 条：源代码片段、正常日志、Markdown 文档、Base64 字符串、UUID、文件路径、SQL、CI 输出）；**误伤率 = 被错误改写条数 / 200**；**可接受阈值 ≤ 0.5%（即 ≤ 1 条）**；超过即 S2 |
-| SEC-09 | 误伤样本可复现 | 误伤样本集入 `tests/fixtures/redaction/clean-*.txt`，作为回归集；规则变更必跑 |
-| SEC-10 | **可关闭开关** | 提供开关（配置项 / `--no-redact`）：**开启（默认）时脱敏**；关闭后**不脱敏**（明文入库）且 UI/日志有明确警示；测试必须覆盖「关闭后不脱敏」这一方向 |
-| SEC-11 | 归档与导出 | 归档 JSONL（MS-14）、metrics 导出、日志导出中均不含明文（与 L3 同源断言） |
-| SEC-12 | **脱敏与搜索交互（结论）** | **搜不到被脱敏的原文 = 预期行为**。M2 搜索验收口径：① 搜凭据原文返回 **0 命中**；② 不静默空结果 —— 命中 0 时 UI 提示「部分内容已脱敏，可能搜不到」；③ FTS 索引中只存脱敏后内容（L2 层断言 FTS 影子表无明文） |
-| SEC-13 | 通知不含敏感信息 | NOT-05 延伸：通知正文/标题中不得出现脱敏前原文 |
-| SEC-14 | 日志与调试 | debug/trace 日志、崩溃报告、metrics 标签中均不得出现明文；`--export-metrics` 产物同样扫描 |
-
-### 3.12.4 其他
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| SEC-15 | 性能 | 脱敏不得成为写入瓶颈：1 万条含凭据消息写入耗时相比无凭据消息增长 ≤ 30%；单条 1 MB 消息脱敏 ≤ 50 ms |
-| SEC-16 | 不影响顺序与去重 | 脱敏在**唯一性判定之后或与之无关**：`msgId` 不因脱敏改变；消息顺序、去重键、时间线排序与未脱敏场景完全一致（与 MS-01/02/03 交叉验证） |
-| SEC-17 | 掩码稳定性 | 同一原文每次掩码结果**一致**（确定性），否则快照与去重会不一致；掩码保留类型提示（如 `[REDACTED:OPENAI_KEY]`）便于排查 |
-
-> **优先级**：SEC-01~07、SEC-12、L1~L3 三层验证为 **M1 硬阻塞（P0）**；SEC-08~11、13~17 为 M1 内 P1。
-
----
-
-## 3.13 文件读写区分（Q1）
-
-> Q1 精确定义以 `docs/roadmap.md` 为准；本节按「工位卡片需区分 agent 正在 **读** 与 **写** 的文件」设计，若定义不同请告知，用例可直接改标签复用。
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| RW-01 | 读写视觉区分 | 读 / 写分别有可区分标识（图标 + 文案 + `data-testid="file-op-<agentId>-<idx>"` 的 `data-op="read\|write"`），不依赖颜色单一通道（色盲可用） |
-| RW-02 | 同文件先读后写 | 状态正确流转，不残留「读」的旧条目 |
-| RW-03 | 同文件并发读写 | 展示为「读+写」或按最后事件，语义明确且不闪烁 |
-| RW-04 | 路径归一化去重 | 同一文件的不同表示（`./a.ts`、`a.ts`、`/abs/a.ts`、软链、大小写）归一化为一条 |
-| RW-05 | 高频切换节流 | 高频读写事件下 UI 防抖（建议 200 ms），不抖动（RT-05/RT-08 同类） |
-| RW-06 | 列表长度控制 | 超过 N（建议 5）折叠为「+M 个文件」，可展开；不撑破卡片 |
-| RW-07 | 数据缺失 | 无文件信息时显示「未知」而非空白或伪造上次文件名（与 PRG-02 同源硬断言精神） |
-| RW-08 | 超长路径 / 特殊字符 | 空格、中文、emoji、超长路径省略显示（中间省略保留首尾），可 tooltip 查看全路径 |
-
----
-
-## 3.14 紧凑模式阈值（Q3）
-
-> 阈值待 leader/coder 确认；以下按「**成员数 > 8 自动切换紧凑模式**」给建议值，实测后调整。
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| CPT-01 | **阈值边界** | 8 个成员不切紧凑、9 个成员切紧凑（阈值可配）；边界前后各取 1 个采样点 |
-| CPT-02 | 手动覆盖 | 用户手动切换后**覆盖**自动判定，且选择持久化（重启后保持） |
-| CPT-03 | **紧凑不丢关键信息** | 紧凑模式下状态、进度、已耗时、degraded 标志**仍可见**（可折叠/ tooltip），不得仅保留头像 |
-| CPT-04 | 触发维度确认 | 明确按「成员数」还是「窗口宽度/可用空间」触发；若按宽度，需覆盖 resize 断点测试（**待确认，已列入遗留问题**） |
-| CPT-05 | 大规模布局 | 64 成员下紧凑布局不破版、不重叠、滚动流畅（≥ 50 fps） |
-| CPT-06 | 切换不重挂载 | 自动/手动切换不重建卡片组件（状态、进度动画不重置），与 RT-08 同类断言 |
-
----
-
-## 3.15 反向控制（Q7，派活 / 中断）—— **归 M4，M0~M3 不测**
-
-范围：仅「派活」与「中断」两个动作；**每个动作需二次确认**，**必须记事件日志**。
-
-| 编号 | 用例 | 断言 |
-| --- | --- | --- |
-| CTRL-01 | 二次确认必现 | 派活/中断均弹二次确认；确认框含目标成员与动作摘要 |
-| CTRL-02 | 取消不执行 | 取消/Esc 关闭后**无任何指令下发**（用 fake source 断言未收到指令） |
-| CTRL-03 | 中断后状态正确 | 中断成功后目标成员状态按状态机转换（busy→idle 等），不得直接 offline |
-| CTRL-04 | 事件日志完整 | 日志记录：操作者、时间（UTC+本地）、目标、动作、确认结果、执行结果；可审计、可回放 |
-| CTRL-05 | 不可用场景 | 目标 `offline`/`degraded` 时动作禁用或需额外确认；不下发无效指令 |
-| CTRL-06 | 无副作用 | 误点、重复点击（防连点）不产生重复指令；执行失败有明确反馈且不改本地状态 |
-
-**议事厅（§3.16）不在本节范围内**：它不向任何被监控会话下发指令，参与者是服务端新起的一次性进程。
-CTRL-* 的用例一条都不适用于它，它有自己的 COUNCIL-* 一组。
-
----
-
-## 3.16 议事厅（COUNCIL-*）
-
-范围与能力边界见 `requirements.md` §15，实现形态见 `implementation-status.md` §4.2。
-**落地方式与本文其它用例不同**：不是 Vitest / Playwright，而是**普通 node 脚本**，
-挂在根 `package.json` 的 `test:council-*` 上（`ok(标签, 条件)` 计数器，失败即非零退出）。
-理由与仓库其余 60 多个 `test:*` 一致：零依赖、`node 文件` 直接跑、CI 与本地同一套。
-
-### 3.16.1 必测断言（按"错了会真出什么事"排）
-
-| 编号 | 用例 | 断言 | 落在哪 |
+| State | Meaning | Derived from | Visual |
 | --- | --- | --- | --- |
-| **COUNCIL-01** | **只读保证** | 1F/4F 的 `--tools` 是 `Read,Grep,Glob` 且 `--allowedTools` 同一份、4F 的 `--permission-prompts none` 排在变参**前面**；7F/8F 注入的配置里只放行 `read/glob/grep/list`，`bash/edit/write/webfetch` 与 **`external_directory`** 全 deny；7F 的 `plugin` 被摘成空数组 | `test:council-agents` |
-| **COUNCIL-02** | **隔离** | 各层配方的 `env` 里都**没有 `HOME`**（挡掉 HOME = 挡掉登录凭据）；提示词走 stdin 时不出现在 `argv` 里（**2F Cline 是例外**：它的 JSON 模式不读 stdin，提示词只能走位置参数） | `test:council-agents` |
-| **COUNCIL-03** | **角色校验** | 必须恰好一名 `moderator`、一名 `main`、至少一名 `reviewer`，且**同一楼层不能兼任**：缺角色 / 主持人兼主答 / 评审与主持人或主答同层 → 400 且一个进程都不起；重复评审折叠成一条；楼层未安装或未就绪 → 400 并带上**原因原话** | `test:council-api` |
-| **COUNCIL-04** | **真线格式** | 用**真机抓下来的原样输出**（opencode 的两行事件流、CodeBuddy 的五条记录数组、Cline 的 `run_result`、Codex 的 `agent_message`）断言：正文取到、**提问原文与快照/reasoning 不许混进来**、答复只出现一次、词元读得到；空 stdout / 坏 JSON / 只有状态事件 → `ok=false`，不编造正文 | `test:council-agents` |
-| **COUNCIL-05** | **结构化解析（ReviewPoint）** | 取**最后一个**围栏 JSON 块（正文中段的示例不算），字符串里的花括号不许提前截断；没有块 → `parsed=false` 但正文照存（绝不丢）；缺 `suggestion` 的条目**丢弃并计数**（`parse_dropped`），不补写；缺 `dimension` 归「其他」、缺 `evidence` 是 NULL；逐条 `stance` 缺省继承整轮立场，两者都缺 → 该条**不可用**（绝不默认 `accept`）；`reviews: []` 是合法结果（`parsed=true`），与解析失败必须分开；评审人身份由服务端按楼层赋予，模型不能自报 | `test:council-parse` |
-| **COUNCIL-06** | **收敛度可解释** | `raw = 100 − (blocker×25 + major×8 + minor×2 + nit×0 + 冲突×10)`，clamp 到 0..100；每一项扣分与权重都随分值一起返回；模型自报的 `convergenceScore` **不进入解析结果**（被服务端算出的数值覆盖）；未知严重度计入总数但不进任何严重度桶；`nit` 不扣分；冲突表缺失按空处理 | `test:council-convergence`、`test:council-orchestrator` |
-| **COUNCIL-07** | **主持人硬指令与一致性** | 指令缺「必须」、缺验收标准、命中含糊词（建议 / 可以考虑 / 酌情 / 尽量 / maybe / consider）→ 记 warning；有 blocker 却没有对应指令 / 没进 `openIssues` → 记 warning；`reject` 立场却没有登记冲突 → 记 warning；没产出任何意见的评审被点名；最终 `approve` 而最后一轮仍有 blocker → 记 warning。warnings **不改变流程与 verdict**，只如实展示 | `test:council-convergence`、`test:council-orchestrator`、`test:council-report` |
-| **COUNCIL-08** | 单次调用 | 用临时目录里的 `#!/bin/sh` stub 当 CLI：JSON 解析、**超时杀进程**（含子进程组）、非零退出如实记 error、解析不出正文不编造 | `test:council-runner` |
-| **COUNCIL-09** | 编排 | 端到端跑一场（stub 参与者）：第 0 轮拆题只跑一次；1..N 轮各落一个 `RoundResult`（提案、diff、评审、主持人汇总）；**高分也不提前停**；轮末裁决与最终稿各一次；`verdict='completed'`、`status='done'`；WS 事件带 `project=null`；**临时目录被清理** | `test:council-orchestrator` |
-| **COUNCIL-10** | 接口 | 真实 express + 真实 repo + 临时 DB：发起 / 列表 / 详情 / 取消 / 删除；`/floors` 发布权重、角色、严重度、立场与轮数默认值（界面不许再抄一份）；详情带回 `roundResults` / `utterances` / `materials` / `participants` / `report`；**409（还在跑）不许当成功**，服务端原话照搬给界面 | `test:council-api`、`test:council-ui-store` |
-| **COUNCIL-11** | 材料截断 | 超限文件按上限截断，`bytes_total` / `bytes_included` 落真值，界面显示「原文 N 字节，只嵌了前 M 字节」；文件读不到 / 是目录 / 是二进制 → **整个请求 400 并点名那个文件**（不静默跳过）；落库层 `bytes_total` 取不到时是 NULL（**不是 0**） | `test:council-materials`、`test:render-smoke`、`test:council-api` |
-| **COUNCIL-12** | 界面数据合并 | HTTP 详情（快照）与 WS 增量（最新）按**轮次号**取新的那份；增量不许抹掉已有的正文；同一楼层不同 phase 的发言不许互相覆盖；收尾推送只有摘要 → 必须**回拉详情**，否则页面停在没有结论的"已结束"上 | `test:council-ui-store` |
-| **COUNCIL-13** | 不进办公室 | 跑完一场会，`members` / `task_runs` 里**一条都不许多**；办公室与任务记录页看不到任何痕迹（工程模式下还要加上 2F/6F/7F/8F 的会话清单，见 COUNCIL-17） | `test:council-orchestrator`（断言表未被动） |
+| `busy` | Working on a task | At least one task of that member/session has `tasks.state = 'running'` | Blue (`--state-busy`), label `忙碌` |
+| `blocked` | Explicitly waiting for authorization | A `session_status` row with `state = 'blocked'` for that session | Orange (`--state-blocked`), label `阻塞` |
+| `idle` | Neither of the above | No running task and no blocked row | Green (`--state-idle`), label `空闲` |
 
-**2026-10-02 的工程目录 / 2026-10-19 的角色化重构补的用例**：
+There is no fourth state and no orthogonal flag. There is no `offline`, `online`, `error`, `thinking`, `unknown` or `degraded` value. Unknown values arriving from old data or a bad client normalize to `idle` in the renderer (`normalizeState`).
 
-| 编号 | 用例 | 断言 | 落在哪 |
+`busy` includes "thinking / waiting for the model" while a task is running: no progress event is required, and the absence of events for any length of time does not end the task.
+
+`blocked` is an **authorization wait only**. The hook layer sets it on `PermissionRequest` or a permission `Notification`, with the conceptual reason `awaiting_permission`. The database row stores only `state_since` / `updated_at`; the reason is not a column and must not be invented by the UI. Waiting for a human reply, a sub-task, or a slow tool is **not** `blocked`.
+
+#### 3.2.2 Derivation rules
+
+Server, `buildMemberCard` (per member):
+
+1. Start with no candidate.
+2. Every `session_status` row contributes `blocked` with its `state_since`.
+3. A borrowed `agent_status` row contributes `busy` with its `state_since` (resident gremlin only; see §3.2.3).
+4. Every running task contributes `busy` with `started_at`.
+5. Pick the highest priority: **`blocked` > `busy` > `idle`**. On equal priority, the **earliest `stateSince`** wins.
+6. If no candidate exists, the state is `idle`; `stateSince` falls back to `members.created_at`.
+
+Renderer, `memberForSession` (for the selected session):
+
+1. `blocked` for the same session wins over everything.
+2. Otherwise a running task for the same session → `busy`.
+3. Otherwise a **borrowed summon task** for that session → `busy`.
+4. Otherwise `idle`.
+5. With no selected session (demo / a floor without an active session), the server card state is shown as-is.
+
+`stateSince` is the reference timestamp for the status line: blocked uses the blocked row's `state_since`, busy uses the task's `started_at`, idle uses the member's creation time. The card renders an absolute `MM-DD HH:mm` (task start when busy, last active when idle), never a fabricated duration. There is no separate "last seen" timestamp.
+
+#### 3.2.3 Scoping and the borrowed-busy exception
+
+- **Blocked is session-scoped.** Its primary key is `(member_id, session_id)`. A blocked row in session B never makes session A blocked, and a member card with several sessions can be blocked in one and busy in another.
+- **Tasks are session-scoped.** A running task in session A does not make session B busy. The member card aggregates across sessions for the office overview; the renderer chooses the selected session's task.
+- **Pending is not busy.** A task with `state = 'pending'` is work that has not started. Only `running` counts.
+- **Borrowed busy is a display state.** A resident gremlin (no session of its own) may borrow `busy` from a same-named ephemeral ghost while that ghost has a running task. `agent_status` is the **only** table that can hold this borrowed `busy` (its `CHECK` constraint allows nothing else). It is not task liveness; the task itself belongs to the ghost.
+- **State only changes on data changes.** No timeout, age, ping, reconnect, poll, sleep/wake or server restart changes a state by itself.
+
+#### 3.2.4 Cases
+
+| ID | Case | Assertion | Nearest suite |
 | --- | --- | --- | --- |
-| **COUNCIL-14** | **工程目录不许被动** | 注入 `removeDir` / `isDir` stub：工程模式下**不建也不删**临时目录、断言用户的目录没被删；提示词里带上工程路径与"不能修改任何文件"；目录在发起后被删掉 → `verdict='failed'` + 原话落库，**一个进程都不起** | `test:council-orchestrator` |
-| **COUNCIL-15** | 入参校验 | `workspacePath` 是相对路径 / 不存在 / 是个文件 → 400 且**原话里带上那个路径**；`~` 展开成 home 再判；`maxRounds` 超上限按上限、非法值回落到缺省**而不是 0**；重复评审折叠；空/全空白议题 → 400 | `test:council-api` |
-| **COUNCIL-16** | **工程模式的两道隔离锁** | ①所有配方的 `env` 都带 `WORKGREMLIN_DISABLE=1`；hook 认到就**原地退出**（不连服务端、不写状态文件、退出码 0），插件两条入口都认（返回的形状不许变，否则 7F 会当成"插件加载失败"）；②7F/8F 配方发的 `--title`、6F 的 `--name` 都等于会话清单过滤的那个标题；2F 没有标题开关，它把提示词存成标题，所以提示词开头固定带 `COUNCIL_PROMPT_MARKER` —— 同库同工程里**用户会话照常列出、只有参与者那条被挡住** | `test:council-agents`、`test:claude-hook`、`test:council-quiet-plugin`、`test:kilo`、`test:opencode`、`test:cline` |
-| **COUNCIL-17** | **报告落盘** | 收尾后**只**在 `~/.workgremlin/councils/<id>/` 下写出 `report.json` / `reviews.csv` / `rounds.csv` / `report.md`；即使发起时填了工程目录，也**不往工程里写任何文件**（工程只读写、不写）；CSV 带 UTF-8 BOM、逗号/引号/换行按 CSV 规则转义、CRLF 行尾；**已存在的文件绝不被覆盖**（同名加时间戳）；报告 schema 固定（含 plan / 每轮 `RoundResult` / 裁决 / 最终稿 / 改动说明 / warnings / files）；词元取不到写「—」、只报一半写「≥ N」，**绝不补 0** | `test:council-report`、`test:council-orchestrator` |
-| **COUNCIL-18** | **新表结构与无投票** | 全新库直接建七张 `council_*` 表；`verdict` 的 CHECK 认 `completed/partial/needs_clarification/cancelled/failed`；**没有** `mode` / `threshold` / `vote` / 票数列；`completed`、`partial` 与 `needs_clarification` → `done`、`cancelled` → `cancelled`、其余 `failed`；旧表 CHECK 缺新状态时只重建对应表，council / participant / utterance 历史与 `AUTOINCREMENT` 序列保留；删除会清掉全部子行，进行中的会删除返回 409 | `test:council-store`、`test:council-api` |
-| **COUNCIL-19** | **失败、恢复与「工作中」标识** | 第 0 轮主持人真的无可用输出（CLI 退出码 0 且解析不出正文）→ `unparsed`，会议立即 `failed`，**不再发起提案 / 评审**，错误写明轮次 / 阶段 / 楼层与原始输出尾部，报告照常归档，参与者不留 `running`；transcript 在最后一个完整 `result` / assistant 事件之后被截断 → 从完整前缀恢复正文与用量，不误判失败；主持人返回具体 `needsClarification` → `needs_clarification` / `done`，只跑第 0 轮，主持人不是「没答上来」，其余角色为 `skipped`，报告照常归档；评审失败 / 未解析 → 不进入主持人汇总，`turn_failed` 进报告；完成过一轮后再失败 → `partial`；`progressOf` 在调用进行中返回 `{roundNo, phase, floors}` 并随 WS 推送，会议结束后为 `null`；详情接口同样返回 `progress`，刷新后可见 | `test:council-parse`、`test:council-agents`、`test:council-runner`、`test:council-orchestrator`、`test:council-api`、`test:council-ui-store`、`test:render-smoke` |
-| **COUNCIL-20** | **右侧只显示汇总** | 收敛度取**最后一轮**的服务端分值并同时展示公式；n 条意见 / n 条 blocker / n 处冲突；三名角色的楼层、模型、词元各一行，没有用量写「—」；需要补充信息时逐条显示具体问题；**页面上不出现任何投票痕迹** | `test:render-smoke`、`test:council-timeline` |
-| **COUNCIL-21** | **完整过程折叠 + 每轮 diff** | 过程区是 `<details>` 且**默认不展开**（不带 `open`）；第 0 轮展示拆题与分工；首版提案不写 diff（明确占位），后续每轮展示与上一版的 diff；每轮评审（严重度 + 立场 + 证据 + 建议）与主持人汇总（共识 / 未决 / 冲突双方 / 硬指令 / warnings）原文照录；失败 / 未解析的发言展示原话与原因，**不替它编一条意见**；**每轮（含第 0 轮）末尾保留全部发言的原始输出**（楼层 / 阶段 / 状态 / 耗时 / 错误原文）；fail-fast 中止后没有 `RoundResult` 的轮次标为「未完成」并列出已发生的发言，裁决 / 交付轮**不得**被误标为未完成；`partial` 没有裁决块与报告文件块，但仍显示谁没答；运行中显示实时标记与已有汇总 | `test:render-smoke` |
+| **SC-01** | Task start → busy | `POST /api/v1/task/start` creates a `running` task; card `state='busy'`, `stateSince = started_at` | `taskSync`, `taskRunsRoute` |
+| **SC-02** | Pending is not busy | A `pending` task without a running task → member `idle`; negative: must not render `busy` or claim a current task | `taskRunsRoute` (shape) |
+| **SC-03** | Task end → idle | `POST /api/v1/task/end` with `done` / `failed` / `cancelled` → `idle` when no other running task exists in that session | `taskSync`, `finalStop` |
+| **SC-04** | Several running tasks in one session | Member stays `busy` until the **last** running task ends; ending one does not flip the card to idle | `taskSync` |
+| **SC-05** | Thinking / waiting for the model stays busy | A task that emits no progress for 10+ minutes is still `running` → `busy`; negative: no timeout-driven `idle` | Specified |
+| **SC-06** | Authorization wait → blocked | Permission hook writes a `blocked` row (`awaiting_permission`); card `state='blocked'`, `stateSince` = first blocked timestamp | `hookDispatch` |
+| **SC-07** | Blocked does not leak between sessions | Member has session A `blocked` and session B with a running task: A renders `blocked`, B renders `busy`, C renders `idle` | `memberTask` |
+| **SC-08** | Blocked is per member as well | Two members with the same name in different projects keep independent blocked rows; no card cross-contamination | Specified |
+| **SC-09** | Repeated blocked is idempotent | A second permission event for the same session does not move `stateSince` and emits no duplicate card update | `hookDispatch` |
+| **SC-10** | Blocked clears on task progress | `POST /api/v1/task/progress` deletes only that session's blocked row; state falls back to the running task (`busy`) or `idle` | `taskSync` |
+| **SC-11** | Blocked clears on task end | `POST /api/v1/task/end` clears the session's blocked row before deriving the new state | `taskSync` |
+| **SC-12** | Blocked clears on session end | `SessionEnd` hook clears that session's blocked row; other sessions are untouched | `hookRuntime` |
+| **SC-13** | Blocked clears on idle notification | A permission-resolved / idle notification clears the row; the card updates once | `hookDispatch` |
+| **SC-14** | Clearing one session leaves the other blocked | Clearing session A keeps session B `blocked`; negative: a global clear is a bug | `memberTask` |
+| **SC-15** | Status timestamp comes from `stateSince` / task start | Busy card shows the absolute task start (`MM-DD HH:mm`); idle card shows the absolute last-active time (`—` when absent); no fabricated duration | `memberTask` |
+| **SC-16** | Age never changes state | A 6-hour running task is still `busy`; a 6-hour blocked row is still `blocked`; no sweep, no lease, no expiry | Specified |
+| **SC-17** | WS ping / reconnect does not change state | Drop the socket, let the ping timeout fire, reconnect, fall back to polling: only `connection` events change; `state` and `stateSince` are stable | `wsReconnect` |
+| **SC-18** | Server restart preserves derived state | Restart with the same DB: running tasks still yield `busy`, blocked rows still yield `blocked`, finished tasks yield `idle`; no synthetic transition event | `taskRecover` |
+| **SC-19** | Borrowed busy for a resident gremlin | A resident gremlin with a same-named ghost working in the same session renders `busy`; in the borrowed case its own card carries no task row | `agentRoster`, `memberTask` |
+| **SC-20** | Borrowed busy is display-only and scoped | Ghost finishing clears borrowed busy; another session does not borrow it; resident's own task wins over a borrowed one; idle resident does not borrow | `agentRoster`, `memberTask` |
+| **SC-21** | Last active = latest task start/end | `lastTaskAt` = max over the member's tasks; `lastTaskAtBySession` is per session; no task → `null`, UI shows `—` | `memberTask` |
+| **SC-22** | Vanished sessions are reconciled | `pruneSessionStatuses` closes running tasks of removed sessions as `cancelled`, removes their blocked rows, broadcasts one card | `sessionCompact`, floor suites |
+| **SC-23** | Multi-member isolation | 16 members with mixed states update concurrently; each card keeps its own state and timestamp | Specified |
+| **SC-24** | Legacy / unknown state strings normalize | `online`, `paused`, `weird` all render as `idle`; label, tone and test id agree | `memberTask` |
+| **SC-25** | Missing task title is not invented | Empty title renders `(未命名任务)` (records) or the idle label on a card; never the previous task's title | `doneShape` |
+| **SC-26** | Missing data is shown as missing | No progress percentage, no file, no artifact → `—` / "no file"; negative: no `0%`, no fabricated filename | `memberTask` |
+| **SC-27** | Update merge window | Several reports within 200 ms produce one `member.status` carrying the final card, not a burst of intermediate states | Specified |
+| **SC-28** | Repeated progress does not move `stateSince` | Progress on the same running task keeps `stateSince = started_at`; no state churn | `taskSync` |
+| **SC-29** | Selected session chooses the task | `currentTaskOf` returns the running task of the requested session; an unknown session returns none; no session returns the newest (demo path) | `memberTask` |
+| **SC-30** | Per-session renderer precedence | `blocked` beats a running task in the same session; a running task beats a borrowed summon; otherwise idle | `memberTask` |
+| **SC-31** | Three states are distinguishable without color | Label + shape/icon + text all differ; color is not the only channel | Specified |
+| **SC-32** | No fourth state exists in the contract | `AGENT_STATES` is exactly `['busy','idle','blocked']`; no code path writes another value | `agentRoster` |
 
+"Nearest suite" names the suite that covers at least the core of the case. `Specified` means the behavior exists but has no dedicated automated case yet; add one before the milestone exit.
 
-### 3.16.2 人工烟测（自动化覆盖不到的部分）
+#### 3.2.5 Explicitly removed behavior (do not test as a feature)
 
-外部 CLI 的真实输出格式只能真跑才知道 —— 2026-10-01 的烟测正是这样抓到两个单测全绿的真 bug
-（opencode 的正文在 `part.text` 而不是 `parts`；CodeBuddy 给的是整个对话数组、
-把提问原文当成了它的发言）。两条都写进了 `implementation-status.md` §4.2。
+The following were deleted with the old model. A test that exercises them is a bug in the test:
 
-| 项 | 怎么做 | 期望 |
+- Transition matrices between five states and "illegal transition" correction rules.
+- Liveness timeout constants (`HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `A_SILENT_TIMEOUT`, `BLOCK_GRACE`, `ERROR_WINDOW`, `CLOCK_SKEW_TOL`) and their boundary sampling.
+- The `degraded` flag (D1–D5), the "9 visible combinations + 1 normalized" display matrix, and degraded-specific visual assertions.
+- "Offline after N seconds" and "task still running after ping loss → degraded" cases.
+- `agent_status_history` replay and synthetic intermediate states.
+
+### 3.3 Message integrity
+
+Current reality: messages are stored in SQLite with a `dedupe_key`; ordering is `ts_ms` with `id` as a deterministic tiebreaker. The FTS5 trigram table and triggers exist, but the query layer still uses `LIKE`. There is **no virtual scrolling** and no client-side streaming message reassembly yet.
+
+**Message retention and archival are not implemented.** The only automatic cleanup is **task-record retention** (§3.4): deleting a task record older than the configured number of days also deletes the messages, artifacts and tool-usage rows tied to that task id. There is no message-count cap and no JSONL export; `archived_at` exists but is never populated.
+
+| ID | Case | Assertion | Status |
+| --- | --- | --- | --- |
+| MS-01 | No loss | Inject 10,000 unique messages; count of unique `msgId` = 10,000 | Specified |
+| MS-02 | No duplication | The same `dedupe_key` delivered 3 times (including across reconnect) yields 1 row; unique index holds | Automated (`pluginIngest`) |
+| MS-03 | Out-of-order timeline | Within a ±5 s window, sort by `occurredAt`; equal timestamps break ties by message id, so repeated runs are identical | Specified |
+| MS-04 | Streaming message | Token merge and a terminal `stream_end`; a missing terminal event must not leave a permanent "typing" state | Planned |
+| MS-05 | 100k virtual scrolling | DOM ≤ 80 nodes, first render ≤ 500 ms, ≥ 55 fps, memory delta ≤ 200 MB | **Planned** — no virtual list exists |
+| MS-06 | Auto-follow | At the bottom, new messages scroll into view; after the user scrolls up, follow pauses and a jump control appears; returning to the bottom resumes | Specified |
+| MS-07 | Filter by member | Single / multiple / all members produce the exact set difference expected | Automated (`taskFilter`, `projectScope`) |
+| MS-08 | Filter by time | Boundary semantics are documented (half-open recommended); UTC storage, local display | Automated (`timeRange`) |
+| MS-09 | Keyword search | Matches content / sender / recipient, case-insensitive; regex metacharacters do not throw; Chinese substring works; 100k messages ≤ 300 ms | Specified (LIKE path) |
+| MS-10 | Filter + search + live insert | A new message enters the current filtered view without destroying the scroll position | Specified |
+| MS-11 | 1 MB single message | Renders without freezing; collapse/truncate with a copy path; no storage cap today | Planned |
+| MS-12 | Legacy message schema | An old row renders or is clearly marked "unrecognized type"; no crash | Specified |
+| MS-13 | Messages follow their task record | When task-record retention deletes a task, its messages disappear with it by task id; this targeted cascade is expected, not message loss | Automated (`retention` partial) |
+| MS-14 | Retained messages are untouched | A message whose task is newer than the cutoff survives the sweep; the sweep never deletes unrelated messages | Specified |
+| MS-15 | No message archive | `messages.archived_at` stays `NULL`; there is no "archived N messages" notice or export. Negative: do not claim an archive exists | Specified |
+| MS-16 | 64 KB truncation | `content_truncated` column exists; no truncation logic is implemented yet. When added: boundary 65536 / 65537 and search must not match the removed tail | **Planned** (column only) |
+
+> Task-record retention is destructive and uses wall-clock time. Tests must create rows relative to the real `Date.now()`, never a fixed absolute timestamp.
+
+### 3.4 Persistence and crash recovery (SQLite)
+
+Current reality: WAL, `secure_delete = ON`, `synchronous = NORMAL`, one writer connection, automatic retention cleanup, schema migration in `server/src/db/index.js`, single-instance lock in the Electron main process.
+
+| ID | Case | Assertion |
 | --- | --- | --- |
-| 各层命令 | 各开一场「主答 + 主持人 + 一个评审」的小会（`WORKGREMLIN_HOME` 指向临时目录，**别碰用户自己的库**） | 各自的正文能读出来、结构化评审块解析得到、模型与词元能归到对应角色 |
-| 关工具真的有效 | 在临时目录里放一个标记文件，让它去读 | 读不到（8F 实测：不锁时能读到，锁上后工具调用被拒；2F 实测：写文件被拒、`read_files` 正常） |
-| 无孤儿进程 | 会开完（或被取消）后 `ps` 查这帮 CLI | 一个都不剩；`/tmp` 下的一次性目录被清掉 |
-| 拿不到就留空 | 看 8F 的词元 | 显示「—」而不是 0（OpenCode 确实不发 usage） |
-| **真读到代码了吗**（工程模式） | 拿一个真实工程目录发起，问一个**只有看代码才知道**的问题（例如"这个函数在哪儿被调用"） | 回答里出现**真实的文件名 / 符号**，不是在复述材料 |
-| **工程目录原封不动**（工程模式） | 跑完一场后看那个目录 | `git status` 干净、没有新增文件、目录还在（这条**单独手验一遍再合**） |
-| **办公室还是干净的**（工程模式） | 跑完一场后看办公室、任务记录、2F/6F/7F/8F 的会话清单 | 都看不到参与者（各家 CLI **自己的**界面里还会留着那几条"议事厅参与者"，那是 CLI 的历史，我们只读不写）。**6F 这条待装好 Qoder CLI 的机器上确认** —— `--name` 是否进 transcript 还没真机验过 |
+| DB-01 | Basic read/write | WAL enabled; batch writes in a transaction; reads do not block writes |
+| DB-02 | Schema migration | Migrations are idempotent, forward-only, and preserve data; a failed migration aborts, it does not half-apply |
+| DB-03 | `kill -9` | After restart, loss ≤ 1 s or ≤ 500 messages; `PRAGMA integrity_check` = ok |
+| DB-04 | Renderer crash | Main process survives, recreates the window, state restored from DB ≤ 2 s |
+| DB-05 | Main-process crash | Cold start rebuilds a consistent state from tables; no half-written row |
+| DB-06 | Disk full / read-only | Clear error, no corruption; recovery after space is freed |
+| DB-07 | Multiple instances | Single-instance lock; the second launch focuses the existing window instead of opening a second writer |
+| DB-08 | Task-record retention | Default 90 days (clamp 1–3650); a settings change cleans immediately; a daily sweep follows; deleting a top-level task removes its child tasks, messages, artifacts, tool usage and subagent rows, while newer records stay intact |
+| DB-09 | Concurrent read/write | High-frequency writes do not block UI queries beyond the latency budget |
+| DB-10 | State recovery consistency | After restart, the card state equals the derivation from `tasks` + `session_status`; no replay of a liveness signal is required |
+| DB-11 | Archive fields present | `messages.archived_at` column and index exist; `content_truncated` exists; new rows default to `NULL` / `0` |
+| DB-12 | Archive export | **Planned** — a future archive path that exports JSONL before deletion, importable and count-verified. It does not exist today; current retention deletes task records without an export |
+| DB-13 | `secure_delete` / WAL checkpoint cost | At 1,000 events/s, throughput ≥ 1,000 events/s and P95 ≤ 300 ms; record the comparison with `secure_delete=OFF` and `ON + checkpoint(TRUNCATE)`. If P95 degrades by > 20%, escalate |
+| DB-14 | Dual-connection contingency | **Not implemented.** If adopted: writer with `secure_delete=OFF`, delete path with `ON + TRUNCATE`, no deadlock, no lost write |
+| DB-15 | Reverse validation of security assertions | Deliberately disable a protection and confirm the assertion **fails**; an assertion that passes with the protection off has no detection power |
+| **DB-16** | **Liveness-era schema migration** | A legacy DB with `agent_status` / `session_status` columns `task_id`, `last_heartbeat_at`, `degraded`, `source` and `members.last_seen_at` migrates in place: those columns are dropped, `agent_status` keeps only borrowed `busy`, `session_status` keeps only `blocked`, `projects.source='timeout'` becomes `'watch'`, and members / tasks / messages survive |
+| DB-17 | Project attribution | Reports resolve the project from `workspacePath` first, then fall back to the request's `project`; two agents in different directories never write into the same project by accident |
+| DB-18 | Identity normalization | `client` is the floor base name (`codebuddy`, `kilo`, `opencode`, `claude`, …); `form` is `vscode` / `cli` / `ide` or `null`; `agentBase` strips only `@project` and lowercases; `isPluginClient(form)` and `formToSource(form)` are the only source of plugin/cli/ide |
 
-**取样纪律**：烟测产出的原始 stdout 要**原样存进单测**（见 COUNCIL-04）——
-照着猜的线格式写测试等于没测，这是那次两个 bug 的共同根因。
+### 3.5 Desktop-specific behavior
 
-## 4. 缺陷分级标准
-
-### 4.1 严重度（Severity）
-
-| 级别 | 名称 | 判定标准（满足任一） | 响应时限 |
+| ID | Case | Assertion | Status |
 | --- | --- | --- | --- |
-| **S1** | 阻断（Blocker） | 应用无法启动/安装/升级；主进程或渲染进程崩溃且无法自恢复；核心功能不可用；消息丢失或状态长期错误；数据损坏（`integrity_check` 失败）；安全配置被绕过；原生模块在目标平台不可用且被静默降级；**明文凭据落盘（脱敏失效，SEC 三层验证任一命中）** | 立即停测，24 h 内修复或给出绕过方案 |
-| **S2** | 严重（Critical） | 核心主流程错误但可绕过；状态机/心跳判定错误（**含非法转换未被拒绝、degraded 语义错误**）；消息丢失/重复率 > 0.1%；归档导致消息丢失；**进度伪造 0%/100%（PRG-02）**；**S2 及以下事件触发了通知（NOT-02）**；**通知限流/免打扰失效**；**脱敏误伤率 > 0.5%**；P95 > 2× 阈值；高频下 < 30 fps 或 > 500 ms 卡顿；崩溃恢复丢失 > 1 s；任一支持平台核心路径不可用 | 当前迭代必须修复 |
-| **S3** | 一般（Major） | 次要功能异常；UI 显示/布局错误；过滤搜索边界错误；监听降级无提示；P95 在 1–2× 阈值之间；万级消息内存超阈值但无 OOM；demo 模式缺标识 | 下个迭代修复 |
-| **S4** | 轻微（Minor） | 文案/拼写/图标；样式细节；a11y 提示缺失；日志不友好；性能轻微不达标 | Backlog |
+| DS-01 | Cold start | First window visible ≤ 3 s (warm) / ≤ 5 s (cold) | Specified |
+| DS-02 | Install | Silent install on all three platforms; first launch succeeds | Planned (packaging) |
+| DS-03 | Upgrade | Config, DB, window position preserved; migration succeeds; rollback path exists | Planned |
+| DS-04 | Code signing / notarization | macOS notarization or documented ad-hoc path; Windows SmartScreen behavior recorded | Planned |
+| DS-05 | Cross-platform consistency | Same L4 suite on all platforms; path separators, watcher backend, tray, menu, shortcuts differ correctly | Planned |
+| DS-06 | Architecture scope | x64 only; `--arch` accepted without error; no ARM artifact | Planned |
+| DS-07 | Focus / minimize | Background throttling (RT-07); refocus syncs immediately | Specified |
+| DS-08 | Sleep / lock screen | After 30 min sleep, reconnect ≤ 5 s with backoff and jitter; missed messages backfill without duplicates; workstation state does not change just because time passed | Automated (`wsReconnect` partial) |
+| DS-09 | Network switch | 60 s without network → reconnect; the UI distinguishes disconnected / reconnecting / connected; no silent failure | Automated (`wsReconnect`) |
+| DS-10 | Multi-monitor / DPI | 150% / 200% scaling keeps layout intact; window position remembered per display | Specified |
+| DS-11 | High contrast / dark mode | Readable after theme switch (contrast ≥ 4.5:1) | Specified |
+| DS-12 | Security configuration | `contextIsolation: true`, `nodeIntegration: false`, restricted preload bridge; `webSecurity` is not disabled | Specified |
+| DS-13 | Uninstall | User-data policy documented; reinstall is not blocked by leftovers | Planned |
+| DS-14 | No hardcoded architecture | Packaging config, CI and scripts must not contain literal `x64` / `ia32` / `arm64` / `universal`; arch comes from CLI/env. `electron-builder.yml` passes `--x64` today; a static check script is **planned** | Specified |
+| DS-15 | Package size | Not a gate; record measured size in release notes; > 200 MB raises an S4 note | Planned |
 
-### 4.2 优先级（Priority）
+### 3.6 Data-source robustness (floors, hooks, watchers)
 
-| 级别 | 含义 |
+**Status of the A-route watcher:** not implemented. There is no chokidar-based directory watcher. Data arrives through three paths:
+
+1. **Hooks** (`/api/v1/hook`) — authoritative for task start/end, permission waits, session end.
+2. **Floor readers** (`server/src/floor*.js`, `server/src/sessions.js`) — poll product data directories and parse session/transcript files. File mtimes and idle windows describe a **session's** activity phase; they are not a workstation state.
+3. **Subagent manifest** (`.workgremlin/subagents.json`) — polled plus `fs.watch`, debounced.
+
+The old "poll as a fallback" path, which also set a separate trust flag, does not exist. Polling is the normal path for floor scanners and never changes a workstation state.
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| FW-01 | Partial write | A half-written JSON/JSONL file is skipped; the last good state is kept and retried; no dirty state, no crash |
+| FW-02 | Atomic write | Producer writes tmp then renames; the reader sees either the old or the new complete file |
+| FW-03 | Directory removed | `ENOENT` → no crash; scanner backs off (1→2→4→…→30 s with jitter); existing workstation state is untouched |
+| FW-04 | Directory recreated | Next poll picks the directory up; changes during the gap are reconciled |
+| FW-05 | Permission change | `EACCES` / `EPERM` skips the file, keeps other products working; recovery is automatic |
+| FW-06 | Many files / deep trees | 10,000 files do not cause `EMFILE`; the first paint is not blocked by the scan |
+| FW-07 | Event flood | 10,000 changes in 1 s are coalesced (50–100 ms trailing window injectable); CPU stays bounded; the manifest watcher does not emit per-file cards |
+| FW-08 | Poll cadence | The scanner interval is configurable; a long interval does not make a working task idle — tasks end only on an explicit end / cancel / session reconciliation |
+| FW-09 | Network drive **[M4]** | NFS/SMB behavior evaluated; no support claim before M4 |
+| FW-10 | WSL **[M4]** | WSL1/2 path and watch semantics evaluated; not in M0–M2 exit |
+| FW-11 | Symlinks / case conflicts | Symlink loops terminate; case-insensitive filesystems normalize to one path |
+| FW-12 | Long paths / special characters | Spaces, Chinese, emoji and Windows paths > 260 chars parse without failure |
+| FW-13 | Resource leak | Switching watched directories 100 times does not grow handles (`lsof` count) |
+| FW-14 | Coexistence with hooks | The same task reported by hook and discovered by a floor scan does not create two tasks; superseded rounds are closed exactly once |
+| FW-15 | Sleep / clock jump | After a suspend or a clock jump, the next poll runs immediately; no phantom disconnection, no mass task cancellation, no state change from elapsed time |
+
+### 3.7 Demo mode
+
+Demo mode is a **UI action**, not a CLI flag. The HUD "演示模式" button calls `POST /api/v1/workspace` with an empty path (or `demo`), which opens the isolated demo project and seeds it on demand; "退出演示" returns to the previous project. `syncDemo` also starts a ticker so the demo moves. The generator is deterministic per seed and supports `WORKGREMLIN_DEMO_FIXED_TS=1` for snapshot-stable absolute timestamps.
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| DEMO-01 | Single entry point | Demo starts only from the HUD action / `POST /api/v1/workspace {path:''}`. Negative: there is no `--demo`, `MOCK=1` or `WORKGREMLIN_DEMO=1` startup switch |
+| DEMO-02 | Zero external dependencies | No real agent, network or watched directory is required; office and cards render within 3 s |
+| DEMO-03 | Determinism | The same seed produces identical members, tasks, messages and relative timestamps; `WORKGREMLIN_DEMO_FIXED_TS=1` makes absolute timestamps stable for DOM snapshots |
+| DEMO-04 | Isolation | The demo project has its own rows; exit restores the previous project; no demo member, task or message leaks into a real project |
+| DEMO-05 | Same components | Demo and real data use the same components and `data-testid` selectors; switching the source does not change DOM structure |
+| DEMO-06 | Coverage | Demo data covers all three states (`busy` / `idle` / `blocked`), includes at least one ephemeral ghost and one error-level message, and ≥ 200 messages |
+| DEMO-07 | Clear labeling | UI shows `演示模式`; the session dropdown has exactly one entry, `演示工程 · 演示会话`; leaving is only via `退出演示` |
+
+### 3.8 Native-module build verification (electron-rebuild / better-sqlite3) — M0 highest risk
+
+> **Hard constraint:** on failure, do **not** silently fall back to `node:sqlite`, `sql.js` or an in-memory store. Any fallback requires written leader approval and a matching update to §3.4 and the persistence design.
+
+#### 3.8.1 Verification matrix
+
+| # | Platform | Arch | Target Electron | Milestone | Priority |
+| --- | --- | --- | --- | --- | --- |
+| N1 | **Linux x64** (Ubuntu 22.04 / 24.04, dev machine) | x64 | version pinned by `package.json` | **M0 exit** | P0 |
+| N2 | Windows x64 (10/11) | x64 | same as N1 | **M3 matrix** (early smoke in M1 recommended) | P1 |
+| N3 | macOS x64 (13+) | x64 | same as N1 | **M3 matrix** (early smoke in M1 recommended) | P1 |
+
+> ARM is out of scope (§0). Extending the matrix later does not change the process.
+
+#### 3.8.2 Commands (actual scripts)
+
+```bash
+# 1) Baseline
+node -v && npx electron --version
+
+# 2) Rebuild better-sqlite3 against the installed Electron ABI
+npm run rebuild:native          # scripts/postinstall.js -> electron-rebuild -w better-sqlite3 -v <electron>
+
+# 3) Verify inside Electron, not plain Node
+node -e "console.log(process.versions.modules)"      # ABI
+#   in the Electron main process: require('better-sqlite3') succeeds and new Database() works
+
+# 4) Packaged artifact (asar scenario); arch comes from the CLI, not the config
+npm run build
+npx electron-builder --linux AppImage --x64
+
+# 5) Storage smoke test
+npm run db:check                # create tables / write 10k / read back / integrity_check
+```
+
+#### 3.8.3 Success criteria (all required)
+
+1. `require('better-sqlite3')` succeeds **in the packaged Electron main process**, not only in Node.
+2. `process.versions.modules` matches the compiled target; no "compiled against a different Node.js version" error.
+3. Storage smoke passes: create → write 10,000 → read back the same count → `PRAGMA integrity_check` = ok.
+4. The `electron-builder --dir` artifact starts with a usable DB (`asarUnpack` correctly unpacks `.node`).
+5. No error-level native-module log on cold start; DB-01 passes in both L3 and L4 contexts.
+
+#### 3.8.4 Failure escalation (in order; do not skip to a fallback)
+
+| Step | Action | Note |
+| --- | --- | --- |
+| 1 | `npm run rebuild:native` | Most failures are an ABI mismatch |
+| 2 | Retry with a `prebuild-install` mirror; `--build-from-source` as a fallback | Common on CI networks |
+| 3 | Align `better-sqlite3` with a version that supports the Electron major | Record the constraint in `package.json` |
+| 4 | Pin the Node / Electron pair in CI and `.nvmrc` | Prevent drift |
+| 5 | **Escalate to leader for written approval** before `node:sqlite` or `sql.js` | Silent fallback is forbidden; approval implies updating §3.4 |
+
+#### 3.8.5 Gates
+
+- `npm run rebuild:native` must exit 0 after install; `WORKGREMLIN_SKIP_REBUILD=1` is an explicit, reported exception, not a silent pass.
+- `npm run db:check` is the current storage gate.
+- **Planned:** a `native:check` script that requires native modules inside the Electron main process and prints ABI/versions, and a `check:arch-param` static script. Neither exists today; do not report them as green.
+
+### 3.9 Spikes
+
+#### 3.9.1 Round A — 100k-message virtual list (**M1 kickoff; not implemented**)
+
+**Purpose:** choose a virtual-list approach before the record view grows. There is no virtual list today; `MessageList.vue` renders every row.
+
+| ID | Minimal case | Gate |
+| --- | --- | --- |
+| SPIKE-01 | First render of 100k rows | ≤ 500 ms |
+| SPIKE-02 | Continuous scrolling | avg ≥ 55 fps, min ≥ 40 fps |
+| SPIKE-03 | DOM node count | ≤ 80 (visible + buffer) |
+| SPIKE-04 | Memory delta | ≤ 200 MB; no growth after 5 min of scrolling |
+| SPIKE-05 | Live append (100/s at the tail) | ≥ 50 fps; auto-follow correct |
+| SPIKE-06 | Keyword search over 100k | ≤ 300 ms |
+| SPIKE-07 | Filter switch (member / time) | ≤ 200 ms; scroll position and view correct |
+| SPIKE-08 | 1 MB single message | No freeze; collapse/truncate works (MS-11) |
+
+**Deliverables:** fixed vs variable row height, library vs custom, recycling/buffer policy; baseline numbers for CI comparison (20% regression warns); updated MS-05 thresholds if a gate is not met.
+
+#### 3.9.2 Round B — Chinese FTS5 tokenization (**M2 kickoff; partially available**)
+
+**Status:** the messages table has an FTS5 trigram table and triggers. **The query layer still uses `LIKE`**, and the tokenizer is not configurable. Cases below are design; only the raw FTS table can be measured today.
+
+| ID | Option | Gate (Chinese corpus, 100k) |
+| --- | --- | --- |
+| SPIKE-09 | FTS5 `unicode61` + custom bigram | < 200 ms; recall ≥ 95% for 2+ character Chinese terms |
+| SPIKE-10 | FTS5 `trigram` | < 200 ms; recall ≥ 95%; record index size |
+| SPIKE-11 | `LIKE '%kw%'` fallback | Measure; baseline if A/B fail |
+| SPIKE-12 | Index maintenance cost | Build ≤ 30 s for 100k; 100 appends/s do not block writes; index growth ≤ 50% of DB |
+
+Interactions that decide the M2 search contract:
+
+- **Redaction × search:** a credential's plaintext must return 0 hits (SEC-12). When redaction lands, the UI must say "some content is redacted and may not be searchable" rather than returning a silent empty result.
+- **Ordering:** FTS hits still obey MS-03's deterministic timeline.
+- **Case / width:** Chinese keywords ignore full-width/half-width differences; English is case-insensitive.
+
+**Deliverables:** chosen option (A/B/C), measured Chinese latency and recall, index size/build time; update MS-09 from "≤ 300 ms" to the measured contract.
+
+### 3.10 Progress display (honest, optional data)
+
+**Current reality:** the progress bar was removed from the workstation card, the office monitor and the task-detail row on 2026-09-29. Observed `tasks.progress` values across the local store were only `0` (start) and `1` (finish), so any bar showed a fake empty/full state. The server still accepts `progress` (0..1) from `/api/v1/task/progress` and stores it; at task end it defaults the stored value to `1` when the caller omits it.
+
+`ProgressBar.vue` still exists and renders a missing value as the `progress.unknown` label (`进度未知（未上报）`), but it is not mounted on any card. Restoring it requires a real per-round progress source, which does not exist.
+
+There is **no** `progress_source` field, no `reported | derived | unknown` tri-state, no subtask-derived percentage, and no "unknown" animation on a card. Progress never changes a workstation state; a progress event only clears that session's blocked row.
+
+The app-wide rule for unavailable data is `—` or an explicit "unreported" label (tokens `—`, last active `—`, files `未上报文件`), never `0`. The unused `ProgressBar` follows the same rule with its `progress.unknown` label.
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| PRG-01 | No fabricated bar | Workstation card, office monitor and task detail contain **no progress bar and no visible task-percentage text** for a running task (Gantt position styles are not progress) |
+| PRG-02 | Missing progress is not zero | A task with `progress = null` never renders `0%`; where `ProgressBar` is used in a harness, null renders the `progress.unknown` label (`进度未知（未上报）`), not a number |
+| PRG-03 | Real zero is preserved | A reported `0` stays `0` in the API and record data; it is not replaced by 100 and not dropped |
+| PRG-04 | Real value round-trips | `POST /api/v1/task/progress {progress:0.42}` returns `progress=0.42` from `/task-runs`; the UI does not invent a different number |
+| PRG-05 | Progress does not create busy | A progress event for an unknown task id does not create a task and does not make the member busy; on a running task it keeps `busy` and clears that session's blocked row |
+| PRG-06 | Completion is not a bar | Ending a task is conveyed by task state and end time, not by a bar reaching 100%; the stored default of 1 at end must not be rendered as a visual percentage |
+| PRG-07 | No derivation | No percentage is computed from subtasks, file counts or elapsed time |
+| PRG-08 | No backfill | A later `null` does not resurrect an earlier value; a missing value stays missing end-to-end |
+
+**Testability requirement:** when real progress returns, the value must be a structured object `{ value: number|null }` (and, if sources return, a `source` field). A bare number cannot distinguish "really 0%" from "unknown".
+
+### 3.11 Notifications
+
+**Status: not implemented.** There is no `Notifier` interface, no system-notification bridge and no notification settings. Nothing in this section may be reported as passing.
+
+The former trigger (`blocked` / `error` / `offline > 60 s`) is void because two of those states no longer exist. With three states, the **only candidate S1 state is `blocked`**. Whether a notification fires on entry, after a duration, at most once per row, or per session is a product decision that must be made before M3. Until then, NOT-01 is blocked on that decision; NOT-02..NOT-15 are specifications for the implementation.
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| NOT-01 | **Candidate S1 trigger** | **Planned / trigger not yet defined** — entering `blocked` is the only candidate. Do not assert an `error` or `offline` trigger; those states do not exist |
+| NOT-02 | Lower-priority events do not notify | Notification count = 0 for: `idle`↔`busy` changes, task start/end, new messages, progress updates, blocked clearing, WS reconnect, session switch. Assert each independently |
+| NOT-03 | No duration-based state trigger | Waiting any number of minutes does not change state, so no "offline after 60 s" notification can exist; a blocked-duration trigger, if adopted, must be defined by product |
+| NOT-04 | Defaults | Fresh data directory: system notifications **on**, sound **off**; defaults are readable in settings, not only visible in UI |
+| NOT-05 | Content | Member name, event type, local time; no sensitive value (see SEC-13) |
+| NOT-06 | Do-not-disturb active | S1 events inside the window do not pop |
+| NOT-07 | DND midnight boundary | 21:59:59 pops, 22:00:00 does not, 07:59:59 does not, 08:00:00 pops; a cross-midnight window is not parsed as an inverted range |
+| NOT-08 | DND time zone | Window follows local time; switching from UTC+8 to UTC−5 keeps the boundary correct |
+| NOT-09 | DND sleep/wake | Sleeping during the window and waking after it does not replay missed popups |
+| NOT-10 | No replay after DND | Events are recorded in the log and unread count; after the window they appear in the UI only, never as retroactive popups |
+| NOT-11 | Per-member mute | A muted member's S1 event produces no notification, but the office state still refreshes (notification and state are decoupled) |
+| NOT-12 | Mute × DND | A muted member stays silent outside DND; unmuting restores; mute persists across restart |
+| NOT-13 | Flood control | Many S1 events in a short window are aggregated; no notification storm |
+| NOT-14 | Permission denied | OS notification permission denied → in-app notice with guidance; no crash, no repeated permission prompts |
+| NOT-15 | No removed-state assertions | A test must fail if it references `error` / `offline` / `degraded` notification triggers; three-state vocabulary only |
+
+**Rate-limit proposal (for the future implementation)**
+
+| Dimension | Proposed value | Rationale |
+| --- | --- | --- |
+| Same member + same event type | At most 1 per 60 s (aggregate window 60 s) | Avoids repeated alerts for one persistent wait |
+| Global | At most 5 per 60 s; excess merged | Single aggregate message |
+| Burst | > 20 S1 events in 60 s → 1 summary + HUD badge | Prevents a storm when many sessions block at once |
+| Recovery | No "recovered" notification when blocked clears | UI state change is enough; optional setting later |
+
+### 3.12 Message redaction (Q5, P0 security baseline)
+
+**Status: not implemented.** No redactor exists, no message is rewritten before insert, and the three-layer verification below has never run. Until a `Redactor` module exists, SEC-01..SEC-17 are design requirements. Do not claim "plaintext never lands on disk" as a current property.
+
+**Hard constraint for the future implementation:** plaintext credentials must not appear in the database file, indexes, FTS shadow tables, WAL, archive JSONL or logs.
+
+#### 3.12.1 Three-layer verification (all required)
+
+| Layer | Method | Assertion |
+| --- | --- | --- |
+| L1 API | Read the message back through the repository | `content` contains a mask (e.g. `sk-***MASKED***`) and `redacted: true` |
+| L2 SQLite | Bypass the app; `SELECT` every table, index and FTS shadow table (`*_content`, `*_data`, `*_idx`, `*_docsize`) | 0 plaintext hits |
+| L3 Binary | `cat` / `strings` / `grep -a` on `.db`, `-wal`, `-shm`, backups, archive JSONL | 0 plaintext hits |
+
+L3 pitfalls:
+
+- SQLite may leave deleted/updated bytes in **freelist** pages → `PRAGMA secure_delete = ON` (already set) and re-check after `VACUUM`.
+- The WAL may hold uncheckpointed plaintext → scan the WAL **before** checkpoint, then scan the main DB after `wal_checkpoint(TRUNCATE)`.
+- Archive export (DB-12) and debug logs are part of the scan surface.
+- Temporary in-memory caches and crash reports must not print plaintext.
+
+#### 3.12.2 Seven rule classes
+
+Each class needs **at least 2 positive cases + boundary cases**: one character short, case change, line wrap, inside a code fence, inside a JSON-escaped string.
+
+| ID | Class | Positive / boundary notes |
+| --- | --- | --- |
+| SEC-01 | `sk-` prefix key (OpenAI-style) | Standard length hits; one character short does not; `SK-` uppercase hits; inside a code fence hits; JSON escape hits; line-wrapped token not missed |
+| SEC-02 | `AKIA` (AWS access key ID) | Standard 20 chars hits; 19 does not; lowercase `akia` decision must be explicit; URL query hits |
+| SEC-03 | `ghp_` (GitHub token) | Standard 36 chars hits; one-char boundary; correct truncation before Chinese / newline / quote |
+| SEC-04 | JWT (`eyJ...`) | Three segments hit; **two segments do not**; wrapped JWT hits; > 2 KB JWT does not hang |
+| SEC-05 | PEM `PRIVATE KEY` block | Whole block hits; **multi-line PEM must be masked as a block**, not only the first line; missing header must not leave the body |
+| SEC-06 | Key-value `password` / `token` / `secret` / `api_key` | `password: "x"`, `"token"="x"`, `apiKey=x`, `PASSWORD=` hit; `passwords`, `tokenizer`, `secretary` must not be harmed; empty value behavior defined |
+| SEC-07 | Credentials in URL (`https://user:pass@host`) | Hits; credential-free URL untouched; IPv6, port and IDN handled |
+
+#### 3.12.3 False-positive baseline and switch
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| SEC-08 | False-positive rate | Fixed 200-item clean corpus (source, logs, Markdown, Base64, UUID, paths, SQL, CI output); rate = rewritten / 200; **≤ 0.5% (≤ 1 item)**; above that is S2 |
+| SEC-09 | Reproducible corpus | Clean samples live in `tests/fixtures/redaction/clean-*.txt` (planned path) and run on every rule change |
+| SEC-10 | Disable switch | Config / `--no-redact`: on (default) redacts; off stores plaintext with a visible warning; both directions tested |
+| SEC-11 | Archive and export | Archive JSONL, metrics export and log export contain no plaintext |
+| SEC-12 | Search interaction | Searching the plaintext returns 0 hits; the UI says "some content is redacted and may not be searchable"; the FTS index stores only redacted content |
+| SEC-13 | Notifications | Title and body never contain pre-redaction text |
+| SEC-14 | Logs and diagnostics | Debug/trace logs, crash reports and metrics labels contain no plaintext; scan `--export-metrics` output |
+| SEC-15 | Performance | 10k credential-bearing messages add ≤ 30% to write time; a 1 MB message redacts in ≤ 50 ms |
+| SEC-16 | Ordering and dedupe | Redaction happens after uniqueness is decided (or is independent of it): `msgId`, order and dedupe are unchanged |
+| SEC-17 | Mask stability | The same input always produces the same mask; the mask keeps a type hint (e.g. `[REDACTED:OPENAI_KEY]`) |
+
+> **Priority when implementation starts:** SEC-01..07, SEC-12 and the L1–L3 verification are M1 hard blockers (P0); the rest are P1.
+
+### 3.13 Read/write distinction (Q1)
+
+Current reality: `/api/v1/file/touch` records `op: 'read' | 'write'`; task detail maps `write` to "added". Workstation cards show a flat `currentFiles` list (paths only), taken from the selected task. There is no per-file read/write icon on the card today.
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| RW-01 | Read/write distinction in records | Task detail shows write vs read with a non-color channel (icon + label / text), testable via `data-op` if a per-file selector is added |
+| RW-02 | Same file read then written | The record reflects the later write; no stale "read only" entry |
+| RW-03 | Concurrent read and write | Displayed as "read + write" or by last event; semantics documented and no flicker |
+| RW-04 | Path normalization | `./a.ts`, `a.ts`, `/abs/a.ts`, symlinks and case variants collapse to one entry |
+| RW-05 | High-frequency debounce | Rapid file events do not churn the card (200 ms window suggested) |
+| RW-06 | List length | More than N (suggested 5) files collapse to "+M files", expandable; no layout break |
+| RW-07 | Missing data | No file info shows `未上报文件` / no tile, never a fabricated filename or the previous task's file |
+| RW-08 | Long path / special characters | Spaces, Chinese, emoji and long paths use middle ellipsis with a full-path tooltip |
+
+### 3.14 Compact mode (Q3)
+
+**Status: not implemented.** There is no threshold, no automatic switch and no density setting. The cases below are a specification for when it is built; the suggested threshold (more than 8 members) is unconfirmed.
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| CPT-01 | Threshold boundary | 8 members do not switch, 9 do (configurable); one sample on each side |
+| CPT-02 | Manual override | Manual toggle overrides auto and persists across restart |
+| CPT-03 | No loss of key information | State, current task, timestamp remain visible in compact mode (collapsible / tooltip); not avatar-only |
+| CPT-04 | Trigger dimension | Confirm member count vs available width; if width, add resize breakpoint tests (**open question**) |
+| CPT-05 | Large layout | 64 members do not overlap or break; scrolling ≥ 50 fps |
+| CPT-06 | No remount | Auto/manual switches do not recreate cards; badges and timestamps are preserved |
+
+### 3.15 Reverse control (Q7: dispatch / interrupt) — **M4, not tested before**
+
+Scope: dispatch a task and interrupt a run; each action requires confirmation and an event-log entry. **Status: not implemented.**
+
+| ID | Case | Assertion |
+| --- | --- | --- |
+| CTRL-01 | Confirmation required | Both actions open a confirmation with target member and action summary |
+| CTRL-02 | Cancel does nothing | Cancel / Esc sends no command (fake source asserts nothing was emitted) |
+| CTRL-03 | State after interrupt | After a successful interrupt the target follows the three-state derivation: running task ends → `idle` (or `blocked` if a blocked row remains); negative: never invent a fourth state |
+| CTRL-04 | Event log | Operator, time (UTC + local), target, action, confirmation result, execution result; auditable and replayable |
+| CTRL-05 | Unavailable target | A member with no live session / no workstation cannot be targeted; the action is disabled or requires extra confirmation |
+| CTRL-06 | No side effects | Double clicks do not send duplicate commands; failure gives clear feedback and does not fake a local state change |
+
+The Council (§3.16) is out of scope here: it never sends commands to a monitored session; participants are one-shot processes started by the server and have their own `COUNCIL-*` cases.
+
+### 3.16 Council (`COUNCIL-*`)
+
+Scope and capability boundary: `requirements.md` §15; implementation shape: `implementation-status.md` §4.2.
+
+Unlike the rest of this document, council tests **are already plain Node scripts**, attached to the root `package.json` as `test:council-*` (an `ok(label, condition)` counter; non-zero exit on failure). Twelve council suites exist: `council-parse`, `council-convergence`, `council-report`, `council-store`, `council-agents`, `council-runner`, `council-orchestrator`, `council-materials`, `council-api`, `council-quiet-plugin`, `council-timeline`, `council-ui-store`. This matches the repository convention: zero dependencies, `node file` directly, same runner locally and in CI.
+
+#### 3.16.1 Required assertions (ordered by real-world damage if wrong)
+
+| ID | Case | Assertion | Suite |
+| --- | --- | --- | --- |
+| **COUNCIL-01** | **Read-only guarantee** | 1F/4F `--tools` is `Read,Grep,Glob`, `--allowedTools` is the same list, and 4F's `--permission-prompts none` precedes the variadic args; 7F/8F inject only `read/glob/grep/list`, denying `bash/edit/write/webfetch` and `external_directory`; 7F's `plugin` is emptied | `test:council-agents` |
+| **COUNCIL-02** | **Isolation** | No recipe `env` contains `HOME` (dropping HOME drops login credentials); a prompt sent over stdin never appears in `argv` (**2F Cline is the exception**: its JSON mode does not read stdin, so the prompt is a positional argument) | `test:council-agents` |
+| **COUNCIL-03** | **Role validation** | Exactly one `moderator`, one `main`, at least one `reviewer`; no floor holds two roles: missing role / moderator also main / reviewer on the moderator's or main's floor → 400 and no process starts; duplicate reviewers collapse; missing floor → 400 with the original reason | `test:council-api` |
+| **COUNCIL-04** | **Real wire formats** | Using captured real output (OpenCode's two-line event stream, CodeBuddy's five-record array, Cline's `run_result`, Codex's `agent_message`): body extracted, **question text and snapshot/reasoning excluded**, answer appears once, tokens readable; empty stdout / bad JSON / status-only events → `ok=false`, no invented body | `test:council-agents` |
+| **COUNCIL-05** | **Structured parse (ReviewPoint)** | Use the **last** fenced JSON block (examples mid-text do not count); braces inside strings do not truncate; no block → `parsed=false` but the body is still stored (never lost); an item missing `suggestion` is dropped and counted (`parse_dropped`), not patched; missing `dimension` → "other", missing `evidence` → NULL; per-item `stance` inherits the turn stance, both missing → item unusable (never default `accept`); `reviews: []` is a valid result (`parsed=true`) distinct from parse failure; reviewer identity is assigned by the server, never self-reported | `test:council-parse` |
+| **COUNCIL-06** | **Explainable convergence** | `raw = 100 − (blocker×25 + major×8 + minor×2 + nit×0 + conflict×10)`, clamped 0..100; every deduction and weight returned with the score; a model-reported `convergenceScore` never enters the parsed result (server value wins); unknown severity counts in the total but no severity bucket; `nit` deducts nothing; a missing conflict list is treated as empty | `test:council-convergence`, `test:council-orchestrator` |
+| **COUNCIL-07** | **Moderator hard instructions and consistency** | Missing "must" / acceptance criteria / hedging words (suggest / consider / maybe) → warning; a blocker without a matching instruction or `openIssues` entry → warning; a `reject` stance without a registered conflict → warning; a reviewer with no opinion is named; final `approve` with a blocker in the last round → warning. Warnings **do not change flow or verdict**, only display | `test:council-convergence`, `test:council-orchestrator`, `test:council-report` |
+| **COUNCIL-08** | Single call | A `#!/bin/sh` stub in a temp dir: JSON parse, **timeout kills the process group**, non-zero exit recorded as an error, unparseable body not invented | `test:council-runner` |
+| **COUNCIL-09** | Orchestration | End-to-end with stub participants: round 0 planning runs once; rounds 1..N each store a `RoundResult` (proposal, diff, reviews, moderation); **a high score does not stop early**; verdict and final draft each once; `verdict='completed'`, `status='done'`; WS events carry `project=null`; **temp dir cleaned** | `test:council-orchestrator` |
+| **COUNCIL-10** | API | Real Express + real repo + temp DB: create / list / detail / cancel / delete; `/floors` publishes weights, roles, severities, stances and round defaults (the UI must not copy them); detail returns `roundResults` / `utterances` / `materials` / `participants` / `report`; **409 (still running) is not success** and the server's message is passed through | `test:council-api`, `test:council-ui-store` |
+| **COUNCIL-11** | Material truncation | Oversized files are truncated to the limit; `bytes_total` / `bytes_included` are true values; UI says "original N bytes, only first M embedded"; unreadable / directory / binary file → **the whole request 400s and names the file** (never silently skipped); `bytes_total` NULL (not 0) when unavailable | `test:council-materials`, `test:render-smoke`, `test:council-api` |
+| **COUNCIL-12** | UI data merge | HTTP detail (snapshot) and WS increment (latest) are chosen by **round number**; an increment never wipes an existing body; different phases on one floor do not overwrite each other; a final push with only a summary must **re-fetch detail**, otherwise the page stays at "finished" without a conclusion | `test:council-ui-store` |
+| **COUNCIL-13** | Not in the office | After a meeting, `members` / `task_runs` gain **nothing**; office and task records show no trace (in project mode also check the 2F/6F/7F/8F session lists, see COUNCIL-17) | `test:council-orchestrator` (assertion table unchanged) |
+
+**Cases added by the 2026-10-02 project-directory work and the 2026-10-19 role refactor:**
+
+| ID | Case | Assertion | Suite |
+| --- | --- | --- | --- |
+| **COUNCIL-14** | **Project directory untouched** | With injected `removeDir` / `isDir` stubs: project mode neither creates nor removes temp dirs, and the user's directory is not deleted; the prompt names the project path and "do not modify any file"; if the directory disappears after start → `verdict='failed'` with the original message, **no process starts** | `test:council-orchestrator` |
+| **COUNCIL-15** | Input validation | `workspacePath` relative / missing / a file → 400 naming the path; `~` expands to home before validation; `maxRounds` above the limit is clamped, illegal values fall back to the default (**not 0**); duplicate reviewers collapse; empty/blank topic → 400 | `test:council-api` |
+| **COUNCIL-16** | **Two isolation locks in project mode** | ① Every recipe `env` carries `WORKGREMLIN_DISABLE=1`; the hook exits immediately (no server connection, no status file, exit 0) and both plugin entry points recognize it (return shape unchanged, otherwise 7F reports "plugin load failed"); ② `--title` for 7F/8F and `--name` for 6F equal the title filtered by the session list; 2F has no title switch and stores the prompt as the title, so the prompt starts with `COUNCIL_PROMPT_MARKER` — user sessions still list normally, only participants are hidden | `test:council-agents`, `test:claude-hook`, `test:council-quiet-plugin`, `test:kilo`, `test:opencode`, `test:cline` |
+| **COUNCIL-17** | **Report files** | After completion, **only** `report.json` / `reviews.csv` / `rounds.csv` / `report.md` under `~/.workgremlin/councils/<id>/`; even with a project path, **nothing is written into the project** (read-only); CSV has a UTF-8 BOM, CSV-escaped commas/quotes/newlines, CRLF; existing files are never overwritten (timestamp suffix); fixed schema (plan / per-round `RoundResult` / verdict / final draft / changelog / warnings / files); missing tokens `—`, partial `≥ N`, **never 0** | `test:council-report`, `test:council-orchestrator` |
+| **COUNCIL-18** | **New schema and no voting** | Seven `council_*` tables on a fresh DB; `verdict` CHECK accepts `completed/partial/needs_clarification/cancelled/failed`; **no** `mode` / `threshold` / `vote` / vote-count columns; `completed`, `partial`, `needs_clarification` → `done`, `cancelled` → `cancelled`, others → `failed`; an old CHECK is fixed by rebuilding only that table, preserving history and `AUTOINCREMENT`; delete removes all child rows; deleting a running council returns 409 | `test:council-store`, `test:council-api` |
+| **COUNCIL-19** | **Failure, recovery and the "working" marker** | Round 0 moderator has no usable output (exit 0, unparseable) → `unparsed`, meeting `failed` immediately, **no proposal/review**, error names round/phase/floor and the output tail, report still archived, no participant left `running`; a transcript truncated after the last complete `result`/assistant event → recover body and usage from the complete prefix, not a failure; moderator returns concrete `needsClarification` → `needs_clarification` / `done`, only round 0, other roles `skipped`, report archived; reviewer failure/unparsed → excluded from moderation, `turn_failed` in report; failure after a completed round → `partial`; `progressOf` returns `{roundNo, phase, floors}` while running and `null` after; detail API returns `progress` too | `test:council-parse`, `test:council-agents`, `test:council-runner`, `test:council-orchestrator`, `test:council-api`, `test:council-ui-store`, `test:render-smoke` |
+| **COUNCIL-20** | **Right panel shows summary only** | Convergence uses the **last round's** server score and shows the formula; n opinions / n blockers / n conflicts; three roles each show floor, model, tokens (missing → `—`); clarification questions listed individually; **no voting trace anywhere** | `test:render-smoke`, `test:council-timeline` |
+| **COUNCIL-21** | **Collapsible full process + per-round diff** | Process area is `<details>` and **collapsed by default** (no `open`); round 0 shows planning and roles; the first proposal has no diff and says so explicitly, later rounds diff against the previous version; each review (severity + stance + evidence + suggestion) and moderation (consensus / open / conflict sides / hard instructions / warnings) is transcribed; failures show the original text and reason, **never a fabricated opinion**; **every round (including 0) keeps all raw utterances** (floor / phase / state / duration / error); after a fail-fast abort, rounds without a `RoundResult` are marked "incomplete" and list utterances that did happen, while the verdict / delivery round must **not** be marked incomplete; `partial` has no verdict block and no report-file block but shows who failed; running shows a live marker and available summary | `test:render-smoke` |
+
+#### 3.16.2 Manual smoke tests (what automation cannot cover)
+
+Real CLI output formats can only be learned by running them. The 2026-10-01 smoke test caught two bugs that all unit tests missed: OpenCode's body lives in `part.text`, not `parts`; CodeBuddy returns the whole conversation array and treated the question text as its own answer. Both are recorded in `implementation-status.md` §4.2.
+
+| Item | How | Expected |
+| --- | --- | --- |
+| Each floor's command | Run a small meeting (main + moderator + one reviewer) with `WORKGREMLIN_HOME` pointing at a temp dir; **never touch the user's DB** | Body extracted, structured review parsed, model and tokens attributed to the right role |
+| Tools actually disabled | Put a marker file in the temp dir and ask it to read | Cannot read (8F: without the lock it can, with the lock the tool call is rejected; 2F: writing rejected, `read_files` still works) |
+| No orphan processes | `ps` for the CLIs after the meeting ends or is cancelled | None left; the temp directory is removed |
+| Missing means missing | Check 8F tokens | `—`, not 0 (OpenCode really does not emit usage) |
+| Did it really read the code? (project mode) | Start on a real project and ask something only the code can answer ("where is this function called?") | Real file names / symbols, not a paraphrase of the material |
+| Project directory untouched (project mode) | Check the directory after the meeting | `git status` clean, no new files, directory still there (verify manually before merging) |
+| Office still clean (project mode) | Check office, task records and 2F/6F/7F/8F session lists | No participants visible (the CLIs' own UI keeps those "council participant" entries — that is the CLI's history; we only read). **6F still needs a machine with Qoder CLI installed** to confirm `--name` reaches the transcript |
+
+**Sampling discipline:** raw stdout from a smoke test must be stored verbatim in the unit suite (see COUNCIL-04). Guessing the wire format is how those two bugs survived.
+
+---
+
+## 4. Defect severity
+
+### 4.1 Severity
+
+| Level | Name | Criteria (any one) | Response |
+| --- | --- | --- | --- |
+| **S1** | Blocker | App cannot start / install / upgrade; main or renderer crash without self-recovery; core function unavailable; message loss or a long-lived wrong state; data corruption (`integrity_check` fails); security config bypassed; native module unavailable on a target platform and silently replaced by a fallback implementation; **plaintext credentials on disk (redaction fails any layer)** | Stop testing; fix or provide a workaround within 24 h |
+| **S2** | Critical | Core flow wrong but bypassable; **state derivation wrong** (blocked leaking across sessions, pending counted as busy, a timer changing state, borrowed busy outliving its ghost); message loss/duplication > 0.1%; retention cleanup losing live data; **fabricated progress value**; a lower-priority event triggering a notification; notification rate-limit / DND failure; redaction false-positive rate > 0.5%; P95 > 2× target; < 30 fps or > 500 ms freeze under load; crash recovery losing > 1 s; a core path broken on a supported platform | Fix in this iteration |
+| **S3** | Major | Minor function wrong; UI layout / display error; filter or search boundary wrong; missing "source unavailable" hint; P95 between 1× and 2× target; high memory without OOM; demo mode missing its label | Next iteration |
+| **S4** | Minor | Copy / typo / icon; style detail; missing a11y hint; unfriendly log; slight performance miss | Backlog |
+
+### 4.2 Priority
+
+| Level | Meaning |
 | --- | --- |
-| **P0** | 阻塞发布（release blocker） |
-| **P1** | 本次发布前必须修复，除非 leader 签字豁免 |
-| **P2** | 应尽量本迭代修复 |
-| **P3** | 愿望清单 |
+| **P0** | Release blocker |
+| **P1** | Must fix before this release unless the leader signs a waiver |
+| **P2** | Should fix this iteration if possible |
+| **P3** | Wish list |
 
-### 4.3 缺陷流程
+### 4.3 Defect workflow
 
-1. 提交必带：**环境（OS/版本/构建号/Electron 版本/ABI）、复现步骤、最小可回放事件 JSONL（§7.3）、期望 vs 实际、截图/录屏、内置 metrics 导出、debug 级日志**。
-2. 可回放缺陷必须附 `tests/fixtures/bugs/<BUG-ID>.jsonl`，修复后自动进入回归集。
-3. flaky 测试单独标记（禁止长期 `test.fails`），每周清理；连续 3 次 flaky 未修按 S2 处理。
+1. Every report includes: environment (OS / version / build / Electron / ABI), reproduction steps, minimal replayable event JSONL or request sequence, expected vs actual, screenshot/video, metrics export, debug logs.
+2. A replayable defect attaches `tests/fixtures/bugs/<BUG-ID>.jsonl` (planned) and joins the regression set after the fix.
+3. Flaky tests are marked individually (no permanent `test.fails`), reviewed weekly; three consecutive flakes without a fix are treated as S2.
 
 ---
 
-## 5. 回归范围定义
+## 5. Regression scope
 
-| 级别 | 触发时机 | 范围 | 时长预算 |
+| Level | Trigger | Scope | Budget |
 | --- | --- | --- | --- |
-| **R0 冒烟** | 每次 push / 每个 PR | L0（含 `check:arch-param` + `native:check`）+ L1 全量 + L2 关键组件（工位卡片 5 态 × degraded、消息行）+ 1 条 L4 冒烟（demo 模式：启动 → 状态刷新 → 发消息 → 退出） | ≤ 5 min |
-| **R1 增量** | PR 合入前 | R0 + 改动模块及其直接依赖的 L1/L2/L3 + 相关 L4 路径 | ≤ 15 min |
-| **R2 全量功能** | 每日夜间 + 每个里程碑准出 | L0–L3 全量 + L4 关键路径 + 平台 matrix（Linux + Windows） | ≤ 60 min |
-| **R3 发布** | 发版前 | R2 + L5 全量（性能、8 h 长稳、休眠重连、目录监听健壮性、安装升级、三平台原生模块、macOS 公证） | 按需（含 8 h 长稳） |
+| **R0 Smoke** | Every push / PR | `npm run test:all` (73 suites) + `npm run db:check`; renderer build | ~2 min |
+| **R1 Incremental** | Before merge | R0 + the changed module's dedicated suites + affected route / hook suites | ≤ 15 min |
+| **R2 Full functional** | Nightly + milestone exit | R0 + all state / message / DB / council suites + a manual office pass on demo data + platform smoke (Linux + Windows) | ≤ 60 min |
+| **R3 Release** | Before release | R2 + packaging matrix, 8 h soak, sleep/reconnect, watcher robustness, native modules on three platforms, macOS signing/notarization path | As needed (includes 8 h) |
 
-**改动-回归映射**
+**Change → regression map**
 
-| 改动位置 | 最低回归级别 |
+| Change location | Minimum level |
 | --- | --- |
-| `packages/core/状态机`、`degraded` 逻辑 | R1 + SC-01~SC-08 全量 |
-| `apps/main/IPC` | R1 + L3 契约 + R0 E2E |
-| `apps/main/watcher` | R1 + FW-01~FW-08 全量（Linux + Windows） |
-| `apps/renderer/虚拟列表` | R1 + SPIKE-01~08 + MS-05/06 + RT-03 |
-| SQLite schema / 迁移 / 归档 | R2（DB-* 全量 + 三平台） |
-| Electron 版本升级 / 原生模块 / 打包配置 | R3（含 `native:check` 三平台） |
-| demo 数据源 / fixture | R1 + DEMO-* 全量 + 全部 L2/L4（因其为默认数据源） |
-| 仅文档 / 样式微调 | R0 |
+| `shared/index.js` `AGENT_STATES`, labels, `agentBase`, `formToSource` | R1 + SC-24/SC-32 + DB-18 + all renderer suites |
+| `server/src/ingest/bus.js` member-card derivation / `session_status` | R1 + SC-01–SC-30 + `test:task-sync`, `test:task-runs-route` |
+| `renderer/src/lib/memberTask.js` | R1 + SC-07, SC-14, SC-19–SC-21, SC-29–SC-30 + `test:member-task` |
+| `server/src/ingest/hookCommon.js` blocked / task transitions | R1 + SC-06, SC-09–SC-13 + `test:hook-dispatch`, `test:hook-runtime` |
+| IPC / preload bridge | R1 + DS-12 + R0 manual launch |
+| Floor reader / poller | R1 + FW-01–FW-08, FW-14 (Linux + Windows) |
+| Message list / record view | R1 + SPIKE-01–08 (when implemented) + MS-03/05/06 + RT-03 |
+| SQLite schema / migration / retention | R2 + DB-01–DB-16 on all platforms |
+| Electron version / native module / packaging config | R3 + native matrix + `npm run db:check` in the packaged app |
+| Demo generator / fixture | R1 + DEMO-01–07 + every renderer suite (demo is a default data source) |
+| Docs / style only | R0 |
 
 ---
 
-## 6. 里程碑准出条件（Definition of Done，主编号）
+## 6. Definition of Done (main numbering)
 
-### 通用 DoD（每个里程碑都满足）
+> Checkboxes are acceptance criteria, not a status report. Features marked **Planned** remain unchecked until implemented.
 
-1. 范围内 L1 覆盖率 ≥ 80% 行覆盖；核心模块（状态机、degraded、消息去重排序、虚拟滚动）**分支覆盖 ≥ 90%**。
-2. 相关 L2 覆盖：正常态、空态、加载态、错误态、边界态。
-3. 无 S1；S2 清零（或书面豁免）；S3 ≤ 3 且有计划。
-4. 新增配置有默认值且被测试覆盖；所有阈值写进 metrics（不是口头约定）。
-5. 测试重复执行 5 次结果一致（flaky 率 = 0）。
-6. 文档同步更新；新增 IPC 通道更新契约测试。
+### Common DoD (every milestone)
 
-### M0 — 骨架 + 可测性地基 + Demo + 原生模块
+1. In-scope L1 line coverage ≥ 80%; core modules (state derivation, message dedupe/order, floor parsing) branch coverage ≥ 90% once coverage tooling exists.
+2. Relevant L2 coverage: normal, empty, loading, error and boundary states.
+3. No S1; S2 cleared or waived in writing; S3 ≤ 3 with a plan.
+4. New settings have defaults and a test that reads them; every threshold is recorded in metrics, not only in prose.
+5. Repeated runs (5×) produce identical results; flaky rate = 0.
+6. Docs updated; new HTTP/WS contracts have a test.
 
-- [ ] `pnpm i && pnpm dev` 一键启动（Linux x64；macOS/Windows x64 建议验证）。
-- [ ] **状态枚举与字段冻结**：主状态枚举固定 5 个（`offline`/`idle`/`busy`/`blocked`/`error`，**无 `unknown` 主状态、不得沿用旧 6 状态**）；`degraded` 为独立正交布尔字段。状态机**判定规则**属 M1，M0 只冻结枚举与字段。
-- [ ] **core / main / renderer 三层分离**：`packages/core` 零 electron 依赖（lint 强制）。
-- [ ] **M0 硬阻塞的 6 项可测性契约全部落地**（§7.1、7.2、7.4、7.6、7.7、7.9）。
-- [ ] `createTestApp()` 可用：1 秒内跑通「注入事件 → 断言 store 状态」。
-- [ ] IPC 通道类型化定义 + 契约测试骨架 ≥ 1 条通过。
-- [ ] **demo 模式交付**：DEMO-01~07 全通过；成为 L2 组件测试与 L4 E2E 的默认数据源。
-- [ ] **原生模块验证**：N1（Linux x64）全部成功判据通过；`native:check` 进 L0 门禁且为绿。
-- [ ] **`archived_at` 字段与索引存在**（DB-11 通过）；归档逻辑本身不在 M0 验收。
-- [ ] `check:arch-param` 静态检查通过（DS-14 前置条件）。
-- [ ] 两个界面在 demo 数据下可静态渲染（不要求实时刷新与交互完整）。
+### M0 — Skeleton + testability baseline + demo + native modules
 
-### M1 — 工位视图 + 归档逻辑 + 虚拟列表 Spike
+- [ ] `npm run dev` starts on Linux x64; macOS/Windows x64 verified at least once.
+- [ ] `AGENT_STATES` frozen as exactly `['busy','idle','blocked']`; no other value is written anywhere.
+- [ ] `Clock` abstraction exists (`server/src/clock.js`) and business code uses it.
+- [ ] `WORKGREMLIN_HOME` / data-directory override works; single-instance lock works.
+- [ ] Demo project seeds on demand, covers three states, and is deterministic per seed.
+- [ ] Native modules: N1 (Linux x64) passes all success criteria; `npm run rebuild:native` exits 0.
+- [ ] `npm run db:check` passes.
+- [ ] `messages.archived_at` and `content_truncated` columns and indexes exist.
+- [ ] Office and records surfaces render on demo data.
+- [ ] `npm run test:all` is green (baseline: 73/73).
 
-- [ ] **虚拟列表 spike 在 M1 第一周完成**，SPIKE-01~08 全过，选型结论入库（早于对话窗口开发）。
-- [ ] **状态组合全覆盖**：5 主状态 × degraded 有/无 = 9 个可见组合 + offline+degraded 归一化断言（SC-08）。
-- [ ] **非法转换负向用例通过**：SC-02、SC-03（拒绝 + 保留原状态 + metrics 计数 + warn）。
-- [ ] **心跳 60 s 超时边界**：SC-05 边界三点采样通过。
-- [ ] SC-04、SC-06~SC-15 全通过；16 成员并发无串台。
-- [ ] RT-01 达标（P95 ≤ 300 ms）；RT-03/RT-04/RT-08 通过（附前后对比录屏）。
-- [ ] **消息归档逻辑**：MS-13~MS-16、DB-12 全通过（归档不丢消息、搜索范围提示、64 KB 截断）。
-- [ ] **判定链与阈值边界**：SC-05（优先级 `error>busy>blocked>idle` + 活性闸门最高）、SC-07/SC-17/SC-18/SC-19 四个阈值边界全通过。
-- [ ] **A-only 硬规则**：SC-20 通过（**禁止推断 `blocked`/`error`**，逐状态负向断言）。
-- [ ] **idle/busy 易错边界**：SC-21（pending=idle）、SC-22（思考中=busy）、SC-23（工具间隙不闪烁）、SC-24（>5min=busy+慢于预期）、SC-25（心跳断 60s 仍 busy+degraded）、SC-27（边跑边等=busy）全通过。
-- [ ] **blocked 规则**：SC-26/SC-28/SC-29/SC-30 全通过（reason 受控词表、`waiting_on` 必渲染且缺失显示 `等待 —（未上报原因）`、五条解除路径、长期阻塞不改主状态）。
-- [ ] **非法迁移三原则**：SC-02/SC-03/SC-04 通过（rejected 事件 + 合成中间态 `synthetic=1` + `state_since` 取触发事件 ts，据此断言「已耗时」正确）。
-- [ ] **进度三态（对齐 §5.9.1 AC-PR1~7）**：PRG-01~PRG-12 全通过；**PRG-06（AC-PR5）为硬阻塞** —— DOM 正则 `/\d+%/` 在 unknown 卡片上 0 命中，只渲染条纹动画 + `—`。
-- [ ] **通知**：NOT-01~NOT-14 全通过；**NOT-02（S2 及以下不通知）逐条负向断言**；限流阈值按 §3.11 表格落地。
-- [ ] **脱敏（P0 / S1）**：SEC-01~SEC-07 七类规则 + **L1/L2/L3 三层验证全通过**（.db 与 -wal 二进制扫描 0 命中）；SEC-12 搜索交互结论落地；SEC-08 误伤率 ≤ 0.5%；SEC-10 开关两向均测。
-- [ ] **分词最小用例前置**（Q10）：M1 末用数百条中文语料跑通 trigram 命中与 1~2 字降级 LIKE，避免 M2 重建 FTS 索引。
-- [ ] **文件读写区分**：RW-01~RW-08 全通过。
-- [ ] **紧凑模式**：CPT-01~CPT-06 全通过（阈值按确认值调整）。
-- [ ] L4 冒烟：真实启动下状态实时刷新可见。
+### M1 — Office state + message integrity + honest progress
 
-### M2 — 对话记录窗口 + 持久化与恢复
+- [ ] All SC-01–SC-32 pass, including session scoping, blocked clearing, borrowed busy, last-active and "age never changes state".
+- [ ] The old liveness model has no residue: no state timeout, no TTL, no `degraded`, no `lastSeenAt`, no `agent_status_history` usage.
+- [ ] RT-01 target met (P95 ≤ 300 ms); RT-03/04/06/08 measured, with before/after evidence.
+- [ ] MS-01–MS-03, MS-06–MS-10 pass; message ordering is deterministic under repeated runs.
+- [ ] PRG-01–PRG-08 pass; **no progress bar and no fabricated percentage** in card, office or detail.
+- [ ] DS-08/DS-09 reconnect cases pass; state does not change on ping loss.
+- [ ] Notifications remain off: trigger design is not final (NOT-01 blocked), so no notification exit criterion is claimed.
+- [ ] Redaction remains off: SEC-* cannot be claimed until a `Redactor` exists.
+- [ ] L4 is still manual: at least one real launch checks state refresh on demo data.
 
-- [ ] MS-01~MS-12 全通过；MS-05 达标（DOM ≤ 80、滚动 ≥ 55 fps、内存增量 ≤ 200 MB）。
-- [ ] 过滤/搜索组合行为与规格一致（边界语义已文档化）。
-- [ ] **中文分词 spike（SPIKE-09~12）完成**：trigram 方案结论入库；中文语料搜索 < 200 ms 实测；1~2 字降级 LIKE 行为正确；索引体积与建索引耗时达标。
-- [ ] **搜索 × 脱敏口径落地**：搜凭据原文 0 命中 + UI 提示「部分内容已脱敏，可能搜不到」（SEC-12）。
-- [ ] L4：真实收发 1000 条消息不丢不重。
-- [ ] DB-01~DB-10 全通过；kill -9 恢复丢失窗口 ≤ 1 s。
-- [ ] 崩溃恢复有 L4 自动化用例（非手工步骤）。
-- [ ] 迁移脚本向前兼容测试 + 备份策略说明。
+### M2 — Task records, conversation data, persistence and recovery
 
-### M3 — 打包与发布（三平台 x64）
+- [ ] MS-04, MS-05, MS-11, MS-12 pass, or MS-05 is explicitly deferred with a spike result.
+- [ ] Filter/search combinations match the documented boundary semantics.
+- [ ] FTS5 trigram table is consistent with the message table; if the query layer moves off `LIKE`, SPIKE-09–12 results are recorded and MS-09 is updated.
+- [ ] Task-record retention (90-day default, 1–3650 clamp) passes DB-08 and MS-13/MS-14; no message-count cap is claimed.
+- [ ] DB-01–DB-10 pass; `kill -9` loss window ≤ 1 s.
+- [ ] Crash recovery has an automated case, not only a manual step.
+- [ ] Migration from the liveness-era schema (DB-16) is automated and idempotent.
+- [ ] Virtual scrolling is either adopted (MS-05) or explicitly deferred; no claim of smooth 100k rendering until then.
 
-- [ ] DS-01~DS-05、DS-07~DS-13 全通过；三平台 matrix 绿。
-- [ ] **DS-06 / DS-14**：仅出 x64；`check:arch-param` 通过，打包配置无硬编码架构。
-- [ ] **原生模块 N2（Windows x64）、N3（macOS x64）验证通过**。
-- [ ] 静默安装/升级/卸载自动化覆盖；DS-15 体积仅记录不门禁。
-- [ ] **macOS 公证已书面豁免**：改为验证 ad-hoc 签名可安装启动 + 「未公证说明」四处明示（发布页 / README / release notes / 应用内关于页）静态检查 + 人工核对双保险 + 首次启动右键打开路径可走通。
-- [ ] 8 小时长稳：RSS 增长 < 20%、无句柄泄漏、无崩溃。
-- [ ] **通知在真实系统通知中心可送达**（三平台各 1 条 S1 冒烟）。
+### M3 — Packaging and release (three platforms, x64)
 
-### M4（可选）— 目录监听生产化 + 反向控制
+- [ ] DS-01–DS-05, DS-07–DS-13 pass; three-platform matrix green.
+- [ ] DS-06 / DS-14: x64 only, no hardcoded arch; `check:arch-param` exists and passes (currently planned).
+- [ ] Native modules N2 (Windows x64) and N3 (macOS x64) pass.
+- [ ] Silent install / upgrade / uninstall automated; DS-15 size recorded, not gated.
+- [ ] macOS signing path: notarization or the documented ad-hoc path, verified on a clean machine.
+- [ ] 8 h soak: RSS growth < 20%, no handle leak, no crash.
+- [ ] **If and only if notifications are implemented and the trigger is defined:** one real S1 (`blocked`) notification per platform.
+- [ ] Electron packaging E2E (planned) is either implemented or the manual release checklist is signed.
 
-- [ ] FW-01~FW-08、FW-11~FW-14 全通过（Linux + Windows + macOS 各跑 FW-01/03/05/08）。
-- [ ] **网络盘 / WSL / 高精度计时器跳变评估**：FW-09、FW-10、FW-15 出结论，决定是否支持。
-- [ ] 降级路径（5 s 轮询 + degraded）有 UI 提示与自动化验证。
-- [ ] **反向控制（Q7）**：CTRL-01~CTRL-06 全通过（二次确认、事件日志、禁用场景、防连点）。
+### M4 (optional) — Watch productionization + reverse control
+
+- [ ] FW-01–FW-08, FW-11–FW-14 pass (FW-01/03/05/08 on all three platforms).
+- [ ] FW-09, FW-10, FW-15 produce a decision on network drives, WSL and clock jumps.
+- [ ] The poll/scanner path has a UI "source unavailable" hint and automated verification.
+- [ ] CTRL-01–CTRL-06 pass (confirmation, event log, unavailable targets, double-click protection).
 
 ---
 
-## 7. 需要 coder 预留的可测性设计（Testability Contract）
+## 7. Testability contract
 
-**M0 硬阻塞列**：✅ = M0 必须落地（否则 M0 不准出）；○ = M1 落地即可。
+**M0 blocker** = required for the M0 exit; ○ = needed by the milestone that owns the feature.
 
-| # | 要求 | 目的 | M0 硬阻塞 | 影响用例 |
+| # | Requirement | Purpose | M0 blocker | Affected cases | Status |
+| --- | --- | --- | --- | --- | --- |
+| 7.1 | **Injectable clock:** `Clock` with `now()` / `monotonic()`; tests swap it via `__setClock` | Deterministic elapsed-time and timeout behavior | **✅** | SC-15, SC-16, MS-03, DS-08 | Implemented |
+| 7.2 | **Injectable event source:** a formal interface plus `FakeEventSource` (`emit` / `emitBurst` / `emitOutOfOrder`) | Precise timing and flood control; reuse for synthetic scenarios | ○ | SC / RT / DEMO | **Planned** — suites call bus routes directly |
+| 7.3 | **Replayable messages:** append-only event JSONL + `replay(file, speed)` | Minimal defect reproduction and cross-check of recovery | ○ | DB-10, regression set | **Planned** |
+| 7.4 | **Deterministic IDs and idempotency:** `dedupe_key` unique index, message id tiebreak, WS envelope `seq` | Dedupe and ordering assertions | **✅** | MS-01–03, SC-27 | Implemented (dedupe key + id ordering) |
+| 7.5 | **Monotonic vs wall clock:** monotonic for elapsed, wall clock for display | Avoid sleep / clock-jump misjudgment | **✅** (merged into 7.1) | SC-15, DS-08 | Implemented |
+| 7.6 | **Headless core:** pure state/task rules in `shared/` and `renderer/src/lib/`, no Electron imports | L1/L2 run in Node | **✅** | all L1/L2, DEMO-02 | Implemented in practice |
+| 7.7 | **Test factory `createTestApp(overrides)`:** fake source + temp repo + fake clock, exposing `emit()` / `advance()` / `snapshot()` | Lower integration cost | ○ | all L3 | **Planned** |
+| 7.8 | **Built-in metrics:** ingest→bus→WS→store→paint histograms, state counts, frame rate, queue length, dropped count; `getMetrics()` + debug HUD | Real-time claims are measurable | ○ | RT-01–05, defect triage | **Planned** |
+| 7.9 | **Stable selectors:** `seat-card-<id>`, `seat-status-<id>`, `msg-row-<id>`, `conv-list`, `filter-agent`, `search-input` | Tests survive styling changes | **✅** | all L2/L4, DEMO-05 | Implemented (subset; the removed status, progress and banner selectors are absent) |
+| 7.10 | **Repository abstraction:** SQL centralized in `server/src/db/index.js`; tests open a temp DB per suite | DB logic testable | ○ | DB-01/02/09 | Implemented (single SQLite implementation, temp DB) |
+| 7.11 | **Configurable render merge:** `member.status` 200 ms merge window; renderer update strategy configurable | Jitter and load comparison | ○ | RT-03/05/06, SC-27 | Partial (server merge implemented) |
+| 7.12 | **Fault injection switches:** `--simulate-crash`, `--simulate-slow-fs`, `--simulate-clock-skew`, `--simulate-disk-full`, `--simulate-watch-error` | Automate failure paths | ○ | DB-03–06, FW-01/03/05 | **Planned** |
+| 7.13 | **Versioned event schema:** `schemaVersion` + migration functions + old fixtures | Backward compatibility | ○ | MS-12, DB-02 | Partial (`PROTOCOL_VERSION = 2`; no fixture versioning) |
+| 7.14 | **Shared IPC contract:** typed channel definitions used by preload / main / renderer | Contract tests | ○ | L3, DS-12 | **Planned** (bridge exists, no types) |
+| 7.15 | **Overridable data directory:** `WORKGREMLIN_HOME` + data-dir option | Isolated E2E and parallel suites | ○ (strongly recommended for M0) | DS-07, DB-07, DEMO-04, CI | Implemented (`shared/paths.js`) |
+| 7.16 | **Standalone redactor:** pure `Redactor` function, injectable rules, disable switch, runs before insert and before FTS indexing | SEC-* automation | ○ (required before M1 redaction work) | SEC-01–17 | **Not implemented** |
+| 7.17 | **Injectable notifier:** `Notifier` + fake that records calls; injectable window focus; notification decoupled from state updates | NOT-* including negatives and aggregation | ○ (required before notification work) | NOT-01–15 | **Not implemented** |
+| 7.18 | **Structured progress:** `{ value: number\|null, source? }` | Distinguish "0%" from "unknown" | ○ | PRG-01–08 | **Not implemented** (`number\|null` only) |
+| 7.19 | **Switchable FTS tokenizer:** tokenizer configurable per index | Spike comparison and migration | ○ (end of M1) | SPIKE-09–12 | **Partial** (trigram table fixed; query uses LIKE) |
+| 7.20 | **Observable security PRAGMAs:** expose `secure_delete` / `journal_mode` and connection purpose | Support DB-13/14 assertions | ○ (before M1 security work) | DB-13, DB-14 | Partial (`secure_delete=ON` fixed; not queryable) |
+
+> M0 blockers actually in place: 7.1, 7.4, 7.6, 7.9. 7.2, 7.7 and 7.8 are **planned**; do not claim M0 completeness until they exist or are explicitly waived.
+
+---
+
+## 8. Test data and mock strategy
+
+1. **Synthetic team generator:** default 4 members (leader / researcher / coder / tester), scalable to 16 / 64 for layout and pressure tests. The demo generator already provides a fixed roster plus two ephemeral ghosts (`ghost-*`).
+2. **Demo seed data:** `syncDemo` seeds on demand; `WORKGREMLIN_DEMO_FIXED_TS=1` freezes absolute timestamps; same seed → identical members, tasks, messages. Demo data covers `busy` / `idle` / `blocked`, at least one ghost and ≥ 200 messages.
+3. **Event-stream generator:** parameterized `{ rate, duration, outOfOrderRatio, duplicateRatio, dropRatio, burst, seed }`, emitting JSONL for L3/L5 — **planned**; today suites construct rows and requests inline.
+4. **Golden snapshots:** DOM snapshots of the office and message list under a fixed event stream; they require deterministic ordering (MS-03), a fake clock and a demo seed, otherwise they are flaky.
+5. **WS mock:** supports disconnect, half-frame, out-of-order and replay for DS-08/DS-09; currently tests use the real server on a random port plus forced socket close.
+6. **Do not mock:** real SQLite (temp file), real Express routes, real hook dispatch, real `fs` where the risk is the filesystem. These are the highest-risk areas.
+
+---
+
+## 9. CI pipeline
+
+**Current reality:** there is no CI configuration in the repository (`.github/workflows` does not exist). The local gate is:
+
+```bash
+npm run build          # renderer must compile
+npm run test:all       # 73 suites, serial, ~58 s
+npm run db:check       # SQLite self-test
+```
+
+**Planned pipeline** (when CI exists):
+
+| Stage | Content | Gate |
+| --- | --- | --- |
+| stage-1 | L0: syntax / lint / security config / `check:arch-param` (planned) / native check (planned) | Stop on failure |
+| stage-2 | `npm run test:all` on Linux x64 with a pinned Node version | 73/73 green |
+| stage-3 | Build the renderer; Electron packaging smoke (planned) | Green |
+| stage-4 | Platform matrix: Windows x64 + macOS x64 | Green on main and release branches |
+| stage-5 (nightly) | Load / 8 h soak / watcher robustness / three-platform native modules | Threshold gate, warn on regression |
+
+PRs run stage-1–2; main adds stage-3; release triggers stage-4–5. Until the pipeline exists, a release candidate requires a signed local run of the commands above.
+
+---
+
+## 10. Risks and open items
+
+| # | Risk | Impact | Mitigation | Status |
 | --- | --- | --- | --- | --- |
-| 7.1 | **时间源可注入**：`Clock` 接口（单调 `now()`、墙钟 `wallNow()`、`sleep()`）；全代码禁用裸 `Date.now()`/`setTimeout`（lint 自定义规则） | 心跳/休眠/乱序可在毫秒内测完 | **✅** | SC-05/09/14、MS-03、DS-08、RT-07 |
-| 7.2 | **事件源可注入**：`EventSource` 接口 + `FileEventSource` / `WsEventSource` / `FakeEventSource`（支持 `emit` / `emitBurst` / `emitOutOfOrder`） | 精确控制时序与洪泛；**并直接复用为 demo 模式** | **✅**（因 demo 提前到 M0） | 全部 SC-/RT-/DEMO- |
-| 7.3 | **消息可回放**：事件 JSONL 追加落盘 + `replay(file, speed)` + `--replay=` | 缺陷最小复现、崩溃恢复交叉验证 | ○ | DB-10、回归集 |
-| 7.4 | **确定性 ID 与幂等**：`eventId`、`msgId`、每 agent 单调 `seq`；`(msgId)` 唯一索引、`(agentId, seq)` 索引 | 去重、乱序仲裁、不丢不重可断言 | **✅** | MS-01/02/03、SC-11/12 |
-| 7.5 | **单调 vs 墙钟分离**：超时用单调，展示用墙钟；事件同时携带 `monotonicTs` 与 `wallTs` | 避免休眠/对时误判 | **✅**（并入 7.1） | SC-09、DS-08 |
-| 7.6 | **core 与 Electron 解耦**：`packages/core` 纯 TS，依赖注入 source/repository/clock | L1/L2 无头运行、demo 可复用 | **✅** | 全部 L1/L2、DEMO-02 |
-| 7.7 | **测试工厂 `createTestApp(overrides)`**：一行装配 fake source + 内存 repo + fake clock + store，暴露 `emit()` / `advance()` / `snapshot()` | 降低集成测试成本 | **✅** | 全部 L3 |
-| 7.8 | **内置 metrics**：ingest→IPC→fanout→store→paint 四段直方图、`illegal_transition_total`、帧率、队列长度、丢弃数、watcher 状态；`getMetrics()` + debug HUD + `--export-metrics=` | 实时性/稳定性有据可依 | ○ | RT-01~05、SC-02、缺陷定位 |
-| 7.9 | **稳定选择器**：`data-testid` 命名约定 `seat-card-<agentId>`、`seat-status-<agentId>`、`seat-degraded-<agentId>`、`seat-progress-<agentId>`、`msg-row-<msgId>`、`conv-list`、`filter-agent`、`search-input`、`watcher-banner`、`archive-notice` | 测试不因样式重构而碎；demo 与真实源共用 | **✅** | 全部 L2/L4、DEMO-05 |
-| 7.10 | **Repository 抽象**：`SqliteRepository` + `MemoryRepository` 双实现，SQL 集中在 repository 层 | DB 逻辑可单测 | ○ | DB-01/02/09 |
-| 7.11 | **渲染节流可配置**：store→UI 合并策略（`raf` / `throttle(ms)`）运行时可配（默认 100 ms） | 压测对比、抖动量化 | ○ | RT-03/05/06 |
-| 7.12 | **故障注入开关**：`--simulate-crash=main\|renderer\|after:<n>`、`--simulate-slow-fs=<ms>`、`--simulate-clock-skew=<ms>`、`--simulate-disk-full`、`--simulate-watch-error=ENOENT\|EACCES` | 异常路径自动化 | ○ | DB-03~06、FW-01/03/05、SC-09 |
-| 7.13 | **事件 schema 版本化**：`schemaVersion` + 迁移函数 + 旧版 fixture | 向后兼容可测 | ○ | MS-12、DB-02 |
-| 7.14 | **IPC 契约类型共享**：`shared/ipc-contract.ts` 三方共用，契约测试双向校验 | IPC 契约可自动生成 | ○ | L3、DS-12 |
-| 7.15 | **数据目录可覆盖**：`--user-data-dir=` 与 `WORKGREMLIN_HOME` | E2E 隔离并行、demo 隔离 | ○（M0 强建议） | DS-07、DB-07、DEMO-04、CI 并行 |
-| 7.16 | **脱敏器独立可测**：`Redactor` 纯函数模块（输入原文 → 输出脱敏后文本 + 命中类型），规则集可注入；提供**关闭开关**（配置 + `--no-redact`）；脱敏在**落盘前**执行且早于 FTS 索引构建 | SEC-* 全部、三层验证 | ○（M1 前必须） | SEC-01~17 |
-| 7.17 | **通知可注入与可断言**：`Notifier` 接口 + Fake 实现（记录每次调用：成员/类型/时间/是否弹出/是否聚合）；窗口焦点状态可注入（`--simulate-focus=lost\|gained`）；**通知与状态更新解耦**（同一事件两条独立路径） | NOT-* 全部，尤其是负向与聚合 | ○（M1 前必须） | NOT-01~14 |
-| 7.18 | **进度为结构化对象**：`{ value: number\|null, source: 'reported'\|'derived'\|'unknown' }`，禁止裸 number | 无法区分「真的是 0%」与「不知道」就无法测 PRG-02 | ○（M1 前必须） | PRG-01~08 |
-| 7.19 | **FTS 分词器可切换**：建表语句中 tokenizer 可配置（`trigram` / `unicode61` / 无 FTS），便于 SPIKE 对照与后续迁移 | 分词方案变更时不至于改死代码 | ○（M1 末） | SPIKE-09~12 |
-| 7.20 | **安全相关 PRAGMA 可观测**：暴露当前连接 `secure_delete` / `journal_mode` 设置与连接用途（写入连接 vs 删除/归档连接） | 支撑双连接方案的断言 | ○（M1 前必须） | DB-13 |
+| R1 | Electron E2E is inherently flaky (window / focus / timing) | L4 instability | Fake clock + event-driven waits (no `waitForTimeout`); retry 2×; weekly flake review | Open |
+| R2 | Floor readers differ across Windows / network drives | FW-* may only be green on Linux | M0–M2 keep only the polling path; network drives / WSL deferred to M4 | Contained |
+| R3 | 100k-message performance requires a rewrite | M2 rework | Virtual-list spike at M1 kickoff (§3.9.1) | Open (not started) |
+| R4 | Sleep / clock-jump tests are unreliable in CI | DS-08 / SC-16 flaky | Fake clock + an injectable skew switch (planned 7.12); real sleep manual only | Open |
+| R5 | Native module ABI mismatch (better-sqlite3 × Electron) | M0 blocker; all DB work unavailable | §3.8 matrix + `npm run rebuild:native` + explicit escalation; no silent fallback | **Highest priority** |
+| R6 | Demo data not deterministic | L2 snapshots flaky | DEMO-03 seed determinism + `WORKGREMLIN_DEMO_FIXED_TS=1` | Mitigated |
+| R7 | macOS / Windows runners are expensive | Cross-platform issues found late | Run the matrix at least nightly; mandatory before release | Open |
+| R8 | Redaction misses a secret (false negative) | Plaintext on disk = S1 | Three-layer verification + rule regression + ≥ 2 positives per class; feature not implemented yet | **P0, blocked** |
+| R9 | Redaction harms normal code/logs (false positive) | Usability damage | SEC-08 fixed 200-item clean corpus, ≤ 0.5% gate; feature not implemented yet | **P0, blocked** |
+| R10 | Chinese tokenization not validated early | FTS index rebuild in M2 | Minimal Chinese corpus at end of M1; FTS is currently unwired | Open |
+| R11 | Notifications fire for lower-priority events | Noise disaster; users disable notifications | NOT-02 per-event negative assertions; feature not implemented | **P1, blocked** |
+| R12 | `secure_delete=ON` + WAL checkpoint hurts write throughput | 1,000 events/s target missed | DB-13 measurement; dual-connection contingency (DB-14) | Open |
+| R13 | Window-focus notification behavior cannot be automated | NOT-* partly manual | `--simulate-focus=` (7.17, planned); otherwise a manual checklist | Open |
+| R14 | Blocked rows accumulate or leak across sessions | Wrong state, phantom orange cards | Session-scoped PK + prune on session reconciliation (SC-07/SC-14/SC-22) + `test:session-compact` | Mitigated |
+| R15 | Borrowed busy sticks after a ghost disappears | Resident gremlin permanently busy | `agent_status` is the only writer; ghost finish/disperse clears it (SC-19/SC-20, `test:agent-roster`) | Mitigated |
 
-> 说明：leader 指定的 M0 硬阻塞为 5 项（7.1、7.4、7.6、7.7、7.9）。**7.2 因 demo 模式提前到 M0 而升为硬阻塞**（demo 模式即 `FakeEventSource` + fixture），**7.5 并入 7.1**。故 M0 硬阻塞共 6 条。
+**Closed items from earlier versions:** the five-state model and its transition matrix (removed by `e2ad323`); liveness timeouts and the degraded flag (removed); the 100,000-message cap and automatic JSONL archive (never implemented; retention is days-based).
 
----
+**Open small questions (non-blocking; adjust cases after confirmation):**
 
-## 8. 测试数据与 Mock 策略
-
-1. **合成团队生成器**：默认 4 成员（leader/researcher/coder/tester），可放大到 16/64 用于压测与布局验证。
-2. **事件流生成器**：参数化 `{ rate, duration, outOfOrderRatio, duplicateRatio, dropRatio, burst, degradedRatio, seed }`，输出 JSONL，供 L3/L4/L5 共用。
-3. **demo 种子数据**：`--demo-seed=N` 确定性输出；覆盖 5 主状态 + degraded + ≥ 200 条消息（DEMO-03/06）。**L2 组件测试与 L4 E2E 默认均使用 demo 数据源**。
-4. **黄金快照**：工位视图与对话列表在固定事件流下的 DOM 快照；必须基于确定性排序（MS-03）+ fake clock + demo seed，否则必 flaky。
-5. **WS mock**：支持断连、半包、乱序、重放，用于 DS-08/09。
-6. **不 mock 的部分**：真实 SQLite（`:memory:` 或临时目录）、真实 Electron 启动（L4）、真实文件监听（L5）—— 这些恰恰风险最高。
+1. Should a future notification trigger use blocked duration, or entry only? (§3.11; must be decided before M3.)
+2. Retention export: location and naming of a future JSONL archive (affects MS-15/SEC-11).
+3. CPT-04: compact mode triggered by member count or available width.
+4. SEC-02: explicit decision on lowercase `akia`.
+5. Q9 encrypted channel / Q10 short-term search semantics: waiting on researcher; may affect SEC-* and search cases.
+6. Project-mode 6F: whether `--name` reaches the Qoder transcript (needs a machine with Qoder CLI installed).
 
 ---
 
-## 9. CI 流水线（建议）
+## 11. Q8: notification default proposals
 
-| 阶段 | 内容 | 门禁 |
+> Status: notification delivery is **not implemented**. These values are proposals to settle before implementation; the "default value assertion" (NOT-04) cannot run until settings exist.
+
+| Setting | Proposed default | Reason |
 | --- | --- | --- |
-| stage-1 | L0：类型 + lint + 安全配置 + **`check:arch-param`（DS-14）** + **`native:check`（§3.8.5）** | 失败即止 |
-| stage-2 | L1 + L2（Linux x64，Node 固定版本） | core 覆盖率 ≥ 80% |
-| stage-3 | L3 集成 + L4 E2E（Linux x64 + xvfb，**demo 数据源**） | 全绿 |
-| stage-4 | L4 E2E（Windows x64 + macOS x64 runner） | 全绿（main 与发版分支） |
-| stage-5（nightly） | L5：性能 + 8 h 长稳 + 目录监听健壮性 + 三平台原生模块 | 阈值门禁，超标告警 |
-
-PR 必跑 stage-1~3；main 合入加 stage-4；发版触发 stage-5。
-
----
-
-## 10. 风险与未决项（v0.2 更新）
-
-| # | 风险 | 影响 | 缓解 | 状态 |
-| --- | --- | --- | --- | --- |
-| R1 | Electron E2E 天生不稳（窗口/焦点/时序） | L4 flaky | fake clock + 事件驱动等待（禁 `waitForTimeout`）；重试 2 次；flaky 周清 | 开放 |
-| R2 | 文件监听跨 Windows/网络盘差异大 | FW-* 可能只在 Linux 绿 | M0~M2 只保降级路径；网络盘/WSL 归 M4 | 已收敛 |
-| R3 | 万级消息性能不达标需重构虚拟列表 | M2 返工 | **spike 提前到 M1 开工即做**（§3.9） | 已缓解 |
-| R4 | 休眠/计时器测试在 CI 不可靠 | DS-08/SC-09 flaky | fake clock + `--simulate-clock-skew` 覆盖 90%；真实休眠只做手工验收 | 开放 |
-| **R5** | **原生模块 ABI 不匹配（better-sqlite3 × Electron）** | **M0 直接阻塞，DB 全线不可用** | **§3.8 验证矩阵 + CI `native:check` 门禁 + 明确升级路径；禁止静默降级** | **新增，最高优先级** |
-| R6 | demo 数据若不确定 | L2/L4 快照全 flaky | DEMO-03 强制 seed 确定性；快照统一用 demo 源 | 新增 |
-| R7 | macOS/Windows runner 成本高，stage-4 被跳过 | 跨平台问题后延 | 至少每日一次全平台；发版前必跑 | 开放 |
-| **R8** | **脱敏规则漏杀（假阴性）** | 明文落盘 = S1 安全事件 | 三层验证（L1/L2/L3）+ 规则集回归 + 每类 ≥2 正例 + 边界；新增规则必须同步加漏杀用例 | **新增，P0** |
-| **R9** | **脱敏误伤（假阳性）** | 正常代码/日志被改写，可用性受损 | SEC-08 固定 200 条干净样本集，误伤率 ≤ 0.5% 作为门禁 | **新增，P0** |
-| **R10** | **中文分词方案未早验** | M2 才发现要重建 FTS 索引 | **分词最小用例前置到 M1 末**（数百条语料即可） | **新增，P1** |
-| **R11** | **通知误触发（S2 事件也弹）** | 噪音灾难，用户关闭通知 = 功能失效 | NOT-02 逐条负向断言，进 M1 硬阻塞与 R1 回归 | **新增，P1** |
-| **R12** | **`secure_delete=ON` + WAL checkpoint 拖垮写入吞吐** | 1000 事件/s 稳态不达标 | **新增 DB-13：压测期间实测吞吐与 P95**；若下降明显，采用「写入连接 OFF + 删除/归档连接 ON」的双连接方案（DB-14） | **新增（leader 指定），P1** |
-| R13 | 窗口焦点相关的通知行为在 CI 上不可自动化 | NOT-* 部分只能手工 | 要求 coder 提供 `--simulate-focus=`（7.17）；若仍不可行则标手工清单 | 新增 |
-
-**v0.2 已关闭的未决项**：状态模型（5+1）、保留策略（90 天/10 万条 + 归档 + 64 KB 截断）、网络盘/WSL（M0~M2 不支持，归 M4）、ARM（不出，参数化）、demo 模式（M0 交付）。
-
-**遗留小问题（不阻塞，需确认后微调用例）**：
-1. ~~`blocked` 状态栈深度~~ → **已由 §5.6 解除条件澄清**（依赖满足→busy / 放弃→idle / 失败→error / 活性丢失→offline），无需状态栈；SC-04 已改为「非法迁移 taskId 分支」。
-2. ~~`error` 是否携带错误类型~~ → **已由 §5.4 澄清**（`/task/end failed`、`/status error`、失败计数；卡片显示摘要首行 + `✕N` 徽标）。通知聚合的「同故障类型」粒度建议取 `reason`/摘要首行，待确认。
-3. 归档 JSONL 的存放位置与命名规范待定（影响 MS-15 与 SEC-11 扫描路径）。
-4. **CPT-04**：紧凑模式按「成员数」还是「窗口可用宽度」触发（影响断点用例设计）。
-5. ~~`derived`/`unknown` 是否置 `degraded`~~ → **已由 §5.7 澄清**：`degraded` 仅由 D1~D5 触发，与 `progress_source` 正交，见 PRG-11。
-6. **NOT-13 焦点自动化**：窗口失焦才弹系统通知的行为，在 CI/xvfb 下是否可自动化；不可行则列入手工验收清单（并要求 7.17 的 `--simulate-focus=` 兜底）。
-7. **Q1 精确定义**：以「区分读/写」为假设，若 roadmap 定义不同则改标签复用 RW-*。
-8. **SEC-02 小写 `akia`**：大小写变体是否命中需给明确结论。
-9. **Q9 原文加密通道 / Q10 短词搜索语义**：researcher 补写中，出来后评估是否影响 SEC-* 与搜索用例（leader 已承诺同步）。
+| **Do not disturb** | **Off** (no window) | The candidate trigger scope is narrow (only `blocked`); default silence would read as "not monitoring", which is worse than an occasional alert |
+| Window template | `22:00–08:00`, **disabled by default** | Lowers configuration cost; enabling it is itself a test case (NOT-06/07/08) |
+| Time-zone semantics | **Local time** (system zone; `--simulate-tz=` for tests) | Matches user expectation; cross-zone case NOT-08 |
+| **Per-member mute** | **All unmuted** | Mute is a user action, not a preset |
+| System notifications | **On** | The product's value is "you do not have to watch the screen" |
+| Notification sound | **Off** | Office environments; visual is enough |
+| Aggregation window | Same member + same event type, **5 min (300 s)** → 1 notification | A typical wait lasts under 5 min; a longer window hides recurrence, a shorter one loses aggregation |
+| Global rate limit | ≤ 5 per 60 s; > 20 → one summary | Prevents a storm when many sessions block together |
+| Recovery notification | **None** when blocked clears | Less noise; an opt-in setting can come later |
+| Permission prompt | Request on the **first S1 event**, not on cold start | Users have no context on cold start and tend to deny permanently |
+| Events during DND | Event log + unread count, **no retroactive popup** | Avoids a notification flood after wake (NOT-09/10) |
 
 ---
 
-## 11. Q8：通知默认值建议（免打扰时段与静音规则）
+## Appendix A: Threshold quick reference (v0.5)
 
-> main 已点名要具体数值与理由；以下为 tester 建议值，理由同时是「默认值断言」的依据（NOT-04）。
-
-| 配置 | 建议默认值 | 理由 |
-| --- | --- | --- |
-| **免打扰时段** | **默认关闭**（不设时段） | ① 触发范围已极窄（仅 S1 三类：blocked / error / offline>60s），本身稀少，误打扰风险低；② 默认静默会让用户误以为「没在监控」，比偶尔打扰更危险；③ 关闭时行为最简单，默认值断言也最不容易 flaky |
-| 时段模板 | 提供 `22:00–08:00` 一键启用模板，默认**未启用** | 降低配置成本；启用路径本身是用例（NOT-06/07/08） |
-| 时段时区语义 | **本地时间**（跟随系统时区，可 `--simulate-tz=` 覆盖） | 用户心智为本地时间；跨时区有专门用例（NOT-08） |
-| **按成员静音** | **默认全部不静音** | 同上；静音是用户主动降噪手段，不应预置 |
-| 系统通知 | **默认开** | 产品核心价值是「不必盯屏」 |
-| 通知声音 | **默认关** | 桌面通知声音在办公环境干扰大；视觉足够 |
-| 聚合窗口 | **同成员 + 同故障类型，5 分钟（300 s）内聚合为 1 条** | 一个故障的持续期通常 < 5 min；窗口太长会掩盖「故障反复出现」，太短失去聚合意义 |
-| 全局限流 | 60 s 内最多 5 条，超出合并为 1 条汇总；> 20 条只发 1 条汇总 | 防止集体掉线时的通知风暴 |
-| 恢复通知 | 默认**不发**「已恢复」通知 | 减少噪音；可在设置中开启（若后续提供） |
-| 通知权限请求时机 | **首次触发 S1 时**再请求系统授权，**不在冷启动请求** | 冷启动时用户无上下文，容易拒绝且难以挽回 |
-| 免打扰期内事件 | 记事件日志 + UI 未读计数，**不补发弹窗** | 避免唤醒后通知轰炸（NOT-09/10） |
-
----
-
-## 附录 A：关键阈值速查（v0.3）
-
-| 指标 | 阈值 |
+| Metric | Value |
 | --- | --- |
-| 状态上报→渲染 端到端 | P95 ≤ 300 ms / P99 ≤ 800 ms |
-| ingest→IPC / IPC→fanout / fanout→store | ≤ 30 ms / ≤ 50 ms / ≤ 50 ms |
-| store→paint | ≤ 16.7 ms（最差 50 ms） |
-| 高频稳态 | 1000 事件/s × 60 s，≥ 50 fps，长任务(>50 ms) = 0 |
-| 突发 | 5000 事件/s × 5 s，收敛 ≤ 1 s |
-| **`HEARTBEAT_INTERVAL`（上报侧）** | **15 s**（上报侧建议值；**非** `tech-design.md` §5.2 的旧 5 s 建议，已被 requirements §5.3 覆盖） |
-| **`HEARTBEAT_TIMEOUT`（判定侧）** | **60 s**（可配，边界 59.9 / 60.0 / 60.1 s） |
-| **二者关系（不可单独改）** | **`interval ≤ timeout/3`**（15 ≤ 60/3=20），保证连续丢 3 包才判超时；改任一常量时必须同步校验另一个 |
-| **常态上报速率基线** | 每成员 1/15 req/s：**10 成员 ≈ 0.67 req/s、16 成员 ≈ 1.07 req/s、64 成员 ≈ 4.27 req/s**（压测期望值按此换算，**不得沿用 5 s 周期算出的 2 req/s / 6.4 req/s / 12.8 req/s**） |
-| `A_SILENT_TIMEOUT` | 300 s（仅 A 可用时无活动迹象 → `offline`） |
-| `BLOCK_GRACE` | 45 s（发出请求后无推进 → `blocked`） |
-| `ERROR_WINDOW` / `ERROR_THRESHOLD` | 300 s / 3 次 |
-| `CLOCK_SKEW_TOL` | 5 s（超出置 degraded D3） |
-| `BLOCK_ALERT` | 10 min（仅加角标，**不改主状态**） |
-| `SLOW_FACTOR` | 1.5×（超同类任务中位数 → 「慢于预期」角标） |
-| **状态组合** | **5 主状态 × degraded 有/无 = 9 可见 + 1 归一化** |
-| 消息量能力 | 100,000 条，DOM ≤ 80 节点，滚动 ≥ 55 fps，内存增量 ≤ 200 MB |
-| **消息保留** | **90 天 / 单 team 10 万条（先到者为准）；单条 > 64 KB 截断** |
-| 搜索响应（10 万条） | ≤ 300 ms |
-| 崩溃恢复丢失窗口 | ≤ 1 s 或 ≤ 500 条 |
-| 重连时间 | ≤ 5 s（指数退避 + jitter，上限 30 s） |
-| **监听降级轮询** | **5 s（可配）+ 置 degraded** |
-| **通知聚合窗口** | **同成员 + 同故障类型 300 s（5 min）内聚合为 1 条** |
-| **通知全局限流** | 60 s ≤ 5 条，> 20 条只发 1 条汇总 |
-| **通知默认值** | 系统通知开 / 声音关 / 免打扰默认关闭 / 成员默认不静音 |
-| **脱敏误伤率** | **≤ 0.5%**（200 条干净样本，> 0.5% 记 S2） |
-| **脱敏明文残留** | **0 命中**（messages 表 / 索引 / FTS 影子表 / .db 二进制 / .db-wal / 归档 JSONL / 日志） |
-| **中文搜索响应** | < 200 ms（10 万条，中文语料 ≥ 70%） |
-| 冷启动首屏 | ≤ 3 s（warm）/ ≤ 5 s（cold） |
-| 长稳 8 h | RSS 增长 < 20%，无句柄泄漏，无崩溃 |
+| Workstation states | **3** (`busy` / `idle` / `blocked`); no orthogonal flag |
+| State derivation precedence | `blocked` > `busy` > `idle`; ties by earliest `stateSince` |
+| Renderer per-session rule | blocked (same session) > running task (same session) > borrowed summon busy > idle |
+| Report → render end-to-end | P95 ≤ 300 ms / P99 ≤ 800 ms |
+| ingest→bus / bus→fanout / fanout→store | ≤ 30 ms / ≤ 50 ms / ≤ 50 ms |
+| store→paint | ≤ 16.7 ms (worst 50 ms) |
+| Sustained load | 1,000 events/s × 60 s, ≥ 50 fps, no task > 50 ms |
+| Burst | 5,000 events/s × 5 s, convergence ≤ 1 s |
+| State update merge window | 200 ms (`member.status`) |
+| WS keepalive | ping every 30 s, 60 s pong timeout — **transport only**, never a state signal |
+| Task-record retention | default **90 days** (clamp 1–3650); deleting a task record also deletes its messages; no message-count cap |
+| Message truncation | `content_truncated` column exists; 64 KB logic **planned** |
+| Message capacity | 100,000 messages, DOM ≤ 80 nodes, ≥ 55 fps, memory ≤ 200 MB — **virtual list planned** |
+| Search response (100k) | ≤ 300 ms target (current query uses `LIKE`) |
+| Crash recovery loss | ≤ 1 s or ≤ 500 messages |
+| Reconnect | ≤ 5 s (exponential backoff + jitter, cap 30 s) |
+| Scanner / poll | configurable interval; **not** a fallback mode, never changes state |
+| Notification aggregation | 300 s per member + event type (proposal) |
+| Notification global limit | ≤ 5 per 60 s; > 20 → one summary (proposal) |
+| Notification defaults | system on / sound off / DND off / all unmuted (proposal) |
+| Redaction false-positive rate | ≤ 0.5% over 200 clean samples |
+| Redaction plaintext residue | 0 hits (messages / indexes / FTS shadow tables / `.db` / `-wal` / archive / logs) |
+| Chinese search response | < 200 ms (100k, Chinese corpus ≥ 70%) — target |
+| Cold start | ≤ 3 s warm / ≤ 5 s cold |
+| 8 h soak | RSS growth < 20%, no handle leak, no crash |
 
-## 附录 B：M0 最小落地清单（coder 必做，按优先级）
+## Appendix B: M0 minimum landing list
 
-| 优先级 | 项 |
+| Priority | Item |
 | --- | --- |
-| P0 | `packages/core` 纯 TS，零 electron 依赖（lint 强制） |
-| P0 | `Clock` 接口 + Fake 实现（含单调/墙钟分离） |
-| P0 | `EventSource` 接口 + `FakeEventSource`（`--demo` / `MOCK=1` 复用之） |
-| P0 | 确定性 ID：`eventId` / `msgId` / 每 agent 单调 `seq` + 唯一索引 |
-| P0 | `createTestApp()` 测试工厂 |
-| P0 | `data-testid` 规范落地（工位卡片含 `seat-degraded-<agentId>`、消息行） |
-| P0 | **原生模块：Electron 主进程内 `require('better-sqlite3')` 可用（Linux x64）** |
-| P0 | demo 模式可启动并渲染两个界面（确定性 seed） |
-| P1 | `messages.archived_at` 字段 + 索引 + `content_truncated` 标志 |
-| P1 | `--user-data-dir=` / `WORKGREMLIN_HOME` 支持 |
-| P1 | 打包脚本架构参数化（禁硬编码），`check:arch-param` 脚本 |
-| P2 | 事件 JSONL 落盘 + `replay()` |
-| P2 | 四段延迟 metrics + `getMetrics()` |
-| P2 | 故障注入开关 |
+| P0 | `shared/index.js` is the protocol source of truth; `AGENT_STATES` is exactly three values |
+| P0 | `Clock` abstraction with `__setClock` (monotonic / wall time) |
+| P0 | Deterministic `dedupe_key` + message ordering (`ts_ms`, id) |
+| P0 | Native modules: `require('better-sqlite3')` works inside the Electron main process (Linux x64) |
+| P0 | `npm run rebuild:native` exits 0; `npm run db:check` passes |
+| P0 | Data-directory override (`WORKGREMLIN_HOME`) + single-instance lock |
+| P0 | Stable selectors: `seat-card-*`, `seat-status-*`, `msg-row-*`, `conv-list`, `filter-agent`, `search-input` |
+| P0 | Demo project seeds on demand with deterministic data (three states + ghost + 200 messages) |
+| P1 | `messages.archived_at` + index + `content_truncated` column |
+| P1 | Architecture-parameterized packaging (no hardcoded arch), `check:arch-param` script |
+| P2 | Event JSONL persistence + `replay()` |
+| P2 | Latency metrics + `getMetrics()` |
+| P2 | Fault-injection switches |
 
-## 附录 C：M1 前必须补的可测性契约（Q4/Q5/Q2 相关）
+## Appendix C: Testability to add before feature work
 
-| 优先级 | 项 | 理由 |
+| Priority | Item | Reason |
 | --- | --- | --- |
-| P0（M1 硬阻塞） | `Redactor` 纯函数模块 + 规则集可注入 + **关闭开关** | 无此则 SEC-* 全部无法自动化 |
-| P0（M1 硬阻塞） | 脱敏在**落盘前**执行且早于 FTS 索引构建 | 否则 L2/L3 层必命中明文 |
-| P0（M1 硬阻塞） | `Notifier` 接口 + Fake 实现（可断言调用记录） | 无此则 NOT-02 负向用例只能人肉看弹窗 |
-| P0（M1 硬阻塞） | 通知与状态更新解耦（两条独立路径） | 保证静音/免打扰期间状态仍刷新（NOT-11） |
-| P1 | `--simulate-focus=lost\|gained` | 窗口焦点相关的通知行为可自动化（R13） |
-| P1 | 进度结构化对象 `{ value, source }` | 否则无法区分「0%」与「unknown」（PRG-02） |
-| P1 | FTS tokenizer 可配置 | SPIKE-09~12 对照与后续迁移 |
-| P1 | 暴露连接用途与 `secure_delete` 设置（7.20） | 支撑 DB-13/DB-14 双连接断言 |
+| P0 | `Redactor` pure module + injectable rules + disable switch | Without it, SEC-* cannot be automated |
+| P0 | Redaction runs before insert and before FTS indexing | Otherwise L2/L3 will always find plaintext |
+| P0 | `Notifier` interface + fake that records calls | NOT-02 negatives cannot be verified by watching the screen |
+| P0 | Notification decoupled from state updates | Muting must not freeze the office state (NOT-11) |
+| P1 | `--simulate-focus=lost\|gained` | Window-focus notification behavior becomes testable |
+| P1 | Structured progress `{ value, source? }` if progress returns | Distinguish "0%" from "unknown" |
+| P1 | Configurable FTS tokenizer | SPIKE-09–12 comparison and migration |
+| P1 | Expose connection purpose and `secure_delete` (7.20) | Support DB-13/DB-14 assertions |
