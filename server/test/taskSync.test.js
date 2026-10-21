@@ -777,46 +777,43 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('会话停掉后再跑一轮 → 落回 idle', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
 
   console.log('[9] /reporter-phase：按楼层基名（opencode）走对那一路（8F 回归）');
-  // 回归（2026-09-28 实测）：route 里两条分支曾写成 `clientBase(client) === 'opencode' | 'kilo'`，
-  // 而那时渲染层传的是"整个楼层的 clients 串"（合并楼层是 'opencode,opencode-plugin'），
-  // clientBase 只剥单个 -plugin 后缀、逗号串永远不相等 → 整条分支不生效：
-  // 主控制台相位/模型/完成标记全空，只剩一句"思考中"、没有任何内容。
-  // 现在身份恒为基名（单值），routes 直接等值判 → 走对那一路。
-  sessionsMod.reporterMainPhase = () => null;
+  // Regression: the route must use the central dispatcher for every floor. The old route hard-coded
+  // opencode here and compared a comma-separated client list with a scalar base name, which left the
+  // phase, model, and done marker empty. Identity is now always the bare floor base name.
   sessionsMod.reporterStateMeta = () => ({ sessionId: '', instrumented: false });
   sessionsMod.readReporterDone = () => null;
   opencodeMod.listOpencodeSessions = () => opencodeRows;
-  opencodeMod.opencodeMainPhase = () => ({
+  opencodeMod.readPhaseFallback = () => ({
     sessionId: 'oc-sid-1',
     phase: 'thinking',
     action: '',
     target: '',
     context: [],
     tool: '',
-    prompt: '逗号串也要给原话',
+    prompt: '基名也要给原话',
     model: 'longcat',
   });
-  // 用可变变量 + 闭包：route 在 require 时就把 readOpencodeDone 解构进去了，
-  // 之后再改模块导出对它无效（第一版就是踩了这个，done 一直是 null）。
+  // The route reaches the capability through the shared floor object at request time, so patching the
+  // floor export is sufficient.
   let ocDone = null;
-  opencodeMod.readOpencodeDone = () => ocDone;
-  opencodeMod.opencodeInstrumented = () => true;
+  opencodeMod.readDoneFallback = () => ocDone;
+  opencodeMod.instrumented = () => true;
   const { createSessionsRouter } = require('../src/http/routes/sessions');
   const appPhase = express();
   appPhase.use('/api/v1', createSessionsRouter({ workspace: { current: () => ({ workspacePath: '/tmp/p1' }) } }));
   const srvPhase = appPhase.listen(0, '127.0.0.1');
   await new Promise((r) => srvPhase.once('listening', r));
-  const rpComma = await (
-    await fetch(`http://127.0.0.1:${srvPhase.address().port}/api/v1/reporter-phase?client=opencode`)
+  const rpFallback = await (
+    await fetch(`http://127.0.0.1:${srvPhase.address().port}/api/v1/reporter-phase?client=opencode&session=oc-sid-1`)
   ).json();
   ok(
-    '逗号串也走 8F 轮询那一路（相位 / 用户原话 / 模型都在）',
-    rpComma.phase === 'thinking' && rpComma.prompt === '逗号串也要给原话' && rpComma.model === 'longcat',
-    JSON.stringify({ phase: rpComma.phase, prompt: rpComma.prompt, model: rpComma.model })
+    '基名 opencode 走 8F 轮询兜底（相位 / 用户原话 / 模型都在）',
+    rpFallback.phase === 'thinking' && rpFallback.prompt === '基名也要给原话' && rpFallback.model === 'longcat',
+    JSON.stringify({ phase: rpFallback.phase, prompt: rpFallback.prompt, model: rpFallback.model })
   );
-  // 被打断的那一轮：轮询那一路（readOpencodeDone）带的 doneCancelled 要经 toReporterDone 透传成
-  // 快轮询的 `done.cancelled` —— 渲染层读的就是它（IsoOfficeView 的 `fpDone.cancelled`），
-  // 少了这一步 8F 被终止也只会干等回待命，不会亮红色「任务取消」。
+  // An interrupted turn carries doneCancelled from the polling reader. toReporterDone must preserve it as
+  // fast-polling `done.cancelled` (IsoOfficeView's fpDone.cancelled), otherwise cancelling 8F never lights
+  // the red "task cancelled" state.
   ocDone = {
     doneAt: Date.now(),
     doneTitle: '',
@@ -827,7 +824,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const srv2 = appPhase.listen(0, '127.0.0.1');
   await new Promise((r) => srv2.once('listening', r));
   const rpCancel = await (
-    await fetch(`http://127.0.0.1:${srv2.address().port}/api/v1/reporter-phase?client=opencode`)
+    await fetch(`http://127.0.0.1:${srv2.address().port}/api/v1/reporter-phase?client=opencode&session=oc-sid-1`)
   ).json();
   ok(
     '8F 被打断：快轮询的 done.cancelled=true（主控制台据此亮红色「任务取消」）',

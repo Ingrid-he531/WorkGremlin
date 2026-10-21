@@ -921,7 +921,11 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function clineHandler(p, src, ctx) {
-  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter, table } = ctx;
+  const {
+    claimSession, upsert, now, workspacePath, TIMEOUT_MS,
+    reporterTruthPhase,
+    readReporterDone, doneFieldsFromReporter, table,
+  } = ctx;
   for (const s of listClineSessions()) {
     // A **terminal** session (Cline stamped ended_at, or wrote a terminal status) is over: drop its
     // registry row right away instead of keeping it for the whole 60-minute window. The dropdown lists
@@ -940,7 +944,7 @@ function clineHandler(p, src, ctx) {
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     const ph = readClinePhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;
-    const truth = reporterMainPhase(wsOfSession, CLIENT, s.id) || null;
+    const truth = reporterTruthPhase(wsOfSession, CLIENT, s.id) || null;
     const doneTruth = readReporterDone(wsOfSession, CLIENT, s.id);
     const donePoll = readClineDone(s.id, s);
     const form = truth ? 'vscode' : s.form;
@@ -1009,6 +1013,10 @@ module.exports = {
   syncClineSubagents,
   clineInstrumented,
   clineMainPhase,
+  // Phase/done/instrumentation capabilities consumed by the central phase dispatcher (sessions.js).
+  readPhaseFallback: clineMainPhase,
+  readDoneFallback: readClineDone,
+  instrumented: clineInstrumented,
   NO_DONE,
   // ---- 2F task syncer ----
   syncClineTasks,

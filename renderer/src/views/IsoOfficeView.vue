@@ -60,9 +60,8 @@ async function startPhasePoll() {
       // already refreshed it from server.json on WS reconnect), never hard-bake the startup token into the closure ——
       // baking it in means a 401 every 1.5s and the phase and "action" stuck on old values forever (same as the api/ws.js regression).
       const info = project.serverInfo || info0;
-      // Pass the current floor's clients: when Codex and CodeBuddy run in the same project at once, each takes its own phase
-      // A merged floor (1F CodeBuddy = CLI + Plugin) carries a list (comma-separated); the server counts the floor as hit if any one matches
-      const want = sessions.selectedClients.join(',');
+      // Reporter phases are scoped by one bare floor base name. CLI and plugin forms of a floor share it.
+      const want = sessions.selectedClient;
       const params = [];
       if (want) params.push(`client=${encodeURIComponent(want)}`);
       // Also pass the selected session's session id (axis 2): several sessions can be open under one client

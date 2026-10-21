@@ -71,10 +71,8 @@ const floorOptions = computed(() => (session.floors || []).filter((f) => f.clien
 
 /**
  * Floor ↔ client (axis 1):
- *   - A merged floor (1F CodeBuddy = CLI + Plugin) has a **comma-separated client string** as its
- *     key; the server matches it as a set;
- *   - A single floor is just one client and takes the same path (the string holds only itself), so
- *     behavior is unchanged.
+ *   - A floor is identified by one bare client base name; CLI and plugin forms share it;
+ *   - Selecting several floors produces a comma-separated value for the server's set filter.
  */
 function floorClients(f) {
   return Array.isArray(f.clients) && f.clients.length ? f.clients : f.client ? [f.client] : [];
@@ -808,8 +806,7 @@ function rowOfTask(t) {
 /**
  * Floors that still get a row even with no tasks that day (user request 2026-10-01):
  *   · Floor filter = all floors → **every installed floor** is drawn, empty ones leaving an empty row;
- *   · One or more floors are selected → only the matching floors remain (a merged floor's value is a
- *     comma-separated client string).
+ *   · One or more floors are selected → only the matching floors remain.
  * When a task really lands somewhere not listed (a client not in the floor table / no client at all),
  * buildFloorGantt still adds a row for it — not a single row is lost.
  */
@@ -923,8 +920,8 @@ async function saveRetention() {
         :all-label="tr('records.filter.project')"
         :aria-label="tr('records.col.project')"
       />
-      <!-- A merged floor (1F CodeBuddy) value is a comma-separated client string, matched as a set by the server (see query.js);
-           the item text includes the floor number ("1F CodeBuddy") — with only the product name you can't tell which floor it is -->
+      <!-- Floor values are bare client base names; selecting several floors sends a comma-separated set to the server.
+           The item text includes the floor number ("1F CodeBuddy") so floors with similar product names stay distinguishable. -->
       <MultiSelect
         v-model="tasks.filterClients"
         :options="floorSelOptions"

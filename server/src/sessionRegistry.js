@@ -44,7 +44,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const log = require('./log');
-const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase, reporterSnapshotPhase, freshestReporterWs } = require('./sessions');
+const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterTruthPhase, reporterSnapshotPhase, freshestReporterWs } = require('./sessions');
 const { detectProducts } = require('./floors');
 const { floorOf, floorByAgent } = require('./floors');
 const { formToSource, agentBase } = require('@workgremlin/shared');
@@ -586,7 +586,7 @@ function refresh({ workspacePath = '', force = false } = {}) {
     resolveProjectName, formatAge,
     upsert, doneFieldsOf, doneFieldsFromReporter,
     scanCliSessions, liveSessionCwds, listReporterSessions,
-    listSessions, reporterMainPhase, readReporterDone,
+    listSessions, reporterTruthPhase, readReporterDone,
   };
 
   for (const p of products) {

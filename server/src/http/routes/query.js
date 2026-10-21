@@ -12,8 +12,8 @@ const { floorByAgent } = require('../../floors');
 
 /**
  * Floor filter param → client list.
- * A single client ('codebuddy') or a comma-separated string ('codebuddy,codebuddy-plugin', used by
- * merged floors); 'all' / empty = no filter.
+ * A single floor base name ('codebuddy') or a comma-separated list when task-record filters select
+ * several floors; 'all' / empty = no filter.
  * @param {unknown} raw
  * @returns {string[]}
  */
@@ -128,9 +128,8 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
    *
    * Top-level filters (server-side):
    *   - project: a project id, or a comma-separated list of ids (multi-select); absent / 'all' = all projects.
-   *   - client : floor = the member client that ran the task (codebuddy/codex/cline/claude…);
-   *              may be a comma-separated string (merged floor 1F CodeBuddy = codebuddy + codebuddy-plugin);
-   *              absent / 'all' = all floors.
+   *   - client : floor base name that ran the task (codebuddy/codex/cline/claude…); a comma-separated
+   *              list means several selected floors; absent / 'all' = all floors.
    * The second-level filter (state) is applied by the frontend on the fetched rows (see the state
    * segment in TaskRecordsView).
    *
@@ -143,8 +142,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
    */
   router.get('/task-runs', (req, res) => {
     const projects = projectFilter(req.query.project);
-    // Floor filter: client may be a **comma-separated string** — a merged floor (1F CodeBuddy =
-    // CLI + Plugin) maps to two member clients, and selecting it must fetch both (see products.js).
+    // Floor filter: each floor contributes one base name; multiple selected floors are comma-separated.
     const clients = clientFilter(req.query.client);
     const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
     const conds = ['t.parent_task_id IS NULL'];
@@ -365,8 +363,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
    * Both are destructive, so the frontend shows a confirmation with the affected count first.
    */
   router.delete('/task-runs', (req, res) => {
-    // Same as GET: project / client may each be a comma-separated list (multi-select, and a merged
-    // floor deletes both of its clients at once).
+    // Same as GET: project / client may each be a comma-separated multi-select list.
     const project = projectFilter(req.query.project).join(',') || null;
     const client = clientFilter(req.query.client).join(',') || null;
     const mode = req.query.mode || 'all';

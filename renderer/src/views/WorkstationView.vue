@@ -29,9 +29,6 @@ const sorted = computed(() => {
   const order = ['blocked', 'busy', 'idle'];
   // Same rule as the office: filter by the current floor's client (an empty client counts as generic)
   const want = sessions.selectedClient;
-  // Recognize every floor's client: merged floors (1F CodeBuddy = CLI + Plugin) must include both variants,
-  // and single floors (3F Codex, where CLI and IDE are merged) likewise.
-  const allClients = (sessions.floors || []).map((f) => f.client);
   return sourceMembers.value
     // Workstation cards only show resident gremlins; ghosts summoned temporarily (subagent-xxx) are not listed,
     // avoiding the misunderstanding of "a same-named gremlin appearing in the card list after a summon".

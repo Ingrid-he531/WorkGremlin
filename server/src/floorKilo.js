@@ -1380,7 +1380,11 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function kiloHandler(p, src, ctx) {
-  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS, reporterMainPhase, readReporterDone, doneFieldsFromReporter } = ctx;
+  const {
+    claimSession, upsert, now, workspacePath, TIMEOUT_MS,
+    reporterTruthPhase,
+    readReporterDone, doneFieldsFromReporter,
+  } = ctx;
   for (const s of listKiloSessions()) {
     // Freshness before claiming: the separate hook source (plugin) owns the same session id, and claiming a
     // stale DB row here would shadow the fresher hook row —— see the same note in opencodeHandler.
@@ -1389,7 +1393,7 @@ function kiloHandler(p, src, ctx) {
     const ph = readKiloPhase(s.id) || null;
     const wsOfSession = s.projectPath || workspacePath;
     const truth =
-      reporterMainPhase(wsOfSession, 'kilo', s.id) ||
+      reporterTruthPhase(wsOfSession, 'kilo', s.id) ||
       null;
     const doneTruth =
       readReporterDone(wsOfSession, 'kilo', s.id);
@@ -1435,6 +1439,10 @@ module.exports = {
   readRoundPrompt, // What the user said this turn (the line on the "thinking" screen; much cheaper than readKiloRounds)
   kiloInstrumented,
   kiloMainPhase,
+  // Phase/done/instrumentation capabilities consumed by the central phase dispatcher (sessions.js).
+  readPhaseFallback: kiloMainPhase,
+  readDoneFallback: readKiloDone,
+  instrumented: kiloInstrumented,
   NO_DONE,
   // ---- 7F task syncer (from the old kiloTasks.js) ----
   syncKiloTasks,

@@ -29,10 +29,11 @@ const express = require('express');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-qoder-plugin-'));
 const HOME = path.join(TMP, 'home');
 const WG = path.join(TMP, 'wg');
+const HOOKS = path.join(WG, 'hooks');
 const PROJ = path.join(TMP, 'p1');
 const DBP = path.join(TMP, 'lingma', 'local.db');
 fs.mkdirSync(HOME, { recursive: true });
-fs.mkdirSync(WG, { recursive: true });
+fs.mkdirSync(HOOKS, { recursive: true });
 fs.mkdirSync(PROJ, { recursive: true });
 fs.writeFileSync(path.join(PROJ, 'package.json'), JSON.stringify({ name: 'p1' }));
 process.env.HOME = HOME;
@@ -45,6 +46,7 @@ const { createIngestBus } = require('../src/ingest/bus');
 const { createQueryRouter } = require('../src/http/routes/query');
 const { detectProducts } = require('../src/floors');
 const { snapshot } = require('../src/sessionRegistry');
+const { reporterMainPhase, reporterTruthPhase } = require('../src/sessions');
 const qoder = require('../src/floorQoder');
 const { syncQoderPluginTasks, LIVE_MS, TASK_ID_PREFIX } = qoder;
 
@@ -130,6 +132,23 @@ function writeDb({ sessions = [], records = [], snapshots = [], schema = SCHEMA 
   }
   db.close();
   qoder.resetLingmaCache(); // 会话表有 5s 缓存：刚换过库/刚写过行必须清掉
+}
+
+/** Write one reporter state file using the same path encoding as the hook/plugin reporter. */
+function writeState(client, sessionId, extra, ws = PROJ) {
+  const name = `${client}@${ws}@${sessionId}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+  fs.writeFileSync(
+    path.join(HOOKS, `${name}.json`),
+    JSON.stringify({
+      client,
+      sessionId,
+      taskId: `task-${sessionId}`,
+      taskStartedAt: Date.now(),
+      taskWorkspacePath: ws,
+      hb: { lastEventAt: Date.now() },
+      ...extra,
+    }, null, 2)
+  );
 }
 
 const NOW = Date.now();
@@ -427,6 +446,39 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     const snap = snapshot({ force: true, workspacePath: PROJ });
     const floor = snap.floors.find((f) => f.id === '6F');
     ok('空会话不进表（主控制台不会凭空多一条）', !((floor && floor.sessions) || []).some((s) => s.sessionId === 's-empty'), ((floor && floor.sessions) || []).map((s) => s.sessionId).join(' '));
+  }
+
+  head('[D] Qoder phase precedence: hook truth first, Lingma polling only as fallback');
+  const fallbackSid = 's-qoder-fallback';
+  const hookSid = 's-qoder-hook-truth';
+  writeDb({
+    sessions: [
+      { id: fallbackSid, title: 'Lingma fallback', lastEventAt: NOW },
+      { id: hookSid, title: 'Hook truth', lastEventAt: NOW },
+    ],
+    records: [
+      { requestId: 'd0', sessionId: fallbackSid, prompt: 'fallback round', startedAt: NOW - 20_000, updatedAt: NOW - 2_000 },
+      { requestId: 'd1', sessionId: hookSid, prompt: 'hook round', startedAt: NOW - 20_000, updatedAt: NOW - 2_000 },
+    ],
+  });
+  writeState('qoder', hookSid, {
+    sessionPhase: { phase: 'await', ts: Date.now(), workspacePath: PROJ, tool: 'Bash', cmd: 'npm test', target: 'npm test' },
+    pending: null,
+    taskTitle: 'run the tests',
+  });
+  {
+    const truth = reporterTruthPhase(PROJ, 'qoder', hookSid);
+    const memberTruth = reporterTruthPhase(PROJ, 'qoder@p1', hookSid);
+    const main = reporterMainPhase(PROJ, 'qoder', hookSid);
+    ok('Qoder hook await is reported truth even while Lingma has a live round', Boolean(truth) && truth.phase === 'await', truth && truth.phase);
+    ok('memberId clients are normalized before reading reporter truth', Boolean(memberTruth) && memberTruth.phase === 'await', memberTruth && memberTruth.phase);
+    ok('reported truth is not marked inferred', Boolean(truth) && truth.inferred === false, truth && String(truth.inferred));
+    ok('hook await wins over the Lingma thinking fallback', Boolean(main) && main.phase === 'await', main && main.phase);
+
+    const fallback = reporterMainPhase(PROJ, 'qoder', fallbackSid);
+    ok('Lingma fallback is used when no hook truth exists', Boolean(fallback) && fallback.phase === 'thinking', fallback && fallback.phase);
+    ok('Lingma fallback is marked inferred and keeps the requested session', Boolean(fallback) && fallback.inferred === true && fallback.sessionId === fallbackSid, fallback && `${fallback.inferred}:${fallback.sessionId}`);
+    ok('Lingma fallback rejects a different workspace', reporterMainPhase(path.join(TMP, 'other'), 'qoder', fallbackSid) === null);
   }
 
   server.close();

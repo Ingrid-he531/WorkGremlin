@@ -339,7 +339,7 @@ head('[H] 终态会话立刻回收（源里标了结束就不进下拉）');
     now: Date.now(),
     workspacePath: '',
     TIMEOUT_MS: 60 * 60_000,
-    reporterMainPhase: () => null,
+    reporterTruthPhase: () => null,
     readReporterDone: () => null,
     doneFieldsFromReporter: () => ({}),
     table,

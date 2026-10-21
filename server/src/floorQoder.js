@@ -1,26 +1,25 @@
 'use strict';
 
 /**
- * 6F Qoder (CLI and plugin merged single floor) floor module —— merges the plugin form's **data
- * source** and **task synchronizer** (formerly lingma.js / qoderPluginTasks.js) into this one file.
+ * 6F Qoder (CLI and plugin merged single floor) floor module. It merges the plugin form's data
+ * source and task synchronizer (formerly lingma.js / qoderPluginTasks.js) into this file.
  *
  * 6F has only one reporting identity, qoder (the CLI and the plugin cannot be told apart, they share
  * the same client), and three sources:
- *   · cli    —— scan the CLI transcripts under <root>/projects to produce sessions (same as 4F Claude).
+ *   · cli    — scan the CLI transcripts under <root>/projects to produce sessions (same as 4F Claude).
  *              Both roots are scanned: ~/.qoder for the global CLI and ~/.qoder-cn for the CN CLI
  *              (same transcript format, different roots)
- *   · lingma —— poll Qoder CN's own SQLite (local.db), plugin form only
- *   · hook   —— real-time phase fallback
+ *   · lingma — poll Qoder CN's own SQLite (local.db), plugin form only
+ *   · hook   — primary/reported phase source (coarse for Qoder)
  *
- * This file only owns the "plugin form" path: lingma.js reads the disk, qoderPluginTasks.js writes the
- * ledger. Detailed discipline (read-only opening / short timeouts / caching / phase is inferred not
- * reported) is documented above each function.
+ * The plugin path reads the disk (read-only opening / short timeouts / caching) and the synchronizer
+ * writes the ledger. Lingma-derived phases are always inferred, never reported truth.
  *
  * Unified interface (see FLOOR_CONTRACT in floors.js):
  *   id / client   floor identity
  *   listSessions  this plugin path's sessions (= listLingmaSessions)
  *   readRounds    = readLingmaRounds
- *   readPhase     = readLingmaPhase
+ *   readPhaseFallback = qoderMainPhase
  *   readDone      = readLingmaDone
  *   syncTasks     = syncQoderPluginTasks
  */
@@ -393,6 +392,29 @@ function readLingmaPhase(sessionId, rounds = null, meta = {}, now = Date.now()) 
     model: String(last.model || ''),
     inferred: true,
   };
+}
+
+/**
+ * Reporter-signature adapter for Qoder's product-store polling fallback.
+ *
+ * Hooks are Qoder's primary phase source. This adapter only runs after reporter truth is absent, and
+ * returns a phase only when the requested session exists in Lingma's local.db for the requested
+ * workspace. The result stays explicitly inferred.
+ *
+ * @param {string} workspacePath
+ * @param {string} session
+ * @returns {object|null}
+ */
+function qoderMainPhase(workspacePath, session = '') {
+  const id = String(session || '').trim();
+  if (!id) return null;
+  const row = listLingmaSessions().find((s) => s.id === id);
+  if (!row) return null;
+  if (workspacePath && path.resolve(row.projectPath) !== path.resolve(workspacePath)) return null;
+  const rounds = readLingmaRounds(id);
+  const phase = readLingmaPhase(id, rounds, row, Date.now());
+  if (!phase) return null;
+  return { sessionId: id, ...phase };
 }
 
 /** Freshness window of the done marker: only wrapping up within this long counts as "just happened", otherwise opening the page replays the previous round (same criterion as kilo.js) */
@@ -792,7 +814,7 @@ module.exports = {
   // Unified interface aliases
   listSessions: listLingmaSessions,
   readRounds: readLingmaRounds,
-  readPhase: readLingmaPhase,
+  readPhaseFallback: qoderMainPhase,
   readDone: readLingmaDone,
   syncTasks: syncQoderPluginTasks,
   // Server-side hook event handling (disk parsing belongs to the server)

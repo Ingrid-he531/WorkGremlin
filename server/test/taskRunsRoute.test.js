@@ -157,7 +157,7 @@ app.use('/api/v1', createIngestRouter({ bus }));
   ok('老数据 form 为 null（显示退回只写产品名）', (all.body.items.find((t) => t.id === 't-old') || {}).form === null);
   ok('file_count / files_json / model / result 列都在 SELECT 里', ['file_count', 'files_json', 'model', 'result', 'session_id', 'duration_ms', 'subagentCount'].every((k) => k in row), Object.keys(row).join(','));
 
-  console.log('[3] 楼层筛选照常（合并楼层的逗号集合）');
+  console.log('[3] 楼层筛选照常（多楼层选择使用逗号集合）');
   const filtered = await get('limit=50&client=codex');
   ok('client=codex 取到 3 条', (filtered.body.items || []).length === 3, JSON.stringify((filtered.body.items || []).map((t) => t.id)));
 

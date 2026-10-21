@@ -219,8 +219,9 @@ could fool the detector).
 
 Merged floors declare their `sources` in `products.js` (1F is `['cli','plugin','hook']`, 5F is two `dir` sources +
 `hook`, 7F is one `kilo` source with its own data-root stats, 8F is one `opencode` source with its own data root
-plus `hook` for plugin truth). A floor can consume several on-disk routes, each with its own client
-(`codebuddy` / `codebuddy-plugin`, `trae` / `trae-plugin`), and phase / completion are accepted per session.
+plus `hook` for plugin truth). A floor can consume several on-disk routes, but all routes share the floor's
+bare client base name (`codebuddy` / `trae`); `form` distinguishes CLI, IDE, and plugin. Phase / completion
+are accepted per session.
 
 An entry is `{ kind, label?, client?, dirs?, note? }`:
 
@@ -527,28 +528,33 @@ same reason as above:
 says where a session is **listed** and has nothing to do with phase; phase goes through `reporterMainPhase`.
 
 The unified entry is `reporterMainPhase(workspacePath, client, session)` (`server/src/sessions.js`)
-= `FLOORS[client].readPhase || readReporterPhase`. Who supplies real phase:
+= `floorByAgent[agentBase(client)].readPhase || readReporterPhase`, followed by the floor's optional
+`readPhaseFallback` when no reported truth exists. Who supplies real phase:
 
 | Floor | Product | Live phase source | Write / read path |
 | --- | --- | --- | --- |
 | 1F | CodeBuddy | **hook** | `hook.js` writes the state file, `readReporterPhase` reads it |
-| 2F | Cline | **on-disk** | `FLOORS.cline.readPhase = clineMainPhase` (reads `~/.cline/data` `sessions.db` + session JSON, `inferred`) |
+| 2F | Cline | **on-disk fallback** | `floorByAgent.cline.readPhaseFallback = clineMainPhase` (reads `~/.cline/data` `sessions.db` + session JSON, `inferred`) |
 | 3F | Codex | **hook** | Same as 1F |
 | 4F | Claude Code | **hook** | Same as 1F |
 | 5F | TraeCode | **hook** | Same (sessions themselves also come only from the state file) |
-| 6F | Qoder | **on-disk** | `FLOORS.qoder.readPhase = readLingmaPhase` (Lingma `local.db`, `inferred`) |
-| 7F | Kilo Code | **plugin** | Plugin installed → state file (truth, includes "awaiting authorization"); otherwise poll `kilo.db` (`inferred`) |
-| 8F | OpenCode | **plugin** | Plugin installed → state file (truth, includes "awaiting authorization"); otherwise poll `session_message` (`inferred`) |
-| 9F | GitHub Copilot | **on-disk** | `FLOORS.copilot.readPhase = readCopilotPhaseFromSqlite` (`inferred`) |
+| 6F | Qoder | **hook, then on-disk fallback** | Hook state file is reported truth (coarse); `floorByAgent.qoder.readPhaseFallback = qoderMainPhase` polls Lingma `local.db` only when no hook truth exists (`inferred`) |
+| 7F | Kilo Code | **plugin** | Plugin installed → state file (truth, includes "awaiting authorization"); otherwise `readPhaseFallback = kiloMainPhase` polls `kilo.db` (`inferred`) |
+| 8F | OpenCode | **plugin** | Plugin installed → state file (truth, includes "awaiting authorization"); otherwise `readPhaseFallback = opencodeMainPhase` polls `session_message` (`inferred`) |
+| 9F | GitHub Copilot | **on-disk** | `floorByAgent.copilot.readPhase = readCopilotPhaseFromSqlite` (`inferred`) |
 
 Hook and plugin write the **same** state file `~/.workgremlin/hooks/<client>@<project>@<session>.json`
 (`shared/paths.js` `statePath`), **one per session** — so every session on disk has a live phase, none missing.
+
+`readPhase` is the floor's primary/reported source. Product-store polling is a separate
+`readPhaseFallback` capability, so a polled value can never outrank a plugin-reported phase (including
+`await`). `reporterMainPhase` owns that precedence and the `/reporter-phase` route stays product-agnostic.
 
 Who can read it:
 
 | Channel | Granularity | Who gets it |
 | --- | --- | --- |
-| `GET /api/v1/reporter-phase` (1.5 s fast poll) | **one session per call** | Only "selected floor + selected session": the frontend sends only `?client=&session=` (`IsoOfficeView.vue`); the server does `if (!session) return null` and keeps only the named file (`sameSession`) — deliberately, because an earlier "latest for the client" showed another session's phase |
+| `GET /api/v1/reporter-phase` (1.5 s fast poll) | **one session per call** | Only "selected floor + selected session": the frontend sends only `?client=<floor-base>&session=` (`IsoOfficeView.vue`); the server does `if (!session) return null` and keeps only the named file (`sameSession`) — deliberately, because an earlier "latest for the client" showed another session's phase |
 | `GET /api/v1/sessions` (snapshot, 5 s) | every session has a `phase` | `cli` / `hook` rows stay `'unreported'` (that path does not invent phase); plugin rows are written by their handler (the current session overlays reporter truth, others are inferred from disk) |
 
 The scrolling ticker uses the second channel: `/api/v1/task-feed` returns `client` + `sessionId` per row
@@ -560,9 +566,9 @@ not"**.
 **Plan A (landed): backfill real phase while building the session snapshot.** The data is already in the state
 files; nobody read it for **non-selected** sessions. In `sessionRegistry.js` `snapshot()`, for rows with
 `phase === 'unreported'`, call `reporterSnapshotPhase(ws, client, sessionId)` (`sessions.js`, internally
-`reporterMainPhase`); only for floors **without their own `readPhase`** (hook / plugin floors; 6F/9F rows already
-carry inferred phase from their handler and are left alone). On a hit, overwrite `phase / action / target /
-context / tool / prompt` and set `inferred = false`. Scope and trade-offs:
+`reporterTruthPhase`); only for floors **without their own primary `readPhase`** (hook / plugin floors;
+9F rows already carry inferred phase from their handler and are left alone). On a hit, overwrite
+`phase / action / target / context / tool / prompt` and set `inferred = false`. Scope and trade-offs:
 
 - The ticker changes **not at all**: it already joins the snapshot, so it reads the truth (including "awaiting
   authorization") after the backfill.
@@ -659,7 +665,7 @@ the Codex side still need verification.
 | Awaiting authorization (`blocked` · `awaiting_permission`) | 🟡 Verified without a live session | This machine runs `permission_mode=bypassPermissions` and never shows a permission dialog; Codex uses an explicit `PermissionRequest` (no longer inferred from CodeBuddy's pending state) |
 | Seated gremlin roster (Codex-side agent definitions) | 🟡 Not verified | Scans `.md` / `.toml` under `$CODEX_HOME/agents` and `<project>/.codex/agents`; this machine has no such files yet |
 | Floor / session list (3F) | ✅ Exists | `products.js` detects the codex executable; `sessionRegistry.js` scans `~/.codex/sessions/**/rollout-*.jsonl` and uses `cwdOfHead` to read `payload.cwd` from the first lines |
-| Client isolation (3F does not show CodeBuddy members or phases) | ✅ Measured | `members.client` + `/api/v1/reporter-phase?client=` (merged floors may pass a comma-separated list) |
+| Client isolation (3F does not show CodeBuddy members or phases) | ✅ Measured | `members.client` + `/api/v1/reporter-phase?client=` (the renderer passes one bare floor base name; CLI and plugin forms share it) |
 | PreCompact / PostCompact | ❌ Unhandled | Same as CodeBuddy (no UI semantics) |
 | `Stop.last_assistant_message` | ❌ Unused | The completion summary still comes from "files changed this turn" |
 | `turn_id` / `agent_id` attribution | ❌ Unused | A subagent's tool calls carry `agent_id`, which could attribute file activity to that ghost (currently still credited to the main member) |

@@ -2,15 +2,8 @@
 
 const express = require('express');
 const { reporterMainPhase, freshestReporterWs, reporterStateMeta, readReporterDone } = require('../../sessions');
-// 7F Kilo Code: Kilo has no hook state file, so phase / done markers are derived from its own SQLite
-const { kiloMainPhase, readKiloDone, kiloInstrumented } = require('../../floorKilo');
-// 8F OpenCode: **two paths** —— with the WorkGremlin plugin installed the true phase comes from the
-// reporter state file; without it (or before it ever wrote) we fall back to deriving it by polling
-// opencode.db. The shape differs from 7F, see the notes below.
-const { opencodeMainPhase, readOpencodeDone, opencodeInstrumented } = require('../../floorOpencode');
-// 2F Cline: Cline has no WorkGremlin hook installed (its own hooks are opt-in and unused here), so
-// phase / done markers are derived by polling its own store (`~/.cline/data`).
-const { clineMainPhase, readClineDone, clineInstrumented } = require('../../floorCline');
+const { floorByAgent } = require('../../floors');
+const { agentBase } = require('@workgremlin/shared');
 
 
 /**
@@ -42,8 +35,7 @@ function toReporterDone(done, sessionId, workspacePath = '') {
     sessionId: String(sessionId || ''),
     workspacePath,
     // This round was cut short by the user (ESC / stop) → the main console lights up red "task
-    // cancelled" instead of "task finished". The polling branch of 7F/8F (readKiloDone /
-    // readOpencodeDone) relies on this to carry "cancelled" up from the store.
+    // cancelled" instead of "task finished". Polling floors carry this flag from their store reader.
     cancelled: Boolean(done.doneCancelled),
     // The text this round spat out (the wrap-up summary) —— carried even when cancelled ("did not
     // finish" is not "produced nothing"); the render layer's `fpDone.said` is this value, and only
@@ -52,9 +44,10 @@ function toReporterDone(done, sessionId, workspacePath = '') {
   };
 }
 
-/** Is the client in the request **this path** (identity is always the floor base name, compared for equality). */
-function clientListHas(client, base) {
-  return String(client || '').trim().toLowerCase() === String(base || '').toLowerCase();
+/** Resolve a floor by its base client name. Product-specific capabilities stay on the floor module. */
+function floorForClient(client) {
+  const base = agentBase(client);
+  return base ? floorByAgent[base] || null : null;
 }
 
 /**
@@ -81,172 +74,56 @@ function createSessionsRouter({ workspace }) {
   // and dedicated to showing the main Agent console's "action" in real time.
   router.get('/reporter-phase', (req, res) => {
     const cur = workspace && workspace.current ? workspace.current() : {};
-    // Take the phase per floor (client): Codex and CodeBuddy running in the same project must not
-    // contaminate each other
-    // client may be a **comma-separated list** —— a merged floor (1F CodeBuddy = CLI + Plugin) has to
-    // recognize two reporting identities at once; any hit in the list counts as this floor (matching
-    // is clientHit in sessions.js).
-    const client = String(req.query.client || '').trim().toLowerCase();
+    // Client identity is always the bare floor base name. Resolve it through agentBase() so a member-style
+    // id can never accidentally become a separate phase identity.
+    const client = agentBase(req.query.client || '');
     // Axis 2 (session): `?session=<session_id>` takes only that session's phase / done marker.
     // A floor can have several sessions open at once (one claude in two terminals / a mix of CLI and
-    // plugin); omitting session keeps the old behavior —— "whoever is newest under the same client
-    // wins", which cross-contaminates when there are multiple sessions.
+    // plugin), so a missing session deliberately yields no phase instead of borrowing another session's.
     const session = String(req.query.session || '').trim();
     // Follow the freshest project the reporter is actually active in, rather than the one recorded
     // by manually "opening a project" in the office
     const ws = freshestReporterWs(cur.workspacePath || '', client, session);
 
-    // ---- 7F Kilo Code: two paths, split by client ----
-    //   · kilo-plugin (VS Code extension with the WorkGremlin plugin installed): **true phase first,
-    //     polling as fallback** (same pattern as 8F OpenCode: the plugin writes phase / done markers
-    //     into the reporter state file, which is reported truth, never flagged inferred, and it alone
-    //     can give "awaiting permission" —— measured Kilo tool states likewise only have completed /
-    //     error / running with no pending, so polling cannot derive it either).
-    //   · kilo (CLI / TUI without the plugin): pure polling, derived from its own SQLite (always
-    //     flagged inferred).
-    // Both paths respond in exactly the same shape; the render layer cannot and need not tell them apart.
-    if (clientListHas(client, 'kilo')) {
-      const fallbackWs = ws || cur.workspacePath || '';
-      // ---- Ask the true phase first: the state file written by the plugin (the same thing the
-      // generic path reads) ----
-      //
-      // **Both kilo and kilo-plugin have to be asked**, not just the latter: when the plugin is
-      // installed on the CLI / TUI, resolveClient() decides `kilo` from the environment variables
-      // (only the extension's three variables mean kilo-plugin), and the CLI writes state files just
-      // the same and has "awaiting permission" too. Recognizing only kilo-plugin would ignore the
-      // true phase for the "CLI with plugin installed" combination entirely and show the polling
-      // derived phase instead —— installing the plugin would make things worse.
-      const rpTruth = reporterMainPhase(ws, client, session);
-      const metaTruth = reporterStateMeta(ws, client, session);
-      const useTruth = Boolean(rpTruth && rpTruth.phase);
-      // ---- Fallback: derive it by polling kilo.db ----
-      const rpPoll = useTruth ? null : kiloMainPhase(fallbackWs, session);
-      const rp = rpTruth && rpTruth.phase ? rpTruth : rpPoll;
-      const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
-
-      // Same for the done marker: the plugin's copy carries the changed-file list, polling only has
-      // a count —— prefer the plugin's when there is one.
-      const doneTruth = readReporterDone(ws, client, phaseSessionId);
-      const done = doneTruth && doneTruth.at
-        ? doneTruth
-        : toReporterDone(phaseSessionId ? readKiloDone(phaseSessionId, { title: '', fileCount: 0 }) : null, phaseSessionId, fallbackWs);
-      // "Is it hooked up": the plugin is installed (state file exists) **or** this session is in the
-      // store —— either one counts as true.
-      const instrumented = Boolean(metaTruth.instrumented || kiloInstrumented(phaseSessionId));
-      return res.json({
-        ok: true,
-        workspacePath: useTruth ? ws || fallbackWs : fallbackWs,
-        instrumented,
-        session: session || phaseSessionId,
-        sessionId: phaseSessionId,
-        done: done || null,
-        ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
-      });
-    }
-
-    // ---- 2F Cline: pure polling (no WorkGremlin hook installed for it) ----
-    // Same shape as 7F: the render layer cannot and need not tell the two paths apart. Cline's own
-    // hooks are opt-in and WorkGremlin does not install into them, so phase / done markers come from
-    // polling its store (`~/.cline/data`), always flagged inferred.
-    if (clientListHas(client, 'cline')) {
-      const fallbackWs = ws || cur.workspacePath || '';
-      const rpTruth = reporterMainPhase(ws, client, session);
-      const metaTruth = reporterStateMeta(ws, client, session);
-      const useTruth = Boolean(rpTruth && rpTruth.phase);
-      const rpPoll = useTruth ? null : clineMainPhase(fallbackWs, session);
-      const rp = rpTruth && rpTruth.phase ? rpTruth : rpPoll;
-      const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
-      const doneTruth = readReporterDone(ws, client, phaseSessionId);
-      const done = doneTruth && doneTruth.at
-        ? doneTruth
-        : toReporterDone(phaseSessionId ? readClineDone(phaseSessionId, { title: '', fileCount: 0 }) : null, phaseSessionId, fallbackWs);
-      const instrumented = Boolean(metaTruth.instrumented || clineInstrumented(phaseSessionId));
-      return res.json({
-        ok: true,
-        workspacePath: useTruth ? ws || fallbackWs : fallbackWs,
-        instrumented,
-        session: session || phaseSessionId,
-        sessionId: phaseSessionId,
-        done: done || null,
-        ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
-      });
-    }
-
-    // ---- 8F OpenCode: **true phase first, polling as fallback** (differs from 7F, see below) ----
-    // 7F short-circuits straight to kilo.js because Kilo has no hook state file at all, leaving
-    // reporterMainPhase permanently empty for it. 8F is different: OpenCode **does** have a plugin
-    // mechanism, and the WorkGremlin plugin writes phase / done markers into the reporter state file
-    // —— that is **reported truth** (no inferred flag, no graying out in the UI), and it alone can
-    // give "awaiting permission" (measured OpenCode tool states only have completed/error/running;
-    // the permission signal exists in the in-memory event stream only and polling cannot derive it).
-    // Hence the order: read the reporter the generic way first (hit when the plugin is installed) →
-    // fall back to polling when nothing is there.
-    // Both paths respond in exactly the same shape; the render layer cannot and need not tell them apart.
-    if (clientListHas(client, 'opencode')) {
-      const fallbackWs = ws || cur.workspacePath || '';
-      // ---- True phase: the state file written by the plugin (the same thing the generic path below reads) ----
-      const rpTruth = reporterMainPhase(ws, client, session);
-      const metaTruth = reporterStateMeta(ws, client, session);
-      // ---- Fallback: derive it by polling opencode.db ----
-      const rpPoll = opencodeMainPhase(fallbackWs, session);
-      const useTruth = Boolean(rpTruth && rpTruth.phase);
-      const rp = useTruth ? rpTruth : rpPoll;
-      // Which session this phase belongs to (the render layer uses it to confirm "is the session I
-      // am looking at this one")
-      const phaseSessionId = String((rp && rp.sessionId) || metaTruth.sessionId || session || '');
-
-      // Same for the done marker: the plugin's copy carries the **changed-file list** (measured from
-      // the data.files of session.step.ended events), polling only has a count —— prefer the plugin's
-      // when there is one. Both are funneled through toReporterDone into the same shape (the plugin's
-      // copy is already in reporter shape, so translating is idempotent).
-      const doneTruth = readReporterDone(ws, client, phaseSessionId);
-      const done = doneTruth && doneTruth.at
-        ? doneTruth
-        : toReporterDone(phaseSessionId ? readOpencodeDone(phaseSessionId, { title: '', fileCount: 0 }) : null, phaseSessionId, fallbackWs);
-      // "Is it hooked up": the plugin is installed (state file exists) **or** this session is in the
-      // store —— either one counts as true. The render layer uses it to tell "this product is not
-      // running at all" from "running but idle right now".
-      const instrumented = Boolean(metaTruth.instrumented || opencodeInstrumented(phaseSessionId));
-      return res.json({
-        ok: true,
-        workspacePath: useTruth ? ws || fallbackWs : fallbackWs,
-        instrumented,
-        session: session || phaseSessionId,
-        sessionId: phaseSessionId,
-        done: done || null,
-        ...(rp || { phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }),
-      });
-    }
-
+    // Phase dispatch is floor-driven: sessions.js tries the floor's primary/reported source first and only
+    // then its declared polling fallback. This route stays product-agnostic and normalizes the shared response
+    // shape (phase, done marker, instrumentation, workspace/session identity).
+    const floor = floorForClient(client);
+    const fallbackWs = ws || cur.workspacePath || '';
     const rp = reporterMainPhase(ws, client, session);
-    // Whether this project has a hook attached (attached but idle right now → the render layer shows
-    // "standby" instead of guessing from file times)
-    // Whether a hook is attached + which session that state file belongs to (the render layer uses it
-    // to judge "is the session you are watching actually reporting")
     const meta = reporterStateMeta(ws, client, session);
-    const instrumented = meta.instrumented;
-    // The previous round's done marker (including Codex's wrap-up self-report): CLI floors light up
-    // "task finished" thanks to it
-    const done = readReporterDone(ws, client, session);
-    // Carry the project path (workspacePath) this phase belongs to: the render layer only overlays
-    // the live phase when "the selected session belongs to exactly this project", so an old session
-    // (whose own project is no longer active) is not contaminated by another project's phase and
-    // flashes "thinking" briefly. The session is echoed back too: callers may not pass it (old
-    // behavior), so use this field to confirm whose phase it really is.
+    const phaseSessionId = String((rp && rp.sessionId) || meta.sessionId || session || '');
+
+    // Prefer the reporter's done marker (it may carry the exact changed-file list); polling floors supply
+    // their own store-shaped marker through the matching capability and the route converts it once here.
+    const doneTruth = readReporterDone(ws, client, phaseSessionId);
+    const done = doneTruth && doneTruth.at
+      ? doneTruth
+      : phaseSessionId && floor && typeof floor.readDoneFallback === 'function'
+        ? toReporterDone(floor.readDoneFallback(phaseSessionId, { title: '', fileCount: 0 }), phaseSessionId, fallbackWs)
+        : null;
+
+    // A hook/plugin state file or a live store row both mean "this product is present"; the UI uses this to
+    // distinguish "not running" from "running but idle".
+    const instrumented = Boolean(
+      meta.instrumented || (floor && typeof floor.instrumented === 'function' && floor.instrumented(phaseSessionId))
+    );
+
+    // A polling fallback carries inferred=true. Keep the requested workspace for reported phases and the
+    // current workspace for inferred ones (the same workspace/session guard the renderer uses).
+    const usingFallback = Boolean(rp && rp.inferred);
     const body = {
       ok: true,
-      workspacePath: ws,
+      workspacePath: usingFallback ? fallbackWs : rp ? ws || fallbackWs : ws,
       instrumented,
-      // Echo the session back when the request specified one; otherwise echo "the one actually read"
-      // (meta.sessionId)
-      session: session || meta.sessionId || '',
-      sessionId: meta.sessionId,
-      done,
+      session: session || phaseSessionId,
+      sessionId: phaseSessionId,
+      done: done || null,
     };
     res.json(
       rp
         ? { ...body, ...rp }
-        : { ...body, phase: null, action: '', target: '', context: [] }
+        : { ...body, phase: null, action: '', target: '', context: [], tool: '', prompt: '', model: '' }
     );
   });
 

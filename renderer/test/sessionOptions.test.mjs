@@ -11,6 +11,8 @@
  */
 import { createServer } from 'vite';
 import { createPinia, setActivePinia } from 'pinia';
+import fs from 'node:fs';
+import path from 'node:path';
 
 let pass = 0;
 let fail = 0;
@@ -114,6 +116,13 @@ head('虚拟演示会话：每次 /sessions 更新后重新注入');
   s.removeVirtualSession();
   ok('退出演示后虚拟会话被移除', !s.options.some((o) => o.value === demo.id));
   ok('退出演示后已选中的演示 id 被清空', s.selectedId !== demo.id);
+}
+
+head('reporter-phase 使用单个楼层基名');
+{
+  const officeSrc = fs.readFileSync(path.resolve('renderer/src/views/IsoOfficeView.vue'), 'utf8');
+  ok('快轮询直接传 selectedClient', officeSrc.includes('const want = sessions.selectedClient;'));
+  ok('快轮询不再拼接逗号分隔的 clients', !officeSrc.includes('selectedClients.join'));
 }
 
 await server.close();

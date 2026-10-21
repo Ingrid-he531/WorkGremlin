@@ -22,6 +22,9 @@
  *                sources/hookSource/dataKind/matchRe/homeDirs/homeDirsPlugin/cliBinDirs)
  *   kindHandlers (optional) this floor's own "session source branch": { <kind>: (product, spec, ctx) => void }
  *   sessionTitle (optional) this floor's own session-title read: function(sessionId) => string
+ *   readPhase / readPhaseFallback (optional) primary phase vs product-store polling fallback; sessions.js
+ *                owns the precedence rule (reporter/primary truth first, polling only when absent)
+ *   readDoneFallback / instrumented (optional) the matching done marker and "session exists in store" probe
  *   syncTasks / pollMs (optional) floors that write the task ledger by polling (see each floor file):
  *                syncTasks(ctx) reads the local store and fills in task + task_run; pollMs declares
  *                the cadence (default 5000). **Floors hold no timers** — the single clock lives in
@@ -74,6 +77,10 @@ const FLOOR_CONTRACT = [
   'meta',
   'kindHandlers',
   'sessionTitle',
+  'readPhase',
+  'readPhaseFallback',
+  'readDoneFallback',
+  'instrumented',
   'syncTasks',
   'pollMs',
   'modelOf',

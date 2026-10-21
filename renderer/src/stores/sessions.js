@@ -116,19 +116,6 @@ export const useSessionStore = defineStore('sessions', {
     },
 
     /**
-     * The clients the current floor accepts (the server's floors[].clients passed through as-is; the
-     * identity is always the floor base name, e.g. 1F's ['codebuddy']).
-     * /reporter-phase filters phases by it; the floor ↔ client mapping is authoritative in the server's
-     * floors, so it is not repeated here.
-     */
-    selectedClients: (s) => {
-      const f = s.floors.find((x) => x.id === s.selectedFloor);
-      if (!f) return [];
-      if (Array.isArray(f.clients) && f.clients.length) return f.clients;
-      return f.client ? [f.client] : [];
-    },
-
-    /**
      * The current floor's client (= clients[0], the floor base name, e.g. codebuddy / kilo).
      * The office filters members/ghosts by it (the client on a member card is stamped by the server,
      * see the server's members.client) —— match by base name.

@@ -1372,6 +1372,10 @@ module.exports = {
   readOpencodeTurns, // per-round task list (8F's ledger records "one per round", see the task synchronizer in this file)
   opencodeInstrumented,
   opencodeMainPhase,
+  // Phase/done/instrumentation capabilities consumed by the central phase dispatcher (sessions.js).
+  readPhaseFallback: opencodeMainPhase,
+  readDoneFallback: readOpencodeDone,
+  instrumented: opencodeInstrumented,
   NO_DONE,
   // ---- 8F task synchronizer (formerly opencodeTasks.js) ----
   syncOpencodeTasks,

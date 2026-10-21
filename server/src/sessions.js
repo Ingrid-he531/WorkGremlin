@@ -39,13 +39,14 @@
 const fs = require('node:fs');
 const path = require('path');
 // WorkGremlin's own storage locations (the state-file dir) come from shared/paths.js.
+const { agentBase } = require('@workgremlin/shared');
 const { hooksDir } = require('@workgremlin/shared/paths');
 // Generic on-disk scanning infrastructure (dir conventions + tolerant file reads); readJson / readDir come
 // from roots so they are not redefined everywhere. findPluginStorage finds a product's plugin storage root.
 const { readJson, readDir, findPluginStorage } = require('./roots');
 // Floor module registry (floors.js): needed when dispatching session titles by client to the registry's
 // sessionTitle
-const { floors: floorRegistry } = require('./floors');
+const { floors: floorRegistry, floorByAgent } = require('./floors');
 // Floor capability modules (module group): every floor (trae / claude / codebuddy / copilot) implements the
 // same "session capability" interface, and sessions.js always reaches it as `floor.capability`. Adding a
 // floor = one require line in FLOORS + implementing whichever capabilities that floor module needs; call
@@ -285,7 +286,7 @@ function readReporterPhase(workspacePath, client = '', session = '') {
     }
   }
   // Copilot 9F has no reporter hook, so its phase is not in this state file — 9F supplies its own readPhase
-  // (see reporterMainPhase dispatching to FLOORS[base].readPhase: copilot.readPhase =
+  // (see reporterTruthPhase dispatching to floorByAgent[base].readPhase: copilot.readPhase =
   // readCopilotPhaseFromSqlite). This function only covers products with hooks; unreadable → return null
   // honestly, never fabricate a fallback.
   if (!win) return null;
@@ -462,62 +463,103 @@ function reporterStateMeta(workspacePath, client = '', session = '') {
   return { instrumented: true, sessionId: String(best.sessionId || '') };
 }
 
-function reporterMainPhase(workspacePath, client = '', session = '') {
+/**
+ * The floor's primary phase source. Reporter-backed floors read the state file; floors without a reporter
+ * may override `readPhase` (for example 9F Copilot reads its own SQLite store).
+ *
+ * This deliberately does **not** consult `readPhaseFallback`: callers that need to know whether the reporter
+ * actually reported a phase must not mistake polling-derived data for reported truth.
+ *
+ * @param {string} [client] floor base name or memberId; normalized with agentBase() before dispatch
+ */
+function reporterTruthPhase(workspacePath, client = '', session = '') {
   // A phase must be tied to a session (see readReporterPhase): no session named / no session id available → no phase.
   if (!session) return null;
-  // Each floor (especially 9F Copilot, which has no reporter hook) may implement readPhase to supply its
-  // phase; floors without one (products with hooks) fall back to the generic readReporterPhase. The phase
-  // duty is dispatched per floor; no fallback is stuffed into generic.
-  const base = String(client || '').trim().toLowerCase();
-  const floor = FLOORS[base];
+  const base = agentBase(client);
+  const floor = floorByAgent[base] || null;
   const readPhase = floor && typeof floor.readPhase === 'function' ? floor.readPhase : readReporterPhase;
-  const rp = readPhase(workspacePath, client, session);
-  if (!rp) return null;
+  const rp = readPhase(workspacePath, base, session);
+  if (!rp || !rp.phase) return null;
+
+  let body;
   // Every branch below **builds its own object** instead of spreading rp — whatever needs to be carried out
   // must be added in each branch; missing one silently drops it (that is how model was lost once).
   if (rp.phase === 'await') {
-    return {
+    body = {
       phase: 'await',
       action: rp.tool ? `申请执行 ${rp.tool}` : '等待用户授权',
-      target: rp.file || '',
-      context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, rp.file && `目标：${rp.file}`].filter(Boolean),
+      target: rp.file || rp.target || '',
+      context: ['等待用户授权后继续', rp.tool && `工具：${rp.tool}`, (rp.file || rp.target) && `目标：${rp.file || rp.target}`].filter(Boolean),
+      tool: rp.tool || '',
       prompt: rp.prompt || '',
       model: rp.model || '',
       // When the phase was written: the render layer compares it with the finish marker
       // (see IsoOfficeView's consoleLive guard)
       ts: Number(rp.ts) || 0,
     };
-  }
-  if (rp.phase === 'tool') {
+  } else if (rp.phase === 'tool') {
     // Prefer the full command reported by the hook (Read src/main.js / grep ... / Bash npm run build), and
     // fall back to the generic "calling Xxx" wording when there is none.
-    // action is what it is doing concretely; tool shows only the tool name, never the full command.
-    const cmd = rp.cmd || (rp.tool ? `调用 ${rp.tool}` : '调用工具');
-    return {
+    const file = rp.file || rp.target || '';
+    const cmd = rp.cmd || rp.action || (rp.tool ? `调用 ${rp.tool}` : '调用工具');
+    body = {
       phase: 'tool',
       action: cmd,
       tool: rp.tool || '',
-      target: rp.file || '',
-      context: rp.file ? [`目标：${rp.file}`] : [],
+      target: file,
+      context: Array.isArray(rp.context) && rp.context.length ? rp.context : file ? [`目标：${file}`] : [],
+      prompt: rp.prompt || '',
+      model: rp.model || '',
+      ts: Number(rp.ts) || 0,
+    };
+  } else {
+    // Every other phase is passed through verbatim. Idle / done must not be squashed into thinking.
+    body = {
+      phase: rp.phase,
+      action: rp.action || '',
+      target: rp.target || rp.file || '',
+      context: Array.isArray(rp.context) ? rp.context : [],
+      tool: rp.tool || '',
       prompt: rp.prompt || '',
       model: rp.model || '',
       ts: Number(rp.ts) || 0,
     };
   }
-  // Every other phase is **passed through verbatim**; do not squash it into thinking.
-  //
-  // This used to recognize only the await / tool branches and dump everything else into the final thinking
-  // fallback, so "a turn that wrote idle has ended" and "a task that wrote done has completed" both displayed
-  // as "thinking" on the console — showing thinking after finishing is reporting completed work as still busy.
-  // The phase vocabulary already contains idle / unreported / dispatch / done / waiting
-  // (see PHASES in renderer/src/iso/mainConsole.js), so pass them through; no need to wrap each one.
-  // Only a genuinely **unknown** phase falls into thinking (the fallback, and only for unknown values).
-  if (rp.phase && rp.phase !== 'await' && rp.phase !== 'tool') {
-    return { phase: rp.phase, action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '', ts: Number(rp.ts) || 0 };
-  }
-  // thinking: clean, no filler words; but carry the user's sentence (prompt) out too, shown front and center
-  // on the third layer of the screen
-  return { phase: 'thinking', action: '', target: '', context: [], prompt: rp.prompt || '', model: rp.model || '', ts: Number(rp.ts) || 0 };
+
+  return {
+    sessionId: String(rp.sessionId || session || ''),
+    inferred: rp.inferred === true,
+    ...body,
+  };
+}
+
+/**
+ * The main-console phase for a floor/session.
+ *
+ * Order is fixed: primary/reported phase first, then the floor's polling fallback. Only floors that declare
+ * `readPhaseFallback` participate (Cline / Qoder / Kilo / OpenCode); all product-specific polling stays in its floor
+ * module, while this central function owns the precedence rule.
+ */
+function reporterMainPhase(workspacePath, client = '', session = '') {
+  const truth = reporterTruthPhase(workspacePath, client, session);
+  if (truth) return truth;
+
+  const floor = floorByAgent[agentBase(client)] || null;
+  if (!session || !floor || typeof floor.readPhaseFallback !== 'function') return null;
+  const rp = floor.readPhaseFallback(workspacePath, session);
+  if (!rp || !rp.phase) return null;
+  return {
+    sessionId: String(rp.sessionId || session || ''),
+    inferred: true,
+    phase: String(rp.phase),
+    action: String(rp.action || ''),
+    target: String(rp.target || ''),
+    context: Array.isArray(rp.context) ? rp.context : [],
+    tool: String(rp.tool || ''),
+    prompt: String(rp.prompt || ''),
+    model: String(rp.model || ''),
+    ts: Number(rp.ts) || 0,
+  };
 }
 
 /**
@@ -527,22 +569,21 @@ function reporterMainPhase(workspacePath, client = '', session = '') {
  * session — one file per session, see shared/paths.statePath — it is just that nothing read it for a
  * **non-selected** session (the main console asks /reporter-phase for the selected one only).
  *
- * Resolve it here through the same dispatcher the console uses (reporterMainPhase), so the session
+ * Resolve it here through reporterTruthPhase, so the session
  * snapshot — and everything that reads it, e.g. the ticker's phase suffix — gets the reported truth
  * too (including "awaiting authorization", which a hook floor produces but a phase-less row never showed).
  *
- * Floors that already carry their own phase in the snapshot row (a `readPhase` override: 6F Qoder reads
- * the Lingma DB, 9F Copilot reads its own SQLite) are left untouched — their own handler already wrote
- * the inferred phase there, and readPhase's contract is not the generic (workspacePath, client, session).
+ * Floors that already carry their own phase in the snapshot row through a primary `readPhase` (9F Copilot
+ * reads its own SQLite) are left untouched — their handler already wrote that inferred phase.
  *
  * @returns {object|null} a reporterMainPhase-shaped phase, or null when there is nothing to fill
  */
 function reporterSnapshotPhase(workspacePath, client, session) {
   if (!session) return null;
-  const base = String(client || '').trim().toLowerCase();
-  const floor = FLOORS[base];
+  const base = agentBase(client);
+  const floor = floorByAgent[base] || null;
   if (floor && typeof floor.readPhase === 'function') return null;
-  return reporterMainPhase(workspacePath, client, session);
+  return reporterTruthPhase(workspacePath, client, session);
 }
 
 /**
@@ -1047,7 +1088,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
     // you get the newest one on the same floor — with several sessions open on one floor (CLI + Plugin / two
     // plugin sessions), an idle session borrows another's running "thinking" and the main console sticks on
     // thinking forever (this function is one of three missed filters; see also inWindow / done).
-    const rp = reporterMainPhase(workspacePath, client, id);
+    const rp = reporterTruthPhase(workspacePath, client, id);
     if (rp) {
       reported = true;
       phase = rp.phase;
@@ -1438,6 +1479,7 @@ module.exports = {
   sessionModel,       // Which model this session uses (TraeCode reads globalStorage; others stay empty)
   listSessions,
   reporterMainPhase,
+  reporterTruthPhase,
   reporterSnapshotPhase,
   freshestReporterWs,
   readReporterPhase, // The live phase on the main console (the invalidation-after-interrupt logic lives here; regression tests watch it directly)

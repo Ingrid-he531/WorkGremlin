@@ -20,9 +20,8 @@ export const useTaskStore = defineStore('tasks', {
     loading: false,
     subLoading: false,
     /**
-     * Top-level filters: empty array = no filter. A project entry is a project id; a client entry is
-     * a member client, and it may itself be a comma-separated string (a merged floor such as
-     * 1F CodeBuddy = codebuddy + codebuddy-plugin), matched by the server as a set.
+     * Top-level filters: empty array = no filter. A project entry is a project id; a client entry is a
+     * floor base name. Multiple selected floors are joined with commas only when sent to the server.
      * They live in the store so the selection survives switching pages.
      */
     filterProjects: [],
@@ -39,7 +38,7 @@ export const useTaskStore = defineStore('tasks', {
 
   getters: {
     selectedTask: (s) => s.tasks.find((t) => t.id === s.selectedTaskId) || null,
-    /** Deduped client list from the selected floors (flatten each entry's comma-separated clients) */
+    /** Deduped floor base-name list from the selected task filters */
     clientList: (s) => {
       const set = new Set();
       for (const v of s.filterClients) {

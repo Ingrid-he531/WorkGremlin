@@ -1157,9 +1157,9 @@ function createRepo(db) {
     /**
      * Top-level task id selector: reuses the task-records page top filters (project + floor), plus an
      * optional "older than" cutoff (keep the last N days).
-     * @project is a ",a,b," delimited project id set and @client is a ",a,b," delimited client set
-     * (a merged floor 1F CodeBuddy = the two clients CLI + Plugin); instr does set-membership —
-     * a single value takes the same path (",codebuddy," matches codebuddy).
+     * @project is a ",a,b," delimited project id set and @client is a ",a,b," delimited floor base-name
+     * set from multi-select; instr does set-membership — a single value takes the same path
+     * (",codebuddy," matches codebuddy).
      */
     selectTopTaskIds: db.prepare(`
       SELECT t.id FROM tasks t
@@ -1372,7 +1372,7 @@ function createRepo(db) {
   /**
    * Delete by the top-level filters (project + floor); when beforeTs is given, only delete older than that (keep the last N days).
    * @param {{ project?: string, client?: string, beforeTs?: number }} opt
-   *        client may be a comma-separated list (merged floor 1F CodeBuddy = CLI + Plugin)
+   *        client may be a comma-separated list of floor base names from multi-select
    * @returns {number} how many top-level tasks were deleted
    */
   function deleteTaskRunsByFilter(opt = {}) {
