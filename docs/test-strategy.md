@@ -511,9 +511,9 @@ The former trigger (`blocked` / `error` / `offline > 60 s`) is void because two 
 
 | ID | Case | Assertion |
 | --- | --- | --- |
-| NOT-01 | **Candidate S1 trigger** | **Planned / trigger not yet defined** — entering `blocked` is the only candidate. Do not assert an `error` or `offline` trigger; those states do not exist |
+| NOT-01 | **Candidate S1 trigger** | **Planned / trigger not yet defined** — entering `blocked` is the only candidate. `error` and `offline` were removed as workstation states; a test that asserts them is invalid |
 | NOT-02 | Lower-priority events do not notify | Notification count = 0 for: `idle`↔`busy` changes, task start/end, new messages, progress updates, blocked clearing, WS reconnect, session switch. Assert each independently |
-| NOT-03 | No duration-based state trigger | Waiting any number of minutes does not change state, so no "offline after 60 s" notification can exist; a blocked-duration trigger, if adopted, must be defined by product |
+| NOT-03 | No duration-based state trigger | The old "offline after 60 s" trigger was removed with the state; waiting any number of minutes does not change current state, so no such notification can exist. A blocked-duration trigger, if adopted, must be defined by product |
 | NOT-04 | Defaults | Fresh data directory: system notifications **on**, sound **off**; defaults are readable in settings, not only visible in UI |
 | NOT-05 | Content | Member name, event type, local time; no sensitive value (see SEC-13) |
 | NOT-06 | Do-not-disturb active | S1 events inside the window do not pop |
