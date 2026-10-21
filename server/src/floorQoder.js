@@ -277,14 +277,19 @@ const LIVE_MS = 90_000;
 /**
  * What the plugin wrote to disk in **each round** of this session (ascending gmt_create = real order).
  *
- * ⚠️ The source has **no** truth for "did this round finish": `finish_status` stays 0 (measured, even
- * for finished rounds), and the verbatim `answer` is ciphertext. So only "the last update"
- * (updatedAt) is given here; whether it is still running or finished is left to the caller to judge by
- * freshness (see LIVE_MS in qoderPluginTasks.js), and it must be honestly flagged as inferred.
+ * ⚠️ The source has **no** reliable truth for "did this round finish": `finish_status` stays 0
+ * (measured, even for finished rounds), and the verbatim `answer` is ciphertext. `chat_record.summary`
+ * is conversation context written for a future turn, not this round's answer, so it is deliberately not
+ * returned here. Whether a round is still running is judged from request-scoped freshness (see LIVE_MS).
+ *
+ * Explicit cancellation is different: Qoder writes a tool message whose `tool_result` contains
+ * `toolCallStatus: "CANCELLED"` (or `errorCode: 40441`). That is a terminal round signal and must win
+ * over any later session-level timestamp.
  *
  * @param {string} sessionId
- * @returns {Array<{index: number, requestId: string, prompt: string, summary: string,
- *                  model: string, startedAt: number, updatedAt: number, files: string[]}>}
+ * @returns {Array<{index: number, requestId: string, prompt: string, model: string,
+ *                  startedAt: number, updatedAt: number, activityAt: number,
+ *                  cancelled: boolean, cancelledAt: number, files: string[]}>}
  */
 function readLingmaRounds(sessionId) {
   const id = String(sessionId || '').trim();
@@ -292,7 +297,7 @@ function readLingmaRounds(sessionId) {
   const rows = query((db) =>
     db
       .prepare(
-        `SELECT request_id, extra, summary, gmt_create, gmt_modified
+        `SELECT request_id, extra, gmt_create, gmt_modified
            FROM chat_record
           WHERE session_id = ?
           ORDER BY gmt_create`
@@ -301,19 +306,70 @@ function readLingmaRounds(sessionId) {
   );
   if (!Array.isArray(rows)) return [];
   const filesOf = filesByRecord(id);
+  const messagesOf = messageMetaByRecord(id);
   return rows.map((r, i) => {
     const requestId = String(r.request_id || '');
+    const messageMeta = messagesOf.get(requestId) || {};
+    const updatedAt = Math.max(Number(r.gmt_modified) || 0, Number(messageMeta.activityAt) || 0);
+    const cancelled = Boolean(messageMeta.cancelled);
     return {
       index: i,
       requestId,
       prompt: promptOf(r.extra),
-      summary: String(r.summary || '').trim(),
       model: modelOf(r.extra),
       startedAt: Number(r.gmt_create) || 0,
-      updatedAt: Number(r.gmt_modified) || 0,
+      updatedAt,
+      activityAt: updatedAt,
+      cancelled,
+      cancelledAt: cancelled ? Number(messageMeta.cancelledAt) || updatedAt : 0,
       files: filesOf.get(requestId) || [],
     };
   });
+}
+
+/** Whether a persisted tool result is Qoder's explicit "the user cancelled this round" signal. */
+function isCancelledToolResult(raw) {
+  try {
+    const j = JSON.parse(String(raw || ''));
+    const status = String((j && j.toolCallStatus) || '').toUpperCase();
+    const code = Number(j && j.errorCode);
+    return status === 'CANCELLED' || status === 'CANCELED' || code === 40441;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Request-scoped message metadata. `activityAt` keeps liveness tied to the round that produced the
+ * messages, and the first cancellation tool result makes that round terminal.
+ *
+ * @returns {Map<string, {activityAt:number, cancelled:boolean, cancelledAt:number}>}
+ */
+function messageMetaByRecord(sessionId) {
+  const out = new Map();
+  const rows = query((db) =>
+    db
+      .prepare(
+        `SELECT request_id, role, tool_result, gmt_create
+           FROM chat_message
+          WHERE session_id = ?
+          ORDER BY gmt_create`
+      )
+      .all(sessionId)
+  );
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const requestId = String(r.request_id || '');
+    if (!requestId) continue;
+    const at = Number(r.gmt_create) || 0;
+    const meta = out.get(requestId) || { activityAt: 0, cancelled: false, cancelledAt: 0 };
+    if (at > meta.activityAt) meta.activityAt = at;
+    if (!meta.cancelled && String(r.role || '') === 'tool' && isCancelledToolResult(r.tool_result)) {
+      meta.cancelled = true;
+      meta.cancelledAt = at;
+    }
+    out.set(requestId, meta);
+  }
+  return out;
 }
 
 /**
@@ -353,15 +409,15 @@ function filesByRecord(sessionId) {
 /**
  * Is the last round "still running" (criterion and reasoning under LIVE_MS).
  *
- * The same expression as qoderPluginTasks.js's isLive: **this session's last round** + disk writes
- * within 90 seconds. The session's own gmt_modified (meta.lastEventAt) is taken into the max as well
- * —— the extension does not necessarily reflect every message write onto chat_record.gmt_modified, and
- * that timestamp on the session row is also written by it.
+ * The same expression as qoderPluginTasks.js's isLive: **this session's last round** + request-scoped
+ * disk writes within 90 seconds. Session-level `gmt_modified` is intentionally excluded: it can move
+ * after Stop and must not resurrect a terminal round.
  */
-function lastRoundLive(rounds, meta = {}, now = Date.now()) {
+function lastRoundLive(rounds, now = Date.now()) {
   const last = rounds[rounds.length - 1];
   if (!last) return false;
-  return now - Math.max(Number(last.updatedAt) || 0, Number((meta && meta.lastEventAt) || 0)) <= LIVE_MS;
+  if (last.cancelled) return false;
+  return now - (Number(last.activityAt) || Number(last.updatedAt) || 0) <= LIVE_MS;
 }
 
 /**
@@ -383,7 +439,7 @@ function readLingmaPhase(sessionId, rounds = null, meta = {}, now = Date.now()) 
   if (!rs.length) return null;
   const last = rs[rs.length - 1];
   return {
-    phase: lastRoundLive(rs, meta, now) ? 'thinking' : 'idle',
+    phase: lastRoundLive(rs, now) ? 'thinking' : 'idle',
     // Tool / target: not in the source, do not guess (see "not one word is filled in" above)
     action: '',
     target: '',
@@ -421,22 +477,15 @@ function qoderMainPhase(workspacePath, session = '') {
 
 /** Freshness window of the done marker: only wrapping up within this long counts as "just happened", otherwise opening the page replays the previous round (same criterion as kilo.js) */
 const DONE_TTL_MS = 10 * 60_000;
-/**
- * Default value of the done marker (none means none, no fabrication).
- * doneCancelled is always false: the extension's on-disk data has **no** "the user pressed stop" signal
- * (even the verbatim body is ciphertext, let alone an interrupt trace), so the red "task cancelled" is
- * not lit —— same criterion as 9F Copilot.
- */
+/** Default value of the done marker (none means none, no fabrication). */
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false, doneSaid: '' };
 
 /**
  * This plugin session's "done" marker —— the counterpart of the `done` that the hook path drops on Stop.
  *
- * There is exactly one criterion: **the last round has finished**, evidenced by the `summary` the
- * extension wrote itself (a plaintext conversation summary, written only once a round completes). Still
- * in flight (disk writes within 90s) does not count; no summary written does not count either (that
- * means "not finished or the extension has not summarized yet", not "done"). The finish time is that
- * round's last disk write —— the source has nothing more precise.
+ * An explicit cancellation tool result produces a cancelled marker immediately. Otherwise, a round that
+ * has had no request-scoped writes for LIVE_MS is treated as finished by inference. `chat_record.summary`
+ * is not used as completion evidence or as the wrap-up text: it is context for the next turn.
  *
  * @param {string} sessionId
  * @param {Array|null} rounds
@@ -447,10 +496,8 @@ function readLingmaDone(sessionId, rounds = null, meta = {}, now = Date.now()) {
   const rs = Array.isArray(rounds) ? rounds : readLingmaRounds(sessionId);
   if (!rs.length) return NO_DONE;
   const last = rs[rs.length - 1];
-  if (lastRoundLive(rs, meta, now)) return NO_DONE;
-  const summary = String(last.summary || '').trim();
-  if (!summary) return NO_DONE;
-  const at = Number(last.updatedAt) || 0;
+  if (!last.cancelled && lastRoundLive(rs, now)) return NO_DONE;
+  const at = Number(last.cancelled ? last.cancelledAt : last.activityAt || last.updatedAt) || 0;
   if (!at || now - at > DONE_TTL_MS) return NO_DONE;
   const projectPath = String((meta && meta.projectPath) || '');
   // Changed files: the extension records absolute paths, convert to project-relative (same criterion as
@@ -465,10 +512,10 @@ function readLingmaDone(sessionId, rounds = null, meta = {}, now = Date.now()) {
     doneTitle: String(last.prompt || ''),
     doneCount: Array.isArray(last.files) ? last.files.length : 0,
     doneFiles: files.map((name) => ({ name })),
-    doneCancelled: false,
-    // Wrap-up self-report: the conversation summary the extension wrote itself (plaintext) —— that is
-    // the "what it said" line on the main console
-    doneSaid: summary.replace(/\s+/g, ' ').trim().slice(0, 200),
+    doneCancelled: Boolean(last.cancelled),
+    // Qoder writes no trustworthy plaintext answer for this round. Leave the line empty rather than
+    // surfacing the conversation summary intended for a future turn.
+    doneSaid: '',
   };
 }
 
@@ -512,8 +559,6 @@ const CLIENT = 'qoder';
 /** The form column: it stores the **form** (vscode), not the source (plugin) —— task lists show "Qoder Plugin" from it.
  *  It used to be 'plugin', while isPluginClient only recognizes 'vscode' → the label fell back to "Qoder" and the source was computed as cli. */
 const FORM = 'vscode';
-/** Cap on the length of the output summary (same order of magnitude as RESULT_MAX in hook.js) */
-const RESULT_MAX = 4_000;
 /** How fresh reporter metadata has to be for the hook (CLI) path to take precedence while it is active. */
 
 /** Project name (project id): resolved the same way as the CLI path (the hook reports the name from package.json, measured as `qoder@workgremlin`), otherwise the plugin and the CLI each create their own member and this floor ends up with two workstations */
@@ -527,7 +572,7 @@ function projectIdOf(s) {
  * Write one ledger entry (two rows, tasks + task_runs). 6F's plugin path is **one entry per round**.
  * @returns {string|null} this record's files_json, reused directly by the workstation card
  */
-function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result }) {
+function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, state, files, result, cancelReason }) {
   const st = state || (endedAt ? 'done' : 'running');
   const running = st === 'running';
   repo.insertTask.run({
@@ -541,6 +586,14 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     startedAt,
     endedAt: endedAt || null,
   });
+  if (st === 'cancelled' && cancelReason && repo.cancelTaskWithReason) {
+    repo.cancelTaskWithReason.run({
+      id,
+      progress: 1,
+      endedAt: endedAt || null,
+      cancelReason,
+    });
+  }
   repo.upsertTaskRun.run({
     id,
     projectId,
@@ -559,10 +612,9 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     title,
     model: model || null,
     form: FORM,
-    // Output summary: the summary the extension wrote itself (plaintext). A round still in flight is
-    // left empty for now (half a sentence is not output), and filled in at wrap-up by the next sync ——
-    // same as 7F/8F.
-    result: result || null,
+    // Qoder has no trustworthy current-turn output. An explicit empty string clears any summary that
+    // earlier versions persisted for this ledger row; null would preserve it via COALESCE.
+    result: result == null ? null : String(result),
     fileCount: files ? files.length : 0,
     filesJson,
     endedAt: endedAt || null,
@@ -630,7 +682,8 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
   const isLive = (s, round) => {
     const rounds = roundsOf.get(s.id) || [];
     if (!rounds.length || rounds[rounds.length - 1] !== round) return false;
-    return now - Math.max(Number(round.updatedAt || 0), Number(s.lastEventAt || 0)) <= LIVE_MS;
+    if (round.cancelled) return false;
+    return now - (Number(round.activityAt) || Number(round.updatedAt) || 0) <= LIVE_MS;
   };
 
   for (const s of sessions) {
@@ -678,7 +731,13 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
           return rel && !rel.startsWith('..') ? rel : '';
         })
         .filter(Boolean);
+      const cancelled = Boolean(t.cancelled);
       const live = isLive(s, t);
+      const endedAt = cancelled
+        ? t.cancelledAt || t.activityAt || t.startedAt || now
+        : live
+          ? null
+          : t.activityAt || t.updatedAt || t.startedAt || now;
       const title = t.prompt.replace(/\s+/g, ' ').trim() || s.title || '(Qoder 插件会话)';
       writeTurnRun(repo, {
         id,
@@ -688,13 +747,11 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
         model: t.model || '',
         title,
         startedAt: t.startedAt || now,
-        // Finish time = when this round last wrote to disk (the source has no more precise finish signal, see the file header)
-        endedAt: live ? null : t.updatedAt || t.startedAt || now,
-        state: live ? 'running' : 'done',
+        endedAt,
+        state: cancelled ? 'cancelled' : live ? 'running' : 'done',
         files,
-        // A round still in flight writes no output (it is already finalized in the source by the time
-        // the next round starts, then it gets filled in)
-        result: live ? '' : String(t.summary || '').slice(0, RESULT_MAX),
+        result: '',
+        cancelReason: cancelled ? 'qoder_user_cancelled' : null,
       });
       count += 1;
     }

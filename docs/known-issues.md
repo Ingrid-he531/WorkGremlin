@@ -74,6 +74,23 @@ None available. Token statistics will remain unavailable until Qoder's extension
 - Table: `chat_record`
 - Relevant code: `server/src/floorQoder.js` (see `readLingmaRounds` and `writeTurnRun` functions)
 
+### 2.1.1 Qoder Plugin: Current-Round Output and Liveness Are Limited
+
+**Status:** ⚠️ Known Limitation
+
+**Description:**
+`chat_record.summary` is context generated for a future Qoder turn, not the answer for the current task. WorkGremlin therefore does not use it as task output or as the session's completion message. Qoder does not expose a trustworthy plaintext current-round answer in `local.db`, so the task output remains empty instead of showing unrelated summary text.
+
+Qoder also does not expose a reliable "round finished" field (`finish_status` remains `0`). WorkGremlin infers completion from request-scoped disk activity after a 90-second silence. If a shell command hangs without writing any new `chat_message` rows, the source cannot distinguish it from a finished round. When the user presses Stop, Qoder writes a terminal tool result containing `toolCallStatus: "CANCELLED"` or `errorCode: 40441`; WorkGremlin uses that explicit signal to change the task to `cancelled` and prevent later session timestamps from restoring it to `running`.
+
+**Impact:**
+- A hung command may be shown as completed by inference until Qoder records explicit cancellation.
+- Qoder Plugin task output may be empty even when the plugin displayed an answer in the IDE.
+- Task status updates depend on Qoder writing the cancellation result to disk.
+
+**Workaround:**
+Press Stop in Qoder after terminating a hung command so the explicit cancellation signal is persisted. Avoid interactive commands that wait for input or open a pager (for example, use `git --no-pager log`).
+
 ### 2.2 TraeCode IDE: No Subagent Visibility (No Real-Time Ghosts, No Call Traces)
 
 **Status:** ⚠️ Known Limitation

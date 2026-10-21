@@ -12,9 +12,10 @@
  *     成员卡只有一个槽位 —— CLI 在跑时插件这一路只写台账，不许压掉 CLI 刚上报的相位；
  *   · **相位是推断**（源里没有"跑完了没有"的真值，只有最后一次落盘的时刻）。
  *
- * 库的表结构照抄真实库（`chat_session` / `chat_record` / `chat_snapshot` /
- * `chat_working_space_file`，2026-09-30 从 ~/.lingma/.../local.db 里 dump 出来的），
- * 逐字正文按真实情况填成密文（**只**用明文那两处：extra.originalContent 与 summary）。
+ * 库的表结构照抄真实库（`chat_session` / `chat_record` / `chat_message` / `chat_snapshot` /
+ * `chat_working_space_file`，2026-10-21 从 ~/.lingma/.../local.db 里 dump 出来的）。
+ * Verbatim bodies stay ciphertext like the real database; the only plaintext task metadata used is
+ * extra.originalContent, while chat_message.tool_result carries explicit cancellation signals.
  *
  * 跑法：`npm run test:qoder-plugin`
  */
@@ -79,6 +80,10 @@ const SCHEMA = `
     question text, answer text, gmt_create INTEGER, gmt_modified INTEGER, finish_status INTEGER,
     extra text DEFAULT '{}', summary text DEFAULT ''
   );
+  CREATE TABLE chat_message (
+    id varchar(64) primary key, session_id varchar(64) not null, request_id varchar(64) not null,
+    role varchar(64), content text, summary text, tool_result text, gmt_create INTEGER
+  );
   CREATE TABLE chat_snapshot (
     snapshot_id varchar(64) primary key, session_id varchar(64) not null, chat_record_id varchar(64),
     status varchar(64), name varchar(64), gmt_create INTEGER, gmt_modified INTEGER
@@ -90,12 +95,13 @@ const SCHEMA = `
 `;
 
 /**
- * 重建库。`sessions` / `records` 的形状刻意贴住 qoder.js 的读法：
+ * 重建库。`sessions` / `records` / `messages` 的形状刻意贴住 qoder.js 的读法：
  *   session: {id, title, projectPath, createdAt, lastEventAt, type}
  *   record : {requestId, sessionId, prompt, summary, model, startedAt, updatedAt}
+ *   message: {sessionId, requestId, role, toolResult, at}
  *   snapshot: {id, sessionId, recordId|null, at, files:[绝对路径]}
  */
-function writeDb({ sessions = [], records = [], snapshots = [], schema = SCHEMA } = {}) {
+function writeDb({ sessions = [], records = [], messages = [], snapshots = [], schema = SCHEMA } = {}) {
   fs.mkdirSync(path.dirname(DBP), { recursive: true });
   fs.rmSync(DBP, { force: true });
   const db = new Database(DBP);
@@ -120,6 +126,21 @@ function writeDb({ sessions = [], records = [], snapshots = [], schema = SCHEMA 
       r.requestId, r.sessionId, 't', 'CIPHER-Q', 'CIPHER-A', r.startedAt, r.updatedAt, 0,
       JSON.stringify({ context: {}, modelConfig: { key: r.model || 'auto' }, originalContent: r.prompt }),
       r.summary || ''
+    );
+  }
+  const insM = db.prepare(
+    `INSERT INTO chat_message (id,session_id,request_id,role,content,summary,tool_result,gmt_create)
+     VALUES (?,?,?,?,?,?,?,?)`
+  );
+  for (const [i, m] of messages.entries()) {
+    const toolResult = m.toolResult == null
+      ? ''
+      : typeof m.toolResult === 'string'
+        ? m.toolResult
+        : JSON.stringify(m.toolResult);
+    insM.run(
+      m.id || `m-${i}`, m.sessionId, m.requestId, m.role || 'tool', m.content || '', m.summary || '',
+      toolResult, m.at || NOW
     );
   }
   const insSnap = db.prepare('INSERT INTO chat_snapshot (snapshot_id,session_id,chat_record_id,status,name,gmt_create,gmt_modified) VALUES (?,?,?,?,?,?,?)');
@@ -211,7 +232,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('工程名与 CLI 那一路同一条解析（package.json name）', (sess.find((s) => s.id === 's-a') || {}).project === 'p1', JSON.stringify(sess[0] && sess[0].project));
   ok('核心表齐了', qoder.hasCoreTables() === true);
 
-  head('[A2] 每一轮：标题=用户原话（明文）、产出=扩展写的 summary、模型只在用户真的选了时才有');
+  head('[A2] 每一轮：标题=用户原话（明文），summary 不作为本轮产出，模型只在用户真的选了时才有');
   writeDb({
     sessions: [{ id: 's-a', title: '插件会话 A', lastEventAt: NOW }],
     records: [
@@ -222,7 +243,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const rounds = qoder.readLingmaRounds('s-a');
   ok('按 gmt_create 升序（真实先后）', rounds.length === 2 && rounds[0].index === 0 && rounds[1].index === 1, JSON.stringify(rounds.map((r) => r.index)));
   ok('标题 = 用户原话（extra.originalContent 是明文）', rounds[0].prompt === '把 6F 接上台账' && rounds[1].prompt === '再改一处', `${rounds[0].prompt} / ${rounds[1].prompt}`);
-  ok('产出 = 扩展自己写的 summary（明文）', rounds[0].summary === '**对话总结：** 接好了', rounds[0].summary);
+  ok('summary 不进入轮次产出契约（它是下一轮上下文）', !('summary' in rounds[0]) && !('result' in rounds[0]), JSON.stringify(rounds[0]));
   ok('用户选了模型就带上', rounds[0].model === 'qwen3-coder', rounds[0].model);
   ok("'auto' 不算模型名（那是让插件自己挑）→ 留空", rounds[1].model === '', JSON.stringify(rounds[1].model));
   ok('逐字正文一个字都不碰（question/answer 是密文）', !JSON.stringify(rounds).includes('CIPHER'), '应只出现明文那两处');
@@ -266,7 +287,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   /* ------------------------------ B. 写台账 ------------------------------ */
 
-  head('[B1] 每一轮一条台账：标题=用户原话、产出=summary、改动文件=工程相对');
+  head('[B1] 每一轮一条台账：标题=用户原话、summary 不冒充产出、改动文件=工程相对');
   const liveStart = NOW - 20_000;
   writeDb({
     sessions: [{ id: 's-live', title: '插件会话', lastEventAt: NOW }],
@@ -286,7 +307,8 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('两轮都按 6F 楼层筛选取得到', Boolean(row0) && Boolean(row1), JSON.stringify(items.map((t) => t.id)));
   ok('标题 = 那一轮用户原话', Boolean(row0) && row0.title === '上一轮干完了' && Boolean(row1) && row1.title === '修复后测试，你不用回复和工作', `${row0 && row0.title} / ${row1 && row1.title}`);
   ok('在飞那轮 running、收工那轮 done', Boolean(row1) && row1.state === 'running' && Boolean(row0) && row0.state === 'done', `${row1 && row1.state}/${row0 && row0.state}`);
-  ok('产出摘要用扩展写的 summary', Boolean(row0) && row0.result === '做完了', row0 && row0.result);
+  ok('summary 不写进任务产出', Boolean(row0) && !row0.result, row0 && row0.result);
+  ok('任务列表里不泄漏会话 summary 文本', !JSON.stringify(items).includes('做完了'));
   ok('还在飞的那轮不写产出（半截话不算）', Boolean(row1) && !row1.result, row1 && row1.result);
   ok('改动文件转成工程相对路径', Boolean(row0) && row0.file_count === 1 && String(row0.files_json) === JSON.stringify(['server/test/pluginReply.test.js']), row0 && `${row0.file_count} ${row0.files_json}`);
   ok('形态标成 vscode（isPluginClient 认它 → 任务列表显示「Qoder Plugin」而不是 CLI）', Boolean(row1) && row1.form === 'vscode', row1 && row1.form);
@@ -296,10 +318,25 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
 
   head('[B1b] 幂等：连跑两次不会插重、不会把起点推走');
   const startedBefore = repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:1`).started_at;
+  const staleRun = repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:0`);
+  // Simulate a row written by an older WorkGremlin version before summary was removed from the
+  // current-round output contract. The next sync must explicitly clear it rather than preserve it.
+  repo.endTaskRun.run({
+    id: staleRun.id,
+    title: staleRun.title,
+    model: staleRun.model,
+    form: staleRun.form,
+    result: 'legacy summary that is not this round output',
+    fileCount: staleRun.file_count,
+    filesJson: staleRun.files_json,
+    endedAt: staleRun.ended_at,
+    durationMs: staleRun.duration_ms,
+  });
   syncQoderPluginTasks({ bus, repo });
   const items2 = await get(`project=p1&client=${F6.join(',')}&limit=50`);
   ok('还是那两条，没有多出来', items2.filter((t) => String(t.id).startsWith(TASK_ID_PREFIX)).length === 2, JSON.stringify(items2.filter((t) => String(t.id).startsWith(TASK_ID_PREFIX)).map((t) => t.id)));
   ok('起点还是这一轮的起点（没被下一次同步推到现在）', repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:1`).started_at === startedBefore, `${startedBefore} → ${repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:1`).started_at}`);
+  ok('旧版本写过的 summary 产出一并清掉', !repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:0`).result, repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:0`).result);
 
   head('[B2] 一轮收工（超过 LIVE_MS 没再落盘）→ done + 成员卡回落 idle');
   writeDb({
@@ -313,9 +350,67 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const doneRow = repo.getTask.get(`${TASK_ID_PREFIX}s-live:1`);
   ok('那一轮落成 done', Boolean(doneRow) && doneRow.state === 'done', doneRow && doneRow.state);
   ok('收工时刻 = 这一轮最后一次落盘（源里没有更准的，见文件头）', Boolean(doneRow) && doneRow.ended_at === NOW - 5 * MIN, doneRow && String(doneRow.ended_at));
-  ok('收工后补上产出摘要', repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:1`).result === '修好并跑过测试了');
+  ok('收工后也不拿 summary 冒充产出', !repo.getTaskRun.get(`${TASK_ID_PREFIX}s-live:1`).result);
   ok('成员卡回落 idle（不再永远"思考中"）', stateOf(MEMBER) === 'idle', stateOf(MEMBER));
   ok('LIVE_MS 是 90 秒（判据见该常量处）', LIVE_MS === 90_000, String(LIVE_MS));
+
+  head('[B2b] Qoder Stop：tool_result CANCELLED/40441 → cancelled 终态，不被更新的 session 时间复活');
+  const cancelAt = NOW - 2_000;
+  const cancelRoundAt = NOW - 30_000;
+  writeDb({
+    sessions: [{ id: 's-cancel', title: '插件会话', lastEventAt: NOW }],
+    records: [
+      {
+        requestId: 'z-old', sessionId: 's-cancel', prompt: '更早的一轮',
+        summary: '更早一轮的下一轮上下文', startedAt: NOW - 10 * MIN, updatedAt: NOW - 9 * MIN,
+      },
+      {
+        requestId: 'z0', sessionId: 's-cancel', prompt: '你提交代码吧',
+        summary: '用户取消后生成的会话摘要，不是本轮产出', startedAt: NOW - 5 * MIN, updatedAt: cancelRoundAt,
+      },
+    ],
+    messages: [
+      { sessionId: 's-cancel', requestId: 'z0', role: 'assistant', at: cancelRoundAt },
+    ],
+  });
+  ok('取消信号出现前先写下两条轮次', syncQoderPluginTasks({ bus, repo }) === 2);
+  ok('当前轮先处于 running', (repo.getTask.get(`${TASK_ID_PREFIX}s-cancel:1`) || {}).state === 'running');
+  writeDb({
+    sessions: [{ id: 's-cancel', title: '插件会话', lastEventAt: NOW }],
+    records: [
+      {
+        requestId: 'z-old', sessionId: 's-cancel', prompt: '更早的一轮',
+        summary: '更早一轮的下一轮上下文', startedAt: NOW - 10 * MIN, updatedAt: NOW - 9 * MIN,
+      },
+      {
+        requestId: 'z0', sessionId: 's-cancel', prompt: '你提交代码吧',
+        summary: '用户取消后生成的会话摘要，不是本轮产出', startedAt: NOW - 5 * MIN, updatedAt: cancelRoundAt,
+      },
+    ],
+    messages: [
+      { sessionId: 's-cancel', requestId: 'z0', role: 'assistant', at: cancelRoundAt },
+      {
+        sessionId: 's-cancel', requestId: 'z0', role: 'tool', at: cancelAt,
+        toolResult: { toolCallStatus: 'CANCELLED', errorCode: 40441, errorMsg: 'user cancelled' },
+      },
+    ],
+  });
+  const cancelRounds = qoder.readLingmaRounds('s-cancel');
+  ok('取消信号按 request_id 归到对应轮次', cancelRounds.length === 2 && cancelRounds[0].cancelled === false && cancelRounds[1].cancelled === true, JSON.stringify(cancelRounds.map((r) => r.cancelled)));
+  ok('取消轮次的活动时间包含 request 级 chat_message', cancelRounds[1].activityAt === cancelAt, String(cancelRounds[1].activityAt));
+  ok('取消后 phase 立即 idle，即使 chat_session 更新时间更晚', qoder.readLingmaPhase('s-cancel', cancelRounds, { lastEventAt: NOW }, Date.now()).phase === 'idle');
+  ok('取消后 done marker 点亮 doneCancelled', qoder.readLingmaDone('s-cancel', cancelRounds, { lastEventAt: NOW, projectPath: PROJ }, Date.now()).doneCancelled === true);
+  syncQoderPluginTasks({ bus, repo });
+  const cancelItems = await get(`project=p1&client=${F6.join(',')}&limit=50`);
+  const cancelRow = cancelItems.find((t) => t.id === `${TASK_ID_PREFIX}s-cancel:1`) || null;
+  const priorRow = cancelItems.find((t) => t.id === `${TASK_ID_PREFIX}s-cancel:0`) || null;
+  ok('台账状态 = cancelled（不是 done）', Boolean(cancelRow) && cancelRow.state === 'cancelled', cancelRow && cancelRow.state);
+  ok('结束时间 = 取消消息时间', Boolean(cancelRow) && cancelRow.ended_at === cancelAt, cancelRow && String(cancelRow.ended_at));
+  ok('取消原因为 qoder_user_cancelled', (repo.getTask.get(`${TASK_ID_PREFIX}s-cancel:1`) || {}).cancel_reason === 'qoder_user_cancelled', JSON.stringify(repo.getTask.get(`${TASK_ID_PREFIX}s-cancel:1`)));
+  ok('更早的轮次不被同一个取消信号污染', Boolean(priorRow) && priorRow.state === 'done' && !(repo.getTask.get(`${TASK_ID_PREFIX}s-cancel:0`) || {}).cancel_reason, JSON.stringify(priorRow));
+  ok('取消轮次不把 summary 写进产出', Boolean(cancelRow) && !cancelRow.result, cancelRow && cancelRow.result);
+  syncQoderPluginTasks({ bus, repo });
+  ok('重复同步后仍是 cancelled，不会因 session 时间翻回 running', (repo.getTask.get(`${TASK_ID_PREFIX}s-cancel:1`) || {}).state === 'cancelled');
 
   head('[B3] CLI and plugin sessions stay isolated');
   // qoder@p1 is shared by the CLI and plugin forms. Each session owns its own blocked row and running
@@ -420,7 +515,7 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     ok('还在跑 → 没有完成标记（不臆造）', Boolean(row) && !row.doneAt, row && String(row.doneAt));
   }
 
-  head('[C2] 收工（超过 LIVE_MS 没再落盘）→ idle + 一枚完成标记（凭据是扩展自己写的 summary）');
+  head('[C2] 收工（超过 LIVE_MS 没再落盘）→ idle + 完成标记，但 summary 不作为收尾自述');
   const doneAt = NOW - 3 * MIN;
   writeDb({
     sessions: [{ id: 's-ui', title: '插件会话', lastEventAt: doneAt }],
@@ -436,8 +531,31 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
     ok('相位回落待命中', Boolean(row) && row.phase === 'idle', row && row.phase);
     ok('完成标记 = 那一轮最后一次落盘（源里没有更准的）', Boolean(row) && row.doneAt === doneAt, row && String(row.doneAt));
     ok('完成标题 = 那一轮用户原话', Boolean(row) && row.doneTitle === '再看看', row && String(row.doneTitle));
-    ok('收尾自述 = 扩展自己写的 summary（明文）', Boolean(row) && /弄好了/.test(row.doneSaid || ''), row && String(row.doneSaid));
+    ok('收尾自述不拿 summary 冒充', Boolean(row) && !row.doneSaid, row && String(row.doneSaid));
     ok('扩展的落盘里没有"被用户打断"这个信号 → 不臆造取消', Boolean(row) && row.doneCancelled === false, row && String(row.doneCancelled));
+  }
+
+  head('[C2b] Stop 取消 → 主控制台显示 idle + 取消标记');
+  writeDb({
+    sessions: [{ id: 's-ui-cancel', title: '插件会话', lastEventAt: NOW }],
+    records: [
+      { requestId: 'uc0', sessionId: 's-ui-cancel', prompt: '提交代码', summary: '用户取消了操作', startedAt: NOW - 5 * MIN, updatedAt: NOW - 2 * MIN },
+    ],
+    messages: [
+      {
+        sessionId: 's-ui-cancel', requestId: 'uc0', role: 'tool', at: NOW - 2 * MIN,
+        toolResult: { toolCallStatus: 'CANCELLED', errorCode: 40441, errorMsg: 'user cancelled' },
+      },
+    ],
+  });
+  {
+    const snap = snapshot({ force: true, workspacePath: PROJ });
+    const floor = snap.floors.find((f) => f.id === '6F');
+    const row = ((floor && floor.sessions) || []).find((s) => s.sessionId === 's-ui-cancel') || null;
+    ok('取消后会话相位 = idle', Boolean(row) && row.phase === 'idle', row && row.phase);
+    ok('取消标记 doneCancelled = true', Boolean(row) && row.doneCancelled === true, row && String(row.doneCancelled));
+    ok('取消时刻取 chat_message 的取消时间', Boolean(row) && row.doneAt === NOW - 2 * MIN, row && String(row.doneAt));
+    ok('取消时不展示会话 summary', Boolean(row) && !row.doneSaid, row && String(row.doneSaid));
   }
 
   head('[C3] 只在插件里开了会话、一句话没说 → 不建会话行（与台账同口径）');
