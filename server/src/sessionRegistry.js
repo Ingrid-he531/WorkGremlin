@@ -47,7 +47,7 @@ const log = require('./log');
 const { listSessions, listReporterSessions, readReporterDones, readReporterDone, reporterMainPhase, reporterSnapshotPhase, freshestReporterWs } = require('./sessions');
 const { detectProducts } = require('./floors');
 const { floorOf, floorByAgent } = require('./floors');
-const { formToSource } = require('@workgremlin/shared');
+const { formToSource, agentBase } = require('@workgremlin/shared');
 
 /**
  * The floor's id ("1F" / "8F" …). The single source is the floor module's `meta.id` — reading a
@@ -67,7 +67,7 @@ const SINCE_BOOT = Date.now();
  * name" lives in meta.sessionSubtree / meta.sessionIdOfFile; this file only dispatches by meta and keeps
  * no product-specific parsing rules (see each <product>.js).
  */
-const metaOfAgent = (agent) => (floorByAgent[String(agent || '').toLowerCase()] || {}).meta || null;
+const metaOfAgent = (agent) => (floorByAgent[agentBase(agent)] || {}).meta || null;
 const { resolveProjectName } = require('./project');
 
 /** No events for longer than this → removed from the table */
@@ -435,6 +435,21 @@ function prune(now = Date.now()) {
     }
   }
   return removed;
+}
+
+/**
+ * Session ids currently considered active by the registry. Task reconciliation and the task feed use
+ * only this set: project, floor and client do not participate in liveness.
+ * @returns {Set<string>}
+ */
+function getActiveSessionIds() {
+  const ids = new Set();
+  for (const s of table.values()) {
+    if (!s.active) continue;
+    const sessionId = String(s.sessionId || '').trim();
+    if (sessionId) ids.add(sessionId);
+  }
+  return ids;
 }
 
 /** The uniform return value when a done marker is missing (none means none, no fabrication)
@@ -968,7 +983,7 @@ function snapshot({ workspacePath = '', force = false } = {}) {
       log.debug('账本查询异常（不影响会话表构建）：', e);
     }
     for (const r of rows) {
-      const f = floorByAgent[String(r.client || '').toLowerCase()];
+      const f = floorByAgent[agentBase(r.client)];
       const sessionId = String(r.sessionId || '');
       const fid = floorIdOf(f);
       if (!fid || !sessionId) continue;
@@ -1097,4 +1112,6 @@ function snapshot({ workspacePath = '', force = false } = {}) {
   };
 }
 
-module.exports = { snapshot, refresh, prune, TIMEOUT_MS, table, setBackend, scanCliSessions, liveSessionCwds };
+module.exports = {
+  snapshot, refresh, prune, getActiveSessionIds, TIMEOUT_MS, table, setBackend, scanCliSessions, liveSessionCwds,
+};

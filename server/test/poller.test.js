@@ -143,6 +143,62 @@ head('[4] 楼层自己扫 agent，经上层注册；当前工程名随 ctx 传�
   ok('syncAgentsNow() 忽略节流，立刻再扫一次（换工程用）', ctxs.length === 3, String(ctxs.length));
 }
 
+head('[6] 会话扫描成功后才对账孤儿任务；扫描失败时不触发取消');
+{
+  let t = 4_000_000;
+  let scanOk = false;
+  let reconcileCalls = 0;
+  let seenIds = null;
+  const poller = createPoller({
+    bus: {
+      reconcileRunningTasksWithActiveSessions: ({ activeSessionIds }) => {
+        reconcileCalls += 1;
+        seenIds = [...activeSessionIds];
+      },
+    },
+    repo: {},
+    getWorkspace: () => ({ workspacePath: '' }),
+    now: () => t,
+    getFloors: () => [],
+    getAgentFloors: () => [],
+    snapshot: () => {
+      if (!scanOk) throw new Error('scan failed');
+      return { defaultFloor: '1F', floors: [], sessions: [] };
+    },
+    getActiveSessionIds: () => new Set(['active-session']),
+  });
+
+  poller.tick();
+  ok('首次扫描失败不触发孤儿任务取消', reconcileCalls === 0, String(reconcileCalls));
+
+  t += 2_000;
+  scanOk = true;
+  poller.tick();
+  ok('成功扫描后立即对账一次', reconcileCalls === 1, String(reconcileCalls));
+  ok(
+    '对账只收到活跃 session id',
+    JSON.stringify(seenIds) === JSON.stringify(['active-session']),
+    JSON.stringify(seenIds)
+  );
+
+  t += 2_000;
+  scanOk = false;
+  poller.tick();
+  ok('后续扫描失败不再触发对账', reconcileCalls === 1, String(reconcileCalls));
+}
+
+head('[7] getActiveSessionIds 只收集活跃且有 id 的会话');
+{
+  const { table, getActiveSessionIds } = require('../src/sessionRegistry');
+  const keys = ['__active_a', '__active_b', '__active_c'];
+  table.set(keys[0], { active: true, sessionId: 's-active' });
+  table.set(keys[1], { active: false, sessionId: 's-stale' });
+  table.set(keys[2], { active: true, sessionId: '' });
+  const ids = getActiveSessionIds();
+  ok('只返回 active=true 且 sessionId 非空的会话', ids.has('s-active') && !ids.has('s-stale') && !ids.has(''), JSON.stringify([...ids]));
+  for (const key of keys) table.delete(key);
+}
+
 head('[5] 楼层注册表：agentSyncerFloors 是"导出了 syncAgents"的楼层');
 {
   const list = agentSyncerFloors();

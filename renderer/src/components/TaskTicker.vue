@@ -53,10 +53,10 @@ const sessions = useSessionStore();
 /**
  * The **single source of truth** for the ticker: the server's /api/v1/task-feed (see
  * server/src/http/routes/query.js). It lists the tasks table directly by taskId and returns each
- * task's { id, title, started_at, ended_at, client, state }
- * (a zombie running is judged cancelled) — **completely independent** of floors / sessions, so no
- * floor dedup / session aggregation is done any more, and each active task is shown separately.
- * client is reverse-looked up to a floor number (see floorLabelForClient).
+ * task's { id, title, started_at, ended_at, client, state }. The server includes a running task only
+ * while its session is active, and permanently hides tasks cancelled by orphan reconciliation. The
+ * component therefore performs no floor deduplication or session-liveness inference of its own; each
+ * active task is shown separately. client is reverse-looked up to a floor number here.
  */
 const feed = ref([]);
 let feedTimer = null;
@@ -282,8 +282,8 @@ function floorLabelForClient(client) {
 /**
  * In-progress tasks (state === 'running' in the feed): the permanent content of the infinite scroll
  * loop. Taken directly from /api/v1/task-feed, each task on its own line, **no longer deduplicated by
- * floor** — several running at once on the same floor (say a zombie old task plus a new task) are
- * each shown on their own, without mixing into each other.
+ * floor**. The server has already filtered out tasks outside active sessions, so this only projects
+ * the valid running rows into display lines.
  */
 const runningItems = computed(() => {
   return feed.value

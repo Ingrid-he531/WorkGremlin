@@ -3,10 +3,11 @@
 /** Read-only query endpoints. When WS drops, the frontend falls back to polling /api/v1/snapshot, which also lands here. */
 
 const express = require('express');
-const { DEFAULTS, formToSource, clientLabel } = require('@workgremlin/shared');
+const { DEFAULTS, formToSource, clientLabel, agentBase } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
 const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessions');
+const { getActiveSessionIds: registryActiveSessionIds } = require('../../sessionRegistry');
 
 /**
  * Floor filter param → client list.
@@ -65,9 +66,9 @@ function projectLabelOf(row) {
 }
 
 /**
- * @param {{bus: any, repo: any}} ctx
+ * @param {{bus: any, repo: any, getActiveSessionIds?: () => Iterable<string>}} ctx
  */
-function createQueryRouter({ bus, repo }) {
+function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSessionIds }) {
   const router = express.Router();
 
   router.get('/projects', (req, res) => {
@@ -279,24 +280,30 @@ function createQueryRouter({ bus, repo }) {
    *   · Order: running first (by ascending start time), then finished (by ascending end time), and
    *     the frontend just scrolls in the order it receives.
    *
-   * State follows /task-runs: tasks.state is the only truth.
+   * State follows /task-runs: tasks.state is the only truth. A running task is shown only while its
+   * session is active; session identity alone decides liveness (project / floor / client do not).
+   * Tasks cancelled by orphan reconciliation are excluded entirely so stale work never scrolls once.
    */
   router.get('/task-feed', (req, res) => {
     const minutes = Math.min(Math.max(Number(req.query.minutes) || 5, 1), 120);
     const since = Date.now() - minutes * 60_000;
     const project = req.query.project;
+    const activeSessionJson = JSON.stringify([...(getActiveSessionIds() || [])]);
 
     const conds = [
       't.parent_task_id IS NULL',
-      `(t.state = 'running' OR (t.state IN ('done', 'failed', 'cancelled') AND t.ended_at >= @since))`,
+      "COALESCE(t.cancel_reason, '') <> 'orphan_session'",
+      `(t.state IN ('done', 'failed', 'cancelled') AND t.ended_at >= @since
+        OR (t.state = 'running'
+            AND tr.session_id IN (SELECT value FROM json_each(@activeSessionJson))))`,
     ];
-    const args = { since, limit: 100 };
+    const args = { since, limit: 100, activeSessionJson };
     if (project && project !== 'all') {
       conds.push('t.project_id = @project');
       args.project = project;
     }
 
-    const items = repo.raw
+    const rows = repo.raw
       .prepare(
         `SELECT t.id, t.project_id, t.member_id AS memberId, t.title, t.started_at, t.ended_at,
                 COALESCE(tr.client, m.client) AS client,
@@ -311,6 +318,10 @@ function createQueryRouter({ bus, repo }) {
           LIMIT @limit`
       )
       .all(args);
+    const items = rows.map((row) => ({
+      ...row,
+      client: agentBase(row.client || row.memberId) || null,
+    }));
     return res.json({ ok: true, items });
   });
 

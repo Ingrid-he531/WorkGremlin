@@ -378,6 +378,7 @@ function migrate(db) {
   // really do have a token breakdown.
   ensureColumn(db, 'task_runs', 'usage_yuan', 'usage_yuan REAL');
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
+  ensureColumn(db, 'tasks', 'cancel_reason', 'cancel_reason TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
   // Council room: the old vote/analysis schema is intentionally not migrated (the refactor shipped before
@@ -771,13 +772,24 @@ function createRepo(db) {
         title = excluded.title, state = excluded.state,
         progress = COALESCE(excluded.progress, tasks.progress),
         started_at = COALESCE(tasks.started_at, excluded.started_at),
-        ended_at = excluded.ended_at
+        ended_at = excluded.ended_at,
+        cancel_reason = NULL
     `),
     updateTask: db.prepare(`
       UPDATE tasks SET
         state = COALESCE(@state, state),
         progress = COALESCE(@progress, progress),
-        ended_at = COALESCE(@endedAt, ended_at)
+        ended_at = COALESCE(@endedAt, ended_at),
+        cancel_reason = CASE WHEN @state = 'running' THEN NULL ELSE cancel_reason END
+      WHERE id = @id
+    `),
+    /** Cancel an orphaned running task and mark it so the live ticker never replays it. */
+    cancelTaskWithReason: db.prepare(`
+      UPDATE tasks SET
+        state = 'cancelled',
+        progress = COALESCE(@progress, progress),
+        ended_at = COALESCE(@endedAt, ended_at),
+        cancel_reason = @cancelReason
       WHERE id = @id
     `),
     getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
@@ -973,6 +985,21 @@ function createRepo(db) {
       FROM task_runs r JOIN tasks t ON t.id = r.id
       WHERE r.project_id = ? AND r.session_id = ? AND t.state = 'running'
       ORDER BY r.started_at ASC
+    `),
+
+    /** Every top-level running task, with the session that must still be active. */
+    listRunningTasksForSessionReconcile: db.prepare(`
+      SELECT t.id,
+             t.project_id AS projectId,
+             t.member_id AS memberId,
+             t.started_at AS startedAt,
+             COALESCE(tr.client, m.client) AS client,
+             tr.session_id AS sessionId
+      FROM tasks t
+      LEFT JOIN task_runs tr ON tr.id = t.id
+      LEFT JOIN members m ON m.id = t.member_id
+      WHERE t.parent_task_id IS NULL AND t.state = 'running'
+      ORDER BY t.started_at ASC
     `),
 
     /** Running top-level tasks are the sole source for floor activity. */

@@ -392,6 +392,70 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * Close top-level running tasks whose session is no longer active.
+   *
+   * Session identity is the only liveness key: project, floor and client are deliberately ignored.
+   * The grace period bridges the short window between a task start report and the next session scan.
+   * Member cards are rebuilt once per affected member after the sweep, so several cancellations do
+   * not emit a burst of intermediate states.
+   *
+   * @param {{activeSessionIds?: Iterable<string>, now?: number, graceMs?: number}} [p]
+   * @returns {{ok: boolean, checked: number, ended: number, error?: string}}
+   */
+  function reconcileRunningTasksWithActiveSessions({ activeSessionIds, now: nowMs, graceMs = 30_000 } = {}) {
+    if (activeSessionIds == null) {
+      return { ok: false, checked: 0, ended: 0, error: 'missing_active_sessions' };
+    }
+    const active = new Set(
+      [...activeSessionIds]
+        .map((sessionId) => normSession(sessionId))
+        .filter(Boolean)
+    );
+    const rows = typeof repo.listRunningTasksForSessionReconcile?.all === 'function'
+      ? repo.listRunningTasksForSessionReconcile.all()
+      : [];
+    const ts = Number(nowMs) || now();
+    const grace = Math.max(0, Number(graceMs) || 0);
+    const affected = new Map();
+    let ended = 0;
+
+    for (const row of rows) {
+      const sessionId = normSession(row.sessionId);
+      if (sessionId && active.has(sessionId)) continue;
+      const startedAt = Number(row.startedAt) || 0;
+      if (startedAt && ts - startedAt < grace) continue;
+
+      const project = projectIdOf(row.projectId);
+      const member = requireMember(project, row.memberId);
+      if (!member) continue;
+
+      const key = `${project}\n${member.id}`;
+      if (!affected.has(key)) {
+        affected.set(key, { project, memberId: member.id, before: buildMemberCard(member.id) });
+      }
+      const result = endTask(
+        {
+          project,
+          memberId: member.id,
+          taskId: row.id,
+          sessionId,
+          state: 'cancelled',
+          cancelReason: 'orphan_session',
+          ts,
+        },
+        { broadcastCard: false }
+      );
+      if (result.ok) ended += 1;
+    }
+
+    for (const { project, memberId, before } of affected.values()) {
+      const card = buildMemberCard(memberId);
+      if (!cardsEqual(before, card)) hub.broadcast(project, WS_EVENTS.MEMBER_STATUS, card);
+    }
+    return { ok: true, checked: rows.length, ended };
+  }
+
+  /**
    * Record an explicit authorization wait for one session. Blocked is session-scoped and has no
    * standalone member-level row; a live task always remains the busy source of truth.
    */
@@ -588,7 +652,12 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const ts = Number(p.ts) || now();
     const state = ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done';
 
-    repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
+    const cancelReason = state === 'cancelled' ? normText(p.cancelReason, 64) : null;
+    if (cancelReason && repo.cancelTaskWithReason) {
+      repo.cancelTaskWithReason.run({ id: p.taskId, progress: p.progress ?? 1, endedAt: ts, cancelReason });
+    } else {
+      repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
+    }
     const sessionId = normSession(p.sessionId);
     // A finished task supplies history only. Remaining running tasks (if any) keep the member busy.
     clearSessionBlocked(member.id, sessionId);
@@ -630,6 +699,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
           model: endModel,
           title: null,
           startedAt: null,
+          baselineCommit: null,
         });
       }
       const startedAt = run ? Number(run.started_at) || null : null;
@@ -1709,6 +1779,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     clearBorrowedBusy,
     clearBlocked,
     pruneSessionStatuses,
+    reconcileRunningTasksWithActiveSessions,
     startTask,
     taskProgress,
     endTask,

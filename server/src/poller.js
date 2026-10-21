@@ -6,6 +6,7 @@
  * Floor modules hold **no process / thread / timer**; they only export functions. This loop walks the
  * floor registry and owns all periodic duties, each throttled on its own cadence:
  *   · session scan (2s)      — registrySnapshot(force): the full session table + phase, broadcast only on change;
+ *                              after a successful scan, cancel top-level running tasks with no active session;
  *   · floor task sync        — per floor `pollMs` (default 5s); floors opt in by exporting `syncTasks(ctx)`
  *                              (6F Qoder plugin / 7F Kilo / 8F OpenCode / 9F Copilot);
  *   · floor agent sync       — per floor `agentsPollMs` (default 15s); floors opt in by exporting
@@ -21,7 +22,7 @@
  */
 
 const { WS_EVENTS } = require('@workgremlin/shared');
-const { snapshot: registrySnapshot } = require('./sessionRegistry');
+const { snapshot: registrySnapshot, getActiveSessionIds: registryActiveSessionIds } = require('./sessionRegistry');
 const { taskSyncerFloors, agentSyncerFloors } = require('./floors');
 
 /** Base tick. Duty cadences below are throttled against `now`, so this only bounds latency. */
@@ -44,6 +45,7 @@ const GHOST_GC_MS = 2_000;
  *   getFloors?: () => Array<object>,
  *   getAgentFloors?: () => Array<object>,
  *   snapshot?: (opts: { workspacePath: string, force: boolean }) => object,
+ *   getActiveSessionIds?: () => Iterable<string>,
  *   agents?: { registerAgent: (floor: object, a: object) => void,
  *              unregisterAgent: (floor: object, name: string) => void,
  *              pollMs?: number } | null,
@@ -58,6 +60,7 @@ function createPoller({
   getFloors = taskSyncerFloors,
   getAgentFloors = agentSyncerFloors,
   snapshot = registrySnapshot,
+  getActiveSessionIds = registryActiveSessionIds,
   agents = null,
 }) {
   const lastTaskAt = new Map();
@@ -134,10 +137,22 @@ function createPoller({
     const at = now();
     if (at - lastSessionAt >= SESSION_SCAN_MS) {
       lastSessionAt = at;
+      let scanned = false;
       try {
         scanSessions();
+        scanned = true;
       } catch {
-        /* A disk scan failure must not stall the loop. */
+        /* A disk scan failure must not stall the loop or trigger destructive reconciliation. */
+      }
+      if (scanned && typeof bus.reconcileRunningTasksWithActiveSessions === 'function') {
+        try {
+          bus.reconcileRunningTasksWithActiveSessions({
+            activeSessionIds: getActiveSessionIds(),
+            now: at,
+          });
+        } catch {
+          /* Reconciliation is retried on the next successful session scan. */
+        }
       }
     }
     syncFloorTasks(at);

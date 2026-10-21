@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   state           TEXT NOT NULL CHECK (state IN ('pending', 'running', 'done', 'failed', 'cancelled')),
   progress        REAL,
   started_at      INTEGER,
-  ended_at        INTEGER
+  ended_at        INTEGER,
+  -- Internal reason for a cancellation that should not be replayed by the live task feed.
+  cancel_reason   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_member_state ON tasks(member_id, state);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_started ON tasks(project_id, started_at);

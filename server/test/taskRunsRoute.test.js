@@ -124,7 +124,8 @@ repo.upsertTaskRun.run({
 
 /* ------------------------------ 真路由 ------------------------------ */
 const app = express();
-app.use('/api/v1', createQueryRouter({ bus, repo }));
+const activeSessionIds = new Set();
+app.use('/api/v1', createQueryRouter({ bus, repo, getActiveSessionIds: () => activeSessionIds }));
 // 上报接口也挂上：工具使用（/tool/use）走的就是它，这里连 HTTP 那一段一起验
 app.use('/api/v1', createIngestRouter({ bus }));
 
@@ -322,6 +323,89 @@ app.use('/api/v1', createIngestRouter({ bus }));
   const frow = ((feed.items || []).find((t) => t.id === 't-feed')) || {};
   ok('/task-feed 把刚收工的任务带回来', Boolean(frow.id), JSON.stringify((feed.items || []).map((t) => t.id)));
   ok('每行带 sessionId（渲染层据此读相位后缀）', frow.sessionId === 's-feed', JSON.stringify(frow.sessionId));
+
+  // Running tasks are filtered by session liveness before the SQL limit, regardless of project.
+  const feedStartedAt = feedNow - 2_000;
+  repo.insertTask.run({
+    id: 't-feed-active',
+    projectId: 'p1',
+    memberId: 'codex@p1',
+    parentTaskId: null,
+    title: 'active feed task',
+    state: 'running',
+    progress: 0,
+    startedAt: feedStartedAt,
+    endedAt: null,
+  });
+  repo.upsertTaskRun.run({
+    id: 't-feed-active', projectId: 'p1', memberId: 'codex@p1', client: 'codex',
+    sessionId: 's-feed-active', form: 'cli', model: null, title: 'active feed task',
+    startedAt: feedStartedAt, baselineCommit: null,
+  });
+  repo.insertTask.run({
+    id: 't-feed-active-other-project',
+    projectId: 'stb-dashboard-2',
+    memberId: 'claude@stb-dashboard-2',
+    parentTaskId: null,
+    title: 'same session in another project',
+    state: 'running',
+    progress: 0,
+    startedAt: feedStartedAt,
+    endedAt: null,
+  });
+  repo.upsertTaskRun.run({
+    id: 't-feed-active-other-project', projectId: 'stb-dashboard-2', memberId: 'claude@stb-dashboard-2',
+    client: 'claude', sessionId: 's-feed-active', form: null, model: null,
+    title: 'same session in another project', startedAt: feedStartedAt, baselineCommit: null,
+  });
+  repo.insertTask.run({
+    id: 't-feed-orphan',
+    projectId: 'p1',
+    memberId: 'codex@p1',
+    parentTaskId: null,
+    title: 'orphan feed task',
+    state: 'running',
+    progress: 0,
+    startedAt: feedStartedAt,
+    endedAt: null,
+  });
+  repo.upsertTaskRun.run({
+    id: 't-feed-orphan', projectId: 'p1', memberId: 'codex@p1', client: 'codex',
+    sessionId: 's-feed-orphan', form: 'cli', model: null, title: 'orphan feed task',
+    startedAt: feedStartedAt, baselineCommit: null,
+  });
+  repo.insertTask.run({
+    id: 't-feed-orphan-cancelled',
+    projectId: 'p1',
+    memberId: 'codex@p1',
+    parentTaskId: null,
+    title: 'orphan cancelled feed task',
+    state: 'running',
+    progress: 0,
+    startedAt: feedStartedAt,
+    endedAt: null,
+  });
+  repo.cancelTaskWithReason.run({
+    id: 't-feed-orphan-cancelled', progress: 1, endedAt: feedNow, cancelReason: 'orphan_session',
+  });
+
+  activeSessionIds.add('s-feed-active');
+  const filteredFeed = await (await fetch(`${base}/task-feed?minutes=5`)).json();
+  const filteredIds = (filteredFeed.items || []).map((t) => t.id);
+  ok('running task in an active session is returned', filteredIds.includes('t-feed-active'), JSON.stringify(filteredIds));
+  ok(
+    'active session matching ignores project',
+    filteredIds.includes('t-feed-active-other-project'),
+    JSON.stringify(filteredIds)
+  );
+  ok('running task outside active sessions is hidden', !filteredIds.includes('t-feed-orphan'), JSON.stringify(filteredIds));
+  ok(
+    'orphan-cancelled task is never replayed by the ticker',
+    !filteredIds.includes('t-feed-orphan-cancelled'),
+    JSON.stringify(filteredIds)
+  );
+  const activeRow = (filteredFeed.items || []).find((t) => t.id === 't-feed-active') || {};
+  ok('feed client is normalized with agentBase()', activeRow.client === 'codex', JSON.stringify(activeRow.client));
 
   server.close();
   close();
