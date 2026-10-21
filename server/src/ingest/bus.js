@@ -1016,7 +1016,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
           project: rec.project,
           memberId: rec.memberName,
           taskId: rec.taskId,
-          state: 'done',
+          state: ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done',
           artifacts: p.result ? [{ kind: 'text', title: p.result, path: GHOST_SUMMARY_PATH }] : undefined,
         });
       } catch {
@@ -1192,7 +1192,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   /**
    * Sweep one session's (or one floor's) ghosts (Stop / SessionEnd / UserPromptSubmit, or the
    * task-ended fallback).
-   * @param {{project:string, client?:string, sessionId?:string, all?:boolean}} p
+   * @param {{project:string, client?:string, sessionId?:string, all?:boolean, state?:string}} p
    * @returns {number} how many were dispersed
    */
   function ghostSweep(p) {
@@ -1205,7 +1205,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       if (client && rec.client !== client) continue;
       if (sessionId && rec.sessionId !== sessionId) continue;
       if (!p.all && (rec.endedAt || rec.background)) continue;
-      closeGhost(rec);
+      closeGhost(rec, { state: p.state });
       ghosts.delete(rec.key);
       removeGhostMemberIfUnused(rec);
       n += 1;
@@ -1249,6 +1249,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     let n = 0;
     for (const rec of [...ghosts.values()]) {
       let drop = false;
+      let closeState = 'done';
       // A running parent keeps the ghost alive regardless of the TTL (see the JSDoc above).
       let parentRunning = false;
       if (rec.parentTaskId) {
@@ -1262,7 +1263,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
           } else {
             const endAt = Number(task.ended_at) || 0;
             const endedAfterSpawn = !endAt || endAt >= Number(rec.at || 0);
-            if (endedAfterSpawn && !rec.background) drop = true;
+            if (endedAfterSpawn && !rec.background) {
+              drop = true;
+              closeState = task.state === 'cancelled' || task.state === 'failed' ? task.state : 'done';
+            }
           }
         }
       }
@@ -1271,7 +1275,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         if (t - rec.at > ttl) drop = true;
       }
       if (drop) {
-        closeGhost(rec);
+        closeGhost(rec, { state: closeState });
         ghosts.delete(rec.key);
         removeGhostMemberIfUnused(rec);
         n += 1;

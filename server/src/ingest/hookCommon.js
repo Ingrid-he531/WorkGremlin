@@ -749,12 +749,18 @@ function bindGhostIdentity(bus, project, name, id, agentId, background, client, 
 /**
  * Sweep one session's (or one floor's) ghosts: close their runs, drop the ephemeral members; also
  * retain background summons in the session ledger until their exact completion signal or cancellation.
- * @param {{all?: boolean}} opts
+ * @param {{all?: boolean, state?: string}} opts
  */
 function sweepGhosts(bus, project, client, opts = {}, session = '', sessionState = null) {
   const n =
     bus && typeof bus.ghostSweep === 'function'
-      ? bus.ghostSweep({ project, client, sessionId: session, all: Boolean(opts && opts.all) })
+      ? bus.ghostSweep({
+          project,
+          client,
+          sessionId: session,
+          all: Boolean(opts && opts.all),
+          state: opts && opts.state,
+        })
       : 0;
   if (sessionState && Array.isArray(sessionState.subagents)) {
     sessionState.subagents = opts && opts.all ? [] : sessionState.subagents.filter((r) => r && r.background);
@@ -1013,9 +1019,9 @@ async function runHookEvent(ev, ctx, floorImpl) {
     }
     const replies0 = impl.repliesOf(tp());
     await reportReplies(ctx, memberId, taskId0, replies0, sessionId, client);
-    // A parent turn may end while a detached background child keeps working. Only explicit
-    // session teardown may sweep those children.
-    sweepGhosts(bus, stableProject, client, {}, sessionId, st0);
+    // Detached background children survive the parent turn, while foreground children are closed
+    // with this cancellation. Explicit session teardown still sweeps every remaining child.
+    sweepGhosts(bus, stableProject, client, { state: 'cancelled' }, sessionId, st0);
     const files0 = collectRoundFiles(st0, ev0, cwd, startedAt0, workspacePath);
     const last0 = replies0.length ? replies0[replies0.length - 1].text : '';
     const said0 = String(last0 || '').replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -1399,7 +1405,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const roundFileDetails = collectRoundFiles(st, ev, cwd, startedAt, workspacePath);
     const justCancelled = prevCancelledDone && !taskId;
     const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
-    sweepGhosts(bus, stableProject, client, {}, sessionId, get());
+    sweepGhosts(bus, stableProject, client, cancelledRound ? { state: 'cancelled' } : {}, sessionId, get());
     if (taskId) {
       const form = formOf() || st.form || '';
       const transcriptPath = tp();

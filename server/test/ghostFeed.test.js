@@ -123,12 +123,17 @@ console.log('\n[5] gcGhosts：父任务收工才散；召唤前就已收工的�
   ok('父任务在召唤前就已取消 → 幽灵留着（别把还在跑的 subagent 误散）', !!member('subagent-D'));
   bus.ghostSweep({ project: 'p1', client: 'codebuddy', sessionId: 's4' });
 
-  // (b) 父任务还在跑 → 留着；随后收工 → 散
-  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's3', name: 'C', id: 'c1', parentTaskId: main });
+  // (b) 父任务还在跑 → 留着；随后取消 → 散场，子任务同步取消
+  const childC = bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's3', name: 'C', id: 'c1', parentTaskId: main });
   ok('父任务还在跑时不散', bus.gcGhosts() === 0 && !!member('subagent-C'));
   nextMs(); // the parent must end strictly after the summon started (not in the same ms)
   bus.endTask({ project: 'p1', memberId: 'codebuddy', taskId: main, state: 'cancelled' });
-  ok('父任务在召唤后收工 → 散场', bus.gcGhosts() >= 1 && !member('subagent-C'));
+  ok(
+    '父任务取消后 GC 散场并把子任务标记为 cancelled',
+    bus.gcGhosts() >= 1 &&
+      !member('subagent-C') &&
+      repo.getTask.get(repo.raw.prepare('SELECT task_id FROM subagent_runs WHERE id = ?').get(childC.runId).task_id).state === 'cancelled'
+  );
 }
 
 console.log('\n[6] gcGhosts：父任务还在跑时，孤儿 TTL 不得把还在干活的 subagent 误散');

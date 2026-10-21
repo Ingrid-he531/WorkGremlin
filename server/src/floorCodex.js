@@ -147,14 +147,14 @@ function codexForm(transcriptPath) {
 }
 
 /**
- * Codex `spawn_agent` is detached from the spawning turn. Mirror that lifecycle on SubagentStart
- * so a parent Stop/Interrupt does not sweep the child while it is still running.
+ * Codex child turns are terminated when the parent turn is interrupted, so they are foreground
+ * children: a parent cancellation must sweep them instead of letting the ghost outlive its turn.
  */
 function codexLaunchOf(ev) {
   if (!ev || ev.hook_event_name !== 'SubagentStart') return null;
   const agentId = String(ev.agent_id || ev.agentId || '').trim();
   if (!agentId) return null;
-  return { agentId, background: true };
+  return { agentId, background: false };
 }
 
 /** Codex differs only in how it reads its on-disk data: event gating and the common
