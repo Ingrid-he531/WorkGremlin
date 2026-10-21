@@ -25,7 +25,7 @@ npm run launch:electron
 # Just check the native module works (create table → write → read back): npm run db:check
 ```
 
-**Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the UI switches to an isolated **demo project**, the main console automatically plays a full round, and the members in the room become the demo team (6 experts + 2 temporary members). Click "Exit demo" again to return to the project that was open before.
+**Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the current floor gets an isolated virtual **demo session**, the main console follows the server-owned demo phase, and the office shows the demo team (6 experts + 2 temporary members). Task records, the project selector and the conversation stay on the real project. Click "Exit demo" again to return to the previously selected real session.
 
 ## Four pages
 

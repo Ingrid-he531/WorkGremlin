@@ -82,7 +82,59 @@ export async function getWorkspace(info) {
 }
 
 /**
- * Open a project. An empty path / 'demo' means switch back to the demo data.
+ * Start (or restart) the in-memory demo session on a floor.
+ * @param {{port?:number, token?:string, fallback?:boolean}} info
+ * @param {string} floor
+ */
+export async function startDemoSession(info, floor) {
+  const res = await fetch(`${httpBase(info)}/api/v1/demo/session`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(info && info.token ? { Authorization: `Bearer ${info.token}` } : {}),
+    },
+    body: JSON.stringify({ floor }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) throw new Error((data && data.error && data.error.message) || `HTTP ${res.status}`);
+  return data;
+}
+
+/**
+ * Live demo phase / member state. Read-only; no DB access on the server.
+ * @param {{port?:number, token?:string, fallback?:boolean}} info
+ * @param {string} floor
+ * @param {string} sessionId
+ */
+export async function getDemoSession(info, floor, sessionId) {
+  const qs = new URLSearchParams({ floor: String(floor || ''), session: String(sessionId || '') });
+  const res = await fetch(`${httpBase(info)}/api/v1/demo/session?${qs}`, {
+    headers: info && info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) throw new Error((data && data.error && data.error.message) || `HTTP ${res.status}`);
+  return data;
+}
+
+/**
+ * Drop the in-memory demo state for a floor. Safe to call repeatedly.
+ * @param {{port?:number, token?:string, fallback?:boolean}} info
+ * @param {string} floor
+ */
+export async function stopDemoSession(info, floor) {
+  const qs = new URLSearchParams({ floor: String(floor || '') });
+  try {
+    await fetch(`${httpBase(info)}/api/v1/demo/session?${qs}`, {
+      method: 'DELETE',
+      headers: info && info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+    });
+  } catch {
+    /* Leaving demo must never be blocked by a network failure */
+  }
+}
+
+/**
+ * Open a real project directory.
  * @param {{port?:number, token?:string, fallback?:boolean}} info
  * @param {string} path
  */

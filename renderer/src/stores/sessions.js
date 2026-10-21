@@ -63,6 +63,12 @@ export const useSessionStore = defineStore('sessions', {
     floors: [],
     /** Active sessions across all floors (flat, in floor order) */
     sessions: [],
+    /**
+     * A virtual session merged into every server snapshot (currently only the demo session).
+     * It is **not** server state: demo mode installs it here, `applySnapshot` re-injects it after
+     * every `/sessions` refresh / WS push, and leaving demo mode removes it again.
+     */
+    virtualSession: null,
     selectedFloor: '',
     selectedId: '',
     /**
@@ -149,6 +155,16 @@ export const useSessionStore = defineStore('sessions', {
         // Source tag: the backend's source is already derived from form (plugin/cli/ide), use it as-is
         // plugin → Plugin-, cli → CLI-, ide → IDE-, desktop → Desktop-, empty → no prefix
         const src = String(x.source || '').toLowerCase();
+        // The virtual demo session has a project label and a synthetic id that are useful in logs,
+        // but not in the dropdown. Use the normal translated label instead of showing
+        // "__demo__:session".
+        if (src === 'demo' || x.demo) {
+          return {
+            value: x.id,
+            label: t('session.demo_session'),
+            title: t('session.demo_session_title'),
+          };
+        }
         const tag =
           src === 'plugin' ? 'Plugin' : src === 'cli' ? 'CLI' : src === 'ide' ? 'IDE' : src === 'desktop' ? 'Desktop' : '';
         const proj = x.project || t('sessions.unknown_project');
@@ -200,6 +216,11 @@ export const useSessionStore = defineStore('sessions', {
       if (Number(data.timeoutMs)) this.timeoutMs = Number(data.timeoutMs);
       this.loaded = true;
 
+      // The server never knows about the virtual demo session. Re-inject it **before** any selected
+      // floor / session fix-up: every `/sessions` poll and WS push replaces `floors` / `sessions`,
+      // and without this the demo entry would disappear after at most 5 seconds.
+      this.injectVirtualSession();
+
       // The only floor move this store makes on its own: the selected floor is **gone** (never seen,
       // or no longer installed) — without this the user is left staring at a floor that does not
       // exist. An installed floor that merely has no active sessions is NOT a reason to move; the
@@ -219,6 +240,59 @@ export const useSessionStore = defineStore('sessions', {
       }
       // This floor finally has sessions (it was empty before) → the office returns to normal display
       if (this.selectedId) this.floorEmpty = false;
+    },
+
+    /**
+     * Install / replace the virtual session and merge it into the currently loaded table.
+     * Demo mode owns the session object; this store only keeps the merge logic in one place.
+     * @param {object|null} session
+     */
+    setVirtualSession(session) {
+      this.virtualSession = session ? { ...session } : null;
+      this.injectVirtualSession();
+    },
+
+    /** Refresh live fields (phase / action / task state) without touching the rest of the table */
+    updateVirtualSession(session) {
+      if (!session || !this.virtualSession || session.id !== this.virtualSession.id) return;
+      this.virtualSession = { ...this.virtualSession, ...session };
+      this.injectVirtualSession();
+    },
+
+    /** Remove the virtual session; the caller decides which real floor / session to select next */
+    removeVirtualSession() {
+      const id = this.virtualSession && this.virtualSession.id;
+      this.virtualSession = null;
+      if (!id) return;
+      for (const f of this.floors) {
+        const before = Array.isArray(f.sessions) ? f.sessions.length : 0;
+        f.sessions = (f.sessions || []).filter((x) => x.id !== id);
+        if (f.sessions.length !== before) f.activeCount = f.sessions.length;
+      }
+      this.sessions = this.sessions.filter((x) => x.id !== id);
+      if (this.selectedId === id) this.selectedId = '';
+    },
+
+    /**
+     * Merge `virtualSession` into `floors` / `sessions` (idempotent). Called after every server
+     * snapshot and whenever live demo data changes. If the floor is not installed (or the session
+     * table has not loaded yet) it leaves the table alone; the next snapshot will retry.
+     */
+    injectVirtualSession() {
+      const v = this.virtualSession;
+      if (!v || !v.id || !v.floor) return;
+      const floor = this.floors.find((f) => f.id === v.floor);
+      if (!floor) return;
+      if (!Array.isArray(floor.sessions)) floor.sessions = [];
+
+      const fIdx = floor.sessions.findIndex((x) => x.id === v.id);
+      if (fIdx >= 0) floor.sessions.splice(fIdx, 1, v);
+      else floor.sessions.push(v);
+      floor.activeCount = floor.sessions.length;
+
+      const gIdx = this.sessions.findIndex((x) => x.id === v.id);
+      if (gIdx >= 0) this.sessions.splice(gIdx, 1, v);
+      else this.sessions.push(v);
     },
 
     /** Select a session: the floor follows it (sessions are already grouped by floor) */

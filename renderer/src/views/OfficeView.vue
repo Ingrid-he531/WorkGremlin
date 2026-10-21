@@ -9,6 +9,7 @@ import { computed } from 'vue';
 import DeskScene from '../components/DeskScene.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
+import { useDemoStore } from '../stores/demo';
 import { floorAcceptsClient } from '../lib/clientMatch';
 import { memberForSession, normalizeState } from '../lib/memberTask';
 
@@ -19,14 +20,17 @@ const emit = defineEmits(['select']);
 
 const project = useProjectStore();
 const sessions = useSessionStore();
+const demo = useDemoStore();
+/** Demo owns only the office roster; task records / messages keep reading the real project. */
+const sourceMembers = computed(() => (demo.active ? demo.members : project.members));
 
 /** Anomalous first: makes sure blocked/busy members are always on the first screen */
 const desks = computed(() => {
   const order = ['blocked', 'busy', 'idle'];
-  return project.members
+  return sourceMembers.value
     .filter((m) => floorAcceptsClient(sessions.selectedClient, m.client))
     .slice()
-    .map((m) => memberForSession(m, sessions.selectedSessionId, project.members))
+    .map((m) => memberForSession(m, sessions.selectedSessionId, sourceMembers.value))
     .sort((a, b) => order.indexOf(normalizeState(a.state)) - order.indexOf(normalizeState(b.state)));
 });
 </script>

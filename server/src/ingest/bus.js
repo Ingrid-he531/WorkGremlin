@@ -1702,8 +1702,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       mainConversationId: t.main_conversation_id || null,
       source: t.source,
       createdAt: t.created_at,
-      // The demo project has no directory, so its display name is fixed as "演示工程" (shown side by side with real projects)
-      projectName: t.workspace_path ? resolveProjectName(t.workspace_path) : config.DEMO_PROJECT_NAME,
+      // A project without a directory has no resolvable package/directory name; fall back to its
+      // stored slug. (The virtual demo project is not in this table at all.)
+      projectName: t.workspace_path ? resolveProjectName(t.workspace_path) : t.name || '',
     }));
   }
 

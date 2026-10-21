@@ -10,6 +10,17 @@
 const PROTOCOL_VERSION = 2;
 
 /**
+ * Virtual demo identities.
+ *
+ * Demo mode is a normal floor + session selection from the renderer's point of view, but the
+ * session and its project are never persisted in the office tables. The server exposes them from
+ * an in-memory, read-only demo provider; the renderer injects the virtual session back into every
+ * `/sessions` snapshot while demo mode is active.
+ */
+const DEMO_PROJECT_ID = '__demo__';
+const DEMO_SESSION_ID = '__demo__:session';
+
+/**
  * Workstation states. "Thinking / waiting for the model" is part of `busy`; connection liveness and
  * inferred session phases belong to other axes and are not workstation states.
  * @type {ReadonlyArray<'busy'|'idle'|'blocked'>}
@@ -182,6 +193,7 @@ const HTTP_ROUTES = Object.freeze({
   SNAPSHOT: '/api/v1/snapshot',
   MESSAGES: '/api/v1/messages',
   PROJECTS: '/api/v1/projects',
+  DEMO_SESSION: '/api/v1/demo/session',
   REGISTER: '/api/v1/register',
   TASK_START: '/api/v1/task/start',
   TASK_PROGRESS: '/api/v1/task/progress',
@@ -451,6 +463,8 @@ function home() {
 
 module.exports = {
   PROTOCOL_VERSION,
+  DEMO_PROJECT_ID,
+  DEMO_SESSION_ID,
   IPC_EVENTS,
   AGENT_STATES,
   TASK_STATES,

@@ -42,7 +42,15 @@ ok('a lineSuffixColor helper exists', /const\s+lineSuffixColor\s*=/.test(src));
 
 console.log('\n[2] Only running lines go live; ended lines keep their baked terminal suffix');
 ok('lineSuffix branches on it.live', /it\.live\s*\?/.test(src));
-ok('ended lines are NOT marked live (exactly one live:true —— the running branch)', (src.match(/\blive:\s*true/g) || []).length === 1);
+// Two live lines now: the real running branch and the frontend-only demo pseudo line. Ended lines
+// still do not set live:true (they bake a terminal suffix in endedText).
+ok(
+  'only the running + demo branches are live',
+  (src.match(/\blive:\s*true/g) || []).length === 2
+);
+ok('demo line is frontend-only and reads the backend session', /if \(demo\.active && demo\.session\)/.test(src));
+ok('demo line has a dedicated i18n label', /t\('ticker\.demoLabel'\)/.test(src));
+ok('real /task-feed remains the only ended-task source', /for \(const it of feed\.value\)/.test(src) && !/demo.*detectEnded/.test(src));
 
 console.log('\n[3] The template renders the suffix through the live helper, never the baked field');
 const template = src.slice(src.indexOf('<template>'));

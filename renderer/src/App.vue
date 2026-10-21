@@ -15,6 +15,7 @@ import { useCouncilStore } from './stores/council';
 import { useProjectStore } from './stores/project';
 import { useMessageStore } from './stores/messages';
 import { useSessionStore } from './stores/sessions';
+import { useDemoStore } from './stores/demo';
 import { WS_EVENTS } from '@workgremlin/shared';
 import { httpBase, setFullScreen, onFullScreen } from './api/bridge';
 import { useElevator } from './composables/useElevator';
@@ -23,6 +24,7 @@ import { useI18n } from './i18n';
 const project = useProjectStore();
 const msgs = useMessageStore();
 const sessions = useSessionStore();
+const demo = useDemoStore();
 const council = useCouncilStore();
 const { t } = useI18n();
 
@@ -132,6 +134,8 @@ function onKeydown(e) {
 }
 
 async function refreshMessages() {
+  // Demo mode only replaces the office members. The conversation log always follows the real
+  // project, just like task records and the project selector.
   const info = project.serverInfo || {};
   const base = httpBase(info);
   const t = project.project ? project.project.name : '';
@@ -153,37 +157,24 @@ function selectDesk(id) {
 }
 
 /**
- * The session dropdown's contents: in demo mode it is replaced by the **single** entry "demo
- * project · demo session".
- *
- * Why not keep listing real sessions: a demo is not any real session —— listing them makes them
- * unclickable (the project does not switch during a demo, see IsoOfficeView's demo guard) and
- * clashes with "project: demo project". To leave the demo, use the HUD's "exit demo".
+ * The demo session is injected by stores/sessions.js like any other active session, so the
+ * dropdown is always the normal floor-scoped list. Selecting a real entry leaves demo mode first;
+ * selecting the virtual demo entry only re-selects it.
  */
-const DEMO_SESSION_ID = '__demo__';
-const sessionItems = computed(() =>
-  project.demo
-    ? [
-        {
-          value: DEMO_SESSION_ID,
-          label: t('session.demo_session'),
-          title: t('session.demo_session_title'),
-        },
-      ]
-    : sessions.options
-);
-const sessionValue = computed(() => (project.demo ? DEMO_SESSION_ID : sessions.selectedId));
-const sessionEmptyLabel = computed(() => (project.demo ? t('session.demo_session') : sessions.emptyLabel));
+const sessionItems = computed(() => sessions.options);
+const sessionValue = computed(() => sessions.selectedId);
+const sessionEmptyLabel = computed(() => sessions.emptyLabel);
 
-/** Select a session: not switched during a demo (to leave the demo use the HUD button) */
-function selectSession(id) {
-  if (project.demo) return;
+async function selectSession(id) {
+  if (demo.active && id !== demo.sessionId) {
+    await demo.exit({ restore: true });
+  }
   sessions.select(id);
 }
 
-/** Phase-source badge: say "demo script" during a demo; do not pass off a real session's "reported / inferred" */
+/** Phase-source badge: the demo phase still comes from the server provider, just not from a real hook */
 const phaseSource = computed(() => {
-  if (project.demo) return 'demo';
+  if (demo.active) return 'demo';
   const sel = sessions.selected;
   if (!sel) return '';
   return sel.inferred ? 'inferred' : 'reported';
@@ -203,6 +194,18 @@ watch(
   }
 );
 
+/**
+ * Demo is tied to **one floor**. Riding the elevator / picking a floor leaves it; the normal floor
+ * + session filtering then drives the real project again. The old session on the old floor is
+ * restored only if it is still alive (see stores/demo.js).
+ */
+watch(
+  () => sessions.selectedFloor,
+  (floor, old) => {
+    if (demo.active && old && floor && floor !== demo.floor) demo.exit({ restore: true });
+  }
+);
+
 /** The selected session changed -> handled by IsoOfficeView's main console (strictly follows the selected session; the office layout does not move) */
 
 onMounted(async () => {
@@ -217,8 +220,11 @@ onMounted(async () => {
   });
   await project.init((msg) => {
     if (msg.type === WS_EVENTS.MESSAGE_NEW) msgs.push(msg.payload);
-    // An empty floor accepts no snapshot: otherwise the server-pushed one (still from the previous project) would refill the conversation just cleared
-    if (msg.type === WS_EVENTS.SNAPSHOT && !sessions.floorEmpty) msgs.setSnapshot(msg.payload.recentMessages || []);
+    // An empty floor accepts no snapshot: otherwise the server-pushed one (still from the previous project) would refill the conversation just cleared.
+    // Demo mode never changes the real project, so real message pushes keep flowing.
+    if (msg.type === WS_EVENTS.SNAPSHOT && !sessions.floorEmpty) {
+      msgs.setSnapshot(msg.payload.recentMessages || []);
+    }
     // Sessions (project/session open-close) are pushed live: refresh the floors and dropdown immediately instead of waiting for the 10s poll
     if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
     // Council: start / round-by-round speech / vote count / wrap up. project is null to broadcast, independent of the project
@@ -242,6 +248,7 @@ onUnmounted(() => {
   // Finish the in-flight trip on unmount (design §8.1: a "door closed halfway" state must not be left behind)
   settleElevator();
   sessions.stopPolling();
+  demo.dispose();
   project.dispose();
 });
 </script>

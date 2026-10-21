@@ -176,7 +176,7 @@ The ownership unit is the **project** (`projects`). There is no `team` table and
 
 | Entity | Key fields | Difference from the docs |
 | --- | --- | --- |
-| `projects` | `id`, `name`, `workspace_path`, `main_conversation_id`, `source CHECK IN ('report','watch')` | Formerly `teams`; the demo project uses the reserved id `__demo__`; retired `source='timeout'` values are migrated to `'watch'` |
+| `projects` | `id`, `name`, `workspace_path`, `main_conversation_id`, `source CHECK IN ('report','watch')` | Formerly `teams`; the virtual demo project uses the reserved id `__demo__` but is never stored in this table; retired `source='timeout'` values are migrated to `'watch'` |
 | `members` | `id`, `project_id`, `name`, `role`, `session_id`, `reported`, `created_at`, `ephemeral`, `project_label`, **`client`** | **No `last_seen_at`** (dropped by migration). Adds ephemeral ghosts and their project label. Badge level is not stored (computed at runtime). `client` is the product base name (`codebuddy` / `cline` / `codex` / `claude`, NULL = generic); the office filters by the current floor's client |
 | `agent_status` | `member_id` PK, `state CHECK (state = 'busy')`, `state_since`, `updated_at` | **Only borrowed busy** for a resident gremlin whose same-named ghost is working. Idle is "no row". Main-agent busy is always derived from `tasks.state`. No `progress`, `current_files`, `task_id`, `last_heartbeat_at`, `degraded`, or `source` |
 | `session_status` | `member_id`, `session_id`, `state CHECK (state = 'blocked')`, `state_since`, `updated_at`, PK `(member_id, session_id)` | **Only explicit authorization waits.** No row = not blocked. Blocked is session-scoped: two sessions of one member do not affect each other. Cleared by task progress / task end / session end / idle notification |
@@ -674,25 +674,30 @@ the Codex side still need verification.
 
 ## 10. Demo mode: entry moved from a launch flag to a UI button (2026-09-21)
 
+> **2026-10-21 — superseded by the virtual demo session.** Demo mode is now a read-only, in-memory
+> virtual project + session (`__demo__` / `__demo__:session`) exposed by `server/src/demo/provider.js`
+> through `/api/v1/demo/session`. It is selected on the current floor like a real session; it never
+> writes `projects` / `members` / `tasks` / `messages` / `task_runs`. The old seeded-project path,
+> `workspace.openDemo()`, seeder, cleanup, ticker and the in-browser `SCRIPT` were removed. The
+> historical notes below are kept for context only.
+
 **The requirement did not change** (still "one deterministic fake dataset, isolated from real data"); only **how
 you enter it** changed:
 
 | Item | Before | Now |
 | --- | --- | --- |
-| Entry | `npm run dev -- --demo` / `--demo-seed N` / `WORKGREMLIN_DEMO=1` / `MOCK=1` | The "演示模式" button on the office HUD (left of "集合开会") → `POST /api/v1/workspace` (empty path) → `openDemo()` |
-| Seeding | Decided at startup by `shouldSeedDemo()` (`WORKGREMLIN_DEMO_REFRESH=1` forces reseed) | Seeded on demand when switching into the demo project (only when `__demo__` has no messages), via `server/src/demo/` (`seeder`, `cleanup`, `ticker`) called from `syncDemo` / `ensureDemoData` |
-| Demo ticker | Started by `isDemoMode()` at startup and ran for the life of the process | Started/stopped with the project switch: starts on entry, stops on exit (`workspace.setOnSwitch` → `createDemo` `onSwitch`) |
-| Exit | Restart without `--demo` | Click the button again ("退出演示") → return to the project that was open before (`project.demoReturnPath`) |
-| Startup restore | `WORKGREMLIN_NO_DEMO=1` existed solely to "not take me back to the demo project" | The persisted `current.demo` is the user's own click, so restore does enter the demo; that variable was deleted |
+| Entry | `npm run dev -- --demo` / `--demo-seed N` / `WORKGREMLIN_DEMO=1` / `MOCK=1` | The "演示模式" button on the office HUD (left of "集合开会") → `POST /api/v1/demo/session { floor }` |
+| Data | Seed rows written into the real tables | Built in memory on every request by `server/src/demo/provider.js`; no project / member / task / message rows are written |
+| Ticker | Started by `isDemoMode()` at startup and ran for the life of the process | One frontend-only pseudo line in `TaskTicker.vue`; it never enters `/task-feed` or the ended-task announcement logic |
+| Exit | Restart without `--demo` | Click the button again ("退出演示"), switch floors, or select a real session → `DELETE /api/v1/demo/session` |
+| Startup restore | `WORKGREMLIN_NO_DEMO=1` existed solely to "not take me back to the demo project" | Never restored: the in-memory demo disappears with the server process |
 
-Removed with it: `desktop/src/main.js` `flags` and the `workgremlin:get-flags` IPC (and `flags` in `preload.js` /
-`api/bridge.js` / `stores/project.js`), `server/src/cli.js` `--demo` / `--demo-seed`, `scripts/dev.js`
-`WORKGREMLIN_DEMO*` injection, the `createServer({demo, seed})` parameters, and `workspace.js` `preferDemo`.
-Kept: `config.DEMO_PROJECT` (`__demo__`) and `workspace.openDemo()` (project switching already existed), the
-generator's `seedDemoData` / `createDemoTicker` (now called on demand), and `WORKGREMLIN_DEMO_FIXED_TS` (the
-generator's time base, unrelated to "how you enter the demo").
+Removed with it: the seeded `__demo__` project path, `workspace.openDemo()`, seeder / cleanup / ticker modules,
+`server/src/mock/generator.js`, `WORKGREMLIN_DEMO_FIXED_TS`, `syncDemo`, and the in-browser demo `SCRIPT`.
+Kept: the fixed `DEMO_PROJECT` / `DEMO_PROJECT_ID` identity (`__demo__`, never overridden by
+`WORKGREMLIN_PROJECT`) and the frontend-only ticker line.
 
-Five frontend special cases exist so that "clicking the button really means demo mode":
+The former seeded-project demo had five frontend special cases (all removed with the virtual session):
 
 1. `sceneMembers` lets the demo override floor/session filtering (`floorEmpty` does not clear the room,
    `sessions.live` does not grey out members).

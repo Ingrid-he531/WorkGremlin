@@ -26,10 +26,11 @@ const { createIngestRouter } = require('./http/routes/ingest');
 const { createWorkspaceRouter } = require('./http/routes/workspace');
 const { createProductsRouter } = require('./http/routes/floors');
 const { createSessionsRouter } = require('./http/routes/sessions');
+const { createDemoRouter } = require('./http/routes/demo');
 const { createCouncilRouter } = require('./http/routes/council');
 const { createCouncilOrchestrator } = require('./council/orchestrator');
 const { requireToken } = require('./http/auth');
-const { createDemo } = require('./demo');
+const { createDemoProvider } = require('./demo');
 const { setBackend: setRegistryBackend } = require('./sessionRegistry');
 const { createPoller } = require('./poller');
 const config = require('./config');
@@ -94,8 +95,9 @@ function isLoopbackOrigin(origin) {
 /**
  * Server lifecycle hooks: a tiny registry that replaces the hand-written chaining in start()/close()
  * with explicit registration, run in registration order.
- *   - onWorkspaceSwitch: fires after every project switch (restore / manual switch / demo switch all
- *     go through workspace.setOnSwitch -> afterWorkspaceSwitch)
+ *   - onWorkspaceSwitch: fires after every real project switch (restore / manual switch go through
+ *     workspace.setOnSwitch -> afterWorkspaceSwitch; demo is a virtual session and never switches
+ *     the workspace)
  *   - onClose: fires before the server closes (for resources other than timers)
  * An error inside a hook must not block the other hooks, hence the one-by-one try/catch.
  */
@@ -176,6 +178,12 @@ function createServer(opts = {}) {
 
   hub = createHub({ server: httpServer, token, bus, repo });
 
+  /**
+   * Demo is a read-only virtual session, not a seeded project: the provider owns its members,
+   * phase and messages in memory. It sees real projects only for the snapshot's project list.
+   */
+  const demo = createDemoProvider({ listProjects: () => bus.listProjectSummaries() });
+
   /* The session table needs to be able to add one more entry to the ledger (the server discovering
      on its own that "this round was cut short by the user" → task/end(cancelled), see
      flushSynthesizedCancels in sessionRegistry). The bus instance is created inside this function
@@ -217,13 +225,14 @@ function createServer(opts = {}) {
     repo,
     bus,
     initial: { workspacePath, projectName },
-    demoProject: config.DEMO_PROJECT,
     broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
   app.use('/api/v1', requireToken(token), createProductsRouter());
   /** Session dropdown: active sessions across all projects */
   app.use('/api/v1', requireToken(token), createSessionsRouter({ workspace }));
+  /** Virtual demo session (read-only; never writes office tables) */
+  app.use('/api/v1', requireToken(token), createDemoRouter({ demo }));
 
   /**
    * Council room: pick a few floors' agents and hold a meeting.
@@ -249,9 +258,8 @@ function createServer(opts = {}) {
   let info = null;
   let agentRoster = null;
 
-  // Lifecycle hooks + demo logic (see createLifecycle above and server/src/demo/).
+  // Lifecycle hooks (see createLifecycle above).
   const lifecycle = createLifecycle();
-  const demo = createDemo({ bus, repo, getRoster: () => agentRoster });
 
   /**
    * Start listening.
@@ -324,16 +332,14 @@ function createServer(opts = {}) {
     }
 
     // Resident gremlin roster: register defined subagents (project-level + user-level) as gremlins
-    // that sit at workstations wearing badges. The demo project has no directory
-    // (workspacePath === ''), so the roster lists only **user-level** agents then.
+    // that sit at workstations wearing badges.
     agentRoster = createAgentRoster({
       bus,
-      // Gremlins follow the project of "the currently open project" (no longer hardcoded to the demo
-      // project), so switching projects carries them along
-      getProject: () => workspace.current().project || config.DEMO_PROJECT,
+      // Gremlins follow the project of "the currently open project", so switching real projects
+      // carries them along. Demo is not a workspace: its members come from the in-memory provider.
+      getProject: () => workspace.current().project,
       // Only honor the **current project's** path, never fall back to "the project resolved at server
-      // start": once you switch to the demo project the room plays the demo team, and those "agents
-      // of this project" must not drift in with it.
+      // start", so agents from another project do not drift into the room.
       getWorkspacePath: () => workspace.current().workspacePath,
     });
     // Hand the roster to the bus: a summoned "defined subagent" shows busy in the office
@@ -371,11 +377,10 @@ function createServer(opts = {}) {
     lifecycle.onWorkspaceSwitch(() => {
       poller.syncAgentsNow();
     });
-    lifecycle.onWorkspaceSwitch(() => demo.onSwitch(workspace.current(), agentRoster));
     workspace.setOnSwitch(() => lifecycle.afterWorkspaceSwitch());
 
-    // Close hooks: stop non-timer resources in registration order (demo driver / hub).
-    lifecycle.onClose(() => demo.stop());
+    // Close hooks: stop non-timer resources in registration order.
+    lifecycle.onClose(() => demo.stopAll());
     // Council room: first kill the in-flight participant processes (SIGTERM → SIGKILL), then record
     // an ending for each meeting still in flight. It sits before hub.close() —— the wrap-up still has
     // to broadcast one last state to clients.
@@ -388,16 +393,11 @@ function createServer(opts = {}) {
     });
     lifecycle.onClose(() => { try { hub.close(); } catch {} });
 
-    // The roster's ground truth is "defined" (the demo reconciliation uses it): the poller's first
-    // tick already ran it (poller.start() runs after workspace.restore()), so the demo prep goes here.
-    demo.onSwitch(workspace.current(), agentRoster);
-
     if (!opts.silent) {
       log.info(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
       if (!token) log.warn('[workgremlin] 已关闭 token 校验（--no-token，仅调试用）');
       const cur = workspace.current();
-      if (cur.demo) log.info('[workgremlin] 当前：演示工程');
-      else log.info(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
+      log.info(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
     }
     return info;
   }

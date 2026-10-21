@@ -371,17 +371,18 @@ The old "poll as a fallback" path, which also set a separate trust flag, does no
 
 ### 3.7 Demo mode
 
-Demo mode is a **UI action**, not a CLI flag. The HUD "演示模式" button calls `POST /api/v1/workspace` with an empty path (or `demo`), which opens the isolated demo project and seeds it on demand; "退出演示" returns to the previous project. `syncDemo` also starts a ticker so the demo moves. The generator is deterministic per seed and supports `WORKGREMLIN_DEMO_FIXED_TS=1` for snapshot-stable absolute timestamps.
+Demo mode is a **UI action**, not a CLI flag. The HUD "演示模式" button calls `POST /api/v1/demo/session {floor}`; the server returns a normal snapshot for the virtual project `__demo__` and session `__demo__:session`, built entirely in memory. The renderer injects that session into the ordinary floor/session table, merges it back after every `/sessions` refresh, and polls `GET /api/v1/demo/session` for the server-owned phase / member state. Switching floors or selecting a real session exits; there is no demo row in any office table.
 
 | ID | Case | Assertion |
 | --- | --- | --- |
-| DEMO-01 | Single entry point | Demo starts only from the HUD action / `POST /api/v1/workspace {path:''}`. Negative: there is no `--demo`, `MOCK=1` or `WORKGREMLIN_DEMO=1` startup switch |
+| DEMO-01 | Single entry point | Demo starts only from the HUD action / `POST /api/v1/demo/session`. Negative: empty / `'demo'` workspace paths are rejected, and there is no `--demo`, `MOCK=1` or `WORKGREMLIN_DEMO=1` startup switch |
 | DEMO-02 | Zero external dependencies | No real agent, network or watched directory is required; office and cards render within 3 s |
-| DEMO-03 | Determinism | The same seed produces identical members, tasks, messages and relative timestamps; `WORKGREMLIN_DEMO_FIXED_TS=1` makes absolute timestamps stable for DOM snapshots |
-| DEMO-04 | Isolation | The demo project has its own rows; exit restores the previous project; no demo member, task or message leaks into a real project |
-| DEMO-05 | Same components | Demo and real data use the same components and `data-testid` selectors; switching the source does not change DOM structure |
-| DEMO-06 | Coverage | Demo data covers all three states (`busy` / `idle` / `blocked`), includes at least one ephemeral ghost and one error-level message, and ≥ 200 messages |
-| DEMO-07 | Clear labeling | UI shows `演示模式`; the session dropdown has exactly one entry, `演示工程 · 演示会话`; leaving is only via `退出演示` |
+| DEMO-03 | Deterministic content / live phase | Roster, tasks and 220 messages come from static demo data; the phase timeline is owned by the server provider. A browser poll must not invent a phase locally |
+| DEMO-04 | Isolation | Starting demo writes zero rows to `projects` / `members` / `tasks` / `messages` / `task_runs`; `GET /snapshot` remains the real project; the renderer keeps the real project / members / task records / conversation in the project store, with only the office views reading the demo member list; exit restores the previous session |
+| DEMO-05 | Same components | Demo member cards carry the normal project / client / session fields, so the ordinary floor + session filters, workstation cards and sprites are used without demo branches |
+| DEMO-06 | Coverage | Demo data covers `busy` / `idle` / `blocked`, includes ephemeral ghosts, and ≥ 200 messages |
+| DEMO-07 | Clear labeling / lifecycle | The dropdown shows a normal translated `演示工程 · 演示会话` entry; the ticker adds one frontend-only `HH:mm floor 演示会话(phase)` line; switching floors or selecting a real session exits; a `/sessions` refresh cannot evict the virtual session; a server restart (404) exits cleanly |
+| DEMO-08 | Real tasks untouched | `/task-feed` and real task rows remain unchanged; demo adds no task record and no ended-task ticker announcement |
 
 ### 3.8 Native-module build verification (electron-rebuild / better-sqlite3) — M0 highest risk
 
@@ -736,7 +737,7 @@ Real CLI output formats can only be learned by running them. The 2026-10-01 smok
 | Message list / record view | R1 + SPIKE-01–08 (when implemented) + MS-03/05/06 + RT-03 |
 | SQLite schema / migration / retention | R2 + DB-01–DB-16 on all platforms |
 | Electron version / native module / packaging config | R3 + native matrix + `npm run db:check` in the packaged app |
-| Demo generator / fixture | R1 + DEMO-01–07 + every renderer suite (demo is a default data source) |
+| Demo provider / fixture | R1 + DEMO-01–08 + `test:demo`, `test:demo-lifecycle` |
 | Docs / style only | R0 |
 
 ---
@@ -843,8 +844,8 @@ Real CLI output formats can only be learned by running them. The 2026-10-01 smok
 
 ## 8. Test data and mock strategy
 
-1. **Synthetic team generator:** default 4 members (leader / researcher / coder / tester), scalable to 16 / 64 for layout and pressure tests. The demo generator already provides a fixed roster plus two ephemeral ghosts (`ghost-*`).
-2. **Demo seed data:** `syncDemo` seeds on demand; `WORKGREMLIN_DEMO_FIXED_TS=1` freezes absolute timestamps; same seed → identical members, tasks, messages. Demo data covers `busy` / `idle` / `blocked`, at least one ghost and ≥ 200 messages.
+1. **Synthetic team generator:** default 4 members (leader / researcher / coder / tester), scalable to 16 / 64 for layout and pressure tests. The demo provider already supplies a fixed roster plus two ephemeral ghosts (`ghost-*`).
+2. **Demo data:** the read-only provider (`server/src/demo/provider.js`) builds the virtual project / session / members / messages in memory on every request; nothing is seeded into the database. Roster and task data are static, messages use a fixed PRNG seed, and the session phase follows a fixed server-owned timeline. Demo data covers `busy` / `idle` / `blocked`, at least one ghost and ≥ 200 messages.
 3. **Event-stream generator:** parameterized `{ rate, duration, outOfOrderRatio, duplicateRatio, dropRatio, burst, seed }`, emitting JSONL for L3/L5 — **planned**; today suites construct rows and requests inline.
 4. **Golden snapshots:** DOM snapshots of the office and message list under a fixed event stream; they require deterministic ordering (MS-03), a fake clock and a demo seed, otherwise they are flaky.
 5. **WS mock:** supports disconnect, half-frame, out-of-order and replay for DS-08/DS-09; currently tests use the real server on a random port plus forced socket close.
@@ -885,7 +886,7 @@ PRs run stage-1–2; main adds stage-3; release triggers stage-4–5. Until the 
 | R3 | 100k-message performance requires a rewrite | M2 rework | Virtual-list spike at M1 kickoff (§3.9.1) | Open (not started) |
 | R4 | Sleep / clock-jump tests are unreliable in CI | DS-08 / SC-16 flaky | Fake clock + an injectable skew switch (planned 7.12); real sleep manual only | Open |
 | R5 | Native module ABI mismatch (better-sqlite3 × Electron) | M0 blocker; all DB work unavailable | §3.8 matrix + `npm run rebuild:native` + explicit escalation; no silent fallback | **Highest priority** |
-| R6 | Demo data not deterministic | L2 snapshots flaky | DEMO-03 seed determinism + `WORKGREMLIN_DEMO_FIXED_TS=1` | Mitigated |
+| R6 | Demo data not deterministic | L2 snapshots flaky | DEMO-03: static roster/tasks + fixed message seed + server-owned phase timeline in the virtual provider | Mitigated |
 | R7 | macOS / Windows runners are expensive | Cross-platform issues found late | Run the matrix at least nightly; mandatory before release | Open |
 | R8 | Redaction misses a secret (false negative) | Plaintext on disk = S1 | Three-layer verification + rule regression + ≥ 2 positives per class; feature not implemented yet | **P0, blocked** |
 | R9 | Redaction harms normal code/logs (false positive) | Usability damage | SEC-08 fixed 200-item clean corpus, ≤ 0.5% gate; feature not implemented yet | **P0, blocked** |

@@ -11,6 +11,7 @@ import WorkstationCard from '../components/WorkstationCard.vue';
 import ConnectionBar from '../components/ConnectionBar.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
+import { useDemoStore } from '../stores/demo';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
@@ -33,7 +34,10 @@ const emit = defineEmits(['select', 'toggle-fullscreen']);
 
 const project = useProjectStore();
 const sessions = useSessionStore();
+const demo = useDemoStore();
 const mainAgent = useMainAgentStore();
+/** Demo owns only the office roster; project data (task records, messages, workspace) stays real. */
+const sourceMembers = computed(() => (demo.active ? demo.members : project.members));
 const { t } = useI18n();
 const wrapRef = ref(null);
 const canvasRef = ref(null);
@@ -132,7 +136,7 @@ function clearMTip() {
 }
 
 const mtipMember = computed(() =>
-  mtip.value.id ? project.members.find((m) => m.memberId === mtip.value.id) : null
+  mtip.value.id ? sourceMembers.value.find((m) => m.memberId === mtip.value.id) : null
 );
 /**
  * Task text: an ephemeral member (ghost) is a string, a workstation gremlin is { title }.
@@ -146,7 +150,7 @@ const mtipTask = computed(() => {
   if (!m) return '';
   // The "current task" definition matches the workstation card (see lib/memberTask.summonTaskTitle): when the gremlin itself has no running task,
   // borrow the same-named ghost dispatched by this summon (only while it really is running) —— the same implementation as the workstation card.
-  return summonTaskTitle(m, project.members, sessions.selectedSessionId);
+  return summonTaskTitle(m, sourceMembers.value, sessions.selectedSessionId);
 });
 /** The most recent completed result (recorded by the engine when the report animation finishes) */
 const mtipResult = computed(() => (mtip.value.id && office ? office.lastResult(mtip.value.id) : null));
@@ -321,7 +325,7 @@ const consoleBase = computed(() => {
 /**
  * Subagents currently doing work for the main agent (the ghosts floating in the office).
  *
- * This reads project.members directly and **does not reuse sceneMembers below** ——
+ * This reads the same member source as sceneMembers below but **does not reuse sceneMembers** ——
  * the consoleLive watch evaluates once during setup, when sceneMembers is not initialized yet (TDZ).
  * The filter definition stays consistent with sceneMembers (see liveSubagents): only ephemeral
  * members (ghosts) count, and they are scoped to the selected floor and session. Without the
@@ -329,7 +333,7 @@ const consoleBase = computed(() => {
  */
 const busySubagents = computed(() => {
   if (sessions.floorEmpty || !sessions.live) return [];
-  return busySubagentsOf(project.members, {
+  return busySubagentsOf(sourceMembers.value, {
     client: sessions.selectedClient,
     sessionId: sessions.selectedSessionId,
   });
@@ -351,7 +355,7 @@ const consoleLive = computed(() => {
       phase: 'waiting',
       action: t('console.waiting_subs', { names }),
       context: subs.slice(0, 3).map((m) => {
-        const task = summonTaskTitle(m, project.members, sessions.selectedSessionId);
+        const task = summonTaskTitle(m, sourceMembers.value, sessions.selectedSessionId);
         return task ? `${m.name}：${task}` : t('console.sub_running', { name: m.name });
       }),
       target: null,
@@ -405,13 +409,6 @@ let trackSince = PAGE_OPEN_AT;
 watch(
   consoleLive,
   (v) => {
-    // Demo mode: the console is **owned exclusively by the demo script**; real sessions never take part.
-    // Without this guard, the real session selected in the dropdown feeds its phase in every 1.5s (usually "standby" during a demo),
-    // and the script is pushed back right after one step —— the very symptom of "clicked demo mode, main Agent state does not change".
-    if (project.demo) {
-      if (!mainAgent.auto) startDemoScript();
-      return;
-    }
     const sel = sessions.selected;
     const selId = sel ? sel.id : null;
     // The done marker has two sources; take the **newer** one: ① the session snapshot's doneAt (one per 10s, present on every floor;
@@ -451,9 +448,9 @@ watch(
         return;
       }
       mainAgent.applySession(v);
-      // During a demo, do not let a session drag the project away: a demo is entered and exited explicitly by the user (the HUD button), while "auto-follow new session"
-      // could well insert a real session right while watching a demo —— it would drag away and the demo would break on the spot.
-      if (!project.demo && sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
+      // A real session can switch the viewed project. The virtual demo session has no
+      // projectPath, so demo mode never triggers this path.
+      if (sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
         project.openWorkspace(sel.projectPath);
       }
       return;
@@ -589,10 +586,6 @@ let cardRaf = 0;
 // (setMainAgent), so placing another one in the workstation area would be a duplicate. So it is excluded from the workstation roster,
 // leaving only true subagent gremlins (including resident members registered by the scanner) at workstations.
 const sceneMembers = computed(() => {
-  // Demo mode overrides both the floor / session filters: demo members' active state is maintained by the server's driver
-  // and has nothing to do with "which real session is selected in the dropdown". Without this special case,
-  // the demo gremlins would lose their active states whenever the selected floor had no real session.
-  const demo = project.demo;
   /**
    * How to handle an empty floor (no active session on this floor) —— two categories:
    *   · Ghosts (`subagent-<name>`) are not kept: they are session-level ephemeral members, the product of "this round's summon",
@@ -601,13 +594,15 @@ const sceneMembers = computed(() => {
    *     "present even when not currently summoned", unrelated to whether this floor has a session.
    *     Not seeing them after switching would make people think this floor has nobody at all (with no session on 1F, user-level/project-level experts should still be at their workstations).
    */
-  const emptyFloor = sessions.floorEmpty && !demo;
-  const want = demo ? '' : sessions.selectedClient;
-  const wantSession = demo ? '' : sessions.selectedSessionId;
+  const emptyFloor = sessions.floorEmpty;
+  // The virtual demo session behaves exactly like a real one here: its members carry the floor
+  // client and the demo session id, so the ordinary floor / session filters select them.
+  const want = sessions.selectedClient;
+  const wantSession = sessions.selectedSessionId;
   // Gremlins are assigned to floors by agent base name: the CLI and plugin forms belong to the same floor (1F CodeBuddy is merged this way),
   // so a resident gremlin is placed as long as its base name matches. floorAcceptsClient strips -plugin internally before comparing base names.
-  const live = demo || sessions.live;
-  return project.members
+  const live = sessions.live;
+  return sourceMembers.value
     .filter((m) => m.role !== 'agent')
     .filter((m) => !(emptyFloor && isEphemeralMember(m))) // Empty floor: keep only resident ones
     // Filter the source by client (product / floor identifier): 3F sees only Codex, 1F only CodeBuddy.
@@ -619,7 +614,7 @@ const sceneMembers = computed(() => {
     // Resident gremlins (role=subagent but not ephemeral) have no sessionId and are shared floor-wide, so they must not be filtered out by this.
     // Ghosts with an empty sessionId (old store / manual scripts) are passed through too, rather than hiding every ghost.
     .filter((m) => !isEphemeralMember(m) || !wantSession || !m.sessionId || m.sessionId === wantSession)
-    .map((m) => (live ? memberForSession(m, wantSession, project.members) : { ...m, state: 'idle', tasks: [], sessionStatuses: [] }))
+    .map((m) => (live ? memberForSession(m, wantSession, sourceMembers.value) : { ...m, state: 'idle', tasks: [], sessionStatuses: [] }))
     .map((m) => ({
       memberId: m.memberId,
       name: m.name || String(m.memberId || '').split('@')[0],
@@ -666,7 +661,7 @@ watch(mainAgentState, (v) => office && office.setMainAgent(v));
 const card = ref(null);
 let lastOpen = 0;
 
-const cardMember = computed(() => (card.value ? project.members.find((m) => m.memberId === card.value.memberId) : null));
+const cardMember = computed(() => (card.value ? sourceMembers.value.find((m) => m.memberId === card.value.memberId) : null));
 
 function updateCardPos() {
   if (!card.value || !office || !wrapRef.value) return;
@@ -694,51 +689,14 @@ function closeCard() {
   card.value = null;
 }
 
-/* ------------------------------ When the demo script starts ------------------------------
- * The main console's SCRIPT (see stores/mainAgent.js) is **demo data** and must only run in demo mode.
- * With the real data source (the default) the first screen should be standby: with no session and no hook wired up, there is no non-null
- * applySession / setLiveState to take over, so the script loops "refactor the user login module" on its own
- * and the fake state is never replaced —— a new device hits this on first launch (the office is empty, yet the screen performs).
- *
- * Two details:
- *   1) project.demo is **fetched asynchronously** (App.vue calls project.init() in the parent's onMounted,
- *      while the child mounts first), so what onMounted reads is often still false —— the real start is left to the watch below;
- *   2) When real data is already driving, do not grab the wheel (live / hookLive).
- */
-function startDemoScript() {
-  if (mainAgent.auto) return; // Already performing; do not wind progress back to step one
-  // During a demo the console belongs to the script: live / hookLive must be cleared first, otherwise the script cannot start / is pushed back by a real session right away.
-  // Prefer the store's startDemo(); during hot reload the page may still hold the pre-change store instance (without that action),
-  // so clear the flags in place then start() —— "HMR did not swap in the action" must not turn into the console throwing once every 1.5s.
-  if (typeof mainAgent.startDemo === 'function') {
-    mainAgent.startDemo();
-    return;
-  }
-  mainAgent.live = false;
-  mainAgent.hookLive = false;
-  mainAgent.liveMember = null;
-  mainAgent.start();
-}
-
-/** Only start performing after the server confirms it is currently on the demo project (including the case where "was last on the demo project" is restored);
- *  on exiting the demo, take down the script and hand the console back to real sessions (the real phase is taken over immediately by the watch above). */
-watch(
-  () => project.demo,
-  (v) => {
-    if (v) startDemoScript();
-    else if (mainAgent.auto) mainAgent.enterIdle();
-  }
-);
-
 /* ------------------------------ HUD ------------------------------ */
 
-/** Demo mode toggle (the button in the HUD, before the meeting call): switch into / out of the demo project */
+/** Demo mode toggle: start / stop the read-only virtual session on the current floor. */
 async function toggleDemo() {
   try {
-    if (project.demo) await project.exitDemo();
-    else await project.enterDemo();
+    await demo.toggle(sessions.selectedFloor);
   } catch (err) {
-    // If the switch fails (directory gone / server refused), the view must not crash: stay as-is, just log one line
+    // If the switch fails (unknown floor / server refused), the view must not crash: stay as-is, just log one line
     console.warn('[workgremlin] 切换演示模式失败：', err && err.message);
   }
 }
@@ -763,8 +721,6 @@ onMounted(() => {
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);
-  // Do not start() outside demo mode: stay on standby, waiting for real sessions / hook phases to take over (see the comment on startDemoScript)
-  if (project.demo) startDemoScript();
   startPhasePoll();
 
   const loop = () => {
@@ -776,8 +732,6 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(cardRaf);
-  // Only stop() when the demo script is running: stop() lights a "paused" summary, so don't fire it otherwise
-  if (mainAgent.auto) mainAgent.stop();
   stopPhasePoll();
   if (office) office.destroy();
   office = null;
@@ -852,22 +806,21 @@ onBeforeUnmount(() => {
       :style="{ left: `${card.left}px`, top: `${card.top}px` }"
       @click.stop
     >
-      <WorkstationCard :member="cardMember" :members="project.members" :session-id="sessions.selectedSessionId" />
+      <WorkstationCard :member="cardMember" :members="sourceMembers" :session-id="sessions.selectedSessionId" />
       <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 
     <!-- HUD -->
     <div class="hud" @click.stop>
-      <!-- Demo mode: switch to the demo project (the main console performs a round automatically, gremlins become demo members).
-           Placed on the office's own action bar, before the meeting call —— it switches "this machine in the office",
-           the same class of action as meeting call / everyone back to desk, and takes no top-bar tab. -->
+      <!-- Demo mode: start / stop the read-only virtual session on this floor. It behaves like a
+           normal session for the dropdown, member cards and sprites. -->
       <button
         class="demo-btn"
-        :class="{ on: project.demo }"
-        :title="project.demo ? t('office.exit_demo_title') : t('office.demo_title')"
+        :class="{ on: demo.active }"
+        :title="demo.active ? t('office.exit_demo_title') : t('office.demo_title')"
         @click="toggleDemo"
       >
-        {{ project.demo ? t('office.exit_demo') : t('office.demo') }}
+        {{ demo.active ? t('office.exit_demo') : t('office.demo') }}
       </button>
       <button @click="callAll">{{ t('office.meeting') }}</button>
       <button @click="dismiss">{{ t('office.back_to_desk') }}</button>

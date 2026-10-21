@@ -17,7 +17,10 @@
  *
  * Project management: one workspace = one project: opening a project shows that project's members
  * in the office (including its subagent ghosts). The choice is persisted to
- * ~/.workgremlin/workspaces.json and restored on restart; demo data is an item you can switch back to.
+ * ~/.workgremlin/workspaces.json and restored on restart.
+ *
+ * Demo mode is deliberately **not** a workspace: it is an in-memory virtual session (see
+ * server/src/demo/provider.js), so opening / restoring a real project never touches demo rows.
  *
  * Why open manually: the office (members / gremlins / ghosts) aggregates **by project**, so you see
  * whichever project is open. Subagent ghosts now write straight to the DB (an ephemeral member +
@@ -29,7 +32,6 @@ const os = require('node:os');
 const path = require('node:path');
 const { WS_EVENTS } = require('@workgremlin/shared');
 const { workspacesPath } = require('@workgremlin/shared/paths');
-const config = require('./config');
 
 /* ============================ Project name resolution ============================ */
 
@@ -116,21 +118,19 @@ function expand(p) {
 
 /**
  * @param {{repo: any, bus: any, initial?: {workspacePath?: string, projectName?: string},
- *          demoProject?: string, broadcast?: (project: string|null, type: string, payload: unknown) => void}} opts
+ *          broadcast?: (project: string|null, type: string, payload: unknown) => void}} opts
  */
 function createWorkspaceManager(opts) {
   const repo = opts.repo;
   const bus = opts.bus;
-  const demoProject = opts.demoProject || config.DEMO_PROJECT;
   const initial = opts.initial || {};
   const broadcast = opts.broadcast || (() => {});
 
-  /** @type {{workspacePath: string, projectName: string, project: string|null, demo: boolean}} */
+  /** @type {{workspacePath: string, projectName: string, project: string|null}} */
   let current = {
     workspacePath: initial.workspacePath || '',
     projectName: initial.projectName || '',
     project: null,
-    demo: false,
   };
   let recent = [];
   /** Callback after a project switch (index.js uses it to restart subagent manifest watching) */
@@ -179,15 +179,8 @@ function createWorkspaceManager(opts) {
       bus.ensureProject(id, abs, null, 'report');
       row = repo.getProject.get(id);
     }
-    current = { workspacePath: abs, projectName, project: row.id, demo: false };
+    current = { workspacePath: abs, projectName, project: row.id };
     pushRecent({ path: abs, projectName, project: row.id, openedAt: Date.now() });
-    return apply();
-  }
-
-  /** Switch to the demo project (does not delete real data in the DB, it only switches the view to the demo project) */
-  function openDemo() {
-    bus.ensureProject(demoProject, '', null, 'report');
-    current = { workspacePath: '', projectName: config.DEMO_PROJECT_NAME, project: demoProject, demo: true };
     return apply();
   }
 
@@ -216,19 +209,16 @@ function createWorkspaceManager(opts) {
    * Restore the last opened project at startup; if that directory is gone, fall back to the
    * project resolved at startup (cwd / --workspace).
    *
-   * About the demo project: **only the persisted history counts here**, there is no longer such a
-   * thing as "start into demo" —— demo mode is toggled from the UI instead (see syncDemo in
-   * server/src/index.js). If the user last clicked "demo mode" himself, this startup returns to
-   * the demo project as usual (just like returning to any other project); if no project was ever
-   * opened, fall back to the project resolved at startup rather than forcing demo data in.
+   * Demo is never restored: it is ephemeral by design (the provider state disappears with the
+   * server / page). Older stores may still say `demo: true`; ignore that and fall back to the
+   * project resolved at startup.
    */
   function restore() {
     const store = readStore();
     if (store) recent = Array.isArray(store.recent) ? store.recent : [];
     const saved = store && store.current;
-    if (!saved) return openInitial();
+    if (!saved || saved.demo) return openInitial();
     try {
-      if (saved.demo) return openDemo();
       const savedPath = saved.workspacePath || saved.path;
       if (savedPath) return open(savedPath);
     } catch {
@@ -241,7 +231,6 @@ function createWorkspaceManager(opts) {
     current: () => ({ ...current }),
     recent: () => recent.slice(),
     open,
-    openDemo,
     restore,
     setOnSwitch: (fn) => {
       onSwitch = fn;

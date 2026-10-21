@@ -80,6 +80,42 @@ head('同一层里秒级相邻的会话：label 必须互不相同');
   ok('没有这一层时返回空数组，不炸', Array.isArray(s.options) && s.options.length === 0);
 }
 
+head('虚拟演示会话：每次 /sessions 更新后重新注入');
+{
+  setActivePinia(createPinia());
+  const s = useSessionStore();
+  const real = { id: 'real-1', sessionId: 'real-session-1', floor: '1F', project: 'wg', source: 'cli', live: true, mine: true };
+  const demo = {
+    id: '__demo__:session',
+    sessionId: '__demo__:session',
+    floor: '1F',
+    project: '演示工程',
+    source: 'demo',
+    live: true,
+    mine: true,
+  };
+  const snapshot = () => ({
+    ok: true,
+    floors: [{ id: '1F', name: 'CodeBuddy', installed: true, activeCount: 1, sessions: [{ ...real }] }],
+    sessions: [{ ...real }],
+    defaultFloor: '1F',
+  });
+  s.applySnapshot(snapshot());
+  s.select(real.id);
+  s.setVirtualSession(demo);
+  s.select(demo.id);
+  ok('注入后 dropdown 里有演示会话', s.options.some((o) => o.value === demo.id));
+  ok('演示会话使用翻译后的标签，不暴露内部 id', s.options.find((o) => o.value === demo.id).label !== demo.id);
+  s.applySnapshot(snapshot());
+  ok('普通 /sessions 刷新后演示会话仍在', s.options.some((o) => o.value === demo.id));
+  ok('刷新后仍然选中演示会话', s.selectedId === demo.id);
+  s.select(real.id);
+  ok('选真实会话后演示项仍作为普通选项存在', s.options.some((o) => o.value === real.id));
+  s.removeVirtualSession();
+  ok('退出演示后虚拟会话被移除', !s.options.some((o) => o.value === demo.id));
+  ok('退出演示后已选中的演示 id 被清空', s.selectedId !== demo.id);
+}
+
 await server.close();
 console.log(`\n${fail ? '✗' : '✓'} session-options: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

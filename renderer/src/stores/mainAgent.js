@@ -1,28 +1,11 @@
 /**
  * mainAgent.js —— state of the main Agent (Craft Agent).
  *
- * Right now it runs a mock: it plays the SCRIPT step by step to get the console's three
- * layers and five visual states built out first. When the real hook is wired up later,
- * just swap advance/apply for event-driven updates:
- *   standby     ← no active events for a while
- *   running     ← PreToolUse / PostToolUse (the second layer writes things like "reading xxx.js")
- *   dispatching ← a subagent is detected being summoned (the third layer writes "delegated: xxx", target points at that workstation)
+ * The console is driven by the selected session / hook data. The old in-browser demo SCRIPT was
+ * removed: demo mode now gets its phase, action and context from the server's read-only provider,
+ * exactly like a real session (see stores/demo.js and server/src/demo/provider.js).
  *
  * Phase values live in PHASES in iso/mainConsole.js.
- *
- * Today's tweaks:
- *   1) While thinking, the screen's third layer pins the received prompt text to the very front;
- *   2) If a tool call is Bash/Shell-like: **no longer** treated as await (waiting for authorization) —— the plugin sends
- *      neither a "waiting for authorization" notification nor an "authorization finished" one, and command-like tools send
- *      no PostToolUse either, so once marked await nothing can ever clear it (you hit run and it keeps showing "waiting for authorization").
- *      Now the server always reports tool (tool call + actual command), and the render layer no longer swaps the wording by tool name:
- *      the screen's first line and the tooltip's first line both say "tool call" (see
- *      consolePhaseLabel in iso/mainConsole.js), the action stays the actual command, and the two never bleed into each other;
- *   3) When the session stops (setLiveState/applySession receives null, or a manual stop), first show
- *      a "task complete / paused" summary for 10s; if no new events arrive, fall back to standby (idle).
- *   4) 2026-10-01: the demo script no longer plays "planning"; the "paused" that `stop()` shows no longer borrows
- *      the summarize ("summarizing") phase —— those two phases never occur on the real thing, so they were removed
- *      from PHASES (see iso/mainConsole.js). Pausing is now just "standby + the action line reading 'paused'".
  */
 
 import { defineStore, acceptHMRUpdate } from 'pinia';
@@ -31,35 +14,12 @@ import { defineStore, acceptHMRUpdate } from 'pinia';
 import { PHASES, consolePhaseLabel } from '../iso/mainConsole';
 import { t } from '../i18n/index.js';
 
-/** Demo script for one main session round: phase / second-layer action / third-layer context / dwell time / dispatch target workstation */
-const SCRIPT = [
-  { phase: 'idle', action: '', context: ['等待派单'], skill: '', tool: '', prompt: '', ms: 6000 },
-  { phase: 'thinking', action: '正在分析你的请求', context: ['任务：重构用户登录模块', '思考：先理清登录链路'], skill: 'reasoning（推理）', tool: '', prompt: '请帮我重构用户登录模块，先理清登录链路', ms: 4200 },
-  { phase: 'tool', action: '正在读取 src/main.js', context: ['任务：重构用户登录模块', '进度：已读取 1 个文件'], skill: '', tool: 'mcp: filesystem.read_file', prompt: '', ms: 3800 },
-  { phase: 'tool', action: '正在搜索 login 相关引用', context: ['任务：重构用户登录模块', '进度：已读取 3 个文件', '命中：7 处引用'], skill: '', tool: 'mcp: ripgrep.search', prompt: '', ms: 3800 },
-  { phase: 'tool', action: '执行构建脚本', context: ['任务：重构用户登录模块', '进度：跑 npm run build'], skill: '', tool: 'bash: npm run build', prompt: '', ms: 4000 },
-  { phase: 'dispatch', action: '正在召唤 Coder 专家', target: 'A1', context: ['任务：重构用户登录模块', '委托：Coder 改写登录逻辑'], skill: 'delegate（委托专家）', tool: '', prompt: '', ms: 5200 },
-  { phase: 'tool', action: '正在读取 src/auth/session.js', context: ['任务：重构用户登录模块', '进度：已读取 5 个文件'], skill: '', tool: 'mcp: filesystem.read_file', prompt: '', ms: 3600 },
-  { phase: 'dispatch', action: '正在召唤 Tester 专家', target: 'B1', context: ['任务：重构用户登录模块', '委托：Tester 补登录用例'], skill: 'delegate（委托专家）', tool: '', prompt: '', ms: 4800 },
-  { phase: 'await', action: '申请写入 renderer/vite.config.js', target: 'renderer/vite.config.js', context: ['等待用户授权后继续', '原因：修改构建基路径 base'], skill: '', tool: 'mcp: filesystem.write_file', prompt: '', ms: 5000 },
-  { phase: 'done', action: '任务完成', context: ['任务：重构用户登录模块', '已交付：登录链路重构', '改动 3 个文件'], skill: '', tool: '', prompt: '', ms: 5000 },
-];
-
-// Command-like tools (Bash / Shell / terminal …) no longer add a "needs authorization" hint: it goes neither into
-// context nor into the phase wording (see consolePhaseLabel) —— writing it into context would leak onto "task
-// complete" via enterDone's "reuse the last context".
-
-/** The timer lives outside the store: it isn't "state", and there's no need to put it in devtools */
-let timer = null;
+/** The wrap-up timer lives outside the store: it isn't "state", and there's no need to put it in devtools */
 let stopTimer = null;
 
 export const useMainAgentStore = defineStore('mainAgent', {
   state: () => ({
-    idx: 0,
-    /** true = the demo script is auto-advancing. **Off by default**: the demo script only runs when the view explicitly start()s it in demo mode
-     *  (see startDemoScript in IsoOfficeView); with a real data source the first screen should sit at standby and wait for the session / hook to take over. */
-    auto: false,
-    /** true = state comes from a real session (persisted by the plugin, phase is inferred), so the mock does not advance */
+    /** true = state comes from a real / demo session (persisted by the server, phase is inferred) */
     live: false,
     /** true = currently driven by live hook reports (the reporter sends busy/idle/blocked to the server) */
     hookLive: false,
@@ -84,80 +44,10 @@ export const useMainAgentStore = defineStore('mainAgent', {
   },
 
   actions: {
-    /** Copy step i of the script onto state */
-    apply(i = this.idx) {
-      this.idx = ((i % SCRIPT.length) + SCRIPT.length) % SCRIPT.length;
-      const step = SCRIPT[this.idx];
-      this.phase = step.phase;
-      this.action = step.action || '';
-      this.skill = step.skill || '';
-      this.tool = step.tool || '';
-      // Point 2: in the mock, if a tool is Bash/Shell-like (`bash: npm run build`), the phase stays tool
-      // and the wording stays "tool call" (no more swapping in "needs authorization" by tool name); context stays as-is.
-      this.context = step.context || [];
-      this.target = step.target || null;
-      this.prompt = step.prompt || '';
-    },
-
-    /** Schedule the next step after the current step's dwell time (nothing scheduled while paused) */
-    advance() {
-      clearTimeout(timer);
-      timer = null;
-      if (!this.auto) return;
-      timer = setTimeout(() => {
-        this.apply(this.idx + 1);
-        this.advance();
-      }, SCRIPT[this.idx].ms);
-    },
-
-    start() {
-      this.auto = true;
-      this.apply();
-      this.advance();
-    },
-
-    /**
-     * Demo mode: **take the console back** and hand it to the script.
-     *
-     * This is where it differs from start(): live / hookLive must be cleared first. Those two flags mean
-     * "a real session is taking over" —— during a demo the dropdown usually still has a real session selected,
-     * and the fast poll feeds its phase in every 1.5s (during a demo that's usually "standby"), so:
-     *   ① startDemoScript() is blocked by live and the script never starts;
-     *   ② even if it starts, the next step is immediately overridden by that real session's phase.
-     * The symptom is "you click demo mode and the main Agent sits at standby without moving". Once things are cleared, the script plays all the way through.
-     */
-    startDemo() {
-      this.live = false;
-      this.hookLive = false;
-      this.liveMember = null;
-      clearTimeout(stopTimer);
-      stopTimer = null;
-      this.start();
-    },
-
-    /** Stop the mock manually: first show a "paused" summary, then fall back to standby after 10s */
-    stop() {
-      this.auto = false;
-      clearTimeout(timer);
-      timer = null;
-      this.enterPause(t('console.paused'));
-    },
-
-    /** Advance one step manually (clickable while paused too, to inspect the phases one by one) */
-    next() {
-      this.apply(this.idx + 1);
-      if (this.auto) this.advance();
-    },
-
-    setAuto(v) {
-      if (v) this.start();
-      else this.stop();
-    },
-
     /**
      * Drive the main console from the member card reported live by the reporter hook. When the hook sends
      * no event, s is null; if the hook was driving before, first show a "task complete" summary for 10s,
-     * then fall back to standby (not straight back to the script).
+     * then fall back to standby.
      *
      * Phase mapping (hook's AGENT_STATES -> main console PHASES):
      *   busy    -> tool  (tool call / working)
@@ -184,9 +74,6 @@ export const useMainAgentStore = defineStore('mainAgent', {
         this.liveMember = null;
         return;
       }
-      this.auto = false;
-      clearTimeout(timer);
-      timer = null;
       this.hookLive = true;
       this.liveMember = s;
       // s.phase is already a UI phase (thinking / tool / await / idle …) or a raw hook state (busy / blocked).
@@ -236,22 +123,18 @@ export const useMainAgentStore = defineStore('mainAgent', {
 
     /**
      * Session takeover: once a session is selected in the dropdown, the console shows **that session's** state.
-     * The source of truth is the plugin's persisted data, and the phase is derived from runtime + todos + file changes (inferred),
-     * so the mock's auto-advance has to stop and not fight the real data. When the session is cancelled (s=null):
-     * first show a "task complete" summary for 10s, then fall back to standby.
-     * @param {null|{phase?:string, action?:string, context?:string[], prompt?:string}} s session; null = hand back to the demo script
+     * The source of truth is the plugin's persisted data, and the phase is derived from runtime + todos + file changes (inferred).
+     * When the session is cancelled (s=null): first show a "task complete" summary for 10s, then fall back to standby.
+     * @param {null|{phase?:string, action?:string, context?:string[], prompt?:string}} s session; null = the session ended
      */
     applySession(s) {
       if (!s) {
-        if (!this.live) return; // the script is already running, don't interrupt
+        if (!this.live) return;
         this.live = false;
         // Session cancelled: show the "task complete" summary (reusing the last context), then fall back to standby after 10s
         this.enterDone(t('console.done_wait'), this.context && this.context.length ? this.context.slice() : [t('console.this_task_done')]);
         return;
       }
-      this.auto = false;
-      clearTimeout(timer);
-      timer = null;
       this.live = true;
       // done/cancelled are not set directly: switching back to a session, consoleBase feeds back
       // {phase:'done'} from sel.taskState='done', and setting it directly would skip stopTimer → stuck on "task complete" forever.
@@ -290,7 +173,7 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
 
     /**
-     * The common part of the wrap-up phases (both done / cancelled go here): stop the mock, clear the tool name and prompt,
+     * The common part of the wrap-up phases (both done / cancelled go here): clear the tool name and prompt,
      * show for 10s then fall back to standby.
      * The wrap-up phase clears the tool name along with the prompt: this round is over, so don't leave the previous round's tool name in state.
      * @param {'done'|'cancelled'} phase wrap-up phase
@@ -319,9 +202,6 @@ export const useMainAgentStore = defineStore('mainAgent', {
      * @param {string[]} [context] the text shown on the screen's third layer while on standby
      */
     enterIdle(context = []) {
-      this.auto = false;
-      clearTimeout(timer);
-      timer = null;
       clearTimeout(stopTimer);
       stopTimer = null;
       this.live = false;
@@ -359,8 +239,6 @@ export const useMainAgentStore = defineStore('mainAgent', {
     },
   },
 });
-
-export { SCRIPT as MAIN_AGENT_SCRIPT };
 
 // Let the store support HMR: when this file changes, Pinia hot-swaps the store instance's actions/state,
 // otherwise the running instance stays on the old version (e.g. missing the newly added enterDone) and calls error out.

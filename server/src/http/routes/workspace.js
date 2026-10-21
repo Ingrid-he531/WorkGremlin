@@ -3,8 +3,10 @@
 /**
  * Project (workspace) query and switch.
  *   GET  /api/v1/workspace          current project + recently opened + subagent manifest path
- *   POST /api/v1/workspace {path}   open a project directory; an empty path or 'demo' means
- *                                   switching back to the demo data
+ *   POST /api/v1/workspace {path}   open a real project directory.
+ *
+ * Demo mode is not a workspace switch: it is a virtual session exposed by /api/v1/demo/session,
+ * so empty / 'demo' paths are rejected rather than seeding a demo project into the real tables.
  */
 
 const express = require('express');
@@ -26,10 +28,15 @@ function createWorkspaceRouter({ workspace }) {
   router.post('/workspace', (req, res) => {
     const raw = req.body && (req.body.path ?? req.body.workspacePath);
     try {
-      const cur = raw === undefined || raw === null || String(raw).trim() === '' || raw === 'demo'
-        ? workspace.openDemo()
-        : workspace.open(raw);
-      res.json(view(cur));
+      const target = String(raw ?? '').trim();
+      if (!target || target === 'demo') {
+        return res.status(400).json({
+          ok: false,
+          error: { code: ERROR_CODES.BAD_PAYLOAD, message: 'a real workspace path is required' },
+        });
+      }
+      const cur = workspace.open(target);
+      return res.json(view(cur));
     } catch (err) {
       res.status(400).json({
         ok: false,

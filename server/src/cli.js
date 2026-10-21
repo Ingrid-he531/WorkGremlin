@@ -11,9 +11,9 @@
  *   node server/src/cli.js --log=debug          log level (error|warn|info|debug, default info)
  *   node server/src/cli.js --log-file=0         turn off file logging (~/.workgremlin/workgremlin.log)
  *
- * There is no startup flag for demo mode anymore: after start, POST /api/v1/workspace (empty path)
- * switches to the demo project, and the server seeds on demand and starts the ticker (see syncDemo
- * in index.js); in the UI that is the "demo mode" button in the HUD.
+ * There is no startup flag for demo mode. Demo mode is a read-only, in-memory virtual session
+ * exposed by /api/v1/demo/session (see server/src/demo/provider.js); it never seeds the real tables.
+ * In the UI that is the "demo mode" button in the HUD.
  */
 
 // Runtime version check: the server is now preferably started by Electron's bundled Node (see

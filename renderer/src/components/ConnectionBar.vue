@@ -6,13 +6,13 @@ const { t } = useI18n();
 
 const props = defineProps({
   connection: { type: Object, required: true },
-  /** Phase source: 'reported' (agent-reported ground truth) / 'inferred' (server-side inference) / 'demo' (demo script) / '' (no session) */
+  /** Phase source: 'reported' (agent-reported ground truth) / 'inferred' (server-side inference) / 'demo' (server-owned demo session) / '' (no session) */
   source: { type: String, default: '' },
   /** Embedded in the host bar (the note bar at the bottom-left of the office): no longer carries its own backing and border, it follows the host */
   bare: { type: Boolean, default: false },
 });
 
-/** Phase source text (the demo script is neither "ground truth" nor "inferred", so it gets its own entry) */
+/** Phase source text (the server-owned demo session is neither "ground truth" nor "inferred", so it gets its own entry) */
 const sourceText = computed(() =>
   props.source === 'demo'
     ? t('conn.source.demo')

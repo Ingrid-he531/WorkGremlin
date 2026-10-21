@@ -970,8 +970,8 @@ function inferPhase({ todos, files, runtime, pending, lastUpdated, now, inWindow
   }
   // "Wrap up once the session is idle": the plugin queued messages to be sent after this turn ends; nobody is
   // working — report idle and put the reason in action. This used to report summarize ("summarizing"), but
-  // that phase never occurs on a real machine (only the demo script produces it), and keeping it made "not
-  // working" look like "summarizing" (removed 2026-10-01, see renderer/src/iso/mainConsole.js).
+  // that phase never occurs on a real machine (only the old demo script produced it), and keeping it made
+  // "not working" look like "summarizing" (removed 2026-10-01, see renderer/src/iso/mainConsole.js).
   if (runtime.awaitingSessionIdle && afterRestart(lastUpdated) && now - lastUpdated < IDLE_MS) {
     return { phase: 'idle', action: '等会话空闲后收尾', inferred: true };
   }

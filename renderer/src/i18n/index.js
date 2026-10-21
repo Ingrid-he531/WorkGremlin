@@ -84,7 +84,7 @@ const MESSAGES = {
     'session.demo_project': '演示工程',
     'session.demo_mode': '演示模式',
     'session.demo_session': '演示工程 · 演示会话',
-    'session.demo_session_title': '演示模式（退出：办公室操作条上的「退出演示」）',
+    'session.demo_session_title': '演示模式（只读；切换楼层或选择真实会话会退出）',
     'session.floor_empty': '{name} · 本层暂无活跃会话',
     'session.empty_no_project': '没有打开的工程',
     'session.empty_no_active': '没有活跃会话',
@@ -98,7 +98,7 @@ const MESSAGES = {
     'conn.source_label': '相位来源',
     'conn.source.reported': '上报真值',
     'conn.source.inferred': '推断值',
-    'conn.source.demo': '演示脚本',
+    'conn.source.demo': '演示会话',
 
     // ---- floor shaft / elevator ----
     'floor.title': '楼层',
@@ -129,10 +129,11 @@ const MESSAGES = {
     'ticker.suffixClose': '）',
     'ticker.no_task': '暂无活跃任务',
     'ticker.tag': '全楼层监控',
+    'ticker.demoLabel': '演示会话',
 
     // ---- office HUD / caption bar ----
     'office.demo': '演示模式',
-    'office.demo_title': '切到演示工程：主控制台自动演一轮，小怪物用演示成员',
+    'office.demo_title': '在当前楼层启动只读演示会话（不会写入真实数据）',
     'office.exit_demo': '退出演示',
     'office.exit_demo_title': '退出演示，回到进演示前的工程',
     'office.meeting': '集合开会',
@@ -545,7 +546,7 @@ const MESSAGES = {
     'session.demo_project': 'Demo project',
     'session.demo_mode': 'Demo',
     'session.demo_session': 'Demo project · demo session',
-    'session.demo_session_title': 'Demo mode (exit via "Exit demo" in the office action bar)',
+    'session.demo_session_title': 'Demo mode (read-only; switching floors or choosing a real session exits)',
     'session.floor_empty': '{name} · no active session on this floor',
     'session.empty_no_project': 'No project open',
     'session.empty_no_active': 'No active session',
@@ -559,7 +560,7 @@ const MESSAGES = {
     'conn.source_label': 'Phase source',
     'conn.source.reported': 'Reported',
     'conn.source.inferred': 'Inferred',
-    'conn.source.demo': 'Demo script',
+    'conn.source.demo': 'Demo session',
 
     // ---- floor rail / lift ----
     'floor.title': 'Floors',
@@ -590,10 +591,11 @@ const MESSAGES = {
     'ticker.suffixClose': ')',
     'ticker.no_task': 'No active tasks',
     'ticker.tag': 'All floors',
+    'ticker.demoLabel': 'Demo session',
 
     // ---- office HUD / tip bar ----
     'office.demo': 'Demo mode',
-    'office.demo_title': 'Switch to the demo project: the console plays a full run, gremlins are demo members',
+    'office.demo_title': 'Start a read-only demo session on this floor (never writes real data)',
     'office.exit_demo': 'Exit demo',
     'office.exit_demo_title': 'Leave the demo and go back to the project you had open',
     'office.meeting': 'Call a meeting',

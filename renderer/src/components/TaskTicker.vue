@@ -16,10 +16,11 @@
  *     minutes", see /api/v1/task-feed.
  *
  * Three hard constraints (carried over from FloorLcd):
- *   1. Single source of truth: every entry comes from the server's tasks table
+ *   1. Single source of truth: every real entry comes from the server's tasks table
  *      (/api/v1/task-feed), and this component **does not infer task state**;
  *      the server also resolves the task's floor, with sessions.floors kept only as a compatibility
- *      fallback for older feeds;
+ *      fallback for older feeds. The only pseudo entry is the demo line below: it is explicit,
+ *      frontend-only, and never enters the task tables or the ended-task logic;
  *   2. Only transform is touched: the scroll is written by a JS rAF loop each frame as
  *      `translateX(offset)`, with offset accumulating continuously; width / left / top are never
  *      touched; this way adding or removing content (especially an ended line) does not make an
@@ -38,8 +39,9 @@
  * Accessibility: the scrolling segment code is noise to a screen reader → the screen itself is
  * aria-hidden, and a separate sr-only static text is provided.
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useSessionStore } from '../stores/sessions';
+import { useDemoStore } from '../stores/demo';
 import { colorsFor } from '../iso/officeMap';
 import { shade } from '../iso/iso';
 import { PHASES } from '../iso/mainConsole';
@@ -49,6 +51,7 @@ import { httpBase, getServerInfo } from '../api/bridge';
 
 const { t } = useI18n();
 const sessions = useSessionStore();
+const demo = useDemoStore();
 
 /**
  * The **single source of truth** for the ticker: the server's /api/v1/task-feed (see
@@ -293,9 +296,13 @@ function floorLabelForTask(it) {
  * loop. Taken directly from /api/v1/task-feed, each task on its own line, **no longer deduplicated by
  * floor**. The server has already filtered out tasks outside active sessions, so this only projects
  * the valid running rows into display lines.
+ *
+ * Demo adds one frontend-only line. It is deliberately not a `/task-feed` row: demo state is
+ * read-only and ephemeral (no tasks table writes), and this line must not go through the
+ * done/cancelled announcement path.
  */
 const runningItems = computed(() => {
-  return feed.value
+  const items = feed.value
     .filter((it) => it.state === 'running')
     .map((it) => {
       const floor = floorLabelForTask(it);
@@ -329,6 +336,32 @@ const runningItems = computed(() => {
       };
     })
     .sort((a, b) => a.startedAt - b.startedAt);
+
+  // Demo is not a real task and must not be written into the task tables. It is a frontend-only
+  // pseudo line; its floor, wording and phase still come from the backend demo session. The real
+  // /task-feed and its ended-task handling are untouched.
+  if (demo.active && demo.session) {
+    const floor = String(demo.session.floor || sessions.selectedFloor || '').trim();
+    const time = hhmm(demo.session.taskStartedAt);
+    const taskLabel = t('ticker.demoLabel');
+    items.push({
+      id: `demo:${demo.sessionId}`,
+      kind: 'running',
+      live: true,
+      demo: true,
+      sessionId: demo.sessionId,
+      time,
+      floor,
+      taskLabel,
+      taskText: '',
+      floorColor: shade(colorsFor(floor).wood, 1.6),
+      text: `${time} ${floor} ${taskLabel}`,
+      suffix: wrapSuffix(t(`phase.${demo.session.phase || 'thinking'}`)),
+      suffixColor: phaseColorOf(demo.session.phase || 'thinking'),
+      startedAt: Number(demo.session.taskStartedAt) || 0,
+    });
+  }
+  return items;
 });
 
 /**
@@ -373,6 +406,20 @@ let ro = null;
 let raf = null;
 let lastTs = 0;
 let offset = 0;
+
+// Entering / leaving demo changes the pseudo line. Segments are immutable snapshots, so drop the
+// current track instead of waiting for a segment to recycle: the next tick appends a fresh segment
+// with (or without) the demo line immediately.
+watch(
+  () => demo.active,
+  () => {
+    // Keep pendingEnded: a real task that just finished must still scroll its one-line notice;
+    // only the already-scrolled snapshots are dropped so the demo line appears immediately.
+    segs.value = [];
+    segsDirty = true;
+    offset = 0;
+  }
+);
 /** Total width of all segments on the track (px, including trailing gaps): used to decide appending / recycling */
 let trackW = 0;
 /**

@@ -144,6 +144,11 @@ export interface MessageFilters {
 }
 
 export declare const PROTOCOL_VERSION: number;
+
+/** Virtual project id used by the in-memory demo session (never persisted). */
+export declare const DEMO_PROJECT_ID: '__demo__';
+/** Virtual session id used by demo mode (never persisted). */
+export declare const DEMO_SESSION_ID: '__demo__:session';
 export declare const AGENT_STATES: readonly AgentState[];
 export declare const TASK_STATES: readonly TaskState[];
 export declare const MESSAGE_TYPES: readonly string[];

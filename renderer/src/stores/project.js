@@ -11,7 +11,7 @@ const RECONCILE_MS = 15_000;
 /** Workstation view + connection state (current project's members / ghosts / connection) */
 export const useProjectStore = defineStore('project', {
   state: () => ({
-    /** All projects (demo project and real projects side by side) */
+    /** All real projects (the virtual demo project lives in stores/demo.js, not here) */
     projects: [],
     /** Current project */
     project: null,
@@ -22,18 +22,14 @@ export const useProjectStore = defineStore('project', {
      */
     projectId: '',
     members: [],
-    /** Current project display name (resolved by the server: package.json name > directory name; the demo project has a fixed name) */
+    /** Current real project display name (resolved by the server: package.json name > directory name) */
     projectName: '',
-    /** Current project root directory (empty for the demo project) */
+    /** Current real project root directory */
     workspacePath: '',
     /** Recently opened projects */
     recent: [],
     connection: { state: 'connecting', source: 'ws' },
     serverInfo: null,
-    /** Currently parked on the demo project (demo in the server's workspace response, toggled by the demo mode button) */
-    demo: false,
-    /** Which project was open before entering demo: return here when leaving demo (the demo project has no directory of its own) */
-    demoReturnPath: '',
     _conn: null,
     _reconcileTimer: null,
   }),
@@ -152,6 +148,10 @@ export const useProjectStore = defineStore('project', {
       // The snapshot is already sliced by current project; filtering again here is just defensive (server swapped / an old snapshot slipped in)
       this.members = (snapshot.members || []).filter((m) => memberBelongsToProject(m, this.projectId));
       if (snapshot.projectName) this.projectName = snapshot.projectName;
+      // Keep the real workspace path in sync: the next project open uses it.
+      if (snapshot.project && Object.prototype.hasOwnProperty.call(snapshot.project, 'workspacePath')) {
+        this.workspacePath = snapshot.project.workspacePath || '';
+      }
     },
 
     /** @param {any} card */
@@ -177,10 +177,8 @@ export const useProjectStore = defineStore('project', {
       this.projectName = ws.projectName || '';
       this.workspacePath = ws.workspacePath || '';
       this.recent = Array.isArray(ws.recent) ? ws.recent : [];
-      this.demo = Boolean(ws.demo);
       // Switching projects must immediately clear the previous project's people from the room: the server's new snapshot arrives **asynchronously** (broadcast within the same request),
-      // and without filtering first the previous project's members keep standing at their workstations during that stretch —— the 8 demo gremlins when leaving demo
-      // are the most visible instance (2026-10-01 user test: after leaving demo and switching floors they briefly appeared again).
+      // and without filtering first the previous project's members keep standing at their workstations during that stretch.
       // When the new project id is unavailable (old server / response missing the field), don't swap projectId and don't filter, keep things as they are.
       if (ws.project) {
         this.projectId = String(ws.project);
@@ -189,7 +187,7 @@ export const useProjectStore = defineStore('project', {
     },
 
     /**
-     * Open a project: the room's members/ghosts all switch to this project. An empty path / 'demo' switches to the demo project.
+     * Open a real project: the room's members/ghosts all switch to this project.
      * The server broadcasts the new snapshot, so there is no need to pull it here.
      * @param {string} path
      */
@@ -197,37 +195,6 @@ export const useProjectStore = defineStore('project', {
       const cur = await openWorkspace(this.serverInfo || {}, path);
       this.applyWorkspace(cur);
       return cur;
-    },
-
-    /**
-     * Directory to return to when leaving demo: the one recorded before entering demo → the most recently opened → the one resolved at server start.
-     * The demo project has no directory of its own (workspacePath empty), so it can't be the "address to go back to".
-     */
-    realPath() {
-      if (this.workspacePath) return this.workspacePath;
-      const hit = (this.recent || []).find((r) => r && r.path);
-      if (hit) return hit.path;
-      return (this.serverInfo && this.serverInfo.workspacePath) || '';
-    },
-
-    /**
-     * Enter demo mode: switch to the "demo project" (POST /api/v1/workspace with an empty path → the server's openDemo).
-     * The server readies the demo data and starts the demo task driver along the way (see server/src/index.js's syncDemo).
-     *
-     * Record "which project to return to on exit" first —— it must be captured **before switching away** (after switching into demo workspacePath is empty).
-     */
-    async enterDemo() {
-      if (this.demo) return null;
-      this.demoReturnPath = this.realPath();
-      return this.openWorkspace('demo');
-    },
-
-    /** Leave demo: return to the real project opened before entering demo; if there is not a single real project, stay in demo */
-    async exitDemo() {
-      if (!this.demo) return null;
-      const back = this.demoReturnPath || this.realPath();
-      if (!back) return null;
-      return this.openWorkspace(back);
     },
 
     dispose() {

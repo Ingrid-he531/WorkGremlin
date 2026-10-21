@@ -53,8 +53,9 @@ function pingPort(port, timeoutMs = 1500) {
 async function bootstrap() {
   await app.whenReady();
 
-  // 演示模式**没有启动开关**（原来的 --demo / --demo-seed / WORKGREMLIN_DEMO* 都散了）：
-  // 它由界面上的「演示模式」按钮切换工程触发（见 server 的 syncDemo），启动一律接真实数据。
+  // Demo mode has no startup switch (the old --demo / --demo-seed / WORKGREMLIN_DEMO* flags are
+  // gone). It is a read-only virtual session started from the office HUD via
+  // /api/v1/demo/session; startup always opens real data.
 
   // server 由 launcher（desktop/src/launcher.js）先行启动并写入 server.json；client 只读取并连接，不自行启动 server。
   const existing = readServerInfoFile();

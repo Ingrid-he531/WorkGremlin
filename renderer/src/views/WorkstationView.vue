@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
+import { useDemoStore } from '../stores/demo';
 import { isEphemeralMember } from '../lib/ephemeral';
 import { floorAcceptsClient, isBaseAgent } from '../lib/clientMatch';
 import { memberForSession, normalizeState } from '../lib/memberTask';
@@ -10,7 +11,10 @@ import { useI18n } from '../i18n';
 
 const project = useProjectStore();
 const sessions = useSessionStore();
+const demo = useDemoStore();
 const { t } = useI18n();
+/** Demo owns only the office roster; project data (task records, messages, workspace) stays real. */
+const sourceMembers = computed(() => (demo.active ? demo.members : project.members));
 
 // Main agent: the member name (with -plugin stripped) equals its client base name (codebuddy / qoder / codex …),
 // matching the "main agent of this floor" registered by a hook; sub-agents (leo / peter / software-architect…) have names that differ from the base name.
@@ -28,13 +32,13 @@ const sorted = computed(() => {
   // Recognize every floor's client: merged floors (1F CodeBuddy = CLI + Plugin) must include both variants,
   // and single floors (3F Codex, where CLI and IDE are merged) likewise.
   const allClients = (sessions.floors || []).map((f) => f.client);
-  return project.members
+  return sourceMembers.value
     // Workstation cards only show resident gremlins; ghosts summoned temporarily (subagent-xxx) are not listed,
     // avoiding the misunderstanding of "a same-named gremlin appearing in the card list after a summon".
     .filter((m) => !isEphemeralMember(m))
     .filter((m) => floorAcceptsClient(want, m.client))
     .slice()
-    .map((m) => memberForSession(m, sessions.selectedSessionId, project.members))
+    .map((m) => memberForSession(m, sessions.selectedSessionId, sourceMembers.value))
     // The main agent card is always pinned first (the rest still follow phase order), no longer random
     .sort((a, b) => {
       const am = isMainAgent(a) ? 0 : 1;
@@ -96,14 +100,14 @@ const mainAgentCard = computed(() => {
         v-if="mainAgentCard"
         :key="mainAgentCard.memberId"
         :member="mainAgentCard"
-        :members="project.members"
+        :members="sourceMembers"
         :session-id="sessions.selectedSessionId"
       />
       <WorkstationCard
         v-for="m in sorted"
         :key="m.memberId"
         :member="m"
-        :members="project.members"
+        :members="sourceMembers"
         :session-id="sessions.selectedSessionId"
       />
     </div>

@@ -19,6 +19,7 @@ import GhostSprite from '../components/GhostSprite.vue';
 import WorkstationCard from '../components/WorkstationCard.vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
+import { useDemoStore } from '../stores/demo';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
 import { floorAcceptsClient } from '../lib/clientMatch';
 import { memberForSession, normalizeState } from '../lib/memberTask';
@@ -46,6 +47,9 @@ const emit = defineEmits(['select']);
 
 const project = useProjectStore();
 const sessions = useSessionStore();
+const demo = useDemoStore();
+/** Demo owns only the office roster; task records / messages keep reading the real project. */
+const sourceMembers = computed(() => (demo.active ? demo.members : project.members));
 
 const wrapRef = ref(null);
 const svgRef = ref(null);
@@ -68,7 +72,7 @@ const stateText = (s) => t(STATE_KEY[normalizeState(s)]);
 /** Expert team: resident members, one workstation each (ephemeral members take no workstation).
  *  The main Agent (role=agent) only shows up as a silhouette at the main console and takes no workstation, so it is dropped from the roster. */
 const roster = computed(() =>
-  project.members
+  sourceMembers.value
     .filter((m) => !isEphemeralMember(m) && m.role !== 'agent')
     .filter((m) => floorAcceptsClient(sessions.selectedClient, m.client))
     .slice(0, DESKS.length)
@@ -77,14 +81,14 @@ const roster = computed(() =>
 const ghostRoster = computed(() => {
   const seated = new Set(roster.value.map((m) => m.memberId));
   const sid = sessions.selectedSessionId;
-  return project.members
+  return sourceMembers.value
     .filter((m) => !seated.has(m.memberId))
     .filter((m) => floorAcceptsClient(sessions.selectedClient, m.client))
     .filter((m) => !isEphemeralMember(m) || !sid || !m.sessionId || m.sessionId === sid);
 });
 const memberOf = computed(() => {
   const m = new Map();
-  project.members.forEach((x) => m.set(x.memberId, memberForSession(x, sessions.selectedSessionId, project.members)));
+  sourceMembers.value.forEach((x) => m.set(x.memberId, memberForSession(x, sessions.selectedSessionId, sourceMembers.value)));
   return m;
 });
 
@@ -697,7 +701,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
       :style="{ left: `${card.left}px`, top: `${card.top}px` }"
       @click.stop
     >
-      <WorkstationCard :member="cardMember" :members="project.members" :session-id="sessions.selectedSessionId" />
+      <WorkstationCard :member="cardMember" :members="sourceMembers" :session-id="sessions.selectedSessionId" />
       <button class="card-close" @click="closeCard">{{ t('records.delete_cancel') }}</button>
     </div>
 
