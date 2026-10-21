@@ -51,5 +51,13 @@ ok('suffix span uses lineSuffix(it) as text', /class="suf"[^>]*>\{\{\s*lineSuffi
 ok('suffix colour uses lineSuffixColor(it)', /:style="\{\s*color:\s*lineSuffixColor\(it\)\s*\}"/.test(template));
 ok('the template no longer reads the baked it.suffix / it.suffixColor', !/\{\{\s*it\.suffix\s*\}\}/.test(template) && !/color:\s*it\.suffixColor/.test(template));
 
+console.log('\n[4] Floor labels prefer the server-resolved value');
+ok('a floorLabelForTask helper exists', /function\s+floorLabelForTask\s*\(/.test(src));
+ok('the helper prefers it.floor before the session-store fallback', /String\(it\.floor \|\| ''\)\.trim\(\) \|\| floorLabelForClient\(it\.client\)/.test(src));
+ok(
+  'both running and ended lines use the task-floor helper',
+  (src.match(/const floor = floorLabelForTask\(it\);/g) || []).length === 2
+);
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

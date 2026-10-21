@@ -8,6 +8,7 @@ const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
 const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessions');
 const { getActiveSessionIds: registryActiveSessionIds } = require('../../sessionRegistry');
+const { floorByAgent } = require('../../floors');
 
 /**
  * Floor filter param → client list.
@@ -318,10 +319,15 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
           LIMIT @limit`
       )
       .all(args);
-    const items = rows.map((row) => ({
-      ...row,
-      client: agentBase(row.client || row.memberId) || null,
-    }));
+    const items = rows.map((row) => {
+      const client = agentBase(row.client || row.memberId) || null;
+      return {
+        ...row,
+        client,
+        // Resolve the floor on the server so the first rendered ticker segment already has a stable label.
+        floor: (floorByAgent[client] && floorByAgent[client].meta && floorByAgent[client].meta.id) || null,
+      };
+    });
     return res.json({ ok: true, items });
   });
 

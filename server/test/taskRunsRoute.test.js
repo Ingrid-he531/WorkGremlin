@@ -406,6 +406,13 @@ app.use('/api/v1', createIngestRouter({ bus }));
   );
   const activeRow = (filteredFeed.items || []).find((t) => t.id === 't-feed-active') || {};
   ok('feed client is normalized with agentBase()', activeRow.client === 'codex', JSON.stringify(activeRow.client));
+  ok('feed carries the server-resolved floor id', activeRow.floor === '3F', JSON.stringify(activeRow.floor));
+  const otherProjectRow = (filteredFeed.items || []).find((t) => t.id === 't-feed-active-other-project') || {};
+  ok(
+    'floor resolution does not depend on the task project',
+    otherProjectRow.floor === '4F',
+    JSON.stringify(otherProjectRow.floor)
+  );
 
   server.close();
   close();

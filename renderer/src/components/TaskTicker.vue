@@ -18,8 +18,8 @@
  * Three hard constraints (carried over from FloorLcd):
  *   1. Single source of truth: every entry comes from the server's tasks table
  *      (/api/v1/task-feed), and this component **does not infer task state**;
- *      the floor number is looked up by reverse-checking task.client against sessions.floors, not a
- *      separate floor table built here;
+ *      the server also resolves the task's floor, with sessions.floors kept only as a compatibility
+ *      fallback for older feeds;
  *   2. Only transform is touched: the scroll is written by a JS rAF loop each frame as
  *      `translateX(offset)`, with offset accumulating continuously; width / left / top are never
  *      touched; this way adding or removing content (especially an ended line) does not make an
@@ -53,10 +53,10 @@ const sessions = useSessionStore();
 /**
  * The **single source of truth** for the ticker: the server's /api/v1/task-feed (see
  * server/src/http/routes/query.js). It lists the tasks table directly by taskId and returns each
- * task's { id, title, started_at, ended_at, client, state }. The server includes a running task only
- * while its session is active, and permanently hides tasks cancelled by orphan reconciliation. The
- * component therefore performs no floor deduplication or session-liveness inference of its own; each
- * active task is shown separately. client is reverse-looked up to a floor number here.
+ * task's { id, title, started_at, ended_at, client, floor, state }. The server includes a running task
+ * only while its session is active, and permanently hides tasks cancelled by orphan reconciliation.
+ * The component therefore performs no floor deduplication or session-liveness inference of its own;
+ * each active task is shown separately. The server-resolved floor is used directly.
  */
 const feed = ref([]);
 let feedTimer = null;
@@ -177,7 +177,7 @@ const lineSuffixColor = (it) => (it.live ? phaseColorOf(runningPhaseOfTask(it)) 
  * cancelled/failed red). It scrolls exactly once (see pendingEnded → makeSeg) and then leaves the track.
  */
 function endedText(it) {
-  const floor = floorLabelForClient(it.client);
+  const floor = floorLabelForTask(it);
   const base = promptOf(it.title || '') || t('ticker.untitled');
   const done = it.state === 'done';
   const suffix = wrapSuffix(done ? t('ticker.done') : t('ticker.cancelled'));
@@ -280,6 +280,15 @@ function floorLabelForClient(client) {
 }
 
 /**
+ * The server resolves a task's floor from its client and includes it in /task-feed. Prefer that
+ * stable value so the first ticker segment does not fall back to the client name before the
+ * renderer's session snapshot has loaded. Keep the client lookup as a compatibility fallback.
+ */
+function floorLabelForTask(it) {
+  return String(it.floor || '').trim() || floorLabelForClient(it.client);
+}
+
+/**
  * In-progress tasks (state === 'running' in the feed): the permanent content of the infinite scroll
  * loop. Taken directly from /api/v1/task-feed, each task on its own line, **no longer deduplicated by
  * floor**. The server has already filtered out tasks outside active sessions, so this only projects
@@ -289,7 +298,7 @@ const runningItems = computed(() => {
   return feed.value
     .filter((it) => it.state === 'running')
     .map((it) => {
-      const floor = floorLabelForClient(it.client);
+      const floor = floorLabelForTask(it);
       const text = promptOf(it.title || '') || t('ticker.untitled');
       const taskLabel = t('ticker.taskLabel');
       const taskText = clip(text);
