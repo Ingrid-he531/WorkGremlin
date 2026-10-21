@@ -74,32 +74,40 @@ None available. Token statistics will remain unavailable until Qoder's extension
 - Table: `chat_record`
 - Relevant code: `server/src/floorQoder.js` (see `readLingmaRounds` and `writeTurnRun` functions)
 
-### 2.2 TraeCode IDE: Subagent Ghosts Not Shown in Real-Time
+### 2.2 TraeCode IDE: No Subagent Visibility (No Real-Time Ghosts, No Call Traces)
 
 **Status:** ⚠️ Known Limitation
 
 **Description:**  
 TraeCode IDE does not send `Task` or `Agent` tool names through its hook system, nor does it emit `SubagentStart` / `SubagentStop` hook events. The hook `PreToolUse` matcher is empty (matches all tools), but the actual tool names reported are limited to: `RunCommand`, `Read`, `Edit`, `Grep`, `TodoWrite`, `Glob`, `Write`, `LS`, `Delete`, `AskUserQuestion`, `WebSearch`, `WebFetch`, `StopCommand`. None of these match `isSubagentTool` (which recognizes `task|agent|spawn_agent|collaborationspawn_agent`), so the ghost lifecycle (`addGhost` on PreToolUse, `finishGhostServer` on PostToolUse/SubagentStop) never triggers.
 
-The only subagent signal available is `IdeSubagentContribution` in `renderer.log`, which fires **after** the subagent has completed its work and its code contribution has been accepted — not when the subagent starts. This makes real-time ghost display impossible.
+The only subagent-related signal in `renderer.log` is `IdeSubagentContribution`, but it is **not an invocation record**. It reports that a subagent's generated code was accepted into an editor buffer (`documentUri`, `acceptCodeLength`, `line`). Records with `source=ide_subagent` appear only when the subagent actually writes code; a read-only subagent (analysis, review, retrieval) never produces one. `source=ide_agent` refers to the main agent itself and is deliberately ignored.
 
 **Impact:**  
 - The office view will not show small ghosties (小幽灵) when TraeCode IDE summons experts/subagents
-- Subagent activity is still recorded post-completion from `renderer.log` and appears in task details (see `subagent_runs` table and `/api/v1/task-runs/:id/subagents` endpoint)
-- This is a **data source limitation**: TraeCode's hook system does not expose subagent lifecycle events
+- Task details show **no subagent call traces at all** for current TraeCode versions. The `subagent_runs` backfill path exists but has nothing to consume, because the signal it depends on is not emitted
+- This is a **data source limitation**: neither the hook stream nor the local logs expose subagent dispatch/return or invocation events
 
 **Why This Happens:**  
-TraeCode's internal subagent mechanism (`IdeSubagentContribution`) is a post-completion reporting system, not a lifecycle event system. The hook infrastructure only reports tool calls, not subagent dispatch/return. Without a "subagent started" signal, there is no trigger to create a real-time ghost entry.
+TraeCode's hook system only reports tool calls. In a full agent turn the observed `tool_name` values are limited to `RunCommand`, `Read`, `Edit`, `Grep`, `TodoWrite`, `Glob`, `Write`, `LS`, `Delete`, `AskUserQuestion`, `WebSearch`, `WebFetch`, `StopCommand` — no `Task`/`Agent` dispatch tool, and no `SubagentStart`/`SubagentStop` events. A subagent invocation therefore leaves no local trace: it is absent from the hook stream, from `renderer.log`, and from the agent service logs.
 
 **Workaround:**  
-- **Post-completion recording**: Subagent contributions are parsed from `renderer.log`'s `IdeSubagentContribution` events (with `source=ide_subagent`) and stored in the `subagent_runs` table, visible in task details
 - **Real-time ghosts**: Not available until TraeCode adds `Task`/`Agent` tool name reporting or `SubagentStart`/`SubagentStop` hook events
+- **Post-completion recording**: Only partially works, and only for code-writing subagents. `flushTraeSubagents` backfills `IdeSubagentContribution` entries with `source=ide_subagent` into `subagent_runs`, but each row has zero duration (`started_at == ended_at`) and no invocation timestamp
+- Do not rely on task details to confirm that a subagent ran (for example, to verify that a custom agent such as a user-level agent in `~/.trae-cn/agents/` was actually called)
+
+**Verification (2026-10-21):**  
+- `source=ide_subagent` occurrences: **0** in the 2026-10-21 log tree; 88 historical occurrences, all from a single 2026-10-13 session
+- Historical rows in `subagent_runs` for `client='trae'`: 88, all attached to one task, all with `started_at == ended_at`
+- A read-only subagent run produced 0 `IdeSubagentContribution` records of either source
+- The hook log for the same run contained no `Task`/`Agent`/`SubagentStart` entry
 
 **Technical Details:**  
-- Hook events source: `~/.workgremlin/hooks/events.log`
-- Subagent contribution source: `<globalStorage>/Trae CN/logs/<launch>/window1/renderer.log`
-- Relevant code: `server/src/floorTrae.js` (renderer.log parsing), `server/src/ingest/hookCommon.js` (`isSubagentTool`, `addGhost`, `finishGhostServer`)
-- Key event pattern in renderer.log: `[tooling] [IdeSubagentContribution] downstream SDK report started: source=ide_subagent, sessionId=..., operationId=..., documentUri=..., acceptCodeLength=...`
+- Hook events source: `~/.workgremlin/hooks/events.log`; Trae-side hook transcript: `<logs>/<launch>/window<N>/agent-hooks.log`
+- Subagent contribution source: `<dataRoot>/Trae CN/logs/<launch>/window<N>/renderer.log` (`<dataRoot>` is `~/.config` or `~/.local/share` on Linux)
+- Relevant code: `server/src/floorTrae.js` (`allSubagentContribs`, `flushTraeSubagents`), `server/src/ingest/hookCommon.js` (`isSubagentTool`, `addGhost`, `finishGhostServer`)
+- Task-detail endpoint: `GET /api/v1/subagent-runs?parent=<task_runs.id>`
+- Key event pattern in renderer.log: `[tooling] [IdeSubagentContribution] downstream SDK report started: source=ide_subagent, sessionId=..., operationId=..., documentUri=..., acceptCodeLength=..., line=...`
 
 ---
 
@@ -138,7 +146,7 @@ If you encounter limitations not documented here, please:
 | CodeBuddy | Plugin | ✅ Supported | ✅ Yes | Full functionality |
 | Claude | CLI | ✅ Supported | ✅ Yes | Full functionality |
 | Copilot | IDE | ✅ Supported | ✅ Yes | Full functionality |
-| Trae | IDE | ✅ Supported | ⚠️ Credits only | No token breakdown; no real-time subagent ghosts (post-completion only) |
+| Trae | IDE | ✅ Supported | ⚠️ Credits only | No token breakdown; no real-time subagent ghosts and no subagent call traces |
 | Qoder | CLI | ✅ Supported | ✅ Yes | Full functionality |
 | Qoder | Plugin | ✅ Supported | ❌ No | Token data unavailable from source |
 | Kilo | CLI | ✅ Supported | ✅ Yes | Full functionality |
@@ -175,6 +183,6 @@ If you have access to the development teams of these tools, please encourage the
 
 ---
 
-**Last Updated:** 2026-10-13  
-**Document Version:** 1.0  
+**Last Updated:** 2026-10-21  
+**Document Version:** 1.1  
 **Maintained By:** WorkGremlin Team

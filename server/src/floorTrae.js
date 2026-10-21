@@ -27,10 +27,10 @@ const { genericAgentDirs, makeAgentSync } = require('./ingest/agentLevel');
 const { hooksDir } = require('@workgremlin/shared/paths');
 
 /**
- * 5F's static subagent definition directories. Trae has no "user-level / project-level agent definition
- * file" mechanism yet, so this goes through the generic derivation (meta.homeDirs is empty → returns [],
- * no disk scan). If Trae ever puts agent definitions in some directory, just give the explicit directories
- * here (same interface as CodeBuddy / Codex / Claude).
+ * 5F's static subagent definition directories. Trae supports user-level (`~/.trae-cn/agents`,
+ * `~/.trae/agents`) and project-level (`<workspace>/.trae/agents`) agent definition files, so this
+ * goes through the generic derivation from meta.homeDirs (project dirs are derived as
+ * `<workspace>/<basename(home)>/agents`).
  * @returns {Array<{dir:string, level:'project'|'user'}>}
  */
 function agentDirs(workspacePath) {
@@ -83,6 +83,8 @@ const meta = {
   agent: 'trae',
   plugin: false,
   pluginRe: /trae|coding-copilot/i,
+  // Also drives agentDirs (user-level ~/.trae-cn/agents, ~/.trae/agents); consistent with the IDE dir sources below
+  homeDirs: [path.join(os.homedir(), '.trae-cn'), path.join(os.homedir(), '.trae')],
   sources: [
     { kind: 'dir', label: 'IDE', client: 'trae', dirs: [path.join(os.homedir(), '.trae-cn'), path.join(os.homedir(), '.trae')] },
     { kind: 'dir', label: 'plugin', form: 'vscode', dirs: [path.join(os.homedir(), '.marscode')] },
@@ -399,6 +401,8 @@ function traeDoneStatus(sessionId) {
 
 
 let _usagesCache = { at: 0, list: null };
+/** Usage scan file-level cache: path -> { mtimeMs, size, list } (kept module-level to survive calls) */
+const _usageFileCache = new Map();
 
 
 
@@ -477,16 +481,15 @@ function allTokenUsages() {
   }
 
   // File-level cache: each file is parsed once per mtime+size
-  const _fileCache = new Map();
   const results = [];
   for (const { f, mtimeMs, size } of files) {
-    const hit = _fileCache.get(f);
+    const hit = _usageFileCache.get(f);
     let arr;
     if (hit && hit.mtimeMs === mtimeMs && hit.size === size) {
       arr = hit.list;
     } else {
       arr = parseFileUsages(f);
-      _fileCache.set(f, { mtimeMs, size, list: arr });
+      _usageFileCache.set(f, { mtimeMs, size, list: arr });
     }
     results.push(...arr);
   }
@@ -958,7 +961,7 @@ function flushTraeDone(now, backend) {
     const atH = Number(h.at) || 0;
     const match = all
       .filter((r) => Number(r.startedAt) && (!atH || Number(r.startedAt) <= atH))
-      .sort((a, b) => Number(b.startedAt) - Number(a.startAt))[0];
+      .sort((a, b) => Number(b.startedAt) - Number(a.startedAt))[0];
     if (!match) continue;
     const state = h.status === 'completed' ? 'done' : 'cancelled';
     const task = repo.getTask ? repo.getTask.get(match.id) : null;
