@@ -80,6 +80,8 @@ const meta = {
   // after session_id
   sessionSubtree: 'projects',
   sessionIdOfFile: (name) => String(name).replace(/\.jsonl$/i, ''),
+  // User-level agent definition directories (for subagent discovery)
+  homeDirs: [path.join(HOME, '.qoder'), path.join(HOME, '.qoder-cn')],
 };
 
 /* ───────────── formerly lingma.js ───────────── */
