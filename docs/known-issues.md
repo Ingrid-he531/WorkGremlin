@@ -21,18 +21,24 @@ None available. Please use supported Trae integration paths instead.
 
 ---
 
-### 1.2 GitHub Copilot CLI (Not Supported)
+### 1.2 GitHub Copilot CLI (Limited)
 
-**Status:** ❌ Not Supported
+**Status:** ⚠️ Supported with Limitations
 
 **Description:**  
-WorkGremlin does not support GitHub Copilot CLI. The monitoring infrastructure is designed for IDE-integrated agents and cannot capture Copilot CLI sessions.
+GitHub Copilot CLI is monitored through polling, like the VS Code extension. WorkGremlin reads the CLI's own SQLite store (`~/.copilot/session-store.db`: `sessions`, `turns`, `session_files`) and its live event stream (`~/.copilot/session-state/<session>/events.jsonl`), which supplies the in-flight turn, the exact user prompt, the turn start/end times, and the model. Both forms share the 9F floor and are merged by session id.
+
+The CLI exposes no hook, no reporter, and no "interrupted" marker, so:
+
+- Session phase, the done marker, and the task ledger are **inferred** from on-disk state (`inferred: true`).
+- A cancelled turn is reported as a normal completion; cancellation cannot be detected.
+- Token usage is not read from the CLI store.
 
 **Impact:**  
-GitHub Copilot CLI usage will not be tracked, and no task records or status information will be available in WorkGremlin.
+CLI sessions appear on 9F with live prompts, phases, changed files, and per-turn task records, but without cancellation signals or token statistics.
 
 **Workaround:**  
-None available. For Copilot integration, please use the GitHub Copilot IDE extension instead.
+For full-fidelity task records (explicit start/finish/cancel events and tokens), use a product with hook/reporter support.
 
 ---
 
@@ -170,7 +176,7 @@ If you encounter limitations not documented here, please:
 | OpenCode | CLI | ✅ Supported | ✅ Yes | Full functionality |
 | Cline | CLI/Plugin | ✅ Supported | ✅ Yes | Full functionality (phase inferred by polling the on-disk store) |
 | TraeCode | Plugin | ❌ Not Supported | N/A | Integration not available |
-| GitHub Copilot | CLI | ❌ Not Supported | N/A | Integration not available |
+| Copilot | CLI | ✅ Supported | ❌ No | Phase, done, and ledger inferred by polling; no cancellation signal |
 
 ---
 
@@ -180,7 +186,7 @@ If you encounter limitations not documented here, please:
 
 - **Qoder Plugin Token Tracking**: Monitor future Qoder releases for token usage exposure
 - **TraeCode Plugin Support**: Evaluate feasibility as Qoder's architecture evolves
-- **GitHub Copilot CLI**: Assess integration possibilities if Copilot adds local data persistence
+- **Copilot Token Tracking**: Read the CLI's usage events if a stable, documented format appears
 
 ### How You Can Help
 

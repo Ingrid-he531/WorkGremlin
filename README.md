@@ -98,7 +98,7 @@ One monitored product per floor (the left capsules are ordered this way); **a fl
 | 6F | Qoder | CLI and plugin (same on-disk store, merged into one floor) |
 | 7F | Kilo Code | Terminal TUI and VS Code extension |
 | 8F | OpenCode | CLI / TUI / desktop / web (same data) |
-| 9F | GitHub Copilot | VS Code plugin |
+| 9F | GitHub Copilot | CLI and VS Code extension (separate stores, merged into one floor) |
 
 Among them, **1F / 2F / 3F / 4F / 6F / 7F / 8F can also join the council** (these are verified or documented to be invocable headlessly and narrowed to read-only tools); the other floors do not appear in the council candidates even if installed, and the other pages still show them.
 

@@ -1183,7 +1183,12 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const key = `${client}@@${ws}@@${currentOnly ? 'current-only' : 'all'}@@${activeKey}@@${String(Array.isArray(re) ? re.map((r) => (r && r.source) || String(r)).join('|') : re instanceof RegExp ? re.source : String(re || ''))}`;
   if (!force && cache.value && cache.key === key && now - cache.at < TTL) return cache.value;
 
-  const storage = findPluginStorage(re, storageMarks);
+  // 9F has two independent stores (CLI ~/.copilot and the VS Code extension under globalStorage): the
+  // plugin locator only finds the latter. When the client is Copilot, accept either, and read both below.
+  const isCopilotClient = String(client || '').trim().toLowerCase() === 'copilot';
+  const pluginStorage = findPluginStorage(re, storageMarks);
+  const copilotRoots = isCopilotClient ? copilot.copilotStorages() : [];
+  const storage = pluginStorage || copilotRoots[0] || '';
   if (!storage) {
     cache = {
       at: now,
@@ -1226,9 +1231,9 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   // Real plugin disk state like GitHub Copilot uses the SQLite `session-store.db`, not `genie-history`:
   // merge those into the same session table here, otherwise 9F is forever swallowed by the old Tencent dir and
   // the UI never lights up.
-  // The whole Copilot SQLite read + enrich lives in copilot.js's readCopilotSessions (plugin sources are
-  // funneled through one place).
-  const sqliteRows = copilot.readCopilotSessions(storage, { ws, now });
+  // The whole Copilot SQLite read + enrich lives in copilot.js's readCopilotSessions. 9F merges both forms,
+  // so read every Copilot store (CLI + extension); other floors have no Copilot store to read.
+  const sqliteRows = isCopilotClient ? copilot.readCopilotAllSessions({ ws, now }) : [];
   const sqliteById = new Map();
   for (const row of sqliteRows) {
     if (!row || !row.id) continue;

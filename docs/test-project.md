@@ -7,7 +7,7 @@
 - 5F plugin/CLI
 - 7F plugin/CLI
 - 8F plugin/CLI
-- 9F plugin
+- 9F CLI/plugin
 
 # 办公室页面
 ## 测试条目（以上每个楼层均适用）

@@ -4,10 +4,15 @@
  * 9F GitHub Copilot floor module — merges "data-source reading" and "ledger syncer" into this one file
  * (the Copilot readers from the old sessions.js + the syncer from copilotTasks.js).
  *
- * 9F has neither a hook nor a reporter, so tasks can only come from the server polling its own on-disk state:
- *   · session-store.db (GitHub Copilot's SQLite session store — see readCopilotTurns / readCopilotFiles)
- *   · VS Code's state.vscdb chat index (readCopilotChatIndex, the only side evidence of "a turn is in flight")
- *   · VS Code's chatSessions/<session>.jsonl session log (readCopilotLiveRequest: user prompt / start-end / in-flight)
+ * 9F has no hook and no reporter, so tasks can only come from the server polling its own on-disk state.
+ * The floor has two forms, each with its own store, merged by session id:
+ *   · CLI (~/.copilot):
+ *       session-store.db                 sessions / turns / session_files (same schema as the extension)
+ *       session-state/<id>/events.jsonl  user prompt / turn start-end / errors ("a turn is in flight")
+ *   · VS Code extension (globalStorage/github.copilot-chat):
+ *       session-store.db                 sessions / turns / session_files
+ *       workspaceStorage/<workspace>/state.vscdb  chat index ("a turn is in flight")
+ *       workspaceStorage/<workspace>/chatSessions/<id>.jsonl  user prompt / start-end / in-flight
  *
  * This file depends only on generic modules (roots.js for findPluginStorage / globalStorageRoots /
  * workspaceStorageRoots and tolerant file reads) to read its own on-disk state; it no longer requires
@@ -33,6 +38,11 @@ const { resolveProjectName } = require('./project');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 
+// Copilot CLI's data root. The CLI and the VS Code extension keep **separate** SQLite stores (the CLI's
+// sessions never appear in globalStorage), so 9F has to read both and merge by session id.
+const CLI_ROOT = path.join(HOME, '.copilot');
+const CLI_SESSION_STATE = path.join(CLI_ROOT, 'session-state');
+
 // 9F's own on-disk windows (same order as the CLI floors; 7F/8F define their own too)
 const IDLE_MS = 10 * 60_000; // how long without activity counts as "inactive" (no heartbeat, so only file times)
 const LISTED_MS = 60 * 60_000; // window in which a session is "still in the dropdown"
@@ -43,6 +53,30 @@ const RE_GITHUB_COPILOT = [/^github\.copilot/i, /^github-copilot/i, /^github\.co
 // Marker for this floor's plugin storage root: the dir must hold a session store to count
 // (filters out the same-prefixed `github.copilot` base extension dir)
 const RE_GITHUB_COPILOT_MARKS = ['session-store.db'];
+
+/** The Copilot CLI data root, or '' when the CLI has never written a session store. */
+function copilotCliRoot() {
+  return isFile(path.join(CLI_ROOT, 'session-store.db')) ? CLI_ROOT : '';
+}
+
+/**
+ * Every on-disk Copilot session store this floor reads: the CLI first, then the VS Code extension.
+ * Callers merge by session id; the two stores are independent, so normally they never overlap.
+ * @returns {string[]}
+ */
+function copilotStorages() {
+  const out = [];
+  const cli = copilotCliRoot();
+  if (cli) out.push(cli);
+  const plugin = findPluginStorage(RE_GITHUB_COPILOT, RE_GITHUB_COPILOT_MARKS);
+  if (plugin && !out.includes(plugin)) out.push(plugin);
+  return out;
+}
+
+/** True when `storage` is the CLI root (its live evidence is events.jsonl, not VS Code's state.vscdb). */
+function isCopilotCliStorage(storage) {
+  return Boolean(storage) && path.resolve(String(storage)) === path.resolve(CLI_ROOT);
+}
 
 // Generic file checks (isFile / isDir) come from roots so they are not redefined everywhere
 /* ───────────── Copilot readers from the old sessions.js ───────────── */
@@ -525,6 +559,155 @@ function readCopilotLiveRequest(sessionId) {
 /* ───────────── */
 
 /**
+ * Read the **tail** of a Copilot CLI session's event stream and take the newest request.
+ *
+ * The CLI has no VS Code chat index / chatSessions log. It appends one JSON object per line to
+ * `~/.copilot/session-state/<sessionId>/events.jsonl`, with the same information this floor needs:
+ * `user.message` (the user's exact words), `assistant.turn_start` / `assistant.turn_end` (turn index and
+ * start/end times), and `session.error` (a failed turn still ends). The returned shape deliberately matches
+ * readCopilotLiveRequest, so copilotInFlight / copilotInWindow / copilotDoneAt work unchanged.
+ *
+ * @param {string} sessionId
+ * @returns {{index: number|null, prompt: string, model: string, startedAt: number, completed: boolean,
+ *            completedAt: number, reqs: Array<{index: number, startedAt: number, endedAt: number}>,
+ *            changed: Array}|null}
+ */
+function readCopilotCliLiveRequest(sessionId) {
+  const id = String(sessionId || '').trim();
+  // The id becomes a directory name: accept only what Copilot writes (UUIDs) and never a path.
+  if (!id || !/^[A-Za-z0-9._-]+$/.test(id)) return null;
+  const file = path.join(CLI_SESSION_STATE, id, 'events.jsonl');
+  if (!isFile(file)) return null;
+  let st = null;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return null;
+  }
+  const key = `${st.mtimeMs}@@${st.size}`;
+  const hit = copilotCliLiveCache.get(id);
+  if (hit && hit.key === key) return hit.value;
+
+  const TAIL = 4 * 1024 * 1024; // a turn's tool output can be long → read extra
+  let txt = '';
+  try {
+    const start = Math.max(0, st.size - TAIL);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(st.size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      txt = buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (start > 0) txt = txt.slice(txt.indexOf('\n') + 1); // drop the possibly truncated first line
+  } catch {
+    return null;
+  }
+
+  let prompt = '';
+  let model = '';
+  let startedAt = 0; // start of the newest user message
+  let openTurn = null; // { index, start } — turn_start seen, turn_end not yet
+  let lastCompletedIndex = null;
+  let completedAt = 0;
+  const reqs = [];
+  for (const line of txt.split('\n')) {
+    if (!line || line[0] !== '{') continue;
+    let j = null;
+    try {
+      j = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const d = (j && j.data) || {};
+    const at = Date.parse(j && j.timestamp) || 0;
+    switch (j && j.type) {
+      case 'user.message':
+        prompt = String(d.content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        startedAt = at;
+        openTurn = null;
+        break;
+      case 'assistant.message':
+        if (d.model) model = String(d.model);
+        break;
+      case 'session.model_change':
+        if (d.newModel && d.newModel !== 'auto') model = String(d.newModel);
+        break;
+      case 'session.auto_mode_resolved':
+        if (!model && d.chosenModel) model = String(d.chosenModel);
+        break;
+      case 'assistant.turn_start': {
+        const idx = Number(d.turnId);
+        openTurn = {
+          index: Number.isFinite(idx) ? idx : lastCompletedIndex != null ? lastCompletedIndex + 1 : 0,
+          start: at,
+        };
+        break;
+      }
+      case 'assistant.turn_end': {
+        const idx = Number(d.turnId);
+        const index = Number.isFinite(idx)
+          ? idx
+          : openTurn
+            ? openTurn.index
+            : lastCompletedIndex != null
+              ? lastCompletedIndex + 1
+              : 0;
+        const startAt = openTurn && openTurn.index === index ? openTurn.start : startedAt || at;
+        const prev = reqs.find((r) => r.index === index);
+        if (prev) prev.endedAt = at;
+        else reqs.push({ index, startedAt: startAt, endedAt: at });
+        lastCompletedIndex = index;
+        completedAt = at;
+        openTurn = null;
+        break;
+      }
+      case 'session.error':
+        // A failed turn is over too. Without this a quota / network error would leave the session
+        // "thinking" until copilotInFlight's 60-minute residue guard.
+        if (openTurn) {
+          const prev = reqs.find((r) => r.index === openTurn.index);
+          if (prev) prev.endedAt = at;
+          else reqs.push({ index: openTurn.index, startedAt: openTurn.start || startedAt || at, endedAt: at });
+          lastCompletedIndex = openTurn.index;
+          completedAt = at;
+          openTurn = null;
+        } else if (startedAt && at >= startedAt && completedAt < startedAt) {
+          completedAt = at;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  // The newest user message has no finished turn after it → still running.
+  const inFlight = Boolean(openTurn) || Boolean(startedAt && completedAt < startedAt);
+  const index = inFlight
+    ? openTurn
+      ? openTurn.index
+      : lastCompletedIndex != null
+        ? lastCompletedIndex + 1
+        : 0
+    : lastCompletedIndex;
+  const value = {
+    index,
+    prompt,
+    model,
+    startedAt,
+    completed: !inFlight && Boolean(startedAt && completedAt >= startedAt),
+    completedAt: !inFlight && startedAt && completedAt >= startedAt ? completedAt : 0,
+    reqs: reqs.sort((a, b) => a.index - b.index),
+    // CLI tool calls are not in this stream; the SQLite session_files table supplies the file list.
+    changed: [],
+  };
+  copilotCliLiveCache.set(id, { key, value });
+  return value;
+}
+
+/* ───────────── */
+
+/**
  * The reporter hook's "main console phase": every event writes the current phase (thinking/tool/await)
  * into `sessionPhase` in ~/.workgremlin/hooks/<station>.json (see packages/reporter/src/hook.js).
  * That is reported truth and outranks a phase inferred from genie-history; the UI shows it as truth
@@ -558,8 +741,11 @@ function readSqliteSessionRows(storage) {
       // Neither table is guaranteed (Copilot versions may change); missing → empty, no exception surfaced.
       const turnsBySid = readCopilotTurns(db);
       const filesBySid = readCopilotFiles(db);
-      // Side evidence for "is this turn in flight" (VS Code's chat index — see readCopilotChatIndex)
-      const chatBySid = readCopilotChatIndex();
+      // Side evidence for "is this turn in flight". The VS Code extension keeps a chat index in
+      // workspaceStorage/state.vscdb; the CLI has no such index and appends its own event stream instead
+      // (session-state/<id>/events.jsonl, see readCopilotCliLiveRequest). Pick the reader by store.
+      const cli = isCopilotCliStorage(storage);
+      const chatBySid = cli ? new Map() : readCopilotChatIndex();
 
       return rows
         .map((row) => {
@@ -591,9 +777,10 @@ function readSqliteSessionRows(storage) {
             hasPendingTurn: t.hasPendingTurn || false,
             files,
             turns: Array.isArray(t.turns) ? t.turns : [],
-            chat: chatBySid.get(id) || null,
-            // The newest request (VS Code session log): in flight or not + user text + start/end times
-            live: readCopilotLiveRequest(id),
+            chat: cli ? null : chatBySid.get(id) || null,
+            // The newest request: in flight or not + user text + start/end times. VS Code reads its session
+            // log; the CLI reads its events stream (same shape).
+            live: cli ? readCopilotCliLiveRequest(id) : readCopilotLiveRequest(id),
           };
         })
         .filter(Boolean);
@@ -641,6 +828,9 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
       // otherwise an empty list (older Copilot may lack that table — readCopilotFiles already returns empty).
       files: { count: (row.files || []).length, recent: row.files || [], lastAt: row.lastUpdated || null },
       phase: inWindow ? 'thinking' : 'idle',
+      // Only the CLI store records the model per turn (events.jsonl); the VS Code extension's current
+      // model is read globally by copilotCurrentModel instead.
+      model: (row.live && row.live.model) || '',
       action: '',
       target: '',
       tool: '',
@@ -679,16 +869,35 @@ function readCopilotSessions(storage, { ws = '', now = Date.now() } = {}) {
   return out;
 }
 
+/**
+ * All Copilot sessions across both forms, merged by session id and deduped (keep the fresher row).
+ * The CLI and the extension keep separate stores, so this is normally a plain concatenation; dedupe only
+ * protects against a future version that makes them share ids.
+ * @param {{ws?: string, now?: number}} o
+ */
+function readCopilotAllSessions({ ws = '', now = Date.now() } = {}) {
+  const byId = new Map();
+  for (const storage of copilotStorages()) {
+    for (const row of readCopilotSessions(storage, { ws, now })) {
+      if (!row || !row.id) continue;
+      const prev = byId.get(row.id);
+      if (!prev || Number(row.lastUpdated || 0) > Number(prev.lastUpdated || 0)) byId.set(row.id, row);
+    }
+  }
+  return [...byId.values()];
+}
+
 function readCopilotPhaseFromSqlite(workspacePath, client = '', session = '') {
-  // copilot-only: `client` now describes the form only (cli / vscode); the floor is guaranteed by the caller
-  const storage = findPluginStorage(RE_GITHUB_COPILOT, RE_GITHUB_COPILOT_MARKS);
-  if (!storage) return null;
-  const rowList = readSqliteSessionRows(storage)
+  // copilot-only: `client` now describes the form only (cli / vscode); the floor is guaranteed by the caller.
+  // Both stores are read: the CLI (~/.copilot) and the VS Code extension (globalStorage/github.copilot-chat).
+  const rowList = [];
+  for (const storage of copilotStorages()) rowList.push(...readSqliteSessionRows(storage));
+  const matched = rowList
     .filter((r) => (!session || String(r.id || '') === String(session)))
     .filter((r) => (!workspacePath || !r.projectPath || path.resolve(r.projectPath) === path.resolve(workspacePath)));
-  if (!rowList.length) return null;
-  rowList.sort((a, b) => Number(b.lastUpdated || 0) - Number(a.lastUpdated || 0));
-  const row = rowList[0];
+  if (!matched.length) return null;
+  matched.sort((a, b) => Number(b.lastUpdated || 0) - Number(a.lastUpdated || 0));
+  const row = matched[0];
   // Phase: trust VS Code's chat index on "is this turn in flight" first; only with no evidence fall back to the
   // 2-minute freshness window. Same rule as listSessions (copilotInWindow) — do not let old sessions show
   // thinking forever, and do not report idle while a turn is actually running.
@@ -781,7 +990,9 @@ function copilotCurrentModel() {
 function readCopilotDone(sessionId) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
-  const at = copilotDoneAt({ live: readCopilotLiveRequest(id) }, Date.now());
+  // CLI first (its event stream names the exact turn end), then the VS Code extension's session log.
+  const live = readCopilotCliLiveRequest(id) || readCopilotLiveRequest(id);
+  const at = copilotDoneAt({ live }, Date.now());
   if (!at) return null;
   return { doneAt: at, doneTitle: '', doneCount: 0, doneFiles: [] };
 }
@@ -840,6 +1051,9 @@ let copilotIndexCache = new Map();
 
 /** sessionId -> { key, value }: the log is append-only, so unchanged mtime+size means no need to reread */
 const copilotLiveCache = new Map();
+
+/** Same cache for the CLI's events.jsonl (append-only; phase polling runs every 1.5s) */
+const copilotCliLiveCache = new Map();
 
 /* ───────────── */
 
@@ -1067,6 +1281,8 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     const projectPath = s.projectPath || '';
     const projectName = s.project || (projectPath ? path.basename(projectPath) : 'GitHub Copilot');
     const projectId = projectName;
+    // CLI sessions record their own model; the extension has only one global selected model.
+    const sessionModel = s.model || model;
 
     // Make sure the project & member exist (quiet write, no broadcast)
     bus.ensureProject(projectId, projectPath, null, 'report');
@@ -1141,7 +1357,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         projectId,
         memberId,
         sessionId: s.id || null,
-        model,
+        model: sessionModel,
         title,
         startedAt,
         endedAt,
@@ -1167,7 +1383,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         projectId,
         memberId,
         sessionId: s.id || null,
-        model,
+        model: sessionModel,
         title,
         startedAt: s.liveStartedAt || now,
         endedAt: null,
@@ -1189,26 +1405,89 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
 /* ── Unified contract aliases + exports (via mutation, so the C reference held while sessions.js cycles stays stable) ── */
 module.exports.client = 'copilot';
 module.exports.RE_GITHUB_COPILOT = RE_GITHUB_COPILOT;
-// Product detection metadata (the old products.js 9F entry): 9F has only the plugin form.
+
+/**
+ * 9F CLI source branch (source kind `copilot-cli`).
+ *
+ * The generic CLI handler scans `*.jsonl`; Copilot CLI keeps its sessions in SQLite, so this floor reads its
+ * own store instead. Everything the session table needs (phase / in-flight / done / turn list) is already
+ * computed by readCopilotSessions; this only projects one row per session with the CLI form.
+ */
+function copilotCliHandler(p, src, ctx) {
+  const { workspacePath, now, claimSession, upsert, TIMEOUT_MS } = ctx;
+  const roots = (src.dataPaths && src.dataPaths.length ? src.dataPaths : [src.dataPath]).filter(Boolean);
+  const seen = new Set();
+  for (const root of roots) {
+    for (const s of readCopilotSessions(root, { ws: workspacePath, now })) {
+      if (!s || !s.id || seen.has(s.id)) continue;
+      seen.add(s.id);
+      // Same "still open" window as the CLI / hook paths: older rows are history, not sessions in the table.
+      if (!s.lastUpdated || now - s.lastUpdated >= TIMEOUT_MS) continue;
+      if (!claimSession(p.id, s.id)) continue;
+      upsert({
+        floor: p.id,
+        id: s.id,
+        sessionId: s.id,
+        source: 'cli',
+        sourceKind: 'cli',
+        form: 'cli',
+        project: s.project || '',
+        projectPath: s.projectPath || '',
+        mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
+        current: Boolean(s.current),
+        fresh: false,
+        live: true,
+        runtime: s.runtime,
+        pending: s.pending || 0,
+        todos: s.todos,
+        files: s.files,
+        phase: s.phase,
+        action: s.action || '',
+        target: s.target || '',
+        tool: s.tool || '',
+        context: s.context || [],
+        prompt: s.prompt || '',
+        doneAt: s.doneAt || 0,
+        doneTitle: s.doneTitle || '',
+        doneCount: s.doneCount || 0,
+        doneFiles: s.doneFiles || [],
+        doneCancelled: Boolean(s.doneCancelled),
+        inferred: Boolean(s.inferred),
+        lastEventAt: s.lastUpdated || 0,
+      });
+    }
+  }
+}
+
+const kindHandlers = { 'copilot-cli': copilotCliHandler };
+
+// Product detection metadata: the Copilot CLI and the VS Code extension keep separate stores, but they are
+// one floor -- form (cli / vscode) is the only difference, and sessions are merged by session id.
 const meta = {
   id: '9F',
   name: 'GitHub Copilot',
-  kind: 'plugin',
+  kind: 'cli',
   cmd: 'copilot',
   agent: 'copilot',
-  plugin: true,
+  plugin: false,
   pluginRe: RE_GITHUB_COPILOT,
   // This floor's plugin storage root marker: the same-prefixed `github.copilot` (base extension) has no
   // session store, so session-store.db filters it out
   pluginStorageMarks: ['session-store.db'],
-  // Show only the GitHub Copilot VS Code plugin layer (no standalone CLI form).
-  sources: ['plugin'],
+  sources: [
+    { kind: 'copilot-cli', label: 'CLI', client: 'copilot', form: 'cli', dirs: [CLI_ROOT] },
+    { kind: 'plugin', label: 'VS Code plugin', client: 'copilot', form: 'vscode' },
+  ],
   dataKind: 'copilot',
-  // On-disk detection (used by findDataPath): the plugin form lives under VS Code's globalStorage
+  // On-disk detection (used by findDataPath): the CLI data root, and the extension under globalStorage.
   matchRe: RE_GITHUB_COPILOT,
-  homeDirs: [path.join(HOME, '.config', 'Code', 'User', 'globalStorage')],
+  homeDirs: [CLI_ROOT],
+  homeDirsPlugin: [path.join(HOME, '.config', 'Code', 'User', 'globalStorage')],
 };
 module.exports.meta = meta;
+module.exports.kindHandlers = kindHandlers;
+module.exports.copilotCliRoot = copilotCliRoot;
+module.exports.copilotStorages = copilotStorages;
 /**
  * 9F's static subagent definition dirs. GitHub Copilot has no "user-level / project-level agent definition
  * file" mechanism (its globalStorage is not an agent definition dir), so this returns [] and scans nothing.
@@ -1238,6 +1517,8 @@ module.exports.readCopilotPhaseFromSqlite = readCopilotPhaseFromSqlite;
 /* Readers (from the old sessions.js) + 9F-only SQLite session assembly */
 module.exports.readSqliteSessionRows = readSqliteSessionRows;
 module.exports.readCopilotSessions = readCopilotSessions;
+module.exports.readCopilotAllSessions = readCopilotAllSessions;
+module.exports.readCopilotCliLiveRequest = readCopilotCliLiveRequest;
 module.exports.copilotCurrentModel = copilotCurrentModel;
 module.exports.readCopilotDone = readCopilotDone;
 module.exports.COPILOT_PHASE_MS = COPILOT_PHASE_MS;
