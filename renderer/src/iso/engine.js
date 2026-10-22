@@ -12,6 +12,7 @@ import {
   AX,
   AY,
   AZ,
+  TILE,
   UNIT_Z,
   project,
   depthOf,
@@ -2786,6 +2787,44 @@ export function createIsoOffice(canvas, opts = {}) {
     raf = requestAnimationFrame(tick);
   }
 
+  /**
+   * Overhead light: a soft warm pool hanging above the workstations.
+   *
+   * The room is a night scene whose only light comes in through the rear window, so the front half
+   * (near the camera, where most people sit) reads darker than the rest. Add one additive light from
+   * above: additive means it lifts whatever it covers — floor, walls, furniture and people — instead of
+   * laying a grey veil over them. The clip covers the room's vertical footprint (the floor diamond plus
+   * the same diamond one wall-height up), so the empty surround never receives a glow.
+   *
+   * @param {CanvasRenderingContext2D} c
+   */
+  function drawOverheadLight(c) {
+    const center = project(ROOM.w / 2, ROOM.d / 2, WALL.h * 0.72);
+    const radius = TILE * Math.hypot(ROOM.w, ROOM.d) * 0.55;
+    c.save();
+    c.beginPath();
+    for (const z of [0, WALL.h]) {
+      const pts = [
+        project(0, 0, z),
+        project(ROOM.w, 0, z),
+        project(ROOM.w, ROOM.d, z),
+        project(0, ROOM.d, z),
+      ];
+      c.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i += 1) c.lineTo(pts[i].x, pts[i].y);
+      c.closePath();
+    }
+    c.clip();
+    c.globalCompositeOperation = 'lighter';
+    const g = c.createRadialGradient(center.x, center.y, 0, center.x, center.y, radius);
+    g.addColorStop(0, 'rgba(255,236,206,0.11)');
+    g.addColorStop(0.55, 'rgba(255,232,200,0.05)');
+    g.addColorStop(1, 'rgba(255,228,196,0)');
+    c.fillStyle = g;
+    c.fill();
+    c.restore();
+  }
+
   function draw(now) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -2841,6 +2880,9 @@ export function createIsoOffice(canvas, opts = {}) {
     if (reportGhost) items.push({ depth: depthOf(reportGhost.x, reportGhost.y) + 3, draw: (c) => drawFloatingGhostSprite(c, reportGhost) });
     items.sort((p, q) => p.depth - q.depth);
     for (const it of items) it.draw(ctx, now);
+
+    // Overhead light sits above everything in the room, so it is added after the depth-sorted layer.
+    drawOverheadLight(ctx);
 
     // Path-network debug
     if (showPaths) {
