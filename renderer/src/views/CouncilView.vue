@@ -118,6 +118,12 @@ async function submit() {
 /* ---------------------------------------------------------------- result */
 
 const council = computed(() => (store.current ? store.current.council : null));
+/** Meeting-level failure text (round/phase/floor + raw CLI error). Clarification questions have their own block. */
+const meetingError = computed(() => {
+  if (!council.value || !council.value.error) return '';
+  if (council.value.verdict === 'needs_clarification') return '';
+  return council.value.error;
+});
 const summary = computed(() => store.summary);
 const rounds = computed(() => (store.current ? store.current.roundResults : []));
 const plan = computed(() => (store.current ? store.current.plan : null));
@@ -456,7 +462,6 @@ function toggleReviewer(id) {
         </div>
 
         <p v-if="formError" class="why bad" data-testid="cv-form-error">{{ formError }}</p>
-        <p v-if="store.error" class="why bad" data-testid="cv-store-error">{{ store.error }}</p>
 
         <button class="primary" type="submit" :disabled="store.submitting || !store.canStart">
           {{ store.submitting ? t('council.starting') : t('council.start') }}
@@ -482,7 +487,17 @@ function toggleReviewer(id) {
 
     <!-- ------------------------------------------------------------ right column: summary + collapsed process -->
     <section class="main">
-      <p v-if="!store.current" class="empty">{{ t('council.pick_one') }}</p>
+      <div v-if="store.submitting" class="working" data-testid="cv-preflight" role="status" aria-live="polite">
+        <span class="pulse" aria-hidden="true"></span>
+        <strong class="working-hd">{{ t('council.preflight_running') }}</strong>
+      </div>
+
+      <template v-if="!store.current">
+        <p v-if="!store.error && !store.submitting" class="empty">{{ t('council.pick_one') }}</p>
+        <section v-else-if="store.error" class="card alert" data-testid="cv-op-error">
+          <p class="alert-text">{{ store.error }}</p>
+        </section>
+      </template>
 
       <template v-else>
         <header class="head">
@@ -507,6 +522,10 @@ function toggleReviewer(id) {
           </div>
         </header>
 
+        <section v-if="meetingError" class="card alert" data-testid="cv-council-error">
+          <p class="alert-text">{{ meetingError }}</p>
+        </section>
+
         <!-- ------------------------------------------------- live work strip -->
         <div v-if="working" class="working" data-testid="cv-working" role="status" aria-live="polite">
           <span class="pulse" aria-hidden="true"></span>
@@ -523,7 +542,9 @@ function toggleReviewer(id) {
           <span class="dim">{{ t('council.round_n', { n: working.roundNo }) }}</span>
         </div>
 
-        <p v-if="store.error" class="why bad" data-testid="cv-op-error">{{ store.error }}</p>
+        <section v-if="store.error" class="card alert" data-testid="cv-op-error">
+          <p class="alert-text">{{ store.error }}</p>
+        </section>
 
         <!-- ------------------------------------------------ summary card -->
         <section class="card summary" data-testid="cv-summary">
@@ -1079,6 +1100,20 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
   background: var(--bg-panel);
 }
 .card.result { border-color: var(--border-strong); }
+/* Server/preflight failures belong in the right column, where the meeting lives; the left column is
+   the form. `pre-wrap` is required: provider errors keep their own line breaks. */
+.card.alert {
+  border-color: var(--state-blocked);
+  background: color-mix(in srgb, var(--state-blocked) 6%, var(--bg-panel));
+}
+.alert-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--state-blocked);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* ---- summary ---- */
 .scoreline { display: flex; align-items: baseline; gap: 14px; }

@@ -406,6 +406,7 @@ const MESSAGES = {
     'council.models_hint':
       '填了就作为 --model 传给那一层。开跑前会先让每层回答一句话（试麦）：模型过期、账号没登录、网络不通会直接拒绝建会，并写明是哪一层、什么原因；不会留下半场会。',
     'council.starting': '试麦并启动中…',
+    'council.preflight_running': '正在逐层试麦，确认每一层现在都能说话…',
     'council.roles': '角色分配',
     'council.role.moderator': '主持人',
     'council.role.main': '主答',
@@ -866,6 +867,7 @@ const MESSAGES = {
     'council.models_hint':
       'A value is passed to that floor as --model. Before creating the meeting the server asks every selected floor one short question: an expired model, a missing login or an unreachable provider is refused right there, naming the floor and the reason — no half-built meeting is left behind.',
     'council.starting': 'Checking floors and starting\u2026',
+    'council.preflight_running': 'Probing each selected floor before creating the meeting\u2026',
     'council.roles': 'Role assignment',
     'council.role.moderator': 'Moderator',
     'council.role.main': 'Main answerer',

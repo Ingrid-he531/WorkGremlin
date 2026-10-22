@@ -476,6 +476,9 @@ The P0 changes (implemented in this tree):
 4. **Timeouts and retry.** Single-turn timeouts are 240s (isolated) / 600s (workspace); the whole meeting has a
    90-minute budget. A transient `timeout` / `network` turn gets **one** retry; auth/model/quota/protocol never
    do. The error text notes a retry, and the meeting-level reason shows the normalized label.
+5. **Feedback lives with the meeting.** The left column is only the compose form (and its own validation); the
+   right column shows the preflight strip, the preflight/create error, the meeting-level failure reason, and the
+   final result. A failed start never disappears just because `current` is still empty.
 
 **Real validation (2026-10-22, separate server, temp DB).** `4F` moderator / `8F` main / `6F` reviewer, one
 round, no workspace: `POST /councils` → preflight all ok (4F 37s, 8F 27s, 6F 6s, sequential) → meeting

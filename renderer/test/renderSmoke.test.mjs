@@ -516,6 +516,23 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     ok(`council: truncated material is labelled (${W.truncated})`, won.includes(W.truncated) && won.includes('/tmp/spec.md'));
   }
 
+  const startFail = await render('/src/views/CouncilView.vue', () => {
+    const council = useCouncilStore();
+    council.floors = [
+      { floorId: '1F', name: 'CodeBuddy', ready: true, cliPath: '/usr/bin/codebuddy', reason: null },
+      { floorId: '4F', name: 'Claude Code', ready: true, cliPath: '/usr/bin/claude', reason: null },
+    ];
+    council.current = null;
+    council.error = '这些楼层现在说不了话 —— 1F（400 Copilot: The requested model is not supported）';
+  });
+  ok('council · failed start: renders without throwing', typeof startFail === 'string', startFail && startFail.error);
+  if (typeof startFail === 'string') {
+    const alert = chunkOf(startFail, 'cv-op-error');
+    ok('council: the preflight reason is shown in the right column',
+      alert.includes('The requested model is not supported'), alert.slice(0, 240));
+    ok('council: the left form does not repeat the server error', !startFail.includes('cv-store-error'));
+  }
+
   const partial = await render('/src/views/CouncilView.vue', seedCouncil(PARTIAL));
   ok('council · partial: renders without throwing', typeof partial === 'string', partial && partial.error);
   if (typeof partial === 'string') {
@@ -525,6 +542,9 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     ok('council: partial has no adjudication/final result block', !partial.includes('cv-result'));
     ok('council: partial has no report files block', !partial.includes('cv-report-files'));
     ok('council: partial still shows which floor did not answer', partial.includes(W.noAnswer));
+    const finalError = chunkOf(partial, 'cv-council-error');
+    ok('council: the final failure reason is shown in the right column',
+      finalError.includes('最终交付稿没有解析出来'), finalError.slice(0, 240));
   }
 
   const incomplete = await render('/src/views/CouncilView.vue', seedCouncil(INCOMPLETE));
@@ -556,6 +576,8 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     const roleTable = roleTableAt < 0 ? '' : clarification.slice(roleTableAt, roleTableEnd);
     ok('council: asking for information is not shown as a moderator failure',
       roleTable.includes(W.needClarification) && !roleTable.includes(W.noAnswer), roleTable);
+    ok('council: a clarification question is not repeated as a failure',
+      !clarification.includes('cv-council-error'));
     ok('council: no adjudication is fabricated for a clarification request',
       !clarification.includes('cv-result'));
     ok('council: the clarification report is still archived',
