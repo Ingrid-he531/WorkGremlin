@@ -384,7 +384,8 @@ const MESSAGES = {
     'records.board.sum_floors': '楼层 {n} 个',
     'records.board.active_window': '活跃时段 {from}–{to}',
     'records.board.untimed': '另有 {n} 条没有开始时间，画不进图',
-    'records.board.hint': '只列这一天有任务的楼层 · 同一时间并行的那段会加深（一层就一行）· 点块跳到列表里那条任务',
+    'records.board.concurrent': '此刻 {n} 个任务并行',
+    'records.board.hint': '只列这一天有任务的楼层 · 同一时间并行的那段会按并发数加深，悬停看数量（一层就一行）· 点块跳到列表里那条任务',
 
     // ---- council ----
     // Wording matters here, because it decides what "no answer" is read as. Anything that is
@@ -838,7 +839,8 @@ const MESSAGES = {
     'records.board.sum_floors': '{n} floors',
     'records.board.active_window': 'active {from}–{to}',
     'records.board.untimed': '{n} more have no start time and cannot be drawn',
-    'records.board.hint': 'only floors with tasks that day · overlapping runs are darkened (one row per floor) · click a block to open the task',
+    'records.board.concurrent': '{n} tasks running at once',
+    'records.board.hint': 'only floors with tasks that day · the more tasks run at once, the darker the overlap — hover for the count (one row per floor) · click a block to open the task',
 
     // ---- council ----
     // The wording here carries weight: it decides how "said nothing" gets read.

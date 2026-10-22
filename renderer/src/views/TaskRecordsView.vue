@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useTaskStore } from '../stores/tasks';
-import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, dayStartOf, fmtHM, isBoardTask } from '../lib/dayBoard';
+import { HOUR_COLS, MIN_PER_DAY, buildFloorGantt, concurrencyAlpha, dayStartOf, fmtHM, isBoardTask } from '../lib/dayBoard';
 import {
   TIME_RANGES,
   clampDay,
@@ -840,12 +840,19 @@ function blockTitle(it) {
   return `${promptOf(task) || tr('records.untitled_task')}\n${fmtHM(it.startMin)}–${fmtHM(it.endMin)} · ${dur} · ${stateLabel(task.state)}`;
 }
 /**
- * Darkening of overlapping spans: 2 running at once adds one step, 3 adds another (capped at the
- * darkest so it doesn't smear into a black blob). Darken only, no recolor — the block's own state
- * color is barely covered by this layer, so you can still read "done" vs "running".
+ * Clicking the dark parallel overlay opens the task under the cursor, exactly as if the overlay were
+ * not there: find the topmost painted block at that instant (items are sorted by start, longer first,
+ * and painted in order, so the last match wins).
  */
-function scrimAlpha(count) {
-  return Math.min(0.6, 0.22 * (count - 1));
+function openOverlap(row, ev) {
+  const lane = ev.currentTarget.parentElement;
+  const rect = lane && lane.getBoundingClientRect();
+  if (!rect || !rect.width) return;
+  const at = boardDay.value + ((ev.clientX - rect.left) / rect.width) * MIN_PER_DAY * 60_000;
+  let hit = null;
+  for (const it of row.items) if (it.s <= at && at < it.e) hit = it;
+  if (!hit) hit = row.items.find((it) => it.s <= at && at <= it.e);
+  if (hit) openTask(hit.task.id);
 }
 /** Click a block = view that task's detail: jump to the list view and select it */
 function openTask(id) {
@@ -1409,7 +1416,8 @@ async function saveRetention() {
                 :title="blockTitle(it)"
                 @click="openTask(it.task.id)"
               />
-              <!-- More than one at the same time: lay down a dark layer (not another row) -->
+              <!-- More than one at the same time: lay down a dark layer (not another row). The deeper the
+                   colour, the more tasks run at once; hovering names the count, clicking still opens a task. -->
               <span
                 v-for="(o, i) in row.overlaps"
                 :key="`o${i}`"
@@ -1419,8 +1427,10 @@ async function saveRetention() {
                   width: `${o.width}%`,
                   top: '2px',
                   height: `${LANE_H - 4}px`,
-                  background: `rgba(0, 0, 0, ${scrimAlpha(o.count)})`,
+                  background: `rgba(0, 0, 0, ${concurrencyAlpha(o.count)})`,
                 }"
+                :title="tr('records.board.concurrent', { n: o.count })"
+                @click="openOverlap(row, $event)"
               />
             </div>
           </div>
@@ -1615,14 +1625,14 @@ async function saveRetention() {
 /* cancelled is the red one (failed / pending never reach the board, see BOARD_HIDDEN_STATES) */
 .block.st-cancelled { background: #ff7b72; }
 /**
- * The span where tasks run in parallel: lay down a dark layer (not another row). Capped at 0.6 so it
- * doesn't smear into a black blob. It doesn't take mouse events — hover still lands on the task block
- * underneath (the task tooltip still shows).
+ * The span where tasks run in parallel: lay down a dark layer (not another row). Opacity comes from
+ * concurrencyAlpha (log scale, deeper for every extra task). It must take mouse events so hovering can
+ * name the count; clicks are forwarded to the task under the cursor by openOverlap.
  */
 .overlap {
   position: absolute;
   border-radius: 2px;
-  pointer-events: none;
+  cursor: pointer;
 }
 .now-line {
   position: absolute;

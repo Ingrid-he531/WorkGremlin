@@ -56,13 +56,17 @@ export function fmtHM(minutes) {
 
 /**
  * A task's time span; returns null when the start time is unavailable (nothing fabricated).
- * @param {{started_at?:number|null, ended_at?:number|null, state?:string}} t
+ * @param {{started_at?:number|null, ended_at?:number|null, state?:string, cancel_reason?:string|null}} t
  * @param {number} now the current instant (local ms): only used to decide how far to draw a task that is "still running"
  * @returns {{s:number,e:number}|null}
  */
 export function spanOf(t, now) {
   const s = Number(t && t.started_at) || 0;
   if (!s) return null;
+  // An orphan-session cancellation means "the session disappeared", not "the task ran until the sweep".
+  // Even if an older row still carries the sweep time in ended_at, draw only the start instant: the real
+  // stop time was never observed. (The server also clears that field, see db migrate().)
+  if (t && t.cancel_reason === 'orphan_session') return { s, e: s };
   let e = Number(t && t.ended_at) || 0;
   if (!e) e = t.state === 'running' ? now : s;
   return { s, e: Math.max(e, s) };
@@ -97,6 +101,21 @@ export function overlapSpans(items) {
     else out.push({ ...seg });
   }
   return out;
+}
+
+/**
+ * Opacity of the parallel overlay for `count` tasks running at once.
+ *
+ * The board has one row per floor, so concurrency is shown by **darkening**, not by adding rows.
+ * The scale is logarithmic: every extra task still visibly deepens the overlay (2 → 0.16, 8 → 0.48,
+ * 32 → 0.80) instead of saturating at 4. It stops at 0.90 so the block's state colour stays readable
+ * even when a floor is running dozens of tasks at once.
+ * @param {number} count concurrent tasks (values below 2 are clamped to 2: a single task has no overlay)
+ * @returns {number} rgba black alpha in (0, 1]
+ */
+export function concurrencyAlpha(count) {
+  const n = Math.max(2, Number(count) || 2);
+  return Math.min(0.9, 0.16 * Math.log2(n));
 }
 
 /**

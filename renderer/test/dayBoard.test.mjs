@@ -10,7 +10,7 @@
  *
  * 跑法：`npm run test:day-board`
  */
-const { HOUR_COLS, MIN_PER_DAY, BOARD_HIDDEN_STATES, buildFloorGantt, dayStartOf, fmtHM, isBoardTask, spanOf } = await import(
+const { HOUR_COLS, MIN_PER_DAY, BOARD_HIDDEN_STATES, buildFloorGantt, concurrencyAlpha, dayStartOf, fmtHM, isBoardTask, spanOf } = await import(
   '../src/lib/dayBoard.js'
 );
 
@@ -114,6 +114,17 @@ console.log('\n[4] 同一层并行 ⇒ 仍是**一行**，重叠的那段加深�
   ok('首尾相接 ⇒ 没有加深段', g.rows[0].overlaps.length === 0, JSON.stringify(g.rows[0].overlaps));
 }
 
+console.log('\n[4b] 并发越多颜色越深（不再到 4 个就封顶）');
+{
+  const counts = [2, 3, 4, 8, 16, 32];
+  const alphas = counts.map((n) => concurrencyAlpha(n));
+  ok('并发数越大，蒙层越深', alphas.every((a, i) => i === 0 || a > alphas[i - 1]), alphas.map((a) => a.toFixed(3)).join(' '));
+  ok('8 个比 4 个明显更深', concurrencyAlpha(8) - concurrencyAlpha(4) >= 0.1, `${concurrencyAlpha(4)} → ${concurrencyAlpha(8)}`);
+  ok('几十个并发仍比旧的 0.6 封顶更深', concurrencyAlpha(32) > 0.6, String(concurrencyAlpha(32)));
+  ok('最深也留一点底色，不糊成纯黑', concurrencyAlpha(1000) <= 0.9, String(concurrencyAlpha(1000)));
+  ok('单个任务没有蒙层，0/1 也按 2 个算（不会除零或变负）', concurrencyAlpha(1) === concurrencyAlpha(2) && concurrencyAlpha(0) === concurrencyAlpha(2));
+}
+
 console.log('\n[5] 没有结束时间怎么画（不编造）');
 {
   const g = gantt([task(600, null, { state: 'running' })], 660);
@@ -129,6 +140,21 @@ console.log('\n[5] 没有结束时间怎么画（不编造）');
   const g = gantt([{ id: 'x', started_at: null, ended_at: min(600), state: 'done', client: 'codex' }], 700);
   ok('没有开始时间 ⇒ 进不了图，单记一笔 untimed', g.total === 0 && g.untimed === 1 && g.rows.length === 0);
   ok('spanOf 也直接回 null', spanOf({ started_at: null }, min(700)) === null);
+}
+
+console.log('\n[5b] 孤儿会话取消：结束时间未知，只画开始那一瞬间');
+{
+  // 很早开始、昨天才被发现会话已消失：即使行里还留着"发现时间"当结束时间，也不能画成长条
+  const g = gantt([task(600, 1380, { state: 'cancelled', cancel_reason: 'orphan_session' })], 1400);
+  const it = g.rows[0].items[0];
+  ok('孤儿取消只占开始那一刻（10:00–10:01），不横跨到 23:00', it.startMin === 600 && it.endMin === 601, `${it.startMin}–${it.endMin}`);
+  ok('块宽仍大于 0（能看见、能点）', it.width > 0);
+}
+{
+  // 正常取消（用户按了停止）仍然画到真实结束时间
+  const g = gantt([task(600, 700, { state: 'cancelled' })], 1400);
+  const it = g.rows[0].items[0];
+  ok('普通取消仍按真实结束时间画', it.startMin === 600 && it.endMin === 700, `${it.startMin}–${it.endMin}`);
 }
 
 console.log('\n[6] 跨天 / 边界');
