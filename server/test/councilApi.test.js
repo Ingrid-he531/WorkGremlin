@@ -71,9 +71,38 @@ const orch = {
   },
 };
 
+/** Preflight is a real model call, so the API test stubs it; individual cases override `probeBehavior`. */
+const probeCalls = [];
+let probeBehavior = () => null;
+const probeFloors = async (floorIds, opts) => {
+  probeCalls.push({ floorIds: [...floorIds], models: { ...(opts && opts.models) } });
+  return floorIds.map((floorId) => {
+    const forced = probeBehavior(floorId, opts);
+    if (forced) return { floorId, ok: false, model: null, cliPath: null, status: 'failed', error: forced, errorKind: 'model', durationMs: 1, cached: false };
+    return {
+      floorId,
+      ok: true,
+      model: (opts && opts.models && opts.models[floorId]) || null,
+      cliPath: (FLOORS.find((f) => f.floorId === floorId) || {}).cliPath || null,
+      status: 'ok',
+      error: null,
+      errorKind: null,
+      durationMs: 1,
+      cached: false,
+    };
+  });
+};
+
 const app = express();
 app.use(express.json());
-app.use('/api/v1', createCouncilRouter({ repo, orchestrator: orch, deps: { listFloors: () => FLOORS } }));
+app.use(
+  '/api/v1',
+  createCouncilRouter({
+    repo,
+    orchestrator: orch,
+    deps: { listFloors: () => FLOORS, probeFloors },
+  })
+);
 
 const post = (p, body) =>
   fetch(`${base}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
@@ -116,6 +145,27 @@ const valid = (over = {}) => ({
       body.defaults.maxRounds >= 1 && body.defaults.maxRoundsLimit >= body.defaults.maxRounds);
     ok('material byte limits are published', body.defaults.materialMaxBytes > 0 && body.defaults.materialTotalMaxBytes > 0);
     ok('turn timeouts are published', body.defaults.turnTimeoutMs > 0 && body.defaults.workspaceTurnTimeoutMs >= 60_000);
+  }
+
+  /* ------------------------------------------------------------ preflight endpoint */
+  head('preflight: the UI can ask before creating a meeting');
+  {
+    probeBehavior = () => null;
+    probeCalls.length = 0;
+    const res = await post('/councils/preflight', { floors: ['4F', '1F'], models: { '1F': 'deepseek-v4.1-flash' } });
+    const body = await res.json();
+    ok('200', res.status === 200, String(res.status));
+    ok('ok=true when every floor answers', body.ok === true, JSON.stringify(body));
+    ok('one result per requested floor', body.results.length === 2, String(body.results.length));
+    ok('the per-seat model reached the probe', probeCalls.at(-1).models['1F'] === 'deepseek-v4.1-flash', JSON.stringify(probeCalls.at(-1)));
+
+    probeBehavior = (floorId) => (floorId === '1F' ? '401 You need to sign in to use this model' : null);
+    const bad = await post('/councils/preflight', { floors: ['4F', '1F'] });
+    const badBody = await bad.json();
+    ok('ok=false when one floor fails', badBody.ok === false, JSON.stringify(badBody));
+    ok('the failure is attached to that floor',
+      badBody.results.find((r) => r.floorId === '1F').ok === false, JSON.stringify(badBody));
+    probeBehavior = () => null;
   }
 
   /* ------------------------------------------------------------ rejection */
@@ -183,6 +233,33 @@ const valid = (over = {}) => ({
     ok('400', res.status === 400, String(res.status));
     ok('the file is named', String(r.error.message).includes('这个文件肯定不存在'), String(r.error.message));
     ok('nothing was silently skipped', repo.listCouncils(50).length === 0);
+  }
+
+  head('start: preflight refuses a floor that cannot speak');
+  {
+    probeBehavior = (floorId) =>
+      floorId === '1F' ? '400 Copilot: The requested model is not supported.' : null;
+    const before = repo.listCouncils(50).length;
+    const res = await post('/councils', valid());
+    const r = await res.json();
+    ok('400', res.status === 400, String(res.status));
+    ok('the dead floor is named', String(r.error.message).includes('1F'), String(r.error.message));
+    ok('the provider reason is echoed', String(r.error.message).includes('model is not supported'), String(r.error.message));
+    ok('no meeting was built', repo.listCouncils(50).length === before);
+    probeBehavior = () => null;
+  }
+
+  head('start: per-seat model reaches preflight and is persisted');
+  {
+    probeCalls.length = 0;
+    const res = await post('/councils', valid({ models: { '1F': 'deepseek-v4.1-flash', '7F': '' } }));
+    const r = await res.json();
+    ok('201', res.status === 201, `${res.status} ${JSON.stringify(r).slice(0, 120)}`);
+    ok('preflight received the model', probeCalls.at(-1).models['1F'] === 'deepseek-v4.1-flash', JSON.stringify(probeCalls.at(-1)));
+    ok('a blank model is not sent', !('7F' in probeCalls.at(-1).models), JSON.stringify(probeCalls.at(-1)));
+    const seat = repo.listParticipants(r.council.id).find((p) => p.floor_id === '1F');
+    ok('the participant row stores it', seat && seat.model === 'deepseek-v4.1-flash', JSON.stringify(seat));
+    await del(`/councils/${r.council.id}`);
   }
 
   /* ------------------------------------------------------------ success */

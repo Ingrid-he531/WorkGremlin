@@ -134,6 +134,40 @@ function alive(pid) {
     ok('错误里点明是解析不出', /解析不出/.test(String(r.error)), String(r.error));
     ok('raw keeps the original output for troubleshooting', r.raw.includes('这不是 JSON'), String(r.raw));
   }
+  head('退出码 0 但 stdout 为空：这是模型/账号报错，不是"解析不出"');
+  {
+    const bin = stub(
+      'model-gone.sh',
+      'echo "400 Copilot: The requested model is not supported." >&2\nexit 0'
+    );
+    const r = await runOnce({ bin, args: [], cwd: TMP, timeoutMs: 10_000, agent: 'x' });
+    ok('status=failed (there is no body to parse)', r.status === 'failed', r.status);
+    ok('errorKind=model', r.errorKind === 'model', String(r.errorKind));
+    ok('the provider text is kept verbatim', String(r.error).includes('requested model is not supported'), String(r.error));
+    ok('text stays empty', r.text === '');
+  }
+  head('退出码 0 且 stdout/stderr 都为空：也是失败，不是 unparsed');
+  {
+    const bin = stub('silent.sh', 'exit 0');
+    const r = await runOnce({ bin, args: [], cwd: TMP, timeoutMs: 10_000, agent: 'x' });
+    ok('status=failed', r.status === 'failed', r.status);
+    ok('errorKind=provider', r.errorKind === 'provider', String(r.errorKind));
+    ok('the message says both streams were empty', /stdout 和 stderr 都是空的/.test(String(r.error)), String(r.error));
+  }
+  head('超时但输出里有网络错误：errorKind=network（便于决定是否重试）');
+  {
+    const bin = stub('reconnect.sh', 'echo "Reconnecting... request timed out" >&2\nsleep 60');
+    const r = await runOnce({ bin, args: [], cwd: TMP, timeoutMs: 600, agent: 'x' });
+    ok('status=timeout', r.status === 'timeout', r.status);
+    ok('errorKind=network', r.errorKind === 'network', String(r.errorKind));
+  }
+  head('非零退出：认证类错误单独归类');
+  {
+    const bin = stub('auth.sh', 'echo "401 You need to sign in to use this model" >&2\nexit 1');
+    const r = await runOnce({ bin, args: [], cwd: TMP, timeoutMs: 10_000, agent: 'x' });
+    ok('status=failed', r.status === 'failed', r.status);
+    ok('errorKind=auth', r.errorKind === 'auth', String(r.errorKind));
+  }
   head('起不来：记失败，不抛异常');
   {
     const r = await runOnce({ bin: path.join(TMP, '根本不存在'), args: [], cwd: TMP, timeoutMs: 5_000, agent: 'x' });

@@ -445,6 +445,49 @@ shows the `council_utterances` text by round (floor, phase, status, duration; ra
 proposal, review, moderation) but no `RoundResult` appear separately as "incomplete" (`DEBATE_PHASES` excludes
 adjudication / final). All data comes from stored utterance rows; nothing is inferred or backfilled.
 
+**P0 robustness (2026-10-22): from "never completed" to one real completed meeting.** Five real meetings
+existed, all created on 2026-10-19/22: **0 `completed`**, 1 `partial`, 4 failed at round 0. The failures were
+structural, not one bug:
+
+- `c_3c18…` — 1F CodeBuddy exited **0** with an empty stdout and a 400 on stderr: its default model
+  (`copilot/gemini-3.8-flash`) had been retired. The runner called that "unparsed", which sent the user looking
+  for a parser bug.
+- `c_f257…` — the moderator had been changed to 3F Codex, but `codex exec` was stuck in
+  `Reconnecting... request timed out`; 120s was not enough and the meeting died at round 0.
+- `c_d1c9…` — 1F CodeBuddy hit the 120s timeout.
+- `c_2393…` — `partial`; one round took ~20 minutes, and round 2's main turn timed out at 300s.
+
+`floors.js` reported **all seven floors `ready`** because it only checked that the executable existed. That is
+the readiness bug: a retired model, an expired login or a broken provider are invisible to an `fs` check.
+
+The P0 changes (implemented in this tree):
+
+1. **Preflight ("试麦").** `probeFloors()` asks each selected floor one short sentence with its configured
+   model before `POST /councils` persists anything. A failure returns 400 naming the floor and the raw provider
+   text; no half-built meeting. Probes run **sequentially** (measured: OpenCode took 29s alone but 73s parallel
+   with Claude Code + Qoder), 60s each. A success is cached 5 minutes, a failure 1 minute (a user who fixes a
+   login should not have to restart the app). `POST /councils/preflight` exposes the same check to the UI.
+2. **Per-seat model pass-through.** `council_participants.model` stores an optional model; each recipe maps it to
+   the product's own flag (`--model` / `-m`). Blank means the CLI's own default. The create form has one model
+   input per occupied seat.
+3. **Failure classification.** `council_utterances.error_kind` stores `auth` / `model` / `network` / `quota` /
+   `timeout` / `meeting_timeout` / `protocol` / `spawn` / `exit` / `output_limit` / `provider`. `runner.js`
+   treats **exit 0 + empty stdout** as a provider failure (`failed`), not `unparsed`; stderr is kept verbatim.
+4. **Timeouts and retry.** Single-turn timeouts are 240s (isolated) / 600s (workspace); the whole meeting has a
+   90-minute budget. A transient `timeout` / `network` turn gets **one** retry; auth/model/quota/protocol never
+   do. The error text notes a retry, and the meeting-level reason shows the normalized label.
+
+**Real validation (2026-10-22, separate server, temp DB).** `4F` moderator / `8F` main / `6F` reviewer, one
+round, no workspace: `POST /councils` → preflight all ok (4F 37s, 8F 27s, 6F 6s, sequential) → meeting
+`completed` / `done` in **1018s**. All six turns were `ok` with `error_kind=NULL`:
+plan 37s, proposal 171s, review 135s, moderation 165s, adjudication 47s, final 222s. The report and four files
+were archived under `~/.workgremlin/councils/c_58fbdef8fed8009184216969/`; the final draft contains the
+adjudication's changes. It is still a long meeting (~17 min) — P0 made it **survive and finish**, not fast.
+
+Still true on this machine (2026-10-22): 1F works only with an explicit `--model`; 3F's network is broken; 7F
+is not signed in. The preflight now says so in seconds instead of killing a meeting. Remaining P1 work
+(server-generated plan fallback, allow reviewer absence, quick mode, resume) is not implemented.
+
 **Real-machine failure (2026-10-19, 1F round 0, located and fixed).** Historical meeting
 `c_f66f8f9f86185744a29a16c0` was not a timeout. 1F CodeBuddy exited with code **0** in about **297 s** (under the
 300 s cap), wrote **146176 bytes** to stdout and nothing to stderr, but the transcript array was missing its final

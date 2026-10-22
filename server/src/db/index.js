@@ -100,7 +100,7 @@ const COUNCIL_STATUS_TABLES = {
   },
   council_participants: {
     marker: "'needs_clarification'",
-    columns: ['council_id', 'floor_id', 'role', 'agent', 'cli_path', 'status', 'error'],
+    columns: ['council_id', 'floor_id', 'role', 'agent', 'cli_path', 'model', 'status', 'error'],
     create: `
       CREATE TABLE council_participants (
         council_id TEXT NOT NULL,
@@ -108,6 +108,7 @@ const COUNCIL_STATUS_TABLES = {
         role       TEXT NOT NULL CHECK (role IN ('moderator','main','reviewer')),
         agent      TEXT NOT NULL,
         cli_path   TEXT,
+        model      TEXT,
         status     TEXT NOT NULL DEFAULT 'pending'
                    CHECK (status IN ('pending','running','ok','failed','unparsed','needs_clarification','skipped','cancelled')),
         error      TEXT,
@@ -128,6 +129,7 @@ const COUNCIL_STATUS_TABLES = {
       'model',
       'status',
       'error',
+      'error_kind',
       'input_tokens',
       'output_tokens',
       'cache_read_tokens',
@@ -150,6 +152,7 @@ const COUNCIL_STATUS_TABLES = {
         status        TEXT NOT NULL DEFAULT 'ok'
                       CHECK (status IN ('ok','failed','timeout','unparsed')),
         error         TEXT,
+        error_kind    TEXT,
         input_tokens       INTEGER,
         output_tokens      INTEGER,
         cache_read_tokens  INTEGER,
@@ -193,8 +196,11 @@ function migrateCouncilStatusChecks(db) {
       db.exec(`DROP TABLE IF EXISTS ${old}`);
       db.exec(`ALTER TABLE ${table} RENAME TO ${old}`);
       db.exec(spec.create);
-      const cols = spec.columns.join(', ');
-      db.exec(`INSERT INTO ${table} (${cols}) SELECT ${cols} FROM ${old}`);
+      // Copy only the columns the old table actually has: a rebuild that also introduces a new column
+      // (model / error_kind) must let that column take its default, not fail with "no such column".
+      const cols = spec.columns.filter((c) => hasColumn(db, old, c));
+      const list = cols.join(', ');
+      db.exec(`INSERT INTO ${table} (${list}) SELECT ${list} FROM ${old}`);
       db.exec(`DROP TABLE ${old}`);
       for (const sql of spec.indexes) db.exec(sql);
 
@@ -395,7 +401,10 @@ function migrate(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
   // Council room: the old vote/analysis schema is intentionally not migrated (the refactor shipped before
   // any real council data existed). resetLegacyCouncilSchema already dropped and recreated those tables
-  // before schema.sql ran, so nothing needs adding here.
+  // before schema.sql ran. These two columns were added after the review-loop rewrite, so an existing DB
+  // needs the incremental ALTER; a new DB already has them from schema.sql.
+  ensureColumn(db, 'council_participants', 'model', 'model TEXT');
+  ensureColumn(db, 'council_utterances', 'error_kind', 'error_kind TEXT');
   // Backfill: products once missing from CLIENT_BASES have their main agent member's client written as
   // NULL, and an empty client is treated on the frontend as "generic, show it on every floor" —— so
   // that product's members drift into every floor (measured: the qoder main agent row drifted into
@@ -1478,8 +1487,8 @@ function createRepo(db) {
     del: db.prepare(`DELETE FROM councils WHERE id = ?`),
 
     insertParticipant: db.prepare(`
-      INSERT INTO council_participants (council_id, floor_id, role, agent, cli_path, status)
-      VALUES (@councilId, @floorId, @role, @agent, @cliPath, 'pending')
+      INSERT INTO council_participants (council_id, floor_id, role, agent, cli_path, model, status)
+      VALUES (@councilId, @floorId, @role, @agent, @cliPath, @model, 'pending')
     `),
     setParticipantStatus: db.prepare(`
       UPDATE council_participants SET status = @status, error = @error
@@ -1531,11 +1540,11 @@ function createRepo(db) {
 
     insertUtterance: db.prepare(`
       INSERT INTO council_utterances
-        (council_id, round_no, floor_id, phase, content, model, status, error,
+        (council_id, round_no, floor_id, phase, content, model, status, error, error_kind,
          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
          parse_dropped, started_at, ended_at, duration_ms)
       VALUES
-        (@councilId, @roundNo, @floorId, @phase, @content, @model, @status, @error,
+        (@councilId, @roundNo, @floorId, @phase, @content, @model, @status, @error, @errorKind,
          @inputTokens, @outputTokens, @cacheReadTokens, @cacheWriteTokens,
          @parseDropped, @startedAt, @endedAt, @durationMs)
     `),
@@ -1634,7 +1643,11 @@ function createRepo(db) {
     return councilStmt.failStaleRunning.run({ error: reason, at: at != null ? at : Date.now() }).changes;
   }
 
-  const insertParticipant = (p) => councilStmt.insertParticipant.run(p);
+  const insertParticipant = (p) =>
+    councilStmt.insertParticipant.run({
+      ...p,
+      model: p && p.model != null && String(p.model).trim() ? String(p.model).trim() : null,
+    });
   const setParticipantStatus = (councilId, floorId, status, error) =>
     councilStmt.setParticipantStatus.run({ councilId, floorId, status, error: error != null ? error : null });
   const listParticipants = (councilId) => councilStmt.listParticipants.all(councilId);
@@ -1689,6 +1702,7 @@ function createRepo(db) {
       model: u.model != null ? u.model : null,
       status: u.status || 'ok',
       error: u.error != null ? u.error : null,
+      errorKind: u.errorKind != null ? u.errorKind : null,
       inputTokens: u.inputTokens != null ? u.inputTokens : null,
       outputTokens: u.outputTokens != null ? u.outputTokens : null,
       cacheReadTokens: u.cacheReadTokens != null ? u.cacheReadTokens : null,

@@ -327,6 +327,7 @@ CREATE TABLE IF NOT EXISTS council_participants (
              CHECK (role IN ('moderator','main','reviewer')),
   agent      TEXT NOT NULL,                -- codebuddy / claude / kilo / opencode
   cli_path   TEXT,                         -- cliInstallPath; NULL = not detected at the time
+  model      TEXT,                         -- optional per-seat --model; NULL = the CLI's own default
   status     TEXT NOT NULL DEFAULT 'pending'
              CHECK (status IN ('pending','running','ok','failed','unparsed','needs_clarification','skipped','cancelled')),
   error      TEXT,
@@ -406,6 +407,7 @@ CREATE TABLE IF NOT EXISTS council_utterances (
   status        TEXT NOT NULL DEFAULT 'ok'
                 CHECK (status IN ('ok','failed','timeout','unparsed')),
   error         TEXT,
+  error_kind    TEXT,                      -- auth / model / network / quota / timeout / protocol / ...
   input_tokens       INTEGER,
   output_tokens      INTEGER,
   cache_read_tokens  INTEGER,

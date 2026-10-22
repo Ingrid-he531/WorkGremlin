@@ -105,19 +105,49 @@ const DEFAULTS = Object.freeze({
   COUNCIL_ROUNDS_MAX: 8,
   /**
    * Timeout for a single participant's turn. On expiry we **kill the process** and record the failure
-   * honestly — the timeout is not "wait a bit longer", it is "we definitely cannot get this turn". It
-   * leaves ample margin for the slowest floor (one answer runs a whole model call).
+   * honestly — the timeout is not "wait a bit longer", it is "we definitely cannot get this turn".
+   *
+   * 240s, not 120s: measured on 2026-10-22, a cold CLI start plus one model call already needs 3-5s,
+   * and a Codex request that is retrying its own connection can burn 120s without ever reaching the
+   * model. The old 120s turned "the network is being slow" into "this meeting is dead" far too early.
    */
-  COUNCIL_TURN_TIMEOUT_MS: 120_000,
+  COUNCIL_TURN_TIMEOUT_MS: 240_000,
   /**
    * Timeout for a single participant's turn in **workspace mode** (councils.workspace_path has a value).
    *
    * Much wider than isolated mode: an isolated-mode participant just "talks", whereas a workspace-mode
    * participant uses read-only tools to dig through the code round after round (read a file → search
-   * references → read again), so one answer may contain dozens of tool calls. 120s is a normal timeout for
-   * it, not an anomaly — using it would misrecord "it is still reading" as "it gave no stance".
+   * references → read again), so one answer may contain dozens of tool calls. Measured: a CodeBuddy plan
+   * took 297s on a real project; 300s was a coin flip, so 600s.
    */
-  COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: 300_000,
+  COUNCIL_WORKSPACE_TURN_TIMEOUT_MS: 600_000,
+  /**
+   * Timeout for one floor's "can you speak?" probe before a meeting is created. A probe is one short
+   * answer, so it must not inherit the full turn timeout — but 60s, not 15s: measured 2026-10-22,
+   * Claude Code and OpenCode cold starts (OpenCode's `--standalone` launches a private server) took
+   * 18s and 29s on their own. Probes run one at a time so those numbers stay representative; a false
+   * "cannot speak" is worse than waiting a minute.
+   */
+  COUNCIL_PREFLIGHT_TIMEOUT_MS: 60_000,
+  /** How long a successful probe verdict is reused. Repeated creations must not re-run every CLI. */
+  COUNCIL_PROBE_CACHE_MS: 5 * 60_000,
+  /**
+   * How long a **failed** verdict is reused. Much shorter than success: the usual failure is an expired
+   * login or a retired model, and the user may fix it a minute later. Re-probing a broken floor costs
+   * less than telling the user to restart the app.
+   */
+  COUNCIL_PROBE_FAILURE_CACHE_MS: 60_000,
+  /**
+   * Whole-meeting wall-clock budget. Retries and long per-turn timeouts can otherwise turn a stuck
+   * meeting into an hour of "working". On expiry the current turn is recorded as a timeout and the
+   * meeting wraps up with whatever completed.
+   */
+  COUNCIL_MEETING_TIMEOUT_MS: 90 * 60_000,
+  /**
+   * Extra attempts for a **transient** turn (network / timeout). Auth, model, quota, protocol and spawn
+   * errors are never retried: repeating them only wastes minutes and produces the same message.
+   */
+  COUNCIL_TURN_RETRIES: 1,
   /**
    * The session title (`--title`) for 7F Kilo / 8F OpenCode participants — **also the lock that keeps them
    * out of the office**.
@@ -155,6 +185,25 @@ const DEFAULTS = Object.freeze({
   COUNCIL_MATERIAL_MAX_BYTES: 64 * 1024,
   /** Byte cap for all inlined material (the prompt must fit into argv / stdin; it cannot grow without bound) */
   COUNCIL_MATERIAL_TOTAL_MAX_BYTES: 200 * 1024,
+  /**
+   * Normalized failure classes attached to a turn. They decide two things the UI and the retry policy
+   * need to distinguish: "the process never spoke because of the account/network" vs. "it spoke, but
+   * not in our protocol". Raw CLI text is always kept; this is only a stable label on top of it.
+   */
+  COUNCIL_ERROR_KINDS: Object.freeze([
+    'auth',
+    'model',
+    'network',
+    'quota',
+    'timeout',
+    'meeting_timeout',
+    'protocol',
+    'spawn',
+    'exit',
+    'output_limit',
+    'provider',
+    'unknown',
+  ]),
 });
 
 /** server -> client */

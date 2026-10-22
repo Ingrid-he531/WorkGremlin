@@ -38,7 +38,11 @@ export const useCouncilStore = defineStore('council', {
       severityWeights: {},
       conflictWeight: 10,
       scoreMax: 100,
+      turnTimeoutMs: 0,
       workspaceTurnTimeoutMs: 0,
+      preflightTimeoutMs: 0,
+      meetingTimeoutMs: 0,
+      turnRetries: 0,
       materialMaxBytes: 0,
       materialTotalMaxBytes: 0,
     },
@@ -167,7 +171,7 @@ export const useCouncilStore = defineStore('council', {
      * Start a council.
      * @returns {Promise<string|null>} the new id; on failure null and the reason in `error`
      */
-    async create({ topic, moderator, main, reviewers, files, maxRounds, workspacePath }) {
+    async create({ topic, moderator, main, reviewers, files, maxRounds, workspacePath, models }) {
       const project = useProjectStore();
       this.submitting = true;
       this.error = '';
@@ -181,6 +185,13 @@ export const useCouncilStore = defineStore('council', {
       };
       const ws = String(workspacePath == null ? '' : workspacePath).trim();
       if (ws) body.workspacePath = ws;
+      // Only send non-empty entries: an empty string means "let the CLI use its own default".
+      const modelMap = {};
+      for (const [floorId, model] of Object.entries(models || {})) {
+        const m = String(model == null ? '' : model).trim();
+        if (m) modelMap[floorId] = m;
+      }
+      if (Object.keys(modelMap).length) body.models = modelMap;
       try {
         const info = project.serverInfo || {};
         const res = await fetch(`${httpBase(info)}/api/v1/councils`, {

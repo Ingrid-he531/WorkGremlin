@@ -816,6 +816,7 @@ run commands or access the network. `workspace_path` only selects which director
 | Commands / network | Not allowed. 1F/4F expose no execution tool; 7F/8F deny `bash`; the 3F sandbox blocks writes and network. **Honest limitation:** 2F `--plan` and the 3F sandbox may still run read-only commands |
 | Background material | Read by the server and inlined verbatim into the prompt; when the directory is empty, the participants rely on this material |
 | Environment | Inherited as-is (login state lives in each CLI's home). Isolation relies on cwd + read-only mode, not on moving `HOME`. All recipes inject `WORKGREMLIN_DISABLE=1` |
+| Model | Optional per-seat model, stored in `council_participants.model` and passed through that product's own flag (`--model` / `-m`). Blank means the CLI's own default. Because a retired default is invisible to an executable check, every selected floor must pass a one-sentence **preflight** before the meeting is created; a failing floor blocks creation and names its raw reason. Probes run one at a time (parallel cold starts produced false timeouts), 60s each; successes are cached 5 min, failures 1 min |
 | Eligible floors | 1F CodeBuddy / 2F Cline / 3F Codex / 4F Claude Code / 6F Qoder / 7F Kilo Code / 8F OpenCode. Other floors do not appear even if their CLI is installed |
 
 **Known imperfections (accepted):**
@@ -842,6 +843,11 @@ run commands or access the network. `workspace_path` only selects which director
 | `main` | 1 | Round 1 proposal; revisions; final draft and change notes |
 | `reviewer` | ≥ 1 | Independent structured review each round (reviewers do not see each other) |
 
+0. **Preflight — can these floors speak?** Before a council row exists, each selected floor answers one short
+   sentence using its configured model. A failure is reported as a 400 naming the floor and the raw CLI text
+   (auth / model / network / timeout / quota / protocol); no half-built meeting is left behind. This is a gate,
+   not a model test: it exists because "the executable exists" and "this floor can answer right now" are
+   different facts.
 1. **Round 0 — plan.** The moderator decomposes the topic, assigns review focus, and returns
    `{"needsClarification":[...]}` if essential information is missing. The server then ends normally with
    `verdict='needs_clarification'` / `status='done'`, marks later roles `skipped`, and archives the report.
@@ -897,6 +903,10 @@ run commands or access the network. `workspace_path` only selects which director
    round → `partial`, none → `failed`; `council.error` names the round, phase, floor and raw CLI error.
    In-flight participants are marked `failed`; the "working" indicator disappears. A missing role fails before
    any model call. A truncated transcript with a complete prefix is recovered rather than treated as a failure.
+   **One retry** is made for a transient `timeout` / `network` failure; `auth` / `model` / `quota` / `protocol` /
+   `spawn` failures are never retried (they would repeat the same sentence and waste the budget). The whole
+   meeting has a 90-minute wall-clock cap. Every failed turn stores a normalized `council_utterances.error_kind`
+   next to the raw text, so "the model is retired" is distinguishable from "the network is down".
 
 **Convergence (server-computed; model-reported scores are ignored):**
 
@@ -941,6 +951,9 @@ With no completed round, show `—`, never 100.
 ### 15.6 Acceptance points
 
 1. Floors without a CLI are greyed out with a reason; when none is available, the entry is disabled.
+1a. **Preflight:** a floor whose executable exists but cannot answer (retired model, expired login, broken
+    network) is refused at creation with the floor and the raw provider reason; no meeting row is created.
+    A per-seat model is passed to the probe and stored on the participant; a blank model uses the CLI default.
 2. **Role validation:** missing moderator / missing main / no reviewer / one floor in two roles / a floor
    outside the allowlist / a floor without a CLI → the whole request is rejected with a reason; no silent
    degradation and no half-started meeting.
@@ -966,6 +979,10 @@ With no completed round, show `—`, never 100.
     `needs_clarification` / `done`; the moderator shows "more information needed", other roles show "not
     reached", and the report is archived. Setting a workspace later does not rerun or rewrite a finished
     meeting.
+9d. **Retry, deadline and error kind:** a transient `timeout` / `network` turn is attempted once more; an
+    `auth` / `model` / `quota` / `protocol` failure is not. A meeting cannot outlive its 90-minute budget.
+    Failed turns store `error_kind`; the UI/report can label "model unavailable" separately from "network
+    down" without hiding the raw CLI text.
 10. Material truncation is labelled.
 11. On server shutdown all child processes are reaped (no orphans) and temp directories are removed.
 12. The office and task records show **no trace** of a council.

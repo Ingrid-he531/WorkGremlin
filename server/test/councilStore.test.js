@@ -66,7 +66,14 @@ head('create and read back');
 head('participants and roles');
 {
   repo.insertParticipant({ councilId: 'c1', floorId: '4F', role: 'moderator', agent: 'claude', cliPath: '/usr/bin/claude' });
-  repo.insertParticipant({ councilId: 'c1', floorId: '1F', role: 'main', agent: 'codebuddy', cliPath: '/usr/bin/codebuddy' });
+  repo.insertParticipant({
+    councilId: 'c1',
+    floorId: '1F',
+    role: 'main',
+    agent: 'codebuddy',
+    cliPath: '/usr/bin/codebuddy',
+    model: 'deepseek-v4.1-flash',
+  });
   repo.insertParticipant({ councilId: 'c1', floorId: '7F', role: 'reviewer', agent: 'kilo', cliPath: null });
   const ps = repo.listParticipants('c1');
   ok(
@@ -75,6 +82,8 @@ head('participants and roles');
     JSON.stringify(ps.map((p) => `${p.floor_id}:${p.role}`)),
   );
   ok('cli_path is preserved for troubleshooting', ps[0].cli_path === '/usr/bin/claude');
+  ok('a per-seat model round-trips', ps[1].model === 'deepseek-v4.1-flash', String(ps[1].model));
+  ok('a seat without a model stays NULL (not empty string)', ps[0].model === null, String(ps[0].model));
   ok('initial status = pending', ps[1].status === 'pending');
   repo.setParticipantStatus('c1', '1F', 'failed', 'spawn ENOENT');
   const one = repo.listParticipants('c1')[1];
@@ -158,7 +167,7 @@ head('utterances: unavailable values stay NULL');
   });
   repo.insertUtterance({
     councilId: 'c1', roundNo: 1, floorId: '8F', phase: 'review', content: null, model: null,
-    status: 'timeout', error: '120s 未返回，已杀进程',
+    status: 'timeout', error: '120s 未返回，已杀进程', errorKind: 'network',
     startedAt: AT + 100, endedAt: AT + 220, durationMs: 120000,
   });
   const us = repo.listUtterances('c1');
@@ -166,6 +175,8 @@ head('utterances: unavailable values stay NULL');
   ok('phase, model, parse_dropped round-trip', us[1].phase === 'review' && us[1].model === 'gpt-5.1' && us[1].parse_dropped === 2);
   ok('a missing token count is NULL, **not 0**', us[1].output_tokens === null, String(us[1].output_tokens));
   ok('failure text is kept verbatim', us[2].status === 'timeout' && String(us[2].error).includes('120s'));
+  ok('the normalized failure kind is stored', us[2].error_kind === 'network', String(us[2].error_kind));
+  ok('an ok turn has no error kind', us[1].error_kind === null, String(us[1].error_kind));
   ok('duration is recorded when known', us[1].duration_ms === 50);
 }
 
@@ -432,6 +443,10 @@ head('legacy schema: vote-era tables are dropped and rebuilt, not half-read');
   const uc = r2.raw.prepare('PRAGMA table_info(council_utterances)').all().map((c) => c.name);
   ok('the old vote column is gone', !uc.includes('vote'), uc.join(','));
   ok('the new phase/model columns are present', uc.includes('phase') && uc.includes('model'));
+  ok('the new error_kind column is present', uc.includes('error_kind'), uc.join(','));
+
+  const pc = r2.raw.prepare('PRAGMA table_info(council_participants)').all().map((c) => c.name);
+  ok('the new participant model column is present', pc.includes('model'), pc.join(','));
 
   const created = r2.createCouncil({ id: 'c_new', topic: 'new topic', maxRounds: 2, createdAt: AT + 100 });
   ok('a new council can be created after the reset', created && created.id === 'c_new');

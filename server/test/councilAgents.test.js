@@ -47,6 +47,22 @@ head('every floor has a recipe');
 for (const f of FLOORS) ok(`${f} has build()`, Boolean(RECIPES[f] && typeof RECIPES[f].build === 'function'));
 ok('no unexpected floors', Object.keys(RECIPES).length === FLOORS.length, Object.keys(RECIPES).join(','));
 
+/* ------------------------------------------------------------ model pass-through */
+head('optional per-floor model is passed with that product\'s own flag');
+{
+  const MODEL_FLAG = { '1F': '--model', '2F': '-m', '3F': '-m', '4F': '--model', '6F': '-m', '7F': '--model', '8F': '--model' };
+  for (const floor of FLOORS) {
+    const without = RECIPES[floor].build({ bin: `/usr/bin/${floor}`, prompt: '问题' });
+    ok(`${floor} adds no model flag when the seat has no model`,
+      !without.args.includes('--model') && !without.args.includes('-m'), JSON.stringify(without.args));
+
+    const withModel = RECIPES[floor].build({ bin: `/usr/bin/${floor}`, prompt: '问题', model: 'vendor/model-1' });
+    const at = withModel.args.indexOf(MODEL_FLAG[floor]);
+    ok(`${floor} passes ${MODEL_FLAG[floor]} vendor/model-1`,
+      at >= 0 && withModel.args[at + 1] === 'vendor/model-1', JSON.stringify(withModel.args));
+  }
+}
+
 /* ------------------------------------------------------------ read-only */
 head('read-only: 1F / 4F whitelist read tools only');
 {

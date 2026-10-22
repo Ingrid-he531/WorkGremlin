@@ -113,7 +113,10 @@ const READ_TOOLS = 'Read,Grep,Glob';
 /**
  * One recipe per floor.
  *
- * build({ bin, prompt }) → { bin, args, env, stdin }
+ * build({ bin, prompt, model }) → { bin, args, env, stdin }
+ *   · `model` is optional and comes from the seat's stored `council_participants.model`. When present
+ *     it is passed through the product's own model flag. Empty means "whatever that CLI is configured
+ *     with"; the preflight probe reports the real failure when that default is broken.
  *   · The council is **always read-only**: every recipe narrows the participant to read-type tools
  *     (see READ_TOOLS / READ_PERMISSION and each recipe's own note above) —— no writes, no network, and
  *     command execution only where a CLI cannot turn it off (see 2F / 3F).
@@ -143,8 +146,10 @@ const RECIPES = {
     agent: 'codebuddy',
     name: 'CodeBuddy',
     // Measured: `-p` with no message reads the pipe (help text: "useful for pipes")
-    build({ bin, prompt }) {
+    build({ bin, prompt, model }) {
       const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
+      // Model goes before the variadic --allowedTools, which would otherwise swallow it.
+      if (model) args.push('--model', model);
       args.push('--tools', READ_TOOLS, '--allowedTools', READ_TOOLS);
       return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
@@ -170,8 +175,11 @@ const RECIPES = {
      * in `~/.cline/data`. The office lock is therefore the **prompt marker**: Cline stores the prompt
      * itself as the session title, and floorCline.js skips titles containing COUNCIL_PROMPT_MARKER.
      */
-    build({ bin, prompt }) {
-      return { bin, args: ['--plan', '--json', prompt], env: { ...QUIET_ENV }, stdin: null };
+    build({ bin, prompt, model }) {
+      const args = ['--plan', '--json'];
+      if (model) args.push('-m', model);
+      args.push(prompt);
+      return { bin, args, env: { ...QUIET_ENV }, stdin: null };
     },
   },
 
@@ -193,25 +201,24 @@ const RECIPES = {
      * `-c web_search="disabled"` — no web search.
      * `-` reads the prompt from stdin (the pipe the runner sets up).
      */
-    build({ bin, prompt }) {
-      return {
-        bin,
-        args: [
-          'exec', '--json', '--sandbox', 'read-only', '--ephemeral',
-          '--skip-git-repo-check', '--ignore-user-config',
-          '-c', 'web_search="disabled"', '-',
-        ],
-        env: { ...QUIET_ENV },
-        stdin: prompt,
-      };
+    build({ bin, prompt, model }) {
+      const args = [
+        'exec', '--json', '--sandbox', 'read-only', '--ephemeral',
+        '--skip-git-repo-check', '--ignore-user-config',
+        '-c', 'web_search="disabled"',
+      ];
+      if (model) args.push('-m', model);
+      args.push('-');
+      return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
   },
 
   '4F': {
     agent: 'claude',
     name: 'Claude Code',
-    build({ bin, prompt }) {
+    build({ bin, prompt, model }) {
       const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config'];
+      if (model) args.push('--model', model);
       // `--permission-prompts none` = refuse when nobody answers (rather than "hang and wait"). It
       // goes **before** `--allowedTools`: that switch takes variadic arguments and would swallow it
       // if placed later.
@@ -237,13 +244,10 @@ const RECIPES = {
      *
      * The prompt arrives over stdin (Qoder reads it when `-p` gets no argument).
      */
-    build({ bin, prompt }) {
-      return {
-        bin,
-        args: ['-p', '--output-format', 'json', '--name', SESSION_TITLE],
-        env: { ...QUIET_ENV },
-        stdin: prompt,
-      };
+    build({ bin, prompt, model }) {
+      const args = ['-p', '--output-format', 'json', '--name', SESSION_TITLE];
+      if (model) args.push('-m', model);
+      return { bin, args, env: { ...QUIET_ENV }, stdin: prompt };
     },
   },
 
@@ -254,10 +258,12 @@ const RECIPES = {
     // Our prompt always starts with our own template block and never begins with '-', so there is no
     // need to add a '--' separator (adding it risks yargs eating it as a separator, doing more harm
     // than good).
-    build({ bin, prompt }) {
+    build({ bin, prompt, model }) {
+      const args = ['run', prompt, '--format', 'json', '--title', SESSION_TITLE];
+      if (model) args.push('--model', model);
       return {
         bin,
-        args: ['run', prompt, '--format', 'json', '--title', SESSION_TITLE],
+        args,
         env: {
           KILO_CONFIG_CONTENT: JSON.stringify({
             plugin: [], // strip WorkGremlin's own reporting plugin (otherwise participants get reported into the office)
@@ -273,7 +279,9 @@ const RECIPES = {
   '8F': {
     agent: 'opencode',
     name: 'OpenCode',
-    build({ bin, prompt }) {
+    build({ bin, prompt, model }) {
+      const args = ['run', prompt, '--format', 'json', '--standalone', '--title', SESSION_TITLE];
+      if (model) args.push('--model', model);
       return {
         bin,
         /**
@@ -288,7 +296,7 @@ const RECIPES = {
          * OpenCode has no `plugin: []`-style config switch that would help here (unlike 7F Kilo): the shared
          * daemon ignores per-run config for plugins it already loaded.
          */
-        args: ['run', prompt, '--format', 'json', '--standalone', '--title', SESSION_TITLE],
+        args,
         env: {
           OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: READ_PERMISSION }),
           ...QUIET_ENV,

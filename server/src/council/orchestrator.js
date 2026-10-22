@@ -73,6 +73,27 @@ const PHASE_ZH = {
   final: '最终交付',
 };
 
+/** Human-readable label for a normalized failure class (the raw CLI text is always shown separately). */
+const ERROR_KIND_ZH = {
+  auth: '账号未登录或无权限',
+  model: '模型不可用',
+  network: '网络不通',
+  quota: '额度或限流',
+  timeout: '超时',
+  meeting_timeout: '整场超时',
+  protocol: '输出格式不符',
+  spawn: '命令起不来',
+  exit: '进程异常退出',
+  output_limit: '输出过大',
+  provider: '命令行报错',
+  unknown: '未归类失败',
+};
+
+/** A transient failure is worth one more attempt; auth/model/quota/protocol failures are not. */
+const TRANSIENT_KINDS = new Set(['timeout', 'network']);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** DB snake_case → camelCase used by prompts */
 function materialOf(row) {
   return {
@@ -135,6 +156,9 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   const mkdtemp = deps.mkdtemp || ((prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const timeoutMs = deps.timeoutMs || DEFAULTS.COUNCIL_TURN_TIMEOUT_MS;
   const workspaceTimeoutMs = deps.workspaceTimeoutMs || DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS;
+  const meetingTimeoutMs = deps.meetingTimeoutMs || DEFAULTS.COUNCIL_MEETING_TIMEOUT_MS;
+  const turnRetries =
+    deps.turnRetries != null ? Math.max(0, Number(deps.turnRetries) || 0) : DEFAULTS.COUNCIL_TURN_RETRIES;
   const removeDir = deps.removeDir || ((dir) => fs.rmSync(dir, { recursive: true, force: true }));
   const isDir =
     deps.isDir ||
@@ -198,20 +222,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         content: null,
         model: null,
         error: '这一轮还没发问，这场会就已经在收尾了',
-        raw: '',
-        tokens: null,
-        startedAt,
-        endedAt: now(),
-        durationMs: 0,
-      };
-    }
-    if (!recipe || !bin) {
-      return {
-        floorId: floor.floor_id,
-        status: 'failed',
-        content: null,
-        model: null,
-        error: recipe ? '没有可用的命令行可执行文件' : `议事厅不支持 ${floor.floor_id} 这一层`,
+        errorKind: null,
         raw: '',
         tokens: null,
         startedAt,
@@ -220,11 +231,46 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       };
     }
 
-    const inv = recipe.build({ bin, prompt });
+    // Whole-meeting budget: a retry or a slow turn must not push the meeting past its wall-clock cap.
+    const remainingMs = ctx.deadline ? ctx.deadline - now() : Number.POSITIVE_INFINITY;
+    if (remainingMs <= 0) {
+      const at = now();
+      return {
+        floorId: floor.floor_id,
+        status: 'timeout',
+        content: null,
+        model: null,
+        error: `整场会议已超过 ${Math.round(meetingTimeoutMs / 60_000)} 分钟预算，这一轮没有开始`,
+        errorKind: 'meeting_timeout',
+        raw: '',
+        tokens: null,
+        startedAt: at,
+        endedAt: at,
+        durationMs: 0,
+      };
+    }
+    const turnMs = Number.isFinite(remainingMs) ? Math.max(1, Math.min(perTurnMs, remainingMs)) : perTurnMs;
+    if (!recipe || !bin) {
+      return {
+        floorId: floor.floor_id,
+        status: 'failed',
+        content: null,
+        model: null,
+        error: recipe ? '没有可用的命令行可执行文件' : `议事厅不支持 ${floor.floor_id} 这一层`,
+        errorKind: 'spawn',
+        raw: '',
+        tokens: null,
+        startedAt,
+        endedAt: now(),
+        durationMs: 0,
+      };
+    }
+
+    const inv = recipe.build({ bin, prompt, model: floor.model || null });
     const r = await runTurn({
       ...inv,
       cwd: ctx.workDir,
-      timeoutMs: perTurnMs,
+      timeoutMs: turnMs,
       agent: recipe.agent,
       onChild: (child) => {
         if (ctx.cancelled || ctx.closed) {
@@ -243,32 +289,52 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       model: r.model || null,
       tokens: r.tokens || null,
       error: r.error || null,
+      errorKind: r.errorKind || null,
       raw: r.raw || '',
+      attempts: 1,
       startedAt,
       endedAt: now(),
       durationMs: r.durationMs,
     };
   }
 
-  /** A participant blowing up must not take the whole meeting down; record it honestly instead. */
+  /**
+   * A participant blowing up must not take the whole meeting down; record it honestly instead.
+   *
+   * One retry for transient failures only. A network hiccup or a process that timed out once is worth
+   * another shot; an expired login, a retired model, a quota error or a protocol violation will say the
+   * same thing again and only burn the meeting's time budget.
+   */
   async function askOneSafe(arg) {
-    try {
-      return await askOne(arg);
-    } catch (err) {
-      const at = now();
-      return {
-        floorId: arg.floor.floor_id,
-        status: 'failed',
-        content: null,
-        model: null,
-        tokens: null,
-        error: `调用参与者时出错：${err && err.message}`,
-        raw: '',
-        startedAt: at,
-        endedAt: at,
-        durationMs: 0,
-      };
+    let last = null;
+    const attempts = 1 + Math.max(0, Number(turnRetries) || 0);
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        last = await askOne(arg);
+      } catch (err) {
+        const at = now();
+        last = {
+          floorId: arg.floor.floor_id,
+          status: 'failed',
+          content: null,
+          model: null,
+          tokens: null,
+          error: `调用参与者时出错：${err && err.message}`,
+          errorKind: 'unknown',
+          raw: '',
+          attempts: i + 1,
+          startedAt: at,
+          endedAt: at,
+          durationMs: 0,
+        };
+      }
+      last.attempts = i + 1;
+      const retryable = TRANSIENT_KINDS.has(last.errorKind) && last.status !== 'ok';
+      if (!retryable || i === attempts - 1 || arg.ctx.cancelled || arg.ctx.closed) break;
+      // Short backoff: the automations that fail this way usually recover in a second or two.
+      await sleep(2_000 * (i + 1));
     }
+    return last;
   }
 
   /**
@@ -286,10 +352,13 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
   function recordUtterance(councilId, roundNo, floorId, phase, turn, override = {}) {
     const status = override.status || turn.status || 'ok';
     const content = override.content !== undefined ? override.content : turn.content;
+    const attemptNote = turn.attempts > 1 ? `（已重试 ${turn.attempts - 1} 次）` : '';
     const error =
       status === 'unparsed' && turn.raw
-        ? `${turn.error || '输出解析不出内容'}\n\n原始输出尾部：\n${turn.raw}`
-        : turn.error;
+        ? `${turn.error || '输出解析不出内容'}${attemptNote}\n\n原始输出尾部：\n${turn.raw}`
+        : turn.error
+          ? `${turn.error}${attemptNote}`
+          : null;
     repo.insertUtterance({
       councilId,
       roundNo,
@@ -299,6 +368,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       model: turn.model,
       status,
       error,
+      errorKind: turn.errorKind || null,
       inputTokens: turn.tokens ? turn.tokens.input : null,
       outputTokens: turn.tokens ? turn.tokens.output : null,
       cacheReadTokens: turn.tokens ? turn.tokens.cacheRead : null,
@@ -320,6 +390,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
         model: turn.model || null,
         status,
         error: error || null,
+        errorKind: turn.errorKind || null,
         durationMs: turn.durationMs,
       },
     });
@@ -555,6 +626,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       ownsTmpDir: Boolean(tmpDir),
       workDir,
       workspaceProvided: Boolean(workspace),
+      deadline: now() + meetingTimeoutMs,
     };
     active.set(councilId, ctx);
     emit({ councilId, status: 'running', workspace: workspace || null });
@@ -612,11 +684,15 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
               : turn.status === 'failed'
                 ? '调用失败（failed）'
                 : turn.status;
-        const reason =
+        // The normalized class is what makes "model retired" distinguishable from "network down" in
+        // the report header, before the user expands the raw turn.
+        const kindLabel = turn.errorKind && ERROR_KIND_ZH[turn.errorKind] ? ` [${ERROR_KIND_ZH[turn.errorKind]}]` : '';
+        const reasonBase =
           message ||
           `第 ${roundNo} 轮${PHASE_ZH[phase] || phase}（${floor.floor_id} ${floorName(
             floor.floor_id
           )}）${statusText}：${detail}`;
+        const reason = `${reasonBase}${kindLabel}`;
         globalWarnings.push({ code, message: reason, round: roundNo });
         const verdict = rounds.length ? 'partial' : 'failed';
         const archived = archiveReport({

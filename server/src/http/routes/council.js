@@ -24,7 +24,7 @@ const path = require('node:path');
 
 const { DEFAULTS } = require('@workgremlin/shared');
 
-const { listCouncilFloors, isCouncilFloor } = require('../../council/floors');
+const { listCouncilFloors, isCouncilFloor, probeFloors } = require('../../council/floors');
 const { readMaterials } = require('../../council/materials');
 const { roundResultOf } = require('../../council/orchestrator');
 
@@ -77,8 +77,31 @@ function parseJson(value, fallback) {
 function createCouncilRouter({ repo, orchestrator, deps = {} }) {
   const router = express.Router();
   const listFloors = deps.listFloors || (() => listCouncilFloors());
+  const probe = deps.probeFloors || probeFloors;
 
   const floorsById = () => new Map(listFloors().map((f) => [f.floorId, f]));
+
+  /**
+   * Optional per-seat model map: `{ "1F": "deepseek-v4.1-flash" }`. Only selected floors are kept;
+   * a blank value means "use that CLI's own default". The length cap keeps a pasted log line from
+   * becoming argv.
+   */
+  function modelsOf(raw, floorIds) {
+    if (raw == null) return { models: {} };
+    if (typeof raw !== 'object' || Array.isArray(raw)) return { error: '模型要写成 {楼层: 模型名} 的对象' };
+    const models = {};
+    for (const floorId of floorIds) {
+      const value = raw[floorId];
+      if (value == null) continue;
+      const model = String(value).trim();
+      if (!model) continue;
+      if (model.length > 200) return { error: `${floorId} 的模型名太长了（最多 200 个字符）` };
+      models[floorId] = model;
+    }
+    return { models };
+  }
+
+  const describeProbe = (r) => `${r.floorId}（${r.error || '说不了话'}）`;
 
   /* ------------------------------------------------------------------ Available floors */
   router.get('/councils/floors', (req, res) => {
@@ -97,14 +120,59 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
         scoreMax: DEFAULTS.COUNCIL_SCORE_MAX,
         turnTimeoutMs: DEFAULTS.COUNCIL_TURN_TIMEOUT_MS,
         workspaceTurnTimeoutMs: DEFAULTS.COUNCIL_WORKSPACE_TURN_TIMEOUT_MS,
+        preflightTimeoutMs: DEFAULTS.COUNCIL_PREFLIGHT_TIMEOUT_MS,
+        meetingTimeoutMs: DEFAULTS.COUNCIL_MEETING_TIMEOUT_MS,
+        turnRetries: DEFAULTS.COUNCIL_TURN_RETRIES,
         materialMaxBytes: DEFAULTS.COUNCIL_MATERIAL_MAX_BYTES,
         materialTotalMaxBytes: DEFAULTS.COUNCIL_MATERIAL_TOTAL_MAX_BYTES,
       },
     });
   });
 
+  /* ------------------------------------------------------------------ Preflight */
+  /**
+   * "Can these floors actually speak right now?" — one tiny model call per selected floor.
+   *
+   * The executable check in `listCouncilFloors` is necessary but not sufficient: a CLI can be installed
+   * and still be unable to answer (retired default model, expired login, unreachable provider). This
+   * endpoint gives the UI a "试麦" button and lets `POST /councils` refuse before creating a meeting
+   * that is guaranteed to die on round 0.
+   */
+  router.post('/councils/preflight', async (req, res) => {
+    const body = req.body || {};
+    const floors = Array.isArray(body.floors)
+      ? [...new Set(body.floors.map((x) => String(x || '').trim()).filter(Boolean))]
+      : [];
+    if (!floors.length) return bad(res, '先选楼层再试麦');
+    const unknown = floors.filter((f) => !isCouncilFloor(f));
+    if (unknown.length) return bad(res, `这几个楼层议事厅请不了：${unknown.join('、')}`);
+
+    const known = floorsById();
+    const asleep = floors.filter((f) => !(known.get(f) || {}).ready);
+    if (asleep.length) {
+      const why = asleep.map((f) => `${f}：${(known.get(f) || {}).reason || '不可用'}`).join('；');
+      return bad(res, `这些楼层现在请不动 —— ${why}`);
+    }
+
+    const parsed = modelsOf(body.models, floors);
+    if (parsed.error) return bad(res, parsed.error);
+
+    try {
+      const results = await probe(floors, {
+        models: parsed.models,
+        cliPathOf: (floorId) => (known.get(floorId) || {}).cliPath || null,
+      });
+      res.json({ ok: results.every((r) => r.ok), results });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: { code: 'preflight_failed', message: `试麦失败：${(err && err.message) || '未知原因'}` },
+      });
+    }
+  });
+
   /* ------------------------------------------------------------------ Start */
-  router.post('/councils', (req, res) => {
+  router.post('/councils', async (req, res) => {
     const body = req.body || {};
     const topic = String(body.topic == null ? '' : body.topic).trim();
     if (!topic) return bad(res, '议题不能是空的');
@@ -133,6 +201,27 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     if (asleep.length) {
       const why = asleep.map((f) => `${f}：${(known.get(f) || {}).reason || '不可用'}`).join('；');
       return bad(res, `这些楼层现在请不动 —— ${why}`);
+    }
+
+    const parsedModels = modelsOf(body.models, all);
+    if (parsedModels.error) return bad(res, parsedModels.error);
+
+    // Gate: a floor that cannot answer one short sentence will not suddenly answer a full plan.
+    // Doing this before `createCouncil` means a dead floor leaves no half-built meeting behind.
+    try {
+      const probes = await probe(all, {
+        models: parsedModels.models,
+        cliPathOf: (floorId) => (known.get(floorId) || {}).cliPath || null,
+      });
+      const broken = probes.filter((r) => !r.ok);
+      if (broken.length) {
+        return bad(res, `这些楼层现在说不了话 —— ${broken.map(describeProbe).join('；')}`);
+      }
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: { code: 'preflight_failed', message: `会前试麦失败：${(err && err.message) || '未知原因'}` },
+      });
     }
 
     const wantedRounds = Number(body.maxRounds);
@@ -164,6 +253,7 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
           role,
           agent: floorOf(floorId).agent || '',
           cliPath: floorOf(floorId).cliPath || null,
+          model: parsedModels.models[floorId] || null,
         });
       }
       materials.forEach((m, ord) => {

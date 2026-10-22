@@ -64,12 +64,13 @@ const OK = (text) => ({
   durationMs: 5,
   exitCode: 0,
 });
-const FAIL = (error, status = 'failed') => ({
+const FAIL = (error, status = 'failed', errorKind = null) => ({
   status,
   text: '',
   tokens: null,
   model: null,
   error,
+  errorKind,
   durationMs: 9,
   exitCode: 1,
 });
@@ -150,7 +151,9 @@ function makeHarness() {
     const round = m ? Number(m[1]) : 0;
     const phase = phaseOf(prompt);
     if (typeof arg.onChild === 'function') arg.onChild(fakeChild());
-    seen.push({ floor, round, phase, prompt, cwd: arg.cwd, agent: arg.agent });
+    const modelFlag = arg.args.includes('--model') ? '--model' : arg.args.includes('-m') ? '-m' : null;
+    const model = modelFlag ? arg.args[arg.args.indexOf(modelFlag) + 1] : null;
+    seen.push({ floor, round, phase, prompt, cwd: arg.cwd, agent: arg.agent, model });
 
     const answer = () => {
       const spec =
@@ -402,6 +405,71 @@ const reportOf = (id) => {
     ok('no participant is left "running"',
       repo.listParticipants(id).every((p) => p.status !== 'running' && p.status !== 'pending'));
   }
+  head('a transient timeout is retried once, then the meeting continues');
+  {
+    const h = makeHarness();
+    let attempts = 0;
+    h.set('4F:plan', () => {
+      attempts += 1;
+      return attempts === 1
+        ? FAIL('网络断开，120s 内没有返回', 'timeout', 'network')
+        : defaultReply({ phase: 'plan', round: 0 });
+    });
+    const id = newCouncil('cRetry', { maxRounds: 1 });
+    const row = await mkOrchestrator(h).start(id);
+
+    ok('the plan was attempted twice', attempts === 2 && h.countOf('4F', 'plan') === 2, String(attempts));
+    ok('the second answer carried the meeting', row.verdict === 'completed' && row.status === 'done', `${row.verdict}/${row.status}`);
+    const u = repo.listUtterances(id).find((x) => x.floor_id === '4F' && x.phase === 'plan');
+    ok('the archived turn is the successful one', u.status === 'ok' && Boolean(u.content), JSON.stringify(u));
+  }
+
+  head('an auth/model failure is not retried (the same sentence would come back)');
+  {
+    const h = makeHarness();
+    let attempts = 0;
+    h.set('4F:plan', () => {
+      attempts += 1;
+      return FAIL('401 You need to sign in to use this model', 'failed', 'auth');
+    });
+    const id = newCouncil('cAuthFail', { maxRounds: 1 });
+    const row = await mkOrchestrator(h).start(id);
+
+    ok('attempted exactly once', attempts === 1, String(attempts));
+    ok('meeting failed', row.verdict === 'failed', `${row.verdict}/${row.status}`);
+    ok('the normalized kind is visible in the reason', String(row.error).includes('账号未登录'), String(row.error));
+    const u = repo.listUtterances(id).find((x) => x.floor_id === '4F' && x.phase === 'plan');
+    ok('the utterance stores error_kind=auth', u.error_kind === 'auth', String(u.error_kind));
+  }
+
+  head('the per-seat model reaches the participant invocation');
+  {
+    const h = makeHarness();
+    const id = newCouncil('cModel', { maxRounds: 1 });
+    repo.raw
+      .prepare('UPDATE council_participants SET model = ? WHERE council_id = ? AND floor_id = ?')
+      .run('deepseek-v4.1-flash', id, '4F');
+    const row = await mkOrchestrator(h).start(id);
+
+    ok('meeting completed', row.verdict === 'completed', `${row.verdict}/${row.status}`);
+    const plan = h.seen.find((s) => s.floor === '4F' && s.phase === 'plan');
+    ok('the moderator got --model deepseek-v4.1-flash', Boolean(plan) && plan.model === 'deepseek-v4.1-flash', JSON.stringify(plan));
+    const other = h.seen.find((s) => s.floor === '1F' && s.phase === 'proposal');
+    ok('a seat without a model passes none', Boolean(other) && other.model === null, JSON.stringify(other));
+  }
+
+  head('the whole-meeting budget stops a meeting that has not started answering');
+  {
+    const h = makeHarness();
+    const id = newCouncil('cDeadline', { maxRounds: 1 });
+    const row = await mkOrchestrator(h, { meetingTimeoutMs: 1 }).start(id);
+
+    ok('meeting failed rather than hanging', row.verdict === 'failed', `${row.verdict}/${row.status}`);
+    const u = repo.listUtterances(id).find((x) => x.floor_id === '4F' && x.phase === 'plan');
+    ok('the turn is recorded as meeting_timeout', u && u.error_kind === 'meeting_timeout', JSON.stringify(u));
+    ok('no model call was made', h.callsOf('plan').length === 0, String(h.callsOf('plan').length));
+  }
+
   head('a moderator asking for a missing path ends normally as needs_clarification');
   {
     const h = makeHarness();

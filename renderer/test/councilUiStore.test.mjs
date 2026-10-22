@@ -317,6 +317,7 @@ head('start: roles go into the body; a blank workspace omits the key');
     files: ['/tmp/a.md'],
     maxRounds: 2,
     workspacePath: '/home/me/proj',
+    models: { '1F': 'deepseek-v4.1-flash', '4F': '   ', '7F': '' },
   });
   const sent = calls.find((c) => c.method === 'POST');
   ok('moderator in the body', sent.body.moderator === '4F', JSON.stringify(sent.body));
@@ -325,6 +326,8 @@ head('start: roles go into the body; a blank workspace omits the key');
   ok('files in the body', JSON.stringify(sent.body.files) === JSON.stringify(['/tmp/a.md']));
   ok('no vote-era "mode" key', !('mode' in sent.body), JSON.stringify(sent.body));
   ok('workspace in the body when given', sent.body.workspacePath === '/home/me/proj');
+  ok('only non-empty per-seat models are sent',
+    JSON.stringify(sent.body.models) === JSON.stringify({ '1F': 'deepseek-v4.1-flash' }), JSON.stringify(sent.body.models));
 }
 {
   const s = fresh();
@@ -343,6 +346,7 @@ head('start: roles go into the body; a blank workspace omits the key');
   // A blank path is NOT sent as an empty string: isolated mode is the server default, and an empty
   // string would be a different thing to normalize. The old frontend never sent it either.
   ok('a blank workspace omits the key entirely', !('workspacePath' in sent.body), JSON.stringify(sent.body));
+  ok('all-blank models omit the key entirely', !('models' in sent.body), JSON.stringify(sent.body));
 }
 
 head('workspacePath getter: null means isolated mode, shown as an empty string');

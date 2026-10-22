@@ -31,6 +31,8 @@ const form = reactive({
   files: '',
   maxRounds: 3,
   workspace: '',
+  /** floorId -> optional --model. Empty = that CLI's own default. */
+  models: {},
 });
 const formError = ref('');
 const showAdvanced = ref(false);
@@ -52,6 +54,12 @@ const notReadyFloors = computed(() => store.floors.filter((f) => !f.ready));
 const reviewerOptions = computed(() =>
   readyFloors.value.filter((f) => f.floorId !== form.moderator && f.floorId !== form.main),
 );
+
+/** One row per occupied seat, so the user can pin a model for each floor that will actually speak. */
+const selectedSeats = computed(() => {
+  const ids = [...new Set([form.moderator, form.main, ...form.reviewers].filter(Boolean))];
+  return ids.map((id) => store.floors.find((f) => f.floorId === id) || { floorId: id, name: id });
+});
 
 /** The same floor cannot hold two roles. Changing a single-role seat drops it from the reviewer list. */
 watch([() => form.moderator, () => form.main], () => {
@@ -89,6 +97,11 @@ async function submit() {
     formError.value = t('council.workspace_abs');
     return;
   }
+  const models = {};
+  for (const seat of selectedSeats.value) {
+    const model = String(form.models[seat.floorId] || '').trim();
+    if (model) models[seat.floorId] = model;
+  }
   const id = await store.create({
     topic: form.topic.trim(),
     moderator: form.moderator,
@@ -97,6 +110,7 @@ async function submit() {
     files: files(),
     maxRounds: Number(form.maxRounds) || store.defaults.maxRounds,
     workspacePath: ws,
+    models,
   });
   if (id) form.topic = '';
 }
@@ -410,6 +424,21 @@ function toggleReviewer(id) {
             <p v-if="form.workspace.trim()" class="hint">
               {{ t('council.workspace_timeout', { min: Math.round((store.defaults.workspaceTurnTimeoutMs || 0) / 60000) }) }}
             </p>
+
+            <template v-if="selectedSeats.length">
+              <p class="lbl">{{ t('council.models') }}</p>
+              <div v-for="seat in selectedSeats" :key="seat.floorId" class="row">
+                <span class="role-lbl">{{ seat.floorId }} · {{ seat.name }}</span>
+                <input
+                  v-model="form.models[seat.floorId]"
+                  class="ta mono model-input"
+                  type="text"
+                  :data-testid="`cv-model-${seat.floorId}`"
+                  :placeholder="t('council.model_ph')"
+                />
+              </div>
+              <p class="hint">{{ t('council.models_hint') }}</p>
+            </template>
 
             <div class="row">
               <label class="lbl inline" for="cv-rounds">{{ t('council.rounds') }}</label>
@@ -914,6 +943,8 @@ input.ta { padding: 6px 8px; }
 .accordion.open .accordion-bd { display: block; }
 
 .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.row .role-lbl { margin-bottom: 0; white-space: nowrap; }
+.model-input { flex: 1; min-width: 0; }
 .num {
   width: 56px;
   background: var(--bg-elevated);
