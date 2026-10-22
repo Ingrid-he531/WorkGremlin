@@ -100,11 +100,14 @@ console.log('[2] 按 sessionId 回收孤儿任务，project 不参与判定');
       repo.getTask.get('t-no-run').cancel_reason === 'orphan_session'
   );
   ok(
-    '取消时间统一取本轮扫描时间',
-    repo.getTask.get('t-gone').ended_at === NOW && repo.getTask.get('t-no-run').ended_at === NOW
+    '结束时间留空：发现会话消失不等于看到任务停止（不把扫描时间当结束时间）',
+    repo.getTask.get('t-gone').ended_at === null && repo.getTask.get('t-no-run').ended_at === null
   );
   const insertedRun = repo.getTaskRun.get('t-no-run');
-  ok('缺少 ledger 行时 endTask 正常补写并收尾', Boolean(insertedRun) && insertedRun.ended_at === NOW);
+  ok(
+    '缺少 ledger 行时 endTask 正常补写并收尾，但同样不编造结束时间/时长',
+    Boolean(insertedRun) && insertedRun.ended_at === null && insertedRun.duration_ms === null
+  );
 }
 
 console.log('[3] 对账幂等');

@@ -165,7 +165,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
       .prepare(
         `SELECT
            t.id, t.project_id, t.member_id, t.parent_task_id, t.title,
-           t.progress, t.started_at, t.ended_at,
+           t.progress, t.started_at, t.ended_at, t.cancel_reason,
            COALESCE(tr.client, m.client) AS client,
            -- Axis 2 (session): which session this round belongs to. The same floor can have several
            -- sessions open at once; reports use this to tell same-client sessions apart;

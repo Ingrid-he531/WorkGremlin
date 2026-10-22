@@ -442,6 +442,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
           state: 'cancelled',
           cancelReason: 'orphan_session',
           ts,
+          // The sweep time is when we noticed, not when the task stopped (it may have been dead for
+          // days/weeks). Leave the end unknown rather than stretching the task to this moment.
+          endedAt: null,
         },
         { broadcastCard: false }
       );
@@ -651,12 +654,19 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     if (!member) return { ok: false, error: 'unknown_member' };
     const ts = Number(p.ts) || now();
     const state = ['done', 'failed', 'cancelled'].includes(p.state) ? p.state : 'done';
+    /**
+     * `ts` is "when this end was reported", which is not always "when the task stopped": orphan
+     * reconciliation only notices that a session is gone, possibly weeks after its last event. Passing
+     * `endedAt: null` records the honest "unknown" instead of a fabricated interval; normal callers
+     * omit it and keep `ts`.
+     */
+    const endedAt = p.endedAt === undefined ? ts : (p.endedAt === null ? null : Number(p.endedAt) || ts);
 
     const cancelReason = state === 'cancelled' ? normText(p.cancelReason, 64) : null;
     if (cancelReason && repo.cancelTaskWithReason) {
-      repo.cancelTaskWithReason.run({ id: p.taskId, progress: p.progress ?? 1, endedAt: ts, cancelReason });
+      repo.cancelTaskWithReason.run({ id: p.taskId, progress: p.progress ?? 1, endedAt, cancelReason });
     } else {
-      repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt: ts });
+      repo.updateTask.run({ id: p.taskId, state, progress: p.progress ?? 1, endedAt });
     }
     const sessionId = normSession(p.sessionId);
     // A finished task supplies history only. Remaining running tasks (if any) keep the member busy.
@@ -740,8 +750,8 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         result: normText(p.result, RUN_RESULT_MAX),
         fileCount,
         filesJson: filesJson ? JSON.stringify(filesJson) : null,
-        endedAt: ts,
-        durationMs: startedAt && ts > startedAt ? ts - startedAt : null,
+        endedAt,
+        durationMs: startedAt && endedAt && endedAt > startedAt ? endedAt - startedAt : null,
       });
       /* Tokens consumed this round: the truth read by the hook / plugin from the session's on-disk files
          (see reporter/src/usage.js and plugin/index.js).

@@ -379,6 +379,18 @@ function migrate(db) {
   ensureColumn(db, 'task_runs', 'usage_yuan', 'usage_yuan REAL');
   ensureColumn(db, 'messages', 'session_id', 'session_id TEXT');
   ensureColumn(db, 'tasks', 'cancel_reason', 'cancel_reason TEXT');
+  // Orphan reconciliation used to stamp the moment it noticed the dead session as the task's end, so a
+  // task stuck running for weeks painted a weeks-long cancelled bar on the daily board. The real stop
+  // time was never observed: clear that invented end (and its derived duration) so the board draws only
+  // the start instant. Idempotent, and it also keeps any future orphan cancellation honest.
+  db.exec(`
+    UPDATE task_runs SET ended_at = NULL, duration_ms = NULL
+     WHERE id IN (SELECT id FROM tasks WHERE cancel_reason = 'orphan_session');
+  `);
+  db.exec(`
+    UPDATE tasks SET ended_at = NULL
+     WHERE cancel_reason = 'orphan_session' AND ended_at IS NOT NULL;
+  `);
   db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(project_id, session_id, started_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(project_id, session_id, ts_ms DESC)');
   // Council room: the old vote/analysis schema is intentionally not migrated (the refactor shipped before
@@ -783,12 +795,16 @@ function createRepo(db) {
         cancel_reason = CASE WHEN @state = 'running' THEN NULL ELSE cancel_reason END
       WHERE id = @id
     `),
-    /** Cancel an orphaned running task and mark it so the live ticker never replays it. */
+    /**
+     * Cancel an orphaned running task and mark it so the live ticker never replays it.
+     * `ended_at` is assigned directly (not COALESCE): orphan reconciliation passes NULL because it only
+     * noticed that the session was gone, so the real stop time is unknown and must stay unknown.
+     */
     cancelTaskWithReason: db.prepare(`
       UPDATE tasks SET
         state = 'cancelled',
         progress = COALESCE(@progress, progress),
-        ended_at = COALESCE(@endedAt, ended_at),
+        ended_at = @endedAt,
         cancel_reason = @cancelReason
       WHERE id = @id
     `),
