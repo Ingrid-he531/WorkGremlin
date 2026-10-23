@@ -1,5 +1,6 @@
 /**
- * Council CLI recipes + output parsing self-check — pure data, no processes.
+ * Council CLI recipes + output parsing self-check — mostly pure data; one `#!/bin/sh` stub pins the
+ * 3F → codex `mcp list` handshake.
  *
  * Three properties are load-bearing and pinned separately:
  *   1. **Read-only is real.** The council room accepts participants only if every recipe removes the
@@ -21,10 +22,15 @@ const {
   READ_PERMISSION,
   READ_TOOLS,
   QUIET_ENV,
+  codexMcpArgs,
   parseOutput,
 } = require('../src/council/agents');
 const { roleBlock } = require('../src/council/prompt');
 const { DEFAULTS } = require('@workgremlin/shared');
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 let pass = 0;
 let fail = 0;
@@ -121,9 +127,51 @@ head('read-only: 1F / 4F whitelist read tools only');
   ok('3F runs codex exec', c3.args[0] === 'exec', JSON.stringify(c3.args));
   ok('3F pins --sandbox read-only', c3.args[c3.args.indexOf('--sandbox') + 1] === 'read-only');
   ok('3F is ephemeral (no session lands on the office 3F)', c3.args.includes('--ephemeral'));
-  ok('3F ignores the user config (no user MCP servers)', c3.args.includes('--ignore-user-config'));
+  ok('3F falls back to ignoring the user config when the MCP list cannot be read',
+    c3.args.includes('--ignore-user-config'), JSON.stringify(c3.args));
   ok('3F disables web search', c3.args.includes('web_search="disabled"'));
   ok('3F reads the prompt from stdin', c3.stdin === '问题' && c3.args[c3.args.length - 1] === '-');
+}
+{
+  // 2026-10-23: `--ignore-user-config` also dropped `model_provider` / `base_url`, so a Codex that
+  // reaches its model through a local proxy fell back to api.openai.com and died in the 60s preflight
+  // ("3F 60s 内没有返回"). 3F now keeps the user config and switches each MCP server off by name,
+  // the way 4F's `--strict-mcp-config` does. Both halves are pinned here.
+  const off = codexMcpArgs([
+    { name: 'metabase', enabled: true },
+    { name: 'cua_repl', enabled: false },
+  ]);
+  ok('3F turns every enabled MCP server off by name',
+    Array.isArray(off) && off.join(' ').includes('mcp_servers.metabase.enabled=false'), JSON.stringify(off));
+  ok('3F leaves an already-disabled server alone',
+    Array.isArray(off) && !off.join(' ').includes('mcp_servers.cua_repl.enabled=false'), JSON.stringify(off));
+  ok('3F clears a configured notify command (it would run outside the sandbox)',
+    Array.isArray(off) && off.join(' ').includes('notify=[]'), JSON.stringify(off));
+  ok('3F does not ignore the user config when the MCP list is readable',
+    Array.isArray(off) && !off.includes('--ignore-user-config'), JSON.stringify(off));
+  ok('an MCP name that cannot be addressed makes 3F fall back (no server may slip through)',
+    codexMcpArgs([{ name: 'my.server', enabled: true }]) === null);
+  ok('an unreadable MCP list makes 3F fall back too', codexMcpArgs(null) === null);
+}
+{
+  // End to end through the CLI boundary: a stub `codex` answers `mcp list --json`, and only that
+  // subcommand — proving the recipe asks the CLI instead of parsing config.toml by hand.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-council-3f-'));
+  try {
+    const bin = path.join(dir, 'codex');
+    fs.writeFileSync(
+      bin,
+      '#!/bin/sh\nif [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "warning: config has typos"; echo \'[{"name":"metabase","enabled":true}]\'; exit 0; fi\nexit 0\n',
+      { mode: 0o755 }
+    );
+    const inv = RECIPES['3F'].build({ bin, prompt: 'p', cwd: dir });
+    ok('3F asks the CLI for its MCP list and overrides it',
+      inv.args.join(' ').includes('mcp_servers.metabase.enabled=false') && !inv.args.includes('--ignore-user-config'),
+      JSON.stringify(inv.args));
+    ok('the MCP override does not replace the read-only sandbox', inv.args.includes('--sandbox') && inv.args.includes('read-only'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 {
   const c6 = build('6F');

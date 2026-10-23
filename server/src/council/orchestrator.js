@@ -266,7 +266,7 @@ function createCouncilOrchestrator({ repo, broadcast, deps = {} }) {
       };
     }
 
-    const inv = recipe.build({ bin, prompt, model: floor.model || null });
+    const inv = recipe.build({ bin, prompt, model: floor.model || null, cwd: ctx.workDir });
     const r = await runTurn({
       ...inv,
       cwd: ctx.workDir,

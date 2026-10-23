@@ -192,7 +192,7 @@ async function probeFloors(floorIds, opts = {}) {
         continue;
       }
 
-      const inv = recipe.build({ bin: cliPath, prompt: PROBE_PROMPT, model });
+      const inv = recipe.build({ bin: cliPath, prompt: PROBE_PROMPT, model, cwd });
       const turn = await runTurn({
         ...inv,
         cwd,

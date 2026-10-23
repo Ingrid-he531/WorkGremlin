@@ -45,6 +45,8 @@
  * guess "probably agree".
  */
 
+const { spawnSync } = require('node:child_process');
+
 const { DEFAULTS } = require('@workgremlin/shared');
 
 /**
@@ -109,6 +111,83 @@ const READ_PERMISSION = Object.freeze(
  * read-only, it is read-nothing.
  */
 const READ_TOOLS = 'Read,Grep,Glob';
+
+/**
+ * Turn every MCP server in the user's Codex config **off by name**, instead of refusing the whole
+ * config with `--ignore-user-config`.
+ *
+ * Why the whole config must stay loaded: `--ignore-user-config` also drops `model_provider` /
+ * `base_url`, so a machine whose Codex reaches the model through a local proxy silently falls back to
+ * `api.openai.com`, prints `Reconnecting... (request timed out)` until the 60s preflight kills it, and
+ * 3F can never take part in a meeting. Measured on 2026-10-23: with the flag the probe never answered;
+ * without it, 12s and `OK`. 4F already has the precise switch for this (`--strict-mcp-config`); Codex
+ * has none, so we ask Codex itself what its config defines and override each server.
+ *
+ * Two near-misses were measured and must not be used instead:
+ *   · `-c mcp_servers={}` does **not** clear the table — Codex merges it, and the server still started;
+ *   · a quoted key (`mcp_servers."name".enabled=false`) is rejected as `invalid transport`.
+ * Plain dotted names are the only accepted form, hence `CODEX_CONFIG_KEY`.
+ *
+ * `-c notify=[]` is part of the same deal: with the user config loaded, a configured `notify` command
+ * would run outside the sandbox on every turn.
+ */
+
+/** A server name that can be addressed as a bare dotted `-c` key. */
+const CODEX_CONFIG_KEY = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * @param {Array<{name?:string, enabled?:boolean}>} servers `codex mcp list --json` output
+ * @returns {string[]|null} extra args, or null when the list cannot be honoured safely
+ */
+function codexMcpArgs(servers) {
+  if (!Array.isArray(servers)) return null;
+  const names = servers
+    .filter((s) => s && s.enabled !== false)
+    .map((s) => String(s.name || ''))
+    .filter(Boolean);
+  // A name we cannot address would silently stay enabled — fall back to ignoring the whole config
+  // rather than let one MCP server (and its network access) into the meeting.
+  if (names.some((n) => !CODEX_CONFIG_KEY.test(n))) return null;
+  const args = ['-c', 'notify=[]'];
+  for (const name of names) args.push('-c', `mcp_servers.${name}.enabled=false`);
+  return args;
+}
+
+/**
+ * Read the user's MCP list with the CLI's own parser (a hand-written TOML reader would drift from the
+ * real syntax) and shape it into `-c` overrides. Any failure falls back to `--ignore-user-config`:
+ * keeping MCP tools out of the meeting matters more than honouring a custom endpoint.
+ *
+ * `cwd` is passed so a project-level `.codex/config.toml` is seen by the same listing the turn uses.
+ */
+function codexMcpOffArgs(bin, cwd) {
+  let stdout;
+  try {
+    const r = spawnSync(bin, ['mcp', 'list', '--json'], {
+      cwd: cwd || undefined,
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    if (r.status !== 0 || typeof r.stdout !== 'string') return ['--ignore-user-config'];
+    stdout = r.stdout;
+  } catch {
+    return ['--ignore-user-config'];
+  }
+  // Tolerate stray log lines around the JSON array
+  const start = stdout.indexOf('[');
+  const end = stdout.lastIndexOf(']');
+  if (start < 0 || end < start) return ['--ignore-user-config'];
+  let servers;
+  try {
+    servers = JSON.parse(stdout.slice(start, end + 1));
+  } catch {
+    return ['--ignore-user-config'];
+  }
+  return codexMcpArgs(servers) || ['--ignore-user-config'];
+}
 
 /**
  * One recipe per floor.
@@ -196,15 +275,17 @@ const RECIPES = {
      * That is why 3F, unlike 2F/7F/8F, needs no title marker.
      *
      * `--skip-git-repo-check` — isolated mode's cwd is a throwaway temp dir, which is not a git repo.
-     * `--ignore-user-config` — do not load the user's `config.toml` (its MCP servers would hand the
-     * participant extra tools); auth still comes from CODEX_HOME, so login survives.
+     * The user's `config.toml` **is** loaded (the model may only be reachable through a provider/base_url
+     * defined there), but every MCP server it defines is switched off one by one — see
+     * `codexMcpOffArgs`. `--ignore-user-config` remains the fallback when that list cannot be read.
      * `-c web_search="disabled"` — no web search.
      * `-` reads the prompt from stdin (the pipe the runner sets up).
      */
-    build({ bin, prompt, model }) {
+    build({ bin, prompt, model, cwd }) {
       const args = [
         'exec', '--json', '--sandbox', 'read-only', '--ephemeral',
-        '--skip-git-repo-check', '--ignore-user-config',
+        '--skip-git-repo-check',
+        ...codexMcpOffArgs(bin, cwd),
         '-c', 'web_search="disabled"',
       ];
       if (model) args.push('-m', model);
@@ -620,5 +701,7 @@ module.exports = {
   READ_PERMISSION,
   READ_TOOLS,
   QUIET_ENV,
+  codexMcpArgs,
+  codexMcpOffArgs,
   parseOutput,
 };
