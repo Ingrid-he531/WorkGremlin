@@ -814,6 +814,7 @@ run commands or access the network. `workspace_path` only selects which director
 | Tools | Read-only. 1F/4F use `--tools Read,Grep,Glob`; 7F/8F get an injected permission config allowing only `read/glob/grep/list`; 2F uses Cline's `--plan`; 3F uses `codex exec --sandbox read-only`; 6F uses headless `-p` (confirmation-required actions are denied) |
 | Files | Read-only. Participants may read code; write tools stay denied |
 | Commands / network | Not allowed. 1F/4F expose no execution tool; 7F/8F deny `bash`; the 3F sandbox blocks writes and network. **Honest limitation:** 2F `--plan` and the 3F sandbox may still run read-only commands |
+| MCP | Disabled. MCP tools can reach the network, so they never enter a meeting: 1F/4F pass `--strict-mcp-config`; 7F/8F deny every non-read tool in the injected permission table; 3F asks `codex mcp list --json` and overrides each enabled server with `-c mcp_servers.<name>.enabled=false` (plus `-c notify=[]`, since a configured notify command runs outside the sandbox). If that list cannot be read, or a server name is not a bare TOML key, 3F falls back to `--ignore-user-config`. The whole user config is **not** dropped: that would also drop `model_provider` / `base_url` and make a proxied Codex unreachable (see implementation-status, 2026-10-23) |
 | Background material | Read by the server and inlined verbatim into the prompt; when the directory is empty, the participants rely on this material |
 | Environment | Inherited as-is (login state lives in each CLI's home). Isolation relies on cwd + read-only mode, not on moving `HOME`. All recipes inject `WORKGREMLIN_DISABLE=1` |
 | Model | Optional per-seat model, stored in `council_participants.model` and passed through that product's own flag (`--model` / `-m`). Blank means the CLI's own default. Because a retired default is invisible to an executable check, every selected floor must pass a one-sentence **preflight** before the meeting is created; a failing floor blocks creation and names its raw reason. Probes run one at a time (parallel cold starts produced false timeouts), 60s each; successes are cached 5 min, failures 1 min |
@@ -946,7 +947,7 @@ With no completed round, show `—`, never 100.
 | Tokens / duration unavailable | `NULL`, not 0 | Show `—`; a partially reported role shows `≥ N` |
 | A round has no diff | `diff_from_prev = NULL` | Say "no diff was provided", do not imply nothing changed |
 | Material truncated | Store `bytes_total` and `bytes_included` | State the original and inlined byte counts |
-| Final round failed | `verdict='partial'`; completed rounds and the report are archived | Mark "partially completed"; do not fabricate a final draft |
+| Final round failed | `verdict='partial'`; completed rounds and the report are archived | No top verdict badge; completed rounds and the report stay, and the failure reason is shown; do not fabricate a final draft |
 
 ### 15.6 Acceptance points
 
@@ -954,6 +955,14 @@ With no completed round, show `—`, never 100.
 1a. **Preflight:** a floor whose executable exists but cannot answer (retired model, expired login, broken
     network) is refused at creation with the floor and the raw provider reason; no meeting row is created.
     A per-seat model is passed to the probe and stored on the participant; a blank model uses the CLI default.
+    While probing, the page uses the round-0 layout (topic, cancel, live strip) with the probe status inside the
+    strip; cancelling aborts the request, kills the in-flight probe and creates no meeting.
+1b. **The compose form keeps the meeting's settings.** Starting a meeting no longer clears the topic; the left
+    column keeps the topic and every option. Opening a history record restores that record's topic, moderator,
+    main, reviewers, rounds, workspace, material paths and per-seat models (files/workspace/models open the
+    advanced section). Every floor is always listed in the role pickers; a floor without its CLI is shown
+    disabled instead of disappearing, with its reason as a hover tooltip and no visible "not ready" label or
+    separate unavailable-floor list. A floor already chosen by an old record can still be unchecked / replaced.
 2. **Role validation:** missing moderator / missing main / no reviewer / one floor in two roles / a floor
    outside the allowlist / a floor without a CLI → the whole request is rejected with a reason; no silent
    degradation and no half-started meeting.
@@ -974,7 +983,8 @@ With no completed round, show `—`, never 100.
     proposals/reviews; if one round completed, `partial` and the report is archived; in-flight participants
     are no longer `running`.
 9b. **Working indicator:** visible between the start and the first utterance, survives a refresh, disappears
-    when the meeting ends.
+    when the meeting ends. A finished meeting (completed, partial, failed, cancelled) shows no verdict badge at
+    the top; the summary, error and result blocks carry that information.
 9c. **Needs-more-information is not failure:** a round-0 clarification request ends with
     `needs_clarification` / `done`; the moderator shows "more information needed", other roles show "not
     reached", and the report is archived. Setting a workspace later does not rerun or rewrite a finished

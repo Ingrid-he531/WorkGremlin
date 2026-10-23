@@ -477,7 +477,7 @@ The P0 changes (implemented in this tree):
    90-minute budget. A transient `timeout` / `network` turn gets **one** retry; auth/model/quota/protocol never
    do. The error text notes a retry, and the meeting-level reason shows the normalized label.
 5. **Feedback lives with the meeting.** The left column is only the compose form (and its own validation); the
-   right column shows the preflight strip, the preflight/create error, the meeting-level failure reason, and the
+   right column shows the preflight view, the preflight/create error, the meeting-level failure reason, and the
    final result. A failed start never disappears just because `current` is still empty.
 
 **Real validation (2026-10-22, separate server, temp DB).** `4F` moderator / `8F` main / `6F` reviewer, one
@@ -487,9 +487,51 @@ plan 37s, proposal 171s, review 135s, moderation 165s, adjudication 47s, final 2
 were archived under `~/.workgremlin/councils/c_58fbdef8fed8009184216969/`; the final draft contains the
 adjudication's changes. It is still a long meeting (~17 min) — P0 made it **survive and finish**, not fast.
 
-Still true on this machine (2026-10-22): 1F works only with an explicit `--model`; 3F's network is broken; 7F
-is not signed in. The preflight now says so in seconds instead of killing a meeting. Remaining P1 work
-(server-generated plan fallback, allow reviewer absence, quick mode, resume) is not implemented.
+Still true on this machine (2026-10-23): 1F works only with an explicit `--model`; 3F works when the user's Codex
+provider config is honoured (see the 2026-10-23 entry below); 7F is not signed in. The preflight now says so in
+seconds instead of killing a meeting. Remaining P1 work (server-generated plan fallback, allow reviewer absence,
+quick mode, resume) is not implemented.
+
+**3F could not speak when Codex used a custom endpoint (2026-10-23, located and fixed).** The reported symptom was
+`3F 60s 内没有返回` at preflight — no meeting row was ever created, so this was a refusal, not a dead meeting. Cause:
+the 3F recipe passed `--ignore-user-config`, which drops the **whole** `config.toml`, including `model_provider` /
+`base_url`. On a machine whose Codex reaches its model through a local proxy (`model_provider = "magpie"`,
+`base_url = http://127.0.0.1:3425/v1` here), Codex fell back to `api.openai.com` and printed
+`Reconnecting... (request timed out)` until the 60s probe killed it. Reproduced with the exact recipe: with the flag
+it never answered in 75s; without it, 12s and `OK`. The older note "3F's network is broken" was therefore wrong.
+
+The flag existed to keep MCP servers out (they can reach the network, which the council forbids), so the fix keeps
+that guarantee but stops throwing the endpoint away: `codex mcp list --json` (the CLI's own parser) enumerates the
+configured servers and each enabled one gets `-c mcp_servers.<name>.enabled=false`; `-c notify=[]` clears a
+configured notify command (it would run outside the sandbox). Two near-misses were measured and rejected:
+`-c mcp_servers={}` does not clear the table (Codex merges it; the server still started), and a quoted key
+(`mcp_servers."name".enabled=false`) is rejected as `invalid transport`. If the list cannot be read, or a server
+name is not a bare TOML key, the recipe falls back to `--ignore-user-config`. Measured: the control run starts
+`metabase-mcp` at 3.1s, the override does not start it, and the probe answers in 12s. `--sandbox read-only`,
+`--ephemeral` and `web_search="disabled"` are unchanged. `test:council-agents` pins both halves (override by name,
+fallback when unreadable) and `docs/requirements.md` §15.3 gained an MCP row.
+
+**Council header and preflight layout (2026-10-23).** Two UI facts changed in `renderer/src/views/CouncilView.vue`:
+
+- The verdict badge (including "部分完成" / "partially completed") no longer appears above a finished meeting.
+  The topic header is identical in every state; the summary, `cv-council-error` and result blocks carry the
+  outcome. The `.who` / `.v-*` styles and `verdictKey()` were removed with it.
+- Preflight renders exactly like the start of round 0: the submitted topic, the cancel button and the live
+  strip (`.working`, `data-testid="cv-preflight"`). The probe status and the floors being probed are the strip's
+  content. Cancel calls `store.cancelSubmit()`, which aborts the fetch; the server's `clientGoneGuard` reacts to
+  the closed response by aborting `probeFloors`, killing the in-flight CLI and skipping `createCouncil` — so a
+  cancelled probe leaves no meeting behind. `probeFloors` stops before the next floor and records no verdict for
+  the killed turn; `test:council-preflight` and `test:council-api` pin both halves.
+- The compose form no longer clears itself after a start (it used to blank the topic). Selecting a history
+  record calls `selectCouncil()`, which opens the meeting and maps it back through `store.composeDraft()`:
+  topic, roles, max rounds, workspace, material paths and per-seat models. The advanced section opens when the
+  record used files, a workspace or models. The moderator/main selects and the reviewer list always iterate
+  over **all** floors; a floor without its CLI is `disabled` instead of being filtered out, so an old record
+  never loses a seat and no extra "not ready" text is needed (the disabled state says it; the reason is a
+  hover tooltip). The former separate list of unavailable floors was removed, and a floor already chosen by
+  the record can still be unchecked (reviewer) or replaced (single-role seats).
+  `test:council-ui-store` pins the mapping and `test:render-smoke` pins the complete, disabled-when-unavailable
+  floor list.
 
 **Real-machine failure (2026-10-19, 1F round 0, located and fixed).** Historical meeting
 `c_f66f8f9f86185744a29a16c0` was not a timeout. 1F CodeBuddy exited with code **0** in about **297 s** (under the
