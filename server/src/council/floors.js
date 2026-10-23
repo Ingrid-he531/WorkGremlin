@@ -32,7 +32,7 @@ const { DEFAULTS } = require('@workgremlin/shared');
 
 const { detectProducts } = require('../floors');
 const { RECIPES } = require('./agents');
-const { runOnce } = require('./runner');
+const { runOnce, killTree } = require('./runner');
 
 /** The floors available in the council. Order = the order they appear in the UI */
 const COUNCIL_FLOORS = Object.freeze(['1F', '2F', '3F', '4F', '6F', '7F', '8F']);
@@ -133,12 +133,24 @@ async function probeFloors(floorIds, opts = {}) {
   const mkdtemp = typeof opts.mkdtemp === 'function' ? opts.mkdtemp : (prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const removeDir = typeof opts.removeDir === 'function' ? opts.removeDir : (dir) => fs.rmSync(dir, { recursive: true, force: true });
 
+  // The start request runs preflight before creating anything, so a user who cancels while a slow
+  // CLI is thinking must **stop the probe**, not let it finish and create a meeting nobody is
+  // waiting for. The signal kills the in-flight child and the loop never starts the next floor.
+  const signal = opts.signal || null;
+  if (signal && signal.aborted) return [];
+
   let cwd = opts.cwd || null;
   let ownsCwd = false;
   if (!cwd) {
     cwd = mkdtemp('wg-council-probe-');
     ownsCwd = true;
   }
+
+  let child = null;
+  const killCurrent = () => {
+    if (child) killTree(child);
+  };
+  if (signal) signal.addEventListener('abort', killCurrent, { once: true });
 
   try {
     // Sequential on purpose. Measured 2026-10-22: OpenCode answered in 29s alone but 73s when it
@@ -147,6 +159,7 @@ async function probeFloors(floorIds, opts = {}) {
     // so accuracy beats the few seconds parallel probing saves on three seats.
     const results = [];
     for (const floorId of ids) {
+      if (signal && signal.aborted) break;
       const recipe = RECIPES[floorId];
       const cliPath = recipe ? cliPathOfFn(floorId) : null;
       const model = models[floorId] ? String(models[floorId]).trim() : null;
@@ -198,7 +211,14 @@ async function probeFloors(floorIds, opts = {}) {
         cwd,
         timeoutMs,
         agent: recipe.agent,
+        onChild: (c) => {
+          child = c;
+          // Aborted between spawn and this callback: do not leave it running for the full timeout
+          if (signal && signal.aborted) killTree(c);
+        },
       });
+      child = null;
+      if (signal && signal.aborted) break;
       const ok = turn.status === 'ok' && Boolean(String(turn.text || '').trim());
       const result = {
         floorId,
@@ -216,6 +236,8 @@ async function probeFloors(floorIds, opts = {}) {
     }
     return results;
   } finally {
+    if (signal) signal.removeEventListener('abort', killCurrent);
+    child = null;
     if (ownsCwd) {
       try {
         removeDir(cwd);

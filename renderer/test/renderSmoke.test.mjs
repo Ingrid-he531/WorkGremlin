@@ -56,6 +56,7 @@ const WORDS = {
     process: '完整过程', plan: '第 0 轮 · 议题拆解与评审分工', breakdown: '议题拆解', assignments: '评审分工',
     moderatorSummary: '主持人汇总', consensus: '共识', openIssues: '未决问题', directives: '修改指令',
     working: '正在工作中', phaseReview: '评审', round1: '第 1 轮',
+    probing: '正在逐层试麦', unavailable: '请不动',
     rawOutput: '原始输出', incomplete: '未完成', incompleteHint: '这一轮没有走完',
     timedOut: '超时', noTurns: '没有留下任何发言记录',
   },
@@ -70,6 +71,7 @@ const WORDS = {
     process: 'Full process', plan: 'Round 0 · topic breakdown and review assignments', breakdown: 'Topic breakdown', assignments: 'Review assignments',
     moderatorSummary: 'Moderator summary', consensus: 'Consensus', openIssues: 'Open issues', directives: 'Revision directives',
     working: 'Working', phaseReview: 'review', round1: 'Round 1',
+    probing: 'Probing each selected floor', unavailable: 'unavailable',
     rawOutput: 'Raw output', incomplete: 'Incomplete', incompleteHint: 'This round did not finish',
     timedOut: 'timed out', noTurns: 'No turns were recorded',
   },
@@ -426,6 +428,22 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     const end = html.indexOf(`data-testid="${toId}"`, at);
     return html.slice(at, end < 0 ? html.length : end);
   };
+  /** An entire <select> (its `data-testid` up to `</select>`). */
+  const selectOf = (html, testid) => {
+    const at = html.indexOf(`data-testid="${testid}"`);
+    if (at < 0) return '';
+    const start = html.lastIndexOf('<select', at);
+    const end = html.indexOf('</select>', at);
+    return html.slice(start, end < 0 ? html.length : end + '</select>'.length);
+  };
+  /** The opening tag of the element that carries `value="..."` (option or input). */
+  const fieldWithValue = (html, value) => {
+    const at = html.indexOf(`value="${value}"`);
+    if (at < 0) return '';
+    const start = html.lastIndexOf('<', at);
+    const end = html.indexOf('>', at);
+    return html.slice(start, end + 1);
+  };
 
   const won = await render('/src/views/CouncilView.vue', seedCouncil(COUNCIL));
   ok('council · completed: renders without throwing', typeof won === 'string', won && won.error);
@@ -474,6 +492,22 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     // ---------------------------------------------------- history rail
     ok('council: history entries show the date as well as the time (never a bare clock)',
       won.includes('01-02 03:04') && won.includes('上一次会议'));
+
+    // ---------------------------------------------------- the whole building stays pickable
+    const moderatorSelect = selectOf(won, 'cv-moderator');
+    ok('council: the role picker lists every floor, including unavailable ones',
+      ['1F', '4F', '7F', '8F'].every((id) => moderatorSelect.includes(`value="${id}"`)),
+      moderatorSelect.slice(0, 320));
+    ok('council: a floor that is not installed is listed but not selectable',
+      fieldWithValue(moderatorSelect, '8F').includes('disabled'), fieldWithValue(moderatorSelect, '8F'));
+    ok(`council: the disabled option is not annotated (${W.unavailable})`,
+      !moderatorSelect.includes(W.unavailable), moderatorSelect.slice(0, 320));
+
+    const reviewerList = between(won, 'cv-reviewers', 'cv-advanced-toggle');
+    ok('council: unavailable floors stay in the reviewer list',
+      reviewerList.includes('value="8F"'), reviewerList.slice(0, 240));
+    ok('council: an unavailable reviewer cannot be ticked',
+      fieldWithValue(reviewerList, '8F').includes('disabled'), fieldWithValue(reviewerList, '8F'));
 
     // ---------------------------------------------------- collapsed full process
     const processTag = openingTagOf(won, 'cv-process');
@@ -533,10 +567,33 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
     ok('council: the left form does not repeat the server error', !startFail.includes('cv-store-error'));
   }
 
+  const probing = await render('/src/views/CouncilView.vue', () => {
+    const council = useCouncilStore();
+    council.floors = [
+      { floorId: '1F', name: 'CodeBuddy', ready: true, cliPath: '/usr/bin/codebuddy', reason: null },
+      { floorId: '4F', name: 'Claude Code', ready: true, cliPath: '/usr/bin/claude', reason: null },
+      { floorId: '7F', name: 'Kilo Code', ready: true, cliPath: '/usr/bin/kilo', reason: null },
+    ];
+    council.current = null;
+    council.submitting = true;
+    council.pending = { topic: '试麦中的议题', workspacePath: '', floors: ['4F', '1F', '7F'] };
+  });
+  ok('council · probing: renders without throwing', typeof probing === 'string', probing && probing.error);
+  if (typeof probing === 'string') {
+    ok('council: the topic sits above the probe strip', probing.includes('试麦中的议题'));
+    ok('council: cancel is offered while probing', probing.includes('cv-preflight-cancel'));
+    const strip = chunkOf(probing, 'cv-preflight');
+    ok(`council: the probe status is inside the live strip (${W.probing})`,
+      strip.includes(W.probing), strip.slice(0, 240));
+    ok('council: the strip names the floors being probed',
+      strip.includes('Claude Code') && strip.includes('CodeBuddy') && strip.includes('Kilo Code'), strip.slice(0, 240));
+  }
+
   const partial = await render('/src/views/CouncilView.vue', seedCouncil(PARTIAL));
   ok('council · partial: renders without throwing', typeof partial === 'string', partial && partial.error);
   if (typeof partial === 'string') {
-    ok(`council: a partial meeting says so (${W.partial})`, partial.includes(W.partial));
+    ok('council: a finished meeting no longer repeats a verdict badge at the top',
+      !partial.includes(W.partial) && !partial.includes('class="who"'), partial.slice(0, 240));
     ok('council: partial still shows the summary and the process',
       partial.includes('cv-summary') && partial.includes('cv-process'));
     ok('council: partial has no adjudication/final result block', !partial.includes('cv-result'));
@@ -564,8 +621,8 @@ for (const [loc, stateWord, hudWord, taskWord, overviewWord] of [
   ok('council · clarification: renders without throwing',
     typeof clarification === 'string', clarification && clarification.error);
   if (typeof clarification === 'string') {
-    ok(`council: a clarification request is a normal verdict (${W.needClarification})`,
-      clarification.includes(W.needClarification) && clarification.includes('v-needs_clarification'));
+    ok('council: a clarification request is not labelled with a top verdict badge',
+      !clarification.includes('v-needs_clarification'), clarification.slice(0, 240));
     const ask = chunkOf(clarification, 'cv-clarification');
     ok('council: the exact question the moderator needs is shown',
       ask.includes('请给出需要评审的项目绝对路径'), ask);

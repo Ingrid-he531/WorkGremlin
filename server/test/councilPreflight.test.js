@@ -142,6 +142,53 @@ const head = (t) => console.log(`\n${t}`);
     ok('the owned directory was removed anyway', removed.includes('/tmp/wg-owned-probe'), JSON.stringify(removed));
   }
 
+  head('cancelling the request stops probing and never starts the next floor');
+  {
+    clearProbeCache();
+    const ac = new AbortController();
+    let calls = 0;
+    let release = null;
+    const runTurn = async ({ onChild }) => {
+      calls += 1;
+      onChild({ pid: null, killed: false });
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      return { status: 'failed', text: '', error: 'killed', errorKind: 'unknown', durationMs: 1 };
+    };
+    const pending = probeFloors(['1F', '4F'], {
+      cwd: '/tmp/fake-probe-cwd',
+      cliPathOf: () => '/usr/bin/fake',
+      runTurn,
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    ac.abort();
+    release();
+    const results = await pending;
+    ok('only the in-flight floor was probed', calls === 1, String(calls));
+    ok('the killed turn is not recorded as a verdict', results.length === 0, JSON.stringify(results));
+  }
+
+  head('an already-cancelled request spawns nothing');
+  {
+    clearProbeCache();
+    const ac = new AbortController();
+    ac.abort();
+    let calls = 0;
+    const results = await probeFloors(['1F'], {
+      cwd: '/tmp/fake-probe-cwd',
+      cliPathOf: () => '/usr/bin/fake',
+      runTurn: async () => {
+        calls += 1;
+        return { status: 'ok', text: 'OK', durationMs: 1 };
+      },
+      signal: ac.signal,
+    });
+    ok('no floor was probed', calls === 0, String(calls));
+    ok('no result is reported', results.length === 0, JSON.stringify(results));
+  }
+
   console.log(`\n${fail ? '✗' : '✓'} council-preflight: ${pass} passed / ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

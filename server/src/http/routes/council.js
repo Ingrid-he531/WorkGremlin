@@ -61,6 +61,33 @@ function resolveWorkspaceDir(raw) {
 const bad = (res, message) => res.status(400).json({ ok: false, error: { code: 'bad_payload', message } });
 const notFound = (res) => res.status(404).json({ ok: false, error: { code: 'not_found', message: '没有这场会' } });
 
+/**
+ * "The browser went away" → stop working.
+ *
+ * Preflight runs **before** anything is persisted and can take a minute per floor, so it is the one
+ * phase where cancel is free: aborting the request must kill the slow CLI and must never fall through
+ * to `createCouncil`. Without this, a user who presses cancel would still get a meeting started in the
+ * background — the response is simply lost.
+ *
+ * `stop()` detaches the listener before the normal response is written, so a completed request is not
+ * mistaken for an aborted one ('close' also fires after a response is sent).
+ */
+function clientGoneGuard(res) {
+  const ac = new AbortController();
+  let listening = true;
+  const onClose = () => {
+    if (listening) ac.abort();
+  };
+  res.on('close', onClose);
+  return {
+    signal: ac.signal,
+    stop() {
+      listening = false;
+      res.off('close', onClose);
+    },
+  };
+}
+
 function parseJson(value, fallback) {
   if (value == null || value === '') return fallback;
   try {
@@ -157,17 +184,23 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
     const parsed = modelsOf(body.models, floors);
     if (parsed.error) return bad(res, parsed.error);
 
+    const guard = clientGoneGuard(res);
     try {
       const results = await probe(floors, {
         models: parsed.models,
         cliPathOf: (floorId) => (known.get(floorId) || {}).cliPath || null,
+        signal: guard.signal,
       });
+      if (guard.signal.aborted) return;
       res.json({ ok: results.every((r) => r.ok), results });
     } catch (err) {
+      if (guard.signal.aborted) return;
       res.status(500).json({
         ok: false,
         error: { code: 'preflight_failed', message: `试麦失败：${(err && err.message) || '未知原因'}` },
       });
+    } finally {
+      guard.stop();
     }
   });
 
@@ -208,20 +241,29 @@ function createCouncilRouter({ repo, orchestrator, deps = {} }) {
 
     // Gate: a floor that cannot answer one short sentence will not suddenly answer a full plan.
     // Doing this before `createCouncil` means a dead floor leaves no half-built meeting behind.
+    const guard = clientGoneGuard(res);
     try {
       const probes = await probe(all, {
         models: parsedModels.models,
         cliPathOf: (floorId) => (known.get(floorId) || {}).cliPath || null,
+        signal: guard.signal,
       });
+      // Cancelled while probing: nothing was persisted, so there is nothing to clean up — and no
+      // meeting may be created now that the user is gone.
+      if (guard.signal.aborted) return;
       const broken = probes.filter((r) => !r.ok);
       if (broken.length) {
         return bad(res, `这些楼层现在说不了话 —— ${broken.map(describeProbe).join('；')}`);
       }
     } catch (err) {
-      return res.status(500).json({
+      if (guard.signal.aborted) return;
+      res.status(500).json({
         ok: false,
         error: { code: 'preflight_failed', message: `会前试麦失败：${(err && err.message) || '未知原因'}` },
       });
+      return;
+    } finally {
+      guard.stop();
     }
 
     const wantedRounds = Number(body.maxRounds);

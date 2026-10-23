@@ -48,13 +48,14 @@ const floorName = (id) => {
   return f ? f.name : id;
 };
 
-const readyFloors = computed(() => store.readyFloors);
-const notReadyFloors = computed(() => store.floors.filter((f) => !f.ready));
-/** Reviewers may be any ready floor except the two single-role seats. */
+/**
+ * Every floor not holding a single-role seat. Floors without their CLI stay in the list but are
+ * disabled: the panel shows the whole building, and an unavailable floor is visibly unavailable
+ * instead of disappearing (which used to make a history record look like it had fewer seats).
+ */
 const reviewerOptions = computed(() =>
-  readyFloors.value.filter((f) => f.floorId !== form.moderator && f.floorId !== form.main),
+  store.floors.filter((f) => f.floorId !== form.moderator && f.floorId !== form.main),
 );
-
 /** One row per occupied seat, so the user can pin a model for each floor that will actually speak. */
 const selectedSeats = computed(() => {
   const ids = [...new Set([form.moderator, form.main, ...form.reviewers].filter(Boolean))];
@@ -102,7 +103,7 @@ async function submit() {
     const model = String(form.models[seat.floorId] || '').trim();
     if (model) models[seat.floorId] = model;
   }
-  const id = await store.create({
+  await store.create({
     topic: form.topic.trim(),
     moderator: form.moderator,
     main: form.main,
@@ -112,7 +113,24 @@ async function submit() {
     workspacePath: ws,
     models,
   });
-  if (id) form.topic = '';
+  // The compose form is deliberately left untouched: the started meeting's topic and options stay
+  // on the left, so the page never loses the settings that are being discussed on the right.
+}
+
+/**
+ * Open a meeting from history and mirror it into the compose form. Without this the left column
+ * keeps the previous draft, which looks like the selected record ran with somebody else's topic.
+ */
+async function selectCouncil(id) {
+  await store.open(id);
+  if (store.error) return;
+  const draft = store.composeDraft(store.current, store.defaults);
+  if (!draft) return;
+  Object.assign(form, draft);
+  formError.value = '';
+  // Files, workspace and per-seat models live behind the "advanced" toggle; open it when the record
+  // actually used them so "all options" are visible.
+  if (draft.files || draft.workspace || Object.keys(draft.models).length) showAdvanced.value = true;
 }
 
 /* ---------------------------------------------------------------- result */
@@ -155,8 +173,6 @@ const warnings = computed(() => {
   return out;
 });
 
-const verdictKey = (v) =>
-  ['completed', 'partial', 'needs_clarification', 'cancelled', 'failed'].includes(v) ? v : 'failed';
 const PARTICIPANT_STATUSES = new Set([
   'ok',
   'failed',
@@ -197,6 +213,9 @@ const working = computed(() => {
     floors: ((w && w.floors) || []).map(floorName),
   };
 });
+
+/** Floors being probed, shown in the same strip that later reports live round progress. */
+const pendingFloors = computed(() => ((store.pending && store.pending.floors) || []).map(floorName));
 
 /**
  * Every recorded turn per round, including turns that failed or only half-parsed. `system` is the
@@ -329,14 +348,15 @@ function toggleReviewer(id) {
             v-model="form.moderator"
             class="sel"
             data-testid="cv-moderator"
-            :disabled="!readyFloors.length"
+            :disabled="!store.floors.length"
           >
             <option value="">{{ t('council.role.please_select') }}</option>
             <option
-              v-for="f in readyFloors"
+              v-for="f in store.floors"
               :key="f.floorId"
               :value="f.floorId"
-              :disabled="f.floorId === form.main"
+              :disabled="!f.ready || f.floorId === form.main"
+              :title="f.ready ? '' : f.reason"
             >
               {{ f.floorId }} · {{ f.name }}
             </option>
@@ -350,14 +370,15 @@ function toggleReviewer(id) {
             v-model="form.main"
             class="sel"
             data-testid="cv-main"
-            :disabled="!readyFloors.length"
+            :disabled="!store.floors.length"
           >
             <option value="">{{ t('council.role.please_select') }}</option>
             <option
-              v-for="f in readyFloors"
+              v-for="f in store.floors"
               :key="f.floorId"
               :value="f.floorId"
-              :disabled="f.floorId === form.moderator"
+              :disabled="!f.ready || f.floorId === form.moderator"
+              :title="f.ready ? '' : f.reason"
             >
               {{ f.floorId }} · {{ f.name }}
             </option>
@@ -367,31 +388,25 @@ function toggleReviewer(id) {
         <div class="role-row">
           <span class="role-lbl">{{ t('council.role.reviewer') }}</span>
           <ul class="plist" data-testid="cv-reviewers">
-            <li v-for="f in reviewerOptions" :key="f.floorId">
+            <li v-for="f in reviewerOptions" :key="f.floorId" :title="f.ready ? '' : f.reason">
               <label>
                 <input
                   type="checkbox"
                   :value="f.floorId"
                   :checked="form.reviewers.includes(f.floorId)"
+                  :disabled="!f.ready && !form.reviewers.includes(f.floorId)"
                   @change="toggleReviewer(f.floorId)"
                 />
                 <span class="fid">{{ f.floorId }}</span>
                 <span class="fname">{{ f.name }}</span>
               </label>
             </li>
-            <li v-if="!reviewerOptions.length" class="hint">{{ t('council.role.no_reviewers') }}</li>
+            <li v-if="!reviewerOptions.length" class="hint">
+              {{ t('council.role.no_reviewers') }}
+            </li>
           </ul>
           <p class="hint">{{ t('council.role.reviewer_hint') }}</p>
         </div>
-
-        <ul v-if="notReadyFloors.length" class="floors">
-          <li v-for="f in notReadyFloors" :key="f.floorId" class="off">
-            <span class="fid">{{ f.floorId }}</span>
-            <span class="fname">{{ f.name }}</span>
-            <span class="why">{{ t('council.floor_not_ready') }}</span>
-            <p class="why dim">{{ f.reason }}</p>
-          </li>
-        </ul>
 
         <div class="accordion" :class="{ open: showAdvanced }">
           <button
@@ -476,7 +491,7 @@ function toggleReviewer(id) {
             v-for="c in store.list"
             :key="c.id"
             :class="{ on: council && council.id === c.id }"
-            @click="store.open(c.id)"
+            @click="selectCouncil(c.id)"
           >
             <span class="ctime">{{ fmtTime(c.created_at) }}</span>
             <span class="topic">{{ c.topic }}</span>
@@ -487,13 +502,33 @@ function toggleReviewer(id) {
 
     <!-- ------------------------------------------------------------ right column: summary + collapsed process -->
     <section class="main">
-      <div v-if="store.submitting" class="working" data-testid="cv-preflight" role="status" aria-live="polite">
-        <span class="pulse" aria-hidden="true"></span>
-        <strong class="working-hd">{{ t('council.preflight_running') }}</strong>
-      </div>
+      <!-- Probing is the start of the meeting, so it uses the meeting's own layout: topic on top,
+           cancel on the next line, and the live strip below it. The strip carries the probe status
+           instead of a separate banner, so the page does not jump when round 0 begins. -->
+      <template v-if="store.submitting && store.pending">
+        <header class="head">
+          <h2 class="topic-h">{{ store.pending.topic }}</h2>
+          <p v-if="store.pending.workspacePath" class="ws mono">
+            {{ t('council.workspace_line') }}<span class="ws-path">{{ store.pending.workspacePath }}</span>
+          </p>
+          <div class="acts">
+            <button class="ghost" data-testid="cv-preflight-cancel" @click="store.cancelSubmit()">
+              {{ t('council.cancel') }}
+            </button>
+          </div>
+        </header>
+        <div class="working" data-testid="cv-preflight" role="status" aria-live="polite">
+          <span class="pulse" aria-hidden="true"></span>
+          <strong class="working-hd">{{ t('council.preflight_running') }}</strong>
+          <template v-if="pendingFloors.length">
+            <span class="sep">·</span>
+            <span class="working-floors">{{ pendingFloors.join('、') }}</span>
+          </template>
+        </div>
+      </template>
 
-      <template v-if="!store.current">
-        <p v-if="!store.error && !store.submitting" class="empty">{{ t('council.pick_one') }}</p>
+      <template v-else-if="!store.current">
+        <p v-if="!store.error" class="empty">{{ t('council.pick_one') }}</p>
         <section v-else-if="store.error" class="card alert" data-testid="cv-op-error">
           <p class="alert-text">{{ store.error }}</p>
         </section>
@@ -501,14 +536,6 @@ function toggleReviewer(id) {
 
       <template v-else>
         <header class="head">
-          <!-- A running meeting is already described by the work strip below; repeating the state
-               here adds nothing. The verdict badge stays for a finished meeting, where it is the
-               only summary of how the meeting ended. -->
-          <div v-if="council.verdict" class="who">
-            <span class="badge" :class="'v-' + verdictKey(council.verdict)">
-              {{ t('council.verdict.' + verdictKey(council.verdict)) }}
-            </span>
-          </div>
           <h2 class="topic-h">{{ council.topic }}</h2>
           <p v-if="store.workspacePath" class="ws mono" data-testid="cv-workspace-show">
             {{ t('council.workspace_line') }}<span class="ws-path">{{ store.workspacePath }}</span>
@@ -900,10 +927,6 @@ function toggleReviewer(id) {
 }
 input.ta { padding: 6px 8px; }
 
-.floors { list-style: none; margin: 0; padding: 0; }
-.floors li { margin: 3px 0; }
-.floors label { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
-.floors li.off label { cursor: not-allowed; color: var(--text-faint); }
 .fid {
   font-family: var(--mono);
   font-size: 11px;
@@ -1027,7 +1050,6 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
 .empty { color: var(--text-faint); font-size: 13px; margin: 20px; }
 
 .head { display: flex; flex-direction: column; gap: 6px; }
-.who { display: flex; align-items: center; gap: 8px; }
 
 .topic-h { font-size: 15px; margin: 0; line-height: 1.4; }
 
@@ -1087,11 +1109,6 @@ button.ghost.danger:hover { color: var(--state-blocked); border-color: var(--sta
   border: 1px solid var(--border-strong);
   white-space: nowrap;
 }
-.v-completed { color: var(--state-success); border-color: var(--state-success); }
-.v-partial { color: var(--state-busy); border-color: var(--state-busy); }
-.v-needs_clarification,
-.v-cancelled,
-.v-failed { color: var(--text-dim); }
 
 .card {
   border: 1px solid var(--border-strong);

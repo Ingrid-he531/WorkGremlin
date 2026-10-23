@@ -328,6 +328,40 @@ head('start: roles go into the body; a blank workspace omits the key');
   ok('workspace in the body when given', sent.body.workspacePath === '/home/me/proj');
   ok('only non-empty per-seat models are sent',
     JSON.stringify(sent.body.models) === JSON.stringify({ '1F': 'deepseek-v4.1-flash' }), JSON.stringify(sent.body.models));
+  ok('the pending start state is cleared after success', s.pending === null && s.submitAbort === null);
+}
+
+head('start: cancelling while probing aborts the request and reports no error');
+{
+  const s = fresh();
+  const realFetch = globalThis.fetch;
+  let sawSignal = null;
+  globalThis.fetch = (url, opts) =>
+    new Promise((resolve, reject) => {
+      sawSignal = opts && opts.signal;
+      if (!sawSignal) return reject(new Error('the start request must be abortable'));
+      sawSignal.addEventListener('abort', () => {
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        reject(err);
+      }, { once: true });
+    });
+
+  const pending = s.create({ topic: '取消测试', moderator: '4F', main: '1F', reviewers: ['7F'], files: [], maxRounds: 2 });
+  ok('submitting is true while probing', s.submitting === true);
+  ok('the topic and floors are captured for the header',
+    s.pending && s.pending.topic === '取消测试' && s.pending.floors.join(',') === '4F,1F,7F',
+    JSON.stringify(s.pending));
+  ok('the request carries an AbortSignal', Boolean(sawSignal));
+
+  s.cancelSubmit();
+  const id = await pending;
+  ok('no meeting id is returned', id === null);
+  ok('cancel is not shown as a failure', s.error === '', s.error);
+  ok('submitting / pending are cleared immediately', s.submitting === false && s.pending === null && s.submitAbort === null);
+  ok('the signal was aborted', sawSignal.aborted === true);
+
+  globalThis.fetch = realFetch;
 }
 {
   const s = fresh();
@@ -347,6 +381,45 @@ head('start: roles go into the body; a blank workspace omits the key');
   // string would be a different thing to normalize. The old frontend never sent it either.
   ok('a blank workspace omits the key entirely', !('workspacePath' in sent.body), JSON.stringify(sent.body));
   ok('all-blank models omit the key entirely', !('models' in sent.body), JSON.stringify(sent.body));
+}
+
+head('history selection: a stored meeting maps back to every compose option');
+{
+  const s = fresh();
+  const draft = s.composeDraft(
+    {
+      council: { id: 'c1', topic: '旧议题', max_rounds: 2, workspace_path: '/home/me/proj' },
+      participants: [
+        { floor_id: '4F', role: 'moderator', model: 'sonnet' },
+        { floor_id: '1F', role: 'main', model: null },
+        { floor_id: '7F', role: 'reviewer', model: 'kilo-x' },
+        { floor_id: '8F', role: 'reviewer', model: null },
+      ],
+      materials: [{ path: '/tmp/a.md' }, { path: '' }],
+    },
+    { maxRounds: 3 },
+  );
+  ok('the topic is kept', draft.topic === '旧议题');
+  ok('moderator / main / reviewers are restored',
+    draft.moderator === '4F' && draft.main === '1F' && draft.reviewers.join(',') === '7F,8F',
+    JSON.stringify(draft));
+  ok('the round count is the record\'s, not the current default', draft.maxRounds === 2);
+  ok('the workspace is restored', draft.workspace === '/home/me/proj');
+  ok('material paths come back one per line', draft.files === '/tmp/a.md');
+  ok('only models the record really used are restored',
+    JSON.stringify(draft.models) === JSON.stringify({ '4F': 'sonnet', '7F': 'kilo-x' }), JSON.stringify(draft.models));
+
+  const isolated = s.composeDraft(
+    {
+      council: { id: 'c2', topic: '隔离', max_rounds: 1, workspace_path: null },
+      participants: [],
+      materials: [],
+    },
+    { maxRounds: 3 },
+  );
+  ok('an isolated meeting leaves the workspace blank', isolated.workspace === '');
+  ok('an empty record is not invented', isolated.moderator === '' && isolated.main === '' && isolated.reviewers.length === 0);
+  ok('no current meeting -> no draft', s.composeDraft(null, {}) === null);
 }
 
 head('workspacePath getter: null means isolated mode, shown as an empty string');

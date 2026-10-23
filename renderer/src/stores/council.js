@@ -54,6 +54,14 @@ export const useCouncilStore = defineStore('council', {
     liveProposal: null,
     loading: false,
     submitting: false,
+    /**
+     * The meeting being started (topic / workspace / floors), captured when `create()` begins.
+     * The right column renders it as the normal meeting header **while probing**, so preflight looks
+     * like the start of a meeting instead of a detached banner.
+     */
+    pending: null,
+    /** AbortController for the in-flight start request (cancel during preflight) */
+    submitAbort: null,
     /** Raw failure text. **Untouched** — the user must see exactly what the server said */
     error: '',
   }),
@@ -168,13 +176,60 @@ export const useCouncilStore = defineStore('council', {
     },
 
     /**
+     * A stored meeting mapped back to the compose form's shape.
+     *
+     * The left column is the only place the settings are visible, so opening a history record must
+     * restore the topic, the three roles, max rounds, workspace, material paths and per-seat models —
+     * otherwise it keeps showing the previous draft. Nothing is invented: a nameless participant or
+     * an empty material path is dropped.
+     *
+     * @returns {{topic:string, moderator:string, main:string, reviewers:string[], files:string,
+     *   maxRounds:number, workspace:string, models:Object<string,string>}|null}
+     */
+    composeDraft(current, defaults = {}) {
+      if (!current || !current.council) return null;
+      const council = current.council;
+      const parts = Array.isArray(current.participants) ? current.participants : [];
+      const byRole = (role) => parts.find((p) => p && p.role === role);
+      const moderator = byRole('moderator');
+      const main = byRole('main');
+      const models = {};
+      for (const p of parts) {
+        if (p && p.floor_id && p.model) models[p.floor_id] = p.model;
+      }
+      return {
+        topic: council.topic || '',
+        moderator: (moderator && moderator.floor_id) || '',
+        main: (main && main.floor_id) || '',
+        reviewers: parts
+          .filter((p) => p && p.role === 'reviewer' && p.floor_id)
+          .map((p) => p.floor_id),
+        files: (current.materials || [])
+          .map((m) => m && m.path)
+          .filter(Boolean)
+          .join('\n'),
+        maxRounds: Number(council.max_rounds) || Number(defaults.maxRounds) || 3,
+        workspace: council.workspace_path || '',
+        models,
+      };
+    },
+
+    /**
      * Start a council.
      * @returns {Promise<string|null>} the new id; on failure null and the reason in `error`
      */
     async create({ topic, moderator, main, reviewers, files, maxRounds, workspacePath, models }) {
       const project = useProjectStore();
+      const ac = new AbortController();
       this.submitting = true;
+      this.submitAbort = ac;
       this.error = '';
+      const ws = String(workspacePath == null ? '' : workspacePath).trim();
+      this.pending = {
+        topic: String(topic == null ? '' : topic),
+        workspacePath: ws,
+        floors: [...new Set([moderator, main, ...(Array.isArray(reviewers) ? reviewers : [])].filter(Boolean))],
+      };
       const body = {
         topic,
         moderator,
@@ -183,7 +238,6 @@ export const useCouncilStore = defineStore('council', {
         files: Array.isArray(files) ? files : [],
         maxRounds,
       };
-      const ws = String(workspacePath == null ? '' : workspacePath).trim();
       if (ws) body.workspacePath = ws;
       // Only send non-empty entries: an empty string means "let the CLI use its own default".
       const modelMap = {};
@@ -198,6 +252,7 @@ export const useCouncilStore = defineStore('council', {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(authHeaders(info) || {}) },
           body: JSON.stringify(body),
+          signal: ac.signal,
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
@@ -209,11 +264,32 @@ export const useCouncilStore = defineStore('council', {
         await this.open(id);
         return id;
       } catch (err) {
+        // Cancel is not a failure: the user pressed the button, so say nothing.
+        if (err && err.name === 'AbortError') return null;
         this.error = `发起失败：${(err && err.message) || '和服务端联系不上'}`;
         return null;
       } finally {
-        this.submitting = false;
+        // A newer start request (or cancel) may already own the state; only the owner clears it.
+        if (this.submitAbort === ac) {
+          this.submitting = false;
+          this.submitAbort = null;
+          this.pending = null;
+        }
       }
+    },
+
+    /**
+     * Cancel while probing. The request is aborted, which makes the server kill the CLI it is
+     * waiting on and skip `createCouncil` entirely (see `clientGoneGuard` in the council routes),
+     * so cancelling here never leaves a meeting running in the background.
+     */
+    cancelSubmit() {
+      const ac = this.submitAbort;
+      this.submitAbort = null;
+      this.submitting = false;
+      this.pending = null;
+      this.error = '';
+      if (ac) ac.abort();
     },
 
     async cancel(id) {

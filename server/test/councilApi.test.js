@@ -74,8 +74,11 @@ const orch = {
 /** Preflight is a real model call, so the API test stubs it; individual cases override `probeBehavior`. */
 const probeCalls = [];
 let probeBehavior = () => null;
+/** When set, the stub waits here — used to hold a start request inside preflight and abort it. */
+let probeGate = null;
 const probeFloors = async (floorIds, opts) => {
   probeCalls.push({ floorIds: [...floorIds], models: { ...(opts && opts.models) } });
+  if (probeGate) await probeGate(floorIds, opts);
   return floorIds.map((floorId) => {
     const forced = probeBehavior(floorId, opts);
     if (forced) return { floorId, ok: false, model: null, cliPath: null, status: 'failed', error: forced, errorKind: 'model', durationMs: 1, cached: false };
@@ -166,6 +169,51 @@ const valid = (over = {}) => ({
     ok('the failure is attached to that floor',
       badBody.results.find((r) => r.floorId === '1F').ok === false, JSON.stringify(badBody));
     probeBehavior = () => null;
+  }
+
+  /* ------------------------------------------------------------ cancel while probing */
+  head('start: cancelling while probing creates no meeting');
+  {
+    probeBehavior = () => null;
+    probeCalls.length = 0;
+    const before = repo.listCouncils(50).length;
+    let entered;
+    const enteredP = new Promise((r) => {
+      entered = r;
+    });
+    let gateSignal = null;
+    probeGate = (floorIds, opts) => {
+      gateSignal = opts && opts.signal;
+      entered();
+      return new Promise((resolve) => {
+        if (!gateSignal || gateSignal.aborted) return resolve();
+        gateSignal.addEventListener('abort', () => resolve(), { once: true });
+      });
+    };
+
+    const ac = new AbortController();
+    const req = fetch(`${base}/councils`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(valid()),
+      signal: ac.signal,
+    });
+    await enteredP;
+    ac.abort();
+    let abortedErr = null;
+    try {
+      await req;
+    } catch (err) {
+      abortedErr = err;
+    }
+    // The server reacts to the socket closing on its own turn; give it one tick to run.
+    await new Promise((r) => setTimeout(r, 100));
+
+    ok('the client request was aborted', abortedErr && abortedErr.name === 'AbortError', String(abortedErr));
+    ok('the abort reached the running probe', Boolean(gateSignal) && gateSignal.aborted === true);
+    ok('no meeting was created', repo.listCouncils(50).length === before, String(repo.listCouncils(50).length));
+    ok('the orchestrator was never started', orch.started.length === 0, JSON.stringify(orch.started));
+    probeGate = null;
   }
 
   /* ------------------------------------------------------------ rejection */
