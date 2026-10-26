@@ -5,6 +5,11 @@
  * Standalone entry point (headless mode):
  *   node server/src/cli.js                      default port probing + connect real data sources
  *   node server/src/cli.js --port 21800
+ *   node server/src/cli.js --host 0.0.0.0       listen on all interfaces (remote clients need --token)
+ *   node server/src/cli.js --token mytoken      fixed token (the default is random per start)
+ *   node server/src/cli.js --static renderer/dist
+ *                                              also serve the built UI, so a client machine only
+ *                                              needs a browser (`npm run build` first)
  *   node server/src/cli.js --db /tmp/wg.db
  *   node server/src/cli.js --self-test          only verify better-sqlite3 create/read/write (V1 criterion 3)
  *   node server/src/cli.js --no-token           disable the local token (debugging only)
@@ -40,6 +45,24 @@ const log = require('./log');
 const { createServer } = require('./index');
 const { openDatabase } = require('./db');
 const config = require('./config');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+/**
+ * Host to put in the printed browser URL: 0.0.0.0 / :: cannot be opened, so use the first
+ * non-internal IPv4 address instead.
+ * @param {string} [host]
+ */
+function browserHost(host) {
+  if (host && host !== '0.0.0.0' && host !== '::') return host;
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const addr of list || []) {
+      if (addr.family === 'IPv4' && !addr.internal) return addr.address;
+    }
+  }
+  return '127.0.0.1';
+}
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -138,17 +161,48 @@ async function main() {
     return;
   }
 
+  const host = typeof args.host === 'string' ? args.host : undefined;
+  const staticDir = typeof args.static === 'string' ? path.resolve(args.static) : undefined;
+  if (staticDir && !fs.existsSync(path.join(staticDir, 'index.html'))) {
+    log.error(`[workgremlin] --static 目录里没有 index.html：${staticDir}（先跑 npm run build）`);
+    process.exit(1);
+  }
   const server = createServer({
     dbPath: typeof args.db === 'string' ? args.db : undefined,
     port: args.port ? Number(args.port) : undefined,
-    token: args['no-token'] ? '' : undefined,
+    host,
+    // --no-token wins: validation explicitly disabled (debugging only). --token pins a token so a
+    // remote client can know it before the server starts (the default rotates on every start).
+    token: args['no-token'] ? '' : typeof args.token === 'string' ? args.token : undefined,
     workspacePath: typeof args.workspace === 'string' ? args.workspace : undefined,
+    serveStatic: staticDir,
     // --log=debug / --log=error … (equivalent to WORKGREMLIN_LOG; --log-file=0 disables file logging)
     log: typeof args.log === 'string' ? args.log : undefined,
   });
   if (args['log-file'] === '0') log.setFileEnabled(false);
 
   await server.start(args.port ? Number(args.port) : undefined);
+
+  if (staticDir) {
+    const base = `http://${browserHost(host)}:${server.info.port}/`;
+    log.info(
+      `[workgremlin] 浏览器访问（客户端无需安装任何东西）：${base}${server.token ? `?token=${server.token}` : ''}`
+    );
+  }
+
+  const loopback = !host || host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  if (!loopback) {
+    if (args['no-token']) {
+      log.warn(`[workgremlin] 已监听 ${host} 且关闭了 token：只能用于可信网络或 SSH 隧道`);
+    } else if (!args.token) {
+      log.warn(
+        `[workgremlin] 已监听 ${host}，但 token 是本次随机生成的：远程客户端读不到它，` +
+          '请用 --token <固定值> 启动（token 明文传输，建议配合隧道/反代）'
+      );
+    } else {
+      log.warn(`[workgremlin] 已监听 ${host}：token 与实际数据都是明文 HTTP/WS 传输`);
+    }
+  }
   log.info(`[workgremlin] server.json -> ${config.serverInfoPath()}`);
   log.info('[workgremlin] Ctrl+C 退出');
 

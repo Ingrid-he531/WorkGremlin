@@ -20,3 +20,6 @@ recordings/
 .kilo/
 
 .qoder/
+
+# Client-only package output (electron-builder.client.yml)
+dist-client/

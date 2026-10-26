@@ -5,15 +5,20 @@
  *
  * 关键设计：server 由 launcher（desktop/src/launcher.js，Electron 主进程入口）先行以独立进程
  * 启动（electron server/src/cli.js，即 Electron 内置 Node 跑），并写入 ~/.workgremlin/server.json；
- * 本进程只读取 server.json 连接该 server，**不自行启动 server**，也不依赖任何环境变量。
+ * 本进程只读取 server.json 连接该 server，**不自行启动 server**。
  * server 的内存持久由 launcher 管理（detached，应用退出不随之退出）。
  *
  * 启动顺序：app.ready -> 读 server.json 连接已起好的 server -> 建窗
+ *
+ * Exception: when a remote target is configured (see remoteConfig.js), the window connects to a
+ * server running elsewhere, does not read server.json and never expects a local server. The
+ * remote token is fixed, so it is handed to the renderer as-is instead of re-read per reconnect.
  */
 
 const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen, shell } = require('electron');
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
+const { remoteConfig, isClientBuild } = require('./remoteConfig');
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
@@ -39,10 +44,10 @@ function readServerInfoFile() {
   return null;
 }
 
-/** 轻量探活：127.0.0.1:port 是否有人监听 */
-function pingPort(port, timeoutMs = 1500) {
+/** 轻量探活：host:port 是否有人监听 */
+function pingPort(host, port, timeoutMs = 1500) {
   return new Promise((resolve) => {
-    const s = net.connect({ host: '127.0.0.1', port });
+    const s = net.connect({ host, port });
     const done = (ok) => { try { s.destroy(); } catch {} resolve(ok); };
     const t = setTimeout(() => done(false), timeoutMs);
     s.once('connect', () => { clearTimeout(t); done(true); });
@@ -57,15 +62,46 @@ async function bootstrap() {
   // gone). It is a read-only virtual session started from the office HUD via
   // /api/v1/demo/session; startup always opens real data.
 
-  // server 由 launcher（desktop/src/launcher.js）先行启动并写入 server.json；client 只读取并连接，不自行启动 server。
-  const existing = readServerInfoFile();
-  if (existing && (await pingPort(existing.port))) {
-    serverInfo = existing;
-    console.log(`[workgremlin] 连接 server：port=${existing.port}`);
-  } else {
-    console.error('[workgremlin] 未找到可用 server（请先通过 npm run dev / npm run launch:electron 启动），退出');
+  const remote = remoteConfig();
+
+  // Client-only package: there is no server inside it, so a missing target must be explained
+  // instead of silently quitting (a portable exe has no console to read).
+  if (!remote && isClientBuild(app.getAppPath())) {
+    dialog.showErrorBox(
+      'WorkGremlin Client',
+      '没有找到远程服务配置。\n\n' +
+        '在与本程序相同的目录放一个 client.json：\n\n' +
+        '{\n  "host": "192.168.1.5",\n  "port": 21800,\n  "token": "<服务端 --token 指定的值>"\n}\n\n' +
+        '也可以改用环境变量 WORKGREMLIN_REMOTE=host:port 与 WORKGREMLIN_REMOTE_TOKEN。'
+    );
     app.quit();
     return;
+  }
+
+  if (remote) {
+    // Remote mode: no local server.json, no local server. Only the fixed target + token are needed;
+    // the token cannot rotate under us, so re-reading it per reconnect (below) does not apply.
+    if (!(await pingPort(remote.host, remote.port))) {
+      console.error(`[workgremlin] 远程 server 不可达：${remote.host}:${remote.port}，退出`);
+      app.quit();
+      return;
+    }
+    serverInfo = { host: remote.host, port: remote.port, token: remote.token, version: 'remote' };
+    console.log(`[workgremlin] 连接远程 server：host=${remote.host} port=${remote.port}`);
+    if (isDev) {
+      console.warn('[workgremlin] dev 模式下窗口仍由本地 Vite 提供，远程模式请先用 npm run build 再启动');
+    }
+  } else {
+    // server 由 launcher（desktop/src/launcher.js）先行启动并写入 server.json；client 只读取并连接，不自行启动 server。
+    const existing = readServerInfoFile();
+    if (existing && (await pingPort('127.0.0.1', existing.port))) {
+      serverInfo = existing;
+      console.log(`[workgremlin] 连接 server：port=${existing.port}`);
+    } else {
+      console.error('[workgremlin] 未找到可用 server（请先通过 npm run dev / npm run launch:electron 启动），退出');
+      app.quit();
+      return;
+    }
   }
 
   /**
@@ -75,8 +111,11 @@ async function bootstrap() {
    * 启动那一刻缓存的那份，server 一重启渲染层就拿着旧 token 一直重连（服务端 close 4001
    * bad_token）+ 所有 HTTP 轮询 401，界面停在旧数据上不再更新（实测：任务列表里"运行中"
    * 的任务消失，只剩旧记录）。所以这里现读现给，读不到才退回缓存。
+   *
+   * 远程模式下跳过：目标地址和 token 都由配置固定，不存在"本地 server 重启换了 token"这回事。
    */
   ipcMain.handle(IPC_EVENTS.GET_SERVER_INFO, () => {
+    if (remote) return serverInfo;
     const fresh = readServerInfoFile();
     if (fresh) serverInfo = fresh;
     return serverInfo;

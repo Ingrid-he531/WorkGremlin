@@ -12,7 +12,6 @@
 
 const http = require('node:http');
 const express = require('express');
-const path = require('node:path');
 
 const log = require('./log');
 const { openDatabase } = require('./db');
@@ -30,6 +29,7 @@ const { createDemoRouter } = require('./http/routes/demo');
 const { createCouncilRouter } = require('./http/routes/council');
 const { createCouncilOrchestrator } = require('./council/orchestrator');
 const { requireToken } = require('./http/auth');
+const { createStaticSite } = require('./http/staticSite');
 const { createDemoProvider } = require('./demo');
 const { setBackend: setRegistryBackend } = require('./sessionRegistry');
 const { createPoller } = require('./poller');
@@ -251,7 +251,9 @@ function createServer(opts = {}) {
   app.use('/api/v1', requireToken(token), createCouncilRouter({ repo, orchestrator }));
 
   if (opts.serveStatic) {
-    app.use(express.static(path.resolve(opts.serveStatic)));
+    // Browser-only mode: the same server hands out the built UI, so the client machine needs
+    // nothing installed. Registered after the API routers so /api is never shadowed.
+    app.use(createStaticSite({ dir: opts.serveStatic, token }));
   }
 
   const timers = [];
@@ -270,7 +272,7 @@ function createServer(opts = {}) {
     autoInstallHooks();
 
     const existing = config.readServerInfo();
-    const chosen = Number(port) || Number(opts.port) || (await config.pickPort());
+    const chosen = Number(port) || Number(opts.port) || (await config.pickPort(undefined, undefined, host));
     if (!chosen) throw new Error('no free port available in the configured range');
 
     await new Promise((resolve, reject) => {

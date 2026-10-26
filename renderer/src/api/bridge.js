@@ -8,7 +8,7 @@ export function hasBridge() {
   return typeof window !== 'undefined' && Boolean(window.workgremlin);
 }
 
-/** @returns {Promise<{port: number, token: string, dbPath?: string, version?: string}>} */
+/** @returns {Promise<{host?: string, port: number, token: string, dbPath?: string, version?: string}>} */
 export async function getServerInfo() {
   if (hasBridge()) {
     try {
@@ -19,7 +19,12 @@ export async function getServerInfo() {
     }
   }
   const fallbackPort = Number(import.meta.env.VITE_SERVER_PORT || location.port || 21800);
-  return { port: fallbackPort, token: '', version: 'dev', fallback: true };
+  // Browser-only mode (`--static`): the server injects this global into index.html with the token,
+  // and API/WS are same-origin, so no bridge and no Vite proxy is involved. In Vite dev mode the
+  // global is absent and the proxy injects the token instead.
+  const boot = typeof window !== 'undefined' ? window.__WORKGREMLIN_BOOT__ : null;
+  const bootToken = boot && typeof boot.token === 'string' ? boot.token : '';
+  return { port: fallbackPort, token: bootToken, version: boot ? 'web' : 'dev', fallback: true };
 }
 
 /**
@@ -169,21 +174,30 @@ export async function chooseWorkspace() {
 }
 
 /**
- * WS url. With a bridge, connect straight to 127.0.0.1:<port>; otherwise go same-origin (vite proxy).
- * @param {{port:number, token:string}} info
+ * Host of the current target. Local mode stays on loopback; the desktop client can be pointed at
+ * a server on another machine (see desktop/src/remoteConfig.js), which sets `host`.
+ * @param {{host?: string}} [info]
+ */
+function hostOf(info) {
+  return (info && info.host) || '127.0.0.1';
+}
+
+/**
+ * WS url. With a bridge, connect straight to the configured host; otherwise go same-origin (vite proxy).
+ * @param {{host?: string, port: number, token: string}} info
  */
 export function wsUrl(info) {
-  if (info && info.port && !info.fallback) return `ws://127.0.0.1:${info.port}/ws`;
+  if (info && info.port && !info.fallback) return `ws://${hostOf(info)}:${info.port}/ws`;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/ws`;
 }
 
 /**
  * HTTP base.
- * @param {{port:number, fallback?:boolean}} info
+ * @param {{host?: string, port: number, fallback?: boolean}} info
  */
 export function httpBase(info) {
-  if (info && info.port && !info.fallback) return `http://127.0.0.1:${info.port}`;
+  if (info && info.port && !info.fallback) return `http://${hostOf(info)}:${info.port}`;
   return '';
 }
 

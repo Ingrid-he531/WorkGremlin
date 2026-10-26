@@ -1,0 +1,56 @@
+# Client-only package: the Electron window as a thin client for a WorkGremlin server running
+# elsewhere (or on the same machine). It contains **no server, no SQLite, no native module**, so it
+# is much smaller than the full package and cross-builds without a native toolchain.
+#
+# Usage (renderer must be built first):
+#   npm run build
+#   npx electron-builder --config electron-builder.client.yml --linux dir        # verify locally
+#   npx electron-builder --config electron-builder.client.yml --linux AppImage   # Linux package
+#   npx electron-builder --config electron-builder.client.yml --win portable     # Windows exe
+#
+# The client needs a target, in this order:
+#   · client.json next to the executable (portable: unzip, put the file beside the exe, run)
+#   · ~/.workgremlin/client.json
+#   · WORKGREMLIN_REMOTE=host:port + WORKGREMLIN_REMOTE_TOKEN=<token>
+# Without a target it shows a dialog explaining the file shape instead of starting a local server
+# (there is none in this package).
+
+appId: com.workgremlin.client
+productName: WorkGremlin Client
+copyright: Copyright © 2026 WorkGremlin
+
+# The package ships no native module; rebuilding better-sqlite3 for Electron would only add a
+# C++ toolchain requirement (and minutes) to the build.
+npmRebuild: false
+
+directories:
+  output: dist-client
+  buildResources: build
+
+# Only the window + the shared constants + the built renderer. In particular `server/`,
+# `packages/reporter` and `better-sqlite3` are intentionally absent: the root package.json still
+# lists them as dependencies, so they are excluded explicitly instead of being pulled in as
+# production node_modules.
+files:
+  - package.json
+  - desktop
+  - shared
+  - renderer/dist
+  - "!node_modules/**"
+  - node_modules/@workgremlin/shared
+  - "!**/*.map"
+  - "!**/*.md"
+
+# Read at runtime by desktop/src/remoteConfig.js (isClientBuild): a package without a server must
+# never fall back to "start a local server".
+extraMetadata:
+  workgremlinClient: true
+
+# Predictable artifact names for both platforms (the product name contains a space).
+artifactName: ${name}-client-${version}-${arch}.${ext}
+
+linux:
+  target:
+    - AppImage
+  category: Utility
+  executableName: workgremlin-client

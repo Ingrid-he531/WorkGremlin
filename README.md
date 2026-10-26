@@ -27,6 +27,31 @@ npm run launch:electron
 
 **Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the current floor gets an isolated virtual **demo session**, the main console follows the server-owned demo phase, and the office shows the demo team (6 experts + 2 temporary members). Task records, the project selector and the conversation stay on the real project. Click "Exit demo" again to return to the previously selected real session.
 
+### Remote access
+
+The renderer only talks HTTP `/api/v1` + WebSocket `/ws`, so the window can be a thin client and a browser can open the UI directly.
+
+**Server side** (the machine running the agents and the database):
+
+```bash
+# Browser mode: also serve the built UI; the printed URL carries the token once
+npm run build
+node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token --static renderer/dist
+
+# Window-client mode: expose the API + WS only
+node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token
+```
+
+Always pass a fixed `--token`: the default token is regenerated on every start and is only readable on the server machine.
+
+**Client side** (no server, no database):
+
+- **Browser — nothing to install**: open the URL printed by `--static` (`http://<host>:21800/?token=my-token`). The token is exchanged for an httpOnly cookie, so a refresh does not need it again. `msedge --app=<url>` / `chrome --app=<url>` gives a window without browser chrome.
+- **Client-only window**: `npm run build:client` (Linux unpacked build), then put `client.json` `{ "host": "192.168.1.5", "port": 21800, "token": "my-token" }` next to the executable or in `~/.workgremlin/client.json`. On a Windows machine the same config produces the exe: `npx electron-builder --config electron-builder.client.yml --win portable`. The client package contains no server and no native module, so it is ~112 MB instead of ~125 MB and needs no SQLite toolchain. The `Client packages (Windows)` GitHub Actions workflow (`.github/workflows/client-windows.yml`) builds the zip + portable exe on `windows-latest` — run it from the Actions tab or push a `v*` tag.
+- **Full package**: the same `client.json` turns it into a remote client; with a target configured it never starts or reads a local server.
+
+Everything is plain HTTP/WS: use it only on a trusted network, or put an SSH tunnel or a TLS reverse proxy in front. `--no-token` disables the only gate, so never combine it with `--host 0.0.0.0` on a shared network.
+
 ## Four pages
 
 ### Office (default)

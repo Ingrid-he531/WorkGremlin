@@ -24,6 +24,7 @@ const { spawn } = require('child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const { home } = require('@workgremlin/shared');
+const { remoteConfig, isClientBuild } = require('./remoteConfig');
 
 const HOME = home();
 const SERVER_JSON = path.join(HOME, 'server.json');
@@ -164,6 +165,17 @@ function startServer() {
 }
 
 app.whenReady().then(async () => {
+  // Remote mode (see remoteConfig.js): the window is a thin client for a server on another
+  // machine, so starting a local server would only add a second, unused instance. The same holds
+  // for the client-only package, which ships no server at all: let main.js handle (and explain)
+  // a missing target instead of spawning a CLI that is not there.
+  const remote = remoteConfig();
+  if (remote || isClientBuild(app.getAppPath())) {
+    if (remote) console.log(`[launcher] 远程模式：${remote.host}:${remote.port}（不启动本地 server）`);
+    require('./main');
+    return;
+  }
+
   let existing = readServerInfo();
   if (WANT_RESTART) {
     await stopServer(existing);

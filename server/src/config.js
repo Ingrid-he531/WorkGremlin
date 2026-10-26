@@ -41,13 +41,18 @@ function newToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
-/** @param {number} port */
-function isPortFree(port) {
+/**
+ * @param {number} port
+ * @param {string} [host] interface the port will actually be bound to (defaults to loopback)
+ */
+function isPortFree(port, host = '127.0.0.1') {
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.once('error', () => resolve(false));
     srv.once('listening', () => srv.close(() => resolve(true)));
-    srv.listen(port, '127.0.0.1');
+    // Probe the same interface the server will bind: 0.0.0.0 can collide with a port that is
+    // only taken on another interface, which a 127.0.0.1 probe would not see.
+    srv.listen(port, host);
   });
 }
 
@@ -55,12 +60,13 @@ function isPortFree(port) {
  * Find the first available port within [start, end].
  * @param {number} [start]
  * @param {number} [end]
+ * @param {string} [host]
  * @returns {Promise<number|null>}
  */
-async function pickPort(start = DEFAULTS.PORT_START, end = DEFAULTS.PORT_END) {
+async function pickPort(start = DEFAULTS.PORT_START, end = DEFAULTS.PORT_END, host = '127.0.0.1') {
   for (let port = start; port <= end; port += 1) {
     // eslint-disable-next-line no-await-in-loop
-    if (await isPortFree(port)) return port;
+    if (await isPortFree(port, host)) return port;
   }
   return null;
 }
