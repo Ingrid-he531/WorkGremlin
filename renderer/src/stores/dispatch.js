@@ -14,6 +14,26 @@ function upsertById(list, item) {
 
 /** Keep the transcript bounded on the client too (the server keeps the last 200 KB per turn) */
 const CLIENT_OUTPUT_MAX = 400 * 1024;
+/** Remember which session this window had open, so reopening the app resumes the same conversation */
+const LAST_SESSION_KEY = 'workgremlin.dispatch.lastSession';
+
+function readLastSession() {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_SESSION_KEY) || '' : '';
+  } catch {
+    return '';
+  }
+}
+
+function writeLastSession(id) {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    if (id) localStorage.setItem(LAST_SESSION_KEY, id);
+    else localStorage.removeItem(LAST_SESSION_KEY);
+  } catch {
+    /* private mode / quota: sessions still work, just no resume */
+  }
+}
 
 /**
  * Remote dispatch: long-running **sessions** on the server machine.
@@ -70,7 +90,10 @@ export const useDispatchStore = defineStore('dispatch', {
         this.configFile = data.configFile || '';
         this.loaded = true;
 
-        if (!this.currentId && this.sessions.length) this.currentId = this.sessions[0].id;
+        if (!this.currentId && this.sessions.length) {
+          const saved = readLastSession();
+          this.currentId = this.sessions.some((s) => s.id === saved) ? saved : this.sessions[0].id;
+        }
         if (this.currentId && this.sessions.some((s) => s.id === this.currentId)) {
           await this.open(info, this.currentId);
         } else {
@@ -93,6 +116,7 @@ export const useDispatchStore = defineStore('dispatch', {
       this.currentId = id;
       this.current = null;
       this.error = '';
+      writeLastSession(id);
       try {
         const res = await fetch(`${httpBase(info)}/api/v1/dispatch/sessions/${encodeURIComponent(id)}`, {
           headers: authHeaders(info),
@@ -123,6 +147,7 @@ export const useDispatchStore = defineStore('dispatch', {
       upsertById(this.sessions, data.session);
       this.currentId = data.session.id;
       this.current = { ...data.session, turns: [] };
+      writeLastSession(data.session.id);
       return data.session;
     },
 
@@ -203,6 +228,7 @@ export const useDispatchStore = defineStore('dispatch', {
         this.currentId = this.sessions.length ? this.sessions[0].id : '';
         this.current = null;
         if (this.currentId) await this.open(info, this.currentId);
+        else writeLastSession('');
       }
       return data;
     },
@@ -280,6 +306,7 @@ export const useDispatchStore = defineStore('dispatch', {
         if (this.currentId === payload.sessionId) {
           this.currentId = this.sessions.length ? this.sessions[0].id : '';
           this.current = null;
+          writeLastSession(this.currentId);
         }
       }
     },

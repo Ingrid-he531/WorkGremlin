@@ -18,8 +18,11 @@
  * loopback); `auto` starts immediately. The policy itself comes from ~/.workgremlin/config.json
  * (see control/config.js) — never from a client setting.
  *
- * State is in memory only: a server restart forgets the conversation list (the real session still
- * exists in OpenCode's own store and the office/ledger remain correct).
+ * The conversation list is **persisted** to `~/.workgremlin/dispatch-sessions.json` (prompts, output
+ * tails, the minted OpenCode session id), so restarting the server — or opening a client later —
+ * restores the sessions and can keep talking in the same OpenCode session. A turn that was running
+ * when the server died is marked failed on restore, and a still-pending one expires; nothing is
+ * presented as if it had finished. The real conversation still lives in OpenCode's own store too.
  */
 
 const crypto = require('node:crypto');
@@ -29,6 +32,8 @@ const os = require('node:os');
 const { spawn } = require('node:child_process');
 
 const { DEFAULTS, WS_EVENTS } = require('@workgremlin/shared');
+const { atomicWriteJson, readJson } = require('@workgremlin/shared/fslock');
+const { dispatchStorePath } = require('@workgremlin/shared/paths');
 const { killTree } = require('../council/runner');
 const { recipeOf: defaultRecipeOf, binOf: defaultBinOf } = require('./recipes');
 const { readDispatchConfig } = require('./config');
@@ -132,6 +137,7 @@ function defaultRun({ bin, args, cwd, timeoutMs, onChild, onData }) {
  *   recipeFor?: (floor: string) => any,
  *   now?: () => number,
  *   mintSessionId?: () => string,
+ *   storeFile?: string|null,
  * }} [deps]
  */
 function createDispatchService(deps = {}) {
@@ -143,6 +149,8 @@ function createDispatchService(deps = {}) {
   const readConfig = deps.readConfig || (() => readDispatchConfig());
   const mintSessionId =
     deps.mintSessionId || (() => `ses_wg${crypto.randomBytes(12).toString('hex')}`);
+  // `null`/'' disables persistence (tests); undefined means the real store.
+  const storeFile = deps.storeFile === undefined ? dispatchStorePath() : deps.storeFile;
   const insertEvent =
     deps.insertEvent ||
     ((projectId, tsMs, kind, payloadJson) => {
@@ -156,10 +164,130 @@ function createDispatchService(deps = {}) {
   /** @type {Map<string, any>} */
   const sessions = new Map();
   let disposed = false;
+  let persistTimer = null;
 
   function emit(payload) {
     broadcast(null, WS_EVENTS.DISPATCH, payload);
   }
+
+  /**
+   * Snapshot for the on-disk store. Runtime handles (child / timers / deadlines) are dropped;
+   * output is already capped per turn.
+   */
+  function snapshot() {
+    return {
+      version: 1,
+      sessions: [...sessions.values()].map((session) => ({
+        id: session.id,
+        floor: session.floor,
+        workspacePath: session.workspacePath,
+        model: session.model || null,
+        title: session.title || '',
+        opencodeSessionId: session.opencodeSessionId,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        turns: session.turns.map((turn) => ({
+          id: turn.id,
+          prompt: turn.prompt,
+          state: turn.state,
+          mode: turn.mode,
+          createdAt: turn.createdAt,
+          startedAt: turn.startedAt,
+          endedAt: turn.endedAt,
+          error: turn.error || '',
+          exitCode: turn.exitCode == null ? null : turn.exitCode,
+          output: turn.output || '',
+        })),
+      })),
+    };
+  }
+
+  function flushPersist() {
+    if (!storeFile) return;
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    try {
+      atomicWriteJson(storeFile, snapshot(), { pretty: false });
+      // Transcripts contain prompts and agent output: keep the file private to this user.
+      fs.chmodSync(storeFile, 0o600);
+    } catch {
+      /* losing the cache must not break a running turn */
+    }
+  }
+
+  /** Debounced write: output arrives in many small chunks and must not hit the disk per chunk. */
+  function persistSoon() {
+    if (!storeFile || persistTimer || disposed) return;
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      flushPersist();
+    }, 500);
+    if (persistTimer.unref) persistTimer.unref();
+  }
+
+  /**
+   * Restore the sessions written by a previous server process.
+   * A turn that was `running`/`pending` when the process died cannot still be alive: mark it failed
+   * (or expired) honestly instead of pretending it finished.
+   */
+  function restore() {
+    if (!storeFile) return;
+    const raw = readJson(storeFile, null);
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.sessions)) return;
+    const ts = now();
+    for (const entry of raw.sessions) {
+      if (!entry || typeof entry !== 'object') continue;
+      const id = String(entry.id || '');
+      const floor = String(entry.floor || '');
+      const opencodeSessionId = String(entry.opencodeSessionId || '');
+      if (!id || !DEFAULTS.DISPATCH_FLOORS.includes(floor) || !opencodeSessionId) continue;
+      const turns = (Array.isArray(entry.turns) ? entry.turns : []).map((t) => {
+        const state = STATES.includes(t && t.state) ? t.state : 'failed';
+        let finalState = state;
+        let error = String((t && t.error) || '');
+        let endedAt = Number.isFinite(Number(t && t.endedAt)) ? Number(t.endedAt) : null;
+        if (state === 'running') {
+          finalState = 'failed';
+          error = '服务重启，执行中的这一轮已中断';
+          endedAt = endedAt || ts;
+        } else if (state === 'pending') {
+          finalState = 'expired';
+          error = '服务重启，待确认的请求已失效';
+          endedAt = endedAt || ts;
+        }
+        return {
+          id: String((t && t.id) || crypto.randomUUID()),
+          prompt: String((t && t.prompt) || ''),
+          state: finalState,
+          mode: DEFAULTS.DISPATCH_MODES.includes(t && t.mode) ? t.mode : 'auto',
+          createdAt: Number(t && t.createdAt) || ts,
+          startedAt: Number(t && t.startedAt) || null,
+          endedAt,
+          error,
+          exitCode: Number.isInteger(t && t.exitCode) ? t.exitCode : null,
+          output: String((t && t.output) || '').slice(-OUTPUT_MAX_BYTES),
+          pendingDeadline: null,
+          child: null,
+          expiryTimer: null,
+        };
+      });
+      sessions.set(id, {
+        id,
+        floor,
+        workspacePath: String(entry.workspacePath || ''),
+        model: entry.model ? String(entry.model) : null,
+        title: String(entry.title || ''),
+        opencodeSessionId,
+        createdAt: Number(entry.createdAt) || ts,
+        updatedAt: Number(entry.updatedAt) || ts,
+        turns,
+      });
+    }
+  }
+
+  restore();
 
   /**
    * Audit row in `events` (reverse control must be auditable). The prompt itself is not stored ——
@@ -257,6 +385,7 @@ function createDispatchService(deps = {}) {
   function touchSession(session) {
     session.updatedAt = now();
     emit({ kind: 'session', session: summary(session) });
+    persistSoon();
   }
 
   /** @param {any} session @param {any} turn */
@@ -339,6 +468,7 @@ function createDispatchService(deps = {}) {
         turn.output = (turn.output + chunk).slice(-OUTPUT_MAX_BYTES);
         // Streaming event: the client appends it to this turn without re-fetching the session.
         emit({ kind: 'output', sessionId: session.id, turnId: turn.id, chunk });
+        persistSoon();
       },
     })
       .then((r) => {
@@ -567,6 +697,7 @@ function createDispatchService(deps = {}) {
   }
 
   function dispose() {
+    flushPersist();
     disposed = true;
     for (const session of sessions.values()) {
       for (const turn of session.turns) {

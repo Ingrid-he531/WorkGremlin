@@ -55,6 +55,7 @@ function makeHarness() {
   /** Broadcast payloads, to assert streaming */
   const events = [];
   const service = createDispatchService({
+    storeFile: null,
     readConfig: () => ({ ...config }),
     broadcast: (_project, _type, payload) => events.push(payload),
     binFor: (floor) => (floor === '8F' ? '/fake/opencode' : null),
@@ -235,6 +236,73 @@ const post = (url, body) =>
     ok('next turn starts after cancel', res.status === 200);
 
     close();
+  }
+
+  head('persistence across restarts');
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-dispatch-store-'));
+    const storeFile = path.join(dir, 'sessions.json');
+    const config = { mode: 'auto' };
+    const runs = [];
+    const mk = (mode) =>
+      createDispatchService({
+        storeFile,
+        readConfig: () => ({ ...config, mode }),
+        broadcast: () => {},
+        binFor: (floor) => (floor === '8F' ? '/fake/opencode' : null),
+        recipeFor: () => ({ build: ({ sessionId }) => ({ args: ['run', '--session', sessionId] }) }),
+        runCommand: (arg) => new Promise((resolve) => runs.push({ arg, resolve })),
+      });
+
+    // First "server process": one completed turn
+    const s1 = mk('auto');
+    const created = s1.createSession({ floor: '8F', workspacePath: WORKSPACE });
+    s1.sendTurn(created.id, { prompt: '记住我' });
+    runs[0].arg.onData('持久化输出');
+    runs[0].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((r) => setTimeout(r, 30));
+    s1.dispose();
+
+    // Second "server process": everything comes back from disk
+    const s2 = mk('auto');
+    const restored = s2.list();
+    ok('restored the session list', restored.length === 1 && restored[0].id === created.id);
+    const detail = s2.getSession(created.id);
+    ok('restored the transcript', detail.turns.length === 1 && detail.turns[0].state === 'done');
+    ok('restored the output', detail.turns[0].output.includes('持久化输出'), detail.turns[0].output);
+    ok('restored the OpenCode session id', detail.opencodeSessionId === created.opencodeSessionId);
+
+    s2.sendTurn(created.id, { prompt: '继续' });
+    ok(
+      'continuing uses the restored OpenCode session',
+      runs[1].arg.args.includes(created.opencodeSessionId)
+    );
+    runs[1].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((r) => setTimeout(r, 30));
+    s2.dispose();
+
+    // A turn that was running when the process died must not look finished
+    const s3 = mk('auto');
+    const running = s3.createSession({ floor: '8F', workspacePath: WORKSPACE });
+    s3.sendTurn(running.id, { prompt: '会被中断' });
+    s3.dispose(); // flush with state=running
+    const s4 = mk('auto');
+    const after = s4.getSession(running.id);
+    ok('running turn restored as failed', after.turns[0].state === 'failed', after.turns[0].state);
+    ok('the interruption is explained', /重启/.test(after.turns[0].error), after.turns[0].error);
+    s4.dispose();
+
+    // A still-pending confirmation must not stay pending forever
+    const s5 = mk('confirm');
+    const pending = s5.createSession({ floor: '8F', workspacePath: WORKSPACE });
+    s5.sendTurn(pending.id, { prompt: '等待确认' });
+    s5.dispose();
+    const s6 = mk('confirm');
+    const expired = s6.getSession(pending.id);
+    ok('pending turn restored as expired', expired.turns[0].state === 'expired', expired.turns[0].state);
+    s6.dispose();
+
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

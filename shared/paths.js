@@ -75,6 +75,11 @@ function serverConfigPath() {
   return path.join(home(), 'config.json');
 }
 
+/** Remote-dispatch session store (written by the server): `~/.workgremlin/dispatch-sessions.json` */
+function dispatchStorePath() {
+  return path.join(home(), 'dispatch-sessions.json');
+}
+
 /** Server database: `~/.workgremlin/workgremlin.db` */
 function dbPath() {
   return path.join(home(), 'workgremlin.db');
@@ -233,6 +238,7 @@ module.exports = {
   hooksDir,
   serverInfoPath,
   serverConfigPath,
+  dispatchStorePath,
   dbPath,
   workspacesPath,
   logsDir,
