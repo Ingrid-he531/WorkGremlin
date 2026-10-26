@@ -69,6 +69,27 @@ const DEFAULTS = Object.freeze({
   RETENTION_DAYS: 90,
 
   /**
+   * Remote dispatch (reverse control, 8F only for now): a client asks the server to run one floor with
+   * one prompt. The server never writes the ledger itself —— the floor's own session store is read by
+   * the existing poller, so the office/task records stay as truthful as a manual CLI run.
+   *
+   * `off`     no dispatch at all (default)
+   * `auto`    run immediately, tool permissions auto-approved (`opencode run --auto`)
+   * `confirm` park the request until someone on the **server machine** approves it
+   */
+  DISPATCH_MODES: Object.freeze(['off', 'auto', 'confirm']),
+  /** Floors reverse control is wired up for (verified headless write mode + normal session) */
+  DISPATCH_FLOORS: Object.freeze(['8F']),
+  /** Whole-run budget for one dispatched task */
+  DISPATCH_TIMEOUT_MS: 30 * 60_000,
+  /** How long a `confirm` request stays pending before it expires */
+  DISPATCH_PENDING_TIMEOUT_MS: 5 * 60_000,
+  /** Prompt cap (argv length; a task description, not a file dump) */
+  DISPATCH_PROMPT_MAX_BYTES: 32 * 1024,
+  /** How many dispatch records to keep in memory (they are not persisted) */
+  DISPATCH_KEEP: 20,
+
+  /**
    * Council Chamber — a moderated review loop over one topic.
    *
    * There is no vote and no vote tally. Each council has one moderator, one main answerer, and one or
@@ -227,6 +248,11 @@ const WS_EVENTS = Object.freeze({
    * server/src/council/orchestrator.js.
    */
   COUNCIL: 'council.update',
+  /**
+   * Remote dispatch (reverse control): a request was created / changed state, or the server-side
+   * setting changed. Not tied to the current project, so it is broadcast with project=null.
+   */
+  DISPATCH: 'dispatch.update',
 });
 
 /** client -> server */
@@ -402,6 +428,7 @@ const IPC_EVENTS = Object.freeze({
   CHOOSE_WORKSPACE: 'workgremlin:choose-workspace',
   SET_FULL_SCREEN: 'workgremlin:set-full-screen',
   IS_FULL_SCREEN: 'workgremlin:is-full-screen',
+  FOCUS_WINDOW: 'workgremlin:focus-window',
   FULL_SCREEN_EVENT: 'workgremlin:full-screen',
   EVENT: 'workgremlin:event',
   QUIT: 'workgremlin:quit',

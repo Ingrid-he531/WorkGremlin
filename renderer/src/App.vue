@@ -11,7 +11,10 @@ import WorkstationView from './views/WorkstationView.vue';
 import ConversationView from './views/ConversationView.vue';
 import TaskRecordsView from './views/TaskRecordsView.vue';
 import CouncilView from './views/CouncilView.vue';
+import DispatchView from './views/DispatchView.vue';
+import DispatchApproval from './components/DispatchApproval.vue';
 import { useCouncilStore } from './stores/council';
+import { useDispatchStore } from './stores/dispatch';
 import { useProjectStore } from './stores/project';
 import { useMessageStore } from './stores/messages';
 import { useSessionStore } from './stores/sessions';
@@ -26,6 +29,7 @@ const msgs = useMessageStore();
 const sessions = useSessionStore();
 const demo = useDemoStore();
 const council = useCouncilStore();
+const dispatch = useDispatchStore();
 const { t } = useI18n();
 
 /**
@@ -56,7 +60,7 @@ const selectedId = ref('');
  * The workstation card **does not** count: it still switches floors to look at, so it keeps the
  * floor pills and the session dropdown.
  */
-const bareTab = computed(() => tab.value === 'conversation' || tab.value === 'council');
+const bareTab = computed(() => tab.value === 'conversation' || tab.value === 'council' || tab.value === 'dispatch');
 
 /**
  * Fullscreen (focus) mode: keep only the main stage (the office scene, i.e. the main Agent console
@@ -229,12 +233,16 @@ onMounted(async () => {
     if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
     // Council: start / round-by-round speech / vote count / wrap up. project is null to broadcast, independent of the project
     if (msg.type === WS_EVENTS.COUNCIL) council.applyEvent(msg.payload);
+    // Remote dispatch: request created / state changed / server-side setting changed (project is null too)
+    if (msg.type === WS_EVENTS.DISPATCH) dispatch.applyEvent(msg.payload);
   });
   await refreshMessages();
   await sessions.refresh(project.serverInfo || {});
   sessions.startPolling(project.serverInfo || {});
   // The council entry needs to know "whether any floor can be summoned" to decide if the button is clickable (if it cannot be fetched, keep it clickable and explain on the page)
   await council.fetchFloors();
+  // Remote dispatch: mode + floor availability + any request that is already waiting/running
+  await dispatch.refresh(project.serverInfo || {});
 });
 
 // Fetch history once when switching over: a council started elsewhere meanwhile must not wait for a page refresh to appear
@@ -272,6 +280,7 @@ onUnmounted(() => {
           :title="council.canStart ? '' : t('nav.council_title')"
           @click="tab = 'council'"
         >{{ t('nav.council') }}</button>
+        <button :class="{ on: tab === 'dispatch' }" @click="tab = 'dispatch'">{{ t('nav.dispatch') }}</button>
       </div>
       <div class="tabs-group tabs-actions">
         <SessionSwitcher
@@ -321,10 +330,13 @@ onUnmounted(() => {
           <DeskLabView v-else-if="tab === 'lab'" />
           <TaskRecordsView v-else-if="tab === 'conversation'" />
           <CouncilView v-else-if="tab === 'council'" />
+          <DispatchView v-else-if="tab === 'dispatch'" />
           <ConversationView v-else />
         </section>
       </ElevatorDoors>
     </main>
+    <!-- Server-side approval for a remote dispatch request: only the window on the server machine shows it -->
+    <DispatchApproval />
   </div>
 </template>
 

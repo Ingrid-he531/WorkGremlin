@@ -64,6 +64,17 @@ function serverInfoPath() {
   return path.join(home(), 'server.json');
 }
 
+/**
+ * User-editable server configuration: `~/.workgremlin/config.json`.
+ *
+ * Not written by the server (unlike server.json): it is read on demand, so editing it takes effect
+ * without a restart. Shape:
+ *   { "dispatch": { "mode": "off" | "auto" | "confirm" } }
+ */
+function serverConfigPath() {
+  return path.join(home(), 'config.json');
+}
+
 /** Server database: `~/.workgremlin/workgremlin.db` */
 function dbPath() {
   return path.join(home(), 'workgremlin.db');
@@ -221,6 +232,7 @@ module.exports = {
   ensureHome,
   hooksDir,
   serverInfoPath,
+  serverConfigPath,
   dbPath,
   workspacesPath,
   logsDir,

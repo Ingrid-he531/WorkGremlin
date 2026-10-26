@@ -52,7 +52,25 @@ Always pass a fixed `--token`: the default token is regenerated on every start a
 
 Everything is plain HTTP/WS: use it only on a trusted network, or put an SSH tunnel or a TLS reverse proxy in front. `--no-token` disables the only gate, so never combine it with `--host 0.0.0.0` on a shared network.
 
-## Four pages
+### Remote task dispatch (8F OpenCode)
+
+A client can hand **one prompt** to one floor; the run happens on the server machine. The office and task records are written by the floor itself: the dispatched command is a normal, persistent session in the target directory, so the existing hooks/poller record it exactly like typing the prompt in a terminal. The dispatcher writes no ledger rows.
+
+- **Server policy** (a file on the server, **not** a client setting) — `~/.workgremlin/config.json`:
+  ```json
+  { "dispatch": { "mode": "off" } }
+  ```
+  - `off` — reject every request (default);
+  - `auto` — start on arrival; tool permissions are auto-approved (`opencode run --auto`);
+  - `confirm` — a dialog appears in the server's window before anything starts. A remote client cannot approve it: the decision endpoint only accepts loopback requests.
+
+  The file is re-read on every policy check, so an edit takes effect without restarting the server; `WORKGREMLIN_DISPATCH_MODE` overrides it (containers/tests). An invalid value falls back to `off`. The client cannot change this policy: there is no HTTP write endpoint for it.
+- **Client**: the **Remote tasks** tab (next to Council). Create a session with a floor (8F), a project directory (absolute path **on the server**) and an optional model, then keep sending prompts in the composer: every prompt is a turn in the **same** OpenCode session (`--session`), so the office/ledger sees one long conversation. Output streams into the transcript while the turn runs; one turn per session at a time, cancellable; a pending turn expires after 5 minutes.
+- **Model**: optional `provider/model`; leave empty to use the CLI's default.
+
+This is reverse control: a dispatched task can modify files on the server. Keep the mode on `confirm` (or `off`) on networks you do not trust; the token is still plaintext HTTP/WS. Every request/decision is recorded in the `events` table (without the prompt text). The config path follows `WORKGREMLIN_HOME`, so a non-default home uses `<that home>/config.json`.
+
+## Pages
 
 ### Office (default)
 

@@ -79,7 +79,7 @@ P1 is the only design target. P2/P3 needs are satisfied only when they do not ad
 | Platform | x64 only (Linux AppImage/deb, Windows NSIS, macOS-x64 dmg). ARM is not shipped; packaging scripts are parameterized rather than hardcoding an architecture |
 | Network drives / WSL | Not supported. Floor readers use short SQLite timeouts and degrade to empty data on lock/EMFILE; there is no `degraded` flag and no state change |
 | Demo | A UI action that switches to an isolated demo project. The old `--demo` / `MOCK=1` startup flags are retired |
-| Reverse control | Not implemented. The council chamber (§15) is not reverse control: it starts its own one-off processes |
+| Reverse control | 8F only (dispatch sessions): a client opens a session and sends prompts; each prompt is a turn in the **same** OpenCode session (`--session`), streamed to the client. Office/ledger come from the product's own hooks/poller. Policy lives in the server's `~/.workgremlin/config.json` (`off` / `auto` / `confirm`, loopback-only approval); no HTTP endpoint can change it. One active turn per session, cancellable; no retry / no interrupt into existing sessions yet |
 | Notifications | Not implemented. With only three states, the old trigger set (`blocked / error / offline > 60 s`) is obsolete; the only candidate event is `blocked` |
 
 ---
@@ -715,7 +715,7 @@ one-off read-only processes.
 | **Q5** | Redaction / encryption at rest? | Decided | Redact before persistence (§8); not implemented. Do not encrypt SQLite (planned); use file permissions |
 | Q5-1 | Encrypt the SQLite file? | Open | Recommendation: no; local trusted environment, FTS and debugging matter. Revisit SQLCipher if requested |
 | **Q6** | Accept a ~100 MB Electron package? | Accepted | Yes; revisit Tauri after M3 |
-| **Q7** | Reverse control? | Decided: no | Architectural reservation only; no dead UI |
+| **Q7** | Reverse control? | Decided: conservative | 8F dispatch only; server-side confirmation is loopback-only; requests are audited in `events`; no interrupt/retry yet |
 | Q7-1 | Local strong auth later? | Deferred | Token + confirmation + audit if reverse control happens |
 | **Q8** | Quiet hours default? | Decided | Off by default; `22:00–08:00` template prefilled but disabled |
 | **Q9** | Store originals behind an encrypted channel? | Decided / planned | Default off; three-step enable; OS keychain; re-unlock per session; audit (§8.5) |

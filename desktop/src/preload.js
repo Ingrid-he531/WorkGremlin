@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld('workgremlin', {
   setFullScreen: (on) => ipcRenderer.invoke(IPC_EVENTS.SET_FULL_SCREEN, Boolean(on)),
   /** @returns {Promise<boolean>} 窗口当前是否处于原生全屏 */
   isFullScreen: () => ipcRenderer.invoke(IPC_EVENTS.IS_FULL_SCREEN),
+  /** Bring the window forward (used when a remote dispatch request needs a decision) @returns {Promise<boolean>} */
+  focusWindow: () => ipcRenderer.invoke(IPC_EVENTS.FOCUS_WINDOW),
   /** @param {(on: boolean) => void} cb @returns {() => void} 取消订阅 */
   onFullScreen: (cb) => {
     fullScreenListeners.add(cb);

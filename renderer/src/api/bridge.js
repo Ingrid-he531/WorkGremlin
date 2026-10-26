@@ -28,6 +28,22 @@ export async function getServerInfo() {
 }
 
 /**
+ * Bring the desktop window forward (no-op in a plain browser). Used when a remote dispatch request
+ * needs a decision on this machine.
+ * @returns {Promise<boolean>}
+ */
+export async function focusWindow() {
+  if (hasBridge() && typeof window.workgremlin.focusWindow === 'function') {
+    try {
+      return Boolean(await window.workgremlin.focusWindow());
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
  * Native (OS-level) fullscreen: when true the window fills the whole screen and the title bar /
  * frame / menu bar all go away.
  * Inside Electron this goes through IPC; in plain browser dev it falls back to the HTML5 Fullscreen

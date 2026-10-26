@@ -28,6 +28,8 @@ const { createSessionsRouter } = require('./http/routes/sessions');
 const { createDemoRouter } = require('./http/routes/demo');
 const { createCouncilRouter } = require('./http/routes/council');
 const { createCouncilOrchestrator } = require('./council/orchestrator');
+const { createDispatchService } = require('./control/service');
+const { createDispatchRouter } = require('./http/routes/dispatch');
 const { requireToken } = require('./http/auth');
 const { createStaticSite } = require('./http/staticSite');
 const { createDemoProvider } = require('./demo');
@@ -250,6 +252,18 @@ function createServer(opts = {}) {
   });
   app.use('/api/v1', requireToken(token), createCouncilRouter({ repo, orchestrator }));
 
+  /**
+   * Remote dispatch (reverse control): one client asks one floor to do one task on this machine.
+   * Unlike the council, the spawned run is a **normal session** in the target directory: it is not
+   * hidden, and this server writes no ledger rows for it —— the floor's own hook/poller records it,
+   * exactly like a manual CLI run. `confirm` mode parks requests until the server machine approves.
+   */
+  const dispatch = createDispatchService({
+    repo,
+    broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
+  });
+  app.use('/api/v1', requireToken(token), createDispatchRouter({ service: dispatch }));
+
   if (opts.serveStatic) {
     // Browser-only mode: the same server hands out the built UI, so the client machine needs
     // nothing installed. Registered after the API routers so /api is never shadowed.
@@ -383,6 +397,8 @@ function createServer(opts = {}) {
 
     // Close hooks: stop non-timer resources in registration order.
     lifecycle.onClose(() => demo.stopAll());
+    // Remote dispatch: kill any in-flight child before the HTTP/WS resources go away.
+    lifecycle.onClose(() => dispatch.dispose());
     // Council room: first kill the in-flight participant processes (SIGTERM → SIGKILL), then record
     // an ending for each meeting still in flight. It sits before hub.close() —— the wrap-up still has
     // to broadcast one last state to clients.
@@ -398,6 +414,11 @@ function createServer(opts = {}) {
     if (!opts.silent) {
       log.info(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
       if (!token) log.warn('[workgremlin] 已关闭 token 校验（--no-token，仅调试用）');
+      const dispatchPolicy = dispatch.policy();
+      log.info(
+        `[workgremlin] 远程派发：${dispatchPolicy.mode}` +
+          (dispatchPolicy.file ? `（配置文件 ${dispatchPolicy.file}，可随时修改，无需重启）` : '')
+      );
       const cur = workspace.current();
       log.info(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
     }

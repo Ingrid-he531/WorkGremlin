@@ -227,6 +227,32 @@ async function bootstrap() {
     return win && !win.isDestroyed() ? win.isFullScreen() : false;
   });
 
+  /**
+   * Bring the window forward when a remote dispatch request needs a decision on this machine.
+   * Flash the taskbar/dock too: the operator may be looking at another app, and a pending request
+   * expires (5 minutes) rather than sitting there forever.
+   */
+  ipcMain.handle(IPC_EVENTS.FOCUS_WINDOW, () => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return false;
+    try {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+      win.flashFrame(true);
+      setTimeout(() => {
+        try {
+          if (!win.isDestroyed()) win.flashFrame(false);
+        } catch {
+          /* window closed meanwhile */
+        }
+      }, 8000).unref?.();
+    } catch {
+      return false;
+    }
+    return true;
+  });
+
   buildMenu();
   mainWindow = createWindow({ serverInfo });
 
