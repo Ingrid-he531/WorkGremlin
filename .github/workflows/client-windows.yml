@@ -2,15 +2,25 @@ name: Client packages (Windows)
 
 # Builds the client-only package (electron-builder.client.yml): the window as a thin client for a
 # WorkGremlin server running elsewhere. There is no server and no native module in this package, so
-# no SQLite toolchain and no Wine are needed.
+# the build needs no SQLite/C++ toolchain and no Wine.
 #
-# Run it manually from the Actions tab ("Run workflow"), or push a `v*` tag.
-# Artifacts: workgremlin-client-<version>-x64.zip (unpacked app) and
-#            workgremlin-client-<version>-x64.exe (portable single file).
+# Runs manually (Actions -> Run workflow), on pushes to main that touch the client, and on v* tags.
+# Artifacts: workgremlin-client-<version>-x64.zip (unpacked app)
+#            workgremlin-client-<version>-x64.exe (portable single file)
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "electron-builder.client.yml"
+      - "desktop/**"
+      - "renderer/**"
+      - "shared/**"
+      - ".github/workflows/client-windows.yml"
     tags:
       - "v*"
 
@@ -21,6 +31,16 @@ concurrency:
   group: client-windows-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Electron is downloaded by electron-builder during packaging, not by the `electron` npm package
+  # during `npm ci`; skipping the latter keeps the install step free of a 120 MB download and of a
+  # binary that this package never ships.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+  # The repo's .npmrc points electron_mirror at npmmirror (fast in China, unreliable on GitHub
+  # runners). npm_config_* wins over ELECTRON_MIRROR in @electron/get, so set both.
+  ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+  npm_config_electron_mirror: https://github.com/electron/electron/releases/download/
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -28,17 +48,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
 
-      # Electron and electron-builder caches: the runner re-downloads ~120 MB of Electron otherwise.
+      # Electron and electron-builder caches; otherwise every run re-downloads ~120 MB.
       - name: Cache Electron downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/AppData/Local/electron/Cache
@@ -47,16 +67,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-electron-
 
-      # WORKGREMLIN_SKIP_REBUILD: the client package must not contain better-sqlite3, so the
-      # electron-rebuild postinstall step is pointless here and would only require a C++ toolchain.
-      # ELECTRON_MIRROR: override the npmmirror listed in .npmrc (fast in China, unreliable from
-      # GitHub's runners) with the official GitHub release URL.
+      - name: Environment info
+        run: |
+          node -v
+          npm -v
+          npm config get registry
+          npm config get electron_mirror
+
+      # --ignore-scripts: the client package contains no server and no native module, so neither the
+      # electron binary (see ELECTRON_SKIP_BINARY_DOWNLOAD above) nor the electron-rebuild of
+      # better-sqlite3 is needed. Both were the expensive, toolchain-sensitive parts of the install.
       - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-        env:
-          WORKGREMLIN_SKIP_REBUILD: "1"
-          ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
-          npm_config_electron_mirror: https://github.com/electron/electron/releases/download/
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Build renderer
         run: npm run build
@@ -72,7 +94,7 @@ jobs:
         run: Get-ChildItem dist-client -File | Select-Object Name, Length | Format-Table
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: workgremlin-client-windows-x64
           path: |
