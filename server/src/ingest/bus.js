@@ -11,7 +11,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync } = require('node:child_process');
-const { MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey, isPluginClient } = require('@workgremlin/shared');
+const { MESSAGE_TYPES, DEFAULTS, WS_EVENTS, dedupeKey, isPluginClient, agentNameKey } = require('@workgremlin/shared');
 const clock = require('../clock');
 const config = require('../config');
 const { resolveProjectName } = require('../project');
@@ -884,7 +884,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     // A roster "defined subagent": summon ended → its workstation goes back to idle. Each instance now
     // has its own member, so "is a same-name instance still running" must be judged by **name**, not by
     // the member instance —— otherwise the first of several concurrent summons would mark it idle.
-    for (const r of ghosts.values()) if (r.project === rec.project && r.name === rec.name) return;
+    // Names are compared case-insensitively: the workstation is named after the definition file stem
+    // (`simmon`) while the summon reports the frontmatter name (`Simmon`).
+    for (const r of ghosts.values()) if (r.project === rec.project && agentNameKey(r.name) === agentNameKey(rec.name)) return;
     if (ghostRoster && rec.project === context.project && typeof ghostRoster.isDefined === 'function' && ghostRoster.isDefined(rec.name)) {
       try {
         ghostRoster.markIdle(rec.name);
@@ -1232,10 +1234,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     const project = projectIdOf(p.project);
     const name = normText(p.name, 64);
     if (!name) return false;
+    const key = agentNameKey(name);
     for (const rec of ghosts.values()) {
       if (rec.project !== project) continue;
       if (rec.endedAt) continue;
-      if (rec.name === name) return true;
+      // Case-insensitive: the roster names a resident after the definition file stem, the summon
+      // reports the frontmatter name (see agentNameKey).
+      if (agentNameKey(rec.name) === key) return true;
     }
     return false;
   }
@@ -1552,10 +1557,11 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
    */
   function heirOf(member) {
     if (!member || !member.ephemeral || !member.name) return null;
-    const id = memberIdOf(member.project_id, member.name);
-    if (id === member.id) return null;
-    const host = repo.getMember.get(id);
-    return host && !host.ephemeral ? id : null;
+    // Case-insensitive: the resident is named after the definition file stem (`simmon`), the summon
+    // carries the frontmatter name (`Simmon`). The old member-id formula matched neither spelling.
+    const host = repo.getResidentByName.get({ projectId: member.project_id, name: member.name });
+    if (!host || host.id === member.id) return null;
+    return host.id;
   }
 
   /** The on-disk path of the member's project (project-level agent definition files are looked up here); an empty string when unreadable, so only the user-level directory is searched */

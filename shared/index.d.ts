@@ -218,6 +218,8 @@ export declare function formToSource(form: string): 'plugin' | 'cli' | 'ide' | '
 export declare const AGENT_LABELS: Record<string, string>;
 /** Identity → agent base name (strips an `@<project>` suffix; plugin-vs-not is decided by `form`). */
 export declare function agentBase(id: string): string;
+/** Case-insensitive identity key pairing a resident gremlin (file stem) with its summons (definition name). */
+export declare function agentNameKey(name: string | null | undefined): string;
 /** Final display name from agent + form (e.g. "Kilo Code CLI" / "CodeBuddy Plugin"). */
 export declare function clientLabel(agent: string, form: string): string;
 /** WorkGremlin home dir: default ~/.workgremlin, overridable with WORKGREMLIN_HOME. */

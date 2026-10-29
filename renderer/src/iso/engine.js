@@ -47,6 +47,7 @@ import { drawGremlin, drawGhost, drawTag, colorOf, propOf, SPRITE_UNITS } from '
 import { PHASES, drawConsoleDesk, drawConsoleScreen, drawOperator } from './mainConsole';
 // Text on the canvas (nameplates, bubbles, wall signs) also goes through i18n: redrawn every frame, so it reads the current language
 import { t } from '../i18n/index.js';
+import { agentNameKey } from '@workgremlin/shared';
 
 const STATE_COLOR = {
   busy: '#f5a623',
@@ -448,7 +449,7 @@ export function createIsoOffice(canvas, opts = {}) {
     if (ghosts.some((g) => g.memberId === ghostId)) return;
     const m = members.find((x) => x.memberId === ghostId);
     if (!m) return;
-    const info = m.ghost ? seatByName[m.name] : null;
+    const info = m.ghost ? seatByName[agentNameKey(m.name)] : null;
     ghosts.push(makeGhost(m, ghosts.length, info && info.seat));
   }
 
@@ -629,8 +630,9 @@ export function createIsoOffice(canvas, opts = {}) {
   function makeGhost(member, i, nearSeat) {
     const gname = member.name || member.memberId;
     // Same-name instances of one gremlin share a seat: fan them into their own lanes so they do not
-    // stack into a single ghost (slot = how many same-name overhead ghosts already exist).
-    const slot = nearSeat ? ghosts.filter((g) => g.nearSeat && g.name === gname).length : 0;
+    // stack into a single ghost (slot = how many same-name overhead ghosts already exist). Names are
+    // keyed case-insensitively, matching the server's resident↔ghost pairing.
+    const slot = nearSeat ? ghosts.filter((g) => g.nearSeat && agentNameKey(g.name) === agentNameKey(gname)).length : 0;
     const fan = nearSeat ? seatFanOffset(slot) : null;
     const center = nearSeat ? { x: nearSeat.x + fan.x, y: nearSeat.y - 0.1 + fan.y, z: 2.15 } : null;
     const a = center || GHOST_SPOTS[i % GHOST_SPOTS.length];
@@ -708,7 +710,7 @@ export function createIsoOffice(canvas, opts = {}) {
       }
       seatPos[m.memberId] = DESK_UNITS[i].seat;
       const nm = m.name || String(m.memberId).split('@')[0];
-      if (nm) byName[nm] = { seat: DESK_UNITS[i].seat, agentId: m.memberId };
+      if (nm) byName[agentNameKey(nm)] = { seat: DESK_UNITS[i].seat, agentId: m.memberId };
     });
     seatByName = byName;
     /**
@@ -742,14 +744,14 @@ export function createIsoOffice(canvas, opts = {}) {
     // Gremlins currently being summoned: pinned to their workstation during this time (see canWander)
     summonedAgentIds.clear();
     for (const m of floating) {
-      const info = m.ghost ? byName[m.name] : null;
+      const info = m.ghost ? byName[agentNameKey(m.name)] : null;
       if (info) summonedAgentIds.add(info.agentId);
     }
 
     floating.forEach((m, i) => {
       const taskKey = String(m.taskKey || '');
       // If a ghost's name equals some seated gremlin's name, this is the instance ghost of "some gremlin was summoned".
-      const info = m.ghost ? byName[m.name] : null;
+      const info = m.ghost ? byName[agentNameKey(m.name)] : null;
       const queued = summonQueue.find((s) => s.ghostId === m.memberId);
       const running = !!(dispatch && dispatch.ghostId === m.memberId);
       const dispatched = dispatchedGhostTasks.has(m.memberId);

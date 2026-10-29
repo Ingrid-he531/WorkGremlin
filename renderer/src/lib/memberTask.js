@@ -7,6 +7,7 @@
 // Write /index.js explicitly: renderer/test node scripts import this file directly, and Node won't add the extension
 import { t } from '../i18n/index.js';
 import { isEphemeralMember } from './ephemeral.js';
+import { agentNameKey } from '@workgremlin/shared';
 
 /** Workstation states are busy / idle / blocked. Unknown values normalize to idle. */
 export const WORKING_STATES = ['busy'];
@@ -72,8 +73,11 @@ export function currentTaskStartedAt(member, sessionId = '') {
 export function summonTaskOf(member, allMembers, sessionId = '') {
   if (!member || member.ephemeral || normalizeState(member.agentState) !== 'busy') return null;
   const sid = String(sessionId || '');
+  // Case-insensitive: the resident is named after the definition file stem (`simmon`), the summon
+  // carries the frontmatter name (`Simmon`) — the same rule as the server (shared agentNameKey).
+  const key = agentNameKey(member.name);
   const ghost = (Array.isArray(allMembers) ? allMembers : []).find((candidate) => {
-    if (!candidate || !isEphemeralMember(candidate) || candidate.name !== member.name) return false;
+    if (!candidate || !isEphemeralMember(candidate) || agentNameKey(candidate.name) !== key) return false;
     if (sid && candidate.sessionId && String(candidate.sessionId) !== sid) return false;
     return Boolean(currentTaskOf(candidate, sid));
   });

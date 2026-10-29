@@ -753,6 +753,15 @@ function createRepo(db) {
       WHERE id = @id AND (client IS NULL OR client <> @client)
     `),
     getMember: db.prepare(`SELECT * FROM members WHERE id = ?`),
+    /**
+     * Resident (non-ephemeral) member by display name, case-insensitively: a resident is named after its
+     * definition file stem (`simmon`) while a summon may report the frontmatter name (`Simmon`).
+     */
+    getResidentByName: db.prepare(`
+      SELECT * FROM members
+       WHERE project_id = @projectId AND ephemeral = 0 AND lower(name) = lower(@name)
+       ORDER BY id LIMIT 1
+    `),
     listMembers: db.prepare(`SELECT * FROM members WHERE project_id = ? ORDER BY name`),
     /** Members by reporting identity (polling reconcilers use it to clear vanished sessions). */
     listMembersByClient: db.prepare(`SELECT * FROM members WHERE client = ? ORDER BY name`),
@@ -905,7 +914,7 @@ function createRepo(db) {
     listGhostArtifactsByName: db.prepare(`
       SELECT a.* FROM artifacts a
         JOIN subagent_runs r ON r.task_id = a.task_id
-       WHERE r.project_id = @projectId AND r.name = @name
+       WHERE r.project_id = @projectId AND lower(r.name) = lower(@name)
        ORDER BY a.ts_ms DESC LIMIT @limit
     `),
 

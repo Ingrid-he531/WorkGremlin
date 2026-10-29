@@ -115,6 +115,10 @@ const ghost = {
   sessionStatuses: [],
 };
 ok('same-name ghost task is borrowed', summonTaskTitle(resident, [resident, ghost], 'session-a') === 'write docs');
+ok(
+  'same-name ghost with different casing is borrowed',
+  summonTaskTitle(resident, [resident, { ...ghost, name: 'Susan' }], 'session-a') === 'write docs'
+);
 ok('summonTaskOf returns the ghost task', summonTaskOf(resident, [resident, ghost], 'session-a') === ghost.tasks[0]);
 ok('another session does not borrow it', summonTaskTitle(resident, [resident, ghost], 'session-b') === '');
 ok('ended ghost task is not borrowed', summonTaskTitle(resident, [resident, { ...ghost, tasks: [task('g1', 'session-a', 'write docs', T, T + 1)] }], 'session-a') === '');

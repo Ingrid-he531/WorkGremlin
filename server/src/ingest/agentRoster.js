@@ -17,6 +17,7 @@
  */
 
 const config = require('../config');
+const { agentNameKey } = require('@workgremlin/shared');
 
 /**
  * @param {{bus:any, project?:string, getProject?:()=>string, getWorkspacePath?:()=>string}} opts
@@ -31,17 +32,17 @@ function createAgentRoster(opts) {
    */
   const getProject = typeof opts.getProject === 'function' ? opts.getProject : () => opts.project || config.DEMO_PROJECT;
   const getWorkspacePath = typeof opts.getWorkspacePath === 'function' ? opts.getWorkspacePath : () => '';
-  /** project -> Set(name) this roster registered there */
+  /** project -> Map(nameKey -> registered display name); member ids are built from the display name */
   const registered = new Map();
-  /** project -> Map(name -> floor id that claimed it); the first floor to claim a duplicate name wins */
+  /** project -> Map(nameKey -> floor id that claimed it); the first floor to claim a duplicate name wins */
   const owners = new Map();
-  /** project -> Set(name): resident gremlins whose same-name ghost is currently working */
+  /** project -> Set(nameKey): resident gremlins whose same-name ghost is currently working */
   const active = new Map();
 
   function state(project) {
     let mine = registered.get(project);
     if (!mine) {
-      mine = new Set();
+      mine = new Map();
       registered.set(project, mine);
     }
     let own = owners.get(project);
@@ -85,18 +86,20 @@ function createAgentRoster(opts) {
     const project = getProject();
     const ws = getWorkspacePath();
     const name = String((a && a.name) || '').trim();
-    if (!name) return;
+    const key = agentNameKey(name);
+    if (!key) return;
     const floorId = (floor && floor.meta && floor.meta.id) || '';
     const client = (a && a.client) || (floor && floor.meta && floor.meta.agent) || '';
     const { mine, own, act } = state(project);
-    if (mine.has(name)) {
-      const alive = act.has(name) && ghostAlive(project, name);
-      if (alive) act.add(name);
-      else if (act.delete(name)) writeBorrowedBusy(project, name, false);
+    if (mine.has(key)) {
+      const actual = mine.get(key) || name;
+      const alive = act.has(key) && ghostAlive(project, actual);
+      if (alive) act.add(key);
+      else if (act.delete(key)) writeBorrowedBusy(project, actual, false);
       return;
     }
-    mine.add(name);
-    own.set(name, floorId);
+    mine.set(key, name);
+    own.set(key, floorId);
     bus.registerMember({
       project,
       memberId: name,
@@ -121,49 +124,52 @@ function createAgentRoster(opts) {
    * @param {string} name
    */
   function unregisterAgent(floor, name) {
-    name = String(name || '').trim();
-    if (!name) return;
+    const key = agentNameKey(name);
+    if (!key) return;
     const project = getProject();
     const floorId = (floor && floor.meta && floor.meta.id) || '';
     const { mine, own, act } = state(project);
-    if (!mine.has(name)) return;
-    if (floorId && own.get(name) !== floorId) return; // a different floor owns this name
+    if (!mine.has(key)) return;
+    if (floorId && own.get(key) !== floorId) return; // a different floor owns this name
+    const actual = mine.get(key) || name;
     try {
-      bus.removeMember({ project, memberId: name });
+      bus.removeMember({ project, memberId: actual });
     } catch {
       /* ignore */
     }
-    mine.delete(name);
-    own.delete(name);
-    act.delete(name);
+    mine.delete(key);
+    own.delete(key);
+    act.delete(key);
   }
 
   /**
    * Summoned: mark the resident workstation busy while a same-name ghost is working.
+   * The ghost may report the definition's frontmatter name (`Simmon`) while the workstation is named
+   * after the file stem (`simmon`); resolve the registered spelling before writing `agent_status`.
    */
   function markActive(name) {
-    name = String(name || '').trim();
-    if (!name) return;
+    const key = agentNameKey(name);
+    if (!key) return;
     const project = getProject();
-    const { act } = state(project);
-    if (act.has(name)) return;
-    act.add(name);
-    writeBorrowedBusy(project, name, true);
+    const { mine, act } = state(project);
+    if (act.has(key)) return;
+    act.add(key);
+    writeBorrowedBusy(project, mine.get(key) || String(name || '').trim(), true);
   }
 
   /** Summon finished: clear the borrowed busy state so the resident workstation returns to idle. */
   function markIdle(name) {
-    name = String(name || '').trim();
-    if (!name) return;
+    const key = agentNameKey(name);
+    if (!key) return;
     const project = getProject();
-    const { act } = state(project);
-    act.delete(name);
-    writeBorrowedBusy(project, name, false);
+    const { mine, act } = state(project);
+    act.delete(key);
+    writeBorrowedBusy(project, mine.get(key) || String(name || '').trim(), false);
   }
 
   function isDefined(name) {
     const mine = registered.get(getProject());
-    return Boolean(mine && mine.has(String(name || '').trim()));
+    return Boolean(mine && mine.has(agentNameKey(name)));
   }
 
   return {
@@ -174,7 +180,7 @@ function createAgentRoster(opts) {
     isDefined,
     get defined() {
       const mine = registered.get(getProject());
-      return mine ? [...mine] : [];
+      return mine ? [...mine.values()] : [];
     },
   };
 }

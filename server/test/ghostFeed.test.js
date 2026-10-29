@@ -219,6 +219,16 @@ console.log('\n[8] 同名常驻小怪物借阅幽灵产出（按名字查，不�
   ok('按名字查到已散场幽灵的产出（成员行已删，靠 subagent_runs 关联）', arts.length >= 1 && arts[0].path === 'workgremlin:summary', JSON.stringify(arts));
 }
 
+console.log('\n[8a] 常驻名与召唤名大小写不同（simmon / Simmon）也能借阅产出');
+{
+  const m8a = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '大小写借阅', client: 'codebuddy' }).taskId;
+  bus.registerMember({ project: 'p1', memberId: 'simmon', name: 'simmon', role: 'subagent:user', client: 'codebuddy' });
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-case', name: 'Simmon', task: '写设计', id: 'sm1', parentTaskId: m8a });
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-case', name: 'Simmon', id: 'sm1', result: '设计好了' });
+  const arts = repo.listGhostArtifactsByName.all({ projectId: 'p1', name: 'simmon', limit: 3 });
+  ok('常驻 simmon 能按名字借阅 Simmon 的产出（大小写不敏感）', arts.length >= 1 && arts[0].path === 'workgremlin:summary', JSON.stringify(arts));
+}
+
 console.log('\n[9] 后台 agent 多次 SubagentStop：先收工，再复活，下一次停止再收工');
 {
   const parent = bus.startTask({ project: 'p1', memberId: 'codebuddy', title: '后台续跑', client: 'codebuddy', sessionId: 's-revive' }).taskId;

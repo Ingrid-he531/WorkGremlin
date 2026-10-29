@@ -134,6 +134,24 @@ console.log('\n[4] 召唤 → 工位忙碌；收工 → 回到空闲');
   ok('收工后 leo 回到空闲（幽灵散场复位）', leoState() === 'idle', String(leoState()));
 }
 
+console.log('\n[4a] 定义名大小写与文件名不一致时仍借用忙碌（Simmon / simmon）');
+{
+  const archState = () => cardOf('architect@p1').state;
+  bus.setGhostRoster(roster);
+  ok('大小写不敏感地认定已定义', roster.isDefined('Architect') && roster.isDefined('ARCHITECT'));
+  const before = repo.listMembers.all('p1').length;
+  roster.registerAgent({ meta: { id: 'other-floor', agent: 'codebuddy' } }, { name: 'ARCHITECT', level: 'user', client: 'codebuddy' });
+  ok('同名不同大小写的定义不会建第二个工位', repo.listMembers.all('p1').length === before, `${before} -> ${repo.listMembers.all('p1').length}`);
+  bus.ghostSpawn({ project: 'p1', client: 'codebuddy', sessionId: 's-case', name: 'Architect', task: '按定义名召唤', id: 'gc1' });
+  ok('按定义名（首字母大写）召唤仍点亮同名工位', archState() === 'busy', String(archState()));
+  ok(
+    '借用忙碌写在常驻成员 id 上，而不是召唤名上',
+    Boolean(repo.getStatus.get('architect@p1')) && (repo.getStatus.get('Architect@p1') || null) === null
+  );
+  bus.ghostRetire({ project: 'p1', client: 'codebuddy', sessionId: 's-case', name: 'Architect', id: 'gc1', result: '收工' });
+  ok('按定义名收工后回到空闲', archState() === 'idle', String(archState()));
+}
+
 console.log('\n[5] 借用忙碌没有 TTL：以幽灵是否仍存活为准');
 {
   const leoState = () => cardOf('leo@p1').state;

@@ -499,6 +499,22 @@ function agentBase(id) {
 }
 
 /**
+ * Identity key for a subagent / resident gremlin name.
+ *
+ * A resident gremlin is named after its definition **file stem** (`simmon.md` → `simmon`), while a
+ * product reports the definition's frontmatter `name` when summoning it (`Simmon`). Both are the same
+ * agent, so every pairing of "resident gremlin ↔ its summons" compares this case-insensitive key
+ * instead of the raw display name. Display keeps the original spelling.
+ * @param {string} name display name (may be null / undefined)
+ * @returns {string} trimmed, lowercased key
+ */
+function agentNameKey(name) {
+  return String(name == null ? '' : name)
+    .trim()
+    .toLowerCase();
+}
+
+/**
  * Final display name from agent + form. The single source shared by frontend and backend; the API returns
  * the already-computed string, so the frontend no longer assembles it from form itself.
  *
@@ -565,6 +581,7 @@ module.exports = {
   formToSource,
   clientLabel,
   agentBase,
+  agentNameKey,
   AGENT_LABELS,
   home,
 };
