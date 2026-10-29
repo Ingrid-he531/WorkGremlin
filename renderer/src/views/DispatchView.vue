@@ -462,6 +462,11 @@ function onKeydown(e) {
   min-height: 0;
   overflow: auto;
   padding: 14px 16px 6px;
+  /* theme.css turns text selection off app-wide (#app { user-select: none }); the transcript is
+     read-and-copy material (the prompt just sent and the CLI's output), so selection comes back
+     here. Selecting inside it cannot break the layout: it is plain text in auto-scrolling boxes. */
+  -webkit-user-select: text;
+  user-select: text;
 }
 .turn {
   border: 1px solid var(--border);
@@ -545,6 +550,21 @@ function onKeydown(e) {
 .send-row .model-sel option,
 .send-row .model-sel optgroup {
   background-color: #000;
+  color: #fff;
+}
+/* Focus ring + the highlighted row in the open popup, both in the theme accent (blue). The
+   browser default is a white/grey ring and a grey highlight, which read as "disabled" on the dark
+   theme. `:focus-visible` alone would not cover mouse focus in every Chromium build, so `:focus`
+   is listed too. */
+.send-row .model-sel:focus,
+.send-row .model-sel:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+.send-row .model-sel option:checked,
+.send-row .model-sel option:focus {
+  background-color: var(--accent);
   color: #fff;
 }
 .send {
