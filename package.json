@@ -43,6 +43,7 @@
     "test:log": "node server/test/log.test.js",
     "test:plugin-ingest": "node server/test/pluginIngest.test.js",
     "test:static-site": "node server/test/staticSite.test.js",
+    "test:tls": "node server/test/tlsServer.test.js",
     "test:dispatch": "node server/test/dispatchApi.test.js",
     "test:plugin-e2e": "node server/test/kiloPluginE2E.test.js",
     "test:ghost-feed": "node server/test/ghostFeed.test.js",

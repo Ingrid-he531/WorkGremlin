@@ -200,20 +200,28 @@ function hostOf(info) {
 
 /**
  * WS url. With a bridge, connect straight to the configured host; otherwise go same-origin (vite proxy).
- * @param {{host?: string, port: number, token: string}} info
+ * The scheme follows `info.protocol` because a remote target may speak https: `ws://host:port` against
+ * a TLS listener fails the handshake, and host+port alone cannot tell us which one it is.
+ * @param {{host?: string, port: number, token: string, protocol?: string}} info
  */
 export function wsUrl(info) {
-  if (info && info.port && !info.fallback) return `ws://${hostOf(info)}:${info.port}/ws`;
+  if (info && info.port && !info.fallback) {
+    const scheme = String(info.protocol || '').toLowerCase() === 'https' ? 'wss' : 'ws';
+    return `${scheme}://${hostOf(info)}:${info.port}/ws`;
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/ws`;
 }
 
 /**
  * HTTP base.
- * @param {{host?: string, port: number, fallback?: boolean}} info
+ * @param {{host?: string, port: number, protocol?: string, fallback?: boolean}} info
  */
 export function httpBase(info) {
-  if (info && info.port && !info.fallback) return `http://${hostOf(info)}:${info.port}`;
+  if (info && info.port && !info.fallback) {
+    const scheme = String(info.protocol || '').toLowerCase() === 'https' ? 'https' : 'http';
+    return `${scheme}://${hostOf(info)}:${info.port}`;
+  }
   return '';
 }
 

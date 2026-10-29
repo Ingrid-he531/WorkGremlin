@@ -7,6 +7,11 @@ import path from 'node:path';
 
 // dev 模式下也可直连本地服务（端口 21800 起）。Electron 内运行时优先走 preload 注入的 serverInfo。
 const SERVER_PORT = process.env.WORKGREMLIN_PORT || 21800;
+// 服务端用 `node server/src/cli.js --tls`（或 WORKGREMLIN_TLS=1）启动时同样置 WORKGREMLIN_TLS=1，
+// 代理改走 https/wss。自签证书不能通过 Node 的默认校验，故 `secure: false`（只影响本机回环这一跳）。
+const SERVER_TLS = process.env.WORKGREMLIN_TLS === '1';
+const SERVER_ORIGIN = `${SERVER_TLS ? 'https' : 'http'}://127.0.0.1:${SERVER_PORT}`;
+const SERVER_WS_ORIGIN = `${SERVER_TLS ? 'wss' : 'ws'}://127.0.0.1:${SERVER_PORT}`;
 
 /**
  * 读取本地服务 token（每次启动随机生成，写在 ~/.workgremlin/server.json）。
@@ -48,8 +53,9 @@ export default defineConfig({
     strictPort: false,
     proxy: {
       '/api': {
-        target: `http://127.0.0.1:${SERVER_PORT}`,
+        target: SERVER_ORIGIN,
         changeOrigin: true,
+        secure: false,
         configure: (proxy) => {
           proxy.on('proxyReq', (proxyReq) => {
             const token = readServerToken();
@@ -58,8 +64,9 @@ export default defineConfig({
         },
       },
       '/ws': {
-        target: `ws://127.0.0.1:${SERVER_PORT}`,
+        target: SERVER_WS_ORIGIN,
         ws: true,
+        secure: false,
         configure: (proxy) => {
           proxy.on('proxyReqWs', (proxyReq) => {
             const token = readServerToken();

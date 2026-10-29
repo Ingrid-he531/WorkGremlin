@@ -36,21 +36,29 @@ The renderer only talks HTTP `/api/v1` + WebSocket `/ws`, so the window can be a
 ```bash
 # Browser mode: also serve the built UI; the printed URL carries the token once
 npm run build
-node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token --static renderer/dist
+node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token --static renderer/dist --tls
 
 # Window-client mode: expose the API + WS only
-node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token
+node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token --tls
 ```
 
 Always pass a fixed `--token`: the default token is regenerated on every start and is only readable on the server machine.
 
+**TLS**: `--tls` makes the server speak HTTPS with a self-signed certificate (generated once into `~/.workgremlin/tls`, reused while valid), so the token and all data stop travelling in clear text. The startup log prints the certificate's SHA-256 fingerprint: the browser will warn once ("not private" → Advanced → Continue), and matching the fingerprint there is what makes that click-through meaningful. A self-signed certificate encrypts but does not *identify* the server —— if you need both, pass a real certificate instead:
+
+```bash
+node server/src/cli.js --static renderer/dist --tls-cert /path/server.crt --tls-key /path/server.key
+```
+
+In Vite dev mode, set `WORKGREMLIN_TLS=1` on both commands so the proxy targets `https`/`wss`.
+
 **Client side** (no server, no database):
 
-- **Browser — nothing to install**: open the URL printed by `--static` (`http://<host>:21800/?token=my-token`). The token is exchanged for an httpOnly cookie, so a refresh does not need it again. `msedge --app=<url>` / `chrome --app=<url>` gives a window without browser chrome.
+- **Browser — nothing to install**: open the URL printed by `--static` (`https://<host>:21800/?token=my-token` with `--tls`, `http://…` without). The token is exchanged for an httpOnly cookie, so a refresh does not need it again. `msedge --app=<url>` / `chrome --app=<url>` gives a window without browser chrome.
 - **Client-only window**: `npm run build:client` (Linux unpacked build), then put `client.json` `{ "host": "192.168.1.5", "port": 21800, "token": "my-token" }` next to the executable or in `~/.workgremlin/client.json`. On a Windows machine the same config produces the exe: `npx electron-builder --config electron-builder.client.yml --win portable`. The client package contains no server and no native module, so it is ~112 MB instead of ~125 MB and needs no SQLite toolchain. The `Client packages (Windows)` GitHub Actions workflow (`.github/workflows/client-windows.yml`) builds the zip + portable exe on `windows-latest` — run it from the Actions tab or push a `v*` tag.
 - **Full package**: the same `client.json` turns it into a remote client; with a target configured it never starts or reads a local server.
 
-Everything is plain HTTP/WS: use it only on a trusted network, or put an SSH tunnel or a TLS reverse proxy in front. `--no-token` disables the only gate, so never combine it with `--host 0.0.0.0` on a shared network.
+Without `--tls` everything is plain HTTP/WS: use it only on a trusted network, or put an SSH tunnel or a TLS reverse proxy in front. `--no-token` disables the only gate, so never combine it with `--host 0.0.0.0` on a shared network.
 
 ### Remote task dispatch (8F OpenCode)
 

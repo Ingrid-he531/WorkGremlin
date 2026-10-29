@@ -11,6 +11,7 @@
  */
 
 const http = require('node:http');
+const https = require('node:https');
 const express = require('express');
 
 const log = require('./log');
@@ -143,6 +144,7 @@ function createLifecycle() {
  *   host?: string,
  *   workspacePath?: string,
  *   serveStatic?: string,
+ *   tls?: {key: string, cert: string, fingerprint256?: string},
  *   silent?: boolean,
  *   log?: string,
  * }} [opts]
@@ -166,7 +168,10 @@ function createServer(opts = {}) {
   const projectName = resolveProjectName(workspacePath);
 
   const app = express();
-  const httpServer = http.createServer(app);
+  // HTTPS when TLS material was resolved (cli.js / --tls). Everything below is protocol-agnostic:
+  // the ws hub attaches to whichever server this is, and the API/static routers do not care.
+  const tls = opts.tls || null;
+  const httpServer = tls ? https.createServer({ key: tls.key, cert: tls.cert }, app) : http.createServer(app);
 
   let hub = null;
   const bus = createIngestBus({
@@ -267,7 +272,7 @@ function createServer(opts = {}) {
   if (opts.serveStatic) {
     // Browser-only mode: the same server hands out the built UI, so the client machine needs
     // nothing installed. Registered after the API routers so /api is never shadowed.
-    app.use(createStaticSite({ dir: opts.serveStatic, token }));
+    app.use(createStaticSite({ dir: opts.serveStatic, token, secure: Boolean(tls) }));
   }
 
   const timers = [];
@@ -304,6 +309,11 @@ function createServer(opts = {}) {
       previousPid: existing ? existing.pid : null,
       projectName,
       workspacePath,
+      // Clients build their HTTP/WS base from this (renderer/api/bridge.js): a remote client may
+      // have no way to guess that the target speaks https, and the scheme is not derivable from
+      // host+port alone. `http` is written explicitly so old readers see no change.
+      protocol: tls ? 'https' : 'http',
+      tlsFingerprint: tls && tls.fingerprint256 ? tls.fingerprint256 : null,
     };
     config.writeServerInfo(info);
 
@@ -412,7 +422,7 @@ function createServer(opts = {}) {
     lifecycle.onClose(() => { try { hub.close(); } catch {} });
 
     if (!opts.silent) {
-      log.info(`[workgremlin] server listening on http://${host}:${chosen} (db=${dbPath})`);
+      log.info(`[workgremlin] server listening on ${info.protocol}://${host}:${chosen} (db=${dbPath})`);
       if (!token) log.warn('[workgremlin] 已关闭 token 校验（--no-token，仅调试用）');
       const dispatchPolicy = dispatch.policy();
       log.info(

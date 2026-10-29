@@ -11,9 +11,9 @@
  *     script (the browser cannot read an httpOnly cookie);
  *   · `/api/*` and `/ws` still authenticate with the same token.
  *
- * Scope: plain HTTP on the LAN. The page is only served to callers that know the token, but the
- * token and all data travel in clear text —— use an SSH tunnel or a TLS reverse proxy when the
- * network is not trusted.
+ * Transport: the server can terminate TLS itself (`--tls`, see server/src/tls.js) or sit behind a
+ * reverse proxy / SSH tunnel. Without one of those the page and all data travel in clear text on
+ * the LAN, and the token is only as private as the network.
  */
 
 const fs = require('node:fs');
@@ -42,10 +42,13 @@ function readCookie(header, name) {
 }
 
 /**
- * @param {{dir: string, token: string}} opts
+ * @param {{dir: string, token: string, secure?: boolean}} opts
+ *   `secure` marks the cookie Secure when the page is served over HTTPS. It has to follow the
+ *   actual protocol instead of being hard-coded: a Secure cookie set by an http:// server is
+ *   silently dropped by the browser, which looks exactly like "the token keeps getting rejected".
  * @returns {import('express').RequestHandler}
  */
-function createStaticSite({ dir, token }) {
+function createStaticSite({ dir, token, secure = false }) {
   const root = path.resolve(dir);
   const indexFile = path.join(root, 'index.html');
   const html = fs.readFileSync(indexFile, 'utf8');
@@ -74,7 +77,7 @@ function createStaticSite({ dir, token }) {
 
     if (!queryToken) return res.type('html').send(index);
 
-    res.cookie(COOKIE, token, { httpOnly: true, sameSite: 'lax' });
+    res.cookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: Boolean(secure) });
     // Drop the token from the address bar right away; the cookie carries it from now on.
     const url = new URL(req.originalUrl, 'http://localhost');
     url.searchParams.delete('token');
