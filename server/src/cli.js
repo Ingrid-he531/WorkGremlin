@@ -162,6 +162,8 @@ async function main() {
   }
 
   const host = typeof args.host === 'string' ? args.host : undefined;
+  // The address actually bound by createServer: no --host means loopback, never the LAN address.
+  const bindHost = host || '127.0.0.1';
   const staticDir = typeof args.static === 'string' ? path.resolve(args.static) : undefined;
   if (staticDir && !fs.existsSync(path.join(staticDir, 'index.html'))) {
     log.error(`[workgremlin] --static 目录里没有 index.html：${staticDir}（先跑 npm run build）`);
@@ -184,7 +186,9 @@ async function main() {
   await server.start(args.port ? Number(args.port) : undefined);
 
   if (staticDir) {
-    const base = `http://${browserHost(host)}:${server.info.port}/`;
+    // Use the bound host, not browserHost(undefined): without --host the server listens on loopback,
+    // so printing the LAN address made the URL unreachable (the socket never accepted it).
+    const base = `http://${browserHost(bindHost)}:${server.info.port}/`;
     log.info(
       `[workgremlin] 浏览器访问（客户端无需安装任何东西）：${base}${server.token ? `?token=${server.token}` : ''}`
     );
@@ -202,6 +206,10 @@ async function main() {
     } else {
       log.warn(`[workgremlin] 已监听 ${host}：token 与实际数据都是明文 HTTP/WS 传输`);
     }
+  } else if (staticDir) {
+    log.warn(
+      '[workgremlin] 当前只监听本机（127.0.0.1）；其他机器要访问，请加 --host 0.0.0.0 --token <固定值>'
+    );
   }
   log.info(`[workgremlin] server.json -> ${config.serverInfoPath()}`);
   log.info('[workgremlin] Ctrl+C 退出');
