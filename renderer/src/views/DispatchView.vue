@@ -535,6 +535,17 @@ function onKeydown(e) {
   min-width: 0;
   padding: 7px 8px;
   font-size: 12px;
+  /* The closed control and its popup must both be dark: the OS defaults the list to a white
+     background, which clashes with the office theme. `color-scheme: dark` swaps the native popup;
+     the explicit option rules cover Chromium builds that ignore it. */
+  background: var(--bg);
+  color: var(--text);
+  color-scheme: dark;
+}
+.send-row .model-sel option,
+.send-row .model-sel optgroup {
+  background-color: #000;
+  color: #fff;
 }
 .send {
   align-self: center;
