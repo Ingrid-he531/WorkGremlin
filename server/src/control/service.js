@@ -7,6 +7,8 @@
  * The unit is a session, not a one-shot request:
  *   · a session owns one OpenCode session id (minted here, so we can keep talking to it);
  *   · each prompt is a turn; a turn is one `opencode run --session <id> "<prompt>"` process;
+ *   · a turn may pin its own `--model` (the composer's per-turn picker); an empty choice leaves the
+ *     model to the floor's own default, and legacy sessions keep their session-level model as fallback;
  *   · stdout is streamed to clients (`dispatch.output`), so the UI shows progress while it runs.
  *
  * What it does NOT do: it never writes members / tasks / task_runs. The spawned CLI is a normal,
@@ -29,7 +31,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 
 const { DEFAULTS, WS_EVENTS } = require('@workgremlin/shared');
 const { atomicWriteJson, readJson } = require('@workgremlin/shared/fslock');
@@ -40,6 +42,8 @@ const { readDispatchConfig } = require('./config');
 
 /** Output kept for a finished turn and for the detail endpoint (streaming itself is not capped) */
 const OUTPUT_MAX_BYTES = 200 * 1024;
+/** The model catalog is a read-only convenience: cache it per floor so a picker refresh cannot spawn a CLI per keystroke */
+const MODELS_TTL_MS = 60_000;
 const STATES = Object.freeze(['pending', 'running', 'done', 'failed', 'timeout', 'cancelled', 'rejected', 'expired']);
 
 /** @param {Error & {code?: string}} err */
@@ -56,6 +60,47 @@ function cleanOutput(text) {
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
     .replace(/\r\n?/g, '\n')
     .replace(/[^\S\n]+$/gm, '');
+}
+
+/**
+ * Parse `opencode models` output: one `provider/model` reference per line. Blank lines and CLI
+ * banners / warnings are dropped; duplicates are collapsed (the same ref may be listed twice).
+ * @param {string} text
+ * @returns {string[]}
+ */
+function parseModelList(text) {
+  const seen = new Set();
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const ref = line.trim();
+    if (!ref || !ref.includes('/')) continue;
+    seen.add(ref);
+  }
+  return [...seen];
+}
+
+/**
+ * Default model catalog reader: the floor's CLI prints one `provider/model` reference per line.
+ * Using the CLI (instead of a bundled list) keeps the picker aligned with the account, providers and
+ * variants actually available on this machine. Failures are reported, never thrown: the picker can
+ * still offer "default model" when the CLI is briefly unavailable.
+ * @param {string} bin
+ * @returns {Promise<{models: string[], error: string}>}
+ */
+function defaultFetchModels(bin) {
+  return new Promise((resolve) => {
+    execFile(
+      bin,
+      ['models'],
+      { timeout: 15_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env } },
+      (err, stdout) => {
+        if (err) {
+          resolve({ models: [], error: String((err && err.message) || err) });
+          return;
+        }
+        resolve({ models: parseModelList(stdout), error: '' });
+      }
+    );
+  });
 }
 
 /**
@@ -147,6 +192,7 @@ function createDispatchService(deps = {}) {
   const recipeFor = deps.recipeFor || defaultRecipeOf;
   const now = deps.now || (() => Date.now());
   const readConfig = deps.readConfig || (() => readDispatchConfig());
+  const fetchModels = deps.fetchModels || defaultFetchModels;
   const mintSessionId =
     deps.mintSessionId || (() => `ses_wg${crypto.randomBytes(12).toString('hex')}`);
   // `null`/'' disables persistence (tests); undefined means the real store.
@@ -163,6 +209,8 @@ function createDispatchService(deps = {}) {
 
   /** @type {Map<string, any>} */
   const sessions = new Map();
+  /** floor -> { at, value: {floor, models, error} } */
+  const modelsCache = new Map();
   let disposed = false;
   let persistTimer = null;
 
@@ -191,6 +239,7 @@ function createDispatchService(deps = {}) {
           prompt: turn.prompt,
           state: turn.state,
           mode: turn.mode,
+          model: turn.model || '',
           createdAt: turn.createdAt,
           startedAt: turn.startedAt,
           endedAt: turn.endedAt,
@@ -262,6 +311,7 @@ function createDispatchService(deps = {}) {
           prompt: String((t && t.prompt) || ''),
           state: finalState,
           mode: DEFAULTS.DISPATCH_MODES.includes(t && t.mode) ? t.mode : 'auto',
+          model: String((t && t.model) || ''),
           createdAt: Number(t && t.createdAt) || ts,
           startedAt: Number(t && t.startedAt) || null,
           endedAt,
@@ -307,7 +357,7 @@ function createDispatchService(deps = {}) {
           turnId: turn ? turn.id : null,
           floor: session.floor,
           workspacePath: session.workspacePath,
-          model: session.model || null,
+          model: (turn && turn.model) || session.model || null,
           promptBytes: turn ? Buffer.byteLength(turn.prompt || '', 'utf8') : null,
           state: turn ? turn.state : sessionState(session),
           exitCode: turn ? turn.exitCode : null,
@@ -350,6 +400,7 @@ function createDispatchService(deps = {}) {
       prompt: turn.prompt,
       state: turn.state,
       mode: turn.mode,
+      model: turn.model || '',
       createdAt: turn.createdAt,
       startedAt: turn.startedAt,
       endedAt: turn.endedAt,
@@ -435,7 +486,8 @@ function createDispatchService(deps = {}) {
     try {
       inv = recipe.build({
         prompt: turn.prompt,
-        model: session.model,
+        // Per-turn choice wins; legacy sessions created with a model keep it as their fallback.
+        model: turn.model || session.model || null,
         sessionId: session.opencodeSessionId,
       });
     } catch (err) {
@@ -608,6 +660,9 @@ function createDispatchService(deps = {}) {
     if (Buffer.byteLength(prompt, 'utf8') > DEFAULTS.DISPATCH_PROMPT_MAX_BYTES) {
       throw fail('prompt_too_large', `任务内容超过 ${DEFAULTS.DISPATCH_PROMPT_MAX_BYTES} 字节`, 413);
     }
+    // Per-turn model override: the composer lets the user pick a different model for every message.
+    // Empty means "the floor's default" (or the session-level model on legacy sessions).
+    const model = String(input.model || '').trim().slice(0, 200);
     if (session.turns.some((t) => ['pending', 'running'].includes(t.state))) {
       throw fail('busy', '这个会话还有一轮正在等待或执行，请先等它结束', 409);
     }
@@ -617,6 +672,7 @@ function createDispatchService(deps = {}) {
       prompt,
       state: 'pending',
       mode: currentMode,
+      model,
       createdAt: now(),
       startedAt: null,
       endedAt: null,
@@ -696,6 +752,33 @@ function createDispatchService(deps = {}) {
     return DEFAULTS.DISPATCH_FLOORS.map((id) => ({ id, available: Boolean(binFor(id)) }));
   }
 
+  /**
+   * Model catalog for one floor, read from that floor's own CLI (`opencode models`) and cached
+   * briefly. The composer uses it for a per-turn model picker; the server never picks a model for
+   * the user beyond "empty = CLI default".
+   * @param {string} floor
+   * @param {{refresh?: boolean}} [opts]
+   * @returns {Promise<{floor: string, models: string[], error: string}>}
+   */
+  async function listModels(floor, opts = {}) {
+    const id = String(floor || '');
+    if (!DEFAULTS.DISPATCH_FLOORS.includes(id)) {
+      throw fail('bad_floor', `暂不支持该楼层：${id || '(空)'}`, 400);
+    }
+    const bin = binFor(id);
+    if (!bin) throw fail('floor_unavailable', `${id} 的 CLI 未安装`, 409);
+    const hit = modelsCache.get(id);
+    if (!opts.refresh && hit && now() - hit.at < MODELS_TTL_MS) return hit.value;
+    const raw = await fetchModels(bin);
+    const value = {
+      floor: id,
+      models: Array.isArray(raw && raw.models) ? raw.models : [],
+      error: String((raw && raw.error) || ''),
+    };
+    modelsCache.set(id, { at: now(), value });
+    return value;
+  }
+
   function dispose() {
     flushPersist();
     disposed = true;
@@ -724,9 +807,10 @@ function createDispatchService(deps = {}) {
     deleteSession,
     list,
     floors,
+    listModels,
     dispose,
     STATES,
   };
 }
 
-module.exports = { createDispatchService, defaultRun, STATES, cleanOutput };
+module.exports = { createDispatchService, defaultRun, defaultFetchModels, parseModelList, STATES, cleanOutput };

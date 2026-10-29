@@ -4,10 +4,11 @@
  * Remote dispatch API (reverse control, conservative): **sessions**, not one-shot requests.
  *
  *   GET    /api/v1/dispatch                          policy + floor availability + session list
+ *   GET    /api/v1/dispatch/models?floor=8F          model catalog for the per-turn picker
  *   POST   /api/v1/dispatch/sessions                 create a session {floor, workspacePath, model?}
  *   GET    /api/v1/dispatch/sessions/:id             full transcript (turns + output tails)
  *   DELETE /api/v1/dispatch/sessions/:id             close a session (kills a running turn)
- *   POST   /api/v1/dispatch/sessions/:id/turns       send a prompt (202 when it needs confirmation)
+ *   POST   /api/v1/dispatch/sessions/:id/turns       send a prompt {prompt, model?}
  *   POST   /api/v1/dispatch/turns/:id/decision       {approve}   (loopback only)
  *   DELETE /api/v1/dispatch/turns/:id                cancel a pending/running turn
  *
@@ -55,6 +56,17 @@ function createDispatchRouter({ service }) {
 
   router.get('/dispatch', (req, res) => {
     res.json(overview(req));
+  });
+
+  router.get('/dispatch/models', async (req, res) => {
+    try {
+      // No client-controlled refresh: the catalog is cached server-side (see listModels), so a
+      // remote caller cannot turn the picker into an endless "spawn a CLI" loop.
+      const out = await service.listModels(String(req.query.floor || '8F'));
+      return res.json({ ok: true, ...out });
+    } catch (err) {
+      return bad(res, err);
+    }
   });
 
   router.post('/dispatch/sessions', (req, res) => {

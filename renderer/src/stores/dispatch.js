@@ -49,6 +49,10 @@ export const useDispatchStore = defineStore('dispatch', {
     mode: 'off',
     /** [{ id, available }] */
     floors: [],
+    /** Model references for the per-turn picker (e.g. opencode-go/deepseek-v4.1-flash) */
+    models: [],
+    /** Why the catalog could not be read; the picker still offers "default model" */
+    modelsError: '',
     /** Session summaries, newest first */
     sessions: [],
     /** Currently open session id + its full transcript */
@@ -152,21 +156,43 @@ export const useDispatchStore = defineStore('dispatch', {
     },
 
     /**
+     * Load the floor's model catalog for the composer picker.
+     * @param {{token?: string}|null} info
+     * @param {string} [floor] defaults to the first available floor
+     */
+    async loadModels(info, floor) {
+      const f = String(floor || (this.availableFloors[0] && this.availableFloors[0].id) || '8F');
+      this.modelsError = '';
+      try {
+        const res = await fetch(`${httpBase(info)}/api/v1/dispatch/models?floor=${encodeURIComponent(f)}`, {
+          headers: authHeaders(info),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error((data.error && data.error.message) || `HTTP ${res.status}`);
+        this.models = Array.isArray(data.models) ? data.models : [];
+        this.modelsError = data.error || '';
+      } catch (err) {
+        this.models = [];
+        this.modelsError = (err && err.message) || String(err);
+      }
+    },
+
+    /**
      * Send one prompt into the current session. 202 = parked for server-side approval.
      * @param {{token?: string}|null} info
      * @param {string} prompt
+     * @param {string} [model] per-turn model override; empty = the floor's default
      */
-    async sendTurn(info, prompt) {
+    async sendTurn(info, prompt, model) {
       if (!this.currentId) throw new Error('no session');
       this.error = '';
       const sessionId = this.currentId;
-      const session = this.sessions.find((s) => s.id === sessionId) || this.current;
       const res = await fetch(
         `${httpBase(info)}/api/v1/dispatch/sessions/${encodeURIComponent(sessionId)}/turns`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(authHeaders(info) || {}) },
-          body: JSON.stringify({ prompt }),
+          body: JSON.stringify({ prompt, model: model || '' }),
         }
       );
       const data = await res.json();

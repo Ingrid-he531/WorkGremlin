@@ -18,7 +18,8 @@ const dispatch = useDispatchStore();
 const showNew = ref(false);
 const floor = ref('8F');
 const workspace = ref('');
-const model = ref('');
+/** Per-turn model for the composer picker; empty = the floor's default model */
+const turnModel = ref('');
 const prompt = ref('');
 const error = ref('');
 const sending = ref(false);
@@ -27,6 +28,17 @@ const scroller = ref(null);
 
 const session = computed(() => dispatch.current);
 const active = computed(() => dispatch.activeTurn);
+/** Legacy sessions created before per-turn selection may carry a session-level model */
+const sessionModel = computed(() => (session.value && session.value.model) || '');
+
+/** Start each session with its own model (if it has one); the user can change it per turn. */
+watch(
+  () => (session.value && session.value.id) || '',
+  () => {
+    turnModel.value = sessionModel.value;
+  },
+  { immediate: true }
+);
 const canSend = computed(
   () =>
     Boolean(session.value) &&
@@ -53,7 +65,22 @@ const progressKey = computed(() => {
 
 onMounted(async () => {
   await dispatch.refresh(project.serverInfo || {});
+  // The picker is a convenience: load the catalog in the background so the page is usable first.
+  dispatch.loadModels(project.serverInfo || {}).catch(() => {});
   if (!dispatch.sessions.length) openNew();
+});
+
+/** Model references grouped by provider prefix (e.g. opencode-go, opencode) for the <optgroup>. */
+const modelGroups = computed(() => {
+  const groups = new Map();
+  for (const id of dispatch.models) {
+    const text = String(id);
+    const slash = text.indexOf('/');
+    const provider = slash > 0 ? text.slice(0, slash) : 'other';
+    if (!groups.has(provider)) groups.set(provider, []);
+    groups.get(provider).push(text);
+  }
+  return [...groups.entries()].map(([label, models]) => ({ label, models }));
 });
 
 watch(progressKey, () => {
@@ -81,7 +108,6 @@ async function create() {
     await dispatch.createSession(project.serverInfo || {}, {
       floor: floor.value,
       workspacePath: workspace.value.trim(),
-      model: model.value.trim() || undefined,
     });
     showNew.value = false;
   } catch (err) {
@@ -96,7 +122,7 @@ async function send() {
   sending.value = true;
   error.value = '';
   try {
-    await dispatch.sendTurn(project.serverInfo || {}, prompt.value.trim());
+    await dispatch.sendTurn(project.serverInfo || {}, prompt.value.trim(), turnModel.value);
     prompt.value = '';
   } catch (err) {
     error.value = (err && err.message) || String(err);
@@ -182,10 +208,6 @@ function onKeydown(e) {
           <span class="lbl">{{ t('dispatch.workspace') }}</span>
           <input v-model="workspace" class="input mono" :placeholder="t('dispatch.workspace_ph')" />
         </label>
-        <label class="field">
-          <span class="lbl">{{ t('dispatch.model') }}</span>
-          <input v-model="model" class="input mono" :placeholder="t('dispatch.model_ph')" />
-        </label>
         <p v-if="modeHint" class="hint" :class="{ bad: dispatch.mode === 'off' }">{{ modeHint }}</p>
         <p v-if="dispatch.configFile" class="hint mono">
           {{ t('dispatch.config_file', { path: dispatch.configFile }) }}
@@ -260,9 +282,27 @@ function onKeydown(e) {
             <p v-if="modeHint" class="hint" :class="{ bad: dispatch.mode === 'off' }">{{ modeHint }}</p>
             <p v-if="active" class="hint">{{ t('dispatch.active_hint') }}</p>
             <p v-if="error" class="err">{{ error }}</p>
-            <button type="button" class="primary send" :disabled="!canSend" @click="send">
-              {{ t('dispatch.send') }}
-            </button>
+            <div class="send-row">
+              <select
+                v-model="turnModel"
+                class="input model-sel mono"
+                :title="t('dispatch.model')"
+                :aria-label="t('dispatch.model')"
+                data-testid="dispatch-model"
+              >
+                <option value="">{{ t('dispatch.model_default') }}</option>
+                <option v-if="sessionModel && !dispatch.models.includes(sessionModel)" :value="sessionModel">
+                  {{ sessionModel }}
+                </option>
+                <optgroup v-for="g in modelGroups" :key="g.label" :label="g.label">
+                  <option v-for="ref in g.models" :key="ref" :value="ref">{{ ref }}</option>
+                </optgroup>
+              </select>
+              <button type="button" class="primary send" :disabled="!canSend" @click="send">
+                {{ t('dispatch.send') }}
+              </button>
+            </div>
+            <p v-if="dispatch.modelsError" class="hint bad">{{ t('dispatch.models_error') }}</p>
           </div>
         </div>
       </template>
@@ -478,14 +518,27 @@ function onKeydown(e) {
   min-height: 64px;
 }
 .composer-side {
-  width: 240px;
+  width: 320px;
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-.send {
-  align-self: flex-end;
+.send-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
   margin-top: auto;
+}
+.send-row .model-sel {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  padding: 7px 8px;
+  font-size: 12px;
+}
+.send {
+  align-self: center;
+  flex: 0 0 auto;
 }
 .input {
   width: 100%;

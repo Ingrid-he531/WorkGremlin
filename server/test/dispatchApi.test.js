@@ -19,7 +19,7 @@ const os = require('node:os');
 const path = require('node:path');
 const express = require('express');
 
-const { createDispatchService } = require('../src/control/service');
+const { createDispatchService, parseModelList } = require('../src/control/service');
 const { createDispatchRouter, isLoopback } = require('../src/http/routes/dispatch');
 const { readDispatchConfig } = require('../src/control/config');
 
@@ -60,7 +60,13 @@ function makeHarness() {
     broadcast: (_project, _type, payload) => events.push(payload),
     binFor: (floor) => (floor === '8F' ? '/fake/opencode' : null),
     recipeFor: () => ({
-      build: ({ prompt, sessionId }) => ({ args: ['run', prompt, '--session', sessionId] }),
+      build: ({ prompt, sessionId, model }) => ({
+        args: ['run', prompt, '--session', sessionId, ...(model ? ['-m', model] : [])],
+      }),
+    }),
+    fetchModels: async () => ({
+      models: ['opencode-go/deepseek-v4.1-flash', 'opencode/deepseek-v4.1-flash-free'],
+      error: '',
     }),
     runCommand: (arg) =>
       new Promise((resolve) => {
@@ -95,6 +101,18 @@ const post = (url, body) =>
     ok('IPv6 loopback', isLoopback(fake('::1')));
     ok('remote address is not loopback', !isLoopback(fake('10.10.0.5')));
     ok('missing address is not loopback', !isLoopback({ socket: {} }));
+  }
+
+  head('model catalog parsing');
+  {
+    ok(
+      'keeps provider/model refs (variants included)',
+      JSON.stringify(parseModelList('opencode-go/a\nopencode/b#high\n')) ===
+        JSON.stringify(['opencode-go/a', 'opencode/b#high']),
+      JSON.stringify(parseModelList('opencode-go/a\nopencode/b#high\n'))
+    );
+    ok('drops blank lines and CLI banners', parseModelList('\nLoading models…\nnot-a-ref\nx/y\n').join(',') === 'x/y');
+    ok('dedupes repeated refs', parseModelList('a/b\na/b\n').length === 1);
   }
 
   head('server config file');
@@ -132,6 +150,16 @@ const post = (url, body) =>
     ok('the policy is not editable over HTTP', r.data.editable === undefined);
     ok('no sessions yet', r.data.sessions.length === 0);
 
+    // Model catalog for the per-turn picker
+    r = await getJson(`${base}/api/v1/dispatch/models?floor=8F`);
+    ok(
+      'model catalog is exposed for the picker',
+      r.status === 200 && r.data.models.includes('opencode-go/deepseek-v4.1-flash'),
+      JSON.stringify(r.data)
+    );
+    r = await getJson(`${base}/api/v1/dispatch/models?floor=9F`);
+    ok('unknown floor model list -> 400', r.status === 400, `status=${r.status}`);
+
     // Session validation
     r = await getJson(`${base}/api/v1/dispatch/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ floor: '9F', workspacePath: WORKSPACE }) });
     ok('unsupported floor -> 400', r.status === 400, `status=${r.status}`);
@@ -147,7 +175,7 @@ const post = (url, body) =>
     ok('session mints an OpenCode session id', /^ses_wg/.test(session.opencodeSessionId || ''), session.opencodeSessionId);
     ok('session is idle', r.data.session.state === 'idle');
 
-    const send = (prompt) => post(`${base}/api/v1/dispatch/sessions/${session.id}/turns`, { prompt });
+    const send = (prompt, extra) => post(`${base}/api/v1/dispatch/sessions/${session.id}/turns`, { prompt, ...(extra || {}) });
 
     // off mode refuses the turn
     ok('off-mode turn -> 403', (await send('做点小事')).status === 403);
@@ -157,9 +185,10 @@ const post = (url, body) =>
     r = await getJson(`${base}/api/v1/dispatch`);
     ok('config edit is picked up without restart', r.data.mode === 'confirm');
 
-    let res = await send('第一轮');
+    let res = await send('第一轮', { model: 'opencode-go/deepseek-v4.1-flash' });
     const pending = await res.json();
     ok('confirm -> 202 pending', res.status === 202 && pending.turn.state === 'pending');
+    ok('pending turn records the chosen model', pending.turn.model === 'opencode-go/deepseek-v4.1-flash', pending.turn.model);
     ok('one active turn per session (busy)', (await send('插队')).status === 409);
 
     // Detail shows the pending turn
@@ -171,12 +200,17 @@ const post = (url, body) =>
     ok('reject -> rejected', r.data.turn.state === 'rejected');
 
     // Approve -> running, stream output, finish
-    res = await send('第二轮');
+    res = await send('第二轮', { model: 'opencode-go/glm-5.3' });
     const second = await res.json();
     r = await getJson(`${base}/api/v1/dispatch/turns/${second.turn.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approve: true }) });
     ok('approve -> running', r.data.turn.state === 'running');
     ok('the CLI was started once', runs.length === 1);
     ok('continuity passes the same session id', runs[0].arg.args.includes(session.opencodeSessionId));
+    ok(
+      'the approved turn runs with the model chosen when it was sent',
+      runs[0].arg.args.includes('-m') && runs[0].arg.args.includes('opencode-go/glm-5.3'),
+      JSON.stringify(runs[0].arg.args)
+    );
 
     runs[0].arg.onData('hello ');
     runs[0].arg.onData('world');
@@ -191,10 +225,11 @@ const post = (url, body) =>
     ok('streamed output is kept on the turn', doneTurn.output.includes('hello world'), doneTurn.output);
     ok('session title comes from the first prompt', r.data.session.title === '第一轮');
 
-    // Failure keeps the raw error
+    // Failure keeps the raw error; the next turn may omit the model (floor default)
     res = await send('第三轮');
     const third = await res.json();
     await getJson(`${base}/api/v1/dispatch/turns/${third.turn.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approve: true }) });
+    ok('omitting the model passes no -m flag', !runs[1].arg.args.includes('-m'), JSON.stringify(runs[1].arg.args));
     runs[1].resolve({ status: 'failed', exitCode: 1, stdout: '', stderr: 'provider said no' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     r = await getJson(`${base}/api/v1/dispatch/sessions/${session.id}`);
@@ -234,6 +269,21 @@ const post = (url, body) =>
     // A second prompt is allowed once the turn is no longer active
     res = await post(`${base}/api/v1/dispatch/sessions/${session.id}/turns`, { prompt: '第二轮' });
     ok('next turn starts after cancel', res.status === 200);
+    runs[1].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Legacy sessions created with a model keep it as the fallback for turns that omit one.
+    r = await getJson(`${base}/api/v1/dispatch/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ floor: '8F', workspacePath: WORKSPACE, model: 'opencode-go/kimi-k3' }),
+    });
+    res = await post(`${base}/api/v1/dispatch/sessions/${r.data.session.id}/turns`, { prompt: '继承会话模型' });
+    const legacyTurn = await res.json();
+    ok('session-level model is used when a turn omits one', runs[2].arg.args.includes('opencode-go/kimi-k3'), JSON.stringify(runs[2].arg.args));
+    ok('the turn itself reports no explicit model', legacyTurn.turn.model === '', legacyTurn.turn.model);
+    runs[2].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     close();
   }
@@ -250,14 +300,18 @@ const post = (url, body) =>
         readConfig: () => ({ ...config, mode }),
         broadcast: () => {},
         binFor: (floor) => (floor === '8F' ? '/fake/opencode' : null),
-        recipeFor: () => ({ build: ({ sessionId }) => ({ args: ['run', '--session', sessionId] }) }),
+        recipeFor: () => ({
+          build: ({ sessionId, model }) => ({
+            args: ['run', '--session', sessionId, ...(model ? ['-m', model] : [])],
+          }),
+        }),
         runCommand: (arg) => new Promise((resolve) => runs.push({ arg, resolve })),
       });
 
     // First "server process": one completed turn
     const s1 = mk('auto');
     const created = s1.createSession({ floor: '8F', workspacePath: WORKSPACE });
-    s1.sendTurn(created.id, { prompt: '记住我' });
+    s1.sendTurn(created.id, { prompt: '记住我', model: 'opencode-go/deepseek-v4.1-flash' });
     runs[0].arg.onData('持久化输出');
     runs[0].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
     await new Promise((r) => setTimeout(r, 30));
@@ -270,6 +324,7 @@ const post = (url, body) =>
     const detail = s2.getSession(created.id);
     ok('restored the transcript', detail.turns.length === 1 && detail.turns[0].state === 'done');
     ok('restored the output', detail.turns[0].output.includes('持久化输出'), detail.turns[0].output);
+    ok('restored the per-turn model', detail.turns[0].model === 'opencode-go/deepseek-v4.1-flash', detail.turns[0].model);
     ok('restored the OpenCode session id', detail.opencodeSessionId === created.opencodeSessionId);
 
     s2.sendTurn(created.id, { prompt: '继续' });
@@ -277,6 +332,7 @@ const post = (url, body) =>
       'continuing uses the restored OpenCode session',
       runs[1].arg.args.includes(created.opencodeSessionId)
     );
+    ok('a turn without a model keeps the floor default', !runs[1].arg.args.includes('-m'), JSON.stringify(runs[1].arg.args));
     runs[1].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
     await new Promise((r) => setTimeout(r, 30));
     s2.dispose();
