@@ -121,12 +121,12 @@ export interface Project {
 }
 
 export interface Snapshot {
-  /** current project */
+  /** the project this snapshot was requested for (the selected session's project) */
   project: Project | null;
   /** all projects (including the demo project) */
   projects: Project[];
   members: MemberCard[];
-  /** current project display name (package.json name > dir name) */
+  /** that project's display name (package.json name > dir name) */
   projectName?: string;
   recentMessages: Message[];
   serverTime: number;

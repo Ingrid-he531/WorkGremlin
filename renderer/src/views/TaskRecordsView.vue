@@ -1051,7 +1051,7 @@ async function saveRetention() {
             <div class="k">{{ tr('records.detail.client') }}</div><div class="v">{{ tasks.selectedTask.client_label }}</div>
             <div class="k">{{ tr('records.detail.model') }}</div><div class="v">{{ tasks.selectedTask.model || '—' }}</div>
             <!-- Project: the project this round belongs to. The server computes it from the project **directory** on the fly
-                 (package.json name > directory name, the same semantics as "open project", see project_label in /task-runs);
+                 (package.json name > directory name, the same semantics as resolveProjectName, see project_label in /task-runs);
                  only when the directory is unavailable does it fall back to projects.name in the DB (which may carry a
                  same-name conflict suffix like stb-dashboard-2), then to project_id, and only then a placeholder — never invented -->
             <div class="k">{{ tr('records.detail.project') }}</div>

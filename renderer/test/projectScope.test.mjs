@@ -15,7 +15,7 @@
  *
  * 跑法：`npm run test:project-scope`
  */
-const { memberBelongsToProject } = await import('../src/lib/projectScope.js');
+const { memberBelongsToProject, sameWorkspacePath } = await import('../src/lib/projectScope.js');
 
 let pass = 0;
 let fail = 0;
@@ -53,6 +53,13 @@ console.log('\n[3] 与场景里的过滤是两条独立的轴');
 const { floorAcceptsClient } = await import('../src/lib/clientMatch.js');
 ok('演示成员的 client 为 NULL → 楼层过滤放行（所以挡不住，得靠工程过滤）', floorAcceptsClient('codex', null));
 ok('工程过滤把它拦下', !memberBelongsToProject({ project: '__demo__', client: null }, 'realproj'));
+
+console.log('\n[4] 会话按 workspacePath 匹配项目');
+ok('同一路径 → 匹配', sameWorkspacePath('/home/me/proj', '/home/me/proj'));
+ok('尾斜杠不影响', sameWorkspacePath('/home/me/proj/', '/home/me/proj'));
+ok('Windows 分隔符不影响', sameWorkspacePath('C:\\work\\proj', 'C:/work/proj'));
+ok('不同路径 → 不匹配', !sameWorkspacePath('/home/me/proj', '/home/me/other'));
+ok('空路径不匹配空路径', !sameWorkspacePath('', ''));
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

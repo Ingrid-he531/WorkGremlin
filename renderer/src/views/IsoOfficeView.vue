@@ -430,7 +430,7 @@ watch(
     const doneAt = Math.max(Number(sel && sel.doneAt) || 0, fastDoneAt);
     // Session switched (or first time): switch the console straight to this session's current state, reset the done marker, no "task done" pop.
     // The office's workstation gremlins also follow the selected session: switching to another project's session switches to that project's member list,
-    // so the whole "main Agent + gremlins" group follows the one selected in the dropdown, no longer stuck on the previously opened project.
+    // so the whole "main Agent + gremlins" group follows the one selected in the dropdown, no longer stuck on the previous project.
     if (selId !== lastConsoleSessionId) {
       lastConsoleSessionId = selId;
       lastDoneAt = doneAt;
@@ -447,11 +447,6 @@ watch(
         return;
       }
       mainAgent.applySession(v);
-      // A real session can switch the viewed project. The virtual demo session has no
-      // projectPath, so demo mode never triggers this path.
-      if (sel && sel.projectPath && sel.projectPath !== project.workspacePath) {
-        project.openWorkspace(sel.projectPath);
-      }
       return;
     }
     // Waiting on wrap-up (the office is still playing this round's summon / report):
@@ -577,7 +572,7 @@ let cardRaf = 0;
 /**
  * Scene actors: experts (with a workstation) + ephemeral members (ghosts, floating).
  *
- * When the selected session is not "the one running in the current project" (another project's session / only fossil data left),
+ * When the selected session is not "the one running in the viewed project" (another project's session / only fossil data left),
  * this member list does not match that session. The actors then fall back to idle, never using project A's people
  * to impersonate project B's state. The office layout is unaffected.
  */

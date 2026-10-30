@@ -77,9 +77,9 @@ function createHub({ server, token, bus, repo }) {
         case CLIENT_EVENTS.HELLO:
           conn.project = msg.project || conn.project;
           conn.filters = msg.filters || conn.filters;
-          // Send a snapshot even when no project is specified (buildSnapshot(null) uses the team
-          // of "the currently open project"). Otherwise the client receives no frame after
-          // connecting and has to wait for a later status broadcast.
+          // Send a snapshot even when no project is specified (buildSnapshot(null) uses the server's
+          // default workspace fallback). Otherwise the client receives no frame after connecting
+          // and has to wait for a later status broadcast.
           send(conn, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(conn.project));
           break;
         case CLIENT_EVENTS.SUBSCRIBE:

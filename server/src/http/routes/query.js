@@ -40,7 +40,7 @@ function projectFilter(raw) {
 
 /**
  * Project directory → display name (`package.json name > directory name`, the same criterion as
- * resolveProjectName in `server/src/project.js` used by "open project").
+ * resolveProjectName in `server/src/project.js`).
  *
  * Why compute it live from the directory instead of using projects.name directly: when two
  * directories share a name, the office appends a collision suffix to the new project's id / name
@@ -243,7 +243,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
       session_title: resolveSessionTitle(r.session_id, r.client) || firstPrompts.get(String(r.session_id || '').trim()) || '',
       /**
        * The name shown in the "project" field of task details: computed live from the project
-       * **directory** (`package.json name > directory name`, same criterion as "open project"), and
+       * **directory** (`package.json name > directory name`, the same criterion as resolveProjectName), and
        * only falls back to projects.name from the DB when the directory is missing / the name cannot
        * be read.
        * Why not projects.name: with two directories sharing a name the office appends a collision

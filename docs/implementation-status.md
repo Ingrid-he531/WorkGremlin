@@ -44,8 +44,7 @@ server/                  Express + ws + better-sqlite3; embeddable in Electron o
   src/ingest/hookCommon.js      shared hook-event semantics: registration, tasks, file activity,
                                 tool usage, ghost lifecycle, blocked / clear-blocked
   src/ingest/hookDispatch.js    raw hook event → the owning floor's handleHookEvent
-  src/project.js         project name resolution (package.json name > directory name)
-  src/workspace.js       "open project": switch + persist workspaces.json + recent 8
+  src/project.js         project name resolution + server default workspace fallback
   src/products.js        floors = monitored products (install location + on-disk detection)
   src/floors.js          floor registry + generic session/disk readers + per-floor dispatch
   src/sessions.js        structured on-disk plugin parsing (genie-history / todos / message-queue /
@@ -125,10 +124,10 @@ heartbeat-based or elapsed-time normalization, and `blocked` is not a task state
 - File counts, token counts, model names, and durations stay `NULL` when the floor cannot provide them; the UI shows "—".
 - A session's activity phase may be inferred from file mtimes (for example `IDLE_MS = 10 min` in `server/src/floors.js`), and the UI greys it as inferred. That is a **session phase**, not a workstation state.
 
-### 2.3 Report ownership follows `workspacePath`, not the office's open project
+### 2.3 Report ownership follows `workspacePath`, not a default project
 
-Fixed on 2026-09-29. The hook used to take `workspacePath` from `/api/v1/workspace` (the project open in the
-office) and the server used `body.project` as the destination, so "office is showing A while I run the CLI in B"
+Fixed on 2026-09-29. The hook used to take `workspacePath` from `/api/v1/workspace` (the server's default
+workspace) and the server used `body.project` as the destination, so "default is A while I run the CLI in B"
 recorded the task / member / file activity under A. Now `resolveCtx` always reports `REAL_WS` (the cwd where the
 agent started the hook), and `projectFirst` in `server/src/http/routes/ingest.js` calls
 `bus.projectForReport()` to resolve the project **by `workspacePath`**: match `projects.workspace_path`, otherwise
@@ -814,7 +813,7 @@ The former seeded-project demo had five frontend special cases (all removed with
 > script never started.
 
 **Only user-level gremlins remain in the demo project** (2026-09-21): `createAgentRoster`'s `getWorkspacePath` no
-longer falls back to "the project resolved at server start" and only accepts the current project path. The demo
+longer falls back to "the project resolved at server start" and only accepts the server default workspace path. The demo
 project has no directory (`workspacePath === ''`), so `listDefinedAgents('')` lists only user-level agents
 (`~/.codebuddy/agents`, `$CODEX_HOME/agents`). Project-level gremlins (`<project>/.codebuddy/agents`, such as this
 repo's leo / susan) are therefore removed from the demo project by `sync()` and re-added when switching back;

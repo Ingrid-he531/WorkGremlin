@@ -7,7 +7,7 @@
  *   2. installs the virtual session into the ordinary sessions table (so the dropdown, floor
  *      filtering, member cards and sprites behave exactly like a real session);
  *   3. keeps the live demo snapshot / members in its own state. The real project store is **not**
- *      overwritten: task records, the project selector and the conversation log keep reading real
+ *      overwritten: task records and the conversation log keep reading real
  *      data while the office / workstation views opt into `demo.members`;
  *   4. restores the previous real session when demo mode exits.
  *

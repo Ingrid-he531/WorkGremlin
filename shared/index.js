@@ -239,18 +239,18 @@ const WS_EVENTS = Object.freeze({
   ARTIFACT_NEW: 'artifact.new',
   CONNECTION: 'connection',
   ERROR: 'error',
-  /** Global active-session table changed (open/close project·session): the server pushes on change, the client refreshes immediately */
+  /** Global active-session table changed (session opened/closed): the server pushes on change, the client refreshes immediately */
   SESSIONS: 'sessions',
   /**
    * Council incremental update (a council's status / someone's utterance / this round's votes / the closing conclusion).
-   * The council is unrelated to "current project" / "current floor" (it is an independently launched meeting), so
+   * The council is unrelated to any office project or floor (it is an independently launched meeting), so
    * project is null on broadcast. The payload is an **increment**; the client places it by councilId, see
    * server/src/council/orchestrator.js.
    */
   COUNCIL: 'council.update',
   /**
    * Remote dispatch (reverse control): a request was created / changed state, or the server-side
-   * setting changed. Not tied to the current project, so it is broadcast with project=null.
+   * setting changed. Not tied to an office project, so it is broadcast with project=null.
    */
   DISPATCH: 'dispatch.update',
 });
@@ -425,7 +425,6 @@ function avatarOf(name) {
 const IPC_EVENTS = Object.freeze({
   GET_SERVER_INFO: 'workgremlin:get-server-info',
   GET_APP_VERSION: 'workgremlin:get-app-version',
-  CHOOSE_WORKSPACE: 'workgremlin:choose-workspace',
   SET_FULL_SCREEN: 'workgremlin:set-full-screen',
   IS_FULL_SCREEN: 'workgremlin:is-full-screen',
   FOCUS_WINDOW: 'workgremlin:focus-window',

@@ -1,30 +1,22 @@
 'use strict';
 
 /**
- * Project (workspace) identity resolution + project management ("open project").
+ * Project identity resolution + the server's **default workspace fallback**.
  *
- * This file merges the former src/project.js (project name resolution) and src/workspace.js
- * (open/switch project management).
+ * There is no user-facing "open project" state. A client shows the office of the project carried
+ * by the session it selected; project is only an ownership key for members/tasks/messages and the
+ * filter the office applies to gremlins.
  *
- * Project name resolution: the top connection bar shows "which project is being watched now",
- * and the name is taken by priority:
- *   1. WORKGREMLIN_WORKSPACE / the directory given as a parameter
- *   2. otherwise process.cwd()
- * The name itself: <dir>/package.json's name (scope stripped) > the directory name > empty string.
+ * The server still needs one default directory for:
+ *   1. legacy reports that omit `workspacePath` (attribution fallback);
+ *   2. the floor poller / resident subagent scan;
+ *   3. startup logging and `server.json`.
  *
- * When it cannot be resolved it is the empty string —— the UI falls back to the original hint
- * and never fabricates a project name that merely "looks right".
+ * Project name resolution: the default workspace resolves to package.json's name (scope stripped)
+ * > the directory name > empty. The name is not displayed as a global selection in the UI.
  *
- * Project management: one workspace = one project: opening a project shows that project's members
- * in the office (including its subagent ghosts). The choice is persisted to
- * ~/.workgremlin/workspaces.json and restored on restart.
- *
- * Demo mode is deliberately **not** a workspace: it is an in-memory virtual session (see
- * server/src/demo/provider.js), so opening / restoring a real project never touches demo rows.
- *
- * Why open manually: the office (members / gremlins / ghosts) aggregates **by project**, so you see
- * whichever project is open. Subagent ghosts now write straight to the DB (an ephemeral member +
- * a subagent_run) attributed to their own project / session, so the view still follows the open project.
+ * Project management: one workspace = one project row. The same directory always maps to the same
+ * project; opening a different default never rewrites other projects' data.
  */
 
 const fs = require('node:fs');
@@ -71,7 +63,7 @@ function resolveProjectName(workspacePath) {
   return base && base !== path.sep ? base : '';
 }
 
-/* ============================ Project management ============================ */
+/* ==================== Default workspace (server fallback) ==================== */
 
 function storePath() {
   return workspacesPath();
@@ -117,10 +109,21 @@ function expand(p) {
 }
 
 /**
+ * Server-side **default workspace** (not a user-facing project selection).
+ *
+ * The office does not follow this value: each client derives the shown project from the session it
+ * has selected (GET /api/v1/snapshot?project=<id|path>). The server keeps one default workspace only
+ * as a fallback for:
+ *   · legacy reports that carry no `workspacePath` (attribution);
+ *   · the floor poller / resident subagent scan, which needs one directory to read;
+ *   · startup logging and `server.json`.
+ *
+ * `setDefault` exists for explicit API callers and tests; the UI never calls it.
+ *
  * @param {{repo: any, bus: any, initial?: {workspacePath?: string, projectName?: string},
  *          broadcast?: (project: string|null, type: string, payload: unknown) => void}} opts
  */
-function createWorkspaceManager(opts) {
+function createWorkspaceContext(opts) {
   const repo = opts.repo;
   const bus = opts.bus;
   const initial = opts.initial || {};
@@ -132,19 +135,14 @@ function createWorkspaceManager(opts) {
     projectName: initial.projectName || '',
     project: null,
   };
-  let recent = [];
-  /** Callback after a project switch (index.js uses it to restart subagent manifest watching) */
+  /** Callback after the default changes (index.js uses it to restart subagent manifest watching) */
   let onSwitch = null;
 
   function persist() {
-    writeStore({ current: { ...current, openedAt: Date.now() }, recent });
+    writeStore({ default: { ...current, savedAt: Date.now() } });
   }
 
-  function pushRecent(entry) {
-    recent = [entry, ...recent.filter((r) => r.path !== entry.path)].slice(0, 8);
-  }
-
-  /** Apply the switch: update bus context -> persist -> notify -> broadcast the new snapshot */
+  /** Apply the default: update bus fallback context -> persist -> notify -> broadcast a snapshot. */
   function apply() {
     bus.setContext({ projectName: current.projectName, project: current.project, workspacePath: current.workspacePath });
     persist();
@@ -153,8 +151,8 @@ function createWorkspaceManager(opts) {
     return { ...current };
   }
 
-  /** Open a project directory; throws if the directory does not exist or is not a directory (no guessing, no creating) */
-  function open(rawPath) {
+  /** Set the default workspace; throws if the directory does not exist (no guessing, no creating). */
+  function setDefault(rawPath) {
     const abs = expand(rawPath);
     if (!abs) throw new Error('empty path');
     let st = null;
@@ -180,57 +178,42 @@ function createWorkspaceManager(opts) {
       row = repo.getProject.get(id);
     }
     current = { workspacePath: abs, projectName, project: row.id };
-    pushRecent({ path: abs, projectName, project: row.id, openedAt: Date.now() });
     return apply();
   }
 
-  /**
-   * Fallback: actually open() "the project resolved at startup" (cwd / --workspace) once.
-   *
-   * Key point: it must go through open() —— that settles current.project into the project this
-   * directory maps to and hands it to bus via setContext. The old code did `return {...current}`
-   * right in the fallback branch, leaving project null; and buildSnapshot falls back to
-   * projects[0] when it has no project (which may be exactly the demo / a polluted project), so
-   * the office shows the wrong members and does not track the current session. If the directory
-   * is missing or there is no path, return as-is (there really is no "current project" then).
-   */
-  function openInitial() {
+  /** Establish the startup default (cwd / --workspace). */
+  function setInitial() {
     if (initial.workspacePath) {
       try {
-        return open(initial.workspacePath);
+        return setDefault(initial.workspacePath);
       } catch {
-        /* directory gone / not a directory: keep the current state */
+        /* directory gone / not a directory: keep the initial value */
       }
     }
     return { ...current };
   }
 
   /**
-   * Restore the last opened project at startup; if that directory is gone, fall back to the
-   * project resolved at startup (cwd / --workspace).
-   *
-   * Demo is never restored: it is ephemeral by design (the provider state disappears with the
-   * server / page). Older stores may still say `demo: true`; ignore that and fall back to the
-   * project resolved at startup.
+   * Restore the default saved by the previous run; if that directory is gone, fall back to the
+   * startup default. This is persistence of a fallback, not a "last opened project" feature.
    */
   function restore() {
     const store = readStore();
-    if (store) recent = Array.isArray(store.recent) ? store.recent : [];
-    const saved = store && store.current;
-    if (!saved || saved.demo) return openInitial();
+    // New files use `default`; older ones wrote `current`. Read both.
+    const saved = store && (store.default || store.current);
+    if (!saved || saved.demo) return setInitial();
     try {
       const savedPath = saved.workspacePath || saved.path;
-      if (savedPath) return open(savedPath);
+      if (savedPath) return setDefault(savedPath);
     } catch {
-      /* directory gone / machine changed: fall back to the default */
+      /* directory gone / machine changed: fall back to the startup default */
     }
-    return openInitial();
+    return setInitial();
   }
 
   return {
-    current: () => ({ ...current }),
-    recent: () => recent.slice(),
-    open,
+    get: () => ({ ...current }),
+    setDefault,
     restore,
     setOnSwitch: (fn) => {
       onSwitch = fn;
@@ -238,4 +221,12 @@ function createWorkspaceManager(opts) {
   };
 }
 
-module.exports = { readPackageName, resolveWorkspacePath, resolveProjectName, createWorkspaceManager, storePath, slug, expand };
+module.exports = {
+  readPackageName,
+  resolveWorkspacePath,
+  resolveProjectName,
+  createWorkspaceContext,
+  storePath,
+  slug,
+  expand,
+};

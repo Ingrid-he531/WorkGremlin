@@ -88,7 +88,7 @@ function dbPath() {
   return path.join(home(), 'workgremlin.db');
 }
 
-/** Project list: `~/.workgremlin/workspaces.json` */
+/** Server default workspace fallback: `~/.workgremlin/workspaces.json` (not a UI project list) */
 function workspacesPath() {
   return path.join(home(), 'workspaces.json');
 }

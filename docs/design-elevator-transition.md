@@ -28,8 +28,9 @@
                                                        this.floorEmpty    = !this.selectedId
   ↓
   连锁反应（同步 / 异步混杂）
-    · App.vue      watch(floorEmpty → projectName)  →  msgs.setSnapshot([]) 或 refreshMessages()  ← 唯一的网络请求
-    · IsoOfficeView.vue  watch(sessions.selected)   →  mainAgent.applySession / project.openWorkspace(sel.projectPath)
+    · App.vue      watch(projectId)  →  msgs.setSnapshot([]) 或 refreshMessages()  ← 唯一的网络请求
+    · sessions.js  select()          →  project.followSession(sel)  ← 只在本机加载该会话的工程成员
+    · IsoOfficeView.vue  watch(sessions.selected)   →  mainAgent.applySession
     · IsoOfficeView.vue  watch(sceneMembers)        →  office.setMembers(v)（Canvas 重画）
     · IsoOfficeView.vue  floorLabel computed         →  左上角「3F · xxx」标签
 ```

@@ -276,7 +276,7 @@ const descCache = new Map(); // file path -> { mtimeMs, size, value }
  * when unavailable —— the render layer hides that field accordingly, instead of substituting state
  * phrasing like "project subagent · idle".
  * @param {string} name subagent name (the member name, e.g. leo)
- * @param {string} workspacePath current project path (project-level agents are looked for here)
+ * @param {string} workspacePath project path (project-level agents are looked for here)
  * @param {Array<{dir:string, level:'project'|'user'}>} dirs candidate directories (order is priority)
  */
 function descriptionInDirs(name, workspacePath, dirs) {

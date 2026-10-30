@@ -1,14 +1,14 @@
 import { defineStore } from 'pinia';
-import { getServerInfo, getWorkspace, openWorkspace, wsUrl, httpBase } from '../api/bridge';
+import { getServerInfo, getWorkspace, wsUrl, httpBase } from '../api/bridge';
 import { createConnection } from '../api/ws';
 import { WS_EVENTS } from '@workgremlin/shared';
-import { memberBelongsToProject } from '../lib/projectScope';
+import { memberBelongsToProject, sameWorkspacePath } from '../lib/projectScope';
 import { normalizeState } from '../lib/memberTask';
 
 /** Fallback reconcile interval: WS increment events (especially member.remove) are one-shot, so a missed one stays stale forever; this heals it */
 const RECONCILE_MS = 15_000;
 
-/** Workstation view + connection state (current project's members / ghosts / connection) */
+/** Office view + connection state (the selected session's project members / ghosts / WS) */
 export const useProjectStore = defineStore('project', {
   state: () => ({
     /** All real projects (the virtual demo project lives in stores/demo.js, not here) */
@@ -26,11 +26,11 @@ export const useProjectStore = defineStore('project', {
     projectName: '',
     /** Current real project root directory */
     workspacePath: '',
-    /** Recently opened projects */
-    recent: [],
     connection: { state: 'connecting', source: 'ws' },
     serverInfo: null,
     _conn: null,
+    /** Project already requested from the WS; avoids re-subscribing on every 5s session poll */
+    _subscribedProjectId: '',
     _reconcileTimer: null,
   }),
 
@@ -81,7 +81,10 @@ export const useProjectStore = defineStore('project', {
           // return the current state, so there is no need to wait for the next incremental push
           // before seeing members/gremlins (HELLO also returns a snapshot; this is an explicit extra pull).
           // Must be sent after HELLO —— the order is guaranteed by api/ws.js's open callback, and jumping ahead of HELLO gets kicked by the server as a bad token.
-          if (st && st.state === 'open' && this._conn) this._conn.subscribe({});
+          if (st && st.state === 'open' && this._conn) {
+            this._subscribedProjectId = this.projectId ? String(this.projectId) : '';
+            this._conn.subscribe({}, this.projectId || undefined);
+          }
         },
       });
 
@@ -125,7 +128,10 @@ export const useProjectStore = defineStore('project', {
     async reconcile() {
       try {
         const info = this.serverInfo || {};
-        const res = await fetch(`${httpBase(info)}/api/v1/snapshot`, {
+        // Reconcile the project the office is actually showing (the selected session's project), not
+        // the server's default workspace.
+        const q = this.projectId ? `?project=${encodeURIComponent(this.projectId)}` : '';
+        const res = await fetch(`${httpBase(info)}/api/v1/snapshot${q}`, {
           headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
         });
         if (!res.ok) return;
@@ -141,11 +147,23 @@ export const useProjectStore = defineStore('project', {
       this._reconcileTimer = null;
     },
 
-    applySnapshot(snapshot) {
+    applySnapshot(snapshot, opts = {}) {
+      if (!snapshot) return;
+      // A global workspace switch (another client, an explicit API call) must not steal the project
+      // this client is showing: project follows the selected session. Keep the project list fresh,
+      // but leave members/messages alone unless the snapshot is for the viewed project.
+      if (
+        !opts.force &&
+        this.projectId &&
+        (!snapshot.project || String(snapshot.project.id) !== String(this.projectId))
+      ) {
+        this.projects = snapshot.projects || this.projects;
+        return;
+      }
       this.project = snapshot.project;
       if (snapshot.project && snapshot.project.id) this.projectId = String(snapshot.project.id);
       this.projects = snapshot.projects || [];
-      // The snapshot is already sliced by current project; filtering again here is just defensive (server swapped / an old snapshot slipped in)
+      // The snapshot is already sliced by the viewed project; filtering again here is just defensive (server swapped / an old snapshot slipped in)
       this.members = (snapshot.members || []).filter((m) => memberBelongsToProject(m, this.projectId));
       if (snapshot.projectName) this.projectName = snapshot.projectName;
       // Keep the real workspace path in sync: the next project open uses it.
@@ -176,7 +194,6 @@ export const useProjectStore = defineStore('project', {
       if (!ws) return;
       this.projectName = ws.projectName || '';
       this.workspacePath = ws.workspacePath || '';
-      this.recent = Array.isArray(ws.recent) ? ws.recent : [];
       // Switching projects must immediately clear the previous project's people from the room: the server's new snapshot arrives **asynchronously** (broadcast within the same request),
       // and without filtering first the previous project's members keep standing at their workstations during that stretch.
       // When the new project id is unavailable (old server / response missing the field), don't swap projectId and don't filter, keep things as they are.
@@ -187,20 +204,59 @@ export const useProjectStore = defineStore('project', {
     },
 
     /**
-     * Open a real project: the room's members/ghosts all switch to this project.
-     * The server broadcasts the new snapshot, so there is no need to pull it here.
-     * @param {string} path
+     * Show the office of one selected session's project **locally**.
+     *
+     * Project is not a user-managed, server-global state: the session already carries its
+     * workspace path, so this only loads that project's members/messages into this client. It must
+     * never call POST /api/v1/workspace — that would switch every other connected client too.
+     *
+     * @param {{projectPath?: string}|null} session
+     * @returns {Promise<boolean>} whether a concrete project was found and applied
      */
-    async openWorkspace(path) {
-      const cur = await openWorkspace(this.serverInfo || {}, path);
-      this.applyWorkspace(cur);
-      return cur;
+    async followSession(session) {
+      const projectPath = String((session && session.projectPath) || '').trim();
+      if (!projectPath) return false;
+      const target = this.projects.find((p) => sameWorkspacePath(p.workspacePath, projectPath));
+      if (target && String(this.projectId) === String(target.id)) {
+        this.subscribeProject(target.id);
+        return true;
+      }
+      // Unknown to the local list (a project without a row yet): let the server resolve the path.
+      return this.loadProject(target ? target.id : projectPath);
+    },
+
+    /** Load one project's snapshot into this client only; no server-side workspace switch. */
+    async loadProject(projectIdOrPath) {
+      const key = String(projectIdOrPath || '').trim();
+      if (!key) return false;
+      const info = this.serverInfo || {};
+      try {
+        const res = await fetch(`${httpBase(info)}/api/v1/snapshot?project=${encodeURIComponent(key)}`, {
+          headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
+        });
+        const data = await res.json();
+        if (!res.ok || !data || !data.ok || !data.snapshot || !data.snapshot.project) return false;
+        this.applySnapshot(data.snapshot, { force: true });
+        this.subscribeProject(data.snapshot.project.id);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    /** Scope live member events to the project the office is showing. */
+    subscribeProject(projectId) {
+      const id = projectId ? String(projectId) : '';
+      if (this._subscribedProjectId === id) return;
+      this._subscribedProjectId = id;
+      if (this._conn) this._conn.subscribe({}, id || undefined);
     },
 
     dispose() {
       this.stopReconcile();
       if (this._conn) this._conn.close();
       this._conn = null;
+      this._subscribedProjectId = '';
     },
   },
 });

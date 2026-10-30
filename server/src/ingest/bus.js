@@ -189,7 +189,7 @@ function enrichFiles(ws, reportedFiles) {
  * @param {{ repo: any, hub: any, projectName?: string, project?: string|null }} ctx
  */
 function createIngestBus({ repo, hub, projectName = '', project = null }) {
-  /** Things that change with the "opened project": current project name + project path + current project (whose workstation the room shows) */
+  /** Server-side **default workspace fallback** (legacy attribution / polling), not a UI project selection. */
   const context = { projectName, project: project || null, workspacePath: '' };
   /** memberId -> 'user' | 'project': decided once at registration from the subagent directory */
   const levels = new Map();
@@ -238,19 +238,18 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   /**
    * Which **project** (id) this report should land under.
    *
-   * The `project` in the report historically took the project the office **currently has open**
-   * (the hook's resolveCtx reads it from `/api/v1/workspace`), while `workspacePath` is the directory
-   * the reporter **is actually in**. When "the office has A open but I'm running the CLI in B" the two
-   * disagree: the task gets attributed to A.
+   * The `project` in older reports was the server's default workspace name (historically called the
+   * "open project"), while `workspacePath` is the directory the reporter **is actually in**. When
+   * those disagree, the task must belong to the real directory, not the default.
    * Measured 2026-09-29: a codex task run in /home/yinghui/work/stb-insight showed up in the task list
    * under workgremlin (the project name of that session in the office view was correct -- sessions follow the rollout's cwd).
    *
    * So **workspacePath wins**:
-   *   1) an existing project is found by this path -> use its id (same row as the office's "open project");
+   *   1) an existing project is found by this path -> use its id;
    *   2) not found -> derive a name from this directory (package.json name > directory name, same rule as server/src/project.js)
    *      and create one;
    *   3) no workspacePath given (old reports / hand-written scripts) -> fall back to the `project` field, behavior unchanged.
-   * @param {string} reportedProject the project in the report (office's current project name, fallback only)
+   * @param {string} reportedProject fallback project name (legacy reports only)
    * @param {string} workspacePath the directory the reporter is actually in
    * @returns {string} project id (empty string = neither side given it, the caller treats it as missing project)
    */
@@ -1305,7 +1304,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * The task id currently being run by the **main agent** (role='agent') in the current project.
+   * The task id currently being run by the **main agent** (role='agent') in the given project.
    * Used as a fallback to identify the parent when the summon relationship is unavailable (old hooks write lists with no parent field).
    * @param {string} project
    */
@@ -1646,7 +1645,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       projectLabel: m.project_label ?? null,
       // The project id it belongs to: the client uses it to keep "member cards of other projects" out.
       // The renderer filters member cards by this project id so broadcasts from other projects cannot
-      // leak into the currently open room.
+      // leak into the room this client is viewing.
       project: m.project_id,
       // Source client: the office filters by floor accordingly (NULL = unknown, shown on every floor)
       client: m.client || null,
@@ -1699,8 +1698,9 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * Switch the current project / team (see server/src/workspace.js).
-   * @param {{project?: string, project?: string|null}} next
+   * Set the server-side default workspace fallback (attribution / polling). This is not a UI
+   * project switch: clients show the project of their selected session.
+   * @param {{projectName?: string, project?: string|null, workspacePath?: string}} next
    */
   function setContext(next = {}) {
     if (typeof next.projectName === 'string') context.projectName = next.projectName;
@@ -1729,19 +1729,34 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
-   * The first-screen snapshot. When no project is specified, use the team of the "currently open project".
+   * The first-screen snapshot for one project. A client passes the project of its selected session
+   * (id or workspace path); when omitted, use the server's default workspace fallback.
    *
    * Note: **never fall back to projects[0]**. projects is ordered by creation time descending, so the first entry
-   * may be demo data or a polluted project; using it as "current" would make the office show the wrong members
-   * (even with demo residue from hours ago). When the matching project isn't found, match once more by the current
-   * project path; if still not found, return an empty member list and let the client explicitly switch to the correct
-   * project (POST /api/v1/workspace).
+   * may be demo data or a polluted project. When an explicitly requested project isn't found, return
+   * an empty member list instead of silently showing a different project.
    */
   function buildSnapshot(projectId) {
     const projects = listProjectSummaries();
     const want = projectId || context.project;
     let projectRow = want ? projects.find((t) => t.id === projectIdOf(want)) : null;
-    if (!projectRow && context.workspacePath) {
+    // A caller may pass the workspace path instead of the project id (the renderer follows the
+    // selected session's projectPath). Resolve that against the project rows as well.
+    if (!projectRow && want) {
+      let wantPath = '';
+      try {
+        wantPath = path.resolve(String(want));
+      } catch {
+        wantPath = '';
+      }
+      if (wantPath) {
+        projectRow =
+          projects.find((t) => t.workspacePath && path.resolve(t.workspacePath) === wantPath) || null;
+      }
+    }
+    // Only fall back to the server's default workspace when the caller did not ask for a specific
+    // project — otherwise a requested project that has no row yet would silently show another.
+    if (!projectRow && !projectId && context.workspacePath) {
       const ws = path.resolve(context.workspacePath);
       projectRow = projects.find((t) => t.workspacePath && path.resolve(t.workspacePath) === ws) || null;
     }
@@ -1765,7 +1780,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       project: projectRow,
       projects,
       members,
-      projectName: context.projectName,
+      projectName: projectRow.projectName || context.projectName,
       recentMessages,
       serverTime: now(),
       serverVersion: '0.1.0',

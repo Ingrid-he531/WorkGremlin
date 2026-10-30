@@ -52,15 +52,14 @@ function floorForClient(client) {
 
 /**
  * Sessions: the global active session table (grouped by floor).
- * The data source is each agent's own on-disk data and has nothing to do with the currently open
- * project —— the entry point for changing project is /api/v1/workspace; this only "lists / picks
- * which session".
+ * The data source is each agent's own on-disk data. `workspacePath` here is only the server's
+ * default fallback (legacy attribution / the floor poller); it is not a UI-selected project.
  */
 function createSessionsRouter({ workspace }) {
   const router = express.Router();
 
   router.get('/sessions', (req, res) => {
-    const cur = workspace && workspace.current ? workspace.current() : {};
+    const cur = workspace && workspace.get ? workspace.get() : {};
     res.json(
       snapshotSafe({
         workspacePath: cur.workspacePath || '',
@@ -73,7 +72,7 @@ function createSessionsRouter({ workspace }) {
   // mapped to UI fields); the render layer pulls it every 1.5s, fresher than /sessions' 10s polling,
   // and dedicated to showing the main Agent console's "action" in real time.
   router.get('/reporter-phase', (req, res) => {
-    const cur = workspace && workspace.current ? workspace.current() : {};
+    const cur = workspace && workspace.get ? workspace.get() : {};
     // Client identity is always the bare floor base name. Resolve it through agentBase() so a member-style
     // id can never accidentally become a separate phase identity.
     const client = agentBase(req.query.client || '');

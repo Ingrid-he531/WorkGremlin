@@ -18,7 +18,7 @@ const log = require('./log');
 const { openDatabase } = require('./db');
 const { createIngestBus } = require('./ingest/bus');
 const { createAgentRoster } = require('./ingest/agentRoster');
-const { resolveWorkspacePath, resolveProjectName, createWorkspaceManager } = require('./project');
+const { resolveWorkspacePath, resolveProjectName, createWorkspaceContext } = require('./project');
 const { createHub } = require('./ws/hub');
 const { createHealthRouter } = require('./http/routes/health');
 const { createQueryRouter } = require('./http/routes/query');
@@ -98,9 +98,9 @@ function isLoopbackOrigin(origin) {
 /**
  * Server lifecycle hooks: a tiny registry that replaces the hand-written chaining in start()/close()
  * with explicit registration, run in registration order.
- *   - onWorkspaceSwitch: fires after every real project switch (restore / manual switch go through
- *     workspace.setOnSwitch -> afterWorkspaceSwitch; demo is a virtual session and never switches
- *     the workspace)
+ *   - onWorkspaceSwitch: fires after the server default workspace changes (startup restore / an
+ *     explicit POST /api/v1/workspace; the UI does not switch it). Demo is a virtual session and
+ *     never changes the default.
  *   - onClose: fires before the server closes (for resources other than timers)
  * An error inside a hook must not block the other hooks, hence the one-by-one try/catch.
  */
@@ -230,8 +230,12 @@ function createServer(opts = {}) {
   app.use('/api/v1', requireToken(token), createQueryRouter({ bus, repo }));
   app.use('/api/v1', requireToken(token), createIngestRouter({ bus, repo }));
 
-  /** Project ("open project"): one workspace = one project, switching changes which members show in the room */
-  const workspace = createWorkspaceManager({
+  /**
+   * Server-side default workspace. It is **not** what the office shows: each client follows the
+   * project of its selected session. This value only backs legacy attribution (reports without a
+   * workspacePath), the floor poller and the resident subagent scan.
+   */
+  const workspace = createWorkspaceContext({
     repo,
     bus,
     initial: { workspacePath, projectName },
@@ -252,7 +256,7 @@ function createServer(opts = {}) {
    * Participants run inside a throwaway temp directory with all tools disabled and write only to the
    * council's own tables —— they touch no monitored session and no workspace, so they do not appear
    * in the office or in task records. Broadcasts carry project=null: a meeting has nothing to do with
-   * "the current project".
+   * the office's selected project.
    */
   const orchestrator = createCouncilOrchestrator({
     repo,
@@ -352,7 +356,8 @@ function createServer(opts = {}) {
 
     for (const t of timers) if (t.unref) t.unref();
 
-    // Restore the last opened project (fall back to the one resolved from cwd / --workspace)
+    // Restore the server-side default workspace (cwd / --workspace is the fallback). This does
+    // not select a project for the UI; clients still follow their selected session.
     const restored = workspace.restore();
     if (info) {
       info.projectName = restored.projectName;
@@ -361,15 +366,12 @@ function createServer(opts = {}) {
     }
 
     // Resident gremlin roster: register defined subagents (project-level + user-level) as gremlins
-    // that sit at workstations wearing badges.
+    // that sit at workstations wearing badges. The roster uses the server default workspace, not a
+    // client-selected project; the office then filters cards by the selected session's project.
     agentRoster = createAgentRoster({
       bus,
-      // Gremlins follow the project of "the currently open project", so switching real projects
-      // carries them along. Demo is not a workspace: its members come from the in-memory provider.
-      getProject: () => workspace.current().project,
-      // Only honor the **current project's** path, never fall back to "the project resolved at server
-      // start", so agents from another project do not drift into the room.
-      getWorkspacePath: () => workspace.current().workspacePath,
+      getProject: () => workspace.get().project,
+      getWorkspacePath: () => workspace.get().workspacePath,
     });
     // Hand the roster to the bus: a summoned "defined subagent" shows busy in the office
     // (the ghost path marks it active / idle)
@@ -385,12 +387,12 @@ function createServer(opts = {}) {
 
     /* The one clock: session scans, per-floor task-ledger sync, agent sync and ghost GC all live in
        this single unified poller, so floor modules hold no timers (see poller.js).
-       It starts here — after workspace.restore() — so the first tick scans the restored project and
-       replaces the roster's old boot-time sync. */
+       It starts after workspace.restore() so the first tick scans the server's default workspace
+       and replaces the roster's old boot-time sync. */
     const poller = createPoller({
       bus,
       repo,
-      getWorkspace: () => workspace.current(),
+      getWorkspace: () => workspace.get(),
       broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
       now: () => clock.now(),
       agents: {
@@ -432,8 +434,11 @@ function createServer(opts = {}) {
         `[workgremlin] 远程派发：${dispatchPolicy.mode}` +
           (dispatchPolicy.file ? `（配置文件 ${dispatchPolicy.file}，可随时修改，无需重启）` : '')
       );
-      const cur = workspace.current();
-      log.info(`[workgremlin] project=${cur.projectName || '(未命名工程)'} (${cur.workspacePath || workspacePath})`);
+      const cur = workspace.get();
+      log.info(
+        `[workgremlin] default workspace=${cur.workspacePath || workspacePath}` +
+          ` (project=${cur.projectName || '(未命名工程)'})`
+      );
     }
     return info;
   }

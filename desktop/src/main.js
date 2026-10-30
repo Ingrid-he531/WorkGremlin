@@ -209,17 +209,6 @@ async function bootstrap() {
     }
   });
 
-  // "打开工程"：系统目录选择框。取消返回 null（渲染层据此什么都不做）
-  ipcMain.handle(IPC_EVENTS.CHOOSE_WORKSPACE, async () => {
-    const win = BrowserWindow.getFocusedWindow() || mainWindow;
-    const res = await dialog.showOpenDialog(win, {
-      title: '打开工程',
-      properties: ['openDirectory', 'createDirectory'],
-    });
-    if (res.canceled || !res.filePaths || !res.filePaths.length) return null;
-    return res.filePaths[0];
-  });
-
   /**
    * 原生（OS 级）全屏：窗口占满整屏，标题栏/边框/菜单栏一起没掉 —— 只有主舞台留着。
    * 渲染层那套"专注模式"（收自家顶栏与左栏）跟着它一起走，见 App.vue。

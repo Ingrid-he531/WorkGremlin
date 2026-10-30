@@ -23,8 +23,8 @@
  *   message-queue/*.json                                               per session runtime:{activated,paused,awaitingSessionIdle} + queued messages
  *   file-changes/{session id}/*.json                                   changed files (added/removed lines + diff)
  *
- * The dropdown wants **the sessions active in every project** (not only the currently opened one), so this
- * walks each project dir under genie-history; when there is not a single active session →
+ * The dropdown wants **the sessions active in every project**, so this walks each project dir under
+ * genie-history; when there is not a single active session →
  * reason: 'no-open-project'.
  *
  * Discipline (aligned with docs/requirements.md §P0-6 "never fabricate"):
@@ -594,9 +594,9 @@ function reporterSnapshotPhase(workspacePath, client, session) {
  *
  * It also checks "whether this state file itself is still alive": leftover / exited sessions leave dead files
  * in the hooks dir whose taskId never updates (e.g. old-naming files from before the switch to "one file per
- * station + project"). Without that check, a single dead file whose taskId matches the current project pins
+ * station + project"). Without that check, a single dead file whose taskId matches the default project pins
  * inWindow to true forever, so after Stop it still infers "thinking" from "still working".
- * @param {string} workspacePath currently opened project; empty means no project filter
+ * @param {string} workspacePath server default fallback path; empty means no project filter
  * @param {string} [client] source client; empty means no client filter
  * @returns {boolean}
  */
@@ -950,11 +950,9 @@ function listReporterSessions(client = '', { includeEnded = false } = {}) {
 
 /**
  * The project currently "really being worked on": take the project path the reporter hook last wrote a phase /
- * task into. The reporter stamps phases on REAL_WS (the project it actually runs in), not on whatever office
- * manually recorded as "opened project", so this judges by the newest activity, avoiding phases being
- * attributed to the old project when a new one is opened directly in the IDE (the main console would not match
- * the dropdown). Past the freshness window (REPORTER_WS_FRESH_MS) it counts as stale and falls back to the passed-in
- * fallback (usually office's currently opened project).
+ * task into. The reporter stamps phases on the real workspace, so this judges by the newest activity instead of
+ * a manually recorded default. Past the freshness window (REPORTER_WS_FRESH_MS) it counts as stale and falls back
+ * to the passed-in fallback (usually the server's default workspace).
  * @param {string} fallback fallback value
  * @returns {string}
  */
@@ -974,7 +972,7 @@ function freshestReporterWs(fallback, client = '', session = '') {
     const ws = (sp && sp.workspacePath) || j.taskWorkspacePath || '';
     if (!ws || !ts || now - ts > REPORTER_WS_FRESH_MS) continue;
     // As above: only trust phases written after this process started, so residue from the previous run does
-    // not decide "the current project"
+    // not decide the ownership project
     if (ts < SERVER_STARTED_AT) continue;
     if (ts > bestTs) {
       bestTs = ts;
@@ -1155,7 +1153,7 @@ function sessionInfo(storage, id, { current = false, now = Date.now(), workspace
  *  (see collectProjects in floorCodebuddy.js). */
 
 /**
- * List the active sessions in **all projects** (not limited to the currently opened one).
+ * List the active sessions in **all projects**.
  * @param {{workspacePath?: string, force?: boolean, client?: string, pluginRe?: RegExp[], currentOnly?: boolean, activeSessions?: object[]}} o
  * @returns {{ok: true, sessions: Array, current: string, workspacePath: string,
  *            storage: string, reason?: string}}
@@ -1168,12 +1166,9 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
   const mod = floorModuleOf(client);
   const re = pluginRe || (mod && mod.meta && mod.meta.pluginRe) || [];
   const storageMarks = (mod && mod.meta && mod.meta.pluginStorageMarks) || [];
-  // The "current project" used for session ownership follows the reporter's newest real activity project,
-  // not the one office manually recorded as "opened project" (the two drift apart when a new project is
-  // opened directly inside the IDE).
-  // Only this passed-in client's path counts: this listing belongs to one plugin floor, and another floor's
-  // (another product's / the same product's CLI) activity in another project must not decide this floor's
-  // "current project" — otherwise mine / current / fresh all get dragged off.
+  // The ownership project follows the reporter's newest real activity project; the passed-in default
+  // workspace is only the fallback. Only this passed-in client's path counts: this listing belongs to
+  // one plugin floor, and another floor's activity must not decide this floor's ownership.
   const ws = freshestReporterWs(workspacePath, client);
   const now = Date.now();
   // The cache key must cover client / pluginRe / project, otherwise different plugin floors in the same
@@ -1287,7 +1282,7 @@ function listSessions({ workspacePath = '', force = false, client = '', pluginRe
     let info;
     if (sqliteRow) {
       // The whole enrich is already done in copilot.readCopilotSessions (phase / inFlight / doneAt / the live*
-      // family); here we only layer the reporter's inWindow on top and unify the "current project" rule
+      // family); here we only layer the reporter's inWindow on top and unify the project-ownership rule
       // (isProjectCurrent || projectPath===ws).
       info = { ...sqliteRow, inWindow: reporterInWindow || sqliteRow.inWindow };
       info.current = Boolean(isProjectCurrent || (sqliteRow.projectPath && sqliteRow.projectPath === ws));

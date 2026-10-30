@@ -70,8 +70,8 @@ P1 is the only design target. P2/P3 needs are satisfied only when they do not ad
 
 | Dimension | Decision |
 | --- | --- |
-| workspace | **One workspace** (the open project). Multi-workspace is an architectural reservation only |
-| ~~team~~ → **project** | The code has no team concept. `project_id` is the ownership key for `members`, `tasks`, `messages`, `file_activity`, `artifacts` and `task_runs`. Switching is via the floor list, the session dropdown and "Open project" |
+| workspace | **A project is an ownership key, not a UI selection.** The office follows the selected session's `workspacePath`; there is no global open-project switch. Multi-workspace observation is an architectural reservation only |
+| ~~team~~ → **project** | The code has no team concept. `project_id` is the ownership key for `members`, `tasks`, `messages`, `file_activity`, `artifacts` and `task_runs`. The office filters by the project carried by the selected session; the server keeps only a default workspace for legacy attribution/polling |
 | Workstation states | **Exactly three: `busy` / `idle` / `blocked`.** No `offline`, `online`, `error`, `thinking`, `unknown` or `degraded` |
 | Liveness | **No business heartbeat and no TTL.** A task is running exactly while `tasks.state='running'`; no elapsed-time or heartbeat heuristic may change a state |
 | Member scale | Target 16 members. Compact mode (≥5 members) and pagination (>16) are **not implemented**; the target remains a requirement |
@@ -619,7 +619,7 @@ searched as stored. Tests must assert against redacted text, not the original re
 | **P0-1** | Workstation view | Three states, automatic refresh, no manual refresh button, 16-member no-cross-talk target; see §6.5 |
 | **P0-2** | Conversation view | Full message stream (not one member's inbox); time / sender → recipient / type / content; see AC-M1–M6, AC-S1, AC-P1 |
 | **P0-3** | Ingest and persistence | Route B reporting + floor readers; SQLite; 90-day / 100k retention target. No heartbeat and no liveness inference |
-| **P0-4** | Project scope | `project_id` in every core table; switching shows only that project's data, with zero cross-project leakage |
+| **P0-4** | Project scope | `project_id` in every core table; the office shows the project carried by the selected session, with zero cross-project leakage |
 | **P0-5** | Connection and self-explanation | WS status and polling fallback; last sync time; exponential reconnect. A connection problem never changes a member state |
 | **P0-6** | Demo mode | A UI action creates an isolated demo project with deterministic data, visually marked as demo |
 | **P0-7** | Message redaction | Requirements in §8; **not implemented** |

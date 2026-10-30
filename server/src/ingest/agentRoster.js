@@ -25,10 +25,9 @@ const { agentNameKey } = require('@workgremlin/shared');
 function createAgentRoster(opts) {
   const bus = opts.bus;
   /**
-   * Which project the gremlins register under: **follows the currently open project**. Pass
-   * `getProject()` so it is read fresh each time — otherwise the roster pins to one project (the old
-   * code hardcoded the demo project id, which only "worked" because the demo happened to share the
-   * real project's name) and gremlins won't follow a project switch.
+   * Which project the gremlins register under: the server's default workspace. This is a polling
+   * fallback, not a client-selected project (each client filters the office by its selected
+   * session). Pass `getProject()` so it is read fresh each time.
    */
   const getProject = typeof opts.getProject === 'function' ? opts.getProject : () => opts.project || config.DEMO_PROJECT;
   const getWorkspacePath = typeof opts.getWorkspacePath === 'function' ? opts.getWorkspacePath : () => '';
@@ -76,9 +75,9 @@ function createAgentRoster(opts) {
   }
 
   /**
-   * A floor found this subagent defined: register it under the current project (the first floor to
-   * claim a duplicate name wins). Registration does not write an idle row; a member with no explicit
-   * state is idle by definition.
+   * A floor found this subagent defined: register it under the server's default project (the first
+   * floor to claim a duplicate name wins). Registration does not write an idle row; a member with no
+   * explicit state is idle by definition.
    * @param {{meta?: {id?: string, agent?: string}}} floor
    * @param {{name: string, level: 'project'|'user', client?: string}} a
    */

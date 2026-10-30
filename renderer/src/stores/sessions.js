@@ -130,8 +130,7 @@ export const useSessionStore = defineStore('sessions', {
 
     /**
      * Dropdown options: list all active sessions of the **currently selected floor** directly (flat,
-     * no floor headings, and no distinction of "another project" —— there is no concept of a "currently
-     * open project" now, all sessions are treated the same).
+     * no floor headings). Project is not a dropdown dimension; the selected session carries it.
      * Switching floors naturally swaps the set along with it.
      */
     options: (s) => {
@@ -168,7 +167,7 @@ export const useSessionStore = defineStore('sessions', {
 
     /**
      * Whether the selected session is worth treating as "live".
-     * Only sessions in the **current project** that the **plugin still recognizes** (has a runtime) are live;
+     * Only sessions in the **viewed project** that the **plugin still recognizes** (has a runtime) are live;
      * sessions from another project / with only fossil data show no active status (no invented state).
      * No session selected (empty dropdown) → leave the room's current display untouched.
      */
@@ -227,6 +226,7 @@ export const useSessionStore = defineStore('sessions', {
       }
       // This floor finally has sessions (it was empty before) → the office returns to normal display
       if (this.selectedId) this.floorEmpty = false;
+      this.followSelectedProject();
     },
 
     /**
@@ -282,12 +282,26 @@ export const useSessionStore = defineStore('sessions', {
       else this.sessions.push(v);
     },
 
-    /** Select a session: the floor follows it (sessions are already grouped by floor) */
+    /** Select a session: the floor follows it (sessions are already grouped by floor), and so does the office project. */
     select(id) {
       this.selectedId = id || '';
       this.floorEmpty = false;
       const s = this.sessions.find((x) => x.id === this.selectedId);
       if (s && s.floor) this.selectedFloor = s.floor;
+      this.followSelectedProject();
+    },
+
+    /**
+     * Project follows the selected session, not a server-wide "current project". This only loads
+     * the project's members into this client; it never calls POST /api/v1/workspace.
+     */
+    followSelectedProject() {
+      const s = this.sessions.find((x) => x.id === this.selectedId);
+      if (!s || !s.projectPath) return;
+      const project = useProjectStore();
+      project.followSession(s).catch(() => {
+        /* transient failure: keep the previous office until the next selection / reconcile */
+      });
     },
 
     /**
@@ -302,6 +316,7 @@ export const useSessionStore = defineStore('sessions', {
       const pick = list.find((x) => x.current) || list[0];
       this.selectedId = pick ? pick.id : '';
       this.floorEmpty = !this.selectedId;
+      this.followSelectedProject();
     },
 
     /**

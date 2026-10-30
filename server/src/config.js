@@ -114,17 +114,6 @@ function readServerInfo() {
   return readServerInfoFile({ requireAlive: true });
 }
 
-function clearServerInfo() {
-  const file = serverInfoPath();
-  if (fs.existsSync(file)) {
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
 /**
  * Keep only the token after a normal shutdown.
  *
@@ -160,6 +149,5 @@ module.exports = {
   pickPort,
   writeServerInfo,
   readServerInfo,
-  clearServerInfo,
   writeStoppedInfo,
 };

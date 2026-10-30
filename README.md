@@ -25,7 +25,7 @@ npm run launch:electron
 # Just check the native module works (create table → write → read back): npm run db:check
 ```
 
-**Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the current floor gets an isolated virtual **demo session**, the main console follows the server-owned demo phase, and the office shows the demo team (6 experts + 2 temporary members). Task records, the project selector and the conversation stay on the real project. Click "Exit demo" again to return to the previously selected real session.
+**Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the current floor gets an isolated virtual **demo session**, the main console follows the server-owned demo phase, and the office shows the demo team (6 experts + 2 temporary members). Task records and the conversation stay on the real project. Click "Exit demo" again to return to the previously selected real session.
 
 ### Remote access
 
@@ -113,7 +113,7 @@ This is reverse control: a dispatched task can modify files on the server. Keep 
 
 An isometric (2.5D) office that draws "which agent is doing what":
 
-- **Floors**: pick a floor from the capsules on the left; switching plays an **elevator animation** (doors close, the car changes floors behind them, doors open on the new floor); each floor has its own furniture material/color so you can tell where you are. The dot/number on a capsule = whether that floor has active sessions and how many; products that are not installed are greyed out and not clickable. The lintel shows the current project name and floor.
+- **Floors**: pick a floor from the capsules on the left; switching plays an **elevator animation** (doors close, the car changes floors behind them, doors open on the new floor); each floor has its own furniture material/color so you can tell where you are. The dot/number on a capsule = whether that floor has active sessions and how many; products that are not installed are greyed out and not clickable. The lintel is the task ticker; the floor is shown in the left capsules/car.
 - **Main agent console**: the floating screen shows its current phase — `idle / unreported / thinking / calling a tool / delegating to an expert / awaiting permission / waiting (for a subagent to report) / task done / task cancelled`. Hover the screen to pop up the action, target, skills and context; the bottom-left marks whether this phase is a **reported truth / inferred value / demo script**.
 - **Gremlins (subagents at their desks)**: they walk in through the front door one by one and sit down; when summoned by the main agent (the `task` tool) they run to the **right side** of the console, take the task, reply "got it", then go back to their desk to work, and report the result at the console when done; while summoned, a **ghost** (this subagent instance) appears above their head and floats in through the front door. Idle ones go get water, print, or chat with someone; two or more blocked ones gather for a meeting on their own.
 - **Interaction**: drag to pan · scroll to zoom · double-click to reset; click a desk for the task card; hover a gremlin for its current task; hover the console screen for phase details; `F` fullscreen / `Esc` exit fullscreen.
@@ -193,7 +193,7 @@ Among them, **1F / 2F / 3F / 4F / 6F / 7F / 8F can also join the council** (thes
 
 - All data lives in `~/.workgremlin/`: `workgremlin.db` (one SQLite database) + each product's state files. Change the directory with `WORKGREMLIN_HOME`, change the database file with `WORKGREMLIN_DB`.
 - At startup it **automatically writes the "status reporting hook" into the config of installed products** (only adds/updates our own entry, backing up to `.bak-workgremlin` before changing). To opt out of automatic config changes: `WORKGREMLIN_NO_AUTO_HOOKS=1`.
-- Open a project: decided at server startup — `WORKGREMLIN_WORKSPACE=<dir>` (or `npm run server -- --workspace <dir>`); if neither is given it uses the directory it was started from. The last opened project is remembered and restored on the next startup.
+- Project follows the **selected session**: the session carries its workspace path, and the office loads that project's members. There is no global "open project" switch in the UI; project is only the ownership key for members/tasks/messages. The server keeps a default workspace for startup (`WORKGREMLIN_WORKSPACE=<dir>` / `--workspace <dir>` / cwd, remembered across restarts) as a fallback for legacy reports that omit `workspacePath` and for the floor poller. The project name is not shown as a separate global selector.
 - Logs: by default outputs `info` / `warn` / `error`, and writes per-day to `~/.workgremlin/logs/workgremlin-<YYYY-MM-DD>.log`. For finer troubleshooting: `WORKGREMLIN_LOG=debug` (or `npm run server -- --log=debug`) enables per-event debug; to see only problems: `WORKGREMLIN_LOG=error`; `WORKGREMLIN_LOG_FILE=0` turns off file logging. **Keeps only 7 days by default** (`WORKGREMLIN_LOG_KEEP_DAYS` changes it): expired per-day files and expired lines in `hooks/events.log` are cleaned up at startup / when the day changes.
 
 ## Documentation

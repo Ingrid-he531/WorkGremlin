@@ -1205,7 +1205,7 @@ function createRepo(db) {
         AND (@before IS NULL OR t.started_at < @before)
     `),
     /**
-     * The task the **main agent** (role='agent', the one reported by the hook) in the current project is running.
+     * The task the **main agent** (role='agent', the one reported by the hook) in the given project is running.
      * Used to recognize the parent as a fallback when the summoning relation cannot be had (old hook
      * written lists have no parent field): a ghost was dispatched by the main agent, so while it is alive
      * the main agent must be running some user task.

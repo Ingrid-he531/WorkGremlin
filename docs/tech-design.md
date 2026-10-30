@@ -359,8 +359,8 @@ There is **no `/heartbeat` endpoint** and **no `/status` endpoint**. Blocked sta
 dispatcher, not by a client-side status call.
 
 Ownership: `projectFirst` resolves the project from `workspacePath` (the reporter's actual cwd), falling
-back to the request's `project`. This prevents "office shows project A, CLI runs in project B" from
-recording B's work under A.
+back to the request's `project` (the server default). This prevents "default workspace is A, CLI runs in
+project B" from recording B's work under A.
 
 Responses: `{ok:true, ...}` or `{ok:false, error:{code,message}}` with
 `400 bad_payload / 401 bad_token / 404 unknown_member / 500 internal`.
@@ -503,6 +503,6 @@ Detailed divergence tracking lives in `docs/implementation-status.md`.
    written; plaintext must never reach the database.
 4. **Retention/archiving.** The retention setting and task deletion paths exist; message archiving to JSONL
    is not implemented.
-5. **Multi-workspace.** One open project at a time; multi-workspace observation remains an architectural
+5. **Multi-workspace.** The office follows one selected session's project at a time; multi-workspace observation remains an architectural
    reservation, not a feature.
 6. **Renderer test tooling.** Plain Node suites cover logic; a browser/Electron E2E layer is still missing.

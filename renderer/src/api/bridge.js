@@ -2,7 +2,6 @@
  * preload bridge. Inside Electron use window.workgremlin (real port + token);
  * in browser dev mode fall back to same-origin /api, /ws (forwarded by the vite proxy).
  */
-import { t } from '../i18n/index.js';
 
 export function hasBridge() {
   return typeof window !== 'undefined' && Boolean(window.workgremlin);
@@ -87,7 +86,8 @@ export function onFullScreen(cb) {
 }
 
 /**
- * Current project + recently opened projects + subagent manifest path.
+ * Server-side default workspace (fallback for attribution / polling). The office does not use it
+ * to choose a project; that follows the selected session.
  * @param {{port?:number, token?:string, fallback?:boolean}} info
  */
 export async function getWorkspace(info) {
@@ -154,40 +154,6 @@ export async function stopDemoSession(info, floor) {
   }
 }
 
-/**
- * Open a real project directory.
- * @param {{port?:number, token?:string, fallback?:boolean}} info
- * @param {string} path
- */
-export async function openWorkspace(info, path) {
-  const res = await fetch(`${httpBase(info)}/api/v1/workspace`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(info && info.token ? { Authorization: `Bearer ${info.token}` } : {}),
-    },
-    body: JSON.stringify({ path }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error((data && data.error && data.error.message) || `HTTP ${res.status}`);
-  return data;
-}
-
-/**
- * Pop up the system directory picker (Electron). In browser dev it falls back to window.prompt.
- * @returns {Promise<string|null>}
- */
-export async function chooseWorkspace() {
-  if (hasBridge() && typeof window.workgremlin.chooseWorkspace === 'function') {
-    try {
-      return await window.workgremlin.chooseWorkspace();
-    } catch {
-      /* fall back to prompt */
-    }
-  }
-  const p = window.prompt(t('workspace.prompt'));
-  return p ? p.trim() : null;
-}
 
 /**
  * Host of the current target. Local mode stays on loopback; the desktop client can be pointed at

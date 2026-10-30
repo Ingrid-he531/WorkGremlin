@@ -98,8 +98,10 @@ export function createConnection({ url, token, project, resolve, onEvent, onStat
 
   return {
     send,
-    subscribe(filters) {
-      send({ type: CLIENT_EVENTS.SUBSCRIBE, filters, ts: Date.now() });
+    subscribe(filters, project) {
+      const msg = { type: CLIENT_EVENTS.SUBSCRIBE, filters, ts: Date.now() };
+      if (project) msg.project = project;
+      send(msg);
     },
     backfill(beforeId, limit = 100) {
       send({ type: CLIENT_EVENTS.BACKFILL, beforeId, limit, ts: Date.now() });

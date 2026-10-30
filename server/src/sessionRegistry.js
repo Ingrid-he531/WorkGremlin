@@ -3,8 +3,8 @@
 /**
  * sessionRegistry.js —— the global active session table.
  *
- * One table manages the sessions every agent (floor) has open in every project, regardless of which
- * project is currently open. Each record = one session, grouped by **floor** (monitored product), and
+ * One table manages the sessions every agent (floor) has open in every project; no global "open
+ * project" is involved. Each record = one session, grouped by **floor** (monitored product), and
  * removed on timeout:
  *
  *   1F CodeBuddy —— **merged floor**: the CLI and Plugin are two forms of the same product, merged into

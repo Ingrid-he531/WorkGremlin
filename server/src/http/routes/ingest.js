@@ -39,9 +39,9 @@ function createIngestRouter({ bus, repo }) {
   const projectFirst = (fn) =>
     wrap((body) => {
       /* Ownership follows **the directory the reporter is actually in** (see the notes on
-         bus.projectForReport): with "the office showing A while I run the CLI inside B",
-         body.project is A (the office's current project) and body.workspacePath is the real B ——
-         taking A as the destination used to record the task under another project.
+         bus.projectForReport): body.project is the server's default workspace name and
+         body.workspacePath is the real directory. Taking the default as the destination used to
+         record the task under another project.
          Old reports that carry no workspacePath fall back to body.project, behavior unchanged. */
       const project = bus.projectForReport(body.project || body.projectId || '', body.workspacePath || '');
       if (!project) return { ok: false, error: 'missing project' };
@@ -126,8 +126,8 @@ function createIngestRouter({ bus, repo }) {
 
   /* Raw events forwarded by the CLI hook: no longer split into semantic routes, they are handed
      straight to the server-side dispatcher, and that floor's handleHookEvent reads the disk and
-     writes the ledger. Ownership is settled by workspacePath (cwd); with no project attached it
-     falls back to "the project currently open in the office". */
+     writes the ledger. Ownership is settled by workspacePath (cwd); with no workspacePath it falls
+     back to the server's default workspace. */
   router.post('/hook', async (req, res) => {
     try {
       const body = req.body || {};

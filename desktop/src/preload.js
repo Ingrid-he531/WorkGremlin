@@ -35,8 +35,6 @@ contextBridge.exposeInMainWorld('workgremlin', {
   /** @returns {Promise<{port:number, token:string, dbPath:string, version:string}|null>} */
   getServerInfo: () => ipcRenderer.invoke(IPC_EVENTS.GET_SERVER_INFO),
   getAppVersion: () => ipcRenderer.invoke(IPC_EVENTS.GET_APP_VERSION),
-  /** 弹出系统目录选择框；取消返回 null @returns {Promise<string|null>} */
-  chooseWorkspace: () => ipcRenderer.invoke(IPC_EVENTS.CHOOSE_WORKSPACE),
   /** @param {(payload: any) => void} cb @returns {() => void} 取消订阅 */
   onEvent: (cb) => {
     listeners.add(cb);

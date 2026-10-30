@@ -96,6 +96,15 @@ app.use('/api/v1', createIngestRouter({ bus }));
   ok('工程行数没变', before === after, `${before} → ${after}`);
   ok('B 的工程 id 仍是 stb-dashboard', (repo.getProjectByWorkspace.get(WS_B) || {}).id === 'stb-dashboard', JSON.stringify(repo.getProjectByWorkspace.get(WS_B)));
 
+  head('[4] 快照可以按会话的 workspacePath 取，不必切服务器当前工程');
+  const snapB = bus.buildSnapshot(WS_B);
+  ok('按路径取到 B', Boolean(snapB.project) && snapB.project.id === 'stb-dashboard', JSON.stringify(snapB.project));
+  ok('B 的成员在快照里', snapB.members.some((m) => m.project === 'stb-dashboard'));
+  const snapMissing = bus.buildSnapshot(path.join(TMP, 'not-a-project'));
+  ok('明确请求的未知路径不会回退到当前工程 A', snapMissing.project === null, JSON.stringify(snapMissing.project));
+  const snapCurrent = bus.buildSnapshot();
+  ok('不传参数时仍回退到当前工程 A', Boolean(snapCurrent.project) && snapCurrent.project.id === 'workgremlin', JSON.stringify(snapCurrent.project));
+
   server.close();
   close();
   fs.rmSync(TMP, { recursive: true, force: true });

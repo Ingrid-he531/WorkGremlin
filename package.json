@@ -37,6 +37,7 @@
     "test:done": "node server/test/doneAttribution.test.js",
     "test:floors": "node server/test/mergedFloors.test.js",
     "test:session-project": "node server/test/sessionProject.test.js",
+    "test:session-follow": "node renderer/test/sessionProjectFollow.test.mjs",
     "test:codex-subagent-session": "node server/test/codexSubagentSession.test.js",
     "test:kilo": "node server/test/kiloFloor.test.js",
     "test:cline": "node server/test/clineFloor.test.js",

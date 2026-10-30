@@ -102,8 +102,9 @@ function createPoller({
 
   /**
    * Let every floor scan its own agent dirs and register the changes through the upper layer. The floor
-   * gets the current project (id + display name) and workspace path, and the register / unregister
-   * callbacks; the server keeps no per-product agent knowledge.
+   * gets the server's default workspace (id + display name + path) and the register / unregister
+   * callbacks; the server keeps no per-product agent knowledge. This default is a polling fallback,
+   * not the project a client is viewing (the office filters cards by the selected session).
    */
   function syncFloorAgents(at) {
     const cur = (getWorkspace && getWorkspace()) || {};

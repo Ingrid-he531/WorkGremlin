@@ -138,11 +138,11 @@ function onKeydown(e) {
 }
 
 async function refreshMessages() {
-  // Demo mode only replaces the office members. The conversation log always follows the real
-  // project, just like task records and the project selector.
+  // Demo mode only replaces the office members. The conversation log follows the project the
+  // selected session belongs to; that project is a local view, not the server's global one.
   const info = project.serverInfo || {};
   const base = httpBase(info);
-  const t = project.project ? project.project.name : '';
+  const t = project.projectId || (project.project && project.project.id) || '';
   try {
     const res = await fetch(`${base}/api/v1/snapshot${t ? `?project=${encodeURIComponent(t)}` : ''}`, {
       headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
@@ -185,15 +185,27 @@ const phaseSource = computed(() => {
 });
 
 /**
+ * The server's global workspace may have been restored/changed while this client was offline.
+ * Once the websocket is back, re-apply the selected session's project so a reconnect does not
+ * silently move the office to another project.
+ */
+watch(
+  () => project.connection && project.connection.state,
+  (state) => {
+    if (state === 'open') sessions.followSelectedProject();
+  }
+);
+
+/**
  * The conversation log follows "which floor you are currently viewing":
  *   - empty floor -> clear (this floor has no session, and the previous floor's conversation
  *     should not linger);
  *   - switching to a floor with sessions / the session changing project -> refetch a batch for the new project.
  */
 watch(
-  () => (sessions.floorEmpty ? '' : (project.project && project.project.name) || ''),
-  (name) => {
-    if (!name) msgs.setSnapshot([]);
+  () => (sessions.floorEmpty ? '' : project.projectId || ''),
+  (id) => {
+    if (!id) msgs.setSnapshot([]);
     else refreshMessages();
   }
 );
@@ -227,7 +239,11 @@ onMounted(async () => {
     // An empty floor accepts no snapshot: otherwise the server-pushed one (still from the previous project) would refill the conversation just cleared.
     // Demo mode never changes the real project, so real message pushes keep flowing.
     if (msg.type === WS_EVENTS.SNAPSHOT && !sessions.floorEmpty) {
-      msgs.setSnapshot(msg.payload.recentMessages || []);
+      const snap = msg.payload || {};
+      const sid = snap.project && snap.project.id;
+      if (!project.projectId || !sid || String(sid) === String(project.projectId)) {
+        msgs.setSnapshot(snap.recentMessages || []);
+      }
     }
     // Sessions (project/session open-close) are pushed live: refresh the floors and dropdown immediately instead of waiting for the 10s poll
     if (msg.type === WS_EVENTS.SESSIONS) sessions.applySnapshot(msg.payload);
