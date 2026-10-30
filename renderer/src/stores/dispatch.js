@@ -51,6 +51,8 @@ export const useDispatchStore = defineStore('dispatch', {
     floors: [],
     /** Model references for the per-turn picker (e.g. opencode-go/deepseek-v4.1-flash) */
     models: [],
+    /** id -> human label (Claude's model picker); empty for floors without labels */
+    modelLabels: {},
     /** Why the catalog could not be read; the picker still offers "default model" */
     modelsError: '',
     /** Session summaries, newest first */
@@ -137,7 +139,7 @@ export const useDispatchStore = defineStore('dispatch', {
 
     /**
      * @param {{token?: string}|null} info
-     * @param {{floor: string, workspacePath: string, model?: string}} payload
+     * @param {{floor: string, workspacePath: string, permission?: string, model?: string}} payload
      */
     async createSession(info, payload) {
       this.error = '';
@@ -170,9 +172,11 @@ export const useDispatchStore = defineStore('dispatch', {
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error((data.error && data.error.message) || `HTTP ${res.status}`);
         this.models = Array.isArray(data.models) ? data.models : [];
+        this.modelLabels = data.labels && typeof data.labels === 'object' ? data.labels : {};
         this.modelsError = data.error || '';
       } catch (err) {
         this.models = [];
+        this.modelLabels = {};
         this.modelsError = (err && err.message) || String(err);
       }
     },
@@ -182,8 +186,9 @@ export const useDispatchStore = defineStore('dispatch', {
      * @param {{token?: string}|null} info
      * @param {string} prompt
      * @param {string} [model] per-turn model override; empty = the floor's default
+     * @param {string} [permission] per-turn permission override; empty = the session/default
      */
-    async sendTurn(info, prompt, model) {
+    async sendTurn(info, prompt, model, permission) {
       if (!this.currentId) throw new Error('no session');
       this.error = '';
       const sessionId = this.currentId;
@@ -192,7 +197,7 @@ export const useDispatchStore = defineStore('dispatch', {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(authHeaders(info) || {}) },
-          body: JSON.stringify({ prompt, model: model || '' }),
+          body: JSON.stringify({ prompt, model: model || '', permission: permission || '' }),
         }
       );
       const data = await res.json();

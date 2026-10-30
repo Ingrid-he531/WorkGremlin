@@ -175,6 +175,16 @@ select {
   padding: 4px 8px;
 }
 
+/* Keep native dropdown popups on the dark panel palette instead of pure black/white. */
+select {
+  color-scheme: dark;
+}
+select option,
+select optgroup {
+  background-color: var(--bg-panel);
+  color: var(--text);
+}
+
 .mono {
   font-family: var(--mono);
 }

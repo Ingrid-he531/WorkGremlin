@@ -85,7 +85,7 @@ In Vite dev mode, set `WORKGREMLIN_TLS=1` on both commands so the proxy targets 
 
 Without `--tls` everything is plain HTTP/WS: use it only on a trusted network, or put an SSH tunnel or a TLS reverse proxy in front. `--no-token` disables the only gate, so never combine it with `--host 0.0.0.0` on a shared network.
 
-### Remote task dispatch (8F OpenCode)
+### Remote task dispatch (4F Claude Code / 8F OpenCode)
 
 A client can hand **one prompt** to one floor; the run happens on the server machine. The office and task records are written by the floor itself: the dispatched command is a normal, persistent session in the target directory, so the existing hooks/poller record it exactly like typing the prompt in a terminal. The dispatcher writes no ledger rows.
 
@@ -97,13 +97,15 @@ A client can hand **one prompt** to one floor; the run happens on the server mac
   }
   ```
   - `off` — reject every request (default);
-  - `auto` — start on arrival; tool permissions are auto-approved (`opencode run --auto`);
+  - `auto` — start on arrival; the floor's selected permission mode is used (`opencode run --auto` / Claude's `--permission-mode`);
   - `confirm` — a dialog appears in the server's window before anything starts. A remote client cannot approve it: the decision endpoint only accepts loopback requests.
 
   The file is re-read on every policy check, so an edit takes effect without restarting the server; `WORKGREMLIN_DISPATCH_MODE` overrides it (containers/tests). An invalid value falls back to `off`. The client cannot change this policy: there is no HTTP write endpoint for it.
-- **Client**: the **Remote tasks** tab (next to Council). Create a session with a floor (8F), a project directory (absolute path **on the server**) and an optional model, then keep sending prompts in the composer: every prompt is a turn in the **same** OpenCode session (`--session`), so the office/ledger sees one long conversation. Output streams into the transcript while the turn runs; one turn per session at a time, cancellable; a pending turn expires after 5 minutes.
-- **Model**: optional `provider/model`; leave empty to use the CLI's default.
-- **Persistence**: sessions are stored on the server in `~/.workgremlin/dispatch-sessions.json` (mode 0600), so restarting the server keeps the list and the client reopens the session it had last selected. A turn that was running when the server died is restored as **failed** with that reason, and a still-pending approval as **expired** — nothing is shown as if it had finished. Continuing a restored session reuses its OpenCode session id.
+- **Client**: the **Remote tasks** tab (next to Council). Create a session with a floor and a project directory (absolute path **on the server**), then choose the model and permission mode in the composer for **each turn**: every prompt is a turn in the **same** product session (`--session` / `--resume`), so the office/ledger sees one long conversation. Output streams into the transcript while the turn runs; one turn per session at a time, cancellable; a pending turn expires after 5 minutes.
+  - **4F Claude Code** offers `Auto`, `Accept edits`, `Bypass permissions` and `Plan (read-only)` per turn. These map to Claude's own `--permission-mode` (and the explicit bypass flag); `Plan` is read-only.
+  - **8F OpenCode** offers only `Auto` (`opencode run --auto`).
+- **Model**: optional per turn; leave empty to use the CLI's default. OpenCode exposes a catalog from `opencode models`; Claude Code's picker is read from `~/.claude/settings.json` (`modelPicker.options`), so you can choose the same provider/model refs you use in the terminal.
+- **Persistence**: sessions are stored on the server in `~/.workgremlin/dispatch-sessions.json` (mode 0600), so restarting the server keeps the list and the client reopens the session it had last selected. A turn that was running when the server died is restored as **failed** with that reason, and a still-pending approval as **expired** — nothing is shown as if it had finished. Continuing a restored session reuses its product session id (OpenCode `ses_…` / Claude UUID).
 
 This is reverse control: a dispatched task can modify files on the server. Keep the mode on `confirm` (or `off`) on networks you do not trust; the token is still plaintext HTTP/WS. Every request/decision is recorded in the `events` table (without the prompt text). The config path follows `WORKGREMLIN_HOME`, so a non-default home uses `<that home>/config.json`.
 

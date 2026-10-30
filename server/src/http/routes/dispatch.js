@@ -4,7 +4,7 @@
  * Remote dispatch API (reverse control, conservative): **sessions**, not one-shot requests.
  *
  *   GET    /api/v1/dispatch                          policy + floor availability + session list
- *   GET    /api/v1/dispatch/models?floor=8F          model catalog for the per-turn picker
+ *   GET    /api/v1/dispatch/models?floor=4F|8F    model catalog for the per-turn picker
  *   POST   /api/v1/dispatch/sessions                 create a session {floor, workspacePath, model?}
  *   GET    /api/v1/dispatch/sessions/:id             full transcript (turns + output tails)
  *   DELETE /api/v1/dispatch/sessions/:id             close a session (kills a running turn)

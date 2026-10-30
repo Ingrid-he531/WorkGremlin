@@ -69,17 +69,17 @@ const DEFAULTS = Object.freeze({
   RETENTION_DAYS: 90,
 
   /**
-   * Remote dispatch (reverse control, 8F only for now): a client asks the server to run one floor with
+   * Remote dispatch (reverse control, 4F/8F): a client asks the server to run one floor with
    * one prompt. The server never writes the ledger itself —— the floor's own session store is read by
    * the existing poller, so the office/task records stay as truthful as a manual CLI run.
    *
    * `off`     no dispatch at all (default)
-   * `auto`    run immediately, tool permissions auto-approved (`opencode run --auto`)
+   * `auto`    run immediately with the floor's selected permission mode
    * `confirm` park the request until someone on the **server machine** approves it
    */
   DISPATCH_MODES: Object.freeze(['off', 'auto', 'confirm']),
   /** Floors reverse control is wired up for (verified headless write mode + normal session) */
-  DISPATCH_FLOORS: Object.freeze(['8F']),
+  DISPATCH_FLOORS: Object.freeze(['4F', '8F']),
   /** Whole-run budget for one dispatched task */
   DISPATCH_TIMEOUT_MS: 30 * 60_000,
   /** How long a `confirm` request stays pending before it expires */

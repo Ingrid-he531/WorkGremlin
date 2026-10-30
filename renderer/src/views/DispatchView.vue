@@ -17,9 +17,12 @@ const dispatch = useDispatchStore();
 
 const showNew = ref(false);
 const floor = ref('8F');
+const newModel = ref('');
 const workspace = ref('');
 /** Per-turn model for the composer picker; empty = the floor's default model */
 const turnModel = ref('');
+/** Per-turn permission for the composer picker; floor-specific */
+const turnPermission = ref('');
 const prompt = ref('');
 const error = ref('');
 const sending = ref(false);
@@ -30,6 +33,33 @@ const session = computed(() => dispatch.current);
 const active = computed(() => dispatch.activeTurn);
 /** Legacy sessions created before per-turn selection may carry a session-level model */
 const sessionModel = computed(() => (session.value && session.value.model) || '');
+const permissionLabel = (p) => t(`dispatch.permission.${p}`);
+
+/** Permission choices belong to the open session's floor, not the new-session form. */
+const sessionFloorInfo = computed(() => {
+  const id = session.value && session.value.floor;
+  return dispatch.floors.find((f) => f.id === id) || null;
+});
+const sessionPermissions = computed(
+  () => (sessionFloorInfo.value && sessionFloorInfo.value.permissions) || []
+);
+
+watch(
+  () => [session.value && session.value.id, sessionPermissions.value.join(',')],
+  () => {
+    const current = (active.value && active.value.permission) || (session.value && session.value.permission);
+    const wanted = sessionPermissions.value.includes(current)
+      ? current
+      : sessionPermissions.value[0] || 'auto';
+    turnPermission.value = wanted;
+  },
+  { immediate: true }
+);
+
+watch(floor, (id) => {
+  newModel.value = '';
+  dispatch.loadModels(project.serverInfo || {}, id).catch(() => {});
+});
 
 /** Start each session with its own model (if it has one); the user can change it per turn. */
 watch(
@@ -65,8 +95,12 @@ const progressKey = computed(() => {
 
 onMounted(async () => {
   await dispatch.refresh(project.serverInfo || {});
+  if (dispatch.current && dispatch.current.floor) floor.value = dispatch.current.floor;
+  if (!dispatch.floors.some((f) => f.id === floor.value && f.available)) {
+    floor.value = (dispatch.availableFloors[0] && dispatch.availableFloors[0].id) || floor.value;
+  }
   // The picker is a convenience: load the catalog in the background so the page is usable first.
-  dispatch.loadModels(project.serverInfo || {}).catch(() => {});
+  dispatch.loadModels(project.serverInfo || {}, floor.value).catch(() => {});
   if (!dispatch.sessions.length) openNew();
 });
 
@@ -107,6 +141,7 @@ async function create() {
   try {
     await dispatch.createSession(project.serverInfo || {}, {
       floor: floor.value,
+      model: newModel.value || undefined,
       workspacePath: workspace.value.trim(),
     });
     showNew.value = false;
@@ -122,7 +157,12 @@ async function send() {
   sending.value = true;
   error.value = '';
   try {
-    await dispatch.sendTurn(project.serverInfo || {}, prompt.value.trim(), turnModel.value);
+    await dispatch.sendTurn(
+      project.serverInfo || {},
+      prompt.value.trim(),
+      turnModel.value,
+      turnPermission.value
+    );
     prompt.value = '';
   } catch (err) {
     error.value = (err && err.message) || String(err);
@@ -153,6 +193,8 @@ async function removeSession(id) {
 
 function open(id) {
   showNew.value = false;
+  const item = dispatch.sessions.find((s) => s.id === id);
+  if (item && item.floor) floor.value = item.floor;
   dispatch.open(project.serverInfo || {}, id);
 }
 
@@ -200,8 +242,19 @@ function onKeydown(e) {
           <span class="lbl">{{ t('dispatch.floor') }}</span>
           <select v-model="floor" class="input">
             <option v-for="f in dispatch.floors" :key="f.id" :value="f.id" :disabled="!f.available">
-              {{ f.id }} · OpenCode{{ f.available ? '' : ' —' }}
+              {{ f.id }} · {{ f.name || f.id }}{{ f.available ? '' : ' —' }}
             </option>
+          </select>
+        </label>
+        <label v-if="dispatch.models.length" class="field">
+          <span class="lbl">{{ t('dispatch.model') }}</span>
+          <select v-model="newModel" class="input mono" data-testid="dispatch-new-model">
+            <option value="">{{ t('dispatch.model_default') }}</option>
+            <optgroup v-for="g in modelGroups" :key="g.label" :label="g.label">
+              <option v-for="ref in g.models" :key="ref" :value="ref" :title="ref">
+                {{ dispatch.modelLabels[ref] || ref }}
+              </option>
+            </optgroup>
           </select>
         </label>
         <label class="field">
@@ -282,6 +335,17 @@ function onKeydown(e) {
             <p v-if="modeHint" class="hint" :class="{ bad: dispatch.mode === 'off' }">{{ modeHint }}</p>
             <p v-if="active" class="hint">{{ t('dispatch.active_hint') }}</p>
             <p v-if="error" class="err">{{ error }}</p>
+            <label v-if="sessionPermissions.length" class="field composer-permission">
+              <span class="lbl">{{ t('dispatch.permission') }}</span>
+              <select
+                v-model="turnPermission"
+                class="input"
+                data-testid="dispatch-turn-permission"
+                :disabled="dispatch.mode === 'off'"
+              >
+                <option v-for="p in sessionPermissions" :key="p" :value="p">{{ permissionLabel(p) }}</option>
+              </select>
+            </label>
             <div class="send-row">
               <select
                 v-model="turnModel"
@@ -292,10 +356,12 @@ function onKeydown(e) {
               >
                 <option value="">{{ t('dispatch.model_default') }}</option>
                 <option v-if="sessionModel && !dispatch.models.includes(sessionModel)" :value="sessionModel">
-                  {{ sessionModel }}
+                  {{ dispatch.modelLabels[sessionModel] || sessionModel }}
                 </option>
                 <optgroup v-for="g in modelGroups" :key="g.label" :label="g.label">
-                  <option v-for="ref in g.models" :key="ref" :value="ref">{{ ref }}</option>
+                  <option v-for="ref in g.models" :key="ref" :value="ref" :title="ref">
+                    {{ dispatch.modelLabels[ref] || ref }}
+                  </option>
                 </optgroup>
               </select>
               <button type="button" class="primary send" :disabled="!canSend" @click="send">
@@ -543,14 +609,14 @@ function onKeydown(e) {
   /* The closed control and its popup must both be dark: the OS defaults the list to a white
      background, which clashes with the office theme. `color-scheme: dark` swaps the native popup;
      the explicit option rules cover Chromium builds that ignore it. */
-  background: var(--bg);
+  background: var(--bg-panel);
   color: var(--text);
   color-scheme: dark;
 }
 .send-row .model-sel option,
 .send-row .model-sel optgroup {
-  background-color: #000;
-  color: #fff;
+  background-color: var(--bg-panel);
+  color: var(--text);
 }
 /* Focus ring + the highlighted row in the open popup, both in the theme accent (blue). The
    browser default is a white/grey ring and a grey highlight, which read as "disabled" on the dark
@@ -581,6 +647,21 @@ function onKeydown(e) {
   color: var(--text);
   font: inherit;
   font-size: 13px;
+}
+/* Native dropdowns otherwise use a pure black/white OS popup; keep them on the panel palette. */
+select.input {
+  background: var(--bg-panel);
+  color-scheme: dark;
+}
+.input option,
+.input optgroup {
+  background-color: var(--bg-panel);
+  color: var(--text);
+}
+.input option:checked,
+.input option:focus {
+  background-color: var(--accent);
+  color: #fff;
 }
 .area {
   resize: vertical;

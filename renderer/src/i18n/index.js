@@ -172,6 +172,11 @@ const MESSAGES = {
     'dispatch.untitled': '未命名会话',
     'dispatch.title': '远程触发任务',
     'dispatch.floor': '楼层',
+    'dispatch.permission': '权限',
+    'dispatch.permission.auto': '自动',
+    'dispatch.permission.acceptEdits': '自动接受编辑',
+    'dispatch.permission.bypassPermissions': '完全放行',
+    'dispatch.permission.plan': '只读规划',
     'dispatch.workspace': '工程目录',
     'dispatch.workspace_ph': '服务器上的绝对路径',
     'dispatch.prompt': '任务内容',
@@ -201,7 +206,7 @@ const MESSAGES = {
     'dispatch.state.cancelled': '已取消',
     'dispatch.state.rejected': '服务器已取消',
     'dispatch.state.expired': '确认超时',
-    'dispatch.no_floor': '服务器上没有可用的 8F CLI',
+    'dispatch.no_floor': '服务器上没有可用的派发 CLI',
 
     // ---- main console phases (first line on screen / first line of the tooltip, one source for both) ----
     'phase.idle': '待命中',
@@ -692,6 +697,11 @@ const MESSAGES = {
     'dispatch.untitled': 'Untitled session',
     'dispatch.title': 'Remote task',
     'dispatch.floor': 'Floor',
+    'dispatch.permission': 'Permission',
+    'dispatch.permission.auto': 'Auto',
+    'dispatch.permission.acceptEdits': 'Accept edits',
+    'dispatch.permission.bypassPermissions': 'Bypass permissions',
+    'dispatch.permission.plan': 'Plan (read-only)',
     'dispatch.workspace': 'Project directory',
     'dispatch.workspace_ph': 'Absolute path on the server',
     'dispatch.prompt': 'Task',
@@ -721,7 +731,7 @@ const MESSAGES = {
     'dispatch.state.cancelled': 'Cancelled',
     'dispatch.state.rejected': 'Rejected by server',
     'dispatch.state.expired': 'Confirmation expired',
-    'dispatch.no_floor': 'The 8F CLI is not installed on the server',
+    'dispatch.no_floor': 'No dispatch-capable CLI is installed on the server',
 
     // ---- main console phases ----
     'phase.idle': 'Idle',

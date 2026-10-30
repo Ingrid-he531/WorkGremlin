@@ -46,6 +46,7 @@
     "test:static-site": "node server/test/staticSite.test.js",
     "test:tls": "node server/test/tlsServer.test.js",
     "test:dispatch": "node server/test/dispatchApi.test.js",
+    "test:dispatch-claude": "node server/test/dispatchClaude.test.js",
     "test:plugin-e2e": "node server/test/kiloPluginE2E.test.js",
     "test:ghost-feed": "node server/test/ghostFeed.test.js",
     "test:opencode": "node server/test/opencodeFloor.test.js",

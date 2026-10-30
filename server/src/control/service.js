@@ -5,10 +5,11 @@
  * client, executed on this machine.
  *
  * The unit is a session, not a one-shot request:
- *   · a session owns one OpenCode session id (minted here, so we can keep talking to it);
- *   · each prompt is a turn; a turn is one `opencode run --session <id> "<prompt>"` process;
- *   · a turn may pin its own `--model` (the composer's per-turn picker); an empty choice leaves the
- *     model to the floor's own default, and legacy sessions keep their session-level model as fallback;
+ *   · a session owns one product session id (OpenCode `ses_…` / Claude UUID);
+ *   · each prompt is a turn; a turn is one headless CLI process (`opencode run`, `claude -p`);
+ *   · a session has a floor default, and every turn may choose its own permission mode
+ *     (OpenCode: auto; Claude: its permission modes);
+ *   · a turn may pin its own `--model`; an empty choice leaves the model to the floor's own default;
  *   · stdout is streamed to clients (`dispatch.output`), so the UI shows progress while it runs.
  *
  * What it does NOT do: it never writes members / tasks / task_runs. The spawned CLI is a normal,
@@ -21,10 +22,10 @@
  * (see control/config.js) — never from a client setting.
  *
  * The conversation list is **persisted** to `~/.workgremlin/dispatch-sessions.json` (prompts, output
- * tails, the minted OpenCode session id), so restarting the server — or opening a client later —
- * restores the sessions and can keep talking in the same OpenCode session. A turn that was running
+ * tails, the minted product session id), so restarting the server — or opening a client later —
+ * restores the sessions and can keep talking in the same product session. A turn that was running
  * when the server died is marked failed on restore, and a still-pending one expires; nothing is
- * presented as if it had finished. The real conversation still lives in OpenCode's own store too.
+ * presented as if it had finished. The real conversation still lives in the product's own store too.
  */
 
 const crypto = require('node:crypto');
@@ -60,6 +61,13 @@ function cleanOutput(text) {
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
     .replace(/\r\n?/g, '\n')
     .replace(/[^\S\n]+$/gm, '');
+}
+
+/** Per-chunk cleanup: strip terminal escapes but keep spaces (streaming text must not glue words). */
+function cleanChunk(text) {
+  return String(text || '')
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+    .replace(/\r\n?/g, '\n');
 }
 
 /**
@@ -105,10 +113,10 @@ function defaultFetchModels(bin) {
 
 /**
  * Default runner: spawn, stream stdout/stderr, keep the tail, kill the whole process group on timeout.
- * @param {{bin: string, args: string[], cwd: string, timeoutMs: number,
+ * @param {{bin: string, args: string[], cwd: string, timeoutMs: number, stdin?: string|null,
  *          onChild?: Function, onData?: (chunk: string) => void}} arg
  */
-function defaultRun({ bin, args, cwd, timeoutMs, onChild, onData }) {
+function defaultRun({ bin, args, cwd, timeoutMs, stdin, onChild, onData }) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     let child;
@@ -117,11 +125,16 @@ function defaultRun({ bin, args, cwd, timeoutMs, onChild, onData }) {
         cwd,
         env: { ...process.env },
         detached: process.platform !== 'win32',
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
       resolve({ status: 'failed', exitCode: null, error: `起进程失败：${err && err.message}`, stdout: '', stderr: '' });
       return;
+    }
+    try {
+      if (child.stdin) child.stdin.end(stdin == null ? '' : String(stdin));
+    } catch {
+      /* a closed stdin is not a reason to fail the run */
     }
     if (onChild) {
       try {
@@ -141,7 +154,7 @@ function defaultRun({ bin, args, cwd, timeoutMs, onChild, onData }) {
       else stderr += text;
       if (onData) {
         try {
-          onData(cleanOutput(text));
+          onData(text);
         } catch {
           /* a broken listener must not stop the process */
         }
@@ -230,8 +243,10 @@ function createDispatchService(deps = {}) {
         floor: session.floor,
         workspacePath: session.workspacePath,
         model: session.model || null,
+        permission: session.permission || null,
         title: session.title || '',
-        opencodeSessionId: session.opencodeSessionId,
+        productSessionId: session.productSessionId || session.opencodeSessionId || '',
+        opencodeSessionId: session.opencodeSessionId || null,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         turns: session.turns.map((turn) => ({
@@ -240,6 +255,7 @@ function createDispatchService(deps = {}) {
           state: turn.state,
           mode: turn.mode,
           model: turn.model || '',
+          permission: turn.permission || null,
           createdAt: turn.createdAt,
           startedAt: turn.startedAt,
           endedAt: turn.endedAt,
@@ -290,8 +306,16 @@ function createDispatchService(deps = {}) {
       if (!entry || typeof entry !== 'object') continue;
       const id = String(entry.id || '');
       const floor = String(entry.floor || '');
-      const opencodeSessionId = String(entry.opencodeSessionId || '');
-      if (!id || !DEFAULTS.DISPATCH_FLOORS.includes(floor) || !opencodeSessionId) continue;
+      const productSessionId = String(entry.productSessionId || entry.opencodeSessionId || '');
+      const recipe = recipeFor(floor);
+      if (!id || !DEFAULTS.DISPATCH_FLOORS.includes(floor) || !productSessionId || !recipe) continue;
+      const permissions =
+        Array.isArray(recipe.permissions) && recipe.permissions.length
+          ? recipe.permissions
+          : ['auto'];
+      const permission = permissions.includes(entry.permission)
+        ? entry.permission
+        : recipe.defaultPermission || permissions[0];
       const turns = (Array.isArray(entry.turns) ? entry.turns : []).map((t) => {
         const state = STATES.includes(t && t.state) ? t.state : 'failed';
         let finalState = state;
@@ -312,6 +336,7 @@ function createDispatchService(deps = {}) {
           state: finalState,
           mode: DEFAULTS.DISPATCH_MODES.includes(t && t.mode) ? t.mode : 'auto',
           model: String((t && t.model) || ''),
+          permission: permissions.includes(t && t.permission) ? t.permission : permission,
           createdAt: Number(t && t.createdAt) || ts,
           startedAt: Number(t && t.startedAt) || null,
           endedAt,
@@ -328,8 +353,10 @@ function createDispatchService(deps = {}) {
         floor,
         workspacePath: String(entry.workspacePath || ''),
         model: entry.model ? String(entry.model) : null,
+        permission,
         title: String(entry.title || ''),
-        opencodeSessionId,
+        productSessionId,
+        opencodeSessionId: floor === '8F' ? productSessionId : entry.opencodeSessionId || null,
         createdAt: Number(entry.createdAt) || ts,
         updatedAt: Number(entry.updatedAt) || ts,
         turns,
@@ -401,6 +428,7 @@ function createDispatchService(deps = {}) {
       state: turn.state,
       mode: turn.mode,
       model: turn.model || '',
+      permission: turn.permission || null,
       createdAt: turn.createdAt,
       startedAt: turn.startedAt,
       endedAt: turn.endedAt,
@@ -418,12 +446,14 @@ function createDispatchService(deps = {}) {
       floor: session.floor,
       workspacePath: session.workspacePath,
       model: session.model || null,
+      permission: session.permission || null,
       title: session.title || '',
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       state: sessionState(session),
       turnCount: session.turns.length,
-      opencodeSessionId: session.opencodeSessionId,
+      productSessionId: session.productSessionId || session.opencodeSessionId || null,
+      opencodeSessionId: session.opencodeSessionId || null,
     };
   }
 
@@ -488,7 +518,11 @@ function createDispatchService(deps = {}) {
         prompt: turn.prompt,
         // Per-turn choice wins; legacy sessions created with a model keep it as their fallback.
         model: turn.model || session.model || null,
-        sessionId: session.opencodeSessionId,
+        sessionId: session.productSessionId || session.opencodeSessionId,
+        permission: turn.permission || session.permission,
+        // Claude Code distinguishes the first turn (--session-id) from later ones (--resume).
+        // Only a turn that actually started proves the product session exists.
+        resume: session.turns.some((t) => t.id !== turn.id && Number(t.startedAt) > 0),
       });
     } catch (err) {
       turn.state = 'failed';
@@ -499,6 +533,17 @@ function createDispatchService(deps = {}) {
       touchSession(session);
       return publicTurn(turn);
     }
+
+    const parser = typeof inv.parser === 'function' ? inv.parser() : null;
+    const appendOutput = (text) => {
+      if (!text) return;
+      const chunk = cleanChunk(text);
+      if (!chunk) return;
+      turn.output = (turn.output + chunk).slice(-OUTPUT_MAX_BYTES);
+      // Streaming event: the client appends it to this turn without re-fetching the session.
+      emit({ kind: 'output', sessionId: session.id, turnId: turn.id, chunk });
+      persistSoon();
+    };
 
     turn.state = 'running';
     turn.startedAt = now();
@@ -517,15 +562,13 @@ function createDispatchService(deps = {}) {
       },
       onData: (chunk) => {
         if (!chunk) return;
-        turn.output = (turn.output + chunk).slice(-OUTPUT_MAX_BYTES);
-        // Streaming event: the client appends it to this turn without re-fetching the session.
-        emit({ kind: 'output', sessionId: session.id, turnId: turn.id, chunk });
-        persistSoon();
+        appendOutput(parser ? parser.push(chunk) : chunk);
       },
     })
       .then((r) => {
         turn.child = null;
         if (turn.state === 'cancelled') return;
+        if (parser) appendOutput(parser.flush());
         turn.endedAt = now();
         turn.exitCode = r.exitCode == null ? null : r.exitCode;
         if (r.status === 'ok') {
@@ -598,14 +641,23 @@ function createDispatchService(deps = {}) {
     return publicTurn(turn);
   }
 
-  /** @param {{floor: string, workspacePath: string, model?: string, title?: string}} input */
+  /** @param {{floor: string, workspacePath: string, model?: string, permission?: string, title?: string}} input */
   function createSession(input = {}) {
     const floor = String(input.floor || '');
     if (!DEFAULTS.DISPATCH_FLOORS.includes(floor)) {
       throw fail('bad_floor', `暂不支持该楼层：${floor || '(空)'}`, 400);
     }
-    if (!recipeFor(floor)) throw fail('bad_floor', `${floor} 没有派发配方`, 400);
+    const recipe = recipeFor(floor);
+    if (!recipe) throw fail('bad_floor', `${floor} 没有派发配方`, 400);
     if (!binFor(floor)) throw fail('floor_unavailable', `${floor} 的 CLI 未安装`, 409);
+
+    const permissions =
+      Array.isArray(recipe.permissions) && recipe.permissions.length ? recipe.permissions : ['auto'];
+    const requestedPermission = String(input.permission || '').trim();
+    if (requestedPermission && !permissions.includes(requestedPermission)) {
+      throw fail('bad_permission', `${floor} 不支持这个权限选项：${requestedPermission}`, 400);
+    }
+    const permission = requestedPermission || recipe.defaultPermission || permissions[0];
 
     let workspacePath = String(input.workspacePath || '').trim();
     if (!workspacePath) throw fail('empty_workspace', '请选择工程目录（服务器上的绝对路径）', 400);
@@ -624,13 +676,17 @@ function createDispatchService(deps = {}) {
       throw fail('bad_workspace', `工程目录不存在或不是目录：${workspacePath}`, 400);
     }
 
+    const productSessionId =
+      typeof recipe.mintSessionId === 'function' ? recipe.mintSessionId() : mintSessionId();
     const session = {
       id: crypto.randomUUID(),
       floor,
       workspacePath,
       model: input.model ? String(input.model) : null,
+      permission,
       title: String(input.title || '').slice(0, 120),
-      opencodeSessionId: mintSessionId(),
+      productSessionId,
+      opencodeSessionId: floor === '8F' ? productSessionId : null,
       createdAt: now(),
       updatedAt: now(),
       turns: [],
@@ -663,6 +719,21 @@ function createDispatchService(deps = {}) {
     // Per-turn model override: the composer lets the user pick a different model for every message.
     // Empty means "the floor's default" (or the session-level model on legacy sessions).
     const model = String(input.model || '').trim().slice(0, 200);
+    // Per-turn permission override: 8F only has auto; Claude Code offers its modes.
+    const recipe = recipeFor(session.floor);
+    const permissions =
+      recipe && Array.isArray(recipe.permissions) && recipe.permissions.length
+        ? recipe.permissions
+        : ['auto'];
+    const requestedPermission = String(input.permission || '').trim();
+    if (requestedPermission && !permissions.includes(requestedPermission)) {
+      throw fail('bad_permission', `${session.floor} 不支持这个权限选项：${requestedPermission}`, 400);
+    }
+    const permission =
+      requestedPermission ||
+      session.permission ||
+      (recipe && recipe.defaultPermission) ||
+      permissions[0];
     if (session.turns.some((t) => ['pending', 'running'].includes(t.state))) {
       throw fail('busy', '这个会话还有一轮正在等待或执行，请先等它结束', 409);
     }
@@ -673,6 +744,7 @@ function createDispatchService(deps = {}) {
       state: 'pending',
       mode: currentMode,
       model,
+      permission,
       createdAt: now(),
       startedAt: null,
       endedAt: null,
@@ -749,16 +821,31 @@ function createDispatchService(deps = {}) {
   }
 
   function floors() {
-    return DEFAULTS.DISPATCH_FLOORS.map((id) => ({ id, available: Boolean(binFor(id)) }));
+    return DEFAULTS.DISPATCH_FLOORS.map((id) => {
+      const recipe = recipeFor(id);
+      return {
+        id,
+        name: (recipe && recipe.name) || id,
+        available: Boolean(binFor(id)),
+        permissions:
+          recipe && Array.isArray(recipe.permissions) && recipe.permissions.length
+            ? recipe.permissions
+            : ['auto'],
+        defaultPermission:
+          (recipe && recipe.defaultPermission) ||
+          (recipe && Array.isArray(recipe.permissions) && recipe.permissions[0]) ||
+          'auto',
+      };
+    });
   }
 
   /**
-   * Model catalog for one floor, read from that floor's own CLI (`opencode models`) and cached
-   * briefly. The composer uses it for a per-turn model picker; the server never picks a model for
-   * the user beyond "empty = CLI default".
+   * Model catalog for one floor, from that floor's own CLI (`opencode models`) or a recipe-provided
+   * reader (Claude Code has no catalog command). The composer uses it for the per-turn model picker;
+   * the server never picks a model for the user beyond "empty = CLI default".
    * @param {string} floor
    * @param {{refresh?: boolean}} [opts]
-   * @returns {Promise<{floor: string, models: string[], error: string}>}
+   * @returns {Promise<{floor: string, models: string[], labels: Record<string,string>, error: string}>}
    */
   async function listModels(floor, opts = {}) {
     const id = String(floor || '');
@@ -769,10 +856,15 @@ function createDispatchService(deps = {}) {
     if (!bin) throw fail('floor_unavailable', `${id} 的 CLI 未安装`, 409);
     const hit = modelsCache.get(id);
     if (!opts.refresh && hit && now() - hit.at < MODELS_TTL_MS) return hit.value;
-    const raw = await fetchModels(bin);
+    const recipe = recipeFor(id);
+    const raw =
+      recipe && typeof recipe.fetchModels === 'function'
+        ? await recipe.fetchModels(bin)
+        : await fetchModels(bin);
     const value = {
       floor: id,
       models: Array.isArray(raw && raw.models) ? raw.models : [],
+      labels: raw && raw.labels && typeof raw.labels === 'object' ? raw.labels : {},
       error: String((raw && raw.error) || ''),
     };
     modelsCache.set(id, { at: now(), value });
