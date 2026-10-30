@@ -293,7 +293,7 @@ export const useSessionStore = defineStore('sessions', {
 
     /**
      * Project follows the selected session, not a server-wide "current project". This only loads
-     * the project's members into this client; it never calls POST /api/v1/workspace.
+     * the project's members into this client; it never changes the server default workspace.
      */
     followSelectedProject() {
       const s = this.sessions.find((x) => x.id === this.selectedId);

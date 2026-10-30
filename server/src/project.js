@@ -22,7 +22,6 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { WS_EVENTS } = require('@workgremlin/shared');
 const { workspacesPath } = require('@workgremlin/shared/paths');
 
 /* ============================ Project name resolution ============================ */
@@ -118,16 +117,14 @@ function expand(p) {
  *   · the floor poller / resident subagent scan, which needs one directory to read;
  *   · startup logging and `server.json`.
  *
- * `setDefault` exists for explicit API callers and tests; the UI never calls it.
+ * `setDefault` is only used by startup restore; there is no runtime/UI switch.
  *
- * @param {{repo: any, bus: any, initial?: {workspacePath?: string, projectName?: string},
- *          broadcast?: (project: string|null, type: string, payload: unknown) => void}} opts
+ * @param {{repo: any, bus: any, initial?: {workspacePath?: string, projectName?: string}}} opts
  */
 function createWorkspaceContext(opts) {
   const repo = opts.repo;
   const bus = opts.bus;
   const initial = opts.initial || {};
-  const broadcast = opts.broadcast || (() => {});
 
   /** @type {{workspacePath: string, projectName: string, project: string|null}} */
   let current = {
@@ -135,23 +132,19 @@ function createWorkspaceContext(opts) {
     projectName: initial.projectName || '',
     project: null,
   };
-  /** Callback after the default changes (index.js uses it to restart subagent manifest watching) */
-  let onSwitch = null;
 
   function persist() {
     writeStore({ default: { ...current, savedAt: Date.now() } });
   }
 
-  /** Apply the default: update bus fallback context -> persist -> notify -> broadcast a snapshot. */
+  /** Apply the startup default: update the bus fallback context and persist it. */
   function apply() {
     bus.setContext({ projectName: current.projectName, project: current.project, workspacePath: current.workspacePath });
     persist();
-    if (onSwitch) onSwitch(current);
-    broadcast(null, WS_EVENTS.SNAPSHOT, bus.buildSnapshot(null));
     return { ...current };
   }
 
-  /** Set the default workspace; throws if the directory does not exist (no guessing, no creating). */
+  /** Set the default workspace (startup only); throws if the directory does not exist. */
   function setDefault(rawPath) {
     const abs = expand(rawPath);
     if (!abs) throw new Error('empty path');
@@ -215,9 +208,6 @@ function createWorkspaceContext(opts) {
     get: () => ({ ...current }),
     setDefault,
     restore,
-    setOnSwitch: (fn) => {
-      onSwitch = fn;
-    },
   };
 }
 

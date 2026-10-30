@@ -55,7 +55,7 @@ node packages/reporter/src/cli.js --project $S --member coder --message --to lea
 
 上报后工位卡片应实时变化（状态/文件/最近产出）。
 
-> 不传 `--project` 时，reporter 会跟随服务端「当前打开的工程」（`GET /api/v1/workspace`）；`WORKGREMLIN_PROJECT` 也可覆盖。
+> 不传 `--project` 时，reporter 会跟随服务端「默认 workspace」（`GET /api/v1/workspace`）；`WORKGREMLIN_PROJECT` 也可覆盖。
 
 ## 数据库与安全
 

@@ -96,33 +96,15 @@ function isLoopbackOrigin(origin) {
 }
 
 /**
- * Server lifecycle hooks: a tiny registry that replaces the hand-written chaining in start()/close()
- * with explicit registration, run in registration order.
- *   - onWorkspaceSwitch: fires after the server default workspace changes (startup restore / an
- *     explicit POST /api/v1/workspace; the UI does not switch it). Demo is a virtual session and
- *     never changes the default.
- *   - onClose: fires before the server closes (for resources other than timers)
+ * Server lifecycle hooks: a tiny registry for close-time cleanup.
  * An error inside a hook must not block the other hooks, hence the one-by-one try/catch.
  */
 function createLifecycle() {
-  const switchHooks = [];
   const closeHooks = [];
 
   return {
-    onWorkspaceSwitch(fn) {
-      switchHooks.push(fn);
-    },
     onClose(fn) {
       closeHooks.push(fn);
-    },
-    afterWorkspaceSwitch() {
-      for (const fn of switchHooks) {
-        try {
-          fn();
-        } catch (err) {
-          log.warn('[workgremlin] afterWorkspaceSwitch 钩子失败：', err && err.message);
-        }
-      }
     },
     beforeClose() {
       for (const fn of closeHooks) {
@@ -239,7 +221,6 @@ function createServer(opts = {}) {
     repo,
     bus,
     initial: { workspacePath, projectName },
-    broadcast: (project, type, payload) => (hub ? hub.broadcast(project, type, payload) : undefined),
   });
   app.use('/api/v1', requireToken(token), createWorkspaceRouter({ workspace }));
   app.use('/api/v1', requireToken(token), createProductsRouter());
@@ -402,13 +383,6 @@ function createServer(opts = {}) {
       },
     });
     timers.push(poller.start());
-
-    // Lifecycle hook: fires in registration order after every project switch (restore / manual
-    // switch / demo switch all come through here).
-    lifecycle.onWorkspaceSwitch(() => {
-      poller.syncAgentsNow();
-    });
-    workspace.setOnSwitch(() => lifecycle.afterWorkspaceSwitch());
 
     // Close hooks: stop non-timer resources in registration order.
     lifecycle.onClose(() => demo.stopAll());

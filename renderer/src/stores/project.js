@@ -208,7 +208,7 @@ export const useProjectStore = defineStore('project', {
      *
      * Project is not a user-managed, server-global state: the session already carries its
      * workspace path, so this only loads that project's members/messages into this client. It must
-     * never call POST /api/v1/workspace — that would switch every other connected client too.
+     * never change the server's default workspace — that would affect every other connected client.
      *
      * @param {{projectPath?: string}|null} session
      * @returns {Promise<boolean>} whether a concrete project was found and applied

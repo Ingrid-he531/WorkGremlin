@@ -127,7 +127,7 @@ function createPoller({
     }
   }
 
-  /** Run the agent sync now, ignoring the cadence (e.g. right after a workspace switch). */
+  /** Run the agent sync now, ignoring the cadence (tests / an explicit refresh). */
   function syncAgentsNow() {
     if (!agents) return;
     lastAgentsAt.clear();

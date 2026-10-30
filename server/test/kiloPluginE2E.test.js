@@ -24,6 +24,7 @@ const env = {
   HOME: TMP,
   WORKGREMLIN_HOME: WG,
   WORKGREMLIN_NO_AUTO_HOOKS: '1',
+  WORKGREMLIN_WORKSPACE: WS,
 }
 
 // **本进程**也锁进沙箱。只给子进程 spawn 传 env 是不够的：插件是 `import()` 到**当前**
@@ -103,9 +104,6 @@ async function main() {
   const info = JSON.parse(fs.readFileSync(infoFile, 'utf8'))
   const base = `http://127.0.0.1:${info.port}`
   console.log('  端口', info.port)
-
-  // 告诉服务端"当前打开的是这个工程"（插件按服务端当前工程归属，与 hook.js 同一口径）
-  await post(`${base}/api/v1/workspace`, info.token, { project: 'proj-e2e', workspacePath: WS })
 
   const plugin = (await import(pathToFileURL(path.join(ROOT, 'packages/reporter/src/plugin/index.js')))).default
   // 把插件的 fetch 拦下来：既打日志（出问题时能一眼看出"是没发"、"发了但 400"还是"发了但被丢"），
@@ -357,7 +355,6 @@ async function main() {
   fs.writeFileSync(OLD, '// 别人一小时前改的\n')
   const hourAgo = new Date(Date.now() - 3_600_000)
   fs.utimesSync(OLD, hourAgo, hourAgo)
-  await post(`${base}/api/v1/workspace`, info.token, { project: 'proj-e2e3', workspacePath: WS3 })
   const SID5 = 'ses_e2e_0005'
   const hooksDiff = await plugin.server({ directory: WS3 }, { client: 'kilo' })
   let d5 = 0

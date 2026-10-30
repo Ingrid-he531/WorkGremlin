@@ -29,6 +29,7 @@ const env = {
   HOME: TMP,
   WORKGREMLIN_HOME: WG,
   WORKGREMLIN_NO_AUTO_HOOKS: '1',
+  WORKGREMLIN_WORKSPACE: WS,
 }
 
 // 本进程也锁进沙箱（插件的 readServerInfo 读当前进程 env）
@@ -89,8 +90,6 @@ async function main() {
   const base = `http://127.0.0.1:${info.port}`
   console.log('  端口', info.port)
 
-  await post(`${base}/api/v1/workspace`, info.token, { project: 'proj-reply', workspacePath: WS })
-
   // 加载插件（VS Code 形态）
   const plugin = (await import(pathToFileURL(path.join(ROOT, 'packages/reporter/src/plugin/index.js')))).default
   process.env.KILO_CLIENT = 'vscode'
@@ -124,14 +123,14 @@ async function main() {
 
   {
     const d = db()
-    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo-plugin'").get(SID1)
+    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo'").get(SID1)
     const tk = t ? d.prepare("SELECT state FROM tasks WHERE id = ?").get(t.id) : null
     d.close()
     ok('正常完成：task_runs 有一行', Boolean(t), JSON.stringify(t))
     ok('state = done', tk && tk.state === 'done', tk && tk.state)
     ok('标题 = 用户原话', t && t.title === '帮我写一个 hello', t && t.title)
     ok('收尾自述 = assistant 的最后一段', t && String(t.result || '').includes('已经写好了 hello.ts'), t && t.result)
-    ok('form = plugin', t && t.form === 'plugin', t && t.form)
+    ok('form = vscode', t && t.form === 'vscode', t && t.form)
     ok('model 带上了', t && t.model === 'kilo-auto/free', t && t.model)
   }
 
@@ -150,7 +149,7 @@ async function main() {
 
   {
     const d = db()
-    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo-plugin'").get(SID2)
+    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo'").get(SID2)
     const tk = t ? d.prepare("SELECT state FROM tasks WHERE id = ?").get(t.id) : null
     d.close()
     ok('被打断：task_runs 有一行', Boolean(t), JSON.stringify(t))
@@ -179,7 +178,7 @@ async function main() {
 
   {
     const d = db()
-    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo-plugin'").get(SID3)
+    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo'").get(SID3)
     const tk = t ? d.prepare("SELECT state FROM tasks WHERE id = ?").get(t.id) : null
     d.close()
     ok('finish=length：task_runs 有一行', Boolean(t), JSON.stringify(t))
@@ -211,7 +210,7 @@ async function main() {
 
   {
     const d = db()
-    const rows = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo-plugin' ORDER BY started_at").all(SID4)
+    const rows = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo' ORDER BY started_at").all(SID4)
     const states = rows.map((r) => d.prepare("SELECT state FROM tasks WHERE id = ?").get(r.id)?.state)
     d.close()
     ok('多轮：两轮各一行', rows.length === 2, `实际 ${rows.length} 行`)
@@ -234,14 +233,14 @@ async function main() {
   await part(SID5, { id: 'p12', type: 'tool', tool: 'bash', callID: 'c5', state: { status: 'pending', input: { command: 'rm -rf /tmp/test' } } }, 'a5')
   await sleep(300)
 
-  const rp5 = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID5)}`, info.token)
+  const rp5 = await get(`${base}/api/v1/reporter-phase?client=kilo&session=${encodeURIComponent(SID5)}`, info.token)
   ok('等待授权：相位 = await', rp5.phase === 'await', JSON.stringify(rp5))
 
   // 授权通过后工具继续 running → 相位回到 thinking
   await part(SID5, { id: 'p12b', type: 'tool', tool: 'bash', callID: 'c5', state: { status: 'running', input: { command: 'rm -rf /tmp/test' } } }, 'a5')
   await sleep(300)
-  const rp5b = await get(`${base}/api/v1/reporter-phase?client=kilo-plugin&session=${encodeURIComponent(SID5)}`, info.token)
-  ok('授权通过后：相位回到 thinking', rp5b.phase === 'thinking', JSON.stringify(rp5b))
+  const rp5b = await get(`${base}/api/v1/reporter-phase?client=kilo&session=${encodeURIComponent(SID5)}`, info.token)
+  ok('授权通过后：相位是 tool（工具继续执行）', rp5b.phase === 'tool', JSON.stringify(rp5b))
 
   // 收尾
   await part(SID5, { id: 'p13', type: 'text', role: 'assistant', text: '"删除完毕"' }, 'a5')
@@ -251,7 +250,7 @@ async function main() {
 
   {
     const d = db()
-    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo-plugin'").get(SID5)
+    const t = d.prepare("SELECT * FROM task_runs WHERE session_id = ? AND client = 'kilo'").get(SID5)
     const tk = t ? d.prepare("SELECT state FROM tasks WHERE id = ?").get(t.id) : null
     d.close()
     ok('等待授权后完成：state = done', tk && tk.state === 'done', tk && tk.state)

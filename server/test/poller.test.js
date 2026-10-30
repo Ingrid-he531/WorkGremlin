@@ -140,7 +140,7 @@ head('[4] 楼层自己扫 agent，经上层注册；当前工程名随 ctx 传�
   ok('楼层发现消失的 agent → 调上层 unregister', removed.length === 1 && removed[0][1] === 'gone', JSON.stringify(removed));
 
   poller.syncAgentsNow();
-  ok('syncAgentsNow() 忽略节流，立刻再扫一次（换工程用）', ctxs.length === 3, String(ctxs.length));
+  ok('syncAgentsNow() 忽略节流，立刻再扫一次', ctxs.length === 3, String(ctxs.length));
 }
 
 head('[6] 会话扫描成功后才对账孤儿任务；扫描失败时不触发取消');
