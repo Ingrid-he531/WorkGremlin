@@ -25,7 +25,10 @@ function readServerInfo() {
   const file = path.join(home(), 'server.json');
   if (!fs.existsSync(file)) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    const info = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // After a normal shutdown the file keeps only the token (no port/pid): not connection info.
+    if (!info || !Number.isInteger(info.port) || info.port <= 0) return null;
+    return info;
   } catch {
     return null;
   }

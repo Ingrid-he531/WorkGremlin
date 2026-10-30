@@ -108,6 +108,24 @@ function pidAlive(pid) {
 
 function dropServerInfo() {
   try {
+    // Keep the token across a --restart, but drop port/pid: the token is what remote clients
+    // were given, and it must not rotate just because the development server was restarted.
+    const info = JSON.parse(fs.readFileSync(SERVER_JSON, 'utf8'));
+    if (info && typeof info.token === 'string' && info.token) {
+      fs.writeFileSync(SERVER_JSON, JSON.stringify({ token: info.token, stoppedAt: Date.now() }, null, 2), {
+        mode: 0o600,
+      });
+      try {
+        fs.chmodSync(SERVER_JSON, 0o600);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+  } catch {
+    /* missing / corrupt file: fall through to deletion */
+  }
+  try {
     fs.rmSync(SERVER_JSON, { force: true });
   } catch {
     /* 删不掉就算了，后面还会 ping 端口判活 */
@@ -115,9 +133,9 @@ function dropServerInfo() {
 }
 
 /**
- * 停掉在跑的 server（--restart 用）：先 SIGTERM 让它走正常收尾（它会自己清 server.json、
- * 关库、停钩子），等它退；超时就 SIGKILL 兜底，再把残留的 server.json 删掉 ——
- * 不删的话下面会把它当成"已有可用 server"，新代码起不来。
+ * 停掉在跑的 server（--restart 用）：先 SIGTERM 让它走正常收尾（它会自己写回 token、
+ * 关库、停钩子），等它退；超时就 SIGKILL 兜底，再把残留的 server.json 的 port/pid 清掉 ——
+ * 不清的话下面会把它当成"已有可用 server"，新代码起不来；token 保留，远程客户端不用重配。
  */
 async function stopServer(info) {
   const pid = info && Number.isInteger(info.pid) ? info.pid : 0;
@@ -150,17 +168,25 @@ async function stopServer(info) {
 }
 
 function startServer() {
-  // 用 AppImage 自带的 Electron 跑 server（不是系统 node）；asar 内脚本可作为 electron 入口
-  const child = spawn(
-    process.execPath,
-    [...passthroughFlags(), path.join(ROOT, 'server/src/cli.js')],
-    {
-      cwd: ROOT,
-      env: { ...process.env },
-      stdio: 'ignore',
-      detached: true,
-    }
-  );
+  // Use Electron's bundled Node (not a system node) so a packaged AppImage needs no Node install.
+  // Serve the built renderer as well, so the same server can be opened from a browser on another
+  // machine while the local Electron window keeps using it. Missing dist (dev before the first
+  // build) simply leaves browser mode off; the desktop window still loads the Vite URL in dev.
+  const staticDir = path.join(ROOT, 'renderer', 'dist');
+  const serveStatic = fs.existsSync(path.join(staticDir, 'index.html'));
+
+  const args = [...passthroughFlags(), path.join(ROOT, 'server/src/cli.js')];
+  if (serveStatic) args.push('--static', staticDir);
+  if (serveStatic) console.log(`[launcher] 同时提供浏览器 UI：${staticDir}`);
+
+  // Host / port / TLS come from ~/.workgremlin/config.json's "server" section (read by cli.js),
+  // so `npm run launch:electron -- --restart` is the same command for local and remote use.
+  const child = spawn(process.execPath, args, {
+    cwd: ROOT,
+    env: { ...process.env },
+    stdio: 'ignore',
+    detached: true,
+  });
   child.unref();
 }
 

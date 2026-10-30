@@ -1175,8 +1175,8 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
    *
    * **Yielding only holds while the plugin is still reporting** (since 2026-09-30, same criterion as
    * kilo.js): a plugin-written row only proves it **used** to report —— it lives and dies with the agent
-   * process, and when the channel breaks (the server restarted with a new random token, so in the old
-   * process that plugin's every report is a silent 401) neither path writes, and the rounds the user runs
+   * process, and when the channel breaks (the server rotated its token -- a restart used to generate
+   * a new one, so in the old process that plugin's every report is a silent 401) neither path writes, and the rounds the user runs
    * vanish into thin air.
    * Hence the criterion is "did the plugin write **this round** too": its newest row landing after the
    * newest round's start point in the source (tolerating PLUGIN_COVER_MS) → yield; if the round just

@@ -15,13 +15,14 @@
  * remote token is fixed, so it is handed to the renderer as-is instead of re-read per reconnect.
  */
 
-const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen, shell } = require('electron');
+const { app, ipcMain, BrowserWindow, dialog, globalShortcut, screen, shell, session } = require('electron');
 const { createWindow, isDev } = require('./window');
 const { buildMenu } = require('./menu');
 const { remoteConfig, isClientBuild } = require('./remoteConfig');
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
+const crypto = require('node:crypto');
 const { execSync } = require('node:child_process');
 const { IPC_EVENTS, home: wgHome } = require('@workgremlin/shared');
 
@@ -55,6 +56,40 @@ function pingPort(host, port, timeoutMs = 1500) {
   });
 }
 
+/**
+ * Trust exactly the certificate the local server reported in server.json.
+ *
+ * A self-signed certificate is fine for loopback, but Chromium refuses it, which would break the
+ * local window as soon as `server.tls` is enabled. Matching the SHA-256 fingerprint keeps that
+ * window working without disabling certificate checks for any other HTTPS request.
+ *
+ * @param {{protocol?: string, tlsFingerprint?: string}|null} info
+ */
+function trustServerCertificate(info) {
+  if (!info || String(info.protocol || '').toLowerCase() !== 'https' || !info.tlsFingerprint) return;
+  const expected = String(info.tlsFingerprint).replace(/[^0-9a-f]/gi, '').toUpperCase();
+  if (!expected) return;
+  try {
+    session.defaultSession.setCertificateVerifyProc((request, callback) => {
+      try {
+        const cert = request && request.certificate;
+        if (cert && cert.data) {
+          const actual = new crypto.X509Certificate(cert.data)
+            .fingerprint256.replace(/[^0-9a-f]/gi, '')
+            .toUpperCase();
+          if (actual === expected) return callback(0);
+        }
+      } catch {
+        /* fall through to Chromium's normal verification */
+      }
+      return callback(-3);
+    });
+    console.log('[workgremlin] 已信任本地 server 的 TLS 证书指纹');
+  } catch (err) {
+    console.warn('[workgremlin] 无法安装本地证书信任：', err && err.message);
+  }
+}
+
 async function bootstrap() {
   await app.whenReady();
 
@@ -71,7 +106,7 @@ async function bootstrap() {
       'WorkGremlin Client',
       '没有找到远程服务配置。\n\n' +
         '在与本程序相同的目录放一个 client.json：\n\n' +
-        '{\n  "host": "192.168.1.5",\n  "port": 21800,\n  "token": "<服务端 --token 指定的值>"\n}\n\n' +
+        '{\n  "host": "192.168.1.5",\n  "port": 21800,\n  "token": "<服务端 server.json 里的 token>"\n}\n\n' +
         '也可以改用环境变量 WORKGREMLIN_REMOTE=host:port 与 WORKGREMLIN_REMOTE_TOKEN。'
     );
     app.quit();
@@ -104,11 +139,13 @@ async function bootstrap() {
     }
   }
 
+  trustServerCertificate(serverInfo);
+
   /**
    * 渲染层每次（重）连前都会来问一次当前 server 信息 —— **每次都重读 server.json**。
    *
-   * server 每次启动都会换 token（见 server/src/config.js 的 newToken），如果这里只回
-   * 启动那一刻缓存的那份，server 一重启渲染层就拿着旧 token 一直重连（服务端 close 4001
+   * token 会在 --rotate-token 时更换（正常重启复用同一个 token），如果这里只回启动那一刻
+   * 缓存的那份，服务端轮换 token 后渲染层就拿着旧 token 一直重连（服务端 close 4001
    * bad_token）+ 所有 HTTP 轮询 401，界面停在旧数据上不再更新（实测：任务列表里"运行中"
    * 的任务消失，只剩旧记录）。所以这里现读现给，读不到才退回缓存。
    *

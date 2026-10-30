@@ -67,9 +67,12 @@ function serverInfoPath() {
 /**
  * User-editable server configuration: `~/.workgremlin/config.json`.
  *
- * Not written by the server (unlike server.json): it is read on demand, so editing it takes effect
- * without a restart. Shape:
- *   { "dispatch": { "mode": "off" | "auto" | "confirm" } }
+ * Not written by the server (unlike server.json). `dispatch` is re-read on every policy check;
+ * `server` is read once at startup. Shape:
+ *   {
+ *     "server": { "host": "0.0.0.0", "port": 21800, "tls": true },
+ *     "dispatch": { "mode": "off" | "auto" | "confirm" }
+ *   }
  */
 function serverConfigPath() {
   return path.join(home(), 'config.json');
@@ -222,12 +225,16 @@ function isPidAlive(pid) {
  *   - the server itself: `readServerInfo({ requireAlive: true })`
  *   - reporter SDK / plugin: `readServerInfo()` (whether to check pid is left to the caller)
  *
+ * A file without a usable `port` is not connection info: after a normal shutdown config.js keeps
+ * only `{ token }` so the next start can reuse the token, and those readers must treat it as absent.
+ *
  * @param {{requireAlive?: boolean}} [opts]
  * @returns {Record<string, any>|null}
  */
 function readServerInfo(opts = {}) {
   const info = readJson(serverInfoPath(), null);
   if (!info || typeof info !== 'object' || Array.isArray(info)) return null;
+  if (!Number.isInteger(info.port) || info.port <= 0) return null;
   if (opts.requireAlive && !isPidAlive(info.pid)) return null;
   return info;
 }

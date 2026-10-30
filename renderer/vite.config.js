@@ -14,9 +14,9 @@ const SERVER_ORIGIN = `${SERVER_TLS ? 'https' : 'http'}://127.0.0.1:${SERVER_POR
 const SERVER_WS_ORIGIN = `${SERVER_TLS ? 'wss' : 'ws'}://127.0.0.1:${SERVER_PORT}`;
 
 /**
- * 读取本地服务 token（每次启动随机生成，写在 ~/.workgremlin/server.json）。
+ * 读取本地服务 token（首次启动生成，持久化在 ~/.workgremlin/server.json）。
  * 浏览器 dev 模式没有 preload 桥接，拿不到 token 会被 401 / WS 踢下线，
- * 因此由 vite 代理在转发时**动态**注入（每次请求现读，服务端重启换 token 也不用重启 vite）。
+ * 因此由 vite 代理在转发时**动态**注入（每次请求现读，服务端轮换 token 也不用重启 vite）。
  */
 function readServerToken() {
   const home = process.env.WORKGREMLIN_HOME || path.join(os.homedir(), '.workgremlin');

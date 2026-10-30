@@ -11,6 +11,9 @@
  *     "dispatch": { "mode": "off" }     // off | auto | confirm
  *   }
  *
+ * The same file also has a `server` section (host / port / TLS), read once by startupConfig.js;
+ * this module only parses the dispatch policy.
+ *
  * The file is read on demand (every policy check), so edits take effect without restarting the
  * server. `WORKGREMLIN_DISPATCH_MODE` overrides the file for containers / tests; an invalid value in
  * either place falls back to `off` (never "allow by accident").

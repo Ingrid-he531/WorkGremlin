@@ -102,7 +102,7 @@ it is not a member state and does not imply `offline`.
 | A product changes its private on-disk format | Each floor module is isolated; a parse failure logs a warning and returns empty data, and never crashes the server or other floors |
 | A native SQLite module does not match Electron's ABI | `better-sqlite3` is rebuilt for Electron by `postinstall`; `npm run db:check` verifies open → write → read → checkpoint |
 | Local port already in use / multiple instances | Probe ports 21800–21820; write `port`/`token`/`pid` to `~/.workgremlin/server.json`; verify the recorded pid is alive before reusing |
-| Another local process abuses the API | A random token is generated on every start; HTTP and WS require it; the server binds `127.0.0.1` only |
+| Another local process abuses the API | A token is generated on the first start, persisted in `server.json` (`0600`) and reused on later starts; HTTP and WS require it; the server binds `127.0.0.1` only |
 | A floor has no hook → data gaps | Floor readers supply sessions/tasks/tokens; the UI labels passive members and empty fields honestly |
 | A running task's process dies | No timeout/TTL heuristic guesses. A running task stays running until an explicit end/reconciliation event; liveness is not fabricated |
 
@@ -123,7 +123,7 @@ it is not a member state and does not imply `offline`.
 | Packaging | `electron-builder` (x64 Linux/Windows/macOS) | AppImage/deb, NSIS, dmg; macOS is ad-hoc signed (no notarization account) |
 
 **Security baseline.** SQLite connections use `secure_delete=ON`, WAL auto-checkpointing, `synchronous=NORMAL`,
-`foreign_keys=ON` and file mode `0600`. The server binds loopback only and requires a per-start token.
+`foreign_keys=ON` and file mode `0600`. The server binds loopback only and requires a persisted token.
 Message redaction is **not implemented yet**; when it lands it must happen before persistence and before
 FTS indexing, so plaintext never enters the database.
 
@@ -143,7 +143,7 @@ WorkGremlin/
 │   ├── src/
 │   │   ├── index.js              # createServer(): DB + bus + hub + routers + poller + demo
 │   │   ├── cli.js                # standalone server + --self-test
-│   │   ├── config.js             # port probe, random token, server.json
+│   │   ├── config.js             # port probe, persisted token, server.json
 │   │   ├── clock.js              # injectable clock
 │   │   ├── db/{schema.sql,index.js}   # schema, migrations, prepared statements
 │   │   ├── ingest/

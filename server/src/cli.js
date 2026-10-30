@@ -3,10 +3,16 @@
 
 /**
  * Standalone entry point (headless mode):
+ *   Host / port / TLS can also be set in ~/.workgremlin/config.json under "server";
+ *   command-line flags and environment variables override that file.
+ *
  *   node server/src/cli.js                      default port probing + connect real data sources
  *   node server/src/cli.js --port 21800
- *   node server/src/cli.js --host 0.0.0.0       listen on all interfaces (remote clients need --token)
- *   node server/src/cli.js --token mytoken      fixed token (the default is random per start)
+ *   node server/src/cli.js --host 0.0.0.0       listen on all interfaces (remote clients reuse the
+ *                                              token persisted in server.json)
+ *   node server/src/cli.js --token mytoken      explicit token (not recommended: visible in the
+ *                                              process list / shell history)
+ *   node server/src/cli.js --rotate-token       generate a new token and persist it in server.json
  *   node server/src/cli.js --static renderer/dist
  *                                              also serve the built UI, so a client machine only
  *                                              needs a browser (`npm run build` first)
@@ -52,6 +58,7 @@ const log = require('./log');
 const { createServer } = require('./index');
 const { openDatabase } = require('./db');
 const { resolveTls } = require('./tls');
+const { resolveStartupSettings, validTls } = require('./startupConfig');
 const config = require('./config');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -169,8 +176,12 @@ async function main() {
     return;
   }
 
-  const host = typeof args.host === 'string' ? args.host : undefined;
-  // The address actually bound by createServer: no --host means loopback, never the LAN address.
+  // host / port / TLS may come from ~/.workgremlin/config.json ("server" section) in addition to
+  // the flags. Command line > environment > file > default; the same file also holds dispatch.mode.
+  const startup = resolveStartupSettings({ args });
+  const host = startup.host;
+  const requestedPort = startup.port;
+  // The address actually bound by createServer: no host means loopback, never the LAN address.
   const bindHost = host || '127.0.0.1';
   const staticDir = typeof args.static === 'string' ? path.resolve(args.static) : undefined;
   if (staticDir && !fs.existsSync(path.join(staticDir, 'index.html'))) {
@@ -178,19 +189,12 @@ async function main() {
     process.exit(1);
   }
 
-  // TLS: `--tls` (self-signed, generated once) or `--tls-cert` + `--tls-key`. WORKGREMLIN_TLS=1 is
-  // the same as --tls, so a dev shell can start an https server without a long command line.
-  const tlsFlag = args.tls;
+  // TLS: `--tls` (self-signed, generated once) or `--tls-cert` + `--tls-key`. WORKGREMLIN_TLS=1
+  // and config.json's `server.tls` are the same as --tls, so a dev shell can start an https server
+  // without a long command line. An explicit certificate pair always wins over the self-signed flag.
   const certFile = typeof args['tls-cert'] === 'string' ? path.resolve(args['tls-cert']) : undefined;
   const keyFile = typeof args['tls-key'] === 'string' ? path.resolve(args['tls-key']) : undefined;
-  const wantsSelfSigned =
-    tlsFlag === true ||
-    tlsFlag === '1' ||
-    tlsFlag === 'self-signed' ||
-    // The env var is a convenience for the dev shell; an explicit pair always wins, otherwise
-    // WORKGREMLIN_TLS=1 left in the environment would make --tls-cert fail as "二选一".
-    (!certFile && !keyFile && process.env.WORKGREMLIN_TLS === '1');
-  if (wantsSelfSigned && (certFile || keyFile)) {
+  if (validTls(args.tls) === true && (certFile || keyFile)) {
     log.error('[workgremlin] --tls 与 --tls-cert/--tls-key 只能二选一（自签 或 指定证书）');
     process.exit(1);
   }
@@ -198,21 +202,64 @@ async function main() {
     log.error('[workgremlin] --tls-cert 和 --tls-key 必须同时给出');
     process.exit(1);
   }
+  const wantsSelfSigned = !certFile && !keyFile && startup.tls;
   let tls = null;
   try {
-    tls = await resolveTls({ certFile, keyFile, selfSigned: Boolean(wantsSelfSigned) });
+    tls = await resolveTls({ certFile, keyFile, selfSigned: wantsSelfSigned });
   } catch (err) {
     log.error(`[workgremlin] TLS 配置不成立：${(err && err.message) || err}`);
     process.exit(1);
   }
+  log.info(
+    `[workgremlin] 启动配置：host=${bindHost} port=${requestedPort || 'auto'} tls=${tls ? 'on' : 'off'}` +
+      `（${startup.file}）`
+  );
+
+  // Token: an explicit --token wins, --rotate-token forces a new one, otherwise the token in
+  // server.json is reused. Reuse is what lets a remote client keep working after a restart.
+  // --no-token (debugging only) disables validation and is never reused.
+  const noToken = Boolean(args['no-token']);
+  const rotateToken = Boolean(args['rotate-token']);
+  if (rotateToken && noToken) {
+    log.error('[workgremlin] --rotate-token 和 --no-token 不能同时使用');
+    process.exit(1);
+  }
+  if (rotateToken && args.token !== undefined) {
+    log.error('[workgremlin] --rotate-token 和 --token 不能同时使用');
+    process.exit(1);
+  }
+  if (args.token !== undefined && typeof args.token !== 'string') {
+    log.error('[workgremlin] --token 需要一个值');
+    process.exit(1);
+  }
+  let token;
+  let tokenSource;
+  if (noToken) {
+    token = '';
+    tokenSource = 'none';
+  } else if (rotateToken) {
+    token = config.newToken();
+    tokenSource = 'rotated';
+  } else if (typeof args.token === 'string') {
+    token = args.token;
+    tokenSource = 'explicit';
+  } else {
+    const persisted = config.persistedToken();
+    token = persisted || config.newToken();
+    tokenSource = persisted ? 'persisted' : 'generated';
+  }
+  if (tokenSource === 'explicit') {
+    log.warn(
+      '[workgremlin] --token 会把密钥暴露在进程参数/命令历史里；建议去掉 --token，' +
+        '让服务器复用 server.json 中持久化的 token'
+    );
+  }
 
   const server = createServer({
     dbPath: typeof args.db === 'string' ? args.db : undefined,
-    port: args.port ? Number(args.port) : undefined,
+    port: requestedPort,
     host,
-    // --no-token wins: validation explicitly disabled (debugging only). --token pins a token so a
-    // remote client can know it before the server starts (the default rotates on every start).
-    token: args['no-token'] ? '' : typeof args.token === 'string' ? args.token : undefined,
+    token,
     workspacePath: typeof args.workspace === 'string' ? args.workspace : undefined,
     serveStatic: staticDir,
     tls,
@@ -221,7 +268,7 @@ async function main() {
   });
   if (args['log-file'] === '0') log.setFileEnabled(false);
 
-  await server.start(args.port ? Number(args.port) : undefined);
+  await server.start(requestedPort);
 
   if (tls) {
     const kind = tls.source === 'self-signed' ? '自签证书' : '证书文件';
@@ -237,36 +284,44 @@ async function main() {
     }
   }
 
+  // Never print the token itself: this log line is also written to disk for 7 days.
+  if (tokenSource === 'generated') {
+    log.info(`[workgremlin] 已生成新 token 并写入 ${config.serverInfoPath()}（0600）`);
+  } else if (tokenSource === 'rotated') {
+    log.info(`[workgremlin] 已轮换 token 并写入 ${config.serverInfoPath()}（0600）`);
+  } else if (tokenSource === 'persisted') {
+    log.info('[workgremlin] 复用 server.json 中已有的 token（重启不会更换）');
+  }
+
   if (staticDir) {
     // Use the bound host, not browserHost(undefined): without --host the server listens on loopback,
     // so printing the LAN address made the URL unreachable (the socket never accepted it).
     const base = `${server.info.protocol}://${browserHost(bindHost)}:${server.info.port}/`;
-    log.info(
-      `[workgremlin] 浏览器访问（客户端无需安装任何东西）：${base}${server.token ? `?token=${server.token}` : ''}`
-    );
+    log.info(`[workgremlin] 浏览器访问（客户端无需安装任何东西）：${base}`);
+    if (server.token) {
+      log.info(
+        `[workgremlin] 首次访问需要 token：读取 ${config.serverInfoPath()} 的 token 字段，` +
+          `打开 ${base}?token=<token>`
+      );
+    }
   }
 
   const loopback = !host || host === '127.0.0.1' || host === 'localhost' || host === '::1';
   if (!loopback) {
-    if (args['no-token']) {
+    if (noToken) {
       log.warn(`[workgremlin] 已监听 ${host} 且关闭了 token：只能用于可信网络或 SSH 隧道`);
-    } else if (!args.token) {
-      log.warn(
-        `[workgremlin] 已监听 ${host}，但 token 是本次随机生成的：远程客户端读不到它，` +
-          '请用 --token <固定值> 启动' +
-          (tls ? '（传输已加密，但 token 仍是长期共享密钥）' : '（token 明文传输，建议配合隧道/反代）')
-      );
-    } else if (tls) {
+    }
+    if (tls) {
       log.warn(
         `[workgremlin] 已监听 ${host}：传输已加密；但自签证书不能证明服务器身份，` +
-          '首次访问请核对启动日志里的 SHA-256 指纹（固定 --token 也是长期密钥，建议按需轮换）'
+          '首次访问请核对启动日志里的 SHA-256 指纹'
       );
-    } else {
+    } else if (!noToken) {
       log.warn(`[workgremlin] 已监听 ${host}：token 与实际数据都是明文 HTTP/WS 传输（建议加 --tls）`);
     }
   } else if (staticDir) {
     log.warn(
-      '[workgremlin] 当前只监听本机（127.0.0.1）；其他机器要访问，请加 --host 0.0.0.0 --token <固定值>' +
+      '[workgremlin] 当前只监听本机（127.0.0.1）；其他机器要访问，请加 --host 0.0.0.0' +
         (tls ? '' : ' --tls')
     );
   }

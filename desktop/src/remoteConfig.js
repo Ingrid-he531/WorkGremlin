@@ -17,8 +17,9 @@
  * The executable-adjacent file is what a portable client package uses: unzip, drop client.json
  * beside the binary, run. (For an AppImage the file goes next to the .AppImage itself.)
  *
- * The token must be a fixed one passed to the remote server with `--token`: the default token
- * is regenerated on every server start and is only readable from the server machine.
+ * The token is the one persisted in the server's ~/.workgremlin/server.json (0600). It is
+ * generated on the first start and reused on later starts; copy it to the client once. The
+ * explicit `--token` flag still works but is not recommended (visible in the process list).
  */
 
 const fs = require('node:fs');

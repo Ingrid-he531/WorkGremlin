@@ -72,7 +72,7 @@ function createStaticSite({ dir, token, secure = false }) {
       return res
         .status(401)
         .type('text')
-        .send('WorkGremlin: token required —— open /?token=<token> (the token is printed by the server)');
+        .send('WorkGremlin: token required —— open /?token=<token> (read the token from ~/.workgremlin/server.json)');
     }
 
     if (!queryToken) return res.type('html').send(index);

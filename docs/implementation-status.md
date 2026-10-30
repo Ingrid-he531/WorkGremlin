@@ -35,7 +35,7 @@ shared/                  protocol source of truth (CJS, zero dependencies, Node 
 server/                  Express + ws + better-sqlite3; embeddable in Electron or standalone
   src/index.js           createServer(): DB / bus / hub / routes / project management / roster
   src/cli.js             standalone start + --self-test (create tables → write → read back → checkpoint)
-  src/config.js          port probe (21800-21820), random token per start, ~/.workgremlin/server.json
+  src/config.js          port probe (21800-21820), persisted token, ~/.workgremlin/server.json
   src/clock.js           clock abstraction (test contract 7.1)
   src/db/{schema.sql,index.js}   tables + prepared statements + PRAGMA + migrations
   src/ingest/bus.js      the single write entry: persist → broadcast → build member card / snapshot

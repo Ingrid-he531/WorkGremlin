@@ -34,15 +34,40 @@ The renderer only talks HTTP `/api/v1` + WebSocket `/ws`, so the window can be a
 **Server side** (the machine running the agents and the database):
 
 ```bash
-# Browser mode: also serve the built UI; the printed URL carries the token once
+# Browser mode: also serve the built UI
 npm run build
-node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token --static renderer/dist --tls
+node server/src/cli.js --host 0.0.0.0 --port 21800 --static renderer/dist --tls
 
 # Window-client mode: expose the API + WS only
-node server/src/cli.js --host 0.0.0.0 --port 21800 --token my-token --tls
+node server/src/cli.js --host 0.0.0.0 --port 21800 --tls
 ```
 
-Always pass a fixed `--token`: the default token is regenerated on every start and is only readable on the server machine.
+The token is generated on the **first** start and written to `~/.workgremlin/server.json` (mode `0600`, inside a `0700` directory). Later starts reuse it, so a remote client does not lose access every time the server restarts. Read it once on the server machine and give it to the clients:
+
+```bash
+node -e "const p=require('path'),os=require('os'),fs=require('fs');console.log(JSON.parse(fs.readFileSync(p.join(process.env.WORKGREMLIN_HOME||p.join(os.homedir(),'.workgremlin'),'server.json'),'utf8')).token)"
+```
+
+The same startup settings can live in `~/.workgremlin/config.json`, so the command line can stay short:
+
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 21800, "tls": true }
+}
+```
+
+Then `node server/src/cli.js --static renderer/dist` is enough. Command-line flags and environment variables (`WORKGREMLIN_HOST`, `WORKGREMLIN_PORT`, `WORKGREMLIN_TLS`) override the file. The `server` section is read at startup, so a change needs a restart; `dispatch.mode` in the same file is re-read on demand.
+
+**One launch for local and remote**: the same `server` section also drives the Electron launcher. With `host` set to `0.0.0.0`, run:
+
+```bash
+npm run build            # only needed when renderer/dist is missing or stale
+npm run launch:electron -- --restart
+```
+
+That starts the server with the configured host/port/TLS, serves the built UI for browser clients, and opens the local window. The local window and a remote browser can use it at the same time; read the token from `server.json` for the browser URL. With `tls: true`, the local window trusts exactly the server's certificate fingerprint, while the browser shows the usual one-time self-signed warning. If `host` stays `127.0.0.1`, remote browsers cannot connect.
+
+To rotate it, start once with `--rotate-token` (a new random token is generated and persisted; no secret on the command line), then update every client. Deleting `server.json` while the server is stopped has the same effect. `--token <value>` still works but is **not recommended**: the secret then appears in `ps`, shell history and process-manager configuration.
 
 **TLS**: `--tls` makes the server speak HTTPS with a self-signed certificate (generated once into `~/.workgremlin/tls`, reused while valid), so the token and all data stop travelling in clear text. The startup log prints the certificate's SHA-256 fingerprint: the browser will warn once ("not private" → Advanced → Continue), and matching the fingerprint there is what makes that click-through meaningful. A self-signed certificate encrypts but does not *identify* the server —— if you need both, pass a real certificate instead:
 
@@ -54,8 +79,8 @@ In Vite dev mode, set `WORKGREMLIN_TLS=1` on both commands so the proxy targets 
 
 **Client side** (no server, no database):
 
-- **Browser — nothing to install**: open the URL printed by `--static` (`https://<host>:21800/?token=my-token` with `--tls`, `http://…` without). The token is exchanged for an httpOnly cookie, so a refresh does not need it again. `msedge --app=<url>` / `chrome --app=<url>` gives a window without browser chrome.
-- **Client-only window**: `npm run build:client` (Linux unpacked build), then put `client.json` `{ "host": "192.168.1.5", "port": 21800, "token": "my-token" }` next to the executable or in `~/.workgremlin/client.json`. On a Windows machine the same config produces the exe: `npx electron-builder --config electron-builder.client.yml --win portable`. The client package contains no server and no native module, so it is ~112 MB instead of ~125 MB and needs no SQLite toolchain. The `Client packages (Windows)` GitHub Actions workflow (`.github/workflows/client-windows.yml`) builds the zip + portable exe on `windows-latest` — run it from the Actions tab or push a `v*` tag.
+- **Browser — nothing to install**: open `https://<host>:21800/?token=<token from server.json>` with `--tls`, `http://…` without. The token is exchanged for an httpOnly cookie, so a refresh does not need it again. `msedge --app=<url>` / `chrome --app=<url>` gives a window without browser chrome.
+- **Client-only window**: `npm run build:client` (Linux unpacked build), then put `client.json` `{ "host": "192.168.1.5", "port": 21800, "token": "<token from server.json>" }` next to the executable or in `~/.workgremlin/client.json`. On a Windows machine the same config produces the exe: `npx electron-builder --config electron-builder.client.yml --win portable`. The client package contains no server and no native module, so it is ~112 MB instead of ~125 MB and needs no SQLite toolchain. The `Client packages (Windows)` GitHub Actions workflow (`.github/workflows/client-windows.yml`) builds the zip + portable exe on `windows-latest` — run it from the Actions tab or push a `v*` tag.
 - **Full package**: the same `client.json` turns it into a remote client; with a target configured it never starts or reads a local server.
 
 Without `--tls` everything is plain HTTP/WS: use it only on a trusted network, or put an SSH tunnel or a TLS reverse proxy in front. `--no-token` disables the only gate, so never combine it with `--host 0.0.0.0` on a shared network.
@@ -66,7 +91,10 @@ A client can hand **one prompt** to one floor; the run happens on the server mac
 
 - **Server policy** (a file on the server, **not** a client setting) — `~/.workgremlin/config.json`:
   ```json
-  { "dispatch": { "mode": "off" } }
+  {
+    "server": { "host": "0.0.0.0", "port": 21800, "tls": true },
+    "dispatch": { "mode": "off" }
+  }
   ```
   - `off` — reject every request (default);
   - `auto` — start on arrival; tool permissions are auto-approved (`opencode run --auto`);

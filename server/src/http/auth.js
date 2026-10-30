@@ -1,8 +1,8 @@
 'use strict';
 
 /**
- * Local authentication: only validates the local machine token (randomly generated on every
- * start and written to ~/.workgremlin/server.json).
+ * Local authentication: validates the machine token persisted in ~/.workgremlin/server.json
+ * (generated on the first start, reused afterwards).
  * The goal is not to defend against attacks, but to stop other processes on the same machine
  * from forging reports / subscriptions.
  */

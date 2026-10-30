@@ -1155,8 +1155,8 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
    * vanished from the list). "This session has plugin rows" only proves it **once** reported — the plugin
    * lives and dies with the agent process, and when the channel breaks it neither knows nor can send
    * anything. That measured case: the Kilo CLI process started at 11:00 (the plugin inside it predated the
-   * "re-read server.json" version), WorkGremlin restarted at 11:29 with a new random token (server/src/
-   * config.js generates one per start) → from then on every report from that process got a 401, and
+   * "re-read server.json" version), WorkGremlin restarted at 11:29 with a new token (at the time
+   * config.js generated one per start) → from then on every report from that process got a 401, and
    * **completely silently**: the state file was still written (so phase/state displayed fine) while not a
    * single ledger row arrived. So the two turns the user ran at 12:46 and 12:48 had no plugin write and
    * polling yielded the whole session → **neither task was findable** (the report was "state shows, but no

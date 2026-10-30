@@ -4,8 +4,9 @@
  * Local server config: port probing, token, and persisting runtime info.
  *
  * Runtime info is written to ~/.workgremlin/server.json and shared by the Electron main
- * process, the renderer, and the reporter CLI. It listens on 127.0.0.1 only; a random token
- * is generated on every start to stop other local processes from forging reports.
+ * process, the renderer, and the reporter CLI. The token is generated on the first start and
+ * then reused on every later start (see persistedToken), so a remote client does not lose
+ * access every time the server restarts.
  */
 
 const fs = require('node:fs');
@@ -39,6 +40,25 @@ const DEMO_PROJECT_NAME = '演示工程';
 
 function newToken() {
   return crypto.randomBytes(24).toString('hex');
+}
+
+/**
+ * Token persisted by a previous run, or null when this is the first start.
+ *
+ * Read **without** the liveness check: the old process may be gone, but the token in
+ * server.json is still the one remote clients were given, so a restart must keep it.
+ * `--no-token` writes an empty token, which is deliberately not reused: a later normal start
+ * should generate a real one.
+ *
+ * @returns {string|null}
+ */
+function persistedToken() {
+  try {
+    const info = JSON.parse(fs.readFileSync(serverInfoPath(), 'utf8'));
+    return info && typeof info.token === 'string' && info.token ? info.token : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -105,6 +125,27 @@ function clearServerInfo() {
   }
 }
 
+/**
+ * Keep only the token after a normal shutdown.
+ *
+ * Runtime fields (port / pid) are deliberately removed: readers that need a reachable server
+ * must treat this file as absent, while the next start can still reuse the token. This is what
+ * lets remote clients survive a restart without a separate token file.
+ *
+ * @param {string} token
+ */
+function writeStoppedInfo(token) {
+  ensureHome();
+  const file = serverInfoPath();
+  fs.writeFileSync(file, JSON.stringify({ token, stoppedAt: Date.now() }, null, 2), { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    /* ignore on non-POSIX systems */
+  }
+  return file;
+}
+
 module.exports = {
   home,
   ensureHome,
@@ -113,10 +154,12 @@ module.exports = {
   DEMO_PROJECT,
   DEMO_PROJECT_NAME,
   newToken,
+  persistedToken,
   isPortFree,
   isPidAlive,
   pickPort,
   writeServerInfo,
   readServerInfo,
   clearServerInfo,
+  writeStoppedInfo,
 };

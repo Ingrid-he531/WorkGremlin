@@ -155,10 +155,13 @@ function createServer(opts = {}) {
   if (opts.log) log.setLevel(opts.log);
   const dbPath = opts.dbPath || process.env.WORKGREMLIN_DB || config.defaultDbPath();
   // A string (empty included) means "use it": empty string = validation explicitly disabled
-  // (--no-token, debugging only); absent means generate a random token.
-  // Note it must not be `opts.token || newToken()` —— an empty string is falsy, which would silently
+  // (--no-token, debugging only); absent means reuse the token persisted by a previous run, or
+  // generate one on the very first start. Reuse matters for remote clients: a token that changed
+  // on every restart would invalidate every client each time the server comes back.
+  // Note it must not be `opts.token || ...` —— an empty string is falsy, which would silently
   // break --no-token.
-  const token = typeof opts.token === 'string' ? opts.token : config.newToken();
+  const token =
+    typeof opts.token === 'string' ? opts.token : config.persistedToken() || config.newToken();
   const host = opts.host || '127.0.0.1';
 
   const { db, repo, checkpoint, startCheckpointLoop, close: closeDb } = openDatabase(dbPath);
@@ -440,7 +443,8 @@ function createServer(opts = {}) {
     lifecycle.beforeClose();
     await new Promise((resolve) => httpServer.close(() => resolve(null)));
     closeDb();
-    config.clearServerInfo();
+    // Keep the token for the next start; drop port/pid so nobody mistakes this for a live server.
+    config.writeStoppedInfo(token);
   }
 
   return {

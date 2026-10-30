@@ -49,6 +49,8 @@
     "test:ghost-feed": "node server/test/ghostFeed.test.js",
     "test:opencode": "node server/test/opencodeFloor.test.js",
     "test:tokens": "node server/test/taskTokens.test.js",
+    "test:token-persistence": "node server/test/tokenPersistence.test.js",
+    "test:startup-config": "node server/test/startupConfig.test.js",
     "test:done-shape": "node server/test/doneShape.test.js",
     "test:task-filter": "node server/test/taskFilter.test.js",
     "test:retention": "node server/test/retention.test.js",
