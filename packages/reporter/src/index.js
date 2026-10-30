@@ -20,6 +20,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { HTTP_ROUTES, home } = require('@workgremlin/shared');
+const { baseUrl, request } = require('./transport');
 
 function readServerInfo() {
   const file = path.join(home(), 'server.json');
@@ -42,7 +43,9 @@ async function createReporter(opts) {
   if (!info && !opts.endpoint) {
     throw new Error('未找到 ~/.workgremlin/server.json，请先启动 WorkGremlin 或传入 endpoint');
   }
-  const base = (opts.endpoint || `http://127.0.0.1:${info.port}`).replace(/\/$/, '');
+  // Follow server.json's protocol: with TLS on, an http:// request to that port gets no answer at all
+  // (see transport.js).
+  const base = (opts.endpoint || baseUrl(info)).replace(/\/$/, '');
   const token = opts.token || (info ? info.token : '');
   const member = opts.member;
   const silent = opts.silent !== false;
@@ -51,7 +54,7 @@ async function createReporter(opts) {
   let project = opts.project;
   if (!project) {
     try {
-      const res = await fetch(`${base}/api/v1/workspace`, {
+      const res = await request(`${base}/api/v1/workspace`, {
         headers: token ? { authorization: `Bearer ${token}` } : {},
       });
       const cur = res.ok ? await res.json() : null;
@@ -64,7 +67,7 @@ async function createReporter(opts) {
   async function post(route, body) {
     const payload = { project, ...body };
     try {
-      const res = await fetch(`${base}${route}`, {
+      const res = await request(`${base}${route}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify(payload),
@@ -114,4 +117,4 @@ async function createReporter(opts) {
   };
 }
 
-module.exports = { createReporter, readServerInfo, HTTP_ROUTES };
+module.exports = { createReporter, readServerInfo, HTTP_ROUTES, baseUrl, request };

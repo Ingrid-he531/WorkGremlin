@@ -9,10 +9,13 @@
  * 跑法：`npm run test:hook-forward`
  */
 const http = require('node:http');
+const https = require('node:https');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+
+const { resolveTls } = require('../src/tls');
 
 const HOOK = path.join(__dirname, '..', '..', 'packages', 'reporter', 'src', 'hook.js');
 
@@ -133,6 +136,44 @@ async function run() {
   ok('503 下 hook 仍以 0 退出（绝不阻塞 agent）', exitCode === 0, `exitCode=${exitCode}`);
 
   server.close();
+
+  // --- TLS: server.json says protocol https, so the forwarder must not keep knocking on http ------
+  // Regression: an http:// request to a TLS port gets an empty reply, and the hook swallows the
+  // failure by design — every hook-based floor (4F Claude Code first among them) silently stopped
+  // writing task records the moment TLS was enabled, while polling floors kept working.
+  const tls = await resolveTls({ selfSigned: true, dir: path.join(TMP, 'tls'), names: ['localhost', '127.0.0.1'] });
+  received = null;
+  exitCode = null;
+  const tlsServer = https.createServer({ key: tls.key, cert: tls.cert }, (req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      try { received = JSON.parse(body); } catch { received = body; }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  await new Promise((resolve) => tlsServer.listen(0, '127.0.0.1', resolve));
+  fs.writeFileSync(
+    path.join(TMP, 'server.json'),
+    JSON.stringify({ port: tlsServer.address().port, token: 'test-token', protocol: 'https' }),
+    'utf8'
+  );
+  await new Promise((resolve) => {
+    const child = spawn(process.execPath, [HOOK, '--agent', 'claude'], {
+      env: { ...process.env, WORKGREMLIN_HOME: TMP },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdin.write(JSON.stringify({ ...ev, agent: 'claude', client: 'claude' }));
+    child.stdin.end();
+    child.on('close', (code) => { exitCode = code; resolve(); });
+  });
+  ok('TLS 服务端收到 /api/v1/hook 的 POST', !!received, 'received=null');
+  ok('TLS 下转发 body 带 hook_event_name', received && received.hook_event_name === 'UserPromptSubmit');
+  ok('TLS 下转发 body 带 agent', received && received.agent === 'claude');
+  ok('TLS 下 hook 进程退出码为 0', exitCode === 0, `exitCode=${exitCode}`);
+  tlsServer.close();
+
   fs.rmSync(TMP, { recursive: true, force: true });
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);

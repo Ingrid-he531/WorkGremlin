@@ -90,6 +90,9 @@ import { createRequire } from "node:module"
 const require_ = createRequire(import.meta.url)
 const { statePath, writeState, readServerInfo, isPidAlive } = require_('@workgremlin/shared/paths')
 const { DEFAULTS } = require_('@workgremlin/shared')
+// Loopback transport: follows server.json's protocol and accepts the server's self-signed
+// certificate (plain `fetch('http://…')` cannot reach a TLS listener at all — see transport.js).
+const { baseUrl: serverBaseUrl, request: serverRequest } = require_('../transport.js')
 
 /**
  * Council participants' sessions carry this fixed title (set via `--title`, see
@@ -224,11 +227,31 @@ function createIngest(client) {
       return null
     }
     conn = {
-      base: `http://127.0.0.1:${info.port}`,
+      base: serverBaseUrl(info),
+      // Plain HTTP keeps using `fetch` (host runtimes may optimise it, and tests intercept it);
+      // TLS needs the shared https-capable transport, which `fetch` cannot provide because the
+      // server's certificate is self-signed.
+      secure: String(info.protocol || "").toLowerCase() === "https",
       token: info.token || "",
       headers: { "content-type": "application/json", ...(info.token ? { authorization: `Bearer ${info.token}` } : {}) },
     }
     return conn
+  }
+
+  /**
+   * One HTTP call, fetch-shaped either way. HTTP goes through `fetch`; HTTPS goes through the shared
+   * transport in ../transport.js (accepts the self-signed loopback certificate).
+   */
+  function send(c, url, init) {
+    if (c.secure) {
+      return serverRequest(url, {
+        method: init.method,
+        headers: init.headers,
+        body: init.body == null ? null : init.body,
+        timeoutMs: HTTP_TIMEOUT_MS,
+      })
+    }
+    return fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
   }
 
   /** WorkGremlin not running / not installed → don't send, never hit a known-dead port */
@@ -251,11 +274,10 @@ function createIngest(client) {
     const c = connect()
     if (!c) return Promise.resolve(null)
     try {
-      return fetch(`${c.base}/api/v1${route}`, {
+      return send(c, `${c.base}/api/v1${route}`, {
         method: "POST",
         headers: c.headers,
         body: JSON.stringify({ project: projectCache, ...body }),
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       }).catch(() => null)
     } catch {
       /* can't send → skip */
@@ -276,7 +298,7 @@ function createIngest(client) {
     if (projectPromise) return projectPromise
     projectPromise = (async () => {
       try {
-        const res = await fetch(`${c.base}/api/v1/workspace`, { headers: c.headers, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+        const res = await send(c, `${c.base}/api/v1/workspace`, { headers: c.headers })
         const j = res.ok ? await res.json() : null
         const p = String((j && j.project) || "")
         if (p) {

@@ -27,7 +27,7 @@ const path = require('node:path');
 
 // Only readServerInfo is needed (to find the local server's port / token for the forwarding POST);
 // the route constants are owned by the server.
-const { readServerInfo } = require('./index');
+const { readServerInfo, baseUrl, request: httpRequest } = require('./index');
 const { home } = require('@workgremlin/shared');
 
 const REQ_TIMEOUT_MS = 2_000;
@@ -85,17 +85,16 @@ function readStdin() {
 
 /** Forward to the local server (reusing the Bearer token). A non-empty body means POST, otherwise GET. */
 async function request(info, route, body) {
-  const init = {
-    method: body ? 'POST' : 'GET',
-    headers: info.token ? { authorization: `Bearer ${info.token}` } : {},
-    signal: AbortSignal.timeout(REQ_TIMEOUT_MS),
-  };
-  if (body) {
-    init.headers['content-type'] = 'application/json';
-    init.body = JSON.stringify(body);
-  }
+  const headers = info.token ? { authorization: `Bearer ${info.token}` } : {};
+  if (body) headers['content-type'] = 'application/json';
   try {
-    const res = await fetch(`http://127.0.0.1:${info.port}${route}`, init);
+    // baseUrl follows server.json's `protocol`: with TLS on, http:// to that port gets no answer.
+    const res = await httpRequest(`${baseUrl(info)}${route}`, {
+      method: body ? 'POST' : 'GET',
+      headers,
+      body: body ? JSON.stringify(body) : null,
+      timeoutMs: REQ_TIMEOUT_MS,
+    });
     if (!res.ok) {
       debug(route, '->', res.status);
       return null;
