@@ -105,6 +105,27 @@ app.use('/api/v1', createIngestRouter({ bus }));
   const snapCurrent = bus.buildSnapshot();
   ok('不传参数时仍回退到当前工程 A', Boolean(snapCurrent.project) && snapCurrent.project.id === 'workgremlin', JSON.stringify(snapCurrent.project));
 
+  head('[5] 用户级小怪物不随工程走：任何工程的快照里都应出现');
+  bus.registerMember({
+    project: 'workgremlin',
+    memberId: 'simmon',
+    name: 'simmon',
+    role: 'subagent:user',
+    level: 'user',
+    client: 'codex',
+  });
+  const userInB = bus.buildSnapshot(WS_B).members.find((m) => m.name === 'simmon');
+  ok('B 的快照里有用户级小怪物', Boolean(userInB), JSON.stringify(bus.buildSnapshot(WS_B).members.map((m) => m.name)));
+  ok('用户级小怪物不挂工程（project=null）', userInB && userInB.project === null, userInB && userInB.project);
+  const snapA = bus.buildSnapshot();
+  const snapAUsers = snapA.members;
+  const userInA = snapAUsers.find((m) => m.name === 'simmon');
+  ok(
+    'A 的快照里也有，且不挂工程',
+    Boolean(userInA) && userInA.project === null,
+    JSON.stringify(snapAUsers.map((m) => [m.name, m.role, m.project]))
+  );
+
   server.close();
   close();
   fs.rmSync(TMP, { recursive: true, force: true });

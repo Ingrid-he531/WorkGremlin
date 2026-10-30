@@ -14,6 +14,7 @@ import { useSessionStore } from '../stores/sessions';
 import { useDemoStore } from '../stores/demo';
 import { useMainAgentStore } from '../stores/mainAgent';
 import { isEphemeralMember, projectLabelOf } from '../lib/ephemeral';
+import { isProjectLevelMember } from '../lib/projectScope';
 import { floorAcceptsClient } from '../lib/clientMatch';
 import { busySubagentsOf } from '../lib/liveSubagents';
 import { memberForSession, normalizeState, summonTaskTitle } from '../lib/memberTask';
@@ -581,14 +582,15 @@ let cardRaf = 0;
 // leaving only true subagent gremlins (including resident members registered by the scanner) at workstations.
 const sceneMembers = computed(() => {
   /**
-   * How to handle an empty floor (no active session on this floor) —— two categories:
+   * How to handle an empty floor (no selected session on this floor):
    *   · Ghosts (`subagent-<name>`) are not kept: they are session-level ephemeral members, the product of "this round's summon",
    *     and should not exist without a session (keeping them is the previous floor's afterimage).
-   *   · **Resident gremlins are kept**: user-level / project-level gremlins are static workstations already defined in the agents directory,
-   *     "present even when not currently summoned", unrelated to whether this floor has a session.
-   *     Not seeing them after switching would make people think this floor has nobody at all (with no session on 1F, user-level/project-level experts should still be at their workstations).
+   *   · **User-level resident gremlins are kept**: they are defined in the user's agent directory, not under a project,
+   *     so they exist without a project and stay at their workstations.
+   *   · **Project-level resident gremlins are hidden**: they are defined under `<project>/<agent-dir>` and have no meaning
+   *     without a project. Showing the previous project's experts on an empty floor is the afterimage this guard removes.
    */
-  const emptyFloor = sessions.floorEmpty;
+  const emptyFloor = sessions.floorEmpty || (sessions.loaded && !sessions.selectedId);
   // The virtual demo session behaves exactly like a real one here: its members carry the floor
   // client and the demo session id, so the ordinary floor / session filters select them.
   const want = sessions.selectedClient;
@@ -599,6 +601,7 @@ const sceneMembers = computed(() => {
   return sourceMembers.value
     .filter((m) => m.role !== 'agent')
     .filter((m) => !(emptyFloor && isEphemeralMember(m))) // Empty floor: keep only resident ones
+    .filter((m) => !(emptyFloor && isProjectLevelMember(m))) // ...and only the user-level ones
     // Filter the source by client (product / floor identifier): 3F sees only Codex, 1F only CodeBuddy.
     // client alone represents "which floor this belongs to" —— resident gremlins are written in the agents directory, and memberId is a
     // human-given name like peter/leo unrelated to the product, so it is never used to match floors. An empty client (old store / demo data /

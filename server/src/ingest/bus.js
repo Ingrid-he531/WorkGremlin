@@ -1771,7 +1771,27 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         serverVersion: '0.1.0',
       };
     }
-    const members = repo.listMembers.all(projectRow.id).map((m) => buildMemberCard(m.id)).filter(Boolean);
+    const localCards = repo.listMembers.all(projectRow.id).map((m) => buildMemberCard(m.id)).filter(Boolean);
+    // User-level gremlins are not project-scoped: they are defined in the user's agent directory and
+    // must exist without a project (and on every project's office). Project-level gremlins stay local.
+    const members = localCards.map((card) =>
+      card.role === 'subagent:user' ? { ...card, project: null } : card
+    );
+    const seenUserNames = new Set(
+      members.filter((m) => m.role === 'subagent:user').map((m) => String(m.name || '').toLowerCase())
+    );
+    for (const p of projects) {
+      if (!p || !p.id) continue;
+      for (const row of repo.listMembers.all(p.id)) {
+        if (row.role !== 'subagent:user') continue;
+        const key = String(row.name || '').toLowerCase();
+        if (seenUserNames.has(key)) continue;
+        const card = buildMemberCard(row.id);
+        if (!card) continue;
+        members.push({ ...card, project: null });
+        seenUserNames.add(key);
+      }
+    }
     const recentMessages = repo.listMessages(projectRow.id, { limit: DEFAULTS.MESSAGE_WINDOW, direction: 'desc' })
       .slice()
       .reverse()

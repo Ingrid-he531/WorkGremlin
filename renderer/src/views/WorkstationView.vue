@@ -5,6 +5,7 @@ import { useProjectStore } from '../stores/project';
 import { useSessionStore } from '../stores/sessions';
 import { useDemoStore } from '../stores/demo';
 import { isEphemeralMember } from '../lib/ephemeral';
+import { isProjectLevelMember } from '../lib/projectScope';
 import { floorAcceptsClient, isBaseAgent } from '../lib/clientMatch';
 import { memberForSession, normalizeState } from '../lib/memberTask';
 import { useI18n } from '../i18n';
@@ -29,10 +30,14 @@ const sorted = computed(() => {
   const order = ['blocked', 'busy', 'idle'];
   // Same rule as the office: filter by the current floor's client (an empty client counts as generic)
   const want = sessions.selectedClient;
+  const emptyFloor = sessions.floorEmpty || (sessions.loaded && !sessions.selectedId);
   return sourceMembers.value
     // Workstation cards only show resident gremlins; ghosts summoned temporarily (subagent-xxx) are not listed,
     // avoiding the misunderstanding of "a same-named gremlin appearing in the card list after a summon".
     .filter((m) => !isEphemeralMember(m))
+    // A floor with no selected session has no project: project-level experts from the previous
+    // project must not remain on its cards. User-level gremlins are not project-scoped.
+    .filter((m) => !(emptyFloor && isProjectLevelMember(m)))
     .filter((m) => floorAcceptsClient(want, m.client))
     .slice()
     .map((m) => memberForSession(m, sessions.selectedSessionId, sourceMembers.value))

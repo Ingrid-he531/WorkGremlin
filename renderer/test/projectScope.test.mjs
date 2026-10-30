@@ -15,7 +15,7 @@
  *
  * 跑法：`npm run test:project-scope`
  */
-const { memberBelongsToProject, sameWorkspacePath } = await import('../src/lib/projectScope.js');
+const { memberBelongsToProject, sameWorkspacePath, isProjectLevelMember } = await import('../src/lib/projectScope.js');
 
 let pass = 0;
 let fail = 0;
@@ -40,6 +40,14 @@ ok(
   !memberBelongsToProject({ memberId: 'coder@realproj', project: 'realproj' }, '__demo__')
 );
 ok('同工程但 id 一个是数字一个是字符串 → 收（按字符串比）', memberBelongsToProject({ project: 7 }, '7'));
+ok(
+  '用户级小怪物不属于某个工程 → 在别的工程里也收',
+  memberBelongsToProject({ role: 'subagent:user', project: 'realproj' }, 'otherproj')
+);
+ok(
+  '用户级小怪物按 level=user 也收',
+  memberBelongsToProject({ level: 'user', project: 'realproj' }, 'otherproj')
+);
 
 console.log('\n[2] 缺字段时一律放行（不能因为缺信息把当前工程的人挡掉）');
 ok('卡片没带 project（老服务端 / 老事件）→ 收', memberBelongsToProject({ memberId: 'coder@x' }, 'realproj'));
@@ -60,6 +68,14 @@ ok('尾斜杠不影响', sameWorkspacePath('/home/me/proj/', '/home/me/proj'));
 ok('Windows 分隔符不影响', sameWorkspacePath('C:\\work\\proj', 'C:/work/proj'));
 ok('不同路径 → 不匹配', !sameWorkspacePath('/home/me/proj', '/home/me/other'));
 ok('空路径不匹配空路径', !sameWorkspacePath('', ''));
+
+console.log('\n[5] 空楼层：项目级小怪物隐藏，用户级保留');
+ok('role=subagent:project → 项目级', isProjectLevelMember({ role: 'subagent:project' }));
+ok('level=project → 项目级', isProjectLevelMember({ level: 'project' }));
+ok('role=subagent:user → 不是项目级', !isProjectLevelMember({ role: 'subagent:user' }));
+ok('level=user → 不是项目级', !isProjectLevelMember({ level: 'user' }));
+ok('主 Agent 不是项目级小怪物', !isProjectLevelMember({ role: 'agent' }));
+ok('空值不会误判', !isProjectLevelMember(null));
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
