@@ -194,7 +194,8 @@ const FINGERPRINT = /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/;
 
     res = await request(base, '/?token=tok');
     const setCookie = res.headers['set-cookie'] || [];
-    ok('带 token -> 302', res.status === 302, `status=${res.status}`);
+    ok('带 token -> 200（不再 302 跳转）', res.status === 200, `status=${res.status}`);
+    ok('带 token 的响应也注入 boot token', res.body.includes('__WORKGREMLIN_BOOT__'));
     ok(
       'cookie 带 Secure（http 下浏览器会丢弃，所以必须跟随协议）',
       setCookie.some((c) => /wg_token=tok/.test(c) && /Secure/i.test(c)),

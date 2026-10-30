@@ -4,7 +4,8 @@
  *
  * Pinned rules:
  *   · no token / wrong token → 401, the page is not handed out;
- *   · `?token=<token>` → 302 to `/` + httpOnly cookie, so the token leaves the address bar;
+ *   · `?token=<token>` → 200 + httpOnly cookie + the page itself, with an inline script that
+ *     removes the token from the address bar (no 302: mobile browsers can loop on redirect+cookie);
  *   · a valid cookie → index.html with the boot token injected (the page cannot read the cookie);
  *   · static assets are served normally;
  *   · `--no-token` keeps the old "no gate" behavior instead of inventing a second auth scheme.
@@ -69,9 +70,15 @@ function buildApp(token) {
 
     res = await fetch(`${base}/?token=tok`, { redirect: 'manual' });
     const setCookie = res.headers.get('set-cookie') || '';
-    ok('right token -> 302', res.status === 302, `status=${res.status}`);
-    ok('redirect removes the token from the URL', res.headers.get('location') === '/');
+    const tokenHtml = await res.text();
+    ok('right token -> 200 (no redirect)', res.status === 200, `status=${res.status}`);
+    ok('no Location header', res.headers.get('location') === null, res.headers.get('location'));
     ok('sets an httpOnly cookie', /wg_token=tok/.test(setCookie) && /HttpOnly/i.test(setCookie), setCookie);
+    ok('boot token is injected on the token URL too', tokenHtml.includes('__WORKGREMLIN_BOOT__') && tokenHtml.includes('"tok"'));
+    ok(
+      'page strips the token from the address bar client-side',
+      tokenHtml.includes("searchParams.delete('token')") && tokenHtml.includes('history.replaceState')
+    );
 
     res = await fetch(`${base}/`, { headers: { cookie: 'wg_token=tok' } });
     const html = await res.text();
