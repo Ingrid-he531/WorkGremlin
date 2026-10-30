@@ -93,6 +93,29 @@ ok(
 );
 ok('that half path is not a directory on disk (so isDir is not short-circuiting)', !fs.existsSync(decoded));
 
+/* ---------------------------------------------------------------------------
+ * [1b] The extension's encoder replaces `/`, `+` and `=` with `_`, so base64 padding
+ * arrives as trailing underscores. Feeding those straight into Node makes it read them as
+ * base64url data: `/` (`Lw==`) becomes `Lw__` and decodes to `/\x0f\uFFFD`, which the UI
+ * then prints as an unreadable project name. Short paths carry padding, so they were the
+ * only ones affected; long (truncated) names have none.
+ * --------------------------------------------------------------------------- */
+head('[1b] unit: base64 padding written as trailing `_` decodes back to the real path');
+/** Exactly what the extension does (see sanitizeWorkspaceId in tencent-cloud.coding-copilot). */
+const encodeLikeExtension = (p) =>
+  Buffer.from(p).toString('base64').replace(/[/+=]/g, '_').substring(0, 64);
+ok('premise: `/` is encoded with padding replaced by underscores', encodeLikeExtension('/') === 'Lw__');
+ok('`/` decodes to `/`, not to control characters + U+FFFD', decodeDirName('Lw__') === '/', JSON.stringify(decodeDirName('Lw__')));
+for (const shortPath of ['/tmp/a', '/tmp/ab', '/opt/wg', '/a/b/c']) {
+  const name = encodeLikeExtension(shortPath);
+  ok(`short path ${shortPath} round-trips`, decodeDirName(name) === shortPath, `${name} -> ${JSON.stringify(decodeDirName(name))}`);
+}
+ok(
+  'a name that is not a path still yields empty (no garbage project name)',
+  decodeDirName('not-base64-at-all') === '',
+  JSON.stringify(decodeDirName('not-base64-at-all'))
+);
+
 // genie-history: written the way the extension does, i.e. the dir name is the truncated base64.
 const PROJ_DIR = path.join(STORAGE, 'genie-history', TRUNC);
 fs.mkdirSync(path.join(PROJ_DIR, 'conversations', SID), { recursive: true });

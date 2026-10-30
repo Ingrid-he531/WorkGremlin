@@ -889,6 +889,50 @@ head('[A2d] CLI 裸 jsonl 的会话，形态取 reporter 状态文件的 form');
   ok('source 随之算成 plugin（下拉前缀不再误显示 CLI）', Boolean(row) && row.source === 'plugin', row && row.source);
 }
 
+/* [A6] 两类假会话不进 1F 下拉：没有打开文件夹（工程路径是根 "/"）、以及没有任何落盘活动的陈旧 current.json */
+head('[A6] 1F 不列「未知工程」：无文件夹会话 / 无活动的陈旧 current.json');
+{
+  // Plugin encodes "no folder is open" as the filesystem root. Give it a fresh in-progress todo so
+  // only the root-workspace rule can keep it out (the lastUpdated guard below would not: this row
+  // really has on-disk activity).
+  const ROOT_SID = 'root-no-folder-conversation';
+  const ROOT_DIR = path.join(STORAGE, 'genie-history', 'Lw__');
+  fs.mkdirSync(path.join(ROOT_DIR, 'conversations', ROOT_SID), { recursive: true });
+  fs.writeFileSync(
+    path.join(ROOT_DIR, 'current.json'),
+    JSON.stringify({ conversationId: ROOT_SID, lastUpdated: new Date().toISOString() })
+  );
+  fs.writeFileSync(
+    path.join(STORAGE, 'todos', `${ROOT_SID}.json`),
+    JSON.stringify({ todos: [{ status: 'in_progress', content: 'no folder is open' }] })
+  );
+
+  // A stale project whose current.json still names a conversation, but with no todos /
+  // file-changes / message-queue entry: it has no event time at all. It must not be registered
+  // with "now" (which made it permanently active).
+  const STALE_WS = '/tmp/ProjStaleNoActivity';
+  const STALE_SID = 'stale-no-activity-conversation';
+  const STALE_DIR = path.join(STORAGE, 'genie-history', Buffer.from(STALE_WS).toString('base64'));
+  fs.mkdirSync(path.join(STALE_DIR, 'conversations', STALE_SID), { recursive: true });
+  fs.writeFileSync(
+    path.join(STALE_DIR, 'current.json'),
+    JSON.stringify({ conversationId: STALE_SID, lastUpdated: '2020-01-01T00:00:00.000Z' })
+  );
+
+  const snap = snapshot({ force: true, workspacePath: WS });
+  const floor = snap.floors.find((f) => f.id === '1F');
+  ok(
+    '无文件夹会话（工程路径 "/"）不进下拉（不再显示「未知工程」）',
+    !floor.sessions.some((s) => s.sessionId === ROOT_SID),
+    floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' ')
+  );
+  ok(
+    '没有任何落盘活动的陈旧 current.json 不会借「now」变成活跃会话',
+    !floor.sessions.some((s) => s.sessionId === STALE_SID),
+    floor.sessions.map((s) => `${s.source}:${s.sessionId}`).join(' ')
+  );
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 fs.rmSync(TMP, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

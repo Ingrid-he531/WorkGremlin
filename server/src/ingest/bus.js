@@ -1570,6 +1570,21 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /** @param {string} memberId */
+  /**
+   * Badge level carried by the member role. This is a fallback for rows whose in-memory level entry
+   * is missing (server just started, or a historical duplicate project row): the role already says
+   * whether the subagent was defined at project or user level, and a grey badge for a known role is
+   * simply wrong.
+   * @param {string} role
+   * @returns {'project'|'user'|null}
+   */
+  function roleLevelOf(role) {
+    const r = String(role || '');
+    if (r === 'subagent:project') return 'project';
+    if (r === 'subagent:user') return 'user';
+    return null;
+  }
+
   function buildMemberCard(memberId) {
     const m = repo.getMember.get(memberId);
     if (!m) return null;
@@ -1653,8 +1668,10 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       // have none). The renderer uses it to keep another session's ghosts out of the selected
       // session's scene / "waiting for subagents" phase.
       sessionId: m.session_id || null,
-      // subagent level (user-level / project-level): drives the badge color on the gremlin's neck
-      level: levels.get(memberId) || null,
+      // subagent level (user-level / project-level): drives the badge color on the gremlin's neck.
+      // The role is the durable copy: it survives a restart and a duplicate project row, where the
+      // in-memory level map (keyed by the canonical member id) has no entry.
+      level: levels.get(memberId) || roleLevelOf(m.role),
       // The **function description** of a resident subagent (static data from the agent definition file): shown on the card as "what it does",
       // not a state. An empty string when unavailable, with the renderer hiding that field -- never standing in with "项目子代理 · 空闲".
       description: String(m.role || '').startsWith('subagent') ? agentDescription(m.name, projectWorkspacePath(m.project_id), m.client || '') : '',
@@ -1710,6 +1727,41 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
   }
 
   /**
+   * Resolve a workspace path to one project row.
+   *
+   * Historical data can hold several rows for the same directory: reports without a workspacePath
+   * used to overwrite the stored path with an empty string, so the next startup no longer found the
+   * original row and created a suffixed clone (`-2`, `-3`, …). Every clone is a fragment (its own
+   * members / tasks), so picking "the first match" made the office jump to an incomplete roster and
+   * the resident gremlins lost their levels (grey neck badges).
+   *
+   * The oldest row is the original and wins; the server's current workspace project takes priority
+   * when it points at the same path (it is the row the workspace endpoint and the reporter use).
+   *
+   * @param {Array<{id:string, workspacePath?:string, createdAt?:number}>} projects
+   * @param {string} wantPath
+   * @returns {object|null}
+   */
+  function projectByWorkspace(projects, wantPath) {
+    let want = '';
+    try {
+      want = path.resolve(String(wantPath || ''));
+    } catch {
+      return null;
+    }
+    if (!want) return null;
+    const matches = (Array.isArray(projects) ? projects : []).filter(
+      (t) => t && t.workspacePath && path.resolve(t.workspacePath) === want
+    );
+    if (!matches.length) return null;
+    const preferred = context.project ? matches.find((t) => t.id === projectIdOf(context.project)) : null;
+    if (preferred) return preferred;
+    return matches
+      .slice()
+      .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0) || String(a.id).localeCompare(String(b.id)))[0];
+  }
+
+  /**
    * The team list. A project's name is an internal slug, while the UI should show the name of the project it belongs to,
    * so the project is reverse-resolved here from workspace_path (package.json name > directory name) and sent along.
    * @returns {Array<any>}
@@ -1742,23 +1794,11 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     let projectRow = want ? projects.find((t) => t.id === projectIdOf(want)) : null;
     // A caller may pass the workspace path instead of the project id (the renderer follows the
     // selected session's projectPath). Resolve that against the project rows as well.
-    if (!projectRow && want) {
-      let wantPath = '';
-      try {
-        wantPath = path.resolve(String(want));
-      } catch {
-        wantPath = '';
-      }
-      if (wantPath) {
-        projectRow =
-          projects.find((t) => t.workspacePath && path.resolve(t.workspacePath) === wantPath) || null;
-      }
-    }
+    if (!projectRow && want) projectRow = projectByWorkspace(projects, want);
     // Only fall back to the server's default workspace when the caller did not ask for a specific
     // project — otherwise a requested project that has no row yet would silently show another.
     if (!projectRow && !projectId && context.workspacePath) {
-      const ws = path.resolve(context.workspacePath);
-      projectRow = projects.find((t) => t.workspacePath && path.resolve(t.workspacePath) === ws) || null;
+      projectRow = projectByWorkspace(projects, context.workspacePath);
     }
     if (!projectRow) {
       return {

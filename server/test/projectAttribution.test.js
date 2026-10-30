@@ -126,6 +126,33 @@ app.use('/api/v1', createIngestRouter({ bus }));
     JSON.stringify(snapAUsers.map((m) => [m.name, m.role, m.project]))
   );
 
+  head('[6] 同一目录的历史重复工程行：路径解析取最早的规范行，且空路径上报不再抹掉已存路径');
+  // An older build wiped workspace_path whenever an event arrived without one, so the next startup
+  // no longer found the row and created a suffixed clone for the same directory. The clone owns only
+  // a fragment of the members, so resolving a session by path must never land on it.
+  bus.ensureProject('workgremlin-copy', WS_A, null, 'report');
+  const byWs = repo.getProjectByWorkspace.get(WS_A);
+  ok('按路径反查拿到最早的规范行', Boolean(byWs) && byWs.id === 'workgremlin', byWs && byWs.id);
+  const snapDup = bus.buildSnapshot(WS_A);
+  ok('按路径取快照也取规范行（不是较新的克隆）', snapDup.project && snapDup.project.id === 'workgremlin', snapDup.project && snapDup.project.id);
+  // Members that live only on a clone have no entry in the in-memory level map (it is keyed by the
+  // canonical member id). Their badge color must still come from the role instead of turning grey.
+  bus.registerMember({
+    project: 'workgremlin-copy',
+    memberId: 'clone-leo',
+    name: 'clone-leo',
+    role: 'subagent:project',
+    client: 'codebuddy',
+  });
+  const cloneCard = bus.buildSnapshot('workgremlin-copy').members.find((m) => m.name === 'clone-leo');
+  ok('落单在克隆工程里的成员，工牌级别仍按 role 下发（不是灰色）', Boolean(cloneCard) && cloneCard.level === 'project', cloneCard && String(cloneCard.level));
+
+  bus.ensureProject('workgremlin', '', 'conv-1', 'report');
+  ok('不带 workspacePath 的上报不再抹掉已存路径', (repo.getProject.get('workgremlin') || {}).workspace_path === WS_A, JSON.stringify(repo.getProject.get('workgremlin')));
+  ok('顺带写入的 mainConversationId 保留', (repo.getProject.get('workgremlin') || {}).main_conversation_id === 'conv-1');
+  bus.ensureProject('workgremlin', '', null, 'report');
+  ok('再次不带二者的上报同样不清空它们', (repo.getProject.get('workgremlin') || {}).workspace_path === WS_A && (repo.getProject.get('workgremlin') || {}).main_conversation_id === 'conv-1');
+
   server.close();
   close();
   fs.rmSync(TMP, { recursive: true, force: true });

@@ -728,13 +728,18 @@ function createRepo(db) {
       INSERT INTO projects (id, name, workspace_path, main_conversation_id, source, created_at)
       VALUES (@id, @name, @workspacePath, @mainConversationId, @source, @createdAt)
       ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        workspace_path = excluded.workspace_path,
-        main_conversation_id = excluded.main_conversation_id
+        name = COALESCE(NULLIF(excluded.name, ''), projects.name),
+        workspace_path = COALESCE(NULLIF(excluded.workspace_path, ''), projects.workspace_path),
+        main_conversation_id = COALESCE(excluded.main_conversation_id, projects.main_conversation_id)
     `),
     listProjects: db.prepare(`SELECT * FROM projects ORDER BY created_at DESC`),
     getProject: db.prepare(`SELECT * FROM projects WHERE id = ?`),
-    getProjectByWorkspace: db.prepare(`SELECT * FROM projects WHERE workspace_path = ?`),
+    // A workspace path must resolve to one deterministic row. Duplicate rows are a historical bug
+    // (empty reports used to wipe workspace_path, so the next startup created a "-2"/"-3" clone);
+    // the oldest row is the original and therefore the canonical one.
+    getProjectByWorkspace: db.prepare(
+      `SELECT * FROM projects WHERE workspace_path = ? ORDER BY created_at ASC, id ASC LIMIT 1`
+    ),
 
     upsertMember: db.prepare(`
       INSERT INTO members (id, project_id, name, role, session_id, reported, created_at, ephemeral, project_label, client)

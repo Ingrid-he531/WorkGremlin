@@ -691,6 +691,11 @@ function handlePlugin(p, src, ctx) {
   if (!pluginSessions.length) return;
   for (const s of pluginSessions) {
     if (!claimSession(p.id, s.id)) continue;
+    // A plugin row with no on-disk activity carries no event time (todos / file-changes /
+    // message-queue are all absent). Registering it would let upsert() fall back to "now", which
+    // makes a long-dead project's current.json look permanently active — the dropdown then grows a
+    // phantom session that can never time out. No evidence = not an active session.
+    if (!s.lastUpdated) continue;
     upsert({
       floor: p.id,
       id: s.id,

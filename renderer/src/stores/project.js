@@ -21,6 +21,13 @@ export const useProjectStore = defineStore('project', {
      * Empty string = not known yet (old server / workspace not fetched yet) → no filtering, see lib/projectScope.js.
      */
     projectId: '',
+    /**
+     * The selected session names a project the server has no row for (a workspace opened without a
+     * folder, a deleted project, …). The room is deliberately empty then: keeping the previous
+     * project's gremlins would show another project's people under this session. This flag also keeps
+     * global snapshots / member broadcasts from repopulating the room until a real project is selected.
+     */
+    projectUnresolved: false,
     members: [],
     /** Current real project display name (resolved by the server: package.json name > directory name) */
     projectName: '',
@@ -149,6 +156,12 @@ export const useProjectStore = defineStore('project', {
 
     applySnapshot(snapshot, opts = {}) {
       if (!snapshot) return;
+      // A session whose project has no row keeps an empty room: a global snapshot (or the periodic
+      // reconcile of the empty project) must not pull the default project's gremlins back in.
+      if (this.projectUnresolved && !opts.force) {
+        this.projects = snapshot.projects || this.projects;
+        return;
+      }
       // A global workspace switch (another client, an explicit API call) must not steal the project
       // this client is showing: project follows the selected session. Keep the project list fresh,
       // but leave members/messages alone unless the snapshot is for the viewed project.
@@ -160,6 +173,7 @@ export const useProjectStore = defineStore('project', {
         this.projects = snapshot.projects || this.projects;
         return;
       }
+      this.projectUnresolved = false;
       this.project = snapshot.project;
       if (snapshot.project && snapshot.project.id) this.projectId = String(snapshot.project.id);
       this.projects = snapshot.projects || [];
@@ -175,6 +189,9 @@ export const useProjectStore = defineStore('project', {
     /** @param {any} card */
     upsertMember(card) {
       if (!card) return;
+      // The room is showing "this session's project does not exist"; a broadcast from any real
+      // project must not put gremlins into it.
+      if (this.projectUnresolved) return;
       // Never accept a member card from another project: the WS subscription carries no project, so the server
       // may broadcast other projects' events here, and letting one in makes it flash in the room and then vanish.
       if (!memberBelongsToProject(card, this.projectId)) return;
@@ -199,6 +216,7 @@ export const useProjectStore = defineStore('project', {
       // When the new project id is unavailable (old server / response missing the field), don't swap projectId and don't filter, keep things as they are.
       if (ws.project) {
         this.projectId = String(ws.project);
+        this.projectUnresolved = false;
         this.members = this.members.filter((m) => memberBelongsToProject(m, this.projectId));
       }
     },
@@ -216,16 +234,52 @@ export const useProjectStore = defineStore('project', {
     async followSession(session) {
       const projectPath = String((session && session.projectPath) || '').trim();
       if (!projectPath) return false;
-      const target = this.projects.find((p) => sameWorkspacePath(p.workspacePath, projectPath));
-      if (target && String(this.projectId) === String(target.id)) {
-        this.subscribeProject(target.id);
+      // Never jump away from the project already on screen when it points at the same directory.
+      // Several rows can claim one workspace path (a historical duplicate), and switching to a
+      // sibling row would swap the roster for that row's fragment: resident gremlins disappear or
+      // lose their level badges (grey neck badges).
+      const current = this.projects.find((p) => String(p.id) === String(this.projectId));
+      if (current && sameWorkspacePath(current.workspacePath, projectPath)) {
+        this.projectUnresolved = false;
+        this.subscribeProject(current.id);
         return true;
       }
+      // Prefer the original row among same-path duplicates: the canonical project is the oldest one,
+      // the suffixed clones are newer fragments (see the server's projectByWorkspace).
+      const matches = this.projects.filter((p) => sameWorkspacePath(p.workspacePath, projectPath));
+      const target = matches
+        .slice()
+        .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0))[0] || null;
       // Unknown to the local list (a project without a row yet): let the server resolve the path.
-      return this.loadProject(target ? target.id : projectPath);
+      const result = await this.loadProject(target ? target.id : projectPath);
+      if (result === 'no-project') this.showUnresolvedProject(projectPath);
+      return result === true;
     },
 
-    /** Load one project's snapshot into this client only; no server-side workspace switch. */
+    /**
+     * The selected session's project has no row on the server: empty the room instead of leaving the
+     * previous project's people standing in it. The project label still comes from the session itself,
+     * so the dropdown keeps naming the (possibly unknown) project.
+     * @param {string} projectPath the path the session carries
+     */
+    showUnresolvedProject(projectPath = '') {
+      this.project = null;
+      this.projectId = '';
+      this.projectUnresolved = true;
+      this.members = [];
+      this.projectName = '';
+      this.workspacePath = String(projectPath || '');
+      // No real project is being viewed: clear the subscription bookkeeping so selecting a project
+      // again re-subscribes. The server keeps its previous filter, but member cards are dropped by
+      // the `projectUnresolved` guard in upsertMember.
+      this._subscribedProjectId = '';
+    },
+
+    /**
+     * Load one project's snapshot into this client only; no server-side workspace switch.
+     * @returns {Promise<true|false|'no-project'>} true = applied; 'no-project' = the server answered
+     *   but owns no row for this path; false = transient failure (keep the current room)
+     */
     async loadProject(projectIdOrPath) {
       const key = String(projectIdOrPath || '').trim();
       if (!key) return false;
@@ -235,7 +289,10 @@ export const useProjectStore = defineStore('project', {
           headers: info.token ? { Authorization: `Bearer ${info.token}` } : undefined,
         });
         const data = await res.json();
-        if (!res.ok || !data || !data.ok || !data.snapshot || !data.snapshot.project) return false;
+        if (!res.ok || !data || !data.ok || !data.snapshot) return false;
+        // A resolved request with no project: the path is not a project the server knows (it
+        // deliberately does not fall back to the default workspace for an explicit path).
+        if (!data.snapshot.project) return 'no-project';
         this.applySnapshot(data.snapshot, { force: true });
         this.subscribeProject(data.snapshot.project.id);
         return true;

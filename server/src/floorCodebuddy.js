@@ -59,14 +59,66 @@ function mtime(p) {
   }
 }
 
-/** The directory name is the base64 of the project path; returns empty when it does not decode (not a path) */
-function decodeDirName(name) {
+/** A decoded string only counts as a workspace path when it has no control characters and no
+ *  interior replacement character. A trailing U+FFFD is tolerated: the extension cuts the name to
+ *  64 base64 chars, which can split the last UTF-8 sequence of a non-ASCII path. */
+function looksLikePath(value) {
+  const s = String(value || '');
+  if (!s) return false;
+  if (/[\u0000-\u001f\u007f]/.test(s)) return false;
+  if (/\uFFFD(?!$)/.test(s)) return false;
+  return s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s);
+}
+
+/**
+ * The plugin encodes "no folder is open" as the filesystem root (`/`, `C:\`, …). Such a session has
+ * no project to show in the office and used to surface as an "unknown project" dropdown entry, so it
+ * is not a 1F session at all.
+ * @param {string} value workspace path
+ * @returns {boolean}
+ */
+function isRootWorkspace(value) {
+  const s = String(value || '').trim();
+  if (!s) return false;
+  let abs = '';
   try {
-    const s = Buffer.from(String(name), 'base64').toString('utf8');
-    if (!s || s.includes('\u0000')) return '';
-    if (s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
+    abs = path.resolve(s);
   } catch {
-    /* not base64, skip */
+    return false;
+  }
+  return abs === path.parse(abs).root;
+}
+
+/** @param {string} text @returns {string} UTF-8 text, '' when the input cannot be decoded */
+function decodeBase64(text) {
+  try {
+    return Buffer.from(text, 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The directory name is the base64 of the project path; returns empty when it does not decode (not a path).
+ *
+ * The extension's `sanitizeWorkspaceId` is `base64(path).replace(/[/+=]/g, '_')` (then cut to 64
+ * chars). `_` for `/` / `+` is normal base64url and decodes correctly, but **the `=` padding is
+ * replaced too**. Feeding trailing `_` straight to Node makes it read them as base64url data, so a
+ * short path such as `/` (`Lw==` → `Lw__`) decodes to `/\x0f\uFFFD` and its project label shows up
+ * as unreadable characters. Try the literal form first (long names carry no padding), then restore
+ * one or two trailing `_` as padding — whichever form yields a plausible path.
+ */
+function decodeDirName(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return '';
+
+  const direct = decodeBase64(raw);
+  if (looksLikePath(direct)) return direct;
+
+  for (const pad of [1, 2]) {
+    if (!raw.endsWith('_'.repeat(pad))) continue;
+    const restored = decodeBase64(raw.slice(0, raw.length - pad) + '='.repeat(pad));
+    if (looksLikePath(restored)) return restored;
   }
   return '';
 }
@@ -901,8 +953,11 @@ function pluginPolicy(ctx) {
     // Ones already SessionEnd'd: removed from the list
     ended: life.filter((s) => s.endedAt),
     // Ones whose runtime already cancelled: still should not enter the dropdown (cancelled = did not
-    // finish, so it should not hold a session slot either)
+    // finish, so it should not hold a session slot either).
+    // A "no folder is open" session (filesystem root) is not a project either: listing it only adds an
+    // "unknown project" row whose office is necessarily empty.
     exclude: (row) =>
+      isRootWorkspace(row && row.projectPath) ||
       Boolean(row && row.runtime && row.runtime.paused && String(row.runtime.pauseReason || '').toLowerCase() === 'cancel'),
   };
 }
