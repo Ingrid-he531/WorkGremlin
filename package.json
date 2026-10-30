@@ -115,6 +115,7 @@
     "test:council-timeline": "node renderer/test/councilTimeline.test.mjs",
     "test:council-ui-store": "node renderer/test/councilUiStore.test.mjs",
     "test:session-options": "node renderer/test/sessionOptions.test.mjs",
+    "test:browser-zoom": "node renderer/test/browserZoom.test.mjs",
     "test:demo": "node server/test/demoProvider.test.js",
     "test:demo-lifecycle": "node renderer/test/demoLifecycle.test.mjs",
     "test:all": "node scripts/run-tests.js",
