@@ -698,6 +698,24 @@ function createDispatchService(deps = {}) {
   }
 
   /**
+   * Update a session's saved defaults. The composer persists its model choice here so reopening
+   * the session resumes the same model instead of falling back to the floor's default.
+   * @param {string} sessionId
+   * @param {{model?: string}} input
+   */
+  function updateSession(sessionId, input = {}) {
+    const session = sessions.get(String(sessionId || ''));
+    if (!session) throw fail('not_found', '会话不存在', 404);
+    if (Object.prototype.hasOwnProperty.call(input, 'model')) {
+      const model = String(input.model || '').trim().slice(0, 200);
+      session.model = model || null;
+    }
+    audit('dispatch.session_updated', session);
+    touchSession(session);
+    return summary(session);
+  }
+
+  /**
    * Send one prompt into an existing session.
    * @param {string} sessionId
    * @param {{prompt: string}} input
@@ -892,6 +910,7 @@ function createDispatchService(deps = {}) {
     mode,
     policy,
     createSession,
+    updateSession,
     sendTurn,
     decide,
     cancel,

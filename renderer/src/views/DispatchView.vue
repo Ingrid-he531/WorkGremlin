@@ -17,7 +17,6 @@ const dispatch = useDispatchStore();
 
 const showNew = ref(false);
 const floor = ref('8F');
-const newModel = ref('');
 const workspace = ref('');
 /** Per-turn model for the composer picker; empty = the floor's default model */
 const turnModel = ref('');
@@ -31,7 +30,7 @@ const scroller = ref(null);
 
 const session = computed(() => dispatch.current);
 const active = computed(() => dispatch.activeTurn);
-/** Legacy sessions created before per-turn selection may carry a session-level model */
+/** Session-level model saved from the composer (older sessions may have picked it at creation) */
 const sessionModel = computed(() => (session.value && session.value.model) || '');
 const permissionLabel = (p) => t(`dispatch.permission.${p}`);
 
@@ -57,11 +56,10 @@ watch(
 );
 
 watch(floor, (id) => {
-  newModel.value = '';
   dispatch.loadModels(project.serverInfo || {}, id).catch(() => {});
 });
 
-/** Start each session with its own model (if it has one); the user can change it per turn. */
+/** Start each session with its saved model (if it has one); the user can change it per turn. */
 watch(
   () => (session.value && session.value.id) || '',
   () => {
@@ -141,7 +139,6 @@ async function create() {
   try {
     await dispatch.createSession(project.serverInfo || {}, {
       floor: floor.value,
-      model: newModel.value || undefined,
       workspacePath: workspace.value.trim(),
     });
     showNew.value = false;
@@ -149,6 +146,19 @@ async function create() {
     error.value = (err && err.message) || String(err);
   } finally {
     creating.value = false;
+  }
+}
+
+/** Persist the composer's model choice on the session, so reopening it resumes the same model. */
+async function saveModel() {
+  if (!session.value) return;
+  error.value = '';
+  try {
+    await dispatch.updateSession(project.serverInfo || {}, session.value.id, {
+      model: turnModel.value,
+    });
+  } catch (err) {
+    error.value = (err && err.message) || String(err);
   }
 }
 
@@ -244,17 +254,6 @@ function onKeydown(e) {
             <option v-for="f in dispatch.floors" :key="f.id" :value="f.id" :disabled="!f.available">
               {{ f.id }} · {{ f.name || f.id }}{{ f.available ? '' : ' —' }}
             </option>
-          </select>
-        </label>
-        <label v-if="dispatch.models.length" class="field">
-          <span class="lbl">{{ t('dispatch.model') }}</span>
-          <select v-model="newModel" class="input mono" data-testid="dispatch-new-model">
-            <option value="">{{ t('dispatch.model_default') }}</option>
-            <optgroup v-for="g in modelGroups" :key="g.label" :label="g.label">
-              <option v-for="ref in g.models" :key="ref" :value="ref" :title="ref">
-                {{ dispatch.modelLabels[ref] || ref }}
-              </option>
-            </optgroup>
           </select>
         </label>
         <label class="field">
@@ -353,6 +352,7 @@ function onKeydown(e) {
                 :title="t('dispatch.model')"
                 :aria-label="t('dispatch.model')"
                 data-testid="dispatch-model"
+                @change="saveModel"
               >
                 <option value="">{{ t('dispatch.model_default') }}</option>
                 <option v-if="sessionModel && !dispatch.models.includes(sessionModel)" :value="sessionModel">

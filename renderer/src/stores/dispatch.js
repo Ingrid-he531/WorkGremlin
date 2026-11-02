@@ -158,6 +158,29 @@ export const useDispatchStore = defineStore('dispatch', {
     },
 
     /**
+     * Save session defaults chosen in the composer (the model picker), so reopening the session
+     * resumes the same choice instead of falling back to the floor's default.
+     * @param {{token?: string}|null} info
+     * @param {string} id
+     * @param {{model?: string}} patch
+     */
+    async updateSession(info, id, patch) {
+      this.error = '';
+      const res = await fetch(`${httpBase(info)}/api/v1/dispatch/sessions/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...(authHeaders(info) || {}) },
+        body: JSON.stringify(patch || {}),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error((data.error && data.error.message) || `HTTP ${res.status}`);
+      upsertById(this.sessions, data.session);
+      if (this.current && this.current.id === data.session.id) {
+        this.current.model = data.session.model;
+      }
+      return data.session;
+    },
+
+    /**
      * Load the floor's model catalog for the composer picker.
      * @param {{token?: string}|null} info
      * @param {string} [floor] defaults to the first available floor

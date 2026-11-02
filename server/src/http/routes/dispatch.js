@@ -7,6 +7,7 @@
  *   GET    /api/v1/dispatch/models?floor=4F|8F    model catalog for the per-turn picker
  *   POST   /api/v1/dispatch/sessions                 create a session {floor, workspacePath, model?}
  *   GET    /api/v1/dispatch/sessions/:id             full transcript (turns + output tails)
+ *   PATCH  /api/v1/dispatch/sessions/:id             save session defaults {model?}
  *   DELETE /api/v1/dispatch/sessions/:id             close a session (kills a running turn)
  *   POST   /api/v1/dispatch/sessions/:id/turns       send a prompt {prompt, model?}
  *   POST   /api/v1/dispatch/turns/:id/decision       {approve}   (loopback only)
@@ -81,6 +82,14 @@ function createDispatchRouter({ service }) {
   router.get('/dispatch/sessions/:id', (req, res) => {
     try {
       return res.json({ ok: true, session: service.getSession(req.params.id) });
+    } catch (err) {
+      return bad(res, err);
+    }
+  });
+
+  router.patch('/dispatch/sessions/:id', (req, res) => {
+    try {
+      return res.json({ ok: true, session: service.updateSession(req.params.id, req.body || {}) });
     } catch (err) {
       return bad(res, err);
     }

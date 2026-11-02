@@ -288,6 +288,57 @@ const post = (url, body) =>
     close();
   }
 
+  head('saved composer model');
+  {
+    const { app, config, runs } = makeHarness();
+    const { base, close } = await listen(app);
+    config.mode = 'auto';
+
+    let r = await getJson(`${base}/api/v1/dispatch/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ floor: '8F', workspacePath: WORKSPACE }) });
+    const session = r.data.session;
+    ok('a new session starts without a model', session.model === null, String(session.model));
+
+    const patchSession = (body) =>
+      getJson(`${base}/api/v1/dispatch/sessions/${session.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    r = await patchSession({ model: 'opencode-go/kimi-k3' });
+    ok('the composer choice is saved on the session', r.status === 200 && r.data.session.model === 'opencode-go/kimi-k3', JSON.stringify(r.data));
+
+    r = await getJson(`${base}/api/v1/dispatch`);
+    ok('the saved model is in the session list', r.data.sessions[0].model === 'opencode-go/kimi-k3');
+
+    let res = await post(`${base}/api/v1/dispatch/sessions/${session.id}/turns`, { prompt: '用保存的模型' });
+    const savedTurn = await res.json();
+    ok(
+      'a turn without a model uses the saved one',
+      runs[0].arg.args.includes('-m') && runs[0].arg.args.includes('opencode-go/kimi-k3'),
+      JSON.stringify(runs[0].arg.args)
+    );
+    ok('the turn itself reports no explicit model', savedTurn.turn.model === '', savedTurn.turn.model);
+    runs[0].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    r = await patchSession({ model: '' });
+    ok('clearing the picker clears the saved model', r.data.session.model === null);
+    res = await post(`${base}/api/v1/dispatch/sessions/${session.id}/turns`, { prompt: '回到默认模型' });
+    ok('cleared model falls back to the floor default', !runs[1].arg.args.includes('-m'), JSON.stringify(runs[1].arg.args));
+    runs[1].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    r = await getJson(`${base}/api/v1/dispatch/sessions/nope`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x' }),
+    });
+    ok('patching an unknown session -> 404', r.status === 404, `status=${r.status}`);
+
+    close();
+  }
+
   head('persistence across restarts');
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-dispatch-store-'));
