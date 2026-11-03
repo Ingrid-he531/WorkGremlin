@@ -23,7 +23,13 @@ npm run launch:electron
 # Build the renderer then start (prod): npm run build:electron
 # Run only the local server, no window: npm run server
 # Just check the native module works (create table → write → read back): npm run db:check
+
+# Optional (Linux): application-menu + desktop shortcut for this checkout
+npm run shortcut:install          # add "-- --autostart" to also start on login, "-- --no-desktop" for the menu only
+npm run shortcut:uninstall
 ```
+
+**Desktop shortcut (Linux)**: `npm run shortcut:install` writes `~/.local/bin/workgremlin`, an application-menu entry and a desktop icon. The launcher starts the local server when needed and opens the window from this source checkout, so the icon always runs the current code; a missing `renderer/dist` is built on first launch. Only files created by the script (marked as managed) are removed on uninstall, so other entries stay untouched. Output goes to `~/.local/state/workgremlin/launcher.log`, and `--dry-run` shows what would be written without touching the disk.
 
 **Demo mode**: once it is up, click "Demo mode" on the bottom-right action bar (left of "Gather for a meeting") — the current floor gets an isolated virtual **demo session**, the main console follows the server-owned demo phase, and the office shows the demo team (6 experts + 2 temporary members). Task records and the conversation stay on the real project. Click "Exit demo" again to return to the previously selected real session.
 

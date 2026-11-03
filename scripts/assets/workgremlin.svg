@@ -1,0 +1,28 @@
+<!-- Managed by WorkGremlin (scripts/install-desktop-shortcut.js) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#26344a"/>
+      <stop offset="1" stop-color="#111821"/>
+    </linearGradient>
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#82e58e"/>
+      <stop offset="1" stop-color="#33a85b"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <path d="M66 96 L32 54 Q27 47 36 47 L96 68 Z" fill="#2f9c53"/>
+  <path d="M190 96 L224 54 Q229 47 220 47 L160 68 Z" fill="#2f9c53"/>
+  <path d="M128 52 C176 52 204 84 204 128 C204 178 172 208 128 208
+           C84 208 52 178 52 128 C52 84 80 52 128 52 Z" fill="url(#skin)"/>
+  <ellipse cx="100" cy="120" rx="20" ry="24" fill="#f6fff8"/>
+  <ellipse cx="156" cy="120" rx="20" ry="24" fill="#f6fff8"/>
+  <circle cx="104" cy="124" r="9" fill="#101820"/>
+  <circle cx="160" cy="124" r="9" fill="#101820"/>
+  <circle cx="107" cy="120" r="3" fill="#ffffff"/>
+  <circle cx="163" cy="120" r="3" fill="#ffffff"/>
+  <path d="M92 160 Q128 194 164 160 Q128 176 92 160 Z" fill="#17331f"/>
+  <path d="M100 163 L108 176 L116 166 L126 179 L134 166 L142 177 L150 163"
+        fill="none" stroke="#f6fff8" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

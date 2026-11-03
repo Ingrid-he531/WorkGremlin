@@ -33,6 +33,8 @@
     "db:check": "node server/src/cli.js --self-test",
     "hooks:install": "node scripts/install-hooks.js",
     "hooks:uninstall": "node scripts/install-hooks.js --uninstall",
+    "shortcut:install": "node scripts/install-desktop-shortcut.js",
+    "shortcut:uninstall": "node scripts/install-desktop-shortcut.js --uninstall",
     "test:elevator": "node renderer/test/elevator.t3.test.mjs",
     "test:done": "node server/test/doneAttribution.test.js",
     "test:floors": "node server/test/mergedFloors.test.js",
