@@ -103,19 +103,32 @@ function decodeBase64(text) {
  *
  * The extension's `sanitizeWorkspaceId` is `base64(path).replace(/[/+=]/g, '_')` (then cut to 64
  * chars). `_` for `/` / `+` is normal base64url and decodes correctly, but **the `=` padding is
- * replaced too**. Feeding trailing `_` straight to Node makes it read them as base64url data, so a
- * short path such as `/` (`Lw==` → `Lw__`) decodes to `/\x0f\uFFFD` and its project label shows up
- * as unreadable characters. Try the literal form first (long names carry no padding), then restore
- * one or two trailing `_` as padding — whichever form yields a plausible path.
+ * replaced too**, and Node's base64 decoder accepts `_` as a data character:
+ *   · `==` (`Lw__`) decodes to `/\x0f\uFFFD` — rejected by looksLikePath (control characters), so
+ *     restoring the padding already happened in practice;
+ *   · **one** `=` is the dangerous case: `…/deepseek-harness` (`…c3M=`) arrives as `…c3M_` and
+ *     decodes to `…/deepseek-harness?` — the stray `?` still looks like a path character, so the
+ *     literal form won. The office then followed that 1F session to a path with no project row,
+ *     its room went empty, and the 1F task list looked like it had lost every task.
+ * Hence restore padding **before** decoding the literal form. Only a single trailing `_` needs it
+ * (the `==` form is already rejected literally); when the restored form is not a path (a name
+ * ending in a genuine data `_`) the literal form is still tried as a fallback.
  */
 function decodeDirName(name) {
   const raw = String(name || '').trim();
   if (!raw) return '';
 
+  // `raw` always has a length that is a multiple of 4 (base64 padding replacement keeps it there),
+  // so replaying the replaced padding does not change the length.
+  if (raw.length % 4 === 0 && raw.endsWith('_')) {
+    const restored = decodeBase64(`${raw.slice(0, -1)}=`);
+    if (looksLikePath(restored)) return restored;
+  }
+
   const direct = decodeBase64(raw);
   if (looksLikePath(direct)) return direct;
 
-  for (const pad of [1, 2]) {
+  for (const pad of [2, 1]) {
     if (!raw.endsWith('_'.repeat(pad))) continue;
     const restored = decodeBase64(raw.slice(0, raw.length - pad) + '='.repeat(pad));
     if (looksLikePath(restored)) return restored;

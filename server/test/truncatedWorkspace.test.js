@@ -116,6 +116,27 @@ ok(
   JSON.stringify(decodeDirName('not-base64-at-all'))
 );
 
+/**
+ * [1c] **One** `=` of padding is the dangerous form. It arrives as a single trailing `_`, which Node's
+ * base64 decoder accepts as a data character and turns into one extra byte — `0x3F` (`?`). That `?`
+ * still looks like a path character, so the literal form used to win and the session claimed a project
+ * path with a trailing `?`: the office followed it to a path with no project row, emptied the room and
+ * hid every 1F task (measured 2026-11-03: `/home/yinghui/work/deepseek-harness` → `…-harness?`, while
+ * the task rows were stored under the real project). The padding must be restored **before** decoding
+ * the literal form.
+ */
+head('[1c] unit: a single `=` of padding written as `_` does not append a stray `?`');
+for (const p of ['/tmp/abc', '/home/user/example-project']) {
+  const name = encodeLikeExtension(p);
+  ok(`premise: ${p} has exactly one trailing underscore`, name.endsWith('_') && !name.endsWith('__'), name);
+  ok(`single-padding path ${p} round-trips without a stray "?"`, decodeDirName(name) === p, `${name} -> ${JSON.stringify(decodeDirName(name))}`);
+}
+ok(
+  'the measured regression shape decodes back to the real directory',
+  decodeDirName('L2hvbWUveWluZ2h1aS93b3JrL2RlZXBzZWVrLWhhcm5lc3M_') === '/home/yinghui/work/deepseek-harness',
+  JSON.stringify(decodeDirName('L2hvbWUveWluZ2h1aS93b3JrL2RlZXBzZWVrLWhhcm5lc3M_'))
+);
+
 // genie-history: written the way the extension does, i.e. the dir name is the truncated base64.
 const PROJ_DIR = path.join(STORAGE, 'genie-history', TRUNC);
 fs.mkdirSync(path.join(PROJ_DIR, 'conversations', SID), { recursive: true });
