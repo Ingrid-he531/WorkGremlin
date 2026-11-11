@@ -308,7 +308,7 @@ function createDispatchService(deps = {}) {
       const floor = String(entry.floor || '');
       const productSessionId = String(entry.productSessionId || entry.opencodeSessionId || '');
       const recipe = recipeFor(floor);
-      if (!id || !DEFAULTS.DISPATCH_FLOORS.includes(floor) || !productSessionId || !recipe) continue;
+      if (!id || !DEFAULTS.DISPATCH_FLOORS.includes(floor) || (!productSessionId && floor !== '8F') || !recipe) continue;
       const permissions =
         Array.isArray(recipe.permissions) && recipe.permissions.length
           ? recipe.permissions
@@ -348,6 +348,11 @@ function createDispatchService(deps = {}) {
           expiryTimer: null,
         };
       });
+      const resetMissingOpenCodeId =
+        floor === '8F' &&
+        recipe.nativeSessionId &&
+        !turns.some((turn) => turn.state === 'done') &&
+        turns.some((turn) => /Session not found/i.test(turn.error));
       sessions.set(id, {
         id,
         floor,
@@ -355,8 +360,13 @@ function createDispatchService(deps = {}) {
         model: entry.model ? String(entry.model) : null,
         permission,
         title: String(entry.title || ''),
-        productSessionId,
-        opencodeSessionId: floor === '8F' ? productSessionId : entry.opencodeSessionId || null,
+        productSessionId: resetMissingOpenCodeId ? null : productSessionId || null,
+        opencodeSessionId:
+          floor === '8F'
+            ? resetMissingOpenCodeId
+              ? null
+              : entry.opencodeSessionId || productSessionId || null
+            : entry.opencodeSessionId || null,
         createdAt: Number(entry.createdAt) || ts,
         updatedAt: Number(entry.updatedAt) || ts,
         turns,
@@ -535,6 +545,14 @@ function createDispatchService(deps = {}) {
     }
 
     const parser = typeof inv.parser === 'function' ? inv.parser() : null;
+    const captureProductSessionId = () => {
+      if (!parser || typeof parser.sessionId !== 'function') return;
+      const productSessionId = String(parser.sessionId() || '');
+      if (!productSessionId || productSessionId === session.productSessionId) return;
+      session.productSessionId = productSessionId;
+      if (session.floor === '8F') session.opencodeSessionId = productSessionId;
+      persistSoon();
+    };
     const appendOutput = (text) => {
       if (!text) return;
       const chunk = cleanChunk(text);
@@ -563,12 +581,14 @@ function createDispatchService(deps = {}) {
       onData: (chunk) => {
         if (!chunk) return;
         appendOutput(parser ? parser.push(chunk) : chunk);
+        captureProductSessionId();
       },
     })
       .then((r) => {
         turn.child = null;
         if (turn.state === 'cancelled') return;
         if (parser) appendOutput(parser.flush());
+        captureProductSessionId();
         turn.endedAt = now();
         turn.exitCode = r.exitCode == null ? null : r.exitCode;
         if (r.status === 'ok') {
@@ -677,7 +697,11 @@ function createDispatchService(deps = {}) {
     }
 
     const productSessionId =
-      typeof recipe.mintSessionId === 'function' ? recipe.mintSessionId() : mintSessionId();
+      floor === '8F' && recipe.nativeSessionId
+        ? ''
+        : typeof recipe.mintSessionId === 'function'
+          ? recipe.mintSessionId()
+          : mintSessionId();
     const session = {
       id: crypto.randomUUID(),
       floor,
@@ -686,7 +710,7 @@ function createDispatchService(deps = {}) {
       permission,
       title: String(input.title || '').slice(0, 120),
       productSessionId,
-      opencodeSessionId: floor === '8F' ? productSessionId : null,
+      opencodeSessionId: floor === '8F' && !recipe.nativeSessionId ? productSessionId : null,
       createdAt: now(),
       updatedAt: now(),
       turns: [],
@@ -694,6 +718,7 @@ function createDispatchService(deps = {}) {
     sessions.set(session.id, session);
     audit('dispatch.session', session);
     emit({ kind: 'session', session: summary(session) });
+    persistSoon();
     return summary(session);
   }
 

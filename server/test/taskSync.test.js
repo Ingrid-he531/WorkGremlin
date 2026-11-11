@@ -501,6 +501,26 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const done9 = nine3.find((t) => t.id === 'copilot:cop-sid-live:1') || null;
   ok('收工后那一轮 done / 成员卡 idle', Boolean(done9) && done9.state === 'done' && stateOf('copilot@p1') === 'idle', `${done9 && done9.state}/${stateOf('copilot@p1')}`);
 
+  console.log('[6b] 9F：SQLite turns 落后会话日志时，收掉日志已完成的旧轮');
+  const laggingStart = Date.now() - 15_000;
+  const laggingEnd = laggingStart + 10_000;
+  const currentStart = Date.now() - 2_000;
+  const laggingId = 'copilot:cop-sid-log-finish:1';
+  copilotRows = [{
+    id: 'cop-sid-log-finish', copilot: true, project: 'p1', projectPath: '/tmp/p1',
+    lastUpdated: currentStart, inFlight: true, prompt: 'current turn', doneTitle: 'session',
+    copilotTurns: [{ index: 0, userMessage: 'older completed turn', at: laggingEnd - 30_000 }],
+    livePrompt: 'current turn', liveStartedAt: currentStart, liveIndex: 2,
+    liveReqs: [{ index: 1, startedAt: laggingStart, endedAt: laggingEnd }],
+  }];
+  repo.insertTask.run({ id: laggingId, projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: 'completed from session log', state: 'running', progress: null, startedAt: laggingStart, endedAt: null });
+  repo.upsertTaskRun.run({ id: laggingId, projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'cop-sid-log-finish', form: null, model: null, title: 'completed from session log', startedAt: laggingStart, baselineCommit: null });
+  syncCopilotTasks({ bus, repo });
+  const logFinished = repo.getTask.get(laggingId);
+  ok('会话日志明确结束的旧轮被定稿 done', Boolean(logFinished) && logFinished.state === 'done' && logFinished.ended_at === laggingEnd, logFinished && JSON.stringify({ state: logFinished.state, endedAt: logFinished.ended_at }));
+  ok('较新的当前轮仍保持 running', repo.getTask.get('copilot:cop-sid-log-finish:2')?.state === 'running', repo.getTask.get('copilot:cop-sid-log-finish:2')?.state);
+  copilotRows = [];
+
   console.log('[7] 8F OpenCode：每一轮一条台账（在飞那轮 running）+ 改动文件只认 edit');
   const o0 = Date.now() - 20 * 60_000;
   const o1 = Date.now() - 15 * 60_000;
@@ -907,6 +927,32 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   const cancelRunC = repo.getTaskRun.get('cline:cline-sid-1:2');
   ok('取消的台账行带 ended_at（不挂在 running 上）', Boolean(cancelRunC) && Number(cancelRunC.ended_at) > 0, cancelRunC && cancelRunC.ended_at);
   ok('取消 → 成员卡回落 idle', stateOf('cline@p1') === 'idle', stateOf('cline@p1'));
+
+  console.log('[9] 用户删除轮询任务后不被源会话重建；同步器内部删除不写 tombstone');
+  const deletedPollTask = 'opencode:oc-sid-delete:0';
+  opencodeRows = [{
+    id: 'oc-sid-delete', project: 'p1', projectPath: '/tmp/p1', title: '可删除的诊断任务', model: '',
+    lastEventAt: Date.now(),
+    turns: [{ index: 0, prompt: '可删除的诊断任务', startedAt: Date.now() - 1000, endedAt: Date.now(), files: [] }],
+  }];
+  syncOpencodeTasks({ bus, repo });
+  ok('源会话先生成轮询任务', Boolean(repo.getTaskRun.get(deletedPollTask)));
+  repo.deleteTaskRun(deletedPollTask, { suppressPolled: true });
+  ok('用户删除写入持久 suppression', Boolean(repo.isTaskRunSuppressed.get(deletedPollTask)));
+  syncOpencodeTasks({ bus, repo });
+  ok('源会话仍存在时任务不被重新创建', !repo.getTaskRun.get(deletedPollTask));
+
+  const internalTask = 'opencode:oc-sid-internal-delete:0';
+  opencodeRows = [{
+    id: 'oc-sid-internal-delete', project: 'p1', projectPath: '/tmp/p1', title: '内部清理回归', model: '',
+    lastEventAt: Date.now(),
+    turns: [{ index: 0, prompt: '内部清理回归', startedAt: Date.now() - 1000, endedAt: Date.now(), files: [] }],
+  }];
+  syncOpencodeTasks({ bus, repo });
+  repo.deleteTaskRun(internalTask);
+  ok('同步器内部删除不创建 suppression', !repo.isTaskRunSuppressed.get(internalTask));
+  syncOpencodeTasks({ bus, repo });
+  ok('内部删除后源行仍可由同步器重建', Boolean(repo.getTaskRun.get(internalTask)));
 
   server.close();
   close();

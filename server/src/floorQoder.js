@@ -720,6 +720,7 @@ function syncQoderPluginTasks({ bus, repo, now: nowFn = Date.now }) {
 
     for (const t of rounds) {
       const id = `${prefix}:${t.index}`;
+      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(id)) continue;
       // Changed files: the extension records absolute paths, uniformly converted to project-relative
       // (same as 7F/8F)
       const files = (t.files || [])

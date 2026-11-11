@@ -1277,21 +1277,23 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     // makes users think "the new task was not recorded".
     const last = rounds[rounds.length - 1];
     const lastId = `${prefix}:${last.index}`;
-    writeTurnRun(repo, {
-      id: lastId,
-      projectId,
-      memberId,
-      sessionId: s.id || null,
-      model: s.model || '',
-      title: last.prompt || s.title || '(Kilo 会话)',
-      startedAt: last.startedAt || now,
-      endedAt: last.endedAt || null,
-      state: last.outcome,
-      files: relFiles(last.files),
-      result: last.endedAt ? last.result || '' : '',
-      tokens: last.tokens,
-    });
-    count += 1;
+    if (!repo.isTaskRunSuppressed || !repo.isTaskRunSuppressed.get(lastId)) {
+      writeTurnRun(repo, {
+        id: lastId,
+        projectId,
+        memberId,
+        sessionId: s.id || null,
+        model: s.model || '',
+        title: last.prompt || s.title || '(Kilo 会话)',
+        startedAt: last.startedAt || now,
+        endedAt: last.endedAt || null,
+        state: last.outcome,
+        files: relFiles(last.files),
+        result: last.endedAt ? last.result || '' : '',
+        tokens: last.tokens,
+      });
+      count += 1;
+    }
 
     // ②b When taking the session back from the plugin (its channel died — see yieldsOf), backfill the turns
     // it missed while disconnected: the test is "the plugin never reported this turn" (aligned by turn start,
@@ -1306,6 +1308,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
         if (coveredBy(starts, r.startedAt)) continue;
         const rid = `${prefix}:${r.index}`;
         if (sessionRuns.some((x) => String(x.id) === rid)) continue;
+        if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(rid)) continue;
         writeTurnRun(repo, {
           id: rid,
           projectId,
@@ -1332,6 +1335,7 @@ function syncKiloTasks({ bus, repo, now: nowFn = Date.now }) {
     for (const r of sessionRuns) {
       const idx = roundIndexOf(r.id, prefix);
       if (idx === null || idx >= last.index) continue;
+      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(r.id)) continue;
       const old = byIndex.get(idx);
       if (!old) continue;
       writeTurnRun(repo, {

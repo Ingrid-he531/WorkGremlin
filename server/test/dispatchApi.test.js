@@ -21,6 +21,7 @@ const express = require('express');
 
 const { createDispatchService, parseModelList } = require('../src/control/service');
 const { createDispatchRouter, isLoopback } = require('../src/http/routes/dispatch');
+const { recipeOf } = require('../src/control/recipes');
 const { readDispatchConfig } = require('../src/control/config');
 
 let pass = 0;
@@ -286,6 +287,74 @@ const post = (url, body) =>
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     close();
+  }
+
+  head('OpenCode first-turn session bootstrap');
+  {
+    const runs = [];
+    const service = createDispatchService({
+      storeFile: null,
+      readConfig: () => ({ mode: 'auto' }),
+      binFor: (floor) => (floor === '8F' ? '/fake/opencode' : null),
+      recipeFor: recipeOf,
+      runCommand: (arg) => new Promise((resolve) => runs.push({ arg, resolve })),
+    });
+    const created = service.createSession({ floor: '8F', workspacePath: WORKSPACE });
+    ok('OpenCode session ID is not fabricated before first run', !created.opencodeSessionId);
+
+    service.sendTurn(created.id, { prompt: 'first turn' });
+    ok('first turn lets OpenCode create its own session', !runs[0].arg.args.includes('--session'));
+    ok('first turn requests structured output', runs[0].arg.args.includes('json'));
+    runs[0].arg.onData(`${JSON.stringify({ type: 'text', sessionID: 'ses_opencode_native', part: { type: 'text', text: 'first reply' } })}\n`);
+    runs[0].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const afterFirst = service.getSession(created.id);
+    ok('native OpenCode session ID is captured', afterFirst.opencodeSessionId === 'ses_opencode_native');
+    ok('structured response text is shown in transcript', afterFirst.turns[0].output === 'first reply');
+
+    service.sendTurn(created.id, { prompt: 'second turn' });
+    const sessionFlag = runs[1].arg.args.indexOf('--session');
+    ok('second turn resumes the native session', sessionFlag >= 0 && runs[1].arg.args[sessionFlag + 1] === 'ses_opencode_native');
+    runs[1].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    service.dispose();
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-dispatch-missing-session-'));
+    const storeFile = path.join(dir, 'sessions.json');
+    fs.writeFileSync(
+      storeFile,
+      JSON.stringify({
+        sessions: [{
+          id: 'legacy-session',
+          floor: '8F',
+          workspacePath: WORKSPACE,
+          productSessionId: 'ses_wg_legacy_missing',
+          opencodeSessionId: 'ses_wg_legacy_missing',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          turns: [{ id: 'legacy-turn', state: 'failed', error: 'Error: Session not found', createdAt: Date.now() }],
+        }],
+      })
+    );
+    const retryRuns = [];
+    const recoveredService = createDispatchService({
+      storeFile,
+      readConfig: () => ({ mode: 'auto' }),
+      binFor: (floor) => (floor === '8F' ? '/fake/opencode' : null),
+      recipeFor: recipeOf,
+      runCommand: (arg) => new Promise((resolve) => retryRuns.push({ arg, resolve })),
+    });
+    const recovered = recoveredService.getSession('legacy-session');
+    ok('legacy missing OpenCode ID is cleared on restore', !recovered.opencodeSessionId);
+    recoveredService.sendTurn('legacy-session', { prompt: 'retry first turn' });
+    ok('retry of legacy session uses native creation', !retryRuns[0].arg.args.includes('--session'));
+    retryRuns[0].arg.onData(`${JSON.stringify({ type: 'text', sessionID: 'ses_opencode_recovered', part: { type: 'text', text: 'recovered' } })}\n`);
+    retryRuns[0].resolve({ status: 'ok', exitCode: 0, stdout: '', stderr: '' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    ok('legacy retry stores the newly created ID', recoveredService.getSession('legacy-session').opencodeSessionId === 'ses_opencode_recovered');
+    recoveredService.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 
   head('saved composer model');

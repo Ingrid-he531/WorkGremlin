@@ -832,6 +832,16 @@ function createRepo(db) {
       WHERE id = @id
     `),
     getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
+    isTaskRunSuppressed: db.prepare(`SELECT 1 FROM task_run_suppressions WHERE id = ?`),
+    insertTaskRunSuppression: db.prepare(`
+      INSERT INTO task_run_suppressions (id, deleted_at) VALUES (?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `),
+    selectPollerTaskRunIds: db.prepare(`
+      SELECT id FROM task_runs
+       WHERE id IN (SELECT value FROM json_each(?))
+         AND client IN ('copilot', 'opencode', 'kilo', 'cline', 'qoder')
+    `),
     listTasks: db.prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY started_at DESC`),
     /** Latest task start or end per session: the workstation's last-active timestamp. */
     lastTaskAtOfMemberBySession: db.prepare(`
@@ -1382,12 +1392,14 @@ function createRepo(db) {
    * @param {string[]} topIds list of top-level task ids
    * @returns {number} how many top-level tasks were deleted
    */
-  function deleteByTopIds(topIds) {
+  function deleteByTopIds(topIds, { suppressPolled = false } = {}) {
     if (!topIds.length) return 0;
     const topJson = JSON.stringify(topIds);
     const childRows = stmt.selectChildTaskIds.all(topJson);
     const allJson = JSON.stringify([...topIds, ...childRows.map((r) => r.id)]);
+    const pollerIds = suppressPolled ? stmt.selectPollerTaskRunIds.all(topJson).map((r) => r.id) : [];
     const tx = db.transaction(() => {
+      for (const id of pollerIds) stmt.insertTaskRunSuppression.run(id, Date.now());
       stmt.deleteMessagesByTask.run(allJson);
       stmt.deleteArtifactsByTask.run(allJson);
       stmt.deleteToolUsageByTask.run(allJson);
@@ -1404,8 +1416,8 @@ function createRepo(db) {
    * Delete a single task record (the second confirmation happens client-side; this only does the actual deletion).
    * @param {string} id top-level task id
    */
-  function deleteTaskRun(id) {
-    return deleteByTopIds([id]);
+  function deleteTaskRun(id, options) {
+    return deleteByTopIds([id], options);
   }
 
   /**
@@ -1432,7 +1444,7 @@ function createRepo(db) {
     const topIds = stmt.selectTopTaskIds
       .all({ project: projectArg, client: clientArg, before: beforeArg })
       .map((r) => r.id);
-    return deleteByTopIds(topIds);
+    return deleteByTopIds(topIds, { suppressPolled: Boolean(opt.suppressPolled) });
   }
 
   const getSettingStmt = db.prepare('SELECT value FROM settings WHERE key = ?');

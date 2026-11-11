@@ -352,7 +352,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
   router.delete('/task-runs/:id', (req, res) => {
     const id = req.params.id;
     if (!id) return res.status(400).json({ ok: false, error: { code: 'bad_payload', message: 'missing id' } });
-    const n = repo.deleteTaskRun(id);
+    const n = repo.deleteTaskRun(id, { suppressPolled: true });
     return res.json({ ok: true, deleted: n });
   });
 
@@ -373,7 +373,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
       const days = Math.max(1, Math.min(Number(req.query.days) || DEFAULTS.RETENTION_DAYS, 3650));
       beforeTs = Date.now() - days * 24 * 60 * 60 * 1000;
     }
-    const n = repo.deleteTaskRunsByFilter({ project, client, beforeTs });
+    const n = repo.deleteTaskRunsByFilter({ project, client, beforeTs, suppressPolled: true });
     return res.json({ ok: true, deleted: n });
   });
 
@@ -389,7 +389,7 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
     // (the daily timer keeps handling rolling cleanup afterwards)
     let cleaned = 0;
     try {
-      cleaned = repo.deleteTaskRunsByFilter({ beforeTs: Date.now() - days * 24 * 60 * 60 * 1000 });
+      cleaned = repo.deleteTaskRunsByFilter({ beforeTs: Date.now() - days * 24 * 60 * 60 * 1000, suppressPolled: true });
     } catch {
       /* a failed cleanup does not affect saving */
     }

@@ -1342,6 +1342,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     // ① Every finished turn: one record (the title is that turn's exact user text)
     for (const t of turns) {
       const id = `${TASK_ID_PREFIX}${s.id}:${t.index}`;
+      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(id)) continue;
       const title = t.userMessage || s.doneTitle || s.prompt || '(Copilot 会话)';
       const known = liveReqByIndex.get(t.index);
       const startedAt = (known && known.startedAt) || t.at || s.lastUpdated || now;
@@ -1366,6 +1367,31 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       count += 1;
     }
 
+    // Copilot's session-store.db may lag its VS Code session log: a completed request can be missing from
+    // `turns` while the next request is already in flight. The log's completedAt is authoritative for that
+    // round, so close only an existing running ledger row; never synthesize a task from timing alone.
+    for (const request of Array.isArray(s.liveReqs) ? s.liveReqs : []) {
+      const id = `${TASK_ID_PREFIX}${s.id}:${request.index}`;
+      const endedAt = Number(request.endedAt) || 0;
+      if (!endedAt || (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(id))) continue;
+      const task = repo.getTask.get(id);
+      if (!task || task.state !== 'running') continue;
+      const run = repo.getTaskRun.get(id);
+      repo.updateTask.run({ id, state: 'done', progress: 1, endedAt });
+      repo.endTaskRun.run({
+        id,
+        title: null,
+        model: null,
+        form: null,
+        result: null,
+        fileCount: null,
+        filesJson: null,
+        endedAt,
+        durationMs: task.started_at ? endedAt - task.started_at : null,
+      });
+      count += 1;
+    }
+
     // ② The in-flight turn: one running row (the user's text comes from the VS Code session log — Copilot's
     //    store does not have it yet)
     let runningId = '';
@@ -1377,6 +1403,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
       const logIdx = Number.isFinite(Number(s.liveIndex)) && s.liveIndex != null ? Number(s.liveIndex) : -1;
       const idx = Math.max(logIdx, lastDone + 1);
       runningId = `${TASK_ID_PREFIX}${s.id}:${idx}`;
+      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(runningId)) continue;
       const title = s.livePrompt || s.prompt || s.doneTitle || '(Copilot 会话)';
       writeTurnRun(repo, {
         id: runningId,

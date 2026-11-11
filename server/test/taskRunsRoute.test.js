@@ -414,6 +414,22 @@ app.use('/api/v1', createIngestRouter({ bus }));
     JSON.stringify(otherProjectRow.floor)
   );
 
+  console.log('[9] 删除 OpenCode 轮询任务时写入 suppression');
+  const deletedPollId = 'opencode:delete-route-session:0';
+  repo.insertTask.run({
+    id: deletedPollId, projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null,
+    title: 'poll-derived task', state: 'done', progress: 1, startedAt: feedNow, endedAt: feedNow + 1,
+  });
+  repo.upsertTaskRun.run({
+    id: deletedPollId, projectId: 'p1', memberId: 'opencode@p1', client: 'opencode',
+    sessionId: 'delete-route-session', form: 'cli', model: null, title: 'poll-derived task',
+    startedAt: feedNow, baselineCommit: null,
+  });
+  const deletedPollRes = await fetch(`${base}/task-runs/${encodeURIComponent(deletedPollId)}`, { method: 'DELETE' });
+  const deletedPollBody = await deletedPollRes.json();
+  ok('delete endpoint succeeds', deletedPollRes.status === 200 && deletedPollBody.deleted === 1, JSON.stringify(deletedPollBody));
+  ok('delete endpoint stores suppression for a polling floor', Boolean(repo.isTaskRunSuppressed.get(deletedPollId)));
+
   server.close();
   close();
   fs.rmSync(WG_HOME, { recursive: true, force: true });

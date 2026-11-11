@@ -226,6 +226,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
 CREATE INDEX IF NOT EXISTS idx_task_runs_project_started ON task_runs(project_id, started_at DESC);
 -- As above: idx_task_runs_session is created in migrate().
 
+-- Explicit user deletions of polling-derived task rows. Their source sessions remain owned by the agent,
+-- so a later poll must not recreate a task the user deliberately removed from the ledger.
+CREATE TABLE IF NOT EXISTS task_run_suppressions (
+  id          TEXT PRIMARY KEY,
+  deleted_at  INTEGER NOT NULL
+);
+
 -- One row per **subagent instance summoned** this turn (ghosts).
 -- Not deleted when a ghost disperses (purgeMember): this is the only ledger of "how many subagents this turn
 -- used" — whether they have a small station (susan) or are station-less instances spawned directly by a

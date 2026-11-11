@@ -1258,6 +1258,7 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     for (const t of turns) {
       if (coveredBy(starts, t.startedAt)) continue; // rounds the plugin reported are not written twice
       const id = `${prefix}:${t.index}`;
+      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(id)) continue;
       // Changed files: only ones a write tool (edit) touched; OpenCode's input is absolute, convert
       // uniformly to project-relative
       const files = (t.files || [])

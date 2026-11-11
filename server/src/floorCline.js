@@ -875,6 +875,7 @@ function syncClineTasks({ bus, repo, now: nowFn = Date.now }) {
     // `running` records whether this session's latest turn is still running.
     for (const r of rounds) {
       const id = `${prefix}:${r.index}`;
+      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(id)) continue;
       // The round's own outcome is authoritative: running | done | cancelled. A cancelled round has an
       // endedAt but must be written as 'cancelled', not 'done' —— otherwise the ticker lights "task
       // completed" on a stop, and the list hides that it was cut short.

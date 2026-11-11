@@ -314,7 +314,7 @@ function createServer(opts = {}) {
       try {
         const days = repo.getRetentionDays();
         const beforeTs = clock.now() - days * 24 * 60 * 60 * 1000;
-        const n = repo.deleteTaskRunsByFilter({ beforeTs });
+        const n = repo.deleteTaskRunsByFilter({ beforeTs, suppressPolled: true });
         if (n > 0 && !opts.silent) log.info(`[workgremlin] 自动清理：删除 ${n} 条超过 ${days} 天的任务记录`);
       } catch (err) {
         if (!opts.silent) log.warn('[workgremlin] 自动清理失败：', err && err.message);

@@ -87,6 +87,51 @@ function claudeStreamParser() {
   };
 }
 
+function opencodeJsonParser() {
+  let buffer = '';
+  let sessionId = '';
+
+  const drain = (line) => {
+    const text = line.trim();
+    if (!text) return '';
+    try {
+      const event = JSON.parse(text);
+      if (event && event.sessionID) sessionId = String(event.sessionID);
+      if (event && event.type === 'text' && event.part && event.part.type === 'text') {
+        return String(event.part.text || '');
+      }
+      if (event && event.type === 'error') {
+        return String((event.error && event.error.message) || '');
+      }
+    } catch {
+      return '';
+    }
+    return '';
+  };
+
+  const parser = {
+    push(chunk) {
+      buffer += String(chunk || '');
+      let out = '';
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        out += drain(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + 1);
+      }
+      return out;
+    },
+    flush() {
+      const tail = buffer;
+      buffer = '';
+      return drain(tail);
+    },
+    sessionId() {
+      return sessionId;
+    },
+  };
+  return parser;
+}
+
 const CLAUDE_PERMISSIONS = Object.freeze(['auto', 'acceptEdits', 'bypassPermissions', 'plan']);
 
 /** Claude Code stores its model picker in `~/.claude/settings.json` (CLAUDE_CONFIG_DIR overrides). */
@@ -160,15 +205,16 @@ const RECIPES = Object.freeze({
     floor: '8F',
     client: 'opencode',
     name: 'OpenCode',
+    nativeSessionId: true,
     permissions: Object.freeze(['auto']),
     defaultPermission: 'auto',
     build({ prompt, model, sessionId }) {
-      const args = ['run', prompt, '--auto'];
+      const args = ['run', prompt, '--auto', '--format', 'json'];
       // Continue the same OpenCode session for every turn: the office/ledger then sees one long
       // conversation instead of one session per prompt.
       if (sessionId) args.push('--session', sessionId);
       if (model) args.push('-m', model);
-      return { args, stdin: null };
+      return { args, stdin: null, parser: opencodeJsonParser };
     },
   },
 });
