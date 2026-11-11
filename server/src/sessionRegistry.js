@@ -610,7 +610,18 @@ function refresh({ workspacePath = '', force = false } = {}) {
       // confined to its own file" landed —— adding / adjusting a floor touches only its file + floors.js,
       // this file stays unchanged.
       const handler = (mod && mod.kindHandlers && mod.kindHandlers[src.kind]) || DEFAULT_KIND_HANDLERS[src.kind];
-      if (handler) handler(p, src, ctx);
+      if (handler) {
+        try {
+          handler(p, src, ctx);
+        } catch (err) {
+          // One floor's local store being locked / renamed must not abort the scan for every other floor.
+          // The whole scan runs inside the poller's try/catch, so an exception here used to freeze the
+          // registry table: a session that started afterwards never entered the active set, the task feed
+          // hid its running task ("no active task" on the ticker while the console showed tool calls), and
+          // orphan reconciliation stopped. Keep the other floors updating and leave a trace.
+          log.debug(`会话扫描失败（${p.id} / ${src.kind}）：`, (err && err.message) || err);
+        }
+      }
     }
     // The floor's own background flush (e.g. 5F Trae's endTask / amount re-emission): it must run before
     // the generic flush, otherwise superseded would first turn Trae's normally finished running tasks into

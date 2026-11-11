@@ -116,7 +116,7 @@ const { reporterMainPhase } = require('../src/sessions');
  * 之后推的事件一个都收不到（表现为状态文件与台账全空）。
  * `push` 也不能既入队又唤醒等待者：那会把同一个事件交付两次。
  */
-function makeCtx(options) {
+function makeCtx(options, dir = WS) {
   const queue = [];
   let waiting = null;
   const push = (v) => {
@@ -130,7 +130,7 @@ function makeCtx(options) {
   };
   return {
     options: options || {},
-    location: { directory: WS },
+    location: { directory: dir },
     event: {
       subscribe() {
         return {
@@ -400,6 +400,49 @@ head('[F] 边界：两代信封都认 / OpenCode v2 事件词汇 / 拿不到标�
   ok('子会话 execution.succeeded → /ghost finish（散场）', Boolean(gEnd) && gEnd.body.name === 'explore', JSON.stringify(gEnd && gEnd.body));
   ok('散场带上子代理最后说的话', gEnd && gEnd.body.result === '查到了', gEnd && gEnd.body.result);
   if (typeof off2 === 'function') off2();
+}
+
+/* [H] One OpenCode server serves several workspaces and loads the plugin once per workspace, while
+   the event stream is whole-server. Regression (user, 2026-11-11): the same user turn opened two
+   ledger tasks 9ms apart — one immediately cancelled, one running. Each instance must only report
+   sessions inside its own workspace. */
+head('[H] 多工作区插件实例：同一轮只由一个实例记账');
+{
+  const OTHER = '/tmp/OtherWorkspace';
+  const ctxHome = makeCtx({ client: 'opencode' }, WS);
+  const ctxOther = makeCtx({ client: 'opencode' }, OTHER);
+  const offHome = await plugin.setup(ctxHome);
+  const offOther = await plugin.setup(ctxOther);
+  const SID_HOME = 'ses_home_1';
+  const homeEvent = (type, data, withLocation = true) => ({
+    type,
+    data: { sessionID: SID_HOME, ...data },
+    ...(withLocation ? { location: { directory: WS } } : {}),
+    created: Date.now(),
+  });
+  // Both instances receive the same events (the second workspace's instance included).
+  for (const c of [ctxHome, ctxOther]) {
+    c.emit(homeEvent('session.created', { info: { directory: WS } }));
+    c.emit(homeEvent('session.inbox.enqueued', { item: { type: 'user', payload: { text: '"同一轮任务"' } } }));
+    // No `location`: the instance must fall back to the directory it learned from the earlier event.
+    c.emit(homeEvent('session.execution.started', {}, false));
+  }
+  await settle();
+  const homeStarts = seen.filter((s) => s.route === '/api/v1/task/start' && s.body.sessionId === SID_HOME);
+  ok('同一轮只开一个台账任务', homeStarts.length === 1, JSON.stringify(homeStarts.map((s) => s.body.taskId)));
+  ok(
+    '改由会话所在工作区的实例记账（工程路径正确）',
+    homeStarts.length === 1 && homeStarts[0].body.workspacePath === WS,
+    JSON.stringify(homeStarts.map((s) => s.body.workspacePath))
+  );
+  const homeStateFiles = fs.readdirSync(path.join(WG, 'hooks')).filter((n) => n.includes(SID_HOME));
+  ok(
+    '状态文件只属于本工作区（没有写到别的工作区名下）',
+    homeStateFiles.length === 1 && homeStateFiles[0].includes('ProjPlugin'),
+    JSON.stringify(homeStateFiles)
+  );
+  if (typeof offHome === 'function') offHome();
+  if (typeof offOther === 'function') offOther();
 }
 
 if (typeof dispose === 'function') dispose();

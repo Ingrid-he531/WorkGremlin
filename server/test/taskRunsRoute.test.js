@@ -414,6 +414,58 @@ app.use('/api/v1', createIngestRouter({ bus }));
     JSON.stringify(otherProjectRow.floor)
   );
 
+  /* [8b] Liveness fallback: the registry reads each product's own local store. A store that is
+     momentarily locked / renamed / fails for one floor leaves a live session out of the active set,
+     and the ticker then says "no active task" while the main console (which reads the reporter state
+     file directly) clearly shows the run's tool calls (user report, 2026-11-11). A state file
+     rewritten during the round is an equally strong liveness signal. */
+  console.log('[8b] /task-feed：registry 漏掉的会话，reporter 状态文件新鲜时仍然算活跃');
+  const reporterFeedStart = feedNow - 3_000;
+  repo.insertTask.run({
+    id: 't-feed-reporter',
+    projectId: 'p1',
+    memberId: 'codex@p1',
+    parentTaskId: null,
+    title: 'reporter-alive task',
+    state: 'running',
+    progress: 0,
+    startedAt: reporterFeedStart,
+    endedAt: null,
+  });
+  repo.upsertTaskRun.run({
+    id: 't-feed-reporter', projectId: 'p1', memberId: 'codex@p1', client: 'codex',
+    sessionId: 's-feed-reporter', form: 'cli', model: null, title: 'reporter-alive task',
+    startedAt: reporterFeedStart, baselineCommit: null,
+  });
+  const hooksDir = path.join(WG_HOME, 'hooks');
+  fs.mkdirSync(hooksDir, { recursive: true });
+  const reporterStateFile = path.join(hooksDir, 'codex__tmp_p1_s-feed-reporter.json');
+  const writeReporterState = (at) =>
+    fs.writeFileSync(
+      reporterStateFile,
+      JSON.stringify({
+        client: 'codex',
+        form: 'cli',
+        sessionId: 's-feed-reporter',
+        sessionPhase: { phase: 'tool', ts: at, workspacePath: '/tmp/p1' },
+        hb: { pid: process.pid, lastEventAt: at },
+      })
+    );
+  writeReporterState(feedNow);
+  let fallbackFeed = await (await fetch(`${base}/task-feed?minutes=5`)).json();
+  ok(
+    '状态文件新鲜 → running 任务在 feed 里（不再显示“暂无活跃任务”）',
+    (fallbackFeed.items || []).some((t) => t.id === 't-feed-reporter'),
+    JSON.stringify((fallbackFeed.items || []).map((t) => t.id))
+  );
+  writeReporterState(feedNow - 10 * 60_000);
+  fallbackFeed = await (await fetch(`${base}/task-feed?minutes=5`)).json();
+  ok(
+    '状态文件过期 → 不再冒充活跃（旧轮不会复活）',
+    !(fallbackFeed.items || []).some((t) => t.id === 't-feed-reporter'),
+    JSON.stringify((fallbackFeed.items || []).map((t) => t.id))
+  );
+
   console.log('[9] 删除 OpenCode 轮询任务时写入 suppression');
   const deletedPollId = 'opencode:delete-route-session:0';
   repo.insertTask.run({

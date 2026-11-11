@@ -387,6 +387,29 @@ function subagentOf(input) {
   return { name: String(name || "").trim() || "subagent", task: String(task).replace(/\s+/g, " ").trim().slice(0, 80) }
 }
 
+/**
+ * Whether two workspace directories are the same directory or one contains the other (a session can
+ * run in a subdirectory of the workspace it was opened from; that still belongs to the same plugin
+ * instance). Used to keep one OpenCode server's several per-workspace plugin instances from all
+ * reporting the same session (see the guard in `handle`).
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function sameWorkspaceTree(a, b) {
+  const inside = (from, to) => {
+    const rel = path.relative(from, to)
+    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+  }
+  try {
+    const ra = path.resolve(String(a || ""))
+    const rb = path.resolve(String(b || ""))
+    return inside(ra, rb) || inside(rb, ra)
+  } catch {
+    return false
+  }
+}
+
 /* ------------------------------ Plugin ------------------------------ */
 
 /**
@@ -875,6 +898,20 @@ function createIngestPlugin(options, { location, base } = {}) {
      * title is set at creation, so it is the reliable signal here regardless of which server loaded us.
      */
     if (sid && titles.get(sid) === COUNCIL_SESSION_TITLE) return
+
+    /**
+     * OpenCode serves **several workspaces from one long-lived server** and loads this plugin once per
+     * workspace, while the event stream is whole-server (see wsOf's note). Without a guard every
+     * instance reports every session: the same user turn opened two ledger tasks 9ms apart (the
+     * server then cancelled one as "the previous round"), and the other workspace's instance wrote
+     * phase state files under its own path. Only the instance whose workspace contains the session may
+     * report it. The session's directory is learned from the envelope (v2) before deciding; note the
+     * event can lack `location`, so the directory learned from an earlier event is used then.
+     */
+    const eventDir = String((event && event.location && event.location.directory) || "")
+    if (sid && eventDir) dirs.set(sid, eventDir)
+    const sessionDir = sid ? dirs.get(sid) || "" : ""
+    if (sessionDir && ownDir && !sameWorkspaceTree(sessionDir, ownDir)) return
 
     // Member registration: **ensure on every event**, not only on `session.created`. Must: reopening the
     // Kilo VS Code window restarts kilo serve while the session already exists, so a new process never

@@ -6,7 +6,7 @@ const express = require('express');
 const { DEFAULTS, formToSource, clientLabel, agentBase } = require('@workgremlin/shared');
 const { cachedDirSize } = require('../../dirSize');
 const { resolveProjectName } = require('../../project');
-const { resolveSessionTitle, sessionFirstPrompts } = require('../../sessions');
+const { resolveSessionTitle, sessionFirstPrompts, listReporterSessions } = require('../../sessions');
 const { getActiveSessionIds: registryActiveSessionIds } = require('../../sessionRegistry');
 const { floorByAgent } = require('../../floors');
 
@@ -64,6 +64,38 @@ function projectLabelOf(row) {
   const label = resolveProjectName(ws) || fallback;
   _projectLabelCache.set(ws, { at: now, label });
   return label;
+}
+
+/** How fresh a reporter state file must be to count as "this session is alive right now" (task feed fallback) */
+const REPORTER_LIVE_MS = 5 * 60_000;
+
+/**
+ * Session ids that can still be running a task, for the ticker feed.
+ *
+ * Primary source: the registry's active set (the session table). Fallback: the reporter state files,
+ * which are rewritten continuously while a round runs (`hb.lastEventAt` / phase `ts`). The fallback
+ * matters because the registry reads each product's own local store; a store that is momentarily
+ * locked, renamed or fails for one floor leaves a live session out of the table. The main console
+ * (which reads the state file directly) then shows the task's tool calls while the ticker says "no
+ * active task" — the exact mismatch users report. A stale state file (old round, no end marker) is
+ * older than the window and does not resurrect anything.
+ * @returns {Set<string>}
+ */
+function liveSessionIds(getActiveSessionIds) {
+  const ids = new Set(
+    [...(getActiveSessionIds() || [])].map((id) => String(id || '').trim()).filter(Boolean)
+  );
+  try {
+    const now = Date.now();
+    for (const s of listReporterSessions('')) {
+      const at = Number(s && s.lastEventAt) || 0;
+      const sessionId = String((s && s.sessionId) || '').trim();
+      if (sessionId && at && now - at < REPORTER_LIVE_MS) ids.add(sessionId);
+    }
+  } catch {
+    /* the fallback must never break the feed; the registry set is still authoritative */
+  }
+  return ids;
 }
 
 /**
@@ -280,14 +312,16 @@ function createQueryRouter({ bus, repo, getActiveSessionIds = registryActiveSess
    *     the frontend just scrolls in the order it receives.
    *
    * State follows /task-runs: tasks.state is the only truth. A running task is shown only while its
-   * session is active; session identity alone decides liveness (project / floor / client do not).
-   * Tasks cancelled by orphan reconciliation are excluded entirely so stale work never scrolls once.
+   * session is alive; session identity alone decides liveness (project / floor / client do not).
+   * "Alive" = the registry's active set, or a reporter state file younger than REPORTER_LIVE_MS (see
+   * liveSessionIds). Tasks cancelled by orphan reconciliation are excluded entirely so stale work
+   * never scrolls once.
    */
   router.get('/task-feed', (req, res) => {
     const minutes = Math.min(Math.max(Number(req.query.minutes) || 5, 1), 120);
     const since = Date.now() - minutes * 60_000;
     const project = req.query.project;
-    const activeSessionJson = JSON.stringify([...(getActiveSessionIds() || [])]);
+    const activeSessionJson = JSON.stringify([...liveSessionIds(getActiveSessionIds)]);
 
     const conds = [
       't.parent_task_id IS NULL',
