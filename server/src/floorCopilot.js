@@ -122,7 +122,10 @@ function readCopilotTurns(db) {
     if (idxCol && msgCol) {
       const tsSel = tsCol ? `, ${tsCol} as ts` : '';
       const pendSel = respCol ? `, (${respCol} IS NULL OR TRIM(${respCol}) = '') as pend` : ', 0 as pend';
-      for (const r of db.prepare(`SELECT ${sidCol} as sid, ${idxCol} as idx, ${msgCol} as msg${pendSel}${tsSel} FROM turns`).all()) {
+      // The assistant's answer to this turn is the ledger's "产出摘要" (other floors read the same thing
+      // from their transcript); without it the record detail has an empty result block.
+      const respSel = respCol ? `, ${respCol} as resp` : '';
+      for (const r of db.prepare(`SELECT ${sidCol} as sid, ${idxCol} as idx, ${msgCol} as msg${pendSel}${respSel}${tsSel} FROM turns`).all()) {
         const sid = String(r.sid || '').trim();
         if (!sid) continue;
         const existing = out.get(sid) || { turnCount: 0, lastUserMessage: '', hasPendingTurn: false };
@@ -132,6 +135,7 @@ function readCopilotTurns(db) {
           userMessage: String(r.msg || '').replace(/\s+/g, ' ').trim().slice(0, 120),
           at: r.ts ? Number(new Date(String(r.ts)).getTime()) || 0 : 0,
           pending: Boolean(r.pend),
+          assistantResponse: String(r.resp || '').trim().slice(0, 4_000),
         });
         out.set(sid, existing);
       }
@@ -296,6 +300,38 @@ function readCopilotChatIndex() {
 /* ───────────── */
 
 /**
+ * VS Code's chat log request indexes can be **one ahead** of Copilot SQLite's `turn_index`
+ * (measured 2026-11-11: SQLite turn 12 ↔ log request 13). Every task id is built from the SQLite
+ * index, so anything read from the log must be shifted into that space first — otherwise the same
+ * turn is booked twice (a done row and a running row).
+ *
+ * Both sides carry the turn's completion moment (the log's `completedAt`, SQLite's `timestamp`), so
+ * pair the closest completion within 5 seconds and take the index delta. No confident pair → 0,
+ * which keeps the old behaviour for builds whose indexes already agree.
+ * @param {Array<{index: number, at?: number}>} turns Copilot SQLite turns
+ * @param {Array<{index: number, endedAt?: number}>} liveReqs completed requests from the session log
+ * @returns {number} SQLite index − log index
+ */
+function copilotLiveIndexOffset(turns, liveReqs) {
+  let offset = 0;
+  let closest = 5_001;
+  for (const turn of Array.isArray(turns) ? turns : []) {
+    if (!Number(turn && turn.at) || turn.index == null) continue;
+    for (const request of Array.isArray(liveReqs) ? liveReqs : []) {
+      if (!Number(request && request.endedAt) || request.index == null) continue;
+      const delta = Math.abs(Number(turn.at) - Number(request.endedAt));
+      if (delta < closest) {
+        closest = delta;
+        offset = Number(turn.index) - Number(request.index);
+      }
+    }
+  }
+  return offset;
+}
+
+/* ───────────── */
+
+/**
  * The "in flight" flag on a session row: true in flight / false done / null no side evidence
  * (falls back to the time-window inference).
  *
@@ -311,13 +347,16 @@ function copilotInFlight(row) {
   const live = row.live || null;
   const turns = Array.isArray(row.turns) ? row.turns : [];
   const lastTurnIdx = turns.length ? Number(turns[turns.length - 1].index) : -1;
+  // Compare in SQLite's index space: the log may number its requests one higher (see
+  // copilotLiveIndexOffset), and using the raw index made a finished turn look unfinished.
+  const indexOffset = copilotLiveIndexOffset(turns, live && live.reqs);
   // Follow the log when it is **not older** than the turn the index knows about. Do not demand "strictly
   // newer": in the measured VS Code build the index writes lastRequestEnded equal to lastRequestStarted
   // (so in-flight can never be detected), and letting the index win ties produces "the log says it just
   // started, the index says it is done" → the phase stays idle forever.
   const logKnowsNewer = Boolean(live && live.startedAt && (!c || live.startedAt >= (c.lastRequestStarted || 0)));
   if (logKnowsNewer) {
-    if (live.index != null && lastTurnIdx >= Number(live.index)) return false; // this turn's turn row already landed
+    if (live.index != null && lastTurnIdx >= Number(live.index) + indexOffset) return false; // this turn's turn row already landed
     if (Date.now() - live.startedAt > 60 * 60_000) return false; // a very old "unfinished" is likely residue, not in flight
     return !live.completed;
   }
@@ -1147,7 +1186,7 @@ function isSessionActive(s, now) {
  * syncCopilotTasks' notes.
  * @returns {string|null} this record's files_json, reused directly by the workstation card
  */
-function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, files }) {
+function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, startedAt, endedAt, files, result }) {
   const running = !endedAt;
   repo.insertTask.run({
     id,
@@ -1173,13 +1212,14 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
     baselineCommit: null,
   });
   const filesJson = files && files.length ? JSON.stringify(files) : null;
-  // Fill file_count / files_json / ended_at / duration_ms (upsertTaskRun does not write those columns)
+  const resultText = String(result || '').slice(0, 4_000) || null;
+  // Fill file_count / files_json / result / ended_at / duration_ms (upsertTaskRun does not write those columns)
   repo.endTaskRun.run({
     id,
     title,
     model: model || null,
     form: null,
-    result: null,
+    result: resultText,
     fileCount: files ? files.length : 0,
     filesJson,
     endedAt: endedAt || null,
@@ -1315,19 +1355,7 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     const liveReqs = Array.isArray(s.liveReqs) ? s.liveReqs : [];
     // VS Code's chat log request indexes can be one ahead of Copilot SQLite's turn_index. Align the
     // two using their completion timestamps; the SQLite turn index remains the canonical task ID.
-    let liveIndexOffset = 0;
-    let closestCompletionDelta = 5_001;
-    for (const turn of turns) {
-      if (!Number(turn.at)) continue;
-      for (const request of liveReqs) {
-        if (!Number(request.endedAt)) continue;
-        const delta = Math.abs(Number(turn.at) - Number(request.endedAt));
-        if (delta < closestCompletionDelta && turn.index != null && request.index != null) {
-          closestCompletionDelta = delta;
-          liveIndexOffset = Number(turn.index) - Number(request.index);
-        }
-      }
-    }
+    const liveIndexOffset = copilotLiveIndexOffset(turns, liveReqs);
     const canonicalLiveIndex = (index) => Number(index) + liveIndexOffset;
     const changedByIndex = new Map(
       (Array.isArray(s.liveChanged) ? s.liveChanged : []).map((c) => [canonicalLiveIndex(c.index), c.files || []])
@@ -1380,6 +1408,9 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         startedAt,
         endedAt,
         files: filesFor(t.index),
+        // Copilot's own store keeps this turn's answer; it is the record's "产出摘要" (like 7F/8F's
+        // last assistant message).
+        result: t.assistantResponse || '',
       });
       count += 1;
     }
@@ -1411,33 +1442,38 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
 
     // ② The in-flight turn: one running row (the user's text comes from the VS Code session log — Copilot's
     //    store does not have it yet)
-    let runningId = '';
     let currentIndex = -1;
     if (isActive) {
-      // Turn index = the one from the session log; before the log is complete fall back to "last turn + 1".
-      // It must be greater than the largest finished turn index — otherwise the previous turn's done record
-      // gets flipped back to running.
-      const lastDone = turns.length ? turns[turns.length - 1].index : -1;
-      const logIdx = Number.isFinite(Number(s.liveIndex)) && s.liveIndex != null ? canonicalLiveIndex(s.liveIndex) : -1;
-      currentIndex = Math.max(logIdx, lastDone + 1);
-      runningId = `${TASK_ID_PREFIX}${s.id}:${currentIndex}`;
-      if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(runningId)) continue;
-      const title = s.livePrompt || s.prompt || s.doneTitle || '(Copilot 会话)';
-      const startedAt = s.liveStartedAt || now;
-      const previousTask = repo.getTask.get(runningId);
-      if (previousTask && Number(previousTask.started_at) !== Number(startedAt)) repo.deleteTaskRun(runningId);
-      writeTurnRun(repo, {
-        id: runningId,
-        projectId,
-        memberId,
-        sessionId: s.id || null,
-        model: sessionModel,
-        title,
-        startedAt,
-        endedAt: null,
-        files: filesFor(currentIndex),
-      });
-      count += 1;
+      // Turn index = the one from the session log, shifted into SQLite's index space; before the log is
+      // complete fall back to "last turn + 1".
+      const lastDone = turns.length ? Number(turns[turns.length - 1].index) : -1;
+      const logIdx = Number.isFinite(Number(s.liveIndex)) && s.liveIndex != null ? canonicalLiveIndex(s.liveIndex) : null;
+      // Only a turn the ledger does **not** have yet is in flight. A finished turn can still look active for
+      // one tick (SQLite writes its row before the log's completion patch lands); booking it again as
+      // "last turn + 1" is exactly the duplicate the user sees — one done row plus one identical running row,
+      // which disappears on the next sync.
+      if (logIdx == null || logIdx > lastDone) {
+        const index = logIdx == null ? lastDone + 1 : logIdx;
+        const runningId = `${TASK_ID_PREFIX}${s.id}:${index}`;
+        if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(runningId)) continue;
+        currentIndex = index;
+        const title = s.livePrompt || s.prompt || s.doneTitle || '(Copilot 会话)';
+        const startedAt = s.liveStartedAt || now;
+        const previousTask = repo.getTask.get(runningId);
+        if (previousTask && Number(previousTask.started_at) !== Number(startedAt)) repo.deleteTaskRun(runningId);
+        writeTurnRun(repo, {
+          id: runningId,
+          projectId,
+          memberId,
+          sessionId: s.id || null,
+          model: sessionModel,
+          title,
+          startedAt,
+          endedAt: null,
+          files: filesFor(currentIndex),
+        });
+        count += 1;
+      }
     }
 
     const representedIndices = new Set(turns.map((turn) => Number(turn.index)));

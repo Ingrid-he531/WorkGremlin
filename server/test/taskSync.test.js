@@ -548,6 +548,41 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('错位占用的当前轮 ID 被修复为唯一运行任务', Boolean(mappedCurrent) && mappedCurrent.state === 'running' && mappedCurrent.started_at === mappedCurrentStart && !repo.getTaskRun.get('copilot:cop-sid-index-offset:3'), mappedCurrent && JSON.stringify({ state: mappedCurrent.state, startedAt: mappedCurrent.started_at }));
   copilotRows = [];
 
+  console.log('[6d] 9F：SQLite 已收下这一轮、日志完成补丁还没到时，不再多写一条 running；产出摘要写进 result');
+  // 回归（2026-11-11 用户实测）：一轮结束时列表里并排出现「完成」「进行中」两条一样的任务，几秒后
+  // 才合成一条。原因：SQLite 的 turns 行已经落库（这一轮已收工），但会话日志的 completedAt 补丁晚到
+  // 一拍，会话仍被判定在飞；旧逻辑用 "lastDone + 1" 又补了一条 running —— 正是这条幽灵。
+  const ndTurn0 = Date.now() - 200_000;
+  const ndTurn1 = Date.now() - 150_000;
+  const ndTurn2 = Date.now() - 60_000;
+  const ndNow = Date.now() - 5_000;
+  copilotRows = [{
+    id: 'cop-sid-no-dup', copilot: true, project: 'p1', projectPath: '/tmp/p1',
+    lastUpdated: ndNow, inFlight: true, prompt: 'finished turn', doneTitle: 'session',
+    copilotTurns: [
+      { index: 0, userMessage: 'first turn', at: ndTurn0 + 1200, assistantResponse: '第一轮的产出' },
+      { index: 1, userMessage: 'second turn', at: ndTurn1 + 1200, assistantResponse: '第二轮的产出' },
+      { index: 2, userMessage: 'finished turn', at: ndTurn2 + 1200, assistantResponse: '第三轮的产出' },
+    ],
+    livePrompt: 'finished turn', liveStartedAt: ndTurn2, liveIndex: 3,
+    liveReqs: [
+      { index: 1, startedAt: ndTurn0, endedAt: ndTurn0 },
+      { index: 2, startedAt: ndTurn1, endedAt: ndTurn1 },
+      { index: 3, startedAt: ndTurn2, endedAt: ndTurn2 },
+    ],
+  }];
+  // 旧逻辑留下的幽灵行（SQLite 已收工的轮次却又被当成 lastDone + 1 的在飞轮）
+  repo.insertTask.run({ id: 'copilot:cop-sid-no-dup:3', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: 'finished turn', state: 'running', progress: null, startedAt: ndTurn2, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'copilot:cop-sid-no-dup:3', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'cop-sid-no-dup', form: null, model: null, title: 'finished turn', startedAt: ndTurn2, baselineCommit: null });
+  syncCopilotTasks({ bus, repo });
+  const noDupRows = repo.taskRunsOfSession.all('cop-sid-no-dup');
+  ok('同一轮不再并排写 running（没有 copilot:cop-sid-no-dup:3）', !repo.getTaskRun.get('copilot:cop-sid-no-dup:3'), JSON.stringify(noDupRows.map((r) => r.id)));
+  ok('每轮正好一条（共 3 条）', noDupRows.length === 3, String(noDupRows.length));
+  const noDupDone = repo.getTaskRun.get('copilot:cop-sid-no-dup:2');
+  ok('最后一轮是 done', Boolean(noDupDone) && repo.getTask.get('copilot:cop-sid-no-dup:2')?.state === 'done', repo.getTask.get('copilot:cop-sid-no-dup:2')?.state);
+  ok('产出摘要 = 那一轮的 Copilot 回答', Boolean(noDupDone) && noDupDone.result === '第三轮的产出', noDupDone && noDupDone.result);
+  copilotRows = [];
+
   console.log('[7] 8F OpenCode：每一轮一条台账（在飞那轮 running）+ 改动文件只认 edit');
   const o0 = Date.now() - 20 * 60_000;
   const o1 = Date.now() - 15 * 60_000;
