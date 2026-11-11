@@ -521,6 +521,33 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('较新的当前轮仍保持 running', repo.getTask.get('copilot:cop-sid-log-finish:2')?.state === 'running', repo.getTask.get('copilot:cop-sid-log-finish:2')?.state);
   copilotRows = [];
 
+  console.log('[6c] 9F：日志请求索引比 SQLite 轮次多一位时，对齐任务 ID 和文件');
+  const mappedStart = Date.now() - 40_000;
+  const mappedEnd = mappedStart + 10_000;
+  const mappedCurrentStart = Date.now() - 3_000;
+  copilotRows = [{
+    id: 'cop-sid-index-offset', copilot: true, project: 'p1', projectPath: '/tmp/p1',
+    lastUpdated: mappedCurrentStart, inFlight: true, prompt: 'current mapped turn', doneTitle: 'session',
+    copilotTurns: [
+      { index: 0, userMessage: 'first turn', at: mappedStart - 60_000 },
+      { index: 1, userMessage: 'completed mapped turn', at: mappedEnd + 1200 },
+    ],
+    livePrompt: 'current mapped turn', liveStartedAt: mappedCurrentStart, liveIndex: 3,
+    liveReqs: [{ index: 2, startedAt: mappedStart, endedAt: mappedEnd }],
+    liveChanged: [{ index: 2, files: ['/tmp/outside/src/mapped-change.js'] }],
+  }];
+  repo.insertTask.run({ id: 'copilot:cop-sid-index-offset:2', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: 'misindexed old task', state: 'done', progress: 1, startedAt: mappedCurrentStart - 60_000, endedAt: mappedCurrentStart - 1 });
+  repo.upsertTaskRun.run({ id: 'copilot:cop-sid-index-offset:2', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'cop-sid-index-offset', form: null, model: null, title: 'misindexed old task', startedAt: mappedCurrentStart - 60_000, baselineCommit: null });
+  repo.insertTask.run({ id: 'copilot:cop-sid-index-offset:3', projectId: 'p1', memberId: 'copilot@p1', parentTaskId: null, title: 'misindexed duplicate running task', state: 'running', progress: null, startedAt: mappedCurrentStart, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'copilot:cop-sid-index-offset:3', projectId: 'p1', memberId: 'copilot@p1', client: 'copilot', sessionId: 'cop-sid-index-offset', form: null, model: null, title: 'misindexed duplicate running task', startedAt: mappedCurrentStart, baselineCommit: null });
+  syncCopilotTasks({ bus, repo });
+  const mappedDone = repo.getTaskRun.get('copilot:cop-sid-index-offset:1');
+  ok('日志第 2 请求映射到 SQLite 第 1 轮', Boolean(mappedDone) && mappedDone.started_at === mappedStart, mappedDone && String(mappedDone.started_at));
+  ok('跨出会话工程目录的改动仍显示绝对路径', Boolean(mappedDone) && mappedDone.files_json === JSON.stringify(['/tmp/outside/src/mapped-change.js']), mappedDone && mappedDone.files_json);
+  const mappedCurrent = repo.getTask.get('copilot:cop-sid-index-offset:2');
+  ok('错位占用的当前轮 ID 被修复为唯一运行任务', Boolean(mappedCurrent) && mappedCurrent.state === 'running' && mappedCurrent.started_at === mappedCurrentStart && !repo.getTaskRun.get('copilot:cop-sid-index-offset:3'), mappedCurrent && JSON.stringify({ state: mappedCurrent.state, startedAt: mappedCurrent.started_at }));
+  copilotRows = [];
+
   console.log('[7] 8F OpenCode：每一轮一条台账（在飞那轮 running）+ 改动文件只认 edit');
   const o0 = Date.now() - 20 * 60_000;
   const o1 = Date.now() - 15 * 60_000;

@@ -1312,8 +1312,25 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
      */
     const isActive = isSessionActive(s, now);
     const turns = Array.isArray(s.copilotTurns) ? s.copilotTurns : [];
+    const liveReqs = Array.isArray(s.liveReqs) ? s.liveReqs : [];
+    // VS Code's chat log request indexes can be one ahead of Copilot SQLite's turn_index. Align the
+    // two using their completion timestamps; the SQLite turn index remains the canonical task ID.
+    let liveIndexOffset = 0;
+    let closestCompletionDelta = 5_001;
+    for (const turn of turns) {
+      if (!Number(turn.at)) continue;
+      for (const request of liveReqs) {
+        if (!Number(request.endedAt)) continue;
+        const delta = Math.abs(Number(turn.at) - Number(request.endedAt));
+        if (delta < closestCompletionDelta && turn.index != null && request.index != null) {
+          closestCompletionDelta = delta;
+          liveIndexOffset = Number(turn.index) - Number(request.index);
+        }
+      }
+    }
+    const canonicalLiveIndex = (index) => Number(index) + liveIndexOffset;
     const changedByIndex = new Map(
-      (Array.isArray(s.liveChanged) ? s.liveChanged : []).map((c) => [Number(c.index), c.files || []])
+      (Array.isArray(s.liveChanged) ? s.liveChanged : []).map((c) => [canonicalLiveIndex(c.index), c.files || []])
     );
     /**
      * Which files this record should carry: **only those touched by "write" tools in the session log**
@@ -1330,13 +1347,13 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
           const p = String(abs || '');
           if (!p || !projectPath) return p;
           const r = path.relative(projectPath, p);
-          return r && !r.startsWith('..') ? r : ''; // Files outside the project do not enter this column
+          return r && !r.startsWith('..') ? r : p;
         })
         .filter(Boolean);
       return rel.length ? [...new Set(rel)] : null;
     };
     const liveReqByIndex = new Map(
-      (Array.isArray(s.liveReqs) ? s.liveReqs : []).map((r) => [r.index, r])
+      liveReqs.map((r) => [canonicalLiveIndex(r.index), r])
     );
 
     // ① Every finished turn: one record (the title is that turn's exact user text)
@@ -1370,8 +1387,8 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     // Copilot's session-store.db may lag its VS Code session log: a completed request can be missing from
     // `turns` while the next request is already in flight. The log's completedAt is authoritative for that
     // round, so close only an existing running ledger row; never synthesize a task from timing alone.
-    for (const request of Array.isArray(s.liveReqs) ? s.liveReqs : []) {
-      const id = `${TASK_ID_PREFIX}${s.id}:${request.index}`;
+    for (const request of liveReqs) {
+      const id = `${TASK_ID_PREFIX}${s.id}:${canonicalLiveIndex(request.index)}`;
       const endedAt = Number(request.endedAt) || 0;
       if (!endedAt || (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(id))) continue;
       const task = repo.getTask.get(id);
@@ -1395,16 +1412,20 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
     // ② The in-flight turn: one running row (the user's text comes from the VS Code session log — Copilot's
     //    store does not have it yet)
     let runningId = '';
+    let currentIndex = -1;
     if (isActive) {
       // Turn index = the one from the session log; before the log is complete fall back to "last turn + 1".
       // It must be greater than the largest finished turn index — otherwise the previous turn's done record
       // gets flipped back to running.
       const lastDone = turns.length ? turns[turns.length - 1].index : -1;
-      const logIdx = Number.isFinite(Number(s.liveIndex)) && s.liveIndex != null ? Number(s.liveIndex) : -1;
-      const idx = Math.max(logIdx, lastDone + 1);
-      runningId = `${TASK_ID_PREFIX}${s.id}:${idx}`;
+      const logIdx = Number.isFinite(Number(s.liveIndex)) && s.liveIndex != null ? canonicalLiveIndex(s.liveIndex) : -1;
+      currentIndex = Math.max(logIdx, lastDone + 1);
+      runningId = `${TASK_ID_PREFIX}${s.id}:${currentIndex}`;
       if (repo.isTaskRunSuppressed && repo.isTaskRunSuppressed.get(runningId)) continue;
       const title = s.livePrompt || s.prompt || s.doneTitle || '(Copilot 会话)';
+      const startedAt = s.liveStartedAt || now;
+      const previousTask = repo.getTask.get(runningId);
+      if (previousTask && Number(previousTask.started_at) !== Number(startedAt)) repo.deleteTaskRun(runningId);
       writeTurnRun(repo, {
         id: runningId,
         projectId,
@@ -1412,11 +1433,26 @@ function syncCopilotTasks({ bus, repo, now: nowFn = Date.now }) {
         sessionId: s.id || null,
         model: sessionModel,
         title,
-        startedAt: s.liveStartedAt || now,
+        startedAt,
         endedAt: null,
-        files: filesFor(idx),
+        files: filesFor(currentIndex),
       });
       count += 1;
+    }
+
+    const representedIndices = new Set(turns.map((turn) => Number(turn.index)));
+    for (const request of liveReqs) representedIndices.add(canonicalLiveIndex(request.index));
+    if (currentIndex >= 0) representedIndices.add(currentIndex);
+    const maxRepresentedIndex = representedIndices.size ? Math.max(...representedIndices) : -1;
+    if (maxRepresentedIndex >= 0 && repo.taskRunsOfSession) {
+      for (const run of repo.taskRunsOfSession.all(s.id || '')) {
+        const runId = String(run.id || '');
+        if (!runId.startsWith(`${TASK_ID_PREFIX}${s.id}:`)) continue;
+        const index = Number(runId.slice(`${TASK_ID_PREFIX}${s.id}:`.length));
+        if (!Number.isInteger(index) || index <= maxRepresentedIndex) continue;
+        const task = repo.getTask.get(runId);
+        if (task && task.state === 'running') repo.deleteTaskRun(runId);
+      }
     }
 
     // ③ Retract the transitional "one row per session" legacy record (id without a turn index; own prefix only)
