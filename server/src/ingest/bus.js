@@ -629,8 +629,13 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     // plugin is still running (this was the earlier "running the CLI killed the plugin's task" bug).
     // When want is empty (the report carried no client, old data), fall back to filtering by session only, keeping the old behavior.
     const want = normClient(client0);
+    // Match by session only: the row's project may have been re-attributed to a duplicate project row
+    // for the same directory (see listStaleRunningBySessionAnyProject), and then the previous round
+    // would never be collected. The session id itself is globally unique.
+    const stale = repo.listStaleRunningBySessionAnyProject || null;
+    const rows = stale ? stale.all(sid) : repo.listStaleRunningBySession.all(project, sid);
     let n = 0;
-    for (const old of repo.listStaleRunningBySession.all(project, sid)) {
+    for (const old of rows) {
       if (!old.id || old.id === excludeTaskId) continue;
       // **A task that started at the same instant is this round itself**, not the superseded previous round: the
       // new round's started_at and the taskStartedAt the registry scan reads from the state file are the same
@@ -641,7 +646,16 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
       if (Number(old.startedAt) && Number(old.startedAt) >= ts) continue;
       const oc = normClient(old.client);
       if (want && oc && oc !== want) continue; // different forms never cut each other off
-      endTask({ project, memberId: old.memberId, taskId: old.id, sessionId: sid, state: 'cancelled', ts });
+      // End it under **its own** project: the member lookup and the task/runs update both key off the
+      // project that row actually belongs to.
+      endTask({
+        project: old.projectId || project,
+        memberId: old.memberId,
+        taskId: old.id,
+        sessionId: sid,
+        state: 'cancelled',
+        ts,
+      });
       n += 1;
     }
     return n;

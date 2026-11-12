@@ -466,6 +466,33 @@ app.use('/api/v1', createIngestRouter({ bus }));
     JSON.stringify((fallbackFeed.items || []).map((t) => t.id))
   );
 
+  console.log('[8c] 新一轮开跑：同一会话上一轮即使被归到另一个工程 id，也要收掉');
+  // Regression (2026-11-11, user): after a server restart the same session was re-attributed from the
+  // `workgremlin` project row to the duplicate `workgremlin-2` row for the same directory. The previous
+  // round's row stayed `running` forever (its plugin instance had been reloaded, so its end never came),
+  // because stale-row collection was scoped by project id.
+  const crossStart = feedNow - 60_000;
+  repo.upsertProject.run({
+    id: 'p1-dup',
+    name: 'p1-dup',
+    workspacePath: '/tmp/p1',
+    mainConversationId: null,
+    source: 'report',
+    createdAt: 2,
+  });
+  repo.insertTask.run({
+    id: 't-cross-old', projectId: 'p1-dup', memberId: 'codex@p1', parentTaskId: null,
+    title: 'old round', state: 'running', progress: 0, startedAt: crossStart, endedAt: null,
+  });
+  repo.upsertTaskRun.run({
+    id: 't-cross-old', projectId: 'p1-dup', memberId: 'codex@p1', client: 'codex',
+    sessionId: 's-cross', form: 'cli', model: null, title: 'old round', startedAt: crossStart, baselineCommit: null,
+  });
+  bus.startTask({ project: 'p1', memberId: 'codex@p1', client: 'codex', sessionId: 's-cross', taskId: 't-cross-new', title: 'new round', ts: feedNow });
+  const crossOld = repo.getTask.get('t-cross-old');
+  ok('上一轮的 running 行被收成 cancelled（即使工程 id 不同）', Boolean(crossOld) && crossOld.state === 'cancelled', crossOld && crossOld.state);
+  ok('新一轮照常开成 running', repo.getTask.get('t-cross-new')?.state === 'running', repo.getTask.get('t-cross-new')?.state);
+
   console.log('[9] 删除 OpenCode 轮询任务时写入 suppression');
   const deletedPollId = 'opencode:delete-route-session:0';
   repo.insertTask.run({
