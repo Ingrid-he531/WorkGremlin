@@ -66,7 +66,7 @@ function autoInstallHooks() {
     const { installHooks } = require('../../scripts/install-hooks');
     const result = installHooks({});
     if (result.installed.length) {
-      log.info(`[workgremlin] 自动接入 hook：${result.installed.join('、')}`);
+      log.info(`[workgremlin] 自动接入 hook / 插件：${result.installed.join('、')}`);
     }
     if (result.failed.length) {
       log.warn(`[workgremlin] 自动接入 hook 跳过（配置不是合法 JSON）：${result.failed.join('、')}`);

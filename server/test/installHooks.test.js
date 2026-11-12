@@ -26,7 +26,7 @@ fs.writeFileSync(path.join(HOME, '.codebuddy', 'credentials.json'), '{}');
 process.env.HOME = HOME;
 process.env.WORKGREMLIN_NO_AUTO_HOOKS = '1';
 
-const { installHooks, HOOK_SCRIPT } = require('../../scripts/install-hooks');
+const { installHooks, HOOK_SCRIPT, OPENCODE_PLUGIN_DIR } = require('../../scripts/install-hooks');
 
 const SETTINGS = path.join(HOME, '.codebuddy', 'settings.json');
 const OLD_HOOK = '/home/someone/work/WorkGremlin/packages/reporter/src/hook.js'; // a different checkout
@@ -102,6 +102,48 @@ console.log('\n[4] 卸载：只撤我们的');
   ok('我们的 hook 全撤了', Object.values(ourCountByEvent()).every((n) => n === 0), JSON.stringify(ourCountByEvent()));
   const ups = readSettings().hooks.UserPromptSubmit || [];
   ok('别人的那条还在', ups.some((g) => (g.hooks || []).some((h) => h.command === 'node /opt/other/hook.js')));
+}
+
+console.log('\n[5] OpenCode：全局 plugins 指向当前 checkout 的插件目录，且不动别家插件');
+{
+  const CFG = path.join(HOME, '.config', 'opencode', 'opencode.json');
+  fs.mkdirSync(path.dirname(CFG), { recursive: true });
+  // Seed a different checkout's directory entry plus an unrelated plugin and the schema.
+  fs.writeFileSync(
+    CFG,
+    `${JSON.stringify(
+      {
+        $schema: 'https://opencode.ai/config.json',
+        plugins: ['opencode-acme-plugin', '/home/someone/work/WorkGremlin/packages/reporter/src/plugin'],
+        plugin: [['/home/someone/work/WorkGremlin/packages/reporter/src/plugin/index.js', {}]],
+      },
+      null,
+      2
+    )}\n`
+  );
+
+  installHooks({ targets: 'opencode-plugin' });
+  const readCfg = () => JSON.parse(fs.readFileSync(CFG, 'utf8'));
+  const ours = (p) => String(p).replace(/\\/g, '/').includes('packages/reporter/src/plugin');
+  {
+    const cfg = readCfg();
+    ok('$schema 和其他插件都保留', cfg.$schema === 'https://opencode.ai/config.json' && cfg.plugins.includes('opencode-acme-plugin'));
+    ok('旧的 checkout 条目被替换成当前绝对目录（不是并列）', cfg.plugins.filter(ours).length === 1 && cfg.plugins.some((p) => p === OPENCODE_PLUGIN_DIR), JSON.stringify(cfg.plugins));
+    ok('废弃的 plugin 键里我们的条目被清掉（不留双份）', !(cfg.plugin || []).some(ours), JSON.stringify(cfg.plugin));
+    ok('写的是目录而不是单文件（OpenCode v2 会跳过单文件）', cfg.plugins.filter(ours).every((p) => !p.endsWith('.js')), JSON.stringify(cfg.plugins));
+  }
+
+  console.log('\n[6] OpenCode：再装一次幂等；卸载只撤我们的');
+  {
+    const before = fs.readFileSync(CFG, 'utf8');
+    installHooks({ targets: 'opencode-plugin' });
+    ok('内容没变（already up to date）', before === fs.readFileSync(CFG, 'utf8'));
+
+    installHooks({ targets: 'opencode-plugin', uninstall: true });
+    const cfg = readCfg();
+    ok('我们的目录条目撤掉了', !(cfg.plugins || []).some(ours), JSON.stringify(cfg.plugins));
+    ok('别家的插件还在', (cfg.plugins || []).includes('opencode-acme-plugin'), JSON.stringify(cfg.plugins));
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

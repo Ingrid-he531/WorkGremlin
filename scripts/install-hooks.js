@@ -10,11 +10,16 @@
  * product, add one entry to `all`.
  *
  * Usage:
- *   node scripts/install-hooks.js                       install (user-level: ~/.codebuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json)
- *   node scripts/install-hooks.js --targets=codex        install only some (codebuddy / codex / claude / trae / qoder / qoder-cn / project)
+ *   node scripts/install-hooks.js                       install (user-level: ~/.codebuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json + global OpenCode / Kilo plugins)
+ *   node scripts/install-hooks.js --targets=codex        install only some (codebuddy / codex / claude / trae / qoder / qoder-cn / kilo-plugin / opencode-plugin / project)
  *   node scripts/install-hooks.js --project              also write a project-level <repo>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            remove (only the entries we added; others' config untouched)
  *   node scripts/install-hooks.js --dry-run              only print what would be written, no disk writes
+ *
+ * **The reporters are user-level on purpose.** WorkGremlin monitors every project the agent works in, so
+ * the plugin must be loaded by every workspace — not only by this repo. A project-level
+ * `.opencode/plugins/workgremlin.js` makes every clone of this repo load another instance; the global
+ * entry below is the product installation model (the repo-local shim was development-only and is gone).
  *
  * Notes:
  *   - CodeBuddy Plugin and CodeBuddy CLI share one user-level config (~/.codebuddy/settings.json), so the
@@ -44,6 +49,14 @@ const HOOK_SCRIPT = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'hook.js
  * their config instead.
  */
 const PLUGIN_ENTRY_FILE = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'plugin', 'index.js');
+/**
+ * OpenCode v2 configures **plugin directories**, not single files: a configured local path that is a
+ * file is silently skipped. This directory contains our `index.js`, which OpenCode loads as the server
+ * part when there is no package.json `exports` map.
+ */
+const OPENCODE_PLUGIN_DIR = path.dirname(PLUGIN_ENTRY_FILE);
+/** Repo-relative signature of the same directory (any checkout, so moving/cloning self-heals). */
+const OPENCODE_PLUGIN_DIR_REL = 'packages/reporter/src/plugin';
 
 /**
  * Repo-relative signatures of our own files. Entries are matched by these **suffixes**, never by the
@@ -326,6 +339,127 @@ function hasPluginEntry(settings, client) {
 }
 
 /**
+ * Is this one of our OpenCode plugin entries?
+ *
+ * OpenCode's `plugins` array normally carries the **directory** (`packages/reporter/src/plugin`), but an
+ * older install may carry the entry file or the project shim. Match every shape and every checkout.
+ */
+function isOurOpencodePluginPath(p) {
+  const s = normSlash(p);
+  return (
+    s.includes(OPENCODE_PLUGIN_DIR_REL) ||
+    s.includes(PLUGIN_ENTRY_REL) ||
+    /\/\.opencode\/plugins\/workgremlin\.(js|ts)$/.test(s)
+  );
+}
+
+/** Whether this config already has our OpenCode plugin entry, in either the current or deprecated key. */
+function hasOpencodePluginEntry(settings) {
+  const lists = [settings && settings.plugins, settings && settings.plugin];
+  return lists.some(
+    (l) => Array.isArray(l) && l.some((p) => isOurOpencodePluginPath(pluginPathOf(p)))
+  );
+}
+
+/**
+ * Idempotent merge of OpenCode's `plugins` array: strip the entry we wrote last time, then append the
+ * current checkout's plugin **directory**. Others' entries are untouched; `uninstall` removes only ours.
+ *
+ * Why the directory and not `index.js`: OpenCode v2 skips configured local paths that are single files
+ * (see the plugins docs), while a directory without a package.json falls back to `index.js` as the server
+ * part. Also strip ours from the deprecated `plugin` key if an earlier version wrote it there, but never
+ * write that key ourselves.
+ */
+function mergeOpencodePlugins(existing, uninstall) {
+  const out = { ...existing };
+  const list = Array.isArray(existing.plugins) ? existing.plugins : [];
+  const kept = list.filter((p) => !isOurOpencodePluginPath(pluginPathOf(p)));
+  const next = uninstall ? kept : [...kept, OPENCODE_PLUGIN_DIR];
+  if (next.length) out.plugins = next;
+  else delete out.plugins;
+
+  if (Array.isArray(existing.plugin)) {
+    const keptLegacy = existing.plugin.filter((p) => !isOurOpencodePluginPath(pluginPathOf(p)));
+    if (keptLegacy.length) out.plugin = keptLegacy;
+    else delete out.plugin;
+  }
+  return out;
+}
+
+/** OpenCode's global config directory (its own override wins over XDG, same ruler as floorOpencode). */
+function opencodeConfigDir() {
+  const explicit = String(process.env.OPENCODE_CONFIG_DIR || '').trim();
+  if (explicit) return path.resolve(explicit);
+  const xdg = String(process.env.XDG_CONFIG_HOME || '').trim();
+  if (xdg) return path.join(path.resolve(xdg), 'opencode');
+  return path.join(os.homedir(), '.config', 'opencode');
+}
+
+/**
+ * OpenCode's global config file. Prefer `opencode.json`; accept `opencode.jsonc` only when it parses as
+ * plain JSON (rewriting a file with comments through JSON.stringify would silently delete them, so we
+ * fall back to the sibling `.json` instead).
+ */
+function opencodeConfigFile() {
+  const dir = opencodeConfigDir();
+  const json = path.join(dir, 'opencode.json');
+  const jsonc = path.join(dir, 'opencode.jsonc');
+  if (fs.existsSync(json)) return json;
+  if (fs.existsSync(jsonc)) {
+    try {
+      JSON.parse(fs.readFileSync(jsonc, 'utf8'));
+      return jsonc;
+    } catch {
+      return json;
+    }
+  }
+  return json;
+}
+
+/** OpenCode's data root (used only as "is the product really installed?" evidence). */
+function opencodeDataDir() {
+  const explicit = String(process.env.WORKGREMLIN_OPENCODE_HOME || '').trim();
+  if (explicit) return path.resolve(explicit);
+  const xdg = String(process.env.XDG_DATA_HOME || '').trim();
+  if (xdg) return path.join(path.resolve(xdg), 'opencode');
+  return path.join(os.homedir(), '.local', 'share', 'opencode');
+}
+
+/**
+ * Our own project-level OpenCode entries (`.opencode/{plugins,plugin}/*.{ts,js}`).
+ *
+ * With the global entry installed, a project-level shim starts a **second instance in the same
+ * workspace**: one round then opens two ledger tasks (the Kilo equivalent is measured in
+ * `projectPluginEntryFiles`). Report only, never delete a user's file.
+ */
+function projectOpencodePluginEntryFiles(dir) {
+  const hits = [];
+  for (const sub of ['plugins', 'plugin']) {
+    const d = path.join(dir, '.opencode', sub);
+    let names = [];
+    try {
+      names = fs.readdirSync(d);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!/\.(ts|js)$/.test(n)) continue;
+      const f = path.join(d, n);
+      let body = '';
+      try {
+        body = fs.readFileSync(f, 'utf8');
+      } catch {
+        continue;
+      }
+      if (/workgremlin/i.test(n) || body.includes(OPENCODE_PLUGIN_DIR_REL) || /workgremlin/i.test(body)) {
+        hits.push(f);
+      }
+    }
+  }
+  return hits;
+}
+
+/**
  * Idempotent merge of the plugin array: strip the entry we wrote last time (same package path), then append.
  * Others' plugins are untouched; `uninstall` removes only ours.
  *
@@ -463,10 +597,20 @@ function findPluginDir(res = RE_PLUGIN) {
 }
 
 function looksInstalled(t) {
-  // CLI: an executable is found in PATH or a common install dir
-  if (t.cmd && (resolveCommand(t.cmd) || findCliBin(t.cmd))) return true;
+  // CLI: an executable is found in PATH or a common install dir. A product-specific dir is needed for
+  // OpenCode: its binary lives in ~/.opencode/bin and is deliberately **not** on PATH (floorOpencode
+  // carries the same note).
+  if (
+    t.cmd &&
+    (resolveCommand(t.cmd) ||
+      findCliBin(t.cmd) ||
+      (t.cliDirs || []).some((d) => isFile(path.join(d, t.cmd))))
+  )
+    return true;
   // Plugin: found in the editor extension dir (CodeBuddy Plugin and CLI share ~/.codebuddy)
   if (t.plugin && findPluginDir(t.pluginRe || RE_PLUGIN)) return true;
+  // Product data root exists even when the CLI is not on PATH (e.g. first run from a desktop app)
+  if ((t.dataDirs || []).some((d) => isDir(d))) return true;
   // Fallback: the config dir has data besides our own settings.json
   const ours = new Set(['settings.json', 'settings.json.bak-workgremlin']);
   try {
@@ -594,6 +738,24 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       // Report identity is the floor base name; the form (CLI / VS Code) is decided by the plugin itself
       client: 'kilo',
     },
+    {
+      // 8F OpenCode: like 7F, there is no hook to install; the reporter is our plugin. It is installed
+      // **globally** because WorkGremlin monitors every project the agent works in. A project-level
+      // `.opencode/plugins/workgremlin.js` would make every clone of this repo load another instance.
+      //
+      // OpenCode v2's key is `plugins` (plural) and a configured local path must be a **directory**:
+      //   "plugins": ["/abs/path/packages/reporter/src/plugin"]
+      // Without a package.json/`exports`, OpenCode loads `index.js` as the server part.
+      id: 'opencode-plugin',
+      label: 'OpenCode plugin (true phase + task ledger)',
+      kind: 'opencode-plugin',
+      file: opencodeConfigFile(),
+      cmd: 'opencode',
+      dir: opencodeConfigDir(),
+      // `opencode` is normally at ~/.opencode/bin and deliberately not on PATH (same note as floorOpencode)
+      cliDirs: [path.join(os.homedir(), '.opencode', 'bin')],
+      dataDirs: [opencodeDataDir()],
+    },
   ];
   const targets = all.filter((t) => (t.optional ? args.project === true || wanted.includes(t.id) : !wanted.length || wanted.includes(t.id)));
 
@@ -623,6 +785,20 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
   }
 
+  // 8F **may only be registered in one place** as well. The global `plugins` entry loads for every
+  // workspace; a project-level `.opencode/plugins/workgremlin.js` (a clone of this repo carries one)
+  // makes the same workspace run two instances, so one round opens two ledger tasks.
+  if (!uninstall && targets.some((t) => t.id === 'opencode-plugin')) {
+    const dirs = [...new Set([process.cwd(), REPO_ROOT])];
+    const conflicts = dirs.flatMap((d) => projectOpencodePluginEntryFiles(d));
+    if (conflicts.length) {
+      console.warn('[workgremlin] ⚠ OpenCode: this project still has a project-level plugin entry:');
+      for (const f of conflicts) console.warn(`[workgremlin]     ${f}`);
+      console.warn('[workgremlin]   Two registrations start two plugin instances in one OpenCode server, so one round is reported twice (one ledger row becomes two).');
+      console.warn(`[workgremlin]   The global entry (${opencodeConfigFile()}) is enough; consider deleting the one above (we do not touch your files automatically).`);
+    }
+  }
+
   for (const t of targets) {
     // Don't write for a product that isn't installed: writing would fabricate "installed" evidence for it
     if (!uninstall && !t.optional && !looksInstalled(t)) {
@@ -641,8 +817,13 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       continue;
     }
 
-    const isPlugin = t.kind === 'plugin';
-    const next = isPlugin ? mergePlugins(existing || {}, t.client, uninstall) : merge(existing || {}, t.ours, uninstall);
+    const isKiloPlugin = t.kind === 'plugin';
+    const isOpencodePlugin = t.kind === 'opencode-plugin';
+    const next = isKiloPlugin
+      ? mergePlugins(existing || {}, t.client, uninstall)
+      : isOpencodePlugin
+        ? mergeOpencodePlugins(existing || {}, uninstall)
+        : merge(existing || {}, t.ours, uninstall);
     // The hooks.json protocol (TraeCode) carries a schema version by default: ensure it on create/existing, don't overwrite an existing one
     if (!uninstall && t.version) next.version = next.version || t.version;
     const before = JSON.stringify(existing || {});
@@ -660,8 +841,14 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     }
 
     // dry-run must not write a single byte: earlier this did not check dryRun, so previewing really wrote a .bak-workgremlin
-    // The plugin form checks its own entry (by package path); don't ask hasOurs about hooks — that only looks at hooks
-    if (!dryRun && exists && !(isPlugin ? hasPluginEntry(existing, t.client) : hasOurs(existing))) {
+    // The plugin forms check their own entry (by package/directory path); don't ask hasOurs about hooks —
+    // that only looks at hooks.
+    const alreadyOurs = isKiloPlugin
+      ? hasPluginEntry(existing, t.client)
+      : isOpencodePlugin
+        ? hasOpencodePluginEntry(existing)
+        : hasOurs(existing);
+    if (!dryRun && exists && !alreadyOurs) {
       fs.copyFileSync(t.file, `${t.file}.bak-workgremlin`);
       console.log(`[workgremlin]   backup -> ${t.file}.bak-workgremlin`);
     }
@@ -689,12 +876,26 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('                changes to kilo.jsonc need a **Kilo session reopen** to load. Without the plugin there is still a task ledger —');
     console.log('                the server\'s poller writes one row per round (read-only inference: phase greyed out, no closing summary);');
     console.log('                with the plugin it is the true value (phase not greyed out, "awaiting permission", conversation records and file activity)');
-    console.log('[workgremlin] · To opt out of auto-hooking: WORKGREMLIN_NO_AUTO_HOOKS=1');
+    console.log('  · 8F OpenCode: same, the plugin is written to the **global** config (`plugins`); it loads for every workspace,');
+    console.log(`                so a task in any project is reported under that project. Restart opencode once (config may hot-reload).`);
+    console.log('                If any project still has .opencode/plugins/workgremlin.js, delete it: global + project = two instances.');
+    console.log('[workgremlin] · To opt out of auto-hooking / auto-install: WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;
 }
 
-module.exports = { installHooks, HOOK_SCRIPT, EVENTS, CODEBUDDY_EVENTS, CODEX_EVENTS, CLAUDE_EVENTS };
+module.exports = {
+  installHooks,
+  HOOK_SCRIPT,
+  PLUGIN_ENTRY_FILE,
+  OPENCODE_PLUGIN_DIR,
+  opencodeConfigDir,
+  opencodeConfigFile,
+  EVENTS,
+  CODEBUDDY_EVENTS,
+  CODEX_EVENTS,
+  CLAUDE_EVENTS,
+};
 
 if (require.main === module) {
   try {
