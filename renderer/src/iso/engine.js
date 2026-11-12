@@ -1442,6 +1442,104 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
+   * Mug on the pantry table: a tall, opaque ceramic cylinder with a thick rim and a D-shaped handle.
+   *
+   * A bare isoCylinder reads as a water glass; these details turn it into pottery:
+   *   1) a horizontal **glaze band** wrapped around the visible half of the body —— at this size the
+   *      strongest "ceramic, not glass" cue;
+   *   2) the top face is repainted as a **warm lip ring** + a thin inner wall + a lighter cup bottom,
+   *      instead of the cylinder's blown-out bright top (that bright face made the cup look transparent);
+   *   3) the handle is a **solid, thin ceramic band** (outer half ellipse + inner half ellipse closed
+   *      into one polygon), taller than it is wide, not a thick stroked line;
+   *   4) the body keeps a real mug's proportions (h ~= 2.2r), so the silhouette stands upright and does
+   *      not read as a squat bowl;
+   *   5) a soft highlight / dark rim on the body plus a contact shadow, so it sits on the table instead
+   *      of floating as a flat sticker.
+   *
+   * Handle direction is +gx/-gy (or its mirror): in isometric that is exactly **screen-horizontal**,
+   * so the D does not skew with the cup's oblique ellipse and its roots are not swallowed by the
+   * body's rightmost silhouette. The reach is only ~0.4r beyond the wall, keeping it tight to the cup
+   * (a real mug handle is a tall, narrow ear, not a wide loop).
+   * The handle is drawn first, so the body covers its two roots as if it were glued to the wall.
+   * No Math.random here: the static layer is rebuilt every frame (see buildStatics).
+   */
+  function drawMug(c, { x, y, z, r = 0.07, h = 0.155, color = '#e6ebf2', side = 1 }) {
+    // A real mug is TALLER than it is wide: screen width ~= 2.45r (2r swept through the oblique
+    // projection) and screen height = h, so h/r ~= 2.2 keeps the silhouette upright instead of bowl-like.
+    const D = Math.SQRT1_2;
+    // u = distance from the cup axis along the screen-horizontal direction.
+    const P = (u, zz) => project(x + side * u * D, y - side * u * D, zz);
+    const root = r * 0.95;     // roots sit just inside the wall, hidden by the body drawn later
+    const bulge = r * 0.8;     // protrudes ~0.75r past the wall, enough to keep the hole visible (3px)
+    const th = 0.028;          // constant ceramic thickness of the band (~1.5px on screen)
+    const zHi = z + h * 0.88;
+    const zLo = z + h * 0.12;
+    const cz = (zHi + zLo) / 2;
+    const rise = (zHi - zLo) / 2;
+    const outer = [];
+    const inner = [];
+    const N = 16;
+    for (let i = 0; i <= N; i += 1) {
+      const a = Math.PI / 2 - (i / N) * Math.PI; // top root -> outermost -> bottom root
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      outer.push(P(root + ca * bulge, cz + sa * rise));
+      inner.push(P(root + ca * (bulge - th), cz + sa * (rise - th)));
+    }
+    // ---- Contact shadow on the table (light from the upper left, so the shadow falls lower-right) ----
+    const sh = groundEllipse(x + 0.035, y + 0.035, r * 1.3, z + 0.001);
+    c.save();
+    c.globalAlpha *= 0.22;
+    c.beginPath();
+    c.ellipse(sh.x, sh.y, sh.rx, sh.ry, sh.rot, 0, Math.PI * 2);
+    c.fillStyle = '#000';
+    c.fill();
+    c.restore();
+
+    poly(c, [...outer, ...inner.reverse()], shade(color, 0.9), shade(color, 0.6), 0.7);
+
+    // ---- Body ----
+    isoCylinder(c, { x, y, z, r, h, color });
+
+    // ---- Glaze band: horizontal stripe on the visible half (theta -pi/4 .. 3pi/4 faces the camera) ----
+    const at = (a, zz) => project(x + Math.cos(a) * r, y + Math.sin(a) * r, zz);
+    const band = (a0, a1, z0, z1, fill) => {
+      const pts = [];
+      const n = 10;
+      for (let i = 0; i <= n; i += 1) pts.push(at(a0 + ((a1 - a0) * i) / n, z1));
+      for (let i = n; i >= 0; i -= 1) pts.push(at(a0 + ((a1 - a0) * i) / n, z0));
+      poly(c, pts, fill);
+    };
+    band(-Math.PI / 4, (3 * Math.PI) / 4, z + h * 0.4, z + h * 0.62, shade(color, 0.45));
+
+    // ---- Cylindrical shading: soft highlight toward the camera + a darker right rim ----
+    band(Math.PI / 4 - 0.55, Math.PI / 4 + 0.12, z, z + h - 0.002, rgba('#ffffff', 0.16));
+    band(-Math.PI / 4 - 0.18, -Math.PI / 4 + 0.34, z, z + h - 0.002, rgba('#000000', 0.14));
+
+    // ---- Rim: warm lip ring + a thin inner wall + a lighter cup bottom (depth, not a black hole) ----
+    c.save();
+    const lip = groundEllipse(x, y, r, z + h + 0.001);
+    c.beginPath();
+    c.ellipse(lip.x, lip.y, lip.rx, lip.ry, lip.rot, 0, Math.PI * 2);
+    c.fillStyle = shade(color, 0.96);
+    c.fill();
+    c.strokeStyle = shade(color, 1.12);
+    c.lineWidth = 0.8;
+    c.stroke();
+    const wall = groundEllipse(x, y, r * 0.82, z + h + 0.002);
+    c.beginPath();
+    c.ellipse(wall.x, wall.y, wall.rx, wall.ry, wall.rot, 0, Math.PI * 2);
+    c.fillStyle = shade(color, 0.42);
+    c.fill();
+    const bottom = groundEllipse(x, y, r * 0.52, z + h + 0.003);
+    c.beginPath();
+    c.ellipse(bottom.x, bottom.y, bottom.rx, bottom.ry, bottom.rot, 0, Math.PI * 2);
+    c.fillStyle = shade(color, 0.6);
+    c.fill();
+    c.restore();
+  }
+
+  /**
    * Magazine rack (pantry north wall, east section, see PANTRY.rack): a three-tier slanted display rack.
    *
    * How to make it "read as a magazine rack" in isometric, and not a small cabinet with a few books —— every point is for "the cover can be seen":
@@ -2142,9 +2240,9 @@ export function createIsoOffice(canvas, opts = {}) {
         isoBox(c, { x: pt.x + dx, y: pt.y + dy, z: 0, w: 0.12, d: 0.12, h: pt.h - 0.08, color: colors.deskLeg });
       });
       isoBox(c, { x: pt.x, y: pt.y, z: pt.h - 0.08, w: pt.w, d: pt.d, h: 0.08, color: colors.wood });
-      // Cup on the table
-      isoCylinder(c, { x: pt.x + 0.5, y: pt.y + 0.42, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
-      isoCylinder(c, { x: pt.x + 1.45, y: pt.y + 0.6, z: pt.h, r: 0.09, h: 0.16, color: '#e6ebf2' });
+      // Two ceramic mugs on the table (see drawMug): a glaze band, a warm lip and a tall D-shaped handle
+      drawMug(c, { x: pt.x + 0.5, y: pt.y + 0.42, z: pt.h, color: '#efe8dc' });
+      drawMug(c, { x: pt.x + 1.45, y: pt.y + 0.6, z: pt.h, color: '#d9744f', side: -1 });
     });
 
     PANTRY.chairs.forEach((ch, i) => pushChair(ch.x, ch.y, i < 3));
