@@ -365,6 +365,49 @@ function makeExitSign(text) {
 }
 
 /**
+ * Round magnetic button stuck to a wall face (the meeting-room whiteboard).
+ *
+ * Drawn in the wall's own (gx, gz) basis: a circle in that plane projects to the same slanted
+ * ellipse as the board, instead of a screen-perfect circle that would look pasted on. A highlight
+ * toward the upper left, a darker rim and a soft contact shadow make it read as a domed magnet
+ * rather than a flat sticker.
+ *
+ * @param {CanvasRenderingContext2D} c
+ * @param {number} gx center along the wall
+ * @param {number} gz center height
+ * @param {number} r radius (world units)
+ * @param {string} color magnet body color
+ */
+function drawWallMagnet(c, gx, gz, r, color) {
+  const p = project(gx, 0, gz);
+  c.save();
+  c.transform(AX.x, AX.y, AZ.x, AZ.y, p.x, p.y);
+  // Contact shadow: the disc stands a few millimetres off the board, so it casts a soft edge shadow
+  c.beginPath();
+  c.arc(0.012, -0.012, r * 1.12, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(18,26,38,0.25)';
+  c.fill();
+  // Domed body: lit from the upper left, falling away to a darker rim at the lower right
+  const g = c.createRadialGradient(-r * 0.4, r * 0.4, r * 0.1, 0, 0, r);
+  g.addColorStop(0, shade(color, 1.7));
+  g.addColorStop(0.45, shade(color, 1.15));
+  g.addColorStop(1, shade(color, 0.6));
+  c.beginPath();
+  c.arc(0, 0, r, 0, Math.PI * 2);
+  c.fillStyle = g;
+  c.fill();
+  c.lineWidth = 0.012;
+  c.strokeStyle = 'rgba(10,16,26,0.35)';
+  c.stroke();
+  // Specular dot
+  c.beginPath();
+  c.arc(-r * 0.32, r * 0.34, r * 0.22, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(255,255,255,0.55)';
+  c.fill();
+  c.restore();
+}
+
+/**
  * @param {HTMLCanvasElement} canvas
  * @param {{onSelect?: (id: string) => void, floor?: string, floorPlate?: string, floorPlateWidthText?: string}} [opts]
  *   floor: current floor id (e.g. '1F' / '3F' / '5F'). Used to pick this floor's material palette (see officeMap's colorsFor),
@@ -2717,7 +2760,7 @@ export function createIsoOffice(canvas, opts = {}) {
     // Emergency-exit sign: on the same wall, left of the doorway and low (see WALL.exitSign). Static, so it
     // belongs in this cached background rather than the per-frame sort layer.
     drawExitSign(c);
-    // Meeting room whiteboard (on the back wall's inner side): 0.09 aluminum frame + inner shadow under the frame + pen tray (markers / eraser).
+    // Meeting room whiteboard (on the back wall's inner side): 0.09 aluminum frame + inner shadow under the frame + pen tray (markers / eraser) + a magnetic eraser and colorful magnets.
     // A lone whiteboard looks too much like a sheet of paper —— the frame's thickness, the bright-top dark-bottom frame edge, and the pen tray protruding from the wall are what make it a "whiteboard".
     const wb = MEETING.whiteboard;
     const WFW = 0.09;
@@ -2742,6 +2785,25 @@ export function createIsoOffice(canvas, opts = {}) {
       wallQuad(c, 'y', 0, wb.x0 + 0.2, wb.x1 - 0.5 - k * 0.35, z, z + 0.05, '#7d8ea6');
     }
     wallQuad(c, 'y', 0, wb.x0 + 1.9, wb.x0 + 2.5, wb.z0 + 0.16, wb.z1 - 0.16, 'rgba(76,141,255,0.18)');
+    // Magnetic eraser: a small block pressed against the panel, felt side on the board (hidden) and a
+    // colored plastic back. Drawn as an iso box so its top/side faces catch the light instead of
+    // reading as a printed rectangle.
+    const ez = wb.z0 + 0.03;
+    const ex = wb.x0 + 0.35;
+    const ew = 0.52;
+    const ed = 0.055;
+    const eh = 0.15;
+    isoBox(c, { x: ex, y: 0.004, z: ez, w: ew, d: ed, h: eh, color: '#4a5468' });
+    wallQuad(c, 'y', 0.004 + ed + 0.002, ex + 0.04, ex + ew - 0.04, ez + 0.03, ez + eh - 0.03, '#c0453d');
+    // Magnets pinning the blue sheet: two at the top corners, one at the bottom center. Different
+    // colors keep them reading as loose magnetic buttons rather than part of the board graphics.
+    const sheetX0 = wb.x0 + 1.9;
+    const sheetX1 = wb.x0 + 2.5;
+    const sheetZ1 = wb.z1 - 0.16;
+    const sheetZ0 = wb.z0 + 0.16;
+    drawWallMagnet(c, sheetX0 + 0.07, sheetZ1 - 0.05, 0.06, '#c94a44');
+    drawWallMagnet(c, sheetX1 - 0.07, sheetZ1 - 0.05, 0.06, '#d99a2b');
+    drawWallMagnet(c, (sheetX0 + sheetX1) / 2, sheetZ0 + 0.05, 0.06, '#3d7fbf');
 
     // Meeting room sign: stuck above the solid back wall (gy=0, same plane as the whiteboard), z does not exceed the wall height 2.8.
     // The pantry sign is not drawn here: its wall (= the meeting room's south glass) has blinds hung on it,

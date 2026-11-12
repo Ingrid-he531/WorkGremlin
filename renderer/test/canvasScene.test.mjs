@@ -151,6 +151,11 @@ ok(
   'the emergency-exit sign hangs left of the door, low on the wall',
   /exitSign:\s*\{\s*gy:\s*10\.55,\s*gz:\s*0\.66\s*\}/.test(mapSrc)
 );
+ok(
+  'the whiteboard carries three colorful magnets and a magnetic eraser',
+  (engineSrc.match(/^ {4}drawWallMagnet\(c,/gm) || []).length === 3 &&
+    /isoBox\(c, \{ x: ex, y:/.test(engineSrc)
+);
 ok('the old wall clock is gone', !/function\s+drawClock\s*\(/.test(engineSrc));
 plated.setFloorPlate('2F Cline', '10F DeepSeek Harness');
 drawn.length = 0;
