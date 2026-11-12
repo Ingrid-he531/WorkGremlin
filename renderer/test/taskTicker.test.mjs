@@ -10,7 +10,8 @@
  *
  * Why a source scan: TaskTicker.vue is not mounted in these node-only suites, and the regression is
  * invisible at the lib level —— it only shows on screen. Scan the SFC so a future edit cannot silently
- * re-bake the running suffix into the segment.
+ * re-bake the running suffix into the segment, or replace the product-name line prefix with the
+ * generic "Task:" label.
  *
  * Run: `npm run test:ticker`
  */
@@ -66,6 +67,23 @@ ok(
   'both running and ended lines use the task-floor helper',
   (src.match(/const floor = floorLabelForTask\(it\);/g) || []).length === 2
 );
+
+console.log('\n[5] The line prefix is the floor product name, not the generic "Task:" label');
+const { AGENT_LABELS } = await import('@workgremlin/shared');
+ok('AGENT_LABELS is imported into the ticker', /import\s*\{[^}]*\bAGENT_LABELS\b[^}]*\}\s*from\s*'@workgremlin\/shared'/.test(src));
+ok('a taskLabelForTask helper exists', /function\s+taskLabelForTask\s*\(/.test(src));
+ok('the label resolves from the feed client through the shared table', /AGENT_LABELS\[agentBase\(it && it\.client\)\]/.test(src));
+ok('the product label ends with an ASCII colon and a non-breaking space', /\$\{label\}:\\u00a0/.test(src));
+ok(
+  'both running and ended lines use the product label',
+  (src.match(/const taskLabel = taskLabelForTask\(it\);/g) || []).length === 2
+);
+ok(
+  'the localized "Task:" label is only the unresolvable-client fallback',
+  (src.match(/t\('ticker\.taskLabel'\)/g) || []).length === 1 && /:\s*t\('ticker\.taskLabel'\)/.test(src)
+);
+ok('1F (codebuddy) reads "CodeBuddy:"', AGENT_LABELS.codebuddy === 'CodeBuddy');
+ok('2F (cline) reads "Cline:"', AGENT_LABELS.cline === 'Cline');
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -46,7 +46,7 @@ import { colorsFor } from '../iso/officeMap';
 import { shade } from '../iso/iso';
 import { PHASES } from '../iso/mainConsole';
 import { useI18n } from '../i18n';
-import { agentBase } from '@workgremlin/shared';
+import { agentBase, AGENT_LABELS } from '@workgremlin/shared';
 import { httpBase, getServerInfo } from '../api/bridge';
 
 const { t } = useI18n();
@@ -175,7 +175,7 @@ const lineSuffix = (it) =>
 const lineSuffixColor = (it) => (it.live ? phaseColorOf(runningPhaseOfTask(it)) : it.suffixColor);
 
 /**
- * An ended task's line: reuse the **same wording it scrolled with** (time floor task: prompt) and append
+ * An ended task's line: reuse the **same wording it scrolled with** (time floor product: prompt) and append
  * the phase suffix "(task complete)/(task cancelled)" — same wording and colour as the phase scheme (done green,
  * cancelled/failed red). It scrolls exactly once (see pendingEnded → makeSeg) and then leaves the track.
  */
@@ -185,7 +185,7 @@ function endedText(it) {
   const done = it.state === 'done';
   const suffix = wrapSuffix(done ? t('ticker.done') : t('ticker.cancelled'));
   const suffixColor = done ? PHASES.done.color : PHASES.cancelled.color;
-  const taskLabel = t('ticker.taskLabel');
+  const taskLabel = taskLabelForTask(it);
   const taskText = clip(base);
   const time = hhmm(it.ended_at);
   return {
@@ -292,6 +292,19 @@ function floorLabelForTask(it) {
 }
 
 /**
+ * A line's leading label: the floor's **product name** with an ASCII colon, e.g.
+ * "12:34 1F CodeBuddy: <prompt>" / "12:34 2F Cline: <prompt>". /task-feed carries the agent base
+ * name as `client`, and AGENT_LABELS is the shared product display-name table, so the name always
+ * agrees with the floor number next to it. Legacy rows with no resolvable client keep the localized
+ * generic "Task:" label. The trailing NBSP stops the space after the colon from collapsing into
+ * the prompt (the label and the prompt are two adjacent inline spans).
+ */
+function taskLabelForTask(it) {
+  const label = AGENT_LABELS[agentBase(it && it.client)];
+  return label ? `${label}:\u00a0` : t('ticker.taskLabel');
+}
+
+/**
  * In-progress tasks (state === 'running' in the feed): the permanent content of the infinite scroll
  * loop. Taken directly from /api/v1/task-feed, each task on its own line, **no longer deduplicated by
  * floor**. The server has already filtered out tasks outside active sessions, so this only projects
@@ -307,7 +320,7 @@ const runningItems = computed(() => {
     .map((it) => {
       const floor = floorLabelForTask(it);
       const text = promptOf(it.title || '') || t('ticker.untitled');
-      const taskLabel = t('ticker.taskLabel');
+      const taskLabel = taskLabelForTask(it);
       const taskText = clip(text);
       // The time is the task's actual start time (tasks.started_at), no longer the "current time"
       const time = hhmm(it.started_at);
@@ -661,12 +674,12 @@ onBeforeUnmount(() => {
   font-size: 15px;
   font-weight: 500;
   letter-spacing: 0.5px;
-  /* Line body colour = the floor desktop's wood tone (the dot, time, floor number and "task:" label
+  /* Line body colour = the floor desktop's wood tone (the dot, time, floor number and "product:" label
      all inherit it); when no floor colour is set, fall back to the running blue */
   color: var(--floor-color, var(--accent, #4c8dff));
 }
 
-/* The prefixes (time / floor / "task:" label) and the trailing phase suffix always render in full:
+/* The prefixes (time / floor / "product:" label) and the trailing phase suffix always render in full:
    only the **task prompt** (.task-text) may be ellipsised (flex-shrink + min-width:0 + ellipsis). So the
    suffix ("(thinking)/(task complete)…") always stays visible right after the prompt and is never pushed off
    screen by a long title — that was the root cause of the "ended line shows ... but no status word" bug. */
@@ -698,7 +711,7 @@ onBeforeUnmount(() => {
 }
 
 /* Per-part colouring within a line:
-   · dot / time / floor number (xF) / "task:" label / task prompt → all use the floor desktop's wood
+   · dot / time / floor number (xF) / "product:" label / task prompt → all use the floor desktop's wood
      tone (--floor-color, colorsFor(floor).wood), the same colour as that floor's desks and chairs in
      the office, so you can tell at a glance which floor a task belongs to;
    · the status word at the end of an ended line (.suf) → green/red, coloured independently. */
