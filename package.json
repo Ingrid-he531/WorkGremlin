@@ -52,6 +52,7 @@
     "test:plugin-e2e": "node server/test/kiloPluginE2E.test.js",
     "test:ghost-feed": "node server/test/ghostFeed.test.js",
     "test:opencode": "node server/test/opencodeFloor.test.js",
+    "test:dsh": "node server/test/deepseekFloor.test.js && node server/test/deepseekPlugin.test.js && node server/test/deepseekInstall.test.js",
     "test:tokens": "node server/test/taskTokens.test.js",
     "test:token-persistence": "node server/test/tokenPersistence.test.js",
     "test:startup-config": "node server/test/startupConfig.test.js",

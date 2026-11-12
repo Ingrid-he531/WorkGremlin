@@ -40,7 +40,7 @@ The important conclusions still hold:
 | The team directory contains a roster and inboxes, but **no state fields** | Watching it alone can never produce `busy` / `blocked`, the current task, files or elapsed time |
 | The path embeds a private, undocumented `mainConversationId` hash | A watcher would need multi-root scanning and would break on format changes |
 | Mailboxes are append-only **receiving** arrays | Only the recipient side of a conversation is visible; the sender side is missing |
-| Many products do not use this layout at all | A single `.codebuddy/teams` reader cannot cover the nine supported floors |
+| Many products do not use this layout at all | A single `.codebuddy/teams` reader cannot cover the ten supported floors |
 | We can control how hooks/reporters are installed | Active reporting (route B) is feasible and is the only source of semantic truth |
 
 **Design consequence.** Route B (active reporting plus the server-side hook dispatcher) is the only
@@ -72,8 +72,8 @@ agent hook / reporter ──POST /api/v1/*──▶ ingest bus ──▶ SQLite 
 
 ### 1.2 On-disk floor readers (implemented, supplementary)
 
-Nine floors are monitored: CodeBuddy, Cline, Codex, Claude Code, TraeCode, Qoder, Kilo Code,
-OpenCode and GitHub Copilot. Each floor module reads its own product's data directory (SQLite,
+Ten floors are monitored: CodeBuddy, Cline, Codex, Claude Code, TraeCode, Qoder, Kilo Code,
+OpenCode, GitHub Copilot and DeepSeek Harness. Each floor module reads its own product's data directory (SQLite,
 JSONL/rollout files, checkpoint databases, transcripts and session indexes) and normalizes that into
 sessions, task runs, token counts and phases.
 
@@ -477,8 +477,8 @@ The product has shipped beyond the original M0–M3 outline. The current shape:
 | Area | Status |
 | --- | --- |
 | Electron shell + embedded/standalone server + SQLite + WS | Done |
-| Reporting SDK/CLI, hooks for CodeBuddy/Codex/Claude/Qoder/Kilo/OpenCode/Copilot | Done |
-| Nine floors with on-disk session/task/token readers | Done |
+| Reporting SDK/CLI, hooks for CodeBuddy/Codex/Claude/Qoder/Kilo/OpenCode/Copilot/DeepSeek Harness | Done |
+| Ten floors with on-disk session/task/token readers | Done |
 | Isometric office, elevator, main console, desk cards, ghosts | Done |
 | Task records: list, summary aggregates, daily Gantt, retention, CSV export | Done |
 | Council chamber: fixed roles, multi-round review, convergence, reports | Done |

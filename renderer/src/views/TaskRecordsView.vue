@@ -1560,10 +1560,10 @@ async function saveRetention() {
 .gantt { min-width: 960px; }
 .gantt-head { display: flex; }
 /* Left-side floor name (one per row), fixed width so the time axis on the right lines up.
-   124px fits the longest name ("9F GitHub Copilot"); any narrower and you'd have to rely on the title tooltip */
+   140px fits the longest name ("10F DeepSeek Harness"); any narrower and you'd have to rely on the title tooltip */
 .gutter {
   flex: none;
-  width: 124px;
+  width: 140px;
   padding-right: 8px;
   text-align: right;
   font-size: 12px;

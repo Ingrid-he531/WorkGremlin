@@ -482,6 +482,7 @@ const AGENT_LABELS = {
   qoder: 'Qoder',
   opencode: 'OpenCode',
   copilot: 'GitHub Copilot',
+  dsh: 'DeepSeek Harness',
 };
 
 /**

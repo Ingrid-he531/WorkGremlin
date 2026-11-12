@@ -197,6 +197,17 @@ export const FLOOR_COLORS = {
     note: '#b7cfff',
     noteInk: '#11284f',
   },
+  '10F': {
+    // desk/chair wood: DeepSeek indigo (cool violet-blue, distinct from 9F's 212° cruise blue)
+    wood: '#4b4f9e',
+    woodDark: '#343a75',
+    deskLeg: '#252a57',
+    metal: '#3c3f73',
+    metalDark: '#282b52',
+    chair: '#353a63',
+    note: '#c3c8ff',
+    noteInk: '#1a1d55',
+  },
 };
 
 /** Palette for a given floor (baseline COLORS + that floor's overrides; floors with no override return the baseline directly, with no extra copy) */

@@ -62,7 +62,7 @@
 
 | Surface | Key behavior | Quality goal |
 | --- | --- | --- |
-| **Office** (isometric 2.5D canvas) | Nine floors, elevator, resident gremlins at desks, ephemeral ghosts, main-agent console | State **accurate**, updates **fast**, no jitter or frame drops under high event rates |
+| **Office** (isometric 2.5D canvas) | Ten floors, elevator, resident gremlins at desks, ephemeral ghosts, main-agent console | State **accurate**, updates **fast**, no jitter or frame drops under high event rates |
 | **Workstation / Desk cards** | Per member: one of `busy` / `idle` / `blocked`, current task, files touched, artifacts, start or last-active time | Correct state for the **selected session**; no leakage between sessions; missing data never invented |
 | **Task records** | Task list, summary, daily Gantt, per-round client / model / tokens / files / result | Nothing lost or duplicated; deterministic ordering; honest empty values |
 | **Council** | Fixed-role, multi-round review with a server-computed convergence score | Read-only participants, no office pollution, faithful reporting of failures |

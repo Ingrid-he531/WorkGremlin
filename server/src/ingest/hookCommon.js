@@ -48,12 +48,15 @@ const WRITE_TOOLS = new Set([
   'Edit', 'MultiEdit', 'NotebookEdit', 'Write', 'Delete',
   'replace_in_file', 'write_to_file', 'delete_file',
   'apply_patch',
+  // DeepSeek Harness uses lowercase tool ids; they are exact matches, not a
+  // case-insensitive rule, so no other product's tool name is affected.
+  'edit', 'write',
 ]);
 
 const INJECTED_PROMPT_RE = /^\s*<(?:task-notification|agent-message)[\s>]/i;
 
 function isSubagentTool(tool) {
-  return /^(task|agent|spawn_agent|collaborationspawn_agent)$/i.test(String(tool || '').trim());
+  return /^(task|agent|subagent|spawn_agent|collaborationspawn_agent)$/i.test(String(tool || '').trim());
 }
 
 /* ============================== product-agnostic: files / progress ============================== */
@@ -141,7 +144,7 @@ function opOf(tool) {
   const t = String(tool || '');
   if (t === 'apply_patch') return 'edit';
   if (/delete/i.test(t)) return 'delete';
-  return /^(Edit|MultiEdit|NotebookEdit|replace_in_file)$/.test(t) ? 'edit' : 'write';
+  return /^(Edit|MultiEdit|NotebookEdit|replace_in_file|edit)$/.test(t) ? 'edit' : 'write';
 }
 
 /** Extract "task progress" (completed / total) from the input of TodoWrite-like tools */
@@ -162,7 +165,10 @@ function todoProgress(tool, input) {
 /** Record a relative path inside the project, an absolute path outside it */
 function relFile(file, cwd) {
   if (!file) return '';
-  const abs = path.resolve(file);
+  // Tool inputs may be relative (DSH's `path`, for example). They are relative
+  // to the session workspace, never to the server process's cwd; resolving
+  // against the event's cwd is the only interpretation that can be correct.
+  const abs = path.resolve(cwd || '', file);
   if (cwd && (abs === cwd || abs.startsWith(cwd + path.sep))) return path.relative(cwd, abs);
   return abs;
 }
@@ -265,6 +271,14 @@ function stopReasonCancelled(ev) {
     .trim()
     .toLowerCase();
   return r === 'cancelled' || r === 'canceled' || r === 'interrupted' || r === 'aborted';
+}
+
+/** A turn that ended in an error is a failed task, not a successful one. */
+function stopReasonFailed(ev) {
+  const r = String((ev && (ev.final_stop_reason || ev.stop_reason || ev.reason)) || '')
+    .trim()
+    .toLowerCase();
+  return r === 'failed' || r === 'error' || r === 'errored';
 }
 
 /* ============================== reply dedupe key ============================== */
@@ -1309,6 +1323,16 @@ async function runHookEvent(ev, ctx, floorImpl) {
     return { ok: true, handled: event };
   }
 
+  // An approval decision that arrives as its own event (DeepSeek Harness
+  // reports approval/asked and approval/decided separately; the tool has not
+  // necessarily produced a PostToolUse yet). Clear the blocked wait without
+  // pretending the tool already finished.
+  if (event === 'PermissionResolved') {
+    set({ await: null, pending: null, sessionPhase: { phase: 'thinking', ts: Date.now(), workspacePath } });
+    await clearBlocked();
+    return { ok: true, handled: event };
+  }
+
   if (event === 'Notification') {
     if (ev.notification_type === 'idle_prompt') {
       set({ await: null, pending: null, sessionPhase: { phase: 'idle', ts: Date.now(), workspacePath } });
@@ -1405,6 +1429,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
     const roundFileDetails = collectRoundFiles(st, ev, cwd, startedAt, workspacePath);
     const justCancelled = prevCancelledDone && !taskId;
     const cancelledRound = justCancelled || stopReasonCancelled(ev) || impl.interruptedSince(tp(), startedAt, sessionId);
+    const failedRound = !cancelledRound && stopReasonFailed(ev);
     sweepGhosts(bus, stableProject, client, cancelledRound ? { state: 'cancelled' } : {}, sessionId, get());
     if (taskId) {
       const form = formOf() || st.form || '';
@@ -1413,7 +1438,7 @@ async function runHookEvent(ev, ctx, floorImpl) {
       await bus.endTask({
         ...base,
         taskId,
-        state: cancelledRound ? 'cancelled' : 'done',
+        state: cancelledRound ? 'cancelled' : failedRound ? 'failed' : 'done',
         model: String(ev.model || ''),
         result,
         files: roundFileDetails,
@@ -1464,14 +1489,17 @@ async function runHookEvent(ev, ctx, floorImpl) {
   if (event === 'SessionEnd') {
     const stEnd = get();
     await reportReplies(ctx, memberId, stEnd.taskId, impl.repliesOf(tp()), sessionId, client);
-    if (impl.coarse) {
+    if (impl.coarse || impl.endOnSessionEnd) {
       const qFormEnd = formOf() || stEnd.form || '';
       if (qFormEnd && qFormEnd !== stEnd.form) set({ form: qFormEnd });
       if (stEnd.taskId) {
         await bus.endTask({
           ...base,
           taskId: stEnd.taskId,
-          state: 'done',
+          // A process that ends without a Stop did not complete the turn; a
+          // floor that opts in (DSH headless shutdown) records it as cancelled
+          // instead of leaving a running row behind.
+          state: impl.coarse ? 'done' : 'cancelled',
           model: '',
           result: '',
           files: [],
@@ -1564,7 +1592,7 @@ module.exports = {
   runHookEvent,
   // product-agnostic helpers (exported for unit tests and reuse)
   filesOf, fileOf, opOf, todoProgress, relFile, userRequestText, touchedSince, collectRoundFiles,
-  transcriptRoundFiles, stopReasonCancelled, isSubagentTool, isSubagentEvent, readTokens,
+  transcriptRoundFiles, stopReasonCancelled, stopReasonFailed, isSubagentTool, isSubagentEvent, readTokens,
   addGhost, retireGhost, bindGhostIdentity, sweepGhosts, agentName, agentTask, subagentKeys,
   resultOfResponse, INJECTED_PROMPT_RE, WRITE_TOOLS, RESULT_MAX, MSG_MAX, MAX_REPLIES,
   PENDING_SPAWN_MS,

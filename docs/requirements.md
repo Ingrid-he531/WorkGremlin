@@ -75,7 +75,7 @@ P1 is the only design target. P2/P3 needs are satisfied only when they do not ad
 | Workstation states | **Exactly three: `busy` / `idle` / `blocked`.** No `offline`, `online`, `error`, `thinking`, `unknown` or `degraded` |
 | Liveness | **No business heartbeat and no TTL.** A task is running exactly while `tasks.state='running'`; no elapsed-time or heartbeat heuristic may change a state |
 | Member scale | Target 16 members. Compact mode (≥5 members) and pagination (>16) are **not implemented**; the target remains a requirement |
-| Floors | Nine monitored products: 1F CodeBuddy, 2F Cline, 3F Codex, 4F Claude Code, 5F TraeCode, 6F Qoder, 7F Kilo Code, 8F OpenCode, 9F GitHub Copilot |
+| Floors | Ten monitored products: 1F CodeBuddy, 2F Cline, 3F Codex, 4F Claude Code, 5F TraeCode, 6F Qoder, 7F Kilo Code, 8F OpenCode, 9F GitHub Copilot, 10F DeepSeek Harness |
 | Platform | x64 only (Linux AppImage/deb, Windows NSIS, macOS-x64 dmg). ARM is not shipped; packaging scripts are parameterized rather than hardcoding an architecture |
 | Network drives / WSL | Not supported. Floor readers use short SQLite timeouts and degrade to empty data on lock/EMFILE; there is no `degraded` flag and no state change |
 | Demo | A UI action that switches to an isolated demo project. The old `--demo` / `MOCK=1` startup flags are retired |

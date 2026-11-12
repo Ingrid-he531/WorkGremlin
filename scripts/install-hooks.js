@@ -3,7 +3,7 @@
 
 /**
  * Install WorkGremlin's reporting hook into each monitored product's user-level config
- * (CodeBuddy CLI+Plugin / Codex / Claude Code / TraeCode / Qoder).
+ * (CodeBuddy CLI+Plugin / Codex / Claude Code / TraeCode / Qoder / Kilo / OpenCode / DeepSeek Harness).
  *
  * By default it installs **everything**: without --targets it walks every non-optional target in `all`
  * below, each doing "write only if installed, skip if not" (the check is looksInstalled). To add a new
@@ -11,7 +11,7 @@
  *
  * Usage:
  *   node scripts/install-hooks.js                       install (user-level: ~/.codebuddy + ~/.codex + ~/.claude + ~/.trae-cn/hooks.json + global OpenCode / Kilo plugins)
- *   node scripts/install-hooks.js --targets=codex        install only some (codebuddy / codex / claude / trae / qoder / qoder-cn / kilo-plugin / opencode-plugin / project)
+ *   node scripts/install-hooks.js --targets=codex        install only some (codebuddy / codex / claude / trae / qoder / qoder-cn / kilo-plugin / opencode-plugin / dsh-plugin / project)
  *   node scripts/install-hooks.js --project              also write a project-level <repo>/.codebuddy/settings.json
  *   node scripts/install-hooks.js --uninstall            remove (only the entries we added; others' config untouched)
  *   node scripts/install-hooks.js --dry-run              only print what would be written, no disk writes
@@ -425,6 +425,136 @@ function opencodeDataDir() {
   return path.join(os.homedir(), '.local', 'share', 'opencode');
 }
 
+/* ------------------------------ 10F DeepSeek Harness ------------------------------ */
+
+/**
+ * DSH's user-data root. `$DSH_HOME` is DSH's own override, matching the server
+ * floor (`server/src/floorDeepseek.js`) and DSH's `home-paths` package.
+ */
+function dshHome() {
+  const explicit = String(process.env.DSH_HOME || '').trim();
+  return explicit ? path.resolve(explicit) : path.join(os.homedir(), '.dsh');
+}
+
+/** The DSH plugin source in this checkout; copied to `$DSH_HOME/workgremlin/plugin.mjs`. */
+const DSH_PLUGIN_SRC = path.join(REPO_ROOT, 'packages', 'reporter', 'src', 'plugin-dsh', 'index.mjs');
+const DSH_PATCH_BEGIN = '# >>> workgremlin dsh reporter (managed) >>>';
+const DSH_PATCH_END = '# <<< workgremlin dsh reporter (managed) <<<';
+const DSH_ROW_ID = 'workgremlin-dsh-reporter';
+
+/** One YAML patch row that mounts our local plugin from the home-level layer. */
+function dshPatchBlock(pluginFile) {
+  // YAML single-quoted scalars escape a quote by doubling it.
+  const quoted = String(pluginFile).replace(/'/g, "''");
+  return [
+    DSH_PATCH_BEGIN,
+    '- insert:',
+    `    - id: ${DSH_ROW_ID}`,
+    `      name: '${quoted}'`,
+    DSH_PATCH_END,
+    '',
+  ].join('\n');
+}
+
+/**
+ * Merge the home-level `cordis.patch.yml`: replace our marked block, or append
+ * it to an existing array. An empty array (`[]`) is replaced rather than followed
+ * by a second root node. Others' patch rows are never touched.
+ */
+function mergeDshPatch(existing, pluginFile, uninstall) {
+  const text = String(existing || '');
+  const start = text.indexOf(DSH_PATCH_BEGIN);
+  const end = text.indexOf(DSH_PATCH_END);
+  if (start < 0 || end < start) {
+    // Not ours: never rewrite a user's patch while uninstalling.
+    if (uninstall) return text;
+    const block = dshPatchBlock(pluginFile);
+    const meaningful = text
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n')
+      .trim();
+    if (!meaningful || meaningful === '[]') {
+      const comments = text
+        .split('\n')
+        .filter((line) => !/^\s*\[\s*\]\s*(?:#.*)?$/.test(line))
+        .join('\n')
+        .replace(/\s*$/, '');
+      return comments ? `${comments}\n${block}` : block;
+    }
+    return `${text.replace(/\s*$/, '')}\n\n${block}`;
+  }
+  const tail = text.indexOf('\n', end);
+  const without = text.slice(0, start) + (tail >= 0 ? text.slice(tail + 1) : '');
+  if (uninstall) {
+    const cleaned = without.replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').trimEnd();
+    const meaningful = cleaned
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('')
+      .trim();
+    if (!meaningful) return cleaned ? `${cleaned}\n[]\n` : '[]\n';
+    return `${cleaned}\n`;
+  }
+  const block = dshPatchBlock(pluginFile);
+  const meaningful = without
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+    .trim();
+  if (!meaningful || meaningful === '[]') {
+    // Preserve the template's comments but replace the empty root array; a
+    // block appended after `[]` would be a second YAML root node.
+    const comments = without
+      .split('\n')
+      .filter((line) => !/^\s*\[\s*\]\s*(?:#.*)?$/.test(line))
+      .join('\n')
+      .replace(/\s*$/, '');
+    return comments ? `${comments}\n${block}` : block;
+  }
+  return `${without.replace(/\s*$/, '')}\n\n${block}`;
+}
+
+/**
+ * Install / uninstall the DSH reporter. This is not a JSON settings file: DSH
+ * loads local Cordis plugins by absolute path through its home-level patch, so
+ * one entry covers every profile (web / headless / acp) without installing an
+ * npm package into each profile.
+ * @returns {{changed:boolean, files:string[]}}
+ */
+function installDshPlugin(t, uninstall, dryRun) {
+  const patchFile = t.patchFile;
+  const pluginFile = t.file;
+  const existingPatch = fs.existsSync(patchFile) ? fs.readFileSync(patchFile, 'utf8') : '';
+  const existingPlugin = fs.existsSync(pluginFile) ? fs.readFileSync(pluginFile, 'utf8') : '';
+  const sourcePlugin = uninstall ? '' : fs.readFileSync(DSH_PLUGIN_SRC, 'utf8');
+  const nextPatch = mergeDshPatch(existingPatch, pluginFile, uninstall);
+  const patchChanged = nextPatch !== existingPatch;
+  const pluginChanged = uninstall ? existingPlugin !== '' : existingPlugin !== sourcePlugin;
+  if (!patchChanged && !pluginChanged) return { changed: false, files: [patchFile, pluginFile] };
+
+  if (!dryRun) {
+    // Back up an existing patch before the first write that is not already ours.
+    if (fs.existsSync(patchFile) && !existingPatch.includes(DSH_PATCH_BEGIN) && !fs.existsSync(`${patchFile}.bak-workgremlin`)) {
+      fs.copyFileSync(patchFile, `${patchFile}.bak-workgremlin`);
+    }
+    fs.mkdirSync(path.dirname(patchFile), { recursive: true });
+    fs.writeFileSync(patchFile, nextPatch, 'utf8');
+    if (uninstall) {
+      try {
+        fs.rmSync(pluginFile, { force: true });
+        fs.rmdirSync(path.dirname(pluginFile));
+      } catch {
+        /* the plugin dir may contain files the user put there; leave it */
+      }
+    } else {
+      fs.mkdirSync(path.dirname(pluginFile), { recursive: true });
+      fs.writeFileSync(pluginFile, sourcePlugin, 'utf8');
+    }
+  }
+  return { changed: true, files: [patchFile, pluginFile] };
+}
+
 /**
  * Our own project-level OpenCode entries (`.opencode/{plugins,plugin}/*.{ts,js}`).
  *
@@ -756,6 +886,19 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
       cliDirs: [path.join(os.homedir(), '.opencode', 'bin')],
       dataDirs: [opencodeDataDir()],
     },
+    {
+      // 10F DeepSeek Harness: a Cordis plugin, not a hooks.json product. DSH's
+      // home-level patch applies to every profile, so one local plugin file is
+      // enough for the web / headless / acp profiles. The server floor reads the
+      // same session directory for the history list.
+      id: 'dsh-plugin',
+      label: 'DeepSeek Harness plugin (true phase + task ledger)',
+      kind: 'dsh-plugin',
+      file: path.join(dshHome(), 'workgremlin', 'plugin.mjs'),
+      patchFile: path.join(dshHome(), 'cordis.patch.yml'),
+      cmd: 'dsh',
+      dir: dshHome(),
+    },
   ];
   const targets = all.filter((t) => (t.optional ? args.project === true || wanted.includes(t.id) : !wanted.length || wanted.includes(t.id)));
 
@@ -806,6 +949,22 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
         `[workgremlin] · ${t.label}: looks not installed (no ${t.cmd} in PATH, no other data in ${t.dir}), skipping (if you're sure it's installed, force with --targets=${t.id})`
       );
       result.skipped.push(t.label);
+      continue;
+    }
+
+    // 10F DeepSeek Harness: Cordis plugin + home-level YAML patch, not a JSON
+    // settings/hooks file. Handle it before the JSON read below.
+    if (t.kind === 'dsh-plugin') {
+      const outcome = installDshPlugin(t, uninstall, dryRun);
+      if (!outcome.changed) {
+        console.log(`[workgremlin] · ${t.label}: ${uninstall ? 'was not installed' : 'already up to date'} ${t.patchFile}`);
+        result.unchanged.push(t.label);
+      } else {
+        const verb = uninstall ? 'removed' : 'written';
+        console.log(`[workgremlin] ✓ ${t.label}: ${dryRun ? (uninstall ? 'would remove' : 'would write') : verb} ${t.patchFile}`);
+        if (!dryRun) result.installed.push(t.label);
+        result.files.push(...outcome.files);
+      }
       continue;
     }
 
@@ -879,6 +1038,8 @@ function installHooks(args = parseArgs(process.argv.slice(2))) {
     console.log('  · 8F OpenCode: same, the plugin is written to the **global** config (`plugins`); it loads for every workspace,');
     console.log(`                so a task in any project is reported under that project. Restart opencode once (config may hot-reload).`);
     console.log('                If any project still has .opencode/plugins/workgremlin.js, delete it: global + project = two instances.');
+    console.log('  · 10F DeepSeek Harness: the plugin is copied into $DSH_HOME/workgremlin/ and mounted by the');
+    console.log('                home-level cordis.patch.yml. It covers the web / headless / acp profiles; restart DSH once.');
     console.log('[workgremlin] · To opt out of auto-hooking / auto-install: WORKGREMLIN_NO_AUTO_HOOKS=1');
   }
   return result;
@@ -891,6 +1052,9 @@ module.exports = {
   OPENCODE_PLUGIN_DIR,
   opencodeConfigDir,
   opencodeConfigFile,
+  dshHome,
+  DSH_PLUGIN_SRC,
+  mergeDshPatch,
   EVENTS,
   CODEBUDDY_EVENTS,
   CODEX_EVENTS,

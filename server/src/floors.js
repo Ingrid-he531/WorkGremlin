@@ -17,7 +17,7 @@
  * helpers live in roots.js (also floor-agnostic).
  *
  * Floor module contract:
- *   id           floor id ('1F' … '9F')
+ *   id           floor id ('1F' … '10F')
  *   meta         product detection metadata (id/name/kind/cmd/agent/plugin/pluginRe/altPluginRe/
  *                sources/hookSource/dataKind/matchRe/homeDirs/homeDirsPlugin/cliBinDirs)
  *   kindHandlers (optional) this floor's own "session source branch": { <kind>: (product, spec, ctx) => void }
@@ -105,6 +105,7 @@ const FLOOR_MODULES = [
   require('./floorKilo'),
   require('./floorOpencode'),
   require('./floorCopilot'),
+  require('./floorDeepseek'),
 ];
 
 /** Floor id → floor module (keyed by `meta.id`) */
@@ -340,9 +341,15 @@ function detectOne(p) {
  * @returns {Array}
  */
 function floorMetas() {
-  // Ascending floor id, so the 1F…9F order stays stable (both the UI and snapshots depend on it)
+  // Ascending floor id, so the 1F…10F order stays stable (both the UI and snapshots
+  // depend on it). A plain string sort puts "10F" before "1F", so compare the
+  // numeric prefix and keep the id itself as the deterministic tie-breaker.
+  const order = (id) => {
+    const n = Number.parseInt(String(id), 10);
+    return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+  };
   return Object.keys(floors)
-    .sort()
+    .sort((a, b) => order(a) - order(b) || a.localeCompare(b))
     .map((id) => floors[id].meta);
 }
 

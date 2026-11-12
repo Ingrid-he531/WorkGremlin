@@ -130,7 +130,9 @@ function scanDataDir(dir) {
         continue;
       }
       files += 1;
-      if (/\.jsonl$/i.test(e.name)) sessions += 1;
+      // Plain JSONL, plus compressed JSONL session logs (DeepSeek Harness writes
+      // `session.vN.jsonl.zstd`). The extension still means "one session file".
+      if (/\.jsonl(?:\.zstd)?$/i.test(e.name)) sessions += 1;
       try {
         const st = fs.statSync(p);
         bytes += st.size || 0;
