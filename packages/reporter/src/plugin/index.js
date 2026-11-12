@@ -387,27 +387,68 @@ function subagentOf(input) {
   return { name: String(name || "").trim() || "subagent", task: String(task).replace(/\s+/g, " ").trim().slice(0, 80) }
 }
 
+/** Whether `dir` is `root` itself or sits inside it. */
+function insideDir(root, dir) {
+  const rel = path.relative(root, dir)
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+}
+
 /**
- * Whether two workspace directories are the same directory or one contains the other (a session can
- * run in a subdirectory of the workspace it was opened from; that still belongs to the same plugin
- * instance). Used to keep one OpenCode server's several per-workspace plugin instances from all
- * reporting the same session (see the guard in `handle`).
- * @param {string} a
- * @param {string} b
- * @returns {boolean}
+ * Process-wide registry of plugin instances, keyed by product (`client`) and then by resolved
+ * workspace directory.
+ *
+ * OpenCode serves several workspaces from one long-lived process and loads this module **once per
+ * workspace**, while the event stream is whole-server. Module state is per load, so the instances can
+ * only agree on who reports a session through `globalThis`. Keeping the map per client means the Kilo
+ * and OpenCode entry points (which may run in the same process) never contend for each other's work.
+ *
+ * The value is the owning instance's token; a reload of the same workspace replaces it, so the newest
+ * loaded code reports even if the previous subscription was not torn down.
+ * @param {string} client
+ * @returns {Map<string, object>} resolved workspace dir -> instance token
  */
-function sameWorkspaceTree(a, b) {
-  const inside = (from, to) => {
-    const rel = path.relative(from, to)
-    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+function instanceRegistry(client) {
+  const key = "__workgremlinReporterInstances"
+  let all = globalThis[key]
+  if (!all) {
+    all = new Map()
+    globalThis[key] = all
   }
+  let byDir = all.get(client)
+  if (!byDir) {
+    byDir = new Map()
+    all.set(client, byDir)
+  }
+  return byDir
+}
+
+/**
+ * The **most specific** registered workspace that contains the session: the workspace itself or a
+ * subdirectory of it. Returns "" when no instance covers the session.
+ *
+ * Why the most specific one: OpenCode also boots the global plugin for an ancestor directory (the home
+ * directory, `~`), and an ancestor contains every project below it. Letting any containing instance
+ * report the session made `~` and the real project report the same user turn: two ledger tasks ~9ms
+ * apart, one cancelled by the server as "the previous round", then both closed with identical titles
+ * (user report, 2026-11-11, still seen 2026-11-12). The instance loaded for the session's own
+ * directory is the one that should report it.
+ * @param {Map<string, object>} byDir
+ * @param {string} sessionDir
+ * @returns {string}
+ */
+function ownerOf(byDir, sessionDir) {
+  let best = ""
+  let dir = ""
   try {
-    const ra = path.resolve(String(a || ""))
-    const rb = path.resolve(String(b || ""))
-    return inside(ra, rb) || inside(rb, ra)
+    dir = path.resolve(String(sessionDir || ""))
   } catch {
-    return false
+    return ""
   }
+  for (const candidate of byDir.keys()) {
+    if (!insideDir(candidate, dir)) continue
+    if (candidate.length > best.length) best = candidate
+  }
+  return best
 }
 
 /* ------------------------------ Plugin ------------------------------ */
@@ -495,6 +536,11 @@ function createIngestPlugin(options, { location, base } = {}) {
   const ingest = createIngest(client)
   /** This plugin instance's own workspace (the event stream is **whole-server**, not just this workspace — see wsOf below) */
   const ownDir = String((location && location.directory) || "")
+  /** Resolved own workspace + registry token: several instances share one process, see instanceRegistry */
+  const ownKey = ownDir ? path.resolve(ownDir) : ""
+  const registry = ownKey ? instanceRegistry(client) : null
+  const instanceToken = {}
+  if (registry) registry.set(ownKey, instanceToken)
 
   /* ------------------------------ Member registration ------------------------------ */
 
@@ -904,14 +950,20 @@ function createIngestPlugin(options, { location, base } = {}) {
      * workspace, while the event stream is whole-server (see wsOf's note). Without a guard every
      * instance reports every session: the same user turn opened two ledger tasks 9ms apart (the
      * server then cancelled one as "the previous round"), and the other workspace's instance wrote
-     * phase state files under its own path. Only the instance whose workspace contains the session may
-     * report it. The session's directory is learned from the envelope (v2) before deciding; note the
-     * event can lack `location`, so the directory learned from an earlier event is used then.
+     * phase state files under its own path. Only **the instance loaded for the session's own (most
+     * specific) workspace** may report it: an ancestor workspace such as the home directory also
+     * contains the session, and allowing it is what kept the duplicate alive. The session's directory
+     * is learned from the envelope (v2) before deciding; note the event can lack `location`, so the
+     * directory learned from an earlier event is used then.
      */
     const eventDir = String((event && event.location && event.location.directory) || "")
     if (sid && eventDir) dirs.set(sid, eventDir)
     const sessionDir = sid ? dirs.get(sid) || "" : ""
-    if (sessionDir && ownDir && !sameWorkspaceTree(sessionDir, ownDir)) return
+    if (sessionDir && ownKey) {
+      const owner = ownerOf(registry, sessionDir)
+      // Same directory loaded twice (reload): only the newest token reports, not every load.
+      if (!owner || registry.get(owner) !== instanceToken) return
+    }
 
     // Member registration: **ensure on every event**, not only on `session.created`. Must: reopening the
     // Kilo VS Code window restarts kilo serve while the session already exists, so a new process never
@@ -1394,7 +1446,13 @@ function createIngestPlugin(options, { location, base } = {}) {
     }
   }
 
-  return { handle, dispose: () => {} }
+  return {
+    handle,
+    /** Leave the workspace registry so a reloaded instance can take over (see instanceRegistry) */
+    dispose: () => {
+      if (registry && registry.get(ownKey) === instanceToken) registry.delete(ownKey)
+    },
+  }
 }
 
 /**

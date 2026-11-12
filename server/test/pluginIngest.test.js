@@ -403,16 +403,23 @@ head('[F] 边界：两代信封都认 / OpenCode v2 事件词汇 / 拿不到标�
 }
 
 /* [H] One OpenCode server serves several workspaces and loads the plugin once per workspace, while
-   the event stream is whole-server. Regression (user, 2026-11-11): the same user turn opened two
-   ledger tasks 9ms apart — one immediately cancelled, one running. Each instance must only report
-   sessions inside its own workspace. */
+   the event stream is whole-server. Regressions (user, 2026-11-11 and 2026-11-12): the same user
+   turn opened two ledger tasks 9ms apart — one immediately cancelled, one running, then two identical
+   done rows. Only the instance loaded for the session's own (most specific) workspace may report it;
+   an ancestor workspace (OpenCode also boots the plugin for the home directory) must not. */
 head('[H] 多工作区插件实例：同一轮只由一个实例记账');
 {
   const OTHER = '/tmp/OtherWorkspace';
   const ctxHome = makeCtx({ client: 'opencode' }, WS);
   const ctxOther = makeCtx({ client: 'opencode' }, OTHER);
+  // An ancestor workspace (~): it contains WS, but the session belongs to WS, not to it.
+  const ctxParent = makeCtx({ client: 'opencode' }, path.dirname(WS));
+  // A reload of the same workspace: the newest instance takes over from the earlier one.
+  const ctxHome2 = makeCtx({ client: 'opencode' }, WS);
   const offHome = await plugin.setup(ctxHome);
   const offOther = await plugin.setup(ctxOther);
+  const offParent = await plugin.setup(ctxParent);
+  const offHome2 = await plugin.setup(ctxHome2);
   const SID_HOME = 'ses_home_1';
   const homeEvent = (type, data, withLocation = true) => ({
     type,
@@ -420,8 +427,8 @@ head('[H] 多工作区插件实例：同一轮只由一个实例记账');
     ...(withLocation ? { location: { directory: WS } } : {}),
     created: Date.now(),
   });
-  // Both instances receive the same events (the second workspace's instance included).
-  for (const c of [ctxHome, ctxOther]) {
+  // Every instance receives the same events (other workspaces + the ancestor + the reload included).
+  for (const c of [ctxHome, ctxOther, ctxParent, ctxHome2]) {
     c.emit(homeEvent('session.created', { info: { directory: WS } }));
     c.emit(homeEvent('session.inbox.enqueued', { item: { type: 'user', payload: { text: '"同一轮任务"' } } }));
     // No `location`: the instance must fall back to the directory it learned from the earlier event.
@@ -435,6 +442,11 @@ head('[H] 多工作区插件实例：同一轮只由一个实例记账');
     homeStarts.length === 1 && homeStarts[0].body.workspacePath === WS,
     JSON.stringify(homeStarts.map((s) => s.body.workspacePath))
   );
+  ok(
+    '祖先工作区（home）的实例不记账（与会话同级的其它工作区也不记）',
+    homeStarts.length === 1,
+    JSON.stringify(routes().slice(-8))
+  );
   const homeStateFiles = fs.readdirSync(path.join(WG, 'hooks')).filter((n) => n.includes(SID_HOME));
   ok(
     '状态文件只属于本工作区（没有写到别的工作区名下）',
@@ -443,6 +455,8 @@ head('[H] 多工作区插件实例：同一轮只由一个实例记账');
   );
   if (typeof offHome === 'function') offHome();
   if (typeof offOther === 'function') offOther();
+  if (typeof offParent === 'function') offParent();
+  if (typeof offHome2 === 'function') offHome2();
 }
 
 if (typeof dispose === 'function') dispose();
