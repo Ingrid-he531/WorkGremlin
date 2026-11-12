@@ -203,6 +203,60 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   ok('ended_at 是会话日志给的收工时刻', Boolean(task9) && task9.ended_at === liveEnd, task9 && String(task9.ended_at));
   ok('成员卡回落 idle（不再永远"思考中"）', stateOf('copilot@p1') === 'idle', stateOf('copilot@p1'));
 
+  console.log('[2b] 9F：整份 requests 快照已认出收工 → 不挂幻影 running（滚动屏不再一直滚）');
+  // 旧行为：日志只剩整份 requests 快照时漏读 modelState.completedAt → 这一轮永远算在飞，
+  // 同步器按「上一轮 + 1」再记一条 running。这里直接放一条旧的幻影行，验证收工同步会把它收掉。
+  const compactSid = 'cop-sid-compact';
+  const phantomId = `copilot:${compactSid}:1`;
+  repo.insertTask.run({
+    id: phantomId,
+    projectId: 'p1',
+    memberId: 'copilot@p1',
+    parentTaskId: null,
+    title: '幻影 running',
+    state: 'running',
+    progress: null,
+    startedAt: liveStart,
+    endedAt: null,
+  });
+  repo.upsertTaskRun.run({
+    id: phantomId,
+    projectId: 'p1',
+    memberId: 'copilot@p1',
+    client: 'copilot',
+    sessionId: compactSid,
+    form: null,
+    model: null,
+    title: '幻影 running',
+    startedAt: liveStart,
+    baselineCommit: null,
+  });
+  copilotRows = [
+    {
+      id: compactSid,
+      copilot: true,
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      lastUpdated: liveEnd,
+      inFlight: false,
+      // SQLite 只有这一轮；日志的整份快照已经带 completedAt（见 mergedFloors [A2b]）
+      copilotTurns: [{ index: 0, userMessage: '快照里已完成的一轮', at: liveEnd }],
+      livePrompt: '快照里已完成的一轮',
+      liveStartedAt: liveStart,
+      liveIndex: 0,
+      liveReqs: [{ index: 0, startedAt: liveStart, endedAt: liveEnd }],
+      liveChanged: [],
+      files: { count: 0, recent: [] },
+    },
+  ];
+  syncCopilotTasks({ bus, repo });
+  ok('幻影 running 行被收掉', !repo.getTaskRun.get(phantomId), JSON.stringify(repo.getTaskRun.get(phantomId)));
+  ok(
+    '真实那一轮落成 done（不是又冒一条 running）',
+    Boolean(repo.getTask.get(`copilot:${compactSid}:0`)) && repo.getTask.get(`copilot:${compactSid}:0`).state === 'done',
+    JSON.stringify(repo.getTask.get(`copilot:${compactSid}:0`))
+  );
+
   console.log('[3] 7F Kilo Code：活跃会话 → 台账 + 成员卡思考中');
   const round7Start = Date.now() - 60_000;
   kiloRows = [

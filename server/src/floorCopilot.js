@@ -350,6 +350,19 @@ function copilotInFlight(row) {
   // Compare in SQLite's index space: the log may number its requests one higher (see
   // copilotLiveIndexOffset), and using the raw index made a finished turn look unfinished.
   const indexOffset = copilotLiveIndexOffset(turns, live && live.reqs);
+  // The chat index can prove this exact turn already ended even when the log kept only the request-start
+  // snapshot (no completion marker at all): its start equals ours and its end is later. This is not the
+  // tie case the note below talks about — builds that write `lastRequestEnded == lastRequestStarted`
+  // cannot prove in-flight, while `ended > started` does prove "finished".
+  const indexKnowsThisTurnEnded = Boolean(
+    c &&
+      live &&
+      live.startedAt &&
+      live.startedAt >= (c.lastRequestStarted || 0) &&
+      c.lastRequestEnded > c.lastRequestStarted &&
+      live.startedAt <= c.lastRequestEnded
+  );
+  if (indexKnowsThisTurnEnded) return false;
   // Follow the log when it is **not older** than the turn the index knows about. Do not demand "strictly
   // newer": in the measured VS Code build the index writes lastRequestEnded equal to lastRequestStarted
   // (so in-flight can never be detected), and letting the index win ties produces "the log says it just
@@ -509,6 +522,14 @@ function readCopilotLiveRequest(sessionId) {
   const elapsedByIndex = new Map(); // turn index -> elapsedMs (start = completedAt - elapsedMs)
   const changedByIndex = new Map(); // turn index -> Set(files touched by write tools: absolute paths)
   let maxIndex = -1;
+  /**
+   * Completion carried **inside** the whole `requests` snapshot, not in a `requests.<n>.modelState`
+   * patch. VS Code sometimes persists the session log as one snapshot after the turn has already
+   * finished (measured 2026-11-12: a five-line log whose only `requests` line was `[completed request
+   * with modelState.completedAt]`, no patches at all). Missing it left the turn "in flight" forever →
+   * the syncer booked a phantom running row (`<last turn + 1>`) that the ticker scrolled endlessly.
+   */
+  let snapshotComplete = null;
   for (const line of txt.split('\n')) {
     if (!line || line[0] !== '{') continue;
     let j = null;
@@ -523,10 +544,24 @@ function readCopilotLiveRequest(sessionId) {
       // The whole requests array (rolling window): the last entry is the newest turn
       const arr = Array.isArray(j.v) ? j.v : [];
       const last = arr[arr.length - 1];
+      snapshotComplete = null;
       if (last && typeof last === 'object') {
         const startedAt = Number(last.timestamp) || 0;
         const prompt = String((last.message || {}).text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-        if (startedAt) req = { index: null, prompt, startedAt, completed: false, completedAt: 0 };
+        if (startedAt) {
+          req = { index: null, prompt, startedAt, completed: false, completedAt: 0 };
+          const completedAt = Number(last.modelState && last.modelState.completedAt) || 0;
+          if (completedAt >= startedAt) {
+            // The array's position is used only as a fallback index: a compacted snapshot has no
+            // per-request patches to tell us the global index, and a one-entry snapshot is turn 0 of
+            // what the log kept. copilotLiveIndexOffset re-aligns it with SQLite's turn index.
+            snapshotComplete = {
+              index: arr.length - 1,
+              completedAt,
+              elapsedMs: Number(last.elapsedMs) || 0,
+            };
+          }
+        }
       }
     } else {
       const idx = Number(k[1]);
@@ -553,6 +588,16 @@ function readCopilotLiveRequest(sessionId) {
           }
         }
       }
+    }
+  }
+  // Merge the snapshot's own completion marker into the per-index evidence. A newer snapshot wins: the
+  // whole-array line that carries a completion is written after the turn ended, so it is fresher than
+  // any patch left over from an earlier turn.
+  if (snapshotComplete) {
+    const known = modelStateByIndex.get(snapshotComplete.index);
+    if (!known || snapshotComplete.completedAt > known.completedAt) {
+      modelStateByIndex.set(snapshotComplete.index, { value: 1, completedAt: snapshotComplete.completedAt });
+      if (snapshotComplete.elapsedMs) elapsedByIndex.set(snapshotComplete.index, snapshotComplete.elapsedMs);
     }
   }
   if (!req) return null;

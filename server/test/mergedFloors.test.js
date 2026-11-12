@@ -820,6 +820,88 @@ head('[D] 9F GitHub Copilot：插件扩展楼层被识别并展示');
     Boolean(newRow) && Array.isArray(newRow.liveChanged) && newRow.liveChanged[0] && JSON.stringify(newRow.liveChanged[0].files) === JSON.stringify(['/tmp/ProjGitHubCopilot/src/highlight.ts']),
     JSON.stringify(newRow && newRow.liveChanged)
   );
+
+  head('[A2b] 9F：会话日志只剩整份 requests 快照时，也要认出这一轮已收工');
+  {
+    // 实测（2026-11-12）：有些 VS Code 会话的 chatSessions jsonl 只有几行，完成标记不是
+    // `requests.<n>.modelState` 补丁，而是**整份 requests 里那条请求自己的 modelState.completedAt**。
+    // 漏读它 → 这一轮永远算「在飞」→ 同步器按「上一轮 + 1」再记一条 running，滚动屏一直滚。
+    const snapshotStart = Date.now() - 20_000;
+    const snapshotEnd = snapshotStart + 18_000;
+    fs.writeFileSync(
+      logFile,
+      [
+        { kind: 0, v: { version: 3, sessionId: ghSid, requests: [] } },
+        { kind: 1, k: ['customTitle'], v: '整份快照的会话' },
+        {
+          kind: 2,
+          k: ['requests'],
+          v: [
+            {
+              requestId: 'r-compacted',
+              timestamp: snapshotStart,
+              message: { text: '日志只留整份快照的这一轮' },
+              modelState: { value: 1, completedAt: snapshotEnd },
+              elapsedMs: snapshotEnd - snapshotStart,
+            },
+          ],
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join('\n') + '\n'
+    );
+    const { readCopilotLiveRequest } = require('../src/floorCopilot');
+    const live = readCopilotLiveRequest(ghSid);
+    ok(
+      '整份快照里的完成标记被读到（不再当成一直在飞）',
+      Boolean(live) && live.completed === true && live.completedAt === snapshotEnd,
+      JSON.stringify(live && { completed: live.completed, completedAt: live.completedAt, index: live.index })
+    );
+    ok(
+      '这一轮进了 liveReqs（台账据此收工 / 清掉幻影 running 行）',
+      Boolean(live) && Array.isArray(live.reqs) && live.reqs.some((r) => r.startedAt === snapshotStart && r.endedAt === snapshotEnd),
+      JSON.stringify(live && live.reqs)
+    );
+    const snap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
+    const row = snap.sessions.find((s) => s.id === ghSid);
+    ok(
+      '9F 相位 / 在飞判定改为已收工',
+      Boolean(row) && row.inFlight === false && row.phase === 'idle',
+      row && JSON.stringify({ inFlight: row.inFlight, phase: row.phase, doneAt: row.doneAt })
+    );
+
+    // 另一种同类落盘：日志只留了起跑快照（连 modelState 完成标记都没有），但 VS Code 的 chat
+    // 索引明确写着这一轮 ended > started —— 同一轮（start 相等）已经收工，不能再等在日志里。
+    const fallbackStart = Date.now() - 5_000;
+    const fallbackEnd = fallbackStart + 4_000;
+    writeChatIndex(fallbackStart, fallbackEnd);
+    fs.writeFileSync(
+      logFile,
+      [
+        {
+          kind: 2,
+          k: ['requests'],
+          v: [
+            {
+              requestId: 'r-fallback',
+              timestamp: fallbackStart,
+              message: { text: '日志里没有完成标记的这一轮' },
+              modelState: { value: 0 },
+            },
+          ],
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join('\n') + '\n'
+    );
+    const fallbackSnap = listSessions({ workspacePath: '/tmp/ProjGitHubCopilot', force: true, client: 'copilot' });
+    const fallbackRow = fallbackSnap.sessions.find((s) => s.id === ghSid);
+    ok(
+      '日志没有完成标记、索引明确 ended > started 的同一轮 → 也判收工',
+      Boolean(fallbackRow) && fallbackRow.inFlight === false && fallbackRow.phase === 'idle',
+      fallbackRow && JSON.stringify({ inFlight: fallbackRow.inFlight, phase: fallbackRow.phase })
+    );
+  }
 }
 
 /* [A2c] 相位按会话 id 归属：空闲会话不许借同层别的会话的实时相位（stuck「思考中」回归） */
