@@ -247,8 +247,8 @@ export const WALL = {
    * because a larger gy is further left). It hangs low — a real corridor sign, not a room nameplate —
    * with its bottom edge near knee height, and has to clear the door casing (door.y1 + 0.09).
    * @property {number} gy center along gy
-   * @property {number} gz center height: half-height 0.28 (see engine.js), so 0.66 puts it at
-   *   0.38 .. 0.94 — below the door handle, on the lower part of the wall
+   * @property {number} gz center height: half-height 0.14 (see engine.js), so 0.66 puts it at
+   *   0.52 .. 0.80 — smaller than a room nameplate, reading as a corridor sign beside the door
    */
   exitSign: { gy: 10.55, gz: 0.66 },
 };

@@ -254,7 +254,7 @@ function makeWallText(text) {
 }
 
 /**
- * "安全出口" sign: a bright green, **self-luminous** plate with a white running-man pictogram + label.
+ * "安全出口" sign: a dark-green plate with a bright-green running-man pictogram + label.
  *
  * Unlike the dark-blue room nameplates (which read as framed notices), an exit sign has to read as lit, so
  * the glow is baked into the bitmap (a soft green halo + a lit top edge on the plate). The bitmap keeps a
@@ -291,37 +291,37 @@ function makeExitSign(text) {
 
   // ---- Halo: fill the plate outline a couple of times under a green shadow, then paint the crisp plate on top ----
   g.save();
-  g.shadowColor = 'rgba(64,255,150,0.85)';
+  g.shadowColor = 'rgba(72,255,142,0.8)';
   g.shadowBlur = 16;
   roundRectPath(g, x0, y0, w, h, 12);
-  g.fillStyle = '#16c86a';
+  g.fillStyle = '#0c3a25';
   g.fill();
   g.fill();
   g.restore();
 
-  // ---- Plate: bright green light box; the lighter top edge is what makes it read as self-luminous ----
+  // ---- Plate: dark green light box; the lighter top edge is what makes it read as self-luminous ----
   const grad = g.createLinearGradient(0, y0, 0, y0 + h);
-  grad.addColorStop(0, '#47f295');
-  grad.addColorStop(0.45, '#1ed473');
-  grad.addColorStop(1, '#079c4b');
+  grad.addColorStop(0, '#1d6343');
+  grad.addColorStop(0.45, '#0f3d29');
+  grad.addColorStop(1, '#08281a');
   roundRectPath(g, x0, y0, w, h, 12);
   g.fillStyle = grad;
   g.fill();
   g.lineWidth = 2.5;
-  g.strokeStyle = 'rgba(198,255,224,0.92)';
+  g.strokeStyle = 'rgba(106,255,164,0.85)';
   g.stroke();
   // Inner bezel hairline: a light box has a frame inside the border, not just a flat sticker
   roundRectPath(g, x0 + 4, y0 + 4, w - 8, h - 8, 9);
   g.lineWidth = 1;
-  g.strokeStyle = 'rgba(240,255,246,0.5)';
+  g.strokeStyle = 'rgba(106,255,164,0.32)';
   g.stroke();
 
-  // ---- Pictogram: a running man, white, drawn with round strokes ----
+  // ---- Pictogram: a running man, bright green, drawn with round strokes ----
   const cx = x0 + 12;
   const cy = y0 + h / 2 + 2;
   g.save();
-  g.strokeStyle = '#f4fff8';
-  g.fillStyle = '#f4fff8';
+  g.strokeStyle = '#5bff96';
+  g.fillStyle = '#5bff96';
   g.lineWidth = 6;
   g.lineCap = 'round';
   g.lineJoin = 'round';
@@ -351,13 +351,13 @@ function makeExitSign(text) {
   g.stroke();
   g.restore();
 
-  // ---- Label: heavy white text with a dark-green shadow so it stays crisp on the bright plate ----
+  // ---- Label: heavy bright-green text with a green glow so it reads as backlit ----
   g.textAlign = 'left';
   g.textBaseline = 'middle';
-  g.shadowColor = 'rgba(0,64,32,0.55)';
-  g.shadowBlur = 3;
-  g.shadowOffsetY = 2;
-  g.fillStyle = '#ffffff';
+  g.shadowColor = 'rgba(72,255,142,0.6)';
+  g.shadowBlur = 4;
+  g.shadowOffsetY = 0;
+  g.fillStyle = '#6bffa0';
   g.fillText(key, x0 + picW + gap, y0 + h / 2 + 1);
 
   EXIT_SIGN_CACHE.set(key, off);
@@ -1882,7 +1882,7 @@ export function createIsoOffice(canvas, opts = {}) {
     const tc = makeExitSign(t('wall.exit'));
     const W = tc.width;
     const H = tc.height;
-    const halfH = 0.28;
+    const halfH = 0.14; // half of the original 0.28: the plate reads in proportion with the door
     const halfW = halfH * (W / H);
     const { gy, gz } = WALL.exitSign;
     const sD = project(0, gy + halfW, gz + halfH);
