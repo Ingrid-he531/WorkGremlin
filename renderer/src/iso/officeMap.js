@@ -242,6 +242,15 @@ export const WALL = {
    *   level with the door casing top (door.z1 + 0.09) and on the same slanted line on screen
    */
   plate: { gy: 4.2, gz: 1.59 },
+  /**
+   * Emergency-exit sign on this same left wall, **to the left of the door on screen** (gy > door.y1,
+   * because a larger gy is further left). It hangs low — a real corridor sign, not a room nameplate —
+   * with its bottom edge near knee height, and has to clear the door casing (door.y1 + 0.09).
+   * @property {number} gy center along gy
+   * @property {number} gz center height: half-height 0.28 (see engine.js), so 0.66 puts it at
+   *   0.38 .. 0.94 — below the door handle, on the lower part of the wall
+   */
+  exitSign: { gy: 10.55, gz: 0.66 },
 };
 
 /* ------------------------------------------------------------------ *

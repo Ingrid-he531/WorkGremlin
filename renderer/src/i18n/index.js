@@ -232,6 +232,7 @@ const MESSAGES = {
     'bubble.done_prefix': '已完成：{task}',
     'wall.meeting_room': '会议室',
     'wall.pantry': '茶水间',
+    'wall.exit': '安全出口',
     // ---- legacy 2D scene (?tab=flat) and the design bench (?tab=lab) ----
     'state.busy': '忙碌',
     'state.idle': '空闲',
@@ -757,6 +758,7 @@ const MESSAGES = {
     'bubble.done_prefix': 'Done: {task}',
     'wall.meeting_room': 'Meeting room',
     'wall.pantry': 'Pantry',
+    'wall.exit': 'EXIT',
     // ---- legacy 2D scene (?tab=flat) and desk lab (?tab=lab) ----
     'state.busy': 'Busy',
     'state.idle': 'Idle',

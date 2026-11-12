@@ -181,6 +181,8 @@ const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /** Sign bitmap cache: the same text is rendered once (tags now get redrawn in the sort layer, cannot make a canvas every frame) */
 const WALL_TEXT_CACHE = new Map();
+/** Emergency-exit sign bitmaps, keyed by the localized label (one per language) */
+const EXIT_SIGN_CACHE = new Map();
 
 /* ------------------------------ Summon/report state persisted across instances ------------------------------
  * The office view (IsoOfficeView) is a route-level component: switching to "workstation card" / "conversation log" and back
@@ -248,6 +250,117 @@ function makeWallText(text) {
   g.fillStyle = '#eaf1fb';
   g.fillText(text, w / 2, h / 2 + 1);
   WALL_TEXT_CACHE.set(key, off);
+  return off;
+}
+
+/**
+ * "安全出口" sign: a bright green, **self-luminous** plate with a white running-man pictogram + label.
+ *
+ * Unlike the dark-blue room nameplates (which read as framed notices), an exit sign has to read as lit, so
+ * the glow is baked into the bitmap (a soft green halo + a lit top edge on the plate). The bitmap keeps a
+ * transparent margin around the plate for that halo; the world quad in drawExitSign covers the whole
+ * bitmap, so the margin simply becomes light spill on the wall.
+ *
+ * Drawn once per locale and cached: the sign is static, and the room background that mounts it is cached too.
+ */
+function makeExitSign(text) {
+  const key = String(text || 'EXIT');
+  const cached = EXIT_SIGN_CACHE.get(key);
+  if (cached) return cached;
+  const fontPx = 40;
+  const font = `800 ${fontPx}px "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif`;
+  const glowPad = 22; // transparent margin: the halo painted by shadowBlur must not be clipped by the bitmap
+  const picW = 62;
+  const gap = 14;
+  const off = document.createElement('canvas');
+  let g = off.getContext('2d');
+  g.font = font;
+  const textW = Math.ceil(g.measureText(key).width);
+  const plateW = glowPad * 2 + picW + gap + textW;
+  const plateH = glowPad * 2 + fontPx + 16;
+  off.width = plateW;
+  off.height = plateH;
+  // Changing width/height clears the context, so get it back and re-set the font
+  g = off.getContext('2d');
+  g.font = font;
+
+  const x0 = glowPad;
+  const y0 = glowPad;
+  const w = plateW - glowPad * 2;
+  const h = plateH - glowPad * 2;
+
+  // ---- Halo: fill the plate outline a couple of times under a green shadow, then paint the crisp plate on top ----
+  g.save();
+  g.shadowColor = 'rgba(64,255,150,0.85)';
+  g.shadowBlur = 16;
+  roundRectPath(g, x0, y0, w, h, 12);
+  g.fillStyle = '#16c86a';
+  g.fill();
+  g.fill();
+  g.restore();
+
+  // ---- Plate: bright green light box; the lighter top edge is what makes it read as self-luminous ----
+  const grad = g.createLinearGradient(0, y0, 0, y0 + h);
+  grad.addColorStop(0, '#47f295');
+  grad.addColorStop(0.45, '#1ed473');
+  grad.addColorStop(1, '#079c4b');
+  roundRectPath(g, x0, y0, w, h, 12);
+  g.fillStyle = grad;
+  g.fill();
+  g.lineWidth = 2.5;
+  g.strokeStyle = 'rgba(198,255,224,0.92)';
+  g.stroke();
+  // Inner bezel hairline: a light box has a frame inside the border, not just a flat sticker
+  roundRectPath(g, x0 + 4, y0 + 4, w - 8, h - 8, 9);
+  g.lineWidth = 1;
+  g.strokeStyle = 'rgba(240,255,246,0.5)';
+  g.stroke();
+
+  // ---- Pictogram: a running man, white, drawn with round strokes ----
+  const cx = x0 + 12;
+  const cy = y0 + h / 2 + 2;
+  g.save();
+  g.strokeStyle = '#f4fff8';
+  g.fillStyle = '#f4fff8';
+  g.lineWidth = 6;
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  // head
+  g.beginPath();
+  g.arc(cx + 11, cy - 21, 7, 0, Math.PI * 2);
+  g.fill();
+  // torso, leaning forward toward the exit
+  g.beginPath();
+  g.moveTo(cx + 5, cy - 10);
+  g.lineTo(cx + 13, cy + 5);
+  g.stroke();
+  // arms, one forward and one back
+  g.beginPath();
+  g.moveTo(cx + 6, cy - 6);
+  g.lineTo(cx + 24, cy - 12);
+  g.moveTo(cx + 6, cy - 7);
+  g.lineTo(cx - 10, cy - 1);
+  g.stroke();
+  // legs: front leg lands forward, back leg kicks out behind
+  g.beginPath();
+  g.moveTo(cx + 13, cy + 5);
+  g.lineTo(cx + 27, cy + 20);
+  g.moveTo(cx + 13, cy + 5);
+  g.lineTo(cx + 1, cy + 19);
+  g.lineTo(cx - 8, cy + 25);
+  g.stroke();
+  g.restore();
+
+  // ---- Label: heavy white text with a dark-green shadow so it stays crisp on the bright plate ----
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  g.shadowColor = 'rgba(0,64,32,0.55)';
+  g.shadowBlur = 3;
+  g.shadowOffsetY = 2;
+  g.fillStyle = '#ffffff';
+  g.fillText(key, x0 + picW + gap, y0 + h / 2 + 1);
+
+  EXIT_SIGN_CACHE.set(key, off);
   return off;
 }
 
@@ -1757,6 +1870,31 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
+   * Emergency-exit sign, mounted on the **left wall (gx = 0), left of the door** (see WALL.exitSign).
+   * Same 'x' wall affine as the floor plate: on this wall a larger gy is further left on screen, so the
+   * bitmap's left corner sits at gy + halfW. The bitmap's transparent margin becomes the green light
+   * spill on the wall; the plate itself is what reads as the sign.
+   *
+   * Drawn into the cached background with the walls: the sign is static, and everything in the room is
+   * in front of it, so the depth-sorted furniture naturally covers it when it passes in front.
+   */
+  function drawExitSign(c) {
+    const tc = makeExitSign(t('wall.exit'));
+    const W = tc.width;
+    const H = tc.height;
+    const halfH = 0.28;
+    const halfW = halfH * (W / H);
+    const { gy, gz } = WALL.exitSign;
+    const sD = project(0, gy + halfW, gz + halfH);
+    const sC = project(0, gy - halfW, gz + halfH);
+    const sA = project(0, gy + halfW, gz - halfH);
+    c.save();
+    c.transform((sC.x - sD.x) / W, (sC.y - sD.y) / W, (sA.x - sD.x) / H, (sA.y - sD.y) / H, sD.x, sD.y);
+    c.drawImage(tc, 0, 0);
+    c.restore();
+  }
+
+  /**
    * Metal vertical face (the divider's aluminum frame south / east face): screen-vertical gradient, from (gx,gy,z1) to (gx,gy,z0).
    * The gradient must take its coordinates hugging **the actual face** —— if you just take a vertical line at the origin by z,
    * the face is far outside the gradient range, and the part beyond it only gets the end color
@@ -2576,6 +2714,9 @@ export function createIsoOffice(canvas, opts = {}) {
     c.clip();
     wallQuad(c, 'x', -0.32, d.y0, d.y1, d.z0, d.z1, '#070a10');
     c.restore();
+    // Emergency-exit sign: on the same wall, left of the doorway and low (see WALL.exitSign). Static, so it
+    // belongs in this cached background rather than the per-frame sort layer.
+    drawExitSign(c);
     // Meeting room whiteboard (on the back wall's inner side): 0.09 aluminum frame + inner shadow under the frame + pen tray (markers / eraser).
     // A lone whiteboard looks too much like a sheet of paper —— the frame's thickness, the bright-top dark-bottom frame edge, and the pen tray protruding from the wall are what make it a "whiteboard".
     const wb = MEETING.whiteboard;

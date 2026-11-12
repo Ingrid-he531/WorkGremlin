@@ -103,9 +103,9 @@ async function runFrames(office, n = 40) {
   return null;
 }
 
-for (const [loc, busyWord, meetingWord] of [
-  ['zh', '忙碌', '会议室'],
-  ['en', 'Busy', 'Meeting room'],
+for (const [loc, busyWord, meetingWord, exitWord] of [
+  ['zh', '忙碌', '会议室', '安全出口'],
+  ['en', 'Busy', 'Meeting room', 'EXIT'],
 ]) {
   console.log(`\n[${loc}] 画布跑起来 + 文字跟着语言走`);
   setLocale(loc);
@@ -118,6 +118,7 @@ for (const [loc, busyWord, meetingWord] of [
   ok('小怪物进到屋里了（画布在正常出人）', Boolean(office.screenOf('coder@x')));
   ok(`名牌上的状态字是「${busyWord}」`, drawn.includes(busyWord), drawn.slice(0, 12).join(' | '));
   ok(`墙上的「${meetingWord}」也翻译了`, drawn.includes(meetingWord));
+  ok(`门边的安全出口牌上是「${exitWord}」`, drawn.includes(exitWord), drawn.filter((s) => /出口|EXIT/.test(s)).join(' | '));
 }
 
 setLocale('zh');
@@ -145,6 +146,10 @@ ok('the clock line is bold', /font2\s*=\s*'700\s+22px/.test(engineSrc));
 ok(
   'the plate hangs right of the door with its top level with the door casing',
   /plate:\s*\{\s*gy:\s*4\.2,\s*gz:\s*1\.59\s*\}/.test(mapSrc)
+);
+ok(
+  'the emergency-exit sign hangs left of the door, low on the wall',
+  /exitSign:\s*\{\s*gy:\s*10\.55,\s*gz:\s*0\.66\s*\}/.test(mapSrc)
 );
 ok('the old wall clock is gone', !/function\s+drawClock\s*\(/.test(engineSrc));
 plated.setFloorPlate('2F Cline', '10F DeepSeek Harness');
