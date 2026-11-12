@@ -643,7 +643,7 @@ head('[E] 插件写的状态文件能被认出来（真相位优先于轮询）'
       client: 'opencode',
       sessionId: sid,
       hb: { lastEventAt: at },
-      sessionPhase: { phase: 'await', ts: at, workspacePath: '/tmp/ProjO', tool: 'write', target: '/tmp/ProjO/z.txt' },
+      sessionPhase: { phase: 'await', ts: at, workspacePath: '/tmp/ProjO', tool: 'write', file: '/tmp/ProjO/z.txt' },
       done: { at, title: '插件这一轮', fileCount: 2, files: ['a.ts', 'b.ts'], workspacePath: '/tmp/ProjO', sessionId: sid },
     })
   );
@@ -657,6 +657,13 @@ head('[E] 插件写的状态文件能被认出来（真相位优先于轮询）'
   ok('8F 会话表列得出**还在超时窗口内**的会话', ids8.includes('ses_live0000000000000000000001') && ids8.includes('ses_done0000000000000000000001'), ids8.join(' '));
   ok('超时（60 分钟无动静）的会话已被剔除', !ids8.includes('ses_old00000000000000000000001'), ids8.join(' '));
   ok('clients = [opencode]（前端按它过滤相位与成员）', snap.floors.every((f) => f.id !== '8F' || JSON.stringify(f.clients) === JSON.stringify(['opencode'])));
+  // Regression (user report, 2026-11-12): the session table/office card still said "inferred" with the
+  // plugin installed. The poll source claims the session id first, so the hook source never gets to
+  // upsert; opencodeHandler must therefore prefer the reporter truth phase itself (as kiloHandler does).
+  const liveRow = f8 && f8.sessions.find((s) => s.id === sid);
+  ok('会话表里的相位来源也是插件真相位（await），不是轮询推断', Boolean(liveRow) && liveRow.phase === 'await', liveRow && liveRow.phase);
+  ok('inferred = false（UI 不再标"推断值"）', Boolean(liveRow) && liveRow.inferred === false, liveRow && String(liveRow.inferred));
+  ok('相位细节来自状态文件（tool/target/prompt）', Boolean(liveRow) && liveRow.tool === 'write' && liveRow.target === '/tmp/ProjO/z.txt', JSON.stringify(liveRow && { tool: liveRow.tool, target: liveRow.target }));
 
   // 真相位那一路：/reporter-phase 的组装逻辑（直接调函数，免得起服务）
   const { opencodeMainPhase, opencodeInstrumented } = require('../src/floorOpencode');

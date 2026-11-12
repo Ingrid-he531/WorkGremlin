@@ -1319,7 +1319,11 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
  * @param {object} ctx shared utilities provided by the framework
  */
 function opencodeHandler(p, src, ctx) {
-  const { claimSession, upsert, now, workspacePath, TIMEOUT_MS, readReporterDone, doneFieldsFromReporter } = ctx;
+  const {
+    claimSession, upsert, now, workspacePath, TIMEOUT_MS,
+    reporterTruthPhase,
+    readReporterDone, doneFieldsFromReporter,
+  } = ctx;
   for (const s of listOpencodeSessions()) {
     // Freshness is checked **before claiming**: this poll path and the plugin hook path describe the same
     // session id, and `claimSession` is first-come-first-served. Claiming a stale DB row here would block the
@@ -1328,8 +1332,13 @@ function opencodeHandler(p, src, ctx) {
     if (now - (Number(s.lastEventAt) || 0) >= TIMEOUT_MS) continue;
     if (!claimSession(p.id, s.id)) continue;
     const ph = readOpencodePhase(s.id) || null;
-    const doneTruth =
-      readReporterDone(s.projectPath || workspacePath, 'opencode', s.id);
+    const wsOfSession = s.projectPath || workspacePath;
+    // The plugin writes the same session's phase into its state file. Prefer that reported truth over the
+    // polled one (same rule as 7F's kiloHandler): otherwise the session table keeps showing the inferred
+    // phase even though the plugin is installed, because the poll source claims the session id before the
+    // hook source and the snapshot backfill only fills rows whose phase is still 'unreported'.
+    const truth = reporterTruthPhase(wsOfSession, 'opencode', s.id) || null;
+    const doneTruth = readReporterDone(wsOfSession, 'opencode', s.id);
     upsert({
       floor: p.id,
       id: s.id,
@@ -1343,14 +1352,14 @@ function opencodeHandler(p, src, ctx) {
       mine: Boolean(workspacePath && s.projectPath && path.resolve(s.projectPath) === path.resolve(workspacePath)),
       current: false,
       live: true,
-      phase: ph ? ph.phase : 'unreported',
-      action: ph ? ph.action : '',
-      target: ph ? ph.target : '',
-      tool: ph ? ph.tool : '',
-      context: ph ? ph.context : [],
-      prompt: (ph && ph.prompt) || '',
-      model: s.model || '',
-      inferred: true,
+      phase: truth ? truth.phase : ph ? ph.phase : 'unreported',
+      action: truth ? truth.action || '' : ph ? ph.action : '',
+      target: truth ? truth.target || '' : ph ? ph.target : '',
+      tool: truth ? truth.tool || '' : ph ? ph.tool : '',
+      context: truth ? truth.context || [] : ph ? ph.context : [],
+      prompt: truth ? truth.prompt || '' : (ph && ph.prompt) || '',
+      model: s.model || (truth && truth.model) || '',
+      inferred: !truth,
       ...(doneTruth && doneTruth.at ? doneFieldsFromReporter(doneTruth) : readOpencodeDone(s.id, s)),
       lastEventAt: s.lastEventAt,
     });
