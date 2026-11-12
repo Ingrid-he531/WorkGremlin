@@ -1106,6 +1106,60 @@ function writeTurnRun(repo, { id, projectId, memberId, sessionId, model, title, 
   return filesJson;
 }
 
+/**
+ * Close plugin-written ledger rows whose round has already finished in the source.
+ *
+ * The plugin keeps the running round's task id **in memory only** (`taskIds`). OpenCode reloads a plugin
+ * whenever its entry file changes, which is routine while the plugin itself is being developed: the map
+ * is wiped, `endTask()` then returns early and no `/task/end` is ever posted. Nothing else closes the row
+ * either: polling yields to the plugin for every round the plugin reported, and orphan reconciliation only
+ * fires once the session leaves the registry (up to 60 minutes), where the row is then closed as
+ * `orphan_session` instead of "done".
+ *
+ * The source of truth is opencode.db: a turn with `endedAt` means that round finished. A plugin row
+ * (anything without polling's own id prefix) whose `started_at` matches such a turn is closed with the
+ * turn's own end time, outcome and summary — exactly what the plugin's `/task/end` would have reported.
+ *
+ * @param {{bus: any, repo: any, projectId: string, memberId: string, sessionId: string,
+ *          runs: Array<{id: string, started_at: number}>, turns: Array<object>}} p
+ * @returns {number} how many rows were closed
+ */
+function healUnfinishedPluginRuns({ bus, repo, projectId, memberId, sessionId, runs, turns }) {
+  if (!Array.isArray(runs) || !runs.length || !Array.isArray(turns) || !turns.length) return 0;
+  const endedTurns = turns.filter((t) => Number(t.endedAt) > 0);
+  if (!endedTurns.length) return 0;
+  let closed = 0;
+  for (const run of runs) {
+    // Polling's own rows have their own lifecycle (written and retired by the loop below).
+    if (String(run.id).startsWith(TASK_ID_PREFIX)) continue;
+    const task = repo.getTask.get(run.id);
+    if (!task || task.state !== 'running') continue;
+    const startedAt = Number(run.started_at) || 0;
+    // Same tolerance as coveredBy: the plugin stamps Date.now() at start, the source stores the user
+    // message time, and the two differ by a few milliseconds.
+    const turn = endedTurns.find((t) => Math.abs(Number(t.startedAt) - startedAt) <= PLUGIN_COVER_MS);
+    if (!turn) continue;
+    try {
+      bus.endTask({
+        project: task.project_id || projectId,
+        memberId: task.member_id || memberId,
+        taskId: run.id,
+        sessionId,
+        // The same mapping as the ledger writes below: an interrupted round is "cancelled", not "finished".
+        state: turn.outcome === 'interrupted' ? 'cancelled' : 'done',
+        ts: Number(turn.endedAt),
+        endedAt: Number(turn.endedAt),
+        result: turn.result || '',
+        ...(turn.tokens ? { tokens: turn.tokens } : {}),
+      });
+      closed += 1;
+    } catch {
+      /* One row failing must not stall the floor's sync; the next tick retries it. */
+    }
+  }
+  return closed;
+}
+
 /** The round sequence number in the ledger id (`opencode:<session id>:<seq>`); null when it is not this shape (same as kilo.js) */
 function turnIndexOf(taskId, prefix) {
   const id = String(taskId || '');
@@ -1226,6 +1280,17 @@ function syncOpencodeTasks({ bus, repo, now: nowFn = Date.now }) {
     // and also collect the fallback rows polling itself grabbed earlier (only ids with our own prefix are
     // deleted; not one hair on the plugin's rows).
     const sessionRuns = runsOf.get(s.id);
+    // A plugin that lost its in-memory task id (hot reload) never posts /task/end; the source already
+    // knows that round is over, so close those rows whether or not this session is still plugin-owned.
+    healUnfinishedPluginRuns({
+      bus,
+      repo,
+      projectId,
+      memberId: `opencode@${projectId}`,
+      sessionId: s.id,
+      runs: sessionRuns,
+      turns: turnsOf.get(s.id) || [],
+    });
     if (yieldsOf(s)) {
       for (const r of sessionRuns) if (String(r.id).startsWith(TASK_ID_PREFIX)) repo.deleteTaskRun(r.id);
       continue;

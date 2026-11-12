@@ -834,6 +834,76 @@ app.use('/api/v1', createQueryRouter({ bus, repo }));
   repo.upsertTaskRun.run({ id: 't_oc_twin', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-twin', form: 'cli', model: null, title: '插件先落的那一轮', startedAt: ocTwinStart - 87, baselineCommit: null });
   ok('轮询一条都不写（这一轮插件报过，早 87 毫秒也算）', syncOpencodeTasks({ bus, repo }) === 0, JSON.stringify(repo.getTaskRun.get('opencode:oc-sid-twin:0')));
 
+  console.log('[7h] 8F：插件热重载丢了 taskId → 源里这一轮已收工，插件那行也要收尾');
+  // Regression: the plugin keeps the running round's taskId in memory only. Editing the plugin file
+  // (routine while developing it) makes OpenCode reload the instance mid-round, the map is wiped,
+  // endTask() returns early and /task/end is never sent. Polling yields to the plugin and orphan
+  // reconciliation waits up to 60 minutes, so the task sits at "running" (then turns into
+  // "cancelled/orphan_session" instead of "done"). The source says the turn finished at a known time.
+  const healStart = Date.now() - 20 * 60_000;
+  const healEnd = healStart + 4 * 60_000;
+  const healLive = Date.now() - 60_000;
+  opencodeRows = [
+    {
+      id: 'oc-sid-heal',
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      title: '热重载丢了 taskId',
+      model: '',
+      lastEventAt: healLive,
+      turns: [
+        {
+          index: 0,
+          prompt: '已收工的一轮',
+          startedAt: healStart,
+          endedAt: healEnd,
+          files: [],
+          result: '这一轮的收尾自述',
+          tokens: { input: 11, output: 22, cacheRead: 33, cacheWrite: 0 },
+        },
+        { index: 1, prompt: '还在跑的一轮', startedAt: healLive, endedAt: null, files: [] },
+      ],
+    },
+  ];
+  repo.insertTask.run({ id: 'k_heal_done', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '已收工的一轮', state: 'running', progress: null, startedAt: healStart + 9, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_heal_done', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-heal', form: 'cli', model: null, title: '已收工的一轮', startedAt: healStart + 9, baselineCommit: null });
+  repo.insertTask.run({ id: 'k_heal_live', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '还在跑的一轮', state: 'running', progress: null, startedAt: healLive - 1_000, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_heal_live', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-heal', form: 'cli', model: null, title: '还在跑的一轮', startedAt: healLive - 1_000, baselineCommit: null });
+  syncOpencodeTasks({ bus, repo });
+  const healedTask = repo.getTask.get('k_heal_done');
+  const healedRun = repo.getTaskRun.get('k_heal_done');
+  ok(
+    '插件那行收尾成 done，结束时间取源里这一轮的时间（不是"现在"）',
+    Boolean(healedTask) && healedTask.state === 'done' && Number(healedTask.ended_at) === healEnd,
+    `${healedTask && healedTask.state} / ${healedTask && healedTask.ended_at}`
+  );
+  ok(
+    '产出摘要与 token 一并补上（和插件自己上报一个样）',
+    Boolean(healedRun) && healedRun.result === '这一轮的收尾自述' && healedRun.input_tokens === 11 && healedRun.cache_read_tokens === 33,
+    JSON.stringify(healedRun && [healedRun.result, healedRun.input_tokens, healedRun.cache_read_tokens])
+  );
+  ok('源里还在跑的那一轮不碰', repo.getTask.get('k_heal_live').state === 'running', repo.getTask.get('k_heal_live').state);
+  ok('轮询仍然让位（不为这条会话另写 opencode: 行）', !repo.getTaskRun.get('opencode:oc-sid-heal:0'));
+
+  // The interrupted case must land on "cancelled": the plugin's /task/end maps idle.outcome=interrupted
+  // to a cancel, and the self-heal must not report a user-stopped round as finished.
+  const healIntStart = healStart - 10 * 60_000;
+  opencodeRows = [
+    {
+      id: 'oc-sid-heal-int',
+      project: 'p1',
+      projectPath: '/tmp/p1',
+      title: '被终止的一轮',
+      model: '',
+      lastEventAt: Date.now() - 9 * 60_000,
+      turns: [{ index: 0, prompt: '被终止的一轮', startedAt: healIntStart, endedAt: healIntStart + 2_000, outcome: 'interrupted', files: [] }],
+    },
+  ];
+  repo.insertTask.run({ id: 'k_heal_int', projectId: 'p1', memberId: 'opencode@p1', parentTaskId: null, title: '被终止的一轮', state: 'running', progress: null, startedAt: healIntStart, endedAt: null });
+  repo.upsertTaskRun.run({ id: 'k_heal_int', projectId: 'p1', memberId: 'opencode@p1', client: 'opencode', sessionId: 'oc-sid-heal-int', form: 'cli', model: null, title: '被终止的一轮', startedAt: healIntStart, baselineCommit: null });
+  syncOpencodeTasks({ bus, repo });
+  ok('被终止（idle.outcome=interrupted）的插件行记「已取消」', repo.getTask.get('k_heal_int').state === 'cancelled', repo.getTask.get('k_heal_int').state);
+
   console.log('[8] 9F：别的楼层的会话不许被写成 Copilot 台账（打开 VS Code 就冒「(Copilot 会话)」的根因）');
   // 回归（2026-09-30 用户实测）：9F 同步器原来用 listSessions 的**默认** PLUGIN_RE 去要会话清单，
   // 那一串里含 `/^tencent/` 与 `/coding-copilot/i` —— 本机上命中 Tencent CodeBuddy 的
