@@ -227,6 +227,12 @@ function sessionFromRow(r) {
     model: String(r.model || md.modelId || ''),
     form: String(r.source || '').toLowerCase() === 'vscode' ? 'vscode' : 'cli',
     status: String(r.status || ''),
+    // Which subsystem stamped the terminal state (Cline writes this into metadata on a stale-process
+    // reconcile). Only `stale_session_reconciler` needs the quiet-window rule (see sessionTerminal).
+    terminalMarkerSource: String(md.terminal_marker_source || ''),
+    // Cline creates a checkpoint when the user starts a new turn. `createdAt` is then the only on-disk
+    // evidence that a turn began before the conversation was written (see pendingTurnAt).
+    turnStartedAt: Number(md.checkpoint && md.checkpoint.latest && md.checkpoint.latest.createdAt) || 0,
     startedAt: timeOf(r.started_at) || 0,
     endedAt: timeOf(r.ended_at) || 0,
     lastEventAt: timeOf(r.updated_at) || 0,
@@ -311,6 +317,31 @@ const PHASE_FRESH_MS = 2 * 60_000;
 const DONE_TTL_MS = 10 * 60_000;
 const NO_DONE = { doneAt: 0, doneTitle: '', doneCount: 0, doneFiles: [], doneCancelled: false, doneSaid: '' };
 
+/**
+ * Cline's own "stale session" reconciler (metadata `terminal_marker_source`). It stamps a session
+ * `failed` when the pid recorded on its row is no longer alive. That is **not** a user stop: a VS Code
+ * session outlives its extension host — reloading the window changes the pid while the task keeps
+ * appending to the same session — so Cline re-stamps this marker on a session that is still working
+ * (measured on 4.1.26: roughly once a minute, each time `status='failed'` + `ended_at`). Trusting it
+ * immediately made the office drop the session ("no active session") and the ledger close the running
+ * turn as "cancelled" on every stamp, until the next transcript write brought it back.
+ *
+ * So the stamp only counts once the transcript itself has been quiet for `STALE_QUIET_MS`; a session
+ * that is still writing is alive no matter what the reconciler says. The window is deliberately longer
+ * than a single thinking step: one tool call can run for many minutes with no transcript write (measured
+ * on this store: a `run_commands` step took 9m25s), and dropping the session in the middle would make the
+ * office flap on every long command.
+ */
+const STALE_MARKER_SOURCE = 'stale_session_reconciler';
+const STALE_QUIET_MS = 20 * 60_000;
+
+/**
+ * Grace for "the checkpoint is newer than the transcript": Cline creates the checkpoint a fraction of a
+ * second after the prompt of a brand-new session is written, and that turn is already visible in the
+ * transcript. A real pending turn starts well after the transcript's last event (the previous reply).
+ */
+const PENDING_TURN_GRACE_MS = 2_000;
+
 /** Cline tool names that actually write/modify a file. Read-only tools (read_files, grep, glob, run_commands …) never count. */
 const WRITE_TOOLS = new Set(['write', 'edit', 'str_replace_editor', 'insert', 'apply_diff']);
 
@@ -381,6 +412,24 @@ function currentPrompt(convo) {
   return '';
 }
 
+/**
+ * Whether the user started a turn that the conversation has not recorded on disk yet.
+ *
+ * Cline 4.1.26 persists `messages.json` on assistant-message / iteration-end events only, so a follow-up
+ * prompt the user just submitted is **not** in it while the model is thinking (measured: a 08:58:13 prompt
+ * landed in the file at 09:01:24 together with the first assistant message). The checkpoint Cline creates
+ * at submit (`metadata.checkpoint.latest.createdAt`) is then the only on-disk evidence that a new turn
+ * began: newer than the transcript's last event ⇒ the turn is in flight, and the previous reply's phase
+ * and done marker must not be replayed.
+ *
+ * @param {{turnStartedAt?:number}} s session row
+ * @param {number} lastAt last transcript event (last message ts, or the file's mtime)
+ */
+function pendingTurnAt(s, lastAt) {
+  const started = Number(s && s.turnStartedAt) || 0;
+  return Boolean(started && lastAt && started > lastAt + PENDING_TURN_GRACE_MS);
+}
+
 /** A readable action for a `tool_use` item (command / files / path / tool name). */
 function toolAction(session, tu) {
   const input = tu && tu.input && typeof tu.input === 'object' ? tu.input : {};
@@ -420,6 +469,10 @@ function toolTarget(tu) {
  * is idle — otherwise an old reply would show as "just spoke". Polling can only use a time window, so every
  * phase carries `inferred: true`.
  *
+ * **A turn whose prompt is not on disk yet** (see pendingTurnAt) reports thinking with an empty prompt:
+ * Cline has started the turn but the conversation still ends on the previous reply, and replaying that
+ * reply/prompt would show the *previous* task while this one is running.
+ *
  * @param {string} sessionId
  * @returns {{phase,action,target,tool,context,prompt,model,inferred}|null}
  */
@@ -433,9 +486,10 @@ function readClinePhase(sessionId) {
   const prompt = currentPrompt(convo);
   const base = { action: '', target: '', tool: '', context: [], prompt, model: s.model || '', inferred: true };
   const last = convo.messages[convo.messages.length - 1];
+  const at = Number(last.ts) || 0;
+  if (pendingTurnAt(s, at)) return { phase: 'thinking', ...base, prompt: '' };
   const content = Array.isArray(last.content) ? last.content : [];
   const tail = content[content.length - 1];
-  const at = Number(last.ts) || 0;
   if (!tail || !at || Date.now() - at > PHASE_FRESH_MS) return { phase: 'idle', ...base };
   if (last.role === 'assistant') {
     if (tail.type === 'tool_use') {
@@ -463,6 +517,9 @@ function readClineDone(sessionId, meta = {}) {
   const content = Array.isArray(last && last.content) ? last.content : [];
   const tail = content[content.length - 1];
   const at = Number(last && last.ts) || 0;
+  // A newer turn started (its prompt is not in the conversation yet): the previous reply's closing text is
+  // not this turn's finish, so there is nothing to announce as done.
+  if (pendingTurnAt(s, at)) return NO_DONE;
   if (last && last.role === 'assistant' && tail && tail.type === 'text' && at && Date.now() - at <= DONE_TTL_MS) {
     return {
       doneAt: at,
@@ -599,7 +656,11 @@ function readClineRounds(sessionId) {
   // The trailing turn is still open. While the session itself is running that is genuine; once Cline marks
   // the session terminal (status completed/cancelled/failed/error, or an ended_at stamp), an open turn was
   // cancelled —— the transcript ends on a user prompt with no closing assistant text.
-  if (cur && !cur.endedAt && sessionTerminal(s)) closeOpen(s.endedAt || cur.lastAt);
+  // A stale-process stamp is re-written long after the session actually went quiet, so the transcript's own
+  // last activity is the honest end time there (the reconciler's ended_at would stretch the turn to "now").
+  if (cur && !cur.endedAt && sessionTerminal(s)) {
+    closeOpen(s.terminalMarkerSource === STALE_MARKER_SOURCE ? cur.lastAt : s.endedAt || cur.lastAt);
+  }
   if (rounds.length && s.tokens) rounds[rounds.length - 1].tokens = s.tokens;
   return rounds;
 }
@@ -607,11 +668,36 @@ function readClineRounds(sessionId) {
 /** Cline's own terminal session statuses (from @cline/core): the session is over, no further turn will run. */
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'failed', 'error']);
 
+/**
+ * Last write to this session's transcript (ms), 0 when there is no readable file. The conversation file
+ * is rewritten on every append, so its mtime is a cheap "is anything still being written here" probe —
+ * unlike `updated_at`, which the stale-session reconciler keeps bumping on every stamp.
+ */
+function transcriptAt(s) {
+  const p = (s && s.messagesPath) || '';
+  if (!p) return 0;
+  try {
+    return Number(fs.statSync(p).mtimeMs) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Whether Cline has marked this session terminal (an ended_at stamp, or a terminal status). */
 function sessionTerminal(s) {
   if (!s) return false;
-  if (Number(s.endedAt) > 0) return true;
-  return TERMINAL_STATUSES.has(String(s.status || '').toLowerCase());
+  const stamped = Number(s.endedAt) > 0 || TERMINAL_STATUSES.has(String(s.status || '').toLowerCase());
+  if (!stamped) return false;
+  // A stale-reconciler stamp is a *process* observation (the recorded pid is gone), not a task outcome.
+  // A VS Code session survives its extension host and keeps writing the same conversation under the old
+  // pid, so this stamp reappears on a live session — only accept it once the transcript went quiet.
+  // A turn whose prompt has not been written yet (pendingTurnAt) also keeps the session alive.
+  if (s.terminalMarkerSource === STALE_MARKER_SOURCE) {
+    const lastWrite = transcriptAt(s);
+    if (lastWrite && Date.now() - lastWrite < STALE_QUIET_MS) return false;
+    if (pendingTurnAt(s, lastWrite)) return false;
+  }
+  return true;
 }
 
 const SUBAGENT_TOOL_PREFIX = 'subagent_';
@@ -932,7 +1018,8 @@ function clineHandler(p, src, ctx) {
     // registry row right away instead of keeping it for the whole 60-minute window. The dropdown lists
     // "sessions you can watch"; a finished one is no longer watchable, and the time window meant a
     // finished — or since deleted — session still showed as active. `sessionTerminal` is the same yardstick
-    // the cancel detection uses (never invent a second one).
+    // the cancel detection uses (never invent a second one) — including its stale-reconciler carve-out:
+    // that stamp is re-written on live VS Code sessions and must not drop a working one.
     //
     // The task ledger is untouched: syncTasks still walks listClineSessions (not this registry path) and
     // writes every round, so "task cancelled" stays visible in the task records. Only 2F has this signal;

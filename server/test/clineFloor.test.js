@@ -34,6 +34,10 @@
  *     [G1] a session whose title carries COUNCIL_PROMPT_MARKER is skipped; a mere mention is not
  *   H. Terminal sessions
  *     [H1] a finished (terminal) session is not listed; [H2] its existing registry row is retracted; [H3] in-flight ones stay
+ *   K. Stale-process stamp (Cline 4.1.26 `stale_session_reconciler`)
+ *     [K1..K5] a stamp on a transcript that is still being written is not terminal; only a quiet one is
+ *   L. A turn whose prompt is not on disk yet (checkpoint newer than the transcript)
+ *     [L1..L4] thinking with an empty prompt, no replayed "task done", the session stays listed; [L5] done sessions unaffected
  */
 'use strict';
 
@@ -126,6 +130,12 @@ function writeConvo(id, messages, updatedAt) {
   return p;
 }
 
+/** Backdate a file's mtime ("this transcript stopped being written N ms ago"). */
+function touch(file, at) {
+  const d = new Date(at);
+  fs.utimesSync(file, d, d);
+}
+
 const text = (t) => ({ type: 'text', text: t });
 const thinking = () => ({ type: 'thinking', thinking: '……' });
 const toolUse = (name, input = {}) => ({ type: 'tool_use', id: `call-${Math.random().toString(36).slice(2)}`, name, input });
@@ -134,9 +144,18 @@ const userInput = (t) => ({ type: 'text', text: `<user_input mode="act">${t}</us
 const msg = (role, content, ts) => ({ id: `msg_${Math.random().toString(36).slice(2)}`, role, content, ts });
 
 /** One sessions-table record (updated ~1 second ago by default). */
-function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath, status = 'idle', endedAt = 0, parentSessionId = null, prompt = '', startedAt = 0 } = {}) {
+function row(id, { source = 'vscode', model = 'cline-free/nemotron', cwd = '/tmp/proj', title = '', tokens = null, at = Date.now(), isSubagent = 0, messagesPath, status = 'idle', endedAt = 0, parentSessionId = null, prompt = '', startedAt = 0, terminalMarkerSource = '', turnStartedAt = 0 } = {}) {
   const md = { title };
   if (tokens) md.aggregateUsage = { inputTokens: tokens.input, outputTokens: tokens.output, cacheReadTokens: tokens.cacheRead, cacheWriteTokens: tokens.cacheWrite };
+  // Cline creates a checkpoint when the user starts a turn; its createdAt is the only on-disk
+  // evidence of a turn whose prompt is not written to the conversation yet.
+  if (turnStartedAt) md.checkpoint = { latest: { ref: 'deadbeef', createdAt: turnStartedAt, runCount: 1, kind: 'stash' } };
+  // Cline's stale-session reconciler stamps these into the session metadata.
+  if (terminalMarkerSource) {
+    md.terminal_marker = 'failed_external_process_exit';
+    md.terminal_marker_at = ISO(endedAt || at);
+    md.terminal_marker_source = terminalMarkerSource;
+  }
   return {
     session_id: id,
     source,
@@ -208,6 +227,31 @@ const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
     msg('user', [userInput('第二轮')], NOW - 3 * MIN),
     msg('assistant', [thinking(), text('第二轮完成')], NOW - 2 * MIN),
   ], NOW - 2 * MIN);
+  // Cline 4.1.26's stale-session reconciler stamped a session `failed` while it is still writing: a VS Code
+  // session outlives its extension host, so the recorded pid is gone but the task keeps appending here.
+  const pStaleLive = writeConvo('cli-stale-live', [
+    msg('user', [userInput('把茶水间的杯子改成马克杯')], NOW - 60_000),
+    msg('assistant', [thinking(), toolUse('read_files', { files: [{ path: '/tmp/proj/a.js' }] })], NOW - 2_000),
+    msg('user', [toolResult()], NOW - 1_000),
+  ], NOW - 1_000);
+  // The same stamp on a transcript that really stopped more than STALE_QUIET_MS (20 min) ago: that one is a stop.
+  const pStaleDead = writeConvo('cli-stale-dead', [
+    msg('user', [userInput('很久没动那轮')], NOW - 22 * MIN),
+    msg('user', [toolResult()], NOW - 21 * MIN),
+  ], NOW - 21 * MIN);
+  touch(pStaleDead, NOW - 21 * MIN);
+  // A follow-up prompt Cline has accepted but not written to the conversation yet: the checkpoint is newer
+  // than the last message, so the previous reply's "done" and phase must not be replayed.
+  const pPending = writeConvo('cli-pending', [
+    msg('user', [userInput('上一轮')], NOW - 6 * MIN),
+    msg('assistant', [thinking(), text('上一轮完成了。')], NOW - 5 * MIN),
+  ], NOW - 5 * MIN);
+  // Same, but the old transcript is already beyond the stale quiet window: the plugin must still be kept.
+  const pPendingLong = writeConvo('cli-pending-long', [
+    msg('user', [userInput('很久以前')], NOW - 26 * MIN),
+    msg('user', [toolResult()], NOW - 25 * MIN),
+  ], NOW - 25 * MIN);
+  touch(pPendingLong, NOW - 25 * MIN);
 
   makeClineDb(MAIN_DB, [
     row('cli-tool', { messagesPath: pTool, title: '跑测试', model: 'cline-free/nemotron' }),
@@ -218,6 +262,10 @@ const MAIN_DB = path.join(DATA, 'db', 'sessions.db');
     row('cli-hist', { messagesPath: pHist, title: '两轮会话', tokens: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0 } }),
     row('cli-cancel-end', { messagesPath: pCancelEnd, title: '被取消那轮', status: 'cancelled', endedAt: NOW - 90_000 }),
     row('cli-cancel-next', { messagesPath: pCancelNext, title: '取消后重试' }),
+    row('cli-stale-live', { messagesPath: pStaleLive, title: '还在跑', status: 'failed', endedAt: NOW - 1_000, at: NOW - 1_000, terminalMarkerSource: 'stale_session_reconciler' }),
+    row('cli-stale-dead', { messagesPath: pStaleDead, title: '确实停了', status: 'failed', endedAt: NOW - 21 * MIN, at: NOW - 21 * MIN, terminalMarkerSource: 'stale_session_reconciler' }),
+    row('cli-pending', { messagesPath: pPending, title: '新一轮刚开始', status: 'failed', endedAt: NOW - 60_000, at: NOW - 60_000, terminalMarkerSource: 'stale_session_reconciler', turnStartedAt: NOW - 60_000 }),
+    row('cli-pending-long', { messagesPath: pPendingLong, title: '等首条回复', status: 'failed', endedAt: NOW - 2 * MIN, at: NOW - 2 * MIN, terminalMarkerSource: 'stale_session_reconciler', turnStartedAt: NOW - 2 * MIN }),
     row('cli-sub', { messagesPath: pTool, title: '子代理', isSubagent: 1 }),
     // A council participant: Cline stores the prompt itself as the session title, and the council prompt
     // always opens with COUNCIL_PROMPT_MARKER. 2F must skip it (else in workspace mode it would surface on
@@ -350,6 +398,87 @@ head('[H] 终态会话立刻回收（源里标了结束就不进下拉）');
   ok('[H1] 终态会话不进下拉', !upserts.some((e) => e.id === 'cli-cancel-end'), JSON.stringify(upserts.map((e) => e.id)));
   ok('[H2] 已存在的终态行被撤回', !table.has('2F:cli-cancel-end'));
   ok('[H3] 在飞的会话照常列出（不误伤）', upserts.some((e) => e.id === 'cli-hist'), JSON.stringify(upserts.map((e) => e.id)));
+}
+
+head('[K] 陈旧进程标记：转录还在写就仍是活的');
+{
+  // Cline 4.1.26's stale-session reconciler stamps `failed` + `ended_at` when the pid recorded on the row is
+  // gone. A VS Code session outlives its extension host (a window reload changes the pid while the task keeps
+  // writing the same conversation), so Cline re-stamps it on a live session — roughly once a minute. While
+  // the transcript is fresh that stamp is not a stop: the turn is running and must not light "task cancelled".
+  const roundsLive = cline.readClineRounds('cli-stale-live');
+  const rLive = roundsLive[roundsLive.length - 1] || {};
+  ok('[K1] 转录仍在写 → 尾巴那轮保持 running', rLive.outcome === 'running' && !rLive.endedAt, JSON.stringify(rLive));
+  const dLive = cline.readClineDone('cli-stale-live', {});
+  ok('[K2] 不亮「任务取消」', !dLive.doneAt && dLive.doneCancelled === false, JSON.stringify(dLive));
+
+  // The same stamp on a transcript that has really been quiet for longer than the window is a stop.
+  const roundsDead = cline.readClineRounds('cli-stale-dead');
+  const rDead = roundsDead[roundsDead.length - 1] || {};
+  ok('[K3] 转录停了超过窗口 → 那轮判 cancelled', rDead.outcome === 'cancelled' && Number(rDead.endedAt) > 0, JSON.stringify(rDead));
+  ok(
+    '[K3] 结束时间取转录最后活动，而非后来重写的 ended_at',
+    Number(rDead.endedAt) <= NOW - 20 * MIN,
+    JSON.stringify({ endedAt: rDead.endedAt, windowStart: NOW - 20 * MIN })
+  );
+
+  // The dropdown: keep the session that is still writing, reclaim the one that really stopped.
+  const table = new Map();
+  const upserts = [];
+  const ctx = {
+    claimSession: () => true,
+    upsert: (e) => {
+      upserts.push(e);
+      table.set(`${e.floor}:${e.id}`, e);
+    },
+    now: Date.now(),
+    workspacePath: '',
+    TIMEOUT_MS: 60 * 60_000,
+    reporterTruthPhase: () => null,
+    readReporterDone: () => null,
+    doneFieldsFromReporter: () => ({}),
+    table,
+  };
+  table.set('2F:cli-stale-live', { floor: '2F', id: 'cli-stale-live' });
+  table.set('2F:cli-stale-dead', { floor: '2F', id: 'cli-stale-dead' });
+  cline.kindHandlers.cline({ id: '2F' }, { kind: 'cline', client: 'cline' }, ctx);
+  ok('[K4] 还在写的会话留在下拉里', upserts.some((e) => e.id === 'cli-stale-live') && table.has('2F:cli-stale-live'), JSON.stringify(upserts.map((e) => e.id)));
+  ok('[K5] 真停了的会话被撤回', !upserts.some((e) => e.id === 'cli-stale-dead') && !table.has('2F:cli-stale-dead'), JSON.stringify(upserts.map((e) => e.id)));
+}
+
+head('[L] 新一轮的提示词还没落盘（Cline 只在 assistant/iteration 结束时写 messages.json）');
+{
+  // Cline 4.1.26 creates a checkpoint at submit; while the model is thinking the conversation still ends on
+  // the previous reply. The checkpoint is newer than the last message → the new turn is in flight.
+  const ph = cline.readClinePhase('cli-pending') || {};
+  ok('[L1] 新一轮进行中 → 思考中（不回放上一轮的 idle）', ph.phase === 'thinking', JSON.stringify(ph));
+  ok('[L2] 新提示词还读不到 → prompt 留空，不冒充上一轮的原话', ph.prompt === '', JSON.stringify(ph.prompt));
+  const d = cline.readClineDone('cli-pending', {});
+  ok('[L3] 上一轮的收尾文字不再算「任务完成」', !d.doneAt && d.doneCancelled === false, JSON.stringify(d));
+
+  // The old transcript is beyond the stale quiet window, but the pending turn keeps the session alive.
+  const table = new Map();
+  const upserts = [];
+  const ctx = {
+    claimSession: () => true,
+    upsert: (e) => {
+      upserts.push(e);
+      table.set(`${e.floor}:${e.id}`, e);
+    },
+    now: Date.now(),
+    workspacePath: '',
+    TIMEOUT_MS: 60 * 60_000,
+    reporterTruthPhase: () => null,
+    readReporterDone: () => null,
+    doneFieldsFromReporter: () => ({}),
+    table,
+  };
+  table.set('2F:cli-pending-long', { floor: '2F', id: 'cli-pending-long' });
+  cline.kindHandlers.cline({ id: '2F' }, { kind: 'cline', client: 'cline' }, ctx);
+  const live = upserts.find((e) => e.id === 'cli-pending-long');
+  ok('[L4] 转录已静默超窗，但新一轮在跑 → 会话仍在下拉里', Boolean(live) && table.has('2F:cli-pending-long'), JSON.stringify(upserts.map((e) => e.id)));
+  ok('[L4] 同样显示思考中', live && live.phase === 'thinking', live && live.phase);
+  ok('[L5] 已完成的普通会话不受影响（仍按转录收尾判 done）', (cline.readClineDone('cli-idle', {}) || {}).doneAt > 0);
 }
 
 head('[I] 静态子代理：Cline 的 YAML / YML 定义进入名册');
