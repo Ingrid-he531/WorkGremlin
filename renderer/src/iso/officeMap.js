@@ -216,11 +216,21 @@ export const WALL = {
   ],
   /**
    * Main door: cut into the left wall (the gx = 0 face), not the back wall.
-   * That wall also holds the clock (cy 6.6); the door sits to the clock's left —— on this wall, a larger gy is further left on screen.
+   * On this wall a larger gy is further left on screen, so gy < y0 is the door's right-hand side and
+   * gy > y1 is its left-hand side.
    * @property {number} y0 start of the doorway along gy
    * @property {number} y1 end of the doorway along gy
    */
   door: { y0: 8.4, y1: 9.4, z0: 0, z1: 2.05 },
+  /**
+   * Floor plate on this same left wall, **centered in the stretch to the right of the door**
+   * (gy 0 .. door.y0, midpoint 4.2). Its width is fixed by the longest floor name (see engine.js),
+   * so switching floors never resizes it and the two lines (floor name + clock) stay centered.
+   * @property {number} gy center along gy
+   * @property {number} gz center height: the plate is 1.1 tall, so 1.59 puts its top edge at 2.14 —
+   *   level with the door casing top (door.z1 + 0.09) and on the same slanted line on screen
+   */
+  plate: { gy: 4.2, gz: 1.59 },
 };
 
 /* ------------------------------------------------------------------ *
@@ -593,7 +603,7 @@ const EDGES = [
   // vertical connections on both sides
   ['B06', 'M06'], ['M06', 'F06'],
   ['B134', 'M134'], ['M134', 'F134'],
-  // Main door (left wall, left of the clock) → mid / front aisles (both on the west walkway at x<1, not crossing workstations)
+  // Main door (left wall) → mid / front aisles (both on the west walkway at x<1, not crossing workstations)
   ['M06', 'DOOR'], ['F06', 'DOOR'],
   // Workstations: each side's aisle → seat. A face-to-face double desk's chairs are all on the **outer side**,
   // so the people on each side walk straight in from their own side's aisle (no more turning point "around the divider gap").

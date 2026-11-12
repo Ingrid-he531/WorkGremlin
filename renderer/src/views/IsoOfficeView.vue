@@ -636,6 +636,25 @@ const sceneMembers = computed(() => {
     }));
 });
 
+/**
+ * First line of the plate hung to the right of the office door ("1F CodeBuddy" / "2F Cline" …). The
+ * product name comes from the server's floor list, so the office never invents a name of its own.
+ * Empty until that list arrives; the engine leaves the wall bare until then.
+ */
+const floorPlateText = computed(() => {
+  const f = (sessions.floors || []).find((x) => x.id === sessions.selectedFloor);
+  return f && f.name ? `${f.id} ${f.name}` : '';
+});
+
+/** Longest floor label: the engine measures the plate's fixed width from it, so both lines stay
+    centered and switching floors never resizes the plate. */
+const floorPlateWidthText = computed(() =>
+  (sessions.floors || []).reduce((longest, f) => {
+    const label = f && f.name ? `${f.id} ${f.name}` : '';
+    return label.length > longest.length ? label : longest;
+  }, '')
+);
+
 watch(sceneMembers, (v) => {
   // Everyone is gone (switched to an empty floor): take down the open workstation card too, do not leave a previous floor member's task card hanging
   if (!v.length) card.value = null;
@@ -651,6 +670,9 @@ watch(
   () => sessions.selectedFloor,
   (v) => office && office.setFloor(v)
 );
+// The floor list is fetched asynchronously (and replaced on every snapshot): keep the door plate's
+// text and its fixed-width ruler in sync when the floor or the floor list changes.
+watch([floorPlateText, floorPlateWidthText], ([text, widthText]) => office && office.setFloorPlate(text, widthText));
 watch(mainAgentState, (v) => office && office.setMainAgent(v));
 
 /* ------------------------------ Task card ------------------------------ */
@@ -707,14 +729,14 @@ function dismiss() {
 function resetView() {
   if (!office) return;
   office.destroy();
-  office = createIsoOffice(canvasRef.value, { onSelect: openCard, floor: sessions.selectedFloor });
+  office = createIsoOffice(canvasRef.value, { onSelect: openCard, floor: sessions.selectedFloor, floorPlate: floorPlateText.value, floorPlateWidthText: floorPlateWidthText.value });
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);
 }
 
 onMounted(() => {
-  office = createIsoOffice(canvasRef.value, { onSelect: openCard, floor: sessions.selectedFloor });
+  office = createIsoOffice(canvasRef.value, { onSelect: openCard, floor: sessions.selectedFloor, floorPlate: floorPlateText.value, floorPlateWidthText: floorPlateWidthText.value });
   office.setMembers(sceneMembers.value);
   office.setSelected(props.selectedId);
   office.setMainAgent(mainAgentState.value);

@@ -121,5 +121,47 @@ for (const [loc, busyWord, meetingWord] of [
 }
 
 setLocale('zh');
+
+console.log('\n[plate] Fixed-width two-line door plate with a live clock');
+const fs = await import('node:fs');
+const engineSrc = fs.readFileSync(new URL('../src/iso/engine.js', import.meta.url), 'utf8');
+const mapSrc = fs.readFileSync(new URL('../src/iso/officeMap.js', import.meta.url), 'utf8');
+const timeRe = /^\d{2}:\d{2}:\d{2}$/;
+drawn.length = 0;
+const plated = createIsoOffice(fakeCanvas(), {
+  floorPlate: '1F CodeBuddy',
+  floorPlateWidthText: '10F DeepSeek Harness',
+});
+let plateErr = await runFrames(plated, 2);
+ok('the plate does not break the frame loop', !plateErr, plateErr && plateErr.message);
+ok('line 1 shows the floor label', drawn.includes('1F CodeBuddy'), drawn.slice(0, 12).join(' | '));
+ok('line 2 shows a live HH:mm:ss clock', drawn.some((s) => timeRe.test(s)), drawn.slice(0, 12).join(' | '));
+ok('the fixed width is measured from the longest floor label', /measureText\(floorPlateWidthText\)/.test(engineSrc));
+ok(
+  'both lines are centered',
+  /textAlign\s*=\s*'center'/.test(engineSrc.slice(engineSrc.indexOf('function makeFloorPlate')))
+);
+ok('the clock line is bold', /font2\s*=\s*'700\s+22px/.test(engineSrc));
+ok(
+  'the plate hangs right of the door with its top level with the door casing',
+  /plate:\s*\{\s*gy:\s*4\.2,\s*gz:\s*1\.59\s*\}/.test(mapSrc)
+);
+ok('the old wall clock is gone', !/function\s+drawClock\s*\(/.test(engineSrc));
+plated.setFloorPlate('2F Cline', '10F DeepSeek Harness');
+drawn.length = 0;
+plateErr = await runFrames(plated, 2);
+ok(
+  'switching floors keeps the plate and the clock',
+  !plateErr && drawn.includes('2F Cline') && drawn.some((s) => timeRe.test(s)),
+  plateErr && plateErr.message
+);
+plated.setFloorPlate('');
+drawn.length = 0;
+await runFrames(plated, 2);
+ok(
+  'no floor name leaves the wall bare',
+  !drawn.includes('2F Cline') && !drawn.includes('1F CodeBuddy') && !drawn.some((s) => timeRe.test(s))
+);
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

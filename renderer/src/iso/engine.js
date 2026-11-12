@@ -253,9 +253,11 @@ function makeWallText(text) {
 
 /**
  * @param {HTMLCanvasElement} canvas
- * @param {{onSelect?: (id: string) => void, floor?: string}} [opts]
+ * @param {{onSelect?: (id: string) => void, floor?: string, floorPlate?: string, floorPlateWidthText?: string}} [opts]
  *   floor: current floor id (e.g. '1F' / '3F' / '5F'). Used to pick this floor's material palette (see officeMap's colorsFor),
  *   and can later be switched at runtime with setFloor().
+ *   floorPlate: first line of the plate beside the door (e.g. '1F CodeBuddy'); updated with setFloorPlate().
+ *   floorPlateWidthText: the longest floor label, used to measure the plate's fixed width.
  */
 export function createIsoOffice(canvas, opts = {}) {
   const ctx = canvas.getContext('2d');
@@ -263,6 +265,10 @@ export function createIsoOffice(canvas, opts = {}) {
   /** This floor's palette: material tokens that change per floor (dividers / metal / wood), the rest follows the base */
   let colors = colorsFor(opts.floor);
   let floorId = opts.floor || '';
+  /** First line of the door plate: the floor id plus this floor's product name (see setFloorPlate) */
+  let floorPlate = String(opts.floorPlate || '');
+  /** Longest floor label: the ruler for the plate's fixed width, so switching floors never resizes it */
+  let floorPlateWidthText = String(opts.floorPlateWidthText || opts.floorPlate || '');
 
   let W = 0;
   let H = 0;
@@ -2266,7 +2272,7 @@ export function createIsoOffice(canvas, opts = {}) {
     door.a = want > door.a ? Math.min(1, door.a + step) : Math.max(0, door.a - step);
   }
 
-  /** Landing point of the door leaf's free edge: rotate DOOR_OPEN_DEG into the room around the hinge (on the doorway's clock side gy = y0) */
+  /** Landing point of the door leaf's free edge: rotate DOOR_OPEN_DEG into the room around the hinge (doorway side gy = y0, the end nearer the floor plate) */
   function doorLeafEdge() {
     const d = WALL.door;
     const w = d.y1 - d.y0;
@@ -2460,7 +2466,7 @@ export function createIsoOffice(canvas, opts = {}) {
       });
     });
 
-    /* Door (left wall gx = 0, hanging to the left of the clock. The wall switched sides -> use the 'x' face, the a axis becomes gy):
+    /* Door (left wall gx = 0; the floor plate hangs to its right at smaller gy). The wall switched sides -> use the 'x' face, the a axis becomes gy):
        here we draw only the **door casing + doorway**; the swinging leaf is drawn per frame in the sort layer (see drawDoor) ——
        drawn into the background cache it could never be pushed open (the cache is only redrawn when the camera changes).
        Inside the opening is the small corridor outside the wall: step back a layer and darken a notch to get the depth of "seeing through". */
@@ -2505,80 +2511,83 @@ export function createIsoOffice(canvas, opts = {}) {
   }
 
   /**
-   * Left-wall clock (the gx = 0 wall; the door is also on this wall, to the left of the clock at the larger gy end).
-   * The second hand moves, so it is drawn every frame —— drawn into the cached background it would freeze at the first second.
-   * The wall is slanted in isometric, so like the nameplate it is skew-mapped using the wall's own two axes as the local basis.
-   * Hung high enough (cz > 1.4) that furniture cannot cover it: in isometric the wall height furniture can block = object height − object distance to the wall.
+   * The door plate replaces the old wall clock: a **fixed-width**, two-line sign on the gx=0 wall,
+   * centered in the stretch to the right of the door (see WALL.plate). Line 1 is the floor label,
+   * line 2 is a live HH:mm:ss clock. It is drawn every frame (the cached background would freeze the
+   * clock). Its top edge lines up with the door casing (see WALL.plate), so it hangs lower than the old
+   * wall clock did.
+   *
+   * The bitmap is measured from the **longest** floor label, not the current one, so switching floors
+   * never changes the plate's size and both lines stay centered. One offscreen canvas is reused and
+   * redrawn once per second, so a ticking clock never grows a per-text bitmap cache.
    */
-  function drawClock(c) {
-    const cy = 6.6;
-    const cz = 2.15;
-    const r = 0.45;
-    /** How long 1 screen pixel is in local coordinates (unit tile) —— so line width does not thicken with zoom */
-    const px = 1 / (UNIT_Z * cam.zoom);
+  /** Reused offscreen bitmap for the door plate + the key it was last painted with */
+  let plateBitmap = null;
+  let plateBitmapKey = '';
+
+  function plateClock() {
     const d = new Date();
-    const turn = (v, unit) => ((v % unit) / unit) * Math.PI * 2;
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
 
-    const o = project(0, cy, cz);
+  function makeFloorPlate() {
+    const time = plateClock();
+    const key = `${floorPlate}|${floorPlateWidthText}|${time}`;
+    if (plateBitmap && plateBitmapKey === key) return plateBitmap;
+    const off = plateBitmap || document.createElement('canvas');
+    const font1 = '600 30px ui-sans-serif, system-ui, sans-serif';
+    const font2 = '700 22px ui-sans-serif, system-ui, sans-serif';
+    let g = off.getContext('2d');
+    g.font = font1;
+    const padX = 18;
+    const padY = 12;
+    const gap = 8;
+    // Fixed width: the longest floor label plus padding rules every floor, so the plate never resizes.
+    const w = Math.max(180, Math.ceil(g.measureText(floorPlateWidthText).width) + padX * 2);
+    const h = 30 + gap + 22 + padY * 2;
+    off.width = w;
+    off.height = h;
+    // Changing width/height clears the context, so get it again
+    g = off.getContext('2d');
+    // Plate background (rounded dark + blue border), same language as the other wall signs
+    roundRectPath(g, 0.75, 0.75, w - 1.5, h - 1.5, 10);
+    g.fillStyle = 'rgba(18,24,34,0.82)';
+    g.fill();
+    g.lineWidth = 1.5;
+    g.strokeStyle = 'rgba(127,176,255,0.55)';
+    g.stroke();
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.shadowColor = 'rgba(0,0,0,0.6)';
+    g.shadowBlur = 4;
+    g.font = font1;
+    g.fillStyle = '#eaf1fb';
+    g.fillText(floorPlate, w / 2, padY + 15);
+    g.font = font2;
+    g.fillStyle = '#9fc3ff';
+    g.fillText(time, w / 2, padY + 30 + gap + 11);
+    plateBitmap = off;
+    plateBitmapKey = key;
+    return off;
+  }
+
+  function drawFloorPlate(c) {
+    if (!floorPlate) return; // floor list has not arrived yet: leave the wall bare
+    const tc = makeFloorPlate();
+    const W = tc.width;
+    const H = tc.height;
+    const halfH = 0.55;
+    // Keep the plate inside the wall stretch right of the door even for a very long product name.
+    const halfW = Math.min(halfH * (W / H), WALL.plate.gy - 0.4);
+    // gx is constant on this wall; -gy is the viewer's right, so the bitmap's left corner is at the
+    // larger gy. Copying the back-wall corners would mirror both lines.
+    const sD = project(0, WALL.plate.gy + halfW, WALL.plate.gz + halfH);
+    const sC = project(0, WALL.plate.gy - halfW, WALL.plate.gz + halfH);
+    const sA = project(0, WALL.plate.gy + halfW, WALL.plate.gz - halfH);
     c.save();
-    // Local coordinates: u along -gy (the "right hand side" when standing in front of this wall), v downward, unit tile, center at (0,0).
-    // Note it cannot be along +gy: that would mirror the whole dial (3 o'clock to the left, the second hand turning backwards).
-    // The back wall uses +gx = AX because the back wall's right hand side happens to be +gx; not every "axis along the wall" can be copied.
-    c.transform(-AY.x, -AY.y, -AZ.x, -AZ.y, o.x, o.y);
-    /** Draw a hand from (tail) to (len) at angle a: 0 = 12 o'clock, clockwise */
-    const hand = (a, len, w, color, tail = 0) => {
-      const s = Math.sin(a);
-      const k = -Math.cos(a);
-      c.beginPath();
-      c.moveTo(s * tail, k * tail);
-      c.lineTo(s * len, k * len);
-      c.strokeStyle = color;
-      c.lineWidth = w * px;
-      c.lineCap = 'round';
-      c.stroke();
-    };
-
-    // Shadow cast on the wall (offset a bit to the lower-right, so the clock has thickness)
-    c.beginPath();
-    c.arc(2 * px, 3 * px, r + 1 * px, 0, Math.PI * 2);
-    c.fillStyle = 'rgba(0,0,0,0.35)';
-    c.fill();
-    // Bezel
-    c.beginPath();
-    c.arc(0, 0, r, 0, Math.PI * 2);
-    c.fillStyle = '#12161d';
-    c.fill();
-    // Dial
-    c.beginPath();
-    c.arc(0, 0, r - 3 * px, 0, Math.PI * 2);
-    c.fillStyle = '#e8edf5';
-    c.fill();
-    c.strokeStyle = '#9aa7b8';
-    c.lineWidth = 1 * px;
-    c.stroke();
-    // 12 tick marks, with 3/6/9/12 drawn a bit longer
-    for (let i = 0; i < 12; i += 1) {
-      const long = i % 3 === 0;
-      hand(
-        (i / 12) * Math.PI * 2,
-        r - (long ? 6 : 4) * px,
-        long ? 2 : 1.2,
-        '#3a4454',
-        r - 9 * px
-      );
-    }
-    // Hour / minute / second hands: the second hand moves continuously, with a tail segment
-    const sec = d.getSeconds() + d.getMilliseconds() / 1000;
-    const min = d.getMinutes() + sec / 60;
-    const hour = (d.getHours() % 12) + min / 60;
-    hand(turn(hour, 12), r * 0.5, 3.4, '#2c3442');
-    hand(turn(min, 60), r * 0.72, 2.4, '#2c3442');
-    hand(turn(sec, 60), r * 0.78, 1.3, '#e0574f', -r * 0.2);
-    // Center pivot
-    c.beginPath();
-    c.arc(0, 0, 2.6 * px, 0, Math.PI * 2);
-    c.fillStyle = '#2c3442';
-    c.fill();
+    c.transform((sC.x - sD.x) / W, (sC.y - sD.y) / W, (sA.x - sD.x) / H, (sA.y - sD.y) / H, sD.x, sD.y);
+    c.drawImage(tc, 0, 0);
     c.restore();
   }
 
@@ -2838,8 +2847,9 @@ export function createIsoOffice(canvas, opts = {}) {
     ctx.translate(cam.ox, cam.oy);
     ctx.scale(cam.zoom, cam.zoom);
 
-    // Left-wall clock: stuck on the gx=0 wall, hung high enough that nothing in the room covers it, so drawn first
-    drawClock(ctx);
+    // Door plate (two lines: floor + live clock): on the gx=0 wall, hung high enough that nothing
+    // in the room covers it, so drawn before the depth-sorted furniture and characters.
+    drawFloorPlate(ctx);
 
     // Sorting: furniture + characters mixed together, larger depth drawn later (covers the ones in front)
     const items = statics.slice();
@@ -3158,6 +3168,11 @@ export function createIsoOffice(canvas, opts = {}) {
     /** Switch floor: change this floor's material palette (dividers / metal / wood), see officeMap's FLOOR_COLORS */
     setFloor(id) {
       applyFloor(id);
+    },
+    /** Update the door plate: text = floor label, widthText = longest floor label (the fixed-width ruler) */
+    setFloorPlate(text, widthText) {
+      floorPlate = String(text || '');
+      if (widthText !== undefined) floorPlateWidthText = String(widthText || floorPlate);
     },
     setSelected(id) {
       selectedId = id || '';
