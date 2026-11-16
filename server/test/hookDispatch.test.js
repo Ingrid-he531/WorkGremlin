@@ -100,6 +100,24 @@ function ok(label, cond, extra = '') {
     ok('[3] 没触发任何 bus 调用', calls.length === 0, JSON.stringify(calls.map((c) => c[0])));
   }
 
+  // [5] dsh 插件在 Stop 里直接给 last_assistant_message：产出摘要必须保留换行。
+  //     这条曾经断在 hookCommon：它在把话交给 bus 之前先 replace(/\s+/g,' ')，台账再规范也没用。
+  {
+    calls.length = 0;
+    const sid = '44444444-4444-4444-8444-444444444444';
+    await d.dispatch(
+      { hook_event_name: 'UserPromptSubmit', session_id: sid, client: 'dsh', prompt: '整理一下', agent: 'dsh' },
+      ctx
+    );
+    const multiline = '## 结论\n\n- 改了 bus.js\n- 补了测试\n\n```js\nconst a = 1;\n```';
+    await d.dispatch(
+      { hook_event_name: 'Stop', session_id: sid, client: 'dsh', agent: 'dsh', last_assistant_message: multiline },
+      ctx
+    );
+    const end = calls.find((c) => c[0] === 'endTask');
+    ok('[5] dsh Stop 的产出摘要保留换行（不被 hook 侧压平）', Boolean(end) && end[1].result === multiline, end && JSON.stringify(end[1].result));
+  }
+
   // [4] CodeBuddy CLI / Plugin SessionStart / SessionEnd 更新服务端会话清单
   {
     for (const [sessionId, client, expectedForm] of [

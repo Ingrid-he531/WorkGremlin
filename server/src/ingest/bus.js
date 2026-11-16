@@ -17,6 +17,7 @@ const config = require('../config');
 const { resolveProjectName } = require('../project');
 const { detectLevel, agentDescription } = require('../floors');
 const { sessionModel } = require('../sessions');
+const { normalizeMultiline } = require('./text');
 
 function projectIdOf(name) {
   return name;
@@ -81,6 +82,14 @@ const RUN_RESULT_MAX = 4_000;
 function normText(v, max) {
   const s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
   return s ? s.slice(0, max) : null;
+}
+
+/**
+ * The ledger's "output summary" is shown as Markdown in the records view, so it keeps its line
+ * structure (only single-line fields such as titles / names go through normText above).
+ */
+function normResult(v) {
+  return normalizeMultiline(v, RUN_RESULT_MAX);
 }
 
 function jsonOrNull(v) {
@@ -760,7 +769,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
         title: finalTitle,
         model: endModel,
         form: normForm(p.form),
-        result: normText(p.result, RUN_RESULT_MAX),
+        result: normResult(p.result),
         fileCount,
         filesJson: filesJson ? JSON.stringify(filesJson) : null,
         endedAt,
@@ -873,7 +882,7 @@ function createIngestBus({ repo, hub, projectName = '', project = null }) {
     return repo.endSubagentRun.run({
       id: p.id,
       model: normModel(p.model),
-      result: normText(p.result, RUN_RESULT_MAX),
+      result: normResult(p.result),
       filesJson: filesJson ? JSON.stringify(filesJson) : null,
       endedAt: Number(p.endedAt) || now(),
     }).changes;

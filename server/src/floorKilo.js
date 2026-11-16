@@ -66,6 +66,7 @@ const { isFile } = require('./roots');
 // Static subagent dirs (project level / user level): private knowledge of this floor, kept here rather than
 // in the central agentLevel
 const { genericAgentDirs } = require('./ingest/agentLevel');
+const { normalizeMultiline } = require('./ingest/text');
 
 /**
  * 7F's static subagent definition dirs. Kilo Code currently has no "user-level / project-level agent
@@ -516,9 +517,10 @@ function readKiloRounds(sessionId) {
       const t = String(p.type || '');
       if (t === 'text') {
         // This turn's closing summary: later messages overwrite earlier ones, so what remains is "what the
-        // last message said" (same rule as 8F:opencode.js and the plugin path)
+        // last message said" (same rule as 8F:opencode.js and the plugin path). Its line structure is kept:
+        // the records view renders this as Markdown, where headings / lists / fences need their own lines.
         const said = unquoteText(p.text);
-        if (said) cur.result = said.replace(/\s+/g, ' ').trim().slice(0, 4_000);
+        if (said) cur.result = normalizeMultiline(said, 4_000);
       } else if (t === 'patch') {
         // Changed files come only from patch parts — **not from tool input**: read / grep and other read-only
         // tools also carry filePath, so treating them as "changes" would count merely-read files as

@@ -1421,8 +1421,12 @@ async function runHookEvent(ev, ctx, floorImpl) {
       }
     }
     const replies = impl.repliesOf(tp());
-    const eventSaid = String((ev && ev.last_assistant_message) || '').replace(/\s+/g, ' ').trim();
-    const lastText = eventSaid || (replies.length ? replies[replies.length - 1].text : '');
+    // The closing summary is stored as the ledger's "output" and rendered as Markdown, so it keeps its
+    // line structure: only the short `said` (done marker / notification) is flattened. Flattening here
+    // used to destroy the newlines before ingest ever saw them, no matter what the ledger did.
+    const eventLast = String((ev && ev.last_assistant_message) || '');
+    const eventSaid = eventLast.replace(/\s+/g, ' ').trim();
+    const lastText = eventSaid ? eventLast.trim() : replies.length ? replies[replies.length - 1].text : '';
     const said = lastText.replace(/\s+/g, ' ').trim().slice(0, 160);
     const result = lastText.trim().slice(0, RESULT_MAX);
     if (!replies.length && lastText) replies.push({ id: 'h' + fnv1a32(lastText), text: lastText });

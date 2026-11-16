@@ -46,6 +46,11 @@ const { t: tr } = useI18n();
  * attributes, javascript: links) — the output comes from a local agent so the risk is low, but the
  * render layer should not execute arbitrary HTML as-is. In non-browser environments (unit tests) it
  * returns marked's raw output so assertions are unaffected.
+ *
+ * `style` / `class` are dropped too: a summary is allowed to express structure (headings, lists, code,
+ * tables, emphasis) but not its own appearance. Styling stays with `.result-md` and the theme variables,
+ * so an answer cannot clash with the light/dark palette or lay itself over the page
+ * (`position:fixed; inset:0` was possible before), and the theme switch keeps working for it.
  */
 const md = (text) => {
   if (!text) return '';
@@ -55,7 +60,9 @@ const md = (text) => {
   doc.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach((e) => e.remove());
   doc.querySelectorAll('*').forEach((el) => {
     for (const a of [...el.attributes]) {
-      if (/^on/i.test(a.name) || /^javascript:/i.test(a.value)) el.removeAttribute(a.name);
+      if (/^on/i.test(a.name) || /^javascript:/i.test(a.value) || a.name === 'style' || a.name === 'class') {
+        el.removeAttribute(a.name);
+      }
     }
     if (el.tagName === 'A' && /^\s*javascript:/i.test(el.getAttribute('href') || '')) {
       el.removeAttribute('href');
